@@ -6163,9 +6163,11 @@ impl WriteHandler {
     }
 
     /// Refuse a statement that replaces `table`'s whole contents (INSERT
-    /// OVERWRITE, CREATE OR REPLACE ... AS SELECT) when the caller has any
-    /// row filter, mask or restriction on it: the replace would drop rows
-    /// they cannot see and overwrite values they cannot read.
+    /// OVERWRITE, CREATE OR REPLACE ... AS SELECT) when a row filter governs
+    /// the caller on it. Follows the PostgreSQL RLS model: a whole-table
+    /// replace is a bulk delete, and a caller may only delete rows they can
+    /// see. Column masks and restrictions hide values, not rows, so they do
+    /// not block a replace (dbt's `table` materialization relies on this).
     async fn refuse_replace_under_policy(
         &self,
         session: &Session,
@@ -6184,14 +6186,14 @@ impl WriteHandler {
         let predicates = self
             .compute_write_predicates(session, table_ident, schema, &mut None)
             .await?;
-        if predicates.is_empty() {
+        if predicates.row_filter_sql.is_none() {
             return Ok(());
         }
         Err(SqeError::with_code(
             SqeErrorCode::AccessDenied,
             format!(
-                "{what} on {table_ident} is not allowed under a row-level security policy \
-                 (row filter, mask or restricted column); use DELETE and INSERT instead"
+                "write to {table_ident} violates row-level security policy: \
+                 {what} would remove rows hidden from this user"
             ),
         ))
     }
@@ -11861,6 +11863,48 @@ s3_path_style = true
                 vec![(1, s("a")), (100, s("b"))],
                 "hidden row survives"
             );
+        }
+
+        /// Masks and restrictions hide values, not rows: a caller with only a
+        /// column mask (no row filter) on the target may still replace its
+        /// whole contents, as dbt's `table` materialization does.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn overwrite_and_replace_allowed_under_mask_only() {
+            let rig = SqliteRig::new().await;
+            run_ctas(
+                &handler(&rig),
+                &rig,
+                "CREATE TABLE default.mk AS SELECT * FROM (VALUES (1, 'a'), (100, 'b')) AS s(id, v)",
+            )
+            .await;
+
+            let store = sqe_policy::policy_store::InMemoryPolicyStore::new();
+            let mut pol = sqe_policy::ResolvedPolicy::default();
+            pol.column_masks.insert(
+                "v".to_string(),
+                sqe_policy::MaskType::Redact("***".to_string()),
+            );
+            store.add_table_policy("default", "mk", pol).await;
+            let h = handler(&rig).with_policy_enforcer(Arc::new(
+                sqe_policy::plan_rewriter::PolicyPlanRewriter::new(Arc::new(store)),
+            ));
+
+            run_insert(
+                &h,
+                &rig,
+                "INSERT OVERWRITE default.mk SELECT * FROM (VALUES (2, 'c')) AS s(id, v)",
+            )
+            .await
+            .expect("INSERT OVERWRITE under a mask only must be allowed");
+            assert_eq!(rig.scan_id_v(&rig.ident("mk")).await, vec![(2, s("c"))]);
+
+            run_ctas(
+                &h,
+                &rig,
+                "CREATE OR REPLACE TABLE default.mk AS SELECT * FROM (VALUES (3, 'd')) AS s(id, v)",
+            )
+            .await;
+            assert_eq!(rig.scan_id_v(&rig.ident("mk")).await, vec![(3, s("d"))]);
         }
 
         /// 500: a different column set cannot be written into the live table,
