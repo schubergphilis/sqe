@@ -63,18 +63,26 @@ pub(crate) struct MergeNames<'a> {
 /// filter admits a target row. Exists only inside the merge SQL.
 pub(crate) const MERGE_ADMIT_COLUMN: &str = "__sqe_merge_admit";
 
-/// Column alias carrying the RAW value of a masked target column inside the
-/// merge SQL, for the engine's passthrough only. It embeds the per-invocation
-/// scratch ref (a fresh UUID), so user SQL cannot name it; the column's own
-/// name carries the masked value.
+/// Column alias carrying the RAW value of a masked or row-filter-guarded
+/// target column inside the merge SQL, for the engine's passthrough only. It
+/// embeds the per-invocation scratch ref (a fresh UUID), so user SQL cannot
+/// name it; the column's own name carries the value the caller sees.
 fn raw_alias(names: &MergeNames<'_>, col: &str) -> String {
     format!("__sqe_raw_{}_{col}", names.target_ref)
 }
 
+/// Whether the caller reads target column `col` through the policy (a mask
+/// or the row-filter guard), so its own name does not carry the stored value.
+fn read_via_policy(names: &MergeNames<'_>, col: &str) -> bool {
+    names.target_policy.row_filter_sql.is_some()
+        || names.target_policy.column_mask_sqls.contains_key(col)
+}
+
 /// The engine's reference to the stored value of target column `col`: the
-/// raw alias for a masked column, the column itself otherwise.
+/// raw alias for a column read through the policy, the column itself
+/// otherwise.
 pub(crate) fn raw_target_col(names: &MergeNames<'_>, col: &str) -> String {
-    if names.target_policy.column_mask_sqls.contains_key(col) {
+    if read_via_policy(names, col) {
         format!("{}.\"{}\"", names.target_ref, raw_alias(names, col))
     } else {
         format!("{}.\"{col}\"", names.target_ref)
@@ -140,20 +148,35 @@ pub(crate) async fn register_target_policy_view(
 }
 
 /// The policy SELECT over the target scratch table behind [`target_relation`].
+///
+/// With a row filter every column is read through the guard
+/// `CASE WHEN <row filter> THEN <col> END`, so a hidden target row is all
+/// NULL to the user's ON, clause predicates and SET expressions. The
+/// optimizer may evaluate those on every row (a predicate pushed below the
+/// join, the right side of an AND over the whole batch), and a fallible one,
+/// say `1 / (t.id - 2)`, would otherwise fail on a hidden row and reveal its
+/// values. The admit verdict is computed on the stored values, TRUE-only.
 fn target_policy_select(names: &MergeNames<'_>, qualified_target_ref: &str) -> String {
     let policy = names.target_policy;
-    let mut projections = Vec::with_capacity(names.target_columns.len() + 1);
+    let row_filter = policy.row_filter_sql.as_deref();
+    let mut projections = Vec::with_capacity(2 * names.target_columns.len() + 1);
     for col in names.target_columns {
-        match policy.column_mask_sqls.get(col) {
-            Some(mask_sql) => {
-                projections.push(format!("({mask_sql}) AS \"{col}\""));
-                projections.push(format!("\"{col}\" AS \"{}\"", raw_alias(names, col)));
-            }
-            None => projections.push(format!("\"{col}\"")),
+        let mask = policy.column_mask_sqls.get(col);
+        let seen = match mask {
+            Some(mask_sql) => format!("({mask_sql})"),
+            None => format!("\"{col}\""),
+        };
+        match row_filter {
+            Some(rf) => projections.push(format!("CASE WHEN ({rf}) THEN {seen} END AS \"{col}\"")),
+            None if mask.is_some() => projections.push(format!("{seen} AS \"{col}\"")),
+            None => projections.push(seen),
+        }
+        if read_via_policy(names, col) {
+            projections.push(format!("\"{col}\" AS \"{}\"", raw_alias(names, col)));
         }
     }
-    if let Some(rf) = &policy.row_filter_sql {
-        projections.push(format!("({rf}) AS \"{MERGE_ADMIT_COLUMN}\""));
+    if let Some(rf) = row_filter {
+        projections.push(format!("(({rf}) IS TRUE) AS \"{MERGE_ADMIT_COLUMN}\""));
     }
     format!(
         "SELECT {} FROM {qualified_target_ref}",
@@ -954,10 +977,12 @@ mod tests {
         );
         let relation = target_policy_select(&n, "datafusion.public.__merge_target_x");
         assert!(
-            relation.contains("(region = 'EU') AS \"__sqe_merge_admit\"")
-                && relation.contains("('***') AS \"ssn\"")
-                && relation.contains("\"ssn\" AS \"__sqe_raw___merge_target_x_ssn\""),
-            "target relation must compute admit, masked and raw columns: {relation}"
+            relation.contains("((region = 'EU') IS TRUE) AS \"__sqe_merge_admit\"")
+                && relation.contains("CASE WHEN (region = 'EU') THEN ('***') END AS \"ssn\"")
+                && relation.contains("CASE WHEN (region = 'EU') THEN \"id\" END AS \"id\"")
+                && relation.contains("\"ssn\" AS \"__sqe_raw___merge_target_x_ssn\"")
+                && relation.contains("\"id\" AS \"__sqe_raw___merge_target_x_id\""),
+            "target relation must compute admit, guarded and raw columns: {relation}"
         );
         assert!(
             out.contains("ELSE __merge_target_x.\"__sqe_raw___merge_target_x_ssn\" END AS \"ssn\""),
@@ -1014,9 +1039,10 @@ mod tests {
         )
         .unwrap();
 
-        let run = |sql: &str, policy: WritePolicyPredicates| {
+        let try_run = |sql: &str, on: &str, policy: WritePolicyPredicates| {
             let ctx = ctx.clone();
             let sql = sql.to_string();
+            let on = on.to_string();
             async move {
                 let clauses = merge_clauses(&sql);
                 let tc = cols(&["id", "region", "amount"]);
@@ -1028,9 +1054,13 @@ mod tests {
                     &n,
                     "datafusion.public.__merge_target_x",
                     "datafusion.public.__merge_source_x",
-                    "__merge_target_x.id = __merge_source_x.id",
+                    &on,
                 );
-                let batches = ctx.sql(&select).await.unwrap().collect().await.unwrap();
+                let batches = match ctx.sql(&select).await {
+                    Ok(df) => df.collect().await,
+                    Err(e) => Err(e),
+                }
+                .map_err(|e| e.to_string())?;
                 let mut rows: Vec<(i32, String, i32)> = Vec::new();
                 for b in &batches {
                     // CASE arms coerce types (literal 0 -> Int64, Utf8 -> Utf8View);
@@ -1046,13 +1076,40 @@ mod tests {
                     }
                 }
                 rows.sort();
-                rows
+                Ok::<_, String>(rows)
             }
+        };
+        let on = "__merge_target_x.id = __merge_source_x.id";
+        let run = |sql: &str, policy: WritePolicyPredicates| {
+            let fut = try_run(sql, on, policy);
+            async move { fut.await.unwrap() }
         };
         let eu_only = || WritePolicyPredicates {
             row_filter_sql: Some("region = 'EU'".to_string()),
             ..Default::default()
         };
+
+        // A fallible ON / clause predicate / SET never runs on a hidden row:
+        // through the row-filter guard a hidden row is all NULL. The same
+        // MERGE without the policy divides by zero on the US rows (amount 20
+        // in ON and MATCHED, amount 30 in BY SOURCE).
+        let fallible = "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+                        WHEN MATCHED AND 1 / (t.amount - 20) <> 7 THEN UPDATE SET amount = 1 / (t.amount - 20) \
+                        WHEN NOT MATCHED BY SOURCE AND 1 / (t.amount - 30) = 1 THEN DELETE";
+        let fallible_on = format!("({on}) AND 1 / (__merge_target_x.amount - 20) <> 7");
+        let err = try_run(fallible, &fallible_on, WritePolicyPredicates::default())
+            .await
+            .expect_err("unguarded, the predicate fails on the US rows");
+        assert!(err.contains("Divide by zero"), "{err}");
+        assert_eq!(
+            try_run(fallible, &fallible_on, eu_only()).await.unwrap(),
+            vec![
+                (1, "EU".to_string(), 0),
+                (2, "US".to_string(), 20),
+                (3, "US".to_string(), 30)
+            ],
+            "the visible row is updated; hidden rows pass through unchanged"
+        );
 
         let delete = "MERGE INTO tgt AS t USING src AS s ON t.id = s.id WHEN MATCHED THEN DELETE";
         assert_eq!(
