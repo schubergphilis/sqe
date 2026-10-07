@@ -1438,14 +1438,10 @@ impl FlightService for WorkerFlightService {
                     request.expires_at,
                     !self.worker_secret.is_empty(),
                 )?;
-                // Without keys `build_file_io` falls back to the worker's
-                // ambient AWS identity; the rewrite must run only with the
-                // credentials the coordinator chose for it.
-                if request.s3.access_key.is_empty() || request.s3.secret_key.is_empty() {
-                    return Err(Status::invalid_argument(
-                        "compact_file_group: request carries no S3 credentials",
-                    ));
-                }
+                // No S3 key check: an empty key pair is how IRSA / pod-role
+                // deployments (`distributed_credentials = worker_default`)
+                // hand the rewrite to the worker's own identity, and with a
+                // signed request that choice can only be the coordinator's.
                 let group_id = request.group_id;
 
                 info!(
@@ -2639,25 +2635,6 @@ mod tests {
         let err = unwrap_err(svc.do_action(signed_compact_action(&signature, body)).await);
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
         assert!(err.message().contains("HMAC"), "{err}");
-    }
-
-    /// L4: a request without S3 keys would run on the worker's ambient
-    /// identity; refuse it before any rewrite starts.
-    #[tokio::test]
-    async fn compact_file_group_rejects_request_without_s3_keys() {
-        let svc = make_service("");
-        let mut req =
-            sqe_compaction::wire::CompactGroupRequest::from_bytes(&make_compact_request_bytes())
-                .unwrap();
-        req.s3.access_key.clear();
-        req.s3.secret_key.clear();
-        let request = Request::new(Action {
-            r#type: "compact_file_group".to_string(),
-            body: bytes::Bytes::from(req.to_bytes().unwrap()),
-        });
-        let err = unwrap_err(svc.do_action(request).await);
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(err.message().contains("S3 credentials"), "{err}");
     }
 
     // ---- finding 608: the rewrite is tied to the RPC -------------------

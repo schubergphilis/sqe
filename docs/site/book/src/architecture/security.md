@@ -155,6 +155,8 @@ Heartbeats are bound to the peer: when mTLS is off (the common case), the advert
 
 **Migration:** If you still have coordinators running pre-Ed25519 code alongside new workers, set `[worker] accept_hmac_tickets = true` on new workers to accept the legacy HMAC-signed tickets while you roll the coordinators. The HMAC key is the shared secret every worker holds, so the HMAC proves nothing; turn this option off as soon as all coordinators are upgraded.
 
+Distributed compaction (`compact_file_group`) uses the same signature scheme, so a mixed-version rollout affects it too. A new coordinator with an old worker fails distributed compaction: the old worker checks the `ed25519:` tag as an HMAC and refuses it. An old coordinator with a new worker is refused unless the worker sets `accept_hmac_tickets`, which `production_mode` forbids. Queries are not affected by this change; scan tickets follow the paragraph above. During a mixed-version rollout, set `[maintenance.distribution] mode = "local"` so compaction runs on the coordinator, and restore it once every node is upgraded.
+
 ### Distributed Scan Credentials
 
 Scan tickets carry storage credentials. The source is chosen per-query via `[coordinator] distributed_credentials`:
