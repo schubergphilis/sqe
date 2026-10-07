@@ -365,7 +365,7 @@ pub async fn create_session_context(
             let ctx = if let Some(rt) = runtime {
                 // Use the shared coordinator runtime (memory pool per
                 // `coordinator.memory_pool`, spill-to-disk per config)
-                SessionContext::new_with_config_rt(session_config, Arc::clone(rt))
+                sqe_catalog::engine_context(session_config, Arc::clone(rt))
             } else {
                 // Fallback path (tests, one-shot helpers): greedy pool with
                 // spill disabled. Greedy matches the shared runtime default;
@@ -403,7 +403,7 @@ pub async fn create_session_context(
                         .map_err(|e| {
                             Arc::new(SqeError::Config(format!("Failed to create runtime env: {e}")))
                         })?;
-                    SessionContext::new_with_config_rt(session_config, rt)
+                    sqe_catalog::engine_context(session_config, rt)
                 } else {
                     // Unlimited-memory fallback (max_query_memory = 0; test /
                     // one-shot only). Build an explicit runtime so this path
@@ -418,7 +418,7 @@ pub async fn create_session_context(
                         .map_err(|e| {
                             Arc::new(SqeError::Config(format!("Failed to create runtime env: {e}")))
                         })?;
-                    SessionContext::new_with_config_rt(session_config, rt)
+                    sqe_catalog::engine_context(session_config, rt)
                 }
             };
 

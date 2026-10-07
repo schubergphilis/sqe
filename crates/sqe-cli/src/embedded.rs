@@ -292,7 +292,7 @@ pub fn build_embedded_context_with_mask(
         .build_arc()
         .map_err(|e| anyhow::anyhow!("failed to build runtime env: {e}"))?;
 
-    let ctx = SessionContext::new_with_config_rt(session_config, runtime);
+    let ctx = sqe_catalog::engine_context(session_config, runtime);
 
     // V8: enable `SELECT * FROM 'file.parquet'` auto-detection. The wrapped
     // catalog list resolves quoted-string table names against
