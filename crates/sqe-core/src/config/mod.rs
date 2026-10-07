@@ -4649,13 +4649,13 @@ pub struct SecurityConfig {
     /// diffs. Dev (non-production) still WARNs and starts.
     #[serde(default)]
     pub allow_unkeyed_hash_masks: bool,
-    /// Opt-in escape hatch for `policy.engine = passthrough` under
+    /// Opt-in escape hatch for `policy.engine = passthrough` (or the
+    /// empty, non-persistent `in_memory` test store) under
     /// `production_mode` (architecture review 212, issue #565). Passthrough
     /// enforces nothing: every user sees every row and column the catalog
     /// lets them read, with no row filters, masks or column restrictions.
     /// Leaving this `false` (the default) makes `production_mode` refuse to
-    /// start without a real policy engine (`ranger`, or `in_memory` for
-    /// tests). Set `true` only for a deployment that deliberately relies on
+    /// start without a real policy engine (`ranger`). Set `true` only for a deployment that deliberately relies on
     /// catalog-level authorization alone; the choice is then visible in
     /// config diffs, and startup still logs the disabled enforcement.
     #[serde(default)]
@@ -8650,7 +8650,9 @@ s3_secret_key = "configured-secret"
         config.catalog.require_vended_credentials = true;
         // Review 212: a real policy engine and a grant backend are part of a
         // hardened config; the tests below flip each back to its default.
-        config.policy.engine = PolicyEngine::InMemory;
+        config.policy.engine = PolicyEngine::Ranger;
+        config.policy.mask_key = "test-mask-key".to_string();
+        config.policy.ranger.project_tags = true;
         config.access_control.backend = AccessControlBackend::Polaris;
         // Finding 751: inline TVF credentials default on; hardened turns it off.
         config.storage.tvf.allow_inline_credentials = false;
@@ -8712,6 +8714,17 @@ s3_secret_key = "configured-secret"
         let err = config.validate_production().unwrap_err().to_string();
         assert!(
             err.contains("policy.engine is passthrough") && err.contains("allow_no_policy_engine"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_production_rejects_in_memory_policy_engine() {
+        let mut config = valid_production_config();
+        config.policy.engine = PolicyEngine::InMemory;
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(
+            err.contains("policy.engine is in_memory") && err.contains("allow_no_policy_engine"),
             "got: {err}"
         );
     }
