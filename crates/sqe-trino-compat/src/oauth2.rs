@@ -36,13 +36,7 @@ fn poll_key(auth_id: &str) -> String {
 /// `initiate/{state}` redirects it, the callback (`?state=`) completes it, and
 /// `token/{auth_id}` polls it. `state` doubles as the anti-CSRF token verified
 /// in the callback (RFC 6749 section 10.12).
-///
-/// `requester_ip` is recorded so `initiate` can show the browser user which
-/// client asked for the sign-in.
-pub async fn generate_challenge(
-    state: &OAuth2State,
-    requester_ip: &str,
-) -> Result<(String, String), StatusCode> {
+pub async fn generate_challenge(state: &OAuth2State) -> Result<(String, String), StatusCode> {
     let challenge = state
         .auth_code_service
         .start_challenge()
@@ -61,7 +55,6 @@ pub async fn generate_challenge(
         challenge.code_verifier,
         challenge.state,
         challenge.authorization_url,
-        requester_ip.to_string(),
     );
 
     let initiate_url = format!("{}/oauth2/token/initiate/{}", state.base_url, session_key);
@@ -73,60 +66,19 @@ pub async fn generate_challenge(
     Ok((auth_id, www_authenticate))
 }
 
-#[derive(Debug, Default, Deserialize)]
-pub struct InitiateParams {
-    #[serde(default)]
-    pub confirm: Option<String>,
-}
-
 /// GET /oauth2/token/initiate/{auth_id_hash}
-/// First shows an interstitial naming the client address that requested the
-/// sign-in; its "continue" button (`?confirm=1`) redirects the browser to the
-/// IdP authorization URL of the pending session issued in the 401 challenge.
-/// A link someone else minted and sent to the user therefore shows a foreign
-/// address before any sign-in happens. Unknown or already-used hash -> 404.
+/// Redirects the user's browser to the IdP authorization URL of the pending
+/// session issued in the 401 challenge. Unknown or already-used hash -> 404.
 pub async fn initiate_handler(
     State(state): State<Arc<OAuth2State>>,
     Path(auth_id_hash): Path<String>,
-    Query(params): Query<InitiateParams>,
 ) -> Response {
     match state.pending_store.poll(&auth_id_hash) {
         Some(PendingAuth::AwaitingCallback {
-            authorization_url,
-            requester_ip,
-            ..
-        }) => {
-            if params.confirm.is_some() {
-                Redirect::temporary(&authorization_url).into_response()
-            } else {
-                Html(confirm_html(&requester_ip)).into_response()
-            }
-        }
+            authorization_url, ..
+        }) => Redirect::temporary(&authorization_url).into_response(),
         _ => (StatusCode::NOT_FOUND, "Auth session not found or expired").into_response(),
     }
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
-
-fn confirm_html(requester_ip: &str) -> String {
-    format!(
-        r#"<!DOCTYPE html>
-<html><head><title>SQE — Confirm Sign-in</title></head>
-<body style="font-family:system-ui;text-align:center;padding:60px">
-<h2>Sign in to SQE</h2>
-<p>A client at <strong>{}</strong> asked to sign in as you.</p>
-<p>Continue only if you just started this sign-in yourself.</p>
-<form method="get"><input type="hidden" name="confirm" value="1">
-<button type="submit">Continue to sign in</button></form>
-</body></html>"#,
-        html_escape(requester_ip)
-    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -297,7 +249,6 @@ mod tests {
             "verifier".to_string(),
             "state".to_string(),
             String::new(),
-            String::new(),
         );
 
         assert!(matches!(
@@ -333,7 +284,6 @@ mod tests {
             "verifier-1".to_string(),
             "good-state".to_string(),
             String::new(),
-            String::new(),
         );
 
         let result = verify_state_and_take_verifier(&store, "good-state");
@@ -351,18 +301,10 @@ mod tests {
             "verifier-2".to_string(),
             "real-state".to_string(),
             String::new(),
-            String::new(),
         );
 
         let result = verify_state_and_take_verifier(&store, "lookup-key");
         assert!(result.is_err(), "mismatched state must be rejected");
-    }
-
-    #[test]
-    fn confirm_page_escapes_requester() {
-        let html = confirm_html("<script>\"x'&");
-        assert!(html.contains("&lt;script&gt;&quot;x&#39;&amp;"));
-        assert!(!html.contains("<script>"));
     }
 
     #[test]
@@ -372,7 +314,6 @@ mod tests {
             "good-state",
             "verifier-3".to_string(),
             "good-state".to_string(),
-            String::new(),
             String::new(),
         );
 
@@ -416,48 +357,17 @@ mod tests {
             "verifier".to_string(),
             key.clone(),
             "http://idp/authorize?state=x".to_string(),
-            "198.51.100.7".to_string(),
         );
-        let confirmed = || InitiateParams {
-            confirm: Some("1".to_string()),
-        };
 
-        // Without confirmation the browser gets the interstitial naming the
-        // requesting client, not the IdP redirect.
-        let resp = initiate_handler(
-            State(state.clone()),
-            Path(key.clone()),
-            Query(InitiateParams::default()),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("198.51.100.7"));
-        assert!(body.contains("Continue to sign in"));
-        assert!(!body.contains("idp/authorize"));
-
-        // Browser-visible hash drives the redirect once confirmed...
-        let resp = initiate_handler(
-            State(state.clone()),
-            Path(key.clone()),
-            Query(confirmed()),
-        )
-        .await;
+        // Browser-visible hash drives the redirect...
+        let resp = initiate_handler(State(state.clone()), Path(key.clone())).await;
         assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
         assert_eq!(
             resp.headers().get("location").unwrap(),
             "http://idp/authorize?state=x"
         );
         // ...and an unknown hash does not mint a fresh session.
-        let resp = initiate_handler(
-            State(state.clone()),
-            Path("nope".to_string()),
-            Query(confirmed()),
-        )
-        .await;
+        let resp = initiate_handler(State(state.clone()), Path("nope".to_string())).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         state.pending_store.complete(
