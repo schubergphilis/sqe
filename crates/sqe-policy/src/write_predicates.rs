@@ -122,9 +122,22 @@ pub fn unparse_predicates(rewritten: &LogicalPlan) -> sqe_core::Result<WritePoli
                     if matches!(body, Expr::Column(c) if c.name == alias_name) {
                         continue;
                     }
-                    let sql = expr_to_sql(body)
-                        .map_err(|e| unrenderable(format!("column mask on `{alias_name}`"), e))?;
-                    column_mask_sqls.insert(alias_name, sql.to_string());
+                    // A Nullify mask or restricted column is a typed NULL. For
+                    // struct / map / list types that is a nested ScalarValue
+                    // (or a CAST to a nested type) the unparser cannot render,
+                    // which would refuse every DML on the table even when the
+                    // column is never referenced. Plain `NULL` hides the value
+                    // just as well, and is what the unparser already emits for
+                    // scalar typed NULLs (and what the WITH CHECK nullify test
+                    // matches on).
+                    let sql = if is_null_literal(body) {
+                        "NULL".to_string()
+                    } else {
+                        expr_to_sql(body)
+                            .map_err(|e| unrenderable(format!("column mask on `{alias_name}`"), e))?
+                            .to_string()
+                    };
+                    column_mask_sqls.insert(alias_name, sql);
                 }
                 node = p.input.as_ref();
             }
@@ -147,6 +160,17 @@ pub fn unparse_predicates(rewritten: &LogicalPlan) -> sqe_core::Result<WritePoli
         row_filter_sql,
         column_mask_sqls,
     })
+}
+
+/// `true` for a NULL literal of any type, or a CAST / TRY_CAST of one (the
+/// shapes `plan_rewriter::typed_null` produces).
+fn is_null_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(v, _) => v.is_null(),
+        Expr::Cast(c) => is_null_literal(&c.expr),
+        Expr::TryCast(c) => is_null_literal(&c.expr),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -316,6 +340,55 @@ mod tests {
             .expect("id mask present");
         let upper = mask.to_uppercase();
         assert!(upper.contains("NULL"), "nullify mask sql: {mask}");
+    }
+
+    // A restricted or Nullify-masked struct / map column is a typed NULL the
+    // unparser cannot render; it must still yield a predicate set (plain
+    // NULL), not refuse every DML on the table.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restricted_and_nullified_nested_columns_render_as_null() {
+        use arrow_schema::Fields;
+        let addr = DataType::Struct(Fields::from(vec![
+            Field::new("street", DataType::Utf8, true),
+            Field::new("zip", DataType::Int32, true),
+        ]));
+        let attrs = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", DataType::Utf8, true),
+                ])),
+                false,
+            )),
+            false,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("addr", addr, true),
+            Field::new("attrs", attrs, true),
+        ]));
+
+        let store = InMemoryPolicyStore::new();
+        let mut pol = ResolvedPolicy::default();
+        pol.restricted_columns.push("addr".to_string());
+        pol.column_masks
+            .insert("attrs".to_string(), MaskType::Nullify);
+        store.add_table_policy("default", "people", pol).await;
+        let enf = PolicyPlanRewriter::new(Arc::new(store));
+
+        let (out, _) = extract_write_predicates(&enf, &user("alice"), "default", "people", schema)
+            .await
+            .expect("nested typed NULL masks must render");
+        assert_eq!(
+            out.column_mask_sqls.get("addr").map(String::as_str),
+            Some("NULL")
+        );
+        assert_eq!(
+            out.column_mask_sqls.get("attrs").map(String::as_str),
+            Some("NULL")
+        );
+        assert!(!out.column_mask_sqls.contains_key("id"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
