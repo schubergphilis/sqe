@@ -1757,15 +1757,9 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
                 credential_tracker.clone(),
                 interval,
                 config.coordinator.worker_secret.expose().to_string(),
-                |_fragment| async {
-                    // Credential vending is deferred to Step 5 (Pluggable
-                    // Catalogs): the CatalogBackend trait will expose a
-                    // `vend_credentials(table)` method that reloads the
-                    // table from Polaris to obtain fresh STS tokens scoped
-                    // to the fragment's data files. Until then, workers use
-                    // the original session credentials.
-                    None
-                },
+                // Reload the fragment's table as the querying user; the
+                // catalog vends a fresh table-scoped set (or refuses).
+                sqe_coordinator::credential_refresh::reload_vended_credentials,
             ),
         );
         tracing::info!(

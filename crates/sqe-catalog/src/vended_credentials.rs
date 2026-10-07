@@ -8,8 +8,10 @@
 //! deadline so caches never hand out a table whose keys are about to lapse.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use futures::future::BoxFuture;
 use iceberg::table::Table;
 
 /// Iceberg REST property names for vended S3 credentials.
@@ -43,6 +45,37 @@ pub fn credential_expiry(props: &HashMap<String, String>) -> Option<SystemTime> 
 /// [`credential_expiry`] of a loaded table's FileIO.
 pub fn table_credential_expiry(table: &Table) -> Option<SystemTime> {
     credential_expiry(table.file_io().config().props())
+}
+
+/// Reloads one table from its catalog as the principal that first loaded
+/// it, bypassing every cache, to obtain freshly vended credentials. Carried
+/// from the table provider onto its scan node so the coordinator's
+/// credential-refresh task can renew keys for a distributed scan without
+/// knowing which catalog (or which user's bearer) the table came from.
+#[derive(Clone)]
+pub struct TableReloader(
+    Arc<dyn Fn() -> BoxFuture<'static, sqe_core::Result<Table>> + Send + Sync>,
+);
+
+impl TableReloader {
+    /// Wrap a reload function.
+    pub fn new<F>(reload: F) -> Self
+    where
+        F: Fn() -> BoxFuture<'static, sqe_core::Result<Table>> + Send + Sync + 'static,
+    {
+        Self(Arc::new(reload))
+    }
+
+    /// Load the table again from the catalog.
+    pub fn reload(&self) -> BoxFuture<'static, sqe_core::Result<Table>> {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for TableReloader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TableReloader")
+    }
 }
 
 /// When a holder of credentials expiring at `expires_at`, obtained at

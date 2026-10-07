@@ -1185,7 +1185,9 @@ impl SqeFlightSqlService {
         client_ip: Option<String>,
         query_id: Option<uuid::Uuid>,
     ) -> Result<Response<FlightStream>, Status> {
-        if statement.plan.is_some() {
+        // A stored plan whose tables' vended keys are due for refresh is not
+        // run: the text path below re-plans, which reloads the tables.
+        if statement.plan.is_some() && !statement.stored_plan_credentials_expired() {
             let plan = statement
                 .bound_plan()
                 .map_err(Status::failed_precondition)?;

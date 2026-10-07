@@ -2394,6 +2394,21 @@ impl SessionCatalog {
         Box::pin(self.load_table_inner(table_ident))
     }
 
+    /// A [`crate::vended_credentials::TableReloader`] for `table_ident` that
+    /// reloads through this session (same bearer, same catalog) with
+    /// [`Self::load_table_uncached`].
+    pub fn table_reloader(
+        self: &Arc<Self>,
+        table_ident: TableIdent,
+    ) -> crate::vended_credentials::TableReloader {
+        let catalog = Arc::clone(self);
+        crate::vended_credentials::TableReloader::new(move || {
+            let catalog = Arc::clone(&catalog);
+            let table_ident = table_ident.clone();
+            Box::pin(async move { catalog.load_table_uncached(&table_ident).await })
+        })
+    }
+
     /// Load `table_ident` from the catalog as this session's principal,
     /// bypassing the metadata cache in both directions (nothing read from
     /// it, nothing written to it).
