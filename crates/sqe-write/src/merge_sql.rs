@@ -82,18 +82,66 @@ pub(crate) fn raw_target_col(names: &MergeNames<'_>, col: &str) -> String {
 }
 
 /// The target relation as the merge SQL should read it: the bare scratch
-/// table when the caller has no policy on the target, otherwise a derived
-/// table that projects each masked column's mask under the column's own
-/// name (so any user reference, bare or qualified, reads it masked), its raw
-/// value under [`raw_alias`], and the `MERGE_ADMIT_COLUMN` row-filter
-/// verdict. Every policy expression is evaluated inside this single-table
-/// subquery, so the unqualified column names the rewriter produced resolve
-/// without ambiguity.
+/// table when the caller has no policy on the target, otherwise a relation
+/// that projects each masked column's mask under the column's own name (so
+/// any user reference, bare or qualified, reads it masked), its raw value
+/// under [`raw_alias`], and the `MERGE_ADMIT_COLUMN` row-filter verdict.
+/// Every policy expression is evaluated inside this single-table relation,
+/// so the unqualified column names the rewriter produced resolve without
+/// ambiguity.
+///
+/// With column masks the relation is the view [`register_target_policy_view`]
+/// registers: mask SQL can call the internal keyed HASH function, which the
+/// user's session (where the merge SQL, with the user's ON / SET / clause
+/// predicates, is planned) deliberately cannot resolve. If the view was not
+/// registered the merge SQL fails to plan; there is no inline fallback. A
+/// row filter alone stays inline.
 pub(crate) fn target_relation(names: &MergeNames<'_>, qualified_target_ref: &str) -> String {
     let policy = names.target_policy;
     if policy.is_empty() {
         return qualified_target_ref.to_string();
     }
+    if let Some(view) = target_policy_view(names) {
+        return view;
+    }
+    format!("({})", target_policy_select(names, qualified_target_ref))
+}
+
+/// Name of the masked target view for this MERGE invocation, or `None` when
+/// the target has no column masks. It embeds the per-invocation scratch ref,
+/// and its `__sqe_` prefix in the `datafusion` catalog marks it as engine
+/// scratch for the DML policy pass.
+pub(crate) fn target_policy_view(names: &MergeNames<'_>) -> Option<String> {
+    (!names.target_policy.column_mask_sqls.is_empty())
+        .then(|| format!("datafusion.public.__sqe_mpol_{}", names.target_ref))
+}
+
+/// Register the masked target view [`target_relation`] references, planned
+/// in the separate mask context ([`crate::policy_view`]). A no-op without
+/// column masks. Call it after the target scratch table is registered, and
+/// again whenever that registration is replaced: the view captures the
+/// table it was planned against. The caller deregisters
+/// [`target_policy_view`].
+pub(crate) async fn register_target_policy_view(
+    ctx: &datafusion::prelude::SessionContext,
+    names: &MergeNames<'_>,
+    qualified_target_ref: &str,
+) -> sqe_core::Result<()> {
+    let Some(view) = target_policy_view(names) else {
+        return Ok(());
+    };
+    crate::policy_view::register_policy_view(
+        ctx,
+        &view,
+        &target_policy_select(names, qualified_target_ref),
+        names.target_policy,
+    )
+    .await
+}
+
+/// The policy SELECT over the target scratch table behind [`target_relation`].
+fn target_policy_select(names: &MergeNames<'_>, qualified_target_ref: &str) -> String {
+    let policy = names.target_policy;
     let mut projections = Vec::with_capacity(names.target_columns.len() + 1);
     for col in names.target_columns {
         match policy.column_mask_sqls.get(col) {
@@ -108,7 +156,7 @@ pub(crate) fn target_relation(names: &MergeNames<'_>, qualified_target_ref: &str
         projections.push(format!("({rf}) AS \"{MERGE_ADMIT_COLUMN}\""));
     }
     format!(
-        "(SELECT {} FROM {qualified_target_ref})",
+        "SELECT {} FROM {qualified_target_ref}",
         projections.join(", ")
     )
 }
@@ -856,6 +904,7 @@ mod tests {
                 "ssn".to_string(),
                 "'***'".to_string(),
             )]),
+            ..Default::default()
         }
     }
 
@@ -895,11 +944,20 @@ mod tests {
             )),
             "BY SOURCE DELETE must be guarded: {out}"
         );
+        // Masks never reach the merge SQL itself: it reads the masked view,
+        // whose SELECT (planned in the mask context) computes admit, masked
+        // and raw columns.
+        let view = target_policy_view(&n).expect("masked target has a view");
         assert!(
-            out.contains("(region = 'EU') AS \"__sqe_merge_admit\"")
-                && out.contains("('***') AS \"ssn\"")
-                && out.contains("\"ssn\" AS \"__sqe_raw___merge_target_x_ssn\""),
-            "target relation must compute admit, masked and raw columns: {out}"
+            out.contains(&format!("FROM {view}")) && !out.contains("'***'"),
+            "merge SQL must read the masked view, not inline masks: {out}"
+        );
+        let relation = target_policy_select(&n, "datafusion.public.__merge_target_x");
+        assert!(
+            relation.contains("(region = 'EU') AS \"__sqe_merge_admit\"")
+                && relation.contains("('***') AS \"ssn\"")
+                && relation.contains("\"ssn\" AS \"__sqe_raw___merge_target_x_ssn\""),
+            "target relation must compute admit, masked and raw columns: {relation}"
         );
         assert!(
             out.contains("ELSE __merge_target_x.\"__sqe_raw___merge_target_x_ssn\" END AS \"ssn\""),
@@ -993,7 +1051,7 @@ mod tests {
         };
         let eu_only = || WritePolicyPredicates {
             row_filter_sql: Some("region = 'EU'".to_string()),
-            column_mask_sqls: Default::default(),
+            ..Default::default()
         };
 
         let delete = "MERGE INTO tgt AS t USING src AS s ON t.id = s.id WHEN MATCHED THEN DELETE";
@@ -1118,8 +1176,12 @@ mod tests {
                 "ssn".to_string(),
                 "'***'".to_string(),
             )]),
+            ..Default::default()
         };
         let n = names_with_policy(&tc, &sc, &policy);
+        register_target_policy_view(&ctx, &n, "datafusion.public.__merge_target_x")
+            .await
+            .unwrap();
         let classified = classify_merge_clauses(&clauses, &n).unwrap();
         let select = build_merge_select(
             &classified,
@@ -1149,6 +1211,167 @@ mod tests {
                 (2, "222".to_string(), "***".to_string()),
             ],
             "predicate and SET read the mask; stored ssn is kept raw"
+        );
+    }
+
+    /// A HASH mask calls the internal keyed function, which the session that
+    /// plans the merge SQL (and the user's ON / SET / USING text) never
+    /// registers. The masked target view is planned in the separate mask
+    /// context, so MERGE plans and reads the keyed hash, while user SQL
+    /// naming the function still fails to plan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keyed_hash_mask_merges_without_exposing_mask_udf() {
+        use arrow_array::{Int32Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::prelude::SessionContext;
+        use sqe_policy::plan_rewriter::PolicyPlanRewriter;
+        use sqe_policy::policy_store::InMemoryPolicyStore;
+        use sqe_policy::sha256_udf::{sha256_udf, MASK_HASH_UDF_NAME};
+        use sqe_policy::{MaskType, ResolvedPolicy};
+        use std::sync::Arc;
+
+        let ctx = SessionContext::new();
+        let tschema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("ssn", DataType::Utf8, false),
+            Field::new("note", DataType::Utf8, false),
+        ]));
+        let target = arrow_array::RecordBatch::try_new(
+            tschema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["111", "222"])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+        let sschema = Arc::new(Schema::new(vec![Field::new("sid", DataType::Int32, false)]));
+        let source = arrow_array::RecordBatch::try_new(
+            sschema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )
+        .unwrap();
+        for (name, schema, batch) in [
+            ("datafusion.public.__merge_target_x", tschema.clone(), target),
+            ("datafusion.public.__merge_source_x", sschema, source),
+        ] {
+            let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+            ctx.register_table(name, Arc::new(mem)).unwrap();
+        }
+
+        // The real rewriter, so the mask text and its function are the ones
+        // production hands the write path.
+        let key = Arc::new(b"mask-key".to_vec());
+        let store = InMemoryPolicyStore::new();
+        let mut pol = ResolvedPolicy::default();
+        pol.column_masks.insert("ssn".to_string(), MaskType::Hash);
+        store.add_table_policy("default", "tgt", pol).await;
+        let enf = PolicyPlanRewriter::new(Arc::new(store)).with_mask_key(Some(key.clone()));
+        let user = sqe_core::SessionUser {
+            username: "alice".to_string(),
+            roles: vec![],
+            subject: None,
+            email: None,
+            groups: vec![],
+        };
+        let (policy, _) = sqe_policy::write_predicates::extract_write_predicates(
+            &enf, &user, "default", "tgt", tschema,
+        )
+        .await
+        .unwrap();
+
+        let keyed = {
+            let c = SessionContext::new();
+            c.register_udf(sha256_udf(Some(key)));
+            let b = c
+                .sql(&format!("SELECT {MASK_HASH_UDF_NAME}('111')"))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let a = arrow::compute::cast(b[0].column(0), &DataType::Utf8).unwrap();
+            a.as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0)
+                .to_string()
+        };
+
+        let tc = cols(&["id", "ssn", "note"]);
+        let sc = cols(&["sid"]);
+        let n = names_with_policy(&tc, &sc, &policy);
+        let plan_merge = |sql: &str| {
+            let clauses = merge_clauses(sql);
+            let classified = classify_merge_clauses(&clauses, &n).unwrap();
+            build_merge_select(
+                &classified,
+                &n,
+                "datafusion.public.__merge_target_x",
+                "datafusion.public.__merge_source_x",
+                "__merge_target_x.id = __merge_source_x.sid",
+            )
+        };
+        let update = plan_merge(
+            "MERGE INTO tgt AS t USING src AS s ON t.id = s.sid \
+             WHEN MATCHED THEN UPDATE SET note = ssn",
+        );
+        assert!(
+            ctx.sql(&update).await.is_err(),
+            "without the mask-context view the merge must fail to plan, never fall back"
+        );
+
+        register_target_policy_view(&ctx, &n, "datafusion.public.__merge_target_x")
+            .await
+            .unwrap();
+        let batches = ctx.sql(&update).await.unwrap().collect().await.unwrap();
+        let mut rows: Vec<(i32, String, String)> = Vec::new();
+        for b in &batches {
+            let ids = arrow::compute::cast(b.column(0), &DataType::Int32).unwrap();
+            let ids = ids.as_any().downcast_ref::<Int32Array>().unwrap();
+            let ssn = arrow::compute::cast(b.column(1), &DataType::Utf8).unwrap();
+            let ssn = ssn.as_any().downcast_ref::<StringArray>().unwrap();
+            let note = arrow::compute::cast(b.column(2), &DataType::Utf8).unwrap();
+            let note = note.as_any().downcast_ref::<StringArray>().unwrap();
+            for i in 0..b.num_rows() {
+                rows.push((
+                    ids.value(i),
+                    ssn.value(i).to_string(),
+                    note.value(i).to_string(),
+                ));
+            }
+        }
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (1, "111".to_string(), keyed),
+                (2, "222".to_string(), "b".to_string()),
+            ],
+            "SET reads the keyed mask; stored ssn and unmatched rows are kept"
+        );
+
+        // The function stays out of the user's session, also inside a MERGE
+        // that reads the masked view and in a USING-style SELECT.
+        assert!(
+            !ctx.state()
+                .scalar_functions()
+                .contains_key(MASK_HASH_UDF_NAME),
+            "mask UDF leaked into the session"
+        );
+        let user_call = plan_merge(&format!(
+            "MERGE INTO tgt AS t USING src AS s ON t.id = s.sid \
+             WHEN MATCHED THEN UPDATE SET note = {MASK_HASH_UDF_NAME}(note)"
+        ));
+        assert!(
+            ctx.sql(&user_call).await.is_err(),
+            "user SET resolved the mask function"
+        );
+        assert!(
+            ctx.sql(&format!("SELECT {MASK_HASH_UDF_NAME}('111') AS sid"))
+                .await
+                .is_err(),
+            "a USING query resolved the mask function"
         );
     }
 
@@ -1351,7 +1574,7 @@ mod tests {
         assert_eq!(
             count(WritePolicyPredicates {
                 row_filter_sql: Some("region = 'EU'".to_string()),
-                column_mask_sqls: Default::default(),
+                ..Default::default()
             })
             .await,
             0,

@@ -591,21 +591,61 @@ fn augment_where_with_row_filter(
     }
 }
 
+/// FROM clause for the per-batch evaluator, plus the guard that deregisters
+/// the masked view behind it (if any) on drop.
+struct PolicyFrom {
+    sql: String,
+    _view: Option<MergeScratchCleanup>,
+}
+
 /// Build the FROM clause for the per-batch evaluator. With no policy this
 /// is the scratch table aliased to the target name. With column masks it
-/// wraps the scratch table in a subquery that projects each column either
-/// raw or masked, plus a [`policy_raw_alias`] raw alias for masked columns
-/// when `raw_alias_nonce` is set (the UPDATE path needs this for the
-/// CASE-ELSE branch).
-fn build_policy_from_clause(
+/// is a view over the scratch table that projects each column either raw or
+/// masked, plus a [`policy_raw_alias`] raw alias for masked columns when
+/// `raw_alias_nonce` is set (the UPDATE path needs this for the CASE-ELSE
+/// branch). The view is planned in the separate mask context
+/// ([`crate::policy_view`]) because a HASH mask calls the internal keyed
+/// function, which the session planning the user's WHERE / SET cannot
+/// resolve.
+async fn build_policy_from_clause(
+    ctx: &DFSessionContext,
     scratch_table: &str,
     orig_alias: &str,
     schema: &ArrowSchema,
     predicates: &sqe_policy::write_predicates::WritePolicyPredicates,
     raw_alias_nonce: Option<&str>,
-) -> String {
+) -> sqe_core::Result<PolicyFrom> {
+    let Some(select_sql) =
+        policy_projection_sql(scratch_table, schema, predicates, raw_alias_nonce)
+    else {
+        return Ok(PolicyFrom {
+            sql: format!("{scratch_table} AS \"{orig_alias}\""),
+            _view: None,
+        });
+    };
+    let view = format!(
+        "datafusion.public.{DML_SCRATCH_PREFIX}pol_{}",
+        Uuid::now_v7().simple()
+    );
+    // Guard first so a failed registration leaves nothing behind.
+    let cleanup = MergeScratchCleanup::new(ctx, vec![view.clone()]);
+    crate::policy_view::register_policy_view(ctx, &view, &select_sql, predicates).await?;
+    Ok(PolicyFrom {
+        sql: format!("{view} AS \"{orig_alias}\""),
+        _view: Some(cleanup),
+    })
+}
+
+/// The masking SELECT over the scratch table, or `None` without column
+/// masks. Only column names, the scratch name and policy text go in.
+fn policy_projection_sql(
+    scratch_table: &str,
+    schema: &ArrowSchema,
+    predicates: &sqe_policy::write_predicates::WritePolicyPredicates,
+    raw_alias_nonce: Option<&str>,
+) -> Option<String> {
     if predicates.column_mask_sqls.is_empty() {
-        return format!("{scratch_table} AS \"{orig_alias}\"");
+        return None;
     }
 
     let mut projections: Vec<String> = Vec::with_capacity(schema.fields().len() + 1);
@@ -625,7 +665,7 @@ fn build_policy_from_clause(
         }
     }
     let projection_sql = projections.join(", ");
-    format!("(SELECT {projection_sql} FROM {scratch_table}) AS \"{orig_alias}\"")
+    Some(format!("SELECT {projection_sql} FROM {scratch_table}"))
 }
 
 /// Best-effort cleanup of a partially-created CTAS table.
@@ -4128,6 +4168,10 @@ impl WriteHandler {
         };
         let classified = crate::merge_sql::classify_merge_clauses(clauses, &merge_names)?;
         let (matched_clauses, not_matched_clauses, by_source_clauses) = classified.counts();
+        // The masked target view is (re)registered per attempt below, over
+        // that attempt's target; this guard drops it with the statement.
+        let _policy_view_guard = crate::merge_sql::target_policy_view(&merge_names)
+            .map(|view| MergeScratchCleanup::new(ctx, vec![view]));
 
         // 501: the emptiness shortcut lives *after* classification. With an
         // empty source and no BY SOURCE clause nothing can change, so return
@@ -4216,6 +4260,7 @@ impl WriteHandler {
             empty_source_count_sql.as_deref(),
             cardinality_sql.as_ref(),
             with_check_sql.as_deref(),
+            &merge_names,
         );
         let outcome = self
             .commit_rewrite_with_retry(
@@ -4231,6 +4276,7 @@ impl WriteHandler {
                         empty_source_count_sql,
                         cardinality_sql,
                         with_check_sql,
+                        merge_names,
                     ) = borrowed;
                     async move {
                         let old_data_files = self.collect_data_files(&fresh_table).await?;
@@ -4255,6 +4301,14 @@ impl WriteHandler {
                                     "Failed to register target provider: {e}"
                                 ))
                             })?;
+                        // The masked target view captures the provider it is
+                        // planned against, so rebuild it over this attempt's.
+                        crate::merge_sql::register_target_policy_view(
+                            ctx,
+                            merge_names,
+                            qualified_target_ref,
+                        )
+                        .await?;
 
                         if let Some((pair_sql, matched_sql)) = cardinality_sql {
                             check_merge_cardinality(ctx, pair_sql, matched_sql).await?;
@@ -4944,7 +4998,11 @@ impl WriteHandler {
         };
         // Every per-clause query below reads the target through its policy
         // relation (admit verdict + masked columns) and the guarded ON, so a
-        // hidden target row is never matched, deleted or updated.
+        // hidden target row is never matched, deleted or updated. Masked
+        // columns come from a view planned in the separate mask context.
+        let _policy_view_guard = crate::merge_sql::target_policy_view(&merge_names)
+            .map(|view| MergeScratchCleanup::new(ctx, vec![view]));
+        crate::merge_sql::register_target_policy_view(ctx, &merge_names, &q_target).await?;
         let q_target_rel = format!(
             "{} AS {target_ref}",
             crate::merge_sql::target_relation(&merge_names, &q_target)
@@ -5243,6 +5301,7 @@ impl WriteHandler {
                 let row_filter_only = sqe_policy::write_predicates::WritePolicyPredicates {
                     row_filter_sql: target_policy.row_filter_sql.clone(),
                     column_mask_sqls: Default::default(),
+                    mask_udfs: Vec::new(),
                 };
                 stream = checked_stream(ctx, &table_ident, row_filter_only, stream);
             }
@@ -5824,13 +5883,16 @@ impl WriteHandler {
         let orig_name = table_ident.name();
 
         let augmented_where = augment_where_with_row_filter(where_sql, predicates);
-        let from_clause = build_policy_from_clause(
+        let policy_from = build_policy_from_clause(
+            ctx,
             scratch.qualified(),
             orig_name,
             &batch.schema(),
             predicates,
             None,
-        );
+        )
+        .await?;
+        let from_clause = &policy_from.sql;
 
         // Execute: SELECT <where_clause> AS __match FROM __sqe_dml_<uuid>
         // Alias the scratch table to the original target name (see apply_update
@@ -5900,13 +5962,16 @@ impl WriteHandler {
         let orig_name = table_ident.name();
 
         let augmented_where = augment_where_with_row_filter(where_sql, predicates);
-        let from_clause = build_policy_from_clause(
+        let policy_from = build_policy_from_clause(
+            ctx,
             scratch.qualified(),
             orig_name,
             &batch.schema(),
             predicates,
             None,
-        );
+        )
+        .await?;
+        let from_clause = &policy_from.sql;
 
         // Alias the scratch table to the original target name so correlated
         // subqueries inside WHERE can reference `tablename.col`.
@@ -6060,13 +6125,16 @@ impl WriteHandler {
         } else {
             format!(" {}{}", extra_joins.join(" "), in_subquery_joins)
         };
-        let from_clause = build_policy_from_clause(
+        let policy_from = build_policy_from_clause(
+            ctx,
             scratch.qualified(),
             orig_name,
             &batch.schema(),
             predicates,
             Some(&raw_nonce),
-        );
+        )
+        .await?;
+        let from_clause = &policy_from.sql;
         let select_sql = format!(
             "SELECT {cols} FROM {from_clause}{joins}",
             cols = columns.join(", "),
@@ -6105,6 +6173,7 @@ impl WriteHandler {
         let row_filter_only = sqe_policy::write_predicates::WritePolicyPredicates {
             row_filter_sql: predicates.row_filter_sql.clone(),
             column_mask_sqls: Default::default(),
+            mask_udfs: Vec::new(),
         };
         check_batch_within_policy(ctx, &updated, table_ident, &row_filter_only).await?;
         Ok(out)
@@ -9981,6 +10050,20 @@ s3_path_style = true
         TableIdent,
         DFSessionContext,
     ) {
+        employees_handler_with_keyed_policy(row_filter, masks, None).await
+    }
+
+    /// [`employees_handler_with_policy`] with a HASH-mask key.
+    async fn employees_handler_with_keyed_policy(
+        row_filter: Option<datafusion::logical_expr::Expr>,
+        masks: Vec<(&str, sqe_policy::MaskType)>,
+        mask_key: Option<Arc<Vec<u8>>>,
+    ) -> (
+        WriteHandler,
+        sqe_core::Session,
+        TableIdent,
+        DFSessionContext,
+    ) {
         use sqe_policy::plan_rewriter::PolicyPlanRewriter;
         use sqe_policy::policy_store::InMemoryPolicyStore;
         use sqe_policy::ResolvedPolicy;
@@ -9995,7 +10078,7 @@ s3_path_style = true
         }
         store.add_table_policy("default", "employees", pol).await;
         let enforcer: Arc<dyn sqe_policy::PolicyEnforcer> =
-            Arc::new(PolicyPlanRewriter::new(Arc::new(store)));
+            Arc::new(PolicyPlanRewriter::new(Arc::new(store)).with_mask_key(mask_key));
 
         let handler = WriteHandler::new(write_test_config()).with_policy_enforcer(enforcer);
         let session = sqe_core::Session::new(
@@ -10336,6 +10419,144 @@ s3_path_style = true
                 );
             }
         }
+    }
+
+    // A HASH mask calls the internal keyed function, which the user's session
+    // never registers. UPDATE and DELETE still plan (the masked relation comes
+    // from the separate mask context), read the keyed hash, keep the stored
+    // value of an unassigned masked column, and leave the function out of
+    // reach of user SQL.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dml_under_keyed_hash_mask_plans_without_exposing_mask_udf() {
+        use arrow_array::StringArray;
+        use sqe_policy::sha256_udf::{sha256_udf, user_sha256_udf, MASK_HASH_UDF_NAME};
+        use sqe_policy::MaskType;
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let key = Arc::new(b"mask-key".to_vec());
+        let (handler, session, table_ident, ctx) = employees_handler_with_keyed_policy(
+            None,
+            vec![("ssn", MaskType::Hash)],
+            Some(key.clone()),
+        )
+        .await;
+        let predicates = compute_predicates_for_employees(&handler, &session, &table_ident).await;
+
+        let hash_of = |udf: datafusion::logical_expr::ScalarUDF, v: &str| {
+            let v = v.to_string();
+            async move {
+                let c = DFSessionContext::new();
+                c.register_udf(udf.clone());
+                let b = c
+                    .sql(&format!("SELECT {}('{v}')", udf.name()))
+                    .await
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                let a =
+                    arrow::compute::cast(b[0].column(0), &arrow_schema::DataType::Utf8).unwrap();
+                a.as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0)
+                    .to_string()
+            }
+        };
+        let keyed = hash_of(sha256_udf(Some(key.clone())), "111-11").await;
+        let unkeyed = hash_of(user_sha256_udf(None), "111-11").await;
+        assert_ne!(keyed, unkeyed, "the mask must be the keyed hash");
+
+        let assignments = |sql: &str| match Parser::parse_sql(&GenericDialect {}, sql)
+            .unwrap()
+            .pop()
+            .unwrap()
+        {
+            sqlparser::ast::Statement::Update(update) => update.assignments,
+            _ => panic!("expected UPDATE"),
+        };
+        let batch = make_employee_batch();
+        let out = handler
+            .apply_update(
+                &ctx,
+                &session,
+                &batch,
+                &assignments("UPDATE employees SET region = ssn WHERE id = 1"),
+                "id = 1",
+                "",
+                &table_ident,
+                &predicates,
+            )
+            .await
+            .expect("UPDATE under a HASH mask must plan");
+        let column = |name: &str| {
+            out.column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .clone()
+        };
+        let (ssn, region) = (column("ssn"), column("region"));
+        assert_eq!(region.value(0), keyed, "SET reads the keyed mask");
+        assert_eq!(
+            (0..4).map(|i| ssn.value(i)).collect::<Vec<_>>(),
+            vec!["111-11", "222-22", "333-33", "444-44"],
+            "the unassigned masked column keeps its stored values"
+        );
+        assert_eq!(
+            (1..4).map(|i| region.value(i)).collect::<Vec<_>>(),
+            vec!["US", "EU", "US"],
+            "rows outside WHERE are unchanged"
+        );
+
+        // DELETE's WHERE reads the same keyed mask.
+        let matched = handler
+            .filter_batch_match(
+                &ctx,
+                &session,
+                &batch,
+                &format!("ssn = '{keyed}'"),
+                "",
+                &table_ident,
+                &predicates,
+            )
+            .await
+            .expect("DELETE under a HASH mask must plan");
+        assert_eq!(matched.true_count(), 1);
+
+        // The internal function stays out of the user's session.
+        assert!(
+            !ctx.state()
+                .scalar_functions()
+                .contains_key(MASK_HASH_UDF_NAME),
+            "mask UDF leaked into the session"
+        );
+        assert!(
+            ctx.sql(&format!("SELECT {MASK_HASH_UDF_NAME}('111-11')"))
+                .await
+                .is_err(),
+            "user SQL must not resolve the keyed mask function"
+        );
+        let res = handler
+            .apply_update(
+                &ctx,
+                &session,
+                &batch,
+                &assignments(&format!(
+                    "UPDATE employees SET region = {MASK_HASH_UDF_NAME}(region)"
+                )),
+                "TRUE",
+                "",
+                &table_ident,
+                &predicates,
+            )
+            .await;
+        assert!(
+            res.is_err(),
+            "user SET must not resolve the keyed mask function"
+        );
     }
 
     // WITH CHECK: an updated row must still satisfy the caller's row filter,
