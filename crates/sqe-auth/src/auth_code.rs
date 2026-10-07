@@ -160,8 +160,13 @@ impl AuthCodeService {
 
         let authorization_url = format!("{}?{}", auth_endpoint, query_string);
 
-        // auth_id is the client-only token-poll capability, not a log ID.
-        debug!("Starting Authorization Code + PKCE challenge");
+        // auth_id is the client-only token-poll capability, not a log ID; a
+        // prefix of the one-way `state` hash correlates the flow instead
+        // (the full `state` keys the initiate route, so it stays out too).
+        debug!(
+            state_prefix = &state[..12],
+            "Starting Authorization Code + PKCE challenge"
+        );
 
         Ok(AuthCodeChallenge {
             auth_id,

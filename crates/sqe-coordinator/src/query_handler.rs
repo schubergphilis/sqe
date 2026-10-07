@@ -205,6 +205,32 @@ fn is_sorted_write(kind: &StatementKind) -> bool {
     }
 }
 
+/// Table properties that are policy state rather than table configuration.
+/// `sqe.column-tags` is what SET/UNSET TAGS writes and it drives tag masks.
+/// Other `sqe.` keys stay owner-settable: `sqe.maintenance.*` is how a table
+/// owner opts into and tunes autonomous compaction.
+const POLICY_TABLE_PROPERTIES: &[&str] = &[crate::tag_source_impl::PROP_KEY];
+
+/// True when an `ALTER TABLE ... SET TBLPROPERTIES` writes a policy property
+/// (matched case-insensitively), which needs the same admin gate as SET/UNSET
+/// TAGS.
+fn sets_reserved_table_property(stmt: &Statement) -> bool {
+    let Statement::AlterTable(at) = stmt else {
+        return false;
+    };
+    at.operations.iter().any(|op| match op {
+        sqlparser::ast::AlterTableOperation::SetTblProperties { table_properties } => {
+            table_properties.iter().any(|p| match p {
+                sqlparser::ast::SqlOption::KeyValue { key, .. } => POLICY_TABLE_PROPERTIES
+                    .iter()
+                    .any(|reserved| key.value.eq_ignore_ascii_case(reserved)),
+                _ => false,
+            })
+        }
+        _ => false,
+    })
+}
+
 /// A compile-time firewall, not an extension point: keep it even with one impl.
 ///
 /// `ChannelObserver` owns an `mpsc::Sender<LineageMsg>`, and `LineageMsg`
@@ -414,7 +440,8 @@ impl QueryHandler {
             write_handler = write_handler.with_metrics(Arc::clone(m));
         }
         write_handler = write_handler.with_policy_enforcer(Arc::clone(&policy_enforcer));
-        let mut maintenance_handler = MaintenanceHandler::new(config.clone());
+        let mut maintenance_handler =
+            MaintenanceHandler::new(config.clone()).with_ticket_signer(Arc::clone(&ticket_signer));
         if let Some(ref a) = audit {
             maintenance_handler = maintenance_handler.with_audit(Arc::clone(a));
         }
@@ -649,6 +676,21 @@ impl QueryHandler {
         projector: std::sync::Arc<dyn sqe_policy::tag_projector::TagProjector>,
     ) -> Self {
         self.catalog_ops = self.catalog_ops.with_tag_projector(projector);
+        self
+    }
+
+    /// Replace the ticket signer with one shared by other components (the
+    /// maintenance scheduler's handler), so every request workers receive is
+    /// signed by the single key they pin via heartbeat.
+    #[must_use = "with_ticket_signer consumes self; bind the returned QueryHandler"]
+    pub fn with_ticket_signer(
+        mut self,
+        signer: Arc<sqe_core::ticket_signing::TicketSigner>,
+    ) -> Self {
+        self.maintenance_handler = self
+            .maintenance_handler
+            .with_ticket_signer(Arc::clone(&signer));
+        self.ticket_signer = signer;
         self
     }
 
@@ -1152,6 +1194,18 @@ impl QueryHandler {
         // the parsed statement so a window ORDER BY or a VIEW is not a hit.
         // Extra writers are rejected (ResourceExhausted), not queued.
         let _sorted_write_permit = self.try_acquire_sorted_write(&kind).map_err(failed)?;
+
+        // A SET TBLPROPERTIES that writes policy state (`sqe.column-tags`) is
+        // policy DDL, gated like SET/UNSET TAGS. It runs before the catalog
+        // preflight so a non-admin is refused on the privilege, whatever the
+        // catalog qualifier, and learns nothing about which catalogs exist.
+        if kind.statement().is_some_and(sets_reserved_table_property) {
+            self.require_admin(
+                session,
+                "ALTER TABLE ... SET TBLPROPERTIES on a policy property",
+            )
+            .map_err(failed)?;
+        }
 
         // Pre-flight: when a 3-part identifier names a catalog that the
         // coordinator has not registered, fail fast with a clear error
@@ -1692,6 +1746,8 @@ impl QueryHandler {
                     Ok(vec![])
                 }
                 StatementKind::AlterTableProps(stmt) => {
+                    // Policy-property writes were admin-gated before the
+                    // catalog preflight (`sets_reserved_table_property`).
                     self.catalog_ops.set_table_properties(session, stmt).await?;
                     crate::session_context::invalidate_session_cache(&session.user.username).await;
                     // Flush cached tag policies so a SET TBLPROPERTIES on sqe.column-tags

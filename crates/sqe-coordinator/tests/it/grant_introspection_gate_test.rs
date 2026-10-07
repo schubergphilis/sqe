@@ -359,6 +359,70 @@ async fn set_tags_requires_admin() {
 }
 
 #[tokio::test]
+async fn set_reserved_tblproperties_requires_admin() {
+    // `sqe.column-tags` is the same property SET TAGS writes, so writing it
+    // through SET TBLPROPERTIES needs the same gate. The gate runs before
+    // catalog resolution, so the unknown `cat` qualifier still yields 403.
+    let backend = Arc::new(RecordingBackend::default());
+    let store = Arc::new(RecordingStore::default());
+    let handler = make_handler(backend, store);
+    let session = session_for("alice", vec!["analyst"]);
+
+    let err = handler
+        .execute(
+            &session,
+            "ALTER TABLE cat.ns.tbl SET TBLPROPERTIES ('SQE.column-tags' = '{}')",
+            None,
+        )
+        .await
+        .expect_err("non-admin must not write reserved sqe. properties");
+    assert!(err.to_string().contains("403"), "expected 403: {err}");
+
+    // A non-reserved key is not admin-gated (it fails later, on the missing
+    // catalog, not on the admin gate).
+    let err = handler
+        .execute(
+            &session,
+            "ALTER TABLE cat.ns.tbl SET TBLPROPERTIES ('write.format.default' = 'parquet')",
+            None,
+        )
+        .await
+        .expect_err("no catalog is wired");
+    assert!(
+        !err.to_string().contains("requires one of admin roles"),
+        "unexpected admin gate: {err}"
+    );
+}
+
+#[tokio::test]
+async fn set_maintenance_tblproperties_stays_owner_settable() {
+    // Table owners opt into autonomous compaction with `sqe.maintenance.*`
+    // keys; only policy properties are admin-gated, not every `sqe.` key.
+    let backend = Arc::new(RecordingBackend::default());
+    let store = Arc::new(RecordingStore::default());
+    let handler = make_handler(backend, store);
+    let session = session_for("alice", vec!["analyst"]);
+
+    for sql in [
+        "ALTER TABLE cat.ns.tbl SET TBLPROPERTIES ('sqe.maintenance.enabled' = 'true')",
+        "ALTER TABLE cat.ns.tbl SET TBLPROPERTIES \
+         ('sqe.maintenance.compaction.min-input-files' = '8')",
+    ] {
+        // Gets past the gate, then fails on the missing catalog.
+        let err = handler
+            .execute(&session, sql, None)
+            .await
+            .expect_err("no catalog is wired");
+        let msg = err.to_string();
+        assert!(!msg.contains("403"), "unexpected 403 for {sql}: {msg}");
+        assert!(
+            msg.contains("unknown catalog"),
+            "expected catalog error for {sql}: {msg}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn check_access_self_is_allowed() {
     let backend = Arc::new(RecordingBackend::default());
     let store = Arc::new(RecordingStore::default());

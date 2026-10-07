@@ -642,6 +642,16 @@ pub trait TrinoAuthenticator: Send + Sync + 'static {
             "Bearer token authentication not configured".to_string(),
         ))
     }
+
+    /// Spend `peer_ip`'s pre-auth budget before an unauthenticated request
+    /// mints an OAuth2 external-auth challenge. Each challenge occupies a
+    /// slot in the bounded pending-auth store, so an ungated flood would
+    /// evict legitimate in-flight logins. A `ResourceExhausted` denial
+    /// becomes 429. The coordinator adapter routes this through the same
+    /// limiter as the provider chain; the default admits everything.
+    async fn admit_auth_challenge(&self, _peer_ip: &str) -> Result<(), sqe_core::SqeError> {
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -2305,6 +2315,15 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             }
             Err(AuthFailure::Missing) => {
                 if let Some(ref oauth2_state) = state.oauth2 {
+                    if let Err(e) = state.authenticator.admit_auth_challenge(&peer_host).await {
+                        if matches!(
+                            classify_auth_error(&e, "oauth2-challenge", &client_ip),
+                            AuthFailure::RateLimited
+                        ) {
+                            return rate_limited_response();
+                        }
+                        return error_response(StatusCode::UNAUTHORIZED, "authentication failed");
+                    }
                     return match crate::oauth2::generate_challenge(oauth2_state).await {
                         Ok((_auth_id, www_authenticate)) => (
                             StatusCode::UNAUTHORIZED,
@@ -5904,6 +5923,9 @@ mod tests {
             self.spend(peer_ip, &bearer_fingerprint(token))?;
             Err(sqe_core::SqeError::Auth("bad bearer".to_string()))
         }
+        async fn admit_auth_challenge(&self, peer_ip: &str) -> Result<(), sqe_core::SqeError> {
+            self.spend(peer_ip, "oauth2-challenge")
+        }
     }
 
     /// Counts how many times the provider chain was actually asked to
@@ -6058,6 +6080,59 @@ mod tests {
         assert_eq!(
             limiter.seen(),
             vec![("127.0.0.1".to_string(), "mallory".to_string()); 3]
+        );
+    }
+
+    /// An unauthenticated submit mints an OAuth2 challenge; each one spends
+    /// the peer's pre-auth budget, so a flood from one host is answered 429
+    /// before it can fill the bounded pending-auth store.
+    #[tokio::test]
+    async fn oauth2_challenge_creation_is_rate_limited_per_peer() {
+        use sqe_auth::auth_code::AuthCodeService;
+        use sqe_auth::oidc_discovery::{OidcDiscovery, OidcDiscoveryConfig};
+        use sqe_auth::pending_auth::PendingAuthStore;
+
+        let discovery = Arc::new(
+            OidcDiscovery::new(OidcDiscoveryConfig {
+                issuer: "http://127.0.0.1:1".to_string(),
+                authorization_endpoint_override: None,
+                token_endpoint_override: None,
+                accept_invalid_certs: false,
+            })
+            .unwrap(),
+        );
+        let limiter = BudgetAuth::new(1);
+        let mut state = Arc::into_inner(state_with(limiter.clone(), Arc::new(MockQuery))).unwrap();
+        state.oauth2 = Some(Arc::new(crate::oauth2::OAuth2State {
+            auth_code_service: Arc::new(AuthCodeService::new(
+                discovery,
+                "cid",
+                None,
+                "http://sqe/oauth2/callback",
+                vec![],
+            )),
+            pending_store: Arc::new(PendingAuthStore::new(std::time::Duration::from_secs(60))),
+            base_url: "http://sqe:8080".to_string(),
+        }));
+        let state = Arc::new(state);
+
+        let submit = || {
+            submit_query(
+                State(state.clone()),
+                test_peer(),
+                HeaderMap::new(),
+                "SELECT 1".to_string(),
+            )
+        };
+
+        // The first challenge is admitted (the unreachable IdP then fails it).
+        assert_ne!(submit().await.status(), StatusCode::TOO_MANY_REQUESTS);
+        let denied = submit().await;
+        assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(retry_after(&denied).as_deref(), Some("1"));
+        assert_eq!(
+            limiter.seen(),
+            vec![("127.0.0.1".to_string(), "oauth2-challenge".to_string()); 2]
         );
     }
 

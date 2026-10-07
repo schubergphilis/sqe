@@ -1035,6 +1035,9 @@ struct AuthenticatorAdapter {
     /// `None` (some unit-test fixtures), Basic auth falls back to the legacy
     /// `Authenticator`.
     bearer_provider: Option<Arc<dyn sqe_auth::AuthProvider>>,
+    /// The chain's pre-auth limiter, also spent on every OAuth2 challenge an
+    /// unauthenticated request mints, keyed `(peer, "oauth2-challenge")`.
+    auth_rate_limiter: Arc<sqe_coordinator::rate_limiter::AuthRateLimiter>,
 }
 
 /// The chain-level pre-auth limiter (#562) refuses with `RateLimited`; the
@@ -1104,6 +1107,12 @@ impl TrinoAuthenticator for AuthenticatorAdapter {
         // Fall back to the raw JWT as the catalog token when the provider did
         // not supply one (passthrough to Polaris).
         Ok(identity.into_session(Some(token)))
+    }
+
+    async fn admit_auth_challenge(&self, peer_ip: &str) -> Result<(), sqe_core::SqeError> {
+        self.auth_rate_limiter
+            .check(peer_ip, "oauth2-challenge")
+            .map_err(|_| trino_auth_error(sqe_auth::AuthError::RateLimited, ""))
     }
 }
 
@@ -1920,6 +1929,11 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
 
     let audit = Arc::new(audit_logger);
 
+    // Finding 601 / L4: one ticket-signing key for the whole coordinator.
+    // The query path and the scheduler's maintenance handler both sign
+    // worker requests with it, and workers pin only one key.
+    let ticket_signer = Arc::new(sqe_coordinator::load_ticket_signer(&config.coordinator));
+
     // Advisory/active auto-compaction scheduler (Phase 4a, Task 5). `Off`
     // mode (the default) constructs NOTHING here: neither the dedicated
     // maintenance service principal nor the `MaintenanceScheduler` value
@@ -1985,7 +1999,8 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
                 // (even when `distributed` is false) is safe: a registry with
                 // no seeded/heartbeat-discovered workers, or one whose health
                 // checks never started, reports `0` healthy either way.
-                .with_worker_registry(Arc::clone(&worker_registry));
+                .with_worker_registry(Arc::clone(&worker_registry))
+                .with_ticket_signer(Arc::clone(&ticket_signer));
         if config.maintenance.mode == sqe_core::config::MaintenanceMode::Active {
             let maintenance_runtime = sqe_coordinator::runtime::build_coordinator_runtime(
                 &config.coordinator,
@@ -2232,7 +2247,8 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         )?
         .with_table_cache(table_cache)
         .with_session_manager(session_manager.clone())
-        .with_hive_registries(hive_catalogs.clone(), hive_manifest_cache.clone()),
+        .with_hive_registries(hive_catalogs.clone(), hive_manifest_cache.clone())
+        .with_ticket_signer(ticket_signer),
     );
 
     // Spawn background memory metrics reporter (updates gauges every 1s for Grafana)
@@ -2345,6 +2361,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         let auth_adapter = Arc::new(AuthenticatorAdapter {
             authenticator: authenticator.clone(),
             bearer_provider: bearer_provider.clone(),
+            auth_rate_limiter: Arc::clone(&auth_rate_limiter),
         });
         let handler_adapter = Arc::new(QueryHandlerAdapter {
             handler: query_handler.clone(),
