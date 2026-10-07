@@ -52,12 +52,15 @@ scoped to that catalog can read it with the engine's credentials (see
 ```toml
 [coordinator]
 memory_pool = "greedy"        # default; do not switch to fair on the coordinator
+unspillable_headroom_percent = 20   # default; share spillable operators may not take
 memory_limit = "12GB"         # tune to ~40-50% of box RAM (example for a 32 GB host)
 spill_to_disk = true
 spill_dir = "/fast-nvme/sqe-spill"
 ```
 
-Greedy pool lets one large operator use the full budget until spill. Fair pool divides memory across every registered spillable consumer. Wide plans (TPC-DS class) register dozens of consumers and fail before spilling when fair is enabled. Workers use fair pool internally; that asymmetry is intentional.
+Greedy pool lets one large operator use the budget until spill. Fair pool divides memory across every registered spillable consumer. Wide plans (TPC-DS class) register dozens of consumers and fail before spilling when fair is enabled. Workers use fair pool internally; that asymmetry is intentional.
+
+`unspillable_headroom_percent` keeps the top share of the pool, and of each query's `query.max_query_memory`, for consumers that cannot spill: the scan's decode buffers, a sort's merge, hash-join builds. Spillable operators (hash aggregates, sorts, repartition buffers) are refused at that line and spill there. Without it a large aggregate fills the cap and the scan feeding it is refused first, failing a query that could have spilled; with the 20% default the same SF10 aggregate under a 2 GB cap completes. The cost is that a lone spillable operator spills a little earlier at a tight cap. `0` turns it off; valid values are 0 to 50. It applies to the greedy pool only.
 
 ### Observability
 
