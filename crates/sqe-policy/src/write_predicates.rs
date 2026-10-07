@@ -14,7 +14,11 @@
 //!   alias body is not a plain `Expr::Column` reference to the same name).
 //!
 //! Each `Expr` is unparsed to SQL text so the coordinator can splice it
-//! into the WHERE clause and the SET RHS.
+//! into the WHERE clause and the SET RHS. A HASH mask unparses to the
+//! internal keyed function, which no user session registers; the write path
+//! plans masked relations in a separate context with [`WritePolicyPredicates::mask_udfs`]
+//! registered and never splices mask text into SQL planned in the user's
+//! session.
 //!
 //! The probe scan carries the target's FULL dotted namespace as its schema,
 //! which is exactly what the SELECT planner puts in a `TableScan`'s
@@ -26,9 +30,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::Schema as ArrowSchema;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::TableReference;
 use datafusion::datasource::{provider_as_source, MemTable};
-use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder};
+use datafusion::logical_expr::expr_rewriter::unnormalize_col;
+use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, ScalarUDF};
 use datafusion::sql::unparser::expr_to_sql;
 
 use sqe_core::error::{SqeError, SqeErrorCode};
@@ -46,6 +52,12 @@ pub struct WritePolicyPredicates {
     /// SQL expression that should be substituted for a bare reference to
     /// that column in WHERE or SET RHS.
     pub column_mask_sqls: HashMap<String, String>,
+    /// Internal functions the mask SQL calls (the keyed HASH mask,
+    /// [`crate::sha256_udf::MASK_HASH_UDF_NAME`]). They are never registered
+    /// in a user session, so the write path plans the masked relation in a
+    /// separate context that has them and hands the user SQL only the
+    /// resulting relation. Each carries the key the rewriter applied.
+    pub mask_udfs: Vec<Arc<ScalarUDF>>,
 }
 
 impl WritePolicyPredicates {
@@ -104,6 +116,7 @@ pub fn unparse_predicates(rewritten: &LogicalPlan) -> sqe_core::Result<WritePoli
     };
     let mut row_filters: Vec<Expr> = Vec::new();
     let mut column_mask_sqls: HashMap<String, String> = HashMap::new();
+    let mut mask_udfs: Vec<Arc<ScalarUDF>> = Vec::new();
     let mut node = rewritten;
 
     loop {
@@ -133,7 +146,13 @@ pub fn unparse_predicates(rewritten: &LogicalPlan) -> sqe_core::Result<WritePoli
                     let sql = if is_null_literal(body) {
                         "NULL".to_string()
                     } else {
-                        expr_to_sql(body)
+                        collect_mask_udfs(body, &mut mask_udfs);
+                        // The rewriter's projection qualifies column refs with
+                        // the probe table (`employees.ssn`). The write path
+                        // evaluates a mask over the bare scratch relation, where
+                        // that qualifier does not resolve; the mask reads one
+                        // table, so the bare name is exact.
+                        expr_to_sql(&unnormalize_col(body.clone()))
                             .map_err(|e| unrenderable(format!("column mask on `{alias_name}`"), e))?
                             .to_string()
                     };
@@ -159,7 +178,25 @@ pub fn unparse_predicates(rewritten: &LogicalPlan) -> sqe_core::Result<WritePoli
     Ok(WritePolicyPredicates {
         row_filter_sql,
         column_mask_sqls,
+        mask_udfs,
     })
+}
+
+/// Collect the internal mask functions `expr` calls (the keyed HASH mask is
+/// wrapped in a CAST for non-string columns, hence the walk), once per name.
+fn collect_mask_udfs(expr: &Expr, out: &mut Vec<Arc<ScalarUDF>>) {
+    // The closure never fails; the walk result carries no information.
+    let _ = expr.apply(|e| {
+        if let Expr::ScalarFunction(f) = e {
+            let name = f.func.name();
+            if name == crate::sha256_udf::MASK_HASH_UDF_NAME
+                && !out.iter().any(|u| u.name() == name)
+            {
+                out.push(Arc::clone(&f.func));
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
 }
 
 /// `true` for a NULL literal of any type, or a CAST / TRY_CAST of one (the
@@ -415,5 +452,40 @@ mod tests {
         assert_eq!(summary.columns_masked, vec!["ssn".to_string()]);
         assert!(out.row_filter_sql.is_some());
         assert!(out.column_mask_sqls.contains_key("ssn"));
+    }
+
+    // A HASH mask renders as the internal keyed function, and the predicates
+    // carry that function (with its key) so the write path can plan the mask
+    // without registering it in the user's session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hash_mask_carries_internal_udf() {
+        use crate::sha256_udf::MASK_HASH_UDF_NAME;
+        let store = InMemoryPolicyStore::new();
+        let mut pol = ResolvedPolicy::default();
+        pol.column_masks.insert("ssn".to_string(), MaskType::Hash);
+        pol.column_masks
+            .insert("region".to_string(), MaskType::Redact("***".to_string()));
+        store.add_table_policy("default", "employees", pol).await;
+        let enf =
+            PolicyPlanRewriter::new(Arc::new(store)).with_mask_key(Some(Arc::new(b"k".to_vec())));
+
+        let (out, _) = extract_write_predicates(
+            &enf,
+            &user("alice"),
+            "default",
+            "employees",
+            employees_schema(),
+        )
+        .await
+        .unwrap();
+
+        let mask = out.column_mask_sqls.get("ssn").expect("ssn mask present");
+        assert!(mask.contains(MASK_HASH_UDF_NAME), "hash mask sql: {mask}");
+        assert!(
+            !mask.contains("employees."),
+            "the mask reads the bare scratch relation, so its columns are unqualified: {mask}"
+        );
+        let names: Vec<&str> = out.mask_udfs.iter().map(|u| u.name()).collect();
+        assert_eq!(names, vec![MASK_HASH_UDF_NAME]);
     }
 }
