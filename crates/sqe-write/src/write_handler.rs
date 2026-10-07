@@ -1645,6 +1645,10 @@ impl WriteHandler {
         } else {
             None
         };
+        if let Some(live) = &existing {
+            self.refuse_replace_under_policy(session, &table_ident, live, "CREATE OR REPLACE")
+                .await?;
+        }
 
         let staged_ident = match &existing {
             Some(live)
@@ -2021,6 +2025,10 @@ impl WriteHandler {
             .load_table(&table_ident)
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
+        if overwrite {
+            self.refuse_replace_under_policy(session, &table_ident, &table, "INSERT OVERWRITE")
+                .await?;
+        }
 
         let effective_sql = if explicit_columns.is_empty() {
             select_sql.to_string()
@@ -6152,6 +6160,42 @@ impl WriteHandler {
             .as_deref()
             .map(|enf| (enf, &session.user));
         lift_in_subqueries_enforced(where_sql, ctx, enforce).await
+    }
+
+    /// Refuse a statement that replaces `table`'s whole contents (INSERT
+    /// OVERWRITE, CREATE OR REPLACE ... AS SELECT) when a row filter governs
+    /// the caller on it. Follows the PostgreSQL RLS model: a whole-table
+    /// replace is a bulk delete, and a caller may only delete rows they can
+    /// see. Column masks and restrictions hide values, not rows, so they do
+    /// not block a replace (dbt's `table` materialization relies on this).
+    async fn refuse_replace_under_policy(
+        &self,
+        session: &Session,
+        table_ident: &TableIdent,
+        table: &IcebergTable,
+        what: &str,
+    ) -> sqe_core::Result<()> {
+        if self.policy_enforcer.is_none() {
+            return Ok(());
+        }
+        let schema = Arc::new(
+            iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema()).map_err(
+                |e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to derive target Arrow schema: {e}")),
+            )?,
+        );
+        let predicates = self
+            .compute_write_predicates(session, table_ident, schema, &mut None)
+            .await?;
+        if predicates.row_filter_sql.is_none() {
+            return Ok(());
+        }
+        Err(SqeError::with_code(
+            SqeErrorCode::AccessDenied,
+            format!(
+                "write to {table_ident} violates row-level security policy: \
+                 {what} would remove rows hidden from this user"
+            ),
+        ))
     }
 
     /// PostgreSQL RLS `WITH CHECK` for appends (#729): a caller whose SELECT
@@ -11765,6 +11809,102 @@ s3_path_style = true
                 "history kept and extended"
             );
             assert_eq!(rig.scan_id_v(&ident).await, vec![(7, s("z")), (8, s("y"))]);
+        }
+
+        /// A caller with a row filter on the target cannot replace its whole
+        /// contents (INSERT OVERWRITE / CREATE OR REPLACE ... AS SELECT):
+        /// that would remove rows the filter hides from them.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn overwrite_and_replace_refused_under_target_row_filter() {
+            use datafusion::logical_expr::{col, lit};
+            let rig = SqliteRig::new().await;
+            run_ctas(
+                &handler(&rig),
+                &rig,
+                "CREATE TABLE default.rf AS SELECT * FROM (VALUES (1, 'a'), (100, 'b')) AS s(id, v)",
+            )
+            .await;
+
+            let store = sqe_policy::policy_store::InMemoryPolicyStore::new();
+            let mut pol = sqe_policy::ResolvedPolicy::default();
+            pol.row_filters.push(col("id").lt(lit(50_i64)));
+            store.add_table_policy("default", "rf", pol).await;
+            let h = handler(&rig).with_policy_enforcer(Arc::new(
+                sqe_policy::plan_rewriter::PolicyPlanRewriter::new(Arc::new(store)),
+            ));
+
+            let err = run_insert(
+                &h,
+                &rig,
+                "INSERT OVERWRITE default.rf SELECT * FROM (VALUES (2, 'c')) AS s(id, v)",
+            )
+            .await
+            .expect_err("INSERT OVERWRITE under a row filter must be refused");
+            assert!(err.to_string().contains("row-level security"), "{err}");
+
+            let stmt = parse_one(
+                "CREATE OR REPLACE TABLE default.rf AS SELECT * FROM (VALUES (2, 'c')) AS s(id, v)",
+            );
+            let err = h
+                .handle_ctas_streaming(
+                    &rig.session(),
+                    &stmt,
+                    &DFSessionContext::new(),
+                    &ctas_select_sql(&stmt),
+                    &mut None,
+                    &mut None,
+                )
+                .await
+                .expect_err("CREATE OR REPLACE under a row filter must be refused");
+            assert!(err.to_string().contains("row-level security"), "{err}");
+
+            assert_eq!(
+                rig.scan_id_v(&rig.ident("rf")).await,
+                vec![(1, s("a")), (100, s("b"))],
+                "hidden row survives"
+            );
+        }
+
+        /// Masks and restrictions hide values, not rows: a caller with only a
+        /// column mask (no row filter) on the target may still replace its
+        /// whole contents, as dbt's `table` materialization does.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn overwrite_and_replace_allowed_under_mask_only() {
+            let rig = SqliteRig::new().await;
+            run_ctas(
+                &handler(&rig),
+                &rig,
+                "CREATE TABLE default.mk AS SELECT * FROM (VALUES (1, 'a'), (100, 'b')) AS s(id, v)",
+            )
+            .await;
+
+            let store = sqe_policy::policy_store::InMemoryPolicyStore::new();
+            let mut pol = sqe_policy::ResolvedPolicy::default();
+            pol.column_masks.insert(
+                "v".to_string(),
+                sqe_policy::MaskType::Redact("***".to_string()),
+            );
+            store.add_table_policy("default", "mk", pol).await;
+            let h = handler(&rig).with_policy_enforcer(Arc::new(
+                sqe_policy::plan_rewriter::PolicyPlanRewriter::new(Arc::new(store)),
+            ));
+
+            run_insert(
+                &h,
+                &rig,
+                "INSERT OVERWRITE default.mk SELECT * FROM (VALUES (2, 'c')) AS s(id, v)",
+            )
+            .await
+            .expect("INSERT OVERWRITE under a mask only must be allowed");
+            assert_eq!(rig.scan_id_v(&rig.ident("mk")).await, vec![(2, s("c"))]);
+
+            run_ctas(
+                &h,
+                &rig,
+                "CREATE OR REPLACE TABLE default.mk AS SELECT * FROM (VALUES (3, 'd')) AS s(id, v)",
+            )
+            .await;
+            assert_eq!(rig.scan_id_v(&rig.ident("mk")).await, vec![(3, s("d"))]);
         }
 
         /// 500: a different column set cannot be written into the live table,
