@@ -33,6 +33,10 @@ use sqlparser::ast::{
 /// It exists only inside the merge SELECT; the outer projection drops it.
 pub(crate) const MERGE_KEEP_COLUMN: &str = "__sqe_merge_keep";
 
+/// Synthetic boolean column marking rows some MERGE clause claimed; only in
+/// the WITH CHECK count query.
+const MERGE_CLAIMED_COLUMN: &str = "__sqe_merge_claimed";
+
 /// Naming context shared by classification and SELECT generation. The
 /// `*_ref` names are the per-invocation scratch table names the target and
 /// source relations are registered under; `t_alias`/`s_alias` are the
@@ -392,6 +396,26 @@ pub(crate) fn build_merge_select(
     qualified_source_ref: &str,
     on_rewritten: &str,
 ) -> String {
+    merge_select(
+        classified,
+        names,
+        qualified_target_ref,
+        qualified_source_ref,
+        on_rewritten,
+        None,
+    )
+}
+
+/// [`build_merge_select`], or with `with_check_row_filter` the
+/// [`build_merge_with_check_sql`] count over the same row classes.
+fn merge_select(
+    classified: &ClassifiedMerge<'_>,
+    names: &MergeNames<'_>,
+    qualified_target_ref: &str,
+    qualified_source_ref: &str,
+    on_rewritten: &str,
+    with_check_row_filter: Option<&str>,
+) -> String {
     let t_flag = present_flag(names.target_ref);
     let s_flag = present_flag(names.source_ref);
     let target_sentinel = format!("{}.\"{t_flag}\"", names.target_ref);
@@ -527,12 +551,53 @@ pub(crate) fn build_merge_select(
         keep_arms.join(" ")
     ));
 
-    let outer_projection = names
-        .target_columns
-        .iter()
-        .map(|c| format!("\"{c}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
+    // WITH CHECK variant: flag the rows some clause claimed (same first-match
+    // arms) and count the kept ones whose new values the caller's row filter
+    // rejects. Unclaimed rows pass through unchanged and are not checked.
+    let outer_projection = match with_check_row_filter {
+        Some(rf) => {
+            let claimed_arms: Vec<String> = classified
+                .matched
+                .iter()
+                .map(|c| case_arm(&matched_cond, c.predicate.as_deref(), "TRUE"))
+                .chain(
+                    classified
+                        .not_matched
+                        .iter()
+                        .map(|c| case_arm(&source_only_cond, c.predicate.as_deref(), "TRUE")),
+                )
+                .chain(
+                    classified
+                        .by_source
+                        .iter()
+                        .map(|c| case_arm(&target_only_cond, c.predicate.as_deref(), "TRUE")),
+                )
+                .collect();
+            let claimed = if claimed_arms.is_empty() {
+                "FALSE".to_string()
+            } else {
+                format!("CASE {} ELSE FALSE END", claimed_arms.join(" "))
+            };
+            inner_cols.push(format!("{claimed} AS {MERGE_CLAIMED_COLUMN}"));
+            (
+                "COUNT(*)".to_string(),
+                format!(
+                    "{MERGE_KEEP_COLUMN} AND {MERGE_CLAIMED_COLUMN} \
+                     AND NOT COALESCE(CAST(({rf}) AS BOOLEAN), FALSE)"
+                ),
+            )
+        }
+        None => (
+            names
+                .target_columns
+                .iter()
+                .map(|c| format!("\"{c}\""))
+                .collect::<Vec<_>>()
+                .join(", "),
+            MERGE_KEEP_COLUMN.to_string(),
+        ),
+    };
+    let (outer_projection, outer_filter) = outer_projection;
 
     // Wrap each side in a derived table that adds the presence flag, so match
     // class depends on the flag rather than a nullable user column. The derived
@@ -545,11 +610,33 @@ pub(crate) fn build_merge_select(
          FULL OUTER JOIN \
          (SELECT *, TRUE AS \"{s_flag}\" FROM {qualified_source_ref}) AS {} \
          ON {on_rewritten}) \
-         WHERE {MERGE_KEEP_COLUMN}",
+         WHERE {outer_filter}",
         inner_cols.join(", "),
         names.target_ref,
         names.source_ref,
     )
+}
+
+/// WITH CHECK for MERGE (as for INSERT, #729): a COUNT of the rows the
+/// statement inserts or updates whose new values fall outside the caller's
+/// row filter on the target, or `None` without a row filter. Non-zero means
+/// the statement must be refused.
+pub(crate) fn build_merge_with_check_sql(
+    classified: &ClassifiedMerge<'_>,
+    names: &MergeNames<'_>,
+    qualified_target_ref: &str,
+    qualified_source_ref: &str,
+    on_rewritten: &str,
+) -> Option<String> {
+    let rf = names.target_policy.row_filter_sql.as_deref()?;
+    Some(merge_select(
+        classified,
+        names,
+        qualified_target_ref,
+        qualified_source_ref,
+        on_rewritten,
+        Some(rf),
+    ))
 }
 
 /// Build the two COUNT queries used to detect a MERGE cardinality violation
@@ -932,6 +1019,51 @@ mod tests {
                 (3, "US".to_string(), 30)
             ],
             "hidden rows are neither matched nor claimed by NOT MATCHED BY SOURCE"
+        );
+
+        // WITH CHECK: rows a clause updates or inserts must stay inside the
+        // caller's row filter; unclaimed hidden rows are not checked.
+        let violations = |sql: &str| {
+            let ctx = ctx.clone();
+            let sql = sql.to_string();
+            async move {
+                let clauses = merge_clauses(&sql);
+                let tc = cols(&["id", "region", "amount"]);
+                let sc = cols(&["id"]);
+                let policy = eu_only();
+                let n = names_with_policy(&tc, &sc, &policy);
+                let classified = classify_merge_clauses(&clauses, &n).unwrap();
+                let check = build_merge_with_check_sql(
+                    &classified,
+                    &n,
+                    "datafusion.public.__merge_target_x",
+                    "datafusion.public.__merge_source_x",
+                    "__merge_target_x.id = __merge_source_x.id",
+                )
+                .expect("row filter present");
+                let b = ctx.sql(&check).await.unwrap().collect().await.unwrap();
+                let c = arrow::compute::cast(b[0].column(0), &DataType::Int64).unwrap();
+                c.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap().value(0)
+            }
+        };
+        assert_eq!(violations(update).await, 0, "in-filter update passes");
+        assert_eq!(
+            violations(
+                "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+                 WHEN MATCHED THEN UPDATE SET region = 'US'"
+            )
+            .await,
+            1,
+            "moving the visible EU row out of the filter is a violation"
+        );
+        assert_eq!(
+            violations(
+                "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+                 WHEN NOT MATCHED THEN INSERT (id, region, amount) VALUES (s.id, 'US', 0)"
+            )
+            .await,
+            1,
+            "inserting a row the caller could not see is a violation"
         );
     }
 
