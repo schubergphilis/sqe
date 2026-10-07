@@ -20,15 +20,23 @@
 //! `SessionCatalog::load_table` on the *session's* catalog, which carries the
 //! caller's own bearer token, so a Polaris principal without `loadTable` on
 //! the table gets the catalog's 403 and no metadata. The policy rewriter
-//! keys `TableScan`s by `scan.table_name`, which for a TVF is the function
-//! name (`table_files`), not the target table, so it is handed
-//! [`metadata_tvf_target_ident`] (`PolicyPlanRewriter::with_metadata_target`)
-//! and, on every path that enforces policy (queries, subqueries, CTAS/INSERT,
-//! EXPLAIN), refuses the statement as "table not found" when the policy
-//! store denies the caller all access to the target. Residual: row
-//! filters and column masks still do not reach this output, so partition
-//! values and bounds of a restricted or masked column remain visible to a
-//! caller who holds any privilege on the table.
+//! does not apply here: it keys `TableScan`s by `scan.table_name`, which for
+//! a TVF is the function name (`table_files`), not the target table. The
+//! coordinator therefore resolves the target via [`metadata_tvf_target_ident`]
+//! before the rewrite (`deny_hidden_metadata_tvf_targets` in
+//! `query_handler.rs`) and refuses the statement as "table not found" when the
+//! policy store denies the caller all access to the target.
+//!
+//! Column and row policy reach the output through a [`MetadataPolicy`] the
+//! coordinator attaches to `table_files` and `table_partitions`: it resolves
+//! the caller's effective policy on the target (column tags read from the
+//! loaded table's `sqe.column-tags` property). Per-column statistics
+//! (value/null counts, column sizes, lower/upper bounds) and partition values
+//! of a masked or restricted column are withheld. When a row filter applies,
+//! every column is treated as governed and record counts are NULL too, since
+//! all of them describe rows the caller cannot see. Residual: the snapshot
+//! summary and manifest row counts (`table_snapshots`, `table_manifests`)
+//! still carry whole-table totals.
 //!
 //! ## Removing block_in_place (issue #19)
 //!
@@ -53,6 +61,7 @@
 //! not implemented here and is documented as blocked on the upstream fork.
 //! Track progress at: <https://github.com/risingwavelabs/iceberg-rust>
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -68,9 +77,123 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion_expr::Expr;
 use iceberg::table::Table;
 use iceberg::{NamespaceIdent, TableIdent};
+use sqe_policy_api::ResolvedPolicy;
 use tracing::warn;
 
 use crate::rest_catalog::SessionCatalog;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Caller policy on the target table
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Table property holding the column -> tag-label JSON map (the same key the
+/// coordinator's tag source reads).
+const COLUMN_TAGS_PROP: &str = "sqe.column-tags";
+
+type PolicyFuture = futures::future::BoxFuture<'static, ResolvedPolicy>;
+type PolicyResolverFn = dyn Fn(String, String, HashMap<String, Vec<String>>) -> PolicyFuture + Send + Sync;
+
+/// Resolves the caller's effective policy on a metadata TVF's target table,
+/// given `(namespace, table, column tags)`. Built by the coordinator from its
+/// policy store; `sqe-catalog` cannot depend on `sqe-policy`.
+#[derive(Clone)]
+pub struct MetadataPolicy(Arc<PolicyResolverFn>);
+
+impl MetadataPolicy {
+    pub fn new<F>(resolve: F) -> Self
+    where
+        F: Fn(String, String, HashMap<String, Vec<String>>) -> PolicyFuture
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self(Arc::new(resolve))
+    }
+}
+
+impl std::fmt::Debug for MetadataPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MetadataPolicy")
+    }
+}
+
+/// The caller's policy flattened to what the statistics output needs, so no
+/// `Expr` is held across an await.
+#[derive(Debug, Default)]
+struct StatsGovernance {
+    /// A row filter applies (or the tag state is unreadable): every column's
+    /// statistics describe rows the caller may not see.
+    all: bool,
+    /// Lowercased names of masked or restricted columns.
+    columns: HashSet<String>,
+}
+
+impl StatsGovernance {
+    fn from_policy(policy: &ResolvedPolicy) -> Self {
+        Self {
+            all: !policy.row_filters.is_empty(),
+            columns: policy
+                .column_masks
+                .keys()
+                .chain(&policy.restricted_columns)
+                .map(|c| c.to_lowercase())
+                .collect(),
+        }
+    }
+
+    /// Whether the statistics of the field named `name` (the schema's full
+    /// dotted name) must be withheld. A nested field is governed by its
+    /// top-level column; a field the current schema no longer names is
+    /// withheld whenever any governance applies.
+    fn governs(&self, name: Option<&str>) -> bool {
+        if self.all {
+            return true;
+        }
+        if self.columns.is_empty() {
+            return false;
+        }
+        match name {
+            Some(name) => {
+                let name = name.to_lowercase();
+                let top = name.split('.').next().unwrap_or(&name);
+                self.columns.contains(&name) || self.columns.contains(top)
+            }
+            None => true,
+        }
+    }
+}
+
+/// Resolve the caller's governance on `table`. No policy = passthrough. An
+/// unreadable `sqe.column-tags` property withholds everything (fail closed,
+/// as the rewriter does for an unknown tag state).
+async fn resolve_governance(
+    policy: Option<&MetadataPolicy>,
+    ident: &TableIdent,
+    table: &Table,
+) -> StatsGovernance {
+    let Some(policy) = policy else {
+        return StatsGovernance::default();
+    };
+    let col_tags = match table.metadata().properties().get(COLUMN_TAGS_PROP) {
+        None => HashMap::new(),
+        Some(raw) => match serde_json::from_str::<HashMap<String, Vec<String>>>(raw) {
+            Ok(tags) => tags,
+            Err(_) => {
+                return StatsGovernance {
+                    all: true,
+                    columns: HashSet::new(),
+                }
+            }
+        },
+    };
+    let resolved = (policy.0)(
+        ident.namespace().as_ref().join("."),
+        ident.name().to_string(),
+        col_tags,
+    )
+    .await;
+    StatsGovernance::from_policy(&resolved)
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Lazy provider — async load deferred to scan() so the TVF dispatch is sync.
@@ -109,6 +232,8 @@ struct IcebergMetadataProvider {
     catalog: Arc<SessionCatalog>,
     ident: TableIdent,
     kind: MetadataKind,
+    /// The caller's policy on `ident`; `None` = passthrough.
+    policy: Option<MetadataPolicy>,
 }
 
 #[async_trait]
@@ -155,8 +280,16 @@ impl TableProvider for IcebergMetadataProvider {
                 MetadataKind::Snapshots => build_snapshots_batch(&table, &self.schema)?,
                 MetadataKind::Manifests => build_manifests_batch(&table, &self.schema).await?,
                 MetadataKind::History => build_history_batch(&table, &self.schema)?,
-                MetadataKind::Files => build_files_batch(&table, &self.schema).await?,
-                MetadataKind::Partitions => build_partitions_batch(&table, &self.schema).await?,
+                MetadataKind::Files => {
+                    let gov =
+                        resolve_governance(self.policy.as_ref(), &self.ident, &table).await;
+                    build_files_batch(&table, &self.schema, &gov).await?
+                }
+                MetadataKind::Partitions => {
+                    let gov =
+                        resolve_governance(self.policy.as_ref(), &self.ident, &table).await;
+                    build_partitions_batch(&table, &self.schema, &gov).await?
+                }
                 MetadataKind::Refs => build_refs_batch(&table, &self.schema)?,
             };
 
@@ -272,6 +405,7 @@ impl TableFunctionImpl for TableSnapshotsFunction {
             catalog: Arc::clone(&self.session_catalog),
             ident: ident_for(&namespace, &table_name),
             kind: MetadataKind::Snapshots,
+            policy: None,
         }))
     }
 }
@@ -381,6 +515,7 @@ impl TableFunctionImpl for TableManifestsFunction {
             catalog: Arc::clone(&self.session_catalog),
             ident: ident_for(&namespace, &table_name),
             kind: MetadataKind::Manifests,
+            policy: None,
         }))
     }
 }
@@ -503,6 +638,7 @@ impl TableFunctionImpl for TableHistoryFunction {
             catalog: Arc::clone(&self.session_catalog),
             ident: ident_for(&namespace, &table_name),
             kind: MetadataKind::History,
+            policy: None,
         }))
     }
 }
@@ -568,7 +704,8 @@ fn files_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("file_path", DataType::Utf8, false),
         Field::new("file_format", DataType::Utf8, false),
-        Field::new("record_count", DataType::Int64, false),
+        // Nullable: withheld when a row filter governs the caller.
+        Field::new("record_count", DataType::Int64, true),
         Field::new("file_size_in_bytes", DataType::Int64, false),
         Field::new("column_sizes", DataType::Utf8, true),
         Field::new("value_counts", DataType::Utf8, true),
@@ -591,11 +728,21 @@ fn files_schema() -> Arc<Schema> {
 #[derive(Debug)]
 pub struct TableFilesFunction {
     session_catalog: Arc<SessionCatalog>,
+    policy: Option<MetadataPolicy>,
 }
 
 impl TableFilesFunction {
     pub fn new(session_catalog: Arc<SessionCatalog>) -> Self {
-        Self { session_catalog }
+        Self {
+            session_catalog,
+            policy: None,
+        }
+    }
+
+    /// Withhold statistics the caller's policy governs (see module doc).
+    pub fn with_policy(mut self, policy: Option<MetadataPolicy>) -> Self {
+        self.policy = policy;
+        self
     }
 }
 
@@ -607,6 +754,7 @@ impl TableFunctionImpl for TableFilesFunction {
             catalog: Arc::clone(&self.session_catalog),
             ident: ident_for(&namespace, &table_name),
             kind: MetadataKind::Files,
+            policy: self.policy.clone(),
         }))
     }
 }
@@ -615,37 +763,68 @@ fn u64_to_i64_saturating(v: u64) -> i64 {
     i64::try_from(v).unwrap_or(i64::MAX)
 }
 
-/// Serialize a `HashMap<i32, u64>` to a compact JSON string like `{"1":100,"2":200}`.
-fn int_map_to_json(map: &std::collections::HashMap<i32, u64>) -> String {
-    if map.is_empty() {
-        return "{}".to_string();
-    }
+/// Serialize a `HashMap<i32, u64>` to a compact JSON string like
+/// `{"1":100,"2":200}`, keeping only the field ids `keep` accepts.
+fn int_map_to_json(map: &HashMap<i32, u64>, keep: impl Fn(i32) -> bool) -> String {
     let pairs: Vec<String> = map
         .iter()
+        .filter(|(k, _)| keep(**k))
         .map(|(k, v)| format!("\"{}\":{}", k, v))
         .collect();
     format!("{{{}}}", pairs.join(","))
 }
 
-/// Serialise a `{field_id: Datum}` bound map to a JSON object. Datum's Display
-/// renders numbers bare and strings quoted, so each value is already a valid
-/// JSON value. Keys are sorted for deterministic output.
-fn bounds_map_to_json(map: &std::collections::HashMap<i32, iceberg::spec::Datum>) -> String {
-    if map.is_empty() {
-        return "{}".to_string();
-    }
+/// Serialise a `{field_id: Datum}` bound map to a JSON object, keeping only
+/// the field ids `keep` accepts. Datum's Display renders numbers bare and
+/// strings quoted, so each value is already a valid JSON value. Keys are
+/// sorted for deterministic output.
+fn bounds_map_to_json(
+    map: &HashMap<i32, iceberg::spec::Datum>,
+    keep: impl Fn(i32) -> bool,
+) -> String {
     let mut pairs: Vec<String> = map
         .iter()
+        .filter(|(k, _)| keep(**k))
         .map(|(k, v)| format!("\"{}\":{}", k, v))
         .collect();
     pairs.sort();
     format!("{{{}}}", pairs.join(","))
 }
 
-async fn build_files_batch(table: &Table, schema: &SchemaRef) -> DFResult<RecordBatch> {
+/// Render a data file's partition tuple as `[v1,v2,...]`, with the value of
+/// every partition field whose source column `gov` governs shown as `null`.
+fn partition_key(table: &Table, df: &iceberg::spec::DataFile, gov: &StatsGovernance) -> String {
+    let metadata = table.metadata();
+    let schema = metadata.current_schema();
+    let spec = metadata.partition_spec_by_id(df.partition_spec_id());
+    let parts: Vec<String> = df
+        .partition()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let source = spec
+                .and_then(|s| s.fields().get(i))
+                .and_then(|pf| schema.name_by_field_id(pf.source_id));
+            if gov.governs(source) {
+                return "null".to_string();
+            }
+            f.as_ref().map_or("null".to_string(), |v| format!("{v:?}"))
+        })
+        .collect();
+    format!("[{}]", parts.join(","))
+}
+
+async fn build_files_batch(
+    table: &Table,
+    schema: &SchemaRef,
+    gov: &StatsGovernance,
+) -> DFResult<RecordBatch> {
     use iceberg::spec::{DataContentType, ManifestStatus};
 
     let metadata = table.metadata();
+    let table_schema = metadata.current_schema();
+    let keep = |field_id: i32| !gov.governs(table_schema.name_by_field_id(field_id));
 
     let mut file_path_b = StringBuilder::new();
     let mut file_format_b = StringBuilder::new();
@@ -675,29 +854,28 @@ async fn build_files_batch(table: &Table, schema: &SchemaRef) -> DFResult<Record
 
                                 file_path_b.append_value(df.file_path());
                                 file_format_b.append_value(format!("{:?}", df.file_format()));
-                                record_count_b
-                                    .append_value(u64_to_i64_saturating(df.record_count()));
+                                if gov.all {
+                                    record_count_b.append_null();
+                                } else {
+                                    record_count_b
+                                        .append_value(u64_to_i64_saturating(df.record_count()));
+                                }
                                 file_size_b
                                     .append_value(u64_to_i64_saturating(df.file_size_in_bytes()));
 
-                                column_sizes_b.append_value(int_map_to_json(df.column_sizes()));
-                                value_counts_b.append_value(int_map_to_json(df.value_counts()));
+                                column_sizes_b
+                                    .append_value(int_map_to_json(df.column_sizes(), keep));
+                                value_counts_b
+                                    .append_value(int_map_to_json(df.value_counts(), keep));
                                 null_value_counts_b
-                                    .append_value(int_map_to_json(df.null_value_counts()));
+                                    .append_value(int_map_to_json(df.null_value_counts(), keep));
 
-                                // Represent partition as a simple string of field values
-                                let parts: Vec<String> = df
-                                    .partition()
-                                    .fields()
-                                    .iter()
-                                    .map(|f| {
-                                        f.as_ref().map_or("null".to_string(), |v| format!("{v:?}"))
-                                    })
-                                    .collect();
-                                partition_b.append_value(format!("[{}]", parts.join(",")));
+                                partition_b.append_value(partition_key(table, df, gov));
 
-                                lower_bounds_b.append_value(bounds_map_to_json(df.lower_bounds()));
-                                upper_bounds_b.append_value(bounds_map_to_json(df.upper_bounds()));
+                                lower_bounds_b
+                                    .append_value(bounds_map_to_json(df.lower_bounds(), keep));
+                                upper_bounds_b
+                                    .append_value(bounds_map_to_json(df.upper_bounds(), keep));
                             }
                         }
                         Err(e) => {
@@ -747,7 +925,8 @@ async fn build_files_batch(table: &Table, schema: &SchemaRef) -> DFResult<Record
 fn partitions_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("partition", DataType::Utf8, false),
-        Field::new("record_count", DataType::Int64, false),
+        // Nullable: withheld when a row filter governs the caller.
+        Field::new("record_count", DataType::Int64, true),
         Field::new("file_count", DataType::Int64, false),
         Field::new("total_size", DataType::Int64, false),
     ]))
@@ -760,11 +939,22 @@ fn partitions_schema() -> Arc<Schema> {
 #[derive(Debug)]
 pub struct TablePartitionsFunction {
     session_catalog: Arc<SessionCatalog>,
+    policy: Option<MetadataPolicy>,
 }
 
 impl TablePartitionsFunction {
     pub fn new(session_catalog: Arc<SessionCatalog>) -> Self {
-        Self { session_catalog }
+        Self {
+            session_catalog,
+            policy: None,
+        }
+    }
+
+    /// Withhold partition values and counts the caller's policy governs
+    /// (see module doc).
+    pub fn with_policy(mut self, policy: Option<MetadataPolicy>) -> Self {
+        self.policy = policy;
+        self
     }
 }
 
@@ -776,11 +966,16 @@ impl TableFunctionImpl for TablePartitionsFunction {
             catalog: Arc::clone(&self.session_catalog),
             ident: ident_for(&namespace, &table_name),
             kind: MetadataKind::Partitions,
+            policy: self.policy.clone(),
         }))
     }
 }
 
-async fn build_partitions_batch(table: &Table, schema: &SchemaRef) -> DFResult<RecordBatch> {
+async fn build_partitions_batch(
+    table: &Table,
+    schema: &SchemaRef,
+    gov: &StatsGovernance,
+) -> DFResult<RecordBatch> {
     use iceberg::spec::{DataContentType, ManifestStatus};
 
     let metadata = table.metadata();
@@ -804,18 +999,9 @@ async fn build_partitions_batch(table: &Table, schema: &SchemaRef) -> DFResult<R
                                     continue;
                                 }
 
-                                let parts: Vec<String> = df
-                                    .partition()
-                                    .fields()
-                                    .iter()
-                                    .map(|f| {
-                                        f.as_ref().map_or("null".to_string(), |v| format!("{v:?}"))
-                                    })
-                                    .collect();
-                                let partition_key = format!("[{}]", parts.join(","));
-
-                                let entry_stats =
-                                    partition_stats.entry(partition_key).or_insert((0, 0, 0));
+                                let entry_stats = partition_stats
+                                    .entry(partition_key(table, df, gov))
+                                    .or_insert((0, 0, 0));
                                 entry_stats.0 = entry_stats
                                     .0
                                     .saturating_add(u64_to_i64_saturating(df.record_count()));
@@ -852,7 +1038,11 @@ async fn build_partitions_batch(table: &Table, schema: &SchemaRef) -> DFResult<R
 
     for (key, (records, files, size)) in &partition_stats {
         partition_b.append_value(key);
-        record_count_b.append_value(*records);
+        if gov.all {
+            record_count_b.append_null();
+        } else {
+            record_count_b.append_value(*records);
+        }
         file_count_b.append_value(*files);
         total_size_b.append_value(*size);
     }
@@ -909,6 +1099,7 @@ impl TableFunctionImpl for TableRefsFunction {
             catalog: Arc::clone(&self.session_catalog),
             ident: ident_for(&namespace, &table_name),
             kind: MetadataKind::Refs,
+            policy: None,
         }))
     }
 }
@@ -1119,6 +1310,88 @@ mod tests {
                 "manifests column {i} must be nullable"
             );
         }
+    }
+
+    // ── policy governance of per-column statistics ───────────────────────────
+
+    fn governed_schema() -> iceberg::spec::Schema {
+        use iceberg::spec::{NestedField, PrimitiveType, StructType, Type};
+        iceberg::spec::Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long))),
+                Arc::new(NestedField::optional(2, "ssn", Type::Primitive(PrimitiveType::String))),
+                Arc::new(NestedField::optional(
+                    3,
+                    "addr",
+                    Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+                        4,
+                        "city",
+                        Type::Primitive(PrimitiveType::String),
+                    ))])),
+                )),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    fn bounds() -> HashMap<i32, iceberg::spec::Datum> {
+        use iceberg::spec::Datum;
+        HashMap::from([
+            (1, Datum::long(7)),
+            (2, Datum::string("123-45-6789")),
+            (4, Datum::string("Utrecht")),
+            (99, Datum::long(1)), // a dropped column's id
+        ])
+    }
+
+    fn rendered(gov: &StatsGovernance) -> String {
+        let schema = governed_schema();
+        bounds_map_to_json(&bounds(), |id| !gov.governs(schema.name_by_field_id(id)))
+    }
+
+    #[test]
+    fn test_no_policy_keeps_all_bounds() {
+        let gov = StatsGovernance::from_policy(&ResolvedPolicy::default());
+        let out = rendered(&gov);
+        assert!(out.contains("123-45-6789") && out.contains("Utrecht") && out.contains("\"99\""));
+        assert!(!gov.governs(None));
+    }
+
+    #[test]
+    fn test_masked_and_restricted_columns_withhold_bounds_and_counts() {
+        let mut policy = ResolvedPolicy::default();
+        policy
+            .column_masks
+            .insert("SSN".to_string(), sqe_policy_api::MaskType::Nullify);
+        policy.restricted_columns.push("addr".to_string());
+        let gov = StatsGovernance::from_policy(&policy);
+
+        let out = rendered(&gov);
+        assert_eq!(out, "{\"1\":7}", "masked, restricted (nested) and unknown ids withheld");
+
+        let schema = governed_schema();
+        let counts = HashMap::from([(1, 10u64), (2, 10), (4, 3)]);
+        let out = int_map_to_json(&counts, |id| !gov.governs(schema.name_by_field_id(id)));
+        assert_eq!(out, "{\"1\":10}");
+        assert!(!gov.all);
+    }
+
+    #[test]
+    fn test_row_filter_withholds_every_column() {
+        let mut policy = ResolvedPolicy::default();
+        policy
+            .row_filters
+            .push(datafusion::logical_expr::col("region").eq(datafusion::logical_expr::lit("NL")));
+        let gov = StatsGovernance::from_policy(&policy);
+        assert!(gov.all);
+        assert_eq!(rendered(&gov), "{}");
+        assert!(gov.governs(Some("id")));
+    }
+
+    #[test]
+    fn test_record_count_nullable_for_row_filtered_callers() {
+        assert!(files_schema().field_with_name("record_count").unwrap().is_nullable());
+        assert!(partitions_schema().field_with_name("record_count").unwrap().is_nullable());
     }
 
     // ── summary JSON serialisation ────────────────────────────────────────────
