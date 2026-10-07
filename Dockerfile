@@ -22,6 +22,9 @@ FROM rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1
 
 ARG TARGETARCH
 ARG SCCACHE_VERSION=0.9.0
+# Upstream release .sha256 files for SCCACHE_VERSION; bump together.
+ARG SCCACHE_SHA256_X86_64=f29522f9aa70aa929b7e76b6d4a1286196b17668ea753e5687899a8f7e4b9d3e
+ARG SCCACHE_SHA256_AARCH64=d0122fbeda107eff00a6401d6e3085fd1e361813821a05bcd224fc1d7071ecdf
 
 COPY --from=cargo-chef-bin /usr/local/cargo/bin/cargo-chef /usr/local/cargo/bin/cargo-chef
 
@@ -32,14 +35,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake protobuf-compiler libprotobuf-dev libssl-dev pkg-config clang lld curl \
     && rm -rf /var/lib/apt/lists/* \
     && case "$TARGETARCH" in \
-         amd64) SCCACHE_ARCH=x86_64 ;; \
-         arm64) SCCACHE_ARCH=aarch64 ;; \
+         amd64) SCCACHE_ARCH=x86_64 SCCACHE_SHA256=$SCCACHE_SHA256_X86_64 ;; \
+         arm64) SCCACHE_ARCH=aarch64 SCCACHE_SHA256=$SCCACHE_SHA256_AARCH64 ;; \
          *) echo "unsupported arch: $TARGETARCH" >&2; exit 1 ;; \
        esac \
-    && curl -fsSL \
+    && curl -fsSL -o /tmp/sccache.tar.gz \
       "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz" \
-      | tar xz --strip-components=1 -C /usr/local/bin \
-        "sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl/sccache"
+    && echo "${SCCACHE_SHA256}  /tmp/sccache.tar.gz" | sha256sum -c - \
+    && tar xzf /tmp/sccache.tar.gz --strip-components=1 -C /usr/local/bin \
+        "sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl/sccache" \
+    && rm /tmp/sccache.tar.gz
 
 ENV RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=lld" \
     RUSTC_WRAPPER=sccache \

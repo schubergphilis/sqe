@@ -15,4 +15,4 @@ services:
       - ./queries.sql:/queries.sql:ro
     ports:
       # MCP uses the already-existing health/web port (prometheus_port + 1).
-      - "${SQE_MCP_PORT:-19091}:9091"
+      - "127.0.0.1:${SQE_MCP_PORT:-19091}:9091"

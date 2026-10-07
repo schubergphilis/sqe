@@ -27,8 +27,8 @@ services:
     volumes:
       - rustfs-data:/data
     ports:
-      - "${RUSTFS_PORT:-19100}:9000"
-      - "${RUSTFS_CONSOLE_PORT:-19101}:9001"
+      - "127.0.0.1:${RUSTFS_PORT:-19100}:9000"
+      - "127.0.0.1:${RUSTFS_CONSOLE_PORT:-19101}:9001"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health"]
       interval: 5s
@@ -92,8 +92,8 @@ services:
       - ./sqe.toml:/etc/sqe/sqe.toml:ro
       - ./queries.sql:/queries.sql:ro
     ports:
-      - "${SQE_FLIGHT_PORT:-60061}:50051"
-      - "${SQE_TRINO_PORT:-18081}:8080"
+      - "127.0.0.1:${SQE_FLIGHT_PORT:-60061}:50051"
+      - "127.0.0.1:${SQE_TRINO_PORT:-18081}:8080"
     healthcheck:
       test: ["CMD", "/usr/local/bin/wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9091/healthz"]
       interval: 10s

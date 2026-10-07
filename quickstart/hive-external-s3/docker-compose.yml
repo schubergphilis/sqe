@@ -18,7 +18,7 @@ services:
     volumes:
       - rustfs-data:/data
     ports:
-      - "${S3_PORT:-19100}:9000"
+      - "127.0.0.1:${S3_PORT:-19100}:9000"
 
 
   # S3 client for bootstrapping the bucket and uploading fixtures, for hosts
