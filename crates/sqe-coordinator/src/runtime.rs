@@ -43,7 +43,15 @@ use sqe_core::parse_memory_limit;
 /// every consumer at ~95 MB of an 8 GB pool and failing a partial aggregate
 /// that DataFusion 53 cannot emit early under a constant GROUP BY ordering
 /// key. Unknown values warn and fall back to greedy.
-fn build_memory_pool(kind: MemoryPoolKind, memory_bytes: usize) -> Arc<dyn MemoryPool> {
+///
+/// The greedy pool keeps `headroom_percent` of itself for non-spillable
+/// consumers ([`crate::memory_headroom`]); `fair` divides memory itself and
+/// is not wrapped.
+fn build_memory_pool(
+    kind: MemoryPoolKind,
+    memory_bytes: usize,
+    headroom_percent: u8,
+) -> Arc<dyn MemoryPool> {
     const TOP_CONSUMERS_IN_ERROR: usize = 5;
     let tracked_greedy = || {
         let pool = Arc::new(TrackConsumersPool::new(
@@ -57,7 +65,11 @@ fn build_memory_pool(kind: MemoryPoolKind, memory_bytes: usize) -> Arc<dyn Memor
     };
     match kind {
         MemoryPoolKind::Fair => Arc::new(FairSpillPool::new(memory_bytes)),
-        MemoryPoolKind::Greedy => tracked_greedy(),
+        MemoryPoolKind::Greedy => crate::memory_headroom::HeadroomPool::wrap(
+            tracked_greedy(),
+            memory_bytes,
+            headroom_percent,
+        ),
     }
 }
 
@@ -76,13 +88,18 @@ pub fn build_coordinator_runtime(
         memory_limit = %config.memory_limit,
         memory_bytes = memory_bytes,
         memory_pool = %config.memory_pool,
+        unspillable_headroom_percent = config.unspillable_headroom_percent,
         spill_to_disk = config.spill_to_disk,
         spill_dir = %config.spill_dir,
         spill_compression = %config.spill_compression,
         "Configuring coordinator DataFusion runtime"
     );
 
-    let memory_pool = build_memory_pool(config.memory_pool, memory_bytes);
+    let memory_pool = build_memory_pool(
+        config.memory_pool,
+        memory_bytes,
+        config.unspillable_headroom_percent,
+    );
 
     // V10 httpfs: wrap the default ObjectStoreRegistry so http(s) URLs in
     // file-format TVFs (read_csv / read_json / read_parquet) get a backing
@@ -175,12 +192,26 @@ mod tests {
         assert_eq!(config.memory_pool, MemoryPoolKind::Greedy);
 
         for kind in [MemoryPoolKind::Greedy, MemoryPoolKind::Fair] {
-            let pool = build_memory_pool(kind, 1024 * 1024 * 1024);
+            let pool = build_memory_pool(kind, 1024 * 1024 * 1024, 20);
             match pool.memory_limit() {
                 MemoryLimit::Finite(limit) => assert_eq!(limit, 1024 * 1024 * 1024),
                 _ => panic!("Expected Finite memory limit for kind {kind}"),
             }
         }
+        // The unspillable headroom wraps greedy only; fair divides the pool
+        // itself, and 0 leaves greedy unwrapped.
+        assert_eq!(
+            build_memory_pool(MemoryPoolKind::Greedy, 1 << 30, 20).name(),
+            "HeadroomPool"
+        );
+        assert_ne!(
+            build_memory_pool(MemoryPoolKind::Fair, 1 << 30, 20).name(),
+            "HeadroomPool"
+        );
+        assert_ne!(
+            build_memory_pool(MemoryPoolKind::Greedy, 1 << 30, 0).name(),
+            "HeadroomPool"
+        );
     }
 
     #[test]

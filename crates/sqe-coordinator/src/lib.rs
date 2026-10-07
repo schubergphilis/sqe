@@ -32,6 +32,7 @@ pub mod maintenance_log;
 pub mod maintenance_principal;
 pub mod maintenance_scheduler;
 pub mod memory;
+pub(crate) mod memory_headroom;
 pub(crate) mod query_memory;
 pub mod metrics_history;
 pub mod mode;

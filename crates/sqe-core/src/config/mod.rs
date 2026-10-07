@@ -807,6 +807,18 @@ pub struct CoordinatorConfig {
     ///   `query.per_user_memory_budget`.
     #[serde(default)]
     pub memory_pool: MemoryPoolKind,
+    /// Percent of `memory_limit`, and of each query's
+    /// `query.max_query_memory`, that spillable operators (hash aggregates,
+    /// sorts, repartition buffers, nested-loop joins) may not use. Only
+    /// non-spillable consumers (scan decode, sort merges, hash-join builds)
+    /// can draw on it. A spillable operator that reaches the line is refused
+    /// and spills, so a scan's next decode or a sort's merge finds room
+    /// instead of failing the query (#788). The cost: at a tight cap a lone
+    /// spillable operator spills at `100 - n` percent where it would have
+    /// fit. `0` turns it off. Greedy pool only; `fair` divides the pool
+    /// itself. Default 20, valid 0..=50.
+    #[serde(default = "default_unspillable_headroom_percent")]
+    pub unspillable_headroom_percent: u8,
     /// Enable spill-to-disk when memory limit is reached. Default: true.
     #[serde(default = "default_true")]
     pub spill_to_disk: bool,
@@ -5486,6 +5498,9 @@ fn default_star_schema_min_ratio() -> usize {
 fn default_coordinator_memory() -> String {
     "8GB".to_string()
 }
+fn default_unspillable_headroom_percent() -> u8 {
+    20
+}
 fn default_spill_compression() -> FlightCompression {
     FlightCompression::Lz4
 }
@@ -6593,6 +6608,12 @@ fn validate_memory_budget_invariants(config: &SqeConfig, errors: &mut Vec<String
 /// startup so `coordinator.memory_limit = "8X"` fails at config-load
 /// instead of two seconds into the first query (issue #116).
 fn validate_byte_sizes(config: &SqeConfig, errors: &mut Vec<String>) {
+    if config.coordinator.unspillable_headroom_percent > 50 {
+        errors.push(format!(
+            "coordinator.unspillable_headroom_percent = {}: must be 0..=50",
+            config.coordinator.unspillable_headroom_percent
+        ));
+    }
     let mut check = |field: &str, value: &str| {
         if value.is_empty() {
             return;
@@ -7520,6 +7541,7 @@ partial_progress_batch = 5
                 distributed_credentials: DistributedCredentialMode::Auto,
                 memory_limit: default_coordinator_memory(),
                 memory_pool: MemoryPoolKind::Greedy,
+                unspillable_headroom_percent: default_unspillable_headroom_percent(),
                 spill_to_disk: true,
                 spill_dir: default_coordinator_spill_dir(),
                 spill_compression: default_spill_compression(),

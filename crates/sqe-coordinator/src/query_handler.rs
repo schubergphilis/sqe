@@ -283,6 +283,10 @@ pub struct QueryHandler {
     /// Cached parse of `config.query.max_query_memory`. Used as the
     /// per-query reservation increment against the per-user budget.
     per_query_memory_bytes: usize,
+    /// Share of each query's cap kept for non-spillable consumers
+    /// (`coordinator.unspillable_headroom_percent`); 0 under the fair pool,
+    /// which divides memory itself.
+    unspillable_headroom_percent: u8,
     /// Cached parse of `config.query.query_profile`. Parsed once at startup
     /// so an unknown value warns once, not per query.
     profile_mode: sqe_core::ProfileMode,
@@ -487,6 +491,13 @@ impl QueryHandler {
                 ))
             })? as usize
         };
+        // The fair pool divides memory itself; the headroom applies to greedy.
+        let unspillable_headroom_percent = match config.coordinator.memory_pool {
+            sqe_core::config::MemoryPoolKind::Greedy => {
+                config.coordinator.unspillable_headroom_percent
+            }
+            sqe_core::config::MemoryPoolKind::Fair => 0,
+        };
         let per_query_memory_bytes = if config.query.max_query_memory == "0" {
             0
         } else {
@@ -529,6 +540,7 @@ impl QueryHandler {
             per_user_memory: Arc::new(crate::memory::PerUserMemoryRegistry::new()),
             per_user_memory_budget_bytes,
             per_query_memory_bytes,
+            unspillable_headroom_percent,
             profile_mode,
             runtime,
             table_cache: None,
@@ -3277,7 +3289,11 @@ impl QueryHandler {
         start: std::time::Instant,
     ) -> sqe_core::Result<OpenStreamResult> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
-        let ctx = crate::query_memory::with_query_limit(ctx, self.per_query_memory_bytes);
+        let ctx = crate::query_memory::with_query_limit(
+            ctx,
+            self.per_query_memory_bytes,
+            self.unspillable_headroom_percent,
+        );
 
         // Every recursive phase (SQL planning, the policy rewrite, the
         // optimizer, physical planning, the post-planning rules) runs on the
@@ -3736,7 +3752,11 @@ impl QueryHandler {
         summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
-        let ctx = crate::query_memory::with_query_limit(ctx, self.per_query_memory_bytes);
+        let ctx = crate::query_memory::with_query_limit(
+            ctx,
+            self.per_query_memory_bytes,
+            self.unspillable_headroom_percent,
+        );
 
         self.refresh_listing_snapshots(&ctx, &session_catalog, session, sql)
             .await;

@@ -5,9 +5,9 @@
 //! MemoryPool contract's infallible `grow` are not a process RSS limit.
 
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use crate::memory_headroom::HeadroomBudget;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::memory_pool::{
     MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
@@ -19,7 +19,9 @@ use datafusion::prelude::SessionContext;
 struct QueryMemoryPool {
     shared: Arc<dyn MemoryPool>,
     limit: usize,
-    used: AtomicUsize,
+    /// `limit`, with the share only non-spillable consumers may use
+    /// (`coordinator.unspillable_headroom_percent`).
+    budget: HeadroomBudget,
 }
 
 impl fmt::Display for QueryMemoryPool {
@@ -44,35 +46,27 @@ impl MemoryPool for QueryMemoryPool {
     fn grow(&self, reservation: &MemoryReservation, additional: usize) {
         // DataFusion requires this method to succeed; operators requiring
         // admission must use try_grow. Still account these bytes in both pools.
-        self.used.fetch_add(additional, Ordering::AcqRel);
+        self.budget.charge(reservation.consumer(), additional);
         self.shared.grow(reservation, additional);
     }
 
     fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
         self.shared.shrink(reservation, shrink);
-        self.used.fetch_sub(shrink, Ordering::AcqRel);
+        self.budget.release(reservation.consumer(), shrink);
     }
 
     fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> Result<()> {
-        self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(additional).filter(|next| *next <= self.limit)
-            })
-            .map_err(|used| {
-                DataFusionError::ResourcesExhausted(format!(
-                    "query.max_query_memory={} bytes: {} requests {} additional bytes with {} already reserved",
-                    self.limit, reservation.consumer().name(), additional, used
-                ))
-            })?;
+        self.budget
+            .try_charge(reservation.consumer(), additional, "query.max_query_memory")?;
         if let Err(error) = self.shared.try_grow(reservation, additional) {
-            self.used.fetch_sub(additional, Ordering::AcqRel);
+            self.budget.release(reservation.consumer(), additional);
             return Err(error);
         }
         Ok(())
     }
 
     fn reserved(&self) -> usize {
-        self.used.load(Ordering::Acquire)
+        self.budget.charged()
     }
 
     fn memory_limit(&self) -> MemoryLimit {
@@ -95,7 +89,13 @@ pub(crate) fn execution_error(error: &DataFusionError) -> sqe_core::SqeError {
 
 /// Clone session state for one execution, preserving catalogs, object stores,
 /// caches and the disk manager. Cached sessions must never share query quotas.
-pub(crate) fn with_query_limit(ctx: SessionContext, limit: usize) -> SessionContext {
+/// `headroom_percent` of `limit` is kept for non-spillable consumers
+/// ([`crate::memory_headroom`]).
+pub(crate) fn with_query_limit(
+    ctx: SessionContext,
+    limit: usize,
+    headroom_percent: u8,
+) -> SessionContext {
     if limit == 0 {
         return ctx;
     }
@@ -103,7 +103,7 @@ pub(crate) fn with_query_limit(ctx: SessionContext, limit: usize) -> SessionCont
     runtime.memory_pool = Arc::new(QueryMemoryPool {
         shared: Arc::clone(&runtime.memory_pool),
         limit,
-        used: AtomicUsize::new(0),
+        budget: HeadroomBudget::new(limit, headroom_percent, true),
     });
     let state = SessionStateBuilder::from(ctx.state())
         .with_runtime_env(Arc::new(runtime))
@@ -115,12 +115,13 @@ pub(crate) fn with_query_limit(ctx: SessionContext, limit: usize) -> SessionCont
 mod tests {
     use super::*;
     use datafusion::execution::memory_pool::GreedyMemoryPool;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn pool(shared: Arc<dyn MemoryPool>, limit: usize) -> Arc<dyn MemoryPool> {
         Arc::new(QueryMemoryPool {
             shared,
             limit,
-            used: AtomicUsize::new(0),
+            budget: HeadroomBudget::new(limit, 0, true),
         })
     }
 
@@ -204,7 +205,7 @@ mod tests {
             Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()),
         )
         .unwrap();
-        let query = with_query_limit(ctx.clone(), 64 * 1024);
+        let query = with_query_limit(ctx.clone(), 64 * 1024, 0);
         let frame = query
             .sql("SELECT a.id FROM build_side a JOIN build_side b ON a.id = b.id")
             .await
@@ -229,7 +230,7 @@ mod tests {
             0,
             "failed build must release its global reservation"
         );
-        let light = with_query_limit(ctx, 64 * 1024)
+        let light = with_query_limit(ctx, 64 * 1024, 0)
             .sql("SELECT 1")
             .await
             .unwrap()
@@ -254,8 +255,8 @@ mod tests {
             ),
         )
         .unwrap();
-        let first = with_query_limit(ctx.clone(), 64);
-        let second = with_query_limit(ctx.clone(), 64);
+        let first = with_query_limit(ctx.clone(), 64, 0);
+        let second = with_query_limit(ctx.clone(), 64, 0);
         assert!(Arc::ptr_eq(
             &ctx.runtime_env().disk_manager,
             &first.runtime_env().disk_manager
