@@ -1,7 +1,81 @@
 //! Shared DataFusion session flags used by the coordinator and sqe-cli
 //! embedded mode so the two paths cannot drift.
 
-use datafusion::prelude::SessionConfig;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use datafusion::catalog::Session;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::error::Result;
+use datafusion::execution::context::QueryPlanner;
+use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
+use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
+use datafusion::prelude::{SessionConfig, SessionContext};
+
+/// A context for user SQL: `config` and `runtime`, planned by
+/// [`EngineQueryPlanner`].
+pub fn engine_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> SessionContext {
+    let state = SessionStateBuilder::new()
+        .with_config(config)
+        .with_runtime_env(runtime)
+        .with_default_features()
+        .with_query_planner(Arc::new(EngineQueryPlanner))
+        .build();
+    SessionContext::new_with_state(state)
+}
+
+/// DataFusion's planner, except that a plan holding `WITH RECURSIVE` is
+/// planned without the aggregate dynamic filter. `RecursiveQueryExec` resets
+/// the recursive term between iterations, but `AggregateExec` keeps the
+/// MIN/MAX bound the first iteration pushed into its scan, so later
+/// iterations scan with a stale bound and return wrong rows
+/// (apache/datafusion#26054). Drop this once the upstream fix lands.
+#[derive(Debug)]
+pub struct EngineQueryPlanner;
+
+#[async_trait]
+impl QueryPlanner for EngineQueryPlanner {
+    async fn create_physical_plan(
+        &self,
+        plan: &LogicalPlan,
+        session: &dyn Session,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let planner = DefaultPhysicalPlanner::default();
+        let state = match session.as_any().downcast_ref::<SessionState>() {
+            Some(state)
+                if state.config_options().optimizer.enable_aggregate_dynamic_filter_pushdown
+                    && has_recursive_query(plan) =>
+            {
+                state
+            }
+            _ => return planner.create_physical_plan(plan, session).await,
+        };
+        let mut state = state.clone();
+        state
+            .config_mut()
+            .options_mut()
+            .optimizer
+            .enable_aggregate_dynamic_filter_pushdown = false;
+        planner.create_physical_plan(plan, &state).await
+    }
+}
+
+fn has_recursive_query(plan: &LogicalPlan) -> bool {
+    let mut found = false;
+    // The closure never fails; a traversal error is treated as recursive.
+    let walked = plan.apply_with_subqueries(|node| {
+        found = matches!(node, LogicalPlan::RecursiveQuery(_));
+        Ok(if found {
+            TreeNodeRecursion::Stop
+        } else {
+            TreeNodeRecursion::Continue
+        })
+    });
+    found || walked.is_err()
+}
 
 /// Engine-wide DataFusion session flags (decimal literals, DuckDB dialect,
 /// broadcast threshold, dynamic filter pushdown, Parquet predicate pushdown).
@@ -109,5 +183,58 @@ mod grouping_sets_empty_input {
         // Eight groups plus the grand total; the total (a NULL, s 12) ranks first.
         assert_eq!(out.lines().filter(|l| l.starts_with("| ")).count() - 1, 9, "\n{out}");
         assert!(out.contains("|    | 12 | 1  |"), "grand total row\n{out}");
+    }
+}
+
+/// apache/datafusion#26054: a MIN/MAX in the recursive term of a recursive
+/// CTE must give the same value on every iteration.
+#[cfg(test)]
+mod recursive_aggregate_dynamic_filter {
+    use std::sync::Arc;
+
+    use datafusion::execution::runtime_env::RuntimeEnv;
+    use datafusion::prelude::SessionContext;
+
+    const QUERY: &str = "WITH RECURSIVE w(n, m) AS ( \
+          SELECT 0, CAST(NULL AS DOUBLE) \
+          UNION ALL \
+          SELECT w.n + 1, x.m \
+          FROM w CROSS JOIN (SELECT MAX(r) AS m FROM t WHERE r % 2 = 0) x \
+          WHERE w.n < 3) \
+        SELECT n, m FROM w WHERE m IS NOT NULL ORDER BY n";
+
+    async fn non_null_iterations(ctx: &SessionContext, dir: &std::path::Path) -> usize {
+        let path = dir.join("t.parquet");
+        let path = path.to_str().unwrap();
+        // A filtered MAX, so it is computed by scanning, not from statistics.
+        ctx.sql(&format!(
+            "COPY (SELECT CAST(value AS DOUBLE) AS r FROM generate_series(0, 128)) TO '{path}'"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+        ctx.sql(&format!("CREATE EXTERNAL TABLE t STORED AS PARQUET LOCATION '{path}'"))
+            .await
+            .unwrap();
+        let batches = ctx.sql(QUERY).await.unwrap().collect().await.unwrap();
+        batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    #[tokio::test]
+    async fn every_iteration_sees_the_maximum() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = super::engine_context(super::engine_session_config(), Arc::new(RuntimeEnv::default()));
+        assert_eq!(non_null_iterations(&ctx, dir.path()).await, 3);
+    }
+
+    /// Tripwire: when this fails, DataFusion has fixed #26054 and
+    /// `EngineQueryPlanner` can go.
+    #[tokio::test]
+    async fn plain_datafusion_still_loses_later_iterations() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = SessionContext::new_with_config(super::engine_session_config());
+        assert_eq!(non_null_iterations(&ctx, dir.path()).await, 1);
     }
 }
