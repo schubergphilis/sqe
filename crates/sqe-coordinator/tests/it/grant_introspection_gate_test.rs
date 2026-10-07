@@ -361,7 +361,8 @@ async fn set_tags_requires_admin() {
 #[tokio::test]
 async fn set_reserved_tblproperties_requires_admin() {
     // `sqe.column-tags` is the same property SET TAGS writes, so writing it
-    // (or any other `sqe.` key) through SET TBLPROPERTIES needs the same gate.
+    // through SET TBLPROPERTIES needs the same gate. The gate runs before
+    // catalog resolution, so the unknown `cat` qualifier still yields 403.
     let backend = Arc::new(RecordingBackend::default());
     let store = Arc::new(RecordingStore::default());
     let handler = make_handler(backend, store);
@@ -391,6 +392,34 @@ async fn set_reserved_tblproperties_requires_admin() {
         !err.to_string().contains("requires one of admin roles"),
         "unexpected admin gate: {err}"
     );
+}
+
+#[tokio::test]
+async fn set_maintenance_tblproperties_stays_owner_settable() {
+    // Table owners opt into autonomous compaction with `sqe.maintenance.*`
+    // keys; only policy properties are admin-gated, not every `sqe.` key.
+    let backend = Arc::new(RecordingBackend::default());
+    let store = Arc::new(RecordingStore::default());
+    let handler = make_handler(backend, store);
+    let session = session_for("alice", vec!["analyst"]);
+
+    for sql in [
+        "ALTER TABLE cat.ns.tbl SET TBLPROPERTIES ('sqe.maintenance.enabled' = 'true')",
+        "ALTER TABLE cat.ns.tbl SET TBLPROPERTIES \
+         ('sqe.maintenance.compaction.min-input-files' = '8')",
+    ] {
+        // Gets past the gate, then fails on the missing catalog.
+        let err = handler
+            .execute(&session, sql, None)
+            .await
+            .expect_err("no catalog is wired");
+        let msg = err.to_string();
+        assert!(!msg.contains("403"), "unexpected 403 for {sql}: {msg}");
+        assert!(
+            msg.contains("unknown catalog"),
+            "expected catalog error for {sql}: {msg}"
+        );
+    }
 }
 
 #[tokio::test]

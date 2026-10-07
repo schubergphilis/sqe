@@ -205,9 +205,15 @@ fn is_sorted_write(kind: &StatementKind) -> bool {
     }
 }
 
-/// True when an `ALTER TABLE ... SET TBLPROPERTIES` writes a reserved
-/// `sqe.`-prefixed key. `sqe.column-tags` drives tag masks, so these keys are
-/// policy state and need the same admin gate as SET/UNSET TAGS.
+/// Table properties that are policy state rather than table configuration.
+/// `sqe.column-tags` is what SET/UNSET TAGS writes and it drives tag masks.
+/// Other `sqe.` keys stay owner-settable: `sqe.maintenance.*` is how a table
+/// owner opts into and tunes autonomous compaction.
+const POLICY_TABLE_PROPERTIES: &[&str] = &[crate::tag_source_impl::PROP_KEY];
+
+/// True when an `ALTER TABLE ... SET TBLPROPERTIES` writes a policy property
+/// (matched case-insensitively), which needs the same admin gate as SET/UNSET
+/// TAGS.
 fn sets_reserved_table_property(stmt: &Statement) -> bool {
     let Statement::AlterTable(at) = stmt else {
         return false;
@@ -215,9 +221,9 @@ fn sets_reserved_table_property(stmt: &Statement) -> bool {
     at.operations.iter().any(|op| match op {
         sqlparser::ast::AlterTableOperation::SetTblProperties { table_properties } => {
             table_properties.iter().any(|p| match p {
-                sqlparser::ast::SqlOption::KeyValue { key, .. } => {
-                    key.value.to_ascii_lowercase().starts_with("sqe.")
-                }
+                sqlparser::ast::SqlOption::KeyValue { key, .. } => POLICY_TABLE_PROPERTIES
+                    .iter()
+                    .any(|reserved| key.value.eq_ignore_ascii_case(reserved)),
                 _ => false,
             })
         }
@@ -1189,6 +1195,18 @@ impl QueryHandler {
         // Extra writers are rejected (ResourceExhausted), not queued.
         let _sorted_write_permit = self.try_acquire_sorted_write(&kind).map_err(failed)?;
 
+        // A SET TBLPROPERTIES that writes policy state (`sqe.column-tags`) is
+        // policy DDL, gated like SET/UNSET TAGS. It runs before the catalog
+        // preflight so a non-admin is refused on the privilege, whatever the
+        // catalog qualifier, and learns nothing about which catalogs exist.
+        if kind.statement().is_some_and(sets_reserved_table_property) {
+            self.require_admin(
+                session,
+                "ALTER TABLE ... SET TBLPROPERTIES on a policy property",
+            )
+            .map_err(failed)?;
+        }
+
         // Pre-flight: when a 3-part identifier names a catalog that the
         // coordinator has not registered, fail fast with a clear error
         // instead of letting DataFusion silently fall back to the
@@ -1728,12 +1746,8 @@ impl QueryHandler {
                     Ok(vec![])
                 }
                 StatementKind::AlterTableProps(stmt) => {
-                    if sets_reserved_table_property(stmt) {
-                        self.require_admin(
-                            session,
-                            "ALTER TABLE ... SET TBLPROPERTIES ('sqe.*')",
-                        )?;
-                    }
+                    // Policy-property writes were admin-gated before the
+                    // catalog preflight (`sets_reserved_table_property`).
                     self.catalog_ops.set_table_properties(session, stmt).await?;
                     crate::session_context::invalidate_session_cache(&session.user.username).await;
                     // Flush cached tag policies so a SET TBLPROPERTIES on sqe.column-tags
