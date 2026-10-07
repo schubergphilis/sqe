@@ -574,6 +574,10 @@ fn policy_raw_alias(col: &str, nonce: &str) -> String {
     format!("__pol_raw_{nonce}_{col}")
 }
 
+/// Synthetic flag column marking the rows an UPDATE evaluation changed;
+/// stripped before the batch leaves `apply_update`.
+const UPDATE_CHANGED_COLUMN: &str = "__sqe_update_changed";
+
 /// Combine the user's WHERE clause with the policy row filter. ANDing it
 /// here ensures DELETE and UPDATE only act on rows the policy admits,
 /// matching PostgreSQL RLS semantics on the SELECT path.
@@ -4126,12 +4130,20 @@ impl WriteHandler {
         // Before this, MERGE — the dbt incremental hot path, and the statement
         // most likely to run against a table the compaction scheduler is
         // rewriting — failed the whole statement on the first lost race.
+        let with_check_sql = crate::merge_sql::build_merge_with_check_sql(
+            &classified,
+            &merge_names,
+            &qualified_target_ref,
+            &qualified_source_ref,
+            &on_rewritten,
+        );
         let borrowed = (
             &table_ident,
             &qualified_target_ref[..],
             &select_sql[..],
             empty_source_count_sql.as_deref(),
             cardinality_sql.as_ref(),
+            with_check_sql.as_deref(),
         );
         let outcome = self
             .commit_rewrite_with_retry(
@@ -4146,6 +4158,7 @@ impl WriteHandler {
                         select_sql,
                         empty_source_count_sql,
                         cardinality_sql,
+                        with_check_sql,
                     ) = borrowed;
                     async move {
                         let old_data_files = self.collect_data_files(&fresh_table).await?;
@@ -4173,6 +4186,18 @@ impl WriteHandler {
 
                         if let Some((pair_sql, matched_sql)) = cardinality_sql {
                             check_merge_cardinality(ctx, pair_sql, matched_sql).await?;
+                        }
+                        if let Some(check_sql) = with_check_sql {
+                            let outside = scalar_count(ctx, check_sql, "MERGE WITH CHECK").await?;
+                            if outside > 0 {
+                                return Err(SqeError::with_code(
+                                    SqeErrorCode::AccessDenied,
+                                    format!(
+                                        "write to {table_ident} violates row-level security policy: \
+                                         {outside} row(s) fall outside the caller's row filter"
+                                    ),
+                                ));
+                            }
                         }
 
                         let mut empty_source_affected: Option<usize> = None;
@@ -5136,9 +5161,19 @@ impl WriteHandler {
             vec![]
         } else {
             let chained = futures::stream::select_all(new_row_streams);
-            let stream: datafusion::execution::SendableRecordBatchStream = Box::pin(
+            let mut stream: datafusion::execution::SendableRecordBatchStream = Box::pin(
                 RecordBatchStreamAdapter::new(target_schema.clone(), Box::pin(chained)),
             );
+            // WITH CHECK (#729): every inserted or updated row must satisfy
+            // the caller's row filter. Row filter only: an unassigned
+            // restricted column carries its stored value through an update.
+            if target_policy.row_filter_sql.is_some() {
+                let row_filter_only = sqe_policy::write_predicates::WritePolicyPredicates {
+                    row_filter_sql: target_policy.row_filter_sql.clone(),
+                    column_mask_sqls: Default::default(),
+                };
+                stream = checked_stream(ctx, &table_ident, row_filter_only, stream);
+            }
             // A zero-row stream closes the writer without producing a file.
             let (files, _rows) = write_data_files_streaming_with_metrics(
                 &table,
@@ -5920,6 +5955,14 @@ impl WriteHandler {
                 }
             })
             .collect();
+        // WITH CHECK (as for INSERT, #729): flag the rows this UPDATE changes
+        // so their new values can be held to the caller's row filter below.
+        let mut columns = columns;
+        if predicates.row_filter_sql.is_some() {
+            columns.push(format!(
+                "CAST(({augmented_where}) AS BOOLEAN) AS \"{UPDATE_CHANGED_COLUMN}\""
+            ));
+        }
 
         // Alias the scratch table back to the UPDATE target's original name so
         // correlated subqueries inside the SET expression can reference it.
@@ -5962,10 +6005,31 @@ impl WriteHandler {
         drop(scratch);
 
         // Return the first (and only) result batch
-        result_batches
+        let out = result_batches
             .into_iter()
             .next()
-            .ok_or_else(|| SqeError::with_code(SqeErrorCode::ExecutionFailed, "UPDATE produced no output batches".to_string()))
+            .ok_or_else(|| SqeError::with_code(SqeErrorCode::ExecutionFailed, "UPDATE produced no output batches".to_string()))?;
+        let Some(changed_idx) = out.schema().index_of(UPDATE_CHANGED_COLUMN).ok() else {
+            return Ok(out);
+        };
+        let changed = out
+            .column(changed_idx)
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .ok_or_else(|| SqeError::with_code(SqeErrorCode::ExecutionFailed, "UPDATE change flag is not boolean"))?
+            .clone();
+        let mut out = out;
+        out.remove_column(changed_idx);
+        let updated = filter_record_batch(&out, &changed)
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to filter updated rows: {e}")))?;
+        // Row filter only: an unassigned restricted column legitimately
+        // carries its stored value through an UPDATE.
+        let row_filter_only = sqe_policy::write_predicates::WritePolicyPredicates {
+            row_filter_sql: predicates.row_filter_sql.clone(),
+            column_mask_sqls: Default::default(),
+        };
+        check_batch_within_policy(ctx, &updated, table_ident, &row_filter_only).await?;
+        Ok(out)
     }
 
 
@@ -6047,20 +6111,30 @@ impl WriteHandler {
         if predicates.is_empty() {
             return Ok(stream);
         }
-        let shared = Arc::new((ctx.clone(), table_ident.clone(), predicates));
-        let schema = stream.schema();
-        let checked = stream.and_then(move |batch| {
-            let shared = shared.clone();
-            async move {
-                let (ctx, ident, predicates) = &*shared;
-                check_batch_within_policy(ctx, &batch, ident, predicates)
-                    .await
-                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
-                Ok(batch)
-            }
-        });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, checked)))
+        Ok(checked_stream(ctx, table_ident, predicates, stream))
     }
+}
+
+/// Wrap `stream` so every batch passes [`check_batch_within_policy`].
+fn checked_stream(
+    ctx: &DFSessionContext,
+    table_ident: &TableIdent,
+    predicates: sqe_policy::write_predicates::WritePolicyPredicates,
+    stream: datafusion::execution::SendableRecordBatchStream,
+) -> datafusion::execution::SendableRecordBatchStream {
+    let shared = Arc::new((ctx.clone(), table_ident.clone(), predicates));
+    let schema = stream.schema();
+    let checked = stream.and_then(move |batch| {
+        let shared = shared.clone();
+        async move {
+            let (ctx, ident, predicates) = &*shared;
+            check_batch_within_policy(ctx, &batch, ident, predicates)
+                .await
+                .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+            Ok(batch)
+        }
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, checked))
 }
 
 /// Refuse `batch` if any row falls outside the caller's row filter on the
@@ -10074,6 +10148,35 @@ s3_path_style = true
                 );
             }
         }
+    }
+
+    // WITH CHECK: an updated row must still satisfy the caller's row filter,
+    // so it cannot be moved out of their view.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_refuses_rows_moved_outside_row_filter() {
+        use datafusion::logical_expr::{col, lit};
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+        let (handler, session, table_ident, ctx) =
+            employees_handler_with_policy(Some(col("region").eq(lit("EU"))), vec![]).await;
+        let predicates = compute_predicates_for_employees(&handler, &session, &table_ident).await;
+        let update = |sql: &str| match Parser::parse_sql(&GenericDialect {}, sql).unwrap().pop().unwrap() {
+            sqlparser::ast::Statement::Update(update) => update.assignments,
+            _ => panic!("expected UPDATE"),
+        };
+        let batch = make_employee_batch();
+
+        let err = handler
+            .apply_update(&ctx, &batch, &update("UPDATE employees SET region = 'US'"), "TRUE", "", &table_ident, &predicates)
+            .await
+            .expect_err("moving EU rows to US must be refused");
+        assert!(err.to_string().contains("row-level security"), "{err}");
+
+        // Staying inside the filter is fine, and hidden US rows are untouched.
+        handler
+            .apply_update(&ctx, &batch, &update("UPDATE employees SET ssn = 'X'"), "TRUE", "", &table_ident, &predicates)
+            .await
+            .expect("in-filter update is allowed");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
