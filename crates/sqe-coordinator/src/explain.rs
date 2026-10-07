@@ -130,10 +130,11 @@ impl ExplainHandler {
         let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
 
         let policy_start = std::time::Instant::now();
-        let (enforced, _policy_summary) = self
+        let (enforced, policy_summary) = self
             .policy_enforcer
             .evaluate(&session.user, &sqe_policy::TableScope::of(ctx), logical)
             .await?;
+        refuse_metrics_under_row_filter(&policy_summary, "EXPLAIN ANALYZE")?;
         let policy_ms = policy_start.elapsed().as_secs_f64() * 1000.0;
 
         let physical_plan_start = std::time::Instant::now();
@@ -267,10 +268,11 @@ impl ExplainHandler {
         let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
 
         let policy_start = std::time::Instant::now();
-        let (enforced, _policy_summary) = self
+        let (enforced, policy_summary) = self
             .policy_enforcer
             .evaluate(&session.user, &sqe_policy::TableScope::of(ctx), logical)
             .await?;
+        refuse_metrics_under_row_filter(&policy_summary, "EXPLAIN FULL")?;
         let policy_ms = policy_start.elapsed().as_secs_f64() * 1000.0;
 
         let physical_plan_start = std::time::Instant::now();
@@ -397,6 +399,28 @@ fn require_query(inner_sql: &str) -> sqe_core::Result<()> {
         format!(
             "EXPLAIN only accepts a query; {} statements are not explained (run them directly)",
             kind.name()
+        ),
+    ))
+}
+
+/// EXPLAIN ANALYZE / FULL report per-operator `output_rows` (and FULL the
+/// snapshot's `total-records`), including operators below the injected row
+/// filter, so they would reveal how many rows the policy hides. Refuse both
+/// whenever a row filter or deny-all applies, for every caller: the filter
+/// binds whoever it was resolved for, admin or not. Plain EXPLAIN (no
+/// execution, no counts) stays available.
+fn refuse_metrics_under_row_filter(
+    summary: &sqe_policy::PolicySummary,
+    what: &str,
+) -> sqe_core::Result<()> {
+    if summary.row_filters_applied == 0 && !summary.denied {
+        return Ok(());
+    }
+    Err(SqeError::with_code(
+        SqeErrorCode::ExecutionFailed,
+        format!(
+            "{what} is not available for a query governed by a row filter policy \
+             (operator metrics would expose filtered row counts); use EXPLAIN instead"
         ),
     ))
 }
@@ -675,8 +699,68 @@ async fn drain_capped(
 
 #[cfg(test)]
 mod tests {
-    use super::{drain_capped, require_query};
+    use super::{drain_capped, require_query, ExplainHandler};
+    use datafusion::logical_expr::LogicalPlan;
     use datafusion::prelude::SessionContext;
+    use sqe_policy::{PolicyEnforcer, PolicySummary, TableScope};
+    use std::sync::Arc;
+
+    /// Returns the plan unchanged but reports the given policy summary, as a
+    /// rewriter that injected a row filter would.
+    struct SummaryEnforcer(PolicySummary);
+
+    #[async_trait::async_trait]
+    impl PolicyEnforcer for SummaryEnforcer {
+        async fn evaluate(
+            &self,
+            _user: &sqe_core::SessionUser,
+            _scope: &TableScope,
+            plan: LogicalPlan,
+        ) -> sqe_core::Result<(LogicalPlan, PolicySummary)> {
+            Ok((plan, self.0.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn explain_metrics_refused_under_row_filter() {
+        let session = sqe_core::Session::new(
+            "alice".to_string(),
+            sqe_core::SecretString::new("t".to_string()),
+            None,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            vec![],
+        );
+        let ctx = SessionContext::new();
+        for summary in [
+            PolicySummary {
+                row_filters_applied: 1,
+                ..Default::default()
+            },
+            PolicySummary {
+                denied: true,
+                ..Default::default()
+            },
+        ] {
+            let handler = ExplainHandler::new(
+                Arc::new(SummaryEnforcer(summary)),
+                &sqe_core::config::QueryConfig::default(),
+                None,
+            );
+            let err = handler
+                .analyze(&session, "SELECT 1", &ctx)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("EXPLAIN ANALYZE is not available"), "{err}");
+            let err = handler
+                .full(&session, "SELECT 1", &ctx)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("EXPLAIN FULL is not available"), "{err}");
+        }
+        assert!(super::refuse_metrics_under_row_filter(&PolicySummary::default(), "x").is_ok());
+    }
 
     #[tokio::test]
     async fn explain_execution_stops_at_max_result_rows() {
