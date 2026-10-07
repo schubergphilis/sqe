@@ -580,13 +580,12 @@ allow_unbounded_issuer = false                          # Allow missing/empty is
 
 Auth0 and Okta use the same two-provider shape, differing only in `token_url`, `jwks_url`, `issuer`, and the `roles_claim` path (Auth0 uses a namespaced claim, Okta uses `groups`).
 
-AWS IAM maps caller ARNs to SQE roles:
+AWS IAM verifies every access key and secret with STS `GetCallerIdentity`, then maps the caller ARN to SQE roles. There is no config-only mode: `validate_with_sts = false` fails at startup.
 
 ```toml
 [[auth.providers]]
 type = "aws_iam"
 region = "eu-west-1"
-validate_with_sts = true
 
 [auth.role_mappings]
 "arn:aws:iam::123456789012:role/DataAnalyst" = ["analyst", "reader"]

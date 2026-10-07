@@ -178,17 +178,19 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                     region,
                     validate_with_sts,
                 } => {
+                    if !*validate_with_sts {
+                        return Err(sqe_core::SqeError::Config(
+                            "auth.providers: aws_iam validate_with_sts = false is not supported; credentials are always validated with STS. Remove the setting".into(),
+                        ));
+                    }
                     info!(
                         index = i,
                         region = %region,
-                        validate_with_sts = validate_with_sts,
                         "Adding AwsIamProvider to chain"
                     );
                     let aws_config = AwsIamProviderConfig {
                         region: region.clone(),
-                        validate_with_sts: *validate_with_sts,
                         role_mappings: config.role_mappings.clone(),
-                        key_mappings: HashMap::new(),
                     };
                     Arc::new(AwsIamProvider::new(aws_config))
                 }
@@ -325,6 +327,33 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn aws_iam_without_sts_validation_is_rejected() {
+        let config = AuthConfig {
+            keycloak_url: String::new(),
+            realm: String::new(),
+            client_id: String::new(),
+            client_secret: sqe_core::SecretString::default(),
+            token_endpoint: String::new(),
+            token_refresh_buffer_secs: 60,
+            ssl_verification: true,
+            tls_skip_verify: false,
+            roles_claim: "realm_access.roles".into(),
+            providers: vec![AuthProviderConfig::AwsIam {
+                region: "us-east-1".into(),
+                validate_with_sts: false,
+            }],
+            role_mappings: HashMap::new(),
+            external: None,
+            admin_roles: Vec::new(),
+        };
+        let err = match build_auth_chain(&config).await {
+            Ok(_) => panic!("aws_iam with validate_with_sts = false must fail at startup"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("validate_with_sts"), "{err}");
     }
 
     use super::*;
