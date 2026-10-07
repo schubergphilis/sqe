@@ -273,7 +273,37 @@ async fn infallible_caller_predicate_is_not_guarded() {
     let (mem, _) = build_scan("employees");
     let ctx = SessionContext::new();
     ctx.register_table("employees", mem).unwrap();
-    let sql = "SELECT customer_id FROM employees WHERE customer_id > 1 AND ssn LIKE '3%'";
+    for sql in [
+        "SELECT customer_id FROM employees WHERE customer_id > 1 AND ssn LIKE '3%'",
+        // EXISTS and IN (subquery) cannot fail on the outer row.
+        "SELECT customer_id FROM employees e \
+         WHERE customer_id IN (SELECT customer_id FROM employees WHERE ssn LIKE '3%') \
+         AND EXISTS (SELECT 1 FROM employees x WHERE x.customer_id = e.customer_id)",
+    ] {
+        let plan = ctx.state().create_logical_plan(sql).await.unwrap();
+        let (plan, _summary) = eu_rewriter()
+            .await
+            .evaluate(&user("alice", &[]), &sqe_policy::TableScope::default(), plan)
+            .await
+            .unwrap();
+        let s = format!("{}", plan.display_indent());
+        assert!(!s.contains("CASE WHEN"), "no guard expected, got: {s}");
+        let batches = ctx.execute_logical_plan(plan).await.unwrap().collect().await.unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1, "only customer 3 is EU and starts with 3: {sql}");
+    }
+}
+
+/// A fallible predicate inside a subquery body still runs over a row-filtered
+/// scan, so it switches the guard on even though EXISTS itself cannot fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallible_predicate_inside_a_subquery_is_guarded() {
+    let (mem, _) = build_scan("employees");
+    let ctx = SessionContext::new();
+    ctx.register_table("employees", mem).unwrap();
+    let sql = "SELECT customer_id FROM employees e WHERE EXISTS (\
+               SELECT 1 FROM employees x WHERE x.customer_id = e.customer_id \
+               AND CASE WHEN x.region = 'US' THEN 1 / (x.customer_id - 2) ELSE 1 END = 1)";
     let plan = ctx.state().create_logical_plan(sql).await.unwrap();
     let (plan, _summary) = eu_rewriter()
         .await
@@ -281,10 +311,16 @@ async fn infallible_caller_predicate_is_not_guarded() {
         .await
         .unwrap();
     let s = format!("{}", plan.display_indent());
-    assert!(!s.contains("CASE WHEN"), "no guard expected, got: {s}");
-    let batches = ctx.execute_logical_plan(plan).await.unwrap().collect().await.unwrap();
+    assert!(s.contains("CASE WHEN"), "the guard must be applied, got: {s}");
+    let batches = ctx
+        .execute_logical_plan(plan)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .expect("the hidden row must not be reachable through a runtime error");
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(rows, 1, "only customer 3 is EU, > 1 and starts with 3");
+    assert_eq!(rows, 2, "both visible EU rows pass the subquery");
 }
 
 /// A fallible predicate already pushed into the scan (a view body is
