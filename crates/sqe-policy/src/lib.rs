@@ -188,7 +188,9 @@ impl PolicyEnforcer for PassthroughEnforcer {
 /// The policy-store contract and its result types live in `sqe-policy-api`
 /// (build-time item C1) so `sqe-catalog` can depend on them without waiting
 /// for this crate to compile. Re-exported under the old paths.
-pub use sqe_policy_api::{MaskPolicyInfo, MaskType, PolicyStore, ResolvedPolicy, TagMaskSpec};
+pub use sqe_policy_api::{
+    MaskPolicyInfo, MaskType, PolicyStore, ResolvedPolicy, TablePrivilege, TagMaskSpec,
+};
 
 #[cfg(test)]
 mod tests {

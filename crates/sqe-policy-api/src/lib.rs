@@ -122,6 +122,29 @@ pub struct MaskPolicyInfo {
     pub grantees: String,
 }
 
+/// A table-level DDL privilege, for statements that change or remove a table
+/// definition rather than read its rows. Only tables whose definition SQE
+/// owns (Hive-root tables) ask for one; an Iceberg table's DDL is decided by
+/// its catalog under the caller's own bearer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TablePrivilege {
+    /// Change the definition in place (Ranger `alter`).
+    Alter,
+    /// Remove or replace the definition (Ranger `drop`).
+    Drop,
+}
+
+impl TablePrivilege {
+    /// The `hive` servicedef access type that carries this privilege. `all`
+    /// carries every one of them.
+    pub fn access_type(self) -> &'static str {
+        match self {
+            Self::Alter => "alter",
+            Self::Drop => "drop",
+        }
+    }
+}
+
 /// Trait for policy storage backends. Implementations resolve policies
 /// for a given (user, table) pair from an external system.
 #[async_trait]
@@ -192,6 +215,26 @@ pub trait PolicyStore: Send + Sync {
              cannot list mask policies. It needs [policy] engine = \"ranger\"."
                 .to_string(),
         ))
+    }
+
+    /// Does the policy engine grant `user` the DDL `privilege` on this table?
+    ///
+    /// `namespace` is keyed exactly as `resolve` is (`{root}.{database}` for
+    /// a Hive-root table). This is one way to hold DDL authority over a table,
+    /// next to an admin role and ownership; it can only add authority, never
+    /// take an admin's or an owner's away.
+    ///
+    /// The default answers `false`: a backend without a privilege model
+    /// grants nothing, so its callers fall back to admin or owner. A backend
+    /// gains it by overriding this.
+    async fn grants_table_privilege(
+        &self,
+        _user: &SessionUser,
+        _table_name: &str,
+        _namespace: &str,
+        _privilege: TablePrivilege,
+    ) -> sqe_core::Result<bool> {
+        Ok(false)
     }
 
     /// Create or replace a fine-grained row-filter / column-mask policy.

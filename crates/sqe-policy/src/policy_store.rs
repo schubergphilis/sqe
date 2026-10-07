@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 
 use sqe_core::SessionUser;
 
-use crate::{PolicyStore, ResolvedPolicy};
+use crate::{PolicyStore, ResolvedPolicy, TablePrivilege};
 
 /// In-memory policy store backed by a concurrent HashMap.
 /// Policies are keyed by (namespace, table_name).
@@ -20,6 +20,9 @@ pub struct InMemoryPolicyStore {
     policies: Arc<RwLock<HashMap<String, ResolvedPolicy>>>,
     /// Role-based policies keyed by role name, applied to all tables
     role_policies: Arc<RwLock<HashMap<String, ResolvedPolicy>>>,
+    /// DDL privileges keyed by "namespace.table_name": (grantee, privilege),
+    /// where the grantee matches a username or any of the user's roles.
+    privileges: Arc<RwLock<HashMap<String, Vec<(String, TablePrivilege)>>>>,
     /// Bumped on every mutation; feeds `policy_fingerprint` (finding 902).
     generation: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -29,8 +32,29 @@ impl InMemoryPolicyStore {
         Self {
             policies: Arc::new(RwLock::new(HashMap::new())),
             role_policies: Arc::new(RwLock::new(HashMap::new())),
+            privileges: Arc::new(RwLock::new(HashMap::new())),
             generation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
+    }
+
+    /// Grant a DDL privilege on one table to `grantee`, a username or a role
+    /// name. Nothing is granted until registered here.
+    pub async fn grant_table_privilege(
+        &self,
+        namespace: &str,
+        table_name: &str,
+        grantee: &str,
+        privilege: TablePrivilege,
+    ) {
+        let key = format!("{}.{}", namespace, table_name);
+        self.privileges
+            .write()
+            .await
+            .entry(key)
+            .or_default()
+            .push((grantee.to_string(), privilege));
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Register a policy for a specific table.
@@ -129,6 +153,28 @@ impl PolicyStore for InMemoryPolicyStore {
 
         // No policy found — allow all (passthrough)
         Ok(ResolvedPolicy::default())
+    }
+
+    /// Only what `grant_table_privilege` registered: unlike `resolve`, an
+    /// absent entry grants nothing, because DDL authority is opt-in.
+    async fn grants_table_privilege(
+        &self,
+        user: &SessionUser,
+        table_name: &str,
+        namespace: &str,
+        privilege: TablePrivilege,
+    ) -> sqe_core::Result<bool> {
+        let key = format!("{}.{}", namespace, table_name);
+        Ok(self
+            .privileges
+            .read()
+            .await
+            .get(&key)
+            .is_some_and(|grants| {
+                grants.iter().any(|(grantee, p)| {
+                    *p == privilege && (*grantee == user.username || user.roles.contains(grantee))
+                })
+            }))
     }
 }
 
