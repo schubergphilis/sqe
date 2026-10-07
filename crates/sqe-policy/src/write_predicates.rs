@@ -405,6 +405,39 @@ mod tests {
         assert!(mask.contains("***"), "redact mask sql: {mask}");
     }
 
+    // The row-filter guard is skipped, not read as a mask on every column.
+    #[test]
+    fn row_filter_guard_is_not_a_mask() {
+        use datafusion::logical_expr::when;
+        let scan = LogicalPlanBuilder::scan(
+            "employees",
+            provider_as_source(Arc::new(
+                MemTable::try_new(employees_schema(), vec![vec![]]).unwrap(),
+            )),
+            None,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let rf = col("region").eq(lit("EU"));
+        let guard = ["id", "ssn", "region"]
+            .map(|c| when(rf.clone(), col(c)).end().unwrap().alias(c))
+            .to_vec();
+        let plan = LogicalPlanBuilder::from(scan)
+            .filter(rf.clone())
+            .unwrap()
+            .project(guard)
+            .unwrap()
+            .project(vec![col("id"), lit("***").alias("ssn"), col("region")])
+            .unwrap()
+            .build()
+            .unwrap();
+        let out = unparse_predicates(&plan).unwrap();
+        assert!(out.row_filter_sql.is_some(), "row filter present");
+        assert_eq!(out.column_mask_sqls.len(), 1, "only ssn is masked: {out:?}");
+        assert!(out.column_mask_sqls["ssn"].contains("***"));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn nullify_on_int_round_trips_to_typed_null() {
         let store = InMemoryPolicyStore::new();
