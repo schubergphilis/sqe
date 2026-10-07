@@ -312,6 +312,7 @@ Route audit logs and traces through an OpenTelemetry Collector when possible. Au
 | `no-plaintext-client-listeners` | An enabled plaintext Trino HTTP (`trino_http_port`), Quack (without `[coordinator.tls]`) or MCP (without TLS, or on the web port) listener on a non-loopback address, unless `security.allow_plaintext_behind_tls_proxy = true` acknowledges a TLS-terminating proxy in front (client passwords and bearer tokens would cross it in cleartext). |
 | `no-shared-service-identity` | Config-held `client_credentials` in `[auth].providers` or `[catalog(s).auth]` without `security.allow_shared_service_identity = true` (one identity for every user at Polaris/S3). |
 | `worker-secret-required` | `coordinator.worker_urls` set with an empty `coordinator.worker_secret` and `allow_unauthenticated_workers = true` (any TCP-reachable client may register as a worker). |
+| `no-unauthenticated-worker` | `worker.allow_unauthenticated = true` (a worker without a secret accepts scan tickets and credential refreshes from any TCP-reachable client). |
 | `max-sql-bytes` | `query.max_sql_bytes = 0` (disables the pre-parse statement size cap). |
 | `explicit-distributed-credentials` | `coordinator.distributed_credentials = auto` with workers configured (ships the shared `[storage]` keys to workers for tables without vended credentials). |
 | `vended-credentials-required` | A REST catalog without `require_vended_credentials = true` (FileIO would fall back to the shared `[storage]` S3 keys). |
