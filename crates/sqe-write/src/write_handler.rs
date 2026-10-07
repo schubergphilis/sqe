@@ -10311,14 +10311,14 @@ s3_path_style = true
         let batch = make_employee_batch();
 
         let err = handler
-            .apply_update(&ctx, &batch, &update("UPDATE employees SET region = 'US'"), "TRUE", "", &table_ident, &predicates)
+            .apply_update(&ctx, &session, &batch, &update("UPDATE employees SET region = 'US'"), "TRUE", "", &table_ident, &predicates)
             .await
             .expect_err("moving EU rows to US must be refused");
         assert!(err.to_string().contains("row-level security"), "{err}");
 
         // Staying inside the filter is fine, and hidden US rows are untouched.
         handler
-            .apply_update(&ctx, &batch, &update("UPDATE employees SET ssn = 'X'"), "TRUE", "", &table_ident, &predicates)
+            .apply_update(&ctx, &session, &batch, &update("UPDATE employees SET ssn = 'X'"), "TRUE", "", &table_ident, &predicates)
             .await
             .expect("in-filter update is allowed");
     }
@@ -10403,7 +10403,7 @@ s3_path_style = true
         };
         let batch = make_employee_batch();
         let result = handler
-            .apply_update(&ctx, &batch, &assignments, "TRUE", "", &table_ident, &predicates)
+            .apply_update(&ctx, &session, &batch, &assignments, "TRUE", "", &table_ident, &predicates)
             .await;
         if let Ok(rewritten) = result {
             let region = rewritten
