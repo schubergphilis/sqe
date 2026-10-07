@@ -209,21 +209,7 @@ pub async fn create_session_context(
     hive_manifest_cache: &Arc<sqe_catalog::hive::provider::HiveMetadataCache>,
     secrets: &sqe_core::SecretStore,
 ) -> sqe_core::Result<(SessionContext, Arc<SessionCatalog>)> {
-    // --- Cache key: username + token fingerprint + session catalog/schema ---
-    // Different tokens from the same user must not share a stale SessionCatalog.
-    // We key by username + first 16 hex chars of the SHA-256 of the access token.
-    // The session catalog/schema (X-Trino-Catalog / X-Trino-Schema) are part of
-    // the key: the same user+token opening two connections against different
-    // catalogs/schemas builds distinct DataFusion default-catalog contexts and
-    // must not collide in the cache.
-    let token_hash = hex::encode(Sha256::digest(session.access_token().expose_bytes()));
-    let cache_key = format!(
-        "{}:{}:{}:{}",
-        session.user.username,
-        &token_hash[..16],
-        session.default_catalog.as_deref().unwrap_or(""),
-        session.default_schema.as_deref().unwrap_or(""),
-    );
+    let cache_key = session_cache_key(session);
 
     // --- Atomic cache lookup / build via try_get_with ---
     // Eliminates the TOCTOU race where two concurrent requests for the same key
@@ -1198,6 +1184,46 @@ pub async fn invalidate_all_session_caches() {
     debug!("All SessionContext caches invalidated");
 }
 
+/// Cache key: username + token fingerprint + identity digest + session
+/// catalog/schema.
+///
+/// Different tokens from the same user must not share a stale SessionCatalog,
+/// so the key carries the first 16 hex chars of the SHA-256 of the access
+/// token. Tokenless identities (API keys) share one username and an empty
+/// token, yet the cached context captures the caller's roles (TVF caller,
+/// Hive visibility, system.runtime scope), so the key also carries a digest
+/// of subject + sorted roles + sorted groups. The session catalog/schema
+/// (X-Trino-Catalog / X-Trino-Schema) are part of the key: the same
+/// user+token opening two connections against different catalogs/schemas
+/// builds distinct DataFusion default-catalog contexts and must not collide.
+fn session_cache_key(session: &Session) -> String {
+    let token_hash = hex::encode(Sha256::digest(session.access_token().expose_bytes()));
+    let mut roles = session.user.roles.clone();
+    roles.sort();
+    let mut groups = session.user.groups.clone();
+    groups.sort();
+    // Length-prefix every part so no two identities serialise the same.
+    let mut identity = Sha256::new();
+    for part in std::iter::once(session.user.subject.as_deref().unwrap_or(""))
+        .chain(std::iter::once("\0roles"))
+        .chain(roles.iter().map(String::as_str))
+        .chain(std::iter::once("\0groups"))
+        .chain(groups.iter().map(String::as_str))
+    {
+        identity.update((part.len() as u64).to_le_bytes());
+        identity.update(part.as_bytes());
+    }
+    let identity_hash = hex::encode(identity.finalize());
+    format!(
+        "{}:{}:{}:{}:{}",
+        session.user.username,
+        &token_hash[..16],
+        &identity_hash[..16],
+        session.default_catalog.as_deref().unwrap_or(""),
+        session.default_schema.as_deref().unwrap_or(""),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1305,6 +1331,37 @@ allowed_object_store_prefixes = ["s3://shared-landing/"]
             chrono::Utc::now() + chrono::Duration::hours(1),
             vec![],
         )
+    }
+
+    /// Two tokenless identities with the same username but different
+    /// roles/groups/subject must not share a cached SessionContext.
+    #[test]
+    fn cache_key_separates_same_user_with_different_identity() {
+        let api_key = |roles: Vec<String>| {
+            Session::new(
+                "api-key-user".to_string(),
+                sqe_core::SecretString::new(String::new()),
+                None,
+                chrono::Utc::now() + chrono::Duration::hours(1),
+                roles,
+            )
+        };
+        let reader = api_key(vec!["reader".to_string()]);
+        let admin = api_key(vec!["service_admin".to_string()]);
+        assert_ne!(session_cache_key(&reader), session_cache_key(&admin));
+
+        let mut grouped = api_key(vec!["reader".to_string()]);
+        grouped.user.groups = vec!["finance".to_string()];
+        assert_ne!(session_cache_key(&reader), session_cache_key(&grouped));
+
+        let mut other_subject = api_key(vec!["reader".to_string()]);
+        other_subject.user.subject = Some("key-2".to_string());
+        assert_ne!(session_cache_key(&reader), session_cache_key(&other_subject));
+
+        // Role order does not matter.
+        let ab = api_key(vec!["a".to_string(), "b".to_string()]);
+        let ba = api_key(vec!["b".to_string(), "a".to_string()]);
+        assert_eq!(session_cache_key(&ab), session_cache_key(&ba));
     }
 
     /// The caller is scoped to the session's resolved catalog: catalog A's
