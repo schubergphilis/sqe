@@ -125,10 +125,11 @@ pub fn unparse_predicates(rewritten: &LogicalPlan) -> sqe_core::Result<WritePoli
                 row_filters.push(f.predicate.clone());
                 node = f.input.as_ref();
             }
-            // The projection directly over the row filters is the rewriter's
-            // row-filter guard (`CASE WHEN <filter> THEN col END`), not a
-            // mask; the DML path applies the row filter itself.
-            LogicalPlan::Projection(p) if matches!(p.input.as_ref(), LogicalPlan::Filter(_)) => {
+            // The rewriter's row-filter guard (`CASE WHEN <filter> THEN col
+            // END`) is not a mask; the DML path applies the row filter
+            // itself. Matched by shape: the mask projection also sits
+            // directly over the row filters when there is no guard.
+            LogicalPlan::Projection(p) if is_row_filter_guard(p) => {
                 node = p.input.as_ref();
             }
             LogicalPlan::Projection(p) => {
@@ -186,6 +187,26 @@ pub fn unparse_predicates(rewritten: &LogicalPlan) -> sqe_core::Result<WritePoli
         column_mask_sqls,
         mask_udfs,
     })
+}
+
+/// True for the rewriter's row-filter guard: every entry is
+/// `CASE WHEN <cond> THEN col END AS col`, over a row filter.
+fn is_row_filter_guard(p: &datafusion::logical_expr::Projection) -> bool {
+    matches!(p.input.as_ref(), LogicalPlan::Filter(_))
+        && !p.expr.is_empty()
+        && p.expr.iter().all(|e| match e {
+            Expr::Alias(a) => match a.expr.as_ref() {
+                Expr::Case(c) => {
+                    c.expr.is_none()
+                        && c.else_expr.is_none()
+                        && c.when_then_expr.len() == 1
+                        && matches!(c.when_then_expr[0].1.as_ref(),
+                            Expr::Column(col) if col.name == a.name)
+                }
+                _ => false,
+            },
+            _ => false,
+        })
 }
 
 /// Collect the internal mask functions `expr` calls (the keyed HASH mask is
@@ -355,6 +376,33 @@ mod tests {
             !out.column_mask_sqls.contains_key("id"),
             "unmasked column should have no entry"
         );
+    }
+
+    // With a row filter and no guard, the mask projection sits directly over
+    // the row filter; it must still be read as the mask.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mask_over_a_row_filter_is_extracted() {
+        let store = InMemoryPolicyStore::new();
+        let mut pol = ResolvedPolicy::default();
+        pol.row_filters.push(col("region").eq(lit("EU")));
+        pol.column_masks
+            .insert("ssn".to_string(), MaskType::Redact("***".to_string()));
+        store.add_table_policy("default", "employees", pol).await;
+        let enf = PolicyPlanRewriter::new(Arc::new(store));
+
+        let (out, _summary) = extract_write_predicates(
+            &enf,
+            &user("alice"),
+            "default",
+            "employees",
+            employees_schema(),
+        )
+        .await
+        .unwrap();
+
+        assert!(out.row_filter_sql.is_some(), "row filter present");
+        let mask = out.column_mask_sqls.get("ssn").expect("ssn mask present");
+        assert!(mask.contains("***"), "redact mask sql: {mask}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
