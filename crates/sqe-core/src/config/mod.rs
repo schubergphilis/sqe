@@ -4022,12 +4022,14 @@ impl std::str::FromStr for PolicyEngine {
 pub struct PolicyConfig {
     #[serde(default)]
     pub engine: PolicyEngine,
-    /// Per-deployment secret keyed into the SHA-256 column mask UDF.
+    /// Per-deployment secret keyed into the HASH column mask.
     ///
-    /// When set, the `sha256(col)` mask runs as HMAC-SHA256 with this key,
-    /// blocking the offline rainbow-table attack against low-entropy
-    /// columns (SSN, phone, employee ID). When empty, the UDF falls back
-    /// to plain SHA-256 and emits a startup warning. Rotating the key
+    /// When set, HASH masks run as HMAC-SHA256 with this key, blocking the
+    /// offline rainbow-table attack against low-entropy columns (SSN,
+    /// phone, employee ID). The mask uses an internal function that user
+    /// SQL cannot call; on the coordinator the user-callable `sha256()` is
+    /// plain, unkeyed SHA-256 and never sees this key. When empty, the mask falls
+    /// back to plain SHA-256 and emits a startup warning. Rotating the key
     /// changes every masked digest, so the same key must persist across
     /// coordinator restarts and across all coordinators in an HA setup.
     ///
