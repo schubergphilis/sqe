@@ -32,6 +32,7 @@ pub fn redact_pii(sql: &str) -> String {
     static PHONE_RE: OnceLock<regex::Regex> = OnceLock::new();
     static CARD_RE: OnceLock<regex::Regex> = OnceLock::new();
     static SECRET_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static SECRET_KV_RE: OnceLock<regex::Regex> = OnceLock::new();
 
     let email_re = EMAIL_RE.get_or_init(|| {
         regex::Regex::new(r"'[^']*[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^']*'").unwrap()
@@ -52,7 +53,15 @@ pub fn redact_pii(sql: &str) -> String {
             // `KMS_KEY_ID`; it replaces `ACCESS_KEY_ID`, which it contains.
             // The literal accepts SQL `''` escapes so `PASSWORD 'it''s'` is
             // consumed whole instead of stopping at the doubled quote (#733).
-            r"(?i)\b([A-Z0-9_]*(?:TOKEN|PASSWORD|PASSWD|SECRET|ACCESS_KEY|KEY_ID|SECRET_KEY|API_KEY|BEARER))\b(\s*=\s*|\s+|\s*\(\s*)'(?:[^']|'')*'",
+            // `=>` is the named TVF argument form (`secret_key => '...'`).
+            r"(?i)\b([A-Z0-9_]*(?:TOKEN|PASSWORD|PASSWD|SECRET|ACCESS_KEY|KEY_ID|SECRET_KEY|API_KEY|BEARER))\b(\s*=>\s*|\s*=\s*|\s+|\s*\(\s*)'(?:[^']|'')*'",
+        )
+        .unwrap()
+    });
+    // A whole `'<secret-ish key>=value'` literal (option-string form).
+    let secret_kv_re = SECRET_KV_RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)'([A-Z0-9_]*(?:TOKEN|PASSWORD|PASSWD|SECRET|ACCESS_KEY|KEY_ID|SECRET_KEY|API_KEY|BEARER)\s*=)(?:[^']|'')*'",
         )
         .unwrap()
     });
@@ -64,6 +73,9 @@ pub fn redact_pii(sql: &str) -> String {
     result = card_re.replace_all(&result, "'[CARD]'").to_string();
     result = secret_re
         .replace_all(&result, "$1$2'[REDACTED]'")
+        .to_string();
+    result = secret_kv_re
+        .replace_all(&result, "'$1[REDACTED]'")
         .to_string();
     result
 }
@@ -404,6 +416,31 @@ mod tests {
         assert!(
             redacted.contains("'http://minio:9000'"),
             "non-secret option must survive: {redacted}"
+        );
+    }
+
+    #[test]
+    fn redact_tvf_named_and_key_value_secret_args() {
+        // Named TVF arguments (`secret_key => '...'`) and `'key=value'`
+        // option literals.
+        let sql = "SELECT * FROM read_parquet('s3://b/x.parquet', \
+            access_key => 'AKIAEXAMPLE', secret_key=>'wJalrEXAMPLE', \
+            'session_token=FQoDEXAMPLE', endpoint => 'http://minio:9000')";
+        let redacted = redact_pii(sql);
+        for leaked in ["AKIAEXAMPLE", "wJalrEXAMPLE", "FQoDEXAMPLE"] {
+            assert!(!redacted.contains(leaked), "{leaked} leaked: {redacted}");
+        }
+        assert!(
+            redacted.contains("secret_key=>'[REDACTED]'"),
+            "{redacted}"
+        );
+        assert!(
+            redacted.contains("'session_token=[REDACTED]'"),
+            "{redacted}"
+        );
+        assert!(
+            redacted.contains("'http://minio:9000'"),
+            "non-secret arg must survive: {redacted}"
         );
     }
 
