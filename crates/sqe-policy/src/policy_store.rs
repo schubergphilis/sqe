@@ -13,6 +13,9 @@ use sqe_core::SessionUser;
 
 use crate::{PolicyStore, ResolvedPolicy, TablePrivilege};
 
+/// One registered DDL grant: (grantee, privilege).
+type PrivilegeGrant = (String, TablePrivilege);
+
 /// In-memory policy store backed by a concurrent HashMap.
 /// Policies are keyed by (namespace, table_name).
 pub struct InMemoryPolicyStore {
@@ -22,7 +25,7 @@ pub struct InMemoryPolicyStore {
     role_policies: Arc<RwLock<HashMap<String, ResolvedPolicy>>>,
     /// DDL privileges keyed by "namespace.table_name": (grantee, privilege),
     /// where the grantee matches a username or any of the user's roles.
-    privileges: Arc<RwLock<HashMap<String, Vec<(String, TablePrivilege)>>>>,
+    privileges: Arc<RwLock<HashMap<String, Vec<PrivilegeGrant>>>>,
     /// Bumped on every mutation; feeds `policy_fingerprint` (finding 902).
     generation: Arc<std::sync::atomic::AtomicU64>,
 }
