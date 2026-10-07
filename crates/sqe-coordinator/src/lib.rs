@@ -93,6 +93,7 @@ pub use quack_executor::CoordinatorExecutor;
 pub use query_handler::QueryHandler;
 pub use runtime_catalog::{AttachedCatalog, RuntimeCatalogRegistry};
 pub use session_manager::SessionManager;
+pub use ticket_credentials::load_ticket_signer;
 
 /// Parse the `audit.gdpr_identifier_mode` config string.
 ///
