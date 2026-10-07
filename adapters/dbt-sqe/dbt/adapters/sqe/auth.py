@@ -12,7 +12,7 @@ runtime installed. The three auth styles all resolve to ADBC `db_kwargs`:
 - Basic auth (human user): `user` / `password` as before.
 """
 
-from typing import Optional
+from typing import Optional, Tuple
 
 
 class AuthError(ValueError):
@@ -50,3 +50,28 @@ def flight_db_kwargs(
         return {"username": user, "password": password or ""}
 
     return {}
+
+
+def flight_location(
+    host: str,
+    port: int,
+    *,
+    tls: bool = True,
+    tls_root_certs: Optional[str] = None,
+) -> Tuple[str, dict]:
+    """Return the Flight SQL URI and any TLS `db_kwargs`.
+
+    TLS is on by default; credentials and bearer tokens travel in every call,
+    so plaintext (`tls: false`) is an explicit opt-out for local stacks.
+    ``tls_root_certs`` is a path to a PEM bundle; ADBC takes the PEM contents.
+    """
+    if not tls:
+        if tls_root_certs:
+            raise AuthError("dbt-sqe: 'tls_root_certs' requires 'tls: true'")
+        return f"grpc://{host}:{port}", {}
+
+    db_kwargs = {}
+    if tls_root_certs:
+        with open(tls_root_certs, encoding="utf-8") as f:
+            db_kwargs["adbc.flight.sql.client_option.tls_root_certs"] = f.read()
+    return f"grpc+tls://{host}:{port}", db_kwargs

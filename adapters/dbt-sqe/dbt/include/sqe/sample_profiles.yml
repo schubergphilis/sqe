@@ -6,6 +6,7 @@ my_project:
       type: sqe
       host: localhost
       port: 50051
+      tls: false  # local plaintext stack; drop for a TLS coordinator
       user: admin
       password: "{{ env_var('SQE_PASSWORD') }}"
       catalog: warehouse
@@ -19,6 +20,7 @@ my_project:
       type: sqe
       host: localhost
       port: 50051
+      tls: false  # local plaintext stack; drop for a TLS coordinator
       method: oauth
       client_id: "{{ env_var('SQE_CLIENT_ID') }}"
       client_secret: "{{ env_var('SQE_CLIENT_SECRET') }}"
@@ -33,6 +35,7 @@ my_project:
       type: sqe
       host: localhost
       port: 50051
+      tls: false  # local plaintext stack; drop for a TLS coordinator
       token: "{{ env_var('SQE_TOKEN') }}"
       catalog: warehouse
       schema: analytics
