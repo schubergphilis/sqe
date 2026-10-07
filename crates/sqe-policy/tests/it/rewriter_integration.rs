@@ -217,6 +217,109 @@ async fn row_filter_injects_filter_above_scan() {
     assert_eq!(rows, 2, "row filter should leave only EU rows");
 }
 
+/// A caller predicate must never be evaluated on a row the row filter hides.
+/// The optimizer merges the policy Filter with the caller's WHERE into one
+/// conjunction, and AND evaluates its right side over the whole batch when
+/// enough rows pass (2 of 3 here). Unguarded, `1 / (customer_id - 2)` then
+/// runs on the hidden US row (customer_id 2) and the divide-by-zero error
+/// reveals that the hidden row is in region US.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn caller_predicate_cannot_error_on_rows_the_row_filter_hides() {
+    let (mem, _) = build_scan("employees");
+    let ctx = SessionContext::new();
+    ctx.register_table("employees", mem).unwrap();
+    let store = InMemoryPolicyStore::new();
+    let mut policy = ResolvedPolicy::default();
+    policy.row_filters.push(col("region").eq(lit("EU")));
+    store
+        .add_table_policy("public", "employees", policy.clone())
+        .await;
+    store.add_table_policy("default", "employees", policy).await;
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store));
+
+    let sql = "SELECT customer_id FROM employees \
+               WHERE CASE WHEN region = 'US' THEN 1 / (customer_id - 2) ELSE 1 END = 1";
+    let plan = ctx.state().create_logical_plan(sql).await.unwrap();
+    let (plan, _summary) = rewriter
+        .evaluate(&user("alice", &[]), &sqe_policy::TableScope::default(), plan)
+        .await
+        .unwrap();
+    let batches = ctx
+        .execute_logical_plan(plan)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .expect("the hidden row must not be reachable through a runtime error");
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 2, "both visible EU rows pass the caller predicate");
+}
+
+async fn eu_rewriter() -> PolicyPlanRewriter {
+    let store = InMemoryPolicyStore::new();
+    let mut policy = ResolvedPolicy::default();
+    policy.row_filters.push(col("region").eq(lit("EU")));
+    store
+        .add_table_policy("public", "employees", policy.clone())
+        .await;
+    store.add_table_policy("default", "employees", policy).await;
+    PolicyPlanRewriter::new(Arc::new(store))
+}
+
+/// A predicate that cannot fail keeps flowing through the row filter (and
+/// so into scan pruning): the guard is only paid for when it is needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn infallible_caller_predicate_is_not_guarded() {
+    let (mem, _) = build_scan("employees");
+    let ctx = SessionContext::new();
+    ctx.register_table("employees", mem).unwrap();
+    let sql = "SELECT customer_id FROM employees WHERE customer_id > 1 AND ssn LIKE '3%'";
+    let plan = ctx.state().create_logical_plan(sql).await.unwrap();
+    let (plan, _summary) = eu_rewriter()
+        .await
+        .evaluate(&user("alice", &[]), &sqe_policy::TableScope::default(), plan)
+        .await
+        .unwrap();
+    let s = format!("{}", plan.display_indent());
+    assert!(!s.contains("CASE WHEN"), "no guard expected, got: {s}");
+    let batches = ctx.execute_logical_plan(plan).await.unwrap().collect().await.unwrap();
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 1, "only customer 3 is EU, > 1 and starts with 3");
+}
+
+/// A fallible predicate already pushed into the scan (a view body is
+/// optimized when it is planned) would run on raw rows below the row filter.
+/// It is lifted out of the scan and re-applied above the guard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallible_scan_filter_is_lifted_above_the_guard() {
+    let (mem, _) = build_scan("employees");
+    let fallible = (lit(1i64) / (col("customer_id") - lit(2i64))).eq(lit(1i64));
+    let plan = LogicalPlanBuilder::scan_with_filters(
+        TableReference::bare("employees"),
+        provider_as_source(mem.clone()),
+        None,
+        vec![fallible],
+    )
+    .unwrap()
+    .build()
+    .unwrap();
+    let (plan, _summary) = eu_rewriter()
+        .await
+        .evaluate(&user("alice", &[]), &sqe_policy::TableScope::default(), plan)
+        .await
+        .unwrap();
+    let s = format!("{}", plan.display_indent());
+    let scan_line = s.lines().find(|l| l.contains("TableScan")).unwrap();
+    assert!(
+        !scan_line.contains("customer_id - "),
+        "fallible filter must leave the scan, got: {s}"
+    );
+    assert!(s.contains("CASE WHEN"), "the guard must be applied, got: {s}");
+    let guard_at = s.find("CASE WHEN").unwrap();
+    let lifted_at = s.find("customer_id - ").expect("filter re-applied");
+    assert!(lifted_at < guard_at, "the lifted filter must sit above the guard: {s}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nullify_mask_on_bigint_executes_without_type_error() {
     // Regression test for #84.
