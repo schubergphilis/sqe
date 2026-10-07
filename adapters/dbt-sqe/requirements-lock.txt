@@ -79,7 +79,7 @@ certifi==2026.7.22 \
     # via
     #   -c /private/tmp/claude-502/-Users-jjverhoeks-git-schuberg-vpf-data-ai-chameleon-Applications-sqlengine/6065c382-f105-4519-b13e-33b965a2ca20/scratchpad/dbtvenv/../constraints.txt
     #   requests
-charset-normalizer==3.5.1 \
+charset-normalizer==3.5.2 \
     --hash=sha256:00668ebb0609751758682eb0b5857e7c35b9f00e84dfdef062e103244ec94d45 \
     --hash=sha256:012a22b88a77ca2e59b98ac5889b0deb604147666032f45e6d6e217634d2550d \
     --hash=sha256:01e93745f7f219b703b60ba7afead36cfc4242782be5af484673fc500df12da5 \
@@ -388,7 +388,7 @@ leather==0.4.1 \
     # via
     #   -c /private/tmp/claude-502/-Users-jjverhoeks-git-schuberg-vpf-data-ai-chameleon-Applications-sqlengine/6065c382-f105-4519-b13e-33b965a2ca20/scratchpad/dbtvenv/../constraints.txt
     #   agate
-markupsafe==3.0.3 \
+markupsafe==3.0.4 \
     --hash=sha256:0303439a41979d9e74d18ff5e2dd8c43ed6c6001fd40e5bf2e43f7bd9bbc523f \
     --hash=sha256:068f375c472b3e7acbe2d5318dea141359e6900156b5b2ba06a30b169086b91a \
     --hash=sha256:0bf2a864d67e76e5c9a34dc26ec616a66b9888e25e7b9460e1c76d3293bd9dbf \
@@ -481,7 +481,7 @@ markupsafe==3.0.3 \
     # via
     #   -c /private/tmp/claude-502/-Users-jjverhoeks-git-schuberg-vpf-data-ai-chameleon-Applications-sqlengine/6065c382-f105-4519-b13e-33b965a2ca20/scratchpad/dbtvenv/../constraints.txt
     #   jinja2
-mashumaro==3.22 \
+mashumaro==3.23 \
     --hash=sha256:5ef6f2b963892cbe9a4ceb3441dfbea37f8c3412523f25d42e9b3a7186555f1d \
     --hash=sha256:c12a649599a8f7b1a0b35d18f12e678423c3066189f7bc7bd8dd431c5c8132c3
     # via
@@ -495,7 +495,7 @@ more-itertools==10.8.0 \
     # via
     #   -c /private/tmp/claude-502/-Users-jjverhoeks-git-schuberg-vpf-data-ai-chameleon-Applications-sqlengine/6065c382-f105-4519-b13e-33b965a2ca20/scratchpad/dbtvenv/../constraints.txt
     #   dbt-semantic-interfaces
-msgpack==1.2.2 \
+msgpack==1.2.3 \
     --hash=sha256:06d95f61de7afe4f4ff908a6feebfcb070d0582ac87c9cf3cedf8551cf634516 \
     --hash=sha256:0708afbf6a9587f0bfe479a9825c141d14d91e2f6a5c8103cf28bc96f4edb5d9 \
     --hash=sha256:0883a1578168929fd1640fbbc4614773f1a130e419a8a817dc2918d9af1b651c \
@@ -826,19 +826,19 @@ python-dateutil==2.9.0.post0 \
     #   -c /private/tmp/claude-502/-Users-jjverhoeks-git-schuberg-vpf-data-ai-chameleon-Applications-sqlengine/6065c382-f105-4519-b13e-33b965a2ca20/scratchpad/dbtvenv/../constraints.txt
     #   dbt-common
     #   dbt-semantic-interfaces
-python-slugify==9.1.1 \
+python-slugify==9.1.2 \
     --hash=sha256:1cd20fe7ebf941b11964a92aba9e5319edfe18606276c6e2481b92e737cde44a \
     --hash=sha256:b1180fb0fd6b3590e7fbd8328b08d56cde9dcac736527a070c0a811480621316
     # via
     #   -c /private/tmp/claude-502/-Users-jjverhoeks-git-schuberg-vpf-data-ai-chameleon-Applications-sqlengine/6065c382-f105-4519-b13e-33b965a2ca20/scratchpad/dbtvenv/../constraints.txt
     #   agate
-pytimeparse==1.1.8 \
+pytimeparse==1.1.9 \
     --hash=sha256:04b7be6cc8bd9f5647a6325444926c3ac34ee6bc7e69da4367ba282f076036bd \
     --hash=sha256:e86136477be924d7e670646a98561957e8ca7308d44841e21f5ddea757556a0a
     # via
     #   -c /private/tmp/claude-502/-Users-jjverhoeks-git-schuberg-vpf-data-ai-chameleon-Applications-sqlengine/6065c382-f105-4519-b13e-33b965a2ca20/scratchpad/dbtvenv/../constraints.txt
     #   agate
-pytz==2026.4 \
+pytz==2026.5 \
     --hash=sha256:2211d3fcf9a797d3405cac96ac7f61d80e6a644f72a3309607282fe8a2010c5d \
     --hash=sha256:dd95840dd199baea12d9cc096a1d452caa6596a1c1e4b5f3dbd1541855d5e815
     # via
@@ -938,7 +938,7 @@ requests==2.34.2 \
     #   dbt-common
     #   dbt-core
     #   snowplow-tracker
-rpds-py==2026.6.3 \
+rpds-py==2026.9.1 \
     --hash=sha256:0be972be84cfcaf46c8c6edf690ca0f154ac17babf1f6a955a51579b34ad2dc5 \
     --hash=sha256:127565fead0a10943b282957bd5447804ff3160ad79f2ad2635e6d249e380680 \
     --hash=sha256:127e08c0642d880cf32ca47ec2a4a77b901f7e2dd1ad9762adb13955d72ffcc9 \
@@ -1112,7 +1112,7 @@ urllib3==2.8.0 \
     # via
     #   -c /private/tmp/claude-502/-Users-jjverhoeks-git-schuberg-vpf-data-ai-chameleon-Applications-sqlengine/6065c382-f105-4519-b13e-33b965a2ca20/scratchpad/dbtvenv/../constraints.txt
     #   requests
-zipp==4.1.0 \
+zipp==4.1.1 \
     --hash=sha256:25ad4e16390cd314347dd8f1de67a2ac538ae658ed4ab9db16029c07c188e97f \
     --hash=sha256:4cb57381f544315db7688e976e922a2b18cdb513d21cc194eb42232ba2a3e602
     # via
