@@ -35,7 +35,7 @@ own AWS credentials. Every `sqe-server` build carries the Glue client, so a
 stock release binary or image works; no feature flag is needed. Build with
 `--release`: a debug binary decodes Parquet and
 runs DataFusion 5 to 10 times slower, and the server warns at startup when it
-is one. The startup line and `/api/v1/status` report `build_profile` and
+is one. The startup line and `/api/v1/status/detail` (admin bearer) report `build_profile` and
 `git_sha` so you can check which binary answered.
 
 The flags:
