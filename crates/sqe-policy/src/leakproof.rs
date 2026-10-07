@@ -11,9 +11,11 @@
 //! The classification is an allowlist: column references, literals, boolean
 //! logic, comparisons, `IN`, `BETWEEN`, `LIKE` with a constant pattern, and
 //! `CASE`/`CAST` built from these, where every implicit coercion of a value
-//! read from a row is a lossless widening. Everything else (arithmetic,
-//! functions, subqueries, a cast that can fail) counts as fallible. A
-//! sub-expression that reads no row is data-independent and never counts.
+//! read from a row is a lossless widening, plus `EXISTS` and `IN (subquery)`
+//! (their bodies are checked as plans of their own). Everything else
+//! (arithmetic, functions, scalar subqueries, a cast that can fail) counts as
+//! fallible. A sub-expression that reads no row is data-independent and
+//! never counts.
 
 use arrow_schema::DataType;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
@@ -162,6 +164,20 @@ pub(crate) fn is_fallible(expr: &Expr, schema: &DFSchema) -> bool {
                 || !matches!(type_of(&c.expr, schema), Some(from) if widens(&from, c.field.data_type()))
         }
         Expr::GroupingSet(g) => g.distinct_expr().into_iter().any(f),
+        // The subquery body is walked as a plan of its own
+        // (`apply_with_subqueries`), so only the outer side counts here. An
+        // existence test cannot fail; `IN` can only fail through the
+        // coercion between the outer value and the subquery's column. A
+        // scalar subquery stays fallible: "more than one row" depends on
+        // the data.
+        Expr::Exists(_) => false,
+        Expr::InSubquery(i) => {
+            f(&i.expr)
+                || !matches!(
+                    (type_of(&i.expr, schema), i.subquery.subquery.schema().fields().first()),
+                    (Some(outer), Some(inner)) if coerce_widens(&[outer.clone(), inner.data_type().clone()])
+                )
+        }
         _ => true,
     }
 }
@@ -193,17 +209,25 @@ fn coerces_losslessly(exprs: &[&Expr], schema: &DFSchema) -> bool {
     let Some(types) = exprs.iter().map(|e| type_of(e, schema)).collect::<Option<Vec<_>>>() else {
         return false;
     };
-    let Some(common) = types
-        .iter()
-        .skip(1)
-        .try_fold(types[0].clone(), |acc, t| comparison_coercion(&acc, t))
-    else {
+    let Some(common) = common_type(&types) else {
         return false;
     };
     exprs
         .iter()
         .zip(&types)
         .all(|(e, t)| !reads_rows(e) || widens(t, &common))
+}
+
+fn common_type(types: &[DataType]) -> Option<DataType> {
+    let (first, rest) = types.split_first()?;
+    rest.iter()
+        .try_fold(first.clone(), |acc, t| comparison_coercion(&acc, t))
+}
+
+/// True when every one of `types`, all read from rows, widens to their
+/// common comparison type.
+fn coerce_widens(types: &[DataType]) -> bool {
+    common_type(types).is_some_and(|common| types.iter().all(|t| widens(t, &common)))
 }
 
 fn is_string(t: &DataType) -> bool {
@@ -318,6 +342,27 @@ mod tests {
         ] {
             assert!(is_fallible(&e, &s), "{e} should be fallible");
         }
+    }
+
+    #[test]
+    fn existence_and_membership_subqueries_are_leakproof() {
+        use datafusion::logical_expr::expr_fn::{exists, in_subquery, scalar_subquery};
+        use datafusion::logical_expr::LogicalPlanBuilder;
+        use std::sync::Arc;
+        let s = schema();
+        let ints = Arc::new(
+            LogicalPlanBuilder::values(vec![vec![lit(1i64)]]).unwrap().build().unwrap(),
+        );
+        let strings = Arc::new(
+            LogicalPlanBuilder::values(vec![vec![lit("a")]]).unwrap().build().unwrap(),
+        );
+        assert!(!is_fallible(&exists(ints.clone()), &s));
+        assert!(!is_fallible(&in_subquery(col("id"), ints.clone()), &s));
+        // The string column would be cast to the subquery's integer type.
+        assert!(is_fallible(&in_subquery(col("name"), ints.clone()), &s));
+        assert!(is_fallible(&in_subquery(col("id"), strings), &s));
+        assert!(is_fallible(&in_subquery(lit(1) / col("id"), ints.clone()), &s));
+        assert!(is_fallible(&col("id").eq(scalar_subquery(ints)), &s));
     }
 
     #[test]
