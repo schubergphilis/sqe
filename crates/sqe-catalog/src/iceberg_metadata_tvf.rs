@@ -20,12 +20,12 @@
 //! `SessionCatalog::load_table` on the *session's* catalog, which carries the
 //! caller's own bearer token, so a Polaris principal without `loadTable` on
 //! the table gets the catalog's 403 and no metadata. The policy rewriter
-//! does not apply here: it keys `TableScan`s by `scan.table_name`, which for
-//! a TVF is the function name (`table_files`), not the target table. The
-//! coordinator therefore resolves the target via [`metadata_tvf_target_ident`]
-//! before the rewrite (`deny_hidden_metadata_tvf_targets` in
-//! `query_handler.rs`) and refuses the statement as "table not found" when the
-//! policy store denies the caller all access to the target. Residual: row
+//! keys `TableScan`s by `scan.table_name`, which for a TVF is the function
+//! name (`table_files`), not the target table, so it is handed
+//! [`metadata_tvf_target_ident`] (`PolicyPlanRewriter::with_metadata_target`)
+//! and, on every path that enforces policy (queries, subqueries, CTAS/INSERT,
+//! EXPLAIN), refuses the statement as "table not found" when the policy
+//! store denies the caller all access to the target. Residual: row
 //! filters and column masks still do not reach this output, so partition
 //! values and bounds of a restricted or masked column remain visible to a
 //! caller who holds any privilege on the table.

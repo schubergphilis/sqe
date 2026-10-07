@@ -50,7 +50,15 @@ pub struct PolicyPlanRewriter {
     /// instead of the Iceberg convention. Defaults to empty, which is why an
     /// Iceberg-only deployment never takes the Hive branch.
     hive_catalogs: Arc<HiveCatalogs>,
+    /// Maps a metadata TVF provider (`table_files('ns','t')`, ...) to the
+    /// `(namespace, table)` it describes. `None` when not wired (unit tests).
+    metadata_target: Option<MetadataTarget>,
 }
+
+/// `(namespace, table)` a metadata TVF provider reads, `None` for any other
+/// provider. Injected because the TVF type lives in `sqe-catalog`.
+pub type MetadataTarget =
+    fn(&dyn datafusion::catalog::TableProvider) -> Option<(String, String)>;
 
 impl PolicyPlanRewriter {
     pub fn new(store: Arc<dyn PolicyStore>) -> Self {
@@ -60,7 +68,17 @@ impl PolicyPlanRewriter {
             tag_source: Arc::new(NoopTagSource),
             mask_precedence: sqe_core::config::MaskPrecedence::default(),
             hive_catalogs: Arc::new(HiveCatalogs::default()),
+            metadata_target: None,
         }
+    }
+
+    /// Inject the metadata TVF target lookup. With it, `evaluate` refuses a
+    /// plan whose metadata TVF names a table the caller is denied all
+    /// access to, on every path that enforces policy (#750).
+    #[must_use = "with_metadata_target consumes self; bind the returned rewriter"]
+    pub fn with_metadata_target(mut self, metadata_target: MetadataTarget) -> Self {
+        self.metadata_target = Some(metadata_target);
+        self
     }
 
     /// Choose which mask wins when a resource mask and a tag mask cover the same
@@ -141,10 +159,20 @@ impl PolicyEnforcer for PolicyPlanRewriter {
         // usually empty, leaking the base table raw. Mark such scans for a
         // fail-closed deny rather than trusting the view-name policy.
         let mut view_scans: HashSet<String> = HashSet::new();
+        // Tables described by metadata TVF scans. The scan itself is keyed by
+        // the function name, so the target's own policy is checked below.
+        let mut metadata_targets: Vec<(String, String)> = Vec::new();
         plan.apply_with_subqueries(|node| {
             if let LogicalPlan::TableScan(scan) = node {
                 let table_name = scan.table_name.to_string();
                 if let Ok(provider) = datafusion::datasource::source_as_provider(&scan.source) {
+                    if let Some(target) =
+                        self.metadata_target.and_then(|f| f(provider.as_ref()))
+                    {
+                        if !metadata_targets.contains(&target) {
+                            metadata_targets.push(target);
+                        }
+                    }
                     // TableProvider has `Any` as a supertrait but no `as_any()`
                     // method; upcast the reference to downcast to ViewTable.
                     let any_provider: &dyn std::any::Any = provider.as_ref();
@@ -165,6 +193,29 @@ impl PolicyEnforcer for PolicyPlanRewriter {
             Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
         })
         .map_err(|e| sqe_core::error::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Plan traversal failed: {e}")))?;
+
+        // A metadata TVF exposes file paths, partition values and row counts
+        // of its target, so a caller denied all access to the target is
+        // refused, with the missing-table wording so "denied" is
+        // indistinguishable from "never existed" (#750). Table-level only.
+        let no_tags = HashMap::new();
+        for (ns, table) in &metadata_targets {
+            let policy = resolve_effective_policy(
+                store.as_ref(),
+                user,
+                table,
+                ns,
+                &no_tags,
+                self.mask_precedence,
+            )
+            .await;
+            if policy_denies_all(&policy) {
+                return Err(sqe_core::error::SqeError::with_code(
+                    sqe_core::SqeErrorCode::TableNotFound,
+                    format!("table not found: {ns}.{table}"),
+                ));
+            }
+        }
 
         // Resolve policies for all tables
         let mut table_policies: HashMap<String, ResolvedPolicy> = HashMap::new();
@@ -2065,6 +2116,70 @@ mod tests {
             2,
             "the caller's columns are unchanged"
         );
+    }
+
+    /// #750: a metadata TVF over a table the caller is denied all access to is
+    /// refused by `evaluate` itself (so CTAS/INSERT/EXPLAIN are covered too),
+    /// including when the TVF sits inside a subquery.
+    #[tokio::test]
+    async fn metadata_tvf_over_a_denied_table_is_refused_inside_a_subquery() {
+        use crate::policy_store::InMemoryPolicyStore;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::catalog::TableProvider;
+        use datafusion::datasource::empty::EmptyTable;
+        use datafusion::datasource::provider_as_source;
+        use datafusion::logical_expr::exists;
+        use sqe_core::SessionUser;
+
+        // Stand-in for `table_files('sales','orders')`: an EmptyTable that the
+        // injected lookup maps to its target.
+        fn target(p: &dyn TableProvider) -> Option<(String, String)> {
+            (p as &dyn std::any::Any)
+                .downcast_ref::<EmptyTable>()
+                .map(|_| ("sales".to_string(), "orders".to_string()))
+        }
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let tvf = LogicalPlanBuilder::scan(
+            "table_files",
+            provider_as_source(Arc::new(EmptyTable::new(Arc::clone(&schema)))),
+            None,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let plan = datafusion::logical_expr::builder::table_scan(Some("t"), &schema, None)
+            .unwrap()
+            .filter(exists(Arc::new(tvf)))
+            .unwrap()
+            .build()
+            .unwrap();
+        let user = SessionUser {
+            username: "analyst".to_string(),
+            roles: vec![],
+            subject: None,
+            email: None,
+            groups: vec![],
+        };
+
+        let store = Arc::new(InMemoryPolicyStore::new());
+        let rewriter = PolicyPlanRewriter::new(store.clone()).with_metadata_target(target);
+        assert!(
+            rewriter
+                .evaluate(&user, &crate::TableScope::default(), plan.clone())
+                .await
+                .is_ok(),
+            "no policy on the target: passes"
+        );
+
+        let mut deny = ResolvedPolicy::default();
+        deny.row_filters.push(lit(false));
+        store.add_table_policy("sales", "orders", deny).await;
+        let err = rewriter
+            .evaluate(&user, &crate::TableScope::default(), plan)
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::TableNotFound);
+        assert!(err.to_string().contains("table not found: sales.orders"), "{err}");
     }
 
     // ── resolve_effective_policy (SHOW EFFECTIVE POLICY diagnostic) ───────
