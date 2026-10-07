@@ -1,4 +1,5 @@
 pub mod grants;
+mod leakproof;
 pub mod mask_udf;
 pub mod plan_rewriter;
 pub mod policy_expr;

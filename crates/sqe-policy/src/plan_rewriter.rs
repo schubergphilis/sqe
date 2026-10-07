@@ -8,7 +8,9 @@
 //! 3. Removes restricted columns from projections
 //!
 //! This happens BEFORE the optimizer runs, so:
-//! - User predicates CAN push through row filters (same semantics)
+//! - User predicates that cannot fail are pushed through row filters; when
+//!   any can fail, a row-filtered row reads as all NULL (no error oracle,
+//!   see `crate::leakproof`)
 //! - User predicates CANNOT push through column masks (expression boundary)
 //! - Restricted columns are invisible (not errors)
 
@@ -18,7 +20,8 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::common::tree_node::{Transformed, TreeNodeRecursion};
-use datafusion::logical_expr::{col, lit, Cast, Expr, LogicalPlan, LogicalPlanBuilder};
+use datafusion::logical_expr::utils::conjunction;
+use datafusion::logical_expr::{col, lit, when, Cast, Expr, LogicalPlan, LogicalPlanBuilder};
 use datafusion::scalar::ScalarValue;
 use tracing::{debug, warn};
 
@@ -398,6 +401,15 @@ impl PolicyEnforcer for PolicyPlanRewriter {
         // column is NOT a deny: it stays in the schema as a forced NULL.
         let summary = summarise_policies(&table_policies);
 
+        // Whether any caller expression the optimizer can move below a row
+        // filter could fail on a hidden row (see `crate::leakproof`). Only
+        // then are row-filtered tables read through the guard (step 1b),
+        // which costs those tables their scan pruning. A plan-wide switch,
+        // not per column: an alias in a view or subquery hides which scan
+        // column a predicate reads.
+        let guard_rows = table_policies.values().any(|p| !p.row_filters.is_empty())
+            && crate::leakproof::plan_has_fallible_predicate(&plan);
+
         // Rewrite the plan
         let rewritten = plan
             .transform_down_with_subqueries(|node| {
@@ -428,7 +440,19 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                         // row-group and row level, here and on workers. One that
                         // reads a masked or restricted column would filter on the
                         // value the mask hides, so it leaves the scan and is
-                        // re-applied above the mask (step 2b).
+                        // re-applied above the mask (step 2b). So does a
+                        // fallible one on a row-filtered table: in the scan it
+                        // runs on rows the row filter hides (step 1b).
+                        let guard = guard_rows && !policy.row_filters.is_empty();
+                        let source_schema = if guard && !scan.filters.is_empty() {
+                            datafusion::common::DFSchema::try_from_qualified_schema(
+                                scan.table_name.clone(),
+                                &scan.source.schema(),
+                            )
+                            .ok()
+                        } else {
+                            None
+                        };
                         let raw_on_governed: Vec<Expr> = scan
                             .filters
                             .iter()
@@ -436,7 +460,10 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                                 f.column_refs().iter().any(|c| {
                                     policy.is_restricted(&c.name)
                                         || policy.mask_for(&c.name).is_some()
-                                })
+                                }) || (guard
+                                    && source_schema.as_ref().is_none_or(|s| {
+                                        crate::leakproof::is_fallible(f, s)
+                                    }))
                             })
                             .cloned()
                             .collect();
@@ -464,6 +491,47 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                             builder = builder.filter(filter_expr.clone()).map_err(|e| {
                                 datafusion::error::DataFusionError::Internal(format!(
                                     "Failed to create policy filter: {e}"
+                                ))
+                            })?;
+                        }
+
+                        // 1b. Read every column through the row filter:
+                        //     `CASE WHEN <row filter> THEN col END`. The
+                        //     optimizer merges the Filter above with the
+                        //     caller's predicates into one conjunction (and may
+                        //     reorder it), and AND evaluates its right side over
+                        //     the whole batch unless few rows pass. A fallible
+                        //     caller predicate would then run on hidden rows and
+                        //     its error would reveal their values. Guarded, a
+                        //     hidden row is all NULL to everything above, wherever
+                        //     the predicate ends up. Cost: caller predicates on a
+                        //     row-filtered table no longer reach scan pruning,
+                        //     so the guard is only added when the plan holds a
+                        //     fallible expression (`guard_rows`).
+                        //     `write_predicates::unparse_predicates` recognises
+                        //     the guard by its shape.
+                        let guard_expr = if guard {
+                            conjunction(policy.row_filters.iter().cloned())
+                        } else {
+                            None
+                        };
+                        if let Some(guard) = guard_expr {
+                            let schema = builder.schema().clone();
+                            let exprs = schema
+                                .iter()
+                                .map(|(qualifier, field)| -> datafusion::error::Result<Expr> {
+                                    let column = Expr::Column(datafusion::common::Column::new(
+                                        qualifier.cloned(),
+                                        field.name(),
+                                    ));
+                                    Ok(when(guard.clone(), column)
+                                        .end()?
+                                        .alias_qualified(qualifier.cloned(), field.name().clone()))
+                                })
+                                .collect::<datafusion::error::Result<Vec<Expr>>>()?;
+                            builder = builder.project(exprs).map_err(|e| {
+                                datafusion::error::DataFusionError::Internal(format!(
+                                    "Failed to create policy row-filter guard: {e}"
                                 ))
                             })?;
                         }

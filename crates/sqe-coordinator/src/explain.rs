@@ -928,6 +928,14 @@ mod tests {
         assert!(!user.contains("MASKSECRET"), "mask body leaked:\n{user}");
         assert!(user.contains("<row filter>") && user.contains("<mask>"), "{user}");
         assert!(user.contains("Int64(7)"), "the user's own predicate stays visible:\n{user}");
+
+        // A fallible predicate adds the row-filter guard, whose CASE carries
+        // the row filter body too.
+        let sql = "SELECT id, name FROM datafusion.public.orders WHERE 70 / id > 7";
+        let admin = render(handler.plan(&session, sql, &ctx, true).await.unwrap());
+        assert!(admin.contains("CASE WHEN"), "guard expected:\n{admin}");
+        let user = render(handler.plan(&session, sql, &ctx, false).await.unwrap());
+        assert!(!user.contains("SECRETREGION"), "guard body leaked:\n{user}");
     }
 
     #[test]
