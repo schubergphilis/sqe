@@ -1,5 +1,5 @@
 //! Records the git commit and build profile into the binary (issue #669),
-//! so the startup log and `/api/v1/status` can say which code and which
+//! so the startup log and `/api/v1/status/detail` can say which code and which
 //! optimisation level is running. Falls back to `unknown` outside a git
 //! checkout (release tarballs, vendored builds) rather than failing the build.
 

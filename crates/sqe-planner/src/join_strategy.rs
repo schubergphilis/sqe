@@ -179,6 +179,16 @@ fn estimate_build_side_size(hash_join: &HashJoinExec) -> BuildSizeEstimate {
         Err(_) => return BuildSizeEstimate::Unknown,
     };
 
+    // The raw precision, inexact values included, so a run at
+    // `sqe_planner=debug` can set the estimate beside the build's actual
+    // `build_mem_used` (#784). Only an exact value drives the rewrite.
+    debug!(
+        join_type = ?hash_join.join_type(),
+        build_bytes = ?stats.total_byte_size,
+        build_rows = ?stats.num_rows,
+        "JoinStrategyRule: build-side statistics"
+    );
+
     match stats.total_byte_size {
         Precision::Exact(v) => BuildSizeEstimate::Exact(v),
         Precision::Inexact(_) | Precision::Absent => BuildSizeEstimate::Unknown,

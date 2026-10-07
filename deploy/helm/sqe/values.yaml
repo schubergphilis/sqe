@@ -224,6 +224,9 @@ config:
   security:
     allow_no_policy_engine: false
     allow_no_grant_backend: false
+    # production_mode refuses the plaintext Trino HTTP listener unless a
+    # TLS-terminating ingress/proxy fronts it and this says so.
+    allow_plaintext_behind_tls_proxy: false
 
   metrics:
     prometheus_port: 9090

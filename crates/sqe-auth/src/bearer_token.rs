@@ -1754,6 +1754,22 @@ Gsk+TB4BOZOZvvRKOPj1Dj5tcKc/tv2Hx8kiS4egVEC2qWmKaBDbv9kN
     // -----------------------------------------------------------------------
 
     #[tokio::test]
+    async fn malformed_optional_nbf_is_rejected_after_signature_verification() {
+        let (_handle, jwks_url) = start_jwks_server(build_jwks_json()).await;
+        let provider = BearerTokenProvider::new(test_config(&jwks_url)).unwrap();
+        let now = chrono::Utc::now().timestamp() as u64;
+        for nbf in [json!("99999999999"), json!(true), json!([]), json!({"time": now})] {
+            let claims = json!({"sub": "alice", "nbf": nbf, "exp": now + 3600});
+            let creds = FlightCredentials {
+                bearer_token: Some(sqe_core::SecretString::new(build_signed_jwt(&claims))),
+                ..Default::default()
+            };
+            assert!(matches!(provider.authenticate(&creds).await, Err(AuthError::AuthFailed(_))),
+                "validly signed malformed nbf must fail authentication: {nbf}");
+        }
+    }
+
+    #[tokio::test]
     async fn nbf_in_the_future_returns_auth_failed() {
         let jwks = build_jwks_json();
         let (_handle, jwks_url) = start_jwks_server(jwks).await;

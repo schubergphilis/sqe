@@ -43,6 +43,7 @@ my_project:
       type: sqe
       host: localhost
       port: 50051
+      tls: false  # local plaintext coordinator; omit when it runs with TLS
       user: jacob
       password: "{{ env_var('SQE_PASSWORD') }}"
       catalog: production
@@ -50,7 +51,7 @@ my_project:
       threads: 4
 ```
 
-`dbt debug` validates the connection and reports the SQE version. The adapter runs every dbt operation as the authenticated user, so models only see and write what that user is allowed to. See [dbt Compatibility](../design-notes/dbt-sqe.md) for the materialization details.
+The adapter connects over TLS by default. `tls: false` is for a local plaintext coordinator only, and `tls_root_certs` points at a PEM CA bundle when the coordinator's certificate comes from a private CA. `dbt debug` validates the connection and reports the SQE version. The adapter runs every dbt operation as the authenticated user, so models only see and write what that user is allowed to. See [dbt Compatibility](../design-notes/dbt-sqe.md) for the materialization details.
 
 ## Flight SQL over JDBC
 

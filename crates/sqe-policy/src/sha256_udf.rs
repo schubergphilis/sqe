@@ -10,12 +10,14 @@
 //!   defeats the privacy intent of column masking. Operators should
 //!   migrate to keyed mode.
 //!
-//! The function is registered under the SQL name `sha256` regardless of mode
-//! so SELECT statements that already use `sha256(col)` continue to work.
+//! The mask function is named [`MASK_HASH_UDF_NAME`] and is never registered
+//! in a session: HASH masks embed it into the plan directly, so users cannot
+//! call the keyed function and compare its output against masked values.
+//! Users get a plain, unkeyed `sha256` from [`user_sha256_udf`].
 //!
 //! Usage:
-//!   ctx.register_udf(sha256_udf(None));            // legacy unkeyed
-//!   ctx.register_udf(sha256_udf(Some(key_bytes))); // HMAC-SHA256
+//!   ctx.register_udf(user_sha256_udf(None));       // user-callable sha256
+//!   sha256_udf(Some(key_bytes))                    // HASH mask (HMAC-SHA256)
 
 use std::sync::Arc;
 
@@ -29,6 +31,10 @@ use sha2::{Digest, Sha256};
 use tracing::warn;
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Name of the HASH-mask function. Not registered in any session, so SQL
+/// cannot resolve it; it only appears in plans the policy rewriter builds.
+pub const MASK_HASH_UDF_NAME: &str = "__sqe_mask_sha256";
 
 /// Compute either HMAC-SHA256 (when `key` is `Some`) or plain SHA-256 (when
 /// `key` is `None`). The hex digest is returned as a Utf8 string.
@@ -53,6 +59,7 @@ fn hash_value(key: Option<&[u8]>, val: &[u8]) -> String {
 
 #[derive(Debug)]
 struct Sha256Func {
+    name: &'static str,
     signature: Signature,
     /// HMAC key when set. `None` means legacy unkeyed SHA-256.
     key: Option<Arc<Vec<u8>>>,
@@ -60,7 +67,8 @@ struct Sha256Func {
 
 impl PartialEq for Sha256Func {
     fn eq(&self, other: &Self) -> bool {
-        self.signature == other.signature
+        self.name == other.name
+            && self.signature == other.signature
             && match (&self.key, &other.key) {
                 (Some(a), Some(b)) => a.as_slice() == b.as_slice(),
                 (None, None) => true,
@@ -73,6 +81,7 @@ impl Eq for Sha256Func {}
 
 impl std::hash::Hash for Sha256Func {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
         self.signature.hash(state);
         match &self.key {
             Some(k) => {
@@ -87,6 +96,7 @@ impl std::hash::Hash for Sha256Func {
 impl Sha256Func {
     fn new(key: Option<Arc<Vec<u8>>>) -> Self {
         Self {
+            name: MASK_HASH_UDF_NAME,
             signature: Signature::exact(vec![DataType::Utf8], Volatility::Immutable),
             key,
         }
@@ -95,7 +105,7 @@ impl Sha256Func {
 
 impl ScalarUDFImpl for Sha256Func {
     fn name(&self) -> &str {
-        "sha256"
+        self.name
     }
 
     fn signature(&self) -> &Signature {
@@ -178,6 +188,16 @@ pub fn sha256_udf(key: Option<Arc<Vec<u8>>>) -> ScalarUDF {
     ScalarUDF::from(Sha256Func::new(key))
 }
 
+/// The user-callable `sha256(text)`. Pass `None` wherever HASH masks apply
+/// (the coordinator): a user-callable keyed hash would reproduce masked
+/// output. Only embedded mode, which has no policy, passes a key.
+pub fn user_sha256_udf(key: Option<Arc<Vec<u8>>>) -> ScalarUDF {
+    ScalarUDF::from(Sha256Func {
+        name: "sha256",
+        ..Sha256Func::new(key)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +217,30 @@ mod tests {
             return_field,
             config_options: Arc::new(ConfigOptions::default()),
         }
+    }
+
+    /// The keyed mask function must not be reachable as `sha256`: SQL users
+    /// get only the unkeyed function under that name.
+    #[test]
+    fn test_keyed_mask_udf_is_not_user_sha256() {
+        let mask = sha256_udf(Some(Arc::new(b"k".to_vec())));
+        assert_ne!(mask.name(), "sha256");
+        assert_eq!(mask.name(), MASK_HASH_UDF_NAME);
+
+        let user = user_sha256_udf(None);
+        assert_eq!(user.name(), "sha256");
+        let input = ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(Some(
+            "hello".to_string(),
+        )));
+        let result = user.invoke_with_args(make_args(vec![input], 1)).unwrap();
+        let ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(Some(hash))) = result
+        else {
+            panic!("Expected Utf8 scalar");
+        };
+        assert_eq!(
+            hash, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            "user sha256 is plain SHA-256"
+        );
     }
 
     #[test]

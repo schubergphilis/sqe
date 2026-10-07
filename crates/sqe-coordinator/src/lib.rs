@@ -11,6 +11,7 @@
 pub(crate) mod adaptive_sort;
 pub(crate) mod audit_emitter;
 pub(crate) mod audit_resources;
+pub(crate) mod buffered_result;
 pub mod audit_tag_adapter;
 pub(crate) mod catalog_ops;
 pub mod channel_pool;
@@ -31,6 +32,8 @@ pub mod maintenance_log;
 pub mod maintenance_principal;
 pub mod maintenance_scheduler;
 pub mod memory;
+pub(crate) mod memory_headroom;
+pub(crate) mod query_memory;
 pub mod metrics_history;
 pub mod mode;
 pub(crate) mod parallel_probe_scan;
@@ -90,6 +93,7 @@ pub use quack_executor::CoordinatorExecutor;
 pub use query_handler::QueryHandler;
 pub use runtime_catalog::{AttachedCatalog, RuntimeCatalogRegistry};
 pub use session_manager::SessionManager;
+pub use ticket_credentials::load_ticket_signer;
 
 /// Parse the `audit.gdpr_identifier_mode` config string.
 ///
@@ -359,3 +363,9 @@ superdebug_log_results = {enabled}
         );
     }
 }
+
+#[cfg(test)]
+mod tpcbb_preaggregation_test;
+
+#[cfg(test)]
+mod planner_entry_lint;

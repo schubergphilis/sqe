@@ -43,6 +43,10 @@ pub fn build_worker_service_with_hot_reload(
     memory_pool: Option<Arc<ResizableFairSpillPool>>,
     config_path: Option<&str>,
 ) -> anyhow::Result<WorkerFlightService> {
+    // Fail closed before anything listens: `validate()` only guards a worker
+    // that has a `coordinator_url`, so a static-topology worker would
+    // otherwise boot without authentication.
+    config.worker.require_secret().map_err(|e| anyhow::anyhow!(e))?;
     let worker_flight_compression = config.coordinator.worker_flight_compression;
     crate::executor::configure_row_group_pruning(config.worker.row_group_pruning);
 

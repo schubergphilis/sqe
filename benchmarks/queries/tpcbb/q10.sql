@@ -3,24 +3,42 @@
 --              (store, catalog, web) and summarise their spend and web browsing
 --              behaviour. Customers active in 2+ channels are multi-channel.
 -- timeout: 180s
-WITH channel_activity AS (
+-- Each channel is summed per customer before the join. Joining the three
+-- fact tables to customer directly multiplied every SUM by the customer's
+-- row counts in the other two channels.
+WITH store_spend AS (
+    SELECT ss_customer_sk AS customer_sk, SUM(ss_net_paid) AS spend
+    FROM store_sales
+    WHERE ss_customer_sk IS NOT NULL
+    GROUP BY ss_customer_sk
+),
+catalog_spend AS (
+    SELECT cs_bill_customer_sk AS customer_sk, SUM(cs_net_paid) AS spend
+    FROM catalog_sales
+    WHERE cs_bill_customer_sk IS NOT NULL
+    GROUP BY cs_bill_customer_sk
+),
+web_spend AS (
+    SELECT ws_bill_customer_sk AS customer_sk, SUM(ws_net_paid) AS spend
+    FROM web_sales
+    WHERE ws_bill_customer_sk IS NOT NULL
+    GROUP BY ws_bill_customer_sk
+),
+channel_activity AS (
     SELECT
         c.c_customer_sk,
         c.c_customer_id,
-        MAX(CASE WHEN ss.ss_customer_sk IS NOT NULL THEN 1 ELSE 0 END) AS uses_store,
-        MAX(CASE WHEN cs.cs_bill_customer_sk IS NOT NULL THEN 1 ELSE 0 END) AS uses_catalog,
-        MAX(CASE WHEN ws.ws_bill_customer_sk IS NOT NULL THEN 1 ELSE 0 END) AS uses_web,
-        COALESCE(SUM(ss.ss_net_paid), 0)   AS store_spend,
-        COALESCE(SUM(cs.cs_net_paid), 0)   AS catalog_spend,
-        COALESCE(SUM(ws.ws_net_paid), 0)   AS web_spend
+        CASE WHEN ss.customer_sk IS NOT NULL THEN 1 ELSE 0 END AS uses_store,
+        CASE WHEN cs.customer_sk IS NOT NULL THEN 1 ELSE 0 END AS uses_catalog,
+        CASE WHEN ws.customer_sk IS NOT NULL THEN 1 ELSE 0 END AS uses_web,
+        COALESCE(ss.spend, 0) AS store_spend,
+        COALESCE(cs.spend, 0) AS catalog_spend,
+        COALESCE(ws.spend, 0) AS web_spend
     FROM
         customer c
-        LEFT JOIN store_sales   ss ON ss.ss_customer_sk       = c.c_customer_sk
-        LEFT JOIN catalog_sales cs ON cs.cs_bill_customer_sk  = c.c_customer_sk
-        LEFT JOIN web_sales     ws ON ws.ws_bill_customer_sk  = c.c_customer_sk
-    GROUP BY
-        c.c_customer_sk,
-        c.c_customer_id
+        LEFT JOIN store_spend   ss ON ss.customer_sk = c.c_customer_sk
+        LEFT JOIN catalog_spend cs ON cs.customer_sk = c.c_customer_sk
+        LEFT JOIN web_spend     ws ON ws.customer_sk = c.c_customer_sk
 ),
 web_activity AS (
     SELECT

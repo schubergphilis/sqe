@@ -52,6 +52,20 @@ impl HiveManifestStore {
         }
     }
 
+    /// The same store, with every `check_path` gate evaluated for `caller`
+    /// instead of the caller baked in at attach time. DDL issued by a session
+    /// must be authorized as that session's user, not as whoever attached
+    /// the root (`trusted_startup_config()` for a `[[hive.roots]]` entry).
+    pub fn with_caller(&self, caller: TvfCaller) -> Self {
+        Self {
+            root: self.root.clone(),
+            store: Arc::clone(&self.store),
+            limits: self.limits,
+            tvf: self.tvf.clone(),
+            caller,
+        }
+    }
+
     /// `<root_path>/<database>/<table>/_sqe/table.json`.
     pub fn manifest_path(&self, database: &str, table: &str) -> Path {
         self.database_prefix(database)

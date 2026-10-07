@@ -161,6 +161,11 @@ pub struct SqeCatalogProvider {
     /// of rebuilding it per lookup (review 307). Table-name snapshots
     /// themselves are process-global; see `schema_provider.rs`.
     schema_providers: DashMap<String, Arc<SqeSchemaProvider>>,
+    /// `true` when the construction-time namespace listing succeeded with
+    /// this session's catalog bearer, i.e. the catalog answered for this
+    /// caller. `false` when it degraded to empty (forbidden or unresolvable)
+    /// and for providers built from a pre-known namespace list.
+    listing_succeeded: bool,
 }
 
 impl std::fmt::Debug for SqeCatalogProvider {
@@ -225,13 +230,17 @@ impl SqeCatalogProvider {
         //   * `degrade_unresolvable` is set and the catalog is an unresolvable
         //     static anchor whose warehouse does not exist (#501).
         // Transient/infra faults always propagate so the build fails loudly.
+        let mut listing_succeeded = false;
         let cached_namespaces = match Self::list_visible_namespace_names(
             Arc::clone(&session_catalog),
             namespace_visibility_filter,
         )
         .await
         {
-            Ok(names) => names,
+            Ok(names) => {
+                listing_succeeded = true;
+                names
+            }
             Err(e) if should_degrade_to_empty_namespaces(&e, degrade_unresolvable) => {
                 if e.error_code() == sqe_core::SqeErrorCode::AccessDenied {
                     debug!(
@@ -266,7 +275,16 @@ impl SqeCatalogProvider {
             prom_metrics: None,
             tuning: ScanTuning::default(),
             schema_providers: DashMap::new(),
+            listing_succeeded,
         })
+    }
+
+    /// Whether the construction-time namespace listing succeeded with this
+    /// session's catalog bearer. With a per-user bearer that is proof the
+    /// caller may use the catalog; a forbidden or unresolvable catalog
+    /// degrades to empty and reports `false`.
+    pub fn listing_succeeded(&self) -> bool {
+        self.listing_succeeded
     }
 
     /// Replace every scan tuning knob at once (#575). Handed unchanged to
@@ -319,6 +337,7 @@ impl SqeCatalogProvider {
             prom_metrics: None,
             tuning: ScanTuning::default(),
             schema_providers: DashMap::new(),
+            listing_succeeded: false,
         }
     }
 
@@ -343,29 +362,75 @@ impl SqeCatalogProvider {
     /// miss case, cooldown-gated), then refresh its table-name snapshot when
     /// it is older than the TTL. Errors are folded into the snapshot with
     /// their reason and returned for the caller to log.
+    ///
+    /// A miss inside the re-list cooldown asks the catalog about that one
+    /// namespace before the planner answers "schema not found". dbt runs
+    /// models in parallel on connections that share this provider: model A's
+    /// `CREATE SCHEMA` on another coordinator replica, or any writer outside
+    /// SQE, is not in a list another statement re-read moments ago, and the
+    /// cooldown used to turn that into a hard "schema not found".
     pub async fn refresh_namespace(&self, namespace: &str) -> sqe_core::Result<()> {
-        let known = self
-            .cached_namespaces
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .any(|n| n == namespace);
-        if !known && relist_due(&self.namespace_relist_at, NAMESPACE_RELIST_COOLDOWN) {
-            let fresh = Self::list_visible_namespace_names(
-                Arc::clone(&self.session_catalog),
-                self.namespace_visibility_filter,
-            )
-            .await?;
-            *self
-                .cached_namespaces
-                .write()
-                .unwrap_or_else(PoisonError::into_inner) = fresh;
+        let known = self.is_cached_namespace(namespace);
+        if !known {
+            if relist_due(&self.namespace_relist_at, NAMESPACE_RELIST_COOLDOWN) {
+                let fresh = Self::list_visible_namespace_names(
+                    Arc::clone(&self.session_catalog),
+                    self.namespace_visibility_filter,
+                )
+                .await?;
+                *self
+                    .cached_namespaces
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner) = fresh;
+            } else if self.probe_missing_namespace(namespace).await? {
+                let mut names = self
+                    .cached_namespaces
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if !names.iter().any(|n| n == namespace) {
+                    names.push(namespace.to_string());
+                }
+            }
+            // Still unknown: the planner answers "schema not found", and
+            // listing the tables of a namespace that does not exist would
+            // only fail.
+            if !self.is_cached_namespace(namespace) {
+                return Ok(());
+            }
         }
         let provider = self.schema_provider(namespace);
         if provider.needs_refresh() {
             provider.refresh_table_names().await?;
         }
         Ok(())
+    }
+
+    fn is_cached_namespace(&self, namespace: &str) -> bool {
+        self.cached_namespaces
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|n| n == namespace)
+    }
+
+    /// One catalog round trip for a namespace missing from the snapshot:
+    /// `Ok(true)` when it exists and the caller may see it (the same rule
+    /// as the listing: a 403 hides it), `Ok(false)` when it does not exist
+    /// or is hidden. Other failures propagate, as a failed listing would.
+    async fn probe_missing_namespace(&self, namespace: &str) -> sqe_core::Result<bool> {
+        let ident = NamespaceIdent::from_strs(namespace.split('.')).map_err(|e| {
+            sqe_core::SqeError::catalog_src(format!("Invalid namespace {namespace}: {e}"), e)
+        })?;
+        let probe = if self.namespace_visibility_filter && self.session_catalog.is_rest_backend() {
+            self.session_catalog.namespace_visible(&ident).await
+        } else {
+            self.session_catalog.get_namespace(&ident).await.map(|_| true)
+        };
+        match probe {
+            Err(e) if e.is_not_found() => Ok(false),
+            Err(e) if e.error_code() == sqe_core::SqeErrorCode::AccessDenied => Ok(false),
+            other => other,
+        }
     }
 
     /// Async pre-plan refresh for a statement that reads `information_schema`
@@ -545,6 +610,158 @@ mod tests {
 
     fn ns(name: &str) -> NamespaceIdent {
         NamespaceIdent::new(name.to_string())
+    }
+
+    /// `listing_succeeded` is the per-caller access proof the coordinator
+    /// gates a catalog's `tvf_prefixes` on: true when the namespace listing
+    /// answered this bearer, false when a 403 degraded the catalog to empty.
+    #[tokio::test]
+    async fn listing_succeeded_reports_whether_the_catalog_answered_the_caller() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const WAREHOUSE: &str = "ws-a";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"overrides": {"prefix": WAREHOUSE}, "defaults": {}}),
+            ))
+            .mount(&server)
+            .await;
+        let granted = format!("granted-{}", uuid::Uuid::new_v4());
+        let denied = format!("denied-{}", uuid::Uuid::new_v4());
+        Mock::given(method("GET"))
+            .and(path("/v1/ws-a/namespaces"))
+            .and(header("authorization", format!("Bearer {granted}").as_str()))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"namespaces": []})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/ws-a/namespaces"))
+            .and(header("authorization", format!("Bearer {denied}").as_str()))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": {"message": "not authorized", "type": "ForbiddenException", "code": 403}
+            })))
+            // Verified on drop: the `false` below comes from this 403, not
+            // from an unmatched request.
+            .expect(1..)
+            .mount(&server)
+            .await;
+
+        for (token, expected) in [(&granted, true), (&denied, false)] {
+            let catalog = Arc::new(
+                SessionCatalog::new(
+                    &server.uri(),
+                    WAREHOUSE,
+                    token,
+                    &StorageConfig::default(),
+                    Some(crate::rest_catalog::TableMetadataCache::new(0)),
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .expect("session catalog"),
+            );
+            let provider = SqeCatalogProvider::try_new_with_options(
+                catalog,
+                StorageConfig::default(),
+                WAREHOUSE.to_string(),
+                false,
+                true,
+            )
+            .await
+            .expect("a forbidden listing degrades, it does not fail the build");
+            assert_eq!(provider.listing_succeeded(), expected, "token {token}");
+        }
+    }
+
+    /// dbt race: model A's `CREATE SCHEMA` lands (on another replica, or
+    /// outside SQE) right after this provider re-listed, and model B names
+    /// the schema inside the re-list cooldown. The miss is resolved by one
+    /// probe of that namespace instead of "schema not found"; a namespace
+    /// that really does not exist still misses.
+    #[tokio::test]
+    async fn a_miss_inside_the_relist_cooldown_probes_the_catalog() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const WAREHOUSE: &str = "test-warehouse";
+        let server = MockServer::start().await;
+        let json = |body: serde_json::Value| ResponseTemplate::new(200).set_body_json(body);
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(json(
+                serde_json::json!({"overrides": {"prefix": WAREHOUSE}, "defaults": {}}),
+            ))
+            .mount(&server)
+            .await;
+        // The listing never shows the new namespace (the stale view).
+        Mock::given(method("GET"))
+            .and(path("/v1/test-warehouse/namespaces"))
+            .respond_with(json(serde_json::json!({"namespaces": [["sales"]]})))
+            .mount(&server)
+            .await;
+        // Loading it directly does.
+        Mock::given(method("GET"))
+            .and(path("/v1/test-warehouse/namespaces/cbs_silver"))
+            .respond_with(json(serde_json::json!({"namespace": ["cbs_silver"], "properties": {}})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/test-warehouse/namespaces/cbs_silver/tables"))
+            .respond_with(json(serde_json::json!({"identifiers": []})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/test-warehouse/namespaces/nope"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": {"message": "Namespace does not exist: nope", "type": "NoSuchNamespaceException", "code": 404}
+            })))
+            .mount(&server)
+            .await;
+
+        let token = format!("miss-probe-{}", uuid::Uuid::new_v4());
+        let catalog = Arc::new(
+            SessionCatalog::new(
+                &server.uri(),
+                WAREHOUSE,
+                &token,
+                &StorageConfig::default(),
+                Some(crate::rest_catalog::TableMetadataCache::new(0)),
+                None,
+                None,
+                false,
+            )
+            .await
+            .expect("session catalog"),
+        );
+        let provider = SqeCatalogProvider::try_new_with_options(
+            catalog,
+            StorageConfig::default(),
+            WAREHOUSE.to_string(),
+            false,
+            false,
+        )
+        .await
+        .expect("provider");
+
+        // A first miss spends the re-list; the cooldown is now running.
+        provider.refresh_namespace("nope").await.expect("missing is not an error");
+        assert!(provider.schema("nope").is_none());
+
+        provider.refresh_namespace("cbs_silver").await.expect("probe");
+        assert!(
+            provider.schema("cbs_silver").is_some(),
+            "found by the probe inside the cooldown: {:?}",
+            provider.schema_names()
+        );
+        // Still a plain miss for a namespace that does not exist.
+        provider.refresh_namespace("nope").await.expect("missing is not an error");
+        assert!(provider.schema("nope").is_none());
     }
 
     /// Issue #664: an `information_schema` read enumerates this catalog

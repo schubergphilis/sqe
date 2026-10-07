@@ -8,7 +8,9 @@
 //! 3. Removes restricted columns from projections
 //!
 //! This happens BEFORE the optimizer runs, so:
-//! - User predicates CAN push through row filters (same semantics)
+//! - User predicates that cannot fail are pushed through row filters; when
+//!   any can fail, a row-filtered row reads as all NULL (no error oracle,
+//!   see `crate::leakproof`)
 //! - User predicates CANNOT push through column masks (expression boundary)
 //! - Restricted columns are invisible (not errors)
 
@@ -18,7 +20,8 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::common::tree_node::{Transformed, TreeNodeRecursion};
-use datafusion::logical_expr::{col, lit, Cast, Expr, LogicalPlan, LogicalPlanBuilder};
+use datafusion::logical_expr::utils::conjunction;
+use datafusion::logical_expr::{col, lit, when, Cast, Expr, LogicalPlan, LogicalPlanBuilder};
 use datafusion::scalar::ScalarValue;
 use tracing::{debug, warn};
 
@@ -50,7 +53,15 @@ pub struct PolicyPlanRewriter {
     /// instead of the Iceberg convention. Defaults to empty, which is why an
     /// Iceberg-only deployment never takes the Hive branch.
     hive_catalogs: Arc<HiveCatalogs>,
+    /// Maps a metadata TVF provider (`table_files('ns','t')`, ...) to the
+    /// `(namespace, table)` it describes. `None` when not wired (unit tests).
+    metadata_target: Option<MetadataTarget>,
 }
+
+/// `(namespace, table)` a metadata TVF provider reads, `None` for any other
+/// provider. Injected because the TVF type lives in `sqe-catalog`.
+pub type MetadataTarget =
+    fn(&dyn datafusion::catalog::TableProvider) -> Option<(String, String)>;
 
 impl PolicyPlanRewriter {
     pub fn new(store: Arc<dyn PolicyStore>) -> Self {
@@ -60,7 +71,17 @@ impl PolicyPlanRewriter {
             tag_source: Arc::new(NoopTagSource),
             mask_precedence: sqe_core::config::MaskPrecedence::default(),
             hive_catalogs: Arc::new(HiveCatalogs::default()),
+            metadata_target: None,
         }
+    }
+
+    /// Inject the metadata TVF target lookup. With it, `evaluate` refuses a
+    /// plan whose metadata TVF names a table the caller is denied all
+    /// access to, on every path that enforces policy (#750).
+    #[must_use = "with_metadata_target consumes self; bind the returned rewriter"]
+    pub fn with_metadata_target(mut self, metadata_target: MetadataTarget) -> Self {
+        self.metadata_target = Some(metadata_target);
+        self
     }
 
     /// Choose which mask wins when a resource mask and a tag mask cover the same
@@ -117,6 +138,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
     async fn evaluate(
         &self,
         user: &SessionUser,
+        scope: &crate::TableScope,
         plan: LogicalPlan,
     ) -> sqe_core::Result<(LogicalPlan, PolicySummary)> {
         let store = self.store.clone();
@@ -140,10 +162,20 @@ impl PolicyEnforcer for PolicyPlanRewriter {
         // usually empty, leaking the base table raw. Mark such scans for a
         // fail-closed deny rather than trusting the view-name policy.
         let mut view_scans: HashSet<String> = HashSet::new();
+        // Tables described by metadata TVF scans. The scan itself is keyed by
+        // the function name, so the target's own policy is checked below.
+        let mut metadata_targets: Vec<(String, String)> = Vec::new();
         plan.apply_with_subqueries(|node| {
             if let LogicalPlan::TableScan(scan) = node {
                 let table_name = scan.table_name.to_string();
                 if let Ok(provider) = datafusion::datasource::source_as_provider(&scan.source) {
+                    if let Some(target) =
+                        self.metadata_target.and_then(|f| f(provider.as_ref()))
+                    {
+                        if !metadata_targets.contains(&target) {
+                            metadata_targets.push(target);
+                        }
+                    }
                     // TableProvider has `Any` as a supertrait but no `as_any()`
                     // method; upcast the reference to downcast to ViewTable.
                     let any_provider: &dyn std::any::Any = provider.as_ref();
@@ -154,13 +186,39 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                         view_scans.insert(table_name.clone());
                     }
                 }
+                // Governed as the table it resolved to: a name written
+                // without its schema/catalog is qualified from the scope the
+                // plan was resolved in.
                 table_refs
                     .entry(table_name)
-                    .or_insert_with(|| scan.table_name.clone());
+                    .or_insert_with(|| scope.qualify(&scan.table_name));
             }
             Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
         })
         .map_err(|e| sqe_core::error::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Plan traversal failed: {e}")))?;
+
+        // A metadata TVF exposes file paths, partition values and row counts
+        // of its target, so a caller denied all access to the target is
+        // refused, with the missing-table wording so "denied" is
+        // indistinguishable from "never existed" (#750). Table-level only.
+        let no_tags = HashMap::new();
+        for (ns, table) in &metadata_targets {
+            let policy = resolve_effective_policy(
+                store.as_ref(),
+                user,
+                table,
+                ns,
+                &no_tags,
+                self.mask_precedence,
+            )
+            .await;
+            if policy_denies_all(&policy) {
+                return Err(sqe_core::error::SqeError::with_code(
+                    sqe_core::SqeErrorCode::TableNotFound,
+                    format!("table not found: {ns}.{table}"),
+                ));
+            }
+        }
 
         // Resolve policies for all tables
         let mut table_policies: HashMap<String, ResolvedPolicy> = HashMap::new();
@@ -343,6 +401,15 @@ impl PolicyEnforcer for PolicyPlanRewriter {
         // column is NOT a deny: it stays in the schema as a forced NULL.
         let summary = summarise_policies(&table_policies);
 
+        // Whether any caller expression the optimizer can move below a row
+        // filter could fail on a hidden row (see `crate::leakproof`). Only
+        // then are row-filtered tables read through the guard (step 1b),
+        // which costs those tables their scan pruning. A plan-wide switch,
+        // not per column: an alias in a view or subquery hides which scan
+        // column a predicate reads.
+        let guard_rows = table_policies.values().any(|p| !p.row_filters.is_empty())
+            && crate::leakproof::plan_has_fallible_predicate(&plan);
+
         // Rewrite the plan
         let rewritten = plan
             .transform_down_with_subqueries(|node| {
@@ -368,14 +435,55 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                         // `project()` both run `normalize_col`, qualifying every
                         // column reference (including those nested inside Hash /
                         // Custom mask expressions) to the child schema.
-                        // Widen the scan's projection if a row filter needs a
-                        // column the query does not select (a narrow view). The
-                        // restore list puts the output schema back afterwards.
-                        let (node, restore) =
-                            match widen_scan_for_row_filters(scan, &policy.row_filters) {
-                                Some((wider, restore)) => (wider, Some(restore)),
-                                None => (node, None),
-                            };
+                        // Predicates already pushed into the scan (a view body is
+                        // optimized when it is planned) run on RAW values at file,
+                        // row-group and row level, here and on workers. One that
+                        // reads a masked or restricted column would filter on the
+                        // value the mask hides, so it leaves the scan and is
+                        // re-applied above the mask (step 2b). So does a
+                        // fallible one on a row-filtered table: in the scan it
+                        // runs on rows the row filter hides (step 1b).
+                        let guard = guard_rows && !policy.row_filters.is_empty();
+                        let source_schema = if guard && !scan.filters.is_empty() {
+                            datafusion::common::DFSchema::try_from_qualified_schema(
+                                scan.table_name.clone(),
+                                &scan.source.schema(),
+                            )
+                            .ok()
+                        } else {
+                            None
+                        };
+                        let raw_on_governed: Vec<Expr> = scan
+                            .filters
+                            .iter()
+                            .filter(|f| {
+                                f.column_refs().iter().any(|c| {
+                                    policy.is_restricted(&c.name)
+                                        || policy.mask_for(&c.name).is_some()
+                                }) || (guard
+                                    && source_schema.as_ref().is_none_or(|s| {
+                                        crate::leakproof::is_fallible(f, s)
+                                    }))
+                            })
+                            .cloned()
+                            .collect();
+                        let mut scan = scan.clone();
+                        let node = if raw_on_governed.is_empty() {
+                            node
+                        } else {
+                            scan.filters.retain(|f| !raw_on_governed.contains(f));
+                            LogicalPlan::TableScan(scan.clone())
+                        };
+                        // Widen the scan's projection if a row filter (or a moved
+                        // predicate) needs a column the query does not select (a
+                        // narrow view). The restore list puts the output schema
+                        // back afterwards.
+                        let needed: Vec<Expr> =
+                            policy.row_filters.iter().chain(&raw_on_governed).cloned().collect();
+                        let (node, restore) = match widen_scan_for_row_filters(&scan, &needed) {
+                            Some((wider, restore)) => (wider, Some(restore)),
+                            None => (node, None),
+                        };
                         let mut builder = LogicalPlanBuilder::from(node);
 
                         // 1. Inject row filters above the TableScan.
@@ -383,6 +491,47 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                             builder = builder.filter(filter_expr.clone()).map_err(|e| {
                                 datafusion::error::DataFusionError::Internal(format!(
                                     "Failed to create policy filter: {e}"
+                                ))
+                            })?;
+                        }
+
+                        // 1b. Read every column through the row filter:
+                        //     `CASE WHEN <row filter> THEN col END`. The
+                        //     optimizer merges the Filter above with the
+                        //     caller's predicates into one conjunction (and may
+                        //     reorder it), and AND evaluates its right side over
+                        //     the whole batch unless few rows pass. A fallible
+                        //     caller predicate would then run on hidden rows and
+                        //     its error would reveal their values. Guarded, a
+                        //     hidden row is all NULL to everything above, wherever
+                        //     the predicate ends up. Cost: caller predicates on a
+                        //     row-filtered table no longer reach scan pruning,
+                        //     so the guard is only added when the plan holds a
+                        //     fallible expression (`guard_rows`).
+                        //     `write_predicates::unparse_predicates` recognises
+                        //     the guard by its shape.
+                        let guard_expr = if guard {
+                            conjunction(policy.row_filters.iter().cloned())
+                        } else {
+                            None
+                        };
+                        if let Some(guard) = guard_expr {
+                            let schema = builder.schema().clone();
+                            let exprs = schema
+                                .iter()
+                                .map(|(qualifier, field)| -> datafusion::error::Result<Expr> {
+                                    let column = Expr::Column(datafusion::common::Column::new(
+                                        qualifier.cloned(),
+                                        field.name(),
+                                    ));
+                                    Ok(when(guard.clone(), column)
+                                        .end()?
+                                        .alias_qualified(qualifier.cloned(), field.name().clone()))
+                                })
+                                .collect::<datafusion::error::Result<Vec<Expr>>>()?;
+                            builder = builder.project(exprs).map_err(|e| {
+                                datafusion::error::DataFusionError::Internal(format!(
+                                    "Failed to create policy row-filter guard: {e}"
                                 ))
                             })?;
                         }
@@ -411,7 +560,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                                     // the user's outer `SELECT t.col` reference
                                     // (planned against the qualified scan) with
                                     // "No field named <qualified>.col".
-                                    if policy.restricted_columns.contains(name) {
+                                    if policy.is_restricted(name) {
                                         apply_mask(
                                             name,
                                             field.data_type(),
@@ -419,7 +568,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                                             mask_key.clone(),
                                         )
                                         .alias_qualified(qualifier.cloned(), name.clone())
-                                    } else if let Some(mask) = policy.column_masks.get(name) {
+                                    } else if let Some(mask) = policy.mask_for(name) {
                                         apply_mask(name, field.data_type(), mask, mask_key.clone())
                                             .alias_qualified(qualifier.cloned(), name.clone())
                                     } else {
@@ -438,6 +587,18 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                                     ))
                                 })?;
                             }
+                        }
+
+                        // 2b. Re-apply the predicates taken off the scan, now on
+                        //     the masked values.
+                        if let Some(pred) =
+                            datafusion::logical_expr::utils::conjunction(raw_on_governed)
+                        {
+                            builder = builder.filter(pred).map_err(|e| {
+                                datafusion::error::DataFusionError::Internal(format!(
+                                    "Failed to re-apply a scan predicate above the mask: {e}"
+                                ))
+                            })?;
                         }
 
                         // 3. Restore the original output columns when the scan's
@@ -641,7 +802,7 @@ pub(crate) fn merge_tag_masks(
         // Restricted columns always win — tag cannot un-restrict. This is not
         // configurable: restriction means SQE could not establish a safe value
         // to return, and no tag rule can answer that question for it.
-        if policy.restricted_columns.contains(column) {
+        if policy.is_restricted(column) {
             continue;
         }
         // A resource mask already covers this column. Under `Resource` the more
@@ -651,7 +812,7 @@ pub(crate) fn merge_tag_masks(
         // Either way the column stays masked, so an unmappable tag must NOT
         // restrict it: the resource mask is sufficient protection and dropping
         // the column would be a strictly worse answer than masking it.
-        let resource_masked = policy.column_masks.contains_key(column);
+        let resource_masked = policy.mask_for(column).is_some();
         if resource_masked && precedence == sqe_core::config::MaskPrecedence::Resource {
             continue;
         }
@@ -1933,7 +2094,7 @@ mod tests {
         };
 
         let (rewritten, _summary) = rewriter
-            .evaluate(&user, scan)
+            .evaluate(&user, &crate::TableScope::default(), scan)
             .await
             .expect("rewrite with sibling-referencing CUSTOM mask must succeed");
 
@@ -1942,6 +2103,151 @@ mod tests {
             rendered.contains("department"),
             "rewritten plan must reference the sibling column, got:\n{rendered}"
         );
+    }
+
+    /// A view body is optimized when it is planned, so its WHERE arrives as
+    /// pushed-down `TableScan.filters`. Those run on raw values at file,
+    /// row-group and row level, so a predicate on a masked or restricted column
+    /// must leave the scan and be evaluated above the mask instead.
+    #[tokio::test]
+    async fn scan_filters_on_governed_columns_move_above_the_mask() {
+        use crate::policy_store::InMemoryPolicyStore;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::tree_node::TreeNode;
+        use datafusion::common::TableReference;
+        use datafusion::logical_expr::builder::table_scan_with_filters;
+        use sqe_core::SessionUser;
+
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("salary", DataType::Int64, true),
+            Field::new("ssn", DataType::Utf8, true),
+        ]);
+        // The salary predicate's column is not even projected (an Exact
+        // pushdown can drop it from the projection).
+        let scan = table_scan_with_filters(
+            Some(TableReference::partial("hr", "employees")),
+            &schema,
+            Some(vec![0, 2]),
+            vec![
+                col("salary").gt_eq(lit(100_000i64)),
+                col("ssn").eq(lit("x")),
+                col("id").gt(lit(0i64)),
+            ],
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        let mut policy = ResolvedPolicy::default();
+        policy
+            .column_masks
+            .insert("salary".to_string(), MaskType::Nullify);
+        policy.restricted_columns.push("ssn".to_string());
+        let store = InMemoryPolicyStore::new();
+        store.add_table_policy("hr", "employees", policy).await;
+        let user = SessionUser {
+            username: "bob".to_string(),
+            roles: vec![],
+            subject: None,
+            email: None,
+            groups: vec![],
+        };
+
+        let (rewritten, _) = PolicyPlanRewriter::new(Arc::new(store))
+            .evaluate(&user, &crate::TableScope::default(), scan)
+            .await
+            .unwrap();
+
+        let mut scan_filters = Vec::new();
+        rewritten
+            .apply(|n| {
+                if let LogicalPlan::TableScan(s) = n {
+                    scan_filters.extend(s.filters.iter().map(|f| f.to_string()));
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+        assert_eq!(
+            scan_filters.len(),
+            1,
+            "only the ungoverned predicate may stay on the scan: {scan_filters:?}"
+        );
+        assert!(scan_filters[0].contains("id"), "{scan_filters:?}");
+        let rendered = format!("{}", rewritten.display_indent());
+        assert!(
+            rendered.contains("salary >= Int64(100000)") && rendered.contains("ssn = Utf8(\"x\")"),
+            "the moved predicates must still filter, above the mask:\n{rendered}"
+        );
+        assert_eq!(
+            rewritten.schema().fields().len(),
+            2,
+            "the caller's columns are unchanged"
+        );
+    }
+
+    /// #750: a metadata TVF over a table the caller is denied all access to is
+    /// refused by `evaluate` itself (so CTAS/INSERT/EXPLAIN are covered too),
+    /// including when the TVF sits inside a subquery.
+    #[tokio::test]
+    async fn metadata_tvf_over_a_denied_table_is_refused_inside_a_subquery() {
+        use crate::policy_store::InMemoryPolicyStore;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::catalog::TableProvider;
+        use datafusion::datasource::empty::EmptyTable;
+        use datafusion::datasource::provider_as_source;
+        use datafusion::logical_expr::exists;
+        use sqe_core::SessionUser;
+
+        // Stand-in for `table_files('sales','orders')`: an EmptyTable that the
+        // injected lookup maps to its target.
+        fn target(p: &dyn TableProvider) -> Option<(String, String)> {
+            (p as &dyn std::any::Any)
+                .downcast_ref::<EmptyTable>()
+                .map(|_| ("sales".to_string(), "orders".to_string()))
+        }
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let tvf = LogicalPlanBuilder::scan(
+            "table_files",
+            provider_as_source(Arc::new(EmptyTable::new(Arc::clone(&schema)))),
+            None,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let plan = datafusion::logical_expr::builder::table_scan(Some("t"), &schema, None)
+            .unwrap()
+            .filter(exists(Arc::new(tvf)))
+            .unwrap()
+            .build()
+            .unwrap();
+        let user = SessionUser {
+            username: "analyst".to_string(),
+            roles: vec![],
+            subject: None,
+            email: None,
+            groups: vec![],
+        };
+
+        let store = Arc::new(InMemoryPolicyStore::new());
+        let rewriter = PolicyPlanRewriter::new(store.clone()).with_metadata_target(target);
+        assert!(
+            rewriter
+                .evaluate(&user, &crate::TableScope::default(), plan.clone())
+                .await
+                .is_ok(),
+            "no policy on the target: passes"
+        );
+
+        let mut deny = ResolvedPolicy::default();
+        deny.row_filters.push(lit(false));
+        store.add_table_policy("sales", "orders", deny).await;
+        let err = rewriter
+            .evaluate(&user, &crate::TableScope::default(), plan)
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::TableNotFound);
+        assert!(err.to_string().contains("table not found: sales.orders"), "{err}");
     }
 
     // ── resolve_effective_policy (SHOW EFFECTIVE POLICY diagnostic) ───────

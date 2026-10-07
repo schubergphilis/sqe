@@ -59,22 +59,16 @@ impl TagSource for HiveTagSource {
 /// kind would introduce one if the default here were anything but "ask the
 /// fallback".
 ///
-/// A `None` catalog (a two-part reference, `sales.orders`) also goes to
-/// `fallback` -- but this is NOT because "no attached Hive root ever is"
-/// `None` in some self-evident sense (an earlier version of this comment
-/// claimed exactly that, and it was false: DataFusion resolves a two-part
-/// reference against the session's default catalog at table-lookup time
-/// while leaving the STORED `TableReference` on the scan node as `Partial`,
-/// catalog `None`, so if a Hive root's name were ever the session default
-/// catalog, this dispatcher would still see `None` here and route to
-/// `fallback` regardless). It holds because `attach_configured_hive_roots`
-/// (`runtime_catalog.rs`) and `handle_attach`'s `hive_external` branch
-/// (`query_handler.rs`) both refuse to attach a Hive root whose name equals
-/// `config.resolve_default_catalog()`. That refusal, not an assumption
-/// about `None`, is what makes a `None` catalog here safe to always treat
-/// as non-Hive: a two-part reference can only ever resolve against an
-/// Iceberg default catalog, because a Hive one is never allowed to hold
-/// that name.
+/// A `None` catalog also goes to `fallback`. DataFusion keeps the scan's
+/// reference as written, so a two-part `sales.orders` carries no catalog
+/// even when the session default is a Hive root (`USE <root>.<db>`). The
+/// policy rewriter therefore qualifies every scan reference from the
+/// planning context's `TableScope` before calling here, and such a
+/// reference arrives with its catalog. A `None` that still reaches this
+/// router came from a caller with no scope, and `fallback` (fail-closed)
+/// is the safe answer for it. `attach_configured_hive_roots` and
+/// `handle_attach`'s `hive_external` branch additionally refuse a Hive
+/// root named like `config.resolve_default_catalog()`.
 ///
 /// `hive_catalogs` is read on every call, not cached at construction, so a
 /// root attached after this router was built is routed correctly the very

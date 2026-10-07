@@ -18,7 +18,7 @@ Verdict: lands it. Chiastic line plus a single-sentence verdict; earned, not a t
 2. L153: "This is the kind of work the matrix does not measure but the engineers do." Same "This"-as-subject rule. Rewrite: "The loader refactor is the kind of work the matrix does not measure but the engineers do."
 3. L285: "This is the unglamorous work that does not appear on any dashboard." Same rule. Rewrite: "Test migration is the unglamorous work that does not appear on any dashboard."
 4. L6: "Sixty-eight per cent." British "per cent" spelling sits beside "68.3%" usage in 16b and the figures-with-% style used everywhere else in this chapter (74.1%, 81.5%, 86.8%). Minor consistency nit; prefer "Sixty-eight percent" or just "68%."
-5. L101 / L149: the live-test reveal ("found `...iceberg_user_events`... on account 311141556126 in `eu-central-1`") is good transparency-trait writing, but a real AWS account id in prose is a leak risk for the published book. Not a voice fault; flag for the sanitizer pass.
+5. L101 / L149: the live-test reveal ("found `...iceberg_user_events`... on account 123456789012 in `eu-central-1`") is good transparency-trait writing, but a real AWS account id in prose is a leak risk for the published book. Not a voice fault; flag for the sanitizer pass.
 
 ## Mechanical violations (PROSE only)
 none
@@ -53,7 +53,7 @@ none. (All `!` hits are inside code fences: L45 `assert!`, L223-224 `assert_eq!`
 - six Iceberg transforms: identity, year, month, day, hour, bucket(N,col), truncate(N,col), plus void
 - partition-evolution fix "fifteen-minute fix" / "one assertion, one branch"
 - HMS image `apache/hive:standalone-metastore-4.1.0`, port 19083:9083; Thrift addr needs `host:port` no scheme; IPv4 `127.0.0.1` fix
-- Glue live test: `iceberg_demo_analytics.iceberg_user_events`, ~1.5 million rows, account 311141556126, `eu-central-1`; S3 Tables in `eu-west-1` returned `testtablebucket/testnamespace/daily_sales`
+- Glue live test: `iceberg_demo_analytics.iceberg_user_events`, ~1.5 million rows, account 123456789012, `eu-central-1`; S3 Tables in `eu-west-1` returned `testtablebucket/testnamespace/daily_sales`
 - Nessie `ghcr.io/projectnessie/nessie:0.107.5`; PostgreSQL JDBC `postgres:15`
 - Five cells flipped Phase O: hive-metastore:v2/v3, aws-glue-catalog:v2/v3, nessie:v3
 - Unity OSS adapter `/api/2.1/unity-catalog/iceberg/`, image pinned `unitycatalog/unitycatalog:main-2f2e32d`, read-only (501 on mutate, per `unitycatalog/unitycatalog#3`), table `unity.default.marksheet_uniform`

@@ -4,6 +4,279 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Trino HTTP: cancelling a query while a client poll was fetching its results did not stop it
+
+    A page fetch pulls the result stream, which is where the query runs,
+    and holds the cursor lock while it does; the cancel only dropped the
+    cursor when it could take that lock, so a `DELETE` during an active poll
+    let the query run to completion, keep its memory and return its rows.
+    The fetch now races the cancel and drops the stream. TPC-H q09 at SF10
+    cancelled at 3 s: before, the client received all rows at 6.1 s with
+    1.2 GB still reserved; now it gets `Query was canceled` at 3.0 s and
+    the reservation is back to zero within five seconds.
+
+- Functions: `from_unixtime` returned NULL for a decimal argument
+
+    SQE parses a literal such as `1700000000.5` as DECIMAL, and the Trino
+    `from_unixtime` UDF had no case for it, so `from_unixtime(1700000000.5)`
+    and any call on a DECIMAL column silently returned NULL. An INT column
+    failed to plan. The function now takes a DOUBLE like Trino's, and every
+    numeric argument is cast to it before the call.
+
+- SQL: ROLLUP / CUBE / GROUPING SETS reach DataFusion as written
+
+    SQE wrapped every grouping-set query in `(SELECT 1) LEFT JOIN q ON TRUE`
+    so that an empty input still returned the grand-total row, a workaround
+    for apache/datafusion#21570. DataFusion 55 emits that row itself, so the
+    wrap is gone. ROLLUP and CUBE results do not change. `GROUPING SETS`
+    without an empty set, such as `((a), (b))`, on empty input used to get an
+    invented all-NULL row from the wrap; it now returns no rows, as Trino
+    does. On TPC-DS q67 the wrap's nested-loop join copied all 6.5M aggregate
+    rows, 2 to 3 s of CPU summed over cores; wall time on the local rig did
+    not improve.
+
+- Writes: a one-off catalog 401 at commit no longer discards the write
+
+    The table reload inside an Iceberg commit was not retried, so a single
+    401 from a token that was valid before and after ended a long CTAS or
+    INSERT and rolled it back. A failed commit attempt now runs again when
+    the catalog never applied it: a 401 (rejected before it was read) or a
+    transient failure of that reload. A commit whose outcome is unknown (a
+    5xx on the commit itself) is still never retried, so data is not
+    appended twice.
+
+- Errors: planning failures report their real error code
+
+    A missing table, an unknown function or an argument type mismatch came
+    back as `EXECUTION_FAILED` on every door (Trino HTTP, Flight SQL, MCP),
+    because each planner call site wrapped the DataFusion error with a fixed
+    code. They now report `TABLE_NOT_FOUND`, `FUNCTION_NOT_FOUND` and
+    `TYPE_MISMATCH`, the user-error codes clients and dbt key on. Other
+    planning errors report `SEMANTIC_ERROR`. The message text is unchanged.
+
+- Catalog: schemas and tables created by a concurrent writer are visible to the next statement
+
+    dbt-trino runs models in parallel on connections that share a JWT; a
+    model that named a schema another model had just created could fail with
+    "schema not found", and operators serialized dbt. A namespace missing from
+    a session's cached list is re-listed at most every 5 s; a miss inside that
+    window now probes Polaris for that one namespace (the same visibility rule
+    as the listing: 404 or 403 still misses), so a schema created by another
+    replica, Spark or Airflow is found immediately. Commits and table DDL
+    (CTAS, INSERT, DROP, RENAME) now also drop every principal's cached table
+    list for the namespace, not only the writer's metadata cache, so
+    `information_schema.tables` and `table_exist` no longer serve the pre-DDL
+    list for up to 5 s.
+
+- Catalog: the per-token circuit breaker counts upstream faults only
+
+    A client that legitimately probed for missing or hidden objects (dbt's
+    `information_schema` checks, `read_parquet` name lookups) collected 404s
+    from Polaris, the per-(token, catalog) breaker counted them, and after
+    five it opened: every query with that JWT was refused for 30 s. All
+    breaker sites now classify the outcome once. 5xx, timeouts, connection
+    failures and 429 count; 401/403, 404 and other 4xx are normal answers
+    and record success. `[catalog] circuit_breaker_failure_classes` sets the
+    counted classes (`server_error`, `timeout`, `connection`,
+    `rate_limited`, `client_error`, `not_found`, `auth`). The `Circuit
+    breaker opened` log line now carries the token `subject` and the
+    `reason` class.
+- SQL: `SHOW SCHEMAS` / `SHOW TABLES` honour `LIKE`; Trino's unknown-catalog error
+
+    The classifier passed only the `FROM`/`IN` scope to the handlers and
+    dropped the `LIKE` pattern, so `SHOW SCHEMAS FROM <catalog> LIKE 'x'`
+    listed every schema. dbt-trino and BI tools check schema existence this
+    way and made wrong create/skip decisions. The pattern now filters the
+    result (`%`, `_`, case-sensitive; `ILIKE` folds case), for
+    Iceberg catalogs and Hive roots alike. An unknown or invisible catalog
+    fails with `Catalog 'x' does not exist` (`CATALOG_NOT_FOUND`), as in
+    Trino, with the operator detail logged instead.
+
+### Changed
+
+- Benchmarks: SSB and TPC-DS fact tables are generated in date order; their values change
+
+    `load` sorts SSB `lineorder` and the TPC-DS sales/returns tables by
+    their date key on write; at SF100 and beyond that sort is the expensive,
+    memory-bound step. The generators now emit those rows already in that
+    order, so the direct Iceberg sink accepts them without sorting. Each
+    order, ticket or return row is a pure function of its number (a hashed
+    head for its date and line count, its own generator for the rest), and
+    a two-pass counting sort over the dates, 4 bytes per order or return
+    row, fixes the emission order. TPC-DS inventory was already generated
+    week by week and is declared as such.
+
+    Generated values change for `ssb.lineorder` and the six TPC-DS sales
+    and returns tables (row counts, distributions, the returns-to-sales
+    join and every planted query row are kept); all other tables, every
+    other suite, and `inventory` are unchanged. Results from these suites
+    are not comparable with earlier baselines; SF1 and SF10 need a fresh
+    baseline. Cost: SSB SF10 generation 32 s / 110 MB to 42 s / 176 MB,
+    TPC-DS SF1 6.6 s to 7.3 s.
+
+- Benchmarks: `benchmark-test.sh` generates every suite straight into Iceberg
+
+    No staged Parquet lands on disk: the script runs `sqe-bench generate
+    --sink iceberg` (as it already did for bank), then restarts the
+    coordinator so it sees the externally committed tables. TPC-BB writes
+    its two tables into the TPC-DS namespace, loading TPC-DS directly first
+    when the run has not. SF1 on the local stack: load 1-9 s per suite,
+    every query passes (TPC-E 18/18, TPC-C 17/17 including its writes on
+    the partitioned tables, ClickBench 43/43, TPC-H 22/22, SSB 13/13,
+    TPC-DS 99/99, TPC-BB 10/10); the SSB, TPC-DS and TPC-BB reports are the
+    new SF1 baseline for the date-ordered data. A suite falls back to
+    generate + `load` under pre-published or attached data, Hive tables,
+    `BENCH_BLOOM_FILTER` or `BENCH_PUFFIN_STATS`; `BENCH_LOAD_MODE=load`
+    forces it for every suite.
+
+- Benchmarks: TPC-C and ClickBench generation streams instead of building each table in memory
+
+    Peak RSS at SF10 drops from 538 MB to 167 MB (TPC-C) and from 912 MB
+    to 199 MB (ClickBench); generated values are byte-identical (the
+    generation golden test now covers both suites, and
+    `SQE_BENCH_RECORD_GOLDEN=1` prints fresh hashes for a deliberate
+    change). Staged Parquet for both suites now honours `--compression`
+    and `--row-group-size`; it was fixed at zstd(3) and the default row
+    group, which are still the defaults.
+
+- Benchmarks: one table-layout definition for `load` and the direct Iceberg sink
+
+    Partitioning, sort-on-write keys and bloom columns per benchmark table
+    now live in `sqe-bench`'s `layout` module, read by both paths.
+    `generate --sink iceberg` creates TPC-H `lineitem`/`orders` and the
+    TPC-C tables with `load`'s partition spec (same field names, e.g.
+    `l_shipdate_month`) and writes them through one shared per-table buffer:
+    rows are split by partition, and once the buffer passes
+    `--partition-buffer` (default `2g`) the largest partition is written out
+    as a file. TPC-H SF10 lineitem lands as 269 files / 2.5 GB (`load`: 415
+    files / 2.6 GB) at 3.5 GB peak RSS, in 39 s for the whole suite.
+
+    It refuses, before writing anything, a suite with a table `load` sorts
+    on write (SSB, TPC-DS, TPCBB fact tables), naming each table; such a
+    table prunes differently and its timings would not compare with a
+    loaded baseline. `--ignore-layout` writes anyway with a warning per
+    table. Direct writes now carry the bloom filters the engine's writer
+    adds on its own (`_sk` integer columns, 1% FPP).
+
+    Fixed on the way: `load --bloom-filter` keyed the SSB date table as
+    `ddate`, but the table is `dim_date`, so its `d_datekey` bloom was never
+    written. A test now checks every column a layout names against the
+    generator's schema.
+
+- Memory: spillable operators leave 20% of the pool and of each query's cap to consumers that cannot spill
+
+    New `coordinator.unspillable_headroom_percent` (default 20, 0..=50,
+    `0` = off, greedy pool only). Hash aggregates, sorts, repartition
+    buffers and nested-loop joins are refused at `100 - n` percent of the
+    node pool and of `query.max_query_memory`, and spill there; scan decode
+    admission, sort merges and hash-join builds may use the rest. Before, a
+    large aggregate filled the cap and the scan feeding it was refused
+    first, so the query failed where it could have spilled (#788). TPC-H
+    SF10 under a 4 GB pool and 2 GB per-query cap: the 60M-group aggregate
+    alone went from a scan-decode refusal to completing in 8.1 s; six
+    concurrent heavy queries went from 1 to 2 completing. Large sorts still
+    fail at that cap (their merge reservation; a separate change).
+
+- SQL: two Trino-compat rewrites retired; DataFusion 55 handles them natively
+
+    `WITH RECURSIVE t(n) AS (...)` column lists (#348) and the bare
+    `ROW(...)` constructor now reach DataFusion as written. Results are
+    unchanged. Over Flight SQL an unaliased `ROW(...)` column is now named
+    `row(...)` instead of `struct(...)`; Trino clients see `_col0` as before.
+
+- Security: `[security] trusted_proxies` accepts CIDR ranges
+
+    Entries may be exact IPv4/IPv6 addresses or CIDR ranges
+    (`"10.42.0.0/16"`, `"fd00::/8"`), so an ingress with changing pod IPs can
+    be trusted by range. One matcher serves every surface that honours
+    forwarded headers: Flight SQL, the web/health router, the Quack server
+    and the Trino HTTP listener. IPv4-mapped IPv6 peers match IPv4 entries.
+    An entry that is neither an address nor a range now fails config
+    validation; previously it silently never matched.
+
+### Added
+
+- File TVFs: per-catalog object-store prefixes, `[catalogs.<name>] tvf_prefixes`
+
+    `read_parquet`, `read_csv` and `read_json` could only be allowed paths
+    through the global `[storage.tvf] allowed_object_store_prefixes`, so a
+    coordinator serving several workspaces let every workspace read every
+    other workspace's landing bucket with the engine's credentials. A
+    catalog's `tvf_prefixes` now apply on top of the global list, only in
+    sessions scoped to that catalog (the session's resolved default
+    catalog). A prefix allowed for catalog A is refused in a session on
+    catalog B, with an error naming the session catalog. Naming catalog A
+    is not enough: its prefixes open only when A's namespace listing
+    succeeded with the caller's own bearer during the session build, so a
+    caller without grants on A who sets `X-Trino-Catalog: A` gets none.
+    Catalogs with engine-held auth prove nothing and never open their
+    prefixes. Discovered Polaris
+    warehouses add none, and Hive external tables keep using the global list.
+    Entries that are not object-store URLs with a bucket fail config
+    validation.
+
+- Trino HTTP: optional TLS listener, `[coordinator] trino_https_port`
+
+    In-cluster Trino clients that refuse credentials over plain HTTP
+    (trino-python-client, dbt-trino) can now call the service directly over
+    TLS. `trino_https_port` serves the same endpoints as `trino_http_port`
+    with the PEM certificate in `[coordinator.trino_tls]` (optional `ca_file`
+    requires client certificates). The certificate is reloaded within 60
+    seconds of a change, so a cert-manager renewal from an internal CA needs
+    no restart. Requests on the TLS port get https `nextUri`/`infoUri` on
+    that port. The plain listener keeps running; `trino_http_port = 0` with
+    `trino_https_port = 8080` makes the Trino port TLS-only. Health and
+    metrics stay plain on their own ports. A missing certificate or a port
+    collision fails config validation.
+
+- Trino HTTP: `[coordinator] public_base_url`; https `nextUri` behind a TLS ingress
+
+    Behind a TLS-terminating ingress that was not listed in
+    `trusted_proxies`, `nextUri` came back as `http://`, so Trino clients
+    (dbt-trino, trino-python-client) followed it to port 80 with their
+    bearer token in cleartext, and failed outright where egress allowed only
+    443. `public_base_url` (e.g. `"https://sql.example.org"`) is used for
+    `nextUri`/`infoUri` on requests addressed to its host; in-cluster
+    clients calling the service directly keep service URIs. From a trusted
+    proxy, `X-Forwarded-Proto: https` always yields https, only `http` and
+    `https` are accepted, the first value of a forwarded list is used, and
+    `X-Forwarded-Port` is honoured when it is not the scheme's default.
+
+### Fixed
+
+- File TVFs: `read_parquet` / `read_csv` / `read_json` are prepared per statement
+
+    With dbt-trino on four threads and one JWT, `CREATE TABLE ... AS SELECT
+    ... FROM read_parquet(...)` failed intermittently with "the table
+    function was not prepared before planning". The providers were stored on
+    the function instances of the user's cached session context, and the
+    CTAS SELECT was planned on a second fetch of that context: when another
+    thread's commit invalidated the cache in between, the write handler got a
+    fresh context with nothing prepared. Prepared providers now live in a
+    per-statement scope keyed by function name and arguments, so every plan
+    of a statement finds them whatever context it plans on, and nothing is
+    shared across statements, sessions or tokens. Every planner entry point
+    (queries, CTAS/INSERT/MERGE, EXPLAIN, views, the embedded CLI) goes
+    through `file_tvf_prepare::plan_sql`; a lint test fails the build on a
+    direct `ctx.sql` or `create_logical_plan`. A statement prepares each call
+    once, so a CTAS no longer lists the same prefix twice.
+
+- Catalog: the per-token circuit breaker counts upstream faults only
+
+    A client that legitimately probed for missing or hidden objects (dbt's
+    `information_schema` checks, `read_parquet` name lookups) collected 404s
+    from Polaris, the per-(token, catalog) breaker counted them, and after
+    five it opened: every query with that JWT was refused for 30 s. All
+    breaker sites now classify the outcome once. 5xx, timeouts, connection
+    failures and 429 count; 401/403, 404 and other 4xx are normal answers
+    and record success. `[catalog] circuit_breaker_failure_classes` sets the
+    counted classes (`server_error`, `timeout`, `connection`,
+    `rate_limited`, `client_error`, `not_found`, `auth`). The `Circuit
+    breaker opened` log line now carries the token `subject` and the
+    `reason` class.
+
 ## [0.49.0] — 2026-09-26
 
 This section covers every change since 0.28.0. Versions 0.29.0 to 0.48.1 were tagged without changelog sections of their own; from 0.49.0 on, `scripts/release.sh` turns this section into the release notes.

@@ -25,6 +25,80 @@ The Trino HTTP listener runs alongside Flight SQL. The default port is `8080`
 trino_http_port = 8080    # 0 to disable
 ```
 
+### HTTPS inside the cluster
+
+trino-python-client and dbt-trino refuse to send a password or token over
+plain HTTP. An in-cluster client that calls the service directly needs TLS
+on the listener itself. Set `trino_https_port` and point `[coordinator.trino_tls]`
+at a PEM certificate and key:
+
+```toml
+[coordinator]
+trino_http_port  = 8080    # plain, for clients that do not need TLS (0 to disable)
+trino_https_port = 8443    # same endpoints over TLS (0, the default, disables it)
+
+[coordinator.trino_tls]
+cert_file = "/etc/sqe/trino-tls/tls.crt"
+key_file  = "/etc/sqe/trino-tls/tls.key"
+# ca_file = "/etc/sqe/trino-tls/ca.crt"   # optional: require client certificates
+```
+
+Both listeners serve the same queries and share sessions. A request on the
+HTTPS port gets `https://` `nextUri` and `infoUri` values on that port, so the
+client never drops back to plain HTTP mid-query. For TLS only, set
+`trino_http_port = 0` and `trino_https_port = 8080`. Health checks and metrics
+stay plain on their own ports either way.
+
+The certificate fits a cert-manager `Certificate` issued by an internal CA.
+Mount its secret at the paths above. SQE polls the files every 60 seconds and
+swaps the certificate for new handshakes, so a renewal needs no restart.
+Clients trust the issuer through the CA bundle trust-manager distributes, for
+example `verify="/etc/ssl/internal/ca.crt"` in trino-python-client. The
+certificate must name the service host the clients use, such as
+`sqe.sqe.svc.cluster.local`.
+
+Startup fails when `trino_https_port` is set without a certificate, when a
+certificate file is missing, or when the port collides with another listener.
+
+The OAuth2 external-auth URLs (`/oauth2/...`) are built from the configured
+`redirect_uri`, not from the listener a request arrives on. Give it the
+https address clients use.
+
+### Behind a TLS-terminating ingress
+
+The plain listener speaks HTTP. Every response carries a `nextUri` that the
+client follows with its bearer token, so that URI must point at the public
+https address, not at the plain listener. SQE builds it from the request in
+one of two ways.
+
+Trust the ingress by address. List its IPs or its range in
+`[security] trusted_proxies`. A trusted peer's `X-Forwarded-Proto`,
+`X-Forwarded-Host` and `X-Forwarded-Port` then shape the URI, and a forwarded
+`https` always yields https:
+
+```toml
+[security]
+trusted_proxies = ["10.42.0.0/16"]   # exact IPs or CIDR ranges, IPv4 or IPv6
+```
+
+Name the public URL instead, when the ingress IPs cannot be pinned:
+
+```toml
+[coordinator]
+public_base_url = "https://sql.example.org"
+```
+
+SQE uses `public_base_url` only for requests addressed to its host. A client
+inside the cluster calling `http://sqe.sqe:8080` keeps getting URIs on
+`http://sqe.sqe:8080`. Without either setting, a proxied request gets an
+`http://` URI, and clients send their token in cleartext to port 80 before
+the ingress redirects them.
+
+Trusting a range trusts every peer in it. Any of them can set
+`X-Forwarded-For`, which becomes the audited client IP, and the forwarded
+scheme and host. Keep the range as narrow as the ingress allows. Invalid
+entries and a malformed `public_base_url` stop the server at startup.
+
 ### Run
 
 ```bash

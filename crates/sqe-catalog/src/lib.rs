@@ -29,10 +29,11 @@ pub mod read_csv;
 pub mod rest_catalog;
 pub mod runtime_bridge;
 mod send_erased;
+pub mod vended_credentials;
 pub mod session_tuning;
 #[cfg(feature = "sql-sqlite-rs")]
 pub mod sqlite_rs_catalog;
-pub use session_tuning::engine_session_config;
+pub use session_tuning::{engine_context, engine_session_config};
 #[cfg(feature = "rest")]
 pub mod schema_provider;
 #[cfg(feature = "rest")]

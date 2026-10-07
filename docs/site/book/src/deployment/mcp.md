@@ -460,11 +460,11 @@ SELECT digest(email, 'sha256') AS h FROM glue.crm.customers LIMIT 1;
 SELECT sha256(lower(arrow_cast(email, 'Utf8View'))) FROM glue.crm.customers LIMIT 1;
 ```
 
-`sha256()` is SQE's own function, the same one column masking uses. With
-`[policy] mask_key` set it is HMAC-SHA256 under that key, so its output is
-stable within one deployment and different across deployments with
-different keys; without a key it is plain SHA-256 and the startup log says
-so. Overlap between two hash sets:
+`sha256()` is SQE's own function and is plain, unkeyed SHA-256. It is not
+the function HASH column masks use: those run HMAC-SHA256 under
+`[policy] mask_key` and cannot be called from SQL, so a query cannot
+reproduce masked values by hashing candidates. Overlap between two hash
+sets:
 
 ```sql
 SELECT COUNT(*) FROM (

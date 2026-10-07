@@ -829,9 +829,15 @@ impl ScalarUDFImpl for FromUnixtime {
         "from_unixtime"
     }
 
+    /// One DOUBLE, like Trino's `from_unixtime(double)`: DataFusion casts
+    /// integer and decimal arguments before the call. `Signature::any`
+    /// passed them through unchanged, and a decimal (SQE parses `1.5` as
+    /// DECIMAL) fell into the NULL arm, so `from_unixtime(1700000000.5)`
+    /// returned NULL.
     fn signature(&self) -> &Signature {
-        static SIG: std::sync::LazyLock<Signature> =
-            std::sync::LazyLock::new(|| Signature::any(1, Volatility::Immutable));
+        static SIG: std::sync::LazyLock<Signature> = std::sync::LazyLock::new(|| {
+            Signature::uniform(1, vec![DataType::Float64], Volatility::Immutable)
+        });
         &SIG
     }
 
@@ -849,38 +855,24 @@ impl ScalarUDFImpl for FromUnixtime {
             (v * 1_000_000.0) as i64
         }
 
+        // The signature coerces the argument to Float64.
         match &args.args[0] {
-            ColumnarValue::Scalar(sv) => {
-                let us = match sv {
-                    ScalarValue::Int64(Some(v)) => epoch_to_us(*v as f64),
-                    ScalarValue::Float64(Some(v)) => epoch_to_us(*v),
-                    ScalarValue::Float32(Some(v)) => epoch_to_us(*v as f64),
-                    ScalarValue::Int32(Some(v)) => epoch_to_us(*v as f64),
-                    _ => {
-                        return Ok(ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(
-                            None, None,
-                        )))
-                    }
-                };
-                Ok(ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(
-                    Some(us),
-                    None,
-                )))
-            }
+            ColumnarValue::Scalar(ScalarValue::Float64(v)) => Ok(ColumnarValue::Scalar(
+                ScalarValue::TimestampMicrosecond(v.map(epoch_to_us), None),
+            )),
+            ColumnarValue::Scalar(other) => Err(DataFusionError::Internal(format!(
+                "from_unixtime: expected a DOUBLE after coercion, got {:?}",
+                other.data_type()
+            ))),
             ColumnarValue::Array(array) => {
+                let arr = array.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "from_unixtime: expected a DOUBLE array after coercion, got {:?}",
+                        array.data_type()
+                    ))
+                })?;
                 let result: TimestampMicrosecondArray =
-                    if let Some(arr) = array.as_any().downcast_ref::<arrow::array::Int64Array>() {
-                        arr.iter()
-                            .map(|opt| opt.map(|v| epoch_to_us(v as f64)))
-                            .collect()
-                    } else if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
-                        arr.iter().map(|opt| opt.map(epoch_to_us)).collect()
-                    } else {
-                        return Err(DataFusionError::Plan(format!(
-                            "from_unixtime: unsupported array type {:?}",
-                            array.data_type()
-                        )));
-                    };
+                    arr.iter().map(|opt| opt.map(epoch_to_us)).collect();
                 Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
             }
         }
@@ -948,11 +940,11 @@ impl ScalarUDFImpl for ToUnixtime {
                     let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
                     arr.iter()
                         .map(|opt| {
-                            opt.map(|days| {
-                                let d = temporal_conversions::date32_to_datetime(days)
-                                    .unwrap()
-                                    .date();
-                                d.signed_duration_since(epoch).num_seconds() as f64
+                            // None for out-of-range Date32 (NULL row, as in the
+                            // scalar branch) instead of unwrapping into a panic.
+                            opt.and_then(|days| {
+                                let d = temporal_conversions::date32_to_datetime(days)?.date();
+                                Some(d.signed_duration_since(epoch).num_seconds() as f64)
                             })
                         })
                         .collect()
@@ -1192,9 +1184,9 @@ fn trino_format_to_chrono(pattern: &str) -> String {
 }
 
 /// Format a `NaiveDateTime` using a Trino-style format string.
-fn format_naive(dt: NaiveDateTime, pattern: &str) -> String {
+fn format_naive(dt: NaiveDateTime, pattern: &str) -> DFResult<String> {
     let chrono_fmt = trino_format_to_chrono(pattern);
-    dt.format(&chrono_fmt).to_string()
+    crate::helpers::strftime_naive("date_format", &dt, &chrono_fmt)
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -1232,7 +1224,7 @@ impl ScalarUDFImpl for DateFormat {
         match &args.args[0] {
             ColumnarValue::Scalar(sv) => {
                 let dt = scalar_to_naive_dt(sv)?;
-                let result = dt.map(|d| format_naive(d, &pattern));
+                let result = dt.map(|d| format_naive(d, &pattern)).transpose()?;
                 Ok(ColumnarValue::Scalar(ScalarValue::Utf8(result)))
             }
             ColumnarValue::Array(array) => {
@@ -1241,15 +1233,21 @@ impl ScalarUDFImpl for DateFormat {
                 {
                     ts_arr
                         .iter()
-                        .map(|opt| opt.map(|us| format_naive(us_to_naive(us), &pattern)))
-                        .collect()
+                        .map(|opt| {
+                            opt.map(|us| format_naive(us_to_naive(us), &pattern))
+                                .transpose()
+                        })
+                        .collect::<DFResult<_>>()?
                 } else if let Some(ts_arr) =
                     array.as_any().downcast_ref::<TimestampNanosecondArray>()
                 {
                     ts_arr
                         .iter()
-                        .map(|opt| opt.map(|ns| format_naive(ns_to_naive(ns), &pattern)))
-                        .collect()
+                        .map(|opt| {
+                            opt.map(|ns| format_naive(ns_to_naive(ns), &pattern))
+                                .transpose()
+                        })
+                        .collect::<DFResult<_>>()?
                 } else if let Some(date_arr) = array.as_any().downcast_ref::<Date32Array>() {
                     date_arr
                         .iter()
@@ -1262,8 +1260,9 @@ impl ScalarUDFImpl for DateFormat {
                                     format_naive(dt.date().and_hms_opt(0, 0, 0).unwrap(), &pattern)
                                 })
                             })
+                            .transpose()
                         })
-                        .collect()
+                        .collect::<DFResult<_>>()?
                 } else {
                     return Err(DataFusionError::Plan(format!(
                         "date_format: unsupported array type {:?}",
@@ -2770,6 +2769,48 @@ mod tests {
         assert_eq!(run_query("SELECT year(from_unixtime(0))").await, 1970,);
     }
 
+    /// A decimal argument used to come back NULL: SQE parses `1700000000.5`
+    /// as DECIMAL and the UDF had no arm for it. Every numeric type now
+    /// reaches the same DOUBLE path, scalar and column alike.
+    #[tokio::test]
+    async fn from_unixtime_accepts_decimal_integer_and_double_input() {
+        use datafusion::prelude::{SessionConfig, SessionContext};
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().set_bool("datafusion.sql_parser.parse_float_as_decimal", true),
+        );
+        register_trino_functions(&ctx);
+        let sql = "SELECT CAST(from_unixtime(v) AS VARCHAR) FROM (VALUES \
+                   (1700000000.5), (CAST(1700000000 AS DECIMAL(11, 1)))) AS t(v) \
+                   UNION ALL SELECT CAST(from_unixtime(1700000000.5) AS VARCHAR) \
+                   UNION ALL SELECT CAST(from_unixtime(CAST(1700000000 AS INT)) AS VARCHAR) \
+                   UNION ALL SELECT CAST(from_unixtime(CAST(1700000000.25 AS DOUBLE)) AS VARCHAR) \
+                   UNION ALL SELECT CAST(from_unixtime(CAST(NULL AS BIGINT)) AS VARCHAR)";
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let mut got: Vec<Option<String>> = batches
+            .iter()
+            .flat_map(|b| {
+                // VARCHAR casts come back as Utf8View; read them as Utf8.
+                let utf8 = arrow::compute::cast(b.column(0), &DataType::Utf8).unwrap();
+                let col = utf8.as_any().downcast_ref::<StringArray>().unwrap();
+                (0..col.len())
+                    .map(|i| (!col.is_null(i)).then(|| col.value(i).to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                None,
+                Some("2023-11-14T22:13:20".to_string()),
+                Some("2023-11-14T22:13:20".to_string()),
+                Some("2023-11-14T22:13:20.250".to_string()),
+                Some("2023-11-14T22:13:20.500".to_string()),
+                Some("2023-11-14T22:13:20.500".to_string()),
+            ]
+        );
+    }
+
     // ── to_unixtime tests ─────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -2791,6 +2832,33 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!(v, 0.0);
+    }
+
+    #[tokio::test]
+    async fn to_unixtime_out_of_range_date_array_is_null() {
+        // A Date32 beyond chrono's range used to panic in the array branch.
+        let ctx = crate::duckdb_test_ctx();
+        register_trino_functions(&ctx);
+        let batch = arrow::record_batch::RecordBatch::try_from_iter([(
+            "d",
+            Arc::new(Date32Array::from(vec![Some(i32::MAX), Some(0)])) as ArrayRef,
+        )])
+        .unwrap();
+        ctx.register_batch("t", batch).unwrap();
+        let batches = ctx
+            .sql("SELECT to_unixtime(d) FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(col.is_null(0));
+        assert_eq!(col.value(1), 0.0);
     }
 
     #[tokio::test]
@@ -2951,6 +3019,21 @@ mod tests {
     async fn date_format_date_input() {
         let s = run_query_string("SELECT date_format(DATE '2024-06-15', '%Y/%m/%d')").await;
         assert_eq!(s, "2024/06/15");
+    }
+
+    #[tokio::test]
+    async fn date_format_unrenderable_pattern_errors() {
+        // %z needs an offset and %Q is unknown; both used to panic.
+        let ctx = crate::duckdb_test_ctx();
+        register_trino_functions(&ctx);
+        for pat in ["%Y %z", "%Q"] {
+            let sql = format!("SELECT date_format(TIMESTAMP '2024-01-15 10:30:45', '{pat}')");
+            let res = match ctx.sql(&sql).await {
+                Ok(df) => df.collect().await.map(|_| ()),
+                Err(e) => Err(e),
+            };
+            assert!(res.is_err(), "{pat} should error");
+        }
     }
 
     // ── date_parse tests ─────────────────────────────────────────────────────

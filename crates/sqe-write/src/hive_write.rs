@@ -129,8 +129,7 @@ pub async fn handle_insert(
         .keep_partition_by_columns = false;
 
     let state = ctx.state();
-    let plan = state
-        .create_logical_plan(sql)
+    let plan = sqe_catalog::file_tvf_prepare::create_logical_plan(&state, sql)
         .await
         .map_err(|e| exec_err("planning failed", e))?;
     let LogicalPlan::Dml(dml) = plan else {
@@ -139,15 +138,22 @@ pub async fn handle_insert(
         ));
     };
     let source = Arc::unwrap_or_clone(dml.input);
-    let (enforced, summary) = enforcer.evaluate(user, source).await?;
+    let (enforced, summary) = enforcer
+        .evaluate(user, &sqe_policy::TableScope::of(ctx), source)
+        .await?;
     *policy_summary_out = Some(summary);
 
     // WITH CHECK on the TARGET (#729), same as the Iceberg INSERT path: the
     // source enforcement above only filters what the caller may read; a
     // row-filtered caller must also not append rows their own SELECT on the
     // target would hide. Keyed exactly like the read path's
-    // `resolve_policy_key` for a Hive catalog: `<catalog>.<schema>`.
-    let namespace_key = match (dml.table_name.catalog(), dml.table_name.schema()) {
+    // `resolve_policy_key` for a Hive catalog: `<catalog>.<schema>`. The
+    // target is qualified from the session scope first, as the read path's
+    // rewriter does: an unqualified `INSERT INTO t` under a Hive-root default
+    // catalog must not fall back to the bare `default` key and miss the
+    // `<root>.<schema>` row filter.
+    let target = sqe_policy::TableScope::of(ctx).qualify(&dml.table_name);
+    let namespace_key = match (target.catalog(), target.schema()) {
         (Some(cat), Some(schema)) => format!("{cat}.{schema}"),
         (None, Some(schema)) => schema.to_string(),
         _ => "default".to_string(),
@@ -748,7 +754,7 @@ mod ctas_tests {
         let store = InMemoryPolicyStore::new();
         let mut pol = ResolvedPolicy::default();
         pol.row_filters.push(col("region").eq(lit("EU")));
-        store.add_table_policy("default", "employees", pol).await;
+        store.add_table_policy("lake.sales", "employees", pol).await;
         let enforcer = PolicyPlanRewriter::new(Arc::new(store));
         let user = sqe_core::Session::new(
             "alice".to_string(),
@@ -760,7 +766,23 @@ mod ctas_tests {
         .user;
 
         let dir = tempfile::tempdir().unwrap();
+        // The session's default catalog is the Hive root, and the statements
+        // below name the target unqualified: the policy key must still be
+        // `lake.sales`, the key the read path resolves the same table under.
+        // `datafusion.public` stays registered: the WITH CHECK scratch table
+        // lives there.
+        use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
         let ctx = SessionContext::new();
+        let lake = Arc::new(MemoryCatalogProvider::new());
+        lake.register_schema("sales", Arc::new(MemorySchemaProvider::new()))
+            .unwrap();
+        ctx.register_catalog("lake", lake);
+        ctx.sql("SET datafusion.catalog.default_catalog = 'lake'")
+            .await
+            .unwrap();
+        ctx.sql("SET datafusion.catalog.default_schema = 'sales'")
+            .await
+            .unwrap();
         ctx.sql(&format!(
             "CREATE EXTERNAL TABLE employees (id BIGINT, region VARCHAR) \
              STORED AS PARQUET LOCATION '{}/'",

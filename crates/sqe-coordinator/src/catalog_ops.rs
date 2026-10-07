@@ -112,6 +112,11 @@ impl CatalogOps {
     /// See `TableMetadataCache::invalidate_table_all_tokens`. No-op when no
     /// cache is wired (e.g. in unit tests constructed via `CatalogOps::new`).
     async fn invalidate_table_all_tokens(&self, table_ident: &TableIdent) {
+        // Every session's table-name snapshot of the namespace, too: a DROP or
+        // RENAME is visible to all of them.
+        sqe_catalog::schema_provider::invalidate_namespace_listing_all_tokens(
+            &table_ident.namespace().as_ref().join("."),
+        );
         if let Some(cache) = &self.table_cache {
             let suffix = format!("{}.{}", table_ident.namespace(), table_ident.name());
             cache.invalidate_table_all_tokens(&suffix).await;

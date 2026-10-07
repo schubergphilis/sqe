@@ -16,7 +16,6 @@ use crate::authenticator::Authenticator;
 use crate::aws_iam::{AwsIamProvider, AwsIamProviderConfig};
 use crate::bearer_token::{BearerTokenProvider, BearerTokenProviderConfig, DEFAULT_LEEWAY_SECS};
 use crate::chain::AuthChain;
-use crate::mtls::{MtlsProvider, MtlsProviderConfig};
 use crate::oidc_client_credentials::{OidcClientCredentialsConfig, OidcClientCredentialsProvider};
 use crate::oidc_provider::{OidcPasswordProvider, OidcPasswordProviderConfig};
 use crate::provider::AuthProvider;
@@ -31,6 +30,9 @@ use crate::token_exchange::{TokenExchangeConfig, TokenExchangeProvider};
 /// `Authenticator` (which uses `keycloak_url` / `token_endpoint`) is wrapped
 /// in a single-provider chain.
 pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain> {
+    config
+        .validate_transport_providers()
+        .map_err(sqe_core::SqeError::Config)?;
     if !config.providers.is_empty() {
         info!(
             count = config.providers.len(),
@@ -176,17 +178,19 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                     region,
                     validate_with_sts,
                 } => {
+                    if !*validate_with_sts {
+                        return Err(sqe_core::SqeError::Config(
+                            "auth.providers: aws_iam validate_with_sts = false is not supported; credentials are always validated with STS. Remove the setting".into(),
+                        ));
+                    }
                     info!(
                         index = i,
                         region = %region,
-                        validate_with_sts = validate_with_sts,
                         "Adding AwsIamProvider to chain"
                     );
                     let aws_config = AwsIamProviderConfig {
                         region: region.clone(),
-                        validate_with_sts: *validate_with_sts,
                         role_mappings: config.role_mappings.clone(),
-                        key_mappings: HashMap::new(),
                     };
                     Arc::new(AwsIamProvider::new(aws_config))
                 }
@@ -209,22 +213,11 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                     })?;
                     Arc::new(provider)
                 }
-                AuthProviderConfig::Mtls {
-                    extract_ou,
-                    extract_san,
-                } => {
-                    info!(
-                        index = i,
-                        extract_ou = extract_ou,
-                        extract_san = extract_san,
-                        "Adding MtlsProvider to chain"
-                    );
-                    let mtls_config = MtlsProviderConfig {
-                        extract_ou: *extract_ou,
-                        extract_san: *extract_san,
-                        role_mappings: config.role_mappings.clone(),
-                    };
-                    Arc::new(MtlsProvider::new(mtls_config))
+                AuthProviderConfig::Mtls { .. } => {
+                    // Defense in depth if provider construction is rearranged.
+                    return Err(sqe_core::SqeError::Config(
+                        "auth.providers: mtls requires verified TLS peer identity extraction, which current listeners do not support".into(),
+                    ));
                 }
                 AuthProviderConfig::Anonymous { user, roles } => {
                     tracing::error!("SECURITY: AnonymousProvider is active — all unauthenticated requests will be accepted. Remove for production.");
@@ -294,6 +287,75 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn configured_mtls_is_rejected_even_with_another_provider() {
+        let mtls = AuthProviderConfig::Mtls {
+            extract_ou: true,
+            extract_san: false,
+        };
+        for providers in [
+            vec![mtls.clone()],
+            vec![
+                AuthProviderConfig::Anonymous {
+                    user: "fallback".into(),
+                    roles: vec![],
+                },
+                mtls,
+            ],
+        ] {
+            let config = AuthConfig {
+                keycloak_url: String::new(),
+                realm: String::new(),
+                client_id: String::new(),
+                client_secret: sqe_core::SecretString::default(),
+                token_endpoint: String::new(),
+                token_refresh_buffer_secs: 60,
+                ssl_verification: true,
+                tls_skip_verify: false,
+                roles_claim: "realm_access.roles".into(),
+                providers,
+                role_mappings: HashMap::new(),
+                external: None,
+                admin_roles: Vec::new(),
+            };
+            let err = match build_auth_chain(&config).await {
+                Ok(_) => panic!("unsupported mTLS must fail before building a fallback chain"),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                err.contains("mtls") && err.contains("verified TLS peer identity"),
+                "{err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn aws_iam_without_sts_validation_is_rejected() {
+        let config = AuthConfig {
+            keycloak_url: String::new(),
+            realm: String::new(),
+            client_id: String::new(),
+            client_secret: sqe_core::SecretString::default(),
+            token_endpoint: String::new(),
+            token_refresh_buffer_secs: 60,
+            ssl_verification: true,
+            tls_skip_verify: false,
+            roles_claim: "realm_access.roles".into(),
+            providers: vec![AuthProviderConfig::AwsIam {
+                region: "us-east-1".into(),
+                validate_with_sts: false,
+            }],
+            role_mappings: HashMap::new(),
+            external: None,
+            admin_roles: Vec::new(),
+        };
+        let err = match build_auth_chain(&config).await {
+            Ok(_) => panic!("aws_iam with validate_with_sts = false must fail at startup"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("validate_with_sts"), "{err}");
+    }
+
     use super::*;
     use crate::provider::FlightCredentials;
 

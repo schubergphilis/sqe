@@ -104,16 +104,27 @@ impl Default for SqeReadOptions {
 }
 
 /// Default gap between byte ranges below which they are coalesced into a
-/// single request. Matches object_store's `OBJECT_STORE_COALESCE_DEFAULT`.
-const DEFAULT_RANGE_COALESCE_BYTES: u64 = 1024 * 1024;
+/// single request.
+///
+/// SQE PATCH (sqe#read-amplification): 64 KiB, not object_store's 1 MiB.
+/// Column chunks of small files (a partitioned table's monthly file is a few
+/// MB) are all under 1 MiB, so a 1 MiB gap merged in every unprojected column
+/// between two projected ones: TPC-H SF1 q21 read 408 MB of lineitem for
+/// 152 MB of projected chunks. No coalescing at all is slower again (request
+/// count), so the gap stays, only smaller.
+const DEFAULT_RANGE_COALESCE_BYTES: u64 = 64 * 1024;
 
 /// Default maximum number of coalesced byte ranges fetched concurrently.
 /// Matches object_store's `OBJECT_STORE_COALESCE_PARALLEL`.
 const DEFAULT_RANGE_FETCH_CONCURRENCY: usize = 10;
 
 /// Default number of bytes to prefetch when parsing Parquet footer metadata.
-/// Matches DataFusion's default `ParquetOptions::metadata_size_hint`.
-const DEFAULT_METADATA_SIZE_HINT: usize = 512 * 1024;
+///
+/// SQE PATCH (sqe#read-amplification): 64 KiB, not DataFusion's 512 KiB. The
+/// footer SQE writes is a few KB (7.5 KB for a 16-column, one-row-group
+/// lineitem file), so 512 KiB per file was 16% of a 3 MB file on every scan.
+/// A footer larger than the hint costs one extra ranged read, nothing more.
+const DEFAULT_METADATA_SIZE_HINT: usize = 64 * 1024;
 
 mod file_reader;
 mod options;
@@ -270,7 +281,7 @@ impl ArrowReaderBuilder {
     /// Sets the gap threshold for merging nearby byte ranges into a single request.
     /// Ranges with gaps smaller than this value will be coalesced.
     ///
-    /// Defaults to 1 MiB, matching object_store's OBJECT_STORE_COALESCE_DEFAULT.
+    /// Defaults to 64 KiB (SQE PATCH, see `DEFAULT_RANGE_COALESCE_BYTES`).
     pub fn with_range_coalesce_bytes(mut self, range_coalesce_bytes: u64) -> Self {
         self.parquet_read_options.range_coalesce_bytes = range_coalesce_bytes;
         self

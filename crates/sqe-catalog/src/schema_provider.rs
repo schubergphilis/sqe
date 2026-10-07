@@ -4,9 +4,12 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use datafusion::catalog::SchemaProvider;
+use datafusion::common::tree_node::Transformed;
+use datafusion::common::TableReference;
 use datafusion::datasource::ViewTable;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::logical_expr::{LogicalPlan, SubqueryAlias, TableScanBuilder};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use iceberg::NamespaceIdent;
 use moka::sync::Cache as SyncCache;
@@ -92,6 +95,27 @@ pub fn cached_namespace_listing(
     namespace: &str,
 ) -> Option<Arc<NamespaceListing>> {
     TABLE_NAMES_SNAPSHOTS.get(&listing_key(catalog, warehouse, namespace))
+}
+
+/// Drop every principal's snapshot of `namespace` (in any warehouse) so the
+/// next pre-plan refresh of each session re-lists it.
+///
+/// A table created, dropped or renamed by one session is visible to all of
+/// them, but snapshots are keyed per token: dropping only the writer's left
+/// every other session (a parallel dbt model with its own connection, another
+/// user) answering `table_exist` and `information_schema.tables` from the
+/// pre-DDL list until the TTL. Matching on the namespace alone over-evicts a
+/// same-named namespace in another warehouse, which only costs it a re-list.
+pub fn invalidate_namespace_listing_all_tokens(namespace: &str) {
+    let suffix = format!("|{namespace}");
+    let keys: Vec<Arc<String>> = TABLE_NAMES_SNAPSHOTS
+        .iter()
+        .filter(|(key, _)| key.ends_with(&suffix))
+        .map(|(key, _)| key)
+        .collect();
+    for key in keys {
+        TABLE_NAMES_SNAPSHOTS.invalidate(key.as_str());
+    }
 }
 
 /// Drop the snapshot for one namespace so the next pre-plan refresh
@@ -437,7 +461,9 @@ impl SchemaProvider for SqeSchemaProvider {
                         Some(ref m) => provider.with_metrics(Arc::clone(m)),
                         None => provider,
                     };
-                    let provider = provider.with_tuning(self.tuning.clone());
+                    let provider = provider
+                        .with_tuning(self.tuning.clone())
+                        .with_reloader(self.session_catalog.table_reloader(table_ident.clone()));
                     return Ok(Some(Arc::new(provider)));
                 }
                 Err(e) => {
@@ -479,6 +505,39 @@ impl SchemaProvider for SqeSchemaProvider {
 
         Ok(None)
     }
+}
+
+/// The schema a view body's unqualified table names resolve in.
+const VIEW_DEFAULT_SCHEMA: &str = "default";
+
+/// Name every table scan in a view body by the table it actually resolved
+/// to (`catalog.schema.table`). The scan keeps the name as written, and the
+/// policy rewriter fills a missing schema from the QUERYING session's scope,
+/// so an unqualified `orders` in a view would otherwise be governed as
+/// whatever `orders` means after the reader's `USE`. A `SubqueryAlias` under
+/// the written name keeps the column qualifiers the rest of the body uses.
+fn qualify_view_scans(plan: LogicalPlan, catalog: &str, schema: &str) -> DFResult<LogicalPlan> {
+    plan.transform_up_with_subqueries(|node| {
+        let LogicalPlan::TableScan(scan) = &node else {
+            return Ok(Transformed::no(node));
+        };
+        if matches!(scan.table_name, TableReference::Full { .. }) {
+            return Ok(Transformed::no(node));
+        }
+        let full: TableReference = scan.table_name.clone().resolve(catalog, schema).into();
+        let qualified = TableScanBuilder::new(full, scan.source.clone())
+            .with_projection(scan.projection.clone())
+            .with_filters(scan.filters.clone())
+            .with_fetch(scan.fetch)
+            .with_statistics_requests(scan.statistics_requests.clone())
+            .build()?;
+        let alias = SubqueryAlias::try_new(
+            Arc::new(LogicalPlan::TableScan(qualified)),
+            scan.table_name.clone(),
+        )?;
+        Ok(Transformed::yes(LogicalPlan::SubqueryAlias(alias)))
+    })
+    .map(|t| t.data)
 }
 
 impl SqeSchemaProvider {
@@ -537,7 +596,7 @@ impl SqeSchemaProvider {
         let mini_ctx = SessionContext::new_with_config(
             SessionConfig::new()
                 .with_information_schema(true)
-                .with_default_catalog_and_schema(catalog_name, "default"),
+                .with_default_catalog_and_schema(catalog_name, VIEW_DEFAULT_SCHEMA),
         );
 
         // The view's own namespace is always resolvable even when the
@@ -559,7 +618,7 @@ impl SqeSchemaProvider {
             DataFusionError::External(format!("Failed to plan view '{name}' SQL: {e}").into())
         };
 
-        let df = match mini_ctx.sql(&sql).await {
+        let df = match crate::file_tvf_prepare::plan_sql(&mini_ctx, &sql).await {
             Ok(df) => df,
             Err(first_err) => {
                 // A view body may reference tables in OTHER catalogs (e.g. a
@@ -610,11 +669,13 @@ impl SqeSchemaProvider {
                         ),
                     }
                 }
-                mini_ctx.sql(&sql).await.map_err(plan_err)?
+                crate::file_tvf_prepare::plan_sql(&mini_ctx, &sql).await.map_err(plan_err)?
             }
         };
 
-        let plan = df.into_optimized_plan().map_err(|e| {
+        let (state, plan) = df.into_parts();
+        let plan = qualify_view_scans(plan, catalog_name, VIEW_DEFAULT_SCHEMA)?;
+        let plan = state.optimize(&plan).map_err(|e| {
             datafusion::error::DataFusionError::External(
                 format!("Failed to optimize view '{name}' plan: {e}").into(),
             )
@@ -627,6 +688,68 @@ impl SqeSchemaProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DDL is visible to every session, so it drops every principal's
+    /// snapshot of the namespace, and only that namespace's.
+    #[test]
+    fn ddl_invalidation_drops_every_tokens_listing_of_the_namespace() {
+        let tag = uuid::Uuid::new_v4().to_string();
+        let ns = format!("cbs_silver_{}", &tag[..8]);
+        let other = format!("x.{ns}");
+        let keys = [
+            format!("tokA|wh|{ns}"),
+            format!("tokB|wh|{ns}"),
+            format!("tokA|other_wh|{ns}"),
+            format!("tokA|wh|{other}"),
+        ];
+        for key in &keys {
+            TABLE_NAMES_SNAPSHOTS.insert(
+                key.clone(),
+                Arc::new(merge_listing(None, Ok(vec!["t".to_string()]))),
+            );
+        }
+        invalidate_namespace_listing_all_tokens(&ns);
+        for key in &keys[..3] {
+            assert!(TABLE_NAMES_SNAPSHOTS.get(key).is_none(), "{key} survived");
+        }
+        assert!(TABLE_NAMES_SNAPSHOTS.get(&keys[3]).is_some(), "`x.{ns}` is a different namespace");
+    }
+
+    /// A view body's scans carry the table they resolved to, so the policy
+    /// rewriter never fills their schema from the reader's session scope.
+    #[test]
+    fn view_scans_are_named_by_the_table_they_resolved_to() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+        use datafusion::logical_expr::builder::table_scan;
+        use datafusion::prelude::col;
+
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, true)]);
+        let orders = table_scan(Some("orders"), &schema, None).unwrap().build().unwrap();
+        let plan = table_scan(Some(TableReference::partial("me", "x")), &schema, None)
+            .unwrap()
+            .cross_join(orders)
+            .unwrap()
+            .project(vec![col("orders.id")])
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let qualified = qualify_view_scans(plan.clone(), "wh", "default").unwrap();
+
+        let mut names = Vec::new();
+        qualified
+            .apply(|n| {
+                if let LogicalPlan::TableScan(s) = n {
+                    names.push(s.table_name.to_string());
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+        names.sort();
+        assert_eq!(names, ["wh.default.orders", "wh.me.x"]);
+        assert_eq!(qualified.schema(), plan.schema(), "the body's output is unchanged");
+    }
 
     #[test]
     fn name_exists_in_matches_tables_and_views() {

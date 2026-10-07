@@ -1,5 +1,9 @@
 # SF10 slower queries: EXPLAIN ANALYZE aggregation (clean rig, 2026-06-16)
 
+> Historical evidence: the measurements and implementation states below describe
+> the dated runs. For the current DataFusion 55 readiness assessment and work
+> plan, see [SF100 readiness](sf100-scaling-risks.md), updated 2026-09-30.
+
 Where SQE trails Trino 465 at SF10, and why. Captured on the dedicated 8-core/31GB
 box, both engines containerized against the same Iceberg store, query cache off,
 single-node. For every query SQE loses (ratio < ~0.85x) we ran `EXPLAIN ANALYZE` on

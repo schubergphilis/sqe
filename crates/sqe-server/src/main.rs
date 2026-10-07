@@ -519,6 +519,17 @@ struct WorkersStatus {
     healthy_urls: Vec<String>,
 }
 
+/// The open `/api/v1/status`: lifecycle state and role only. It is bound on
+/// every interface without auth, so build identity, worker URLs and the
+/// `serving` block live behind the admin guard at `/api/v1/status/detail`.
+async fn open_status(state: axum::extract::State<Arc<HealthState>>) -> Json<serde_json::Value> {
+    let ready = state.ready.load(Ordering::Relaxed);
+    Json(serde_json::json!({
+        "status": if ready { "ACTIVE" } else { "STARTING" },
+        "node": {"role": state.role},
+    }))
+}
+
 async fn cluster_status(state: axum::extract::State<Arc<HealthState>>) -> Json<ClusterStatus> {
     let ready = state.ready.load(Ordering::Relaxed);
 
@@ -772,7 +783,9 @@ async fn dashboard() -> Response {
 /// Build the health server router. Extracted so tests can drive it directly.
 ///
 /// `/healthz`, `/readyz`, and `/api/v1/status` are always ungated -- they
-/// serve k8s liveness/readiness probes and LB health checks. The `web_ui`
+/// serve k8s liveness/readiness probes and LB health checks. The open
+/// `/api/v1/status` carries status and role only; the full payload is
+/// `/api/v1/status/detail`, admin-gated on a coordinator. The `web_ui`
 /// route group (dashboard + JSON API) is gated behind bearer + admin auth via
 /// `route_layer` applied only to that sub-router.
 ///
@@ -788,15 +801,17 @@ fn build_health_router(state: Arc<HealthState>) -> Router {
     let open = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
-        .route("/api/v1/status", get(cluster_status));
+        .route("/api/v1/status", get(open_status));
 
     // Coordinator-only: a worker holds no shared table cache and no session
     // cache, so the hook would 200 having invalidated nothing. `run_worker`
     // also wires no `bearer_provider`, so it would answer a permanent 401 --
     // either way the route would be a lie on a worker. Keep it off there.
+    // The full status payload rides the same guard for the same reason.
     let app = if state.role == "coordinator" {
         let admin_hooks = Router::new()
             .route("/api/v1/catalogs/refresh", post(api_catalogs_refresh))
+            .route("/api/v1/status/detail", get(cluster_status))
             .route_layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 sqe_coordinator::web_auth::require_admin_bearer::<HealthState>,
@@ -1020,6 +1035,9 @@ struct AuthenticatorAdapter {
     /// `None` (some unit-test fixtures), Basic auth falls back to the legacy
     /// `Authenticator`.
     bearer_provider: Option<Arc<dyn sqe_auth::AuthProvider>>,
+    /// The chain's pre-auth limiter, also spent on every OAuth2 challenge an
+    /// unauthenticated request mints, keyed `(peer, "oauth2-challenge")`.
+    auth_rate_limiter: Arc<sqe_coordinator::rate_limiter::AuthRateLimiter>,
 }
 
 /// The chain-level pre-auth limiter (#562) refuses with `RateLimited`; the
@@ -1089,6 +1107,12 @@ impl TrinoAuthenticator for AuthenticatorAdapter {
         // Fall back to the raw JWT as the catalog token when the provider did
         // not supply one (passthrough to Polaris).
         Ok(identity.into_session(Some(token)))
+    }
+
+    async fn admit_auth_challenge(&self, peer_ip: &str) -> Result<(), sqe_core::SqeError> {
+        self.auth_rate_limiter
+            .check(peer_ip, "oauth2-challenge")
+            .map_err(|_| trino_auth_error(sqe_auth::AuthError::RateLimited, ""))
     }
 }
 
@@ -1454,6 +1478,10 @@ async fn async_main() -> anyhow::Result<()> {
 
     let config = config;
     config.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
+    sqe_catalog::rest_catalog::configure_breaker_failure_classes(
+        &config.catalog.circuit_breaker_failure_classes,
+    )
+    .map_err(|e| anyhow::anyhow!("catalog.circuit_breaker_failure_classes: {e}"))?;
 
     // Security warnings for production readiness
     if !config.coordinator.tls.is_enabled() {
@@ -1729,15 +1757,9 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
                 credential_tracker.clone(),
                 interval,
                 config.coordinator.worker_secret.expose().to_string(),
-                |_fragment| async {
-                    // Credential vending is deferred to Step 5 (Pluggable
-                    // Catalogs): the CatalogBackend trait will expose a
-                    // `vend_credentials(table)` method that reloads the
-                    // table from Polaris to obtain fresh STS tokens scoped
-                    // to the fragment's data files. Until then, workers use
-                    // the original session credentials.
-                    None
-                },
+                // Reload the fragment's table as the querying user; the
+                // catalog vends a fresh table-scoped set (or refuses).
+                sqe_coordinator::credential_refresh::reload_vended_credentials,
             ),
         );
         tracing::info!(
@@ -1901,6 +1923,11 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
 
     let audit = Arc::new(audit_logger);
 
+    // Finding 601 / L4: one ticket-signing key for the whole coordinator.
+    // The query path and the scheduler's maintenance handler both sign
+    // worker requests with it, and workers pin only one key.
+    let ticket_signer = Arc::new(sqe_coordinator::load_ticket_signer(&config.coordinator));
+
     // Advisory/active auto-compaction scheduler (Phase 4a, Task 5). `Off`
     // mode (the default) constructs NOTHING here: neither the dedicated
     // maintenance service principal nor the `MaintenanceScheduler` value
@@ -1966,7 +1993,8 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
                 // (even when `distributed` is false) is safe: a registry with
                 // no seeded/heartbeat-discovered workers, or one whose health
                 // checks never started, reports `0` healthy either way.
-                .with_worker_registry(Arc::clone(&worker_registry));
+                .with_worker_registry(Arc::clone(&worker_registry))
+                .with_ticket_signer(Arc::clone(&ticket_signer));
         if config.maintenance.mode == sqe_core::config::MaintenanceMode::Active {
             let maintenance_runtime = sqe_coordinator::runtime::build_coordinator_runtime(
                 &config.coordinator,
@@ -2213,7 +2241,8 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         )?
         .with_table_cache(table_cache)
         .with_session_manager(session_manager.clone())
-        .with_hive_registries(hive_catalogs.clone(), hive_manifest_cache.clone()),
+        .with_hive_registries(hive_catalogs.clone(), hive_manifest_cache.clone())
+        .with_ticket_signer(ticket_signer),
     );
 
     // Spawn background memory metrics reporter (updates gauges every 1s for Grafana)
@@ -2320,11 +2349,13 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         mcp_web_router,
     );
 
-    // Trino compat
-    if config.coordinator.trino_http_port > 0 {
+    // Trino compat: plain on trino_http_port, TLS on trino_https_port, either
+    // may be 0.
+    if config.coordinator.trino_http_port > 0 || config.coordinator.trino_https_port > 0 {
         let auth_adapter = Arc::new(AuthenticatorAdapter {
             authenticator: authenticator.clone(),
             bearer_provider: bearer_provider.clone(),
+            auth_rate_limiter: Arc::clone(&auth_rate_limiter),
         });
         let handler_adapter = Arc::new(QueryHandlerAdapter {
             handler: query_handler.clone(),
@@ -2333,9 +2364,37 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         // The pre-auth rate limit is inside `auth_chain` (#562): the adapter
         // forwards the peer host in the credentials and the chain's denial
         // comes back as `ResourceExhausted`, which the Trino server maps to 429.
+        let https = if config.coordinator.trino_https_port > 0 {
+            sqe_coordinator::tls::ensure_crypto_provider();
+            let material = sqe_core::ServerTlsMaterial::load(&config.coordinator.trino_tls)
+                .map_err(|e| anyhow::anyhow!("Trino HTTPS TLS config: {e}"))?;
+            let mtls = material.requires_client_cert();
+            let tls =
+                axum_server::tls_rustls::RustlsConfig::from_config(material.rustls_server_config());
+            // cert-manager rewrites the mounted secret in place; the watcher
+            // swaps the config for new handshakes without a restart.
+            let _trino_reload = sqe_coordinator::tls::spawn_cert_reload_watch(
+                config.coordinator.trino_tls.clone(),
+                tls.clone(),
+                sqe_coordinator::tls::DEFAULT_CERT_RELOAD_INTERVAL,
+            );
+            tracing::info!(
+                mtls,
+                "Trino-compat HTTPS on port {}",
+                config.coordinator.trino_https_port
+            );
+            Some(sqe_trino_compat::server::HttpsListener {
+                port: config.coordinator.trino_https_port,
+                tls,
+            })
+        } else {
+            None
+        };
         let trino_opts = sqe_trino_compat::server::TrinoServerOptions {
             security: config.security.clone(),
             expose_version: false,
+            public_base_url: config.coordinator.public_base_url.clone(),
+            https,
         };
         sqe_trino_compat::server::start_trino_server_with_options(
             auth_adapter,
@@ -2349,10 +2408,12 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             oauth2_state,
             trino_opts,
         );
-        tracing::info!(
-            "Trino-compat HTTP on port {}",
-            config.coordinator.trino_http_port
-        );
+        if config.coordinator.trino_http_port > 0 {
+            tracing::info!(
+                "Trino-compat HTTP on port {}",
+                config.coordinator.trino_http_port
+            );
+        }
     }
 
     // DuckDB Quack RPC endpoint (off by default). Shares the same AuthChain
@@ -2663,22 +2724,13 @@ fn build_lineage_observer(
     if !ol.http_endpoint.is_empty() {
         let auth = match ol.auth_mode.as_str() {
             "none" => sqe_lineage::sinks::http::AuthMode::None,
-            "bearer" => sqe_lineage::sinks::http::AuthMode::Bearer(ol.api_key.clone()),
-            "user_token" => {
-                // Per-event user token requires per-event sink construction; for v1
-                // the emitter task uses the configured api_key as a fallback when
-                // auth_mode is user_token. The actual per-event token forwarding is
-                // wired in a future task; for now treat user_token like bearer.
-                tracing::warn!(
-                    "openlineage auth_mode=user_token not yet fully wired; \
-                     using static api_key as fallback"
-                );
-                sqe_lineage::sinks::http::AuthMode::Bearer(ol.api_key.clone())
-            }
+            "bearer" => sqe_lineage::sinks::http::AuthMode::Bearer(
+                sqe_core::SecretString::new(ol.api_key.clone()),
+            ),
             other => {
                 return Err(anyhow::anyhow!(
                     "openlineage auth_mode '{other}' is not recognised; \
-                     expected one of: none, bearer, user_token"
+                     expected one of: none, bearer"
                 ));
             }
         };
@@ -2810,6 +2862,15 @@ fn build_oauth2_state(
     // Derive the base URL from the Trino HTTP port. In production, a reverse
     // proxy or TLS terminator provides the external HTTPS URL; for dev, use
     // the configured redirect_uri's scheme+host or fall back to localhost.
+    // The fallback uses the plain port, or the HTTPS one when the Trino
+    // listener is TLS-only (`trino_http_port = 0`).
+    let localhost = if config.coordinator.trino_http_port == 0
+        && config.coordinator.trino_https_port > 0
+    {
+        format!("https://localhost:{}", config.coordinator.trino_https_port)
+    } else {
+        format!("http://localhost:{}", config.coordinator.trino_http_port)
+    };
     let base_url = if ext.redirect_uri.contains("://") {
         // Extract scheme + host from redirect_uri (e.g. "https://sqe.example.com")
         let uri = ext.redirect_uri.trim_end_matches('/');
@@ -2819,10 +2880,10 @@ fn build_oauth2_state(
                 let host_end = after_scheme.find('/').unwrap_or(after_scheme.len());
                 format!("{}://{}", &uri[..idx], &after_scheme[..host_end])
             }
-            None => format!("http://localhost:{}", config.coordinator.trino_http_port),
+            None => localhost,
         }
     } else {
-        format!("http://localhost:{}", config.coordinator.trino_http_port)
+        localhost
     };
 
     Ok(sqe_trino_compat::oauth2::OAuth2State {
@@ -3846,6 +3907,54 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    // ── /api/v1/status (open, trimmed) and /api/v1/status/detail (admin) ───
+
+    #[tokio::test]
+    async fn open_status_carries_only_status_and_role() {
+        use tower::ServiceExt;
+        let app = build_health_router(make_guarded_state_with_web_ui(false));
+        let req = axum::http::Request::builder()
+            .uri("/api/v1/status")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"status": "ACTIVE", "node": {"role": "coordinator"}})
+        );
+    }
+
+    #[tokio::test]
+    async fn status_detail_requires_admin_bearer() {
+        use tower::ServiceExt;
+        let app = build_health_router(make_guarded_state_with_web_ui(false));
+        for (token, expected) in [
+            (None, axum::http::StatusCode::UNAUTHORIZED),
+            (Some("user-tok"), axum::http::StatusCode::FORBIDDEN),
+            (Some("admin-tok"), axum::http::StatusCode::OK),
+        ] {
+            let mut req = axum::http::Request::builder().uri("/api/v1/status/detail");
+            if let Some(t) = token {
+                req = req.header("Authorization", format!("Bearer {t}"));
+            }
+            let resp = app
+                .clone()
+                .oneshot(req.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), expected, "token {token:?}");
+            if expected == axum::http::StatusCode::OK {
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(json["node"]["gitSha"], build_info::GIT_SHA);
+                assert!(json["node"]["uptimeSeconds"].is_u64());
+            }
+        }
     }
 
     // ── POST /api/v1/catalogs/refresh (admin-gated) ────────────────────────

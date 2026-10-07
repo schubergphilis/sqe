@@ -6,8 +6,8 @@
 //! ManifestListWriter}` into a temp-dir `FileIO`, so every manifest walk in
 //! the crate (`compute_table_statistics`, `collect_data_files_for_pruning`,
 //! `SqeTableProvider::scan`) runs against bytes the reader actually decodes,
-//! not against a hand-built `DataFile` list. No Parquet is written: the
-//! fixture stops at metadata, which is all the planning paths read.
+//! not against a hand-built `DataFile` list. The default fixture stops at
+//! metadata; `fake_iceberg_table_with_data` also writes readable Parquet.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -143,6 +143,30 @@ fn data_file(table: &Table, file: &FakeFile) -> DataFile {
 /// Each call gets a fresh table uuid so the process-global
 /// `SNAPSHOT_STATS_CACHE` never serves one test's manifests to another.
 pub(crate) async fn fake_iceberg_table(dir: &Path, with_live_deletes: bool) -> Table {
+    fake_iceberg_table_inner(dir, with_live_deletes, false).await
+}
+
+pub(crate) async fn fake_iceberg_table_with_data(dir: &Path, with_live_deletes: bool) -> Table {
+    fake_iceberg_table_inner(dir, with_live_deletes, true).await
+}
+
+fn write_fixture_parquet(path: &str, batch: &arrow::record_batch::RecordBatch) -> u64 {
+    std::fs::create_dir_all(Path::new(path).parent().unwrap()).unwrap();
+    let props = parquet::file::properties::WriterProperties::builder()
+        .set_max_row_group_row_count(Some(5))
+        .build();
+    let mut writer = parquet::arrow::ArrowWriter::try_new(
+        std::fs::File::create(path).unwrap(),
+        batch.schema(),
+        Some(props),
+    )
+    .unwrap();
+    writer.write(batch).unwrap();
+    writer.close().unwrap();
+    std::fs::metadata(path).unwrap().len()
+}
+
+async fn fake_iceberg_table_inner(dir: &Path, with_live_deletes: bool, real_data: bool) -> Table {
     let location = dir.to_string_lossy().to_string();
     let uuid = uuid::Uuid::new_v4().to_string();
     let manifest_list_path = format!("{location}/metadata/snap-{FAKE_SNAPSHOT_ID}.avro");
@@ -178,8 +202,27 @@ pub(crate) async fn fake_iceberg_table(dir: &Path, with_live_deletes: bool) -> T
         )
         .build_v2_data();
         for file in FAKE_FILES.iter().filter(|f| f.manifest == manifest_index) {
+            let mut file = *file;
+            if real_data {
+                let arrow_schema =
+                    std::sync::Arc::new(iceberg::arrow::schema_to_arrow_schema(&schema).unwrap());
+                let batch = arrow::record_batch::RecordBatch::try_new(
+                    arrow_schema,
+                    vec![
+                        std::sync::Arc::new(arrow::array::Int64Array::from_iter_values(
+                            file.id_min..=file.id_max,
+                        )),
+                        std::sync::Arc::new(arrow::array::StringArray::from_iter(
+                            (0..file.rows)
+                                .map(|i| if i < file.name_nulls { None } else { Some("a") }),
+                        )),
+                    ],
+                )
+                .unwrap();
+                file.bytes = write_fixture_parquet(&fake_file_path(&table, &file), &batch);
+            }
             writer
-                .add_file(data_file(&table, file), 1)
+                .add_file(data_file(&table, &file), 1)
                 .expect("add data file");
         }
         manifests.push(writer.write_manifest_file().await.expect("write manifest"));
@@ -196,12 +239,39 @@ pub(crate) async fn fake_iceberg_table(dir: &Path, with_live_deletes: bool) -> T
             spec,
         )
         .build_v2_deletes();
+        let delete_path = format!("{location}/data/deletes-0.parquet");
+        let delete_bytes = if real_data {
+            use arrow::datatypes::{DataType, Field, Schema};
+            let field = |name: &str, dtype, id: i32| {
+                Field::new(name, dtype, false)
+                    .with_metadata(HashMap::from([("PARQUET:field_id".into(), id.to_string())]))
+            };
+            let schema = std::sync::Arc::new(Schema::new(vec![
+                field("file_path", DataType::Utf8, 2147483546),
+                field("pos", DataType::Int64, 2147483545),
+            ]));
+            let data_path = fake_file_path(&table, &FAKE_FILES[0]);
+            let batch = arrow::record_batch::RecordBatch::try_new(
+                schema,
+                vec![
+                    std::sync::Arc::new(arrow::array::StringArray::from(vec![
+                        data_path.as_str();
+                        2
+                    ])),
+                    std::sync::Arc::new(arrow::array::Int64Array::from(vec![0, 1])),
+                ],
+            )
+            .unwrap();
+            write_fixture_parquet(&delete_path, &batch)
+        } else {
+            40
+        };
         let delete_file = DataFileBuilder::default()
             .partition_spec_id(0)
             .content(DataContentType::PositionDeletes)
-            .file_path(format!("{location}/data/deletes-0.parquet"))
+            .file_path(delete_path)
             .file_format(DataFileFormat::Parquet)
-            .file_size_in_bytes(40)
+            .file_size_in_bytes(delete_bytes)
             .record_count(2)
             .partition(Struct::empty())
             .key_metadata(None)

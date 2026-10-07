@@ -58,6 +58,37 @@ pub struct PreparedStatement {
     pub dataset_schema: SchemaRef,
     /// The current bind, kept until `Close`, a re-bind, or eviction.
     params: RwLock<Option<Vec<ScalarValue>>>,
+    /// The stored plan's tables carry catalog-vended keys; past this instant
+    /// (refresh margin before the earliest expiry) the plan must not run
+    /// and the statement is re-planned from its text, which reloads the
+    /// tables and gets new keys. `None`: no expiring credentials.
+    plan_credentials_usable_until: Option<std::time::SystemTime>,
+}
+
+/// Earliest refresh deadline of the vended credentials held by the Iceberg
+/// tables `plan` scans (subqueries included).
+fn plan_credentials_usable_until(plan: &LogicalPlan) -> Option<std::time::SystemTime> {
+    use datafusion::common::tree_node::TreeNodeRecursion;
+    use sqe_catalog::vended_credentials::{refresh_deadline, table_credential_expiry};
+    let now = std::time::SystemTime::now();
+    let mut earliest: Option<std::time::SystemTime> = None;
+    let _ = plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::TableScan(scan) = node {
+            let expiry = datafusion::datasource::source_as_provider(&scan.source)
+                .ok()
+                .and_then(|provider| {
+                    let any: &dyn std::any::Any = provider.as_ref();
+                    any.downcast_ref::<sqe_catalog::table_provider::SqeTableProvider>()
+                        .and_then(|p| table_credential_expiry(p.table()))
+                });
+            if let Some(expires_at) = expiry {
+                let deadline = refresh_deadline(expires_at, now);
+                earliest = Some(earliest.map_or(deadline, |e| e.min(deadline)));
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    earliest
 }
 
 /// A [`LogicalPlan`] behind a trait object, so that the auto-trait solver
@@ -118,6 +149,7 @@ impl PreparedStatement {
         param_types: Vec<Option<DataType>>,
         dataset_schema: SchemaRef,
     ) -> Self {
+        let plan_credentials_usable_until = plan.as_ref().and_then(plan_credentials_usable_until);
         Self {
             sql,
             numbered_sql,
@@ -125,7 +157,16 @@ impl PreparedStatement {
             param_types,
             dataset_schema,
             params: RwLock::new(None),
+            plan_credentials_usable_until,
         }
+    }
+
+    /// True when the stored plan holds vended credentials that are due for
+    /// refresh: run the statement through the text path instead, so the
+    /// tables are reloaded (fresh keys) rather than scanned with dead ones.
+    pub fn stored_plan_credentials_expired(&self) -> bool {
+        self.plan_credentials_usable_until
+            .is_some_and(|until| std::time::SystemTime::now() >= until)
     }
 
     /// Positional parameter types read off a planned statement:
@@ -486,5 +527,76 @@ mod tests {
         );
         store.remove("s1", id).await;
         assert!(store.get("s1", id).await.is_none());
+    }
+
+    async fn iceberg_scan_plan(expires_at_ms: Option<i64>) -> LogicalPlan {
+        let metadata: iceberg::spec::TableMetadata = serde_json::from_value(serde_json::json!({
+            "format-version": 1,
+            "table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
+            "location": "s3://bucket/ns/t",
+            "last-updated-ms": 1602638573874_i64,
+            "last-column-id": 1,
+            "schema": {"type": "struct", "fields": [
+                {"id": 1, "name": "x", "required": true, "type": "long"}]},
+            "partition-spec": [],
+            "properties": {},
+            "current-snapshot-id": -1,
+            "snapshots": []
+        }))
+        .unwrap();
+        let mut builder =
+            iceberg::io::FileIOBuilder::new(Arc::new(iceberg::io::LocalFsStorageFactory));
+        if let Some(ms) = expires_at_ms {
+            builder = builder.with_prop("s3.session-token-expires-at-ms", ms);
+        }
+        let table = iceberg::table::Table::builder()
+            .runtime(iceberg::Runtime::current())
+            .metadata(metadata)
+            .identifier(iceberg::TableIdent::from_strs(["ns", "t"]).unwrap())
+            .file_io(builder.build())
+            .disable_cache()
+            .build()
+            .unwrap();
+        let provider = sqe_catalog::table_provider::SqeTableProvider::try_new(table)
+            .await
+            .unwrap();
+        datafusion::logical_expr::LogicalPlanBuilder::scan(
+            "t",
+            datafusion::datasource::provider_as_source(Arc::new(provider)),
+            None,
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+    }
+
+    fn stored(plan: LogicalPlan) -> PreparedStatement {
+        let schema = Arc::new(plan.schema().as_arrow().clone());
+        PreparedStatement::new(
+            "SELECT x FROM t".into(),
+            "SELECT x FROM t".into(),
+            Some(plan),
+            vec![],
+            schema,
+        )
+    }
+
+    /// A stored plan holding expired vended keys is reported expired, so
+    /// execution re-plans from text (reloading the table) instead of
+    /// scanning with dead credentials. Long-lived and static keys keep the
+    /// stored plan.
+    #[tokio::test]
+    async fn stored_plan_with_expired_vended_credentials_is_replanned() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        assert!(
+            stored(iceberg_scan_plan(Some(now_ms - 1_000)).await).stored_plan_credentials_expired()
+        );
+        assert!(!stored(iceberg_scan_plan(Some(now_ms + 3_600_000)).await)
+            .stored_plan_credentials_expired());
+        assert!(!stored(iceberg_scan_plan(None).await).stored_plan_credentials_expired());
+        assert!(!prepared("SELECT 1").stored_plan_credentials_expired());
     }
 }

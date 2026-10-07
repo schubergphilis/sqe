@@ -25,7 +25,7 @@ pub use anonymous::{AnonymousProvider, AnonymousProviderConfig};
 pub use api_key::{ApiKeyEntry, ApiKeyProvider, ApiKeyProviderConfig};
 pub use auth_code::{AuthCodeChallenge, AuthCodeService};
 pub use authenticator::Authenticator;
-pub use aws_iam::{AwsIamProvider, AwsIamProviderConfig, KeyMapping as AwsKeyMapping};
+pub use aws_iam::{AwsIamProvider, AwsIamProviderConfig};
 pub use bearer_token::{BearerTokenProvider, BearerTokenProviderConfig};
 pub use chain::AuthChain;
 pub use factory::build_auth_chain;

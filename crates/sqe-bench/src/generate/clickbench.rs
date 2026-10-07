@@ -291,14 +291,17 @@ fn random_opt_string<'a>(rng: &mut StdRng, pool: &[&'a str]) -> &'a str {
     pool[rng.random_range(0..pool.len())]
 }
 
-fn generate_hits(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn generate_hits(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let schema = hits_schema();
     let total = (scale * ROWS_PER_SF) as usize;
     let mut rng = StdRng::seed_from_u64(seed_for_table("hits"));
-    let mut batches = Vec::new();
+    let out_schema = schema.clone();
 
     let mut offset = 0usize;
-    while offset < total {
+    let batches = std::iter::from_fn(move || {
+        if offset >= total {
+            return None;
+        }
         let n = BATCH_SIZE.min(total - offset);
 
         // Int64 columns
@@ -617,123 +620,122 @@ fn generate_hits(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let utm_term_refs: Vec<&str> = utm_term.iter().map(|s| s.as_str()).collect();
         let from_tag_refs: Vec<&str> = from_tag.iter().map(|s| s.as_str()).collect();
 
-        batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int64Array::from(watch_id)),
-                    Arc::new(Int32Array::from(java_enable)),
-                    Arc::new(StringArray::from(title_refs)),
-                    Arc::new(Int32Array::from(good_event)),
-                    Arc::new(Int64Array::from(event_time)),
-                    Arc::new(Date32Array::from(event_date)),
-                    Arc::new(Int32Array::from(counter_id)),
-                    Arc::new(Int32Array::from(client_ip)),
-                    Arc::new(Int32Array::from(region_id)),
-                    Arc::new(Int64Array::from(user_id)),
-                    Arc::new(Int32Array::from(counter_class)),
-                    Arc::new(Int32Array::from(os)),
-                    Arc::new(Int32Array::from(user_agent)),
-                    Arc::new(StringArray::from(url_refs)),
-                    Arc::new(StringArray::from(referer_refs)),
-                    Arc::new(Int32Array::from(is_refresh)),
-                    Arc::new(Int32Array::from(referer_category_id)),
-                    Arc::new(Int32Array::from(referer_region_id)),
-                    Arc::new(Int32Array::from(url_category_id)),
-                    Arc::new(Int32Array::from(url_region_id)),
-                    Arc::new(Int32Array::from(resolution_width)),
-                    Arc::new(Int32Array::from(resolution_height)),
-                    Arc::new(Int32Array::from(resolution_depth)),
-                    Arc::new(Int32Array::from(flash_major)),
-                    Arc::new(Int32Array::from(flash_minor)),
-                    Arc::new(StringArray::from(flash_minor2_refs)),
-                    Arc::new(Int32Array::from(net_major)),
-                    Arc::new(Int32Array::from(net_minor)),
-                    Arc::new(Int32Array::from(user_agent_major)),
-                    Arc::new(StringArray::from(ua_minor_refs)),
-                    Arc::new(Int32Array::from(cookie_enable)),
-                    Arc::new(Int32Array::from(javascript_enable)),
-                    Arc::new(Int32Array::from(is_mobile)),
-                    Arc::new(Int32Array::from(mobile_phone)),
-                    Arc::new(StringArray::from(mob_model_refs)),
-                    Arc::new(StringArray::from(params_refs)),
-                    Arc::new(Int32Array::from(ip_network_id)),
-                    Arc::new(Int32Array::from(trafic_source_id)),
-                    Arc::new(Int32Array::from(search_engine_id)),
-                    Arc::new(StringArray::from(search_phrase_refs)),
-                    Arc::new(Int32Array::from(adv_engine_id)),
-                    Arc::new(Int32Array::from(is_artifical)),
-                    Arc::new(Int32Array::from(window_client_width)),
-                    Arc::new(Int32Array::from(window_client_height)),
-                    Arc::new(Int32Array::from(client_time_zone)),
-                    Arc::new(Int64Array::from(client_event_time)),
-                    Arc::new(Int32Array::from(silverlight_version1)),
-                    Arc::new(Int32Array::from(silverlight_version2)),
-                    Arc::new(Int32Array::from(silverlight_version3)),
-                    Arc::new(Int32Array::from(silverlight_version4)),
-                    Arc::new(StringArray::from(page_charset_refs)),
-                    Arc::new(Int32Array::from(code_version)),
-                    Arc::new(Int32Array::from(is_link)),
-                    Arc::new(Int32Array::from(is_download)),
-                    Arc::new(Int32Array::from(is_not_bounce)),
-                    Arc::new(Int64Array::from(f_uniq_id)),
-                    Arc::new(StringArray::from(original_url_refs)),
-                    Arc::new(Int32Array::from(hid)),
-                    Arc::new(Int32Array::from(is_old_counter)),
-                    Arc::new(Int32Array::from(is_event)),
-                    Arc::new(Int32Array::from(is_parameter)),
-                    Arc::new(Int32Array::from(dont_count_hits)),
-                    Arc::new(Int32Array::from(with_hash)),
-                    Arc::new(StringArray::from(hit_color_refs)),
-                    Arc::new(Int64Array::from(local_event_time)),
-                    Arc::new(Int32Array::from(age)),
-                    Arc::new(Int32Array::from(sex)),
-                    Arc::new(Int32Array::from(income)),
-                    Arc::new(Int32Array::from(interests)),
-                    Arc::new(Int32Array::from(robotness)),
-                    Arc::new(Int32Array::from(remote_ip)),
-                    Arc::new(Int32Array::from(window_name)),
-                    Arc::new(Int32Array::from(opener_name)),
-                    Arc::new(Int32Array::from(history_length)),
-                    Arc::new(StringArray::from(browser_language_refs)),
-                    Arc::new(StringArray::from(browser_country_refs)),
-                    Arc::new(StringArray::from(social_network_refs)),
-                    Arc::new(StringArray::from(social_action_refs)),
-                    Arc::new(Int32Array::from(http_error)),
-                    Arc::new(Int32Array::from(send_timing)),
-                    Arc::new(Int32Array::from(dns_timing)),
-                    Arc::new(Int32Array::from(connect_timing)),
-                    Arc::new(Int32Array::from(response_start_timing)),
-                    Arc::new(Int32Array::from(response_end_timing)),
-                    Arc::new(Int32Array::from(fetch_timing)),
-                    Arc::new(Int32Array::from(social_source_network_id)),
-                    Arc::new(StringArray::from(social_source_page_refs)),
-                    Arc::new(Int64Array::from(param_price)),
-                    Arc::new(StringArray::from(param_order_id_refs)),
-                    Arc::new(StringArray::from(param_currency_refs)),
-                    Arc::new(Int32Array::from(param_currency_id)),
-                    Arc::new(StringArray::from(openstat_service_refs)),
-                    Arc::new(StringArray::from(openstat_campaign_refs)),
-                    Arc::new(StringArray::from(openstat_ad_refs)),
-                    Arc::new(StringArray::from(openstat_source_refs)),
-                    Arc::new(StringArray::from(utm_source_refs)),
-                    Arc::new(StringArray::from(utm_medium_refs)),
-                    Arc::new(StringArray::from(utm_campaign_refs)),
-                    Arc::new(StringArray::from(utm_content_refs)),
-                    Arc::new(StringArray::from(utm_term_refs)),
-                    Arc::new(StringArray::from(from_tag_refs)),
-                    Arc::new(Int32Array::from(has_gclid)),
-                    Arc::new(Int64Array::from(referer_hash)),
-                    Arc::new(Int64Array::from(url_hash)),
-                    Arc::new(Int32Array::from(clid)),
-                ],
-            )
-            .expect("hits batch"),
-        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(watch_id)),
+                Arc::new(Int32Array::from(java_enable)),
+                Arc::new(StringArray::from(title_refs)),
+                Arc::new(Int32Array::from(good_event)),
+                Arc::new(Int64Array::from(event_time)),
+                Arc::new(Date32Array::from(event_date)),
+                Arc::new(Int32Array::from(counter_id)),
+                Arc::new(Int32Array::from(client_ip)),
+                Arc::new(Int32Array::from(region_id)),
+                Arc::new(Int64Array::from(user_id)),
+                Arc::new(Int32Array::from(counter_class)),
+                Arc::new(Int32Array::from(os)),
+                Arc::new(Int32Array::from(user_agent)),
+                Arc::new(StringArray::from(url_refs)),
+                Arc::new(StringArray::from(referer_refs)),
+                Arc::new(Int32Array::from(is_refresh)),
+                Arc::new(Int32Array::from(referer_category_id)),
+                Arc::new(Int32Array::from(referer_region_id)),
+                Arc::new(Int32Array::from(url_category_id)),
+                Arc::new(Int32Array::from(url_region_id)),
+                Arc::new(Int32Array::from(resolution_width)),
+                Arc::new(Int32Array::from(resolution_height)),
+                Arc::new(Int32Array::from(resolution_depth)),
+                Arc::new(Int32Array::from(flash_major)),
+                Arc::new(Int32Array::from(flash_minor)),
+                Arc::new(StringArray::from(flash_minor2_refs)),
+                Arc::new(Int32Array::from(net_major)),
+                Arc::new(Int32Array::from(net_minor)),
+                Arc::new(Int32Array::from(user_agent_major)),
+                Arc::new(StringArray::from(ua_minor_refs)),
+                Arc::new(Int32Array::from(cookie_enable)),
+                Arc::new(Int32Array::from(javascript_enable)),
+                Arc::new(Int32Array::from(is_mobile)),
+                Arc::new(Int32Array::from(mobile_phone)),
+                Arc::new(StringArray::from(mob_model_refs)),
+                Arc::new(StringArray::from(params_refs)),
+                Arc::new(Int32Array::from(ip_network_id)),
+                Arc::new(Int32Array::from(trafic_source_id)),
+                Arc::new(Int32Array::from(search_engine_id)),
+                Arc::new(StringArray::from(search_phrase_refs)),
+                Arc::new(Int32Array::from(adv_engine_id)),
+                Arc::new(Int32Array::from(is_artifical)),
+                Arc::new(Int32Array::from(window_client_width)),
+                Arc::new(Int32Array::from(window_client_height)),
+                Arc::new(Int32Array::from(client_time_zone)),
+                Arc::new(Int64Array::from(client_event_time)),
+                Arc::new(Int32Array::from(silverlight_version1)),
+                Arc::new(Int32Array::from(silverlight_version2)),
+                Arc::new(Int32Array::from(silverlight_version3)),
+                Arc::new(Int32Array::from(silverlight_version4)),
+                Arc::new(StringArray::from(page_charset_refs)),
+                Arc::new(Int32Array::from(code_version)),
+                Arc::new(Int32Array::from(is_link)),
+                Arc::new(Int32Array::from(is_download)),
+                Arc::new(Int32Array::from(is_not_bounce)),
+                Arc::new(Int64Array::from(f_uniq_id)),
+                Arc::new(StringArray::from(original_url_refs)),
+                Arc::new(Int32Array::from(hid)),
+                Arc::new(Int32Array::from(is_old_counter)),
+                Arc::new(Int32Array::from(is_event)),
+                Arc::new(Int32Array::from(is_parameter)),
+                Arc::new(Int32Array::from(dont_count_hits)),
+                Arc::new(Int32Array::from(with_hash)),
+                Arc::new(StringArray::from(hit_color_refs)),
+                Arc::new(Int64Array::from(local_event_time)),
+                Arc::new(Int32Array::from(age)),
+                Arc::new(Int32Array::from(sex)),
+                Arc::new(Int32Array::from(income)),
+                Arc::new(Int32Array::from(interests)),
+                Arc::new(Int32Array::from(robotness)),
+                Arc::new(Int32Array::from(remote_ip)),
+                Arc::new(Int32Array::from(window_name)),
+                Arc::new(Int32Array::from(opener_name)),
+                Arc::new(Int32Array::from(history_length)),
+                Arc::new(StringArray::from(browser_language_refs)),
+                Arc::new(StringArray::from(browser_country_refs)),
+                Arc::new(StringArray::from(social_network_refs)),
+                Arc::new(StringArray::from(social_action_refs)),
+                Arc::new(Int32Array::from(http_error)),
+                Arc::new(Int32Array::from(send_timing)),
+                Arc::new(Int32Array::from(dns_timing)),
+                Arc::new(Int32Array::from(connect_timing)),
+                Arc::new(Int32Array::from(response_start_timing)),
+                Arc::new(Int32Array::from(response_end_timing)),
+                Arc::new(Int32Array::from(fetch_timing)),
+                Arc::new(Int32Array::from(social_source_network_id)),
+                Arc::new(StringArray::from(social_source_page_refs)),
+                Arc::new(Int64Array::from(param_price)),
+                Arc::new(StringArray::from(param_order_id_refs)),
+                Arc::new(StringArray::from(param_currency_refs)),
+                Arc::new(Int32Array::from(param_currency_id)),
+                Arc::new(StringArray::from(openstat_service_refs)),
+                Arc::new(StringArray::from(openstat_campaign_refs)),
+                Arc::new(StringArray::from(openstat_ad_refs)),
+                Arc::new(StringArray::from(openstat_source_refs)),
+                Arc::new(StringArray::from(utm_source_refs)),
+                Arc::new(StringArray::from(utm_medium_refs)),
+                Arc::new(StringArray::from(utm_campaign_refs)),
+                Arc::new(StringArray::from(utm_content_refs)),
+                Arc::new(StringArray::from(utm_term_refs)),
+                Arc::new(StringArray::from(from_tag_refs)),
+                Arc::new(Int32Array::from(has_gclid)),
+                Arc::new(Int64Array::from(referer_hash)),
+                Arc::new(Int64Array::from(url_hash)),
+                Arc::new(Int32Array::from(clid)),
+            ],
+        )
+        .expect("hits batch");
         offset += n;
-    }
+        Some(batch)
+    });
 
-    (schema, batches)
+    (out_schema, Box::new(batches))
 }
 
 // ---------------------------------------------------------------------------
@@ -765,9 +767,15 @@ impl BenchmarkGenerator for ClickBenchGenerator {
         let (schema, batches) = build_clickbench_table(table, scale, _config)?;
 
         let full_output = format!("{output_dir}/clickbench/sf{scale}");
-        let (files, bytes) =
-            parquet_writer::write_parquet_files(&batches, schema, &full_output, table)?;
-        let rows = batches.iter().map(|b| b.num_rows()).sum();
+        let (files, bytes) = parquet_writer::write_parquet_stream(
+            batches,
+            schema,
+            &full_output,
+            table,
+            "",
+            _config,
+        )?;
+        let rows = (scale * ROWS_PER_SF) as usize;
 
         Ok(GenerateStats {
             table: table.to_string(),
@@ -786,9 +794,9 @@ impl BenchmarkGenerator for ClickBenchGenerator {
     ) -> anyhow::Result<super::BatchSource> {
         use super::{BatchShard, BatchSource};
         let (schema, batches) = build_clickbench_table(table, scale, config)?;
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let total_rows = (scale * ROWS_PER_SF) as usize;
         let make: Box<dyn FnOnce() -> Box<dyn Iterator<Item = RecordBatch> + Send> + Send> =
-            Box::new(move || Box::new(batches.into_iter()));
+            Box::new(move || batches);
         Ok(BatchSource {
             schema,
             total_rows,
@@ -804,7 +812,7 @@ fn build_clickbench_table(
     table: &str,
     scale: f64,
     _config: &super::GenerateConfig,
-) -> anyhow::Result<(SchemaRef, Vec<RecordBatch>)> {
+) -> anyhow::Result<(SchemaRef, super::BatchIterator)> {
     if table != "hits" {
         anyhow::bail!("Unknown ClickBench table: {table}. Only 'hits' is defined.");
     }
@@ -849,6 +857,7 @@ mod tests {
     #[test]
     fn test_generate_hits_sf001() {
         let (schema, batches) = generate_hits(0.01);
+        let batches: Vec<_> = batches.collect();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1_000);
         for batch in &batches {
@@ -866,6 +875,7 @@ mod tests {
         // never produces; each seeded pattern must match a small but
         // nonzero fraction of rows.
         let (schema, batches) = generate_hits(0.1); // 10_000 rows
+        let batches: Vec<_> = batches.collect();
         let col = |name: &str| schema.index_of(name).unwrap();
         let uid_idx = col("UserID");
         let title_idx = col("Title");

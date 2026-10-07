@@ -498,14 +498,20 @@ async fn streaming_query_past_the_deadline_is_aborted_with_the_timeout_error() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:polaris"]
 async fn a_slow_worker_is_counted_as_a_straggler_and_the_query_completes() {
-    // Six fragments over three workers: the slow one gets about two, so the
-    // median fragment time stays fast and the slow ones exceed 3x median.
+    // Six fragments over three workers. Placement is least-loaded with file
+    // affinity on randomly named files, so the slow worker gets one to three
+    // of them; with three slow, the median (sorted[3]) is itself slow and
+    // nothing exceeds 3x it. That made this test fail about one run in three.
+    // Only the slow worker's first fragment is delayed: one slow fragment of
+    // six whatever the placement, and every worker gets at least one (the
+    // first three fragments go to three idle workers).
     let table = seed_table("chaos_straggler", 6).await;
     let fast_a = spawn_chaos_worker(ChaosMode::PassThrough).await;
     let fast_b = spawn_chaos_worker(ChaosMode::PassThrough).await;
-    // A fast fragment here is 150 to 350 ms; six frames at 400 ms each puts
-    // the slow one well past 3x the median without approaching any timeout.
-    let slow = spawn_chaos_worker(ChaosMode::DelayPerFrame(Duration::from_millis(400))).await;
+    // A fast fragment here is 150 to 600 ms; 400 ms per frame puts the slow
+    // one well past 3x the median without approaching any timeout.
+    let slow =
+        spawn_chaos_worker(ChaosMode::DelayFirstFragment(Duration::from_millis(400))).await;
     let rig = rig(
         &[fast_a.url.clone(), fast_b.url.clone(), slow.url.clone()],
         |c| {

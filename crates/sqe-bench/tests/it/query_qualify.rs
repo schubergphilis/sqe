@@ -21,6 +21,18 @@ fn column_alias_named_like_a_table_is_untouched() {
 }
 
 #[test]
+fn scalar_subquery_after_between_is_qualified() {
+    // TPC-C stock_level / TPC-DS q54 shape.
+    let tables = vec!["district".to_string()];
+    let sql = "SELECT 1 WHERE x BETWEEN (SELECT a FROM district) AND (SELECT b FROM district)";
+    let out = qualify_tables(sql, "tpcc_sf1", &tables).unwrap();
+    assert_eq!(
+        out,
+        "SELECT 1 WHERE x BETWEEN (SELECT a FROM tpcc_sf1.district) AND (SELECT b FROM tpcc_sf1.district)"
+    );
+}
+
+#[test]
 fn select_list_alias_in_group_and_order_by_is_untouched() {
     // TPC-DS q49 shape: `AS item` alias, then GROUP BY / ORDER BY on it.
     let tables: Vec<String> = ["item", "store_sales"]

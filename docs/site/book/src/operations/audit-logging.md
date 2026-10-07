@@ -478,7 +478,8 @@ role before it serves any content.
 | `/api/v1/metrics/history` | Bearer + admin role |
 | `/healthz` | Open (no auth) |
 | `/readyz` | Open (no auth) |
-| `/api/v1/status` | Open (no auth) |
+| `/api/v1/status` | Open (no auth); status and role only |
+| `/api/v1/status/detail` | Bearer + admin role |
 
 The three open endpoints serve Kubernetes liveness/readiness probes and load-balancer
 health checks. They must not require credentials.
@@ -541,6 +542,13 @@ is available. The health server is served with `into_make_service_with_connect_i
 so `ConnectInfo<SocketAddr>` is always present for real TCP connections. If
 `[security] trusted_proxies` is configured, the XFF header is honoured with the same
 rightmost-untrusted-hop rule used by the Flight SQL and Quack paths.
+
+`trusted_proxies` takes exact addresses and CIDR ranges, IPv4 and IPv6
+(`["10.42.0.0/16", "fd00::/8"]`). An IPv4 peer reported as IPv4-mapped IPv6
+by a dual-stack listener matches IPv4 entries. A range trusts every address
+in it: any of them can set `X-Forwarded-For` and so choose the client IP that
+lands in the audit record. Keep the range as narrow as the ingress allows.
+An entry that is neither an address nor a range fails config validation.
 
 ### Field consistency
 

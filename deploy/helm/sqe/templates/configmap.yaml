@@ -111,6 +111,7 @@ data:
     [security]
     allow_no_policy_engine = {{ .Values.config.security.allow_no_policy_engine }}
     allow_no_grant_backend = {{ .Values.config.security.allow_no_grant_backend }}
+    allow_plaintext_behind_tls_proxy = {{ .Values.config.security.allow_plaintext_behind_tls_proxy | default false }}
 
     {{- with .Values.config.mcp }}
     {{- if .enabled }}

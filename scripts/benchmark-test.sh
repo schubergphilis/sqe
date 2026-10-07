@@ -157,6 +157,65 @@ is_attach_read_only() {
     return 1
 }
 
+# Suites generated straight into Iceberg (`sqe-bench generate --sink
+# iceberg`), with the same partitioning, sort order and blooms as `load`
+# (SSB and TPC-DS facts come out of their generators in date order), so no
+# staged Parquet lands on disk. TPC-BB writes its own two tables into the
+# TPC-DS namespace it joins against.
+# BENCH_LOAD_MODE=load forces generate + load for every suite (A/B, or a
+# fallback). Pre-published data, attach mode, Hive tables and the
+# bloom/Puffin levers are `load` features, so any of them keeps a suite on
+# the load path.
+BENCH_LOAD_MODE="${BENCH_LOAD_MODE:-direct}"
+case "$BENCH_LOAD_MODE" in
+    direct|load) ;;
+    *) echo "ERROR: BENCH_LOAD_MODE must be 'direct' or 'load', got: '$BENCH_LOAD_MODE'" >&2; exit 1 ;;
+esac
+DIRECT_SINK_SUITES=(tpch ssb tpcds tpcbb tpcc tpce clickbench)
+uses_direct_sink() {
+    [ "$BENCH_LOAD_MODE" = "direct" ] || return 1
+    [ -z "$EXTERNAL_DATA" ] || return 1
+    [ "$BENCH_TABLE_FORMAT" = "iceberg" ] || return 1
+    [ -z "$BENCH_PUFFIN_STATS" ] || return 1
+    case "$(printf '%s' "$BENCH_BLOOM_FILTER" | tr '[:upper:]' '[:lower:]')" in
+        ""|0|false|no|off) ;;
+        *) return 1 ;;
+    esac
+    if [ -n "$ATTACH_MODE" ] && is_attach_read_only "$1"; then return 1; fi
+    local b
+    for b in "${DIRECT_SINK_SUITES[@]}"; do
+        [ "$b" = "$1" ] && return 0
+    done
+    return 1
+}
+
+# Generate <suite> straight into Iceberg namespace <ns>; any further
+# arguments go to `sqe-bench generate`. Writes to the WAREHOUSE endpoint
+# (where the Iceberg tables live), not the staging-data endpoint. `--clean`
+# drops and recreates the suite's tables, so a retry is idempotent.
+direct_generate() {
+    local suite=$1 ns=$2
+    shift 2
+    local ep=$S3_ENDPOINT ak=$S3_ACCESS_KEY sk=$S3_SECRET_KEY rg=$S3_REGION
+    if [ "$BENCH_WAREHOUSE" = "external" ]; then
+        ep=$BENCH_S3_ENDPOINT ak=$WH_S3_ACCESS_KEY sk=$WH_S3_SECRET_KEY rg=$BENCH_S3_REGION
+    fi
+    AWS_SECRET_ACCESS_KEY="$sk" "$BENCH_BIN" generate "$suite" \
+        --sink iceberg \
+        "$@" \
+        --namespace "$ns" \
+        --catalog-uri "http://localhost:18181/api/catalog" \
+        --warehouse test_warehouse \
+        --client-id root \
+        --client-secret s3cr3t \
+        --scope 'PRINCIPAL_ROLE:ALL' \
+        --s3-endpoint "$ep" \
+        --s3-access-key "$ak" \
+        --s3-region "$rg" \
+        --s3-path-style \
+        --clean 2>&1
+}
+
 EXTERNAL_DATA=""
 ATTACH_MODE=""
 case "$BENCH_DATA_SOURCE" in
@@ -712,6 +771,10 @@ if [ "$BENCH_TABLE_FORMAT" = "hive" ]; then
     HIVE_TEST_ARGS=(--catalog "$HIVE_ROOT" --result-label hive)
 fi
 
+# Namespace suffix for a scale, as sqe-bench's `bench_namespace` writes it
+# (`1` -> `1`, `0.1` -> `0_1`).
+SCALE_FMT=$(python3 -c "s='$BENCH_SCALE'; print((s.rstrip('0').rstrip('.') if '.' in s else s).replace('.','_'))")
+
 for BENCH in "${BENCHMARKS[@]}"; do
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -725,7 +788,20 @@ for BENCH in "${BENCHMARKS[@]}"; do
     # the PRIMARY catalog to join against -- including in attach mode, where
     # golden's tpcds is a different catalog and doesn't help tpcbb. This runs
     # regardless of ATTACH_MODE.
-    if [ "$BENCH" = "tpcbb" ] && [ -z "$TPCDS_LOADED" ]; then
+    if [ "$BENCH" = "tpcbb" ] && [ -z "$TPCDS_LOADED" ] && uses_direct_sink "$BENCH"; then
+        echo ""
+        echo "  [pre] TPC-BB requires TPC-DS tables — generating straight into tpcds_sf${SCALE_FMT}..."
+        # The coordinator restart after TPC-BB's own direct load below makes
+        # these tables visible too.
+        if ! direct_generate tpcds "tpcds_sf${SCALE_FMT}" --scale "$BENCH_SCALE"; then
+            echo "  ✗ Failed to load TPC-DS prerequisite tables for TPC-BB"
+            RESULTS+=("$BENCH: PREREQ_FAILED")
+            TOTAL_ERROR=$((TOTAL_ERROR + 1))
+            continue
+        fi
+        TPCDS_LOADED=1
+        echo "  ✓ TPC-DS tables loaded for TPC-BB"
+    elif [ "$BENCH" = "tpcbb" ] && [ -z "$TPCDS_LOADED" ]; then
         echo ""
         echo "  [pre] TPC-BB requires TPC-DS tables — generating and loading into the primary catalog..."
         if [ -z "$EXTERNAL_DATA" ]; then
@@ -754,50 +830,31 @@ for BENCH in "${BENCHMARKS[@]}"; do
         echo "  ✓ TPC-DS tables loaded for TPC-BB"
     fi
 
-    if [ "$BENCH" = "bank" ]; then
-        # ── Steps 1+2 (bank): generate straight into Iceberg ──
+    if [ "$BENCH" = "bank" ] || uses_direct_sink "$BENCH"; then
+        # ── Steps 1+2 (bank + DIRECT_SINK_SUITES): generate straight into Iceberg ──
         # No staging parquet, no CTAS through the engine: sqe-bench writes
-        # partition-aligned parquet to the warehouse and commits one
-        # snapshot per trading day via the Iceberg REST API. `--clean`
-        # drops + recreates the tables, so a retry is idempotent.
-        SCALE_FMT=$(python3 -c "s='$BENCH_SCALE'; print((s.rstrip('0').rstrip('.') if '.' in s else s).replace('.','_'))")
-        BANK_ROWS_PER_DAY=$(python3 -c "print(max(1, int(2_000_000 * float('$BENCH_SCALE'))))")
-        BANK_CUSTOMERS=$(python3 -c "print(max(100, int(100_000 * float('$BENCH_SCALE'))))")
-        # The load writes to the WAREHOUSE endpoint (where the Iceberg
-        # tables live), not the staging-data endpoint.
-        if [ "$BENCH_WAREHOUSE" = "external" ]; then
-            BANK_S3_ENDPOINT="$BENCH_S3_ENDPOINT"
-            BANK_S3_ACCESS_KEY="$WH_S3_ACCESS_KEY"
-            BANK_S3_SECRET_KEY="$WH_S3_SECRET_KEY"
-            BANK_S3_REGION="$BENCH_S3_REGION"
+        # parquet to the warehouse with `load`'s partitioning and commits
+        # via the Iceberg REST API (bank: one snapshot per trading day).
+        # `--clean` drops + recreates the tables, so a retry is idempotent.
+        # TPC-BB's own tables live in the TPC-DS namespace it joins against.
+        DIRECT_NS="${BENCH}_sf${SCALE_FMT}"
+        if [ "$BENCH" = "tpcbb" ]; then DIRECT_NS="tpcds_sf${SCALE_FMT}"; fi
+        if [ "$BENCH" = "bank" ]; then
+            BANK_ROWS_PER_DAY=$(python3 -c "print(max(1, int(2_000_000 * float('$BENCH_SCALE'))))")
+            BANK_CUSTOMERS=$(python3 -c "print(max(100, int(100_000 * float('$BENCH_SCALE'))))")
+            DIRECT_ARGS=(--days 12 --rows-per-day "$BANK_ROWS_PER_DAY" --customers "$BANK_CUSTOMERS")
+            DIRECT_WHAT="12 days x ${BANK_ROWS_PER_DAY} rows/day"
         else
-            BANK_S3_ENDPOINT="$S3_ENDPOINT"
-            BANK_S3_ACCESS_KEY="$S3_ACCESS_KEY"
-            BANK_S3_SECRET_KEY="$S3_SECRET_KEY"
-            BANK_S3_REGION="$S3_REGION"
+            DIRECT_ARGS=(--scale "$BENCH_SCALE")
+            DIRECT_WHAT="SF${BENCH_SCALE}; BENCH_LOAD_MODE=load stages Parquet instead"
         fi
         echo ""
-        echo "  [1-2/3] Generating straight into Iceberg (12 days x ${BANK_ROWS_PER_DAY} rows/day)..."
+        echo "  [1-2/3] Generating straight into Iceberg (${DIRECT_WHAT})..."
         LOAD_START=$(date +%s)
         LOAD_ATTEMPTS=2
         LOAD_OK=0
         for attempt in $(seq 1 "$LOAD_ATTEMPTS"); do
-            if AWS_SECRET_ACCESS_KEY="$BANK_S3_SECRET_KEY" "$BENCH_BIN" generate bank \
-                --sink iceberg \
-                --days 12 \
-                --rows-per-day "$BANK_ROWS_PER_DAY" \
-                --customers "$BANK_CUSTOMERS" \
-                --namespace "bank_sf${SCALE_FMT}" \
-                --catalog-uri "http://localhost:18181/api/catalog" \
-                --warehouse test_warehouse \
-                --client-id root \
-                --client-secret s3cr3t \
-                --scope 'PRINCIPAL_ROLE:ALL' \
-                --s3-endpoint "$BANK_S3_ENDPOINT" \
-                --s3-access-key "$BANK_S3_ACCESS_KEY" \
-                --s3-region "$BANK_S3_REGION" \
-                --s3-path-style \
-                --clean 2>&1; then
+            if direct_generate "$BENCH" "$DIRECT_NS" "${DIRECT_ARGS[@]}"; then
                 LOAD_OK=1
                 break
             fi
@@ -814,9 +871,10 @@ for BENCH in "${BENCHMARKS[@]}"; do
         fi
         LOAD_END=$(date +%s)
         echo "  ✓ Loaded in $((LOAD_END - LOAD_START))s"
+        if [ "$BENCH" = "tpcds" ]; then TPCDS_LOADED=1; fi
 
-        # The bank load is the only one that bypasses the engine (direct
-        # Iceberg REST commits), and the coordinator's catalog caches the
+        # A direct load bypasses the engine (Iceberg REST commits from
+        # sqe-bench), and the coordinator's catalog caches the
         # namespace listing: tables committed behind its back come back
         # "table not found" until a restart. Bounce the coordinator so
         # the test step sees the freshly committed namespace.

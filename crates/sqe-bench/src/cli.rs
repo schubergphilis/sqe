@@ -140,6 +140,18 @@ pub enum Command {
         #[arg(long, default_value = "512m")]
         target_file_size: String,
 
+        /// Write a suite directly even where `sqe-bench load` would
+        /// partition or sort a table; the result does not compare with a
+        /// loaded baseline (iceberg sink)
+        #[arg(long, default_value_t = false)]
+        ignore_layout: bool,
+
+        /// Memory a partitioned table (TPC-H lineitem/orders, TPC-C) may
+        /// buffer across all shards before its largest partition is written
+        /// out, e.g. `2g`. Larger means fewer, bigger files (iceberg sink)
+        #[arg(long, default_value = "2g")]
+        partition_buffer: String,
+
         /// Print the sized plan (calibration included) and exit without
         /// writing any table data (iceberg sink)
         #[arg(long, default_value_t = false)]
@@ -492,6 +504,8 @@ pub async fn run() -> anyhow::Result<()> {
             s3_region,
             s3_path_style,
             target_file_size,
+            ignore_layout,
+            partition_buffer,
             dry_run,
             resume,
             clean,
@@ -590,18 +604,16 @@ pub async fn run() -> anyhow::Result<()> {
                         s3_region: Some(s3_region),
                         s3_path_style,
                     };
-                    let file_size = sink::plan::parse_size(&target_file_size)? as usize;
-                    let gen = generate::get_generator(&benchmark)?;
-                    return sink::iceberg::run_direct(
-                        &target,
-                        gen.as_ref(),
-                        scale,
-                        &config,
+                    let opts = sink::iceberg::DirectOptions {
                         clean,
                         resume,
-                        file_size,
-                    )
-                    .await;
+                        target_file_size: sink::plan::parse_size(&target_file_size)? as usize,
+                        ignore_layout,
+                        partition_buffer: sink::plan::parse_size(&partition_buffer)? as usize,
+                    };
+                    let gen = generate::get_generator(&benchmark)?;
+                    return sink::iceberg::run_direct(&target, gen.as_ref(), scale, &config, &opts)
+                        .await;
                 }
             }
 
@@ -612,6 +624,17 @@ pub async fn run() -> anyhow::Result<()> {
             );
             for table_def in gen.tables() {
                 println!("Generating {}.{}...", benchmark, table_def.name);
+                // `load` reads the whole table directory. A regeneration that
+                // writes fewer part files than the last one would otherwise
+                // load the previous run's leftovers too: TPC-DS sf10 inventory
+                // came back as 133M new rows plus ~1.03B stale ones.
+                let table_dir = std::path::Path::new(&output)
+                    .join(&benchmark)
+                    .join(format!("sf{scale}"))
+                    .join(&table_def.name);
+                if table_dir.exists() {
+                    std::fs::remove_dir_all(&table_dir)?;
+                }
                 let stats = gen.generate_table(&table_def.name, scale, &output, &config)?;
                 println!(
                     "  {} rows, {} files, {:.1}s",
@@ -711,6 +734,9 @@ pub async fn run() -> anyhow::Result<()> {
             qualify_tables,
         } => {
             let sqe_endpoint = format!("http://{sqe_host}:{sqe_port}");
+            // Scoped like `test` and like the Trino client below, so both
+            // engines get the committed text (review 707).
+            let namespace = crate::suite_namespace(&benchmark, scale, None);
             let sqe_client = client::create_client(&client::ConnectArgs {
                 protocol: "flight",
                 endpoint: &sqe_endpoint,
@@ -720,13 +746,12 @@ pub async fn run() -> anyhow::Result<()> {
                 client_id: client_id.as_deref(),
                 client_secret: client_secret.as_deref(),
                 catalog: None,
-                schema: None,
+                schema: Some(&namespace),
             })
             .await?;
 
             // The default schema rides on the connection (`X-Trino-Schema`);
             // the query text itself is sent as committed (review 707).
-            let namespace = crate::suite_namespace(&benchmark, scale, None);
             let trino_client =
                 client::trino::TrinoBenchClient::new(&trino_url, Some(&trino_user), None)?
                     .with_catalog(trino_catalog.as_deref().unwrap_or("iceberg"))

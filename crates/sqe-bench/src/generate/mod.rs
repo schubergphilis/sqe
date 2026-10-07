@@ -14,6 +14,46 @@ use std::time::Duration;
 
 pub use config::GenerateConfig;
 
+/// Stateful, lazy batch production. Each call retains only the current batch;
+/// RNG and basket/session state remain owned by the iterator between calls.
+pub(crate) type BatchIterator = Box<dyn Iterator<Item = arrow_array::RecordBatch> + Send>;
+
+/// `ids` ordered by `(key(id), id)` with `key(id) < buckets`: a two-pass
+/// counting sort, 4 bytes per id. The first pass counts, the second
+/// recomputes each key and scatters, so no (key, id) pair is stored. Fact
+/// generators use it to emit rows in the order `load` sorts them on write.
+pub(crate) fn counting_order(
+    ids: std::ops::RangeInclusive<u32>,
+    buckets: usize,
+    key: impl Fn(u32) -> usize,
+) -> Vec<u32> {
+    let mut start = vec![0usize; buckets + 1];
+    for id in ids.clone() {
+        start[key(id) + 1] += 1;
+    }
+    for k in 1..start.len() {
+        start[k] += start[k - 1];
+    }
+    let mut out = vec![0u32; start[buckets]];
+    for id in ids {
+        let k = key(id);
+        out[start[k]] = id;
+        start[k] += 1;
+    }
+    out
+}
+
+/// SplitMix64 finalizer: a cheap, well-mixed hash. Fact generators derive
+/// the fields that decide a row's position (an order's date and line count)
+/// from it, so the sort index can compute them for every id without seeding
+/// a ChaCha generator per id.
+pub(crate) fn mix64(z: u64) -> u64 {
+    let z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    let z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 /// Scale a row count ensuring at least 1 row for small scale factors.
 pub(crate) fn scaled(scale: f64, base: f64) -> usize {
     (scale * base).max(1.0) as usize
@@ -63,6 +103,14 @@ pub trait BenchmarkGenerator: Send + Sync {
         output_dir: &str,
         config: &GenerateConfig,
     ) -> anyhow::Result<GenerateStats>;
+
+    /// The column whose non-decreasing order this generator emits `table`
+    /// in, if any. A table `load` sorts on write by that same column needs
+    /// no sort on the direct sink. `generated_sort_orders_hold` checks the
+    /// claim against the rows.
+    fn sorted_by(&self, _table: &str) -> Option<&'static str> {
+        None
+    }
 
     /// Produce a table's rows as Arrow batches for the Iceberg direct sink.
     /// Default: unsupported (generators opt in one at a time).
@@ -210,6 +258,197 @@ mod batch_source_tests {
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
+
+    #[test]
+    fn generation_golden() {
+        use std::hash::{Hash, Hasher};
+        // Captured from the eager generators before their streaming migration.
+        // `SQE_BENCH_RECORD_GOLDEN=1` prints the current hashes instead of
+        // checking them, for a deliberate change to generated values.
+        let record = std::env::var_os("SQE_BENCH_RECORD_GOLDEN").is_some();
+        let mut recorded = std::collections::BTreeMap::new();
+        let expected: std::collections::HashMap<String, (usize, u64)> =
+            serde_json::from_str(include_str!("generation-golden.json")).unwrap();
+        for suite in ["ssb", "tpcds", "tpcbb", "tpcc", "clickbench"] {
+            let generator = get_generator(suite).unwrap();
+            for table in generator.tables() {
+                let source = generator
+                    .generate_batches(&table.name, 0.01, &GenerateConfig::default())
+                    .unwrap();
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                let mut rows = 0;
+                for shard in source.shards {
+                    for batch in (shard.make)() {
+                        let mut bytes = Vec::new();
+                        let mut writer =
+                            arrow::ipc::writer::StreamWriter::try_new(&mut bytes, &batch.schema())
+                                .unwrap();
+                        writer.write(&batch).unwrap();
+                        writer.finish().unwrap();
+                        drop(writer);
+                        bytes.hash(&mut hash);
+                        rows += batch.num_rows();
+                    }
+                }
+                assert_eq!(rows, source.total_rows);
+                let key = format!("{suite}.{}", table.name);
+                if record {
+                    recorded.insert(key, (rows, hash.finish()));
+                    continue;
+                }
+                assert_eq!(
+                    Some(&(rows, hash.finish())),
+                    expected.get(&key),
+                    "values changed for {key}",
+                );
+            }
+        }
+        if record {
+            println!("{}", serde_json::to_string_pretty(&recorded).unwrap());
+        }
+    }
+
+    /// Every `sorted_by` claim names the key `load` sorts the table by, and
+    /// the generated rows really are non-decreasing on it. SF0.1 has enough
+    /// tickets and return rows that a row landing in the wrong place shows.
+    #[test]
+    fn generated_sort_orders_hold() {
+        use arrow_array::{Array, Int32Array};
+        let mut checked = 0;
+        for suite in [
+            "tpch",
+            "ssb",
+            "tpcds",
+            "tpcbb",
+            "tpcc",
+            "tpce",
+            "clickbench",
+        ] {
+            let generator = get_generator(suite).unwrap();
+            for table in generator.tables() {
+                let Some(key) = generator.sorted_by(&table.name) else {
+                    continue;
+                };
+                assert_eq!(
+                    Some(key),
+                    crate::layout::table_layout(suite, &table.name).sort_key(),
+                    "{suite}.{}: sorted_by differs from load's sort key",
+                    table.name
+                );
+                let source = generator
+                    .generate_batches(&table.name, 0.1, &GenerateConfig::default())
+                    .unwrap();
+                let mut prev = i32::MIN;
+                let mut rows = 0;
+                for shard in source.shards {
+                    for batch in (shard.make)() {
+                        let col = batch
+                            .column_by_name(key)
+                            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                            .unwrap_or_else(|| panic!("{suite}.{}.{key} is Int32", table.name));
+                        for i in 0..col.len() {
+                            let v = col.value(i);
+                            assert!(
+                                v >= prev,
+                                "{suite}.{}: {key} drops from {prev} to {v} at row {}",
+                                table.name,
+                                rows + i
+                            );
+                            prev = v;
+                        }
+                        rows += col.len();
+                    }
+                }
+                assert_eq!(rows, source.total_rows, "{suite}.{}", table.name);
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 8, "ssb lineorder + 7 TPC-DS facts");
+    }
+
+    #[test]
+    fn sf100_sources_generate_only_requested_batches() {
+        for suite in ["ssb", "tpcds", "tpcbb", "tpcc", "clickbench"] {
+            let generator = get_generator(suite).unwrap();
+            for table in generator.tables() {
+                // A date-ordered fact table builds its sort index (4 bytes per
+                // order or return row) before the first batch; at SF100 that
+                // is ~26 s in a debug build, so those tables run at SF10. The
+                // index is the only up-front work; rows are still produced
+                // lazily.
+                let scale = if generator.sorted_by(&table.name).is_some() {
+                    10.0
+                } else {
+                    100.0
+                };
+                let source = generator
+                    .generate_batches(&table.name, scale, &GenerateConfig::default())
+                    .unwrap();
+                assert_eq!(source.total_rows, (table.row_count)(scale));
+                // Creating a source for hundreds of millions of rows must not
+                // produce the table. Dropping an early consumer must stop it.
+                for shard in source.shards {
+                    for batch in (shard.make)().take(2) {
+                        assert_eq!(batch.schema(), table.schema);
+                        assert!(batch.num_rows() <= 10_000);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn staged_stream_preserves_values_and_writer_configuration() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::basic::Compression;
+
+        let output = tempfile::tempdir().unwrap();
+        let config = GenerateConfig {
+            compression: config::CompressionKind::Snappy,
+            row_group_size: Some(2048),
+            ..GenerateConfig::default()
+        };
+        for (suite, table) in [
+            ("ssb", "lineorder"),
+            ("tpcds", "store_sales"),
+            ("tpcbb", "web_clickstreams"),
+        ] {
+            let generator = get_generator(suite).unwrap();
+            let stats = generator
+                .generate_table(table, 0.01, output.path().to_str().unwrap(), &config)
+                .unwrap();
+            let source = generator.generate_batches(table, 0.01, &config).unwrap();
+            assert_eq!(stats.rows, source.total_rows);
+            let schema = source.schema;
+            let expected: Vec<_> = source.shards.into_iter().flat_map(|s| (s.make)()).collect();
+            let expected = arrow::compute::concat_batches(&schema, &expected).unwrap();
+            let directory = output.path().join(format!("{suite}/sf0.01/{table}"));
+            let mut files: Vec<_> = std::fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            files.sort();
+            let mut actual = Vec::new();
+            for file in files {
+                let reader =
+                    ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(file).unwrap())
+                        .unwrap();
+                for row_group in reader.metadata().row_groups() {
+                    assert!(row_group.num_rows() <= 2048);
+                    assert!(row_group
+                        .columns()
+                        .iter()
+                        .all(|c| c.compression() == Compression::SNAPPY));
+                }
+                actual.extend(reader.build().unwrap().map(Result::unwrap));
+            }
+            let actual = arrow::compute::concat_batches(&schema, &actual).unwrap();
+            assert_eq!(
+                actual, expected,
+                "staged values changed for {suite}.{table}"
+            );
+        }
+    }
 
     #[test]
     fn batch_shard_make_produces_rows() {

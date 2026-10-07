@@ -57,7 +57,7 @@ use sqe_sql::{
 use crate::prepared_statements::{PreparedStatement, PreparedStatementStore};
 use crate::query_handler::QueryHandler;
 use crate::query_tracker::QueryTracker;
-use crate::session_manager::SessionManager;
+use crate::session_manager::{session_log_id, SessionManager};
 use crate::worker_registry::WorkerRegistry;
 
 // Re-export helpers so callers that imported directly from this module
@@ -423,6 +423,12 @@ pub fn ipc_options_for(
         .map_err(|e| Status::internal(format!("Failed to set IPC compression: {e}")))
 }
 
+fn execution_error_to_flight(error: datafusion::error::DataFusionError) -> FlightError {
+    FlightError::Tonic(Box::new(sqe_error_to_status(
+        &crate::query_memory::execution_error(&error), None,
+    )))
+}
+
 /// Encode `RecordBatch`es into a streaming Flight response using the given IPC options.
 ///
 /// Standalone function so that tests and other callers can use it without
@@ -511,8 +517,9 @@ pub struct SqeFlightSqlService {
 #[derive(Clone, Debug)]
 struct PendingStatement {
     sql: String,
-    /// Owner: the ticket may only be redeemed by the user it was issued to.
-    username: String,
+    /// Owner ([`sqe_core::SessionUser::principal_id`]): the ticket may only
+    /// be redeemed by the principal it was issued to.
+    owner: String,
     /// For prepared statements, the statement id so `DoGet` runs the stored
     /// plan with the bind current at execution time (finding 406).
     prepared: Option<uuid::Uuid>,
@@ -576,7 +583,7 @@ impl SqeFlightSqlService {
                 query_id,
                 PendingStatement {
                     sql,
-                    username: session.user.username.clone(),
+                    owner: session.user.principal_id().to_string(),
                     prepared,
                 },
             )
@@ -612,11 +619,10 @@ impl SqeFlightSqlService {
                  call GetFlightInfo again"
             )));
         };
-        if pending.username != session.user.username {
+        if pending.owner != session.user.principal_id() {
             warn!(
                 query_id = %query_id,
                 caller = %session.user.username,
-                owner = %pending.username,
                 "DoGet denied: ticket was issued to another user"
             );
             return Err(Status::permission_denied(
@@ -760,7 +766,7 @@ impl SqeFlightSqlService {
                 timing: None,
                 stats: None,
                 query: None,
-                session_id,
+                session_id: session_id.as_deref().map(session_log_id),
                 client_ip,
                 trace_id: sqe_metrics::propagation::current_trace_id(),
                 query_id: None,
@@ -800,7 +806,7 @@ impl SqeFlightSqlService {
                 timing: None,
                 stats: None,
                 query: None,
-                session_id,
+                session_id: session_id.as_deref().map(session_log_id),
                 client_ip,
                 trace_id: sqe_metrics::propagation::current_trace_id(),
                 query_id: None,
@@ -905,7 +911,7 @@ impl SqeFlightSqlService {
             debug!(
                 username = %session.user.username,
                 client_ip = %client_ip,
-                session_id = %session.id,
+                session_id = %session_log_id(&session.id),
                 "Request authenticated via session"
             );
             return Ok(session);
@@ -930,7 +936,7 @@ impl SqeFlightSqlService {
                         debug!(
                             username = %session.user.username,
                             client_ip = %client_ip,
-                            session_id = %session.id,
+                            session_id = %session_log_id(&session.id),
                             "Flight: JWT bearer matched an existing session"
                         );
                         return Ok(session);
@@ -938,7 +944,7 @@ impl SqeFlightSqlService {
                     debug!(
                         username = %session.user.username,
                         client_ip = %client_ip,
-                        session_id = %session.id,
+                        session_id = %session_log_id(&session.id),
                         "Flight: authenticated via validated JWT bearer token"
                     );
                     let jwt_actor = sqe_metrics::audit::Actor::from_parts(
@@ -1114,7 +1120,7 @@ impl SqeFlightSqlService {
     ) -> Result<Response<FlightStream>, Status> {
         let options = self.flight_ipc_options()?;
         let batch_stream =
-            stream.map(|res| res.map_err(|e| FlightError::ExternalError(Box::new(e))));
+            stream.map(|res| res.map_err(execution_error_to_flight));
         let flight_stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .with_options(options)
@@ -1179,7 +1185,9 @@ impl SqeFlightSqlService {
         client_ip: Option<String>,
         query_id: Option<uuid::Uuid>,
     ) -> Result<Response<FlightStream>, Status> {
-        if statement.plan.is_some() {
+        // A stored plan whose tables' vended keys are due for refresh is not
+        // run: the text path below re-plans, which reloads the tables.
+        if statement.plan.is_some() && !statement.stored_plan_credentials_expired() {
             let plan = statement
                 .bound_plan()
                 .map_err(Status::failed_precondition)?;
@@ -1452,7 +1460,7 @@ impl FlightSqlService for SqeFlightSqlService {
 
         info!(
             username = username,
-            session_id = %session.id,
+            session_id = %session_log_id(&session.id),
             "Handshake authentication successful"
         );
         let handshake_actor = sqe_metrics::audit::Actor::from_parts(
@@ -2644,7 +2652,7 @@ impl FlightSqlService for SqeFlightSqlService {
             // Issued but not yet fetched: drop the pending entry so a late
             // DoGet fails with NotFound instead of starting the query.
             let pending_dropped = match self.pending_statements.get(&uuid).await {
-                Some(p) if p.username == session.user.username || is_admin => {
+                Some(p) if p.owner == session.user.principal_id() || is_admin => {
                     self.pending_statements.invalidate(&uuid).await;
                     true
                 }
@@ -2655,17 +2663,16 @@ impl FlightSqlService for SqeFlightSqlService {
                 }
                 None => false,
             };
-            match self.query_tracker.owner_of(&uuid) {
-                Some(owner) if owner == session.user.username || is_admin => {
+            match self.query_tracker.principal_of(&uuid) {
+                Some(owner) if owner == session.user.principal_id() || is_admin => {
                     // `cancel` is false once the query already reached a
                     // terminal state; a dropped pending entry still counts.
                     self.query_tracker.cancel(&uuid) || pending_dropped
                 }
-                Some(owner) => {
+                Some(_) => {
                     warn!(
                         query_id = %query_id,
                         caller = %session.user.username,
-                        owner = %owner,
                         "CancelQuery denied: caller does not own query"
                     );
                     return Err(Status::permission_denied(
@@ -3186,6 +3193,17 @@ mod tests {
     use arrow_flight::sql::metadata::{SqlInfoDataBuilder, XdbcTypeInfo, XdbcTypeInfoDataBuilder};
     use arrow_flight::sql::{Nullable, Searchable, SqlInfo, XdbcDataType};
     use arrow_schema::{DataType, Field, Schema};
+
+    #[test]
+    fn streamed_memory_refusal_keeps_resource_exhausted_status() {
+        use datafusion::error::DataFusionError;
+        let error = DataFusionError::Context("hash build".into(), Box::new(
+            DataFusionError::ResourcesExhausted("query.max_query_memory=65536 bytes".into()),
+        ));
+        let status = Status::from(execution_error_to_flight(error));
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert!(status.message().contains("query.max_query_memory"));
+    }
 
     #[tokio::test]
     async fn flight_trace_layer_uses_remote_w3c_parent() {
@@ -3933,6 +3951,35 @@ catalog_url = ""
             .expect("DoGet after cancel must fail");
         assert_eq!(err.code(), tonic::Code::NotFound);
         assert_eq!(tracker.active_count(), 0);
+    }
+
+    /// Ticket ownership follows the stable principal (IdP subject), not the
+    /// display username: a session with the same username but a different
+    /// subject cannot redeem another principal's ticket (issue #622).
+    #[tokio::test]
+    async fn statement_ticket_owner_is_the_subject_not_the_username() {
+        let (service, token, _tracker) = cancel_test_service().await;
+        let base = service.session_manager.get_session(&token).expect("session");
+        let mut owner = (*base).clone();
+        owner.user.subject = Some("sub-owner".to_string());
+        let mut other = owner.clone();
+        other.user.subject = Some("sub-other".to_string());
+        assert_eq!(owner.user.username, other.user.username);
+
+        let (query_id, _) = service
+            .issue_statement_ticket(&owner, "SELECT 1".to_string(), None)
+            .await;
+        let err = service
+            .resolve_statement_handle(&other, &query_id.to_string())
+            .await
+            .err()
+            .expect("same username, different subject must be denied");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        assert!(service
+            .resolve_statement_handle(&owner, &query_id.to_string())
+            .await
+            .is_ok());
     }
 
     /// The running-query half: DoGet runs the statement under the ticket's

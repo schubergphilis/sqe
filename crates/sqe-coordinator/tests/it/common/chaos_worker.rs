@@ -58,6 +58,10 @@ pub enum ChaosMode {
     /// Sleep this long before every frame: a straggler, or a stream that is
     /// still producing rows when the query deadline passes.
     DelayPerFrame(Duration),
+    /// `DelayPerFrame` on this worker's first `do_get` only; later fragments
+    /// pass through. Exactly one slow fragment, however many the scheduler
+    /// hands this worker, so a straggler test does not depend on placement.
+    DelayFirstFragment(Duration),
 }
 
 /// The wrapped worker as a trait object: a compile firewall, keep it. Held
@@ -141,11 +145,18 @@ impl Drop for ChaosHandle {
 /// production `WorkerFlightService` over a default worker runtime; it reads
 /// object storage with the credentials the ticket carries.
 pub async fn spawn_chaos_worker(mode: ChaosMode) -> ChaosHandle {
+    // Bind first: the worker must advertise the URL the coordinator dials.
+    // Scan tickets carry that URL as their audience, and a worker refuses a
+    // ticket addressed elsewhere (#724).
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind chaos worker");
+    let addr = listener.local_addr().expect("local addr");
+    let url = format!("http://{}", addr);
+
     let worker_config = sqe_core::config::WorkerConfig::default();
     let (session_ctx, _pool) = sqe_worker::runtime::build_session_context(&worker_config)
         .expect("worker session context");
     let metrics = Arc::new(WorkerMetricsRegistry::new().expect("worker metrics"));
-    let inner = WorkerFlightService::new(metrics, session_ctx);
+    let inner = WorkerFlightService::new(metrics, session_ctx).with_advertise_url(url.clone());
 
     let worker = ChaosWorker {
         shared: Arc::new(Shared {
@@ -157,9 +168,6 @@ pub async fn spawn_chaos_worker(mode: ChaosMode) -> ChaosHandle {
         }),
     };
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind chaos worker");
-    let addr = listener.local_addr().expect("local addr");
-    let url = format!("http://{}", addr);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let service = worker.clone();
     let task = tokio::spawn(async move {
@@ -205,8 +213,14 @@ impl FlightService for ChaosWorker {
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let shared = &self.shared;
-        shared.do_gets.fetch_add(1, Ordering::SeqCst);
-        let mode = shared.mode.lock().unwrap().clone();
+        let earlier_do_gets = shared.do_gets.fetch_add(1, Ordering::SeqCst);
+        let mode = match shared.mode.lock().unwrap().clone() {
+            ChaosMode::DelayFirstFragment(delay) if earlier_do_gets == 0 => {
+                ChaosMode::DelayPerFrame(delay)
+            }
+            ChaosMode::DelayFirstFragment(_) => ChaosMode::PassThrough,
+            mode => mode,
+        };
 
         if let ChaosMode::Hang = mode {
             // The request is fully received and never answered. tonic drops
@@ -228,7 +242,10 @@ impl FlightService for ChaosWorker {
         });
 
         let stream: BoxStream<FlightData> = match mode {
-            ChaosMode::PassThrough | ChaosMode::Hang => counted.boxed(),
+            // DelayFirstFragment was resolved to one of the others above.
+            ChaosMode::PassThrough | ChaosMode::Hang | ChaosMode::DelayFirstFragment(_) => {
+                counted.boxed()
+            }
             ChaosMode::FailAfterFrames(n) => counted
                 .enumerate()
                 .take(n + 1)

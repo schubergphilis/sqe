@@ -42,6 +42,9 @@ pub struct SqeTableProvider {
     /// The scan tuning knobs, applied to every `IcebergScanExec` this
     /// provider builds (#575).
     tuning: ScanTuning,
+    /// Reloads the table as the same principal for fresh vended keys;
+    /// handed to every scan this provider builds.
+    reloader: Option<crate::vended_credentials::TableReloader>,
 }
 
 impl SqeTableProvider {
@@ -78,7 +81,22 @@ impl SqeTableProvider {
             trust_sort_order: false,
             snapshot_id,
             tuning: ScanTuning::default(),
+            reloader: None,
         })
+    }
+
+    /// The Iceberg table (and its FileIO) this provider scans.
+    pub fn table(&self) -> &Table {
+        &self.table
+    }
+
+    /// Attach the reloader every scan of this table carries, so a
+    /// distributed scan can renew vended credentials (see
+    /// [`crate::vended_credentials::TableReloader`]).
+    #[must_use = "with_reloader consumes self; bind the returned provider"]
+    pub fn with_reloader(mut self, reloader: crate::vended_credentials::TableReloader) -> Self {
+        self.reloader = Some(reloader);
+        self
     }
 
     /// Replace every scan tuning knob at once (#575). This is the path the
@@ -275,6 +293,9 @@ impl SqeTableProvider {
         );
         if let Some(sid) = self.snapshot_id {
             exec = exec.with_snapshot_id(sid);
+        }
+        if let Some(reloader) = &self.reloader {
+            exec = exec.with_table_reloader(reloader.clone());
         }
         if self.trust_sort_order {
             exec = exec.with_trust_sort_order(true);

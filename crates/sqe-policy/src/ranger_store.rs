@@ -5,10 +5,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use chrono_tz::Tz;
 use datafusion::logical_expr::{lit, Expr};
 use moka::future::Cache;
 use reqwest::Client;
@@ -22,7 +24,7 @@ use sqe_core::CircuitBreaker;
 use crate::policy_expr::parse_sql_predicate;
 use crate::session_udf::SessionIdentity;
 use crate::{MaskType, PolicyStore, ResolvedPolicy, TagMaskSpec};
-use sqe_policy_api::HiveCatalogs;
+use sqe_policy_api::{wildcard_match, HiveCatalogs};
 
 // --- Ranger policy bundle model (ServicePolicies) ---
 
@@ -92,6 +94,26 @@ pub(crate) struct RangerPolicy {
     /// Grantees carved out of `denyPolicyItems`.
     #[serde(rename = "denyExceptions", default)]
     pub(crate) deny_exceptions: Vec<AccessPolicyItem>,
+    /// Time windows the policy is in force. Empty means always. Read only for
+    /// access policies, see `policy_schedule_active`.
+    #[serde(rename = "validitySchedules", default)]
+    pub(crate) validity_schedules: Vec<ValiditySchedule>,
+}
+
+/// One Ranger `validitySchedules` entry. Times use Ranger's
+/// `yyyy/MM/dd HH:mm:ss` format in `timeZone` (UTC when unset).
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct ValiditySchedule {
+    #[serde(rename = "startTime", default)]
+    pub(crate) start_time: Option<String>,
+    #[serde(rename = "endTime", default)]
+    pub(crate) end_time: Option<String>,
+    #[serde(rename = "timeZone", default)]
+    pub(crate) time_zone: Option<String>,
+    /// Recurring windows. Not modelled: a schedule carrying any is treated as
+    /// unevaluable.
+    #[serde(default)]
+    pub(crate) recurrences: Vec<serde_json::Value>,
 }
 
 /// One grantee list with the access types it carries, the shape shared by the
@@ -107,6 +129,10 @@ pub(crate) struct AccessPolicyItem {
     pub(crate) groups: Vec<String>,
     #[serde(default)]
     pub(crate) accesses: Vec<RangerAccess>,
+    /// Ranger policy conditions (IP range, expressions, ...). SQE evaluates
+    /// none of them, so an allow item carrying any never grants.
+    #[serde(default)]
+    pub(crate) conditions: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -141,6 +167,11 @@ pub(crate) struct DataMaskPolicyItem {
     pub(crate) groups: Vec<String>,
     #[serde(rename = "dataMaskInfo", default)]
     pub(crate) data_mask_info: DataMaskInfo,
+    /// Ranger item conditions. SQE evaluates none of them, and the first
+    /// matching item decides the column, so a conditional item restricts the
+    /// column rather than letting a later (possibly `MASK_NONE`) item decide.
+    #[serde(default)]
+    pub(crate) conditions: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -479,51 +510,6 @@ fn hive_database(namespace: &str) -> String {
     namespace.to_string()
 }
 
-/// Ranger wildcard match: `*` matches any run of characters (including none),
-/// `?` matches exactly one.
-///
-/// Semantics taken from the live `hive` service definition, whose `database`,
-/// `table` and `column` resources all declare
-/// `matcherOptions: {wildCard: "true", ignoreCase: "true"}`. Ranger implements
-/// that with commons-io `FilenameUtils.wildcardMatch` and `IOCase.INSENSITIVE`,
-/// where no character other than `*` and `?` is special.
-///
-/// Case folding is part of the same contract, not a separate liberty: with
-/// `ignoreCase: true`, a policy written on `Orders` fires for `orders` in Ranger,
-/// and SQE comparing case-sensitively would silently not mask.
-///
-/// Iterative with a single backtrack point, so a pattern like `*a*a*a*a*` cannot
-/// blow up: policies are operator input reaching a per-query path.
-fn wildcard_match(pattern: &str, target: &str) -> bool {
-    let p: Vec<char> = pattern.to_lowercase().chars().collect();
-    let t: Vec<char> = target.to_lowercase().chars().collect();
-    let (mut pi, mut ti) = (0usize, 0usize);
-    let mut star: Option<usize> = None;
-    let mut resume = 0usize;
-    while ti < t.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = Some(pi);
-            pi += 1;
-            resume = ti;
-        } else if let Some(s) = star {
-            // Backtrack: let the last `*` swallow one more character.
-            pi = s + 1;
-            resume += 1;
-            ti = resume;
-        } else {
-            return false;
-        }
-    }
-    // Trailing `*`s may match nothing.
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
-}
-
 /// True if a Ranger resource value list matches `target`.
 ///
 /// Wildcards and case-insensitivity per the service definition (see
@@ -553,6 +539,13 @@ fn resource_matches(res: &RangerResource, target: &str) -> bool {
 /// old policy is the safe direction while operators migrate; under-matching is a
 /// leak.
 fn policy_matches_table(p: &RangerPolicy, database: &str, table: &str) -> bool {
+    policy_matches_table_with(p, database, table, true)
+}
+
+/// `policy_matches_table` with the last-component fallback switchable. Access
+/// allow items pass `false`: over-matching a grant is the leak direction, so
+/// the fallback is only safe where it can restrict (masks, filters, denies).
+fn policy_matches_table_with(p: &RangerPolicy, database: &str, table: &str, last_component_fallback: bool) -> bool {
     let db_ok = p
         .resources
         .get("database")
@@ -561,7 +554,7 @@ fn policy_matches_table(p: &RangerPolicy, database: &str, table: &str) -> bool {
                 return true;
             }
             let last = database.rsplit('.').next().unwrap_or(database);
-            if last != database && resource_matches(r, last) {
+            if last_component_fallback && last != database && resource_matches(r, last) {
                 warn!(
                     policy_id = p.id,
                     namespace = %database,
@@ -758,13 +751,15 @@ fn map_mask(
     }
 }
 
-/// True when an access-policy item carries `select` (or `all`) as an allowed
-/// access type. Ranger writes `isAllowed: true` on deny items too (the item
-/// list, not the flag, makes it a deny), so the flag only rules out an item
-/// an operator toggled off.
-fn item_grants_select(item: &AccessPolicyItem) -> bool {
+/// True when an access-policy item carries `access_type` (or `all`) as an
+/// allowed access type. Ranger writes `isAllowed: true` on deny items too
+/// (the item list, not the flag, makes it a deny), so the flag only rules out
+/// an item an operator toggled off.
+fn item_grants_access(item: &AccessPolicyItem, access_type: &str) -> bool {
     item.accesses.iter().any(|a| {
-        a.is_allowed && (a.access_type.eq_ignore_ascii_case("select") || a.access_type.eq_ignore_ascii_case("all"))
+        a.is_allowed
+            && (a.access_type.eq_ignore_ascii_case(access_type)
+                || a.access_type.eq_ignore_ascii_case("all"))
     })
 }
 
@@ -786,7 +781,20 @@ fn column_resource_covers_table(p: &RangerPolicy) -> bool {
 
 /// Ranger access-policy evaluation for one table: does any enabled
 /// `policyType` 0 policy on this database and table grant `select` to the
-/// user, with no matching deny item?
+/// user, with no matching deny item? See `access_grants_table_type`.
+fn access_grants_table(
+    bundle: &ServicePolicies,
+    user: &SessionUser,
+    database: &str,
+    table: &str,
+) -> bool {
+    access_grants_table_type(bundle, user, database, table, "select")
+}
+
+/// Ranger access-policy evaluation for one table and one access type
+/// (`select`, `alter`, `drop`; `all` carries each): does any enabled
+/// `policyType` 0 policy on this database and table grant it to the user,
+/// with no matching deny item for it?
 ///
 /// Order follows the `hive` servicedef evaluator: a deny item that matches
 /// the user (and is not carved out by a `denyExceptions` item) decides
@@ -795,32 +803,129 @@ fn column_resource_covers_table(p: &RangerPolicy) -> bool {
 /// priority (`policyPriority` override policies) is not modelled: an
 /// override deny still denies, an override allow does not beat a normal deny
 /// here, which errs on the closed side.
-fn access_grants_table(bundle: &ServicePolicies, user: &SessionUser, database: &str, table: &str) -> bool {
-    let matching: Vec<&RangerPolicy> = bundle
-        .policies
-        .iter()
-        .filter(|p| p.is_enabled && p.policy_type == POLICY_TYPE_ACCESS)
-        .filter(|p| policy_matches_table(p, database, table) && column_resource_covers_table(p))
-        .collect();
-
-    let applies = |items: &[AccessPolicyItem]| {
-        items
+///
+/// Deny items match with the last-namespace-component fallback (fail closed);
+/// allow items need the full dotted namespace, so an allow on `sales` does not
+/// grant `<root>.sales`.
+fn access_grants_table_type(
+    bundle: &ServicePolicies,
+    user: &SessionUser,
+    database: &str,
+    table: &str,
+    access_type: &str,
+) -> bool {
+    let matching = |fallback: bool| {
+        bundle
+            .policies
             .iter()
-            .any(|i| item_grants_select(i) && item_matches(&i.users, &i.roles, &i.groups, user))
+            .filter(|p| p.is_enabled && p.policy_type == POLICY_TYPE_ACCESS)
+            .filter(|p| policy_matches_table_with(p, database, table, fallback) && column_resource_covers_table(p))
+            .collect::<Vec<_>>()
     };
 
-    for p in &matching {
-        if applies(&p.deny_policy_items) && !applies(&p.deny_exceptions) {
+    let applies = |items: &[AccessPolicyItem]| {
+        items.iter().any(|i| {
+            item_grants_access(i, access_type) && item_matches(&i.users, &i.roles, &i.groups, user)
+        })
+    };
+
+    // Items that widen access (allow items, deny exceptions) do not count when
+    // they carry conditions SQE cannot evaluate. Deny items and allow
+    // exceptions keep ignoring conditions, which only ever narrows access.
+    let widens = |p: &RangerPolicy, items: &[AccessPolicyItem]| {
+        items.iter().any(|i| {
+            if !(item_grants_access(i, access_type) && item_matches(&i.users, &i.roles, &i.groups, user)) {
+                return false;
+            }
+            if !i.conditions.is_empty() {
+                warn_unevaluated_conditions(p);
+                return false;
+            }
+            true
+        })
+    };
+
+    // A policy outside its validity schedule is skipped. A schedule SQE cannot
+    // evaluate (`None`) still lets a deny decide but never lets an allow grant.
+    let now = Utc::now();
+    for p in matching(true) {
+        if policy_schedule_active(p, now) == Some(false) {
+            continue;
+        }
+        if applies(&p.deny_policy_items) && !widens(p, &p.deny_exceptions) {
             debug!(policy_id = p.id, policy = %p.name, user = %user.username, table, database, "Ranger deny item matched");
             return false;
         }
     }
-    for p in &matching {
-        if applies(&p.policy_items) && !applies(&p.allow_exceptions) {
+    for p in matching(false) {
+        if policy_schedule_active(p, now) != Some(true) {
+            continue;
+        }
+        if widens(p, &p.policy_items) && !applies(&p.allow_exceptions) {
             return true;
         }
     }
     false
+}
+
+/// Warn once per policy id (per process) that an allow item was not honoured
+/// because it carries Ranger conditions.
+fn warn_unevaluated_conditions(p: &RangerPolicy) {
+    static WARNED: OnceLock<Mutex<HashSet<i64>>> = OnceLock::new();
+    let first = WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .map_or(true, |mut seen| seen.insert(p.id));
+    if first {
+        warn!(
+            policy_id = p.id,
+            policy = %p.name,
+            "Ranger allow item has conditions SQE cannot evaluate; it grants nothing (fail-closed)"
+        );
+    }
+}
+
+/// Whether `now` falls in the policy's `validitySchedules`: `Some(true)` when
+/// there are none or one covers `now`, `Some(false)` when every schedule was
+/// evaluated and none covers it, `None` when no schedule covers `now` and at
+/// least one could not be evaluated (bad timestamp, unknown time zone,
+/// recurrences).
+fn policy_schedule_active(p: &RangerPolicy, now: DateTime<Utc>) -> Option<bool> {
+    let mut unknown = false;
+    for s in &p.validity_schedules {
+        match schedule_covers(s, now) {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => unknown = true,
+        }
+    }
+    if p.validity_schedules.is_empty() || !unknown {
+        Some(p.validity_schedules.is_empty())
+    } else {
+        None
+    }
+}
+
+fn schedule_covers(s: &ValiditySchedule, now: DateTime<Utc>) -> Option<bool> {
+    if !s.recurrences.is_empty() {
+        return None;
+    }
+    let tz: Tz = match s.time_zone.as_deref().filter(|z| !z.is_empty()) {
+        Some(z) => z.parse().ok()?,
+        None => Tz::UTC,
+    };
+    // Outer None: unparseable. Inner None: open-ended bound.
+    let at = |t: &Option<String>| -> Option<Option<DateTime<Utc>>> {
+        match t.as_deref().filter(|t| !t.is_empty()) {
+            None => Some(None),
+            Some(t) => {
+                let local = NaiveDateTime::parse_from_str(t, "%Y/%m/%d %H:%M:%S").ok()?;
+                Some(Some(tz.from_local_datetime(&local).earliest()?.with_timezone(&Utc)))
+            }
+        }
+    };
+    let (start, end) = (at(&s.start_time)?, at(&s.end_time)?);
+    Some(start.is_none_or(|t| t <= now) && end.is_none_or(|t| now < t))
 }
 
 /// Build a `ResolvedPolicy` from an already-fetched bundle. Pure (no I/O), so it
@@ -888,14 +993,29 @@ fn resolve_from_bundle(
                 policy.row_filters.push(lit(false));
                 continue;
             }
+            // Ranger semantics: the first matching item of a policy decides
+            // the column, and a mask set by an earlier policy is not replaced
+            // by a later one.
             for column in &col_res.values {
                 for item in &p.data_mask_policy_items {
                     if !item_matches(&item.users, &item.roles, &item.groups, user) {
                         continue;
                     }
+                    if !item.conditions.is_empty() {
+                        warn!(
+                            column = %column,
+                            policy_id = p.id,
+                            "Ranger datamask item has conditions SQE cannot evaluate; \
+                             restricting column (fail-closed)"
+                        );
+                        if !policy.restricted_columns.contains(column) {
+                            policy.restricted_columns.push(column.clone());
+                        }
+                        break;
+                    }
                     match map_mask(&item.data_mask_info, column, &identity) {
                         Ok(Some(mask)) => {
-                            policy.column_masks.insert(column.clone(), mask);
+                            policy.column_masks.entry(column.clone()).or_insert(mask);
                         }
                         Ok(None) => { /* MASK_NONE exemption: leave column visible */ }
                         Err(()) => {
@@ -909,6 +1029,7 @@ fn resolve_from_bundle(
                             }
                         }
                     }
+                    break;
                 }
             }
         }
@@ -974,7 +1095,7 @@ fn resolve_from_bundle(
 #[allow(clippy::type_complexity)]
 pub(crate) fn resolve_tag_policies(
     bundle: &ServicePolicies,
-    identity: &SessionIdentity,
+    user: &SessionUser,
     tags: &HashSet<String>,
 ) -> (
     HashMap<String, TagMaskSpec>,
@@ -990,14 +1111,13 @@ pub(crate) fn resolve_tag_policies(
         None => return (masks, filters, unmappable),
     };
 
-    // Bridge SessionIdentity -> SessionUser for item_matches.
-    use sqe_core::SessionUser;
-    let user = SessionUser {
-        username: identity.username.clone(),
-        roles: identity.roles.clone(),
-        subject: None,
-        email: None,
-        groups: Vec::new(),
+    // Items match on the full SessionUser (groups included); the identity is
+    // only the UDF-folding view used when parsing filter and mask SQL.
+    let identity = &SessionIdentity {
+        username: user.username.clone(),
+        roles: user.roles.clone(),
+        database: None,
+        schema: None,
     };
 
     for p in &tag_bundle.policies {
@@ -1020,8 +1140,18 @@ pub(crate) fn resolve_tag_policies(
             // policyType 1: datamask
             if p.policy_type == POLICY_TYPE_DATAMASK {
                 for item in &p.data_mask_policy_items {
-                    if !item_matches(&item.users, &item.roles, &item.groups, &user) {
+                    if !item_matches(&item.users, &item.roles, &item.groups, user) {
                         continue;
+                    }
+                    if !item.conditions.is_empty() {
+                        warn!(
+                            tag = %tag_value,
+                            policy_id = p.id,
+                            "Ranger tag datamask item has conditions SQE cannot \
+                             evaluate; marking tag unmappable (fail-closed)"
+                        );
+                        unmappable.insert(tag_value.clone());
+                        break;
                     }
                     // CUSTOM masks carry a `{col}` placeholder that only the
                     // rewriter can substitute (the column name is not known here).
@@ -1031,7 +1161,9 @@ pub(crate) fn resolve_tag_policies(
                     if normalize_mask_type(&item.data_mask_info.data_mask_type) == MASK_TYPE_CUSTOM
                     {
                         if let Some(template) = &item.data_mask_info.value_expr {
-                            masks.insert(tag_value.clone(), TagMaskSpec::Custom(template.clone()));
+                            masks
+                                .entry(tag_value.clone())
+                                .or_insert_with(|| TagMaskSpec::Custom(template.clone()));
                         } else {
                             // CUSTOM with no value_expr: nothing to substitute -> restrict.
                             warn!(
@@ -1042,12 +1174,12 @@ pub(crate) fn resolve_tag_policies(
                             );
                             unmappable.insert(tag_value.clone());
                         }
-                        continue;
+                        break;
                     }
                     // column placeholder is empty for non-CUSTOM types.
                     match map_mask(&item.data_mask_info, "", identity) {
                         Ok(Some(mask)) => {
-                            masks.insert(tag_value.clone(), TagMaskSpec::Ready(mask));
+                            masks.entry(tag_value.clone()).or_insert(TagMaskSpec::Ready(mask));
                         }
                         Ok(None) => { /* MASK_NONE exemption: tag has no mask */ }
                         Err(()) => {
@@ -1061,13 +1193,15 @@ pub(crate) fn resolve_tag_policies(
                             unmappable.insert(tag_value.clone());
                         }
                     }
+                    // First matching item decides, as on the resource path.
+                    break;
                 }
             }
 
             // policyType 2: rowfilter
             if p.policy_type == POLICY_TYPE_ROWFILTER {
                 for item in &p.row_filter_policy_items {
-                    if !item_matches(&item.users, &item.roles, &item.groups, &user) {
+                    if !item_matches(&item.users, &item.roles, &item.groups, user) {
                         continue;
                     }
                     if let Some(expr_str) = &item.row_filter_info.filter_expr {
@@ -1454,6 +1588,33 @@ impl PolicyStore for RangerStore {
         Ok(policy)
     }
 
+    /// The same access-policy evaluation that gates a Hive-root SELECT
+    /// (`access_grants_table`), asked for the DDL access type instead of
+    /// `select`: deny items, exceptions, the full-namespace rule for allows
+    /// and the whole-table column rule all apply unchanged.
+    ///
+    /// Not tied to `hive_access_policies`. That flag decides whether a
+    /// missing `select` grant hides a table; this only ever adds DDL
+    /// authority beside admin and owner, so reading the access policies
+    /// whatever the flag says cannot take anything away. A bundle that will
+    /// not load is an error, which the caller treats as no grant.
+    async fn grants_table_privilege(
+        &self,
+        user: &SessionUser,
+        table_name: &str,
+        namespace: &str,
+        privilege: crate::TablePrivilege,
+    ) -> sqe_core::Result<bool> {
+        let bundle = self.cached_bundle().await?;
+        Ok(access_grants_table_type(
+            &bundle,
+            user,
+            &hive_database(namespace),
+            table_name,
+            privilege.access_type(),
+        ))
+    }
+
     /// Resolve tag-based policies from the Ranger bundle for a given user and
     /// set of tag names present on a table's columns.
     ///
@@ -1500,14 +1661,7 @@ impl PolicyStore for RangerStore {
             }
         };
 
-        let identity = SessionIdentity {
-            username: user.username.clone(),
-            roles: user.roles.clone(),
-            database: None,
-            schema: None,
-        };
-
-        let (masks, tag_filters, unmappable) = resolve_tag_policies(&bundle, &identity, tags);
+        let (masks, tag_filters, unmappable) = resolve_tag_policies(&bundle, user, tags);
         // Discard the tag keys from row filters — the rewriter only needs Exprs.
         let filter_exprs: Vec<Expr> = tag_filters.into_iter().map(|(_, e)| e).collect();
         (masks, filter_exprs, unmappable)
@@ -2021,6 +2175,22 @@ mod tests {
     }
 
     #[test]
+    fn first_matching_mask_item_wins() {
+        let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
+        // A second item also matching `analyst`, after the MASK_NULL one.
+        let later: DataMaskPolicyItem = serde_json::from_str(
+            r#"{"roles": ["analyst"], "dataMaskInfo": {"dataMaskType": "MASK_SHOW_LAST_4"}}"#,
+        )
+        .unwrap();
+        bundle.policies[0].data_mask_policy_items.push(later);
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales", false);
+        assert!(
+            matches!(policy.column_masks.get("amount"), Some(MaskType::Nullify)),
+            "the first matching item decides, a later one must not override it"
+        );
+    }
+
+    #[test]
     fn row_filter_applied_for_matching_role() {
         let bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
         let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales", false);
@@ -2356,6 +2526,68 @@ mod tests {
         assert!(crate::plan_rewriter::policy_denies_all(&gated(&user("eve", &["admin"]), "anything", "glue.bi")));
     }
 
+    /// DDL authority comes from the same access policies as `select`, asked
+    /// for `alter`/`drop`: `all` carries both, a `select`-only grant carries
+    /// neither, and a deny on `all` or an allow exception still wins.
+    #[tokio::test]
+    async fn ddl_privileges_come_from_the_access_policies() {
+        use crate::TablePrivilege::{Alter, Drop};
+        let ddl: ServicePolicies = serde_json::from_str(
+            r#"{"policies":[
+             {"id":1,"name":"ops-alter","policyType":0,"isEnabled":true,
+              "resources":{"database":{"values":["lake.sales"]},"table":{"values":["orders"]}},
+              "policyItems":[{"roles":["ops"],"accesses":[{"type":"alter","isAllowed":true}]}]},
+             {"id":2,"name":"owners-all","policyType":0,"isEnabled":true,
+              "resources":{"database":{"values":["lake.sales"]},"table":{"values":["*"]}},
+              "policyItems":[{"roles":["stewards"],"accesses":[{"type":"all","isAllowed":true}]}],
+              "allowExceptions":[{"users":["eve"],"accesses":[{"type":"all","isAllowed":true}]}]},
+             {"id":3,"name":"readers","policyType":0,"isEnabled":true,
+              "resources":{"database":{"values":["lake.sales"]},"table":{"values":["*"]}},
+              "policyItems":[{"groups":["public"],"accesses":[{"type":"select","isAllowed":true}]}]},
+             {"id":4,"name":"no-drop-locked","policyType":0,"isEnabled":true,
+              "resources":{"database":{"values":["lake.sales"]},"table":{"values":["locked"]}},
+              "denyPolicyItems":[{"roles":["stewards"],"accesses":[{"type":"drop","isAllowed":true}]}]}]}"#,
+        )
+        .unwrap();
+        let store = RangerStore::from_config(&RangerPolicyConfig::default()).unwrap();
+        store.bundle_cache.insert(BUNDLE_KEY, Arc::new(ddl)).await;
+        let can = |u: SessionUser, t: &'static str, p| {
+            let store = &store;
+            async move {
+                store
+                    .grants_table_privilege(&u, t, "lake.sales", p)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        assert!(can(user("olga", &["ops"]), "orders", Alter).await);
+        assert!(
+            !can(user("olga", &["ops"]), "orders", Drop).await,
+            "alter does not carry drop"
+        );
+        assert!(
+            can(user("sam", &["stewards"]), "orders", Drop).await,
+            "all carries drop"
+        );
+        assert!(
+            !can(user("eve", &["stewards"]), "orders", Drop).await,
+            "allow exception"
+        );
+        assert!(
+            !can(user("carol", &[]), "orders", Alter).await,
+            "select is not DDL"
+        );
+        assert!(
+            !can(user("sam", &["stewards"]), "locked", Drop).await,
+            "deny wins"
+        );
+        assert!(
+            can(user("sam", &["stewards"]), "locked", Alter).await,
+            "the deny names drop only"
+        );
+    }
+
     #[test]
     fn without_the_gate_the_table_is_open() {
         let policy = resolve_from_bundle(&access_bundle(), &user("nobody", &[]), "orders", "glue.other", false);
@@ -2388,12 +2620,165 @@ mod tests {
     }
 
     #[test]
+    fn last_component_fallback_restricts_but_never_grants_access() {
+        let allow_short: ServicePolicies = serde_json::from_str(
+            r#"{"policies":[{"id":1,"name":"sales-allow","policyType":0,"isEnabled":true,
+             "resources":{"database":{"values":["sales"]},"table":{"values":["*"]}},
+             "policyItems":[{"groups":["public"],"accesses":[{"type":"select","isAllowed":true}]}]}]}"#,
+        )
+        .unwrap();
+        let carol = user("carol", &[]);
+        assert!(
+            crate::plan_rewriter::policy_denies_all(&resolve_from_bundle(&allow_short, &carol, "t", "root.sales", true)),
+            "an allow on `sales` must not grant `root.sales`"
+        );
+        assert!(!crate::plan_rewriter::policy_denies_all(&resolve_from_bundle(&allow_short, &carol, "t", "sales", true)));
+
+        let deny_short: ServicePolicies = serde_json::from_str(
+            r#"{"policies":[
+             {"id":1,"name":"root-sales-allow","policyType":0,"isEnabled":true,
+              "resources":{"database":{"values":["root.sales"]},"table":{"values":["*"]}},
+              "policyItems":[{"groups":["public"],"accesses":[{"type":"select","isAllowed":true}]}]},
+             {"id":2,"name":"sales-deny","policyType":0,"isEnabled":true,
+              "resources":{"database":{"values":["sales"]},"table":{"values":["*"]}},
+              "denyPolicyItems":[{"groups":["public"],"accesses":[{"type":"select","isAllowed":true}]}]}]}"#,
+        )
+        .unwrap();
+        assert!(
+            crate::plan_rewriter::policy_denies_all(&resolve_from_bundle(&deny_short, &carol, "t", "root.sales", true)),
+            "a deny on `sales` still denies `root.sales`"
+        );
+    }
+
+    #[test]
     fn group_only_access_items_are_counted_but_public_is_not() {
         // Policy 1's allow and policy 2's deny bind to a real group with no
         // users or roles, as does policy 7's mask item; the public-bound
         // items (3, 4, 5), the exceptions and the role/user items (6) are not
         // at risk.
         assert_eq!(count_group_only_items(&access_bundle()), 3);
+    }
+
+    /// One public `select` access policy on `glue.bi.t`, with `extra` JSON
+    /// spliced into the policy object and `item_extra` into its allow item.
+    fn one_policy_bundle(extra: &str, item_extra: &str) -> ServicePolicies {
+        serde_json::from_str(&format!(
+            r#"{{"policies":[{{"id":42,"name":"p","policyType":0,"isEnabled":true{extra},
+              "resources":{{"database":{{"values":["glue.bi"]}},"table":{{"values":["t"]}}}},
+              "policyItems":[{{"groups":["public"],"accesses":[{{"type":"select","isAllowed":true}}]{item_extra}}}]}}]}}"#
+        ))
+        .unwrap()
+    }
+
+    fn denied(bundle: &ServicePolicies) -> bool {
+        crate::plan_rewriter::policy_denies_all(&resolve_from_bundle(bundle, &user("carol", &[]), "t", "glue.bi", true))
+    }
+
+    #[test]
+    fn an_allow_item_with_conditions_grants_nothing() {
+        assert!(!denied(&one_policy_bundle("", "")), "control: the plain item grants");
+        let conditional = one_policy_bundle("", r#","conditions":[{"type":"ip-range","values":["10.0.0.0/8"]}]"#);
+        assert!(denied(&conditional), "an unevaluated condition must not grant");
+        assert!(!denied(&one_policy_bundle("", r#","conditions":[]"#)), "an empty list is no condition");
+    }
+
+    /// A deny exception widens access, so one carrying conditions SQE cannot
+    /// evaluate does not carve the user out of the deny.
+    #[test]
+    fn a_deny_exception_with_conditions_does_not_exempt() {
+        let bundle = |exception_extra: &str| -> ServicePolicies {
+            serde_json::from_str(&format!(
+                r#"{{"policies":[{{"id":1,"policyType":0,"isEnabled":true,
+                  "resources":{{"database":{{"values":["glue.bi"]}},"table":{{"values":["t"]}}}},
+                  "policyItems":[{{"groups":["public"],"accesses":[{{"type":"select","isAllowed":true}}]}}],
+                  "denyPolicyItems":[{{"groups":["public"],"accesses":[{{"type":"select","isAllowed":true}}]}}],
+                  "denyExceptions":[{{"users":["carol"],"accesses":[{{"type":"select","isAllowed":true}}]{exception_extra}}}]}}]}}"#
+            ))
+            .unwrap()
+        };
+        assert!(!denied(&bundle("")), "control: the plain exception exempts carol");
+        assert!(
+            denied(&bundle(r#","conditions":[{"type":"ip-range","values":["10.0.0.0/8"]}]"#)),
+            "an unevaluated condition must not exempt from a deny"
+        );
+    }
+
+    /// The first matching datamask item decides; when it carries conditions
+    /// SQE cannot evaluate, the column is restricted instead of falling
+    /// through to a later item (here a `MASK_NONE` that would show it raw).
+    #[test]
+    fn a_conditional_mask_item_restricts_the_column() {
+        let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
+        let conditional: DataMaskPolicyItem = serde_json::from_str(
+            r#"{"roles": ["analyst"], "conditions": [{"type": "ip-range", "values": ["10.0.0.0/8"]}],
+                "dataMaskInfo": {"dataMaskType": "MASK_NULL"}}"#,
+        )
+        .unwrap();
+        let unmask: DataMaskPolicyItem = serde_json::from_str(
+            r#"{"roles": ["analyst"], "dataMaskInfo": {"dataMaskType": "MASK_NONE"}}"#,
+        )
+        .unwrap();
+        bundle.policies[0].data_mask_policy_items = vec![conditional, unmask];
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales", false);
+        assert!(policy.restricted_columns.contains(&"amount".to_string()));
+        assert!(!policy.column_masks.contains_key("amount"));
+    }
+
+    #[test]
+    fn a_conditional_tag_mask_item_makes_the_tag_unmappable() {
+        let mut sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE).unwrap();
+        sp.tag_policies.as_mut().unwrap().policies[0].data_mask_policy_items[0].conditions =
+            vec![serde_json::json!({"type": "ip-range", "values": ["10.0.0.0/8"]})];
+        let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
+        let (masks, _, unmappable) = resolve_tag_policies(&sp, &user("bob", &["engineer"]), &tags);
+        assert!(!masks.contains_key("PII"));
+        assert!(unmappable.contains("PII"));
+    }
+
+    #[test]
+    fn validity_schedules_gate_the_allow() {
+        let sched = |s: &str| one_policy_bundle(&format!(r#","validitySchedules":[{s}]"#), "");
+        assert!(denied(&sched(r#"{"startTime":"2000/01/01 00:00:00","endTime":"2001/01/01 00:00:00","timeZone":"UTC"}"#)), "expired");
+        assert!(denied(&sched(r#"{"startTime":"2999/01/01 00:00:00"}"#)), "not started");
+        assert!(!denied(&sched(r#"{"startTime":"2000/01/01 00:00:00","endTime":"2999/01/01 00:00:00","timeZone":"Europe/Amsterdam"}"#)), "in force");
+        assert!(denied(&sched(r#"{"endTime":"not a date"}"#)), "unparseable schedule fails closed");
+        assert!(denied(&sched(r#"{"endTime":"2999/01/01 00:00:00","timeZone":"Mars/Olympus"}"#)), "unknown zone fails closed");
+        assert!(denied(&sched(r#"{"recurrences":[{"interval":{"hours":1}}]}"#)), "recurrences are not modelled");
+        // Any one in-force schedule is enough.
+        assert!(!denied(&sched(r#"{"endTime":"bad"},{"endTime":"2999/01/01 00:00:00"}"#)));
+    }
+
+    #[test]
+    fn an_expired_deny_no_longer_denies_but_an_unparseable_one_still_does() {
+        let bundle = |sched: &str| -> ServicePolicies {
+            serde_json::from_str(&format!(
+                r#"{{"policies":[
+                  {{"id":1,"policyType":0,"isEnabled":true,
+                    "resources":{{"database":{{"values":["glue.bi"]}},"table":{{"values":["t"]}}}},
+                    "policyItems":[{{"groups":["public"],"accesses":[{{"type":"select","isAllowed":true}}]}}]}},
+                  {{"id":2,"policyType":0,"isEnabled":true,"validitySchedules":[{sched}],
+                    "resources":{{"database":{{"values":["glue.bi"]}},"table":{{"values":["t"]}}}},
+                    "denyPolicyItems":[{{"groups":["public"],"accesses":[{{"type":"select","isAllowed":true}}]}}]}}]}}"#
+            ))
+            .unwrap()
+        };
+        assert!(!denied(&bundle(r#"{"endTime":"2001/01/01 00:00:00"}"#)));
+        assert!(denied(&bundle(r#"{"endTime":"garbage"}"#)));
+        assert!(denied(&bundle(r#"{"endTime":"2999/01/01 00:00:00"}"#)));
+    }
+
+    #[test]
+    fn schedule_bounds_are_read_in_the_schedule_time_zone() {
+        // 2026-06-01 10:00 UTC is 12:00 in Amsterdam (CEST, UTC+2).
+        let now = Utc.with_ymd_and_hms(2026, 6, 1, 10, 0, 0).unwrap();
+        let s = |start: &str, tz: &str| ValiditySchedule {
+            start_time: Some(start.into()),
+            time_zone: Some(tz.into()),
+            ..Default::default()
+        };
+        assert_eq!(schedule_covers(&s("2026/06/01 11:00:00", "UTC"), now), Some(false));
+        assert_eq!(schedule_covers(&s("2026/06/01 11:00:00", "Europe/Amsterdam"), now), Some(true));
+        assert_eq!(schedule_covers(&s("2026-06-01 11:00:00", "UTC"), now), None);
     }
 
     // --- map_mask arm tests ---
@@ -2508,11 +2893,7 @@ mod tests {
     fn tag_mask_resolved_for_matching_role() {
         let sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE).unwrap();
         let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
-        let id = SessionIdentity {
-            username: "bob".into(),
-            roles: vec!["engineer".into()],
-            ..Default::default()
-        };
+        let id = user("bob", &["engineer"]);
         let (masks, filters, unmappable) = resolve_tag_policies(&sp, &id, &tags);
         // tag PII -> a PartialMask (MASK_SHOW_LAST_4) for engineer, wrapped in TagMaskSpec::Ready
         assert!(masks.contains_key("PII"));
@@ -2534,14 +2915,32 @@ mod tests {
     }
 
     #[test]
+    fn first_matching_tag_mask_item_wins() {
+        let mut sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE).unwrap();
+        let later: DataMaskPolicyItem = serde_json::from_str(
+            r#"{"roles": ["engineer"], "dataMaskInfo": {"dataMaskType": "MASK_NULL"}}"#,
+        )
+        .unwrap();
+        sp.tag_policies.as_mut().unwrap().policies[0]
+            .data_mask_policy_items
+            .push(later);
+        let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
+        let id = user("bob", &["engineer"]);
+        let (masks, _, _) = resolve_tag_policies(&sp, &id, &tags);
+        assert!(
+            matches!(
+                masks.get("PII"),
+                Some(TagMaskSpec::Ready(crate::MaskType::PartialMask { show_last: 4, .. }))
+            ),
+            "the first matching item (MASK_SHOW_LAST_4) decides, not the later MASK_NULL"
+        );
+    }
+
+    #[test]
     fn tag_mask_not_resolved_for_other_role() {
         let sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE).unwrap();
         let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
-        let id = SessionIdentity {
-            username: "x".into(),
-            roles: vec!["other".into()],
-            ..Default::default()
-        };
+        let id = user("x", &["other"]);
         let (masks, _f, _u) = resolve_tag_policies(&sp, &id, &tags);
         assert!(masks.is_empty());
     }
@@ -2550,20 +2949,45 @@ mod tests {
     fn tag_row_filter_resolved() {
         let sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE).unwrap();
         let tags: HashSet<String> = ["RESTRICTED".to_string()].into_iter().collect();
-        let id = SessionIdentity {
-            username: "a".into(),
-            roles: vec!["analyst".into()],
-            ..Default::default()
-        };
+        let id = user("a", &["analyst"]);
         let (_m, filters, _u) = resolve_tag_policies(&sp, &id, &tags);
         assert_eq!(filters.len(), 1); // one (tag, Expr) row filter
+    }
+
+    /// Group-bound tag items must match on the session's groups: dropping
+    /// them would leave a group-scoped tag mask or row filter unapplied.
+    #[test]
+    fn tag_policies_match_on_groups() {
+        let sp: ServicePolicies = serde_json::from_str(
+            r#"{
+              "policyVersion": 1, "policies": [],
+              "tagPolicies": { "serviceName": "tag", "policies": [
+                { "id": 1, "policyType": 1, "isEnabled": true,
+                  "resources": { "tag": { "values": ["PII"] } },
+                  "dataMaskPolicyItems": [
+                    { "groups": ["contractors"],
+                      "dataMaskInfo": { "dataMaskType": "MASK_NULL" } } ] },
+                { "id": 2, "policyType": 2, "isEnabled": true,
+                  "resources": { "tag": { "values": ["PII"] } },
+                  "rowFilterPolicyItems": [
+                    { "groups": ["contractors"],
+                      "rowFilterInfo": { "filterExpr": "region = 'EU'" } } ] }
+              ] }
+            }"#,
+        )
+        .unwrap();
+        let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
+        let id = user_with_groups("carol", &[], &["contractors"]);
+        let (masks, filters, _u) = resolve_tag_policies(&sp, &id, &tags);
+        assert!(matches!(masks.get("PII"), Some(TagMaskSpec::Ready(crate::MaskType::Nullify))));
+        assert_eq!(filters.len(), 1);
     }
 
     #[test]
     fn untagged_yields_nothing() {
         let sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE).unwrap();
         let tags: HashSet<String> = HashSet::new();
-        let id = SessionIdentity::default();
+        let id = user("", &[]);
         let (m, f, u) = resolve_tag_policies(&sp, &id, &tags);
         assert!(m.is_empty() && f.is_empty() && u.is_empty());
     }
@@ -2577,11 +3001,7 @@ mod tests {
             .data_mask_info
             .data_mask_type = "MASK_FUTURE_UNSUPPORTED".to_string();
         let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
-        let id = SessionIdentity {
-            username: "bob".into(),
-            roles: vec!["engineer".into()],
-            ..Default::default()
-        };
+        let id = user("bob", &["engineer"]);
         let (masks, _f, unmappable) = resolve_tag_policies(&sp, &id, &tags);
         assert!(
             !masks.contains_key("PII"),
@@ -2603,11 +3023,7 @@ mod tests {
         mi.data_mask_type = "CUSTOM".to_string();
         mi.value_expr = Some("concat('x', {col})".to_string());
         let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
-        let id = SessionIdentity {
-            username: "bob".into(),
-            roles: vec!["engineer".into()],
-            ..Default::default()
-        };
+        let id = user("bob", &["engineer"]);
         let (masks, _f, unmappable) = resolve_tag_policies(&sp, &id, &tags);
         assert!(
             !unmappable.contains("PII"),
@@ -2634,11 +3050,7 @@ mod tests {
         mi.data_mask_type = "CUSTOM".to_string();
         mi.value_expr = None; // no template
         let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
-        let id = SessionIdentity {
-            username: "bob".into(),
-            roles: vec!["engineer".into()],
-            ..Default::default()
-        };
+        let id = user("bob", &["engineer"]);
         let (masks, _f, unmappable) = resolve_tag_policies(&sp, &id, &tags);
         assert!(
             !masks.contains_key("PII"),
@@ -2709,11 +3121,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let id = SessionIdentity {
-            username: "live-sample-user".into(),
-            roles: vec![LIVE_SAMPLE_ROLE.into()],
-            ..Default::default()
-        };
+        let id = user("live-sample-user", &[LIVE_SAMPLE_ROLE]);
         let (masks, filters, unmappable) = resolve_tag_policies(&sp, &id, &tags);
         assert!(
             masks.contains_key(LIVE_SAMPLE_TAG),

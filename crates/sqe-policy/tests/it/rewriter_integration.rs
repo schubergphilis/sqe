@@ -180,7 +180,7 @@ async fn row_filter_and_mask_execute_over_qualified_multilevel_scan() {
     store.add_table_policy("ns1.ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let (rewritten, _summary) = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("alice", &[]), &sqe_policy::TableScope::default(), plan).await.unwrap();
 
     // The step that failed before the fix: analyze + physical-plan + run.
     let batches = execute_multilevel(rewritten, mem).await;
@@ -204,7 +204,7 @@ async fn row_filter_injects_filter_above_scan() {
     store.add_table_policy("default", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let (rewritten, _summary) = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("alice", &[]), &sqe_policy::TableScope::default(), plan).await.unwrap();
 
     let s = format!("{}", rewritten.display_indent());
     assert!(
@@ -215,6 +215,145 @@ async fn row_filter_injects_filter_above_scan() {
     let batches = execute(rewritten, mem, "employees").await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 2, "row filter should leave only EU rows");
+}
+
+/// A caller predicate must never be evaluated on a row the row filter hides.
+/// The optimizer merges the policy Filter with the caller's WHERE into one
+/// conjunction, and AND evaluates its right side over the whole batch when
+/// enough rows pass (2 of 3 here). Unguarded, `1 / (customer_id - 2)` then
+/// runs on the hidden US row (customer_id 2) and the divide-by-zero error
+/// reveals that the hidden row is in region US.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn caller_predicate_cannot_error_on_rows_the_row_filter_hides() {
+    let (mem, _) = build_scan("employees");
+    let ctx = SessionContext::new();
+    ctx.register_table("employees", mem).unwrap();
+    let store = InMemoryPolicyStore::new();
+    let mut policy = ResolvedPolicy::default();
+    policy.row_filters.push(col("region").eq(lit("EU")));
+    store
+        .add_table_policy("public", "employees", policy.clone())
+        .await;
+    store.add_table_policy("default", "employees", policy).await;
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store));
+
+    let sql = "SELECT customer_id FROM employees \
+               WHERE CASE WHEN region = 'US' THEN 1 / (customer_id - 2) ELSE 1 END = 1";
+    let plan = ctx.state().create_logical_plan(sql).await.unwrap();
+    let (plan, _summary) = rewriter
+        .evaluate(&user("alice", &[]), &sqe_policy::TableScope::default(), plan)
+        .await
+        .unwrap();
+    let batches = ctx
+        .execute_logical_plan(plan)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .expect("the hidden row must not be reachable through a runtime error");
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 2, "both visible EU rows pass the caller predicate");
+}
+
+async fn eu_rewriter() -> PolicyPlanRewriter {
+    let store = InMemoryPolicyStore::new();
+    let mut policy = ResolvedPolicy::default();
+    policy.row_filters.push(col("region").eq(lit("EU")));
+    store
+        .add_table_policy("public", "employees", policy.clone())
+        .await;
+    store.add_table_policy("default", "employees", policy).await;
+    PolicyPlanRewriter::new(Arc::new(store))
+}
+
+/// A predicate that cannot fail keeps flowing through the row filter (and
+/// so into scan pruning): the guard is only paid for when it is needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn infallible_caller_predicate_is_not_guarded() {
+    let (mem, _) = build_scan("employees");
+    let ctx = SessionContext::new();
+    ctx.register_table("employees", mem).unwrap();
+    for sql in [
+        "SELECT customer_id FROM employees WHERE customer_id > 1 AND ssn LIKE '3%'",
+        // EXISTS and IN (subquery) cannot fail on the outer row.
+        "SELECT customer_id FROM employees e \
+         WHERE customer_id IN (SELECT customer_id FROM employees WHERE ssn LIKE '3%') \
+         AND EXISTS (SELECT 1 FROM employees x WHERE x.customer_id = e.customer_id)",
+    ] {
+        let plan = ctx.state().create_logical_plan(sql).await.unwrap();
+        let (plan, _summary) = eu_rewriter()
+            .await
+            .evaluate(&user("alice", &[]), &sqe_policy::TableScope::default(), plan)
+            .await
+            .unwrap();
+        let s = format!("{}", plan.display_indent());
+        assert!(!s.contains("CASE WHEN"), "no guard expected, got: {s}");
+        let batches = ctx.execute_logical_plan(plan).await.unwrap().collect().await.unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1, "only customer 3 is EU and starts with 3: {sql}");
+    }
+}
+
+/// A fallible predicate inside a subquery body still runs over a row-filtered
+/// scan, so it switches the guard on even though EXISTS itself cannot fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallible_predicate_inside_a_subquery_is_guarded() {
+    let (mem, _) = build_scan("employees");
+    let ctx = SessionContext::new();
+    ctx.register_table("employees", mem).unwrap();
+    let sql = "SELECT customer_id FROM employees e WHERE EXISTS (\
+               SELECT 1 FROM employees x WHERE x.customer_id = e.customer_id \
+               AND CASE WHEN x.region = 'US' THEN 1 / (x.customer_id - 2) ELSE 1 END = 1)";
+    let plan = ctx.state().create_logical_plan(sql).await.unwrap();
+    let (plan, _summary) = eu_rewriter()
+        .await
+        .evaluate(&user("alice", &[]), &sqe_policy::TableScope::default(), plan)
+        .await
+        .unwrap();
+    let s = format!("{}", plan.display_indent());
+    assert!(s.contains("CASE WHEN"), "the guard must be applied, got: {s}");
+    let batches = ctx
+        .execute_logical_plan(plan)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .expect("the hidden row must not be reachable through a runtime error");
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 2, "both visible EU rows pass the subquery");
+}
+
+/// A fallible predicate already pushed into the scan (a view body is
+/// optimized when it is planned) would run on raw rows below the row filter.
+/// It is lifted out of the scan and re-applied above the guard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallible_scan_filter_is_lifted_above_the_guard() {
+    let (mem, _) = build_scan("employees");
+    let fallible = (lit(1i64) / (col("customer_id") - lit(2i64))).eq(lit(1i64));
+    let plan = LogicalPlanBuilder::scan_with_filters(
+        TableReference::bare("employees"),
+        provider_as_source(mem.clone()),
+        None,
+        vec![fallible],
+    )
+    .unwrap()
+    .build()
+    .unwrap();
+    let (plan, _summary) = eu_rewriter()
+        .await
+        .evaluate(&user("alice", &[]), &sqe_policy::TableScope::default(), plan)
+        .await
+        .unwrap();
+    let s = format!("{}", plan.display_indent());
+    let scan_line = s.lines().find(|l| l.contains("TableScan")).unwrap();
+    assert!(
+        !scan_line.contains("customer_id - "),
+        "fallible filter must leave the scan, got: {s}"
+    );
+    assert!(s.contains("CASE WHEN"), "the guard must be applied, got: {s}");
+    let guard_at = s.find("CASE WHEN").unwrap();
+    let lifted_at = s.find("customer_id - ").expect("filter re-applied");
+    assert!(lifted_at < guard_at, "the lifted filter must sit above the guard: {s}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -230,7 +369,7 @@ async fn nullify_mask_on_bigint_executes_without_type_error() {
     store.add_table_policy("default", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let (rewritten, _summary) = rewriter.evaluate(&user("bob", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("bob", &[]), &sqe_policy::TableScope::default(), plan).await.unwrap();
 
     let batches = execute(rewritten, mem, "employees").await;
     let id_col = batches[0].column_by_name("customer_id").unwrap();
@@ -250,7 +389,7 @@ async fn nullify_mask_on_decimal_executes_without_type_error() {
     store.add_table_policy("default", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let (rewritten, _summary) = rewriter.evaluate(&user("c", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("c", &[]), &sqe_policy::TableScope::default(), plan).await.unwrap();
     let batches = execute(rewritten, mem, "employees").await;
     let salary = batches[0].column_by_name("salary").unwrap();
     assert_eq!(salary.data_type(), &DataType::Decimal128(18, 2));
@@ -269,7 +408,7 @@ async fn nullify_mask_on_timestamp_executes_without_type_error() {
     store.add_table_policy("default", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let (rewritten, _summary) = rewriter.evaluate(&user("d", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("d", &[]), &sqe_policy::TableScope::default(), plan).await.unwrap();
     let batches = execute(rewritten, mem, "employees").await;
     let ts = batches[0].column_by_name("hired_at").unwrap();
     assert_eq!(
@@ -291,7 +430,7 @@ async fn redact_mask_on_string_column_returns_constant() {
     store.add_table_policy("default", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let (rewritten, _summary) = rewriter.evaluate(&user("e", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("e", &[]), &sqe_policy::TableScope::default(), plan).await.unwrap();
     let batches = execute(rewritten, mem, "employees").await;
     let ssn = batches[0]
         .column_by_name("ssn")
@@ -320,7 +459,7 @@ async fn restricted_column_is_nulled_not_dropped() {
     store.add_table_policy("default", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let (rewritten, _summary) = rewriter.evaluate(&user("f", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("f", &[]), &sqe_policy::TableScope::default(), plan).await.unwrap();
     let batches = execute(rewritten, mem, "employees").await;
     let col = batches[0]
         .column_by_name("ssn")
@@ -348,7 +487,7 @@ async fn all_columns_restricted_returns_all_nulls_no_leak() {
     store.add_table_policy("default", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let (rewritten, _summary) = rewriter.evaluate(&user("f", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("f", &[]), &sqe_policy::TableScope::default(), plan).await.unwrap();
     let batches = execute(rewritten, mem, "employees").await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 3, "restriction nulls values, it does not drop rows");
@@ -383,7 +522,7 @@ async fn poisoned_policy_store_fails_closed_to_zero_rows() {
     let (mem, plan) = build_scan("employees");
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(PoisonStore));
-    let (rewritten, _summary) = rewriter.evaluate(&user("g", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("g", &[]), &sqe_policy::TableScope::default(), plan).await.unwrap();
 
     let batches = execute(rewritten, mem, "employees").await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -421,7 +560,7 @@ async fn multilevel_namespace_row_filter_is_applied() {
     store.add_table_policy("ns1.ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let (rewritten, _summary) = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("alice", &[]), &sqe_policy::TableScope::default(), plan).await.unwrap();
 
     let s = format!("{}", rewritten.display_indent());
     assert!(
@@ -442,7 +581,7 @@ async fn multilevel_namespace_restriction_is_applied() {
     store.add_table_policy("ns1.ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let (rewritten, _summary) = rewriter.evaluate(&user("bob", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("bob", &[]), &sqe_policy::TableScope::default(), plan).await.unwrap();
 
     let s = format!("{}", rewritten.display_indent());
     assert!(
@@ -466,7 +605,7 @@ async fn multilevel_namespace_no_policy_still_passes_through() {
 
     let store = InMemoryPolicyStore::new();
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let (rewritten, _summary) = rewriter.evaluate(&user("carol", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("carol", &[]), &sqe_policy::TableScope::default(), plan).await.unwrap();
 
     let s = format!("{}", rewritten.display_indent());
     assert!(
@@ -484,7 +623,7 @@ async fn multilevel_namespace_poisoned_store_fails_closed() {
     let plan = build_multilevel_scan();
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(PoisonStore));
-    let (rewritten, _summary) = rewriter.evaluate(&user("dave", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("dave", &[]), &sqe_policy::TableScope::default(), plan).await.unwrap();
 
     let s = format!("{}", rewritten.display_indent());
     assert!(
@@ -533,7 +672,7 @@ async fn partial_mask_show_last4_on_ssn_over_qualified_multilevel_scan() {
     store.add_table_policy("ns1.ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let (rewritten, _summary) = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("alice", &[]), &sqe_policy::TableScope::default(), plan).await.unwrap();
 
     let batches = execute_multilevel(rewritten, mem).await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -582,7 +721,7 @@ async fn date_show_year_on_timestamp_over_qualified_multilevel_scan() {
     store.add_table_policy("ns1.ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let (rewritten, _summary) = rewriter.evaluate(&user("bob", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("bob", &[]), &sqe_policy::TableScope::default(), plan).await.unwrap();
 
     let batches = execute_multilevel(rewritten, mem).await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -663,7 +802,7 @@ async fn date_show_year_on_date32_executes_and_truncates_to_jan1() {
     store.add_table_policy("ns", "t", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let (rewritten, _summary) = rewriter.evaluate(&user("eve", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("eve", &[]), &sqe_policy::TableScope::default(), plan).await.unwrap();
 
     // Register under catalog "cat", schema "ns" and execute.
     let ctx = SessionContext::new();
@@ -859,7 +998,7 @@ async fn tag_mask_applies_end_to_end() {
     let store = TagTestStore::new().with_tag_mask("PII", MaskType::Nullify);
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store)).with_tag_source(Arc::new(fake_source));
-    let (rewritten, _summary) = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("alice", &[]), &sqe_policy::TableScope::default(), plan).await.unwrap();
 
     let batches = execute_multilevel(rewritten, mem).await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -906,7 +1045,7 @@ async fn tag_source_receives_full_multilevel_namespace() {
     let store = TagTestStore::new().with_tag_mask("PII", MaskType::Nullify);
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store)).with_tag_source(Arc::new(fake_source));
-    let (rewritten, _summary) = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("alice", &[]), &sqe_policy::TableScope::default(), plan).await.unwrap();
 
     // --- Identity assertion: namespace arg must be the full ["ns1","ns2"] ---
     // Assert before the async execute call so the MutexGuard is not held
@@ -987,7 +1126,7 @@ async fn run_contested_column(precedence: MaskPrecedence) {
     let rewriter = PolicyPlanRewriter::new(Arc::new(store))
         .with_tag_source(Arc::new(fake_source))
         .with_mask_precedence(precedence);
-    let (rewritten, _summary) = rewriter.evaluate(&user("bob", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("bob", &[]), &sqe_policy::TableScope::default(), plan).await.unwrap();
 
     let batches = execute_multilevel(rewritten, mem).await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1040,7 +1179,7 @@ async fn unmappable_tag_restricts_column_fail_closed() {
     let store = TagTestStore::new().with_unmappable("SECRET");
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store)).with_tag_source(Arc::new(fake_source));
-    let (rewritten, _summary) = rewriter.evaluate(&user("carol", &[]), scan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("carol", &[]), &sqe_policy::TableScope::default(), scan).await.unwrap();
 
     let batches = execute_multilevel(rewritten, mem).await;
     // Fail-closed via restriction = forced Nullify: ssn stays in the schema but
@@ -1077,7 +1216,7 @@ async fn unknown_tag_state_denies_all_rows() {
     let store = TagTestStore::new();
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store)).with_tag_source(Arc::new(fake_source));
-    let (rewritten, _summary) = rewriter.evaluate(&user("dave", &[]), scan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("dave", &[]), &sqe_policy::TableScope::default(), scan).await.unwrap();
 
     let batches = execute_multilevel(rewritten, mem).await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1130,7 +1269,7 @@ async fn reserved_virtual_refs_not_denied_on_unknown_tag_state() {
         let store = TagTestStore::new();
         let rewriter =
             PolicyPlanRewriter::new(Arc::new(store)).with_tag_source(Arc::new(fake_source));
-        let (rewritten, _summary) = rewriter.evaluate(&user("erin", &[]), plan).await.unwrap();
+        let (rewritten, _summary) = rewriter.evaluate(&user("erin", &[]), &sqe_policy::TableScope::default(), plan).await.unwrap();
 
         // Execute against a context registering exactly this ref.
         let ctx = SessionContext::new();
@@ -1230,7 +1369,7 @@ async fn session_fn_row_filter_admin_sees_all_rows_and_folds_to_literal() {
     // SessionIdentity baked into the UDF is what matters for fold behavior.
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
     let (rewritten, _summary) = rewriter
-        .evaluate(&user("carol", &["admin"]), plan)
+        .evaluate(&user("carol", &["admin"]), &sqe_policy::TableScope::default(), plan)
         .await
         .unwrap();
 
@@ -1289,7 +1428,7 @@ async fn session_fn_row_filter_analyst_sees_eu_only_and_folds_to_literal() {
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
     let (rewritten, _summary) = rewriter
-        .evaluate(&user("dave", &["analyst"]), plan)
+        .evaluate(&user("dave", &["analyst"]), &sqe_policy::TableScope::default(), plan)
         .await
         .unwrap();
 
@@ -1369,7 +1508,7 @@ async fn partial_mask_on_non_string_falls_back_to_typed_null_over_qualified_mult
     store.add_table_policy("ns1.ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
-    let (rewritten, _summary) = rewriter.evaluate(&user("carol", &[]), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&user("carol", &[]), &sqe_policy::TableScope::default(), plan).await.unwrap();
 
     let batches = execute_multilevel(rewritten, mem).await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1423,7 +1562,7 @@ async fn row_filter_on_an_unprojected_column_is_enforced_not_an_error() {
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
     let (rewritten, summary) = rewriter
-        .evaluate(&user("alice", &[]), plan)
+        .evaluate(&user("alice", &[]), &sqe_policy::TableScope::default(), plan)
         .await
         .expect("a filter on an unprojected column must not fail the query");
 
@@ -1519,7 +1658,7 @@ async fn subqueries_enforce_row_filters_and_masks() {
         "SELECT 1 AS n WHERE 1 IN (SELECT customer_id FROM employees)",
     ] {
         let plan = ctx.state().create_logical_plan(sql).await.unwrap();
-        let (plan, summary) = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
+        let (plan, summary) = rewriter.evaluate(&user("alice", &[]), &sqe_policy::TableScope::default(), plan).await.unwrap();
         assert!(
             summary.denied,
             "subquery must participate in policy evaluation: {sql}"

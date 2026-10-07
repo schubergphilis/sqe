@@ -518,6 +518,66 @@ fn write_test_parquet(dir: &std::path::Path) -> std::path::PathBuf {
     path
 }
 
+/// dbt-trino with 4 threads on one JWT: parallel CTAS statements from
+/// `read_parquet`, each commit invalidating the user's cached session
+/// context while the others plan. Intermittently failed with "the table
+/// function was not prepared before planning" when a statement planned its
+/// SELECT on a context rebuilt after its preparation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs:polaris"]
+async fn parallel_ctas_from_read_parquet_on_one_token() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let handler = Arc::new(handler);
+    let tmp_dir = tempfile::tempdir().expect("temp dir");
+    let path = write_test_parquet(tmp_dir.path())
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+    const N: usize = 8;
+    for i in 0..N {
+        let _ = handler
+            .execute(&session, &format!("DROP TABLE IF EXISTS test_ns.tvf_race_{i}"), None)
+            .await;
+    }
+    let tasks: Vec<_> = (0..N)
+        .map(|i| {
+            let (handler, session, path) = (Arc::clone(&handler), session.clone(), path.clone());
+            tokio::spawn(async move {
+                handler
+                    .execute(
+                        &session,
+                        &format!(
+                            "CREATE TABLE test_ns.tvf_race_{i} AS SELECT * FROM read_parquet('{path}')"
+                        ),
+                        None,
+                    )
+                    .await
+                    .map(|_| ())
+            })
+        })
+        .collect();
+    let mut failures = Vec::new();
+    for (i, task) in tasks.into_iter().enumerate() {
+        if let Err(e) = task.await.expect("join") {
+            failures.push(format!("tvf_race_{i}: {e}"));
+        }
+    }
+    for i in 0..N {
+        let rows: usize = handler
+            .execute(&session, &format!("SELECT * FROM test_ns.tvf_race_{i}"), None)
+            .await
+            .map(|b| b.iter().map(|b| b.num_rows()).sum())
+            .unwrap_or(0);
+        if failures.is_empty() {
+            assert_eq!(rows, 3, "tvf_race_{i}");
+        }
+        let _ = handler
+            .execute(&session, &format!("DROP TABLE IF EXISTS test_ns.tvf_race_{i}"), None)
+            .await;
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 // Test: read_parquet() TVF — CTAS from a local Parquet file, verify round-trip
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh

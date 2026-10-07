@@ -33,6 +33,7 @@ use crate::maintenance::MaintenanceHandler;
 use crate::query_cache::ResultCache;
 use crate::query_tracker::{FragmentState, QueryTracker};
 use crate::runtime_catalog::RuntimeCatalogRegistry;
+use crate::session_manager::session_log_id;
 use crate::write_handler::WriteHandler;
 
 // Review 409: the handler is being split by phase into child modules that
@@ -169,16 +170,6 @@ fn normalize_for_planning(session: &Session, sql: &str) -> sqe_core::Result<Stri
     Ok(sqe_sql::rewrite_named_tvf_args(normalized.sql()))
 }
 
-/// Build the providers of the file table functions `sql` calls, on the async
-/// path, before DataFusion's synchronous `TableFunctionImpl::call` asks for
-/// them (architecture review 806). Must run on the final text handed to
-/// `ctx.sql`; every planner entry point in this crate calls it.
-pub(crate) async fn prepare_file_tvfs(ctx: &SessionContext, sql: &str) -> sqe_core::Result<()> {
-    sqe_catalog::file_tvf_prepare::prepare_statement(ctx, sql)
-        .await
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))
-}
-
 fn refuse_if_audit_closed(
     audit: Option<&Arc<sqe_metrics::audit::AuditLogger>>,
 ) -> sqe_core::Result<()> {
@@ -212,6 +203,32 @@ fn is_sorted_write(kind: &StatementKind) -> bool {
         },
         _ => false,
     }
+}
+
+/// Table properties that are policy state rather than table configuration.
+/// `sqe.column-tags` is what SET/UNSET TAGS writes and it drives tag masks.
+/// Other `sqe.` keys stay owner-settable: `sqe.maintenance.*` is how a table
+/// owner opts into and tunes autonomous compaction.
+const POLICY_TABLE_PROPERTIES: &[&str] = &[crate::tag_source_impl::PROP_KEY];
+
+/// True when an `ALTER TABLE ... SET TBLPROPERTIES` writes a policy property
+/// (matched case-insensitively), which needs the same admin gate as SET/UNSET
+/// TAGS.
+fn sets_reserved_table_property(stmt: &Statement) -> bool {
+    let Statement::AlterTable(at) = stmt else {
+        return false;
+    };
+    at.operations.iter().any(|op| match op {
+        sqlparser::ast::AlterTableOperation::SetTblProperties { table_properties } => {
+            table_properties.iter().any(|p| match p {
+                sqlparser::ast::SqlOption::KeyValue { key, .. } => POLICY_TABLE_PROPERTIES
+                    .iter()
+                    .any(|reserved| key.value.eq_ignore_ascii_case(reserved)),
+                _ => false,
+            })
+        }
+        _ => false,
+    })
 }
 
 /// A compile-time firewall, not an extension point: keep it even with one impl.
@@ -293,6 +310,10 @@ pub struct QueryHandler {
     /// Cached parse of `config.query.max_query_memory`. Used as the
     /// per-query reservation increment against the per-user budget.
     per_query_memory_bytes: usize,
+    /// Share of each query's cap kept for non-spillable consumers
+    /// (`coordinator.unspillable_headroom_percent`); 0 under the fair pool,
+    /// which divides memory itself.
+    unspillable_headroom_percent: u8,
     /// Cached parse of `config.query.query_profile`. Parsed once at startup
     /// so an unknown value warns once, not per query.
     profile_mode: sqe_core::ProfileMode,
@@ -419,7 +440,8 @@ impl QueryHandler {
             write_handler = write_handler.with_metrics(Arc::clone(m));
         }
         write_handler = write_handler.with_policy_enforcer(Arc::clone(&policy_enforcer));
-        let mut maintenance_handler = MaintenanceHandler::new(config.clone());
+        let mut maintenance_handler =
+            MaintenanceHandler::new(config.clone()).with_ticket_signer(Arc::clone(&ticket_signer));
         if let Some(ref a) = audit {
             maintenance_handler = maintenance_handler.with_audit(Arc::clone(a));
         }
@@ -497,6 +519,13 @@ impl QueryHandler {
                 ))
             })? as usize
         };
+        // The fair pool divides memory itself; the headroom applies to greedy.
+        let unspillable_headroom_percent = match config.coordinator.memory_pool {
+            sqe_core::config::MemoryPoolKind::Greedy => {
+                config.coordinator.unspillable_headroom_percent
+            }
+            sqe_core::config::MemoryPoolKind::Fair => 0,
+        };
         let per_query_memory_bytes = if config.query.max_query_memory == "0" {
             0
         } else {
@@ -512,7 +541,8 @@ impl QueryHandler {
 
         let mut hive_ddl_handler =
             crate::hive_ddl_handler::HiveDdlHandler::new(runtime_catalogs.clone(), secrets.clone())
-                .with_policy(policy_store.clone(), config.policy.mask_precedence);
+                .with_policy(policy_store.clone(), config.policy.mask_precedence)
+                .with_admin_roles(config.auth.admin_roles.clone());
         if let Some(ref a) = audit {
             hive_ddl_handler = hive_ddl_handler.with_audit(Arc::clone(a));
         }
@@ -539,6 +569,7 @@ impl QueryHandler {
             per_user_memory: Arc::new(crate::memory::PerUserMemoryRegistry::new()),
             per_user_memory_budget_bytes,
             per_query_memory_bytes,
+            unspillable_headroom_percent,
             profile_mode,
             runtime,
             table_cache: None,
@@ -649,6 +680,21 @@ impl QueryHandler {
         self
     }
 
+    /// Replace the ticket signer with one shared by other components (the
+    /// maintenance scheduler's handler), so every request workers receive is
+    /// signed by the single key they pin via heartbeat.
+    #[must_use = "with_ticket_signer consumes self; bind the returned QueryHandler"]
+    pub fn with_ticket_signer(
+        mut self,
+        signer: Arc<sqe_core::ticket_signing::TicketSigner>,
+    ) -> Self {
+        self.maintenance_handler = self
+            .maintenance_handler
+            .with_ticket_signer(Arc::clone(&signer));
+        self.ticket_signer = signer;
+        self
+    }
+
     /// Returns a reference to the query tracker.
     pub fn query_tracker(&self) -> &Arc<QueryTracker> {
         &self.query_tracker
@@ -751,10 +797,18 @@ impl QueryHandler {
                 // described a DIFFERENT catalog than the one named, and reported
                 // success. `SHOW SCHEMAS` is how an operator confirms a grant
                 // landed, so a confidently wrong answer is worse than a refusal.
-                Err(sqe_core::SqeError::Catalog(format!(
-                    "Unknown catalog '{name}': not declared in configuration and not \
-                     resolvable via Polaris (nonexistent, or not authorized for this user)"
-                )))
+                // Trino's answer for a catalog that does not exist or that the
+                // caller may not see: the same message for both, so the reply
+                // does not reveal which. The operator-facing detail is logged.
+                tracing::info!(
+                    catalog = %name,
+                    "SHOW: catalog not declared in configuration and not resolvable via \
+                     Polaris (nonexistent, or not authorized for this user)"
+                );
+                Err(sqe_core::SqeError::with_code(
+                    SqeErrorCode::CatalogNotFound,
+                    format!("Catalog '{name}' does not exist"),
+                ))
             }
         }
     }
@@ -1042,7 +1096,11 @@ impl QueryHandler {
         sql: &'a str,
         client_ip: Option<String>,
     ) -> futures::future::BoxFuture<'a, sqe_core::Result<Vec<RecordBatch>>> {
-        Box::pin(self.execute_inner(session, sql, client_ip))
+        // One statement-scoped set of prepared file-function providers for
+        // the whole execution, whatever session context each step plans on.
+        Box::pin(sqe_catalog::file_tvf_prepare::in_statement(
+            self.execute_inner(session, sql, client_ip),
+        ))
     }
 
     /// Write the audit record for a statement that failed before its normal
@@ -1138,6 +1196,18 @@ impl QueryHandler {
         // Extra writers are rejected (ResourceExhausted), not queued.
         let _sorted_write_permit = self.try_acquire_sorted_write(&kind).map_err(failed)?;
 
+        // A SET TBLPROPERTIES that writes policy state (`sqe.column-tags`) is
+        // policy DDL, gated like SET/UNSET TAGS. It runs before the catalog
+        // preflight so a non-admin is refused on the privilege, whatever the
+        // catalog qualifier, and learns nothing about which catalogs exist.
+        if kind.statement().is_some_and(sets_reserved_table_property) {
+            self.require_admin(
+                session,
+                "ALTER TABLE ... SET TBLPROPERTIES on a policy property",
+            )
+            .map_err(failed)?;
+        }
+
         // Pre-flight: when a 3-part identifier names a catalog that the
         // coordinator has not registered, fail fast with a clear error
         // instead of letting DataFusion silently fall back to the
@@ -1179,12 +1249,7 @@ impl QueryHandler {
                     let (ctx, _) = self.create_session_context(session).await?;
                     sqe_catalog::file_tvf_prepare::prepare_parsed_statement(&ctx, stmt)
                         .await
-                        .map_err(|e| {
-                            SqeError::with_code(
-                                SqeErrorCode::ExecutionFailed,
-                                format!("SQL planning failed: {e}"),
-                            )
-                        })
+                        .map_err(SqeError::planning)
                 }
                 .await
                 .map_err(failed)?;
@@ -1220,8 +1285,8 @@ impl QueryHandler {
             "sqe.query",
             query_id = %query_id,
             sqe.query.id = %query_id,
-            sqe.session.id = %session.id,
-            session_id = %session.id,
+            sqe.session.id = %session_log_id(&session.id),
+            session_id = %session_log_id(&session.id),
             trace_id = tracing::field::Empty,
             span_id = tracing::field::Empty,
             user = %session.user.username,
@@ -1236,9 +1301,10 @@ impl QueryHandler {
         // span not entered across await (finding 410)
         let trace_id = sqe_metrics::propagation::current_trace_id();
 
-        let cancel_token = self.query_tracker.start(
+        let cancel_token = self.query_tracker.start_with_principal(
             query_id,
             &session.user.username,
+            session.user.principal_id(),
             session.source.as_deref(),
             sql,
             &session.id,
@@ -1269,7 +1335,6 @@ impl QueryHandler {
                     sql: sql.to_string(),
                     user: sqe_lineage::UserCtx {
                         username: session.user.username.clone(),
-                        bearer: Some(session.access_token().clone()),
                     },
                     session_id: session.id.clone(),
                     started_at: ol_started_at,
@@ -1349,7 +1414,6 @@ impl QueryHandler {
                                 sql: sql.to_string(),
                                 user: sqe_lineage::UserCtx {
                                     username: session.user.username.clone(),
-                                    bearer: Some(session.access_token().clone()),
                                 },
                                 session_id: session.id.clone(),
                                 started_at: ol_started_at,
@@ -1453,7 +1517,8 @@ impl QueryHandler {
                         if *analyze {
                             self.explain_handler.analyze(session, &inner, &ctx).await
                         } else {
-                            self.explain_handler.plan(session, &inner, &ctx).await
+                            let is_admin = self.config.auth.has_admin_role(&session.user.roles);
+                            self.explain_handler.plan(session, &inner, &ctx, is_admin).await
                         }
                     } else if let sqlparser::ast::Statement::ShowColumns { show_options, .. } =
                         stmt.as_ref()
@@ -1682,6 +1747,8 @@ impl QueryHandler {
                     Ok(vec![])
                 }
                 StatementKind::AlterTableProps(stmt) => {
+                    // Policy-property writes were admin-gated before the
+                    // catalog preflight (`sets_reserved_table_property`).
                     self.catalog_ops.set_table_properties(session, stmt).await?;
                     crate::session_context::invalidate_session_cache(&session.user.username).await;
                     // Flush cached tag policies so a SET TBLPROPERTIES on sqe.column-tags
@@ -1904,9 +1971,7 @@ impl QueryHandler {
                             // Plan the SELECT for its schema only. The column
                             // list and the partition-key types both come from
                             // the query, because a CTAS need not declare them.
-                            prepare_file_tvfs(&ctx, &select_sql).await?;
-                            let schema = ctx
-                                .sql(&select_sql)
+                            let schema = sqe_catalog::file_tvf_prepare::plan_sql(&ctx, &select_sql)
                                 .await
                                 .map_err(|e| {
                                     SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
@@ -1964,7 +2029,6 @@ impl QueryHandler {
                             // failed with "the table function was not
                             // prepared before planning".
                             let (load_ctx, _) = self.create_session_context(session).await?;
-                            prepare_file_tvfs(&load_ctx, &select_sql).await?;
                             let written = crate::hive_write::handle_insert(
                                 &load_ctx,
                                 &load_stmt,
@@ -2225,6 +2289,7 @@ impl QueryHandler {
                             })?;
                             return Ok(vec![batch]);
                         }
+                        self.deny_hidden_table(session, &obj_name.to_string()).await?;
                     }
                     let (ctx, session_catalog) = self.create_session_context(session).await?;
                     self.handle_show_create_table(session, stmt, &ctx, &session_catalog)
@@ -2382,6 +2447,18 @@ impl QueryHandler {
                         .map(|b| vec![b])
                         .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))
                     } else {
+                        // `table_health` is a read-only report the maintenance
+                        // tier lets through without a privilege check; a
+                        // table the caller is fully denied stays "not found".
+                        if let sqe_sql::ProcedureCall::TableHealth { table } = &**call {
+                            deny_hidden_metadata_tvf_targets(
+                                self.policy_store.as_deref(),
+                                &session.user,
+                                self.config.policy.mask_precedence,
+                                &[(table.namespace.clone(), table.name.clone())],
+                            )
+                            .await?;
+                        }
                         let result = self.maintenance_handler.handle(session, call).await;
 
                         // Maintenance procedures rewrite the table's snapshot
@@ -2840,7 +2917,6 @@ impl QueryHandler {
                             sql: sql.to_string(),
                             user: sqe_lineage::UserCtx {
                                 username: session.user.username.clone(),
-                                bearer: Some(session.access_token().clone()),
                             },
                             session_id: session.id.clone(),
                             started_at: ol_started_at,
@@ -2865,7 +2941,6 @@ impl QueryHandler {
                             sql: sql.to_string(),
                             user: sqe_lineage::UserCtx {
                                 username: session.user.username.clone(),
-                                bearer: Some(session.access_token().clone()),
                             },
                             session_id: session.id.clone(),
                             started_at: ol_started_at,
@@ -3133,8 +3208,8 @@ impl QueryHandler {
             "sqe.query",
             query_id = %query_id,
             sqe.query.id = %query_id,
-            sqe.session.id = %session.id,
-            session_id = %session.id,
+            sqe.session.id = %session_log_id(&session.id),
+            session_id = %session_log_id(&session.id),
             trace_id = tracing::field::Empty,
             span_id = tracing::field::Empty,
             user = %session.user.username,
@@ -3160,9 +3235,10 @@ impl QueryHandler {
             "Starting streaming query"
         );
 
-        let cancel_token = self.query_tracker.start(
+        let cancel_token = self.query_tracker.start_with_principal(
             query_id,
             &session.user.username,
+            session.user.principal_id(),
             session.source.as_deref(),
             sql,
             &session.id,
@@ -3287,6 +3363,11 @@ impl QueryHandler {
         start: std::time::Instant,
     ) -> sqe_core::Result<OpenStreamResult> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
+        let ctx = crate::query_memory::with_query_limit(
+            ctx,
+            self.per_query_memory_bytes,
+            self.unspillable_headroom_percent,
+        );
 
         // Every recursive phase (SQL planning, the policy rewrite, the
         // optimizer, physical planning, the post-planning rules) runs on the
@@ -3312,19 +3393,14 @@ impl QueryHandler {
                 // TrackedRecordBatchStream finalizer (not the `execute` path), so
                 // carry the policy summary out to the caller, which stows it on
                 // the StreamFinalizer for the audit emission at stream end.
-                deny_hidden_metadata_tvf_targets(
-                    self.policy_store.as_deref(),
-                    &session.user,
-                    self.config.policy.mask_precedence,
-                    &metadata_tvf_targets(&plan),
-                )
-                .await?;
                 let (enforced_plan, policy_summary) = {
                     let _policy_span = tracing::info_span!(
                         "sqe.policy_rewrite",
                         user = %session.user.username
                     );
-                    self.policy_enforcer.evaluate(&session.user, plan).await?
+                    self.policy_enforcer
+                        .evaluate(&session.user, &sqe_policy::TableScope::of(&ctx), plan)
+                        .await?
                 };
                 debug!("Policy-enforced plan (streaming): {:?}", enforced_plan);
                 // Compute the structured resource list from the logical plan
@@ -3416,10 +3492,9 @@ impl QueryHandler {
             .handle_time_travel(&sql, ctx, session, session_catalog, incremental_identities)
             .await?;
         // The single normalization pass before planning, matching the
-        // execute() path (finding 700): Trino-compat AST rewrites (the
-        // empty-input ROLLUP / CUBE / GROUPING SETS wrap for
-        // apache/datafusion#21570, CAST(v AS JSON) -> to_json(v), the $-suffix
-        // metadata-table rewrite), `_colN` aliasing and `information_schema`
+        // execute() path (finding 700): Trino-compat AST rewrites
+        // (CAST(v AS JSON) -> to_json(v), the $-suffix metadata-table
+        // rewrite, ...), `_colN` aliasing and `information_schema`
         // qualification.
         let sql = normalize_for_planning(session, &sql)?;
         let sql = sql.as_str();
@@ -3428,13 +3503,10 @@ impl QueryHandler {
             "sqe.plan",
             query_id = query_id.map(|q| q.to_string()).unwrap_or_default()
         );
-        prepare_file_tvfs(ctx, sql).await?;
-        let df = ctx.sql(sql).instrument(plan_span).await.map_err(|e| {
-            SqeError::with_code(
-                SqeErrorCode::ExecutionFailed,
-                format!("SQL planning failed: {e}"),
-            )
-        })?;
+        let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, sql)
+            .instrument(plan_span)
+            .await
+            .map_err(SqeError::planning)?;
         // Pinned (time-travel / incremental) scans get their real table
         // identity back before the policy rewriter sees the plan (400).
         let plan = tt_cleanup.restore_identities(df.logical_plan().clone())?;
@@ -3502,11 +3574,9 @@ impl QueryHandler {
                     incremental_identities,
                 )
                 .await?;
-            prepare_file_tvfs(&ctx, &sql_for_plan).await?;
-            let df = ctx
-                .sql(&sql_for_plan)
+            let df = sqe_catalog::file_tvf_prepare::plan_sql(&ctx, &sql_for_plan)
                 .await
-                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
+                .map_err(SqeError::planning)?;
             // `_tt_cleanup` drops here, deregistering any pinned providers
             // that schema-resolution required. Schema-only paths never read
             // batches, so dropping right after `df.schema()` is fine.
@@ -3573,11 +3643,9 @@ impl QueryHandler {
             self.preflight_resolve_catalogs(stmt, session).await?;
         }
         let (ctx, _session_catalog) = self.create_session_context(session).await?;
-        prepare_file_tvfs(&ctx, numbered_sql).await?;
-        let df = ctx
-            .sql(numbered_sql)
+        let df = sqe_catalog::file_tvf_prepare::plan_sql(&ctx, numbered_sql)
             .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
+            .map_err(SqeError::planning)?;
         let types_map = df
             .logical_plan()
             .get_parameter_types()
@@ -3751,6 +3819,11 @@ impl QueryHandler {
         summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
+        let ctx = crate::query_memory::with_query_limit(
+            ctx,
+            self.per_query_memory_bytes,
+            self.unspillable_headroom_percent,
+        );
 
         self.refresh_listing_snapshots(&ctx, &session_catalog, session, sql)
             .await;
@@ -3790,29 +3863,22 @@ impl QueryHandler {
 
             // Plan the query via DataFusion's SQL planner
             let plan_span = tracing::info_span!("sqe.plan", query_id = %query_id);
-            prepare_file_tvfs(&ctx, sql).await?;
-            let df = ctx
-                .sql(sql)
+            let df = sqe_catalog::file_tvf_prepare::plan_sql(&ctx, sql)
                 .instrument(plan_span)
                 .await
-                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
+                .map_err(SqeError::planning)?;
 
             // Get the logical plan, give pinned scans their real identity back
             // (400), and run policy enforcement.
             let plan = tt_cleanup.restore_identities(df.logical_plan().clone())?;
-            deny_hidden_metadata_tvf_targets(
-                self.policy_store.as_deref(),
-                &session.user,
-                self.config.policy.mask_precedence,
-                &metadata_tvf_targets(&plan),
-            )
-            .await?;
             let (enforced_plan, policy_summary) = {
                 let _policy_span = tracing::info_span!(
                     "sqe.policy_rewrite",
                     user = %session.user.username
                 );
-                self.policy_enforcer.evaluate(&session.user, plan).await?
+                self.policy_enforcer
+                    .evaluate(&session.user, &sqe_policy::TableScope::of(&ctx), plan)
+                    .await?
             };
 
             debug!("Policy-enforced plan: {:?}", enforced_plan);
@@ -3853,66 +3919,35 @@ impl QueryHandler {
         })
         .await?;
 
-        // Execute the (possibly distributed) plan.
-        //
-        // We drive the stream manually instead of using DataFusion's `collect()`
-        // so the row-count limit can fire BEFORE the entire result set is
-        // materialised. `collect()` buffers every batch into memory first and
-        // only returns when the plan is exhausted. For an unbounded or
-        // mis-shaped query (e.g. a 20M-row fact-to-dimension cross product) the
-        // buffered `Vec<RecordBatch>` could grow to many GB and trigger an
-        // OS-level OOM kill. Streaming and counting as we go lets the
-        // coordinator reject oversized queries with a clean error and keeps the
-        // process alive for other concurrent requests.
-        //
-        // Two caps apply:
-        //   1. The user-configured `query.max_result_rows` (0 means no explicit
-        //      cap, but see #2).
-        //   2. A hard memory-derived ceiling: `memory_limit / 256` rows, assuming
-        //      a conservative 256-byte average row size. This fires even when
-        //      the config disables #1. The coordinator must never be one query
-        //      away from the OS SIGKILLing the process for crossing the memory
-        //      line, so we always enforce something lower than total memory.
+        // Retain results incrementally under both row and actual byte caps.
+        // Buffer owners hold pool reservations through return, cloning and
+        // cache storage, so completion cannot make live output unaccounted.
         let output_schema = final_plan.schema();
         let configured_max = self.config.query.max_result_rows;
-        let memory_ceiling: usize = {
-            let bytes = crate::memory::limit_bytes(&self.runtime.memory_pool);
-            if bytes == 0 {
-                0
-            } else {
-                bytes / 256
-            }
-        };
-        let effective_max: usize = match (configured_max, memory_ceiling) {
-            (0, 0) => 0, // neither cap configured. Falls back to OS behaviour.
-            (0, m) => m,
-            (c, 0) => c,
-            (c, m) => c.min(m),
-        };
         let mut stream = execute_stream(final_plan.clone(), ctx.task_ctx())
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Query execution failed: {e}")))?;
+            .map_err(|e| crate::query_memory::execution_error(&e))?;
         let mut batches: Vec<RecordBatch> = Vec::new();
+        // The query pool already delegates to the shared pool. Reserve once
+        // so retained result buffers are charged once at each level.
+        let mut result_budget = crate::buffered_result::BufferedResultBudget::new(
+            Arc::clone(&ctx.runtime_env().memory_pool),
+            Arc::clone(&ctx.runtime_env().memory_pool),
+            self.per_query_memory_bytes,
+        );
         let mut rows_so_far: usize = 0;
         while let Some(batch) = stream
             .try_next()
             .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Query execution failed: {e}")))?
+            .map_err(|e| crate::query_memory::execution_error(&e))?
         {
             rows_so_far = rows_so_far.saturating_add(batch.num_rows());
-            if effective_max > 0 && rows_so_far > effective_max {
-                let reason = if configured_max > 0 && rows_so_far > configured_max {
-                    format!("configured max_result_rows={configured_max}")
-                } else {
-                    format!(
-                        "memory-derived ceiling={effective_max} (memory_limit / 256 bytes-per-row)"
-                    )
-                };
-                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "Query result exceeds maximum allowed rows ({rows_so_far} > {effective_max}). \
-                     Reason: {reason}. Use LIMIT to reduce output or raise the limit in config."
+            if configured_max > 0 && rows_so_far > configured_max {
+                return Err(SqeError::with_code(SqeErrorCode::ResourceExhausted, format!(
+                    "Query result exceeds maximum allowed rows ({rows_so_far} > {configured_max}). \
+                     Reason: configured max_result_rows={configured_max}. Use LIMIT to reduce output or raise the limit in config."
                 )));
             }
-            batches.push(batch);
+            batches.push(result_budget.retain(batch)?);
         }
 
         // Aggregate spill metrics from the executed plan tree
@@ -4664,6 +4699,11 @@ impl QueryHandler {
             if let Some(tracker) = &self.credential_tracker {
                 exec = exec.with_credential_tracker(Arc::clone(tracker));
             }
+            // The refresh task renews keys by reloading the table through
+            // the same session catalog (same user bearer) the scan came from.
+            if let Some(reloader) = iceberg_scan.table_reloader() {
+                exec = exec.with_credential_reloader(reloader.clone());
+            }
         }
         info!(
             query_id = %query_id,
@@ -4934,8 +4974,7 @@ impl QueryHandler {
         // back empty for tables outside the default catalog. (#2)
         let col_sql = info_schema_columns_query(&table_name);
 
-        let df = ctx
-            .sql(&col_sql)
+        let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, &col_sql)
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to query column metadata: {e}")))?;
         let batches = df
@@ -5169,7 +5208,10 @@ impl QueryHandler {
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         // `SHOW SCHEMAS FROM <catalog>` must list that catalog's namespaces, not
         // the default warehouse's. Resolve the named catalog (discovered under
-        // polaris-auto) so reads line up with the write path.
+        // polaris-auto) so reads line up with the write path. A trailing
+        // `LIKE '<pattern>'` filters the names.
+        let (filter, like) = ShowLike::split(filter);
+        let keep = |name: &str| like.as_ref().is_none_or(|l| l.matches(name));
         let catalog = show_schemas_catalog(filter);
 
         // Trino's `SHOW SCHEMAS` column is named `Schema`.
@@ -5188,7 +5230,9 @@ impl QueryHandler {
         if let Some(root) = catalog.as_deref() {
             if self.runtime_catalogs.is_hive_root(root).unwrap_or(false) {
                 for name in self.hive_ddl_handler.list_databases(root).await? {
-                    builder.append_value(name);
+                    if keep(&name) {
+                        builder.append_value(name);
+                    }
                 }
                 let array: ArrayRef = Arc::new(builder.finish());
                 let batch = RecordBatch::try_new(schema, vec![array]).map_err(|e| {
@@ -5206,12 +5250,17 @@ impl QueryHandler {
         // A principal that is not authorized to list this catalog's namespaces
         // gets an empty result, not a hard error -- so JDBC schema sync and
         // SHOW SCHEMAS skip catalogs the user can't see instead of aborting. (#5)
-        let namespaces = namespaces_or_empty_on_denial(session_catalog.list_namespaces().await)?;
+        let namespaces = namespaces_or_empty_on_denial(
+            missing_catalog_as_not_found(catalog.as_deref(), session_catalog.list_namespaces().await),
+        )?;
 
         for ns in &namespaces {
             // Namespace is a list of parts, join with "."
             let name: Vec<&str> = ns.as_ref().iter().map(|s| s.as_str()).collect();
-            builder.append_value(name.join("."));
+            let name = name.join(".");
+            if keep(&name) {
+                builder.append_value(name);
+            }
         }
         let array: ArrayRef = Arc::new(builder.finish());
 
@@ -5276,6 +5325,7 @@ impl QueryHandler {
             }
         }
 
+        self.deny_hidden_table(session, table_name).await?;
         let col_sql = info_schema_columns_query(table_name);
 
         let (ctx, session_catalog) = self.create_session_context(session).await?;
@@ -5285,7 +5335,7 @@ impl QueryHandler {
         // come back empty.
         self.refresh_listing_snapshots(&ctx, &session_catalog, session, &col_sql)
             .await;
-        let df = ctx.sql(&col_sql).await.map_err(|e| {
+        let df = sqe_catalog::file_tvf_prepare::plan_sql(&ctx, &col_sql).await.map_err(|e| {
             SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("failed to query information_schema.columns: {e}"))
         })?;
         let batches = df
@@ -5303,6 +5353,35 @@ impl QueryHandler {
             _ => std::collections::HashMap::new(),
         };
         with_column_comments(batches, &comments)
+    }
+
+    /// Refuse `SHOW CREATE TABLE`, `DESCRIBE` / `SHOW COLUMNS` and `CALL
+    /// system.table_health` on an Iceberg table the policy store denies the
+    /// caller all access to, as "table not found" (the metadata TVF gate's
+    /// wording). Hive tables are gated by `HiveDdlHandler` on their own path.
+    /// A bare name is checked under both the session schema and `default`,
+    /// since these handlers resolve it against either.
+    async fn deny_hidden_table(&self, session: &Session, table_name: &str) -> sqe_core::Result<()> {
+        let parts = split_qualified_identifier(table_name);
+        let targets: Vec<(String, String)> = match parts.as_slice() {
+            [.., ns, table] => vec![(ns.clone(), table.clone())],
+            [table] => {
+                let mut namespaces = vec!["default".to_string()];
+                namespaces.extend(session.default_schema.clone());
+                namespaces
+                    .into_iter()
+                    .map(|ns| (ns, table.clone()))
+                    .collect()
+            }
+            [] => Vec::new(),
+        };
+        deny_hidden_metadata_tvf_targets(
+            self.policy_store.as_deref(),
+            &session.user,
+            self.config.policy.mask_precedence,
+            &targets,
+        )
+        .await
     }
 
     /// `doc` per column of an Iceberg table, keyed by column name. Empty when
@@ -5376,7 +5455,10 @@ impl QueryHandler {
         // `SHOW TABLES FROM <catalog>.<schema>` must list tables from that
         // catalog, not the default warehouse. Resolve the leading catalog
         // qualifier (discovered under polaris-auto); the schema part is parsed
-        // separately by parse_show_tables_namespace.
+        // separately by parse_show_tables_namespace. A trailing
+        // `LIKE '<pattern>'` filters the names.
+        let (filter, like) = ShowLike::split(filter);
+        let keep = |name: &str| like.as_ref().is_none_or(|l| l.matches(name));
         let catalog = show_tables_catalog(filter);
         // A Hive root is not an Iceberg catalog: `show_catalog` only knows
         // `[catalogs.*]` config and Polaris discovery, so a Hive root's name
@@ -5398,6 +5480,7 @@ impl QueryHandler {
                     .hive_ddl_handler
                     .list_tables(&session.user, root, &database)
                     .await?;
+                names.retain(|n| keep(n));
                 names.sort();
                 let schema = Arc::new(Schema::new(vec![Field::new(
                     "Table",
@@ -5438,7 +5521,10 @@ impl QueryHandler {
             // known to it.
             //
             // The per-namespace list_tables below already degrades this way.
-            None => namespaces_or_empty_on_denial(session_catalog.list_namespaces().await)?,
+            None => namespaces_or_empty_on_denial(missing_catalog_as_not_found(
+                catalog.as_deref(),
+                session_catalog.list_namespaces().await,
+            ))?,
             Some(name) => vec![iceberg::NamespaceIdent::new(name)],
         };
 
@@ -5481,6 +5567,7 @@ impl QueryHandler {
             }
         }
         // Trino lists table names sorted.
+        names.retain(|n| keep(n));
         names.sort();
         names.dedup();
 
@@ -7703,9 +7790,9 @@ fn append_metadata_tvf_targets(
 
 /// `(namespace, table)` of every metadata TVF scan in `plan`, deduplicated.
 fn metadata_tvf_targets(plan: &datafusion::logical_expr::LogicalPlan) -> Vec<(String, String)> {
-    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::common::tree_node::TreeNodeRecursion;
     let mut targets = Vec::new();
-    let _ = plan.apply(|node| {
+    let _ = plan.apply_with_subqueries(|node| {
         if let datafusion::logical_expr::LogicalPlan::TableScan(scan) = node {
             if let Ok(provider) = datafusion::datasource::source_as_provider(&scan.source) {
                 if let Some(target) =
@@ -7722,17 +7809,12 @@ fn metadata_tvf_targets(plan: &datafusion::logical_expr::LogicalPlan) -> Vec<(St
     targets
 }
 
-/// Refuse a statement whose metadata TVF targets (`table_files('ns','t')`,
-/// ...) the policy store denies `user` all access to (#750).
-///
-/// The rewriter keys `TableScan`s by `scan.table_name`, which for a TVF is
-/// the function name, so the target table's SELECT policy is never consulted
-/// there; without this gate a default-deny user reads object-store paths,
-/// partition values and row counts of a table it cannot SELECT from. Same
-/// wording as a missing table so "denied" is indistinguishable from "never
-/// existed" (the SHOW CREATE TABLE / SHOW TABLES convention). Table-level
-/// only: partition values of restricted or masked columns still flow through
-/// for a caller with any privilege on the table.
+/// Refuse a statement whose targets the policy store denies `user` all
+/// access to (#750). Metadata TVFs are checked inside the policy rewriter;
+/// this gate covers the metadata statements that never build a plan (SHOW
+/// CREATE TABLE, column listings, table health). Same wording as a missing
+/// table so "denied" is indistinguishable from "never existed" (the SHOW
+/// CREATE TABLE / SHOW TABLES convention).
 async fn deny_hidden_metadata_tvf_targets(
     store: Option<&dyn PolicyStore>,
     user: &sqe_core::session::SessionUser,
@@ -8894,7 +8976,7 @@ fn governed_show_stats(
     }
     let columns = column_names
         .into_iter()
-        .filter(|c| !policy.restricted_columns.iter().any(|r| r == c))
+        .filter(|c| !policy.is_restricted(c))
         .collect();
     let row_count = if policy.row_filters.is_empty() {
         row_count
@@ -9118,6 +9200,143 @@ fn extract_affected_rows(batches: &[RecordBatch]) -> Option<u64> {
 /// tree showed every schema as empty.
 /// Strip the leading `IN `/`FROM ` keyword (sqlparser renders a `show_in` clause
 /// as "FROM <x>" / "IN <x>") and return the trimmed remainder.
+/// A `LIKE` / `ILIKE` pattern trailing a `SHOW SCHEMAS` / `SHOW TABLES`
+/// filter (the classifier appends it; see `show_filter_text` in sqe-sql).
+/// `%` matches any run and `_` one character. `LIKE` is case-sensitive like
+/// Trino's; `ILIKE` is not. (sqlparser does not accept `ESCAPE` on SHOW
+/// statements, so no escape character can reach here.)
+#[derive(Debug, Clone, PartialEq)]
+struct ShowLike {
+    pattern: Vec<LikeToken>,
+    case_insensitive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum LikeToken {
+    Any,
+    One,
+    Char(char),
+}
+
+impl ShowLike {
+    /// Split a trailing `[I]LIKE '<pattern>'` off `filter`,
+    /// returning the remaining scope (`FROM <catalog>[.<schema>]`) and the
+    /// pattern.
+    fn split(filter: &str) -> (&str, Option<ShowLike>) {
+        let trimmed = filter.trim_end();
+        let upper = trimmed.to_ascii_uppercase();
+        for keyword in [" ILIKE '", " LIKE '", "ILIKE '", "LIKE '"] {
+            let Some(at) = upper.rfind(keyword) else { continue };
+            if !keyword.starts_with(' ') && at != 0 {
+                continue;
+            }
+            let body = &trimmed[at + keyword.len()..];
+            let Some((pattern, rest)) = read_sql_string(body) else { continue };
+            if !rest.trim().is_empty() {
+                continue;
+            }
+            let case_insensitive = keyword.trim_start().starts_with("ILIKE");
+            let scope = trimmed[..at].trim_end();
+            return (scope, Some(ShowLike::compile(&pattern, case_insensitive)));
+        }
+        (filter, None)
+    }
+
+    fn compile(pattern: &str, case_insensitive: bool) -> Self {
+        let fold = |c: char| {
+            if case_insensitive {
+                c.to_lowercase().next().unwrap_or(c)
+            } else {
+                c
+            }
+        };
+        let mut tokens = Vec::new();
+        for c in pattern.chars() {
+            tokens.push(match c {
+                '%' => LikeToken::Any,
+                '_' => LikeToken::One,
+                other => LikeToken::Char(fold(other)),
+            });
+        }
+        Self { pattern: tokens, case_insensitive }
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        let text: Vec<char> = if self.case_insensitive {
+            name.to_lowercase().chars().collect()
+        } else {
+            name.chars().collect()
+        };
+        // Iterative wildcard match with backtracking to the last `%`.
+        let (mut t, mut p) = (0usize, 0usize);
+        let (mut star, mut star_t) = (None::<usize>, 0usize);
+        while t < text.len() {
+            match self.pattern.get(p) {
+                Some(LikeToken::Char(c)) if *c == text[t] => {
+                    t += 1;
+                    p += 1;
+                }
+                Some(LikeToken::One) => {
+                    t += 1;
+                    p += 1;
+                }
+                Some(LikeToken::Any) => {
+                    star = Some(p);
+                    star_t = t;
+                    p += 1;
+                }
+                _ => match star {
+                    Some(sp) => {
+                        p = sp + 1;
+                        star_t += 1;
+                        t = star_t;
+                    }
+                    None => return false,
+                },
+            }
+        }
+        self.pattern[p..].iter().all(|tok| *tok == LikeToken::Any)
+    }
+}
+
+/// Read a single-quoted SQL string body (`''` is an escaped quote) up to its
+/// closing quote; `input` starts just after the opening quote. Returns the
+/// value and the text after the closing quote.
+fn read_sql_string(input: &str) -> Option<(String, &str)> {
+    let mut value = String::new();
+    let mut chars = input.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '\'' {
+            if matches!(chars.peek(), Some((_, '\''))) {
+                chars.next();
+                value.push('\'');
+                continue;
+            }
+            return Some((value, &input[i + 1..]));
+        }
+        value.push(c);
+    }
+    None
+}
+
+/// Trino's error for a catalog named in `SHOW ... FROM <catalog>` that does
+/// not exist. Under Polaris discovery an unknown name still builds a session
+/// catalog; it is the namespace listing that answers 404 ("Unable to find
+/// warehouse"), which classified as `TableNotFound` with Polaris' raw text.
+/// Only applies when the statement named the catalog.
+fn missing_catalog_as_not_found<T>(
+    named: Option<&str>,
+    result: sqe_core::Result<T>,
+) -> sqe_core::Result<T> {
+    match (named, result) {
+        (Some(name), Err(e)) if e.is_not_found() => Err(SqeError::with_code(
+            SqeErrorCode::CatalogNotFound,
+            format!("Catalog '{name}' does not exist"),
+        )),
+        (_, result) => result,
+    }
+}
+
 fn strip_show_in_keyword(filter: &str) -> &str {
     let raw = filter.trim();
     raw.strip_prefix("IN ")
@@ -9469,6 +9688,66 @@ mod show_stats_policy_tests {
             err.to_string().contains("table not found: sales.orders"),
             "{err}"
         );
+    }
+
+    /// SHOW CREATE TABLE, DESCRIBE, SHOW COLUMNS and `CALL
+    /// system.table_health` on an Iceberg table under a deny-all policy are
+    /// refused as "table not found", the same as a metadata TVF on it; before
+    /// the gate they answered with the table's columns, DDL or file stats.
+    #[tokio::test]
+    async fn denied_iceberg_table_metadata_statements_are_table_not_found() {
+        use crate::query_tracker::QueryTracker;
+        use crate::runtime_catalog::RuntimeCatalogRegistry;
+        use sqe_policy::policy_store::InMemoryPolicyStore;
+        use std::sync::Arc;
+
+        let config: sqe_core::SqeConfig =
+            toml::from_str("[coordinator]\n\n[auth]\n\n[catalog]\ncatalog_url = \"\"\n")
+                .expect("config parses");
+        let store = Arc::new(InMemoryPolicyStore::new());
+        let mut deny = ResolvedPolicy::default();
+        deny.row_filters.push(lit(false));
+        store.add_table_policy("sales", "orders", deny).await;
+        let handler = super::QueryHandler::new(
+            Arc::new(sqe_policy::PassthroughEnforcer),
+            Some(store),
+            config.clone(),
+            None,
+            None,
+            None,
+            None,
+            Arc::new(QueryTracker::new(&config.query_history)),
+            None,
+            None,
+            None,
+            RuntimeCatalogRegistry::new(),
+            sqe_core::SecretStore::new(),
+        )
+        .expect("QueryHandler::new");
+        let session = sqe_core::Session::new(
+            "analyst".to_string(),
+            sqe_core::SecretString::new("tok".to_string()),
+            None,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            Vec::new(),
+        );
+
+        for sql in [
+            "SHOW CREATE TABLE sales.orders",
+            "DESCRIBE sales.orders",
+            "SHOW COLUMNS FROM sales.orders",
+            "CALL system.table_health(table => 'sales.orders')",
+        ] {
+            let err = handler
+                .execute(&session, sql, None)
+                .await
+                .expect_err(sql);
+            assert_eq!(err.error_code(), sqe_core::SqeErrorCode::TableNotFound, "{sql}: {err}");
+            assert!(
+                err.to_string().contains("table not found: sales.orders"),
+                "{sql}: {err}"
+            );
+        }
     }
 }
 
@@ -10378,6 +10657,65 @@ warehouse = "wh1"
             config.access_control.grant_authority,
             sqe_core::config::GrantAuthority::AdminRole
         );
+    }
+
+    #[test]
+    fn show_like_splits_pattern_off_the_scope() {
+        let (scope, like) = ShowLike::split("FROM ws_cbs_energy LIKE 'cbs%'");
+        assert_eq!(scope, "FROM ws_cbs_energy");
+        assert_eq!(show_schemas_catalog(scope), Some("ws_cbs_energy".to_string()));
+        let like = like.unwrap();
+        assert!(like.matches("cbs_silver"));
+        assert!(!like.matches("other"));
+        assert!(!like.matches("CBS_silver"), "LIKE is case-sensitive, as in Trino");
+
+        // No scope, just a pattern; quotes doubled inside the literal.
+        let (scope, like) = ShowLike::split("LIKE 'o''brien'");
+        assert_eq!(scope, "");
+        assert!(like.unwrap().matches("o'brien"));
+
+        // SHOW TABLES FROM catalog.schema LIKE ...
+        let (scope, like) = ShowLike::split("FROM ws.cbs_silver LIKE 'fact_%'");
+        assert_eq!(show_tables_catalog(scope), Some("ws".to_string()));
+        assert!(like.unwrap().matches("fact_sales"));
+
+        // ILIKE folds case; no pattern leaves the filter untouched.
+        let (_, like) = ShowLike::split("IN c ILIKE 'CBS%'");
+        assert!(like.unwrap().matches("cbs_gold"));
+        assert_eq!(ShowLike::split("FROM ws_cbs_energy"), ("FROM ws_cbs_energy", None));
+        // A catalog literally named like a keyword is not mistaken for one.
+        assert_eq!(ShowLike::split("FROM likes"), ("FROM likes", None));
+    }
+
+    #[test]
+    fn a_missing_named_catalog_is_trinos_catalog_not_found() {
+        let polaris_404 = || -> sqe_core::Result<()> {
+            Err(SqeError::CatalogHttp {
+                status: 404,
+                op: sqe_core::CatalogOp::ListNamespaces,
+                body: "Unable to find warehouse no_such_wh".to_string(),
+            })
+        };
+        let err = missing_catalog_as_not_found(Some("no_such_wh"), polaris_404()).unwrap_err();
+        assert_eq!(err.error_code(), SqeErrorCode::CatalogNotFound);
+        assert_eq!(err.to_string(), "Catalog 'no_such_wh' does not exist");
+        // Without a named catalog the error is left alone.
+        assert!(missing_catalog_as_not_found(None, polaris_404()).unwrap_err().is_not_found());
+        assert!(missing_catalog_as_not_found(Some("c"), Ok(())).is_ok());
+    }
+
+    #[test]
+    fn show_like_wildcards() {
+        let (_, like) = ShowLike::split("LIKE '%_gold'");
+        let like = like.unwrap();
+        assert!(like.matches("cbs_gold"));
+        assert!(like.matches("x_gold"));
+        assert!(!like.matches("_golden"));
+        let (_, like) = ShowLike::split("LIKE 'a_c'");
+        let like = like.unwrap();
+        assert!(like.matches("abc") && !like.matches("ac") && !like.matches("abbc"));
+        let (_, like) = ShowLike::split("LIKE '%'");
+        assert!(like.unwrap().matches(""));
     }
 
     #[test]

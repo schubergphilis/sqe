@@ -1,0 +1,23 @@
+{
+  "engine": "SQE embedded; process startup included",
+  "fixture_rows_per_fact": 50000,
+  "item_keys": 1000,
+  "full_result_groups_checked": 750,
+  "measurements_ms": {
+    "original": [
+      243.84708295110613,
+      236.43345799064264,
+      228.08045899728313
+    ],
+    "preaggregated": [
+      59.23145898850635,
+      58.02041699644178,
+      55.204874952323735
+    ]
+  },
+  "medians_ms": {
+    "original": 236.43345799064264,
+    "preaggregated": 58.02041699644178
+  },
+  "speedup": 4.075004459294775
+}
