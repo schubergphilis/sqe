@@ -46,7 +46,6 @@ use datafusion::datasource::file_format::file_compression_type::FileCompressionT
 use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
 use datafusion::datasource::{TableProvider, ViewTable};
 use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{
@@ -2052,7 +2051,7 @@ impl HiveSchemaProvider {
         // JSON arrow operator, so `filter(tags, (tag) -> ...)` planned `tag`
         // as a column and the view was hidden with "No field named tag"
         // while the same expression ran fine as a user statement.
-        let ctx = SessionContext::new_with_config_rt(
+        let ctx = crate::session_tuning::engine_context(
             crate::session_tuning::engine_session_config()
                 .with_default_catalog_and_schema(&self.catalog_name, &default_schema),
             Arc::clone(&self.runtime),
@@ -2463,6 +2462,7 @@ impl SchemaProvider for HiveSchemaProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::execution::context::SessionContext;
 
     /// Athena view bodies reference base tables as `t`, `db.t` or
     /// `awsdatacatalog.db.t`; policy keys on the catalog, so every scan must
