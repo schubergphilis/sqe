@@ -765,13 +765,15 @@ fn map_mask(
     }
 }
 
-/// True when an access-policy item carries `select` (or `all`) as an allowed
-/// access type. Ranger writes `isAllowed: true` on deny items too (the item
-/// list, not the flag, makes it a deny), so the flag only rules out an item
-/// an operator toggled off.
-fn item_grants_select(item: &AccessPolicyItem) -> bool {
+/// True when an access-policy item carries `access_type` (or `all`) as an
+/// allowed access type. Ranger writes `isAllowed: true` on deny items too
+/// (the item list, not the flag, makes it a deny), so the flag only rules out
+/// an item an operator toggled off.
+fn item_grants_access(item: &AccessPolicyItem, access_type: &str) -> bool {
     item.accesses.iter().any(|a| {
-        a.is_allowed && (a.access_type.eq_ignore_ascii_case("select") || a.access_type.eq_ignore_ascii_case("all"))
+        a.is_allowed
+            && (a.access_type.eq_ignore_ascii_case(access_type)
+                || a.access_type.eq_ignore_ascii_case("all"))
     })
 }
 
@@ -793,7 +795,20 @@ fn column_resource_covers_table(p: &RangerPolicy) -> bool {
 
 /// Ranger access-policy evaluation for one table: does any enabled
 /// `policyType` 0 policy on this database and table grant `select` to the
-/// user, with no matching deny item?
+/// user, with no matching deny item? See `access_grants_table_type`.
+fn access_grants_table(
+    bundle: &ServicePolicies,
+    user: &SessionUser,
+    database: &str,
+    table: &str,
+) -> bool {
+    access_grants_table_type(bundle, user, database, table, "select")
+}
+
+/// Ranger access-policy evaluation for one table and one access type
+/// (`select`, `alter`, `drop`; `all` carries each): does any enabled
+/// `policyType` 0 policy on this database and table grant it to the user,
+/// with no matching deny item for it?
 ///
 /// Order follows the `hive` servicedef evaluator: a deny item that matches
 /// the user (and is not carved out by a `denyExceptions` item) decides
@@ -806,7 +821,13 @@ fn column_resource_covers_table(p: &RangerPolicy) -> bool {
 /// Deny items match with the last-namespace-component fallback (fail closed);
 /// allow items need the full dotted namespace, so an allow on `sales` does not
 /// grant `<root>.sales`.
-fn access_grants_table(bundle: &ServicePolicies, user: &SessionUser, database: &str, table: &str) -> bool {
+fn access_grants_table_type(
+    bundle: &ServicePolicies,
+    user: &SessionUser,
+    database: &str,
+    table: &str,
+    access_type: &str,
+) -> bool {
     let matching = |fallback: bool| {
         bundle
             .policies
@@ -817,9 +838,9 @@ fn access_grants_table(bundle: &ServicePolicies, user: &SessionUser, database: &
     };
 
     let applies = |items: &[AccessPolicyItem]| {
-        items
-            .iter()
-            .any(|i| item_grants_select(i) && item_matches(&i.users, &i.roles, &i.groups, user))
+        items.iter().any(|i| {
+            item_grants_access(i, access_type) && item_matches(&i.users, &i.roles, &i.groups, user)
+        })
     };
 
     for p in matching(true) {
@@ -1464,6 +1485,33 @@ impl PolicyStore for RangerStore {
             .insert(key, CachedPolicy(Arc::new(policy.clone())))
             .await;
         Ok(policy)
+    }
+
+    /// The same access-policy evaluation that gates a Hive-root SELECT
+    /// (`access_grants_table`), asked for the DDL access type instead of
+    /// `select`: deny items, exceptions, the full-namespace rule for allows
+    /// and the whole-table column rule all apply unchanged.
+    ///
+    /// Not tied to `hive_access_policies`. That flag decides whether a
+    /// missing `select` grant hides a table; this only ever adds DDL
+    /// authority beside admin and owner, so reading the access policies
+    /// whatever the flag says cannot take anything away. A bundle that will
+    /// not load is an error, which the caller treats as no grant.
+    async fn grants_table_privilege(
+        &self,
+        user: &SessionUser,
+        table_name: &str,
+        namespace: &str,
+        privilege: crate::TablePrivilege,
+    ) -> sqe_core::Result<bool> {
+        let bundle = self.cached_bundle().await?;
+        Ok(access_grants_table_type(
+            &bundle,
+            user,
+            &hive_database(namespace),
+            table_name,
+            privilege.access_type(),
+        ))
     }
 
     /// Resolve tag-based policies from the Ranger bundle for a given user and
@@ -2359,6 +2407,68 @@ mod tests {
     fn allow_exceptions_carve_a_user_out_of_a_role_grant() {
         assert!(!crate::plan_rewriter::policy_denies_all(&gated(&user("dan", &["admin"]), "anything", "glue.bi")));
         assert!(crate::plan_rewriter::policy_denies_all(&gated(&user("eve", &["admin"]), "anything", "glue.bi")));
+    }
+
+    /// DDL authority comes from the same access policies as `select`, asked
+    /// for `alter`/`drop`: `all` carries both, a `select`-only grant carries
+    /// neither, and a deny on `all` or an allow exception still wins.
+    #[tokio::test]
+    async fn ddl_privileges_come_from_the_access_policies() {
+        use crate::TablePrivilege::{Alter, Drop};
+        let ddl: ServicePolicies = serde_json::from_str(
+            r#"{"policies":[
+             {"id":1,"name":"ops-alter","policyType":0,"isEnabled":true,
+              "resources":{"database":{"values":["lake.sales"]},"table":{"values":["orders"]}},
+              "policyItems":[{"roles":["ops"],"accesses":[{"type":"alter","isAllowed":true}]}]},
+             {"id":2,"name":"owners-all","policyType":0,"isEnabled":true,
+              "resources":{"database":{"values":["lake.sales"]},"table":{"values":["*"]}},
+              "policyItems":[{"roles":["stewards"],"accesses":[{"type":"all","isAllowed":true}]}],
+              "allowExceptions":[{"users":["eve"],"accesses":[{"type":"all","isAllowed":true}]}]},
+             {"id":3,"name":"readers","policyType":0,"isEnabled":true,
+              "resources":{"database":{"values":["lake.sales"]},"table":{"values":["*"]}},
+              "policyItems":[{"groups":["public"],"accesses":[{"type":"select","isAllowed":true}]}]},
+             {"id":4,"name":"no-drop-locked","policyType":0,"isEnabled":true,
+              "resources":{"database":{"values":["lake.sales"]},"table":{"values":["locked"]}},
+              "denyPolicyItems":[{"roles":["stewards"],"accesses":[{"type":"drop","isAllowed":true}]}]}]}"#,
+        )
+        .unwrap();
+        let store = RangerStore::from_config(&RangerPolicyConfig::default()).unwrap();
+        store.bundle_cache.insert(BUNDLE_KEY, Arc::new(ddl)).await;
+        let can = |u: SessionUser, t: &'static str, p| {
+            let store = &store;
+            async move {
+                store
+                    .grants_table_privilege(&u, t, "lake.sales", p)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        assert!(can(user("olga", &["ops"]), "orders", Alter).await);
+        assert!(
+            !can(user("olga", &["ops"]), "orders", Drop).await,
+            "alter does not carry drop"
+        );
+        assert!(
+            can(user("sam", &["stewards"]), "orders", Drop).await,
+            "all carries drop"
+        );
+        assert!(
+            !can(user("eve", &["stewards"]), "orders", Drop).await,
+            "allow exception"
+        );
+        assert!(
+            !can(user("carol", &[]), "orders", Alter).await,
+            "select is not DDL"
+        );
+        assert!(
+            !can(user("sam", &["stewards"]), "locked", Drop).await,
+            "deny wins"
+        );
+        assert!(
+            can(user("sam", &["stewards"]), "locked", Alter).await,
+            "the deny names drop only"
+        );
     }
 
     #[test]
