@@ -76,6 +76,43 @@ pub const PRODUCTION_RULES: &[ProductionRule] = &[
             })
         },
     },
+    // The Trino HTTP listener, the Quack listener without `[coordinator.tls]`
+    // and MCP without TLS (or riding the web port) serve cleartext on every
+    // interface; user passwords and bearer tokens cross it. Allowed only when
+    // a TLS-terminating proxy is acknowledged in front.
+    ProductionRule {
+        name: "no-plaintext-client-listeners",
+        summary: "An enabled plaintext Trino HTTP, Quack or MCP listener on a non-loopback address is refused unless `security.allow_plaintext_behind_tls_proxy = true` acknowledges a TLS-terminating proxy in front (client credentials would cross it in cleartext).",
+        check: |c| {
+            if c.security.allow_plaintext_behind_tls_proxy {
+                return None;
+            }
+            let tls = c.coordinator.tls.is_enabled();
+            let mcp_plain = c.mcp.is_enabled()
+                && (c.mcp.port == 0
+                    || (!tls && c.mcp.bind_ip().is_ok_and(|ip| !ip.is_loopback())));
+            let listeners = [
+                ("coordinator.trino_http_port", c.coordinator.trino_http_port > 0),
+                ("coordinator.quack_port", c.coordinator.quack_port > 0 && !tls),
+                ("mcp", mcp_plain),
+            ];
+            let offenders: Vec<&str> = listeners
+                .iter()
+                .filter(|(_, plain)| *plain)
+                .map(|(name, _)| *name)
+                .collect();
+            (!offenders.is_empty()).then(|| {
+                format!(
+                    "production_mode: {} serve plaintext on a non-loopback address; \
+                     enable TLS (trino_https_port with trino_http_port = 0, \
+                     [coordinator.tls] for Quack and MCP) or set \
+                     security.allow_plaintext_behind_tls_proxy = true when a \
+                     TLS-terminating proxy fronts them",
+                    offenders.join(", ")
+                )
+            })
+        },
+    },
     // SEC-03: a config-held `client_credentials` grant hands one server-baked
     // service token to every connection, collapsing all users to a single
     // identity at Polaris/S3 and defeating per-user authorization. Two
@@ -133,6 +170,18 @@ pub const PRODUCTION_RULES: &[ProductionRule] = &[
         },
     },
     ProductionRule {
+        name: "no-unauthenticated-worker",
+        summary: "`worker.allow_unauthenticated` must be false (a worker without a secret accepts scan tickets and credential refreshes from any TCP-reachable client).",
+        check: |c| {
+            c.worker.allow_unauthenticated.then(|| {
+                "production_mode: worker.allow_unauthenticated must be false (a worker \
+                 without a secret accepts scan tickets and credential refreshes from any \
+                 TCP-reachable client, leaking user S3 credentials)"
+                    .to_string()
+            })
+        },
+    },
+    ProductionRule {
         name: "max-sql-bytes",
         summary: "`query.max_sql_bytes` must be > 0 (0 disables the pre-parse statement size cap).",
         check: |c| {
@@ -181,20 +230,26 @@ pub const PRODUCTION_RULES: &[ProductionRule] = &[
     },
     // Architecture review 212 (#565): the default engine enforces nothing.
     // Every other dev-only default is refused here or sits behind an
-    // `allow_*` flag; this one used to start silently.
+    // `allow_*` flag; this one used to start silently. `in_memory` is a test
+    // store that starts empty and is lost on restart, so it counts as none.
     ProductionRule {
         name: "policy-engine-configured",
-        summary: "`policy.engine = passthrough` is refused unless `security.allow_no_policy_engine = true` (no row filters, masks or column restrictions).",
+        summary: "`policy.engine = passthrough` or `in_memory` is refused unless `security.allow_no_policy_engine = true` (no row filters, masks or column restrictions).",
         check: |c| {
-            (c.policy.engine == PolicyEngine::Passthrough && !c.security.allow_no_policy_engine)
-                .then(|| {
-                    "production_mode: policy.engine is passthrough (no row filters, masks or \
-                     column restrictions; only catalog-level authorization applies). Set \
-                     policy.engine = \"ranger\" (or \"in_memory\" for tests), or set \
+            let engine = match c.policy.engine {
+                PolicyEngine::Passthrough => "passthrough",
+                PolicyEngine::InMemory => "in_memory",
+                PolicyEngine::Ranger => return None,
+            };
+            (!c.security.allow_no_policy_engine).then(|| {
+                format!(
+                    "production_mode: policy.engine is {engine} (no persistent row filters, \
+                     masks or column restrictions; only catalog-level authorization \
+                     applies). Set policy.engine = \"ranger\", or set \
                      security.allow_no_policy_engine = true to acknowledge running without \
                      a policy engine."
-                        .to_string()
-                })
+                )
+            })
         },
     },
     ProductionRule {

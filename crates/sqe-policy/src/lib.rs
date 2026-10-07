@@ -1,4 +1,5 @@
 pub mod grants;
+mod leakproof;
 pub mod mask_udf;
 pub mod plan_rewriter;
 pub mod policy_expr;
@@ -97,11 +98,68 @@ pub trait PolicyEnforcer: Send + Sync {
         None
     }
 
+    /// `scope` is the default catalog and schema the plan's table names were
+    /// resolved against. DataFusion keeps a scan's reference as written, so
+    /// without it `SELECT * FROM t` under `USE sales` is governed as
+    /// `default.t`, not `sales.t`.
     async fn evaluate(
         &self,
         user: &SessionUser,
+        scope: &TableScope,
         plan: LogicalPlan,
     ) -> sqe_core::Result<(LogicalPlan, PolicySummary)>;
+}
+
+/// The default catalog and schema a plan's partial table names resolve
+/// against. `TableScope::default()` (no scope) keeps a bare name in the
+/// `default` namespace, which is what every caller got before the scope
+/// existed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TableScope {
+    pub catalog: Option<String>,
+    pub schema: Option<String>,
+}
+
+impl TableScope {
+    /// The scope DataFusion itself resolves against for this session, read
+    /// from the context's own config so it cannot disagree with how the plan
+    /// was actually resolved.
+    pub fn of(ctx: &datafusion::prelude::SessionContext) -> Self {
+        let state = ctx.state_ref();
+        let state = state.read();
+        let c = &state.config().options().catalog;
+        Self {
+            catalog: Some(c.default_catalog.clone()),
+            schema: Some(c.default_schema.clone()),
+        }
+    }
+
+    /// `table` with its missing catalog / schema filled from the scope. A
+    /// reserved catalog (`system`, `datafusion`) is never filled in: it would
+    /// make a user table look like a reserved virtual one and skip its tag
+    /// lookup, and neither Iceberg policy keys nor Hive routing need it.
+    pub fn qualify(
+        &self,
+        table: &datafusion::common::TableReference,
+    ) -> datafusion::common::TableReference {
+        use datafusion::common::TableReference;
+        let catalog = self
+            .catalog
+            .as_deref()
+            .filter(|c| !c.eq_ignore_ascii_case("system") && !c.eq_ignore_ascii_case("datafusion"));
+        match table {
+            TableReference::Bare { table: t } => match (catalog, self.schema.as_deref()) {
+                (Some(c), Some(s)) => TableReference::full(c, s, t.as_ref()),
+                (None, Some(s)) => TableReference::partial(s, t.as_ref()),
+                _ => table.clone(),
+            },
+            TableReference::Partial { schema, table: t } => match catalog {
+                Some(c) => TableReference::full(c, schema.as_ref(), t.as_ref()),
+                None => table.clone(),
+            },
+            TableReference::Full { .. } => table.clone(),
+        }
+    }
 }
 
 /// No-op enforcer that returns the plan unchanged. Used when policy
@@ -121,6 +179,7 @@ impl PolicyEnforcer for PassthroughEnforcer {
     async fn evaluate(
         &self,
         _user: &SessionUser,
+        _scope: &TableScope,
         plan: LogicalPlan,
     ) -> sqe_core::Result<(LogicalPlan, PolicySummary)> {
         Ok((plan, PolicySummary::default()))
@@ -130,7 +189,9 @@ impl PolicyEnforcer for PassthroughEnforcer {
 /// The policy-store contract and its result types live in `sqe-policy-api`
 /// (build-time item C1) so `sqe-catalog` can depend on them without waiting
 /// for this crate to compile. Re-exported under the old paths.
-pub use sqe_policy_api::{MaskPolicyInfo, MaskType, PolicyStore, ResolvedPolicy, TagMaskSpec};
+pub use sqe_policy_api::{
+    MaskPolicyInfo, MaskType, PolicyStore, ResolvedPolicy, TablePrivilege, TagMaskSpec,
+};
 
 #[cfg(test)]
 mod tests {
@@ -163,7 +224,10 @@ mod tests {
         let plan = empty_plan();
         // We compare the debug representation since LogicalPlan doesn't implement PartialEq.
         let before = format!("{plan:?}");
-        let (result, summary) = enforcer.evaluate(&user, plan).await.unwrap();
+        let (result, summary) = enforcer
+            .evaluate(&user, &TableScope::default(), plan)
+            .await
+            .unwrap();
         let after = format!("{result:?}");
         assert_eq!(before, after);
         assert_eq!(summary, PolicySummary::default());
@@ -175,7 +239,10 @@ mod tests {
         let admin = make_user("admin", &["superuser", "admin", "data_owner"]);
         let plan = empty_plan();
         let before = format!("{plan:?}");
-        let (result, _summary) = enforcer.evaluate(&admin, plan).await.unwrap();
+        let (result, _summary) = enforcer
+            .evaluate(&admin, &TableScope::default(), plan)
+            .await
+            .unwrap();
         assert_eq!(before, format!("{result:?}"));
     }
 
@@ -185,7 +252,10 @@ mod tests {
         let guest = make_user("guest", &[]);
         let plan = empty_plan();
         let before = format!("{plan:?}");
-        let (result, _summary) = enforcer.evaluate(&guest, plan).await.unwrap();
+        let (result, _summary) = enforcer
+            .evaluate(&guest, &TableScope::default(), plan)
+            .await
+            .unwrap();
         assert_eq!(before, format!("{result:?}"));
     }
 

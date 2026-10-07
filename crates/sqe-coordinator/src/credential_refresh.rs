@@ -83,6 +83,9 @@ pub struct ActiveFragment {
     pub fragment_id: String,
     pub worker_url: String,
     pub credential_expiry: Option<DateTime<Utc>>,
+    /// Reloads the scanned table as the querying user for fresh vended
+    /// keys. `None` means the fragment cannot be refreshed.
+    pub reloader: Option<sqe_catalog::vended_credentials::TableReloader>,
 }
 
 /// Default buffer before credential expiry at which a refresh is triggered.
@@ -127,11 +130,25 @@ impl CredentialRefreshTracker {
         worker_url: String,
         credential_expiry: Option<DateTime<Utc>>,
     ) {
+        self.register_with_reloader(fragment_id, worker_url, credential_expiry, None)
+            .await;
+    }
+
+    /// [`Self::register`] plus the reloader [`reload_vended_credentials`]
+    /// uses to fetch the fragment's next set of vended keys.
+    pub async fn register_with_reloader(
+        &self,
+        fragment_id: String,
+        worker_url: String,
+        credential_expiry: Option<DateTime<Utc>>,
+        reloader: Option<sqe_catalog::vended_credentials::TableReloader>,
+    ) {
         let mut fragments = self.fragments.write().await;
         debug!(
             fragment_id = %fragment_id,
             worker_url = %worker_url,
             credential_expiry = ?credential_expiry,
+            refreshable = reloader.is_some(),
             "Registered active fragment for credential tracking"
         );
         fragments.insert(
@@ -140,6 +157,7 @@ impl CredentialRefreshTracker {
                 fragment_id,
                 worker_url,
                 credential_expiry,
+                reloader,
             },
         );
     }
@@ -413,6 +431,50 @@ where
     }
 
     success_count
+}
+
+/// The refresh callback the coordinator runs: reload the fragment's table
+/// from its catalog as the querying user (the catalog authorizes the call
+/// again) and take the newly vended keys from its FileIO.
+///
+/// `None` when the fragment has no reloader, the reload fails (revoked
+/// grant, expired user bearer, catalog down), or the catalog returned no
+/// complete vended set with an expiry. The worker then keeps its current
+/// keys and the scan fails if they lapse, which is the honest outcome:
+/// there is no static fallback on this path.
+pub async fn reload_vended_credentials(fragment: ActiveFragment) -> Option<RefreshableCredentials> {
+    let reloader = fragment.reloader.as_ref()?;
+    match reloader.reload().await {
+        Ok(table) => {
+            refreshable_from_props(&fragment.fragment_id, table.file_io().config().props())
+        }
+        Err(e) => {
+            warn!(
+                fragment_id = %fragment.fragment_id,
+                error = %e,
+                "Reloading the table for fresh vended credentials failed"
+            );
+            None
+        }
+    }
+}
+
+/// A complete vended S3 set (key, secret, session token, expiry) from
+/// FileIO properties as a refresh payload for `fragment_id`.
+fn refreshable_from_props(
+    fragment_id: &str,
+    props: &HashMap<String, String>,
+) -> Option<RefreshableCredentials> {
+    use sqe_catalog::vended_credentials as vc;
+    let get = |k: &str| props.get(k).filter(|v| !v.is_empty()).cloned();
+    let expiry = vc::credential_expiry(props)?;
+    Some(RefreshableCredentials {
+        fragment_id: fragment_id.to_string(),
+        access_key_id: get(vc::S3_ACCESS_KEY_ID)?,
+        secret_access_key: get(vc::S3_SECRET_ACCESS_KEY)?,
+        session_token: get(vc::S3_SESSION_TOKEN)?,
+        expiry: DateTime::<Utc>::from(expiry),
+    })
 }
 
 #[cfg(test)]
@@ -734,5 +796,101 @@ mod tests {
             needing2.is_empty(),
             "credential expiring outside buffer should not need refresh"
         );
+    }
+
+    fn table_with_props(props: &[(&str, &str)]) -> iceberg::table::Table {
+        let metadata: iceberg::spec::TableMetadata = serde_json::from_value(serde_json::json!({
+            "format-version": 1,
+            "table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
+            "location": "s3://bucket/ns/t",
+            "last-updated-ms": 1602638573874_i64,
+            "last-column-id": 1,
+            "schema": {"type": "struct", "fields": [
+                {"id": 1, "name": "x", "required": true, "type": "long"}]},
+            "partition-spec": [],
+            "properties": {},
+            "current-snapshot-id": -1,
+            "snapshots": []
+        }))
+        .unwrap();
+        let factory = Arc::new(iceberg::io::LocalFsStorageFactory);
+        let file_io = iceberg::io::FileIOBuilder::new(factory)
+            .with_props(props.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+            .build();
+        iceberg::table::Table::builder()
+            .runtime(iceberg::Runtime::current())
+            .metadata(metadata)
+            .identifier(iceberg::TableIdent::from_strs(["ns", "t"]).unwrap())
+            .file_io(file_io)
+            .disable_cache()
+            .build()
+            .unwrap()
+    }
+
+    fn fragment_with(
+        reloader: Option<sqe_catalog::vended_credentials::TableReloader>,
+    ) -> ActiveFragment {
+        ActiveFragment {
+            fragment_id: "frag-r".to_string(),
+            worker_url: "http://w1:50052".to_string(),
+            credential_expiry: Some(Utc::now()),
+            reloader,
+        }
+    }
+
+    /// The refresh stub is gone: a registered reloader is called and the
+    /// newly vended set (key, secret, token, expiry) becomes the payload.
+    #[tokio::test]
+    async fn refresh_reloads_the_table_and_ships_the_new_vended_set() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let reloader = sqe_catalog::vended_credentials::TableReloader::new(move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Ok(table_with_props(&[
+                    ("s3.access-key-id", "NEW"),
+                    ("s3.secret-access-key", "new-secret"),
+                    ("s3.session-token", "new-token"),
+                    ("s3.session-token-expires-at-ms", "4102444800000"),
+                ]))
+            })
+        });
+        let creds = reload_vended_credentials(fragment_with(Some(reloader)))
+            .await
+            .expect("fresh credentials");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(creds.fragment_id, "frag-r");
+        assert_eq!(creds.access_key_id, "NEW");
+        assert_eq!(creds.secret_access_key, "new-secret");
+        assert_eq!(creds.session_token, "new-token");
+        assert_eq!(creds.expiry.timestamp(), 4_102_444_800);
+    }
+
+    /// No reloader, a failed reload, or a reload without a complete vended
+    /// set never produces credentials (in particular never static ones).
+    #[tokio::test]
+    async fn refresh_without_a_complete_vended_set_yields_nothing() {
+        assert!(reload_vended_credentials(fragment_with(None))
+            .await
+            .is_none());
+
+        let failing = sqe_catalog::vended_credentials::TableReloader::new(|| {
+            Box::pin(async { Err(sqe_core::SqeError::Catalog("revoked".to_string())) })
+        });
+        assert!(reload_vended_credentials(fragment_with(Some(failing)))
+            .await
+            .is_none());
+
+        let static_only = sqe_catalog::vended_credentials::TableReloader::new(|| {
+            Box::pin(async {
+                Ok(table_with_props(&[
+                    ("s3.access-key-id", "STATIC"),
+                    ("s3.secret-access-key", "static-secret"),
+                ]))
+            })
+        });
+        assert!(reload_vended_credentials(fragment_with(Some(static_only)))
+            .await
+            .is_none());
     }
 }

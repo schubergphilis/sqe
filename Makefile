@@ -95,7 +95,7 @@ BENCH_ENV       = PROFILE=$(BENCH_PROFILE) BENCH_LOG_DIR=$(BENCH_LOG_DIR)
         ebook-pdf ebook-epub ebook-html \
         benchmark-charts test test-access-control test-access-control-spark \
         test-integration test-distributed test-integration-down \
-        audit audit-advisories deps-check metrics-layering-check \
+        audit audit-advisories deps-check lock-maintenance metrics-layering-check \
         audit-deny audit-licenses \
         benchmark_all benchmark_all_trino \
         clippy fmt fmt-check pre-commit clean clean-rust clean-rustbook \
@@ -312,13 +312,28 @@ deps-check:  ## Unused-dependency gate (cargo-machete)
 	@echo "==> cargo machete (unused dependencies)"
 	$(CARGO) machete --with-metadata crates/sqe-*
 
+# Replaces Renovate's lock-file maintenance, which is off in renovate.json:
+# Renovate rewrites Cargo.lock but never regenerates crates/workspace-hack,
+# so every one of its lock MRs failed aikido-rust-extra's
+# `cargo hakari generate --diff` drift check. Run this on a branch, then the
+# usual gate, then open an MR.
+lock-maintenance:  ## Refresh Cargo.lock within semver bounds and regenerate the workspace-hack
+	@command -v cargo-hakari >/dev/null 2>&1 || \
+		{ echo "cargo-hakari not found. Install with: cargo install cargo-hakari --locked"; exit 1; }
+	$(CARGO) update
+	$(CARGO) hakari generate
+	$(CARGO) hakari generate --diff
+	$(CARGO) metadata --locked --format-version 1 >/dev/null
+	@echo "==> Cargo.lock refreshed, workspace-hack in sync"
+
 metrics-layering-check:  ## Only runtime crates may link the full sqe-metrics crate
 	@bad=$$(grep -l 'path = "../sqe-metrics" }' crates/*/Cargo.toml | grep -vE 'sqe-(coordinator|server|worker|lineage)/'); \
 	if [ -n "$$bad" ]; then echo "full sqe-metrics linked by a library crate (use sqe-metrics-core):"; echo "$$bad"; exit 1; fi
 	@echo "==> metrics layering ok"
 
 check-advisory-ignores:  ## Every ignored advisory (deny.toml, .cargo/audit.toml, .grype.yaml) has an owner and an unexpired review date
-	@python3 scripts/check-advisory-ignores.py
+	@test -n "$(AIKIDO_SHARED_HOME)" || { echo "Set AIKIDO_SHARED_HOME to an Aikido checkout"; exit 1; }
+	@python3 "$(AIKIDO_SHARED_HOME)/scripts/check-advisory-ignores.py"
 
 dast:  ## DAST baseline: OWASP ZAP against a local sqe-server's HTTP listener (needs Docker; local gate)
 	@scripts/dast-baseline.sh

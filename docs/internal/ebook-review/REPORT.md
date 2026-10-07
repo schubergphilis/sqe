@@ -18,7 +18,7 @@ The risks are three, in order:
 
 1. **A live AWS account id still leaks in the published-docs tree.** The ebook chapter that
    the review snapshot flagged (ch16c) has already been sanitized, but the real id
-   `311141556126` plus live region/table names still sit in `docs/roadmap.md` and two
+   `123456789012` plus live region/table names still sit in `docs/roadmap.md` and two
    `docs/book/` pages. Publication blocker.
 2. **Two unfinished AI-Logbook placeholders** (ch07, ch10) and **one grammar-broken
    AI-Logbook block** (ch03 L602, damaged by a prior mechanical emdash-removal pass).
@@ -85,16 +85,16 @@ verified by repo-wide grep:
 
 | File:line | Leaked content |
 |---|---|
-| `docs/roadmap.md:60` | `live test against AWS account 311141556126 in eu-central-1` |
-| `docs/book/src/features/iceberg.md:58` | `live-verified (2026-05-05) against AWS account 311141556126 in eu-central-1 and eu-west-1` |
-| `docs/book/src/getting-started/catalogs.md:25, 244, 300` | account `311141556126`; ARN `arn:aws:s3tables:eu-west-1:311141556126:bucket/testtablebucket` |
+| `docs/roadmap.md:60` | `live test against AWS account 123456789012 in eu-central-1` |
+| `docs/book/src/features/iceberg.md:58` | `live-verified (2026-05-05) against AWS account 123456789012 in eu-central-1 and eu-west-1` |
+| `docs/book/src/getting-started/catalogs.md:25, 244, 300` | account `123456789012`; ARN `arn:aws:s3tables:eu-west-1:123456789012:bucket/testtablebucket` |
 
-**Problem:** `311141556126` is a real AWS account number. Coupled with the real region
+**Problem:** `123456789012` is a real AWS account number. Coupled with the real region
 (`eu-central-1`/`eu-west-1`), database (`iceberg_demo_analytics`), table
 (`iceberg_user_events`), and bucket (`testtablebucket`), it is a publication leak and a
 reconnaissance gift.
 
-**Fix:** Replace every occurrence of `311141556126` with the AWS docs placeholder
+**Fix:** Replace every occurrence of the real account id with the AWS docs placeholder
 `123456789012` (matching what ch16c, ch04 L426, ch06b L234 already use). Decide whether the
 live database/table/bucket names should also be genericized; at minimum sanitize the account
 id everywhere. Then re-run the book leak-scan so this class is caught next time (per the
@@ -408,7 +408,7 @@ Full table in `analytics.md`. Outliers worth acting on:
 
 Work straight down.
 
-1. **Sanitize the AWS account id `311141556126`** -> `123456789012` in `docs/roadmap.md:60`,
+1. **Sanitize the real AWS account id** -> `123456789012` in `docs/roadmap.md:60`,
    `docs/book/src/features/iceberg.md:58`, and `docs/book/src/getting-started/catalogs.md`
    (L25, L244, L300); decide on genericizing the live db/table/bucket names. Re-run the book
    leak-scan. (P0.1)

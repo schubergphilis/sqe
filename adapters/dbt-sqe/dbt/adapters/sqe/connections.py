@@ -38,6 +38,9 @@ class SQECredentials(Credentials):
     client_id: Optional[str] = None
     client_secret: Optional[str] = None
     token: Optional[str] = None
+    # Transport: TLS unless explicitly disabled (local plaintext stacks).
+    tls: bool = True
+    tls_root_certs: Optional[str] = None
 
     _ALIASES = {"catalog": "database"}
 
@@ -51,7 +54,7 @@ class SQECredentials(Credentials):
 
     def _connection_keys(self) -> Tuple[str, ...]:
         # Never expose password / client_secret / token in dbt debug output.
-        return ("host", "port", "database", "schema", "user", "method", "client_id")
+        return ("host", "port", "tls", "database", "schema", "user", "method", "client_id")
 
 
 # Leading `/* dbt query comment */` and `-- line` comments, then the first
@@ -107,13 +110,19 @@ class SQEConnectionManager(SQLConnectionManager):
 
         credentials = connection.credentials
 
-        uri = f"grpc://{credentials.host}:{credentials.port}"
+        uri = f"{credentials.host}:{credentials.port}"
         try:
             from adbc_driver_flightsql.dbapi import connect
 
-            from dbt.adapters.sqe.auth import flight_db_kwargs
+            from dbt.adapters.sqe.auth import flight_db_kwargs, flight_location
 
-            db_kwargs = flight_db_kwargs(
+            uri, tls_kwargs = flight_location(
+                credentials.host,
+                credentials.port,
+                tls=credentials.tls,
+                tls_root_certs=credentials.tls_root_certs,
+            )
+            db_kwargs = tls_kwargs | flight_db_kwargs(
                 user=credentials.user,
                 password=credentials.password,
                 method=credentials.method,

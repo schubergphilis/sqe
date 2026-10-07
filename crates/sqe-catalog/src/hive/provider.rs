@@ -46,7 +46,6 @@ use datafusion::datasource::file_format::file_compression_type::FileCompressionT
 use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
 use datafusion::datasource::{TableProvider, ViewTable};
 use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{
@@ -987,7 +986,11 @@ impl HiveTableProvider {
             .as_ref()
             .map(|p| p.enabled)
             .unwrap_or(false)
-            || self.index.is_some()
+            // A partition index lists partitions, so it says nothing about an
+            // unpartitioned table. The post-write refresh still persists one
+            // (with no entries) for those, and planning from it made every
+            // unpartitioned Hive CTAS/INSERT table read as empty.
+            || (self.index.is_some() && !self.partition_columns.is_empty())
     }
 
     fn planned_entries(&self, filters: &[Expr]) -> Result<Vec<PartitionIndexEntry>, HiveError> {
@@ -2048,7 +2051,7 @@ impl HiveSchemaProvider {
         // JSON arrow operator, so `filter(tags, (tag) -> ...)` planned `tag`
         // as a column and the view was hidden with "No field named tag"
         // while the same expression ran fine as a user statement.
-        let ctx = SessionContext::new_with_config_rt(
+        let ctx = crate::session_tuning::engine_context(
             crate::session_tuning::engine_session_config()
                 .with_default_catalog_and_schema(&self.catalog_name, &default_schema),
             Arc::clone(&self.runtime),
@@ -2080,7 +2083,7 @@ impl HiveSchemaProvider {
         // on. A body that needs both (a lambda and an UNNEST table factor)
         // is still out of reach; the error names the first attempt.
         let state = ctx.state();
-        let plan = match state.create_logical_plan(&sql).await {
+        let plan = match crate::file_tvf_prepare::create_logical_plan(&state, &sql).await {
             Ok(p) => p,
             Err(first) => {
                 let retry = match state
@@ -2459,6 +2462,7 @@ impl SchemaProvider for HiveSchemaProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::execution::context::SessionContext;
 
     /// Athena view bodies reference base tables as `t`, `db.t` or
     /// `awsdatacatalog.db.t`; policy keys on the catalog, so every scan must

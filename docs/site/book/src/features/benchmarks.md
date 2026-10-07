@@ -121,14 +121,12 @@ Files are split at 128 MB for parallelism. Output is structured as:
 `generate --sink iceberg` skips the staging Parquet step entirely. Instead of
 writing files to `--output` for a later `load` run, it connects straight to
 the Iceberg REST catalog, creates the tables, and commits data files with one
-`fast_append` per table. The sink works for every generator benchmark (TPC-H,
-TPC-DS, SSB, TPC-C, TPC-E, TPC-BB, ClickBench, and bank), not just the bank
-demo schema that introduced the sink.
+`fast_append` per table.
 
 ```bash
-cargo run -p sqe-bench -- generate tpch --scale 10 --sink iceberg \
+cargo run -p sqe-bench -- generate tpce --scale 10 --sink iceberg \
   --catalog-uri http://localhost:8181/api/catalog \
-  --warehouse bench --namespace tpch \
+  --warehouse bench --namespace tpce_sf10 \
   --client-id ... --client-secret ...
 ```
 
@@ -136,11 +134,30 @@ The command creates the namespace if it does not exist, then generates and
 commits each table in turn. Data is written in parallel shards for TPC-H and
 bank; the other generators write one shard per table.
 
-The sink buffers one full generation shard in memory before writing it, so
-peak memory scales with shard size: per-table for the serial generators, per
-`rows / --threads` for TPC-H and bank. At large scales, raise `--threads` to
-shrink each shard, or fall back to the parquet staging path (`generate` then
-`load`) if memory stays tight.
+The sink writes a table only the way `load` would. `load` partitions TPC-H
+`lineitem`/`orders` by month and the TPC-C tables by warehouse and district,
+and the sink creates those tables with the same partition spec. It splits rows
+by partition into one buffer per table, shared by every shard, and writes the
+largest partition out as a file whenever the buffer passes `--partition-buffer`
+(default `2g`). A larger buffer means fewer, bigger files: TPC-H SF10
+`lineitem` lands as 269 files with the default, against 415 from `load`. Peak
+memory is the buffer plus the files being written, about 3.5 GB for that run.
+
+`load` also sorts the SSB `lineorder` and TPC-DS fact tables by their date key
+on write. The sink never sorts. Instead those generators emit the rows already
+in date order: each order or return row is a pure function of its number, and
+a counting sort over the dates (4 bytes per order or return row, built before
+the first batch) fixes the emission order. TPC-DS inventory is generated week
+by week. A table `load` sorts whose generator does not declare that order is
+refused up front by name, since a table written differently prunes differently
+and its timings would not compare with a loaded baseline; `--ignore-layout`
+writes it anyway, with a warning. Every direct write carries the bloom filters
+the engine adds on its own (`_sk` integer columns). Bank has its own
+partitioned writer and is not affected.
+
+Generators stream batches into the writer, so peak memory follows `--threads`
+rather than table size (TPC-C SF10 generates in 167 MB, ClickBench SF10 in
+199 MB).
 
 Two flags control repeated runs against the same namespace:
 
@@ -161,6 +178,15 @@ Catalog and storage settings match the `load` command's `--s3-*` flags, plus
 the catalog's OAuth2 client-credentials pair (`--client-id`/`--client-secret`)
 or a pre-acquired `--bearer-token`. See `sqe-bench generate --help` for the
 full flag list.
+
+`scripts/benchmark-test.sh` uses the sink for every suite, then restarts the
+coordinator so it sees the tables committed behind its back. TPC-BB writes its
+own two tables into the TPC-DS namespace, after a direct TPC-DS load when the
+run has not loaded it already. A suite falls back to generate + `load` under
+`BENCH_DATA_SOURCE` other than `generate`, `BENCH_TABLE_FORMAT=hive`,
+`BENCH_BLOOM_FILTER` or `BENCH_PUFFIN_STATS`, which are `load` features.
+`BENCH_LOAD_MODE=load` forces generate + `load` for every suite, for an A/B
+against the direct path.
 
 ## Loading Data
 

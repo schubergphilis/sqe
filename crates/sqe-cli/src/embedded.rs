@@ -292,7 +292,7 @@ pub fn build_embedded_context_with_mask(
         .build_arc()
         .map_err(|e| anyhow::anyhow!("failed to build runtime env: {e}"))?;
 
-    let ctx = SessionContext::new_with_config_rt(session_config, runtime);
+    let ctx = sqe_catalog::engine_context(session_config, runtime);
 
     // V8: enable `SELECT * FROM 'file.parquet'` auto-detection. The wrapped
     // catalog list resolves quoted-string table names against
@@ -307,7 +307,8 @@ pub fn build_embedded_context_with_mask(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| Arc::new(s.as_bytes().to_vec()));
-    ctx.register_udf(sqe_policy::sha256_udf::sha256_udf(mask_key));
+    // Embedded mode applies no masks, so a keyed user-callable sha256 is safe.
+    ctx.register_udf(sqe_policy::sha256_udf::user_sha256_udf(mask_key));
 
     // Trino dialect compatibility — year(), month(), day_of_week(),
     // url_extract_*, etc. plus the extended set (regexp_extract,
@@ -923,7 +924,7 @@ impl SqlClient for EmbeddedClient {
         // inference over object storage) here, before DataFusion's
         // synchronous `call` asks for them.
         sqe_catalog::file_tvf_prepare::prepare_statement(&self.ctx, &rewritten).await?;
-        let df = self.ctx.sql(&rewritten).await?;
+        let df = sqe_catalog::file_tvf_prepare::plan_sql(&self.ctx, &rewritten).await?;
         // Snapshot the DataFrame schema before collecting so we still
         // emit column names when the query produces zero batches (an
         // optimizer collapse like `WHERE FALSE` yields an EmptyExec).

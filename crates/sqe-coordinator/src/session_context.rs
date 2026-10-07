@@ -199,7 +199,8 @@ pub async fn create_session_context(
     config: &SqeConfig,
     session: &Session,
     // Gates the per-session Hive providers' table visibility (#716). The
-    // Iceberg providers do not read it (#665).
+    // Iceberg providers do not read it (#665). Also governs the statistics
+    // `table_files` / `table_partitions` expose.
     policy_store: Option<&Arc<dyn PolicyStore>>,
     query_tracker: &Arc<QueryTracker>,
     runtime: Option<&Arc<RuntimeEnv>>,
@@ -209,21 +210,7 @@ pub async fn create_session_context(
     hive_manifest_cache: &Arc<sqe_catalog::hive::provider::HiveMetadataCache>,
     secrets: &sqe_core::SecretStore,
 ) -> sqe_core::Result<(SessionContext, Arc<SessionCatalog>)> {
-    // --- Cache key: username + token fingerprint + session catalog/schema ---
-    // Different tokens from the same user must not share a stale SessionCatalog.
-    // We key by username + first 16 hex chars of the SHA-256 of the access token.
-    // The session catalog/schema (X-Trino-Catalog / X-Trino-Schema) are part of
-    // the key: the same user+token opening two connections against different
-    // catalogs/schemas builds distinct DataFusion default-catalog contexts and
-    // must not collide in the cache.
-    let token_hash = hex::encode(Sha256::digest(session.access_token().expose_bytes()));
-    let cache_key = format!(
-        "{}:{}:{}:{}",
-        session.user.username,
-        &token_hash[..16],
-        session.default_catalog.as_deref().unwrap_or(""),
-        session.default_schema.as_deref().unwrap_or(""),
-    );
+    let cache_key = session_cache_key(session);
 
     // --- Atomic cache lookup / build via try_get_with ---
     // Eliminates the TOCTOU race where two concurrent requests for the same key
@@ -258,10 +245,11 @@ pub async fn create_session_context(
                 .into_iter()
                 .map(|(n, c)| (n, c.clone()))
                 .collect();
-            // Do not implicitly promote a Hive root here. Policy routing sees
-            // the catalog only on fully-qualified references, so making Hive
-            // the default would let two-part references take the Iceberg
-            // policy branch (see `attach_configured_hive_roots`).
+            // Do not implicitly promote a Hive root to the config default.
+            // A session may name one (`USE <root>.<db>`, handled below), and
+            // policy then qualifies its references from the session scope;
+            // the config default stays Iceberg (see
+            // `attach_configured_hive_roots`).
             let catalog_name = if flattened.is_empty() {
                 config
                     .query
@@ -303,9 +291,18 @@ pub async fn create_session_context(
                 .as_deref()
                 .filter(|c| !c.is_empty())
             {
-                // Already a static-config catalog: the loop below registers it;
-                // just point DataFusion's default at it.
-                Some(c) if config_catalog_names.contains(c) => c.to_string(),
+                // Already a static-config catalog, an ATTACHed catalog or a
+                // Hive root: registered below, so just point DataFusion's
+                // default at it. Without the last two, `USE <hive-root>.db`
+                // fell through to the config default and unqualified names
+                // silently read the same-named Iceberg table instead.
+                Some(c)
+                    if config_catalog_names.contains(c)
+                        || attached_providers.iter().any(|(n, _)| n == c)
+                        || hive_roots.iter().any(|(n, _)| n == c) =>
+                {
+                    c.to_string()
+                }
                 // Non-config catalog: try Polaris discovery with the caller's
                 // bearer. Register it only if Polaris resolves it for this
                 // principal; otherwise keep the config default.
@@ -368,7 +365,7 @@ pub async fn create_session_context(
             let ctx = if let Some(rt) = runtime {
                 // Use the shared coordinator runtime (memory pool per
                 // `coordinator.memory_pool`, spill-to-disk per config)
-                SessionContext::new_with_config_rt(session_config, Arc::clone(rt))
+                sqe_catalog::engine_context(session_config, Arc::clone(rt))
             } else {
                 // Fallback path (tests, one-shot helpers): greedy pool with
                 // spill disabled. Greedy matches the shared runtime default;
@@ -406,7 +403,7 @@ pub async fn create_session_context(
                         .map_err(|e| {
                             Arc::new(SqeError::Config(format!("Failed to create runtime env: {e}")))
                         })?;
-                    SessionContext::new_with_config_rt(session_config, rt)
+                    sqe_catalog::engine_context(session_config, rt)
                 } else {
                     // Unlimited-memory fallback (max_query_memory = 0; test /
                     // one-shot only). Build an explicit runtime so this path
@@ -421,7 +418,7 @@ pub async fn create_session_context(
                         .map_err(|e| {
                             Arc::new(SqeError::Config(format!("Failed to create runtime env: {e}")))
                         })?;
-                    SessionContext::new_with_config_rt(session_config, rt)
+                    sqe_catalog::engine_context(session_config, rt)
                 }
             };
 
@@ -514,6 +511,11 @@ pub async fn create_session_context(
             // (config catalogs + the session's own discovered catalog), not just
             // the default. (#5)
             let mut system_catalog_entries: Vec<sqe_catalog::SystemCatalogEntry> = Vec::new();
+            // Config catalogs that answered this caller's own bearer: the
+            // proof `tvf_caller_for` needs before it grants a catalog's
+            // `tvf_prefixes`. Naming a catalog is not access to it.
+            let mut catalogs_with_caller_access: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
 
             for (cat_name, cat_cfg) in &flattened {
                 let (catalog_provider, session_catalog) = build_catalog_provider(
@@ -529,6 +531,9 @@ pub async fn create_session_context(
                     true,
                 )
                 .await?;
+                if catalog_provider.listing_succeeded() && catalog_auth_is_per_user(cat_cfg) {
+                    catalogs_with_caller_access.insert(cat_name.clone());
+                }
                 ctx.register_catalog(cat_name, Arc::new(catalog_provider));
                 system_catalog_entries.push(sqe_catalog::SystemCatalogEntry {
                     name: cat_name.clone(),
@@ -599,6 +604,13 @@ pub async fn create_session_context(
                 config.catalog.warehouse.clone(),
                 coordinator_uri,
                 config.coordinator.worker_urls.clone(),
+            )
+            // Non-admin sessions see only their own queries/tasks; the
+            // admin check is the same `[auth] admin_roles` gate as
+            // `require_admin`.
+            .with_owner_filter(
+                (!config.auth.has_admin_role(&session.user.roles))
+                    .then(|| session.user.username.clone()),
             ));
             // Enumerate every reachable catalog (config catalogs + the session's
             // own discovered catalog) so `system.jdbc.*` / `system.metadata.*`
@@ -660,10 +672,7 @@ pub async fn create_session_context(
             // `DROP TABLE`, which every session sees because the snapshots
             // are shared; another process's DDL is visible after the TTL.
             for (name, root) in &hive_roots {
-                let hive_caller = sqe_core::config::TvfCaller::for_user(
-                    session.user.username.clone(),
-                    session.user.roles.clone(),
-                );
+                let hive_caller = crate::hive_ddl_handler::hive_session_caller(&session.user);
                 let hive_provider = sqe_catalog::mount::session_hive_catalog_from_source(
                     name,
                     root.source(),
@@ -705,17 +714,13 @@ pub async fn create_session_context(
                 ctx.register_catalog(name.clone(), hive_provider);
             }
 
-            // Register the sha256() scalar function for column masking.
-            // DataFusion does not ship a built-in sha256, we provide one via sqe-policy.
-            // When `coordinator.policy.mask_key` is set the UDF runs as
-            // HMAC-SHA256 with that key, blocking offline rainbow-table
-            // attacks against low-entropy masked columns (issue #37).
-            let mask_key = if config.policy.mask_key.is_empty() {
-                None
-            } else {
-                Some(std::sync::Arc::new(config.policy.mask_key.as_bytes().to_vec()))
-            };
-            ctx.register_udf(sqe_policy::sha256_udf::sha256_udf(mask_key));
+            // Register the user-callable sha256() scalar function (plain,
+            // unkeyed). DataFusion does not ship a built-in sha256. HASH masks
+            // use a separate keyed function (`coordinator.policy.mask_key`,
+            // issue #37) that the policy rewriter embeds in the plan and that
+            // is deliberately NOT registered: if users could call it they
+            // could hash candidate values and match masked output.
+            ctx.register_udf(sqe_policy::sha256_udf::user_sha256_udf(None));
 
             // Register session-context UDFs: current_user(), is_role_in_session(),
             // current_available_roles(), current_database(), current_schema().
@@ -765,9 +770,14 @@ pub async fn create_session_context(
             // (with `{user}` substitution) or the caller holds a role in
             // `object_store_admin_roles`. Calls carrying complete inline
             // credentials bypass the gate (the engine key is not used).
-            let tvf_caller = sqe_core::config::TvfCaller::for_user(
-                session.user.username.clone(),
-                session.user.roles.clone(),
+            // Scoped to the session's resolved catalog, so that catalog's
+            // `tvf_prefixes` apply and every other catalog's do not, and only
+            // when the catalog answered this caller's own bearer.
+            let tvf_caller = tvf_caller_for(
+                session,
+                &flattened,
+                &default_catalog,
+                catalogs_with_caller_access.contains(&default_catalog),
             );
             // Registered through `FileTableFunctions::register`, not
             // `ctx.register_udtf`: the file readers build their provider on
@@ -843,17 +853,53 @@ pub async fn create_session_context(
                     Arc::clone(&effective_session_catalog),
                 )),
             );
+            // table_files / table_partitions expose per-column bounds, counts
+            // and partition values: withhold the ones the caller's policy on
+            // the target governs (masks, restrictions, row filters).
+            let metadata_policy = policy_store.map(|store| {
+                let store = Arc::clone(store);
+                let user = session.user.clone();
+                let precedence = config.policy.mask_precedence;
+                sqe_catalog::iceberg_metadata_tvf::MetadataPolicy::new(
+                    move |namespace,
+                          table,
+                          col_tags|
+                          -> futures::future::BoxFuture<
+                        'static,
+                        sqe_policy::ResolvedPolicy,
+                    > {
+                        let (store, user) = (Arc::clone(&store), user.clone());
+                        Box::pin(async move {
+                            sqe_policy::plan_rewriter::resolve_effective_policy(
+                                store.as_ref(),
+                                &user,
+                                &table,
+                                &namespace,
+                                &col_tags,
+                                precedence,
+                            )
+                            .await
+                        })
+                    },
+                )
+            });
             ctx.register_udtf(
                 "table_files",
-                Arc::new(sqe_catalog::iceberg_metadata_tvf::TableFilesFunction::new(
-                    Arc::clone(&effective_session_catalog),
-                )),
+                Arc::new(
+                    sqe_catalog::iceberg_metadata_tvf::TableFilesFunction::new(Arc::clone(
+                        &effective_session_catalog,
+                    ))
+                    .with_policy(metadata_policy.clone()),
+                ),
             );
             ctx.register_udtf(
                 "table_partitions",
-                Arc::new(sqe_catalog::iceberg_metadata_tvf::TablePartitionsFunction::new(
-                    Arc::clone(&effective_session_catalog),
-                )),
+                Arc::new(
+                    sqe_catalog::iceberg_metadata_tvf::TablePartitionsFunction::new(Arc::clone(
+                        &effective_session_catalog,
+                    ))
+                    .with_policy(metadata_policy),
+                ),
             );
             ctx.register_udtf(
                 "table_refs",
@@ -924,10 +970,7 @@ pub(crate) fn discovery_template(config: &SqeConfig) -> Option<sqe_core::config:
         // Static / ClientCredentials / Aws template would hand the caller
         // the engine's identity on any warehouse they can spell.
         .filter(|c| {
-            let per_user = matches!(
-                c.auth,
-                None | Some(sqe_core::config::CatalogAuthConfig::SessionBearer)
-            );
+            let per_user = catalog_auth_is_per_user(c);
             if !per_user {
                 debug!(
                     catalog_url = %c.catalog_url,
@@ -936,6 +979,49 @@ pub(crate) fn discovery_template(config: &SqeConfig) -> Option<sqe_core::config:
             }
             per_user
         })
+        // The template's TVF prefixes belong to the template catalog, not to
+        // a warehouse the caller named.
+        .map(|mut c| {
+            c.tvf_prefixes.clear();
+            c
+        })
+}
+
+/// `true` when `cat` reaches the catalog with each caller's own bearer, so a
+/// successful call proves that caller's access. Engine-held auth (static
+/// token, client credentials, AWS) and non-REST backends answer every
+/// caller alike and prove nothing.
+fn catalog_auth_is_per_user(cat: &sqe_core::config::CatalogConfig) -> bool {
+    matches!(cat.backend, sqe_core::config::CatalogBackend::Rest)
+        && matches!(
+            cat.auth,
+            None | Some(sqe_core::config::CatalogAuthConfig::SessionBearer)
+        )
+}
+
+/// The file-TVF caller for `session`, scoped to `default_catalog` (the
+/// catalog the session resolved to). That catalog's `[catalogs.<name>]
+/// tvf_prefixes` join the global list only when `caller_has_access`: the
+/// catalog answered this caller's own bearer during the session build. A
+/// session can name any catalog (`X-Trino-Catalog`, `USE`), so the name
+/// alone must not open another workspace's buckets. A catalog not in config
+/// (a discovered warehouse) adds none.
+fn tvf_caller_for(
+    session: &Session,
+    flattened: &[(String, sqe_core::config::CatalogConfig)],
+    default_catalog: &str,
+    caller_has_access: bool,
+) -> sqe_core::config::TvfCaller {
+    let prefixes = flattened
+        .iter()
+        .find(|(name, _)| caller_has_access && name == default_catalog)
+        .map(|(_, c)| c.tvf_prefixes.as_slice())
+        .unwrap_or_default();
+    sqe_core::config::TvfCaller::for_user(
+        session.user.username.clone(),
+        session.user.roles.clone(),
+    )
+    .with_catalog_scope(default_catalog, prefixes)
 }
 
 /// Attempt to resolve `warehouse` as a Polaris catalog and build its
@@ -1135,6 +1221,46 @@ pub async fn invalidate_all_session_caches() {
     debug!("All SessionContext caches invalidated");
 }
 
+/// Cache key: username + token fingerprint + identity digest + session
+/// catalog/schema.
+///
+/// Different tokens from the same user must not share a stale SessionCatalog,
+/// so the key carries the first 16 hex chars of the SHA-256 of the access
+/// token. Tokenless identities (API keys) share one username and an empty
+/// token, yet the cached context captures the caller's roles (TVF caller,
+/// Hive visibility, system.runtime scope), so the key also carries a digest
+/// of subject + sorted roles + sorted groups. The session catalog/schema
+/// (X-Trino-Catalog / X-Trino-Schema) are part of the key: the same
+/// user+token opening two connections against different catalogs/schemas
+/// builds distinct DataFusion default-catalog contexts and must not collide.
+fn session_cache_key(session: &Session) -> String {
+    let token_hash = hex::encode(Sha256::digest(session.access_token().expose_bytes()));
+    let mut roles = session.user.roles.clone();
+    roles.sort();
+    let mut groups = session.user.groups.clone();
+    groups.sort();
+    // Length-prefix every part so no two identities serialise the same.
+    let mut identity = Sha256::new();
+    for part in std::iter::once(session.user.subject.as_deref().unwrap_or(""))
+        .chain(std::iter::once("\0roles"))
+        .chain(roles.iter().map(String::as_str))
+        .chain(std::iter::once("\0groups"))
+        .chain(groups.iter().map(String::as_str))
+    {
+        identity.update((part.len() as u64).to_le_bytes());
+        identity.update(part.as_bytes());
+    }
+    let identity_hash = hex::encode(identity.finalize());
+    format!(
+        "{}:{}:{}:{}:{}",
+        session.user.username,
+        &token_hash[..16],
+        &identity_hash[..16],
+        session.default_catalog.as_deref().unwrap_or(""),
+        session.default_schema.as_deref().unwrap_or(""),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1197,6 +1323,194 @@ s3_path_style = true
             token: "engine-token".to_string(),
         });
         assert!(discovery_template(&config).is_none());
+    }
+
+    fn two_workspace_config() -> SqeConfig {
+        let toml_text = r#"
+[coordinator]
+flight_sql_port = 0
+trino_http_port = 0
+
+[auth]
+token_endpoint = "http://127.0.0.1:9/unused"
+client_id = "test_client"
+
+[catalog]
+
+[catalogs.ws_a]
+catalog_url = "https://polaris.example.com"
+warehouse = "ws_a"
+tvf_prefixes = ["s3://ws-a-landing/"]
+
+[catalogs.ws_b]
+catalog_url = "https://polaris.example.com"
+warehouse = "ws_b"
+tvf_prefixes = ["s3://ws-b-landing/"]
+
+[storage]
+s3_endpoint = "http://127.0.0.1:9"
+s3_access_key = "_"
+s3_secret_key = "_"
+s3_region = "us-east-1"
+s3_path_style = true
+
+[storage.tvf]
+allowed_object_store_prefixes = ["s3://shared-landing/"]
+"#;
+        toml::from_str::<SqeConfig>(toml_text).expect("test config parses")
+    }
+
+    fn alice() -> Session {
+        Session::new(
+            "alice".to_string(),
+            sqe_core::SecretString::new("token".to_string()),
+            None,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            vec![],
+        )
+    }
+
+    /// Two tokenless identities with the same username but different
+    /// roles/groups/subject must not share a cached SessionContext.
+    #[test]
+    fn cache_key_separates_same_user_with_different_identity() {
+        let api_key = |roles: Vec<String>| {
+            Session::new(
+                "api-key-user".to_string(),
+                sqe_core::SecretString::new(String::new()),
+                None,
+                chrono::Utc::now() + chrono::Duration::hours(1),
+                roles,
+            )
+        };
+        let reader = api_key(vec!["reader".to_string()]);
+        let admin = api_key(vec!["service_admin".to_string()]);
+        assert_ne!(session_cache_key(&reader), session_cache_key(&admin));
+
+        let mut grouped = api_key(vec!["reader".to_string()]);
+        grouped.user.groups = vec!["finance".to_string()];
+        assert_ne!(session_cache_key(&reader), session_cache_key(&grouped));
+
+        let mut other_subject = api_key(vec!["reader".to_string()]);
+        other_subject.user.subject = Some("key-2".to_string());
+        assert_ne!(session_cache_key(&reader), session_cache_key(&other_subject));
+
+        // Role order does not matter.
+        let ab = api_key(vec!["a".to_string(), "b".to_string()]);
+        let ba = api_key(vec!["b".to_string(), "a".to_string()]);
+        assert_eq!(session_cache_key(&ab), session_cache_key(&ba));
+    }
+
+    /// The caller is scoped to the session's resolved catalog: catalog A's
+    /// `tvf_prefixes` hold in A, not in B; the global list holds in both; a
+    /// catalog not in config (a discovered warehouse) adds nothing.
+    #[test]
+    fn tvf_caller_carries_only_the_session_catalogs_prefixes() {
+        let config = two_workspace_config();
+        let flattened: Vec<(String, sqe_core::config::CatalogConfig)> = config
+            .flattened_catalogs()
+            .into_iter()
+            .map(|(n, c)| (n, c.clone()))
+            .collect();
+        let policy = &config.storage.tvf;
+        let a_file = "s3://ws-a-landing/2026/x.parquet";
+
+        let in_a = tvf_caller_for(&alice(), &flattened, "ws_a", true);
+        policy.check_path(a_file, &in_a, false).expect("A's prefix in A");
+
+        let in_b = tvf_caller_for(&alice(), &flattened, "ws_b", true);
+        let err = policy.check_path(a_file, &in_b, false).unwrap_err();
+        assert!(err.contains("scoped to catalog 'ws_b'"), "{err}");
+        policy
+            .check_path("s3://ws-b-landing/x.parquet", &in_b, false)
+            .expect("B's prefix in B");
+
+        let discovered = tvf_caller_for(&alice(), &flattened, "polaris_wh", true);
+        assert!(discovered.catalog_prefixes.is_empty());
+        assert!(policy.check_path(a_file, &discovered, false).is_err());
+        for c in [&in_a, &in_b, &discovered] {
+            policy
+                .check_path("s3://shared-landing/x.csv", c, false)
+                .expect("global prefix holds everywhere");
+        }
+    }
+
+    /// Naming a catalog is not access to it: a caller in workspace B who sets
+    /// `X-Trino-Catalog: ws_a` (or `USE ws_a`) is scoped to ws_a by name,
+    /// but ws_a did not answer their bearer, so its prefixes stay closed.
+    #[test]
+    fn tvf_prefixes_need_proven_access_not_just_the_catalog_name() {
+        let config = two_workspace_config();
+        let flattened: Vec<(String, sqe_core::config::CatalogConfig)> = config
+            .flattened_catalogs()
+            .into_iter()
+            .map(|(n, c)| (n, c.clone()))
+            .collect();
+        let named_only = tvf_caller_for(&alice(), &flattened, "ws_a", false);
+        assert!(named_only.catalog_prefixes.is_empty());
+        assert!(config
+            .storage
+            .tvf
+            .check_path("s3://ws-a-landing/x.parquet", &named_only, false)
+            .is_err());
+    }
+
+    /// Only a per-user bearer proves access; engine-held catalog auth answers
+    /// every caller alike.
+    #[test]
+    fn catalog_access_proof_requires_per_user_auth() {
+        let mut cat = test_config_rest().catalog;
+        assert!(catalog_auth_is_per_user(&cat));
+        cat.auth = Some(sqe_core::config::CatalogAuthConfig::SessionBearer);
+        assert!(catalog_auth_is_per_user(&cat));
+        cat.auth = Some(sqe_core::config::CatalogAuthConfig::Static {
+            token: "engine-token".to_string(),
+        });
+        assert!(!catalog_auth_is_per_user(&cat));
+    }
+
+    /// End to end through `read_parquet`: a query in a session scoped to
+    /// catalog B is refused catalog A's bucket at planning, before any I/O.
+    #[tokio::test]
+    async fn read_parquet_in_catalog_b_rejects_catalog_a_prefix() {
+        use sqe_catalog::file_tvf_prepare::FileTableFunctions;
+
+        let config = two_workspace_config();
+        let flattened: Vec<(String, sqe_core::config::CatalogConfig)> = config
+            .flattened_catalogs()
+            .into_iter()
+            .map(|(n, c)| (n, c.clone()))
+            .collect();
+        let ctx = SessionContext::new();
+        FileTableFunctions::register(
+            &ctx,
+            "read_parquet",
+            Arc::new(sqe_catalog::read_parquet::ReadParquetFunction::with_caller(
+                config.storage.clone(),
+                tvf_caller_for(&alice(), &flattened, "ws_b", true),
+            )),
+        );
+        let err = sqe_catalog::file_tvf_prepare::prepare_statement(
+            &ctx,
+            "SELECT * FROM read_parquet('s3://ws-a-landing/2026/x.parquet')",
+        )
+        .await
+        .expect_err("catalog A's prefix must not open in catalog B");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("denied") && msg.contains("scoped to catalog 'ws_b'"),
+            "{msg}"
+        );
+    }
+
+    /// The discovery template must not hand its catalog's TVF prefixes to a
+    /// warehouse the caller named.
+    #[test]
+    fn discovery_template_drops_tvf_prefixes() {
+        let mut config = test_config_rest();
+        config.catalog.tvf_prefixes = vec!["s3://template-landing/".to_string()];
+        let tmpl = discovery_template(&config).expect("REST template");
+        assert!(tmpl.tvf_prefixes.is_empty());
     }
 
     /// Issue #240: the session-context cache must hold well beyond the old cap
@@ -1337,7 +1651,7 @@ s3_path_style = true
         let mut ctx = SessionContext::new_with_config(cfg);
 
         // Mirror the coordinator's registration set (see the builder above).
-        ctx.register_udf(sqe_policy::sha256_udf::sha256_udf(None));
+        ctx.register_udf(sqe_policy::sha256_udf::user_sha256_udf(None));
         let identity = std::sync::Arc::new(sqe_policy::session_udf::SessionIdentity {
             username: "alice".into(),
             roles: vec!["analyst".into()],

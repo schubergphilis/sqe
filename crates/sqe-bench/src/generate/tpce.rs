@@ -43,17 +43,11 @@ fn seed_salt() -> u64 {
 // Dimension-table cardinality floor
 // ---------------------------------------------------------------------------
 //
-// Several TPC-E reference dimensions scale with SF at very low rates:
-// customer_account (5×SF), broker (10×SF), company (5×SF), security (6.85×SF).
-// At SF < 0.2 the raw formulas collapse each to a single row, which makes
-// every composite foreign-key join between fact tables degenerate into a
-// cross product. The canonical example is `trade × holding × holding_summary`
-// in `trade_result.sql`: at SF0.1 the query produced ~270M rows against
-// 1728 input trades because (ca_id, s_symb) had one value on every side.
-//
-// `DIM_MIN` floors both the dimension-table row count and the matching FK
-// sampling range used by consumer tables. The floor keeps small-scale runs
-// relationally meaningful without changing behaviour at SF ≥ 2.
+// broker scales at 10×SF, so at SF < 1 it collapses toward a single row and
+// every FK join on it degenerates into a cross product. `DIM_MIN` floors both
+// a dimension's row count and the matching FK sampling range used by
+// consumer tables. The account / company / security ratios (below) only hit
+// the floor at SF < 0.02.
 
 const DIM_MIN: usize = 10;
 
@@ -65,6 +59,36 @@ fn dim_card_usize(scale: f64, base: f64) -> usize {
 /// Same as [`dim_card_usize`] but typed for `rng.random_range(1..=n)` callers.
 fn dim_card_i64(scale: f64, base: f64) -> i64 {
     dim_card_usize(scale, base) as i64
+}
+
+// TPC-E cardinalities for SF1 = 1,000 customers: 5 accounts per customer,
+// 500 companies, 685 securities. These were 5 / 5 / 6.85 (per-1,000 ratios
+// read as per-SF), so at SF1 every fact table's FKs collapsed onto 10
+// accounts x 10 symbols and trade_result's holding joins fanned 3.5K trades
+// out to 22M rows.
+fn account_count(scale: f64) -> usize {
+    dim_card_usize(scale, 5_000.0)
+}
+fn company_count(scale: f64) -> usize {
+    dim_card_usize(scale, 500.0)
+}
+fn security_count(scale: f64) -> usize {
+    dim_card_usize(scale, 685.0)
+}
+
+/// The `i`-th holding_summary `(hs_ca_id, symbol index)` pair. Account
+/// `i % accounts + 1` holds its `i / accounts`-th symbol, offset per account,
+/// so pairs are unique (the table's primary key) while `i / accounts <
+/// securities`. holding lots and trades draw an index into this pool, so
+/// their `(ca_id, symb)` joins find their summary instead of a random pair.
+fn holding_pair(i: usize, accounts: usize, securities: usize) -> (i64, usize) {
+    let ca = i % accounts;
+    ((ca + 1) as i64, (i / accounts + ca * 31) % securities)
+}
+
+/// Rows in holding_summary, the pool [`holding_pair`] indexes.
+fn holding_summary_rows(scale: f64) -> usize {
+    super::scaled(scale, 5_000.0).max(1)
 }
 
 // ---------------------------------------------------------------------------
@@ -1005,9 +1029,9 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_customer_account(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    // SF × 5 (floored to DIM_MIN — see DIM_MIN comment near top of file)
+    // SF × 5,000 (see account_count)
     let schema = customer_account_schema();
-    let total = dim_card_usize(scale, 5.0);
+    let total = account_count(scale);
     let num_customers = (scale * 1_000.0).max(1.0) as i64;
     let num_brokers = dim_card_i64(scale, 10.0);
     let mut rng = StdRng::seed_from_u64(seed_for_table("customer_account"));
@@ -1099,7 +1123,7 @@ fn generate_account_permission(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = account_permission_schema();
     let total = super::scaled(scale, 5_000.0);
     let total = total.max(1);
-    let num_accounts = dim_card_i64(scale, 5.0);
+    let num_accounts = account_count(scale) as i64;
     let mut rng = StdRng::seed_from_u64(seed_for_table("account_permission"));
     let mut batches = Vec::new();
     let mut offset = 0usize;
@@ -1201,9 +1225,9 @@ fn generate_broker(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_company(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    // SF × 5 (floored to DIM_MIN — see DIM_MIN comment near top of file)
+    // SF × 500 (see company_count)
     let schema = company_schema();
-    let total = dim_card_usize(scale, 5.0);
+    let total = company_count(scale);
     let num_addr = (scale * 5_500.0).max(1.0) as i64;
     let mut rng = StdRng::seed_from_u64(seed_for_table("company"));
     let mut batches = Vec::new();
@@ -1281,7 +1305,7 @@ fn generate_company_competitor(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = company_competitor_schema();
     let total = super::scaled(scale, 15.0);
     let total = total.max(1);
-    let num_co = dim_card_i64(scale, 5.0);
+    let num_co = company_count(scale) as i64;
     let mut rng = StdRng::seed_from_u64(seed_for_table("company_competitor"));
     let mut batches = Vec::new();
     let mut offset = 0usize;
@@ -1318,10 +1342,10 @@ fn generate_company_competitor(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_security(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    // SF × 6.85 (floored to DIM_MIN — see DIM_MIN comment near top of file)
+    // SF × 685 (see security_count)
     let schema = security_schema();
-    let total = dim_card_usize(scale, 6.85);
-    let num_co = dim_card_i64(scale, 5.0);
+    let total = security_count(scale);
+    let num_co = company_count(scale) as i64;
     let mut rng = StdRng::seed_from_u64(seed_for_table("security"));
     let mut batches = Vec::new();
     let mut offset = 0usize;
@@ -1427,7 +1451,7 @@ fn generate_daily_market(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = daily_market_schema();
     let total = super::scaled(scale, 17_136.0);
     let total = total.max(1);
-    let num_symb = dim_card_usize(scale, 6.85);
+    let num_symb = security_count(scale);
     let mut rng = StdRng::seed_from_u64(seed_for_table("daily_market"));
     let mut batches = Vec::new();
     let mut offset = 0usize;
@@ -1481,7 +1505,7 @@ fn generate_financial(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = financial_schema();
     let total = super::scaled(scale, 100.0);
     let total = total.max(1);
-    let num_co = dim_card_i64(scale, 5.0);
+    let num_co = company_count(scale) as i64;
     let mut rng = StdRng::seed_from_u64(seed_for_table("financial"));
     let mut batches = Vec::new();
     let mut offset = 0usize;
@@ -1551,10 +1575,9 @@ fn generate_financial(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 }
 
 fn generate_last_trade(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
-    // SF × 6.85 — one row per security (floored to DIM_MIN so it matches
-    // the security table after the dim-cardinality floor is applied).
+    // One row per security (see security_count).
     let schema = last_trade_schema();
-    let total = dim_card_usize(scale, 6.85);
+    let total = security_count(scale);
     let mut rng = StdRng::seed_from_u64(seed_for_table("last_trade"));
     let mut batches = Vec::new();
     let mut offset = 0usize;
@@ -1666,7 +1689,7 @@ fn generate_news_xref(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let total = super::scaled(scale, 100.0);
     let total = total.max(1);
     let num_news = (scale * 100.0).max(1.0) as i64;
-    let num_co = dim_card_i64(scale, 5.0);
+    let num_co = company_count(scale) as i64;
     let mut rng = StdRng::seed_from_u64(seed_for_table("news_xref"));
     let mut batches = Vec::new();
     let mut offset = 0usize;
@@ -1702,8 +1725,9 @@ fn generate_trade(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = trade_schema();
     let total = super::scaled(scale, 17_280.0);
     let total = total.max(1);
-    let num_symb = dim_card_usize(scale, 6.85);
-    let num_accounts = dim_card_i64(scale, 5.0);
+    let accounts = account_count(scale);
+    let securities = security_count(scale);
+    let pairs = holding_summary_rows(scale);
     let mut rng = StdRng::seed_from_u64(seed_for_table("trade"));
     let mut batches = Vec::new();
     let mut offset = 0usize;
@@ -1739,10 +1763,13 @@ fn generate_trade(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             );
             t_tt_id.push(TRADE_TYPES[tt_idx].0.to_string());
             t_is_cash.push(rng.random_range(0..=1i32));
-            t_s_symb.push(symb_for_idx(rng.random_range(0..num_symb)));
+            // A trade is on a position the account holds (TPC-E trades
+            // move holdings), so its (ca_id, symb) is a holding_summary pair.
+            let (ca, symb) = holding_pair(rng.random_range(0..pairs), accounts, securities);
+            t_s_symb.push(symb_for_idx(symb));
             t_qty.push(rng.random_range(1..10000i32));
             t_bid_price.push(price);
-            t_ca_id.push(rng.random_range(1..=num_accounts));
+            t_ca_id.push(ca);
             t_exec_name.push(format!(
                 "{} {}",
                 random_name(&mut rng),
@@ -1839,7 +1866,7 @@ fn generate_trade_request(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let schema = trade_request_schema();
     let total = super::scaled(scale, 100.0);
     let total = total.max(1);
-    let num_symb = dim_card_usize(scale, 6.85);
+    let num_symb = security_count(scale);
     let num_brokers = dim_card_i64(scale, 10.0);
     let num_trades = (scale * 17_280.0).max(1.0) as i64;
     let mut rng = StdRng::seed_from_u64(seed_for_table("trade_request"));
@@ -1985,8 +2012,9 @@ fn generate_holding(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let total = super::scaled(scale, 12_500.0);
     let total = total.max(1);
     let num_trades = (scale * 17_280.0).max(1.0) as i64;
-    let num_accounts = dim_card_i64(scale, 5.0);
-    let num_symb = dim_card_usize(scale, 6.85);
+    let accounts = account_count(scale);
+    let securities = security_count(scale);
+    let pairs = holding_summary_rows(scale);
     let mut rng = StdRng::seed_from_u64(seed_for_table("holding"));
     let mut batches = Vec::new();
     let mut offset = 0usize;
@@ -2002,8 +2030,9 @@ fn generate_holding(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
         for _ in 0..n {
             h_t_id.push(rng.random_range(1..=num_trades));
-            h_ca_id.push(rng.random_range(1..=num_accounts));
-            h_s_symb.push(symb_for_idx(rng.random_range(0..num_symb)));
+            let (ca, symb) = holding_pair(rng.random_range(0..pairs), accounts, securities);
+            h_ca_id.push(ca);
+            h_s_symb.push(symb_for_idx(symb));
             h_dts.push(random_date(&mut rng));
             h_price.push((rng.random_range(100..50000u32) as f64) / 100.0);
             h_qty.push(rng.random_range(1..10000i32));
@@ -2078,10 +2107,9 @@ fn generate_holding_history(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 fn generate_holding_summary(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // SF × 5,000
     let schema = holding_summary_schema();
-    let total = super::scaled(scale, 5_000.0);
-    let total = total.max(1);
-    let num_accounts = dim_card_i64(scale, 5.0);
-    let num_symb = dim_card_usize(scale, 6.85);
+    let total = holding_summary_rows(scale);
+    let accounts = account_count(scale);
+    let securities = security_count(scale);
     let mut rng = StdRng::seed_from_u64(seed_for_table("holding_summary"));
     let mut batches = Vec::new();
     let mut offset = 0usize;
@@ -2092,9 +2120,10 @@ fn generate_holding_summary(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let mut hs_s_symb = Vec::with_capacity(n);
         let mut hs_qty = Vec::with_capacity(n);
 
-        for _ in 0..n {
-            hs_ca_id.push(rng.random_range(1..=num_accounts));
-            hs_s_symb.push(symb_for_idx(rng.random_range(0..num_symb)));
+        for i in 0..n {
+            let (ca, symb) = holding_pair(offset + i, accounts, securities);
+            hs_ca_id.push(ca);
+            hs_s_symb.push(symb_for_idx(symb));
             hs_qty.push(rng.random_range(-50000..50000i32));
         }
 
@@ -2159,7 +2188,7 @@ fn generate_watch_item(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let total = super::scaled(scale, 50_000.0);
     let total = total.max(1);
     let num_wl = (scale * 5_000.0).max(1.0) as i64;
-    let num_symb = dim_card_usize(scale, 6.85);
+    let num_symb = security_count(scale);
     let mut rng = StdRng::seed_from_u64(seed_for_table("watch_item"));
     let mut batches = Vec::new();
     let mut offset = 0usize;
@@ -2207,7 +2236,7 @@ impl BenchmarkGenerator for TpceGenerator {
             TableDef {
                 name: "customer_account".into(),
                 schema: customer_account_schema(),
-                row_count: |sf| dim_card_usize(sf, 5.0),
+                row_count: account_count,
             },
             TableDef {
                 name: "customer".into(),
@@ -2295,7 +2324,7 @@ impl BenchmarkGenerator for TpceGenerator {
             TableDef {
                 name: "company".into(),
                 schema: company_schema(),
-                row_count: |sf| dim_card_usize(sf, 5.0),
+                row_count: company_count,
             },
             TableDef {
                 name: "company_competitor".into(),
@@ -2305,7 +2334,7 @@ impl BenchmarkGenerator for TpceGenerator {
             TableDef {
                 name: "security".into(),
                 schema: security_schema(),
-                row_count: |sf| dim_card_usize(sf, 6.85),
+                row_count: security_count,
             },
             TableDef {
                 name: "daily_market".into(),
@@ -2320,7 +2349,7 @@ impl BenchmarkGenerator for TpceGenerator {
             TableDef {
                 name: "last_trade".into(),
                 schema: last_trade_schema(),
-                row_count: |sf| dim_card_usize(sf, 6.85),
+                row_count: security_count,
             },
             TableDef {
                 name: "news_item".into(),
@@ -2531,12 +2560,43 @@ mod tests {
         assert_eq!(count("broker"), 10);
         assert_eq!(count("trade"), 17_280);
         assert_eq!(count("trade_history"), 51_840);
-        // customer_account raw formula is 5×SF, but the DIM_MIN floor (10)
-        // keeps it from collapsing at low SF — see DIM_MIN near top of file.
-        // At SF1 the floor binds (5 < 10) so we get 10 rows.
-        assert_eq!(count("customer_account"), 10);
+        assert_eq!(count("customer_account"), 5_000);
+        assert_eq!(count("company"), 500);
+        assert_eq!(count("security"), 685);
         assert_eq!(count("holding"), 12_500);
         assert_eq!(count("watch_item"), 50_000);
+    }
+
+    #[test]
+    fn holding_summary_pairs_are_unique_and_trades_join_them() {
+        use std::collections::HashSet;
+        let pairs = |(_, batches): (SchemaRef, Vec<RecordBatch>), ca: usize, symb: usize| {
+            let mut out = Vec::new();
+            for b in &batches {
+                let ca_col = b.column(ca).as_any().downcast_ref::<Int64Array>().unwrap();
+                let s_col = b.column(symb).as_any().downcast_ref::<StringArray>().unwrap();
+                for r in 0..b.num_rows() {
+                    out.push((ca_col.value(r), s_col.value(r).to_string()));
+                }
+            }
+            out
+        };
+        let col = |s: SchemaRef, n: &str| s.index_of(n).unwrap();
+        for sf in [0.01, 1.0] {
+            let hs = generate_holding_summary(sf);
+            let (ca, sy) = (col(hs.0.clone(), "hs_ca_id"), col(hs.0.clone(), "hs_s_symb"));
+            let hs = pairs(hs, ca, sy);
+            let set: HashSet<_> = hs.iter().cloned().collect();
+            assert_eq!(set.len(), hs.len(), "holding_summary PK repeats at SF{sf}");
+
+            let t = generate_trade(sf);
+            let (ca, sy) = (col(t.0.clone(), "t_ca_id"), col(t.0.clone(), "t_s_symb"));
+            assert!(pairs(t, ca, sy).iter().all(|p| set.contains(p)), "trade outside holding_summary at SF{sf}");
+
+            let h = generate_holding(sf);
+            let (ca, sy) = (col(h.0.clone(), "h_ca_id"), col(h.0.clone(), "h_s_symb"));
+            assert!(pairs(h, ca, sy).iter().all(|p| set.contains(p)), "holding outside holding_summary at SF{sf}");
+        }
     }
 
     #[test]
@@ -2627,8 +2687,7 @@ mod tests {
     fn generate_security_sf1_correct_count() {
         let (_, batches) = generate_security(1.0);
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        // Raw formula at SF1 is 1.0 * 6.85 = 6, but DIM_MIN (10) floors it.
-        assert_eq!(rows, 10);
+        assert_eq!(rows, 685);
     }
 
     #[test]

@@ -354,7 +354,10 @@ pub struct QueryConfig {
     ///
     #[serde(default)]
     pub query_profile: ProfileMode,
-    /// Maximum memory per query. Default: "256MB". Supports: B, KB, MB, GB. Set to "0" for unlimited.
+    /// Maximum memory per query, including retained buffered SELECT results.
+    /// Default: "256MB". Supports: B, KB, MB, GB. Set to "0" for unlimited.
+    /// Buffered results also reserve their actual Arrow bytes in the shared pool
+    /// until their buffers (including cached copies) are released.
     #[serde(default = "default_max_query_memory")]
     pub max_query_memory: String,
     /// Minimum total scan size to distribute across workers. Below this, execute on coordinator.
@@ -697,6 +700,29 @@ pub struct CoordinatorConfig {
     pub flight_sql_port: u16,
     #[serde(default = "default_trino_port")]
     pub trino_http_port: u16,
+    /// Port of an additional TLS listener for the Trino HTTP protocol, serving
+    /// the same endpoints as `trino_http_port` with `[coordinator.trino_tls]`.
+    /// `0` (default) disables it. In-cluster clients that refuse to send
+    /// credentials over plain HTTP (trino-python-client, dbt-trino) can then
+    /// call the service directly instead of going through the public
+    /// ingress. The plain listener keeps serving probes and plain clients.
+    #[serde(default)]
+    pub trino_https_port: u16,
+    /// Certificate for `trino_https_port`: PEM `cert_file` / `key_file`,
+    /// optional `ca_file` to require client certificates. Rotated in place
+    /// (polled every 60 s), so a cert-manager renewal needs no restart.
+    #[serde(default)]
+    pub trino_tls: TlsConfig,
+    /// Public base URL of the Trino HTTP listener behind a TLS-terminating
+    /// ingress, e.g. `"https://sql.example.org"`. Used for `nextUri` /
+    /// `infoUri` only on requests whose `Host` (or a trusted proxy's
+    /// `X-Forwarded-Host`) matches its host, so in-cluster clients calling
+    /// the service directly keep URIs that point back at the service. A
+    /// fallback for ingresses whose IPs cannot be listed in
+    /// `[security] trusted_proxies`. Must be `http(s)://host[:port]` with no
+    /// path.
+    #[serde(default)]
+    pub public_base_url: Option<String>,
     /// Port the DuckDB Quack RPC server listens on. Zero disables the Quack
     /// endpoint entirely. DuckDB's documented default for `quack:host` URIs
     /// is 9494, so enabling this with `quack_port = 9494` lets a DuckDB CLI
@@ -781,6 +807,18 @@ pub struct CoordinatorConfig {
     ///   `query.per_user_memory_budget`.
     #[serde(default)]
     pub memory_pool: MemoryPoolKind,
+    /// Percent of `memory_limit`, and of each query's
+    /// `query.max_query_memory`, that spillable operators (hash aggregates,
+    /// sorts, repartition buffers, nested-loop joins) may not use. Only
+    /// non-spillable consumers (scan decode, sort merges, hash-join builds)
+    /// can draw on it. A spillable operator that reaches the line is refused
+    /// and spills, so a scan's next decode or a sort's merge finds room
+    /// instead of failing the query (#788). The cost: at a tight cap a lone
+    /// spillable operator spills at `100 - n` percent where it would have
+    /// fit. `0` turns it off. Greedy pool only; `fair` divides the pool
+    /// itself. Default 20, valid 0..=50.
+    #[serde(default = "default_unspillable_headroom_percent")]
+    pub unspillable_headroom_percent: u8,
     /// Enable spill-to-disk when memory limit is reached. Default: true.
     #[serde(default = "default_true")]
     pub spill_to_disk: bool,
@@ -1286,6 +1324,9 @@ impl std::fmt::Debug for CoordinatorConfig {
         f.debug_struct("CoordinatorConfig")
             .field("flight_sql_port", &self.flight_sql_port)
             .field("trino_http_port", &self.trino_http_port)
+            .field("trino_https_port", &self.trino_https_port)
+            .field("trino_tls", &self.trino_tls)
+            .field("public_base_url", &self.public_base_url)
             .field("quack_port", &self.quack_port)
             .field("mode", &self.mode)
             .field("worker_urls", &self.worker_urls)
@@ -1816,8 +1857,8 @@ pub struct WorkerConfig {
     /// forbid re-pinning.
     #[serde(default)]
     pub ticket_public_key: String,
-    /// Accept legacy HMAC scan-ticket tags keyed by `worker_secret`
-    /// (finding 601). Off by default: the HMAC key is the same secret every
+    /// Accept legacy HMAC scan-ticket and `compact_file_group` tags keyed by
+    /// `worker_secret` (finding 601). Off by default: the HMAC key is the same secret every
     /// worker holds, so it proves nothing about who authored the ticket.
     /// Turn on only while rolling a fleet that still has pre-Ed25519
     /// coordinators.
@@ -1839,6 +1880,24 @@ pub struct WorkerConfig {
 }
 
 impl WorkerConfig {
+    /// Worker-role boot guard: an empty `worker_secret` is refused unless
+    /// `allow_unauthenticated` waives it, whatever the topology. `validate()`
+    /// cannot run this because it does not know the process role (the CLI
+    /// `--mode` wins over the config), and a static-`worker_urls` worker has
+    /// no `coordinator_url` for it to key off. Without a secret the Flight
+    /// service accepts scan tickets and credential refreshes from anyone.
+    pub fn require_secret(&self) -> Result<(), String> {
+        if self.worker_secret.is_empty() && !self.allow_unauthenticated {
+            return Err("worker.worker_secret is empty. Any TCP-reachable client could \
+                 send scan tickets or refresh credentials on this worker, leaking user \
+                 S3 credentials. Set worker.worker_secret to match \
+                 coordinator.worker_secret (recommended), or explicitly set \
+                 worker.allow_unauthenticated = true to opt out."
+                .to_string());
+        }
+        Ok(())
+    }
+
     /// The TLS block that governs this worker's Flight listener and the
     /// identity it presents to the coordinator: `[worker.tls]` when it carries
     /// a cert and key, otherwise the inherited `[coordinator.tls]`.
@@ -2190,7 +2249,8 @@ pub enum AuthProviderConfig {
         /// AWS region for STS endpoint. Default: `"us-east-1"`.
         #[serde(default = "default_aws_region")]
         region: String,
-        /// Whether to validate credentials via STS call. Default: true.
+        /// Must stay `true` (the default): credentials are always validated
+        /// via STS, and `false` is rejected at startup.
         #[serde(default = "default_true")]
         validate_with_sts: bool,
     },
@@ -2202,7 +2262,8 @@ pub enum AuthProviderConfig {
         #[serde(default = "default_api_key_prefix")]
         key_prefix: String,
     },
-    /// Mutual TLS client certificate authentication.
+    /// Reserved mutual TLS provider. Current listeners do not extract verified
+    /// peer identity, so startup rejects this provider.
     Mtls {
         /// Whether to extract OU from the cert subject as a group.
         #[serde(default = "default_true")]
@@ -2403,6 +2464,20 @@ fn default_admin_roles() -> Vec<String> {
 }
 
 impl AuthConfig {
+    /// Refuse a configured control that current transport adapters cannot supply.
+    /// TLS client-certificate verification alone does not populate the identity
+    /// consumed by MtlsProvider; never substitute request headers for that proof.
+    pub fn validate_transport_providers(&self) -> Result<(), String> {
+        if self
+            .providers
+            .iter()
+            .any(|p| matches!(p, AuthProviderConfig::Mtls { .. }))
+        {
+            return Err("auth.providers: mtls requires verified TLS peer identity extraction, which current listeners do not support".into());
+        }
+        Ok(())
+    }
+
     /// Returns true if TLS certificate verification should be skipped.
     /// Combines `tls_skip_verify` (new, clear) with `ssl_verification` (legacy, inverted).
     /// Either `tls_skip_verify = true` OR `ssl_verification = false` triggers skip.
@@ -2621,6 +2696,35 @@ pub struct CatalogConfig {
     pub backend: CatalogBackend,
     #[serde(default = "default_cache_ttl")]
     pub metadata_cache_ttl_secs: u64,
+    /// Which catalog failures count toward opening a per-(token, catalog)
+    /// circuit breaker. Classes: `server_error` (5xx, catalog unavailable,
+    /// and anything unrecognised), `timeout`, `connection`, `rate_limited`
+    /// (429), `client_error` (other 4xx), `not_found` (404), `auth` (401/403).
+    /// Default counts upstream faults only: a client probing for objects that
+    /// do not exist, or that it may not see, gets normal answers, and those
+    /// must not lock its token out (dbt `information_schema` checks,
+    /// `read_parquet` name lookups).
+    #[serde(default = "default_breaker_failure_classes")]
+    pub circuit_breaker_failure_classes: Vec<String>,
+    /// Object-store prefixes that file TVFs (`read_parquet`, `read_csv`,
+    /// `read_json`) may read with the engine's storage credentials, in
+    /// sessions scoped to THIS catalog only. Added to the global
+    /// `[storage.tvf] allowed_object_store_prefixes`, never replacing it.
+    /// A session is scoped to the catalog it resolves as its default: the
+    /// one it names (`X-Trino-Catalog`, `USE`, the Flight catalog), or the
+    /// config default when it names none. The name alone does not open
+    /// them: the catalog must also have answered the caller's own bearer
+    /// (per-user REST auth) while the session was built, so engine-held
+    /// catalog auth never opens them. Same matching and `{user}`
+    /// placeholder as the global list. Lets one coordinator serve several
+    /// workspaces, each reading only its own staging buckets:
+    ///
+    /// ```toml
+    /// [catalogs.ws_energy]
+    /// tvf_prefixes = ["s3://ws-energy-landing/"]
+    /// ```
+    #[serde(default)]
+    pub tvf_prefixes: Vec<String>,
     /// Whole-request deadline (seconds) for every HTTP call to the catalog,
     /// both SQE's raw HEAD/GET path and iceberg-rust's own requests. A
     /// catalog that accepts TCP and then goes silent used to stall planning
@@ -2731,11 +2835,55 @@ pub struct CatalogConfig {
     #[serde(default)]
     pub storage: Option<StorageConfig>,
     /// When true, never inject the configured `[storage]` access/secret
-    /// keys into Iceberg FileIO. Reads then require Polaris-vended STS
-    /// (or remote signing). Default false for single-tenant / local
-    /// stacks. `production_mode` requires this to be true (issue #395).
+    /// keys into Iceberg FileIO. Reads then require catalog-vended STS
+    /// credentials. Implies `access_delegation = "vended-credentials"`.
+    /// Default false for single-tenant / local stacks. `production_mode`
+    /// requires this to be true (issue #395).
     #[serde(default)]
     pub require_vended_credentials: bool,
+    /// Ask the REST catalog to vend table-scoped storage credentials: sends
+    /// `X-Iceberg-Access-Delegation: vended-credentials` on every catalog
+    /// request. Vended keys then win over the `[storage]` static pair for
+    /// that table, and the static pair stays the fallback for tables the
+    /// catalog vends nothing for. `"none"` (default) sends no header.
+    /// `require_vended_credentials = true` turns this on and also removes
+    /// the static fallback. REST backend only.
+    #[serde(default)]
+    pub access_delegation: AccessDelegation,
+}
+
+/// Value of the Iceberg REST `X-Iceberg-Access-Delegation` header SQE asks
+/// for. `remote-signing` is not supported.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AccessDelegation {
+    /// Send no delegation header (static `[storage]` keys).
+    #[default]
+    None,
+    /// Ask for vended, table-scoped credentials.
+    VendedCredentials,
+}
+
+impl AccessDelegation {
+    /// The header value, or `None` when no header is sent.
+    pub fn header_value(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::VendedCredentials => Some("vended-credentials"),
+        }
+    }
+}
+
+impl CatalogConfig {
+    /// The delegation SQE asks the catalog for: `require_vended_credentials`
+    /// implies vended credentials whatever `access_delegation` says.
+    pub fn effective_access_delegation(&self) -> AccessDelegation {
+        if self.require_vended_credentials {
+            AccessDelegation::VendedCredentials
+        } else {
+            self.access_delegation
+        }
+    }
 }
 
 /// Tuning for the two-tier dynamic runtime-filter pushdown (MR #220, issue #132).
@@ -3180,6 +3328,12 @@ pub struct TvfCaller {
     /// grepping the token `trusted: true` (or either constructor's name)
     /// finds every place that ever sets it -- there is no other way to.
     pub trusted: bool,
+    /// The catalog this caller's session is scoped to, for denial messages.
+    /// `None` outside a catalog-scoped session.
+    pub scope_catalog: Option<String>,
+    /// That catalog's `[catalogs.<name>] tvf_prefixes`: allowed on top of
+    /// the global `allowed_object_store_prefixes`, for this caller only.
+    pub catalog_prefixes: Vec<String>,
 }
 
 impl TvfCaller {
@@ -3189,7 +3343,18 @@ impl TvfCaller {
             username: Some(username),
             roles,
             trusted: false,
+            scope_catalog: None,
+            catalog_prefixes: Vec::new(),
         }
+    }
+
+    /// Scope this caller to `catalog`, whose `tvf_prefixes` it may then read
+    /// in addition to the global list. A session scoped to another catalog
+    /// never sees them.
+    pub fn with_catalog_scope(mut self, catalog: &str, prefixes: &[String]) -> Self {
+        self.scope_catalog = Some(catalog.to_string());
+        self.catalog_prefixes = prefixes.to_vec();
+        self
     }
 
     /// Trusted local caller (embedded CLI). Object-store prefix gating is
@@ -3199,6 +3364,8 @@ impl TvfCaller {
             username: None,
             roles: Vec::new(),
             trusted: true,
+            scope_catalog: None,
+            catalog_prefixes: Vec::new(),
         }
     }
 
@@ -3231,6 +3398,8 @@ impl TvfCaller {
             username: None,
             roles: Vec::new(),
             trusted: true,
+            scope_catalog: None,
+            catalog_prefixes: Vec::new(),
         }
     }
 }
@@ -3288,6 +3457,24 @@ fn canonicalize_object_url(path: &str) -> Result<String, String> {
         }
     }
     Ok(out)
+}
+
+/// A `tvf_prefixes` entry must be an object-store URL with a bucket that
+/// survives [`canonicalize_object_url`]; anything else would never match.
+fn validate_tvf_prefix(prefix: &str) -> Result<(), String> {
+    const SCHEMES: &[&str] = &[
+        "s3://", "s3a://", "abfss://", "abfs://", "azure://", "az://", "gs://", "gcs://",
+    ];
+    let lower = prefix.to_ascii_lowercase();
+    let Some(scheme) = SCHEMES.iter().find(|s| lower.starts_with(**s)) else {
+        return Err(format!(
+            "'{prefix}' is not an object-store URL (s3://, abfss://, gs://, ...)"
+        ));
+    };
+    if prefix[scheme.len()..].trim_matches('/').is_empty() {
+        return Err(format!("'{prefix}' names no bucket"));
+    }
+    canonicalize_object_url(prefix).map(|_| ())
 }
 
 /// `true` when `path` falls under `prefix` on a path-segment boundary.
@@ -3421,7 +3608,13 @@ impl TvfPolicy {
                 return Err(e);
             }
         };
-        for raw_prefix in &self.allowed_object_store_prefixes {
+        // The session catalog's own prefixes widen the global list for this
+        // caller only; a session scoped to another catalog never carries them.
+        for raw_prefix in self
+            .allowed_object_store_prefixes
+            .iter()
+            .chain(&caller.catalog_prefixes)
+        {
             let Some(substituted) =
                 substitute_user_placeholder(raw_prefix, caller.username.as_deref())
             else {
@@ -3440,9 +3633,19 @@ impl TvfPolicy {
         tracing::warn!(
             principal = %principal,
             path = %path,
+            scope_catalog = caller.scope_catalog.as_deref().unwrap_or(""),
             "TVF object-store access denied: no matching \
-             `[storage.tvf] allowed_object_store_prefixes` entry"
+             `[storage.tvf] allowed_object_store_prefixes` or catalog \
+             `tvf_prefixes` entry"
         );
+        let catalog_hint = match caller.scope_catalog.as_deref() {
+            Some(catalog) => format!(
+                " This session is scoped to catalog '{catalog}', whose \
+                 `[catalogs.{catalog}] tvf_prefixes` add {} more.",
+                caller.catalog_prefixes.len()
+            ),
+            None => String::new(),
+        };
         let inline_hint = if self.allow_inline_credentials {
             ", or pass complete inline credentials (e.g. access_key/secret_key) \
              so the engine's storage key is not used"
@@ -3453,7 +3656,7 @@ impl TvfPolicy {
         Err(format!(
             "TVF: object-store path '{path}' denied for user '{principal}'. \
              Reads with the engine's storage credentials are limited to \
-             `[storage.tvf] allowed_object_store_prefixes` ({} configured). \
+             `[storage.tvf] allowed_object_store_prefixes` ({} configured).{catalog_hint} \
              Add a matching prefix (the `{{user}}` placeholder expands to the \
              authenticated username), grant a role listed in \
              `[storage.tvf] object_store_admin_roles`{inline_hint}.",
@@ -3863,12 +4066,14 @@ impl std::str::FromStr for PolicyEngine {
 pub struct PolicyConfig {
     #[serde(default)]
     pub engine: PolicyEngine,
-    /// Per-deployment secret keyed into the SHA-256 column mask UDF.
+    /// Per-deployment secret keyed into the HASH column mask.
     ///
-    /// When set, the `sha256(col)` mask runs as HMAC-SHA256 with this key,
-    /// blocking the offline rainbow-table attack against low-entropy
-    /// columns (SSN, phone, employee ID). When empty, the UDF falls back
-    /// to plain SHA-256 and emits a startup warning. Rotating the key
+    /// When set, HASH masks run as HMAC-SHA256 with this key, blocking the
+    /// offline rainbow-table attack against low-entropy columns (SSN,
+    /// phone, employee ID). The mask uses an internal function that user
+    /// SQL cannot call; on the coordinator the user-callable `sha256()` is
+    /// plain, unkeyed SHA-256 and never sees this key. When empty, the mask falls
+    /// back to plain SHA-256 and emits a startup warning. Rotating the key
     /// changes every masked digest, so the same key must persist across
     /// coordinator restarts and across all coordinators in an HA setup.
     ///
@@ -4335,7 +4540,7 @@ impl OpenLineageConfig {
     ///
     /// Rules:
     /// - When enabled, at least one sink (file_path or http_endpoint) must be set.
-    /// - `auth_mode = "bearer"` requires `api_key` to be set.
+    /// - Only `none` and `bearer` are supported; `bearer` requires `api_key`.
     /// - `spool_path` only makes sense when `http_endpoint` is set (the spool
     ///   buffers events that fail to deliver over HTTP).
     /// - When enabled, `spool_max_bytes` must be at least 1 MiB so the spool
@@ -4346,7 +4551,12 @@ impl OpenLineageConfig {
                 "openlineage.enabled requires at least one of file_path or http_endpoint".into(),
             );
         }
-        if self.auth_mode == "bearer" && self.api_key.is_empty() {
+        match self.auth_mode.as_str() {
+            "none" | "bearer" => {}
+            "user_token" => return Err("openlineage.auth_mode = \"user_token\" is unsupported: user session tokens must not be forwarded to lineage collectors; use none or bearer with a dedicated collector api_key".into()),
+            _ => return Err("openlineage.auth_mode must be none or bearer".into()),
+        }
+        if self.auth_mode == "bearer" && self.api_key.trim().is_empty() {
             return Err("openlineage.auth_mode = \"bearer\" requires api_key to be set".into());
         }
         if !self.spool_path.is_empty() && self.http_endpoint.is_empty() {
@@ -4436,8 +4646,15 @@ pub struct SecurityConfig {
     /// directly and `x-forwarded-for` is ignored. Empty (the default)
     /// means no proxy is trusted, audit IPs always come from the peer.
     ///
-    /// IPv4 and IPv6 literals are supported. CIDR ranges are not (yet);
-    /// list each proxy IP explicitly. Hostnames are not resolved.
+    /// Each entry is an IPv4/IPv6 address or a CIDR range
+    /// (`"10.42.0.0/16"`, `"fd00::/8"`), so an ingress whose pod IPs change
+    /// can be trusted by its range. Hostnames are not resolved; an entry
+    /// that is neither an address nor a range fails config validation.
+    ///
+    /// Trusting a range lets every peer in it set `x-forwarded-for` (the
+    /// audited client IP) and, on the Trino HTTP listener,
+    /// `x-forwarded-proto` / `-host` / `-port`. Keep it as narrow as the
+    /// ingress allows.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
     /// Opt-in escape hatch for the TLS-on-the-wire requirement. Leaving this
@@ -4448,6 +4665,15 @@ pub struct SecurityConfig {
     /// cleartext and can be captured and replayed by an on-path observer.
     #[serde(default)]
     pub allow_insecure_transport: bool,
+    /// Opt-in escape hatch for the client-facing plaintext listeners (Trino
+    /// HTTP, Quack without `[coordinator.tls]`, MCP without TLS or on the web
+    /// port). Leaving this `false` (the default) makes `production_mode`
+    /// refuse to start with any of them enabled on a non-loopback address,
+    /// because user passwords and bearer tokens would cross it in cleartext.
+    /// Set `true` only when a TLS-terminating proxy or ingress is the sole
+    /// route to those ports; the choice is then visible in config diffs.
+    #[serde(default)]
+    pub allow_plaintext_behind_tls_proxy: bool,
     /// Opt-in escape hatch for the shared-service-identity auth mode (SEC-03).
     /// The config-held `client_credentials` auth provider obtains one bearer
     /// token from server-baked credentials and hands the SAME token to every
@@ -4470,13 +4696,13 @@ pub struct SecurityConfig {
     /// diffs. Dev (non-production) still WARNs and starts.
     #[serde(default)]
     pub allow_unkeyed_hash_masks: bool,
-    /// Opt-in escape hatch for `policy.engine = passthrough` under
+    /// Opt-in escape hatch for `policy.engine = passthrough` (or the
+    /// empty, non-persistent `in_memory` test store) under
     /// `production_mode` (architecture review 212, issue #565). Passthrough
     /// enforces nothing: every user sees every row and column the catalog
     /// lets them read, with no row filters, masks or column restrictions.
     /// Leaving this `false` (the default) makes `production_mode` refuse to
-    /// start without a real policy engine (`ranger`, or `in_memory` for
-    /// tests). Set `true` only for a deployment that deliberately relies on
+    /// start without a real policy engine (`ranger`). Set `true` only for a deployment that deliberately relies on
     /// catalog-level authorization alone; the choice is then visible in
     /// config diffs, and startup still logs the disabled enforcement.
     #[serde(default)]
@@ -4512,13 +4738,7 @@ impl SecurityConfig {
     /// known proxies that prepend to one another.
     pub fn resolve_client_ip(&self, peer: Option<&str>, forwarded_for: Option<&str>) -> String {
         let peer = peer.unwrap_or("unknown");
-        let peer_host = strip_port(peer);
-        let trusted = !self.trusted_proxies.is_empty()
-            && self
-                .trusted_proxies
-                .iter()
-                .any(|p| p.eq_ignore_ascii_case(peer_host));
-        if !trusted {
+        if !self.is_trusted_proxy(peer) {
             return peer.to_string();
         }
         let chain = match forwarded_for {
@@ -4528,19 +4748,113 @@ impl SecurityConfig {
         // Walk right to left, skipping known trusted proxies.
         let hops: Vec<&str> = chain.split(',').map(str::trim).collect();
         for hop in hops.iter().rev() {
-            let hop_host = strip_port(hop);
-            if hop_host.is_empty() {
+            if strip_port(hop).is_empty() {
                 continue;
             }
-            let is_trusted = self
-                .trusted_proxies
-                .iter()
-                .any(|p| p.eq_ignore_ascii_case(hop_host));
-            if !is_trusted {
+            if !self.is_trusted_proxy(hop) {
                 return hop.to_string();
             }
         }
         peer.to_string()
+    }
+}
+
+impl SecurityConfig {
+    /// Is `addr` (an IP, optionally `ip:port` or `[ipv6]:port`) one of
+    /// `trusted_proxies`, as an exact address or inside a CIDR range? The
+    /// single matcher behind every surface that honours forwarded headers:
+    /// Flight SQL, the web/health router, the Quack server and the Trino HTTP
+    /// listener. Entries that do not parse never match (config validation
+    /// rejects them at load).
+    pub fn is_trusted_proxy(&self, addr: &str) -> bool {
+        if self.trusted_proxies.is_empty() {
+            return false;
+        }
+        let Ok(ip) = strip_port(addr).parse::<std::net::IpAddr>() else {
+            return false;
+        };
+        self.trusted_proxies
+            .iter()
+            .any(|entry| TrustedProxy::parse(entry).is_ok_and(|proxy| proxy.contains(ip)))
+    }
+}
+
+/// Split a `public_base_url` into `(scheme, authority)`, normalised: lower
+/// case, no trailing slash. Only `http` / `https` with a host and no path,
+/// query or credentials are accepted.
+pub fn parse_public_base_url(url: &str) -> Result<(String, String), String> {
+    let url = url.trim().trim_end_matches('/');
+    let (scheme, authority) = url
+        .split_once("://")
+        .ok_or_else(|| format!("`{url}` is not an absolute URL"))?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("`{url}`: scheme must be http or https"));
+    }
+    if authority.is_empty() || authority.contains(['/', '?', '#', '@']) {
+        return Err(format!("`{url}`: expected scheme://host[:port] with no path"));
+    }
+    Ok((scheme, authority.to_ascii_lowercase()))
+}
+
+/// One `[security] trusted_proxies` entry: an address (a /32 or /128) or a
+/// CIDR range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustedProxy {
+    network: std::net::IpAddr,
+    prefix_len: u8,
+}
+
+impl TrustedProxy {
+    /// Parse `"10.0.0.1"`, `"10.42.0.0/16"`, `"::1"`, `"[fd00::1]"` or
+    /// `"fd00::/8"`. Host bits below the prefix are ignored.
+    pub fn parse(entry: &str) -> Result<Self, String> {
+        let entry = entry.trim();
+        let (addr, prefix) = match entry.split_once('/') {
+            Some((addr, prefix)) => (addr, Some(prefix)),
+            None => (entry, None),
+        };
+        let addr = addr.trim();
+        let addr = addr
+            .strip_prefix('[')
+            .and_then(|a| a.strip_suffix(']'))
+            .unwrap_or(addr);
+        let network: std::net::IpAddr = addr
+            .parse()
+            .map_err(|_| format!("`{entry}` is not an IP address or CIDR range"))?;
+        let max = if network.is_ipv4() { 32 } else { 128 };
+        let prefix_len = match prefix {
+            None => max,
+            Some(p) => p
+                .trim()
+                .parse::<u8>()
+                .ok()
+                .filter(|len| *len <= max)
+                .ok_or_else(|| format!("`{entry}`: prefix length must be 0-{max}"))?,
+        };
+        Ok(Self { network, prefix_len })
+    }
+
+    /// Does the range contain `ip`? An IPv4-mapped IPv6 peer
+    /// (`::ffff:10.0.0.1`, what a dual-stack listener reports) matches IPv4
+    /// entries.
+    pub fn contains(&self, ip: std::net::IpAddr) -> bool {
+        use std::net::IpAddr;
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+            v4 => v4,
+        };
+        match (self.network, ip) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                let mask = u32::MAX.checked_shl(32 - u32::from(self.prefix_len)).unwrap_or(0);
+                u32::from(net) & mask == u32::from(ip) & mask
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                let mask = u128::MAX.checked_shl(128 - u32::from(self.prefix_len)).unwrap_or(0);
+                u128::from(net) & mask == u128::from(ip) & mask
+            }
+            _ => false,
+        }
     }
 }
 
@@ -5126,6 +5440,116 @@ fn default_runtime_filter_inlist_max_size() -> String {
 fn default_stream_idle_timeout() -> u64 {
     300
 }
+fn default_breaker_failure_classes() -> Vec<String> {
+    BreakerFailureClass::DEFAULT_COUNTED
+        .iter()
+        .map(|c| c.as_str().to_string())
+        .collect()
+}
+
+/// Classes of catalog failure, for deciding which ones open a circuit
+/// breaker (`[catalog] circuit_breaker_failure_classes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BreakerFailureClass {
+    ServerError,
+    Timeout,
+    Connection,
+    RateLimited,
+    ClientError,
+    NotFound,
+    Auth,
+}
+
+impl BreakerFailureClass {
+    /// Upstream faults: the default set that counts toward opening.
+    pub const DEFAULT_COUNTED: [BreakerFailureClass; 4] = [
+        BreakerFailureClass::ServerError,
+        BreakerFailureClass::Timeout,
+        BreakerFailureClass::Connection,
+        BreakerFailureClass::RateLimited,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ServerError => "server_error",
+            Self::Timeout => "timeout",
+            Self::Connection => "connection",
+            Self::RateLimited => "rate_limited",
+            Self::ClientError => "client_error",
+            Self::NotFound => "not_found",
+            Self::Auth => "auth",
+        }
+    }
+
+    pub fn parse(name: &str) -> Result<Self, String> {
+        Ok(match name.trim().to_ascii_lowercase().as_str() {
+            "server_error" => Self::ServerError,
+            "timeout" => Self::Timeout,
+            "connection" => Self::Connection,
+            "rate_limited" => Self::RateLimited,
+            "client_error" => Self::ClientError,
+            "not_found" => Self::NotFound,
+            "auth" => Self::Auth,
+            other => {
+                return Err(format!(
+                    "unknown class `{other}` (expected server_error, timeout, connection, \
+                     rate_limited, client_error, not_found or auth)"
+                ))
+            }
+        })
+    }
+
+    /// Classify an HTTP status from the catalog.
+    pub fn from_http_status(status: u16) -> Self {
+        match status {
+            401 | 403 => Self::Auth,
+            404 => Self::NotFound,
+            429 => Self::RateLimited,
+            408 | 504 => Self::Timeout,
+            400..=499 => Self::ClientError,
+            _ => Self::ServerError,
+        }
+    }
+
+    /// Classify a catalog error. Unrecognised errors are `ServerError`, so
+    /// they keep counting as they did before classes existed.
+    pub fn of_error(error: &crate::error::SqeError) -> Self {
+        use crate::error::{SqeError, SqeErrorCode};
+        if let SqeError::CatalogHttp { status, .. } = error {
+            return Self::from_http_status(*status);
+        }
+        let message = error.to_string().to_ascii_lowercase();
+        if message.contains("timed out") || message.contains("timeout") {
+            return Self::Timeout;
+        }
+        match error.error_code() {
+            SqeErrorCode::AuthenticationFailed | SqeErrorCode::AccessDenied => Self::Auth,
+            SqeErrorCode::TableNotFound
+            | SqeErrorCode::ViewNotFound
+            | SqeErrorCode::SchemaNotFound
+            | SqeErrorCode::CatalogNotFound
+            | SqeErrorCode::ColumnNotFound
+            | SqeErrorCode::FunctionNotFound => Self::NotFound,
+            SqeErrorCode::DuplicateTable
+            | SqeErrorCode::DuplicateColumn
+            | SqeErrorCode::InvalidArguments
+            | SqeErrorCode::SyntaxError
+            | SqeErrorCode::ParseError
+            | SqeErrorCode::SemanticError => Self::ClientError,
+            SqeErrorCode::ResourceExhausted => Self::RateLimited,
+            SqeErrorCode::QueryTimeout => Self::Timeout,
+            _ if message.contains("error sending request")
+                || message.contains("connection")
+                || message.contains("connect error")
+                || message.contains("dns error") =>
+            {
+                Self::Connection
+            }
+            _ => Self::ServerError,
+        }
+    }
+}
+
 fn default_max_query_memory() -> String {
     "256MB".to_string()
 }
@@ -5147,6 +5571,9 @@ fn default_star_schema_min_ratio() -> usize {
 
 fn default_coordinator_memory() -> String {
     "8GB".to_string()
+}
+fn default_unspillable_headroom_percent() -> u8 {
+    20
 }
 fn default_spill_compression() -> FlightCompression {
     FlightCompression::Lz4
@@ -5358,7 +5785,41 @@ impl SqeConfig {
     pub fn validate(&self) -> crate::error::Result<()> {
         let mut errors = Vec::new();
         self.quack_client.validate(&mut errors);
+        if let Err(error) = self.auth.validate_transport_providers() {
+            errors.push(error);
+        }
         self.validate_ticket_keys(&mut errors);
+        // A per-catalog TVF prefix that cannot match anything is a typo, not
+        // a policy: fail here rather than skip it silently at query time.
+        let mut catalogs: Vec<(String, &CatalogConfig)> = self
+            .catalogs
+            .iter()
+            .map(|(name, c)| (format!("[catalogs.{name}]"), c))
+            .collect();
+        catalogs.sort_by(|a, b| a.0.cmp(&b.0));
+        catalogs.insert(0, ("[catalog]".to_string(), &self.catalog));
+        for (section, catalog) in catalogs {
+            for prefix in &catalog.tvf_prefixes {
+                if let Err(e) = validate_tvf_prefix(prefix) {
+                    errors.push(format!("{section} tvf_prefixes: {e}"));
+                }
+            }
+        }
+        for class in &self.catalog.circuit_breaker_failure_classes {
+            if let Err(e) = BreakerFailureClass::parse(class) {
+                errors.push(format!("catalog.circuit_breaker_failure_classes: {e}"));
+            }
+        }
+        for entry in &self.security.trusted_proxies {
+            if let Err(e) = TrustedProxy::parse(entry) {
+                errors.push(format!("security.trusted_proxies: {e}"));
+            }
+        }
+        if let Some(url) = &self.coordinator.public_base_url {
+            if let Err(e) = parse_public_base_url(url) {
+                errors.push(format!("coordinator.public_base_url: {e}"));
+            }
+        }
 
         // Required fields
         //
@@ -5412,6 +5873,38 @@ impl SqeConfig {
                 ));
             }
         }
+        let hp = self.coordinator.trino_https_port;
+        if hp > 0 {
+            if !self.coordinator.trino_tls.is_enabled() {
+                errors.push(
+                    "coordinator.trino_https_port is set but [coordinator.trino_tls] has no \
+                     cert_file/key_file"
+                        .to_string(),
+                );
+            }
+            for (name, port) in [
+                (
+                    "coordinator.trino_http_port",
+                    self.coordinator.trino_http_port,
+                ),
+                (
+                    "coordinator.flight_sql_port",
+                    self.coordinator.flight_sql_port,
+                ),
+                ("coordinator.quack_port", self.coordinator.quack_port),
+                ("metrics.prometheus_port", self.metrics.prometheus_port),
+                (
+                    "health/web port",
+                    self.metrics.prometheus_port.saturating_add(1),
+                ),
+            ] {
+                if port == hp {
+                    errors.push(format!(
+                        "port conflict: coordinator.trino_https_port and {name} are both {hp}"
+                    ));
+                }
+            }
+        }
         if self.mcp.enabled_by_port_only() {
             tracing::warn!(
                 port = self.mcp.port,
@@ -5435,6 +5928,10 @@ impl SqeConfig {
                         self.coordinator.trino_http_port,
                     ),
                     ("coordinator.quack_port", self.coordinator.quack_port),
+                    (
+                        "coordinator.trino_https_port",
+                        self.coordinator.trino_https_port,
+                    ),
                     ("metrics.prometheus_port", self.metrics.prometheus_port),
                     (
                         "health/web port",
@@ -5673,6 +6170,23 @@ impl SqeConfig {
             }
             if !tls.ca_file.is_empty() && !std::path::Path::new(&tls.ca_file).exists() {
                 errors.push(format!("tls.ca_file '{}' not found", tls.ca_file));
+            }
+        }
+
+        // Same shape checks for the Trino HTTPS listener's certificate.
+        let trino_tls = &self.coordinator.trino_tls;
+        if trino_tls.cert_file.is_empty() != trino_tls.key_file.is_empty() {
+            errors.push(
+                "coordinator.trino_tls needs both cert_file and key_file, or neither".to_string(),
+            );
+        }
+        for (name, path) in [
+            ("cert_file", &trino_tls.cert_file),
+            ("key_file", &trino_tls.key_file),
+            ("ca_file", &trino_tls.ca_file),
+        ] {
+            if !path.is_empty() && !std::path::Path::new(path).exists() {
+                errors.push(format!("coordinator.trino_tls.{name} '{path}' not found"));
             }
         }
 
@@ -6168,6 +6682,12 @@ fn validate_memory_budget_invariants(config: &SqeConfig, errors: &mut Vec<String
 /// startup so `coordinator.memory_limit = "8X"` fails at config-load
 /// instead of two seconds into the first query (issue #116).
 fn validate_byte_sizes(config: &SqeConfig, errors: &mut Vec<String>) {
+    if config.coordinator.unspillable_headroom_percent > 50 {
+        errors.push(format!(
+            "coordinator.unspillable_headroom_percent = {}: must be 0..=50",
+            config.coordinator.unspillable_headroom_percent
+        ));
+    }
     let mut check = |field: &str, value: &str| {
         if value.is_empty() {
             return;
@@ -6416,6 +6936,70 @@ fn validate_urls(config: &SqeConfig, errors: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unsupported_mtls_provider_fails_configuration_validation() {
+        let mtls = AuthProviderConfig::Mtls {
+            extract_ou: true,
+            extract_san: true,
+        };
+        for providers in [
+            vec![mtls.clone()],
+            vec![
+                AuthProviderConfig::Anonymous {
+                    user: "fallback".into(),
+                    roles: vec![],
+                },
+                mtls,
+            ],
+        ] {
+            let mut config = valid_config();
+            config.auth.providers = providers;
+            config.coordinator.tls.cert_file = "/tmp/server.crt".into();
+            config.coordinator.tls.key_file = "/tmp/server.key".into();
+            config.coordinator.tls.ca_file = "/tmp/client-ca.crt".into();
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("mtls") && err.contains("verified TLS peer identity"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn openlineage_rejects_user_token_and_unknown_auth_modes() {
+        for mode in ["user_token", "bearre", ""] {
+            let mut config = valid_config();
+            config.metrics.openlineage.enabled = true;
+            config.metrics.openlineage.http_endpoint = "https://collector.example/lineage".into();
+            config.metrics.openlineage.auth_mode = mode.into();
+            config.metrics.openlineage.api_key = "collector-credential".into();
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains("openlineage.auth_mode"), "{err}");
+        }
+        for mode in ["none", "bearer"] {
+            let config = OpenLineageConfig {
+                enabled: true,
+                http_endpoint: "https://collector.example/lineage".into(),
+                auth_mode: mode.into(),
+                api_key: "collector-credential".into(),
+                ..OpenLineageConfig::default()
+            };
+            config.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn openlineage_bearer_rejects_blank_collector_credentials() {
+        let config = OpenLineageConfig {
+            enabled: true,
+            http_endpoint: "https://collector.example/lineage".into(),
+            auth_mode: "bearer".into(),
+            api_key: "  ".into(),
+            ..OpenLineageConfig::default()
+        };
+        assert!(config.validate().unwrap_err().contains("api_key"));
+    }
+
     use super::*;
 
     #[test]
@@ -7015,6 +7599,9 @@ partial_progress_batch = 5
             coordinator: CoordinatorConfig {
                 flight_sql_port: 50051,
                 trino_http_port: 8080,
+                trino_https_port: 0,
+                trino_tls: TlsConfig::default(),
+                public_base_url: None,
                 quack_port: 0,
                 mode: ServerMode::Hybrid,
                 worker_urls: vec![],
@@ -7028,6 +7615,7 @@ partial_progress_batch = 5
                 distributed_credentials: DistributedCredentialMode::Auto,
                 memory_limit: default_coordinator_memory(),
                 memory_pool: MemoryPoolKind::Greedy,
+                unspillable_headroom_percent: default_unspillable_headroom_percent(),
                 spill_to_disk: true,
                 spill_dir: default_coordinator_spill_dir(),
                 spill_compression: default_spill_compression(),
@@ -7071,6 +7659,8 @@ partial_progress_batch = 5
                 warehouse: "wh".to_string(),
                 backend: CatalogBackend::default(),
                 metadata_cache_ttl_secs: 30,
+                circuit_breaker_failure_classes: default_breaker_failure_classes(),
+                tvf_prefixes: Vec::new(),
                 request_timeout_secs: 30,
                 connect_timeout_secs: 5,
                 authorization_recheck_secs: 10,
@@ -7085,6 +7675,7 @@ partial_progress_batch = 5
                 auth: None,
                 storage: None,
                 require_vended_credentials: false,
+                access_delegation: AccessDelegation::None,
             },
             catalogs: HashMap::new(),
             storage: StorageConfig::default(),
@@ -7402,6 +7993,65 @@ partial_progress_batch = 5
     }
 
     #[test]
+    fn test_validate_trino_https_port_needs_a_certificate() {
+        let mut config = valid_config();
+        config.coordinator.trino_https_port = 8443;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("trino_https_port is set but [coordinator.trino_tls]"),
+            "Expected missing certificate error, got: {err}"
+        );
+        config.coordinator.trino_tls = TlsConfig {
+            cert_file: "/nonexistent/tls.crt".to_string(),
+            key_file: "/nonexistent/tls.key".to_string(),
+            ..TlsConfig::default()
+        };
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("coordinator.trino_tls.cert_file '/nonexistent/tls.crt' not found"),
+            "Expected missing file error, got: {err}"
+        );
+        config.coordinator.trino_tls = fixture_server_tls();
+        config.validate().expect("certificate configured");
+    }
+
+    fn fixture_server_tls() -> TlsConfig {
+        let fixture = |name: &str| {
+            format!(
+                "{}/tests/fixtures/tls/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        };
+        TlsConfig {
+            cert_file: fixture("server.crt"),
+            key_file: fixture("server.key"),
+            ..TlsConfig::default()
+        }
+    }
+
+    #[test]
+    fn test_validate_trino_https_port_conflicts() {
+        let mut config = valid_config();
+        config.coordinator.trino_tls = fixture_server_tls();
+        config.coordinator.trino_https_port = config.coordinator.trino_http_port;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("trino_https_port and coordinator.trino_http_port"),
+            "Expected port conflict error, got: {err}"
+        );
+        config.coordinator.trino_https_port = config.metrics.prometheus_port + 1;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("trino_https_port and health/web port"),
+            "Expected port conflict error, got: {err}"
+        );
+        // HTTPS only: the plain port off, TLS on 8080 itself.
+        config.coordinator.trino_http_port = 0;
+        config.coordinator.trino_https_port = 8080;
+        config.validate().expect("TLS-only Trino listener");
+    }
+
+    #[test]
     fn test_validate_flight_metrics_port_conflict() {
         let mut config = valid_config();
         config.coordinator.flight_sql_port = 9090;
@@ -7541,8 +8191,11 @@ partial_progress_batch = 5
     fn mcp_anonymous_mode_is_allowed_alongside_non_idp_providers() {
         let mut config = mcp_enabled_config();
         config.mcp.auth.mode = McpAuthMode::Anonymous;
-        config.auth.providers = vec![provider_from_toml(r#"type = "mtls""#)];
-        config.validate().expect("mtls is not an IdP");
+        config.auth.providers = vec![provider_from_toml(
+            r#"type = "api_key"
+keys_file = "/tmp/unused-keys.toml""#,
+        )];
+        config.validate().expect("api_key is not an IdP");
     }
 
     #[test]
@@ -8045,11 +8698,42 @@ s3_secret_key = "configured-secret"
         config.catalog.require_vended_credentials = true;
         // Review 212: a real policy engine and a grant backend are part of a
         // hardened config; the tests below flip each back to its default.
-        config.policy.engine = PolicyEngine::InMemory;
+        config.policy.engine = PolicyEngine::Ranger;
+        config.policy.mask_key = "test-mask-key".to_string();
+        config.policy.ranger.project_tags = true;
         config.access_control.backend = AccessControlBackend::Polaris;
         // Finding 751: inline TVF credentials default on; hardened turns it off.
         config.storage.tvf.allow_inline_credentials = false;
+        // The fixture's Trino HTTP listener is plaintext; acknowledge the
+        // TLS-terminating proxy a real deployment puts in front.
+        config.security.allow_plaintext_behind_tls_proxy = true;
         config
+    }
+
+    #[test]
+    fn validate_production_rejects_plaintext_client_listeners() {
+        let mut config = valid_production_config();
+        config.security.allow_plaintext_behind_tls_proxy = false;
+        config.coordinator.trino_http_port = 8080;
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(
+            err.contains("coordinator.trino_http_port")
+                && err.contains("allow_plaintext_behind_tls_proxy"),
+            "got: {err}"
+        );
+
+        // TLS-only Trino (plain port off) passes.
+        config.coordinator.trino_http_port = 0;
+        config.coordinator.trino_https_port = 8443;
+        assert!(config.validate_production().is_ok());
+
+        // Plaintext Quack is refused too.
+        config.coordinator.quack_port = 9494;
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(err.contains("coordinator.quack_port"), "got: {err}");
+
+        config.security.allow_plaintext_behind_tls_proxy = true;
+        assert!(config.validate_production().is_ok());
     }
 
     /// Finding 751: the three switches production mode used to let through.
@@ -8078,6 +8762,17 @@ s3_secret_key = "configured-secret"
         let err = config.validate_production().unwrap_err().to_string();
         assert!(
             err.contains("policy.engine is passthrough") && err.contains("allow_no_policy_engine"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_production_rejects_in_memory_policy_engine() {
+        let mut config = valid_production_config();
+        config.policy.engine = PolicyEngine::InMemory;
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(
+            err.contains("policy.engine is in_memory") && err.contains("allow_no_policy_engine"),
             "got: {err}"
         );
     }
@@ -8259,6 +8954,28 @@ s3_secret_key = "configured-secret"
     }
 
     #[test]
+    fn validate_production_rejects_worker_unauthenticated_waiver() {
+        let mut config = valid_production_config();
+        config.worker.allow_unauthenticated = true;
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(err.contains("worker.allow_unauthenticated"), "got: {err}");
+    }
+
+    /// A static-topology worker (no `coordinator_url`) with an empty secret
+    /// must not boot open: the role guard ignores the topology.
+    #[test]
+    fn worker_role_requires_secret_without_coordinator_url() {
+        let mut worker = WorkerConfig::default();
+        assert!(worker.coordinator_url.is_empty());
+        assert!(worker.require_secret().unwrap_err().contains("worker.worker_secret"));
+        worker.allow_unauthenticated = true;
+        assert!(worker.require_secret().is_ok());
+        worker.allow_unauthenticated = false;
+        worker.worker_secret = "shared-secret-value".to_string();
+        assert!(worker.require_secret().is_ok());
+    }
+
+    #[test]
     fn validate_production_accepts_distributed_with_worker_secret() {
         let mut config = valid_production_config();
         config.coordinator.worker_urls = vec!["http://worker-1:50051".to_string()];
@@ -8433,6 +9150,8 @@ s3_secret_key = "configured-secret"
                 warehouse: "main".to_string(),
                 backend: CatalogBackend::default(),
                 metadata_cache_ttl_secs: 30,
+                circuit_breaker_failure_classes: default_breaker_failure_classes(),
+                tvf_prefixes: Vec::new(),
                 request_timeout_secs: 30,
                 connect_timeout_secs: 5,
                 authorization_recheck_secs: 10,
@@ -8447,6 +9166,7 @@ s3_secret_key = "configured-secret"
                 auth: None,
                 storage: None,
                 require_vended_credentials: false,
+                access_delegation: AccessDelegation::None,
             },
         );
         let flat = cfg.flattened_catalogs();
@@ -8468,6 +9188,8 @@ s3_secret_key = "configured-secret"
                     warehouse: name.to_string(),
                     backend: CatalogBackend::default(),
                     metadata_cache_ttl_secs: 30,
+                    circuit_breaker_failure_classes: default_breaker_failure_classes(),
+                    tvf_prefixes: Vec::new(),
                     request_timeout_secs: 30,
                     connect_timeout_secs: 5,
                     authorization_recheck_secs: 10,
@@ -8482,6 +9204,7 @@ s3_secret_key = "configured-secret"
                     auth: None,
                     storage: None,
                     require_vended_credentials: false,
+                    access_delegation: AccessDelegation::None,
                 },
             );
         }
@@ -8510,6 +9233,8 @@ s3_secret_key = "configured-secret"
                 warehouse: "s3://wh/".to_string(),
                 backend: CatalogBackend::default(),
                 metadata_cache_ttl_secs: 30,
+                circuit_breaker_failure_classes: default_breaker_failure_classes(),
+                tvf_prefixes: Vec::new(),
                 request_timeout_secs: 30,
                 connect_timeout_secs: 5,
                 authorization_recheck_secs: 10,
@@ -8524,6 +9249,7 @@ s3_secret_key = "configured-secret"
                 auth: None,
                 storage: None,
                 require_vended_credentials: false,
+                access_delegation: AccessDelegation::None,
             },
         );
         let flat = cfg.flattened_catalogs();
@@ -9787,6 +10513,84 @@ audience = "polaris"
         assert!(check_remote(&policy, "hf://datasets/foo/bar/x").is_ok());
     }
 
+    /// A prefix allowed for catalog A is rejected for a caller scoped to
+    /// catalog B, and the global list still applies to both.
+    #[test]
+    fn tvf_catalog_prefixes_apply_only_to_their_catalog() {
+        let policy = TvfPolicy {
+            allowed_object_store_prefixes: vec!["s3://shared-landing/".to_string()],
+            ..TvfPolicy::default()
+        };
+        let a_prefixes = vec!["s3://ws-a-landing/".to_string()];
+        let in_a = caller("alice").with_catalog_scope("ws_a", &a_prefixes);
+        let in_b = caller("alice").with_catalog_scope("ws_b", &["s3://ws-b-landing/".to_string()]);
+
+        policy
+            .check_path("s3://ws-a-landing/2026/x.parquet", &in_a, false)
+            .expect("catalog A's prefix in a session scoped to A");
+        let err = policy
+            .check_path("s3://ws-a-landing/2026/x.parquet", &in_b, false)
+            .unwrap_err();
+        assert!(
+            err.contains("scoped to catalog 'ws_b'") && err.contains("[catalogs.ws_b] tvf_prefixes"),
+            "denial names the session catalog: {err}"
+        );
+        // Unscoped callers see the global list only.
+        assert!(policy
+            .check_path("s3://ws-a-landing/2026/x.parquet", &caller("alice"), false)
+            .is_err());
+        // The global list holds in every scope.
+        for c in [&in_a, &in_b] {
+            policy
+                .check_path("s3://shared-landing/x.csv", c, false)
+                .expect("global prefix");
+        }
+        // Same segment-boundary matching as the global list.
+        assert!(policy
+            .check_path("s3://ws-a-landing-evil/x.parquet", &in_a, false)
+            .is_err());
+    }
+
+    #[test]
+    fn tvf_catalog_prefixes_expand_the_user_placeholder() {
+        let policy = TvfPolicy::default();
+        let scoped = |user: &str| {
+            caller(user).with_catalog_scope("ws_a", &["s3://ws-a-scratch/{user}/".to_string()])
+        };
+        policy
+            .check_path("s3://ws-a-scratch/alice/x.csv", &scoped("alice"), false)
+            .expect("own scratch area");
+        assert!(policy
+            .check_path("s3://ws-a-scratch/alice/x.csv", &scoped("bob"), false)
+            .is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_malformed_catalog_tvf_prefixes() {
+        let mut config = valid_config();
+        config.catalog.tvf_prefixes = vec!["s3://ok-bucket/landing/".to_string()];
+        config.validate().expect("well-formed prefix");
+        for (bad, expected) in [
+            ("/data/landing", "is not an object-store URL"),
+            ("https://example.org/x", "is not an object-store URL"),
+            ("s3://", "names no bucket"),
+            ("s3://bucket/../other", "dot path segment"),
+        ] {
+            config.catalog.tvf_prefixes = vec![bad.to_string()];
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("[catalog] tvf_prefixes") && err.contains(expected),
+                "{bad}: {err}"
+            );
+        }
+        config.catalog.tvf_prefixes.clear();
+        let mut ws = config.catalog.clone();
+        ws.tvf_prefixes = vec!["landing/".to_string()];
+        config.catalogs.insert("ws_a".to_string(), ws);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("[catalogs.ws_a] tvf_prefixes"), "{err}");
+    }
+
     #[test]
     fn tvf_object_store_prefix_allows_exact_subtree() {
         let policy = TvfPolicy {
@@ -10189,6 +10993,135 @@ audience = "polaris"
         }
     }
 
+    // --- circuit breaker failure classes ---
+
+    #[test]
+    fn breaker_failure_classes_classify_errors() {
+        use crate::error::{CatalogOp, SqeError, SqeErrorCode};
+        let http = |status| SqeError::CatalogHttp { status, op: CatalogOp::LoadTable, body: String::new() };
+        assert_eq!(BreakerFailureClass::of_error(&http(404)), BreakerFailureClass::NotFound);
+        assert_eq!(BreakerFailureClass::of_error(&http(403)), BreakerFailureClass::Auth);
+        assert_eq!(BreakerFailureClass::of_error(&http(401)), BreakerFailureClass::Auth);
+        assert_eq!(BreakerFailureClass::of_error(&http(409)), BreakerFailureClass::ClientError);
+        assert_eq!(BreakerFailureClass::of_error(&http(429)), BreakerFailureClass::RateLimited);
+        assert_eq!(BreakerFailureClass::of_error(&http(502)), BreakerFailureClass::ServerError);
+        assert_eq!(BreakerFailureClass::of_error(&http(504)), BreakerFailureClass::Timeout);
+        assert_eq!(
+            BreakerFailureClass::of_error(&SqeError::with_code(SqeErrorCode::TableNotFound, "t")),
+            BreakerFailureClass::NotFound
+        );
+        assert_eq!(
+            BreakerFailureClass::of_error(&SqeError::Catalog("request timed out".into())),
+            BreakerFailureClass::Timeout
+        );
+        assert_eq!(
+            BreakerFailureClass::of_error(&SqeError::Catalog("error sending request for url".into())),
+            BreakerFailureClass::Connection
+        );
+        // Unrecognised errors keep counting, as before classes existed.
+        assert_eq!(
+            BreakerFailureClass::of_error(&SqeError::Catalog("unexpected body".into())),
+            BreakerFailureClass::ServerError
+        );
+    }
+
+    #[test]
+    fn breaker_failure_classes_default_and_validation() {
+        let cfg = valid_config();
+        assert_eq!(
+            cfg.catalog.circuit_breaker_failure_classes,
+            vec!["server_error", "timeout", "connection", "rate_limited"]
+        );
+        let mut cfg = valid_config();
+        cfg.catalog.circuit_breaker_failure_classes = vec!["server_error".into(), "4xx".into()];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("catalog.circuit_breaker_failure_classes: unknown class `4xx`"), "{err}");
+    }
+
+    // --- trusted_proxies CIDR ranges ---
+
+    fn trusts(entries: &[&str]) -> SecurityConfig {
+        SecurityConfig {
+            trusted_proxies: entries.iter().map(|e| e.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn trusted_proxy_parses_addresses_and_ranges() {
+        for ok in ["10.0.0.1", "10.42.0.0/16", "0.0.0.0/0", " 10.1.2.3/32 ", "::1", "[fd00::1]", "fd00::/8", "::/0"] {
+            assert!(TrustedProxy::parse(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "ingress.local", "10.0.0.0/33", "fd00::/129", "10.0.0.0/", "10.0.0.0/x", "10.0.0.256"] {
+            assert!(TrustedProxy::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn trusted_proxy_matches_inside_ipv4_range_only() {
+        let sec = trusts(&["10.42.0.0/16"]);
+        assert!(sec.is_trusted_proxy("10.42.7.9"));
+        assert!(sec.is_trusted_proxy("10.42.255.255:51234"));
+        assert!(!sec.is_trusted_proxy("10.43.0.1"));
+        // Exact entries keep working.
+        assert!(trusts(&["10.0.0.1"]).is_trusted_proxy("10.0.0.1:443"));
+        assert!(!trusts(&["10.0.0.1"]).is_trusted_proxy("10.0.0.2"));
+        // A dual-stack listener reports IPv4 peers as mapped IPv6.
+        assert!(sec.is_trusted_proxy("[::ffff:10.42.1.1]:9000"));
+        assert!(!trusts(&[]).is_trusted_proxy("10.42.1.1"));
+    }
+
+    #[test]
+    fn trusted_proxy_matches_ipv6_range() {
+        let sec = trusts(&["fd00:42::/32"]);
+        assert!(sec.is_trusted_proxy("fd00:42:1::5"));
+        assert!(sec.is_trusted_proxy("[fd00:42:ffff::1]:8080"));
+        assert!(!sec.is_trusted_proxy("fd00:43::1"));
+        assert!(!sec.is_trusted_proxy("10.42.0.1"));
+    }
+
+    #[test]
+    fn client_ip_resolution_honours_cidr_proxies() {
+        let sec = trusts(&["10.42.0.0/16"]);
+        // Ingress pod in the range: the rightmost hop outside it is the client.
+        assert_eq!(
+            sec.resolve_client_ip(Some("10.42.3.4:5000"), Some("203.0.113.7, 10.42.9.9")),
+            "203.0.113.7"
+        );
+        // A peer outside the range cannot spoof the client IP.
+        assert_eq!(
+            sec.resolve_client_ip(Some("192.0.2.1:5000"), Some("203.0.113.7")),
+            "192.0.2.1:5000"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_bad_trusted_proxies_and_public_base_url() {
+        let mut cfg = valid_config();
+        cfg.security.trusted_proxies = vec!["10.0.0.0/8".into(), "ingress.local".into(), "10.0.0.0/40".into()];
+        cfg.coordinator.public_base_url = Some("https://sql.example.org/path".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("security.trusted_proxies: `ingress.local`"), "{err}");
+        assert!(err.contains("security.trusted_proxies: `10.0.0.0/40`"), "{err}");
+        assert!(err.contains("coordinator.public_base_url"), "{err}");
+        assert!(!err.contains("`10.0.0.0/8`"), "{err}");
+
+        cfg.security.trusted_proxies = vec!["10.0.0.0/8".into(), "fd00::/8".into()];
+        cfg.coordinator.public_base_url = Some("https://sql.example.org".into());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn public_base_url_parsing() {
+        assert_eq!(
+            parse_public_base_url("HTTPS://SQL.Example.org:8443/").unwrap(),
+            ("https".to_string(), "sql.example.org:8443".to_string())
+        );
+        for bad in ["sql.example.org", "ftp://x", "https://", "https://x/y", "https://u@x", "https://x?q"] {
+            assert!(parse_public_base_url(bad).is_err(), "{bad}");
+        }
+    }
+
     // --- SecurityConfig::resolve_client_ip (issue #74 regression tests) ---
 
     #[test]
@@ -10555,6 +11488,48 @@ audience = "polaris"
             err.contains("catalog.request_timeout_secs")
                 && err.contains("catalog.connect_timeout_secs"),
             "got: {err}"
+        );
+    }
+
+    /// `access_delegation` defaults off, takes the env overlay, rejects
+    /// values SQE cannot honour, and `require_vended_credentials` implies it.
+    #[test]
+    fn access_delegation_default_env_validation_and_implication() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let cfg = load_with_env();
+        assert_eq!(cfg.catalog.access_delegation, AccessDelegation::None);
+        assert_eq!(
+            cfg.catalog.effective_access_delegation().header_value(),
+            None
+        );
+
+        std::env::set_var("SQE_CATALOG__ACCESS_DELEGATION", "vended-credentials");
+        let cfg = load_with_env();
+        std::env::remove_var("SQE_CATALOG__ACCESS_DELEGATION");
+        assert_eq!(
+            cfg.catalog.access_delegation,
+            AccessDelegation::VendedCredentials
+        );
+        assert_eq!(
+            cfg.catalog.effective_access_delegation().header_value(),
+            Some("vended-credentials")
+        );
+
+        std::env::set_var("SQE_CATALOG__ACCESS_DELEGATION", "remote-signing");
+        let err = SqeConfig::load_from_str(MINIMAL_TOML)
+            .err()
+            .map(|e| e.to_string());
+        std::env::remove_var("SQE_CATALOG__ACCESS_DELEGATION");
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("remote-signing")),
+            "got: {err:?}"
+        );
+
+        let mut cfg = valid_config();
+        cfg.catalog.require_vended_credentials = true;
+        assert_eq!(
+            cfg.catalog.effective_access_delegation(),
+            AccessDelegation::VendedCredentials
         );
     }
 

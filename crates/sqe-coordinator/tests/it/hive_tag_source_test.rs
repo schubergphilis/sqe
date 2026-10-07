@@ -370,7 +370,7 @@ async fn a_tag_in_the_hive_manifest_masks_the_column_in_an_executed_plan() {
         tag_filters: Frozen::new(vec![]),
     };
     let rewriter = PolicyPlanRewriter::new(Arc::new(store)).with_tag_source(routed);
-    let (rewritten, _summary) = rewriter.evaluate(&test_user(), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&test_user(), &sqe_policy::TableScope::default(), plan).await.unwrap();
 
     let ctx = SessionContext::new();
     let catalog = Arc::new(MemoryCatalogProvider::new());
@@ -430,7 +430,7 @@ async fn a_tag_row_filter_also_reaches_a_hive_scan() {
         ]),
     };
     let rewriter = PolicyPlanRewriter::new(Arc::new(store)).with_tag_source(routed);
-    let (rewritten, _summary) = rewriter.evaluate(&test_user(), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&test_user(), &sqe_policy::TableScope::default(), plan).await.unwrap();
 
     let ctx = SessionContext::new();
     let catalog = Arc::new(MemoryCatalogProvider::new());
@@ -497,7 +497,7 @@ async fn a_resource_level_mask_needs_no_tag_at_all_on_a_hive_scan() {
         }),
     };
     let rewriter = PolicyPlanRewriter::new(Arc::new(store)).with_tag_source(routed);
-    let (rewritten, _summary) = rewriter.evaluate(&test_user(), plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(&test_user(), &sqe_policy::TableScope::default(), plan).await.unwrap();
 
     let ctx = SessionContext::new();
     let catalog = Arc::new(MemoryCatalogProvider::new());

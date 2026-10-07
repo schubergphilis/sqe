@@ -360,7 +360,17 @@ Perf fixes the benchmarks drove: runtime (dynamic) filter pushdown into iceberg-
 
 ### SF100 (Next)
 
-SF100 inverts the SF10 playbook: broadcast joins, in-memory hash tables, and single scan streams each become the bottleneck. Needs memory-pool discipline under concurrency, a true multi-node rig (separate worker hosts), and a streaming data generator. Predicted failure modes: `docs/evidence/perf/sf100-scaling-risks.md`.
+SF100 inverts the SF10 playbook: broadcast joins, in-memory hash tables, and single scan streams each become the bottleneck. Needs memory-pool discipline under concurrency, a true multi-node rig (separate worker hosts), and a data path that scales. Predicted failure modes: `docs/evidence/perf/sf100-scaling-risks.md`.
+
+Data path status:
+
+- [x] Streaming generation for SSB, TPC-DS and TPC-BB: peak memory follows `--threads`, not table size (SSB 84 MB at SF1, 110 MB at SF10).
+- [x] One table-layout definition (partitioning, sort-on-write, blooms) shared by `load` and the direct Iceberg sink; the sink refuses a table it would lay out differently.
+- [x] Direct Iceberg sink writes TPC-H and TPC-C partitioned like `load`, through a bounded per-table buffer (TPC-H SF10 in 39 s at 3.5 GB peak, no staged Parquet).
+- [ ] Date-ordered fact generation for SSB, TPC-DS and TPC-BB, so the direct sink clusters them without a sort; needs a fresh SF1/SF10 baseline.
+- [ ] Stream TPC-C and ClickBench generation (they still build each table in memory).
+- [ ] Switch the benchmark script to the direct sink for every suite, removing the staged-Parquet disk peak.
+- [ ] SF100 peak-memory and load run on a dedicated host.
 
 ### Reliability Testing (Planned)
 

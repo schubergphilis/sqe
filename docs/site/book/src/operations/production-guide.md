@@ -42,17 +42,25 @@ allow_http = false
 allowed_object_store_prefixes = ["s3://your-warehouse/"]
 ```
 
+Keep the global list to what every user may read. A bucket that belongs to
+one workspace goes in that catalog's `tvf_prefixes` instead, so only sessions
+scoped to that catalog can read it with the engine's credentials (see
+[read_parquet](../features/read-parquet.md#which-paths-the-engines-credentials-may-read)).
+
 ### Memory
 
 ```toml
 [coordinator]
 memory_pool = "greedy"        # default; do not switch to fair on the coordinator
+unspillable_headroom_percent = 20   # default; share spillable operators may not take
 memory_limit = "12GB"         # tune to ~40-50% of box RAM (example for a 32 GB host)
 spill_to_disk = true
 spill_dir = "/fast-nvme/sqe-spill"
 ```
 
-Greedy pool lets one large operator use the full budget until spill. Fair pool divides memory across every registered spillable consumer. Wide plans (TPC-DS class) register dozens of consumers and fail before spilling when fair is enabled. Workers use fair pool internally; that asymmetry is intentional.
+Greedy pool lets one large operator use the budget until spill. Fair pool divides memory across every registered spillable consumer. Wide plans (TPC-DS class) register dozens of consumers and fail before spilling when fair is enabled. Workers use fair pool internally; that asymmetry is intentional.
+
+`unspillable_headroom_percent` keeps the top share of the pool, and of each query's `query.max_query_memory`, for consumers that cannot spill: the scan's decode buffers, a sort's merge, hash-join builds. Spillable operators (hash aggregates, sorts, repartition buffers) are refused at that line and spill there. Without it a large aggregate fills the cap and the scan feeding it is refused first, failing a query that could have spilled; with the 20% default the same SF10 aggregate under a 2 GB cap completes. The cost is that a lone spillable operator spills a little earlier at a tight cap. `0` turns it off; valid values are 0 to 50. It applies to the greedy pool only.
 
 ### Observability
 
@@ -301,12 +309,14 @@ Route audit logs and traces through an OpenTelemetry Collector when possible. Au
 | `no-dev-auth-providers` | `auth.providers` containing `anonymous` or `bearer_passthrough` (dev-only; accept any connection or skip local JWT validation). |
 | `rate-limit-enabled` | `rate_limit.enabled = false` (allows query and auth flooding). |
 | `no-insecure-transport` | `security.allow_insecure_transport = true` (cleartext distributed hops expose bearer tokens, worker secrets and vended S3 credentials). |
+| `no-plaintext-client-listeners` | An enabled plaintext Trino HTTP (`trino_http_port`), Quack (without `[coordinator.tls]`) or MCP (without TLS, or on the web port) listener on a non-loopback address, unless `security.allow_plaintext_behind_tls_proxy = true` acknowledges a TLS-terminating proxy in front (client passwords and bearer tokens would cross it in cleartext). |
 | `no-shared-service-identity` | Config-held `client_credentials` in `[auth].providers` or `[catalog(s).auth]` without `security.allow_shared_service_identity = true` (one identity for every user at Polaris/S3). |
 | `worker-secret-required` | `coordinator.worker_urls` set with an empty `coordinator.worker_secret` and `allow_unauthenticated_workers = true` (any TCP-reachable client may register as a worker). |
+| `no-unauthenticated-worker` | `worker.allow_unauthenticated = true` (a worker without a secret accepts scan tickets and credential refreshes from any TCP-reachable client). |
 | `max-sql-bytes` | `query.max_sql_bytes = 0` (disables the pre-parse statement size cap). |
 | `explicit-distributed-credentials` | `coordinator.distributed_credentials = auto` with workers configured (ships the shared `[storage]` keys to workers for tables without vended credentials). |
 | `vended-credentials-required` | A REST catalog without `require_vended_credentials = true` (FileIO would fall back to the shared `[storage]` S3 keys). |
-| `policy-engine-configured` | `policy.engine = passthrough` without `security.allow_no_policy_engine = true` (no row filters, masks or column restrictions). |
+| `policy-engine-configured` | `policy.engine = passthrough` or `in_memory` (an empty, non-persistent test store) without `security.allow_no_policy_engine = true` (no row filters, masks or column restrictions). |
 | `grant-backend-configured` | `access_control.backend = none` without `security.allow_no_grant_backend = true` (GRANT and REVOKE would be rejected). |
 | `ranger-mask-key` | `policy.engine = ranger` with an empty `policy.mask_key` and no `security.allow_unkeyed_hash_masks = true` (MASK_HASH would fall back to unsalted SHA-256). |
 | `ranger-project-tags` | `policy.engine = ranger` with `policy.ranger.project-tags = false` and no `security.allow_unprojected_tags = true` (Spark would return columns SQE masks). |

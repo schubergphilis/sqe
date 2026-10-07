@@ -8,10 +8,11 @@ use sqe_planner::ScanCredentials;
 use tracing::{info, warn};
 
 /// Iceberg REST vended-credential property names (table `config`).
-const VENDED_ACCESS_KEY: &str = "s3.access-key-id";
-const VENDED_SECRET_KEY: &str = "s3.secret-access-key";
-const VENDED_SESSION_TOKEN: &str = "s3.session-token";
-const VENDED_EXPIRES_AT_MS: &str = "s3.session-token-expires-at-ms";
+use sqe_catalog::vended_credentials::{
+    S3_ACCESS_KEY_ID as VENDED_ACCESS_KEY, S3_SECRET_ACCESS_KEY as VENDED_SECRET_KEY,
+    S3_SESSION_TOKEN as VENDED_SESSION_TOKEN,
+    S3_SESSION_TOKEN_EXPIRES_AT_MS as VENDED_EXPIRES_AT_MS,
+};
 
 /// Build the coordinator's ticket signer: from
 /// `coordinator.ticket_signing_key_file` when set (PKCS#8 v2 Ed25519 DER),
@@ -52,7 +53,7 @@ pub fn select_scan_credentials(
     storage: &StorageConfig,
     table: &Table,
 ) -> Option<ScanCredentials> {
-    let vended = vended_credentials(table);
+    let vended = vended_credentials(table, storage);
     select_with(mode, storage, vended)
 }
 
@@ -100,12 +101,21 @@ fn warn_static_once() {
 
 /// Vended S3 credentials from the table's FileIO properties, when the
 /// catalog supplied them at LOAD_TABLE time.
-fn vended_credentials(table: &Table) -> Option<ScanCredentials> {
-    vended_from_props(table.file_io().config().props())
+fn vended_credentials(table: &Table, storage: &StorageConfig) -> Option<ScanCredentials> {
+    vended_from_props(table.file_io().config().props(), storage)
 }
 
-fn vended_from_props(props: &std::collections::HashMap<String, String>) -> Option<ScanCredentials> {
-    let access = props.get(VENDED_ACCESS_KEY).filter(|v| !v.is_empty())?;
+/// The FileIO props merge the catalog's own properties (which carry the
+/// `[storage]` static pair when vended credentials are not required) with
+/// the LOAD_TABLE `config`. A key pair equal to the static one therefore
+/// came from SQE's config, not the catalog, and is not vended.
+fn vended_from_props(
+    props: &std::collections::HashMap<String, String>,
+    storage: &StorageConfig,
+) -> Option<ScanCredentials> {
+    let access = props
+        .get(VENDED_ACCESS_KEY)
+        .filter(|v| !v.is_empty() && **v != storage.s3_access_key)?;
     let secret = props.get(VENDED_SECRET_KEY).filter(|v| !v.is_empty())?;
     let token = props.get(VENDED_SESSION_TOKEN).cloned().unwrap_or_default();
     let expires_at = props
@@ -143,7 +153,7 @@ mod tests {
             VENDED_EXPIRES_AT_MS.to_string(),
             "1893456000000".to_string(),
         );
-        vended_from_props(&props)
+        vended_from_props(&props, &storage(true))
     }
 
     #[test]
@@ -153,7 +163,78 @@ mod tests {
         assert_eq!(c.access_key(), "ASIAVENDED");
         assert_eq!(c.session_token(), "sts-token");
         assert_eq!(c.expires_at(), Some(1_893_456_000));
-        assert!(vended_from_props(&HashMap::new()).is_none());
+        assert!(vended_from_props(&HashMap::new(), &storage(true)).is_none());
+    }
+
+    /// `distributed_credentials = vended` reads the table's own FileIO: the
+    /// per-table vended set (token and expiry included) is what workers get,
+    /// even with a static pair configured; a table whose FileIO carries only
+    /// the static pair is not distributed at all.
+    #[tokio::test]
+    async fn vended_mode_ships_the_tables_vended_set_never_the_static_pair() {
+        fn table(props: &[(&str, &str)]) -> Table {
+            let metadata: iceberg::spec::TableMetadata =
+                serde_json::from_value(serde_json::json!({
+                    "format-version": 1,
+                    "table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
+                    "location": "s3://bucket/ns/t",
+                    "last-updated-ms": 1602638573874_i64,
+                    "last-column-id": 1,
+                    "schema": {"type": "struct", "fields": [
+                        {"id": 1, "name": "x", "required": true, "type": "long"}]},
+                    "partition-spec": [],
+                    "properties": {},
+                    "current-snapshot-id": -1,
+                    "snapshots": []
+                }))
+                .unwrap();
+            let factory = std::sync::Arc::new(iceberg::io::LocalFsStorageFactory);
+            let file_io = iceberg::io::FileIOBuilder::new(factory)
+                .with_props(props.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+                .build();
+            Table::builder()
+                .runtime(iceberg::Runtime::current())
+                .metadata(metadata)
+                .identifier(iceberg::TableIdent::from_strs(["ns", "t"]).unwrap())
+                .file_io(file_io)
+                .disable_cache()
+                .build()
+                .unwrap()
+        }
+        let s = storage(true);
+        let vended_table = table(&[
+            (VENDED_ACCESS_KEY, "ASIATABLE"),
+            (VENDED_SECRET_KEY, "table-secret"),
+            (VENDED_SESSION_TOKEN, "table-token"),
+            (VENDED_EXPIRES_AT_MS, "1893456000000"),
+        ]);
+        let c = select_scan_credentials(DistributedCredentialMode::Vended, &s, &vended_table)
+            .expect("vended set");
+        assert_eq!(c.source(), "vended");
+        assert_eq!(c.access_key(), "ASIATABLE");
+        assert_eq!(c.session_token(), "table-token");
+        assert_eq!(c.expires_at(), Some(1_893_456_000));
+
+        let static_table = table(&[
+            (VENDED_ACCESS_KEY, "AKIASTATIC"),
+            (VENDED_SECRET_KEY, "static-secret"),
+        ]);
+        assert_eq!(
+            select_scan_credentials(DistributedCredentialMode::Vended, &s, &static_table),
+            None
+        );
+    }
+
+    /// The `[storage]` static pair merged into FileIO props is not vended.
+    #[test]
+    fn static_keys_in_fileio_props_are_not_vended() {
+        let mut props = HashMap::new();
+        props.insert(VENDED_ACCESS_KEY.to_string(), "AKIASTATIC".to_string());
+        props.insert(VENDED_SECRET_KEY.to_string(), "static-secret".to_string());
+        let s = storage(true);
+        let vended = vended_from_props(&props, &s);
+        assert!(vended.is_none());
+        assert_eq!(select_with(DistributedCredentialMode::Vended, &s, vended), None);
     }
 
     /// 401: `vended` never falls back to the static pair; `static` never

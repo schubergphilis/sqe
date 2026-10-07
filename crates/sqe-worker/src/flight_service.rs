@@ -291,9 +291,10 @@ const WORKER_SECRET_HEADER: &str = "x-sqe-worker-secret";
 /// limit. Empty `worker_secret` (dev mode) skips this check.
 const SCAN_SIGNATURE_HEADER: &str = "x-sqe-scan-signature";
 
-/// Metadata header carrying the HMAC-SHA256 tag (hex, via
-/// `sqe_compaction::wire::sign`) over the raw `CompactGroupRequest` wire
-/// bytes (Phase 4c Task 3). Mirrors `SCAN_SIGNATURE_HEADER`: the worker
+/// Metadata header carrying the coordinator's signature (`ed25519:<hex>`, or
+/// the legacy HMAC hex tag from `sqe_compaction::wire::sign`) over the raw
+/// `CompactGroupRequest` wire bytes (Phase 4c Task 3). Mirrors
+/// `SCAN_SIGNATURE_HEADER`: the worker
 /// recomputes the tag over the exact bytes it received and constant-time
 /// compares before decoding, so a tampered compaction request (swapped file
 /// path, forged S3 credentials) fails here rather than being executed.
@@ -1011,58 +1012,32 @@ impl WorkerFlightService {
         if self.worker_secret.is_empty() {
             return Ok(());
         }
-        use hmac::{Hmac, KeyInit, Mac};
-        use sha2::Sha256;
-        use subtle::ConstantTimeEq;
-
         let provided = metadata
             .get(SCAN_SIGNATURE_HEADER)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
 
-        // Finding 601: an `ed25519:` tag is checked against the pinned
-        // coordinator public key. Only the coordinator can produce it, so a
-        // compromised worker holding the shared secret cannot forge tickets.
-        if sqe_core::ticket_signing::TicketVerifier::is_asymmetric_signature(provided) {
-            let verifier = self.ticket_pin.as_ref().and_then(|p| p.verifier());
-            return match verifier {
-                Some(v) if v.verify(ticket_bytes, provided) => Ok(()),
-                Some(_) => Err(Status::unauthenticated("Invalid scan task signature")),
-                None => Err(Status::unauthenticated(
-                    "Coordinator ticket-signing key not pinned yet; retry after the next heartbeat",
-                )),
-            };
-        }
-        if !self.accept_hmac_tickets {
-            return Err(Status::unauthenticated(
-                "HMAC scan-ticket signatures are not accepted; set worker.accept_hmac_tickets \
-                 only while migrating from pre-Ed25519 coordinators",
-            ));
-        }
+        self.verify_coordinator_signature("scan task", provided, ticket_bytes, || {
+            use hmac::{Hmac, KeyInit, Mac};
+            use sha2::Sha256;
+            use subtle::ConstantTimeEq;
 
-        let mut mac = <Hmac<Sha256>>::new_from_slice(self.worker_secret.as_bytes())
-            .expect("HMAC accepts keys of any length");
-        mac.update(ticket_bytes);
-        let expected = mac.finalize().into_bytes();
-        let expected_hex = hex_encode(&expected);
-
-        let provided_bytes = provided.as_bytes();
-        let expected_bytes = expected_hex.as_bytes();
-        if provided_bytes.len() != expected_bytes.len()
-            || !bool::from(provided_bytes.ct_eq(expected_bytes))
-        {
-            return Err(Status::unauthenticated("Invalid scan task signature"));
-        }
-        Ok(())
+            let mut mac = <Hmac<Sha256>>::new_from_slice(self.worker_secret.as_bytes())
+                .expect("HMAC accepts keys of any length");
+            mac.update(ticket_bytes);
+            let expected_hex = hex_encode(&mac.finalize().into_bytes());
+            let provided_bytes = provided.as_bytes();
+            let expected_bytes = expected_hex.as_bytes();
+            provided_bytes.len() == expected_bytes.len()
+                && bool::from(provided_bytes.ct_eq(expected_bytes))
+        })
     }
 
-    /// Verify the HMAC-SHA256 signature over the raw `CompactGroupRequest`
-    /// bytes (Phase 4c Task 3). Delegates the tag computation to
-    /// `sqe_compaction::wire::verify` (rather than recomputing the HMAC
-    /// locally, as [`Self::verify_scan_signature`] does for scan tickets) so
-    /// the worker and the Task 4 coordinator job runner that signs these
-    /// requests share one signing implementation instead of two parallel
-    /// HMAC call sites that could drift apart.
+    /// Verify the signature over the raw `CompactGroupRequest` bytes
+    /// (Phase 4c Task 3). Same trust model as scan tickets (finding 601):
+    /// an `ed25519:` tag from the pinned coordinator key, or the legacy HMAC
+    /// tag (`sqe_compaction::wire::verify`, keyed by `worker_secret`) only
+    /// while `worker.accept_hmac_tickets` is set.
     ///
     /// When `worker_secret` is empty the deployment opted into
     /// `worker.allow_unauthenticated`; there is no key to sign with, so this
@@ -1080,10 +1055,41 @@ impl WorkerFlightService {
             .get(COMPACT_SIGNATURE_HEADER)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if !sqe_compaction::wire::verify(body, provided, &self.worker_secret) {
-            return Err(Status::unauthenticated(
-                "Invalid compaction request signature",
-            ));
+        self.verify_coordinator_signature("compaction request", provided, body, || {
+            sqe_compaction::wire::verify(body, provided, &self.worker_secret)
+        })
+    }
+
+    /// Finding 601: an `ed25519:` tag is checked against the pinned
+    /// coordinator public key. Only the coordinator can produce it, so a
+    /// compromised worker holding the shared secret cannot forge requests.
+    /// Any other tag is a legacy HMAC, checked by `hmac_ok` only when the
+    /// operator opted into `worker.accept_hmac_tickets`.
+    fn verify_coordinator_signature(
+        &self,
+        what: &str,
+        provided: &str,
+        body: &[u8],
+        hmac_ok: impl FnOnce() -> bool,
+    ) -> Result<(), Status> {
+        if sqe_core::ticket_signing::TicketVerifier::is_asymmetric_signature(provided) {
+            let verifier = self.ticket_pin.as_ref().and_then(|p| p.verifier());
+            return match verifier {
+                Some(v) if v.verify(body, provided) => Ok(()),
+                Some(_) => Err(Status::unauthenticated(format!("Invalid {what} signature"))),
+                None => Err(Status::unauthenticated(
+                    "Coordinator ticket-signing key not pinned yet; retry after the next heartbeat",
+                )),
+            };
+        }
+        if !self.accept_hmac_tickets {
+            return Err(Status::unauthenticated(format!(
+                "HMAC {what} signatures are not accepted; set worker.accept_hmac_tickets \
+                 only while migrating from pre-Ed25519 coordinators"
+            )));
+        }
+        if !hmac_ok() {
+            return Err(Status::unauthenticated(format!("Invalid {what} signature")));
         }
         Ok(())
     }
@@ -1415,8 +1421,8 @@ impl FlightService for WorkerFlightService {
             "compact_file_group" => {
                 // Compaction requests carry S3 credentials for the group's
                 // input/output files and drive a real rewrite. Require the
-                // worker secret AND the request-specific HMAC (#Phase 4c
-                // Task 3, mirrors the do_get scan-ticket gate from #206)
+                // worker secret AND the request-specific signature (Ed25519
+                // from the pinned coordinator key, like do_get scan tickets)
                 // over the exact wire bytes before decoding.
                 self.verify_worker_secret(&metadata)?;
                 self.verify_compaction_signature(&metadata, &action.body)?;
@@ -1432,6 +1438,10 @@ impl FlightService for WorkerFlightService {
                     request.expires_at,
                     !self.worker_secret.is_empty(),
                 )?;
+                // No S3 key check: an empty key pair is how IRSA / pod-role
+                // deployments (`distributed_credentials = worker_default`)
+                // hand the rewrite to the worker's own identity, and with a
+                // signed request that choice can only be the coordinator's.
                 let group_id = request.group_id;
 
                 info!(
@@ -2579,6 +2589,52 @@ mod tests {
         let request = Request::new(action);
         let err = unwrap_err(svc.do_action(request).await);
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    fn signed_compact_action(signature: &str, body: Vec<u8>) -> Request<Action> {
+        let mut request = Request::new(Action {
+            r#type: "compact_file_group".to_string(),
+            body: bytes::Bytes::from(body),
+        });
+        request
+            .metadata_mut()
+            .insert(WORKER_SECRET_HEADER, "expected-secret".parse().unwrap());
+        request
+            .metadata_mut()
+            .insert(COMPACT_SIGNATURE_HEADER, signature.parse().unwrap());
+        request
+    }
+
+    /// L4: compaction requests carry the same trust as scan tickets. A
+    /// request signed by the pinned coordinator key passes the gates; one
+    /// signed by any other key does not.
+    #[tokio::test]
+    async fn compact_file_group_accepts_only_the_pinned_ed25519_key() {
+        let coordinator = sqe_core::ticket_signing::TicketSigner::generate().unwrap();
+        let impostor = sqe_core::ticket_signing::TicketSigner::generate().unwrap();
+        let svc = ed25519_service(Some(&coordinator));
+        let body = make_compact_request_bytes();
+
+        let request = signed_compact_action(&coordinator.sign(&body), body.clone());
+        let response = unwrap_ok(svc.do_action(request).await);
+        let err = drain_to_first_error(response).await;
+        assert_ne!(err.code(), tonic::Code::Unauthenticated, "{err}");
+
+        let request = signed_compact_action(&impostor.sign(&body), body);
+        let err = unwrap_err(svc.do_action(request).await);
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    /// L4: a shared-secret HMAC tag no longer authorizes a rewrite unless
+    /// the operator opted into `worker.accept_hmac_tickets`.
+    #[tokio::test]
+    async fn compact_file_group_rejects_hmac_tag_without_opt_in() {
+        let svc = ed25519_service(None);
+        let body = make_compact_request_bytes();
+        let signature = sqe_compaction::wire::sign(&body, "expected-secret");
+        let err = unwrap_err(svc.do_action(signed_compact_action(&signature, body)).await);
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert!(err.message().contains("HMAC"), "{err}");
     }
 
     // ---- finding 608: the rewrite is tied to the RPC -------------------

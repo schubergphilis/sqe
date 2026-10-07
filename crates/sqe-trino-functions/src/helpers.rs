@@ -774,10 +774,39 @@ pub(crate) fn micros_to_local_naive(us: i64, tz: Option<&str>) -> Option<NaiveDa
     }
 }
 
+/// Render `dt` with a chrono strftime pattern, returning an error instead of
+/// panicking: `DelayedFormat::to_string` panics on an unknown specifier or
+/// one a zoneless value cannot render (`%z` on a `NaiveDateTime`).
+pub(crate) fn strftime_naive(func: &str, dt: &NaiveDateTime, fmt: &str) -> DFResult<String> {
+    use chrono::format::{Item, StrftimeItems};
+    use std::fmt::Write as _;
+    let items: Vec<Item> = StrftimeItems::new(fmt).collect();
+    let bad = || DataFusionError::Execution(format!("{func}: unsupported format pattern '{fmt}'"));
+    if items.iter().any(|i| matches!(i, Item::Error)) {
+        return Err(bad());
+    }
+    let mut out = String::new();
+    write!(out, "{}", dt.format_with_items(items.iter())).map_err(|_| bad())?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::array::StringViewArray;
+
+    #[test]
+    fn strftime_naive_errors_instead_of_panicking() {
+        let dt = chrono::NaiveDate::from_ymd_opt(2024, 1, 15)
+            .unwrap()
+            .and_hms_opt(10, 30, 0)
+            .unwrap();
+        assert_eq!(strftime_naive("f", &dt, "%Y-%m-%d").unwrap(), "2024-01-15");
+        // %z needs an offset a NaiveDateTime does not have.
+        assert!(strftime_naive("f", &dt, "%Y %z").is_err());
+        // Unknown specifier.
+        assert!(strftime_naive("f", &dt, "%Q").is_err());
+    }
 
     #[test]
     fn str_transform_rejects_non_string_scalar_with_trino_message() {

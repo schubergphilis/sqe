@@ -15,13 +15,16 @@
 # Reuse the packaged cargo-chef binary without surrendering the repository's
 # pinned Rust toolchain to whichever compiler the cargo-chef image currently
 # carries.
-FROM lukemathwalker/cargo-chef:latest-rust-bookworm@sha256:5a37e174ceb7ccbebd6d0024049e9308f4de399bbcabbc3c6c649c70486880d5 AS cargo-chef-bin
+FROM lukemathwalker/cargo-chef:latest-rust-bookworm@sha256:2ee6e8edf0b91b5a7295071299596601710bccb243bd9735e0b9abf6e114582b AS cargo-chef-bin
 
 # Renovate's "container images" group bumps tag and digest together; the rust tag must match rust-toolchain.toml.
 FROM rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS chef
 
 ARG TARGETARCH
 ARG SCCACHE_VERSION=0.9.0
+# Upstream release .sha256 files for SCCACHE_VERSION; bump together.
+ARG SCCACHE_SHA256_X86_64=f29522f9aa70aa929b7e76b6d4a1286196b17668ea753e5687899a8f7e4b9d3e
+ARG SCCACHE_SHA256_AARCH64=d0122fbeda107eff00a6401d6e3085fd1e361813821a05bcd224fc1d7071ecdf
 
 COPY --from=cargo-chef-bin /usr/local/cargo/bin/cargo-chef /usr/local/cargo/bin/cargo-chef
 
@@ -32,14 +35,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake protobuf-compiler libprotobuf-dev libssl-dev pkg-config clang lld curl \
     && rm -rf /var/lib/apt/lists/* \
     && case "$TARGETARCH" in \
-         amd64) SCCACHE_ARCH=x86_64 ;; \
-         arm64) SCCACHE_ARCH=aarch64 ;; \
+         amd64) SCCACHE_ARCH=x86_64 SCCACHE_SHA256=$SCCACHE_SHA256_X86_64 ;; \
+         arm64) SCCACHE_ARCH=aarch64 SCCACHE_SHA256=$SCCACHE_SHA256_AARCH64 ;; \
          *) echo "unsupported arch: $TARGETARCH" >&2; exit 1 ;; \
        esac \
-    && curl -fsSL \
+    && curl -fsSL -o /tmp/sccache.tar.gz \
       "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz" \
-      | tar xz --strip-components=1 -C /usr/local/bin \
-        "sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl/sccache"
+    && echo "${SCCACHE_SHA256}  /tmp/sccache.tar.gz" | sha256sum -c - \
+    && tar xzf /tmp/sccache.tar.gz --strip-components=1 -C /usr/local/bin \
+        "sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl/sccache" \
+    && rm /tmp/sccache.tar.gz
 
 ENV RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=lld" \
     RUSTC_WRAPPER=sccache \
@@ -98,7 +103,7 @@ RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},sharing=locked,target
 
 # Digest-pinned; Renovate bumps the runtime independently of builder tooling.
 # Keep this digest in lockstep with Dockerfile.bench.
-FROM cgr.dev/chainguard/glibc-dynamic@sha256:6acf5a19a988abdaf0f3d30247561431a206034e702871442bed66a2c68cc1a2 AS runtime-base
+FROM cgr.dev/chainguard/glibc-dynamic@sha256:82edc253a57efee78d0fb504e11a93b7c74687b1b736110ad3a2a4f3edf632ab AS runtime-base
 
 USER 65532
 

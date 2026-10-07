@@ -20,6 +20,7 @@ The MCP block has its own page with the authorization model and tool reference: 
 [coordinator]
 flight_sql_port = 50051         # Flight SQL gRPC port
 trino_http_port = 8080          # Trino-compat HTTP port (0 to disable)
+trino_https_port = 0            # Trino-compat over TLS with [coordinator.trino_tls] (0 = off)
 mode = "hybrid"                 # "coordinator", "worker", "hybrid", "local", "distributed"
 worker_urls = []                # Worker Flight URLs for distributed mode
 worker_secret = ""              # Shared secret for worker heartbeat auth (empty disables the check)
@@ -48,6 +49,11 @@ ca_file = ""                    # Optional PEM CA. Server side: requires a clien
                                 # every listener. Client side: trust root for https:// worker and
                                 # coordinator URLs. Required for a private cluster CA.
 allow_ip_advertise = false      # Permit a bare-IP worker.advertise_url under TLS (needs IP SANs)
+
+# [coordinator.trino_tls]       # Certificate for trino_https_port; same fields as above.
+# cert_file = ""                # Hot-reloaded every 60s like the other HTTP listeners.
+# key_file = ""
+# ca_file = ""                  # Optional: require client certificates on the Trino HTTPS port
 
 [mcp]                           # Model Context Protocol endpoint. Off by default.
 enabled = false                 # true mounts /mcp. A nonzero port alone still does, with a deprecation WARN, for one release
@@ -141,7 +147,15 @@ default_table_format_version = 2 # Iceberg table format version (2 or 3)
 trust_sort_order = false        # Trust Iceberg sort order for all columns, not just partition keys
 small_file_threshold_mb = 3     # Max file size for the direct-read fast path (0 to disable)
 parquet_compression = "zstd"    # Write-path Parquet codec: zstd, lz4, snappy, none
-require_vended_credentials = false # When true, FileIO never gets [storage] keys (issue #395)
+access_delegation = "none"      # "none" or "vended-credentials": send X-Iceberg-Access-Delegation so
+                                # the catalog vends table-scoped keys, which beat [storage] keys
+require_vended_credentials = false # When true, FileIO never gets [storage] keys (issue #395); implies
+                                # access_delegation = "vended-credentials"
+tvf_prefixes = []               # Extra object-store prefixes file TVFs may read in sessions
+                                # scoped to THIS catalog only; added to [storage.tvf]
+                                # allowed_object_store_prefixes. Also on [catalogs.<name>].
+                                # Opens only when the catalog answered the caller's own
+                                # bearer (per-user REST auth), never on the name alone.
 
 # `catalog_url` accepts any Iceberg REST endpoint. SQE has been
 # verified live against Apache Polaris, Project Nessie 0.107+,
@@ -398,6 +412,7 @@ Every config field can be overridden via environment variable. Convention: `SQE_
 | `SQE_CATALOG__CATALOG_URL` | `catalog.catalog_url` | string |
 | `SQE_CATALOG__POLARIS_URL` | `catalog.catalog_url` (legacy alias) | string |
 | `SQE_CATALOG__WAREHOUSE` | `catalog.warehouse` | string |
+| `SQE_CATALOG__ACCESS_DELEGATION` | `catalog.access_delegation` | `none` / `vended-credentials` |
 | `SQE_CATALOG__REQUIRE_VENDED_CREDENTIALS` | `catalog.require_vended_credentials` | bool |
 | `SQE_CATALOG__METADATA_CACHE_TTL_SECS` | `catalog.metadata_cache_ttl_secs` | u64 |
 | `SQE_CATALOG__DEFAULT_TABLE_FORMAT_VERSION` | `catalog.default_table_format_version` | u8 |
@@ -467,7 +482,7 @@ With TLS on, `worker.advertise_url` must resolve to a hostname. A worker that wo
 
 ### Certificate rotation
 
-The HTTP listeners (MCP, Quack) poll `cert_file` and `key_file` every 60 seconds and swap the certificate in place. A cert-manager renewal is picked up within about a minute, with no dropped connections and no restart. A half-written pair is rejected and retried on the next poll, so the listener never serves a mismatched cert and key.
+The HTTP listeners (MCP, Quack, and the Trino HTTPS port with `[coordinator.trino_tls]`) poll `cert_file` and `key_file` every 60 seconds and swap the certificate in place. A cert-manager renewal is picked up within about a minute, with no dropped connections and no restart. A half-written pair is rejected and retried on the next poll, so the listener never serves a mismatched cert and key.
 
 The Flight (gRPC) listener does not do this. tonic builds its TLS acceptor once at startup and offers no way to replace it on a live server, so the Flight port keeps serving the certificate it booted with. Cover that in Kubernetes with a reloader sidecar that restarts the pod when the TLS secret changes:
 
@@ -529,8 +544,10 @@ Each entry requires a `type`:
 | `token_exchange` | `token_url`, `client_id` | RFC 8693 token exchange |
 | `aws_iam` | none | AWS IAM via STS `GetCallerIdentity` |
 | `api_key` | `keys_file` | API key from a TOML keys file |
-| `mtls` | none | Client certificate authentication |
+| `mtls` | none | Reserved; startup rejects it because current listeners do not extract verified peer identities |
 | `anonymous` | none | Fixed identity for dev / test |
+
+The `mtls` auth provider is reserved. Transport mutual TLS through the configured client CA still verifies client certificates, but current adapters do not map those certificates to a SQL identity.
 
 A common production chain accepts both interactive logins (password grant) and pre-minted JWTs from programmatic clients:
 
@@ -567,13 +584,12 @@ allow_unbounded_issuer = false                          # Allow missing/empty is
 
 Auth0 and Okta use the same two-provider shape, differing only in `token_url`, `jwks_url`, `issuer`, and the `roles_claim` path (Auth0 uses a namespaced claim, Okta uses `groups`).
 
-AWS IAM maps caller ARNs to SQE roles:
+AWS IAM verifies every access key and secret with STS `GetCallerIdentity`, then maps the caller ARN to SQE roles. There is no config-only mode: `validate_with_sts = false` fails at startup.
 
 ```toml
 [[auth.providers]]
 type = "aws_iam"
 region = "eu-west-1"
-validate_with_sts = true
 
 [auth.role_mappings]
 "arn:aws:iam::123456789012:role/DataAnalyst" = ["analyst", "reader"]

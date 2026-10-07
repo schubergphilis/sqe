@@ -31,6 +31,10 @@ vendor/iceberg-rust/Cargo.lock
 !crates/sqe-core/tests/fixtures/tls/*.crt
 !crates/sqe-core/tests/fixtures/tls/*.key
 
+# Python bytecode
+__pycache__/
+*.pyc
+
 # Logs
 *.log
 *.jsonl
@@ -54,3 +58,6 @@ testing/tempto/*.hprof
 # Benchmark profiles carrying real credentials are never committed.
 benchmarks/profiles/*.local.toml
 benchmarks/profiles/*.secret.toml
+
+# Downloaded immutable Aikido control scripts
+.aikido-shared/

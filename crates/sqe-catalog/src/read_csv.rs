@@ -183,7 +183,7 @@ impl ReadCsvFunction {
             storage,
             caller: TvfCaller::default(),
             runtime_env: None,
-            prepared: PreparedProviders::default(),
+            prepared: PreparedProviders::named(FN_NAME),
         }
     }
 
@@ -193,7 +193,7 @@ impl ReadCsvFunction {
             storage,
             caller,
             runtime_env: None,
-            prepared: PreparedProviders::default(),
+            prepared: PreparedProviders::named(FN_NAME),
         }
     }
 

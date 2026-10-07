@@ -511,15 +511,18 @@ fn generate_dim_date() -> (SchemaRef, Vec<RecordBatch>) {
     (schema, vec![batch])
 }
 
-fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_customer(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let schema = customer_schema();
     let total = super::scaled(scale, 30_000.0);
     let total = total.max(1);
     let mut rng = StdRng::seed_from_u64(seed_for_table("customer"));
-    let mut batches = Vec::new();
 
     let mut offset = 0usize;
-    while offset < total {
+    let output_schema = schema.clone();
+    let batches = std::iter::from_fn(move || {
+        if offset >= total {
+            return None;
+        }
         let n = BATCH_SIZE.min(total - offset);
         let mut c_custkey = Vec::with_capacity(n);
         let mut c_name = Vec::with_capacity(n);
@@ -555,37 +558,39 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let phone_refs: Vec<&str> = c_phone.iter().map(|s| s.as_str()).collect();
         let seg_refs: Vec<&str> = c_mktsegment.iter().map(|s| s.as_str()).collect();
 
-        batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from(c_custkey)),
-                    Arc::new(StringArray::from(name_refs)),
-                    Arc::new(StringArray::from(addr_refs)),
-                    Arc::new(StringArray::from(city_refs)),
-                    Arc::new(StringArray::from(nation_refs)),
-                    Arc::new(StringArray::from(region_refs)),
-                    Arc::new(StringArray::from(phone_refs)),
-                    Arc::new(StringArray::from(seg_refs)),
-                ],
-            )
-            .expect("customer batch"),
-        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(c_custkey)),
+                Arc::new(StringArray::from(name_refs)),
+                Arc::new(StringArray::from(addr_refs)),
+                Arc::new(StringArray::from(city_refs)),
+                Arc::new(StringArray::from(nation_refs)),
+                Arc::new(StringArray::from(region_refs)),
+                Arc::new(StringArray::from(phone_refs)),
+                Arc::new(StringArray::from(seg_refs)),
+            ],
+        )
+        .expect("customer batch");
         offset += n;
-    }
+        Some(batch)
+    });
 
-    (schema, batches)
+    (output_schema, Box::new(batches))
 }
 
-fn generate_supplier(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_supplier(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let schema = supplier_schema();
     let total = super::scaled(scale, 2_000.0);
     let total = total.max(1);
     let mut rng = StdRng::seed_from_u64(seed_for_table("supplier"));
-    let mut batches = Vec::new();
 
     let mut offset = 0usize;
-    while offset < total {
+    let output_schema = schema.clone();
+    let batches = std::iter::from_fn(move || {
+        if offset >= total {
+            return None;
+        }
         let n = BATCH_SIZE.min(total - offset);
         let mut s_suppkey = Vec::with_capacity(n);
         let mut s_name = Vec::with_capacity(n);
@@ -617,37 +622,39 @@ fn generate_supplier(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let region_refs: Vec<&str> = s_region.iter().map(|s| s.as_str()).collect();
         let phone_refs: Vec<&str> = s_phone.iter().map(|s| s.as_str()).collect();
 
-        batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from(s_suppkey)),
-                    Arc::new(StringArray::from(name_refs)),
-                    Arc::new(StringArray::from(addr_refs)),
-                    Arc::new(StringArray::from(city_refs)),
-                    Arc::new(StringArray::from(nation_refs)),
-                    Arc::new(StringArray::from(region_refs)),
-                    Arc::new(StringArray::from(phone_refs)),
-                ],
-            )
-            .expect("supplier batch"),
-        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(s_suppkey)),
+                Arc::new(StringArray::from(name_refs)),
+                Arc::new(StringArray::from(addr_refs)),
+                Arc::new(StringArray::from(city_refs)),
+                Arc::new(StringArray::from(nation_refs)),
+                Arc::new(StringArray::from(region_refs)),
+                Arc::new(StringArray::from(phone_refs)),
+            ],
+        )
+        .expect("supplier batch");
         offset += n;
-    }
+        Some(batch)
+    });
 
-    (schema, batches)
+    (output_schema, Box::new(batches))
 }
 
-fn generate_part(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_part(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let schema = part_schema();
     // SSB spec: SF × 200,000 × 0.4 = SF × 80,000
     let total = super::scaled(scale, 80_000.0);
     let total = total.max(1);
     let mut rng = StdRng::seed_from_u64(seed_for_table("part"));
-    let mut batches = Vec::new();
 
     let mut offset = 0usize;
-    while offset < total {
+    let output_schema = schema.clone();
+    let batches = std::iter::from_fn(move || {
+        if offset >= total {
+            return None;
+        }
         let n = BATCH_SIZE.min(total - offset);
         let mut p_partkey = Vec::with_capacity(n);
         let mut p_name = Vec::with_capacity(n);
@@ -692,38 +699,53 @@ fn generate_part(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let type_refs: Vec<&str> = p_type.iter().map(|s| s.as_str()).collect();
         let container_refs: Vec<&str> = p_container.iter().map(|s| s.as_str()).collect();
 
-        batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from(p_partkey)),
-                    Arc::new(StringArray::from(name_refs)),
-                    Arc::new(StringArray::from(mfgr_refs)),
-                    Arc::new(StringArray::from(cat_refs)),
-                    Arc::new(StringArray::from(brand_refs)),
-                    Arc::new(StringArray::from(color_refs)),
-                    Arc::new(StringArray::from(type_refs)),
-                    Arc::new(Int32Array::from(p_size)),
-                    Arc::new(StringArray::from(container_refs)),
-                ],
-            )
-            .expect("part batch"),
-        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(p_partkey)),
+                Arc::new(StringArray::from(name_refs)),
+                Arc::new(StringArray::from(mfgr_refs)),
+                Arc::new(StringArray::from(cat_refs)),
+                Arc::new(StringArray::from(brand_refs)),
+                Arc::new(StringArray::from(color_refs)),
+                Arc::new(StringArray::from(type_refs)),
+                Arc::new(Int32Array::from(p_size)),
+                Arc::new(StringArray::from(container_refs)),
+            ],
+        )
+        .expect("part batch");
         offset += n;
-    }
+        Some(batch)
+    });
 
-    (schema, batches)
+    (output_schema, Box::new(batches))
 }
 
-fn generate_lineorder(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+/// An order's line count and date index, from a hash of its key, so the
+/// date index and the emitted rows agree. Lines keep the old sequential
+/// rule's distribution: after line k the order ends with probability k/7.
+fn order_head(seed: u64, order_key: u32, n_dates: usize) -> (usize, usize) {
+    let h = super::mix64(seed ^ order_key as u64);
+    let date_idx = (h % n_dates as u64) as usize;
+    let mut lines = 1;
+    while lines < 7 {
+        let r = 1 + (super::mix64(h ^ lines as u64) % 7) as usize;
+        if r <= lines {
+            break;
+        }
+        lines += 1;
+    }
+    (lines, date_idx)
+}
+
+fn stream_lineorder(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let schema = lineorder_schema();
     let total = super::scaled(scale, 6_000_000.0);
     let total = total.max(1);
     let num_customers = (scale * 30_000.0) as i32;
     let num_parts = (scale * 80_000.0) as i32;
     let num_suppliers = (scale * 2_000.0) as i32;
-    let mut rng = StdRng::seed_from_u64(seed_for_table("lineorder"));
-    let mut batches = Vec::new();
+    let seed = seed_for_table("lineorder");
 
     // Ordered list of every valid date key, so a commit date can be expressed as
     // the order date advanced by a number of days (datekeys are YYYYMMDD, which
@@ -731,15 +753,36 @@ fn generate_lineorder(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let date_keys = all_date_keys();
     let n_dates = date_keys.len();
 
-    // State for multi-line orders
+    // Orders 1..=last, the last cut to `last_lines` so the table has exactly
+    // `total` rows, emitted in order-date order (`load` sorts lineorder by
+    // lo_orderdate). Each order's values come from its own generator, so they
+    // do not depend on the emission order.
+    let mut rows = 0usize;
+    let mut last = 0u32;
+    let last_lines = loop {
+        last += 1;
+        let (lines, _) = order_head(seed, last, n_dates);
+        if rows + lines >= total {
+            break total - rows;
+        }
+        rows += lines;
+    };
+    let orders = super::counting_order(1..=last, n_dates, |o| order_head(seed, o, n_dates).1);
+    let mut next = 0usize;
+    let mut rng = StdRng::seed_from_u64(seed);
     let mut order_key: i64 = 0;
+    let mut order_lines: usize = 0;
     let mut line_number: i32 = 1;
-    let mut order_idx: usize = rng.random_range(0..n_dates);
-    let mut order_date: i32 = date_keys[order_idx];
-    let mut order_total: f64 = (rng.random_range(10_000..5_000_000_i64) as f64) / 100.0;
+    let mut order_idx: usize = 0;
+    let mut order_date: i32 = 0;
+    let mut order_total: f64 = 0.0;
 
     let mut offset = 0usize;
-    while offset < total {
+    let output_schema = schema.clone();
+    let batches = std::iter::from_fn(move || {
+        if offset >= total {
+            return None;
+        }
         let n = BATCH_SIZE.min(total - offset);
         let mut lo_orderkey = Vec::with_capacity(n);
         let mut lo_linenumber = Vec::with_capacity(n);
@@ -760,10 +803,16 @@ fn generate_lineorder(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let mut lo_shipmode = Vec::with_capacity(n);
 
         for _ in 0..n {
-            if line_number == 1 {
-                order_key += 1;
-                order_idx = rng.random_range(0..n_dates);
+            if line_number as usize > order_lines {
+                let order = orders[next];
+                next += 1;
+                let (lines, idx) = order_head(seed, order, n_dates);
+                order_key = order as i64;
+                order_lines = if order == last { last_lines } else { lines };
+                order_idx = idx;
                 order_date = date_keys[order_idx];
+                line_number = 1;
+                rng = StdRng::seed_from_u64(seed ^ order as u64);
                 order_total = (rng.random_range(10_000..5_000_000_i64) as f64) / 100.0;
             }
 
@@ -800,45 +849,40 @@ fn generate_lineorder(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             lo_commitdate.push(commit_date);
             lo_shipmode.push(SHIP_MODES[rng.random_range(0..SHIP_MODES.len())].to_string());
 
-            // Advance line_number; when it exceeds a random 1..=7 bound, reset
             line_number += 1;
-            if line_number > rng.random_range(1..=7i32) {
-                line_number = 1;
-            }
         }
 
         let priority_refs: Vec<&str> = lo_orderpriority.iter().map(|s| s.as_str()).collect();
         let mode_refs: Vec<&str> = lo_shipmode.iter().map(|s| s.as_str()).collect();
 
-        batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int64Array::from(lo_orderkey)),
-                    Arc::new(Int32Array::from(lo_linenumber)),
-                    Arc::new(Int32Array::from(lo_custkey)),
-                    Arc::new(Int32Array::from(lo_partkey)),
-                    Arc::new(Int32Array::from(lo_suppkey)),
-                    Arc::new(Int32Array::from(lo_orderdate)),
-                    Arc::new(StringArray::from(priority_refs)),
-                    Arc::new(Int32Array::from(lo_shippriority)),
-                    Arc::new(Int32Array::from(lo_quantity)),
-                    Arc::new(Float64Array::from(lo_extendedprice)),
-                    Arc::new(Float64Array::from(lo_ordtotalprice)),
-                    Arc::new(Int32Array::from(lo_discount)),
-                    Arc::new(Float64Array::from(lo_revenue)),
-                    Arc::new(Float64Array::from(lo_supplycost)),
-                    Arc::new(Int32Array::from(lo_tax)),
-                    Arc::new(Int32Array::from(lo_commitdate)),
-                    Arc::new(StringArray::from(mode_refs)),
-                ],
-            )
-            .expect("lineorder batch"),
-        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(lo_orderkey)),
+                Arc::new(Int32Array::from(lo_linenumber)),
+                Arc::new(Int32Array::from(lo_custkey)),
+                Arc::new(Int32Array::from(lo_partkey)),
+                Arc::new(Int32Array::from(lo_suppkey)),
+                Arc::new(Int32Array::from(lo_orderdate)),
+                Arc::new(StringArray::from(priority_refs)),
+                Arc::new(Int32Array::from(lo_shippriority)),
+                Arc::new(Int32Array::from(lo_quantity)),
+                Arc::new(Float64Array::from(lo_extendedprice)),
+                Arc::new(Float64Array::from(lo_ordtotalprice)),
+                Arc::new(Int32Array::from(lo_discount)),
+                Arc::new(Float64Array::from(lo_revenue)),
+                Arc::new(Float64Array::from(lo_supplycost)),
+                Arc::new(Int32Array::from(lo_tax)),
+                Arc::new(Int32Array::from(lo_commitdate)),
+                Arc::new(StringArray::from(mode_refs)),
+            ],
+        )
+        .expect("lineorder batch");
         offset += n;
-    }
+        Some(batch)
+    });
 
-    (schema, batches)
+    (output_schema, Box::new(batches))
 }
 
 // ---------------------------------------------------------------------------
@@ -848,6 +892,10 @@ fn generate_lineorder(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 impl BenchmarkGenerator for SsbGenerator {
     fn name(&self) -> &str {
         "ssb"
+    }
+
+    fn sorted_by(&self, table: &str) -> Option<&'static str> {
+        (table == "lineorder").then_some("lo_orderdate")
     }
 
     fn tables(&self) -> Vec<TableDef> {
@@ -889,12 +937,23 @@ impl BenchmarkGenerator for SsbGenerator {
     ) -> anyhow::Result<GenerateStats> {
         let start = std::time::Instant::now();
 
-        let (schema, batches) = build_ssb_table(table, scale, _config)?;
+        let (schema, batches) = stream_ssb_table(table, scale, _config)?;
 
         let full_output = format!("{output_dir}/ssb/sf{scale}");
-        let (files, bytes) =
-            parquet_writer::write_parquet_files(&batches, schema, &full_output, table)?;
-        let rows = batches.iter().map(|b| b.num_rows()).sum();
+        let rows = self
+            .tables()
+            .into_iter()
+            .find(|t| t.name == table)
+            .map(|t| (t.row_count)(scale).max(1))
+            .expect("validated table");
+        let (files, bytes) = parquet_writer::write_parquet_stream(
+            batches,
+            schema,
+            &full_output,
+            table,
+            "",
+            _config,
+        )?;
 
         Ok(GenerateStats {
             table: table.to_string(),
@@ -912,10 +971,15 @@ impl BenchmarkGenerator for SsbGenerator {
         config: &super::GenerateConfig,
     ) -> anyhow::Result<super::BatchSource> {
         use super::{BatchShard, BatchSource};
-        let (schema, batches) = build_ssb_table(table, scale, config)?;
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let (schema, batches) = stream_ssb_table(table, scale, config)?;
+        let total_rows = self
+            .tables()
+            .into_iter()
+            .find(|t| t.name == table)
+            .map(|t| (t.row_count)(scale).max(1))
+            .expect("validated table");
         let make: Box<dyn FnOnce() -> Box<dyn Iterator<Item = RecordBatch> + Send> + Send> =
-            Box::new(move || Box::new(batches.into_iter()));
+            Box::new(move || batches);
         Ok(BatchSource {
             schema,
             total_rows,
@@ -926,17 +990,20 @@ impl BenchmarkGenerator for SsbGenerator {
 
 /// Build the (schema, batches) for one SSB table. Shared by `generate_table`
 /// (staged to Parquet) and `generate_batches` (direct-to-Iceberg sink).
-fn build_ssb_table(
+fn stream_ssb_table(
     table: &str,
     scale: f64,
     _config: &super::GenerateConfig,
-) -> anyhow::Result<(SchemaRef, Vec<RecordBatch>)> {
+) -> anyhow::Result<(SchemaRef, super::BatchIterator)> {
     Ok(match table {
-        "dim_date" => generate_dim_date(),
-        "customer" => generate_customer(scale),
-        "supplier" => generate_supplier(scale),
-        "part" => generate_part(scale),
-        "lineorder" => generate_lineorder(scale),
+        "dim_date" => {
+            let (schema, batches) = generate_dim_date();
+            (schema, Box::new(batches.into_iter()))
+        }
+        "customer" => stream_customer(scale),
+        "supplier" => stream_supplier(scale),
+        "part" => stream_part(scale),
+        "lineorder" => stream_lineorder(scale),
         _ => anyhow::bail!("Unknown SSB table: {table}"),
     })
 }
@@ -947,6 +1014,28 @@ fn build_ssb_table(
 
 #[cfg(test)]
 mod tests {
+    // Existing semantic tests inspect materialized small tables; production is lazy.
+    #[allow(dead_code)]
+    fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_customer(scale);
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_supplier(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_supplier(scale);
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_part(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_part(scale);
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_lineorder(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_lineorder(scale);
+        (schema, batches.collect())
+    }
+
     use super::*;
     use crate::generate::BenchmarkGenerator;
 

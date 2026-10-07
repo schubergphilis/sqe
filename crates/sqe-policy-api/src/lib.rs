@@ -41,6 +41,81 @@ pub struct ResolvedPolicy {
     pub restricted_columns: Vec<String>,
 }
 
+impl ResolvedPolicy {
+    /// True when `column` is restricted. Entries are column names compared
+    /// without regard to case, as Ranger compares datamask and row-filter
+    /// `column` resources (`ignoreCase: true`, `wildCard: false` in the
+    /// `hive` service definition): `card_*` names a column called `card_*`.
+    pub fn is_restricted(&self, column: &str) -> bool {
+        let folded = column.to_lowercase();
+        self.restricted_columns.iter().any(|c| c.to_lowercase() == folded)
+    }
+
+    /// The mask that applies to `column`: an exact key first, else a key that
+    /// differs only by case (the one that sorts first, so the choice is
+    /// deterministic). Callers check [`Self::is_restricted`] first, so a
+    /// restriction on any spelling of the column beats a mask.
+    pub fn mask_for(&self, column: &str) -> Option<&MaskType> {
+        if let Some(mask) = self.column_masks.get(column) {
+            return Some(mask);
+        }
+        let folded = column.to_lowercase();
+        self.column_masks
+            .iter()
+            .filter(|(c, _)| c.to_lowercase() == folded)
+            .min_by_key(|(c, _)| *c)
+            .map(|(_, mask)| mask)
+    }
+}
+
+/// Ranger wildcard match: `*` matches any run of characters (including none),
+/// `?` matches exactly one.
+///
+/// Semantics taken from the live `hive` service definition, whose access
+/// policy `database`, `table` and `column` resources declare
+/// `matcherOptions: {wildCard: "true", ignoreCase: "true"}`. Ranger implements
+/// that with commons-io `FilenameUtils.wildcardMatch` and `IOCase.INSENSITIVE`,
+/// where no character other than `*` and `?` is special.
+///
+/// Case folding is part of the same contract, not a separate liberty: with
+/// `ignoreCase: true`, a policy written on `Orders` fires for `orders` in Ranger.
+///
+/// Datamask and row-filter resources are different: `dataMaskDef` and
+/// `rowFilterDef` declare `wildCard: "false"`, so their column entries are
+/// plain names compared without case (see [`ResolvedPolicy::is_restricted`]).
+///
+/// Iterative with a single backtrack point, so a pattern like `*a*a*a*a*` cannot
+/// blow up: policies are operator input reaching a per-query path.
+pub fn wildcard_match(pattern: &str, target: &str) -> bool {
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    let t: Vec<char> = target.to_lowercase().chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut resume = 0usize;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            pi += 1;
+            resume = ti;
+        } else if let Some(s) = star {
+            // Backtrack: let the last `*` swallow one more character.
+            pi = s + 1;
+            resume += 1;
+            ti = resume;
+        } else {
+            return false;
+        }
+    }
+    // Trailing `*`s may match nothing.
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 /// Types of column masking supported.
 #[derive(Debug, Clone)]
 pub enum MaskType {
@@ -122,6 +197,29 @@ pub struct MaskPolicyInfo {
     pub grantees: String,
 }
 
+/// A table-level DDL privilege, for statements that change or remove a table
+/// definition rather than read its rows. Only tables whose definition SQE
+/// owns (Hive-root tables) ask for one; an Iceberg table's DDL is decided by
+/// its catalog under the caller's own bearer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TablePrivilege {
+    /// Change the definition in place (Ranger `alter`).
+    Alter,
+    /// Remove or replace the definition (Ranger `drop`).
+    Drop,
+}
+
+impl TablePrivilege {
+    /// The `hive` servicedef access type that carries this privilege. `all`
+    /// carries every one of them.
+    pub fn access_type(self) -> &'static str {
+        match self {
+            Self::Alter => "alter",
+            Self::Drop => "drop",
+        }
+    }
+}
+
 /// Trait for policy storage backends. Implementations resolve policies
 /// for a given (user, table) pair from an external system.
 #[async_trait]
@@ -194,6 +292,26 @@ pub trait PolicyStore: Send + Sync {
         ))
     }
 
+    /// Does the policy engine grant `user` the DDL `privilege` on this table?
+    ///
+    /// `namespace` is keyed exactly as `resolve` is (`{root}.{database}` for
+    /// a Hive-root table). This is one way to hold DDL authority over a table,
+    /// next to an admin role and ownership; it can only add authority, never
+    /// take an admin's or an owner's away.
+    ///
+    /// The default answers `false`: a backend without a privilege model
+    /// grants nothing, so its callers fall back to admin or owner. A backend
+    /// gains it by overriding this.
+    async fn grants_table_privilege(
+        &self,
+        _user: &SessionUser,
+        _table_name: &str,
+        _namespace: &str,
+        _privilege: TablePrivilege,
+    ) -> sqe_core::Result<bool> {
+        Ok(false)
+    }
+
     /// Create or replace a fine-grained row-filter / column-mask policy.
     async fn create_policy(
         &self,
@@ -223,4 +341,41 @@ pub trait PolicyStore: Send + Sync {
     /// default no-op. The method is synchronous because moka's
     /// `invalidate_all()` is synchronous (it only marks existing entries stale).
     fn invalidate_all(&self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Datamask column entries match like Ranger's `dataMaskDef`: any case,
+    /// no wildcards. `card_*` is a literal name, not a pattern.
+    #[test]
+    fn column_entries_match_like_ranger_datamask() {
+        let mut p = ResolvedPolicy::default();
+        p.column_masks.insert("card_*".to_string(), MaskType::Hash);
+        p.column_masks.insert("SSN".to_string(), MaskType::Nullify);
+        p.restricted_columns.push("*".to_string());
+        assert!(p.mask_for("card_number").is_none());
+        assert!(matches!(p.mask_for("card_*"), Some(MaskType::Hash)));
+        assert!(matches!(p.mask_for("ssn"), Some(MaskType::Nullify)));
+        assert!(p.mask_for("name").is_none());
+        assert!(!p.is_restricted("anything"));
+
+        let mut q = ResolvedPolicy::default();
+        q.restricted_columns.push("Notes".to_string());
+        assert!(q.is_restricted("notes"));
+        assert!(q.is_restricted("NOTES"));
+        assert!(!q.is_restricted("notes2"));
+    }
+
+    /// An exact key wins; otherwise the case-variant that sorts first.
+    #[test]
+    fn mask_for_prefers_the_exact_key() {
+        let mut p = ResolvedPolicy::default();
+        p.column_masks.insert("Email".to_string(), MaskType::Hash);
+        p.column_masks.insert("email".to_string(), MaskType::Nullify);
+        assert!(matches!(p.mask_for("email"), Some(MaskType::Nullify)));
+        assert!(matches!(p.mask_for("Email"), Some(MaskType::Hash)));
+        assert!(matches!(p.mask_for("EMAIL"), Some(MaskType::Hash)));
+    }
 }

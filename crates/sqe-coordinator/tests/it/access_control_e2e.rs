@@ -2822,6 +2822,23 @@ async fn show_schemas_describes_the_catalog_it_names() {
         err.to_string().contains("no_such_wh"),
         "the error must name the catalog asked for, got: {err}"
     );
+    // Trino's answer, for a catalog that is missing or not visible alike.
+    assert_eq!(err.error_code(), sqe_core::SqeErrorCode::CatalogNotFound, "{err}");
+    assert!(err.to_string().contains("Catalog 'no_such_wh' does not exist"), "{err}");
+
+    // LIKE narrows the named catalog's schemas; dbt-trino checks existence
+    // this way, and the pattern used to be dropped (every schema matched).
+    let sales_like = schemas("SHOW SCHEMAS FROM sales_wh LIKE 'only_in%'").await;
+    assert_eq!(sales_like, vec!["only_in_sales".to_string()], "{sales_like:?}");
+    let ops_in_sales = schemas("SHOW SCHEMAS FROM sales_wh LIKE 'only_in_ops'").await;
+    assert!(ops_in_sales.is_empty(), "{ops_in_sales:?}");
+    let ops_like = schemas("SHOW SCHEMAS IN ops_wh LIKE 'only_in_%'").await;
+    assert_eq!(ops_like, vec!["only_in_ops".to_string()], "{ops_like:?}");
+    let sales_orders = col_strings(
+        &exec_ok(&ctx, &ctx.carol, "SHOW TABLES FROM sales_wh.ac LIKE 'ord%'").await,
+        "Table",
+    );
+    assert_eq!(sales_orders, vec!["orders".to_string()], "{sales_orders:?}");
 
     for stmt in [
         "DROP SCHEMA IF EXISTS sales_wh.only_in_sales",

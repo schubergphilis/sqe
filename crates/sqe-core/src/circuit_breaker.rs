@@ -48,6 +48,9 @@ pub struct CircuitBreaker {
     state: AtomicU32,
     /// Human-readable name for logging.
     name: String,
+    /// Who the breaker protects, for the log line when it opens: the token
+    /// subject on a per-user catalog breaker. Never a metric label.
+    subject: Option<String>,
 }
 
 impl std::fmt::Debug for CircuitBreaker {
@@ -94,7 +97,14 @@ impl CircuitBreaker {
             half_open_since_ms: AtomicU64::new(0),
             state: AtomicU32::new(STATE_CLOSED),
             name: name.into(),
+            subject: None,
         }
+    }
+
+    /// Name the principal this breaker protects; logged when it opens.
+    pub fn with_subject(mut self, subject: impl Into<String>) -> Self {
+        self.subject = Some(subject.into());
+        self
     }
 
     /// Override how long a Half-Open probe holds its slot.
@@ -210,7 +220,14 @@ impl CircuitBreaker {
     /// the threshold is reached.  If the circuit is Half-Open, re-opens it
     /// immediately.
     pub fn record_failure(&self) {
+        self.record_failure_with_reason("unclassified");
+    }
+
+    /// [`Self::record_failure`] with the failure class that caused it, logged
+    /// with the subject when the breaker opens or re-opens.
+    pub fn record_failure_with_reason(&self, reason: &str) {
         self.last_failure_ms.store(now_millis(), Ordering::Relaxed);
+        let subject = self.subject.as_deref().unwrap_or("-");
 
         let prev_state = self.state.load(Ordering::Acquire);
         if prev_state == STATE_HALF_OPEN {
@@ -218,6 +235,8 @@ impl CircuitBreaker {
             self.state.store(STATE_OPEN, Ordering::Release);
             warn!(
                 circuit = %self.name,
+                subject,
+                reason,
                 "Circuit breaker re-opened after failed probe"
             );
             return;
@@ -237,6 +256,8 @@ impl CircuitBreaker {
         {
             warn!(
                 circuit = %self.name,
+                subject,
+                reason,
                 failures = count,
                 threshold = self.failure_threshold,
                 recovery_secs = self.recovery_timeout.as_secs(),

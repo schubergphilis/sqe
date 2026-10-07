@@ -21,6 +21,7 @@ pub mod hive_write;
 pub mod ident;
 pub mod merge_sql;
 pub mod merge_target_provider;
+mod policy_view;
 pub mod puffin_carry;
 pub mod write_handler;
 pub mod writer;

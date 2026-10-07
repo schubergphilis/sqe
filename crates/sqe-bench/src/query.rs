@@ -404,6 +404,7 @@ fn is_paren_opener_keyword(k: Keyword) -> bool {
             | Keyword::JOIN
             | Keyword::ON
             | Keyword::AND
+            | Keyword::BETWEEN
             | Keyword::OR
             | Keyword::NOT
             | Keyword::SELECT

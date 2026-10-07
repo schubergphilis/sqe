@@ -162,20 +162,12 @@ moka = { version = "0.12", features = ["future", "sync"] }
 governor = "0.10"
 
 # Auth
-# PINNED at 9 by decision, not by blocker. The 11.x bump arrived via renovate
-# !728 unvalidated and cost two separate failures: 11 ships NO crypto provider
-# by default, so every JWT verification panicked at runtime while compiling
-# perfectly clean (!738), and the `rust_crypto` provider that fixes that pulls
-# p256/p384 and transitively fiat-crypto. The other provider, `aws_lc_rs`,
-# needs a C toolchain (aws-lc-sys) at build time, which is worse for
-# reproducible cross-platform builds.
-#
-# 9.x needs no provider selection at all, so there is no runtime-only failure
-# mode to guard against, and it carries a smaller crypto dependency tree. Do
-# not let a bot bump this: renovate is configured to treat it as a major, and
-# any move to 11 has to come with an explicit provider feature and a test that
-# actually verifies a token rather than merely type-checking.
-jsonwebtoken = "9"
+# >=10.3 fixes malformed optional registered-claim validation (CVE-2026-25537).
+# Select exactly one crypto provider: provider-less major upgrades compile but
+# panic during signature verification. Keep the signed-JWT/JWKS auth tests.
+# AWS-LC avoids introducing the unpatched RustCrypto RSA dependency into
+# network-facing JWT verification; native/CI signature tests cover the C build.
+jsonwebtoken = { version = "10.4", features = ["aws_lc_rs"] }
 
 # Observability
 tracing = "0.1"
