@@ -1880,6 +1880,24 @@ pub struct WorkerConfig {
 }
 
 impl WorkerConfig {
+    /// Worker-role boot guard: an empty `worker_secret` is refused unless
+    /// `allow_unauthenticated` waives it, whatever the topology. `validate()`
+    /// cannot run this because it does not know the process role (the CLI
+    /// `--mode` wins over the config), and a static-`worker_urls` worker has
+    /// no `coordinator_url` for it to key off. Without a secret the Flight
+    /// service accepts scan tickets and credential refreshes from anyone.
+    pub fn require_secret(&self) -> Result<(), String> {
+        if self.worker_secret.is_empty() && !self.allow_unauthenticated {
+            return Err("worker.worker_secret is empty. Any TCP-reachable client could \
+                 send scan tickets or refresh credentials on this worker, leaking user \
+                 S3 credentials. Set worker.worker_secret to match \
+                 coordinator.worker_secret (recommended), or explicitly set \
+                 worker.allow_unauthenticated = true to opt out."
+                .to_string());
+        }
+        Ok(())
+    }
+
     /// The TLS block that governs this worker's Flight listener and the
     /// identity it presents to the coordinator: `[worker.tls]` when it carries
     /// a cert and key, otherwise the inherited `[coordinator.tls]`.
@@ -8872,6 +8890,28 @@ s3_secret_key = "configured-secret"
             err.contains("allow_unauthenticated_workers") && err.contains("worker_secret"),
             "heartbeat-only: {err}"
         );
+    }
+
+    #[test]
+    fn validate_production_rejects_worker_unauthenticated_waiver() {
+        let mut config = valid_production_config();
+        config.worker.allow_unauthenticated = true;
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(err.contains("worker.allow_unauthenticated"), "got: {err}");
+    }
+
+    /// A static-topology worker (no `coordinator_url`) with an empty secret
+    /// must not boot open: the role guard ignores the topology.
+    #[test]
+    fn worker_role_requires_secret_without_coordinator_url() {
+        let mut worker = WorkerConfig::default();
+        assert!(worker.coordinator_url.is_empty());
+        assert!(worker.require_secret().unwrap_err().contains("worker.worker_secret"));
+        worker.allow_unauthenticated = true;
+        assert!(worker.require_secret().is_ok());
+        worker.allow_unauthenticated = false;
+        worker.worker_secret = "shared-secret-value".to_string();
+        assert!(worker.require_secret().is_ok());
     }
 
     #[test]
