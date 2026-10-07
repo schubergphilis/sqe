@@ -9,16 +9,13 @@
 //! This provider handles credentials where the username starts with `"AKIA"` (long-term
 //! access keys) or `"ASIA"` (temporary session credentials from STS AssumeRole).
 //!
-//! # Validation Modes
+//! # Validation
 //!
-//! **STS validation (default):** Calls `GetCallerIdentity` using AWS Signature Version 4
-//! signing. This is the secure path — it cryptographically proves the client possesses
-//! the claimed AWS credentials. No AWS SDK dependency: SigV4 is implemented inline
-//! using `sha2` + `hmac`.
-//!
-//! **Config-only mode (`validate_with_sts = false`):** Skips the STS call and derives
-//! identity purely from the access key ID via configured mappings. Faster and no
-//! network dependency, but less secure — it trusts the client to present a valid key.
+//! Every attempt calls `GetCallerIdentity` using AWS Signature Version 4 signing,
+//! which cryptographically proves the client possesses the claimed AWS credentials.
+//! There is no config-only mode: matching on the access key ID alone would never
+//! check the secret. No AWS SDK dependency: SigV4 is implemented inline using
+//! `sha2` + `hmac`.
 //!
 //! # Use Cases
 //!
@@ -34,7 +31,7 @@ use chrono::Utc;
 // `KeyInit`. Import only, no behavioural change to the SigV4 signing below.
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::provider::{AuthError, AuthProvider, FlightCredentials, Identity};
 
@@ -46,7 +43,6 @@ type HmacSha256 = Hmac<Sha256>;
 /// [[auth.providers]]
 /// type = "aws_iam"
 /// region = "us-east-1"
-/// validate_with_sts = true
 ///
 /// [auth.providers.role_mappings]
 /// "arn:aws:iam::*:role/DataAnalyst" = ["analyst", "reader"]
@@ -57,45 +53,19 @@ pub struct AwsIamProviderConfig {
     /// AWS region for the STS endpoint (e.g., `"us-east-1"`).
     pub region: String,
 
-    /// Whether to validate credentials by calling STS `GetCallerIdentity`.
-    /// When `false`, identity is derived purely from config mappings.
-    /// Default: `true`.
-    pub validate_with_sts: bool,
-
     /// Maps ARN glob patterns to role lists.
     ///
     /// The glob pattern supports `*` as a wildcard matching any substring.
     /// Example: `"arn:aws:iam::*:role/DataAnalyst"` matches any account's
     /// `DataAnalyst` role.
     pub role_mappings: HashMap<String, Vec<String>>,
-
-    /// Maps access key IDs to static identities (for config-only mode).
-    /// Only used when `validate_with_sts = false`.
-    ///
-    /// Example:
-    /// ```toml
-    /// [auth.providers.key_mappings]
-    /// "AKIA...EXAMPLE" = { arn = "arn:aws:iam::123456789012:user/dbt-prod", roles = ["writer"] }
-    /// ```
-    pub key_mappings: HashMap<String, KeyMapping>,
-}
-
-/// Static identity mapping for a known access key ID (config-only mode).
-#[derive(Debug, Clone)]
-pub struct KeyMapping {
-    /// The full ARN to use as the user_id.
-    pub arn: String,
-    /// Roles to assign directly (bypasses role_mappings glob matching).
-    pub roles: Vec<String>,
 }
 
 impl Default for AwsIamProviderConfig {
     fn default() -> Self {
         Self {
             region: "us-east-1".to_string(),
-            validate_with_sts: true,
             role_mappings: HashMap::new(),
-            key_mappings: HashMap::new(),
         }
     }
 }
@@ -287,71 +257,36 @@ impl AuthProvider for AwsIamProvider {
         debug!(
             access_key_id = %username,
             has_session_token = session_token.is_some(),
-            validate_with_sts = self.config.validate_with_sts,
             "AWS IAM authentication attempt"
         );
 
-        if self.config.validate_with_sts {
-            // --- STS validation path ---
-            let sts_identity = self
-                .call_sts_get_caller_identity(&username, secret_key, session_token)
-                .await?;
+        let sts_identity = self
+            .call_sts_get_caller_identity(&username, secret_key, session_token)
+            .await?;
 
-            let display_name = extract_display_name_from_arn(&sts_identity.arn);
-            let roles = self.resolve_roles(&sts_identity.arn);
+        let display_name = extract_display_name_from_arn(&sts_identity.arn);
+        let roles = self.resolve_roles(&sts_identity.arn);
 
-            debug!(
-                arn = %sts_identity.arn,
-                account = %sts_identity.account,
-                sts_user_id = %sts_identity.user_id,
-                roles = ?roles,
-                "AWS IAM authentication succeeded via STS"
-            );
+        debug!(
+            arn = %sts_identity.arn,
+            account = %sts_identity.account,
+            sts_user_id = %sts_identity.user_id,
+            roles = ?roles,
+            "AWS IAM authentication succeeded via STS"
+        );
 
-            Ok(Identity {
-                user_id: sts_identity.arn,
-                display_name,
-                roles,
-                subject: None,
-                email: None,
-                groups: vec![],
-                catalog_token: None,
-                refresh_token: None,
-                expires_at: None,
-                scopes: vec![],
-            })
-        } else {
-            // --- Config-only path ---
-            if let Some(mapping) = self.config.key_mappings.get(&username) {
-                debug!(
-                    access_key_id = %username,
-                    arn = %mapping.arn,
-                    roles = ?mapping.roles,
-                    "AWS IAM authentication succeeded via config mapping"
-                );
-
-                Ok(Identity {
-                    user_id: mapping.arn.clone(),
-                    display_name: extract_display_name_from_arn(&mapping.arn),
-                    roles: mapping.roles.clone(),
-                    subject: None,
-                    email: None,
-                    groups: vec![],
-                    catalog_token: None,
-                    refresh_token: None,
-                    expires_at: None,
-                    scopes: vec![],
-                })
-            } else {
-                warn!(
-                    access_key_id = %username,
-                    "AWS access key ID not found in key_mappings (validate_with_sts=false)"
-                );
-                Err(AuthError::AuthFailed(format!(
-                    "unknown AWS access key ID: {username}"
-                )))
-            }
-        }
+        Ok(Identity {
+            user_id: sts_identity.arn,
+            display_name,
+            roles,
+            subject: None,
+            email: None,
+            groups: vec![],
+            catalog_token: None,
+            refresh_token: None,
+            expires_at: None,
+            scopes: vec![],
+        })
     }
 
     // refresh_catalog_token: uses the default (Ok(None)).
@@ -565,71 +500,6 @@ mod tests {
         match provider.authenticate(&creds).await {
             Err(AuthError::AuthFailed(msg)) => {
                 assert!(msg.contains("secret access key"), "got: {msg}");
-            }
-            other => panic!("expected AuthFailed, got: {other:?}"),
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Config-only mode: known key → identity
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn config_only_known_key_returns_identity() {
-        let mut key_mappings = HashMap::new();
-        key_mappings.insert(
-            // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS's documented example key, test fixture
-            "AKIAIOSFODNN7EXAMPLE".to_string(),
-            KeyMapping {
-                arn: "arn:aws:iam::123456789012:user/Alice".to_string(),
-                roles: vec!["analyst".to_string(), "reader".to_string()],
-            },
-        );
-
-        let provider = AwsIamProvider::new(AwsIamProviderConfig {
-            validate_with_sts: false,
-            key_mappings,
-            ..Default::default()
-        });
-
-        let creds = FlightCredentials {
-            // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS's documented example key, test fixture
-            username: Some("AKIAIOSFODNN7EXAMPLE".to_string()),
-            password: Some(sqe_core::SecretString::new(
-                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
-            )),
-            ..Default::default()
-        };
-
-        let identity = provider.authenticate(&creds).await.expect("should succeed");
-        assert_eq!(identity.user_id, "arn:aws:iam::123456789012:user/Alice");
-        assert_eq!(identity.display_name, "Alice");
-        assert_eq!(identity.roles, vec!["analyst", "reader"]);
-        assert!(identity.catalog_token.is_none());
-        assert!(identity.refresh_token.is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // Config-only mode: unknown key → AuthFailed
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn config_only_unknown_key_returns_auth_failed() {
-        let provider = AwsIamProvider::new(AwsIamProviderConfig {
-            validate_with_sts: false,
-            ..Default::default()
-        });
-
-        let creds = FlightCredentials {
-            // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS's documented example key, test fixture
-            username: Some("AKIAIOSFODNN7EXAMPLE".to_string()),
-            password: Some(sqe_core::SecretString::new("secret".to_string())),
-            ..Default::default()
-        };
-
-        match provider.authenticate(&creds).await {
-            Err(AuthError::AuthFailed(msg)) => {
-                assert!(msg.contains("unknown AWS access key ID"), "got: {msg}");
             }
             other => panic!("expected AuthFailed, got: {other:?}"),
         }
