@@ -1245,9 +1245,10 @@ impl QueryHandler {
         // span not entered across await (finding 410)
         let trace_id = sqe_metrics::propagation::current_trace_id();
 
-        let cancel_token = self.query_tracker.start(
+        let cancel_token = self.query_tracker.start_with_principal(
             query_id,
             &session.user.username,
+            session.user.principal_id(),
             session.source.as_deref(),
             sql,
             &session.id,
@@ -3162,9 +3163,10 @@ impl QueryHandler {
             "Starting streaming query"
         );
 
-        let cancel_token = self.query_tracker.start(
+        let cancel_token = self.query_tracker.start_with_principal(
             query_id,
             &session.user.username,
+            session.user.principal_id(),
             session.source.as_deref(),
             sql,
             &session.id,

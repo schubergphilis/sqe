@@ -93,6 +93,16 @@ pub struct SessionUser {
     pub groups: Vec<String>,
 }
 
+impl SessionUser {
+    /// Stable identity of the principal: the IdP subject when the provider
+    /// forwarded one, else the display username. Ownership checks compare
+    /// this, not the username, so a second provider in the chain that mints
+    /// the same display name is a different owner (issue #622).
+    pub fn principal_id(&self) -> &str {
+        self.subject.as_deref().unwrap_or(&self.username)
+    }
+}
+
 impl Session {
     pub fn new(
         username: String,
