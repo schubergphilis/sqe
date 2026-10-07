@@ -154,6 +154,20 @@ All notable changes to SQE are documented in this file.
     written. A test now checks every column a layout names against the
     generator's schema.
 
+- Memory: spillable operators leave 20% of the pool and of each query's cap to consumers that cannot spill
+
+    New `coordinator.unspillable_headroom_percent` (default 20, 0..=50,
+    `0` = off, greedy pool only). Hash aggregates, sorts, repartition
+    buffers and nested-loop joins are refused at `100 - n` percent of the
+    node pool and of `query.max_query_memory`, and spill there; scan decode
+    admission, sort merges and hash-join builds may use the rest. Before, a
+    large aggregate filled the cap and the scan feeding it was refused
+    first, so the query failed where it could have spilled (#788). TPC-H
+    SF10 under a 4 GB pool and 2 GB per-query cap: the 60M-group aggregate
+    alone went from a scan-decode refusal to completing in 8.1 s; six
+    concurrent heavy queries went from 1 to 2 completing. Large sorts still
+    fail at that cap (their merge reservation; a separate change).
+
 - SQL: two Trino-compat rewrites retired; DataFusion 55 handles them natively
 
     `WITH RECURSIVE t(n) AS (...)` column lists (#348) and the bare
