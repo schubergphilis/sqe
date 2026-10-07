@@ -974,7 +974,7 @@ fn resolve_from_bundle(
 #[allow(clippy::type_complexity)]
 pub(crate) fn resolve_tag_policies(
     bundle: &ServicePolicies,
-    identity: &SessionIdentity,
+    user: &SessionUser,
     tags: &HashSet<String>,
 ) -> (
     HashMap<String, TagMaskSpec>,
@@ -990,14 +990,13 @@ pub(crate) fn resolve_tag_policies(
         None => return (masks, filters, unmappable),
     };
 
-    // Bridge SessionIdentity -> SessionUser for item_matches.
-    use sqe_core::SessionUser;
-    let user = SessionUser {
-        username: identity.username.clone(),
-        roles: identity.roles.clone(),
-        subject: None,
-        email: None,
-        groups: Vec::new(),
+    // Items match on the full SessionUser (groups included); the identity is
+    // only the UDF-folding view used when parsing filter and mask SQL.
+    let identity = &SessionIdentity {
+        username: user.username.clone(),
+        roles: user.roles.clone(),
+        database: None,
+        schema: None,
     };
 
     for p in &tag_bundle.policies {
@@ -1020,7 +1019,7 @@ pub(crate) fn resolve_tag_policies(
             // policyType 1: datamask
             if p.policy_type == POLICY_TYPE_DATAMASK {
                 for item in &p.data_mask_policy_items {
-                    if !item_matches(&item.users, &item.roles, &item.groups, &user) {
+                    if !item_matches(&item.users, &item.roles, &item.groups, user) {
                         continue;
                     }
                     // CUSTOM masks carry a `{col}` placeholder that only the
@@ -1067,7 +1066,7 @@ pub(crate) fn resolve_tag_policies(
             // policyType 2: rowfilter
             if p.policy_type == POLICY_TYPE_ROWFILTER {
                 for item in &p.row_filter_policy_items {
-                    if !item_matches(&item.users, &item.roles, &item.groups, &user) {
+                    if !item_matches(&item.users, &item.roles, &item.groups, user) {
                         continue;
                     }
                     if let Some(expr_str) = &item.row_filter_info.filter_expr {
@@ -1500,14 +1499,7 @@ impl PolicyStore for RangerStore {
             }
         };
 
-        let identity = SessionIdentity {
-            username: user.username.clone(),
-            roles: user.roles.clone(),
-            database: None,
-            schema: None,
-        };
-
-        let (masks, tag_filters, unmappable) = resolve_tag_policies(&bundle, &identity, tags);
+        let (masks, tag_filters, unmappable) = resolve_tag_policies(&bundle, user, tags);
         // Discard the tag keys from row filters — the rewriter only needs Exprs.
         let filter_exprs: Vec<Expr> = tag_filters.into_iter().map(|(_, e)| e).collect();
         (masks, filter_exprs, unmappable)
@@ -2508,11 +2500,7 @@ mod tests {
     fn tag_mask_resolved_for_matching_role() {
         let sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE).unwrap();
         let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
-        let id = SessionIdentity {
-            username: "bob".into(),
-            roles: vec!["engineer".into()],
-            ..Default::default()
-        };
+        let id = user("bob", &["engineer"]);
         let (masks, filters, unmappable) = resolve_tag_policies(&sp, &id, &tags);
         // tag PII -> a PartialMask (MASK_SHOW_LAST_4) for engineer, wrapped in TagMaskSpec::Ready
         assert!(masks.contains_key("PII"));
@@ -2537,11 +2525,7 @@ mod tests {
     fn tag_mask_not_resolved_for_other_role() {
         let sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE).unwrap();
         let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
-        let id = SessionIdentity {
-            username: "x".into(),
-            roles: vec!["other".into()],
-            ..Default::default()
-        };
+        let id = user("x", &["other"]);
         let (masks, _f, _u) = resolve_tag_policies(&sp, &id, &tags);
         assert!(masks.is_empty());
     }
@@ -2550,20 +2534,45 @@ mod tests {
     fn tag_row_filter_resolved() {
         let sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE).unwrap();
         let tags: HashSet<String> = ["RESTRICTED".to_string()].into_iter().collect();
-        let id = SessionIdentity {
-            username: "a".into(),
-            roles: vec!["analyst".into()],
-            ..Default::default()
-        };
+        let id = user("a", &["analyst"]);
         let (_m, filters, _u) = resolve_tag_policies(&sp, &id, &tags);
         assert_eq!(filters.len(), 1); // one (tag, Expr) row filter
+    }
+
+    /// Group-bound tag items must match on the session's groups: dropping
+    /// them would leave a group-scoped tag mask or row filter unapplied.
+    #[test]
+    fn tag_policies_match_on_groups() {
+        let sp: ServicePolicies = serde_json::from_str(
+            r#"{
+              "policyVersion": 1, "policies": [],
+              "tagPolicies": { "serviceName": "tag", "policies": [
+                { "id": 1, "policyType": 1, "isEnabled": true,
+                  "resources": { "tag": { "values": ["PII"] } },
+                  "dataMaskPolicyItems": [
+                    { "groups": ["contractors"],
+                      "dataMaskInfo": { "dataMaskType": "MASK_NULL" } } ] },
+                { "id": 2, "policyType": 2, "isEnabled": true,
+                  "resources": { "tag": { "values": ["PII"] } },
+                  "rowFilterPolicyItems": [
+                    { "groups": ["contractors"],
+                      "rowFilterInfo": { "filterExpr": "region = 'EU'" } } ] }
+              ] }
+            }"#,
+        )
+        .unwrap();
+        let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
+        let id = user_with_groups("carol", &[], &["contractors"]);
+        let (masks, filters, _u) = resolve_tag_policies(&sp, &id, &tags);
+        assert!(matches!(masks.get("PII"), Some(TagMaskSpec::Ready(crate::MaskType::Nullify))));
+        assert_eq!(filters.len(), 1);
     }
 
     #[test]
     fn untagged_yields_nothing() {
         let sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE).unwrap();
         let tags: HashSet<String> = HashSet::new();
-        let id = SessionIdentity::default();
+        let id = user("", &[]);
         let (m, f, u) = resolve_tag_policies(&sp, &id, &tags);
         assert!(m.is_empty() && f.is_empty() && u.is_empty());
     }
@@ -2577,11 +2586,7 @@ mod tests {
             .data_mask_info
             .data_mask_type = "MASK_FUTURE_UNSUPPORTED".to_string();
         let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
-        let id = SessionIdentity {
-            username: "bob".into(),
-            roles: vec!["engineer".into()],
-            ..Default::default()
-        };
+        let id = user("bob", &["engineer"]);
         let (masks, _f, unmappable) = resolve_tag_policies(&sp, &id, &tags);
         assert!(
             !masks.contains_key("PII"),
@@ -2603,11 +2608,7 @@ mod tests {
         mi.data_mask_type = "CUSTOM".to_string();
         mi.value_expr = Some("concat('x', {col})".to_string());
         let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
-        let id = SessionIdentity {
-            username: "bob".into(),
-            roles: vec!["engineer".into()],
-            ..Default::default()
-        };
+        let id = user("bob", &["engineer"]);
         let (masks, _f, unmappable) = resolve_tag_policies(&sp, &id, &tags);
         assert!(
             !unmappable.contains("PII"),
@@ -2634,11 +2635,7 @@ mod tests {
         mi.data_mask_type = "CUSTOM".to_string();
         mi.value_expr = None; // no template
         let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
-        let id = SessionIdentity {
-            username: "bob".into(),
-            roles: vec!["engineer".into()],
-            ..Default::default()
-        };
+        let id = user("bob", &["engineer"]);
         let (masks, _f, unmappable) = resolve_tag_policies(&sp, &id, &tags);
         assert!(
             !masks.contains_key("PII"),
@@ -2709,11 +2706,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let id = SessionIdentity {
-            username: "live-sample-user".into(),
-            roles: vec![LIVE_SAMPLE_ROLE.into()],
-            ..Default::default()
-        };
+        let id = user("live-sample-user", &[LIVE_SAMPLE_ROLE]);
         let (masks, filters, unmappable) = resolve_tag_policies(&sp, &id, &tags);
         assert!(
             masks.contains_key(LIVE_SAMPLE_TAG),
