@@ -321,6 +321,25 @@ pub fn client_side_sigv4_props(
     props
 }
 
+/// REST catalog property that makes the vendored client send
+/// `X-Iceberg-Access-Delegation` on every request (`header.*` props become
+/// request headers).
+pub const ACCESS_DELEGATION_HEADER_PROP: &str = "header.X-Iceberg-Access-Delegation";
+
+/// REST catalog properties that ask the catalog to vend table-scoped
+/// storage credentials, per `[catalog] access_delegation` (or implied by
+/// `require_vended_credentials`). Empty when no delegation is configured,
+/// which keeps static-key mode byte-for-byte unchanged.
+pub fn access_delegation_props(
+    catalog: &sqe_core::config::CatalogConfig,
+) -> HashMap<String, String> {
+    catalog
+        .effective_access_delegation()
+        .header_value()
+        .map(|v| HashMap::from([(ACCESS_DELEGATION_HEADER_PROP.to_string(), v.to_string())]))
+        .unwrap_or_default()
+}
+
 /// SigV4 signer for SQE's own raw HTTP calls to the catalog (the HEAD
 /// authorization check, ETag revalidation, the view and commit endpoints).
 /// Built from the same `rest.*` and `s3.*` properties the vendored client
@@ -529,6 +548,30 @@ struct CachedTableEntry {
     etag: Option<String>,
     /// When this entry was last confirmed fresh (inserted or revalidated via 304).
     validated_at: Instant,
+    /// When the catalog-vended credentials in `table`'s FileIO stop being
+    /// served from the cache (refresh margin before their expiry). `None`
+    /// for static or non-expiring credentials. A 304 revalidation proves
+    /// the metadata unchanged, not the keys, so it does not move this.
+    credentials_usable_until: Option<std::time::SystemTime>,
+}
+
+impl CachedTableEntry {
+    fn new(table: Table, etag: Option<String>, validated_at: Instant) -> Self {
+        let now = std::time::SystemTime::now();
+        let credentials_usable_until = crate::vended_credentials::table_credential_expiry(&table)
+            .map(|expires_at| crate::vended_credentials::refresh_deadline(expires_at, now));
+        Self {
+            table,
+            etag,
+            validated_at,
+            credentials_usable_until,
+        }
+    }
+
+    fn credentials_usable(&self) -> bool {
+        self.credentials_usable_until
+            .is_none_or(|until| std::time::SystemTime::now() < until)
+    }
 }
 
 /// Global table metadata cache shared across all sessions.
@@ -602,7 +645,8 @@ pub async fn invalidate_rest_catalog_cache_all() {
 
 /// SHA-256 prefix used as the last segment of a `REST_CATALOG_CACHE` key.
 ///
-/// Must stay in lockstep with `SessionCatalog::new` (`{url}-{warehouse}-{fp}`).
+/// Must stay in lockstep with `SessionCatalog::new`
+/// (`{url}-{warehouse}-vended{n}-deleg{n}-{fp}`: fingerprint last).
 /// Do not use [`sqe_core::Session::token_fingerprint`]: that string also
 /// prefixes the username and will not match these keys.
 pub fn rest_catalog_token_fingerprint(bearer: &str) -> String {
@@ -905,7 +949,7 @@ impl TableMetadataCache {
     /// Get a cached entry if it exists and is still fresh (within soft TTL).
     /// Returns `None` if no entry exists or if the entry has expired.
     pub async fn get_fresh(&self, key: &str) -> Option<Table> {
-        let entry = self.inner.get(key).await?;
+        let entry = self.usable_entry(key).await?;
         if entry.validated_at.elapsed() < self.soft_ttl {
             Some(entry.table)
         } else {
@@ -915,9 +959,26 @@ impl TableMetadataCache {
 
     /// Get a stale cached entry for conditional revalidation.
     /// Returns the table and its ETag if the entry exists (regardless of soft TTL).
+    ///
+    /// Never an entry whose vended credentials are within the refresh margin
+    /// of expiry: a 304 would hand those dead keys back as current.
     pub async fn get_stale(&self, key: &str) -> Option<(Table, Option<String>)> {
-        let entry = self.inner.get(key).await?;
+        let entry = self.usable_entry(key).await?;
         Some((entry.table, entry.etag))
+    }
+
+    /// The entry for `key`, dropped instead when its vended credentials are
+    /// due for refresh, so the caller reloads the table (and gets new keys)
+    /// rather than serving FileIO that will fail mid-scan.
+    async fn usable_entry(&self, key: &str) -> Option<CachedTableEntry> {
+        let entry = self.inner.get(key).await?;
+        if entry.credentials_usable() {
+            return Some(entry);
+        }
+        debug!(cache_key = %key, "Vended credentials due for refresh; dropping cached table");
+        // Only this principal's entry: the keys were vended to it alone.
+        self.inner.invalidate(key).await;
+        None
     }
 
     /// Refresh the soft TTL on an existing entry (called after a 304 revalidation).
@@ -953,14 +1014,7 @@ impl TableMetadataCache {
     /// must use [`Self::insert_if_generation`].
     pub async fn insert_with_etag(&self, key: String, table: Table, etag: Option<String>) {
         self.inner
-            .insert(
-                key,
-                CachedTableEntry {
-                    table,
-                    etag,
-                    validated_at: Instant::now(),
-                },
-            )
+            .insert(key, CachedTableEntry::new(table, etag, Instant::now()))
             .await;
     }
 
@@ -993,11 +1047,7 @@ impl TableMetadataCache {
         self.inner
             .insert(
                 key.clone(),
-                CachedTableEntry {
-                    table,
-                    etag,
-                    validated_at: Instant::now(),
-                },
+                CachedTableEntry::new(table, etag, Instant::now()),
             )
             .await;
         !self.undo_if_raced(&key, snapshot).await
@@ -1024,11 +1074,7 @@ impl TableMetadataCache {
         self.inner
             .insert(
                 key,
-                CachedTableEntry {
-                    table,
-                    etag: None,
-                    validated_at: Instant::now() - age,
-                },
+                CachedTableEntry::new(table, None, Instant::now() - age),
             )
             .await;
     }
@@ -1706,6 +1752,8 @@ impl SessionCatalog {
     ) -> sqe_core::Result<Self> {
         match &catalog.backend {
             sqe_core::config::CatalogBackend::Rest => {
+                let mut extra_props = client_side_sigv4_props(catalog, storage);
+                extra_props.extend(access_delegation_props(catalog));
                 Self::new_with_props(
                     &catalog.catalog_url,
                     &catalog.warehouse,
@@ -1715,7 +1763,7 @@ impl SessionCatalog {
                     Some(shared_http_client_for(catalog)),
                     None,
                     catalog.require_vended_credentials,
-                    client_side_sigv4_props(catalog, storage),
+                    extra_props,
                 )
                 .await
             }
@@ -2095,10 +2143,20 @@ impl SessionCatalog {
         insert_s3_location_props(&mut props, storage_config);
         props.extend(extra_props.iter().map(|(k, v)| (k.clone(), v.clone())));
         if require_vended_credentials {
+            // Vended-only: ask for credentials, and leave nothing static
+            // for FileIO to fall back to.
+            props.insert(
+                ACCESS_DELEGATION_HEADER_PROP.to_string(),
+                "vended-credentials".to_string(),
+            );
             insert_s3_vended_isolation_props(&mut props);
         } else {
+            // Static keys stay the fallback. With `access_delegation` on,
+            // the vendored client lets any vended set replace them per
+            // table (`SQE PATCH (vended-credentials)`).
             insert_s3_credential_props(&mut props, storage_config);
         }
+        let delegated = props.contains_key(ACCESS_DELEGATION_HEADER_PROP);
         // SQE's raw HEAD/GET/POST calls bypass the vendored client's
         // authenticator, so they need their own signer for a SigV4 catalog.
         let sigv4 = raw_sigv4_signer(&props);
@@ -2117,9 +2175,18 @@ impl SessionCatalog {
         // Include the FileIO identity mode. A catalog built with static
         // keys must not be reused when a later session asks for vended-only
         // FileIO (same URL, warehouse, and bearer).
+        // Likewise the delegation header: a catalog built without it never
+        // receives vended keys, so it must not serve a delegated session.
+        // The fingerprint stays the LAST segment: per-token eviction
+        // (`rest_catalog_keys_for_token`) matches on the `-{fp}` suffix, and
+        // the earlier `{fp}-vended{n}` order never matched it.
         let catalog_key = format!(
-            "{}-{}-{}-vended{}",
-            catalog_url, warehouse, token_fingerprint, require_vended_credentials as u8
+            "{}-{}-vended{}-deleg{}-{}",
+            catalog_url,
+            warehouse,
+            require_vended_credentials as u8,
+            delegated as u8,
+            token_fingerprint
         );
         // iceberg-rust's own calls (list_namespaces, load_table, update_table)
         // get a client with the same deadlines as SQE's raw HEAD/GET path.
@@ -2325,6 +2392,36 @@ impl SessionCatalog {
         table_ident: &'a TableIdent,
     ) -> futures::future::BoxFuture<'a, sqe_core::Result<Table>> {
         Box::pin(self.load_table_inner(table_ident))
+    }
+
+    /// Load `table_ident` from the catalog as this session's principal,
+    /// bypassing the metadata cache in both directions (nothing read from
+    /// it, nothing written to it).
+    ///
+    /// For the credential-refresh path: a distributed scan whose vended keys
+    /// near expiry needs a fresh `loadTable` answer (new keys) for the same
+    /// user, not whatever the cache holds. The catalog authorizes the call
+    /// again, so a revoked user gets an error, not keys.
+    pub fn load_table_uncached<'a>(
+        &'a self,
+        table_ident: &'a TableIdent,
+    ) -> futures::future::BoxFuture<'a, sqe_core::Result<Table>> {
+        Box::pin(async move {
+            self.circuit_breaker
+                .check()
+                .map_err(sqe_core::SqeError::Catalog)?;
+            let started = Instant::now();
+            let result = dispatch_catalog!(self.inner, load_table(table_ident))
+                .map_err(|e| classify_iceberg_catalog_error("Failed to reload table", e));
+            match &result {
+                Ok(_) => self.circuit_breaker.record_success(),
+                Err(e) => {
+                    record_breaker_class(&self.circuit_breaker, BreakerFailureClass::of_error(e))
+                }
+            }
+            self.record_catalog_call("load_table", started, result.is_ok());
+            result
+        })
     }
 
     #[instrument(name = "sqe.catalog", skip(self), fields(op = "load_table", table = %table_ident, warehouse = %self.warehouse))]
@@ -4094,6 +4191,19 @@ type = "aws"
     /// cache is keyed by the string we pass to `insert`, so its value is
     /// irrelevant to what we assert.
     pub(super) fn test_table() -> iceberg::table::Table {
+        test_table_with_file_io(iceberg::io::FileIO::new_with_fs())
+    }
+
+    /// [`test_table`] whose FileIO carries `props` (e.g. vended keys).
+    pub(super) fn test_table_with_props(props: &[(&str, &str)]) -> iceberg::table::Table {
+        let factory = std::sync::Arc::new(iceberg::io::LocalFsStorageFactory);
+        let file_io = iceberg::io::FileIOBuilder::new(factory)
+            .with_props(props.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+            .build();
+        test_table_with_file_io(file_io)
+    }
+
+    fn test_table_with_file_io(file_io: iceberg::io::FileIO) -> iceberg::table::Table {
         const META_V1: &str = r#"{
             "format-version": 1,
             "table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
@@ -4110,7 +4220,6 @@ type = "aws"
             "snapshots": []
         }"#;
         let metadata: iceberg::spec::TableMetadata = serde_json::from_str(META_V1).unwrap();
-        let file_io = iceberg::io::FileIO::new_with_fs();
         iceberg::table::Table::builder()
             .runtime(iceberg::Runtime::current())
             .metadata(metadata)
@@ -4161,6 +4270,76 @@ type = "aws"
         cache.insert("tokenA|ns.t1".to_string(), test_table()).await;
         cache.invalidate_all().await;
         assert_eq!(cache.entry_count(), 0);
+    }
+
+    fn expires_in(secs: i64) -> String {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        (now_ms + secs * 1000).to_string()
+    }
+
+    /// Vended credentials inside the refresh margin are never served from the
+    /// cache, fresh OR stale: a stale hit would be revalidated with a 304 and
+    /// handed back with dead keys. The entry is dropped so the next lookup
+    /// reloads the table (and gets new keys).
+    #[tokio::test]
+    async fn cached_table_with_expiring_vended_credentials_is_not_served() {
+        let cache = TableMetadataCache::new(60);
+        let soon = expires_in(30);
+        let expiring = test_table_with_props(&[
+            ("s3.access-key-id", "VENDED"),
+            ("s3.session-token", "tok"),
+            ("s3.session-token-expires-at-ms", &soon),
+        ]);
+        cache
+            .insert_with_etag("tok|wh|ns.t".to_string(), expiring, Some("e1".into()))
+            .await;
+        // 30 s left on a token obtained now: the deadline is half-life (15 s),
+        // so it is still usable.
+        assert!(cache.get_fresh("tok|wh|ns.t").await.is_some());
+
+        let past = expires_in(-1);
+        let expired = test_table_with_props(&[("s3.session-token-expires-at-ms", &past)]);
+        let key = "tok|wh|ns.t".to_string();
+        cache
+            .insert_with_etag(key.clone(), expired.clone(), Some("e1".into()))
+            .await;
+        assert!(cache.get_fresh("tok|wh|ns.t").await.is_none());
+        cache
+            .insert_with_etag(key, expired, Some("e1".into()))
+            .await;
+        assert!(
+            cache.get_stale("tok|wh|ns.t").await.is_none(),
+            "an ETag revalidation must not resurrect expired keys"
+        );
+        cache.inner.run_pending_tasks().await;
+        assert_eq!(cache.entry_count(), 0, "the expired entry is evicted");
+    }
+
+    /// Hour-long credentials are cached normally until the refresh margin;
+    /// static keys (no expiry) are unaffected.
+    #[tokio::test]
+    async fn long_lived_and_static_credentials_are_cached() {
+        let cache = TableMetadataCache::new(60);
+        let hour = expires_in(3600);
+        let vended = test_table_with_props(&[("s3.session-token-expires-at-ms", &hour)]);
+        cache.insert("a|wh|ns.t".to_string(), vended).await;
+        assert!(cache.get_fresh("a|wh|ns.t").await.is_some());
+        assert!(cache.get_stale("a|wh|ns.t").await.is_some());
+
+        // Inside the 5-minute margin of an hour-long token: refreshed.
+        let entry = cache.inner.get("a|wh|ns.t").await.unwrap();
+        let mut entry = entry.clone();
+        entry.credentials_usable_until =
+            Some(std::time::SystemTime::now() - std::time::Duration::from_secs(1));
+        cache.inner.insert("a|wh|ns.t".to_string(), entry).await;
+        assert!(cache.get_fresh("a|wh|ns.t").await.is_none());
+
+        let static_keys = test_table_with_props(&[("s3.access-key-id", "STATIC")]);
+        cache.insert("b|wh|ns.t".to_string(), static_keys).await;
+        assert!(cache.get_fresh("b|wh|ns.t").await.is_some());
     }
 
     use super::{NamespaceIdent, TableIdent, TableMetadataCache};
@@ -5824,5 +6003,176 @@ mod sigv4_raw_tests {
             .authorize_table_access(&events())
             .await
             .expect("bearer HEAD is accepted");
+    }
+}
+
+/// Credential vending end to end through the vendored REST client against a
+/// mock catalog: the delegation header goes out, vended keys win over the
+/// static `[storage]` pair, and vended-only mode carries no static keys.
+#[cfg(test)]
+mod vended_credentials_rest_tests {
+    use iceberg::{NamespaceIdent, TableIdent};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::{access_delegation_props, SessionCatalog};
+
+    const LOAD_TABLE_RESPONSE: &str = include_str!(
+        "../../../vendor/iceberg-rust/crates/catalog/rest/testdata/load_table_response.json"
+    );
+
+    fn orders() -> TableIdent {
+        TableIdent::new(
+            NamespaceIdent::new("sales".to_string()),
+            "orders".to_string(),
+        )
+    }
+
+    fn static_storage() -> sqe_core::config::StorageConfig {
+        sqe_core::config::StorageConfig {
+            s3_access_key: "STATIC".to_string(),
+            s3_secret_key: sqe_core::SecretString::new("static-secret".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn catalog_config(server: &MockServer, extra: &str) -> sqe_core::config::CatalogConfig {
+        toml::from_str(&format!(
+            "catalog_url = \"{}\"\nwarehouse = \"wh\"\n{extra}",
+            server.uri()
+        ))
+        .expect("catalog config")
+    }
+
+    /// Mount `/v1/config` and a `loadTable` answer that only matches when the
+    /// delegation header is present. `vended` is merged into the response
+    /// `config`.
+    async fn mock_catalog(vended: serde_json::Value) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "defaults": {}, "overrides": {"prefix": "wh"}
+            })))
+            .mount(&server)
+            .await;
+        let mut body: serde_json::Value = serde_json::from_str(LOAD_TABLE_RESPONSE).unwrap();
+        body["config"] = vended;
+        Mock::given(method("GET"))
+            .and(path("/v1/wh/namespaces/sales/tables/orders"))
+            .and(header("x-iceberg-access-delegation", "vended-credentials"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[test]
+    fn delegation_props_follow_the_effective_setting() {
+        let off: sqe_core::config::CatalogConfig = toml::from_str("").unwrap();
+        assert!(access_delegation_props(&off).is_empty());
+        let on: sqe_core::config::CatalogConfig =
+            toml::from_str("access_delegation = \"vended-credentials\"").unwrap();
+        assert_eq!(
+            access_delegation_props(&on)
+                .get("header.X-Iceberg-Access-Delegation")
+                .map(String::as_str),
+            Some("vended-credentials")
+        );
+        let required: sqe_core::config::CatalogConfig =
+            toml::from_str("require_vended_credentials = true").unwrap();
+        assert!(!access_delegation_props(&required).is_empty());
+    }
+
+    /// `access_delegation = "vended-credentials"` with a static pair
+    /// configured: the header is sent and the table's FileIO carries the
+    /// vended, table-scoped keys, not the static ones.
+    #[tokio::test]
+    async fn delegation_header_is_sent_and_vended_keys_beat_static() {
+        let server = mock_catalog(serde_json::json!({
+            "s3.access-key-id": "VENDED",
+            "s3.secret-access-key": "vended-secret",
+            "s3.session-token": "vended-token",
+            "s3.session-token-expires-at-ms": "4102444800000",
+        }))
+        .await;
+        let cfg = catalog_config(&server, "access_delegation = \"vended-credentials\"");
+        let session = SessionCatalog::for_session_with(&cfg, &static_storage(), None, "tok-a")
+            .await
+            .unwrap();
+
+        let table = session.load_table(&orders()).await.expect("header matched");
+        let props = table.file_io().config().props();
+        assert_eq!(props["s3.access-key-id"], "VENDED");
+        assert_eq!(props["s3.secret-access-key"], "vended-secret");
+        assert_eq!(props["s3.session-token"], "vended-token");
+        assert_eq!(props["s3.session-token-expires-at-ms"], "4102444800000");
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests
+            .iter()
+            .filter(|r| r.url.path().starts_with("/v1/"))
+            .all(|r| r.headers.get("x-iceberg-access-delegation").is_some()
+                || r.method == wiremock::http::Method::HEAD));
+    }
+
+    /// `require_vended_credentials`: the header is implied, and a catalog
+    /// that vends nothing leaves FileIO with NO static keys to fall back to.
+    #[tokio::test]
+    async fn require_vended_sends_header_and_never_carries_static_keys() {
+        let server = mock_catalog(serde_json::json!({})).await;
+        let cfg = catalog_config(&server, "require_vended_credentials = true");
+        let session = SessionCatalog::for_session_with(&cfg, &static_storage(), None, "tok-b")
+            .await
+            .unwrap();
+
+        let table = session.load_table(&orders()).await.expect("header matched");
+        let props = table.file_io().config().props();
+        let keys: Vec<_> = props.keys().collect();
+        assert!(!props.contains_key("s3.access-key-id"), "{keys:?}");
+        assert!(!props.contains_key("s3.secret-access-key"));
+    }
+
+    /// Default static mode: no header goes out (the delegated mock does not
+    /// match), and nothing else about the request changes.
+    #[tokio::test]
+    async fn static_mode_sends_no_delegation_header() {
+        let server = mock_catalog(serde_json::json!({})).await;
+        let cfg = catalog_config(&server, "");
+        let session = SessionCatalog::for_session_with(&cfg, &static_storage(), None, "tok-c")
+            .await
+            .unwrap();
+        assert!(session.load_table(&orders()).await.is_err());
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests.is_empty());
+        assert!(requests
+            .iter()
+            .all(|r| r.headers.get("x-iceberg-access-delegation").is_none()));
+    }
+
+    /// `load_table_uncached` asks the catalog again (new keys) even when a
+    /// cached copy exists.
+    #[tokio::test]
+    async fn uncached_reload_always_reaches_the_catalog() {
+        let server = mock_catalog(serde_json::json!({"s3.access-key-id": "V"})).await;
+        let cfg = catalog_config(&server, "access_delegation = \"vended-credentials\"");
+        let cache = super::TableMetadataCache::new(300);
+        let session =
+            SessionCatalog::for_session_with(&cfg, &static_storage(), Some(cache), "tok-d")
+                .await
+                .unwrap();
+        let loads = |reqs: &[wiremock::Request]| {
+            reqs.iter()
+                .filter(|r| {
+                    r.method == wiremock::http::Method::GET
+                        && r.url.path() == "/v1/wh/namespaces/sales/tables/orders"
+                })
+                .count()
+        };
+        session.load_table(&orders()).await.unwrap();
+        let before = loads(&server.received_requests().await.unwrap());
+        session.load_table_uncached(&orders()).await.unwrap();
+        let after = loads(&server.received_requests().await.unwrap());
+        assert_eq!(after, before + 1);
     }
 }
