@@ -309,6 +309,7 @@ Route audit logs and traces through an OpenTelemetry Collector when possible. Au
 | `no-dev-auth-providers` | `auth.providers` containing `anonymous` or `bearer_passthrough` (dev-only; accept any connection or skip local JWT validation). |
 | `rate-limit-enabled` | `rate_limit.enabled = false` (allows query and auth flooding). |
 | `no-insecure-transport` | `security.allow_insecure_transport = true` (cleartext distributed hops expose bearer tokens, worker secrets and vended S3 credentials). |
+| `no-plaintext-client-listeners` | An enabled plaintext Trino HTTP (`trino_http_port`), Quack (without `[coordinator.tls]`) or MCP (without TLS, or on the web port) listener on a non-loopback address, unless `security.allow_plaintext_behind_tls_proxy = true` acknowledges a TLS-terminating proxy in front (client passwords and bearer tokens would cross it in cleartext). |
 | `no-shared-service-identity` | Config-held `client_credentials` in `[auth].providers` or `[catalog(s).auth]` without `security.allow_shared_service_identity = true` (one identity for every user at Polaris/S3). |
 | `worker-secret-required` | `coordinator.worker_urls` set with an empty `coordinator.worker_secret` and `allow_unauthenticated_workers = true` (any TCP-reachable client may register as a worker). |
 | `max-sql-bytes` | `query.max_sql_bytes = 0` (disables the pre-parse statement size cap). |
