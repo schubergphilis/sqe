@@ -565,28 +565,61 @@ fn resolve_table_ident(name: &ObjectName, session: &Session) -> sqe_core::Result
     Ok(ident)
 }
 
-/// Alias used inside the policy subquery to expose the unmasked value of a
-/// masked column. UPDATE's CASE-ELSE branch must reference this so unchanged
-/// rows persist their pre-mask values instead of writing the masked value
-/// to disk. `nonce` is fresh per statement evaluation so user SQL spliced
-/// into the same SELECT cannot name the alias and read the raw value.
+/// Alias used inside the policy subquery to expose the stored value of a
+/// column the caller reads through a mask or the row-filter guard. UPDATE's
+/// CASE-ELSE branch must reference this so unchanged rows persist their
+/// stored values instead of the masked (or guarded NULL) value. `nonce` is
+/// fresh per statement evaluation so user SQL spliced into the same SELECT
+/// cannot name the alias and read the raw value.
 fn policy_raw_alias(col: &str, nonce: &str) -> String {
     format!("__pol_raw_{nonce}_{col}")
+}
+
+/// Alias of the row-filter verdict inside the policy subquery: TRUE exactly
+/// when the caller's row filter admits the row, computed on stored values.
+fn policy_admit_alias(nonce: &str) -> String {
+    format!("__pol_admit_{nonce}")
+}
+
+/// Refuse user SQL that names the internal `__pol_` aliases. The per-call
+/// nonce already makes them unguessable.
+fn refuse_internal_policy_aliases<'a>(
+    stmt: &str,
+    sqls: impl IntoIterator<Item = &'a str>,
+) -> sqe_core::Result<()> {
+    if sqls
+        .into_iter()
+        .any(|s| s.to_ascii_lowercase().contains("__pol_"))
+    {
+        return Err(SqeError::with_code(
+            SqeErrorCode::AccessDenied,
+            format!("{stmt} may not reference internal `__pol_` identifiers"),
+        ));
+    }
+    Ok(())
 }
 
 /// Synthetic flag column marking the rows an UPDATE evaluation changed;
 /// stripped before the batch leaves `apply_update`.
 const UPDATE_CHANGED_COLUMN: &str = "__sqe_update_changed";
 
-/// Combine the user's WHERE clause with the policy row filter. ANDing it
-/// here ensures DELETE and UPDATE only act on rows the policy admits,
-/// matching PostgreSQL RLS semantics on the SELECT path.
+/// Combine the user's WHERE clause with the policy row filter's verdict, so
+/// DELETE and UPDATE only act on rows the policy admits, matching PostgreSQL
+/// RLS semantics on the SELECT path. The verdict is the admit column of the
+/// policy relation ([`policy_projection_sql`]); the user's WHERE reads
+/// columns through the row-filter guard there, so it never sees a hidden
+/// row's values and cannot fail on them.
 fn augment_where_with_row_filter(
     where_sql: &str,
     predicates: &sqe_policy::write_predicates::WritePolicyPredicates,
+    orig_alias: &str,
+    nonce: &str,
 ) -> String {
     match &predicates.row_filter_sql {
-        Some(rf) => format!("({where_sql}) AND ({rf})"),
+        Some(_) => format!(
+            "({where_sql}) AND \"{orig_alias}\".\"{}\"",
+            policy_admit_alias(nonce)
+        ),
         None => where_sql.to_string(),
     }
 }
@@ -599,30 +632,35 @@ struct PolicyFrom {
 }
 
 /// Build the FROM clause for the per-batch evaluator. With no policy this
-/// is the scratch table aliased to the target name. With column masks it
-/// is a view over the scratch table that projects each column either raw or
-/// masked, plus a [`policy_raw_alias`] raw alias for masked columns when
-/// `raw_alias_nonce` is set (the UPDATE path needs this for the CASE-ELSE
-/// branch). The view is planned in the separate mask context
+/// is the scratch table aliased to the target name. Otherwise it is the
+/// policy relation of [`policy_projection_sql`] over the scratch table. With
+/// column masks that relation is a view planned in the separate mask context
 /// ([`crate::policy_view`]) because a HASH mask calls the internal keyed
 /// function, which the session planning the user's WHERE / SET cannot
-/// resolve.
+/// resolve. A row filter alone stays inline.
 async fn build_policy_from_clause(
     ctx: &DFSessionContext,
     scratch_table: &str,
     orig_alias: &str,
     schema: &ArrowSchema,
     predicates: &sqe_policy::write_predicates::WritePolicyPredicates,
-    raw_alias_nonce: Option<&str>,
+    nonce: &str,
+    raw_aliases: bool,
 ) -> sqe_core::Result<PolicyFrom> {
     let Some(select_sql) =
-        policy_projection_sql(scratch_table, schema, predicates, raw_alias_nonce)
+        policy_projection_sql(scratch_table, orig_alias, schema, predicates, nonce, raw_aliases)
     else {
         return Ok(PolicyFrom {
             sql: format!("{scratch_table} AS \"{orig_alias}\""),
             _view: None,
         });
     };
+    if predicates.column_mask_sqls.is_empty() {
+        return Ok(PolicyFrom {
+            sql: format!("({select_sql}) AS \"{orig_alias}\""),
+            _view: None,
+        });
+    }
     let view = format!(
         "datafusion.public.{DML_SCRATCH_PREFIX}pol_{}",
         Uuid::now_v7().simple()
@@ -636,36 +674,60 @@ async fn build_policy_from_clause(
     })
 }
 
-/// The masking SELECT over the scratch table, or `None` without column
-/// masks. Only column names, the scratch name and policy text go in.
+/// The policy SELECT over the scratch table, or `None` without a policy.
+/// Only column names, the scratch name and policy text go in.
+///
+/// Each column is projected as the caller sees it: through its mask, and
+/// with a row filter through the guard `CASE WHEN <row filter> THEN <col>
+/// END`, so a hidden row is all NULL to the user's WHERE and SET (they are
+/// spliced into the same SELECT and may be evaluated on every row; a
+/// fallible one, say `1 / (id - 2)`, would otherwise fail on a hidden row and
+/// reveal its values). The row filter's verdict on the stored values is
+/// projected as [`policy_admit_alias`], TRUE-only so a NULL verdict hides the
+/// row. With `raw_aliases` (UPDATE's write-back), every column read through a
+/// mask or the guard also gets a [`policy_raw_alias`] carrying its stored
+/// value. Unlike the read path, which guards only queries holding a fallible
+/// expression, this always guards: the scratch table has no scan pruning to
+/// lose.
 fn policy_projection_sql(
     scratch_table: &str,
+    orig_alias: &str,
     schema: &ArrowSchema,
     predicates: &sqe_policy::write_predicates::WritePolicyPredicates,
-    raw_alias_nonce: Option<&str>,
+    nonce: &str,
+    raw_aliases: bool,
 ) -> Option<String> {
-    if predicates.column_mask_sqls.is_empty() {
+    let row_filter = predicates.row_filter_sql.as_deref();
+    if predicates.column_mask_sqls.is_empty() && row_filter.is_none() {
         return None;
     }
 
-    let mut projections: Vec<String> = Vec::with_capacity(schema.fields().len() + 1);
+    let mut projections: Vec<String> = Vec::with_capacity(2 * schema.fields().len() + 1);
     for f in schema.fields() {
         let name = f.name();
-        match predicates.column_mask_sqls.get(name) {
-            Some(mask_sql) => {
-                projections.push(format!("({mask_sql}) AS \"{name}\""));
-                if let Some(nonce) = raw_alias_nonce {
-                    let raw = policy_raw_alias(name, nonce);
-                    projections.push(format!("\"{name}\" AS \"{raw}\""));
-                }
-            }
-            None => {
-                projections.push(format!("\"{name}\""));
-            }
+        let mask = predicates.column_mask_sqls.get(name);
+        let seen = match mask {
+            Some(mask_sql) => format!("({mask_sql})"),
+            None => format!("\"{name}\""),
+        };
+        match row_filter {
+            Some(rf) => projections.push(format!("CASE WHEN ({rf}) THEN {seen} END AS \"{name}\"")),
+            None if mask.is_some() => projections.push(format!("{seen} AS \"{name}\"")),
+            None => projections.push(seen),
+        }
+        if raw_aliases && (mask.is_some() || row_filter.is_some()) {
+            let raw = policy_raw_alias(name, nonce);
+            projections.push(format!("\"{name}\" AS \"{raw}\""));
         }
     }
+    if let Some(rf) = row_filter {
+        projections.push(format!("(({rf}) IS TRUE) AS \"{}\"", policy_admit_alias(nonce)));
+    }
     let projection_sql = projections.join(", ");
-    Some(format!("SELECT {projection_sql} FROM {scratch_table}"))
+    // Aliased to the target name: the policy SQL may qualify its columns.
+    Some(format!(
+        "SELECT {projection_sql} FROM {scratch_table} AS \"{orig_alias}\""
+    ))
 }
 
 /// Best-effort cleanup of a partially-created CTAS table.
@@ -5927,14 +5989,18 @@ impl WriteHandler {
         let scratch = ScratchTable::register(ctx, batch)?;
         let orig_name = table_ident.name();
 
-        let augmented_where = augment_where_with_row_filter(where_sql, predicates);
+        refuse_internal_policy_aliases("WHERE", [where_sql])?;
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let augmented_where =
+            augment_where_with_row_filter(where_sql, predicates, orig_name, &nonce);
         let policy_from = build_policy_from_clause(
             ctx,
             scratch.qualified(),
             orig_name,
             &batch.schema(),
             predicates,
-            None,
+            &nonce,
+            false,
         )
         .await?;
         let from_clause = &policy_from.sql;
@@ -5943,8 +6009,9 @@ impl WriteHandler {
         // Alias the scratch table to the original target name (see apply_update
         // for rationale) so correlated subqueries inside the WHERE clause can
         // reference `tablename.col`.
+        // TRUE-only: a NULL verdict neither deletes the row nor reports it.
         let eval_sql = format!(
-            "SELECT CAST(({augmented_where}) AS BOOLEAN) AS __match \
+            "SELECT COALESCE(CAST(({augmented_where}) AS BOOLEAN), FALSE) AS __match \
              FROM {from_clause}{joins_sql}"
         );
         let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, &eval_sql)
@@ -6006,22 +6073,27 @@ impl WriteHandler {
         let scratch = ScratchTable::register(ctx, batch)?;
         let orig_name = table_ident.name();
 
-        let augmented_where = augment_where_with_row_filter(where_sql, predicates);
+        refuse_internal_policy_aliases("WHERE", [where_sql])?;
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let augmented_where =
+            augment_where_with_row_filter(where_sql, predicates, orig_name, &nonce);
         let policy_from = build_policy_from_clause(
             ctx,
             scratch.qualified(),
             orig_name,
             &batch.schema(),
             predicates,
-            None,
+            &nonce,
+            false,
         )
         .await?;
         let from_clause = &policy_from.sql;
 
         // Alias the scratch table to the original target name so correlated
         // subqueries inside WHERE can reference `tablename.col`.
+        // TRUE-only: a NULL verdict neither deletes the row nor reports it.
         let eval_sql = format!(
-            "SELECT CAST(({augmented_where}) AS BOOLEAN) AS __match \
+            "SELECT COALESCE(CAST(({augmented_where}) AS BOOLEAN), FALSE) AS __match \
              FROM {from_clause}{joins_sql}"
         );
         let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, &eval_sql)
@@ -6090,36 +6162,33 @@ impl WriteHandler {
             assignment_map.insert(d.col_name.clone(), d.expr_sql.clone());
         }
 
-        // The raw alias is internal: user SQL naming it is refused outright
-        // (the per-call nonce below already makes it unguessable).
-        if assignment_map
-            .values()
-            .map(String::as_str)
-            .chain([where_sql])
-            .any(|s| s.to_ascii_lowercase().contains("__pol_raw_"))
-        {
-            return Err(SqeError::with_code(
-                SqeErrorCode::AccessDenied,
-                "UPDATE may not reference internal `__pol_raw_` identifiers",
-            ));
-        }
+        // The raw and admit aliases are internal: user SQL naming them is
+        // refused outright (the per-call nonce below already makes them
+        // unguessable).
+        refuse_internal_policy_aliases(
+            "UPDATE",
+            assignment_map.values().map(String::as_str).chain([where_sql]),
+        )?;
         let raw_nonce = uuid::Uuid::new_v4().simple().to_string();
 
-        let augmented_where = augment_where_with_row_filter(where_sql, predicates);
+        let augmented_where =
+            augment_where_with_row_filter(where_sql, predicates, orig_name, &raw_nonce);
 
-        // Build SELECT with CASE expressions for assigned columns. Masked
-        // columns require special handling: the ELSE branch must reference
-        // the raw alias so unchanged rows keep their pre-mask values on
-        // disk. The aliased subquery exposes a nonce-suffixed raw alias for
-        // every masked column in addition to the masked projection.
+        // Build SELECT with CASE expressions for assigned columns. A column
+        // the caller reads through a mask or the row-filter guard needs
+        // special handling: the ELSE branch must reference the raw alias so
+        // unchanged rows (hidden ones included) keep their stored values on
+        // disk. The policy subquery exposes a nonce-suffixed raw alias for
+        // every such column next to the masked / guarded projection.
+        let row_filtered = predicates.row_filter_sql.is_some();
         let columns: Vec<String> = batch
             .schema()
             .fields()
             .iter()
             .map(|f| {
                 let col = f.name().clone();
-                let is_masked = predicates.column_mask_sqls.contains_key(&col);
-                let else_ref = if is_masked {
+                let via_policy = predicates.column_mask_sqls.contains_key(&col) || row_filtered;
+                let else_ref = if via_policy {
                     format!("\"{}\"", policy_raw_alias(&col, &raw_nonce))
                 } else {
                     format!("\"{col}\"")
@@ -6133,9 +6202,9 @@ impl WriteHandler {
                     // `_last_updated_sequence_number` is nulled so it inherits
                     // the new file's sequence number (spec, Row Lineage).
                     format!(
-                        "CASE WHEN ({augmented_where}) THEN CAST(NULL AS BIGINT) ELSE \"{col}\" END AS \"{col}\""
+                        "CASE WHEN ({augmented_where}) THEN CAST(NULL AS BIGINT) ELSE {else_ref} END AS \"{col}\""
                     )
-                } else if is_masked {
+                } else if via_policy {
                     format!("{else_ref} AS \"{col}\"")
                 } else {
                     format!("\"{col}\"")
@@ -6176,7 +6245,8 @@ impl WriteHandler {
             orig_name,
             &batch.schema(),
             predicates,
-            Some(&raw_nonce),
+            &raw_nonce,
+            true,
         )
         .await?;
         let from_clause = &policy_from.sql;
@@ -10203,6 +10273,159 @@ s3_path_style = true
         for i in 0..regions.len() {
             assert_eq!(regions.value(i), "US", "EU rows must not survive");
         }
+    }
+
+    fn int64_column(batch: &arrow_array::RecordBatch, name: &str) -> Vec<Option<i64>> {
+        let col = batch.column_by_name(name).expect("column");
+        let col = arrow::compute::cast(col, &arrow_schema::DataType::Int64).unwrap();
+        col.as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap()
+            .iter()
+            .collect()
+    }
+
+    /// A fallible WHERE / SET never runs on a row the caller's row filter
+    /// hides: the evaluators read every column through the row-filter guard,
+    /// so a hidden row is all NULL to the user's SQL. `1 / (id - 2)` divides
+    /// by zero only on id 2, a hidden US row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dml_caller_predicate_cannot_error_on_hidden_rows() {
+        use datafusion::logical_expr::{col, lit};
+        use sqe_policy::MaskType;
+        let fallible = "1 / (id - 2) = 1";
+        let batch = make_employee_batch();
+
+        // Unguarded, the predicate fails on id 2.
+        let (handler, session, table_ident, ctx) = employees_handler_with_policy(None, vec![]).await;
+        let predicates = compute_predicates_for_employees(&handler, &session, &table_ident).await;
+        let err = handler
+            .filter_batch_match(&ctx, &session, &batch, fallible, "", &table_ident, &predicates)
+            .await
+            .expect_err("unguarded, the predicate divides by zero");
+        assert!(err.to_string().contains("Divide by zero"), "{err}");
+
+        let (handler, session, table_ident, ctx) = employees_handler_with_policy(
+            Some(col("region").eq(lit("EU"))),
+            vec![("ssn", MaskType::Redact("***".to_string()))],
+        )
+        .await;
+        let predicates = compute_predicates_for_employees(&handler, &session, &table_ident).await;
+
+        let survivors = handler
+            .filter_batch_negate(&ctx, &session, &batch, fallible, "", &table_ident, &predicates)
+            .await
+            .unwrap();
+        assert_eq!(int64_column(&survivors, "id"), vec![Some(1), Some(2), Some(4)]);
+
+        let matched = handler
+            .filter_batch_match(&ctx, &session, &batch, fallible, "", &table_ident, &predicates)
+            .await
+            .unwrap();
+        assert_eq!(
+            matched.iter().collect::<Vec<_>>(),
+            vec![Some(false), Some(false), Some(true), Some(false)]
+        );
+
+        // UPDATE: only id 3 changes; every hidden column, the masked one
+        // included, is written back as stored.
+        let stmt = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::GenericDialect {},
+            "UPDATE employees SET ssn = CAST(1 / (id - 2) AS VARCHAR)",
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let sqlparser::ast::Statement::Update(update) = stmt else {
+            panic!("expected UPDATE");
+        };
+        let out = handler
+            .apply_update(&ctx, &session, &batch, &update.assignments, fallible, "", &table_ident, &predicates)
+            .await
+            .unwrap();
+        let expected = arrow_array::RecordBatch::try_new(
+            batch.schema(),
+            vec![
+                batch.column(0).clone(),
+                Arc::new(arrow_array::StringArray::from(vec!["111-11", "222-22", "1", "444-44"])),
+                batch.column(2).clone(),
+            ],
+        )
+        .unwrap();
+        let out = arrow::compute::cast(out.column(1), &arrow_schema::DataType::Utf8)
+            .map(|ssn| {
+                arrow_array::RecordBatch::try_new(
+                    batch.schema(),
+                    vec![out.column(0).clone(), ssn, out.column(2).clone()],
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert_eq!(out, expected);
+    }
+
+    /// A row whose row-filter verdict is NULL is hidden: DELETE keeps it, and
+    /// a boolean column reads NULL through the guard on it, so a predicate
+    /// that fails unless the hidden value is NULL does not fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dml_null_row_filter_verdict_hides_the_row() {
+        use arrow_array::{BooleanArray, Int64Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema2};
+        use datafusion::logical_expr::{col, lit};
+        let (handler, session, table_ident, ctx) =
+            employees_handler_with_policy(Some(col("region").eq(lit("EU"))), vec![]).await;
+        let predicates = compute_predicates_for_employees(&handler, &session, &table_ident).await;
+        let batch = arrow_array::RecordBatch::try_new(
+            Arc::new(ArrowSchema2::new(vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("ssn", DataType::Utf8, true),
+                Field::new("region", DataType::Utf8, true),
+                Field::new("active", DataType::Boolean, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+                Arc::new(StringArray::from(vec!["111-11", "222-22", "333-33"])),
+                Arc::new(StringArray::from(vec![Some("EU"), Some("US"), None])),
+                Arc::new(BooleanArray::from(vec![true, false, false])),
+            ],
+        )
+        .unwrap();
+
+        let survivors = handler
+            .filter_batch_negate(&ctx, &session, &batch, "TRUE", "", &table_ident, &predicates)
+            .await
+            .unwrap();
+        assert_eq!(int64_column(&survivors, "id"), vec![Some(2), Some(3)]);
+
+        let probe = "1 / (CASE WHEN active IS NULL OR id = 1 THEN 1 ELSE 0 END) = 1";
+        let survivors = handler
+            .filter_batch_negate(&ctx, &session, &batch, probe, "", &table_ident, &predicates)
+            .await
+            .unwrap();
+        assert_eq!(int64_column(&survivors, "id"), vec![Some(2), Some(3)]);
+
+        // Without a policy, a NULL WHERE verdict does not delete the row either.
+        let (handler, session, table_ident, ctx) = employees_handler_with_policy(None, vec![]).await;
+        let predicates = compute_predicates_for_employees(&handler, &session, &table_ident).await;
+        let survivors = handler
+            .filter_batch_negate(&ctx, &session, &batch, "region = 'EU'", "", &table_ident, &predicates)
+            .await
+            .unwrap();
+        assert_eq!(int64_column(&survivors, "id"), vec![Some(2), Some(3)]);
+    }
+
+    /// The admit and raw aliases are internal to the policy relation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dml_where_cannot_reference_internal_policy_aliases() {
+        use datafusion::logical_expr::{col, lit};
+        let (handler, session, table_ident, ctx) =
+            employees_handler_with_policy(Some(col("region").eq(lit("EU"))), vec![]).await;
+        let predicates = compute_predicates_for_employees(&handler, &session, &table_ident).await;
+        let err = handler
+            .filter_batch_match(&ctx, &session, &make_employee_batch(), "\"__pol_admit_x\"", "", &table_ident, &predicates)
+            .await
+            .expect_err("internal alias refused");
+        assert!(err.to_string().contains("__pol_"), "{err}");
     }
 
     // #729: appends honour the target row filter / restricted columns
