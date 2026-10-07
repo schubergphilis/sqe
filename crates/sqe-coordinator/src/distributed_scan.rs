@@ -146,6 +146,9 @@ pub struct DistributedScanExec {
     credential_expiry: Option<DateTime<Utc>>,
     /// Optional tracker for coordinating credential refresh pushes.
     credential_tracker: Option<Arc<CredentialRefreshTracker>>,
+    /// Reloads the scanned table as the querying user for fresh vended
+    /// keys; registered with each fragment so the refresh task can use it.
+    credential_reloader: Option<sqe_catalog::vended_credentials::TableReloader>,
     /// Worker registry for health tracking and failover.
     worker_registry: Option<Arc<WorkerRegistry>>,
     /// Maximum number of retry attempts per fragment.
@@ -316,6 +319,7 @@ impl DistributedScanExec {
             properties,
             credential_expiry: None,
             credential_tracker: None,
+            credential_reloader: None,
             worker_registry: None,
             max_retries: DEFAULT_MAX_RETRIES,
             dispatcher: None,
@@ -341,6 +345,7 @@ impl DistributedScanExec {
             properties: self.properties.clone(),
             credential_expiry: self.credential_expiry,
             credential_tracker: self.credential_tracker.clone(),
+            credential_reloader: self.credential_reloader.clone(),
             worker_registry: self.worker_registry.clone(),
             max_retries: self.max_retries,
             dispatcher: self.dispatcher.clone(),
@@ -408,6 +413,17 @@ impl DistributedScanExec {
     #[must_use = "with_credential_tracker consumes self; bind the returned scan"]
     pub fn with_credential_tracker(mut self, tracker: Arc<CredentialRefreshTracker>) -> Self {
         self.credential_tracker = Some(tracker);
+        self
+    }
+
+    /// Set the reloader the refresh task uses to fetch this scan's next
+    /// vended keys (as the querying user).
+    #[must_use = "with_credential_reloader consumes self; bind the returned scan"]
+    pub fn with_credential_reloader(
+        mut self,
+        reloader: sqe_catalog::vended_credentials::TableReloader,
+    ) -> Self {
+        self.credential_reloader = Some(reloader);
         self
     }
 
@@ -635,6 +651,7 @@ impl ExecutionPlan for DistributedScanExec {
         let schema_for_stream = self.schema.clone();
         let credential_expiry = self.credential_expiry;
         let credential_tracker = self.credential_tracker.clone();
+        let credential_reloader = self.credential_reloader.clone();
         let max_retries = self.max_retries;
         let worker_registry = self.worker_registry.clone();
         let channel_pool = self.worker_registry.as_ref().map(|r| r.channel_pool());
@@ -820,10 +837,11 @@ impl ExecutionPlan for DistributedScanExec {
             // Register fragment with the credential tracker if available
             if let Some(ref tracker) = credential_tracker {
                 tracker
-                    .register(
+                    .register_with_reloader(
                         task.fragment_id.clone(),
                         initial_worker_url.clone(),
                         credential_expiry,
+                        credential_reloader.clone(),
                     )
                     .await;
             }

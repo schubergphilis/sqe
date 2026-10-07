@@ -307,6 +307,10 @@ pub struct IcebergScanExec {
     /// clone) of this scan node, sized `scan_fetch_ahead`. Rebuilt by
     /// [`IcebergScanExec::with_scan_fetch_ahead`] at planning time.
     fetch_permits: Arc<tokio::sync::Semaphore>,
+    /// Reloads `table` from its catalog as the same principal, for fresh
+    /// vended credentials when a distributed scan outlives its keys. `None`
+    /// for tables not loaded through a session catalog.
+    table_reloader: Option<crate::vended_credentials::TableReloader>,
     static_plan: Arc<tokio::sync::OnceCell<Arc<StaticScanPlan>>>,
     split_assignments: Arc<tokio::sync::OnceCell<Vec<Vec<FileScanTask>>>>,
     /// First sealed snapshot of each `pushed_down_filters` entry, collapsed
@@ -555,6 +559,7 @@ impl IcebergScanExec {
             decode_permits,
             scan_fetch_ahead,
             fetch_permits,
+            table_reloader: None,
             static_plan: Arc::new(tokio::sync::OnceCell::new()),
             split_assignments: Arc::new(tokio::sync::OnceCell::new()),
             sealed_filters: new_sealed_filter_cache(0),
@@ -766,6 +771,22 @@ impl IcebergScanExec {
     pub fn table(&self) -> &Table {
         &self.table
     }
+
+    /// Attach the reloader the credential-refresh path uses (see
+    /// [`crate::vended_credentials::TableReloader`]).
+    #[must_use = "with_table_reloader consumes self; bind the returned scan"]
+    pub fn with_table_reloader(
+        mut self,
+        reloader: crate::vended_credentials::TableReloader,
+    ) -> Self {
+        self.table_reloader = Some(reloader);
+        self
+    }
+
+    /// The reloader attached by the table provider, if any.
+    pub fn table_reloader(&self) -> Option<&crate::vended_credentials::TableReloader> {
+        self.table_reloader.as_ref()
+    }
     pub fn predicates(&self) -> Option<&Predicate> {
         self.predicates.as_ref()
     }
@@ -827,6 +848,7 @@ impl IcebergScanExec {
             decode_permits: self.decode_permits.clone(),
             scan_fetch_ahead: self.scan_fetch_ahead,
             fetch_permits: self.fetch_permits.clone(),
+            table_reloader: self.table_reloader.clone(),
             static_plan: self.static_plan.clone(),
             split_assignments: self.split_assignments.clone(),
             sealed_filters,
