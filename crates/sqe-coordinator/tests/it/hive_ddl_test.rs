@@ -23,7 +23,7 @@ use sqe_core::{SecretStore, Session, SqeConfig};
 use sqe_metrics::audit::AuditLogger;
 use sqe_policy::plan_rewriter::HiveCatalogs;
 use sqe_policy::policy_store::InMemoryPolicyStore;
-use sqe_policy::{PassthroughEnforcer, PolicyStore, ResolvedPolicy};
+use sqe_policy::{PassthroughEnforcer, PolicyStore, ResolvedPolicy, TablePrivilege};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -1335,4 +1335,273 @@ async fn ddl_location_checks_run_as_the_session_user() {
     h.execute_for_test(&named_table_ddl("orders_raw", "s3://raw/orders/"))
         .await
         .expect("an object-store admin may");
+}
+
+// ---------------------------------------------------------------------------
+// Hive DDL authorization: admin, owner, or a policy-engine grant
+// ---------------------------------------------------------------------------
+
+/// The sidecar of `lake.<db>.<table>` under a harness's `ATTACH`ed root.
+fn manifest_file(h: &Harness, db: &str, table: &str) -> PathBuf {
+    h._dirs[0]
+        .path()
+        .join("wh")
+        .join(db)
+        .join(table)
+        .join("_sqe")
+        .join("table.json")
+}
+
+/// A non-owner holding a `drop` grant from the policy engine may replace and
+/// drop the table; one without it, or with only `alter`, may not.
+#[tokio::test]
+async fn a_policy_grant_lets_a_non_owner_replace_or_drop_a_hive_table() {
+    let store = Arc::new(InMemoryPolicyStore::new());
+    let h = handler_with_root_and_policy("lake", store.clone()).await;
+    store
+        .grant_table_privilege("lake.sales", "orders", "stewards", TablePrivilege::Drop)
+        .await;
+    store
+        .grant_table_privilege("lake.sales", "orders", "ops", TablePrivilege::Alter)
+        .await;
+    let steward = session_with_roles(vec!["stewards".to_string()]);
+    let ops = session_with_roles(vec!["ops".to_string()]);
+    let analyst = session_with_roles(vec!["analyst".to_string()]);
+
+    for who in [&analyst, &ops] {
+        let err = h
+            .handler
+            .execute(who, "DROP TABLE lake.sales.orders", None)
+            .await
+            .expect_err("no drop grant, not the owner, not an admin");
+        assert!(err.to_string().contains("403"), "{err}");
+    }
+
+    let elsewhere = format!("file://{}", h._dirs[0].path().join("elsewhere").display());
+    h.handler
+        .execute(&steward, &named_table_ddl("orders", &elsewhere), None)
+        .await
+        .expect("a drop grant may replace the definition");
+    h.handler
+        .execute(&steward, "DROP TABLE lake.sales.orders", None)
+        .await
+        .expect("a drop grant may drop the table");
+}
+
+/// A manifest with no recorded owner (an older sidecar, a Glue mirror) is
+/// not admin-only: the policy-engine grant still applies to it.
+#[tokio::test]
+async fn an_ownerless_manifest_is_droppable_through_a_grant() {
+    let store = Arc::new(InMemoryPolicyStore::new());
+    let h = handler_with_root_and_policy("lake", store.clone()).await;
+    let path = manifest_file(&h, "sales", "orders");
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read manifest")).expect("json");
+    json.as_object_mut().expect("object").remove("owner");
+    std::fs::write(&path, serde_json::to_vec(&json).unwrap()).expect("write manifest");
+
+    let steward = session_with_roles(vec!["stewards".to_string()]);
+    let err = h
+        .handler
+        .execute(&steward, "DROP TABLE lake.sales.orders", None)
+        .await
+        .expect_err("no grant yet");
+    assert!(err.to_string().contains("403"), "{err}");
+
+    store
+        .grant_table_privilege("lake.sales", "orders", "stewards", TablePrivilege::Drop)
+        .await;
+    h.handler
+        .execute(&steward, "DROP TABLE lake.sales.orders", None)
+        .await
+        .expect("the grant covers an ownerless manifest");
+}
+
+/// Nesting a table under one the caller owns, or holds `alter` on, is the
+/// normal Hive layout; the overlap refusal only protects other people's
+/// tables.
+#[tokio::test]
+async fn nesting_under_a_table_the_caller_may_administer_is_allowed() {
+    let store = Arc::new(InMemoryPolicyStore::new());
+    let h = handler_with_root_and_policy("lake", store.clone()).await;
+    let base = h._dirs[0].path().join("mine");
+    let analyst = session_with_roles(vec!["analyst".to_string()]);
+    let other = session_with_roles(vec!["analyst".to_string()]);
+
+    h.handler
+        .execute(
+            &analyst,
+            &named_table_ddl("parent", &format!("file://{}", base.display())),
+            None,
+        )
+        .await
+        .expect("a disjoint location");
+    let nested = format!("file://{}/dt=2026-01-01", base.display());
+    h.handler
+        .execute(&analyst, &named_table_ddl("child", &nested), None)
+        .await
+        .expect("the owner may nest a table under their own table");
+
+    let err = h
+        .handler
+        .execute(&other, &named_table_ddl("alias", &nested), None)
+        .await
+        .expect_err("someone else may not");
+    assert!(err.to_string().contains("overlaps"), "{err}");
+
+    // `orders` (the harness's table, owned by its admin session) is open to
+    // a caller with an alter grant on it.
+    let data = h._dirs[0].path().join("data");
+    store
+        .grant_table_privilege("lake.sales", "orders", "ops", TablePrivilege::Alter)
+        .await;
+    let ops = session_with_roles(vec!["ops".to_string()]);
+    h.handler
+        .execute(
+            &ops,
+            &named_table_ddl(
+                "orders_day",
+                &format!("file://{}/dt=2026-01-01", data.display()),
+            ),
+            None,
+        )
+        .await
+        .expect("an alter grant on orders covers a table nested under it");
+}
+
+/// One bad sidecar in the root must not block every non-admin's DDL.
+#[tokio::test]
+async fn an_unparsable_manifest_does_not_block_ddl_on_other_tables() {
+    let store = Arc::new(InMemoryPolicyStore::new());
+    let h = handler_with_root_and_policy("lake", store).await;
+    let garbage = manifest_file(&h, "sales", "broken");
+    std::fs::create_dir_all(garbage.parent().unwrap()).unwrap();
+    std::fs::write(&garbage, b"{ not a manifest").unwrap();
+    let bad_location = manifest_file(&h, "sales", "bad_location");
+    std::fs::create_dir_all(bad_location.parent().unwrap()).unwrap();
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(manifest_file(&h, "sales", "orders")).unwrap())
+            .unwrap();
+    json["name"] = "bad_location".into();
+    json["storage_descriptor"]["location"] = "http://[::1".into();
+    std::fs::write(&bad_location, serde_json::to_vec(&json).unwrap()).unwrap();
+
+    let analyst = session_with_roles(vec!["analyst".to_string()]);
+    let own = format!("file://{}", h._dirs[0].path().join("own").display());
+    h.handler
+        .execute(&analyst, &named_table_ddl("mine", &own), None)
+        .await
+        .expect("a bad sidecar elsewhere in the root is skipped");
+    h.handler
+        .execute(&analyst, "DROP TABLE lake.sales.mine", None)
+        .await
+        .expect("and the owner can drop it again");
+}
+
+/// A `[[hive.roots]]` root is attached with the trusted startup caller, but
+/// a session's SELECT scans as the session user. DDL checks locations with
+/// that same caller, so whoever may SELECT a table there needs nothing more
+/// for DDL than the grant: no global allowlist entry. Conversely a caller the
+/// allowlist refuses is refused both ways, through the same `{user}` prefix.
+#[test]
+fn ddl_on_a_configured_root_needs_no_more_than_select() {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(1)
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()
+        .unwrap()
+        .block_on(async {
+            let root_dir = tempfile::tempdir().expect("tempdir");
+            let mock = mock_polaris().await;
+            let mut config = minimal_config(&mock.uri());
+            config.storage.tvf.allowed_object_store_prefixes = vec!["s3://raw/{user}/".to_string()];
+            config.hive = toml::from_str(&format!(
+                "[[roots]]\nname = \"lake\"\nlocation = \"file://{}/wh\"\n",
+                root_dir.path().display()
+            ))
+            .expect("hive config");
+            let store = Arc::new(InMemoryPolicyStore::new());
+            let registry = RuntimeCatalogRegistry::new();
+            let hive_catalogs = Arc::new(HiveCatalogs::new());
+            sqe_coordinator::runtime_catalog::attach_configured_hive_roots(
+                &config.hive,
+                &config.storage,
+                &registry,
+                &hive_catalogs,
+                "iceberg",
+            )
+            .await
+            .expect("attach [[hive.roots]]");
+            let tracker = Arc::new(QueryTracker::new(&config.query_history));
+            let handler = Arc::new(
+                QueryHandler::new(
+                    Arc::new(PassthroughEnforcer),
+                    Some(store.clone() as Arc<dyn PolicyStore>),
+                    config,
+                    None,
+                    None,
+                    None,
+                    None,
+                    tracker,
+                    None,
+                    None,
+                    None,
+                    registry,
+                    SecretStore::new(),
+                )
+                .expect("QueryHandler::new")
+                .with_hive_registries(hive_catalogs, Arc::new(HiveMetadataCache::new())),
+            );
+
+            let admin = dummy_session();
+            let data_dir = root_dir.path().join("data");
+            write_csv_fixture(&data_dir);
+            handler
+                .execute(&admin, &create_orders_ddl(&data_dir, "lake"), None)
+                .await
+                .expect("create orders");
+            store
+                .grant_table_privilege("lake.sales", "orders", "stewards", TablePrivilege::Drop)
+                .await;
+            store
+                .grant_table_privilege("lake.sales", "events", "stewards", TablePrivilege::Drop)
+                .await;
+
+            let steward = session_with_roles(vec!["stewards".to_string()]);
+            let stranger = session_with_roles(vec!["stewards".to_string()]);
+            let theirs = format!("s3://raw/{}/events/", steward.user.username);
+            handler
+                .execute(&admin, &named_table_ddl("events", &theirs), None)
+                .await
+                .expect("an object-store admin creates the s3 table");
+
+            let (h2, s2) = (Arc::clone(&handler), steward.clone());
+            tokio::spawn(async move {
+                h2.execute(&s2, "SELECT count(*) AS n FROM lake.sales.orders", None)
+                    .await
+            })
+            .await
+            .expect("join")
+            .expect("the steward may SELECT orders");
+            for sql in [
+                "SHOW PARTITIONS lake.sales.orders",
+                "DROP TABLE lake.sales.orders",
+            ] {
+                handler
+                    .execute(&steward, sql, None)
+                    .await
+                    .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            }
+
+            let err = handler
+                .execute(&stranger, "DROP TABLE lake.sales.events", None)
+                .await
+                .expect_err("the allowlist names the steward's prefix, not the stranger's");
+            assert!(err.to_string().contains("forbidden"), "{err}");
+            handler
+                .execute(&steward, "DROP TABLE lake.sales.events", None)
+                .await
+                .expect("the `{user}` prefix and the grant are enough on an s3 location");
+        });
 }
