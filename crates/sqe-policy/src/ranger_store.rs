@@ -167,6 +167,11 @@ pub(crate) struct DataMaskPolicyItem {
     pub(crate) groups: Vec<String>,
     #[serde(rename = "dataMaskInfo", default)]
     pub(crate) data_mask_info: DataMaskInfo,
+    /// Ranger item conditions. SQE evaluates none of them, and the first
+    /// matching item decides the column, so a conditional item restricts the
+    /// column rather than letting a later (possibly `MASK_NONE`) item decide.
+    #[serde(default)]
+    pub(crate) conditions: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -996,6 +1001,18 @@ fn resolve_from_bundle(
                     if !item_matches(&item.users, &item.roles, &item.groups, user) {
                         continue;
                     }
+                    if !item.conditions.is_empty() {
+                        warn!(
+                            column = %column,
+                            policy_id = p.id,
+                            "Ranger datamask item has conditions SQE cannot evaluate; \
+                             restricting column (fail-closed)"
+                        );
+                        if !policy.restricted_columns.contains(column) {
+                            policy.restricted_columns.push(column.clone());
+                        }
+                        break;
+                    }
                     match map_mask(&item.data_mask_info, column, &identity) {
                         Ok(Some(mask)) => {
                             policy.column_masks.entry(column.clone()).or_insert(mask);
@@ -1125,6 +1142,16 @@ pub(crate) fn resolve_tag_policies(
                 for item in &p.data_mask_policy_items {
                     if !item_matches(&item.users, &item.roles, &item.groups, user) {
                         continue;
+                    }
+                    if !item.conditions.is_empty() {
+                        warn!(
+                            tag = %tag_value,
+                            policy_id = p.id,
+                            "Ranger tag datamask item has conditions SQE cannot \
+                             evaluate; marking tag unmappable (fail-closed)"
+                        );
+                        unmappable.insert(tag_value.clone());
+                        break;
                     }
                     // CUSTOM masks carry a `{col}` placeholder that only the
                     // rewriter can substitute (the column name is not known here).
@@ -2655,6 +2682,59 @@ mod tests {
         assert!(!denied(&one_policy_bundle("", r#","conditions":[]"#)), "an empty list is no condition");
     }
 
+    /// A deny exception widens access, so one carrying conditions SQE cannot
+    /// evaluate does not carve the user out of the deny.
+    #[test]
+    fn a_deny_exception_with_conditions_does_not_exempt() {
+        let bundle = |exception_extra: &str| -> ServicePolicies {
+            serde_json::from_str(&format!(
+                r#"{{"policies":[{{"id":1,"policyType":0,"isEnabled":true,
+                  "resources":{{"database":{{"values":["glue.bi"]}},"table":{{"values":["t"]}}}},
+                  "policyItems":[{{"groups":["public"],"accesses":[{{"type":"select","isAllowed":true}}]}}],
+                  "denyPolicyItems":[{{"groups":["public"],"accesses":[{{"type":"select","isAllowed":true}}]}}],
+                  "denyExceptions":[{{"users":["carol"],"accesses":[{{"type":"select","isAllowed":true}}]{exception_extra}}}]}}]}}"#
+            ))
+            .unwrap()
+        };
+        assert!(!denied(&bundle("")), "control: the plain exception exempts carol");
+        assert!(
+            denied(&bundle(r#","conditions":[{"type":"ip-range","values":["10.0.0.0/8"]}]"#)),
+            "an unevaluated condition must not exempt from a deny"
+        );
+    }
+
+    /// The first matching datamask item decides; when it carries conditions
+    /// SQE cannot evaluate, the column is restricted instead of falling
+    /// through to a later item (here a `MASK_NONE` that would show it raw).
+    #[test]
+    fn a_conditional_mask_item_restricts_the_column() {
+        let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
+        let conditional: DataMaskPolicyItem = serde_json::from_str(
+            r#"{"roles": ["analyst"], "conditions": [{"type": "ip-range", "values": ["10.0.0.0/8"]}],
+                "dataMaskInfo": {"dataMaskType": "MASK_NULL"}}"#,
+        )
+        .unwrap();
+        let unmask: DataMaskPolicyItem = serde_json::from_str(
+            r#"{"roles": ["analyst"], "dataMaskInfo": {"dataMaskType": "MASK_NONE"}}"#,
+        )
+        .unwrap();
+        bundle.policies[0].data_mask_policy_items = vec![conditional, unmask];
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales", false);
+        assert!(policy.restricted_columns.contains(&"amount".to_string()));
+        assert!(!policy.column_masks.contains_key("amount"));
+    }
+
+    #[test]
+    fn a_conditional_tag_mask_item_makes_the_tag_unmappable() {
+        let mut sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE).unwrap();
+        sp.tag_policies.as_mut().unwrap().policies[0].data_mask_policy_items[0].conditions =
+            vec![serde_json::json!({"type": "ip-range", "values": ["10.0.0.0/8"]})];
+        let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
+        let (masks, _, unmappable) = resolve_tag_policies(&sp, &user("bob", &["engineer"]), &tags);
+        assert!(!masks.contains_key("PII"));
+        assert!(unmappable.contains("PII"));
+    }
+
     #[test]
     fn validity_schedules_gate_the_allow() {
         let sched = |s: &str| one_policy_bundle(&format!(r#","validitySchedules":[{s}]"#), "");
@@ -2845,11 +2925,7 @@ mod tests {
             .data_mask_policy_items
             .push(later);
         let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
-        let id = SessionIdentity {
-            username: "bob".into(),
-            roles: vec!["engineer".into()],
-            ..Default::default()
-        };
+        let id = user("bob", &["engineer"]);
         let (masks, _, _) = resolve_tag_policies(&sp, &id, &tags);
         assert!(
             matches!(
