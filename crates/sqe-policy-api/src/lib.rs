@@ -42,22 +42,28 @@ pub struct ResolvedPolicy {
 }
 
 impl ResolvedPolicy {
-    /// True when `column` is restricted. Entries may be Ranger column
-    /// patterns (`*`, `card_*`), matched like Ranger: wildcards, any case.
+    /// True when `column` is restricted. Entries are column names compared
+    /// without regard to case, as Ranger compares datamask and row-filter
+    /// `column` resources (`ignoreCase: true`, `wildCard: false` in the
+    /// `hive` service definition): `card_*` names a column called `card_*`.
     pub fn is_restricted(&self, column: &str) -> bool {
-        self.restricted_columns.iter().any(|p| wildcard_match(p, column))
+        let folded = column.to_lowercase();
+        self.restricted_columns.iter().any(|c| c.to_lowercase() == folded)
     }
 
-    /// The mask that applies to `column`: an exact key first, else the
-    /// matching pattern that sorts first (deterministic across runs).
+    /// The mask that applies to `column`: an exact key first, else a key that
+    /// differs only by case (the one that sorts first, so the choice is
+    /// deterministic). Callers check [`Self::is_restricted`] first, so a
+    /// restriction on any spelling of the column beats a mask.
     pub fn mask_for(&self, column: &str) -> Option<&MaskType> {
         if let Some(mask) = self.column_masks.get(column) {
             return Some(mask);
         }
+        let folded = column.to_lowercase();
         self.column_masks
             .iter()
-            .filter(|(p, _)| wildcard_match(p, column))
-            .min_by_key(|(p, _)| *p)
+            .filter(|(c, _)| c.to_lowercase() == folded)
+            .min_by_key(|(c, _)| *c)
             .map(|(_, mask)| mask)
     }
 }
@@ -65,15 +71,18 @@ impl ResolvedPolicy {
 /// Ranger wildcard match: `*` matches any run of characters (including none),
 /// `?` matches exactly one.
 ///
-/// Semantics taken from the live `hive` service definition, whose `database`,
-/// `table` and `column` resources all declare
+/// Semantics taken from the live `hive` service definition, whose access
+/// policy `database`, `table` and `column` resources declare
 /// `matcherOptions: {wildCard: "true", ignoreCase: "true"}`. Ranger implements
 /// that with commons-io `FilenameUtils.wildcardMatch` and `IOCase.INSENSITIVE`,
 /// where no character other than `*` and `?` is special.
 ///
 /// Case folding is part of the same contract, not a separate liberty: with
-/// `ignoreCase: true`, a policy written on `Orders` fires for `orders` in Ranger,
-/// and SQE comparing case-sensitively would silently not mask.
+/// `ignoreCase: true`, a policy written on `Orders` fires for `orders` in Ranger.
+///
+/// Datamask and row-filter resources are different: `dataMaskDef` and
+/// `rowFilterDef` declare `wildCard: "false"`, so their column entries are
+/// plain names compared without case (see [`ResolvedPolicy::is_restricted`]).
 ///
 /// Iterative with a single backtrack point, so a pattern like `*a*a*a*a*` cannot
 /// blow up: policies are operator input reaching a per-query path.
@@ -338,22 +347,35 @@ pub trait PolicyStore: Send + Sync {
 mod tests {
     use super::*;
 
-    /// Ranger column resources are patterns: `*`, prefix wildcards and any case
-    /// must hit the real column, or the mask/restriction never fires.
+    /// Datamask column entries match like Ranger's `dataMaskDef`: any case,
+    /// no wildcards. `card_*` is a literal name, not a pattern.
     #[test]
-    fn column_patterns_match_like_ranger() {
+    fn column_entries_match_like_ranger_datamask() {
         let mut p = ResolvedPolicy::default();
         p.column_masks.insert("card_*".to_string(), MaskType::Hash);
         p.column_masks.insert("SSN".to_string(), MaskType::Nullify);
         p.restricted_columns.push("*".to_string());
-        assert!(matches!(p.mask_for("card_number"), Some(MaskType::Hash)));
+        assert!(p.mask_for("card_number").is_none());
+        assert!(matches!(p.mask_for("card_*"), Some(MaskType::Hash)));
         assert!(matches!(p.mask_for("ssn"), Some(MaskType::Nullify)));
         assert!(p.mask_for("name").is_none());
-        assert!(p.is_restricted("anything"));
+        assert!(!p.is_restricted("anything"));
 
         let mut q = ResolvedPolicy::default();
         q.restricted_columns.push("Notes".to_string());
         assert!(q.is_restricted("notes"));
+        assert!(q.is_restricted("NOTES"));
         assert!(!q.is_restricted("notes2"));
+    }
+
+    /// An exact key wins; otherwise the case-variant that sorts first.
+    #[test]
+    fn mask_for_prefers_the_exact_key() {
+        let mut p = ResolvedPolicy::default();
+        p.column_masks.insert("Email".to_string(), MaskType::Hash);
+        p.column_masks.insert("email".to_string(), MaskType::Nullify);
+        assert!(matches!(p.mask_for("email"), Some(MaskType::Nullify)));
+        assert!(matches!(p.mask_for("Email"), Some(MaskType::Hash)));
+        assert!(matches!(p.mask_for("EMAIL"), Some(MaskType::Hash)));
     }
 }

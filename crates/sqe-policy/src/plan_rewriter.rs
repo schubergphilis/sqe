@@ -434,8 +434,8 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                             .iter()
                             .filter(|f| {
                                 f.column_refs().iter().any(|c| {
-                                    policy.restricted_columns.contains(&c.name)
-                                        || policy.column_masks.contains_key(&c.name)
+                                    policy.is_restricted(&c.name)
+                                        || policy.mask_for(&c.name).is_some()
                                 })
                             })
                             .cloned()
