@@ -147,7 +147,10 @@ default_table_format_version = 2 # Iceberg table format version (2 or 3)
 trust_sort_order = false        # Trust Iceberg sort order for all columns, not just partition keys
 small_file_threshold_mb = 3     # Max file size for the direct-read fast path (0 to disable)
 parquet_compression = "zstd"    # Write-path Parquet codec: zstd, lz4, snappy, none
-require_vended_credentials = false # When true, FileIO never gets [storage] keys (issue #395)
+access_delegation = "none"      # "none" or "vended-credentials": send X-Iceberg-Access-Delegation so
+                                # the catalog vends table-scoped keys, which beat [storage] keys
+require_vended_credentials = false # When true, FileIO never gets [storage] keys (issue #395); implies
+                                # access_delegation = "vended-credentials"
 tvf_prefixes = []               # Extra object-store prefixes file TVFs may read in sessions
                                 # scoped to THIS catalog only; added to [storage.tvf]
                                 # allowed_object_store_prefixes. Also on [catalogs.<name>].
@@ -409,6 +412,7 @@ Every config field can be overridden via environment variable. Convention: `SQE_
 | `SQE_CATALOG__CATALOG_URL` | `catalog.catalog_url` | string |
 | `SQE_CATALOG__POLARIS_URL` | `catalog.catalog_url` (legacy alias) | string |
 | `SQE_CATALOG__WAREHOUSE` | `catalog.warehouse` | string |
+| `SQE_CATALOG__ACCESS_DELEGATION` | `catalog.access_delegation` | `none` / `vended-credentials` |
 | `SQE_CATALOG__REQUIRE_VENDED_CREDENTIALS` | `catalog.require_vended_credentials` | bool |
 | `SQE_CATALOG__METADATA_CACHE_TTL_SECS` | `catalog.metadata_cache_ttl_secs` | u64 |
 | `SQE_CATALOG__DEFAULT_TABLE_FORMAT_VERSION` | `catalog.default_table_format_version` | u8 |

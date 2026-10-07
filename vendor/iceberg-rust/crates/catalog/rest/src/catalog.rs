@@ -417,6 +417,86 @@ pub(crate) fn explicit_headers_from_props(props: &HashMap<String, String>) -> Re
     Ok(headers)
 }
 
+// SQE PATCH (vended-credentials): table FileIO properties from a
+// `LoadTableResult`. Upstream merges `config` and then the local catalog
+// properties over it, so a static key pair configured on the client silently
+// replaces the short-lived, table-scoped credentials the server vended, and
+// `storage-credentials` is parsed but never read.
+
+/// Property keys that carry storage credentials a REST server can vend.
+fn is_vended_credential_key(key: &str) -> bool {
+    matches!(
+        key,
+        "s3.access-key-id"
+            | "s3.secret-access-key"
+            | "s3.session-token"
+            | "s3.session-token-expires-at-ms"
+            | "gcs.oauth2.token"
+            | "gcs.oauth2.token-expires-at"
+    ) || key.starts_with("adls.sas-token")
+}
+
+/// `s3a://` and `s3n://` name the same objects as `s3://`.
+fn normalize_storage_scheme(location: &str) -> std::borrow::Cow<'_, str> {
+    for alias in ["s3a://", "s3n://"] {
+        if let Some(rest) = location.strip_prefix(alias) {
+            return std::borrow::Cow::Owned(format!("s3://{rest}"));
+        }
+    }
+    std::borrow::Cow::Borrowed(location)
+}
+
+/// The storage credential whose `prefix` is the longest prefix of
+/// `location` (Iceberg REST spec: "choose the most specific prefix").
+/// `None` when no entry covers the location.
+pub(crate) fn select_storage_credential<'a>(
+    credentials: Option<&'a [crate::types::StorageCredential]>,
+    location: &str,
+) -> Option<&'a crate::types::StorageCredential> {
+    let location = normalize_storage_scheme(location);
+    credentials?
+        .iter()
+        .filter(|c| !c.prefix.is_empty())
+        .filter(|c| location.starts_with(normalize_storage_scheme(&c.prefix).as_ref()))
+        .max_by_key(|c| c.prefix.len())
+}
+
+/// FileIO properties for a table, in increasing precedence:
+///
+/// 1. the response `config`;
+/// 2. the `storage-credentials` entry with the longest prefix of
+///    `table_location` (more specific than `config`);
+/// 3. the local catalog properties (upstream behaviour: local settings such
+///    as `s3.endpoint` win over the server's);
+/// 4. any credential keys from (1) or (2), which replace the local
+///    credential set as a whole, so a vended token is never paired with a
+///    static access key.
+///
+/// A server that vends nothing (no delegation header was sent) leaves the
+/// result identical to upstream's `config` + local merge.
+pub(crate) fn table_file_io_props(
+    response_config: &HashMap<String, String>,
+    storage_credentials: Option<&[crate::types::StorageCredential]>,
+    table_location: &str,
+    local_props: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut props = response_config.clone();
+    if let Some(credential) = select_storage_credential(storage_credentials, table_location) {
+        props.extend(credential.config.clone());
+    }
+    let vended: HashMap<String, String> = props
+        .iter()
+        .filter(|(k, _)| is_vended_credential_key(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    props.extend(local_props.clone());
+    if !vended.is_empty() {
+        props.retain(|k, _| !is_vended_credential_key(k));
+        props.extend(vended);
+    }
+    props
+}
+
 /// The optional OAuth parameters added to each authentication request.
 pub(crate) fn oauth_params_from_props(props: &HashMap<String, String>) -> HashMap<String, String> {
     let mut params = HashMap::new();
@@ -1221,11 +1301,14 @@ impl SessionCatalog for RestSessionCatalog {
             "Metadata location missing in `create_table` response!",
         ))?;
 
-        let config = response
-            .config
-            .into_iter()
-            .chain(self.user_config.props.clone())
-            .collect();
+        // SQE PATCH (vended-credentials): vended keys and the matching
+        // `storage-credentials` entry win over local static keys.
+        let config = table_file_io_props(
+            &response.config,
+            response.storage_credentials.as_deref(),
+            response.metadata.location(),
+            &self.user_config.props,
+        );
 
         let file_io = self
             .load_file_io(Some(metadata_location), Some(config))
@@ -1285,11 +1368,14 @@ impl SessionCatalog for RestSessionCatalog {
             }
         };
 
-        let config = response
-            .config
-            .into_iter()
-            .chain(self.user_config.props.clone())
-            .collect();
+        // SQE PATCH (vended-credentials): vended keys and the matching
+        // `storage-credentials` entry win over local static keys.
+        let config = table_file_io_props(
+            &response.config,
+            response.storage_credentials.as_deref(),
+            response.metadata.location(),
+            &self.user_config.props,
+        );
 
         let file_io = self
             .load_file_io(response.metadata_location.as_deref(), Some(config))
@@ -3909,6 +3995,154 @@ mod tests {
 
         config_mock.assert_async().await;
         rename_table_mock.assert_async().await;
+    }
+
+    // SQE PATCH (vended-credentials) tests.
+
+    fn kv(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn storage_credential(prefix: &str, access_key: &str) -> crate::types::StorageCredential {
+        let secret = format!("{access_key}-secret");
+        let token = format!("{access_key}-token");
+        crate::types::StorageCredential {
+            prefix: prefix.to_string(),
+            config: kv(&[
+                ("s3.access-key-id", access_key),
+                ("s3.secret-access-key", &secret),
+                ("s3.session-token", &token),
+            ]),
+        }
+    }
+
+    #[test]
+    fn storage_credential_longest_matching_prefix_wins() {
+        let creds = vec![
+            storage_credential("s3://warehouse/", "bucket"),
+            storage_credential("s3://warehouse/db/table", "table"),
+            storage_credential("s3://warehouse/db", "db"),
+            storage_credential("s3://other/db/table", "other"),
+        ];
+        let picked = select_storage_credential(Some(&creds), "s3://warehouse/db/table").unwrap();
+        assert_eq!(picked.prefix, "s3://warehouse/db/table");
+        // `s3a://` names the same objects.
+        let picked = select_storage_credential(Some(&creds), "s3a://warehouse/db/x").unwrap();
+        assert_eq!(picked.prefix, "s3://warehouse/db");
+        assert!(select_storage_credential(Some(&creds), "s3://elsewhere/t").is_none());
+        assert!(select_storage_credential(None, "s3://warehouse/db/table").is_none());
+    }
+
+    #[test]
+    fn table_file_io_props_precedence() {
+        let local = kv(&[
+            ("s3.access-key-id", "STATIC"),
+            ("s3.secret-access-key", "static-secret"),
+            ("s3.endpoint", "http://local:9000"),
+        ]);
+
+        // Nothing vended: upstream behaviour, local keys stay.
+        let config = kv(&[("s3.endpoint", "http://server")]);
+        let props = table_file_io_props(&config, None, "s3://w/t", &local);
+        assert_eq!(props["s3.access-key-id"], "STATIC");
+        assert_eq!(props["s3.endpoint"], "http://local:9000");
+
+        // Vended in `config`: the vended set replaces the static one.
+        let config = kv(&[
+            ("s3.access-key-id", "VENDED"),
+            ("s3.secret-access-key", "vended-secret"),
+            ("s3.session-token", "vended-token"),
+            ("s3.session-token-expires-at-ms", "1893456000000"),
+            ("s3.endpoint", "http://server"),
+        ]);
+        let props = table_file_io_props(&config, None, "s3://w/t", &local);
+        assert_eq!(props["s3.access-key-id"], "VENDED");
+        assert_eq!(props["s3.secret-access-key"], "vended-secret");
+        assert_eq!(props["s3.session-token"], "vended-token");
+        assert_eq!(props["s3.session-token-expires-at-ms"], "1893456000000");
+        assert_eq!(props["s3.endpoint"], "http://local:9000");
+
+        // A token-only vend never pairs with the static access key.
+        let config = kv(&[("s3.session-token", "tok")]);
+        let props = table_file_io_props(&config, None, "s3://w/t", &local);
+        assert!(!props.contains_key("s3.access-key-id"));
+
+        // A matching storage credential beats `config`; no match falls back.
+        let creds = vec![storage_credential("s3://w/t", "PREFIX")];
+        let config = kv(&[
+            ("s3.access-key-id", "CONFIG"),
+            ("s3.secret-access-key", "config-secret"),
+        ]);
+        let props = table_file_io_props(&config, Some(&creds), "s3://w/t", &local);
+        assert_eq!(props["s3.access-key-id"], "PREFIX");
+        assert_eq!(props["s3.session-token"], "PREFIX-token");
+        let props = table_file_io_props(&config, Some(&creds), "s3://w/other", &local);
+        assert_eq!(props["s3.access-key-id"], "CONFIG");
+    }
+
+    #[tokio::test]
+    async fn test_load_table_vended_credentials_beat_static_keys() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+
+        let path = format!(
+            "{}/testdata/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            "load_table_response.json"
+        );
+        let mut body: serde_json::Value =
+            serde_json::from_reader(BufReader::new(File::open(path).unwrap())).unwrap();
+        body["config"] = json!({
+            "s3.access-key-id": "CONFIG",
+            "s3.secret-access-key": "config-secret",
+        });
+        body["storage-credentials"] = json!([
+            {"prefix": "s3://warehouse/", "config": {
+                "s3.access-key-id": "BUCKET", "s3.secret-access-key": "b"}},
+            {"prefix": "s3://warehouse/database/table", "config": {
+                "s3.access-key-id": "TABLE",
+                "s3.secret-access-key": "table-secret",
+                "s3.session-token": "table-token",
+                "s3.session-token-expires-at-ms": "1893456000000"}},
+        ]);
+
+        let load_mock = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .match_header("x-iceberg-access-delegation", "vended-credentials")
+            .with_status(200)
+            .with_body(body.to_string())
+            .create_async()
+            .await;
+
+        let catalog = session_catalog(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(kv(&[
+                    ("header.X-Iceberg-Access-Delegation", "vended-credentials"),
+                    ("s3.access-key-id", "STATIC"),
+                    ("s3.secret-access-key", "static-secret"),
+                ]))
+                .build(),
+        );
+        let table = catalog
+            .load_table(
+                &SessionContext::empty(),
+                &TableIdent::new(NamespaceIdent::new("ns1".to_string()), "test1".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let props = table.file_io().config().props();
+        assert_eq!(props["s3.access-key-id"], "TABLE");
+        assert_eq!(props["s3.secret-access-key"], "table-secret");
+        assert_eq!(props["s3.session-token"], "table-token");
+        assert_eq!(props["s3.session-token-expires-at-ms"], "1893456000000");
+
+        config_mock.assert_async().await;
+        load_mock.assert_async().await;
     }
 
     #[tokio::test]

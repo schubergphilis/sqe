@@ -1,13 +1,12 @@
-# S3 credential vending (next-steps notes)
+# S3 credential vending
 
-Issue #395 shipped the FileIO gate: `[catalog] require_vended_credentials`
-stops the coordinator injecting the shared `[storage]` keys into Iceberg
-FileIO, and `production_mode` requires that flag on every REST catalog.
-This note is the remaining work: put loadTable STS credentials on the
-distributed `ScanTask` instead of the static key.
-
-Future phase for the worker ticket. Captures the research and the local-test
-decision so we can pick it up after the Ranger work.
+SQE consumes table-scoped S3 credentials vended by an Iceberg REST catalog
+(Polaris) on the Iceberg data path: single-node scans, writes, and
+distributed scan tickets. Issue #395 added the FileIO gate
+(`[catalog] require_vended_credentials`); the later work described under
+[SQE state](#sqe-state) asks the catalog for credentials, prefers them over
+the static key, honours their expiry, and ships them to workers. This note
+keeps the research and the local-test decision alongside.
 
 ## Goal
 
@@ -34,27 +33,110 @@ single broad key. Production object store is AWS S3 or NetApp StorageGRID.
   test-only bypass that hands the server's ambient creds to every client. Not
   for production; use per-catalog `stsUnavailable` for STS-less stores instead.
 
-## SQE state (what needs building)
+## SQE state
 
-- WRITES already consume vended creds: INSERT/MERGE/DELETE use `table.file_io()`,
-  which carries the loadTable vended credentials. Likely works end-to-end today.
-- FileIO reads honour `require_vended_credentials` (issue #395): the catalog
-  props omit `s3.access-key-id` / `s3.secret-access-key` and set
-  `s3.disable-config-load` / `s3.disable-ec2-metadata`, so iceberg-rust
-  cannot fall back to `[storage]`, `AWS_*` env, IRSA, or IMDSv2 after
-  LOAD_TABLE.
-- Distributed READS still discard vended creds. The coordinator hardcodes
-  `s3_session_token: ""` in every `ScanTask` and fills the access/secret
-  from the static `[storage]` key
-  (`crates/sqe-coordinator/src/query_handler.rs` `try_distribute`).
-  The `credential_refresh` callback in `sqe_server.rs` still returns `None`.
-- Worker side is READY: `build_object_store_with_creds` already applies
-  `.with_token(session_token)` and there is a credential-refresh channel for
-  mid-scan rotation (`crates/sqe-worker/src/executor.rs` ~836, ~549).
-- The gap (the work): coordinator extracts `s3.access-key-id`/`-secret`/
-  `-session-token` from the loadTable response and puts them into `ScanTask`
-  instead of the static config; wire the deferred `vend_credentials` refresh
-  callback (reload table near token expiry, push fresh creds to workers).
+### Asking for credentials
+
+The catalog only vends when the client sends
+`X-Iceberg-Access-Delegation: vended-credentials`. SQE sends it when either
+setting is on:
+
+```toml
+[catalog]
+access_delegation = "vended-credentials"   # default "none"
+# or, stricter: also keeps static keys out of FileIO entirely
+require_vended_credentials = true          # implies access_delegation
+```
+
+`SQE_CATALOG__ACCESS_DELEGATION` overrides it. Only `none` and
+`vended-credentials` parse; `remote-signing` is rejected at startup because
+SQE does not implement the signer. The header goes out as a `header.*`
+catalog property, so every catalog request carries it, including the
+sibling-warehouse catalogs built for multi-warehouse sessions.
+
+### Which keys FileIO gets
+
+The loadTable (and createTable) response can carry credentials in two
+places: the flat `config` map and the `storage-credentials` list. SQE
+builds a table's FileIO properties in this order:
+
+1. the response `config`;
+2. the `storage-credentials` entry whose `prefix` is the longest prefix of
+   the table location (`s3a://` and `s3n://` count as `s3://`); with no
+   match, `config` alone stands;
+3. SQE's own catalog properties (endpoint, region, path style, and in
+   static mode the `[storage]` key pair);
+4. if the catalog vended any credential key, those keys are put back on
+   top, and any local credential key the catalog did not vend (a static
+   session token, say) is removed so the two sets never mix.
+
+So vended keys always beat static ones, and a table whose response has no
+credentials keeps the static pair (static mode) or nothing at all
+(`require_vended_credentials`). With `require_vended_credentials` the
+static pair is never placed in FileIO, and `s3.disable-config-load` /
+`s3.disable-ec2-metadata` stop iceberg-rust falling back to `AWS_*` env,
+`~/.aws/config`, IRSA, or IMDSv2.
+
+### Expiry and refresh
+
+Vended sets carry `s3.session-token-expires-at-ms`. SQE reads the earliest
+expiry in a table's FileIO and treats the credentials as usable until five
+minutes before it (or half the remaining lifetime, for tokens shorter than
+ten minutes):
+
+- **Table metadata cache.** An entry is not served, fresh or stale, past
+  that point. A stale hit would otherwise be revalidated with an ETag 304
+  that proves the metadata unchanged and hands back the dead keys. The
+  next lookup reloads the table and gets a new set.
+- **Prepared statements.** A stored plan holds its tables' FileIO. When
+  any of those credentials is past its usable point, execution re-plans
+  from the SQL text, which reloads the tables.
+- **Distributed scans.** The coordinator registers each fragment with its
+  expiry and a reloader bound to the querying user's session. The refresh
+  task reloads the table as that user, without the cache, and pushes the
+  new set to the worker over `refresh_credentials`; the worker applies it
+  between files. A reload that yields no complete set (key, secret,
+  token, expiry) pushes nothing, and the worker keeps its current keys
+  until they expire.
+
+The vendored REST client does not call the catalog's
+`client.refresh-credentials-endpoint`; refresh is a full loadTable. That
+costs a metadata round trip per refresh, and it re-runs the catalog's
+authorisation check, so a revoked grant stops the refresh.
+
+### Workers
+
+`[coordinator] distributed_credentials` picks what a scan ticket carries:
+
+| Mode | Ticket carries |
+|------|----------------|
+| `auto` (default) | the table's vended set; the static pair only when the table has none (warns once) |
+| `vended` | the table's vended set (key, secret, session token, expiry); a table without one is not distributed |
+| `static` | the `[storage]` pair |
+| `worker_default` | nothing; workers use their own chain |
+
+A key pair equal to the configured static pair is never treated as vended.
+For a multi-tenant cluster set `distributed_credentials = "vended"` with
+`require_vended_credentials = true`: workers then never see the engine key.
+
+### What still uses the static key
+
+These paths do not go through an Iceberg catalog's loadTable, so there is
+nothing to vend. They use the `[storage]` keys or the AWS SDK chain no
+matter what the settings above say:
+
+- **File TVFs** (`read_parquet`, `read_csv`, `read_json` and friends) read
+  with the engine key, but only under prefixes listed in
+  `[storage.tvf] allowed_object_store_prefixes` (empty by default) or a
+  catalog's `tvf_prefixes`.
+- **Hive external tables** read with the `[storage]` pair (the mount's own
+  keys when it was created with them), and distributed Hive scans ship
+  that pair to workers.
+- **Distributed compaction** ships the static `[storage]` pair to the
+  workers that rewrite files.
+
+A deployment with no static key can still run Iceberg reads and writes;
+those three features then need their own credentials or stay unused.
 
 ## Minimal S3 permissions (Polaris inline session policy)
 
@@ -92,10 +174,10 @@ POST-body AssumeRole 500s, SigV4 ignores `X-Amz-Security-Token`); Garage (no STS
 / no IAM at all, only long-lived per-key-per-bucket keys); MinIO (excluded by
 request; it does support AssumeRole + session policies).
 
-## Phase shape (when we build it)
+## Phase shape (step 1 done, 2-4 remaining)
 
-1. SQE coordinator: extract vended creds from loadTable -> `ScanTask`; wire the
-   refresh callback. Read-path is the work; write-path already vends.
+1. Done: SQE asks for, prefers, expires, and refreshes vended credentials,
+   and ships them on the `ScanTask`.
 2. Quickstart `quickstart/polaris-ranger-keycloak` variant (or new) with rustack
    + Polaris `stsEndpoint` -> rustack STS, `stsUnavailable: false`, a role ARN,
    and SQE with NO static `[storage]` key. Test: read succeeds only via vended

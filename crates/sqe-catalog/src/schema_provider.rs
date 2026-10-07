@@ -461,7 +461,9 @@ impl SchemaProvider for SqeSchemaProvider {
                         Some(ref m) => provider.with_metrics(Arc::clone(m)),
                         None => provider,
                     };
-                    let provider = provider.with_tuning(self.tuning.clone());
+                    let provider = provider
+                        .with_tuning(self.tuning.clone())
+                        .with_reloader(self.session_catalog.table_reloader(table_ident.clone()));
                     return Ok(Some(Arc::new(provider)));
                 }
                 Err(e) => {

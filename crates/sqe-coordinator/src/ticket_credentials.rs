@@ -8,10 +8,11 @@ use sqe_planner::ScanCredentials;
 use tracing::{info, warn};
 
 /// Iceberg REST vended-credential property names (table `config`).
-const VENDED_ACCESS_KEY: &str = "s3.access-key-id";
-const VENDED_SECRET_KEY: &str = "s3.secret-access-key";
-const VENDED_SESSION_TOKEN: &str = "s3.session-token";
-const VENDED_EXPIRES_AT_MS: &str = "s3.session-token-expires-at-ms";
+use sqe_catalog::vended_credentials::{
+    S3_ACCESS_KEY_ID as VENDED_ACCESS_KEY, S3_SECRET_ACCESS_KEY as VENDED_SECRET_KEY,
+    S3_SESSION_TOKEN as VENDED_SESSION_TOKEN,
+    S3_SESSION_TOKEN_EXPIRES_AT_MS as VENDED_EXPIRES_AT_MS,
+};
 
 /// Build the coordinator's ticket signer: from
 /// `coordinator.ticket_signing_key_file` when set (PKCS#8 v2 Ed25519 DER),
@@ -163,6 +164,65 @@ mod tests {
         assert_eq!(c.session_token(), "sts-token");
         assert_eq!(c.expires_at(), Some(1_893_456_000));
         assert!(vended_from_props(&HashMap::new(), &storage(true)).is_none());
+    }
+
+    /// `distributed_credentials = vended` reads the table's own FileIO: the
+    /// per-table vended set (token and expiry included) is what workers get,
+    /// even with a static pair configured; a table whose FileIO carries only
+    /// the static pair is not distributed at all.
+    #[tokio::test]
+    async fn vended_mode_ships_the_tables_vended_set_never_the_static_pair() {
+        fn table(props: &[(&str, &str)]) -> Table {
+            let metadata: iceberg::spec::TableMetadata =
+                serde_json::from_value(serde_json::json!({
+                    "format-version": 1,
+                    "table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
+                    "location": "s3://bucket/ns/t",
+                    "last-updated-ms": 1602638573874_i64,
+                    "last-column-id": 1,
+                    "schema": {"type": "struct", "fields": [
+                        {"id": 1, "name": "x", "required": true, "type": "long"}]},
+                    "partition-spec": [],
+                    "properties": {},
+                    "current-snapshot-id": -1,
+                    "snapshots": []
+                }))
+                .unwrap();
+            let factory = std::sync::Arc::new(iceberg::io::LocalFsStorageFactory);
+            let file_io = iceberg::io::FileIOBuilder::new(factory)
+                .with_props(props.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+                .build();
+            Table::builder()
+                .runtime(iceberg::Runtime::current())
+                .metadata(metadata)
+                .identifier(iceberg::TableIdent::from_strs(["ns", "t"]).unwrap())
+                .file_io(file_io)
+                .disable_cache()
+                .build()
+                .unwrap()
+        }
+        let s = storage(true);
+        let vended_table = table(&[
+            (VENDED_ACCESS_KEY, "ASIATABLE"),
+            (VENDED_SECRET_KEY, "table-secret"),
+            (VENDED_SESSION_TOKEN, "table-token"),
+            (VENDED_EXPIRES_AT_MS, "1893456000000"),
+        ]);
+        let c = select_scan_credentials(DistributedCredentialMode::Vended, &s, &vended_table)
+            .expect("vended set");
+        assert_eq!(c.source(), "vended");
+        assert_eq!(c.access_key(), "ASIATABLE");
+        assert_eq!(c.session_token(), "table-token");
+        assert_eq!(c.expires_at(), Some(1_893_456_000));
+
+        let static_table = table(&[
+            (VENDED_ACCESS_KEY, "AKIASTATIC"),
+            (VENDED_SECRET_KEY, "static-secret"),
+        ]);
+        assert_eq!(
+            select_scan_credentials(DistributedCredentialMode::Vended, &s, &static_table),
+            None
+        );
     }
 
     /// The `[storage]` static pair merged into FileIO props is not vended.
