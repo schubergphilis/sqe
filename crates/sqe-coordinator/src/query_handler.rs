@@ -1462,7 +1462,8 @@ impl QueryHandler {
                         if *analyze {
                             self.explain_handler.analyze(session, &inner, &ctx).await
                         } else {
-                            self.explain_handler.plan(session, &inner, &ctx).await
+                            let is_admin = self.config.auth.has_admin_role(&session.user.roles);
+                            self.explain_handler.plan(session, &inner, &ctx, is_admin).await
                         }
                     } else if let sqlparser::ast::Statement::ShowColumns { show_options, .. } =
                         stmt.as_ref()
@@ -3335,13 +3336,6 @@ impl QueryHandler {
                 // TrackedRecordBatchStream finalizer (not the `execute` path), so
                 // carry the policy summary out to the caller, which stows it on
                 // the StreamFinalizer for the audit emission at stream end.
-                deny_hidden_metadata_tvf_targets(
-                    self.policy_store.as_deref(),
-                    &session.user,
-                    self.config.policy.mask_precedence,
-                    &metadata_tvf_targets(&plan),
-                )
-                .await?;
                 let (enforced_plan, policy_summary) = {
                     let _policy_span = tracing::info_span!(
                         "sqe.policy_rewrite",
@@ -3820,13 +3814,6 @@ impl QueryHandler {
             // Get the logical plan, give pinned scans their real identity back
             // (400), and run policy enforcement.
             let plan = tt_cleanup.restore_identities(df.logical_plan().clone())?;
-            deny_hidden_metadata_tvf_targets(
-                self.policy_store.as_deref(),
-                &session.user,
-                self.config.policy.mask_precedence,
-                &metadata_tvf_targets(&plan),
-            )
-            .await?;
             let (enforced_plan, policy_summary) = {
                 let _policy_span = tracing::info_span!(
                     "sqe.policy_rewrite",
@@ -7741,9 +7728,9 @@ fn append_metadata_tvf_targets(
 
 /// `(namespace, table)` of every metadata TVF scan in `plan`, deduplicated.
 fn metadata_tvf_targets(plan: &datafusion::logical_expr::LogicalPlan) -> Vec<(String, String)> {
-    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::common::tree_node::TreeNodeRecursion;
     let mut targets = Vec::new();
-    let _ = plan.apply(|node| {
+    let _ = plan.apply_with_subqueries(|node| {
         if let datafusion::logical_expr::LogicalPlan::TableScan(scan) = node {
             if let Ok(provider) = datafusion::datasource::source_as_provider(&scan.source) {
                 if let Some(target) =
@@ -7760,17 +7747,12 @@ fn metadata_tvf_targets(plan: &datafusion::logical_expr::LogicalPlan) -> Vec<(St
     targets
 }
 
-/// Refuse a statement whose metadata TVF targets (`table_files('ns','t')`,
-/// ...) the policy store denies `user` all access to (#750).
-///
-/// The rewriter keys `TableScan`s by `scan.table_name`, which for a TVF is
-/// the function name, so the target table's SELECT policy is never consulted
-/// there; without this gate a default-deny user reads object-store paths,
-/// partition values and row counts of a table it cannot SELECT from. Same
-/// wording as a missing table so "denied" is indistinguishable from "never
-/// existed" (the SHOW CREATE TABLE / SHOW TABLES convention). Table-level
-/// only: partition values of restricted or masked columns still flow through
-/// for a caller with any privilege on the table.
+/// Refuse a statement whose targets the policy store denies `user` all
+/// access to (#750). Metadata TVFs are checked inside the policy rewriter;
+/// this gate covers the metadata statements that never build a plan (SHOW
+/// CREATE TABLE, column listings, table health). Same wording as a missing
+/// table so "denied" is indistinguishable from "never existed" (the SHOW
+/// CREATE TABLE / SHOW TABLES convention).
 async fn deny_hidden_metadata_tvf_targets(
     store: Option<&dyn PolicyStore>,
     user: &sqe_core::session::SessionUser,
