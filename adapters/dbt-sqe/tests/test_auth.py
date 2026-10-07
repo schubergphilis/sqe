@@ -53,6 +53,34 @@ def test_oauth_missing_secret_defaults_empty_password():
     assert out == {"username": "sp-reader", "password": ""}
 
 
+def test_tls_is_default_and_plaintext_is_opt_out():
+    assert auth.flight_location("h", 50051) == ("grpc+tls://h:50051", {})
+    assert auth.flight_location("h", 50051, tls=False) == ("grpc://h:50051", {})
+
+
+def test_tls_root_certs_file_is_passed_as_pem():
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as f:
+        f.write("-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----\n")
+    try:
+        uri, kwargs = auth.flight_location("h", 1, tls_root_certs=f.name)
+    finally:
+        os.unlink(f.name)
+    assert uri == "grpc+tls://h:1"
+    assert kwargs == {
+        "adbc.flight.sql.client_option.tls_root_certs": "-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----\n"
+    }
+
+
+def test_tls_root_certs_without_tls_raises():
+    try:
+        auth.flight_location("h", 1, tls=False, tls_root_certs="/ca.pem")
+    except auth.AuthError:
+        return
+    raise AssertionError("expected AuthError when tls_root_certs is set with tls: false")
+
+
 if __name__ == "__main__":
     import traceback
 
