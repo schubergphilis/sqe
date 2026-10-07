@@ -2324,8 +2324,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                         }
                         return error_response(StatusCode::UNAUTHORIZED, "authentication failed");
                     }
-                    return match crate::oauth2::generate_challenge(oauth2_state, &peer_host).await
-                    {
+                    return match crate::oauth2::generate_challenge(oauth2_state).await {
                         Ok((_auth_id, www_authenticate)) => (
                             StatusCode::UNAUTHORIZED,
                             [(axum::http::header::WWW_AUTHENTICATE, www_authenticate)],
@@ -6103,8 +6102,7 @@ mod tests {
             .unwrap(),
         );
         let limiter = BudgetAuth::new(1);
-        let mut state =
-            Arc::into_inner(state_with(limiter.clone(), Arc::new(MockQuery))).unwrap();
+        let mut state = Arc::into_inner(state_with(limiter.clone(), Arc::new(MockQuery))).unwrap();
         state.oauth2 = Some(Arc::new(crate::oauth2::OAuth2State {
             auth_code_service: Arc::new(AuthCodeService::new(
                 discovery,
