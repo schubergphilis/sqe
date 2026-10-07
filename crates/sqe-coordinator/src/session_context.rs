@@ -672,10 +672,7 @@ pub async fn create_session_context(
             // `DROP TABLE`, which every session sees because the snapshots
             // are shared; another process's DDL is visible after the TTL.
             for (name, root) in &hive_roots {
-                let hive_caller = sqe_core::config::TvfCaller::for_user(
-                    session.user.username.clone(),
-                    session.user.roles.clone(),
-                );
+                let hive_caller = crate::hive_ddl_handler::hive_session_caller(&session.user);
                 let hive_provider = sqe_catalog::mount::session_hive_catalog_from_source(
                     name,
                     root.source(),
