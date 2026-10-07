@@ -31,6 +31,10 @@ vendor/iceberg-rust/Cargo.lock
 !crates/sqe-core/tests/fixtures/tls/*.crt
 !crates/sqe-core/tests/fixtures/tls/*.key
 
+# Python bytecode
+__pycache__/
+*.pyc
+
 # Logs
 *.log
 *.jsonl
