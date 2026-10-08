@@ -786,10 +786,25 @@ pub struct CoordinatorConfig {
     #[serde(default)]
     pub distributed_credentials: DistributedCredentialMode,
     /// Memory limit for the coordinator's DataFusion runtime.
-    /// Accepts human-readable sizes: "8GB", "512MB", "4096MB".
+    /// Accepts human-readable sizes: "8GB", "512MB", "4096MB", or `"auto"`.
+    /// `"auto"` sizes the pool from the container at startup: the enforced
+    /// cgroup limit x `memory_limit_auto_fraction`, minus `process_headroom`.
+    /// With no enforced limit (macOS, an unlimited cgroup) it falls back to
+    /// the 8GB default. The resolved value is logged.
     /// Default: "8GB". Applies to all query operator memory (sorts, joins, aggregates).
     #[serde(default = "default_coordinator_memory")]
     pub memory_limit: String,
+    /// Share of the enforced cgroup limit that `memory_limit = "auto"` starts
+    /// from, before `process_headroom` is taken off. Default 0.7, valid
+    /// (0, 1].
+    #[serde(default = "default_memory_limit_auto_fraction")]
+    pub memory_limit_auto_fraction: f64,
+    /// Memory kept outside the DataFusion pool for the Rust runtime,
+    /// allocator fragmentation, Flight and HTTP buffers and caches. The
+    /// coordinator refuses to start when `memory_limit + process_headroom`
+    /// exceeds an enforced cgroup limit, as the worker does. Default "2GB".
+    #[serde(default = "default_process_headroom")]
+    pub process_headroom: String,
     /// Memory pool strategy for the shared DataFusion runtime.
     ///
     /// - `"greedy"` (default): first-come first-served up to `memory_limit`;
@@ -1338,6 +1353,11 @@ impl std::fmt::Debug for CoordinatorConfig {
                 &self.allow_unauthenticated_workers,
             )
             .field("memory_limit", &self.memory_limit)
+            .field(
+                "memory_limit_auto_fraction",
+                &self.memory_limit_auto_fraction,
+            )
+            .field("process_headroom", &self.process_headroom)
             .field("spill_to_disk", &self.spill_to_disk)
             .field("spill_dir", &self.spill_dir)
             .field("spill_compression", &self.spill_compression)
@@ -5569,8 +5589,15 @@ fn default_star_schema_min_ratio() -> usize {
     10
 }
 
+/// `coordinator.memory_limit` default, and what `"auto"` resolves to when no
+/// cgroup limit is enforced.
+pub const DEFAULT_COORDINATOR_MEMORY_LIMIT: &str = "8GB";
+
 fn default_coordinator_memory() -> String {
-    "8GB".to_string()
+    DEFAULT_COORDINATOR_MEMORY_LIMIT.to_string()
+}
+fn default_memory_limit_auto_fraction() -> f64 {
+    0.7
 }
 fn default_unspillable_headroom_percent() -> u8 {
     20
@@ -6688,6 +6715,12 @@ fn validate_byte_sizes(config: &SqeConfig, errors: &mut Vec<String>) {
             config.coordinator.unspillable_headroom_percent
         ));
     }
+    let fraction = config.coordinator.memory_limit_auto_fraction;
+    if !(fraction > 0.0 && fraction <= 1.0) {
+        errors.push(format!(
+            "coordinator.memory_limit_auto_fraction = {fraction}: must be in (0, 1]"
+        ));
+    }
     let mut check = |field: &str, value: &str| {
         if value.is_empty() {
             return;
@@ -6697,7 +6730,14 @@ fn validate_byte_sizes(config: &SqeConfig, errors: &mut Vec<String>) {
         }
     };
 
-    check("coordinator.memory_limit", &config.coordinator.memory_limit);
+    // `auto` is resolved against the cgroup at coordinator startup.
+    if !crate::process_memory::is_auto_memory_limit(&config.coordinator.memory_limit) {
+        check("coordinator.memory_limit", &config.coordinator.memory_limit);
+    }
+    check(
+        "coordinator.process_headroom",
+        &config.coordinator.process_headroom,
+    );
     check("worker.memory_limit", &config.worker.memory_limit);
     check(
         "worker.memory.process_headroom",
@@ -7614,6 +7654,8 @@ partial_progress_batch = 5
                 allow_unverified_advertise: false,
                 distributed_credentials: DistributedCredentialMode::Auto,
                 memory_limit: default_coordinator_memory(),
+                memory_limit_auto_fraction: default_memory_limit_auto_fraction(),
+                process_headroom: default_process_headroom(),
                 memory_pool: MemoryPoolKind::Greedy,
                 unspillable_headroom_percent: default_unspillable_headroom_percent(),
                 spill_to_disk: true,

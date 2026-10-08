@@ -431,6 +431,73 @@ pub fn enforced_memory_limit_source() -> &'static str {
     runtime_memory_info().enforced_memory_limit_source
 }
 
+/// The `memory_limit` value that sizes a pool from the container.
+pub const MEMORY_LIMIT_AUTO: &str = "auto";
+
+/// Smallest pool `memory_limit = "auto"` may resolve to. Below it the
+/// container is too small for the configured headroom, and starting with a
+/// pool that refuses every query would hide that.
+pub const MIN_AUTO_MEMORY_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// True when `raw` is `"auto"` (any case, surrounding space ignored).
+pub fn is_auto_memory_limit(raw: &str) -> bool {
+    raw.trim().eq_ignore_ascii_case(MEMORY_LIMIT_AUTO)
+}
+
+/// Resolve a configured `memory_limit` to bytes.
+///
+/// A size string parses as usual. `"auto"` takes `enforced` (the enforced
+/// cgroup limit) x `fraction` and subtracts `process_headroom`; with no
+/// enforced limit it resolves `fallback` instead. The enforced limit is a
+/// parameter so the arithmetic is testable on a host without cgroups.
+pub fn resolve_memory_limit(
+    raw: &str,
+    fallback: &str,
+    fraction: f64,
+    process_headroom: u64,
+    enforced: Option<u64>,
+) -> crate::error::Result<u64> {
+    if !is_auto_memory_limit(raw) {
+        return Ok(crate::config::parse_memory_limit(raw)? as u64);
+    }
+    let Some(enforced) = enforced.filter(|&e| e > 0) else {
+        return Ok(crate::config::parse_memory_limit(fallback)? as u64);
+    };
+    let resolved = ((enforced as f64) * fraction) as u64;
+    let resolved = resolved.saturating_sub(process_headroom);
+    if resolved < MIN_AUTO_MEMORY_LIMIT_BYTES {
+        return Err(crate::error::SqeError::Config(format!(
+            "memory_limit = \"auto\" resolves to {resolved} bytes: enforced limit {enforced} \
+             x fraction {fraction} - process_headroom {process_headroom} is below the \
+             {MIN_AUTO_MEMORY_LIMIT_BYTES}-byte minimum. Raise the container limit, lower \
+             process_headroom, or set memory_limit explicitly."
+        )));
+    }
+    Ok(resolved)
+}
+
+/// Fail closed when `memory_limit + process_headroom` exceeds a known
+/// enforced cgroup limit: the kernel would OOM-kill the process before the
+/// pool ever refused or spilled. `role` names the config section in the
+/// error (`worker`, `coordinator`). No enforced limit passes.
+pub fn check_process_headroom(
+    role: &str,
+    memory_limit: u64,
+    process_headroom: u64,
+    mem: &RuntimeMemoryInfo,
+) -> Result<(), String> {
+    let need = memory_limit.saturating_add(process_headroom);
+    match mem.enforced_memory_limit_bytes {
+        Some(enforced) if enforced > 0 && need > enforced => Err(format!(
+            "{role}.memory_limit ({memory_limit}) + process_headroom ({process_headroom}) = \
+             {need} exceeds enforced memory limit ({enforced}, source={}, os={}, \
+             container={}, cgroup={}). Lower memory_limit or raise the container/cgroup limit.",
+            mem.enforced_memory_limit_source, mem.os, mem.container, mem.cgroup.version,
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Periodically re-probe container/cgroup/OS memory.
 ///
 /// Cgroup limit files apply **live** (no container restart). The configured
@@ -1120,6 +1187,62 @@ mod tests {
         let change = RuntimeMemoryChange::between(&a, &b);
         assert!(change.enforced_limit_changed);
         assert!(change.any());
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn resolve_memory_limit_parses_explicit_sizes() {
+        // An explicit size ignores the cgroup entirely.
+        assert_eq!(
+            resolve_memory_limit("4GB", "8GB", 0.7, 2 * GIB, Some(GIB)).unwrap(),
+            4 * GIB
+        );
+        assert!(resolve_memory_limit("4XB", "8GB", 0.7, 0, None).is_err());
+    }
+
+    #[test]
+    fn resolve_memory_limit_auto_sizes_from_the_enforced_limit() {
+        // 16 GiB container x 0.7 - 2 GiB headroom.
+        let got = resolve_memory_limit("auto", "8GB", 0.7, 2 * GIB, Some(16 * GIB)).unwrap();
+        assert_eq!(got, ((16 * GIB) as f64 * 0.7) as u64 - 2 * GIB);
+        // Case and surrounding space do not matter.
+        assert_eq!(
+            resolve_memory_limit(" AUTO ", "8GB", 0.5, 0, Some(8 * GIB)).unwrap(),
+            4 * GIB
+        );
+    }
+
+    #[test]
+    fn resolve_memory_limit_auto_falls_back_without_an_enforced_limit() {
+        assert_eq!(
+            resolve_memory_limit("auto", "8GB", 0.7, 2 * GIB, None).unwrap(),
+            8 * GIB
+        );
+    }
+
+    #[test]
+    fn resolve_memory_limit_auto_refuses_a_container_too_small_for_the_headroom() {
+        // 2 GiB x 0.7 is below the 2 GiB headroom: no usable pool.
+        let err = resolve_memory_limit("auto", "8GB", 0.7, 2 * GIB, Some(2 * GIB))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("process_headroom"), "{err}");
+    }
+
+    #[test]
+    fn check_process_headroom_fails_closed_only_over_an_enforced_limit() {
+        let mut info = runtime_memory_info();
+        info.enforced_memory_limit_bytes = None;
+        assert!(check_process_headroom("coordinator", 8 * GIB, 2 * GIB, &info).is_ok());
+
+        info.enforced_memory_limit_bytes = Some(10 * GIB);
+        assert!(check_process_headroom("coordinator", 8 * GIB, 2 * GIB, &info).is_ok());
+
+        info.enforced_memory_limit_bytes = Some(10 * GIB - 1);
+        let err = check_process_headroom("coordinator", 8 * GIB, 2 * GIB, &info).unwrap_err();
+        assert!(err.starts_with("coordinator.memory_limit ("), "{err}");
+        assert!(err.contains("exceeds enforced memory limit"), "{err}");
     }
 
     #[test]

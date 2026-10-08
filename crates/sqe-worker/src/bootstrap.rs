@@ -256,18 +256,9 @@ fn validate_process_headroom(
         "Runtime memory environment (container/cgroup/OS)"
     );
 
+    sqe_core::check_process_headroom("worker", limit, headroom, &mem)
+        .map_err(|e| anyhow::anyhow!(e))?;
     match mem.enforced_memory_limit_bytes {
-        Some(enforced) if enforced > 0 && need > enforced => {
-            return Err(anyhow::anyhow!(
-                "worker.memory_limit ({limit}) + process_headroom ({headroom}) = {need} \
-                 exceeds enforced memory limit ({enforced}, source={}, os={}, container={}, \
-                 cgroup={}). Lower memory_limit or raise the container/cgroup limit.",
-                mem.enforced_memory_limit_source,
-                mem.os,
-                mem.container,
-                mem.cgroup.version,
-            ));
-        }
         Some(enforced) => {
             tracing::info!(
                 memory_limit = limit,
