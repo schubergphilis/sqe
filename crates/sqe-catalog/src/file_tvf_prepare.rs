@@ -86,12 +86,27 @@ pub async fn in_statement<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
+/// What [`plan_sql`] and [`plan_parsed`] let DataFusion plan.
+///
+/// `SessionContext::sql` does not only plan: a DDL statement runs right
+/// there, before the caller holds a plan. `SELECT ... INTO
+/// datafusion.public.t FROM governed` therefore collected the governed table
+/// raw into a session MemTable before the policy rewriter ever saw a plan,
+/// and the next query read it back with no row filter or restriction
+/// applied. Nothing may execute before policy enforcement sees the plan, so
+/// DDL is refused here; the engine's own DDL never reaches DataFusion
+/// through SQL text (scratch relations are registered through the API).
+fn planning_options() -> datafusion::execution::context::SQLOptions {
+    datafusion::execution::context::SQLOptions::new().with_allow_ddl(false)
+}
+
 /// Prepare the file table functions `sql` calls, then plan it: the one way
-/// a planner entry point should reach `ctx.sql`.
+/// a planner entry point should reach `ctx.sql`. Refuses DDL
+/// ([`planning_options`]).
 pub async fn plan_sql(ctx: &SessionContext, sql: &str) -> DFResult<datafusion::dataframe::DataFrame> {
     in_statement(async {
         prepare_statement(ctx, sql).await?;
-        ctx.sql(sql).await
+        ctx.sql_with_options(sql, planning_options()).await
     })
     .await
 }
@@ -105,7 +120,7 @@ pub async fn plan_parsed(
 ) -> DFResult<datafusion::dataframe::DataFrame> {
     in_statement(async {
         prepare_parsed_statement(ctx, statement).await?;
-        ctx.sql(sql).await
+        ctx.sql_with_options(sql, planning_options()).await
     })
     .await
 }
@@ -671,5 +686,26 @@ mod tests {
         let large = [Expr::Literal(ScalarValue::LargeUtf8(Some("p".into())), None)];
         assert_eq!(PreparedProviders::key(&utf8), PreparedProviders::key(&large));
         assert_ne!(PreparedProviders::key(&utf8), PreparedProviders::key(&[lit("q")]));
+    }
+
+    /// `SELECT ... INTO` is DDL that `SessionContext::sql` would run while
+    /// planning, before policy enforcement holds a plan; it must be refused,
+    /// and nothing may be registered.
+    #[tokio::test]
+    async fn planning_refuses_ddl_and_registers_nothing() {
+        let ctx = SessionContext::new();
+        for sql in [
+            "SELECT 1 AS a INTO into_t",
+            "CREATE TABLE ctas_t AS SELECT 1 AS a",
+            "CREATE VIEW view_t AS SELECT 1 AS a",
+        ] {
+            plan_sql(&ctx, sql).await.expect_err(sql);
+            let statement = Parser::parse_sql(&GenericDialect {}, sql).unwrap().remove(0);
+            plan_parsed(&ctx, &statement, sql).await.expect_err(sql);
+        }
+        for t in ["into_t", "ctas_t", "view_t"] {
+            assert!(ctx.table(t).await.is_err(), "{t} was registered");
+        }
+        plan_sql(&ctx, "SELECT 1").await.expect("queries still plan");
     }
 }
