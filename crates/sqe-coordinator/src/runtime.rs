@@ -14,23 +14,66 @@ use datafusion::execution::memory_pool::{
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use tracing::info;
 
-use sqe_core::config::{CoordinatorConfig, MemoryPoolKind, StorageConfig};
-use sqe_core::parse_memory_limit;
+use sqe_core::config::{
+    CoordinatorConfig, MemoryPoolKind, StorageConfig, DEFAULT_COORDINATOR_MEMORY_LIMIT,
+};
+use sqe_core::{parse_memory_limit, RuntimeMemoryInfo};
 
-/// Build a DataFusion [`RuntimeEnv`] for the coordinator with memory limits
-/// and spill-to-disk support.
+/// Resolve `coordinator.memory_limit` before anything reads it.
 ///
-/// - Memory is managed via a [`FairSpillPool`] set on the runtime via
-///   `RuntimeEnvBuilder::with_memory_pool`.
-/// - When `spill_to_disk` is `true`, the spill directory is set via
-///   `RuntimeEnvBuilder::with_temp_file_path`.
-/// - When `spill_to_disk` is `false`, the disk manager is disabled via
-///   `DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled)`.
+/// `"auto"` becomes enforced cgroup limit x `memory_limit_auto_fraction` -
+/// `process_headroom`, or [`DEFAULT_COORDINATOR_MEMORY_LIMIT`] when no limit
+/// is enforced. The resolved byte count is written back into
+/// `config.memory_limit`, because the runtime, admission, write and
+/// maintenance paths each parse that string on their own.
 ///
-/// `storage` is the coordinator-wide `[storage]` block; it is handed to the
-/// object-store registry so file-reader TVFs (`read_csv` / `read_parquet`) can
-/// lazily build `s3://` stores for ad-hoc buckets that were never
-/// pre-registered as Iceberg catalogs.
+/// Fails closed when `memory_limit + process_headroom` exceeds the enforced
+/// limit. Returns that sum, the need the runtime memory watch compares the
+/// live limit against.
+pub fn resolve_coordinator_memory(config: &mut CoordinatorConfig) -> anyhow::Result<u64> {
+    resolve_coordinator_memory_with(config, &sqe_core::runtime_memory_info())
+}
+
+fn resolve_coordinator_memory_with(
+    config: &mut CoordinatorConfig,
+    mem: &RuntimeMemoryInfo,
+) -> anyhow::Result<u64> {
+    let headroom = parse_memory_limit(&config.process_headroom).map_err(|e| {
+        anyhow::anyhow!(
+            "Invalid coordinator process_headroom '{}': {e}",
+            config.process_headroom
+        )
+    })? as u64;
+    let auto = sqe_core::is_auto_memory_limit(&config.memory_limit);
+    let limit = sqe_core::resolve_memory_limit(
+        &config.memory_limit,
+        DEFAULT_COORDINATOR_MEMORY_LIMIT,
+        config.memory_limit_auto_fraction,
+        headroom,
+        mem.enforced_memory_limit_bytes,
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "Invalid coordinator memory_limit '{}': {e}",
+            config.memory_limit
+        )
+    })?;
+    if auto {
+        info!(
+            memory_limit_bytes = limit,
+            enforced_limit_bytes = ?mem.enforced_memory_limit_bytes,
+            enforced_limit_source = mem.enforced_memory_limit_source,
+            fraction = config.memory_limit_auto_fraction,
+            process_headroom_bytes = headroom,
+            "Resolved coordinator memory_limit = \"auto\""
+        );
+    }
+    sqe_core::check_process_headroom("coordinator", limit, headroom, mem)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    config.memory_limit = limit.to_string();
+    Ok(limit.saturating_add(headroom))
+}
+
 /// Build the runtime memory pool from the `coordinator.memory_pool` knob.
 ///
 /// `"greedy"` (default) hands out memory first-come first-served up to the
@@ -73,6 +116,20 @@ fn build_memory_pool(
     }
 }
 
+/// Build a DataFusion [`RuntimeEnv`] for the coordinator with memory limits
+/// and spill-to-disk support.
+///
+/// - The memory pool comes from [`build_memory_pool`]: greedy behind the
+///   unspillable headroom by default, `fair` on request.
+/// - When `spill_to_disk` is `true`, the spill directory is set via
+///   `RuntimeEnvBuilder::with_temp_file_path`.
+/// - When `spill_to_disk` is `false`, the disk manager is disabled via
+///   `DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled)`.
+///
+/// `storage` is the coordinator-wide `[storage]` block; it is handed to the
+/// object-store registry so file-reader TVFs (`read_csv` / `read_parquet`) can
+/// lazily build `s3://` stores for ad-hoc buckets that were never
+/// pre-registered as Iceberg catalogs.
 pub fn build_coordinator_runtime(
     config: &CoordinatorConfig,
     storage: &StorageConfig,
@@ -257,5 +314,54 @@ mod tests {
         let config = config_no_spill("not_a_number");
         let result = build_coordinator_runtime(&config, &StorageConfig::default());
         assert!(result.is_err(), "Should error on invalid memory limit");
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn mem_with_enforced(enforced: Option<u64>) -> RuntimeMemoryInfo {
+        let mut mem = sqe_core::runtime_memory_info();
+        mem.enforced_memory_limit_bytes = enforced;
+        mem
+    }
+
+    #[test]
+    fn auto_memory_limit_is_written_back_as_bytes() {
+        let mut config = config_no_spill("auto");
+        config.memory_limit_auto_fraction = 0.5;
+        config.process_headroom = "1GB".to_string();
+        let need = resolve_coordinator_memory_with(&mut config, &mem_with_enforced(Some(16 * GIB)))
+            .expect("auto resolves");
+        assert_eq!(config.memory_limit, (7 * GIB).to_string());
+        assert_eq!(need, 8 * GIB);
+        // Every downstream reader re-parses the string; it must still parse.
+        assert_eq!(
+            parse_memory_limit(&config.memory_limit).unwrap() as u64,
+            7 * GIB
+        );
+        build_coordinator_runtime(&config, &StorageConfig::default())
+            .expect("runtime builds from the resolved limit");
+    }
+
+    #[test]
+    fn auto_memory_limit_falls_back_without_a_cgroup_limit() {
+        let mut config = config_no_spill("auto");
+        resolve_coordinator_memory_with(&mut config, &mem_with_enforced(None))
+            .expect("auto falls back");
+        assert_eq!(
+            config.memory_limit,
+            (parse_memory_limit(DEFAULT_COORDINATOR_MEMORY_LIMIT).unwrap() as u64).to_string()
+        );
+    }
+
+    #[test]
+    fn explicit_memory_limit_over_the_cgroup_refuses_to_start() {
+        let mut config = config_no_spill("8GB");
+        config.process_headroom = "2GB".to_string();
+        let err = resolve_coordinator_memory_with(&mut config, &mem_with_enforced(Some(8 * GIB)))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("coordinator.memory_limit"), "{err}");
+        // A refused config is left as written.
+        assert_eq!(config.memory_limit, "8GB");
     }
 }
