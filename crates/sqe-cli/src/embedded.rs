@@ -924,7 +924,10 @@ impl SqlClient for EmbeddedClient {
         // inference over object storage) here, before DataFusion's
         // synchronous `call` asks for them.
         sqe_catalog::file_tvf_prepare::prepare_statement(&self.ctx, &rewritten).await?;
-        let df = sqe_catalog::file_tvf_prepare::plan_sql(&self.ctx, &rewritten).await?;
+        // Embedded mode has no policy, and `CREATE TABLE ... AS` /
+        // `CREATE EXTERNAL TABLE` here are DataFusion's own DDL.
+        let df =
+            sqe_catalog::file_tvf_prepare::plan_sql_without_policy(&self.ctx, &rewritten).await?;
         // Snapshot the DataFrame schema before collecting so we still
         // emit column names when the query produces zero batches (an
         // optimizer collapse like `WHERE FALSE` yields an EmptyExec).
