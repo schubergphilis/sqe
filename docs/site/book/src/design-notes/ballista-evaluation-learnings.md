@@ -3,7 +3,8 @@
 Date: 2026-05-31
 Status: final. Ballista integration removed from the codebase on branch
 `chore/wind-down-ballista`. The detailed design and phase reports are archived
-under `docs/archive/ballista-evaluation/`.
+under `docs/archive/ballista-evaluation/`. Revisited 2026-10-08 against
+Ballista 55: see [Revisited: Ballista 55](#revisited-ballista-55-2026-10).
 
 ## The one-paragraph version
 
@@ -172,6 +173,94 @@ both systems, worth solving on our own terms).
   That fix stands on its own and stays.
 - **The `/api/v1/status` health endpoint** (Ballista/DataFusion-style cluster
   status JSON) predates this work and is unaffected.
+
+## Revisited: Ballista 55 (2026-10)
+
+Ballista 55.0.0 (October 2026, DataFusion 55.1) ran TPC-H SF1000 on 32
+executors (8 vCPU, 64 GiB each) over Parquet on S3 in 502 s, against 898 s for
+Spark 4.1.3 and 455 s for Spark with Comet. That release closed most of what
+stopped us in May: all 99 TPC-DS queries now complete and match single-node
+DataFusion, a task error no longer evicts the executor, adaptive query
+execution is on by default, and the memory pool is bounded and spills.
+
+We re-read the source (main as of 2026-10-08, on DataFusion 55.2) to decide whether SQE should run
+on top of it. It should not, and the reason is no longer speed:
+
+- **No Iceberg on the executors.** DataFusion's Iceberg integration moved to
+  the new `apache/datafusion-iceberg` repository in September 2026. Its
+  `IcebergTableScan` holds a live table handle, has no physical extension
+  codec, and reports one output partition, listing files only when it runs.
+  Ballista cannot ship it to an executor, and if it could, one task would scan
+  the whole table. Reading the data files as plain Parquet would skip delete
+  files and field-id projection, which returns wrong rows after MERGE, UPDATE,
+  DELETE or a column rename.
+- **No writes.** The Flight SQL frontend refuses INSERT, UPDATE, DELETE, COPY
+  and CREATE TABLE AS SELECT: the distributed write path is not implemented.
+- **No per-user identity.** The Flight SQL authenticator yields a username
+  only. No bearer token reaches a task, and object store settings are
+  cluster-wide.
+- **Dynamic filters are disabled** (`enable_dynamic_filter_pushdown = false`),
+  because they cannot cross a stage boundary. SQE's star-join wins depend on
+  them.
+- **Blocking shuffle.** Every stage finishes and writes its output before the
+  next starts. Ballista's own FAQ points interactive workloads at pipelined
+  engines instead.
+
+The product decision stands: very large batch queries belong to a batch
+engine, and SQE stays the governed, interactive Iceberg engine in front of
+the lakehouse.
+
+### Lessons to carry into SQE
+
+1. **Planning statistics must not cost a footer read per query.** Ballista
+   spends about 15% of its SF1000 time planning, much of it re-reading
+   Parquet footers on every job, because file statistics are rebuilt per
+   job. SQE plans from Iceberg manifests,
+   Puffin sidecars and its metadata caches. Keep it that way: any new scan
+   path that reaches for footers at plan time is a regression.
+2. **Choose the join strategy from runtime sizes, not estimates.** Ballista's
+   adaptive planner picks broadcast after the build side has been
+   materialized (threshold 128 MB). SQE's join-strategy rule trusts only exact
+   statistics, and Iceberg scans report inexact or absent ones. A
+   runtime decision on the measured build size is the way out of that
+   dilemma, and it is the shape of the fix for unbounded hash builds (#784).
+3. **Size the memory pool from the container.** Ballista defaults to 70% of
+   the detected container limit, divided across vCores. SQE workers fail
+   closed when the configured limit exceeds the cgroup limit. The
+   coordinator could derive its default the same way rather than needing a
+   hand-set `memory_limit`.
+4. **Do not slice memory statically per core.** Ballista's own performance
+   review (#2520) found that a fixed per-vCore slice makes a task spill while
+   the rest of the executor sits idle, and that a single-core stage gets
+   1/V of the memory. Any per-query or per-operator memory cap SQE adds
+   should not take that shape.
+5. **Encode the plan and session once, not per task.** Re-encoding a full
+   stage plan per task scaled with tasks times plan size in Ballista; 55
+   encodes session configuration once. SQE's per-fragment `ScanTask` encoding
+   is the equivalent hot path.
+6. **Stream results in parallel with wide windows.** Ballista's client waited
+   for the job, then fetched partitions one by one over 64 KiB HTTP/2
+   windows. SQE lifted its worker-link windows (#432); any new result path
+   should start from that, not the defaults.
+7. **Classify a statement once, including its subqueries.** Ballista's Flight
+   SQL frontend returns one verdict per plan (refuse, run locally,
+   distribute) and walks subqueries, so wrapping a write in `EXPLAIN ANALYZE`
+   cannot slip past the check. SQE's statement routing and policy checks
+   should hold to the same rule: one classifier, applied to the whole tree.
+8. **Durable event logs and a history server.** Ballista writes job events to
+   disk and a separate server indexes them, so finished jobs survive a
+   scheduler restart. SQE's query history lives in coordinator memory; an
+   event log is the cheap path to history that survives a restart.
+9. **If SQE ever distributes joins again, pipeline them.** Ballista's
+   blocking, disk-backed shuffle is the right trade for long batch jobs and
+   the wrong one for interactive queries. A pipelined design (DataFusion
+   Distributed, Sail) fits SQE's workload, and any shuffle needs spill from
+   the first day; the one SQE deleted had none.
+10. **The distributed Iceberg scan is unclaimed upstream.** A split-by-files
+    scan with a physical codec (file list, projection, predicate, limit,
+    credentials per task) is what `apache/datafusion-iceberg` lacks for any
+    distributed engine, and SQE's `ScanTask` model already has that shape.
+    It is a candidate upstream contribution.
 
 ## Where the detail lives
 
