@@ -36,7 +36,7 @@ pub use catalog_qualifiers::{
     extract_schema_qualifiers_from_sql, pinned_table_schema_from_sql,
 };
 pub use classifier::{
-    parse_and_classify, parse_and_classify_typed, CheckAccessParams, ShowEffectivePolicyParams,
+    hidden_write, parse_and_classify, parse_and_classify_typed, CheckAccessParams, ShowEffectivePolicyParams,
     ShowGrantsTarget, StatementKind,
 };
 pub use ctas_compat::rewrite_ctas_compat;

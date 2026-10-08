@@ -317,6 +317,47 @@ impl StatementKind {
         }
     }
 
+    /// Statements that change table data: the audit log's DML category.
+    pub fn is_data_write(&self) -> bool {
+        self.reports_rows_affected() || matches!(self, StatementKind::Truncate(_))
+    }
+
+    /// Data writes whose result is a one-row `rows_affected` count.
+    /// TRUNCATE is a data write that reports no count.
+    pub fn reports_rows_affected(&self) -> bool {
+        matches!(
+            self,
+            StatementKind::Insert(_)
+                | StatementKind::Ctas(_)
+                | StatementKind::Update(_)
+                | StatementKind::Delete(_)
+                | StatementKind::Merge(_)
+        )
+    }
+
+    /// Statements that only read: queries and the catalog / policy SHOW
+    /// forms. A `Query` never hides a write; [`classify`] refuses the shapes
+    /// that would ([`hidden_write`]).
+    pub fn is_read_only(&self) -> bool {
+        matches!(
+            self,
+            StatementKind::Query(_)
+                | StatementKind::ShowCatalogs
+                | StatementKind::ShowSchemas(_)
+                | StatementKind::ShowTables(_)
+                | StatementKind::ShowViews(_)
+                | StatementKind::ShowGrants(_)
+                | StatementKind::ShowEffectiveGrants(_)
+                | StatementKind::ShowEffectivePolicy(_)
+                | StatementKind::ShowTags(_)
+                | StatementKind::ShowMaskingPolicies(_)
+                | StatementKind::ShowCreateTable(_)
+                | StatementKind::ShowCreateSchema(_)
+                | StatementKind::ShowStats(_)
+                | StatementKind::ShowPartitions(_)
+        )
+    }
+
     /// The Trino `updateType` for this statement, or `None` for reads. Kinds
     /// that wrap a sqlparser statement defer to [`crate::metadata::update_type`];
     /// SQE-only kinds map to the closest Trino name (a partition-spec change
@@ -892,12 +933,71 @@ fn resource_parts(
     }
 }
 
+/// Finds a write inside a statement that reads: `SELECT ... INTO` or a
+/// data statement used as a query body (`WITH x AS (...) INSERT ...`, a
+/// nested `(DELETE ...)`).
+struct HiddenWrite(Option<&'static str>);
+
+impl sqlparser::ast::Visitor for HiddenWrite {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &sqlparser::ast::Query) -> std::ops::ControlFlow<()> {
+        use sqlparser::ast::SetExpr;
+        self.0 = match query.body.as_ref() {
+            SetExpr::Insert(_) => Some("insert statement"),
+            SetExpr::Update(_) => Some("update statement"),
+            SetExpr::Delete(_) => Some("delete statement"),
+            SetExpr::Merge(_) => Some("merge statement"),
+            _ => None,
+        };
+        if self.0.is_some() {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    }
+
+    fn pre_visit_select(&mut self, select: &sqlparser::ast::Select) -> std::ops::ControlFlow<()> {
+        if select.into.is_some() {
+            self.0 = Some("select into statement");
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    }
+}
+
+/// The write a query or EXPLAIN hides, if any (#811). These shapes classify
+/// as reads by their outer statement, so every check keyed on the kind
+/// (read-only tools, audit category, routing) would take them for one;
+/// DataFusion would then run `SELECT INTO` as DDL while planning.
+pub fn hidden_write(stmt: &Statement) -> Option<&'static str> {
+    use sqlparser::ast::Visit;
+    let mut finder = HiddenWrite(None);
+    let _ = stmt.visit(&mut finder);
+    finder.0
+}
+
+/// Refuse a query or EXPLAIN that hides a write ([`hidden_write`]).
+fn refuse_hidden_write(stmt: &Statement) -> sqe_core::Result<()> {
+    match hidden_write(stmt) {
+        Some(shape) => Err(sqe_core::SqeError::with_code(
+            sqe_core::SqeErrorCode::NotSupported,
+            format!("a {shape} inside a query is not supported; run the write as its own statement"),
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Classify a parsed statement. Custom SQE grammar never reaches this
 /// function; see [`try_classify_custom`].
 pub(crate) fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
     match stmt {
         // SELECT / WITH ... SELECT
-        Statement::Query(_) => Ok(StatementKind::Query(Box::new(stmt))),
+        Statement::Query(_) => {
+            refuse_hidden_write(&stmt)?;
+            Ok(StatementKind::Query(Box::new(stmt)))
+        }
 
         // CREATE TABLE ... AS SELECT (CTAS) vs regular CREATE TABLE (columns)
         Statement::CreateTable(ref ct) => {
@@ -992,8 +1092,13 @@ pub(crate) fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
         Statement::Revoke { .. } => Ok(StatementKind::Revoke(Box::new(stmt))),
         Statement::Deny { .. } => Ok(StatementKind::Deny(Box::new(stmt))),
 
-        // EXPLAIN → Utility
-        Statement::Explain { .. } => Ok(StatementKind::Utility(Box::new(stmt))),
+        // EXPLAIN → Utility. A data statement under EXPLAIN is refused by the
+        // coordinator's `explain::require_query`; a query hiding a write is
+        // refused here, as it is unexplained.
+        Statement::Explain { .. } => {
+            refuse_hidden_write(&stmt)?;
+            Ok(StatementKind::Utility(Box::new(stmt)))
+        }
         Statement::ExplainTable { .. } => Ok(StatementKind::Utility(Box::new(stmt))),
 
         // SET → Utility (sqlparser 0.62 consolidates every SET flavour
@@ -3168,4 +3273,60 @@ mod token_dispatch_tests {
         }
     }
 
+    /// #811: a write hiding inside a query or EXPLAIN is refused at
+    /// classification, so no kind-keyed check takes it for a read.
+    #[test]
+    fn queries_hiding_a_write_are_refused() {
+        for (sql, shape) in [
+            ("SELECT 1 INTO t", "select into"),
+            ("SELECT * INTO datafusion.public.t FROM ns.src", "select into"),
+            ("SELECT a FROM (SELECT 1 AS a) s UNION ALL SELECT 2 INTO t", "select into"),
+            ("WITH x AS (SELECT 1 AS a) INSERT INTO t SELECT * FROM x", "insert"),
+            ("WITH x AS (SELECT 1 AS a) DELETE FROM t", "delete"),
+            ("WITH x AS (SELECT 1 AS a) UPDATE t SET a = 1", "update"),
+            ("EXPLAIN SELECT 1 INTO t", "select into"),
+            ("EXPLAIN ANALYZE WITH x AS (SELECT 1 AS a) INSERT INTO t SELECT * FROM x", "insert"),
+        ] {
+            let err = parse_and_classify(sql).expect_err(sql);
+            assert_eq!(err.error_code(), SqeErrorCode::NotSupported, "{sql}");
+            assert!(err.to_string().contains(&format!("{shape} statement")), "{sql}: {err}");
+        }
+        for sql in [
+            "SELECT 1",
+            "WITH x AS (SELECT 1 AS a) SELECT * FROM x",
+            "SELECT * FROM t WHERE a IN (SELECT a FROM u)",
+            "EXPLAIN SELECT 1",
+            "EXPLAIN ANALYZE SELECT 1",
+        ] {
+            parse_and_classify(sql).expect(sql);
+        }
+        // A data statement is not a hidden write; EXPLAIN of one is the
+        // coordinator's `explain::require_query` to refuse.
+        assert!(matches!(
+            parse_and_classify("INSERT INTO t SELECT * FROM u").unwrap(),
+            StatementKind::Insert(_)
+        ));
+        parse_and_classify("EXPLAIN INSERT INTO t SELECT * FROM u").expect("utility");
+    }
+
+    #[test]
+    fn write_and_read_predicates_agree() {
+        for (sql, data_write, rows_affected, read_only) in [
+            ("SELECT 1", false, false, true),
+            ("SHOW TABLES", false, false, true),
+            ("INSERT INTO t VALUES (1)", true, true, false),
+            ("CREATE TABLE t AS SELECT 1 AS a", true, true, false),
+            ("UPDATE t SET a = 1", true, true, false),
+            ("DELETE FROM t", true, true, false),
+            ("MERGE INTO t USING u ON t.a = u.a WHEN MATCHED THEN DELETE", true, true, false),
+            ("TRUNCATE TABLE t", true, false, false),
+            ("CREATE TABLE t (a INT)", false, false, false),
+            ("EXPLAIN SELECT 1", false, false, false),
+        ] {
+            let k = parse_and_classify(sql).expect(sql);
+            assert_eq!(k.is_data_write(), data_write, "{sql}");
+            assert_eq!(k.reports_rows_affected(), rows_affected, "{sql}");
+            assert_eq!(k.is_read_only(), read_only, "{sql}");
+        }
+    }
 }
