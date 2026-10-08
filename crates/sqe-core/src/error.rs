@@ -1816,4 +1816,99 @@ mod tests {
         );
         assert_eq!(err.error_code(), SqeErrorCode::TypeMismatch);
     }
+
+    /// Error text shaped like what the classifiers see: words, digits,
+    /// URLs and ports, a few status codes, and any other character.
+    fn noise() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+        proptest::collection::vec(
+            prop_oneof![
+                "[a-zA-Z0-9 .:/_-]{0,8}",
+                Just("401".to_string()),
+                Just("403".to_string()),
+                Just("503".to_string()),
+                "\\PC{0,3}",
+            ],
+            0..6,
+        )
+        .prop_map(|parts| parts.concat())
+    }
+
+    proptest::proptest! {
+        /// Oracle: split on every byte that is not ASCII alphanumeric and look
+        /// for the code as a whole token.
+        #[test]
+        fn has_status_token_matches_a_tokenizer(lower in noise()) {
+            for code in ["401", "403", "503"] {
+                let oracle = lower
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .any(|token| token == code);
+                proptest::prop_assert_eq!(
+                    has_status_token(&lower, code),
+                    oracle,
+                    "{:?} {}",
+                    lower,
+                    code
+                );
+            }
+        }
+
+        /// A 401 is an authentication failure whatever surrounds it, and it
+        /// wins over every later branch (timeouts, 404s, 503s in the noise).
+        #[test]
+        fn catalog_401_is_authentication_failed_under_any_noise(
+            before in noise(),
+            after in noise(),
+            marker in proptest::sample::select(vec![
+                " 401 ",
+                " Unauthorized ",
+                " WWW-Authenticate ",
+            ]),
+        ) {
+            let msg = format!("{before}{marker}{after}");
+            proptest::prop_assert_eq!(
+                classify_catalog_error(&msg),
+                SqeErrorCode::AuthenticationFailed,
+                "{:?}", msg
+            );
+        }
+
+        /// A port or id that contains 401 is not a 401: a timed-out request to
+        /// a catalog on port 39401 is a timeout (CI, 2026-09-07).
+        #[test]
+        fn catalog_port_digits_are_not_a_status(port in 1024u32..65536) {
+            let msg = format!(
+                "error sending request for url (http://127.0.0.1:{port}/v1/config): \
+                 operation timed out"
+            );
+            proptest::prop_assert_eq!(classify_catalog_error(&msg), SqeErrorCode::QueryTimeout);
+        }
+
+        /// Expired engine storage credentials are reported as such even when
+        /// the S3 reply also says 403 Forbidden.
+        #[test]
+        fn execution_expired_credentials_win_over_forbidden(before in noise(), after in noise()) {
+            let msg = format!("{before} 403 Forbidden: ExpiredToken {after}");
+            proptest::prop_assert_eq!(
+                classify_execution_error(&msg),
+                SqeErrorCode::StorageCredentialsUnavailable,
+                "{:?}", msg
+            );
+        }
+
+        /// Classification ignores ASCII case, so an upper-cased message (a
+        /// proxy's error page, a shouting SDK) classifies the same way.
+        #[test]
+        fn classifiers_ignore_ascii_case(msg in noise()) {
+            let upper = msg.to_ascii_uppercase();
+            proptest::prop_assert_eq!(
+                classify_catalog_error(&upper),
+                classify_catalog_error(&msg)
+            );
+            proptest::prop_assert_eq!(
+                classify_execution_error(&upper),
+                classify_execution_error(&msg)
+            );
+        }
+    }
 }

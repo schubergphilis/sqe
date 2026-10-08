@@ -170,4 +170,100 @@ mod tests {
         );
         assert_eq!(arrow_to_trino_type(&DataType::Null), "unknown");
     }
+
+    /// Every scalar (non-nested) Arrow type SQE can put in a result.
+    fn scalar_type() -> impl proptest::strategy::Strategy<Value = DataType> {
+        use arrow_schema::{IntervalUnit, TimeUnit};
+        use proptest::prelude::*;
+        let unit = prop_oneof![
+            Just(TimeUnit::Second),
+            Just(TimeUnit::Millisecond),
+            Just(TimeUnit::Microsecond),
+            Just(TimeUnit::Nanosecond),
+        ];
+        prop_oneof![
+            proptest::sample::select(vec![
+                DataType::Boolean,
+                DataType::Int8,
+                DataType::UInt8,
+                DataType::Int16,
+                DataType::UInt16,
+                DataType::Int32,
+                DataType::UInt32,
+                DataType::Int64,
+                DataType::UInt64,
+                DataType::Float16,
+                DataType::Float32,
+                DataType::Float64,
+                DataType::Utf8,
+                DataType::LargeUtf8,
+                DataType::Utf8View,
+                DataType::Binary,
+                DataType::LargeBinary,
+                DataType::BinaryView,
+                DataType::FixedSizeBinary(16),
+                DataType::Date32,
+                DataType::Date64,
+                DataType::Time32(TimeUnit::Millisecond),
+                DataType::Time64(TimeUnit::Microsecond),
+                DataType::Duration(TimeUnit::Microsecond),
+                DataType::Interval(IntervalUnit::YearMonth),
+                DataType::Interval(IntervalUnit::DayTime),
+                DataType::Interval(IntervalUnit::MonthDayNano),
+            ]),
+            (1u8..=38)
+                .prop_flat_map(|p| (Just(p), -10i8..=p as i8))
+                .prop_map(|(p, s)| DataType::Decimal128(p, s)),
+            (39u8..=76, 0i8..=38).prop_map(|(p, s)| DataType::Decimal256(p, s)),
+            (unit, proptest::option::of(Just("UTC")))
+                .prop_map(|(u, tz)| DataType::Timestamp(u, tz.map(Into::into))),
+        ]
+    }
+
+    proptest::proptest! {
+        /// The client side (`parse_trino_type`, which the CLI and MCP decoders
+        /// use) understands every scalar type name the server emits, so no
+        /// scalar column decodes as an opaque string.
+        #[test]
+        fn scalar_type_names_parse_back(dt in scalar_type()) {
+            use sqe_trino_protocol::types::{parse_trino_type, TrinoType};
+            let name = arrow_to_trino_type(&dt);
+            let parsed = parse_trino_type(&name);
+            proptest::prop_assert!(
+                !matches!(parsed, TrinoType::Other(_)),
+                "{dt:?} -> {name:?} parses as {parsed:?}"
+            );
+            match dt {
+                DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => {
+                    proptest::prop_assert_eq!(
+                        parsed,
+                        TrinoType::Decimal { precision: p, scale: s }
+                    );
+                }
+                DataType::Timestamp(_, tz) => {
+                    proptest::prop_assert_eq!(
+                        parsed,
+                        TrinoType::Timestamp { precision: 6, with_time_zone: tz.is_some() }
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        /// The JDBC driver's ClientTypeSignature rejects a parameterized
+        /// `rawType` (#345): parameters belong in `arguments`.
+        #[test]
+        fn scalar_type_signatures_keep_parameters_out_of_raw_type(dt in scalar_type()) {
+            let name = arrow_to_trino_type(&dt);
+            let sig = sqe_trino_protocol::types::type_signature_for(&name);
+            proptest::prop_assert!(!sig.raw_type.contains('('), "{name:?} -> {:?}", sig.raw_type);
+            if let DataType::Decimal128(p, s) | DataType::Decimal256(p, s) = dt {
+                let args: Vec<_> = sig.arguments.iter().map(|a| a.value.clone()).collect();
+                proptest::prop_assert_eq!(
+                    args,
+                    vec![serde_json::json!(p), serde_json::json!(s)]
+                );
+            }
+        }
+    }
 }
