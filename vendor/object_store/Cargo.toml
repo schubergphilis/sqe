@@ -34,7 +34,7 @@ keywords = [
     "storage",
     "cloud",
 ]
-license = "MIT OR Apache-2.0"
+license = "MIT/Apache-2.0"
 repository = "https://github.com/apache/arrow-rs-object-store"
 
 [package.metadata.docs.rs]

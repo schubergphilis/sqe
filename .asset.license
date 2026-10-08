@@ -10,6 +10,20 @@ owner = "vpf-data-ai/chameleon sqlengine maintainers"
 reason = "r-efi is UEFI firmware ABI bindings pulled only as a target-specific dependency of getrandom (0.3+/0.4) for target_os=uefi. SQE does not build or ship UEFI binaries; Linux/macOS/Windows server artifacts do not link r-efi. No drop-in replacement exists for getrandom's UEFI backend. Prefer removing if getrandom drops the dep; until then treat as platform-optional not-linked."
 expires = "2027-07-27"
 
+# The [patch] path copy of object_store 0.13.2 (vendor/object_store, for
+# RUSTSEC-2026-0194/0195). A path dependency reports the license field of its
+# own Cargo.toml, which upstream spells "MIT/Apache-2.0", the pre-SPDX form of
+# the dual license, and the gate does not parse it. Pinned to 0.13.2: drop
+# with the patch when DataFusion moves to object_store 0.14 (!1133).
+[[exception]]
+id = "OSS-OBJECT-STORE-VENDORED-LICENSE-SPELLING-2026"
+component = "pkg:cargo/object_store@0.13.2"
+licenses = ["MIT/Apache-2.0"]
+scope = "evidence-vouched"
+owner = "vpf-data-ai/chameleon sqlengine maintainers"
+reason = "object_store is dual MIT or Apache-2.0: https://github.com/apache/arrow-rs-object-store/blob/v0.13.2/Cargo.toml . The vendored copy is the published 0.13.2 crate with only its quick-xml requirement raised."
+expires = "2027-10-08"
+
 # GitHub Actions referenced by .github/workflows/release-binaries.yml. The SBOM
 # lists them as components, deps.dev has no license record for action
 # repositories, so each shows as "license evidence missing". All four are MIT:
