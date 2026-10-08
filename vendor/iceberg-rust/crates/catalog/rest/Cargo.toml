@@ -62,14 +62,14 @@ itertools = { workspace = true }
 # this client reads the other, finds none, and emits no `traceparent`.
 # Everything still compiles; distributed tracing just stops. See sqe-catalog
 # tests/mount_rest_test.rs::polaris_requests_preserve_the_incoming_trace_id.
-opentelemetry = "0.32"
+opentelemetry = "0.33"
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_derive = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-tracing-opentelemetry = "0.33"
+tracing-opentelemetry = "0.34"
 typed-builder = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
