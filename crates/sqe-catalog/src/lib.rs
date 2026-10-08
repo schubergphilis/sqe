@@ -31,6 +31,7 @@ pub mod runtime_bridge;
 mod send_erased;
 pub mod vended_credentials;
 pub mod session_tuning;
+pub mod eliminate_cross_join;
 #[cfg(feature = "sql-sqlite-rs")]
 pub mod sqlite_rs_catalog;
 pub use session_tuning::{engine_context, engine_session_config};
