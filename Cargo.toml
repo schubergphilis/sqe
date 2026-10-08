@@ -253,13 +253,11 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 flate2 = { version = "1" }
 
 # object_store 0.13.2 as published, with quick-xml raised from ^0.39 to ^0.41
-# for RUSTSEC-2026-0194/0195 (object_store 0.14 makes the same move with the
-# same call sites). The only other edit is the license field, spelled
-# "MIT OR Apache-2.0" instead of the published "MIT/Apache-2.0": same terms,
-# but the SBOM license gate reads SPDX expressions only and a path dependency
-# reports its own Cargo.toml. DataFusion 55 is on the 0.13 trait
+# for RUSTSEC-2026-0194/0195 (the only change; object_store 0.14 makes the
+# same move with the same call sites). DataFusion 55 is on the 0.13 trait
 # line, so SQE cannot take 0.14 alone. Drop this patch and vendor/object_store
-# when DataFusion moves to object_store 0.14 (!1133).
+# when DataFusion moves to object_store 0.14 (!1133), together with its
+# license exception in .asset.license.
 [patch.crates-io]
 object_store = { path = "vendor/object_store" }
 
