@@ -2711,7 +2711,7 @@ impl QueryHandler {
         // O2: rows written/affected by a DML statement, recovered from the
         // 1-row `rows_affected` batch the write handlers return. `None` for
         // reads and for writes that reported no count.
-        let rows_written: Option<u64> = if result.is_ok() && is_dml_write(&kind) {
+        let rows_written: Option<u64> = if result.is_ok() && kind.reports_rows_affected() {
             result.as_ref().ok().and_then(|b| extract_affected_rows(b))
         } else {
             None
@@ -9143,19 +9143,6 @@ fn should_emit(kind: &StatementKind, cfg: &sqe_core::config::OpenLineageConfig) 
         StatementKind::Procedure(_) => true,
         _ => true,
     }
-}
-
-/// True for DML statements that report a rows-affected count (INSERT, CTAS,
-/// UPDATE, DELETE, MERGE). Used to recover `rows_written` for O2 write stats.
-fn is_dml_write(kind: &StatementKind) -> bool {
-    matches!(
-        kind,
-        StatementKind::Insert(_)
-            | StatementKind::Ctas(_)
-            | StatementKind::Update(_)
-            | StatementKind::Delete(_)
-            | StatementKind::Merge(_)
-    )
 }
 
 /// Recover the affected-row count from a write handler's 1-row, 1-column

@@ -89,18 +89,6 @@ pub(crate) fn timing(duration: Duration, execution_ms: u64) -> Timing {
     }
 }
 
-fn is_dml(kind: &StatementKind) -> bool {
-    matches!(
-        kind,
-        StatementKind::Insert(_)
-            | StatementKind::Ctas(_)
-            | StatementKind::Merge(_)
-            | StatementKind::Delete(_)
-            | StatementKind::Update(_)
-            | StatementKind::Truncate(_)
-    )
-}
-
 fn is_secret_bearing(kind: &StatementKind) -> bool {
     matches!(
         kind,
@@ -269,7 +257,7 @@ pub(crate) fn emit_statement_audit(audit: &AuditLogger, a: StatementAudit<'_>) {
             timing(a.duration, 0),
             None,
         ),
-        kind if is_dml(kind) => (
+        kind if kind.is_data_write() => (
             AuditKind::Query,
             a.resources,
             Some(policy_audit(&ps)),

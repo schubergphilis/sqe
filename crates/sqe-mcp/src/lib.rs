@@ -2083,40 +2083,18 @@ fn ensure_single_statement(sql: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn is_read_only(kind: &StatementKind) -> bool {
-    matches!(
-        kind,
-        StatementKind::Query(_)
-            | StatementKind::ShowCatalogs
-            | StatementKind::ShowSchemas(_)
-            | StatementKind::ShowTables(_)
-            | StatementKind::ShowViews(_)
-            | StatementKind::ShowGrants(_)
-            | StatementKind::ShowEffectiveGrants(_)
-            | StatementKind::ShowEffectivePolicy(_)
-            | StatementKind::ShowTags(_)
-            | StatementKind::ShowMaskingPolicies(_)
-            | StatementKind::ShowCreateTable(_)
-            | StatementKind::ShowCreateSchema(_)
-            | StatementKind::ShowStats(_)
-            | StatementKind::ShowPartitions(_)
-    )
-}
-
 /// Classify and require a read-only kind; returns the kind for the caller.
 fn ensure_read_only(sql: &str, session_catalog: Option<&str>) -> Result<StatementKind, String> {
+    // `classify` already refuses a Query hiding a write (SELECT INTO,
+    // WITH-INSERT; `sqe_sql::hidden_write`).
     let kind = classify(sql, session_catalog)?;
-    if !is_read_only(&kind) {
+    if !kind.is_read_only() {
         return Err(format!("Read-only tool rejected {} statement", kind.name()));
     }
-    // Query is an allow-list kind, but sqlparser types SELECT INTO, WITH-INSERT
-    // and FROM read_parquet(...) as Query. Those skip catalog/Ranger (#703 #704).
-    let shape = walk_query_shape(&kind);
-    if let Some(reason) = shape.denied {
+    // FROM read_parquet(...) is a Query too, and skips catalog/Ranger
+    // (#703 #704).
+    if let Some(reason) = walk_query_shape(&kind).denied {
         return Err(format!("Read-only tool rejected {reason}"));
-    }
-    if let Some(shape) = shape.write_shape {
-        return Err(format!("Read-only tool rejected {shape}"));
     }
     // SHOW CREATE names its target outside any TableFactor, so the visitor
     // above never sees it (#774): run the relation denylist on it directly.
@@ -2209,7 +2187,6 @@ fn denied_relation(name: &sqlparser::ast::ObjectName) -> Option<String> {
 
 struct QueryShapeFinder {
     denied: Option<String>,
-    write_shape: Option<&'static str>,
 }
 
 impl sqlparser::ast::Visitor for QueryShapeFinder {
@@ -2250,37 +2227,6 @@ impl sqlparser::ast::Visitor for QueryShapeFinder {
         }
         std::ops::ControlFlow::Continue(())
     }
-
-    fn pre_visit_query(
-        &mut self,
-        query: &sqlparser::ast::Query,
-    ) -> std::ops::ControlFlow<Self::Break> {
-        use sqlparser::ast::SetExpr;
-        self.write_shape = match query.body.as_ref() {
-            SetExpr::Insert(_) => Some("insert statement"),
-            SetExpr::Update(_) => Some("update statement"),
-            SetExpr::Delete(_) => Some("delete statement"),
-            SetExpr::Merge(_) => Some("merge statement"),
-            _ => None,
-        };
-        if self.write_shape.is_some() {
-            std::ops::ControlFlow::Break(())
-        } else {
-            std::ops::ControlFlow::Continue(())
-        }
-    }
-
-    fn pre_visit_select(
-        &mut self,
-        select: &sqlparser::ast::Select,
-    ) -> std::ops::ControlFlow<Self::Break> {
-        if select.into.is_some() {
-            self.write_shape = Some("select into statement");
-            std::ops::ControlFlow::Break(())
-        } else {
-            std::ops::ControlFlow::Continue(())
-        }
-    }
 }
 
 /// The parsed statement of the kinds whose sources can hide a table
@@ -2302,10 +2248,7 @@ fn statement_of(kind: &StatementKind) -> Option<&sqlparser::ast::Statement> {
 
 fn walk_query_shape(kind: &StatementKind) -> QueryShapeFinder {
     use sqlparser::ast::Visit;
-    let mut finder = QueryShapeFinder {
-        denied: None,
-        write_shape: None,
-    };
+    let mut finder = QueryShapeFinder { denied: None };
     if let Some(stmt) = statement_of(kind) {
         let _ = stmt.visit(&mut finder);
     }
@@ -2371,7 +2314,7 @@ fn ends_with_comment(sql: &str) -> bool {
 /// can inspect it without parsing twice.
 fn ensure_change(sql: &str, session_catalog: Option<&str>) -> Result<StatementKind, String> {
     let kind = classify(sql, session_catalog)?;
-    if is_read_only(&kind) {
+    if kind.is_read_only() {
         return Err(format!(
             "Use a read-only tool for {} statements",
             kind.name()
@@ -2936,14 +2879,19 @@ mod tests {
             "SELECT * FROM read_json('hf://datasets/x')",
             "WITH t AS (SELECT * FROM read_parquet('s3://b/x')) SELECT * FROM t",
             "SELECT * FROM u JOIN read_parquet('s3://b/x') v ON true",
-            "SELECT 1 INTO t",
-            "WITH x AS (SELECT 1 AS a) INSERT INTO t SELECT * FROM x",
         ] {
             let err = ensure_read_only(sql, None).expect_err(sql);
             assert!(
                 err.contains("Read-only tool rejected"),
                 "{sql}: {err}"
             );
+        }
+        for sql in [
+            "SELECT 1 INTO t",
+            "WITH x AS (SELECT 1 AS a) INSERT INTO t SELECT * FROM x",
+        ] {
+            let err = ensure_read_only(sql, None).expect_err(sql);
+            assert!(err.contains("inside a query is not supported"), "{sql}: {err}");
         }
         ensure_read_only("SELECT 'read_parquet' AS x", None).expect("literal is not a TVF");
         ensure_read_only("SELECT * FROM read_parquet", None)
