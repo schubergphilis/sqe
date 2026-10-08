@@ -30,7 +30,7 @@ members = [
     "xtask",
 ]
 # Exclude vendored trees. They are referenced via path / [patch], not members.
-exclude = ["vendor/iceberg-rust", "vendor/datafusion-iceberg", "vendor/sqlite-rs"]
+exclude = ["vendor/iceberg-rust", "vendor/datafusion-iceberg", "vendor/sqlite-rs", "vendor/object_store"]
 
 [workspace.package]
 version = "0.49.0"
@@ -251,6 +251,14 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 
 # Gzip (de)compression for read_json(compression => 'gzip') buffer path.
 flate2 = { version = "1" }
+
+# object_store 0.13.2 as published, with quick-xml raised from ^0.39 to ^0.41
+# for RUSTSEC-2026-0194/0195 (the only change; object_store 0.14 makes the
+# same move with the same call sites). DataFusion 55 is on the 0.13 trait
+# line, so SQE cannot take 0.14 alone. Drop this patch and vendor/object_store
+# when DataFusion moves to object_store 0.14 (!1133).
+[patch.crates-io]
+object_store = { path = "vendor/object_store" }
 
 # ── Dev profile: fast incremental builds ───────────────────────
 [profile.dev]

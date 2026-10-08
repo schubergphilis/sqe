@@ -27,17 +27,9 @@ ignore = [
     # run with `default-features = false`, so the legacy stack (rustls 0.21,
     # webpki 0.101.7, hyper 0.14) is gone from the tree. Ignores removed so the
     # gate catches any regression.
-    # quick-xml (0.37.5/0.38.4/0.39.4): high-severity XML-parsing DoS advisories
-    # fixed in >=0.41.0. Transitive only -- object_store 0.13.2 pins
-    # `quick-xml ^0.39.0` (S3/GCS list + multipart XML) and the AWS SDK pulls the
-    # older lines. object_store 0.14.2 now uses patched XML, but DataFusion 55
-    # requires the 0.13 trait/API line; migrate the stack together (!1133).
-    # SQE parses XML only from its
-    # configured object store / catalog (trusted infra), never attacker input, so
-    # the DoS needs a malicious storage backend. Drop when object_store bumps
-    # quick-xml past 0.41. Matched by cargo-deny too (version-range match).
-    "RUSTSEC-2026-0194",  # review-by 2026-10-25 owner=sqe-maintainers
-    "RUSTSEC-2026-0195",  # review-by 2026-10-25 owner=sqe-maintainers
+    # RUSTSEC-2026-0194/0195 (quick-xml < 0.41) were ignored until 2026-10-08:
+    # object_store 0.13.2 is now patched to quick-xml ^0.41 (vendor/object_store,
+    # [patch.crates-io] in Cargo.toml) and no older quick-xml is locked.
 ]
 
 # Without this section cargo-deny 0.20 rejects EVERY license as "not explicitly
