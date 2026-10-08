@@ -11,20 +11,37 @@ use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::optimizer::{Optimizer, OptimizerRule};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use datafusion::prelude::{SessionConfig, SessionContext};
 
+use crate::eliminate_cross_join::EliminateCrossJoin;
+
 /// A context for user SQL: `config` and `runtime`, planned by
-/// [`EngineQueryPlanner`].
+/// [`EngineQueryPlanner`], with SQE's [`EliminateCrossJoin`] in place of
+/// DataFusion's.
 pub fn engine_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> SessionContext {
     let state = SessionStateBuilder::new()
         .with_config(config)
         .with_runtime_env(runtime)
         .with_default_features()
+        .with_optimizer_rules(engine_optimizer_rules())
         .with_query_planner(Arc::new(EngineQueryPlanner))
         .build();
     SessionContext::new_with_state(state)
+}
+
+/// DataFusion's default logical rules, with `eliminate_cross_join` swapped
+/// for SQE's copy that keeps unplaced `ON` keys (apache/datafusion#26058).
+fn engine_optimizer_rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
+    let mut rules = Optimizer::new().rules;
+    for rule in rules.iter_mut() {
+        if rule.name() == "eliminate_cross_join" {
+            *rule = Arc::new(EliminateCrossJoin::new());
+        }
+    }
+    rules
 }
 
 /// DataFusion's planner, except that a plan holding `WITH RECURSIVE` is
