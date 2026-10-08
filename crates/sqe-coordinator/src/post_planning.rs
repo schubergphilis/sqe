@@ -27,8 +27,9 @@
 //!    `ParallelScanRule`; takes the scans it can (issue #414).
 //! 4. `ParallelScanRule` (gated by `query.parallel_scan`) -- covers what the
 //!    probe rule does not reach.
-//! 5. `JoinStrategyRule` -- spillable join fallback (unknown/large build ->
-//!    SortMergeJoin).
+//! 5. `JoinStrategyRule` -- spillable join fallback: a build whose *exact*
+//!    size exceeds the threshold -> SortMergeJoin. Inexact or absent
+//!    statistics keep the hash join (#784).
 //! 6. `AdaptiveSortRule` -- strips non-partition sorts under memory pressure
 //!    per `query.sort_mode`.
 //! 7. `SortMemoryRule` -- FAIL CLOSED when remaining `SortExec`s cannot
