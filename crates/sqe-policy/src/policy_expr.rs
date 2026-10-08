@@ -45,7 +45,7 @@ use crate::session_udf::SessionIdentity;
 pub fn parse_sql_predicate(sql: &str, identity: &SessionIdentity) -> sqe_core::Result<Expr> {
     let trimmed = sql.trim();
     if trimmed.is_empty() {
-        return Err(sqe_core::error::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
+        return Err(sqe_core::error::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed,
             "empty policy expression".to_string(),
         ));
     }
@@ -118,8 +118,9 @@ impl Visitor for IdentCollector<'_> {
             // normalization lowercases unquoted names but preserves the case of
             // quoted ones. Lowercasing a quoted "Tier" here would put "tier" in
             // the stub while parse_sql_expr later looks up "Tier" -> FieldNotFound.
+            // ASCII letters only, as DataFusion does: `ÉTAT` is looked up as `État`.
             let key = if ident.quote_style.is_none() {
-                ident.value.to_lowercase()
+                ident.value.to_ascii_lowercase()
             } else {
                 ident.value.clone()
             };
@@ -223,6 +224,17 @@ mod tests {
         // Quoted ident must NOT be lowercased into the stub.
         let e = parse_sql_predicate("\"Tier\" >= 3", &SessionIdentity::default()).unwrap();
         assert!(matches!(e, datafusion::logical_expr::Expr::BinaryExpr(_)));
+    }
+
+    #[test]
+    fn parses_unquoted_non_ascii_uppercase_column() {
+        // DataFusion folds only ASCII letters, so `ÉTAT` resolves as `État`;
+        // the stub must hold that name, not the Unicode-lowercased `état`.
+        let e = parse_sql_predicate("ÉTAT = 'actif'", &SessionIdentity::default()).unwrap();
+        let sql = datafusion::sql::unparser::expr_to_sql(&e)
+            .unwrap()
+            .to_string();
+        assert!(sql.contains("État"), "{sql}");
     }
 
     #[test]
