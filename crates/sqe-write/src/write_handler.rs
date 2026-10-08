@@ -348,13 +348,11 @@ pub fn affected_rows_batch(count: u64) -> sqe_core::Result<Vec<RecordBatch>> {
     Ok(vec![batch])
 }
 
-/// Plan and run a one-row, one-column `COUNT(*)` query and return the value.
-/// `label` names the caller in the two error messages. Shared by the MERGE
+/// Run a planned one-row, one-column `COUNT(*)` query and return the value.
+/// `label` names the caller in the error message. Shared by the MERGE
 /// cardinality check and the empty-source affected-row count (501).
-async fn scalar_count(ctx: &DFSessionContext, sql: &str, label: &str) -> sqe_core::Result<i64> {
-    let batches = sqe_catalog::file_tvf_prepare::plan_sql(ctx, sql)
-        .await
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("{label} failed to plan: {e}")))?
+async fn scalar_count(df: datafusion::dataframe::DataFrame, label: &str) -> sqe_core::Result<i64> {
+    let batches = df
         .collect()
         .await
         .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("{label} failed: {e}")))?;
@@ -369,31 +367,6 @@ async fn scalar_count(ctx: &DFSessionContext, sql: &str, label: &str) -> sqe_cor
         .unwrap_or(0))
 }
 
-/// Run the MERGE cardinality check against the registered target/source
-/// scratch tables. Errors when a single target row is matched by more than one
-/// source row (Spark / Trino / Athena all reject this rather than silently
-/// duplicating the target row). Shared by the copy-on-write and merge-on-read
-/// merge paths; the caller gates on `merge_cardinality_check` and on the
-/// statement actually having a matched clause (source-only / by-source rows
-/// cannot violate cardinality).
-async fn check_merge_cardinality(
-    ctx: &DFSessionContext,
-    pair_count_sql: &str,
-    matched_count_sql: &str,
-) -> sqe_core::Result<()> {
-    let pair_count = scalar_count(ctx, pair_count_sql, "MERGE cardinality check").await?;
-    let matched_count = scalar_count(ctx, matched_count_sql, "MERGE cardinality check").await?;
-    if pair_count > matched_count {
-        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed,
-            "One MERGE target table row matched more than one source row \
-             (cardinality violation). Deduplicate the source rows or narrow the \
-             ON condition; set query.merge_cardinality_check = false to disable \
-             this check."
-                .to_string(),
-        ));
-    }
-    Ok(())
-}
 
 /// Wrap a source SELECT `LogicalPlan` in a synthetic `LogicalPlan::Dml::Insert`
 /// targeting the given (catalog, namespace, table) tuple, so the OpenLineage
@@ -1350,6 +1323,54 @@ impl WriteHandler {
         ctx.execute_logical_plan(plan).await.map_err(|e| {
             SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("DML policy plan failed: {e}"))
         })
+    }
+
+    /// Plan one engine-built MERGE query over the `__sqe_merge_*` scratch
+    /// relations and govern every other table it reads (#804). The ON, WHEN
+    /// and SET text is the caller's, so its subqueries name catalog tables
+    /// directly; the source was enforced before it became a scratch table and
+    /// the target is read through its policy relation.
+    async fn plan_merge_sql(
+        &self,
+        ctx: &DFSessionContext,
+        session: &Session,
+        sql: &str,
+        label: &str,
+    ) -> sqe_core::Result<datafusion::dataframe::DataFrame> {
+        let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, sql)
+            .await
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("{label} failed to plan: {e}")))?;
+        self.enforce_dml_eval(ctx, session, df).await
+    }
+
+    /// Run the MERGE cardinality check against the registered target/source
+    /// scratch tables. Errors when a single target row is matched by more than
+    /// one source row (Spark / Trino / Athena all reject this rather than
+    /// silently duplicating the target row). Shared by the copy-on-write and
+    /// merge-on-read merge paths; the caller gates on `merge_cardinality_check`
+    /// and on the statement actually having a matched clause (source-only /
+    /// by-source rows cannot violate cardinality).
+    async fn check_merge_cardinality(
+        &self,
+        ctx: &DFSessionContext,
+        session: &Session,
+        pair_count_sql: &str,
+        matched_count_sql: &str,
+    ) -> sqe_core::Result<()> {
+        const LABEL: &str = "MERGE cardinality check";
+        let pair_count = scalar_count(self.plan_merge_sql(ctx, session, pair_count_sql, LABEL).await?, LABEL).await?;
+        let matched_count =
+            scalar_count(self.plan_merge_sql(ctx, session, matched_count_sql, LABEL).await?, LABEL).await?;
+        if pair_count > matched_count {
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed,
+                "One MERGE target table row matched more than one source row \
+                 (cardinality violation). Deduplicate the source rows or narrow the \
+                 ON condition; set query.merge_cardinality_check = false to disable \
+                 this check."
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Resolve write-path policy predicates for the target of a DELETE / UPDATE.
@@ -4186,8 +4207,10 @@ impl WriteHandler {
         let t_alias = target_alias.clone().unwrap_or_else(|| "t".to_string());
         let s_alias = source_alias.clone().unwrap_or_else(|| "s".to_string());
         let merge_id = Uuid::now_v7().simple().to_string();
-        let target_table_ref = format!("__merge_target_{merge_id}");
-        let source_table_ref = format!("__merge_source_{merge_id}");
+        // The `__sqe_` prefix marks both as engine scratch, so
+        // `enforce_dml_eval` governs only the catalog tables around them.
+        let target_table_ref = format!("__sqe_merge_target_{merge_id}");
+        let source_table_ref = format!("__sqe_merge_source_{merge_id}");
         let qualified_target_ref = format!("datafusion.public.{target_table_ref}");
         let qualified_source_ref = format!("datafusion.public.{source_table_ref}");
         let _merge_scratch_guard = MergeScratchCleanup::new(
@@ -4418,10 +4441,12 @@ impl WriteHandler {
                         .await?;
 
                         if let Some((pair_sql, matched_sql)) = cardinality_sql {
-                            check_merge_cardinality(ctx, pair_sql, matched_sql).await?;
+                            self.check_merge_cardinality(ctx, session, pair_sql, matched_sql).await?;
                         }
                         if let Some(check_sql) = with_check_sql {
-                            let outside = scalar_count(ctx, check_sql, "MERGE WITH CHECK").await?;
+                            let label = "MERGE WITH CHECK";
+                            let outside =
+                                scalar_count(self.plan_merge_sql(ctx, session, check_sql, label).await?, label).await?;
                             if outside > 0 {
                                 return Err(SqeError::with_code(
                                     SqeErrorCode::AccessDenied,
@@ -4435,15 +4460,14 @@ impl WriteHandler {
 
                         let mut empty_source_affected: Option<usize> = None;
                         if let Some(count_sql) = empty_source_count_sql {
+                            let label = "MERGE empty-source row count";
                             let claimed =
-                                scalar_count(ctx, count_sql, "MERGE empty-source row count")
+                                scalar_count(self.plan_merge_sql(ctx, session, count_sql, label).await?, label)
                                     .await?;
                             empty_source_affected = Some(claimed.max(0) as usize);
                         }
 
-                        let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, select_sql).await.map_err(|e| {
-                            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to plan MERGE query: {e}"))
-                        })?;
+                        let df = self.plan_merge_sql(ctx, session, select_sql, "MERGE query").await?;
 
                         // Layer B (output side): stream the merged output straight into the
                         // streaming sink instead of `df.collect()`-ing the whole merged result
@@ -4650,13 +4674,12 @@ impl WriteHandler {
     async fn merge_subquery_stream(
         &self,
         ctx: &DFSessionContext,
+        session: &Session,
         sql: &str,
         label: &str,
         counter: Arc<std::sync::atomic::AtomicUsize>,
     ) -> sqe_core::Result<datafusion::execution::SendableRecordBatchStream> {
-        let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, sql)
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("MoR MERGE {label} plan failed: {e}")))?;
+        let df = self.plan_merge_sql(ctx, session, sql, &format!("MoR MERGE {label}")).await?;
         let stream = self
             .execute_source_stream(df, &format!("MoR MERGE {label}"))
             .await?;
@@ -4683,13 +4706,12 @@ impl WriteHandler {
     async fn collect_merge_keys(
         &self,
         ctx: &DFSessionContext,
+        session: &Session,
         sql: &str,
         label: &str,
         keys: &mut TrackedBatchBuffer,
     ) -> sqe_core::Result<usize> {
-        let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, sql)
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("MoR MERGE {label} plan failed: {e}")))?;
+        let df = self.plan_merge_sql(ctx, session, sql, &format!("MoR MERGE {label}")).await?;
         let mut stream = self
             .execute_source_stream(df, &format!("MoR MERGE {label}"))
             .await?;
@@ -5019,8 +5041,9 @@ impl WriteHandler {
         let t_alias = target_alias.clone().unwrap_or_else(|| "t".to_string());
         let s_alias = source_alias.clone().unwrap_or_else(|| "s".to_string());
         let merge_id = Uuid::now_v7().simple().to_string();
-        let target_ref = format!("__merge_mor_target_{merge_id}");
-        let source_ref = format!("__merge_mor_source_{merge_id}");
+        // `__sqe_` marks engine scratch for `enforce_dml_eval` (#804).
+        let target_ref = format!("__sqe_merge_mor_target_{merge_id}");
+        let source_ref = format!("__sqe_merge_mor_source_{merge_id}");
         let q_target = format!("datafusion.public.{target_ref}");
         let q_source = format!("datafusion.public.{source_ref}");
         let _merge_scratch_guard =
@@ -5146,7 +5169,7 @@ impl WriteHandler {
                 &q_source,
                 &on_rewritten,
             );
-            check_merge_cardinality(ctx, &pair_sql, &matched_sql).await?;
+            self.check_merge_cardinality(ctx, session, &pair_sql, &matched_sql).await?;
         }
 
         info!(
@@ -5235,6 +5258,7 @@ impl WriteHandler {
                     new_row_streams.push(
                         self.merge_subquery_stream(
                             ctx,
+                            session,
                             &new_sql,
                             "MATCHED UPDATE new-row",
                             Arc::clone(&updated_rows),
@@ -5247,6 +5271,7 @@ impl WriteHandler {
                     );
                     self.collect_merge_keys(
                         ctx,
+                        session,
                         &old_sql,
                         "MATCHED UPDATE old-key",
                         &mut equality_delete_batches,
@@ -5261,6 +5286,7 @@ impl WriteHandler {
                     deleted_rows += self
                         .collect_merge_keys(
                             ctx,
+                            session,
                             &del_sql,
                             "MATCHED DELETE",
                             &mut equality_delete_batches,
@@ -5310,6 +5336,7 @@ impl WriteHandler {
                 new_row_streams.push(
                     self.merge_subquery_stream(
                         ctx,
+                        session,
                         &insert_sql,
                         "NOT MATCHED INSERT",
                         Arc::clone(&inserted_rows),
@@ -5335,6 +5362,7 @@ impl WriteHandler {
                     deleted_rows += self
                         .collect_merge_keys(
                             ctx,
+                            session,
                             &del_sql,
                             "BY SOURCE DELETE",
                             &mut equality_delete_batches,
@@ -5363,6 +5391,7 @@ impl WriteHandler {
                     new_row_streams.push(
                         self.merge_subquery_stream(
                             ctx,
+                            session,
                             &new_sql,
                             "BY SOURCE UPDATE new-row",
                             Arc::clone(&updated_rows),
@@ -5372,6 +5401,7 @@ impl WriteHandler {
                     let old_sql = format!("SELECT {} {anti}", old_key_cols());
                     self.collect_merge_keys(
                         ctx,
+                        session,
                         &old_sql,
                         "BY SOURCE UPDATE old-key",
                         &mut equality_delete_batches,
@@ -10540,6 +10570,99 @@ s3_path_style = true
         for i in 0..region.len() {
             assert_eq!(region.value(i), "***", "raw ssn copied at index {i}");
         }
+    }
+
+    /// Register MERGE-shaped scratch relations (`__sqe_merge_*`, as the CoW
+    /// and MoR paths name them) over the employee rows, for #804.
+    fn register_merge_scratch(ctx: &DFSessionContext) {
+        for name in ["__sqe_merge_target_x", "__sqe_merge_source_x"] {
+            let provider = datafusion::datasource::MemTable::try_new(
+                make_employee_batch().schema(),
+                vec![vec![make_employee_batch()]],
+            )
+            .unwrap();
+            ctx.register_table(format!("datafusion.public.{name}"), Arc::new(provider)).unwrap();
+        }
+    }
+
+    // #804: a correlated SET subquery in a MERGE reads the other table
+    // masked, while the scratch target and source are read as registered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn merge_set_subquery_applies_column_mask() {
+        use arrow_array::Array as _;
+        use sqe_policy::MaskType;
+        let (handler, session, _employees, ctx) =
+            employees_handler_with_policy(None, vec![("ssn", MaskType::Redact("***".to_string()))])
+                .await;
+        ctx.register_batch("employees", make_employee_batch()).unwrap();
+        register_merge_scratch(&ctx);
+
+        let sql = "SELECT t.ssn AS kept, (SELECT MAX(e.ssn) FROM employees e WHERE e.id = t.id) AS copied \
+                   FROM datafusion.public.__sqe_merge_target_x t \
+                   JOIN datafusion.public.__sqe_merge_source_x s ON t.id = s.id ORDER BY t.id";
+        let batches = handler
+            .plan_merge_sql(&ctx, &session, sql, "MERGE query")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let batch = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+        let strings = |name: &str| -> Vec<String> {
+            let col = arrow::compute::cast(batch.column_by_name(name).unwrap(), &arrow_schema::DataType::Utf8)
+                .unwrap();
+            let col = col.as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+            (0..col.len()).map(|i| col.value(i).to_string()).collect()
+        };
+        assert_eq!(strings("copied"), vec!["***"; 4], "raw ssn copied from the other table");
+        assert_eq!(strings("kept"), vec!["111-11", "222-22", "333-33", "444-44"], "scratch re-masked");
+    }
+
+    // #804: an ON / WHEN subquery reads the other table row-filtered, in the
+    // merge query and in the count queries (cardinality, WITH CHECK, empty
+    // source) alike, so neither the merged rows nor a count reveal hidden rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn merge_on_subquery_applies_row_filter() {
+        use datafusion::logical_expr::{col, lit};
+        let (handler, session, _employees, ctx) =
+            employees_handler_with_policy(Some(col("region").eq(lit("EU"))), vec![]).await;
+        ctx.register_batch("employees", make_employee_batch()).unwrap();
+        register_merge_scratch(&ctx);
+
+        let from = "FROM datafusion.public.__sqe_merge_target_x t \
+                    JOIN datafusion.public.__sqe_merge_source_x s ON t.id = s.id \
+                    AND EXISTS (SELECT 1 FROM employees e WHERE e.id = t.id AND e.region = 'US')";
+        let count = |sql: String| {
+            let handler = &handler;
+            let (ctx, session) = (&ctx, &session);
+            async move {
+                scalar_count(handler.plan_merge_sql(ctx, session, &sql, "MERGE count").await.unwrap(), "MERGE count")
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(count(format!("SELECT COUNT(*) {from}")).await, 0, "US rows are hidden from the caller");
+        // The scratch relations themselves are not filtered: 4 matched pairs.
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM datafusion.public.__sqe_merge_target_x t \
+                 JOIN datafusion.public.__sqe_merge_source_x s ON t.id = s.id"
+                    .to_string()
+            )
+            .await,
+            4
+        );
+
+        // The cardinality check runs the same governed planning: a duplicate
+        // match that only exists through hidden rows is not a violation.
+        let pair = "SELECT COUNT(*) FROM datafusion.public.__sqe_merge_target_x t \
+                    JOIN datafusion.public.__sqe_merge_source_x s \
+                    ON t.id = s.id OR EXISTS (SELECT 1 FROM employees e WHERE e.region = 'US')";
+        let matched = "SELECT COUNT(*) FROM datafusion.public.__sqe_merge_target_x";
+        handler
+            .check_merge_cardinality(&ctx, &session, pair, matched)
+            .await
+            .expect("hidden rows cannot create a cardinality violation");
     }
 
     // #731: the IN-subquery keyset SELECT goes through the enforcer, so a
