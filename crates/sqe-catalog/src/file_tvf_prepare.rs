@@ -111,6 +111,20 @@ pub async fn plan_sql(ctx: &SessionContext, sql: &str) -> DFResult<datafusion::d
     .await
 }
 
+/// [`plan_sql`] for a session no policy governs (the embedded CLI: no auth,
+/// no policy), whose users create tables through DataFusion's own DDL. DDL
+/// runs while planning, so never call this where a policy enforcer exists.
+pub async fn plan_sql_without_policy(
+    ctx: &SessionContext,
+    sql: &str,
+) -> DFResult<datafusion::dataframe::DataFrame> {
+    in_statement(async {
+        prepare_statement(ctx, sql).await?;
+        ctx.sql(sql).await
+    })
+    .await
+}
+
 /// [`plan_sql`] preparing from a statement the caller already parsed (the
 /// engine's front door accepts syntax `GenericDialect` does not).
 pub async fn plan_parsed(
