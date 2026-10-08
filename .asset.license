@@ -13,11 +13,12 @@ expires = "2027-07-27"
 # The [patch] path copy of object_store 0.13.2 (vendor/object_store, for
 # RUSTSEC-2026-0194/0195). A path dependency reports the license field of its
 # own Cargo.toml, which upstream spells "MIT/Apache-2.0", the pre-SPDX form of
-# the dual license, and the gate does not parse it. Pinned to 0.13.2: drop
+# the dual license, and the gate does not parse it. A path dependency has no
+# purl in the SBOM, so the component is name@version. Pinned to 0.13.2: drop
 # with the patch when DataFusion moves to object_store 0.14 (!1133).
 [[exception]]
 id = "OSS-OBJECT-STORE-VENDORED-LICENSE-SPELLING-2026"
-component = "pkg:cargo/object_store@0.13.2"
+component = "object_store@0.13.2"
 licenses = ["MIT/Apache-2.0"]
 scope = "evidence-vouched"
 owner = "vpf-data-ai/chameleon sqlengine maintainers"
