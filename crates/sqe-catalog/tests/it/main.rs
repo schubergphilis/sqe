@@ -24,6 +24,7 @@ mod hive_manifest_test;
 mod hive_mount_test;
 mod hive_partition_bench;
 mod hive_partition_test;
+mod hive_plan_io_test;
 mod hive_provider_test;
 mod hive_scan_exec_test;
 mod hive_scan_mode_test;
