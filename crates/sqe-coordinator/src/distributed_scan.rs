@@ -188,6 +188,9 @@ pub struct DistributedScanExec {
     /// lineorder: 6M rows / ~115MB per query) even when the dim build side
     /// already proved only a few percent can survive the join.
     pushed_down_filters: Vec<Arc<dyn PhysicalExpr>>,
+    /// Prometheus registry for the ticket cost metrics (#809). `None` (tests,
+    /// no `/metrics` server) skips the timing entirely.
+    metrics_registry: Option<Arc<sqe_metrics::MetricsRegistry>>,
 }
 
 /// A fragment's batches as they arrive from a worker, before reassembly to
@@ -332,6 +335,7 @@ impl DistributedScanExec {
             max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
             metrics: ExecutionPlanMetricsSet::new(),
             pushed_down_filters: vec![],
+            metrics_registry: None,
         }
     }
 
@@ -358,6 +362,7 @@ impl DistributedScanExec {
             max_message_bytes: self.max_message_bytes,
             metrics: self.metrics.clone(),
             pushed_down_filters: filters,
+            metrics_registry: self.metrics_registry.clone(),
         }
     }
 
@@ -481,6 +486,14 @@ impl DistributedScanExec {
     #[must_use = "with_message_limit consumes self; bind the returned scan"]
     pub fn with_message_limit(mut self, max_message_bytes: usize) -> Self {
         self.max_message_bytes = max_message_bytes;
+        self
+    }
+
+    /// Record ticket size and encode / dynamic-filter rewrite time into the
+    /// coordinator's Prometheus registry (#809).
+    #[must_use = "with_metrics consumes self; bind the returned scan"]
+    pub fn with_metrics(mut self, registry: Arc<sqe_metrics::MetricsRegistry>) -> Self {
+        self.metrics_registry = Some(registry);
         self
     }
 }
@@ -656,6 +669,7 @@ impl ExecutionPlan for DistributedScanExec {
         let worker_registry = self.worker_registry.clone();
         let channel_pool = self.worker_registry.as_ref().map(|r| r.channel_pool());
         let fragment_callback = self.fragment_callback.0.clone();
+        let metrics_registry = self.metrics_registry.clone();
         let dispatch_limits = DispatchLimits {
             connect_timeout: self.worker_connect_timeout,
             rpc_timeout: self.worker_rpc_timeout,
@@ -688,6 +702,7 @@ impl ExecutionPlan for DistributedScanExec {
                 ticket_ttl: self.ticket_ttl,
                 limits: dispatch_limits,
                 ticket_predicate_dropped,
+                metrics_registry: metrics_registry.clone(),
             }),
         };
 
@@ -744,6 +759,11 @@ impl ExecutionPlan for DistributedScanExec {
                 }
             }
             if !pushed_down_filters.is_empty() {
+                // #809: starts after the readiness wait so it measures the
+                // decode + AND + re-serialize work, not the join builds.
+                let rewrite_started = metrics_registry
+                    .as_ref()
+                    .map(|_| std::time::Instant::now());
                 let mut snapshots: Vec<datafusion::logical_expr::Expr> = Vec::new();
                 for f in &pushed_down_filters {
                     let resolved = match f.downcast_ref::<DynamicFilterPhysicalExpr>() {
@@ -831,6 +851,10 @@ impl ExecutionPlan for DistributedScanExec {
                             ),
                         }
                     }
+                }
+                if let (Some(m), Some(started)) = (&metrics_registry, rewrite_started) {
+                    m.scan_ticket_dynamic_filter_seconds
+                        .observe(started.elapsed().as_secs_f64());
                 }
             }
 
@@ -1290,6 +1314,7 @@ struct FlightDispatcher {
     ticket_ttl: std::time::Duration,
     limits: DispatchLimits,
     ticket_predicate_dropped: datafusion::physical_plan::metrics::Count,
+    metrics_registry: Option<Arc<sqe_metrics::MetricsRegistry>>,
 }
 
 impl fmt::Debug for FlightDispatcher {
@@ -1314,6 +1339,7 @@ impl FragmentDispatcher for FlightDispatcher {
         let ticket_ttl = self.ticket_ttl;
         let limits = self.limits;
         let dropped = self.ticket_predicate_dropped.clone();
+        let metrics_registry = self.metrics_registry.clone();
         Box::pin(async move {
             let flight_stream = dispatch_to_worker(
                 &task,
@@ -1325,6 +1351,7 @@ impl FragmentDispatcher for FlightDispatcher {
                 ticket_ttl,
                 &limits,
                 &dropped,
+                metrics_registry.as_deref(),
             )
             .await?;
             let boxed: WorkerStream = Box::pin(flight_stream);
@@ -1370,7 +1397,32 @@ struct DispatchLimits {
 /// A raw-byte budget on the `Expr` cannot see base64 expansion, the file-path
 /// list, or the projection, and the earlier 3 MiB raw budget admitted tickets
 /// that measured 8-9 MB on the wire.
+///
+/// With `metrics`, records the shipped ticket's size and the time spent
+/// encoding it, both attempts included (#809).
 fn encode_ticket_within_limit(
+    task: &ScanTask,
+    worker_url: &str,
+    max_message_bytes: usize,
+    ticket_predicate_dropped: &datafusion::physical_plan::metrics::Count,
+    metrics: Option<&sqe_metrics::MetricsRegistry>,
+) -> Result<Vec<u8>, DataFusionError> {
+    let started = metrics.map(|_| std::time::Instant::now());
+    let encoded = encode_ticket_unmeasured(
+        task,
+        worker_url,
+        max_message_bytes,
+        ticket_predicate_dropped,
+    )?;
+    if let (Some(m), Some(started)) = (metrics, started) {
+        m.scan_ticket_encode_seconds
+            .observe(started.elapsed().as_secs_f64());
+        m.scan_ticket_bytes.observe(encoded.len() as f64);
+    }
+    Ok(encoded)
+}
+
+fn encode_ticket_unmeasured(
     task: &ScanTask,
     worker_url: &str,
     max_message_bytes: usize,
@@ -1415,6 +1467,7 @@ async fn dispatch_to_worker(
     ticket_ttl: std::time::Duration,
     limits: &DispatchLimits,
     ticket_predicate_dropped: &datafusion::physical_plan::metrics::Count,
+    metrics: Option<&sqe_metrics::MetricsRegistry>,
 ) -> Result<FlightRecordBatchStream, DispatchError> {
     // Finding 601: bind the ticket to this worker and to a deadline before
     // signing, so a captured ticket cannot be replayed elsewhere or later.
@@ -1427,6 +1480,7 @@ async fn dispatch_to_worker(
         worker_url,
         limits.max_message_bytes,
         ticket_predicate_dropped,
+        metrics,
     )
     .map_err(DispatchError::Ticket)?;
 
@@ -2136,9 +2190,19 @@ mod tests {
         task.predicate_proto = Some(vec![7u8; 256 * 1024]);
         let limit = 64 * 1024;
 
-        let bytes = encode_ticket_within_limit(&task, "http://w1:50052", limit, &dropped).unwrap();
+        let registry = sqe_metrics::MetricsRegistry::new().unwrap();
+        let bytes =
+            encode_ticket_within_limit(&task, "http://w1:50052", limit, &dropped, Some(&registry))
+                .unwrap();
 
         assert_eq!(dropped.value(), 1, "the drop must be counted, not silent");
+        // #809: the shipped (stripped) ticket is what gets measured, once.
+        assert_eq!(registry.scan_ticket_bytes.get_sample_count(), 1);
+        assert_eq!(
+            registry.scan_ticket_bytes.get_sample_sum(),
+            bytes.len() as f64
+        );
+        assert_eq!(registry.scan_ticket_encode_seconds.get_sample_count(), 1);
         assert!(
             bytes.len() <= limit,
             "stripped ticket is {} bytes, still over the {limit} ceiling",
@@ -2162,13 +2226,58 @@ mod tests {
         let mut task = make_task("frag-small");
         task.predicate_proto = Some(vec![3u8; 512]);
 
-        let bytes =
-            encode_ticket_within_limit(&task, "http://w1:50052", 16 * 1024 * 1024, &dropped)
-                .unwrap();
+        let registry = sqe_metrics::MetricsRegistry::new().unwrap();
+        let bytes = encode_ticket_within_limit(
+            &task,
+            "http://w1:50052",
+            16 * 1024 * 1024,
+            &dropped,
+            Some(&registry),
+        )
+        .unwrap();
 
         assert_eq!(dropped.value(), 0);
+        // #809: one sample per encoded ticket, sized as shipped.
+        assert_eq!(registry.scan_ticket_bytes.get_sample_count(), 1);
+        assert!(registry.scan_ticket_bytes.get_sample_sum() > 512.0);
+        assert_eq!(
+            registry.scan_ticket_bytes.get_sample_sum(),
+            bytes.len() as f64
+        );
+        assert_eq!(registry.scan_ticket_encode_seconds.get_sample_count(), 1);
         assert_eq!(
             ScanTask::from_bytes(&bytes).unwrap().predicate_proto,
+            Some(vec![3u8; 512])
+        );
+    }
+
+    /// Without a registry the encode path records nothing and the ticket is
+    /// byte-identical to the measured one (#809).
+    #[test]
+    fn ticket_encoding_without_metrics_is_unchanged() {
+        let metrics = ExecutionPlanMetricsSet::new();
+        let dropped = MetricBuilder::new(&metrics).counter("ticket_predicate_dropped_oversize", 0);
+
+        let mut task = make_task("frag-plain");
+        task.predicate_proto = Some(vec![3u8; 512]);
+
+        let registry = sqe_metrics::MetricsRegistry::new().unwrap();
+        let measured = encode_ticket_within_limit(
+            &task,
+            "http://w1:50052",
+            16 * 1024 * 1024,
+            &dropped,
+            Some(&registry),
+        )
+        .unwrap();
+        let plain =
+            encode_ticket_within_limit(&task, "http://w1:50052", 16 * 1024 * 1024, &dropped, None)
+                .unwrap();
+
+        assert_eq!(measured, plain);
+        assert_eq!(registry.scan_ticket_bytes.get_sample_count(), 1);
+        assert_eq!(
+            ScanTask::from_bytes(&plain).unwrap().predicate_proto,
             Some(vec![3u8; 512])
         );
     }
@@ -2186,7 +2295,8 @@ mod tests {
             .map(|i| format!("s3://bucket/very/long/prefix/that/repeats/file-{i}.parquet"))
             .collect();
 
-        let bytes = encode_ticket_within_limit(&task, "http://w1:50052", 4 * 1024, &dropped).unwrap();
+        let bytes =
+            encode_ticket_within_limit(&task, "http://w1:50052", 4 * 1024, &dropped, None).unwrap();
 
         assert_eq!(dropped.value(), 0);
         assert!(bytes.len() > 4 * 1024);
