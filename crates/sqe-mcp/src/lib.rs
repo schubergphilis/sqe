@@ -2630,17 +2630,19 @@ fn batches_json(batches: &[RecordBatch], max_rows: usize, max_bytes: usize) -> V
             for (index, field) in batch.schema().fields().iter().enumerate() {
                 let mut value =
                     sqe_trino_protocol::encode::arrow_value_to_json(batch.column(index).as_ref(), row);
-                if let Value::String(text) = &mut value {
-                    if text.len() > cell_budget {
-                        let mut end = cell_budget;
-                        while !text.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        let dropped = text.len() - end;
-                        text.truncate(end);
-                        text.push_str(&format!("...[truncated {dropped} bytes]"));
-                        cell_truncated = true;
+                // Arrays, maps and rows arrive as JSON structure (#818); an
+                // oversized one is cut as its JSON text instead.
+                let oversized = match &value {
+                    Value::String(text) => (text.len() > cell_budget).then(|| text.clone()),
+                    Value::Array(_) | Value::Object(_) => {
+                        Some(value.to_string()).filter(|text| text.len() > cell_budget)
                     }
+                    _ => None,
+                };
+                if let Some(mut text) = oversized {
+                    truncate_cell(&mut text, cell_budget);
+                    value = Value::String(text);
+                    cell_truncated = true;
                 }
                 object.insert(field.name().clone(), value);
             }
@@ -2666,7 +2668,18 @@ fn batches_json(batches: &[RecordBatch], max_rows: usize, max_bytes: usize) -> V
     })
 }
 
-/// Longest string cell serialized into a tool response (#707).
+/// Cuts `text` to `budget` bytes on a char boundary and notes what was dropped.
+fn truncate_cell(text: &mut String, budget: usize) {
+    let mut end = budget;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let dropped = text.len() - end;
+    text.truncate(end);
+    text.push_str(&format!("...[truncated {dropped} bytes]"));
+}
+
+/// Longest cell serialized into a tool response (#707).
 const CELL_BYTES_MAX: usize = 64 * 1024;
 
 fn tool_success(value: Value) -> Value {
@@ -2974,6 +2987,29 @@ mod tests {
         assert!(cell.ends_with("bytes]"), "{}", &cell[cell.len() - 40..]);
         assert_eq!(value["returned_rows"], 1);
         assert_eq!(value["truncated"], true);
+    }
+
+    /// A nested cell is JSON structure, not a string (#818), so the
+    /// string-only cut missed it and one wide array emptied the page.
+    #[test]
+    fn a_wide_nested_cell_is_cut_as_json_text_and_small_ones_stay_structured() {
+        use arrow_array::{types::Int64Type, Array, ListArray};
+        let wide = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some((0..20_000).map(|i| Some(1_000_000 + i)).collect::<Vec<_>>()),
+            Some(vec![Some(1), None]),
+        ]);
+        let schema = Arc::new(Schema::new(vec![Field::new("v", wide.data_type().clone(), true)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(wide)]).unwrap();
+        let value = batches_json(&[batch], 10, 1024 * 1024);
+        assert_eq!(value["returned_rows"], 2);
+        assert_eq!(value["truncated"], true);
+        let cell = value["rows"][0]["v"]
+            .as_str()
+            .expect("an oversized array becomes text");
+        assert!(cell.starts_with("[1000000,1000001,"), "{}", &cell[..40]);
+        assert!(cell.len() < CELL_BYTES_MAX + 64, "{}", cell.len());
+        assert!(cell.ends_with("bytes]"), "{}", &cell[cell.len() - 40..]);
+        assert_eq!(value["rows"][1]["v"], json!([1, null]));
     }
 
     /// #723 #749: the change tool applies the same denylist, and the
