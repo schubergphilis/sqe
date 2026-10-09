@@ -11421,14 +11421,29 @@ s3_path_style = true
     /// vendored `Transaction::commit` has its own inner retry for retryable
     /// errors, which would swallow the conflict before the helper under test
     /// ever saw it.
+    ///
+    /// `unauthorized_load`, when set, is the 1-based `load_table` call that
+    /// fails with the 401 `SessionCatalogBridge` hands back (sqe#803).
     #[derive(Debug)]
     struct FlakyCatalog {
         table: IcebergTable,
         fail_first: usize,
         commits: std::sync::Mutex<usize>,
+        unauthorized_load: Option<usize>,
+        loads: std::sync::Mutex<usize>,
     }
 
     impl FlakyCatalog {
+        fn new(table: IcebergTable, fail_first: usize) -> Self {
+            Self {
+                table,
+                fail_first,
+                commits: std::sync::Mutex::new(0),
+                unauthorized_load: None,
+                loads: std::sync::Mutex::new(0),
+            }
+        }
+
         fn commit_count(&self) -> usize {
             *self.commits.lock().expect("commit counter")
         }
@@ -11437,6 +11452,18 @@ s3_path_style = true
     #[async_trait::async_trait]
     impl Catalog for FlakyCatalog {
         async fn load_table(&self, _table: &TableIdent) -> iceberg::Result<IcebergTable> {
+            let mut n = self.loads.lock().expect("load counter");
+            *n += 1;
+            if self.unauthorized_load == Some(*n) {
+                // The shape `SessionCatalogBridge::load_table` produces for a
+                // catalog 401.
+                return Err(iceberg::Error::new(
+                    iceberg::ErrorKind::Unexpected,
+                    "Catalog HTTP 401 (other): Failed to load table: Unexpected, context: \
+                     { status: 401 Unauthorized } => Received response with unexpected status code",
+                )
+                .with_context("status", "401"));
+            }
             Ok(self.table.clone())
         }
 
@@ -11531,11 +11558,7 @@ s3_path_style = true
 
         let dir = tempfile::tempdir().expect("tempdir");
         let table = local_table(&dir, UNPARTITIONED_META);
-        let catalog = FlakyCatalog {
-            table: table.clone(),
-            fail_first: 2,
-            commits: std::sync::Mutex::new(0),
-        };
+        let catalog = FlakyCatalog::new(table.clone(), 2);
         let metrics = Arc::new(sqe_metrics::MetricsRegistry::new().expect("metrics"));
         let handler = WriteHandler::new(write_test_config()).with_metrics(metrics.clone());
         let ident = TableIdent::from_strs(["ns", "tbl"]).unwrap();
@@ -11585,11 +11608,7 @@ s3_path_style = true
     async fn commit_rewrite_with_retry_skips_the_commit_when_there_is_nothing_to_do() {
         let dir = tempfile::tempdir().expect("tempdir");
         let table = local_table(&dir, UNPARTITIONED_META);
-        let catalog = FlakyCatalog {
-            table,
-            fail_first: 0,
-            commits: std::sync::Mutex::new(0),
-        };
+        let catalog = FlakyCatalog::new(table, 0);
         let handler = WriteHandler::new(write_test_config());
         let ident = TableIdent::from_strs(["ns", "tbl"]).unwrap();
 
@@ -11610,12 +11629,8 @@ s3_path_style = true
     async fn commit_rewrite_with_retry_does_not_retry_a_non_conflict_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let table = local_table(&dir, UNPARTITIONED_META);
-        let catalog = FlakyCatalog {
-            table,
-            // Any positive count: the error message below is what decides.
-            fail_first: 1,
-            commits: std::sync::Mutex::new(0),
-        };
+        // Any positive count: the error message below is what decides.
+        let catalog = FlakyCatalog::new(table, 1);
         let handler = WriteHandler::new(write_test_config());
         let ident = TableIdent::from_strs(["ns", "tbl"]).unwrap();
 
@@ -11635,6 +11650,48 @@ s3_path_style = true
             .expect_err("the closure's error propagates");
         assert!(format!("{err}").contains("read failed"), "err: {err}");
         assert_eq!(catalog.commit_count(), 0);
+    }
+
+    /// sqe#803: a 401 on the reload inside `Transaction::commit` (the second
+    /// `load_table`) used to end a finished CTAS. The attempt is retried and
+    /// the data files are appended exactly once.
+    #[tokio::test]
+    async fn commit_with_retry_survives_a_401_on_the_commit_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table = local_table(&dir, UNPARTITIONED_META);
+        let catalog = FlakyCatalog {
+            unauthorized_load: Some(2),
+            ..FlakyCatalog::new(table, 0)
+        };
+        let ident = TableIdent::from_strs(["ns", "tbl"]).unwrap();
+        let files = vec![test_data_file(
+            "s3://bucket/ctas.parquet",
+            0,
+            iceberg::spec::Struct::empty(),
+        )];
+
+        commit_with_retry(&catalog, &ident, "unit-test", |fresh| {
+            let files = files.clone();
+            let catalog = &catalog;
+            async move {
+                let tx = Transaction::new(&fresh);
+                let tx = tx.fast_append().add_data_files(files).apply(tx)?;
+                tx.commit(catalog).await
+            }
+        })
+        .await
+        .expect("the 401 is retried");
+
+        assert_eq!(
+            catalog.commit_count(),
+            1,
+            "one update_table, no double append"
+        );
+        assert_eq!(
+            *catalog.loads.lock().expect("load counter"),
+            4,
+            "two loads per attempt, two attempts"
+        );
     }
 
     /// 502: an old-spec file is partitioned by `country`, not by `region`, so

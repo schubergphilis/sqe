@@ -3447,6 +3447,22 @@ pub struct SessionCatalogBridge {
     session: Arc<SessionCatalog>,
 }
 
+/// Hand an `SqeError` back to iceberg-rust callers. The message keeps the
+/// SQE text; a catalog HTTP status also rides along as the `status` context,
+/// so `iceberg::Error::http_status` sees it on the far side (the commit
+/// retry tells a 401 from a 5xx by it, sqe#803).
+fn bridge_error(e: SqeError) -> iceberg::Error {
+    let status = match &e {
+        SqeError::CatalogHttp { status, .. } => Some(*status),
+        _ => None,
+    };
+    let bridged = iceberg::Error::new(iceberg::ErrorKind::Unexpected, e.to_string());
+    match status {
+        Some(status) => bridged.with_context("status", status.to_string()),
+        None => bridged,
+    }
+}
+
 #[async_trait::async_trait]
 impl Catalog for SessionCatalogBridge {
     async fn list_namespaces(
@@ -3509,10 +3525,7 @@ impl Catalog for SessionCatalogBridge {
 
     async fn load_table(&self, table: &TableIdent) -> iceberg::Result<Table> {
         // Delegate through SessionCatalog::load_table so the cache is used.
-        self.session
-            .load_table(table)
-            .await
-            .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::Unexpected, e.to_string()))
+        self.session.load_table(table).await.map_err(bridge_error)
     }
 
     async fn drop_table(&self, table: &TableIdent) -> iceberg::Result<()> {
@@ -4455,6 +4468,35 @@ type = "aws"
             wrapped.error_code(),
             sqe_core::SqeErrorCode::CatalogUnavailable
         );
+    }
+
+    /// sqe#803: the bridge used to drop the status, leaving the commit retry
+    /// to find "status: 401" in the text. It now carries it as context too,
+    /// and the SQE text is unchanged.
+    #[test]
+    fn bridge_error_carries_the_catalog_http_status() {
+        let e = iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            "Received response with unexpected status code",
+        )
+        .with_context("status", "401 Unauthorized");
+        let sqe = super::classify_iceberg_catalog_error("Failed to load table", e);
+        let bridged = super::bridge_error(sqe);
+        assert_eq!(bridged.http_status(), Some(401));
+        assert!(
+            bridged
+                .message()
+                .starts_with("Catalog HTTP 401 (other): Failed to load table: "),
+            "{bridged}"
+        );
+        assert!(
+            bridged.to_string().contains("status: 401 Unauthorized"),
+            "{bridged}"
+        );
+
+        let other = super::bridge_error(sqe_core::SqeError::Catalog("boom".into()));
+        assert_eq!(other.http_status(), None);
+        assert_eq!(other.message(), "Catalog error: boom");
     }
 
     /// A table whose name contains "forbidden" with a 500 must not classify as

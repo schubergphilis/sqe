@@ -116,8 +116,20 @@ fn commit_attempt_is_retryable(e: &iceberg::Error) -> bool {
     }
     e.retryable()
         || is_conflict_message(&msg)
-        || msg.contains("status: 401")
+        || has_http_status(e, &msg, &[401])
         || (msg.contains("failed to load table") && is_transient_load_error(e))
+}
+
+/// Whether `e` answered with one of `codes`: the structured `status` context
+/// when the error carries one, else "status: <code>" in the text (`msg`, its
+/// lowercased Display), for errors that lost the context on the way.
+fn has_http_status(e: &iceberg::Error, msg: &str, codes: &[u16]) -> bool {
+    match e.http_status() {
+        Some(status) => codes.contains(&status),
+        None => codes
+            .iter()
+            .any(|code| msg.contains(&format!("status: {code}"))),
+    }
 }
 
 /// Load attempts for the table reload that opens each commit attempt.
@@ -169,7 +181,7 @@ pub(crate) fn is_transient_load_error(e: &iceberg::Error) -> bool {
         return true;
     }
     let msg = e.to_string().to_lowercase();
-    msg.contains("status: 401") || ["500", "502", "503", "504"].iter().any(|code| msg.contains(&format!("status: {code}")))
+    has_http_status(e, &msg, &[401, 500, 502, 503, 504])
 }
 
 /// `pub` so the coordinator's `maintenance_lease.rs` can classify a losing claim commit
@@ -238,6 +250,35 @@ mod tests {
         // Not transient.
         assert!(!commit_attempt_is_retryable(&http_error("403 Forbidden")));
         assert!(!commit_attempt_is_retryable(&http_error("404 Not Found")));
+    }
+
+    /// sqe#803: the exact shape `SessionCatalogBridge::load_table` hands to
+    /// `Transaction::commit` for a catalog 401. It is retryable by the
+    /// structured status, and by the text alone for a bridge that drops it.
+    #[test]
+    fn the_bridged_catalog_401_is_retryable() {
+        let text = "Catalog HTTP 401 (other): Failed to load table: Unexpected, context: \
+                    { status: 401 Unauthorized, headers: {\"www-authenticate\": \"Bearer\"} } \
+                    => Received response with unexpected status code";
+        let text_only = iceberg::Error::new(iceberg::ErrorKind::Unexpected, text);
+        assert_eq!(text_only.http_status(), None);
+        assert!(commit_attempt_is_retryable(&text_only));
+        assert!(is_transient_load_error(&text_only));
+
+        let structured =
+            iceberg::Error::new(iceberg::ErrorKind::Unexpected, text).with_context("status", "401");
+        assert_eq!(structured.http_status(), Some(401));
+        assert!(commit_attempt_is_retryable(&structured));
+
+        // The structured status wins over text: a 403 that quotes a 401
+        // somewhere in its message is still not retried.
+        let forbidden = iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            "Catalog HTTP 403 (other): Failed to load table: earlier status: 401",
+        )
+        .with_context("status", "403");
+        assert!(!commit_attempt_is_retryable(&forbidden));
+        assert!(!is_transient_load_error(&forbidden));
     }
 
     #[tokio::test]
