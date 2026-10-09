@@ -14,7 +14,7 @@ use sqe_lineage::extract;
 use std::sync::Arc;
 
 fn lookup() -> extract::CatalogLookup {
-    Arc::new(|n: &str| format!("sqe://{n}"))
+    Arc::new(|n: &str| sqe_lineage::extract::CatalogInfo::new(n, None))
 }
 
 /// `INSERT INTO polaris.hr.archive (SELECT <exprs> FROM polaris.hr.employees)`,
@@ -67,7 +67,12 @@ fn a_masked_source_column_is_reported_as_masked_not_identity() {
     // scan of `polaris.hr.employees` was masked. The key is the scan's
     // TableReference display, as `PolicyPlanRewriter` keys its summary.
     let masked = vec![("polaris.hr.employees".to_string(), "email".to_string())];
-    let extracted = extract::extract_lineage_governed(&plan, &lookup(), &masked);
+    let extracted = extract::extract_lineage_governed(
+        &plan,
+        &lookup(),
+        &masked,
+        &sqe_lineage::LineageScope::default(),
+    );
 
     let cl = extracted.outputs[0]
         .facets
@@ -80,8 +85,14 @@ fn a_masked_source_column_is_reported_as_masked_not_identity() {
     assert!(email.transformations[0].masking, "{email:?}");
 
     let id = &cl.fields["id"].inputFields[0];
-    assert_eq!(id.transformations[0].subtype, "IDENTITY", "unmasked columns are untouched: {id:?}");
-    assert!(extracted.quality.complete, "every node here has a trace rule");
+    assert_eq!(
+        id.transformations[0].subtype, "IDENTITY",
+        "unmasked columns are untouched: {id:?}"
+    );
+    assert!(
+        extracted.quality.complete,
+        "every node here has a trace rule"
+    );
     assert!(extracted.quality.untraced.is_empty());
 }
 
@@ -92,15 +103,35 @@ fn the_namespace_only_table_key_matches_the_same_scan() {
     // same way, so the mask still lands.
     let plan = ctas_over_employees(|b| b.project(vec![col("email")]).unwrap());
     let masked = vec![("hr.employees".to_string(), "email".to_string())];
-    let extracted = extract::extract_lineage_governed(&plan, &lookup(), &masked);
-    let email = &extracted.outputs[0].facets.columnLineage.as_ref().unwrap().fields["email"]
+    let extracted = extract::extract_lineage_governed(
+        &plan,
+        &lookup(),
+        &masked,
+        &sqe_lineage::LineageScope::default(),
+    );
+    let email = &extracted.outputs[0]
+        .facets
+        .columnLineage
+        .as_ref()
+        .unwrap()
+        .fields["email"]
         .inputFields[0];
     assert_eq!(email.transformations[0].subtype, "MASKED");
 
     // A different table's `email` is not.
     let other = vec![("hr.contractors".to_string(), "email".to_string())];
-    let extracted = extract::extract_lineage_governed(&plan, &lookup(), &other);
-    let email = &extracted.outputs[0].facets.columnLineage.as_ref().unwrap().fields["email"]
+    let extracted = extract::extract_lineage_governed(
+        &plan,
+        &lookup(),
+        &other,
+        &sqe_lineage::LineageScope::default(),
+    );
+    let email = &extracted.outputs[0]
+        .facets
+        .columnLineage
+        .as_ref()
+        .unwrap()
+        .fields["email"]
         .inputFields[0];
     assert_eq!(email.transformations[0].subtype, "IDENTITY");
 }
@@ -115,7 +146,12 @@ fn an_untraced_node_is_reported_in_the_quality_facet() {
             .unnest_column("tags")
             .unwrap()
     });
-    let extracted = extract::extract_lineage_governed(&plan, &lookup(), &[]);
+    let extracted = extract::extract_lineage_governed(
+        &plan,
+        &lookup(),
+        &[],
+        &sqe_lineage::LineageScope::default(),
+    );
     assert!(!extracted.quality.complete);
     assert_eq!(extracted.quality.untraced, vec!["Unnest".to_string()]);
     let cl = extracted.outputs[0]
@@ -136,5 +172,8 @@ fn the_plain_entry_point_is_unchanged() {
     let (inputs, outputs) = extract::extract_lineage(&plan, &lookup());
     assert_eq!(inputs.len(), 1);
     let cl = outputs[0].facets.columnLineage.as_ref().unwrap();
-    assert_eq!(cl.fields["email"].inputFields[0].transformations[0].subtype, "IDENTITY");
+    assert_eq!(
+        cl.fields["email"].inputFields[0].transformations[0].subtype,
+        "IDENTITY"
+    );
 }

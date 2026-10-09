@@ -39,6 +39,7 @@ fn sample_run() -> Run {
             parent: None,
             errorMessage: None,
             sqe_lineageQuality: None,
+            sqe_query: None,
         },
     }
 }
@@ -79,7 +80,7 @@ fn snapshot_select_complete() {
                     name: "polaris".into(),
                     uri: "https://polaris.example/api/catalog".into(),
                 }),
-                columnLineage: None,
+                ..DatasetFacets::default()
             },
         }],
         outputs: vec![],
@@ -153,6 +154,7 @@ fn snapshot_query_fail() {
                     programmingLanguage: "sql".into(),
                 }),
                 sqe_lineageQuality: None,
+                sqe_query: None,
             },
         },
         job: sample_job("query:err"),

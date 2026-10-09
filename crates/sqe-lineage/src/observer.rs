@@ -30,6 +30,38 @@ pub enum LineageHint {
         schema: String,
         table: String,
     },
+    /// A statement that changes a table's lifecycle without a source plan:
+    /// `DROP TABLE` (`change = "DROP"`) or a plain `CREATE TABLE`
+    /// (`"CREATE"`). The table is the one output dataset and carries the OL
+    /// `lifecycleStateChange` facet; there is no schema or column lineage.
+    /// Values are the [`crate::event::lifecycle`] constants.
+    TableLifecycle {
+        catalog: String,
+        schema: String,
+        table: String,
+        change: String,
+    },
+}
+
+/// The session scope a statement was planned in: the catalog and schema
+/// DataFusion resolved unqualified and 2-part table names against. Lineage
+/// uses it to name a scan of `customers` or `sales.customers` after the
+/// catalog the table actually lives in, instead of a literal `default`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LineageScope {
+    pub catalog: String,
+    pub schema: String,
+}
+
+impl Default for LineageScope {
+    /// `default.default`, the fallback this crate used before the scope was
+    /// threaded through (and still the DataFusion default).
+    fn default() -> Self {
+        Self {
+            catalog: "default".into(),
+            schema: "default".into(),
+        }
+    }
 }
 
 pub enum PlanOrHint {
@@ -64,6 +96,11 @@ pub struct QueryCompleteCtx {
     /// display; column lineage reports them as `MASKED` (review 610). Empty
     /// when no policy engine is wired or nothing was masked.
     pub masked_fields: Vec<(String, String)>,
+    /// Scope unqualified table names resolved in.
+    pub scope: LineageScope,
+    /// OL lifecycle change the statement made to its output dataset(s), e.g.
+    /// `CREATE` for a CTAS. `None` for plain writes.
+    pub output_lifecycle: Option<String>,
 }
 
 pub struct QueryFailCtx {
@@ -83,6 +120,10 @@ pub struct QueryFailCtx {
     /// display; column lineage reports them as `MASKED` (review 610). Empty
     /// when no policy engine is wired or nothing was masked.
     pub masked_fields: Vec<(String, String)>,
+    /// Scope unqualified table names resolved in.
+    pub scope: LineageScope,
+    /// OL lifecycle change the statement attempted on its output dataset(s).
+    pub output_lifecycle: Option<String>,
 }
 
 /// Test helper. Constructs a minimally-valid context for unit tests in this
@@ -122,6 +163,8 @@ impl QueryCompleteCtx {
             rows_returned: 0,
             plan: None,
             masked_fields: Vec::new(),
+            scope: LineageScope::default(),
+            output_lifecycle: None,
         }
     }
 }
@@ -145,6 +188,8 @@ impl QueryFailCtx {
             error_message: "boom".into(),
             plan: None,
             masked_fields: Vec::new(),
+            scope: LineageScope::default(),
+            output_lifecycle: None,
         }
     }
 }

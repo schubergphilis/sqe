@@ -1437,6 +1437,8 @@ impl QueryHandler {
                                 rows_returned: rows,
                                 plan: None,
                                 masked_fields: Vec::new(),
+                                scope: lineage_scope(&self.config, session),
+                                output_lifecycle: None,
                             });
                         }
                     }
@@ -1681,6 +1683,21 @@ impl QueryHandler {
                     // `catalog_ops.drop_table` below) only the first is
                     // acted on; a mixed Hive/Iceberg multi-name drop is not
                     // a new problem this branch introduces.
+                    // Lineage: the dropped table is the output dataset, with
+                    // the `lifecycleStateChange: DROP` facet. Recorded before
+                    // the drop so a failed DROP's FAIL event names it too.
+                    // `DROP TABLE IF EXISTS` of a missing table still emits
+                    // it: `drop_table` does not say whether anything existed.
+                    if let Statement::Drop { names, .. } = stmt.as_ref() {
+                        if let Some(name) = names.first() {
+                            captured_plan = Some(lineage_lifecycle_hint(
+                                &self.config,
+                                session,
+                                name,
+                                sqe_lineage::event::lifecycle::DROP,
+                            ));
+                        }
+                    }
                     let hive_drop = if let Statement::Drop {
                         names,
                         if_exists,
@@ -1852,6 +1869,15 @@ impl QueryHandler {
                 }
 
                 StatementKind::CreateTable(stmt) => {
+                    // Lineage: the new table, `lifecycleStateChange: CREATE`.
+                    if let Statement::CreateTable(ref ct) = **stmt {
+                        captured_plan = Some(lineage_lifecycle_hint(
+                            &self.config,
+                            session,
+                            &ct.name,
+                            sqe_lineage::event::lifecycle::CREATE,
+                        ));
+                    }
                     // The session-cache drop lives in
                     // `WriteHandler::after_commit` with every other write path
                     // (architecture review 507).
@@ -2948,6 +2974,8 @@ impl QueryHandler {
                                 .as_ref()
                                 .map(|s| s.masked_fields.clone())
                                 .unwrap_or_default(),
+                            scope: lineage_scope(&self.config, session),
+                            output_lifecycle: lineage_output_lifecycle(&kind),
                         });
                     }
                     Err(e) => {
@@ -2978,6 +3006,8 @@ impl QueryHandler {
                                 .as_ref()
                                 .map(|s| s.masked_fields.clone())
                                 .unwrap_or_default(),
+                            scope: lineage_scope(&self.config, session),
+                            output_lifecycle: lineage_output_lifecycle(&kind),
                         });
                     }
                 }
@@ -9244,6 +9274,87 @@ fn build_describe_input(param_types: &[Option<DataType>]) -> sqe_core::Result<Ve
     Ok(vec![batch])
 }
 
+/// The catalog and schema a session resolves unqualified and 2-part table
+/// names in, as `session_context` hands them to DataFusion
+/// (`with_default_catalog_and_schema`): the session's catalog
+/// (`X-Trino-Catalog`, `USE`) or the configured default, and the session's
+/// schema or `default`. Lineage names a scan of `customers` after it.
+fn lineage_scope(config: &SqeConfig, session: &Session) -> sqe_lineage::LineageScope {
+    sqe_lineage::LineageScope {
+        catalog: session
+            .default_catalog
+            .clone()
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| config.resolve_default_catalog()),
+        schema: session
+            .default_schema
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "default".to_string()),
+    }
+}
+
+/// `(catalog, schema, table)` of a DDL target, unqualified parts filled from
+/// [`lineage_scope`].
+fn lineage_table(
+    config: &SqeConfig,
+    session: &Session,
+    name: &sqlparser::ast::ObjectName,
+) -> (String, String, String) {
+    let scope = lineage_scope(config, session);
+    let table_ref = table_reference_of(name);
+    (
+        table_ref
+            .catalog()
+            .map(str::to_string)
+            .unwrap_or(scope.catalog),
+        table_ref
+            .schema()
+            .map(str::to_string)
+            .unwrap_or(scope.schema),
+        table_ref.table().to_string(),
+    )
+}
+
+/// Lineage hint for a DDL statement that changes a table's lifecycle without
+/// a source plan: the first table of `DROP TABLE` (the one `drop_table`
+/// acts on) and the target of a plain `CREATE TABLE`.
+fn lineage_lifecycle_hint(
+    config: &SqeConfig,
+    session: &Session,
+    name: &sqlparser::ast::ObjectName,
+    change: &str,
+) -> sqe_lineage::PlanOrHint {
+    let (catalog, schema, table) = lineage_table(config, session, name);
+    sqe_lineage::PlanOrHint::Hint(sqe_lineage::LineageHint::TableLifecycle {
+        catalog,
+        schema,
+        table,
+        change: change.to_string(),
+    })
+}
+
+/// OL lifecycle change a write statement makes to its output dataset, decided
+/// from the parsed statement: `CREATE` for a CTAS, `OVERWRITE` for
+/// `CREATE OR REPLACE ... AS` and `INSERT OVERWRITE`, `TRUNCATE` for
+/// `TRUNCATE TABLE`. Plain writes change no lifecycle.
+fn lineage_output_lifecycle(kind: &StatementKind) -> Option<String> {
+    use sqe_lineage::event::lifecycle;
+    let change = match kind {
+        StatementKind::Ctas(stmt) => match stmt.as_ref() {
+            Statement::CreateTable(ct) if ct.or_replace => lifecycle::OVERWRITE,
+            _ => lifecycle::CREATE,
+        },
+        StatementKind::Insert(stmt) => match stmt.as_ref() {
+            Statement::Insert(ins) if ins.overwrite => lifecycle::OVERWRITE,
+            _ => return None,
+        },
+        StatementKind::Truncate(_) => lifecycle::TRUNCATE,
+        _ => return None,
+    };
+    Some(change.to_string())
+}
+
 /// Decide whether a statement should produce OpenLineage events.
 ///
 /// - SELECT (`Query`): opt-in via `cfg.emit_selects` -- read-only queries
@@ -11433,6 +11544,95 @@ warehouse = "wh1"
             let err = ran.expect_err(&sql);
             assert_eq!(err.error_code(), SqeErrorCode::SyntaxError, "{sql}: {err}");
         }
+    }
+
+    // ── lineage scope / lifecycle ──────────────────────────────────────
+
+    fn lineage_config() -> SqeConfig {
+        toml::from_str("[coordinator]\n[auth]\n[catalog]\ncatalog_url = \"http://polaris\"\n")
+            .expect("minimal config parses")
+    }
+
+    #[test]
+    fn lineage_scope_follows_the_session_catalog_and_schema() {
+        let config = lineage_config();
+        let mut session = test_session(vec![]);
+        assert_eq!(
+            lineage_scope(&config, &session),
+            sqe_lineage::LineageScope {
+                catalog: "iceberg".into(),
+                schema: "default".into()
+            },
+            "no session scope: the configured default catalog, schema `default`"
+        );
+        session.default_catalog = Some("workspace1".into());
+        session.default_schema = Some("sales".into());
+        assert_eq!(
+            lineage_scope(&config, &session),
+            sqe_lineage::LineageScope {
+                catalog: "workspace1".into(),
+                schema: "sales".into()
+            }
+        );
+    }
+
+    #[test]
+    fn drop_hint_names_the_table_in_the_session_scope() {
+        let config = lineage_config();
+        let mut session = test_session(vec![]);
+        session.default_catalog = Some("workspace1".into());
+        for (sql, expected) in [
+            (
+                "DROP TABLE IF EXISTS lin_probe",
+                ("workspace1", "default", "lin_probe"),
+            ),
+            ("DROP TABLE s.t", ("workspace1", "s", "t")),
+            ("DROP TABLE ws2.s.t", ("ws2", "s", "t")),
+        ] {
+            let kind = sqe_sql::parse_and_classify(sql).expect("parse DROP");
+            let StatementKind::Drop(stmt) = kind else {
+                panic!("{sql} is not a DROP")
+            };
+            let Statement::Drop { names, .. } = stmt.as_ref() else {
+                panic!("{sql} is not a Statement::Drop")
+            };
+            let hint = lineage_lifecycle_hint(&config, &session, &names[0], "DROP");
+            let sqe_lineage::PlanOrHint::Hint(sqe_lineage::LineageHint::TableLifecycle {
+                catalog,
+                schema,
+                table,
+                change,
+            }) = hint
+            else {
+                panic!("expected a TableLifecycle hint")
+            };
+            assert_eq!(
+                (catalog.as_str(), schema.as_str(), table.as_str()),
+                expected,
+                "{sql}"
+            );
+            assert_eq!(change, "DROP");
+        }
+    }
+
+    #[test]
+    fn output_lifecycle_is_decided_from_the_statement() {
+        let of = |sql: &str| lineage_output_lifecycle(&sqe_sql::parse_and_classify(sql).unwrap());
+        assert_eq!(
+            of("CREATE TABLE t AS SELECT 1 AS a").as_deref(),
+            Some("CREATE")
+        );
+        assert_eq!(
+            of("CREATE OR REPLACE TABLE t AS SELECT 1 AS a").as_deref(),
+            Some("OVERWRITE")
+        );
+        assert_eq!(of("INSERT INTO t SELECT 1").as_deref(), None);
+        assert_eq!(
+            of("INSERT OVERWRITE t SELECT 1").as_deref(),
+            Some("OVERWRITE")
+        );
+        assert_eq!(of("TRUNCATE TABLE t").as_deref(), Some("TRUNCATE"));
+        assert_eq!(of("DELETE FROM t").as_deref(), None);
     }
 }
 
