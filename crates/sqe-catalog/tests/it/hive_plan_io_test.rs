@@ -192,9 +192,9 @@ async fn register(ctx: &SessionContext, root: &str) -> Arc<DataReadCounter> {
         inner: Arc::new(object_store::local::LocalFileSystem::new()),
         data_reads: AtomicUsize::new(0),
     });
-    // An unindexed Hive scan resolves its store from the session registry,
-    // not from the factory (the indexed path registers the factory's store
-    // there itself), so the counter has to be in both places.
+    // `ListingTable` resolves its store from the session registry. Hive
+    // registers the factory's store there, but the counter goes in directly
+    // as well, so it sees the reads whichever path put the store there.
     ctx.register_object_store(
         &url::Url::parse("file:///").expect("file url"),
         counter.clone(),
