@@ -584,13 +584,14 @@ fn try_classify_custom(parser: &mut Parser, sql: &str) -> sqe_core::Result<Optio
             Some(StatementKind::ShowCreateSchema(schema))
         }
         // EXPLAIN FULL <statement>: not standard SQL. The inner statement is
-        // carried as text and goes through the normal path later.
+        // carried as text, but classified here so only a query is explained.
         ["EXPLAIN", "FULL", ..] => {
             consume_words(parser, &["EXPLAIN", "FULL"]);
             let inner = remaining_text(parser, sql);
             if inner.is_empty() {
                 return Err(syntax_error("EXPLAIN FULL requires a statement"));
             }
+            require_explainable(&parse_and_classify(inner)?)?;
             Some(StatementKind::ExplainFull(inner.to_string()))
         }
         // SHOW STATS FOR <table>: sqlparser reads it as a variable.
@@ -989,6 +990,24 @@ fn refuse_hidden_write(stmt: &Statement) -> sqe_core::Result<()> {
     }
 }
 
+/// Refuse an EXPLAIN whose inner statement is not a query (#711, #811).
+/// Every EXPLAIN form plans the inner statement through `ctx.sql`, and
+/// ANALYZE / FULL then execute it. DataFusion runs DDL while planning and DML
+/// on collect, so an explained write would skip SQE's write gates. Refusing
+/// here, by kind, holds for every door and every EXPLAIN form alike.
+fn require_explainable(inner: &StatementKind) -> sqe_core::Result<()> {
+    if matches!(inner, StatementKind::Query(_)) {
+        return Ok(());
+    }
+    Err(sqe_core::SqeError::with_code(
+        sqe_core::SqeErrorCode::NotSupported,
+        format!(
+            "EXPLAIN only accepts a query; {} statements are not explained (run them directly)",
+            inner.name()
+        ),
+    ))
+}
+
 /// Classify a parsed statement. Custom SQE grammar never reaches this
 /// function; see [`try_classify_custom`].
 pub(crate) fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
@@ -1092,11 +1111,11 @@ pub(crate) fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
         Statement::Revoke { .. } => Ok(StatementKind::Revoke(Box::new(stmt))),
         Statement::Deny { .. } => Ok(StatementKind::Deny(Box::new(stmt))),
 
-        // EXPLAIN → Utility. A data statement under EXPLAIN is refused by the
-        // coordinator's `explain::require_query`; a query hiding a write is
-        // refused here, as it is unexplained.
-        Statement::Explain { .. } => {
-            refuse_hidden_write(&stmt)?;
+        // EXPLAIN → Utility. The inner statement is classified like any
+        // other, so a query hiding a write is refused by the Query arm and
+        // anything that is not a query by `require_explainable`.
+        Statement::Explain { ref statement, .. } => {
+            require_explainable(&classify((**statement).clone())?)?;
             Ok(StatementKind::Utility(Box::new(stmt)))
         }
         Statement::ExplainTable { .. } => Ok(StatementKind::Utility(Box::new(stmt))),
@@ -3300,13 +3319,48 @@ mod token_dispatch_tests {
         ] {
             parse_and_classify(sql).expect(sql);
         }
-        // A data statement is not a hidden write; EXPLAIN of one is the
-        // coordinator's `explain::require_query` to refuse.
+        // A data statement is not a hidden write.
         assert!(matches!(
             parse_and_classify("INSERT INTO t SELECT * FROM u").unwrap(),
             StatementKind::Insert(_)
         ));
-        parse_and_classify("EXPLAIN INSERT INTO t SELECT * FROM u").expect("utility");
+    }
+
+    /// Every EXPLAIN form classifies its inner statement and explains only a
+    /// query (#711, #811).
+    #[test]
+    fn explain_refuses_anything_but_a_query() {
+        for sql in [
+            "EXPLAIN SELECT 1",
+            "EXPLAIN ANALYZE WITH t AS (SELECT 1 AS n) SELECT n FROM t",
+            "EXPLAIN FULL SELECT 1",
+            "EXPLAIN FULL WITH t AS (SELECT 1 AS n) SELECT n FROM t",
+        ] {
+            parse_and_classify(sql).expect(sql);
+        }
+        for (sql, inner) in [
+            ("EXPLAIN INSERT INTO lake.sales.orders SELECT 1, 2.0, 'x'", "insert"),
+            ("EXPLAIN ANALYZE DELETE FROM lake.sales.orders WHERE id = 1", "delete"),
+            ("EXPLAIN DROP TABLE lake.sales.orders", "drop"),
+            ("EXPLAIN SHOW TABLES", "showtables"),
+            ("EXPLAIN FULL UPDATE t SET a = 1", "update"),
+            (
+                "EXPLAIN FULL CREATE EXTERNAL TABLE t (a INT) STORED AS PARQUET LOCATION 's3://b/p'",
+                "createexternaltable",
+            ),
+            ("EXPLAIN FULL SHOW TAGS ON ns.t", "showtags"),
+            ("EXPLAIN FULL EXPLAIN FULL SELECT 1", "explain_full"),
+        ] {
+            let err = parse_and_classify(sql).expect_err(sql);
+            assert_eq!(err.error_code(), SqeErrorCode::NotSupported, "{sql}");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "EXPLAIN only accepts a query; {inner} statements are not explained (run them directly)"
+                ),
+                "{sql}"
+            );
+        }
     }
 
     #[test]
