@@ -16,14 +16,17 @@ use sqe_catalog::hive::provider::HiveMetadataCache;
 use sqe_policy::plan_rewriter::HiveCatalogs;
 use sqe_policy::TagSource;
 
-/// Reads `sqe.column_tags` from a cached Hive manifest.
+/// Reads a cached Hive manifest's column tags through
+/// `HiveManifest::column_tags`: the sidecar `sqe.column_tags` block plus the
+/// `sqe.column-tags` table and column parameters a Glue catalog carries.
 ///
 /// `column_tags` is synchronous, so this can only answer from cache, never by
 /// fetching. The ordering it relies on: plan rewriting runs after LogicalPlan
 /// construction, which has already called `HiveSchemaProvider::table()` for
 /// every scanned table and populated the manifest cache. A cache miss is
 /// reported as unknown (`None`), never as no-tags: an entry that has not been
-/// loaded yet is not the same as a table confirmed to carry no tags.
+/// loaded yet is not the same as a table confirmed to carry no tags. A tag
+/// parameter that does not parse is unknown too.
 pub struct HiveTagSource {
     cache: Arc<HiveMetadataCache>,
 }
@@ -45,7 +48,18 @@ impl TagSource for HiveTagSource {
         // the database name regardless of how many parts the caller passed.
         let database = namespace.last()?;
         let manifest = self.cache.get(database, table)?;
-        Some(manifest.sqe.column_tags.clone().into_iter().collect())
+        match manifest.column_tags() {
+            Ok(tags) => Some(tags.into_iter().collect()),
+            Err(e) => {
+                tracing::warn!(
+                    database = %database,
+                    table = %table,
+                    error = %e,
+                    "hive tag_source: unreadable column tags, tag state UNKNOWN (fail closed)"
+                );
+                None
+            }
+        }
     }
 }
 

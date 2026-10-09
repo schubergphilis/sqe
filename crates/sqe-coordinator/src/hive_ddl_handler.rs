@@ -1179,7 +1179,7 @@ impl HiveDdlHandler {
     /// effect on the Iceberg read path.
     ///
     /// Column tags come straight from the manifest already in hand
-    /// (`manifest.sqe.column_tags`), not `HiveMetadataCache`/`HiveTagSource`:
+    /// (`manifest.column_tags()`), not `HiveMetadataCache`/`HiveTagSource`:
     /// that cache is populated as a side effect of `HiveSchemaProvider::table()`
     /// during planning, which neither `show_create_table` nor `list_tables`
     /// goes through (there is no LogicalPlan here), so it may not be warm.
@@ -1202,12 +1202,22 @@ impl HiveDdlHandler {
             return sqe_policy::ResolvedPolicy::default();
         };
         let namespace = self.policy_namespace(root, database, table);
-        let col_tags: HashMap<String, Vec<String>> = manifest
-            .sqe
-            .column_tags
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        // Unreadable tags deny, as the plan rewriter does for the same
+        // manifest: a listing must not show what a `SELECT` refuses.
+        let col_tags: HashMap<String, Vec<String>> = match manifest.column_tags() {
+            Ok(tags) => tags.into_iter().collect(),
+            Err(e) => {
+                tracing::warn!(
+                    database = %database,
+                    table = %table,
+                    error = %e,
+                    "hive_external: unreadable column tags, tag state UNKNOWN (fail closed)"
+                );
+                let mut deny = sqe_policy::ResolvedPolicy::default();
+                deny.row_filters.push(datafusion::logical_expr::lit(false));
+                return deny;
+            }
+        };
         resolve_effective_policy(
             store,
             user,
