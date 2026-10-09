@@ -37,6 +37,9 @@ data:
     # (~70-75%) so spill triggers before the cgroup OOM. DEP-01 gives /tmp the
     # writable volume the spill needs.
     memory_limit = {{ .Values.config.coordinator.memory_limit | quote }}
+    {{- with .Values.config.coordinator.process_headroom }}
+    process_headroom = {{ . | quote }}
+    {{- end }}
     spill_to_disk = {{ .Values.config.coordinator.spill_to_disk }}
     spill_dir = {{ .Values.config.coordinator.spill_dir | quote }}
     {{- if .Values.worker.enabled }}
