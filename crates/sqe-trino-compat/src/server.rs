@@ -673,6 +673,21 @@ pub trait TrinoQueryExecutor: Send + Sync + 'static {
         sql: &str,
     ) -> Result<TrinoResultStream, sqe_core::SqeError>;
 
+    /// [`Self::execute`] for the statement the client knows as `query_id`
+    /// (the protocol `id` this server minted). An engine that tracks
+    /// statements should record them under this id so its query history,
+    /// audit and lineage runs match what the client saw. The default ignores
+    /// the id (test mocks).
+    async fn execute_with_query_id(
+        &self,
+        session: &Session,
+        sql: &str,
+        query_id: &str,
+    ) -> Result<TrinoResultStream, sqe_core::SqeError> {
+        let _ = query_id;
+        self.execute(session, sql).await
+    }
+
     /// Memory pool the buffered result page is charged to, so Trino-path
     /// memory is visible to the same limit as every other consumer. `None`
     /// (the default) disables accounting; the coordinator returns its
@@ -2205,6 +2220,7 @@ async fn run_statement<Q: TrinoQueryExecutor>(
     session: &Session,
     plan: &ExecPlan,
     show_session_props: &[(String, String)],
+    query_id: &str,
 ) -> Result<TrinoResultStream, sqe_core::SqeError> {
     match plan {
         ExecPlan::Immediate => Ok(TrinoResultStream::from_batches(vec![])),
@@ -2215,7 +2231,7 @@ async fn run_statement<Q: TrinoQueryExecutor>(
         ExecPlan::ShowSession { like } => Ok(TrinoResultStream::from_batches(
             build_show_session_batches(show_session_props, like.as_deref()),
         )),
-        ExecPlan::Sql(sql) => handler.execute(session, sql).await,
+        ExecPlan::Sql(sql) => handler.execute_with_query_id(session, sql, query_id).await,
     }
 }
 
@@ -2520,6 +2536,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                     &task_session,
                     &task_plan,
                     &task_props,
+                    &task_query_id,
                 )
                 .await;
                 let cursor = match result {
@@ -3294,6 +3311,8 @@ mod tests {
     /// assert what the prepared-statement rewrite produced.
     struct RecordingQuery {
         seen: Arc<Mutex<Vec<String>>>,
+        /// The query ids the server handed `execute_with_query_id`.
+        ids: Arc<Mutex<Vec<String>>>,
     }
     #[async_trait::async_trait]
     impl TrinoQueryExecutor for RecordingQuery {
@@ -3305,6 +3324,16 @@ mod tests {
             self.seen.lock().push(sql.to_string());
             Ok(TrinoResultStream::from_batches(vec![]))
         }
+
+        async fn execute_with_query_id(
+            &self,
+            session: &Session,
+            sql: &str,
+            query_id: &str,
+        ) -> Result<TrinoResultStream, sqe_core::SqeError> {
+            self.ids.lock().push(query_id.to_string());
+            self.execute(session, sql).await
+        }
     }
 
     fn recording_state(
@@ -3312,7 +3341,10 @@ mod tests {
     ) -> Arc<TrinoState<MockAuthOk, RecordingQuery>> {
         Arc::new(TrinoState::<MockAuthOk, RecordingQuery> {
             authenticator: Arc::new(MockAuthOk),
-            query_handler: Arc::new(RecordingQuery { seen }),
+            query_handler: Arc::new(RecordingQuery {
+                seen,
+                ids: Arc::new(Mutex::new(Vec::new())),
+            }),
             queries: build_query_registry(build_expired_ids()),
             expired: build_expired_ids(),
             node: NodeContext {
@@ -3939,6 +3971,35 @@ mod tests {
         };
         let session = apply_trino_headers(session, &trino_headers);
         assert_eq!(session.compression_codec.as_deref(), Some("SNAPPY"));
+    }
+
+    /// The executor runs the statement under the query id the client was
+    /// given, so the engine's tracker, audit and lineage run id match it.
+    #[tokio::test]
+    async fn executor_receives_the_protocol_query_id() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let state = recording_state(seen.clone());
+
+        let resp = submit_query::<MockAuthOk, RecordingQuery>(
+            State(state.clone()),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            "SELECT 1".to_string(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tr: TrinoResponse = serde_json::from_slice(&body).unwrap();
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while state.query_handler.ids.lock().is_empty() && Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(*state.query_handler.ids.lock(), vec![tr.id.clone()]);
+        assert!(uuid::Uuid::parse_str(&tr.id).is_ok(), "the id is a UUID");
     }
 
     #[tokio::test]
