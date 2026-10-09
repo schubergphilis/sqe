@@ -231,6 +231,7 @@ mod tests {
             grantor: None,
             with_grant_option: false,
             object: Default::default(),
+            grantor_is_admin: false,
         };
         let req = to_grant_request(&stmt);
         assert_eq!(req.privilege, "SELECT");
