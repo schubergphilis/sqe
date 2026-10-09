@@ -907,6 +907,7 @@ async fn injected_projection_is_null_without_a_predicate_and_pins_with_one() {
             name: "tenant".into(),
             r#type: "string".into(),
             comment: None,
+            parameters: Default::default(),
         }];
         m.parameters
             .insert("projection.enabled".into(), "true".into());

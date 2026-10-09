@@ -815,6 +815,7 @@ mod tests {
             name: name.to_string(),
             r#type: "string".to_string(),
             comment: None,
+            parameters: Default::default(),
         }
     }
 

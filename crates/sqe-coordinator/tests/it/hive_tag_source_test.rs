@@ -547,3 +547,152 @@ impl PolicyStore for ResourceMaskStore {
         (HashMap::new(), vec![], HashSet::new())
     }
 }
+
+// ─── #702: tags carried in Glue table and column parameters ─────────────────
+//
+// A Glue root maps `GetTable` onto a `HiveManifest` with an empty `sqe`
+// block. Before #702 the tag source read only that block, so every Glue
+// table reported "no tags" and a column tagged in Glue was never masked.
+
+/// A Glue-shaped manifest: no `sqe.column_tags`, the tag on `ssn` lives in
+/// the column's own `parameters`, as `GetTable` returns it.
+fn glue_manifest_with_column_tag(tags_json: &str) -> HiveManifest {
+    let mut manifest = manifest_for("sales", "orders");
+    manifest
+        .storage_descriptor
+        .columns
+        .push(sqe_catalog::hive::manifest::GlueColumn {
+            name: "ssn".to_string(),
+            r#type: "string".to_string(),
+            comment: None,
+            parameters: [("sqe.column-tags".to_string(), tags_json.to_string())]
+                .into_iter()
+                .collect(),
+        });
+    manifest
+}
+
+fn routed_over(manifest: HiveManifest) -> Arc<dyn TagSource> {
+    let cache = Arc::new(HiveMetadataCache::new());
+    cache.insert("sales", "orders", manifest);
+    let hive_catalogs = Arc::new(HiveCatalogs::new());
+    hive_catalogs.insert("lake");
+    Arc::new(
+        sqe_coordinator::hive_tag_source::CatalogRoutedTagSource::new(
+            hive_catalogs,
+            Arc::new(sqe_coordinator::hive_tag_source::HiveTagSource::new(cache)),
+            Arc::new(AlwaysUnknown),
+        ),
+    )
+}
+
+/// Rewrite `SELECT order_id, ssn FROM lake.sales.orders` under a store that
+/// nullifies the `PII` tag, execute it, and return the batches.
+async fn select_under_pii_mask(tags: Arc<dyn TagSource>) -> Vec<RecordBatch> {
+    let mem = Arc::new(MemTable::try_new(orders_schema(), vec![vec![orders_batch()]]).unwrap());
+    let tref = datafusion::common::TableReference::full("lake", "sales", "orders");
+    let plan = LogicalPlanBuilder::scan(tref.clone(), provider_as_source(mem.clone()), None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let store = OneTagMaskStore {
+        tag: "PII".to_string(),
+        mask: Frozen::new(MaskType::Nullify),
+        tag_filters: Frozen::new(vec![]),
+    };
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store)).with_tag_source(tags);
+    let (rewritten, _summary) = rewriter
+        .evaluate(&test_user(), &sqe_policy::TableScope::default(), plan)
+        .await
+        .unwrap();
+
+    let ctx = SessionContext::new();
+    let catalog = Arc::new(MemoryCatalogProvider::new());
+    catalog
+        .register_schema("sales", Arc::new(MemorySchemaProvider::new()))
+        .unwrap();
+    ctx.register_catalog("lake", catalog);
+    ctx.register_table(tref, mem).unwrap();
+    ctx.execute_logical_plan(rewritten)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap()
+}
+
+#[test]
+fn a_glue_column_parameter_tag_is_returned() {
+    let got = routed_over(glue_manifest_with_column_tag(r#"["PII"]"#))
+        .column_tags(Some("lake"), &["sales".to_string()], "orders")
+        .expect("known");
+    assert_eq!(got.get("ssn"), Some(&vec!["PII".to_string()]));
+}
+
+#[test]
+fn a_table_parameter_tag_map_is_returned() {
+    // Glue `Table.Parameters` is the analogue of an Iceberg table property,
+    // so the Iceberg key and shape are honoured there too.
+    let mut manifest = manifest_for("sales", "orders");
+    manifest.parameters.insert(
+        "sqe.column-tags".to_string(),
+        r#"{"ssn":["PII"]}"#.to_string(),
+    );
+    let got = routed_over(manifest)
+        .column_tags(Some("lake"), &["sales".to_string()], "orders")
+        .expect("known");
+    assert_eq!(
+        got.get("ssn"),
+        Some(&vec!["PII".to_string()]),
+        "an empty map here is the #702 bypass: the tag exists and was ignored"
+    );
+}
+
+#[test]
+fn an_unparseable_table_parameter_tag_map_is_unknown_not_untagged() {
+    let mut manifest = manifest_for("sales", "orders");
+    manifest
+        .parameters
+        .insert("sqe.column-tags".to_string(), "not json{{".to_string());
+    assert_eq!(
+        routed_over(manifest).column_tags(Some("lake"), &["sales".to_string()], "orders"),
+        None,
+        "malformed tags are unknown tag state; Some(empty) would unmask"
+    );
+}
+
+#[test]
+fn an_unparseable_glue_column_tag_is_unknown_not_untagged() {
+    assert_eq!(
+        routed_over(glue_manifest_with_column_tag("PII,GDPR")).column_tags(
+            Some("lake"),
+            &["sales".to_string()],
+            "orders"
+        ),
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_glue_column_tag_masks_the_column_in_an_executed_plan() {
+    let batches =
+        select_under_pii_mask(routed_over(glue_manifest_with_column_tag(r#"["PII"]"#))).await;
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 3, "a mask must not drop rows");
+    let ssn = batches[0].column_by_name("ssn").expect("ssn projected");
+    assert_eq!(
+        ssn.null_count(),
+        ssn.len(),
+        "the PII tag came from a Glue column parameter, so ssn must be nullified"
+    );
+}
+
+#[tokio::test]
+async fn an_unparseable_glue_column_tag_denies_every_row() {
+    let batches = select_under_pii_mask(routed_over(glue_manifest_with_column_tag("PII"))).await;
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        rows, 0,
+        "unknown tag state must fail closed; 3 rows means ssn was read as untagged"
+    );
+}
