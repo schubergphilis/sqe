@@ -25,8 +25,9 @@
 //!
 //! The parse dialect is `GenericDialect`, the one every rewriter in this
 //! crate is written against; the DataFusion session is separately configured
-//! for its DuckDB dialect and re-parses the serialized text, exactly as
-//! before.
+//! for [`EXECUTION_DIALECT`] and re-parses the serialized text. Text the two
+//! dialects tokenize differently is refused in step 1 (#683): a nested block
+//! comment was one SELECT to the classifier and an INSERT to the planner.
 //!
 //! Callers that need the SQE clauses sqlparser cannot see (`FOR VERSION AS
 //! OF`, `FOR INCREMENTAL BETWEEN`, `PARTITIONED BY (...)`) must run
@@ -40,6 +41,11 @@ use sqlparser::parser::Parser;
 use crate::classifier::{classify_single, dispatch, Dispatch, StatementKind};
 use crate::metadata::{self, UpdateType};
 use crate::token_scan::parse_error;
+
+/// The `datafusion.sql_parser.dialect` every engine session plans under, and
+/// the dialect the front door checks the text against before classifying it.
+/// One constant so the check and the session cannot name different dialects.
+pub const EXECUTION_DIALECT: &str = "DuckDB";
 
 /// The protocol a statement arrived on.
 ///
@@ -524,6 +530,25 @@ mod tests {
             ("SELECT 1; DROP TABLE t", "SyntaxError"),
             ("EXPLAIN SELECT 1; DROP TABLE t", "SyntaxError"),
             ("EXPLAIN FULL SELECT 1; DROP TABLE t", "SyntaxError"),
+            // #683: one SELECT to GenericDialect, a write or two statements
+            // to the DuckDB dialect DataFusion plans under.
+            (
+                "/* /* */ INSERT INTO t SELECT * FROM t; -- */ SELECT * FROM t",
+                "SyntaxError",
+            ),
+            (
+                "/* /* */ DELETE FROM t; -- */ SELECT * FROM t",
+                "SyntaxError",
+            ),
+            (
+                "/* /* */ COPY (SELECT * FROM t) TO 'out.parquet'; -- */ SELECT * FROM t",
+                "SyntaxError",
+            ),
+            (
+                "SELECT q'[', 1 FROM t; DROP TABLE t; -- ]' FROM t",
+                "SyntaxError",
+            ),
+            ("SELECT * FROM t /* closed */", "query"),
         ];
         let mut gaps = Vec::new();
         for (sql, want) in cases {
