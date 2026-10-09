@@ -110,7 +110,7 @@ impl WorkerStatus {
     pub fn acknowledge_failures(&self, reported: u32) {
         let _ = self
             .failures_since_last
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 Some(cur.saturating_sub(reported))
             });
     }
@@ -153,12 +153,12 @@ pub struct InflightScanGuard {
 
 impl Drop for InflightScanGuard {
     fn drop(&mut self) {
-        let _ =
-            self.status
-                .inflight_scans
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                    Some(cur.saturating_sub(1))
-                });
+        let _ = self
+            .status
+            .inflight_scans
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                Some(cur.saturating_sub(1))
+            });
     }
 }
 
