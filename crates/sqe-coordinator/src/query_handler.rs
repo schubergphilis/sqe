@@ -6457,6 +6457,7 @@ impl QueryHandler {
             grantor: None,
             with_grant_option,
             object,
+            grantor_is_admin: false,
         })
     }
 
@@ -6475,6 +6476,13 @@ impl QueryHandler {
         let backend = self.require_grant_backend()?;
         self.require_grant_authority(session, "GRANT", backend)?;
         let mut grant_stmt = Self::extract_grant_statement(stmt)?;
+        // WITH GRANT OPTION confers ownership, and only an admin confers it
+        // (#817). Under `ranger-delegate` the gate above stood down, and Ranger
+        // lets any holder of delegateAdmin grant it again, so without this a
+        // delegate could pass ownership on, and its grantee after it, by chaining.
+        if grant_stmt.with_grant_option {
+            self.require_admin(session, "GRANT ... WITH GRANT OPTION")?;
+        }
         // Always act as the authenticated caller, never as SQE's service
         // identity. Ranger authorizes the grant against this name, so a caller
         // can only grant what it holds delegate authority over, and the Ranger
@@ -6483,6 +6491,7 @@ impl QueryHandler {
         // this is resource-scoped, and the Polaris backend still swaps in a
         // service token (issue #204) so it has no equivalent check of its own.
         grant_stmt.grantor = Some(session.user.username.clone());
+        grant_stmt.grantor_is_admin = self.config.auth.has_admin_role(&session.user.roles);
         backend
             .grant(session.access_token().expose(), &grant_stmt)
             .await?;
