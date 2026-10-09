@@ -99,7 +99,16 @@ pub struct GlueColumn {
     pub r#type: String,
     #[serde(default)]
     pub comment: Option<String>,
+    /// Glue's `Column.Parameters`. Carries a column's `sqe.column-tags`
+    /// entry (see [`HiveManifest::column_tags`]); a Glue mapping that dropped
+    /// this map would report a tagged column as untagged.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub parameters: BTreeMap<String, String>,
 }
+
+/// Table and column parameter key holding column tags, the same key the
+/// Iceberg path reads from table properties.
+pub const COLUMN_TAGS_KEY: &str = "sqe.column-tags";
 
 /// Mirrors Glue's `SerDeInfo`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -275,6 +284,7 @@ fn glue_column_of(c: &sqe_sql::hive_ddl::HiveColumn) -> GlueColumn {
         name: c.name.clone(),
         r#type: c.sql_type.clone(),
         comment: c.comment.clone(),
+        parameters: BTreeMap::new(),
     }
 }
 
@@ -454,6 +464,59 @@ impl HiveManifest {
             .get("sqe.secret")
             .map(String::as_str)
             .or(self.sqe.secret.as_deref())
+    }
+
+    /// Every column's tags, the union of three places a tag can live:
+    ///
+    /// - `sqe.column_tags`, written by `ALTER TABLE ... SET TAGS` on a
+    ///   sidecar root;
+    /// - `parameters["sqe.column-tags"]`, a JSON object `{"col": ["TAG"]}`,
+    ///   the shape the Iceberg path reads from table properties;
+    /// - each storage column's and partition key's own
+    ///   `parameters["sqe.column-tags"]`, a JSON array `["TAG", ...]`, which
+    ///   is where a Glue catalog carries them.
+    ///
+    /// A union, never a precedence: a tag can only add a mask. An absent key
+    /// is known-untagged. A value that does not parse is `Err`, meaning the
+    /// tag state is unknown: callers must deny rather than read the table as
+    /// untagged, or a malformed entry would unmask the column it tags.
+    pub fn column_tags(&self) -> Result<BTreeMap<String, Vec<String>>, HiveError> {
+        let mut tags = self.sqe.column_tags.clone();
+        let mut add = |column: &str, labels: Vec<String>| {
+            let entry = tags.entry(column.to_string()).or_default();
+            for label in labels {
+                if !entry.contains(&label) {
+                    entry.push(label);
+                }
+            }
+        };
+        if let Some(raw) = self.parameters.get(COLUMN_TAGS_KEY) {
+            let map: BTreeMap<String, Vec<String>> = serde_json::from_str(raw).map_err(|e| {
+                HiveError::Validation(format!(
+                    "table parameter `{COLUMN_TAGS_KEY}` is not a JSON object of tag arrays: {e}"
+                ))
+            })?;
+            for (column, labels) in map {
+                add(&column, labels);
+            }
+        }
+        for column in self
+            .storage_descriptor
+            .columns
+            .iter()
+            .chain(&self.partition_keys)
+        {
+            if let Some(raw) = column.parameters.get(COLUMN_TAGS_KEY) {
+                let labels: Vec<String> = serde_json::from_str(raw).map_err(|e| {
+                    HiveError::Validation(format!(
+                        "column `{}` parameter `{COLUMN_TAGS_KEY}` is not a JSON array of tags: {e}",
+                        column.name
+                    ))
+                })?;
+                add(&column.name, labels);
+            }
+        }
+        Ok(tags)
     }
 
     /// Persisted `ANALYZE TABLE` counts, if any.
