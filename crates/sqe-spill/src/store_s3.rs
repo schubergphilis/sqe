@@ -269,12 +269,12 @@ impl S3SegmentStore {
             });
         }
         let max_bytes = self.max_bytes;
-        if let Err(used) =
-            self.used_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                    let next = used.checked_add(need)?;
-                    (next <= max_bytes).then_some(next)
-                })
+        if let Err(used) = self
+            .used_bytes
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                let next = used.checked_add(need)?;
+                (next <= max_bytes).then_some(next)
+            })
         {
             return Err(BudgetError::SpillQuotaExceeded {
                 scope: "s3".into(),
@@ -286,7 +286,7 @@ impl S3SegmentStore {
         let max_objects = self.max_objects;
         if let Err(objs) =
             self.used_objects
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |objs| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |objs| {
                     let next = objs.checked_add(1)?;
                     (next <= max_objects).then_some(next)
                 })
@@ -354,7 +354,7 @@ impl QuotaHold {
         if actual_bytes > self.reserved_bytes {
             let extra = actual_bytes - self.reserved_bytes;
             self.used_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                     used.checked_add(extra)
                         .filter(|next| *next <= self.max_bytes)
                 })
@@ -384,7 +384,7 @@ impl Drop for QuotaHold {
             self.used_bytes
                 .fetch_sub(self.reserved_bytes, Ordering::AcqRel);
             self.used_objects
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |c| {
                     Some(c.saturating_sub(1))
                 })
                 .ok();
@@ -590,7 +590,7 @@ impl SegmentStore for S3SegmentStore {
             } else {
                 self.used_bytes.fetch_sub(size, Ordering::Relaxed);
                 self.used_objects
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
                         Some(c.saturating_sub(1))
                     })
                     .ok();

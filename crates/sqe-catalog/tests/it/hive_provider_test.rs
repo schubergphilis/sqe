@@ -1356,7 +1356,7 @@ mod counting {
         }
         fn take_failure(&self) -> bool {
             self.fail_next_lists
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
         }
     }

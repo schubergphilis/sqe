@@ -411,7 +411,7 @@ impl LocalQuotaHold {
         if actual > self.reserved {
             let extra = actual - self.reserved;
             self.used_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                     used.checked_add(extra)
                         .filter(|next| *next <= self.max_bytes)
                 })
