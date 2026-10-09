@@ -1,5 +1,5 @@
 use std::io::IsTerminal;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -1563,9 +1563,20 @@ async fn async_main() -> anyhow::Result<()> {
 }
 
 // ── Coordinator ────────────────────────────────────────────────
-async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
+async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
     let started_at = Instant::now();
     let ready = Arc::new(AtomicBool::new(false));
+
+    // Resolve `memory_limit = "auto"` to bytes and fail closed over the
+    // cgroup limit before any pool, admission gate or write path reads it.
+    let memory_need =
+        sqe_coordinator::runtime::resolve_coordinator_memory(&mut config.coordinator)?;
+    // Detached on purpose, like the worker's: the watch only logs, and lives
+    // as long as the runtime.
+    let _runtime_memory_task = sqe_core::spawn_runtime_memory_watch(
+        Arc::new(AtomicU64::new(memory_need)),
+        sqe_core::DEFAULT_RUNTIME_MEMORY_WATCH_INTERVAL,
+    );
 
     // Single source of truth for the distributed worker path. Computed once so
     // the registry wiring, health checks, credential refresh, the health-server

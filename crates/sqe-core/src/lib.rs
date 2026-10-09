@@ -13,10 +13,11 @@ pub mod ticket_signing;
 pub mod tls;
 
 pub use process_memory::{
-    enforced_memory_limit_bytes, enforced_memory_limit_source, process_rss_bytes,
-    runtime_memory_info, spawn_runtime_memory_watch, CgroupMemoryInfo, CgroupVersion,
-    ContainerKind, EnforcedLimitPressure, HostMemoryInfo, OsKind, RuntimeMemoryChange,
-    RuntimeMemoryInfo, DEFAULT_RUNTIME_MEMORY_WATCH_INTERVAL,
+    check_process_headroom, enforced_memory_limit_bytes, enforced_memory_limit_source,
+    is_auto_memory_limit, process_rss_bytes, resolve_memory_limit, runtime_memory_info,
+    spawn_runtime_memory_watch, CgroupMemoryInfo, CgroupVersion, ContainerKind,
+    EnforcedLimitPressure, HostMemoryInfo, OsKind, RuntimeMemoryChange, RuntimeMemoryInfo,
+    DEFAULT_RUNTIME_MEMORY_WATCH_INTERVAL,
 };
 
 pub use config::{
