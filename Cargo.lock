@@ -7306,6 +7306,7 @@ dependencies = [
  "futures",
  "iceberg",
  "parquet",
+ "proptest",
  "serde_json",
  "sqe-catalog",
  "sqe-compaction",
