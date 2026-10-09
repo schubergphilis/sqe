@@ -315,7 +315,7 @@ dbt-extractor==0.6.0 \
     # via
     #   -c /private/tmp/claude-502/-Users-jjverhoeks-git-schuberg-vpf-data-ai-chameleon-Applications-sqlengine/6065c382-f105-4519-b13e-33b965a2ca20/scratchpad/dbtvenv/../constraints.txt
     #   dbt-core
-dbt-protos==1.0.565 \
+dbt-protos==1.0.594 \
     --hash=sha256:130a8333fcd644ba1f00c8377e8f8013b28cca696a6af56037feb55a011f964c \
     --hash=sha256:fabee73a6f98a7eb7e52ab34571ef24d82cce760829e268c7263a5805f3937cf
     # via
