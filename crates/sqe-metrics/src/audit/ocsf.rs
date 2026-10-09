@@ -244,4 +244,58 @@ mod tests {
         assert_eq!(v["class_uid"], 6005);
         assert_eq!(v["status_id"], 2);
     }
+
+    proptest::proptest! {
+        /// Caller-controlled text (user name, groups, client label, query text,
+        /// error message) lands verbatim in its field, through a serialize /
+        /// parse round trip, and an absent value is an absent key, never null.
+        #[test]
+        fn caller_text_is_carried_verbatim(
+            username in "\\PC{0,16}",
+            subject in proptest::option::of("\\PC{0,8}"),
+            groups in proptest::collection::vec("\\PC{0,8}", 0..3),
+            app_name in proptest::option::of("\\PC{0,16}"),
+            text in proptest::option::of("\\PC{0,32}"),
+            message in proptest::option::of(proptest::option::of("\\PC{0,16}")),
+            kind in proptest::sample::select(vec![
+                AuditKind::Query, AuditKind::Auth, AuditKind::Session, AuditKind::Grant,
+                AuditKind::AdminDdl, AuditKind::PolicyDecision, AuditKind::Maintenance,
+                AuditKind::Scan, AuditKind::AuditResume,
+            ]),
+        ) {
+            use proptest::prop_assert_eq;
+            let mut ev = query_event();
+            ev.kind = kind.clone();
+            ev.actor.username = username.clone();
+            ev.actor.subject = subject.clone();
+            ev.actor.groups = groups.clone();
+            ev.actor.app_name = app_name.clone();
+            ev.query.as_mut().unwrap().text = text.clone();
+            ev.outcome = match &message {
+                None => Outcome::Success,
+                Some(m) => Outcome::Failure {
+                    error_type: None,
+                    error_code: None,
+                    message: m.clone(),
+                },
+            };
+
+            let wire = serde_json::to_string(&to_ocsf(&ev)).unwrap();
+            let v: Value = serde_json::from_str(&wire).unwrap();
+
+            prop_assert_eq!(&v["class_uid"], &json!(class_for(&kind).0));
+            prop_assert_eq!(&v["status_id"], &json!(if message.is_some() { 2 } else { 1 }));
+            let user = &v["actor"]["user"];
+            prop_assert_eq!(&user["name"], &json!(username));
+            prop_assert_eq!(user.get("uid").cloned(), subject.map(Value::from));
+            let got_groups: Vec<_> = user
+                .get("groups")
+                .map(|g| g.as_array().unwrap().iter().map(|g| g["name"].clone()).collect())
+                .unwrap_or_default();
+            prop_assert_eq!(got_groups, groups.into_iter().map(Value::from).collect::<Vec<_>>());
+            prop_assert_eq!(v["actor"].get("app_name").cloned(), app_name.map(Value::from));
+            prop_assert_eq!(v["unmapped"].get("query_text").cloned(), text.map(Value::from));
+            prop_assert_eq!(v.get("message").cloned(), message.flatten().map(Value::from));
+        }
+    }
 }

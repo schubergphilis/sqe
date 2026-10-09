@@ -170,4 +170,223 @@ mod tests {
         );
         assert_eq!(arrow_to_trino_type(&DataType::Null), "unknown");
     }
+
+    /// Every scalar (non-nested) Arrow type SQE can put in a result.
+    fn scalar_type() -> impl proptest::strategy::Strategy<Value = DataType> {
+        use arrow_schema::{IntervalUnit, TimeUnit};
+        use proptest::prelude::*;
+        let unit = prop_oneof![
+            Just(TimeUnit::Second),
+            Just(TimeUnit::Millisecond),
+            Just(TimeUnit::Microsecond),
+            Just(TimeUnit::Nanosecond),
+        ];
+        prop_oneof![
+            proptest::sample::select(vec![
+                DataType::Boolean,
+                DataType::Int8,
+                DataType::UInt8,
+                DataType::Int16,
+                DataType::UInt16,
+                DataType::Int32,
+                DataType::UInt32,
+                DataType::Int64,
+                DataType::UInt64,
+                DataType::Float16,
+                DataType::Float32,
+                DataType::Float64,
+                DataType::Utf8,
+                DataType::LargeUtf8,
+                DataType::Utf8View,
+                DataType::Binary,
+                DataType::LargeBinary,
+                DataType::BinaryView,
+                DataType::FixedSizeBinary(16),
+                DataType::Date32,
+                DataType::Date64,
+                DataType::Time32(TimeUnit::Millisecond),
+                DataType::Time64(TimeUnit::Microsecond),
+                DataType::Duration(TimeUnit::Microsecond),
+                DataType::Interval(IntervalUnit::YearMonth),
+                DataType::Interval(IntervalUnit::DayTime),
+                DataType::Interval(IntervalUnit::MonthDayNano),
+            ]),
+            (1u8..=38)
+                .prop_flat_map(|p| (Just(p), -10i8..=p as i8))
+                .prop_map(|(p, s)| DataType::Decimal128(p, s)),
+            (39u8..=76, 0i8..=38).prop_map(|(p, s)| DataType::Decimal256(p, s)),
+            (unit, proptest::option::of(Just("UTC")))
+                .prop_map(|(u, tz)| DataType::Timestamp(u, tz.map(Into::into))),
+        ]
+    }
+
+    proptest::proptest! {
+        /// The client side (`parse_trino_type`, which the CLI and MCP decoders
+        /// use) understands every scalar type name the server emits, so no
+        /// scalar column decodes as an opaque string.
+        #[test]
+        fn scalar_type_names_parse_back(dt in scalar_type()) {
+            use sqe_trino_protocol::types::{parse_trino_type, TrinoType};
+            let name = arrow_to_trino_type(&dt);
+            let parsed = parse_trino_type(&name);
+            proptest::prop_assert!(
+                !matches!(parsed, TrinoType::Other(_)),
+                "{dt:?} -> {name:?} parses as {parsed:?}"
+            );
+            match dt {
+                DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => {
+                    proptest::prop_assert_eq!(
+                        parsed,
+                        TrinoType::Decimal { precision: p, scale: s }
+                    );
+                }
+                DataType::Timestamp(_, tz) => {
+                    proptest::prop_assert_eq!(
+                        parsed,
+                        TrinoType::Timestamp { precision: 6, with_time_zone: tz.is_some() }
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        /// The JDBC driver's ClientTypeSignature rejects a parameterized
+        /// `rawType` (#345): parameters belong in `arguments`.
+        #[test]
+        fn scalar_type_signatures_keep_parameters_out_of_raw_type(dt in scalar_type()) {
+            let name = arrow_to_trino_type(&dt);
+            let sig = sqe_trino_protocol::types::type_signature_for(&name);
+            proptest::prop_assert!(!sig.raw_type.contains('('), "{name:?} -> {:?}", sig.raw_type);
+            if let DataType::Decimal128(p, s) | DataType::Decimal256(p, s) = dt {
+                let args: Vec<_> = sig.arguments.iter().map(|a| a.value.clone()).collect();
+                proptest::prop_assert_eq!(
+                    args,
+                    vec![serde_json::json!(p), serde_json::json!(s)]
+                );
+            }
+        }
+    }
+
+    /// Nested types of any depth: a client parses the type string the
+    /// coordinator reports, so every one must be a Trino type, never the
+    /// `Debug` fallback, and a container must name exactly its children.
+    mod nested {
+        use std::sync::Arc;
+
+        use arrow_schema::{Field, Fields, IntervalUnit, TimeUnit};
+        use proptest::prelude::*;
+
+        use super::*;
+
+        fn leaf() -> impl Strategy<Value = DataType> {
+            prop_oneof![
+                Just(DataType::Null),
+                Just(DataType::Boolean),
+                Just(DataType::Int8),
+                Just(DataType::UInt8),
+                Just(DataType::Int16),
+                Just(DataType::UInt16),
+                Just(DataType::Int32),
+                Just(DataType::UInt32),
+                Just(DataType::Int64),
+                Just(DataType::UInt64),
+                Just(DataType::Float16),
+                Just(DataType::Float32),
+                Just(DataType::Float64),
+                Just(DataType::Utf8),
+                Just(DataType::LargeUtf8),
+                Just(DataType::Utf8View),
+                Just(DataType::Binary),
+                Just(DataType::LargeBinary),
+                Just(DataType::BinaryView),
+                (1i32..64).prop_map(DataType::FixedSizeBinary),
+                Just(DataType::Date32),
+                Just(DataType::Date64),
+                Just(DataType::Time32(TimeUnit::Millisecond)),
+                Just(DataType::Time64(TimeUnit::Microsecond)),
+                Just(DataType::Timestamp(TimeUnit::Microsecond, None)),
+                Just(DataType::Timestamp(
+                    TimeUnit::Nanosecond,
+                    Some("UTC".into())
+                )),
+                Just(DataType::Duration(TimeUnit::Microsecond)),
+                Just(DataType::Interval(IntervalUnit::YearMonth)),
+                Just(DataType::Interval(IntervalUnit::MonthDayNano)),
+                (1u8..=38, 0i8..=10).prop_map(|(p, s)| DataType::Decimal128(p, s)),
+                (1u8..=76, 0i8..=10).prop_map(|(p, s)| DataType::Decimal256(p, s)),
+            ]
+        }
+
+        fn map_of(k: DataType, v: DataType) -> DataType {
+            let entries = Fields::from(vec![
+                Field::new("key", k, false),
+                Field::new("value", v, true),
+            ]);
+            DataType::Map(
+                Arc::new(Field::new("entries", DataType::Struct(entries), false)),
+                false,
+            )
+        }
+
+        fn nested() -> impl Strategy<Value = DataType> {
+            leaf().prop_recursive(4, 32, 4, |inner| {
+                prop_oneof![
+                    inner
+                        .clone()
+                        .prop_map(|t| DataType::List(Arc::new(Field::new("item", t, true)))),
+                    inner
+                        .clone()
+                        .prop_map(|t| DataType::LargeList(Arc::new(Field::new("item", t, true)))),
+                    (inner.clone(), inner.clone()).prop_map(|(k, v)| map_of(k, v)),
+                    prop::collection::vec(inner, 1..4).prop_map(|ts| {
+                        DataType::Struct(
+                            ts.into_iter()
+                                .enumerate()
+                                .map(|(i, t)| Field::new(format!("f{i}"), t, true))
+                                .collect(),
+                        )
+                    }),
+                ]
+            })
+        }
+
+        proptest! {
+            /// No `Debug` fallback leaks out: Trino type names are lowercase
+            /// words, digits and `(),_ `, with balanced parentheses.
+            #[test]
+            fn every_type_renders_as_a_trino_type(t in nested()) {
+                let s = arrow_to_trino_type(&t);
+                prop_assert!(
+                    s.chars().all(|c| c.is_ascii_lowercase()
+                        || c.is_ascii_digit()
+                        || "(),_ ".contains(c)),
+                    "{t:?} -> {s}"
+                );
+                let mut depth = 0i32;
+                for c in s.chars() {
+                    depth += match c { '(' => 1, ')' => -1, _ => 0 };
+                    prop_assert!(depth >= 0, "{s}");
+                }
+                prop_assert_eq!(depth, 0, "{}", s);
+            }
+
+            /// A container's type is built from its children's, so nesting
+            /// never changes how an element type is reported.
+            #[test]
+            fn containers_compose_their_children(k in nested(), v in nested()) {
+                let (ks, vs) = (arrow_to_trino_type(&k), arrow_to_trino_type(&v));
+                let list = DataType::List(Arc::new(Field::new("item", v.clone(), true)));
+                prop_assert_eq!(arrow_to_trino_type(&list), format!("array({vs})"));
+                prop_assert_eq!(
+                    arrow_to_trino_type(&map_of(k.clone(), v.clone())),
+                    format!("map({ks},{vs})")
+                );
+                let row = DataType::Struct(Fields::from(vec![
+                    Field::new("a", k, true),
+                    Field::new("b", v, true),
+                ]));
+                prop_assert_eq!(arrow_to_trino_type(&row), format!("row(a {ks},b {vs})"));
+            }
+        }
+    }
 }
