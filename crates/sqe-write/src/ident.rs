@@ -11,16 +11,17 @@ use sqlparser::ast::ObjectName;
 
 use sqe_core::{Session, SqeError, SqeErrorCode};
 
-/// Fold a column identifier the way Trino does: unquoted names fold to
-/// lowercase, double-quoted names are preserved. This matches DataFusion's
-/// query-side identifier normalization (`to_lowercase`), so a column stored
-/// from unquoted DDL resolves against an unquoted (folded) query, and a
-/// double-quoted column keeps its case and must be quoted to reference (#337).
+/// Fold a column identifier the way the query side does: unquoted names fold
+/// to lowercase, quoted names are preserved. DataFusion's identifier
+/// normalization lowercases ASCII letters only (`ÉTAT` resolves as `État`),
+/// so this does too: a column stored from unquoted DDL resolves against the
+/// same unquoted name in a query, and a double-quoted column keeps its case
+/// and must be quoted to reference (#337).
 pub fn fold_unquoted_ident(ident: &sqlparser::ast::Ident) -> String {
     if ident.quote_style.is_some() {
         ident.value.clone()
     } else {
-        ident.value.to_lowercase()
+        ident.value.to_ascii_lowercase()
     }
 }
 
@@ -123,6 +124,31 @@ fn leading_qualifier(name: &ObjectName, parts: usize) -> Option<String> {
 mod tests {
     use super::*;
     use sqlparser::ast::Ident;
+
+    #[test]
+    fn fold_unquoted_ident_folds_ascii_letters_only() {
+        // `SELECT ÉTAT` resolves `État`, so that is the name to store.
+        assert_eq!(fold_unquoted_ident(&Ident::new("ÉTAT")), "État");
+        assert_eq!(fold_unquoted_ident(&Ident::new("STRASSE_Ä")), "strasse_Ä");
+    }
+
+    proptest::proptest! {
+        /// The stored name is the name a query resolves: DataFusion's own
+        /// identifier normalizer is the oracle, quoted or not.
+        #[test]
+        fn fold_unquoted_ident_matches_datafusion(
+            value in "\\PC{0,12}",
+            quote in proptest::option::of(proptest::sample::select(vec!['"', '`'])),
+        ) {
+            let ident = match quote {
+                Some(q) => Ident::with_quote(q, value),
+                None => Ident::new(value),
+            };
+            let query_side =
+                datafusion::sql::planner::IdentNormalizer::new(true).normalize(ident.clone());
+            proptest::prop_assert_eq!(fold_unquoted_ident(&ident), query_side);
+        }
+    }
 
     #[test]
     fn fold_unquoted_ident_folds_unquoted_preserves_quoted() {
