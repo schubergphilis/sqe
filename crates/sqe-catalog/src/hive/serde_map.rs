@@ -439,10 +439,10 @@ pub fn listing_options(
     // Correctness is unaffected: HiveTableProvider overrides
     // `TableProvider::statistics()` and returns its own size-derived value, so
     // the planner never sees ListingTable's. What changes is cost. With the
-    // session default, ListingTable::scan may stat each file while planning,
-    // which is the per-file work the partition index exists to avoid. Set
-    // `datafusion.execution.collect_statistics = false` on the session if that
-    // shows up on wide tables.
+    // session default, ListingTable::scan reads each file's footer while
+    // planning, which is the per-file work the partition index exists to
+    // avoid, so every Hive scan plans on a session copy with the knob off
+    // (`without_footer_statistics` in provider.rs, #807).
     Ok(ListingOptions::new(format)
         .with_file_extension(&r.file_extension)
         .with_table_partition_cols(partition_cols))
