@@ -561,6 +561,43 @@ async fn select_pages_columns_and_rows_via_next_uri() {
     h.assert_golden("select_inline");
 }
 
+/// Nested columns go out the way Trino sends them, which is what the JDBC
+/// driver decodes against: the type signature nests the element types (never
+/// a parameterized `rawType`), arrays and rows are JSON arrays, maps JSON
+/// objects, and a row field name that is not a plain identifier is quoted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nested_columns_carry_nested_signatures_and_structured_values() {
+    let mut h = Harness::start().await;
+    let req = h.post_as(
+        "alice",
+        "SELECT make_array(1, NULL, 3) AS arr, \
+         map(['a', 'b'], [1, NULL]) AS m, \
+         named_struct('a', 1, 'My Field', 'x') AS r, \
+         make_array(named_struct('k', 2, 'v', make_array(4))) AS deep",
+    );
+    let posted = h.step("post", req).await;
+    assert_eq!(posted.status, 200);
+    let pages = h.follow("page", &posted).await;
+    let page = pages.last().expect("a result page");
+    assert_eq!(page.state(), "FINISHED");
+    let columns = page.body["columns"].as_array().expect("columns");
+    let raw: Vec<&str> = columns
+        .iter()
+        .map(|c| c["typeSignature"]["rawType"].as_str().expect("rawType"))
+        .collect();
+    assert_eq!(raw, ["array", "map", "row", "array"]);
+    assert_eq!(columns[2]["type"], "row(a bigint,\"My Field\" varchar)");
+    assert_eq!(
+        columns[2]["typeSignature"]["arguments"][1]["value"]["fieldName"]["name"],
+        "My Field"
+    );
+    assert_eq!(
+        page.rows(),
+        vec![json!([[1, null, 3], {"a": 1, "b": null}, [1, "x"], [[2, [4]]]])]
+    );
+    h.assert_golden("nested_types");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn paginated_select_follows_next_uri_to_finished() {
     let mut h = Harness::start().await;

@@ -75,8 +75,10 @@ fn display(array: &dyn arrow_array::Array, row: usize) -> String {
 /// follow Java's `Double.toString` notation switch, timestamps are
 /// `YYYY-MM-DD HH:MM:SS.ffffff` with a space separator and six fractional
 /// digits, binary is base64, intervals use Trino's `D HH:MM:SS.mmm` and `Y-M`
-/// literals. Everything else falls back to Arrow's display string.
+/// literals. Arrays and rows are JSON arrays, maps JSON objects. Everything
+/// else falls back to Arrow's display string.
 pub fn arrow_value_to_json(array: &dyn arrow_array::Array, row: usize) -> serde_json::Value {
+    use arrow_array::cast::AsArray;
     use arrow_array::*;
 
     if array.is_null(row) {
@@ -276,8 +278,51 @@ pub fn arrow_value_to_json(array: &dyn arrow_array::Array, row: usize) -> serde_
             };
             serde_json::Value::String(format_day_time_interval(0, nanos))
         }
+        // Nested values are structured JSON, as Trino sends them: the JDBC
+        // driver decodes an `array`/`map`/`row` cell by its type signature and
+        // rejects a string there. Elements recurse, so nulls stay JSON null
+        // at every depth.
+        DataType::List(_) => elements_to_json(array.as_list::<i32>().value(row).as_ref()),
+        DataType::LargeList(_) => elements_to_json(array.as_list::<i64>().value(row).as_ref()),
+        DataType::FixedSizeList(_, _) => {
+            elements_to_json(array.as_fixed_size_list().value(row).as_ref())
+        }
+        // A map is a JSON object; Trino's object keys are strings, so a
+        // non-string key is rendered as its JSON text.
+        DataType::Map(_, _) => {
+            let entries = array.as_map().value(row);
+            let (keys, values) = (entries.column(0), entries.column(1));
+            let object = (0..entries.len())
+                .map(|i| {
+                    let key = match arrow_value_to_json(keys.as_ref(), i) {
+                        serde_json::Value::String(s) => s,
+                        other => other.to_string(),
+                    };
+                    (key, arrow_value_to_json(values.as_ref(), i))
+                })
+                .collect();
+            serde_json::Value::Object(object)
+        }
+        // A row is a JSON array of its field values, in field order.
+        DataType::Struct(_) => serde_json::Value::Array(
+            array
+                .as_struct()
+                .columns()
+                .iter()
+                .map(|c| arrow_value_to_json(c.as_ref(), row))
+                .collect(),
+        ),
         _ => serde_json::Value::String(display(array, row)),
     }
+}
+
+/// Every element of a list cell's child array as JSON.
+fn elements_to_json(elements: &dyn arrow_array::Array) -> serde_json::Value {
+    serde_json::Value::Array(
+        (0..elements.len())
+            .map(|i| arrow_value_to_json(elements, i))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -417,6 +462,96 @@ mod tests {
         assert_eq!(
             arrow_value_to_json(&arr, 0),
             serde_json::Value::String("2024-03-20 08:00:00.500000".to_string())
+        );
+    }
+
+    #[test]
+    fn list_values_are_json_arrays_with_null_elements() {
+        use arrow_array::types::Int64Type;
+        let arr = arrow_array::ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(1), None, Some(3)]),
+            None,
+            Some(vec![]),
+        ]);
+        assert_eq!(
+            arrow_value_to_json(&arr, 0),
+            serde_json::json!([1, null, 3])
+        );
+        assert_eq!(arrow_value_to_json(&arr, 1), serde_json::Value::Null);
+        assert_eq!(arrow_value_to_json(&arr, 2), serde_json::json!([]));
+
+        let large = arrow_array::LargeListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(7)]),
+        ]);
+        assert_eq!(arrow_value_to_json(&large, 0), serde_json::json!([7]));
+
+        let fixed = arrow_array::FixedSizeListArray::from_iter_primitive::<Int64Type, _, _>(
+            vec![Some(vec![Some(1), Some(2)])],
+            2,
+        );
+        assert_eq!(arrow_value_to_json(&fixed, 0), serde_json::json!([1, 2]));
+    }
+
+    #[test]
+    fn map_values_are_json_objects_with_string_keys() {
+        use arrow_array::builder::{Int64Builder, MapBuilder, StringBuilder};
+        let mut b = MapBuilder::new(None, StringBuilder::new(), Int64Builder::new());
+        b.keys().append_value("a");
+        b.values().append_value(1);
+        b.keys().append_value("b");
+        b.values().append_null();
+        b.append(true).unwrap();
+        b.append(false).unwrap();
+        let arr = b.finish();
+        assert_eq!(
+            arrow_value_to_json(&arr, 0),
+            serde_json::json!({ "a": 1, "b": null })
+        );
+        assert_eq!(arrow_value_to_json(&arr, 1), serde_json::Value::Null);
+
+        let mut b = MapBuilder::new(None, Int64Builder::new(), StringBuilder::new());
+        b.keys().append_value(10);
+        b.values().append_value("x");
+        b.append(true).unwrap();
+        assert_eq!(
+            arrow_value_to_json(&b.finish(), 0),
+            serde_json::json!({ "10": "x" })
+        );
+    }
+
+    #[test]
+    fn struct_values_are_json_arrays_in_field_order() {
+        use std::sync::Arc;
+
+        use arrow_array::{ArrayRef, FixedSizeListArray, Int32Array, StringArray, StructArray};
+        use arrow_schema::{Field, Fields};
+
+        let fields = Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Utf8, true),
+        ]);
+        let arr = StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), None, Some(3)])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("x"), Some("y"), None])),
+            ],
+            Some(vec![true, true, false].into()),
+        );
+        assert_eq!(arrow_value_to_json(&arr, 0), serde_json::json!([1, "x"]));
+        assert_eq!(arrow_value_to_json(&arr, 1), serde_json::json!([null, "y"]));
+        assert_eq!(arrow_value_to_json(&arr, 2), serde_json::Value::Null);
+
+        // array(row(a integer, b varchar)): rows nest inside the list.
+        let list = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Struct(fields), true)),
+            2,
+            Arc::new(arr.slice(0, 2)),
+            None,
+        );
+        assert_eq!(
+            arrow_value_to_json(&list, 0),
+            serde_json::json!([[1, "x"], [null, "y"]])
         );
     }
 }
