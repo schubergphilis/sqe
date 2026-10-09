@@ -10351,6 +10351,108 @@ s3_path_style = true
             .unwrap()
     }
 
+    /// DELETE, UPDATE and MERGE resolve the target's policy under the
+    /// target's catalog: the statement's qualifier, else the session catalog.
+    /// A catalog-scoped store holds the row filter under `ws_a.default`, so
+    /// the same `default.employees` in `ws_b` is not filtered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dml_target_policy_is_keyed_on_the_target_catalog() {
+        use datafusion::logical_expr::{col, lit};
+        use sqe_policy::plan_rewriter::PolicyPlanRewriter;
+        use sqe_policy::policy_store::InMemoryPolicyStore;
+        use sqe_policy::{PolicyStore, ResolvedPolicy};
+        use sqlparser::ast::TableFactor;
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        struct Scoped(InMemoryPolicyStore);
+        #[async_trait::async_trait]
+        impl PolicyStore for Scoped {
+            fn catalog_scoped(&self) -> bool {
+                true
+            }
+            async fn resolve(
+                &self,
+                user: &sqe_core::SessionUser,
+                table: &str,
+                namespace: &str,
+            ) -> sqe_core::Result<ResolvedPolicy> {
+                self.0.resolve(user, table, namespace).await
+            }
+        }
+        let store = InMemoryPolicyStore::new();
+        let mut pol = ResolvedPolicy::default();
+        pol.row_filters.push(col("region").eq(lit("EU")));
+        store.add_table_policy("ws_a.default", "employees", pol).await;
+        let enforcer: Arc<dyn sqe_policy::PolicyEnforcer> =
+            Arc::new(PolicyPlanRewriter::new(Arc::new(Scoped(store))));
+        let handler = WriteHandler::new(write_test_config()).with_policy_enforcer(enforcer);
+        let mut session = sqe_core::Session::new(
+            "alice".to_string(),
+            "tok".to_string().into(),
+            None,
+            chrono::Utc::now(),
+            vec![],
+        );
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, true),
+            arrow_schema::Field::new("region", arrow_schema::DataType::Utf8, true),
+        ]));
+
+        let target = |sql: &str| -> ObjectName {
+            let stmt = Parser::parse_sql(&GenericDialect {}, sql)
+                .unwrap()
+                .remove(0);
+            match &stmt {
+                Statement::Delete(_) => delete_target_object_name(&stmt).unwrap().clone(),
+                Statement::Update(_) => update_target_object_name(&stmt).unwrap().clone(),
+                Statement::Merge(m) => match &m.table {
+                    TableFactor::Table { name, .. } => name.clone(),
+                    other => panic!("merge target: {other}"),
+                },
+                other => panic!("unexpected statement: {other}"),
+            }
+        };
+        let filtered = |session: &sqe_core::Session, name: ObjectName| {
+            let (handler, schema) = (&handler, schema.clone());
+            let session = session.clone();
+            async move {
+                let ident = resolve_table_ident(&name, &session).unwrap();
+                handler
+                    .compute_write_predicates(
+                        &session,
+                        catalog_qualifier(&name),
+                        &ident,
+                        schema,
+                        &mut None,
+                    )
+                    .await
+                    .unwrap()
+                    .row_filter_sql
+                    .is_some()
+            }
+        };
+
+        for (catalog, expect) in [("ws_a", true), ("ws_b", false)] {
+            for sql in [
+                format!("DELETE FROM {catalog}.default.employees WHERE id = 1"),
+                format!("UPDATE {catalog}.default.employees SET region = 'US'"),
+                format!(
+                    "MERGE INTO {catalog}.default.employees t USING src s ON t.id = s.id \
+                     WHEN MATCHED THEN DELETE"
+                ),
+            ] {
+                assert_eq!(filtered(&session, target(&sql)).await, expect, "{sql}");
+            }
+        }
+
+        // An unqualified target takes the session catalog.
+        session.default_catalog = Some("ws_a".to_string());
+        assert!(filtered(&session, target("DELETE FROM default.employees WHERE id = 1")).await);
+        session.default_catalog = Some("ws_b".to_string());
+        assert!(!filtered(&session, target("DELETE FROM default.employees WHERE id = 1")).await);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn delete_with_row_filter_keeps_rows_outside_user_view() {
         use arrow_array::Array as _;
