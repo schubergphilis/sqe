@@ -1332,7 +1332,7 @@ mod tests {
             groups: vec![],
         };
         let (policy, _) = sqe_policy::write_predicates::extract_write_predicates(
-            &enf, &user, "default", "tgt", tschema,
+            &enf, &user, None, "default", "tgt", tschema,
         )
         .await
         .unwrap();

@@ -4013,13 +4013,13 @@ fn default_access_control_timeout() -> u64 {
 pub struct RangerConfig {
     /// Ranger service instance name. Must match the Polaris
     /// `polaris.authorization.ranger.service-name` setting.
-    #[serde(default = "default_ranger_service_name")]
+    #[serde(default = "default_ranger_service_name", alias = "service_name")]
     pub service_name: String,
     /// Ranger Admin user for HTTP basic auth.
-    #[serde(default = "default_ranger_admin_user")]
+    #[serde(default = "default_ranger_admin_user", alias = "admin_user")]
     pub admin_user: String,
     /// Ranger Admin password. Set via `SQE_ACCESS_CONTROL__RANGER__ADMIN_PASSWORD`.
-    #[serde(default)]
+    #[serde(default, alias = "admin_password")]
     pub admin_password: SecretString,
     /// Value for the top-level `root` resource (the Polaris realm/context the
     /// embedded authorizer prefixes onto resource paths). When empty, the
@@ -4028,10 +4028,10 @@ pub struct RangerConfig {
     #[serde(default)]
     pub realm: String,
     /// HTTP timeout for a single Ranger Admin call, in seconds.
-    #[serde(default = "default_ranger_timeout_secs")]
+    #[serde(default = "default_ranger_timeout_secs", alias = "timeout_secs")]
     pub timeout_secs: u64,
     /// Accept self-signed TLS certs on the Ranger Admin endpoint.
-    #[serde(default)]
+    #[serde(default, alias = "accept_invalid_certs")]
     pub accept_invalid_certs: bool,
 }
 
@@ -4162,19 +4162,22 @@ pub struct RangerPolicyConfig {
     #[serde(default)]
     pub url: String,
     /// The `hive` Ranger service instance to read. Shared with Spark/Kyuubi.
-    #[serde(default = "default_ranger_policy_service_name")]
+    #[serde(default = "default_ranger_policy_service_name", alias = "service_name")]
     pub service_name: String,
     /// Ranger Admin user for HTTP basic auth.
-    #[serde(default = "default_ranger_admin_user")]
+    #[serde(default = "default_ranger_admin_user", alias = "admin_user")]
     pub admin_user: String,
     /// Ranger Admin password. Set via `SQE_POLICY__RANGER__ADMIN_PASSWORD`.
-    #[serde(default)]
+    #[serde(default, alias = "admin_password")]
     pub admin_password: SecretString,
     /// HTTP timeout for a single Ranger download call, in seconds.
-    #[serde(default = "default_ranger_policy_timeout_secs")]
+    #[serde(default = "default_ranger_policy_timeout_secs", alias = "timeout_secs")]
     pub timeout_secs: u64,
     /// Maximum cached `ResolvedPolicy` entries.
-    #[serde(default = "default_ranger_policy_cache_max_entries")]
+    #[serde(
+        default = "default_ranger_policy_cache_max_entries",
+        alias = "cache_max_entries"
+    )]
     pub cache_max_entries: u64,
     /// Cache TTL in seconds for resolved row-filter / data-mask policies.
     ///
@@ -4185,16 +4188,25 @@ pub struct RangerPolicyConfig {
     /// improvement is `lastKnownVersion` / HTTP-304 polling so external edits
     /// are picked up promptly without a short TTL; until then, lower this value
     /// if prompt propagation of Admin-side edits matters more than fetch load.
-    #[serde(default = "default_ranger_policy_cache_ttl_secs")]
+    #[serde(
+        default = "default_ranger_policy_cache_ttl_secs",
+        alias = "cache_ttl_secs"
+    )]
     pub cache_ttl_secs: u64,
     /// Consecutive failures before the circuit breaker opens.
-    #[serde(default = "default_policy_breaker_failure_threshold")]
+    #[serde(
+        default = "default_policy_breaker_failure_threshold",
+        alias = "breaker_failure_threshold"
+    )]
     pub breaker_failure_threshold: u32,
     /// How long to keep the breaker open before probing again, in seconds.
-    #[serde(default = "default_policy_breaker_recovery_secs")]
+    #[serde(
+        default = "default_policy_breaker_recovery_secs",
+        alias = "breaker_recovery_secs"
+    )]
     pub breaker_recovery_secs: u64,
     /// Accept self-signed TLS certs on the Ranger Admin endpoint.
-    #[serde(default)]
+    #[serde(default, alias = "accept_invalid_certs")]
     pub accept_invalid_certs: bool,
     /// Also write column-tag associations into Ranger's TAG STORE, so engines
     /// other than SQE can see them.
@@ -4209,7 +4221,7 @@ pub struct RangerPolicyConfig {
     /// deployments MUST set this true so Spark sees the same tags SQE masks.
     /// `production_mode` refuses Ranger with this off unless
     /// `security.allow_unprojected_tags = true` (issue #397).
-    #[serde(default)]
+    #[serde(default, alias = "project_tags")]
     pub project_tags: bool,
     /// Enforce Ranger ACCESS policies (`policyType` 0) on Hive-root tables:
     /// a Hive table is readable only when an enabled access policy grants
@@ -4230,8 +4242,27 @@ pub struct RangerPolicyConfig {
     /// Iceberg tables are never gated by this: their access policies stay
     /// with the catalog. Set `false` to restore the previous behaviour, where
     /// the Ranger `hive` service supplied masks and row filters only.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", alias = "hive_access_policies")]
     pub hive_access_policies: bool,
+    /// Key Ranger policies on the catalog as well as the namespace: the Ranger
+    /// `database` of an Iceberg table becomes `{catalog}.{namespace}` (the full
+    /// dotted namespace), e.g. `ws_sales.finance.orders` is matched by a policy
+    /// with `database = "ws_sales.finance"` and `table = "orders"`.
+    ///
+    /// OFF by default, which keeps the Hive/Kyuubi convention where `database`
+    /// is the namespace alone and the catalog is dropped. That convention lets a
+    /// policy written for `finance.orders` fire in EVERY catalog holding a
+    /// `finance.orders`, so a deployment that runs several Iceberg catalogs with
+    /// the same namespace and table names (one per workspace) must turn this on,
+    /// or a mask authored for one catalog leaks to, or is missing from, the
+    /// others. When on, the last-namespace-component migration fallback is off
+    /// too, so a policy can never match across catalogs. Hive-root tables are
+    /// keyed `{root}.{database}` either way.
+    ///
+    /// The serde alias accepts the snake spelling, which is what the
+    /// `SQE_POLICY__RANGER__CATALOG_SCOPED` environment override produces.
+    #[serde(default, alias = "catalog_scoped")]
+    pub catalog_scoped: bool,
 }
 
 /// Circuit-breaker defaults shared by the policy backends. 5 consecutive
@@ -4258,6 +4289,7 @@ impl Default for RangerPolicyConfig {
             accept_invalid_certs: false,
             project_tags: false,
             hive_access_policies: true,
+            catalog_scoped: false,
         }
     }
 }
@@ -11741,6 +11773,84 @@ warehouse = "wh"
             }
             other => panic!("provider 0 should be Okta bearer_token, got {other:?}"),
         }
+    }
+
+    /// `[policy.ranger] catalog_scoped`: off by default, settable in TOML under
+    /// the kebab name the section uses, and settable through
+    /// `SQE_POLICY__RANGER__CATALOG_SCOPED`, whose overlay inserts the SNAKE
+    /// name. Without the serde alias the env override would be dropped
+    /// silently, because the section has no `deny_unknown_fields`.
+    #[test]
+    fn ranger_catalog_scoped_loads_from_toml_and_env() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("SQE_POLICY__RANGER__CATALOG_SCOPED");
+        assert!(!load_with_env().policy.ranger.catalog_scoped, "default off");
+
+        let from_toml = SqeConfig::load_from_str(
+            &(MINIMAL_TOML.to_string() + "[policy.ranger]\ncatalog-scoped = true\n"),
+        )
+        .unwrap();
+        assert!(from_toml.policy.ranger.catalog_scoped, "kebab TOML key");
+
+        std::env::set_var("SQE_POLICY__RANGER__CATALOG_SCOPED", "true");
+        let from_env = SqeConfig::load_from_str(MINIMAL_TOML);
+        std::env::remove_var("SQE_POLICY__RANGER__CATALOG_SCOPED");
+        assert!(
+            from_env.unwrap().policy.ranger.catalog_scoped,
+            "env override"
+        );
+    }
+
+    /// Every multi-word `[policy.ranger]` key took only its kebab spelling, so
+    /// the documented `SQE_POLICY__RANGER__ADMIN_PASSWORD` (overlaid as
+    /// `admin_password`) was dropped without an error and the store sent an
+    /// empty password, and `hive_access_policies = false` as the docs spell it
+    /// left the gate on. Both spellings now land.
+    #[test]
+    fn ranger_policy_snake_keys_and_env_overrides_land() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("SQE_POLICY__RANGER__ADMIN_PASSWORD", "from-env");
+        std::env::set_var("SQE_POLICY__RANGER__SERVICE_NAME", "query");
+        let from_env = SqeConfig::load_from_str(MINIMAL_TOML);
+        std::env::remove_var("SQE_POLICY__RANGER__ADMIN_PASSWORD");
+        std::env::remove_var("SQE_POLICY__RANGER__SERVICE_NAME");
+        let from_env = from_env.unwrap();
+        assert_eq!(from_env.policy.ranger.admin_password.expose(), "from-env");
+        assert_eq!(from_env.policy.ranger.service_name, "query");
+
+        // With the kebab key in the file the env value replaces it, rather than
+        // landing next to it as a duplicate field.
+        std::env::set_var("SQE_POLICY__RANGER__ADMIN_PASSWORD", "from-env");
+        let both = SqeConfig::load_from_str(
+            &(MINIMAL_TOML.to_string() + "[policy.ranger]\nadmin-password = \"from-toml\"\n"),
+        );
+        std::env::remove_var("SQE_POLICY__RANGER__ADMIN_PASSWORD");
+        assert_eq!(
+            both.unwrap().policy.ranger.admin_password.expose(),
+            "from-env"
+        );
+
+        // `[access_control.ranger]` is kebab-case too and had the same hole.
+        std::env::set_var("SQE_ACCESS_CONTROL__RANGER__ADMIN_PASSWORD", "ac-env");
+        let ac = SqeConfig::load_from_str(MINIMAL_TOML);
+        std::env::remove_var("SQE_ACCESS_CONTROL__RANGER__ADMIN_PASSWORD");
+        assert_eq!(
+            ac.unwrap().access_control.ranger.admin_password.expose(),
+            "ac-env"
+        );
+
+        let snake = SqeConfig::load_from_str(
+            &(MINIMAL_TOML.to_string()
+                + "[policy.ranger]\nhive_access_policies = false\nproject_tags = true\n"),
+        )
+        .unwrap();
+        assert!(!snake.policy.ranger.hive_access_policies);
+        assert!(snake.policy.ranger.project_tags);
+        let kebab = SqeConfig::load_from_str(
+            &(MINIMAL_TOML.to_string() + "[policy.ranger]\nhive-access-policies = false\n"),
+        )
+        .unwrap();
+        assert!(!kebab.policy.ranger.hive_access_policies);
     }
 }
 

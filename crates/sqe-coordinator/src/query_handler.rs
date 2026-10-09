@@ -755,6 +755,16 @@ impl QueryHandler {
         Ok(catalog)
     }
 
+    /// Name of the catalog an unqualified reference resolves in for this
+    /// session: its own default, else the configured default. The same rule
+    /// the planner's scope and the metadata TVF registration use.
+    fn session_catalog_name(&self, session: &Session) -> String {
+        session
+            .default_catalog
+            .clone()
+            .unwrap_or_else(|| self.config.resolve_default_catalog())
+    }
+
     /// Resolve the catalog whose metadata a `SHOW SCHEMAS/TABLES FROM <catalog>`
     /// should read.
     ///
@@ -2452,10 +2462,15 @@ impl QueryHandler {
                         // tier lets through without a privilege check; a
                         // table the caller is fully denied stays "not found".
                         if let sqe_sql::ProcedureCall::TableHealth { table } = &**call {
+                            let catalog = table
+                                .catalog
+                                .clone()
+                                .unwrap_or_else(|| self.session_catalog_name(session));
                             deny_hidden_metadata_tvf_targets(
                                 self.policy_store.as_deref(),
                                 &session.user,
                                 self.config.policy.mask_precedence,
+                                &catalog,
                                 &[(table.namespace.clone(), table.name.clone())],
                             )
                             .await?;
@@ -5432,10 +5447,15 @@ impl QueryHandler {
             }
             [] => Vec::new(),
         };
+        let catalog = match parts.as_slice() {
+            [catalog, _, _] => catalog.clone(),
+            _ => self.session_catalog_name(session),
+        };
         deny_hidden_metadata_tvf_targets(
             self.policy_store.as_deref(),
             &session.user,
             self.config.policy.mask_precedence,
+            &catalog,
             &targets,
         )
         .await
@@ -6741,25 +6761,33 @@ impl QueryHandler {
             .load_column_tags(session, &params.table)
             .await?;
 
-        // Derive the (namespace, table) policy key the SAME way the rewriter
-        // does (`resolve_policy_key`): the last DOT-separated component of the
-        // namespace. `parse_table_ref` collapses a 3-part reference to a single
-        // namespace component, but a quoted multi-level component (e.g.
-        // `cat."ns1.ns2".tbl`) stays as the string "ns1.ns2"; the rewriter and
-        // the write path both key on its last component ("ns2"), so we must too
-        // or the diagnostic would resolve a different policy than enforcement.
-        let namespace_raw = table_ident
-            .namespace()
-            .as_ref()
-            .last()
-            .cloned()
-            .unwrap_or_else(|| "default".to_string());
-        let namespace = namespace_raw
-            .rsplit('.')
-            .next()
-            .unwrap_or(&namespace_raw)
-            .to_string();
-        let table_name = table_ident.name().to_string();
+        // Derive the (namespace, table) policy key through the SAME function
+        // the rewriter uses (`resolve_policy_key_scoped`): the full dotted
+        // namespace, prefixed with the catalog when the store is
+        // `catalog_scoped`. This used to take the LAST namespace component,
+        // which the rewriter stopped doing in #205, so a multi-level namespace
+        // reported a different policy than enforcement applied.
+        let parts = split_qualified_identifier(&params.table);
+        let catalog_name = match parts.as_slice() {
+            [c, _, _, ..] => c.clone(),
+            _ => self.session_catalog_name(session),
+        };
+        let default_hive = sqe_policy::plan_rewriter::HiveCatalogs::new();
+        let hive_catalogs = self.hive_catalogs.as_deref().unwrap_or(&default_hive);
+        let (namespace, table_name) =
+            sqe_policy::plan_rewriter::resolve_policy_key_for_ident_scoped(
+                Some(&catalog_name),
+                table_ident.namespace().as_ref(),
+                table_ident.name(),
+                hive_catalogs,
+                store.catalog_scoped(),
+            )
+            .ok_or_else(|| {
+                SqeError::with_code(
+                    SqeErrorCode::TableNotFound,
+                    format!("table not found: {}", params.table),
+                )
+            })?;
 
         // The target user's roles are only known for the self case. For
         // `FOR USER other` we have no role lookup wired (the session holds only
@@ -7358,14 +7386,26 @@ impl QueryHandler {
                     })?;
                 let default_hive = sqe_policy::plan_rewriter::HiveCatalogs::new();
                 let hive_catalogs = self.hive_catalogs.as_deref().unwrap_or(&default_hive);
-                let (policy_ns, policy_table) =
-                    sqe_policy::plan_rewriter::resolve_policy_key_for_ident(
-                        Some(session_catalog.warehouse()),
+                // Keyed by the catalog NAME the planner uses (explicit
+                // qualifier, else the session's), not the warehouse, which can
+                // differ and is what a catalog-scoped Ranger key must carry.
+                let catalog_name = catalog
+                    .map(str::to_string)
+                    .unwrap_or_else(|| self.session_catalog_name(session));
+                let Some((policy_ns, policy_table)) =
+                    sqe_policy::plan_rewriter::resolve_policy_key_for_ident_scoped(
+                        Some(&catalog_name),
                         table_ident.namespace().as_ref(),
                         table_ident.name(),
                         hive_catalogs,
+                        store.catalog_scoped(),
                     )
-                    .unwrap_or_else(|| (namespace.to_string(), bare_table.to_string()));
+                else {
+                    return Err(SqeError::with_code(
+                        SqeErrorCode::TableNotFound,
+                        format!("table not found: {table_name}"),
+                    ));
+                };
                 let policy = sqe_policy::plan_rewriter::resolve_effective_policy(
                     store,
                     &session.user,
@@ -7881,10 +7921,15 @@ fn metadata_tvf_targets(plan: &datafusion::logical_expr::LogicalPlan) -> Vec<(St
 /// CREATE TABLE, column listings, table health). Same wording as a missing
 /// table so "denied" is indistinguishable from "never existed" (the SHOW
 /// CREATE TABLE / SHOW TABLES convention).
+///
+/// `catalog` is the catalog the target lives in. A `catalog_scoped` store
+/// keys the target as `{catalog}.{namespace}`, the same key a `SELECT` on
+/// that table resolves.
 async fn deny_hidden_metadata_tvf_targets(
     store: Option<&dyn PolicyStore>,
     user: &sqe_core::session::SessionUser,
     precedence: sqe_core::config::MaskPrecedence,
+    catalog: &str,
     targets: &[(String, String)],
 ) -> sqe_core::Result<()> {
     let Some(store) = store else {
@@ -7892,11 +7937,16 @@ async fn deny_hidden_metadata_tvf_targets(
     };
     let no_tags = std::collections::HashMap::new();
     for (ns, table) in targets {
+        let key_ns = if store.catalog_scoped() {
+            format!("{catalog}.{ns}")
+        } else {
+            ns.clone()
+        };
         let policy = sqe_policy::plan_rewriter::resolve_effective_policy(
             store,
             user,
             table,
-            ns,
+            &key_ns,
             &no_tags,
             precedence,
         )
@@ -9718,13 +9768,13 @@ mod show_stats_policy_tests {
         let store_ref: Option<&dyn PolicyStore> = Some(&store);
 
         assert!(
-            deny_hidden_metadata_tvf_targets(None, &user, precedence, &targets)
+            deny_hidden_metadata_tvf_targets(None, &user, precedence, "cat", &targets)
                 .await
                 .is_ok(),
             "no policy store: passthrough"
         );
         assert!(
-            deny_hidden_metadata_tvf_targets(store_ref, &user, precedence, &targets)
+            deny_hidden_metadata_tvf_targets(store_ref, &user, precedence, "cat", &targets)
                 .await
                 .is_ok(),
             "no policy on the target: passes"
@@ -9733,7 +9783,7 @@ mod show_stats_policy_tests {
         let mut deny = ResolvedPolicy::default();
         deny.row_filters.push(lit(false));
         store.add_table_policy("sales", "orders", deny).await;
-        let err = deny_hidden_metadata_tvf_targets(store_ref, &user, precedence, &targets)
+        let err = deny_hidden_metadata_tvf_targets(store_ref, &user, precedence, "cat", &targets)
             .await
             .unwrap_err();
         assert_eq!(err.error_code(), sqe_core::SqeErrorCode::TableNotFound);

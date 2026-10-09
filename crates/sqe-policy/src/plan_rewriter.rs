@@ -164,14 +164,21 @@ impl PolicyEnforcer for PolicyPlanRewriter {
         let mut view_scans: HashSet<String> = HashSet::new();
         // Tables described by metadata TVF scans. The scan itself is keyed by
         // the function name, so the target's own policy is checked below.
-        let mut metadata_targets: Vec<(String, String)> = Vec::new();
+        // The TVF reads the catalog it is registered on, so the target lives
+        // in the catalog the function name resolves to.
+        let mut metadata_targets: Vec<(Option<String>, String, String)> = Vec::new();
         plan.apply_with_subqueries(|node| {
             if let LogicalPlan::TableScan(scan) = node {
                 let table_name = scan.table_name.to_string();
                 if let Ok(provider) = datafusion::datasource::source_as_provider(&scan.source) {
-                    if let Some(target) =
+                    if let Some((ns, table)) =
                         self.metadata_target.and_then(|f| f(provider.as_ref()))
                     {
+                        let catalog = scope
+                            .qualify(&scan.table_name)
+                            .catalog()
+                            .map(str::to_string);
+                        let target = (catalog, ns, table);
                         if !metadata_targets.contains(&target) {
                             metadata_targets.push(target);
                         }
@@ -201,18 +208,30 @@ impl PolicyEnforcer for PolicyPlanRewriter {
         // of its target, so a caller denied all access to the target is
         // refused, with the missing-table wording so "denied" is
         // indistinguishable from "never existed" (#750). Table-level only.
+        // A `catalog_scoped` store keys the target as `{catalog}.{namespace}`;
+        // with no catalog to key on, the target is refused (fail closed).
         let no_tags = HashMap::new();
-        for (ns, table) in &metadata_targets {
-            let policy = resolve_effective_policy(
-                store.as_ref(),
-                user,
-                table,
-                ns,
-                &no_tags,
-                self.mask_precedence,
-            )
-            .await;
-            if policy_denies_all(&policy) {
+        for (catalog, ns, table) in &metadata_targets {
+            let key_ns = match (store.catalog_scoped(), catalog) {
+                (false, _) => Some(ns.clone()),
+                (true, Some(catalog)) => Some(format!("{catalog}.{ns}")),
+                (true, None) => None,
+            };
+            let denied = match key_ns {
+                Some(key_ns) => policy_denies_all(
+                    &resolve_effective_policy(
+                        store.as_ref(),
+                        user,
+                        table,
+                        &key_ns,
+                        &no_tags,
+                        self.mask_precedence,
+                    )
+                    .await,
+                ),
+                None => true,
+            };
+            if denied {
                 return Err(sqe_core::error::SqeError::with_code(
                     sqe_core::SqeErrorCode::TableNotFound,
                     format!("table not found: {ns}.{table}"),
@@ -240,7 +259,9 @@ impl PolicyEnforcer for PolicyPlanRewriter {
             // reference. This MUST match the write path's scheme
             // (the full dotted namespace, see `resolve_policy_key`), otherwise
             // reads and writes resolve different policies for the same table.
-            let Some((namespace, table)) = resolve_policy_key(table_ref, &hive_catalogs) else {
+            let Some((namespace, table)) =
+                resolve_policy_key_scoped(table_ref, &hive_catalogs, store.catalog_scoped())
+            else {
                 // FAIL CLOSED: a reference we cannot confidently map to a
                 // policy key must never pass through. Deny all rows rather
                 // than risk leaking an unguarded table (issue #205).
@@ -964,6 +985,32 @@ pub fn resolve_policy_key(
     table_ref: &datafusion::common::TableReference,
     hive_catalogs: &HiveCatalogs,
 ) -> Option<(String, String)> {
+    resolve_policy_key_scoped(table_ref, hive_catalogs, false)
+}
+
+/// `resolve_policy_key` for a store that may key on the catalog
+/// (`PolicyStore::catalog_scoped`, `[policy.ranger] catalog_scoped`).
+///
+/// With `catalog_scoped` the Iceberg branch returns `"{catalog}.{namespace}"`,
+/// the same shape the Hive branch always had, so a portal running one Iceberg
+/// catalog per workspace with identical `namespace.table` names gets a distinct
+/// key, and so a distinct Ranger `database`, per catalog. A reference that
+/// carries no catalog cannot be keyed that way and returns `None`, which every
+/// caller turns into a deny: falling back to the bare namespace would match
+/// nothing written for the scoped convention, and a policy that does not match
+/// is a mask that does not apply. The exceptions are a reserved virtual
+/// reference (`information_schema`, the `system` catalog), which holds no user
+/// rows and is keyed as before, and a schema that already starts with a
+/// registered Hive root (the Hive write probe's `{root}.{database}`).
+///
+/// The rewriter qualifies an unqualified scan with the session's catalog and
+/// schema (`TableScope::qualify`) before calling this, so `SELECT * FROM t`
+/// under `USE ws_a.finance` keys as `ws_a.finance`.
+pub fn resolve_policy_key_scoped(
+    table_ref: &datafusion::common::TableReference,
+    hive_catalogs: &HiveCatalogs,
+    catalog_scoped: bool,
+) -> Option<(String, String)> {
     let table = table_ref.table();
     if table.is_empty() {
         return None;
@@ -977,6 +1024,25 @@ pub fn resolve_policy_key(
     if hive_catalogs.contains_name(table_ref.catalog()) {
         let root = table_ref.catalog().unwrap_or_default();
         return Some((format!("{root}.{namespace}"), table.to_string()));
+    }
+
+    if catalog_scoped {
+        match table_ref.catalog() {
+            Some(catalog) if !catalog.is_empty() => {
+                return Some((format!("{catalog}.{namespace}"), table.to_string()));
+            }
+            _ if is_reserved_virtual_ref(table_ref) => {}
+            // A Hive write probe passes its `{root}.{database}` key as the
+            // schema with no catalog; that key already names the root.
+            None if hive_catalogs.contains_name(namespace.split('.').next()) => {}
+            _ => {
+                warn!(
+                    table = %table_ref,
+                    "catalog-scoped policy key needs a catalog and the reference has none; denying"
+                );
+                return None;
+            }
+        }
     }
 
     Some((namespace, table.to_string()))
@@ -998,6 +1064,18 @@ pub fn resolve_policy_key_for_ident(
     table: &str,
     hive_catalogs: &HiveCatalogs,
 ) -> Option<(String, String)> {
+    resolve_policy_key_for_ident_scoped(catalog, namespace, table, hive_catalogs, false)
+}
+
+/// `resolve_policy_key_for_ident` with the store's `catalog_scoped` flag; see
+/// `resolve_policy_key_scoped`.
+pub fn resolve_policy_key_for_ident_scoped(
+    catalog: Option<&str>,
+    namespace: &[String],
+    table: &str,
+    hive_catalogs: &HiveCatalogs,
+    catalog_scoped: bool,
+) -> Option<(String, String)> {
     use datafusion::common::TableReference;
     let namespace = namespace.join(".");
     let table_ref = match (catalog, namespace.is_empty()) {
@@ -1005,7 +1083,7 @@ pub fn resolve_policy_key_for_ident(
         (_, false) => TableReference::partial(namespace, table),
         (_, true) => TableReference::bare(table),
     };
-    resolve_policy_key(&table_ref, hive_catalogs)
+    resolve_policy_key_scoped(&table_ref, hive_catalogs, catalog_scoped)
 }
 
 /// Widen a `TableScan`'s projection so a row filter can reference a column the
@@ -1968,6 +2046,164 @@ mod tests {
             resolve_policy_key(&r, &cats),
             Some(("lake.sales".to_string(), "orders".to_string())),
             "after ATTACH the same reference must key under the root"
+        );
+    }
+
+    // ── catalog-scoped keys ([policy.ranger] catalog_scoped) ──────────
+
+    #[test]
+    fn catalog_scoped_key_carries_the_catalog() {
+        use datafusion::common::TableReference;
+        let cats = HiveCatalogs::default();
+        let a = TableReference::full("ws_a", "finance", "orders");
+        let b = TableReference::full("ws_b", "finance", "orders");
+        assert_eq!(
+            resolve_policy_key_scoped(&a, &cats, true),
+            Some(("ws_a.finance".to_string(), "orders".to_string()))
+        );
+        assert_eq!(
+            resolve_policy_key_scoped(&b, &cats, true),
+            Some(("ws_b.finance".to_string(), "orders".to_string()))
+        );
+        // Off: both catalogs collapse onto one key, which is the leak.
+        assert_eq!(
+            resolve_policy_key_scoped(&a, &cats, false),
+            resolve_policy_key_scoped(&b, &cats, false)
+        );
+        assert_eq!(
+            resolve_policy_key(&a, &cats),
+            resolve_policy_key_scoped(&a, &cats, false)
+        );
+        // Multi-level namespaces stay whole behind the catalog.
+        assert_eq!(
+            resolve_policy_key_for_ident_scoped(
+                Some("ws_a"),
+                &["a".to_string(), "b".to_string()],
+                "t",
+                &cats,
+                true
+            ),
+            Some(("ws_a.a.b".to_string(), "t".to_string()))
+        );
+    }
+
+    #[test]
+    fn catalog_scoped_key_without_a_catalog_fails_closed() {
+        use datafusion::common::TableReference;
+        let cats = HiveCatalogs::default();
+        assert_eq!(
+            resolve_policy_key_scoped(&TableReference::partial("finance", "orders"), &cats, true),
+            None
+        );
+        assert_eq!(
+            resolve_policy_key_scoped(&TableReference::bare("orders"), &cats, true),
+            None
+        );
+        // A reserved virtual relation holds no user rows; it keeps its key.
+        assert_eq!(
+            resolve_policy_key_scoped(
+                &TableReference::partial("information_schema", "tables"),
+                &cats,
+                true
+            ),
+            Some(("information_schema".to_string(), "tables".to_string()))
+        );
+    }
+
+    #[test]
+    fn catalog_scoped_leaves_the_hive_key_alone() {
+        use datafusion::common::TableReference;
+        let r = TableReference::full("lake", "sales", "orders");
+        assert_eq!(
+            resolve_policy_key_scoped(&r, &hive_only("lake"), true),
+            Some(("lake.sales".to_string(), "orders".to_string())),
+            "a Hive key is root.database already, not lake.lake.sales"
+        );
+    }
+
+    /// Test store that keys on the catalog, like a `catalog_scoped` Ranger.
+    struct CatalogScopedStore(crate::policy_store::InMemoryPolicyStore);
+
+    #[async_trait]
+    impl PolicyStore for CatalogScopedStore {
+        fn catalog_scoped(&self) -> bool {
+            true
+        }
+        async fn resolve(
+            &self,
+            user: &SessionUser,
+            table_name: &str,
+            namespace: &str,
+        ) -> sqe_core::Result<ResolvedPolicy> {
+            self.0.resolve(user, table_name, namespace).await
+        }
+    }
+
+    /// Two catalogs with the same `finance.orders`: a mask written for
+    /// `ws_a.finance` masks `ws_a.finance.orders` and not `ws_b.finance.orders`,
+    /// and a catalog-less scan is denied rather than keyed without a catalog.
+    #[tokio::test]
+    async fn catalog_scoped_store_masks_only_the_named_catalog() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::TableReference;
+        use datafusion::logical_expr::builder::table_scan;
+
+        let inner = crate::policy_store::InMemoryPolicyStore::new();
+        let mut policy = ResolvedPolicy::default();
+        policy
+            .column_masks
+            .insert("ssn".to_string(), MaskType::Nullify);
+        inner
+            .add_table_policy("ws_a.finance", "orders", policy)
+            .await;
+        let rewriter = PolicyPlanRewriter::new(Arc::new(CatalogScopedStore(inner)));
+        let user = diag_user(&[]);
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("ssn", DataType::Utf8, true),
+        ]);
+        let scan_of =
+            |r: TableReference| table_scan(Some(r), &schema, None).unwrap().build().unwrap();
+
+        let (_, a) = rewriter
+            .evaluate(
+                &user,
+                &crate::TableScope::default(),
+                scan_of(TableReference::full("ws_a", "finance", "orders")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            a.columns_masked,
+            vec!["ssn".to_string()],
+            "named catalog is masked"
+        );
+        assert!(!a.denied);
+
+        let (_, b) = rewriter
+            .evaluate(
+                &user,
+                &crate::TableScope::default(),
+                scan_of(TableReference::full("ws_b", "finance", "orders")),
+            )
+            .await
+            .unwrap();
+        assert!(
+            b.columns_masked.is_empty(),
+            "another catalog's same-named table is not"
+        );
+
+        let (_, none) = rewriter
+            .evaluate(
+                &user,
+                &crate::TableScope::default(),
+                scan_of(TableReference::partial("finance", "orders")),
+            )
+            .await
+            .unwrap();
+        assert!(
+            none.denied,
+            "no catalog to key on: deny, never the bare namespace"
         );
     }
 

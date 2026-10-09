@@ -161,6 +161,7 @@ pub async fn handle_insert(
     let (predicates, _) = sqe_policy::write_predicates::extract_write_predicates(
         enforcer,
         user,
+        None,
         &namespace_key,
         dml.table_name.table(),
         dml.target.schema(),
