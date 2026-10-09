@@ -233,7 +233,10 @@ fn count_sorters(plan: &Arc<dyn ExecutionPlan>) -> usize {
 }
 
 /// A copy of `ctx` that plans equi-joins as sort-merge joins, with its own
-/// query quota over `shared_pool`, at `target_partitions` when given.
+/// query quota over `shared_pool`, at `target_partitions` when given. The
+/// quota is a fair one: under a greedy quota one sorter, or one side's spill
+/// merge, could take every byte while another sorter still held nothing, and
+/// a sorter refused with nothing to spill fails the query.
 fn sort_merge_context(
     ctx: &SessionContext,
     shared_pool: Arc<dyn MemoryPool>,
@@ -253,6 +256,7 @@ fn sort_merge_context(
         shared_pool,
         limit,
         headroom_percent,
+        true,
     )
 }
 

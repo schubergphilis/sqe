@@ -36,11 +36,13 @@ impl MemoryPool for QueryMemoryPool {
     }
 
     fn register(&self, consumer: &MemoryConsumer) {
+        self.budget.register(consumer);
         self.shared.register(consumer);
     }
 
     fn unregister(&self, consumer: &MemoryConsumer) {
         self.shared.unregister(consumer);
+        self.budget.unregister(consumer);
     }
 
     fn grow(&self, reservation: &MemoryReservation, additional: usize) {
@@ -56,8 +58,12 @@ impl MemoryPool for QueryMemoryPool {
     }
 
     fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> Result<()> {
-        self.budget
-            .try_charge(reservation.consumer(), additional, "query.max_query_memory")?;
+        self.budget.try_charge(
+            reservation.consumer(),
+            reservation.size(),
+            additional,
+            "query.max_query_memory",
+        )?;
         if let Err(error) = self.shared.try_grow(reservation, additional) {
             self.budget.release(reservation.consumer(), additional);
             return Err(error);
@@ -97,27 +103,34 @@ pub(crate) fn with_query_limit(
     headroom_percent: u8,
 ) -> SessionContext {
     let shared = Arc::clone(&ctx.runtime_env().memory_pool);
-    with_query_limit_over(ctx, shared, limit, headroom_percent)
+    with_query_limit_over(ctx, shared, limit, headroom_percent, false)
 }
 
 /// [`with_query_limit`] with the shared pool given explicitly, for a context
 /// whose own pool is already a query pool. The join fallback (#784) uses it
 /// to give the retry a fresh quota instead of nesting it inside the first
-/// attempt's.
+/// attempt's, with `fair_share` set so its sorts share the quota
+/// ([`HeadroomBudget::with_fair_share`]).
 pub(crate) fn with_query_limit_over(
     ctx: SessionContext,
     shared: Arc<dyn MemoryPool>,
     limit: usize,
     headroom_percent: u8,
+    fair_share: bool,
 ) -> SessionContext {
     if limit == 0 {
         return ctx;
     }
+    let budget = HeadroomBudget::new(limit, headroom_percent, true);
     let mut runtime = (*ctx.runtime_env()).clone();
     runtime.memory_pool = Arc::new(QueryMemoryPool {
         shared,
         limit,
-        budget: HeadroomBudget::new(limit, headroom_percent, true),
+        budget: if fair_share {
+            budget.with_fair_share()
+        } else {
+            budget
+        },
     });
     let state = SessionStateBuilder::from(ctx.state())
         .with_runtime_env(Arc::new(runtime))
@@ -252,6 +265,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(light[0].num_rows(), 1);
+        assert_eq!(shared.reserved(), 0);
+    }
+
+    #[test]
+    fn a_fair_query_pool_counts_its_registered_consumers() {
+        let shared: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024));
+        let query = with_query_limit_over(SessionContext::new(), shared.clone(), 1000, 0, true);
+        let pool = &query.runtime_env().memory_pool;
+        let a = MemoryConsumer::new("a").with_can_spill(true).register(pool);
+        let b = MemoryConsumer::new("b").with_can_spill(true).register(pool);
+        a.try_grow(100).unwrap();
+        a.try_grow(400).unwrap();
+        assert!(a.try_grow(1).is_err(), "two consumers share 1000 bytes");
+        b.try_grow(500).unwrap();
+        drop(b);
+        a.try_grow(500).unwrap();
+        drop(a);
         assert_eq!(shared.reserved(), 0);
     }
 
