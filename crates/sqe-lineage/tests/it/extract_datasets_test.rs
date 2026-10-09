@@ -7,8 +7,11 @@ use std::sync::Arc;
 
 fn lookup_polaris() -> CatalogLookup {
     Arc::new(|name: &str| match name {
-        "polaris" => "https://polaris.example/api/catalog".into(),
-        other => format!("sqe://{other}"),
+        "polaris" => sqe_lineage::extract::CatalogInfo::new(
+            "polaris",
+            Some("https://polaris.example/api/catalog".into()),
+        ),
+        other => sqe_lineage::extract::CatalogInfo::new(other, None),
     })
 }
 
@@ -42,11 +45,11 @@ fn table_scan_yields_one_input_dataset_with_multi_catalog_namespace() {
         &[("id", DataType::Int64), ("amount", DataType::Float64)],
     );
     let lookup = lookup_polaris();
-    let inputs = datasets::extract_inputs(&plan, &lookup);
+    let inputs = datasets::extract_inputs(&plan, &lookup, &sqe_lineage::LineageScope::default());
 
     assert_eq!(inputs.len(), 1);
     let input = &inputs[0];
-    assert_eq!(input.namespace, "https://polaris.example/api/catalog");
+    assert_eq!(input.namespace, "sqe://polaris");
     assert_eq!(input.name, "sales.orders");
     let schema = input.facets.schema.as_ref().expect("schema facet present");
     assert_eq!(schema.fields.len(), 2);
@@ -60,7 +63,7 @@ fn table_scan_yields_one_input_dataset_with_multi_catalog_namespace() {
 fn unknown_catalog_falls_back_to_sqe_namespace() {
     let plan = build_simple_scan("nessie", "archive", "orders", &[("id", DataType::Int64)]);
     let lookup = lookup_polaris();
-    let inputs = datasets::extract_inputs(&plan, &lookup);
+    let inputs = datasets::extract_inputs(&plan, &lookup, &sqe_lineage::LineageScope::default());
 
     assert_eq!(inputs.len(), 1);
     assert_eq!(inputs[0].namespace, "sqe://nessie");
@@ -80,7 +83,7 @@ fn two_part_table_name_uses_default_catalog() {
         .unwrap();
 
     let lookup = lookup_polaris();
-    let inputs = datasets::extract_inputs(&plan, &lookup);
+    let inputs = datasets::extract_inputs(&plan, &lookup, &sqe_lineage::LineageScope::default());
 
     assert_eq!(inputs.len(), 1);
     // 2-part falls back to default catalog

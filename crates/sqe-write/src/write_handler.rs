@@ -380,17 +380,18 @@ async fn scalar_count(df: datafusion::dataframe::DataFrame, label: &str) -> sqe_
 /// fan out column lineage. We synthesise that wrapper here purely for lineage
 /// capture; the wrapper plan is never executed.
 ///
-/// The target schema is derived from `source.schema()` so column-name
-/// alignment matches what the writer will persist (DataFusion's planner has
-/// already projected source columns to the target shape by ordinal — see
-/// design spec §5.3).
+/// The target stub's schema is `target` when the write goes into an existing
+/// table (INSERT: the table's own columns, which the extractor names the
+/// output fields after, by position), else `source.schema()` (CTAS, and the
+/// self-rewrites whose source IS the table).
 fn build_lineage_insert_plan(
     source: LogicalPlan,
+    target: Option<ArrowSchema>,
     catalog: &str,
     namespace: &str,
     table: &str,
 ) -> sqe_core::Result<LogicalPlan> {
-    let arrow_schema: ArrowSchema = source.schema().as_arrow().clone();
+    let arrow_schema: ArrowSchema = target.unwrap_or_else(|| source.schema().as_arrow().clone());
     let target_mem = MemTable::try_new(Arc::new(arrow_schema), vec![vec![]])
         .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build lineage target stub: {e}")))?;
     let target_provider: Arc<dyn datafusion::catalog::TableProvider> = Arc::new(target_mem);
@@ -408,6 +409,46 @@ fn build_lineage_insert_plan(
     .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build lineage INSERT wrapper: {e}")))?
     .build()
     .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build lineage plan: {e}")))
+}
+
+/// Record the Iceberg snapshot a write committed on the lineage wrapper it
+/// captured, so the emitter reports it as the OL `version` facet. The wrapper
+/// is rebuilt with the id in its target stub's schema metadata
+/// (`sqe_lineage::extract::SNAPSHOT_ID_METADATA_KEY`); anything other than a
+/// captured `Dml` wrapper, or no snapshot, leaves `plan_out` as it is.
+fn record_lineage_snapshot(
+    plan_out: &mut Option<sqe_lineage::PlanOrHint>,
+    snapshot_id: Option<i64>,
+) {
+    let Some(snapshot_id) = snapshot_id else {
+        return;
+    };
+    let Some(sqe_lineage::PlanOrHint::Plan(plan)) = plan_out.as_mut() else {
+        return;
+    };
+    let LogicalPlan::Dml(dml) = plan.as_ref() else {
+        return;
+    };
+    let target = dml.target.schema();
+    let mut metadata = target.metadata().clone();
+    metadata.insert(
+        sqe_lineage::extract::SNAPSHOT_ID_METADATA_KEY.to_string(),
+        snapshot_id.to_string(),
+    );
+    let schema = target.as_ref().clone().with_metadata(metadata);
+    let rebuilt = MemTable::try_new(Arc::new(schema), vec![vec![]]).and_then(|stub| {
+        LogicalPlanBuilder::insert_into(
+            dml.input.as_ref().clone(),
+            dml.table_name.clone(),
+            provider_as_source(Arc::new(stub)),
+            InsertOp::Append,
+        )?
+        .build()
+    });
+    match rebuilt {
+        Ok(wrapper) => **plan = wrapper,
+        Err(e) => tracing::debug!(error = %e, "lineage: could not record the committed snapshot"),
+    }
 }
 
 /// Extract the target table `ObjectName` from a `Statement::Delete`. Centralises
@@ -491,11 +532,21 @@ fn try_resolve_update_target_ident(stmt: &Statement, session: &Session) -> Optio
 }
 
 /// Resolve the (catalog, namespace, table) tuple used to label a write target
-/// in OL events. SQE's catalog name is whatever `resolve_default_catalog()`
-/// returns; the OL `catalog_lookup` falls back to `sqe://<name>` when the
-/// operator hasn't configured an explicit URL for it.
-fn lineage_target_parts(config: &SqeConfig, table_ident: &TableIdent) -> (String, String, String) {
-    let catalog = config.resolve_default_catalog();
+/// in OL events. The catalog is the one the write resolves against
+/// ([`resolve_target_catalog`]: the statement's qualifier, else the session
+/// catalog), falling back to `resolve_default_catalog()` for an unqualified
+/// statement in a session that names none. It used to be the configured
+/// default always, so a write into a workspace catalog was labelled with the
+/// default one. The OL `catalog_lookup` maps the name to its Iceberg catalog.
+fn lineage_target_parts(
+    config: &SqeConfig,
+    session: &Session,
+    name: &ObjectName,
+    table_ident: &TableIdent,
+) -> (String, String, String) {
+    let catalog = resolve_target_catalog(catalog_qualifier(name), session)
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| config.resolve_default_catalog());
     // `NamespaceIdent::Display` joins parts with a literal dot, which matches
     // how the OL extractor parses `<catalog>.<schema>.<table>` (it splits on
     // dots in `parse_table_ref`). `to_url_string` uses the unit separator
@@ -1554,6 +1605,7 @@ impl WriteHandler {
     /// fail the write.
     async fn capture_self_lineage(
         &self,
+        session: &Session,
         ctx: &DFSessionContext,
         table_ident: &TableIdent,
         table_factor_name: &sqlparser::ast::ObjectName,
@@ -1573,8 +1625,9 @@ impl WriteHandler {
         };
         let source_plan = df.logical_plan().clone();
         let (lin_catalog, lin_namespace, lin_table) =
-            lineage_target_parts(&self.config, table_ident);
-        match build_lineage_insert_plan(source_plan, &lin_catalog, &lin_namespace, &lin_table) {
+            lineage_target_parts(&self.config, session, table_factor_name, table_ident);
+        match build_lineage_insert_plan(source_plan, None, &lin_catalog, &lin_namespace, &lin_table)
+        {
             Ok(wrapper) => {
                 *plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(wrapper)));
             }
@@ -1748,9 +1801,9 @@ impl WriteHandler {
         // REPLACE path executes the stream.
         let source_plan = df.logical_plan().clone();
         let (lin_catalog, lin_namespace, lin_table) =
-            lineage_target_parts(&self.config, &table_ident);
+            lineage_target_parts(&self.config, session, table_name, &table_ident);
         if let Ok(wrapper) =
-            build_lineage_insert_plan(source_plan, &lin_catalog, &lin_namespace, &lin_table)
+            build_lineage_insert_plan(source_plan, None, &lin_catalog, &lin_namespace, &lin_table)
         {
             *plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(wrapper)));
         }
@@ -1873,7 +1926,7 @@ impl WriteHandler {
         let cleanup_guard =
             WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "ctas-streaming")
                 .with_metrics(self.metrics.clone());
-        let post_create: sqe_core::Result<usize> = async {
+        let post_create: sqe_core::Result<(usize, Option<i64>)> = async {
             let stream = self.execute_source_stream(df, "CTAS").await?;
             // Puffin NDV sketches ride along on the stream when the table
             // opted in; the buffered path clones batches instead, which the
@@ -1891,10 +1944,11 @@ impl WriteHandler {
             )
             .await?;
 
+            let mut snapshot_id = None;
             if !data_files.is_empty() {
                 let files_for_retry = data_files.clone();
                 let catalog_for_commit = catalog.clone();
-                commit_with_retry(
+                let committed = commit_with_retry(
                     catalog.as_ref(),
                     &create_ident,
                     "ctas-streaming",
@@ -1913,6 +1967,7 @@ impl WriteHandler {
                 .map_err(|e| {
                     SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to commit CTAS transaction: {e}"))
                 })?;
+                snapshot_id = committed.metadata().current_snapshot_id();
                 cleanup_guard.mark_committed();
                 info!(
                     table = %create_ident,
@@ -1935,7 +1990,7 @@ impl WriteHandler {
                     "CTAS created empty table (no data to write)"
                 );
             }
-            Ok(total_rows)
+            Ok((total_rows, snapshot_id))
         }
         .await;
 
@@ -1947,7 +2002,10 @@ impl WriteHandler {
             );
             rollback_ctas_partial_create(&catalog, &table, &create_ident).await;
         }
-        let total_rows = post_create?;
+        let (total_rows, snapshot_id) = post_create?;
+        // A staged replacement is renamed into place below and keeps its
+        // snapshot, so the id names the target's data either way.
+        record_lineage_snapshot(plan_out, snapshot_id);
 
         // Swap a staged replacement into place (500). Both calls are metadata
         // only. The failure message names the staged table so the swap can be
@@ -2222,10 +2280,17 @@ impl WriteHandler {
                     self.enforce_source_plan(session, &sqe_policy::TableScope::of(ctx), source_plan)
                         .await?;
 
+                // The stub carries the target table's columns, so lineage
+                // names output column i after the table's column i (the
+                // source is in table order, reordered above for an explicit
+                // column list), not after the SELECT expression feeding it.
                 let (lin_catalog, lin_namespace, lin_table) =
-                    lineage_target_parts(&self.config, &table_ident);
+                    lineage_target_parts(&self.config, session, table_name, &table_ident);
                 let lineage_plan = build_lineage_insert_plan(
                     enforced_plan.clone(),
+                    build_arrow_schema_for_table(&table)
+                        .ok()
+                        .map(|s| s.as_ref().clone()),
                     &lin_catalog,
                     &lin_namespace,
                     &lin_table,
@@ -2279,15 +2344,17 @@ impl WriteHandler {
             return affected_rows_batch(0);
         }
 
-        self.commit_written_files(
-            session,
-            &session_catalog,
-            &table_ident,
-            data_files,
-            overwrite,
-        )
-        .await?;
+        let snapshot_id = self
+            .commit_written_files(
+                session,
+                &session_catalog,
+                &table_ident,
+                data_files,
+                overwrite,
+            )
+            .await?;
         cleanup_guard.mark_committed();
+        record_lineage_snapshot(plan_out, snapshot_id);
 
         if let Some(sketches) = finish_puffin_sketches(sketch_acc) {
             let op = if overwrite {
@@ -3533,7 +3600,7 @@ impl WriteHandler {
         // synthesise this by planning `SELECT * FROM target` and wrapping
         // it in a synthetic INSERT against the same target. Errors are
         // swallowed because lineage capture is best-effort.
-        self.capture_self_lineage(ctx, &table_ident, table_factor_name, plan_out)
+        self.capture_self_lineage(session, ctx, &table_ident, table_factor_name, plan_out)
             .await;
 
         let mode = resolve_delete_mode(table.metadata().properties())?;
@@ -3838,7 +3905,7 @@ impl WriteHandler {
         // Capture lineage: UPDATE rewrites target rows in place. v1 emits
         // identity column lineage; richer per-column SET-expression tracing
         // is deferred. See `capture_self_lineage` for details.
-        self.capture_self_lineage(ctx, &table_ident, table_factor_name, plan_out)
+        self.capture_self_lineage(session, ctx, &table_ident, table_factor_name, plan_out)
             .await;
 
         let mode = resolve_update_mode(table.metadata().properties())?;
@@ -4910,8 +4977,9 @@ impl WriteHandler {
         // MERGE_UPDATE annotation is deferred (spec §5.3 v1 limitation).
         if let Some(src_plan) = source_plan {
             let (lin_catalog, lin_namespace, lin_table) =
-                lineage_target_parts(&self.config, &table_ident);
-            match build_lineage_insert_plan(src_plan, &lin_catalog, &lin_namespace, &lin_table) {
+                lineage_target_parts(&self.config, session, target_name, &table_ident);
+            match build_lineage_insert_plan(src_plan, None, &lin_catalog, &lin_namespace, &lin_table)
+            {
                 Ok(wrapper) => {
                     *plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(wrapper)));
                 }
@@ -5658,14 +5726,14 @@ impl WriteHandler {
         table_ident: &TableIdent,
         new_data_files: Vec<DataFile>,
         overwrite: bool,
-    ) -> sqe_core::Result<()> {
+    ) -> sqe_core::Result<Option<i64>> {
         let bridge = catalog.as_catalog();
         if !overwrite {
             if new_data_files.is_empty() {
-                return Ok(());
+                return Ok(None);
             }
             let bridge_ref = bridge.as_ref();
-            commit_with_retry(bridge_ref, table_ident, "insert", move |fresh_table| {
+            let committed = commit_with_retry(bridge_ref, table_ident, "insert", move |fresh_table| {
                 let files = new_data_files.clone();
                 async move {
                     let tx = Transaction::new(&fresh_table);
@@ -5678,7 +5746,8 @@ impl WriteHandler {
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to commit INSERT: {e}")))?;
             self.after_commit(session, catalog.as_ref(), table_ident)
                 .await;
-            return Ok(());
+            // The append's snapshot, for lineage (the OL `version` facet).
+            return Ok(committed.metadata().current_snapshot_id());
         }
 
         // Distinct partitions touched by the new files (dynamic overwrite).
@@ -5788,7 +5857,9 @@ impl WriteHandler {
             self.after_commit(session, catalog.as_ref(), table_ident)
                 .await;
         }
-        Ok(())
+        // The rewrite helper does not hand back the committed table; lineage
+        // records no snapshot for an INSERT OVERWRITE.
+        Ok(None)
     }
 
     /// Extend an about-to-be-removed set of data files with the position-delete
@@ -8693,6 +8764,109 @@ mod tests {
             resolve_target_catalog(Some("other_wh".to_string()), &session),
             Some("other_wh".to_string())
         );
+    }
+
+    /// Lineage labels a write with the catalog it resolves against, not the
+    /// configured default: explicit qualifier, then the session catalog.
+    #[test]
+    fn lineage_target_parts_follow_the_write_catalog() {
+        use sqlparser::ast::Ident;
+        let config = write_test_config();
+        let mut session = test_session(Some("sales"));
+        let bare = ObjectName::from(vec![Ident::new("t")]);
+        let ident = resolve_table_ident(&bare, &session).unwrap();
+        assert_eq!(
+            lineage_target_parts(&config, &session, &bare, &ident),
+            (
+                config.resolve_default_catalog(),
+                "sales".to_string(),
+                "t".to_string()
+            )
+        );
+
+        session.default_catalog = Some("workspace1".to_string());
+        assert_eq!(
+            lineage_target_parts(&config, &session, &bare, &ident).0,
+            "workspace1"
+        );
+
+        let full = ObjectName::from(vec![Ident::new("ws2"), Ident::new("s"), Ident::new("t")]);
+        let ident = resolve_table_ident(&full, &session).unwrap();
+        assert_eq!(
+            lineage_target_parts(&config, &session, &full, &ident),
+            ("ws2".to_string(), "s".to_string(), "t".to_string())
+        );
+    }
+
+    /// An INSERT's lineage wrapper carries the target table's columns, so the
+    /// output fields are the table's (`country, seg, n`), not the SELECT's
+    /// (`country, segment, Int64(1)`).
+    #[tokio::test]
+    async fn insert_lineage_names_fields_after_the_target_table() {
+        let ctx = DFSessionContext::new();
+        let customers = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("country", DataType::Utf8, false),
+            Field::new("segment", DataType::Utf8, false),
+        ]));
+        ctx.register_table(
+            "customers",
+            Arc::new(MemTable::try_new(customers, vec![vec![]]).unwrap()),
+        )
+        .unwrap();
+        let source = ctx
+            .sql("SELECT country, segment, 1 FROM customers")
+            .await
+            .unwrap()
+            .logical_plan()
+            .clone();
+        let target = arrow_schema::Schema::new(vec![
+            Field::new("country", DataType::Utf8, true),
+            Field::new("seg", DataType::Utf8, true),
+            Field::new("n", DataType::Int64, true),
+        ]);
+        let wrapper =
+            build_lineage_insert_plan(source, Some(target), "workspace1", "default", "lin_probe")
+                .unwrap();
+        let lookup: sqe_lineage::extract::CatalogLookup =
+            Arc::new(|n: &str| sqe_lineage::extract::CatalogInfo::new(n, None));
+        let (_, outputs) = sqe_lineage::extract::extract_lineage(&wrapper, &lookup);
+        let fields: Vec<&str> = outputs[0]
+            .facets
+            .schema
+            .as_ref()
+            .unwrap()
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(fields, ["country", "seg", "n"]);
+        let lineage = outputs[0].facets.columnLineage.as_ref().unwrap();
+        assert_eq!(
+            lineage.fields["seg"].inputFields[0].field, "segment",
+            "seg is fed by customers.segment"
+        );
+        assert!(lineage.fields["n"].inputFields.is_empty());
+
+        // After the commit the write records its snapshot on the wrapper;
+        // the extractor reports it as the OL `version` facet and nothing else
+        // about the output changes.
+        let mut plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(wrapper)));
+        record_lineage_snapshot(&mut plan_out, Some(4205761418235361718));
+        let Some(sqe_lineage::PlanOrHint::Plan(recorded)) = plan_out else {
+            panic!("wrapper kept")
+        };
+        let (_, outputs) = sqe_lineage::extract::extract_lineage(&recorded, &lookup);
+        assert_eq!(
+            outputs[0].facets.version.as_ref().unwrap().datasetVersion,
+            "4205761418235361718"
+        );
+        assert_eq!(outputs[0].name, "default.lin_probe");
+        assert_eq!(outputs[0].facets.schema.as_ref().unwrap().fields.len(), 3);
+
+        // No snapshot (empty write, INSERT OVERWRITE): nothing recorded.
+        let mut untouched = Some(sqe_lineage::PlanOrHint::Plan(recorded));
+        record_lineage_snapshot(&mut untouched, None);
+        assert!(matches!(untouched, Some(sqe_lineage::PlanOrHint::Plan(_))));
     }
 
     fn test_session(default_schema: Option<&str>) -> sqe_core::Session {

@@ -8,7 +8,7 @@ fn cfg() -> Arc<EmitterConfig> {
     Arc::new(EmitterConfig {
         job_namespace: "sqe-test".into(),
         producer: "https://test/v0".into(),
-        catalog_lookup: Arc::new(|n| format!("sqe://{n}")),
+        catalog_lookup: Arc::new(|n| sqe_lineage::extract::CatalogInfo::new(n, None)),
     })
 }
 

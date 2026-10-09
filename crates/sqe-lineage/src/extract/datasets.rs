@@ -3,24 +3,29 @@
 //! See `docs/superpowers/specs/2026-05-08-openlineage-emitter-design.md` §4.4.
 
 use crate::event::*;
-use crate::extract::CatalogLookup;
+use crate::extract::{dataset_identity, CatalogLookup};
+use crate::observer::LineageScope;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::{DdlStatement, LogicalPlan, TableScan};
 
-/// Parse a (possibly quoted) qualified table name into (catalog, schema, table)
-/// tuple, applying SQE's "default catalog" / "default schema" fallbacks per
-/// spec §4.4.
-fn parse_table_ref(name: &str) -> Option<(String, String, String)> {
+/// Parse a (possibly quoted) qualified table name into (catalog, schema, table),
+/// filling a missing catalog and schema from the statement's session `scope`:
+/// `t` is `<scope.catalog>.<scope.schema>.t` and `s.t` is `<scope.catalog>.s.t`,
+/// the same way DataFusion resolved them when it planned the statement.
+pub(crate) fn parse_table_ref(
+    name: &str,
+    scope: &LineageScope,
+) -> Option<(String, String, String)> {
     let parts: Vec<String> = name
         .split('.')
         .map(|s| s.trim_matches('"').to_string())
         .collect();
     match parts.len() {
         3 => Some((parts[0].clone(), parts[1].clone(), parts[2].clone())),
-        2 => Some(("default".to_string(), parts[0].clone(), parts[1].clone())),
+        2 => Some((scope.catalog.clone(), parts[0].clone(), parts[1].clone())),
         1 => Some((
-            "default".to_string(),
-            "default".to_string(),
+            scope.catalog.clone(),
+            scope.schema.clone(),
             parts[0].clone(),
         )),
         _ => None,
@@ -28,19 +33,25 @@ fn parse_table_ref(name: &str) -> Option<(String, String, String)> {
 }
 
 /// Walk the plan for TableScan nodes and produce one InputDataset per scan.
-pub fn extract_inputs(plan: &LogicalPlan, lookup: &CatalogLookup) -> Vec<InputDataset> {
+pub fn extract_inputs(
+    plan: &LogicalPlan,
+    lookup: &CatalogLookup,
+    scope: &LineageScope,
+) -> Vec<InputDataset> {
     let mut out = Vec::new();
     let _ = plan.apply(|node| {
         if let LogicalPlan::TableScan(TableScan {
             table_name, source, ..
         }) = node
         {
-            let Some((catalog, schema, table)) = parse_table_ref(&table_name.to_string()) else {
+            let Some((catalog, schema, table)) = parse_table_ref(&table_name.to_string(), scope)
+            else {
                 return Ok(TreeNodeRecursion::Continue);
             };
 
-            let namespace = lookup(&catalog);
-            let schema_facet = SchemaFacet {
+            let id = dataset_identity(lookup, &catalog, &schema, &table);
+            let mut facets = id.facets;
+            facets.schema = Some(SchemaFacet {
                 fields: source
                     .schema()
                     .fields()
@@ -50,19 +61,12 @@ pub fn extract_inputs(plan: &LogicalPlan, lookup: &CatalogLookup) -> Vec<InputDa
                         field_type: f.data_type().to_string(),
                     })
                     .collect(),
-            };
+            });
 
             out.push(InputDataset {
-                namespace: namespace.clone(),
-                name: format!("{schema}.{table}"),
-                facets: DatasetFacets {
-                    schema: Some(schema_facet),
-                    dataSource: Some(DataSourceFacet {
-                        name: catalog.clone(),
-                        uri: namespace,
-                    }),
-                    columnLineage: None,
-                },
+                namespace: id.namespace,
+                name: id.name,
+                facets,
             });
         }
         Ok(TreeNodeRecursion::Continue)
@@ -78,7 +82,11 @@ pub fn extract_inputs(plan: &LogicalPlan, lookup: &CatalogLookup) -> Vec<InputDa
 /// source plan, which this layer doesn't see. We leave ``facets.schema = None``
 /// here as a sentinel so the caller's "did this output already get a schema?"
 /// check is unambiguous.
-pub fn extract_outputs(plan: &LogicalPlan, lookup: &CatalogLookup) -> Vec<OutputDataset> {
+pub fn extract_outputs(
+    plan: &LogicalPlan,
+    lookup: &CatalogLookup,
+    scope: &LineageScope,
+) -> Vec<OutputDataset> {
     let mut out = Vec::new();
     let _ = plan.apply(|node| {
         let target_name: Option<String> = match node {
@@ -90,19 +98,12 @@ pub fn extract_outputs(plan: &LogicalPlan, lookup: &CatalogLookup) -> Vec<Output
         };
 
         if let Some(name) = target_name {
-            if let Some((catalog, schema, table)) = parse_table_ref(&name) {
-                let namespace = lookup(&catalog);
+            if let Some((catalog, schema, table)) = parse_table_ref(&name, scope) {
+                let id = dataset_identity(lookup, &catalog, &schema, &table);
                 out.push(OutputDataset {
-                    namespace: namespace.clone(),
-                    name: format!("{schema}.{table}"),
-                    facets: DatasetFacets {
-                        schema: None,
-                        dataSource: Some(DataSourceFacet {
-                            name: catalog.clone(),
-                            uri: namespace,
-                        }),
-                        columnLineage: None,
-                    },
+                    namespace: id.namespace,
+                    name: id.name,
+                    facets: id.facets,
                     outputFacets: OutputDatasetFacets::default(),
                 });
             }
