@@ -68,6 +68,9 @@ pub const REST_CATALOG_PROP_AUTH_TYPE: &str = "rest.auth.type";
 /// Google Cloud Storage credentials JSON string, plain or base64 encoded.
 pub use iceberg::io::GCS_CREDENTIALS_JSON;
 
+// SQE: the BigLake auth that reads this and `gcp_credential` is not part of
+// this vendored build; both are kept to stay close to upstream.
+#[allow(dead_code)]
 pub(crate) const GCP_CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 
 const ICEBERG_REST_SPEC_VERSION: &str = "0.14.1";
@@ -305,6 +308,7 @@ impl RestCatalogConfig {
     ///
     /// `gcs.credentials-json` is accepted as either raw JSON or base64-encoded
     /// JSON because both forms are used by existing Iceberg integrations.
+    #[allow(dead_code)] // SQE: see GCP_CLOUD_PLATFORM_SCOPE.
     pub(crate) fn gcp_credential(&self) -> Option<String> {
         let value = self.props.get(GCS_CREDENTIALS_JSON)?;
         if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(value)

@@ -35,7 +35,7 @@ exclude = ["vendor/iceberg-rust", "vendor/datafusion-iceberg", "vendor/sqlite-rs
 [workspace.package]
 version = "0.49.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.99"
 license = "Apache-2.0"
 repository = "https://gitlab.schubergphilis.com/data-ai/chameleon/sqlengine"
 homepage = "https://gitlab.schubergphilis.com/data-ai/chameleon/sqlengine"

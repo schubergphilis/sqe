@@ -116,7 +116,7 @@ impl Drop for ReservationGuard {
             // reserved, but keep the same defensive shape as the count.
             let _ = e
                 .load
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                     Some(cur.saturating_sub(self.load))
                 });
         }
