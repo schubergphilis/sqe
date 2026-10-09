@@ -58,6 +58,44 @@ pub(crate) fn reject_multi_statement(tokens: &[TokenWithSpan]) -> sqe_core::Resu
     Ok(())
 }
 
+/// Reject text that [`crate::front_door::EXECUTION_DIALECT`] tokenizes
+/// differently from `GenericDialect` (#683). Every classifier parses with
+/// Generic, but DataFusion plans the text under the execution dialect, and
+/// the two disagree on nested block comments, `q'[...]'`, `E'...'` and
+/// `U&'...'` strings and `@`/`#` in identifiers. `/* /* */ INSERT INTO t ...;
+/// -- */ SELECT * FROM t` was a SELECT to the classifier and an INSERT to the
+/// planner. `tokens` is the Generic stream of `sql`; comments count, so the
+/// two must agree on where every comment ends as well.
+pub(crate) fn reject_dialect_divergence(
+    sql: &str,
+    tokens: &[TokenWithSpan],
+) -> sqe_core::Result<()> {
+    let Some(dialect) = sqlparser::dialect::dialect_from_str(crate::front_door::EXECUTION_DIALECT)
+    else {
+        return Err(syntax_error(format!(
+            "unknown execution dialect {}",
+            crate::front_door::EXECUTION_DIALECT
+        )));
+    };
+    let execution = tokenize(dialect.as_ref(), sql).unwrap_or_default();
+    let Some(at) = tokens
+        .iter()
+        .zip(&execution)
+        .position(|(generic, engine)| generic.token != engine.token)
+        .or((tokens.len() != execution.len()).then(|| tokens.len().min(execution.len())))
+    else {
+        return Ok(());
+    };
+    let loc = tokens.get(at).or(tokens.last()).map(|t| t.span.start);
+    Err(syntax_error(format!(
+        "Parse error: the engine's SQL dialect reads this statement differently from \
+         line {}, column {} (a nested block comment, or a q'[...]', E'...' or U&'...' \
+         string); rewrite it without them.",
+        loc.map_or(1, |l| l.line),
+        loc.map_or(1, |l| l.column)
+    )))
+}
+
 /// Convert a tokenizer `Location` (1-based line and column, columns counted
 /// in characters) into a byte offset into `sql`. Used to hand the text of a
 /// statement body -- starting at its first significant token, so leading

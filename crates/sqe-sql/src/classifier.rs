@@ -496,12 +496,14 @@ pub(crate) enum Dispatch {
     Standard(Result<Vec<Statement>, ParserError>),
 }
 
-/// Tokenize once, reject multi-statement input, classify SQE-only grammar
+/// Tokenize once, reject text the execution dialect reads differently and
+/// multi-statement input, classify SQE-only grammar
 /// from the tokens, and otherwise parse with sqlparser. Both
 /// [`parse_and_classify`] and the SQL front door start here.
 pub(crate) fn dispatch(sql: &str) -> sqe_core::Result<Dispatch> {
     let dialect = GenericDialect {};
     let tokens = crate::token_scan::tokenize(&dialect, sql)?;
+    crate::token_scan::reject_dialect_divergence(sql, &tokens)?;
     crate::token_scan::reject_multi_statement(&tokens)?;
     let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens);
     if let Some(kind) = try_classify_custom(&mut parser, sql)? {
