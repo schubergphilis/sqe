@@ -387,6 +387,44 @@ mod tests {
                 ]));
                 prop_assert_eq!(arrow_to_trino_type(&row), format!("row(a {ks},b {vs})"));
             }
+
+            /// The JDBC driver's ClientTypeSignature rejects a `rawType`
+            /// holding `<`, `>` or `,`: at every depth the base name goes
+            /// in `rawType` and the children in `arguments`.
+            #[test]
+            fn nested_type_signatures_keep_parameters_out_of_raw_type(t in nested()) {
+                fn raw_types(v: &serde_json::Value, out: &mut Vec<String>) {
+                    match v {
+                        serde_json::Value::Object(m) => {
+                            if let Some(serde_json::Value::String(raw)) = m.get("rawType") {
+                                out.push(raw.clone());
+                            }
+                            m.values().for_each(|c| raw_types(c, out));
+                        }
+                        serde_json::Value::Array(a) => a.iter().for_each(|c| raw_types(c, out)),
+                        _ => {}
+                    }
+                }
+                let name = arrow_to_trino_type(&t);
+                let sig = sqe_trino_protocol::types::type_signature_for(&name);
+                let expected_base = match &t {
+                    DataType::List(_) | DataType::LargeList(_) => Some("array"),
+                    DataType::Map(..) => Some("map"),
+                    DataType::Struct(_) => Some("row"),
+                    _ => None,
+                };
+                if let Some(base) = expected_base {
+                    prop_assert_eq!(sig.raw_type.as_str(), base, "{}", name);
+                }
+                let mut raws = Vec::new();
+                raw_types(&serde_json::to_value(&sig).unwrap(), &mut raws);
+                for raw in raws {
+                    prop_assert!(
+                        !raw.contains(['(', ')', ',', '<', '>']),
+                        "{name} -> rawType {raw:?}"
+                    );
+                }
+            }
         }
     }
 }
