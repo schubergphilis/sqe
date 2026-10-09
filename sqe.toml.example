@@ -320,6 +320,15 @@ engine = "passthrough"
 # Mixed SQE+Spark MUST set project-tags = true so Spark sees the same
 # column tags SQE masks. Default is false (SQE-only Ranger deploys).
 # project-tags = true
+#
+# Key Ranger policies on the catalog too: a policy's `database` resource is
+# then "<catalog>.<namespace>" (e.g. "ws_sales.finance" for
+# ws_sales.finance.orders) instead of the namespace alone. Turn this on when
+# several Iceberg catalogs hold the same namespace.table names (one catalog
+# per workspace), or a mask written for one catalog applies to all of them.
+# Policies written without the catalog stop matching. Default false.
+# Environment override: SQE_POLICY__RANGER__CATALOG_SCOPED=true
+# catalog-scoped = true
 
 [session]
 idle_timeout_secs = 900       # 15 minutes — sessions idle longer than this are expired

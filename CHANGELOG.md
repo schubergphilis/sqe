@@ -17,6 +17,37 @@ All notable changes to SQE are documented in this file.
     1.2 GB still reserved; now it gets `Query was canceled` at 3.0 s and
     the reservation is back to zero within five seconds.
 
+- Ranger masks and row filters follow Ranger's policy and item order
+
+    Behaviour change. Within a mask policy the first matching item already
+    won; now the first mask policy to decide a column is final as well,
+    MASK_NONE included, so a later policy can no longer re-mask a column an
+    earlier one exempted. Policies with `policyPriority` override (1) are
+    evaluated first, then bundle order, on resource and tag policies. Within
+    a row-filter policy only the first matching item applies (SQE ANDed
+    every matching item), and an item with an empty expression filters
+    nothing instead of denying every row. An item with Ranger conditions
+    SQE cannot evaluate still fails closed: a conditional mask item
+    restricts its columns, and a conditional row-filter item does not stop
+    later items from applying. Row filters of separate policies are still
+    ANDed, which is stricter than Ranger.
+
+- Config: `[policy.ranger]` keys take the snake spelling, and env overrides land
+
+    The section only accepted kebab keys (`admin-password`) and ignored
+    unknown ones, while `SQE_POLICY__RANGER__ADMIN_PASSWORD` (the documented
+    way to set the password) overlays the snake key `admin_password`. The
+    override was dropped without an error and the store sent an empty
+    password; `hive_access_policies = false`, as the docs spell it, left the
+    gate on. Every key now takes both spellings, and an env override
+    replaces the kebab key from the file instead of colliding with it.
+
+- `SHOW EFFECTIVE POLICY` keys a multi-level namespace the way enforcement does
+
+    It looked policies up under the last namespace component while the
+    rewriter has used the full dotted namespace since #205, so for
+    `cat.a.b.t` it could report a different policy than the one applied.
+
 - Functions: `from_unixtime` returned NULL for a decimal argument
 
     SQE parses a literal such as `1700000000.5` as DECIMAL, and the Trino
@@ -197,6 +228,19 @@ All notable changes to SQE are documented in this file.
     validation; previously it silently never matched.
 
 ### Added
+
+- Ranger: `[policy.ranger] catalog_scoped` keys policies on the catalog
+
+    A Ranger `hive` policy's `database` was the table's namespace alone, so
+    in a deployment with one Iceberg catalog per workspace and the same
+    `namespace.table` in each, a mask written for one workspace applied to
+    all of them. With `catalog-scoped = true`
+    (`SQE_POLICY__RANGER__CATALOG_SCOPED`) the `database` an Iceberg table
+    matches is `<catalog>.<namespace>`, the last-component migration
+    fallback is off so nothing matches across catalogs, a reference without
+    a catalog is denied, and `CREATE POLICY ON TABLE cat.ns.t` writes
+    `cat.ns`. `SHOW STATS`, `SHOW EFFECTIVE POLICY` and the metadata-TVF
+    gate key the same way. Default false: existing policies keep matching.
 
 - File TVFs: per-catalog object-store prefixes, `[catalogs.<name>] tvf_prefixes`
 

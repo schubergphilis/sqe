@@ -217,8 +217,25 @@ fn insert_path(
     for (i, seg) in segs.iter().enumerate() {
         let last = i + 1 == segs.len();
         if last {
+            // An env name is always snake (`ADMIN_PASSWORD` -> `admin_password`),
+            // but a kebab-case section spells the key `admin-password` in TOML.
+            // Write over the kebab twin when the file has it: inserting the snake
+            // key next to it is a serde "duplicate field" error once the struct
+            // aliases the snake name, and was a silently ignored key before.
+            let twin;
+            let seg: &str = match &*cur {
+                toml::Value::Table(t) if !t.contains_key(*seg) => {
+                    twin = seg.replace('_', "-");
+                    if t.contains_key(&twin) {
+                        &twin
+                    } else {
+                        seg
+                    }
+                }
+                _ => seg,
+            };
             let existing = match cur {
-                toml::Value::Table(t) => t.get(*seg),
+                toml::Value::Table(t) => t.get(seg),
                 toml::Value::Array(arr) => {
                     let idx: usize = seg.parse().map_err(|_| {
                         SqeError::Config(format!(
@@ -237,7 +254,7 @@ fn insert_path(
             let parsed = parse_env_value(env_key, trimmed, existing)?;
             match cur {
                 toml::Value::Table(t) => {
-                    t.insert((*seg).to_string(), parsed);
+                    t.insert(seg.to_string(), parsed);
                 }
                 toml::Value::Array(arr) => {
                     let idx: usize = seg.parse().map_err(|_| {

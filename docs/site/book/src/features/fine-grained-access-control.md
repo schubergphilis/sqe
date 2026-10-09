@@ -26,7 +26,37 @@ admin-user = "admin"
 # Set the password via SQE_POLICY__RANGER__ADMIN_PASSWORD, not in the file.
 admin-password = ""
 cache-ttl-secs = 30            # resolved-policy cache TTL
+catalog-scoped = false         # true: policy `database` = "<catalog>.<namespace>" (default: false)
 ```
+
+Keys in `[policy.ranger]` take either spelling, `service-name` or `service_name`, and every key can be set from the environment as `SQE_POLICY__RANGER__<KEY>` (for example `SQE_POLICY__RANGER__CATALOG_SCOPED=true`).
+
+### Which `database` a policy names
+
+A Ranger `hive` policy has a `database`, a `table` and, for masks, a `column` resource. SQE matches the `database` against a key derived from the table's name:
+
+| Table | `catalog-scoped = false` (default) | `catalog-scoped = true` |
+|---|---|---|
+| Iceberg `ws_sales.finance.orders` | `finance` | `ws_sales.finance` |
+| Iceberg `ws_sales.a.b.orders` (multi-level namespace) | `a.b` | `ws_sales.a.b` |
+| Hive root `glue.bi.orders` | `glue.bi` | `glue.bi` |
+
+The default drops the catalog, the convention Hive and Spark/Kyuubi use, so one policy covers the same `namespace.table` in every catalog. That is wrong for a deployment that runs several Iceberg catalogs with the same namespace and table names, such as one catalog per workspace: a mask written for one workspace applies to all of them. Turn `catalog-scoped` on there, and write each policy's `database` as `<catalog>.<namespace>`. With it on:
+
+- A policy matches one catalog only. The compatibility fallback that lets a policy naming only the last namespace component (`finance` for `a.finance`) still match is off, so no policy can match across catalogs.
+- A table reference that carries no catalog is denied rather than looked up without one. The planner fills the session's catalog in, so this only bites a reference that cannot be resolved.
+- `CREATE POLICY ... ON TABLE` needs the three-part name and writes `<catalog>.<namespace>` as the `database`.
+- Policies written for the default convention stop matching. Rewrite them before turning the setting on, or masks disappear.
+
+Tag-based policies are unaffected: a tag policy names a tag, not a table.
+
+### Which item and which policy wins
+
+SQE evaluates mask and row-filter policies the way Ranger does:
+
+- **Within a policy the first matching item wins.** Ranger keeps `dataMaskPolicyItems` and `rowFilterPolicyItems` in the order you write them and stops at the first item whose users, groups or roles match. "Mask for everyone except group E" is therefore two items in this order: `{groups: [E], MASK_NONE}`, then `{groups: [public], MASK_NULL}`. Swap them and E is masked too. A row-filter item with an empty filter expression filters nothing, which is how an exemption is written there.
+- **Across mask policies the first policy that decides a column wins**, an exemption included. Policies with override priority (`policyPriority` 1) go first; within one priority SQE takes the order of the downloaded bundle. Ranger breaks that tie with a resource-specificity heuristic SQE does not reproduce, so do not write two same-priority mask policies on the same column for the same user; give the one that must win override priority.
+- **Across row-filter policies SQE applies every matching policy's filter**, ANDed. Ranger applies only the first. A user covered by two filter policies sees no more rows in SQE than in Ranger, and possibly fewer.
 
 `mask-precedence` settles the one case where a column is covered twice, by a resource policy naming it and by a tag policy matching its classification. `tag` is the default and matches the plugin order Hive and Spark/Kyuubi implement, so a rule authored once in Ranger renders the same value whichever engine reads it. `resource` restores the narrower most-specific-rule-wins reading. The column is masked either way; only which mask applies changes.
 
@@ -63,6 +93,8 @@ A Hive root has no Polaris in front of it. A Glue catalog or a sidecar warehouse
 This is on by default (`[policy.ranger] hive_access_policies = true`), because the alternative is that every table appearing in a Glue database is open to every authenticated user until someone writes a mask for it. Grant a broad group `select` on `<root>.*` to get the old behaviour deliberately; set the option to `false` to get it silently.
 
 Groups arrive from the JWT (`groups_claim` on the auth provider). A group-bound grant on a deployment without that claim matches nobody, which under this gate means everybody is denied; the store logs the group-only items once per bundle download for that reason.
+
+The same group binding applies to masks and row filters, on resource and tag policies alike. A policy item's `groups` are compared exactly, case included, with the strings in the token's groups claim; nothing is stripped or mapped. Keycloak's group-membership mapper sends `/SG-DataAnalysts` (a leading slash) when "Full group path" is on, which does not match a Ranger group named `SG-DataAnalysts`; turn the option off or name the group with the slash in Ranger.
 
 ## Row filters
 
