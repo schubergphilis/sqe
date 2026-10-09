@@ -1785,13 +1785,14 @@ mod tests {
     /// Issue #365: a stream that emits no batch but whose operator metrics
     /// keep advancing (a spilling final aggregate mid-merge) must NOT be
     /// aborted at the idle deadline — the guard extends instead.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn idle_timeout_extends_while_operator_metrics_advance() {
-        // 400 ms idle window, ticker every 20 ms: the ticker has twenty
-        // chances per window to be scheduled. The 50 ms / 10 ms version
-        // still aborted on a loaded CI runner (!983 test job) even with the
-        // seed below, because a starved runner can hold a task for more
-        // than 50 ms at a stretch.
+        // Paused clock: time only advances when every task is idle, and then
+        // to the next timer, so the 20 ms ticker always runs before the
+        // 400 ms deadline. On the wall clock a starved CI runner could hold
+        // the thread past the deadline, wake both timers together and let
+        // the stream sample the metrics before the ticker ran (!983, and
+        // again on !1361 with the 400 ms window).
         let idle = Duration::from_millis(400);
         let (mut stream, rows, _tracker, _qid) = idle_test_stream(idle).await;
 
@@ -1839,7 +1840,10 @@ mod tests {
 
     /// Progress-based extensions must not be unbounded: past the query
     /// deadline the stream aborts even though operators still advance.
-    #[tokio::test]
+    /// Paused clock for the same reason as the test above: on the wall
+    /// clock a starved runner can abort at the idle deadline before the
+    /// query deadline, with the wrong error.
+    #[tokio::test(start_paused = true)]
     async fn query_deadline_bounds_idle_extensions() {
         let (stream, rows, tracker, qid) = idle_test_stream(Duration::from_millis(50)).await;
         let mut stream = stream.with_query_deadline(Duration::from_millis(150));
