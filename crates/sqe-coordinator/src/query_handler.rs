@@ -1107,10 +1107,28 @@ impl QueryHandler {
         sql: &'a str,
         client_ip: Option<String>,
     ) -> futures::future::BoxFuture<'a, sqe_core::Result<Vec<RecordBatch>>> {
+        self.execute_with_id(session, sql, client_ip, None)
+    }
+
+    /// [`Self::execute`] with a caller-minted `query_id`.
+    ///
+    /// The Trino front door mints the query id it hands the client (the
+    /// protocol `id`) before the statement reaches the engine; passing it
+    /// here makes the tracker, the audit record and the OpenLineage `runId`
+    /// carry that same id, so a lineage run joins to the statement the user
+    /// saw. `None` mints a fresh UUIDv7 (every other caller). Same contract
+    /// as [`Self::execute_stream_with_id`] (finding 403).
+    pub fn execute_with_id<'a>(
+        &'a self,
+        session: &'a Session,
+        sql: &'a str,
+        client_ip: Option<String>,
+        query_id: Option<uuid::Uuid>,
+    ) -> futures::future::BoxFuture<'a, sqe_core::Result<Vec<RecordBatch>>> {
         // One statement-scoped set of prepared file-function providers for
         // the whole execution, whatever session context each step plans on.
         Box::pin(sqe_catalog::file_tvf_prepare::in_statement(
-            self.execute_inner(session, sql, client_ip),
+            self.execute_inner(session, sql, client_ip, query_id),
         ))
     }
 
@@ -1178,6 +1196,7 @@ impl QueryHandler {
         session: &Session,
         sql: &str,
         client_ip: Option<String>,
+        caller_query_id: Option<uuid::Uuid>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         // Issue #403: reject oversized SQL before parse so a client cannot
         // burn coordinator memory/CPU on an arbitrarily large statement.
@@ -1196,8 +1215,9 @@ impl QueryHandler {
         // (finding 700).
         // Failures from here until the execution race below return before
         // the statement's audit block, so each is audited on its way out.
-        let failed =
-            |e: SqeError| self.audit_failure(session, sql, start, client_ip.clone(), None, e);
+        let failed = |e: SqeError| {
+            self.audit_failure(session, sql, start, client_ip.clone(), caller_query_id, e)
+        };
         let kind = classify_user_sql(session, sql).map_err(failed)?;
         let kind_name = kind.name().to_string();
 
@@ -1281,8 +1301,9 @@ impl QueryHandler {
             }
         }
 
-        // Generate a query ID for lifecycle tracking
-        let query_id = uuid::Uuid::now_v7();
+        // The query ID for lifecycle tracking, audit and the OpenLineage run:
+        // the caller's (the id its client holds) or a fresh one.
+        let query_id = caller_query_id.unwrap_or_else(uuid::Uuid::now_v7);
         // Wall-clock start timestamp for OpenLineage. The Instant `start`
         // already captured monotonic time but OL events need RFC3339 timestamps.
         let ol_started_at = chrono::Utc::now();

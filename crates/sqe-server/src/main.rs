@@ -1123,14 +1123,67 @@ struct QueryHandlerAdapter {
 
 #[async_trait::async_trait]
 impl TrinoQueryExecutor for QueryHandlerAdapter {
-    /// SELECTs stream through [`QueryHandler::execute_stream`] so the Trino
-    /// path never holds more than one page of a result (#621); every other
-    /// statement kind (DML counts, DDL, SHOW, ...) takes the buffered
-    /// `execute` path exactly as Flight SQL does.
+    /// See [`QueryHandlerAdapter::execute_as`]; the engine mints the id.
     async fn execute(
         &self,
         session: &sqe_core::Session,
         sql: &str,
+    ) -> Result<TrinoResultStream, sqe_core::SqeError> {
+        self.execute_as(session, sql, None).await
+    }
+
+    /// The Trino query id is a UUID this server minted; the engine records
+    /// the statement under it, so its query history, audit record and
+    /// OpenLineage `runId` equal the `id` the client polls. A non-UUID id
+    /// (none today) falls back to an engine-minted one.
+    async fn execute_with_query_id(
+        &self,
+        session: &sqe_core::Session,
+        sql: &str,
+        query_id: &str,
+    ) -> Result<TrinoResultStream, sqe_core::SqeError> {
+        self.execute_as(session, sql, uuid::Uuid::parse_str(query_id).ok())
+            .await
+    }
+
+    fn memory_pool(&self) -> Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>> {
+        Some(self.handler.runtime().memory_pool.clone())
+    }
+
+    fn audit_rejected(&self, session: &sqe_core::Session, sql: &str, error: &sqe_core::SqeError) {
+        self.handler.record_failed_statement(
+            session,
+            sql,
+            std::time::Instant::now(),
+            None,
+            None,
+            error,
+        );
+    }
+
+    async fn describe_prepared(
+        &self,
+        session: &sqe_core::Session,
+        prepared_sql: &str,
+        kind: sqe_trino_compat::protocol::DescribeKind,
+    ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
+        self.handler
+            .describe_prepared(session, prepared_sql, kind)
+            .await
+    }
+}
+
+impl QueryHandlerAdapter {
+    /// SELECTs stream through [`QueryHandler::execute_stream_with_id`] so the
+    /// Trino path never holds more than one page of a result (#621); every
+    /// other statement kind (DML counts, DDL, SHOW, ...) takes the buffered
+    /// `execute_with_id` path exactly as Flight SQL does. `query_id` is the
+    /// id the engine records the statement under (`None`: engine-minted).
+    async fn execute_as(
+        &self,
+        session: &sqe_core::Session,
+        sql: &str,
+        query_id: Option<uuid::Uuid>,
     ) -> Result<TrinoResultStream, sqe_core::SqeError> {
         use futures::StreamExt;
         use sqe_sql::{
@@ -1159,40 +1212,17 @@ impl TrinoQueryExecutor for QueryHandlerAdapter {
             .map(|kind| matches!(kind, StatementKind::Query(_)))
             .unwrap_or(false);
         if is_query {
-            let (schema, stream) = self.handler.execute_stream(session, sql, None).await?;
+            let (schema, stream) = self
+                .handler
+                .execute_stream_with_id(session, sql, None, query_id)
+                .await?;
             let stream = stream.map(|res| res.map_err(sqe_core::SqeError::from));
             return Ok(TrinoResultStream::new(schema, Box::pin(stream)));
         }
         self.handler
-            .execute(session, sql, None)
+            .execute_with_id(session, sql, None, query_id)
             .await
             .map(TrinoResultStream::from_batches)
-    }
-
-    fn memory_pool(&self) -> Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>> {
-        Some(self.handler.runtime().memory_pool.clone())
-    }
-
-    fn audit_rejected(&self, session: &sqe_core::Session, sql: &str, error: &sqe_core::SqeError) {
-        self.handler.record_failed_statement(
-            session,
-            sql,
-            std::time::Instant::now(),
-            None,
-            None,
-            error,
-        );
-    }
-
-    async fn describe_prepared(
-        &self,
-        session: &sqe_core::Session,
-        prepared_sql: &str,
-        kind: sqe_trino_compat::protocol::DescribeKind,
-    ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
-        self.handler
-            .describe_prepared(session, prepared_sql, kind)
-            .await
     }
 }
 
