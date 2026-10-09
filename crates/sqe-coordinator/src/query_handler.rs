@@ -11311,6 +11311,79 @@ warehouse = "wh1"
         assert!(matches!(kind, StatementKind::CreateTable(_)));
         assert!(should_emit(&kind, &ol_cfg(false)));
     }
+
+    /// #683: the query path classified `/* /* */ INSERT ...; -- */ SELECT
+    /// ...` with GenericDialect as a query and handed the text to DataFusion,
+    /// whose DuckDB dialect planned the INSERT (or COPY) and ran it with no
+    /// write handler in front. The steps below are the query path's, in
+    /// order, on an engine-configured session: classify, normalize, plan,
+    /// execute the plan.
+    #[tokio::test]
+    async fn dialect_divergent_text_is_refused_before_anything_is_written() {
+        use arrow_array::Int32Array;
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::datasource::MemTable;
+        use datafusion::prelude::SessionContext;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let copy_target = dir.path().join("out.parquet");
+        let ctx = SessionContext::new_with_config(sqe_catalog::engine_session_config());
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .expect("batch");
+        ctx.register_table(
+            "t",
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("memtable")),
+        )
+        .expect("register t");
+        let session = test_session(vec![]);
+
+        let mut outcomes = Vec::new();
+        for sql in [
+            "/* /* */ INSERT INTO t VALUES (4); -- */ SELECT * FROM t".to_string(),
+            format!(
+                "/* /* */ COPY (SELECT * FROM t) TO '{}'; -- */ SELECT * FROM t",
+                copy_target.display()
+            ),
+        ] {
+            let ran = async {
+                let kind = classify_user_sql(&session, &sql)?;
+                let text = normalize_for_planning(&session, &sql)?;
+                let df = sqe_catalog::file_tvf_prepare::plan_sql(&ctx, &text)
+                    .await
+                    .map_err(SqeError::planning)?;
+                ctx.execute_logical_plan(df.logical_plan().clone())
+                    .await
+                    .map_err(SqeError::planning)?
+                    .collect()
+                    .await
+                    .map_err(SqeError::planning)?;
+                Ok::<_, SqeError>(kind)
+            }
+            .await;
+            outcomes.push((sql, ran));
+        }
+
+        let rows: usize = ctx
+            .sql("SELECT * FROM t")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("collect")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert!(!copy_target.exists(), "no file was written");
+        assert_eq!(rows, 3, "no row was inserted");
+        for (sql, ran) in outcomes {
+            let err = ran.expect_err(&sql);
+            assert_eq!(err.error_code(), SqeErrorCode::SyntaxError, "{sql}: {err}");
+        }
+    }
 }
 
 /// Which tag a named masking policy is keyed on.

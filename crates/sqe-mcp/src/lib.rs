@@ -2064,6 +2064,9 @@ fn classify(sql: &str, session_catalog: Option<&str>) -> Result<StatementKind, S
     sqe_sql::classify_normalized(normalized).map_err(|e| e.to_string())
 }
 
+/// One statement in the raw text, before the pre-parse pipeline rewrites it.
+/// Text the engine's dialect reads differently from this one (#683) is
+/// refused by the front door in `classify`, as on every other door.
 fn ensure_single_statement(sql: &str) -> Result<(), String> {
     use sqlparser::{
         dialect::GenericDialect,
@@ -3003,6 +3006,74 @@ mod tests {
     fn rejects_multiple_statements_but_not_semicolon_in_literal() {
         assert!(ensure_read_only("SELECT 1; DROP TABLE t", None).is_err());
         assert!(ensure_read_only("SELECT ';' AS value;", None).is_ok());
+    }
+
+    /// #683: the gates classify with `GenericDialect`, the engine plans the
+    /// text it is sent under DataFusion's DuckDB dialect. Generic nests block
+    /// comments and reads Oracle `q'[...]'` strings; DuckDB does neither, so
+    /// the same text was one SELECT to the gate and a write, or two
+    /// statements, to the planner.
+    #[test]
+    fn refuses_text_the_engine_dialect_reads_differently() {
+        use sqlparser::{
+            ast::Statement,
+            dialect::{DuckDbDialect, GenericDialect},
+            parser::Parser,
+        };
+        type EngineReads = fn(&[Statement]) -> bool;
+        let cases: &[(&str, EngineReads)] = &[
+            (
+                "/* /* */ INSERT INTO t SELECT * FROM t; -- */ SELECT * FROM t",
+                |s| matches!(s, [Statement::Insert(_)]),
+            ),
+            ("/* /* */ DELETE FROM t; -- */ SELECT * FROM t", |s| {
+                matches!(s, [Statement::Delete(_)])
+            }),
+            (
+                "/* /* */ COPY (SELECT * FROM t) TO 'out.parquet'; -- */ SELECT * FROM t",
+                |s| matches!(s, [Statement::Copy { .. }]),
+            ),
+            ("SELECT q'[', 1 FROM t; DROP TABLE t; -- ]' FROM t", |s| {
+                s.len() == 2
+            }),
+        ];
+        for (sql, engine_reads) in cases {
+            // The premise: one query to the gate, something else to the engine.
+            let gate = Parser::parse_sql(&GenericDialect {}, sql).expect(sql);
+            assert!(
+                matches!(gate.as_slice(), [Statement::Query(_)]),
+                "{sql}: {gate:?}"
+            );
+            let engine = Parser::parse_sql(&DuckDbDialect {}, sql).expect(sql);
+            assert!(engine_reads(&engine), "{sql}: {engine:?}");
+
+            let err = ensure_read_only(sql, None).expect_err(sql);
+            assert!(err.contains("dialect"), "{sql}: {err}");
+        }
+    }
+
+    /// The check and the engine agree on ordinary comments and quoting: what
+    /// the gate accepts, the engine dialect parses to the same one statement,
+    /// with the row cap appended as well.
+    #[test]
+    fn accepted_text_parses_the_same_under_the_engine_dialect() {
+        use sqlparser::{dialect::DuckDbDialect, parser::Parser};
+        for sql in [
+            "SELECT * FROM t",
+            "SELECT * FROM t /* note */",
+            "-- leading\nSELECT * FROM t WHERE a = '/*'",
+            "SELECT '--;' AS a, \"x;y\" FROM t;",
+            "SELECT * FROM t WHERE a = $$;$$",
+            "/* one */ /* two */ SELECT * FROM t",
+        ] {
+            let kind = ensure_read_only(sql, None).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let capped = with_row_cap(sql, &kind, 10);
+            let engine = Parser::parse_sql(&DuckDbDialect {}, &capped).expect(&capped);
+            assert!(
+                matches!(engine.as_slice(), [sqlparser::ast::Statement::Query(q)] if q.limit_clause.is_some()),
+                "{capped}: {engine:?}"
+            );
+        }
     }
 
     #[test]
