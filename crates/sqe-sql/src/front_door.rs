@@ -443,4 +443,100 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.error_code(), SqeErrorCode::SyntaxError);
     }
+
+    /// One door's verdict: the kind name, or the error code.
+    fn verdict(r: sqe_core::Result<StatementKind>) -> String {
+        match r {
+            Ok(kind) => kind.name().to_string(),
+            Err(e) => format!("{:?}", e.error_code()),
+        }
+    }
+
+    /// Every wire door's verdict: pre-parse pipeline, front door, classify.
+    fn door_verdicts(sql: &str) -> Vec<(String, String)> {
+        let user = crate::UserSql::new(sql);
+        [
+            WireDialect::Trino,
+            WireDialect::Flight,
+            WireDialect::Embedded,
+            WireDialect::Mcp,
+        ]
+        .iter()
+        .map(|d| {
+            let r = crate::pre_parse_pipeline(&user).and_then(|c| {
+                SqlFrontDoor::new(*d)
+                    .with_session_catalog(Some("iceberg"))
+                    .normalize(c.as_str())
+                    .and_then(classify_normalized)
+            });
+            (format!("{d:?}"), verdict(r))
+        })
+        .collect()
+    }
+
+    /// #811: every door reaches the same verdict for the same statement, and
+    /// an EXPLAIN of anything but a query is refused while classifying, in
+    /// every EXPLAIN form, rather than by whichever handler runs it.
+    #[test]
+    fn every_door_reaches_the_same_verdict() {
+        const NOT_SUPPORTED: &str = "NotSupported";
+        let cases: &[(&str, &str)] = &[
+            ("SELECT 1", "query"),
+            ("WITH t AS (SELECT 1 AS n) SELECT n FROM t", "query"),
+            ("INSERT INTO t VALUES (1)", "insert"),
+            ("INSERT INTO t VALUES 1", "insert"),
+            // The EXPLAIN FULL inner is classified as written, without the
+            // Trino folds, as the explain handler then plans it.
+            ("EXPLAIN FULL TABLE t", "SyntaxError"),
+            ("DELETE FROM t WHERE id = 1", "delete"),
+            ("DROP TABLE t", "drop"),
+            ("EXPLAIN SELECT 1", "utility"),
+            ("EXPLAIN ANALYZE SELECT 1", "utility"),
+            ("EXPLAIN FULL SELECT 1", "explain_full"),
+            (
+                "EXPLAIN WITH t AS (SELECT 1 AS n) SELECT n FROM t",
+                "utility",
+            ),
+            ("EXPLAIN INSERT INTO t VALUES (1)", NOT_SUPPORTED),
+            ("EXPLAIN ANALYZE INSERT INTO t VALUES (1)", NOT_SUPPORTED),
+            ("EXPLAIN FULL INSERT INTO t VALUES (1)", NOT_SUPPORTED),
+            ("EXPLAIN DELETE FROM t WHERE id = 1", NOT_SUPPORTED),
+            ("EXPLAIN ANALYZE DELETE FROM t WHERE id = 1", NOT_SUPPORTED),
+            ("EXPLAIN FULL DELETE FROM t WHERE id = 1", NOT_SUPPORTED),
+            ("EXPLAIN DROP TABLE t", NOT_SUPPORTED),
+            ("EXPLAIN FULL DROP TABLE t", NOT_SUPPORTED),
+            ("EXPLAIN CREATE TABLE t AS SELECT 1", NOT_SUPPORTED),
+            ("EXPLAIN FULL CREATE TABLE t AS SELECT 1", NOT_SUPPORTED),
+            // sqlparser rejects a nested EXPLAIN before classification.
+            ("EXPLAIN EXPLAIN SELECT 1", "SyntaxError"),
+            ("EXPLAIN FULL EXPLAIN SELECT 1", NOT_SUPPORTED),
+            ("EXPLAIN FULL EXPLAIN FULL SELECT 1", NOT_SUPPORTED),
+            ("EXPLAIN SHOW TABLES", NOT_SUPPORTED),
+            ("EXPLAIN FULL SHOW TAGS ON ns.t", NOT_SUPPORTED),
+            ("EXPLAIN FULL", "SyntaxError"),
+            (
+                "WITH w AS (INSERT INTO t VALUES (1)) SELECT * FROM w",
+                NOT_SUPPORTED,
+            ),
+            ("SELECT * INTO t2 FROM t", NOT_SUPPORTED),
+            ("EXPLAIN SELECT * INTO t2 FROM t", NOT_SUPPORTED),
+            ("EXPLAIN FULL SELECT * INTO t2 FROM t", NOT_SUPPORTED),
+            ("SELECT 1; DROP TABLE t", "SyntaxError"),
+            ("EXPLAIN SELECT 1; DROP TABLE t", "SyntaxError"),
+            ("EXPLAIN FULL SELECT 1; DROP TABLE t", "SyntaxError"),
+        ];
+        let mut gaps = Vec::new();
+        for (sql, want) in cases {
+            for (door, got) in door_verdicts(sql) {
+                if got != *want {
+                    gaps.push(format!("{door:>8} | {sql} => {got}, want {want}"));
+                }
+            }
+        }
+        assert!(
+            gaps.is_empty(),
+            "door verdicts differ:\n{}",
+            gaps.join("\n")
+        );
+    }
 }
