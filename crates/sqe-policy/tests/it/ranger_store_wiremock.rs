@@ -469,3 +469,114 @@ async fn catalog_scoped_mask_applies_to_the_named_catalog_only() {
     );
     assert!(!flat.column_masks.contains_key("ssn"));
 }
+
+/// Through SQL and the rewriter: `ws_a` and `ws_b` both hold
+/// `finance.orders`. With `catalog_scoped` a mask on `ws_a.finance` nulls
+/// `ws_a`'s column only; with it off, a mask on `finance` (main's key) nulls
+/// both catalogs, as before.
+#[tokio::test]
+async fn catalog_scoped_mask_through_the_rewriter_covers_one_catalog() {
+    use std::sync::Arc;
+
+    use arrow::array::{RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::catalog::{MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider};
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+    use sqe_policy::plan_rewriter::PolicyPlanRewriter;
+    use sqe_policy::{PolicyEnforcer, TableScope};
+
+    let ctx = SessionContext::new();
+    let schema = Arc::new(Schema::new(vec![Field::new("ssn", DataType::Utf8, true)]));
+    for catalog in ["ws_a", "ws_b"] {
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["123-45-6789"]))],
+        )
+        .unwrap();
+        let finance = Arc::new(MemorySchemaProvider::new());
+        finance
+            .register_table(
+                "orders".into(),
+                Arc::new(MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap()),
+            )
+            .unwrap();
+        let cat = Arc::new(MemoryCatalogProvider::new());
+        datafusion::catalog::CatalogProvider::register_schema(cat.as_ref(), "finance", finance)
+            .unwrap();
+        ctx.register_catalog(catalog, cat);
+    }
+
+    let mask = |database: &str| {
+        serde_json::json!({
+            "policyVersion": 1,
+            "policies": [
+                {"id": 1, "name": "ssn", "policyType": 1, "isEnabled": true,
+                 "resources": {"database": {"values": [database]}, "table": {"values": ["orders"]},
+                               "column": {"values": ["ssn"]}},
+                 "dataMaskPolicyItems": [
+                    {"groups": ["SG-Exempt"], "dataMaskInfo": {"dataMaskType": "MASK_NONE"}},
+                    {"groups": ["public"], "dataMaskInfo": {"dataMaskType": "MASK_NULL"}}]}
+            ]
+        })
+    };
+    let user = |groups: &[&str]| SessionUser {
+        username: "ann".into(),
+        roles: vec![],
+        subject: None,
+        email: None,
+        groups: groups.iter().map(|g| g.to_string()).collect(),
+    };
+    /// `true` when the caller reads the raw value from `catalog`.
+    async fn raw(
+        ctx: &SessionContext,
+        rewriter: &PolicyPlanRewriter,
+        who: SessionUser,
+        catalog: &str,
+    ) -> bool {
+        let sql = format!("SELECT ssn FROM {catalog}.finance.orders");
+        let plan = ctx.sql(&sql).await.unwrap().logical_plan().clone();
+        let (enforced, _) = rewriter
+            .evaluate(&who, &TableScope::of(ctx), plan)
+            .await
+            .unwrap();
+        let batches = ctx
+            .execute_logical_plan(enforced)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        !batches[0].column(0).is_null(0)
+    }
+
+    for (scoped, database, masked_in) in [
+        (true, "ws_a.finance", &["ws_a"][..]),
+        (false, "finance", &["ws_a", "ws_b"][..]),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/service/plugins/secure/policies/download/hive"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mask(database)))
+            .mount(&server)
+            .await;
+        let store = RangerStore::from_config(&RangerPolicyConfig {
+            catalog_scoped: scoped,
+            ..cfg(&server.uri())
+        })
+        .unwrap();
+        let rewriter = PolicyPlanRewriter::new(Arc::new(store));
+        for catalog in ["ws_a", "ws_b"] {
+            let masked = masked_in.contains(&catalog);
+            assert_eq!(
+                raw(&ctx, &rewriter, user(&["SG-DataAnalysts"]), catalog).await,
+                !masked,
+                "catalog_scoped={scoped}, policy on `{database}`, reading {catalog}"
+            );
+            assert!(
+                raw(&ctx, &rewriter, user(&["SG-Exempt"]), catalog).await,
+                "MASK_NONE leaves the column raw for the exempt group ({catalog})"
+            );
+        }
+    }
+}
