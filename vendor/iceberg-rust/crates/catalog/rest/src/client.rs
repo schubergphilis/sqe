@@ -220,6 +220,10 @@ impl HttpClient {
         request.headers_mut().extend(self.extra_headers.clone());
         let mut sent = Request::new(request.method().clone(), request.url().clone());
         *sent.headers_mut() = request.headers().clone();
+        // SQE PATCH (sqe#803): read by the 401 warning below.
+        let authorization_sent = request
+            .headers()
+            .contains_key(reqwest::header::AUTHORIZATION);
 
         // SQE PATCH (observability): one client span per catalog call, and
         // the W3C `traceparent` of the current trace on the wire, so Polaris
@@ -249,6 +253,26 @@ impl HttpClient {
                         current.record("otel.status_code", "ERROR");
                     } else {
                         current.record("otel.status_code", "OK");
+                    }
+                    // SQE PATCH (sqe#803): a 401 names the hop that refused
+                    // it. Whether a bearer went out (never its value), the
+                    // challenge, and the server's request id, which for
+                    // Polaris also identifies the process that answered.
+                    if status == reqwest::StatusCode::UNAUTHORIZED {
+                        let header = |name: &str| {
+                            response
+                                .headers()
+                                .get(name)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string()
+                        };
+                        tracing::warn!(
+                            authorization_sent,
+                            www_authenticate = %header("www-authenticate"),
+                            x_request_id = %header("x-request-id"),
+                            "REST catalog answered 401"
+                        );
                     }
                     HttpResponse::read(response).await
                 }
