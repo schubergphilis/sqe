@@ -162,6 +162,12 @@ config:
     # DEP-02: keep below coordinator.resources.limits.memory (2Gi) so spill
     # fires before the kernel OOMKills the pod. ~70-75% of 2Gi.
     memory_limit: "1500MB"
+    # Memory outside the DataFusion pool (runtime, Flight/HTTP buffers,
+    # caches). The coordinator refuses to start when memory_limit +
+    # process_headroom exceeds the pod limit; the engine default (2GB) does
+    # not fit a 2Gi pod. 1500MB + 512MB = 2012MB < 2Gi. Raise both together
+    # with coordinator.resources.limits.memory.
+    process_headroom: "512MB"
     spill_to_disk: true
     # DEP-01: spill dir lives under the writable /tmp emptyDir mounted on the
     # coordinator pod.
