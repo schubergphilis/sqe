@@ -52,3 +52,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 ctor = "1"
 datafusion = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[dev-dependencies]
+# Property tests for the error classifiers (#639).
+proptest = "1"
