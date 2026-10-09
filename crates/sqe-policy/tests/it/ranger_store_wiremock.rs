@@ -391,3 +391,81 @@ async fn resolve_tags_caches_bundle_within_ttl() {
         "two resolve_tags calls within TTL must download the bundle once (got {count})"
     );
 }
+
+/// `[policy.ranger] catalog_scoped` through the real store and HTTP path: two
+/// catalogs hold `finance.orders`, the portal's "everyone except SG-Exempt"
+/// mask names `ws_a.finance`, and it applies to `ws_a` only. With the setting
+/// off, the same lookups key on `finance` and a catalog-less policy covers both.
+#[tokio::test]
+async fn catalog_scoped_mask_applies_to_the_named_catalog_only() {
+    let bundle = serde_json::json!({
+        "policyVersion": 1,
+        "policies": [
+            {"id": 1, "name": "ws_a-ssn", "policyType": 1, "isEnabled": true,
+             "resources": {"database": {"values": ["ws_a.finance"]}, "table": {"values": ["orders"]},
+                           "column": {"values": ["ssn"]}},
+             "dataMaskPolicyItems": [
+                {"groups": ["SG-Exempt"], "dataMaskInfo": {"dataMaskType": "MASK_NONE"}},
+                {"groups": ["public"], "dataMaskInfo": {"dataMaskType": "MASK_NULL"}}]},
+            {"id": 2, "name": "legacy", "policyType": 1, "isEnabled": true,
+             "resources": {"database": {"values": ["finance"]}, "table": {"values": ["orders"]},
+                           "column": {"values": ["iban"]}},
+             "dataMaskPolicyItems": [{"groups": ["public"], "dataMaskInfo": {"dataMaskType": "MASK_NULL"}}]}
+        ]
+    });
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/service/plugins/secure/policies/download/hive"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(bundle))
+        .mount(&server)
+        .await;
+    let user = |groups: &[&str]| SessionUser {
+        username: "ann".into(),
+        roles: vec![],
+        subject: None,
+        email: None,
+        groups: groups.iter().map(|g| g.to_string()).collect(),
+    };
+
+    let scoped = RangerStore::from_config(&RangerPolicyConfig {
+        catalog_scoped: true,
+        ..cfg(&server.uri())
+    })
+    .unwrap();
+    let a = scoped
+        .resolve(&user(&["SG-DataAnalysts"]), "orders", "ws_a.finance")
+        .await
+        .unwrap();
+    assert!(a.column_masks.contains_key("ssn"), "ws_a is masked");
+    assert!(
+        !a.column_masks.contains_key("iban"),
+        "a catalog-less policy does not match a scoped key"
+    );
+    let b = scoped
+        .resolve(&user(&["SG-DataAnalysts"]), "orders", "ws_b.finance")
+        .await
+        .unwrap();
+    assert!(
+        b.column_masks.is_empty(),
+        "ws_b's finance.orders is not covered"
+    );
+    let exempt = scoped
+        .resolve(&user(&["SG-Exempt"]), "orders", "ws_a.finance")
+        .await
+        .unwrap();
+    assert!(
+        exempt.column_masks.is_empty(),
+        "the exemption item comes first"
+    );
+
+    let unscoped = RangerStore::from_config(&cfg(&server.uri())).unwrap();
+    let flat = unscoped
+        .resolve(&user(&[]), "orders", "finance")
+        .await
+        .unwrap();
+    assert!(
+        flat.column_masks.contains_key("iban"),
+        "off: `finance` covers every catalog's finance.orders"
+    );
+    assert!(!flat.column_masks.contains_key("ssn"));
+}
