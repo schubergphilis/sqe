@@ -1133,7 +1133,10 @@ impl TrinoQueryExecutor for QueryHandlerAdapter {
         sql: &str,
     ) -> Result<TrinoResultStream, sqe_core::SqeError> {
         use futures::StreamExt;
-        use sqe_sql::{parse_and_classify_typed, pre_parse_pipeline, StatementKind, UserSql};
+        use sqe_sql::{
+            classify_normalized, pre_parse_pipeline, SqlFrontDoor, StatementKind, UserSql,
+            WireDialect,
+        };
 
         self.rate_limiter
             .check(&session.user.username)
@@ -1144,9 +1147,15 @@ impl TrinoQueryExecutor for QueryHandlerAdapter {
                 )
             })?;
         // Classification failures fall through to `execute`, which produces
-        // the engine's own parse error for the client.
+        // the engine's own parse error for the client. The front door folds
+        // Trino-only shapes, so a Trino-shaped SELECT streams too (#811).
         let is_query = pre_parse_pipeline(&UserSql::from(sql))
-            .and_then(|c| parse_and_classify_typed(&c))
+            .and_then(|c| {
+                SqlFrontDoor::new(WireDialect::Trino)
+                    .with_session_catalog(session.default_catalog.clone())
+                    .normalize(c.as_str())
+            })
+            .and_then(classify_normalized)
             .map(|kind| matches!(kind, StatementKind::Query(_)))
             .unwrap_or(false);
         if is_query {
