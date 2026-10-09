@@ -77,7 +77,7 @@ moka = { version = "0.12", features = ["future", "sync"] }
 num-bigint = { version = "0.4", features = ["serde"] }
 num-integer = { version = "0.1", features = ["i128"] }
 num-traits = { version = "0.2", features = ["i128", "libm"] }
-object_store = { version = "0.13", features = ["aws", "azure", "gcp", "http"] }
+object_store = { path = "../../vendor/object_store", features = ["aws", "azure", "gcp", "http"] }
 once_cell = { version = "1" }
 opentelemetry = { version = "0.33", features = ["testing"] }
 opentelemetry_sdk = { version = "0.33", features = ["rt-tokio", "testing"] }
@@ -87,6 +87,7 @@ percent-encoding = { version = "2" }
 portable-atomic = { version = "1", features = ["require-cas"] }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
 prost-types = { version = "0.14" }
+quick-xml = { version = "0.41", features = ["overlapped-lists", "serialize"] }
 rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }
 rand-93f6ce9d446188ac = { package = "rand", version = "0.10" }
 rand_chacha = { version = "0.9", default-features = false, features = ["std"] }

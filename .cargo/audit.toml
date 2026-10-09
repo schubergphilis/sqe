@@ -5,20 +5,13 @@
 # including the explicitly selected AWS-LC JWT provider), and
 # RUSTSEC-2026-0176/0177 (pyo3 is now patched 0.29.2 in the lockfile).
 #
+# Removed on 2026-10-08: RUSTSEC-2026-0194/0195 (quick-xml 0.39.4 is absent
+# from Cargo.lock; object_store 0.13.2 is patched to quick-xml ^0.41 in
+# vendor/object_store).
+#
 # paste 1.0.15 is an unmaintained proc macro with no known vulnerability;
 # upstream Arrow/DataFusion/tonic migration is still pending.
-#
-# RUSTSEC-2026-0194/0195: quick-xml 0.39.4 remains through object_store
-# 0.13.2's ^0.39 dependency. Fixed in >=0.41.0. object_store 0.14.2 is now
-# available and uses ^0.41, but DataFusion 55 uses the 0.13 trait/API line;
-# upgrading only SQE's direct dependency would introduce incompatible object
-# store traits. A coordinated stack migration is tracked by !1133.
-# SQE reads this XML from configured object-store/catalog endpoints; a
-# malicious or compromised endpoint remains a DoS risk. No review dates are
-# extended. Drop these exceptions once the compatible stack uses patched XML.
 [advisories]
 ignore = [
     "RUSTSEC-2024-0436",  # review-by 2026-12-25 owner=sqe-maintainers
-    "RUSTSEC-2026-0194",  # review-by 2026-10-25 owner=sqe-maintainers
-    "RUSTSEC-2026-0195",  # review-by 2026-10-25 owner=sqe-maintainers
 ]
