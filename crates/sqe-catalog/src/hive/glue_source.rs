@@ -190,6 +190,15 @@ fn column_of(c: &GlueSdkColumn) -> GlueColumn {
         name: c.name().to_string(),
         r#type: c.r#type().unwrap_or("string").to_string(),
         comment: c.comment().map(str::to_string),
+        // Carries `sqe.column-tags`; see `HiveManifest::column_tags`.
+        parameters: c
+            .parameters()
+            .map(|p| {
+                p.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -266,6 +275,9 @@ pub fn manifest_from_glue_table(database: &str, t: &Table) -> HiveManifest {
             })
             .unwrap_or_default(),
         storage_descriptor: storage_descriptor_of(t.storage_descriptor()),
+        // Glue has no SQE block. Column tags are not copied in here: they
+        // stay in the table and column `parameters` carried above, and
+        // `HiveManifest::column_tags` reads them from there.
         sqe: SqeExtensions::default(),
     }
 }
@@ -492,6 +504,94 @@ mod scope_tests {
         let s = source(&[]);
         assert!(s.scope().is_empty());
         assert!(!s.database_blocked("anything"));
+    }
+}
+
+#[cfg(test)]
+mod column_tag_tests {
+    use super::*;
+    use crate::hive::manifest::COLUMN_TAGS_KEY;
+
+    fn column(name: &str, tags: Option<&str>) -> GlueSdkColumn {
+        let mut b = GlueSdkColumn::builder().name(name).r#type("string");
+        if let Some(tags) = tags {
+            b = b.parameters(COLUMN_TAGS_KEY, tags);
+        }
+        b.build().expect("column")
+    }
+
+    fn table(columns: Vec<GlueSdkColumn>, partition_keys: Vec<GlueSdkColumn>) -> Table {
+        Table::builder()
+            .name("customers")
+            .storage_descriptor(
+                GlueSdkSd::builder()
+                    .location("s3://bucket/crm/customers")
+                    .set_columns(Some(columns))
+                    .build(),
+            )
+            .set_partition_keys(Some(partition_keys))
+            .build()
+            .expect("table")
+    }
+
+    /// The #702 bypass: the Glue mapping dropped column parameters and set
+    /// an empty SQE block, so a column tagged in Glue read as untagged and
+    /// its tag mask never applied.
+    #[test]
+    fn a_glue_column_tag_reaches_the_manifest() {
+        let t = table(
+            vec![column("id", None), column("ssn", Some(r#"["PII","GDPR"]"#))],
+            vec![column("region", Some(r#"["RESIDENCY"]"#))],
+        );
+        let tags = manifest_from_glue_table("crm", &t)
+            .column_tags()
+            .expect("well-formed tags");
+        assert_eq!(
+            tags,
+            BTreeMap::from([
+                (
+                    "ssn".to_string(),
+                    vec!["PII".to_string(), "GDPR".to_string()]
+                ),
+                ("region".to_string(), vec!["RESIDENCY".to_string()]),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_glue_table_parameter_tag_map_is_read_like_an_iceberg_property() {
+        let t = Table::builder()
+            .name("customers")
+            .storage_descriptor(GlueSdkSd::builder().columns(column("ssn", None)).build())
+            .parameters(COLUMN_TAGS_KEY, r#"{"ssn":["PII"]}"#)
+            .build()
+            .expect("table");
+        let tags = manifest_from_glue_table("crm", &t)
+            .column_tags()
+            .expect("ok");
+        assert_eq!(tags.get("ssn"), Some(&vec!["PII".to_string()]));
+    }
+
+    #[test]
+    fn an_untagged_glue_table_is_known_untagged() {
+        let t = table(vec![column("id", None)], Vec::new());
+        assert!(manifest_from_glue_table("crm", &t)
+            .column_tags()
+            .expect("known")
+            .is_empty());
+    }
+
+    /// A tag value that does not parse is unknown tag state, not "no tags":
+    /// reading it as untagged would unmask the very column it tags.
+    #[test]
+    fn a_malformed_glue_column_tag_is_unknown_not_untagged() {
+        for bad in ["PII", "PII,GDPR", r#"{"ssn":["PII"]}"#, "[1]"] {
+            let t = table(vec![column("ssn", Some(bad))], Vec::new());
+            assert!(
+                manifest_from_glue_table("crm", &t).column_tags().is_err(),
+                "`{bad}` must be unknown tag state"
+            );
+        }
     }
 }
 
