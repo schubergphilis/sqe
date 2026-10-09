@@ -1042,6 +1042,8 @@ impl HiveTableProvider {
         filters: Vec<Expr>,
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let quiet = without_footer_statistics(state);
+        let state: &dyn Session = quiet.as_ref().map_or(state, |s| s as &dyn Session);
         let entries = self.planned_entries(&filters).map_err(to_df)?;
         let out_schema = projected_schema(&self.schema, projection);
         if entries.is_empty() {
@@ -1212,6 +1214,29 @@ pub(super) fn plan_partition_scan<'a>(
     })
 }
 
+/// The session a Hive scan plans its `ListingTable`s with: the caller's,
+/// with `datafusion.execution.collect_statistics` off (#807). With it on
+/// (the DataFusion default) `ListingTable::scan` reads every listed file's
+/// footer while planning, one GET per file before a row is wanted: 1,000
+/// reads for a 1,000-file table. Nothing here uses what it buys, because
+/// `HiveTableProvider::statistics` answers the planner from the manifest.
+/// Scoped to Hive scans: `read_parquet` and friends share the session.
+/// `None` for a `Session` that is not a `SessionState` (a bare trait object
+/// in tests); that caller plans with what it was given.
+fn without_footer_statistics(state: &dyn Session) -> Option<SessionState> {
+    let session_state = state.as_any().downcast_ref::<SessionState>()?;
+    if !session_state.config().collect_statistics() {
+        return None;
+    }
+    let mut quiet = session_state.clone();
+    quiet
+        .config_mut()
+        .options_mut()
+        .execution
+        .collect_statistics = false;
+    Some(quiet)
+}
+
 fn projected_schema(schema: &Schema, projection: Option<&[usize]>) -> SchemaRef {
     match projection {
         Some(idx) => {
@@ -1380,6 +1405,8 @@ impl TableProvider for HiveTableProvider {
         }
         let held = SendErased::new(rewritten);
         Box::pin(async move {
+            let quiet = without_footer_statistics(state);
+            let state: &dyn Session = quiet.as_ref().map_or(state, |s| s as &dyn Session);
             let plan = self
                 .inner
                 .scan(state, projection, held.get(), limit)
@@ -1418,6 +1445,8 @@ impl TableProvider for HiveTableProvider {
         let held = SendErased::new(rewritten.unwrap_or_default());
         let has_filters = args.filters().is_some();
         Box::pin(async move {
+            let quiet = without_footer_statistics(state);
+            let state: &dyn Session = quiet.as_ref().map_or(state, |s| s as &dyn Session);
             let mut new_args = ScanArgs::default()
                 .with_projection(projection)
                 .with_limit(limit);
