@@ -251,6 +251,10 @@ distribution_fallback = "error" # "error" (default) fails a query whose scan cou
                                 # Policy skips (below threshold, no workers) always run
                                 # locally and are counted in
                                 # sqe_scheduler_decisions_total{decision="local",reason=...}
+join_fallback = true            # A read query whose hash join exhausts max_query_memory before
+                                # its first row is planned once more with sort-merge joins,
+                                # which spill, and run on the coordinator. Needs spill_to_disk.
+                                # Counted in sqe_join_fallback_total{outcome}.
 sort_mode = "adaptive"          # "adaptive", "partition_only", or "strict"
 
 # Write-path memory safety (see Features -> Write Path)

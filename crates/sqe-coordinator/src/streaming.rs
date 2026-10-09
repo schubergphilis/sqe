@@ -581,6 +581,9 @@ pub struct TrackedRecordBatchStream {
     /// path errors once the row count passes it; before this the stream
     /// only counted rows for audit and never enforced the cap (#735).
     max_rows: Option<usize>,
+    /// Set by the sort-merge retry (#784) when it replaces the plan, so the
+    /// finalizer reports on the plan that produced the rows.
+    replanned: Option<crate::join_fallback::ReplannedPlan>,
 }
 
 impl TrackedRecordBatchStream {
@@ -610,6 +613,7 @@ impl TrackedRecordBatchStream {
             deadline_sleep: None,
             query_timeout: None,
             max_rows: None,
+            replanned: None,
         }
     }
 
@@ -641,6 +645,7 @@ impl TrackedRecordBatchStream {
             deadline_sleep: None,
             query_timeout: None,
             max_rows: None,
+            replanned: None,
         }
     }
 
@@ -673,6 +678,7 @@ impl TrackedRecordBatchStream {
             deadline_sleep: None,
             query_timeout: None,
             max_rows: None,
+            replanned: None,
         }
     }
 
@@ -683,6 +689,26 @@ impl TrackedRecordBatchStream {
     pub fn with_teardown<T: std::any::Any + Send + 'static>(mut self, t: T) -> Self {
         self._teardown = Some(Box::new(t));
         self
+    }
+
+    /// Watch for the sort-merge retry's plan (#784).
+    pub(crate) fn with_replanned_plan(
+        mut self,
+        replanned: crate::join_fallback::ReplannedPlan,
+    ) -> Self {
+        self.replanned = Some(replanned);
+        self
+    }
+
+    /// Point the finalizer at the retry's plan once it exists, so metrics,
+    /// the profile and the idle-progress check read the running plan.
+    fn adopt_replanned_plan(&mut self) {
+        let Some(plan) = self.replanned.as_ref().and_then(|r| r.take()) else {
+            return;
+        };
+        if let Some(f) = self.finalizer.as_mut() {
+            f.plan = plan;
+        }
     }
 
     /// Enable the idle-timeout guard. The stream aborts (releasing its
@@ -815,7 +841,10 @@ impl Stream for TrackedRecordBatchStream {
         if cancel_fired {
             return self.abort_cancelled();
         }
-        match self.inner.as_mut().poll_next(cx) {
+        let polled = self.inner.as_mut().poll_next(cx);
+        // The retry may have replaced the plan during this poll.
+        self.adopt_replanned_plan();
+        match polled {
             Poll::Ready(Some(Ok(batch))) => {
                 // An always-ready inner never reaches the `Pending` arm, so
                 // check the absolute deadline here too (one Instant compare).
@@ -949,6 +978,7 @@ impl Drop for TrackedRecordBatchStream {
         // Client dropped the response or the task panicked before the
         // stream was drained. Mark the query cancelled so the tracker
         // doesn't list it as still-running forever.
+        self.adopt_replanned_plan();
         if let Some(f) = self.finalizer.take() {
             f.on_cancel(self.rows_so_far);
         }

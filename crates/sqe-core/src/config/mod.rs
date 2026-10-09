@@ -377,6 +377,14 @@ pub struct QueryConfig {
     /// worker registry is configured; policy skips always run locally.
     #[serde(default)]
     pub distribution_fallback: DistributionFallback,
+    /// Retry a read query once with sort-merge joins when it runs out of
+    /// `max_query_memory` before producing its first batch (#784). A hash
+    /// join's build side cannot spill and its size is unknown until it is
+    /// built; the sort-merge plan spills. The retry is coordinator-local and
+    /// slower: small broadcasts and hash-join dynamic filters are gone.
+    /// Needs `coordinator.spill_to_disk`. Default: true.
+    #[serde(default = "default_true")]
+    pub join_fallback: bool,
     /// Dispatch Hive external table scans to workers (cycle 5).
     ///
     /// Defaults to FALSE. Hive scans have run coordinator-local since cycle 1,
@@ -586,6 +594,7 @@ impl Default for QueryConfig {
             distribution_file_threshold: default_distribution_file_threshold(),
             target_task_size: default_target_task_size(),
             distribution_fallback: DistributionFallback::Error,
+            join_fallback: true,
             distributed_hive_scans: false,
             sort_mode: SortMode::Adaptive,
             star_schema_reorder: default_true(),
