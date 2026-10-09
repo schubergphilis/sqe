@@ -263,7 +263,7 @@ async fn planning_a_partition_pruned_hive_query_reads_no_data_files() {
 /// The acceptance number: plan time and data-file reads over 1,000 files.
 /// Run with `--ignored --nocapture` to see it.
 #[tokio::test]
-#[ignore = "timing report, not a gate"]
+#[ignore = "bench; timing report, not a gate"]
 async fn plan_time_over_a_thousand_files() {
     let (dir, root) = parquet_table(10, 100).await;
     let ctx = SessionContext::new();
