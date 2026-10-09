@@ -4741,6 +4741,9 @@ impl QueryHandler {
 
         // Attach worker registry for health tracking / failover
         exec = exec.with_worker_registry(Arc::clone(registry));
+        if let Some(ref m) = self.metrics {
+            exec = exec.with_metrics(Arc::clone(m));
+        }
         if let Some(expiry) = credential_expiry {
             // Finding 401: vended credentials expire; let the refresh tracker
             // push renewed ones before the worker hits the wall. The tracker
@@ -4889,6 +4892,9 @@ impl QueryHandler {
             std::time::Duration::from_secs(self.config.coordinator.worker_rpc_timeout_secs),
         );
         exec = exec.with_worker_registry(Arc::clone(registry));
+        if let Some(ref m) = self.metrics {
+            exec = exec.with_metrics(Arc::clone(m));
+        }
 
         info!(
             username = %session.user.username,

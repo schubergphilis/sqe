@@ -45,6 +45,34 @@ histogram_quantile(0.99, rate(sqe_query_duration_seconds_bucket[5m]))
 sqe_active_sessions
 ```
 
+### Distributed scan tickets
+
+Every fragment of a distributed scan travels to its worker as one `ScanTask` ticket: file list, projection, predicate, storage settings and credentials. The coordinator encodes a ticket per dispatch attempt, and when dynamic join filters are in play it first decodes each partition's predicate, ANDs in the filter snapshots and serializes it again. Three histograms measure that cost.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `sqe_scan_ticket_bytes` | Histogram | none | Size of each ticket sent to a worker, after a predicate that would break the message ceiling is dropped. One sample per dispatch attempt, so retries count again |
+| `sqe_scan_ticket_encode_seconds` | Histogram | none | Coordinator time to serialize one ticket, including the re-encode without the predicate |
+| `sqe_scan_ticket_dynamic_filter_seconds` | Histogram | none | Coordinator time per partition to AND dynamic filters into the ticket predicate and serialize it again. The bounded wait for the join builds is excluded |
+| `sqe_scheduler_task_count` | Histogram | none | Tickets planned per distributed Iceberg scan |
+
+Byte buckets run from 1 KiB to 16 MiB, the default gRPC message ceiling. Time buckets run from 10 microseconds to 1 second. The `_sum` series are CPU time spent across concurrent partitions, not wall time, so compare them with query time as a share of work, not as latency.
+
+```promql
+# Ticket size p50 and p99 over a run
+histogram_quantile(0.5, sum(increase(sqe_scan_ticket_bytes_bucket[1h])) by (le))
+histogram_quantile(0.99, sum(increase(sqe_scan_ticket_bytes_bucket[1h])) by (le))
+
+# Ticket work as a share of query time
+(sum(increase(sqe_scan_ticket_encode_seconds_sum[1h]))
+  + sum(increase(sqe_scan_ticket_dynamic_filter_seconds_sum[1h])))
+/ sum(increase(sqe_query_duration_seconds_sum[1h]))
+
+# Encodes per planned ticket (above 1 means retries)
+increase(sqe_scan_ticket_encode_seconds_count[1h])
+/ increase(sqe_scheduler_task_count_sum[1h])
+```
+
 ### Local observability stack
 
 For a self-contained metrics view alongside the test stack, SQE ships a Docker Compose overlay using VictoriaMetrics (Prometheus-compatible, around 30 MB RAM) and Grafana:
