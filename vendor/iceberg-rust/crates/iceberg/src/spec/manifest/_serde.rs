@@ -22,7 +22,7 @@ use serde_with::serde_as;
 
 use super::{Datum, ManifestEntry, Schema, Struct};
 use crate::error::invalid_data;
-use crate::spec::{FormatVersion, Literal, PrimitiveType, RawLiteral, StructType, Type};
+use crate::spec::{FormatVersion, Literal, PrimitiveType, RawLiteral, Type};
 use crate::{Error, metadata_columns};
 
 #[derive(Serialize, Deserialize)]
