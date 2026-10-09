@@ -157,16 +157,18 @@ impl PhysicalOptimizerRule for JoinStrategyRule {
 pub enum BuildSizeEstimate {
     /// Exact byte size from plan statistics (safe for threshold comparison).
     Exact(usize),
-    /// Stats missing, inexact, or unreadable — choose the spillable path.
+    /// Stats missing, inexact, or unreadable. The hash join is kept: an
+    /// inexact estimate is off by 3x under to 150x over at SF10 (#784).
     Unknown,
 }
 
 /// Estimate the build-side (left input) size from DataFusion statistics.
 ///
-/// Phase 5a: only `Precision::Exact` yields [`BuildSizeEstimate::Exact`].
-/// Absent, inexact, or errored stats yield [`BuildSizeEstimate::Unknown`] so
-/// the rule rewrites to spillable sort-merge rather than keeping a non-spillable
-/// hash join on a guessed-zero build side.
+/// Only `Precision::Exact` yields [`BuildSizeEstimate::Exact`]. Absent,
+/// inexact, or errored stats yield [`BuildSizeEstimate::Unknown`], which keeps
+/// the hash join (see the rule's `Unknown => false` arm). A too-large build is
+/// bounded at run time by per-query operator admission and ends in a clean
+/// resource error, not by a planner rewrite.
 fn estimate_build_side_size(hash_join: &HashJoinExec) -> BuildSizeEstimate {
     use datafusion::common::stats::Precision;
 
