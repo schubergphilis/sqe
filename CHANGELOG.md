@@ -4,6 +4,8 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+## [0.50.0] — 2026-10-09
+
 ### Fixed
 
 - Trino HTTP: cancelling a query while a client poll was fetching its results did not stop it
