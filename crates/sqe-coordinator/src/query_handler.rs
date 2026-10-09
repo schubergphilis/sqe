@@ -77,6 +77,7 @@ type OpenStreamResult = (
     Vec<String>,
     sqe_policy::PolicySummary,
     Vec<sqe_metrics::audit::Resource>,
+    crate::join_fallback::ReplannedPlan,
 );
 
 /// Marks a tracked query abandoned if the future running it is dropped
@@ -3264,6 +3265,7 @@ impl QueryHandler {
                 tables_touched,
                 policy_summary,
                 audit_resources,
+                replanned,
             )) => {
                 let actor = crate::audit_emitter::actor_for(session);
                 let finalizer = crate::streaming::StreamFinalizer {
@@ -3298,6 +3300,7 @@ impl QueryHandler {
                     cancel_token,
                 )
                 .with_teardown(tt_cleanup)
+                .with_replanned_plan(replanned)
                 // `query.max_result_rows` bounds the streaming path like the
                 // buffered one (#735); 0 = unlimited.
                 .with_max_rows(self.config.query.max_result_rows)
@@ -3363,6 +3366,7 @@ impl QueryHandler {
         start: std::time::Instant,
     ) -> sqe_core::Result<OpenStreamResult> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
+        let shared_pool = Arc::clone(&ctx.runtime_env().memory_pool);
         let ctx = crate::query_memory::with_query_limit(
             ctx,
             self.per_query_memory_bytes,
@@ -3374,7 +3378,7 @@ impl QueryHandler {
         // dedicated planning stack (#640): a plan deeper than the request
         // thread's stack used to abort the coordinator. Execution below stays
         // on the runtime threads.
-        let (final_plan, tt_cleanup, tables_touched, policy_summary, audit_resources) =
+        let (final_plan, enforced_logical, tt_cleanup, tables_touched, policy_summary, audit_resources) =
             sqe_core::runtime::on_planning_stack(async {
                 let (plan, tt_cleanup) = match prebuilt {
                     Some(plan) => (plan, TimeTravelCleanup::new(&ctx, Vec::new())),
@@ -3425,6 +3429,8 @@ impl QueryHandler {
                 let mut tables_touched =
                     sqe_lineage::extract::extract_table_names(&enforced_plan);
                 append_metadata_tvf_targets(&enforced_plan, &mut tables_touched);
+                // Kept for the sort-merge retry (#784), which plans it again.
+                let enforced_logical = enforced_plan.clone();
 
                 let enforced_df = ctx
                     .execute_logical_plan(enforced_plan)
@@ -3443,6 +3449,7 @@ impl QueryHandler {
                     .await?;
                 Ok::<_, SqeError>((
                     final_plan,
+                    enforced_logical,
                     tt_cleanup,
                     tables_touched,
                     policy_summary,
@@ -3458,6 +3465,14 @@ impl QueryHandler {
         let schema = final_plan.schema();
         let stream = execute_stream(Arc::clone(&final_plan), ctx.task_ctx())
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Query execution failed: {e}")))?;
+        let fallback = self.join_fallback(&ctx, shared_pool, enforced_logical, query_id);
+        let replanned = crate::join_fallback::ReplannedPlan::default();
+        let stream = crate::join_fallback::FallbackStream::wrap(
+            stream,
+            Arc::clone(&final_plan),
+            fallback,
+            replanned.clone(),
+        );
 
         Ok((
             schema,
@@ -3467,6 +3482,7 @@ impl QueryHandler {
             tables_touched,
             policy_summary,
             audit_resources,
+            replanned,
         ))
     }
 
@@ -3819,6 +3835,7 @@ impl QueryHandler {
         summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
+        let shared_pool = Arc::clone(&ctx.runtime_env().memory_pool);
         let ctx = crate::query_memory::with_query_limit(
             ctx,
             self.per_query_memory_bytes,
@@ -3832,7 +3849,7 @@ impl QueryHandler {
         // dedicated planning stack (#640); see `open_stream`. The out-params
         // are written inside so the caller sees them whether or not planning
         // succeeds past them.
-        let (final_plan, _tt_cleanup) = sqe_core::runtime::on_planning_stack(async {
+        let (final_plan, enforced_logical, _tt_cleanup) = sqe_core::runtime::on_planning_stack(async {
             // Pre-process incremental (CDC) first. The FOR INCREMENTAL BETWEEN
             // clause is not modelled by sqlparser-rs, so the downstream
             // handle_time_travel call (which parses SQL) would fail if we left
@@ -3895,6 +3912,8 @@ impl QueryHandler {
             *plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(
                 enforced_plan.clone(),
             )));
+            // Kept for the sort-merge retry (#784), which plans it again.
+            let enforced_logical = enforced_plan.clone();
 
             // Create a new DataFrame from the enforced plan
             let enforced_df = ctx
@@ -3915,7 +3934,7 @@ impl QueryHandler {
             let final_plan = self
                 .finish_physical_plan(&ctx, session, query_id, physical_plan)
                 .await?;
-            Ok::<_, SqeError>((final_plan, tt_cleanup))
+            Ok::<_, SqeError>((final_plan, enforced_logical, tt_cleanup))
         })
         .await?;
 
@@ -3924,8 +3943,16 @@ impl QueryHandler {
         // cache storage, so completion cannot make live output unaccounted.
         let output_schema = final_plan.schema();
         let configured_max = self.config.query.max_result_rows;
-        let mut stream = execute_stream(final_plan.clone(), ctx.task_ctx())
+        let fallback = self.join_fallback(&ctx, shared_pool, enforced_logical, query_id);
+        let replanned = crate::join_fallback::ReplannedPlan::default();
+        let stream = execute_stream(final_plan.clone(), ctx.task_ctx())
             .map_err(|e| crate::query_memory::execution_error(&e))?;
+        let mut stream = crate::join_fallback::FallbackStream::wrap(
+            stream,
+            Arc::clone(&final_plan),
+            fallback,
+            replanned.clone(),
+        );
         let mut batches: Vec<RecordBatch> = Vec::new();
         // The query pool already delegates to the shared pool. Reserve once
         // so retained result buffers are charged once at each level.
@@ -3949,6 +3976,8 @@ impl QueryHandler {
             }
             batches.push(result_budget.retain(batch)?);
         }
+        // Report on the plan that produced the rows.
+        let final_plan = replanned.take().unwrap_or(final_plan);
 
         // Aggregate spill metrics from the executed plan tree
         if let Some(ref metrics) = self.metrics {
@@ -4003,6 +4032,28 @@ impl QueryHandler {
         );
 
         Ok(batches)
+    }
+
+    /// The sort-merge retry for this query's execution (#784), or `None`
+    /// when `query.join_fallback` or spilling is off. `shared_pool` is the
+    /// pool under the query's own quota, so the retry gets a fresh quota.
+    fn join_fallback(
+        &self,
+        ctx: &SessionContext,
+        shared_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+        logical: LogicalPlan,
+        query_id: &uuid::Uuid,
+    ) -> Option<crate::join_fallback::JoinFallback> {
+        crate::join_fallback::JoinFallback::new(
+            ctx,
+            shared_pool,
+            self.per_query_memory_bytes,
+            self.unspillable_headroom_percent,
+            logical,
+            &self.config.query,
+            self.metrics.clone(),
+            *query_id,
+        )
     }
 
     /// Turn DataFusion's optimized physical plan into the plan the coordinator
