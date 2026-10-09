@@ -51,6 +51,7 @@ mod in_subquery_view_rewrite;
 mod incremental_scan_e2e;
 mod insert_overwrite_e2e;
 mod integration_test;
+mod join_fallback_e2e;
 mod lease_cas_spike_test;
 mod maintenance_lease_test;
 mod maintenance_log_test;
