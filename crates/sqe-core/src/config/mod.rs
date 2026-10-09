@@ -4013,13 +4013,13 @@ fn default_access_control_timeout() -> u64 {
 pub struct RangerConfig {
     /// Ranger service instance name. Must match the Polaris
     /// `polaris.authorization.ranger.service-name` setting.
-    #[serde(default = "default_ranger_service_name")]
+    #[serde(default = "default_ranger_service_name", alias = "service_name")]
     pub service_name: String,
     /// Ranger Admin user for HTTP basic auth.
-    #[serde(default = "default_ranger_admin_user")]
+    #[serde(default = "default_ranger_admin_user", alias = "admin_user")]
     pub admin_user: String,
     /// Ranger Admin password. Set via `SQE_ACCESS_CONTROL__RANGER__ADMIN_PASSWORD`.
-    #[serde(default)]
+    #[serde(default, alias = "admin_password")]
     pub admin_password: SecretString,
     /// Value for the top-level `root` resource (the Polaris realm/context the
     /// embedded authorizer prefixes onto resource paths). When empty, the
@@ -4028,10 +4028,10 @@ pub struct RangerConfig {
     #[serde(default)]
     pub realm: String,
     /// HTTP timeout for a single Ranger Admin call, in seconds.
-    #[serde(default = "default_ranger_timeout_secs")]
+    #[serde(default = "default_ranger_timeout_secs", alias = "timeout_secs")]
     pub timeout_secs: u64,
     /// Accept self-signed TLS certs on the Ranger Admin endpoint.
-    #[serde(default)]
+    #[serde(default, alias = "accept_invalid_certs")]
     pub accept_invalid_certs: bool,
 }
 
@@ -11828,6 +11828,15 @@ warehouse = "wh"
         assert_eq!(
             both.unwrap().policy.ranger.admin_password.expose(),
             "from-env"
+        );
+
+        // `[access_control.ranger]` is kebab-case too and had the same hole.
+        std::env::set_var("SQE_ACCESS_CONTROL__RANGER__ADMIN_PASSWORD", "ac-env");
+        let ac = SqeConfig::load_from_str(MINIMAL_TOML);
+        std::env::remove_var("SQE_ACCESS_CONTROL__RANGER__ADMIN_PASSWORD");
+        assert_eq!(
+            ac.unwrap().access_control.ranger.admin_password.expose(),
+            "ac-env"
         );
 
         let snake = SqeConfig::load_from_str(

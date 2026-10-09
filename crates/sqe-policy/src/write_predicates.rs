@@ -75,14 +75,29 @@ impl WritePolicyPredicates {
 /// of the Iceberg `NamespaceIdent`) and together with `table_name` forms the
 /// `TableReference` the rewriter keys policy on, the same way the SELECT
 /// planner does; see `plan_rewriter::resolve_policy_key`.
+///
+/// `catalog` is the catalog the target lives in (the statement's qualifier,
+/// else the session's). With it the probe reference is `catalog.ns.table`,
+/// exactly what a `SELECT` on the same table is governed as; a
+/// `catalog_scoped` store keys on it, and without it that store denies. A
+/// Hive target passes `None` with its `{root}.{database}` key as
+/// `namespace_key`, which is already the Hive key.
 pub async fn extract_write_predicates(
     enforcer: &dyn PolicyEnforcer,
     user: &SessionUser,
+    catalog: Option<&str>,
     namespace_key: &str,
     table_name: &str,
     schema: Arc<ArrowSchema>,
 ) -> sqe_core::Result<(WritePolicyPredicates, crate::PolicySummary)> {
-    let table_ref = TableReference::partial(namespace_key.to_string(), table_name.to_string());
+    let table_ref = match catalog.filter(|c| !c.is_empty()) {
+        Some(catalog) => TableReference::full(
+            catalog.to_string(),
+            namespace_key.to_string(),
+            table_name.to_string(),
+        ),
+        None => TableReference::partial(namespace_key.to_string(), table_name.to_string()),
+    };
 
     let empty_batches: Vec<Vec<arrow_array::RecordBatch>> = vec![vec![]];
     let mem = Arc::new(
@@ -93,7 +108,7 @@ pub async fn extract_write_predicates(
         .and_then(|b| b.build())
         .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("policy probe scan: {e}")))?;
 
-    // The reference above is already namespace-qualified; no scope to apply.
+    // The reference above is already qualified; no scope to apply.
     let (rewritten, summary) = enforcer
         .evaluate(user, &crate::TableScope::default(), plan)
         .await?;
@@ -277,6 +292,7 @@ mod tests {
         let res = extract_write_predicates(
             &enf,
             &user("alice"),
+            None,
             "default",
             "employees",
             employees_schema(),
@@ -313,6 +329,7 @@ mod tests {
         let (out, _summary) = extract_write_predicates(
             &enf,
             &user("alice"),
+            None,
             "default",
             "employees",
             employees_schema(),
@@ -333,6 +350,7 @@ mod tests {
         let (out, summary) = extract_write_predicates(
             &enf,
             &user("alice"),
+            None,
             "default",
             "employees",
             employees_schema(),
@@ -358,6 +376,7 @@ mod tests {
         let (out, summary) = extract_write_predicates(
             &enf,
             &user("alice"),
+            None,
             "default",
             "employees",
             employees_schema(),
@@ -393,6 +412,7 @@ mod tests {
         let (out, _summary) = extract_write_predicates(
             &enf,
             &user("alice"),
+            None,
             "default",
             "employees",
             employees_schema(),
@@ -449,6 +469,7 @@ mod tests {
         let (out, summary) = extract_write_predicates(
             &enf,
             &user("alice"),
+            None,
             "default",
             "employees",
             employees_schema(),
@@ -501,7 +522,7 @@ mod tests {
         store.add_table_policy("default", "people", pol).await;
         let enf = PolicyPlanRewriter::new(Arc::new(store));
 
-        let (out, _) = extract_write_predicates(&enf, &user("alice"), "default", "people", schema)
+        let (out, _) = extract_write_predicates(&enf, &user("alice"), None, "default", "people", schema)
             .await
             .expect("nested typed NULL masks must render");
         assert_eq!(
@@ -528,6 +549,7 @@ mod tests {
         let (out, summary) = extract_write_predicates(
             &enf,
             &user("alice"),
+            None,
             "default",
             "employees",
             employees_schema(),
@@ -559,6 +581,7 @@ mod tests {
         let (out, _) = extract_write_predicates(
             &enf,
             &user("alice"),
+            None,
             "default",
             "employees",
             employees_schema(),
@@ -574,5 +597,65 @@ mod tests {
         );
         let names: Vec<&str> = out.mask_udfs.iter().map(|u| u.name()).collect();
         assert_eq!(names, vec![MASK_HASH_UDF_NAME]);
+    }
+
+    /// The DML probe is governed as `catalog.ns.table` like a SELECT: a
+    /// catalog-scoped store finds the target's row filter under its catalog,
+    /// and without a catalog the probe is denied rather than keyed bare.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_scoped_probe_keys_on_the_target_catalog() {
+        use crate::PolicyStore;
+        struct Scoped(InMemoryPolicyStore);
+        #[async_trait::async_trait]
+        impl PolicyStore for Scoped {
+            fn catalog_scoped(&self) -> bool {
+                true
+            }
+            async fn resolve(
+                &self,
+                user: &SessionUser,
+                table: &str,
+                namespace: &str,
+            ) -> sqe_core::Result<ResolvedPolicy> {
+                self.0.resolve(user, table, namespace).await
+            }
+        }
+        let store = InMemoryPolicyStore::new();
+        let mut pol = ResolvedPolicy::default();
+        pol.row_filters.push(col("region").eq(lit("EU")));
+        store
+            .add_table_policy("ws_a.default", "employees", pol)
+            .await;
+        let enf = PolicyPlanRewriter::new(Arc::new(Scoped(store)));
+
+        let probe = |catalog: Option<&'static str>| {
+            let enf = &enf;
+            async move {
+                extract_write_predicates(
+                    enf,
+                    &user("alice"),
+                    catalog,
+                    "default",
+                    "employees",
+                    employees_schema(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let (a, _) = probe(Some("ws_a")).await;
+        assert!(
+            a.row_filter_sql
+                .as_deref()
+                .is_some_and(|f| f.contains("EU")),
+            "{a:?}"
+        );
+        let (b, _) = probe(Some("ws_b")).await;
+        assert!(
+            b.row_filter_sql.is_none(),
+            "another catalog's table is not filtered: {b:?}"
+        );
+        let (_, none) = probe(None).await;
+        assert!(none.denied, "no catalog: denied, not keyed without one");
     }
 }

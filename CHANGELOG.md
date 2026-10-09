@@ -39,8 +39,19 @@ All notable changes to SQE are documented in this file.
     way to set the password) overlays the snake key `admin_password`. The
     override was dropped without an error and the store sent an empty
     password; `hive_access_policies = false`, as the docs spell it, left the
-    gate on. Every key now takes both spellings, and an env override
-    replaces the kebab key from the file instead of colliding with it.
+    gate on. `[access_control.ranger]` had the same hole
+    (`SQE_ACCESS_CONTROL__RANGER__ADMIN_PASSWORD`). Every key of both
+    sections now takes both spellings, and an env override replaces the
+    kebab key from the file instead of colliding with it.
+
+- DML policy probe: the target is governed with its catalog
+
+    DELETE, UPDATE, MERGE and the INSERT WITH CHECK guard probed the
+    target's row filters and masks as `ns.table` with no catalog, while a
+    `SELECT` on the same table is governed as `catalog.ns.table` (the
+    session's catalog filled in for an unqualified name). The probe now
+    carries the statement's catalog, else the session's, so the tag lookup
+    finds a cache keyed by catalog and a catalog-scoped Ranger key matches.
 
 - `SHOW EFFECTIVE POLICY` keys a multi-level namespace the way enforcement does
 

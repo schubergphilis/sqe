@@ -998,9 +998,14 @@ pub fn resolve_policy_key(
 /// carries no catalog cannot be keyed that way and returns `None`, which every
 /// caller turns into a deny: falling back to the bare namespace would match
 /// nothing written for the scoped convention, and a policy that does not match
-/// is a mask that does not apply. The one exception is a reserved virtual
+/// is a mask that does not apply. The exceptions are a reserved virtual
 /// reference (`information_schema`, the `system` catalog), which holds no user
-/// rows and is keyed as before.
+/// rows and is keyed as before, and a schema that already starts with a
+/// registered Hive root (the Hive write probe's `{root}.{database}`).
+///
+/// The rewriter qualifies an unqualified scan with the session's catalog and
+/// schema (`TableScope::qualify`) before calling this, so `SELECT * FROM t`
+/// under `USE ws_a.finance` keys as `ws_a.finance`.
 pub fn resolve_policy_key_scoped(
     table_ref: &datafusion::common::TableReference,
     hive_catalogs: &HiveCatalogs,
@@ -1027,6 +1032,9 @@ pub fn resolve_policy_key_scoped(
                 return Some((format!("{catalog}.{namespace}"), table.to_string()));
             }
             _ if is_reserved_virtual_ref(table_ref) => {}
+            // A Hive write probe passes its `{root}.{database}` key as the
+            // schema with no catalog; that key already names the root.
+            None if hive_catalogs.contains_name(namespace.split('.').next()) => {}
             _ => {
                 warn!(
                     table = %table_ref,
