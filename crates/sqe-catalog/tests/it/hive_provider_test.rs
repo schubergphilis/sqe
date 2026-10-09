@@ -464,6 +464,79 @@ async fn two_hive_tables_in_one_bucket_with_different_secrets_are_refused() {
     drop(dir);
 }
 
+/// An unindexed Hive table reads through the store its factory built for
+/// the table's `sqe.secret`, not whatever the session registry already
+/// holds for that bucket (the engine's own credentials). The factory's
+/// store here sees a different filesystem view than the default one: the
+/// data file exists only under its prefix, so reading through the default
+/// store finds an empty directory and returns zero rows without an error.
+#[tokio::test]
+async fn an_unindexed_table_reads_through_its_secrets_store() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let root = format!("file://{}/wh", dir.path().display());
+    let data_path = dir.path().join("data");
+    std::fs::create_dir_all(&data_path).expect("mkdir data");
+    let secret_view = dir.path().join("secret-view");
+    let seen = secret_view.join(data_path.strip_prefix("/").expect("absolute"));
+    std::fs::create_dir_all(&seen).expect("mkdir secret view");
+    std::fs::write(seen.join("part-0.csv"), "id\n1\n").expect("write csv");
+
+    let ddl = format!(
+        "CREATE EXTERNAL TABLE sales.orders (id BIGINT) \
+         ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' \
+         STORED AS TEXTFILE LOCATION 'file://{}' \
+         TBLPROPERTIES ('skip.header.line.count' = '1', 'sqe.secret' = 'reader')",
+        data_path.display()
+    );
+    let stmts = sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, &ddl)
+        .expect("parse");
+    let spec = sqe_sql::hive_ddl::try_extract_hive_table(&stmts[0])
+        .expect("extract")
+        .expect("external");
+    let m = HiveManifest::from_spec(&spec, "sales", "test", "2026-10-09T00:00:00Z");
+    local_store_for_test(&root)
+        .put(&m, false)
+        .await
+        .expect("put manifest");
+
+    #[derive(Debug)]
+    struct SecretViewFactory(std::path::PathBuf);
+    impl sqe_catalog::hive::provider::HiveDataStoreFactory for SecretViewFactory {
+        fn store_for(
+            &self,
+            _location: &str,
+            secret: Option<&str>,
+        ) -> Result<Arc<dyn object_store::ObjectStore>, sqe_catalog::hive::HiveError> {
+            assert_eq!(secret, Some("reader"), "the table's secret reaches the factory");
+            Ok(Arc::new(
+                object_store::local::LocalFileSystem::new_with_prefix(&self.0)
+                    .expect("prefixed store"),
+            ))
+        }
+    }
+
+    let ctx = SessionContext::new();
+    let provider = Arc::new(HiveCatalogProvider::new(
+        "lake".to_string(),
+        Arc::new(local_store_for_test(&root)),
+        Arc::new(SecretViewFactory(secret_view)),
+        ctx.runtime_env(),
+        Arc::new(HiveMetadataCache::new()),
+        Duration::from_secs(60),
+    ));
+    ctx.register_catalog("lake", provider);
+
+    let batches = ctx
+        .sql("SELECT count(*) FROM lake.sales.orders")
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("collect");
+    assert_eq!(count_i64(&batches), 1, "the scan must read through the secret's store");
+    drop(dir);
+}
+
 fn count_i64(batches: &[datafusion::arrow::array::RecordBatch]) -> i64 {
     batches
         .iter()

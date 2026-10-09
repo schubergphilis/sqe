@@ -2328,6 +2328,12 @@ impl SchemaProvider for HiveSchemaProvider {
         // The session's own runtime, not a fresh one: `ListingTable`
         // resolves its object store from the session's registry at scan
         // time, so the store has to live where the query will look for it.
+        // Without it an unindexed scan reads with whatever the registry
+        // already holds for the bucket (the engine's own credentials), not
+        // the table's `sqe.secret`.
+        self.runtime
+            .register_object_store(url.as_ref(), Arc::clone(&data_store));
+
         // Compression has to come from a real object key: Glue records
         // nothing usable (`compressionType` is absent on most tables and
         // says "none" on every table carrying it, gzipped ones included).
