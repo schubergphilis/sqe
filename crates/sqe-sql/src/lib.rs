@@ -41,7 +41,9 @@ pub use classifier::{
 };
 pub use ctas_compat::rewrite_ctas_compat;
 pub use ddl::{try_parse_ref_ddl, BranchRetention, RefDdl};
-pub use front_door::{classify_normalized, NormalizedSql, SqlFrontDoor, WireDialect};
+pub use front_door::{
+    classify_normalized, NormalizedSql, SqlFrontDoor, WireDialect, EXECUTION_DIALECT,
+};
 pub use metadata::{
     is_metadata_query, qualify_information_schema, reads_information_schema, update_type,
     UpdateType,

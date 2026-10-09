@@ -101,8 +101,9 @@ pub fn engine_session_config() -> SessionConfig {
         // Parse numeric literals like 0.06 as DECIMAL instead of DOUBLE.
         .set_bool("datafusion.sql_parser.parse_float_as_decimal", true)
         // DuckDB dialect adds `x -> expr` lambda syntax without changing
-        // identifier/quoting behaviour. See #354.
-        .set_str("datafusion.sql_parser.dialect", "DuckDB")
+        // identifier/quoting behaviour. See #354. The front door refuses text
+        // this dialect tokenizes differently from the classifier (#683).
+        .set_str("datafusion.sql_parser.dialect", sqe_sql::EXECUTION_DIALECT)
         .set_usize(
             "datafusion.optimizer.hash_join_single_partition_threshold",
             64 * 1024 * 1024,
