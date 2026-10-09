@@ -411,6 +411,46 @@ fn build_lineage_insert_plan(
     .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build lineage plan: {e}")))
 }
 
+/// Record the Iceberg snapshot a write committed on the lineage wrapper it
+/// captured, so the emitter reports it as the OL `version` facet. The wrapper
+/// is rebuilt with the id in its target stub's schema metadata
+/// (`sqe_lineage::extract::SNAPSHOT_ID_METADATA_KEY`); anything other than a
+/// captured `Dml` wrapper, or no snapshot, leaves `plan_out` as it is.
+fn record_lineage_snapshot(
+    plan_out: &mut Option<sqe_lineage::PlanOrHint>,
+    snapshot_id: Option<i64>,
+) {
+    let Some(snapshot_id) = snapshot_id else {
+        return;
+    };
+    let Some(sqe_lineage::PlanOrHint::Plan(plan)) = plan_out.as_mut() else {
+        return;
+    };
+    let LogicalPlan::Dml(dml) = plan.as_ref() else {
+        return;
+    };
+    let target = dml.target.schema();
+    let mut metadata = target.metadata().clone();
+    metadata.insert(
+        sqe_lineage::extract::SNAPSHOT_ID_METADATA_KEY.to_string(),
+        snapshot_id.to_string(),
+    );
+    let schema = target.as_ref().clone().with_metadata(metadata);
+    let rebuilt = MemTable::try_new(Arc::new(schema), vec![vec![]]).and_then(|stub| {
+        LogicalPlanBuilder::insert_into(
+            dml.input.as_ref().clone(),
+            dml.table_name.clone(),
+            provider_as_source(Arc::new(stub)),
+            InsertOp::Append,
+        )?
+        .build()
+    });
+    match rebuilt {
+        Ok(wrapper) => **plan = wrapper,
+        Err(e) => tracing::debug!(error = %e, "lineage: could not record the committed snapshot"),
+    }
+}
+
 /// Extract the target table `ObjectName` from a `Statement::Delete`. Centralises
 /// the FromTable + TableFactor matching so a future sqlparser variant change only
 /// needs to be patched once.
@@ -1886,7 +1926,7 @@ impl WriteHandler {
         let cleanup_guard =
             WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "ctas-streaming")
                 .with_metrics(self.metrics.clone());
-        let post_create: sqe_core::Result<usize> = async {
+        let post_create: sqe_core::Result<(usize, Option<i64>)> = async {
             let stream = self.execute_source_stream(df, "CTAS").await?;
             // Puffin NDV sketches ride along on the stream when the table
             // opted in; the buffered path clones batches instead, which the
@@ -1904,10 +1944,11 @@ impl WriteHandler {
             )
             .await?;
 
+            let mut snapshot_id = None;
             if !data_files.is_empty() {
                 let files_for_retry = data_files.clone();
                 let catalog_for_commit = catalog.clone();
-                commit_with_retry(
+                let committed = commit_with_retry(
                     catalog.as_ref(),
                     &create_ident,
                     "ctas-streaming",
@@ -1926,6 +1967,7 @@ impl WriteHandler {
                 .map_err(|e| {
                     SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to commit CTAS transaction: {e}"))
                 })?;
+                snapshot_id = committed.metadata().current_snapshot_id();
                 cleanup_guard.mark_committed();
                 info!(
                     table = %create_ident,
@@ -1948,7 +1990,7 @@ impl WriteHandler {
                     "CTAS created empty table (no data to write)"
                 );
             }
-            Ok(total_rows)
+            Ok((total_rows, snapshot_id))
         }
         .await;
 
@@ -1960,7 +2002,10 @@ impl WriteHandler {
             );
             rollback_ctas_partial_create(&catalog, &table, &create_ident).await;
         }
-        let total_rows = post_create?;
+        let (total_rows, snapshot_id) = post_create?;
+        // A staged replacement is renamed into place below and keeps its
+        // snapshot, so the id names the target's data either way.
+        record_lineage_snapshot(plan_out, snapshot_id);
 
         // Swap a staged replacement into place (500). Both calls are metadata
         // only. The failure message names the staged table so the swap can be
@@ -2299,15 +2344,17 @@ impl WriteHandler {
             return affected_rows_batch(0);
         }
 
-        self.commit_written_files(
-            session,
-            &session_catalog,
-            &table_ident,
-            data_files,
-            overwrite,
-        )
-        .await?;
+        let snapshot_id = self
+            .commit_written_files(
+                session,
+                &session_catalog,
+                &table_ident,
+                data_files,
+                overwrite,
+            )
+            .await?;
         cleanup_guard.mark_committed();
+        record_lineage_snapshot(plan_out, snapshot_id);
 
         if let Some(sketches) = finish_puffin_sketches(sketch_acc) {
             let op = if overwrite {
@@ -5679,14 +5726,14 @@ impl WriteHandler {
         table_ident: &TableIdent,
         new_data_files: Vec<DataFile>,
         overwrite: bool,
-    ) -> sqe_core::Result<()> {
+    ) -> sqe_core::Result<Option<i64>> {
         let bridge = catalog.as_catalog();
         if !overwrite {
             if new_data_files.is_empty() {
-                return Ok(());
+                return Ok(None);
             }
             let bridge_ref = bridge.as_ref();
-            commit_with_retry(bridge_ref, table_ident, "insert", move |fresh_table| {
+            let committed = commit_with_retry(bridge_ref, table_ident, "insert", move |fresh_table| {
                 let files = new_data_files.clone();
                 async move {
                     let tx = Transaction::new(&fresh_table);
@@ -5699,7 +5746,8 @@ impl WriteHandler {
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to commit INSERT: {e}")))?;
             self.after_commit(session, catalog.as_ref(), table_ident)
                 .await;
-            return Ok(());
+            // The append's snapshot, for lineage (the OL `version` facet).
+            return Ok(committed.metadata().current_snapshot_id());
         }
 
         // Distinct partitions touched by the new files (dynamic overwrite).
@@ -5809,7 +5857,9 @@ impl WriteHandler {
             self.after_commit(session, catalog.as_ref(), table_ident)
                 .await;
         }
-        Ok(())
+        // The rewrite helper does not hand back the committed table; lineage
+        // records no snapshot for an INSERT OVERWRITE.
+        Ok(None)
     }
 
     /// Extend an about-to-be-removed set of data files with the position-delete
@@ -8796,6 +8846,27 @@ mod tests {
             "seg is fed by customers.segment"
         );
         assert!(lineage.fields["n"].inputFields.is_empty());
+
+        // After the commit the write records its snapshot on the wrapper;
+        // the extractor reports it as the OL `version` facet and nothing else
+        // about the output changes.
+        let mut plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(wrapper)));
+        record_lineage_snapshot(&mut plan_out, Some(4205761418235361718));
+        let Some(sqe_lineage::PlanOrHint::Plan(recorded)) = plan_out else {
+            panic!("wrapper kept")
+        };
+        let (_, outputs) = sqe_lineage::extract::extract_lineage(&recorded, &lookup);
+        assert_eq!(
+            outputs[0].facets.version.as_ref().unwrap().datasetVersion,
+            "4205761418235361718"
+        );
+        assert_eq!(outputs[0].name, "default.lin_probe");
+        assert_eq!(outputs[0].facets.schema.as_ref().unwrap().fields.len(), 3);
+
+        // No snapshot (empty write, INSERT OVERWRITE): nothing recorded.
+        let mut untouched = Some(sqe_lineage::PlanOrHint::Plan(recorded));
+        record_lineage_snapshot(&mut untouched, None);
+        assert!(matches!(untouched, Some(sqe_lineage::PlanOrHint::Plan(_))));
     }
 
     fn test_session(default_schema: Option<&str>) -> sqe_core::Session {
