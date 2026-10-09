@@ -80,8 +80,12 @@ fn make(kind: &str, subtype: &str, masking: bool) -> Transformation {
 // by node kind. Unknown nodes return an empty trace (conservative for v1).
 // ---------------------------------------------------------------------------
 
-/// Parse a (possibly quoted) qualified table name into (catalog, schema, table)
-/// applying the same fallback rules as `extract::datasets::parse_table_ref`.
+/// Parse a (possibly quoted) qualified table name into (catalog, schema, table).
+///
+/// A part the name does not spell is left EMPTY: the tracer has no session
+/// scope, so `s.t` traces as `("", "s", "t")` and `t` as `("", "", "t")`.
+/// [`resolve_scope`] fills them from the statement's scope afterwards, the way
+/// `extract::datasets::parse_table_ref` does for the dataset list.
 pub(crate) fn parse_table_ref(name: &str) -> (String, String, String) {
     let parts: Vec<String> = name
         .split('.')
@@ -89,13 +93,22 @@ pub(crate) fn parse_table_ref(name: &str) -> (String, String, String) {
         .collect();
     match parts.len() {
         3 => (parts[0].clone(), parts[1].clone(), parts[2].clone()),
-        2 => ("default".to_string(), parts[0].clone(), parts[1].clone()),
-        1 => (
-            "default".to_string(),
-            "default".to_string(),
-            parts[0].clone(),
-        ),
+        2 => (String::new(), parts[0].clone(), parts[1].clone()),
+        1 => (String::new(), String::new(), parts[0].clone()),
         _ => (String::new(), String::new(), name.to_string()),
+    }
+}
+
+/// Fill every dependency's empty catalog / schema (a part its scan's table
+/// name did not spell) from the statement's session scope.
+pub fn resolve_scope(trace: &mut ColumnTrace, scope: &crate::observer::LineageScope) {
+    for dep in trace.iter_mut().flat_map(|deps| deps.iter_mut()) {
+        if dep.catalog.is_empty() {
+            dep.catalog = scope.catalog.clone();
+        }
+        if dep.schema.is_empty() {
+            dep.schema = scope.schema.clone();
+        }
     }
 }
 

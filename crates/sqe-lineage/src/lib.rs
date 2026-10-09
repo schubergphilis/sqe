@@ -11,7 +11,7 @@ pub mod sinks;
 
 pub use emitter::{spawn_emitter, EmitterConfig};
 pub use observer::{
-    ChannelObserver, LineageHint, LineageMsg, PlanOrHint, QueryCompleteCtx,
+    ChannelObserver, LineageHint, LineageMsg, LineageScope, PlanOrHint, QueryCompleteCtx,
     QueryFailCtx, QueryStartCtx, UserCtx,
 };
 pub use sink::{MultiSink, Sink, SinkError};

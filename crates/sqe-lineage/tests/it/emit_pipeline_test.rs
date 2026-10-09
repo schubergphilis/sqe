@@ -21,7 +21,7 @@ use tempfile::tempdir;
 use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
 
 fn lookup() -> extract::CatalogLookup {
-    Arc::new(|n: &str| format!("sqe://{n}"))
+    Arc::new(|n: &str| sqe_lineage::extract::CatalogInfo::new(n, None))
 }
 
 /// Poll the wiremock collector until it has received `expected` requests, or

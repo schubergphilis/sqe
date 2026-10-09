@@ -9,8 +9,11 @@ use std::sync::Arc;
 
 fn lookup() -> extract::CatalogLookup {
     Arc::new(|n: &str| match n {
-        "polaris" => "https://polaris.example/api/catalog".into(),
-        other => format!("sqe://{other}"),
+        "polaris" => sqe_lineage::extract::CatalogInfo::new(
+            "polaris",
+            Some("https://polaris.example/api/catalog".into()),
+        ),
+        other => sqe_lineage::extract::CatalogInfo::new(other, None),
     })
 }
 
@@ -44,7 +47,7 @@ fn insert_into_yields_inputs_outputs_and_column_lineage() {
 
     assert_eq!(inputs.len(), 1, "one source dataset");
     assert_eq!(inputs[0].name, "sales.orders");
-    assert_eq!(inputs[0].namespace, "https://polaris.example/api/catalog");
+    assert_eq!(inputs[0].namespace, "sqe://polaris");
 
     assert_eq!(outputs.len(), 1, "one target dataset");
     assert_eq!(outputs[0].name, "sales.archive");
@@ -58,7 +61,7 @@ fn insert_into_yields_inputs_outputs_and_column_lineage() {
     let entry = &cl.fields["id"];
     assert_eq!(entry.inputFields.len(), 1);
     let src = &entry.inputFields[0];
-    assert_eq!(src.namespace, "https://polaris.example/api/catalog");
+    assert_eq!(src.namespace, "sqe://polaris");
     assert_eq!(src.name, "sales.orders");
     assert_eq!(src.field, "id");
     assert_eq!(entry.inputFields[0].transformations.len(), 1);

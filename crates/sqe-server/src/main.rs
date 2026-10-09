@@ -1123,14 +1123,67 @@ struct QueryHandlerAdapter {
 
 #[async_trait::async_trait]
 impl TrinoQueryExecutor for QueryHandlerAdapter {
-    /// SELECTs stream through [`QueryHandler::execute_stream`] so the Trino
-    /// path never holds more than one page of a result (#621); every other
-    /// statement kind (DML counts, DDL, SHOW, ...) takes the buffered
-    /// `execute` path exactly as Flight SQL does.
+    /// See [`QueryHandlerAdapter::execute_as`]; the engine mints the id.
     async fn execute(
         &self,
         session: &sqe_core::Session,
         sql: &str,
+    ) -> Result<TrinoResultStream, sqe_core::SqeError> {
+        self.execute_as(session, sql, None).await
+    }
+
+    /// The Trino query id is a UUID this server minted; the engine records
+    /// the statement under it, so its query history, audit record and
+    /// OpenLineage `runId` equal the `id` the client polls. A non-UUID id
+    /// (none today) falls back to an engine-minted one.
+    async fn execute_with_query_id(
+        &self,
+        session: &sqe_core::Session,
+        sql: &str,
+        query_id: &str,
+    ) -> Result<TrinoResultStream, sqe_core::SqeError> {
+        self.execute_as(session, sql, uuid::Uuid::parse_str(query_id).ok())
+            .await
+    }
+
+    fn memory_pool(&self) -> Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>> {
+        Some(self.handler.runtime().memory_pool.clone())
+    }
+
+    fn audit_rejected(&self, session: &sqe_core::Session, sql: &str, error: &sqe_core::SqeError) {
+        self.handler.record_failed_statement(
+            session,
+            sql,
+            std::time::Instant::now(),
+            None,
+            None,
+            error,
+        );
+    }
+
+    async fn describe_prepared(
+        &self,
+        session: &sqe_core::Session,
+        prepared_sql: &str,
+        kind: sqe_trino_compat::protocol::DescribeKind,
+    ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
+        self.handler
+            .describe_prepared(session, prepared_sql, kind)
+            .await
+    }
+}
+
+impl QueryHandlerAdapter {
+    /// SELECTs stream through [`QueryHandler::execute_stream_with_id`] so the
+    /// Trino path never holds more than one page of a result (#621); every
+    /// other statement kind (DML counts, DDL, SHOW, ...) takes the buffered
+    /// `execute_with_id` path exactly as Flight SQL does. `query_id` is the
+    /// id the engine records the statement under (`None`: engine-minted).
+    async fn execute_as(
+        &self,
+        session: &sqe_core::Session,
+        sql: &str,
+        query_id: Option<uuid::Uuid>,
     ) -> Result<TrinoResultStream, sqe_core::SqeError> {
         use futures::StreamExt;
         use sqe_sql::{
@@ -1159,40 +1212,17 @@ impl TrinoQueryExecutor for QueryHandlerAdapter {
             .map(|kind| matches!(kind, StatementKind::Query(_)))
             .unwrap_or(false);
         if is_query {
-            let (schema, stream) = self.handler.execute_stream(session, sql, None).await?;
+            let (schema, stream) = self
+                .handler
+                .execute_stream_with_id(session, sql, None, query_id)
+                .await?;
             let stream = stream.map(|res| res.map_err(sqe_core::SqeError::from));
             return Ok(TrinoResultStream::new(schema, Box::pin(stream)));
         }
         self.handler
-            .execute(session, sql, None)
+            .execute_with_id(session, sql, None, query_id)
             .await
             .map(TrinoResultStream::from_batches)
-    }
-
-    fn memory_pool(&self) -> Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>> {
-        Some(self.handler.runtime().memory_pool.clone())
-    }
-
-    fn audit_rejected(&self, session: &sqe_core::Session, sql: &str, error: &sqe_core::SqeError) {
-        self.handler.record_failed_statement(
-            session,
-            sql,
-            std::time::Instant::now(),
-            None,
-            None,
-            error,
-        );
-    }
-
-    async fn describe_prepared(
-        &self,
-        session: &sqe_core::Session,
-        prepared_sql: &str,
-        kind: sqe_trino_compat::protocol::DescribeKind,
-    ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
-        self.handler
-            .describe_prepared(session, prepared_sql, kind)
-            .await
     }
 }
 
@@ -2705,6 +2735,67 @@ async fn run_worker(config: SqeConfig, config_path: String) -> anyhow::Result<()
 
 // ── OpenLineage observer construction ─────────────────────────
 
+/// SQE catalog name -> lineage identity (`sqe-lineage` namespaces datasets
+/// `sqe://<name>` and links them to `<uri>` / `<name>.<schema>.<table>`).
+///
+/// A configured Iceberg REST catalog is named after its `warehouse`, the
+/// Polaris catalog it is: the legacy `[catalog]` block is registered under the
+/// SQL name `iceberg` but IS `workspace1` when its warehouse says so, and a
+/// workspace catalog that `polaris-auto` discovers is registered under that
+/// same warehouse name, so both spellings land on one dataset. The URI is the
+/// catalog's `catalog_url`; for a discovered (unconfigured) name it is the
+/// discovery template's, the Polaris every discovered catalog lives on.
+/// Anything else (Glue, HMS, ATTACHed, Hive roots) keeps its SQL name and no
+/// URI.
+fn lineage_catalog_lookup(config: &SqeConfig) -> sqe_lineage::extract::CatalogLookup {
+    use sqe_core::config::{CatalogBackend, CatalogDiscovery};
+    use sqe_lineage::extract::CatalogInfo;
+
+    let is_rest_url = |c: &sqe_core::config::CatalogConfig| {
+        matches!(c.backend, CatalogBackend::Rest) && !c.catalog_url.trim().is_empty()
+    };
+    let configured: std::collections::HashMap<String, CatalogInfo> = config
+        .flattened_catalogs()
+        .iter()
+        .map(|(name, c)| {
+            let info = if is_rest_url(c) {
+                let warehouse = c.warehouse.trim();
+                let iceberg_name = if warehouse.is_empty() || warehouse.contains(['/', ':']) {
+                    name.clone()
+                } else {
+                    warehouse.to_string()
+                };
+                CatalogInfo::new(iceberg_name, Some(c.catalog_url.clone()))
+            } else {
+                CatalogInfo::new(name.clone(), None)
+            };
+            (name.clone(), info)
+        })
+        .collect();
+    // The REST catalog `polaris-auto` clones for a discovered warehouse
+    // (mirrors `session_context::discovery_template`'s pick).
+    let discovery_uri: Option<String> = (config.query.catalog_discovery
+        == CatalogDiscovery::PolarisAuto)
+        .then(|| {
+            let flattened = config.flattened_catalogs();
+            config
+                .query
+                .default_catalog
+                .as_deref()
+                .and_then(|name| flattened.iter().find(|(n, _)| n == name))
+                .filter(|(_, c)| is_rest_url(c))
+                .or_else(|| flattened.iter().find(|(_, c)| is_rest_url(c)))
+                .map(|(_, c)| c.catalog_url.clone())
+        })
+        .flatten();
+    Arc::new(move |name: &str| {
+        configured
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| CatalogInfo::new(name, discovery_uri.clone()))
+    })
+}
+
 /// Build the [`sqe_lineage::ChannelObserver`] from `[metrics.openlineage]`.
 ///
 /// Returns `None` when the section is disabled (the default). When enabled,
@@ -2791,20 +2882,7 @@ fn build_lineage_observer(
     )
     .expect("static prometheus opts cannot fail");
 
-    // Build catalog lookup from flattened catalog config: name -> REST URL,
-    // with `sqe://<name>` fallback when no URL is configured.
-    let catalog_lookup_map: std::collections::HashMap<String, String> = config
-        .flattened_catalogs()
-        .iter()
-        .map(|(name, c)| (name.clone(), c.catalog_url.clone()))
-        .collect();
-    let catalog_lookup: sqe_lineage::extract::CatalogLookup = Arc::new(move |name: &str| {
-        catalog_lookup_map
-            .get(name)
-            .cloned()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| format!("sqe://{name}"))
-    });
+    let catalog_lookup = lineage_catalog_lookup(config);
 
     let producer = if ol.producer.is_empty() {
         format!("https://github.com/sbp/sqe/v{}", env!("CARGO_PKG_VERSION"))
@@ -2925,6 +3003,53 @@ mod tests {
         assert!(
             !ready.load(Ordering::Relaxed),
             "readiness must be flipped to NOT-ready on shutdown"
+        );
+    }
+
+    /// The AI portal's shape: a legacy `[catalog]` block on Polaris with
+    /// warehouse `workspace1` and `polaris-auto` discovery. The SQL name
+    /// `iceberg` and the discovered `workspace1` are one Polaris catalog, so
+    /// lineage names both `workspace1`; another discovered workspace keeps
+    /// its own name on the same Polaris.
+    #[test]
+    fn lineage_lookup_names_rest_catalogs_after_their_warehouse() {
+        let config = SqeConfig::load_from_str(
+            r#"
+[coordinator]
+
+[catalog]
+polaris_url = "http://polaris:8181/api/catalog"
+warehouse = "workspace1"
+
+[query]
+catalog_discovery = "polaris-auto"
+
+[auth]
+client_id = "unused-no-idp"
+token_endpoint = "http://127.0.0.1:1/token"
+"#,
+        )
+        .unwrap();
+        let lookup = lineage_catalog_lookup(&config);
+        let polaris = Some("http://polaris:8181/api/catalog".to_string());
+        assert_eq!(
+            lookup("iceberg"),
+            sqe_lineage::extract::CatalogInfo::new("workspace1", polaris.clone())
+        );
+        assert_eq!(
+            lookup("workspace1"),
+            sqe_lineage::extract::CatalogInfo::new("workspace1", polaris.clone())
+        );
+        assert_eq!(
+            lookup("ws_team_a"),
+            sqe_lineage::extract::CatalogInfo::new("ws_team_a", polaris)
+        );
+
+        // Without discovery an unknown name has no catalog URI.
+        let config = SqeConfig::load_from_str(DEFAULT_FLAG_ONLY_CONFIG).unwrap();
+        assert_eq!(
+            lineage_catalog_lookup(&config)("other"),
+            sqe_lineage::extract::CatalogInfo::new("other", None)
         );
     }
 

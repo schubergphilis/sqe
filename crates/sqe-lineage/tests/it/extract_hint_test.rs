@@ -20,8 +20,11 @@ fn ddl_hint_yields_output_dataset_with_schema() {
         ],
     };
     let lookup: extract::CatalogLookup = Arc::new(|n: &str| match n {
-        "polaris" => "https://polaris.example/api/catalog".into(),
-        other => format!("sqe://{other}"),
+        "polaris" => sqe_lineage::extract::CatalogInfo::new(
+            "polaris",
+            Some("https://polaris.example/api/catalog".into()),
+        ),
+        other => sqe_lineage::extract::CatalogInfo::new(other, None),
     });
 
     let (inputs, outputs) = extract::extract_from_hint(&hint, &lookup);
@@ -31,7 +34,7 @@ fn ddl_hint_yields_output_dataset_with_schema() {
 
     let out = &outputs[0];
     assert_eq!(out.name, "sales.new_table");
-    assert_eq!(out.namespace, "https://polaris.example/api/catalog");
+    assert_eq!(out.namespace, "sqe://polaris");
 
     let schema = out.facets.schema.as_ref().expect("schema facet");
     assert_eq!(schema.fields.len(), 2);

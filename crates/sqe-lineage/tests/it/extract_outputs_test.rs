@@ -8,8 +8,11 @@ use std::sync::Arc;
 
 fn lookup_polaris() -> CatalogLookup {
     Arc::new(|name: &str| match name {
-        "polaris" => "https://polaris.example/api/catalog".into(),
-        other => format!("sqe://{other}"),
+        "polaris" => sqe_lineage::extract::CatalogInfo::new(
+            "polaris",
+            Some("https://polaris.example/api/catalog".into()),
+        ),
+        other => sqe_lineage::extract::CatalogInfo::new(other, None),
     })
 }
 
@@ -59,11 +62,11 @@ fn insert_plan_yields_one_output_dataset() {
         &[("id", DataType::Int64), ("amount", DataType::Float64)],
     );
     let lookup = lookup_polaris();
-    let outputs = datasets::extract_outputs(&plan, &lookup);
+    let outputs = datasets::extract_outputs(&plan, &lookup, &sqe_lineage::LineageScope::default());
 
     assert_eq!(outputs.len(), 1);
     let output = &outputs[0];
-    assert_eq!(output.namespace, "https://polaris.example/api/catalog");
+    assert_eq!(output.namespace, "sqe://polaris");
     assert_eq!(output.name, "sales.archive");
     let ds = output.facets.dataSource.as_ref().expect("dataSource facet");
     assert_eq!(ds.name, "polaris");
@@ -82,7 +85,7 @@ fn insert_with_unknown_catalog_uses_sqe_fallback() {
         &[("id", DataType::Int64)],
     );
     let lookup = lookup_polaris();
-    let outputs = datasets::extract_outputs(&plan, &lookup);
+    let outputs = datasets::extract_outputs(&plan, &lookup, &sqe_lineage::LineageScope::default());
 
     assert_eq!(outputs.len(), 1);
     assert_eq!(outputs[0].namespace, "sqe://nessie");
