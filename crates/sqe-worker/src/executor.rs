@@ -191,11 +191,11 @@ impl Stream for QueueTrackedScanStream {
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(batch))) => {
                 let sz = batch.charged_bytes();
-                let _ =
-                    self.queue_bytes
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                            Some(cur.saturating_sub(sz))
-                        });
+                let _ = self
+                    .queue_bytes
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                        Some(cur.saturating_sub(sz))
+                    });
                 self.space.notify_waiters();
                 if let Some(ref m) = self.metrics {
                     m.scan_queue_resident_bytes
@@ -1026,7 +1026,7 @@ async fn scan_streaming_inner(
             if tx.send(Ok(accounted)).await.is_err() {
                 // Consumer dropped: Accounted is dropped by send error path
                 // (value not moved), so the permit releases. Reverse queue gauge.
-                let _ = queue_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                let _ = queue_bytes.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                     Some(cur.saturating_sub(charged))
                 });
                 queue_space.notify_waiters();
