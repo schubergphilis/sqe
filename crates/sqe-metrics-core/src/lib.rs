@@ -151,6 +151,18 @@ pub struct MetricsRegistry {
     pub scheduler_task_count: Histogram,
     pub scheduler_task_size_mb: Histogram,
     pub scheduler_stragglers: IntCounter,
+    /// `sqe_scan_ticket_bytes` (#809): size of each `ScanTask` ticket sent to
+    /// a worker, after the oversize fallback. One sample per dispatch attempt,
+    /// so retries count again.
+    pub scan_ticket_bytes: Histogram,
+    /// `sqe_scan_ticket_encode_seconds` (#809): coordinator time to serialize
+    /// one ticket, including the predicate-stripped re-encode when the first
+    /// one is over the message ceiling.
+    pub scan_ticket_encode_seconds: Histogram,
+    /// `sqe_scan_ticket_dynamic_filter_seconds` (#809): per-partition time to
+    /// decode the ticket predicate, AND in the dynamic-filter snapshots and
+    /// re-serialize it. Excludes the bounded wait for the join builds.
+    pub scan_ticket_dynamic_filter_seconds: Histogram,
     /// `sqe_worker_fragment_failures_total{fault}` (finding 602): scan
     /// fragments that ended in an error, by `sqe_planner::WorkerFault` label
     /// (`principal_denied`, `worker_internal`, ...; `transport` for a dead
@@ -437,7 +449,11 @@ impl MetricsRegistry {
                 "sqe_scheduler_task_count",
                 "Number of tasks per distributed query",
             )
-            .buckets(vec![1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0, 100.0]),
+            // Byte-range morsels put SF10 scans well past 100 tasks (#809).
+            .buckets(vec![
+                1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0,
+                10000.0,
+            ]),
         )?;
 
         let scheduler_task_size_mb = register_histogram(
@@ -453,6 +469,47 @@ impl MetricsRegistry {
             &registry,
             "sqe_scheduler_stragglers_total",
             "Number of straggler fragments detected",
+        )?;
+
+        // #809: ScanTask ticket cost. The byte buckets end at the 16 MiB
+        // default gRPC message ceiling the ticket must fit under.
+        let scan_ticket_bytes = register_histogram(
+            &registry,
+            HistogramOpts::new(
+                "sqe_scan_ticket_bytes",
+                "Size of each encoded ScanTask ticket sent to a worker, in bytes",
+            )
+            .buckets(vec![
+                1024.0,
+                4096.0,
+                16384.0,
+                65536.0,
+                262_144.0,
+                1_048_576.0,
+                4_194_304.0,
+                8_388_608.0,
+                16_777_216.0,
+            ]),
+        )?;
+        let ticket_seconds_buckets = vec![
+            0.000_01, 0.000_05, 0.000_1, 0.000_5, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0,
+        ];
+        let scan_ticket_encode_seconds = register_histogram(
+            &registry,
+            HistogramOpts::new(
+                "sqe_scan_ticket_encode_seconds",
+                "Coordinator time to serialize one ScanTask ticket, in seconds",
+            )
+            .buckets(ticket_seconds_buckets.clone()),
+        )?;
+        let scan_ticket_dynamic_filter_seconds = register_histogram(
+            &registry,
+            HistogramOpts::new(
+                "sqe_scan_ticket_dynamic_filter_seconds",
+                "Coordinator time per partition to AND dynamic filters into the ticket \
+                 predicate and re-serialize it, in seconds",
+            )
+            .buckets(ticket_seconds_buckets),
         )?;
 
         let footer_cache_hits = register_counter(
@@ -911,6 +968,9 @@ impl MetricsRegistry {
             scheduler_task_count,
             scheduler_task_size_mb,
             scheduler_stragglers,
+            scan_ticket_bytes,
+            scan_ticket_encode_seconds,
+            scan_ticket_dynamic_filter_seconds,
             worker_fragment_failures_total,
             worker_reported_memory_limit_bytes,
             worker_reported_scan_budget_free_bytes,
@@ -1214,6 +1274,9 @@ mod tests {
         metrics.scheduler_task_count.observe(0.0);
         metrics.scheduler_task_size_mb.observe(0.0);
         metrics.scheduler_stragglers.inc_by(0);
+        metrics.scan_ticket_bytes.observe(0.0);
+        metrics.scan_ticket_encode_seconds.observe(0.0);
+        metrics.scan_ticket_dynamic_filter_seconds.observe(0.0);
         metrics.footer_cache_hits.inc_by(0.0);
         metrics.footer_cache_misses.inc_by(0.0);
         metrics.footer_cache_size_bytes.set(0.0);
@@ -1278,6 +1341,40 @@ mod tests {
         metrics.dashboard_auth_anonymous_denied_total.inc_by(0);
         // 17 original + 14 streaming + 7 new (S3 + auth) + 1 adaptive sort + 1 dashboard = 40 minimum
         assert!(metrics.registry.gather().len() >= 40);
+    }
+
+    #[test]
+    fn test_scan_ticket_metrics_registered() {
+        let metrics = MetricsRegistry::new().unwrap();
+        metrics.scan_ticket_bytes.observe(2048.0);
+        metrics.scan_ticket_encode_seconds.observe(0.000_2);
+        metrics.scan_ticket_dynamic_filter_seconds.observe(0.001);
+        let names: Vec<String> = metrics
+            .registry
+            .gather()
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect();
+        for name in [
+            "sqe_scan_ticket_bytes",
+            "sqe_scan_ticket_encode_seconds",
+            "sqe_scan_ticket_dynamic_filter_seconds",
+        ] {
+            assert!(names.iter().any(|n| n == name), "{name} not registered");
+        }
+        // The byte buckets must reach the 16 MiB default message ceiling.
+        let families = metrics.registry.gather();
+        let bytes = families
+            .iter()
+            .find(|f| f.name() == "sqe_scan_ticket_bytes")
+            .unwrap();
+        let top = bytes.get_metric()[0]
+            .get_histogram()
+            .get_bucket()
+            .iter()
+            .map(|b| b.upper_bound())
+            .fold(0.0_f64, f64::max);
+        assert_eq!(top, 16_777_216.0);
     }
 
     #[test]
