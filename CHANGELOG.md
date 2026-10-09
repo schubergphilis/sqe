@@ -138,6 +138,20 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- OpenLineage: datasets are named `sqe://<catalog>` / `<schema>.<table>`; events carry the written columns, the snapshot and the query id
+
+    A scan was named `sqe://default` and a write by the bare catalog URL,
+    so one table had two identities. Every input and output is now
+    namespace `sqe://<catalog>` with an OL `symlinks` TABLE identifier,
+    and a write is labelled with the catalog it actually targets. INSERT
+    and DML output fields are named after the target table's columns.
+    DDL and overwriting writes carry `lifecycleStateChange`; an INSERT
+    append or CTAS carries the committed snapshot as the `version` facet;
+    every event has the run facet `sqe_query.queryId`. Consumers keyed on
+    the old namespaces see new dataset identities. A Trino statement now
+    runs under the protocol query id, so `runId`, query history and audit
+    records use the id the client polls.
+
 - Benchmarks: SSB and TPC-DS fact tables are generated in date order; their values change
 
     `load` sorts SSB `lineorder` and the TPC-DS sales/returns tables by

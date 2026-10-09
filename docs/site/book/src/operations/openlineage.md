@@ -16,6 +16,15 @@ Use these events to drive a lineage UI (Marquez, DataHub) or to feed a metadata 
 
 Each query produces two events: a START at submit time and a COMPLETE on success or FAIL on error.
 
+### Dataset names and facets
+
+- Every input and output dataset has namespace `sqe://<catalog>` and name `<schema>.<table>`, where `<catalog>` is the Iceberg catalog the table was read from or written to. A REST catalog is named after its warehouse. An unqualified or two-part table name resolves in the statement's session catalog and schema.
+- Each dataset carries a `symlinks` facet with a `TABLE` identifier: namespace is the catalog URI and name is `<catalog>.<schema>.<table>`. `dataSource` keeps the catalog URI.
+- The output fields of INSERT, MERGE, UPDATE and DELETE are named after the target table's columns, by position.
+- CREATE TABLE, CTAS, CREATE OR REPLACE, INSERT OVERWRITE, TRUNCATE and DROP TABLE carry `lifecycleStateChange` (`CREATE`, `OVERWRITE`, `TRUNCATE`, `DROP`).
+- An INSERT append or CTAS carries the committed Iceberg snapshot id as the `version` facet (`datasetVersion`). Other writes do not carry one yet.
+- Every event carries the run facet `sqe_query` with `queryId`, equal to `runId`. For a statement over the Trino HTTP protocol, that is the query id the client polls.
+
 ## Configuration
 
 ```toml
