@@ -380,17 +380,18 @@ async fn scalar_count(df: datafusion::dataframe::DataFrame, label: &str) -> sqe_
 /// fan out column lineage. We synthesise that wrapper here purely for lineage
 /// capture; the wrapper plan is never executed.
 ///
-/// The target schema is derived from `source.schema()` so column-name
-/// alignment matches what the writer will persist (DataFusion's planner has
-/// already projected source columns to the target shape by ordinal — see
-/// design spec §5.3).
+/// The target stub's schema is `target` when the write goes into an existing
+/// table (INSERT: the table's own columns, which the extractor names the
+/// output fields after, by position), else `source.schema()` (CTAS, and the
+/// self-rewrites whose source IS the table).
 fn build_lineage_insert_plan(
     source: LogicalPlan,
+    target: Option<ArrowSchema>,
     catalog: &str,
     namespace: &str,
     table: &str,
 ) -> sqe_core::Result<LogicalPlan> {
-    let arrow_schema: ArrowSchema = source.schema().as_arrow().clone();
+    let arrow_schema: ArrowSchema = target.unwrap_or_else(|| source.schema().as_arrow().clone());
     let target_mem = MemTable::try_new(Arc::new(arrow_schema), vec![vec![]])
         .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build lineage target stub: {e}")))?;
     let target_provider: Arc<dyn datafusion::catalog::TableProvider> = Arc::new(target_mem);
@@ -491,11 +492,21 @@ fn try_resolve_update_target_ident(stmt: &Statement, session: &Session) -> Optio
 }
 
 /// Resolve the (catalog, namespace, table) tuple used to label a write target
-/// in OL events. SQE's catalog name is whatever `resolve_default_catalog()`
-/// returns; the OL `catalog_lookup` falls back to `sqe://<name>` when the
-/// operator hasn't configured an explicit URL for it.
-fn lineage_target_parts(config: &SqeConfig, table_ident: &TableIdent) -> (String, String, String) {
-    let catalog = config.resolve_default_catalog();
+/// in OL events. The catalog is the one the write resolves against
+/// ([`resolve_target_catalog`]: the statement's qualifier, else the session
+/// catalog), falling back to `resolve_default_catalog()` for an unqualified
+/// statement in a session that names none. It used to be the configured
+/// default always, so a write into a workspace catalog was labelled with the
+/// default one. The OL `catalog_lookup` maps the name to its Iceberg catalog.
+fn lineage_target_parts(
+    config: &SqeConfig,
+    session: &Session,
+    name: &ObjectName,
+    table_ident: &TableIdent,
+) -> (String, String, String) {
+    let catalog = resolve_target_catalog(catalog_qualifier(name), session)
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| config.resolve_default_catalog());
     // `NamespaceIdent::Display` joins parts with a literal dot, which matches
     // how the OL extractor parses `<catalog>.<schema>.<table>` (it splits on
     // dots in `parse_table_ref`). `to_url_string` uses the unit separator
@@ -1554,6 +1565,7 @@ impl WriteHandler {
     /// fail the write.
     async fn capture_self_lineage(
         &self,
+        session: &Session,
         ctx: &DFSessionContext,
         table_ident: &TableIdent,
         table_factor_name: &sqlparser::ast::ObjectName,
@@ -1573,8 +1585,9 @@ impl WriteHandler {
         };
         let source_plan = df.logical_plan().clone();
         let (lin_catalog, lin_namespace, lin_table) =
-            lineage_target_parts(&self.config, table_ident);
-        match build_lineage_insert_plan(source_plan, &lin_catalog, &lin_namespace, &lin_table) {
+            lineage_target_parts(&self.config, session, table_factor_name, table_ident);
+        match build_lineage_insert_plan(source_plan, None, &lin_catalog, &lin_namespace, &lin_table)
+        {
             Ok(wrapper) => {
                 *plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(wrapper)));
             }
@@ -1748,9 +1761,9 @@ impl WriteHandler {
         // REPLACE path executes the stream.
         let source_plan = df.logical_plan().clone();
         let (lin_catalog, lin_namespace, lin_table) =
-            lineage_target_parts(&self.config, &table_ident);
+            lineage_target_parts(&self.config, session, table_name, &table_ident);
         if let Ok(wrapper) =
-            build_lineage_insert_plan(source_plan, &lin_catalog, &lin_namespace, &lin_table)
+            build_lineage_insert_plan(source_plan, None, &lin_catalog, &lin_namespace, &lin_table)
         {
             *plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(wrapper)));
         }
@@ -2222,10 +2235,17 @@ impl WriteHandler {
                     self.enforce_source_plan(session, &sqe_policy::TableScope::of(ctx), source_plan)
                         .await?;
 
+                // The stub carries the target table's columns, so lineage
+                // names output column i after the table's column i (the
+                // source is in table order, reordered above for an explicit
+                // column list), not after the SELECT expression feeding it.
                 let (lin_catalog, lin_namespace, lin_table) =
-                    lineage_target_parts(&self.config, &table_ident);
+                    lineage_target_parts(&self.config, session, table_name, &table_ident);
                 let lineage_plan = build_lineage_insert_plan(
                     enforced_plan.clone(),
+                    build_arrow_schema_for_table(&table)
+                        .ok()
+                        .map(|s| s.as_ref().clone()),
                     &lin_catalog,
                     &lin_namespace,
                     &lin_table,
@@ -3533,7 +3553,7 @@ impl WriteHandler {
         // synthesise this by planning `SELECT * FROM target` and wrapping
         // it in a synthetic INSERT against the same target. Errors are
         // swallowed because lineage capture is best-effort.
-        self.capture_self_lineage(ctx, &table_ident, table_factor_name, plan_out)
+        self.capture_self_lineage(session, ctx, &table_ident, table_factor_name, plan_out)
             .await;
 
         let mode = resolve_delete_mode(table.metadata().properties())?;
@@ -3838,7 +3858,7 @@ impl WriteHandler {
         // Capture lineage: UPDATE rewrites target rows in place. v1 emits
         // identity column lineage; richer per-column SET-expression tracing
         // is deferred. See `capture_self_lineage` for details.
-        self.capture_self_lineage(ctx, &table_ident, table_factor_name, plan_out)
+        self.capture_self_lineage(session, ctx, &table_ident, table_factor_name, plan_out)
             .await;
 
         let mode = resolve_update_mode(table.metadata().properties())?;
@@ -4910,8 +4930,9 @@ impl WriteHandler {
         // MERGE_UPDATE annotation is deferred (spec §5.3 v1 limitation).
         if let Some(src_plan) = source_plan {
             let (lin_catalog, lin_namespace, lin_table) =
-                lineage_target_parts(&self.config, &table_ident);
-            match build_lineage_insert_plan(src_plan, &lin_catalog, &lin_namespace, &lin_table) {
+                lineage_target_parts(&self.config, session, target_name, &table_ident);
+            match build_lineage_insert_plan(src_plan, None, &lin_catalog, &lin_namespace, &lin_table)
+            {
                 Ok(wrapper) => {
                     *plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(wrapper)));
                 }
@@ -8693,6 +8714,88 @@ mod tests {
             resolve_target_catalog(Some("other_wh".to_string()), &session),
             Some("other_wh".to_string())
         );
+    }
+
+    /// Lineage labels a write with the catalog it resolves against, not the
+    /// configured default: explicit qualifier, then the session catalog.
+    #[test]
+    fn lineage_target_parts_follow_the_write_catalog() {
+        use sqlparser::ast::Ident;
+        let config = write_test_config();
+        let mut session = test_session(Some("sales"));
+        let bare = ObjectName::from(vec![Ident::new("t")]);
+        let ident = resolve_table_ident(&bare, &session).unwrap();
+        assert_eq!(
+            lineage_target_parts(&config, &session, &bare, &ident),
+            (
+                config.resolve_default_catalog(),
+                "sales".to_string(),
+                "t".to_string()
+            )
+        );
+
+        session.default_catalog = Some("workspace1".to_string());
+        assert_eq!(
+            lineage_target_parts(&config, &session, &bare, &ident).0,
+            "workspace1"
+        );
+
+        let full = ObjectName::from(vec![Ident::new("ws2"), Ident::new("s"), Ident::new("t")]);
+        let ident = resolve_table_ident(&full, &session).unwrap();
+        assert_eq!(
+            lineage_target_parts(&config, &session, &full, &ident),
+            ("ws2".to_string(), "s".to_string(), "t".to_string())
+        );
+    }
+
+    /// An INSERT's lineage wrapper carries the target table's columns, so the
+    /// output fields are the table's (`country, seg, n`), not the SELECT's
+    /// (`country, segment, Int64(1)`).
+    #[tokio::test]
+    async fn insert_lineage_names_fields_after_the_target_table() {
+        let ctx = DFSessionContext::new();
+        let customers = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("country", DataType::Utf8, false),
+            Field::new("segment", DataType::Utf8, false),
+        ]));
+        ctx.register_table(
+            "customers",
+            Arc::new(MemTable::try_new(customers, vec![vec![]]).unwrap()),
+        )
+        .unwrap();
+        let source = ctx
+            .sql("SELECT country, segment, 1 FROM customers")
+            .await
+            .unwrap()
+            .logical_plan()
+            .clone();
+        let target = arrow_schema::Schema::new(vec![
+            Field::new("country", DataType::Utf8, true),
+            Field::new("seg", DataType::Utf8, true),
+            Field::new("n", DataType::Int64, true),
+        ]);
+        let wrapper =
+            build_lineage_insert_plan(source, Some(target), "workspace1", "default", "lin_probe")
+                .unwrap();
+        let lookup: sqe_lineage::extract::CatalogLookup =
+            Arc::new(|n: &str| sqe_lineage::extract::CatalogInfo::new(n, None));
+        let (_, outputs) = sqe_lineage::extract::extract_lineage(&wrapper, &lookup);
+        let fields: Vec<&str> = outputs[0]
+            .facets
+            .schema
+            .as_ref()
+            .unwrap()
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(fields, ["country", "seg", "n"]);
+        let lineage = outputs[0].facets.columnLineage.as_ref().unwrap();
+        assert_eq!(
+            lineage.fields["seg"].inputFields[0].field, "segment",
+            "seg is fed by customers.segment"
+        );
+        assert!(lineage.fields["n"].inputFields.is_empty());
     }
 
     fn test_session(default_schema: Option<&str>) -> sqe_core::Session {
