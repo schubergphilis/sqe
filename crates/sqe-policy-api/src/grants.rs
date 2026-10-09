@@ -98,13 +98,22 @@ pub struct GrantStatement {
     /// pre-existing behaviour and keeps test doubles and non-session callers
     /// working.
     pub grantor: Option<String>,
-    /// `WITH GRANT OPTION`: the grantee may re-grant what it was given. Maps to
+    /// `WITH GRANT OPTION`: the grantee may grant what it was given. Maps to
     /// Ranger's `delegateAdmin`. Without this, only principals seeded with
     /// delegate authority at bootstrap can ever grant.
+    ///
+    /// Only an admin grantor may set it (#817). The grantee may then grant the
+    /// privilege onward, but not the grant option itself, so ownership cannot
+    /// pass from delegate to delegate by chaining.
     pub with_grant_option: bool,
     /// Whether the named object is a table or a view. Selects the access-type
     /// set; the resource shape is the same either way.
     pub object: GrantObjectKind,
+    /// The caller holds an engine admin role. A backend must refuse
+    /// `with_grant_option` without it: Ranger lets any holder of
+    /// `delegateAdmin` confer it again, so its own check does not stop a
+    /// delegate handing ownership on (#817).
+    pub grantor_is_admin: bool,
 }
 
 /// A parsed REVOKE statement ready for backend dispatch.

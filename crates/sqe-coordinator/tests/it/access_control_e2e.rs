@@ -2359,6 +2359,46 @@ async fn polaris_access_types_for_role(
     polaris_access_types_inner(ctx, "roles", role, catalog, namespace, table).await
 }
 
+/// Whether any `polaris` policy item on exactly `{catalog}.{namespace}.{table}`
+/// names `user` with `delegateAdmin: true`.
+async fn user_holds_delegate_admin(
+    ctx: &AcCtx,
+    user: &str,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+) -> bool {
+    let policies = ctx
+        .ranger
+        .get_policies("polaris")
+        .await
+        .expect("list polaris policies");
+    policies.iter().any(|p| {
+        let val = |k: &str| {
+            p.get("resources")?
+                .get(k)?
+                .get("values")?
+                .as_array()?
+                .first()?
+                .as_str()
+        };
+        val("catalog") == Some(catalog)
+            && val("namespace") == Some(namespace)
+            && val("table") == Some(table)
+            && p.get("policyItems")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .any(|item| {
+                    item.get("delegateAdmin").and_then(|d| d.as_bool()) == Some(true)
+                        && item
+                            .get("users")
+                            .and_then(|u| u.as_array())
+                            .is_some_and(|us| us.iter().any(|u| u.as_str() == Some(user)))
+                })
+    })
+}
+
 async fn polaris_access_types_for(
     ctx: &AcCtx,
     user: &str,
@@ -3291,6 +3331,27 @@ async fn a_delegated_owner_grants_on_their_own_table_without_an_admin_role() {
     assert!(
         not_his.contains("403") || not_his.to_lowercase().contains("delegate"),
         "the refusal must come from Ranger's per-resource check, got: {not_his}"
+    );
+
+    // Ownership is not transferable (#817). dave may share his table, but not
+    // the grant option: Ranger itself would accept the onward delegateAdmin, so
+    // without SQE's own gate bob could pass ownership on again, and so on.
+    let onward = delegating
+        .execute(
+            &ctx.dave,
+            &format!("GRANT SELECT ON {table} TO USER \"bob\" WITH GRANT OPTION"),
+            None,
+        )
+        .await
+        .expect_err("a delegate must not pass WITH GRANT OPTION onward")
+        .to_string();
+    assert!(
+        onward.contains("403") && onward.contains("WITH GRANT OPTION"),
+        "the refusal must name the clause, got: {onward}"
+    );
+    assert!(
+        !user_holds_delegate_admin(&ctx, "bob", "sales_wh", "ac", "orders_delegated").await,
+        "bob must not hold delegateAdmin on the table after a refused onward grant"
     );
 
     for stmt in [

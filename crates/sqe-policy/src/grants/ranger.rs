@@ -1972,6 +1972,20 @@ pub fn evaluate_access(
 #[async_trait]
 impl GrantBackend for RangerGrantBackend {
     async fn grant(&self, _token: &str, stmt: &GrantStatement) -> sqe_core::Result<()> {
+        // Ownership is not transferable (#817). Ranger lets any holder of
+        // delegateAdmin confer it again, so its grantor check alone lets a
+        // delegate hand the grant option to B, B to C, and so on. Only an admin
+        // confers it. Refused, not downgraded to a plain grant: reporting success
+        // for less than the statement asked is worse than an error.
+        if stmt.with_grant_option && !stmt.grantor_is_admin {
+            return Err(sqe_core::SqeError::Catalog(format!(
+                "403 Forbidden: GRANT ... WITH GRANT OPTION needs an admin. '{}' may grant \
+                 the privilege to {}, but not the grant option: ownership cannot be passed \
+                 on by a delegate.",
+                stmt.grantor.as_deref().unwrap_or("the caller"),
+                stmt.grantee.name()
+            )));
+        }
         let plan = self.build_grant_plan(
             &stmt.privilege,
             stmt.object,
@@ -2616,6 +2630,59 @@ mod tests {
         assert_eq!(puts, 0, "the policy must not be PUT as the REST admin");
     }
 
+    /// #817: a non-admin grantor never writes delegateAdmin, under either grant
+    /// authority. Under `admin-role` the policy API would write it as the REST
+    /// admin; under `ranger-delegate` Ranger accepts it from any delegate. Both
+    /// would let ownership pass on by chaining.
+    #[tokio::test]
+    async fn a_non_admin_grantor_never_confers_the_grant_option() {
+        use sqe_core::config::GrantAuthority;
+        use wiremock::MockServer;
+
+        for authority in [GrantAuthority::AdminRole, GrantAuthority::RangerDelegate] {
+            let server = MockServer::start().await;
+            let backend = RangerGrantBackend::new(
+                &server.uri(),
+                "polaris",
+                "admin",
+                "admin-pw",
+                "POLARIS",
+                30,
+                false,
+                authority,
+            )
+            .unwrap();
+            let stmt = GrantStatement {
+                privilege: "SELECT".to_string(),
+                catalog: Some("wh".to_string()),
+                namespace: Some("sales".to_string()),
+                table: Some("orders".to_string()),
+                grantee: Grantee::User("carol".to_string()),
+                grantor: Some("bob".to_string()),
+                with_grant_option: true,
+                object: Default::default(),
+                grantor_is_admin: false,
+            };
+
+            let err = backend
+                .grant("token", &stmt)
+                .await
+                .expect_err("a delegate must not pass the grant option onward");
+            assert!(
+                err.to_string().contains("403"),
+                "{authority:?}: expected 403: {err}"
+            );
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .is_empty(),
+                "{authority:?}: refused before any request to Ranger"
+            );
+        }
+    }
+
     #[test]
     fn constructor_trims_trailing_slash_and_sets_name() {
         let b = test_backend();
@@ -3122,6 +3189,7 @@ mod tests {
             grantor: Some("carol".into()),
             with_grant_option: true,
             object: GrantObjectKind::Table,
+            grantor_is_admin: true,
         };
         let mut body = store
             .build_grant_revoke(

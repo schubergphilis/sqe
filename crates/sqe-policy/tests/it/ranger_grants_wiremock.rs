@@ -46,6 +46,7 @@ fn grant_stmt() -> GrantStatement {
         grantor: Some("carol".to_string()),
         with_grant_option: false,
         object: Default::default(),
+        grantor_is_admin: false,
     }
 }
 
@@ -305,6 +306,8 @@ async fn the_named_level_is_written_even_when_already_held() {
     let backend = backend(&server.uri());
     let mut stmt = grant_stmt();
     stmt.with_grant_option = true;
+    // Only an admin grantor may confer the grant option (#817).
+    stmt.grantor_is_admin = true;
     backend
         .grant("token", &stmt)
         .await
@@ -313,6 +316,46 @@ async fn the_named_level_is_written_even_when_already_held() {
         grant_posts(&server).await,
         1,
         "the named level must still be POSTed so delegateAdmin can be set"
+    );
+}
+
+/// A delegate cannot pass the grant option onward (#817).
+///
+/// Ranger lets any holder of `delegateAdmin` on a resource confer it again, so
+/// the secure endpoint would accept this POST and ownership would pass from
+/// delegate to delegate. The backend refuses before any request, so a caller that
+/// skipped the coordinator's gate still cannot chain it.
+#[tokio::test]
+async fn a_delegate_cannot_pass_the_grant_option_onward() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/service/plugins/secure/services/grant/{SERVICE}"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&server)
+        .await;
+
+    let backend = backend(&server.uri());
+    let mut stmt = grant_stmt();
+    stmt.with_grant_option = true;
+    let err = backend
+        .grant("token", &stmt)
+        .await
+        .expect_err("a non-admin grantor must not confer WITH GRANT OPTION");
+    let msg = err.to_string();
+    assert!(msg.contains("403"), "expected a 403 refusal, got: {msg}");
+    assert!(
+        msg.contains("WITH GRANT OPTION"),
+        "must name the clause: {msg}"
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "refused before any request to Ranger"
     );
 }
 
