@@ -215,7 +215,7 @@ A short rationale:
 
 ## Known gaps
 
-- No `WITH GRANT OPTION`. Grants are non-delegating; only an admin can grant.
+- `WITH GRANT OPTION` is admin-only. A grantee holding it can grant the privilege onward, but not the grant option itself, so ownership does not pass from delegate to delegate.
 - No column-level INSERT (`GRANT INSERT (col1, col2) ON ...`). The granularity is table-level for INSERT today.
 - Mask expressions are scalar only; aggregate / table-valued mask expressions are not allowed.
 - `REVOKE SELECT` is not a read gate while `table-properties-read` remains (INSERT is the common leftover). Use `REVOKE ALL PRIVILEGES` and `CHECK ACCESS`. See [Closing a gate](#closing-a-gate). This is a documented release limitation (issue #396), not something a profile rewrite can fix.

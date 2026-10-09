@@ -36,7 +36,7 @@ The gap to know about is the default, not the capability: enforcement does nothi
 
 Within the grant SQL surface itself, these things are not supported:
 
-- No `WITH GRANT OPTION`. Grants are non-delegating. Only an admin can grant.
+- `WITH GRANT OPTION` is admin-only. Its grantee can grant the privilege onward, but not the grant option itself.
 - No column-level `INSERT`. INSERT granularity is table-level.
 - Mask expressions are scalar only. Aggregate and table-valued mask expressions are rejected.
 - `REVOKE SELECT` does not stop reads. Privileges expand to Polaris access types, and `INSERT` keeps `table-properties-read`, which is what unlocks `LOAD_TABLE`. After the load, SQE reads files directly, so `table-data-read` is not the read gate. Unity Catalog keeps SELECT and MODIFY independent. SQE cannot match that with a grant-profile edit, because a writer has to load the table. Close a gate with `REVOKE ALL PRIVILEGES` and confirm with `CHECK ACCESS` (issue #396).
