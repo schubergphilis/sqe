@@ -71,6 +71,11 @@ pub(crate) struct RangerPolicy {
     /// 0 = access, 1 = DATAMASK, 2 = ROWFILTER.
     #[serde(rename = "policyType", default)]
     pub(crate) policy_type: i32,
+    /// Ranger `policyPriority`: 0 normal, 1 override. Ranger evaluates
+    /// higher priorities first, and for a mask the first policy that decides a
+    /// column is final, so an override mask beats a normal one.
+    #[serde(rename = "policyPriority", default)]
+    pub(crate) policy_priority: i32,
     #[serde(rename = "isEnabled", default)]
     pub(crate) is_enabled: bool,
     /// Resource map: keys are "database", "table", "column".
@@ -194,6 +199,10 @@ pub(crate) struct RowFilterPolicyItem {
     pub(crate) groups: Vec<String>,
     #[serde(rename = "rowFilterInfo", default)]
     pub(crate) row_filter_info: RowFilterInfo,
+    /// Ranger item conditions. SQE evaluates none of them; see
+    /// `deciding_row_filter_items` for how a conditional item is applied.
+    #[serde(default)]
+    pub(crate) conditions: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -278,6 +287,9 @@ pub struct RangerStore {
     /// `[policy.ranger] hive_access_policies`: gate Hive-root tables on a
     /// Ranger access grant (default true).
     hive_access_policies: bool,
+    /// `[policy.ranger] catalog_scoped`: the Ranger `database` of an Iceberg
+    /// table is `{catalog}.{namespace}`, and the last-component fallback is off.
+    catalog_scoped: bool,
 }
 
 impl RangerStore {
@@ -333,6 +345,7 @@ impl RangerStore {
             metrics: None,
             hive_catalogs: Arc::new(HiveCatalogs::new()),
             hive_access_policies: cfg.hive_access_policies,
+            catalog_scoped: cfg.catalog_scoped,
         })
     }
 
@@ -498,9 +511,12 @@ impl RangerStore {
 
 /// Flatten an Iceberg namespace to a hive `database` name. SQE namespaces are
 /// already dotted multi-level strings and Kyuubi uses the same dotted
-/// convention, so this is identity for now. Catalog is intentionally dropped
-/// (hive has no catalog level); cross-engine policies must be written without a
-/// catalog prefix. See docs/ranger-fine-grained-service-type.md.
+/// convention, so this is identity for now. By default the catalog is dropped
+/// before this point (hive has no catalog level) and cross-engine policies are
+/// written without a catalog prefix. Under `[policy.ranger] catalog_scoped` the
+/// caller's key already carries it (`{catalog}.{namespace}`, see
+/// `plan_rewriter::resolve_policy_key_scoped`). See
+/// docs/ranger-fine-grained-service-type.md.
 ///
 /// `plan_rewriter.rs::resolve_policy_key` passes the **whole** dotted
 /// namespace as `namespace` (schema `"sales_wh.sales"` stays `"sales_wh.sales"`),
@@ -538,6 +554,7 @@ fn resource_matches(res: &RangerResource, target: &str) -> bool {
 /// policy that stops matching is protection silently disappearing. Over-matching an
 /// old policy is the safe direction while operators migrate; under-matching is a
 /// leak.
+#[cfg(test)]
 fn policy_matches_table(p: &RangerPolicy, database: &str, table: &str) -> bool {
     policy_matches_table_with(p, database, table, true)
 }
@@ -545,6 +562,12 @@ fn policy_matches_table(p: &RangerPolicy, database: &str, table: &str) -> bool {
 /// `policy_matches_table` with the last-component fallback switchable. Access
 /// allow items pass `false`: over-matching a grant is the leak direction, so
 /// the fallback is only safe where it can restrict (masks, filters, denies).
+///
+/// It is off everywhere under `catalog_scoped`: the key there is
+/// `{catalog}.{namespace}`, so the last component of `ws_a.finance` is
+/// `finance`, and a policy written for `finance` would fire in every catalog --
+/// the cross-catalog match the setting exists to stop. A catalog-scoped
+/// deployment has no old-style policies to migrate.
 fn policy_matches_table_with(p: &RangerPolicy, database: &str, table: &str, last_component_fallback: bool) -> bool {
     let db_ok = p
         .resources
@@ -787,8 +810,9 @@ fn access_grants_table(
     user: &SessionUser,
     database: &str,
     table: &str,
+    last_component_fallback: bool,
 ) -> bool {
-    access_grants_table_type(bundle, user, database, table, "select")
+    access_grants_table_type(bundle, user, database, table, "select", last_component_fallback)
 }
 
 /// Ranger access-policy evaluation for one table and one access type
@@ -806,13 +830,15 @@ fn access_grants_table(
 ///
 /// Deny items match with the last-namespace-component fallback (fail closed);
 /// allow items need the full dotted namespace, so an allow on `sales` does not
-/// grant `<root>.sales`.
+/// grant `<root>.sales`. `last_component_fallback` is false under
+/// `catalog_scoped`, which turns the fallback off for deny items too.
 fn access_grants_table_type(
     bundle: &ServicePolicies,
     user: &SessionUser,
     database: &str,
     table: &str,
     access_type: &str,
+    last_component_fallback: bool,
 ) -> bool {
     let matching = |fallback: bool| {
         bundle
@@ -848,7 +874,7 @@ fn access_grants_table_type(
     // A policy outside its validity schedule is skipped. A schedule SQE cannot
     // evaluate (`None`) still lets a deny decide but never lets an allow grant.
     let now = Utc::now();
-    for p in matching(true) {
+    for p in matching(last_component_fallback) {
         if policy_schedule_active(p, now) == Some(false) {
             continue;
         }
@@ -936,6 +962,7 @@ fn schedule_covers(s: &ValiditySchedule, now: DateTime<Utc>) -> Option<bool> {
 /// policy grants `select`, the result carries the deny-all row filter that
 /// every consumer already treats as "table not found". Iceberg tables pass
 /// `false`, because their object-level decision belongs to the catalog.
+#[cfg(test)]
 fn resolve_from_bundle(
     bundle: &ServicePolicies,
     user: &SessionUser,
@@ -943,10 +970,113 @@ fn resolve_from_bundle(
     namespace: &str,
     require_access_grant: bool,
 ) -> ResolvedPolicy {
+    resolve_from_bundle_with(bundle, user, table, namespace, require_access_grant, false)
+}
+
+/// The row-filter expressions one policy applies to `user`, ANDed by the
+/// caller. Ranger takes the first matching item, and an empty or missing
+/// `filterExpr` filters nothing (that is how an exemption item is written).
+///
+/// A first matching item carrying conditions SQE cannot evaluate does not
+/// decide alone: the condition might be false in Ranger, handing the decision
+/// to a later item. So that item and every later matching one apply, ANDed,
+/// which is never less restrictive than either outcome.
+fn deciding_row_filter_items<'a>(p: &'a RangerPolicy, user: &SessionUser) -> Vec<&'a str> {
+    let mut exprs = Vec::new();
+    for item in p
+        .row_filter_policy_items
+        .iter()
+        .filter(|item| item_matches(&item.users, &item.roles, &item.groups, user))
+    {
+        if let Some(e) = item
+            .row_filter_info
+            .filter_expr
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+        {
+            exprs.push(e);
+        }
+        if item.conditions.is_empty() {
+            break;
+        }
+        warn!(
+            policy_id = p.id,
+            "Ranger row-filter item has conditions SQE cannot evaluate; \
+             applying it and the later matching items (fail-closed)"
+        );
+    }
+    exprs
+}
+
+/// The enabled mask and row-filter policies that cover `database.table`, in
+/// Ranger's evaluation order as far as SQE models it: `policyPriority`
+/// descending (override before normal), then bundle order. The sort is stable.
+///
+/// Ranger breaks a priority tie with a resource-specificity heuristic
+/// (`RangerOptimizedPolicyEvaluator.computeEvalOrder`: fewer wildcards first)
+/// and then the policy name. SQE does not reproduce that heuristic, so two
+/// same-priority mask policies naming the same column for the same user can
+/// pick a different winner here than in Ranger. Do not author overlapping
+/// same-priority masks; give the one that must win override priority.
+fn matching_fine_grained_policies<'a>(
+    bundle: &'a ServicePolicies,
+    database: &str,
+    table: &str,
+    last_component_fallback: bool,
+) -> Vec<&'a RangerPolicy> {
+    let mut matching: Vec<&RangerPolicy> = bundle
+        .policies
+        .iter()
+        .filter(|p| p.is_enabled)
+        .filter(|p| p.policy_type == POLICY_TYPE_DATAMASK || p.policy_type == POLICY_TYPE_ROWFILTER)
+        .filter(|p| policy_matches_table_with(p, database, table, last_component_fallback))
+        .collect();
+    matching.sort_by_key(|p| std::cmp::Reverse(p.policy_priority));
+    matching
+}
+
+/// `resolve_from_bundle` with the `catalog_scoped` flag. Under it, `namespace`
+/// is already `{catalog}.{namespace}` (see `resolve_policy_key_scoped`) and the
+/// last-component fallback is off, so no policy can match across catalogs.
+///
+/// # Precedence (Ranger semantics, verified against Apache Ranger source)
+///
+/// - **Within one policy the FIRST matching item wins**, for masks and row
+///   filters alike. Ranger keeps `dataMaskPolicyItems` and
+///   `rowFilterPolicyItems` in the order written (`RangerDefaultPolicyEvaluator`:
+///   "must be evaluated in the order given in the policy; hence no sort") and
+///   takes the first item whose users, groups or roles match. So the usual
+///   "everyone except group E" policy is written `[{groups:[E], MASK_NONE},
+///   {groups:[public], MASK}]`, and a member of E sees the raw value.
+/// - **Across mask policies the first decision for a column is final**,
+///   including a `MASK_NONE` decision ("decision made earlier by a policy with
+///   same priority or higher will be final", `RangerPolicyEngineImpl`). Order is
+///   `matching_fine_grained_policies`.
+/// - **Across row-filter policies SQE ANDs** the filter of every matching
+///   policy, where Ranger applies only the first policy's. That is a deliberate,
+///   more restrictive deviation: a user covered by two filter policies sees the
+///   intersection, never more than Ranger would show.
+/// - A matched row-filter item with no or an empty `filterExpr` filters
+///   nothing, as in Ranger (`isRowFilterEnabled` is `isNotEmpty(filterExpr)`):
+///   that is how an exemption item is written.
+/// - A first matching item that carries conditions SQE cannot evaluate decides
+///   too: its columns are restricted (fail-closed), never left to a later item.
+fn resolve_from_bundle_with(
+    bundle: &ServicePolicies,
+    user: &SessionUser,
+    table: &str,
+    namespace: &str,
+    require_access_grant: bool,
+    catalog_scoped: bool,
+) -> ResolvedPolicy {
     let database = hive_database(namespace);
+    let last_component_fallback = !catalog_scoped;
     let mut policy = ResolvedPolicy::default();
 
-    if require_access_grant && !access_grants_table(bundle, user, &database, table) {
+    if require_access_grant
+        && !access_grants_table(bundle, user, &database, table, last_component_fallback)
+    {
         debug!(
             user = %user.username,
             table,
@@ -967,11 +1097,11 @@ fn resolve_from_bundle(
         schema: None,
     };
 
-    for p in &bundle.policies {
-        if !p.is_enabled || !policy_matches_table(p, &database, table) {
-            continue;
-        }
+    // Columns some earlier policy already decided for this user: masked,
+    // exempted (MASK_NONE) or restricted. A later policy does not reopen them.
+    let mut decided_columns: HashSet<&str> = HashSet::new();
 
+    for p in matching_fine_grained_policies(bundle, &database, table, last_component_fallback) {
         // Data-mask policy (policyType 1). A datamask policy's `column`
         // resource can list several columns that all receive the same mask;
         // iterate ALL of them so multi-column policies don't leak.
@@ -994,65 +1124,63 @@ fn resolve_from_bundle(
                 continue;
             }
             // Ranger semantics: the first matching item of a policy decides
-            // the column, and a mask set by an earlier policy is not replaced
-            // by a later one.
+            // the column, and the first policy to decide a column is final.
+            let Some(item) = p
+                .data_mask_policy_items
+                .iter()
+                .find(|item| item_matches(&item.users, &item.roles, &item.groups, user))
+            else {
+                continue;
+            };
             for column in &col_res.values {
-                for item in &p.data_mask_policy_items {
-                    if !item_matches(&item.users, &item.roles, &item.groups, user) {
-                        continue;
+                if !decided_columns.insert(column.as_str()) {
+                    continue;
+                }
+                if !item.conditions.is_empty() {
+                    warn!(
+                        column = %column,
+                        policy_id = p.id,
+                        "Ranger datamask item has conditions SQE cannot evaluate; \
+                         restricting column (fail-closed)"
+                    );
+                    if !policy.restricted_columns.contains(column) {
+                        policy.restricted_columns.push(column.clone());
                     }
-                    if !item.conditions.is_empty() {
+                    continue;
+                }
+                match map_mask(&item.data_mask_info, column, &identity) {
+                    Ok(Some(mask)) => {
+                        policy.column_masks.insert(column.clone(), mask);
+                    }
+                    Ok(None) => { /* MASK_NONE exemption: leave column visible */ }
+                    Err(()) => {
                         warn!(
                             column = %column,
-                            policy_id = p.id,
-                            "Ranger datamask item has conditions SQE cannot evaluate; \
-                             restricting column (fail-closed)"
+                            mask_type = %item.data_mask_info.data_mask_type,
+                            "unsupported Ranger mask type; restricting column (fail-closed)"
                         );
                         if !policy.restricted_columns.contains(column) {
                             policy.restricted_columns.push(column.clone());
                         }
-                        break;
                     }
-                    match map_mask(&item.data_mask_info, column, &identity) {
-                        Ok(Some(mask)) => {
-                            policy.column_masks.entry(column.clone()).or_insert(mask);
-                        }
-                        Ok(None) => { /* MASK_NONE exemption: leave column visible */ }
-                        Err(()) => {
-                            warn!(
-                                column = %column,
-                                mask_type = %item.data_mask_info.data_mask_type,
-                                "unsupported Ranger mask type; restricting column (fail-closed)"
-                            );
-                            if !policy.restricted_columns.contains(column) {
-                                policy.restricted_columns.push(column.clone());
-                            }
-                        }
-                    }
-                    break;
                 }
             }
         }
 
-        // Row-filter policy (policyType 2)
+        // Row-filter policy (policyType 2): first matching item wins.
         if p.policy_type == POLICY_TYPE_ROWFILTER {
-            for item in &p.row_filter_policy_items {
-                if !item_matches(&item.users, &item.roles, &item.groups, user) {
-                    continue;
-                }
-                if let Some(expr_str) = &item.row_filter_info.filter_expr {
-                    match parse_sql_predicate(expr_str, &identity) {
-                        Ok(expr) => policy.row_filters.push(expr),
-                        Err(e) => {
-                            // Do not log `expr_str`: a row-filter body routinely
-                            // embeds sensitive literals (e.g. region = 'EU'). The
-                            // expression lives in Ranger; log only that it failed.
-                            warn!(
-                                error = %e,
-                                "unparseable Ranger row filter; denying (fail-closed)"
-                            );
-                            policy.row_filters.push(lit(false));
-                        }
+            for expr_str in deciding_row_filter_items(p, user) {
+                match parse_sql_predicate(expr_str, &identity) {
+                    Ok(expr) => policy.row_filters.push(expr),
+                    Err(e) => {
+                        // Do not log `expr_str`: a row-filter body routinely
+                        // embeds sensitive literals (e.g. region = 'EU'). The
+                        // expression lives in Ranger; log only that it failed.
+                        warn!(
+                            error = %e,
+                            "unparseable Ranger row filter; denying (fail-closed)"
+                        );
+                        policy.row_filters.push(lit(false));
                     }
                 }
             }
@@ -1120,11 +1248,14 @@ pub(crate) fn resolve_tag_policies(
         schema: None,
     };
 
-    for p in &tag_bundle.policies {
-        if !p.is_enabled {
-            continue;
-        }
+    // Same precedence as the resource path (`resolve_from_bundle_with`):
+    // priority first, the first matching item of a policy wins, and the first
+    // policy to decide a tag's mask (MASK_NONE included) is final.
+    let mut ordered: Vec<&RangerPolicy> = tag_bundle.policies.iter().filter(|p| p.is_enabled).collect();
+    ordered.sort_by_key(|p| std::cmp::Reverse(p.policy_priority));
+    let mut decided_tags: HashSet<&str> = HashSet::new();
 
+    for p in ordered {
         // Read tag resource values for this policy.
         let tag_res = match p.resources.get("tag") {
             Some(r) => r,
@@ -1142,6 +1273,10 @@ pub(crate) fn resolve_tag_policies(
                 for item in &p.data_mask_policy_items {
                     if !item_matches(&item.users, &item.roles, &item.groups, user) {
                         continue;
+                    }
+                    // An earlier policy already decided this tag.
+                    if !decided_tags.insert(tag_value.as_str()) {
+                        break;
                     }
                     if !item.conditions.is_empty() {
                         warn!(
@@ -1198,24 +1333,21 @@ pub(crate) fn resolve_tag_policies(
                 }
             }
 
-            // policyType 2: rowfilter
+            // policyType 2: rowfilter. The first matching item decides and an
+            // empty expression filters nothing; filters of several policies
+            // are ANDed.
             if p.policy_type == POLICY_TYPE_ROWFILTER {
-                for item in &p.row_filter_policy_items {
-                    if !item_matches(&item.users, &item.roles, &item.groups, user) {
-                        continue;
-                    }
-                    if let Some(expr_str) = &item.row_filter_info.filter_expr {
-                        match parse_sql_predicate(expr_str, identity) {
-                            Ok(expr) => filters.push((tag_value.clone(), expr)),
-                            Err(e) => {
-                                // Do not log the filter body (may carry literals).
-                                warn!(
-                                    tag = %tag_value,
-                                    error = %e,
-                                    "unparseable Ranger tag row filter; denying (fail-closed)"
-                                );
-                                filters.push((tag_value.clone(), lit(false)));
-                            }
+                for expr_str in deciding_row_filter_items(p, user) {
+                    match parse_sql_predicate(expr_str, identity) {
+                        Ok(expr) => filters.push((tag_value.clone(), expr)),
+                        Err(e) => {
+                            // Do not log the filter body (may carry literals).
+                            warn!(
+                                tag = %tag_value,
+                                error = %e,
+                                "unparseable Ranger tag row filter; denying (fail-closed)"
+                            );
+                            filters.push((tag_value.clone(), lit(false)));
                         }
                     }
                 }
@@ -1363,7 +1495,7 @@ impl RangerStore {
                 ))
             })?,
         };
-        let body = ranger_policy_body(stmt, &service, &link.component_type)?;
+        let body = ranger_policy_body(stmt, &service, &link.component_type, self.catalog_scoped)?;
         let existing = self
             .policies_for_service(&service)
             .await?
@@ -1441,10 +1573,17 @@ impl RangerStore {
     }
 }
 
+/// `catalog_scoped` keeps the catalog of `CREATE POLICY ... ON TABLE
+/// cat.ns.t` in the Ranger `database` (`cat.ns`), which is the key the read
+/// path resolves under `[policy.ranger] catalog_scoped`; without it the
+/// catalog is dropped, the Hive/Kyuubi convention. Scoped mode refuses a
+/// two-part name: the store does not know the session's catalog, and a policy
+/// written without one would never match.
 fn ranger_policy_body(
     stmt: &sqe_sql::policy_ddl::CreatePolicyStatement,
     service: &str,
     component_type: &str,
+    catalog_scoped: bool,
 ) -> sqe_core::Result<serde_json::Value> {
     use sqe_sql::policy_ddl::{FineGrainedPolicyKind, PolicyPrincipalKind, PolicyTarget};
 
@@ -1474,8 +1613,15 @@ fn ranger_policy_body(
                     "CREATE POLICY ON TABLE requires at least <schema>.<table>".to_string(),
                 ));
             }
+            if catalog_scoped && parts.len() < 3 {
+                return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed,
+                    "CREATE POLICY ON TABLE needs <catalog>.<schema>.<table> when \
+                     [policy.ranger] catalog_scoped is on"
+                        .to_string(),
+                ));
+            }
             let table_name = parts[parts.len() - 1];
-            let namespace_start = usize::from(parts.len() >= 3);
+            let namespace_start = usize::from(parts.len() >= 3 && !catalog_scoped);
             let namespace = parts[namespace_start..parts.len() - 1].join(".");
             resources.insert(
                 "database".into(),
@@ -1533,6 +1679,12 @@ fn ranger_policy_body(
 
 #[async_trait]
 impl PolicyStore for RangerStore {
+    /// `[policy.ranger] catalog_scoped`: callers key Iceberg tables as
+    /// `{catalog}.{namespace}`, the Ranger `database` policies must name.
+    fn catalog_scoped(&self) -> bool {
+        self.catalog_scoped
+    }
+
     /// Ranger publishes a monotonically increasing `policyVersion` with every
     /// bundle; the resolved-policy cache is already dropped when it changes,
     /// so it is the natural fingerprint. Before the first download nothing is
@@ -1575,12 +1727,13 @@ impl PolicyStore for RangerStore {
         }
         self.record_cache_miss();
         let bundle = self.cached_bundle().await?;
-        let policy = resolve_from_bundle(
+        let policy = resolve_from_bundle_with(
             &bundle,
             user,
             table_name,
             namespace,
             self.requires_access_grant(namespace),
+            self.catalog_scoped,
         );
         self.cache
             .insert(key, CachedPolicy(Arc::new(policy.clone())))
@@ -1612,6 +1765,7 @@ impl PolicyStore for RangerStore {
             &hive_database(namespace),
             table_name,
             privilege.access_type(),
+            !self.catalog_scoped,
         ))
     }
 
@@ -1696,7 +1850,7 @@ mod tests {
             "CREATE POLICY p ON TABLE sales_wh.ac.orders COLUMN MASK MASK_NULL \
              TO ROLE engineer ON COLUMN amount",
         );
-        let body = ranger_policy_body(&stmt, "query", "hive").unwrap();
+        let body = ranger_policy_body(&stmt, "query", "hive", false).unwrap();
         assert_eq!(body["service"], "query");
         assert_eq!(body["policyType"], 1);
         assert_eq!(body["resources"]["database"]["values"][0], "ac");
@@ -1715,7 +1869,7 @@ mod tests {
             "CREATE POLICY p ON TAG pii COLUMN MASK CUSTOM TO ROLE engineer \
              USING (concat('x', {col}))",
         );
-        let body = ranger_policy_body(&stmt, "query_tag", "hive").unwrap();
+        let body = ranger_policy_body(&stmt, "query_tag", "hive", false).unwrap();
         assert_eq!(body["service"], "query_tag");
         assert_eq!(body["resources"]["tag"]["values"][0], "pii");
         assert_eq!(
@@ -3423,5 +3577,315 @@ mod mask_policy_listing_tests {
     #[test]
     fn the_order_is_stable() {
         assert_eq!(listed(), listed());
+    }
+}
+
+/// `[policy.ranger] catalog_scoped` and Ranger's first-match item precedence.
+#[cfg(test)]
+mod catalog_scope_and_precedence_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn bundle(policies: serde_json::Value) -> ServicePolicies {
+        serde_json::from_value(json!({ "policyVersion": 1, "policies": policies })).unwrap()
+    }
+
+    fn member(name: &str, groups: &[&str]) -> SessionUser {
+        SessionUser {
+            username: name.to_string(),
+            roles: Vec::new(),
+            subject: None,
+            email: None,
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+        }
+    }
+
+    fn mask_policy(id: i64, database: &str, column: &str, items: serde_json::Value) -> serde_json::Value {
+        json!({
+            "id": id, "name": format!("mask-{id}"), "policyType": 1, "isEnabled": true,
+            "resources": {
+                "database": {"values": [database]},
+                "table": {"values": ["orders"]},
+                "column": {"values": [column]}
+            },
+            "dataMaskPolicyItems": items
+        })
+    }
+
+    fn item(groups: &[&str], mask: &str) -> serde_json::Value {
+        json!({"groups": groups, "accesses": [{"type": "select", "isAllowed": true}],
+               "dataMaskInfo": {"dataMaskType": mask}})
+    }
+
+    /// The portal's shape: "mask for everyone except group E".
+    fn everyone_but_e() -> serde_json::Value {
+        json!([item(&["SG-Exempt"], "MASK_NONE"), item(&["public"], "MASK_NULL")])
+    }
+
+    fn resolve(b: &ServicePolicies, u: &SessionUser, namespace: &str, scoped: bool) -> ResolvedPolicy {
+        resolve_from_bundle_with(b, u, "orders", namespace, false, scoped)
+    }
+
+    // ── catalog_scoped ─────────────────────────────────────────────────
+
+    #[test]
+    fn scoped_mask_applies_only_to_the_named_catalog() {
+        let b = bundle(json!([mask_policy(1, "ws_a.finance", "ssn", json!([item(&["public"], "MASK_NULL")]))]));
+        let u = member("ann", &[]);
+        assert!(resolve(&b, &u, "ws_a.finance", true).column_masks.contains_key("ssn"));
+        assert!(
+            resolve(&b, &u, "ws_b.finance", true).column_masks.is_empty(),
+            "same namespace.table in another catalog is not covered"
+        );
+    }
+
+    #[test]
+    fn unscoped_a_catalogless_policy_covers_every_catalog() {
+        // Today's behaviour, kept when the setting is off: both catalogs key on
+        // `finance`, so one policy fires in both.
+        let b = bundle(json!([mask_policy(1, "finance", "ssn", json!([item(&["public"], "MASK_NULL")]))]));
+        let u = member("ann", &[]);
+        assert!(resolve(&b, &u, "finance", false).column_masks.contains_key("ssn"));
+    }
+
+    #[test]
+    fn scoped_disables_the_last_component_fallback() {
+        let b = bundle(json!([mask_policy(1, "finance", "ssn", json!([item(&["public"], "MASK_NULL")]))]));
+        let u = member("ann", &[]);
+        assert!(
+            resolve(&b, &u, "ws_a.finance", false).column_masks.contains_key("ssn"),
+            "unscoped: the migration fallback matches on the last component"
+        );
+        assert!(
+            resolve(&b, &u, "ws_a.finance", true).column_masks.is_empty(),
+            "scoped: `finance` must not match `ws_a.finance` (or `ws_b.finance`)"
+        );
+        // A policy naming another catalog never matches through the fallback.
+        let other = bundle(json!([mask_policy(1, "ws_b.finance", "ssn", json!([item(&["public"], "MASK_NULL")]))]));
+        assert!(resolve(&other, &u, "ws_a.finance", true).column_masks.is_empty());
+    }
+
+    /// The deny-item fallback is off under `catalog_scoped` too: a deny on
+    /// `finance` is another catalog's (or no catalog's) policy.
+    #[test]
+    fn scoped_access_deny_does_not_match_by_last_component() {
+        let b = bundle(json!([
+            {"id": 1, "name": "allow", "policyType": 0, "isEnabled": true,
+             "resources": {"database": {"values": ["ws_a.finance"]}, "table": {"values": ["*"]}},
+             "policyItems": [{"groups": ["public"], "accesses": [{"type": "select", "isAllowed": true}]}]},
+            {"id": 2, "name": "deny", "policyType": 0, "isEnabled": true,
+             "resources": {"database": {"values": ["finance"]}, "table": {"values": ["*"]}},
+             "denyPolicyItems": [{"groups": ["public"], "accesses": [{"type": "select", "isAllowed": true}]}]}
+        ]));
+        let u = member("ann", &[]);
+        let denied = |scoped| {
+            crate::plan_rewriter::policy_denies_all(&resolve_from_bundle_with(
+                &b, &u, "orders", "ws_a.finance", true, scoped,
+            ))
+        };
+        assert!(denied(false), "unscoped: the deny on `finance` matches by last component");
+        assert!(!denied(true), "scoped: it does not");
+    }
+
+    #[test]
+    fn scoped_store_reports_the_flag_and_scoped_ddl_keeps_the_catalog() {
+        let on = RangerStore::from_config(&RangerPolicyConfig {
+            catalog_scoped: true,
+            ..RangerPolicyConfig::default()
+        })
+        .unwrap();
+        assert!(on.catalog_scoped());
+        let off = RangerStore::from_config(&RangerPolicyConfig::default()).unwrap();
+        assert!(!off.catalog_scoped());
+
+        let parsed = sqe_sql::policy_ddl::try_parse_policy_ddl(
+            "CREATE POLICY m ON TABLE ws_a.finance.orders COLUMN MASK MASK_NULL \
+             TO GROUP analysts ON COLUMN ssn",
+        )
+        .expect("valid policy SQL")
+        .expect("policy statement");
+        let sqe_sql::policy_ddl::PolicyDdlStatement::Create(stmt) = parsed else {
+            panic!("expected create")
+        };
+        let scoped = ranger_policy_body(&stmt, "query", "hive", true).unwrap();
+        assert_eq!(scoped["resources"]["database"]["values"], json!(["ws_a.finance"]));
+        let unscoped = ranger_policy_body(&stmt, "query", "hive", false).unwrap();
+        assert_eq!(unscoped["resources"]["database"]["values"], json!(["finance"]));
+
+        let two_part = sqe_sql::policy_ddl::try_parse_policy_ddl(
+            "CREATE POLICY m ON TABLE finance.orders COLUMN MASK MASK_NULL TO GROUP analysts ON COLUMN ssn",
+        )
+        .unwrap()
+        .unwrap();
+        let sqe_sql::policy_ddl::PolicyDdlStatement::Create(two_part) = two_part else {
+            panic!("expected create")
+        };
+        assert!(
+            ranger_policy_body(&two_part, "query", "hive", true).is_err(),
+            "scoped DDL without a catalog would write a policy that never matches"
+        );
+    }
+
+    // ── first-match precedence ─────────────────────────────────────────
+
+    #[test]
+    fn first_matching_mask_item_wins_so_an_exemption_item_exempts() {
+        let b = bundle(json!([mask_policy(1, "finance", "ssn", everyone_but_e())]));
+        let exempt = member("eve", &["SG-Exempt"]);
+        let other = member("ann", &["SG-DataAnalysts"]);
+        let p = resolve(&b, &exempt, "finance", false);
+        assert!(p.column_masks.is_empty() && p.restricted_columns.is_empty(), "E sees the raw value");
+        assert!(resolve(&b, &other, "finance", false).column_masks.contains_key("ssn"));
+    }
+
+    #[test]
+    fn mask_none_for_a_user_leaves_the_column_unmasked() {
+        let items = json!([
+            {"users": ["owner"], "dataMaskInfo": {"dataMaskType": "MASK_NONE"}},
+            item(&["public"], "MASK_NULL")
+        ]);
+        let b = bundle(json!([mask_policy(1, "finance", "ssn", items)]));
+        let p = resolve(&b, &member("owner", &[]), "finance", false);
+        assert!(p.column_masks.is_empty() && p.restricted_columns.is_empty());
+        assert!(resolve(&b, &member("ann", &[]), "finance", false).column_masks.contains_key("ssn"));
+    }
+
+    #[test]
+    fn item_order_decides_so_public_first_masks_everyone() {
+        let items = json!([item(&["public"], "MASK_NULL"), item(&["SG-Exempt"], "MASK_NONE")]);
+        let b = bundle(json!([mask_policy(1, "finance", "ssn", items)]));
+        assert!(
+            resolve(&b, &member("eve", &["SG-Exempt"]), "finance", false)
+                .column_masks
+                .contains_key("ssn"),
+            "Ranger takes the first matching item: public, so E is masked too"
+        );
+    }
+
+    #[test]
+    fn with_two_matching_mask_items_the_first_wins() {
+        let items = json!([item(&["public"], "MASK_HASH"), item(&["public"], "MASK_NULL")]);
+        let b = bundle(json!([mask_policy(1, "finance", "ssn", items)]));
+        assert!(matches!(
+            resolve(&b, &member("ann", &[]), "finance", false).column_masks.get("ssn"),
+            Some(MaskType::Hash)
+        ));
+    }
+
+    #[test]
+    fn first_policy_to_decide_a_column_is_final_and_override_priority_goes_first() {
+        let exempt = member("eve", &["SG-Exempt"]);
+        // Policy 1 exempts E; policy 2 masks everyone. Same priority: bundle
+        // order, policy 1 decides for E and policy 2 cannot re-mask.
+        let b = bundle(json!([
+            mask_policy(1, "finance", "ssn", json!([item(&["SG-Exempt"], "MASK_NONE")])),
+            mask_policy(2, "finance", "ssn", json!([item(&["public"], "MASK_HASH")])),
+        ]));
+        assert!(resolve(&b, &exempt, "finance", false).column_masks.is_empty());
+        assert!(matches!(
+            resolve(&b, &member("ann", &[]), "finance", false).column_masks.get("ssn"),
+            Some(MaskType::Hash)
+        ));
+
+        // Override priority on the masking policy puts it first.
+        let mut over = mask_policy(2, "finance", "ssn", json!([item(&["public"], "MASK_HASH")]));
+        over["policyPriority"] = json!(1);
+        let b = bundle(json!([
+            mask_policy(1, "finance", "ssn", json!([item(&["SG-Exempt"], "MASK_NONE")])),
+            over
+        ]));
+        assert!(matches!(
+            resolve(&b, &exempt, "finance", false).column_masks.get("ssn"),
+            Some(MaskType::Hash)
+        ));
+    }
+
+    /// A conditional first item decides its columns (restricted) for the
+    /// whole bundle: a later policy's `MASK_NONE` does not reopen them.
+    #[test]
+    fn a_conditional_first_item_is_a_final_decision() {
+        let conditional = json!([{"groups": ["public"], "conditions": [{"type": "ip-range", "values": ["10.0.0.0/8"]}],
+                                  "dataMaskInfo": {"dataMaskType": "MASK_NULL"}}]);
+        let b = bundle(json!([
+            mask_policy(1, "finance", "ssn", conditional),
+            mask_policy(2, "finance", "ssn", json!([item(&["public"], "MASK_NONE")])),
+        ]));
+        let p = resolve(&b, &member("ann", &[]), "finance", false);
+        assert!(p.restricted_columns.contains(&"ssn".to_string()));
+    }
+
+    fn filter_policy(id: i64, items: serde_json::Value) -> serde_json::Value {
+        json!({
+            "id": id, "name": format!("rf-{id}"), "policyType": 2, "isEnabled": true,
+            "resources": {"database": {"values": ["finance"]}, "table": {"values": ["orders"]}},
+            "rowFilterPolicyItems": items
+        })
+    }
+
+    #[test]
+    fn first_matching_row_filter_item_wins_and_an_empty_filter_exempts() {
+        let b = bundle(json!([filter_policy(
+            1,
+            json!([
+                {"groups": ["SG-Exempt"], "rowFilterInfo": {"filterExpr": ""}},
+                {"groups": ["public"], "rowFilterInfo": {"filterExpr": "region = 'EU'"}}
+            ])
+        )]));
+        assert!(resolve(&b, &member("eve", &["SG-Exempt"]), "finance", false).row_filters.is_empty());
+        assert_eq!(resolve(&b, &member("ann", &[]), "finance", false).row_filters.len(), 1);
+    }
+
+    /// A conditional exemption item cannot exempt: SQE cannot tell whether
+    /// its condition holds, so the later matching item applies as well.
+    #[test]
+    fn a_conditional_row_filter_item_does_not_decide_alone() {
+        let b = bundle(json!([filter_policy(
+            1,
+            json!([
+                {"groups": ["SG-Exempt"], "conditions": [{"type": "ip-range", "values": ["10.0.0.0/8"]}],
+                 "rowFilterInfo": {"filterExpr": ""}},
+                {"groups": ["public"], "rowFilterInfo": {"filterExpr": "region = 'EU'"}}
+            ])
+        )]));
+        assert_eq!(resolve(&b, &member("eve", &["SG-Exempt"]), "finance", false).row_filters.len(), 1);
+    }
+
+    #[test]
+    fn row_filters_of_separate_policies_are_anded() {
+        let b = bundle(json!([
+            filter_policy(1, json!([{"groups": ["public"], "rowFilterInfo": {"filterExpr": "region = 'EU'"}}])),
+            filter_policy(2, json!([{"groups": ["public"], "rowFilterInfo": {"filterExpr": "year > 2020"}}])),
+        ]));
+        assert_eq!(resolve(&b, &member("ann", &[]), "finance", false).row_filters.len(), 2);
+    }
+
+    // ── tag path ───────────────────────────────────────────────────────
+
+    #[test]
+    fn tag_policies_take_the_first_item_and_the_first_deciding_policy() {
+        let mut b = bundle(json!([]));
+        b.tag_policies = Some(
+            serde_json::from_value(json!({"policies": [
+                {"id": 9, "name": "pii-exempt", "policyType": 1, "isEnabled": true,
+                 "resources": {"tag": {"values": ["PII"]}},
+                 "dataMaskPolicyItems": [
+                     {"groups": ["SG-Exempt"], "dataMaskInfo": {"dataMaskType": "hive:MASK_NONE"}},
+                     {"groups": ["SG-DataAnalysts"], "dataMaskInfo": {"dataMaskType": "hive:MASK_NULL"}}
+                 ]},
+                {"id": 10, "name": "pii-all", "policyType": 1, "isEnabled": true,
+                 "resources": {"tag": {"values": ["PII"]}},
+                 "dataMaskPolicyItems": [
+                     {"groups": ["public"], "dataMaskInfo": {"dataMaskType": "hive:MASK_HASH"}}
+                 ]}
+            ]}))
+            .unwrap(),
+        );
+        let tags: HashSet<String> = ["PII".to_string()].into();
+        let (masks, _, _) = resolve_tag_policies(&b, &member("ann", &["SG-DataAnalysts"]), &tags);
+        assert!(matches!(masks.get("PII"), Some(TagMaskSpec::Ready(MaskType::Nullify))));
+        let (masks, _, _) = resolve_tag_policies(&b, &member("eve", &["SG-Exempt", "SG-DataAnalysts"]), &tags);
+        assert!(masks.is_empty(), "the exemption item comes first and its decision is final");
+        let (masks, _, _) = resolve_tag_policies(&b, &member("bob", &[]), &tags);
+        assert!(matches!(masks.get("PII"), Some(TagMaskSpec::Ready(MaskType::Hash))));
     }
 }

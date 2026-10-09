@@ -231,6 +231,16 @@ pub trait PolicyStore: Send + Sync {
         None
     }
 
+    /// Whether this store keys an Iceberg table's policies on its catalog as
+    /// well as its namespace. When true, every caller derives the `namespace`
+    /// it passes to `resolve` as `{catalog}.{namespace}` (see
+    /// `sqe_policy::plan_rewriter::resolve_policy_key_scoped`), so two
+    /// catalogs holding the same `namespace.table` resolve different policies.
+    /// Default false: the catalog is dropped, the Hive/Kyuubi convention.
+    fn catalog_scoped(&self) -> bool {
+        false
+    }
+
     /// Look up the resolved policy for a user accessing a specific table.
     async fn resolve(
         &self,

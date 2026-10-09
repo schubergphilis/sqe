@@ -1380,6 +1380,7 @@ impl WriteHandler {
     async fn compute_write_predicates(
         &self,
         session: &Session,
+        qualifier: Option<String>,
         table_ident: &TableIdent,
         schema: Arc<ArrowSchema>,
         policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
@@ -1397,9 +1398,15 @@ impl WriteHandler {
         } else {
             table_ident.namespace().to_string()
         };
+        // The catalog the target lives in: the statement's qualifier, else the
+        // session's, else the configured default. The read path governs the
+        // same table as `catalog.ns.t` (`TableScope::qualify`), and a
+        // catalog-scoped policy store keys on that catalog.
+        let catalog_name = self.policy_catalog_name(qualifier, session);
         let (predicates, summary) = sqe_policy::write_predicates::extract_write_predicates(
             enf.as_ref(),
             &session.user,
+            Some(&catalog_name),
             &namespace_key,
             table_ident.name(),
             schema,
@@ -1407,6 +1414,15 @@ impl WriteHandler {
         .await?;
         *policy_summary_out = Some(summary);
         Ok(predicates)
+    }
+
+    /// Name of the catalog a write target lives in, for policy keys: the
+    /// statement's explicit qualifier, else the session's default catalog,
+    /// else the configured default. Same rule as `resolve_target_catalog`
+    /// plus the configured fallback, which a policy key cannot do without.
+    fn policy_catalog_name(&self, qualifier: Option<String>, session: &Session) -> String {
+        resolve_target_catalog(qualifier, session)
+            .unwrap_or_else(|| self.config.resolve_default_catalog())
     }
 
     /// Return the Parquet compression codec for this write.
@@ -1769,8 +1785,14 @@ impl WriteHandler {
             None
         };
         if let Some(live) = &existing {
-            self.refuse_replace_under_policy(session, &table_ident, live, "CREATE OR REPLACE")
-                .await?;
+            self.refuse_replace_under_policy(
+                session,
+                target_catalog.clone(),
+                &table_ident,
+                live,
+                "CREATE OR REPLACE",
+            )
+            .await?;
         }
 
         let staged_ident = match &existing {
@@ -2149,8 +2171,14 @@ impl WriteHandler {
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
         if overwrite {
-            self.refuse_replace_under_policy(session, &table_ident, &table, "INSERT OVERWRITE")
-                .await?;
+            self.refuse_replace_under_policy(
+                session,
+                target_catalog.clone(),
+                &table_ident,
+                &table,
+                "INSERT OVERWRITE",
+            )
+            .await?;
         }
 
         let effective_sql = if explicit_columns.is_empty() {
@@ -2219,7 +2247,14 @@ impl WriteHandler {
         }
 
         let stream = self
-            .with_check_guard(session, ctx, &table_ident, &table, stream)
+            .with_check_guard(
+                session,
+                ctx,
+                catalog_qualifier(table_name),
+                &table_ident,
+                &table,
+                stream,
+            )
             .await?;
         let (stream, sketch_acc) = tap_stream_for_puffin_sketches(&table, stream);
 
@@ -2580,7 +2615,14 @@ impl WriteHandler {
         // target's row filter over each uploaded batch (#729). A filter that
         // needs another table fails closed here rather than being skipped.
         let stream = self
-            .with_check_guard(session, &DFSessionContext::new(), &table_ident, &table, stream)
+            .with_check_guard(
+                session,
+                &DFSessionContext::new(),
+                target_catalog.map(str::to_string),
+                &table_ident,
+                &table,
+                stream,
+            )
             .await?;
 
         let tracker = new_upload_tracker();
@@ -2679,7 +2721,13 @@ impl WriteHandler {
         // optimistic-concurrency conflict.
         let target_schema = build_arrow_schema_for_table(&table)?;
         let predicates = self
-            .compute_write_predicates(session, &table_ident, target_schema, policy_summary_out)
+            .compute_write_predicates(
+                session,
+                catalog_qualifier(delete_target_object_name(stmt)?),
+                &table_ident,
+                target_schema,
+                policy_summary_out,
+            )
             .await?;
 
         // No WHERE = truncate. With no policy row filter we keep the fast
@@ -2892,7 +2940,13 @@ impl WriteHandler {
         let where_clause = &delete.selection;
         let target_schema = build_arrow_schema_for_table(&table)?;
         let predicates = self
-            .compute_write_predicates(session, &table_ident, target_schema, policy_summary_out)
+            .compute_write_predicates(
+                session,
+                catalog_qualifier(delete_target_object_name(stmt)?),
+                &table_ident,
+                target_schema,
+                policy_summary_out,
+            )
             .await?;
 
         // No WHERE clause and no policy row filter: keep the fast truncate
@@ -3260,7 +3314,13 @@ impl WriteHandler {
         let where_clause = &delete.selection;
         let target_schema = build_arrow_schema_for_table(&table)?;
         let predicates = self
-            .compute_write_predicates(session, &table_ident, target_schema, policy_summary_out)
+            .compute_write_predicates(
+                session,
+                catalog_qualifier(delete_target_object_name(stmt)?),
+                &table_ident,
+                target_schema,
+                policy_summary_out,
+            )
             .await?;
 
         // DELETE without WHERE and without a policy row filter: fall back
@@ -3542,7 +3602,13 @@ impl WriteHandler {
         // the initial snapshot, consistent with UPDATE's snapshot isolation.
         let target_schema = build_arrow_schema_for_table(&table)?;
         let predicates = self
-            .compute_write_predicates(session, &table_ident, target_schema, policy_summary_out)
+            .compute_write_predicates(
+                session,
+                catalog_qualifier(update_target_object_name(stmt)?),
+                &table_ident,
+                target_schema,
+                policy_summary_out,
+            )
             .await?;
         // Build the SET clause as SQL CASE expressions for a SELECT rewrite:
         // UPDATE t SET c1=e1 WHERE cond  ->  SELECT CASE WHEN cond THEN e1 ELSE c1 END, ...
@@ -3865,7 +3931,13 @@ impl WriteHandler {
 
         let target_schema = build_arrow_schema_for_table(&table)?;
         let predicates = self
-            .compute_write_predicates(session, &table_ident, target_schema, policy_summary_out)
+            .compute_write_predicates(
+                session,
+                catalog_qualifier(update_target_object_name(stmt)?),
+                &table_ident,
+                target_schema,
+                policy_summary_out,
+            )
             .await?;
 
         let raw_where = selection
@@ -4194,6 +4266,7 @@ impl WriteHandler {
         let target_policy = self
             .compute_write_predicates(
                 session,
+                catalog_qualifier(target_table_name),
                 &table_ident,
                 target_schema.clone(),
                 policy_summary_out,
@@ -5112,6 +5185,7 @@ impl WriteHandler {
         let target_policy = self
             .compute_write_predicates(
                 session,
+                catalog_qualifier(target_table_name),
                 &table_ident,
                 target_schema.clone(),
                 policy_summary_out,
@@ -6385,6 +6459,7 @@ impl WriteHandler {
     async fn refuse_replace_under_policy(
         &self,
         session: &Session,
+        qualifier: Option<String>,
         table_ident: &TableIdent,
         table: &IcebergTable,
         what: &str,
@@ -6398,7 +6473,7 @@ impl WriteHandler {
             )?,
         );
         let predicates = self
-            .compute_write_predicates(session, table_ident, schema, &mut None)
+            .compute_write_predicates(session, qualifier, table_ident, schema, &mut None)
             .await?;
         if predicates.row_filter_sql.is_none() {
             return Ok(());
@@ -6421,6 +6496,7 @@ impl WriteHandler {
         &self,
         session: &Session,
         ctx: &DFSessionContext,
+        qualifier: Option<String>,
         table_ident: &TableIdent,
         table: &IcebergTable,
         stream: datafusion::execution::SendableRecordBatchStream,
@@ -6434,7 +6510,7 @@ impl WriteHandler {
             )?,
         );
         let predicates = self
-            .compute_write_predicates(session, table_ident, target_schema, &mut None)
+            .compute_write_predicates(session, qualifier, table_ident, target_schema, &mut None)
             .await?;
         if predicates.is_empty() {
             return Ok(stream);
@@ -10270,9 +10346,111 @@ s3_path_style = true
         ]));
         let mut policy_summary = None;
         handler
-            .compute_write_predicates(session, table_ident, schema, &mut policy_summary)
+            .compute_write_predicates(session, None, table_ident, schema, &mut policy_summary)
             .await
             .unwrap()
+    }
+
+    /// DELETE, UPDATE and MERGE resolve the target's policy under the
+    /// target's catalog: the statement's qualifier, else the session catalog.
+    /// A catalog-scoped store holds the row filter under `ws_a.default`, so
+    /// the same `default.employees` in `ws_b` is not filtered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dml_target_policy_is_keyed_on_the_target_catalog() {
+        use datafusion::logical_expr::{col, lit};
+        use sqe_policy::plan_rewriter::PolicyPlanRewriter;
+        use sqe_policy::policy_store::InMemoryPolicyStore;
+        use sqe_policy::{PolicyStore, ResolvedPolicy};
+        use sqlparser::ast::TableFactor;
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        struct Scoped(InMemoryPolicyStore);
+        #[async_trait::async_trait]
+        impl PolicyStore for Scoped {
+            fn catalog_scoped(&self) -> bool {
+                true
+            }
+            async fn resolve(
+                &self,
+                user: &sqe_core::SessionUser,
+                table: &str,
+                namespace: &str,
+            ) -> sqe_core::Result<ResolvedPolicy> {
+                self.0.resolve(user, table, namespace).await
+            }
+        }
+        let store = InMemoryPolicyStore::new();
+        let mut pol = ResolvedPolicy::default();
+        pol.row_filters.push(col("region").eq(lit("EU")));
+        store.add_table_policy("ws_a.default", "employees", pol).await;
+        let enforcer: Arc<dyn sqe_policy::PolicyEnforcer> =
+            Arc::new(PolicyPlanRewriter::new(Arc::new(Scoped(store))));
+        let handler = WriteHandler::new(write_test_config()).with_policy_enforcer(enforcer);
+        let mut session = sqe_core::Session::new(
+            "alice".to_string(),
+            "tok".to_string().into(),
+            None,
+            chrono::Utc::now(),
+            vec![],
+        );
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, true),
+            arrow_schema::Field::new("region", arrow_schema::DataType::Utf8, true),
+        ]));
+
+        let target = |sql: &str| -> ObjectName {
+            let stmt = Parser::parse_sql(&GenericDialect {}, sql)
+                .unwrap()
+                .remove(0);
+            match &stmt {
+                Statement::Delete(_) => delete_target_object_name(&stmt).unwrap().clone(),
+                Statement::Update(_) => update_target_object_name(&stmt).unwrap().clone(),
+                Statement::Merge(m) => match &m.table {
+                    TableFactor::Table { name, .. } => name.clone(),
+                    other => panic!("merge target: {other}"),
+                },
+                other => panic!("unexpected statement: {other}"),
+            }
+        };
+        let filtered = |session: &sqe_core::Session, name: ObjectName| {
+            let (handler, schema) = (&handler, schema.clone());
+            let session = session.clone();
+            async move {
+                let ident = resolve_table_ident(&name, &session).unwrap();
+                handler
+                    .compute_write_predicates(
+                        &session,
+                        catalog_qualifier(&name),
+                        &ident,
+                        schema,
+                        &mut None,
+                    )
+                    .await
+                    .unwrap()
+                    .row_filter_sql
+                    .is_some()
+            }
+        };
+
+        for (catalog, expect) in [("ws_a", true), ("ws_b", false)] {
+            for sql in [
+                format!("DELETE FROM {catalog}.default.employees WHERE id = 1"),
+                format!("UPDATE {catalog}.default.employees SET region = 'US'"),
+                format!(
+                    "MERGE INTO {catalog}.default.employees t USING src s ON t.id = s.id \
+                     WHEN MATCHED THEN DELETE"
+                ),
+            ] {
+                assert_eq!(filtered(&session, target(&sql)).await, expect, "{sql}");
+            }
+        }
+
+        // An unqualified target takes the session catalog.
+        session.default_catalog = Some("ws_a".to_string());
+        assert!(filtered(&session, target("DELETE FROM default.employees WHERE id = 1")).await);
+        session.default_catalog = Some("ws_b".to_string());
+        assert!(!filtered(&session, target("DELETE FROM default.employees WHERE id = 1")).await);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -110,3 +110,107 @@ fn a_reserved_catalog_is_never_filled_in() {
         TableReference::bare("t")
     );
 }
+
+/// Live-stack report: `SELECT * FROM customers` with session catalog
+/// `workspace1` and schema `default` was denied with "Tag state unknown",
+/// because the tag cache is keyed by the real catalog and the lookup ran with
+/// no catalog. The rewriter qualifies the reference from the session scope
+/// before the tag lookup AND before the policy key, so the unqualified,
+/// schema-qualified and fully qualified spellings must all find the tags and
+/// all resolve the catalog-scoped key `workspace1.default`.
+#[tokio::test]
+async fn an_unqualified_reference_uses_the_session_catalog_for_tags_and_the_scoped_key() {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use sqe_policy::tag_source::TagSource;
+    use sqe_policy::PolicyStore;
+
+    /// Answers only for the fully qualified table, like the metadata cache.
+    struct CatalogKeyedTags(Mutex<Vec<Option<String>>>);
+    impl TagSource for CatalogKeyedTags {
+        fn column_tags(
+            &self,
+            catalog: Option<&str>,
+            namespace: &[String],
+            table: &str,
+        ) -> Option<HashMap<String, Vec<String>>> {
+            self.0.lock().unwrap().push(catalog.map(str::to_string));
+            (catalog == Some("workspace1") && namespace == ["default"] && table == "customers")
+                .then(HashMap::new)
+        }
+    }
+
+    struct Scoped(InMemoryPolicyStore);
+    #[async_trait]
+    impl PolicyStore for Scoped {
+        fn catalog_scoped(&self) -> bool {
+            true
+        }
+        async fn resolve(
+            &self,
+            user: &SessionUser,
+            table: &str,
+            namespace: &str,
+        ) -> sqe_core::Result<ResolvedPolicy> {
+            self.0.resolve(user, table, namespace).await
+        }
+    }
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "region",
+        DataType::Utf8,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec!["EU", "US", "EU"]))],
+    )
+    .unwrap();
+    let table = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap());
+    let ctx = SessionContext::new_with_config(
+        SessionConfig::new().with_default_catalog_and_schema("workspace1", "default"),
+    );
+    ctx.register_catalog(
+        "workspace1",
+        Arc::new(datafusion::catalog::MemoryCatalogProvider::new()),
+    );
+    let default = Arc::new(MemorySchemaProvider::new());
+    default
+        .register_table("customers".into(), table as Arc<dyn TableProvider>)
+        .unwrap();
+    ctx.catalog("workspace1")
+        .unwrap()
+        .register_schema("default", default)
+        .unwrap();
+
+    let inner = InMemoryPolicyStore::new();
+    let mut policy = ResolvedPolicy::default();
+    policy.row_filters.push(col("region").eq(lit("EU")));
+    inner
+        .add_table_policy("workspace1.default", "customers", policy)
+        .await;
+    let tags = Arc::new(CatalogKeyedTags(Mutex::new(Vec::new())));
+    let rewriter = PolicyPlanRewriter::new(Arc::new(Scoped(inner))).with_tag_source(tags.clone());
+
+    for sql in [
+        "SELECT count(*) FROM customers",
+        "SELECT count(*) FROM default.customers",
+        "SELECT count(*) FROM workspace1.default.customers",
+    ] {
+        assert_eq!(
+            count(&ctx, &rewriter, sql).await,
+            2,
+            "`{sql}`: tags found and the scoped filter applied"
+        );
+    }
+    assert!(
+        tags.0
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| c.as_deref() == Some("workspace1")),
+        "every tag lookup carried the session catalog"
+    );
+}
