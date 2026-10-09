@@ -53,11 +53,36 @@ pub fn arrow_to_trino_type(dt: &DataType) -> String {
         DataType::Struct(fields) => {
             let cols: Vec<String> = fields
                 .iter()
-                .map(|f| format!("{} {}", f.name(), arrow_to_trino_type(f.data_type())))
+                .map(|f| {
+                    format!(
+                        "{} {}",
+                        row_field_name(f.name()),
+                        arrow_to_trino_type(f.data_type())
+                    )
+                })
                 .collect();
             format!("row({})", cols.join(","))
         }
         other => format!("{other:?}"),
+    }
+}
+
+/// A row field name as it appears in a `row(...)` type string: bare when it
+/// is a plain lowercase identifier, otherwise double-quoted with `"` doubled,
+/// so a name holding a space, comma, parenthesis or uppercase letter cannot
+/// be misread as part of the field's type.
+fn row_field_name(name: &str) -> String {
+    let plain = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if plain {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
     }
 }
 
@@ -424,6 +449,32 @@ mod tests {
                         "{name} -> rawType {raw:?}"
                     );
                 }
+            }
+
+            /// Any field name survives the trip through the `row(...)` type
+            /// string into the signature's `fieldName`, however it is
+            /// spelled, and the field's type is signed as if it stood alone.
+            #[test]
+            fn row_field_names_round_trip_through_the_signature(
+                field in "[a-zA-Z0-9 ,\"()_]{1,8}",
+                t in nested(),
+            ) {
+                let row = DataType::Struct(Fields::from(vec![
+                    Field::new(field.clone(), t.clone(), true),
+                    Field::new("z", DataType::Int64, true),
+                ]));
+                let name = arrow_to_trino_type(&row);
+                let sig = serde_json::to_value(
+                    sqe_trino_protocol::types::type_signature_for(&name),
+                ).unwrap();
+                let args = sig["arguments"].as_array().unwrap();
+                prop_assert_eq!(args.len(), 2, "{}", name);
+                prop_assert_eq!(&args[0]["value"]["fieldName"]["name"], &serde_json::json!(field), "{}", name);
+                let alone = serde_json::to_value(
+                    sqe_trino_protocol::types::type_signature_for(&arrow_to_trino_type(&t)),
+                ).unwrap();
+                prop_assert_eq!(&args[0]["value"]["typeSignature"], &alone, "{}", name);
+                prop_assert_eq!(&args[1]["value"]["fieldName"]["name"], &serde_json::json!("z"));
             }
         }
     }
