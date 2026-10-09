@@ -67,6 +67,19 @@ pub struct RunFacets {
     /// source" from "the extractor gave up" (architecture review 610).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sqe_lineageQuality: Option<LineageQualityFacet>,
+    /// SQE-specific: the query id the client was given over its protocol
+    /// (Trino `id`, Flight SQL ticket), so a consumer can join a run to the
+    /// statement a user saw. Set on every event SQE emits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sqe_query: Option<SqeQueryFacet>,
+}
+
+/// Custom run facet `sqe_query`: `{"queryId": "<protocol query id>"}`. When
+/// the protocol id is a UUID the `runId` is the same value; the facet is
+/// there so a consumer never has to rely on that.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SqeQueryFacet {
+    pub queryId: String,
 }
 
 /// Custom run facet `sqe_lineageQuality`. `complete` is false when at least
@@ -117,6 +130,49 @@ pub struct DatasetFacets {
     // outputFacets caused it to be silently dropped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub columnLineage: Option<ColumnLineageFacet>,
+    /// OL `SymlinksDatasetFacet`: the same table under the Iceberg catalog's
+    /// own identity (the catalog REST URI as namespace,
+    /// `<catalog>.<schema>.<table>` as name).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symlinks: Option<SymlinksFacet>,
+    /// OL `LifecycleStateChangeDatasetFacet`: set when the statement created,
+    /// dropped, overwrote or truncated the dataset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycleStateChange: Option<LifecycleStateChangeFacet>,
+    /// OL `DatasetVersionDatasetFacet`: the Iceberg snapshot id a write
+    /// committed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<DatasetVersionFacet>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SymlinksFacet {
+    pub identifiers: Vec<SymlinkIdentifier>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SymlinkIdentifier {
+    pub namespace: String,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+/// OL lifecycle state values used by SQE.
+pub mod lifecycle {
+    pub const CREATE: &str = "CREATE";
+    pub const DROP: &str = "DROP";
+    pub const OVERWRITE: &str = "OVERWRITE";
+    pub const TRUNCATE: &str = "TRUNCATE";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LifecycleStateChangeFacet {
+    pub lifecycleStateChange: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DatasetVersionFacet {
+    pub datasetVersion: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

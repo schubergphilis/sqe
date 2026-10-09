@@ -54,15 +54,26 @@ fn build_start(c: &QueryStartCtx, cfg: &EmitterConfig) -> RunEvent {
 
 /// Datasets plus the lineage-quality facet for a plan or hint. Hints carry
 /// no column lineage, so their quality is trivially complete (no facet).
+/// `lifecycle` (e.g. `CREATE` for a CTAS) is set on every output dataset.
 fn extract_for(
     plan: &Option<PlanOrHint>,
     masked_fields: &[(String, String)],
+    scope: &LineageScope,
+    lifecycle: Option<&str>,
     cfg: &EmitterConfig,
-) -> (Vec<InputDataset>, Vec<OutputDataset>, Option<LineageQualityFacet>) {
-    match plan {
+) -> (
+    Vec<InputDataset>,
+    Vec<OutputDataset>,
+    Option<LineageQualityFacet>,
+) {
+    let (inputs, mut outputs, quality) = match plan {
         Some(PlanOrHint::Plan(p)) => {
-            let extracted =
-                extract::extract_lineage_governed(p.as_ref(), &cfg.catalog_lookup, masked_fields);
+            let extracted = extract::extract_lineage_governed(
+                p.as_ref(),
+                &cfg.catalog_lookup,
+                masked_fields,
+                scope,
+            );
             let quality = (!extracted.quality.complete).then_some(extracted.quality);
             (extracted.inputs, extracted.outputs, quality)
         }
@@ -71,11 +82,21 @@ fn extract_for(
             (i, o, None)
         }
         None => (vec![], vec![], None),
+    };
+    if let Some(change) = lifecycle {
+        extract::apply_lifecycle(&mut outputs, change);
     }
+    (inputs, outputs, quality)
 }
 
 fn build_complete(c: &QueryCompleteCtx, cfg: &EmitterConfig) -> RunEvent {
-    let (inputs, outputs, quality) = extract_for(&c.plan, &c.masked_fields, cfg);
+    let (inputs, outputs, quality) = extract_for(
+        &c.plan,
+        &c.masked_fields,
+        &c.scope,
+        c.output_lifecycle.as_deref(),
+        cfg,
+    );
     RunEvent {
         eventType: EventType::Complete,
         eventTime: c.ended_at.to_rfc3339(),
@@ -89,7 +110,13 @@ fn build_complete(c: &QueryCompleteCtx, cfg: &EmitterConfig) -> RunEvent {
 }
 
 fn build_fail(c: &QueryFailCtx, cfg: &EmitterConfig) -> RunEvent {
-    let (inputs, outputs, quality) = extract_for(&c.plan, &c.masked_fields, cfg);
+    let (inputs, outputs, quality) = extract_for(
+        &c.plan,
+        &c.masked_fields,
+        &c.scope,
+        c.output_lifecycle.as_deref(),
+        cfg,
+    );
     RunEvent {
         eventType: EventType::Fail,
         eventTime: c.ended_at.to_rfc3339(),
@@ -108,6 +135,9 @@ fn build_fail(c: &QueryFailCtx, cfg: &EmitterConfig) -> RunEvent {
     }
 }
 
+/// `run_id` is the statement's query id: the id SQE's tracker, audit log and
+/// (for Trino and Flight SQL) the client hold. The `sqe_query` facet repeats
+/// it as a string so a consumer can join on it without relying on that.
 fn build_run(
     run_id: uuid::Uuid,
     started: chrono::DateTime<chrono::Utc>,
@@ -138,6 +168,9 @@ fn build_run(
                 programmingLanguage: "sql".into(),
             }),
             sqe_lineageQuality: quality,
+            sqe_query: Some(SqeQueryFacet {
+                queryId: run_id.to_string(),
+            }),
         },
     }
 }

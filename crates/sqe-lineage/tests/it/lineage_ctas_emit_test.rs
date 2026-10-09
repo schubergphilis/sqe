@@ -23,8 +23,11 @@ use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
 
 fn lookup() -> extract::CatalogLookup {
     Arc::new(|n: &str| match n {
-        "polaris" => "https://polaris.example/api/catalog".into(),
-        other => format!("sqe://{other}"),
+        "polaris" => sqe_lineage::extract::CatalogInfo::new(
+            "polaris",
+            Some("https://polaris.example/api/catalog".into()),
+        ),
+        other => sqe_lineage::extract::CatalogInfo::new(other, None),
     })
 }
 

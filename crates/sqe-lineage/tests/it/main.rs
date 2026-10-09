@@ -14,6 +14,7 @@ mod extract_lineage_test;
 mod extract_outputs_test;
 mod lineage_ctas_emit_test;
 mod observer_test;
+mod portal_gaps_test;
 mod sink_multi_test;
 mod sinks_file_test;
 mod sinks_http_test;
