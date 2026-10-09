@@ -96,12 +96,26 @@ pub(crate) fn with_query_limit(
     limit: usize,
     headroom_percent: u8,
 ) -> SessionContext {
+    let shared = Arc::clone(&ctx.runtime_env().memory_pool);
+    with_query_limit_over(ctx, shared, limit, headroom_percent)
+}
+
+/// [`with_query_limit`] with the shared pool given explicitly, for a context
+/// whose own pool is already a query pool. The join fallback (#784) uses it
+/// to give the retry a fresh quota instead of nesting it inside the first
+/// attempt's.
+pub(crate) fn with_query_limit_over(
+    ctx: SessionContext,
+    shared: Arc<dyn MemoryPool>,
+    limit: usize,
+    headroom_percent: u8,
+) -> SessionContext {
     if limit == 0 {
         return ctx;
     }
     let mut runtime = (*ctx.runtime_env()).clone();
     runtime.memory_pool = Arc::new(QueryMemoryPool {
-        shared: Arc::clone(&runtime.memory_pool),
+        shared,
         limit,
         budget: HeadroomBudget::new(limit, headroom_percent, true),
     });

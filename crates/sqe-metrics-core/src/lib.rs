@@ -181,6 +181,15 @@ pub struct MetricsRegistry {
     pub sort_spill_bytes: Counter,
     pub join_spill_count: Counter,
     pub join_spill_bytes: Counter,
+    /// `sqe_join_fallback_total{outcome}` (#784): read queries that ran out
+    /// of query memory before their first batch and were planned again with
+    /// sort-merge joins. `outcome` is `replanned` for every retry and
+    /// `failed` when the retry also ended in an error, so completed retries
+    /// are `replanned - failed`.
+    pub join_fallback_total: IntCounterVec,
+    /// `sqe_join_fallback_wasted_seconds_total` (#784): wall time spent in
+    /// the abandoned hash-join attempt before each retry.
+    pub join_fallback_wasted_seconds: Counter,
 
     // Late materialization metrics
     pub late_mat_bytes_predicate: Counter,
@@ -511,6 +520,19 @@ impl MetricsRegistry {
             &registry,
             "sqe_join_spill_bytes_total",
             "Bytes spilled for joins",
+        )?;
+
+        let join_fallback_total = register_int_counter_vec(
+            &registry,
+            "sqe_join_fallback_total",
+            "Read queries re-planned with sort-merge joins after running out of query memory",
+            &["outcome"],
+        )?;
+
+        let join_fallback_wasted_seconds = register_counter(
+            &registry,
+            "sqe_join_fallback_wasted_seconds_total",
+            "Wall time spent in hash-join attempts abandoned for the sort-merge fallback",
         )?;
 
         // Late materialization metrics
@@ -905,6 +927,8 @@ impl MetricsRegistry {
             sort_spill_bytes,
             join_spill_count,
             join_spill_bytes,
+            join_fallback_total,
+            join_fallback_wasted_seconds,
             late_mat_bytes_predicate,
             late_mat_bytes_projection,
             late_mat_selectivity,
@@ -1198,6 +1222,11 @@ mod tests {
         metrics.sort_spill_bytes.inc_by(0.0);
         metrics.join_spill_count.inc_by(0.0);
         metrics.join_spill_bytes.inc_by(0.0);
+        metrics
+            .join_fallback_total
+            .with_label_values(&["replanned"])
+            .inc_by(0);
+        metrics.join_fallback_wasted_seconds.inc_by(0.0);
         metrics.late_mat_bytes_predicate.inc_by(0.0);
         metrics.late_mat_bytes_projection.inc_by(0.0);
         metrics.late_mat_selectivity.observe(0.5);
