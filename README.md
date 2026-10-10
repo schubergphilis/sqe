@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-**An Iceberg-first SQL server that scales.** Run SQE embedded as one binary on your laptop, or distributed across a cluster of stateless workers behind an Arrow Flight SQL, Trino HTTP, or MCP endpoint. Same SQL surface, same Iceberg semantics, same identity model.
+**An Iceberg-first SQL server that scales.** Run SQE embedded as one binary on your laptop, or distributed across a cluster of stateless workers behind an Arrow Flight SQL, Trino HTTP, or MCP endpoint. Same SQL surface, same Iceberg semantics, same identity model. Transactions are autocommit-only, as in Trino's Iceberg connector: inside `START TRANSACTION` reads run and writes fail with `AUTOCOMMIT_WRITE_CONFLICT`, over both Trino HTTP and Flight SQL (#820).
 
 SQE is a Rust-based SQL query engine for [Apache Iceberg](https://iceberg.apache.org/) tables, built on [DataFusion 55](https://datafusion.apache.org/) and [iceberg-rust](https://github.com/apache/iceberg-rust). Every query runs as the authenticated user. No service account. No shared root.
 

@@ -447,6 +447,13 @@ impl SessionManager {
         self.update_session(session_id, |s| s.set_default_scope(catalog, schema))
     }
 
+    /// `BEGIN` / `COMMIT` / `ROLLBACK` for a stored session (#820). Flight
+    /// SQL has no transaction header, so the explicit transaction lives on
+    /// the session every later request on the same token resolves through.
+    pub fn set_transaction_id(&self, session_id: &str, transaction_id: Option<String>) -> bool {
+        self.update_session(session_id, |s| s.transaction_id = transaction_id)
+    }
+
     /// Save current sessions to a JSON file for crash recovery.
     ///
     /// Only non-sensitive fields are serialized (id, username, expires_at).
