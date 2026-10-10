@@ -33,7 +33,7 @@ members = [
 exclude = ["vendor/iceberg-rust", "vendor/datafusion-iceberg", "vendor/sqlite-rs", "vendor/object_store"]
 
 [workspace.package]
-version = "0.50.0"
+version = "0.50.1"
 edition = "2021"
 rust-version = "1.99"
 license = "Apache-2.0"

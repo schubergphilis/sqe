@@ -4,6 +4,8 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+## [0.50.1] — 2026-10-10
+
 ## [0.50.0] — 2026-10-09
 
 ### Fixed
