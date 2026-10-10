@@ -11,6 +11,26 @@ use iceberg::{Catalog, TableIdent};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+/// The branch a write to `table_ident` must commit to: `None` outside an
+/// explicit transaction, else the transaction branch (#821). The first
+/// write of a transaction creates the branch; see
+/// [`sqe_catalog::txn::target_branch`].
+///
+/// Call once per statement, before its commit loop, and set the branch on
+/// every action the loop builds.
+pub async fn txn_target_branch(
+    catalog: &dyn Catalog,
+    table_ident: &TableIdent,
+) -> sqe_core::Result<Option<String>> {
+    if sqe_catalog::txn::current().is_none() {
+        return Ok(None);
+    }
+    let table = catalog.load_table(table_ident).await.map_err(|e| {
+        sqe_core::SqeError::catalog_src(format!("Failed to load table {table_ident}"), e)
+    })?;
+    sqe_catalog::txn::target_branch(catalog, &table).await
+}
+
 /// Backoff (exponential + jitter, capped ~1s) before retrying commit
 /// `attempt` (1-based) after an optimistic-concurrency conflict.
 pub(crate) fn conflict_backoff_ms(attempt: u32) -> u64 {

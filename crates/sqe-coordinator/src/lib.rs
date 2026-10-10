@@ -61,6 +61,7 @@ pub mod table_health;
 pub mod tag_source_impl;
 pub mod tls;
 pub mod transport;
+pub(crate) mod txn_registry;
 pub mod web_auth;
 pub mod web_ui;
 pub mod worker_registry;

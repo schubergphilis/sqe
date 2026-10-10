@@ -386,6 +386,14 @@ impl TableCommit {
         &self.ident
     }
 
+    /// The updates, without taking them.
+    ///
+    /// SQE PATCH (#821): lets a catalog wrapper inspect a commit (refuse
+    /// one that moves `main` inside a transaction) before forwarding it.
+    pub fn updates(&self) -> &[TableUpdate] {
+        &self.updates
+    }
+
     /// Take all requirements.
     pub fn take_requirements(&mut self) -> Vec<TableRequirement> {
         take(&mut self.requirements)

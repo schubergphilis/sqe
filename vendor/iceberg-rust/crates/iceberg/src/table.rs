@@ -213,6 +213,16 @@ impl Table {
         self
     }
 
+    /// This table read through `ref_name`: `main` and the current snapshot
+    /// are the ref's head. `None` when the ref does not exist.
+    ///
+    /// SQE PATCH (#821): see [`crate::spec::TableMetadata::pinned_to_ref`]. Everything
+    /// but the metadata (FileIO, object cache, encryption) is shared.
+    pub fn pinned_to_ref(&self, ref_name: &str) -> Option<Table> {
+        let metadata = self.metadata.pinned_to_ref(ref_name)?;
+        Some(self.clone().with_metadata(Arc::new(metadata)))
+    }
+
     /// Sets the [`Table`] metadata location and returns an updated instance.
     pub(crate) fn with_metadata_location(mut self, metadata_location: String) -> Self {
         self.metadata_location = Some(metadata_location);

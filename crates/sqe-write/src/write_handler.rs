@@ -862,6 +862,7 @@ impl WriteHandler {
         F: FnMut(IcebergTable) -> Fut,
         Fut: std::future::Future<Output = sqe_core::Result<Option<RewriteAttempt<T>>>>,
     {
+        let target_branch = crate::commit::txn_target_branch(catalog, table_ident).await?;
         let mut attempt = 1u32;
         loop {
             let table = catalog.load_table(table_ident).await.map_err(|e| {
@@ -879,6 +880,9 @@ impl WriteHandler {
 
             let tx = Transaction::new(&table);
             let mut action = tx.rewrite_files();
+            if let Some(branch) = &target_branch {
+                action = action.set_target_branch(branch.clone());
+            }
             if !add.is_empty() {
                 action = action.add_data_files(add);
             }
@@ -2208,6 +2212,7 @@ impl WriteHandler {
         };
 
         let table_ident = resolve_table_ident(table_name, session)?;
+        sqe_catalog::txn::check_target(&table_ident)?;
 
         info!(
             username = %session.user.username,
@@ -2712,6 +2717,8 @@ impl WriteHandler {
         if !data_files.is_empty() {
             let files_for_retry = data_files.clone();
             let catalog_for_commit = catalog.clone();
+            let target_branch =
+                crate::commit::txn_target_branch(catalog.as_ref(), &table_ident).await?;
             commit_with_retry(
                 catalog.as_ref(),
                 &table_ident,
@@ -2719,9 +2726,13 @@ impl WriteHandler {
                 move |fresh_table| {
                     let files = files_for_retry.clone();
                     let cat = catalog_for_commit.clone();
+                    let target_branch = target_branch.clone();
                     async move {
                         let tx = Transaction::new(&fresh_table);
-                        let action = tx.fast_append().add_data_files(files);
+                        let mut action = tx.fast_append().add_data_files(files);
+                        if let Some(branch) = target_branch {
+                            action = action.set_target_branch(branch);
+                        }
                         let tx = action.apply(tx)?;
                         tx.commit(cat.as_ref()).await
                     }
@@ -2770,6 +2781,7 @@ impl WriteHandler {
         policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_ident = resolve_delete_target_ident(stmt, session)?;
+        sqe_catalog::txn::check_target(&table_ident)?;
         let delete = match stmt {
             Statement::Delete(d) => d,
             // unreachable: resolve_delete_target_ident above already filtered.
@@ -2986,6 +2998,7 @@ impl WriteHandler {
         policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_ident = resolve_delete_target_ident(stmt, session)?;
+        sqe_catalog::txn::check_target(&table_ident)?;
         let delete = match stmt {
             Statement::Delete(d) => d,
             other => {
@@ -3242,6 +3255,8 @@ impl WriteHandler {
         let retired_for_retry = retired_deletes.clone();
         let referenced_for_retry = Arc::new(referenced_paths);
         let catalog_for_commit = catalog.clone();
+        let target_branch =
+            crate::commit::txn_target_branch(catalog.as_catalog().as_ref(), &table_ident).await?;
         commit_with_retry(
             catalog.as_catalog().as_ref(),
             &table_ident,
@@ -3252,6 +3267,7 @@ impl WriteHandler {
                 let retired = retired_for_retry.clone();
                 let referenced = Arc::clone(&referenced_for_retry);
                 let cat = catalog_for_commit.clone();
+                let target_branch = target_branch.clone();
                 async move {
                     if !v3 && fresh_table.metadata().current_snapshot_id() != base_snapshot_id {
                         let live: std::collections::HashSet<String> =
@@ -3285,6 +3301,9 @@ impl WriteHandler {
                         if let Some(base) = base_snapshot_id {
                             action = action.validate_from_snapshot(base);
                         }
+                        if let Some(branch) = target_branch {
+                            action = action.set_target_branch(branch);
+                        }
                         action.apply(tx)?
                     } else {
                         // Pinned to the snapshot the live-file check above
@@ -3297,6 +3316,9 @@ impl WriteHandler {
                         let mut action = tx.row_delta().add_delete_files(files);
                         if let Some(snap) = fresh_table.metadata().current_snapshot_id() {
                             action = action.validate_from_snapshot(snap);
+                        }
+                        if let Some(branch) = target_branch {
+                            action = action.set_target_branch(branch);
                         }
                         action.apply(tx)?
                     };
@@ -3350,6 +3372,7 @@ impl WriteHandler {
         policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_ident = resolve_delete_target_ident(stmt, session)?;
+        sqe_catalog::txn::check_target(&table_ident)?;
         let delete = match stmt {
             Statement::Delete(d) => d,
             other => {
@@ -3494,6 +3517,8 @@ impl WriteHandler {
         // SnapshotProducer's added-delete-files summary key mirrors Spark.
         let files_for_retry = delete_files.clone();
         let catalog_for_commit = catalog.clone();
+        let target_branch =
+            crate::commit::txn_target_branch(catalog.as_catalog().as_ref(), &table_ident).await?;
         commit_with_retry(
             catalog.as_catalog().as_ref(),
             &table_ident,
@@ -3501,12 +3526,16 @@ impl WriteHandler {
             move |fresh_table| {
                 let files = files_for_retry.clone();
                 let cat = catalog_for_commit.clone();
+                let target_branch = target_branch.clone();
                 async move {
                     let snapshot_id = fresh_table.metadata().current_snapshot_id();
                     let tx = Transaction::new(&fresh_table);
                     let mut action = tx.row_delta().add_delete_files(files);
                     if let Some(snap) = snapshot_id {
                         action = action.validate_from_snapshot(snap);
+                    }
+                    if let Some(branch) = target_branch {
+                        action = action.set_target_branch(branch);
                     }
                     let tx = action.apply(tx)?;
                     tx.commit(cat.as_catalog().as_ref()).await
@@ -3652,6 +3681,7 @@ impl WriteHandler {
         policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_ident = resolve_update_target_ident(stmt, session)?;
+        sqe_catalog::txn::check_target(&table_ident)?;
         let (assignments, selection) = match stmt {
             Statement::Update(update) => (&update.assignments, &update.selection),
             other => {
@@ -3965,6 +3995,7 @@ impl WriteHandler {
         policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_ident = resolve_update_target_ident(stmt, session)?;
+        sqe_catalog::txn::check_target(&table_ident)?;
         let (assignments, selection) = match stmt {
             Statement::Update(update) => (&update.assignments, &update.selection),
             other => {
@@ -4163,6 +4194,8 @@ impl WriteHandler {
         let data_files_for_retry = new_data_files.clone();
         let delete_files_for_retry = delete_files.clone();
         let catalog_for_commit = catalog.clone();
+        let target_branch =
+            crate::commit::txn_target_branch(catalog.as_catalog().as_ref(), &table_ident).await?;
         commit_with_retry(
             catalog.as_catalog().as_ref(),
             &table_ident,
@@ -4171,12 +4204,16 @@ impl WriteHandler {
                 let dfs = data_files_for_retry.clone();
                 let dels = delete_files_for_retry.clone();
                 let cat = catalog_for_commit.clone();
+                let target_branch = target_branch.clone();
                 async move {
                     let snapshot_id = fresh_table.metadata().current_snapshot_id();
                     let tx = Transaction::new(&fresh_table);
                     let mut action = tx.row_delta().add_data_files(dfs).add_delete_files(dels);
                     if let Some(snap) = snapshot_id {
                         action = action.validate_from_snapshot(snap);
+                    }
+                    if let Some(branch) = target_branch {
+                        action = action.set_target_branch(branch);
                     }
                     let tx = action.apply(tx)?;
                     tx.commit(cat.as_catalog().as_ref()).await
@@ -4267,6 +4304,7 @@ impl WriteHandler {
         };
 
         let table_ident = resolve_table_ident(target_table_name, session)?;
+        sqe_catalog::txn::check_target(&table_ident)?;
 
         // Extract source alias (needed for column references in the JOIN)
         let source_alias = match source_factor {
@@ -5117,6 +5155,7 @@ impl WriteHandler {
             }
         };
         let table_ident = resolve_table_ident(target_table_name, session)?;
+        sqe_catalog::txn::check_target(&table_ident)?;
 
         let source_alias = match source_factor {
             TableFactor::Table { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),
@@ -5631,6 +5670,8 @@ impl WriteHandler {
         let data_files_for_retry = new_data_files.clone();
         let delete_files_for_retry = delete_files.clone();
         let catalog_for_commit = catalog.clone();
+        let target_branch =
+            crate::commit::txn_target_branch(catalog.as_catalog().as_ref(), &table_ident).await?;
         commit_with_retry(
             catalog.as_catalog().as_ref(),
             &table_ident,
@@ -5639,6 +5680,7 @@ impl WriteHandler {
                 let dfs = data_files_for_retry.clone();
                 let dels = delete_files_for_retry.clone();
                 let cat = catalog_for_commit.clone();
+                let target_branch = target_branch.clone();
                 async move {
                     let snapshot_id = fresh_table.metadata().current_snapshot_id();
                     let tx = Transaction::new(&fresh_table);
@@ -5651,6 +5693,9 @@ impl WriteHandler {
                     }
                     if let Some(snap) = snapshot_id {
                         action = action.validate_from_snapshot(snap);
+                    }
+                    if let Some(branch) = target_branch {
+                        action = action.set_target_branch(branch);
                     }
                     let tx = action.apply(tx)?;
                     tx.commit(cat.as_catalog().as_ref()).await
@@ -5733,11 +5778,16 @@ impl WriteHandler {
                 return Ok(None);
             }
             let bridge_ref = bridge.as_ref();
+            let target_branch = crate::commit::txn_target_branch(bridge_ref, table_ident).await?;
             let committed = commit_with_retry(bridge_ref, table_ident, "insert", move |fresh_table| {
                 let files = new_data_files.clone();
+                let target_branch = target_branch.clone();
                 async move {
                     let tx = Transaction::new(&fresh_table);
-                    let action = tx.fast_append().add_data_files(files);
+                    let mut action = tx.fast_append().add_data_files(files);
+                    if let Some(branch) = target_branch {
+                        action = action.set_target_branch(branch);
+                    }
                     let tx = action.apply(tx)?;
                     tx.commit(bridge_ref).await
                 }
@@ -12504,6 +12554,224 @@ s3_path_style = true
 
         fn s(v: &str) -> Option<String> {
             Some(v.to_string())
+        }
+
+        // --- Explicit transactions (#821) ---------------------------------
+        //
+        // The coordinator runs every statement of a transaction inside
+        // `sqe_catalog::txn::scope`; these drive the real write paths the
+        // same way and publish or discard outside it, as COMMIT / ROLLBACK do.
+
+        fn new_txn() -> Arc<sqe_catalog::txn::TxnScope> {
+            sqe_catalog::txn::TxnScope::new(uuid::Uuid::new_v4().to_string())
+        }
+
+        /// `(id, v)` rows of `table` at its current snapshot, ordered by id.
+        async fn rows_of(table: IcebergTable) -> Vec<(i64, Option<String>)> {
+            if table.metadata().current_snapshot_id().is_none() {
+                return Vec::new();
+            }
+            let provider = sqe_catalog::table_provider::SqeTableProvider::try_new(table)
+                .await
+                .expect("table provider");
+            let ctx = DFSessionContext::new();
+            ctx.register_table("t", Arc::new(provider))
+                .expect("register");
+            let batches = ctx
+                .sql("SELECT id, v FROM t ORDER BY id")
+                .await
+                .expect("plan")
+                .collect()
+                .await
+                .expect("execute");
+            id_v_pairs(&batches)
+        }
+
+        /// What a statement inside `txn` reads for `ident`: the load goes
+        /// through the session catalog, which pins it to the branch.
+        async fn rows_in_txn(
+            rig: &SqliteRig,
+            txn: &Arc<sqe_catalog::txn::TxnScope>,
+            ident: &TableIdent,
+        ) -> Vec<(i64, Option<String>)> {
+            let catalog = rig.session_catalog().await.as_catalog();
+            let table = sqe_catalog::txn::scope(Some(Arc::clone(txn)), catalog.load_table(ident))
+                .await
+                .expect("load inside the transaction");
+            rows_of(table).await
+        }
+
+        async fn insert_in(
+            h: &WriteHandler,
+            rig: &SqliteRig,
+            txn: &Arc<sqe_catalog::txn::TxnScope>,
+            sql: &str,
+        ) -> sqe_core::Result<i64> {
+            sqe_catalog::txn::scope(Some(Arc::clone(txn)), run_insert(h, rig, sql)).await
+        }
+
+        fn txn_refs(table: &IcebergTable) -> Vec<String> {
+            table
+                .metadata()
+                .refs_iter()
+                .map(|(name, _)| name.to_string())
+                .filter(|name| sqe_catalog::txn::is_txn_ref(name))
+                .collect()
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn transaction_writes_stay_on_the_branch_until_commit() {
+            let rig = SqliteRig::new().await;
+            let h = handler(&rig);
+            let ident = seeded_id_v(&rig, "tx_commit").await;
+            let main_before = rig.load(&ident).await.metadata().current_snapshot_id();
+            let txn = new_txn();
+
+            insert_in(&h, &rig, &txn, "INSERT INTO default.tx_commit VALUES (4, 'd')")
+                .await
+                .expect("first INSERT");
+            // The second INSERT commits on top of the first one's branch head.
+            insert_in(&h, &rig, &txn, "INSERT INTO default.tx_commit VALUES (5, 'e')")
+                .await
+                .expect("second INSERT");
+
+            let all = vec![(1, s("a")), (2, s("b")), (3, s("c")), (4, s("d")), (5, s("e"))];
+            assert_eq!(rows_in_txn(&rig, &txn, &ident).await, all, "reads its own writes");
+            let outside = rig.load(&ident).await;
+            assert_eq!(outside.metadata().current_snapshot_id(), main_before);
+            assert_eq!(
+                rows_of(outside).await,
+                vec![(1, s("a")), (2, s("b")), (3, s("c"))],
+                "other sessions see main"
+            );
+
+            sqe_catalog::txn::publish(&txn).await.expect("COMMIT");
+            let published = rig.load(&ident).await;
+            assert!(txn_refs(&published).is_empty(), "COMMIT removes the branch");
+            assert_eq!(rows_of(published).await, all);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn dml_inside_a_transaction_sees_its_own_inserts() {
+            let rig = SqliteRig::new().await;
+            let h = handler(&rig);
+            let ident = seeded_id_v(&rig, "tx_dml").await;
+            let txn = new_txn();
+            let scope = || Some(Arc::clone(&txn));
+
+            insert_in(&h, &rig, &txn, "INSERT INTO default.tx_dml VALUES (4, 'd')")
+                .await
+                .expect("INSERT");
+            let deleted = sqe_catalog::txn::scope(
+                scope(),
+                run_delete(&h, &rig, "DELETE FROM default.tx_dml WHERE id = 4"),
+            )
+            .await
+            .expect("DELETE");
+            assert_eq!(deleted, 1, "the DELETE reads the transaction's branch");
+            let updated = sqe_catalog::txn::scope(
+                scope(),
+                run_update(&h, &rig, "UPDATE default.tx_dml SET v = 'z' WHERE id = 1"),
+            )
+            .await
+            .expect("UPDATE");
+            assert_eq!(updated, 1);
+
+            sqe_catalog::txn::publish(&txn).await.expect("COMMIT");
+            assert_eq!(
+                rows_of(rig.load(&ident).await).await,
+                vec![(1, s("z")), (2, s("b")), (3, s("c"))]
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_concurrent_commit_to_main_rolls_the_transaction_back() {
+            let rig = SqliteRig::new().await;
+            let h = handler(&rig);
+            let ident = seeded_id_v(&rig, "tx_conflict").await;
+            let txn = new_txn();
+
+            insert_in(&h, &rig, &txn, "INSERT INTO default.tx_conflict VALUES (4, 'd')")
+                .await
+                .expect("INSERT");
+            append_rows(&rig.catalog, &ident, vec![id_v_batch(&[(99, "late")])]).await;
+
+            let err = sqe_catalog::txn::publish(&txn)
+                .await
+                .expect_err("main moved under the transaction");
+            assert_eq!(err.error_code(), sqe_core::SqeErrorCode::TransactionConflict, "{err}");
+            let table = rig.load(&ident).await;
+            assert!(txn_refs(&table).is_empty(), "a conflict drops the branch");
+            assert_eq!(
+                rows_of(table).await,
+                vec![(1, s("a")), (2, s("b")), (3, s("c")), (99, s("late"))],
+                "the transaction's row never reaches main"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn rollback_drops_the_branch_and_leaves_main_alone() {
+            let rig = SqliteRig::new().await;
+            let h = handler(&rig);
+            let ident = seeded_id_v(&rig, "tx_rollback").await;
+            let main_before = rig.load(&ident).await.metadata().current_snapshot_id();
+            let txn = new_txn();
+
+            insert_in(&h, &rig, &txn, "INSERT INTO default.tx_rollback VALUES (4, 'd')")
+                .await
+                .expect("INSERT");
+            assert_eq!(txn_refs(&rig.load(&ident).await).len(), 1);
+
+            sqe_catalog::txn::discard(&txn).await;
+            let table = rig.load(&ident).await;
+            assert!(txn_refs(&table).is_empty());
+            assert_eq!(table.metadata().current_snapshot_id(), main_before);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_transaction_on_an_empty_table_creates_its_branch_on_first_write() {
+            let rig = SqliteRig::new().await;
+            let h = handler(&rig);
+            run_create(&h, &rig, "CREATE TABLE default.tx_empty (id BIGINT NOT NULL, v VARCHAR)")
+                .await;
+            let ident = rig.ident("tx_empty");
+            let txn = new_txn();
+
+            insert_in(&h, &rig, &txn, "INSERT INTO default.tx_empty VALUES (1, 'a')")
+                .await
+                .expect("first INSERT");
+            insert_in(&h, &rig, &txn, "INSERT INTO default.tx_empty VALUES (2, 'b')")
+                .await
+                .expect("second INSERT");
+            assert!(rig.load(&ident).await.metadata().current_snapshot_id().is_none());
+            assert_eq!(rows_in_txn(&rig, &txn, &ident).await, vec![(1, s("a")), (2, s("b"))]);
+
+            sqe_catalog::txn::publish(&txn).await.expect("COMMIT");
+            assert_eq!(
+                rows_of(rig.load(&ident).await).await,
+                vec![(1, s("a")), (2, s("b"))]
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_second_table_is_refused_before_it_is_written() {
+            let rig = SqliteRig::new().await;
+            let h = handler(&rig);
+            seeded_id_v(&rig, "tx_first").await;
+            let other = seeded_id_v(&rig, "tx_second").await;
+            let other_snapshots = snapshot_count(&rig.load(&other).await);
+            let txn = new_txn();
+
+            insert_in(&h, &rig, &txn, "INSERT INTO default.tx_first VALUES (4, 'd')")
+                .await
+                .expect("INSERT");
+            let err = insert_in(&h, &rig, &txn, "INSERT INTO default.tx_second VALUES (4, 'd')")
+                .await
+                .expect_err("second table");
+            assert_eq!(err.error_code(), sqe_core::SqeErrorCode::NotSupported, "{err}");
+            let table = rig.load(&other).await;
+            assert_eq!(snapshot_count(&table), other_snapshots);
+            assert!(txn_refs(&table).is_empty());
         }
 
         #[tokio::test(flavor = "multi_thread")]

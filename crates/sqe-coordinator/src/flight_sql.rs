@@ -2337,6 +2337,13 @@ impl FlightSqlService for SqeFlightSqlService {
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
         let session = self.get_session_from_request(&request).await?;
+        // Bulk ingest commits straight to main; it does not run in the
+        // session's SQL transaction (#821).
+        if session.transaction_id.is_some() || ticket.transaction_id.is_some() {
+            return Err(Status::failed_precondition(
+                "Bulk ingest only runs in autocommit; COMMIT or ROLLBACK the transaction first",
+            ));
+        }
 
         // Build qualified table name from catalog + schema + table
         let mut qualified = String::new();
