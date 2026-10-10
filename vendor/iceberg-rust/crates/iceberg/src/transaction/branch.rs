@@ -32,7 +32,7 @@ use crate::spec::{MAIN_BRANCH, SnapshotReference, SnapshotRetention};
 use crate::table::Table;
 use crate::transaction::action::{ActionCommit, TransactionAction};
 use crate::transaction::Transaction;
-use crate::{Error, ErrorKind, Result, TableUpdate};
+use crate::{Error, ErrorKind, Result, TableRequirement, TableUpdate};
 
 /// A transactional action that creates or updates a named branch.
 ///
@@ -289,7 +289,109 @@ impl TransactionAction for RemoveRefAction {
     }
 }
 
+/// Fast-forwards `main` to the head of `branch` and removes `branch`, in one
+/// commit that only applies while `main` is still at `expected_main`.
+///
+/// SQE PATCH (#821): publishes a transaction's branch. The requirements are
+/// fixed when the action is built and checked again against every refreshed
+/// table, so the rebase in `Transaction::do_commit` cannot turn a concurrent
+/// change to `main` into a silent overwrite: a moved `main` is a
+/// `PreconditionFailed` error, never a retry onto the new head.
+pub struct PublishBranchAction {
+    branch: String,
+    expected_main: Option<i64>,
+}
+
+impl PublishBranchAction {
+    /// Publishes `branch`; `expected_main` is the `main` snapshot the branch
+    /// was created from, or `None` if the table had no snapshot.
+    pub fn new(branch: impl Into<String>, expected_main: Option<i64>) -> Self {
+        Self {
+            branch: branch.into(),
+            expected_main,
+        }
+    }
+}
+
+#[async_trait]
+impl TransactionAction for PublishBranchAction {
+    async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+        if self.branch == MAIN_BRANCH {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                "cannot publish the main branch onto itself",
+            ));
+        }
+        let metadata = table.metadata();
+        let head = metadata
+            .snapshot_for_ref(&self.branch)
+            .map(|s| s.snapshot_id())
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::PreconditionFailed,
+                    format!("reference {} does not exist", self.branch),
+                )
+            })?;
+        let main_now = metadata
+            .snapshot_for_ref(MAIN_BRANCH)
+            .map(|s| s.snapshot_id());
+        if main_now != self.expected_main {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                format!(
+                    "branch {} conflicts with a concurrent commit: main moved from {:?} to {:?}",
+                    self.branch, self.expected_main, main_now
+                ),
+            ));
+        }
+
+        let retention = metadata
+            .reference_by_name(MAIN_BRANCH)
+            .map(|r| r.retention.clone())
+            .unwrap_or(SnapshotRetention::Branch {
+                min_snapshots_to_keep: None,
+                max_snapshot_age_ms: None,
+                max_ref_age_ms: None,
+            });
+        let updates = vec![
+            TableUpdate::SetSnapshotRef {
+                ref_name: MAIN_BRANCH.to_string(),
+                reference: SnapshotReference {
+                    snapshot_id: head,
+                    retention,
+                },
+            },
+            TableUpdate::RemoveSnapshotRef {
+                ref_name: self.branch.clone(),
+            },
+        ];
+        let requirements = vec![
+            TableRequirement::UuidMatch {
+                uuid: metadata.uuid(),
+            },
+            TableRequirement::RefSnapshotIdMatch {
+                r#ref: MAIN_BRANCH.to_string(),
+                snapshot_id: self.expected_main,
+            },
+            TableRequirement::RefSnapshotIdMatch {
+                r#ref: self.branch.clone(),
+                snapshot_id: Some(head),
+            },
+        ];
+        Ok(ActionCommit::new(updates, requirements))
+    }
+}
+
 impl Transaction {
+    /// Creates a `PublishBranchAction` for this transaction.
+    pub fn publish_branch(
+        &self,
+        branch: impl Into<String>,
+        expected_main: Option<i64>,
+    ) -> PublishBranchAction {
+        PublishBranchAction::new(branch, expected_main)
+    }
+
     /// Creates a new `CreateBranchAction` for this transaction.
     pub fn create_branch(&self, name: impl Into<String>) -> CreateBranchAction {
         CreateBranchAction::new(name)
@@ -315,8 +417,17 @@ impl Transaction {
 
 #[cfg(test)]
 mod tests {
-    use crate::spec::{MAIN_BRANCH, SnapshotRetention};
-    use crate::transaction::branch::{CreateBranchAction, CreateTagAction, RemoveRefAction};
+    use std::sync::Arc;
+
+    use crate::spec::{MAIN_BRANCH, SnapshotReference, SnapshotRetention};
+    use crate::table::Table;
+    use crate::test_utils::test_runtime;
+    use crate::transaction::branch::{
+        CreateBranchAction, CreateTagAction, PublishBranchAction, RemoveRefAction,
+    };
+    use crate::transaction::tests::make_v2_table;
+    use crate::transaction::{Transaction, TransactionAction};
+    use crate::{ErrorKind, TableRequirement};
 
     #[test]
     fn test_create_branch_builder() {
@@ -373,5 +484,95 @@ mod tests {
     #[test]
     fn test_main_branch_constant() {
         assert_eq!(MAIN_BRANCH, "main");
+    }
+
+    const BASE: i64 = 3051729675574597004;
+    const HEAD: i64 = 3055729675574597004;
+
+    /// `make_v2_table` with `main` at `main` and `sqe-txn-1` at `HEAD`.
+    fn table_with_branch(main: i64) -> Table {
+        let table = make_v2_table();
+        let reference = |snapshot_id| SnapshotReference {
+            snapshot_id,
+            retention: SnapshotRetention::branch(None, None, None),
+        };
+        let metadata = table
+            .metadata()
+            .clone()
+            .into_builder(None)
+            .set_ref(MAIN_BRANCH, reference(main))
+            .unwrap()
+            .set_ref("sqe-txn-1", reference(HEAD))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        Table::builder()
+            .metadata(metadata)
+            .metadata_location("s3://bucket/test/location/metadata/v2.json")
+            .identifier(table.identifier().clone())
+            .file_io(table.file_io().clone())
+            .runtime(test_runtime())
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_publish_branch_moves_main_and_drops_the_branch() {
+        let table = table_with_branch(BASE);
+        let commit = Arc::new(PublishBranchAction::new("sqe-txn-1", Some(BASE)))
+            .commit(&table)
+            .await
+            .unwrap();
+        let mut existing_requirements = vec![];
+        let published =
+            Transaction::apply(table, commit, &mut vec![], &mut existing_requirements).unwrap();
+
+        assert_eq!(published.metadata().current_snapshot_id(), Some(HEAD));
+        assert!(published.metadata().snapshot_for_ref("sqe-txn-1").is_none());
+        assert!(existing_requirements.contains(&TableRequirement::RefSnapshotIdMatch {
+            r#ref: MAIN_BRANCH.to_string(),
+            snapshot_id: Some(BASE),
+        }));
+        assert!(existing_requirements.contains(&TableRequirement::RefSnapshotIdMatch {
+            r#ref: "sqe-txn-1".to_string(),
+            snapshot_id: Some(HEAD),
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_publish_branch_refuses_a_moved_main() {
+        // The transaction started at BASE, but main has since moved to HEAD.
+        let table = table_with_branch(HEAD);
+        let err = Arc::new(PublishBranchAction::new("sqe-txn-1", Some(BASE)))
+            .commit(&table)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), ErrorKind::PreconditionFailed);
+        assert!(!err.retryable());
+    }
+
+    #[tokio::test]
+    async fn test_publish_branch_refuses_main_and_missing_branch() {
+        let table = table_with_branch(BASE);
+        for branch in [MAIN_BRANCH, "no-such-branch"] {
+            let err = Arc::new(PublishBranchAction::new(branch, Some(BASE)))
+                .commit(&table)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(err.kind(), ErrorKind::PreconditionFailed);
+        }
+    }
+
+    #[test]
+    fn test_pinned_to_ref_reads_the_branch_as_main() {
+        let table = table_with_branch(BASE);
+        let pinned = table.metadata().pinned_to_ref("sqe-txn-1").unwrap();
+        assert_eq!(pinned.current_snapshot_id(), Some(HEAD));
+        assert_eq!(pinned.snapshot_for_ref(MAIN_BRANCH).unwrap().snapshot_id(), HEAD);
+        assert_eq!(pinned.snapshot_for_ref("sqe-txn-1").unwrap().snapshot_id(), HEAD);
+        assert!(table.metadata().pinned_to_ref("no-such-branch").is_none());
     }
 }
