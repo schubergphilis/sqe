@@ -41,10 +41,11 @@ pub fn is_txn_ref(name: &str) -> bool {
 }
 
 /// Refuse a statement that names a transaction branch: reading one
-/// (`FOR VERSION AS OF`), writing to one (`SET WRITE_BRANCH`), or creating,
-/// replacing or dropping one. An open transaction's writes are invisible to
+/// (`FOR VERSION AS OF`), writing to one (`SET WRITE_BRANCH`), or creating
+/// or replacing one. An open transaction's writes are invisible to
 /// everyone but that transaction until COMMIT; its branch is reachable only
-/// through the transaction's own pin.
+/// through the transaction's own pin. Dropping one is allowed: it discloses
+/// nothing, and it is how a branch left by a crashed coordinator is removed.
 pub fn reject_txn_ref(name: &str) -> sqe_core::Result<()> {
     if is_txn_ref(name) {
         return Err(sqe_core::SqeError::with_code(
@@ -151,7 +152,11 @@ impl TxnScope {
     /// The transaction's branch if `table_uuid` is its table, `None` when
     /// the transaction has not written yet. Errors when it wrote another
     /// table: one table per transaction until #823.
-    fn claimed_branch(&self, table_uuid: Uuid, ident: &TableIdent) -> sqe_core::Result<Option<String>> {
+    fn claimed_branch(
+        &self,
+        table_uuid: Uuid,
+        ident: &TableIdent,
+    ) -> sqe_core::Result<Option<String>> {
         match self.lock().as_ref() {
             None => Ok(None),
             Some(t) if t.table_uuid == table_uuid => Ok(Some(t.branch.clone())),
@@ -384,8 +389,7 @@ async fn publish_branch(catalog: &dyn Catalog, txn_table: &TxnTable) -> sqe_core
 /// `sqe-txn-` name marks it for cleanup.
 pub async fn discard(txn: &TxnScope) {
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
-    let (Some(TxnTable { ident, branch, .. }), Some(catalog)) = (txn.table(), txn.catalog())
-    else {
+    let (Some(TxnTable { ident, branch, .. }), Some(catalog)) = (txn.table(), txn.catalog()) else {
         return;
     };
     let dropped = async {
@@ -428,7 +432,10 @@ mod tests {
     fn an_unclaimed_transaction_has_no_branch_and_pins_nothing() {
         let txn = TxnScope::new("tx-1");
         assert_eq!(txn.branch_name(), "sqe-txn-tx-1");
-        assert_eq!(txn.claimed_branch(Uuid::from_u128(1), &ident("t")).unwrap(), None);
+        assert_eq!(
+            txn.claimed_branch(Uuid::from_u128(1), &ident("t")).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -446,7 +453,10 @@ mod tests {
         // recreated): still a second table.
         let other = Uuid::from_u128(2);
         let err = txn.claimed_branch(other, &ident("t")).unwrap_err();
-        assert!(err.to_string().contains("Multi-table writes not supported"), "{err}");
+        assert!(
+            err.to_string().contains("Multi-table writes not supported"),
+            "{err}"
+        );
     }
 
     /// Two snapshots, BASE <- HEAD, with refs pointing where the test says.
@@ -503,7 +513,10 @@ mod tests {
     async fn current_is_only_set_inside_the_scope() {
         assert!(current().is_none());
         let txn = TxnScope::new("tx-2");
-        let seen = scope(Some(Arc::clone(&txn)), async { current().map(|t| t.id().to_string()) }).await;
+        let seen = scope(Some(Arc::clone(&txn)), async {
+            current().map(|t| t.id().to_string())
+        })
+        .await;
         assert_eq!(seen.as_deref(), Some("tx-2"));
         assert!(scope(None, async { current() }).await.is_none());
         assert!(current().is_none());

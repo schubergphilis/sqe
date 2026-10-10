@@ -1060,8 +1060,11 @@ impl CatalogOps {
             }
         };
 
-        // Transaction branches are the coordinator's alone (#821).
-        sqe_catalog::txn::reject_txn_ref(ref_name)?;
+        // Transaction branches are the coordinator's alone (#821). DROP is
+        // the manual cleanup for a branch a crashed coordinator left.
+        if !is_drop {
+            sqe_catalog::txn::reject_txn_ref(ref_name)?;
+        }
 
         // Reject drop of the reserved main branch early, before any round-trip.
         if is_drop && ref_name == MAIN_BRANCH {

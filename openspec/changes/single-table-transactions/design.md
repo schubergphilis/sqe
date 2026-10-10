@@ -91,7 +91,7 @@ Deferred: a sweep of `sqe-txn-*` branches left by a crashed coordinator, and dro
 A `sqe-txn-*` branch holds uncommitted data, so SQE refuses it everywhere it can be named:
 
 - `FOR VERSION AS OF 'sqe-txn-…'`, and `FOR VERSION AS OF <id>` / incremental reads of a snapshot reachable only from a transaction branch (`txn_private_snapshots`).
-- `CREATE BRANCH / TAG` from such a snapshot, branch DDL on a `sqe-txn-*` name, and `SET WRITE_BRANCH 'sqe-txn-…'`.
+- `CREATE BRANCH / TAG` from such a snapshot or with a `sqe-txn-*` name, and `SET WRITE_BRANCH 'sqe-txn-…'`. `DROP BRANCH` on a `sqe-txn-*` name is allowed: it discloses nothing and is the manual cleanup.
 - `$snapshots` leaves those snapshots out; `$refs` leaves the branches out.
 
 A session with a `WRITE_BRANCH` set cannot write inside a transaction (`NotSupported`): transactions publish to `main`.
