@@ -422,7 +422,12 @@ fn build_snapshots_batch(table: &Table, schema: &SchemaRef) -> DFResult<RecordBa
     let mut manifest_list_b = StringBuilder::new();
     let mut summary_b = StringBuilder::new();
 
+    // An open transaction's snapshots stay unlisted until COMMIT (#821).
+    let private = crate::txn::txn_private_snapshots(metadata);
     for snap in metadata.snapshots() {
+        if private.contains(&snap.snapshot_id()) {
+            continue;
+        }
         committed_at_ms.push(snap.timestamp_ms());
         snapshot_id_b.append_value(snap.snapshot_id());
 

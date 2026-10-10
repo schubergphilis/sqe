@@ -70,7 +70,7 @@ mod update_schema;
 mod update_statistics;
 mod upgrade_format_version;
 
-pub use branch::{CreateBranchAction, CreateTagAction, RemoveRefAction};
+pub use branch::{CreateBranchAction, CreateTagAction, PublishBranchAction, RemoveRefAction};
 pub use row_delta::RowDeltaAction;
 
 use std::sync::Arc;

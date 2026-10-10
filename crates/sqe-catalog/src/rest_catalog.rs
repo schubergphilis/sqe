@@ -2391,7 +2391,38 @@ impl SessionCatalog {
         &'a self,
         table_ident: &'a TableIdent,
     ) -> futures::future::BoxFuture<'a, sqe_core::Result<Table>> {
-        Box::pin(self.load_table_inner(table_ident))
+        Box::pin(async move {
+            let table = self.load_table_inner(table_ident).await?;
+            self.pin_to_txn_branch(table_ident, table).await
+        })
+    }
+
+    /// Inside a transaction that wrote this table, read it at the
+    /// transaction's branch (#821). Only the returned value is pinned: the
+    /// shared metadata cache keeps the real table, which other sessions of
+    /// the same principal read.
+    async fn pin_to_txn_branch(
+        &self,
+        table_ident: &TableIdent,
+        table: Table,
+    ) -> sqe_core::Result<Table> {
+        use crate::txn::{pin, Pin};
+        match pin(table) {
+            Pin::Unpinned(table) | Pin::Pinned(table) => return Ok(table),
+            Pin::Stale { .. } => {}
+        }
+        // A cached copy from before the branch existed. Never read `main`
+        // in its place: that would drop the transaction's own writes.
+        match pin(self.load_table_uncached(table_ident).await?) {
+            Pin::Unpinned(table) | Pin::Pinned(table) => Ok(table),
+            Pin::Stale { branch } => Err(sqe_core::SqeError::with_code(
+                sqe_core::SqeErrorCode::TransactionConflict,
+                format!(
+                    "transaction branch {branch} of {table_ident} is gone; \
+                     the transaction was rolled back"
+                ),
+            )),
+        }
     }
 
     /// A [`crate::vended_credentials::TableReloader`] for `table_ident` that
@@ -2405,7 +2436,10 @@ impl SessionCatalog {
         crate::vended_credentials::TableReloader::new(move || {
             let catalog = Arc::clone(&catalog);
             let table_ident = table_ident.clone();
-            Box::pin(async move { catalog.load_table_uncached(&table_ident).await })
+            Box::pin(async move {
+                let table = catalog.load_table_uncached(&table_ident).await?;
+                catalog.pin_to_txn_branch(&table_ident, table).await
+            })
         })
     }
 
@@ -3575,7 +3609,33 @@ impl Catalog for SessionCatalogBridge {
 
     async fn update_table(&self, commit: iceberg::TableCommit) -> iceberg::Result<Table> {
         let ident = commit.identifier().clone();
+        // Inside a transaction every write goes to the transaction branch and
+        // only COMMIT, which runs outside the scope, moves `main` (#821). A
+        // write path that forgot the branch fails here instead of publishing
+        // part of the transaction early.
+        let txn = crate::txn::current();
+        let sets_ref = |name: &str| {
+            commit.updates().iter().any(|u| {
+                matches!(u, iceberg::TableUpdate::SetSnapshotRef { ref_name, .. }
+                    if ref_name == name)
+            })
+        };
+        if txn.is_some() && sets_ref(iceberg::spec::MAIN_BRANCH) {
+            return Err(iceberg::Error::new(
+                iceberg::ErrorKind::FeatureUnsupported,
+                format!(
+                    "this write to {ident} is not supported inside a transaction: \
+                     it would commit outside the transaction branch"
+                ),
+            ));
+        }
+        let branch_commit = txn.filter(|txn| sets_ref(&txn.branch_name()));
         let result = dispatch_catalog!(self.session.inner, update_table(commit));
+        if let (Some(txn), Ok(_)) = (branch_commit, &result) {
+            txn.bind_catalog(Arc::new(SessionCatalogBridge {
+                session: Arc::clone(&self.session),
+            }));
+        }
         // A table commit is visible to every principal. Evict every token's
         // copy so a different user cannot rebuild a SessionContext from stale
         // metadata after INSERT/DELETE/UPDATE/MERGE.

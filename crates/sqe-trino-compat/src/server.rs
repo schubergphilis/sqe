@@ -1484,9 +1484,7 @@ fn resolve_statement(
         // Explicit transactions (#820). Trino's protocol keeps the
         // transaction on the client: START TRANSACTION hands out an id the
         // client replays in X-Trino-Transaction-Id, and COMMIT / ROLLBACK
-        // tell it to drop the id. Writes inside one are refused by the
-        // executor (AUTOCOMMIT_WRITE_CONFLICT), so there is nothing to apply
-        // or undo here.
+        // tell it to drop the id.
         StatementKind::Begin => {
             if in_transaction {
                 return Err(Box::new(TrinoError::from_code(
@@ -1500,11 +1498,20 @@ fn resolve_statement(
                 ..Default::default()
             })
         }
-        StatementKind::Commit | StatementKind::Rollback => {
-            immediate(protocol::UpdatedSessionState {
-                clear_transaction_id: in_transaction,
+        // Inside a transaction the executor publishes or drops its branch
+        // (#821), and the clear header goes on its terminal response: a
+        // COMMIT that failed leaves the client holding the id, and the
+        // ROLLBACK it sends next clears it.
+        StatementKind::Commit | StatementKind::Rollback if in_transaction => ResolvedStatement {
+            plan: ExecPlan::Sql(exec_sql),
+            facts,
+            session_update: Some(protocol::UpdatedSessionState {
+                clear_transaction_id: true,
                 ..Default::default()
-            })
+            }),
+        },
+        StatementKind::Commit | StatementKind::Rollback => {
+            immediate(protocol::UpdatedSessionState::default())
         }
         StatementKind::SetTransaction => immediate(protocol::UpdatedSessionState::default()),
         StatementKind::ShowSession { like } => ResolvedStatement {
@@ -4146,7 +4153,8 @@ mod tests {
         for sql in ["COMMIT", "ROLLBACK"] {
             let (headers, tr, executed) = submit_in_transaction(sql, Some("tx-1")).await;
             assert!(tr.error.is_none(), "{sql}: {:?}", tr.error);
-            assert!(!executed, "{sql} must not reach the executor");
+            // The executor publishes or drops the transaction's branch (#821).
+            assert!(executed, "{sql} must reach the executor");
             assert_eq!(
                 headers
                     .get("x-trino-clear-transaction-id")
@@ -4156,8 +4164,9 @@ mod tests {
             );
         }
         // Outside a transaction COMMIT is a lenient no-op with no header.
-        let (headers, tr, _) = submit_in_transaction("COMMIT", None).await;
+        let (headers, tr, executed) = submit_in_transaction("COMMIT", None).await;
         assert!(tr.error.is_none());
+        assert!(!executed);
         assert!(headers.get("x-trino-clear-transaction-id").is_none());
     }
 

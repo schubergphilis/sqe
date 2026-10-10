@@ -163,7 +163,11 @@ pub fn resolve_range(metadata: &TableMetadata, start: i64, end: i64) -> Result<V
         )));
     }
 
-    if metadata.snapshot_by_id(end).is_none() {
+    // An open transaction's snapshot reads as absent (#821). Checking `end`
+    // covers the walk below: a public snapshot's ancestors are all public.
+    if metadata.snapshot_by_id(end).is_none()
+        || crate::txn::txn_private_snapshots(metadata).contains(&end)
+    {
         return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "FOR INCREMENTAL BETWEEN SNAPSHOT: end snapshot {end} not found on table"
         )));
