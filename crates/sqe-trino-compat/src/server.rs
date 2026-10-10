@@ -613,6 +613,9 @@ pub struct TrinoClientHeaders {
     pub source: Option<String>,
     /// `iceberg.compression_codec` from the `X-Trino-Session` property list, if set.
     pub compression_codec: Option<String>,
+    /// `X-Trino-Transaction-Id`, the explicit transaction the client is in.
+    /// Clients send `NONE` in autocommit, which reads as `None` (#820).
+    pub transaction_id: Option<String>,
 }
 
 /// `peer_ip` on both methods is the port-stripped, proxy-resolved client
@@ -1328,6 +1331,7 @@ fn resolve_statement(
     sql: &str,
     session_catalog: Option<&str>,
     prepared: &std::collections::HashMap<String, String>,
+    in_transaction: bool,
     query_id: &str,
     on_parse_error: impl FnOnce(&sqe_core::SqeError),
 ) -> Result<ResolvedStatement, Box<TrinoError>> {
@@ -1477,6 +1481,32 @@ fn resolve_statement(
                 ..Default::default()
             })
         }
+        // Explicit transactions (#820). Trino's protocol keeps the
+        // transaction on the client: START TRANSACTION hands out an id the
+        // client replays in X-Trino-Transaction-Id, and COMMIT / ROLLBACK
+        // tell it to drop the id. Writes inside one are refused by the
+        // executor (AUTOCOMMIT_WRITE_CONFLICT), so there is nothing to apply
+        // or undo here.
+        StatementKind::Begin => {
+            if in_transaction {
+                return Err(Box::new(TrinoError::from_code(
+                    sqe_core::SqeErrorCode::NotSupported,
+                    "Nested transactions not supported",
+                    Some(query_id),
+                )));
+            }
+            immediate(protocol::UpdatedSessionState {
+                started_transaction_id: Some(Uuid::new_v4().to_string()),
+                ..Default::default()
+            })
+        }
+        StatementKind::Commit | StatementKind::Rollback => {
+            immediate(protocol::UpdatedSessionState {
+                clear_transaction_id: in_transaction,
+                ..Default::default()
+            })
+        }
+        StatementKind::SetTransaction => immediate(protocol::UpdatedSessionState::default()),
         StatementKind::ShowSession { like } => ResolvedStatement {
             plan: ExecPlan::ShowSession { like },
             facts,
@@ -1631,6 +1661,20 @@ fn apply_session_headers(
             name,
         );
     }
+    if let Some(id) = &update.started_transaction_id {
+        insert(
+            headers,
+            HeaderName::from_static("x-trino-started-transaction-id"),
+            id,
+        );
+    }
+    if update.clear_transaction_id {
+        insert(
+            headers,
+            HeaderName::from_static("x-trino-clear-transaction-id"),
+            "true",
+        );
+    }
 }
 
 // ── Header extraction ─────────────────────────────────────────
@@ -1649,6 +1693,8 @@ fn extract_trino_headers(headers: &HeaderMap) -> TrinoClientHeaders {
         user: extract_header(headers, "x-trino-user"),
         source: extract_header(headers, "x-trino-source"),
         compression_codec,
+        transaction_id: extract_header(headers, "x-trino-transaction-id")
+            .filter(|id| !id.eq_ignore_ascii_case("NONE")),
     }
 }
 
@@ -1774,6 +1820,7 @@ fn apply_trino_headers(session: Session, trino_headers: &TrinoClientHeaders) -> 
         .with_schema(trino_headers.schema.clone())
         .with_source(trino_headers.source.clone())
         .with_compression_codec(trino_headers.compression_codec.clone())
+        .with_transaction_id(trino_headers.transaction_id.clone())
 }
 
 // ── Pagination helpers ────────────────────────────────────────
@@ -2420,6 +2467,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             sql,
             session.default_catalog.as_deref(),
             &prepared,
+            session.transaction_id.is_some(),
             &query_id,
             |e| state.query_handler.audit_rejected(&session, sql, e),
         ) {
@@ -3968,6 +4016,7 @@ mod tests {
             user: None,
             source: None,
             compression_codec: Some("SNAPPY".to_string()),
+            transaction_id: None,
         };
         let session = apply_trino_headers(session, &trino_headers);
         assert_eq!(session.compression_codec.as_deref(), Some("SNAPPY"));
@@ -4040,6 +4089,107 @@ mod tests {
         let tr: TrinoResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(tr.update_type.as_deref(), Some("SET SESSION"));
         assert_eq!(tr.columns.map(|c| c.len()), Some(0));
+    }
+
+    /// Submit `sql` with an optional `X-Trino-Transaction-Id`, returning the
+    /// response headers and body, and whether the executor saw anything.
+    async fn submit_in_transaction(
+        sql: &str,
+        transaction_id: Option<&str>,
+    ) -> (axum::http::HeaderMap, TrinoResponse, bool) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let state = recording_state(seen.clone());
+        let mut headers = basic_auth_header("alice", "pw");
+        if let Some(id) = transaction_id {
+            headers.insert("x-trino-transaction-id", id.parse().unwrap());
+        }
+        let resp = submit_query::<MockAuthOk, RecordingQuery>(
+            State(state),
+            test_peer(),
+            headers,
+            sql.to_string(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let headers = resp.headers().clone();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let executed = !seen.lock().is_empty();
+        (headers, serde_json::from_slice(&body).unwrap(), executed)
+    }
+
+    #[tokio::test]
+    async fn start_transaction_hands_out_an_id_without_executing() {
+        // The exact statement Trino JDBC sends after setAutoCommit(false)
+        // (#820). Without the started id the driver prefixes every later
+        // statement with another START TRANSACTION.
+        let (headers, tr, executed) = submit_in_transaction(
+            "START TRANSACTION ISOLATION LEVEL READ UNCOMMITTED, READ WRITE",
+            Some("NONE"),
+        )
+        .await;
+        assert!(tr.error.is_none(), "{:?}", tr.error);
+        assert!(!executed, "START TRANSACTION must not reach the executor");
+        let id = headers
+            .get("x-trino-started-transaction-id")
+            .expect("x-trino-started-transaction-id")
+            .to_str()
+            .unwrap();
+        assert!(uuid::Uuid::parse_str(id).is_ok(), "{id}");
+        assert_eq!(tr.update_type.as_deref(), Some("START TRANSACTION"));
+    }
+
+    #[tokio::test]
+    async fn commit_and_rollback_clear_the_transaction() {
+        for sql in ["COMMIT", "ROLLBACK"] {
+            let (headers, tr, executed) = submit_in_transaction(sql, Some("tx-1")).await;
+            assert!(tr.error.is_none(), "{sql}: {:?}", tr.error);
+            assert!(!executed, "{sql} must not reach the executor");
+            assert_eq!(
+                headers
+                    .get("x-trino-clear-transaction-id")
+                    .map(|v| v.to_str().unwrap()),
+                Some("true"),
+                "{sql}"
+            );
+        }
+        // Outside a transaction COMMIT is a lenient no-op with no header.
+        let (headers, tr, _) = submit_in_transaction("COMMIT", None).await;
+        assert!(tr.error.is_none());
+        assert!(headers.get("x-trino-clear-transaction-id").is_none());
+    }
+
+    #[tokio::test]
+    async fn nested_start_transaction_is_refused() {
+        let (headers, tr, executed) =
+            submit_in_transaction("START TRANSACTION", Some("tx-1")).await;
+        assert!(!executed);
+        assert_eq!(
+            tr.error.expect("nested START TRANSACTION fails").error_name,
+            "NOT_SUPPORTED"
+        );
+        assert!(headers.get("x-trino-started-transaction-id").is_none());
+    }
+
+    #[test]
+    fn transaction_id_header_reaches_the_session() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-trino-transaction-id", "NONE".parse().unwrap());
+        assert_eq!(extract_trino_headers(&headers).transaction_id, None);
+
+        headers.insert("x-trino-transaction-id", "tx-1".parse().unwrap());
+        let trino_headers = extract_trino_headers(&headers);
+        let session = Session::new(
+            "u".to_string(),
+            sqe_core::SecretString::new("token".to_string()),
+            None,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            vec![],
+        );
+        let session = apply_trino_headers(session, &trino_headers);
+        assert_eq!(session.transaction_id.as_deref(), Some("tx-1"));
     }
 
     #[tokio::test]
@@ -5202,6 +5352,7 @@ mod tests {
             user: Some("testuser".to_string()),
             source: Some("trino-jdbc".to_string()),
             compression_codec: None,
+            transaction_id: None,
         };
 
         let session = apply_trino_headers(session, &trino_headers);
