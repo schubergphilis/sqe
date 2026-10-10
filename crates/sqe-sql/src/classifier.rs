@@ -118,10 +118,15 @@ pub enum StatementKind {
     PolicyDdl(Box<PolicyDdlStatement>),
     Utility(Box<Statement>),
     ExplainFull(String), // inner SQL string (EXPLAIN FULL pre-processed)
-    // Transaction stubs — no-ops for JDBC tools that use setAutoCommit(false).
+    // Explicit transactions (#820). SQE writes only in autocommit: a
+    // transaction may read, and any write or DDL inside it is refused (see
+    // `allowed_in_transaction`). The isolation level and access mode are
+    // validated at classification and carry no further meaning.
     Begin,
     Commit,
     Rollback,
+    /// `SET TRANSACTION ...`: modes validated, otherwise a no-op.
+    SetTransaction,
     /// USE catalog.schema — switch default catalog/schema for session
     Use(String),
     /// SHOW CREATE TABLE name — reconstruct DDL from metadata
@@ -281,6 +286,7 @@ impl StatementKind {
             StatementKind::Begin => "begin",
             StatementKind::Commit => "commit",
             StatementKind::Rollback => "rollback",
+            StatementKind::SetTransaction => "settransaction",
             StatementKind::Use(_) => "use",
             StatementKind::ShowCreateTable(_) => "showcreatetable",
             StatementKind::ShowCreateSchema(_) => "showcreateschema",
@@ -356,6 +362,58 @@ impl StatementKind {
                 | StatementKind::ShowStats(_)
                 | StatementKind::ShowPartitions(_)
         )
+    }
+
+    /// Statements an explicit transaction may run. SQE writes only in
+    /// autocommit, as Trino's Iceberg connector does
+    /// (`isSingleStatementWritesOnly`): inside `START TRANSACTION` reads,
+    /// EXPLAIN and session and transaction control run, and every write,
+    /// DDL, grant or procedure is refused with `AUTOCOMMIT_WRITE_CONFLICT`
+    /// (#820). An allow-list, so a statement kind added later is refused
+    /// until someone decides it cannot write.
+    pub fn allowed_in_transaction(&self) -> bool {
+        if self.is_read_only() {
+            return true;
+        }
+        match self {
+            StatementKind::Begin
+            | StatementKind::Commit
+            | StatementKind::Rollback
+            | StatementKind::SetTransaction
+            | StatementKind::Use(_)
+            | StatementKind::SetCatalog(_)
+            | StatementKind::SetSession { .. }
+            | StatementKind::ResetSession(_)
+            | StatementKind::ShowSession { .. }
+            | StatementKind::SetWriteBranch(_)
+            | StatementKind::Prepare { .. }
+            | StatementKind::Deallocate(_)
+            | StatementKind::DescribeOutput(_)
+            | StatementKind::DescribeInput(_)
+            | StatementKind::CheckAccess(_)
+            | StatementKind::ShowSecrets
+            | StatementKind::ExplainFull(_) => true,
+            // `EXECUTE` is bound to its template before it runs, and the
+            // bound statement is what gets checked.
+            StatementKind::Execute { .. } => true,
+            // EXPLAIN (queries only, see `require_explainable`), DESCRIBE,
+            // the SHOW variants and `SET <variable>`. Named rather than
+            // excluded: a DROP of an unmodelled object kind and the ALTER
+            // TABLE operations without their own kind also land in Utility.
+            StatementKind::Utility(stmt) => matches!(
+                stmt.as_ref(),
+                Statement::Explain { .. }
+                    | Statement::ExplainTable { .. }
+                    | Statement::Set(_)
+                    | Statement::ShowVariable { .. }
+                    | Statement::ShowFunctions { .. }
+                    | Statement::ShowStatus { .. }
+                    | Statement::ShowVariables { .. }
+                    | Statement::ShowColumns { .. }
+                    | Statement::ShowCollation { .. }
+            ),
+            _ => false,
+        }
     }
 
     /// The Trino `updateType` for this statement, or `None` for reads. Kinds
@@ -1010,6 +1068,25 @@ fn require_explainable(inner: &StatementKind) -> sqe_core::Result<()> {
     ))
 }
 
+/// Validate `START TRANSACTION` / `SET TRANSACTION` modes. Both access modes
+/// and the four standard isolation levels are accepted: writes are refused
+/// inside any transaction, so they never need isolating (#820). `SNAPSHOT`
+/// is not standard or Trino grammar and is refused.
+fn check_transaction_modes(modes: &[sqlparser::ast::TransactionMode]) -> sqe_core::Result<()> {
+    use sqlparser::ast::{TransactionIsolationLevel, TransactionMode};
+    for mode in modes {
+        if let TransactionMode::IsolationLevel(TransactionIsolationLevel::Snapshot) = mode {
+            return Err(sqe_core::SqeError::with_code(
+                sqe_core::SqeErrorCode::NotSupported,
+                "Unsupported isolation level: SNAPSHOT (supported: READ UNCOMMITTED, \
+                 READ COMMITTED, REPEATABLE READ, SERIALIZABLE)"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Classify a parsed statement. Custom SQE grammar never reaches this
 /// function; see [`try_classify_custom`].
 pub(crate) fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
@@ -1124,7 +1201,22 @@ pub(crate) fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
 
         // SET → Utility (sqlparser 0.62 consolidates every SET flavour
         // (SetVariable / SetTimeZone / SetNames / SetNamesDefault /
-        // SetTransaction / SetRole) into a single Statement::Set(Set) variant)
+        // SetTransaction / SetRole) into a single Statement::Set(Set) variant).
+        // SET TRANSACTION is transaction control (#820), the rest Utility.
+        Statement::Set(sqlparser::ast::Set::SetTransaction {
+            ref modes,
+            ref snapshot,
+            ..
+        }) => {
+            if snapshot.is_some() {
+                return Err(sqe_core::SqeError::with_code(
+                    sqe_core::SqeErrorCode::NotSupported,
+                    "SET TRANSACTION SNAPSHOT is not supported".to_string(),
+                ));
+            }
+            check_transaction_modes(modes)?;
+            Ok(StatementKind::SetTransaction)
+        }
         Statement::Set(_) => Ok(StatementKind::Utility(Box::new(stmt))),
 
         // SHOW SCHEMAS — sqlparser has a ShowSchemas variant
@@ -1185,9 +1277,34 @@ pub(crate) fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
         // UPDATE → dedicated variant for routing to the write handler
         Statement::Update { .. } => Ok(StatementKind::Update(Box::new(stmt))),
 
-        // Transaction stubs — no-ops so JDBC tools can call setAutoCommit(false)
-        Statement::StartTransaction { .. } => Ok(StatementKind::Begin),
+        // Explicit transactions (#820). Trino JDBC with setAutoCommit(false)
+        // sends `START TRANSACTION ISOLATION LEVEL READ UNCOMMITTED, READ
+        // WRITE`. A `BEGIN ... END` block parses into the same variant and
+        // is a procedural block, not a transaction start.
+        Statement::StartTransaction {
+            ref modes,
+            ref statements,
+            ref exception,
+            has_end_keyword,
+            ..
+        } => {
+            if !statements.is_empty() || exception.is_some() || has_end_keyword {
+                return Err(sqe_core::SqeError::with_code(
+                    sqe_core::SqeErrorCode::NotSupported,
+                    "BEGIN ... END blocks are not supported".to_string(),
+                ));
+            }
+            check_transaction_modes(modes)?;
+            Ok(StatementKind::Begin)
+        }
         Statement::Commit { .. } => Ok(StatementKind::Commit),
+        Statement::Rollback {
+            savepoint: Some(ref name),
+            ..
+        } => Err(sqe_core::SqeError::with_code(
+            sqe_core::SqeErrorCode::NotSupported,
+            format!("ROLLBACK TO SAVEPOINT {name}: savepoints are not supported"),
+        )),
         Statement::Rollback { .. } => Ok(StatementKind::Rollback),
 
         // USE [CATALOG|SCHEMA|DATABASE] catalog.schema — session context
@@ -2143,6 +2260,103 @@ mod tests {
             matches!(result, Ok(StatementKind::Rollback)),
             "Expected Rollback, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn jdbc_start_transaction_classifies_through_the_trino_front_door() {
+        // The exact text Trino JDBC sends after setAutoCommit(false) (#820).
+        for sql in [
+            "START TRANSACTION ISOLATION LEVEL READ UNCOMMITTED, READ WRITE",
+            "START TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ ONLY",
+            "START TRANSACTION READ ONLY",
+        ] {
+            let normalized = crate::SqlFrontDoor::new(crate::WireDialect::Trino)
+                .normalize(sql)
+                .expect("normalize");
+            let kind = crate::classify_normalized(normalized).expect("classify");
+            assert!(matches!(kind, StatementKind::Begin), "{sql}: {kind:?}");
+        }
+    }
+
+    #[test]
+    fn set_transaction_is_transaction_control() {
+        for sql in [
+            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            "SET TRANSACTION READ ONLY",
+        ] {
+            let kind = parse_and_classify(sql).expect(sql);
+            assert!(
+                matches!(kind, StatementKind::SetTransaction),
+                "{sql}: {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_isolation_savepoints_and_blocks_are_refused() {
+        for sql in [
+            "START TRANSACTION ISOLATION LEVEL SNAPSHOT",
+            "SET TRANSACTION ISOLATION LEVEL SNAPSHOT",
+            "ROLLBACK TO SAVEPOINT sp1",
+        ] {
+            let err = parse_and_classify(sql).expect_err(sql);
+            assert_eq!(
+                err.error_code(),
+                sqe_core::SqeErrorCode::NotSupported,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn transactions_allow_reads_and_control_but_not_writes() {
+        for sql in [
+            "SELECT 1",
+            "EXPLAIN SELECT 1",
+            "SHOW TABLES",
+            "DESCRIBE t",
+            "USE c.s",
+            "COMMIT",
+            "ROLLBACK",
+            "START TRANSACTION",
+            "SET TRANSACTION READ ONLY",
+            "SET datafusion.execution.batch_size = 1024",
+            "SHOW COLUMNS FROM t",
+            "SHOW FUNCTIONS",
+        ] {
+            let kind = parse_and_classify(sql).expect(sql);
+            assert!(
+                kind.allowed_in_transaction(),
+                "{sql} must run in a transaction"
+            );
+        }
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+            "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE",
+            "CREATE TABLE t2 AS SELECT 1 AS a",
+            "CREATE TABLE t3 (a INT)",
+            "DROP TABLE t",
+            "ALTER TABLE t ADD COLUMN b INT",
+            "CREATE VIEW v AS SELECT 1",
+            "GRANT SELECT ON t TO alice",
+            "TRUNCATE TABLE t",
+            // ALTER TABLE operations and DROPs with no kind of their own
+            // classify as Utility, which only allows named statements.
+            "ALTER TABLE t ADD PARTITION (p = 1)",
+            "DROP SEQUENCE s",
+            "ALTER TABLE t OWNER TO bob",
+            "ALTER TABLE t ADD CONSTRAINT pk PRIMARY KEY (a)",
+            "CALL system.expire_snapshots(table => 't')",
+            "ANALYZE TABLE t COMPUTE STATISTICS",
+        ] {
+            let kind = parse_and_classify(sql).expect(sql);
+            assert!(
+                !kind.allowed_in_transaction(),
+                "{sql} must be refused in a transaction"
+            );
+        }
     }
 
     #[test]

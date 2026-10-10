@@ -65,6 +65,11 @@ pub struct Session {
     /// `iceberg.compression_codec` Trino session property (`X-Trino-Session`).
     /// When set, write paths use it instead of `config.catalog.parquet_compression`.
     pub compression_codec: Option<String>,
+    /// The explicit transaction this session is in, if any. Trino carries it
+    /// in `X-Trino-Transaction-Id`; Flight SQL sets it on the stored session
+    /// at `BEGIN`. SQE writes only in autocommit (#820): inside a transaction
+    /// reads run and any write or DDL is refused.
+    pub transaction_id: Option<String>,
     /// Explicit, internal write-authority marker for the in-process
     /// maintenance principal (Phase 4b active auto-compaction).
     ///
@@ -132,6 +137,7 @@ impl Session {
             peer_ip: None,
             write_branch: None,
             compression_codec: None,
+            transaction_id: None,
             maintenance_authority: false,
         }
     }
@@ -209,6 +215,14 @@ impl Session {
     #[must_use = "with_compression_codec consumes self; bind the returned Session"]
     pub fn with_compression_codec(mut self, codec: Option<String>) -> Self {
         self.compression_codec = codec;
+        self
+    }
+
+    /// Returns a new session in the given explicit transaction (`None` is
+    /// autocommit).
+    #[must_use = "with_transaction_id consumes self; bind the returned Session"]
+    pub fn with_transaction_id(mut self, transaction_id: Option<String>) -> Self {
+        self.transaction_id = transaction_id;
         self
     }
 
