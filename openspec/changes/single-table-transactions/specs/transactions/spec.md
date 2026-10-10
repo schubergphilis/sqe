@@ -74,7 +74,7 @@ The system SHALL refuse every way to name a `sqe-txn-*` branch or a snapshot rea
 - **THEN** the transaction's branch and its private snapshots are not listed
 
 #### Scenario: Write branch
-- **WHEN** a session runs `SET WRITE_BRANCH 'sqe-txn-<id>'`, or any branch DDL on a `sqe-txn-*` name
+- **WHEN** a session runs `SET WRITE_BRANCH 'sqe-txn-<id>'`, or `CREATE BRANCH` / `CREATE TAG` with a `sqe-txn-*` name
 - **THEN** the statement fails
 
 ### Requirement: Transaction ids are owned
