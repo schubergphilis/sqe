@@ -5,7 +5,7 @@
 #
 # This file exists for callers that still pass `-f Dockerfile.bench`.
 
-ARG RUST_VERSION=1.97.1
+ARG RUST_VERSION=1.99.0
 
 FROM rust:${RUST_VERSION}-bookworm AS builder
 
