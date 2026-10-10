@@ -134,6 +134,11 @@ class SQEConnectionManager(SQLConnectionManager):
             if db_kwargs:
                 kwargs["db_kwargs"] = db_kwargs
 
+            # SQE commits every statement on its own (Iceberg single-statement
+            # writes, #820). autocommit=True says so up front: ADBC skips the
+            # failing set_autocommit(False) and its "Cannot disable autocommit"
+            # warning, and the handle's commit()/rollback() become no-ops.
+            kwargs["autocommit"] = True
             connection.handle = _Handle(connect(**kwargs))
             connection.state = "open"
         except Exception as e:
@@ -141,6 +146,26 @@ class SQEConnectionManager(SQLConnectionManager):
             connection.state = "fail"
             raise DbtRuntimeError(f"Failed to connect to SQE at {uri}: {e}") from e
 
+        return connection
+
+    # SQE has no multi-statement transactions: each statement autocommits,
+    # and a write inside an explicit BEGIN is refused (#820). dbt-adapters
+    # sends BEGIN / COMMIT as SQL around every model, so keep its
+    # transaction_open bookkeeping and send nothing, as dbt-trino does.
+    def add_begin_query(self):
+        pass
+
+    def add_commit_query(self):
+        pass
+
+    def begin(self):
+        connection = self.get_thread_connection()
+        connection.transaction_open = True
+        return connection
+
+    def commit(self):
+        connection = self.get_thread_connection()
+        connection.transaction_open = False
         return connection
 
     def cancel(self, connection: Connection):
