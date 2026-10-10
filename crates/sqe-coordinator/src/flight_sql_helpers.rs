@@ -99,6 +99,9 @@ pub(crate) fn sqe_error_to_status(
         sqe_core::SqeErrorCode::StorageCredentialsUnavailable => tonic::Code::Unauthenticated,
         sqe_core::SqeErrorCode::CircuitBreakerOpen => tonic::Code::FailedPrecondition,
         sqe_core::SqeErrorCode::CommitConflict => tonic::Code::Aborted,
+        // A write inside BEGIN: the session state, not the statement, is
+        // wrong; COMMIT or ROLLBACK and retry (#820).
+        sqe_core::SqeErrorCode::AutocommitWriteConflict => tonic::Code::FailedPrecondition,
         // Explicit arm for `CatalogError` (previously fell through to the
         // catch-all `_ => Internal`). Operators still see Internal — but
         // it's now documented as a real catalog error, distinct from the

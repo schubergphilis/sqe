@@ -236,11 +236,18 @@ pub struct UpdatedSessionState {
     pub clear_session: Vec<String>,
     pub added_prepare: Vec<(String, String)>,
     pub deallocated_prepare: Vec<String>,
+    /// `START TRANSACTION`: the id the client replays in
+    /// `X-Trino-Transaction-Id` until COMMIT / ROLLBACK (#820).
+    pub started_transaction_id: Option<String>,
+    /// `COMMIT` / `ROLLBACK`: the client drops its transaction id.
+    pub clear_transaction_id: bool,
 }
 
 impl UpdatedSessionState {
     pub fn is_empty(&self) -> bool {
-        self.set_catalog.is_none()
+        self.started_transaction_id.is_none()
+            && !self.clear_transaction_id
+            && self.set_catalog.is_none()
             && self.set_schema.is_none()
             && self.set_session.is_empty()
             && self.clear_session.is_empty()

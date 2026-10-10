@@ -459,6 +459,9 @@ pub enum SqeErrorCode {
     /// working while every scan fails with this.
     StorageCredentialsUnavailable,
     CommitConflict,
+    /// A write or DDL statement inside an explicit transaction. SQE writes
+    /// only in autocommit, as Trino's Iceberg connector does (#820).
+    AutocommitWriteConflict,
     // Feature support
     NotSupported,
     // Catch-all
@@ -493,6 +496,7 @@ impl SqeErrorCode {
                 | SqeErrorCode::AccessDenied
                 | SqeErrorCode::SessionExpired
                 | SqeErrorCode::NotSupported
+                | SqeErrorCode::AutocommitWriteConflict
                 | SqeErrorCode::QueryCancelled
         )
     }
@@ -528,6 +532,7 @@ impl SqeErrorCode {
             SqeErrorCode::StorageError => "STORAGE_ERROR",
             SqeErrorCode::StorageCredentialsUnavailable => "STORAGE_CREDENTIALS_UNAVAILABLE",
             SqeErrorCode::CommitConflict => "COMMIT_CONFLICT",
+            SqeErrorCode::AutocommitWriteConflict => "AUTOCOMMIT_WRITE_CONFLICT",
             SqeErrorCode::NotSupported => "NOT_SUPPORTED",
             SqeErrorCode::InternalError => "GENERIC_INTERNAL_ERROR",
         }
@@ -564,6 +569,8 @@ impl SqeErrorCode {
             SqeErrorCode::StorageError => 65601,
             SqeErrorCode::StorageCredentialsUnavailable => 65605,
             SqeErrorCode::CommitConflict => 65602,
+            // Trino `StandardErrorCode.AUTOCOMMIT_WRITE_CONFLICT`.
+            SqeErrorCode::AutocommitWriteConflict => 25,
             SqeErrorCode::NotSupported => 100,
             SqeErrorCode::InternalError => 65540,
         }

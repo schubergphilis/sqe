@@ -161,7 +161,7 @@ empty result.
 ## Limitations
 
 - The Trino endpoint returns results as JSON (Trino wire format), not Arrow. For maximum performance, use Flight SQL.
-- Transaction control (`START TRANSACTION`, `COMMIT`) is not supported. Queries execute in auto-commit mode.
+- Transactions are autocommit-only, as in Trino's Iceberg connector. `START TRANSACTION` (what JDBC sends after `setAutoCommit(false)`) answers with `X-Trino-Started-Transaction-Id`, and `COMMIT` / `ROLLBACK` with `X-Trino-Clear-Transaction-Id`. Inside the transaction reads run, and a write or DDL statement fails with `AUTOCOMMIT_WRITE_CONFLICT` ("Catalog only supports writes using autocommit"). `SNAPSHOT` isolation and savepoints are refused.
 - Type mapping covers common types; complex nested types may differ from native Trino behavior.
 - Iceberg hidden columns (`$path`, `$file_modified_time`, `$partition`) are not exposed on table scans. They need a per-row, per-source-file column that is resolvable by name but excluded from `SELECT *`. DataFusion has no such metadata-column mechanism yet (tracked upstream at apache/datafusion#20135, not in any release), and adding the column to the scan schema would make every `SELECT *` return it. For file-level introspection use the `table_files('ns', 't')` table function, which lists `file_path`, `record_count`, and `file_size_in_bytes` per data file.
 - Materialized views are not supported. `CREATE MATERIALIZED VIEW` returns a clear "not supported" error rather than creating a plain view. `DROP MATERIALIZED VIEW IF EXISTS` is treated as a no-op so client tooling that issues it on teardown can proceed.

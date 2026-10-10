@@ -908,6 +908,30 @@ impl QueryHandler {
     /// `["service_admin", "catalog_admin"]`). An empty allowlist
     /// fails closed for every caller — operators must populate it
     /// before any admin statement succeeds. Issue #3.
+    /// Start (`Some`) or end (`None`) the explicit transaction on the stored
+    /// session (#820). Without a session manager (the Trino HTTP layer, MCP)
+    /// the protocol carries the transaction, so there is nothing to store.
+    fn set_session_transaction(
+        &self,
+        session: &Session,
+        transaction_id: Option<String>,
+    ) -> sqe_core::Result<()> {
+        let Some(ref manager) = self.session_manager else {
+            tracing::debug!(
+                "transaction control without a session manager; \
+                 the protocol layer carries the transaction in this mode"
+            );
+            return Ok(());
+        };
+        if !manager.set_transaction_id(&session.id, transaction_id) {
+            return Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                "transaction control: session not found in manager".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn require_admin(&self, session: &Session, statement: &str) -> sqe_core::Result<()> {
         if self.config.auth.has_admin_role(&session.user.roles) {
             return Ok(());
@@ -1220,6 +1244,13 @@ impl QueryHandler {
         };
         let kind = classify_user_sql(session, sql).map_err(failed)?;
         let kind_name = kind.name().to_string();
+
+        // #820: SQE writes only in autocommit. Inside an explicit
+        // transaction (Trino `X-Trino-Transaction-Id`, or BEGIN on a stored
+        // Flight session) a write is refused before it can touch a table.
+        if session.transaction_id.is_some() && !kind.allowed_in_transaction() {
+            return Err(failed(autocommit_write_conflict(session)));
+        }
 
         // Issue #408: cap concurrent sorted writes so several CTAS ORDER BY
         // cannot starve ExternalSorterMerge on a greedy pool. Classify from
@@ -2277,11 +2308,30 @@ impl QueryHandler {
                         .await
                 }
 
-                // Transaction stubs — no-ops for JDBC tools that use setAutoCommit(false)
-                StatementKind::Begin | StatementKind::Commit | StatementKind::Rollback => {
-                    tracing::debug!("Transaction stubs: BEGIN/COMMIT/ROLLBACK are no-ops");
+                // Explicit transactions (#820). The Trino HTTP layer answers
+                // these itself through X-Trino-Started/Clear-Transaction-Id;
+                // on Flight SQL the transaction lives on the stored session,
+                // as USE's scope does. Writes inside one are refused above,
+                // so COMMIT and ROLLBACK have nothing to apply or undo.
+                StatementKind::Begin => {
+                    if session.transaction_id.is_some() {
+                        return Err(SqeError::with_code(
+                            SqeErrorCode::NotSupported,
+                            "Nested transactions not supported".to_string(),
+                        ));
+                    }
+                    self.set_session_transaction(session, Some(uuid::Uuid::new_v4().to_string()))?;
                     Ok(vec![])
                 }
+                StatementKind::Commit | StatementKind::Rollback => {
+                    // Lenient without a transaction: dbt-adapters and other
+                    // DB-API clients send COMMIT after autocommit statements.
+                    if session.transaction_id.is_some() {
+                        self.set_session_transaction(session, None)?;
+                    }
+                    Ok(vec![])
+                }
+                StatementKind::SetTransaction => Ok(vec![]),
 
                 // USE [catalog.]schema — session scope switch (review 707).
                 // The Trino HTTP layer is stateless and carries the scope back
@@ -9720,6 +9770,17 @@ fn namespaces_or_empty_on_denial(
 /// quotes preserved) into `(catalog, schema)`. Mirrors the Trino layer's
 /// reading of the same statement: one part is a schema, two parts are
 /// catalog and schema, anything else is a user error.
+/// Trino's `AUTOCOMMIT_WRITE_CONFLICT` for a write inside an explicit
+/// transaction (#820), worded as Trino's `InMemoryTransactionManager` words
+/// it, naming the session catalog when there is one.
+fn autocommit_write_conflict(session: &Session) -> SqeError {
+    let message = match session.default_catalog.as_deref() {
+        Some(catalog) => format!("Catalog only supports writes using autocommit: {catalog}"),
+        None => "Catalog only supports writes using autocommit".to_string(),
+    };
+    SqeError::with_code(SqeErrorCode::AutocommitWriteConflict, message)
+}
+
 fn parse_use_target(target: &str) -> sqe_core::Result<(Option<String>, String)> {
     let unquote = |part: &str| -> String {
         let p = part.trim();
@@ -9982,6 +10043,67 @@ mod show_stats_policy_tests {
                 err.to_string().contains("table not found: sales.orders"),
                 "{sql}: {err}"
             );
+        }
+    }
+
+    /// Inside a transaction (#820) writes and DDL are refused with
+    /// AUTOCOMMIT_WRITE_CONFLICT before planning, while transaction control
+    /// statements still answer.
+    #[tokio::test]
+    async fn writes_inside_a_transaction_are_autocommit_write_conflicts() {
+        use crate::query_tracker::QueryTracker;
+        use crate::runtime_catalog::RuntimeCatalogRegistry;
+        use std::sync::Arc;
+
+        let config: sqe_core::SqeConfig =
+            toml::from_str("[coordinator]\n\n[auth]\n\n[catalog]\ncatalog_url = \"\"\n")
+                .expect("config parses");
+        let handler = super::QueryHandler::new(
+            Arc::new(sqe_policy::PassthroughEnforcer),
+            None,
+            config.clone(),
+            None,
+            None,
+            None,
+            None,
+            Arc::new(QueryTracker::new(&config.query_history)),
+            None,
+            None,
+            None,
+            RuntimeCatalogRegistry::new(),
+            sqe_core::SecretStore::new(),
+        )
+        .expect("QueryHandler::new");
+        let session = sqe_core::Session::new(
+            "analyst".to_string(),
+            sqe_core::SecretString::new("tok".to_string()),
+            None,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            Vec::new(),
+        )
+        .with_catalog(Some("iceberg".to_string()))
+        .with_transaction_id(Some("tx-1".to_string()));
+
+        for sql in [
+            "INSERT INTO sales.orders VALUES (1)",
+            "DELETE FROM sales.orders",
+            "CREATE TABLE sales.t (a INT)",
+            "DROP TABLE sales.orders",
+        ] {
+            let err = handler.execute(&session, sql, None).await.expect_err(sql);
+            assert_eq!(
+                err.error_code(),
+                sqe_core::SqeErrorCode::AutocommitWriteConflict,
+                "{sql}: {err}"
+            );
+            assert!(
+                err.to_string()
+                    .contains("Catalog only supports writes using autocommit: iceberg"),
+                "{sql}: {err}"
+            );
+        }
+        for sql in ["SET TRANSACTION ISOLATION LEVEL READ COMMITTED", "COMMIT"] {
+            handler.execute(&session, sql, None).await.expect(sql);
         }
     }
 }
