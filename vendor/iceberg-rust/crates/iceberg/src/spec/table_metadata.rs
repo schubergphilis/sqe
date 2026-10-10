@@ -346,6 +346,29 @@ impl TableMetadata {
         })
     }
 
+    /// A read view of this metadata in which `main` and the current snapshot
+    /// are `ref_name`'s head. Every other field, including `ref_name` itself,
+    /// is unchanged.
+    ///
+    /// SQE PATCH (#821): a transaction writes to its own branch, and every
+    /// statement in it must read that branch as if it were `main`. Never
+    /// commit a change computed from `main` in this view: it is not the
+    /// catalog's `main`.
+    pub fn pinned_to_ref(&self, ref_name: &str) -> Option<TableMetadata> {
+        let reference = self.refs.get(ref_name)?.clone();
+        let mut pinned = self.clone();
+        pinned.current_snapshot_id = Some(reference.snapshot_id);
+        pinned.refs.insert(MAIN_BRANCH.to_string(), SnapshotReference {
+            snapshot_id: reference.snapshot_id,
+            retention: pinned
+                .refs
+                .get(MAIN_BRANCH)
+                .map(|r| r.retention.clone())
+                .unwrap_or(reference.retention),
+        });
+        Some(pinned)
+    }
+
     /// Lookup the [`SnapshotReference`] (branch or tag metadata) by name.
     ///
     /// Unlike [`Self::snapshot_for_ref`], this returns the reference envelope,

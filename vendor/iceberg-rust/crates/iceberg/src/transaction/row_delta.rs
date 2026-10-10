@@ -38,7 +38,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
+use crate::spec::{DataFile, MAIN_BRANCH, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
     DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
@@ -74,6 +74,8 @@ pub struct RowDeltaAction {
     snapshot_properties: HashMap<String, String>,
     /// Starting snapshot ID for optimistic concurrency control.
     starting_snapshot_id: Option<i64>,
+    /// Branch to commit to; `None` means `main`.
+    target_branch: Option<String>,
 }
 
 impl RowDeltaAction {
@@ -86,6 +88,7 @@ impl RowDeltaAction {
             commit_uuid: None,
             snapshot_properties: HashMap::default(),
             starting_snapshot_id: None,
+            target_branch: None,
         }
     }
 
@@ -137,6 +140,17 @@ impl RowDeltaAction {
         self.starting_snapshot_id = Some(snapshot_id);
         self
     }
+
+    /// Set the branch this row delta commits to.
+    ///
+    /// SQE PATCH (#821): `FastAppendAction` and `RewriteFilesAction` take a
+    /// target branch; this brings `RowDeltaAction` in line so a transaction
+    /// can stage every kind of write on its own branch.
+    /// [`Self::validate_from_snapshot`] then checks the branch head, not `main`.
+    pub fn set_target_branch(mut self, target_branch: String) -> Self {
+        self.target_branch = Some(target_branch);
+        self
+    }
 }
 
 #[async_trait]
@@ -154,16 +168,20 @@ impl TransactionAction for RowDeltaAction {
             ));
         }
 
-        // Conflict detection: table must still be at the expected snapshot.
+        // Conflict detection: the target branch must still be at the
+        // expected snapshot.
+        let branch = self.target_branch.as_deref().unwrap_or(MAIN_BRANCH);
+        let branch_head = table
+            .metadata()
+            .snapshot_for_ref(branch)
+            .map(|s| s.snapshot_id());
         if let Some(expected_snapshot_id) = self.starting_snapshot_id
-            && table.metadata().current_snapshot_id() != Some(expected_snapshot_id)
+            && branch_head != Some(expected_snapshot_id)
         {
             return Err(crate::Error::new(
                 crate::ErrorKind::DataInvalid,
                 format!(
-                    "RowDelta conflict: expected snapshot {}, current {:?}",
-                    expected_snapshot_id,
-                    table.metadata().current_snapshot_id()
+                    "RowDelta conflict: expected snapshot {expected_snapshot_id}, current {branch_head:?}"
                 ),
             ));
         }
@@ -181,6 +199,10 @@ impl TransactionAction for RowDeltaAction {
             self.removed_data_files.clone(),
             self.removed_delete_files.clone(),
         );
+
+        if let Some(target_branch) = &self.target_branch {
+            snapshot_producer.set_target_branch(target_branch.clone());
+        }
 
         snapshot_producer.validate_added_files(&self.added_data_files)?;
         snapshot_producer.validate_added_files(&self.added_delete_files)?;
@@ -397,6 +419,61 @@ mod tests {
             Ok(_) => panic!("expected DataInvalid error for stale snapshot"),
             Err(e) => assert_eq!(e.kind(), crate::ErrorKind::DataInvalid),
         }
+    }
+
+    /// Applies `action` to `table` the way `Transaction::do_commit` does and
+    /// returns the updated table.
+    async fn apply_row_delta(
+        table: crate::table::Table,
+        action: super::RowDeltaAction,
+    ) -> crate::table::Table {
+        let commit = Arc::new(action).commit(&table).await.unwrap();
+        Transaction::apply(table, commit, &mut vec![], &mut vec![]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_row_delta_target_branch_chains_on_the_branch() {
+        let table = make_v2_minimal_table();
+        let branch = "sqe-txn-1".to_string();
+
+        // First write creates the branch; main stays without a snapshot.
+        let first = Transaction::new(&table)
+            .row_delta()
+            .set_target_branch(branch.clone())
+            .add_data_files(vec![data_file("test/1.parquet")]);
+        let table = apply_row_delta(table, first).await;
+        let first_id = table.metadata().snapshot_for_ref(&branch).unwrap().snapshot_id();
+        assert_eq!(table.metadata().current_snapshot_id(), None);
+
+        // Second write validates against and chains on the branch head.
+        let second = Transaction::new(&table)
+            .row_delta()
+            .set_target_branch(branch.clone())
+            .validate_from_snapshot(first_id)
+            .add_delete_files(vec![equality_delete_file("test/del.parquet")]);
+        let table = apply_row_delta(table, second).await;
+        let head = table.metadata().snapshot_for_ref(&branch).unwrap();
+        assert_ne!(head.snapshot_id(), first_id);
+        assert_eq!(head.parent_snapshot_id(), Some(first_id));
+        assert_eq!(table.metadata().current_snapshot_id(), None);
+    }
+
+    #[tokio::test]
+    async fn test_row_delta_target_branch_stale_branch_is_a_conflict() {
+        let table = make_v2_minimal_table();
+        let first = Transaction::new(&table)
+            .row_delta()
+            .set_target_branch("b".to_string())
+            .add_data_files(vec![data_file("test/1.parquet")]);
+        let table = apply_row_delta(table, first).await;
+
+        let stale = Transaction::new(&table)
+            .row_delta()
+            .set_target_branch("b".to_string())
+            .validate_from_snapshot(99999)
+            .add_data_files(vec![data_file("test/2.parquet")]);
+        let err = Arc::new(stale).commit(&table).await.err().unwrap();
+        assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
     }
 
     #[tokio::test]
