@@ -18,7 +18,7 @@
 FROM lukemathwalker/cargo-chef:latest-rust-bookworm@sha256:2ee6e8edf0b91b5a7295071299596601710bccb243bd9735e0b9abf6e114582b AS cargo-chef-bin
 
 # Renovate's "container images" group bumps tag and digest together; the rust tag must match rust-toolchain.toml.
-FROM rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS chef
+FROM rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 AS chef
 
 ARG TARGETARCH
 ARG SCCACHE_VERSION=0.9.0
