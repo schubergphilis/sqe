@@ -102,6 +102,9 @@ pub(crate) fn sqe_error_to_status(
         // A write inside BEGIN: the session state, not the statement, is
         // wrong; COMMIT or ROLLBACK and retry (#820).
         sqe_core::SqeErrorCode::AutocommitWriteConflict => tonic::Code::FailedPrecondition,
+        // The whole transaction lost a race and was rolled back; retrying
+        // it from BEGIN can succeed (#821).
+        sqe_core::SqeErrorCode::TransactionConflict => tonic::Code::Aborted,
         // Explicit arm for `CatalogError` (previously fell through to the
         // catch-all `_ => Internal`). Operators still see Internal — but
         // it's now documented as a real catalog error, distinct from the

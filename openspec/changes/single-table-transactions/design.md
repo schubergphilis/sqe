@@ -4,14 +4,14 @@
 
 | | Staged actions (issue text) | Branch per transaction (chosen) |
 |---|---|---|
-| Read-your-writes | New scan: base snapshot + staged data files - staged deletes (#822 from scratch) | Scan the branch head through the existing time-travel provider |
+| Read-your-writes | New scan: base snapshot + staged data files - staged deletes (#822 from scratch) | Load the table pinned to the branch head; existing scans |
 | Per-statement write path | Must stop before commit and hand back an action | Unchanged; each statement commits to the branch |
 | Conflict detection at COMMIT | Must patch `do_commit` to stop rebasing | Requirement fixed in the publish action; a rebase cannot drop it |
 | Catalog backends | Any | Any (vendored action, not a REST-only POST) |
-| Crash leftovers | Orphan data files only | A `sqe-txn-*` branch plus its files; swept by name and age |
-| Uncommitted data visible to others | No | Through `$refs` / time travel, under the same policies |
+| Crash leftovers | Orphan data files only | A `sqe-txn-*` branch plus its files; dropped by name |
+| Uncommitted data visible to others | No | Not through SQE (refused, see Exposure block); visible to engines reading the catalog directly |
 
-The staged design keeps uncommitted data out of the table metadata, but it costs a second scan path and a change to every write path, where the branch design reuses both. The visibility of the branch is a disclosure to principals who can already `SELECT` the table, and it can be closed later.
+The staged design keeps uncommitted data out of the table metadata, but it costs a second scan path and a change to every write path, where the branch design reuses both. The branch puts uncommitted data in the table metadata, so SQE refuses every way a user could name it.
 
 ## Vendored iceberg-rust findings
 
@@ -20,38 +20,54 @@ The staged design keeps uncommitted data out of the table metadata, but it costs
 - `Transaction::create_branch` and `RemoveRefAction` exist (`transaction/branch.rs`).
 - `TableCommit::builder().build()` is `pub(crate)`, which is why SQE's schema path POSTs raw REST JSON (`catalog_ops.rs:760`). Publishing through a vendored action avoids a REST-only path.
 - SQE calls `fast_append` (~11 sites), `row_delta` (~7) and `rewrite_files` (~6), test code included; every one needs the branch applied.
+- New: `Table::pinned_to_ref(name)` returns the table with `main` read as the named ref, and `TableCommit::updates()` exposes a commit's updates so the session catalog can inspect which refs it sets.
 
 ## Components
 
-### Transaction state (`sqe-coordinator`)
+### Transaction scope (`sqe-catalog::txn`)
 
 ```rust
-pub struct TxnState {
-    pub id: String,                    // == Session::transaction_id
-    pub owner: String,                 // username; the token never leaves the session
-    pub deadline: Instant,             // min(txn timeout, token expiry)
-    pub table: Option<TxnTable>,       // set by the first write
-}
-
 pub struct TxnTable {
-    pub catalog: String,
+    pub table_uuid: Uuid,              // the table is matched by UUID, not name
     pub ident: TableIdent,
     pub base_snapshot_id: Option<i64>, // None = table had no snapshot
     pub branch: String,                // "sqe-txn-<id>"
 }
+
+pub struct TxnScope {
+    id: String,
+    table: Mutex<Option<TxnTable>>,           // set by the first write
+    catalog: Mutex<Option<Arc<dyn Catalog>>>, // bound by each branch commit
+}
 ```
 
-It is held in the `SessionManager`, next to `transaction_id`. Over Trino, where the session is rebuilt from headers on every request, the coordinator keeps a `TxnRegistry: id -> TxnState` instead, and the header id is the lookup key. That is also where #824 plugs in.
+A statement runs inside `txn::scope(Option<Arc<TxnScope>>, fut)`, a tokio task-local. `scope(None, ..)` shadows an outer scope; COMMIT and ROLLBACK run that way, because the session catalog refuses to move `main` from inside a scope.
+
+### Transaction registry (`sqe-coordinator::txn_registry`)
+
+`TxnRegistry: id -> { owner, scope, last_used }` on the `QueryHandler`. Every protocol keys it by `Session::transaction_id`; over Trino that id comes from the client header on every request, so the registry is the only server-side state (and where #824 plugs in).
+
+- The id must be a UUID (it becomes a branch name); anything else is `InvalidArguments`.
+- An id belongs to the user who first used it; another user gets `unknown transaction`.
+- A transaction idle for 30 minutes is swept and its branch dropped.
+- An ended id is kept as a tombstone for 24 hours; using it again is `TransactionConflict: has ended`, so a client that missed the clear header cannot silently start a new transaction under the old id.
 
 ### Write path (`sqe-write`)
 
-`WriteContext` gains `target_branch: Option<String>`. Every `tx.fast_append()`, `tx.row_delta()` and `tx.rewrite_files()` call applies it when it is set. `commit_with_retry` is unchanged: it reloads the table, and the producer reads `snapshot_for_ref(branch)`. The silent rebase in `do_commit` is harmless on a branch only this transaction writes.
+`commit::txn_target_branch(catalog, ident)` returns the transaction's branch when the statement runs inside a scope. Every `fast_append`, `row_delta` and `rewrite_files` site applies it. `commit_with_retry` is unchanged: it reloads the table, and the producer reads `snapshot_for_ref(branch)`. The silent rebase in `do_commit` is harmless on a branch only this transaction writes.
 
-On the first write the coordinator creates the branch at `main`'s current snapshot, with `create_branch(name).with_snapshot_id(base)`. A table with no snapshot gets an empty branch; the vendored `SnapshotProducer` handles a missing parent.
+The first write creates the branch at `main`'s current snapshot with `create_branch(name).with_snapshot_id(base)`. A table with no snapshot gets no branch up front; the first write commit creates it, and the vendored `SnapshotProducer` handles the missing parent.
+
+`txn::check_target(ident)` runs at the top of every DML handler, so a write to a second table fails before it writes any file.
 
 ### Read path
 
-During planning, a scan of `TxnTable.ident` inside the transaction resolves `snapshot_for_ref(branch)` and registers the provider with `with_snapshot_id(head)`. This is the same mechanism `FOR VERSION AS OF` uses (`query_handler.rs:6127`). Session caches are keyed so a pinned provider never serves a non-transaction read.
+Inside a scope, the session catalog loads the transaction's table (matched by UUID) as `Table::pinned_to_ref(branch)`. Every reader — plain scans and the target scans inside DELETE / UPDATE / MERGE — sees the branch head with no change to the scan code. The result cache is bypassed and prepared plans are not cached inside a transaction, so a pinned plan never serves a non-transaction read.
+
+### Session catalog bridge
+
+- Inside a scope, a commit that sets `main` is refused (it would publish part of the transaction).
+- A commit that sets the scope's branch binds the scope to that catalog, so COMMIT and ROLLBACK reach the table as the same principal, with the latest token.
 
 ### Publish (`COMMIT`)
 
@@ -60,27 +76,34 @@ New vendored action `PublishBranchAction { branch, expected_main: Option<i64> }`
 - updates: `SetSnapshotRef(main -> head(branch))`, `RemoveSnapshotRef(branch)`
 - requirements: `AssertRefSnapshotId(main, expected_main)`, `AssertRefSnapshotId(branch, head)`
 
-The requirements are fixed when the action is built, so the reload in `do_commit` cannot weaken them. A requirement failure maps to `SqeErrorCode::SerializationFailure` (new; Trino `TRANSACTION_CONFLICT`, SQLSTATE `40001`), the branch is removed, and the transaction ends.
+The requirements are fixed when the action is built, so the reload in `do_commit` cannot weaken them. A requirement failure (`PreconditionFailed` from the check in `commit()`, or a catalog `CommitFailed`) maps to `SqeErrorCode::TransactionConflict` (new; Trino error code 17 `TRANSACTION_CONFLICT`, gRPC `Aborted`). The branch is dropped and the transaction ends. Any other failure keeps the transaction open (`TxnRegistry::reopen`), so the client can retry `COMMIT` or send `ROLLBACK`.
 
-If the transaction wrote nothing, `COMMIT` clears the state and makes no catalog call.
+On success the query cache and the owner's session cache are invalidated. If the transaction wrote nothing, `COMMIT` clears the state and makes no catalog call.
 
-### Cleanup (`ROLLBACK`, timeout, session end, token expiry)
+### Cleanup (`ROLLBACK`, idle timeout)
 
-1. Collect the data and delete files added by the snapshots on the branch that are not ancestors of the base.
-2. Commit `RemoveSnapshotRef(branch)`.
-3. Delete the collected files.
+Commit `RemoveSnapshotRef(branch)`. The files the branch's snapshots added are no longer reachable from any ref; the orphan-file procedure removes them. A failed drop is logged and leaves the branch for a manual `ALTER TABLE ... DROP BRANCH`.
 
-If step 3 fails, the files are orphans, and the existing orphan-file procedure removes them later.
+Deferred: a sweep of `sqe-txn-*` branches left by a crashed coordinator, and dropping the branch when the session ends or the token expires.
 
-A background sweep removes `sqe-txn-*` branches whose transaction is unknown to this coordinator and whose newest snapshot is older than the transaction timeout.
+### Exposure block
+
+A `sqe-txn-*` branch holds uncommitted data, so SQE refuses it everywhere it can be named:
+
+- `FOR VERSION AS OF 'sqe-txn-…'`, and `FOR VERSION AS OF <id>` / incremental reads of a snapshot reachable only from a transaction branch (`txn_private_snapshots`).
+- `CREATE BRANCH / TAG` from such a snapshot, branch DDL on a `sqe-txn-*` name, and `SET WRITE_BRANCH 'sqe-txn-…'`.
+- `$snapshots` leaves those snapshots out; `$refs` leaves the branches out.
+
+A session with a `WRITE_BRANCH` set cannot write inside a transaction (`NotSupported`): transactions publish to `main`.
 
 ### Wire protocols
 
-- **Flight SQL.** `BeginTransaction` returns the id and stores the `TxnState`. `EndTransaction{COMMIT|ROLLBACK}` publishes or cleans up. `CommandStatement*` / `CommandPreparedStatement*` with a `transaction_id` must match the session's id, or fail with `InvalidArgument`. SqlInfo: 8 = `SQL_SUPPORTED_TRANSACTION_TRANSACTION`, 563 = true, 564 = `SERIALIZABLE`. 11 (`SQL_DATA_DEFINITION_CAUSES_TRANSACTION_COMMIT`) is false, because DDL is refused.
-- **Trino.** `START TRANSACTION` creates the `TxnState` in the registry. The `allowed_in_transaction` guard is relaxed to allow DML (not DDL). `COMMIT` / `ROLLBACK` publish or clean up before answering with the clear header.
+- **Flight SQL.** SQL `BEGIN` / `COMMIT` / `ROLLBACK` on the stored session, as since #820. The `BeginTransaction` / `EndTransaction` actions and the `transaction_id` field on commands are deferred; `CommandStatementIngest` is refused inside a transaction (`FailedPrecondition`).
+- **Trino.** The `allowed_in_transaction` guard allows DML (not DDL, CTAS, grants or procedures). `COMMIT` / `ROLLBACK` inside a transaction go to the executor, which publishes or drops the branch; the clear-transaction header is sent only when that succeeds. After a failed `COMMIT` the client sends `ROLLBACK`, which ends the transaction.
+- **Hive external tables** have no branches; a write to one inside a transaction is `AUTOCOMMIT_WRITE_CONFLICT`.
 
 ### Security and audit
 
 - Policy is evaluated per statement at execution time, as today. The publish needs no new privilege: it moves a ref the user's own writes created, on a table they could write.
-- The token is the user's own. When it expires the transaction aborts; there is no service identity to fall back to.
-- OCSF audit events for begin, commit (with the published snapshot ids) and rollback. Lineage is recorded at `COMMIT`.
+- The token is the user's own. When it expires the publish fails and the transaction stays open; there is no service identity to fall back to.
+- Deferred: OCSF audit events for begin, commit (with the published snapshot ids) and rollback; lineage recorded at `COMMIT`.
