@@ -29,6 +29,7 @@ pub mod read_csv;
 pub mod rest_catalog;
 pub mod runtime_bridge;
 mod send_erased;
+pub mod txn;
 pub mod vended_credentials;
 pub mod session_tuning;
 pub mod eliminate_cross_join;

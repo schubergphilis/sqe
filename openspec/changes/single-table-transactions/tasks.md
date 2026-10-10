@@ -1,0 +1,40 @@
+## 1. Vendored iceberg-rust
+
+- [x] 1.1 `RowDeltaAction::set_target_branch`, mirroring `FastAppendAction` (field, setter, `snapshot_producer.set_target_branch`)
+- [x] 1.2 `PublishBranchAction { branch, expected_main }`: `SetSnapshotRef(main)` + `RemoveSnapshotRef(branch)`, with requirements `AssertRefSnapshotId(main, expected_main)` and `AssertRefSnapshotId(branch, head)`
+- [x] 1.3 Vendored unit tests: a row delta lands on the branch; publishing fails when `main` moved; publishing an empty branch is a fast-forward to the base
+
+## 2. Write path
+
+- [x] 2.1 Target branch applied at every `fast_append` / `row_delta` / `rewrite_files` site (`commit::txn_target_branch`, from the task-local scope rather than a write-context field)
+- [x] 2.2 Create the branch at the base on the first write in a transaction (empty table: the first write commit creates it)
+- [x] 2.3 Refuse a write to a second table: `Multi-table writes not supported in a single transaction`, before any file is written (`txn::check_target`)
+- [ ] 2.4 Session-cache invalidation after a branch write covers the owning session only
+
+## 3. Read path
+
+- [x] 3.1 Pin loads of the transaction's table to the branch head (`Table::pinned_to_ref` in the session catalog, matched by table UUID)
+- [x] 3.2 A pinned table is never served outside the transaction: the pin lives in the task-local scope, the result cache is bypassed and prepared plans are not cached inside a transaction
+- [x] 3.3 Test: `INSERT` then `DELETE ... WHERE` inside one transaction removes the inserted rows
+- [x] 3.4 Exposure block: refuse `sqe-txn-*` refs and branch-private snapshot ids in time travel, incremental reads, ref DDL and `SET WRITE_BRANCH`; hide them from `$snapshots` / `$refs`
+
+## 4. Commit and cleanup
+
+- [x] 4.1 `TxnScope` (task-local) and `TxnRegistry` in the coordinator: UUID ids, owner check, 30-minute idle sweep, 24-hour tombstones for ended ids
+- [x] 4.2 `COMMIT` publishes; a requirement failure becomes `TransactionConflict` (Trino `TRANSACTION_CONFLICT`, gRPC `Aborted`); any other failure keeps the transaction open
+- [~] 4.3 `ROLLBACK` and the idle timeout drop the branch; added files are left to orphan-file cleanup. Session end and token expiry: deferred
+- [ ] 4.4 Sweep stale `sqe-txn-*` branches left by a crashed coordinator
+- [ ] 4.5 Verify that orphan-file cleanup treats files reachable from any ref as live
+
+## 5. Wire protocols
+
+- [ ] 5.1 Flight SQL `BeginTransaction` / `EndTransaction`; `transaction_id` honoured on statement, update, ingest and prepared commands (deferred; SQL `BEGIN` / `COMMIT` works over Flight, ingest is refused inside a transaction)
+- [ ] 5.2 Flight SqlInfo 8 / 563 / 564 / 11 updated (with 5.1)
+- [x] 5.3 Trino: allow DML inside a transaction (DDL, CTAS and Hive writes stay refused); `COMMIT` / `ROLLBACK` publish or drop the branch, clear header only on success
+- [ ] 5.4 dbt-sqe: decide whether models should run inside a real transaction (separate change)
+
+## 6. Audit, docs, tests
+
+- [ ] 6.1 OCSF events for begin / commit / rollback; lineage at `COMMIT`
+- [ ] 6.2 Book: transactions page (branch model, serializable abort, visibility of in-flight branches, SQE vs Trino connector difference)
+- [~] 6.3 sqlite-rig tests in `sqe-write`: commit, read-your-writes, concurrent-commit abort, rollback, empty table, second-table refusal. Still open: integration tests under `make test-integration`, ADBC `autocommit=False`, Trino JDBC `setAutoCommit(false)`

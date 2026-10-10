@@ -364,18 +364,22 @@ impl StatementKind {
         )
     }
 
-    /// Statements an explicit transaction may run. SQE writes only in
-    /// autocommit, as Trino's Iceberg connector does
-    /// (`isSingleStatementWritesOnly`): inside `START TRANSACTION` reads,
-    /// EXPLAIN and session and transaction control run, and every write,
-    /// DDL, grant or procedure is refused with `AUTOCOMMIT_WRITE_CONFLICT`
+    /// Statements an explicit transaction may run: reads, EXPLAIN, session
+    /// and transaction control, and the DML that writes to the
+    /// transaction's branch (#821). CTAS, DDL, grants and procedures stay
+    /// autocommit only and are refused with `AUTOCOMMIT_WRITE_CONFLICT`
     /// (#820). An allow-list, so a statement kind added later is refused
-    /// until someone decides it cannot write.
+    /// until someone decides how it behaves in a transaction.
     pub fn allowed_in_transaction(&self) -> bool {
         if self.is_read_only() {
             return true;
         }
         match self {
+            StatementKind::Insert(_)
+            | StatementKind::Update(_)
+            | StatementKind::Delete(_)
+            | StatementKind::Merge(_)
+            | StatementKind::Truncate(_) => true,
             StatementKind::Begin
             | StatementKind::Commit
             | StatementKind::Rollback
@@ -2309,8 +2313,13 @@ mod tests {
     }
 
     #[test]
-    fn transactions_allow_reads_and_control_but_not_writes() {
+    fn transactions_allow_reads_control_and_dml_but_not_ddl() {
         for sql in [
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+            "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE",
+            "TRUNCATE TABLE t",
             "SELECT 1",
             "EXPLAIN SELECT 1",
             "SHOW TABLES",
@@ -2331,17 +2340,12 @@ mod tests {
             );
         }
         for sql in [
-            "INSERT INTO t VALUES (1)",
-            "UPDATE t SET a = 1",
-            "DELETE FROM t",
-            "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE",
             "CREATE TABLE t2 AS SELECT 1 AS a",
             "CREATE TABLE t3 (a INT)",
             "DROP TABLE t",
             "ALTER TABLE t ADD COLUMN b INT",
             "CREATE VIEW v AS SELECT 1",
             "GRANT SELECT ON t TO alice",
-            "TRUNCATE TABLE t",
             // ALTER TABLE operations and DROPs with no kind of their own
             // classify as Utility, which only allows named statements.
             "ALTER TABLE t ADD PARTITION (p = 1)",

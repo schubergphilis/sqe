@@ -1060,6 +1060,12 @@ impl CatalogOps {
             }
         };
 
+        // Transaction branches are the coordinator's alone (#821). DROP is
+        // the manual cleanup for a branch a crashed coordinator left.
+        if !is_drop {
+            sqe_catalog::txn::reject_txn_ref(ref_name)?;
+        }
+
         // Reject drop of the reserved main branch early, before any round-trip.
         if is_drop && ref_name == MAIN_BRANCH {
             return Err(SqeError::Execution(
@@ -1924,7 +1930,10 @@ fn ddl_action_label(ddl: &RefDdl) -> &'static str {
 fn resolve_snapshot_id(table: &iceberg::table::Table, given: Option<i64>) -> sqe_core::Result<i64> {
     match given {
         Some(id) => {
-            if table.metadata().snapshot_by_id(id).is_none() {
+            // A ref on an open transaction's snapshot would publish it (#821).
+            if table.metadata().snapshot_by_id(id).is_none()
+                || sqe_catalog::txn::txn_private_snapshots(table.metadata()).contains(&id)
+            {
                 return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "snapshot id {id} not found in table history"
                 )));

@@ -330,6 +330,9 @@ pub struct QueryHandler {
     /// Session manager used for `SET WRITE_BRANCH` mutations.
     /// Optional so in-process tests can construct a QueryHandler without it.
     session_manager: Option<Arc<crate::session_manager::SessionManager>>,
+    /// Open explicit transactions by id (#821). Shared by clones, so the
+    /// Flight SQL and Trino front doors see the same transactions.
+    transactions: Arc<crate::txn_registry::TxnRegistry>,
     /// Process-local registry of catalogs added via SQL `ATTACH`.
     /// Default-constructed registries are empty and impose no behaviour
     /// change for callers that never issue `ATTACH`. Cloning shares the
@@ -576,6 +579,7 @@ impl QueryHandler {
             table_cache: None,
             grant_backend,
             session_manager: None,
+            transactions: Arc::default(),
             runtime_catalogs,
             secrets,
             worker_load: Arc::new(crate::worker_registry::WorkerLoadTracker::new()),
@@ -932,6 +936,55 @@ impl QueryHandler {
         Ok(())
     }
 
+    /// COMMIT (`commit`) or ROLLBACK the session's transaction (#821).
+    ///
+    /// Lenient without a transaction: dbt-adapters and other DB-API
+    /// clients send COMMIT after autocommit statements. COMMIT publishes
+    /// the branch to main; a conflict rolls the transaction back and ends
+    /// it, any other failure (catalog unreachable) keeps it open so the
+    /// client can retry the COMMIT or ROLLBACK. Both run outside the
+    /// transaction's scope, where the bridge allows a commit to main.
+    async fn end_transaction(&self, session: &Session, commit: bool) -> sqe_core::Result<()> {
+        use crate::txn_registry::Ended;
+        use sqe_catalog::txn;
+        let Some(id) = session.transaction_id.as_deref() else {
+            return Ok(());
+        };
+        let owner = &session.user.username;
+        let scope = match self.transactions.end(id, owner)? {
+            Ended::Open(scope) => scope,
+            Ended::Unused => return self.set_session_transaction(session, None),
+            Ended::Already(e) => {
+                self.set_session_transaction(session, None)?;
+                return if commit { Err(e) } else { Ok(()) };
+            }
+        };
+        if !commit {
+            txn::scope(None, txn::discard(&scope)).await;
+            return self.set_session_transaction(session, None);
+        }
+        match txn::scope(None, txn::publish(&scope)).await {
+            Ok(()) => {
+                if scope.table().is_some() {
+                    // Other sessions' cached results predate the publish.
+                    if let Some(ref cache) = self.query_cache {
+                        cache.invalidate_all();
+                    }
+                    crate::session_context::invalidate_session_cache(owner).await;
+                }
+                self.set_session_transaction(session, None)
+            }
+            Err(e) if e.error_code() == SqeErrorCode::TransactionConflict => {
+                self.set_session_transaction(session, None)?;
+                Err(e)
+            }
+            Err(e) => {
+                self.transactions.reopen(owner, scope);
+                Err(e)
+            }
+        }
+    }
+
     fn require_admin(&self, session: &Session, statement: &str) -> sqe_core::Result<()> {
         if self.config.auth.has_admin_role(&session.user.roles) {
             return Ok(());
@@ -1151,9 +1204,31 @@ impl QueryHandler {
     ) -> futures::future::BoxFuture<'a, sqe_core::Result<Vec<RecordBatch>>> {
         // One statement-scoped set of prepared file-function providers for
         // the whole execution, whatever session context each step plans on.
-        Box::pin(sqe_catalog::file_tvf_prepare::in_statement(
-            self.execute_inner(session, sql, client_ip, query_id),
+        // Inside an explicit transaction the statement runs in its scope
+        // (#821). A refused transaction id runs unscoped here and fails after
+        // classification, so ROLLBACK of a transaction that already ended
+        // still succeeds.
+        let txn = self.txn_scope(session).ok().flatten();
+        Box::pin(sqe_catalog::txn::scope(
+            txn,
+            sqe_catalog::file_tvf_prepare::in_statement(
+                self.execute_inner(session, sql, client_ip, query_id),
+            ),
         ))
+    }
+
+    /// The scope of the explicit transaction `session` is in (#821), or
+    /// `None` in autocommit. Errors for an id the registry refuses: not a
+    /// UUID, opened by another user, or already ended.
+    fn txn_scope(
+        &self,
+        session: &Session,
+    ) -> sqe_core::Result<Option<Arc<sqe_catalog::txn::TxnScope>>> {
+        session
+            .transaction_id
+            .as_deref()
+            .map(|id| self.transactions.scope(id, &session.user.username))
+            .transpose()
     }
 
     /// Write the audit record for a statement that failed before its normal
@@ -1245,11 +1320,26 @@ impl QueryHandler {
         let kind = classify_user_sql(session, sql).map_err(failed)?;
         let kind_name = kind.name().to_string();
 
-        // #820: SQE writes only in autocommit. Inside an explicit
-        // transaction (Trino `X-Trino-Transaction-Id`, or BEGIN on a stored
-        // Flight session) a write is refused before it can touch a table.
-        if session.transaction_id.is_some() && !kind.allowed_in_transaction() {
-            return Err(failed(autocommit_write_conflict(session)));
+        // Inside an explicit transaction (Trino `X-Trino-Transaction-Id`, or
+        // BEGIN on a stored Flight session) DML writes to the transaction's
+        // branch (#821); DDL, grants and procedures are autocommit only and
+        // refused before they can touch a table (#820).
+        if session.transaction_id.is_some() {
+            if !kind.allowed_in_transaction() {
+                return Err(failed(autocommit_write_conflict(session)));
+            }
+            if !matches!(kind, StatementKind::Commit | StatementKind::Rollback) {
+                // `execute_with_id` ran a refused id unscoped; say why here.
+                self.txn_scope(session).map_err(failed)?;
+            }
+            if kind.is_data_write() && session.write_branch.is_some() {
+                return Err(failed(SqeError::with_code(
+                    SqeErrorCode::NotSupported,
+                    "Transactions publish to main; RESET WRITE_BRANCH before \
+                     writing inside a transaction"
+                        .to_string(),
+                )));
+            }
         }
 
         // Issue #408: cap concurrent sorted writes so several CTAS ORDER BY
@@ -1406,8 +1496,10 @@ impl QueryHandler {
             }
         }
 
-        // Check result cache for read queries (before execution)
-        if let StatementKind::Query(_) = &kind {
+        // Check result cache for read queries (before execution). Never
+        // inside a transaction: its reads see its own uncommitted writes,
+        // which the cache key does not capture (#821).
+        if matches!(&kind, StatementKind::Query(_)) && session.transaction_id.is_none() {
             if let Some(ref cache) = self.query_cache {
                 let policy_fingerprint = self.policy_enforcer.policy_fingerprint();
                 let authorized = cache
@@ -1878,6 +1970,9 @@ impl QueryHandler {
                     Ok(vec![])
                 }
                 StatementKind::SetWriteBranch(ref branch) => {
+                    if let Some(name) = branch.as_deref() {
+                        sqe_catalog::txn::reject_txn_ref(name)?;
+                    }
                     if let Some(ref manager) = self.session_manager {
                         let updated = manager.set_write_branch(&session.id, branch.clone());
                         if !updated {
@@ -2185,6 +2280,12 @@ impl QueryHandler {
                         if let sqlparser::ast::TableObject::TableName(ref name) = ins.table {
                             let hive_ref = table_reference_of(name);
                             if self.is_hive_table(session, &hive_ref) {
+                                // A Hive table has no branches: its files are
+                                // visible once written, so it cannot hold a
+                                // transaction's writes back (#821).
+                                if session.transaction_id.is_some() {
+                                    return Err(autocommit_write_conflict(session));
+                                }
                                 // Syntax first: an OVERWRITE is refused on the
                                 // statement alone, before any table lookup, so
                                 // the refusal cannot be masked by a lookup
@@ -2308,11 +2409,12 @@ impl QueryHandler {
                         .await
                 }
 
-                // Explicit transactions (#820). The Trino HTTP layer answers
-                // these itself through X-Trino-Started/Clear-Transaction-Id;
-                // on Flight SQL the transaction lives on the stored session,
-                // as USE's scope does. Writes inside one are refused above,
-                // so COMMIT and ROLLBACK have nothing to apply or undo.
+                // Explicit transactions (#820, #821). The Trino HTTP layer
+                // answers BEGIN itself through X-Trino-Started-Transaction-Id
+                // and hands COMMIT / ROLLBACK here; on Flight SQL the
+                // transaction lives on the stored session, as USE's scope
+                // does. COMMIT publishes the transaction's branch to main,
+                // ROLLBACK drops it.
                 StatementKind::Begin => {
                     if session.transaction_id.is_some() {
                         return Err(SqeError::with_code(
@@ -2323,12 +2425,12 @@ impl QueryHandler {
                     self.set_session_transaction(session, Some(uuid::Uuid::new_v4().to_string()))?;
                     Ok(vec![])
                 }
-                StatementKind::Commit | StatementKind::Rollback => {
-                    // Lenient without a transaction: dbt-adapters and other
-                    // DB-API clients send COMMIT after autocommit statements.
-                    if session.transaction_id.is_some() {
-                        self.set_session_transaction(session, None)?;
-                    }
+                StatementKind::Commit => {
+                    self.end_transaction(session, true).await?;
+                    Ok(vec![])
+                }
+                StatementKind::Rollback => {
+                    self.end_transaction(session, false).await?;
                     Ok(vec![])
                 }
                 StatementKind::SetTransaction => Ok(vec![]),
@@ -2895,7 +2997,7 @@ impl QueryHandler {
             }
 
             if let Some(ref cache) = self.query_cache {
-                if matches!(&kind, StatementKind::Query(_)) {
+                if matches!(&kind, StatementKind::Query(_)) && session.transaction_id.is_none() {
                     if let Ok(ref batches) = result {
                         cache.store_bound(
                             &ResultCache::session_scope(session),
@@ -3208,7 +3310,14 @@ impl QueryHandler {
         query_id: Option<uuid::Uuid>,
     ) -> futures::future::BoxFuture<'a, sqe_core::Result<(SchemaRef, SendableRecordBatchStream)>>
     {
-        Box::pin(self.execute_stream_inner(session, sql, None, client_ip, query_id))
+        // Planning runs in the transaction's scope, so the tables it loads
+        // read at the transaction's branch (#821). The stream returned
+        // scans those already-pinned tables.
+        let txn = self.txn_scope(session).ok().flatten();
+        Box::pin(sqe_catalog::txn::scope(
+            txn,
+            self.execute_stream_inner(session, sql, None, client_ip, query_id),
+        ))
     }
 
     /// [`Self::execute_stream_with_id`] for a plan that was already built.
@@ -3228,8 +3337,12 @@ impl QueryHandler {
         client_ip: Option<String>,
         query_id: Option<uuid::Uuid>,
     ) -> sqe_core::Result<(SchemaRef, SendableRecordBatchStream)> {
-        self.execute_stream_inner(session, sql, Some(plan), client_ip, query_id)
-            .await
+        let txn = self.txn_scope(session).ok().flatten();
+        sqe_catalog::txn::scope(
+            txn,
+            self.execute_stream_inner(session, sql, Some(plan), client_ip, query_id),
+        )
+        .await
     }
 
     /// Plan a statement once for the prepared-statement store (finding 406).
@@ -3247,7 +3360,9 @@ impl QueryHandler {
     ) -> sqe_core::Result<Option<LogicalPlan>> {
         reject_oversized_sql(&self.config.query, numbered_sql)?;
         let kind = classify_user_sql(session, numbered_sql)?;
-        if !matches!(kind, StatementKind::Query(_)) {
+        // Inside a transaction a stored plan would pin the tables it loaded
+        // to the transaction's branch for every later execution (#821).
+        if !matches!(kind, StatementKind::Query(_)) || session.transaction_id.is_some() {
             return Ok(None);
         }
         if let Some(stmt) = kind.statement() {
@@ -3309,6 +3424,9 @@ impl QueryHandler {
                     .into(),
             ));
         }
+        // A query in a transaction that already ended must not read main
+        // as if the transaction's writes were never made (#821).
+        self.txn_scope(session).map_err(failed)?;
 
         // Pre-flight: same unknown-catalog-qualifier check + lazy Polaris
         // discovery as execute(). See `preflight_resolve_catalogs` for the
@@ -6046,9 +6164,14 @@ impl QueryHandler {
         let iceberg_table = session_catalog.load_table(&table_ident).await?;
         let metadata = iceberg_table.metadata();
 
+        // An open transaction's branch and the snapshots only it reaches
+        // read as absent (#821): uncommitted writes are visible to no one
+        // but the transaction itself, which reads them through its pin.
         let snapshot_id = match &spec.version {
             VersionRef::SnapshotId(id) => {
-                if metadata.snapshot_by_id(*id).is_none() {
+                if metadata.snapshot_by_id(*id).is_none()
+                    || sqe_catalog::txn::txn_private_snapshots(metadata).contains(id)
+                {
                     return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                         "FOR VERSION AS OF {id}: snapshot id not found on {}",
                         spec.table
@@ -6057,6 +6180,7 @@ impl QueryHandler {
                 *id
             }
             VersionRef::Named(name) => {
+                sqe_catalog::txn::reject_txn_ref(name)?;
                 match metadata.reference_by_name(name) {
                     None => {
                         return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
@@ -10046,11 +10170,11 @@ mod show_stats_policy_tests {
         }
     }
 
-    /// Inside a transaction (#820) writes and DDL are refused with
-    /// AUTOCOMMIT_WRITE_CONFLICT before planning, while transaction control
-    /// statements still answer.
+    /// Inside a transaction DDL is refused with AUTOCOMMIT_WRITE_CONFLICT
+    /// before planning (#820), while DML runs on the transaction's branch
+    /// (#821) and transaction control statements still answer.
     #[tokio::test]
-    async fn writes_inside_a_transaction_are_autocommit_write_conflicts() {
+    async fn ddl_inside_a_transaction_is_an_autocommit_write_conflict() {
         use crate::query_tracker::QueryTracker;
         use crate::runtime_catalog::RuntimeCatalogRegistry;
         use std::sync::Arc;
@@ -10081,13 +10205,33 @@ mod show_stats_policy_tests {
             chrono::Utc::now() + chrono::Duration::hours(1),
             Vec::new(),
         )
-        .with_catalog(Some("iceberg".to_string()))
-        .with_transaction_id(Some("tx-1".to_string()));
+        .with_catalog(Some("iceberg".to_string()));
 
+        // The id becomes a branch name, so a client-supplied one must be a
+        // UUID (the Trino protocol carries it in a header).
+        let bogus = session.clone().with_transaction_id(Some("../main".to_string()));
+        let err = handler
+            .execute(&bogus, "SET TRANSACTION READ WRITE", None)
+            .await
+            .expect_err("non-UUID transaction id");
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::InvalidArguments, "{err}");
+
+        // A transaction publishes to main; a session writing elsewhere is
+        // refused rather than having its writes land on main.
+        let mut on_branch = session
+            .clone()
+            .with_transaction_id(Some(uuid::Uuid::new_v4().to_string()));
+        on_branch.write_branch = Some("dev".to_string());
+        let err = handler
+            .execute(&on_branch, "INSERT INTO sales.orders VALUES (1)", None)
+            .await
+            .expect_err("write branch in a transaction");
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::NotSupported, "{err}");
+
+        let session = session.with_transaction_id(Some(uuid::Uuid::new_v4().to_string()));
         for sql in [
-            "INSERT INTO sales.orders VALUES (1)",
-            "DELETE FROM sales.orders",
             "CREATE TABLE sales.t (a INT)",
+            "CREATE TABLE sales.t2 AS SELECT 1 AS a",
             "DROP TABLE sales.orders",
         ] {
             let err = handler.execute(&session, sql, None).await.expect_err(sql);
