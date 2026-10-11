@@ -11,6 +11,7 @@ pub mod supervised_task;
 pub mod table_properties;
 pub mod ticket_signing;
 pub mod tls;
+pub mod txn_id;
 
 pub use process_memory::{
     check_process_headroom, enforced_memory_limit_bytes, enforced_memory_limit_source,
