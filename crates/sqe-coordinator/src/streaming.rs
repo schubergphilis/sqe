@@ -302,6 +302,7 @@ impl StreamFinalizer {
             client_ip: self.client_ip.clone(),
             trace_id: self.trace_id.clone(),
             query_id: Some(self.query_id.to_string()),
+            transaction: None,
             integrity: Default::default(),
         });
     }

@@ -616,6 +616,7 @@ async fn audit_logger_round_trips_session_event() {
         client_ip: Some("127.0.0.1".to_string()),
         trace_id: None,
         query_id: None,
+        transaction: None,
         integrity: sqe_metrics::audit::Integrity::default(),
     };
     audit.log_event(event);
