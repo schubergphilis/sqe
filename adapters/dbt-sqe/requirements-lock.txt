@@ -688,14 +688,14 @@ pyarrow==25.0.1 \
     # via
     #   -c /private/tmp/claude-502/-Users-jjverhoeks-git-schuberg-vpf-data-ai-chameleon-Applications-sqlengine/6065c382-f105-4519-b13e-33b965a2ca20/scratchpad/dbtvenv/../constraints.txt
     #   dbt-sqe (setup.cfg)
-pydantic==2.13.5 \
+pydantic==2.14.0 \
     --hash=sha256:346a034f080da3755d8e9cb5e00e8b07de1d39e4f6e2c87d8ab7cafa0b269a73 \
     --hash=sha256:51a9c5f7b2f8e636f04c6cada605d9b6a3bf1348fdf945a3d8869b19bba0ee08
     # via
     #   -c /private/tmp/claude-502/-Users-jjverhoeks-git-schuberg-vpf-data-ai-chameleon-Applications-sqlengine/6065c382-f105-4519-b13e-33b965a2ca20/scratchpad/dbtvenv/../constraints.txt
     #   dbt-core
     #   dbt-semantic-interfaces
-pydantic-core==2.49.0 \
+pydantic-core==2.50.0 \
     --hash=sha256:013d6f3483d81e02e7c328831808f336c8596ee33b4bd4026b9ffb1e960b8942 \
     --hash=sha256:03b9666e41e35d8909852ba191a0607520f81b74eaf12ccf8737005dbb313821 \
     --hash=sha256:045ab3b6d308439e32b81cc173bba5b9018bc6ed896afd0c65b3b009b1699af5 \
