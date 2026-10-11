@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -57,7 +57,13 @@ pub struct SessionManager {
     /// least-recently-active session is evicted first. `0` disables the cap
     /// (TTL-only behaviour, the prior default).
     max_sessions: usize,
+    /// Called with every session that leaves the map (#824): a Flight SQL
+    /// transaction lives on its session, so the query handler rolls it
+    /// back here.
+    on_session_end: OnceLock<SessionEndHook>,
 }
+
+type SessionEndHook = Box<dyn Fn(&Session) + Send + Sync>;
 
 /// COORD-04: default session-count cap when none is configured. Sized so a
 /// normal multi-tenant coordinator never hits it, while still bounding the map
@@ -69,6 +75,20 @@ impl SessionManager {
     /// Number of live sessions.
     pub fn session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// Run `hook` for every session removed from now on: evicted at the
+    /// cap, expired, swept, or closed. Only the first hook set is kept.
+    pub fn on_session_end(&self, hook: impl Fn(&Session) + Send + Sync + 'static) {
+        if self.on_session_end.set(Box::new(hook)).is_err() {
+            warn!("session-end hook already set; ignoring a second one");
+        }
+    }
+
+    fn session_ended(&self, session: &Session) {
+        if let Some(hook) = self.on_session_end.get() {
+            hook(session);
+        }
     }
 
     fn update_active_sessions_metric(&self) {
@@ -91,6 +111,7 @@ impl SessionManager {
             token_of: DashMap::new(),
             metrics: None,
             max_sessions: DEFAULT_MAX_SESSIONS,
+            on_session_end: OnceLock::new(),
         }
     }
 
@@ -109,6 +130,7 @@ impl SessionManager {
             token_of: DashMap::new(),
             metrics: None,
             max_sessions: DEFAULT_MAX_SESSIONS,
+            on_session_end: OnceLock::new(),
         }
     }
 
@@ -142,6 +164,7 @@ impl SessionManager {
             token_of: DashMap::new(),
             metrics: None,
             max_sessions: DEFAULT_MAX_SESSIONS,
+            on_session_end: OnceLock::new(),
         }
     }
 
@@ -190,7 +213,8 @@ impl SessionManager {
 
             match lru_id {
                 Some(id) => {
-                    if self.sessions.remove(&id).is_some() {
+                    if let Some((_, session)) = self.sessions.remove(&id) {
+                        self.session_ended(&session);
                         self.last_activity.remove(&id);
                         self.forget_token(&id);
                         self.update_active_sessions_metric();
@@ -377,6 +401,7 @@ impl SessionManager {
         if session.token_expiry() <= Utc::now() {
             warn!(session_id = %session_log_id(session_id), "Session token expired, evicting");
             self.sessions.remove(session_id);
+            self.session_ended(&session);
             self.last_activity.remove(session_id);
             self.forget_token(session_id);
             self.update_active_sessions_metric();
@@ -533,7 +558,8 @@ impl SessionManager {
 
     /// Remove a session from the manager.
     pub fn remove_session(&self, id: &str) {
-        if self.sessions.remove(id).is_some() {
+        if let Some((_, session)) = self.sessions.remove(id) {
+            self.session_ended(&session);
             self.last_activity.remove(id);
             self.forget_token(id);
             self.update_active_sessions_metric();
@@ -569,6 +595,7 @@ impl SessionManager {
 
         for id in expired_ids {
             if let Some((_, session)) = self.sessions.remove(&id) {
+                self.session_ended(&session);
                 self.last_activity.remove(&id);
                 self.forget_token(&id);
                 let reason = if session.is_absolute_expired(absolute_timeout) {
@@ -831,6 +858,33 @@ mod tests {
             manager.sessions.get(&id).is_none(),
             "Session should be absent after remove_session"
         );
+    }
+
+    // A removed or swept session reaches the session-end hook (#824).
+    #[tokio::test]
+    async fn ended_sessions_reach_the_session_end_hook() {
+        let auth = make_authenticator().await;
+        let manager = SessionManager::new(auth);
+        let ended = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&ended);
+        manager.on_session_end(move |s| seen.lock().unwrap().push(s.user.username.clone()));
+
+        let removed = Arc::new(make_session("dave"));
+        manager.sessions.insert(removed.id.clone(), Arc::clone(&removed));
+        manager.remove_session(&removed.id);
+        manager.remove_session(&removed.id);
+
+        let idle = Arc::new(make_session("erin"));
+        manager.sessions.insert(idle.id.clone(), Arc::clone(&idle));
+        manager.last_activity.insert(
+            idle.id.clone(),
+            Arc::new(AtomicI64::new(
+                (Utc::now() - chrono::Duration::hours(2)).timestamp_micros(),
+            )),
+        );
+        assert_eq!(manager.sweep_expired_sessions(60, 86_400), 1);
+
+        assert_eq!(*ended.lock().unwrap(), ["dave", "erin"]);
     }
 
     // -----------------------------------------------------------------------

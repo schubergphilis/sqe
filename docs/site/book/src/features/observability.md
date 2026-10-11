@@ -13,6 +13,11 @@ Available at `http://coordinator:9090/metrics` in Prometheus text format.
 | `sqe_rows_returned_total` | Counter | — | Cumulative rows returned |
 | `sqe_active_queries` | Gauge | none | Queries that have not reached a terminal state |
 | `sqe_active_sessions` | Gauge | — | Current active sessions |
+| `sqe_transactions_open` | Gauge | none | Explicit transactions open on this coordinator |
+| `sqe_transactions_ended_total` | Counter | `outcome` | Ended transactions: `committed`, `rolled_back`, `conflict`, `idle_timeout`, `session_ended`, `shutdown` |
+| `sqe_transaction_duration_seconds` | Histogram | none | Seconds from a transaction's first statement to its end |
+| `sqe_transaction_not_found_total` | Counter | none | Statements refused because their transaction belongs to another coordinator or to this one before a restart |
+| `sqe_transaction_branch_drop_failures_total` | Counter | none | Transaction branches a rollback or abort could not drop |
 | `sqe_healthy_workers` | Gauge | — | Workers passing health checks |
 | `sqe_scan_files_total` | Counter | `outcome` | Iceberg files planned, read, or pruned |
 | `sqe_scan_bytes_total` | Counter | `stage` | Iceberg bytes planned and read |

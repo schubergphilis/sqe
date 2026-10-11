@@ -955,7 +955,9 @@ async fn shutdown_signal() {
 ///    Service / load balancer stops routing NEW work to this pod;
 /// 2. sleeps `drain_secs` so connections already routed before the readiness
 ///    flip propagated can finish at the tonic graceful boundary;
-/// 3. resolves, which tells tonic to stop accepting and shut down.
+/// 3. runs `before_close` (the coordinator rolls back its open transactions,
+///    #824);
+/// 4. resolves, which tells tonic to stop accepting and shut down.
 ///
 /// The grace period is bounded by `coordinator.shutdown_drain_secs` and must
 /// stay below the pod's `terminationGracePeriodSeconds` so the process exits
@@ -963,7 +965,11 @@ async fn shutdown_signal() {
 /// in-flight-query drain. SQE has no query-lifecycle registry to wait on yet;
 /// tracking in-flight queries and blocking shutdown until they complete is a
 /// follow-up (see MR).
-async fn shutdown_with_drain(ready: Arc<AtomicBool>, drain_secs: u64) {
+async fn shutdown_with_drain(
+    ready: Arc<AtomicBool>,
+    drain_secs: u64,
+    before_close: impl std::future::Future<Output = ()>,
+) {
     shutdown_signal().await;
     let drain_secs = effective_drain_secs(drain_secs, std::io::stderr().is_terminal());
     // A second SIGINT/SIGTERM during the drain means "now": exit the way a
@@ -975,6 +981,7 @@ async fn shutdown_with_drain(ready: Arc<AtomicBool>, drain_secs: u64) {
             std::process::exit(130);
         }
     }
+    before_close.await;
     // tonic's graceful stop then waits for every open connection to close,
     // which an idle keep-alive client can hold for as long as it likes. Bound
     // that: the accept loop is already closed, so nothing new is lost.
@@ -2542,6 +2549,10 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
         }
     }
 
+    // Rolls back open transactions at shutdown (#824); the Flight service
+    // takes ownership of `query_handler` below.
+    let txn_handler = Arc::clone(&query_handler);
+
     // Mark ready
     ready.store(true, Ordering::Relaxed);
 
@@ -2554,7 +2565,12 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
             "Flight SQL disabled (flight_sql_port = 0); serving MCP only. \
              Coordinator up."
         );
-        shutdown_with_drain(ready.clone(), config.coordinator.shutdown_drain_secs).await;
+        shutdown_with_drain(
+            ready.clone(),
+            config.coordinator.shutdown_drain_secs,
+            query_handler.abort_open_transactions(),
+        )
+        .await;
         if let Some(tx) = shipper_shutdown_tx {
             let _ = tx.send(true);
         }
@@ -2605,7 +2621,11 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
         .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(flight_service))
         .serve_with_shutdown(
             addr,
-            shutdown_with_drain(ready.clone(), config.coordinator.shutdown_drain_secs),
+            shutdown_with_drain(
+                ready.clone(),
+                config.coordinator.shutdown_drain_secs,
+                async move { txn_handler.abort_open_transactions().await },
+            ),
         )
         .await;
 
@@ -2725,7 +2745,11 @@ async fn run_worker(config: SqeConfig, config_path: String) -> anyhow::Result<()
         )
         .serve_with_shutdown(
             addr,
-            shutdown_with_drain(ready.clone(), config.coordinator.shutdown_drain_secs),
+            shutdown_with_drain(
+                ready.clone(),
+                config.coordinator.shutdown_drain_secs,
+                std::future::ready(()),
+            ),
         )
         .await?;
 

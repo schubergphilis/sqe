@@ -1494,7 +1494,7 @@ fn resolve_statement(
                 )));
             }
             immediate(protocol::UpdatedSessionState {
-                started_transaction_id: Some(Uuid::new_v4().to_string()),
+                started_transaction_id: Some(sqe_core::txn_id::new_txn_id()),
                 ..Default::default()
             })
         }
