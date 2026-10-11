@@ -31,6 +31,8 @@ conn.close()
 
 Use `grpc://` for plaintext and `grpc+tls://` when the coordinator runs with TLS (`[coordinator.tls]` cert and key set). The username and password are exchanged by the server for an OIDC token; what credentials are valid depends on the server's auth config.
 
+A DB-API connection starts in a transaction, as the DB-API spec requires. `INSERT`, `UPDATE`, `DELETE`, `MERGE` and bulk ingest stay invisible to everyone else until `conn.commit()`, and closing the connection without it discards them. DDL and CTAS commit at once. Pass `autocommit=True` to `connect` when every statement should commit on its own, as a loader that opens a connection per statement needs. See [Transactions](../sql-reference/dml.md#transactions).
+
 ## dbt with the dbt-sqe adapter
 
 The dbt-sqe adapter connects over ADBC Flight SQL. A `profiles.yml` target looks like this:

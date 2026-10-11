@@ -4082,3 +4082,92 @@ async fn test_multi_table_transaction_conflict_aborts_both() {
             .expect("DROP TABLE cleanup should succeed");
     }
 }
+
+// Test: a Flight SQL BeginTransaction id carries DML onto the branch while
+// DDL inside it autocommits; rollback drops the DML only, commit publishes
+// it. The handler calls stand in for the BeginTransaction / EndTransaction
+// RPCs, which are thin wrappers over them.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn test_client_transaction_ddl_autocommits_and_dml_waits() {
+    let (session, handler) = crate::common::setup_handler().await;
+    txn_tables(&handler, &session, "txn_rpc_a", "txn_rpc_b").await;
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.txn_rpc_ddl", None)
+        .await;
+
+    let id = handler
+        .begin_client_transaction(&session, None)
+        .expect("BeginTransaction");
+    let tx = session.clone().with_client_transaction_id(id);
+    handler
+        .begin_client_transaction(&tx, None)
+        .expect_err("a nested BeginTransaction is refused");
+
+    handler
+        .execute(&tx, "INSERT INTO test_ns.txn_rpc_a SELECT 4 as id", None)
+        .await
+        .expect("INSERT inside the transaction");
+    handler
+        .execute(
+            &tx,
+            "CREATE TABLE test_ns.txn_rpc_ddl AS SELECT 7 as id",
+            None,
+        )
+        .await
+        .expect("CTAS inside a client transaction autocommits");
+    assert_eq!(
+        txn_ids(&handler, &tx, "test_ns.txn_rpc_a").await,
+        vec![1, 2, 3, 4]
+    );
+    // The CTAS is visible outside at once; the INSERT is not.
+    assert_eq!(
+        txn_ids(&handler, &session, "test_ns.txn_rpc_ddl").await,
+        vec![7]
+    );
+    assert_eq!(
+        txn_ids(&handler, &session, "test_ns.txn_rpc_a").await,
+        vec![1, 2, 3]
+    );
+
+    handler
+        .end_client_transaction(&tx, false, None)
+        .await
+        .expect("EndTransaction ROLLBACK");
+    assert_eq!(
+        txn_ids(&handler, &session, "test_ns.txn_rpc_a").await,
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        txn_ids(&handler, &session, "test_ns.txn_rpc_ddl").await,
+        vec![7]
+    );
+    handler
+        .end_client_transaction(&tx, true, None)
+        .await
+        .expect_err("an ended transaction cannot commit");
+
+    let id = handler
+        .begin_client_transaction(&session, None)
+        .expect("second BeginTransaction");
+    let tx = session.clone().with_client_transaction_id(id);
+    handler
+        .execute(&tx, "DELETE FROM test_ns.txn_rpc_b WHERE id = 2", None)
+        .await
+        .expect("DELETE inside the transaction");
+    handler
+        .end_client_transaction(&tx, true, None)
+        .await
+        .expect("EndTransaction COMMIT");
+    assert_eq!(
+        txn_ids(&handler, &session, "test_ns.txn_rpc_b").await,
+        vec![1, 3]
+    );
+
+    for t in ["txn_rpc_a", "txn_rpc_b", "txn_rpc_ddl"] {
+        handler
+            .execute(&session, &format!("DROP TABLE test_ns.{t}"), None)
+            .await
+            .expect("DROP TABLE cleanup should succeed");
+    }
+}

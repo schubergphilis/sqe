@@ -134,10 +134,9 @@ class SQEConnectionManager(SQLConnectionManager):
             if db_kwargs:
                 kwargs["db_kwargs"] = db_kwargs
 
-            # SQE commits every statement on its own (Iceberg single-statement
-            # writes, #820). autocommit=True says so up front: ADBC skips the
-            # failing set_autocommit(False) and its "Cannot disable autocommit"
-            # warning, and the handle's commit()/rollback() become no-ops.
+            # Each dbt model commits on its own. autocommit=True keeps it so:
+            # without it ADBC opens a Flight SQL transaction, and a model's
+            # DML stays on the transaction branch until an explicit commit().
             kwargs["autocommit"] = True
             connection.handle = _Handle(connect(**kwargs))
             connection.state = "open"
@@ -148,10 +147,10 @@ class SQEConnectionManager(SQLConnectionManager):
 
         return connection
 
-    # SQE has no multi-statement transactions: each statement autocommits,
-    # and a write inside an explicit BEGIN is refused (#820). dbt-adapters
-    # sends BEGIN / COMMIT as SQL around every model, so keep its
-    # transaction_open bookkeeping and send nothing, as dbt-trino does.
+    # Models autocommit: a transaction refuses the DDL and CTAS a model
+    # runs. dbt-adapters sends BEGIN / COMMIT as SQL around every model, so
+    # keep its transaction_open bookkeeping and send nothing, as dbt-trino
+    # does.
     def add_begin_query(self):
         pass
 
