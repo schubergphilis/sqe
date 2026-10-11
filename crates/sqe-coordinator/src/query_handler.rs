@@ -965,7 +965,7 @@ impl QueryHandler {
         }
         match txn::scope(None, txn::publish(&scope)).await {
             Ok(()) => {
-                if scope.table().is_some() {
+                if !scope.tables().is_empty() {
                     // Other sessions' cached results predate the publish.
                     if let Some(ref cache) = self.query_cache {
                         cache.invalidate_all();
@@ -3613,7 +3613,9 @@ impl QueryHandler {
         // thread's stack used to abort the coordinator. Execution below stays
         // on the runtime threads.
         let (final_plan, enforced_logical, tt_cleanup, tables_touched, policy_summary, audit_resources) =
-            sqe_core::runtime::on_planning_stack(async {
+            // `carried`: the planning thread does not see the task's
+            // transaction scope, and table loads must pin to its branch.
+            sqe_core::runtime::on_planning_stack(sqe_catalog::txn::carried(async {
                 let (plan, tt_cleanup) = match prebuilt {
                     Some(plan) => (plan, TimeTravelCleanup::new(&ctx, Vec::new())),
                     None => {
@@ -3689,7 +3691,7 @@ impl QueryHandler {
                     policy_summary,
                     audit_resources,
                 ))
-            })
+            }))
             .await?;
 
         // Planning complete — promote tracker to Running
@@ -4083,7 +4085,8 @@ impl QueryHandler {
         // dedicated planning stack (#640); see `open_stream`. The out-params
         // are written inside so the caller sees them whether or not planning
         // succeeds past them.
-        let (final_plan, enforced_logical, _tt_cleanup) = sqe_core::runtime::on_planning_stack(async {
+        // `carried`: see `open_stream`.
+        let (final_plan, enforced_logical, _tt_cleanup) = sqe_core::runtime::on_planning_stack(sqe_catalog::txn::carried(async {
             // Pre-process incremental (CDC) first. The FOR INCREMENTAL BETWEEN
             // clause is not modelled by sqlparser-rs, so the downstream
             // handle_time_travel call (which parses SQL) would fail if we left
@@ -4169,7 +4172,7 @@ impl QueryHandler {
                 .finish_physical_plan(&ctx, session, query_id, physical_plan)
                 .await?;
             Ok::<_, SqeError>((final_plan, enforced_logical, tt_cleanup))
-        })
+        }))
         .await?;
 
         // Retain results incrementally under both row and actual byte caps.

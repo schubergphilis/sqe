@@ -3916,3 +3916,169 @@ async fn test_update_multiple_data_files() {
         .await
         .expect("DROP TABLE cleanup should succeed");
 }
+/// Sorted `id`s of `table`, read as `session`.
+async fn txn_ids(
+    handler: &sqe_coordinator::QueryHandler,
+    session: &sqe_core::Session,
+    table: &str,
+) -> Vec<i64> {
+    let batches = handler
+        .execute(
+            session,
+            &format!("SELECT id FROM {table} ORDER BY id"),
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("SELECT from {table}: {e}"));
+    let mut ids = Vec::new();
+    for batch in &batches {
+        let col = batch
+            .column_by_name("id")
+            .expect("id column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id should be Int64");
+        ids.extend((0..batch.num_rows()).map(|i| col.value(i)));
+    }
+    ids
+}
+
+/// Two fresh three-row tables, `test_ns.{a}` and `test_ns.{b}`.
+async fn txn_tables(
+    handler: &sqe_coordinator::QueryHandler,
+    session: &sqe_core::Session,
+    a: &str,
+    b: &str,
+) {
+    for t in [a, b] {
+        let _ = handler
+            .execute(session, &format!("DROP TABLE IF EXISTS test_ns.{t}"), None)
+            .await;
+        handler
+            .execute(
+                session,
+                &format!(
+                    "CREATE TABLE test_ns.{t} AS \
+                     SELECT 1 as id UNION ALL SELECT 2 UNION ALL SELECT 3"
+                ),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("CTAS {t}: {e}"));
+    }
+}
+
+// Test: BEGIN; INSERT a; DELETE b; COMMIT publishes both tables in one
+// /v1/transactions/commit (#823). The test handler has no session manager,
+// so the transaction id rides on the session as on the Trino path.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn test_multi_table_transaction_commit() {
+    let (session, handler) = crate::common::setup_handler().await;
+    txn_tables(&handler, &session, "txn_multi_a", "txn_multi_b").await;
+    let tx = session
+        .clone()
+        .with_transaction_id(Some(uuid::Uuid::new_v4().to_string()));
+
+    handler
+        .execute(&tx, "INSERT INTO test_ns.txn_multi_a SELECT 4 as id", None)
+        .await
+        .expect("INSERT into a inside the transaction");
+    handler
+        .execute(&tx, "DELETE FROM test_ns.txn_multi_b WHERE id = 2", None)
+        .await
+        .expect("DELETE from b inside the transaction");
+
+    // The transaction sees its own writes; autocommit readers do not.
+    assert_eq!(
+        txn_ids(&handler, &tx, "test_ns.txn_multi_a").await,
+        vec![1, 2, 3, 4]
+    );
+    assert_eq!(
+        txn_ids(&handler, &tx, "test_ns.txn_multi_b").await,
+        vec![1, 3]
+    );
+    assert_eq!(
+        txn_ids(&handler, &session, "test_ns.txn_multi_a").await,
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        txn_ids(&handler, &session, "test_ns.txn_multi_b").await,
+        vec![1, 2, 3]
+    );
+
+    handler
+        .execute(&tx, "COMMIT", None)
+        .await
+        .expect("COMMIT publishes both tables");
+    assert_eq!(
+        txn_ids(&handler, &session, "test_ns.txn_multi_a").await,
+        vec![1, 2, 3, 4]
+    );
+    assert_eq!(
+        txn_ids(&handler, &session, "test_ns.txn_multi_b").await,
+        vec![1, 3]
+    );
+
+    for t in ["txn_multi_a", "txn_multi_b"] {
+        handler
+            .execute(&session, &format!("DROP TABLE test_ns.{t}"), None)
+            .await
+            .expect("DROP TABLE cleanup should succeed");
+    }
+}
+
+// Test: a commit to one table under an open transaction makes COMMIT fail
+// with a conflict and leaves both tables as they were (#823).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn test_multi_table_transaction_conflict_aborts_both() {
+    let (session, handler) = crate::common::setup_handler().await;
+    txn_tables(&handler, &session, "txn_conf_a", "txn_conf_b").await;
+    let tx = session
+        .clone()
+        .with_transaction_id(Some(uuid::Uuid::new_v4().to_string()));
+
+    handler
+        .execute(&tx, "INSERT INTO test_ns.txn_conf_a SELECT 4 as id", None)
+        .await
+        .expect("INSERT into a inside the transaction");
+    handler
+        .execute(&tx, "DELETE FROM test_ns.txn_conf_b WHERE id = 2", None)
+        .await
+        .expect("DELETE from b inside the transaction");
+    // Another writer moves b's main under the transaction.
+    handler
+        .execute(
+            &session,
+            "INSERT INTO test_ns.txn_conf_b SELECT 99 as id",
+            None,
+        )
+        .await
+        .expect("autocommit INSERT into b");
+
+    let err = handler
+        .execute(&tx, "COMMIT", None)
+        .await
+        .expect_err("b moved under the transaction");
+    assert_eq!(
+        err.error_code(),
+        sqe_core::SqeErrorCode::TransactionConflict,
+        "{err}"
+    );
+    assert_eq!(
+        txn_ids(&handler, &session, "test_ns.txn_conf_a").await,
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        txn_ids(&handler, &session, "test_ns.txn_conf_b").await,
+        vec![1, 2, 3, 99]
+    );
+
+    for t in ["txn_conf_a", "txn_conf_b"] {
+        handler
+            .execute(&session, &format!("DROP TABLE test_ns.{t}"), None)
+            .await
+            .expect("DROP TABLE cleanup should succeed");
+    }
+}

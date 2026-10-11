@@ -47,6 +47,7 @@ The system SHALL remove the transaction's branch. Files its snapshots added are 
 
 ### Requirement: One table per transaction
 The system SHALL refuse a write to a second table inside a transaction.
+Narrowed by `multi-table-transactions` (#823) to catalogs that cannot commit several tables atomically.
 
 #### Scenario: Second table
 - **GIVEN** a transaction that wrote to `t1`
