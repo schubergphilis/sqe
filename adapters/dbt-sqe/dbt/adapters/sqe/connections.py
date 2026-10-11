@@ -147,10 +147,10 @@ class SQEConnectionManager(SQLConnectionManager):
 
         return connection
 
-    # SQE has no multi-statement transactions: each statement autocommits,
-    # and a write inside an explicit BEGIN is refused (#820). dbt-adapters
-    # sends BEGIN / COMMIT as SQL around every model, so keep its
-    # transaction_open bookkeeping and send nothing, as dbt-trino does.
+    # Models autocommit: a transaction refuses the DDL and CTAS a model
+    # runs. dbt-adapters sends BEGIN / COMMIT as SQL around every model, so
+    # keep its transaction_open bookkeeping and send nothing, as dbt-trino
+    # does.
     def add_begin_query(self):
         pass
 
