@@ -40,6 +40,16 @@ use uuid::Uuid;
 /// prefix whose transaction no coordinator knows.
 pub const TXN_BRANCH_PREFIX: &str = "sqe-txn-";
 
+/// The longest a transaction stays open, however busy. The coordinator
+/// rolls back a transaction this old on its next statement, which is what
+/// lets [`stale_txn_refs`] call an older branch dead without asking every
+/// coordinator.
+pub const MAX_LIFETIME: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Slack on top of [`MAX_LIFETIME`] for clock skew: a branch head's
+/// timestamp comes from the clock of the coordinator that wrote it.
+const STALE_MARGIN_MS: i64 = 60 * 60 * 1000;
+
 /// Whether `name` is a transaction branch.
 pub fn is_txn_ref(name: &str) -> bool {
     name.starts_with(TXN_BRANCH_PREFIX)
@@ -570,6 +580,76 @@ pub async fn discard(txn: &TxnScope) -> usize {
     failed
 }
 
+/// Transaction branches of `metadata` whose transaction has certainly
+/// ended: the branch head is a snapshot the transaction wrote, and it is
+/// older than [`MAX_LIFETIME`] plus a margin at `now_ms`. The transaction
+/// wrote that snapshot after it opened, so it is older than the lifetime
+/// too, and its coordinator rolled it back or lost it in a crash.
+///
+/// A branch still at its base snapshot is left alone: its head carries
+/// `main`'s old timestamp, not the transaction's, and it stages no file.
+/// `ALTER TABLE ... DROP BRANCH` removes one by hand.
+///
+/// Dropping a branch a live transaction still used would not lose data:
+/// its next statement reads a stale pin and its COMMIT finds no branch,
+/// both of which abort it.
+pub fn stale_txn_refs(metadata: &iceberg::spec::TableMetadata, now_ms: i64) -> Vec<String> {
+    let private = txn_private_snapshots(metadata);
+    let cutoff_ms = now_ms
+        .saturating_sub(MAX_LIFETIME.as_millis() as i64)
+        .saturating_sub(STALE_MARGIN_MS);
+    let mut stale: Vec<String> = metadata
+        .refs_iter()
+        .filter(|(name, _)| is_txn_ref(name))
+        .filter(|(_, r)| private.contains(&r.snapshot_id))
+        .filter(|(_, r)| {
+            metadata
+                .snapshot_by_id(r.snapshot_id)
+                .is_some_and(|s| s.timestamp_ms() < cutoff_ms)
+        })
+        .map(|(name, _)| name.to_string())
+        .collect();
+    stale.sort();
+    stale
+}
+
+/// Drop the [`stale_txn_refs`] of `ident` in one commit and return their
+/// names. Their snapshots then expire like any other unreferenced
+/// snapshot, and the files only they reached become orphans.
+pub async fn drop_stale_branches(
+    catalog: &dyn Catalog,
+    ident: &TableIdent,
+    now_ms: i64,
+) -> sqe_core::Result<Vec<String>> {
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+    let table = catalog
+        .load_table(ident)
+        .await
+        .map_err(|e| sqe_core::SqeError::catalog_src(format!("Failed to load table {ident}"), e))?;
+    let stale = stale_txn_refs(table.metadata(), now_ms);
+    if stale.is_empty() {
+        return Ok(stale);
+    }
+    let mut tx = Transaction::new(&table);
+    for branch in &stale {
+        tx = tx
+            .drop_branch(branch.clone())
+            .if_exists(true)
+            .apply(tx)
+            .map_err(|e| {
+                sqe_core::SqeError::catalog_src(format!("Failed to drop {branch} on {ident}"), e)
+            })?;
+    }
+    tx.commit(catalog).await.map_err(|e| {
+        sqe_core::SqeError::catalog_src(
+            format!("Failed to drop stale transaction branches on {ident}"),
+            e,
+        )
+    })?;
+    tracing::info!(table = %ident, branches = ?stale, "dropped stale transaction branches");
+    Ok(stale)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,6 +762,26 @@ mod tests {
 
     const BASE: i64 = 3051729675574597004;
     const HEAD: i64 = 3055729675574597004;
+    /// `timestamp-ms` of HEAD in the fixture.
+    const HEAD_MS: i64 = 1555100955770;
+
+    #[test]
+    fn only_old_branches_holding_a_private_head_are_stale() {
+        let lifetime = MAX_LIFETIME.as_millis() as i64;
+        let after_lifetime = HEAD_MS + lifetime + STALE_MARGIN_MS + 1;
+        let open = metadata_with_refs(&[("main", BASE), ("sqe-txn-1", HEAD), ("dev", BASE)]);
+        assert_eq!(stale_txn_refs(&open, after_lifetime), ["sqe-txn-1"]);
+        // Within the lifetime plus margin the transaction may still be open.
+        assert!(stale_txn_refs(&open, HEAD_MS + lifetime).is_empty());
+
+        // A branch still at its base carries main's timestamp, not the
+        // transaction's: never stale.
+        let at_base = metadata_with_refs(&[("main", HEAD), ("sqe-txn-1", BASE)]);
+        assert!(stale_txn_refs(&at_base, i64::MAX).is_empty());
+        // A user branch on the head makes it public: not the transaction's.
+        let shared = metadata_with_refs(&[("main", BASE), ("sqe-txn-1", HEAD), ("dev", HEAD)]);
+        assert!(stale_txn_refs(&shared, i64::MAX).is_empty());
+    }
 
     #[test]
     fn snapshots_only_a_transaction_branch_reaches_are_private() {
