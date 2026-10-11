@@ -121,12 +121,15 @@ def sqe_connection():
         import adbc_driver_flightsql.dbapi
         import adbc_driver_manager
 
+        # One connection per statement and no commit(): without autocommit
+        # ADBC opens a Flight SQL transaction and the close discards its DML.
         return adbc_driver_flightsql.dbapi.connect(
             SQE_FLIGHT_URI,
             db_kwargs={
                 adbc_driver_manager.DatabaseOptions.USERNAME.value: CLIENT_ID,
                 adbc_driver_manager.DatabaseOptions.PASSWORD.value: CLIENT_SECRET,
             },
+            autocommit=True,
         )
     if SQE_TRANSPORT != "trino":
         raise ValueError(

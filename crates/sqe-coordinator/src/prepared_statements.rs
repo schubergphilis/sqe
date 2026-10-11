@@ -63,6 +63,9 @@ pub struct PreparedStatement {
     /// and the statement is re-planned from its text, which reloads the
     /// tables and gets new keys. `None`: no expiring credentials.
     plan_credentials_usable_until: Option<std::time::SystemTime>,
+    /// The client-held transaction the statement was prepared in (#824):
+    /// the execute requests that follow carry no transaction id of their own.
+    transaction_id: Option<String>,
 }
 
 /// Earliest refresh deadline of the vended credentials held by the Iceberg
@@ -158,7 +161,22 @@ impl PreparedStatement {
             dataset_schema,
             params: RwLock::new(None),
             plan_credentials_usable_until,
+            transaction_id: None,
         }
+    }
+
+    /// The statement runs in the client-held transaction `transaction_id`
+    /// (`ActionCreatePreparedStatementRequest.transaction_id`, #824).
+    #[must_use]
+    pub fn with_transaction_id(mut self, transaction_id: Option<String>) -> Self {
+        self.transaction_id = transaction_id;
+        self
+    }
+
+    /// The client-held transaction this statement runs in, as the handle
+    /// bytes a request carries.
+    pub fn transaction_handle(&self) -> Option<&[u8]> {
+        self.transaction_id.as_deref().map(str::as_bytes)
     }
 
     /// True when the stored plan holds vended credentials that are due for

@@ -150,13 +150,15 @@ pub fn build_sql_info_data() -> Result<arrow_flight::sql::metadata::SqlInfoData,
     b.append(I::FlightSqlServerReadOnly, false);
     b.append(I::FlightSqlServerSql, true);
     b.append(I::FlightSqlServerSubstrait, false);
-    // SqlSupportedTransaction.SQL_SUPPORTED_TRANSACTION_NONE = 0: no
-    // BeginTransaction RPC. Textual BEGIN / COMMIT run a session-bound
-    // transaction instead (#821, #824).
-    b.append(I::FlightSqlServerTransaction, 0i32);
+    // SqlSupportedTransaction.TRANSACTION = 1: BeginTransaction /
+    // EndTransaction, no savepoints (#824). Advertising it is what makes a
+    // DB-API driver run `autocommit=False` connections in a real transaction
+    // instead of falling back to autocommit.
+    b.append(I::FlightSqlServerTransaction, 1i32);
     b.append(I::FlightSqlServerCancel, true);
     b.append(I::FlightSqlServerBulkIngestion, false);
-    b.append(I::FlightSqlServerIngestTransactionsSupported, false);
+    // An ingest carrying a transaction id writes to the transaction's branch.
+    b.append(I::FlightSqlServerIngestTransactionsSupported, true);
 
     // DDL support.
     b.append(I::SqlDdlCatalog, false);
@@ -353,10 +355,16 @@ pub fn build_sql_info_data() -> Result<arrow_flight::sql::metadata::SqlInfoData,
     b.append(I::SqlMaxBinaryLiteralLength, 0i64);
     b.append(I::SqlMaxCharLiteralLength, 0i64);
 
-    // Transactions. SQE runs in autocommit; no isolation levels supported.
-    b.append(I::SqlDefaultTransactionIsolation, 0i64);
-    b.append(I::SqlTransactionsSupported, false);
-    b.append(I::SqlDataDefinitionCausesTransactionCommit, true);
+    // Transactions (#821, #824). A transaction reads its own writes and the
+    // latest committed state of every other table: READ_COMMITTED
+    // (SqlTransactionIsolationLevel 2, bitmask 1 << 2). DDL inside a
+    // client-held transaction runs autocommit and leaves the transaction
+    // open: it neither commits the transaction nor is ignored.
+    b.append(I::SqlDefaultTransactionIsolation, 2i32);
+    b.append(I::SqlTransactionsSupported, true);
+    b.append(I::SqlSupportedTransactionsIsolationLevels, 1i32 << 2);
+    b.append(I::SqlDataDefinitionCausesTransactionCommit, false);
+    b.append(I::SqlDataDefinitionsInTransactionsIgnored, false);
 
     b.build()
         .map_err(|e| Status::internal(format!("Failed to build SQL info: {e}")))
@@ -525,6 +533,44 @@ struct PendingStatement {
     /// For prepared statements, the statement id so `DoGet` runs the stored
     /// plan with the bind current at execution time (finding 406).
     prepared: Option<uuid::Uuid>,
+    /// The client-held transaction the statement was planned in (#824).
+    /// `DoGet`'s ticket carries no transaction id, so without this a read
+    /// would miss the transaction's own writes.
+    transaction_id: Option<String>,
+}
+
+/// The session a request runs as: `session` itself, or `session` in the
+/// client-held transaction `transaction_id` names (Flight SQL
+/// `BeginTransaction`, #824). An absent or empty id leaves the session as it
+/// is. A session already in a different transaction (a `BEGIN` on the stored
+/// session) is refused rather than silently switched.
+fn in_request_transaction(
+    session: Arc<sqe_core::Session>,
+    transaction_id: Option<&[u8]>,
+) -> Result<Arc<sqe_core::Session>, Status> {
+    let Some(raw) = transaction_id.filter(|id| !id.is_empty()) else {
+        return Ok(session);
+    };
+    let id = std::str::from_utf8(raw)
+        .map_err(|_| Status::invalid_argument("transaction_id is not a transaction handle"))?;
+    match session.transaction_id.as_deref() {
+        Some(current) if current == id => Ok(session),
+        Some(_) => Err(Status::failed_precondition(
+            "The session is in another transaction; COMMIT or ROLLBACK it first",
+        )),
+        None => Ok(Arc::new(
+            (*session).clone().with_client_transaction_id(id.to_string()),
+        )),
+    }
+}
+
+/// The client-held transaction id of `session`, for a ticket or a prepared
+/// statement to carry to a later request.
+fn client_transaction_of(session: &sqe_core::Session) -> Option<String> {
+    session
+        .in_client_transaction()
+        .then(|| session.transaction_id.clone())
+        .flatten()
 }
 
 /// What a redeemed ticket resolves to.
@@ -587,6 +633,7 @@ impl SqeFlightSqlService {
                     sql,
                     owner: session.user.principal_id().to_string(),
                     prepared,
+                    transaction_id: client_transaction_of(session),
                 },
             )
             .await;
@@ -607,13 +654,16 @@ impl SqeFlightSqlService {
     /// resolves to the stored statement (finding 406), whose bind current at
     /// execution time is applied. A handle that is not a UUID is a legacy
     /// raw-SQL ticket from an older client and runs under a fresh id.
+    ///
+    /// The third element is the client-held transaction the statement was
+    /// planned in (#824), for the caller to run it in.
     async fn resolve_statement_handle(
         &self,
         session: &sqe_core::Session,
         handle: &str,
-    ) -> Result<(ResolvedStatement, Option<uuid::Uuid>), Status> {
+    ) -> Result<(ResolvedStatement, Option<uuid::Uuid>, Option<String>), Status> {
         let Ok(query_id) = uuid::Uuid::parse_str(handle) else {
-            return Ok((ResolvedStatement::Sql(handle.to_string()), None));
+            return Ok((ResolvedStatement::Sql(handle.to_string()), None, None));
         };
         let Some(pending) = self.pending_statements.get(&query_id).await else {
             return Err(Status::not_found(format!(
@@ -639,7 +689,7 @@ impl SqeFlightSqlService {
             }
             None => ResolvedStatement::Sql(pending.sql),
         };
-        Ok((resolved, Some(query_id)))
+        Ok((resolved, Some(query_id), pending.transaction_id))
     }
 
     /// Look up a prepared statement by id, scoped to the caller's session
@@ -1507,6 +1557,7 @@ impl FlightSqlService for SqeFlightSqlService {
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         let session = self.get_session_from_request(&request).await?;
+        let session = in_request_transaction(session, query.transaction_id.as_deref())?;
         let sql = &query.query;
 
         debug!(
@@ -1582,7 +1633,8 @@ impl FlightSqlService for SqeFlightSqlService {
         // the raw SQL string.
         let handle_str = std::str::from_utf8(handle)
             .map_err(|e| Status::internal(format!("Invalid statement handle: {e}")))?;
-        let (resolved, query_id) = self.resolve_statement_handle(&session, handle_str).await?;
+        let (resolved, query_id, txn) = self.resolve_statement_handle(&session, handle_str).await?;
+        let session = in_request_transaction(session, txn.as_deref().map(str::as_bytes))?;
 
         let client_ip = Some(self.extract_client_ip(&request));
         self.run_resolved_into_flight_response(&session, resolved, client_ip, query_id)
@@ -1607,9 +1659,10 @@ impl FlightSqlService for SqeFlightSqlService {
                 "do_get_fallback executing query"
             );
 
-            let (resolved, query_id) = self
+            let (resolved, query_id, txn) = self
                 .resolve_statement_handle(&session, &fetch.handle)
                 .await?;
+            let session = in_request_transaction(session, txn.as_deref().map(str::as_bytes))?;
             let client_ip = Some(self.extract_client_ip(&request));
             return self
                 .run_resolved_into_flight_response(&session, resolved, client_ip, query_id)
@@ -1902,6 +1955,7 @@ impl FlightSqlService for SqeFlightSqlService {
         let (statement_id, statement) = self
             .prepared_from_handle(&session, &cmd.prepared_statement_handle)
             .await?;
+        let session = in_request_transaction(session, statement.transaction_handle())?;
         // Finding 406: the schema comes from the plan built at
         // CreatePreparedStatement; nothing is re-planned here.
         let schema = Arc::clone(&statement.dataset_schema);
@@ -2057,6 +2111,7 @@ impl FlightSqlService for SqeFlightSqlService {
         let (_, statement) = self
             .prepared_from_handle(&session, &query.prepared_statement_handle)
             .await?;
+        let session = in_request_transaction(session, statement.transaction_handle())?;
 
         debug!(
             username = %session.user.username,
@@ -2321,6 +2376,7 @@ impl FlightSqlService for SqeFlightSqlService {
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
         let session = self.get_session_from_request(&request).await?;
+        let session = in_request_transaction(session, ticket.transaction_id.as_deref())?;
         let client_ip = Some(self.extract_client_ip(&request));
         let batches = self
             .query_handler
@@ -2338,13 +2394,22 @@ impl FlightSqlService for SqeFlightSqlService {
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
         let session = self.get_session_from_request(&request).await?;
-        // Bulk ingest commits straight to main; it does not run in the
-        // session's SQL transaction (#821).
-        if session.transaction_id.is_some() || ticket.transaction_id.is_some() {
+        // Inside a transaction (BEGIN, or the request's id) the ingest writes
+        // to the transaction's branch like an INSERT does (#824). A DB-API
+        // driver attaches its transaction to every ingest once the server
+        // advertises transactions, so refusing it here would break
+        // `adbc_ingest` on a default connection.
+        let session = in_request_transaction(session, ticket.transaction_id.as_deref())?;
+        if session.transaction_id.is_some() && session.write_branch.is_some() {
             return Err(Status::failed_precondition(
-                "Bulk ingest only runs in autocommit; COMMIT or ROLLBACK the transaction first",
+                "Transactions publish to main; RESET WRITE_BRANCH before \
+                 writing inside a transaction",
             ));
         }
+        let txn = self
+            .query_handler
+            .transaction_scope(&session)
+            .map_err(|e| sqe_error_to_status(&e, None))?;
 
         // Build qualified table name from catalog + schema + table
         let mut qualified = String::new();
@@ -2380,12 +2445,16 @@ impl FlightSqlService for SqeFlightSqlService {
         // that bulk-loaded here and then counted rows on the same connection
         // read the pre-ingest snapshot until the cache TTL expired. Keep the
         // ingest going through a `WriteHandler` entry point for that reason.
-        let rows = self
-            .query_handler
-            .write_handler()
-            .handle_ingest_streaming(&session, &qualified, Box::pin(flight_stream))
-            .await
-            .map_err(|e| sqe_error_to_status(&e, None))?;
+        let rows = sqe_catalog::txn::scope(
+            txn,
+            self.query_handler.write_handler().handle_ingest_streaming(
+                &session,
+                &qualified,
+                Box::pin(flight_stream),
+            ),
+        )
+        .await
+        .map_err(|e| sqe_error_to_status(&e, None))?;
         // `after_commit` drops the session and table-metadata caches; the
         // result cache lives on the QueryHandler, so a SELECT of the same
         // text kept serving pre-ingest rows until its TTL (#746). Same call
@@ -2447,6 +2516,7 @@ impl FlightSqlService for SqeFlightSqlService {
             .await?;
         self.bind_prepared_from_stream(&statement, request.into_inner())
             .await?;
+        let session = in_request_transaction(session, statement.transaction_handle())?;
         let sql = render_bound_sql(&statement)?;
 
         let batches = self
@@ -2470,6 +2540,7 @@ impl FlightSqlService for SqeFlightSqlService {
                 .check(&session.user.username)
                 .map_err(|e| Status::resource_exhausted(e.to_string()))?;
         }
+        let session = in_request_transaction(session, query.transaction_id.as_deref())?;
         let sql = &query.query;
 
         debug!(username = %session.user.username, sql_len = sql.len(), "Creating prepared statement");
@@ -2521,7 +2592,8 @@ impl FlightSqlService for SqeFlightSqlService {
             plan,
             param_types,
             Arc::clone(&dataset_schema),
-        );
+        )
+        .with_transaction_id(client_transaction_of(&session));
         let parameter_schema = statement.parameter_schema();
         let statement_id = self
             .prepared_statements
@@ -2582,20 +2654,57 @@ impl FlightSqlService for SqeFlightSqlService {
         Err(Status::unimplemented("Substrait plans not supported"))
     }
 
+    /// Open a transaction whose id the client carries on its requests
+    /// (#824). The id is not stored on the session: any session of the same
+    /// user that presents it runs in the transaction, which is what lets a
+    /// driver spread one transaction over several connections. One the
+    /// client abandons is rolled back by the 30-minute idle timeout.
     async fn do_action_begin_transaction(
         &self,
         _query: ActionBeginTransactionRequest,
-        _request: Request<Action>,
+        request: Request<Action>,
     ) -> Result<ActionBeginTransactionResult, Status> {
-        Err(Status::unimplemented("Transactions not supported"))
+        let session = self.get_session_from_request(&request).await?;
+        let client_ip = Some(self.extract_client_ip(&request));
+        let id = self
+            .query_handler
+            .begin_client_transaction(&session, client_ip)
+            .map_err(|e| sqe_error_to_status(&e, None))?;
+        debug!(username = %session.user.username, "BeginTransaction");
+        Ok(ActionBeginTransactionResult {
+            transaction_id: id.into_bytes().into(),
+        })
     }
 
+    /// COMMIT or ROLLBACK a transaction `BeginTransaction` opened, with the
+    /// SQL statements' semantics: a conflict is `Aborted` and ends the
+    /// transaction, any other commit failure keeps it open for a retry.
     async fn do_action_end_transaction(
         &self,
-        _query: ActionEndTransactionRequest,
-        _request: Request<Action>,
+        query: ActionEndTransactionRequest,
+        request: Request<Action>,
     ) -> Result<(), Status> {
-        Err(Status::unimplemented("Transactions not supported"))
+        let session = self.get_session_from_request(&request).await?;
+        // `EndTransaction` values; arrow-flight does not export the enum.
+        let commit = match query.action {
+            1 => true,
+            2 => false,
+            _ => {
+                return Err(Status::invalid_argument(format!(
+                    "EndTransaction action {} is neither COMMIT nor ROLLBACK",
+                    query.action
+                )))
+            }
+        };
+        if query.transaction_id.is_empty() {
+            return Err(Status::invalid_argument("EndTransaction needs a transaction_id"));
+        }
+        let session = in_request_transaction(session, Some(&query.transaction_id))?;
+        let client_ip = Some(self.extract_client_ip(&request));
+        self.query_handler
+            .end_client_transaction(&session, commit, client_ip)
+            .await
+            .map_err(|e| sqe_error_to_status(&e, None))
     }
 
     async fn do_action_begin_savepoint(
@@ -3989,6 +4098,167 @@ catalog_url = ""
             .resolve_statement_handle(&owner, &query_id.to_string())
             .await
             .is_ok());
+    }
+
+    use prost::bytes::Bytes;
+
+    async fn begin(service: &SqeFlightSqlService, token: &str) -> Bytes {
+        service
+            .do_action_begin_transaction(
+                ActionBeginTransactionRequest {},
+                authed(token, Action::default()),
+            )
+            .await
+            .expect("BeginTransaction")
+            .transaction_id
+    }
+
+    async fn end(
+        service: &SqeFlightSqlService,
+        token: &str,
+        id: &Bytes,
+        action: i32,
+    ) -> Result<(), Status> {
+        service
+            .do_action_end_transaction(
+                ActionEndTransactionRequest {
+                    transaction_id: id.clone(),
+                    action,
+                },
+                authed(token, Action::default()),
+            )
+            .await
+    }
+
+    /// #824: `BeginTransaction` mints an id the client carries; a statement
+    /// planned with it parks the id on its ticket so `DoGet` (whose ticket
+    /// has no transaction field) runs in the same transaction. COMMIT ends
+    /// it: a second COMMIT fails, a ROLLBACK of the ended id is lenient.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn begin_transaction_id_rides_the_ticket_and_commit_ends_it() {
+        let (service, token, _tracker) = cancel_test_service().await;
+        let id = begin(&service, &token).await;
+        let id_str = std::str::from_utf8(&id).expect("utf-8 id").to_string();
+        assert!(uuid::Uuid::parse_str(&id_str).is_ok(), "id is a UUID: {id_str}");
+
+        let info = service
+            .get_flight_info_statement(
+                CommandStatementQuery {
+                    query: "SELECT 1".to_string(),
+                    transaction_id: Some(id.clone()),
+                },
+                authed(&token, FlightDescriptor::new_cmd(vec![])),
+            )
+            .await
+            .expect("GetFlightInfo in the transaction");
+        let ticket = info.into_inner().endpoint[0].ticket.clone().expect("ticket");
+        let handle = decode_ticket(&ticket).handle;
+        let query_id = uuid::Uuid::parse_str(&handle).expect("uuid handle");
+        let pending = service.pending_statements.get(&query_id).await.expect("pending");
+        assert_eq!(pending.transaction_id.as_deref(), Some(id_str.as_str()));
+
+        // DoGet runs it, in the transaction.
+        let fetch = decode_ticket(&ticket);
+        service
+            .do_get_fallback(authed(&token, ticket.clone()), fetch.as_any())
+            .await
+            .expect("DoGet in the transaction");
+
+        end(&service, &token, &id, 1).await.expect("COMMIT");
+        let again = end(&service, &token, &id, 1).await.expect_err("already ended");
+        assert_eq!(again.code(), tonic::Code::Aborted, "{again}");
+        end(&service, &token, &id, 2)
+            .await
+            .expect("ROLLBACK of an ended transaction is lenient");
+    }
+
+    /// #824: an `EndTransaction` that is neither COMMIT nor ROLLBACK, or has
+    /// no id, is refused; so is ending another user's transaction.
+    #[tokio::test]
+    async fn end_transaction_refuses_bad_actions_and_other_users() {
+        let (service, token, _tracker) = cancel_test_service().await;
+        let id = begin(&service, &token).await;
+
+        let err = end(&service, &token, &id, 0).await.expect_err("UNSPECIFIED");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        let err = end(&service, &token, &Bytes::new(), 1).await.expect_err("no id");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        // The anonymous provider maps every login to one user, so the other
+        // user is built here and goes straight to the handler, which is
+        // where ownership is checked.
+        let bob = sqe_core::Session::new(
+            "bob".to_string(),
+            sqe_core::SecretString::new("tok".to_string()),
+            None,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            vec![],
+        )
+        .with_client_transaction_id(String::from_utf8(id.to_vec()).expect("utf-8"));
+        service
+            .query_handler
+            .end_client_transaction(&bob, true, None)
+            .await
+            .expect_err("bob cannot commit the other user's transaction");
+        end(&service, &token, &id, 2).await.expect("the owner rolls back");
+    }
+
+    /// #824: a request's transaction id applies to a session not already in
+    /// a transaction; a session that ran `BEGIN` keeps its own and refuses a
+    /// different one. An empty id is no transaction, a non-UTF-8 one is bad
+    /// input.
+    #[test]
+    fn request_transaction_applies_only_to_a_session_outside_one() {
+        let session = Arc::new(sqe_core::Session::new(
+            "alice".to_string(),
+            sqe_core::SecretString::new("tok".to_string()),
+            None,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            vec![],
+        ));
+
+        let same = in_request_transaction(Arc::clone(&session), Some(b"")).expect("empty id");
+        assert!(same.transaction_id.is_none());
+        let held = in_request_transaction(Arc::clone(&session), Some(b"t1")).expect("applies");
+        assert!(held.in_client_transaction());
+        assert_eq!(client_transaction_of(&held).as_deref(), Some("t1"));
+
+        let err = in_request_transaction(Arc::clone(&session), Some(&[0xff, 0xfe]))
+            .expect_err("not utf-8");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        let begun = Arc::new(
+            (*session)
+                .clone()
+                .with_transaction_id(Some("t0".to_string())),
+        );
+        let err = in_request_transaction(Arc::clone(&begun), Some(b"t1"))
+            .expect_err("BEGIN's transaction is not switched");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        let kept = in_request_transaction(Arc::clone(&begun), Some(b"t0")).expect("same id");
+        assert!(!kept.in_client_transaction(), "BEGIN's id stays BEGIN's");
+        assert_eq!(client_transaction_of(&kept), None);
+    }
+
+    /// #824: the server advertises the transaction RPCs and the semantics a
+    /// driver plans around.
+    #[test]
+    fn sql_info_advertises_transactions() {
+        let data = build_sql_info_data().expect("sql info");
+        let keys = [
+            SqlInfo::FlightSqlServerTransaction,
+            SqlInfo::FlightSqlServerIngestTransactionsSupported,
+            SqlInfo::SqlTransactionsSupported,
+            SqlInfo::SqlDefaultTransactionIsolation,
+            SqlInfo::SqlSupportedTransactionsIsolationLevels,
+            SqlInfo::SqlDataDefinitionCausesTransactionCommit,
+            SqlInfo::SqlDataDefinitionsInTransactionsIgnored,
+        ];
+        let query = CommandGetSqlInfo {
+            info: keys.iter().map(|k| *k as u32).collect(),
+        };
+        let batch = query.into_builder(&data).build().expect("filtered batch");
+        assert_eq!(batch.num_rows(), keys.len(), "every transaction key is present");
     }
 
     /// The running-query half: DoGet runs the statement under the ticket's

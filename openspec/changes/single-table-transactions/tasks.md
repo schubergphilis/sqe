@@ -31,8 +31,8 @@
 
 ## 5. Wire protocols
 
-- [ ] 5.1 Flight SQL `BeginTransaction` / `EndTransaction`; `transaction_id` honoured on statement, update, ingest and prepared commands (deferred; SQL `BEGIN` / `COMMIT` works over Flight, ingest is refused inside a transaction)
-- [ ] 5.2 Flight SqlInfo 8 / 563 / 564 / 11 updated (with 5.1)
+- [x] 5.1 Flight SQL `BeginTransaction` / `EndTransaction`; `transaction_id` honoured on statement, update, ingest and prepared commands. The client holds the id; DDL and CTAS inside it autocommit and leave it open; a prepared statement is bound to the transaction it was created in
+- [x] 5.2 Flight SqlInfo 8 (Transaction) / 11 / 562 (READ_COMMITTED) / 563 / 564 / 565 / 566 updated (with 5.1)
 - [x] 5.3 Trino: allow DML inside a transaction (DDL, CTAS and Hive writes stay refused); `COMMIT` / `ROLLBACK` publish or drop the branch, clear header only on success
 - [ ] 5.4 dbt-sqe: decide whether models should run inside a real transaction (separate change)
 
@@ -40,4 +40,4 @@
 
 - [ ] 6.1 OCSF events for begin / commit / rollback; lineage at `COMMIT`
 - [~] 6.2 Book: transactions section in `sql-reference/dml.md` (#824); a dedicated page is still open. Scope: transactions page (branch model, serializable abort, visibility of in-flight branches, SQE vs Trino connector difference)
-- [~] 6.3 sqlite-rig tests in `sqe-write`: commit, read-your-writes, concurrent-commit abort, rollback, empty table, second-table refusal. Still open: integration tests under `make test-integration`, ADBC `autocommit=False`, Trino JDBC `setAutoCommit(false)`
+- [~] 6.3 sqlite-rig tests in `sqe-write`: commit, read-your-writes, concurrent-commit abort, rollback, empty table, second-table refusal. Integration tests under `make test-integration`: multi-table commit and conflict (#823), client-held RPC transaction with DDL autocommit, rollback and commit. Still open: an automated ADBC `autocommit=False` test, Trino JDBC `setAutoCommit(false)`
