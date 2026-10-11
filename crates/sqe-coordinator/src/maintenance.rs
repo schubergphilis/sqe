@@ -2418,6 +2418,23 @@ impl MaintenanceHandler {
             .create_catalog_bridge(session, table_ref.catalog.as_deref())
             .await?;
         let ident = to_table_ident(table_ref);
+        // Branches a crashed coordinator left behind go first, so their
+        // snapshots expire in this same call. Best-effort: a lost commit
+        // race leaves them for the next call, not this expiry undone.
+        let txn_branches = sqe_catalog::txn::drop_stale_branches(
+            catalog.as_ref(),
+            &ident,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            warn!(
+                table = %ident,
+                error = %e,
+                "expire_snapshots: stale transaction branches not dropped"
+            );
+            Vec::new()
+        });
         let table = load_table(&catalog, &ident).await?;
 
         let before_count = table.metadata().snapshots().count() as i64;
@@ -2468,7 +2485,10 @@ impl MaintenanceHandler {
             after_count,
             0,
             0,
-            format!("snapshots_removed={removed}"),
+            format!(
+                "snapshots_removed={removed} txn_branches_dropped={}",
+                txn_branches.len()
+            ),
         )?])
     }
 
