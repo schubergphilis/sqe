@@ -3978,7 +3978,7 @@ async fn test_multi_table_transaction_commit() {
     txn_tables(&handler, &session, "txn_multi_a", "txn_multi_b").await;
     let tx = session
         .clone()
-        .with_transaction_id(Some(uuid::Uuid::new_v4().to_string()));
+        .with_transaction_id(Some(sqe_core::txn_id::new_txn_id()));
 
     handler
         .execute(&tx, "INSERT INTO test_ns.txn_multi_a SELECT 4 as id", None)
@@ -4037,7 +4037,7 @@ async fn test_multi_table_transaction_conflict_aborts_both() {
     txn_tables(&handler, &session, "txn_conf_a", "txn_conf_b").await;
     let tx = session
         .clone()
-        .with_transaction_id(Some(uuid::Uuid::new_v4().to_string()));
+        .with_transaction_id(Some(sqe_core::txn_id::new_txn_id()));
 
     handler
         .execute(&tx, "INSERT INTO test_ns.txn_conf_a SELECT 4 as id", None)
