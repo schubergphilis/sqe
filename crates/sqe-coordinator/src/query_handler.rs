@@ -3155,8 +3155,15 @@ impl QueryHandler {
                 }
             }
 
-            // Invalidate cache entries for written tables
-            if let Some(ref cache) = self.query_cache {
+            // Invalidate cache entries for written tables. A write inside a
+            // transaction lands on its private branch and `main` is unchanged,
+            // so no cached result went stale; `COMMIT` clears the cache when
+            // the branch is published (openspec 2.4).
+            let query_cache = self
+                .query_cache
+                .as_ref()
+                .filter(|_| session.transaction_id.is_none());
+            if let Some(cache) = query_cache {
                 match &kind {
                     StatementKind::Insert(stmt) => {
                         if let Statement::Insert(ins) = stmt.as_ref() {

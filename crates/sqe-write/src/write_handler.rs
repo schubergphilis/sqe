@@ -1027,6 +1027,10 @@ impl WriteHandler {
     /// had no call at all: an ADBC client that bulk-loaded and then counted
     /// rows on the same connection read the pre-ingest snapshot until the TTL
     /// expired. Every `WriteHandler` path that reaches a commit calls this.
+    ///
+    /// Inside a transaction the commit only moved the private branch, so
+    /// other principals' copies still describe `main` correctly; only the
+    /// writer's copy is evicted (openspec 2.4).
     async fn after_commit(
         &self,
         session: &Session,
@@ -1038,7 +1042,11 @@ impl WriteHandler {
                 .invalidate_session_cache(&session.user.username)
                 .await;
         }
-        catalog.invalidate_table_all_tokens(table_ident).await;
+        if sqe_catalog::txn::current().is_some() {
+            catalog.invalidate_table(table_ident).await;
+        } else {
+            catalog.invalidate_table_all_tokens(table_ident).await;
+        }
     }
 }
 
@@ -1079,12 +1087,20 @@ pub(crate) trait TableCacheInvalidator: Send + Sync {
     /// only the writer's key leaves others planning against pre-commit
     /// metadata until the soft TTL (architecture review 302).
     async fn invalidate_table_all_tokens(&self, table_ident: &TableIdent);
+
+    /// Evict only the writer's cached copy: a transaction branch write, which
+    /// no other principal reads.
+    async fn invalidate_table(&self, table_ident: &TableIdent);
 }
 
 #[async_trait::async_trait]
 impl TableCacheInvalidator for SessionCatalog {
     async fn invalidate_table_all_tokens(&self, table_ident: &TableIdent) {
         SessionCatalog::invalidate_table_all_tokens(self, table_ident).await;
+    }
+
+    async fn invalidate_table(&self, table_ident: &TableIdent) {
+        SessionCatalog::invalidate_table(self, table_ident).await;
     }
 }
 
@@ -12200,27 +12216,35 @@ s3_path_style = true
         assert_eq!(pruned, 0);
     }
 
+    /// Records which eviction `after_commit` asked for.
+    #[derive(Default)]
+    struct RecordingInvalidator {
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TableCacheInvalidator for RecordingInvalidator {
+        async fn invalidate_table_all_tokens(&self, table_ident: &TableIdent) {
+            self.seen
+                .lock()
+                .expect("recorded idents")
+                .push(format!("all:{table_ident}"));
+        }
+
+        async fn invalidate_table(&self, table_ident: &TableIdent) {
+            self.seen
+                .lock()
+                .expect("recorded idents")
+                .push(format!("own:{table_ident}"));
+        }
+    }
+
     /// 507: `after_commit` evicts the committed table for EVERY token, not just
     /// the writer's. `SessionCatalog` needs a live REST catalog to construct,
     /// so the assertion runs through the `TableCacheInvalidator` seam the hook
     /// takes.
     #[tokio::test]
     async fn after_commit_evicts_the_table_for_every_token() {
-        #[derive(Default)]
-        struct RecordingInvalidator {
-            seen: std::sync::Mutex<Vec<String>>,
-        }
-
-        #[async_trait::async_trait]
-        impl TableCacheInvalidator for RecordingInvalidator {
-            async fn invalidate_table_all_tokens(&self, table_ident: &TableIdent) {
-                self.seen
-                    .lock()
-                    .expect("recorded idents")
-                    .push(table_ident.to_string());
-            }
-        }
-
         let handler = WriteHandler::new(write_test_config());
         let session = test_session(Some("ns"));
         let recorder = RecordingInvalidator::default();
@@ -12230,7 +12254,28 @@ s3_path_style = true
 
         assert_eq!(
             recorder.seen.lock().expect("recorded idents").as_slice(),
-            &["ns.tbl".to_string()]
+            &["all:ns.tbl".to_string()]
+        );
+    }
+
+    /// openspec 2.4: a commit inside a transaction moved only its branch, so
+    /// only the writer's cached copy is evicted.
+    #[tokio::test]
+    async fn after_commit_inside_a_transaction_evicts_only_the_writer() {
+        let handler = WriteHandler::new(write_test_config());
+        let session = test_session(Some("ns"));
+        let recorder = RecordingInvalidator::default();
+        let ident = TableIdent::from_strs(["ns", "tbl"]).unwrap();
+
+        sqe_catalog::txn::scope(
+            Some(sqe_catalog::txn::TxnScope::new(sqe_core::txn_id::new_txn_id())),
+            handler.after_commit(&session, &recorder, &ident),
+        )
+        .await;
+
+        assert_eq!(
+            recorder.seen.lock().expect("recorded idents").as_slice(),
+            &["own:ns.tbl".to_string()]
         );
     }
 
