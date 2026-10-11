@@ -1737,8 +1737,9 @@ impl WriteHandler {
         // Plan the SELECT without executing it; gives us the output schema
         // cheaply. Planning and the policy rewrite are recursive and run on
         // the dedicated planning stack (#640); this is the CTAS + rewriter
-        // path that overflowed a request thread.
-        let (df, policy_summary) = sqe_core::runtime::on_planning_stack(async {
+        // path that overflowed a request thread. `carried`: the planning
+        // thread does not see the task's transaction scope.
+        let (df, policy_summary) = sqe_core::runtime::on_planning_stack(sqe_catalog::txn::carried(async {
             let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, select_sql)
                 .await
                 .map_err(SqeError::planning)?;
@@ -1758,7 +1759,7 @@ impl WriteHandler {
                 .await
                 .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Plan execution failed: {e}")))?;
             Ok::<_, SqeError>((df, policy_summary))
-        })
+        }))
         .await?;
         *policy_summary_out = Some(policy_summary);
 
@@ -2212,7 +2213,6 @@ impl WriteHandler {
         };
 
         let table_ident = resolve_table_ident(table_name, session)?;
-        sqe_catalog::txn::check_target(&table_ident)?;
 
         info!(
             username = %session.user.username,
@@ -2228,6 +2228,7 @@ impl WriteHandler {
         let session_catalog = self
             .resolve_session_catalog(session, target_catalog.as_deref())
             .await?;
+        session_catalog.admit_txn_write(&table_ident).await?;
         let catalog: Arc<dyn Catalog> = session_catalog.as_catalog();
         let table = catalog
             .load_table(&table_ident)
@@ -2277,10 +2278,10 @@ impl WriteHandler {
         // would copy plaintext into sink, bypassing every policy. The rewrite
         // and the physical planning in `execute_stream` are recursive and run
         // on the dedicated planning stack (#640); the stream itself is polled
-        // on the runtime threads.
+        // on the runtime threads, in the transaction scope `carried` brings.
         let source_plan = df.logical_plan().clone();
         let (stream, policy_summary, lineage_plan) =
-            sqe_core::runtime::on_planning_stack(async {
+            sqe_core::runtime::on_planning_stack(sqe_catalog::txn::carried(async {
                 let (enforced_plan, policy_summary) =
                     self.enforce_source_plan(session, &sqe_policy::TableScope::of(ctx), source_plan)
                         .await?;
@@ -2309,7 +2310,7 @@ impl WriteHandler {
 
                 let stream = self.execute_source_stream(df, "INSERT source").await?;
                 Ok::<_, SqeError>((stream, policy_summary, lineage_plan))
-            })
+            }))
             .await?;
         *policy_summary_out = Some(policy_summary);
         if let Some(wrapper) = lineage_plan {
@@ -2781,7 +2782,7 @@ impl WriteHandler {
         policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_ident = resolve_delete_target_ident(stmt, session)?;
-        sqe_catalog::txn::check_target(&table_ident)?;
+        catalog.admit_txn_write(&table_ident).await?;
         let delete = match stmt {
             Statement::Delete(d) => d,
             // unreachable: resolve_delete_target_ident above already filtered.
@@ -2998,7 +2999,7 @@ impl WriteHandler {
         policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_ident = resolve_delete_target_ident(stmt, session)?;
-        sqe_catalog::txn::check_target(&table_ident)?;
+        catalog.admit_txn_write(&table_ident).await?;
         let delete = match stmt {
             Statement::Delete(d) => d,
             other => {
@@ -3372,7 +3373,7 @@ impl WriteHandler {
         policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_ident = resolve_delete_target_ident(stmt, session)?;
-        sqe_catalog::txn::check_target(&table_ident)?;
+        catalog.admit_txn_write(&table_ident).await?;
         let delete = match stmt {
             Statement::Delete(d) => d,
             other => {
@@ -3681,7 +3682,7 @@ impl WriteHandler {
         policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_ident = resolve_update_target_ident(stmt, session)?;
-        sqe_catalog::txn::check_target(&table_ident)?;
+        catalog.admit_txn_write(&table_ident).await?;
         let (assignments, selection) = match stmt {
             Statement::Update(update) => (&update.assignments, &update.selection),
             other => {
@@ -3995,7 +3996,7 @@ impl WriteHandler {
         policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_ident = resolve_update_target_ident(stmt, session)?;
-        sqe_catalog::txn::check_target(&table_ident)?;
+        catalog.admit_txn_write(&table_ident).await?;
         let (assignments, selection) = match stmt {
             Statement::Update(update) => (&update.assignments, &update.selection),
             other => {
@@ -4304,7 +4305,7 @@ impl WriteHandler {
         };
 
         let table_ident = resolve_table_ident(target_table_name, session)?;
-        sqe_catalog::txn::check_target(&table_ident)?;
+        catalog.admit_txn_write(&table_ident).await?;
 
         // Extract source alias (needed for column references in the JOIN)
         let source_alias = match source_factor {
@@ -5155,7 +5156,7 @@ impl WriteHandler {
             }
         };
         let table_ident = resolve_table_ident(target_table_name, session)?;
-        sqe_catalog::txn::check_target(&table_ident)?;
+        catalog.admit_txn_write(&table_ident).await?;
 
         let source_alias = match source_factor {
             TableFactor::Table { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),
@@ -12753,25 +12754,98 @@ s3_path_style = true
             );
         }
 
+        // --- Multi-table transactions (#823) -----------------------------
+
         #[tokio::test(flavor = "multi_thread")]
-        async fn a_second_table_is_refused_before_it_is_written() {
+        async fn two_tables_publish_together_at_commit() {
             let rig = SqliteRig::new().await;
             let h = handler(&rig);
-            seeded_id_v(&rig, "tx_first").await;
-            let other = seeded_id_v(&rig, "tx_second").await;
-            let other_snapshots = snapshot_count(&rig.load(&other).await);
+            let a = seeded_id_v(&rig, "tx_multi_a").await;
+            let b = seeded_id_v(&rig, "tx_multi_b").await;
             let txn = new_txn();
 
-            insert_in(&h, &rig, &txn, "INSERT INTO default.tx_first VALUES (4, 'd')")
+            insert_in(&h, &rig, &txn, "INSERT INTO default.tx_multi_a VALUES (4, 'd')")
                 .await
-                .expect("INSERT");
-            let err = insert_in(&h, &rig, &txn, "INSERT INTO default.tx_second VALUES (4, 'd')")
+                .expect("INSERT into a");
+            let deleted = sqe_catalog::txn::scope(
+                Some(Arc::clone(&txn)),
+                run_delete(&h, &rig, "DELETE FROM default.tx_multi_b WHERE id = 2"),
+            )
+            .await
+            .expect("DELETE from b");
+            assert_eq!(deleted, 1);
+            assert_eq!(txn.tables().len(), 2);
+            assert_eq!(
+                rows_in_txn(&rig, &txn, &b).await,
+                vec![(1, s("a")), (3, s("c"))],
+                "reads its own delete"
+            );
+            let seed = vec![(1, s("a")), (2, s("b")), (3, s("c"))];
+            assert_eq!(rows_of(rig.load(&a).await).await, seed, "a: main untouched");
+            assert_eq!(rows_of(rig.load(&b).await).await, seed, "b: main untouched");
+
+            sqe_catalog::txn::publish(&txn).await.expect("COMMIT");
+            let (ta, tb) = (rig.load(&a).await, rig.load(&b).await);
+            assert!(txn_refs(&ta).is_empty() && txn_refs(&tb).is_empty());
+            assert_eq!(
+                rows_of(ta).await,
+                vec![(1, s("a")), (2, s("b")), (3, s("c")), (4, s("d"))]
+            );
+            assert_eq!(rows_of(tb).await, vec![(1, s("a")), (3, s("c"))]);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_conflict_on_one_table_rolls_back_both() {
+            let rig = SqliteRig::new().await;
+            let h = handler(&rig);
+            let a = seeded_id_v(&rig, "tx_multi_conflict_a").await;
+            let b = seeded_id_v(&rig, "tx_multi_conflict_b").await;
+            let a_main = rig.load(&a).await.metadata().current_snapshot_id();
+            let txn = new_txn();
+
+            insert_in(&h, &rig, &txn, "INSERT INTO default.tx_multi_conflict_a VALUES (4, 'd')")
                 .await
-                .expect_err("second table");
-            assert_eq!(err.error_code(), sqe_core::SqeErrorCode::NotSupported, "{err}");
-            let table = rig.load(&other).await;
-            assert_eq!(snapshot_count(&table), other_snapshots);
-            assert!(txn_refs(&table).is_empty());
+                .expect("INSERT into a");
+            insert_in(&h, &rig, &txn, "INSERT INTO default.tx_multi_conflict_b VALUES (4, 'd')")
+                .await
+                .expect("INSERT into b");
+            // Another session commits to b only.
+            append_rows(&rig.catalog, &b, vec![id_v_batch(&[(99, "late")])]).await;
+
+            let err = sqe_catalog::txn::publish(&txn)
+                .await
+                .expect_err("b's main moved under the transaction");
+            assert_eq!(err.error_code(), sqe_core::SqeErrorCode::TransactionConflict, "{err}");
+            let (ta, tb) = (rig.load(&a).await, rig.load(&b).await);
+            assert!(txn_refs(&ta).is_empty(), "a conflict drops a's branch too");
+            assert!(txn_refs(&tb).is_empty());
+            assert_eq!(ta.metadata().current_snapshot_id(), a_main, "a never moved");
+            assert_eq!(
+                rows_of(tb).await,
+                vec![(1, s("a")), (2, s("b")), (3, s("c")), (99, s("late"))]
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn rollback_drops_every_branch() {
+            let rig = SqliteRig::new().await;
+            let h = handler(&rig);
+            let a = seeded_id_v(&rig, "tx_multi_rb_a").await;
+            let b = seeded_id_v(&rig, "tx_multi_rb_b").await;
+            let txn = new_txn();
+
+            insert_in(&h, &rig, &txn, "INSERT INTO default.tx_multi_rb_a VALUES (4, 'd')")
+                .await
+                .expect("INSERT into a");
+            insert_in(&h, &rig, &txn, "INSERT INTO default.tx_multi_rb_b VALUES (4, 'd')")
+                .await
+                .expect("INSERT into b");
+            assert_eq!(txn_refs(&rig.load(&a).await).len(), 1);
+            assert_eq!(txn_refs(&rig.load(&b).await).len(), 1);
+
+            sqe_catalog::txn::discard(&txn).await;
+            assert!(txn_refs(&rig.load(&a).await).is_empty());
+            assert!(txn_refs(&rig.load(&b).await).is_empty());
         }
 
         #[tokio::test(flavor = "multi_thread")]

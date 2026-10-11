@@ -3137,6 +3137,48 @@ impl SessionCatalog {
         debug!(table = %table_ident, "Table cache and name listings invalidated for all tokens");
     }
 
+    /// Identifies this catalog to a transaction: every table it writes must
+    /// share the key, because COMMIT publishes them in one catalog call.
+    pub(crate) fn txn_catalog_key(&self) -> String {
+        format!("{}|{}", self.catalog_url.trim_end_matches('/'), self.warehouse)
+    }
+
+    /// Refuse a write to `table_ident` that the current transaction could not
+    /// publish atomically with the tables it already wrote (#823): a table in
+    /// another catalog, or a second table in a catalog with no multi-table
+    /// commit. Call it before the statement writes any data file; outside a
+    /// transaction it does nothing.
+    pub async fn admit_txn_write(&self, table_ident: &TableIdent) -> sqe_core::Result<()> {
+        match crate::txn::current() {
+            Some(txn) => self.admit_txn_write_in(&txn, table_ident).await,
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) async fn admit_txn_write_in(
+        &self,
+        txn: &crate::txn::TxnScope,
+        table_ident: &TableIdent,
+    ) -> sqe_core::Result<()> {
+        let needs_atomic = txn.tables().iter().any(|t| &t.ident != table_ident);
+        // For REST, ask what the server advertised (`GET /v1/config`), so a
+        // server without `POST /v1/transactions/commit` is refused here and
+        // not at COMMIT, after both tables were written.
+        let atomic = match (&self.inner, needs_atomic) {
+            (_, false) => true,
+            (CatalogHandle::Rest(rest), true) => {
+                rest.advertises_commit_transaction().await.map_err(|e| {
+                    SqeError::catalog_src(
+                        "Failed to read the catalog's advertised endpoints".to_string(),
+                        e,
+                    )
+                })?
+            }
+            (CatalogHandle::Other(catalog), true) => catalog.supports_commit_transaction(),
+        };
+        crate::txn::admit(txn, table_ident, &self.txn_catalog_key(), || atomic)
+    }
+
     /// Check if a table exists.
     pub async fn table_exists(&self, table_ident: &TableIdent) -> sqe_core::Result<bool> {
         dispatch_catalog!(self.inner, table_exists(table_ident)).map_err(|e| {
@@ -3607,6 +3649,24 @@ impl Catalog for SessionCatalogBridge {
         result
     }
 
+    fn supports_commit_transaction(&self) -> bool {
+        match &self.session.inner {
+            CatalogHandle::Rest(_) => true,
+            CatalogHandle::Other(catalog) => catalog.supports_commit_transaction(),
+        }
+    }
+
+    async fn commit_transaction(&self, commits: Vec<iceberg::TableCommit>) -> iceberg::Result<()> {
+        let idents: Vec<TableIdent> = commits.iter().map(|c| c.identifier().clone()).collect();
+        let result = dispatch_catalog!(self.session.inner, commit_transaction(commits));
+        // As in `update_table`: every principal's cached copy is stale, and
+        // a failure may still have committed (unknown commit state).
+        for ident in &idents {
+            self.session.invalidate_table_all_tokens(ident).await;
+        }
+        result
+    }
+
     async fn update_table(&self, commit: iceberg::TableCommit) -> iceberg::Result<Table> {
         let ident = commit.identifier().clone();
         // Inside a transaction every write goes to the transaction branch and
@@ -3630,11 +3690,23 @@ impl Catalog for SessionCatalogBridge {
             ));
         }
         let branch_commit = txn.filter(|txn| sets_ref(&txn.branch_name()));
+        if let Some(txn) = &branch_commit {
+            // The statement was admitted before it wrote; this catches a
+            // write path that skipped the check, before its branch lands
+            // where COMMIT cannot publish it (#823).
+            self.session
+                .admit_txn_write_in(txn, &ident)
+                .await
+                .map_err(bridge_error)?;
+        }
         let result = dispatch_catalog!(self.session.inner, update_table(commit));
         if let (Some(txn), Ok(_)) = (branch_commit, &result) {
-            txn.bind_catalog(Arc::new(SessionCatalogBridge {
-                session: Arc::clone(&self.session),
-            }));
+            txn.bind_catalog(
+                self.session.txn_catalog_key(),
+                Arc::new(SessionCatalogBridge {
+                    session: Arc::clone(&self.session),
+                }),
+            );
         }
         // A table commit is visible to every principal. Evict every token's
         // copy so a different user cannot rebuild a SessionContext from stale
