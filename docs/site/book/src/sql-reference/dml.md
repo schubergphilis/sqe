@@ -185,7 +185,19 @@ SET WRITE_BRANCH = DEFAULT;
 | `USE catalog.schema` | `sqe-sql/classifier.rs` | Switch active catalog and schema. Subsequent unqualified table references use this scope. Over the Trino protocol the scope travels back as `X-Trino-Set-Catalog` / `X-Trino-Set-Schema` and the client echoes it; over Flight SQL it is stored on the session behind the bearer token, so every later request on that token, on any connection, resolves in the new scope. `current_schema()` reports it. |
 | `USE schema` | `sqe-sql/classifier.rs` | Switch schema only; the catalog stays as it was. |
 | `SET <variable> = <value>` | `sqlparser-rs` (DataFusion) | DataFusion session config. See `EXPLAIN ANALYZE` documentation for valid keys. |
-| `BEGIN` / `START TRANSACTION` / `COMMIT` / `ROLLBACK` / `SET TRANSACTION` | `sqe-sql/classifier.rs` | Autocommit-only transactions, as in Trino's Iceberg connector. Inside an open transaction reads and session statements run, and a write or DDL statement fails with `AUTOCOMMIT_WRITE_CONFLICT`; every write is its own single-statement commit. Over Trino the transaction travels in `X-Trino-Transaction-Id`. Over Flight SQL it is stored on the session behind the bearer token, like `USE`, so it spans every connection on that token and lasts until `COMMIT` / `ROLLBACK` on the same token or until the session expires. A client that sends `BEGIN` and disconnects leaves later writes on its token refused until then. A nested `BEGIN`, `SNAPSHOT` isolation and savepoints are refused. |
+| `BEGIN` / `START TRANSACTION` / `COMMIT` / `ROLLBACK` / `SET TRANSACTION` | `sqe-sql/classifier.rs` | Explicit transactions. See [Transactions](#transactions). |
+
+## Transactions
+
+Inside `START TRANSACTION` (or `BEGIN`), `INSERT`, `UPDATE`, `DELETE`, `MERGE` and `TRUNCATE` write to a private branch, `sqe-txn-<id>`, of each table they touch. Later statements of the transaction read those writes. Nobody else sees them. `COMMIT` publishes every branch to `main` in one catalog commit. If another writer moved a table first, `COMMIT` fails with `TRANSACTION_CONFLICT`, nothing is published, and the client retries the whole transaction. `ROLLBACK` drops the branches.
+
+A transaction may write several tables in one catalog when the catalog commits them atomically: a REST catalog that serves `/v1/transactions/commit` (Polaris) or the embedded SQLite catalog. DDL, CTAS, writes to a second catalog and Hive writes stay refused with `AUTOCOMMIT_WRITE_CONFLICT`. A nested `BEGIN`, `SNAPSHOT` isolation and savepoints are refused. A transaction idle for 30 minutes is rolled back.
+
+The transaction lives in the memory of the coordinator that started it. Over Trino the client carries its id in `X-Trino-Transaction-Id`, and the id names the coordinator process that minted it. A statement or `COMMIT` that reaches another coordinator, or the same one after a restart, fails with `TRANSACTION_CONFLICT` ("not found on this coordinator"). `ROLLBACK` of such an id succeeds, so the client can start over. Route every request of a transaction to one coordinator; SQE supports one coordinator replica today (see [Kubernetes](../deployment/kubernetes.md)).
+
+Over Flight SQL the id is stored on the session behind the bearer token, like `USE`. It spans every connection on that token. When the session ends (idle timeout, token expiry, a restart, or the session cap), the transaction is rolled back. The client is not told. Its next request authenticates a fresh session with no transaction, so later writes commit one by one and `COMMIT` is a no-op. Keep Flight SQL transactions shorter than the session idle timeout and the token lifetime.
+
+A graceful shutdown rolls back every open transaction. A crash leaves the branches behind. They hold no visible data, and `ALTER TABLE ... DROP BRANCH` removes them.
 
 ## Comparison summary
 
@@ -200,4 +212,4 @@ SET WRITE_BRANCH = DEFAULT;
 | `TRUNCATE TABLE` | yes (rewrites to DELETE) | yes | yes | yes |
 | `COPY TO` | yes | - | - | yes |
 | Branch-routed writes | `SET WRITE_BRANCH` (SQE) | partial | yes | - |
-| Multi-statement transactions | no (no-op stubs) | no | no | yes |
+| Multi-statement transactions | yes (DML; one catalog) | no | no | yes |

@@ -22,9 +22,12 @@
 
 - [x] 4.1 `TxnScope` (task-local) and `TxnRegistry` in the coordinator: UUID ids, owner check, 30-minute idle sweep, 24-hour tombstones for ended ids
 - [x] 4.2 `COMMIT` publishes; a requirement failure becomes `TransactionConflict` (Trino `TRANSACTION_CONFLICT`, gRPC `Aborted`); any other failure keeps the transaction open
-- [~] 4.3 `ROLLBACK` and the idle timeout drop the branch; added files are left to orphan-file cleanup. Session end and token expiry: deferred
+- [x] 4.3 `ROLLBACK` and the idle timeout drop the branch; added files are left to orphan-file cleanup. Session end and token expiry roll back through the `SessionManager::on_session_end` hook (#824)
 - [ ] 4.4 Sweep stale `sqe-txn-*` branches left by a crashed coordinator
 - [ ] 4.5 Verify that orphan-file cleanup treats files reachable from any ref as live
+- [x] 4.6 Routing (#824): ids carry the coordinator's incarnation (`sqe_core::txn_id`); a foreign id is `TransactionConflict` "not found on this coordinator", `ROLLBACK` of it succeeds
+- [x] 4.7 Graceful shutdown rolls back every open transaction (`shutdown_with_drain` `before_close`, 10 s bound)
+- [x] 4.8 Metrics: `sqe_transactions_open`, `sqe_transactions_ended_total{outcome}`, `sqe_transaction_duration_seconds`, `sqe_transaction_not_found_total`, `sqe_transaction_branch_drop_failures_total`
 
 ## 5. Wire protocols
 
@@ -36,5 +39,5 @@
 ## 6. Audit, docs, tests
 
 - [ ] 6.1 OCSF events for begin / commit / rollback; lineage at `COMMIT`
-- [ ] 6.2 Book: transactions page (branch model, serializable abort, visibility of in-flight branches, SQE vs Trino connector difference)
+- [~] 6.2 Book: transactions section in `sql-reference/dml.md` (#824); a dedicated page is still open. Scope: transactions page (branch model, serializable abort, visibility of in-flight branches, SQE vs Trino connector difference)
 - [~] 6.3 sqlite-rig tests in `sqe-write`: commit, read-your-writes, concurrent-commit abort, rollback, empty table, second-table refusal. Still open: integration tests under `make test-integration`, ADBC `autocommit=False`, Trino JDBC `setAutoCommit(false)`

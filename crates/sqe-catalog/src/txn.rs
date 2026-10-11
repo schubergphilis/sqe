@@ -542,11 +542,13 @@ async fn publish_branch(catalog: &dyn Catalog, txn_table: &TxnTable) -> sqe_core
 /// ROLLBACK, and the end of a failed COMMIT: drop the transaction branch
 /// of every table. Best effort, one table at a time: a branch left behind
 /// holds no visible data, and its `sqe-txn-` name marks it for cleanup.
-pub async fn discard(txn: &TxnScope) {
+/// Returns how many branches could not be dropped.
+pub async fn discard(txn: &TxnScope) -> usize {
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
     let Some(catalog) = txn.catalog() else {
-        return;
+        return 0;
     };
+    let mut failed = 0;
     for TxnTable { ident, branch, .. } in txn.tables() {
         let dropped = async {
             let table = catalog.load_table(&ident).await?;
@@ -562,8 +564,10 @@ pub async fn discard(txn: &TxnScope) {
                 error = %e,
                 "could not drop transaction branch; it holds no visible data"
             );
+            failed += 1;
         }
     }
+    failed
 }
 
 #[cfg(test)]

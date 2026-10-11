@@ -343,6 +343,22 @@ pub struct MetricsRegistry {
     /// operator can use to confirm the lease is doing its job (avoiding
     /// redundant rewrites) rather than every coordinator racing every tick.
     pub maintenance_lease_skipped_total: IntCounter,
+
+    // Explicit transactions (#824).
+    /// Transactions open on this coordinator: ran at least one statement,
+    /// not yet committed or rolled back.
+    pub transactions_open: IntGauge,
+    /// Transactions that ended, by `outcome`: `committed`, `rolled_back`,
+    /// `conflict`, `idle_timeout`, `session_ended`, `shutdown`.
+    pub transactions_ended_total: IntCounterVec,
+    /// Seconds from a transaction's first statement to its end.
+    pub transaction_duration_seconds: Histogram,
+    /// Statements refused because their transaction id belongs to another
+    /// coordinator or to this one before a restart.
+    pub transaction_not_found_total: IntCounter,
+    /// Transaction branches a ROLLBACK or abort could not drop. The branch
+    /// holds no visible data; `DROP BRANCH` removes it.
+    pub transaction_branch_drop_failures_total: IntCounter,
 }
 
 impl MetricsRegistry {
@@ -951,6 +967,39 @@ impl MetricsRegistry {
             "Active-mode table-ticks skipped because another coordinator holds the catalog lease",
         )?;
 
+        // #824: explicit transactions.
+        let transactions_open = register_int_gauge(
+            &registry,
+            "sqe_transactions_open",
+            "Explicit transactions open on this coordinator",
+        )?;
+        let transactions_ended_total = register_int_counter_vec(
+            &registry,
+            "sqe_transactions_ended_total",
+            "Explicit transactions that ended, by outcome",
+            &["outcome"],
+        )?;
+        let transaction_duration_seconds = register_histogram(
+            &registry,
+            HistogramOpts::new(
+                "sqe_transaction_duration_seconds",
+                "Seconds from a transaction's first statement to its end",
+            )
+            .buckets(vec![
+                0.1, 0.5, 1.0, 5.0, 15.0, 60.0, 300.0, 900.0, 1800.0, 3600.0,
+            ]),
+        )?;
+        let transaction_not_found_total = register_int_counter(
+            &registry,
+            "sqe_transaction_not_found_total",
+            "Statements refused because their transaction is not on this coordinator",
+        )?;
+        let transaction_branch_drop_failures_total = register_int_counter(
+            &registry,
+            "sqe_transaction_branch_drop_failures_total",
+            "Transaction branches a rollback or abort could not drop",
+        )?;
+
         Ok(Self {
             registry,
             query_count,
@@ -1037,6 +1086,11 @@ impl MetricsRegistry {
             maintenance_bytes_rewritten_total,
             maintenance_skipped_total,
             maintenance_lease_skipped_total,
+            transactions_open,
+            transactions_ended_total,
+            transaction_duration_seconds,
+            transaction_not_found_total,
+            transaction_branch_drop_failures_total,
         })
     }
 }
