@@ -1230,13 +1230,131 @@ impl QueryHandler {
         // (#821). A refused transaction id runs unscoped here and fails after
         // classification, so ROLLBACK of a transaction that already ended
         // still succeeds.
-        let txn = self.txn_scope(session).ok().flatten();
-        Box::pin(sqe_catalog::txn::scope(
-            txn,
-            sqe_catalog::file_tvf_prepare::in_statement(
-                self.execute_inner(session, sql, client_ip, query_id),
-            ),
-        ))
+        Box::pin(async move {
+            // DDL in a client-held transaction (Flight SQL BeginTransaction)
+            // runs autocommit rather than being refused (#824); BEGIN's
+            // transaction keeps refusing it below.
+            let autocommit = session
+                .in_client_transaction()
+                .then(|| classify_user_sql(session, sql).ok())
+                .flatten()
+                .filter(|kind| !kind.allowed_in_transaction())
+                .map(|_| session.clone().with_transaction_id(None));
+            let session = autocommit.as_ref().unwrap_or(session);
+            let txn = self.txn_scope(session).ok().flatten();
+            sqe_catalog::txn::scope(
+                txn,
+                sqe_catalog::file_tvf_prepare::in_statement(
+                    self.execute_inner(session, sql, client_ip, query_id),
+                ),
+            )
+            .await
+        })
+    }
+
+    /// Flight SQL `BeginTransaction` (#824): open a transaction whose id the
+    /// client carries on every later request. Refused when the session is
+    /// already in one (a `BEGIN` on the stored session, or the request's).
+    pub fn begin_client_transaction(
+        &self,
+        session: &Session,
+        client_ip: Option<String>,
+    ) -> sqe_core::Result<String> {
+        let start = std::time::Instant::now();
+        let result = if session.transaction_id.is_some() {
+            Err(SqeError::with_code(
+                SqeErrorCode::NotSupported,
+                "Nested transactions not supported".to_string(),
+            ))
+        } else {
+            let id = sqe_core::txn_id::new_txn_id();
+            self.transactions
+                .scope(&id, &session.user.username)
+                .map(|_| id)
+        };
+        let audited = match &result {
+            Ok(id) => session.clone().with_client_transaction_id(id.clone()),
+            Err(_) => session.clone(),
+        };
+        self.audit_transaction_control(
+            &audited,
+            StatementKind::Begin,
+            start,
+            client_ip,
+            result.as_ref().err(),
+        );
+        result
+    }
+
+    /// Flight SQL `EndTransaction` (#824): COMMIT (`commit`) or ROLLBACK the
+    /// transaction `session` carries, as the SQL statements do.
+    pub async fn end_client_transaction(
+        &self,
+        session: &Session,
+        commit: bool,
+        client_ip: Option<String>,
+    ) -> sqe_core::Result<()> {
+        let start = std::time::Instant::now();
+        let result = self.end_transaction(session, commit).await;
+        let kind = if commit {
+            StatementKind::Commit
+        } else {
+            StatementKind::Rollback
+        };
+        self.audit_transaction_control(session, kind, start, client_ip, result.as_ref().err());
+        result
+    }
+
+    /// The scope of the transaction `session` is in, for a write that does
+    /// not go through [`Self::execute`] (Flight SQL bulk ingest).
+    pub fn transaction_scope(
+        &self,
+        session: &Session,
+    ) -> sqe_core::Result<Option<Arc<sqe_catalog::txn::TxnScope>>> {
+        self.txn_scope(session)
+    }
+
+    /// The audit record for a transaction-control RPC, the one its SQL form
+    /// (`BEGIN`, `COMMIT`, `ROLLBACK`) leaves.
+    fn audit_transaction_control(
+        &self,
+        session: &Session,
+        kind: StatementKind,
+        start: std::time::Instant,
+        client_ip: Option<String>,
+        error: Option<&SqeError>,
+    ) {
+        let Some(ref audit) = self.audit else {
+            return;
+        };
+        let sql = match kind {
+            StatementKind::Begin => "BEGIN",
+            StatementKind::Commit => "COMMIT",
+            _ => "ROLLBACK",
+        };
+        crate::audit_emitter::emit_statement_audit(
+            audit,
+            crate::audit_emitter::StatementAudit {
+                session,
+                sql,
+                kind: &kind,
+                kind_name: kind.name().to_string(),
+                error,
+                status: if error.is_some() { "error" } else { "success" },
+                duration: start.elapsed(),
+                execution_ms: 0,
+                rows: 0,
+                rows_written: None,
+                plan_metrics: &Default::default(),
+                policy_summary: None,
+                resources: Vec::new(),
+                tables_touched: Vec::new(),
+                grant_resources: Vec::new(),
+                client_ip,
+                trace_id: sqe_metrics::propagation::current_trace_id(),
+                query_id: uuid::Uuid::now_v7(),
+            },
+        );
     }
 
     /// The scope of the explicit transaction `session` is in (#821), or

@@ -67,9 +67,15 @@ pub struct Session {
     pub compression_codec: Option<String>,
     /// The explicit transaction this session is in, if any. Trino carries it
     /// in `X-Trino-Transaction-Id`; Flight SQL sets it on the stored session
-    /// at `BEGIN`. SQE writes only in autocommit (#820): inside a transaction
-    /// reads run and any write or DDL is refused.
+    /// at `BEGIN`, or a Flight SQL request carries the id `BeginTransaction`
+    /// returned. Inside a transaction DML writes to the transaction's branch
+    /// (#821); DDL is refused, or runs autocommit in a client-held one.
     pub transaction_id: Option<String>,
+    /// `transaction_id` came with the request (Flight SQL
+    /// `BeginTransaction`), not from `BEGIN`. DDL inside such a transaction
+    /// runs autocommit instead of being refused (#824). Private so only
+    /// [`Self::with_client_transaction_id`] sets it.
+    client_transaction: bool,
     /// Explicit, internal write-authority marker for the in-process
     /// maintenance principal (Phase 4b active auto-compaction).
     ///
@@ -138,6 +144,7 @@ impl Session {
             write_branch: None,
             compression_codec: None,
             transaction_id: None,
+            client_transaction: false,
             maintenance_authority: false,
         }
     }
@@ -223,7 +230,26 @@ impl Session {
     #[must_use = "with_transaction_id consumes self; bind the returned Session"]
     pub fn with_transaction_id(mut self, transaction_id: Option<String>) -> Self {
         self.transaction_id = transaction_id;
+        self.client_transaction = false;
         self
+    }
+
+    /// Returns a new session in the transaction a client holds the id of
+    /// (Flight SQL `BeginTransaction`, #824). Unlike [`Self::with_transaction_id`]
+    /// DDL in it runs autocommit: a DB-API driver opens such a transaction on
+    /// every connection, and refusing `CREATE TABLE` there would break every
+    /// default connection.
+    #[must_use = "with_client_transaction_id consumes self; bind the returned Session"]
+    pub fn with_client_transaction_id(mut self, transaction_id: String) -> Self {
+        self.transaction_id = Some(transaction_id);
+        self.client_transaction = true;
+        self
+    }
+
+    /// Whether the transaction id came with the request rather than from
+    /// `BEGIN`; see [`Self::with_client_transaction_id`].
+    pub fn in_client_transaction(&self) -> bool {
+        self.client_transaction && self.transaction_id.is_some()
     }
 
     /// Enrich the session with identity fields from the auth provider.
@@ -398,6 +424,21 @@ mod tests {
             debug_str.contains("last_activity"),
             "Debug output should include last_activity, got: {debug_str}"
         );
+    }
+
+    #[test]
+    fn only_a_request_carried_transaction_is_client_held() {
+        let session = make_session();
+        assert!(!session.in_client_transaction());
+        let held = session.clone().with_client_transaction_id("t1".to_string());
+        assert!(held.in_client_transaction());
+        assert_eq!(held.transaction_id.as_deref(), Some("t1"));
+        let begun = held.with_transaction_id(Some("t2".to_string()));
+        assert!(
+            !begun.in_client_transaction(),
+            "BEGIN's id is not client-held"
+        );
+        assert!(!session.with_transaction_id(None).in_client_transaction());
     }
 
     #[test]
