@@ -44,11 +44,12 @@ use crate::auth::{AUTH_TYPE_NONE, AUTH_TYPE_OAUTH2, AuthManager, NoopAuthManager
 use crate::client::{
     HttpClient, deserialize_catalog_response, deserialize_unexpected_catalog_error,
 };
-use crate::endpoint::{Endpoint, V1_NAMESPACE_EXISTS, V1_TABLE_EXISTS};
+use crate::endpoint::{Endpoint, V1_COMMIT_TRANSACTION, V1_NAMESPACE_EXISTS, V1_TABLE_EXISTS};
 use crate::request::HttpRequest;
 use crate::response::HttpResponse;
 use crate::types::{
-    CatalogConfig, CommitTableRequest, CommitTableResponse, CreateNamespaceRequest,
+    CatalogConfig, CommitTableRequest, CommitTableResponse, CommitTransactionRequest,
+    CreateNamespaceRequest,
     CreateTableRequest, ListNamespaceResponse, ListTablesResponse, LoadTableResult,
     NamespaceResponse, RegisterTableRequest, RenameTableRequest,
 };
@@ -683,6 +684,16 @@ impl RestCatalog {
     async fn client(&self) -> Result<&RestClient> {
         self.inner.client().await
     }
+
+    /// Whether the server advertises `POST /v1/{prefix}/transactions/commit`
+    /// in `GET /v1/config` (a server that advertises no list gets the default
+    /// set, which includes it). Lets a caller refuse a multi-table write before
+    /// any data is written, instead of failing at commit.
+    ///
+    /// SQE PATCH (sqe#823).
+    pub async fn advertises_commit_transaction(&self) -> Result<bool> {
+        self.inner.supports_endpoint(&V1_COMMIT_TRANSACTION).await
+    }
 }
 
 /// Every operation forwards to its [`RestSessionCatalog`] equivalent with the
@@ -787,6 +798,18 @@ impl Catalog for RestCatalog {
 
     async fn update_table(&self, commit: TableCommit) -> Result<Table> {
         self.inner.update_table(&self.session_context, commit).await
+    }
+
+    // SQE PATCH (sqe#823): the server decides at commit time whether it
+    // supports the endpoint; see `RestSessionCatalog::commit_transaction`.
+    fn supports_commit_transaction(&self) -> bool {
+        true
+    }
+
+    async fn commit_transaction(&self, commits: Vec<TableCommit>) -> Result<()> {
+        self.inner
+            .commit_transaction(&self.session_context, commits)
+            .await
     }
 }
 
@@ -949,6 +972,91 @@ impl RestSessionCatalog {
     /// none).
     pub(crate) async fn supports_endpoint(&self, endpoint: &Endpoint) -> Result<bool> {
         Ok(self.client().await?.endpoints.contains(endpoint))
+    }
+
+    /// Commits changes to several tables atomically through
+    /// `POST /v1/{prefix}/transactions/commit`: every table moves, or none does.
+    ///
+    /// A server that does not advertise the endpoint gets `FeatureUnsupported`
+    /// without a request. `409` is `CatalogCommitConflicts` (retryable); a `5xx`
+    /// leaves the commit state unknown.
+    ///
+    /// SQE PATCH (sqe#823).
+    pub async fn commit_transaction(
+        &self,
+        _context: &SessionContext,
+        commits: Vec<TableCommit>,
+    ) -> Result<()> {
+        if !self.supports_endpoint(&V1_COMMIT_TRANSACTION).await? {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "the REST catalog does not advertise POST /v1/{prefix}/transactions/commit",
+            ));
+        }
+        let client = self.client().await?;
+        let table_changes = commits
+            .into_iter()
+            .map(|mut commit| CommitTableRequest {
+                identifier: Some(commit.identifier().clone()),
+                requirements: commit.take_requirements(),
+                updates: commit.take_updates(),
+            })
+            .collect();
+
+        let request = HttpRequest::build(
+            client
+                .http_client
+                .request(
+                    Method::POST,
+                    client.config.url_prefixed(&["transactions", "commit"]),
+                )
+                .json(&CommitTransactionRequest { table_changes }),
+        )?;
+
+        let http_response = client.query_catalog(request).await?;
+
+        match http_response.status() {
+            StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
+            // The spec's 404 names a missing table. A server that never
+            // implemented the route also answers 404 (often with no body),
+            // and calling that a missing table would mislead the user.
+            StatusCode::NOT_FOUND
+                if String::from_utf8_lossy(http_response.body()).contains("NoSuchTable") =>
+            {
+                Err(Error::new(
+                    ErrorKind::TableNotFound,
+                    "Tried to update a table that does not exist",
+                ))
+            }
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED => {
+                Err(Error::new(
+                    ErrorKind::FeatureUnsupported,
+                    format!(
+                        "the REST catalog answered {} to POST /v1/{{prefix}}/transactions/commit; it cannot commit several tables atomically",
+                        http_response.status()
+                    ),
+                ))
+            }
+            StatusCode::CONFLICT => Err(Error::new(
+                ErrorKind::CatalogCommitConflicts,
+                "CatalogCommitConflicts, one or more requirements failed. The client may retry.",
+            )
+            .with_retryable(true)),
+            StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT => Err(Error::new(
+                ErrorKind::Unexpected,
+                format!(
+                    "The catalog answered {} to a multi-table commit; the commit state is unknown.",
+                    http_response.status()
+                ),
+            )),
+            _ => Err(deserialize_unexpected_catalog_error(
+                http_response,
+                client.http_client.disable_header_redaction(),
+            )),
+        }
     }
 
     /// Issue a `HEAD` request to `url` and interpret it as an existence check:
@@ -4621,6 +4729,205 @@ mod tests {
         config_mock.assert_async().await;
         update_table_mock.assert_async().await;
         load_table_mock.assert_async().await;
+    }
+
+    /// Two prepared commits, one per table, for the multi-table tests.
+    async fn two_table_commits() -> Vec<TableCommit> {
+        let mut commits = Vec::new();
+        for name in ["t1", "t2"] {
+            let file = File::open(format!(
+                "{}/testdata/{}",
+                env!("CARGO_MANIFEST_DIR"),
+                "create_table_response.json"
+            ))
+            .unwrap();
+            let resp =
+                serde_json::from_reader::<_, LoadTableResult>(BufReader::new(file)).unwrap();
+            let table = Table::builder()
+                .metadata(resp.metadata)
+                .metadata_location(resp.metadata_location.unwrap())
+                .identifier(TableIdent::from_strs(["ns1", name]).unwrap())
+                .file_io(FileIO::new_with_fs())
+                .runtime(test_runtime())
+                .build()
+                .unwrap();
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .update_table_properties()
+                .set("k".to_string(), name.to_string())
+                .apply(tx)
+                .unwrap();
+            commits.push(tx.prepare_commit().await.unwrap());
+        }
+        commits
+    }
+
+    #[tokio::test]
+    async fn test_commit_transaction() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        let commit_mock = server
+            .mock("POST", "/v1/transactions/commit")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "table-changes": [
+                    {"identifier": {"namespace": ["ns1"], "name": "t1"}},
+                    {"identifier": {"namespace": ["ns1"], "name": "t2"}}
+                ]
+            })))
+            .with_status(204)
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            SessionContext::empty(),
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            None,
+            Some(Arc::new(LocalFsStorageFactory)),
+            Runtime::current(),
+            None,
+        );
+        assert!(catalog.supports_commit_transaction());
+        catalog
+            .commit_transaction(two_table_commits().await)
+            .await
+            .unwrap();
+
+        config_mock.assert_async().await;
+        commit_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_commit_transaction_conflict_is_retryable() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        let commit_mock = server
+            .mock("POST", "/v1/transactions/commit")
+            .with_status(409)
+            .with_body(
+                r#"{"error": {"message": "Requirement failed", "type": "CommitFailedException", "code": 409}}"#,
+            )
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            SessionContext::empty(),
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            None,
+            Some(Arc::new(LocalFsStorageFactory)),
+            Runtime::current(),
+            None,
+        );
+        let err = catalog
+            .commit_transaction(two_table_commits().await)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
+        assert!(err.retryable());
+
+        config_mock.assert_async().await;
+        commit_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_commit_transaction_unadvertised_is_unsupported() {
+        let mut server = Server::new_async().await;
+        let config_mock = server
+            .mock("GET", "/v1/config")
+            .with_status(200)
+            .with_body(
+                r#"{
+                "overrides": {},
+                "defaults": {},
+                "endpoints": ["POST /v1/{prefix}/namespaces/{namespace}/tables/{table}"]
+            }"#,
+            )
+            .create_async()
+            .await;
+        let commit_mock = server
+            .mock("POST", "/v1/transactions/commit")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            SessionContext::empty(),
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            None,
+            Some(Arc::new(LocalFsStorageFactory)),
+            Runtime::current(),
+            None,
+        );
+        let err = catalog
+            .commit_transaction(two_table_commits().await)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+        assert!(!catalog.advertises_commit_transaction().await.unwrap());
+
+        config_mock.assert_async().await;
+        commit_mock.assert_async().await;
+    }
+
+    /// A server with no advertised list is assumed to have the route; when it
+    /// then answers a bare 404, that is "unsupported", not a missing table.
+    #[tokio::test]
+    async fn test_commit_transaction_route_404_is_unsupported() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        let commit_mock = server
+            .mock("POST", "/v1/transactions/commit")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            SessionContext::empty(),
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            None,
+            Some(Arc::new(LocalFsStorageFactory)),
+            Runtime::current(),
+            None,
+        );
+        assert!(catalog.advertises_commit_transaction().await.unwrap());
+        let err = catalog
+            .commit_transaction(two_table_commits().await)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+
+        config_mock.assert_async().await;
+        commit_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_commit_transaction_missing_table_is_not_found() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        let commit_mock = server
+            .mock("POST", "/v1/transactions/commit")
+            .with_status(404)
+            .with_body(
+                r#"{"error": {"message": "Table does not exist: ns1.t2", "type": "NoSuchTableException", "code": 404}}"#,
+            )
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            SessionContext::empty(),
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            None,
+            Some(Arc::new(LocalFsStorageFactory)),
+            Runtime::current(),
+            None,
+        );
+        let err = catalog
+            .commit_transaction(two_table_commits().await)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::TableNotFound);
+
+        config_mock.assert_async().await;
+        commit_mock.assert_async().await;
     }
 
     #[tokio::test]

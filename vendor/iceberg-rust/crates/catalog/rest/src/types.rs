@@ -294,6 +294,17 @@ pub struct CommitTableRequest {
     pub updates: Vec<TableUpdate>,
 }
 
+/// Request body for `POST /v1/{prefix}/transactions/commit`: every change is
+/// applied atomically, or none is.
+///
+/// SQE PATCH (sqe#823).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub struct CommitTransactionRequest {
+    /// One entry per table; each must carry its `identifier`.
+    pub table_changes: Vec<CommitTableRequest>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 /// Response returned when a table is successfully updated.

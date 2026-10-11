@@ -1048,6 +1048,103 @@ impl Catalog for SqliteRsCatalog {
         }
         Ok(staged_table)
     }
+
+    fn supports_commit_transaction(&self) -> bool {
+        true
+    }
+
+    /// The `update_table` compare-and-swap for every table, under one
+    /// `BEGIN IMMEDIATE`: either every pointer moves or none does (#823).
+    /// Staged metadata files are written before the lock is taken; a refused
+    /// commit leaves them for orphan-file cleanup, as `update_table` does.
+    async fn commit_transaction(&self, commits: Vec<TableCommit>) -> Result<()> {
+        let mut swaps = Vec::with_capacity(commits.len());
+        for commit in commits {
+            let table_ident = commit.identifier().clone();
+            let current_table = self.load_table(&table_ident).await?;
+            let expected = current_table.metadata_location_result()?.to_string();
+            let staged_table = commit.apply(current_table)?;
+            let staged = staged_table.metadata_location_result()?.to_string();
+            staged_table
+                .metadata()
+                .write_to(staged_table.file_io(), &MetadataLocation::from_str(&staged)?)
+                .await?;
+            swaps.push(PointerSwap {
+                ident: table_ident,
+                expected,
+                staged,
+            });
+        }
+
+        let name = self.name.clone();
+        self.shared
+            .run(move |conn| swap_pointers(conn, &name, swaps))
+            .await
+    }
+}
+
+/// One table's move in a multi-table commit: `expected` is the pointer the
+/// commit was applied to, `staged` the metadata file it wrote.
+struct PointerSwap {
+    ident: TableIdent,
+    expected: String,
+    staged: String,
+}
+
+/// Swap every pointer under one `BEGIN IMMEDIATE`, or none. A pointer that is
+/// not the expected one is the retryable `CatalogCommitConflicts`, and rolls
+/// back the swaps already made.
+fn swap_pointers(conn: &Connection, name: &str, swaps: Vec<PointerSwap>) -> Result<()> {
+    let key_where = format!(
+        "WHERE catalog_name = ? AND table_name = ? AND table_namespace = ?
+           AND (iceberg_type = '{TABLE_RECORD_TYPE}' OR iceberg_type IS NULL)"
+    );
+    let tx = conn
+        .transaction_with(TransactionBehavior::Immediate)
+        .map_err(from_sqlite_error)?;
+    for swap in swaps {
+        let ns = swap.ident.namespace().join(".");
+        let tbl = swap.ident.name().to_string();
+        let key = vec![name.to_string(), tbl.clone(), ns.clone()];
+        let rows = tx
+            .query_all_with(
+                &format!("SELECT metadata_location, iceberg_type FROM {TABLES} {key_where}"),
+                params(key.clone()),
+            )
+            .map_err(from_sqlite_error)?;
+        let Some(row) = rows.first() else {
+            tx.rollback().map_err(from_sqlite_error)?;
+            return no_such_table_err(&swap.ident);
+        };
+        if nullable_text(row, 0)?.as_deref() != Some(swap.expected.as_str()) {
+            tx.rollback().map_err(from_sqlite_error)?;
+            return Err(Error::new(
+                ErrorKind::CatalogCommitConflicts,
+                format!("Commit conflicted for table: {}", swap.ident),
+            )
+            .with_retryable(true));
+        }
+        let record_type = nullable_text(row, 1)?.unwrap_or_else(|| TABLE_RECORD_TYPE.to_string());
+        tx.execute_with(&format!("DELETE FROM {TABLES} {key_where}"), params(key))
+            .map_err(from_sqlite_error)?;
+        tx.execute_with(
+            &format!(
+                "INSERT INTO {TABLES}
+                 (catalog_name, table_namespace, table_name, metadata_location, previous_metadata_location, iceberg_type)
+                 VALUES (?, ?, ?, ?, ?, ?)"
+            ),
+            vec![
+                text_value(name),
+                text_value(&ns),
+                text_value(&tbl),
+                text_value(&swap.staged),
+                text_value(&swap.expected),
+                text_value(record_type),
+            ],
+        )
+        .map_err(from_sqlite_error)?;
+    }
+    tx.commit().map_err(from_sqlite_error)
 }
 
 #[cfg(test)]
@@ -1172,6 +1269,76 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(text(&rows[0], 0).unwrap(), "file:///v2.json");
         assert_eq!(text(&rows[0], 1).unwrap(), "file:///v1.json");
+    }
+
+    /// The multi-table commit (#823): when the second table's pointer moved,
+    /// the first table's swap, already made inside the lock, is rolled back.
+    /// When both pointers are the expected ones, both move together.
+    #[tokio::test]
+    async fn swap_pointers_moves_every_table_or_none() {
+        let (_dir, catalog) = fresh().await;
+        for (tbl, loc) in [("a", "file:///a1.json"), ("b", "file:///b1.json")] {
+            catalog
+                .execute(
+                    insert_sql(),
+                    vec![
+                        "t".into(),
+                        "sales".into(),
+                        tbl.into(),
+                        loc.into(),
+                        String::new(),
+                        TABLE_RECORD_TYPE.into(),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+        let swap = |tbl: &str, expected: &str, staged: &str| PointerSwap {
+            ident: TableIdent::from_strs(["sales", tbl]).unwrap(),
+            expected: expected.to_string(),
+            staged: staged.to_string(),
+        };
+        let pointer = |tbl: &'static str| {
+            let catalog = &catalog;
+            async move {
+                let rows = catalog
+                    .fetch_rows(
+                        format!("SELECT metadata_location FROM {TABLES} {}", key_where()),
+                        vec!["t".into(), tbl.into(), "sales".into()],
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(rows.len(), 1);
+                text(&rows[0], 0).unwrap()
+            }
+        };
+
+        // b was loaded at b0, but the catalog holds b1: nothing moves.
+        let swaps = vec![
+            swap("a", "file:///a1.json", "file:///a2.json"),
+            swap("b", "file:///b0.json", "file:///b2.json"),
+        ];
+        let err = catalog
+            .shared
+            .run(move |conn| swap_pointers(conn, "t", swaps))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
+        assert!(err.retryable());
+        assert_eq!(pointer("a").await, "file:///a1.json");
+        assert_eq!(pointer("b").await, "file:///b1.json");
+
+        let swaps = vec![
+            swap("a", "file:///a1.json", "file:///a2.json"),
+            swap("b", "file:///b1.json", "file:///b2.json"),
+        ];
+        catalog
+            .shared
+            .run(move |conn| swap_pointers(conn, "t", swaps))
+            .await
+            .unwrap();
+        assert_eq!(pointer("a").await, "file:///a2.json");
+        assert_eq!(pointer("b").await, "file:///b2.json");
     }
 
     /// Pins engine defect 1 from the module docs so the workaround can be

@@ -240,6 +240,48 @@ async fn commit_swaps_the_pointer_and_records_the_previous_one() {
     assert_oracle_ok(&db(dir.path()));
 }
 
+/// `commit_transaction` (#823) moves two tables in one call; each records its
+/// previous pointer, and the file stays valid to stock sqlite3.
+#[tokio::test]
+async fn commit_transaction_moves_two_tables() {
+    let dir = TempDir::new().unwrap();
+    let catalog = open(dir.path()).await;
+    assert!(catalog.supports_commit_transaction());
+    let ns = NamespaceIdent::new("sales".to_string());
+    catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+
+    let mut before = Vec::new();
+    let mut commits = Vec::new();
+    for name in ["orders", "refunds"] {
+        let table = catalog.create_table(&ns, creation(name)).await.unwrap();
+        before.push(table.metadata_location().unwrap().to_string());
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_table_properties()
+            .set("batch".to_string(), "7".to_string())
+            .apply(tx)
+            .unwrap();
+        commits.push(tx.prepare_commit().await.unwrap());
+    }
+    catalog.commit_transaction(commits).await.unwrap();
+
+    for (name, previous) in ["orders", "refunds"].into_iter().zip(before) {
+        let ident = TableIdent::new(ns.clone(), name.to_string());
+        let table = catalog.load_table(&ident).await.unwrap();
+        assert_eq!(table.metadata().properties().get("batch").unwrap(), "7");
+        assert_ne!(table.metadata_location().unwrap(), previous);
+        if let Some(prev) = oracle(
+            &db(dir.path()),
+            &format!(
+                "SELECT previous_metadata_location FROM iceberg_tables WHERE table_name = '{name}';"
+            ),
+        ) {
+            assert_eq!(prev, previous);
+        }
+    }
+    assert_oracle_ok(&db(dir.path()));
+}
+
 #[tokio::test]
 async fn one_connection_per_file_across_path_spellings() {
     let dir = TempDir::new().unwrap();

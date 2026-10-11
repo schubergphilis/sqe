@@ -161,7 +161,9 @@ impl JoinFallback {
         &self,
         ctx: &SessionContext,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        sqe_core::runtime::on_planning_stack(async {
+        // `carried`: the planning thread does not see the task's
+        // transaction scope (#821).
+        sqe_core::runtime::on_planning_stack(sqe_catalog::txn::carried(async {
             let physical = ctx.state().create_physical_plan(&self.logical).await?;
             crate::post_planning::apply_post_planning_rules(
                 ctx,
@@ -170,7 +172,7 @@ impl JoinFallback {
                 physical,
             )
             .map_err(|e| DataFusionError::External(Box::new(e)))
-        })
+        }))
         .await
     }
 }
