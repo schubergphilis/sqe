@@ -123,6 +123,29 @@ pub trait Catalog: Debug + Sync + Send {
 
     /// Update a table to the catalog.
     async fn update_table(&self, commit: TableCommit) -> Result<Table>;
+
+    /// Whether [`Catalog::commit_transaction`] is implemented.
+    ///
+    /// SQE PATCH (sqe#823): lets a caller refuse a multi-table transaction
+    /// on its second table, before it has written to it, instead of at
+    /// commit.
+    fn supports_commit_transaction(&self) -> bool {
+        false
+    }
+
+    /// Commit changes to several tables atomically: every commit's
+    /// requirements are checked and either all updates are applied or none.
+    ///
+    /// SQE PATCH (sqe#823), the REST `POST /v1/{prefix}/transactions/commit`
+    /// (upstream iceberg-rust #2784). Catalogs that cannot commit several
+    /// tables in one step return `FeatureUnsupported`.
+    async fn commit_transaction(&self, commits: Vec<TableCommit>) -> Result<()> {
+        let _ = commits;
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "this catalog cannot commit several tables atomically",
+        ))
+    }
 }
 
 /// Common interface for all catalog builders.

@@ -265,6 +265,17 @@ impl Transaction {
             self.table = refreshed.clone();
         }
 
+        catalog.update_table(self.prepare_commit().await?).await
+    }
+
+    /// Run the actions against the transaction's table and return the
+    /// resulting commit, without sending it. The table is used as given,
+    /// not reloaded.
+    ///
+    /// SQE PATCH (sqe#823), after upstream iceberg-rust #2784: the commits
+    /// of several tables' transactions go to the catalog together through
+    /// [`Catalog::commit_transaction`].
+    pub async fn prepare_commit(&self) -> Result<TableCommit> {
         let mut current_table = self.table.clone();
         let mut existing_updates: Vec<TableUpdate> = vec![];
         let mut existing_requirements: Vec<TableRequirement> = vec![];
@@ -280,13 +291,11 @@ impl Transaction {
             )?;
         }
 
-        let table_commit = TableCommit::builder()
+        Ok(TableCommit::builder()
             .ident(self.table.identifier().to_owned())
             .updates(existing_updates)
             .requirements(existing_requirements)
-            .build();
-
-        catalog.update_table(table_commit).await
+            .build())
     }
 }
 
