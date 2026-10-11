@@ -428,6 +428,10 @@ pub struct MaintenanceScheduler {
 /// can never collide with a real table's key in `inflight`.
 const RETENTION_JOB_KEY: &str = "<maintenance_log retention>";
 
+/// In-flight key prefix of a stale transaction branch sweep; the table
+/// name follows. Angle brackets keep it apart from table names.
+const TXN_BRANCH_JOB_KEY: &str = "<txn branches>";
+
 /// How much `maintenance_log` history the daily retention pass leaves
 /// alone. Rows younger than this are never rewritten (they are the rows a
 /// live lease CAS and a recent-history query care about); older rows are
@@ -543,8 +547,20 @@ impl MaintenanceScheduler {
         let now_ms = chrono::Utc::now().timestamp_millis();
         self.maybe_spawn_history_retention(&catalog, now_ms).await;
 
-        let (props_by_table, idents_by_table) = self.discover_tables(&catalog).await?;
+        let (props_by_table, idents_by_table, with_stale_txn_branches) =
+            self.discover_tables(&catalog).await?;
         let enabled = select_enabled(&props_by_table);
+        // Dropping a ref commits to a user table: Active mode and opted-in
+        // tables only, like a rewrite. Other tables have
+        // `CALL system.expire_snapshots`.
+        if self.cfg.mode == MaintenanceMode::Active {
+            let opted_in: HashSet<&str> = enabled.iter().map(String::as_str).collect();
+            let sweep = with_stale_txn_branches
+                .into_iter()
+                .filter(|ident| opted_in.contains(ident.to_string().as_str()))
+                .collect();
+            self.spawn_txn_branch_sweeps(&catalog, sweep, now_ms).await;
+        }
         // Lookup for `resolve_schedule`'s per-table `sqe.maintenance.compaction.schedule`
         // override; built once per tick from the same discovery pass `select_enabled`
         // just filtered, so the gate and the override resolution can never see
@@ -680,6 +696,7 @@ impl MaintenanceScheduler {
     ) -> sqe_core::Result<(
         Vec<(String, HashMap<String, String>)>,
         HashMap<String, TableIdent>,
+        Vec<TableIdent>,
     )> {
         let namespaces = catalog.list_namespaces(None).await.map_err(|e| {
             SqeError::Catalog(format!("advisory_tick: failed to list namespaces: {e}"))
@@ -711,10 +728,17 @@ impl MaintenanceScheduler {
                 .collect()
         };
 
+        let now_ms = chrono::Utc::now().timestamp_millis();
         let mut loaded: Vec<(TableIdent, HashMap<String, String>)> = Vec::new();
+        let mut with_stale_txn_branches = Vec::new();
         for ident in stale {
             match crate::maintenance::load_table(catalog, &ident).await {
-                Ok(table) => loaded.push((ident, table.metadata().properties().clone())),
+                Ok(table) => {
+                    if !sqe_catalog::txn::stale_txn_refs(table.metadata(), now_ms).is_empty() {
+                        with_stale_txn_branches.push(ident.clone());
+                    }
+                    loaded.push((ident, table.metadata().properties().clone()))
+                }
                 Err(e) => {
                     warn!(
                         table = %ident,
@@ -729,7 +753,40 @@ impl MaintenanceScheduler {
         for (ident, props) in loaded {
             cache.insert(ident, props);
         }
-        Ok(cache.snapshot())
+        let (props_by_table, idents_by_table) = cache.snapshot();
+        Ok((props_by_table, idents_by_table, with_stale_txn_branches))
+    }
+
+    /// Drop the transaction branches a crashed coordinator left on
+    /// `idents` ([`sqe_catalog::txn::stale_txn_refs`]), one background job
+    /// per table. Like the retention pass it takes no `job_permits` permit:
+    /// a ref drop is one metadata commit. The in-flight set keeps one job
+    /// per table.
+    async fn spawn_txn_branch_sweeps(
+        &self,
+        catalog: &Arc<dyn Catalog>,
+        idents: Vec<TableIdent>,
+        now_ms: i64,
+    ) {
+        for ident in idents {
+            let key = format!("{TXN_BRANCH_JOB_KEY} {ident}");
+            let Some(guard) = InflightGuard::try_claim(&self.inflight, &key) else {
+                continue;
+            };
+            let catalog = Arc::clone(catalog);
+            self.jobs.lock().await.spawn(async move {
+                let _guard = guard;
+                if let Err(e) =
+                    sqe_catalog::txn::drop_stale_branches(catalog.as_ref(), &ident, now_ms).await
+                {
+                    warn!(
+                        table = %ident,
+                        error = %e,
+                        "stale transaction branch sweep failed (best-effort, not fatal)"
+                    );
+                }
+            });
+        }
     }
 
     /// Join every job this scheduler has spawned and is still running.

@@ -11,7 +11,9 @@
 //! by COMMIT or ROLLBACK. An id that ended is remembered for a day, so a
 //! client replaying it gets an error instead of a fresh transaction that
 //! silently lacks the earlier writes. A transaction idle for
-//! [`IDLE_TIMEOUT`] is rolled back on the next registry access.
+//! [`IDLE_TIMEOUT`], or open for [`MAX_LIFETIME`], is rolled back on the
+//! next registry access. The lifetime cap is what lets the maintenance
+//! sweep drop an old transaction branch without asking every coordinator.
 //!
 //! The registry lives in this process only. An id minted by another
 //! coordinator, or by this one before a restart, carries another
@@ -22,7 +24,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use sqe_catalog::txn::TxnScope;
+use sqe_catalog::txn::{TxnScope, MAX_LIFETIME};
 use sqe_core::{SqeError, SqeErrorCode};
 use sqe_metrics::MetricsRegistry;
 
@@ -73,6 +75,7 @@ pub(crate) enum Outcome {
     RolledBack,
     Conflict,
     IdleTimeout,
+    Lifetime,
     SessionEnded,
     Shutdown,
 }
@@ -84,6 +87,7 @@ impl Outcome {
             Self::RolledBack => "rolled_back",
             Self::Conflict => "conflict",
             Self::IdleTimeout => "idle_timeout",
+            Self::Lifetime => "lifetime",
             Self::SessionEnded => "session_ended",
             Self::Shutdown => "shutdown",
         }
@@ -143,7 +147,7 @@ impl TxnRegistry {
         };
         self.set_open_gauge(&state);
         drop(state);
-        self.discard_all(expired, Outcome::IdleTimeout);
+        self.discard_all(expired);
         result
     }
 
@@ -175,7 +179,7 @@ impl TxnRegistry {
         };
         self.set_open_gauge(&state);
         drop(state);
-        self.discard_all(expired, Outcome::IdleTimeout);
+        self.discard_all(expired);
         result
     }
 
@@ -214,7 +218,7 @@ impl TxnRegistry {
         drop(state);
         if let Some(entry) = taken {
             tracing::info!(transaction = %id, "rolling back transaction of an ended session");
-            self.discard_all(vec![entry.open], Outcome::SessionEnded);
+            self.discard_all(vec![(entry.open, Outcome::SessionEnded)]);
         }
     }
 
@@ -285,11 +289,18 @@ impl TxnRegistry {
 
     /// Roll back `expired` in the background. Outside any scope: the
     /// spawned task has no transaction task-local.
-    fn discard_all(&self, expired: Vec<Open>, outcome: Outcome) {
-        for open in expired {
+    fn discard_all(&self, expired: Vec<(Open, Outcome)>) {
+        for (open, outcome) in expired {
             self.record_end(open.opened, outcome);
-            if outcome == Outcome::IdleTimeout {
-                tracing::info!(transaction = %open.scope.id(), "rolling back idle transaction");
+            match outcome {
+                Outcome::IdleTimeout => {
+                    tracing::info!(transaction = %open.scope.id(), "rolling back idle transaction")
+                }
+                Outcome::Lifetime => tracing::info!(
+                    transaction = %open.scope.id(),
+                    "rolling back transaction open past its lifetime"
+                ),
+                _ => {}
             }
             let metrics = self.metrics.clone();
             if let Ok(rt) = tokio::runtime::Handle::try_current() {
@@ -314,22 +325,31 @@ fn count_drop_failures(metrics: &Option<Arc<MetricsRegistry>>, failed: usize) {
 }
 
 impl State {
-    /// Remove transactions idle past [`IDLE_TIMEOUT`] (returned for the
-    /// caller to roll back outside the lock) and forget old ended ids.
-    fn sweep(&mut self, now: Instant) -> Vec<Open> {
+    /// Remove transactions idle past [`IDLE_TIMEOUT`] or open past
+    /// [`MAX_LIFETIME`] (returned for the caller to roll back outside the
+    /// lock) and forget old ended ids.
+    fn sweep(&mut self, now: Instant) -> Vec<(Open, Outcome)> {
         self.ended
             .retain(|_, at| now.duration_since(*at) < ENDED_RETENTION);
-        let idle: Vec<String> = self
+        let expired: Vec<(String, Outcome)> = self
             .open
             .iter()
-            .filter(|(_, e)| now.duration_since(e.last_used) >= IDLE_TIMEOUT)
-            .map(|(id, _)| id.clone())
+            .filter_map(|(id, e)| {
+                if now.duration_since(e.open.opened) >= MAX_LIFETIME {
+                    Some((id.clone(), Outcome::Lifetime))
+                } else if now.duration_since(e.last_used) >= IDLE_TIMEOUT {
+                    Some((id.clone(), Outcome::IdleTimeout))
+                } else {
+                    None
+                }
+            })
             .collect();
-        idle.into_iter()
-            .filter_map(|id| {
+        expired
+            .into_iter()
+            .filter_map(|(id, outcome)| {
                 let entry = self.open.remove(&id)?;
                 self.ended.insert(id, now);
-                Some(entry.open)
+                Some((entry.open, outcome))
             })
             .collect()
     }
@@ -366,9 +386,11 @@ fn ended(id: &str) -> SqeError {
     SqeError::with_code(
         SqeErrorCode::TransactionConflict,
         format!(
-            "transaction {id} has ended (committed, rolled back, or idle for \
-             longer than {} minutes); run ROLLBACK and start a new one",
-            IDLE_TIMEOUT.as_secs() / 60
+            "transaction {id} has ended (committed, rolled back, idle for \
+             longer than {} minutes, or open for longer than {} hours); run \
+             ROLLBACK and start a new one",
+            IDLE_TIMEOUT.as_secs() / 60,
+            MAX_LIFETIME.as_secs() / 3600
         ),
     )
 }
@@ -528,8 +550,35 @@ mod tests {
         );
         assert!(state.sweep(Instant::now()).is_empty());
         let later = Instant::now() + IDLE_TIMEOUT;
-        assert_eq!(state.sweep(later).len(), 1);
+        let swept = state.sweep(later);
+        assert_eq!(swept.len(), 1);
+        assert_eq!(swept[0].1, Outcome::IdleTimeout);
         assert!(state.open.is_empty());
+        assert!(state.ended.contains_key(&id));
+    }
+
+    #[test]
+    fn busy_transactions_end_at_their_lifetime() {
+        let id = local_id();
+        let mut state = State::default();
+        let opened = Instant::now();
+        let at_lifetime = opened + MAX_LIFETIME;
+        state.open.insert(
+            id.clone(),
+            Entry {
+                owner: "alice".into(),
+                open: Open {
+                    scope: TxnScope::new(id.as_str()),
+                    opened,
+                },
+                // Used a moment ago: never idle.
+                last_used: at_lifetime - Duration::from_secs(1),
+            },
+        );
+        assert!(state.sweep(at_lifetime - Duration::from_secs(1)).is_empty());
+        let swept = state.sweep(at_lifetime);
+        assert_eq!(swept.len(), 1);
+        assert_eq!(swept[0].1, Outcome::Lifetime);
         assert!(state.ended.contains_key(&id));
     }
 }
