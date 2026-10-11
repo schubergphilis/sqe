@@ -542,6 +542,7 @@ impl QueryHandler {
         };
 
         let profile_mode = config.query.query_profile;
+        let transaction_metrics = metrics.clone();
 
         let mut hive_ddl_handler =
             crate::hive_ddl_handler::HiveDdlHandler::new(runtime_catalogs.clone(), secrets.clone())
@@ -579,7 +580,7 @@ impl QueryHandler {
             table_cache: None,
             grant_backend,
             session_manager: None,
-            transactions: Arc::default(),
+            transactions: Arc::new(crate::txn_registry::TxnRegistry::new(transaction_metrics)),
             runtime_catalogs,
             secrets,
             worker_load: Arc::new(crate::worker_registry::WorkerLoadTracker::new()),
@@ -649,8 +650,22 @@ impl QueryHandler {
         mut self,
         manager: Arc<crate::session_manager::SessionManager>,
     ) -> Self {
+        // A Flight SQL transaction's id lives only on its session: once the
+        // session is gone nothing can commit it, so roll it back (#824).
+        let transactions = Arc::clone(&self.transactions);
+        manager.on_session_end(move |session| {
+            if let Some(id) = session.transaction_id.as_deref() {
+                transactions.abandon(id, &session.user.username);
+            }
+        });
         self.session_manager = Some(manager);
         self
+    }
+
+    /// Roll back every open explicit transaction, for a coordinator that is
+    /// shutting down (#824).
+    pub async fn abort_open_transactions(&self) {
+        self.transactions.abort_all().await;
     }
 
     /// Attach a global table metadata cache shared across all sessions and queries.
@@ -945,26 +960,32 @@ impl QueryHandler {
     /// client can retry the COMMIT or ROLLBACK. Both run outside the
     /// transaction's scope, where the bridge allows a commit to main.
     async fn end_transaction(&self, session: &Session, commit: bool) -> sqe_core::Result<()> {
-        use crate::txn_registry::Ended;
+        use crate::txn_registry::{Ended, Outcome};
         use sqe_catalog::txn;
         let Some(id) = session.transaction_id.as_deref() else {
             return Ok(());
         };
         let owner = &session.user.username;
-        let scope = match self.transactions.end(id, owner)? {
-            Ended::Open(scope) => scope,
+        let open = match self.transactions.end(id, owner)? {
+            Ended::Open(open) => open,
             Ended::Unused => return self.set_session_transaction(session, None),
             Ended::Already(e) => {
                 self.set_session_transaction(session, None)?;
                 return if commit { Err(e) } else { Ok(()) };
             }
         };
+        let scope = Arc::clone(&open.scope);
         if !commit {
-            txn::scope(None, txn::discard(&scope)).await;
+            let failed = txn::scope(None, txn::discard(&scope)).await;
+            if let Some(m) = &self.metrics {
+                m.transaction_branch_drop_failures_total.inc_by(failed as u64);
+            }
+            self.transactions.finish(&open, Outcome::RolledBack);
             return self.set_session_transaction(session, None);
         }
         match txn::scope(None, txn::publish(&scope)).await {
             Ok(()) => {
+                self.transactions.finish(&open, Outcome::Committed);
                 if !scope.tables().is_empty() {
                     // Other sessions' cached results predate the publish.
                     if let Some(ref cache) = self.query_cache {
@@ -975,11 +996,12 @@ impl QueryHandler {
                 self.set_session_transaction(session, None)
             }
             Err(e) if e.error_code() == SqeErrorCode::TransactionConflict => {
+                self.transactions.finish(&open, Outcome::Conflict);
                 self.set_session_transaction(session, None)?;
                 Err(e)
             }
             Err(e) => {
-                self.transactions.reopen(owner, scope);
+                self.transactions.reopen(owner, open);
                 Err(e)
             }
         }
@@ -2422,7 +2444,7 @@ impl QueryHandler {
                             "Nested transactions not supported".to_string(),
                         ));
                     }
-                    self.set_session_transaction(session, Some(uuid::Uuid::new_v4().to_string()))?;
+                    self.set_session_transaction(session, Some(sqe_core::txn_id::new_txn_id()))?;
                     Ok(vec![])
                 }
                 StatementKind::Commit => {
@@ -10223,7 +10245,7 @@ mod show_stats_policy_tests {
         // refused rather than having its writes land on main.
         let mut on_branch = session
             .clone()
-            .with_transaction_id(Some(uuid::Uuid::new_v4().to_string()));
+            .with_transaction_id(Some(sqe_core::txn_id::new_txn_id()));
         on_branch.write_branch = Some("dev".to_string());
         let err = handler
             .execute(&on_branch, "INSERT INTO sales.orders VALUES (1)", None)
@@ -10231,7 +10253,7 @@ mod show_stats_policy_tests {
             .expect_err("write branch in a transaction");
         assert_eq!(err.error_code(), sqe_core::SqeErrorCode::NotSupported, "{err}");
 
-        let session = session.with_transaction_id(Some(uuid::Uuid::new_v4().to_string()));
+        let session = session.with_transaction_id(Some(sqe_core::txn_id::new_txn_id()));
         for sql in [
             "CREATE TABLE sales.t (a INT)",
             "CREATE TABLE sales.t2 AS SELECT 1 AS a",

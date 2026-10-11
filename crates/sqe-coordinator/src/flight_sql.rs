@@ -151,7 +151,8 @@ pub fn build_sql_info_data() -> Result<arrow_flight::sql::metadata::SqlInfoData,
     b.append(I::FlightSqlServerSql, true);
     b.append(I::FlightSqlServerSubstrait, false);
     // SqlSupportedTransaction.SQL_SUPPORTED_TRANSACTION_NONE = 0: no
-    // BeginTransaction RPC. Textual BEGIN is autocommit-only (#820).
+    // BeginTransaction RPC. Textual BEGIN / COMMIT run a session-bound
+    // transaction instead (#821, #824).
     b.append(I::FlightSqlServerTransaction, 0i32);
     b.append(I::FlightSqlServerCancel, true);
     b.append(I::FlightSqlServerBulkIngestion, false);
