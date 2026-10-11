@@ -1557,6 +1557,7 @@ impl HiveDdlHandler {
             client_ip: None,
             trace_id: None,
             query_id: None,
+            transaction: None,
             integrity: sqe_metrics::audit::Integrity::default(),
         });
     }

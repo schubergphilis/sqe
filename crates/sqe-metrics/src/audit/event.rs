@@ -22,6 +22,11 @@ pub enum AuditKind {
     /// a user principal, so `query_id` / `trace_id` identify the coordinator
     /// statement that produced the ticket.
     Scan,
+    /// An explicit transaction started (its first statement registered it)
+    /// or ended: COMMIT, ROLLBACK, a conflict, or a rollback by the
+    /// coordinator (idle, lifetime, session end, shutdown). Details in
+    /// [`AuditEvent::transaction`].
+    Transaction,
     /// Writer resumed after an unparseable tail (torn write or crash mid-line).
     /// `integrity.prev_hash` is `BROKEN:<reason>` so verifiers can distinguish
     /// this from silent truncation back to genesis.
@@ -145,6 +150,31 @@ pub struct PolicyAudit {
     pub denied: bool,
 }
 
+/// The transaction an [`AuditKind::Transaction`] event is about.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TransactionAudit {
+    pub id: String,
+    /// `begin`, `commit` or `rollback`.
+    pub action: String,
+    /// Why it ended: `committed`, `rolled_back`, `conflict`,
+    /// `idle_timeout`, `lifetime`, `session_ended` or `shutdown`. Absent on
+    /// `begin`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// How long the transaction was open; absent on `begin`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// The snapshot a COMMIT moved each table's `main` to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub published: Vec<PublishedSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublishedSnapshot {
+    pub table: String,
+    pub snapshot_id: i64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Integrity {
     pub seq: u64,
@@ -179,6 +209,9 @@ pub struct AuditEvent {
     /// SQE internal query ID (uuid v7 string) for joining audit + history + spans.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query_id: Option<String>,
+    /// Set on [`AuditKind::Transaction`] events only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction: Option<TransactionAudit>,
     #[serde(default)]
     pub integrity: Integrity,
 }
@@ -260,6 +293,7 @@ pub(crate) fn sample_query_event() -> AuditEvent {
         client_ip: Some("10.0.0.1".into()),
         trace_id: Some("0af7651916cd43dd8448eb211c80319c".into()),
         query_id: Some("019f510a-a20f-74f1-81cd-d1d22ae2e18b".into()),
+        transaction: None,
         integrity: Integrity::default(),
     }
 }
@@ -312,6 +346,7 @@ mod tests {
             client_ip: Some("10.0.0.1".into()),
             trace_id: None,
             query_id: None,
+            transaction: None,
             integrity: Integrity::default(),
         }
     }

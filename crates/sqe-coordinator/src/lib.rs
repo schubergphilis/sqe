@@ -185,6 +185,7 @@ pub fn maybe_warn_superdebug(
         client_ip: None,
         trace_id: None,
         query_id: None,
+        transaction: None,
         integrity: sqe_metrics::audit::Integrity::default(),
     };
     audit.log_event(event);

@@ -125,6 +125,9 @@ pub struct TxnScope {
     /// The catalog the last commit to a branch went through: COMMIT and
     /// ROLLBACK reach the tables the same way, as the same principal.
     catalog: Mutex<Option<Arc<dyn Catalog>>>,
+    /// What a successful [`publish`] moved `main` to, per table, for the
+    /// audit and lineage records of the COMMIT.
+    published: Mutex<Vec<(TableIdent, i64)>>,
 }
 
 impl std::fmt::Debug for TxnScope {
@@ -144,6 +147,7 @@ impl TxnScope {
             tables: Mutex::new(Vec::new()),
             catalog_key: Mutex::new(None),
             catalog: Mutex::new(None),
+            published: Mutex::new(Vec::new()),
         })
     }
 
@@ -190,6 +194,20 @@ impl TxnScope {
     /// The tables this transaction wrote, in the order it first wrote them.
     pub fn tables(&self) -> Vec<TxnTable> {
         self.lock().clone()
+    }
+
+    /// The snapshot each table's `main` points at after a successful
+    /// [`publish`]; empty before one, and for a transaction that wrote
+    /// nothing.
+    pub fn published(&self) -> Vec<(TableIdent, i64)> {
+        self.published
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn set_published(&self, heads: Vec<(TableIdent, i64)>) {
+        *self.published.lock().unwrap_or_else(|e| e.into_inner()) = heads;
     }
 
     /// The transaction's branch if it already claimed `table_uuid`.
@@ -390,21 +408,40 @@ pub async fn publish(txn: &TxnScope) -> sqe_core::Result<()> {
     };
     let result = match tables.as_slice() {
         [] => return Ok(()),
-        [table] => publish_branch(catalog.as_ref(), table).await,
+        [table] => publish_branch(catalog.as_ref(), table)
+            .await
+            .map(|head| head.into_iter().collect()),
         _ => publish_branches(catalog.as_ref(), &tables).await,
     };
-    if result
-        .as_ref()
-        .is_err_and(|e| e.error_code() == sqe_core::SqeErrorCode::TransactionConflict)
-    {
-        discard(txn).await;
+    match result {
+        Ok(heads) => {
+            txn.set_published(heads);
+            Ok(())
+        }
+        Err(e) => {
+            if e.error_code() == sqe_core::SqeErrorCode::TransactionConflict {
+                discard(txn).await;
+            }
+            Err(e)
+        }
     }
-    result
+}
+
+/// The snapshot `branch` of `table` points at: what publishing it moves
+/// `main` to.
+fn branch_head(table: &iceberg::table::Table, branch: &str) -> Option<i64> {
+    table
+        .metadata()
+        .snapshot_for_ref(branch)
+        .map(|s| s.snapshot_id())
 }
 
 /// Several tables: one `PublishBranchAction` per table, prepared against
 /// a fresh load of each, sent as one [`Catalog::commit_transaction`].
-async fn publish_branches(catalog: &dyn Catalog, tables: &[TxnTable]) -> sqe_core::Result<()> {
+async fn publish_branches(
+    catalog: &dyn Catalog,
+    tables: &[TxnTable],
+) -> sqe_core::Result<Vec<(TableIdent, i64)>> {
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
     const MAX_ATTEMPTS: u32 = 4;
     let names = tables
@@ -421,6 +458,7 @@ async fn publish_branches(catalog: &dyn Catalog, tables: &[TxnTable]) -> sqe_cor
     let mut attempt = 1;
     loop {
         let mut commits = Vec::with_capacity(tables.len());
+        let mut heads = Vec::with_capacity(tables.len());
         for TxnTable {
             ident,
             branch,
@@ -440,6 +478,7 @@ async fn publish_branches(catalog: &dyn Catalog, tables: &[TxnTable]) -> sqe_cor
                 // created the branch: nothing to publish.
                 continue;
             }
+            heads.extend(branch_head(&table, branch).map(|id| (ident.clone(), id)));
             let tx = Transaction::new(&table);
             let tx = tx
                 .publish_branch(branch.clone(), *base_snapshot_id)
@@ -460,10 +499,10 @@ async fn publish_branches(catalog: &dyn Catalog, tables: &[TxnTable]) -> sqe_cor
             commits.push(commit);
         }
         if commits.is_empty() {
-            return Ok(());
+            return Ok(heads);
         }
         match catalog.commit_transaction(commits).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(heads),
             Err(e) if e.kind() == iceberg::ErrorKind::FeatureUnsupported => {
                 return Err(sqe_core::SqeError::with_code(
                     sqe_core::SqeErrorCode::NotSupported,
@@ -494,7 +533,10 @@ async fn publish_branches(catalog: &dyn Catalog, tables: &[TxnTable]) -> sqe_cor
     }
 }
 
-async fn publish_branch(catalog: &dyn Catalog, txn_table: &TxnTable) -> sqe_core::Result<()> {
+async fn publish_branch(
+    catalog: &dyn Catalog,
+    txn_table: &TxnTable,
+) -> sqe_core::Result<Option<(TableIdent, i64)>> {
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
     const MAX_ATTEMPTS: u32 = 4;
     let TxnTable {
@@ -519,8 +561,9 @@ async fn publish_branch(catalog: &dyn Catalog, txn_table: &TxnTable) -> sqe_core
             .publish_branch(branch.clone(), *base_snapshot_id)
             .apply(tx)
             .map_err(conflict)?;
+        let head = branch_head(&table, branch).map(|id| (ident.clone(), id));
         match tx.commit(catalog).await {
-            Ok(_) => return Ok(()),
+            Ok(_) => return Ok(head),
             // The action, run by the commit, checks `main` against the base
             // and refuses a missing branch: the transaction lost, no retry.
             Err(e) if e.kind() == iceberg::ErrorKind::PreconditionFailed => {

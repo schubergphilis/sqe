@@ -125,6 +125,7 @@ to an OCSF class before writing. The mapping is fixed at the kind level.
 |----------------|-----------|-----------|----------|--------------|
 | `query` | Datastore Activity | 6005 | Application Activity | 6 |
 | `policy_decision` | Datastore Activity | 6005 | Application Activity | 6 |
+| `transaction` | Datastore Activity | 6005 | Application Activity | 6 |
 | `auth` | Authentication | 3002 | Identity & Access Management | 3 |
 | `session` | Authorize Session | 3003 | Identity & Access Management | 3 |
 | `grant` | Account Change | 3001 | Identity & Access Management | 3 |
@@ -261,6 +262,25 @@ OCSF spool and OCSF file.
 | Secret-bearing statements (CREATE SECRET, DROP SECRET, SHOW SECRETS, ATTACH, DETACH) | Native sink + OCSF file + export spool | Legacy flat `AuditEntry` in the native file; the same record as OCSF class 6005 |
 | Result-cache hits (buffered path, `[query_cache] enabled`) | OCSF file + native sink | Same success record as the run that filled the entry |
 | Statements that fail at parse or planning (Flight SQL, Trino HTTP, streaming and buffered) | OCSF file + native sink | Failed `query` record (`status_id` 2); `statement_type` `unknown` when the SQL does not parse |
+| Transaction start and end (SQL `START TRANSACTION`, Trino HTTP) | OCSF file + native sink | `transaction` record; details under `unmapped.transaction` |
+
+A transaction writes two `transaction` records besides the records of its
+statements. The first goes out when the transaction's first statement runs, with
+`action` `begin`. The second goes out when it ends, with `action` `commit` or
+`rollback` and a `reason`: `committed`, `conflict`, `rolled_back`,
+`session_ended`, `idle_timeout`, `lifetime` or `shutdown`. A lost `COMMIT` is
+`action` `commit`, `reason` `conflict`, `status_id` 2 and error code
+`TRANSACTION_CONFLICT`. The end record carries `duration_ms` and, after a
+successful `COMMIT`, `published`: the `main` snapshot id each table now points
+at. `unmapped.transaction.id` is the transaction id the client holds, so the
+two records join to each other and to the statement records in between by
+username and time.
+
+The actor on a `transaction` record is the username alone. The record has no
+session id, groups or client address, because a transaction outlives the
+request that opened it and the coordinator ends some on its own (idle timeout,
+lifetime, shutdown). A transaction that ends without running a statement
+started nothing and writes no `transaction` record.
 
 Secret-bearing statements keep the redacted legacy path. The entry is redacted
 once, before it is queued, so bearer tokens and catalog credentials embedded in the

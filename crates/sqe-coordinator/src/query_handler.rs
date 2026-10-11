@@ -249,6 +249,37 @@ trait LineageSink: Send + Sync {
     fn on_query_fail(&self, ctx: sqe_lineage::QueryFailCtx);
 }
 
+/// End the lineage run of a write held until its transaction ended:
+/// COMPLETE when COMMIT published it (`unpublished` is `None`), FAIL with
+/// the end reason when it rolled back. The end time is the transaction's,
+/// when the write became visible or was dropped.
+fn end_held_lineage(
+    obs: &dyn LineageSink,
+    ctx: sqe_lineage::QueryCompleteCtx,
+    unpublished: Option<&str>,
+) {
+    let ended_at = chrono::Utc::now();
+    match unpublished {
+        None => obs.on_query_complete(sqe_lineage::QueryCompleteCtx { ended_at, ..ctx }),
+        Some(reason) => obs.on_query_fail(sqe_lineage::QueryFailCtx {
+            run_id: ctx.run_id,
+            job_namespace: ctx.job_namespace,
+            sql: ctx.sql,
+            user: ctx.user,
+            session_id: ctx.session_id,
+            started_at: ctx.started_at,
+            ended_at,
+            duration: ctx.duration,
+            statement_kind: ctx.statement_kind,
+            error_message: format!("transaction not committed ({reason})"),
+            plan: ctx.plan,
+            masked_fields: ctx.masked_fields,
+            scope: ctx.scope,
+            output_lifecycle: ctx.output_lifecycle,
+        }),
+    }
+}
+
 impl LineageSink for sqe_lineage::ChannelObserver {
     fn on_query_start(&self, ctx: sqe_lineage::QueryStartCtx) {
         sqe_lineage::ChannelObserver::on_query_start(self, ctx)
@@ -542,7 +573,10 @@ impl QueryHandler {
         };
 
         let profile_mode = config.query.query_profile;
-        let transaction_metrics = metrics.clone();
+        let mut transactions = crate::txn_registry::TxnRegistry::new(metrics.clone());
+        if let Some(ref a) = audit {
+            transactions = transactions.with_audit(Arc::clone(a));
+        }
 
         let mut hive_ddl_handler =
             crate::hive_ddl_handler::HiveDdlHandler::new(runtime_catalogs.clone(), secrets.clone())
@@ -580,7 +614,7 @@ impl QueryHandler {
             table_cache: None,
             grant_backend,
             session_manager: None,
-            transactions: Arc::new(crate::txn_registry::TxnRegistry::new(transaction_metrics)),
+            transactions: Arc::new(transactions),
             runtime_catalogs,
             secrets,
             worker_load: Arc::new(crate::worker_registry::WorkerLoadTracker::new()),
@@ -3273,7 +3307,7 @@ impl QueryHandler {
                     .unwrap_or_default();
                 match &result {
                     Ok(_) => {
-                        obs.on_query_complete(sqe_lineage::QueryCompleteCtx {
+                        let ctx = sqe_lineage::QueryCompleteCtx {
                             run_id: query_id,
                             job_namespace: self.config.metrics.openlineage.job_namespace.clone(),
                             sql: sql.to_string(),
@@ -3296,7 +3330,28 @@ impl QueryHandler {
                                 .unwrap_or_default(),
                             scope: lineage_scope(&self.config, session),
                             output_lifecycle: lineage_output_lifecycle(&kind),
-                        });
+                        };
+                        // A write inside a transaction landed on its branch
+                        // only: its run completes when COMMIT publishes it,
+                        // and fails when the transaction rolls back.
+                        match session.transaction_id.as_deref() {
+                            Some(id) if kind.is_data_write() => {
+                                let obs = Arc::clone(obs);
+                                let at_end: crate::txn_registry::AtEnd =
+                                    Box::new(move |unpublished| {
+                                        end_held_lineage(obs.as_ref(), ctx, unpublished)
+                                    });
+                                // The write registered the transaction, so it
+                                // is gone only if the coordinator ended it
+                                // meanwhile (session end, shutdown) and
+                                // dropped the branch: the write never reached
+                                // main.
+                                if let Err(at_end) = self.transactions.at_end(id, at_end) {
+                                    at_end(Some("ended"));
+                                }
+                            }
+                            _ => obs.on_query_complete(ctx),
+                        }
                     }
                     Err(e) => {
                         obs.on_query_fail(sqe_lineage::QueryFailCtx {
@@ -9713,6 +9768,12 @@ fn should_emit(kind: &StatementKind, cfg: &sqe_core::config::OpenLineageConfig) 
     match kind {
         StatementKind::Query(_) => cfg.emit_selects,
         StatementKind::Procedure(_) => true,
+        // No datasets of their own: a transaction's writes report their
+        // runs when it ends.
+        StatementKind::Begin
+        | StatementKind::Commit
+        | StatementKind::Rollback
+        | StatementKind::SetTransaction => false,
         _ => true,
     }
 }
@@ -11908,6 +11969,14 @@ warehouse = "wh1"
             sqe_sql::parse_and_classify("CREATE TABLE t (id INT)").expect("parse CREATE TABLE");
         assert!(matches!(kind, StatementKind::CreateTable(_)));
         assert!(should_emit(&kind, &ol_cfg(false)));
+    }
+
+    #[test]
+    fn transaction_control_emits_no_run_of_its_own() {
+        for sql in ["BEGIN", "COMMIT", "ROLLBACK"] {
+            let kind = sqe_sql::parse_and_classify(sql).expect(sql);
+            assert!(!should_emit(&kind, &ol_cfg(true)), "{sql}");
+        }
     }
 
     /// #683: the query path classified `/* /* */ INSERT ...; -- */ SELECT

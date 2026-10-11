@@ -59,6 +59,12 @@ pub fn to_ocsf(event: &AuditEvent) -> Value {
             serde_json::to_value(p).unwrap_or(Value::Null),
         );
     }
+    if let Some(t) = &event.transaction {
+        unmapped.insert(
+            "transaction".into(),
+            serde_json::to_value(t).unwrap_or(Value::Null),
+        );
+    }
 
     let mut out = json!({
         "class_uid": class_uid,
@@ -97,7 +103,10 @@ pub fn to_ocsf(event: &AuditEvent) -> Value {
 
 fn class_for(kind: &AuditKind) -> (u32, u32) {
     match kind {
-        AuditKind::Query | AuditKind::PolicyDecision | AuditKind::Scan => (6005, 6),
+        AuditKind::Query
+        | AuditKind::PolicyDecision
+        | AuditKind::Scan
+        | AuditKind::Transaction => (6005, 6),
         AuditKind::Auth => (3002, 3),
         AuditKind::Session => (3003, 3),
         AuditKind::Grant => (3001, 3),
@@ -157,6 +166,7 @@ mod tests {
             client_ip: Some("10.0.0.1".into()),
             trace_id: None,
             query_id: None,
+            transaction: None,
             integrity: Integrity::default(),
         }
     }
@@ -225,6 +235,7 @@ mod tests {
             client_ip: None,
             trace_id: None,
             query_id: None,
+            transaction: None,
             integrity: Integrity::default(),
         };
         // No client label: the key is absent, not null.
@@ -245,6 +256,33 @@ mod tests {
         assert_eq!(v["status_id"], 2);
     }
 
+    #[test]
+    fn transaction_event_rides_on_datastore_activity_with_its_details() {
+        let mut ev = query_event();
+        ev.kind = AuditKind::Transaction;
+        ev.query = None;
+        ev.stats = None;
+        ev.transaction = Some(TransactionAudit {
+            id: "t1".into(),
+            action: "commit".into(),
+            reason: Some("committed".into()),
+            duration_ms: Some(1200),
+            published: vec![PublishedSnapshot {
+                table: "polaris.hr.employees".into(),
+                snapshot_id: 42,
+            }],
+        });
+        let v = to_ocsf(&ev);
+        assert_eq!(v["class_uid"], 6005);
+        let t = &v["unmapped"]["transaction"];
+        assert_eq!(t["id"], "t1");
+        assert_eq!(t["action"], "commit");
+        assert_eq!(t["reason"], "committed");
+        assert_eq!(t["published"][0]["snapshot_id"], 42);
+        // Other events carry no transaction key.
+        assert!(to_ocsf(&query_event())["unmapped"].get("transaction").is_none());
+    }
+
     proptest::proptest! {
         /// Caller-controlled text (user name, groups, client label, query text,
         /// error message) lands verbatim in its field, through a serialize /
@@ -260,7 +298,7 @@ mod tests {
             kind in proptest::sample::select(vec![
                 AuditKind::Query, AuditKind::Auth, AuditKind::Session, AuditKind::Grant,
                 AuditKind::AdminDdl, AuditKind::PolicyDecision, AuditKind::Maintenance,
-                AuditKind::Scan, AuditKind::AuditResume,
+                AuditKind::Scan, AuditKind::Transaction, AuditKind::AuditResume,
             ]),
         ) {
             use proptest::prop_assert_eq;
