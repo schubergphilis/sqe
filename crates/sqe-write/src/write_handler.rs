@@ -12730,6 +12730,39 @@ s3_path_style = true
         }
 
         #[tokio::test(flavor = "multi_thread")]
+        async fn the_stale_branch_sweep_drops_only_branches_past_the_lifetime() {
+            let rig = SqliteRig::new().await;
+            let h = handler(&rig);
+            let ident = seeded_id_v(&rig, "tx_sweep").await;
+            let main_before = rig.load(&ident).await.metadata().current_snapshot_id();
+            let txn = new_txn();
+            insert_in(&h, &rig, &txn, "INSERT INTO default.tx_sweep VALUES (4, 'd')")
+                .await
+                .expect("INSERT");
+            let sweep = |now_ms: i64| {
+                sqe_catalog::txn::drop_stale_branches(rig.catalog.as_ref(), &ident, now_ms)
+            };
+
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let dropped = sweep(now_ms).await.expect("sweep now");
+            assert!(dropped.is_empty(), "an open transaction's branch is not stale");
+            assert_eq!(txn_refs(&rig.load(&ident).await).len(), 1);
+
+            // Two days on, no transaction can still be open.
+            let lifetime_ms = sqe_catalog::txn::MAX_LIFETIME.as_millis() as i64;
+            let dropped = sweep(now_ms + 2 * lifetime_ms).await.expect("sweep later");
+            assert_eq!(dropped.len(), 1);
+            let table = rig.load(&ident).await;
+            assert!(txn_refs(&table).is_empty());
+            assert_eq!(table.metadata().current_snapshot_id(), main_before);
+
+            // Had the transaction still been open, it aborts: no lost write.
+            let err = sqe_catalog::txn::publish(&txn).await.expect_err("COMMIT");
+            assert_eq!(err.error_code(), sqe_core::SqeErrorCode::TransactionConflict, "{err}");
+            assert_eq!(rows_of(rig.load(&ident).await).await.len(), 3);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
         async fn a_transaction_on_an_empty_table_creates_its_branch_on_first_write() {
             let rig = SqliteRig::new().await;
             let h = handler(&rig);
