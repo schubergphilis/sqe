@@ -3116,7 +3116,8 @@ impl SessionCatalog {
     /// leaves other principals planning against pre-commit metadata until the
     /// soft TTL (architecture review 302). This form exists for the
     /// authorization-revoke path, where dropping exactly the affected
-    /// principal's vended credentials is the point.
+    /// principal's vended credentials is the point, and for a write to a
+    /// transaction branch, which `main` readers never see.
     pub async fn invalidate_table(&self, table_ident: &TableIdent) {
         let key = self.table_cache_key(table_ident);
         self.table_cache.invalidate(&key).await;
@@ -3699,6 +3700,7 @@ impl Catalog for SessionCatalogBridge {
                 .await
                 .map_err(bridge_error)?;
         }
+        let branch_commit_seen = branch_commit.is_some();
         let result = dispatch_catalog!(self.session.inner, update_table(commit));
         if let (Some(txn), Ok(_)) = (branch_commit, &result) {
             txn.bind_catalog(
@@ -3710,8 +3712,15 @@ impl Catalog for SessionCatalogBridge {
         }
         // A table commit is visible to every principal. Evict every token's
         // copy so a different user cannot rebuild a SessionContext from stale
-        // metadata after INSERT/DELETE/UPDATE/MERGE.
-        self.session.invalidate_table_all_tokens(&ident).await;
+        // metadata after INSERT/DELETE/UPDATE/MERGE. A transaction branch
+        // write leaves `main` where it was, so only the writer's copy, which
+        // pins the branch head for its next statement, is stale; `COMMIT`
+        // runs outside the scope and evicts every token (openspec 2.4).
+        if branch_commit_seen {
+            self.session.invalidate_table(&ident).await;
+        } else {
+            self.session.invalidate_table_all_tokens(&ident).await;
+        }
         result
     }
 }
