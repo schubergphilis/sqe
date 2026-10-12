@@ -92,9 +92,9 @@
 - [x] 5.8 Extend `crates/sqe-sql/src/ddl.rs` to parse `DEFAULT <literal>` clause -- done differently: sqlparser parses `DEFAULT` natively; `crates/sqe-sql/src/v3_types.rs::extract_default_literal` lifts it to a literal
 - [x] 5.9 Wire `DEFAULT` through to `NestedField::with_write_default` (`arrow_schema_to_iceberg_with_defaults` in `crates/sqe-write/src/write_handler.rs`; `test_default_string_sets_write_default`)
 - [x] 5.10 Verify column-default test passes (#828: INSERT with a column list and MERGE INSERT write `write_default` through `omitted_column_sql`)
-- [ ] 5.11 Write failing test: `ALTER TABLE ADD COLUMN ... DEFAULT 'unknown'` applies retroactively (verified live in #828: the pre-ALTER row reads NULL, a post-ALTER insert reads the default. The cause is SQE's scan NULL-filling missing fields, not the snapshot schema; tracked in #830)
+- [x] 5.11 Write failing test: `ALTER TABLE ADD COLUMN ... DEFAULT 'unknown'` applies retroactively (#830: `v3_e2e.rs::alter_add_column_with_default_on_v3_table` read the pre-ALTER row as NULL. SQE's direct-read scan NULL-filled missing fields, and the vendored reader's row filter treated a missing column as NULL)
 - [x] 5.12 Wire to `NestedField::with_initial_default` (ADD COLUMN path in `crates/sqe-coordinator/src/catalog_ops.rs` sets both `initial_default` and `write_default`)
-- [ ] 5.13 Verify initial-default test passes (see 5.11; #830)
+- [x] 5.13 Verify initial-default test passes (#830: `conform_batch_to_projection` fills `initial_default`; vendored `PredicateConverter` reads it in pushed predicates. Passes on the direct-read and `to_arrow()` scan paths)
 - [x] 5.14 Reject unsupported default expressions (e.g., `current_timestamp()`) with clear error (`rejects_function_default` in `v3_types.rs`; `unsupported_default_surfaces_error_through_coordinator` in `v3_types_integration.rs`)
 - [x] 5.15 Bump table metadata format-version to 3 only when V3 features are used (`requires_v3_features` and `format_version_properties` in `crates/sqe-write/src/write_handler.rs`)
 - [x] 5.16 Add compat test: SQE writes V2 table when only V2 features used -- done differently: gating unit test `format_version_gates_to_v3_only_when_needed` in `v3_types_integration.rs`; no live V2 write check

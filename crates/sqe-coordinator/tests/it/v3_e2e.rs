@@ -322,8 +322,12 @@ async fn alter_add_column_with_default_on_v3_table() {
     let total: i64 = cols.iter().map(|b| b.num_rows() as i64).sum();
     assert_eq!(total, 1, "ALTER ADD COLUMN did not commit the new column");
 
-    // #828: a new row that omits the column gets the write_default. The
-    // pre-ALTER row (id 1) should read the initial_default; #830.
+    // #830: the pre-ALTER row reads the initial_default, before any write
+    // since the ALTER (the scanned snapshot's schema has no `region` yet).
+    let q = |sql: &str| format!("SELECT id, region FROM {fq}{sql} ORDER BY id");
+    assert_eq!(rendered_rows(&handler, &session, &q("")).await, vec!["1|eu"]);
+
+    // #828: a new row that omits the column gets the write_default.
     handler
         .execute(
             &session,
@@ -332,11 +336,13 @@ async fn alter_add_column_with_default_on_v3_table() {
         )
         .await
         .expect("INSERT omitting the defaulted column");
+    assert_eq!(rendered_rows(&handler, &session, &q("")).await, vec!["1|eu", "2|eu"]);
+    // The default is a value, not a display: predicates see it.
     assert_eq!(
-        rendered_rows(&handler, &session, &format!("SELECT id, region FROM {fq} WHERE id = 2"))
-            .await,
-        vec!["2|eu"]
+        rendered_rows(&handler, &session, &q(" WHERE region = 'eu'")).await,
+        vec!["1|eu", "2|eu"]
     );
+    assert!(rendered_rows(&handler, &session, &q(" WHERE region IS NULL")).await.is_empty());
 
     let _ = handler
         .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
