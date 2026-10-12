@@ -1840,6 +1840,7 @@ mod tests {
     fn make_scan_task_bytes() -> Vec<u8> {
         sqe_planner::ScanTask {
             hive: None,
+            projection_fill: None,
             version: 1,
             morsel_id: None,
             row_group_start: None,

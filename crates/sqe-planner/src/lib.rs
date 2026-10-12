@@ -32,7 +32,7 @@ pub mod worker_fault;
 pub mod worker_protocol;
 
 pub use join_strategy::{BuildSizeEstimate, JoinStrategyRule, DEFAULT_HASH_JOIN_THRESHOLD};
-pub use scan_morsel::SCAN_TASK_VERSION_V3;
+pub use scan_morsel::{SCAN_TASK_VERSION_V3, SCAN_TASK_VERSION_V4};
 pub use scan_morsel::{
     group_row_groups_into_morsels, plan_file_byte_morsels, plan_scan_morsels, RowGroupSlice,
     ScanMorsel, DEFAULT_MORSEL_MAX_BYTES, DEFAULT_MORSEL_TARGET_BYTES, SCAN_TASK_VERSION_CURRENT,
