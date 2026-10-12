@@ -290,6 +290,9 @@ pub struct SqeSchemaProvider {
     /// (none yet, or stale after a failed refresh) so `table_exist` does not
     /// treat an outage as "table missing".
     listing_failed: AtomicBool,
+    /// The session's name for this catalog when it is not the warehouse
+    /// name; see [`SqeCatalogProvider::with_catalog_name`].
+    catalog_name: Option<String>,
 }
 
 impl SqeSchemaProvider {
@@ -309,7 +312,16 @@ impl SqeSchemaProvider {
             tuning: ScanTuning::default(),
             known_namespaces: Vec::new(),
             listing_failed: AtomicBool::new(false),
+            catalog_name: None,
         }
+    }
+
+    /// The session's name for this catalog, registered next to the
+    /// warehouse when a view body is planned (#833).
+    #[must_use = "with_catalog_name consumes self; bind the returned provider"]
+    pub fn with_catalog_name(mut self, name: String) -> Self {
+        self.catalog_name = (name != self.warehouse).then_some(name);
+        self
     }
 
     /// Drop the cached `table_names()` snapshot for this namespace. Call after
@@ -561,6 +573,9 @@ impl SqeSchemaProvider {
         if let Some(m) = &self.prom_metrics {
             provider = provider.with_metrics(Arc::clone(m));
         }
+        if let Some(name) = &self.catalog_name {
+            provider = provider.with_catalog_name(name.clone());
+        }
         provider
     }
 
@@ -605,14 +620,18 @@ impl SqeSchemaProvider {
         if !namespaces.contains(&self.namespace) {
             namespaces.push(self.namespace.clone());
         }
-        mini_ctx.register_catalog(
-            catalog_name,
+        let planning_catalog: Arc<dyn datafusion::catalog::CatalogProvider> =
             Arc::new(self.planning_catalog_provider(
                 self.session_catalog.clone(),
                 self.warehouse.clone(),
                 namespaces,
-            )),
-        );
+            ));
+        mini_ctx.register_catalog(catalog_name, Arc::clone(&planning_catalog));
+        // A view body written in a session names this catalog the way that
+        // session does (`iceberg.ns.t`), not by its warehouse (#833).
+        if let Some(alias) = &self.catalog_name {
+            mini_ctx.register_catalog(alias, planning_catalog);
+        }
 
         let plan_err = |e: DataFusionError| {
             DataFusionError::External(format!("Failed to plan view '{name}' SQL: {e}").into())
@@ -630,7 +649,7 @@ impl SqeSchemaProvider {
                 // precise unresolved reference.
                 let siblings: Vec<String> = sqe_sql::extract_catalog_qualifiers_from_sql(&sql)
                     .into_iter()
-                    .filter(|s| s != catalog_name)
+                    .filter(|s| s != catalog_name && Some(s) != self.catalog_name.as_ref())
                     .collect();
                 if siblings.is_empty() {
                     return Err(plan_err(first_err));
