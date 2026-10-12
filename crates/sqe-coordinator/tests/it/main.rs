@@ -34,6 +34,7 @@ mod compaction_benchmark;
 mod compaction_distributed_benchmark;
 mod ctas_write_modes_e2e;
 mod distributed_failure_e2e;
+mod distributed_schema_evolution_e2e;
 mod equality_delete_integration;
 mod flight_sql_smoke;
 mod full_outer_window_join_test;

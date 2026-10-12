@@ -4860,6 +4860,16 @@ impl QueryHandler {
             iceberg_scan.table().metadata().current_schema(),
         );
 
+        // 6a. The declared projection plus each column's initial default, for
+        // workers whose files predate a projected column (#831). `None` unless
+        // a projected column was added, renamed or promoted at some point.
+        let projection_fill = iceberg_scan.projection_fill().map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::InternalError,
+                format!("encoding the scan projection fill: {e}"),
+            )
+        })?;
+
         // 6b. Push the scan predicate and (when safe) the query LIMIT into each
         // ScanTask (#233). Both are pure optimizations: the authoritative
         // FilterExec / GlobalLimitExec remain above DistributedScanExec (the
@@ -4992,6 +5002,7 @@ impl QueryHandler {
                     .with_file_sizes(file_sizes_bytes)
                     .with_projection(projected_cols.clone(), projected_field_ids.clone())
                     .with_predicate_proto(predicate_proto.clone())
+                    .with_projection_fill(projection_fill.clone())
                     .with_limit(scan_limit)
                     .build()]
                 } else {
@@ -5010,6 +5021,7 @@ impl QueryHandler {
                             .with_file_sizes(vec![m.file_size_bytes])
                             .with_projection(projected_cols.clone(), projected_field_ids.clone())
                             .with_predicate_proto(predicate_proto.clone())
+                            .with_projection_fill(projection_fill.clone())
                             .with_limit(scan_limit);
                             if let (Some(start), Some(end)) = (m.start_byte, m.end_byte) {
                                 builder = builder.with_byte_range(start, end);

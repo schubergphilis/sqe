@@ -8,6 +8,7 @@ pub mod flight_service;
 pub mod heartbeat;
 pub mod hive_partition;
 pub mod hive_reader;
+pub mod projection_fill;
 pub mod runtime;
 pub mod status;
 pub mod ticket_pin;
