@@ -156,6 +156,8 @@ tvf_prefixes = []               # Extra object-store prefixes file TVFs may read
                                 # allowed_object_store_prefixes. Also on [catalogs.<name>].
                                 # Opens only when the catalog answered the caller's own
                                 # bearer (per-user REST auth), never on the name alone.
+                                # Entries here and in the global list expand {user} and
+                                # {catalog} (the session catalog, under the same proof).
 
 # `catalog_url` accepts any Iceberg REST endpoint. SQE has been
 # verified live against Apache Polaris, Project Nessie 0.107+,
