@@ -86,4 +86,5 @@ mod trino_session_catalog_test;
 mod v3_e2e;
 mod v3_types_integration;
 mod vended_credentials_e2e;
+mod view_replace_nested_e2e;
 mod write_shape_e2e;

@@ -166,6 +166,10 @@ pub struct SqeCatalogProvider {
     /// caller. `false` when it degraded to empty (forbidden or unresolvable)
     /// and for providers built from a pre-known namespace list.
     listing_succeeded: bool,
+    /// The name the session registered this catalog under (`iceberg`),
+    /// when it differs from the warehouse. A view body names tables by it,
+    /// so view planning registers it too (#833).
+    catalog_name: Option<String>,
 }
 
 impl std::fmt::Debug for SqeCatalogProvider {
@@ -276,6 +280,7 @@ impl SqeCatalogProvider {
             tuning: ScanTuning::default(),
             schema_providers: DashMap::new(),
             listing_succeeded,
+            catalog_name: None,
         })
     }
 
@@ -338,7 +343,19 @@ impl SqeCatalogProvider {
             tuning: ScanTuning::default(),
             schema_providers: DashMap::new(),
             listing_succeeded: false,
+            catalog_name: None,
         }
+    }
+
+    /// Record the name the session registers this catalog under, so a view
+    /// body that names `<catalog>.<ns>.<table>` resolves when that name is
+    /// not the warehouse's (#833).
+    #[must_use = "with_catalog_name consumes self; bind the returned provider"]
+    pub fn with_catalog_name(mut self, name: impl Into<String>) -> Self {
+        let name = name.into();
+        self.catalog_name = (name != self.warehouse).then_some(name);
+        self.schema_providers.clear();
+        self
     }
 
     /// The session catalog this provider plans against.
@@ -499,6 +516,9 @@ impl SqeCatalogProvider {
             self.warehouse.clone(),
         )
         .with_known_namespaces(self.cached_namespace_names());
+        if let Some(name) = &self.catalog_name {
+            provider = provider.with_catalog_name(name.clone());
+        }
         if let Some(ref m) = self.prom_metrics {
             provider = provider.with_metrics(Arc::clone(m));
         }
