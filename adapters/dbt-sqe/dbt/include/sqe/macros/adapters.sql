@@ -1,11 +1,14 @@
 {# ── Metadata discovery ─────────────────────────────────────────────── #}
 
+{# SQLAdapter.list_relations_without_caching unpacks rows positionally as
+   (database, name, schema, type); any other order swaps name and schema and
+   no existing relation is ever found. #}
 {% macro sqe__list_relations_without_caching(schema_relation) %}
   {% call statement('list_relations', fetch_result=True) %}
     SELECT
       table_catalog AS "database",
-      table_schema AS "schema",
       table_name AS "name",
+      table_schema AS "schema",
       CASE table_type
         WHEN 'BASE TABLE' THEN 'table'
         WHEN 'VIEW' THEN 'view'
@@ -40,7 +43,7 @@
   {% call statement('list_schemas', fetch_result=True) %}
     SELECT DISTINCT schema_name
     FROM information_schema.schemata
-    WHERE catalog_name = '{{ database }}'
+    WHERE catalog_name = '{{ database | replace('"', '') }}'
   {% endcall %}
   {{ return(load_result('list_schemas').table) }}
 {% endmacro %}
@@ -71,24 +74,34 @@
   )
 {% endmacro %}
 
+{# The adapter calls these to run the DDL, not to render it: each must run its
+   own statement, as the default__ macros do. A bare SQL body is discarded. #}
 {% macro sqe__drop_relation(relation) %}
-  {% if relation.type == 'view' %}
-    DROP VIEW IF EXISTS {{ relation }}
-  {% else %}
-    DROP TABLE IF EXISTS {{ relation }}
-  {% endif %}
+  {% call statement('drop_relation', auto_begin=False) %}
+    {% if relation.type == 'view' %}
+      DROP VIEW IF EXISTS {{ relation }}
+    {% else %}
+      DROP TABLE IF EXISTS {{ relation }}
+    {% endif %}
+  {% endcall %}
 {% endmacro %}
 
 {% macro sqe__rename_relation(from_relation, to_relation) %}
-  ALTER TABLE {{ from_relation }} RENAME TO {{ to_relation }}
+  {% call statement('rename_relation') %}
+    ALTER TABLE {{ from_relation }} RENAME TO {{ to_relation }}
+  {% endcall %}
 {% endmacro %}
 
 {% macro sqe__create_schema(relation) %}
-  CREATE SCHEMA IF NOT EXISTS {{ relation.without_identifier() }}
+  {% call statement('create_schema') %}
+    CREATE SCHEMA IF NOT EXISTS {{ relation.without_identifier() }}
+  {% endcall %}
 {% endmacro %}
 
 {% macro sqe__drop_schema(relation) %}
-  DROP SCHEMA IF EXISTS {{ relation.without_identifier() }}
+  {% call statement('drop_schema') %}
+    DROP SCHEMA IF EXISTS {{ relation.without_identifier() }}
+  {% endcall %}
 {% endmacro %}
 
 {% macro sqe__current_timestamp() %}
@@ -97,5 +110,7 @@
 
 {% macro sqe__make_temp_relation(base_relation, suffix) %}
   {% set tmp_identifier = base_relation.identifier ~ suffix %}
-  {% do return(base_relation.incorporate(path={"identifier": tmp_identifier})) %}
+  {# Typed: the materializations create it as a table, and drop_relation
+     refuses a relation whose type is null (`this` has none). #}
+  {% do return(base_relation.incorporate(path={"identifier": tmp_identifier}, type='table')) %}
 {% endmacro %}
