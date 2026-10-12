@@ -24,6 +24,10 @@
       {% call statement('create_tmp') %}
         {{ sqe__create_table_as(False, tmp_relation, compiled_code) }}
       {% endcall %}
+      {# DELETE and INSERT commit together: readers never see the deleted
+         keys missing, and a failed INSERT rolls the DELETE back. The temp
+         table's CTAS and DROP autocommit, so they stay outside. #}
+      {% do adapter.begin_transaction() %}
       {% call statement('delete') %}
         DELETE FROM {{ this }}
         WHERE {{ unique_key }} IN (
@@ -35,6 +39,7 @@
         INSERT INTO {{ this }}
         (SELECT * FROM {{ tmp_relation }})
       {% endcall %}
+      {% do adapter.commit_transaction() %}
       {{ adapter.drop_relation(tmp_relation) }}
 
     {% elif strategy == 'merge' %}

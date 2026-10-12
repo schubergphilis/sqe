@@ -34,7 +34,7 @@
 - [x] 5.1 Flight SQL `BeginTransaction` / `EndTransaction`; `transaction_id` honoured on statement, update, ingest and prepared commands. The client holds the id; DDL and CTAS inside it autocommit and leave it open; a prepared statement is bound to the transaction it was created in
 - [x] 5.2 Flight SqlInfo 8 (Transaction) / 11 / 562 (READ_COMMITTED) / 563 / 564 / 565 / 566 updated (with 5.1)
 - [x] 5.3 Trino: allow DML inside a transaction (DDL, CTAS and Hive writes stay refused); `COMMIT` / `ROLLBACK` publish or drop the branch, clear header only on success
-- [ ] 5.4 dbt-sqe: decide whether models should run inside a real transaction (separate change)
+- [x] 5.4 dbt-sqe: decided per statement group, not per model. Models stay in autocommit, because a transaction refuses the DDL and CTAS a model runs. `delete+insert`, the one strategy that writes its target twice, wraps DELETE + INSERT in a Flight SQL transaction (`adapter.begin_transaction` / `commit_transaction`, through ADBC autocommit). dbt's rollback / close aborts it on any failure. Verified live: an INSERT that fails after its DELETE leaves the target unchanged
 
 ## 6. Audit, docs, tests
 

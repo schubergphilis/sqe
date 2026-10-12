@@ -53,9 +53,9 @@ Here's where SQE stands today vs. what dbt needs:
 │ information_schema       │ ✅ Implemented     │ Virtual tables/columns/       │
 │                          │                    │ schemata providers            │
 ├──────────────────────────┼────────────────────┼───────────────────────────────┤
-│ Transactions (BEGIN/     │ ⚠️ N/A            │ Iceberg gives atomic commits  │
-│ COMMIT)                  │                    │ per statement; multi-stmt     │
-│                          │                    │ txns not needed for dbt       │
+│ Transactions (BEGIN/     │ ✅ Implemented     │ Models autocommit; delete+    │
+│ COMMIT)                  │                    │ insert runs DELETE + INSERT   │
+│                          │                    │ in one Flight SQL transaction │
 ├──────────────────────────┼────────────────────┼───────────────────────────────┤
 │ Seeds (batch INSERT)     │ ✅ Implemented     │ dbt-sqe adapter batches rows  │
 │                          │                    │ (1000 per INSERT statement)   │
@@ -616,6 +616,18 @@ small deletes on large tables, but CoW is simpler and correct for all cases.
   {% endif %}
 {% endmaterialization %}
 ```
+
+**Transactions.** Models run in autocommit, and each statement is its own Iceberg commit. `delete+insert` is the one strategy that writes its target in two statements. Run that way, a reader between them would see the replaced keys missing, and a failed INSERT would leave them deleted.
+
+The shipped adapter therefore runs the DELETE and the INSERT in one Flight SQL transaction:
+
+- `adapter.begin_transaction()` switches the ADBC connection out of autocommit.
+- `adapter.commit_transaction()` switches it back, which commits.
+- The temp table's CTAS and DROP autocommit, so they stay outside the transaction.
+
+If the model fails, dbt rolls back and closes its connection, and the adapter aborts the transaction there. That covers a database error and a template error alike, and the target is left as it was.
+
+`append` and `merge` are single statements and need no transaction. Models do not run inside a transaction as a whole, because a transaction refuses the DDL and CTAS a model issues.
 
 ### view materialization
 
