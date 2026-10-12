@@ -12941,6 +12941,137 @@ s3_path_style = true
             assert!(txn_refs(&rig.load(&b).await).is_empty());
         }
 
+        // --- Session WRITE_BRANCH (#829) -----------------------------------
+        //
+        // The coordinator runs a data write outside a transaction inside
+        // `sqe_catalog::txn::write_scope` when the session set a branch.
+        // `main` and the branch diverge first, so a write that read or
+        // committed `main` shows up in the rows.
+
+        /// `ident` with branch `dev` at the seed rows, then `(99, "late")`
+        /// appended to `main` only.
+        async fn diverged_dev(rig: &SqliteRig, name: &str, mor: bool) -> TableIdent {
+            let props = if mor {
+                std::collections::HashMap::from([(
+                    sqe_core::table_properties::WRITE_DELETE_MODE.to_string(),
+                    "merge-on-read".to_string(),
+                )])
+            } else {
+                std::collections::HashMap::new()
+            };
+            let ident = seeded_id_v_with(rig, name, props).await;
+            let table = rig.load(&ident).await;
+            let head = table.metadata().current_snapshot_id().expect("seeded");
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .create_branch("dev".to_string())
+                .with_snapshot_id(head)
+                .apply(tx)
+                .expect("create branch");
+            tx.commit(rig.catalog.as_ref()).await.expect("commit branch");
+            append_rows(&rig.catalog, &ident, vec![id_v_batch(&[(99, "late")])]).await;
+            ident
+        }
+
+        async fn on_dev<F: std::future::Future>(f: F) -> F::Output {
+            sqe_catalog::txn::write_scope(None, s("dev"), f).await
+        }
+
+        async fn dev_rows(rig: &SqliteRig, ident: &TableIdent) -> Vec<(i64, Option<String>)> {
+            rows_of(rig.load(ident).await.pinned_to_ref("dev").expect("dev")).await
+        }
+
+        async fn write_branch_dml_reads_and_writes_the_branch(name: &str, mor: bool) {
+            let rig = SqliteRig::new().await;
+            let h = handler(&rig);
+            let ident = diverged_dev(&rig, name, mor).await;
+            let main_before = rig.load(&ident).await.metadata().current_snapshot_id();
+            let tbl = format!("default.{name}");
+
+            let n = on_dev(run_insert(&h, &rig, &format!("INSERT INTO {tbl} VALUES (4, 'd')")))
+                .await
+                .expect("INSERT");
+            assert_eq!(n, 1);
+            let n = on_dev(run_delete(&h, &rig, &format!("DELETE FROM {tbl} WHERE id = 99")))
+                .await
+                .expect("DELETE of a main-only row");
+            assert_eq!(n, 0, "the DELETE reads dev, where id 99 never existed");
+            let n = on_dev(run_delete(&h, &rig, &format!("DELETE FROM {tbl} WHERE id = 2")))
+                .await
+                .expect("DELETE");
+            assert_eq!(n, 1);
+            let n = on_dev(run_update(&h, &rig, &format!("UPDATE {tbl} SET v = 'z' WHERE id = 1")))
+                .await
+                .expect("UPDATE");
+            assert_eq!(n, 1);
+
+            assert_eq!(
+                dev_rows(&rig, &ident).await,
+                vec![(1, s("z")), (3, s("c")), (4, s("d"))],
+                "dev keeps its own rows and none of main's"
+            );
+            let main = rig.load(&ident).await;
+            assert_eq!(main.metadata().current_snapshot_id(), main_before, "main never moved");
+            assert_eq!(
+                rows_of(main).await,
+                vec![(1, s("a")), (2, s("b")), (3, s("c")), (99, s("late"))]
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn write_branch_cow_dml_stays_on_the_branch() {
+            write_branch_dml_reads_and_writes_the_branch("wb_cow", false).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn write_branch_mor_dml_stays_on_the_branch() {
+            write_branch_dml_reads_and_writes_the_branch("wb_mor", true).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn write_branch_merge_stays_on_the_branch() {
+            let rig = SqliteRig::new().await;
+            let h = handler(&rig);
+            let ident = diverged_dev(&rig, "wb_merge", false).await;
+            let main_before = rig.load(&ident).await.metadata().current_snapshot_id();
+
+            on_dev(run_merge(
+                &h,
+                &rig,
+                "MERGE INTO default.wb_merge AS t USING src AS s ON t.id = s.id \
+                 WHEN MATCHED THEN UPDATE SET v = s.v \
+                 WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
+                vec![id_v_batch(&[(2, "B"), (99, "new")])],
+                None,
+            ))
+            .await
+            .expect("MERGE");
+
+            assert_eq!(
+                dev_rows(&rig, &ident).await,
+                vec![(1, s("a")), (2, s("B")), (3, s("c")), (99, s("new"))],
+                "id 99 is not on dev, so the MERGE inserts it"
+            );
+            assert_eq!(rig.load(&ident).await.metadata().current_snapshot_id(), main_before);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn write_branch_that_does_not_exist_is_refused() {
+            let rig = SqliteRig::new().await;
+            let h = handler(&rig);
+            let ident = seeded_id_v(&rig, "wb_missing").await;
+            let main_before = rig.load(&ident).await.metadata().current_snapshot_id();
+
+            let err = on_dev(run_insert(&h, &rig, "INSERT INTO default.wb_missing VALUES (4, 'd')"))
+                .await
+                .expect_err("no branch dev");
+            assert_eq!(err.error_code(), sqe_core::SqeErrorCode::InvalidArguments, "{err}");
+            assert!(err.to_string().contains("CREATE BRANCH dev"), "{err}");
+            let table = rig.load(&ident).await;
+            assert!(table.metadata().snapshot_for_ref("dev").is_none(), "no branch was created");
+            assert_eq!(table.metadata().current_snapshot_id(), main_before);
+        }
+
         #[tokio::test(flavor = "multi_thread")]
         async fn insert_then_select_round_trip() {
             let rig = SqliteRig::new().await;

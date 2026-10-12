@@ -161,9 +161,15 @@ Iceberg branches let you isolate writes from the production snapshot. SQE expose
 
 | Statement | Notes |
 |---|---|
-| `SET WRITE_BRANCH = 'name'` | Subsequent INSERT / UPDATE / DELETE / MERGE writes go to the named branch. |
+| `SET WRITE_BRANCH = 'name'` | Subsequent INSERT / UPDATE / DELETE / MERGE / TRUNCATE writes, and Flight SQL bulk ingest, go to the named branch. |
 | `SET WRITE_BRANCH = DEFAULT` | Reset to the default (main) branch. |
 | `SET WRITE_BRANCH = NULL` | Same as `DEFAULT`. |
+
+While a branch is set:
+
+- The branch must already exist on the table being written (`ALTER TABLE ... CREATE BRANCH`). A write to a table without it fails instead of creating it. A table with no snapshot cannot hold a branch, so write its first rows on main.
+- UPDATE, DELETE and MERGE read the table at the branch, so they change the branch's rows, not main's. A source table that holds a branch of the same name is also read at it, as Spark's `spark.wap.branch` does. Plain SELECT statements still read main; use `FOR VERSION AS OF 'name'` to read the branch.
+- `CREATE TABLE ... AS SELECT` is refused, because a new table has no branch. Writes inside an explicit transaction are refused too, because a transaction publishes to main. `RESET WRITE_BRANCH` first.
 
 ```sql
 ALTER TABLE events CREATE BRANCH staging;

@@ -1276,8 +1276,17 @@ impl QueryHandler {
                 .map(|_| session.clone().with_transaction_id(None));
             let session = autocommit.as_ref().unwrap_or(session);
             let txn = self.txn_scope(session).ok().flatten();
-            sqe_catalog::txn::scope(
+            // A data write outside a transaction reads and commits at the
+            // session's WRITE_BRANCH (#829). Reads and other statements stay
+            // on `main`, so this classifies only when a branch is set.
+            let write_branch = session
+                .write_branch
+                .clone()
+                .filter(|_| txn.is_none())
+                .filter(|_| classify_user_sql(session, sql).is_ok_and(|k| k.is_data_write()));
+            sqe_catalog::txn::write_scope(
                 txn,
+                write_branch,
                 sqe_catalog::file_tvf_prepare::in_statement(
                     self.execute_inner(session, sql, client_ip, query_id),
                 ),
@@ -1514,6 +1523,17 @@ impl QueryHandler {
                         .to_string(),
                 )));
             }
+        }
+        // CTAS creates the table before its first append, and a new table
+        // holds no branch: the append would be refused after the create
+        // landed, leaving an empty table behind (#829).
+        if matches!(kind, StatementKind::Ctas(_)) && session.write_branch.is_some() {
+            return Err(failed(SqeError::with_code(
+                SqeErrorCode::NotSupported,
+                "CREATE TABLE AS SELECT creates a new table, which has no branch to \
+                 write to; RESET WRITE_BRANCH first"
+                    .to_string(),
+            )));
         }
 
         // Issue #408: cap concurrent sorted writes so several CTAS ORDER BY
@@ -10438,6 +10458,17 @@ mod show_stats_policy_tests {
             .await
             .expect_err("write branch in a transaction");
         assert_eq!(err.error_code(), sqe_core::SqeErrorCode::NotSupported, "{err}");
+
+        // CTAS would create the table on main before its append is refused
+        // on the branch, so it is refused up front (#829).
+        let mut ctas_on_branch = session.clone();
+        ctas_on_branch.write_branch = Some("dev".to_string());
+        let err = handler
+            .execute(&ctas_on_branch, "CREATE TABLE sales.t3 AS SELECT 1 AS a", None)
+            .await
+            .expect_err("CTAS with a write branch");
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::NotSupported, "{err}");
+        assert!(err.to_string().contains("RESET WRITE_BRANCH"), "{err}");
 
         let session = session.with_transaction_id(Some(sqe_core::txn_id::new_txn_id()));
         for sql in [

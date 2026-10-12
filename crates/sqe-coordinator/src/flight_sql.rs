@@ -2447,8 +2447,11 @@ impl FlightSqlService for SqeFlightSqlService {
         // that bulk-loaded here and then counted rows on the same connection
         // read the pre-ingest snapshot until the cache TTL expired. Keep the
         // ingest going through a `WriteHandler` entry point for that reason.
-        let rows = sqe_catalog::txn::scope(
+        // Outside a transaction the ingest writes to the session's
+        // WRITE_BRANCH like an INSERT does (#829).
+        let rows = sqe_catalog::txn::write_scope(
             txn,
+            session.write_branch.clone(),
             self.query_handler.write_handler().handle_ingest_streaming(
                 &session,
                 &qualified,
