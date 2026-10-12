@@ -2268,7 +2268,7 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
     // OpenLineage observer (optional). When [metrics.openlineage] enabled = true,
     // build the configured sinks (file and/or HTTP+spool), spawn the emitter task,
     // and hand back a ChannelObserver wired to the bounded mpsc.
-    let lineage_obs = build_lineage_observer(&config)?;
+    let lineage_obs = build_lineage_observer(&config, &metrics.registry)?;
 
     // Query handler
     let query_handler = Arc::new(
@@ -2832,6 +2832,7 @@ fn lineage_catalog_lookup(config: &SqeConfig) -> sqe_lineage::extract::CatalogLo
 /// task pattern.
 fn build_lineage_observer(
     config: &SqeConfig,
+    registry: &prometheus::Registry,
 ) -> anyhow::Result<Option<Arc<sqe_lineage::ChannelObserver>>> {
     if !config.metrics.openlineage.enabled {
         return Ok(None);
@@ -2879,13 +2880,20 @@ fn build_lineage_observer(
         .map_err(|e| anyhow::anyhow!("openlineage http sink: {e}"))?;
 
         let sink: Arc<dyn sqe_lineage::Sink> = if !ol.spool_path.is_empty() {
-            sqe_lineage::sinks::spool::SpoolSink::wrap(
+            let spool_dropped = prometheus::IntCounter::new(
+                "sqe_lineage_spool_dropped_events_total",
+                "OL events dropped from a full spool (oldest first) while the collector was down",
+            )
+            .expect("static prometheus opts cannot fail");
+            register_lineage_counter(registry, &spool_dropped);
+            sqe_lineage::sinks::spool::SpoolSink::wrap_with_counter(
                 Arc::new(http),
                 sqe_lineage::sinks::spool::SpoolConfig {
                     path: std::path::PathBuf::from(&ol.spool_path),
                     max_bytes: ol.spool_max_bytes,
                     replay_interval: std::time::Duration::from_secs(ol.replay_interval_secs),
                 },
+                Some(spool_dropped),
             )
         } else {
             Arc::new(http)
@@ -2897,14 +2905,12 @@ fn build_lineage_observer(
 
     let (tx, rx) = tokio::sync::mpsc::channel(ol.channel_capacity);
 
-    // TODO: register dropped_events counter with prometheus_registry().
-    // Same pattern as MultiSink::errors in D1: registration is a follow-up.
-    // The counter increments in memory; it just won't appear on /metrics yet.
     let drop_counter = prometheus::IntCounter::new(
         "sqe_lineage_dropped_events_total",
         "OL events dropped due to channel back-pressure",
     )
     .expect("static prometheus opts cannot fail");
+    register_lineage_counter(registry, &drop_counter);
 
     let catalog_lookup = lineage_catalog_lookup(config);
 
@@ -2939,6 +2945,14 @@ fn build_lineage_observer(
         tx,
         drop_counter,
     ))))
+}
+
+/// Expose a lineage drop counter on `/metrics`. A duplicate registration
+/// (the observer built twice in one process, as tests do) only logs.
+fn register_lineage_counter(registry: &prometheus::Registry, counter: &prometheus::IntCounter) {
+    if let Err(e) = registry.register(Box::new(counter.clone())) {
+        tracing::warn!(error = %e, "could not register an OpenLineage drop counter");
+    }
 }
 
 // ── External auth (OAuth2) construction ───────────────────────
