@@ -30,7 +30,8 @@
           SELECT {{ unique_key }} FROM {{ tmp_relation }}
         )
       {% endcall %}
-      {% call statement('insert') %}
+      {# dbt fails a model that never runs statement('main'). #}
+      {% call statement('main') %}
         INSERT INTO {{ this }}
         (SELECT * FROM {{ tmp_relation }})
       {% endcall %}
