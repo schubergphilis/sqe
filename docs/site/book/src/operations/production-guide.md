@@ -46,6 +46,12 @@ Keep the global list to what every user may read. A bucket that belongs to
 one workspace goes in that catalog's `tvf_prefixes` instead, so only sessions
 scoped to that catalog can read it with the engine's credentials (see
 [read_parquet](../features/read-parquet.md#which-paths-the-engines-credentials-may-read)).
+When the workspaces share one layout, a single entry with the `{catalog}`
+placeholder (`"s3://staging/ingest/ws/{catalog}/"`) does the same: it expands
+only to the session's catalog, and only when that catalog answered the
+caller's own bearer. If you rely on any of these prefixes to keep workspaces
+apart, set `allow_inline_credentials = false` too. Otherwise a caller who
+passes their own keys bypasses them.
 
 ### Memory
 

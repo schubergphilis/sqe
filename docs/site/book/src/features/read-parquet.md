@@ -104,6 +104,37 @@ object-store URL with a bucket fails config validation at startup. Hive
 external tables use the global list only, because a Hive root is shared by
 every session that reads it.
 
+#### One entry for every workspace: `{catalog}`
+
+When the workspaces' staging areas follow one layout, a single global entry
+can cover them all:
+
+```toml
+[storage.tvf]
+allowed_object_store_prefixes = ["s3://staging/ingest/ws/{catalog}/"]
+```
+
+`{catalog}` expands to the session's catalog, under the same proof as
+`tvf_prefixes`: the catalog must have answered the caller's own bearer while
+the session was built. A warehouse discovered from Polaris
+(`catalog_discovery = "polaris-auto"`) counts. A member of `ws1` in a `ws1`
+session reads `s3://staging/ingest/ws/ws1/...`. The same caller in a `ws2`
+session, or a caller who names `ws1` without grants on it, is refused. It
+never expands to every catalog the caller can see, only to the one the
+session is on.
+
+With no such catalog the entry is dropped. It never matches as an empty
+segment, so `s3://staging/ingest/ws//...` stays closed. Names match exactly
+and case-sensitively, and a name outside `A-Z a-z 0-9 . _ - @ +`, or one
+containing `..`, never expands. `{user}` and `{catalog}` can share an entry,
+for example `"s3://scratch/{catalog}/{user}/"`, and both must resolve.
+
+Complete inline credentials bypass these prefixes by default, because the
+engine's key is not used. A deployment that relies on the prefixes to keep
+workspaces apart must also set `allow_inline_credentials = false`, so a
+caller cannot bring their own keys to another workspace's path.
+`allow_all_object_stores = true` turns the prefixes off entirely.
+
 ## Glob patterns
 
 `read_parquet()` supports the same glob syntax as object_store:
