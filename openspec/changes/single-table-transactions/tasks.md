@@ -9,7 +9,7 @@
 - [x] 2.1 Target branch applied at every `fast_append` / `row_delta` / `rewrite_files` site (`commit::txn_target_branch`, from the task-local scope rather than a write-context field)
 - [x] 2.2 Create the branch at the base on the first write in a transaction (empty table: the first write commit creates it)
 - [x] 2.3 Refuse a write to a second table: `Multi-table writes not supported in a single transaction`, before any file is written (`txn::check_target`; replaced by `txn::admit` in #823)
-- [ ] 2.4 Session-cache invalidation after a branch write covers the owning session only
+- [x] 2.4 Cache invalidation after a branch write stays with the writer: the result cache is left alone (only `main` feeds it; `COMMIT` clears it), and the table-metadata cache is evicted for the writer's token only (`SessionCatalogBridge::update_table`, `WriteHandler::after_commit`), so other users keep their `main` copy. The session-context drop at `COMMIT` stays user-wide: that cache key has no session id
 
 ## 3. Read path
 
