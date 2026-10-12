@@ -5796,6 +5796,7 @@ impl WriteHandler {
             }
             let bridge_ref = bridge.as_ref();
             let target_branch = crate::commit::txn_target_branch(bridge_ref, table_ident).await?;
+            let written_ref = target_branch.clone();
             let committed = commit_with_retry(bridge_ref, table_ident, "insert", move |fresh_table| {
                 let files = new_data_files.clone();
                 let target_branch = target_branch.clone();
@@ -5814,7 +5815,13 @@ impl WriteHandler {
             self.after_commit(session, catalog.as_ref(), table_ident)
                 .await;
             // The append's snapshot, for lineage (the OL `version` facet).
-            return Ok(committed.metadata().current_snapshot_id());
+            // Inside a transaction it is the branch head, not `main`; COMMIT
+            // makes it part of `main`'s history.
+            let metadata = committed.metadata();
+            return Ok(match written_ref {
+                Some(branch) => metadata.snapshot_for_ref(&branch).map(|s| s.snapshot_id()),
+                None => metadata.current_snapshot_id(),
+            });
         }
 
         // Distinct partitions touched by the new files (dynamic overwrite).
@@ -12694,6 +12701,14 @@ s3_path_style = true
             sqe_catalog::txn::publish(&txn).await.expect("COMMIT");
             let published = rig.load(&ident).await;
             assert!(txn_refs(&published).is_empty(), "COMMIT removes the branch");
+            assert_eq!(
+                txn.published(),
+                vec![(
+                    ident.clone(),
+                    published.metadata().current_snapshot_id().expect("main head")
+                )],
+                "the audit trail names the snapshot COMMIT put on main"
+            );
             assert_eq!(rows_of(published).await, all);
         }
 

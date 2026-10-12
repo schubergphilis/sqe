@@ -167,6 +167,7 @@ pub(crate) fn emit_failed_statement(
             client_ip,
             trace_id,
             query_id: Some(query_id.to_string()),
+            transaction: None,
             integrity: Integrity::default(),
         });
         return;
@@ -287,6 +288,7 @@ pub(crate) fn emit_statement_audit(audit: &AuditLogger, a: StatementAudit<'_>) {
         client_ip: a.client_ip,
         trace_id: a.trace_id,
         query_id: Some(a.query_id.to_string()),
+        transaction: None,
         integrity: Integrity::default(),
     });
 }
