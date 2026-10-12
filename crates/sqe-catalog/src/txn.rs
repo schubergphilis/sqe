@@ -236,23 +236,59 @@ impl TxnScope {
     }
 }
 
+/// What a statement runs in: an explicit transaction, or the session's
+/// `WRITE_BRANCH` for a data write outside one (#829). Never both.
+#[derive(Clone, Default)]
+struct StatementScope {
+    txn: Option<Arc<TxnScope>>,
+    write_branch: Option<Arc<str>>,
+}
+
 tokio::task_local! {
-    static CURRENT: Option<Arc<TxnScope>>;
+    static CURRENT: StatementScope;
 }
 
 /// Run `f` inside `txn`'s scope. `None` runs it outside any transaction,
 /// even when the caller is inside one: COMMIT publishes the branch to
 /// `main`, which the bridge refuses from inside a scope.
 pub async fn scope<F: Future>(txn: Option<Arc<TxnScope>>, f: F) -> F::Output {
-    CURRENT.scope(txn, f).await
+    let scope = StatementScope {
+        txn,
+        write_branch: None,
+    };
+    CURRENT.scope(scope, f).await
+}
+
+/// Run the data write `f` on the session's `WRITE_BRANCH` (#829): inside
+/// `txn` when there is one (the branch is then ignored; a transaction
+/// refuses writes with a branch set), else on `write_branch`. While it
+/// runs, every table that holds the branch is read at it
+/// ([`pin`]), every write commits to it ([`target_branch`]), and the
+/// session catalog refuses a commit that would move `main`.
+pub async fn write_scope<F: Future>(
+    txn: Option<Arc<TxnScope>>,
+    write_branch: Option<String>,
+    f: F,
+) -> F::Output {
+    let write_branch = match txn {
+        Some(_) => None,
+        None => write_branch.map(Arc::from),
+    };
+    CURRENT.scope(StatementScope { txn, write_branch }, f).await
 }
 
 /// The transaction the current task runs in, if any.
 pub fn current() -> Option<Arc<TxnScope>> {
-    CURRENT.try_with(Option::clone).ok().flatten()
+    CURRENT.try_with(|s| s.txn.clone()).ok().flatten()
 }
 
-/// `f` in the caller's transaction scope, captured now.
+/// The session branch the current data write commits to, outside a
+/// transaction ([`write_scope`]).
+pub fn write_branch() -> Option<Arc<str>> {
+    CURRENT.try_with(|s| s.write_branch.clone()).ok().flatten()
+}
+
+/// `f` in the caller's statement scope, captured now.
 ///
 /// The scope is a task-local, which tokio keeps in a thread-local while the
 /// task is polled, so a future driven on another thread
@@ -260,7 +296,8 @@ pub fn current() -> Option<Arc<TxnScope>> {
 /// table loads against `main`. Wrap such a future here, on the calling
 /// thread.
 pub fn carried<F: Future>(f: F) -> impl Future<Output = F::Output> {
-    CURRENT.scope(current(), f)
+    let scope = CURRENT.try_with(StatementScope::clone).unwrap_or_default();
+    CURRENT.scope(scope, f)
 }
 
 /// Whether a write to `ident` through the catalog `catalog_key` may join
@@ -318,8 +355,18 @@ pub enum Pin {
 }
 
 /// Read `table` at the current transaction's branch when the transaction
-/// wrote it.
+/// wrote it, or at the session's write branch when the table holds it
+/// ([`write_scope`]). The second covers the target of a DELETE, UPDATE or
+/// MERGE, which must rewrite the branch's files, not `main`'s, and any
+/// source table staged on the same branch (Spark's `spark.wap.branch`
+/// reads the same way).
 pub fn pin(table: Table) -> Pin {
+    if let Some(branch) = write_branch() {
+        return match table.pinned_to_ref(&branch) {
+            Some(pinned) => Pin::Pinned(pinned),
+            None => Pin::Unpinned(table),
+        };
+    }
     let Some(claimed) = current().and_then(|txn| txn.claimed(table.metadata().uuid())) else {
         return Pin::Unpinned(table);
     };
@@ -334,14 +381,19 @@ pub fn pin(table: Table) -> Pin {
     }
 }
 
-/// The branch a write to `table` must target: `None` outside a
-/// transaction, else the transaction branch.
+/// The branch a write to `table` must target: the transaction branch
+/// inside a transaction, the session's write branch inside a
+/// [`write_scope`], else `None` (`main`).
 ///
 /// The first write of a transaction to a table claims it and creates the
 /// branch at the `main` snapshot `table` was loaded at, so the
 /// transaction's base for that table is the state its first statement
 /// read. A table without a snapshot gets no branch here: the first write
 /// creates it with no parent.
+///
+/// A session write branch must already exist on `table`: committing to a
+/// missing ref would create it, so a typo in `SET WRITE_BRANCH` would
+/// start a new branch instead of failing.
 ///
 /// `catalog` must be the session catalog bridge, so the branch commit
 /// evicts every cached copy of the table and is checked by
@@ -350,6 +402,9 @@ pub async fn target_branch(
     catalog: &dyn Catalog,
     table: &Table,
 ) -> sqe_core::Result<Option<String>> {
+    if let Some(branch) = write_branch() {
+        return existing_write_branch(table, &branch).map(Some);
+    }
     let Some(txn) = current() else {
         return Ok(None);
     };
@@ -387,6 +442,23 @@ pub async fn target_branch(
         branch: branch.clone(),
     });
     Ok(Some(branch))
+}
+
+/// `branch` if `table` holds it. A table without a snapshot holds no
+/// branch, so a session branch cannot be written into an empty table.
+fn existing_write_branch(table: &Table, branch: &str) -> sqe_core::Result<String> {
+    if table.metadata().snapshot_for_ref(branch).is_some() {
+        return Ok(branch.to_string());
+    }
+    let ident = table.identifier();
+    Err(sqe_core::SqeError::with_code(
+        sqe_core::SqeErrorCode::InvalidArguments,
+        format!(
+            "WRITE_BRANCH '{branch}' does not exist on {ident}; create it with \
+             ALTER TABLE {ident} CREATE BRANCH {branch}, or RESET WRITE_BRANCH \
+             to write to main"
+        ),
+    ))
 }
 
 /// COMMIT: move `main` of every table the transaction wrote to its branch
