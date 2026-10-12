@@ -1,6 +1,7 @@
 """SQE adapter implementation."""
 
 import agate
+from dbt.adapters.base.meta import available
 from dbt.adapters.sql import SQLAdapter
 from dbt.adapters.sqe.connections import SQEConnectionManager
 from dbt.adapters.sqe.column import SQEColumn
@@ -24,6 +25,20 @@ class SQEAdapter(SQLAdapter):
 
     def valid_incremental_strategies(self):
         return ["append", "delete+insert", "merge"]
+
+    # A materialization that writes the target in several statements wraps
+    # them in one SQE transaction, so readers never see a half-applied model.
+    # DDL and CTAS stay outside it (they autocommit). See _Handle for how a
+    # failure rolls it back.
+    @available
+    def begin_transaction(self) -> str:
+        self.connections.get_thread_connection().handle.begin_transaction()
+        return ""
+
+    @available
+    def commit_transaction(self) -> str:
+        self.connections.get_thread_connection().handle.commit_transaction()
+        return ""
 
     @classmethod
     def convert_text_type(cls, agate_table, col_idx):
