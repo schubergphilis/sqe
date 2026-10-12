@@ -11,10 +11,11 @@ use iceberg::{Catalog, TableIdent};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-/// The branch a write to `table_ident` must commit to: `None` outside an
-/// explicit transaction, else the transaction branch (#821). The first
-/// write of a transaction creates the branch; see
-/// [`sqe_catalog::txn::target_branch`].
+/// The branch a write to `table_ident` must commit to: the transaction
+/// branch inside an explicit transaction (#821), the session's
+/// `WRITE_BRANCH` outside one (#829), else `None` (`main`). The first write
+/// of a transaction creates the branch; a session branch must already
+/// exist. See [`sqe_catalog::txn::target_branch`].
 ///
 /// Call once per statement, before its commit loop, and set the branch on
 /// every action the loop builds.
@@ -22,7 +23,7 @@ pub async fn txn_target_branch(
     catalog: &dyn Catalog,
     table_ident: &TableIdent,
 ) -> sqe_core::Result<Option<String>> {
-    if sqe_catalog::txn::current().is_none() {
+    if sqe_catalog::txn::current().is_none() && sqe_catalog::txn::write_branch().is_none() {
         return Ok(None);
     }
     let table = catalog.load_table(table_ident).await.map_err(|e| {
