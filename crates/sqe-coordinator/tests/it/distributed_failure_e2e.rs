@@ -45,9 +45,9 @@ const ROWS_PER_FILE: i64 = 40_000;
 
 /// The coordinator side for one test: root session, handler wired to
 /// `worker_urls`, and the tracker and registry the assertions read.
-struct Rig {
-    session: sqe_core::Session,
-    handler: Arc<sqe_coordinator::QueryHandler>,
+pub(crate) struct Rig {
+    pub(crate) session: sqe_core::Session,
+    pub(crate) handler: Arc<sqe_coordinator::QueryHandler>,
     registry: Arc<sqe_coordinator::worker_registry::WorkerRegistry>,
     tracker: Arc<sqe_coordinator::query_tracker::QueryTracker>,
     metrics: Arc<sqe_metrics::MetricsRegistry>,
@@ -59,7 +59,10 @@ struct Rig {
 ///
 /// `distribution_threshold` and `distribution_file_threshold` are zeroed so a
 /// small test table is distributed at all; production keeps small scans local.
-async fn rig(worker_urls: &[String], tune: impl FnOnce(&mut sqe_core::SqeConfig)) -> Rig {
+pub(crate) async fn rig(
+    worker_urls: &[String],
+    tune: impl FnOnce(&mut sqe_core::SqeConfig),
+) -> Rig {
     crate::common::init_tracing();
     let mut config = sqe_core::SqeConfig::load(&crate::common::test_config_path())
         .expect("Failed to load test config");

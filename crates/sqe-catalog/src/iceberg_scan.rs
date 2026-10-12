@@ -800,6 +800,20 @@ impl IcebergScanExec {
     pub fn projection(&self) -> Option<&[String]> {
         self.projection.as_deref()
     }
+    /// The projection fill a distributed worker needs (#831), or `None` when
+    /// no projected column ever changed, so every file carries every column
+    /// as the current schema declares it.
+    pub fn projection_fill(&self) -> DFResult<Option<Vec<u8>>> {
+        let Some(cols) = self.projection.as_deref() else {
+            return Ok(None);
+        };
+        if cols.is_empty() || !projection_evolved(&self.table, cols) {
+            return Ok(None);
+        }
+        let defaults =
+            initial_default_scalars(&self.table, self.snapshot_id, cols, &self.projected_schema)?;
+        encode_projection_fill(&self.projected_schema, &defaults).map(Some)
+    }
     pub fn pushed_down_filters(&self) -> &[Arc<dyn PhysicalExpr>] {
         &self.pushed_down_filters
     }
@@ -2470,6 +2484,78 @@ fn conform_batch_to_projection(
         &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(rows)),
     )
     .map_err(|e| DataFusionError::Internal(format!("failed to conform scan batch: {e}")))
+}
+
+/// Whether some data file may store a projected column differently from the
+/// current schema: absent (added later), under another name (renamed) or as
+/// another type (promoted). Answered from the table's historic schemas, so a
+/// table whose projected columns never changed reports `false`.
+fn projection_evolved(table: &Table, cols: &[String]) -> bool {
+    let metadata = table.metadata();
+    let current = metadata.current_schema();
+    cols.iter().any(|name| {
+        let Some(field) = current.field_by_name(name) else {
+            return false;
+        };
+        metadata
+            .schemas_iter()
+            .any(|schema| match schema.field_by_id(field.id) {
+                None => true,
+                Some(old) => old.name != field.name || old.field_type != field.field_type,
+            })
+    })
+}
+
+/// Encode a projection fill (#831) as an Arrow IPC stream: one row, in
+/// `schema` with every field nullable, holding each column's default from
+/// `defaults` (parallel to `schema`; empty or `None` means NULL).
+///
+/// A distributed worker reads this as the schema it must emit and as the
+/// value of a column its file lacks. See `sqe_planner::ScanTask::projection_fill`.
+pub fn encode_projection_fill(
+    schema: &SchemaRef,
+    defaults: &[Option<ScalarValue>],
+) -> DFResult<Vec<u8>> {
+    let fields: Vec<_> = schema
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone().with_nullable(true))
+        .collect();
+    let fill_schema = Arc::new(arrow::datatypes::Schema::new(fields));
+    let columns = fill_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| match defaults.get(i) {
+            Some(Some(value)) => value.to_array_of_size(1),
+            _ => Ok(arrow::array::new_null_array(f.data_type(), 1)),
+        })
+        .collect::<DFResult<Vec<_>>>()?;
+    let batch = RecordBatch::try_new(Arc::clone(&fill_schema), columns)?;
+    let mut bytes = Vec::new();
+    {
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, &fill_schema)?;
+        writer.write(&batch)?;
+        writer.finish()?;
+    }
+    Ok(bytes)
+}
+
+/// Decode a fill written by [`encode_projection_fill`] back to its one-row
+/// batch.
+pub fn decode_projection_fill(bytes: &[u8]) -> DFResult<RecordBatch> {
+    let mut reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)?;
+    match reader.next() {
+        Some(Ok(batch)) if batch.num_rows() == 1 => Ok(batch),
+        Some(Ok(batch)) => Err(DataFusionError::Internal(format!(
+            "projection fill has {} rows, expected 1",
+            batch.num_rows()
+        ))),
+        Some(Err(e)) => Err(e.into()),
+        None => Err(DataFusionError::Internal(
+            "projection fill holds no batch".to_string(),
+        )),
+    }
 }
 
 /// The value each projected column reads in a data file that predates it: the

@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::scan_morsel::{
     SCAN_TASK_VERSION_CURRENT, SCAN_TASK_VERSION_V1, SCAN_TASK_VERSION_V2, SCAN_TASK_VERSION_V3,
+    SCAN_TASK_VERSION_V4,
 };
 
 /// File format of a Hive external table's data files.
@@ -221,7 +222,8 @@ impl ScanCredentials {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ScanTask {
     /// Ticket encoding version. `1` = whole-file (pre-morsel); `2` = optional
-    /// row-group / byte-range morsel fields; `3` = `hive`. Workers reject
+    /// row-group / byte-range morsel fields; `3` = `hive`; `4` =
+    /// `projection_fill`. Workers reject
     /// unsupported versions. Missing field deserializes as v1 for old
     /// coordinators.
     ///
@@ -341,6 +343,22 @@ pub struct ScanTask {
     /// by a test rather than trusted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hive: Option<HiveScanDescriptor>,
+    /// Projection fill (#831): an Arrow IPC stream holding one row whose
+    /// schema is the scan's declared projected schema (parallel to
+    /// `projected_field_ids`), and whose values are each column's Iceberg
+    /// `initial_default`, or NULL. The worker emits every batch in this
+    /// schema: a column a file lacks is filled from the row instead of being
+    /// dropped, which made the batch narrower than the stream it was sent on.
+    ///
+    /// Set only when a projected column differs in some historic table schema
+    /// (added, renamed or promoted), so other tickets keep their v3 bytes.
+    #[serde(
+        rename = "projection_fill_b64",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "predicate_wire"
+    )]
+    pub projection_fill: Option<Vec<u8>>,
 }
 
 /// Wire codec for [`ScanTask::predicate_proto`]: writes base64, reads either
@@ -470,6 +488,12 @@ impl ScanTaskBuilder {
         self
     }
 
+    /// Projection fill as Arrow IPC bytes (#831); see [`ScanTask::projection_fill`].
+    pub fn with_projection_fill(mut self, fill: Option<Vec<u8>>) -> Self {
+        self.task.projection_fill = fill;
+        self
+    }
+
     /// Per-fragment row LIMIT hint (#233).
     pub fn with_limit(mut self, limit: Option<usize>) -> Self {
         self.task.limit = limit;
@@ -514,6 +538,7 @@ impl std::fmt::Debug for ScanTask {
             .field("has_predicate", &self.predicate_proto.is_some())
             .field("limit", &self.limit)
             .field("hive", &self.hive.as_ref().map(|h| h.format))
+            .field("has_projection_fill", &self.projection_fill.is_some())
             .finish()
     }
 }
@@ -553,6 +578,7 @@ impl ScanTask {
                 predicate_proto: None,
                 limit: None,
                 hive: None,
+                projection_fill: None,
             },
         }
     }
@@ -577,6 +603,9 @@ impl ScanTask {
         }
         if self.hive.is_some() {
             required = required.max(SCAN_TASK_VERSION_V3);
+        }
+        if self.projection_fill.is_some() {
+            required = required.max(SCAN_TASK_VERSION_V4);
         }
         required
     }
@@ -621,6 +650,9 @@ impl ScanTask {
         }
         if required >= SCAN_TASK_VERSION_V3 && self.hive.is_some() {
             fields.push("hive");
+        }
+        if required >= SCAN_TASK_VERSION_V4 && self.projection_fill.is_some() {
+            fields.push("projection_fill");
         }
         fields
     }
@@ -714,7 +746,8 @@ impl ScanTask {
     /// Reject tickets whose version this worker does not understand.
     pub fn validate_version(&self) -> Result<(), String> {
         match self.version {
-            SCAN_TASK_VERSION_V1 | SCAN_TASK_VERSION_V2 | SCAN_TASK_VERSION_V3 => Ok(()),
+            SCAN_TASK_VERSION_V1 | SCAN_TASK_VERSION_V2 | SCAN_TASK_VERSION_V3
+            | SCAN_TASK_VERSION_V4 => Ok(()),
             other => Err(format!(
                 "unsupported ScanTask version {other}; this worker supports \
                  {SCAN_TASK_VERSION_V1}..={SCAN_TASK_VERSION_CURRENT}"
@@ -764,6 +797,7 @@ mod tests {
             predicate_proto: predicate,
             limit: None,
             hive: None,
+            projection_fill: None,
         }
     }
 
@@ -822,21 +856,39 @@ mod tests {
     }
 
     #[test]
-    fn version_three_is_accepted_and_four_is_not() {
+    fn version_four_is_accepted_and_five_is_not() {
         let mut task = task_with_predicate(None);
         for v in [
             SCAN_TASK_VERSION_V1,
             SCAN_TASK_VERSION_V2,
             SCAN_TASK_VERSION_V3,
+            SCAN_TASK_VERSION_V4,
         ] {
             task.version = v;
             assert!(task.validate_version().is_ok(), "v{v} must be accepted");
         }
-        task.version = 4;
+        task.version = 5;
         assert!(
             task.validate_version().is_err(),
             "an unknown version must be refused, not read as the newest known one"
         );
+    }
+
+    #[test]
+    fn a_projection_fill_makes_the_task_v4_and_round_trips() {
+        let task = built(
+            ScanTask::builder("f", vec!["s3://b/f.parquet".to_string()], storage())
+                .with_projection(vec!["id".into()], vec![1])
+                .with_projection_fill(Some(vec![1, 2, 3])),
+        );
+        assert_eq!(task.version, SCAN_TASK_VERSION_V4);
+        let bytes = task.to_bytes().unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(text.contains("\"projection_fill_b64\":\"AQID\""), "{text}");
+        let back = ScanTask::decode_for_worker(&bytes, SCAN_TASK_VERSION_CURRENT).unwrap();
+        assert_eq!(back.projection_fill, Some(vec![1, 2, 3]));
+        // A v3 worker refuses it by version, before any field is read.
+        assert!(ScanTask::decode_for_worker(&bytes, SCAN_TASK_VERSION_V3).is_err());
     }
 
     fn storage() -> ScanStorage {
@@ -1162,6 +1214,7 @@ mod tests {
             predicate_proto: None,
             limit: None,
             hive: None,
+            projection_fill: None,
         };
 
         let bytes = task.to_bytes().unwrap();
@@ -1199,6 +1252,7 @@ mod tests {
             predicate_proto: None,
             limit: None,
             hive: None,
+            projection_fill: None,
         };
 
         let bytes = task.to_bytes().unwrap();
@@ -1260,6 +1314,7 @@ mod tests {
             predicate_proto: None,
             limit: None,
             hive: None,
+            projection_fill: None,
         };
         let debug_output = format!("{task:?}");
         // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS's documented example key, asserting it is redacted
@@ -1297,6 +1352,7 @@ mod tests {
             predicate_proto: Some(predicate_bytes.clone()),
             limit: Some(42),
             hive: None,
+            projection_fill: None,
         };
 
         let bytes = task.to_bytes().unwrap();
