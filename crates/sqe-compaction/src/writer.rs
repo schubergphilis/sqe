@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use arrow::compute::cast;
+use arrow::compute::{cast, cast_with_options, CastOptions};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::execution::memory_pool::MemoryPool;
@@ -339,7 +339,9 @@ pub async fn write_data_files_streaming(
     // Stamping is positional: put the lineage columns last, in schema order.
     let stamp = |batch: RecordBatch| -> sqe_core::Result<RecordBatch> {
         let batch = if lineage { lineage_columns_last(batch)? } else { batch };
-        apply_stamped_schema(batch, &stamped_schema)
+        let batch = apply_stamped_schema(batch, &stamped_schema)?;
+        check_required_columns(&batch, &write_schema)?;
+        Ok(batch)
     };
 
     let mut total_rows = 0usize;
@@ -723,7 +725,10 @@ pub fn apply_stamped_schema(
             if col.data_type() == target {
                 Ok(col.clone())
             } else {
-                cast(col, target).map_err(|e| {
+                // Checked, not safe (#834): a safe cast turns 'abc' -> Int64
+                // into NULL, so the INSERT succeeded and stored a value the
+                // user never wrote.
+                cast_with_options(col, target, &CastOptions { safe: false, ..Default::default() }).map_err(|e| {
                     SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                         "Failed to cast column '{}' from {:?} to {:?}: {e}",
                         stamped_schema.field(i).name(),
@@ -750,8 +755,32 @@ pub fn stamp_batches(
     let stamped_schema = build_stamped_schema(iceberg_schema)?;
     batches
         .into_iter()
-        .map(|batch| apply_stamped_schema(batch, &stamped_schema))
+        .map(|batch| {
+            let batch = apply_stamped_schema(batch, &stamped_schema)?;
+            check_required_columns(&batch, iceberg_schema)?;
+            Ok(batch)
+        })
         .collect()
+}
+
+/// Refuse a NULL in a required top-level column (#834). The stamped schema
+/// is all-nullable, and the parquet writer stores the zeroed value slot of a
+/// NULL in a required column, so `INSERT ... VALUES (NULL)` into a NOT NULL
+/// column used to succeed and read back as 0. `null_count` is cached on the
+/// array, so the check costs nothing per row.
+pub fn check_required_columns(
+    batch: &RecordBatch,
+    iceberg_schema: &IcebergSchema,
+) -> sqe_core::Result<()> {
+    for (field, col) in iceberg_schema.as_struct().fields().iter().zip(batch.columns()) {
+        if field.required && col.null_count() > 0 {
+            return Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("NULL value not allowed for NOT NULL column: {}", field.name),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Resolved fanout limits for a partitioned streaming write. Both `0` means
@@ -1146,6 +1175,83 @@ mod tests {
         let out = apply_stamped_schema(arity_batch(2), &arity_schema(2)).expect("matching arity");
         assert_eq!(out.num_columns(), 2);
         assert_eq!(out.num_rows(), 1);
+    }
+
+    /// #834: a value the target type cannot hold fails the write. A safe cast
+    /// turned 'abc' into NULL, which a required column then stored as 0.
+    #[test]
+    fn apply_stamped_schema_rejects_unparseable_value() {
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![arrow_schema::Field::new(
+                "n",
+                arrow_schema::DataType::Utf8,
+                false,
+            )])),
+            vec![Arc::new(arrow_array::StringArray::from(vec!["7", "abc"]))],
+        )
+        .unwrap();
+        for nullable in [false, true] {
+            let target = Arc::new(ArrowSchema::new(vec![arrow_schema::Field::new(
+                "n",
+                arrow_schema::DataType::Int64,
+                nullable,
+            )]));
+            let err = apply_stamped_schema(batch.clone(), &target)
+                .expect_err("'abc' is not an Int64");
+            assert!(format!("{err}").contains("Failed to cast column 'n'"), "err: {err}");
+        }
+    }
+
+    /// The checked cast still converts what fits, and a NULL stays NULL.
+    #[test]
+    fn apply_stamped_schema_casts_valid_values() {
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![arrow_schema::Field::new(
+                "n",
+                arrow_schema::DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(arrow_array::StringArray::from(vec![Some("7"), None]))],
+        )
+        .unwrap();
+        let target = Arc::new(ArrowSchema::new(vec![arrow_schema::Field::new(
+            "n",
+            arrow_schema::DataType::Int64,
+            true,
+        )]));
+        use arrow_array::Array;
+        let out = apply_stamped_schema(batch, &target).expect("castable");
+        let col = out.column(0).as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+        assert_eq!(col.value(0), 7);
+        assert!(col.is_null(1));
+    }
+
+    /// #834: a NULL in a required column is refused instead of stored as 0;
+    /// the same NULL in an optional column passes.
+    #[test]
+    fn stamp_batches_refuses_null_in_required_column() {
+        let ice = |required: bool| {
+            let f = if required { NestedField::required } else { NestedField::optional };
+            IceSchema::builder()
+                .with_fields(vec![f(1, "n", IceType::Primitive(PrimitiveType::Long)).into()])
+                .build()
+                .unwrap()
+        };
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![arrow_schema::Field::new(
+                "n",
+                arrow_schema::DataType::Int64,
+                true,
+            )])),
+            vec![Arc::new(arrow_array::Int64Array::from(vec![Some(1), None]))],
+        )
+        .unwrap();
+        let err = stamp_batches(vec![batch.clone()], &ice(true)).expect_err("NULL in NOT NULL");
+        assert!(
+            format!("{err}").contains("NULL value not allowed for NOT NULL column: n"),
+            "err: {err}"
+        );
+        assert_eq!(stamp_batches(vec![batch], &ice(false)).unwrap()[0].num_rows(), 2);
     }
 
     /// `parse_parquet_compression` maps "lz4" to the modern `LZ4_RAW` frame,
