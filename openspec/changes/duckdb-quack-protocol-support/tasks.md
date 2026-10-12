@@ -3,34 +3,34 @@
 - [x] 1.1 Read `duckdb/duckdb-quack` source (MIT, v1.5-variegata) and document the wire protocol in `docs/quack-protocol.md`: endpoint, content type, message schema, version constants, auth flow
 - [x] 1.2 Confirm encoding: DuckDB `BinarySerializer` with `SerializationCompatibility::FromIndex(7)`, NOT bincode/msgpack. Result chunks use DuckDB native `DataChunk` (not Arrow IPC)
 - [x] 1.3 Decide serialisation strategy. ORIGINAL plan was to link `duckdb-rs` and reuse DuckDB's serialiser. REVISED (Phase 1.4 finding): `duckdb-rs` does not expose `BinarySerializer` and libduckdb's stable C API exposes only Arrow conversion. Pure-Rust port of `BinarySerializer` chosen. Rationale captured in design.md
-- [ ] 1.4 Create `crates/sqe-quack-wire/` with `Cargo.toml`, `lib.rs`, modules `varint`, `codec`, `message`, `data_chunk` (last one stubbed for now)
-- [ ] 1.5 Implement `VarIntEncode/Decode` (`varint.rs`) with round-trip tests against known DuckDB-emitted byte sequences
-- [ ] 1.6 Implement `BinarySerializer` + `BinaryDeserializer` (`codec.rs`) for primitives: bool, u8-u64, i8-i64, hugeint, f32/f64, string. Plus `Begin/End` block nesting and `MESSAGE_TERMINATOR_FIELD_ID` (0xFFFF). Round-trip tests per primitive
-- [ ] 1.7 Implement non-DataChunk message types (`message.rs`): `MessageHeader`, `ConnectionRequest/Response`, `PrepareRequest`, `FetchRequest`, `SuccessResponse`, `DisconnectMessage`, `ErrorResponse`. Round-trip test per variant
-- [ ] 1.8 Capture real wire fixtures: run `duckdb` CLI + `quack_serve()` locally, dump request bodies, save as `tests/fixtures/*.bin`. Assert our codec decodes them and re-encodes byte-identical output
-- [ ] 1.9 Pin supported DuckDB extension version in `docs/quack-protocol.md` and `sqe-quack-wire/README.md`: `v1.5-variegata`, `quack_version = 1`
-- [ ] 1.10 (deferred to Phase 1.6 sub-phase) Implement `DataChunk` codec covering `LogicalType` recursion, `Vector` data buffers, validity bitmaps. Add `arrow_to_data_chunk` and `data_chunk_to_arrow` converters
-- [ ] 1.11 (deferred to Phase 1.6 sub-phase) Implement `PrepareResponse`, `FetchResponse`, `AppendRequest` message types (they carry `DataChunk`)
+- [x] 1.4 Create `crates/sqe-quack-wire/` with `Cargo.toml`, `lib.rs`, modules `varint`, `codec`, `message`, `data_chunk` (last one stubbed for now) -- done differently: `data_chunk.rs` is fully implemented, plus an `arrow_bridge.rs` module and a cargo-fuzz workspace in `fuzz/`
+- [x] 1.5 Implement `VarIntEncode/Decode` (`varint.rs`) with round-trip tests against known DuckDB-emitted byte sequences
+- [x] 1.6 Implement `BinarySerializer` + `BinaryDeserializer` (`codec.rs`) for primitives: bool, u8-u64, i8-i64, hugeint, f32/f64, string. Plus `Begin/End` block nesting and `MESSAGE_TERMINATOR_FIELD_ID` (0xFFFF). Round-trip tests per primitive -- done differently: the codec carries only the primitives the message set uses (bool, u8/u16/u32/u64, i64, hugeint, f64, string, data_ptr); f32 and the narrow signed ints travel as raw `Vector` bytes in `data_chunk.rs`
+- [x] 1.7 Implement non-DataChunk message types (`message.rs`): `MessageHeader`, `ConnectionRequest/Response`, `PrepareRequest`, `FetchRequest`, `SuccessResponse`, `DisconnectMessage`, `ErrorResponse`. Round-trip test per variant
+- [ ] 1.8 Capture real wire fixtures: run `duckdb` CLI + `quack_serve()` locally, dump request bodies, save as `tests/fixtures/*.bin`. Assert our codec decodes them and re-encodes byte-identical output -- partial: `examples/capture_upstream.rs` captured `tests/fixtures/*.bin` from a live `quack_serve`, and `tests/it/upstream_fixtures.rs` decodes the two upstream responses; no byte-identical re-encode assertion
+- [x] 1.9 Pin supported DuckDB extension version in `docs/quack-protocol.md` and `sqe-quack-wire/README.md`: `v1.5-variegata`, `quack_version = 1` -- done differently: the protocol reference lives in `docs/site/book/src/design-notes/quack-protocol.md` (and `quickstart/quack-protocol.md`), not `docs/quack-protocol.md`
+- [x] 1.10 (deferred to Phase 1.6 sub-phase) Implement `DataChunk` codec covering `LogicalType` recursion, `Vector` data buffers, validity bitmaps. Add `arrow_to_data_chunk` and `data_chunk_to_arrow` converters -- done differently: FLAT vectors only; converters are `record_batch_to_data_chunk` / `data_chunk_to_record_batch` in `arrow_bridge.rs`, with hostile-input property tests in `tests/it/hostile_input.rs`
+- [ ] 1.11 (deferred to Phase 1.6 sub-phase) Implement `PrepareResponse`, `FetchResponse`, `AppendRequest` message types (they carry `DataChunk`) -- partial: `PrepareResponse` and `FetchResponse` are in `message.rs`; `AppendRequest` decode returns `UnknownMessageType(9)`
 
 ## 2. sqe-quack-server crate (Option A)
 
-- [ ] 2.1 Create `crates/sqe-quack-server/` with `Cargo.toml` (depends on `axum`, `tower`, `moka`, `sqe-quack-wire`, `sqe-coordinator`, `sqe-auth`, `sqe-sql`)
-- [ ] 2.2 `QuackServer::serve()`: `axum::Router` with `GET /` (identification) and `POST /quack` (RPC); graceful shutdown via `tokio_util::sync::CancellationToken`
-- [ ] 2.3 `handle_connection_request`: extract `auth_string`, call `sqe-auth::validate_bearer`, create `SqeQuackSession`, store in moka cache keyed by `connection_id`; on failure return `ErrorResponse("SQE-AUTH: ...")`
-- [ ] 2.4 `handle_prepare_request`: lookup session by `connection_id`, parse SQL (DuckDB dialect via `sqe-sql`), translate, policy-rewrite, plan, execute; if result fits return `PrepareResponse { needs_more_fetch: false, results }`, else cache stream and return `result_uuid` with `needs_more_fetch: true`
-- [ ] 2.5 `handle_fetch_request`: lookup pending result by `uuid`, send next batch of `DataChunk`s; clear cache entry when stream ends
+- [x] 2.1 Create `crates/sqe-quack-server/` with `Cargo.toml` (depends on `axum`, `tower`, `moka`, `sqe-quack-wire`, `sqe-coordinator`, `sqe-auth`, `sqe-sql`) -- done differently: no `sqe-coordinator` / `sqe-sql` dependency; the crate defines a `QueryExecutor` trait (`query_executor.rs`) that `sqe-coordinator/src/quack_executor.rs` (`CoordinatorExecutor`) implements
+- [ ] 2.2 `QuackServer::serve()`: `axum::Router` with `GET /` (identification) and `POST /quack` (RPC); graceful shutdown via `tokio_util::sync::CancellationToken` -- partial: `app.rs::router()` serves `GET /` and `POST /quack`; `sqe-server` spawns it with no shutdown token
+- [x] 2.3 `handle_connection_request`: extract `auth_string`, call `sqe-auth::validate_bearer`, create `SqeQuackSession`, store in moka cache keyed by `connection_id`; on failure return `ErrorResponse("SQE-AUTH: ...")` -- done differently: authenticates through the shared `AuthProvider` chain (rate limited, #562) and stores a `Session` bound to the client key in `session.rs::SessionStore` (moka)
+- [x] 2.4 `handle_prepare_request`: lookup session by `connection_id`, parse SQL (DuckDB dialect via `sqe-sql`), translate, policy-rewrite, plan, execute; if result fits return `PrepareResponse { needs_more_fetch: false, results }`, else cache stream and return `result_uuid` with `needs_more_fetch: true` -- done differently: SQL goes through `CoordinatorExecutor` -> `QueryHandler` (same parse, policy and plan path as Flight SQL, DuckDB execution dialect); no DuckDB-specific translation step; the remaining stream is parked in `pending.rs` under a random uuid
+- [x] 2.5 `handle_fetch_request`: lookup pending result by `uuid`, send next batch of `DataChunk`s; clear cache entry when stream ends
 - [ ] 2.6 `handle_append_request`: lookup session, route the chunk through the write path (re-uses Phase 2c machinery) with the user's session context
-- [ ] 2.7 `handle_disconnect_message`: invalidate moka entry, return `SuccessResponse`
+- [x] 2.7 `handle_disconnect_message`: invalidate moka entry, return `SuccessResponse`
 - [ ] 2.8 Cancellation: per-`connection_id` cancellation token threaded into `sqe-coordinator` execution
-- [ ] 2.9 Wire `QuackServer` into the existing `sqe-coordinator` binary behind cargo feature `quack-server`; expose `[quack_server]` TOML config with `bind_addr` (default `127.0.0.1:9494`), `idle_timeout`, `max_inflight_fetches`, `fetch_batch_bytes` (default 4 MiB matching DuckDB's `quack_fetch_batch_bytes`)
+- [x] 2.9 Wire `QuackServer` into the existing `sqe-coordinator` binary behind cargo feature `quack-server`; expose `[quack_server]` TOML config with `bind_addr` (default `127.0.0.1:9494`), `idle_timeout`, `max_inflight_fetches`, `fetch_batch_bytes` (default 4 MiB matching DuckDB's `quack_fetch_batch_bytes`) -- done differently: always compiled into `sqe-server` (no cargo feature), enabled by `[coordinator] quack_port` (0 = off, binds 0.0.0.0, TLS from `[coordinator.tls]`); session idle/lifetime and result byte limits are code defaults on `QuackServerState`, not TOML keys
 - [ ] 2.10 Catalog identification: implement `quack_identify` table function equivalent so DuckDB clients can discover server capabilities
-- [ ] 2.11 Unit tests: handshake, auth success/failure, simple `SELECT 1`, `SHOW TABLES`, error propagation, fetch loop for results that exceed batch size
-- [ ] 2.12 Integration test: real DuckDB CLI connects via `ATTACH 'quack:localhost:9494'`, runs `SHOW TABLES`, runs `FROM ns.t LIMIT 10`, asserts results
+- [x] 2.11 Unit tests: handshake, auth success/failure, simple `SELECT 1`, `SHOW TABLES`, error propagation, fetch loop for results that exceed batch size -- done differently: `crates/sqe-quack-server/tests/it/` (connection, prepare, fetch, disconnect, session_limits) against a stub executor; no `SHOW TABLES` case
+- [ ] 2.12 Integration test: real DuckDB CLI connects via `ATTACH 'quack:localhost:9494'`, runs `SHOW TABLES`, runs `FROM ns.t LIMIT 10`, asserts results -- partial: `quickstart/quack/run.sh` runs a DuckDB CLI `quack_query()` round-trip when `duckdb` is on PATH; no ATTACH and no test in the integration suite
 
 ## 3. DuckDB Dialect Support in sqe-sql
 
 - [ ] 3.1 Add `duckdb-dialect` feature flag to `sqe-sql/Cargo.toml`
-- [ ] 3.2 Wire `sqlparser::dialect::DuckDbDialect` selection into `sqe-sql/src/parser.rs`; dialect chosen per session via `SqeSession::dialect()`
+- [x] 3.2 Wire `sqlparser::dialect::DuckDbDialect` selection into `sqe-sql/src/parser.rs`; dialect chosen per session via `SqeSession::dialect()` -- done differently: no per-session choice; every session plans under DuckDB via `sqe_sql::EXECUTION_DIALECT` (`crates/sqe-sql/src/front_door.rs`), set in `crates/sqe-catalog/src/session_tuning.rs`
 - [ ] 3.3 Implement `crates/sqe-sql/src/dialect/duckdb_translate.rs`: AST walker that converts DuckDB-flavoured nodes to DataFusion-compatible nodes
   - [ ] 3.3.1 `LIST_VALUE([...])` -> array literal
   - [ ] 3.3.2 `STRUCT_PACK(k := v, ...)` -> struct literal
@@ -44,12 +44,12 @@
 
 ## 4. sqe-quack-client crate (Option B, client side)
 
-- [ ] 4.1 Create `crates/sqe-quack-client/` with `Cargo.toml` (depends on `reqwest` with `rustls-tls` feature, `sqe-quack-wire`)
-- [ ] 4.2 `QuackClient::connect(uri, token)`: parse `quack:host[:port]`, derive `http(s)://host:port/quack`, POST `ConnectionRequest`, parse `ConnectionResponse`, store `connection_id`
-- [ ] 4.3 `QuackClient::execute(sql)`: POST `PrepareRequest`, drive `FetchRequest` loop until `needs_more_fetch = false`, yield `RecordBatch` via the `data_chunk_to_arrow` helper from `sqe-quack-wire`
-- [ ] 4.4 Disconnect cleanup: POST `DisconnectMessage` on drop; ignore errors
+- [x] 4.1 Create `crates/sqe-quack-client/` with `Cargo.toml` (depends on `reqwest` with `rustls-tls` feature, `sqe-quack-wire`) -- done differently: blocking `reqwest` on the workspace `rustls-no-provider` build, installing the ring provider itself (`client.rs`); the crate also carries the `quack_query` TVF (`tvf.rs`, `tableprovider.rs`, `policy.rs`)
+- [x] 4.2 `QuackClient::connect(uri, token)`: parse `quack:host[:port]`, derive `http(s)://host:port/quack`, POST `ConnectionRequest`, parse `ConnectionResponse`, store `connection_id`
+- [x] 4.3 `QuackClient::execute(sql)`: POST `PrepareRequest`, drive `FetchRequest` loop until `needs_more_fetch = false`, yield `RecordBatch` via the `data_chunk_to_arrow` helper from `sqe-quack-wire` -- done differently: returns an `ExecuteResult` (names, schema, all batches) built with `data_chunk_to_record_batch`
+- [x] 4.4 Disconnect cleanup: POST `DisconnectMessage` on drop; ignore errors
 - [ ] 4.5 Unit tests with a mock Quack server (the `sqe-quack-server` from task 2 used as a fixture)
-- [ ] 4.6 Integration test: client connects to a real DuckDB instance running `quack_serve('quack:localhost')`, executes a query, reads batches, asserts row equality
+- [ ] 4.6 Integration test: client connects to a real DuckDB instance running `quack_serve('quack:localhost')`, executes a query, reads batches, asserts row equality -- partial: `crates/sqe-quack-client/tests/loopback.rs` drives a live `sqe-server` (env-gated), not a DuckDB `quack_serve`
 
 ## 5. sqe-worker-duckdb crate (Option B, worker)
 
@@ -90,10 +90,10 @@
 
 ## 8. Documentation
 
-- [ ] 8.1 `docs/quack-server.md`: how to enable, how to connect from DuckDB CLI, supported features, authentication
+- [x] 8.1 `docs/quack-server.md`: how to enable, how to connect from DuckDB CLI, supported features, authentication -- done differently: book pages `docs/site/book/src/quickstart/quack.md`, `quickstart/quack-datatype-matrix.md` and `deployment/configuration.md` (`quack_port`, `[quack_client]`), plus `quickstart/quack/`
 - [ ] 8.2 `docs/duckdb-worker.md`: how to deploy a DuckDB worker, configuration, when to use over DataFusion, known limitations
 - [ ] 8.3 `docs/duckdb-dialect-status.md`: full feature matrix (supported / partial / not supported)
-- [ ] 8.4 Update `README.md` roadmap with Quack support entries
+- [x] 8.4 Update `README.md` roadmap with Quack support entries -- done differently: the roadmap lives in `docs/site/book/src/development/roadmap.md` (Quack RPC entry under "Embedded Mode (Done)"); `README.md` lists the three quack crates in its crate table
 - [ ] 8.5 Update `nextsteps.md` with phase markers
 
 ## 9. Benchmarks
@@ -105,8 +105,8 @@
 
 ## 10. End-to-End Integration
 
-- [ ] 10.1 Integration test: DuckDB CLI -> Quack server -> coordinator -> DataFusion worker, runs a multi-table join with row filter and masked column, assert result and audit log
+- [ ] 10.1 Integration test: DuckDB CLI -> Quack server -> coordinator -> DataFusion worker, runs a multi-table join with row filter and masked column, assert result and audit log -- partial: `crates/sqe-coordinator/tests/it/quack_e2e.rs` covers `SELECT 1` over the real `QueryHandler` with a reqwest client; no join, policy or audit assertions
 - [ ] 10.2 Integration test: DuckDB CLI -> Quack server -> coordinator -> DuckDB worker (session sets `worker_kind = 'duckdb'`), same query, assert identical result
-- [ ] 10.3 Integration test: bad token returns `AUTH_FAILED` and connection closes
+- [ ] 10.3 Integration test: bad token returns `AUTH_FAILED` and connection closes -- partial: covered at unit level only (`crates/sqe-quack-server/tests/it/connection.rs`, `SQE-AUTH:` error response)
 - [ ] 10.4 Integration test: unsupported dialect feature returns `UNSUPPORTED_DIALECT` with hint
 - [ ] 10.5 Live test against `dbt-duckdb` adapter pointed at a SQE Quack endpoint; run a minimal dbt project (1 source + 1 model + 1 test)
