@@ -185,7 +185,9 @@ impl PreparableTableFunction for ReadParquetFunction {
             let args = self.checked_args(exprs)?;
             let provider = build_listing_table(&args, &self.storage, self.runtime_env.as_deref())
                 .await
-                .map_err(|e| datafusion::error::DataFusionError::Plan(format!("read_parquet: {e}")))?;
+                .map_err(|e| {
+                    datafusion::error::DataFusionError::Plan(format!("read_parquet: {e}"))
+                })?;
             self.prepared.insert(exprs, provider);
             Ok(())
         })
@@ -340,6 +342,12 @@ fn build_s3_store(
     args: &ReadParquetArgs,
     storage: &StorageConfig,
 ) -> DFResult<object_store::aws::AmazonS3> {
+    s3_builder(args, storage)?
+        .build()
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
+}
+
+fn s3_builder(args: &ReadParquetArgs, storage: &StorageConfig) -> DFResult<AmazonS3Builder> {
     let access_key = args
         .access_key
         .as_deref()
@@ -412,13 +420,13 @@ fn build_s3_store(
     if storage.s3_path_style {
         builder = builder.with_virtual_hosted_style_request(false);
     }
-    if storage.s3_allow_http {
+    // An `http://` endpoint needs plain HTTP, as in `file_tvf_common`: without
+    // it the first request fails with a bare "builder error". An inline
+    // endpoint has already passed `check_endpoint` above.
+    if storage.s3_allow_http || endpoint.starts_with("http://") {
         builder = builder.with_allow_http(true);
     }
-
-    builder
-        .build()
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
+    Ok(builder)
 }
 
 /// Extract the bucket name from an `s3://bucket/...` or `s3a://bucket/...` URL.
@@ -710,6 +718,33 @@ mod tests {
             result.is_ok(),
             "build_s3_store fallback failed: {:?}",
             result.err()
+        );
+    }
+
+    /// An `http://` endpoint enables plain HTTP without `s3_allow_http`;
+    /// otherwise the first S3 request fails with "builder error". An
+    /// `https://` endpoint leaves it off.
+    #[test]
+    fn test_s3_builder_allows_http_for_an_http_endpoint() {
+        use object_store::aws::AmazonS3ConfigKey;
+        use object_store::ClientConfigKey;
+        let allow_http = |endpoint: &str| {
+            let args = ReadParquetArgs {
+                path: "s3://my-bucket/data/*.parquet".to_string(),
+                ..ReadParquetArgs::default()
+            };
+            let storage = StorageConfig {
+                s3_endpoint: endpoint.to_string(),
+                ..StorageConfig::default()
+            };
+            s3_builder(&args, &storage)
+                .unwrap()
+                .get_config_value(&AmazonS3ConfigKey::Client(ClientConfigKey::AllowHttp))
+        };
+        assert_eq!(allow_http("http://minio:9000").as_deref(), Some("true"));
+        assert_ne!(
+            allow_http("https://s3.example.com").as_deref(),
+            Some("true")
         );
     }
 
