@@ -30,6 +30,13 @@ All notable changes to SQE are documented in this file.
     `sqe_audit_export_spool_dropped_records_total`. The local audit log keeps
     every record; queries are never blocked.
 
+### Fixed
+
+- `read_parquet` on an `http://` S3 endpoint failed with "builder error" unless `s3_allow_http = true`
+
+    Its S3 builder did not derive plain HTTP from the endpoint scheme, unlike
+    `read_csv`, `read_json` and table scans. It does now.
+
 ## [0.50.1] — 2026-10-10
 
 ## [0.50.0] — 2026-10-09
