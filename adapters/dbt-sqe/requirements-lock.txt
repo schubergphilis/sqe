@@ -641,7 +641,7 @@ protobuf==6.33.6 \
     #   dbt-common
     #   dbt-core
     #   dbt-protos
-pyarrow==25.0.1 \
+pyarrow==26.0.0 \
     --hash=sha256:0b1edbb2f385a6a65e9711b62ba86ac54a7816a3f8d17bb3e8a5929d65fb2485 \
     --hash=sha256:0b726ad7e7b669be982b0c71c07fe4b037d654354130da79a7902a669e93a66b \
     --hash=sha256:0befcf816e45a1af33ac775a9970b749e4868a230c7372f0ae5e932bee27039f \
