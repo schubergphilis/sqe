@@ -95,7 +95,7 @@ BENCH_ENV       = PROFILE=$(BENCH_PROFILE) BENCH_LOG_DIR=$(BENCH_LOG_DIR)
         ebook-pdf ebook-epub ebook-html \
         benchmark-charts test test-access-control test-access-control-spark \
         test-integration test-distributed test-integration-down \
-        audit audit-advisories deps-check lock-maintenance metrics-layering-check \
+        audit audit-advisories deps-check lock-maintenance dbt-sqe-lock metrics-layering-check \
         audit-deny audit-licenses \
         benchmark_all benchmark_all_trino \
         clippy fmt fmt-check pre-commit clean clean-rust clean-rustbook \
@@ -325,6 +325,19 @@ lock-maintenance:  ## Refresh Cargo.lock within semver bounds and regenerate the
 	$(CARGO) hakari generate --diff
 	$(CARGO) metadata --locked --format-version 1 >/dev/null
 	@echo "==> Cargo.lock refreshed, workspace-hack in sync"
+
+# Renovate is off for this lock too (renovate.json): pip_requirements edited
+# pins in place with stale hashes, and pip-compile cannot read a setup.cfg
+# source. The output is deleted first because uv copies hashes from an
+# existing output for any version it keeps. --exclude-newer is the 7-day
+# release-age floor every Renovate rule carries.
+DBT_SQE_LOCK_CUTOFF := $(shell date -v-7d +%Y-%m-%d 2>/dev/null || date -d '7 days ago' +%Y-%m-%d)
+dbt-sqe-lock:  ## Regenerate adapters/dbt-sqe/requirements-lock.txt (hashed, 7-day release-age floor)
+	cd adapters/dbt-sqe && rm -f requirements-lock.txt && \
+		uv pip compile --no-config --python-version=3.11 --generate-hashes \
+			--exclude-newer $(DBT_SQE_LOCK_CUTOFF) \
+			--custom-compile-command "make dbt-sqe-lock" \
+			--output-file=requirements-lock.txt setup.cfg
 
 metrics-layering-check:  ## Only runtime crates may link the full sqe-metrics crate
 	@bad=$$(grep -l 'path = "../sqe-metrics" }' crates/*/Cargo.toml | grep -vE 'sqe-(coordinator|server|worker|lineage)/'); \

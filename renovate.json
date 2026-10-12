@@ -26,6 +26,21 @@
   },
   "packageRules": [
     {
+      "description": [
+        "Off for adapters/dbt-sqe/requirements-lock.txt, a hashed uv pip compile output. Regenerate it by hand with `make dbt-sqe-lock`.",
+        "pip_requirements edited its pins in place: it kept the previous version's hashes and ignored dbt-common's agate<1.10, so the lock stopped installing (commits 1a290d29, 3e38da17).",
+        "The pip-compile manager, which would re-hash, cannot read a setup.cfg source (Renovate 43: 'support for manager is not yet implemented'). setup-cfg still bumps the ranges in setup.cfg."
+      ],
+      "matchManagers": ["pip_requirements"],
+      "matchFileNames": ["**/requirements-lock.txt"],
+      "enabled": false
+    },
+    {
+      "description": "dbt-sqe Python dependencies, same release-age floor as every other rule.",
+      "matchManagers": ["setup-cfg"],
+      "minimumReleaseAge": "7 days"
+    },
+    {
       "description": "Fold routine Rust minor/patch bumps into one PR; majors stay separate for individual review.",
       "matchManagers": ["cargo"],
       "matchUpdateTypes": ["minor", "patch"],
