@@ -12,7 +12,7 @@ The newest file's `**NEXT:**` line is the current pointer. To read the log:
 ls -r docs/internal/status/2*.md | head -5 | xargs cat
 ```
 
-Entries before 2026-10-12 stay where they were, frozen in `nextsteps.md`.
+The entries from 2026-08-22 to 2026-10-11 were split out of `nextsteps.md` on 2026-10-12. Their file names carry the old same-day ordering code (`2026-10-11-dc-...`), and their text is unchanged apart from the blockquote markers. The old Step 1–6 roadmap is in `legacy-roadmap-steps.md`.
 
 ## Template
 

@@ -3,8 +3,8 @@
 Every merge request used to prepend a `STATUS` paragraph to line 3 of
 `nextsteps.md` (126 commits in the month before), so any two open branches
 conflicted there. Each change now adds its own file under
-`docs/internal/status/`; `nextsteps.md` keeps its history frozen below a
-pointer. Same day: openspec reconciled with the code (!1390; two superseded
+`docs/internal/status/`. The 149 earlier entries were split into one file
+each, and `nextsteps.md` is now only a pointer. Same day: openspec reconciled with the code (!1390; two superseded
 changes archived), and the combined priority list is #827. New P2 bugs from
 that pass: #829 (`SET WRITE_BRANCH` is ignored outside a transaction) and #828
 (column `DEFAULT` never applied).
