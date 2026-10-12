@@ -51,7 +51,7 @@ A column `DEFAULT` takes a literal and makes the table format-version 3. An `INS
 
 | Statement | Origin | Notes | Trino | Snowflake | Spark SQL | DuckDB |
 |---|---|---|---|---|---|---|
-| `ALTER TABLE t ADD COLUMN c TYPE [DEFAULT expr]` | `sqlparser-rs` + `sqe-coordinator` | New column. A later INSERT or MERGE INSERT that omits it writes the default (V3). Rows written before the ALTER read NULL for now, not the default (#830). | yes | yes | yes | yes |
+| `ALTER TABLE t ADD COLUMN c TYPE [DEFAULT expr]` | `sqlparser-rs` + `sqe-coordinator` | New column. Rows written before the ALTER read the default, and a later INSERT or MERGE INSERT that omits the column writes it (V3). | yes | yes | yes | yes |
 | `ALTER TABLE t DROP COLUMN [IF EXISTS] c` | `sqlparser-rs` + `sqe-coordinator` | Logical drop. Field id retained in old data files. | yes | yes | yes | yes |
 | `ALTER TABLE t RENAME COLUMN old TO new` | `sqlparser-rs` + `sqe-coordinator` | Iceberg field id stays the same; only the name changes. | yes | yes | yes | yes |
 | `ALTER TABLE t ALTER COLUMN c SET NOT NULL` | `sqlparser-rs` + `sqe-coordinator` | Tighten nullability. Fails if existing rows have NULL. | yes | yes | yes | yes |

@@ -25,11 +25,15 @@ use std::sync::Arc;
 use arrow_arith::boolean::{and, and_kleene, is_not_null, is_null, not, or, or_kleene};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, Float64Type};
-use arrow_array::{Array, ArrayRef, BooleanArray, Datum as ArrowDatum, RecordBatch, Scalar};
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, Datum as ArrowDatum, RecordBatch, Scalar, UInt32Array,
+    make_array,
+};
 use arrow_buffer::BooleanBuffer;
 use arrow_cast::cast::cast;
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{ArrowError, DataType};
+use arrow_select::take::take;
 use arrow_string::like::starts_with;
 use fnv::FnvHashSet;
 use parquet::schema::types::SchemaDescriptor;
@@ -38,7 +42,7 @@ use crate::arrow::get_arrow_datum;
 use crate::error::{Result, invalid_data};
 use crate::expr::visitors::bound_predicate_visitor::BoundPredicateVisitor;
 use crate::expr::{BoundPredicate, BoundReference};
-use crate::spec::Datum;
+use crate::spec::{Datum, Literal};
 
 /// A visitor to collect field ids from bound predicates.
 pub(super) struct CollectFieldIdVisitor {
@@ -195,6 +199,16 @@ impl BoundPredicateVisitor for CollectFieldIdVisitor {
     }
 }
 
+/// Where a predicate reads its column's values from.
+pub(super) enum PredicateColumn {
+    /// Index of the column in the record batch the row filter projects.
+    Batch(usize),
+    /// SQE PATCH (sqe#830): the file predates the column, so every row reads
+    /// the column's initial-default (Iceberg spec, "Default values"). A
+    /// one-row array, repeated to the batch's length.
+    Default(ArrayRef),
+}
+
 /// A visitor to convert Iceberg bound predicates to Arrow predicates.
 pub(super) struct PredicateConverter<'a> {
     /// The Parquet schema descriptor.
@@ -210,7 +224,26 @@ impl PredicateConverter<'_> {
     /// required column indices which is used to project the column in the record batch.
     /// Return None if the field id is not found in the column map, which is possible
     /// due to schema evolution.
-    fn bound_reference(&mut self, reference: &BoundReference) -> Result<Option<usize>> {
+    ///
+    /// SQE PATCH (sqe#830): a column missing from the file that has an
+    /// initial-default resolves to that default, not to None. Treating it as
+    /// NULL dropped every pre-`ADD COLUMN ... DEFAULT` row from `col = default`.
+    fn bound_reference(&mut self, reference: &BoundReference) -> Result<Option<PredicateColumn>> {
+        let Some(index) = self.bound_column_index(reference)? else {
+            let field = reference.field();
+            return match (&field.initial_default, field.field_type.as_primitive_type()) {
+                (Some(Literal::Primitive(value)), Some(ty)) => {
+                    let datum = get_arrow_datum(&Datum::new(ty.clone(), value.clone()))?;
+                    let (array, _) = datum.get();
+                    Ok(Some(PredicateColumn::Default(make_array(array.to_data()))))
+                }
+                _ => Ok(None),
+            };
+        };
+        Ok(Some(PredicateColumn::Batch(index)))
+    }
+
+    fn bound_column_index(&mut self, reference: &BoundReference) -> Result<Option<usize>> {
         // The leaf column's index in Parquet schema.
         if let Some(column_idx) = self.column_map.get(&reference.field().id) {
             if self.parquet_schema.get_column_root(*column_idx).is_group() {
@@ -266,8 +299,15 @@ fn constant_bool_array(value: bool, len: usize) -> BooleanArray {
 /// supports top-level columns for now.
 fn project_column(
     batch: &RecordBatch,
-    column_idx: usize,
+    source: &PredicateColumn,
 ) -> std::result::Result<ArrayRef, ArrowError> {
+    let column_idx = match source {
+        PredicateColumn::Batch(index) => *index,
+        PredicateColumn::Default(value) => {
+            let zeros = UInt32Array::from(vec![0u32; batch.num_rows()]);
+            return take(value.as_ref(), &zeros, None);
+        }
+    };
     let column = batch.column(column_idx);
 
     match column.data_type() {
@@ -359,7 +399,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
     ) -> Result<Box<PredicateResult>> {
         if let Some(idx) = self.bound_reference(reference)? {
             Ok(Box::new(move |batch| {
-                let column = project_column(&batch, idx)?;
+                let column = project_column(&batch, &idx)?;
                 is_null(&column)
             }))
         } else {
@@ -375,7 +415,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
     ) -> Result<Box<PredicateResult>> {
         if let Some(idx) = self.bound_reference(reference)? {
             Ok(Box::new(move |batch| {
-                let column = project_column(&batch, idx)?;
+                let column = project_column(&batch, &idx)?;
                 is_not_null(&column)
             }))
         } else {
@@ -391,7 +431,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
     ) -> Result<Box<PredicateResult>> {
         if let Some(idx) = self.bound_reference(reference)? {
             Ok(Box::new(move |batch| {
-                let column = project_column(&batch, idx)?;
+                let column = project_column(&batch, &idx)?;
                 compute_is_nan(&column)
             }))
         } else {
@@ -407,7 +447,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
     ) -> Result<Box<PredicateResult>> {
         if let Some(idx) = self.bound_reference(reference)? {
             Ok(Box::new(move |batch| {
-                let column = project_column(&batch, idx)?;
+                let column = project_column(&batch, &idx)?;
                 let is_nan = compute_is_nan(&column)?;
                 not(&is_nan)
             }))
@@ -427,7 +467,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(&batch, &idx)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 lt(&left, literal.as_ref())
             }))
@@ -447,7 +487,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(&batch, &idx)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 lt_eq(&left, literal.as_ref())
             }))
@@ -467,7 +507,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(&batch, &idx)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 gt(&left, literal.as_ref())
             }))
@@ -487,7 +527,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(&batch, &idx)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 gt_eq(&left, literal.as_ref())
             }))
@@ -507,7 +547,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(&batch, &idx)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 eq(&left, literal.as_ref())
             }))
@@ -527,7 +567,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(&batch, &idx)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 neq(&left, literal.as_ref())
             }))
@@ -547,7 +587,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(&batch, &idx)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 starts_with(&left, literal.as_ref())
             }))
@@ -567,7 +607,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(&batch, &idx)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 // update here if arrow ever adds a native not_starts_with
                 not(&starts_with(&left, literal.as_ref())?)
@@ -600,7 +640,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let mut membership: Option<Option<MembershipSet>> = None;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(&batch, &idx)?;
 
                 let set = membership
                     .get_or_insert_with(|| MembershipSet::try_build(left.data_type(), &literals));
@@ -637,7 +677,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
 
             Ok(Box::new(move |batch| {
                 // update this if arrow ever adds a native not_in kernel
-                let left = project_column(&batch, idx)?;
+                let left = project_column(&batch, &idx)?;
                 let mut acc = constant_bool_array(true, batch.num_rows());
                 for literal in &literals {
                     let literal = try_cast_literal(literal, left.data_type())?;
@@ -783,7 +823,7 @@ mod tests {
     use super::{CollectFieldIdVisitor, PredicateConverter, constant_bool_array};
     use crate::expr::visitors::bound_predicate_visitor::visit;
     use crate::expr::{Bind, Predicate, Reference};
-    use crate::spec::{NestedField, PrimitiveType, Schema, SchemaRef, Type};
+    use crate::spec::{Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type};
 
     fn table_schema_simple() -> SchemaRef {
         Arc::new(
@@ -900,6 +940,57 @@ mod tests {
 
         let mut predicate_fn = visit(&mut converter, &bound).unwrap();
         predicate_fn(batch).unwrap()
+    }
+
+    /// SQE PATCH (sqe#830): a column the file predates reads its
+    /// initial-default inside a predicate, so `region = 'eu'` keeps those rows
+    /// and `region IS NULL` drops them. A column with no default stays NULL.
+    #[test]
+    fn test_predicate_converter_missing_column_reads_initial_default() {
+        use arrow_array::Float32Array;
+
+        use crate::spec::Literal;
+
+        let schema: SchemaRef = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(4, "qux", Type::Primitive(PrimitiveType::Float)).into(),
+                    NestedField::optional(5, "region", Type::Primitive(PrimitiveType::String))
+                        .with_initial_default(Literal::string("eu"))
+                        .into(),
+                    NestedField::optional(6, "note", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "qux",
+            DataType::Float32,
+            true,
+        )]));
+        let batch = || {
+            RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Float32Array::from(
+                vec![Some(1.0f32), None],
+            ))])
+            .unwrap()
+        };
+        let all = |predicate: Predicate| {
+            let result = apply_predicate_to_batch(predicate, schema.clone(), batch());
+            assert_eq!(result.len(), 2);
+            result.value(0) && result.value(1)
+        };
+        let none = |predicate: Predicate| {
+            let result = apply_predicate_to_batch(predicate, schema.clone(), batch());
+            !result.value(0) && !result.value(1)
+        };
+
+        assert!(all(Reference::new("region").equal_to(Datum::string("eu"))));
+        assert!(none(Reference::new("region").equal_to(Datum::string("us"))));
+        assert!(all(Reference::new("region").starts_with(Datum::string("e"))));
+        assert!(none(Reference::new("region").is_null()));
+        assert!(all(Reference::new("region").is_not_null()));
+        assert!(all(Reference::new("note").is_null()), "no default: NULL");
     }
 
     #[test]
