@@ -4,6 +4,22 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- File TVFs: a `{catalog}` placeholder in `[storage.tvf] allowed_object_store_prefixes`
+
+    `"s3://staging/ingest/ws/{catalog}/"` expands to the session's catalog,
+    and only when that catalog answered the caller's own bearer while the
+    session was built. Discovered (`polaris-auto`) warehouses count. A
+    member of `ws1` reads `.../ws/ws1/` in a `ws1` session; the same caller
+    in `ws2`, or a caller who names `ws1` without grants on it, is refused.
+    Without a proven catalog the entry is dropped, never matched as an empty
+    segment. Names match exactly and must be `[A-Za-z0-9._@+-]` without
+    `..`. It combines with `{user}`, and works in `[catalogs.<name>]
+    tvf_prefixes` too. Inline credentials and `allow_all_object_stores`
+    still bypass the prefixes; set `allow_inline_credentials = false` when
+    they separate workspaces.
+
 ## [0.50.1] — 2026-10-10
 
 ## [0.50.0] — 2026-10-09

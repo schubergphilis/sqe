@@ -2744,8 +2744,8 @@ pub struct CatalogConfig {
     /// config default when it names none. The name alone does not open
     /// them: the catalog must also have answered the caller's own bearer
     /// (per-user REST auth) while the session was built, so engine-held
-    /// catalog auth never opens them. Same matching and `{user}`
-    /// placeholder as the global list. Lets one coordinator serve several
+    /// catalog auth never opens them. Same matching and `{user}` /
+    /// `{catalog}` placeholders as the global list. Lets one coordinator serve several
     /// workspaces, each reading only its own staging buckets:
     ///
     /// ```toml
@@ -3266,8 +3266,18 @@ pub struct TvfPolicy {
     /// allowed_object_store_prefixes = [
     ///   "s3://data-platform-staging/_table-load-staging/",
     ///   "s3://notebook-scratch/{user}/",
+    ///   "s3://staging/ingest/ws/{catalog}/",
     /// ]
     /// ```
+    ///
+    /// `{catalog}` expands to the session's catalog (the one it names, or the
+    /// config default), and only when that catalog answered the caller's own
+    /// bearer while the session was built: a catalog reached with
+    /// engine-held auth, or merely named, does not expand it. A discovered
+    /// (`polaris-auto`) catalog counts. Without such a catalog the entry is
+    /// dropped, never matched with an empty segment. Names are matched
+    /// exactly (case-sensitive) and must be `[A-Za-z0-9._@+-]` without `..`.
+    /// Both placeholders may appear in one entry.
     ///
     /// Paths whose TVF call carries complete *inline* credentials
     /// (`access_key` + `secret_key`, an Azure key/SAS token, or an inline
@@ -3363,6 +3373,12 @@ pub struct TvfCaller {
     /// That catalog's `[catalogs.<name>] tvf_prefixes`: allowed on top of
     /// the global `allowed_object_store_prefixes`, for this caller only.
     pub catalog_prefixes: Vec<String>,
+    /// The session catalog, set only when it answered this caller's own
+    /// bearer while the session was built. The `{catalog}` placeholder
+    /// expands to it; with `None`, entries using `{catalog}` are dropped.
+    /// Separate from `scope_catalog`, which any session can set by naming a
+    /// catalog.
+    pub catalog_with_access: Option<String>,
 }
 
 impl TvfCaller {
@@ -3374,6 +3390,7 @@ impl TvfCaller {
             trusted: false,
             scope_catalog: None,
             catalog_prefixes: Vec::new(),
+            catalog_with_access: None,
         }
     }
 
@@ -3386,6 +3403,14 @@ impl TvfCaller {
         self
     }
 
+    /// Record that the scoped catalog answered this caller's own bearer, so
+    /// `{catalog}` expands to its name. Call only with that proof in hand:
+    /// naming a catalog is not access to it.
+    pub fn with_proven_catalog_access(mut self) -> Self {
+        self.catalog_with_access = self.scope_catalog.clone();
+        self
+    }
+
     /// Trusted local caller (embedded CLI). Object-store prefix gating is
     /// skipped — the local user owns the config and the credentials in it.
     pub fn trusted_local() -> Self {
@@ -3395,6 +3420,7 @@ impl TvfCaller {
             trusted: true,
             scope_catalog: None,
             catalog_prefixes: Vec::new(),
+            catalog_with_access: None,
         }
     }
 
@@ -3429,6 +3455,7 @@ impl TvfCaller {
             trusted: true,
             scope_catalog: None,
             catalog_prefixes: Vec::new(),
+            catalog_with_access: None,
         }
     }
 }
@@ -3519,23 +3546,33 @@ fn object_prefix_matches(path: &str, prefix: &str) -> bool {
     }
 }
 
-/// Expand the `{user}` placeholder in a configured prefix. Returns `None`
-/// when the prefix needs a username that is absent or contains characters
-/// that could rewrite the URL shape (anything outside `[A-Za-z0-9._@+-]`).
-fn substitute_user_placeholder(prefix: &str, username: Option<&str>) -> Option<String> {
-    if !prefix.contains("{user}") {
-        return Some(prefix.to_string());
+/// Expand the `{user}` and `{catalog}` placeholders in a configured prefix.
+/// Returns `None` when the prefix needs a value that is absent or unsafe in a
+/// URL (anything outside `[A-Za-z0-9._@+-]`, or only dots; a catalog name
+/// may not contain `..` either), so the entry is dropped, never widened to
+/// an empty segment.
+fn substitute_placeholders(
+    prefix: &str,
+    username: Option<&str>,
+    catalog: Option<&str>,
+) -> Option<String> {
+    fn url_safe(value: &str) -> bool {
+        !value.is_empty()
+            && !value.chars().all(|c| c == '.')
+            && value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@' | '+'))
     }
-    let user = username?;
-    let safe = !user.is_empty()
-        && !user.chars().all(|c| c == '.')
-        && user
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@' | '+'));
-    if !safe {
-        return None;
+    let mut out = prefix.to_string();
+    if out.contains("{user}") {
+        let user = username.filter(|u| url_safe(u))?;
+        out = out.replace("{user}", user);
     }
-    Some(prefix.replace("{user}", user))
+    if out.contains("{catalog}") {
+        let catalog = catalog.filter(|c| url_safe(c) && !c.contains(".."))?;
+        out = out.replace("{catalog}", catalog);
+    }
+    Some(out)
 }
 
 impl TvfPolicy {
@@ -3546,7 +3583,7 @@ impl TvfPolicy {
     ///   `azure://`, `az://`, `gs://`, `gcs://`) use the engine's own
     ///   storage credentials, so they are gated per caller identity:
     ///   allowed only under `allowed_object_store_prefixes` (with `{user}`
-    ///   substitution), for a role in `object_store_admin_roles`, for a
+    ///   and `{catalog}` substitution), for a role in `object_store_admin_roles`, for a
     ///   trusted local caller, or when the call carries complete inline
     ///   credentials (`inline_credentials = true`). Default: DENY.
     /// - `hf://` resolves to anonymous HTTPS downloads from
@@ -3644,9 +3681,11 @@ impl TvfPolicy {
             .iter()
             .chain(&caller.catalog_prefixes)
         {
-            let Some(substituted) =
-                substitute_user_placeholder(raw_prefix, caller.username.as_deref())
-            else {
+            let Some(substituted) = substitute_placeholders(
+                raw_prefix,
+                caller.username.as_deref(),
+                caller.catalog_with_access.as_deref(),
+            ) else {
                 continue;
             };
             // A misconfigured prefix (e.g. containing dot segments) is
@@ -3687,7 +3726,8 @@ impl TvfPolicy {
              Reads with the engine's storage credentials are limited to \
              `[storage.tvf] allowed_object_store_prefixes` ({} configured).{catalog_hint} \
              Add a matching prefix (the `{{user}}` placeholder expands to the \
-             authenticated username), grant a role listed in \
+             authenticated username, `{{catalog}}` to the session catalog when \
+             it answered your own credentials), grant a role listed in \
              `[storage.tvf] object_store_admin_roles`{inline_hint}.",
             self.allowed_object_store_prefixes.len()
         ))
@@ -10646,6 +10686,130 @@ audience = "polaris"
         assert!(policy
             .check_path("s3://ws-a-scratch/alice/x.csv", &scoped("bob"), false)
             .is_err());
+    }
+
+    fn catalog_staging_policy() -> TvfPolicy {
+        TvfPolicy {
+            allowed_object_store_prefixes: vec!["s3://staging/ingest/ws/{catalog}/".to_string()],
+            ..TvfPolicy::default()
+        }
+    }
+
+    /// `{catalog}` expands to the session catalog only once its access is
+    /// proven, and is matched exactly.
+    #[test]
+    fn tvf_catalog_placeholder_expands_to_a_proven_session_catalog() {
+        let policy = catalog_staging_policy();
+        let in_ws1 = caller("alice")
+            .with_catalog_scope("ws1", &[])
+            .with_proven_catalog_access();
+        policy
+            .check_path("s3://staging/ingest/ws/ws1/x.parquet", &in_ws1, false)
+            .expect("own workspace staging");
+        for other in [
+            "s3://staging/ingest/ws/ws2/x.parquet",
+            "s3://staging/ingest/ws/WS1/x.parquet",
+            "s3://staging/ingest/ws/ws1-evil/x.parquet",
+            "s3://staging/ingest/ws//x.parquet",
+        ] {
+            let err = policy.check_path(other, &in_ws1, false).unwrap_err();
+            assert!(err.contains("allowed_object_store_prefixes"), "{other}: {err}");
+        }
+    }
+
+    /// A caller with no session catalog, or one that only named it, gets
+    /// nothing from a `{catalog}` entry: it is dropped, never matched as an
+    /// empty segment.
+    #[test]
+    fn tvf_catalog_placeholder_needs_proven_access() {
+        let policy = catalog_staging_policy();
+        let named_only = caller("alice").with_catalog_scope("ws1", &[]);
+        for c in [&caller("alice"), &named_only] {
+            for path in [
+                "s3://staging/ingest/ws/ws1/x.parquet",
+                "s3://staging/ingest/ws//x.parquet",
+                "s3://staging/ingest/ws/x.parquet",
+            ] {
+                let err = policy.check_path(path, c, false).unwrap_err();
+                assert!(err.contains("allowed_object_store_prefixes"), "{err}");
+            }
+        }
+    }
+
+    /// A catalog name that could change the URL shape never expands.
+    #[test]
+    fn tvf_catalog_placeholder_rejects_unsafe_names() {
+        let policy = catalog_staging_policy();
+        for name in ["ws1/../ws2", "a/b", "..", ".", "a..b", "", "ws 1", "ws%2f1"] {
+            let c = caller("alice")
+                .with_catalog_scope(name, &[])
+                .with_proven_catalog_access();
+            for path in [
+                format!("s3://staging/ingest/ws/{name}/x.parquet"),
+                "s3://staging/ingest/ws/b/x.parquet".to_string(),
+                "s3://staging/ingest/ws2/x.parquet".to_string(),
+            ] {
+                assert!(
+                    policy.check_path(&path, &c, false).is_err(),
+                    "catalog '{name}' opened {path}"
+                );
+            }
+        }
+        assert_eq!(substitute_placeholders("s3://s/{catalog}/", None, Some("a..b")), None);
+        assert_eq!(substitute_placeholders("s3://s/{catalog}/", None, Some("a/b")), None);
+        assert_eq!(substitute_placeholders("s3://s/{catalog}/", None, None), None);
+        assert_eq!(
+            substitute_placeholders("s3://s/{catalog}/", None, Some("ws.prod-1")),
+            Some("s3://s/ws.prod-1/".to_string())
+        );
+    }
+
+    /// `{user}` and `{catalog}` combine; both must resolve.
+    #[test]
+    fn tvf_catalog_and_user_placeholders_combine() {
+        let policy = TvfPolicy {
+            allowed_object_store_prefixes: vec!["s3://scratch/{catalog}/{user}/".to_string()],
+            ..TvfPolicy::default()
+        };
+        let alice_ws1 = caller("alice")
+            .with_catalog_scope("ws1", &[])
+            .with_proven_catalog_access();
+        policy
+            .check_path("s3://scratch/ws1/alice/x.csv", &alice_ws1, false)
+            .expect("own area in own workspace");
+        for path in ["s3://scratch/ws1/bob/x.csv", "s3://scratch/ws2/alice/x.csv"] {
+            assert!(policy.check_path(path, &alice_ws1, false).is_err(), "{path}");
+        }
+        let anonymous = TvfCaller {
+            username: None,
+            ..alice_ws1.clone()
+        };
+        assert!(policy
+            .check_path("s3://scratch/ws1/alice/x.csv", &anonymous, false)
+            .is_err());
+        // A catalog's own `tvf_prefixes` expand it too.
+        let scoped = caller("alice")
+            .with_catalog_scope("ws1", &["s3://landing/{catalog}/{user}/".to_string()])
+            .with_proven_catalog_access();
+        TvfPolicy::default()
+            .check_path("s3://landing/ws1/alice/x.csv", &scoped, false)
+            .expect("catalog tvf_prefixes expand {catalog}");
+    }
+
+    /// Inline credentials and `allow_all_object_stores` still bypass the
+    /// prefixes, `{catalog}` entries included.
+    #[test]
+    fn tvf_catalog_placeholder_keeps_the_bypasses() {
+        let no_scope = caller("alice");
+        let path = "s3://elsewhere/x.parquet";
+        catalog_staging_policy()
+            .check_path(path, &no_scope, true)
+            .expect("inline credentials bypass");
+        let all = TvfPolicy {
+            allow_all_object_stores: true,
+            ..catalog_staging_policy()
+        };
+        all.check_path(path, &no_scope, false).expect("allow_all_object_stores");
     }
 
     #[test]

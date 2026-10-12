@@ -558,6 +558,11 @@ pub async fn create_session_context(
             // registered above), or Polaris did not resolve it (default fell
             // back to the config catalog).
             if let Some((cat_name, provider, session_catalog)) = discovered_session_catalog {
+                // Discovery runs only on a per-user template, so a listing that
+                // answered proves this caller's access, as for config catalogs.
+                if provider.listing_succeeded() {
+                    catalogs_with_caller_access.insert(cat_name.clone());
+                }
                 ctx.register_catalog(cat_name.clone(), Arc::new(provider));
                 system_catalog_entries.push(sqe_catalog::SystemCatalogEntry {
                     name: cat_name,
@@ -1010,7 +1015,8 @@ fn catalog_auth_is_per_user(cat: &sqe_core::config::CatalogConfig) -> bool {
 /// catalog answered this caller's own bearer during the session build. A
 /// session can name any catalog (`X-Trino-Catalog`, `USE`), so the name
 /// alone must not open another workspace's buckets. A catalog not in config
-/// (a discovered warehouse) adds none.
+/// (a discovered warehouse) adds none. The same proof lets `{catalog}`
+/// prefixes expand to the catalog's name, discovered warehouses included.
 fn tvf_caller_for(
     session: &Session,
     flattened: &[(String, sqe_core::config::CatalogConfig)],
@@ -1022,11 +1028,16 @@ fn tvf_caller_for(
         .find(|(name, _)| caller_has_access && name == default_catalog)
         .map(|(_, c)| c.tvf_prefixes.as_slice())
         .unwrap_or_default();
-    sqe_core::config::TvfCaller::for_user(
+    let caller = sqe_core::config::TvfCaller::for_user(
         session.user.username.clone(),
         session.user.roles.clone(),
     )
-    .with_catalog_scope(default_catalog, prefixes)
+    .with_catalog_scope(default_catalog, prefixes);
+    if caller_has_access {
+        caller.with_proven_catalog_access()
+    } else {
+        caller
+    }
 }
 
 /// Attempt to resolve `warehouse` as a Polaris catalog and build its
@@ -1458,6 +1469,37 @@ allowed_object_store_prefixes = ["s3://shared-landing/"]
             .tvf
             .check_path("s3://ws-a-landing/x.parquet", &named_only, false)
             .is_err());
+    }
+
+    /// `{catalog}` expands to a discovered warehouse that answered the
+    /// caller, and to nothing when access is unproven.
+    #[test]
+    fn tvf_catalog_placeholder_follows_the_access_proof() {
+        let mut config = two_workspace_config();
+        config.storage.tvf.allowed_object_store_prefixes =
+            vec!["s3://staging/ingest/ws/{catalog}/".to_string()];
+        let flattened: Vec<(String, sqe_core::config::CatalogConfig)> = config
+            .flattened_catalogs()
+            .into_iter()
+            .map(|(n, c)| (n, c.clone()))
+            .collect();
+        let policy = &config.storage.tvf;
+        let ws1_file = "s3://staging/ingest/ws/ws1/x.parquet";
+
+        let member = tvf_caller_for(&alice(), &flattened, "ws1", true);
+        policy.check_path(ws1_file, &member, false).expect("discovered, with access");
+
+        let named_only = tvf_caller_for(&alice(), &flattened, "ws1", false);
+        let err = policy.check_path(ws1_file, &named_only, false).unwrap_err();
+        assert!(err.contains("allowed_object_store_prefixes"), "{err}");
+
+        let in_ws2 = tvf_caller_for(&alice(), &flattened, "ws2", true);
+        assert!(policy.check_path(ws1_file, &in_ws2, false).is_err());
+        // Config catalogs expand the same way.
+        let in_a = tvf_caller_for(&alice(), &flattened, "ws_a", true);
+        policy
+            .check_path("s3://staging/ingest/ws/ws_a/x.parquet", &in_a, false)
+            .expect("config catalog, with access");
     }
 
     /// Only a per-user bearer proves access; engine-held catalog auth answers
