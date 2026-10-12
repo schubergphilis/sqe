@@ -3051,6 +3051,64 @@ fn sqe_view_version(
         .build())
 }
 
+/// The schema and version updates of a `replaceView` commit.
+///
+/// The server's view builder reuses the id of an existing schema or version
+/// that is structurally identical to the one added, and then records it as
+/// "last added" only when it was added in the same commit. So `-1` ("the one
+/// added in this commit") fails once the server deduplicated: an unchanged
+/// schema gave "Cannot set last added schema: no schema has been added"
+/// (#832), and an unchanged definition would fail the same way at
+/// `set-current-view-version`. Both are resolved here against the existing
+/// metadata with the server's own equality, so a replace that changes
+/// nothing just points the view at the version it already has.
+/// `-1` still names a schema that is new, whatever id the server gives it
+/// (#770).
+fn view_replace_updates(
+    existing: &iceberg::spec::ViewMetadata,
+    schema: iceberg::spec::Schema,
+    version_for_schema: impl FnOnce(i32) -> sqe_core::Result<iceberg::spec::ViewVersion>,
+) -> sqe_core::Result<Vec<iceberg::ViewUpdate>> {
+    let mut updates = Vec::with_capacity(3);
+    let same_schema = existing.schemas_iter().find(|s| {
+        s.as_struct() == schema.as_struct() && s.identifier_field_ids().eq(schema.identifier_field_ids())
+    });
+    let schema_id = match same_schema {
+        Some(s) => s.schema_id(),
+        None => {
+            let last_column_id = Some(schema.highest_field_id());
+            updates.push(iceberg::ViewUpdate::AddSchema {
+                schema,
+                last_column_id,
+            });
+            -1
+        }
+    };
+    let version = version_for_schema(schema_id)?;
+    let same_version = (schema_id != -1)
+        .then(|| {
+            existing.versions().find(|v| {
+                v.summary() == version.summary()
+                    && v.representations() == version.representations()
+                    && v.default_catalog() == version.default_catalog()
+                    && v.default_namespace() == version.default_namespace()
+                    && v.schema_id() == version.schema_id()
+            })
+        })
+        .flatten();
+    let view_version_id = match same_version {
+        Some(v) => v.version_id(),
+        None => {
+            updates.push(iceberg::ViewUpdate::AddViewVersion {
+                view_version: version,
+            });
+            -1
+        }
+    };
+    updates.push(iceberg::ViewUpdate::SetCurrentViewVersion { view_version_id });
+    Ok(updates)
+}
+
 /// Parse the coordinator's Iceberg-JSON view schema into the typed schema,
 /// re-numbered to `schema_id` so a replace never collides with the schema
 /// ids already in the view document.
@@ -3254,6 +3312,11 @@ impl SessionCatalog {
         )
         .await?;
 
+        // A new or dropped name changes every session's listing of the
+        // namespace (information_schema, SHOW TABLES), as a table commit does.
+        crate::schema_provider::invalidate_namespace_listing_all_tokens(
+            &namespace.as_ref().join("."),
+        );
         info!(view = name, namespace = ?namespace, "View created");
         Ok(())
     }
@@ -3293,25 +3356,9 @@ impl SessionCatalog {
             .max()
             .map_or(1, |id| id + 1);
         let schema = view_schema_from_json(schema, next_schema_id)?;
-        // The server's `add-schema` reuses an existing id when the new schema
-        // is structurally identical (Java + vendored builder both do), so the
-        // fresh id we picked may never be registered and `add-view-version`
-        // then fails with "Cannot add version with unknown schema" (#770).
-        // `-1` means "the schema added in this commit", whatever id it got.
-        let version = sqe_view_version(next_version_id, -1, sql, namespace, &self.warehouse)?;
-        let last_column_id = Some(schema.highest_field_id());
-        let mut updates = vec![
-            iceberg::ViewUpdate::AddSchema {
-                schema,
-                last_column_id,
-            },
-            iceberg::ViewUpdate::AddViewVersion {
-                view_version: version,
-            },
-            iceberg::ViewUpdate::SetCurrentViewVersion {
-                view_version_id: -1,
-            },
-        ];
+        let mut updates = view_replace_updates(&existing, schema, |schema_id| {
+            sqe_view_version(next_version_id, schema_id, sql, namespace, &self.warehouse)
+        })?;
         if !properties.is_empty() {
             updates.push(iceberg::ViewUpdate::SetProperties {
                 updates: properties.clone(),
@@ -3440,6 +3487,11 @@ impl SessionCatalog {
         )
         .await?;
 
+        // A new or dropped name changes every session's listing of the
+        // namespace (information_schema, SHOW TABLES), as a table commit does.
+        crate::schema_provider::invalidate_namespace_listing_all_tokens(
+            &namespace.as_ref().join("."),
+        );
         info!(view = name, namespace = ?namespace, "View dropped");
         Ok(())
     }
@@ -5695,7 +5747,10 @@ mod view_rest_tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use super::{select_view_sql, SessionCatalog, TableMetadataCache};
+    use super::{
+        select_view_sql, sqe_view_version, view_replace_updates, view_schema_from_json,
+        SessionCatalog, TableMetadataCache,
+    };
     use crate::circuit_breaker::CircuitBreaker;
 
     const WAREHOUSE: &str = "test-warehouse";
@@ -6037,34 +6092,75 @@ mod view_rest_tests {
             .iter()
             .map(|u| u["action"].as_str().unwrap())
             .collect();
+        // The schema is unchanged, so no add-schema: the server would reuse
+        // schema 0 and then refuse `-1` (#832).
+        assert_eq!(actions, ["add-view-version", "set-current-view-version"]);
         assert_eq!(
-            actions,
-            ["add-schema", "add-view-version", "set-current-view-version"]
-        );
-        assert_eq!(
-            body["updates"][0]["schema"]["schema-id"], 1,
-            "fresh schema id"
-        );
-        assert_eq!(
-            body["updates"][1]["view-version"]["version-id"], 3,
+            body["updates"][0]["view-version"]["version-id"], 3,
             "max(1,2)+1"
         );
+        assert_eq!(body["updates"][0]["view-version"]["schema-id"], 0);
         assert_eq!(
-            body["updates"][1]["view-version"]["schema-id"], -1,
-            "must reference the schema added in this commit, not a guessed id: \
-             the server reuses an existing id for an identical schema (#770)"
-        );
-        assert_eq!(
-            body["updates"][1]["view-version"]["representations"][0]["sql"],
+            body["updates"][0]["view-version"]["representations"][0]["sql"],
             "SELECT 3 AS x"
         );
-        assert_eq!(body["updates"][2]["view-version-id"], -1);
+        assert_eq!(body["updates"][1]["view-version-id"], -1);
         assert!(
             !requests
                 .iter()
                 .any(|r| r.method == wiremock::http::Method::DELETE),
             "replace must not drop the view"
         );
+    }
+
+    fn update_actions(updates: &[iceberg::ViewUpdate]) -> Vec<String> {
+        updates
+            .iter()
+            .map(|u| serde_json::to_value(u).unwrap()["action"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// A changed schema is added and referenced as `-1`: the server may give
+    /// it any id (#770).
+    #[test]
+    fn view_replace_adds_a_changed_schema() {
+        let schema = view_schema_from_json(
+            &serde_json::json!({
+                "fields": [{"id": 1, "name": "y", "required": false, "type": "string"}]
+            }),
+            1,
+        )
+        .unwrap();
+        let updates = view_replace_updates(&metadata(1, &[("sqe", "SELECT 1 AS x")]), schema, |id| {
+            sqe_view_version(3, id, "SELECT 'a' AS y", &sales(), "test-warehouse")
+        })
+        .unwrap();
+        assert_eq!(
+            update_actions(&updates),
+            ["add-schema", "add-view-version", "set-current-view-version"]
+        );
+        let body = serde_json::to_value(&updates).unwrap();
+        assert_eq!(body[1]["view-version"]["schema-id"], -1);
+        assert_eq!(body[2]["view-version-id"], -1);
+    }
+
+    /// Replacing a view with the definition it already has (a dbt view
+    /// model re-run) adds nothing and points at the existing version: the
+    /// server would dedupe a re-added version and refuse `-1` (#832).
+    #[test]
+    fn view_replace_with_the_same_definition_reuses_the_version() {
+        let current =
+            sqe_view_version(1, 0, "SELECT 1 AS x", &sales(), "test-warehouse").unwrap();
+        let mut doc = view_metadata_json(1, &[]);
+        doc["versions"][0] = serde_json::to_value(&current).unwrap();
+        let existing: iceberg::spec::ViewMetadata = serde_json::from_value(doc).unwrap();
+        let schema = view_schema_from_json(&view_schema_json(), 1).unwrap();
+        let updates = view_replace_updates(&existing, schema, |id| {
+            sqe_view_version(3, id, "SELECT 1 AS x", &sales(), "test-warehouse")
+        })
+        .unwrap();
+        assert_eq!(update_actions(&updates), ["set-current-view-version"]);
+        assert_eq!(serde_json::to_value(&updates).unwrap()[0]["view-version-id"], 1);
     }
 }
 

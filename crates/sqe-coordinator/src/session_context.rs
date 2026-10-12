@@ -534,7 +534,12 @@ pub async fn create_session_context(
                 if catalog_provider.listing_succeeded() && catalog_auth_is_per_user(cat_cfg) {
                     catalogs_with_caller_access.insert(cat_name.clone());
                 }
-                ctx.register_catalog(cat_name, Arc::new(catalog_provider));
+                // A view body names tables by `cat_name`, which is not the
+                // warehouse name when the config aliases it (#833).
+                ctx.register_catalog(
+                    cat_name,
+                    Arc::new(catalog_provider.with_catalog_name(cat_name.clone())),
+                );
                 system_catalog_entries.push(sqe_catalog::SystemCatalogEntry {
                     name: cat_name.clone(),
                     catalog: session_catalog.clone(),
