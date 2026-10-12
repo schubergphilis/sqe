@@ -540,6 +540,10 @@ fn transport_failure_class(e: &reqwest::Error) -> BreakerFailureClass {
     }
 }
 
+/// Largest fraction by which [`TableMetadataCache`] shortens one key's soft
+/// TTL, so entries cached together do not all go stale together (#816).
+const SOFT_TTL_JITTER: f64 = 0.2;
+
 /// A cached table entry holding metadata, an optional ETag, and the time it was
 /// last validated against Polaris.
 #[derive(Clone)]
@@ -946,11 +950,33 @@ impl TableMetadataCache {
         self.generation(key, &snapshot.table_suffix) != *snapshot
     }
 
+    /// The soft TTL of `key`: `soft_ttl` shortened by up to
+    /// [`SOFT_TTL_JITTER`], by an amount fixed per key (#816).
+    ///
+    /// Entries loaded together (a dashboard opening twenty tables, a burst
+    /// after a deploy) would otherwise all go stale at the same instant and
+    /// revalidate against the catalog together. The jitter only ever
+    /// shortens: the policy-tag path reads fresh entries alone, and a longer
+    /// TTL would widen the window in which a tag set by another engine is
+    /// not seen (architecture review 303).
+    fn soft_ttl_for(&self, key: &str) -> std::time::Duration {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        let unit = (hasher.finish() % 10_000) as f64 / 10_000.0;
+        self.soft_ttl.mul_f64(1.0 - SOFT_TTL_JITTER * unit)
+    }
+
+    /// Whether `entry`, cached under `key`, is inside its soft TTL.
+    fn is_fresh(&self, key: &str, entry: &CachedTableEntry) -> bool {
+        entry.validated_at.elapsed() < self.soft_ttl_for(key)
+    }
+
     /// Get a cached entry if it exists and is still fresh (within soft TTL).
     /// Returns `None` if no entry exists or if the entry has expired.
     pub async fn get_fresh(&self, key: &str) -> Option<Table> {
         let entry = self.usable_entry(key).await?;
-        if entry.validated_at.elapsed() < self.soft_ttl {
+        if self.is_fresh(key, &entry) {
             Some(entry.table)
         } else {
             None
@@ -1213,10 +1239,9 @@ impl TableMetadataCache {
         // mean a tag added by another engine is ignored until the 1h hard
         // TTL (architecture review 303). No fresh entry => `None`, which the
         // tag source treats as UNKNOWN and the rewriter fails closed on.
-        let fresh = |entry: &CachedTableEntry| entry.validated_at.elapsed() < self.soft_ttl;
         if let Some(exact_suffix) = exact_suffix {
             for (key, entry) in self.inner.iter() {
-                if key.ends_with(&exact_suffix) && fresh(&entry) {
+                if key.ends_with(&exact_suffix) && self.is_fresh(&key, &entry) {
                     return Some(entry.table.metadata().properties().clone());
                 }
             }
@@ -1226,7 +1251,7 @@ impl TableMetadataCache {
         let mut fallback_warehouse = None;
         for (key, entry) in self.inner.iter() {
             if key.ends_with(&table_suffix) {
-                if !fresh(&entry) {
+                if !self.is_fresh(&key, &entry) {
                     continue;
                 }
                 let warehouse = key
@@ -4417,6 +4442,43 @@ type = "aws"
         cache.mark_authorized(key).await;
         cache.invalidate_all().await;
         assert!(!cache.authorization_fresh(key).await);
+    }
+
+    /// #816: 1,000 entries cached at one instant do not all go stale at once.
+    /// Each key's soft TTL falls in [0.8, 1.0] of the configured one, spread
+    /// so that no 2 s slice of that 20 s window holds more than 15% of the
+    /// keys (10% is even),
+    /// and never beyond the configured TTL (the policy-tag path reads only
+    /// fresh entries).
+    #[tokio::test]
+    async fn entries_cached_together_go_stale_spread_out() {
+        let ttl = std::time::Duration::from_secs(100);
+        let cache = TableMetadataCache::new(100);
+        let keys: Vec<String> = (0..1000).map(|i| format!("tok{i}|wh|ns.t{i}")).collect();
+
+        let mut buckets = [0usize; 10];
+        for key in &keys {
+            let own = cache.soft_ttl_for(key);
+            assert!(own <= ttl && own > ttl.mul_f64(0.8), "{key}: {own:?}");
+            let slot = ((ttl - own).as_secs_f64() / 2.0) as usize;
+            buckets[slot.min(9)] += 1;
+        }
+        assert!(buckets.iter().all(|&n| n <= 150), "expiry clustered: {buckets:?}");
+
+        // The same through the read path: every entry 90 s old, so roughly
+        // half are still fresh and half revalidate, instead of all of them.
+        for key in &keys {
+            cache
+                .insert_aged(key.clone(), test_table(), std::time::Duration::from_secs(90))
+                .await;
+        }
+        let mut fresh = 0;
+        for key in &keys {
+            if cache.get_fresh(key).await.is_some() {
+                fresh += 1;
+            }
+        }
+        assert!((300..=700).contains(&fresh), "fresh at 0.9 x TTL: {fresh}");
     }
 
     /// Minimal in-memory `Table` for cache tests: a valid v1 metadata document
