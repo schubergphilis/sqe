@@ -24,6 +24,8 @@ pub struct ShipperMetrics {
     pub cursor_seq: Option<prometheus::Gauge>,
     /// `sqe_audit_export_last_success_timestamp` gauge.
     pub last_success_timestamp: Option<prometheus::Gauge>,
+    /// `sqe_audit_export_spool_dropped_records_total` counter.
+    pub spool_dropped_records_total: Option<prometheus::IntCounter>,
 }
 
 /// Where to start reading on a fresh cursor.
@@ -56,6 +58,7 @@ pub struct OtlpLogShipper {
     cursor: SeqCursor,
     exporter: Arc<dyn LogShipExporter>,
     batch_max: usize,
+    /// Hard cap on the spool; see `enforce_cap`.
     max_spool_bytes: u64,
     /// Byte offset after the newline of the last successfully acked record.
     /// The next pass seeks here before reading.
@@ -73,6 +76,45 @@ pub struct OtlpLogShipper {
     compactor: Option<SpoolCompactor>,
     /// Spool size at which a drained spool is truncated.
     compact_at_bytes: u64,
+}
+
+/// Where to cut a spool that is over `cap`: the byte offset to keep from (on
+/// a line boundary) and how many unshipped records the cut drops. `None`
+/// when the spool is within the cap. Shipped bytes (`committed`) go first;
+/// past them the cut runs until at most `cap / 2` bytes remain.
+fn plan_trim(
+    path: &std::path::Path,
+    committed: u64,
+    cap: u64,
+    covers: impl Fn(u64) -> bool,
+) -> std::io::Result<Option<(u64, u64)>> {
+    let len = std::fs::metadata(path)?.len();
+    if len <= cap {
+        return Ok(None);
+    }
+    let mut cut = committed.min(len);
+    let mut dropped = 0u64;
+    if len - cut > cap {
+        let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+        reader.seek(SeekFrom::Start(cut))?;
+        let mut line = Vec::new();
+        while len - cut > cap / 2 {
+            line.clear();
+            let n = reader.read_until(b'\n', &mut line)?;
+            // Never cut into a line the writer has not finished.
+            if n == 0 || !line.ends_with(b"\n") || cut + n as u64 > len {
+                break;
+            }
+            cut += n as u64;
+            let rec = std::str::from_utf8(&line)
+                .ok()
+                .and_then(|l| ocsf_to_ship_record(l.trim_end_matches('\n')));
+            if rec.is_some_and(|r| !covers(r.seq)) {
+                dropped += 1;
+            }
+        }
+    }
+    Ok((cut > 0).then_some((cut, dropped)))
 }
 
 /// A drained spool is truncated once it reaches this size. Small enough to
@@ -164,6 +206,72 @@ impl OtlpLogShipper {
         }
     }
 
+    /// Hold the spool at `max_spool_bytes`. Shipped records go first; when
+    /// that is not enough (a collector outage) the oldest unshipped records
+    /// go too, down to half the cap so the next trim is far off. The spool
+    /// is only the SIEM delivery buffer: the native audit log keeps every
+    /// record, and a gap shows in the shipped `metadata.sequence`. Runs on
+    /// every pass, failed or not, and never blocks a query.
+    async fn enforce_cap(&mut self) {
+        let size = match std::fs::metadata(&self.spool_path) {
+            Ok(m) => m.len(),
+            Err(_) => return,
+        };
+        if size <= self.max_spool_bytes {
+            self.spool_warn_emitted = false;
+            return;
+        }
+        let Some(compactor) = self.compactor.clone() else {
+            if !self.spool_warn_emitted {
+                tracing::warn!(
+                    spool = %self.spool_path.display(),
+                    size_bytes = size,
+                    max_bytes = self.max_spool_bytes,
+                    "audit spool exceeds size threshold; shipper may be lagging"
+                );
+                self.spool_warn_emitted = true;
+            }
+            return;
+        };
+        let path = self.spool_path.clone();
+        let committed = self.committed_offset;
+        let cap = self.max_spool_bytes;
+        let last = self.cursor.last();
+        let covered = self.cursor.covers(last).then_some(last);
+        let trimmed = tokio::task::spawn_blocking(move || {
+            let covers = |seq: u64| covered.is_some_and(|l| seq <= l);
+            let Some((cut, dropped)) = plan_trim(&path, committed, cap, covers)? else {
+                return Ok(None);
+            };
+            Ok::<_, std::io::Error>(compactor.trim_head(cut)?.then_some((cut, dropped)))
+        })
+        .await;
+        match trimmed {
+            Ok(Ok(Some((cut, dropped)))) => {
+                self.committed_offset = self.committed_offset.saturating_sub(cut);
+                if dropped > 0 {
+                    if let Some(ref c) = self.metrics.spool_dropped_records_total {
+                        c.inc_by(dropped);
+                    }
+                    if !self.spool_warn_emitted {
+                        tracing::warn!(
+                            spool = %self.spool_path.display(),
+                            size_bytes = size,
+                            max_bytes = cap,
+                            dropped,
+                            "audit spool over max_spool_bytes; dropped the oldest unshipped \
+                             records (the native audit log still has them)"
+                        );
+                        self.spool_warn_emitted = true;
+                    }
+                }
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => tracing::warn!(err = %e, "audit shipper: spool trim failed"),
+            Err(e) => tracing::warn!(err = %e, "audit shipper: spool trim task failed"),
+        }
+    }
+
     /// Attach Prometheus metric handles. Call before `run`.
     ///
     /// When not called (or called with a default `ShipperMetrics`), the shipper
@@ -210,23 +318,7 @@ impl OtlpLogShipper {
     /// Returns a `ShipOutcome`. The cursor advances ONLY when `export_batch`
     /// returns `Ok`. On error the cursor and `committed_offset` are unchanged.
     pub async fn ship_once(&mut self) -> ShipOutcome {
-        // Check spool size and warn once per threshold crossing.
-        if let Ok(meta) = std::fs::metadata(&self.spool_path) {
-            let size = meta.len();
-            if size > self.max_spool_bytes {
-                if !self.spool_warn_emitted {
-                    tracing::warn!(
-                        spool = %self.spool_path.display(),
-                        size_bytes = size,
-                        max_bytes = self.max_spool_bytes,
-                        "audit spool exceeds size threshold; shipper may be lagging"
-                    );
-                    self.spool_warn_emitted = true;
-                }
-            } else {
-                self.spool_warn_emitted = false;
-            }
-        }
+        self.enforce_cap().await;
 
         // Open the spool and seek to the committed offset.
         let file = match std::fs::File::open(&self.spool_path) {
@@ -570,54 +662,147 @@ mod tests {
         assert_eq!(disk_cursor2.last(), 5, "cursor advanced after ack");
     }
 
-    /// The spool is the local audit log, so a long outage past
-    /// `max_spool_bytes` only warns: every record stays on disk and is shipped,
-    /// in order, once the collector returns (#816).
-    #[tokio::test]
-    async fn outage_past_max_spool_bytes_keeps_every_record_and_replays() {
-        let dir = tempdir().unwrap();
-        let spool = dir.path().join("audit.jsonl");
-        let cursor_path = dir.path().join("audit.cursor");
-        let seqs: Vec<u64> = (1..=20).collect();
-        write_spool(&spool, &seqs);
-        let spool_len = std::fs::metadata(&spool).unwrap().len();
+    /// A logger writing both the native audit log and the export spool, with
+    /// `n` events already flushed to both.
+    fn logger_with_spool(
+        dir: &std::path::Path,
+        n: usize,
+    ) -> (Arc<crate::audit::AuditLogger>, PathBuf, PathBuf) {
+        let native = dir.join("audit.jsonl");
+        let spool = dir.join("audit.spool.jsonl");
+        let logger = Arc::new(
+            crate::audit::AuditLogger::with_config(
+                native.to_str().unwrap(),
+                crate::audit::AuditFormat::Native,
+            )
+            .unwrap()
+            .with_export_spool(spool.to_str().unwrap())
+            .unwrap(),
+        );
+        for _ in 0..n {
+            logger.log_event(sample_query_event());
+        }
+        logger.flush();
+        (logger, native, spool)
+    }
 
+    fn line_count(path: &std::path::Path) -> usize {
+        std::fs::read_to_string(path).unwrap().lines().count()
+    }
+
+    /// The spool is the SIEM delivery buffer, not the audit log of record. A
+    /// collector outage must not let it fill the disk: past `max_spool_bytes`
+    /// the oldest unshipped records go, they are counted, the writer keeps
+    /// writing into the trimmed spool, and the newest records replay in order
+    /// once the collector returns. The native audit log keeps all of them
+    /// (#816).
+    #[tokio::test]
+    async fn outage_past_max_spool_bytes_drops_the_oldest_and_replays_the_rest() {
+        const N: usize = 200;
+        const M: usize = 10;
+        let dir = tempdir().unwrap();
+        let cursor_path = dir.path().join("audit.cursor");
+        let (logger, native, spool) = logger_with_spool(dir.path(), N);
+        let cap = std::fs::metadata(&spool).unwrap().len() / 4;
+
+        let dropped = prometheus::IntCounter::new("dropped", "dropped").unwrap();
         let stub = StubExporter::new(true);
         let mut shipper = OtlpLogShipper::new(
             spool.clone(),
             cursor_path.clone(),
             stub.clone(),
             3,
-            1024, // far below the backlog
+            cap,
             StartAt::Beginning,
             500,
-        );
+        )
+        .with_compactor(logger.spool_compactor(spool.to_str().unwrap()))
+        .with_metrics(ShipperMetrics {
+            spool_dropped_records_total: Some(dropped.clone()),
+            ..Default::default()
+        });
 
         for _ in 0..5 {
             assert!(shipper.ship_once().await.failed);
         }
-        assert_eq!(SeqCursor::load(cursor_path.clone(), true).last(), 0);
-        assert_eq!(
-            std::fs::metadata(&spool).unwrap().len(),
-            spool_len,
-            "no audit record dropped while the collector is down"
+        let kept = line_count(&spool);
+        assert!(
+            std::fs::metadata(&spool).unwrap().len() <= cap,
+            "the spool is held under max_spool_bytes during the outage"
         );
+        assert!(kept > 0, "the newest records stay");
+        assert_eq!(dropped.get() as usize, N - kept, "every drop is counted");
+        assert_eq!(SeqCursor::load(cursor_path.clone(), true).last(), 0);
+
+        // The writer was moved onto the trimmed file and still lands there.
+        for _ in 0..M {
+            logger.log_event(sample_query_event());
+        }
+        logger.flush();
+        assert_eq!(line_count(&spool), kept + M);
 
         stub.fail.store(false, Ordering::SeqCst);
-        for _ in 0..20 {
+        for _ in 0..200 {
             let outcome = shipper.ship_once().await;
             assert!(!outcome.failed);
             if outcome.shipped == 0 {
                 break;
             }
         }
-
+        let first = (N - kept) as u64;
+        let expected: Vec<u64> = (first..(N + M) as u64).collect();
         assert_eq!(
             *stub.shipped.lock().unwrap(),
-            seqs,
-            "replayed in order, no loss"
+            expected,
+            "the newest records replay in order, once each"
         );
-        assert_eq!(SeqCursor::load(cursor_path, true).last(), 20);
+        assert_eq!(
+            line_count(&native),
+            N + M,
+            "the native audit log keeps every record"
+        );
+    }
+
+    /// Over the cap, shipped records are cut before any unshipped one: when
+    /// that alone brings the spool under the cap nothing is counted as dropped.
+    #[tokio::test]
+    async fn spool_over_cap_drops_shipped_records_first() {
+        const N: usize = 50;
+        let dir = tempdir().unwrap();
+        let (logger, _native, spool) = logger_with_spool(dir.path(), N);
+        let len = std::fs::metadata(&spool).unwrap().len();
+
+        let dropped = prometheus::IntCounter::new("dropped", "dropped").unwrap();
+        let stub = StubExporter::new(false);
+        let mut shipper = OtlpLogShipper::new(
+            spool.clone(),
+            dir.path().join("audit.cursor"),
+            stub.clone(),
+            N,
+            len, // the three records written after the first pass cross it
+            StartAt::Beginning,
+            500,
+        )
+        .with_compactor(logger.spool_compactor(spool.to_str().unwrap()))
+        .with_metrics(ShipperMetrics {
+            spool_dropped_records_total: Some(dropped.clone()),
+            ..Default::default()
+        });
+        assert_eq!(shipper.ship_once().await.shipped, N);
+
+        for _ in 0..3 {
+            logger.log_event(sample_query_event());
+        }
+        logger.flush();
+        stub.fail.store(true, Ordering::SeqCst);
+        assert!(shipper.ship_once().await.failed);
+        assert_eq!(line_count(&spool), 3, "only the shipped records were cut");
+        assert_eq!(dropped.get(), 0);
+
+        stub.fail.store(false, Ordering::SeqCst);
+        assert_eq!(shipper.ship_once().await.shipped, 3);
+        let shipped = stub.shipped.lock().unwrap().clone();
+        assert_eq!(shipped, (0..(N + 3) as u64).collect::<Vec<_>>());
     }
 
     // ---------------------------------------------------------------------------
