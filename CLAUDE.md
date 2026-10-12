@@ -49,7 +49,7 @@ Invariant: `docs/site/` must be publish-clean (no secrets or PII). `make leak-sc
 
 ## Roadmap
 
-The live roadmap and its status live in `README.md`; the newest file in `docs/internal/status/` carries the current pointer (`nextsteps.md` holds the frozen log before 2026-10-12). Distribution uses a bespoke scheduler; Ballista was evaluated and rejected (see `docs/site/book/src/design-notes/ballista-evaluation-learnings.md`).
+The live roadmap and its status live in `README.md`; the newest file in `docs/internal/status/` carries the current pointer (`nextsteps.md` is only a pointer to it). Distribution uses a bespoke scheduler; Ballista was evaluated and rejected (see `docs/site/book/src/design-notes/ballista-evaluation-learnings.md`).
 
 ## Common Commands
 
@@ -77,7 +77,7 @@ make test-integration-down                        # tear the stack down
 When finishing a feature, bugfix, or any implementation task, **always update these files** before committing:
 
 1. **`README.md`** -- Update the roadmap checklist (mark items done, add new items)
-2. **`docs/internal/status/YYYY-MM-DD-<branch-slug>.md`** -- Add a new file with the status entry and a `**NEXT:**` line (template in `docs/internal/status/README.md`). Never prepend to `nextsteps.md`: its log is frozen, and a shared line there made every pair of open MRs conflict
+2. **`docs/internal/status/YYYY-MM-DD-<branch-slug>.md`** -- Add a new file with the status entry and a `**NEXT:**` line (template in `docs/internal/status/README.md`). Never add entries to `nextsteps.md`: it is only a pointer now, and a shared line there made every pair of open MRs conflict
 3. **`openspec/changes/*/tasks.md`** -- Check off completed tasks (`- [ ]` -> `- [x]`)
 4. **`benchmarks/results/`** -- Commit benchmark JSON reports for historical tracking (the `benchmarks` skill has the run and compare procedure)
 
