@@ -20,6 +20,16 @@ All notable changes to SQE are documented in this file.
     still bypass the prefixes; set `allow_inline_credentials = false` when
     they separate workspaces.
 
+### Changed
+
+- Audit export: `max_spool_bytes` is a hard cap on the OTLP export spool (#816)
+
+    It only warned, so a long collector outage grew the spool until the disk
+    filled. Past the cap the shipper now cuts records it has already shipped,
+    then the oldest unshipped ones down to half the cap, and counts them in
+    `sqe_audit_export_spool_dropped_records_total`. The local audit log keeps
+    every record; queries are never blocked.
+
 ## [0.50.1] — 2026-10-10
 
 ## [0.50.0] — 2026-10-09
