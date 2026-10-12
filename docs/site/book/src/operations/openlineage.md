@@ -99,7 +99,7 @@ spool_path = "/var/spool/sqe-ol"
 
 **No events appear in Marquez or DataHub.** Check `enabled = true` and that at least one sink is configured. Validation is enforced at startup; the server refuses to start with a misconfigured block.
 
-**Spool directory grows.** The collector is unreachable. SQE buffers up to `spool_max_bytes` then drops newest events. Inspect `/var/spool/sqe-ol/spool.jsonl*`. Restore the collector and the replay loop drains within `replay_interval_secs`.
+**Spool directory grows.** The collector is unreachable. SQE buffers up to `spool_max_bytes`. When it is full, the oldest spooled events are deleted to make room. A long outage therefore keeps the most recent lineage, and each dropped event counts in `sqe_lineage_spool_dropped_events_total`. A warning is logged once each time the spool reaches its cap. Inspect `/var/spool/sqe-ol/spool.jsonl*`. Restore the collector and the replay loop drains the spool oldest first within `replay_interval_secs`. Queries are never held up by an outage.
 
 **`sqe_lineage_dropped_events_total` counter increments.** The bounded mpsc channel was full. Increase `channel_capacity` or investigate why the emitter is slow (collector too slow? HTTP timeouts?).
 

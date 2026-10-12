@@ -570,6 +570,56 @@ mod tests {
         assert_eq!(disk_cursor2.last(), 5, "cursor advanced after ack");
     }
 
+    /// The spool is the local audit log, so a long outage past
+    /// `max_spool_bytes` only warns: every record stays on disk and is shipped,
+    /// in order, once the collector returns (#816).
+    #[tokio::test]
+    async fn outage_past_max_spool_bytes_keeps_every_record_and_replays() {
+        let dir = tempdir().unwrap();
+        let spool = dir.path().join("audit.jsonl");
+        let cursor_path = dir.path().join("audit.cursor");
+        let seqs: Vec<u64> = (1..=20).collect();
+        write_spool(&spool, &seqs);
+        let spool_len = std::fs::metadata(&spool).unwrap().len();
+
+        let stub = StubExporter::new(true);
+        let mut shipper = OtlpLogShipper::new(
+            spool.clone(),
+            cursor_path.clone(),
+            stub.clone(),
+            3,
+            1024, // far below the backlog
+            StartAt::Beginning,
+            500,
+        );
+
+        for _ in 0..5 {
+            assert!(shipper.ship_once().await.failed);
+        }
+        assert_eq!(SeqCursor::load(cursor_path.clone(), true).last(), 0);
+        assert_eq!(
+            std::fs::metadata(&spool).unwrap().len(),
+            spool_len,
+            "no audit record dropped while the collector is down"
+        );
+
+        stub.fail.store(false, Ordering::SeqCst);
+        for _ in 0..20 {
+            let outcome = shipper.ship_once().await;
+            assert!(!outcome.failed);
+            if outcome.shipped == 0 {
+                break;
+            }
+        }
+
+        assert_eq!(
+            *stub.shipped.lock().unwrap(),
+            seqs,
+            "replayed in order, no loss"
+        );
+        assert_eq!(SeqCursor::load(cursor_path, true).last(), 20);
+    }
+
     // ---------------------------------------------------------------------------
     // TEST: restart resumes from cursor; no gap, no duplicate
     // ---------------------------------------------------------------------------

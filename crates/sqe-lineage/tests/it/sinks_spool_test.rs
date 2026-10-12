@@ -95,7 +95,7 @@ async fn spool_buffers_on_http_failure() {
 }
 
 #[tokio::test]
-async fn spool_drops_newest_when_cap_reached() {
+async fn spool_drops_an_event_larger_than_the_cap() {
     let server = MockServer::start().await;
     Mock::given(matchers::method("POST"))
         .respond_with(ResponseTemplate::new(500))
@@ -111,7 +111,9 @@ async fn spool_drops_newest_when_cap_reached() {
     })
     .unwrap();
 
-    // Tiny cap — first event fits, second is dropped
+    // A cap smaller than one event (~250 bytes serialised). Dropping the
+    // oldest cannot make room, so each event is dropped and counted.
+    // `sink_outage_chaos_test` covers the drop-oldest policy itself.
     let spool = SpoolSink::wrap(
         Arc::new(http),
         SpoolConfig {
@@ -125,11 +127,9 @@ async fn spool_drops_newest_when_cap_reached() {
     spool.send(&dummy_event()).await.unwrap();
 
     let live = dir.path().join("spool.jsonl");
-    let line_count = std::fs::read_to_string(&live).unwrap().lines().count();
-
-    // First event fit (~150 bytes serialised); second exceeded cap
-    assert_eq!(line_count, 1, "second event dropped due to cap");
-    assert_eq!(spool.dropped_count(), 1);
+    let spooled = std::fs::read_to_string(&live).unwrap_or_default();
+    assert!(spooled.is_empty(), "nothing over the cap is written");
+    assert_eq!(spool.dropped_count(), 2);
 }
 
 #[tokio::test]
