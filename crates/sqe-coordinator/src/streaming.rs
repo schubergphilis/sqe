@@ -1876,7 +1876,11 @@ mod tests {
     /// idle timer every time and, before the absolute deadline existed,
     /// never timed out. With `with_query_deadline(500ms)` it must error at
     /// about 500ms even though a batch arrives every 100ms.
-    #[tokio::test]
+    ///
+    /// Paused clock, like the idle-extension tests: on the wall clock a
+    /// starved runner woke the batch timer and the deadline together and
+    /// delivered no batch at all (!1407 test job).
+    #[tokio::test(start_paused = true)]
     async fn query_deadline_fires_while_batches_still_flow() {
         let (plan, schema, runtime) = trivial_plan().await;
         let tracker = test_tracker();
@@ -1904,7 +1908,7 @@ mod tests {
             .with_idle_timeout(Duration::from_secs(60))
             .with_query_deadline(Duration::from_millis(500));
 
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         let mut batches = 0usize;
         let err = loop {
             match tokio::time::timeout(Duration::from_secs(5), stream.next())
