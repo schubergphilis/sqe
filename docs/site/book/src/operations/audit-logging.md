@@ -349,7 +349,7 @@ otlp_endpoint    = ""             # e.g. "http://otel-collector:4317"; empty -> 
 spool_path       = ""             # empty -> <audit_log_path>.ocsf.spool.jsonl
 batch_max        = 512            # maximum records per OTLP export batch
 flush_interval_ms = 2000          # shipper poll interval in milliseconds
-max_spool_bytes  = 1073741824     # 1 GiB; spool size above this emits a WARN
+max_spool_bytes  = 1073741824     # 1 GiB; hard cap, the oldest unshipped records go past it
 start_at         = "now"          # "now" (default) | "beginning"
 ```
 
@@ -400,14 +400,27 @@ Lower values reduce latency to the SIEM at the cost of more frequent OTLP calls.
 
 #### `max_spool_bytes`
 
-Spool size threshold in bytes. When the spool file exceeds this value the exporter
-emits a `WARN` log. The exporter continues and queries are never blocked. Default:
-1 073 741 824 (1 GiB).
+Hard cap on the spool file in bytes. Default: 1 073 741 824 (1 GiB).
 
 The shipper empties the spool once every record in it has shipped and it has reached
 16 MiB, so a healthy exporter keeps it small. A spool only grows past that while the
-collector is unreachable. SQE never drops unshipped events to save space; the
-`SqeAuditExportStalled` alert is the signal to act.
+collector is unreachable. When it passes `max_spool_bytes` the shipper first cuts the
+records it has already shipped. If that is not enough, it drops the oldest unshipped
+records until the spool is at half the cap, logs a `WARN` and counts them in
+`sqe_audit_export_spool_dropped_records_total`. An outage therefore cannot fill the
+disk, and queries are never blocked or refused because of it.
+
+The spool is only the delivery buffer for the SIEM. The local audit log
+(`audit_log_path`) and its hash chain keep every record, so dropped records can be
+recovered from it, and the SIEM sees the gap as missing `audit.seq` values. Size the
+cap for the outage you want to ride out: at 1 KB per record, 1 GiB holds about a
+million statements. The `SqeAuditExportStalled` alert is the signal to act before the
+cap is reached.
+
+The cap does not cover the local audit log itself, which SQE only appends to. Rotate
+it with your platform's log rotation and keep its disk monitored. A write that fails
+there (for example on a full disk) is counted in
+`sqe_audit_events_dropped_total{reason="io"}` and does not refuse queries.
 
 #### `start_at`
 
@@ -424,12 +437,13 @@ delivery: a restart resumes exactly where the last successful export acked.
 
 ### Behavior and durability
 
-The exporter provides at-least-once delivery. Records are never removed from the spool.
-The background shipper tails the spool from the byte offset recorded in the cursor file,
+The exporter provides at-least-once delivery for every record that stays in the spool.
+Records leave the spool once shipped, or when an outage pushes it past
+`max_spool_bytes` (see above). The background shipper tails the spool from the byte offset recorded in the cursor file,
 batches up to `batch_max` records, sends them to the collector, and advances the cursor
 only after the collector returns a successful ack.
 
-A collector outage grows the spool. Queries continue without delay. When the collector
+A collector outage grows the spool up to `max_spool_bytes`. Queries continue without delay. When the collector
 recovers, the shipper replays from the last cursor position.
 
 The exporter uses a dedicated OTLP log pipeline. It is not connected to the
@@ -468,6 +482,7 @@ SIEM queries that filter on any of these attributes avoid parsing the full body.
 | `sqe_audit_export_batch_failures_total` | Counter | OTLP export calls that returned an error |
 | `sqe_audit_export_spool_lag_bytes` | Gauge | Bytes between the cursor offset and the current end of spool |
 | `sqe_audit_export_cursor_seq` | Gauge | Last sequence number successfully acked |
+| `sqe_audit_export_spool_dropped_records_total` | Counter | Unshipped records dropped to hold the spool under `max_spool_bytes` |
 | `sqe_audit_export_last_success_timestamp` | Gauge | Unix timestamp of the last successful export |
 
 `sqe_audit_export_spool_lag_bytes = 0` means the shipper is caught up. A rising value

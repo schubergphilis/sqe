@@ -2186,6 +2186,9 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
                         last_success_timestamp: Some(
                             metrics.audit_export_last_success_timestamp.clone(),
                         ),
+                        spool_dropped_records_total: Some(
+                            metrics.audit_export_spool_dropped_records_total.clone(),
+                        ),
                     };
                     let shipper = sqe_metrics::audit::export::OtlpLogShipper::new(
                         std::path::PathBuf::from(spool_path),

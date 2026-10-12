@@ -292,6 +292,7 @@ pub struct MetricsRegistry {
     pub audit_export_spool_lag_bytes: Gauge,
     pub audit_export_cursor_seq: Gauge,
     pub audit_export_last_success_timestamp: Gauge,
+    pub audit_export_spool_dropped_records_total: IntCounter,
 
     // Dashboard auth metrics
     /// Anonymous dashboard denial counter -- incremented instead of writing an
@@ -895,6 +896,12 @@ impl MetricsRegistry {
             "Unix timestamp (seconds) of the last successful audit export batch",
         )?;
 
+        let audit_export_spool_dropped_records_total = register_int_counter(
+            &registry,
+            "sqe_audit_export_spool_dropped_records_total",
+            "Unshipped audit records dropped from the export spool to hold it under max_spool_bytes (the native audit log keeps them)",
+        )?;
+
         let dashboard_auth_anonymous_denied_total = register_int_counter(
             &registry,
             "sqe_dashboard_auth_anonymous_denied_total",
@@ -1076,6 +1083,7 @@ impl MetricsRegistry {
             audit_export_spool_lag_bytes,
             audit_export_cursor_seq,
             audit_export_last_success_timestamp,
+            audit_export_spool_dropped_records_total,
             dashboard_auth_anonymous_denied_total,
             dashboard_auth_success_total,
             table_small_files,
