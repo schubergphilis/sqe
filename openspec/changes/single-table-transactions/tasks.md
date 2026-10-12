@@ -38,6 +38,6 @@
 
 ## 6. Audit, docs, tests
 
-- [ ] 6.1 OCSF events for begin / commit / rollback; lineage at `COMMIT`
+- [x] 6.1 OCSF events for begin / commit / rollback; lineage at `COMMIT`. `AuditKind::Transaction` (OCSF 6005) from `TxnRegistry`: begin at the first statement, one end record per outcome via `record_end`, with reason, duration and the published `main` snapshot ids. Lineage: a write's COMPLETE is held until the transaction ends (FAIL `transaction not committed (<reason>)` unless committed); BEGIN / COMMIT / ROLLBACK emit no runs; INSERT's version facet is the branch head. Limits: actor is the username only (no session id); a transaction that runs no statement writes no record
 - [~] 6.2 Book: transactions section in `sql-reference/dml.md` (#824); a dedicated page is still open. Scope: transactions page (branch model, serializable abort, visibility of in-flight branches, SQE vs Trino connector difference)
 - [~] 6.3 sqlite-rig tests in `sqe-write`: commit, read-your-writes, concurrent-commit abort, rollback, empty table, second-table refusal. Integration tests under `make test-integration`: multi-table commit and conflict (#823), client-held RPC transaction with DDL autocommit, rollback and commit. Still open: an automated ADBC `autocommit=False` test, Trino JDBC `setAutoCommit(false)`

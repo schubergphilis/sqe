@@ -1737,6 +1737,7 @@ fn build_maintenance_audit_event(
         client_ip: None,
         trace_id: None,
         query_id: None,
+        transaction: None,
         integrity: sqe_metrics::audit::Integrity::default(),
     }
 }
@@ -1789,6 +1790,7 @@ fn build_active_audit_event(
         client_ip: None,
         trace_id: None,
         query_id: None,
+        transaction: None,
         integrity: sqe_metrics::audit::Integrity::default(),
     }
 }
@@ -1849,6 +1851,7 @@ fn build_partial_audit_event(
         client_ip: None,
         trace_id: None,
         query_id: None,
+        transaction: None,
         integrity: sqe_metrics::audit::Integrity::default(),
     }
 }
@@ -1903,6 +1906,7 @@ fn build_failed_audit_event(
         client_ip: None,
         trace_id: None,
         query_id: None,
+        transaction: None,
         integrity: sqe_metrics::audit::Integrity::default(),
     }
 }
@@ -1952,6 +1956,7 @@ fn build_skipped_audit_event(
         client_ip: None,
         trace_id: None,
         query_id: None,
+        transaction: None,
         integrity: sqe_metrics::audit::Integrity::default(),
     }
 }
@@ -2012,6 +2017,7 @@ fn build_lease_audit_event(
         client_ip: None,
         trace_id: None,
         query_id: None,
+        transaction: None,
         integrity: sqe_metrics::audit::Integrity::default(),
     }
 }

@@ -199,6 +199,7 @@ impl From<AuditEntry> for AuditEvent {
             client_ip: e.client_ip,
             trace_id: None,
             query_id: None,
+            transaction: None,
             integrity: Integrity::default(),
         }
     }
@@ -459,6 +460,7 @@ fn audit_resume_event(reason: &str) -> AuditEvent {
         client_ip: None,
         trace_id: None,
         query_id: None,
+        transaction: None,
         integrity: Integrity::default(),
     }
 }

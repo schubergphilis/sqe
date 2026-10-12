@@ -16,13 +16,15 @@ Use these events to drive a lineage UI (Marquez, DataHub) or to feed a metadata 
 
 Each query produces two events: a START at submit time and a COMPLETE on success or FAIL on error.
 
+Inside a transaction, a write's START goes out when the statement runs, and its COMPLETE waits for the transaction to end. `COMMIT` releases every held COMPLETE. A rollback, a conflict, an ended session, a timeout or a shutdown turns each one into a FAIL with the message `transaction not committed (<reason>)`, where the reason is the outcome label (`rolled_back`, `conflict`, `session_ended`, `idle_timeout`, `lifetime`, `shutdown`). A lineage graph therefore never shows a write that `main` never saw. Each event keeps its own inputs and column lineage. `eventTime` on the held COMPLETE is the moment the transaction ended. `BEGIN`, `COMMIT`, `ROLLBACK` and `SET TRANSACTION` emit no runs of their own.
+
 ### Dataset names and facets
 
 - Every input and output dataset has namespace `sqe://<catalog>` and name `<schema>.<table>`, where `<catalog>` is the Iceberg catalog the table was read from or written to. A REST catalog is named after its warehouse. An unqualified or two-part table name resolves in the statement's session catalog and schema.
 - Each dataset carries a `symlinks` facet with a `TABLE` identifier: namespace is the catalog URI and name is `<catalog>.<schema>.<table>`. `dataSource` keeps the catalog URI.
 - The output fields of INSERT, MERGE, UPDATE and DELETE are named after the target table's columns, by position.
 - `lifecycleStateChange` is `CREATE` for CREATE TABLE and CTAS, `OVERWRITE` for CREATE OR REPLACE and INSERT OVERWRITE, `TRUNCATE` for TRUNCATE, and `DROP` for DROP TABLE.
-- An INSERT append or CTAS carries the committed Iceberg snapshot id as the `version` facet (`datasetVersion`). Other writes do not carry one yet.
+- An INSERT append or CTAS carries the committed Iceberg snapshot id as the `version` facet (`datasetVersion`). Other writes do not carry one yet. Inside a transaction the id is the head of the transaction's branch. `COMMIT` fast-forwards `main` to that head when it publishes a table without replaying the writes.
 - Every event carries the run facet `sqe_query` with `queryId`, equal to `runId`. For a statement over the Trino HTTP protocol, that is the query id the client polls.
 
 ## Configuration

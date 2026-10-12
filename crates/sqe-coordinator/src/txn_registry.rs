@@ -26,6 +26,9 @@ use std::time::{Duration, Instant};
 
 use sqe_catalog::txn::{TxnScope, MAX_LIFETIME};
 use sqe_core::{SqeError, SqeErrorCode};
+use sqe_metrics::audit::{
+    Actor, AuditEvent, AuditKind, AuditLogger, Integrity, PublishedSnapshot, TransactionAudit,
+};
 use sqe_metrics::MetricsRegistry;
 
 /// An open transaction nobody used for this long is rolled back.
@@ -52,7 +55,27 @@ struct State {
 /// A transaction taken out of the registry by COMMIT or ROLLBACK.
 pub(crate) struct Open {
     pub(crate) scope: Arc<TxnScope>,
+    owner: String,
     opened: Instant,
+    /// Run once when the transaction ends; see [`TxnRegistry::at_end`].
+    at_end: Mutex<Vec<AtEnd>>,
+}
+
+/// Work held until a transaction ends, called with `None` when COMMIT
+/// published its writes and with the end reason otherwise. Erased so the
+/// registry, which `QueryHandler` holds, carries no plan types (the lineage
+/// contexts it holds own a `LogicalPlan`; see `query_handler::LineageSink`).
+pub(crate) type AtEnd = Box<dyn FnOnce(Option<&'static str>) + Send>;
+
+impl Open {
+    fn new(scope: Arc<TxnScope>, owner: &str) -> Self {
+        Self {
+            scope,
+            owner: owner.to_string(),
+            opened: Instant::now(),
+            at_end: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 /// What COMMIT or ROLLBACK finds for a transaction id.
@@ -92,12 +115,21 @@ impl Outcome {
             Self::Shutdown => "shutdown",
         }
     }
+
+    /// The audit `action`: what the transaction's end did to its writes.
+    fn action(self) -> &'static str {
+        match self {
+            Self::Committed | Self::Conflict => "commit",
+            _ => "rollback",
+        }
+    }
 }
 
 #[derive(Default)]
 pub(crate) struct TxnRegistry {
     state: Mutex<State>,
     metrics: Option<Arc<MetricsRegistry>>,
+    audit: Option<Arc<AuditLogger>>,
 }
 
 impl TxnRegistry {
@@ -105,7 +137,16 @@ impl TxnRegistry {
         Self {
             state: Mutex::default(),
             metrics,
+            audit: None,
         }
+    }
+
+    /// Record every transaction's start and end as an
+    /// [`AuditKind::Transaction`] event, the coordinator's own rollbacks
+    /// (idle, lifetime, session end, shutdown) included.
+    pub(crate) fn with_audit(mut self, audit: Arc<AuditLogger>) -> Self {
+        self.audit = Some(audit);
+        self
     }
 
     /// The scope for transaction `id` of `owner`, created on first use.
@@ -119,6 +160,7 @@ impl TxnRegistry {
         }
         let mut state = self.lock();
         let expired = state.sweep(Instant::now());
+        let mut began = false;
         let result = if state.ended.contains_key(id) {
             Err(ended(id))
         } else {
@@ -134,19 +176,20 @@ impl TxnRegistry {
                         id.to_string(),
                         Entry {
                             owner: owner.to_string(),
-                            open: Open {
-                                scope: Arc::clone(&scope),
-                                opened: Instant::now(),
-                            },
+                            open: Open::new(Arc::clone(&scope), owner),
                             last_used: Instant::now(),
                         },
                     );
+                    began = true;
                     Ok(scope)
                 }
             }
         };
         self.set_open_gauge(&state);
         drop(state);
+        if began {
+            self.audit_event(id, owner, "begin", None);
+        }
         self.discard_all(expired);
         result
     }
@@ -183,9 +226,27 @@ impl TxnRegistry {
         result
     }
 
+    /// Hold `f` until transaction `id` ends. Hands it back when `id` is not
+    /// open here, for the caller to run now.
+    pub(crate) fn at_end(&self, id: &str, f: AtEnd) -> Result<(), AtEnd> {
+        let state = self.lock();
+        match state.open.get(id) {
+            Some(entry) => {
+                entry
+                    .open
+                    .at_end
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(f);
+                Ok(())
+            }
+            None => Err(f),
+        }
+    }
+
     /// Record how a transaction [`Self::end`] returned as open ended.
     pub(crate) fn finish(&self, open: &Open, outcome: Outcome) {
-        self.record_end(open.opened, outcome);
+        self.record_end(open, outcome);
     }
 
     /// Put back a transaction whose COMMIT failed without ending it.
@@ -246,7 +307,7 @@ impl TxnRegistry {
         );
         let discards =
             open.into_iter().map(|open| {
-                self.record_end(open.opened, Outcome::Shutdown);
+                self.record_end(&open, Outcome::Shutdown);
                 let metrics = self.metrics.clone();
                 async move {
                     count_drop_failures(&metrics, sqe_catalog::txn::discard(&open.scope).await)
@@ -271,14 +332,91 @@ impl TxnRegistry {
         not_found(id)
     }
 
-    fn record_end(&self, opened: Instant, outcome: Outcome) {
+    /// Every end of a transaction comes through here: COMMIT and ROLLBACK
+    /// by way of [`Self::finish`], the coordinator's own rollbacks directly.
+    fn record_end(&self, open: &Open, outcome: Outcome) {
+        let elapsed = open.opened.elapsed();
         if let Some(m) = &self.metrics {
             m.transactions_ended_total
                 .with_label_values(&[outcome.label()])
                 .inc();
-            m.transaction_duration_seconds
-                .observe(opened.elapsed().as_secs_f64());
+            m.transaction_duration_seconds.observe(elapsed.as_secs_f64());
         }
+        let published = open
+            .scope
+            .published()
+            .into_iter()
+            .map(|(ident, snapshot_id)| PublishedSnapshot {
+                table: ident.to_string(),
+                snapshot_id,
+            })
+            .collect();
+        self.audit_event(
+            open.scope.id(),
+            &open.owner,
+            outcome.action(),
+            Some(TransactionAudit {
+                reason: Some(outcome.label().to_string()),
+                duration_ms: Some(elapsed.as_millis() as u64),
+                published,
+                ..TransactionAudit::default()
+            }),
+        );
+        let held = std::mem::take(&mut *open.at_end.lock().unwrap_or_else(|e| e.into_inner()));
+        let unpublished = (outcome != Outcome::Committed).then(|| outcome.label());
+        for f in held {
+            f(unpublished);
+        }
+    }
+
+    /// One [`AuditKind::Transaction`] event. `end` carries what
+    /// [`Self::record_end`] knows about how it ended; `None` is a start.
+    /// The actor is the owner's user name only: the registry never sees
+    /// the session, and the coordinator's own rollbacks have none. The
+    /// statement record of the `COMMIT` or `ROLLBACK` carries the session.
+    fn audit_event(&self, id: &str, owner: &str, action: &str, end: Option<TransactionAudit>) {
+        let Some(audit) = &self.audit else {
+            return;
+        };
+        let conflict = end
+            .as_ref()
+            .and_then(|e| e.reason.as_deref())
+            .is_some_and(|r| r == Outcome::Conflict.label());
+        let outcome = if conflict {
+            let code = SqeErrorCode::TransactionConflict;
+            sqe_metrics::audit::Outcome::Failure {
+                error_type: Some(code.trino_error_type().to_string()),
+                error_code: Some(code.name().to_string()),
+                message: None,
+            }
+        } else {
+            sqe_metrics::audit::Outcome::Success
+        };
+        let transaction = TransactionAudit {
+            id: id.to_string(),
+            action: action.to_string(),
+            ..end.unwrap_or_default()
+        };
+        audit.log_event(AuditEvent {
+            time: chrono::Utc::now(),
+            kind: AuditKind::Transaction,
+            actor: Actor {
+                username: owner.to_string(),
+                ..Actor::default()
+            },
+            outcome,
+            resources: Vec::new(),
+            policy: None,
+            timing: None,
+            stats: None,
+            query: None,
+            session_id: None,
+            client_ip: None,
+            trace_id: sqe_metrics::propagation::current_trace_id(),
+            query_id: None,
+            transaction: Some(transaction),
+            integrity: Integrity::default(),
+        });
     }
 
     fn set_open_gauge(&self, state: &State) {
@@ -291,7 +429,7 @@ impl TxnRegistry {
     /// spawned task has no transaction task-local.
     fn discard_all(&self, expired: Vec<(Open, Outcome)>) {
         for (open, outcome) in expired {
-            self.record_end(open.opened, outcome);
+            self.record_end(&open, outcome);
             match outcome {
                 Outcome::IdleTimeout => {
                     tracing::info!(transaction = %open.scope.id(), "rolling back idle transaction")
@@ -448,6 +586,114 @@ mod tests {
     }
 
     #[test]
+    fn every_start_and_end_is_audited() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+        let audit = Arc::new(
+            AuditLogger::with_config(
+                path.to_str().unwrap(),
+                sqe_metrics::audit::AuditFormat::Native,
+            )
+            .expect("logger"),
+        );
+        let reg = TxnRegistry::new(None).with_audit(Arc::clone(&audit));
+        let committed = local_id();
+        reg.scope(&committed, "alice").unwrap();
+        // The second statement joins; it starts nothing.
+        reg.scope(&committed, "alice").unwrap();
+        let Ended::Open(open) = reg.end(&committed, "alice").unwrap() else {
+            panic!("expected an open transaction");
+        };
+        reg.finish(&open, Outcome::Committed);
+        let lost = local_id();
+        reg.scope(&lost, "bob").unwrap();
+        let Ended::Open(open) = reg.end(&lost, "bob").unwrap() else {
+            panic!("expected an open transaction");
+        };
+        reg.finish(&open, Outcome::Conflict);
+        // The coordinator's own rollback is recorded too.
+        let abandoned = local_id();
+        reg.scope(&abandoned, "carol").unwrap();
+        reg.abandon(&abandoned, "carol");
+
+        audit.flush();
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("valid JSON line"))
+            .filter(|v: &serde_json::Value| v["kind"] == "transaction")
+            .collect();
+        let summary: Vec<(String, String, String, Option<String>)> = events
+            .iter()
+            .map(|v| {
+                let t = &v["transaction"];
+                (
+                    t["id"].as_str().unwrap().to_string(),
+                    v["actor"]["username"].as_str().unwrap().to_string(),
+                    t["action"].as_str().unwrap().to_string(),
+                    t["reason"].as_str().map(str::to_string),
+                )
+            })
+            .collect();
+        let row = |id: &str, user: &str, action: &str, reason: Option<&str>| {
+            (
+                id.to_string(),
+                user.to_string(),
+                action.to_string(),
+                reason.map(str::to_string),
+            )
+        };
+        assert_eq!(
+            summary,
+            vec![
+                row(&committed, "alice", "begin", None),
+                row(&committed, "alice", "commit", Some("committed")),
+                row(&lost, "bob", "begin", None),
+                row(&lost, "bob", "commit", Some("conflict")),
+                row(&abandoned, "carol", "begin", None),
+                row(&abandoned, "carol", "rollback", Some("session_ended")),
+            ]
+        );
+        assert_eq!(events[1]["status"], "success");
+        assert_eq!(events[3]["status"], "failure");
+        assert_eq!(events[3]["error_code"], "TRANSACTION_CONFLICT");
+        assert!(events[1]["transaction"]["duration_ms"].is_u64());
+        assert!(events[0]["transaction"].get("duration_ms").is_none());
+    }
+
+    #[test]
+    fn held_work_runs_once_with_the_outcome() {
+        let reg = TxnRegistry::default();
+        let seen = Arc::new(Mutex::new(Vec::<Option<&'static str>>::new()));
+        let hold = |id: &str| {
+            let seen = Arc::clone(&seen);
+            reg.at_end(id, Box::new(move |r| seen.lock().unwrap().push(r)))
+        };
+
+        // No open transaction: the caller gets its work back.
+        assert!(hold(&local_id()).is_err());
+
+        let committed = local_id();
+        reg.scope(&committed, "alice").unwrap();
+        assert!(hold(&committed).is_ok());
+        assert!(hold(&committed).is_ok());
+        let Ended::Open(open) = reg.end(&committed, "alice").unwrap() else {
+            panic!("expected an open transaction");
+        };
+        reg.finish(&open, Outcome::Committed);
+
+        let abandoned = local_id();
+        reg.scope(&abandoned, "bob").unwrap();
+        assert!(hold(&abandoned).is_ok());
+        reg.abandon(&abandoned, "bob");
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![None, None, Some(Outcome::SessionEnded.label())]
+        );
+    }
+
+    #[test]
     fn ending_an_unused_transaction_has_nothing_to_publish() {
         let reg = TxnRegistry::default();
         assert!(matches!(
@@ -541,10 +787,7 @@ mod tests {
             id.clone(),
             Entry {
                 owner: "alice".into(),
-                open: Open {
-                    scope: TxnScope::new(id.as_str()),
-                    opened: Instant::now(),
-                },
+                open: Open::new(TxnScope::new(id.as_str()), "alice"),
                 last_used: Instant::now(),
             },
         );
@@ -568,8 +811,8 @@ mod tests {
             Entry {
                 owner: "alice".into(),
                 open: Open {
-                    scope: TxnScope::new(id.as_str()),
                     opened,
+                    ..Open::new(TxnScope::new(id.as_str()), "alice")
                 },
                 // Used a moment ago: never idle.
                 last_used: at_lifetime - Duration::from_secs(1),
