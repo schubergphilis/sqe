@@ -8,6 +8,8 @@ flight_port = 50052
 coordinator_url = "http://coordinator:50051"
 heartbeat_interval_secs = 5
 memory_limit = "512MB"
+# Matches allow_unauthenticated_workers on the coordinator (private network).
+allow_unauthenticated = true
 
 [metrics]
 prometheus_port = 9091
@@ -27,3 +29,8 @@ s3_access_key = "s3admin"
 s3_secret_key = "s3admin"
 s3_region = "us-east-1"
 s3_path_style = true
+
+# Test rig only: coordinator and workers talk over the private compose
+# network in plaintext. Production configs must set [coordinator.tls].
+[security]
+allow_insecure_transport = true
