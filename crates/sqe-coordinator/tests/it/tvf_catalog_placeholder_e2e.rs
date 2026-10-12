@@ -35,9 +35,6 @@ fn config() -> SqeConfig {
     cfg.storage.tvf.allowed_object_store_prefixes =
         vec![format!("s3://{BUCKET}/ingest/ws/{{catalog}}/")];
     cfg.storage.tvf.allow_inline_credentials = false;
-    // `read_parquet`'s own S3 builder does not derive this from the
-    // `http://` endpoint, unlike the other file readers.
-    cfg.storage.s3_allow_http = true;
     cfg
 }
 
