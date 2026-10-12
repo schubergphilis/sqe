@@ -263,12 +263,11 @@ async fn insert_then_select_round_trips_v3_table() {
 // shows up in `information_schema.columns` after the commit. V3 is
 // required because DEFAULT is a V3 spec feature.
 //
-// We do NOT assert that scanning the pre-existing snapshot retroactively
-// fills in the default. iceberg-rust's scan layer reads the snapshot's
-// declared schema_id rather than `metadata.current_schema()`, so
-// `initial_default` for backfilled rows is not surfaced yet (tracked
-// upstream). That gap is read-side; it does not invalidate the V3
-// schema-evolution write path.
+// A row inserted after the ALTER that omits the column gets its
+// write_default (#828). A row written BEFORE the ALTER should read the
+// initial_default but reads NULL: SQE's scan NULL-fills fields missing from
+// older files without consulting initial_default (#830), so that half is
+// not asserted yet.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:polaris"]
@@ -322,6 +321,99 @@ async fn alter_add_column_with_default_on_v3_table() {
         .expect("information_schema.columns lookup");
     let total: i64 = cols.iter().map(|b| b.num_rows() as i64).sum();
     assert_eq!(total, 1, "ALTER ADD COLUMN did not commit the new column");
+
+    // #830: the pre-ALTER row reads the initial_default, before any write
+    // since the ALTER (the scanned snapshot's schema has no `region` yet).
+    let q = |sql: &str| format!("SELECT id, region FROM {fq}{sql} ORDER BY id");
+    assert_eq!(rendered_rows(&handler, &session, &q("")).await, vec!["1|eu"]);
+
+    // #828: a new row that omits the column gets the write_default.
+    handler
+        .execute(
+            &session,
+            &format!("INSERT INTO {fq} (id) VALUES (2)"),
+            None,
+        )
+        .await
+        .expect("INSERT omitting the defaulted column");
+    assert_eq!(rendered_rows(&handler, &session, &q("")).await, vec!["1|eu", "2|eu"]);
+    // The default is a value, not a display: predicates see it.
+    assert_eq!(
+        rendered_rows(&handler, &session, &q(" WHERE region = 'eu'")).await,
+        vec!["1|eu", "2|eu"]
+    );
+    assert!(rendered_rows(&handler, &session, &q(" WHERE region IS NULL")).await.is_empty());
+
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+}
+
+/// Every row of `sql` as `col|col|...` text, NULL rendered as `NULL`.
+async fn rendered_rows(
+    handler: &sqe_coordinator::QueryHandler,
+    session: &sqe_core::Session,
+    sql: &str,
+) -> Vec<String> {
+    let batches = handler.execute(session, sql, None).await.expect(sql);
+    let mut rows = Vec::new();
+    for batch in &batches {
+        for r in 0..batch.num_rows() {
+            let cells: Vec<String> = batch
+                .columns()
+                .iter()
+                .map(|c| {
+                    if c.is_null(r) {
+                        "NULL".to_string()
+                    } else {
+                        arrow::util::display::array_value_to_string(c, r).expect("render")
+                    }
+                })
+                .collect();
+            rows.push(cells.join("|"));
+        }
+    }
+    rows
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Cell: sqe:column-default-values:v3
+//
+// A column DEFAULT declared at CREATE TABLE is written by an INSERT and a
+// MERGE INSERT that omit the column (#828). An explicit NULL stays NULL.
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn create_table_default_applies_on_insert_and_merge() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let fq = "default.v3_create_default";
+
+    reset_table(
+        &handler,
+        &session,
+        fq,
+        &format!(
+            "CREATE TABLE {fq} (id BIGINT, status STRING DEFAULT 'pending', \
+             n INT DEFAULT 7, note STRING)"
+        ),
+    )
+    .await;
+
+    for sql in [
+        format!("INSERT INTO {fq} (id) VALUES (1)"),
+        format!("INSERT INTO {fq} (id, status) VALUES (2, NULL)"),
+        format!(
+            "MERGE INTO {fq} AS t USING (SELECT 3 AS id, 'm' AS v) AS s ON t.id = s.id \
+             WHEN NOT MATCHED THEN INSERT (id, note) VALUES (s.id, s.v)"
+        ),
+    ] {
+        handler.execute(&session, &sql, None).await.expect(&sql);
+    }
+
+    assert_eq!(
+        rendered_rows(&handler, &session, &format!("SELECT * FROM {fq} ORDER BY id")).await,
+        vec!["1|pending|7|NULL", "2|NULL|7|NULL", "3|pending|7|m"]
+    );
 
     let _ = handler
         .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)

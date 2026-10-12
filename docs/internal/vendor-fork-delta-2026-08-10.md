@@ -131,6 +131,10 @@ Marker census: `SQE PATCH (sqe#369)` x26, `(sqe#scan-fetch-pipeline)` x16,
   plus `delete_file_loader.rs` / `caching_delete_file_loader.rs` threading a
   shared `bytes_read_counter` (comment credits apache #2349's idea; the full
   #2349 `read_with_metrics` API is NOT present).
+- **Row filter reads `initial_default` for missing columns (sqe#830)** —
+  `arrow/reader/predicate_visitor.rs` `PredicateColumn::Default`; marker
+  `SQE PATCH (sqe#830)`. Without it a pushed-down predicate sees NULL for a
+  column the file predates and drops rows that read the default.
 
 ### 3c. The six claimed apache cherry-picks: corrected status
 

@@ -9,6 +9,7 @@ use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
@@ -1768,6 +1769,13 @@ impl ExecutionPlan for IcebergScanExec {
                         .collect::<Option<Vec<i32>>>()
                 });
                 let projected_field_ids = Arc::new(projected_field_ids);
+                // What a file that predates a projected column reads for it
+                // (ALTER TABLE ... ADD COLUMN ... DEFAULT), computed once per
+                // scan rather than per file.
+                let projected_defaults: Arc<Vec<Option<ScalarValue>>> = Arc::new(match projection.as_ref() {
+                    Some(cols) => initial_default_scalars(&table, snapshot_id, cols, &schema)?,
+                    None => Vec::new(),
+                });
 
                 let concurrency = direct_read_concurrency.max(1);
                 let resolved_filters = Arc::new(resolved_filters);
@@ -1781,6 +1789,7 @@ impl ExecutionPlan for IcebergScanExec {
                         let projection = projection.clone();
                         let schema = schema.clone();
                         let projected_field_ids = Arc::clone(&projected_field_ids);
+                        let projected_defaults = Arc::clone(&projected_defaults);
                         let resolved_filters = Arc::clone(&resolved_filters);
                         let bytes_scanned = bytes_scanned.clone();
                         let rows_prefilter = rows_prefilter.clone();
@@ -1827,8 +1836,8 @@ impl ExecutionPlan for IcebergScanExec {
                             //
                             // `resolved[i] == None` means the file predates the
                             // column (ADD COLUMN) or stores it under an older name
-                            // that no field ID could match. Those become NULL in
-                            // `conform_batch_to_projection` below. Nothing is ever
+                            // that no field ID could match. Those read the column's
+                            // initial default, or NULL, in `conform_batch_to_projection`. Nothing is ever
                             // dropped: a projection of N columns yields N columns.
                             let mut resolved: Option<Vec<Option<usize>>> = None;
                             let (builder, filter_mask) = if let Some(ref cols) = projection {
@@ -1953,6 +1962,7 @@ impl ExecutionPlan for IcebergScanExec {
                                         &batch,
                                         per_column,
                                         &schema,
+                                        &projected_defaults,
                                     )?);
                                 } else {
                                     batches.push(batch);
@@ -2391,12 +2401,14 @@ fn resolve_projection_in_file(
 /// what made `SELECT id, ssn, nickname` return two columns after `ADD COLUMN`.
 ///
 /// `resolved` comes from [`resolve_projection_in_file`]: one entry per column of
-/// `target`, giving that column's index in the FILE. Columns the file lacks are
-/// filled with typed NULLs.
+/// `target`, giving that column's index in the FILE. A column the file lacks
+/// reads its `initial-default` from `defaults` (same positions as `target`;
+/// empty when no projected column has one), and typed NULLs otherwise.
 fn conform_batch_to_projection(
     decoded: &RecordBatch,
     resolved: &[Option<usize>],
     target: &SchemaRef,
+    defaults: &[Option<ScalarValue>],
 ) -> DFResult<RecordBatch> {
     if resolved.len() != target.fields().len() {
         return Err(DataFusionError::Internal(format!(
@@ -2430,6 +2442,13 @@ fn conform_batch_to_projection(
                 columns.push(Arc::clone(decoded.column(pos)));
             }
             None => {
+                // A file written before `ADD COLUMN ... DEFAULT` reads the
+                // column's initial-default, which is what lets a required
+                // column be added to a table that already has rows.
+                if let Some(Some(default)) = defaults.get(i) {
+                    columns.push(default.to_array_of_size(rows)?);
+                    continue;
+                }
                 // A required column absent from the file is unreadable, not
                 // nullable. Say so rather than emitting NULLs into a NOT NULL
                 // field and letting RecordBatch::try_new produce a shape error
@@ -2451,6 +2470,79 @@ fn conform_batch_to_projection(
         &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(rows)),
     )
     .map_err(|e| DataFusionError::Internal(format!("failed to conform scan batch: {e}")))
+}
+
+/// The value each projected column reads in a data file that predates it: the
+/// column's Iceberg `initial-default`, typed as `target` declares the column.
+///
+/// Looked up by name in the scanned snapshot's schema first, then in the
+/// current one. A plain scan binds the snapshot it reads, and a column added by
+/// `ALTER TABLE ... ADD COLUMN` with no write since is only in the current
+/// schema, yet the files of that snapshot must still read its default.
+///
+/// Returns an empty vector when no projected column has a default, so the
+/// common case costs nothing per batch.
+fn initial_default_scalars(
+    table: &Table,
+    snapshot_id: Option<i64>,
+    cols: &[String],
+    target: &SchemaRef,
+) -> DFResult<Vec<Option<ScalarValue>>> {
+    let scanned = snapshot_schema(table, snapshot_id);
+    let current = table.metadata().current_schema();
+    let mut defaults = Vec::with_capacity(cols.len());
+    for (i, name) in cols.iter().enumerate() {
+        let field = scanned
+            .field_by_name(name)
+            .or_else(|| current.field_by_name(name));
+        let default = match (field, target.fields().get(i)) {
+            (Some(field), Some(arrow_field)) => match &field.initial_default {
+                Some(literal) => Some(literal_to_scalar(field, literal, arrow_field.data_type())?),
+                None => None,
+            },
+            _ => None,
+        };
+        defaults.push(default);
+    }
+    if defaults.iter().all(Option::is_none) {
+        defaults.clear();
+    }
+    Ok(defaults)
+}
+
+/// Convert an Iceberg default literal to a scalar of `data_type`.
+///
+/// Binary, fixed and uuid values are built from their bytes. Every other
+/// primitive goes through its Iceberg JSON form (the same text the table
+/// metadata stores) and an Arrow cast, which covers decimals, dates and
+/// timestamps without a per-type table here.
+fn literal_to_scalar(
+    field: &iceberg::spec::NestedField,
+    literal: &iceberg::spec::Literal,
+    data_type: &arrow::datatypes::DataType,
+) -> DFResult<ScalarValue> {
+    use iceberg::spec::{Literal, PrimitiveLiteral};
+    let unsupported = || {
+        DataFusionError::NotImplemented(format!(
+            "the initial default of column '{}' ({}) cannot be read",
+            field.name, field.field_type
+        ))
+    };
+    let scalar = match literal {
+        Literal::Primitive(PrimitiveLiteral::Binary(bytes)) => {
+            ScalarValue::Binary(Some(bytes.clone()))
+        }
+        Literal::Primitive(PrimitiveLiteral::UInt128(uuid)) => {
+            ScalarValue::FixedSizeBinary(16, Some(uuid.to_be_bytes().to_vec()))
+        }
+        _ => match literal.clone().try_into_json(&field.field_type) {
+            Ok(serde_json::Value::Bool(b)) => ScalarValue::Boolean(Some(b)),
+            Ok(serde_json::Value::Number(n)) => ScalarValue::Utf8(Some(n.to_string())),
+            Ok(serde_json::Value::String(s)) => ScalarValue::Utf8(Some(s)),
+            _ => return Err(unsupported()),
+        },
+    };
+    scalar.cast_to(data_type).map_err(|_| unsupported())
 }
 
 /// Flatten a stream of per-file batch results into a single lazy batch stream.
@@ -3672,7 +3764,7 @@ mod projection_evolution_tests {
             &Schema::new(vec![Field::new("id", DataType::Utf8, false)]),
             vec![vec!["7", "8"]],
         );
-        let out = conform_batch_to_projection(&decoded, &resolved, &target).expect("conform");
+        let out = conform_batch_to_projection(&decoded, &resolved, &target, &[]).expect("conform");
         assert_eq!(out.num_columns(), 1);
         assert_eq!(out.num_rows(), 2);
         assert_eq!(out.schema().field(0).name(), "classified");
@@ -3708,7 +3800,7 @@ mod projection_evolution_tests {
             ]),
             vec![vec!["1", "2"], vec!["a", "b"]],
         );
-        let out = conform_batch_to_projection(&decoded, &resolved, &target).expect("conform");
+        let out = conform_batch_to_projection(&decoded, &resolved, &target, &[]).expect("conform");
         assert_eq!(
             out.num_columns(),
             3,
@@ -3791,7 +3883,7 @@ mod projection_evolution_tests {
             ]),
             vec![vec!["1"], vec!["a"]],
         );
-        let out = conform_batch_to_projection(&decoded, &resolved, &target).expect("conform");
+        let out = conform_batch_to_projection(&decoded, &resolved, &target, &[]).expect("conform");
         let first = out
             .column(0)
             .as_any()
@@ -3802,9 +3894,10 @@ mod projection_evolution_tests {
 
     /// A NOT NULL column missing from a file is a real error, named.
     ///
-    /// Iceberg only permits adding OPTIONAL columns, so reaching this means the
-    /// file and the schema genuinely disagree. Emitting NULLs into a required
-    /// field would fail later with a message naming neither the column nor why.
+    /// Iceberg only permits adding a REQUIRED column together with an initial
+    /// default, so reaching this without one means the file and the schema
+    /// genuinely disagree. Emitting NULLs into a required field would fail
+    /// later with a message naming neither the column nor why.
     #[test]
     fn a_required_column_missing_from_the_file_is_an_error() {
         let target = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
@@ -3812,10 +3905,74 @@ mod projection_evolution_tests {
             &Schema::new(vec![Field::new("other", DataType::Utf8, true)]),
             vec![vec!["x"]],
         );
-        let err = conform_batch_to_projection(&decoded, &[None], &target)
+        let err = conform_batch_to_projection(&decoded, &[None], &target, &[])
             .expect_err("a required column cannot be NULL-filled");
         let msg = err.to_string();
         assert!(msg.contains("id") && msg.contains("NOT NULL"), "got: {msg}");
+    }
+
+    /// A file written before `ADD COLUMN ... DEFAULT` reads the column's
+    /// initial default on every row, required or not (#830).
+    #[test]
+    fn a_column_missing_from_the_file_reads_its_initial_default() {
+        let target = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("region", DataType::Utf8, true),
+            Field::new("tier", DataType::Int32, false),
+            Field::new("note", DataType::Utf8, true),
+        ]));
+        let decoded = batch_of(
+            &Schema::new(vec![Field::new("id", DataType::Utf8, false)]),
+            vec![vec!["1", "2"]],
+        );
+        let defaults = vec![
+            None,
+            Some(ScalarValue::Utf8(Some("eu".to_string()))),
+            Some(ScalarValue::Int32(Some(7))),
+            None,
+        ];
+        let out = conform_batch_to_projection(&decoded, &[Some(0), None, None, None], &target, &defaults)
+            .expect("a defaulted column fills, even when required");
+        let region = out.column(1).as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+        let tier = out.column(2).as_any().downcast_ref::<arrow::array::Int32Array>().unwrap();
+        assert_eq!((region.value(0), region.value(1)), ("eu", "eu"));
+        assert_eq!((tier.value(0), tier.value(1)), (7, 7));
+        assert_eq!(out.column(3).null_count(), 2, "no default still reads NULL");
+    }
+
+    /// Each default literal becomes a scalar of the scan's declared Arrow type,
+    /// the same type the file's other rows decode to.
+    #[test]
+    fn initial_defaults_convert_to_the_declared_arrow_type() {
+        use iceberg::spec::{Literal, NestedField, PrimitiveType, Type};
+        let convert = |ty: PrimitiveType, literal: Literal| {
+            let field = NestedField::optional(1, "c", Type::Primitive(ty.clone()));
+            let arrow_type = iceberg::arrow::type_to_arrow_type(&Type::Primitive(ty)).unwrap();
+            let scalar = literal_to_scalar(&field, &literal, &arrow_type).expect("converts");
+            assert_eq!(scalar.data_type(), arrow_type);
+            scalar.to_string()
+        };
+        assert_eq!(convert(PrimitiveType::Int, Literal::int(7)), "7");
+        assert_eq!(convert(PrimitiveType::Long, Literal::long(-3)), "-3");
+        assert_eq!(convert(PrimitiveType::Double, Literal::double(1.5)), "1.5");
+        assert_eq!(convert(PrimitiveType::Boolean, Literal::bool(true)), "true");
+        assert_eq!(convert(PrimitiveType::String, Literal::string("eu")), "eu");
+        assert_eq!(convert(PrimitiveType::Date, Literal::date(20000)), "2024-10-04");
+        assert_eq!(
+            convert(PrimitiveType::Decimal { precision: 9, scale: 2 }, Literal::decimal(12345)),
+            "123.45"
+        );
+        // Round-trips through the ISO text the metadata stores, back to micros.
+        assert_eq!(convert(PrimitiveType::Timestamp, Literal::timestamp(1_000_001)), "1000001");
+        assert_eq!(convert(PrimitiveType::Timestamptz, Literal::timestamptz(1_000_001)), "1000001");
+        assert_eq!(convert(PrimitiveType::Binary, Literal::binary(vec![0xab, 0x01])), "AB01");
+        let uuid_field = NestedField::optional(1, "c", Type::Primitive(PrimitiveType::Uuid));
+        let uuid = uuid::Uuid::from_u128(0x0102);
+        assert_eq!(
+            literal_to_scalar(&uuid_field, &Literal::uuid(uuid), &DataType::FixedSizeBinary(16)).unwrap(),
+            ScalarValue::FixedSizeBinary(16, Some(uuid.as_bytes().to_vec())),
+            "uuid bytes are big-endian, as Iceberg stores them"
+        );
     }
 
     /// The unevolved case must be untouched: same names, same order, no nulls.

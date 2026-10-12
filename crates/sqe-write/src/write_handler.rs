@@ -90,7 +90,7 @@ fn check_insert_arity(
 /// matching-type columns. We wrap the SELECT in a subquery, alias each
 /// projected column by the explicit target name, then re-project in the
 /// target schema's declared order. Columns absent from `columns` are written
-/// as NULL.
+/// as their `write_default`, or NULL when they have none (#828).
 fn reorder_insert_select(
     select_sql: &str,
     // sqlparser 0.62: INSERT column list is Vec<ObjectName> (was Vec<Ident>).
@@ -146,17 +146,18 @@ fn reorder_insert_select(
         .collect();
     let alias_csv = alias_list.join(", ");
 
-    let projection: Vec<String> = target_names
+    let projection: Vec<String> = target_fields
         .iter()
-        .map(|target| {
+        .map(|field| {
+            let target = field.name.as_str();
             let lower = target.to_ascii_lowercase();
             if provided_lower.iter().any(|p| p == &lower) {
-                quote_ident(target)
+                Ok(quote_ident(target))
             } else {
-                format!("NULL AS {}", quote_ident(target))
+                Ok(format!("{} AS {}", omitted_column_sql(field)?, quote_ident(target)))
             }
         })
-        .collect();
+        .collect::<sqe_core::Result<_>>()?;
 
     Ok(format!(
         "SELECT {} FROM ({}) AS __sqe_insert_src({})",
@@ -164,6 +165,61 @@ fn reorder_insert_select(
         select_sql,
         alias_csv,
     ))
+}
+
+/// The SQL an INSERT writes into `field` when the statement omits it: the
+/// column's `write_default`, cast to the column type, or NULL when it has
+/// none (#828).
+///
+/// The default goes through its Iceberg JSON form (decimals, dates and
+/// timestamps are strings there) and `arrow_cast` from text, so every type
+/// a text cast can parse is covered. Binary, fixed and UUID defaults cannot
+/// round-trip that way; they are refused instead of written as NULL.
+pub(crate) fn omitted_column_sql(field: &iceberg::spec::NestedField) -> sqe_core::Result<String> {
+    use iceberg::spec::{PrimitiveType, Type};
+
+    let Some(default) = &field.write_default else {
+        return Ok("NULL".to_string());
+    };
+    let unsupported = || {
+        SqeError::NotImplemented(format!(
+            "the DEFAULT of column '{}' ({}) cannot be applied on INSERT; \
+             list the column and give its value",
+            field.name, field.field_type
+        ))
+    };
+    if matches!(
+        field.field_type.as_ref(),
+        Type::Primitive(PrimitiveType::Binary | PrimitiveType::Fixed(_) | PrimitiveType::Uuid)
+    ) {
+        return Err(unsupported());
+    }
+    let text = match default.clone().try_into_json(&field.field_type) {
+        Ok(serde_json::Value::Bool(b)) => b.to_string(),
+        Ok(serde_json::Value::Number(n)) => n.to_string(),
+        Ok(serde_json::Value::String(s)) => s,
+        _ => return Err(unsupported()),
+    };
+    let arrow_type =
+        iceberg::arrow::type_to_arrow_type(&field.field_type).map_err(|_| unsupported())?;
+    Ok(format!(
+        "arrow_cast('{}', '{arrow_type}')",
+        text.replace('\'', "''")
+    ))
+}
+
+/// [`omitted_column_sql`] for every top-level column that has a
+/// `write_default`, keyed by column name; MERGE INSERT looks them up.
+pub(crate) fn write_default_sqls(
+    schema: &IcebergSchema,
+) -> sqe_core::Result<std::collections::HashMap<String, String>> {
+    schema
+        .as_struct()
+        .fields()
+        .iter()
+        .filter(|f| f.write_default.is_some())
+        .map(|f| Ok((f.name.clone(), omitted_column_sql(f)?)))
+        .collect()
 }
 
 fn quote_ident(name: &str) -> String {
@@ -4482,6 +4538,7 @@ impl WriteHandler {
         // first column of each side; rows a DELETE clause claims (or
         // source-only rows no INSERT clause claims) are dropped by the
         // keep-column WHERE inside the generated SQL.
+        let column_defaults = write_default_sqls(table.metadata().current_schema())?;
         let merge_names = crate::merge_sql::MergeNames {
             target_ref: &target_table_ref,
             source_ref: &source_table_ref,
@@ -4490,6 +4547,7 @@ impl WriteHandler {
             target_columns: &target_columns,
             source_columns: &source_columns,
             target_policy: &target_policy,
+            column_defaults: &column_defaults,
         };
         let classified = crate::merge_sql::classify_merge_clauses(clauses, &merge_names)?;
         let (matched_clauses, not_matched_clauses, by_source_clauses) = classified.counts();
@@ -5315,6 +5373,7 @@ impl WriteHandler {
                 policy_summary_out,
             )
             .await?;
+        let column_defaults = write_default_sqls(table.metadata().current_schema())?;
         let merge_names = crate::merge_sql::MergeNames {
             target_ref: &target_ref,
             source_ref: &source_ref,
@@ -5323,6 +5382,7 @@ impl WriteHandler {
             target_columns: &target_columns,
             source_columns: &source_columns,
             target_policy: &target_policy,
+            column_defaults: &column_defaults,
         };
         // Every per-clause query below reads the target through its policy
         // relation (admit verdict + masked columns) and the guarded ON, so a
@@ -5522,6 +5582,7 @@ impl WriteHandler {
                             &s_alias,
                             &t_alias,
                             &target_ref,
+                            crate::merge_sql::omitted_value(&merge_names, col),
                         );
                         format!("{expr} AS \"{col}\"")
                     })
@@ -10265,6 +10326,83 @@ SET c = ( \
         assert!(msg.contains("has 4 entries"), "msg: {msg}");
     }
 
+    /// #828: an omitted column renders its `write_default` as a cast that
+    /// DataFusion plans to the column's type and value.
+    #[tokio::test]
+    async fn omitted_column_sql_renders_each_default_as_its_typed_value() {
+        use iceberg::spec::{Literal, PrimitiveType, Type};
+        let field = |ty: PrimitiveType, lit: Option<Literal>| {
+            let f = NestedField::optional(1, "c", Type::Primitive(ty));
+            match lit {
+                Some(l) => f.with_write_default(l),
+                None => f,
+            }
+        };
+        let cases = [
+            (field(PrimitiveType::Int, Some(Literal::int(7))), "7"),
+            (field(PrimitiveType::Long, Some(Literal::long(-3))), "-3"),
+            (field(PrimitiveType::Double, Some(Literal::double(1.5))), "1.5"),
+            (field(PrimitiveType::Boolean, Some(Literal::bool(true))), "true"),
+            (field(PrimitiveType::String, Some(Literal::string("it's"))), "it's"),
+            (field(PrimitiveType::Date, Some(Literal::date(20_000))), "2024-10-04"),
+            (
+                field(
+                    PrimitiveType::Decimal { precision: 9, scale: 2 },
+                    Some(Literal::decimal(12_345)),
+                ),
+                "123.45",
+            ),
+            (field(PrimitiveType::String, None), ""),
+        ];
+        let ctx = DFSessionContext::new();
+        for (f, want) in cases {
+            let sql = omitted_column_sql(&f).unwrap();
+            let batches = ctx
+                .sql(&format!("SELECT {sql} AS c"))
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                .collect()
+                .await
+                .unwrap();
+            let col = batches[0].column(0);
+            let want_type = iceberg::arrow::type_to_arrow_type(&f.field_type).unwrap();
+            if f.write_default.is_none() {
+                assert_eq!(sql, "NULL");
+                continue;
+            }
+            assert_eq!(col.data_type(), &want_type, "{sql}");
+            let got = arrow::util::display::array_value_to_string(col, 0).unwrap();
+            assert_eq!(got, want, "{sql}");
+        }
+    }
+
+    #[test]
+    fn omitted_column_sql_refuses_a_default_it_cannot_cast_from_text() {
+        use iceberg::spec::{Literal, PrimitiveType, Type};
+        let f = NestedField::optional(1, "u", Type::Primitive(PrimitiveType::Uuid))
+            .with_write_default(Literal::uuid(Uuid::nil()));
+        let err = omitted_column_sql(&f).unwrap_err();
+        assert!(err.to_string().contains("list the column"), "{err}");
+    }
+
+    #[test]
+    fn reorder_insert_writes_the_write_default_of_an_omitted_column() {
+        use iceberg::spec::{Literal, PrimitiveType, Type};
+        let schema = IcebergSchema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                Arc::new(NestedField::optional(1, "a", Type::Primitive(PrimitiveType::Int))),
+                Arc::new(
+                    NestedField::optional(2, "b", Type::Primitive(PrimitiveType::String))
+                        .with_write_default(Literal::string("pending")),
+                ),
+            ])
+            .build()
+            .unwrap();
+        let sql = reorder_insert_select("SELECT 1", &[ident("a")], &schema).unwrap();
+        assert!(sql.contains("arrow_cast('pending', 'Utf8') AS \"b\""), "{sql}");
+    }
+
     #[test]
     fn reorder_insert_is_case_insensitive() {
         let schema = make_target_schema();
@@ -13733,6 +13871,97 @@ s3_path_style = true
             assert_eq!(n, 3);
             assert!(rig.scan_id_v(&ident).await.is_empty());
             assert!(rig.live_files(&ident).await.is_empty());
+        }
+
+        /// A table whose every non-key column carries a DEFAULT (#828).
+        const DEFAULTS_DDL: &str = "CREATE TABLE default.{name} (id BIGINT NOT NULL, \
+             status VARCHAR DEFAULT 'pending', n INT DEFAULT 7, \
+             ratio DOUBLE DEFAULT 1.5, flag BOOLEAN DEFAULT true, note VARCHAR)";
+
+        /// Every row of `ident` rendered as text, sorted by `id`.
+        async fn rendered_rows(rig: &SqliteRig, ident: &TableIdent) -> Vec<Vec<String>> {
+            use arrow::util::display::{ArrayFormatter, FormatOptions};
+            let opts = FormatOptions::default().with_null("NULL");
+            let mut rows = Vec::new();
+            for batch in rig.scan_all(ident).await {
+                let fmts: Vec<_> = batch
+                    .columns()
+                    .iter()
+                    .map(|c| ArrayFormatter::try_new(c.as_ref(), &opts).expect("formatter"))
+                    .collect();
+                for r in 0..batch.num_rows() {
+                    rows.push(fmts.iter().map(|f| f.value(r).to_string()).collect());
+                }
+            }
+            rows.sort_by_key(|r: &Vec<String>| r[0].parse::<i64>().expect("id"));
+            rows
+        }
+
+        fn row(cells: &[&str]) -> Vec<String> {
+            cells.iter().map(|c| c.to_string()).collect()
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn insert_writes_the_default_of_an_omitted_column() {
+            let rig = SqliteRig::new().await;
+            let h = handler(&rig);
+            run_create(&h, &rig, &DEFAULTS_DDL.replace("{name}", "cd_insert")).await;
+            let ident = rig.ident("cd_insert");
+
+            run_insert(&h, &rig, "INSERT INTO default.cd_insert (id) VALUES (1)")
+                .await
+                .expect("INSERT omitting every defaulted column");
+            run_insert(
+                &h,
+                &rig,
+                "INSERT INTO default.cd_insert (n, id, status) VALUES (0, 2, 'done')",
+            )
+            .await
+            .expect("INSERT naming some defaulted columns");
+            // An explicit NULL is a value, not an omission.
+            run_insert(&h, &rig, "INSERT INTO default.cd_insert (id, status) VALUES (3, NULL)")
+                .await
+                .expect("INSERT with an explicit NULL");
+
+            assert_eq!(
+                rendered_rows(&rig, &ident).await,
+                vec![
+                    row(&["1", "pending", "7", "1.5", "true", "NULL"]),
+                    row(&["2", "done", "0", "1.5", "true", "NULL"]),
+                    row(&["3", "NULL", "7", "1.5", "true", "NULL"]),
+                ]
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn merge_insert_writes_the_default_of_an_omitted_column() {
+            let rig = SqliteRig::new().await;
+            let h = handler(&rig);
+            run_create(&h, &rig, &DEFAULTS_DDL.replace("{name}", "cd_merge")).await;
+            let ident = rig.ident("cd_merge");
+            run_insert(&h, &rig, "INSERT INTO default.cd_merge (id, status) VALUES (1, 'old')")
+                .await
+                .expect("seed");
+
+            run_merge(
+                &h,
+                &rig,
+                "MERGE INTO default.cd_merge AS t USING src AS s ON t.id = s.id \
+                 WHEN MATCHED THEN UPDATE SET note = s.v \
+                 WHEN NOT MATCHED THEN INSERT (id, note) VALUES (s.id, s.v)",
+                vec![id_v_batch(&[(1, "seen"), (2, "new")])],
+                None,
+            )
+            .await
+            .expect("MERGE");
+
+            assert_eq!(
+                rendered_rows(&rig, &ident).await,
+                vec![
+                    row(&["1", "old", "7", "1.5", "true", "seen"]),
+                    row(&["2", "pending", "7", "1.5", "true", "new"]),
+                ]
+            );
         }
     }
 }

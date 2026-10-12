@@ -57,6 +57,9 @@ pub(crate) struct MergeNames<'a> {
     /// while the engine's own passthrough keeps the raw value so unchanged
     /// rows are rewritten byte-for-byte.
     pub target_policy: &'a WritePolicyPredicates,
+    /// SQL for the `write_default` of each target column that has one, which
+    /// a NOT MATCHED INSERT writes when it does not supply the column (#828).
+    pub column_defaults: &'a std::collections::HashMap<String, String>,
 }
 
 /// Name of the synthetic boolean column that says whether the caller's row
@@ -555,6 +558,7 @@ fn merge_select(
                     names.s_alias,
                     names.t_alias,
                     names.target_ref,
+                    omitted_value(names, col),
                 ),
                 _ => passthrough.clone(),
             };
@@ -820,7 +824,8 @@ pub(crate) fn resolve_update_expr(
 ///
 /// Maps the INSERT column list + VALUES to find the expression for the
 /// given target column. Rewrites alias references (e.g., `s.col`) to
-/// use the MemTable name.
+/// use the MemTable name. A column the clause does not supply gets
+/// `omitted`: its `write_default` or NULL ([`omitted_value`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_insert_expr(
     col: &str,
@@ -832,6 +837,7 @@ pub(crate) fn resolve_insert_expr(
     s_alias: &str,
     t_alias: &str,
     target_table_ref: &str,
+    omitted: &str,
 ) -> String {
     let rewrite = |expr: String| -> String {
         let out = replace_alias_qualifier(&expr, s_alias, source_table_ref);
@@ -848,9 +854,9 @@ pub(crate) fn resolve_insert_expr(
                             return rewrite(format!("{}", row[idx]));
                         }
                     }
-                    return "NULL".to_string();
+                    return omitted.to_string();
                 }
-                "NULL".to_string()
+                omitted.to_string()
             } else {
                 // Explicit column list — find the column position. A MERGE
                 // insert column is a bare name; compare against its last
@@ -867,7 +873,7 @@ pub(crate) fn resolve_insert_expr(
                         }
                     }
                 }
-                "NULL".to_string()
+                omitted.to_string()
             }
         }
         MergeInsertKind::Row => {
@@ -875,10 +881,16 @@ pub(crate) fn resolve_insert_expr(
             if source_columns.contains(&col.to_string()) {
                 format!("{source_table_ref}.\"{col}\"")
             } else {
-                "NULL".to_string()
+                omitted.to_string()
             }
         }
     }
+}
+
+/// What a NOT MATCHED INSERT writes into target column `col` when the clause
+/// does not supply it: the column's `write_default`, else NULL (#828).
+pub(crate) fn omitted_value<'a>(names: &MergeNames<'a>, col: &str) -> &'a str {
+    names.column_defaults.get(col).map_or("NULL", String::as_str)
 }
 
 #[cfg(test)]
@@ -904,6 +916,9 @@ mod tests {
         )
     }
 
+    static NO_DEFAULTS: std::sync::OnceLock<std::collections::HashMap<String, String>> =
+        std::sync::OnceLock::new();
+
     fn names_with_policy<'a>(
         target_cols: &'a [String],
         source_cols: &'a [String],
@@ -917,6 +932,7 @@ mod tests {
             target_columns: target_cols,
             source_columns: source_cols,
             target_policy: policy,
+            column_defaults: NO_DEFAULTS.get_or_init(Default::default),
         }
     }
 
