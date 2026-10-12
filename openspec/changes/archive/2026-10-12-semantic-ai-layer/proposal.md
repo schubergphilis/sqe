@@ -1,3 +1,5 @@
+> Superseded 2026-10-12, archived unbuilt. Agent access ships as the `sqe-mcp` crate (MCP server over the engine) and the separate Python `sqe-semantic` catalog sidecar. No in-engine SPARQL, GQL, Lance vector or REST/OpenAPI layer was built.
+
 ## Why
 
 SQL query engines understand table shapes, not data meaning. AI agents querying a data lake via SQE face the classic schema introspection problem: column names like `ord_typ_cd` and `cust_sgmt_flg` are opaque. Without semantic context, agents either hallucinate table relationships or need exhaustive hand-holding to write correct queries.
