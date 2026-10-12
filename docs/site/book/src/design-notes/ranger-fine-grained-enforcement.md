@@ -83,6 +83,14 @@ the resolved-policy cache is dropped too, so the Admin edit is visible
 on the next resolve instead of waiting out a second 30s. Operators who
 need the change sooner can hit the admin catalog-refresh hook.
 
+Bundle expiry does not send every concurrent query to Ranger. Concurrent
+misses wait on one download. Once the cached bundle is 80% through its
+TTL, the next reader downloads a fresh copy while every other reader is
+still served the cached one. If that refresh fails, the cached bundle is
+served until its TTL ends, and then queries fail closed as before. A
+download that was in flight when `invalidate_policy_cache()` ran is not
+cached.
+
 ### Resolve
 
 `RangerStore::resolve(user, table, namespace)` returns a `ResolvedPolicy`:
