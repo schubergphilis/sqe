@@ -4,7 +4,7 @@
 //! Apache Spark / Kyuubi. See docs/ranger-fine-grained-service-type.md.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -234,6 +234,18 @@ const MASK_TYPE_CUSTOM: &str = "CUSTOM";
 /// Single, constant key for the user-independent ServicePolicies bundle cache.
 const BUNDLE_KEY: &str = "__bundle__";
 
+/// Fraction of the bundle TTL after which a reader refreshes the bundle
+/// ahead of its expiry (#816). One reader downloads; the rest keep reading the
+/// cached copy, so expiry never sends every concurrent query to Ranger.
+const BUNDLE_REFRESH_AHEAD: f64 = 0.8;
+
+/// The cached bundle and when it was downloaded.
+#[derive(Clone)]
+struct CachedBundle {
+    bundle: Arc<ServicePolicies>,
+    fetched_at: Instant,
+}
+
 /// A cached `ResolvedPolicy` behind a trait object: a compile firewall, keep it.
 ///
 /// `ResolvedPolicy` holds row-filter `Expr`s. Stored concretely in the moka
@@ -272,7 +284,15 @@ pub struct RangerStore {
     /// (with the same TTL as the per-user `cache`) avoids re-downloading and
     /// re-parsing it on every query and every tagged table. `Arc` keeps the
     /// moka `get`/`insert` clones cheap.
-    bundle_cache: Cache<&'static str, Arc<ServicePolicies>>,
+    bundle_cache: Cache<&'static str, CachedBundle>,
+    /// Age at which a reader refreshes the bundle ahead of its TTL.
+    bundle_refresh_after: Duration,
+    /// Serialises bundle downloads: a cold miss waits on it, a refresh-ahead
+    /// only `try_lock`s it, so at most one download is in flight.
+    bundle_fetch: tokio::sync::Mutex<()>,
+    /// Bumped by `invalidate_all`. A download that started before an
+    /// invalidation is not cached, so it cannot put a pre-GRANT bundle back.
+    bundle_generation: AtomicU64,
     /// Last `policyVersion` observed on a download. 0 means none yet.
     /// When a later download reports a different version, the per-user
     /// ResolvedPolicy cache is dropped so Ranger Admin edits take effect
@@ -336,6 +356,10 @@ impl RangerStore {
                 .time_to_live(Duration::from_secs(cfg.cache_ttl_secs))
                 .max_capacity(1)
                 .build(),
+            bundle_refresh_after: Duration::from_secs(cfg.cache_ttl_secs)
+                .mul_f64(BUNDLE_REFRESH_AHEAD),
+            bundle_fetch: tokio::sync::Mutex::new(()),
+            bundle_generation: AtomicU64::new(0),
             last_policy_version: AtomicI64::new(0),
             breaker: Arc::new(CircuitBreaker::new(
                 "Ranger",
@@ -474,13 +498,47 @@ impl RangerStore {
     ///
     /// Fail-closed is preserved: a fetch error propagates (`?`) and is NEVER
     /// cached, so the next caller retries (subject to the circuit breaker).
+    ///
+    /// Concurrent misses download once (#816): the first takes `bundle_fetch`,
+    /// the rest wait on it and then find the bundle cached. Past
+    /// `BUNDLE_REFRESH_AHEAD` of the TTL, the one reader that wins `try_lock`
+    /// downloads a fresh copy while every other reader is served the cached
+    /// one; if that download fails, the cached bundle stays until its TTL.
     async fn cached_bundle(&self) -> sqe_core::Result<Arc<ServicePolicies>> {
-        if let Some(bundle) = self.bundle_cache.get(BUNDLE_KEY).await {
-            return Ok(bundle);
+        if let Some(cached) = self.bundle_cache.get(BUNDLE_KEY).await {
+            if cached.fetched_at.elapsed() < self.bundle_refresh_after {
+                return Ok(cached.bundle);
+            }
+            let Ok(_guard) = self.bundle_fetch.try_lock() else {
+                return Ok(cached.bundle);
+            };
+            return match self.download_and_cache().await {
+                Ok(bundle) => Ok(bundle),
+                Err(e) => {
+                    warn!(error = %e, "Ranger bundle refresh-ahead failed; serving the cached bundle");
+                    Ok(cached.bundle)
+                }
+            };
         }
+        let _guard = self.bundle_fetch.lock().await;
+        if let Some(cached) = self.bundle_cache.get(BUNDLE_KEY).await {
+            return Ok(cached.bundle);
+        }
+        self.download_and_cache().await
+    }
+
+    /// Download the bundle and cache it, unless `invalidate_all` ran while it
+    /// was in flight. Callers hold `bundle_fetch`.
+    async fn download_and_cache(&self) -> sqe_core::Result<Arc<ServicePolicies>> {
+        let generation = self.bundle_generation.load(Ordering::Acquire);
+        let fetched_at = Instant::now();
         let bundle = Arc::new(self.fetch_bundle().await?);
         self.drop_resolved_if_bundle_changed(&bundle);
-        self.bundle_cache.insert(BUNDLE_KEY, bundle.clone()).await;
+        if self.bundle_generation.load(Ordering::Acquire) == generation {
+            self.bundle_cache
+                .insert(BUNDLE_KEY, CachedBundle { bundle: bundle.clone(), fetched_at })
+                .await;
+        }
         Ok(bundle)
     }
 
@@ -1825,6 +1883,7 @@ impl PolicyStore for RangerStore {
         self.cache.invalidate_all();
         // Also drop the shared bundle so a manual refresh does not serve a stale
         // bundle until its TTL elapses.
+        self.bundle_generation.fetch_add(1, Ordering::AcqRel);
         self.bundle_cache.invalidate_all();
     }
 }
@@ -2059,7 +2118,10 @@ mod tests {
     async fn cached_bundle_serves_warm_copy_without_fetch() {
         let store = RangerStore::from_config(&RangerPolicyConfig::default()).unwrap();
         let seeded: Arc<ServicePolicies> = Arc::new(serde_json::from_str(BUNDLE).unwrap());
-        store.bundle_cache.insert(BUNDLE_KEY, seeded.clone()).await;
+        store
+            .bundle_cache
+            .insert(BUNDLE_KEY, CachedBundle { bundle: seeded.clone(), fetched_at: Instant::now() })
+            .await;
 
         let got = store
             .cached_bundle()
@@ -2069,6 +2131,131 @@ mod tests {
             Arc::ptr_eq(&seeded, &got),
             "cached_bundle must return the cached Arc, not a re-fetched copy"
         );
+    }
+
+    /// A store whose bundle download is served by `server`, with a 100 s TTL.
+    async fn store_against(server: &wiremock::MockServer) -> Arc<RangerStore> {
+        Arc::new(
+            RangerStore::from_config(&RangerPolicyConfig {
+                url: server.uri(),
+                cache_ttl_secs: 100,
+                ..RangerPolicyConfig::default()
+            })
+            .unwrap(),
+        )
+    }
+
+    async fn mount_bundle(server: &wiremock::MockServer, status: u16, delay: Duration) {
+        use wiremock::matchers::{method, path_regex};
+        wiremock::Mock::given(method("GET"))
+            .and(path_regex("/policies/download/"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(status)
+                    .set_body_string(BUNDLE)
+                    .insert_header("content-type", "application/json")
+                    .set_delay(delay),
+            )
+            .mount(server)
+            .await;
+    }
+
+    async fn downloads(server: &wiremock::MockServer) -> usize {
+        server.received_requests().await.unwrap_or_default().len()
+    }
+
+    async fn concurrent_bundles(store: &Arc<RangerStore>, n: usize) -> Vec<Arc<ServicePolicies>> {
+        let tasks: Vec<_> = (0..n)
+            .map(|_| {
+                let store = store.clone();
+                tokio::spawn(async move { store.cached_bundle().await.expect("bundle") })
+            })
+            .collect();
+        let mut out = Vec::new();
+        for t in tasks {
+            out.push(t.await.unwrap());
+        }
+        out
+    }
+
+    /// #816: 50 queries arriving with no bundle cached download it once, not
+    /// 50 times.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_cold_misses_download_the_bundle_once() {
+        let server = wiremock::MockServer::start().await;
+        mount_bundle(&server, 200, Duration::from_millis(100)).await;
+        let store = store_against(&server).await;
+
+        concurrent_bundles(&store, 50).await;
+        assert_eq!(downloads(&server).await, 1);
+    }
+
+    /// #816: past 80% of the TTL one reader refreshes, every other reader is
+    /// served the cached bundle without waiting, and the refresh resets the age.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_ageing_bundle_is_refreshed_once_ahead_of_expiry() {
+        let server = wiremock::MockServer::start().await;
+        mount_bundle(&server, 200, Duration::from_millis(100)).await;
+        let store = store_against(&server).await;
+        let seeded: Arc<ServicePolicies> = Arc::new(serde_json::from_str(BUNDLE).unwrap());
+        let aged = Instant::now() - Duration::from_secs(90);
+        store
+            .bundle_cache
+            .insert(BUNDLE_KEY, CachedBundle { bundle: seeded.clone(), fetched_at: aged })
+            .await;
+
+        let got = concurrent_bundles(&store, 50).await;
+        assert_eq!(downloads(&server).await, 1);
+        assert!(
+            got.iter().filter(|b| Arc::ptr_eq(b, &seeded)).count() >= 49,
+            "readers that did not refresh are served the cached bundle"
+        );
+        let cached = store.bundle_cache.get(BUNDLE_KEY).await.expect("refreshed bundle");
+        assert!(cached.fetched_at > aged, "the refresh restarted the TTL");
+
+        // Fresh again: no further download.
+        concurrent_bundles(&store, 10).await;
+        assert_eq!(downloads(&server).await, 1);
+    }
+
+    /// #816: a refresh-ahead that fails keeps serving the cached bundle; it is
+    /// still within its TTL, so this is not a fail-open.
+    #[tokio::test]
+    async fn a_failed_refresh_ahead_serves_the_cached_bundle() {
+        let server = wiremock::MockServer::start().await;
+        mount_bundle(&server, 503, Duration::ZERO).await;
+        let store = store_against(&server).await;
+        let seeded: Arc<ServicePolicies> = Arc::new(serde_json::from_str(BUNDLE).unwrap());
+        store
+            .bundle_cache
+            .insert(
+                BUNDLE_KEY,
+                CachedBundle { bundle: seeded.clone(), fetched_at: Instant::now() - Duration::from_secs(90) },
+            )
+            .await;
+
+        let got = store.cached_bundle().await.expect("cached bundle served");
+        assert!(Arc::ptr_eq(&got, &seeded));
+        assert_eq!(downloads(&server).await, 1);
+    }
+
+    /// A download in flight when `invalidate_all` runs (a GRANT through SQE)
+    /// is returned to its caller but not cached, so the next query downloads
+    /// the post-GRANT bundle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_download_racing_invalidate_all_is_not_cached() {
+        let server = wiremock::MockServer::start().await;
+        mount_bundle(&server, 200, Duration::from_millis(300)).await;
+        let store = store_against(&server).await;
+
+        let in_flight = {
+            let store = store.clone();
+            tokio::spawn(async move { store.cached_bundle().await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        PolicyStore::invalidate_all(store.as_ref());
+        in_flight.await.unwrap().expect("bundle");
+
+        assert!(store.bundle_cache.get(BUNDLE_KEY).await.is_none());
     }
 
     fn user(name: &str, roles: &[&str]) -> SessionUser {
@@ -2704,7 +2891,10 @@ mod tests {
         )
         .unwrap();
         let store = RangerStore::from_config(&RangerPolicyConfig::default()).unwrap();
-        store.bundle_cache.insert(BUNDLE_KEY, Arc::new(ddl)).await;
+        store
+            .bundle_cache
+            .insert(BUNDLE_KEY, CachedBundle { bundle: Arc::new(ddl), fetched_at: Instant::now() })
+            .await;
         let can = |u: SessionUser, t: &'static str, p| {
             let store = &store;
             async move {
