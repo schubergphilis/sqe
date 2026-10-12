@@ -103,10 +103,13 @@
       ]
     },
     "sqe:column-default-values:v3": {
-      "level": "full",
-      "notes": "CREATE TABLE ... DEFAULT <literal> applies write_default; ALTER TABLE ADD COLUMN ... DEFAULT applies initial_default. Function-call defaults rejected with clear error.",
-      "evidence": "crates/sqe-sql/src/v3_types.rs",
-      "caveats": []
+      "level": "partial",
+      "notes": "CREATE TABLE ... DEFAULT <literal> and ALTER TABLE ADD COLUMN ... DEFAULT set write_default and initial_default. INSERT with a column list and MERGE INSERT write an omitted column's write_default. Function-call defaults rejected with clear error.",
+      "evidence": "crates/sqe-coordinator/tests/it/v3_e2e.rs::create_table_default_applies_on_insert_and_merge, crates/sqe-coordinator/tests/it/v3_e2e.rs::alter_add_column_with_default_on_v3_table",
+      "caveats": [
+        "Rows written before ALTER TABLE ADD COLUMN ... DEFAULT read NULL instead of the initial_default (#830).",
+        "Binary, fixed and UUID defaults are refused on INSERT rather than applied."
+      ]
     },
     "sqe:table-creation:v2": {
       "level": "full",
