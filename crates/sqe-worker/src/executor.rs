@@ -38,6 +38,7 @@ use sqe_metrics::{MetricsRegistry, WorkerMetricsRegistry};
 use sqe_planner::{classify_anyhow_error, ScanTask, WorkerFault};
 
 use crate::credential_channel::RefreshableCredentials;
+use crate::projection_fill::ProjectionFill;
 
 /// A scan error classified while it was still typed (review finding 602).
 ///
@@ -839,6 +840,15 @@ async fn scan_streaming_inner(
         }
     };
 
+    // The declared projection for an Iceberg task whose projected columns
+    // evolved (#831). Without it the stream takes the first file's shape, and a
+    // fragment mixing files from before and after an ADD COLUMN fails.
+    let fill: Option<Arc<ProjectionFill>> = if hive_ctx.is_none() {
+        ProjectionFill::from_task(&task).map_err(|e| ScanFault::tag(WorkerFault::TaskInvalid, e))?
+    } else {
+        None
+    };
+
     let start = std::time::Instant::now();
     let scan_budget = scan_budget.unwrap_or_else(|| default_scan_budget(&session_ctx));
 
@@ -864,9 +874,10 @@ async fn scan_streaming_inner(
     // A Hive scan's output carries the partition columns too, so the schema
     // reported to the caller is the full one, not the data file's. Taken here,
     // before `hive_ctx` moves into the producer task.
-    let out_schema: SchemaRef = match &hive_ctx {
-        Some(ctx) => Arc::clone(&ctx.1),
-        None => Arc::clone(&first_schema),
+    let out_schema: SchemaRef = match (&hive_ctx, &fill) {
+        (Some(ctx), _) => Arc::clone(&ctx.1),
+        (None, Some(fill)) => Arc::clone(fill.schema()),
+        (None, None) => Arc::clone(&first_schema),
     };
 
     let (tx, rx) = mpsc::channel::<anyhow::Result<AccountedBatch>>(SCAN_CHANNEL_ITEM_CAPACITY);
@@ -986,7 +997,20 @@ async fn scan_streaming_inner(
             pre: Option<sqe_spill::BytePermit>,
             batch: RecordBatch,
             hive: Option<&Arc<(sqe_planner::HiveScanDescriptor, SchemaRef)>>,
+            fill: Option<&Arc<ProjectionFill>>,
         ) -> Option<usize> {
+            // Reshape to the declared projection (#831) before sizing, for the
+            // same reason as the Hive columns below: a filled column allocates.
+            let batch = match fill {
+                None => batch,
+                Some(fill) => match fill.conform(&batch) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = tx.send(Err(ScanFault::classify(e))).await;
+                        return None;
+                    }
+                },
+            };
             // Materialize Hive partition columns BEFORE sizing. Doing it after
             // the permit is acquired would leave the worker holding more memory
             // than it reserved: a partition column allocates one value per row,
@@ -1064,6 +1088,7 @@ async fn scan_streaming_inner(
             queue_space: &Notify,
             metrics: &Option<Arc<WorkerMetricsRegistry>>,
             hive: Option<&Arc<(sqe_planner::HiveScanDescriptor, SchemaRef)>>,
+            fill: Option<&Arc<ProjectionFill>>,
             estimate: &mut usize,
             total_rows: &mut usize,
             row_limit: Option<usize>,
@@ -1092,6 +1117,7 @@ async fn scan_streaming_inner(
                             pre,
                             batch,
                             hive,
+                            fill,
                         )
                         .await
                         {
@@ -1139,6 +1165,7 @@ async fn scan_streaming_inner(
             &queue_space,
             &metrics,
             hive_ctx.as_ref(),
+            fill.as_ref(),
             &mut estimate,
             &mut total_rows,
             row_limit,
@@ -1243,6 +1270,7 @@ async fn scan_streaming_inner(
                 &queue_space,
                 &metrics,
                 hive_ctx.as_ref(),
+                fill.as_ref(),
                 &mut estimate,
                 &mut total_rows,
                 row_limit,
@@ -2045,6 +2073,7 @@ mod tests {
     fn task_with_predicate(predicate_proto: Option<Vec<u8>>, limit: Option<usize>) -> ScanTask {
         ScanTask {
             hive: None,
+            projection_fill: None,
             version: 1,
             morsel_id: None,
             row_group_start: None,
@@ -2445,6 +2474,7 @@ mod tests {
         // "data/f.parquet" matching the blob written above.
         ScanTask {
             hive: None,
+            projection_fill: None,
             version: 1,
             morsel_id: None,
             row_group_start: None,

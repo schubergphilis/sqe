@@ -84,6 +84,7 @@ pub fn local_scan_task(object_keys: Vec<String>, file_sizes: Vec<u64>) -> ScanTa
         .collect();
     ScanTask {
         hive: None,
+        projection_fill: None,
         version: 1,
         morsel_id: None,
         row_group_start: None,
