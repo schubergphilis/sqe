@@ -113,13 +113,53 @@ class _Cursor:
 
 
 class _Handle:
-    """ADBC connection proxy whose cursors are `_Cursor`s."""
+    """ADBC connection proxy whose cursors are `_Cursor`s.
+
+    It also holds the one scoped transaction a materialization may open
+    around its DML (`begin_transaction` / `commit_transaction`). The DB-API
+    commit() and rollback() do nothing on an autocommit connection, so this
+    drives the ADBC connection underneath. dbt calls rollback() and close()
+    on every failure path, and both end an open transaction there. A model
+    that fails between its DELETE and INSERT therefore leaves the target
+    as it was.
+    """
 
     def __init__(self, inner):
         self._inner = inner
+        self.in_transaction = False
 
     def cursor(self, *args, **kwargs):
         return _Cursor(self._inner.cursor(*args, **kwargs))
+
+    def begin_transaction(self):
+        if self.in_transaction:
+            raise DbtRuntimeError("an SQE transaction is already open on this connection")
+        # Leaving autocommit starts a Flight SQL transaction (BeginTransaction).
+        self._inner.adbc_connection.set_autocommit(False)
+        self.in_transaction = True
+
+    def commit_transaction(self):
+        # Returning to autocommit commits the open transaction. If the commit
+        # fails, the transaction stays marked open so close() rolls it back.
+        self._inner.adbc_connection.set_autocommit(True)
+        self.in_transaction = False
+
+    def rollback(self):
+        if not self.in_transaction:
+            return self._inner.rollback()
+        self.in_transaction = False
+        adbc = self._inner.adbc_connection
+        try:
+            adbc.rollback()
+        finally:
+            adbc.set_autocommit(True)
+
+    def close(self):
+        try:
+            if self.in_transaction:
+                self.rollback()
+        finally:
+            self._inner.close()
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
