@@ -45,11 +45,13 @@ SELECT day(occurred_at) AS d, count(*) AS n
 FROM analytics.events GROUP BY 1;
 ```
 
+A column `DEFAULT` takes a literal and makes the table format-version 3. An `INSERT` with a column list and a `MERGE ... WHEN NOT MATCHED THEN INSERT` write the default into every column they omit; an explicit `NULL` is written as NULL. Defaults on `BINARY`, `FIXED` and `UUID` columns are refused on INSERT; name the column and give its value.
+
 ## Schema evolution
 
 | Statement | Origin | Notes | Trino | Snowflake | Spark SQL | DuckDB |
 |---|---|---|---|---|---|---|
-| `ALTER TABLE t ADD COLUMN c TYPE [DEFAULT expr]` | `sqlparser-rs` + `sqe-coordinator` | New column. Existing rows get the default (V3) or NULL (V2). | yes | yes | yes | yes |
+| `ALTER TABLE t ADD COLUMN c TYPE [DEFAULT expr]` | `sqlparser-rs` + `sqe-coordinator` | New column. A later INSERT or MERGE INSERT that omits it writes the default (V3). Rows written before the ALTER read NULL for now, not the default (#830). | yes | yes | yes | yes |
 | `ALTER TABLE t DROP COLUMN [IF EXISTS] c` | `sqlparser-rs` + `sqe-coordinator` | Logical drop. Field id retained in old data files. | yes | yes | yes | yes |
 | `ALTER TABLE t RENAME COLUMN old TO new` | `sqlparser-rs` + `sqe-coordinator` | Iceberg field id stays the same; only the name changes. | yes | yes | yes | yes |
 | `ALTER TABLE t ALTER COLUMN c SET NOT NULL` | `sqlparser-rs` + `sqe-coordinator` | Tighten nullability. Fails if existing rows have NULL. | yes | yes | yes | yes |
