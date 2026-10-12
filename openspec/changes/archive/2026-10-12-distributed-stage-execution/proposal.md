@@ -1,3 +1,5 @@
+> Superseded 2026-10-12, archived unbuilt. The stage/shuffle planner was deleted (#551) and the `DoExchange` shuffle intake in 2026-09; workers answer `DoExchange` with `Unimplemented`. The executed topology is a distributed scan with joins, aggregates and sorts on the coordinator. Large builds are bounded on the coordinator instead (#784 sort-merge retry, #788 spill qualification).
+
 ## Why
 
 Distributed execution today is scan-only. `try_distribute` finds the first `IcebergScanExec` in the physical plan, splits its data files into bin-packed `ScanTask`s, and swaps that one leaf for a `DistributedScanExec` (`crates/sqe-coordinator/src/query_handler.rs:2080-2253`). Everything above the scan -- filters, joins, aggregations, sorts -- still runs single-node on the coordinator. The coordinator pulls every scanned row back over Flight and does all the real work itself. It is the bandwidth and CPU bottleneck.
