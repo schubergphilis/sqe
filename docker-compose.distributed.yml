@@ -45,6 +45,9 @@ services:
       - "29091:9091"
     environment:
       RUST_LOG: sqe=info,warn
+      # Scan tickets are bound to the URL the coordinator dials
+      # (coordinator.worker_urls), not the container IP.
+      SQE_WORKER__ADVERTISE_URL: http://worker-1:50052
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9092/healthz"]
       interval: 10s
@@ -66,6 +69,9 @@ services:
       - "29092:9091"
     environment:
       RUST_LOG: sqe=info,warn
+      # Scan tickets are bound to the URL the coordinator dials
+      # (coordinator.worker_urls), not the container IP.
+      SQE_WORKER__ADVERTISE_URL: http://worker-2:50052
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9092/healthz"]
       interval: 10s
