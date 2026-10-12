@@ -12,11 +12,11 @@
 - [x] 2.2 Write failing integration test `glue_backend_lists_databases` (ignored by default)
 - [x] 2.3 Implement `crates/sqe-catalog/src/backends/glue.rs` wrapping `iceberg-catalog-glue` — `GlueBackend::build_catalog` now delegates to the vendored upstream crate when `--features glue` is enabled.
 - [x] 2.4 Wire Glue into catalog registry behind `glue` Cargo feature
-- [ ] 2.5 Verify Glue test passes against live AWS (manual; needs LocalStack or real AWS Glue endpoint)
+- [x] 2.5 Verify Glue test passes against live AWS (manual; needs LocalStack or real AWS Glue endpoint) -- done differently: live run against a real eu-central-1 account recorded in `nextsteps.md` (2026-04-29, MR !113) and `docs/evidence/iceberg-matrix-state.json` (`sqe:aws-glue-catalog:v2` evidence); test is `crates/sqe-catalog/tests/it/backends_integration.rs::glue::live_glue_namespace_round_trip`, whose header now reads "last verified: never in this tree" after the re-vendor
 - [x] 2.6 Write failing integration test `hms_backend_lists_tables`
 - [x] 2.7 Implement `crates/sqe-catalog/src/backends/hms.rs` wrapping `iceberg-catalog-hms` — `HmsBackend::build_catalog` now delegates to the vendored upstream crate when `--features hms` is enabled.
 - [x] 2.8 Wire HMS into catalog registry behind `hms` Cargo feature
-- [ ] 2.9 Verify HMS test passes against docker-compose HMS stack (needs `docker-compose.hms.yml` and a live HMS server)
+- [x] 2.9 Verify HMS test passes against docker-compose HMS stack (needs `docker-compose.hms.yml` and a live HMS server) -- done differently: `docker-compose.hms.yml` added and the live run recorded in `nextsteps.md` (2026-04-29, MR !113) and the matrix state (`sqe:hive-metastore:v2/v3` full); test is `crates/sqe-catalog/tests/it/backends_integration.rs::hms::hms_namespace_round_trip`, whose header now reads "last verified: never in this tree" after the re-vendor
 - [x] 2.10 Write failing integration test `jdbc_backend_sqlite_roundtrip`
 - [x] 2.11 Implement `crates/sqe-catalog/src/backends/sql.rs` (SQLite via rusqlite). PostgreSQL/MySQL now available through the vendored `iceberg-catalog-sql` crate (sqlx::any) behind the `sql-postgres` feature.
 - [x] 2.12 Wire JDBC into catalog registry behind `sql` Cargo feature
@@ -28,7 +28,7 @@
 - [x] 2.18 Add Unity Catalog integration test with M2M auth (ignored, manual)
 - [x] 2.19 Document Nessie via REST in `docs/deployment.md` (Section 5b Catalog Backends)
 - [x] 2.20 Update `docs/iceberg-matrix-state.json`: 4 catalog rows -> P, nessie v2 -> F (30.7% -> 35.4%)
-- [ ] 2.21 Commit Phase A and tag v0.16.0-catalogs
+- [ ] 2.21 Commit Phase A and tag v0.16.0-catalogs (work merged; no `v0.16.0-catalogs` tag, and plain `v0.16.0` (2026-03-22) predates the phase)
 - [ ] 2.22 Fork Neuw84/iceberg-matrix and prepare SQE entry
 - [ ] 2.23 Add 63 support entries to fork's `src/data/platforms/oss.json`
 - [ ] 2.24 Add SQE SVG logo and wire into CompatibilityMatrix.tsx + FilterPanel.tsx
@@ -56,50 +56,50 @@
 - [x] 3.17 Test that read-only user is rejected with auth error + audit log entry
 - [x] 3.18 Document maintenance procedures in `docs/operations.md`
 - [x] 3.19 Update `docs/iceberg-matrix-state.json`: table-maintenance v2/v3 -> F
-- [ ] 3.20 Commit Phase B and tag v0.17.0-maintenance
+- [ ] 3.20 Commit Phase B and tag v0.17.0-maintenance (work merged; no `v0.17.0-maintenance` tag, and plain `v0.17.0` (2026-03-24) predates the phase)
 
 ## 4. Phase C: Branching and tagging
 
-- [ ] 4.1 Write failing unit test `create_branch_sets_snapshot_ref` in vendored iceberg-rust
-- [ ] 4.2 Implement `vendor/iceberg-rust/crates/iceberg/src/transaction/branch.rs` with `create_branch`, `drop_branch`, `create_tag`, `drop_tag`
-- [ ] 4.3 Verify branch/tag transaction tests pass
-- [ ] 4.4 Write failing parser test for `ALTER TABLE ns.t CREATE BRANCH name`
-- [ ] 4.5 Extend `crates/sqe-sql/src/ddl.rs` parser for branch/tag DDL
-- [ ] 4.6 Write failing parser test for `SELECT ... FOR VERSION AS OF 'branch_name'` (string ref)
-- [ ] 4.7 Extend parser to accept branch/tag names in time-travel syntax
-- [ ] 4.8 Wire branch/tag DDL into coordinator handlers
-- [ ] 4.9 Write e2e test: create branch, insert to branch, main unaffected
-- [ ] 4.10 Verify e2e isolation test passes
-- [ ] 4.11 Write e2e test: tag retention prevents snapshot expiry
-- [ ] 4.12 Verify tag retention test passes
-- [ ] 4.13 Add `SET WRITE_BRANCH` session variable and wire to write planner
-- [ ] 4.14 Test main branch cannot be dropped
-- [ ] 4.15 Add `REPLACE TAG` support and verify behaviour
-- [ ] 4.16 Add `WITH RETENTION` clause to CREATE BRANCH
-- [ ] 4.17 Document branching in `docs/features/branching.md`
-- [ ] 4.18 Update `docs/iceberg-matrix-state.json`: branching-tagging v2/v3 -> F
-- [ ] 4.19 Commit Phase C and tag v0.18.0-branching
+- [x] 4.1 Write failing unit test `create_branch_sets_snapshot_ref` in vendored iceberg-rust -- done differently: builder tests (`test_create_branch_*`, `test_create_tag_builder`, `test_remove_ref_builder`) in `vendor/iceberg-rust/crates/iceberg/src/transaction/branch.rs`; the ref actually landing is asserted by the transaction tests in `crates/sqe-write/src/write_handler.rs` (`txn_refs(...)` after a write, e.g. `rollback_drops_the_branch_and_leaves_main_alone`)
+- [x] 4.2 Implement `vendor/iceberg-rust/crates/iceberg/src/transaction/branch.rs` with `create_branch`, `drop_branch`, `create_tag`, `drop_tag`
+- [x] 4.3 Verify branch/tag transaction tests pass (builder tests plus `test_publish_branch_*` and `test_pinned_to_ref_reads_the_branch_as_main` in `branch.rs`)
+- [x] 4.4 Write failing parser test for `ALTER TABLE ns.t CREATE BRANCH name` (`create_branch_simple` in `crates/sqe-sql/src/ddl.rs`; classifier test in `classifier.rs`)
+- [x] 4.5 Extend `crates/sqe-sql/src/ddl.rs` parser for branch/tag DDL (`try_parse_ref_ddl` -> `RefDdl`)
+- [x] 4.6 Write failing parser test for `SELECT ... FOR VERSION AS OF 'branch_name'` (string ref) (tests in `crates/sqe-sql/src/time_travel.rs`)
+- [x] 4.7 Extend parser to accept branch/tag names in time-travel syntax -- done differently: in `crates/sqe-sql/src/time_travel.rs` (tag wins on a name clash)
+- [x] 4.8 Wire branch/tag DDL into coordinator handlers (`CatalogOps::apply_ref_ddl` in `crates/sqe-coordinator/src/catalog_ops.rs`, dispatched from `StatementKind::RefDdl` in `query_handler.rs`)
+- [x] 4.9 Write e2e test: create branch, insert to branch, main unaffected -- done differently: covered through transaction branches (#821-#824), not user branches: `transaction_writes_stay_on_the_branch_until_commit` and `rollback_drops_the_branch_and_leaves_main_alone` (SQLite rig) in `crates/sqe-write/src/write_handler.rs`. A user branch cannot take writes yet (see 4.13)
+- [x] 4.10 Verify e2e isolation test passes -- done differently: the transaction-branch tests named in 4.9
+- [x] 4.11 Write e2e test: tag retention prevents snapshot expiry -- done differently: unit level in `vendor/iceberg-rust/crates/iceberg/src/transaction/expire_snapshots.rs` (`test_age_expiry_skips_tagged_snapshot`, `test_cannot_expire_tagged_snapshot_explicitly`, `test_ref_aging_keeps_recent_tag`); no live e2e
+- [x] 4.12 Verify tag retention test passes -- done differently: the vendored unit tests named in 4.11
+- [ ] 4.13 Add `SET WRITE_BRANCH` session variable and wire to write planner (session variable and SET parse shipped: `crates/sqe-sql/src/classifier.rs`, `Session::write_branch` in `crates/sqe-core/src/session.rs`, `SessionManager::set_write_branch`; no write path reads it, so writes still land on main. `sqe-write` only consults `txn_target_branch`)
+- [ ] 4.14 Test main branch cannot be dropped (guard exists in `catalog_ops.rs::apply_ref_ddl` and vendored `RemoveRefAction`; no test asserts it)
+- [x] 4.15 Add `REPLACE TAG` support and verify behaviour -- done differently: `ALTER TABLE ... CREATE OR REPLACE TAG` (`create_or_replace_tag` parser test in `ddl.rs`, `CreateTagAction::create_or_replace`, overwrite handling in `catalog_ops.rs::apply_ref_ddl`)
+- [x] 4.16 Add `WITH RETENTION` clause to CREATE BRANCH (`parse_branch_retention` and `create_branch_with_retention` test in `ddl.rs`; mapped by `branch_retention` in `catalog_ops.rs`)
+- [x] 4.17 Document branching in `docs/features/branching.md` -- done differently: `docs/site/book/src/sql-reference/ddl.md` (Branches and tags) and `docs/site/book/src/sql-reference/dml.md` (Branch routing). The dml.md section claims `SET WRITE_BRANCH` routes writes, which the code does not do yet (see 4.13)
+- [x] 4.18 Update `docs/iceberg-matrix-state.json`: branching-tagging v2/v3 -> F (now at `docs/evidence/iceberg-matrix-state.json`)
+- [ ] 4.19 Commit Phase C and tag v0.18.0-branching (no `v0.18.0-branching` tag; plain `v0.18.0` (2026-03-26) predates the phase)
 
 ## 5. Phase D: V3 type-exposure polish
 
-- [ ] 5.1 Write failing test: `TIMESTAMP_NS(9)` round-trip via INSERT/SELECT
-- [ ] 5.2 Extend `crates/sqe-sql/src/types.rs` to accept `TIMESTAMP_NS(N)` and `TIMESTAMPTZ_NS(N)` in DDL
-- [ ] 5.3 Wire `PrimitiveType::TimestampNs` / `TimestamptzNs` through type_map
-- [ ] 5.4 Verify nanosec roundtrip test passes
-- [ ] 5.5 Write failing test: predicate pushdown on nanosec column prunes partitions
+- [x] 5.1 Write failing test: `TIMESTAMP_NS(9)` round-trip via INSERT/SELECT (`crates/sqe-coordinator/tests/it/v3_e2e.rs::insert_then_select_round_trips_v3_table`, `::create_v3_table_with_nanosec_timestamp_round_trips_through_polaris`)
+- [x] 5.2 Extend `crates/sqe-sql/src/types.rs` to accept `TIMESTAMP_NS(N)` and `TIMESTAMPTZ_NS(N)` in DDL -- done differently: `crates/sqe-sql/src/v3_types.rs::detect_ns_timestamp` (sqlparser yields `DataType::Custom`); tests in `crates/sqe-sql/tests/it/v3_types.rs`
+- [x] 5.3 Wire `PrimitiveType::TimestampNs` / `TimestamptzNs` through type_map -- done differently: no type_map module; `sql_type_to_arrow` maps to Arrow `Timestamp(Nanosecond)` and `arrow_schema_to_iceberg` to `TimestampNs`/`TimestamptzNs` in `crates/sqe-write/src/write_handler.rs` (`test_arrow_to_iceberg_preserves_nanosec`)
+- [x] 5.4 Verify nanosec roundtrip test passes (matrix state `sqe:nanosecond-timestamps:v3` full; parser-to-Iceberg tests in `crates/sqe-coordinator/tests/it/v3_types_integration.rs`)
+- [ ] 5.5 Write failing test: predicate pushdown on nanosec column prunes partitions (no such test; `crates/sqe-catalog/src/expr_to_predicate.rs` narrows nanos to micros)
 - [ ] 5.6 Verify predicate pushdown test passes (iceberg-rust #2069 already handles this)
-- [ ] 5.7 Write failing test: `CREATE TABLE ... status STRING DEFAULT 'pending'` then insert without status
-- [ ] 5.8 Extend `crates/sqe-sql/src/ddl.rs` to parse `DEFAULT <literal>` clause
-- [ ] 5.9 Wire `DEFAULT` through to `NestedField::with_write_default`
-- [ ] 5.10 Verify column-default test passes
-- [ ] 5.11 Write failing test: `ALTER TABLE ADD COLUMN ... DEFAULT 'unknown'` applies retroactively
-- [ ] 5.12 Wire to `NestedField::with_initial_default`
-- [ ] 5.13 Verify initial-default test passes
-- [ ] 5.14 Reject unsupported default expressions (e.g., `current_timestamp()`) with clear error
-- [ ] 5.15 Bump table metadata format-version to 3 only when V3 features are used
-- [ ] 5.16 Add compat test: SQE writes V2 table when only V2 features used
-- [ ] 5.17 Update `docs/iceberg-matrix-state.json`: nanosec -> F, column-defaults -> F, V3 read/write/schema cells -> P or F
-- [ ] 5.18 Commit Phase D and tag v0.19.0-v3-types
+- [ ] 5.7 Write failing test: `CREATE TABLE ... status STRING DEFAULT 'pending'` then insert without status (`v3_types_integration.rs::default_string_lands_on_nestedfield` checks only that `write_default` lands on the schema; nothing reads `write_default` on INSERT, so the insert-without-status half is untested and likely unimplemented)
+- [x] 5.8 Extend `crates/sqe-sql/src/ddl.rs` to parse `DEFAULT <literal>` clause -- done differently: sqlparser parses `DEFAULT` natively; `crates/sqe-sql/src/v3_types.rs::extract_default_literal` lifts it to a literal
+- [x] 5.9 Wire `DEFAULT` through to `NestedField::with_write_default` (`arrow_schema_to_iceberg_with_defaults` in `crates/sqe-write/src/write_handler.rs`; `test_default_string_sets_write_default`)
+- [ ] 5.10 Verify column-default test passes (only the schema-level half passes; see 5.7)
+- [ ] 5.11 Write failing test: `ALTER TABLE ADD COLUMN ... DEFAULT 'unknown'` applies retroactively (`v3_e2e.rs::alter_add_column_with_default_on_v3_table` only checks the column commits; its comment says retroactive fill is not surfaced because the scan reads the snapshot's schema)
+- [x] 5.12 Wire to `NestedField::with_initial_default` (ADD COLUMN path in `crates/sqe-coordinator/src/catalog_ops.rs` sets both `initial_default` and `write_default`)
+- [ ] 5.13 Verify initial-default test passes (see 5.11)
+- [x] 5.14 Reject unsupported default expressions (e.g., `current_timestamp()`) with clear error (`rejects_function_default` in `v3_types.rs`; `unsupported_default_surfaces_error_through_coordinator` in `v3_types_integration.rs`)
+- [x] 5.15 Bump table metadata format-version to 3 only when V3 features are used (`requires_v3_features` and `format_version_properties` in `crates/sqe-write/src/write_handler.rs`)
+- [x] 5.16 Add compat test: SQE writes V2 table when only V2 features used -- done differently: gating unit test `format_version_gates_to_v3_only_when_needed` in `v3_types_integration.rs`; no live V2 write check
+- [x] 5.17 Update `docs/iceberg-matrix-state.json`: nanosec -> F, column-defaults -> F, V3 read/write/schema cells -> P or F (now at `docs/evidence/iceberg-matrix-state.json`; all listed cells full)
+- [ ] 5.18 Commit Phase D and tag v0.19.0-v3-types (no `v0.19.0-v3-types` tag; plain `v0.19.0` (2026-03-26) predates the phase)
 
 ## 6. Phase E: Equality deletes + RowDeltaAction
 
@@ -123,7 +123,7 @@
 - [x] 7.1 Write failing test: table with `write.parquet.bloom-filter-columns = 'id'` produces bloom-enabled Parquet (7 unit tests in `crates/sqe-coordinator/src/writer.rs`)
 - [x] 7.2 Extend `crates/sqe-coordinator/src/writer.rs` to read the property and call `set_column_bloom_filter_enabled` / `set_column_bloom_filter_fpp` (writer lives in coordinator, not worker; same effect)
 - [x] 7.3 Verify bloom-write test passes (7/7 in `cargo test --package sqe-coordinator --lib writer::`)
-- [ ] 7.4 Write failing test: point query on bloom-enabled column shows `files_pruned_bloom > 0` (deferred: needs live docker-compose stack; writer verified at unit-test level)
+- [x] 7.4 Write failing test: point query on bloom-enabled column shows `files_pruned_bloom > 0` (deferred: needs live docker-compose stack; writer verified at unit-test level) -- done differently: row-group level at the reader, `crates/sqe-catalog/tests/it/bloom_probe_369.rs::reader_e2e` writes a bloom-enabled Parquet file, scans it with an `IN` predicate and asserts `row_groups_pruned_bloom` (#369)
 - [x] 7.5 Verify Parquet reader is probing blooms during scan (DataFusion 53 sets `bloom_filter_on_read = true` by default in `datafusion-common` `TableParquetOptions`; no new code needed)
 - [x] 7.6 Write failing test: Puffin NDV sketch emitted on CTAS/INSERT (5 unit tests in `crates/sqe-catalog/src/puffin_stats.rs`)
 - [x] 7.7 Implement Puffin sidecar writer in `crates/sqe-catalog/src/puffin_stats.rs`
@@ -174,12 +174,12 @@
 - [x] 9.12 Add Spark 4.1 round-trip test for MoR-written tables (`#[ignore]` pending docker-compose.spark.yml)
 - [x] 9.13 Add Trino 465 round-trip test for MoR-written tables (`#[ignore]` pending docker-compose.trino.yml)
 - [x] 9.14 Update `docs/iceberg-matrix-state.json`: merge-on-read:v2 partial -> full, v3 none -> partial (+3 raw; 96 -> 99; 50.8% -> 52.4%)
-- [ ] 9.15 Commit Phase H and tag v0.23.0-mor
+- [ ] 9.15 Commit Phase H and tag v0.23.0-mor (work merged; no `v0.23.0-mor` tag, and plain `v0.23.0` (2026-03-30) predates the phase)
 
 ## 10. Matrix submission finalisation
 
 - [ ] 10.1 Regenerate `docs/iceberg-matrix-state.json` via `cargo xtask matrix-report`
-- [ ] 10.2 Verify final score matches planned target (~156/189, 83%)
+- [x] 10.2 Verify final score matches planned target (~156/189, 83%) (`docs/evidence/iceberg-matrix-state.json` scores 167/189, 88.4%, above target)
 - [ ] 10.3 Update Neuw84/iceberg-matrix PR with final ratings
 - [ ] 10.4 Link to each relevant blog post and integration test in `links` fields
 - [ ] 10.5 Respond to matrix maintainer review
@@ -192,11 +192,11 @@
 - [ ] 11.3 Upstream `ExpireSnapshotsAction` wrapper to iceberg-rust (ref #2145)
 - [ ] 11.4 Open DataFusion PR integrating Parquet bloom filter writer with `BloomFilter` physical expr (ref apache/datafusion#16435)
 - [ ] 11.5 Open iceberg-rust PR for incremental scan API (ref #2152)
-- [ ] 11.6 Monitor RisingWave fork for DF 54 rebase monthly; plan SQE DF 54 upgrade when landed
+- [x] 11.6 Monitor RisingWave fork for DF 54 rebase monthly; plan SQE DF 54 upgrade when landed -- done differently: superseded; SQE is on DataFusion 55 (`Cargo.toml`), the vendored iceberg-rust is rebuilt on apache `main` with the RisingWave branch merged on top, and the DataFusion integration is vendored separately in `vendor/datafusion-iceberg` (see `vendor/iceberg-rust/README.md`)
 
 ## 12. Cleanup
 
-- [ ] 12.1 Remove TODO comments added during Phase E-H cherry-pick conflict resolution
+- [x] 12.1 Remove TODO comments added during Phase E-H cherry-pick conflict resolution -- done differently: the vendored tree was rebuilt from apache `main` + the RisingWave merge with SQE patches re-applied and marked `SQE PATCH` (`vendor/iceberg-rust/README.md`); the TODOs left in `transaction/` are upstream ones
 - [ ] 12.2 Archive `docs/superpowers/plans/2026-04-24-iceberg-matrix-parity.md` by linking it from the archived change
 - [ ] 12.3 Update `README.md` roadmap checklist for all 8 phases
 - [ ] 12.4 Update `nextsteps.md` to mark the matrix work complete
