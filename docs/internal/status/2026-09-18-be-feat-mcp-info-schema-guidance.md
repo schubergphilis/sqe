@@ -1,0 +1,1 @@
+**STATUS 2026-09-18 (be): `execute_sql_readonly` tells agents not to scan `information_schema` catalog-wide (`feat/mcp-info-schema-guidance`); lazy per-schema build is #701; Hive tag masks (cycle 3) pointer is #702.**
