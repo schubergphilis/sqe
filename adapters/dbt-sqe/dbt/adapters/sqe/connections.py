@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import agate
-import pyarrow  # noqa: F401
+import pyarrow
 from dbt.adapters.contracts.connection import (
     AdapterResponse,
     Connection,
@@ -68,18 +68,45 @@ _NO_RESULT_SQL = re.compile(
 )
 
 
+# ExecuteQuery reports a failing statement only when its stream is read, and
+# closing an unread DML cursor cancels the write. dbt never fetches DML
+# (statement('main') has fetch_result=False), so these are read on execute.
+_DML_SQL = re.compile(
+    r"^(?:\s*(?:/\*.*?\*/|--[^\n]*))*\s*\(?\s*(?:insert|delete|update|merge)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
 class _Cursor:
-    """ADBC cursor proxy: routes no-result statements to ExecuteUpdate."""
+    """ADBC cursor proxy: routes no-result statements to ExecuteUpdate and
+    reads DML results on execute, so failures raise and writes complete."""
 
     def __init__(self, inner):
         self._inner = inner
+        self._result = None
 
     def execute(self, sql, parameters=None):
+        self._result = None
         if parameters is None and _NO_RESULT_SQL.match(sql):
             self._inner.executescript(sql)
+            self._result = pyarrow.table({})
         else:
             self._inner.execute(sql, parameters)
+            if _DML_SQL.match(sql):
+                self._result = self._inner.fetch_arrow_table()
         return self
+
+    def fetch_arrow_table(self):
+        if self._result is not None:
+            return self._result
+        return self._inner.fetch_arrow_table()
+
+    @property
+    def rowcount(self):
+        result = self._result
+        if result is not None and "rows_affected" in result.column_names and result.num_rows == 1:
+            return result.column("rows_affected")[0].as_py()
+        return self._inner.rowcount
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -192,15 +219,17 @@ class SQEConnectionManager(SQLConnectionManager):
 
     @classmethod
     def get_result_from_cursor(cls, cursor, limit=None) -> agate.Table:
-        """Convert ADBC Arrow result to agate table for dbt."""
-        try:
-            table = cursor.fetch_arrow_table()
-        except Exception:
-            return agate.Table(rows=[], column_names=[], column_types=[])
+        """Convert ADBC Arrow result to agate table for dbt.
+
+        A failed read raises: an empty table here would make dbt treat a
+        failed metadata query as "no columns" and render broken SQL from it.
+        """
+        table = cursor.fetch_arrow_table()
 
         if table.num_rows == 0:
+            # agate needs one type per name; there are no values to infer from.
             names = [field.name for field in table.schema]
-            return agate.Table(rows=[], column_names=names, column_types=[])
+            return agate.Table(rows=[], column_names=names, column_types=[agate.Text()] * len(names))
 
         columns = {}
         for i, field in enumerate(table.schema):
