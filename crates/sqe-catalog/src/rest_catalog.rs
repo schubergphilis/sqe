@@ -3690,6 +3690,19 @@ impl Catalog for SessionCatalogBridge {
                 ),
             ));
         }
+        // Same rule for a data write on the session's WRITE_BRANCH (#829):
+        // a write path that ignored the branch must not land on `main`.
+        if let Some(branch) = crate::txn::write_branch() {
+            if sets_ref(iceberg::spec::MAIN_BRANCH) {
+                return Err(iceberg::Error::new(
+                    iceberg::ErrorKind::FeatureUnsupported,
+                    format!(
+                        "this write to {ident} is not supported with WRITE_BRANCH \
+                         '{branch}': it would commit to main; RESET WRITE_BRANCH first"
+                    ),
+                ));
+            }
+        }
         let branch_commit = txn.filter(|txn| sets_ref(&txn.branch_name()));
         if let Some(txn) = &branch_commit {
             // The statement was admitted before it wrote; this catches a

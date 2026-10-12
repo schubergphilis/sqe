@@ -4028,6 +4028,65 @@ async fn test_multi_table_transaction_commit() {
     }
 }
 
+// Test: with WRITE_BRANCH set outside a transaction, INSERT, DELETE and
+// UPDATE read and write the branch and never move main (#829). main gets a
+// row the branch lacks first, so a write that read main would carry it over.
+// The test handler has no session manager, so the branch rides on the
+// session as `SET WRITE_BRANCH` would store it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn test_write_branch_routes_writes_to_the_branch() {
+    let (session, handler) = crate::common::setup_handler().await;
+    txn_tables(&handler, &session, "wb_routing", "wb_routing_unused").await;
+    let table = "test_ns.wb_routing";
+    for sql in [
+        format!("ALTER TABLE {table} CREATE BRANCH dev"),
+        format!("INSERT INTO {table} SELECT 99 as id"),
+    ] {
+        handler
+            .execute(&session, &sql, None)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    let mut on_dev = session.clone();
+    on_dev.write_branch = Some("dev".to_string());
+    for sql in [
+        format!("INSERT INTO {table} SELECT 4 as id"),
+        format!("DELETE FROM {table} WHERE id = 2"),
+        format!("UPDATE {table} SET id = 10 WHERE id = 1"),
+    ] {
+        handler
+            .execute(&on_dev, &sql, None)
+            .await
+            .unwrap_or_else(|e| panic!("{sql} on dev: {e}"));
+    }
+
+    assert_eq!(
+        txn_ids(&handler, &session, &format!("{table} FOR VERSION AS OF 'dev'")).await,
+        vec![3, 4, 10],
+        "dev holds its own writes and none of main's"
+    );
+    assert_eq!(
+        txn_ids(&handler, &session, table).await,
+        vec![1, 2, 3, 99],
+        "main is untouched"
+    );
+
+    let err = handler
+        .execute(&on_dev, "INSERT INTO test_ns.wb_routing_unused SELECT 4 as id", None)
+        .await
+        .expect_err("a table without branch dev");
+    assert!(err.to_string().contains("CREATE BRANCH dev"), "{err}");
+
+    for t in ["wb_routing", "wb_routing_unused"] {
+        handler
+            .execute(&session, &format!("DROP TABLE test_ns.{t}"), None)
+            .await
+            .expect("DROP TABLE cleanup should succeed");
+    }
+}
+
 // Test: a commit to one table under an open transaction makes COMMIT fail
 // with a conflict and leaves both tables as they were (#823).
 #[tokio::test(flavor = "multi_thread")]
