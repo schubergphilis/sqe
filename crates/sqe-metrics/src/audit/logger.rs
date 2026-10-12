@@ -365,6 +365,55 @@ impl SpoolCompactor {
             .set_len(0)?;
         Ok(true)
     }
+
+    /// Remove the first `keep_from` bytes of the spool, which must end on a
+    /// line boundary, and keep everything after them. Returns `Ok(false)`
+    /// when there is no spool sink or the spool shrank underneath.
+    ///
+    /// The bulk copy of the kept tail runs without the lock, so the writer
+    /// thread is not stalled for it: a long stall fills the writer queue,
+    /// and under `fail_mode = closed` that refuses queries. Under the lock
+    /// only the bytes appended during the copy move, then the copy is renamed
+    /// over the spool and the sink reopened on it.
+    pub fn trim_head(&self, keep_from: u64) -> std::io::Result<bool> {
+        use std::io::{Read as _, Seek as _};
+        let len0 = std::fs::metadata(&self.path)?.len();
+        if keep_from == 0 || keep_from > len0 {
+            return Ok(false);
+        }
+        let mut tmp_name = self.path.clone().into_os_string();
+        tmp_name.push(".trim");
+        let tmp = std::path::PathBuf::from(tmp_name);
+        let result = (|| {
+            let mut src = std::fs::File::open(&self.path)?;
+            src.seek(std::io::SeekFrom::Start(keep_from))?;
+            let mut dst = std::fs::File::create(&tmp)?;
+            std::io::copy(&mut (&mut src).take(len0 - keep_from), &mut dst)?;
+
+            let mut guard = spool_lock(&self.sink);
+            let Some(sink) = guard.as_mut() else {
+                return Ok(false);
+            };
+            // Whole records only from here on: the writer never leaves a
+            // partial line behind a flush.
+            sink.flush()?;
+            let len1 = std::fs::metadata(&self.path)?.len();
+            if len1 < len0 {
+                return Ok(false);
+            }
+            std::io::copy(&mut (&mut src).take(len1 - len0), &mut dst)?;
+            std::fs::rename(&tmp, &self.path)?;
+            let file = open_sink_file(&self.path).map_err(std::io::Error::other)?;
+            *guard = Some(OcsfJsonlSink::from_writer(Box::new(
+                std::io::BufWriter::new(file),
+            )));
+            Ok(true)
+        })();
+        if !matches!(result, Ok(true)) {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
+    }
 }
 
 fn record_drop(dropped: &Option<IntCounterVec>, reason: &'static str) {
@@ -1604,13 +1653,27 @@ mod tests {
         let ocsf_text =
             std::fs::read_to_string(dir.path().join("audit.ocsf.jsonl")).unwrap_or_default();
         let lines: Vec<&str> = ocsf_text.lines().filter(|l| !l.is_empty()).collect();
-        assert_eq!(lines.len(), 1, "one OCSF line for the legacy entry: {ocsf_text:?}");
+        assert_eq!(
+            lines.len(),
+            1,
+            "one OCSF line for the legacy entry: {ocsf_text:?}"
+        );
         let ocsf: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
 
-        assert_eq!(ocsf["metadata"]["uid"], native["integrity"]["hash"], "same chained record");
+        assert_eq!(
+            ocsf["metadata"]["uid"], native["integrity"]["hash"],
+            "same chained record"
+        );
         let text = ocsf["unmapped"]["query_text"].as_str().expect("query text");
-        assert_eq!(text, native["query_text"].as_str().unwrap(), "same redacted text");
-        assert!(!ocsf_text.contains("topsecretvalue"), "secret never reaches OCSF: {ocsf_text}");
+        assert_eq!(
+            text,
+            native["query_text"].as_str().unwrap(),
+            "same redacted text"
+        );
+        assert!(
+            !ocsf_text.contains("topsecretvalue"),
+            "secret never reaches OCSF: {ocsf_text}"
+        );
         assert!(text.contains("[REDACTED]"), "{text}");
         assert_eq!(ocsf["status_id"], 1, "{ocsf}");
     }

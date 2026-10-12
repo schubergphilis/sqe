@@ -4455,7 +4455,9 @@ pub struct AuditExportConfig {
     /// Flush interval in milliseconds. Default: 2000.
     #[serde(default = "default_export_flush_ms")]
     pub flush_interval_ms: u64,
-    /// Maximum spool size in bytes before back-pressure applies. Default: 1 GiB.
+    /// Hard cap on the export spool in bytes. Past it the shipper drops
+    /// shipped records, then the oldest unshipped ones, down to half the cap.
+    /// Queries are never blocked. Default: 1 GiB.
     #[serde(default = "default_export_max_spool")]
     pub max_spool_bytes: u64,
     /// Where to start replaying the spool on restart: "now" skips historical
