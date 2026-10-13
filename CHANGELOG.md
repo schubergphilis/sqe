@@ -21,7 +21,10 @@ All notable changes to SQE are documented in this file.
     start seeing `audit.jsonl.00000001`, ... next to the active file. A
     shipper tailing `audit.jsonl` by name keeps working; one that holds the
     file open must follow renames. `max_file_bytes = 0` restores the old
-    single growing file.
+    single growing file. Rotated files are deleted only when the audit
+    volume drops below `min_free_bytes` (default 1 GiB): oldest first, never
+    the newest, each deletion logged as an error and recorded in the chain
+    as a `maintenance` / `PRUNED` record.
 
 ### Fixed
 
