@@ -40,6 +40,8 @@ struct Charged {
     spillable: usize,
     /// Consumers registered on the budget's pool.
     consumers: usize,
+    /// Of those, the sorts' consumers ([`is_sorter`]).
+    sorters: usize,
 }
 
 /// A byte budget whose top `headroom_percent` only non-spillable consumers
@@ -53,6 +55,9 @@ pub(crate) struct HeadroomBudget {
     headroom_percent: u8,
     /// Whether each consumer's growth is capped at an equal share.
     fair_share: bool,
+    /// Whether each sort's growth is capped at an equal share of the
+    /// spillable bytes.
+    sort_share: bool,
     charged: Mutex<Charged>,
 }
 
@@ -68,8 +73,26 @@ impl HeadroomBudget {
             spillable_limit: limit - headroom,
             headroom_percent,
             fair_share: false,
+            sort_share: false,
             charged: Mutex::new(Charged::default()),
         }
+    }
+
+    /// Refuse a sort's consumer ([`is_sorter`]) growth past an equal share
+    /// of the spillable bytes per registered sort consumer. Its first
+    /// reservation is exempt, as under [`Self::with_fair_share`].
+    ///
+    /// A partitioned sort runs one sorter per partition. Under a greedy
+    /// budget the first sorters to fill take every spillable byte, and a
+    /// sorter refused while it holds nothing has nothing to spill and fails
+    /// the query (#788). The share keeps room for each of them, and the
+    /// spillable line keeps the headroom free for the final merge. Other
+    /// consumers stay greedy: a lone hash aggregate in a wide plan keeps
+    /// the whole spillable budget, which a share over every consumer (the
+    /// fair pool's arithmetic) would cut to a sliver.
+    pub(crate) fn with_sort_share(mut self) -> Self {
+        self.sort_share = true;
+        self
     }
 
     /// Refuse a consumer that adapts to a refusal ([`adapts_when_refused`])
@@ -98,13 +121,20 @@ impl HeadroomBudget {
     }
 
     /// Count `consumer` towards the fair share.
-    pub(crate) fn register(&self, _consumer: &MemoryConsumer) {
-        self.lock().consumers += 1;
+    pub(crate) fn register(&self, consumer: &MemoryConsumer) {
+        let mut charged = self.lock();
+        charged.consumers += 1;
+        if is_sorter(consumer) {
+            charged.sorters += 1;
+        }
     }
 
-    pub(crate) fn unregister(&self, _consumer: &MemoryConsumer) {
+    pub(crate) fn unregister(&self, consumer: &MemoryConsumer) {
         let mut charged = self.lock();
         charged.consumers = charged.consumers.saturating_sub(1);
+        if is_sorter(consumer) {
+            charged.sorters = charged.sorters.saturating_sub(1);
+        }
     }
 
     /// The most one consumer may grow to under the fair share.
@@ -140,6 +170,17 @@ impl HeadroomBudget {
                     "{what} fair share: each of {} operators may grow to {share} bytes; {} \
                      requests {additional} additional bytes with {held} reserved",
                     charged.consumers,
+                    consumer.name(),
+                )));
+            }
+        }
+        if self.sort_share && held > 0 && is_sorter(consumer) {
+            let share = self.spillable_limit / charged.sorters.max(1);
+            if held.saturating_add(additional) > share {
+                return Err(DataFusionError::ResourcesExhausted(format!(
+                    "{what} sort share: each of {} sort operators may grow to {share} bytes; \
+                     {} requests {additional} additional bytes with {held} reserved",
+                    charged.sorters,
                     consumer.name(),
                 )));
             }
@@ -190,6 +231,14 @@ impl HeadroomBudget {
 /// whose spill-file merge then merges fewer files per pass.
 fn adapts_when_refused(consumer: &MemoryConsumer) -> bool {
     consumer.can_spill() || consumer.name().starts_with("ExternalSorterMerge[")
+}
+
+/// Whether `consumer` belongs to a sort: DataFusion's `ExternalSorter[n]`
+/// (buffers, spills when refused) or `ExternalSorterMerge[n]` (merge
+/// reservation, merges fewer spill files per pass when refused).
+fn is_sorter(consumer: &MemoryConsumer) -> bool {
+    let name = consumer.name();
+    name.starts_with("ExternalSorter[") || name.starts_with("ExternalSorterMerge[")
 }
 
 /// The node pool with a headroom: the wrapped pool still enforces the total
@@ -495,5 +544,43 @@ mod tests {
         budget.unregister(&b);
         // Alone, a may grow to the spillable line.
         budget.try_charge(&a, 500, 300, "q").unwrap();
+    }
+
+    #[test]
+    fn sorts_share_the_spillable_bytes_and_everything_else_stays_greedy() {
+        // #788: eight sorters under a greedy quota; the first to fill took
+        // the spillable bytes and the last, holding nothing, failed.
+        let sorter = MemoryConsumer::new("ExternalSorter[0]").with_can_spill(true);
+        let merge = MemoryConsumer::new("ExternalSorterMerge[0]");
+        let idle = MemoryConsumer::new("ExternalSorter[1]").with_can_spill(true);
+        let agg = MemoryConsumer::new("GroupedHashAggregateStream[0]").with_can_spill(true);
+        let budget = HeadroomBudget::new(1000, 20, true).with_sort_share();
+        for consumer in [&sorter, &merge, &idle, &agg] {
+            budget.register(consumer);
+        }
+        // Three sort consumers share the 800 spillable bytes: 266 each.
+        assert_eq!(grow_until_refused(&budget, &sorter, 100, 1), 266);
+        let err = budget.try_charge(&sorter, 266, 1, "q").unwrap_err();
+        assert!(
+            matches!(err, DataFusionError::ResourcesExhausted(_)),
+            "the refusal must be the error a sorter spills on: {err}"
+        );
+        assert!(err.to_string().contains("sort share"), "{err}");
+        // The merge reservation arrives in one piece, past the share.
+        budget.try_charge(&merge, 0, 300, "q").unwrap();
+        assert!(budget.try_charge(&merge, 300, 1, "q").is_err());
+        budget.release(&merge, 300);
+        // An aggregate is not a sort: it grows to the spillable line.
+        budget.try_charge(&agg, 0, 100, "q").unwrap();
+        budget.try_charge(&agg, 100, 434, "q").unwrap();
+        assert!(budget.try_charge(&agg, 534, 1, "q").is_err());
+        budget.release(&agg, 534);
+        // The idle sorter still finds its first batch's room.
+        budget.try_charge(&idle, 0, 266, "q").unwrap();
+        // Unregistered sorts give their share back.
+        budget.unregister(&merge);
+        budget.unregister(&idle);
+        budget.release(&idle, 266);
+        budget.try_charge(&sorter, 266, 134, "q").unwrap();
     }
 }

@@ -68,6 +68,8 @@ Greedy pool lets one large operator use the budget until spill. Fair pool divide
 
 `unspillable_headroom_percent` keeps the top share of the pool, and of each query's `query.max_query_memory`, for consumers that cannot spill: the scan's decode buffers, a sort's merge, hash-join builds. Spillable operators (hash aggregates, sorts, repartition buffers) are refused at that line and spill there. Without it a large aggregate fills the cap and the scan feeding it is refused first, failing a query that could have spilled; with the 20% default the same SF10 aggregate under a 2 GB cap completes. The cost is that a lone spillable operator spills a little earlier at a tight cap. `0` turns it off; valid values are 0 to 50. It applies to the greedy pool only.
 
+Within one query, sorts do not take the spillable bytes greedily. A sort runs one sorter per partition; each sorter may grow to an equal share of the spillable bytes before it spills, and the sorters' merge reservations share a quarter of the query's cap (at most `sort_spill_reservation_bytes`, at least 1 MB each). Without this, at 16 partitions the default 10 MB merge reservations alone take 160 MB, and the first sorters to fill leave nothing for the rest. Other operators, such as hash aggregates, still grow to the spillable line.
+
 ### Observability
 
 Enable durable audit and lineage early if governance matters. Do not write audit logs to `/tmp` or container `emptyDir`.

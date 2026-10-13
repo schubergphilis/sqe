@@ -743,7 +743,8 @@ async fn drain_capped(
             format!("{what} execution failed: {e}"),
         )
     };
-    let mut stream = execute_stream(Arc::clone(plan), ctx.task_ctx()).map_err(fail)?;
+    let task = crate::join_fallback::sort_task_context(ctx, plan);
+    let mut stream = execute_stream(Arc::clone(plan), task).map_err(fail)?;
     let mut rows: usize = 0;
     while let Some(batch) = stream.try_next().await.map_err(fail)? {
         rows = rows.saturating_add(batch.num_rows());

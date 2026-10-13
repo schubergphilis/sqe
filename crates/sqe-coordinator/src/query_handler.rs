@@ -3942,7 +3942,8 @@ impl QueryHandler {
             .running(query_id, start.elapsed().as_millis() as u64);
 
         let schema = final_plan.schema();
-        let stream = execute_stream(Arc::clone(&final_plan), ctx.task_ctx())
+        let task = crate::join_fallback::sort_task_context(&ctx, &final_plan);
+        let stream = execute_stream(Arc::clone(&final_plan), task)
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Query execution failed: {e}")))?;
         let fallback = self.join_fallback(&ctx, shared_pool, enforced_logical, query_id);
         let replanned = crate::join_fallback::ReplannedPlan::default();
@@ -4425,7 +4426,8 @@ impl QueryHandler {
         let configured_max = self.config.query.max_result_rows;
         let fallback = self.join_fallback(&ctx, shared_pool, enforced_logical, query_id);
         let replanned = crate::join_fallback::ReplannedPlan::default();
-        let stream = execute_stream(final_plan.clone(), ctx.task_ctx())
+        let task = crate::join_fallback::sort_task_context(&ctx, &final_plan);
+        let stream = execute_stream(final_plan.clone(), task)
             .map_err(|e| crate::query_memory::execution_error(&e))?;
         let mut stream = crate::join_fallback::FallbackStream::wrap(
             stream,
