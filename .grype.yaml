@@ -1,5 +1,5 @@
-# No image advisory exceptions. The runtime base in this update contains
-# glibc-2.44 2.44-r7; an unfiltered arm64 scan no longer reports the previously
-# accepted High CVE-2026-19499. Track the remaining unpatched Medium/Low
-# findings in #800. Keep the High/Critical image gate active.
+# No image advisory exceptions. The runtime base contains glibc-2.44 2.44-r8,
+# which fixes the Medium/Low advisories tracked in #800; unfiltered amd64 and
+# arm64 scans of the base report nothing. Keep the High/Critical image gate
+# active.
 ignore: []
