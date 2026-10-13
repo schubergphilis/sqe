@@ -116,6 +116,33 @@ pub fn verify_audit_bytes(bytes: &[u8]) -> Result<AuditVerifyReport, String> {
     Ok(report)
 }
 
+/// Check that `next` (a rotated-in file) continues `prev` (the file rotated
+/// out before it). `Ok(Some(reason))` when `next` opens with a `BROKEN:`
+/// segment, a deliberate restart that reads as one, not as tampering.
+/// The oldest retained file not starting at genesis is not checked here:
+/// retention deleted what came before it.
+pub fn link_rotated_reports(
+    prev: &AuditVerifyReport,
+    next: &AuditVerifyReport,
+) -> Result<Option<String>, String> {
+    if let Some(reason) = next.first_prev_hash.strip_prefix("BROKEN:") {
+        return Ok(Some(reason.to_string()));
+    }
+    if next.first_seq != prev.last_seq + 1 {
+        return Err(format!(
+            "seq {} follows {}, records missing between files",
+            next.first_seq, prev.last_seq
+        ));
+    }
+    if next.first_prev_hash != prev.last_hash {
+        return Err(format!(
+            "seq {}: prev_hash does not chain to the previous file",
+            next.first_seq
+        ));
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4,6 +4,38 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Audit log rotation that keeps the hash chain (#838)
+
+    `[metrics.audit] max_file_bytes` rotates the audit file, and the OCSF
+    file with it, to `<audit_log_path>.<generation>` once either reaches the
+    size. The first record of the new file chains to the last record of the
+    rotated one, and a restart on a still-empty file resumes from the newest
+    rotated file instead of starting over at genesis. A torn active file
+    still opens a `BROKEN:` segment. `max_files` deletes the oldest rotated
+    generations. `sqe-server --verify-audit <audit_log_path>` now verifies
+    every generation in order and fails if one does not chain to the one
+    before it. Rotation is on by default: `max_file_bytes` is 256 MiB and
+    `max_files` is `0` (keep every rotated file), so existing deployments
+    start seeing `audit.jsonl.00000001`, ... next to the active file. A
+    shipper tailing `audit.jsonl` by name keeps working; one that holds the
+    file open must follow renames. `max_file_bytes = 0` restores the old
+    single growing file. Rotated files are deleted only when the audit
+    volume drops below `min_free_bytes` (default 1 GiB): oldest first, never
+    the newest, each deletion logged as an error and recorded in the chain
+    as a `maintenance` / `PRUNED` record.
+
+### Fixed
+
+- No audit export spool without a shipper to drain it (#838)
+
+    With `[metrics.audit_export] enabled = true` but no OTLP endpoint (or an
+    exporter that failed to build), the spool was still written. Only the
+    shipper enforces `max_spool_bytes`, so it grew without bound. The
+    endpoint is now resolved first, and no spool is opened when there is
+    nothing to ship it.
+
 ## [0.51.0] — 2026-10-13
 
 ### Added
