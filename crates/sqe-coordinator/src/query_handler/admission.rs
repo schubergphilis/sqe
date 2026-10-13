@@ -135,7 +135,9 @@ impl QueryHandler {
         // describes eight tables at once against the defaults (1GB budget,
         // 256MB per query) sees the fifth `SHOW COLUMNS` refused with a
         // memory error while the pool is idle. They still take the
-        // concurrency permits above.
+        // concurrency permits above. A statement admitted under pressure
+        // reserves only its reduced quota, so a user whose heavy queries
+        // hold most of their budget can still run a light read.
         let reserves_memory = !metadata;
         let memory_reservation = if reserves_memory
             && self.per_user_memory_budget_bytes > 0
@@ -144,7 +146,7 @@ impl QueryHandler {
             let username = session.user.username.clone();
             match self.per_user_memory.try_reserve(
                 &username,
-                self.per_query_memory_bytes,
+                quota.bytes,
                 self.per_user_memory_budget_bytes,
             ) {
                 Some(r) => Some(r),

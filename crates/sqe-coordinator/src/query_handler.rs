@@ -10616,6 +10616,12 @@ mod show_stats_policy_tests {
         let admission = handler.admit(&session, "SELECT 1", "query").expect("admitted");
         assert!(admission.quota.under_pressure);
         assert_eq!(admission.quota.bytes, 64 * 1024 * 1024);
+        assert!(admission.memory_reservation.is_some(), "per-user budget is on by default");
+        assert_eq!(
+            handler.per_user_memory.used_bytes("analyst"),
+            64 * 1024 * 1024,
+            "the per-user reservation is the reduced quota"
+        );
         drop(admission);
 
         for sql in [

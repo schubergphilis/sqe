@@ -37,8 +37,10 @@ All notable changes to SQE are documented in this file.
     `[query] pressure_admission_memory` cap (default 64MB, never above
     `max_query_memory`). A read that outgrows it fails with
     `ResourcesExhausted` naming `query.pressure_admission_memory`, and gets
-    no sort-merge join retry. Writes, DDL and procedures are still refused
-    at red. `pressure_admission_memory = "0"` restores the old refusal.
+    no sort-merge join retry. The per-user memory reservation is the
+    reduced cap too. Every other statement (writes, DDL, procedures,
+    session and transaction control) is still refused at red.
+    `pressure_admission_memory = "0"` restores the old refusal.
 
 ### Fixed
 
