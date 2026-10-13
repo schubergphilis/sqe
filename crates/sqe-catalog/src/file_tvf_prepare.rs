@@ -225,6 +225,7 @@ impl PreparedProviders {
     /// Outside a statement scope there is nowhere to keep it: the following
     /// `call` then reports "not prepared", naming the entry point to fix.
     pub fn insert(&self, exprs: &[Expr], provider: Arc<dyn TableProvider>) {
+        let provider: Arc<dyn TableProvider> = Arc::new(FileTableProvider { inner: provider });
         let slot = self.slot(exprs);
         let stored = STATEMENT_PROVIDERS.try_with(|scope| {
             scope
@@ -271,6 +272,92 @@ impl PreparedProviders {
              (architecture review 806: no network IO inside DataFusion's synchronous hooks)"
         ))
     }
+}
+
+/// The provider of a file table function call, as the plan sees it.
+///
+/// Marks the scan as a file read for the policy rewriter
+/// ([`is_file_table_provider`]): a file carries no Iceberg column tags, and
+/// access to it is governed by the `[storage.tvf]` path policy, so the
+/// rewriter must not deny it for an unknown tag state. The marker is the
+/// provider's type, not the scan name, so a table named `read_csv()` gains
+/// nothing. Read-only: the write methods keep the trait's refusals.
+#[derive(Debug)]
+struct FileTableProvider {
+    inner: Arc<dyn TableProvider>,
+}
+
+#[async_trait::async_trait]
+impl TableProvider for FileTableProvider {
+    fn schema(&self) -> arrow_schema::SchemaRef {
+        self.inner.schema()
+    }
+    fn constraints(&self) -> Option<&datafusion::common::Constraints> {
+        self.inner.constraints()
+    }
+    fn table_type(&self) -> datafusion::datasource::TableType {
+        self.inner.table_type()
+    }
+    fn get_table_definition(&self) -> Option<&str> {
+        self.inner.get_table_definition()
+    }
+    fn get_logical_plan(
+        &'_ self,
+    ) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> {
+        self.inner.get_logical_plan()
+    }
+    fn get_column_default(&self, column: &str) -> Option<&Expr> {
+        self.inner.get_column_default(column)
+    }
+    // Desugared `async_trait` signatures that hand back the inner provider's
+    // future: no new async block, so no new `Send` proof to compile.
+    fn scan<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+        &'life0 self,
+        state: &'life1 dyn datafusion::catalog::Session,
+        projection: Option<&'life2 Vec<usize>>,
+        filters: &'life3 [Expr],
+        limit: Option<usize>,
+    ) -> BoxFuture<'async_trait, DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.inner.scan(state, projection, filters, limit)
+    }
+    fn scan_with_args<'a, 'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        state: &'life1 dyn datafusion::catalog::Session,
+        args: datafusion::catalog::ScanArgs<'a>,
+    ) -> BoxFuture<'async_trait, DFResult<datafusion::catalog::ScanResult>>
+    where
+        'a: 'async_trait,
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.inner.scan_with_args(state, args)
+    }
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DFResult<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+        self.inner.supports_filters_pushdown(filters)
+    }
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        self.inner.statistics()
+    }
+}
+
+/// Whether `provider` is a file table function's (`read_csv`,
+/// `read_parquet`, `read_json`, ...). Injected into the policy rewriter,
+/// which cannot name the type.
+pub fn is_file_table_provider(provider: &dyn TableProvider) -> bool {
+    (provider as &dyn std::any::Any)
+        .downcast_ref::<FileTableProvider>()
+        .is_some()
 }
 
 /// A table function whose provider is built ahead of planning.

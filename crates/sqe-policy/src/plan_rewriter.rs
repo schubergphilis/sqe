@@ -56,12 +56,19 @@ pub struct PolicyPlanRewriter {
     /// Maps a metadata TVF provider (`table_files('ns','t')`, ...) to the
     /// `(namespace, table)` it describes. `None` when not wired (unit tests).
     metadata_target: Option<MetadataTarget>,
+    /// Recognises a file table function's provider (`read_csv(...)`, ...).
+    /// `None` when not wired (unit tests).
+    file_table: Option<FileTable>,
 }
 
 /// `(namespace, table)` a metadata TVF provider reads, `None` for any other
 /// provider. Injected because the TVF type lives in `sqe-catalog`.
 pub type MetadataTarget =
     fn(&dyn datafusion::catalog::TableProvider) -> Option<(String, String)>;
+
+/// Whether a provider is a file table function's. Injected because the type
+/// lives in `sqe-catalog`.
+pub type FileTable = fn(&dyn datafusion::catalog::TableProvider) -> bool;
 
 impl PolicyPlanRewriter {
     pub fn new(store: Arc<dyn PolicyStore>) -> Self {
@@ -72,7 +79,17 @@ impl PolicyPlanRewriter {
             mask_precedence: sqe_core::config::MaskPrecedence::default(),
             hive_catalogs: Arc::new(HiveCatalogs::default()),
             metadata_target: None,
+            file_table: None,
         }
+    }
+
+    /// Inject the file table function lookup. A file carries no Iceberg
+    /// column tags and its access is governed by the `[storage.tvf]` path
+    /// policy, so its scan is not denied for an unknown tag state.
+    #[must_use = "with_file_table consumes self; bind the returned rewriter"]
+    pub fn with_file_table(mut self, file_table: FileTable) -> Self {
+        self.file_table = Some(file_table);
+        self
     }
 
     /// Inject the metadata TVF target lookup. With it, `evaluate` refuses a
@@ -167,9 +184,24 @@ impl PolicyEnforcer for PolicyPlanRewriter {
         // The TVF reads the catalog it is registered on, so the target lives
         // in the catalog the function name resolves to.
         let mut metadata_targets: Vec<(Option<String>, String, String)> = Vec::new();
+        // Scan names some file table function scan carries, and scan names
+        // some other scan carries. Policies are keyed by scan name, so a name
+        // in both (a table named `read_csv()` beside a `read_csv(...)` call)
+        // is governed as a table.
+        let mut file_scans: HashSet<String> = HashSet::new();
+        let mut other_scans: HashSet<String> = HashSet::new();
         plan.apply_with_subqueries(|node| {
             if let LogicalPlan::TableScan(scan) = node {
                 let table_name = scan.table_name.to_string();
+                let is_file = datafusion::datasource::source_as_provider(&scan.source)
+                    .ok()
+                    .zip(self.file_table)
+                    .is_some_and(|(provider, f)| f(provider.as_ref()));
+                if is_file {
+                    file_scans.insert(table_name.clone());
+                } else {
+                    other_scans.insert(table_name.clone());
+                }
                 if let Ok(provider) = datafusion::datasource::source_as_provider(&scan.source) {
                     if let Some((ns, table)) =
                         self.metadata_target.and_then(|f| f(provider.as_ref()))
@@ -330,7 +362,11 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                     // as known-no-tags rather than letting the fail-closed None
                     // branch deny every information_schema query (which dbt and
                     // SHOW COLUMNS / SHOW CREATE TABLE issue constantly).
-                    let tag_lookup = if is_reserved_virtual_ref(table_ref) {
+                    // A file table function's scan is never in that cache
+                    // either, and a file has no Iceberg tags.
+                    let file_scan =
+                        file_scans.contains(table_name) && !other_scans.contains(table_name);
+                    let tag_lookup = if is_reserved_virtual_ref(table_ref) || file_scan {
                         Some(HashMap::new())
                     } else {
                         tag_source.column_tags(catalog, &ns_path, table_ref.table())
@@ -2484,6 +2520,110 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.error_code(), sqe_core::SqeErrorCode::TableNotFound);
         assert!(err.to_string().contains("table not found: sales.orders"), "{err}");
+    }
+
+    /// A file table function's scan (`read_csv(...)`) has no Iceberg tags, so
+    /// an unknown tag state does not deny it. Recognised by provider type:
+    /// any other scan named `read_csv()` is still denied, as is one sharing
+    /// that name with a file scan in the same plan.
+    #[tokio::test]
+    async fn file_table_scan_is_not_denied_for_unknown_tag_state() {
+        use crate::policy_store::InMemoryPolicyStore;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::catalog::TableProvider;
+        use datafusion::datasource::empty::EmptyTable;
+        use datafusion::datasource::{provider_as_source, MemTable, ViewTable};
+        use sqe_core::SessionUser;
+
+        struct UnknownTags;
+        impl TagSource for UnknownTags {
+            fn column_tags(
+                &self,
+                _c: Option<&str>,
+                _n: &[String],
+                _t: &str,
+            ) -> Option<HashMap<String, Vec<String>>> {
+                None
+            }
+        }
+        // Stand-in for the file table provider: an EmptyTable.
+        fn file_table(p: &dyn TableProvider) -> bool {
+            (p as &dyn std::any::Any)
+                .downcast_ref::<EmptyTable>()
+                .is_some()
+        }
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let scan = |name: &str, provider: Arc<dyn TableProvider>| {
+            LogicalPlanBuilder::scan(name, provider_as_source(provider), None)
+                .unwrap()
+                .build()
+                .unwrap()
+        };
+        let file = || scan("read_csv()", Arc::new(EmptyTable::new(Arc::clone(&schema))));
+        let mem = |name: &str| {
+            scan(
+                name,
+                Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]]).unwrap()),
+            )
+        };
+        let view = scan(
+            "read_csv()",
+            Arc::new(ViewTable::new(
+                datafusion::logical_expr::builder::table_scan(Some("t"), &schema, None)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+                None,
+            )),
+        );
+        let same_name_union = LogicalPlanBuilder::from(file())
+            .union(mem("read_csv()"))
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let user = SessionUser {
+            username: "analyst".to_string(),
+            roles: vec![],
+            subject: None,
+            email: None,
+            groups: vec![],
+        };
+        let scope = crate::TableScope {
+            catalog: Some("ws".to_string()),
+            schema: Some("default".to_string()),
+        };
+        let rewriter = PolicyPlanRewriter::new(Arc::new(InMemoryPolicyStore::new()))
+            .with_tag_source(Arc::new(UnknownTags))
+            .with_file_table(file_table);
+        let denied = |plan: LogicalPlan| {
+            let rewriter = &rewriter;
+            let scope = &scope;
+            let user = &user;
+            async move { rewriter.evaluate(user, scope, plan).await.unwrap().1.denied }
+        };
+
+        assert!(
+            !denied(file()).await,
+            "a file scan has no tags to be unsure of"
+        );
+        assert!(
+            denied(mem("t")).await,
+            "a table on a tag cache miss fails closed"
+        );
+        assert!(
+            denied(mem("read_csv()")).await,
+            "the scan name grants nothing"
+        );
+        assert!(
+            denied(view).await,
+            "a view named read_csv() is still denied"
+        );
+        assert!(
+            denied(same_name_union).await,
+            "a table sharing the name with a file scan is governed as a table"
+        );
     }
 
     // ── resolve_effective_policy (SHOW EFFECTIVE POLICY diagnostic) ───────
