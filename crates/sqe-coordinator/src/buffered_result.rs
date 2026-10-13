@@ -14,6 +14,7 @@ use sqe_core::{SqeError, SqeErrorCode};
 pub(crate) struct BufferedResultBudget {
     pools: Vec<Arc<dyn MemoryPool>>,
     max_bytes: usize,
+    limit_name: &'static str,
     retained_bytes: usize,
 }
 
@@ -31,8 +32,16 @@ impl BufferedResultBudget {
         Self {
             pools,
             max_bytes,
+            limit_name: "query.max_query_memory",
             retained_bytes: 0,
         }
+    }
+
+    /// Name the setting `max_bytes` came from in the refusal, when it is not
+    /// `query.max_query_memory`.
+    pub(crate) fn with_limit_name(mut self, limit_name: &'static str) -> Self {
+        self.limit_name = limit_name;
+        self
     }
 
     pub(crate) fn retain(&mut self, batch: RecordBatch) -> Result<RecordBatch, SqeError> {
@@ -46,7 +55,7 @@ impl BufferedResultBudget {
         if self.max_bytes > 0 && total > self.max_bytes {
             return Err(SqeError::with_code(
                 SqeErrorCode::ResourceExhausted,
-                format!("Buffered result needs {total} bytes, exceeding query.max_query_memory={} bytes; use LIMIT or a streaming client", self.max_bytes),
+                format!("Buffered result needs {total} bytes, exceeding {}={} bytes; use LIMIT or a streaming client", self.limit_name, self.max_bytes),
             ));
         }
         let mut reservations = Vec::with_capacity(self.pools.len());

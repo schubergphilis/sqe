@@ -26,6 +26,20 @@ All notable changes to SQE are documented in this file.
     the newest, each deletion logged as an error and recorded in the chain
     as a `maintenance` / `PRUNED` record.
 
+### Changed
+
+- Light reads run while coordinator memory is red (#788)
+
+    At red (>95% of the pool used) every statement was refused with
+    "server memory is red", so `SELECT count(*) FROM nation` failed while
+    heavy queries held the pool. Now `SHOW`, `DESCRIBE` and `EXPLAIN`
+    (without `ANALYZE`) pass, and a read runs under the new
+    `[query] pressure_admission_memory` cap (default 64MB, never above
+    `max_query_memory`). A read that outgrows it fails with
+    `ResourcesExhausted` naming `query.pressure_admission_memory`, and gets
+    no sort-merge join retry. Writes, DDL and procedures are still refused
+    at red. `pressure_admission_memory = "0"` restores the old refusal.
+
 ### Fixed
 
 - No audit export spool without a shipper to drain it (#838)

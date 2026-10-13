@@ -15,10 +15,50 @@ use datafusion::execution::memory_pool::{
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
 
+/// The cap one execution runs under, and the setting a refusal names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QueryQuota {
+    pub bytes: usize,
+    /// Admitted while the coordinator pool was red: `bytes` is
+    /// `query.pressure_admission_memory`, not `query.max_query_memory`.
+    pub under_pressure: bool,
+}
+
+impl QueryQuota {
+    /// `query.max_query_memory`: the cap every admitted query runs under.
+    pub(crate) fn normal(bytes: usize) -> Self {
+        Self {
+            bytes,
+            under_pressure: false,
+        }
+    }
+
+    /// `query.pressure_admission_memory`: the smaller cap of a read query
+    /// admitted while the coordinator pool was red.
+    pub(crate) fn under_pressure(bytes: usize) -> Self {
+        Self {
+            bytes,
+            under_pressure: true,
+        }
+    }
+
+    /// The setting a refusal names, so one under pressure reads as "the node
+    /// was full", not "your query is too big".
+    pub(crate) fn name(&self) -> &'static str {
+        if self.under_pressure {
+            "query.pressure_admission_memory (server memory is red)"
+        } else {
+            "query.max_query_memory"
+        }
+    }
+}
+
 #[derive(Debug)]
 struct QueryMemoryPool {
     shared: Arc<dyn MemoryPool>,
     limit: usize,
+    /// The setting named when `limit` refuses a reservation.
+    limit_name: &'static str,
     /// `limit`, with the share only non-spillable consumers may use
     /// (`coordinator.unspillable_headroom_percent`).
     budget: HeadroomBudget,
@@ -62,7 +102,7 @@ impl MemoryPool for QueryMemoryPool {
             reservation.consumer(),
             reservation.size(),
             additional,
-            "query.max_query_memory",
+            self.limit_name,
         )?;
         if let Err(error) = self.shared.try_grow(reservation, additional) {
             self.budget.release(reservation.consumer(), additional);
@@ -97,13 +137,24 @@ pub(crate) fn execution_error(error: &DataFusionError) -> sqe_core::SqeError {
 /// caches and the disk manager. Cached sessions must never share query quotas.
 /// `headroom_percent` of `limit` is kept for non-spillable consumers
 /// ([`crate::memory_headroom`]).
+#[cfg(test)]
 pub(crate) fn with_query_limit(
     ctx: SessionContext,
     limit: usize,
     headroom_percent: u8,
 ) -> SessionContext {
+    with_query_quota(ctx, QueryQuota::normal(limit), headroom_percent)
+}
+
+/// [`with_query_limit`] for a quota that may be the pressure-admission cap,
+/// so a refusal names the setting that applied.
+pub(crate) fn with_query_quota(
+    ctx: SessionContext,
+    quota: QueryQuota,
+    headroom_percent: u8,
+) -> SessionContext {
     let shared = Arc::clone(&ctx.runtime_env().memory_pool);
-    with_query_limit_over(ctx, shared, limit, headroom_percent, false)
+    with_quota_over(ctx, shared, quota, headroom_percent, false)
 }
 
 /// [`with_query_limit`] with the shared pool given explicitly, for a context
@@ -118,6 +169,23 @@ pub(crate) fn with_query_limit_over(
     headroom_percent: u8,
     fair_share: bool,
 ) -> SessionContext {
+    with_quota_over(
+        ctx,
+        shared,
+        QueryQuota::normal(limit),
+        headroom_percent,
+        fair_share,
+    )
+}
+
+fn with_quota_over(
+    ctx: SessionContext,
+    shared: Arc<dyn MemoryPool>,
+    quota: QueryQuota,
+    headroom_percent: u8,
+    fair_share: bool,
+) -> SessionContext {
+    let limit = quota.bytes;
     if limit == 0 {
         return ctx;
     }
@@ -126,6 +194,7 @@ pub(crate) fn with_query_limit_over(
     runtime.memory_pool = Arc::new(QueryMemoryPool {
         shared,
         limit,
+        limit_name: quota.name(),
         budget: if fair_share {
             budget.with_fair_share()
         } else {
@@ -148,6 +217,7 @@ mod tests {
         Arc::new(QueryMemoryPool {
             shared,
             limit,
+            limit_name: QueryQuota::normal(limit).name(),
             budget: HeadroomBudget::new(limit, 0, true),
         })
     }

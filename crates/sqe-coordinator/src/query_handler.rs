@@ -342,6 +342,9 @@ pub struct QueryHandler {
     /// Cached parse of `config.query.max_query_memory`. Used as the
     /// per-query reservation increment against the per-user budget.
     per_query_memory_bytes: usize,
+    /// Cached parse of `config.query.pressure_admission_memory`: the cap of
+    /// a read query admitted while the pool is red. `0` refuses instead.
+    pressure_admission_memory_bytes: usize,
     /// Share of each query's cap kept for non-spillable consumers
     /// (`coordinator.unspillable_headroom_percent`); 0 under the fair pool,
     /// which divides memory itself.
@@ -571,6 +574,15 @@ impl QueryHandler {
                 ))
             })? as usize
         };
+        let pressure_admission_memory_bytes = sqe_core::parse_memory_limit(
+            &config.query.pressure_admission_memory,
+        )
+        .map_err(|e| {
+            sqe_core::SqeError::Config(format!(
+                "Invalid pressure_admission_memory '{}': {e}",
+                config.query.pressure_admission_memory
+            ))
+        })? as usize;
 
         let profile_mode = config.query.query_profile;
         let mut transactions = crate::txn_registry::TxnRegistry::new(metrics.clone());
@@ -608,6 +620,7 @@ impl QueryHandler {
             per_user_memory: Arc::new(crate::memory::PerUserMemoryRegistry::new()),
             per_user_memory_budget_bytes,
             per_query_memory_bytes,
+            pressure_admission_memory_bytes,
             unspillable_headroom_percent,
             profile_mode,
             runtime,
@@ -1503,7 +1516,8 @@ impl QueryHandler {
         // Admission (pressure, per-user and global permits, per-user memory
         // reservation): one sequence shared with the streaming path, see
         // `query_handler::admission`. Held for the whole buffered call.
-        let _admission = self.admit(session, sql, "query")?;
+        let admission = self.admit(session, sql, "query")?;
+        let quota = admission.quota;
 
         let start = std::time::Instant::now();
         // Pre-parse pipeline (strip FOR INCREMENTAL / FOR VERSION AS OF,
@@ -1517,6 +1531,8 @@ impl QueryHandler {
         };
         let kind = classify_user_sql(session, sql).map_err(failed)?;
         let kind_name = kind.name().to_string();
+        self.refuse_under_pressure(&admission, matches!(kind, StatementKind::Query(_)), sql)
+            .map_err(failed)?;
 
         // Inside an explicit transaction (Trino `X-Trino-Transaction-Id`, or
         // BEGIN on a stored Flight session) DML writes to the transaction's
@@ -1856,6 +1872,7 @@ impl QueryHandler {
                         session,
                         sql,
                         &query_id,
+                        quota,
                         &plan_metrics,
                         &mut captured_plan,
                         &mut policy_summary,
@@ -2966,6 +2983,7 @@ impl QueryHandler {
                             session,
                             &source_sql,
                             &query_id,
+                            quota,
                             &plan_metrics,
                             &mut merge_source_plan,
                             &mut policy_summary,
@@ -3647,6 +3665,7 @@ impl QueryHandler {
         let Admission {
             permits,
             memory_reservation: per_user_mem_reservation,
+            quota,
         } = self.admit(session, sql, "streaming query")?;
 
         // --- Classify ---------------------------------------------------------
@@ -3731,7 +3750,7 @@ impl QueryHandler {
         }
 
         match self
-            .open_stream(session, sql, prebuilt, &query_id, start)
+            .open_stream(session, sql, prebuilt, &query_id, quota, start)
             .await
         {
             Ok((
@@ -3840,13 +3859,14 @@ impl QueryHandler {
         sql: &str,
         prebuilt: Option<LogicalPlan>,
         query_id: &uuid::Uuid,
+        quota: crate::query_memory::QueryQuota,
         start: std::time::Instant,
     ) -> sqe_core::Result<OpenStreamResult> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
         let shared_pool = Arc::clone(&ctx.runtime_env().memory_pool);
-        let ctx = crate::query_memory::with_query_limit(
+        let ctx = crate::query_memory::with_query_quota(
             ctx,
-            self.per_query_memory_bytes,
+            quota,
             self.unspillable_headroom_percent,
         );
 
@@ -3944,7 +3964,7 @@ impl QueryHandler {
         let schema = final_plan.schema();
         let stream = execute_stream(Arc::clone(&final_plan), ctx.task_ctx())
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Query execution failed: {e}")))?;
-        let fallback = self.join_fallback(&ctx, shared_pool, enforced_logical, query_id);
+        let fallback = self.join_fallback(&ctx, shared_pool, enforced_logical, query_id, quota);
         let replanned = crate::join_fallback::ReplannedPlan::default();
         let stream = crate::join_fallback::FallbackStream::wrap(
             stream,
@@ -4309,15 +4329,16 @@ impl QueryHandler {
         session: &Session,
         sql: &str,
         query_id: &uuid::Uuid,
+        quota: crate::query_memory::QueryQuota,
         plan_metrics: &Arc<Mutex<PlanMetrics>>,
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
         summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
         let shared_pool = Arc::clone(&ctx.runtime_env().memory_pool);
-        let ctx = crate::query_memory::with_query_limit(
+        let ctx = crate::query_memory::with_query_quota(
             ctx,
-            self.per_query_memory_bytes,
+            quota,
             self.unspillable_headroom_percent,
         );
 
@@ -4423,7 +4444,7 @@ impl QueryHandler {
         // cache storage, so completion cannot make live output unaccounted.
         let output_schema = final_plan.schema();
         let configured_max = self.config.query.max_result_rows;
-        let fallback = self.join_fallback(&ctx, shared_pool, enforced_logical, query_id);
+        let fallback = self.join_fallback(&ctx, shared_pool, enforced_logical, query_id, quota);
         let replanned = crate::join_fallback::ReplannedPlan::default();
         let stream = execute_stream(final_plan.clone(), ctx.task_ctx())
             .map_err(|e| crate::query_memory::execution_error(&e))?;
@@ -4439,8 +4460,9 @@ impl QueryHandler {
         let mut result_budget = crate::buffered_result::BufferedResultBudget::new(
             Arc::clone(&ctx.runtime_env().memory_pool),
             Arc::clone(&ctx.runtime_env().memory_pool),
-            self.per_query_memory_bytes,
-        );
+            quota.bytes,
+        )
+        .with_limit_name(quota.name());
         let mut rows_so_far: usize = 0;
         while let Some(batch) = stream
             .try_next()
@@ -4517,13 +4539,19 @@ impl QueryHandler {
     /// The sort-merge retry for this query's execution (#784), or `None`
     /// when `query.join_fallback` or spilling is off. `shared_pool` is the
     /// pool under the query's own quota, so the retry gets a fresh quota.
+    /// `None` too for a query admitted under pressure: retrying a query that
+    /// did not fit the pressure cap only spends more of a red pool.
     fn join_fallback(
         &self,
         ctx: &SessionContext,
         shared_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
         logical: LogicalPlan,
         query_id: &uuid::Uuid,
+        quota: crate::query_memory::QueryQuota,
     ) -> Option<crate::join_fallback::JoinFallback> {
+        if quota.under_pressure {
+            return None;
+        }
         crate::join_fallback::JoinFallback::new(
             ctx,
             shared_pool,
@@ -10524,6 +10552,126 @@ mod show_stats_policy_tests {
         for sql in ["SET TRANSACTION ISOLATION LEVEL READ COMMITTED", "COMMIT"] {
             handler.execute(&session, sql, None).await.expect(sql);
         }
+    }
+
+    fn pressure_handler(pressure_admission_memory: &str) -> super::QueryHandler {
+        use crate::query_tracker::QueryTracker;
+        use crate::runtime_catalog::RuntimeCatalogRegistry;
+        use std::sync::Arc;
+
+        let mut config: sqe_core::SqeConfig =
+            toml::from_str("[coordinator]\n\n[auth]\n\n[catalog]\ncatalog_url = \"\"\n")
+                .expect("config parses");
+        config.query.pressure_admission_memory = pressure_admission_memory.to_string();
+        super::QueryHandler::new(
+            Arc::new(sqe_policy::PassthroughEnforcer),
+            None,
+            config.clone(),
+            None,
+            None,
+            None,
+            None,
+            Arc::new(QueryTracker::new(&config.query_history)),
+            None,
+            None,
+            None,
+            RuntimeCatalogRegistry::new(),
+            sqe_core::SecretStore::new(),
+        )
+        .expect("QueryHandler::new")
+    }
+
+    /// Hold the coordinator pool in the red band (>95% used).
+    fn hold_red(
+        handler: &super::QueryHandler,
+    ) -> datafusion::execution::memory_pool::MemoryReservation {
+        let pool = &handler.runtime.memory_pool;
+        let limit = crate::memory::limit_bytes(pool);
+        let held = datafusion::execution::memory_pool::MemoryConsumer::new("heavy-query")
+            .register(pool);
+        held.try_grow(limit / 100 * 97).expect("hold the pool");
+        assert!(!crate::memory::check_pressure(pool).admits_new_query());
+        held
+    }
+
+    fn pressure_session() -> sqe_core::Session {
+        sqe_core::Session::new(
+            "analyst".to_string(),
+            sqe_core::SecretString::new("tok".to_string()),
+            None,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            Vec::new(),
+        )
+    }
+
+    /// A light read runs while the pool is red, under the pressure cap,
+    /// including a sort at the default partition count; the cap is the
+    /// pressure setting, not `max_query_memory` (#788).
+    #[tokio::test]
+    async fn a_light_read_runs_under_memory_pressure() {
+        let handler = pressure_handler("64MB");
+        let _held = hold_red(&handler);
+        let session = pressure_session();
+
+        let admission = handler.admit(&session, "SELECT 1", "query").expect("admitted");
+        assert!(admission.quota.under_pressure);
+        assert_eq!(admission.quota.bytes, 64 * 1024 * 1024);
+        drop(admission);
+
+        for sql in [
+            "SELECT 1",
+            "SELECT v FROM (VALUES (3), (1), (2)) AS t(v) ORDER BY v",
+            "SELECT count(*) FROM generate_series(1, 100000)",
+            "SELECT value % 7 AS k, count(*) FROM generate_series(1, 100000) \
+             GROUP BY 1 ORDER BY 2 DESC, 1",
+        ] {
+            handler.execute(&session, sql, None).await.expect(sql);
+        }
+    }
+
+    /// A read that outgrows the pressure cap fails naming that setting.
+    #[tokio::test]
+    async fn a_heavy_read_under_pressure_names_the_pressure_cap() {
+        let handler = pressure_handler("1MB");
+        let _held = hold_red(&handler);
+        let err = handler
+            .execute(
+                &pressure_session(),
+                "SELECT a.value FROM generate_series(1, 2000000) a \
+                 JOIN generate_series(1, 2000000) b ON a.value = b.value",
+                None,
+            )
+            .await
+            .expect_err("over the pressure cap");
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::ResourceExhausted, "{err}");
+        assert!(
+            err.to_string().contains("query.pressure_admission_memory"),
+            "{err}"
+        );
+    }
+
+    /// Only reads are admitted at red; with the cap at 0 nothing but
+    /// metadata statements is.
+    #[tokio::test]
+    async fn writes_and_a_zero_cap_are_refused_under_pressure() {
+        let handler = pressure_handler("64MB");
+        let _held = hold_red(&handler);
+        let session = pressure_session();
+        let err = handler
+            .execute(&session, "CREATE TABLE sales.t AS SELECT 1 AS a", None)
+            .await
+            .expect_err("write at red");
+        assert!(err.to_string().contains("memory is"), "{err}");
+
+        let handler = pressure_handler("0");
+        let _held = hold_red(&handler);
+        let err = handler
+            .execute(&session, "SELECT 1", None)
+            .await
+            .expect_err("cap 0 refuses at red");
+        assert!(err.to_string().contains("memory is"), "{err}");
+        let metadata = handler.admit(&session, "EXPLAIN SELECT 1", "query").expect("metadata");
+        assert!(!metadata.quota.under_pressure);
     }
 }
 
