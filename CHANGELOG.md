@@ -52,6 +52,24 @@ All notable changes to SQE are documented in this file.
     endpoint is now resolved first, and no spool is opened when there is
     nothing to ship it.
 
+- Partitioned sorts complete by spilling under a tight query quota (#788)
+
+    A sort runs one external sorter per partition, and each reserves
+    `sort_spill_reservation_bytes` (10 MB) for its merge before it buffers
+    a row. At 16 partitions that is 160 MB of a quota no sorter can spill,
+    and under the greedy quota the first sorters to fill took the rest, so
+    a sorter that still held nothing was refused with nothing to spill and
+    the query failed with "Not enough memory to continue external sort".
+    Each query's sorts now share a quarter of the quota for their merge
+    reservations (1 MB floor, the configured value as ceiling), and each
+    sort operator may grow to an equal share of the spillable bytes before
+    it spills. Other operators keep the whole spillable budget. A 100 MB
+    `ORDER BY` at 8 partitions under a 64 MB quota, which failed, completes.
+    The cost: a sort's buffers now hold at most half of the spillable bytes
+    before spilling (400 MB of a 1 GB `max_query_memory`, where it could
+    take 800 MB before), so large sorts spill sooner. Writes (CTAS, INSERT
+    with a sort) run without a per-query quota and are unchanged.
+
 ## [0.51.0] — 2026-10-13
 
 ### Added
