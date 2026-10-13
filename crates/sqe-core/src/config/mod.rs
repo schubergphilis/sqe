@@ -360,6 +360,15 @@ pub struct QueryConfig {
     /// until their buffers (including cached copies) are released.
     #[serde(default = "default_max_query_memory")]
     pub max_query_memory: String,
+    /// Memory cap for a read query admitted while the coordinator pool is
+    /// red (>95% used). A light query (a lookup, a small aggregate) still
+    /// runs; a heavy one fails with `RESOURCE_EXHAUSTED` at its first large
+    /// reservation instead of being refused up front. Writes and DDL are
+    /// still refused at red; metadata statements (SHOW, DESCRIBE, EXPLAIN)
+    /// are always admitted. Default: "64MB". Set to "0" to refuse every
+    /// non-metadata statement at red.
+    #[serde(default = "default_pressure_admission_memory")]
+    pub pressure_admission_memory: String,
     /// Minimum total scan size to distribute across workers. Below this, execute on coordinator.
     /// Default: "128MB". Set to "0" to always distribute.
     #[serde(default = "default_distribution_threshold")]
@@ -590,6 +599,7 @@ impl Default for QueryConfig {
             slow_query_threshold_secs: default_slow_query_threshold(),
             query_profile: ProfileMode::Off,
             max_query_memory: default_max_query_memory(),
+            pressure_admission_memory: default_pressure_admission_memory(),
             distribution_threshold: default_distribution_threshold(),
             distribution_file_threshold: default_distribution_file_threshold(),
             target_task_size: default_target_task_size(),
@@ -5681,6 +5691,9 @@ impl BreakerFailureClass {
 
 fn default_max_query_memory() -> String {
     "256MB".to_string()
+}
+fn default_pressure_admission_memory() -> String {
+    "64MB".to_string()
 }
 fn default_distribution_threshold() -> String {
     "128MB".to_string()
