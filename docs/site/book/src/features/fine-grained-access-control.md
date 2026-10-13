@@ -47,6 +47,7 @@ The default drops the catalog, the convention Hive and Spark/Kyuubi use, so one 
 - A table reference that carries no catalog is denied rather than looked up without one. The planner fills the session's catalog in, so this only bites a reference that cannot be resolved.
 - `CREATE POLICY ... ON TABLE` needs the three-part name and writes `<catalog>.<namespace>` as the `database`.
 - Policies written for the default convention stop matching. Rewrite them before turning the setting on, or masks disappear.
+- The catalog is the name the session uses for it, not the warehouse behind it. A config catalog `[catalogs.iceberg]` over warehouse `test_warehouse` is keyed `iceberg.<namespace>`, whether the table is read directly or through a view. Before #835 a view's tables were keyed by the warehouse instead, so a mask written for `iceberg.<namespace>` did not apply through the view. A policy written for `test_warehouse.<namespace>` to cover views no longer matches anything: move it to the session's catalog name. A table no policy matches is read without masks or row filters, so check for such policies before upgrading.
 
 Tag-based policies are unaffected: a tag policy names a tag, not a table.
 

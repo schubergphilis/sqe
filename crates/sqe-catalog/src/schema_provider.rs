@@ -528,15 +528,33 @@ const VIEW_DEFAULT_SCHEMA: &str = "default";
 /// so an unqualified `orders` in a view would otherwise be governed as
 /// whatever `orders` means after the reader's `USE`. A `SubqueryAlias` under
 /// the written name keeps the column qualifiers the rest of the body uses.
-fn qualify_view_scans(plan: LogicalPlan, catalog: &str, schema: &str) -> DFResult<LogicalPlan> {
+///
+/// `catalog` is the session's name for this catalog, the name a direct query
+/// is governed by. A scan that names one of `aliases` (the warehouse, when the
+/// config registers the catalog under another name) is renamed to it too: a
+/// `catalog_scoped` policy store keys on the catalog, and a policy written for
+/// the session's name must not miss the same table read through a view (#835).
+fn qualify_view_scans(
+    plan: LogicalPlan,
+    catalog: &str,
+    schema: &str,
+    aliases: &[&str],
+) -> DFResult<LogicalPlan> {
     plan.transform_up_with_subqueries(|node| {
         let LogicalPlan::TableScan(scan) = &node else {
             return Ok(Transformed::no(node));
         };
-        if matches!(scan.table_name, TableReference::Full { .. }) {
-            return Ok(Transformed::no(node));
-        }
-        let full: TableReference = scan.table_name.clone().resolve(catalog, schema).into();
+        let full: TableReference = match &scan.table_name {
+            TableReference::Full {
+                catalog: named,
+                schema: s,
+                table,
+            } if aliases.contains(&named.as_ref()) => {
+                TableReference::full(catalog, Arc::clone(s), Arc::clone(table))
+            }
+            TableReference::Full { .. } => return Ok(Transformed::no(node)),
+            written => written.clone().resolve(catalog, schema).into(),
+        };
         let qualified = TableScanBuilder::new(full, scan.source.clone())
             .with_projection(scan.projection.clone())
             .with_filters(scan.filters.clone())
@@ -693,7 +711,12 @@ impl SqeSchemaProvider {
         };
 
         let (state, plan) = df.into_parts();
-        let plan = qualify_view_scans(plan, catalog_name, VIEW_DEFAULT_SCHEMA)?;
+        let plan = match &self.catalog_name {
+            Some(session_name) => {
+                qualify_view_scans(plan, session_name, VIEW_DEFAULT_SCHEMA, &[catalog_name])?
+            }
+            None => qualify_view_scans(plan, catalog_name, VIEW_DEFAULT_SCHEMA, &[])?,
+        };
         let plan = state.optimize(&plan).map_err(|e| {
             datafusion::error::DataFusionError::External(
                 format!("Failed to optimize view '{name}' plan: {e}").into(),
@@ -739,7 +762,6 @@ mod tests {
     #[test]
     fn view_scans_are_named_by_the_table_they_resolved_to() {
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
-        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
         use datafusion::logical_expr::builder::table_scan;
         use datafusion::prelude::col;
 
@@ -754,20 +776,75 @@ mod tests {
             .build()
             .unwrap();
 
-        let qualified = qualify_view_scans(plan.clone(), "wh", "default").unwrap();
+        let qualified = qualify_view_scans(plan.clone(), "wh", "default", &[]).unwrap();
 
+        assert_eq!(scan_names(&qualified), ["wh.default.orders", "wh.me.x"]);
+        assert_eq!(
+            qualified.schema(),
+            plan.schema(),
+            "the body's output is unchanged"
+        );
+    }
+
+    /// Under an aliased config catalog, a view body's scans carry the
+    /// session's name for the catalog, the key a direct query is governed by,
+    /// whether the body left the catalog out or named the warehouse (#835).
+    /// Another catalog's scan keeps its name.
+    #[test]
+    fn view_scans_take_the_sessions_catalog_name() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::logical_expr::builder::table_scan;
+        use datafusion::prelude::col;
+
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, true)]);
+        let scan = |name: TableReference| {
+            table_scan(Some(name), &schema, None)
+                .unwrap()
+                .build()
+                .unwrap()
+        };
+        let plan = datafusion::logical_expr::LogicalPlanBuilder::from(scan(TableReference::bare(
+            "orders",
+        )))
+        .cross_join(scan(TableReference::full("test_warehouse", "ns", "t")))
+        .unwrap()
+        .cross_join(scan(TableReference::full("other", "ns", "u")))
+        .unwrap()
+        .project(vec![
+            col("orders.id"),
+            col("test_warehouse.ns.t.id"),
+            col("other.ns.u.id"),
+        ])
+        .unwrap()
+        .build()
+        .unwrap();
+
+        let qualified =
+            qualify_view_scans(plan.clone(), "iceberg", "default", &["test_warehouse"]).unwrap();
+
+        assert_eq!(
+            scan_names(&qualified),
+            ["iceberg.default.orders", "iceberg.ns.t", "other.ns.u"]
+        );
+        assert_eq!(
+            qualified.schema(),
+            plan.schema(),
+            "the body's output is unchanged"
+        );
+    }
+
+    fn scan_names(plan: &LogicalPlan) -> Vec<String> {
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
         let mut names = Vec::new();
-        qualified
-            .apply(|n| {
-                if let LogicalPlan::TableScan(s) = n {
-                    names.push(s.table_name.to_string());
-                }
-                Ok(TreeNodeRecursion::Continue)
-            })
-            .unwrap();
+        plan.apply(|n| {
+            if let LogicalPlan::TableScan(s) = n {
+                names.push(s.table_name.to_string());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
         names.sort();
-        assert_eq!(names, ["wh.default.orders", "wh.me.x"]);
-        assert_eq!(qualified.schema(), plan.schema(), "the body's output is unchanged");
+        names
     }
 
     #[test]
