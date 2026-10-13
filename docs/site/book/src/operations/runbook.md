@@ -260,8 +260,9 @@ it still OOMKilled, the engine `memory_limit` sits too close to the pod limit.
   `[rate_limit]`.
 - While the pool is red, new reads run under `pressure_admission_memory`
   (64MB) and fail with `ResourcesExhausted` naming it when they outgrow it;
-  writes are refused. Set it to `"0"` to refuse every non-metadata statement
-  at red instead.
+  every other statement except `SHOW`/`DESCRIBE`/`EXPLAIN` is refused,
+  including `SET` and transaction control. Set it to `"0"` to refuse reads
+  at red too.
 
 **Escalation.** Repeated OOMKills after lowering the engine limit, with spill
 active, means a single query is too large for the node. Capture the query from

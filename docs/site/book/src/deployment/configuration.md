@@ -247,7 +247,9 @@ max_concurrent_queries = 100    # Concurrency limit (0 = unlimited)
 max_query_memory = "256MB"      # Per-query memory limit
 pressure_admission_memory = "64MB" # Per-query cap for a read admitted while the coordinator
                                 # pool is red (>95% used). SHOW/DESCRIBE/EXPLAIN pass at red;
-                                # writes and DDL are refused. "0" refuses every other statement.
+                                # every statement that is neither a read nor one of those
+                                # (writes, DDL, SET, BEGIN/COMMIT/ROLLBACK) is refused.
+                                # "0" refuses reads too.
 slow_query_threshold_secs = 30  # WARN-log threshold for slow queries
 distribution_threshold = "128MB" # Min scan size to distribute to workers
 distribution_file_threshold = 4 # Min file count to distribute
