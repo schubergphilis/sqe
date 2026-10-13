@@ -139,6 +139,24 @@ pub async fn plan_parsed(
     .await
 }
 
+/// The schema `plan` yields once the analyzer has coerced it, which is what
+/// execution produces. A freshly planned `DataFrame` carries the
+/// pre-analysis schema, where a `UNION` of decimal literals with different
+/// precisions takes its first branch's type (`500000.0` and `1000000.0`:
+/// Decimal(7,1)) and execution widens it (Decimal(8,1)). A table created
+/// from the pre-analysis schema refuses its own rows (#839). Recursive like
+/// planning: call it where the plan was planned.
+pub fn analyzed_schema(
+    ctx: &SessionContext,
+    plan: &datafusion::logical_expr::LogicalPlan,
+) -> DFResult<datafusion::common::DFSchemaRef> {
+    let state = ctx.state();
+    let analyzed = state
+        .analyzer()
+        .execute_and_check(plan.clone(), state.config_options(), |_, _| {})?;
+    Ok(Arc::clone(analyzed.schema()))
+}
+
 /// [`plan_sql`] for callers that hold a `SessionState` and want the logical
 /// plan.
 pub async fn create_logical_plan(
@@ -546,6 +564,25 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    /// #839: the planned schema types the UNION by its first branch; the
+    /// analyzed one matches what execution yields.
+    #[tokio::test]
+    async fn analyzed_schema_widens_a_mixed_precision_decimal_union() {
+        use datafusion::arrow::datatypes::DataType;
+        let ctx = SessionContext::new_with_config(
+            datafusion::prelude::SessionConfig::new()
+                .set_bool("datafusion.sql_parser.parse_float_as_decimal", true),
+        );
+        let df = plan_sql(&ctx, "SELECT 500000.0 AS b UNION ALL SELECT 1000000.0")
+            .await
+            .unwrap();
+        assert_eq!(df.schema().field(0).data_type(), &DataType::Decimal128(7, 1));
+        let analyzed = analyzed_schema(&ctx, df.logical_plan()).unwrap();
+        assert_eq!(analyzed.field(0).data_type(), &DataType::Decimal128(8, 1));
+        let batches = df.collect().await.unwrap();
+        assert_eq!(batches[0].schema().field(0).data_type(), analyzed.field(0).data_type());
     }
 
     fn session_with(name: &str) -> (SessionContext, Arc<Recording>) {

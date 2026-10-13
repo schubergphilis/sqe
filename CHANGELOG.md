@@ -54,6 +54,13 @@ All notable changes to SQE are documented in this file.
     expired. CREATE and DROP VIEW now evict every cached result. A view
     changed from another engine is still only seen after `ttl_secs`.
 
+- CTAS over a `UNION` of decimals with different precisions failed with "cast Decimal128(8,1) to Decimal128(7,1)" (#839)
+
+    The table was created from the planned schema, where such a UNION still
+    has its first branch's type; execution widens it. Iceberg and Hive CTAS
+    now take the schema after type coercion, so
+    `SELECT 500000.0 UNION ALL SELECT 1000000.0` creates a Decimal(8,1) column.
+
 - `read_parquet` on an `http://` S3 endpoint failed with "builder error" unless `s3_allow_http = true`
 
     Its S3 builder did not derive plain HTTP from the endpoint scheme, unlike
