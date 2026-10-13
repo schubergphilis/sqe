@@ -229,6 +229,7 @@ pub struct AuditLoggerOptions {
     pub queue_capacity: usize,
     pub fail_mode: AuditFailMode,
     pub dropped: Option<IntCounterVec>,
+    pub rotation: AuditRotation,
 }
 
 impl Default for AuditLoggerOptions {
@@ -237,8 +238,77 @@ impl Default for AuditLoggerOptions {
             queue_capacity: default_audit_queue_capacity(),
             fail_mode: AuditFailMode::Open,
             dropped: None,
+            rotation: AuditRotation::default(),
         }
     }
+}
+
+/// Size-based rotation of the audit files. The default never rotates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AuditRotation {
+    /// Rotate once the native or OCSF file reaches this size. 0 = never.
+    pub max_file_bytes: u64,
+    /// Rotated generations to keep. 0 = keep all.
+    pub max_files: usize,
+}
+
+/// `<active>.<generation>`: the active path plus a dot and a digits-only
+/// suffix. The generation counts rotations, so it orders files without
+/// trusting mtime. It is not a seq: a `BROKEN:` resume restarts seq at 0.
+fn rotated_path(active: &std::path::Path, generation: u64) -> std::path::PathBuf {
+    let mut name = active.as_os_str().to_os_string();
+    name.push(format!(".{generation:08}"));
+    std::path::PathBuf::from(name)
+}
+
+/// Rotated generations of `active`, oldest first. A reader of the whole log
+/// (`--verify-audit`, query history) reads these, then `active`.
+pub fn rotated_audit_files(active: &std::path::Path) -> Vec<(u64, std::path::PathBuf)> {
+    let (Some(dir), Some(base)) = (active.parent(), active.file_name()) else {
+        return Vec::new();
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        dir
+    };
+    let prefix = format!("{}.", base.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(u64, std::path::PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let digits = name.strip_prefix(&prefix)?;
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let generation: u64 = digits.parse().ok()?;
+            Some((generation, dir.join(&name)))
+        })
+        .collect();
+    out.sort_by_key(|(g, _)| *g);
+    out
+}
+
+/// Rename `active` to `rotated` and open a fresh file at `active`. On a
+/// failed open the rename is undone, so the caller's sink (still writing the
+/// moved inode) and the path agree again and the next check retries.
+fn rotate_one(
+    active: &std::path::Path,
+    rotated: &std::path::Path,
+) -> Result<std::fs::File, String> {
+    std::fs::rename(active, rotated).map_err(|e| {
+        format!(
+            "rename '{}' -> '{}': {e}",
+            active.display(),
+            rotated.display()
+        )
+    })?;
+    open_sink_file(active).inspect_err(|_| {
+        let _ = std::fs::rename(rotated, active);
+    })
 }
 
 /// Default bound on the writer queue. Large enough for a burst of statements
@@ -472,8 +542,19 @@ fn parse_integrity_from_line(line: &str) -> Result<(u64, String), String> {
 /// `Ok((chain, None))` continues from a parseable tip.
 /// `Ok((chain, Some(reason)))` starts a `BROKEN:` segment; the caller should
 /// emit an `AuditResume` event before accepting new records.
+///
+/// An empty or missing active file means a rotation just happened (or the
+/// log is new), so the tip is the newest rotated file's last record. A torn
+/// active file never falls back: that is a crash and must read as one.
 fn resume_chain_from_path(path: &std::path::Path) -> (HashChain, Option<String>) {
-    match read_last_nonempty_line(path) {
+    let last = match read_last_nonempty_line(path) {
+        Ok(None) => match rotated_audit_files(path).pop() {
+            Some((_, newest)) => read_last_nonempty_line(&newest),
+            None => Ok(None),
+        },
+        other => other,
+    };
+    match last {
         Ok(None) => (HashChain::new(), None),
         Ok(Some(line)) => match parse_integrity_from_line(&line) {
             Ok((seq, hash)) => (HashChain::resume(seq, hash), None),
@@ -550,6 +631,7 @@ impl AuditLogger {
     fn build(path: &str, format: AuditFormat, options: AuditLoggerOptions) -> Result<Self, String> {
         let fail_mode = options.fail_mode;
         let dropped = options.dropped;
+        let rotation = options.rotation;
         let queue_capacity = options.queue_capacity.max(1);
         if path.is_empty() {
             return Ok(Self {
@@ -605,6 +687,7 @@ impl AuditLogger {
         let writable = Arc::new(AtomicBool::new(true));
         let writable_worker = Arc::clone(&writable);
         let resume_path = native_path.to_path_buf();
+        let ocsf_path = ocsf_path_from(native_path);
         let (tx, rx) = mpsc::sync_channel::<AuditMsg>(queue_capacity);
         let worker = std::thread::Builder::new()
             .name("sqe-audit-writer".to_string())
@@ -827,6 +910,15 @@ impl AuditLogger {
                             let _ = ack.send(());
                         }
                     }
+                    // Every arm above ends flushed, so a rename here never
+                    // strands buffered bytes in the old file.
+                    Self::maybe_rotate(
+                        &mut native_sink,
+                        &mut ocsf_sink,
+                        &resume_path,
+                        &ocsf_path,
+                        rotation,
+                    );
                 }
                 Self::flush_sinks(
                     &mut native_sink,
@@ -1112,6 +1204,72 @@ impl AuditLogger {
         if let Some(sink) = spool_sink.as_mut() {
             if let Err(e) = sink.flush() {
                 tracing::error!("AUDIT: spool flush failed for '{path}': {e}");
+            }
+        }
+    }
+
+    /// Rotate the native file (and the OCSF file, when one is written) once
+    /// either reaches `max_file_bytes`. Both move to the same generation so
+    /// they pair up. The in-memory chain is untouched: the first record of
+    /// the new file chains to the last record of the rotated one, and a
+    /// restart on the still-empty new file resumes from the rotated file.
+    fn maybe_rotate(
+        native_sink: &mut NativeJsonlSink,
+        ocsf_sink: &mut Option<OcsfJsonlSink>,
+        native_path: &std::path::Path,
+        ocsf_path: &std::path::Path,
+        rotation: AuditRotation,
+    ) {
+        let max = rotation.max_file_bytes;
+        if max == 0 {
+            return;
+        }
+        let len = |p: &std::path::Path| std::fs::metadata(p).map_or(0, |m| m.len());
+        if len(native_path) < max && (ocsf_sink.is_none() || len(ocsf_path) < max) {
+            return;
+        }
+        let rotated = rotated_audit_files(native_path);
+        let generation = rotated.last().map_or(1, |(g, _)| g + 1);
+        match rotate_one(native_path, &rotated_path(native_path, generation)) {
+            Ok(file) => {
+                *native_sink =
+                    NativeJsonlSink::from_writer(Box::new(std::io::BufWriter::new(file)));
+            }
+            Err(e) => {
+                tracing::error!(err = %e, "AUDIT: rotation failed; still writing the current file");
+                return;
+            }
+        }
+        if ocsf_sink.is_some() {
+            match rotate_one(ocsf_path, &rotated_path(ocsf_path, generation)) {
+                Ok(file) => *ocsf_sink = Some(OcsfJsonlSink::from_writer(Box::new(file))),
+                Err(e) => {
+                    tracing::error!(err = %e, "AUDIT: OCSF rotation failed; still writing the current file");
+                }
+            }
+        }
+        info!(
+            path = %native_path.display(),
+            generation,
+            "Audit log rotated"
+        );
+        if rotation.max_files > 0 {
+            let total = rotated.len() + 1;
+            for (g, old) in rotated
+                .iter()
+                .take(total.saturating_sub(rotation.max_files))
+            {
+                for p in [old.clone(), rotated_path(ocsf_path, *g)] {
+                    match std::fs::remove_file(&p) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => tracing::warn!(
+                            path = %p.display(),
+                            err = %e,
+                            "AUDIT: cannot delete rotated file"
+                        ),
+                    }
+                }
             }
         }
     }
@@ -2105,6 +2263,147 @@ mod tests {
             }
             other => panic!("unexpected chain error: {other:?}"),
         }
+    }
+
+    /// Logger that rotates after every write: one event per rotated file.
+    fn rotating_logger(
+        path: &std::path::Path,
+        format: AuditFormat,
+        max_files: usize,
+    ) -> AuditLogger {
+        AuditLogger::with_options(
+            path.to_str().unwrap(),
+            format,
+            AuditLoggerOptions {
+                rotation: AuditRotation {
+                    max_file_bytes: 1,
+                    max_files,
+                },
+                ..AuditLoggerOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn verify_file(path: &std::path::Path) -> crate::audit::AuditVerifyReport {
+        crate::audit::verify_audit_bytes(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn rotation_carries_the_chain_across_files() {
+        let (_dir, path) = fresh_audit_path("audit.jsonl");
+        {
+            let logger = rotating_logger(&path, AuditFormat::Native, 0);
+            for _ in 0..4 {
+                logger.log_event(crate::audit::sample_query_event());
+                logger.flush();
+            }
+        }
+        let rotated = rotated_audit_files(&path);
+        assert_eq!(
+            rotated.iter().map(|(g, _)| *g).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        let reports: Vec<_> = rotated.iter().map(|(_, p)| verify_file(p)).collect();
+        assert!(reports[0].starts_at_genesis());
+        for pair in reports.windows(2) {
+            assert_eq!(
+                crate::audit::link_rotated_reports(&pair[0], &pair[1]),
+                Ok(None)
+            );
+        }
+        assert_eq!(reports[3].last_seq, 3);
+    }
+
+    #[test]
+    fn restart_on_an_empty_active_file_resumes_from_the_newest_rotated_file() {
+        let (_dir, path) = fresh_audit_path("audit.jsonl");
+        {
+            let logger = rotating_logger(&path, AuditFormat::Native, 0);
+            for _ in 0..2 {
+                logger.log_event(crate::audit::sample_query_event());
+                logger.flush();
+            }
+        }
+        {
+            let logger = AuditLogger::new(path.to_str().unwrap()).unwrap();
+            logger.log_event(crate::audit::sample_query_event());
+            logger.flush();
+        }
+        let (_, newest) = rotated_audit_files(&path).pop().unwrap();
+        let active = verify_file(&path);
+        assert_eq!(active.records, 1, "no AuditResume record expected");
+        assert_eq!(
+            crate::audit::link_rotated_reports(&verify_file(&newest), &active),
+            Ok(None)
+        );
+        assert_eq!(active.first_seq, 2);
+    }
+
+    #[test]
+    fn torn_active_file_still_breaks_when_rotated_files_exist() {
+        let (_dir, path) = fresh_audit_path("audit.jsonl");
+        {
+            let logger = rotating_logger(&path, AuditFormat::Native, 0);
+            logger.log_event(crate::audit::sample_query_event());
+            logger.flush();
+        }
+        std::fs::write(&path, "{\"kind\":\"query\",\"integrity\":").unwrap();
+        {
+            let logger = AuditLogger::new(path.to_str().unwrap()).unwrap();
+            logger.log_event(crate::audit::sample_query_event());
+            logger.flush();
+        }
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("BROKEN:"),
+            "a torn active file must not resume from a rotated one: {content}"
+        );
+    }
+
+    #[test]
+    fn both_format_rotates_the_ocsf_file_at_the_same_generation() {
+        let (_dir, path) = fresh_audit_path("audit.jsonl");
+        {
+            let logger = rotating_logger(&path, AuditFormat::Both, 0);
+            for _ in 0..2 {
+                logger.log_event(crate::audit::sample_query_event());
+                logger.flush();
+            }
+        }
+        let ocsf = ocsf_path_from(&path);
+        for g in [1, 2] {
+            let rotated = rotated_path(&ocsf, g);
+            let text = std::fs::read_to_string(&rotated).unwrap();
+            assert_eq!(text.lines().count(), 1, "{}", rotated.display());
+            assert!(rotated_path(&path, g).exists());
+        }
+        assert_eq!(std::fs::metadata(&ocsf).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn max_files_deletes_the_oldest_generations() {
+        let (_dir, path) = fresh_audit_path("audit.jsonl");
+        {
+            let logger = rotating_logger(&path, AuditFormat::Both, 2);
+            for _ in 0..4 {
+                logger.log_event(crate::audit::sample_query_event());
+                logger.flush();
+            }
+        }
+        let kept: Vec<u64> = rotated_audit_files(&path).iter().map(|(g, _)| *g).collect();
+        assert_eq!(kept, vec![3, 4]);
+        let ocsf = ocsf_path_from(&path);
+        assert!(!rotated_path(&ocsf, 1).exists() && !rotated_path(&ocsf, 2).exists());
+        assert!(rotated_path(&ocsf, 3).exists() && rotated_path(&ocsf, 4).exists());
+        // What is left still chains, from a non-genesis start.
+        let first = verify_file(&rotated_path(&path, 3));
+        assert!(!first.starts_at_genesis());
+        assert_eq!(
+            crate::audit::link_rotated_reports(&first, &verify_file(&rotated_path(&path, 4))),
+            Ok(None)
+        );
     }
 
     #[test]

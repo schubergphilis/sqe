@@ -27,6 +27,8 @@ format                = "native"   # "native" | "ocsf" | "both"
 gdpr_tags             = []         # tag names that mark a column as GDPR-sensitive
 gdpr_identifier_mode  = "tokenize" # "tokenize" | "drop" | "keep"
 superdebug_log_results = false      # NEVER true in production
+max_file_bytes        = 0          # rotate at this size; 0 = never
+max_files             = 0          # rotated files to keep; 0 = keep all
 ```
 
 All keys are optional. The defaults above are the production-safe values.
@@ -88,6 +90,24 @@ environments and disable before going to production.
 
 Enabling `superdebug_log_results` in production violates SOC 2, ISO 27001, and
 GDPR data-minimisation requirements.
+
+### `max_file_bytes` and `max_files`
+
+Default `0` for both: the audit file is never rotated and grows without limit.
+Set `max_file_bytes` to bound it. Once the native file or, with `format = "ocsf"`
+or `"both"`, the OCSF file reaches the limit, both move to
+`<audit_log_path>.<generation>` and `audit.ocsf.jsonl.<generation>` (generation
+`00000001`, `00000002`, ...) and the writer opens fresh files.
+
+Rotation does not break the hash chain. The first record of the new file chains to
+the last record of the rotated one, and a restart on a still-empty file resumes
+from the newest rotated file. `--verify-audit <audit_log_path>` checks every
+generation in order (see below).
+
+`max_files` keeps that many rotated generations and deletes the oldest. Deleting is
+intended truncation of the history, not tampering: the oldest kept file simply does
+not start at genesis. Leave it at `0` and archive rotated files yourself if your
+retention policy needs the full trail.
 
 ## Auth provider claim paths
 
@@ -200,6 +220,10 @@ first prev_hash: 0414fcbc...   (hash of seq 99 in the source log)
 last hash:       0f2b6079...   (prev_hash of seq 251 in the source log)
 chain:           OK
 ```
+
+Pointed at a rotated log's active path, it verifies every `<file>.<generation>`
+oldest first, then the active file, and fails if any file does not chain to the
+one before it. Pass a single rotated file to verify only that file.
 
 Verification needs the native file: `format = "native"` or `"both"`. An `ocsf`-only
 deployment has nothing to recompute the hashes from, so pick `"both"` if you may ever
@@ -370,8 +394,9 @@ any other value logs a warning and the exporter does not start.
 #### `otlp_endpoint`
 
 The OTLP/gRPC endpoint URL for the collector. If empty, the exporter falls back to
-`metrics.otlp_endpoint`. If both are empty the server logs a warning at startup and
-the exporter does not start.
+`metrics.otlp_endpoint`. If both are empty, or the exporter cannot be built, the
+server logs a warning at startup, the exporter does not start and no spool is
+written. Nothing would drain or cap it.
 
 Use an `https://` endpoint whenever the collector is not on the same host. SQE
 verifies the collector certificate against the system trust store; point

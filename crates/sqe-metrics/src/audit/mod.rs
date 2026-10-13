@@ -19,14 +19,14 @@ pub use event::{
 };
 pub use export::SeqCursor;
 pub use logger::{
-    default_audit_queue_capacity, query_hash, AuditEntry, AuditFailMode, AuditLogger,
-    AuditLoggerOptions, AuditWriteError, SpoolCompactor,
+    default_audit_queue_capacity, query_hash, rotated_audit_files, AuditEntry, AuditFailMode,
+    AuditLogger, AuditLoggerOptions, AuditRotation, AuditWriteError, SpoolCompactor,
 };
 pub use ocsf::to_ocsf;
 pub use redact::{mask_gdpr_columns, redact_pii, strip_sql_literals, GdprIdentifierMode};
 pub use sink::{AuditFormat, AuditSink, NativeJsonlSink, OcsfJsonlSink};
 pub use tag_lookup::{NoopTagLookup, TagLookup};
-pub use verify::{verify_audit_bytes, AuditVerifyReport};
+pub use verify::{link_rotated_reports, verify_audit_bytes, AuditVerifyReport};
 
 #[cfg(test)]
 pub(crate) use event::sample_query_event;
