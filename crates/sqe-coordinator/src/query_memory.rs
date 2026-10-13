@@ -109,7 +109,8 @@ pub(crate) fn with_query_limit(
 /// [`with_query_limit`] with the shared pool given explicitly, for a context
 /// whose own pool is already a query pool. The join fallback (#784) uses it
 /// to give the retry a fresh quota instead of nesting it inside the first
-/// attempt's, with `fair_share` set so its sorts share the quota
+/// attempt's, with `fair_share` set so every spilling operator, not only the
+/// sorts ([`HeadroomBudget::with_sort_share`]), shares the quota
 /// ([`HeadroomBudget::with_fair_share`]).
 pub(crate) fn with_query_limit_over(
     ctx: SessionContext,
@@ -121,7 +122,9 @@ pub(crate) fn with_query_limit_over(
     if limit == 0 {
         return ctx;
     }
-    let budget = HeadroomBudget::new(limit, headroom_percent, true);
+    // Every query's sorts share its spillable bytes (#788); the retry's
+    // fair share caps the other spilling consumers as well.
+    let budget = HeadroomBudget::new(limit, headroom_percent, true).with_sort_share();
     let mut runtime = (*ctx.runtime_env()).clone();
     runtime.memory_pool = Arc::new(QueryMemoryPool {
         shared,
