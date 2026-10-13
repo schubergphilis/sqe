@@ -4403,6 +4403,11 @@ pub struct AuditConfig {
     /// 0 (default) keeps every rotated file.
     #[serde(default)]
     pub max_files: usize,
+    /// Free space to keep on the audit volume. Below it, the oldest rotated
+    /// files are deleted (never the newest), and the deletion is written
+    /// into the chain. Default: 1 GiB. 0 never deletes for space.
+    #[serde(default = "default_audit_min_free_bytes")]
+    pub min_free_bytes: u64,
 }
 
 fn default_audit_format() -> String {
@@ -4429,6 +4434,10 @@ fn default_audit_max_file_bytes() -> u64 {
     256 * 1024 * 1024
 }
 
+fn default_audit_min_free_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+
 impl Default for AuditConfig {
     fn default() -> Self {
         Self {
@@ -4441,6 +4450,7 @@ impl Default for AuditConfig {
             fail_mode: default_audit_fail_mode(),
             max_file_bytes: default_audit_max_file_bytes(),
             max_files: 0,
+            min_free_bytes: default_audit_min_free_bytes(),
         }
     }
 }

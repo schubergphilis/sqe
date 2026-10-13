@@ -250,6 +250,95 @@ pub struct AuditRotation {
     pub max_file_bytes: u64,
     /// Rotated generations to keep. 0 = keep all.
     pub max_files: usize,
+    /// Free-space floor on the audit volume. Below it, the oldest rotated
+    /// generations are deleted (never the newest) until it is met again.
+    /// 0 = never delete for space.
+    pub min_free_bytes: u64,
+}
+
+/// Delete one rotated generation, native and OCSF.
+fn delete_generation(native: &std::path::Path, ocsf: &std::path::Path, generation: u64) {
+    for p in [
+        rotated_path(native, generation),
+        rotated_path(ocsf, generation),
+    ] {
+        match std::fs::remove_file(&p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                path = %p.display(),
+                err = %e,
+                "AUDIT: cannot delete rotated file"
+            ),
+        }
+    }
+}
+
+/// How often the writer checks the free-space floor.
+const SPACE_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Deleting audit history is a last resort: only when the volume is about
+/// to fill, oldest first, and never the newest rotated generation (the
+/// chain's resume point after a restart on an empty active file).
+fn prune_for_free_space(
+    native: &std::path::Path,
+    ocsf: &std::path::Path,
+    min_free_bytes: u64,
+    free: impl Fn(&std::path::Path) -> Option<u64>,
+) -> Option<String> {
+    if min_free_bytes == 0 {
+        return None;
+    }
+    let dir = native
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let rotated = rotated_audit_files(native);
+    let mut gone = Vec::new();
+    for (g, _) in rotated.iter().take(rotated.len().saturating_sub(1)) {
+        match free(dir) {
+            Some(bytes) if bytes < min_free_bytes => {
+                delete_generation(native, ocsf, *g);
+                gone.push(*g);
+            }
+            _ => break,
+        }
+    }
+    if gone.is_empty() {
+        return None;
+    }
+    tracing::error!(
+        generations = ?gone,
+        min_free_bytes,
+        "AUDIT: volume nearly full; deleted the oldest rotated audit files"
+    );
+    Some(format!(
+        "free space below min_free_bytes={min_free_bytes}; deleted generations {gone:?}"
+    ))
+}
+
+#[cfg(unix)]
+fn free_space_bytes(dir: &std::path::Path) -> Option<u64> {
+    let s = rustix::fs::statvfs(dir).ok()?;
+    Some(s.f_bavail.saturating_mul(s.f_frsize))
+}
+
+#[cfg(not(unix))]
+fn free_space_bytes(_dir: &std::path::Path) -> Option<u64> {
+    None
+}
+
+/// Chain record for deleted rotated files, so the gap they leave is
+/// explained inside the log itself.
+fn audit_pruned_event(note: &str) -> AuditEvent {
+    let mut event = audit_resume_event(note);
+    event.kind = AuditKind::Maintenance;
+    event.outcome = Outcome::Failure {
+        error_type: Some("audit_pruned".into()),
+        error_code: Some("PRUNED".into()),
+        message: Some(note.to_string()),
+    };
+    event
 }
 
 /// `<active>.<generation>`: the active path plus a dot and a digits-only
@@ -715,6 +804,9 @@ impl AuditLogger {
                         &dropped_worker,
                     );
                 }
+                let mut last_space_check = std::time::Instant::now()
+                    .checked_sub(SPACE_CHECK_EVERY)
+                    .unwrap_or_else(std::time::Instant::now);
                 while let Ok(msg) = rx.recv() {
                     writable_worker.store(true, Ordering::Relaxed);
                     // Snapshot GDPR config once per recv iteration. Config is
@@ -914,13 +1006,48 @@ impl AuditLogger {
                     }
                     // Every arm above ends flushed, so a rename here never
                     // strands buffered bytes in the old file.
-                    Self::maybe_rotate(
+                    let mut notes: Vec<String> = Self::maybe_rotate(
                         &mut native_sink,
                         &mut ocsf_sink,
                         &resume_path,
                         &ocsf_path,
                         rotation,
-                    );
+                    )
+                    .into_iter()
+                    .collect();
+                    // Space can run out between rotations (other writers on
+                    // the volume), so the floor is checked on its own clock.
+                    if rotation.min_free_bytes > 0
+                        && last_space_check.elapsed() >= SPACE_CHECK_EVERY
+                    {
+                        last_space_check = std::time::Instant::now();
+                        notes.extend(prune_for_free_space(
+                            &resume_path,
+                            &ocsf_path,
+                            rotation.min_free_bytes,
+                            free_space_bytes,
+                        ));
+                    }
+                    if !notes.is_empty() {
+                        let note = notes.join("; ");
+                        Self::write_event(
+                            &mut native_sink,
+                            native_events,
+                            &mut ocsf_sink,
+                            &mut spool_lock(&spool_sink_worker),
+                            &mut chain,
+                            audit_pruned_event(&note),
+                            None,
+                            &path_owned,
+                            &dropped_worker,
+                        );
+                        Self::flush_sinks(
+                            &mut native_sink,
+                            &mut ocsf_sink,
+                            &mut spool_lock(&spool_sink_worker),
+                            &path_owned,
+                        );
+                    }
                 }
                 Self::flush_sinks(
                     &mut native_sink,
@@ -1215,20 +1342,24 @@ impl AuditLogger {
     /// they pair up. The in-memory chain is untouched: the first record of
     /// the new file chains to the last record of the rotated one, and a
     /// restart on the still-empty new file resumes from the rotated file.
+    ///
+    /// Returns a note when rotated files were deleted, for the caller to
+    /// write into the chain: a verifier then sees why the history starts
+    /// late, instead of a silent gap.
     fn maybe_rotate(
         native_sink: &mut NativeJsonlSink,
         ocsf_sink: &mut Option<OcsfJsonlSink>,
         native_path: &std::path::Path,
         ocsf_path: &std::path::Path,
         rotation: AuditRotation,
-    ) {
+    ) -> Option<String> {
         let max = rotation.max_file_bytes;
         if max == 0 {
-            return;
+            return None;
         }
         let len = |p: &std::path::Path| std::fs::metadata(p).map_or(0, |m| m.len());
         if len(native_path) < max && (ocsf_sink.is_none() || len(ocsf_path) < max) {
-            return;
+            return None;
         }
         let rotated = rotated_audit_files(native_path);
         let generation = rotated.last().map_or(1, |(g, _)| g + 1);
@@ -1239,7 +1370,7 @@ impl AuditLogger {
             }
             Err(e) => {
                 tracing::error!(err = %e, "AUDIT: rotation failed; still writing the current file");
-                return;
+                return None;
             }
         }
         if ocsf_sink.is_some() {
@@ -1255,25 +1386,22 @@ impl AuditLogger {
             generation,
             "Audit log rotated"
         );
+        let mut notes = Vec::new();
         if rotation.max_files > 0 {
             let total = rotated.len() + 1;
-            for (g, old) in rotated
-                .iter()
-                .take(total.saturating_sub(rotation.max_files))
-            {
-                for p in [old.clone(), rotated_path(ocsf_path, *g)] {
-                    match std::fs::remove_file(&p) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => tracing::warn!(
-                            path = %p.display(),
-                            err = %e,
-                            "AUDIT: cannot delete rotated file"
-                        ),
-                    }
-                }
+            let excess = total.saturating_sub(rotation.max_files);
+            let gone: Vec<u64> = rotated.iter().take(excess).map(|(g, _)| *g).collect();
+            for g in &gone {
+                delete_generation(native_path, ocsf_path, *g);
+            }
+            if !gone.is_empty() {
+                notes.push(format!(
+                    "max_files={} deleted generations {gone:?}",
+                    rotation.max_files
+                ));
             }
         }
+        (!notes.is_empty()).then(|| notes.join("; "))
     }
 
     /// Configure GDPR-tag masking on the audit writer.
@@ -2280,6 +2408,7 @@ mod tests {
                 rotation: AuditRotation {
                     max_file_bytes: 1,
                     max_files,
+                    min_free_bytes: 0,
                 },
                 ..AuditLoggerOptions::default()
             },
@@ -2396,18 +2525,88 @@ mod tests {
                 logger.flush();
             }
         }
+        // Prune records are chained writes too, so they rotate as well; the
+        // newest two generations are what is left.
         let kept: Vec<u64> = rotated_audit_files(&path).iter().map(|(g, _)| *g).collect();
-        assert_eq!(kept, vec![3, 4]);
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert_eq!(kept[1], kept[0] + 1);
         let ocsf = ocsf_path_from(&path);
-        assert!(!rotated_path(&ocsf, 1).exists() && !rotated_path(&ocsf, 2).exists());
-        assert!(rotated_path(&ocsf, 3).exists() && rotated_path(&ocsf, 4).exists());
+        for g in 1..kept[0] {
+            assert!(!rotated_path(&path, g).exists() && !rotated_path(&ocsf, g).exists());
+        }
+        assert!(kept.iter().all(|g| rotated_path(&ocsf, *g).exists()));
         // What is left still chains, from a non-genesis start.
-        let first = verify_file(&rotated_path(&path, 3));
+        let first = verify_file(&rotated_path(&path, kept[0]));
         assert!(!first.starts_at_genesis());
         assert_eq!(
-            crate::audit::link_rotated_reports(&first, &verify_file(&rotated_path(&path, 4))),
+            crate::audit::link_rotated_reports(&first, &verify_file(&rotated_path(&path, kept[1]))),
             Ok(None)
         );
+    }
+
+    #[test]
+    fn low_disk_deletes_oldest_generations_but_never_the_newest() {
+        let (_dir, path) = fresh_audit_path("audit.jsonl");
+        let ocsf = ocsf_path_from(&path);
+        for g in 1..=4 {
+            std::fs::write(rotated_path(&path, g), "x\n").unwrap();
+            std::fs::write(rotated_path(&ocsf, g), "x\n").unwrap();
+        }
+        // Enough room: nothing goes.
+        assert_eq!(prune_for_free_space(&path, &ocsf, 100, |_| Some(100)), None);
+        assert_eq!(rotated_audit_files(&path).len(), 4);
+        // Floor met after two deletions.
+        let calls = std::cell::Cell::new(0u64);
+        let note = prune_for_free_space(&path, &ocsf, 100, |_| {
+            calls.set(calls.get() + 1);
+            Some(if calls.get() > 2 { 100 } else { 0 })
+        })
+        .unwrap();
+        assert!(note.contains("[1, 2]"), "{note}");
+        let kept: Vec<u64> = rotated_audit_files(&path).iter().map(|(g, _)| *g).collect();
+        assert_eq!(kept, vec![3, 4]);
+        assert!(!rotated_path(&ocsf, 1).exists() && rotated_path(&ocsf, 3).exists());
+        // Disk never recovers: everything but the newest goes.
+        prune_for_free_space(&path, &ocsf, 100, |_| Some(0)).unwrap();
+        let kept: Vec<u64> = rotated_audit_files(&path).iter().map(|(g, _)| *g).collect();
+        assert_eq!(kept, vec![4]);
+        assert_eq!(prune_for_free_space(&path, &ocsf, 100, |_| Some(0)), None);
+        // Off: never deletes.
+        assert_eq!(prune_for_free_space(&path, &ocsf, 0, |_| Some(0)), None);
+    }
+
+    #[test]
+    fn deleting_rotated_files_is_recorded_in_the_chain() {
+        let (_dir, path) = fresh_audit_path("audit.jsonl");
+        {
+            let logger = rotating_logger(&path, AuditFormat::Native, 1);
+            for _ in 0..3 {
+                logger.log_event(crate::audit::sample_query_event());
+                logger.flush();
+            }
+        }
+        // Each pruning rotation writes a Maintenance record into the new file.
+        let all: Vec<crate::audit::AuditEvent> = rotated_audit_files(&path)
+            .iter()
+            .flat_map(|(_, p)| read_native_events(p))
+            .chain(read_native_events(&path))
+            .collect();
+        let pruned: Vec<_> = all
+            .iter()
+            .filter(|e| matches!(e.kind, AuditKind::Maintenance))
+            .collect();
+        assert!(!pruned.is_empty(), "no prune record in {all:?}");
+        match &pruned[0].outcome {
+            Outcome::Failure {
+                error_code,
+                message,
+                ..
+            } => {
+                assert_eq!(error_code.as_deref(), Some("PRUNED"));
+                assert!(message.as_deref().unwrap().contains("max_files=1"));
+            }
+            other => panic!("unexpected outcome {other:?}"),
+        }
     }
 
     #[test]

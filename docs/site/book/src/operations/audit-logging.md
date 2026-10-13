@@ -29,6 +29,7 @@ gdpr_identifier_mode  = "tokenize" # "tokenize" | "drop" | "keep"
 superdebug_log_results = false      # NEVER true in production
 max_file_bytes        = 268435456  # rotate at 256 MiB; 0 = never
 max_files             = 0          # rotated files to keep; 0 = keep all
+min_free_bytes        = 1073741824 # below 1 GiB free, delete oldest rotated files; 0 = never
 ```
 
 All keys are optional. The defaults above are the production-safe values.
@@ -105,10 +106,25 @@ the last record of the rotated one, and a restart on a still-empty file resumes
 from the newest rotated file. `--verify-audit <audit_log_path>` checks every
 generation in order (see below).
 
-`max_files` keeps that many rotated generations and deletes the oldest. Deleting is
-intended truncation of the history, not tampering: the oldest kept file simply does
-not start at genesis. Leave it at `0` and archive rotated files yourself if your
-retention policy needs the full trail.
+By default nothing is deleted while the disk has room. Audit history is removed in
+two cases only:
+
+- **The volume is about to fill.** Every 10 seconds the writer checks free space
+  on the audit volume. Below `min_free_bytes` (default 1 GiB) it deletes the
+  oldest rotated generations, one at a time, until the floor is met again. The
+  newest rotated file is never deleted. Each deletion logs an `ERROR` and writes
+  a `maintenance` record (`error_code = "PRUNED"`, the deleted generations in the
+  message) into the chain, so the gap is explained inside the log itself. Set
+  `min_free_bytes = 0` to never delete. A full disk then drops new audit events
+  (`sqe_audit_events_dropped_total{reason="io"}`), and anything else sharing
+  that volume runs out of space too.
+- **`max_files` is set.** The writer keeps that many rotated generations and
+  deletes the oldest, with the same chain record.
+
+Deleting is intended truncation of the history, not tampering: the oldest kept file
+simply does not start at genesis, and the `PRUNED` record says why. If your retention
+policy needs the full trail, ship rotated files off the volume before the floor is
+reached.
 
 ## Auth provider claim paths
 

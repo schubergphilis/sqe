@@ -1973,6 +1973,7 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
             rotation: sqe_metrics::audit::AuditRotation {
                 max_file_bytes: config.metrics.audit.max_file_bytes,
                 max_files: config.metrics.audit.max_files,
+                min_free_bytes: config.metrics.audit.min_free_bytes,
             },
         },
     )
