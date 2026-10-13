@@ -23,7 +23,7 @@ use std::time::Instant;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::DataFusionError;
-use datafusion::execution::memory_pool::MemoryPool;
+use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::LogicalPlan;
@@ -140,18 +140,7 @@ impl JoinFallback {
             plan = self.plan_on(&ctx).await?;
         }
         replanned.set(Arc::clone(&plan));
-        let mut config = ctx.copied_config();
-        let execution = &mut config.options_mut().execution;
-        execution.sort_spill_reservation_bytes = merge_reservation(
-            self.limit,
-            count_sorters(&plan),
-            execution.sort_spill_reservation_bytes,
-        );
-        let state = SessionStateBuilder::from(ctx.state())
-            .with_config(config)
-            .build();
-        let task = Arc::new(TaskContext::from(&state));
-        let stream = execute_stream(Arc::clone(&plan), task)?;
+        let stream = execute_stream(Arc::clone(&plan), sort_task_context(&ctx, &plan))?;
         Ok((plan, stream))
     }
 
@@ -199,17 +188,18 @@ fn retry_partitions(limit: usize, sorters: usize, current: usize) -> usize {
     (limit / (per_partition * MIN_SORTER_SHARE)).clamp(2, current)
 }
 
-/// Smallest merge reservation the retry gives a sort, as on the worker.
+/// Smallest merge reservation a sort gets, as on the worker.
 const MIN_MERGE_RESERVATION: usize = 1024 * 1024;
 
-/// Bytes each sort reserves for its merge in the retry. Every sort
-/// partition reserves `sort_spill_reservation_bytes` (10 MB by default)
-/// before it buffers anything, and that reservation cannot spill. A
-/// sort-merge plan sorts both inputs of every join in every partition, so
-/// at the default a 1 GB quota is gone at about 100 sorters, before a row
-/// is joined. The retry shares a quarter of the quota between its sorters
-/// instead, with [`MIN_MERGE_RESERVATION`] as the floor and the configured
-/// value as the ceiling. A smaller reservation means more merge passes.
+/// Bytes each sort reserves for its merge. Every sort partition reserves
+/// `sort_spill_reservation_bytes` (10 MB by default) before it buffers
+/// anything, and that reservation cannot spill. A sort-merge plan sorts both
+/// inputs of every join in every partition, so at the default a 1 GB quota
+/// is gone at about 100 sorters, before a row is joined; a plain `ORDER BY`
+/// at 16 partitions takes 160 MB the same way (#788). The sorters share a
+/// quarter of the quota instead, with [`MIN_MERGE_RESERVATION`] as the floor
+/// and the configured value as the ceiling. A smaller reservation means more
+/// merge passes.
 fn merge_reservation(limit: usize, sorters: usize, configured: usize) -> usize {
     if limit == 0 || sorters == 0 {
         return configured;
@@ -217,6 +207,35 @@ fn merge_reservation(limit: usize, sorters: usize, configured: usize) -> usize {
     (limit / 4 / sorters)
         .max(MIN_MERGE_RESERVATION)
         .min(configured)
+}
+
+/// The task context `plan` executes under on `ctx`: `ctx`'s, with each sort's
+/// merge reservation sized by [`merge_reservation`] from the quota of `ctx`'s
+/// memory pool. Both coordinator execution paths, `EXPLAIN ANALYZE` and the
+/// sort-merge retry execute through it.
+pub(crate) fn sort_task_context(
+    ctx: &SessionContext,
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Arc<TaskContext> {
+    let sorters = count_sorters(plan);
+    if sorters == 0 {
+        return ctx.task_ctx();
+    }
+    let limit = match ctx.runtime_env().memory_pool.memory_limit() {
+        MemoryLimit::Finite(limit) => limit,
+        _ => 0,
+    };
+    let mut config = ctx.copied_config();
+    let execution = &mut config.options_mut().execution;
+    let reservation = merge_reservation(limit, sorters, execution.sort_spill_reservation_bytes);
+    if reservation == execution.sort_spill_reservation_bytes {
+        return ctx.task_ctx();
+    }
+    execution.sort_spill_reservation_bytes = reservation;
+    let state = SessionStateBuilder::from(ctx.state())
+        .with_config(config)
+        .build();
+    Arc::new(TaskContext::from(&state))
 }
 
 /// External sorters `plan` will run: one per output partition of each
@@ -523,7 +542,7 @@ mod tests {
             })
             .flatten();
         let replanned = ReplannedPlan::default();
-        let stream = execute_stream(Arc::clone(&plan), ctx.task_ctx()).unwrap();
+        let stream = execute_stream(Arc::clone(&plan), sort_task_context(&ctx, &plan)).unwrap();
         let stream = FallbackStream::wrap(stream, plan, fallback, replanned.clone());
         (stream.try_collect().await, replanned, shared)
     }
@@ -601,6 +620,92 @@ mod tests {
         // No quota or no sorts: unchanged.
         assert_eq!(merge_reservation(0, 128, configured), configured);
         assert_eq!(merge_reservation(1024 * MB, 0, configured), configured);
+    }
+
+    /// A sort wider than its quota completes by spilling (#788). At 8
+    /// partitions the default merge reservations alone (8 x 10 MB) are more
+    /// than the 64 MB quota, and under a greedy quota the first sorters to
+    /// fill starve the rest, which fail holding nothing to spill.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_partitioned_sort_spills_within_a_tight_quota() {
+        const MB: usize = 1024 * 1024;
+        const SORT_ROWS: usize = 1_000_000;
+        const PARTITIONS: usize = 8;
+        let shared: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * MB));
+        let runtime = Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::clone(&shared))
+                .build()
+                .unwrap(),
+        );
+        let base = SessionContext::new_with_config_rt(
+            SessionConfig::new()
+                .with_target_partitions(PARTITIONS)
+                .with_batch_size(512),
+            runtime,
+        );
+        // About 100 MB of rows: an id and a ~90-byte string to sort on.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let per_partition = SORT_ROWS / PARTITIONS;
+        let partitions = (0..PARTITIONS)
+            .map(|p| {
+                (0..per_partition)
+                    .step_by(512)
+                    .map(|start| {
+                        let ids: Vec<i64> = (start..(start + 512).min(per_partition))
+                            .map(|i| (p * per_partition + i) as i64)
+                            .collect();
+                        let s = ids.iter().map(|id| {
+                            let h = (*id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                            format!(
+                                "{h:016x} quickly regular deposits sleep furiously among the {h:x}"
+                            )
+                        });
+                        RecordBatch::try_new(
+                            Arc::clone(&schema),
+                            vec![
+                                Arc::new(Int64Array::from(ids.clone())),
+                                Arc::new(datafusion::arrow::array::StringArray::from_iter_values(
+                                    s,
+                                )),
+                            ],
+                        )
+                        .unwrap()
+                    })
+                    .collect()
+            })
+            .collect();
+        base.register_table(
+            "t",
+            Arc::new(MemTable::try_new(Arc::clone(&schema), partitions).unwrap()),
+        )
+        .unwrap();
+        let ctx = crate::query_memory::with_query_limit(base, 64 * MB, 20);
+        for sql in [
+            "SELECT id, s FROM t ORDER BY s",
+            "SELECT max(rn), count(*) FROM (SELECT id, row_number() OVER (ORDER BY s) rn FROM t)",
+        ] {
+            let plan = ctx
+                .sql(sql)
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap();
+            let batches = datafusion::physical_plan::collect(
+                Arc::clone(&plan),
+                sort_task_context(&ctx, &plan),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            assert!(rows == SORT_ROWS || rows == 1, "{sql}: {rows} rows");
+            drop(plan);
+        }
+        assert_eq!(shared.reserved(), 0);
     }
 
     #[test]
