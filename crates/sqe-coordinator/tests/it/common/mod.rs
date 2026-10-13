@@ -90,7 +90,8 @@ pub async fn setup_handler_with_store(
         .expect("Auth failed for root");
     let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(
         sqe_policy::plan_rewriter::PolicyPlanRewriter::new(Arc::clone(&store))
-            .with_metadata_target(sqe_catalog::iceberg_metadata_tvf::metadata_tvf_target_ident),
+            .with_metadata_target(sqe_catalog::iceberg_metadata_tvf::metadata_tvf_target_ident)
+            .with_file_table(sqe_catalog::file_tvf_prepare::is_file_table_provider),
     );
     let query_tracker = Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(
         &config.query_history,

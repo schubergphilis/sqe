@@ -32,6 +32,17 @@ All notable changes to SQE are documented in this file.
 
 ### Fixed
 
+- `read_csv`, `read_parquet` and `read_json` returned 0 rows under a policy engine with a tag source (Ranger)
+
+    The rewriter treated a file function's scan as a governed table, found
+    no tag state for it in the table metadata cache, and denied every row,
+    so the query returned the file's schema and nothing else, and a CTAS
+    over it created an empty table. A file carries no column tags, and the
+    `[storage.tvf]` path policy governs it, so its scan now counts as having
+    none. It is recognised by its provider, not its name: a table named
+    `read_csv()` is still governed. A table whose tag state is unknown
+    still returns no rows.
+
 - Security: with `[policy.ranger] catalog-scoped = true`, a mask or row filter missed a table read through a view (#835)
 
     A view body's table was keyed by the warehouse name, a direct read by
