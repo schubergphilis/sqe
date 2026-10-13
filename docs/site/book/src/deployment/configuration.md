@@ -280,7 +280,9 @@ ttl_secs = 300                  # Cache entry TTL
 # Each cached entry is bound to the policy fingerprint active when it was produced.
 # A policy change (bundle update, row filter tighten, new mask) makes older entries
 # misses. ALTER TABLE and RENAME evict everything (tag-based masks live on the table,
-# outside the fingerprint). Engines without a fingerprint keep the cache off.
+# outside the fingerprint), as do CREATE and DROP VIEW. Tables or views changed from
+# another engine are only seen after ttl_secs; keep it short if such views restrict
+# access. Engines without a fingerprint keep the cache off.
 # PassthroughEnforcer has a constant fingerprint, so cache works normally.
 
 [query_history]
