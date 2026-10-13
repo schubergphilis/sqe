@@ -785,6 +785,21 @@ impl QueryHandler {
         self.query_cache.as_ref()
     }
 
+    /// Drop every cached result after CREATE [OR REPLACE] / DROP VIEW (#839).
+    ///
+    /// A cached result records the tables its plan scanned, and a view is
+    /// inlined before that list is taken, so neither the view's name nor a
+    /// view over it appears there: per-table invalidation cannot find the
+    /// results read through a replaced view, and they were served with the
+    /// old definition until the TTL. A view that narrows the rows it exposes
+    /// must not keep serving the wider result. View DDL is rare and the cache
+    /// refills on the next read, as after a maintenance procedure.
+    fn invalidate_results_read_through_views(&self) {
+        if let Some(cache) = &self.query_cache {
+            cache.invalidate_all();
+        }
+    }
+
     /// Returns the audit logger, if one was wired at construction time.
     ///
     /// Used by `SqeFlightSqlService` to emit `AuditKind::Auth` events from the
@@ -2188,11 +2203,13 @@ impl QueryHandler {
                 StatementKind::CreateView(stmt) => {
                     self.handle_create_view(session, stmt).await?;
                     crate::session_context::invalidate_session_cache(&session.user.username).await;
+                    self.invalidate_results_read_through_views();
                     Ok(vec![])
                 }
                 StatementKind::DropView(stmt) => {
                     self.catalog_ops.drop_view(session, stmt).await?;
                     crate::session_context::invalidate_session_cache(&session.user.username).await;
+                    self.invalidate_results_read_through_views();
                     Ok(vec![])
                 }
                 StatementKind::CreateSchema(stmt) => {
