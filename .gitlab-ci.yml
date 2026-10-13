@@ -137,6 +137,37 @@ aikido-build-validate:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $SQE_FORCE_IMAGE_BUILD == "1"'
 
+# `:latest` on Harbor = the newest release. aikido-publish-release-image
+# mirrors only `:vX.Y.Z` + `:stable`, and only to chameleon/sqlengine/sqe
+# (deploy_mirror.py applies one AIKIDO_IMAGE_NAME to every registry), so this
+# adds `:latest` there and keeps chameleon/sqe (the `make push` repo) on the
+# same release. Fail-closed like the release mirror. amd64 only: the CI
+# image is single-arch; multi-arch still needs a local `make push`.
+sqe-publish-latest:
+  interruptible: false
+  stage: .post
+  image: "$AIKIDO_TOOLS_IMAGE"
+  needs:
+    - job: aikido-publish-release-image
+  variables:
+    HARBOR: "repo.sovereign-data.org/chameleon"
+  script:
+    - |
+      set -eu
+      SRC="docker://$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG"
+      for DEST in sqlengine/sqe:latest sqe:$CI_COMMIT_TAG sqe:stable sqe:latest; do
+        skopeo copy --src-creds "$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD" \
+          --dest-creds "$REGISTRY_USERNAME:$REGISTRY_PASSWORD" \
+          "$SRC" "docker://$HARBOR/$DEST"
+        echo "mirrored -> $HARBOR/$DEST"
+      done
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+      exists:
+        - Dockerfile
+
 # Scheduled rescan of the deployed release; main uses the digest gate.
 aikido-image-scan:
   variables:
