@@ -71,6 +71,13 @@ pub fn test_config_path() -> String {
 pub async fn setup_handler_with_policy_store(
     store: Arc<sqe_policy::policy_store::InMemoryPolicyStore>,
 ) -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
+    setup_handler_with_store(store).await
+}
+
+/// `setup_handler_with_policy_store` for any `PolicyStore`.
+pub async fn setup_handler_with_store(
+    store: Arc<dyn sqe_policy::PolicyStore>,
+) -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
     init_tracing();
     let config =
         sqe_core::SqeConfig::load(&test_config_path()).expect("Failed to load test config");
@@ -81,7 +88,6 @@ pub async fn setup_handler_with_policy_store(
         .authenticate("root", "")
         .await
         .expect("Auth failed for root");
-    let store: Arc<dyn sqe_policy::PolicyStore> = store;
     let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(
         sqe_policy::plan_rewriter::PolicyPlanRewriter::new(Arc::clone(&store))
             .with_metadata_target(sqe_catalog::iceberg_metadata_tvf::metadata_tvf_target_ident),
