@@ -1671,6 +1671,84 @@ async fn unknown_tag_state_denies() {
     assert_eq!(total_rows(&after), 3);
 }
 
+/// A file table function has no Iceberg tags, so the unknown-tag-state deny
+/// above does not apply to it: on a cold handler `read_csv` returned the
+/// file's schema and 0 rows, and a CTAS over it created an empty table. Its
+/// access is the `[storage.tvf]` path policy, which still refuses a path
+/// outside the allowed prefixes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn file_table_function_is_not_denied_for_unknown_tag_state() {
+    use object_store::{ObjectStoreExt, PutPayload};
+
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    let config = sqe_core::SqeConfig::load(&crate::common::ranger_config_path())
+        .expect("load tests/sqe-ranger-test.toml");
+    let storage = &config.storage;
+    let store = object_store::aws::AmazonS3Builder::new()
+        .with_bucket_name("warehouse")
+        .with_endpoint(&storage.s3_endpoint)
+        .with_region(&storage.s3_region)
+        .with_access_key_id(&storage.s3_access_key)
+        .with_secret_access_key(storage.s3_secret_key.expose())
+        .with_virtual_hosted_style_request(false)
+        .with_allow_http(true)
+        .build()
+        .expect("S3 client");
+    let bob = &ctx.bob.user.username;
+    store
+        .put(
+            &object_store::path::Path::from(format!("ingest/user/{bob}/c.csv")),
+            PutPayload::from("id,country\n1,NL\n2,DE\n3,BE\n"),
+        )
+        .await
+        .expect("upload fixture");
+
+    // A handler with the TVF prefixes configured. A file scan never has an
+    // entry in the table-metadata cache, so its tag state is unknown however
+    // warm the cache is; that a governed table still fails closed on unknown
+    // tag state is `unknown_tag_state_denies`.
+    let (cold, _cache) = crate::common::setup_ranger_handler_with(|c| {
+        c.storage.tvf.allowed_object_store_prefixes =
+            vec!["s3://warehouse/ingest/user/{user}/".to_string()];
+        c.storage.tvf.allow_inline_credentials = false;
+    })
+    .await;
+    // The session-context cache is process-wide and keyed by session, not by
+    // handler: drop bob's entry so the TVFs are registered with this
+    // handler's prefixes rather than the shared handler's.
+    sqe_coordinator::session_context::invalidate_session_cache(&ctx.bob.user.username).await;
+
+    let counted = cold
+        .execute(
+            &ctx.bob,
+            &format!(
+                "SELECT count(*) AS n FROM read_csv('s3://warehouse/ingest/user/{bob}/c.csv')"
+            ),
+            None,
+        )
+        .await
+        .expect("read_csv on an allowed prefix");
+    assert_eq!(col_strings(&counted, "n"), vec!["3".to_string()]);
+
+    let err = cold
+        .execute(
+            &ctx.bob,
+            "SELECT count(*) FROM read_csv('s3://warehouse/ingest/user/someone-else/c.csv')",
+            None,
+        )
+        .await
+        .expect_err("a path outside the prefixes is refused");
+    assert!(
+        err.to_string().contains("allowed_object_store_prefixes"),
+        "{err}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn ranger_outage_fails_closed() {
