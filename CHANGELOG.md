@@ -46,6 +46,14 @@ All notable changes to SQE are documented in this file.
     their masks. Deployments where every catalog is named after its
     warehouse, or with `catalog-scoped` off, are unaffected.
 
+- A query over a view returned the view's old result after `CREATE OR REPLACE VIEW` or `DROP VIEW` (#839)
+
+    The result cache evicts entries by the tables a query read, and views are
+    inlined before that list is taken, so a view's name was never in it. A
+    view narrowed to hide rows kept serving the wider answer until `ttl_secs`
+    expired. CREATE and DROP VIEW now evict every cached result. A view
+    changed from another engine is still only seen after `ttl_secs`.
+
 - `read_parquet` on an `http://` S3 endpoint failed with "builder error" unless `s3_allow_http = true`
 
     Its S3 builder did not derive plain HTTP from the endpoint scheme, unlike
