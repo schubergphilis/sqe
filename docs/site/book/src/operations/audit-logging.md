@@ -27,7 +27,7 @@ format                = "native"   # "native" | "ocsf" | "both"
 gdpr_tags             = []         # tag names that mark a column as GDPR-sensitive
 gdpr_identifier_mode  = "tokenize" # "tokenize" | "drop" | "keep"
 superdebug_log_results = false      # NEVER true in production
-max_file_bytes        = 0          # rotate at this size; 0 = never
+max_file_bytes        = 268435456  # rotate at 256 MiB; 0 = never
 max_files             = 0          # rotated files to keep; 0 = keep all
 ```
 
@@ -93,8 +93,9 @@ GDPR data-minimisation requirements.
 
 ### `max_file_bytes` and `max_files`
 
-Default `0` for both: the audit file is never rotated and grows without limit.
-Set `max_file_bytes` to bound it. Once the native file or, with `format = "ocsf"`
+`max_file_bytes` defaults to 256 MiB and `max_files` to `0`: files rotate, and
+every rotated file is kept. `max_file_bytes = 0` turns rotation off and the file
+grows without limit. Once the native file or, with `format = "ocsf"`
 or `"both"`, the OCSF file reaches the limit, both move to
 `<audit_log_path>.<generation>` and `audit.ocsf.jsonl.<generation>` (generation
 `00000001`, `00000002`, ...) and the writer opens fresh files.

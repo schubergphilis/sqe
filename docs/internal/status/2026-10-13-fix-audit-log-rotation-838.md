@@ -8,6 +8,6 @@ For #812: rotated files are `audit.jsonl.<generation>` (`rotated_audit_files` li
 
 Tests: five unit tests in `audit::logger` (chain across files, restart on an empty active file, torn active file still breaks, Both-format pairing, `max_files` pruning). All `sqe-metrics` audit tests pass. Not run: `make test-integration` (no integration test covers the audit writer).
 
-Defaults stay off, so existing deployments are unchanged until they set `max_file_bytes`.
+Rotation is on by default (`max_file_bytes` 256 MiB, `max_files` 0 = keep all), so no history is ever deleted unless an operator sets `max_files`. `AuditLoggerOptions::default()` (library and tests) still never rotates.
 
 **NEXT:** #812 durable query history on top of rotated files; dependency/CVE batch (#800, !1133, !1107, !1389); SF100 memory safety (#788, #784, #755).

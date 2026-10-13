@@ -16,8 +16,12 @@ All notable changes to SQE are documented in this file.
     still opens a `BROKEN:` segment. `max_files` deletes the oldest rotated
     generations. `sqe-server --verify-audit <audit_log_path>` now verifies
     every generation in order and fails if one does not chain to the one
-    before it. Both keys default to `0`, so existing deployments do not
-    rotate until they set `max_file_bytes`.
+    before it. Rotation is on by default: `max_file_bytes` is 256 MiB and
+    `max_files` is `0` (keep every rotated file), so existing deployments
+    start seeing `audit.jsonl.00000001`, ... next to the active file. A
+    shipper tailing `audit.jsonl` by name keeps working; one that holds the
+    file open must follow renames. `max_file_bytes = 0` restores the old
+    single growing file.
 
 ### Fixed
 
