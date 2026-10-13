@@ -147,10 +147,10 @@ SQE uses a four-level watermark system to manage memory pressure:
 
 | Level | Pool Utilization | Behavior |
 |-------|-----------------|----------|
-| Green | < 60% | Normal execution, no restrictions |
-| Yellow | 60-75% | Advisory: log warnings, increment metrics |
-| Orange | 75-90% | Spillable operators forced to spill |
-| Red | > 90% | Admission control: new queries queued |
+| Green | < 70% | Normal execution, no restrictions |
+| Yellow | 70-85% | Advisory: log warnings, increment metrics |
+| Orange | 85-95% | Spillable operators forced to spill |
+| Red | ≥ 95% | Admission control: new reads run under `query.pressure_admission_memory` (64MB), metadata statements pass, everything else is refused |
 
 The `FairSpillPool` divides the total `memory_limit` equally among all registered `MemoryConsumer` instances. When a consumer's `try_grow` call would push the pool past the orange threshold, the pool asks other spillable consumers to spill first. If spilling frees enough memory, the allocation succeeds. If not, the allocation fails with `ResourceExhausted`.
 

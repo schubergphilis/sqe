@@ -2,7 +2,8 @@
 //!
 //! Monitors the coordinator's DataFusion [`FairSpillPool`] memory usage and
 //! classifies it into pressure levels. When memory pressure reaches `Red`
-//! (>95% utilization), new queries are rejected to prevent OOM.
+//! (>95% utilization), new queries run under the smaller
+//! `query.pressure_admission_memory` cap, or are rejected when it is 0.
 
 use std::sync::{Arc, OnceLock};
 
@@ -20,7 +21,7 @@ pub enum MemoryPressure {
     Yellow,
     /// 85-95% utilization — high pressure, spilling expected
     Orange,
-    /// > 95% utilization — critical, reject new queries
+    /// > 95% utilization — critical, new reads get the pressure cap
     Red,
 }
 
@@ -39,7 +40,8 @@ impl MemoryPressure {
         }
     }
 
-    /// Returns `true` if new queries should be admitted at this pressure level.
+    /// Returns `true` if new queries are admitted under their normal quota at
+    /// this pressure level.
     pub fn admits_new_query(&self) -> bool {
         !matches!(self, Self::Red)
     }

@@ -6,9 +6,14 @@
 //! two gates failed at once depended on which entry point it used. One
 //! function now, one order:
 //!
-//! 1. memory pressure: refuse outright when the coordinator pool is in the
-//!    red band (the message names the ORDER BY columns because dropping the
-//!    sort is the operator's first lever);
+//! 1. memory pressure: when the coordinator pool is in the red band,
+//!    metadata statements pass, other statements run under the smaller
+//!    `query.pressure_admission_memory` cap, and with that cap at 0 they are
+//!    refused outright (the message names the ORDER BY columns because
+//!    dropping the sort is the operator's first lever). The cap is enough
+//!    for a light query; a heavy one fails at its first large reservation.
+//!    Only reads get the cap, so `execute` refuses any other statement kind
+//!    once it is classified ([`QueryHandler::refuse_under_pressure`]);
 //! 2. the per-user concurrency permit, so one tenant cannot hold every
 //!    global permit while under their own submission rate limit;
 //! 3. the global concurrency permit;
@@ -27,6 +32,9 @@ pub(crate) struct Admission {
     pub permits: Vec<tokio::sync::OwnedSemaphorePermit>,
     /// The per-user memory reservation, when the budget is on.
     pub memory_reservation: Option<crate::memory::PerUserReservation>,
+    /// The cap the statement executes under: `max_query_memory`, or the
+    /// smaller pressure-admission cap when the pool was red.
+    pub quota: crate::query_memory::QueryQuota,
 }
 
 impl QueryHandler {
@@ -38,8 +46,13 @@ impl QueryHandler {
         sql: &str,
         what: &str,
     ) -> sqe_core::Result<Admission> {
-        // Memory pressure admission control: reject new queries when the
-        // coordinator's FairSpillPool is >95% utilized (Red).
+        // Metadata statements (SHOW, DESCRIBE, EXPLAIN without ANALYZE) read
+        // catalog state and plan; they never execute a scan. See below.
+        let metadata = is_metadata_statement(sql);
+
+        // Memory pressure admission control when the coordinator pool is
+        // >95% utilized (Red). Refusing everything there also refused
+        // `count(*) FROM nation` while heavy queries held the pool (#788).
         let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
         if let Some(ref metrics) = self.metrics {
             metrics.coordinator_memory_pressure.set(pressure.as_gauge());
@@ -50,16 +63,27 @@ impl QueryHandler {
                 .coordinator_memory_limit_bytes
                 .set(crate::memory::limit_bytes(&self.runtime.memory_pool) as f64);
         }
-        if !pressure.admits_new_query() {
+        let mut quota = crate::query_memory::QueryQuota::normal(self.per_query_memory_bytes);
+        if !pressure.admits_new_query() && !metadata {
+            if self.pressure_admission_memory_bytes == 0 {
+                warn!(
+                    pressure = %pressure,
+                    username = %session.user.username,
+                    "Rejecting {what} due to memory pressure"
+                );
+                return Err(pressure_rejection(sql, pressure));
+            }
+            let bytes = match self.per_query_memory_bytes {
+                0 => self.pressure_admission_memory_bytes,
+                cap => cap.min(self.pressure_admission_memory_bytes),
+            };
             warn!(
                 pressure = %pressure,
                 username = %session.user.username,
-                "Rejecting {what} due to memory pressure"
+                quota_bytes = bytes,
+                "Admitting {what} under memory pressure with a reduced quota"
             );
-            let sort_cols = extract_order_by_columns(sql);
-            return Err(SqeError::Execution(
-                adaptive_sort::format_pressure_rejection(&sort_cols, pressure),
-            ));
+            quota = crate::query_memory::QueryQuota::under_pressure(bytes);
         }
 
         let mut permits = Vec::new();
@@ -106,14 +130,15 @@ impl QueryHandler {
         // queries would push past their share of the global pool, before
         // the global red-band check fires for everyone else.
         //
-        // Metadata statements (SHOW, DESCRIBE, EXPLAIN without ANALYZE) read
-        // catalog state and plan; they never execute a scan, so they take no
-        // share of the user's execution budget. Without this, a crawler that
+        // Metadata statements take no share of the user's execution budget,
+        // and pass the red band above. Without this, a crawler that
         // describes eight tables at once against the defaults (1GB budget,
         // 256MB per query) sees the fifth `SHOW COLUMNS` refused with a
         // memory error while the pool is idle. They still take the
-        // concurrency permits above.
-        let reserves_memory = !is_metadata_statement(sql);
+        // concurrency permits above. A statement admitted under pressure
+        // reserves only its reduced quota, so a user whose heavy queries
+        // hold most of their budget can still run a light read.
+        let reserves_memory = !metadata;
         let memory_reservation = if reserves_memory
             && self.per_user_memory_budget_bytes > 0
             && self.per_query_memory_bytes > 0
@@ -121,7 +146,7 @@ impl QueryHandler {
             let username = session.user.username.clone();
             match self.per_user_memory.try_reserve(
                 &username,
-                self.per_query_memory_bytes,
+                quota.bytes,
                 self.per_user_memory_budget_bytes,
             ) {
                 Some(r) => Some(r),
@@ -144,8 +169,34 @@ impl QueryHandler {
         Ok(Admission {
             permits,
             memory_reservation,
+            quota,
         })
     }
+
+    /// Refuse a classified statement that is not a read when it was admitted
+    /// under pressure. Only the read path runs under the reduced quota;
+    /// writes, DDL and procedures would run uncapped on a red pool.
+    pub(crate) fn refuse_under_pressure(
+        &self,
+        admission: &Admission,
+        is_read: bool,
+        sql: &str,
+    ) -> sqe_core::Result<()> {
+        if !admission.quota.under_pressure || is_read {
+            return Ok(());
+        }
+        // Red as of admission: the statement was admitted only as a possible
+        // read, even if the pool has drained since.
+        Err(pressure_rejection(sql, crate::memory::MemoryPressure::Red))
+    }
+}
+
+/// The refusal a statement gets at red without a pressure-admission cap.
+fn pressure_rejection(sql: &str, pressure: crate::memory::MemoryPressure) -> SqeError {
+    let sort_cols = extract_order_by_columns(sql);
+    SqeError::Execution(adaptive_sort::format_pressure_rejection(
+        &sort_cols, pressure,
+    ))
 }
 
 /// True when the statement only reads catalog metadata or plans: `SHOW ...`,
