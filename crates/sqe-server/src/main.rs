@@ -46,7 +46,8 @@ struct Cli {
 
     /// Verify the hash chain of a native audit log, or a contiguous extract
     /// of one, print a chain-of-custody report and exit (non-zero on a
-    /// broken chain). Starts no server.
+    /// broken chain). Rotated generations (`FILE.<n>`) are verified first,
+    /// oldest to newest, each chained to the one before. Starts no server.
     #[arg(long, value_name = "FILE")]
     verify_audit: Option<String>,
 
@@ -1252,35 +1253,61 @@ fn main() -> anyhow::Result<()> {
     // TLS listener path stays as the finding-210 check.
     sqe_coordinator::tls::ensure_crypto_provider();
     let cli = Cli::parse();
-    if let Some(path) = &cli.verify_audit {
-        let bytes = std::fs::read(path)
-            .map_err(|e| anyhow::anyhow!("cannot read audit file {path}: {e}"))?;
-        match sqe_metrics::audit::verify_audit_bytes(&bytes) {
-            Ok(r) => {
-                println!("file:            {path}");
-                println!("sha256:          {}", r.file_sha256);
-                println!(
-                    "records:         {} (seq {}..={})",
-                    r.records, r.first_seq, r.last_seq
-                );
-                let genesis = if r.starts_at_genesis() {
-                    " (genesis)"
-                } else {
-                    ""
-                };
-                println!("first prev_hash: {}{genesis}", r.first_prev_hash);
-                println!("last hash:       {}", r.last_hash);
-                for (line, reason) in &r.broken_segments {
-                    println!("broken segment:  line {line}: {reason}");
-                }
-                println!("chain:           OK");
-                return Ok(());
-            }
-            Err(e) => {
-                eprintln!("chain: BROKEN: {e}");
-                std::process::exit(1);
-            }
+    if let Some(active) = &cli.verify_audit {
+        // A rotated log is its generations oldest first, then the active
+        // file; each must chain to the one before. The active file is empty
+        // right after a rotation, which is not a broken chain.
+        let rotated = sqe_metrics::audit::rotated_audit_files(std::path::Path::new(active));
+        let mut files: Vec<String> = rotated
+            .iter()
+            .map(|(_, p)| p.display().to_string())
+            .collect();
+        let active_empty = std::fs::metadata(active).is_ok_and(|m| m.len() == 0);
+        if rotated.is_empty() || !active_empty {
+            files.push(active.clone());
         }
+        let mut prev: Option<sqe_metrics::audit::AuditVerifyReport> = None;
+        for path in &files {
+            let bytes = std::fs::read(path)
+                .map_err(|e| anyhow::anyhow!("cannot read audit file {path}: {e}"))?;
+            let r = match sqe_metrics::audit::verify_audit_bytes(&bytes) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("file:            {path}");
+                    eprintln!("chain: BROKEN: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Some(p) = &prev {
+                match sqe_metrics::audit::link_rotated_reports(p, &r) {
+                    Ok(None) => {}
+                    Ok(Some(reason)) => println!("broken segment:  start of {path}: {reason}"),
+                    Err(e) => {
+                        eprintln!("chain: BROKEN: {path}: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            println!("file:            {path}");
+            println!("sha256:          {}", r.file_sha256);
+            println!(
+                "records:         {} (seq {}..={})",
+                r.records, r.first_seq, r.last_seq
+            );
+            let genesis = if r.starts_at_genesis() {
+                " (genesis)"
+            } else {
+                ""
+            };
+            println!("first prev_hash: {}{genesis}", r.first_prev_hash);
+            println!("last hash:       {}", r.last_hash);
+            for (line, reason) in &r.broken_segments {
+                println!("broken segment:  line {line}: {reason}");
+            }
+            prev = Some(r);
+        }
+        println!("chain:           OK");
+        return Ok(());
     }
     let config_path = cli
         .config
@@ -1943,6 +1970,10 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
             queue_capacity: config.metrics.audit.queue_capacity,
             fail_mode: sqe_metrics::audit::AuditFailMode::parse(&config.metrics.audit.fail_mode),
             dropped: Some(metrics.audit_events_dropped_total.clone()),
+            rotation: sqe_metrics::audit::AuditRotation {
+                max_file_bytes: config.metrics.audit.max_file_bytes,
+                max_files: config.metrics.audit.max_files,
+            },
         },
     )
     .map_err(|e| anyhow::anyhow!(e))?;
@@ -1962,21 +1993,55 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
         audit_logger
     };
 
-    // Attach the OCSF export spool when audit export is enabled.
-    let (audit_logger, shipper_spool_path) =
+    // Resolve the export endpoint before attaching the spool. Only the
+    // shipper enforces `max_spool_bytes`, so a spool with no shipper behind
+    // it would grow without bound (#838): no exporter, no spool.
+    let audit_exporter =
         if config.metrics.audit_export.enabled && config.metrics.audit_export.target == "otlp" {
-            let spool = if config.metrics.audit_export.spool_path.is_empty() {
-                format!("{}.ocsf.spool.jsonl", config.metrics.audit_log_path)
+            let ae = &config.metrics.audit_export;
+            let endpoint = if !ae.otlp_endpoint.is_empty() {
+                ae.otlp_endpoint.clone()
             } else {
-                config.metrics.audit_export.spool_path.clone()
+                config.metrics.otlp_endpoint.clone()
             };
-            let logger = audit_logger
-                .with_export_spool(&spool)
-                .map_err(|e| anyhow::anyhow!("audit export: failed to open spool file: {e}"))?;
-            (logger, Some(spool))
+            if endpoint.is_empty() {
+                tracing::warn!(
+                    "audit export: no OTLP endpoint configured \
+                     (audit_export.otlp_endpoint and metrics.otlp_endpoint are both empty); \
+                     no spool is written and the shipper will not start"
+                );
+                None
+            } else {
+                match sqe_metrics::audit::export::OtlpExporter::new(&endpoint) {
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "audit export: failed to build OtlpExporter; \
+                             no spool is written and the shipper will not start"
+                        );
+                        None
+                    }
+                    Ok(exporter) => Some((exporter, endpoint)),
+                }
+            }
         } else {
-            (audit_logger, None)
+            None
         };
+
+    // Attach the OCSF export spool when there is a shipper to drain it.
+    let (audit_logger, shipper_spool_path) = if audit_exporter.is_some() {
+        let spool = if config.metrics.audit_export.spool_path.is_empty() {
+            format!("{}.ocsf.spool.jsonl", config.metrics.audit_log_path)
+        } else {
+            config.metrics.audit_export.spool_path.clone()
+        };
+        let logger = audit_logger
+            .with_export_spool(&spool)
+            .map_err(|e| anyhow::anyhow!("audit export: failed to open spool file: {e}"))?;
+        (logger, Some(spool))
+    } else {
+        (audit_logger, None)
+    };
 
     let audit = Arc::new(audit_logger);
 
@@ -2149,70 +2214,43 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
             }
         },
     });
-    // Spawn the OTLP audit shipper when export is enabled.
-    let shipper_shutdown_tx = if let Some(ref spool_path) = shipper_spool_path {
+    // Spawn the OTLP audit shipper when export is enabled and an exporter
+    // was built above (the spool exists only then).
+    let shipper_shutdown_tx = if let (Some(spool_path), Some((exporter, endpoint))) =
+        (shipper_spool_path.as_ref(), audit_exporter)
+    {
         let ae = &config.metrics.audit_export;
-
-        let endpoint = if !ae.otlp_endpoint.is_empty() {
-            ae.otlp_endpoint.clone()
-        } else if !config.metrics.otlp_endpoint.is_empty() {
-            config.metrics.otlp_endpoint.clone()
-        } else {
-            tracing::warn!(
-                "audit export: no OTLP endpoint configured \
-                 (audit_export.otlp_endpoint and metrics.otlp_endpoint are both empty); \
-                 shipper will not start"
-            );
-            String::new()
+        let cursor_path = format!("{spool_path}.cursor");
+        let shipper_metrics = sqe_metrics::audit::export::ShipperMetrics {
+            records_total: Some(metrics.audit_export_records_total.clone()),
+            batch_failures_total: Some(metrics.audit_export_batch_failures_total.clone()),
+            spool_lag_bytes: Some(metrics.audit_export_spool_lag_bytes.clone()),
+            cursor_seq: Some(metrics.audit_export_cursor_seq.clone()),
+            last_success_timestamp: Some(metrics.audit_export_last_success_timestamp.clone()),
+            spool_dropped_records_total: Some(
+                metrics.audit_export_spool_dropped_records_total.clone(),
+            ),
         };
+        let shipper = sqe_metrics::audit::export::OtlpLogShipper::new(
+            std::path::PathBuf::from(spool_path),
+            std::path::PathBuf::from(&cursor_path),
+            std::sync::Arc::new(exporter),
+            ae.batch_max,
+            ae.max_spool_bytes,
+            sqe_coordinator::parse_start_at(&ae.start_at),
+            ae.flush_interval_ms,
+        )
+        .with_metrics(shipper_metrics)
+        .with_compactor(audit.spool_compactor(spool_path));
 
-        if endpoint.is_empty() {
-            None
-        } else {
-            match sqe_metrics::audit::export::OtlpExporter::new(&endpoint) {
-                Err(e) => {
-                    tracing::warn!(error = %e, "audit export: failed to build OtlpExporter; shipper will not start");
-                    None
-                }
-                Ok(exporter) => {
-                    let cursor_path = format!("{spool_path}.cursor");
-                    let shipper_metrics = sqe_metrics::audit::export::ShipperMetrics {
-                        records_total: Some(metrics.audit_export_records_total.clone()),
-                        batch_failures_total: Some(
-                            metrics.audit_export_batch_failures_total.clone(),
-                        ),
-                        spool_lag_bytes: Some(metrics.audit_export_spool_lag_bytes.clone()),
-                        cursor_seq: Some(metrics.audit_export_cursor_seq.clone()),
-                        last_success_timestamp: Some(
-                            metrics.audit_export_last_success_timestamp.clone(),
-                        ),
-                        spool_dropped_records_total: Some(
-                            metrics.audit_export_spool_dropped_records_total.clone(),
-                        ),
-                    };
-                    let shipper = sqe_metrics::audit::export::OtlpLogShipper::new(
-                        std::path::PathBuf::from(spool_path),
-                        std::path::PathBuf::from(&cursor_path),
-                        std::sync::Arc::new(exporter),
-                        ae.batch_max,
-                        ae.max_spool_bytes,
-                        sqe_coordinator::parse_start_at(&ae.start_at),
-                        ae.flush_interval_ms,
-                    )
-                    .with_metrics(shipper_metrics)
-                    .with_compactor(audit.spool_compactor(spool_path));
-
-                    let (tx, rx) = tokio::sync::watch::channel(false);
-                    tokio::spawn(shipper.run(rx));
-                    tracing::info!(
-                        spool = %spool_path,
-                        endpoint = %endpoint,
-                        "Started audit OTLP shipper"
-                    );
-                    Some(tx)
-                }
-            }
-        }
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(shipper.run(rx));
+        tracing::info!(
+            spool = %spool_path,
+            endpoint = %endpoint,
+            "Started audit OTLP shipper"
+        );
+        Some(tx)
     } else {
         if config.metrics.audit_export.enabled && config.metrics.audit_export.target != "otlp" {
             tracing::warn!(

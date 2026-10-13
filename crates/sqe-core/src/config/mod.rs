@@ -4393,6 +4393,16 @@ pub struct AuditConfig {
     /// refuses new statements until a subsequent enqueue succeeds.
     #[serde(default = "default_audit_fail_mode")]
     pub fail_mode: String,
+    /// Rotate the audit file once it reaches this many bytes. It is renamed
+    /// to `<audit_log_path>.<generation>` (the OCSF file rotates with it)
+    /// and the hash chain continues into the new file. 0 (default) never
+    /// rotates.
+    #[serde(default)]
+    pub max_file_bytes: u64,
+    /// Rotated files to keep; the oldest past this count are deleted.
+    /// 0 (default) keeps every rotated file.
+    #[serde(default)]
+    pub max_files: usize,
 }
 
 fn default_audit_format() -> String {
@@ -4425,6 +4435,8 @@ impl Default for AuditConfig {
             dashboard_access_audit_window_secs: default_dashboard_access_audit_window_secs(),
             queue_capacity: default_audit_queue_capacity(),
             fail_mode: default_audit_fail_mode(),
+            max_file_bytes: 0,
+            max_files: 0,
         }
     }
 }
