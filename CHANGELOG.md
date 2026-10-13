@@ -32,6 +32,20 @@ All notable changes to SQE are documented in this file.
 
 ### Fixed
 
+- Security: with `[policy.ranger] catalog-scoped = true`, a mask or row filter missed a table read through a view (#835)
+
+    A view body's table was keyed by the warehouse name, a direct read by
+    the session's name for the catalog. When the config names a catalog
+    differently from its warehouse (`[catalogs.iceberg]` over
+    `test_warehouse`), a policy for `iceberg.ns` did not match the view's
+    `test_warehouse.ns` scan, and the view returned raw values. Views are now
+    keyed by the session's catalog name, also when the body names the
+    warehouse. **Migration:** a Ranger policy whose `database` is
+    `<warehouse>.<namespace>` stops matching; rewrite it as
+    `<catalog>.<namespace>` before upgrading, or the views it covered lose
+    their masks. Deployments where every catalog is named after its
+    warehouse, or with `catalog-scoped` off, are unaffected.
+
 - `read_parquet` on an `http://` S3 endpoint failed with "builder error" unless `s3_allow_http = true`
 
     Its S3 builder did not derive plain HTTP from the endpoint scheme, unlike
