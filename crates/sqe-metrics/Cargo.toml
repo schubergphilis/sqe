@@ -30,6 +30,10 @@ regex = { workspace = true }
 async-trait = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
+# Free-space floor for audit log retention (statvfs without unsafe).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
 [lints]
 workspace = true
 
