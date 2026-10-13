@@ -2366,14 +2366,18 @@ impl QueryHandler {
                             // Plan the SELECT for its schema only. The column
                             // list and the partition-key types both come from
                             // the query, because a CTAS need not declare them.
+                            // Analyzed, so the columns carry the types the
+                            // load will write (#839).
                             let schema = sqe_catalog::file_tvf_prepare::plan_sql(&ctx, &select_sql)
                                 .await
+                                .and_then(|df| {
+                                    sqe_catalog::file_tvf_prepare::analyzed_schema(&ctx, df.logical_plan())
+                                })
                                 .map_err(|e| {
                                     SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                                         "hive_external: CTAS query does not plan: {e}"
                                     ))
                                 })?
-                                .schema()
                                 .as_arrow()
                                 .clone();
                             let spec = crate::hive_write::ctas_spec(ct, &schema)?;

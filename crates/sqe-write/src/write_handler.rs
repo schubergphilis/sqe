@@ -1811,7 +1811,7 @@ impl WriteHandler {
         // the dedicated planning stack (#640); this is the CTAS + rewriter
         // path that overflowed a request thread. `carried`: the planning
         // thread does not see the task's transaction scope.
-        let (df, policy_summary) = sqe_core::runtime::on_planning_stack(sqe_catalog::txn::carried(async {
+        let (df, output_schema, policy_summary) = sqe_core::runtime::on_planning_stack(sqe_catalog::txn::carried(async {
             let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, select_sql)
                 .await
                 .map_err(SqeError::planning)?;
@@ -1830,7 +1830,11 @@ impl WriteHandler {
                 .execute_logical_plan(enforced_source)
                 .await
                 .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Plan execution failed: {e}")))?;
-            Ok::<_, SqeError>((df, policy_summary))
+            // The table takes the schema execution produces, not the
+            // pre-analysis one (#839).
+            let output_schema = sqe_catalog::file_tvf_prepare::analyzed_schema(ctx, df.logical_plan())
+                .map_err(SqeError::planning)?;
+            Ok::<_, SqeError>((df, output_schema, policy_summary))
         }))
         .await?;
         *policy_summary_out = Some(policy_summary);
@@ -1842,7 +1846,7 @@ impl WriteHandler {
         // ns values are narrowed to µs on write (#773).
         let create_format_version = self.format_version();
         let arrow_schema = Arc::new(timestamps_for_format_version(
-            df.schema().as_arrow(),
+            output_schema.as_arrow(),
             create_format_version,
         ));
         let iceberg_schema = arrow_schema_to_iceberg(&arrow_schema)?;
@@ -6998,7 +7002,13 @@ async fn lift_in_subqueries_enforced(
                 SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("IN-subquery materialiser policy plan failed: {e}"))
             })?;
         }
-        let schema: Arc<ArrowSchema> = Arc::new(mat_df.schema().as_arrow().clone());
+        // The batches carry the analyzed types, which MemTable checks (#839).
+        let schema: Arc<ArrowSchema> = Arc::new(
+            sqe_catalog::file_tvf_prepare::analyzed_schema(ctx, mat_df.logical_plan())
+                .map_err(SqeError::planning)?
+                .as_arrow()
+                .clone(),
+        );
         let batches = mat_df.collect().await.map_err(|e| {
             SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("IN-subquery materialiser execution failed: {e}"))
         })?;
