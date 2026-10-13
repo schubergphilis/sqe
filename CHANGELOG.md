@@ -4,7 +4,42 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+## [0.51.0] — 2026-10-13
+
 ### Added
+
+- Transactions: DML inside `START TRANSACTION` / `BEGIN` commits atomically on `COMMIT` (#820, #821, #822, #823, #824)
+
+    `BEGIN`, `COMMIT` and `ROLLBACK` were no-op stubs: a client that turned
+    autocommit off believed it had a transaction while every write committed
+    alone. Now `INSERT`, `UPDATE`, `DELETE`, `MERGE` and `TRUNCATE` write to
+    a private branch `sqe-txn-<id>` of each table they touch, later
+    statements of the transaction read those writes, and `COMMIT` publishes
+    every branch to `main` in one catalog commit. If another writer moved a
+    table first, `COMMIT` fails with `TRANSACTION_CONFLICT` and nothing is
+    published. Several tables commit together when the catalog serves
+    `/v1/transactions/commit` (Polaris) or is the embedded SQLite catalog.
+    DDL, CTAS, writes to a second catalog and Hive writes are refused with
+    `AUTOCOMMIT_WRITE_CONFLICT`. Over Flight SQL, `BeginTransaction` /
+    `EndTransaction` are served, so ADBC with autocommit off opens a real
+    transaction. A transaction lives on the coordinator that started it;
+    idle (30 minutes), session end, shutdown and the 24-hour cap roll it
+    back, and `CALL system.expire_snapshots` sweeps branches a crash left
+    behind. Start and end are audited (OCSF 6005) and lineage is held until
+    `COMMIT`. See the Transactions section of the DML reference.
+
+- dbt-sqe: `delete+insert` incremental models commit their DELETE and INSERT in one transaction
+
+    Models otherwise keep autocommit; dbt-sqe sends no `BEGIN` / `COMMIT` of
+    its own.
+
+- Caches: Ranger policy bundle refresh-ahead and jittered table metadata TTL (#816)
+
+    Concurrent misses on an expired Ranger bundle wait on one download, and
+    from 80% of `cache_ttl_secs` one reader refreshes it in the background
+    while the rest are served the cached copy. A failed refresh serves the
+    cached bundle until its TTL ends, then fails closed as before. Table
+    metadata entries cached at the same moment no longer all expire together.
 
 - File TVFs: a `{catalog}` placeholder in `[storage.tvf] allowed_object_store_prefixes`
 
@@ -30,7 +65,42 @@ All notable changes to SQE are documented in this file.
     `sqe_audit_export_spool_dropped_records_total`. The local audit log keeps
     every record; queries are never blocked.
 
+- Lineage: the OpenLineage spool drops its oldest events at the cap instead of only warning (#816)
+
 ### Fixed
+
+- `SET WRITE_BRANCH` was ignored: writes outside a transaction committed to `main` (#829)
+
+    Data writes now commit to the session's write branch, and DELETE,
+    UPDATE and MERGE read the branch's files. A plain SELECT still reads
+    `main`.
+
+- A column's `DEFAULT` was stored but never applied (#828, #830)
+
+    An INSERT or MERGE INSERT that omits the column now writes its
+    `write-default`, and rows written before `ALTER TABLE ... ADD COLUMN ...
+    DEFAULT` read its `initial-default` instead of NULL. An explicit NULL
+    stays NULL.
+
+- An INSERT of a value that does not fit the column stored a wrong value (#834)
+
+    `INSERT INTO t VALUES ('abc')` into a BIGINT column read back as 0, and
+    NULL into a NOT NULL column was stored too. Both now fail: the cast is
+    checked, and required columns are checked after it.
+
+- Distributed scans failed on workers when a table mixed files from before and after `ADD COLUMN` or a rename (#831)
+
+    "number of columns(2) must match number of fields(4)". Workers now align
+    each file to the table schema by field id and fill missing columns.
+
+- `CREATE OR REPLACE VIEW` with an unchanged schema failed, and a view body naming the session's catalog was "table not found" (#832, #833)
+
+- dbt-sqe: incremental models rebuilt the table on every run, and failed DML reported success
+
+    Relation discovery never found an existing relation, so every run was a
+    `CREATE OR REPLACE`; DML errors are now raised and `rows_affected`
+    reaches dbt. The hashed `requirements-lock.txt` is regenerated and no
+    longer edited by Renovate.
 
 - `read_csv`, `read_parquet` and `read_json` returned 0 rows under a policy engine with a tag source (Ranger)
 
