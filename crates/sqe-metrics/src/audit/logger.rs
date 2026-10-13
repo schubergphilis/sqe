@@ -281,7 +281,9 @@ pub fn rotated_audit_files(active: &std::path::Path) -> Vec<(u64, std::path::Pat
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
             let digits = name.strip_prefix(&prefix)?;
-            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            // At least the padded width: logrotate's `audit.jsonl.1` numbers
+            // newest-first and must not be read as an old generation.
+            if digits.len() < 8 || !digits.bytes().all(|b| b.is_ascii_digit()) {
                 return None;
             }
             let generation: u64 = digits.parse().ok()?;
@@ -2292,6 +2294,8 @@ mod tests {
     #[test]
     fn rotation_carries_the_chain_across_files() {
         let (_dir, path) = fresh_audit_path("audit.jsonl");
+        // An external logrotate file is not one of our generations.
+        std::fs::write(path.with_file_name("audit.jsonl.1"), "x\n").unwrap();
         {
             let logger = rotating_logger(&path, AuditFormat::Native, 0);
             for _ in 0..4 {
