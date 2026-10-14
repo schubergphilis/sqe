@@ -1199,31 +1199,36 @@ async fn unmappable_tag_restricts_column_fail_closed() {
     );
 }
 
-/// Test 5 -- UNKNOWN tag state (None) fails closed: zero rows.
+/// Test 5 -- UNKNOWN tag state (None) fails closed: the statement is refused.
 ///
 /// A `TagSource` returning `None` models a metadata cache miss or a disabled
 /// cache: we cannot see whether a tag mask or tag row-filter applies. The
-/// rewriter must deny that scan (inject `lit(false)`), not pass it through as
-/// "no tags". Otherwise a cache miss silently bypasses tag-based governance.
-/// Proves the fail-closed-on-unknown contract: the query returns zero rows.
+/// rewriter must refuse that scan, not pass it through as "no tags".
+/// Otherwise a cache miss silently bypasses tag-based governance. It used to
+/// inject `lit(false)`, which returned an empty result a client could not
+/// tell from an empty table (#840); now it is an `AccessDenied` error naming
+/// the table.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unknown_tag_state_denies_all_rows() {
-    let (mem, scan) = build_multilevel_scan_with_mem();
+async fn unknown_tag_state_refuses_the_statement() {
+    let (_mem, scan) = build_multilevel_scan_with_mem();
 
     // Tag source whose state is UNKNOWN (None). No tag store policy is needed:
-    // the deny must come purely from the unknown tag state.
+    // the refusal must come purely from the unknown tag state.
     let (fake_source, _calls) = FakeTagSource::new_unknown();
     let store = TagTestStore::new();
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store)).with_tag_source(Arc::new(fake_source));
-    let (rewritten, _summary) = rewriter.evaluate(&user("dave", &[]), &sqe_policy::TableScope::default(), scan).await.unwrap();
+    let err = rewriter
+        .evaluate(&user("dave", &[]), &sqe_policy::TableScope::default(), scan)
+        .await
+        .expect_err("unknown tag state (cache miss/disabled) must refuse the statement");
 
-    let batches = execute_multilevel(rewritten, mem).await;
-    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(
-        rows, 0,
-        "unknown tag state (cache miss/disabled) must fail closed (zero rows)"
+        err.error_code(),
+        sqe_core::SqeErrorCode::AccessDenied,
+        "{err}"
     );
+    assert!(err.to_string().contains("tag state unknown"), "{err}");
 }
 
 /// Test 6 -- reserved virtual relations must NOT be denied on an unknown tag
