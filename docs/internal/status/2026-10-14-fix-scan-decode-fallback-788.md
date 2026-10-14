@@ -15,7 +15,25 @@ Live (SF10, 16 GB pool, `max_query_memory = 1GB`, dev-release):
 - TPC-DS q14: 5/5 passed (33-43 s, all retried). Main passed 3/5 and the previous branch 2/5. In these 5 runs every first refusal was a hash build, so q14 did not itself exercise the new path; q09 did.
 - TPC-DS q09 is not covered: it has no hash join to switch, so the fallback does not apply.
 
+SF10 concurrency probe (#788 workload: TPC-H SF10, greedy pool, 4 GB node pool and 2 GB per query; main with !1418 and !1419, plus this change):
+
+| | 2026-10-07 (!1317) | 2026-10-14 |
+|---|---|---|
+| sort alone (`row_number() OVER (ORDER BY l_comment)`) | fails in the merge | ok, 18.9 s |
+| agg alone | ok, 8.1 s | ok, 7.0 s |
+| join alone (q09) | ok | ok, 9.6 s |
+| 2 sort + 2 agg + 2 join concurrently | 2/6 ok | 3/6 ok (both joins, one agg) |
+| light `count(*) FROM nation` every 0.5 s | 2/41 rejected | **0/263 rejected**, p50 135 ms, p95 1443 ms |
+
+- Peak RSS was 3.6 GB, and no spill files were left.
+- In the concurrent run, one join was refused at scan decode, retried through the path this change opens, and completed after 230 s.
+- The three failures were all `iceberg-scan-decode:tpch_sf10.lineitem` refusals against the full 4 GB node pool, while spillable aggregates held about 117 MB per partition. Sorts and aggregates have no fallback.
+- An earlier probe run (q09 mistyped by the probe script) also had 0/68 light rejections.
+- #788 item 3 (zero light-query rejections) holds.
+- Light-query p95 rose from 535 ms to 1.4 s. They are now admitted while heavy queries hold the pool, so they wait behind them instead of being refused.
+
 Open:
+- Scan-decode admission fails against the node pool before other queries' spillable operators spill (#788 open item 1). It is now the only failure mode in the probe.
 - On the second q09 run the coordinator logged `Query completed` with 376 s elapsed, while the bench had all its rows at 82 s. Completion seems to be logged when the stream is released; not investigated.
 
 **NEXT:** rerun the SF10 concurrency probe; then #755.
