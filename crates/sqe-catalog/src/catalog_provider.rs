@@ -924,6 +924,7 @@ mod tests {
             runtime_filter_bloom_probe: false,
             runtime_filter_bloom_max_values: 11,
             scan_fetch_ahead: Some(13),
+            scan_memory_wait_ms: 17,
         };
         let provider = provider.with_tuning(tuning.clone());
         assert_eq!(provider.tuning(), &tuning);
