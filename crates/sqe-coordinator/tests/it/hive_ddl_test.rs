@@ -627,9 +627,9 @@ async fn create_external_table_emits_an_audit_event_with_the_policy_name() {
     );
 }
 
-/// The end-to-end guard for the `lit(false)` failure mode. Without the
-/// routing tag source this returns zero rows rather than erroring, which is
-/// why the assertion is on the row count.
+/// The end-to-end guard for the unknown-tag-state failure mode. Without the
+/// routing tag source this used to return zero rows (`lit(false)`); since
+/// #840 it is refused with `AccessDenied`, which `.expect("query")` catches.
 #[test]
 fn a_hive_query_is_not_denied_when_a_tag_source_is_active() {
     tokio::runtime::Builder::new_multi_thread()
