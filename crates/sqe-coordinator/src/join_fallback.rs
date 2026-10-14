@@ -14,29 +14,46 @@
 //! The retry runs once, on the coordinator, under a fresh query quota.
 //! Distribution is not attempted for it. It is "complete, not fast": small
 //! broadcasts and hash-join dynamic filters are gone from the retry plan.
+//!
+//! A refusal by the coordinator pool rather than the query's own quota
+//! means other queries held the memory, and a smaller plan does not fix
+//! that (#788). The query then drops its attempt, waits until the pool has
+//! room for a full quota and runs the same plan again, still on the
+//! coordinator (`query.memory_rerun`). One rerun waits or starts at a time
+//! per coordinator ([`RerunGate`]), so two queries refused together do not
+//! collide again. A rerun refused before its first batch falls back to
+//! sort-merge joins as above.
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::DataFusionError;
+use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool};
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::execution::TaskContext;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
-    execute_stream, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
+    ExecutionPlan, RecordBatchStream, SendableRecordBatchStream, execute_stream,
 };
 use datafusion::prelude::SessionContext;
 use futures::future::BoxFuture;
 use futures::{FutureExt, Stream};
 use sqe_core::config::QueryConfig;
+use tokio::sync::OwnedMutexGuard;
 use tracing::warn;
+
+/// Admits memory reruns one at a time per coordinator: held from the start
+/// of the wait for room until the rerun's first batch or failure.
+pub(crate) type RerunGate = Arc<tokio::sync::Mutex<()>>;
+
+/// How often a rerun checks the coordinator pool for room.
+const ROOM_POLL: Duration = Duration::from_millis(100);
 
 /// The plan the retry executed, handed to whoever reports on the query
 /// (spill metrics, the streaming finalizer's profile and plan metrics).
@@ -71,12 +88,25 @@ pub(crate) struct JoinFallback {
     metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
     query_id: uuid::Uuid,
     started: Instant,
+    /// `query.join_fallback`, with spill files to make it useful.
+    sort_merge: bool,
+    /// `query.memory_rerun`.
+    rerun: bool,
+    gate: RerunGate,
+}
+
+/// A rerun that found room: its plan, its stream and the gate it holds
+/// until its first batch.
+struct Rerun {
+    plan: Arc<dyn ExecutionPlan>,
+    stream: SendableRecordBatchStream,
+    gate: OwnedMutexGuard<()>,
 }
 
 impl JoinFallback {
-    /// `None` when the fallback is off (`query.join_fallback`) or cannot
-    /// help: without spill files a sort-merge plan holds as much as the hash
-    /// plan did.
+    /// `None` when both the memory rerun (`query.memory_rerun`) and the
+    /// sort-merge retry are off. The retry counts as off without spill
+    /// files: a sort-merge plan then holds as much as the hash plan did.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         ctx: &SessionContext,
@@ -87,8 +117,10 @@ impl JoinFallback {
         query: &QueryConfig,
         metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
         query_id: uuid::Uuid,
+        gate: RerunGate,
     ) -> Option<Self> {
-        if !query.join_fallback || !ctx.runtime_env().disk_manager.tmp_files_enabled() {
+        let sort_merge = query.join_fallback && ctx.runtime_env().disk_manager.tmp_files_enabled();
+        if !sort_merge && !query.memory_rerun {
             return None;
         }
         Some(Self {
@@ -101,15 +133,80 @@ impl JoinFallback {
             metrics,
             query_id,
             started: Instant::now(),
+            sort_merge,
+            rerun: query.memory_rerun,
+            gate,
         })
     }
 
-    /// Whether `error`, raised by `plan` before its first batch, is one the
-    /// retry can fix. Any memory refusal counts, whichever consumer asked
+    /// Whether the sort-merge retry can fix `error`, raised by `plan` before
+    /// its first batch. Any memory refusal counts, whichever consumer asked
     /// last: at a 1 GB cap, TPC-H q09 was refused at scan decode while its
     /// hash builds held most of the pool.
-    fn applies(plan: &Arc<dyn ExecutionPlan>, error: &DataFusionError) -> bool {
-        crate::query_memory::is_resources_exhausted(error) && has_switchable_hash_join(plan)
+    fn switches(&self, plan: &Arc<dyn ExecutionPlan>, error: &DataFusionError) -> bool {
+        self.sort_merge
+            && crate::query_memory::is_resources_exhausted(error)
+            && has_switchable_hash_join(plan)
+    }
+
+    /// Whether `error`, raised before the first batch of an attempt that is
+    /// not a rerun already, was the coordinator pool's refusal: other
+    /// queries held the memory.
+    fn reruns(&self, error: &DataFusionError) -> bool {
+        self.rerun
+            && crate::query_memory::is_resources_exhausted(error)
+            && !crate::query_memory::is_quota_refusal(error)
+    }
+
+    /// Whether the coordinator pool has room for a full quota, or half the
+    /// pool when the quota is larger.
+    fn room(&self) -> bool {
+        let MemoryLimit::Finite(pool) = self.shared_pool.memory_limit() else {
+            return true;
+        };
+        let need = self.limit.min(pool / 2);
+        self.shared_pool.reserved().saturating_add(need) <= pool
+    }
+
+    /// Take the [`RerunGate`] and wait for [`Self::room`], until the
+    /// query's timeout. `None` when the time ran out.
+    async fn wait_for_room(&self) -> Option<OwnedMutexGuard<()>> {
+        let timeout = match self.query.timeout_secs {
+            0 => Duration::from_secs(600),
+            secs => Duration::from_secs(secs),
+        };
+        let deadline = tokio::time::Instant::from_std(self.started + timeout);
+        let gate = tokio::time::timeout_at(deadline, Arc::clone(&self.gate).lock_owned())
+            .await
+            .ok()?;
+        while !self.room() {
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(ROOM_POLL).await;
+        }
+        Some(gate)
+    }
+
+    /// Wait for room, then plan the logical plan again as it was planned
+    /// (hash joins and all) under a fresh quota and open its stream. `None`
+    /// when no room came before the query's timeout.
+    async fn rerun(&self, replanned: ReplannedPlan) -> Result<Option<Rerun>, DataFusionError> {
+        let Some(gate) = self.wait_for_room().await else {
+            return Ok(None);
+        };
+        let ctx = retry_context(
+            &self.ctx,
+            Arc::clone(&self.shared_pool),
+            self.limit,
+            self.headroom_percent,
+            false,
+            None,
+        );
+        let plan = self.plan_on(&ctx).await?;
+        replanned.set(Arc::clone(&plan));
+        let stream = execute_stream(Arc::clone(&plan), sort_task_context(&ctx, &plan))?;
+        Ok(Some(Rerun { plan, stream, gate }))
     }
 
     /// Plan the logical plan again with sort-merge joins, under a fresh
@@ -118,22 +215,24 @@ impl JoinFallback {
         self,
         replanned: ReplannedPlan,
     ) -> Result<(Arc<dyn ExecutionPlan>, SendableRecordBatchStream), DataFusionError> {
-        let mut ctx = sort_merge_context(
+        let mut ctx = retry_context(
             &self.ctx,
             Arc::clone(&self.shared_pool),
             self.limit,
             self.headroom_percent,
+            true,
             None,
         );
         let mut plan = self.plan_on(&ctx).await?;
         let current = ctx.copied_config().options().execution.target_partitions;
         let partitions = retry_partitions(self.limit, count_sorters(&plan), current);
         if partitions < current {
-            ctx = sort_merge_context(
+            ctx = retry_context(
                 &self.ctx,
                 Arc::clone(&self.shared_pool),
                 self.limit,
                 self.headroom_percent,
+                true,
                 Some(partitions),
             );
             plan = self.plan_on(&ctx).await?;
@@ -252,21 +351,26 @@ fn count_sorters(plan: &Arc<dyn ExecutionPlan>) -> usize {
         .sum::<usize>()
 }
 
-/// A copy of `ctx` that plans equi-joins as sort-merge joins, with its own
-/// query quota over `shared_pool`, at `target_partitions` when given. The
-/// quota is a fair one: under a greedy quota one sorter, or one side's spill
-/// merge, could take every byte while another sorter still held nothing, and
-/// a sorter refused with nothing to spill fails the query.
-fn sort_merge_context(
+/// A copy of `ctx` with its own query quota over `shared_pool`. With
+/// `sort_merge` it plans equi-joins as sort-merge joins, at
+/// `target_partitions` when given, and the quota is a fair one: under a
+/// greedy quota one sorter, or one side's spill merge, could take every byte
+/// while another sorter still held nothing, and a sorter refused with
+/// nothing to spill fails the query. Without it the copy plans as the first
+/// attempt did, for a memory rerun.
+fn retry_context(
     ctx: &SessionContext,
     shared_pool: Arc<dyn MemoryPool>,
     limit: usize,
     headroom_percent: u8,
+    sort_merge: bool,
     target_partitions: Option<usize>,
 ) -> SessionContext {
     let state = ctx.state();
     let mut config = state.config().clone();
-    config.options_mut().optimizer.prefer_hash_join = false;
+    if sort_merge {
+        config.options_mut().optimizer.prefer_hash_join = false;
+    }
     if let Some(partitions) = target_partitions {
         config.options_mut().execution.target_partitions = partitions;
     }
@@ -276,7 +380,7 @@ fn sort_merge_context(
         shared_pool,
         limit,
         headroom_percent,
-        true,
+        sort_merge,
     )
 }
 
@@ -299,12 +403,25 @@ type Replanning = BoxFuture<
     Result<(Arc<dyn ExecutionPlan>, SendableRecordBatchStream), DataFusionError>,
 >;
 
+/// A memory rerun waiting for room and being planned. It hands the fallback
+/// back, for a sort-merge retry when no room came.
+type Rerunning = BoxFuture<'static, (Box<JoinFallback>, Result<Option<Rerun>, DataFusionError>)>;
+
 enum State {
-    /// The first attempt, before it has produced a batch.
+    /// An attempt before it has produced a batch. `gate` is held by a
+    /// memory rerun.
     First {
         stream: SendableRecordBatchStream,
         plan: Arc<dyn ExecutionPlan>,
         fallback: Box<JoinFallback>,
+        gate: Option<OwnedMutexGuard<()>>,
+    },
+    /// A memory rerun on its way, with the refused attempt's plan and error
+    /// for when no room comes.
+    Rerunning {
+        future: Rerunning,
+        plan: Arc<dyn ExecutionPlan>,
+        error: DataFusionError,
     },
     Replanning(Replanning),
     /// Either attempt after it started producing batches. `retry` is set
@@ -316,8 +433,8 @@ enum State {
     Done,
 }
 
-/// The query's output stream, with the sort-merge retry armed until the
-/// first batch.
+/// The query's output stream, with the memory rerun and the sort-merge
+/// retry armed until the first batch.
 pub(crate) struct FallbackStream {
     schema: SchemaRef,
     state: State,
@@ -326,15 +443,17 @@ pub(crate) struct FallbackStream {
 }
 
 impl FallbackStream {
-    /// Wrap `stream` (the execution of `plan`). Without a `fallback` the
-    /// stream passes through unchanged.
+    /// Wrap `stream` (the execution of `plan`). Without a `fallback` that
+    /// can act on `plan` the stream passes through unchanged.
     pub(crate) fn wrap(
         stream: SendableRecordBatchStream,
         plan: Arc<dyn ExecutionPlan>,
         fallback: Option<JoinFallback>,
         replanned: ReplannedPlan,
     ) -> SendableRecordBatchStream {
-        let Some(fallback) = fallback.filter(|_| has_switchable_hash_join(&plan)) else {
+        let Some(fallback) = fallback.filter(|fallback| {
+            fallback.rerun || (fallback.sort_merge && has_switchable_hash_join(&plan))
+        }) else {
             return stream;
         };
         Box::pin(Self {
@@ -344,6 +463,7 @@ impl FallbackStream {
                 stream,
                 plan,
                 fallback: Box::new(fallback),
+                gate: None,
             },
             replanned,
         })
@@ -357,6 +477,32 @@ impl FallbackStream {
                 .inc();
         }
     }
+
+    fn wasted(&self, fallback: &JoinFallback) -> Duration {
+        let wasted = fallback.started.elapsed();
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .join_fallback_wasted_seconds
+                .inc_by(wasted.as_secs_f64());
+        }
+        wasted
+    }
+
+    /// Start the sort-merge retry after `error`.
+    fn switch(&mut self, fallback: Box<JoinFallback>, error: &DataFusionError) {
+        let wasted = self.wasted(&fallback);
+        warn!(
+            query_id = %fallback.query_id,
+            limit_bytes = fallback.limit,
+            wasted_ms = wasted.as_millis() as u64,
+            error = %error,
+            "query ran out of memory before its first batch; \
+             retrying with sort-merge joins (#784)"
+        );
+        self.count("replanned");
+        let replanned = self.replanned.clone();
+        self.state = State::Replanning(fallback.replan(replanned).boxed());
+    }
 }
 
 impl Stream for FallbackStream {
@@ -365,48 +511,108 @@ impl Stream for FallbackStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
             match &mut self.state {
-                State::First { stream, plan, .. } => {
-                    match stream.as_mut().poll_next(cx) {
-                        Poll::Ready(Some(Err(error))) if JoinFallback::applies(plan, &error) => {
-                            // Drop the failed attempt first so its
-                            // reservations are released before the retry
-                            // asks for memory.
-                            let State::First { fallback, .. } =
-                                std::mem::replace(&mut self.state, State::Done)
-                            else {
-                                unreachable!("matched First above");
-                            };
-                            let wasted = fallback.started.elapsed();
+                State::First {
+                    stream,
+                    plan,
+                    fallback,
+                    gate,
+                } => match stream.as_mut().poll_next(cx) {
+                    Poll::Ready(Some(Err(error)))
+                        if (gate.is_none() && fallback.reruns(&error))
+                            || fallback.switches(plan, &error) =>
+                    {
+                        // Drop the failed attempt, and a rerun's gate, first
+                        // so their reservations are released before the next
+                        // attempt asks for memory.
+                        let State::First {
+                            plan,
+                            fallback,
+                            gate,
+                            ..
+                        } = std::mem::replace(&mut self.state, State::Done)
+                        else {
+                            unreachable!("matched First above");
+                        };
+                        if gate.is_none() && fallback.reruns(&error) {
+                            let wasted = self.wasted(&fallback);
                             warn!(
                                 query_id = %fallback.query_id,
-                                limit_bytes = fallback.limit,
                                 wasted_ms = wasted.as_millis() as u64,
                                 error = %error,
-                                "query ran out of memory before its first batch; \
-                                 retrying with sort-merge joins (#784)"
+                                "the coordinator pool refused the query before its first \
+                                 batch; waiting for room to run it again (#788)"
                             );
-                            if let Some(metrics) = &self.metrics {
-                                metrics
-                                    .join_fallback_wasted_seconds
-                                    .inc_by(wasted.as_secs_f64());
-                            }
-                            self.count("replanned");
+                            self.count("rerun");
                             let replanned = self.replanned.clone();
-                            self.state = State::Replanning(fallback.replan(replanned).boxed());
-                        }
-                        Poll::Ready(Some(item)) => {
-                            let State::First { stream, .. } =
-                                std::mem::replace(&mut self.state, State::Done)
-                            else {
-                                unreachable!("matched First above");
+                            let future = async move {
+                                let outcome = fallback.rerun(replanned).await;
+                                (fallback, outcome)
+                            }
+                            .boxed();
+                            self.state = State::Rerunning {
+                                future,
+                                plan,
+                                error,
                             };
-                            self.state = State::Running {
-                                stream,
-                                retry: false,
-                            };
-                            return Poll::Ready(Some(item));
+                        } else {
+                            drop(gate);
+                            self.switch(fallback, &error);
                         }
-                        other => return other,
+                    }
+                    Poll::Ready(Some(item)) => {
+                        let State::First { stream, gate, .. } =
+                            std::mem::replace(&mut self.state, State::Done)
+                        else {
+                            unreachable!("matched First above");
+                        };
+                        self.state = State::Running {
+                            stream,
+                            retry: gate.is_some() && item.is_ok(),
+                        };
+                        return Poll::Ready(Some(item));
+                    }
+                    Poll::Ready(None) => {
+                        self.state = State::Done;
+                        return Poll::Ready(None);
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
+                State::Rerunning { future, .. } => {
+                    let Poll::Ready((fallback, outcome)) = future.as_mut().poll(cx) else {
+                        return Poll::Pending;
+                    };
+                    let State::Rerunning { plan, error, .. } =
+                        std::mem::replace(&mut self.state, State::Done)
+                    else {
+                        unreachable!("matched Rerunning above");
+                    };
+                    match outcome {
+                        Ok(Some(rerun)) => {
+                            if rerun.plan.schema() != self.schema {
+                                self.count("failed");
+                                return Poll::Ready(Some(Err(DataFusionError::Internal(
+                                    "memory rerun produced a different output schema".into(),
+                                ))));
+                            }
+                            self.state = State::First {
+                                stream: rerun.stream,
+                                plan: rerun.plan,
+                                fallback,
+                                gate: Some(rerun.gate),
+                            };
+                        }
+                        Ok(None) => {
+                            self.count("rerun_timeout");
+                            if fallback.switches(&plan, &error) {
+                                self.switch(fallback, &error);
+                            } else {
+                                return Poll::Ready(Some(Err(error)));
+                            }
+                        }
+                        Err(rerun_error) => {
+                            self.count("failed");
+                            return Poll::Ready(Some(Err(rerun_error)));
+                        }
                     }
                 }
                 State::Replanning(future) => match future.as_mut().poll(cx) {
@@ -537,6 +743,7 @@ mod tests {
                     &QueryConfig::default(),
                     None,
                     uuid::Uuid::nil(),
+                    RerunGate::default(),
                 )
             })
             .flatten();
@@ -748,6 +955,11 @@ mod tests {
         let logical = ctx.state().create_logical_plan(JOIN).await.unwrap();
         let off = QueryConfig {
             join_fallback: false,
+            memory_rerun: false,
+            ..QueryConfig::default()
+        };
+        let rerun_only = QueryConfig {
+            join_fallback: false,
             ..QueryConfig::default()
         };
         let pool = || ctx.runtime_env().memory_pool.clone();
@@ -761,10 +973,18 @@ mod tests {
                 query,
                 None,
                 uuid::Uuid::nil(),
+                RerunGate::default(),
             )
         };
-        assert!(fallback(&QueryConfig::default(), &ctx).is_some());
+        let sort_merge = |query: &QueryConfig, ctx: &SessionContext| {
+            fallback(query, ctx).map(|fallback| (fallback.sort_merge, fallback.rerun))
+        };
+        assert_eq!(
+            sort_merge(&QueryConfig::default(), &ctx),
+            Some((true, true))
+        );
         assert!(fallback(&off, &ctx).is_none());
+        assert_eq!(sort_merge(&rerun_only, &ctx), Some((false, true)));
         let no_spill = SessionContext::new_with_config_rt(
             SessionConfig::new(),
             Arc::new(
@@ -779,7 +999,142 @@ mod tests {
                     .unwrap(),
             ),
         );
-        assert!(fallback(&QueryConfig::default(), &no_spill).is_none());
+        // Without spill files only the rerun is left.
+        assert_eq!(
+            sort_merge(&QueryConfig::default(), &no_spill),
+            Some((false, true))
+        );
+    }
+
+    /// Run `sql` under a `CAP` quota while another query holds all of the
+    /// `4 * CAP` coordinator pool, with the rerun armed. The hog lets go
+    /// after `release` when given.
+    async fn run_beside_a_full_pool(
+        sql: &str,
+        query: QueryConfig,
+        release: Option<Duration>,
+    ) -> (
+        Result<Vec<RecordBatch>, DataFusionError>,
+        ReplannedPlan,
+        Arc<dyn MemoryPool>,
+    ) {
+        let shared: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(4 * CAP));
+        let base = session(Arc::clone(&shared));
+        let hog = datafusion::execution::memory_pool::MemoryConsumer::new("other query")
+            .register(&shared);
+        hog.try_grow(4 * CAP).unwrap();
+        let ctx = crate::query_memory::with_query_limit(base, CAP, 20);
+        let logical = ctx.state().create_logical_plan(sql).await.unwrap();
+        let plan = ctx.state().create_physical_plan(&logical).await.unwrap();
+        let fallback = JoinFallback::new(
+            &ctx,
+            Arc::clone(&shared),
+            CAP,
+            20,
+            logical,
+            &query,
+            None,
+            uuid::Uuid::nil(),
+            RerunGate::default(),
+        );
+        let replanned = ReplannedPlan::default();
+        let stream = execute_stream(Arc::clone(&plan), sort_task_context(&ctx, &plan)).unwrap();
+        let stream = FallbackStream::wrap(stream, plan, fallback, replanned.clone());
+        let hog = tokio::spawn(async move {
+            match release {
+                Some(after) => tokio::time::sleep(after).await,
+                None => std::future::pending().await,
+            }
+            drop(hog);
+        });
+        let result = stream.try_collect().await;
+        hog.abort();
+        (result, replanned, shared)
+    }
+
+    const FITS: &str = "SELECT l.id, r.v FROM l JOIN r ON l.id = r.id WHERE r.id < 100";
+
+    /// A query the coordinator pool refused, not its quota, waits for the
+    /// other query to let go and runs its hash join again (#788).
+    #[tokio::test]
+    async fn a_query_refused_by_a_full_pool_reruns_once_there_is_room() {
+        let (result, replanned, shared) = run_beside_a_full_pool(
+            FITS,
+            QueryConfig::default(),
+            Some(Duration::from_millis(300)),
+        )
+        .await;
+        let rows: usize = result
+            .expect("the rerun completes")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 100);
+        let plan = replanned.take().expect("the query ran again");
+        let shape = displayable(plan.as_ref()).indent(false).to_string();
+        assert!(shape.contains("HashJoinExec"), "the same plan: {shape}");
+        drop(plan);
+        assert_eq!(shared.reserved(), 0);
+    }
+
+    /// Without room before the query's timeout the refusal comes back.
+    #[tokio::test]
+    async fn a_rerun_gives_up_at_the_query_timeout() {
+        let query = QueryConfig {
+            timeout_secs: 1,
+            join_fallback: false,
+            ..QueryConfig::default()
+        };
+        let started = Instant::now();
+        let (result, replanned, _) = run_beside_a_full_pool(FITS, query, None).await;
+        let error = result.unwrap_err();
+        assert!(
+            crate::query_memory::is_resources_exhausted(&error),
+            "{error}"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(900));
+        assert!(replanned.take().is_none());
+    }
+
+    /// Reruns wait one at a time: a second waits for the first's gate.
+    #[tokio::test]
+    async fn reruns_take_the_gate_one_at_a_time() {
+        let shared: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(4 * CAP));
+        let ctx = session(Arc::clone(&shared));
+        let logical = ctx.state().create_logical_plan(FITS).await.unwrap();
+        let gate = RerunGate::default();
+        let fallback = |timeout_secs| {
+            JoinFallback::new(
+                &ctx,
+                Arc::clone(&shared),
+                CAP,
+                20,
+                logical.clone(),
+                &QueryConfig {
+                    timeout_secs,
+                    ..QueryConfig::default()
+                },
+                None,
+                uuid::Uuid::nil(),
+                Arc::clone(&gate),
+            )
+            .unwrap()
+        };
+        let first = fallback(30);
+        let held = first.wait_for_room().await.expect("room in an empty pool");
+        assert!(
+            fallback(1).wait_for_room().await.is_none(),
+            "the gate is held"
+        );
+        drop(held);
+        assert!(fallback(30).wait_for_room().await.is_some());
+        // Room means a full quota fits next to what the pool holds.
+        let hog = datafusion::execution::memory_pool::MemoryConsumer::new("other query")
+            .register(&shared);
+        hog.try_grow(3 * CAP + 1).unwrap();
+        assert!(!first.room());
+        hog.shrink(1);
+        assert!(first.room());
     }
 
     #[tokio::test]
