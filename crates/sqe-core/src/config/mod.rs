@@ -2851,6 +2851,16 @@ pub struct CatalogConfig {
     /// behavior; A/B escape hatch). Any other value: absolute depth.
     #[serde(default)]
     pub scan_fetch_ahead: Option<usize>,
+    /// How long (ms) an Iceberg scan's decode admission waits for memory
+    /// when the node pool refuses it but the query's own quota still has
+    /// room (#788): the bytes are held by other queries, and their
+    /// reservations are transient. A refusal by the query's own quota
+    /// stays immediate, so the join fallback can retry it. Past the wait
+    /// the scan fails typed, as before. `0`: never wait.
+    ///
+    /// Default: 30000.
+    #[serde(default = "default_scan_memory_wait_ms")]
+    pub scan_memory_wait_ms: u64,
     /// Two-tier dynamic runtime-filter pushdown tuning (issue #132).
     #[serde(default)]
     pub runtime_filters: RuntimeFiltersConfig,
@@ -5815,6 +5825,9 @@ fn default_parquet_compression() -> String {
 fn default_manifest_concurrency() -> usize {
     64
 }
+fn default_scan_memory_wait_ms() -> u64 {
+    30_000
+}
 fn default_prometheus_port() -> u16 {
     9090
 }
@@ -7835,6 +7848,7 @@ partial_progress_batch = 5
                 parquet_compression: "zstd".to_string(),
                 manifest_concurrency: 64,
                 scan_fetch_ahead: None,
+                scan_memory_wait_ms: default_scan_memory_wait_ms(),
                 runtime_filters: RuntimeFiltersConfig::default(),
                 auth: None,
                 storage: None,
@@ -9326,6 +9340,7 @@ s3_secret_key = "configured-secret"
                 parquet_compression: "zstd".to_string(),
                 manifest_concurrency: 64,
                 scan_fetch_ahead: None,
+                scan_memory_wait_ms: default_scan_memory_wait_ms(),
                 runtime_filters: RuntimeFiltersConfig::default(),
                 auth: None,
                 storage: None,
@@ -9364,6 +9379,7 @@ s3_secret_key = "configured-secret"
                     parquet_compression: "zstd".to_string(),
                     manifest_concurrency: 64,
                     scan_fetch_ahead: None,
+                    scan_memory_wait_ms: default_scan_memory_wait_ms(),
                     runtime_filters: RuntimeFiltersConfig::default(),
                     auth: None,
                     storage: None,
@@ -9409,6 +9425,7 @@ s3_secret_key = "configured-secret"
                 parquet_compression: "zstd".to_string(),
                 manifest_concurrency: 64,
                 scan_fetch_ahead: None,
+                scan_memory_wait_ms: default_scan_memory_wait_ms(),
                 runtime_filters: RuntimeFiltersConfig::default(),
                 auth: None,
                 storage: None,

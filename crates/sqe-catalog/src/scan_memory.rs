@@ -19,19 +19,37 @@
 //!   process-global semaphore those parked workers would starve the build
 //!   side's own scan into a deadlock.
 //! - each admitted decode reserves its estimated working set against the
-//!   query's memory pool (fail-fast `try_grow`, never a blocking wait, so
-//!   pressure cannot deadlock against operators waiting on this scan).
-//!   A denial surfaces as `DataFusionError::ResourcesExhausted`: the query
-//!   fails typed, the node and every other query keep running.
+//!   query's memory pool. A denial surfaces as
+//!   `DataFusionError::ResourcesExhausted`: the query fails typed, the node
+//!   and every other query keep running.
+//!
+//! Which pool refused decides whether a denial waits (#788):
+//!
+//! - The query's own quota: the bytes are held by this query, possibly by
+//!   an operator waiting on this very scan, so waiting could deadlock. The
+//!   denial is immediate, and the join fallback (#784) can retry the query
+//!   with sort-merge joins.
+//! - The node pool, while the quota still has room: other queries hold the
+//!   bytes, and decodes, hash builds and merges release them as they
+//!   finish. The admission polls with backoff for up to
+//!   [`ScanDecodeGate::set_memory_wait`] before failing the same way. The
+//!   wait is bounded, so queries waiting on each other's memory still end.
+//!
+//! Without a per-query quota the pool's own `reserved()` is the whole
+//! node's charge, so every denial counts as the query's own and stays
+//! immediate.
 
 use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
+use datafusion::execution::memory_pool::{
+    MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
+};
 use futures::future::BoxFuture;
 use iceberg::arrow::DecodeGate;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -42,6 +60,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 pub const DECODE_MEMORY_ESTIMATE_FACTOR: u64 = 4;
 
 const PPM: u32 = 1_000_000;
+
+/// First and longest pause between retries of a decode admission waiting
+/// for other queries' memory (#788).
+const MEMORY_WAIT_FIRST_RETRY: Duration = Duration::from_millis(10);
+const MEMORY_WAIT_MAX_RETRY: Duration = Duration::from_millis(200);
 
 /// Escape hatch: set to `0`, `false`, or `off` to disable the pool
 /// reservations (the concurrency bound always applies). Diagnostic only,
@@ -80,6 +103,13 @@ pub struct ScanDecodeGate {
     /// parts per million (see [`Self::set_projected_share`]). Applied to the
     /// vendored reader's admissions only.
     projected_share_ppm: AtomicU32,
+    /// How long a denial by the node pool waits for memory, in ms (see
+    /// [`Self::set_memory_wait`]). 0 = fail fast.
+    memory_wait_ms: AtomicU64,
+    /// When this gate's first admission started waiting. Every later wait
+    /// ends at the same deadline, so the wait bounds the whole scan
+    /// partition, not each subtask.
+    wait_started: std::sync::OnceLock<tokio::time::Instant>,
 }
 
 /// Floor for [`ScanDecodeGate::set_projected_share`]: page headers, the
@@ -101,6 +131,8 @@ impl ScanDecodeGate {
             label,
             track_memory,
             projected_share_ppm: AtomicU32::new(PPM),
+            memory_wait_ms: AtomicU64::new(0),
+            wait_started: std::sync::OnceLock::new(),
         })
     }
 
@@ -120,6 +152,8 @@ impl ScanDecodeGate {
             label,
             track_memory,
             projected_share_ppm: AtomicU32::new(PPM),
+            memory_wait_ms: AtomicU64::new(0),
+            wait_started: std::sync::OnceLock::new(),
         })
     }
 
@@ -143,10 +177,59 @@ impl ScanDecodeGate {
         (u128::from(estimated_bytes) * u128::from(ppm) / u128::from(PPM)) as u64
     }
 
+    /// Let an admission the node pool refuses wait up to `wait` for other
+    /// queries to release memory, as long as its own query's quota has room
+    /// (#788; module docs). `Duration::ZERO`, the default, fails fast.
+    pub fn set_memory_wait(&self, wait: Duration) {
+        let ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+        self.memory_wait_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Reserve `bytes` for one admission. A denial is retried with backoff
+    /// until the memory wait runs out, but only while the bytes would fit
+    /// the query's own limit: then the pool that refused was the shared
+    /// one underneath. The wait is one budget for the gate, counted from
+    /// its first wait, so a scan cannot stall for the wait once per
+    /// subtask. The denial returned is the last `try_grow` error, so it
+    /// names this consumer either way.
+    async fn reserve(&self, bytes: usize) -> DFResult<MemoryReservation> {
+        let reservation = MemoryConsumer::new(self.label.clone()).register(&self.pool);
+        let wait = Duration::from_millis(self.memory_wait_ms.load(Ordering::Relaxed));
+        let mut pause = MEMORY_WAIT_FIRST_RETRY;
+        loop {
+            let error = match reservation.try_grow(bytes) {
+                Ok(()) => return Ok(reservation),
+                Err(error) => error,
+            };
+            if wait.is_zero() || !self.fits_own_limit(bytes) {
+                return Err(error);
+            }
+            let now = tokio::time::Instant::now();
+            let deadline = *self.wait_started.get_or_init(|| now) + wait;
+            if now >= deadline {
+                return Err(error);
+            }
+            tokio::time::sleep(pause.min(deadline - now)).await;
+            pause = (pause * 2).min(MEMORY_WAIT_MAX_RETRY);
+        }
+    }
+
+    /// Whether `bytes` more would stay within the pool's own limit. For a
+    /// per-query pool `reserved()` is the query's charge and the limit its
+    /// quota, so a denial that still fits came from the node pool. For a
+    /// plain pool it never fits after a denial.
+    fn fits_own_limit(&self, bytes: usize) -> bool {
+        match self.pool.memory_limit() {
+            MemoryLimit::Finite(limit) => self.pool.reserved().saturating_add(bytes) <= limit,
+            _ => false,
+        }
+    }
+
     /// Admit the FETCH stage of a subtask reading ~`estimated_bytes` of
     /// compressed input: wait for a fetch permit, then reserve the
     /// compressed size (1x — the fetch stage materializes compressed
-    /// column chunks, not the decoded working set) fail-fast. Falls back
+    /// column chunks, not the decoded working set; see [`Self::reserve`]
+    /// for when a denial waits). Falls back
     /// to a full decode admission when no fetch permits were configured,
     /// preserving single-stage semantics.
     pub async fn admit_fetch(&self, estimated_bytes: u64) -> DFResult<DecodeAdmission> {
@@ -160,9 +243,7 @@ impl ScanDecodeGate {
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let reservation = if self.track_memory {
             let estimate = usize::try_from(estimated_bytes).unwrap_or(usize::MAX);
-            let reservation = MemoryConsumer::new(self.label.clone()).register(&self.pool);
-            reservation.try_grow(estimate)?;
-            Some(reservation)
+            Some(self.reserve(estimate).await?)
         } else {
             None
         };
@@ -173,8 +254,9 @@ impl ScanDecodeGate {
     }
 
     /// Admit a decode of ~`estimated_bytes` compressed input: wait for a
-    /// permit, then reserve the decoded estimate fail-fast. The permit is
-    /// released on denial, so a rejected query never wedges the scan.
+    /// permit, then reserve the decoded estimate ([`Self::reserve`]). The
+    /// permit is released on denial, so a rejected query never wedges the
+    /// scan.
     pub async fn admit(&self, estimated_bytes: u64) -> DFResult<DecodeAdmission> {
         let permit = self
             .permits
@@ -186,9 +268,7 @@ impl ScanDecodeGate {
             let estimate =
                 usize::try_from(estimated_bytes.saturating_mul(DECODE_MEMORY_ESTIMATE_FACTOR))
                     .unwrap_or(usize::MAX);
-            let reservation = MemoryConsumer::new(self.label.clone()).register(&self.pool);
-            reservation.try_grow(estimate)?;
-            Some(reservation)
+            Some(self.reserve(estimate).await?)
         } else {
             None
         };
@@ -459,6 +539,164 @@ mod tests {
         assert_eq!(pool.reserved(), scaled + 4096 * DECODE_MEMORY_ESTIMATE_FACTOR as usize);
         drop((vendored, direct));
         assert_eq!(pool.reserved(), 0);
+    }
+
+    /// A per-query pool over a shared node pool, like the coordinator's
+    /// `QueryMemoryPool`: `reserved()` is the query's own charge and the
+    /// limit its quota.
+    #[derive(Debug)]
+    struct QuotaPool {
+        own: std::sync::atomic::AtomicUsize,
+        limit: usize,
+        shared: Arc<dyn MemoryPool>,
+    }
+
+    impl std::fmt::Display for QuotaPool {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("QuotaPool")
+        }
+    }
+
+    impl MemoryPool for QuotaPool {
+        fn name(&self) -> &str {
+            "QuotaPool"
+        }
+
+        fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+            self.own.fetch_add(additional, Ordering::Relaxed);
+            self.shared.grow(reservation, additional);
+        }
+
+        fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+            self.shared.shrink(reservation, shrink);
+            self.own.fetch_sub(shrink, Ordering::Relaxed);
+        }
+
+        fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> DFResult<()> {
+            if self.reserved() + additional > self.limit {
+                return Err(DataFusionError::ResourcesExhausted(format!(
+                    "quota refused {}",
+                    reservation.consumer().name()
+                )));
+            }
+            self.shared.try_grow(reservation, additional)?;
+            self.own.fetch_add(additional, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn reserved(&self) -> usize {
+            self.own.load(Ordering::Relaxed)
+        }
+
+        fn memory_limit(&self) -> MemoryLimit {
+            MemoryLimit::Finite(self.limit)
+        }
+    }
+
+    /// A gate on a `quota`-byte query pool over a 1000-byte node pool of
+    /// which another query holds `held` bytes, returned as the reservation.
+    fn quota_gate(
+        quota: usize,
+        held: usize,
+        wait: Duration,
+        staged: bool,
+    ) -> (Arc<ScanDecodeGate>, Arc<dyn MemoryPool>, MemoryReservation) {
+        let shared: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1000));
+        let other = MemoryConsumer::new("other-query").register(&shared);
+        other.try_grow(held).expect("other query fits");
+        let pool: Arc<dyn MemoryPool> = Arc::new(QuotaPool {
+            own: Default::default(),
+            limit: quota,
+            shared,
+        });
+        let label = "iceberg-scan-decode:test".to_string();
+        let gate = if staged {
+            ScanDecodeGate::new_with_fetch_permits(
+                Arc::new(Semaphore::new(1)),
+                Arc::new(Semaphore::new(1)),
+                pool.clone(),
+                label,
+                true,
+            )
+        } else {
+            ScanDecodeGate::new(Arc::new(Semaphore::new(1)), pool.clone(), label, true)
+        };
+        gate.set_memory_wait(wait);
+        (gate, pool, other)
+    }
+
+    #[tokio::test]
+    async fn a_node_pool_denial_waits_for_another_query_to_release() {
+        for staged in [false, true] {
+            // 200 bytes fit the 800-byte quota; the node pool has 100 left.
+            let (gate, pool, other) = quota_gate(800, 900, Duration::from_secs(10), staged);
+            let release = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                drop(other);
+            });
+            let admission = if staged {
+                gate.admit_fetch(200).await
+            } else {
+                gate.admit(50).await
+            }
+            .expect("admitted once the other query released");
+            assert_eq!(admission.reserved_bytes(), 200);
+            assert_eq!(pool.reserved(), 200);
+            release.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_node_pool_denial_fails_typed_when_the_wait_runs_out() {
+        let wait = Duration::from_millis(50);
+        let (gate, pool, _other) = quota_gate(800, 900, wait, false);
+        let started = std::time::Instant::now();
+        let err = gate.admit(50).await.expect_err("the node pool stays full");
+        assert!(started.elapsed() >= wait, "waited before failing");
+        assert!(
+            matches!(err, DataFusionError::ResourcesExhausted(_)),
+            "typed pool denial, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("iceberg-scan-decode:test"),
+            "{err}"
+        );
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_wait_is_one_budget_for_the_gate_not_one_per_admission() {
+        let wait = Duration::from_millis(100);
+        let (gate, _pool, _other) = quota_gate(800, 900, wait, false);
+        let started = std::time::Instant::now();
+        gate.admit(50)
+            .await
+            .expect_err("first admission waits it out");
+        // A later subtask's denial finds the budget spent and fails at once.
+        let again = std::time::Instant::now();
+        gate.admit(50).await.expect_err("budget spent");
+        assert!(again.elapsed() < wait, "no second wait");
+        assert!(started.elapsed() >= wait);
+    }
+
+    #[tokio::test]
+    async fn a_denial_by_the_query_quota_fails_without_waiting() {
+        // 200 bytes exceed the 100-byte quota: the query's own bytes, so
+        // waiting could deadlock and the join fallback wants it fast.
+        let (gate, _pool, _other) = quota_gate(100, 0, Duration::from_secs(10), false);
+        let started = std::time::Instant::now();
+        let err = gate.admit(50).await.expect_err("over the quota");
+        assert!(started.elapsed() < Duration::from_secs(1), "no wait");
+        assert!(err.to_string().contains("quota refused"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_pool_without_a_quota_fails_without_waiting() {
+        let (gate, _pool) = gate(64, 1, true);
+        gate.set_memory_wait(Duration::from_secs(10));
+        let started = std::time::Instant::now();
+        gate.admit(1 << 20).await.expect_err("tiny pool denies");
+        assert!(started.elapsed() < Duration::from_secs(1), "no wait");
     }
 
     #[tokio::test]

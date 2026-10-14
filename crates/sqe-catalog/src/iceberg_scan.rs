@@ -69,6 +69,11 @@ pub const DEFAULT_MANIFEST_CONCURRENCY: usize = 64;
 /// distributed dispatch wait and Trino's split-generation wait.
 pub const DEFAULT_RUNTIME_FILTER_WAIT_MS: u64 = 100;
 
+/// Default for `[catalog] scan_memory_wait_ms` (#788): how long a decode
+/// admission refused by the node pool, with room left in its own query's
+/// quota, waits for other queries to release memory.
+pub const DEFAULT_SCAN_MEMORY_WAIT_MS: u64 = 30_000;
+
 /// Default concurrency for the direct-read small-file fast path.
 ///
 /// The fast path reads each eligible file entirely in one S3 GET. Without
@@ -142,6 +147,9 @@ pub struct ScanTuning {
     /// Fetch/decode pipelining depth. `None` keeps the scan default
     /// (3x cores); `Some(0)` disables staging; `Some(n)` is an absolute depth.
     pub scan_fetch_ahead: Option<usize>,
+    /// How long (ms) a decode admission refused by the node pool waits for
+    /// memory while its query's own quota has room (#788). `0` fails fast.
+    pub scan_memory_wait_ms: u64,
 }
 
 impl Default for ScanTuning {
@@ -156,6 +164,7 @@ impl Default for ScanTuning {
             runtime_filter_bloom_probe: true,
             runtime_filter_bloom_max_values: 65536,
             scan_fetch_ahead: None,
+            scan_memory_wait_ms: DEFAULT_SCAN_MEMORY_WAIT_MS,
         }
     }
 }
@@ -177,6 +186,7 @@ impl ScanTuning {
             runtime_filter_bloom_probe: catalog.runtime_filters.bloom_probe,
             runtime_filter_bloom_max_values: catalog.runtime_filters.bloom_max_values,
             scan_fetch_ahead: catalog.scan_fetch_ahead,
+            scan_memory_wait_ms: catalog.scan_memory_wait_ms,
         }
         .normalized()
     }
@@ -308,6 +318,10 @@ pub struct IcebergScanExec {
     /// clone) of this scan node, sized `scan_fetch_ahead`. Rebuilt by
     /// [`IcebergScanExec::with_scan_fetch_ahead`] at planning time.
     fetch_permits: Arc<tokio::sync::Semaphore>,
+    /// Bounded wait (ms) for a decode admission the node pool refused while
+    /// the query's quota had room (#788). Sourced from `[catalog]
+    /// scan_memory_wait_ms`. 0 fails fast. Default 30000.
+    scan_memory_wait_ms: u64,
     /// Reloads `table` from its catalog as the same principal, for fresh
     /// vended credentials when a distributed scan outlives its keys. `None`
     /// for tables not loaded through a session catalog.
@@ -560,6 +574,7 @@ impl IcebergScanExec {
             decode_permits,
             scan_fetch_ahead,
             fetch_permits,
+            scan_memory_wait_ms: tuning.scan_memory_wait_ms,
             table_reloader: None,
             static_plan: Arc::new(tokio::sync::OnceCell::new()),
             split_assignments: Arc::new(tokio::sync::OnceCell::new()),
@@ -583,7 +598,8 @@ impl IcebergScanExec {
             .with_runtime_filter_bloom(
                 tuning.runtime_filter_bloom_probe,
                 tuning.runtime_filter_bloom_max_values,
-            );
+            )
+            .with_scan_memory_wait_ms(tuning.scan_memory_wait_ms);
         if let Some(fetch_ahead) = tuning.scan_fetch_ahead {
             exec = exec.with_scan_fetch_ahead(fetch_ahead);
         }
@@ -603,6 +619,7 @@ impl IcebergScanExec {
             runtime_filter_bloom_probe: self.runtime_filter_bloom_probe,
             runtime_filter_bloom_max_values: self.runtime_filter_bloom_max_values,
             scan_fetch_ahead: Some(self.scan_fetch_ahead),
+            scan_memory_wait_ms: self.scan_memory_wait_ms,
         }
     }
 
@@ -667,6 +684,14 @@ impl IcebergScanExec {
     #[must_use = "with_runtime_filter_wait_ms consumes self; bind the returned scan"]
     pub fn with_runtime_filter_wait_ms(mut self, wait_ms: u64) -> Self {
         self.runtime_filter_wait_ms = wait_ms;
+        self
+    }
+
+    /// Bounded wait (ms) for a decode admission the node pool refused while
+    /// the query's own quota had room (#788). `0` fails fast.
+    #[must_use = "with_scan_memory_wait_ms consumes self; bind the returned scan"]
+    pub fn with_scan_memory_wait_ms(mut self, wait_ms: u64) -> Self {
+        self.scan_memory_wait_ms = wait_ms;
         self
     }
 
@@ -863,6 +888,7 @@ impl IcebergScanExec {
             decode_permits: self.decode_permits.clone(),
             scan_fetch_ahead: self.scan_fetch_ahead,
             fetch_permits: self.fetch_permits.clone(),
+            scan_memory_wait_ms: self.scan_memory_wait_ms,
             table_reloader: self.table_reloader.clone(),
             static_plan: self.static_plan.clone(),
             split_assignments: self.split_assignments.clone(),
@@ -1452,6 +1478,7 @@ impl ExecutionPlan for IcebergScanExec {
                 crate::scan_memory::decode_tracking_enabled(),
             )
         };
+        decode_gate.set_memory_wait(std::time::Duration::from_millis(self.scan_memory_wait_ms));
         let static_planning_runs =
             MetricBuilder::new(&self.metrics).counter("static_planning_runs", partition);
         let baseline = BaselineMetrics::new(&self.metrics, partition);
