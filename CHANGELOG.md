@@ -44,6 +44,17 @@ All notable changes to SQE are documented in this file.
 
 ### Fixed
 
+- A scan refused memory by a full node pool waits for other queries instead of failing (#788)
+
+    Under concurrent load, a query's Iceberg scan was refused when other
+    queries held the node pool, even with room left under its own
+    `query.max_query_memory`, and the query failed at once. Those bytes
+    are transient (decodes, hash builds, merges), so the scan now retries
+    with backoff for up to `[catalog] scan_memory_wait_ms` (default 30 s,
+    a budget per scan partition) before failing the same way. A refusal by
+    the query's own cap is still immediate, so the join fallback retries
+    it. A cancelled query stops waiting.
+
 - No audit export spool without a shipper to drain it (#838)
 
     With `[metrics.audit_export] enabled = true` but no OTLP endpoint (or an

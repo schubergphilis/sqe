@@ -204,10 +204,15 @@ fn read_parallel(
                 // admission; unstaged, the single decode admission.
                 let admission = match &decode_gate {
                     Some(gate) => {
-                        let admit_result = if fetch_staged {
-                            gate.admit_fetch(estimate).await
-                        } else {
-                            gate.admit(estimate).await
+                        let admit = async {
+                            if fetch_staged {
+                                gate.admit_fetch(estimate).await
+                            } else {
+                                gate.admit(estimate).await
+                            }
+                        };
+                        let Some(admit_result) = admit_unless_closed(&tx, admit).await else {
+                            break 'outer;
                         };
                         match admit_result {
                             Ok(guard) => Some(guard),
@@ -258,11 +263,15 @@ fn read_parallel(
                                     // granted so fetched bytes stay accounted.
                                     if fetch_staged && let Some(gate) = &decode_gate {
                                         let wait_t = std::time::Instant::now();
-                                        match gate.admit(estimate).await {
-                                            Ok(decode_admission) => {
+                                        match admit_unless_closed(&tx, gate.admit(estimate)).await {
+                                            Some(Ok(decode_admission)) => {
                                                 admission = Some(decode_admission);
                                             }
-                                            Err(err) => {
+                                            None => {
+                                                inflight_workers.fetch_sub(1, Ordering::Relaxed);
+                                                return;
+                                            }
+                                            Some(Err(err)) => {
                                                 let _ = tx.send(Err(err)).await;
                                                 inflight_workers.fetch_sub(1, Ordering::Relaxed);
                                                 return;
@@ -314,6 +323,21 @@ fn read_parallel(
         // last worker finishes and the channel closes.
     });
     Box::pin(futures::stream::poll_fn(move |cx| rx.poll_recv(cx)))
+}
+
+/// SQE PATCH (sqe#788): a gate admission may wait for memory, and the
+/// dispatcher is a detached task, so a cancelled scan would keep waiting.
+/// Race the admission against the consumer going away; `None` = it went.
+async fn admit_unless_closed<T>(
+    tx: &tokio::sync::mpsc::Sender<Result<RecordBatch>>,
+    admit: impl Future<Output = T>,
+) -> Option<T> {
+    let admit = std::pin::pin!(admit);
+    let closed = std::pin::pin!(tx.closed());
+    match futures::future::select(admit, closed).await {
+        futures::future::Either::Left((admitted, _)) => Some(admitted),
+        futures::future::Either::Right(_) => None,
+    }
 }
 
 /// SQE PATCH (sqe#131): split a whole-file Parquet scan task into byte-range
