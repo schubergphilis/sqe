@@ -345,6 +345,8 @@ pub struct QueryHandler {
     /// Cached parse of `config.query.pressure_admission_memory`: the cap of
     /// a read query admitted while the pool is red. `0` refuses instead.
     pressure_admission_memory_bytes: usize,
+    /// Admits memory reruns (#788) one at a time on this coordinator.
+    rerun_gate: crate::join_fallback::RerunGate,
     /// Share of each query's cap kept for non-spillable consumers
     /// (`coordinator.unspillable_headroom_percent`); 0 under the fair pool,
     /// which divides memory itself.
@@ -621,6 +623,7 @@ impl QueryHandler {
             per_user_memory_budget_bytes,
             per_query_memory_bytes,
             pressure_admission_memory_bytes,
+            rerun_gate: crate::join_fallback::RerunGate::default(),
             unspillable_headroom_percent,
             profile_mode,
             runtime,
@@ -4538,11 +4541,11 @@ impl QueryHandler {
         Ok(batches)
     }
 
-    /// The sort-merge retry for this query's execution (#784), or `None`
-    /// when `query.join_fallback` or spilling is off. `shared_pool` is the
-    /// pool under the query's own quota, so the retry gets a fresh quota.
-    /// `None` too for a query admitted under pressure: retrying a query that
-    /// did not fit the pressure cap only spends more of a red pool.
+    /// The memory rerun (#788) and sort-merge retry (#784) for this query's
+    /// execution, or `None` when both are off. `shared_pool` is the pool
+    /// under the query's own quota, so a retry gets a fresh quota. `None`
+    /// too for a query admitted under pressure: retrying a query that did
+    /// not fit the pressure cap only spends more of a red pool.
     fn join_fallback(
         &self,
         ctx: &SessionContext,
@@ -4563,6 +4566,7 @@ impl QueryHandler {
             &self.config.query,
             self.metrics.clone(),
             *query_id,
+            Arc::clone(&self.rerun_gate),
         )
     }
 

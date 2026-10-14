@@ -394,6 +394,16 @@ pub struct QueryConfig {
     /// Needs `coordinator.spill_to_disk`. Default: true.
     #[serde(default = "default_true")]
     pub join_fallback: bool,
+    /// Run a read query once more when the coordinator pool, not its own
+    /// `max_query_memory`, refused it before its first batch (#788): other
+    /// queries held the memory. The failed attempt is dropped, the query
+    /// waits until the pool has room for a full `max_query_memory` (at most
+    /// half the pool) and runs the same plan again on the coordinator. One
+    /// rerun waits or starts at a time per coordinator; the wait ends at
+    /// `timeout_secs`. A rerun refused again falls back as `join_fallback`
+    /// describes. Default: true.
+    #[serde(default = "default_true")]
+    pub memory_rerun: bool,
     /// Dispatch Hive external table scans to workers (cycle 5).
     ///
     /// Defaults to FALSE. Hive scans have run coordinator-local since cycle 1,
@@ -605,6 +615,7 @@ impl Default for QueryConfig {
             target_task_size: default_target_task_size(),
             distribution_fallback: DistributionFallback::Error,
             join_fallback: true,
+            memory_rerun: true,
             distributed_hive_scans: false,
             sort_mode: SortMode::Adaptive,
             star_schema_reorder: default_true(),

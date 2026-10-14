@@ -72,6 +72,8 @@ Within one query, sorts do not take the spillable bytes greedily. A sort runs on
 
 When concurrent queries fill the node pool, a scan whose own query still has room under `query.max_query_memory` waits for the others to release memory instead of failing. `[catalog] scan_memory_wait_ms` (default 30000) is the most one scan partition waits in total. `0` restores the immediate failure. A scan refused by its own query's cap does not wait, so a join query can be retried with sort-merge joins straight away. Without `query.max_query_memory` there is no per-query cap to compare against, and scans fail at once as before.
 
+A read query that the node pool refuses before its first batch, with room left under its own cap, runs again once there is room (`query.memory_rerun`, default on). This covers what the scan wait cannot: a sort taking its merge reservation back after a spill, an aggregate, a hash-join build. The query drops its attempt, waits until the pool has room for a full `query.max_query_memory` (at most half the pool), and runs the same plan again on the coordinator. One rerun waits or starts at a time per coordinator, so two queries refused together do not collide again. The wait ends at `query.timeout_secs`. A rerun refused again is retried with sort-merge joins when it has a hash join, and fails otherwise. The cost is the abandoned attempt's time: on an SF10 probe with six heavy queries on a 4 GB pool, all six complete, against four before, and the reran sorts finish in 40 to 60 s against 13 s alone.
+
 ### Observability
 
 Enable durable audit and lineage early if governance matters. Do not write audit logs to `/tmp` or container `emptyDir`.
