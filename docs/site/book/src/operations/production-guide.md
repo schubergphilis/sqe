@@ -70,6 +70,8 @@ Greedy pool lets one large operator use the budget until spill. Fair pool divide
 
 Within one query, sorts do not take the spillable bytes greedily. A sort runs one sorter per partition; each sorter may grow to an equal share of the spillable bytes before it spills, and the sorters' merge reservations share a quarter of the query's cap (at most `sort_spill_reservation_bytes`, at least 1 MB each). Without this, at 16 partitions the default 10 MB merge reservations alone take 160 MB, and the first sorters to fill leave nothing for the rest. Other operators, such as hash aggregates, still grow to the spillable line.
 
+When concurrent queries fill the node pool, a scan whose own query still has room under `query.max_query_memory` waits for the others to release memory instead of failing. `[catalog] scan_memory_wait_ms` (default 30000) is the most one scan partition waits in total. `0` restores the immediate failure. A scan refused by its own query's cap does not wait, so a join query can be retried with sort-merge joins straight away. Without `query.max_query_memory` there is no per-query cap to compare against, and scans fail at once as before.
+
 ### Observability
 
 Enable durable audit and lineage early if governance matters. Do not write audit logs to `/tmp` or container `emptyDir`.
