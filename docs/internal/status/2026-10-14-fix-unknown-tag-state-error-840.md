@@ -9,7 +9,7 @@ The "cold handler needs up to 60 s" note in `tests/it/common/mod.rs` does not de
 Tests:
 - `sqe-policy` passes: 337 unit and 88 integration tests.
 - The `sqe-coordinator` lib passes 848 tests with `RUST_MIN_STACK=32MiB`.
-- Updated: `unknown_tag_state_refuses_the_statement` (formerly `unknown_tag_state_denies_all_rows`), `file_table_scan_is_not_denied_for_unknown_tag_state`, and the Ranger e2e `unknown_tag_state_denies`.
+- Updated: `unknown_tag_state_refuses_the_statement` (formerly `unknown_tag_state_denies_all_rows`), `file_table_scan_is_not_denied_for_unknown_tag_state`, `an_unparseable_glue_column_tag_refuses_the_statement` (formerly `..._denies_every_row`; the `sqe-coordinator` `it` suite passes 263), and the Ranger e2e `unknown_tag_state_denies`.
 - Live Ranger e2e (`scripts/access-control-test.sh`): `unknown_tag_state_denies` and `file_table_function_is_not_denied_for_unknown_tag_state` pass.
 - Book: the three fail-closed tables now say "refuse the statement".
 

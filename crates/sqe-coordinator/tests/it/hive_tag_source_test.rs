@@ -2,7 +2,8 @@
 //!
 //! 1. Every Hive query is denied, because the Iceberg-backed `TagSource`
 //!    (`CacheTagSource`) returns `None` for a table it never cached, and the
-//!    rewriter turns `None` into a `lit(false)` row filter.
+//!    rewriter used to turn `None` into a `lit(false)` row filter (it now
+//!    refuses the statement, #840).
 //! 2. A grant written for an Iceberg table governs a Hive table of the same
 //!    name, because `resolve_policy_key` dropped the catalog.
 //!
@@ -589,6 +590,11 @@ fn routed_over(manifest: HiveManifest) -> Arc<dyn TagSource> {
 /// Rewrite `SELECT order_id, ssn FROM lake.sales.orders` under a store that
 /// nullifies the `PII` tag, execute it, and return the batches.
 async fn select_under_pii_mask(tags: Arc<dyn TagSource>) -> Vec<RecordBatch> {
+    try_select_under_pii_mask(tags).await.unwrap()
+}
+
+/// [`select_under_pii_mask`] with the rewriter's verdict left to the caller.
+async fn try_select_under_pii_mask(tags: Arc<dyn TagSource>) -> sqe_core::Result<Vec<RecordBatch>> {
     let mem = Arc::new(MemTable::try_new(orders_schema(), vec![vec![orders_batch()]]).unwrap());
     let tref = datafusion::common::TableReference::full("lake", "sales", "orders");
     let plan = LogicalPlanBuilder::scan(tref.clone(), provider_as_source(mem.clone()), None)
@@ -603,8 +609,7 @@ async fn select_under_pii_mask(tags: Arc<dyn TagSource>) -> Vec<RecordBatch> {
     let rewriter = PolicyPlanRewriter::new(Arc::new(store)).with_tag_source(tags);
     let (rewritten, _summary) = rewriter
         .evaluate(&test_user(), &sqe_policy::TableScope::default(), plan)
-        .await
-        .unwrap();
+        .await?;
 
     let ctx = SessionContext::new();
     let catalog = Arc::new(MemoryCatalogProvider::new());
@@ -613,12 +618,13 @@ async fn select_under_pii_mask(tags: Arc<dyn TagSource>) -> Vec<RecordBatch> {
         .unwrap();
     ctx.register_catalog("lake", catalog);
     ctx.register_table(tref, mem).unwrap();
-    ctx.execute_logical_plan(rewritten)
+    Ok(ctx
+        .execute_logical_plan(rewritten)
         .await
         .unwrap()
         .collect()
         .await
-        .unwrap()
+        .unwrap())
 }
 
 #[test]
@@ -688,11 +694,14 @@ async fn a_glue_column_tag_masks_the_column_in_an_executed_plan() {
 }
 
 #[tokio::test]
-async fn an_unparseable_glue_column_tag_denies_every_row() {
-    let batches = select_under_pii_mask(routed_over(glue_manifest_with_column_tag("PII"))).await;
-    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+async fn an_unparseable_glue_column_tag_refuses_the_statement() {
+    let err = try_select_under_pii_mask(routed_over(glue_manifest_with_column_tag("PII")))
+        .await
+        .expect_err("unknown tag state must fail closed; rows mean ssn was read as untagged");
     assert_eq!(
-        rows, 0,
-        "unknown tag state must fail closed; 3 rows means ssn was read as untagged"
+        err.error_code(),
+        sqe_core::SqeErrorCode::AccessDenied,
+        "{err}"
     );
+    assert!(err.to_string().contains("tag state unknown"), "{err}");
 }
