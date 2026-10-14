@@ -109,8 +109,7 @@ impl JoinFallback {
     /// last: at a 1 GB cap, TPC-H q09 was refused at scan decode while its
     /// hash builds held most of the pool.
     fn applies(plan: &Arc<dyn ExecutionPlan>, error: &DataFusionError) -> bool {
-        matches!(error.find_root(), DataFusionError::ResourcesExhausted(_))
-            && has_switchable_hash_join(plan)
+        crate::query_memory::is_resources_exhausted(error) && has_switchable_hash_join(plan)
     }
 
     /// Plan the logical plan again with sort-merge joins, under a fresh

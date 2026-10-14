@@ -123,9 +123,28 @@ impl MemoryPool for QueryMemoryPool {
     }
 }
 
+/// Whether `error` is a memory refusal. `find_root` stops at an
+/// `External` error it cannot downcast, so the source chain is walked too:
+/// an Iceberg scan refused at decode admission carries the DataFusion
+/// refusal as the source of an `iceberg::Error` (`sqe-catalog`
+/// `scan_memory`).
+pub(crate) fn is_resources_exhausted(error: &DataFusionError) -> bool {
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = next {
+        if let Some(DataFusionError::ResourcesExhausted(_)) = current
+            .downcast_ref::<DataFusionError>()
+            .map(DataFusionError::find_root)
+        {
+            return true;
+        }
+        next = current.source();
+    }
+    false
+}
+
 /// Preserve resource refusal through buffered, streaming and Flight paths.
 pub(crate) fn execution_error(error: &DataFusionError) -> sqe_core::SqeError {
-    let code = if matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)) {
+    let code = if is_resources_exhausted(error) {
         sqe_core::SqeErrorCode::ResourceExhausted
     } else {
         sqe_core::SqeErrorCode::ExecutionFailed
@@ -339,6 +358,31 @@ mod tests {
             .unwrap();
         assert_eq!(light[0].num_rows(), 1);
         assert_eq!(shared.reserved(), 0);
+    }
+
+    #[test]
+    fn a_scan_decode_refusal_behind_an_iceberg_error_is_resources_exhausted() {
+        let refused = || {
+            iceberg::Error::new(
+                iceberg::ErrorKind::Unexpected,
+                "scan decode admission refused",
+            )
+            .with_source(DataFusionError::ResourcesExhausted("decode".into()))
+        };
+        let scan = DataFusionError::External(Box::new(refused()));
+        assert!(is_resources_exhausted(&scan));
+        assert!(is_resources_exhausted(&scan.context("q14")));
+        assert_eq!(
+            execution_error(&DataFusionError::External(Box::new(refused()))).error_code(),
+            sqe_core::SqeErrorCode::ResourceExhausted
+        );
+        let other = DataFusionError::External(Box::new(iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            "Resources exhausted, but only as text",
+        )));
+        assert!(!is_resources_exhausted(&other));
+        let plain = DataFusionError::Execution("x".into());
+        assert!(!is_resources_exhausted(&plain));
     }
 
     #[test]
