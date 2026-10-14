@@ -264,6 +264,11 @@ join_fallback = true            # A read query whose hash join exhausts max_quer
                                 # its first row is planned once more with sort-merge joins,
                                 # which spill, and run on the coordinator. Needs spill_to_disk.
                                 # Counted in sqe_join_fallback_total{outcome}.
+memory_rerun = true             # A read query the coordinator pool refuses before its first row,
+                                # with room left under max_query_memory, waits until the pool can
+                                # hold a full max_query_memory (at most half the pool) and runs
+                                # again on the coordinator, one rerun at a time; the wait ends at
+                                # timeout_secs. outcome="rerun" / "rerun_timeout".
 sort_mode = "adaptive"          # "adaptive", "partition_only", or "strict"
 
 # Write-path memory safety (see Features -> Write Path)

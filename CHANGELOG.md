@@ -44,6 +44,25 @@ All notable changes to SQE are documented in this file.
 
 ### Fixed
 
+- A read query refused by a full node pool waits and runs again instead of failing (#788)
+
+    Under concurrent load, a sort, aggregate or join whose own
+    `query.max_query_memory` still had room was refused when other queries
+    held the coordinator pool, and failed. A sort that spilled could not take
+    its merge reservation back, and a refused hash join was retried with
+    sort-merge joins, which does not help when the memory is held by others.
+    Such a query now drops its attempt, waits until the pool has room for a
+    full `max_query_memory` (at most half the pool) and runs the same plan
+    again on the coordinator. One rerun waits or starts at a time per
+    coordinator, so queries refused together do not collide again. The wait
+    ends at the query's `timeout_secs`; a rerun refused again falls back to
+    sort-merge joins. A refusal by the query's own cap goes straight to the
+    sort-merge retry as before. In the SF10 probe (4 GB pool, 2 GB quota, two
+    sorts, two aggregates and two joins at once) all six now complete,
+    against four before; reruns spend the abandoned attempt's time again.
+    `query.memory_rerun = false` turns it off. Counted in
+    `sqe_join_fallback_total{outcome="rerun"}` and `{outcome="rerun_timeout"}`.
+
 - A scan refused memory by a full node pool waits for other queries instead of failing (#788)
 
     Under concurrent load, a query's Iceberg scan was refused when other
