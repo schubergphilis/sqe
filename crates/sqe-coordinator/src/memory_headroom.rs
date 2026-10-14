@@ -12,9 +12,15 @@
 //! available to the non-spillable ones.
 //!
 //! The refusal is `DataFusionError::ResourcesExhausted`, the error operators
-//! treat as "spill now". Nothing waits: admission stays fail-fast (see the
-//! `sqe_catalog::scan_memory` module docs for why a blocking scan admission
-//! could deadlock).
+//! treat as "spill now". Nothing here waits; a scan refused by the node pool
+//! waits for other queries in `sqe_catalog::scan_memory`, whose module docs
+//! say why a refusal by the query's own budget must not.
+//!
+//! A spillable operator does not always survive a refusal. DataFusion's
+//! grouped aggregate re-reserves its baseline right after it spills, and a
+//! refusal there fails the query. So this layer refuses spillable growth
+//! only at a fixed line, not whenever the pool as a whole is past it (#788:
+//! tried, and an aggregate then failed in its post-spill re-reservation).
 //!
 //! Both shares are greedy by default: one consumer may take all of the
 //! spillable bytes, and a non-spillable one everything else. A sort refused
