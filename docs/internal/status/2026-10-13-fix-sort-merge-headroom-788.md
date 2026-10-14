@@ -17,7 +17,14 @@ Not covered: the write path (`sqe-write` `WriteHandler` / `hive_write`, e.g. CTA
 
 Tests: `a_partitioned_sort_spills_within_a_tight_quota` (join_fallback; fails with either half reverted, checked), `sorts_share_the_spillable_bytes_and_everything_else_stays_greedy` (memory_headroom). `cargo test -p sqe-coordinator --lib`: 840 passed.
 
-Not run: TPC-H / TPC-DS SF10 compare at 16 GB (the gate !1317 used), plus one sort-heavy run at `max_query_memory = 1GB` to measure the earlier spill above. At a 1 GB+ quota the merge reservation stays at 10 MB until ~25 sorters; the sort share is what may show a delta.
+Gate: TPC-H / TPC-DS SF10 at a 16 GB pool and `max_query_memory = 1GB` (the strict case; dev-release builds of main c127a759 and this branch, same data, back to back):
+
+| | main | branch |
+|---|---|---|
+| TPC-H | 21/22, 53.1 s | 21/22, 50.1 s |
+| TPC-DS | 98/99, 172.1 s | 98/99, 128.8 s |
+
+Per-query times sit within run-to-run noise (TPC-DS q67 9.9 s -> 5.3 s). TPC-H q09 and TPC-DS q09 fail on both binaries: a scan-decode refusal at 1 GB. TPC-DS q14 sits on the cap and is nondeterministic on both binaries. In 5 runs each, main passed 3/5 and the branch 2/5, and every failure was the same refusal: `iceberg-scan-decode:tpcds_sf10.store_sales` lost the race against a hash build. A hash-build refusal is retried with sort-merge joins (~33 s). A scan-decode refusal is not: `ScanDecodeGate` (`sqe-catalog/src/scan_memory.rs`) stringifies the DataFusion error into `iceberg::ErrorKind::Unexpected`, so `JoinFallback::applies` never sees a `ResourcesExhausted` root. That limitation predates this change; fixed by `fix/scan-decode-fallback-788` (2026-10-14).
 
 Merge order with !1418: both edit the line that builds the query budget. !1418 moves it into `with_quota_over`; whichever merges second rebases, and `.with_sort_share()` belongs in `with_quota_over`.
 
@@ -26,4 +33,4 @@ Open:
 - `SortMemoryRule` grants from `query.max_query_memory`, not the quota a query actually runs under. It is a plan-time gate only; follow-up.
 - An aggregate can still starve a sort inside one query (both spill, greedy between them); pre-existing.
 
-**NEXT:** SF10 compare gate for this MR; after !1418 merges, rerun the SF10 concurrency probe; then #755.
+**NEXT:** rerun the SF10 concurrency probe (!1418 and this change are both merged); then #755.

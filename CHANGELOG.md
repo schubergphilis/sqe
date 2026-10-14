@@ -52,6 +52,16 @@ All notable changes to SQE are documented in this file.
     endpoint is now resolved first, and no spool is opened when there is
     nothing to ship it.
 
+- A join query refused memory at Iceberg scan decode retries with sort-merge joins (#788)
+
+    The join fallback retried only refusals it could see as
+    `ResourcesExhausted`. The scan's decode gate passed its refusal through
+    the Iceberg reader as text, so a query whose scan was refused first
+    failed instead of retrying: TPC-H q09 at SF10 under a 1 GB quota every
+    time, TPC-DS q14 in about half its runs. The refusal now travels as the typed source of the Iceberg
+    error, and the fallback and the client's `RESOURCE_EXHAUSTED` code both
+    follow the error's source chain.
+
 - Partitioned sorts complete by spilling under a tight query quota (#788)
 
     A sort runs one external sorter per partition, and each reserves
