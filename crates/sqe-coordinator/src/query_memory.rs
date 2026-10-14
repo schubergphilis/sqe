@@ -142,6 +142,27 @@ pub(crate) fn is_resources_exhausted(error: &DataFusionError) -> bool {
     false
 }
 
+/// Whether `error` is a refusal by the query's own quota rather than by the
+/// coordinator pool. Every quota refusal starts with the setting it names
+/// ([`QueryQuota::name`], passed as `what` to [`HeadroomBudget::try_charge`]);
+/// a refusal by the pool names `coordinator.unspillable_headroom_percent` or
+/// is DataFusion's own. The source chain is walked as in
+/// [`is_resources_exhausted`].
+pub(crate) fn is_quota_refusal(error: &DataFusionError) -> bool {
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = next {
+        if let Some(DataFusionError::ResourcesExhausted(message)) = current
+            .downcast_ref::<DataFusionError>()
+            .map(DataFusionError::find_root)
+        {
+            return message.starts_with(QueryQuota::normal(0).name())
+                || message.starts_with(QueryQuota::under_pressure(0).name());
+        }
+        next = current.source();
+    }
+    false
+}
+
 /// Preserve resource refusal through buffered, streaming and Flight paths.
 pub(crate) fn execution_error(error: &DataFusionError) -> sqe_core::SqeError {
     let code = if is_resources_exhausted(error) {
@@ -383,6 +404,24 @@ mod tests {
         assert!(!is_resources_exhausted(&other));
         let plain = DataFusionError::Execution("x".into());
         assert!(!is_resources_exhausted(&plain));
+    }
+
+    /// The memory rerun (#788) tells a query's own cap from a full pool.
+    #[test]
+    fn a_refusal_names_whether_the_quota_or_the_pool_refused() {
+        let shared: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(100));
+        let query = pool(shared.clone(), 60);
+        let other = pool(shared.clone(), 60);
+        let a = MemoryConsumer::new("a").register(&query);
+        let quota = a.try_grow(61).unwrap_err();
+        assert!(is_quota_refusal(&quota), "{quota}");
+        assert!(is_quota_refusal(&quota.context("sort")), "wrapped");
+        let b = MemoryConsumer::new("b").register(&other);
+        b.try_grow(60).unwrap();
+        let full = a.try_grow(41).unwrap_err();
+        assert!(is_resources_exhausted(&full));
+        assert!(!is_quota_refusal(&full), "{full}");
+        assert!(!is_quota_refusal(&DataFusionError::Execution("x".into())));
     }
 
     #[test]

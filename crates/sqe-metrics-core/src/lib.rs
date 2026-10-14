@@ -197,7 +197,9 @@ pub struct MetricsRegistry {
     /// of query memory before their first batch and were planned again with
     /// sort-merge joins. `outcome` is `replanned` for every retry and
     /// `failed` when the retry also ended in an error, so completed retries
-    /// are `replanned - failed`.
+    /// are `replanned - failed`. A query the coordinator pool refused runs
+    /// its own plan again first (#788): `rerun` when it starts waiting,
+    /// `rerun_timeout` when no room came before its timeout.
     pub join_fallback_total: IntCounterVec,
     /// `sqe_join_fallback_wasted_seconds_total` (#784): wall time spent in
     /// the abandoned hash-join attempt before each retry.
