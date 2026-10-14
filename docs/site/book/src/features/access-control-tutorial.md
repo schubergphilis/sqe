@@ -529,7 +529,7 @@ and is not any more, because `policy.mask-precedence` now defaults to `tag`.
 | Condition | Result |
 |---|---|
 | Ranger unreachable | all rows denied; enforcement resumes on recovery |
-| Tag state unknown | all rows denied. Unknown is not "untagged" |
+| Tag state unknown | statement refused with `AccessDenied`. Unknown is not "untagged" |
 | Unmappable mask type | column restricted, never returned raw |
 | Unparseable row filter | becomes `lit(false)`, all rows denied |
 | Table not mappable to a policy key | all rows denied |
