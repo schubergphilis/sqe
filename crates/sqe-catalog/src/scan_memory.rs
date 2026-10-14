@@ -204,10 +204,7 @@ impl DecodeGate for ScanDecodeGate {
         Box::pin(async move {
             let admission = ScanDecodeGate::admit(self, self.projected(estimated_bytes))
                 .await
-                // Carry the DataFusion message verbatim: it contains the
-                // "Resources exhausted"/"Failed to allocate" wording the
-                // coordinator classifies as RESOURCE_EXHAUSTED.
-                .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::Unexpected, e.to_string()))?;
+                .map_err(refused)?;
             Ok(Box::new(admission) as Box<dyn Any + Send>)
         })
     }
@@ -219,10 +216,24 @@ impl DecodeGate for ScanDecodeGate {
         Box::pin(async move {
             let admission = ScanDecodeGate::admit_fetch(self, self.projected(estimated_bytes))
                 .await
-                .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::Unexpected, e.to_string()))?;
+                .map_err(refused)?;
             Ok(Box::new(admission) as Box<dyn Any + Send>)
         })
     }
+}
+
+/// A decode refusal crossing the vendored reader as an `iceberg::Error`.
+/// The DataFusion error rides along as the source, not only as text: its
+/// display keeps the "Resources exhausted" wording the coordinator
+/// classifies by, and the typed source lets the join fallback (#784)
+/// recognise the refusal and retry, which it could not while only the text
+/// survived (#788).
+fn refused(error: DataFusionError) -> iceberg::Error {
+    iceberg::Error::new(
+        iceberg::ErrorKind::Unexpected,
+        "scan decode admission refused",
+    )
+    .with_source(error)
 }
 
 /// Guard for one admitted decode. Holds the concurrency permit and the
@@ -426,6 +437,13 @@ mod tests {
         assert!(
             msg.contains("resources exhausted") || msg.contains("failed to allocate"),
             "wording survives the iceberg::Error wrap for classification: {msg}"
+        );
+        let source = std::error::Error::source(&err)
+            .and_then(|s| s.downcast_ref::<DataFusionError>())
+            .expect("the DataFusion refusal is the iceberg::Error's source");
+        assert!(
+            matches!(source, DataFusionError::ResourcesExhausted(_)),
+            "typed refusal behind the wrap: {source}"
         );
     }
 
