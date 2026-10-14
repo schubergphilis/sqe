@@ -106,10 +106,10 @@ pub struct ScanDecodeGate {
     /// How long a denial by the node pool waits for memory, in ms (see
     /// [`Self::set_memory_wait`]). 0 = fail fast.
     memory_wait_ms: AtomicU64,
-    /// When this gate's first admission started waiting. Every later wait
-    /// ends at the same deadline, so the wait bounds the whole scan
-    /// partition, not each subtask.
-    wait_started: std::sync::OnceLock<tokio::time::Instant>,
+    /// Time this gate's admissions have spent waiting for memory, in ms.
+    /// The memory wait is a budget for the gate's whole scan partition,
+    /// not one per subtask.
+    waited_ms: AtomicU64,
 }
 
 /// Floor for [`ScanDecodeGate::set_projected_share`]: page headers, the
@@ -132,7 +132,7 @@ impl ScanDecodeGate {
             track_memory,
             projected_share_ppm: AtomicU32::new(PPM),
             memory_wait_ms: AtomicU64::new(0),
-            wait_started: std::sync::OnceLock::new(),
+            waited_ms: AtomicU64::new(0),
         })
     }
 
@@ -153,7 +153,7 @@ impl ScanDecodeGate {
             track_memory,
             projected_share_ppm: AtomicU32::new(PPM),
             memory_wait_ms: AtomicU64::new(0),
-            wait_started: std::sync::OnceLock::new(),
+            waited_ms: AtomicU64::new(0),
         })
     }
 
@@ -188,28 +188,29 @@ impl ScanDecodeGate {
     /// Reserve `bytes` for one admission. A denial is retried with backoff
     /// until the memory wait runs out, but only while the bytes would fit
     /// the query's own limit: then the pool that refused was the shared
-    /// one underneath. The wait is one budget for the gate, counted from
-    /// its first wait, so a scan cannot stall for the wait once per
-    /// subtask. The denial returned is the last `try_grow` error, so it
-    /// names this consumer either way.
+    /// one underneath. The wait is one budget of slept time shared by
+    /// every admission of the gate, so a scan cannot stall for the wait
+    /// once per subtask, while a long scan keeps what its earlier waits
+    /// left unspent. The denial returned is the last `try_grow` error, so
+    /// it names this consumer either way.
     async fn reserve(&self, bytes: usize) -> DFResult<MemoryReservation> {
         let reservation = MemoryConsumer::new(self.label.clone()).register(&self.pool);
-        let wait = Duration::from_millis(self.memory_wait_ms.load(Ordering::Relaxed));
+        let wait_ms = self.memory_wait_ms.load(Ordering::Relaxed);
         let mut pause = MEMORY_WAIT_FIRST_RETRY;
         loop {
             let error = match reservation.try_grow(bytes) {
                 Ok(()) => return Ok(reservation),
                 Err(error) => error,
             };
-            if wait.is_zero() || !self.fits_own_limit(bytes) {
+            let left_ms = wait_ms.saturating_sub(self.waited_ms.load(Ordering::Relaxed));
+            if left_ms == 0 || !self.fits_own_limit(bytes) {
                 return Err(error);
             }
-            let now = tokio::time::Instant::now();
-            let deadline = *self.wait_started.get_or_init(|| now) + wait;
-            if now >= deadline {
-                return Err(error);
-            }
-            tokio::time::sleep(pause.min(deadline - now)).await;
+            let nap = pause.min(Duration::from_millis(left_ms));
+            let slept = tokio::time::Instant::now();
+            tokio::time::sleep(nap).await;
+            let slept_ms = u64::try_from(slept.elapsed().as_millis()).unwrap_or(u64::MAX);
+            self.waited_ms.fetch_add(slept_ms.max(1), Ordering::Relaxed);
             pause = (pause * 2).min(MEMORY_WAIT_MAX_RETRY);
         }
     }
@@ -677,6 +678,30 @@ mod tests {
         gate.admit(50).await.expect_err("budget spent");
         assert!(again.elapsed() < wait, "no second wait");
         assert!(started.elapsed() >= wait);
+    }
+
+    #[tokio::test]
+    async fn a_later_denial_keeps_the_budget_an_earlier_wait_left() {
+        let (gate, _pool, mut other) = quota_gate(800, 900, Duration::from_millis(300), false);
+        // Pressure lifts after ~50 ms of the 300 ms budget.
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            other.shrink(200);
+            other
+        });
+        let first = gate.admit(50).await.expect("admitted after a short wait");
+        other = release.await.unwrap();
+        drop(first);
+        other.try_grow(200).expect("the node pool is full again");
+        // Later than the budget measured from the first wait: a deadline
+        // would have expired, the unspent budget has not.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(other);
+        });
+        gate.admit(50).await.expect("waited out of the remaining budget");
+        release.await.unwrap();
     }
 
     #[tokio::test]
