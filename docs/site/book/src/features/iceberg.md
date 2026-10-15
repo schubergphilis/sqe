@@ -152,9 +152,8 @@ SQE runs table maintenance through `CALL system.*` procedures, each committing t
 - **`expire_snapshots`**: drops snapshots older than a cutoff, honouring `older_than` and `retain_last`.
 - **`remove_orphan_files`**: deletes data files no snapshot references.
 - **`rewrite_manifests`**: compacts manifest files.
-- **`register_table`** and **`drop_table`** (without purge): catalog-pointer operations for migration, disaster recovery, and the golden-dataset workflow.
-
-Snapshot-pointer procedures (`set_current_snapshot`, `rollback_to_snapshot`) and `drop_table(purge => true)` are not yet implemented and return an explicit error.
+- **`register_table`** and **`drop_table`**: catalog-pointer operations for migration, disaster recovery, and the golden-dataset workflow. `drop_table(purge => true)` also deletes the table's files with the caller's credentials, and refuses when another table shares the location (see [CALL procedures](../sql-reference/procedures.md#safety-notes)).
+- **`set_current_snapshot`** and **`rollback_to_snapshot`**: move the table's main branch to another snapshot.
 
 ## V3 features verified
 
