@@ -139,10 +139,11 @@ impl CatalogOps {
     /// the catalog's `drop_table` method. If `IF EXISTS` is specified
     /// and the table is not found, this returns `Ok(())`.
     ///
-    /// `PURGE` is refused before anything is dropped (#841): the catalog
-    /// drop alone leaves every data file in place, so honouring the
-    /// statement as a plain drop would silently keep the data the caller
-    /// asked to delete. `CALL system.drop_table(purge => true)` is the purge.
+    /// `PURGE` never reaches here: the query handler resolves it with
+    /// [`Self::purge_target`] and runs `system.drop_table(purge => true)`,
+    /// because the catalog drop alone leaves every data file in place
+    /// (#841). A `PURGE` that arrives anyway is refused before anything is
+    /// dropped rather than silently keeping the data.
     #[instrument(skip(self, session, stmt), fields(username = %session.user.username))]
     pub async fn drop_table(&self, session: &Session, stmt: &Statement) -> sqe_core::Result<()> {
         let (names, if_exists) = match stmt {
@@ -151,12 +152,10 @@ impl CatalogOps {
             } => {
                 let table = names.first().map(ToString::to_string).unwrap_or_default();
                 return Err(SqeError::with_code(
-                    SqeErrorCode::NotSupported,
+                    SqeErrorCode::ExecutionFailed,
                     format!(
-                        "DROP TABLE ... PURGE is not supported: it would remove {table} from \
-                         the catalog and leave its data files. Nothing was dropped. Use \
-                         CALL system.drop_table(table => '{table}', purge => true) to delete \
-                         the data, or DROP TABLE without PURGE to keep it."
+                        "DROP TABLE {table} PURGE reached the plain catalog drop, which would \
+                         keep its data files. Nothing was dropped."
                     ),
                 ));
             }
@@ -211,6 +210,67 @@ impl CatalogOps {
         }
     }
 
+    /// The `system.drop_table` target for `DROP TABLE ... PURGE` (#841), or
+    /// `None` when `IF EXISTS` names a table that is not there.
+    ///
+    /// Resolves the name as [`Self::drop_table`] does. Without `IF EXISTS`
+    /// a missing table is left to the procedure, which fails loading it.
+    /// `IF EXISTS` does not cover a missing namespace, as in the plain drop.
+    pub async fn purge_target(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+    ) -> sqe_core::Result<Option<TableRef>> {
+        let Statement::Drop {
+            names, if_exists, ..
+        } = stmt
+        else {
+            return Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("Expected DROP TABLE statement, got: {stmt}"),
+            ));
+        };
+        let table_name = names.first().ok_or_else(|| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                "DROP TABLE requires at least one table name".to_string(),
+            )
+        })?;
+        let table_ident = resolve_table_ident(table_name, session)?;
+        let catalog_name = catalog_qualifier(table_name);
+        let [namespace] = table_ident.namespace().as_ref().as_slice() else {
+            return Err(SqeError::with_code(
+                SqeErrorCode::NotSupported,
+                format!(
+                    "DROP TABLE ... PURGE supports a single-level namespace; {table_ident} has \
+                 several. Nothing was dropped."
+                ),
+            ));
+        };
+        if *if_exists {
+            let catalog = self
+                .create_catalog_bridge(session, catalog_name.as_deref())
+                .await?;
+            match catalog.table_exists(&table_ident).await {
+                Ok(true) => {}
+                Ok(false) => return Ok(None),
+                Err(e) if is_namespace_not_found(&e) => {
+                    return Err(SqeError::Catalog(format!(
+                        "Failed to drop table {table_ident}: namespace is missing. \
+                         IF EXISTS does not cover missing namespaces. \
+                         Verify CREATE SCHEMA succeeded. Underlying error: {e}"
+                    )))
+                }
+                Err(e) if is_table_not_found(&e) => return Ok(None),
+                Err(e) => return Err(SqeError::Catalog(format!("Failed to drop table: {e}"))),
+            }
+        }
+        Ok(Some(TableRef {
+            catalog: catalog_name,
+            namespace: namespace.clone(),
+            name: table_ident.name().to_string(),
+        }))
+    }
     /// Create a schema (namespace) via the Iceberg REST catalog.
     ///
     /// Maps SQL `CREATE SCHEMA` to Iceberg `create_namespace`.
