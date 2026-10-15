@@ -135,8 +135,9 @@ pub enum ProcedureCall {
     /// Drop a table from the catalog. Default `purge => false` removes the
     /// catalog entry only; data and metadata files on the object store are
     /// preserved (the table can be re-registered with [`RegisterTable`]).
-    /// `purge => true` additionally deletes underlying files via the
-    /// backend's `purge_table` operation.
+    /// `purge => true` additionally deletes the table's location prefix with
+    /// the caller's FileIO after the catalog drop (see
+    /// `MaintenanceHandler::drop_table` for the refusal rules).
     DropTable {
         table: TableRef,
         /// When true, delete data + metadata files in addition to the catalog

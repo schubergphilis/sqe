@@ -1,0 +1,11 @@
+**STATUS 2026-10-15: `drop_table(purge => true)` deletes the table's files (`feat/drop-table-purge-836`, #836, openspec iceberg-procedures 4.4/4.6/4.7).**
+
+`MaintenanceHandler::drop_table` loads the table before the drop when `purge` is set, works out the prefix to delete (`purge_prefix`), and checks every other table in the catalog for an overlapping location (`refuse_if_location_shared`, fail-closed on any list or load error). Only then does it drop from the catalog, invalidate the REST catalog cache and call `FileIO::delete_prefix` with the caller's FileIO. The REST `purgeRequested` flag was not used: Polaris needs `DROP_WITH_PURGE_ENABLED` for it and deletes asynchronously with its own credentials, so the caller would get success before anything was deleted.
+
+Refusals, all before anything is dropped: `gc.enabled=false`; a bucket-root location; `write.data.path` / `write.metadata.path` / `write.folder-storage.path` / `write.object-storage.path` outside the location; the current metadata file outside the location; another table whose location equals, contains or sits inside this one. Polaris already refuses overlapping locations at create/register time unless `ALLOW_TABLE_LOCATION_OVERLAP` is set, but Glue, HMS, the SQL catalogs and the Memory catalog allow it. If the catalog drop succeeds and the delete fails, the error names the prefix to delete by hand. A successful purge writes an `AdminDdl` audit event with the hashed location.
+
+Tests: 8 unit tests (`purge_prefix_tests`, including the shared-location refusal on a `MemoryCatalog`) and 3 Polaris integration tests (purge empties the prefix and SELECT fails; drop without purge keeps the files; a registered twin sharing the location, which accepts either Polaris's 403 at register time or SQE's refusal). `make test-integration FILTER=maintenance_procedures_test`: 11 passed.
+
+Limits: the shared-location scan loads every table in the catalog, which is slow on very large catalogs. SQL `DROP TABLE ... PURGE` on an Iceberg table still ignores `PURGE` (`catalog_ops.rs`).
+
+**NEXT:** SQL `DROP TABLE ... PURGE` through the same path; #840 follow-up (tag source loads table properties on a cache miss); #755 cartesian join/aggregate admission.
