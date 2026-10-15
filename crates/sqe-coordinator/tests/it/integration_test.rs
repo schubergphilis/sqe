@@ -236,6 +236,58 @@ async fn test_drop_table() {
     );
 }
 
+// Test: DROP TABLE ... PURGE is refused before anything is dropped (#841).
+// It used to drop the catalog entry and silently keep every data file.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn test_drop_table_purge_is_refused_and_keeps_the_table() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let _ = handler
+        .execute(
+            &session,
+            "DROP TABLE IF EXISTS test_ns.drop_purge_test",
+            None,
+        )
+        .await;
+    handler
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.drop_purge_test AS SELECT 1 as id",
+            None,
+        )
+        .await
+        .expect("CTAS for drop_purge_test should succeed");
+
+    for sql in [
+        "DROP TABLE test_ns.drop_purge_test PURGE",
+        "DROP TABLE IF EXISTS test_ns.drop_purge_test PURGE",
+    ] {
+        let err = handler
+            .execute(&session, sql, None)
+            .await
+            .expect_err("DROP TABLE ... PURGE must be refused");
+        assert_eq!(
+            err.error_code(),
+            sqe_core::SqeErrorCode::NotSupported,
+            "{sql}: {err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("Nothing was dropped"), "{sql}: {msg}");
+        assert!(msg.contains("CALL system.drop_table"), "{sql}: {msg}");
+    }
+
+    let rows = handler
+        .execute(&session, "SELECT id FROM test_ns.drop_purge_test", None)
+        .await
+        .expect("the table must survive a refused PURGE");
+    assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+
+    handler
+        .execute(&session, "DROP TABLE test_ns.drop_purge_test", None)
+        .await
+        .expect("DROP TABLE without PURGE still drops");
+}
+
 // Test: DROP TABLE IF EXISTS on a non-existent table should not error
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh

@@ -138,9 +138,28 @@ impl CatalogOps {
     /// Extracts the table name from a `DROP TABLE` statement and calls
     /// the catalog's `drop_table` method. If `IF EXISTS` is specified
     /// and the table is not found, this returns `Ok(())`.
+    ///
+    /// `PURGE` is refused before anything is dropped (#841): the catalog
+    /// drop alone leaves every data file in place, so honouring the
+    /// statement as a plain drop would silently keep the data the caller
+    /// asked to delete. `CALL system.drop_table(purge => true)` is the purge.
     #[instrument(skip(self, session, stmt), fields(username = %session.user.username))]
     pub async fn drop_table(&self, session: &Session, stmt: &Statement) -> sqe_core::Result<()> {
         let (names, if_exists) = match stmt {
+            Statement::Drop {
+                names, purge: true, ..
+            } => {
+                let table = names.first().map(ToString::to_string).unwrap_or_default();
+                return Err(SqeError::with_code(
+                    SqeErrorCode::NotSupported,
+                    format!(
+                        "DROP TABLE ... PURGE is not supported: it would remove {table} from \
+                         the catalog and leave its data files. Nothing was dropped. Use \
+                         CALL system.drop_table(table => '{table}', purge => true) to delete \
+                         the data, or DROP TABLE without PURGE to keep it."
+                    ),
+                ));
+            }
             Statement::Drop {
                 names, if_exists, ..
             } => (names, *if_exists),
