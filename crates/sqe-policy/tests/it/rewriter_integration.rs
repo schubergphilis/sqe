@@ -25,8 +25,8 @@ use sqe_core::SessionUser;
 use sqe_policy::policy_store::InMemoryPolicyStore;
 use sqe_policy::tag_source::TagSource;
 use sqe_policy::{
-    plan_rewriter::PolicyPlanRewriter, MaskType, PolicyEnforcer, PolicyStore, ResolvedPolicy,
-    TagMaskSpec,
+    plan_rewriter::{PolicyPlanRewriter, ScanTagState},
+    MaskType, PolicyEnforcer, PolicyStore, ResolvedPolicy, TagMaskSpec,
 };
 
 fn user(name: &str, roles: &[&str]) -> SessionUser {
@@ -1229,6 +1229,122 @@ async fn unknown_tag_state_refuses_the_statement() {
         "{err}"
     );
     assert!(err.to_string().contains("tag state unknown"), "{err}");
+}
+
+// Scan-provider tag hooks (#842). A `fn` pointer cannot capture, so each
+// state the hook can report gets its own function. The `MemTable` stands in
+// for the Iceberg provider.
+
+fn is_mem(p: &dyn datafusion::catalog::TableProvider) -> bool {
+    (p as &dyn std::any::Any)
+        .downcast_ref::<MemTable>()
+        .is_some()
+}
+
+fn scan_tags_ssn_pii(p: &dyn datafusion::catalog::TableProvider) -> ScanTagState {
+    if !is_mem(p) {
+        return ScanTagState::NotRecognised;
+    }
+    ScanTagState::Known(HashMap::from([(
+        "ssn".to_string(),
+        vec!["PII".to_string()],
+    )]))
+}
+
+fn scan_tags_unreadable(p: &dyn datafusion::catalog::TableProvider) -> ScanTagState {
+    if is_mem(p) {
+        ScanTagState::Unknown
+    } else {
+        ScanTagState::NotRecognised
+    }
+}
+
+fn scan_tags_not_recognised(_p: &dyn datafusion::catalog::TableProvider) -> ScanTagState {
+    ScanTagState::NotRecognised
+}
+
+/// The scan's own provider knows the tags, so a tag source that cannot (a
+/// disabled or evicted metadata cache) no longer refuses the statement, and
+/// the tag mask still applies (#842).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scan_provider_tags_apply_when_the_tag_source_cannot_answer() {
+    let (mem, scan) = build_multilevel_scan_with_mem();
+    let tref = TableReference::full("cat", "ns1.ns2", "employees");
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![
+            Expr::Column(Column::new(Some(tref.clone()), "customer_id")),
+            Expr::Column(Column::new(Some(tref), "ssn")),
+        ])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let (fake_source, calls) = FakeTagSource::new_unknown();
+    let store = TagTestStore::new().with_tag_mask("PII", MaskType::Nullify);
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store))
+        .with_tag_source(Arc::new(fake_source))
+        .with_scan_tags(scan_tags_ssn_pii);
+    let (rewritten, _summary) = rewriter
+        .evaluate(
+            &user("alice", &[]),
+            &sqe_policy::TableScope::default(),
+            plan,
+        )
+        .await
+        .expect("known scan tags must not refuse");
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "a recognised scan must not ask the tag source"
+    );
+
+    let batches = execute_multilevel(rewritten, mem).await;
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+    let ssn = batches[0].column_by_name("ssn").unwrap();
+    assert_eq!(ssn.null_count(), ssn.len(), "ssn must be tag-masked");
+}
+
+/// An unreadable tag property on the scan's provider refuses the statement,
+/// even when the tag source would answer: the cache could hold an older,
+/// readable value, and using it could drop a mask.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unreadable_scan_provider_tags_refuse_without_asking_the_tag_source() {
+    let (_mem, scan) = build_multilevel_scan_with_mem();
+    let (fake_source, calls) = FakeTagSource::new(HashMap::new());
+    let rewriter = PolicyPlanRewriter::new(Arc::new(TagTestStore::new()))
+        .with_tag_source(Arc::new(fake_source))
+        .with_scan_tags(scan_tags_unreadable);
+    let err = rewriter
+        .evaluate(&user("dave", &[]), &sqe_policy::TableScope::default(), scan)
+        .await
+        .expect_err("unreadable scan tags must refuse");
+    assert_eq!(
+        err.error_code(),
+        sqe_core::SqeErrorCode::AccessDenied,
+        "{err}"
+    );
+    assert!(err.to_string().contains("tag state unknown"), "{err}");
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+/// A provider the hook does not recognise (Hive, a view, a test table) falls
+/// back to the tag source, unknown state included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unrecognised_scan_provider_falls_back_to_the_tag_source() {
+    let (_mem, scan) = build_multilevel_scan_with_mem();
+    let (fake_source, calls) = FakeTagSource::new_unknown();
+    let rewriter = PolicyPlanRewriter::new(Arc::new(TagTestStore::new()))
+        .with_tag_source(Arc::new(fake_source))
+        .with_scan_tags(scan_tags_not_recognised);
+    let err = rewriter
+        .evaluate(&user("dave", &[]), &sqe_policy::TableScope::default(), scan)
+        .await
+        .expect_err("the tag source's unknown state must still refuse");
+    assert!(err.to_string().contains("tag state unknown"), "{err}");
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "the tag source must be asked"
+    );
 }
 
 /// Test 6 -- reserved virtual relations must NOT be denied on an unknown tag

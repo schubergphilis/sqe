@@ -125,7 +125,8 @@ pub fn build_policy_enforcer(
                 .with_mask_precedence(config.mask_precedence)
                 .with_hive_catalogs(hive_catalogs.clone())
                 .with_metadata_target(sqe_catalog::iceberg_metadata_tvf::metadata_tvf_target_ident)
-                .with_file_table(sqe_catalog::file_tvf_prepare::is_file_table_provider);
+                .with_file_table(sqe_catalog::file_tvf_prepare::is_file_table_provider)
+                .with_scan_tags(crate::tag_source_impl::scan_column_tags);
 
             // Wire the tag source. `CacheTagSource` reads `sqe.column-tags`
             // table properties from the shared metadata cache with zero extra
