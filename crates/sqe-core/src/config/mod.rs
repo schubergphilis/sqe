@@ -441,6 +441,16 @@ pub struct QueryConfig {
     /// Default: 10 (fact table must be at least 10x larger than the smallest dimension).
     #[serde(default = "default_star_schema_min_ratio")]
     pub star_schema_min_ratio: usize,
+    /// Refuse a read whose cross join or nested-loop join (a join with no
+    /// equal-key condition) would evaluate more row pairs than this, judged
+    /// from the inputs' row-count statistics before the query runs (#755).
+    /// Joins run on the coordinator, so one such query holds coordinator
+    /// CPU for every tenant until `timeout_secs`. A join input without
+    /// statistics is admitted. `0` disables the gate.
+    ///
+    /// Default: 10,000,000,000.
+    #[serde(default = "default_max_cartesian_rows")]
+    pub max_cartesian_rows: u64,
     /// Parallelize the probe-side Iceberg scan of `CollectLeft` (broadcast)
     /// hash joins so the fact-table decode runs across cores while the build
     /// side stays single-partition (issue #235, follow-up to #131). Build-side
@@ -620,6 +630,7 @@ impl Default for QueryConfig {
             sort_mode: SortMode::Adaptive,
             star_schema_reorder: default_true(),
             star_schema_min_ratio: default_star_schema_min_ratio(),
+            max_cartesian_rows: default_max_cartesian_rows(),
             parallel_probe_scan: true,
             parallel_scan: true,
             dim_build_swap: true,
@@ -5730,6 +5741,12 @@ fn default_fanout_buffer_budget() -> String {
 }
 fn default_star_schema_min_ratio() -> usize {
     10
+}
+/// Ten billion row pairs: a scalar subquery crossed with a fact table of up
+/// to ten billion rows is admitted, a cross join of two 100k-row tables is
+/// not.
+fn default_max_cartesian_rows() -> u64 {
+    10_000_000_000
 }
 
 /// `coordinator.memory_limit` default, and what `"auto"` resolves to when no
