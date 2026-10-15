@@ -1,0 +1,8 @@
+[build]
+target = "wasm32-unknown-unknown"
+
+[target.wasm32-unknown-unknown]
+# getrandom 0.3+ refuses to pick a wasm32-unknown-unknown backend unless the
+# caller names one explicitly. Without this the build fails with
+# "The wasm32/64-unknown-unknown are not supported by default".
+rustflags = ["--cfg", "getrandom_backend=\"wasm_js\""]

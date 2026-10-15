@@ -1,0 +1,4 @@
+kind,region,owner
+click,eu,alice
+purchase,eu,bob
+refund,us,carol

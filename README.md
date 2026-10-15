@@ -248,6 +248,7 @@ The reference docs:
 | [Storage Backends](docs/site/book/src/getting-started/storage-backends.md) | S3, R2, MinIO/Ceph, Azure ADLS Gen2, Google Cloud Storage, HTTPS, hf:// |
 | [Operations: OpenLineage](docs/site/book/src/operations/openlineage.md) | Lineage emit, sinks, troubleshooting |
 | [Benchmark history](docs/evidence/benchmark/index.md) | Per-suite, per-scale, per-query plots over time |
+| [Playground (wasm)](playground/README.md) | DataFusion compiled to WebAssembly: SQL over parquet, CSV and Iceberg in a browser tab, no server |
 | [Roadmap](docs/site/book/src/development/roadmap.md) | Full feature checklist |
 | Security Audit | 43 findings, all resolved |
 | [Architecture, security and scale reviews 2026-09](docs/internal/reviews/2026-09-05-combined-prioritized-findings.md) | 109 findings, GitLab issues #543-#651 in eight work packages (#652-#659); 74 fixed |
