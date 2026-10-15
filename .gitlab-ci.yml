@@ -39,23 +39,23 @@ default:
 
 include:
   - project: 'vpf-data-ai/aikido'
-    ref: '696c60933c30ecbbdda0b3eeef1a6a6ffceef470'
+    ref: '97e6f9e1e9606929b577e84a33c1bc3a79682f6e'
     file: '/ci/templates/guardrails.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: '696c60933c30ecbbdda0b3eeef1a6a6ffceef470'
+    ref: '97e6f9e1e9606929b577e84a33c1bc3a79682f6e'
     file: '/ci/templates/test-rust.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: '696c60933c30ecbbdda0b3eeef1a6a6ffceef470'
+    ref: '97e6f9e1e9606929b577e84a33c1bc3a79682f6e'
     file: '/ci/templates/deploy.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: '696c60933c30ecbbdda0b3eeef1a6a6ffceef470'
+    ref: '97e6f9e1e9606929b577e84a33c1bc3a79682f6e'
     file: '/ci/templates/release.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: '696c60933c30ecbbdda0b3eeef1a6a6ffceef470'
+    ref: '97e6f9e1e9606929b577e84a33c1bc3a79682f6e'
     file: '/ci/templates/consumer-controls.yml'
 
 variables:
-  AIKIDO_SHARED_REF: "696c60933c30ecbbdda0b3eeef1a6a6ffceef470"
+  AIKIDO_SHARED_REF: "97e6f9e1e9606929b577e84a33c1bc3a79682f6e"
   AIKIDO_CARGO_SUPPLY_CHAIN_IN_TEST: "0"
   AIKIDO_DOCKERFILE: "Dockerfile.ci"
   AIKIDO_SCAN_BUILT_IMAGE_ONLY: "1"
@@ -176,6 +176,9 @@ aikido-image-scan:
 aikido-sbom:
   variables:
     AIKIDO_SHARED_SCRIPTS: "sbom-license-from-cargo.py"
+    # playground/ is outside the cargo workspace (wasm32-only, own Cargo.lock),
+    # so its manifest is not in the script's default globs.
+    AIKIDO_SBOM_LICENSE_MANIFESTS: "playground/Cargo.toml"
   before_script:
     - !reference [.aikido-shared-scripts, before_script]
 
