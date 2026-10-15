@@ -270,6 +270,11 @@ memory_rerun = true             # A read query the coordinator pool refuses befo
                                 # again on the coordinator, one rerun at a time; the wait ends at
                                 # timeout_secs. outcome="rerun" / "rerun_timeout".
 sort_mode = "adaptive"          # "adaptive", "partition_only", or "strict"
+max_cartesian_rows = 10000000000 # Refuse a read whose cross join or nested-loop join (no
+                                # equal-key condition) would evaluate more row pairs than this,
+                                # judged from the inputs' row-count statistics before it runs.
+                                # Joins run on the coordinator. An input without statistics is
+                                # admitted. 0 = no limit.
 
 # Write-path memory safety (see Features -> Write Path)
 write_buffer_tracking = true    # Pool-track write buffers; big writes fail with ResourceExhausted, not OOM
@@ -449,6 +454,7 @@ Every config field can be overridden via environment variable. Convention: `SQE_
 | `SQE_SESSION__ABSOLUTE_TIMEOUT_SECS` | `session.absolute_timeout_secs` | u64 |
 | **Query** | | |
 | `SQE_QUERY__TIMEOUT_SECS` | `query.timeout_secs` | u64 |
+| `SQE_QUERY__MAX_CARTESIAN_ROWS` | `query.max_cartesian_rows` | u64 |
 | **Rate Limit** | | |
 | `SQE_RATE_LIMIT__ENABLED` | `rate_limit.enabled` | bool |
 | `SQE_RATE_LIMIT__PER_USER_QUERIES_PER_MINUTE` | `rate_limit.per_user_queries_per_minute` | u32 |

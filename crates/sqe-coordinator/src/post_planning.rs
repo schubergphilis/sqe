@@ -30,14 +30,17 @@
 //! 5. `JoinStrategyRule` -- spillable join fallback: a build whose *exact*
 //!    size exceeds the threshold -> SortMergeJoin. Inexact or absent
 //!    statistics keep the hash join (#784).
-//! 6. `AdaptiveSortRule` -- strips non-partition sorts under memory pressure
+//! 6. `CartesianAdmissionRule` -- FAIL CLOSED when a cross or nested-loop
+//!    join's input row product exceeds `query.max_cartesian_rows` (#755).
+//!    After the join rewrites so it judges the joins that will run.
+//! 7. `AdaptiveSortRule` -- strips non-partition sorts under memory pressure
 //!    per `query.sort_mode`.
-//! 7. `SortMemoryRule` -- FAIL CLOSED when remaining `SortExec`s cannot
+//! 8. `SortMemoryRule` -- FAIL CLOSED when remaining `SortExec`s cannot
 //!    reserve merge headroom (ExternalSorterMerge is non-spillable).
-//! 8. `StripSelfJoinDynamicFiltersRule` -- q95-class inlist blowup; runs
+//! 9. `StripSelfJoinDynamicFiltersRule` -- q95-class inlist blowup; runs
 //!    before distribution so the worker predicate and the coordinator join
 //!    agree on which dynamic filters exist.
-//! 9. (outside this module) `QueryHandler::try_distribute`.
+//! 10. (outside this module) `QueryHandler::try_distribute`.
 //!
 //! # Failure policy
 //!
@@ -115,7 +118,7 @@ pub fn post_planning_rules(
     pressure: MemoryPressure,
     metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
 ) -> Vec<Step> {
-    let mut steps = Vec::with_capacity(8);
+    let mut steps = Vec::with_capacity(9);
     if query.star_schema_reorder {
         steps.push(Step::fallback(sqe_planner::StarSchemaReorderRule::new(
             query.star_schema_min_ratio,
@@ -141,6 +144,10 @@ pub fn post_planning_rules(
     steps.push(Step::fallback(sqe_planner::JoinStrategyRule::new(
         sqe_planner::DEFAULT_HASH_JOIN_THRESHOLD,
     )));
+    steps.push(Step::fail(
+        sqe_planner::CartesianAdmissionRule::new(query.max_cartesian_rows),
+        "Cartesian join admission failed",
+    ));
     steps.push(Step::fallback(AdaptiveSortRule {
         sort_mode: query.sort_mode,
         pressure,
@@ -445,19 +452,22 @@ mod tests {
         }
         expected.extend([
             "JoinStrategyRule",
+            "CartesianAdmissionRule",
             "AdaptiveSortRule",
             "SortMemoryRule",
             "StripSelfJoinDynamicFiltersRule",
         ]);
         assert_eq!(names, expected, "post-planning rule order drifted");
-        let sort_memory = post_planning_rules(&query, MemoryPressure::Green, None)
-            .into_iter()
-            .find(|s| s.rule.name() == "SortMemoryRule")
-            .unwrap();
-        assert!(
-            matches!(sort_memory.on_error, OnError::Fail(_)),
-            "SortMemoryRule must fail closed"
-        );
+        for gate in ["CartesianAdmissionRule", "SortMemoryRule"] {
+            let step = post_planning_rules(&query, MemoryPressure::Green, None)
+                .into_iter()
+                .find(|s| s.rule.name() == gate)
+                .unwrap();
+            assert!(
+                matches!(step.on_error, OnError::Fail(_)),
+                "{gate} must fail closed"
+            );
+        }
     }
 
     #[test]
@@ -564,6 +574,57 @@ mod tests {
                 .get(),
             1
         );
+    }
+
+    /// `fact` (6 rows) x `dim` (3 rows) is 18 row pairs, for a cross join
+    /// and for a join on an inequality alike.
+    #[tokio::test]
+    async fn cartesian_joins_over_max_cartesian_rows_are_refused() {
+        let ctx = ctx_with_tables();
+        for sql in [
+            "SELECT fact.val FROM fact CROSS JOIN dim",
+            "SELECT fact.val FROM fact JOIN dim ON fact.id < dim.id",
+        ] {
+            let capped = |max_cartesian_rows| QueryConfig {
+                max_cartesian_rows,
+                ..QueryConfig::default()
+            };
+            let plan = raw_plan(&ctx, sql).await;
+            let err =
+                apply_post_planning_rules(&ctx, &capped(17), None, Arc::clone(&plan)).unwrap_err();
+            assert_eq!(err.error_code(), SqeErrorCode::ExecutionFailed, "{sql}");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Cartesian join admission failed"),
+                "{sql}: {msg}"
+            );
+            assert!(
+                msg.contains("query.max_cartesian_rows (17)"),
+                "{sql}: {msg}"
+            );
+            assert!(
+                !msg.contains("18") && !msg.contains('6'),
+                "{sql}: the error must not carry the row estimates: {msg}"
+            );
+            apply_post_planning_rules(&ctx, &capped(18), None, Arc::clone(&plan)).unwrap();
+            apply_post_planning_rules(&ctx, &capped(0), None, plan).unwrap();
+        }
+        // An equi-join is never gated, whatever the cap.
+        let plan = raw_plan(
+            &ctx,
+            "SELECT fact.val FROM fact JOIN dim ON fact.id = dim.id",
+        )
+        .await;
+        apply_post_planning_rules(
+            &ctx,
+            &QueryConfig {
+                max_cartesian_rows: 1,
+                ..QueryConfig::default()
+            },
+            None,
+            plan,
+        )
+        .unwrap();
     }
 
     #[tokio::test]
