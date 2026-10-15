@@ -78,7 +78,8 @@ When finishing a feature, bugfix, or any implementation task, **always update th
 
 1. **`README.md`** -- Update the roadmap checklist (mark items done, add new items)
 2. **`docs/internal/status/YYYY-MM-DD-<branch-slug>.md`** -- Add a new file with the status entry and a `**NEXT:**` line (template in `docs/internal/status/README.md`). Never add entries to `nextsteps.md`: it is only a pointer now, and a shared line there made every pair of open MRs conflict
-3. **`openspec/changes/*/tasks.md`** -- Check off completed tasks (`- [ ]` -> `- [x]`)
-4. **`benchmarks/results/`** -- Commit benchmark JSON reports for historical tracking (the `benchmarks` skill has the run and compare procedure)
+3. **`changelog.d/<branch-slug>.md`** -- The CHANGELOG entry, under a `### Fixed` / `### Added` / ... heading (format in `changelog.d/README.md`). Never edit `CHANGELOG.md` in an MR: every entry lands at the top of the same `[Unreleased]` section, so each merge conflicted the next open MR. `scripts/release.sh` folds the fragments in
+4. **`openspec/changes/*/tasks.md`** -- Check off completed tasks (`- [ ]` -> `- [x]`)
+5. **`benchmarks/results/`** -- Commit benchmark JSON reports for historical tracking (the `benchmarks` skill has the run and compare procedure)
 
 This ensures the project state is always visible to anyone reading the repo.
