@@ -32,10 +32,10 @@ use crate::transport::apply_grpc_transport_endpoint;
 pub struct ChannelPoolConfig {
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
-    pub keep_alive: Option<Duration>,
-    /// HTTP/2 receive windows for the pooled channel. tonic leaves both at
-    /// h2's 65,535-byte default, which caps each worker's scan stream at
-    /// `window / RTT`. See `transport::apply_grpc_transport_endpoint`.
+    /// HTTP/2 windows, frame size and keepalive for the pooled channel.
+    /// tonic leaves both windows at h2's 65,535-byte default, which caps each
+    /// worker's scan stream at `window / RTT`. See
+    /// `transport::apply_grpc_transport_endpoint`.
     pub transport: GrpcTransportConfig,
     /// Client TLS for `https://` targets, built once from `[coordinator.tls]`
     /// (trust root from `ca_file`, else the platform store; our own cert
@@ -50,7 +50,6 @@ impl Default for ChannelPoolConfig {
         Self {
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(30),
-            keep_alive: Some(Duration::from_secs(30)),
             transport: GrpcTransportConfig::default(),
             // No configured TLS block: an https target still gets a client
             // config (platform trust store) rather than tonic's hard refusal.
@@ -126,7 +125,6 @@ impl ChannelPool {
             request_timeout,
             transport: *transport,
             client_tls: Some(sqe_core::tls::tonic_client(tls, None)?),
-            ..ChannelPoolConfig::default()
         })))
     }
 
@@ -151,11 +149,6 @@ impl ChannelPool {
             apply_grpc_transport_endpoint(Endpoint::new(url.to_string())?, &self.config.transport)
                 .connect_timeout(self.config.connect_timeout)
                 .timeout(self.config.request_timeout);
-        if let Some(ka) = self.config.keep_alive {
-            endpoint = endpoint
-                .keep_alive_timeout(ka)
-                .http2_keep_alive_interval(ka);
-        }
         // An https target without a ClientTlsConfig is refused by tonic before
         // the connect even starts, which is finding 603 in one line.
         if sqe_core::tls::is_https_url(url) {
