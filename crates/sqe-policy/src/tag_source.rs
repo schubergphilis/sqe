@@ -21,7 +21,7 @@ pub trait TagSource: Send + Sync {
     ///   valid known state ("this table carries no tags"); the caller does no
     ///   tag work but does NOT deny.
     /// - `None` means the tag state is UNKNOWN: a cache miss, a disabled cache,
-    ///   or unreadable metadata. The caller MUST fail closed (deny) for that
+    ///   or unreadable metadata. The caller MUST fail closed (refuse) for that
     ///   scan, because a tag mask or tag row-filter may exist that we cannot
     ///   see. Treating unknown as "no tags" would silently skip a security
     ///   control.
