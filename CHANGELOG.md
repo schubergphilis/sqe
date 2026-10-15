@@ -52,6 +52,14 @@ All notable changes to SQE are documented in this file.
     decompression, among others. Lockfile-only bump; the workspace-hack
     already allows any 0.23.
 
+- `CALL system.register_table` no longer logs the full metadata location (#837)
+
+    The INFO line `register_table: requesting catalog registration` logged
+    the caller's `metadata_location` verbatim, including any query string
+    of a presigned URL. It now logs the scheme and bucket plus a short
+    SHA-256 of the path (`s3://lake/<path sha256:...>`). The result row still
+    returns the full location to the caller who supplied it.
+
 - A read query refused by a full node pool waits and runs again instead of failing (#788)
 
     Under concurrent load, a sort, aggregate or join whose own
