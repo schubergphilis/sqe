@@ -96,6 +96,14 @@ if [[ -z "$(git status --porcelain)" ]]; then
     exit 1
 fi
 
+# Merge requests write changelog.d/<branch>.md rather than CHANGELOG.md, so
+# open merge requests do not conflict there. Fold them into [Unreleased] first.
+# Pre-releases leave them in place for the final release.
+if [[ "$VERSION" != *-* ]]; then
+    echo "==> changelog.d -> CHANGELOG.md [Unreleased]"
+    python3 scripts/changelog-collect.py
+fi
+
 # The curated [Unreleased] notes become this version's section, and a fresh
 # empty [Unreleased] opens above it. The tag pipeline's gitlab-release job
 # publishes that section as the GitLab Release notes.
@@ -111,7 +119,7 @@ else
 fi
 
 echo "==> Committing"
-git add Cargo.toml crates/*/Cargo.toml Cargo.lock deploy/helm/sqe/Chart.yaml CHANGELOG.md
+git add Cargo.toml crates/*/Cargo.toml Cargo.lock deploy/helm/sqe/Chart.yaml CHANGELOG.md changelog.d
 git commit -m "chore(release): ${VERSION}
 
 Bump all workspace crate versions to ${VERSION} ahead of the v${VERSION}

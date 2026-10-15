@@ -22,9 +22,12 @@ What it does:
 1. Bumps `version = "..."` in every `crates/*/Cargo.toml` to the requested
    version. Skips `xtask/Cargo.toml` (internal tooling, pinned at `0.0.0`).
 2. Updates `Cargo.lock` via `cargo check --workspace`.
-3. Creates a `chore(release): <version>` commit.
-4. Creates an annotated tag `v<version>`.
-5. Optionally pushes both to `origin`.
+3. Folds the `changelog.d/` fragments into `[Unreleased]` in `CHANGELOG.md`
+   (`scripts/changelog-collect.py`) and deletes them, then renames
+   `[Unreleased]` to the version. Pre-releases skip both steps.
+4. Creates a `chore(release): <version>` commit.
+5. Creates an annotated tag `v<version>`.
+6. Optionally pushes both to `origin`.
 
 The script refuses to run if the working tree is dirty or the tag already
 exists.
