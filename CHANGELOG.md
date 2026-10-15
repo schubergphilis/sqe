@@ -44,6 +44,14 @@ All notable changes to SQE are documented in this file.
 
 ### Fixed
 
+- rustls 0.23.46 for RUSTSEC-2026-0346, -0347, -0348 and -0349
+
+    Four rustls advisories published on 2026-10-14 failed `deps-check` on
+    every branch: TLS secrets in the session-value `Debug` impls, buffered
+    data sent after an ECH rejection, and unbounded Brotli certificate
+    decompression, among others. Lockfile-only bump; the workspace-hack
+    already allows any 0.23.
+
 - A read query refused by a full node pool waits and runs again instead of failing (#788)
 
     Under concurrent load, a sort, aggregate or join whose own
