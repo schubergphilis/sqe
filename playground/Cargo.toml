@@ -1,0 +1,73 @@
+[package]
+name = "sqe-playground"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "SQE query playground compiled to WebAssembly. DataFusion in the browser."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# `compression` is left off: it pulls liblzma/bzip2 for CSV/JSON codecs we
+# do not need. Parquet's own codecs (snappy, zstd, brotli, lz4, flate2) come
+# in through the `parquet` feature and all build for wasm32.
+datafusion = { version = "55", default-features = false, features = [
+    "parquet",
+    "sql",
+    "nested_expressions",
+    "crypto_expressions",
+    "datetime_expressions",
+    "encoding_expressions",
+    "regex_expressions",
+    "string_expressions",
+    "unicode_expressions",
+    "recursive_protection",
+] }
+object_store = { version = "0.13", features = ["http", "aws"] }
+
+# Named directly, and only for its feature. Without `wasmbind`, chrono's
+# `Utc::now()` falls through to `std::time::SystemTime::now()`, which panics
+# at runtime on wasm32 with "time not implemented on this platform". Cargo
+# features are additive, so naming it here re-enables the js_sys::Date path
+# for every crate in the graph.
+chrono = { version = "0.4", features = ["wasmbind", "clock"] }
+
+# getrandom lands in the tree at three major versions at once (via rand,
+# uuid and ahash). Each needs its own browser-entropy opt-in, and 0.3/0.4
+# additionally need the `getrandom_backend` cfg set in .cargo/config.toml.
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+
+# Manifest lists and manifests are Avro. Pinned to the version the repo's
+# vendored iceberg-rust uses, so the two read the same files.
+apache-avro = "0.21"
+arrow = "59"
+url = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = "0.2.127"
+wasm-bindgen-futures = "0.4"
+futures = "0.3"
+serde-wasm-bindgen = "0.6"
+console_error_panic_hook = "0.1"
+
+# Host-side tests only; wasm32 cannot run them.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# The root workspace patches object_store to vendor/object_store, whose
+# quick-xml 0.41 clears RUSTSEC-2026-0194/0195. This crate keeps its own
+# lockfile, so it needs the same patch or the advisory comes back here. Drop it
+# with the root one when DataFusion moves to object_store 0.14 (!1133).
+[patch.crates-io]
+object_store = { path = "../vendor/object_store" }
