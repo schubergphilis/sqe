@@ -37,13 +37,13 @@ chrono = { version = "0.4", features = ["wasmbind", "clock"] }
 # getrandom lands in the tree at three major versions at once (via rand,
 # uuid and ahash). Each needs its own browser-entropy opt-in, and 0.3/0.4
 # additionally need the `getrandom_backend` cfg set in .cargo/config.toml.
-getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
-getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.4", features = ["js"] }
+getrandom_03 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 
 # Manifest lists and manifests are Avro. Pinned to the version the repo's
 # vendored iceberg-rust uses, so the two read the same files.
-apache-avro = "0.21"
+apache-avro = "0.22"
 arrow = "59"
 url = "2"
 serde = { version = "1", features = ["derive"] }
