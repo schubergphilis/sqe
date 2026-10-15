@@ -1616,9 +1616,7 @@ async fn unknown_tag_state_denies() {
 
     let sql = format!("SELECT id, ssn FROM {ORDERS} ORDER BY id");
 
-    // Control: on the suite's handler bob reads all three rows. Its
-    // TableMetadataCache saw this table during fixture DDL, so `CacheTagSource`
-    // can answer "known: no tags" and the rewriter does no tag work.
+    // Control: on the suite's handler bob reads all three rows.
     let warm = exec_ok(&ctx, &ctx.bob, &sql).await;
     assert_eq!(
         total_rows(&warm),
@@ -1627,45 +1625,88 @@ async fn unknown_tag_state_denies() {
     );
 
     // Same user, same grant, same SQL -- but a handler whose TableMetadataCache
-    // has never seen this table. `TagSource::column_tags` returns None
-    // (UNKNOWN, not "no tags"), and the contract in tag_source.rs is that the
-    // caller MUST fail closed: a mask or tag row filter might exist that we
-    // cannot see, so treating unknown as untagged would silently skip a
-    // security control. plan_rewriter refuses the statement with an
-    // AccessDenied error naming the table (#840; it used to inject a deny-all
-    // row filter, which returned an empty result).
+    // has never seen this table. Until #842 `CacheTagSource` returned None
+    // (UNKNOWN) here and the statement was refused, which is what a disabled
+    // cache (`metadata_cache_ttl_secs = 0`) or an eviction did to every
+    // governed query in production. The rewriter now reads the tags off the
+    // Iceberg provider planning built, so the cold handler answers exactly
+    // like the warm one, masks included.
     //
     // The cold handler only stays cold because `SESSION_CONTEXT_CACHE` is
     // process-global: it hands this handler the warm handler's cached
     // session, whose table loads fill the warm handler's metadata cache, not
     // this one. A production coordinator has one handler and one cache.
-    //
-    // This case rests on the cold handler staying cold for the ONE query below.
-    // Do not "improve" `setup_ranger_handler` to pre-populate the table cache:
-    // the deny would stop happening and this test would pass by no longer
-    // exercising the contract. A test that needs a warm second handler should
-    // ask for one explicitly with `setup_ranger_handler_sharing`.
     let (cold, _cache) = crate::common::setup_ranger_handler().await;
-    let err = match cold.execute(&ctx.bob, &sql, None).await {
-        Ok(batches) => panic!(
-            "unknown tag state must refuse the statement, got {} rows: {:?}",
-            total_rows(&batches),
-            col_strings(&batches, "ssn")
-        ),
-        Err(e) => e,
-    };
+    let cold_rows = cold
+        .execute(&ctx.bob, &sql, None)
+        .await
+        .unwrap_or_else(|e| panic!("a cold tag cache must not refuse the statement: {e}"));
+    assert_eq!(total_rows(&cold_rows), 3);
     assert_eq!(
-        err.error_code(),
-        sqe_core::SqeErrorCode::AccessDenied,
-        "{err}"
-    );
-    assert!(err.to_string().contains("tag state unknown"), "{err}");
-    assert!(
-        !err.to_string().contains("111-11-1111"),
-        "the refusal must not carry row values: {err}"
+        col_strings(&cold_rows, "ssn"),
+        col_strings(&warm, "ssn"),
+        "the cold handler must apply the same tag masks as the warm one"
     );
 
-    // The warm handler is unaffected: the deny is per-scan, not global state.
+    // An unreadable `sqe.column-tags` is still UNKNOWN, on either handler:
+    // a mask or tag row filter might exist that we cannot see, so the
+    // statement is refused with an AccessDenied naming the table (#840; it
+    // used to inject a deny-all row filter, which returned an empty result).
+    // A table of its own, so the ORDERS tags the rest of the suite relies on
+    // are never touched.
+    let bad = "sales_wh.ac.orders_bad_tags";
+    let _ = ctx
+        .handler
+        .execute(&ctx.carol, &format!("DROP TABLE IF EXISTS {bad}"), None)
+        .await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("CREATE TABLE {bad} (id BIGINT, ssn VARCHAR)"),
+    )
+    .await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("INSERT INTO {bad} VALUES (1, '999-99-9999')"),
+    )
+    .await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("ALTER TABLE {bad} SET TBLPROPERTIES ('sqe.column-tags' = 'not-json{{{{')"),
+    )
+    .await;
+    let bad_sql = format!("SELECT id, ssn FROM {bad}");
+    for (which, handler) in [("warm", &ctx.handler), ("cold", &cold)] {
+        let err = match handler.execute(&ctx.carol, &bad_sql, None).await {
+            Ok(batches) => panic!(
+                "{which}: unreadable tags must refuse the statement, got {} rows: {:?}",
+                total_rows(&batches),
+                col_strings(&batches, "ssn")
+            ),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.error_code(),
+            sqe_core::SqeErrorCode::AccessDenied,
+            "{which}: {err}"
+        );
+        assert!(
+            err.to_string().contains("tag state unknown"),
+            "{which}: {err}"
+        );
+        assert!(
+            !err.to_string().contains("999-99-9999"),
+            "{which}: the refusal must not carry row values: {err}"
+        );
+    }
+    let _ = ctx
+        .handler
+        .execute(&ctx.carol, &format!("DROP TABLE {bad}"), None)
+        .await;
+
+    // The deny is per-scan, not global state.
     let after = exec_ok(&ctx, &ctx.bob, &sql).await;
     assert_eq!(total_rows(&after), 3);
 }
@@ -1771,9 +1812,9 @@ async fn ranger_outage_fails_closed() {
     let sql = format!("SELECT id, ssn FROM {ORDERS} ORDER BY id");
 
     // Warm the handler while Ranger is up. This matters: the outage has to be
-    // the ONLY thing that changes. A cold handler denies for an unrelated reason
-    // (unknown tag state), which is what made an earlier version of this test
-    // pass vacuously.
+    // the ONLY thing that changes. A cold handler used to deny for an unrelated
+    // reason (unknown tag state, before #842), which is what made an earlier
+    // version of this test pass vacuously.
     let warm = crate::common::eventually("bob's mask to apply before the outage", || async {
         match ctx.handler.execute(&ctx.bob, &sql, None).await {
             Ok(b)

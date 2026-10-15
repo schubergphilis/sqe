@@ -44,6 +44,10 @@ pub(crate) const PROP_KEY: &str = "sqe.column-tags";
 
 /// Tag source backed by the coordinator's shared `TableMetadataCache`.
 ///
+/// The rewriter reads an Iceberg scan's tags off its provider first
+/// ([`scan_column_tags`]); this is the fallback for scans that hook does not
+/// recognise, and the audit writer's lookup.
+///
 /// During query planning the scan path has already loaded the target table into
 /// the cache via `SessionCatalog::load_table`. `CacheTagSource::column_tags`
 /// then reads the table properties out of the already-cached entry
@@ -113,6 +117,38 @@ impl TagSource for CacheTagSource {
                 );
                 None
             }
+        }
+    }
+}
+
+/// Read the column tags off an Iceberg scan's provider, for
+/// `PolicyPlanRewriter::with_scan_tags`.
+///
+/// Planning built the `SqeTableProvider` from `load_table` with the caller's
+/// token, revalidating a stale cache entry first, so its properties are the
+/// table's current ones. Reading them here does not depend on the metadata
+/// cache still holding the table: a disabled cache (`ttl_secs = 0`), an
+/// eviction, or a commit racing the planning load no longer makes the tag
+/// state unknown (#842). Any other provider (Hive, views, metadata TVFs) is
+/// `NotRecognised` and goes to `CacheTagSource` / `HiveTagSource`.
+pub(crate) fn scan_column_tags(
+    provider: &dyn datafusion::catalog::TableProvider,
+) -> sqe_policy::plan_rewriter::ScanTagState {
+    use sqe_policy::plan_rewriter::ScanTagState;
+
+    let Some(iceberg) = (provider as &dyn std::any::Any)
+        .downcast_ref::<sqe_catalog::table_provider::SqeTableProvider>()
+    else {
+        return ScanTagState::NotRecognised;
+    };
+    match parse_column_tags(iceberg.table().metadata().properties()) {
+        Ok(map) => ScanTagState::Known(map),
+        Err(e) => {
+            debug!(
+                error = %e,
+                "tag_source: malformed sqe.column-tags on the scanned table, tag state UNKNOWN (fail closed)"
+            );
+            ScanTagState::Unknown
         }
     }
 }
@@ -620,5 +656,90 @@ mod tag_key_rewrite_tests {
         );
         assert!(!out.contains_key("a") && !out.contains_key("b"));
         assert!(!out.contains_key("z"));
+    }
+}
+
+#[cfg(test)]
+mod scan_column_tags_tests {
+    use super::*;
+    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use iceberg::{Catalog, CatalogBuilder, TableCreation};
+    use sqe_catalog::table_provider::SqeTableProvider;
+    use sqe_policy::plan_rewriter::ScanTagState;
+
+    /// The provider planning builds for a table carrying `properties`.
+    async fn provider_with(properties: &[(&str, &str)]) -> SqeTableProvider {
+        let catalog = iceberg::memory::MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                [("warehouse".to_string(), "memory:///wh".to_string())].into(),
+            )
+            .await
+            .unwrap();
+        let ns = NamespaceIdent::new("ns".into());
+        catalog
+            .create_namespace(&ns, Default::default())
+            .await
+            .unwrap();
+        let schema = Schema::builder()
+            .with_fields(vec![NestedField::optional(
+                1,
+                "ssn",
+                Type::Primitive(PrimitiveType::String),
+            )
+            .into()])
+            .build()
+            .unwrap();
+        let table = catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name("t".to_string())
+                    .schema(schema)
+                    .properties(
+                        properties
+                            .iter()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect::<HashMap<_, _>>(),
+                    )
+                    .build(),
+            )
+            .await
+            .unwrap();
+        SqeTableProvider::try_new(table).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_iceberg_scan_reports_its_tags() {
+        let provider = provider_with(&[(PROP_KEY, r#"{"ssn":["PII"]}"#)]).await;
+        assert_eq!(
+            scan_column_tags(&provider),
+            ScanTagState::Known(HashMap::from([(
+                "ssn".to_string(),
+                vec!["PII".to_string()]
+            )]))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_untagged_iceberg_scan_is_known_empty() {
+        let provider = provider_with(&[]).await;
+        assert_eq!(
+            scan_column_tags(&provider),
+            ScanTagState::Known(HashMap::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_tags_are_unknown_not_empty() {
+        let provider = provider_with(&[(PROP_KEY, "not-json{{")]).await;
+        assert_eq!(scan_column_tags(&provider), ScanTagState::Unknown);
+    }
+
+    #[test]
+    fn any_other_provider_is_not_recognised() {
+        let schema = Arc::new(arrow::datatypes::Schema::empty());
+        let empty = datafusion::datasource::empty::EmptyTable::new(schema);
+        assert_eq!(scan_column_tags(&empty), ScanTagState::NotRecognised);
     }
 }
