@@ -617,34 +617,47 @@ impl MaintenanceHandler {
         Ok(vec![batch])
     }
 
-    /// Drop a table from the catalog without deleting its data files. The
-    /// `purge => true` form is reserved for a follow-up change that wires
-    /// FileIO::delete_prefix into the drop path; today it returns an
-    /// explicit "not yet implemented" error so users do not accidentally
-    /// rely on it.
+    /// Drop a table from the catalog. `purge => false` removes the catalog
+    /// entry only, so the files stay and the table can be re-registered.
+    ///
+    /// `purge => true` also deletes everything under the table's location,
+    /// through the caller's own FileIO, once the catalog drop has succeeded.
+    /// It does not send the REST `purgeRequested` flag: Polaris refuses that
+    /// unless `DROP_WITH_PURGE_ENABLED` is set, and when it accepts, it
+    /// deletes asynchronously with its own credentials, so the CALL could not
+    /// say whether anything was deleted (#836).
+    ///
+    /// Purge is refused before anything changes when the location cannot be
+    /// trusted as this table's own directory; see [`purge_prefix`]. If the
+    /// prefix delete fails after the catalog drop, the error says the table
+    /// is already gone and names the prefix to clean up by hand.
     async fn drop_table(
         &self,
         session: &Session,
         table_ref: &TableRef,
         purge: bool,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        if purge {
-            return Err(SqeError::Execution(
-                "CALL system.drop_table(purge => true) is not yet implemented; \
-                 drop without purge then delete the table prefix manually"
-                    .into(),
-            ));
-        }
-
         let catalog = self
             .create_catalog_bridge(session, table_ref.catalog.as_deref())
             .await?;
         let ident = to_table_ident(table_ref);
 
+        // Load before the drop: afterwards there is no location or FileIO
+        // left to purge with.
+        let purge_target = if purge {
+            let table = load_table(&catalog, &ident).await?;
+            let prefix = purge_prefix(&table)?;
+            refuse_if_location_shared(&catalog, &ident, &prefix).await?;
+            Some((table.file_io().clone(), prefix))
+        } else {
+            None
+        };
+
         info!(
             user = %session.user.username,
             table = %ident,
-            "drop_table: requesting catalog drop (no purge)"
+            purge,
+            "drop_table: requesting catalog drop"
         );
 
         catalog
@@ -658,6 +671,30 @@ impl MaintenanceHandler {
         // operation per CALL.
         sqe_catalog::invalidate_rest_catalog_cache_all().await;
 
+        let status = match purge_target {
+            None => "dropped",
+            Some((file_io, prefix)) => {
+                file_io.delete_prefix(&prefix).await.map_err(|e| {
+                    SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!(
+                            "drop_table: table '{ident}' was dropped from the catalog, but \
+                             deleting its files under '{prefix}' failed: {e}. Delete that \
+                             prefix by hand."
+                        ),
+                    )
+                })?;
+                info!(
+                    user = %session.user.username,
+                    table = %ident,
+                    prefix = %location_for_log(&prefix),
+                    "drop_table: purged the table prefix"
+                );
+                self.audit_purge(session, table_ref, &prefix);
+                "purged"
+            }
+        };
+
         let schema = Arc::new(Schema::new(vec![
             Field::new("table_identifier", DataType::Utf8, false),
             Field::new("purge", DataType::Utf8, false),
@@ -667,12 +704,61 @@ impl MaintenanceHandler {
             schema,
             vec![
                 Arc::new(StringArray::from(vec![ident.to_string()])),
-                Arc::new(StringArray::from(vec!["false"])),
-                Arc::new(StringArray::from(vec!["dropped"])),
+                Arc::new(StringArray::from(vec![purge.to_string()])),
+                Arc::new(StringArray::from(vec![status])),
             ],
         )
         .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("drop_table summary: {e}")))?;
         Ok(vec![batch])
+    }
+
+    /// Audit a purge as its own `AdminDdl` event. The statement-level event
+    /// carries only the CALL text; this one records that files were deleted
+    /// and under which prefix, logged as scheme, bucket and a path hash like
+    /// the INFO line (#837).
+    fn audit_purge(&self, session: &Session, table_ref: &TableRef, prefix: &str) {
+        let Some(ref audit) = self.audit else {
+            return;
+        };
+        let actor = sqe_metrics::audit::Actor::from_parts(
+            session.user.username.clone(),
+            session.user.subject.clone(),
+            session.user.email.clone(),
+            session.user.roles.clone(),
+            session.user.groups.clone(),
+        );
+        let resource = sqe_metrics::audit::Resource {
+            catalog: table_ref.catalog.clone(),
+            namespace: vec![table_ref.namespace.clone()],
+            name: table_ref.name.clone(),
+            object_type: sqe_metrics::audit::ObjectType::Table,
+        };
+        let text = format!(
+            "CALL system.drop_table(table => '{}', purge => true) deleted prefix {}",
+            table_ref.as_string(),
+            location_for_log(prefix)
+        );
+        audit.log_event(sqe_metrics::audit::AuditEvent {
+            time: chrono::Utc::now(),
+            kind: sqe_metrics::audit::AuditKind::AdminDdl,
+            actor,
+            outcome: sqe_metrics::audit::Outcome::Success,
+            resources: vec![resource],
+            policy: None,
+            timing: None,
+            stats: None,
+            query: Some(sqe_metrics::audit::QueryInfo {
+                query_hash: sqe_metrics::audit::query_hash(&text),
+                text: Some(text),
+                statement_type: "procedure".to_string(),
+            }),
+            session_id: Some(session.id.clone()),
+            client_ip: None,
+            trace_id: None,
+            query_id: None,
+            transaction: None,
+            integrity: sqe_metrics::audit::Integrity::default(),
+        });
     }
 
     /// Read-only probe: walk the in-memory query log and surface the top
@@ -3046,6 +3132,139 @@ fn location_for_log(location: &str) -> String {
     }
 }
 
+/// The prefix `drop_table(purge => true)` deletes: the table location with a
+/// trailing `/`, so a sibling such as `t_2` next to `t` is never matched.
+/// Refuses, before the catalog drop, when deleting that prefix could take
+/// more than this table's files or leave some of them behind:
+///
+/// - `gc.enabled = false`, the Iceberg marker for a table whose files may be
+///   shared (Spark refuses the same purge).
+/// - A `write.*.path` property pointing outside the location: files written
+///   there would survive, and the path may belong to something else.
+/// - A location with no path below the bucket, or a current metadata file
+///   that is not under the location, so the location is not this table's
+///   own directory.
+fn purge_prefix(table: &IcebergTable) -> sqe_core::Result<String> {
+    use iceberg::spec::TableProperties;
+
+    let ident = table.identifier();
+    let metadata = table.metadata();
+    let refuse = |why: String| {
+        SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!("drop_table(purge => true) refused for '{ident}': {why}. Nothing was dropped."),
+        )
+    };
+
+    let gc_enabled = metadata
+        .table_properties()
+        .gc_enabled()
+        .map_err(|e| refuse(format!("cannot read gc.enabled: {e}")))?;
+    if !gc_enabled {
+        return Err(refuse("gc.enabled is false on this table".into()));
+    }
+
+    let location = strip_trailing_slash(metadata.location());
+    let has_table_dir = location.split_once("://").is_some_and(|(_, rest)| {
+        rest.split_once('/')
+            .is_some_and(|(_, path)| !path.is_empty())
+    });
+    if !has_table_dir {
+        return Err(refuse(format!(
+            "location {} is a bucket root",
+            location_for_log(&location)
+        )));
+    }
+
+    for key in [
+        TableProperties::PROPERTY_WRITE_DATA_LOCATION,
+        TableProperties::PROPERTY_WRITE_METADATA_PATH,
+        TableProperties::PROPERTY_WRITE_FOLDER_STORAGE_LOCATION,
+        TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_LOCATION,
+    ] {
+        if let Some(path) = metadata.properties().get(key) {
+            if canonicalize_uri(path) != canonicalize_uri(&location)
+                && !is_strictly_under(path, &location)
+            {
+                return Err(refuse(format!(
+                    "{key} points outside the table location; delete those files by hand"
+                )));
+            }
+        }
+    }
+
+    if let Some(metadata_location) = table.metadata_location() {
+        if !is_strictly_under(metadata_location, &location) {
+            return Err(refuse(
+                "the current metadata file is not under the table location".into(),
+            ));
+        }
+    }
+
+    Ok(format!("{location}/"))
+}
+
+/// Refuse a purge when another table in the catalog shares the prefix.
+/// `register_table` can point a second identifier at an existing table's
+/// files (data-free moves, disaster recovery), so two entries may share one
+/// location; deleting it for one would destroy the other's data. Walks every
+/// namespace the caller can list and compares locations in both directions
+/// (equal, inside, or containing). A table that cannot be loaded refuses the
+/// purge: its location is unknown, so it might be the one sharing.
+async fn refuse_if_location_shared(
+    catalog: &Arc<dyn Catalog>,
+    target: &TableIdent,
+    prefix: &str,
+) -> sqe_core::Result<()> {
+    let refuse = |why: String| {
+        SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!(
+                "drop_table(purge => true) refused for '{target}': {why}. Nothing was dropped."
+            ),
+        )
+    };
+
+    let mut pending: Vec<NamespaceIdent> = catalog.list_namespaces(None).await.map_err(|e| {
+        refuse(format!(
+            "cannot list namespaces to check for shared locations: {e}"
+        ))
+    })?;
+    while let Some(ns) = pending.pop() {
+        let children = catalog.list_namespaces(Some(&ns)).await.map_err(|e| {
+            refuse(format!(
+                "cannot list namespaces under '{}': {e}",
+                ns.to_url_string()
+            ))
+        })?;
+        pending.extend(children);
+        let tables = catalog.list_tables(&ns).await.map_err(|e| {
+            refuse(format!(
+                "cannot list tables in '{}': {e}",
+                ns.to_url_string()
+            ))
+        })?;
+        for ident in tables.iter().filter(|t| *t != target) {
+            let other = catalog.load_table(ident).await.map_err(|e| {
+                refuse(format!(
+                    "cannot load '{ident}' to check whether it shares the location: {e}"
+                ))
+            })?;
+            if locations_overlap(other.metadata().location(), prefix) {
+                return Err(refuse(format!(
+                    "table '{ident}' uses the same location; drop it first or drop without purge"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// True when one location is the other or lies inside it.
+fn locations_overlap(a: &str, b: &str) -> bool {
+    canonicalize_uri(a) == canonicalize_uri(b) || is_strictly_under(a, b) || is_strictly_under(b, a)
+}
+
 /// Strip a single trailing `/` if present so two locations that differ only
 /// by trailing slash compare equal.
 fn strip_trailing_slash(s: &str) -> String {
@@ -3466,6 +3685,195 @@ mod location_log_tests {
         let logged = location_for_log("/local/wh/t/metadata/v1.metadata.json");
         assert!(logged.starts_with("<path sha256:"), "{logged}");
         assert!(!logged.contains("local"), "{logged}");
+    }
+}
+
+#[cfg(test)]
+mod purge_prefix_tests {
+    use super::{locations_overlap, purge_prefix};
+    use std::sync::Arc;
+
+    #[test]
+    fn overlap_is_same_inside_or_containing_but_not_a_sibling() {
+        let prefix = "s3://lake/wh/ns/t/";
+        assert!(locations_overlap("s3://lake/wh/ns/t", prefix));
+        assert!(locations_overlap("S3://LAKE/wh/ns/t//", prefix));
+        assert!(locations_overlap("s3://lake/wh/ns/t/nested", prefix));
+        assert!(locations_overlap("s3://lake/wh/ns", prefix));
+        assert!(!locations_overlap("s3://lake/wh/ns/t_2", prefix));
+        assert!(!locations_overlap("s3://lake/wh/other/t", prefix));
+    }
+
+    fn table(
+        location: &str,
+        metadata_location: Option<&str>,
+        props: &[(&str, &str)],
+    ) -> iceberg::table::Table {
+        let properties: serde_json::Map<String, serde_json::Value> = props
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::from(*v)))
+            .collect();
+        let metadata: iceberg::spec::TableMetadata = serde_json::from_value(serde_json::json!({
+            "format-version": 1,
+            "table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
+            "location": location,
+            "last-updated-ms": 1602638573874_i64,
+            "last-column-id": 1,
+            "schema": {"type": "struct", "fields": [
+                {"id": 1, "name": "x", "required": true, "type": "long"}]},
+            "partition-spec": [],
+            "properties": properties,
+            "current-snapshot-id": -1,
+            "snapshots": []
+        }))
+        .unwrap();
+        let file_io =
+            iceberg::io::FileIOBuilder::new(Arc::new(iceberg::io::LocalFsStorageFactory)).build();
+        let mut builder = iceberg::table::Table::builder()
+            .runtime(iceberg::Runtime::current())
+            .metadata(metadata)
+            .identifier(iceberg::TableIdent::from_strs(["ns", "t"]).unwrap())
+            .file_io(file_io)
+            .disable_cache();
+        if let Some(m) = metadata_location {
+            builder = builder.metadata_location(m);
+        }
+        builder.build().unwrap()
+    }
+
+    const META: Option<&str> = Some("s3://lake/wh/ns/t/metadata/00001-a.metadata.json");
+
+    /// Polaris refuses overlapping table locations by default, so the
+    /// integration suite cannot build a shared location; the in-memory
+    /// catalog allows it, like Glue, HMS and the SQL catalogs do.
+    #[tokio::test]
+    async fn a_table_sharing_the_location_refuses_the_purge() {
+        use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+        use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            iceberg::memory::MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    [("warehouse".to_string(), "memory:///wh".to_string())].into(),
+                )
+                .await
+                .unwrap(),
+        );
+        let ns = NamespaceIdent::new("ns".into());
+        catalog
+            .create_namespace(&ns, Default::default())
+            .await
+            .unwrap();
+        let schema = Schema::builder()
+            .with_fields(vec![NestedField::required(
+                1,
+                "x",
+                Type::Primitive(PrimitiveType::Long),
+            )
+            .into()])
+            .build()
+            .unwrap();
+        let create = |name: &str, location: &str| {
+            TableCreation::builder()
+                .name(name.to_string())
+                .location(location.to_string())
+                .schema(schema.clone())
+                .build()
+        };
+        catalog
+            .create_table(&ns, create("t", "memory:///wh/ns/t"))
+            .await
+            .unwrap();
+        catalog
+            .create_table(&ns, create("t_2", "memory:///wh/ns/t_2"))
+            .await
+            .unwrap();
+        let target = TableIdent::new(ns.clone(), "t".into());
+
+        // A sibling whose name only shares a string prefix does not block.
+        super::refuse_if_location_shared(&catalog, &target, "memory:///wh/ns/t/")
+            .await
+            .expect("no other table shares the location yet");
+
+        catalog
+            .create_table(&ns, create("twin", "memory:///wh/ns/t"))
+            .await
+            .unwrap();
+        let err = super::refuse_if_location_shared(&catalog, &target, "memory:///wh/ns/t/")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("ns.twin"), "{err}");
+        assert!(err.to_string().contains("uses the same location"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_prefix_is_the_location_as_a_directory() {
+        assert_eq!(
+            purge_prefix(&table("s3://lake/wh/ns/t", META, &[])).unwrap(),
+            "s3://lake/wh/ns/t/"
+        );
+        assert_eq!(
+            purge_prefix(&table("s3://lake/wh/ns/t/", META, &[])).unwrap(),
+            "s3://lake/wh/ns/t/"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_disabled_refuses() {
+        let err = purge_prefix(&table(
+            "s3://lake/wh/ns/t",
+            META,
+            &[("gc.enabled", "false")],
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("gc.enabled"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_bucket_root_refuses() {
+        let err = purge_prefix(&table("s3://lake", None, &[])).unwrap_err();
+        assert!(err.to_string().contains("bucket root"), "{err}");
+        assert!(purge_prefix(&table("s3://lake/", None, &[])).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_write_path_outside_the_location_refuses() {
+        let err = purge_prefix(&table(
+            "s3://lake/wh/ns/t",
+            META,
+            &[("write.data.path", "s3://lake/shared/data")],
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("write.data.path"), "{err}");
+        // A sibling that only shares a string prefix is outside too.
+        assert!(purge_prefix(&table(
+            "s3://lake/wh/ns/t",
+            META,
+            &[("write.metadata.path", "s3://lake/wh/ns/t_2/metadata")],
+        ))
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_write_path_inside_the_location_is_fine() {
+        assert!(purge_prefix(&table(
+            "s3://lake/wh/ns/t",
+            META,
+            &[("write.data.path", "s3://lake/wh/ns/t/data")],
+        ))
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn metadata_outside_the_location_refuses() {
+        let err = purge_prefix(&table(
+            "s3://lake/wh/ns/t",
+            Some("s3://lake/elsewhere/00001-a.metadata.json"),
+            &[],
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("metadata file"), "{err}");
     }
 }
 

@@ -739,3 +739,295 @@ async fn rollback_rejects_non_ancestor_but_set_current_allows() {
         .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
         .await;
 }
+
+// ---------------------------------------------------------------------------
+// drop_table(purge => true) (#836)
+// ---------------------------------------------------------------------------
+
+/// A plain `object_store` client on the test stack's RustFS, independent of
+/// the coordinator, so "the files are gone" is checked by something other
+/// than the code that deleted them.
+fn purge_test_store(bucket: &str) -> std::sync::Arc<dyn object_store::ObjectStore> {
+    std::sync::Arc::new(
+        object_store::aws::AmazonS3Builder::new()
+            .with_bucket_name(bucket)
+            .with_endpoint("http://localhost:19000")
+            .with_region("us-east-1")
+            .with_access_key_id("s3admin")
+            .with_secret_access_key("s3admin")
+            .with_virtual_hosted_style_request(false)
+            .with_allow_http(true)
+            .build()
+            .expect("build test S3 client"),
+    )
+}
+
+/// Split `s3://bucket/key` into the bucket and the key.
+fn split_s3(uri: &str) -> (String, String) {
+    let rest = uri
+        .strip_prefix("s3://")
+        .unwrap_or_else(|| panic!("not an s3 uri: {uri}"));
+    let (bucket, key) = rest.split_once('/').expect("s3 uri has a key");
+    (bucket.to_string(), key.to_string())
+}
+
+/// Create `table` with one row and return one of its data file paths.
+async fn table_with_a_data_file(
+    handler: &sqe_coordinator::QueryHandler,
+    session: &sqe_core::Session,
+    table: &str,
+) -> String {
+    let _ = handler
+        .execute(session, &format!("DROP TABLE IF EXISTS {table}"), None)
+        .await;
+    handler
+        .execute(session, &format!("CREATE TABLE {table} (id BIGINT)"), None)
+        .await
+        .expect("CREATE");
+    handler
+        .execute(session, &format!("INSERT INTO {table} VALUES (1)"), None)
+        .await
+        .expect("INSERT");
+    let (ns, name) = table.split_once('.').expect("ns.table");
+    let files = handler
+        .execute(
+            session,
+            &format!("SELECT file_path FROM table_files('{ns}', '{name}')"),
+            None,
+        )
+        .await
+        .expect("table_files");
+    files[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .expect("file_path is Utf8")
+        .value(0)
+        .to_string()
+}
+
+/// The table directory a data file sits in: everything before `/data/`.
+fn table_dir_of(data_file: &str) -> String {
+    let (dir, _) = data_file
+        .rsplit_once("/data/")
+        .expect("data file under /data/");
+    dir.to_string()
+}
+
+async fn keys_under(store: &dyn object_store::ObjectStore, prefix: &str) -> Vec<String> {
+    use futures::TryStreamExt;
+    let path = object_store::path::Path::from(prefix);
+    store
+        .list(Some(&path))
+        .map_ok(|m| m.location.to_string())
+        .try_collect()
+        .await
+        .expect("list prefix")
+}
+
+async fn exists(store: &dyn object_store::ObjectStore, key: &str) -> bool {
+    use object_store::ObjectStoreExt;
+    store
+        .head(&object_store::path::Path::from(key))
+        .await
+        .is_ok()
+}
+
+fn string_cell(batches: &[arrow_array::RecordBatch], column: &str) -> String {
+    batches[0]
+        .column_by_name(column)
+        .unwrap_or_else(|| panic!("{column} column"))
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .expect("Utf8")
+        .value(0)
+        .to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn drop_table_purge_deletes_the_table_prefix() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let session = as_admin(session);
+    let table = "default.maint_drop_purge_test";
+
+    let data_file = table_with_a_data_file(&handler, &session, table).await;
+    let (bucket, data_key) = split_s3(&data_file);
+    let (_, dir_key) = split_s3(&table_dir_of(&data_file));
+    let store = purge_test_store(&bucket);
+    assert!(
+        exists(store.as_ref(), &data_key).await,
+        "fixture data file must exist"
+    );
+
+    let out = handler
+        .execute(
+            &session,
+            &format!("CALL system.drop_table(table => '{table}', purge => true)"),
+            None,
+        )
+        .await
+        .expect("drop_table purge");
+    assert_eq!(string_cell(&out, "purge"), "true");
+    assert_eq!(string_cell(&out, "status"), "purged");
+
+    // HEAD per object is authoritative; the LIST check covers metadata too.
+    assert!(
+        !exists(store.as_ref(), &data_key).await,
+        "data file must be deleted"
+    );
+    let left = keys_under(store.as_ref(), &format!("{dir_key}/")).await;
+    assert!(
+        left.is_empty(),
+        "table prefix must be empty after purge, found {left:?}"
+    );
+    handler
+        .execute(&session, &format!("SELECT * FROM {table}"), None)
+        .await
+        .expect_err("the table must be gone from the catalog");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn drop_table_without_purge_leaves_the_files() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let session = as_admin(session);
+    let table = "default.maint_drop_keep_test";
+
+    let data_file = table_with_a_data_file(&handler, &session, table).await;
+    let (bucket, data_key) = split_s3(&data_file);
+    let store = purge_test_store(&bucket);
+
+    let out = handler
+        .execute(
+            &session,
+            &format!("CALL system.drop_table(table => '{table}')"),
+            None,
+        )
+        .await
+        .expect("drop_table");
+    assert_eq!(string_cell(&out, "purge"), "false");
+    assert_eq!(string_cell(&out, "status"), "dropped");
+    assert!(
+        exists(store.as_ref(), &data_key).await,
+        "a drop without purge must keep the files"
+    );
+
+    // Clean up the files this test deliberately left behind.
+    let (_, dir_key) = split_s3(&table_dir_of(&data_file));
+    for key in keys_under(store.as_ref(), &format!("{dir_key}/")).await {
+        use object_store::ObjectStoreExt;
+        let _ = store.delete(&object_store::path::Path::from(key)).await;
+    }
+}
+
+/// `register_table` can point a second identifier at the same files. Purging
+/// either would delete the other's data, so purge refuses until the twin is
+/// gone, and refuses before the catalog drop.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn drop_table_purge_refuses_while_another_table_shares_the_location() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let session = as_admin(session);
+    let table = "default.maint_purge_shared_test";
+    let twin = "default.maint_purge_shared_twin";
+    let _ = handler
+        .execute(
+            &session,
+            &format!("CALL system.drop_table(table => '{twin}')"),
+            None,
+        )
+        .await;
+
+    let data_file = table_with_a_data_file(&handler, &session, table).await;
+    let (bucket, data_key) = split_s3(&data_file);
+    let (_, dir_key) = split_s3(&table_dir_of(&data_file));
+    let store = purge_test_store(&bucket);
+
+    // Register the twin on the newest metadata file of the original.
+    let metadata_json = keys_under(store.as_ref(), &format!("{dir_key}/metadata/"))
+        .await
+        .into_iter()
+        .filter(|k| k.ends_with(".metadata.json"))
+        .max()
+        .expect("a metadata.json under the table");
+    let registered = handler
+        .execute(
+            &session,
+            &format!(
+                "CALL system.register_table(table => '{twin}', \
+                 metadata_location => 's3://{bucket}/{metadata_json}')"
+            ),
+            None,
+        )
+        .await;
+    // Polaris refuses overlapping table locations unless
+    // ALLOW_TABLE_LOCATION_OVERLAP is set, so on the default stack the twin
+    // never exists. That backstop is Polaris's, not SQE's: the purge-side
+    // check is pinned by `a_table_sharing_the_location_refuses_the_purge`
+    // in maintenance.rs against a catalog that allows overlap.
+    if let Err(e) = registered {
+        assert!(
+            e.to_string().contains("conflicts with existing table"),
+            "{e}"
+        );
+        handler
+            .execute(
+                &session,
+                &format!("CALL system.drop_table(table => '{table}', purge => true)"),
+                None,
+            )
+            .await
+            .expect("purge");
+        assert!(
+            !exists(store.as_ref(), &data_key).await,
+            "data file must be deleted"
+        );
+        return;
+    }
+
+    let err = handler
+        .execute(
+            &session,
+            &format!("CALL system.drop_table(table => '{table}', purge => true)"),
+            None,
+        )
+        .await
+        .expect_err("purge must refuse while the twin shares the location");
+    assert!(err.to_string().contains("uses the same location"), "{err}");
+    assert!(
+        exists(store.as_ref(), &data_key).await,
+        "a refused purge must delete nothing"
+    );
+    let rows = handler
+        .execute(&session, &format!("SELECT COUNT(*) FROM {twin}"), None)
+        .await
+        .expect("the twin still reads");
+    assert_eq!(extract_count(&rows), 1);
+    handler
+        .execute(&session, &format!("SELECT COUNT(*) FROM {table}"), None)
+        .await
+        .expect("a refused purge must not drop the table either");
+
+    // With the twin gone (catalog only), the purge goes through.
+    handler
+        .execute(
+            &session,
+            &format!("CALL system.drop_table(table => '{twin}')"),
+            None,
+        )
+        .await
+        .expect("drop twin without purge");
+    handler
+        .execute(
+            &session,
+            &format!("CALL system.drop_table(table => '{table}', purge => true)"),
+            None,
+        )
+        .await
+        .expect("purge once nothing else shares the location");
+    assert!(
+        !exists(store.as_ref(), &data_key).await,
+        "data file must be deleted"
+    );
+}
