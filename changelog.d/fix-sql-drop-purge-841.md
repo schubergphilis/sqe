@@ -1,10 +1,14 @@
-### Fixed
+### Changed
 
-- `DROP TABLE ... PURGE` no longer drops the table while silently keeping its data (#841)
+- `DROP TABLE ... PURGE` on an Iceberg table now fails instead of succeeding without deleting data (#841)
 
-    The SQL path ignored `PURGE`: the table left the catalog and every data file
-    stayed in storage, with nothing telling the caller. The statement is now
-    refused with `NotSupported` before anything is dropped, and the error points
-    to `CALL system.drop_table(table => ..., purge => true)`. `DROP TABLE`
-    without `PURGE` is unchanged. The DDL reference no longer claims `PURGE`
-    deletes data files.
+    **Behaviour change.** Before, the statement removed the table from the
+    catalog, left every data file in storage and reported success. It is now
+    refused with `NotSupported`, and nothing is dropped. A script that drops
+    with `PURGE` and then recreates the table stops at the drop, because the
+    table is still there. To keep the old effect, drop the `PURGE` keyword.
+    To delete the data as well, use
+    `CALL system.drop_table(table => ..., purge => true)`. `DROP TABLE`
+    without `PURGE` is unchanged, the dbt-sqe adapter never sends `PURGE`,
+    and Hive tables already refused it. The DDL reference no longer claims
+    `PURGE` deletes data files.
