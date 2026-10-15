@@ -59,7 +59,95 @@ pub struct PolicyPlanRewriter {
     /// Recognises a file table function's provider (`read_csv(...)`, ...).
     /// `None` when not wired (unit tests).
     file_table: Option<FileTable>,
+    /// Reads column tags off the provider a scan was planned with. `None`
+    /// when not wired (unit tests), in which case every lookup goes to
+    /// `tag_source`.
+    scan_tags: Option<ScanTags>,
 }
+
+/// Column tags read off a scan's own provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanTagState {
+    /// Not a provider the hook knows; ask the `TagSource`.
+    NotRecognised,
+    /// The provider's tag property is unreadable. Refuse, as for a `None`
+    /// from the `TagSource`. Never fall back: the cache could hold an older,
+    /// readable value.
+    Unknown,
+    /// The provider's tags. Empty means the table carries no tags.
+    Known(HashMap<String, Vec<String>>),
+}
+
+impl ScanTagState {
+    /// Combine the states of two scans of the same table name. An unknown
+    /// state wins; known maps union, which can only add masks.
+    fn merge(self, other: ScanTagState) -> ScanTagState {
+        use ScanTagState::*;
+        match (self, other) {
+            (Unknown, _) | (_, Unknown) => Unknown,
+            (NotRecognised, s) | (s, NotRecognised) => s,
+            (Known(mut a), Known(b)) => {
+                for (column, tags) in b {
+                    let entry = a.entry(column).or_default();
+                    for tag in tags {
+                        if !entry.contains(&tag) {
+                            entry.push(tag);
+                        }
+                    }
+                }
+                Known(a)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod scan_tag_state_tests {
+    use super::ScanTagState::{self, *};
+    use std::collections::HashMap;
+
+    fn known(pairs: &[(&str, &[&str])]) -> ScanTagState {
+        Known(
+            pairs
+                .iter()
+                .map(|(c, ts)| (c.to_string(), ts.iter().map(|t| t.to_string()).collect()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn unknown_wins_over_everything() {
+        assert_eq!(known(&[("a", &["x"])]).merge(Unknown), Unknown);
+        assert_eq!(Unknown.merge(known(&[])), Unknown);
+        assert_eq!(NotRecognised.merge(Unknown), Unknown);
+    }
+
+    #[test]
+    fn not_recognised_yields_to_the_other_state() {
+        assert_eq!(NotRecognised.merge(known(&[])), known(&[]));
+        assert_eq!(known(&[]).merge(NotRecognised), known(&[]));
+        assert_eq!(NotRecognised.merge(NotRecognised), NotRecognised);
+    }
+
+    #[test]
+    fn known_maps_union_their_tags() {
+        let Known(got) = known(&[("a", &["x"]), ("b", &["y"])])
+            .merge(known(&[("a", &["x", "z"]), ("c", &["w"])]))
+        else {
+            panic!("two known states stay known");
+        };
+        let want: HashMap<String, Vec<String>> =
+            [("a", vec!["x", "z"]), ("b", vec!["y"]), ("c", vec!["w"])]
+                .into_iter()
+                .map(|(c, ts)| (c.to_string(), ts.into_iter().map(String::from).collect()))
+                .collect();
+        assert_eq!(got, want);
+    }
+}
+
+/// Reads column tags off a scan's provider. Injected because the Iceberg
+/// provider type lives in `sqe-catalog`.
+pub type ScanTags = fn(&dyn datafusion::catalog::TableProvider) -> ScanTagState;
 
 /// `(namespace, table)` a metadata TVF provider reads, `None` for any other
 /// provider. Injected because the TVF type lives in `sqe-catalog`.
@@ -80,7 +168,19 @@ impl PolicyPlanRewriter {
             hive_catalogs: Arc::new(HiveCatalogs::default()),
             metadata_target: None,
             file_table: None,
+            scan_tags: None,
         }
+    }
+
+    /// Inject the scan-provider tag reader. The Iceberg provider a scan was
+    /// planned with already holds the table's current properties, loaded
+    /// with the caller's token, so its tags are known even when the metadata
+    /// cache is disabled or has evicted the table (#842). Scans it does not
+    /// recognise still go to the `TagSource`.
+    #[must_use = "with_scan_tags consumes self; bind the returned rewriter"]
+    pub fn with_scan_tags(mut self, scan_tags: ScanTags) -> Self {
+        self.scan_tags = Some(scan_tags);
+        self
     }
 
     /// Inject the file table function lookup. A file carries no Iceberg
@@ -190,9 +290,22 @@ impl PolicyEnforcer for PolicyPlanRewriter {
         // is governed as a table.
         let mut file_scans: HashSet<String> = HashSet::new();
         let mut other_scans: HashSet<String> = HashSet::new();
+        // Tags read off each scan's provider, per scan name.
+        let mut scan_tag_states: HashMap<String, ScanTagState> = HashMap::new();
         plan.apply_with_subqueries(|node| {
             if let LogicalPlan::TableScan(scan) = node {
                 let table_name = scan.table_name.to_string();
+                let scan_tags = datafusion::datasource::source_as_provider(&scan.source)
+                    .ok()
+                    .zip(self.scan_tags)
+                    .map_or(ScanTagState::NotRecognised, |(provider, f)| {
+                        f(provider.as_ref())
+                    });
+                let merged = match scan_tag_states.remove(&table_name) {
+                    Some(seen) => seen.merge(scan_tags),
+                    None => scan_tags,
+                };
+                scan_tag_states.insert(table_name.clone(), merged);
                 let is_file = datafusion::datasource::source_as_provider(&scan.source)
                     .ok()
                     .zip(self.file_table)
@@ -366,10 +479,19 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                     // either, and a file has no Iceberg tags.
                     let file_scan =
                         file_scans.contains(table_name) && !other_scans.contains(table_name);
+                    // An Iceberg scan's own provider holds the properties
+                    // planning loaded for this query; only a scan the hook
+                    // does not recognise asks the tag source (#842).
                     let tag_lookup = if is_reserved_virtual_ref(table_ref) || file_scan {
                         Some(HashMap::new())
                     } else {
-                        tag_source.column_tags(catalog, &ns_path, table_ref.table())
+                        match scan_tag_states.get(table_name) {
+                            Some(ScanTagState::Known(tags)) => Some(tags.clone()),
+                            Some(ScanTagState::Unknown) => None,
+                            Some(ScanTagState::NotRecognised) | None => {
+                                tag_source.column_tags(catalog, &ns_path, table_ref.table())
+                            }
+                        }
                     };
 
                     match tag_lookup {

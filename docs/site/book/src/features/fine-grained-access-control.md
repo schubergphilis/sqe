@@ -146,7 +146,7 @@ Every failure mode denies rather than falling back to unfiltered data:
 | Condition | Behaviour |
 |---|---|
 | Ranger unreachable | Deny all rows. The circuit breaker opens, and enforcement resumes on its own once Ranger returns. |
-| Tag state unknown (the table's metadata is not in cache) | Refuse the statement with an `AccessDenied` error naming the table. Unknown is not the same as untagged: a mask might exist that SQE cannot see. An empty result would look like real data, so SQE does not return one. |
+| Tag state unknown (the table's `sqe.column-tags` property cannot be parsed; for an Iceberg table SQE reads it from the metadata loaded to plan the query, so a cold or disabled metadata cache does not cause this) | Refuse the statement with an `AccessDenied` error naming the table. Unknown is not the same as untagged: a mask might exist that SQE cannot see. An empty result would look like real data, so SQE does not return one. |
 | Mask type SQE cannot map, including a `CUSTOM` expression that fails to parse | Restrict the column. It is nullified in place, not dropped, so the query still plans. |
 
 Each of these is pinned by a test in `crates/sqe-coordinator/tests/it/access_control_e2e.rs` against a live Ranger, including one that stops the `ranger-admin` container mid-suite.
