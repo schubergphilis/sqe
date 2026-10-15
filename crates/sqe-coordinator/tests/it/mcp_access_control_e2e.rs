@@ -202,8 +202,17 @@ fn rows(body: &Value) -> Result<Vec<Value>, String> {
         .unwrap_or_default())
 }
 
+/// The `name` field of every row. Panics on a row without the field: indexing
+/// a missing key yields `null`, which once let a renamed column compare as an
+/// empty list and pass a parity check (#843).
 fn column(rows: &[Value], name: &str) -> Vec<Value> {
-    rows.iter().map(|r| r[name].clone()).collect()
+    rows.iter()
+        .map(|r| {
+            r.get(name)
+                .unwrap_or_else(|| panic!("row has no column {name:?}: {r}"))
+                .clone()
+        })
+        .collect()
 }
 
 fn read_sql(sql: &str) -> Value {
@@ -254,7 +263,7 @@ async fn mcp_reads_are_denied_for_the_ungranted_user_and_valid_for_the_admin() {
     )
     .await)
     .expect("list_tables as alice");
-    let mut mcp_names: Vec<String> = column(&via_mcp, "Table")
+    let mut mcp_names: Vec<String> = column(&via_mcp, "table_name")
         .into_iter()
         .filter_map(|v| v.as_str().map(str::to_string))
         .collect();
