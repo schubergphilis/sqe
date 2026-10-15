@@ -494,7 +494,11 @@ pub(crate) fn decompress_zip_to_ndjson(
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name().to_ascii_lowercase();
+        // zip 9 returns an error for an entry name that is not valid UTF-8.
+        let name = entry
+            .name()
+            .map_err(|e| DataFusionError::Plan(format!("{FN_NAME}: zip entry name: {e}")))?
+            .to_ascii_lowercase();
         if !(name.ends_with(".json") || name.ends_with(".jsonl") || name.ends_with(".ndjson")) {
             continue;
         }
