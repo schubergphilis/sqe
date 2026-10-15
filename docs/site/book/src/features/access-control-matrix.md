@@ -216,7 +216,7 @@ tag service definition never defines bare names.
 | Condition | Result | Proven |
 |---|---|---|
 | Ranger unreachable | deny all rows; enforcement resumes after recovery | Yes, by stopping the container mid-test |
-| Tag state unknown | deny all rows. Unknown is not "untagged" | Yes |
+| Tag state unknown | refuse the statement (`AccessDenied`, names the table). Unknown is not "untagged" | Yes |
 | Unmappable mask type, resource or tag | column restricted, never returned raw | Yes |
 | Tag carrying NO rule | **inert**: the column is returned raw | Yes |
 

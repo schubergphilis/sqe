@@ -1631,9 +1631,14 @@ async fn unknown_tag_state_denies() {
     // (UNKNOWN, not "no tags"), and the contract in tag_source.rs is that the
     // caller MUST fail closed: a mask or tag row filter might exist that we
     // cannot see, so treating unknown as untagged would silently skip a
-    // security control. plan_rewriter logs
-    // "Tag state unknown (cache miss or disabled); denying access" and injects a
-    // deny-all row filter.
+    // security control. plan_rewriter refuses the statement with an
+    // AccessDenied error naming the table (#840; it used to inject a deny-all
+    // row filter, which returned an empty result).
+    //
+    // The cold handler only stays cold because `SESSION_CONTEXT_CACHE` is
+    // process-global: it hands this handler the warm handler's cached
+    // session, whose table loads fill the warm handler's metadata cache, not
+    // this one. A production coordinator has one handler and one cache.
     //
     // This case rests on the cold handler staying cold for the ONE query below.
     // Do not "improve" `setup_ranger_handler` to pre-populate the table cache:
@@ -1641,30 +1646,24 @@ async fn unknown_tag_state_denies() {
     // exercising the contract. A test that needs a warm second handler should
     // ask for one explicitly with `setup_ranger_handler_sharing`.
     let (cold, _cache) = crate::common::setup_ranger_handler().await;
-    let denied = cold
-        .execute(&ctx.bob, &sql, None)
-        .await
-        .expect("the deny is a row filter, so the statement itself still succeeds");
+    let err = match cold.execute(&ctx.bob, &sql, None).await {
+        Ok(batches) => panic!(
+            "unknown tag state must refuse the statement, got {} rows: {:?}",
+            total_rows(&batches),
+            col_strings(&batches, "ssn")
+        ),
+        Err(e) => e,
+    };
     assert_eq!(
-        total_rows(&denied),
-        0,
-        "unknown tag state must deny, got {:?}",
-        col_strings(&denied, "ssn")
+        err.error_code(),
+        sqe_core::SqeErrorCode::AccessDenied,
+        "{err}"
     );
-
-    // The decisive check: nothing leaked through the deny.
-    for b in &denied {
-        for idx in 0..b.num_columns() {
-            let arr = b.column(idx);
-            for row in 0..b.num_rows() {
-                let v = crate::common::fmt_val(arr.as_ref(), row);
-                assert!(
-                    !v.contains("111-11-1111"),
-                    "raw ssn leaked while tag state was unknown: {v}"
-                );
-            }
-        }
-    }
+    assert!(err.to_string().contains("tag state unknown"), "{err}");
+    assert!(
+        !err.to_string().contains("111-11-1111"),
+        "the refusal must not carry row values: {err}"
+    );
 
     // The warm handler is unaffected: the deny is per-scan, not global state.
     let after = exec_ok(&ctx, &ctx.bob, &sql).await;

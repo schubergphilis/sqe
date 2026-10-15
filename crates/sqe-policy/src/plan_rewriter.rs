@@ -374,21 +374,29 @@ impl PolicyEnforcer for PolicyPlanRewriter {
 
                     match tag_lookup {
                         // Tag state UNKNOWN (cache miss / disabled cache /
-                        // unreadable metadata). Fail CLOSED exactly like the
-                        // resolve-failure path below: a tag mask or tag
-                        // row-filter may exist that we cannot see, so denying
-                        // is the only safe answer. Skipping tag work here would
-                        // silently bypass a security control.
+                        // unreadable metadata). Fail CLOSED: a tag mask or tag
+                        // row-filter may exist that we cannot see, so the scan
+                        // must not run. Skipping tag work here would silently
+                        // bypass a security control. Refuse the statement
+                        // rather than inject `lit(false)`: a deny-all row
+                        // filter returned an empty result that a client (or a
+                        // CTAS) took for real data, with only a WARN to show
+                        // for it (#840).
                         None => {
                             warn!(
                                 user = %username,
                                 table = %table_name,
                                 namespace = %namespace,
-                                "Tag state unknown (cache miss or disabled); denying access"
+                                "Tag state unknown (cache miss or disabled); refusing the statement"
                             );
-                            let mut deny = ResolvedPolicy::default();
-                            deny.row_filters.push(lit(false));
-                            policy = deny;
+                            return Err(sqe_core::error::SqeError::with_code(
+                                sqe_core::SqeErrorCode::AccessDenied,
+                                format!(
+                                    "tag state unknown for table {table_name}: its column \
+                                     tags could not be read, so the statement was refused \
+                                     rather than run without its tag policies"
+                                ),
+                            ));
                         }
                         // Known: at least one column carries tags. Resolve tag
                         // policies and merge them into the resolved policy.
@@ -2597,11 +2605,21 @@ mod tests {
         let rewriter = PolicyPlanRewriter::new(Arc::new(InMemoryPolicyStore::new()))
             .with_tag_source(Arc::new(UnknownTags))
             .with_file_table(file_table);
+        // Denied either by a deny-all row filter (the un-inlined view) or by
+        // the unknown-tag-state refusal (#840).
         let denied = |plan: LogicalPlan| {
             let rewriter = &rewriter;
             let scope = &scope;
             let user = &user;
-            async move { rewriter.evaluate(user, scope, plan).await.unwrap().1.denied }
+            async move {
+                match rewriter.evaluate(user, scope, plan).await {
+                    Ok((_, summary)) => summary.denied,
+                    Err(e) => {
+                        assert!(e.to_string().contains("tag state unknown"), "{e}");
+                        true
+                    }
+                }
+            }
         };
 
         assert!(
