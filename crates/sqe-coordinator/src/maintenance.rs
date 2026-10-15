@@ -573,7 +573,7 @@ impl MaintenanceHandler {
         info!(
             user = %session.user.username,
             table = %ident,
-            metadata_location = metadata_location,
+            metadata_location = %location_for_log(metadata_location),
             "register_table: requesting catalog registration"
         );
 
@@ -3028,6 +3028,24 @@ fn rewrite_outcome_batch(
     )
 }
 
+/// A caller-supplied location as it may appear in INFO logs (#837): scheme
+/// and bucket, then a short hash of the rest. The path can carry a bucket
+/// layout the operator keeps out of shared logs, and a query string (a
+/// presigned URL) can carry credentials, so neither is logged.
+fn location_for_log(location: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let without_query = location.split(['?', '#']).next().unwrap_or("");
+    let hash = hex::encode(&Sha256::digest(without_query.as_bytes())[..6]);
+    match without_query.split_once("://") {
+        Some((scheme, rest)) => {
+            let bucket = rest.split('/').next().unwrap_or("");
+            format!("{scheme}://{bucket}/<path sha256:{hash}>")
+        }
+        None => format!("<path sha256:{hash}>"),
+    }
+}
+
 /// Strip a single trailing `/` if present so two locations that differ only
 /// by trailing slash compare equal.
 fn strip_trailing_slash(s: &str) -> String {
@@ -3407,6 +3425,47 @@ impl RewriteRaceSeam {
             go: tokio::sync::Notify::new(),
             fired: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+}
+
+#[cfg(test)]
+mod location_log_tests {
+    use super::location_for_log;
+
+    #[test]
+    fn keeps_scheme_and_bucket_and_hides_the_path() {
+        let logged = location_for_log("s3://lake/wh/sales/orders/metadata/00001-abc.metadata.json");
+        assert!(logged.starts_with("s3://lake/<path sha256:"), "{logged}");
+        assert!(!logged.contains("sales"), "{logged}");
+        assert!(!logged.contains("metadata.json"), "{logged}");
+    }
+
+    #[test]
+    fn drops_a_presigned_query_string() {
+        let logged = location_for_log(
+            "https://lake.s3.amazonaws.com/wh/t/m.json?X-Amz-Credential=AKIA123&X-Amz-Signature=deadbeef",
+        );
+        assert!(
+            logged.starts_with("https://lake.s3.amazonaws.com/<path sha256:"),
+            "{logged}"
+        );
+        assert!(!logged.contains("X-Amz"), "{logged}");
+        assert!(!logged.contains("AKIA123"), "{logged}");
+    }
+
+    #[test]
+    fn different_paths_hash_differently_and_the_same_path_stably() {
+        let a = location_for_log("s3://lake/wh/a/m.json");
+        let b = location_for_log("s3://lake/wh/b/m.json");
+        assert_ne!(a, b);
+        assert_eq!(a, location_for_log("s3://lake/wh/a/m.json"));
+    }
+
+    #[test]
+    fn a_location_without_a_scheme_is_fully_hashed() {
+        let logged = location_for_log("/local/wh/t/metadata/v1.metadata.json");
+        assert!(logged.starts_with("<path sha256:"), "{logged}");
+        assert!(!logged.contains("local"), "{logged}");
     }
 }
 
