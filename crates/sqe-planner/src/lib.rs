@@ -8,7 +8,7 @@
 //! - morsel planning over files and row groups ([`plan_scan_morsels`],
 //!   [`bin_pack_files`]);
 //! - the coordinator's physical optimizer rules: [`JoinStrategyRule`],
-//!   [`StarSchemaReorderRule`], [`SortMemoryRule`],
+//!   [`StarSchemaReorderRule`], [`SortMemoryRule`], [`CartesianAdmissionRule`],
 //!   [`SingleDistinctCountCompanionRule`] and [`PuffinStatisticsRequestRule`];
 //! - the coordinator/worker protocol types ([`WorkerHello`], [`WorkerFault`]).
 //!
@@ -19,6 +19,7 @@
 //! deleted on 2026-09-11 (issue #551); git history before that date keeps
 //! them.
 
+pub mod cartesian_admission;
 pub mod join_strategy;
 pub mod scan_morsel;
 pub mod scan_task;
@@ -31,6 +32,7 @@ pub mod stats;
 pub mod worker_fault;
 pub mod worker_protocol;
 
+pub use cartesian_admission::CartesianAdmissionRule;
 pub use join_strategy::{BuildSizeEstimate, JoinStrategyRule, DEFAULT_HASH_JOIN_THRESHOLD};
 pub use scan_morsel::{SCAN_TASK_VERSION_V3, SCAN_TASK_VERSION_V4};
 pub use scan_morsel::{
