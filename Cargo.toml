@@ -30,7 +30,15 @@ members = [
     "xtask",
 ]
 # Exclude vendored trees. They are referenced via path / [patch], not members.
-exclude = ["vendor/iceberg-rust", "vendor/datafusion-iceberg", "vendor/sqlite-rs", "vendor/object_store"]
+# `playground` is a wasm32-only cdylib. As a member it would drag a wasm
+# target and its own DataFusion feature set into every `cargo build --all`.
+exclude = [
+    "vendor/iceberg-rust",
+    "vendor/datafusion-iceberg",
+    "vendor/sqlite-rs",
+    "vendor/object_store",
+    "playground",
+]
 
 [workspace.package]
 version = "0.51.0"
