@@ -2109,7 +2109,22 @@ impl QueryHandler {
                             }
                             _ => false,
                         };
-                    if !routed_to_hive {
+                    let purge = matches!(stmt.as_ref(), Statement::Drop { purge: true, .. });
+                    if !routed_to_hive && purge {
+                        // `PURGE` runs `system.drop_table(purge => true)`
+                        // through the procedure entry (#841), so it takes the
+                        // same admin gate, shared-location refusal and purge
+                        // audit as the CALL. A catalog DROP grant alone drops
+                        // without PURGE.
+                        if let Some(table) = self.catalog_ops.purge_target(session, stmt).await? {
+                            let call = sqe_sql::ProcedureCall::DropTable { table, purge: true };
+                            let purged = self.maintenance_handler.handle(session, &call).await;
+                            purged.map_err(sql_purge_denial)?;
+                            if let Some(ref qcache) = self.query_cache {
+                                qcache.invalidate_all();
+                            }
+                        }
+                    } else if !routed_to_hive {
                         self.catalog_ops.drop_table(session, stmt).await?;
                     }
                     crate::session_context::invalidate_session_cache(&session.user.username).await;
@@ -9411,6 +9426,22 @@ fn info_schema_columns_query(table_name: &str) -> String {
 /// DataFusion's own planner treats one.
 fn table_reference_of(name: &sqlparser::ast::ObjectName) -> TableReference {
     TableReference::from(name.to_string())
+}
+
+/// Reword the procedure's admin-gate denial for a SQL `DROP TABLE ... PURGE`
+/// caller, who never wrote a CALL (#841). Other errors pass through.
+fn sql_purge_denial(e: SqeError) -> SqeError {
+    if e.error_code() != SqeErrorCode::AccessDenied {
+        return e;
+    }
+    SqeError::with_code(
+        SqeErrorCode::AccessDenied,
+        format!(
+            "DROP TABLE ... PURGE deletes the table's files and needs an admin role, as \
+             CALL system.drop_table(purge => true) does; drop without PURGE to keep them. \
+             Nothing was dropped. ({e})"
+        ),
+    )
 }
 
 /// Checks `table_name` (a catalog-qualified reference, either an

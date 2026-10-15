@@ -168,7 +168,7 @@ object and a later implementation, or another engine, can honour it.
 
 | Statement | Origin | Notes |
 |---|---|---|
-| `DROP TABLE [IF EXISTS] t` | `sqlparser-rs` + `sqe-coordinator` | Removes the table from the catalog and keeps its data files. `DROP TABLE ... PURGE` is refused with `NotSupported` and drops nothing; delete the data with `CALL system.drop_table(table => 't', purge => true)`. Hive tables refuse `PURGE` as well. |
+| `DROP TABLE [IF EXISTS] t [PURGE]` | `sqlparser-rs` + `sqe-coordinator` | Removes the table from the catalog and keeps its data files. `PURGE` also deletes everything under the table's location once the catalog drop succeeds; it runs `CALL system.drop_table(table => 't', purge => true)`, so it needs an admin role (`auth.admin_roles`) and is refused, with nothing dropped, when another table shares the location. Hive tables refuse `PURGE`. |
 | `DROP VIEW [IF EXISTS] v` | `sqlparser-rs` + `sqe-coordinator` | Standard. |
 | `DROP SCHEMA [IF EXISTS] s [CASCADE\|RESTRICT]` | `sqlparser-rs` + `sqe-coordinator` | `CASCADE` drops contained tables. |
 
