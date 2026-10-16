@@ -11,12 +11,12 @@ Snowflake and Spark also map well via the Trino layer.
 
 | Function | Origin | Notes | Trino | Snowflake | Spark SQL | DuckDB |
 |---|---|---|---|---|---|---|
-| `now()` | `sqe-trino-functions` | Returns `TIMESTAMP(6)`. Stable within one query. `trino_functions.rs:55` | `now` | `current_timestamp` | `now` / `current_timestamp` | `now` / `current_timestamp` |
+| `now()` | `sqe-trino-functions` | Returns `TIMESTAMP(6)`. Folded to the query start time, so every clock call in one statement returns the same instant. `trino_functions.rs:55` | `now` | `current_timestamp` | `now` / `current_timestamp` | `now` / `current_timestamp` |
 | `current_timestamp` | `sqe-trino-functions` | Alias of `now()`: same function, same `TIMESTAMP(6)` type. SQL keyword, no parens. | `current_timestamp` | `current_timestamp` | `current_timestamp` | `current_timestamp` |
 | `current_date` | `datafusion-builtin` | Today's date in session timezone. | `current_date` | `current_date` | `current_date` | `current_date` |
 | `current_time` | `datafusion-builtin` | Current wall-clock time. | `current_time` | `current_time` | `current_time` | `current_time` |
 | `localtime()` | `sqe-trino-functions` | Local time-of-day. Returns `TIME(6)`. `trino_functions.rs:64` | `localtime` | - | - | - |
-| `localtimestamp()` | `sqe-trino-functions` | Local timestamp without offset. Returns `TIMESTAMP(6)`. `trino_functions.rs:65` | `localtimestamp` | - | - | - |
+| `localtimestamp()` | `sqe-trino-functions` | Local timestamp without offset. Returns `TIMESTAMP(6)`, the query start time like `now()`. `trino_functions.rs:65` | `localtimestamp` | - | - | - |
 | `current_timezone()` | `sqe-trino-functions (ext)` | Returns the session timezone string. `trino_functions_ext.rs:41` | `current_timezone` | - | `current_timezone` | - |
 | `make_date(year, month, day)` | `datafusion-builtin` | Construct a `DATE`. | - | `date_from_parts` | `make_date` | `make_date` |
 
@@ -86,9 +86,9 @@ Two parallel formatting families:
 | `date_parse(str, fmt)` | `sqe-trino-functions` | Inverse of `date_format`. Returns `TIMESTAMP(6)`. `trino_functions.rs:52` | `date_parse` | `to_timestamp` | `to_timestamp` | `strptime` |
 | `format_datetime(d, fmt)` | `sqe-trino-functions (ext)` | Java / Joda specifiers (`yyyy-MM-dd HH:mm:ss`). `trino_functions_ext.rs:54` | `format_datetime` | - | `date_format` | - |
 | `parse_datetime(str, fmt)` | `sqe-trino-functions (ext)` | Inverse of `format_datetime`. `trino_functions_ext.rs:55` | `parse_datetime` | - | `to_timestamp` | - |
-| `to_iso8601(d)` | `sqe-trino-functions (ext)` | RFC 3339 / ISO 8601 string. `trino_functions_ext.rs:40` | `to_iso8601` | - | - | - |
+| `to_iso8601(d)` | `sqe-trino-functions (ext)` | RFC 3339 / ISO 8601 string. A timestamp without a zone has no designator (`2024-01-02T03:04:05`, as in Trino); a zoned one ends in its offset. The fraction appears only when non-zero, in 3, 6 or 9 digits, where Trino pads to the declared precision. `trino_functions_ext.rs:40` | `to_iso8601` | - | - | - |
 | `from_iso8601_date(str)` | `sqe-trino-functions (ext)` | ISO 8601 -> `DATE`. `trino_functions_ext.rs:38` | `from_iso8601_date` | - | - | - |
-| `from_iso8601_timestamp(str)` | `sqe-trino-functions (ext)` | ISO 8601 -> `TIMESTAMP(6)`. `trino_functions_ext.rs:39` | `from_iso8601_timestamp` | - | - | - |
+| `from_iso8601_timestamp(str)` | `sqe-trino-functions (ext)` | ISO 8601 -> `TIMESTAMP(6)`. Reads a `Z`, `+hh`, `+hhmm` or `+hh:mm` designator and returns that instant as UTC wall clock; no designator means UTC. Accepts `T` or a space, `hh:mm` without seconds and a bare date (midnight). `trino_functions_ext.rs:39` | `from_iso8601_timestamp` | - | - | - |
 | `to_char(d, fmt)` | `datafusion-builtin` | Postgres-style. Specifiers differ from Trino's `date_format`. | - | `to_char` | `date_format` | `strftime` |
 | `to_date(str [, fmt])` | `datafusion-builtin` | Parse to `DATE`. | - | `to_date` | `to_date` | `strptime` |
 | `to_timestamp(str [, fmt])` | `datafusion-builtin` | Parse to `TIMESTAMP`. | `parse_datetime` | `to_timestamp` | `to_timestamp` | `strptime` |
