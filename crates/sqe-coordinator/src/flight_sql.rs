@@ -573,6 +573,23 @@ fn client_transaction_of(session: &sqe_core::Session) -> Option<String> {
         .flatten()
 }
 
+/// The IPC bytes a statement's `FlightInfo` (or prepared-statement result)
+/// advertises for `schema`. A schema with no fields is what
+/// `QueryHandler::get_schema` returns for statements whose columns are only
+/// known at execution (SHOW, DESCRIBE, EXPLAIN, DDL), so it is sent as no
+/// schema at all: an encoded zero-field schema made ADBC refuse the stream
+/// DoGet then sent ("endpoint 0 returned inconsistent schema"), while an
+/// unset one lets the client take the stream's own.
+fn advertised_schema_bytes(schema: &arrow_schema::Schema) -> Result<bytes::Bytes, Status> {
+    if schema.fields().is_empty() {
+        return Ok(bytes::Bytes::new());
+    }
+    Ok(FlightInfo::new()
+        .try_with_schema(schema)
+        .map_err(|e| Status::internal(format!("Failed to encode schema: {e}")))?
+        .schema)
+}
+
 /// What a redeemed ticket resolves to.
 enum ResolvedStatement {
     /// Ad-hoc SQL text (`GetFlightInfo(CommandStatementQuery)` or a legacy
@@ -1541,13 +1558,14 @@ impl FlightSqlService for SqeFlightSqlService {
             app_metadata: vec![].into(),
         };
 
-        let info = FlightInfo::new()
-            .try_with_schema(&schema)
-            .map_err(|e| Status::internal(format!("Failed to encode schema: {e}")))?
-            .with_descriptor(FlightDescriptor::new_cmd(vec![]))
-            .with_endpoint(endpoint)
-            .with_total_records(-1)
-            .with_ordered(false);
+        let info = FlightInfo {
+            schema: advertised_schema_bytes(&schema)?,
+            ..FlightInfo::new()
+        }
+        .with_descriptor(FlightDescriptor::new_cmd(vec![]))
+        .with_endpoint(endpoint)
+        .with_total_records(-1)
+        .with_ordered(false);
 
         Ok(Response::new(info))
     }
@@ -1921,12 +1939,13 @@ impl FlightSqlService for SqeFlightSqlService {
             app_metadata: vec![].into(),
         };
 
-        let info = FlightInfo::new()
-            .try_with_schema(&schema)
-            .map_err(|e| Status::internal(format!("Failed to encode schema: {e}")))?
-            .with_descriptor(FlightDescriptor::new_cmd(vec![]))
-            .with_endpoint(endpoint)
-            .with_total_records(-1);
+        let info = FlightInfo {
+            schema: advertised_schema_bytes(&schema)?,
+            ..FlightInfo::new()
+        }
+        .with_descriptor(FlightDescriptor::new_cmd(vec![]))
+        .with_endpoint(endpoint)
+        .with_total_records(-1);
 
         Ok(Response::new(info))
     }
@@ -2554,12 +2573,9 @@ impl FlightSqlService for SqeFlightSqlService {
             "Prepared statement stored"
         );
 
-        // Encode both schemas as IPC for the result. FlightInfo's
-        // try_with_schema produces the encoded bytes.
-        let dataset_schema = FlightInfo::new()
-            .try_with_schema(&dataset_schema)
-            .map_err(|e| Status::internal(format!("Failed to encode schema: {e}")))?
-            .schema;
+        // Encode both schemas as IPC for the result; an empty one is sent
+        // as no schema (see `advertised_schema_bytes`).
+        let dataset_schema = advertised_schema_bytes(&dataset_schema)?;
         let parameter_schema = if parameter_schema.fields().is_empty() {
             Default::default()
         } else {
