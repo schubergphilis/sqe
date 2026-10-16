@@ -30,17 +30,19 @@ const TOKEN_EXPIRY_SAFETY_MARGIN: Duration = Duration::from_secs(30);
 /// precedent in commit c3c5431.
 fn validate_url_identifier(value: &str, what: &str) -> sqe_core::Result<()> {
     if value.is_empty() {
-        return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
-            "{what} must not be empty"
-        )));
+        return Err(sqe_core::SqeError::with_code(
+            sqe_core::SqeErrorCode::ExecutionFailed,
+            format!("{what} must not be empty"),
+        ));
     }
     if let Some(bad) = value
         .chars()
         .find(|c| matches!(c, '/' | '?' | '#' | '%' | '\\') || c.is_whitespace() || c.is_control())
     {
-        return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
-            "{what} '{value}' contains invalid character {bad:?}"
-        )));
+        return Err(sqe_core::SqeError::with_code(
+            sqe_core::SqeErrorCode::ExecutionFailed,
+            format!("{what} '{value}' contains invalid character {bad:?}"),
+        ));
     }
     Ok(())
 }
@@ -287,7 +289,8 @@ impl GrantBackend for PolarisGrantBackend {
     async fn grant(&self, token: &str, stmt: &GrantStatement) -> sqe_core::Result<()> {
         let token = self.resolve_token(token).await?;
         let catalog = stmt.catalog.as_deref().ok_or_else(|| {
-            sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
+            sqe_core::SqeError::with_code(
+                sqe_core::SqeErrorCode::ExecutionFailed,
                 "Polaris GRANT requires a catalog name (use catalog.namespace.table)",
             )
         })?;
@@ -320,16 +323,20 @@ impl GrantBackend for PolarisGrantBackend {
             .send()
             .await
             .map_err(|e| {
-                sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Polaris management API request failed: {e}"))
+                sqe_core::SqeError::with_code(
+                    sqe_core::SqeErrorCode::ExecutionFailed,
+                    format!("Polaris management API request failed: {e}"),
+                )
             })?;
 
         if !resp.status().is_success() && resp.status().as_u16() != 409 {
             let status = resp.status();
             let text = super::response_body_or_unreadable(resp).await;
             warn!(http_status = %status, catalog_role = %cr_name, polaris_body = %text, "Failed to create catalog role");
-            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
-                "Failed to create catalog role '{cr_name}' (HTTP {status})"
-            )));
+            return Err(sqe_core::SqeError::with_code(
+                sqe_core::SqeErrorCode::ExecutionFailed,
+                format!("Failed to create catalog role '{cr_name}' (HTTP {status})"),
+            ));
         }
 
         // Step 2: Grant privilege to catalog role
@@ -353,16 +360,20 @@ impl GrantBackend for PolarisGrantBackend {
             .send()
             .await
             .map_err(|e| {
-                sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Polaris management API request failed: {e}"))
+                sqe_core::SqeError::with_code(
+                    sqe_core::SqeErrorCode::ExecutionFailed,
+                    format!("Polaris management API request failed: {e}"),
+                )
             })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = super::response_body_or_unreadable(resp).await;
             warn!(http_status = %status, catalog_role = %cr_name, polaris_body = %text, "Failed to grant privilege to catalog role");
-            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
-                "Failed to grant privilege to catalog role '{cr_name}' (HTTP {status})"
-            )));
+            return Err(sqe_core::SqeError::with_code(
+                sqe_core::SqeErrorCode::ExecutionFailed,
+                format!("Failed to grant privilege to catalog role '{cr_name}' (HTTP {status})"),
+            ));
         }
 
         // Step 3: Assign catalog role to principal role
@@ -382,7 +393,10 @@ impl GrantBackend for PolarisGrantBackend {
             .send()
             .await
             .map_err(|e| {
-                sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Polaris management API request failed: {e}"))
+                sqe_core::SqeError::with_code(
+                    sqe_core::SqeErrorCode::ExecutionFailed,
+                    format!("Polaris management API request failed: {e}"),
+                )
             })?;
 
         if !resp.status().is_success() {
@@ -408,7 +422,8 @@ impl GrantBackend for PolarisGrantBackend {
     async fn revoke(&self, token: &str, stmt: &RevokeStatement) -> sqe_core::Result<()> {
         let token = self.resolve_token(token).await?;
         let catalog = stmt.catalog.as_deref().ok_or_else(|| {
-            sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
+            sqe_core::SqeError::with_code(
+                sqe_core::SqeErrorCode::ExecutionFailed,
                 "Polaris REVOKE requires a catalog name (use catalog.namespace.table)",
             )
         })?;
@@ -448,16 +463,20 @@ impl GrantBackend for PolarisGrantBackend {
             .send()
             .await
             .map_err(|e| {
-                sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Polaris management API request failed: {e}"))
+                sqe_core::SqeError::with_code(
+                    sqe_core::SqeErrorCode::ExecutionFailed,
+                    format!("Polaris management API request failed: {e}"),
+                )
             })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = super::response_body_or_unreadable(resp).await;
             warn!(http_status = %status, catalog_role = %cr_name, polaris_body = %text, "Failed to revoke privilege from catalog role");
-            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
-                "Failed to revoke privilege from catalog role '{cr_name}' (HTTP {status})"
-            )));
+            return Err(sqe_core::SqeError::with_code(
+                sqe_core::SqeErrorCode::ExecutionFailed,
+                format!("Failed to revoke privilege from catalog role '{cr_name}' (HTTP {status})"),
+            ));
         }
 
         debug!(
@@ -485,7 +504,8 @@ impl GrantBackend for PolarisGrantBackend {
                 table,
             } => {
                 let catalog = catalog.as_deref().ok_or_else(|| {
-                    sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
+                    sqe_core::SqeError::with_code(
+                        sqe_core::SqeErrorCode::ExecutionFailed,
                         "Polaris SHOW GRANTS ON requires a catalog name",
                     )
                 })?;
@@ -500,24 +520,27 @@ impl GrantBackend for PolarisGrantBackend {
                     .send()
                     .await
                     .map_err(|e| {
-                        sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
-                            "Polaris management API request failed: {e}"
-                        ))
+                        sqe_core::SqeError::with_code(
+                            sqe_core::SqeErrorCode::ExecutionFailed,
+                            format!("Polaris management API request failed: {e}"),
+                        )
                     })?;
 
                 if !resp.status().is_success() {
                     let status = resp.status();
                     let text = super::response_body_or_unreadable(resp).await;
                     warn!(http_status = %status, polaris_body = %text, "Failed to list catalog roles");
-                    return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
-                        "Failed to list catalog roles (HTTP {status})"
-                    )));
+                    return Err(sqe_core::SqeError::with_code(
+                        sqe_core::SqeErrorCode::ExecutionFailed,
+                        format!("Failed to list catalog roles (HTTP {status})"),
+                    ));
                 }
 
                 let roles: ListCatalogRolesResponse = resp.json().await.map_err(|e| {
-                    sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
-                        "Failed to parse catalog roles response: {e}"
-                    ))
+                    sqe_core::SqeError::with_code(
+                        sqe_core::SqeErrorCode::ExecutionFailed,
+                        format!("Failed to parse catalog roles response: {e}"),
+                    )
                 })?;
 
                 let mut entries = Vec::new();
@@ -533,9 +556,10 @@ impl GrantBackend for PolarisGrantBackend {
                         .send()
                         .await
                         .map_err(|e| {
-                            sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
-                                "Polaris management API request failed: {e}"
-                            ))
+                            sqe_core::SqeError::with_code(
+                                sqe_core::SqeErrorCode::ExecutionFailed,
+                                format!("Polaris management API request failed: {e}"),
+                            )
                         })?;
 
                     if !resp.status().is_success() {
@@ -622,7 +646,10 @@ impl GrantBackend for PolarisGrantBackend {
             .send()
             .await
             .map_err(|e| {
-                sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Polaris management API request failed: {e}"))
+                sqe_core::SqeError::with_code(
+                    sqe_core::SqeErrorCode::ExecutionFailed,
+                    format!("Polaris management API request failed: {e}"),
+                )
             })?;
 
         if !resp.status().is_success() {
@@ -634,13 +661,17 @@ impl GrantBackend for PolarisGrantBackend {
             }
             let text = super::response_body_or_unreadable(resp).await;
             warn!(http_status = %status, user = %user, polaris_body = %text, "Failed to list principal roles");
-            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
-                "Failed to list principal roles for '{user}' (HTTP {status})"
-            )));
+            return Err(sqe_core::SqeError::with_code(
+                sqe_core::SqeErrorCode::ExecutionFailed,
+                format!("Failed to list principal roles for '{user}' (HTTP {status})"),
+            ));
         }
 
         let principal_roles: ListPrincipalRolesResponse = resp.json().await.map_err(|e| {
-            sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Failed to parse principal roles response: {e}"))
+            sqe_core::SqeError::with_code(
+                sqe_core::SqeErrorCode::ExecutionFailed,
+                format!("Failed to parse principal roles response: {e}"),
+            )
         })?;
 
         // Step 2+3: For each principal-role, get catalog-role assignments
@@ -658,9 +689,10 @@ impl GrantBackend for PolarisGrantBackend {
                 .send()
                 .await
                 .map_err(|e| {
-                    sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
-                        "Polaris management API request failed: {e}"
-                    ))
+                    sqe_core::SqeError::with_code(
+                        sqe_core::SqeErrorCode::ExecutionFailed,
+                        format!("Polaris management API request failed: {e}"),
+                    )
                 })?;
 
             if !resp.status().is_success() {
@@ -759,7 +791,8 @@ impl GrantBackend for PolarisGrantBackend {
         // name the resource explicitly rather than fall back to "any grant
         // with this privilege name", which would be fail-open.
         let catalog = check.catalog.as_deref().ok_or_else(|| {
-            sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
+            sqe_core::SqeError::with_code(
+                sqe_core::SqeErrorCode::ExecutionFailed,
                 "Polaris check_access requires a catalog; use catalog.namespace.table",
             )
         })?;

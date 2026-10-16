@@ -58,12 +58,12 @@ Runs **before** `DistributedSortRule` in the physical optimizer chain (no point 
 for each SortExec node in the physical plan:
     if sort has LIMIT (fetch != None):
         KEEP — TopK is cheap, don't strip
-    
+
     partition_cols = walk input subtree → find IcebergScanExec → extract partition column names
     sort_cols = extract column names from SortExec.expr()
-    
+
     is_partition_sort = all sort_cols are in partition_cols
-    
+
     match (sort_mode, pressure, is_partition_sort):
         (strict, _, _)                    → KEEP
         (partition_only, _, true)          → KEEP
@@ -71,7 +71,7 @@ for each SortExec node in the physical plan:
         (adaptive, Green, _)              → KEEP
         (adaptive, Yellow|Orange|Red, true)  → KEEP
         (adaptive, Yellow|Orange|Red, false) → STRIP
-    
+
     STRIP means: replace SortExec with its input child
 ```
 
@@ -106,8 +106,8 @@ When a sort is stripped, the user must understand *what happened* and *what to d
 Attached to the query result as a gRPC trailing metadata header:
 
 ```
-x-sqe-warning: ORDER BY [column_name, ...] was removed due to memory pressure 
-  (sort_mode=adaptive, pressure=yellow). Results are returned in partition order. 
+x-sqe-warning: ORDER BY [column_name, ...] was removed due to memory pressure
+  (sort_mode=adaptive, pressure=yellow). Results are returned in partition order.
   To force sorting, set sort_mode=strict or remove ORDER BY if ordering is not required.
 ```
 
@@ -122,7 +122,7 @@ Server under memory pressure (>95% utilized). Please retry later.
 Replace with an actionable message:
 
 ```
-Query rejected: server memory is >95% utilized. Your query includes ORDER BY 
+Query rejected: server memory is >95% utilized. Your query includes ORDER BY
 [col1, col2] which requires sort buffers. Options:
   1. Remove ORDER BY from your query (data returns in partition order)
   2. Add LIMIT to reduce sort memory (e.g., ORDER BY col1 LIMIT 1000)
@@ -133,8 +133,8 @@ Query rejected: server memory is >95% utilized. Your query includes ORDER BY
 ### Log Entry (WARN)
 
 ```
-WARN sort_stripped{query_id=abc123 user=jacob}: 
-  Stripped ORDER BY [col1, col2] — non-partition columns, pressure=yellow, sort_mode=adaptive. 
+WARN sort_stripped{query_id=abc123 user=jacob}:
+  Stripped ORDER BY [col1, col2] — non-partition columns, pressure=yellow, sort_mode=adaptive.
   Partition columns: [year, month]. Consider removing ORDER BY or adding LIMIT.
 ```
 

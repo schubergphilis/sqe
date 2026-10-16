@@ -98,7 +98,7 @@ BENCH_ENV       = PROFILE=$(BENCH_PROFILE) BENCH_LOG_DIR=$(BENCH_LOG_DIR)
         audit audit-advisories deps-check lock-maintenance dbt-sqe-lock metrics-layering-check \
         audit-deny audit-licenses \
         benchmark_all benchmark_all_trino \
-        clippy fmt fmt-check pre-commit clean clean-rust clean-rustbook \
+        clippy fmt fmt-check pre-commit pre-commit-all clean clean-rust clean-rustbook \
         clean-ebook clean-benchmark-charts clean-images check-tools maintain \
         build build-sqe sbom sbom-sqe sqe-config images \
         login buildx-builder push push-sqe leak-scan
@@ -123,7 +123,8 @@ help:
 	@echo "    make clippy       cargo clippy --all-targets -- -D warnings"
 	@echo "    make fmt          cargo fmt --all"
 	@echo "    make fmt-check    cargo fmt --all --check"
-	@echo "    make pre-commit   gitleaks + file checks (Aikido .pre secret-scan analog)"
+	@echo "    make pre-commit   commit hooks on staged files: gitleaks, rustfmt ratchet, supply chain, shellcheck"
+	@echo "    make pre-commit-all  every hook on every file, clippy included"
 	@echo ""
 	@echo "  Supply chain:"
 	@echo "    make audit        cargo audit + cargo deny check (advisories, bans, sources)"
@@ -399,11 +400,18 @@ fmt-check:
 	@echo "==> Checking formatting"
 	$(CARGO) fmt --all --check
 
-# Local analog of Aikido aikido-secret-scan (gitleaks via .pre-commit-config.yaml).
+# The hooks in .pre-commit-config.yaml: gitleaks (Aikido aikido-secret-scan
+# analog), file hygiene, a rustfmt ratchet, supply-chain checks on dependency
+# changes, shellcheck, and clippy at pre-push.
 # Requires `pre-commit` on PATH (`pipx install pre-commit` / `brew install pre-commit`).
 pre-commit:
 	@echo "==> Running pre-commit hooks"
 	pre-commit run
+
+pre-commit-all:
+	@echo "==> Running every pre-commit hook on every file"
+	pre-commit run --all-files
+	pre-commit run --all-files --hook-stage pre-push
 
 # ── Container image: build / SBOM / config / push ─────────────────────────
 # Build context is the repo root (the Dockerfile COPYs Cargo.toml, crates/,
@@ -541,7 +549,7 @@ clean-images:
 # ── Diagnostics ───────────────────────────────────────────────────────────
 check-tools:
 	@echo "==> Checking required tools"
-	@for tool in cargo rustc cargo-audit cargo-deny mdbook mdbook-mermaid pandoc d2 mmdc; do \
+	@for tool in cargo rustc pre-commit cargo-audit cargo-deny cargo-hakari cargo-machete mdbook mdbook-mermaid pandoc d2 mmdc; do \
 		if command -v $$tool >/dev/null 2>&1; then \
 			printf "  [ok]  %-18s %s\n" "$$tool" "$$(command -v $$tool)"; \
 		else \
@@ -550,6 +558,7 @@ check-tools:
 	done
 	@echo ""
 	@echo "  audit needs:     cargo-audit, cargo-deny"
+	@echo "  pre-commit needs: pre-commit, cargo-audit, cargo-deny, cargo-hakari, cargo-machete"
 	@echo "  rustbook needs:  mdbook, mdbook-mermaid"
 	@echo "  ebook needs:     pandoc, pandoc-crossref, d2, mmdc, xelatex (or weasyprint)"
 	@echo "  ebook PDF needs: rsvg-convert (librsvg) or cairosvg for SVG -> PDF"

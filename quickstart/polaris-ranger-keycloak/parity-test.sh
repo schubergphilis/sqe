@@ -28,7 +28,7 @@
 # MISSING_ATTRIBUTES (#6889) on a row filter over an unprojected column, so the
 # Ranger bootstrap seeds NO row filter (see ranger/bootstrap-ranger.sh).
 set -uo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit 1
 
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
@@ -81,6 +81,9 @@ fi
 
 # Each --conf is TWO argv entries; a combined string arrives as one argument and
 # spark-sql answers "Unrecognized option". Hence the array rather than a string.
+# The comma in spark.sql.extensions is part of the value: Spark takes a
+# comma-separated extension list.
+# shellcheck disable=SC2054
 SPARK_CONF=(
   --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions,org.apache.kyuubi.plugin.spark.authz.ranger.RangerSparkExtension
   --conf "spark.sql.catalog.sales_wh.token=$BOB_TOKEN"

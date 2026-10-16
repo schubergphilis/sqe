@@ -458,7 +458,7 @@ fn generate_hits(scale: f64) -> (SchemaRef, super::BatchIterator) {
             event_time.push(et);
             event_date.push(ed);
             // q27/q42: a hot counter takes ~1% of rows.
-            counter_id.push(if global % HOT_COUNTER_STRIDE == 0 {
+            counter_id.push(if global.is_multiple_of(HOT_COUNTER_STRIDE) {
                 HOT_COUNTER_ID
             } else {
                 rng.random_range(1..100_000)

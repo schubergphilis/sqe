@@ -39,6 +39,8 @@ echo "  output:  $RESULT_FILE"
 
 run_scenario() {
     local mode="$1"   # "copy-on-write" | "merge-on-read"
+    # Read by the commented-out sqe-cli steps below.
+    # shellcheck disable=SC2034
     local table="bench_mor_cow_${mode//-/_}"
 
     echo ">>> scenario: $mode"
