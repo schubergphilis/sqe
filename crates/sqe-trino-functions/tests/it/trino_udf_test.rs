@@ -491,6 +491,87 @@ async fn test_to_iso8601_date() {
     assert_eq!(v, Some("2024-03-15".to_string()));
 }
 
+/// Trino 476: `from_iso8601_timestamp` reads the zone designator, so each of
+/// these names the instant 2024-01-02 03:04:05 UTC (an empty result was the
+/// old answer for every suffixed input). SQE runs in UTC, so the UTC wall
+/// clock is what comes back.
+#[tokio::test]
+async fn test_from_iso8601_timestamp_reads_the_zone() {
+    for (input, want) in [
+        ("2024-01-02T03:04:05Z", "2024-01-02T03:04:05"),
+        ("2024-01-02T03:04:05.123Z", "2024-01-02T03:04:05.123"),
+        ("2024-01-02T05:04:05+02:00", "2024-01-02T03:04:05"),
+        ("2024-01-02T05:04:05+0200", "2024-01-02T03:04:05"),
+        ("2024-01-02T05:04:05+02", "2024-01-02T03:04:05"),
+        ("2024-01-01T22:04:05-05:00", "2024-01-02T03:04:05"),
+        ("2024-01-02T03:04:05", "2024-01-02T03:04:05"),
+        ("2024-01-02 03:04:05", "2024-01-02T03:04:05"),
+        ("2024-01-02T03:04Z", "2024-01-02T03:04:00"),
+        ("2024-01-02", "2024-01-02T00:00:00"),
+    ] {
+        let v = eval_str(&format!("SELECT from_iso8601_timestamp('{input}')")).await;
+        assert_eq!(
+            v.as_deref(),
+            Some(want),
+            "from_iso8601_timestamp('{input}')"
+        );
+    }
+    for bad in [
+        "2024-01-02T03:04:05+25:00",
+        "2024-01-02T03:04:05+0x:00",
+        "nope",
+    ] {
+        let v = eval_str(&format!("SELECT from_iso8601_timestamp('{bad}')")).await;
+        assert_eq!(v, None, "from_iso8601_timestamp('{bad}')");
+    }
+}
+
+/// Trino 476: a timestamp without a zone renders without a designator
+/// (`2024-01-02T03:04:05`); the `Z` SQE used to append claimed UTC.
+#[tokio::test]
+async fn test_to_iso8601_naive_timestamp_has_no_zone() {
+    let v = eval_str("SELECT to_iso8601(TIMESTAMP '2024-01-02 03:04:05')").await;
+    assert_eq!(v.as_deref(), Some("2024-01-02T03:04:05"));
+    let v = eval_str("SELECT to_iso8601(TIMESTAMP '2024-01-02 03:04:05.123')").await;
+    assert_eq!(v.as_deref(), Some("2024-01-02T03:04:05.123"));
+    let v = eval_str("SELECT to_iso8601(TIMESTAMP '2024-01-02 03:04:05.123456')").await;
+    assert_eq!(v.as_deref(), Some("2024-01-02T03:04:05.123456"));
+    // Round trip through the parser.
+    let v = eval_str(
+        "SELECT to_iso8601(from_iso8601_timestamp(to_iso8601(TIMESTAMP '2024-01-02 03:04:05.5')))",
+    )
+    .await;
+    assert_eq!(v.as_deref(), Some("2024-01-02T03:04:05.500"));
+}
+
+/// Trino evaluates every clock function at the query start, so two calls in
+/// one statement are equal. They used to read the clock per call and differ
+/// by microseconds.
+#[tokio::test]
+async fn test_clock_functions_share_the_query_start() {
+    let ctx = ctx().await;
+    let batches = ctx
+        .sql("SELECT now() = current_timestamp, now() = localtimestamp, now() = now()")
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("execute");
+    let row = &batches[0];
+    for i in 0..row.num_columns() {
+        let col = row
+            .column(i)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(
+            col.value(0),
+            "column {i} differs: {:?}",
+            row.schema().field(i).name()
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_current_timezone() {
     let v = eval_str("SELECT current_timezone()").await;
