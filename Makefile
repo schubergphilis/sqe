@@ -98,7 +98,7 @@ BENCH_ENV       = PROFILE=$(BENCH_PROFILE) BENCH_LOG_DIR=$(BENCH_LOG_DIR)
         audit audit-advisories deps-check lock-maintenance dbt-sqe-lock metrics-layering-check \
         audit-deny audit-licenses \
         benchmark_all benchmark_all_trino \
-        clippy fmt fmt-check pre-commit pre-commit-repo clean clean-rust clean-rustbook \
+        clippy fmt fmt-check pre-commit pre-commit-all clean clean-rust clean-rustbook \
         clean-ebook clean-benchmark-charts clean-images check-tools maintain \
         build build-sqe sbom sbom-sqe sqe-config images \
         login buildx-builder push push-sqe leak-scan
@@ -124,7 +124,7 @@ help:
 	@echo "    make fmt          cargo fmt --all"
 	@echo "    make fmt-check    cargo fmt --all --check"
 	@echo "    make pre-commit   commit hooks on staged files: gitleaks, rustfmt ratchet, supply chain, shellcheck"
-	@echo "    make pre-commit-repo  repo-wide hooks: lockfile, hakari, deny, audit, machete, clippy"
+	@echo "    make pre-commit-all  every hook on every file, clippy included"
 	@echo ""
 	@echo "  Supply chain:"
 	@echo "    make audit        cargo audit + cargo deny check (advisories, bans, sources)"
@@ -408,14 +408,10 @@ pre-commit:
 	@echo "==> Running pre-commit hooks"
 	pre-commit run
 
-# Not `pre-commit run --all-files`: the whitespace fixers would rewrite
-# ~1500 files that predate them. These hooks check the whole repo anyway.
-pre-commit-repo:
-	@echo "==> Running the repo-wide pre-commit hooks"
-	@for hook in cargo-lockfile cargo-hakari cargo-deny cargo-audit cargo-machete; do \
-		pre-commit run --all-files $$hook || exit 1; \
-	done
-	pre-commit run --all-files --hook-stage pre-push clippy
+pre-commit-all:
+	@echo "==> Running every pre-commit hook on every file"
+	pre-commit run --all-files
+	pre-commit run --all-files --hook-stage pre-push
 
 # ── Container image: build / SBOM / config / push ─────────────────────────
 # Build context is the repo root (the Dockerfile COPYs Cargo.toml, crates/,

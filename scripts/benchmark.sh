@@ -55,7 +55,6 @@ else
 fi
 
 COORD_PID=""
-STACK_UP=""
 TRINO_CONTAINER=""
 COORD_CFG=""
 COORD_TEMPLATE="$ROOT_DIR/tests/benchmark-attach/coordinator-attach.toml"
@@ -80,7 +79,6 @@ if [ "$MANAGE_STACK" = 1 ]; then
     echo "==> Bringing up test stack (Polaris + RustFS)"
     docker compose -f "$COMPOSE_FILE" up -d
     scripts/bootstrap-test.sh   # bucket + warehouse + grants (no args)
-    STACK_UP=1
 fi
 
 # Stale-coordinator guard. We health-wait on :60051 below; if a coordinator

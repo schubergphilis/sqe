@@ -15,7 +15,7 @@
 #   - Each role has a baseline traverse grant (list + read metadata). TABLE DATA
 #     access (table-data-read/write) is granted below, via SQE GRANT.
 set -uo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit 1
 
 RANGER_PORT="${RANGER_PORT:-26080}"
 RANGER_PASS="${RANGER_ADMIN_PASSWORD:-rangerR0cks!}"
