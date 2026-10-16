@@ -1212,6 +1212,89 @@ async fn tag_column_mask_applies_from_iceberg_property() {
     );
 }
 
+/// The Iceberg metadata TVFs answer under Ranger, and `table_files` still
+/// withholds a tag-masked column's bounds. Until #846 every one of them was
+/// refused with "tag state unknown": the rewriter looked up tags for the scan
+/// named `table_snapshots()` in the metadata cache, which never holds it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn metadata_tvfs_answer_and_withhold_tag_masked_stats() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    set_column_tag(&ctx, "ssn", "PII").await;
+    ctx.ranger
+        .create_policy(tag_mask_policy(
+            &format!("{PREFIX}tag-mask-pii-tvf"),
+            "PII",
+            serde_json::json!({"dataMaskType": "hive:MASK_SHOW_LAST_4"}),
+        ))
+        .await
+        .expect("create tag mask");
+
+    // The TVFs read the session's default catalog, and this config's default
+    // sorts to ops_wh, so point the sessions at the fixture's catalog.
+    let in_sales = |s: &Session| {
+        let mut s = s.clone();
+        s.default_catalog = Some("sales_wh".to_string());
+        s
+    };
+    let (carol, alice, bob) = (
+        in_sales(&ctx.carol),
+        in_sales(&ctx.alice),
+        in_sales(&ctx.bob),
+    );
+
+    for user in [&carol, &alice, &bob] {
+        let snapshots = exec_ok(
+            &ctx,
+            user,
+            "SELECT snapshot_id FROM table_snapshots('ac', 'orders')",
+        )
+        .await;
+        assert!(
+            total_rows(&snapshots) >= 1,
+            "{}: table_snapshots must list the fixture's snapshots",
+            user.user.username
+        );
+    }
+
+    // Wait until bob's tag mask is live, so the bounds check below is not
+    // racing Ranger's policy refresh.
+    let masked = format!("SELECT ssn FROM {ORDERS} ORDER BY id");
+    crate::common::eventually("bob's tag mask to apply", || async {
+        match ctx.handler.execute(&ctx.bob, &masked, None).await {
+            Ok(b) if col_strings(&b, "ssn")[0] == "xxx-xx-1111" => Ok(()),
+            Ok(b) => Err(format!("got {:?}", col_strings(&b, "ssn"))),
+            Err(e) => Err(format!("query failed: {e}")),
+        }
+    })
+    .await;
+
+    let files = "SELECT lower_bounds, upper_bounds FROM table_files('ac', 'orders')";
+    let bounds = |batches: &[RecordBatch]| {
+        let mut all = col_strings(batches, "lower_bounds");
+        all.extend(col_strings(batches, "upper_bounds"));
+        all.join(" ")
+    };
+    let alice = bounds(&exec_ok(&ctx, &alice, files).await);
+    assert!(
+        alice.contains("111-11-1111"),
+        "unmasked alice sees the ssn bounds: {alice}"
+    );
+    let bob = bounds(&exec_ok(&ctx, &bob, files).await);
+    assert!(
+        !bob.contains("-11-1111") && !bob.contains("-33-3333"),
+        "bob's ssn is tag-masked, so its bounds are withheld: {bob}"
+    );
+    assert!(
+        bob.contains("EU"),
+        "bob still sees the bounds of an ungoverned column: {bob}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn tag_row_filter_restricts_rows() {
