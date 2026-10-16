@@ -4052,11 +4052,11 @@ impl QueryHandler {
     /// Only pure SELECT/WITH queries are planned via DataFusion. DML advertises
     /// the same `rows_affected` result that the write handlers return; this is
     /// required by Flight SQL clients, which reject a prepared statement when
-    /// its declared and actual result schemas differ. Every other statement
-    /// returns an empty schema, meaning "not known before execution":
-    /// SHOW, DESCRIBE and EXPLAIN produce columns their handlers decide, and
-    /// DDL produces none. The Flight layer advertises that as no schema at
-    /// all (see `advertised_schema_bytes`).
+    /// its declared and actual result schemas differ. SHOW, DESCRIBE and
+    /// EXPLAIN (see [`is_read_only_result_set`]) are run and their result's
+    /// schema returned. Every other statement returns an empty schema, which
+    /// the Flight layer advertises as no schema at all (see
+    /// `advertised_schema_bytes`).
     ///
     /// Boxed for the same reason as [`Self::execute`]: awaited unboxed, the
     /// planning state machine below made `get_flight_info_statement` re-prove
@@ -4121,6 +4121,19 @@ impl QueryHandler {
                 DataType::Int64,
                 false,
             )])))
+        } else if is_read_only_result_set(&kind) {
+            // SHOW / DESCRIBE / EXPLAIN: their handlers decide the columns
+            // (a Hive DESCRIBE differs from an Iceberg one), so the statement
+            // is run here and its result's schema advertised. Arrow Flight
+            // SQL JDBC treats a statement advertised with no columns as an
+            // update and refuses to return its rows. These kinds only read,
+            // so running them twice (here and at DoGet) changes nothing; the
+            // audit log records both runs.
+            let batches = self.execute(session, sql, None).await?;
+            Ok(batches
+                .first()
+                .map(|b| b.schema())
+                .unwrap_or_else(|| Arc::new(Schema::empty())))
         } else {
             // Other statements: execution happens in do_get_statement via
             // execute(); their columns (if any) are only known then.
@@ -8548,6 +8561,41 @@ fn is_show_roles(stmt: &Statement) -> bool {
         parts.as_slice(),
         ["ROLES"] | ["CURRENT", "ROLES"] | ["ROLE", "GRANTS"]
     )
+}
+
+/// True for the statements that return rows and only read: the SHOW family,
+/// DESCRIBE, and EXPLAIN without ANALYZE. `QueryHandler::get_schema` runs these
+/// to learn their columns, so nothing that writes, runs a query (EXPLAIN
+/// ANALYZE), or changes session state may be listed here.
+fn is_read_only_result_set(kind: &StatementKind) -> bool {
+    match kind {
+        StatementKind::ShowCatalogs
+        | StatementKind::ShowSchemas(_)
+        | StatementKind::ShowTables(_)
+        | StatementKind::ShowViews(_)
+        | StatementKind::ShowGrants(_)
+        | StatementKind::ShowEffectiveGrants(_)
+        | StatementKind::ShowEffectivePolicy(_)
+        | StatementKind::ShowTags(_)
+        | StatementKind::ShowMaskingPolicies(_)
+        | StatementKind::ShowCreateTable(_)
+        | StatementKind::ShowCreateSchema(_)
+        | StatementKind::ShowStats(_)
+        | StatementKind::ShowPartitions(_)
+        | StatementKind::ShowSession { .. }
+        | StatementKind::DescribeOutput(_)
+        | StatementKind::DescribeInput(_) => true,
+        StatementKind::Utility(stmt) => match stmt.as_ref() {
+            Statement::Explain { analyze, .. } => !analyze,
+            Statement::ExplainTable { describe_alias, .. } => matches!(
+                describe_alias,
+                sqlparser::ast::DescribeAlias::Describe | sqlparser::ast::DescribeAlias::Desc
+            ),
+            Statement::ShowColumns { .. } | Statement::ShowFunctions { .. } => true,
+            other => is_show_roles(other),
+        },
+        _ => false,
+    }
 }
 
 fn replace_table_reference(sql: &str, needle: &str, replacement: &str) -> String {

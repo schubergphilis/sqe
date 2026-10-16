@@ -585,9 +585,127 @@ fn advertised_schema_bytes(schema: &arrow_schema::Schema) -> Result<bytes::Bytes
         return Ok(bytes::Bytes::new());
     }
     Ok(FlightInfo::new()
-        .try_with_schema(schema)
+        .try_with_schema(&client_schema(schema))
         .map_err(|e| Status::internal(format!("Failed to encode schema: {e}")))?
         .schema)
+}
+
+/// The schema a statement's result is described with on the wire: `schema`
+/// with every field, nested ones included, nullable.
+///
+/// The logical plan GetFlightInfo describes and the physical plan DoGet
+/// streams disagree on nullability (`now()`, folded constants, list items,
+/// struct children), and ADBC refuses the stream when they do. Relaxing both
+/// sides to nullable makes them agree without planning twice. Map entries and
+/// keys stay non-null: the Arrow spec requires it.
+fn client_schema(schema: &arrow_schema::Schema) -> arrow_schema::SchemaRef {
+    let fields: Vec<arrow_schema::FieldRef> = schema
+        .fields()
+        .iter()
+        .map(|f| Arc::new(nullable_field(f)))
+        .collect();
+    Arc::new(arrow_schema::Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ))
+}
+
+fn nullable_field(field: &arrow_schema::Field) -> arrow_schema::Field {
+    field
+        .clone()
+        .with_data_type(nullable_type(field.data_type()))
+        .with_nullable(true)
+}
+
+fn nullable_type(data_type: &arrow_schema::DataType) -> arrow_schema::DataType {
+    use arrow_schema::DataType;
+    match data_type {
+        DataType::List(f) => DataType::List(Arc::new(nullable_field(f))),
+        DataType::LargeList(f) => DataType::LargeList(Arc::new(nullable_field(f))),
+        DataType::FixedSizeList(f, n) => DataType::FixedSizeList(Arc::new(nullable_field(f)), *n),
+        DataType::Struct(fields) => {
+            DataType::Struct(fields.iter().map(|f| Arc::new(nullable_field(f))).collect())
+        }
+        DataType::Map(entries, sorted) => {
+            let DataType::Struct(kv) = entries.data_type() else {
+                return data_type.clone();
+            };
+            let kv: arrow_schema::Fields = kv
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    let relaxed = f
+                        .as_ref()
+                        .clone()
+                        .with_data_type(nullable_type(f.data_type()));
+                    // Index 0 is the key, which the spec keeps non-null.
+                    Arc::new(if i == 0 {
+                        relaxed
+                    } else {
+                        relaxed.with_nullable(true)
+                    })
+                })
+                .collect();
+            DataType::Map(
+                Arc::new(
+                    entries
+                        .as_ref()
+                        .clone()
+                        .with_data_type(DataType::Struct(kv)),
+                ),
+                *sorted,
+            )
+        }
+        other => other.clone(),
+    }
+}
+
+/// Re-declare `batch` under `schema` (its [`client_schema`]). Columns whose
+/// nested nullability differs are cast; the values are unchanged.
+fn conform_batch(
+    batch: RecordBatch,
+    schema: &arrow_schema::SchemaRef,
+) -> Result<RecordBatch, arrow_schema::ArrowError> {
+    if batch.schema_ref() == schema {
+        return Ok(batch);
+    }
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(column, field)| {
+            if column.data_type() == field.data_type() {
+                Ok(Arc::clone(column))
+            } else {
+                arrow::compute::cast(column, field.data_type())
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    RecordBatch::try_new_with_options(
+        Arc::clone(schema),
+        columns,
+        &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+}
+
+/// The Flight stream for a statement's result: `batches` under their
+/// [`client_schema`], so DoGet agrees with what GetFlightInfo advertised.
+fn client_batch_stream(
+    schema: &arrow_schema::Schema,
+    batches: impl Stream<Item = Result<RecordBatch, FlightError>> + Send + 'static,
+    options: IpcWriteOptions,
+) -> Response<FlightStream> {
+    let schema = client_schema(schema);
+    let conformed = Arc::clone(&schema);
+    let batches = batches.map(move |batch| {
+        batch.and_then(|b| conform_batch(b, &conformed).map_err(FlightError::Arrow))
+    });
+    let flight_stream = FlightDataEncoderBuilder::new()
+        .with_schema(schema)
+        .with_options(options)
+        .build(batches)
+        .map_err(Status::from);
+    Response::new(Box::pin(flight_stream))
 }
 
 /// What a redeemed ticket resolves to.
@@ -1178,7 +1296,14 @@ impl SqeFlightSqlService {
             .execute(session, sql, client_ip)
             .await
             .map_err(|e| sqe_error_to_status(&e, None))?;
-        self.batches_to_stream(batches)
+        let Some(schema) = batches.first().map(|b| b.schema()) else {
+            return self.batches_to_stream(batches);
+        };
+        Ok(client_batch_stream(
+            &schema,
+            stream::iter(batches.into_iter().map(Ok)),
+            self.flight_ipc_options()?,
+        ))
     }
 
     /// Wrap an opened DataFusion record-batch stream in the Flight encoder.
@@ -1190,14 +1315,8 @@ impl SqeFlightSqlService {
         stream: datafusion::execution::SendableRecordBatchStream,
     ) -> Result<Response<FlightStream>, Status> {
         let options = self.flight_ipc_options()?;
-        let batch_stream =
-            stream.map(|res| res.map_err(execution_error_to_flight));
-        let flight_stream = FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .with_options(options)
-            .build(batch_stream)
-            .map_err(Status::from);
-        Ok(Response::new(Box::pin(flight_stream)))
+        let batch_stream = stream.map(|res| res.map_err(execution_error_to_flight));
+        Ok(client_batch_stream(&schema, batch_stream, options))
     }
 
     /// Run whatever a redeemed ticket resolved to.
@@ -3324,6 +3443,56 @@ mod tests {
             Some("0af7651916cd43dd8448eb211c80319c")
         );
         provider.shutdown().unwrap();
+    }
+
+    /// The client schema relaxes every nested field but a map's entries and
+    /// key, which the Arrow spec requires non-null, and a batch conformed to
+    /// it keeps its values.
+    #[test]
+    fn client_schema_relaxes_nested_fields_but_map_keys() {
+        use arrow::array::{Int64Builder, ListBuilder, MapBuilder, StringBuilder};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let mut list = ListBuilder::new(Int64Builder::new()).with_field(Field::new(
+            "item",
+            DataType::Int64,
+            false,
+        ));
+        list.values().append_value(1);
+        list.append(true);
+        let mut map = MapBuilder::new(None, StringBuilder::new(), Int64Builder::new())
+            .with_values_field(Field::new("value", DataType::Int64, false));
+        map.keys().append_value("k");
+        map.values().append_value(2);
+        map.append(true).unwrap();
+        let (list, map) = (list.finish(), map.finish());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("l", list.data_type().clone(), false),
+            Field::new("m", map.data_type().clone(), false),
+        ]));
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(list), Arc::new(map)]).unwrap();
+
+        let client = super::client_schema(&schema);
+        let DataType::List(item) = client.field(0).data_type() else {
+            panic!("list")
+        };
+        assert!(client.field(0).is_nullable() && item.is_nullable());
+        let DataType::Map(entries, _) = client.field(1).data_type() else {
+            panic!("map")
+        };
+        let DataType::Struct(kv) = entries.data_type() else {
+            panic!("entries")
+        };
+        assert!(!entries.is_nullable() && !kv[0].is_nullable() && kv[1].is_nullable());
+
+        let conformed = super::conform_batch(batch.clone(), &client).unwrap();
+        assert_eq!(conformed.schema(), client);
+        assert_eq!(
+            conformed.column(0).to_data().buffers(),
+            batch.column(0).to_data().buffers()
+        );
+        assert_eq!(conformed.num_rows(), 1);
     }
 
     // -----------------------------------------------------------------------
