@@ -420,9 +420,10 @@ impl SealedFilter {
     /// False for a skipped filter's batches between probes.
     fn should_evaluate(&self) -> bool {
         !self.skipped()
-            || self.batches_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                % ADAPTIVE_FILTER_PROBE_EVERY
-                == 0
+            || self
+                .batches_skipped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .is_multiple_of(ADAPTIVE_FILTER_PROBE_EVERY)
     }
 }
 

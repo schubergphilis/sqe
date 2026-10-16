@@ -1468,7 +1468,7 @@ impl ScalarUDFImpl for JsonObject {
 
         // `is_multiple_of` would be clearer but is stable only from 1.87;
         // workspace MSRV is 1.85.
-        if args.args.len() % 2 != 0 {
+        if !args.args.len().is_multiple_of(2) {
             return Err(DataFusionError::Plan(
                 "json_object: must have an even number of arguments (key-value pairs)".to_string(),
             ));

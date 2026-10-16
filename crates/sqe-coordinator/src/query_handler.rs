@@ -4327,6 +4327,7 @@ impl QueryHandler {
     /// caller can pass it to the OpenLineage observer's complete/fail hook.
     /// Plan capture happens after policy enforcement so the emitted lineage
     /// reflects the user's *enforced* view, not the raw user query.
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip(self, session, sql, plan_metrics, plan_out, summary_out), fields(username = %session.user.username, query_id = %query_id), name = "sqe.execute")]
     async fn execute_query(
         &self,

@@ -500,7 +500,7 @@ fn median_relative_spread(per_file: &[(f64, f64)]) -> Option<f64> {
         .collect();
     spreads.sort_by(f64::total_cmp);
     let mid = spreads.len() / 2;
-    Some(if spreads.len() % 2 == 0 {
+    Some(if spreads.len().is_multiple_of(2) {
         (spreads[mid - 1] + spreads[mid]) / 2.0
     } else {
         spreads[mid]
