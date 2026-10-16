@@ -4021,7 +4021,7 @@ impl QueryHandler {
         self.refresh_listing_snapshots(ctx, session_catalog, session, sql)
             .await;
         let (sql, incremental_identities) =
-            self.handle_incremental(sql, ctx, session_catalog).await?;
+            self.handle_incremental(sql, ctx).await?;
         let (sql, tt_cleanup) = self
             .handle_time_travel(&sql, ctx, session, session_catalog, incremental_identities)
             .await?;
@@ -4098,7 +4098,7 @@ impl QueryHandler {
             // must be stripped before handle_time_travel sees it because that
             // step parses the SQL with sqlparser.
             let (sql_for_plan, incremental_identities) =
-                self.handle_incremental(sql, &ctx, &session_catalog).await?;
+                self.handle_incremental(sql, &ctx).await?;
             let (sql_for_plan, _tt_cleanup) = self
                 .handle_time_travel(
                     &sql_for_plan,
@@ -4376,7 +4376,7 @@ impl QueryHandler {
             // it in place. handle_incremental strips the clause text and
             // registers an IncrementalTableProvider per target table.
             let (sql, incremental_identities) =
-                self.handle_incremental(sql, &ctx, &session_catalog).await?;
+                self.handle_incremental(sql, &ctx).await?;
             // Pre-process time travel: detect FOR SYSTEM_TIME AS OF, resolve
             // snapshot IDs, register snapshot-specific table providers, and
             // strip the temporal clause. `tt_cleanup` deregisters the pinned
@@ -6697,7 +6697,6 @@ impl QueryHandler {
         &self,
         sql: &str,
         ctx: &SessionContext,
-        session_catalog: &Arc<SessionCatalog>,
     ) -> sqe_core::Result<(String, Vec<(String, TableReference)>)> {
         let (mut rewritten, specs) = sqe_sql::extract_incremental_spec(sql)?;
         if specs.is_empty() {
@@ -6705,7 +6704,7 @@ impl QueryHandler {
         }
         let mut identities = Vec::with_capacity(specs.len());
         for spec in &specs {
-            let alias = Self::apply_incremental_spec(spec, ctx, session_catalog).await?;
+            let alias = Self::apply_incremental_spec(spec, ctx).await?;
             // The alias hides the table from the policy rewriter; remember
             // the real reference so the plan can be given it back (400).
             identities.push((alias.clone(), TableReference::from(spec.table.as_str())));
@@ -6729,27 +6728,28 @@ impl QueryHandler {
     async fn apply_incremental_spec(
         spec: &sqe_sql::IncrementalSpec,
         ctx: &SessionContext,
-        session_catalog: &Arc<SessionCatalog>,
     ) -> sqe_core::Result<String> {
         use iceberg::arrow::schema_to_arrow_schema;
         use std::collections::HashMap;
 
-        let parts: Vec<&str> = spec.table.split('.').collect();
-        let (namespace, bare_table) = match parts.len() {
-            1 => ("default", parts[0]),
-            2 => (parts[0], parts[1]),
-            3 => (parts[1], parts[2]),
-            _ => {
-                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "Unsupported table name format for incremental scan: {}",
-                    spec.table
-                )));
-            }
-        };
-
-        let ns_ident = iceberg::NamespaceIdent::new(namespace.to_string());
-        let table_ident = iceberg::TableIdent::new(ns_ident, bare_table.to_string());
-        let iceberg_table = session_catalog.load_table(&table_ident).await?;
+        // Resolve the table the way a plain read of the same name does, so
+        // a catalog-qualified name reads that catalog's table (#845).
+        let reference = TableReference::from(spec.table.as_str());
+        let bare_table = reference.table().to_string();
+        let planned = ctx.table_provider(reference).await?;
+        let iceberg_table = (planned.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<sqe_catalog::table_provider::SqeTableProvider>()
+            .ok_or_else(|| {
+                SqeError::with_code(
+                    SqeErrorCode::NotSupported,
+                    format!(
+                        "FOR INCREMENTAL BETWEEN SNAPSHOT reads Iceberg tables only; {} is not one",
+                        spec.table
+                    ),
+                )
+            })?
+            .table()
+            .clone();
 
         // Plan the range. `plan_incremental` also calls `resolve_range`
         // internally, so range validation happens once.
@@ -6793,7 +6793,11 @@ impl QueryHandler {
             Arc::new(base_schema),
             plan,
             Some(file_io),
-        );
+        )
+        // The policy rewriter reads `sqe.column-tags` off the scan; without
+        // these it fell back to the metadata cache and refused the read on
+        // a miss (#844).
+        .with_table_properties(iceberg_table.metadata().properties().clone());
 
         // Register under a unique alias in the `datafusion.public` schema,
         // which is a MemoryCatalogProvider and supports dynamic registration.
@@ -6807,9 +6811,10 @@ impl QueryHandler {
         let qualified = format!("datafusion.public.{alias}");
         ctx.register_table(qualified.as_str(), Arc::new(provider))
             .map_err(|e| {
-                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "Failed to register incremental provider for {bare_table}: {e}"
-                ))
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Failed to register incremental provider for {bare_table}: {e}"),
+                )
             })?;
 
         Ok(qualified)
