@@ -303,6 +303,19 @@ impl TableProvider for IcebergMetadataProvider {
     }
 }
 
+/// Whether `provider` is an Iceberg metadata TVF's (`table_snapshots`,
+/// `table_files`, ...). Its output columns are metadata, not the target's
+/// columns, so they carry no column tags: the target's tags are applied
+/// inside the provider through [`MetadataPolicy`], which withholds the
+/// statistics of governed columns and fails closed on unreadable tags. The
+/// policy rewriter uses this so it does not refuse the scan for an unknown
+/// tag state (#846). The marker is the provider's type, not the scan name.
+pub fn is_metadata_table_provider(provider: &dyn TableProvider) -> bool {
+    (provider as &dyn std::any::Any)
+        .downcast_ref::<IcebergMetadataProvider>()
+        .is_some()
+}
+
 /// If `provider` is one of the Iceberg metadata TVF providers
 /// (`table_files`, `table_snapshots`, `table_manifests`, ...), return the
 /// underlying Iceberg table as `(namespace, table)`.
