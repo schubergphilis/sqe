@@ -16,9 +16,11 @@ use arrow::datatypes::DataType;
 use arrow::temporal_conversions;
 use chrono::{Datelike, Duration, Months, NaiveDate, NaiveDateTime, Timelike};
 use datafusion::common::Result as DFResult;
+use datafusion::common::ScalarValue;
 use datafusion::error::DataFusionError;
+use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
+    ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
 };
 
@@ -1417,6 +1419,30 @@ impl ScalarUDFImpl for DateParse {
 
 // ─── now() → Timestamp ─────────────────────────────────────────────────────
 
+/// Fold a clock function to the query start instant, as DataFusion's own
+/// `now()` does, so `now()`, `current_timestamp`, `localtimestamp` and
+/// `localtime` in one statement read one instant (Trino: the query start).
+/// The fold has to happen here: the constant evaluator runs before
+/// `simplify` and would otherwise invoke the function and read the clock
+/// once per call. So `invoke_with_args` refuses, as DataFusion's `now()`
+/// does; that failure makes the evaluator keep the call for this fold.
+fn query_start_literal(
+    args: Vec<Expr>,
+    info: &SimplifyContext,
+    value: impl FnOnce(chrono::DateTime<chrono::Utc>) -> ScalarValue,
+) -> ExprSimplifyResult {
+    match info.query_execution_start_time() {
+        Some(start) => ExprSimplifyResult::Simplified(Expr::Literal(value(start), None)),
+        None => ExprSimplifyResult::Original(args),
+    }
+}
+
+fn not_folded(name: &str) -> DFResult<ColumnarValue> {
+    Err(DataFusionError::Internal(format!(
+        "{name}() should have been folded to the query start time"
+    )))
+}
+
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct TrinoNow;
 
@@ -1447,13 +1473,14 @@ impl ScalarUDFImpl for TrinoNow {
         ))
     }
 
+    fn simplify(&self, args: Vec<Expr>, info: &SimplifyContext) -> DFResult<ExprSimplifyResult> {
+        Ok(query_start_literal(args, info, |start| {
+            ScalarValue::TimestampMicrosecond(Some(start.timestamp_micros()), None)
+        }))
+    }
+
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        use datafusion::common::ScalarValue;
-        let us = chrono::Utc::now().timestamp_micros();
-        Ok(ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(
-            Some(us),
-            None,
-        )))
+        not_folded(self.name())
     }
 }
 
@@ -1640,16 +1667,21 @@ impl ScalarUDFImpl for LocalTime {
         Ok(DataType::Time64(arrow::datatypes::TimeUnit::Microsecond))
     }
 
-    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        use datafusion::common::ScalarValue;
-        let now = chrono::Local::now().time();
-        // Microseconds since midnight.
-        let us =
-            now.num_seconds_from_midnight() as i64 * 1_000_000 + (now.nanosecond() / 1_000) as i64;
-        Ok(ColumnarValue::Scalar(ScalarValue::Time64Microsecond(Some(
-            us,
-        ))))
+    fn simplify(&self, args: Vec<Expr>, info: &SimplifyContext) -> DFResult<ExprSimplifyResult> {
+        Ok(query_start_literal(args, info, |start| {
+            ScalarValue::Time64Microsecond(Some(micros_since_midnight(
+                start.with_timezone(&chrono::Local).time(),
+            )))
+        }))
     }
+
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        not_folded(self.name())
+    }
+}
+
+fn micros_since_midnight(t: chrono::NaiveTime) -> i64 {
+    t.num_seconds_from_midnight() as i64 * 1_000_000 + (t.nanosecond() / 1_000) as i64
 }
 
 // ─── e() → Euler's number (Trino has it as a Nullary fn) ──────────────────
@@ -2141,13 +2173,14 @@ impl ScalarUDFImpl for LocalTimestamp {
         ))
     }
 
+    fn simplify(&self, args: Vec<Expr>, info: &SimplifyContext) -> DFResult<ExprSimplifyResult> {
+        Ok(query_start_literal(args, info, |start| {
+            ScalarValue::TimestampMicrosecond(Some(start.timestamp_micros()), None)
+        }))
+    }
+
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        use datafusion::common::ScalarValue;
-        let us = chrono::Utc::now().timestamp_micros();
-        Ok(ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(
-            Some(us),
-            None,
-        )))
+        not_folded(self.name())
     }
 }
 

@@ -511,13 +511,60 @@ impl ScalarUDFImpl for FromIso8601Timestamp {
     }
 }
 
+/// Parse an ISO 8601 timestamp to UTC microseconds. A `Z` or `±hh[:mm]`
+/// suffix names the instant (`03:04:05+02:00` is `01:04:05` UTC); without
+/// one the wall clock is read as UTC, the session zone SQE runs in. A bare
+/// date is midnight, and the minutes may stop at `hh:mm`, as in Trino.
 fn parse_iso_timestamp(s: &str) -> Option<i64> {
-    NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
-        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
-        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f"))
-        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
-        .ok()
-        .map(|dt| dt.and_utc().timestamp_micros())
+    let s = s.trim();
+    let (local, offset_secs) = split_iso_offset(s)?;
+    let naive = [
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M",
+    ]
+    .iter()
+    .find_map(|f| NaiveDateTime::parse_from_str(local, f).ok())
+    .or_else(|| parse_iso_date(local).and_then(|d| d.and_hms_opt(0, 0, 0)))?;
+    let utc = naive.checked_sub_signed(chrono::Duration::seconds(offset_secs))?;
+    Some(utc.and_utc().timestamp_micros())
+}
+
+/// Split a trailing `Z` / `±hh` / `±hhmm` / `±hh:mm` zone designator off an
+/// ISO 8601 timestamp. Returns the wall-clock part and the offset in seconds
+/// east of UTC (0 when there is no designator). Only looks past the time
+/// part, so the `-` separators of the date are never taken for an offset.
+fn split_iso_offset(s: &str) -> Option<(&str, i64)> {
+    if let Some(local) = s.strip_suffix('Z').or_else(|| s.strip_suffix('z')) {
+        return Some((local, 0));
+    }
+    // A date is 10 bytes; an offset can only start after `T`/` ` + time.
+    let Some(pos) = s
+        .get(10..)
+        .and_then(|t| t.rfind(['+', '-']))
+        .map(|p| p + 10)
+    else {
+        return Some((s, 0));
+    };
+    let (local, zone) = s.split_at(pos);
+    let sign = if zone.starts_with('-') { -1 } else { 1 };
+    let digits: String = zone[1..].chars().filter(|c| *c != ':').collect();
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (hh, mm) = match digits.len() {
+        2 => (digits.parse::<i64>().ok()?, 0),
+        4 => (
+            digits[..2].parse::<i64>().ok()?,
+            digits[2..].parse::<i64>().ok()?,
+        ),
+        _ => return None,
+    };
+    if hh > 18 || mm > 59 {
+        return None;
+    }
+    Some((local, sign * (hh * 3600 + mm * 60)))
 }
 
 /// to_iso8601(ts_or_date) → VARCHAR ISO 8601 string
@@ -551,13 +598,17 @@ impl ScalarUDFImpl for ToIso8601 {
             DataType::Timestamp(_, _) | DataType::Null => {
                 let ts: TsArg = arg("to_iso8601", EXPECTED, &args.args, 0)?;
                 // Zoned input renders the local wall clock with its offset
-                // (Trino: `2024-03-15T15:30:45.123+01:00`); naive input is
-                // rendered as UTC with a `Z` suffix.
+                // (Trino: `2024-03-15T15:30:45.123+01:00`). Naive input has
+                // no zone, so it gets no designator either (Trino:
+                // `2024-01-02T03:04:05`); a `Z` would claim it is UTC. The
+                // fraction is shown only when it is non-zero, in 3, 6 or 9
+                // digits, since Arrow carries a unit rather than the declared
+                // precision Trino pads to.
                 let zone = ts.tz.as_deref().map(Zone::parse).transpose()?;
                 lift1(&ts, |us| {
                     let utc = chrono::DateTime::from_timestamp_micros(us);
                     Ok(utc.map(|utc| match &zone {
-                        None => utc.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+                        None => utc.naive_utc().format("%Y-%m-%dT%H:%M:%S%.f").to_string(),
                         Some(Zone::Named(tz)) => utc
                             .with_timezone(tz)
                             .format("%Y-%m-%dT%H:%M:%S%.3f%:z")
