@@ -394,3 +394,65 @@ async fn statement_without_a_token_is_unauthenticated() {
         other => panic!("expected a tonic status, got: {other}"),
     }
 }
+
+/// A `FlightInfo` that advertises a schema must advertise the one DoGet
+/// streams: the ADBC Flight SQL driver compares them and refuses the result
+/// ("endpoint 0 returned inconsistent schema") when they differ. Planning
+/// the advertised schema from the raw text named `SELECT 1 + 1`'s column
+/// `Int64(1) + Int64(1)` while execution, after normalization, sent `_col0`;
+/// EXPLAIN advertised zero fields and streamed `plan_type`/`plan`. A
+/// statement whose columns are only known at execution advertises none.
+#[tokio::test(flavor = "multi_thread")]
+async fn advertised_schema_matches_the_streamed_one() {
+    let server = FlightServer::start().await;
+    let mut client = FlightSqlServiceClient::new(server.channel().await);
+    let token = client.handshake("smoke", "smoke").await.expect("handshake");
+    client.set_token(String::from_utf8(token.to_vec()).expect("token is utf-8"));
+
+    for sql in [
+        "SELECT 1 + 1",
+        "SELECT count(*) FROM generate_series(1, 3)",
+        "SELECT 1 + 1 AS answer, 'x'",
+        "EXPLAIN SELECT 1",
+    ] {
+        let info = client
+            .execute(sql.to_string(), None)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: GetFlightInfo failed: {e}"));
+        let advertised = (!info.schema.is_empty()).then(|| {
+            info.clone()
+                .try_decode_schema()
+                .unwrap_or_else(|e| panic!("{sql}: advertised schema decodes: {e}"))
+        });
+        let ticket = info.endpoint[0]
+            .ticket
+            .clone()
+            .expect("endpoint carries a ticket");
+        let mut stream = client
+            .do_get(ticket)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: DoGet failed: {e}"));
+        while stream
+            .try_next()
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: stream failed: {e}"))
+            .is_some()
+        {}
+        let streamed = stream
+            .schema()
+            .expect("the stream carries a schema")
+            .clone();
+        if let Some(advertised) = advertised {
+            assert_eq!(
+                advertised.fields(),
+                streamed.fields(),
+                "{sql}: FlightInfo advertised a different schema than DoGet streamed"
+            );
+        } else {
+            assert!(
+                sql.starts_with("EXPLAIN"),
+                "{sql}: a query's schema is known before execution and must be advertised"
+            );
+        }
+    }
+}
