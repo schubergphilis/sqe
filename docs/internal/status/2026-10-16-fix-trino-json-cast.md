@@ -7,7 +7,7 @@ Because SQE carries JSON as Utf8, `to_json` cannot tell a JSON value from a stri
 Side-by-side probe against Trino 476, 47 expressions: 39 identical. The other eight are documented in the book's JSON page or are parser gaps already on the list:
 
 - an anonymous `ROW(1, 'x')` gives `c0`/`c1` keys, where Trino gives `""` (two expressions)
-- a JSON value inside an array is encoded as a string, since there is no type marker on Utf8
+- a JSON value inside an array is encoded as a string, since there is no type marker on Utf8. The same applies to `CAST(col AS JSON)` on a stored `JSON` column (not in the probe), which is the case dbt models are likely to hit
 - varbinary and time are written as quoted text, and `CAST(json AS VARCHAR)` is allowed; Trino raises an error for all of these (three expressions)
 - the `CAST(.. AS ARRAY(INTEGER))` and `U&'..'` in `ARRAY[..]` parse errors (two expressions)
 
