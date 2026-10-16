@@ -131,14 +131,19 @@ impl TagSource for CacheTagSource {
 /// eviction, or a commit racing the planning load no longer makes the tag
 /// state unknown (#842). A `FOR INCREMENTAL BETWEEN SNAPSHOT` scan's
 /// `IncrementalTableProvider` carries the properties of the same kind of load
-/// (#844); one built without them is `NotRecognised`, never untagged. Any
-/// other provider (Hive, views, metadata TVFs) is `NotRecognised` and goes to
+/// (#844); one built without them is `NotRecognised`, never untagged. A
+/// metadata TVF's output carries no column tags (the target's are applied
+/// inside the provider), so it is known-untagged (#846). Any other provider
+/// (Hive, views) is `NotRecognised` and goes to
 /// `CacheTagSource` / `HiveTagSource`.
 pub(crate) fn scan_column_tags(
     provider: &dyn datafusion::catalog::TableProvider,
 ) -> sqe_policy::plan_rewriter::ScanTagState {
     use sqe_policy::plan_rewriter::ScanTagState;
 
+    if sqe_catalog::iceberg_metadata_tvf::is_metadata_table_provider(provider) {
+        return ScanTagState::Known(HashMap::new());
+    }
     let any = provider as &dyn std::any::Any;
     let properties = if let Some(iceberg) =
         any.downcast_ref::<sqe_catalog::table_provider::SqeTableProvider>()
