@@ -68,7 +68,8 @@ pub fn try_parse_partition_evolution(sql: &str) -> Result<Option<PartitionEvolut
     if let Some(after_kw) = strip_keyword(&rest_upper, rest_after_table, "ADD PARTITION FIELD") {
         let transform_sql = after_kw.trim().trim_end_matches(';').to_string();
         if transform_sql.is_empty() {
-            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+            return Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
                 "ALTER TABLE ADD PARTITION FIELD: missing transform expression",
             ));
         }
@@ -82,7 +83,8 @@ pub fn try_parse_partition_evolution(sql: &str) -> Result<Option<PartitionEvolut
     if let Some(after_kw) = strip_keyword(&rest_upper, rest_after_table, "DROP PARTITION FIELD") {
         let transform_sql = after_kw.trim().trim_end_matches(';').to_string();
         if transform_sql.is_empty() {
-            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+            return Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
                 "ALTER TABLE DROP PARTITION FIELD: missing transform expression",
             ));
         }
@@ -114,7 +116,8 @@ pub fn try_parse_partition_evolution(sql: &str) -> Result<Option<PartitionEvolut
 fn split_identifier(input: &str) -> Result<(String, &str)> {
     let trimmed = input.trim_start();
     if trimmed.is_empty() {
-        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+        return Err(SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
             "ALTER TABLE: missing table identifier",
         ));
     }
@@ -136,7 +139,8 @@ fn split_identifier(input: &str) -> Result<(String, &str)> {
     let ident = trimmed[..i].to_string();
     let rest = &trimmed[i..];
     if ident.trim_matches('"').is_empty() {
-        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+        return Err(SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
             "ALTER TABLE: empty table identifier",
         ));
     }
@@ -195,7 +199,8 @@ fn split_with(input: &str) -> Result<(String, String)> {
             let old = input[..abs].trim().to_string();
             let new = input[after_idx..].trim().trim_end_matches(';').to_string();
             if old.is_empty() || new.is_empty() {
-                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+                return Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
                     "ALTER TABLE REPLACE PARTITION FIELD: missing old or new transform",
                 ));
             }
@@ -203,7 +208,8 @@ fn split_with(input: &str) -> Result<(String, String)> {
         }
         search_start = abs + 4;
     }
-    Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+    Err(SqeError::with_code(
+        SqeErrorCode::ExecutionFailed,
         "ALTER TABLE REPLACE PARTITION FIELD: expected `WITH <new_transform>`",
     ))
 }

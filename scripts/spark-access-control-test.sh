@@ -37,7 +37,6 @@ set -a; . ./.env; set +a
 RANGER_URL="${AC_RANGER_URL:-http://localhost:${RANGER_PORT:-26080}}"
 POLARIS_URL="${AC_POLARIS_URL:-http://localhost:${POLARIS_PORT:-28181}}"
 KEYCLOAK_URL="${AC_KEYCLOAK_URL:-http://localhost:${KEYCLOAK_PORT:-38080}}"
-RUSTFS_URL="http://localhost:${RUSTFS_PORT:-29000}"
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  Spark access-control stack (Ranger first boot takes 2-4 min)"

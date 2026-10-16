@@ -12,7 +12,7 @@
 #   sp-reader -> READ on orders -> SELECT allowed
 #   sp-denied -> no grant       -> SELECT denied
 set -uo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit 1
 
 KEYCLOAK_PORT="${KEYCLOAK_PORT:-38080}"
 KC="http://localhost:${KEYCLOAK_PORT}/realms/iceberg-ranger/protocol/openid-connect/token"

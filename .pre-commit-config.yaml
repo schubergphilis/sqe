@@ -12,7 +12,7 @@
 #   workspace-hack must be in sync (CI's `cargo hakari generate --diff`),
 #   and cargo-deny + cargo-audit must pass. A changed crate manifest also
 #   runs cargo-machete. Each takes 5-30 s and needs no compile.
-# - Shell: shellcheck at error severity on staged scripts.
+# - Shell: shellcheck at warning severity on staged scripts.
 # - Pre-push: clippy on the whole workspace, warnings denied.
 #
 # Semgrep, grype, trivy, and syft stay in CI: they need the aikido-tools
@@ -24,12 +24,9 @@
 # Run against staged files:
 #   pre-commit run
 #   make pre-commit
-# Run the repo-wide checks (supply chain + clippy) without staging anything:
-#   make pre-commit-repo
+# Run every hook on every file, clippy included (the tree passes clean):
+#   make pre-commit-all
 # Skip one hook for a single commit or push: SKIP=clippy git push
-#
-# Do not run `pre-commit run --all-files`: the whitespace fixers would
-# rewrite ~1500 files that predate them. They are meant for staged files.
 
 default_install_hook_types: [pre-commit, pre-push]
 default_stages: [pre-commit]
@@ -70,19 +67,25 @@ repos:
         # `!reference` tag; `glab ci lint` is the semantic check for that file.
         args: [--allow-multiple-documents, --unsafe]
         exclude: ^deploy/helm/.*/templates/
+      # The fixers leave generated output alone: benchmark reports (the
+      # writer emits no final newline), captured EXPLAIN plans and other
+      # evidence, test data, rendered ebook diagrams, and the vendored
+      # mermaid bundle are kept byte-for-byte as produced.
       - id: trailing-whitespace
         args: [--markdown-linebreak-ext=md]
+        exclude: &generated ^(benchmarks/results/|crates/sqe-bench/benchmarks/results/|docs/evidence/|crates/[^/]+/src/testdata/|docs/site/ebook/diagrams/rendered/|docs/site/book/mermaid\.min\.js$)
       - id: end-of-file-fixer
+        exclude: *generated
       - id: mixed-line-ending
         args: [--fix=lf]
+        exclude: *generated
 
-  # Pinned binary, so a fresh checkout needs no system shellcheck. Error
-  # severity only: 27 scripts carry warnings today, none an error.
+  # Pinned binary, so a fresh checkout needs no system shellcheck.
   - repo: https://github.com/shellcheck-py/shellcheck-py
     rev: v0.11.0.1
     hooks:
       - id: shellcheck
-        args: [--severity=error]
+        args: [--severity=warning]
         types: [shell]
         exclude_types: [zsh]
 

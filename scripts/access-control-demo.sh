@@ -282,7 +282,7 @@ main() {
     "carol grants SELECT to role analyst (alice is a member)"
   settle alice "SELECT id FROM $T" 0
   run ok alice "SELECT id, region FROM $T ORDER BY id" \
-    "alice can now read all three rows" '\(3 rows\)' 
+    "alice can now read all three rows" '\(3 rows\)'
 
   echo; bold "═══ 2. Role vs user, and write separate from read ═══"
   run deny dave "SELECT id FROM $T" \
@@ -325,7 +325,7 @@ ROW FILTER TO ROLE engineer USING (region = 'EU')" \
   run ok bob "SELECT id, region FROM $T ORDER BY id" \
     "bob sees only the EU rows (1 and 3)" '\(2 rows\)' 'US'
   run ok alice "SELECT id, region FROM $T ORDER BY id" \
-    "alice still sees all three" '\(3 rows\)' 
+    "alice still sees all three" '\(3 rows\)'
 
   echo; bold "═══ 5. Data gate: tag-based masking ═══"
   dim "The RULE lives in Ranger against the tag; the ASSOCIATION is Iceberg table metadata."

@@ -168,8 +168,7 @@ start_server() {
     "$SQE_SERVER" > "$SERVER_LOG" 2>&1 &
   SERVER_PID=$!
   printf '    waiting for the coordinator '
-  local i
-  for i in $(seq 1 60); do
+  for _ in $(seq 1 60); do
     if grep -q "coordinator listening" "$SERVER_LOG" 2>/dev/null \
        || lsof -nP -iTCP:"$FLIGHT_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
       echo " ready"
@@ -227,8 +226,8 @@ fi
 
 wait_for_store() {
   printf '    waiting for the store '
-  local i code=000
-  for i in $(seq 1 60); do
+  local code=000
+  for _ in $(seq 1 60); do
     # Any HTTP answer means the listener is up; an unauthenticated request to
     # the root legitimately returns 403 or 503, which is still "listening".
     code=$(curl -s -o /dev/null -w '%{http_code}' "$S3_URL" 2>/dev/null || echo 000)

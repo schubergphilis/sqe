@@ -170,5 +170,3 @@ issuer = "https://idp.example.com/realms/sqe"    # Required unless allow_unbound
 leeway_secs = 60                                 # Clock skew tolerance (default)
 allow_unbounded_issuer = false                   # Dev/test only: allow missing issuer
 ```
-
-

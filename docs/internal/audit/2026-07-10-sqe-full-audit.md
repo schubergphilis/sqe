@@ -691,4 +691,3 @@ Branch `fix/audit-sec04-tvf-inline-creds`.
 Remaining SEC items: SEC-03 (per-user OIDC for client_credentials, architectural),
 SEC-06 (native TLS / ingress). O7 Grafana dashboard and the O3 slow-query
 tail-sampling (Collector config) also still open.
-

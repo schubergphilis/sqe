@@ -34,6 +34,7 @@ COMPOSE_FILE="$ROOT_DIR/docker-compose.test.yml"
 # ── Configuration ─────────────────────────────────────────────
 BENCH_SCALE="${BENCH_SCALE:-100}"
 BENCH_GEN_THREADS="${BENCH_GEN_THREADS:-$(nproc 2>/dev/null || echo 8)}"
+export BENCH_GEN_THREADS
 BENCH_DATA_DIR="${BENCH_DATA_DIR:-/dev/shm/sqe-bench-split-data}"
 BENCH_CLIENT_TIMEOUT_SECS="${BENCH_CLIENT_TIMEOUT_SECS:-1800}"
 BENCH_SKIP_GENERATE="${BENCH_SKIP_GENERATE:-}"
@@ -68,7 +69,7 @@ fi
 LOG_DIR="/tmp/sqe-bench-split-$(date +%Y%m%dT%H%M%S)"
 mkdir -p "$LOG_DIR" "$BENCH_DATA_DIR"
 
-cd "$ROOT_DIR"
+cd "$ROOT_DIR" || exit 1
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  SQE split-phase benchmark runner"
@@ -180,8 +181,7 @@ run_generate() {
     # web_clickstreams/product_reviews to fail with "Query execution failed"
     # (tables not found) at load time.
     echo "  [gen] $bench (SF$BENCH_SCALE, threads=$BENCH_GEN_THREADS)"
-    BENCH_GEN_THREADS=$BENCH_GEN_THREADS \
-      "$BENCH_BIN" generate "$bench" \
+    "$BENCH_BIN" generate "$bench" \
         --scale "$BENCH_SCALE" \
         --output "$BENCH_DATA_DIR" \
         --threads "$BENCH_GEN_THREADS" >>"$log" 2>&1
@@ -223,7 +223,6 @@ if [[ " ${BENCHMARKS[*]} " == *" tpcbb "* && " ${BENCHMARKS[*]} " != *" tpcds "*
     BENCHMARKS=("tpcds" "${BENCHMARKS[@]}")
 fi
 
-TPCDS_READY=""
 for BENCH in "${BENCHMARKS[@]}"; do
     echo ""
     echo "━━ $BENCH (SF$BENCH_SCALE) ━━"
@@ -260,7 +259,6 @@ for BENCH in "${BENCHMARKS[@]}"; do
 
     # Keep tpcds data around if tpcbb is later in the list
     if [ "$BENCH" = "tpcds" ] && [[ " ${BENCHMARKS[*]} " == *" tpcbb "* ]]; then
-        TPCDS_READY=1
         echo "  (keeping tpcds data for tpcbb)"
     else
         rm -rf "${BENCH_DATA_DIR:?}/$BENCH"

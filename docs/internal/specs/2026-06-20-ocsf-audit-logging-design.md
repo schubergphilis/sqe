@@ -229,4 +229,3 @@ Test-driven throughout.
 - Tokenized identifiers use a salted hash. The salt must be stable within a deployment for correlation and is configured or derived once at startup. It is not a secret-grade control, only a correlation aid.
 - Writer-thread `TagSource` lookups on a cache miss return `None` and trigger the conservative fallback rather than blocking the writer on a Polaris round-trip. Acceptable: it masks more, never less.
 ```
-
