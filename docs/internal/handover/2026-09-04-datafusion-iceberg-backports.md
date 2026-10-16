@@ -152,4 +152,3 @@ integration, and JSON functions as one coherent stack.
 - `docs/internal/plans/2026-09-03-datafusion-iceberg-upgrade-program.md`
 - `docs/internal/research/2026-09-02-datafusion-55-followups.md`
 - `vendor/iceberg-rust/README.md`
-

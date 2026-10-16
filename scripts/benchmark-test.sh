@@ -747,7 +747,6 @@ fi
 # ── Run benchmarks ────────────────────────────────────────────
 TOTAL_PASS=0
 TOTAL_FAIL=0
-TOTAL_SKIP=0
 TOTAL_ERROR=0
 RESULTS=()
 # Collect per-benchmark summary lines: "name:pass:fail:diff:skip:error:total:ms"

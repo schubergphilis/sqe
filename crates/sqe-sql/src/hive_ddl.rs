@@ -92,10 +92,13 @@ fn extract(ct: &CreateTable) -> Result<HiveTableSpec, SqeError> {
         [d, t] => (None, Some(d.clone()), t.clone()),
         [c, d, t] => (Some(c.clone()), Some(d.clone()), t.clone()),
         other => {
-            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                "hive_external: table name must have 1 to 3 parts, got {}",
-                other.len()
-            )))
+            return Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!(
+                    "hive_external: table name must have 1 to 3 parts, got {}",
+                    other.len()
+                ),
+            ))
         }
     };
 
@@ -105,7 +108,8 @@ fn extract(ct: &CreateTable) -> Result<HiveTableSpec, SqeError> {
         .map(column_of)
         .collect::<Result<Vec<_>, _>>()?;
     if columns.is_empty() {
-        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+        return Err(SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
             "hive_external: CREATE EXTERNAL TABLE needs an explicit column list; schema \
              inference is not supported because the declared list is what binds CSV fields \
              by ordinal",
@@ -124,11 +128,14 @@ fn extract(ct: &CreateTable) -> Result<HiveTableSpec, SqeError> {
     // the main list would land in the Arrow schema twice.
     for k in &partition_keys {
         if columns.iter().any(|c| c.name == k.name) {
-            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                "hive_external: `{}` is both a column and a partition key. Hive declares \
+            return Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!(
+                    "hive_external: `{}` is both a column and a partition key. Hive declares \
                  partition keys only in PARTITIONED BY; remove it from the column list.",
-                k.name
-            )));
+                    k.name
+                ),
+            ));
         }
     }
 
@@ -192,7 +199,8 @@ fn extract(ct: &CreateTable) -> Result<HiveTableSpec, SqeError> {
         .clone()
         .or_else(|| ct.hive_formats.as_ref().and_then(|f| f.location.clone()))
         .ok_or_else(|| {
-            SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
                 "hive_external: CREATE EXTERNAL TABLE requires LOCATION '<url>'",
             )
         })?;
@@ -208,11 +216,14 @@ fn extract(ct: &CreateTable) -> Result<HiveTableSpec, SqeError> {
     };
     for key in table_properties.keys() {
         if key.starts_with("sqe.") && !KNOWN_SQE_PROPERTIES.contains(&key.as_str()) {
-            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
+            return Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!(
                 "hive_external: unknown property `{key}`. Known sqe. properties: {}. A silently \
                  ignored typo is a setting that did not apply.",
                 KNOWN_SQE_PROPERTIES.join(", ")
-            )));
+            ),
+            ));
         }
     }
 
@@ -260,11 +271,14 @@ fn ident_text(i: &Ident) -> String {
 fn column_of(c: &ColumnDef) -> Result<HiveColumn, SqeError> {
     let sql_type = c.data_type.to_string().to_ascii_lowercase();
     if sql_type.contains('<') {
-        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-            "hive_external: nested type `{sql_type}` on column `{}` is not supported in this \
+        return Err(SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!(
+                "hive_external: nested type `{sql_type}` on column `{}` is not supported in this \
              release. Cycle 2 adds a pre-parse type rewrite. Use a scalar type for now.",
-            ident_text(&c.name)
-        )));
+                ident_text(&c.name)
+            ),
+        ));
     }
     Ok(HiveColumn {
         name: ident_text(&c.name),

@@ -78,7 +78,7 @@ The hive download bundle currently has NO `tagPolicies` (confirmed by curl: pres
 
 ## Task 6: Quickstart live demo + gates + MR
 **Files:** `quickstart/polaris-ranger-keycloak/*`, docs.
-- [ ] Set `sqe.column-tags = {"ssn":["PII"]}` on `sales_wh.sales.pii` (or orders) via a Polaris `updateProperties` curl (no DDL needed for 3a). Ensure the hive service is tag-linked + a tag `PII` -> `MASK_SHOW_LAST_4` policy exists (Prerequisite). 
+- [ ] Set `sqe.column-tags = {"ssn":["PII"]}` on `sales_wh.sales.pii` (or orders) via a Polaris `updateProperties` curl (no DDL needed for 3a). Ensure the hive service is tag-linked + a tag `PII` -> `MASK_SHOW_LAST_4` policy exists (Prerequisite).
 - [ ] Live: as a user whose role the tag policy targets, `SELECT ssn FROM ...` returns the masked form; an exempt user sees raw. Add to test.sh.
 - [ ] Full gates; update `docs/fine-grained-policy.md`/`nextsteps.md`/README roadmap (Phase 3a tag masking shipped; 3b tagging DDL + Iceberg->Ranger sync remain).
 - [ ] Push `feat/tag-based-masking`; open MR -> main.

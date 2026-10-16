@@ -24,9 +24,6 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-
 # Configuration -- defaults to test stack (no OPA, simple auth)
 SQE_HOST="${SQE_HOST:-http://localhost:28080}"
 SQE_CATALOG="${SQE_CATALOG:-test_warehouse}"
@@ -87,17 +84,20 @@ get_sqe_token() {
 # Execute SQL on SQE via Trino HTTP protocol, return CSV-like output
 sqe_query() {
     local sql="$1"
-    local result=$(curl -s -X POST "$SQE_HOST/v1/statement" \
+    # `|| true` on each capture: a failed curl or JSON parse leaves the value
+    # empty and is reported below, rather than aborting the run (set -e).
+    local result state err
+    result=$(curl -s -X POST "$SQE_HOST/v1/statement" \
         -u "$SQE_USER:$SQE_PASS" \
         -H "X-Trino-User: $SQE_USER" \
         -H "X-Trino-Catalog: $SQE_CATALOG" \
         -H "Content-Type: text/plain" \
-        -d "$sql" 2>&1)
+        -d "$sql" 2>&1) || true
 
-    local state=$(echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('stats',{}).get('state','?'))" 2>/dev/null)
+    state=$(echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('stats',{}).get('state','?'))" 2>/dev/null) || true
 
     if [ "$state" != "FINISHED" ]; then
-        local err=$(echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('error',{}).get('message','unknown error'))" 2>/dev/null)
+        err=$(echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('error',{}).get('message','unknown error'))" 2>/dev/null) || true
         echo "ERROR: $err"
         return 1
     fi
@@ -115,12 +115,13 @@ for row in d.get('data', []):
 trino_query() {
     local sql="$1"
     # Redirect stderr to /dev/null to suppress Java warnings
-    local result=$(trino --server "$TRINO_HOST" \
+    local result
+    result=$(trino --server "$TRINO_HOST" \
         --user "$TRINO_USER" \
         --catalog "$TRINO_CATALOG" \
         --schema "$SCHEMA" \
         --execute "$sql" \
-        --output-format CSV_UNQUOTED 2>/dev/null)
+        --output-format CSV_UNQUOTED 2>/dev/null) || true
 
     if echo "$result" | grep -q "^Query.*failed:\|^Error"; then
         echo "ERROR: $result"
@@ -163,8 +164,9 @@ compare_query() {
         sed '/^$/d' | \
         sort
     }
-    local sqe_norm=$(echo "$sqe_out" | normalize)
-    local trino_norm=$(echo "$trino_out" | normalize)
+    local sqe_norm trino_norm
+    sqe_norm=$(echo "$sqe_out" | normalize) || true
+    trino_norm=$(echo "$trino_out" | normalize) || true
 
     # Handle NULL normalization: SQE returns "NULL", Trino returns empty
     if [ "$sqe_norm" = "NULL" ] && [ -z "$trino_norm" ]; then

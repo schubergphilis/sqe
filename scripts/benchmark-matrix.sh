@@ -214,7 +214,7 @@ docker compose -f docker-compose.test.yml up -d 2>&1 | tail -3
 
 # Wait for Polaris
 echo -n "Waiting for Polaris..."
-for i in $(seq 1 60); do
+for _ in $(seq 1 60); do
     HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://localhost:18181/api/catalog/v1/oauth/tokens" \
         -d "grant_type=client_credentials&client_id=root&client_secret=s3cr3t&scope=PRINCIPAL_ROLE:ALL" 2>/dev/null || echo "000")
     if [ "$HTTP" = "200" ]; then
@@ -247,7 +247,7 @@ if ! $SKIP_LOAD; then
     echo "Started coordinator for loading (PID: $LOAD_PID)"
 
     # Wait for coordinator
-    for i in $(seq 1 30); do
+    for _ in $(seq 1 30); do
         if curl -s -o /dev/null http://localhost:19090/metrics 2>/dev/null; then
             break
         fi
@@ -366,7 +366,7 @@ run_single_config() {
     local COORD_PID=$!
 
     # Wait for ready
-    for i in $(seq 1 30); do
+    for _ in $(seq 1 30); do
         if curl -s -o /dev/null http://localhost:19090/metrics 2>/dev/null; then
             break
         fi
@@ -406,7 +406,7 @@ run_single_config() {
 
         # Extract summary line
         SUMMARY_LINE=$(echo "$OUTPUT" | grep "^BENCH_SUMMARY:" || echo "BENCH_SUMMARY:$SUITE:0:0:0:0:0:0:0")
-        IFS=':' read -r _ _ PASS FAIL DIFF SKIP ERROR TOTAL TIME_MS <<< "$SUMMARY_LINE"
+        IFS=':' read -r _ _ PASS _ _ _ ERROR TOTAL TIME_MS <<< "$SUMMARY_LINE"
         TIME_S=$(echo "scale=1; ${TIME_MS:-0}/1000" | bc 2>/dev/null || echo "?")
         echo "${PASS:-0}/${TOTAL:-0} pass, ${ERROR:-0} error, ${TIME_S}s" | tee -a "$SUMMARY_FILE"
 
@@ -453,8 +453,9 @@ run_distributed_config() {
 
     # Check available memory before launching distributed stack
     if command -v sysctl &>/dev/null; then
-        local SYS_RAM_GB=$(($(sysctl -n hw.memsize 2>/dev/null | awk '{print int($1/1024/1024/1024)}') ))
-        local DOCKER_USED_GB=$(docker stats --no-stream --format "{{.MemUsage}}" 2>/dev/null \
+        local SYS_RAM_GB DOCKER_USED_GB
+        SYS_RAM_GB=$(($(sysctl -n hw.memsize 2>/dev/null | awk '{print int($1/1024/1024/1024)}') ))
+        DOCKER_USED_GB=$(docker stats --no-stream --format "{{.MemUsage}}" 2>/dev/null \
             | awk -F'/' '{print $1}' \
             | awk '{val=$0; if(index(val,"GiB")){gsub(/[^0-9.]/,"",val);sum+=val}} END{printf "%d",sum}' 2>/dev/null || echo "0")
         local FREE_GB=$((SYS_RAM_GB - DOCKER_USED_GB - 8))
@@ -480,7 +481,7 @@ run_distributed_config() {
 
     # Wait for coordinator
     echo -n "  Waiting for coordinator..."
-    for i in $(seq 1 120); do
+    for _ in $(seq 1 120); do
         if curl -s -o /dev/null "http://localhost:${DIST_METRICS_PORT}/metrics" 2>/dev/null; then
             echo " ready."
             break
@@ -514,7 +515,7 @@ run_distributed_config() {
         metrics_delta "$METRICS_BEFORE" "$METRICS_AFTER" "$METRICS_DELTA"
 
         SUMMARY_LINE=$(echo "$OUTPUT" | grep "^BENCH_SUMMARY:" || echo "BENCH_SUMMARY:$SUITE:0:0:0:0:0:0:0")
-        IFS=':' read -r _ _ PASS FAIL DIFF SKIP ERROR TOTAL TIME_MS <<< "$SUMMARY_LINE"
+        IFS=':' read -r _ _ PASS _ _ _ ERROR TOTAL TIME_MS <<< "$SUMMARY_LINE"
         TIME_S=$(echo "scale=1; ${TIME_MS:-0}/1000" | bc 2>/dev/null || echo "?")
         echo "${PASS:-0}/${TOTAL:-0} pass, ${ERROR:-0} error, ${TIME_S}s" | tee -a "$SUMMARY_FILE"
 

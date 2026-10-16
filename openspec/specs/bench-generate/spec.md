@@ -104,4 +104,3 @@ The system SHALL name generator output files with a per-partition prefix to allo
 - **WHEN** `sqe-bench load <benchmark>` runs against the output
 - **THEN** every file is ingested into Iceberg
 - **AND** the row count in the Iceberg table matches the expected SF row count
-

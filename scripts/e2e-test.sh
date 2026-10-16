@@ -7,9 +7,6 @@ set -euo pipefail
 #
 # Usage: ./scripts/e2e-test.sh
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-
 FLIGHT_HOST="${SQE_E2E_FLIGHT_HOST:-localhost}"
 FLIGHT_PORT="${SQE_E2E_FLIGHT_PORT:-50051}"
 TRINO_HOST="${SQE_E2E_TRINO_HOST:-localhost}"
