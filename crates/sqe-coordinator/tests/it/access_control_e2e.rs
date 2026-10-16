@@ -1709,6 +1709,61 @@ async fn unknown_tag_state_denies() {
     // The deny is per-scan, not global state.
     let after = exec_ok(&ctx, &ctx.bob, &sql).await;
     assert_eq!(total_rows(&after), 3);
+
+    // An incremental read builds its own provider, not the Iceberg one, so
+    // until #844 the cold handler still refused `FOR INCREMENTAL BETWEEN`.
+    // It now carries the table's properties and reads like a plain scan.
+    let current_snapshot = || async {
+        let catalog = ctx
+            .handler
+            .session_catalog(&ctx.carol)
+            .await
+            .expect("session catalog")
+            .for_sibling_warehouse("sales_wh")
+            .await
+            .expect("sales_wh catalog");
+        let ident = iceberg::TableIdent::from_strs(["ac", "orders"]).expect("ident");
+        let table = catalog
+            .load_table_uncached(&ident)
+            .await
+            .expect("load orders");
+        table
+            .metadata()
+            .current_snapshot()
+            .expect("orders has a snapshot")
+            .snapshot_id()
+    };
+    let before = current_snapshot().await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("INSERT INTO {ORDERS} VALUES (4,'EU',40.0,'444-44-4444','d@x',DATE '2024-08-07')"),
+    )
+    .await;
+    let appended = current_snapshot().await;
+    let incremental = format!(
+        "SELECT id, ssn FROM {ORDERS} FOR INCREMENTAL BETWEEN SNAPSHOT {before} AND SNAPSHOT {appended}"
+    );
+    let warm_inc = exec_ok(&ctx, &ctx.bob, &incremental).await;
+    let cold_inc = cold.execute(&ctx.bob, &incremental, None).await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("DELETE FROM {ORDERS} WHERE id = 4"),
+    )
+    .await;
+    let cold_inc = cold_inc
+        .unwrap_or_else(|e| panic!("a cold tag cache must not refuse an incremental read: {e}"));
+    assert_eq!(
+        total_rows(&cold_inc),
+        1,
+        "only the appended row is in range"
+    );
+    assert_eq!(
+        col_strings(&cold_inc, "ssn"),
+        col_strings(&warm_inc, "ssn"),
+        "the cold handler must read an incremental scan like the warm one"
+    );
 }
 
 /// A file table function has no Iceberg tags, so the unknown-tag-state deny
