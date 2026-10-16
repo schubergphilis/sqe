@@ -924,6 +924,102 @@ async fn drop_table_without_purge_leaves_the_files() {
 /// `register_table` can point a second identifier at the same files. Purging
 /// either would delete the other's data, so purge refuses until the twin is
 /// gone, and refuses before the catalog drop.
+/// SQL `DROP TABLE ... PURGE` runs the same purge as the CALL (#841): it
+/// used to drop the catalog entry and silently keep every data file.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn sql_drop_table_purge_deletes_the_table_prefix() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let session = as_admin(session);
+    let table = "default.maint_sql_drop_purge_test";
+
+    let data_file = table_with_a_data_file(&handler, &session, table).await;
+    let (bucket, data_key) = split_s3(&data_file);
+    let (_, dir_key) = split_s3(&table_dir_of(&data_file));
+    let store = purge_test_store(&bucket);
+    assert!(
+        exists(store.as_ref(), &data_key).await,
+        "fixture data file must exist"
+    );
+
+    handler
+        .execute(&session, &format!("DROP TABLE {table} PURGE"), None)
+        .await
+        .expect("DROP TABLE ... PURGE");
+
+    assert!(
+        !exists(store.as_ref(), &data_key).await,
+        "data file must be deleted"
+    );
+    let left = keys_under(store.as_ref(), &format!("{dir_key}/")).await;
+    assert!(
+        left.is_empty(),
+        "table prefix must be empty after purge, found {left:?}"
+    );
+    handler
+        .execute(&session, &format!("SELECT * FROM {table}"), None)
+        .await
+        .expect_err("the table must be gone from the catalog");
+
+    // IF EXISTS on the table that is now gone is a no-op, not an error.
+    handler
+        .execute(
+            &session,
+            &format!("DROP TABLE IF EXISTS {table} PURGE"),
+            None,
+        )
+        .await
+        .expect("DROP TABLE IF EXISTS ... PURGE of a missing table");
+    // Without IF EXISTS, a missing table fails.
+    handler
+        .execute(&session, &format!("DROP TABLE {table} PURGE"), None)
+        .await
+        .expect_err("DROP TABLE ... PURGE of a missing table must fail");
+}
+
+/// A catalog DROP grant alone does not delete files: SQL `PURGE` takes the
+/// admin gate `CALL system.drop_table(purge => true)` takes, and a denied
+/// caller's table and files stay.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn sql_drop_table_purge_needs_an_admin_role() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let admin = as_admin(session.clone());
+    let mut user = session;
+    user.user.roles = vec![];
+    let table = "default.maint_sql_drop_purge_denied_test";
+
+    let data_file = table_with_a_data_file(&handler, &admin, table).await;
+    let (bucket, data_key) = split_s3(&data_file);
+    let store = purge_test_store(&bucket);
+
+    let err = handler
+        .execute(&user, &format!("DROP TABLE {table} PURGE"), None)
+        .await
+        .expect_err("PURGE without an admin role must be refused");
+    assert_eq!(
+        err.error_code(),
+        sqe_core::SqeErrorCode::AccessDenied,
+        "{err}"
+    );
+    assert!(err.to_string().contains("Nothing was dropped"), "{err}");
+
+    assert!(
+        exists(store.as_ref(), &data_key).await,
+        "a refused PURGE must leave the data file"
+    );
+    let rows = handler
+        .execute(&admin, &format!("SELECT * FROM {table}"), None)
+        .await
+        .expect("a refused PURGE must leave the table");
+    assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+
+    handler
+        .execute(&admin, &format!("DROP TABLE {table} PURGE"), None)
+        .await
+        .expect("cleanup");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:polaris"]
 async fn drop_table_purge_refuses_while_another_table_shares_the_location() {
