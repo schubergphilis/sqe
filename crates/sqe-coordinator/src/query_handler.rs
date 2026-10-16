@@ -4052,8 +4052,11 @@ impl QueryHandler {
     /// Only pure SELECT/WITH queries are planned via DataFusion. DML advertises
     /// the same `rows_affected` result that the write handlers return; this is
     /// required by Flight SQL clients, which reject a prepared statement when
-    /// its declared and actual result schemas differ. Other non-query
-    /// statements remain side-effect-only and use an empty schema.
+    /// its declared and actual result schemas differ. Every other statement
+    /// returns an empty schema, meaning "not known before execution":
+    /// SHOW, DESCRIBE and EXPLAIN produce columns their handlers decide, and
+    /// DDL produces none. The Flight layer advertises that as no schema at
+    /// all (see `advertised_schema_bytes`).
     ///
     /// Boxed for the same reason as [`Self::execute`]: awaited unboxed, the
     /// planning state machine below made `get_flight_info_statement` re-prove
@@ -4091,30 +4094,20 @@ impl QueryHandler {
                 self.preflight_resolve_catalogs(stmt, session).await?;
             }
             let (ctx, session_catalog) = self.create_session_context(session).await?;
-            self.refresh_listing_snapshots(&ctx, &session_catalog, session, sql)
-                .await;
-            // Register incremental providers so the planner can resolve the
-            // tables with their augmented schemas. The FOR INCREMENTAL clause
-            // must be stripped before handle_time_travel sees it because that
-            // step parses the SQL with sqlparser.
-            let (sql_for_plan, incremental_identities) =
-                self.handle_incremental(sql, &ctx).await?;
-            let (sql_for_plan, _tt_cleanup) = self
-                .handle_time_travel(
-                    &sql_for_plan,
-                    &ctx,
-                    session,
-                    &session_catalog,
-                    incremental_identities,
-                )
+            // Plan exactly as DoGet will: the same normalization (`_colN`
+            // names for unaliased expressions), then the analyzed schema
+            // (coerced types, #839). ADBC refuses a stream whose schema
+            // differs from the FlightInfo's, so `SELECT 1+1` advertised
+            // `Int64(1) + Int64(1)` and failed on the `_col0` it received.
+            let (plan, _tt_cleanup) = self
+                .plan_sql_for_stream(&ctx, &session_catalog, session, sql, None)
                 .await?;
-            let df = sqe_catalog::file_tvf_prepare::plan_sql(&ctx, &sql_for_plan)
-                .await
+            let schema = sqe_catalog::file_tvf_prepare::analyzed_schema(&ctx, &plan)
                 .map_err(SqeError::planning)?;
             // `_tt_cleanup` drops here, deregistering any pinned providers
             // that schema-resolution required. Schema-only paths never read
-            // batches, so dropping right after `df.schema()` is fine.
-            Ok(Arc::new(df.schema().as_arrow().clone()))
+            // batches, so dropping right after planning is fine.
+            Ok(Arc::new(schema.as_arrow().clone()))
         } else if matches!(
             kind,
             StatementKind::Insert(_)
@@ -4129,8 +4122,8 @@ impl QueryHandler {
                 false,
             )])))
         } else {
-            // Other non-query statements: execution happens in
-            // do_get_statement via execute() and yields no result columns.
+            // Other statements: execution happens in do_get_statement via
+            // execute(); their columns (if any) are only known then.
             Ok(Arc::new(Schema::empty()))
         }
     }
