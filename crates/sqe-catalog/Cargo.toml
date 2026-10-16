@@ -219,7 +219,7 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 sqlparser = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
 tracing-subscriber = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 wiremock = { workspace = true }
