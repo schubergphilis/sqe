@@ -129,19 +129,32 @@ impl TagSource for CacheTagSource {
 /// table's current ones. Reading them here does not depend on the metadata
 /// cache still holding the table: a disabled cache (`ttl_secs = 0`), an
 /// eviction, or a commit racing the planning load no longer makes the tag
-/// state unknown (#842). Any other provider (Hive, views, metadata TVFs) is
-/// `NotRecognised` and goes to `CacheTagSource` / `HiveTagSource`.
+/// state unknown (#842). A `FOR INCREMENTAL BETWEEN SNAPSHOT` scan's
+/// `IncrementalTableProvider` carries the properties of the same kind of load
+/// (#844); one built without them is `NotRecognised`, never untagged. Any
+/// other provider (Hive, views, metadata TVFs) is `NotRecognised` and goes to
+/// `CacheTagSource` / `HiveTagSource`.
 pub(crate) fn scan_column_tags(
     provider: &dyn datafusion::catalog::TableProvider,
 ) -> sqe_policy::plan_rewriter::ScanTagState {
     use sqe_policy::plan_rewriter::ScanTagState;
 
-    let Some(iceberg) = (provider as &dyn std::any::Any)
-        .downcast_ref::<sqe_catalog::table_provider::SqeTableProvider>()
-    else {
+    let any = provider as &dyn std::any::Any;
+    let properties = if let Some(iceberg) =
+        any.downcast_ref::<sqe_catalog::table_provider::SqeTableProvider>()
+    {
+        iceberg.table().metadata().properties()
+    } else if let Some(properties) = any
+        .downcast_ref::<sqe_catalog::incremental_provider::IncrementalTableProvider>()
+        .and_then(|incremental| incremental.table_properties())
+    {
+        // A `FOR INCREMENTAL BETWEEN SNAPSHOT` scan carries the properties
+        // its planning load read (#844).
+        properties
+    } else {
         return ScanTagState::NotRecognised;
     };
-    match parse_column_tags(iceberg.table().metadata().properties()) {
+    match parse_column_tags(properties) {
         Ok(map) => ScanTagState::Known(map),
         Err(e) => {
             debug!(
@@ -734,6 +747,62 @@ mod scan_column_tags_tests {
     async fn malformed_tags_are_unknown_not_empty() {
         let provider = provider_with(&[(PROP_KEY, "not-json{{")]).await;
         assert_eq!(scan_column_tags(&provider), ScanTagState::Unknown);
+    }
+
+    /// An incremental read of a table carrying `properties` (#844).
+    fn incremental_with(
+        properties: Option<&[(&str, &str)]>,
+    ) -> sqe_catalog::incremental_provider::IncrementalTableProvider {
+        use sqe_catalog::incremental_provider::IncrementalTableProvider;
+        use sqe_catalog::incremental_scan::IncrementalPlan;
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("ssn", arrow::datatypes::DataType::Utf8, true),
+        ]));
+        let provider = IncrementalTableProvider::new(schema, IncrementalPlan::default(), None);
+        match properties {
+            Some(properties) => provider.with_table_properties(
+                properties
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
+            None => provider,
+        }
+    }
+
+    #[test]
+    fn an_incremental_scan_reports_its_tables_tags() {
+        let provider = incremental_with(Some(&[(PROP_KEY, r#"{"ssn":["PII"]}"#)]));
+        assert_eq!(
+            scan_column_tags(&provider),
+            ScanTagState::Known(HashMap::from([(
+                "ssn".to_string(),
+                vec!["PII".to_string()]
+            )]))
+        );
+    }
+
+    #[test]
+    fn an_untagged_incremental_scan_is_known_empty() {
+        let provider = incremental_with(Some(&[]));
+        assert_eq!(
+            scan_column_tags(&provider),
+            ScanTagState::Known(HashMap::new())
+        );
+    }
+
+    #[test]
+    fn malformed_incremental_tags_are_unknown() {
+        let provider = incremental_with(Some(&[(PROP_KEY, "not-json{{")]));
+        assert_eq!(scan_column_tags(&provider), ScanTagState::Unknown);
+    }
+
+    /// Without the table's properties nothing says the read is untagged,
+    /// so it must fall back to the cache, never read as Known(empty).
+    #[test]
+    fn an_incremental_scan_without_properties_is_not_recognised() {
+        let provider = incremental_with(None);
+        assert_eq!(scan_column_tags(&provider), ScanTagState::NotRecognised);
     }
 
     #[test]

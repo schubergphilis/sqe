@@ -27,6 +27,7 @@
 //!   `SqeTableProvider`: `projection` contains indices into the augmented
 //!   schema (base columns plus three meta columns).
 
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -78,6 +79,12 @@ pub struct IncrementalTableProvider {
     /// unit tests that exercise construction without a storage layer; in
     /// that mode the scan returns an empty batch.
     file_io: Option<FileIO>,
+    /// The table's properties as loaded for planning, so the policy
+    /// rewriter can read `sqe.column-tags` off the scan instead of the
+    /// metadata cache (#844). `None` when the builder never supplied them:
+    /// the rewriter then falls back to the cache rather than treating the
+    /// table as untagged.
+    table_properties: Option<HashMap<String, String>>,
 }
 
 impl std::fmt::Debug for IncrementalTableProvider {
@@ -106,7 +113,19 @@ impl IncrementalTableProvider {
             augmented_schema,
             plan: Arc::new(plan),
             file_io,
+            table_properties: None,
         }
+    }
+
+    /// Attach the table's properties as loaded for planning (#844).
+    pub fn with_table_properties(mut self, properties: HashMap<String, String>) -> Self {
+        self.table_properties = Some(properties);
+        self
+    }
+
+    /// The table's properties, if the builder supplied them.
+    pub fn table_properties(&self) -> Option<&HashMap<String, String>> {
+        self.table_properties.as_ref()
     }
 
     /// Return the augmented schema (base + 3 meta columns).
