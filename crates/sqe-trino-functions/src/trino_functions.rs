@@ -119,6 +119,12 @@ pub fn register_trino_functions(ctx: &datafusion::prelude::SessionContext) {
 
     // count_if, element_at (array/map), contains (array) (#356).
     crate::coverage_fns::register_coverage_fns(ctx);
+
+    // DataFusion's `to_char` and `map_extract` claim `date_format` and
+    // `element_at` as aliases. Left claiming them, either could take the key
+    // back whenever a query's session is rebuilt (see `overrides`).
+    crate::overrides::release_alias(ctx, "to_char", "date_format");
+    crate::overrides::release_alias(ctx, "map_extract", "element_at");
 }
 
 /// Register Trino-spelled aliases for existing DataFusion aggregate UDAFs.
@@ -573,8 +579,8 @@ fn ts_add_us(us: i64, unit: TimeUnit, amount: i64) -> DFResult<i64> {
 }
 
 /// Add `amount` of `unit` to a nanosecond timestamp, returning updated nanos.
-/// DataFusion's default timestamp resolution (what `now()` and
-/// `CAST(... AS timestamp)` produce) is nanosecond, so this is the common path.
+/// DataFusion's default timestamp resolution (what `CAST(... AS timestamp)`
+/// produces) is nanosecond, so this is the common path.
 fn ts_add_ns(ns: i64, unit: TimeUnit, amount: i64) -> DFResult<i64> {
     let dt = chrono::DateTime::from_timestamp_nanos(ns).naive_utc();
     let new_dt = add_units_to_naive(dt, unit, amount)
@@ -1417,6 +1423,15 @@ struct TrinoNow;
 impl ScalarUDFImpl for TrinoNow {
     fn name(&self) -> &str {
         "now"
+    }
+
+    // As in Trino, `current_timestamp` is the same function. It must be
+    // claimed here: DataFusion's `now` holds it as an alias, and while it
+    // held any key a session rebuild could hand it `now` back.
+    fn aliases(&self) -> &[String] {
+        static ALIASES: std::sync::LazyLock<Vec<String>> =
+            std::sync::LazyLock::new(|| vec!["current_timestamp".to_string()]);
+        &ALIASES
     }
 
     fn signature(&self) -> &Signature {
@@ -2702,7 +2717,7 @@ mod tests {
 
     #[tokio::test]
     async fn date_add_on_nanosecond_timestamp() {
-        // `CAST(... AS timestamp)` and `now()` produce Timestamp(Nanosecond),
+        // `CAST(... AS timestamp)` produces Timestamp(Nanosecond),
         // DataFusion's default. date_add previously only handled
         // TimestampMicrosecond and fell through to an INTERNAL_ERROR
         // ("unsupported scalar type TimestampNanosecond") -- which reads to a
