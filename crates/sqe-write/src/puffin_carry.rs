@@ -122,7 +122,7 @@ impl RawThetaSketch {
     /// or when it is empty while `ndv > 0` (a metadata-only blob whose body
     /// was never available: nothing to union with).
     pub fn decode(blob: &NdvBlob) -> Option<Self> {
-        if blob.body.len() % 8 != 0 {
+        if !blob.body.len().is_multiple_of(8) {
             return None;
         }
         if blob.body.is_empty() && blob.ndv > 0 {
@@ -130,8 +130,10 @@ impl RawThetaSketch {
         }
         let hashes: Vec<u64> = blob
             .body
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().expect("chunks_exact(8) yields 8 bytes")))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
             .collect();
         let theta = blob
             .properties
@@ -620,8 +622,10 @@ mod tests {
         assert_eq!(raw.encode().len(), 24);
         let decoded: Vec<u64> = raw
             .encode()
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
             .collect();
         assert_eq!(decoded, vec![1, 5, 99]);
     }
