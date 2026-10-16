@@ -400,8 +400,11 @@ async fn statement_without_a_token_is_unauthenticated() {
 /// ("endpoint 0 returned inconsistent schema") when they differ. Planning
 /// the advertised schema from the raw text named `SELECT 1 + 1`'s column
 /// `Int64(1) + Int64(1)` while execution, after normalization, sent `_col0`;
-/// EXPLAIN advertised zero fields and streamed `plan_type`/`plan`. A
-/// statement whose columns are only known at execution advertises none.
+/// EXPLAIN advertised zero fields and streamed `plan_type`/`plan`. Arrow
+/// Flight SQL JDBC treats a statement advertised without columns as an
+/// update, so SHOW / DESCRIBE / EXPLAIN must advertise theirs too, and
+/// nested nullability (list items, struct children) must agree on both
+/// sides. Plain and prepared statements are checked.
 #[tokio::test(flavor = "multi_thread")]
 async fn advertised_schema_matches_the_streamed_one() {
     let server = FlightServer::start().await;
@@ -413,46 +416,84 @@ async fn advertised_schema_matches_the_streamed_one() {
         "SELECT 1 + 1",
         "SELECT count(*) FROM generate_series(1, 3)",
         "SELECT 1 + 1 AS answer, 'x'",
+        "SELECT CAST('2024-01-02 03:04:05' AS TIMESTAMP) AS a",
+        "SELECT ARRAY[1, 2] AS a",
+        "SELECT named_struct('k', 1) AS a",
+        "SELECT CAST(1.5 AS DECIMAL(10, 2)) AS a",
         "EXPLAIN SELECT 1",
+        "DESCRIBE SELECT 1",
+        "SHOW CATALOGS",
     ] {
         let info = client
             .execute(sql.to_string(), None)
             .await
             .unwrap_or_else(|e| panic!("{sql}: GetFlightInfo failed: {e}"));
-        let advertised = (!info.schema.is_empty()).then(|| {
-            info.clone()
-                .try_decode_schema()
-                .unwrap_or_else(|e| panic!("{sql}: advertised schema decodes: {e}"))
-        });
-        let ticket = info.endpoint[0]
-            .ticket
-            .clone()
-            .expect("endpoint carries a ticket");
-        let mut stream = client
-            .do_get(ticket)
+        let advertised = advertised_schema(sql, &info);
+        let streamed = streamed_schema(&mut client, sql, &info).await;
+        assert_eq!(
+            advertised.fields(),
+            streamed.fields(),
+            "{sql}: FlightInfo advertised a different schema than DoGet streamed"
+        );
+
+        let mut prepared = client
+            .prepare(sql.to_string(), None)
             .await
-            .unwrap_or_else(|e| panic!("{sql}: DoGet failed: {e}"));
-        while stream
-            .try_next()
-            .await
-            .unwrap_or_else(|e| panic!("{sql}: stream failed: {e}"))
-            .is_some()
-        {}
-        let streamed = stream
-            .schema()
-            .expect("the stream carries a schema")
+            .unwrap_or_else(|e| panic!("{sql}: CreatePreparedStatement failed: {e}"));
+        let dataset = prepared
+            .dataset_schema()
+            .unwrap_or_else(|e| panic!("{sql}: dataset schema decodes: {e}"))
             .clone();
-        if let Some(advertised) = advertised {
-            assert_eq!(
-                advertised.fields(),
-                streamed.fields(),
-                "{sql}: FlightInfo advertised a different schema than DoGet streamed"
-            );
-        } else {
-            assert!(
-                sql.starts_with("EXPLAIN"),
-                "{sql}: a query's schema is known before execution and must be advertised"
-            );
-        }
+        let info = prepared
+            .execute()
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: prepared GetFlightInfo failed: {e}"));
+        let advertised = advertised_schema(sql, &info);
+        let streamed = streamed_schema(&mut client, sql, &info).await;
+        assert_eq!(
+            dataset.fields(),
+            streamed.fields(),
+            "{sql}: the prepared statement's dataset schema differs from what DoGet streamed"
+        );
+        assert_eq!(
+            advertised.fields(),
+            streamed.fields(),
+            "{sql}: prepared FlightInfo advertised a different schema than DoGet streamed"
+        );
     }
+}
+
+fn advertised_schema(sql: &str, info: &arrow_flight::FlightInfo) -> arrow_schema::Schema {
+    assert!(
+        !info.schema.is_empty(),
+        "{sql}: a result set's schema must be advertised, or Arrow JDBC treats it as an update"
+    );
+    info.clone()
+        .try_decode_schema()
+        .unwrap_or_else(|e| panic!("{sql}: advertised schema decodes: {e}"))
+}
+
+async fn streamed_schema(
+    client: &mut FlightSqlServiceClient<Channel>,
+    sql: &str,
+    info: &arrow_flight::FlightInfo,
+) -> arrow_schema::SchemaRef {
+    let ticket = info.endpoint[0]
+        .ticket
+        .clone()
+        .expect("endpoint carries a ticket");
+    let mut stream = client
+        .do_get(ticket)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: DoGet failed: {e}"));
+    while stream
+        .try_next()
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: stream failed: {e}"))
+        .is_some()
+    {}
+    stream
+        .schema()
+        .expect("the stream carries a schema")
+        .clone()
 }
