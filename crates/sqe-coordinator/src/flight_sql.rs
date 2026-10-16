@@ -1268,11 +1268,12 @@ impl SqeFlightSqlService {
     // -----------------------------------------------------------------
 
     /// Build a `FlightInfo` with a single endpoint pointing at the
-    /// coordinator (the current node).  This is the default for
-    /// non-distributed queries and preserves backward compatibility —
-    /// the endpoint carries no explicit `Location`, which tells
-    /// the client to fetch from the same server that returned the
-    /// `FlightInfo`.
+    /// coordinator (the current node). Every result is one coalesced
+    /// stream from the coordinator: workers only scan, and joins,
+    /// aggregates and sorts run here, so no worker holds a final result
+    /// partition a client could fetch directly (#810). The endpoint
+    /// carries no explicit `Location`, which tells the client to fetch
+    /// from the same server that returned the `FlightInfo`.
     pub fn build_flight_info_single(
         schema: &arrow_schema::Schema,
         ticket: Ticket,
@@ -1286,63 +1287,6 @@ impl SqeFlightSqlService {
                     .with_total_records(-1)
                     .with_ordered(false)
             })
-    }
-
-    /// Build a `FlightInfo` with one `FlightEndpoint` per worker that
-    /// holds result data.  Each endpoint contains a `Ticket` identifying
-    /// the result partition on that worker, and a `Location` pointing to
-    /// the worker's Flight endpoint URL.
-    ///
-    /// When `executor_endpoints` is empty the method falls back to a
-    /// single coordinator endpoint (no location) using
-    /// `fallback_ticket` — this keeps the coordinator as the data
-    /// source, which is the correct behavior when no workers were
-    /// involved.
-    pub fn build_flight_info_distributed(
-        schema: &arrow_schema::Schema,
-        executor_endpoints: &[(String, Ticket)],
-        fallback_ticket: Ticket,
-    ) -> Result<FlightInfo, Status> {
-        if executor_endpoints.is_empty() {
-            return Self::build_flight_info_single(schema, fallback_ticket);
-        }
-
-        let mut info = FlightInfo::new()
-            .try_with_schema(schema)
-            .map_err(|e| Status::internal(format!("Failed to encode schema: {e}")))?
-            .with_total_records(-1)
-            .with_ordered(false);
-
-        for (url, ticket) in executor_endpoints {
-            let endpoint = FlightEndpoint::new()
-                .with_ticket(ticket.clone())
-                .with_location(url.as_str());
-            info = info.with_endpoint(endpoint);
-        }
-
-        Ok(info)
-    }
-}
-
-/// Indicates whether a query's results are available locally on the
-/// coordinator or distributed across workers.
-///
-/// The Flight SQL layer inspects this after query planning / execution
-/// to decide whether to return a single-endpoint or multi-endpoint
-/// `FlightInfo`.
-#[derive(Debug, Clone)]
-pub enum QueryResultLocation {
-    /// Results are (or will be) on the coordinator — single endpoint.
-    Local,
-    /// Results are distributed across the listed workers.
-    /// Each entry is `(worker_flight_url, ticket)`.
-    Distributed(Vec<(String, Ticket)>),
-}
-
-impl QueryResultLocation {
-    /// Returns `true` when results are distributed across workers.
-    pub fn is_distributed(&self) -> bool {
-        matches!(self, Self::Distributed(eps) if !eps.is_empty())
     }
 }
 
@@ -3802,137 +3746,6 @@ mod tests {
             "single-endpoint should have no explicit location (client uses same server)"
         );
         assert_eq!(info.total_records, -1);
-    }
-
-    #[test]
-    fn build_flight_info_distributed_with_multiple_workers() {
-        let schema = test_schema();
-        let endpoints = vec![
-            ("grpc://worker-1:50051".to_string(), test_ticket("part-0")),
-            ("grpc://worker-2:50051".to_string(), test_ticket("part-1")),
-            ("grpc://worker-3:50051".to_string(), test_ticket("part-2")),
-        ];
-        let fallback = test_ticket("fallback");
-
-        let info =
-            SqeFlightSqlService::build_flight_info_distributed(&schema, &endpoints, fallback)
-                .expect("build_flight_info_distributed should succeed");
-
-        assert_eq!(
-            info.endpoint.len(),
-            3,
-            "distributed FlightInfo must have one endpoint per worker"
-        );
-
-        for (i, (expected_url, expected_ticket)) in endpoints.iter().enumerate() {
-            let ep = &info.endpoint[i];
-            assert_eq!(
-                ep.ticket.as_ref().expect("ticket must be set"),
-                expected_ticket,
-                "endpoint {} ticket must match",
-                i
-            );
-            assert_eq!(
-                ep.location.len(),
-                1,
-                "endpoint {} must have exactly 1 location",
-                i
-            );
-            assert_eq!(
-                ep.location[0].uri, *expected_url,
-                "endpoint {} location URI must match worker URL",
-                i
-            );
-        }
-    }
-
-    #[test]
-    fn build_flight_info_distributed_empty_falls_back_to_single() {
-        let schema = test_schema();
-        let empty: Vec<(String, Ticket)> = vec![];
-        let fallback = test_ticket("SELECT 1");
-
-        let info =
-            SqeFlightSqlService::build_flight_info_distributed(&schema, &empty, fallback.clone())
-                .expect("empty executor list should fall back to single endpoint");
-
-        assert_eq!(
-            info.endpoint.len(),
-            1,
-            "fallback must produce exactly 1 endpoint"
-        );
-        let ep = &info.endpoint[0];
-        assert_eq!(
-            ep.ticket.as_ref().expect("ticket must be set"),
-            &fallback,
-            "fallback ticket must match"
-        );
-        assert!(
-            ep.location.is_empty(),
-            "fallback endpoint should have no explicit location"
-        );
-    }
-
-    #[test]
-    fn build_flight_info_distributed_single_worker() {
-        let schema = test_schema();
-        let endpoints = vec![("grpc://worker-1:50051".to_string(), test_ticket("part-0"))];
-        let fallback = test_ticket("fallback");
-
-        let info =
-            SqeFlightSqlService::build_flight_info_distributed(&schema, &endpoints, fallback)
-                .expect("single-worker distributed should succeed");
-
-        assert_eq!(info.endpoint.len(), 1);
-        let ep = &info.endpoint[0];
-        assert_eq!(ep.location[0].uri, "grpc://worker-1:50051");
-        assert_eq!(ep.ticket.as_ref().unwrap().ticket.as_ref(), b"part-0");
-    }
-
-    #[test]
-    fn build_flight_info_distributed_carries_schema_bytes() {
-        let schema = test_schema();
-        let endpoints = vec![("grpc://worker-1:50051".to_string(), test_ticket("part-0"))];
-        let fallback = test_ticket("fallback");
-
-        let info =
-            SqeFlightSqlService::build_flight_info_distributed(&schema, &endpoints, fallback)
-                .expect("should succeed");
-
-        // The FlightInfo must carry encoded schema bytes so the client can
-        // decode the result schema before opening DoGet streams.
-        assert!(
-            !info.schema.is_empty(),
-            "FlightInfo must carry encoded schema bytes"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // QueryResultLocation enum
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn query_result_location_local_is_not_distributed() {
-        let loc = QueryResultLocation::Local;
-        assert!(!loc.is_distributed());
-    }
-
-    #[test]
-    fn query_result_location_distributed_empty_is_not_distributed() {
-        let loc = QueryResultLocation::Distributed(vec![]);
-        assert!(
-            !loc.is_distributed(),
-            "empty distributed list should be treated as non-distributed"
-        );
-    }
-
-    #[test]
-    fn query_result_location_distributed_non_empty_is_distributed() {
-        let loc = QueryResultLocation::Distributed(vec![(
-            "grpc://worker-1:50051".to_string(),
-            test_ticket("part-0"),
-        )]);
-        assert!(loc.is_distributed());
     }
 
     /// The handshake Basic-auth decoder must accept base64 WITH and WITHOUT
