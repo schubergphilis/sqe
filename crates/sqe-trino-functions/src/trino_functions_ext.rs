@@ -76,7 +76,7 @@ pub fn register_extended_trino_functions(ctx: &datafusion::prelude::SessionConte
 
     // Format / JSON
     ctx.register_udf(ScalarUDF::from(Format));
-    ctx.register_udf(ScalarUDF::from(ToJson));
+    ctx.register_udf(ScalarUDF::from(crate::json_cast::ToJson));
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1864,79 +1864,6 @@ fn apply_format(fmt: &str, args: &[String]) -> DFResult<String> {
     }
 
     Ok(result)
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// to_json() — convert scalar value to JSON string
-// ═══════════════════════════════════════════════════════════════════
-
-/// to_json(x) — converts a scalar value to its JSON string representation.
-///
-/// Strings are JSON-encoded (i.e. wrapped in double quotes and escaped).
-/// Numbers and booleans are rendered as JSON primitives.
-/// NULL → `"null"`.
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct ToJson;
-
-impl ScalarUDFImpl for ToJson {
-    fn name(&self) -> &str {
-        "to_json"
-    }
-
-    fn signature(&self) -> &Signature {
-        static SIG: LazyLock<Signature> =
-            LazyLock::new(|| Signature::new(TypeSignature::Any(1), Volatility::Immutable));
-        &SIG
-    }
-
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Utf8)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        match &args.args[0] {
-            ColumnarValue::Scalar(v) => {
-                let json = scalar_to_json_string(v);
-                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(json))))
-            }
-            ColumnarValue::Array(arr) => {
-                let result: StringArray = (0..arr.len())
-                    .map(|i| {
-                        if arr.is_null(i) {
-                            Some("null".to_string())
-                        } else {
-                            ScalarValue::try_from_array(arr.as_ref(), i)
-                                .ok()
-                                .map(|sv| scalar_to_json_string(&sv))
-                        }
-                    })
-                    .collect();
-                Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
-            }
-        }
-    }
-}
-
-/// Convert a `ScalarValue` to its JSON string representation.
-fn scalar_to_json_string(v: &ScalarValue) -> String {
-    match v {
-        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
-            serde_json::to_string(s.as_str()).unwrap_or_else(|_| format!("\"{s}\""))
-        }
-        ScalarValue::Int8(Some(n)) => n.to_string(),
-        ScalarValue::Int16(Some(n)) => n.to_string(),
-        ScalarValue::Int32(Some(n)) => n.to_string(),
-        ScalarValue::Int64(Some(n)) => n.to_string(),
-        ScalarValue::UInt8(Some(n)) => n.to_string(),
-        ScalarValue::UInt16(Some(n)) => n.to_string(),
-        ScalarValue::UInt32(Some(n)) => n.to_string(),
-        ScalarValue::UInt64(Some(n)) => n.to_string(),
-        ScalarValue::Float32(Some(f)) => f.to_string(),
-        ScalarValue::Float64(Some(f)) => f.to_string(),
-        ScalarValue::Boolean(Some(b)) => b.to_string(),
-        ScalarValue::Null => "null".to_string(),
-        other => format!("\"{other}\""),
-    }
 }
 
 #[cfg(test)]

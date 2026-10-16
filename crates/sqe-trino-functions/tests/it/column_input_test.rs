@@ -467,11 +467,7 @@ col_case!(
     "format(fmt_a, int_a)",
     [s("yyyy-MM-dd"), s("HH:mm:ss"), None]
 );
-col_case!(
-    col_to_json,
-    "to_json(int_a)",
-    [s("255"), s("-10"), s("null")]
-);
+col_case!(col_to_json, "to_json(int_a)", [s("255"), s("-10"), None]);
 col_case!(
     col_json_object_col_value,
     "json_object('id', int_a, 'name', str_a)",

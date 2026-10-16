@@ -237,6 +237,13 @@ async fn test_json_parse() {
     assert!(v.unwrap().contains("\"a\""), "Expected key 'a' in result");
 }
 
+#[tokio::test]
+async fn test_json_parse_is_canonical() {
+    // Trino 476: compact, object keys sorted at every level.
+    let v = eval_str(r#"SELECT json_parse('{"b": 1, "a": [2, {"d": 3, "c": 4}]}')"#).await;
+    assert_eq!(v.as_deref(), Some(r#"{"a":[2,{"c":4,"d":3}],"b":1}"#));
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Extended JSON Functions (from trino_functions_ext.rs)
 // ═══════════════════════════════════════════════════════════════
@@ -781,6 +788,78 @@ async fn test_to_json_float() {
     assert!(
         s.contains("3.14"),
         "Expected '3.14' in to_json output, got: {s}"
+    );
+}
+
+/// `CAST(x AS JSON)` is rewritten to `to_json(x)`. The expected strings are
+/// what Trino 476 returns for the same casts.
+#[tokio::test]
+async fn test_to_json_matches_trino_cast_as_json() {
+    let cases = [
+        ("make_array(1, 2)", "[1,2]"),
+        ("make_array(1, NULL, 3)", "[1,null,3]"),
+        (r#"make_array('a', 'b"c')"#, r#"["a","b\"c"]"#),
+        ("make_array(make_array(1), make_array(2, 3))", "[[1],[2,3]]"),
+        ("make_array(CAST(1.5 AS DECIMAL(10,2)))", "[1.50]"),
+        ("make_array(1.5, 1e300)", "[1.5,1.0E300]"),
+        ("make_array(0.0001, 12345678.9)", "[1.0E-4,1.23456789E7]"),
+        ("make_array(CAST('NaN' AS DOUBLE))", r#"["NaN"]"#),
+        ("make_array(CAST(1.5 AS REAL))", "[1.5]"),
+        ("make_array(true, false)", "[true,false]"),
+        ("make_array(9007199254740993)", "[9007199254740993]"),
+        ("make_array(DATE '2024-01-02')", r#"["2024-01-02"]"#),
+        (
+            "make_array(TIMESTAMP '2024-01-02 03:04:05.123')",
+            r#"["2024-01-02 03:04:05.123"]"#,
+        ),
+        ("make_array(chr(1))", r#"["\u0001"]"#),
+        ("map(['b', 'a'], [1, 2])", r#"{"a":2,"b":1}"#),
+        ("map(['B', 'a', 'A'], [1, 2, 3])", r#"{"A":3,"B":1,"a":2}"#),
+        ("map([10, 9], ['x', 'y'])", r#"{"10":"x","9":"y"}"#),
+        ("map(['a'], [NULL])", r#"{"a":null}"#),
+        ("map(['a'], [make_array(1, 2)])", r#"{"a":[1,2]}"#),
+        ("named_struct('a', 1, 'b', 'x')", r#"{"a":1,"b":"x"}"#),
+        (
+            "named_struct('a', 1, 'b', CAST(NULL AS VARCHAR))",
+            r#"{"a":1,"b":null}"#,
+        ),
+        ("1", "1"),
+        ("'abc'", r#""abc""#),
+        ("DATE '2024-01-02'", r#""2024-01-02""#),
+    ];
+    for (expr, want) in cases {
+        let got = eval_str(&format!("SELECT to_json({expr})")).await;
+        assert_eq!(got.as_deref(), Some(want), "to_json({expr})");
+    }
+}
+
+#[tokio::test]
+async fn test_to_json_null_is_sql_null() {
+    assert_eq!(eval_str("SELECT to_json(NULL)").await, None);
+    assert_eq!(
+        eval_str("SELECT to_json(CAST(NULL AS INT))").await,
+        None,
+        "a typed NULL is SQL NULL too, not the text 'null'"
+    );
+}
+
+#[tokio::test]
+async fn test_to_json_column_input() {
+    let ctx = ctx().await;
+    let batches = ctx
+        .sql("SELECT to_json(v) FROM (VALUES (make_array(1, 2)), (NULL), (make_array(3))) t(v)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let col = batches[0].column(0);
+    let got: Vec<Option<String>> = (0..col.len())
+        .map(|i| (!col.is_null(i)).then(|| array_value_to_string(col, i).unwrap()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![Some("[1,2]".to_string()), None, Some("[3]".to_string())]
     );
 }
 
