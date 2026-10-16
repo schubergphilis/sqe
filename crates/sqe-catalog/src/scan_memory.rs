@@ -680,7 +680,11 @@ mod tests {
         assert!(started.elapsed() >= wait);
     }
 
-    #[tokio::test]
+    // Paused clock: the budget counts slept time, so on a loaded runner the
+    // first wait's oversleep spent more than the 200 ms margin and the
+    // second admission failed. Paused, the naps are exact: 70 ms then 150 ms
+    // of the 300 ms budget.
+    #[tokio::test(start_paused = true)]
     async fn a_later_denial_keeps_the_budget_an_earlier_wait_left() {
         let (gate, _pool, mut other) = quota_gate(800, 900, Duration::from_millis(300), false);
         // Pressure lifts after ~50 ms of the 300 ms budget.
