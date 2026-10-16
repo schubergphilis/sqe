@@ -12,7 +12,7 @@ Snowflake and Spark also map well via the Trino layer.
 | Function | Origin | Notes | Trino | Snowflake | Spark SQL | DuckDB |
 |---|---|---|---|---|---|---|
 | `now()` | `sqe-trino-functions` | Returns `TIMESTAMP(6)`. Stable within one query. `trino_functions.rs:55` | `now` | `current_timestamp` | `now` / `current_timestamp` | `now` / `current_timestamp` |
-| `current_timestamp` | `datafusion-builtin` | Same value as `now()`. SQL keyword, no parens. | `current_timestamp` | `current_timestamp` | `current_timestamp` | `current_timestamp` |
+| `current_timestamp` | `sqe-trino-functions` | Alias of `now()`: same function, same `TIMESTAMP(6)` type. SQL keyword, no parens. | `current_timestamp` | `current_timestamp` | `current_timestamp` | `current_timestamp` |
 | `current_date` | `datafusion-builtin` | Today's date in session timezone. | `current_date` | `current_date` | `current_date` | `current_date` |
 | `current_time` | `datafusion-builtin` | Current wall-clock time. | `current_time` | `current_time` | `current_time` | `current_time` |
 | `localtime()` | `sqe-trino-functions` | Local time-of-day. Returns `TIME(6)`. `trino_functions.rs:64` | `localtime` | - | - | - |

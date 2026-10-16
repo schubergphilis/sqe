@@ -1711,6 +1711,10 @@ allowed_object_store_prefixes = ["s3://shared-landing/"]
         sqe_trino_functions::register_trino_functions(&ctx);
         sqe_trino_functions::register_extended_trino_functions(&ctx);
         datafusion_functions_json::register_all(&mut ctx).expect("register json udfs");
+        // A function claiming a key another one holds can take it back when
+        // a query's session is rebuilt for its memory quota.
+        let shadowed = sqe_trino_functions::overrides::shadowed_keys(&ctx.state());
+        assert!(shadowed.is_empty(), "shadowed function keys: {shadowed:?}");
 
         // One representative call per custom-UDF family. Each must parse and
         // build a logical plan under DuckDB; per-function logic is covered by the
