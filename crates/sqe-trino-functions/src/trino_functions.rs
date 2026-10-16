@@ -2595,11 +2595,16 @@ impl ScalarUDFImpl for JsonParse {
         Ok(DataType::Utf8)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        // json_parse validates and normalises the JSON string (compact form).
+        // json_parse validates and normalises the JSON string to Trino's
+        // canonical form: compact, object keys sorted. serde_json keeps
+        // insertion order here (`preserve_order` is on workspace-wide).
         str_transform("json_parse", &args.args[0], |s| {
             Some(
                 serde_json::from_str::<serde_json::Value>(s)
-                    .map(|v| v.to_string())
+                    .map(|mut v| {
+                        v.sort_all_objects();
+                        v.to_string()
+                    })
                     .unwrap_or_else(|_| "null".to_string()),
             )
         })
