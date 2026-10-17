@@ -23,7 +23,7 @@ use crate::ident::{
 };
 use crate::write_handler::{
     default_to_iceberg_literal as alter_default_to_iceberg_literal, parse_partition_transform_sql,
-    sql_type_to_arrow,
+    sql_type_to_arrow, sql_type_to_arrow_for,
 };
 
 /// Per-table async lock used to serialize read-merge-commit sequences (see
@@ -657,9 +657,17 @@ impl CatalogOps {
                         .any(|opt| matches!(opt.option, sqlparser::ast::ColumnOption::NotNull));
 
                     // A variant column exists only from format-version 3, and
-                    // its storage struct is not a plain Iceberg struct (#849).
-                    let is_variant = sqe_sql::is_variant_type(&column_def.data_type);
-                    if is_variant && metadata.format_version() < iceberg::spec::FormatVersion::V3 {
+                    // its storage struct is not a plain Iceberg struct. On a
+                    // v3 table JSON is a variant too, also nested (#849).
+                    let v3 = metadata.format_version() >= iceberg::spec::FormatVersion::V3;
+                    let tagged = sqe_core::variant::tag(&arrow_schema::Field::new(
+                        column_def.name.value.as_str(),
+                        sql_type_to_arrow_for(&column_def.data_type, v3)?,
+                        true,
+                    ));
+                    let arrow_type = tagged.data_type().clone();
+                    let is_variant = sqe_core::variant::is_variant_storage(&arrow_type);
+                    if !v3 && sqe_core::variant::contains_variant(&tagged) {
                         return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                             "Cannot add VARIANT column '{}': table '{table_ident}' is Iceberg format {}, \
                              and variant needs format v3",
@@ -667,7 +675,6 @@ impl CatalogOps {
                             metadata.format_version()
                         )));
                     }
-                    let arrow_type = sql_type_to_arrow(&column_def.data_type)?;
                     let iceberg_type = if is_variant {
                         iceberg::spec::Type::Variant(iceberg::spec::VariantType)
                     } else {

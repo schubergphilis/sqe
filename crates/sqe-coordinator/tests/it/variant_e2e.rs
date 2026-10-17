@@ -166,7 +166,7 @@ async fn variant_survives_ctas_and_insert_select() {
         .expect("INSERT SELECT of a VARIANT column");
 
     // ADD COLUMN VARIANT is refused on a v2 table, so it succeeding here
-    // shows the CTAS created a v3 table.
+    // shows the CTAS table is v3.
     handler
         .execute(
             &session,
@@ -243,7 +243,11 @@ async fn add_variant_column_to_v2_table_is_refused() {
     let fq = "default.variant_on_v2";
     drop(&handler, &session, fq).await;
     handler
-        .execute(&session, &format!("CREATE TABLE {fq} (id INT)"), None)
+        .execute(
+            &session,
+            &format!("CREATE TABLE {fq} (id INT) WITH ('format-version' = '2')"),
+            None,
+        )
         .await
         .expect("CREATE TABLE");
     let err = handler
@@ -257,6 +261,92 @@ async fn add_variant_column_to_v2_table_is_refused() {
     assert!(
         format!("{err}").contains("variant needs format v3"),
         "err: {err}"
+    );
+    drop(&handler, &session, fq).await;
+}
+
+/// On a format v3 table `JSON` is stored as a variant, also when added
+/// later; on a v2 table it stays a string column.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn json_column_is_a_variant_on_a_v3_table() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let v3 = "default.json_on_v3";
+    let v2 = "default.json_on_v2";
+    drop(&handler, &session, v3).await;
+    drop(&handler, &session, v2).await;
+    for sql in [
+        format!("CREATE TABLE {v3} (id INT, j JSON) WITH ('format-version' = '3')"),
+        format!("ALTER TABLE {v3} ADD COLUMN k JSON"),
+        format!(r#"INSERT INTO {v3} VALUES (1, '{{"a": {{"b": 2}}}}', '[1]'), (2, NULL, 'true')"#),
+    ] {
+        handler.execute(&session, &sql, None).await.expect(&sql);
+    }
+    assert_eq!(
+        rows(
+            &handler,
+            &session,
+            &format!("SELECT id, j, k FROM {v3} ORDER BY id")
+        )
+        .await,
+        vec![r#"1|{"a":{"b":2}}|[1]"#, "2|NULL|true"]
+    );
+    let ddl = show_create(&handler, &session, v3).await;
+    assert!(
+        ddl.contains("j VARIANT") && ddl.contains("k VARIANT"),
+        "SHOW CREATE TABLE {v3}: {ddl}"
+    );
+    // A variant takes only JSON.
+    let err = handler
+        .execute(
+            &session,
+            &format!("INSERT INTO {v3} VALUES (3, 'oops', NULL)"),
+            None,
+        )
+        .await
+        .expect_err("invalid JSON must fail on a v3 JSON column");
+    assert!(format!("{err}").contains("as VARIANT"), "err: {err}");
+
+    for sql in [
+        format!("CREATE TABLE {v2} (id INT, j JSON) WITH ('format-version' = '2')"),
+        format!("INSERT INTO {v2} VALUES (1, 'not json at all')"),
+    ] {
+        handler.execute(&session, &sql, None).await.expect(&sql);
+    }
+    assert_eq!(
+        rows(&handler, &session, &format!("SELECT j FROM {v2}")).await,
+        vec!["not json at all"]
+    );
+
+    drop(&handler, &session, v3).await;
+    drop(&handler, &session, v2).await;
+}
+
+/// The JSON functions take a variant column of a v3 table as they take
+/// JSON text.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn json_functions_read_a_v3_json_column() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let fq = "default.json_fns_on_v3";
+    drop(&handler, &session, fq).await;
+    for sql in [
+        format!("CREATE TABLE {fq} (id INT, j JSON) WITH ('format-version' = '3')"),
+        format!(r#"INSERT INTO {fq} VALUES (1, '{{"a": {{"b": 2}}, "s": "x"}}')"#),
+    ] {
+        handler.execute(&session, &sql, None).await.expect(&sql);
+    }
+    assert_eq!(
+        rows(
+            &handler,
+            &session,
+            &format!(
+                "SELECT json_extract(j, '$.a'), json_extract_scalar(j, '$.s'), \
+                 json_get_int(j, 'a', 'b') FROM {fq}"
+            )
+        )
+        .await,
+        vec![r#"{"b":2}|x|2"#]
     );
     drop(&handler, &session, fq).await;
 }

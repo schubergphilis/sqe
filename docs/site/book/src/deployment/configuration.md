@@ -145,7 +145,8 @@ warehouse = "iceberg"           # warehouse identifier the catalog expects
 metadata_cache_ttl_secs = 30    # Table metadata cache TTL; each table is revalidated
                                 # after 80-100% of it, so tables cached together
                                 # do not all revalidate at once
-default_table_format_version = 2 # Iceberg table format version (2 or 3)
+default_table_format_version = 3 # Iceberg table format version (2 or 3); 2 for
+                                # Trino < 481 / Spark < 4.0 / Iceberg < 1.10 readers
 trust_sort_order = false        # Trust Iceberg sort order for all columns, not just partition keys
 small_file_threshold_mb = 3     # Max file size for the direct-read fast path (0 to disable)
 parquet_compression = "zstd"    # Write-path Parquet codec: zstd, lz4, snappy, none

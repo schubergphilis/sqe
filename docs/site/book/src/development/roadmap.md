@@ -264,6 +264,7 @@ Iceberg V3 table format support landed end-to-end. The vendored fork at `vendor/
 | Schema evolution (`ALTER TABLE ADD/DROP COLUMN`, incl. nested struct fields) | Done |
 | Nanosecond timestamps (`TIMESTAMP_NS`, `TIMESTAMPTZ_NS`) | Done |
 | `VARIANT` columns (unshredded, JSON text in and out) | Done |
+| `JSON` stored as variant on V3 tables; `json*` functions read variants | Done |
 | Partition evolution | Done |
 | Equality deletes + position deletes (MoR) | Done |
 
