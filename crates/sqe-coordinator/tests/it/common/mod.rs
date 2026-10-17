@@ -6,6 +6,8 @@
 pub mod chaos_worker;
 /// Ranger Admin REST fixtures for `access_control_e2e`.
 pub mod ranger_fixture;
+/// The Spark 4.x interop container (`docker-compose.spark.yml`).
+pub mod spark_interop;
 pub mod spark_runner;
 
 use std::sync::Arc;

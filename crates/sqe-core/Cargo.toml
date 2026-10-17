@@ -60,3 +60,6 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 [dev-dependencies]
 # Property tests for the error classifiers (#639).
 proptest = "1"
+# The JSON functions `variant_json_args` wraps.
+datafusion-functions-json = { workspace = true }
+sqe-trino-functions = { path = "../sqe-trino-functions" }
