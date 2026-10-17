@@ -67,11 +67,11 @@ bootstrap() {
   # Two phases: `--wait` treats an EXITED container as a failure, so the
   # one-shot bootstrap containers cannot be in the --wait set.
   docker compose up -d keycloak rustfs ranger-db ranger-admin >/dev/null 2>&1
-  docker compose up -d --wait keycloak rustfs ranger-db ranger-admin || {
+  docker compose up -d --wait --wait-timeout 600 keycloak rustfs ranger-db ranger-admin || {
     red "stack failed to become healthy"; exit 1; }
   docker compose up -d keycloak-config bucket-init ranger-setup >/dev/null 2>&1
   wait_oneshot keycloak-config bucket-init ranger-setup
-  docker compose up -d --wait polaris || { red "polaris failed"; exit 1; }
+  docker compose up -d --wait --wait-timeout 300 polaris || { red "polaris failed"; exit 1; }
   docker compose up -d polaris-setup >/dev/null 2>&1
   wait_oneshot polaris-setup
   # Build before inspecting the image. The local tag may legitimately still
@@ -89,7 +89,7 @@ bootstrap() {
     exit 1
   }
   # Prefer health, but print actionable diagnostics when --wait fails.
-  if ! docker compose up -d --wait sqe; then
+  if ! docker compose up -d --wait --wait-timeout 300 sqe; then
     red "sqe failed healthcheck (compose --wait)"
     red "common cause: image missing /usr/local/bin/wget after Chainguard/distroless"
     red "rebuild: docker compose build sqe && docker compose up -d --force-recreate sqe"

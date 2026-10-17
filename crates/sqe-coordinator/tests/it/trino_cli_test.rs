@@ -207,26 +207,28 @@ fn find_trino_cli() -> Option<PathBuf> {
 /// Run one statement through the CLI and render `exit=<code>` plus the
 /// normalised stdout and stderr.
 fn run_cli(cli: &Path, server: &str, user: &str, password: &str, sql: &str) -> String {
-    let output = Command::new(cli)
-        .args([
-            "--server",
-            server,
-            "--insecure",
-            "--user",
-            user,
-            "--password",
-            "--catalog",
-            "test_warehouse",
-            "--schema",
-            "default",
-            "--output-format",
-            "CSV_HEADER",
-            "--execute",
-            sql,
-        ])
-        .env("TRINO_PASSWORD", password)
-        .output()
-        .expect("spawn trino-cli");
+    let output = crate::common::process::output_with_timeout(
+        Command::new(cli)
+            .args([
+                "--server",
+                server,
+                "--insecure",
+                "--user",
+                user,
+                "--password",
+                "--catalog",
+                "test_warehouse",
+                "--schema",
+                "default",
+                "--output-format",
+                "CSV_HEADER",
+                "--execute",
+                sql,
+            ])
+            .env("TRINO_PASSWORD", password),
+        crate::common::process::CLI_TIMEOUT,
+    )
+    .expect("run trino-cli");
     let code = output
         .status
         .code()

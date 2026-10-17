@@ -169,15 +169,16 @@ bootstrap() {
   dim "Ranger first boot can take 2-4 minutes; each Spark comparison starts a JVM."
 
   docker compose up -d keycloak rustfs ranger-db ranger-admin >/dev/null
-  docker compose up -d --wait keycloak rustfs ranger-db ranger-admin
+  docker compose up -d --wait --wait-timeout 600 keycloak rustfs ranger-db ranger-admin
   docker compose up -d keycloak-config bucket-init ranger-setup >/dev/null
   wait_oneshot keycloak-config bucket-init ranger-setup
   docker compose up -d polaris >/dev/null
-  docker compose up -d --wait polaris
+  docker compose up -d --wait --wait-timeout 300 polaris
   docker compose up -d polaris-setup >/dev/null
   wait_oneshot polaris-setup
   docker compose up -d sqe spark >/dev/null
-  docker compose up -d --wait sqe spark
+  # spark waits on data-seed, whose own retries are bounded (~3 min).
+  docker compose up -d --wait --wait-timeout 600 sqe spark
 }
 
 if [ "${AC_PARITY_NO_BOOTSTRAP:-0}" != 1 ]; then
