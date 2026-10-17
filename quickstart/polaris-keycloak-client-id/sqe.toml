@@ -46,7 +46,7 @@ roles_claim = "realm_access.roles"        # where SQE reads the user's roles
 polaris_url = "http://polaris:8181/api/catalog"
 warehouse = "quickstart"
 metadata_cache_ttl_secs = 30
-default_table_format_version = 2
+default_table_format_version = 3
 
 # Legacy single-catalog block: still required by the deserialiser even when
 # [catalogs.*] is set. The runtime drops it because [catalogs.*] is non-empty.

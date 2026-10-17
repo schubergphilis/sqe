@@ -40,13 +40,13 @@ accept_invalid_certs = true
 polaris_url = "http://polaris:8181/api/catalog"
 warehouse = "sales_wh"
 metadata_cache_ttl_secs = 30
-default_table_format_version = 2
+default_table_format_version = 3
 
 [catalogs.ops_wh]
 polaris_url = "http://polaris:8181/api/catalog"
 warehouse = "ops_wh"
 metadata_cache_ttl_secs = 30
-default_table_format_version = 2
+default_table_format_version = 3
 
 [catalog]
 polaris_url = "http://polaris:8181/api/catalog"

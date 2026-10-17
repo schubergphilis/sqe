@@ -159,6 +159,6 @@ ORDER BY 1;
 
 ## Iceberg V3 nanosecond timestamps
 
-`TIMESTAMP_NS` and `TIMESTAMP_NS WITH TIME ZONE` only exist in Iceberg format-version 3. Adding such a column to a CREATE TABLE auto-bumps the table format version. All datetime functions operate on these the same way they operate on `TIMESTAMP(6)`; the underlying Arrow type is `Timestamp(Nanosecond, ...)` instead of `Timestamp(Microsecond, ...)`.
+`TIMESTAMP_NS` and `TIMESTAMP_NS WITH TIME ZONE` only exist in Iceberg format-version 3. New tables are V3 by default, and a CREATE TABLE with such a column is V3 even when the configured default is 2. All datetime functions operate on these the same way they operate on `TIMESTAMP(6)`; the underlying Arrow type is `Timestamp(Nanosecond, ...)` instead of `Timestamp(Microsecond, ...)`.
 
 When you query a V3 ns column from a Trino client, Trino downscales to microseconds. SQE keeps the full precision when serving Arrow Flight SQL clients.

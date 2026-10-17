@@ -38,7 +38,7 @@ roles = ["admin"]
 polaris_url = "http://nessie:19120/iceberg"
 warehouse = "warehouse"
 metadata_cache_ttl_secs = 30
-default_table_format_version = 2
+default_table_format_version = 3
 
 [catalog]
 polaris_url = "http://nessie:19120/iceberg"

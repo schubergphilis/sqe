@@ -50,7 +50,7 @@ allow_insecure_jwks = true
 polaris_url = "http://polaris:8181/api/catalog"
 warehouse = "quickstart"
 metadata_cache_ttl_secs = 30
-default_table_format_version = 2
+default_table_format_version = 3
 
 [catalog]
 polaris_url = "http://polaris:8181/api/catalog"
