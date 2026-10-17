@@ -22,6 +22,7 @@ pub mod coverage_fns;
 pub(crate) mod helpers;
 pub mod higher_order;
 pub mod histogram;
+mod json_cast;
 pub mod map_aggregates;
 pub mod overrides;
 pub mod scalar_fns;

@@ -10,7 +10,9 @@
 //!   value to a JSON-formatted string; SQE already has a `to_json(v)` UDF
 //!   that does exactly that. DataFusion's SQL planner does not recognize
 //!   `JSON` as a target type for CAST, so without this rewrite users get
-//!   `Error: Unsupported SQL type JSON` at planning time.
+//!   `Error: Unsupported SQL type JSON` at planning time. A cast of a
+//!   JSON-returning function (`json_parse`, `json_extract`, ...) is dropped
+//!   instead, since `to_json` would re-encode its text as a JSON string.
 //!
 //! - `SELECT * FROM "ns.t$snapshots"` -> `SELECT * FROM table_snapshots('ns', 't')`.
 //!   Trino exposes Iceberg metadata tables as virtual tables with a `$`
@@ -182,8 +184,8 @@ pub fn apply_trino_compat(statements: &mut Vec<Statement>, source: &str) -> bool
     // we rewrite the cast to VARCHAR.
     let has_custom_cast = lower.contains("as uuid") || lower.contains("as ipaddress");
     // `json '...'` / `uuid '...'` -> rewrite_utf8_typed_string: Trino typed-string
-    // literals DataFusion rejects; rewritten to a plain string (SQE stores both
-    // JSON and UUID as Utf8). See #326 for UUID.
+    // literals DataFusion rejects; rewritten to a plain string / json_parse
+    // call (SQE stores both JSON and UUID as Utf8). See #326 for UUID.
     let has_utf8_literal = lower.contains("json '") || lower.contains("uuid '");
     // `row(` -> the `CAST(ROW(...) AS ROW(...))` named-row cast, which becomes
     // `named_struct(...)`. A bare ROW(...) is DataFusion's own row(). A false
@@ -705,20 +707,24 @@ fn rewrite_listagg_within_group(expr: &mut Expr) -> bool {
     true
 }
 
-/// Rewrite a Trino typed-string literal whose type SQE represents as Utf8 to a
-/// plain string literal: `JSON '<text>'` (#7) and `UUID '<text>'` (#326).
-/// DataFusion's planner rejects both typed strings ("Unsupported SQL type
-/// JSON" / "Unsupported SQL type UUID"); SQE stores JSON and UUID columns as
-/// Utf8 (see `sql_type_to_arrow`), and the string value carries the same
-/// content. This is the literal counterpart to `rewrite_cast_custom_to_varchar`,
-/// which already maps `CAST(.. AS UUID)` to VARCHAR. Returns true if the
-/// rewrite fired.
+/// Rewrite a Trino typed-string literal whose type SQE represents as Utf8:
+/// `JSON '<text>'` (#7) and `UUID '<text>'` (#326). DataFusion's planner
+/// rejects both typed strings ("Unsupported SQL type JSON" / "Unsupported SQL
+/// type UUID"); SQE stores JSON and UUID columns as Utf8 (see
+/// `sql_type_to_arrow`). A UUID becomes the plain string literal. A JSON
+/// literal becomes `json_parse('<text>')`, since Trino canonicalizes the text
+/// (compact, keys sorted): `JSON '{"b": 1, "a": 2}'` is `{"a":2,"b":1}`. This
+/// is the literal counterpart to `rewrite_cast_custom_to_varchar`, which
+/// already maps `CAST(.. AS UUID)` to VARCHAR. Returns true if the rewrite
+/// fired.
 fn rewrite_utf8_typed_string(expr: &mut Expr) -> bool {
     if let Expr::TypedString(ts) = expr {
-        if matches!(ts.data_type, SqlDataType::JSON | SqlDataType::Uuid) {
-            *expr = Expr::Value(ts.value.clone());
-            return true;
+        match ts.data_type {
+            SqlDataType::Uuid => *expr = Expr::Value(ts.value.clone()),
+            SqlDataType::JSON => *expr = call("json_parse", Expr::Value(ts.value.clone())),
+            _ => return false,
         }
+        return true;
     }
     false
 }
@@ -991,6 +997,12 @@ fn function_name_is(func: &Function, want: &str) -> bool {
             .unwrap_or(false)
 }
 
+/// Functions whose result Trino types as JSON. `to_json` is here because an
+/// inner `CAST(.. AS JSON)` has already been rewritten by the time the outer
+/// one is visited.
+const JSON_RETURNING_FUNCTIONS: &[&str] =
+    &["json_parse", "json_extract", "json_array_get", "to_json"];
+
 fn rewrite_cast_as_json(expr: &mut Expr) -> bool {
     let Expr::Cast {
         kind: _,
@@ -1005,25 +1017,44 @@ fn rewrite_cast_as_json(expr: &mut Expr) -> bool {
     if !matches!(data_type, SqlDataType::JSON) {
         return false;
     }
+    // SQE carries JSON as Utf8, so `to_json` would encode an already-JSON
+    // value as a JSON string. Trino's cast of a JSON value is the identity.
+    if let Expr::Function(func) = inner.as_ref() {
+        if JSON_RETURNING_FUNCTIONS
+            .iter()
+            .any(|name| function_name_is(func, name))
+        {
+            *expr = std::mem::replace(
+                inner.as_mut(),
+                Expr::Identifier(Ident::new("__cast_as_json_placeholder__")),
+            );
+            return true;
+        }
+    }
     let inner_expr = std::mem::replace(
         inner.as_mut(),
         Expr::Identifier(Ident::new("__cast_as_json_placeholder__")),
     );
-    *expr = Expr::Function(Function {
-        name: ObjectName::from(vec![Ident::new("to_json")]),
+    *expr = call("to_json", inner_expr);
+    true
+}
+
+/// `name(arg)`, a plain one-argument function call.
+fn call(name: &str, arg: Expr) -> Expr {
+    Expr::Function(Function {
+        name: ObjectName::from(vec![Ident::new(name)]),
         uses_odbc_syntax: false,
         parameters: FunctionArguments::None,
         args: FunctionArguments::List(FunctionArgumentList {
             duplicate_treatment: None,
-            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(inner_expr))],
+            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(arg))],
             clauses: vec![],
         }),
         filter: None,
         null_treatment: None,
         over: None,
         within_group: vec![],
-    });
-    true
+    })
 }
 
 /// Rewrite a bare `current_schema` identifier into the `current_schema()`
@@ -1403,6 +1434,16 @@ mod tests {
         assert!(lower.contains("to_json"), "outer cast missing: {out}");
         assert!(lower.contains("cast"), "inner cast removed: {out}");
         assert!(lower.contains("bigint"), "BIGINT type removed: {out}");
+    }
+
+    #[test]
+    fn cast_of_json_value_is_the_identity() {
+        let out = rewrite_trino_compat("SELECT CAST(json_parse(s) AS JSON) FROM t");
+        assert_eq!(out, "SELECT json_parse(s) FROM t");
+        let out = rewrite_trino_compat("SELECT CAST(json_extract(s, '$.a') AS JSON) FROM t");
+        assert_eq!(out, "SELECT json_extract(s, '$.a') FROM t");
+        let out = rewrite_trino_compat("SELECT CAST(CAST(x AS JSON) AS JSON) FROM t");
+        assert_eq!(out, "SELECT to_json(x) FROM t");
     }
 
     #[test]
@@ -2060,15 +2101,15 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_json_literal_to_string() {
-        // Trino `JSON '<text>'` -> a plain string literal (SQE stores JSON as
-        // Utf8); DataFusion rejects the JSON typed string. (#7)
+    fn rewrites_json_literal_to_json_parse() {
+        // Trino `JSON '<text>'` -> `json_parse('<text>')` (SQE stores JSON as
+        // Utf8, and json_parse canonicalizes as Trino does); DataFusion
+        // rejects the JSON typed string. (#7)
         let out = rewrite_trino_compat(r#"SELECT JSON '{"a": 1}' AS j"#);
-        assert!(
-            !out.to_uppercase().contains("JSON '"),
-            "JSON literal kept: {out}"
-        );
-        assert!(out.contains(r#"'{"a": 1}'"#), "string value lost: {out}");
+        assert_eq!(out, r#"SELECT json_parse('{"a": 1}') AS j"#);
+        // A cast of the literal is then the identity.
+        let out = rewrite_trino_compat(r#"SELECT CAST(JSON '[1]' AS JSON)"#);
+        assert_eq!(out, "SELECT json_parse('[1]')");
     }
 
     #[test]

@@ -11,7 +11,7 @@ JSON columns are stored as `VARCHAR` (Iceberg has no native JSON type yet). Both
 
 | Function | Origin | Notes | Trino | Snowflake | Spark SQL | DuckDB |
 |---|---|---|---|---|---|---|
-| `json_parse(s)` | `sqe-trino-functions` | Parse JSON text. Returns the same `VARCHAR` after validation; primarily used to fail fast on malformed input. `trino_functions.rs:92` | yes | `parse_json` | `from_json` | `json` |
+| `json_parse(s)` | `sqe-trino-functions` | Parse JSON text and return it in Trino's canonical form: compact, object keys sorted (`{"b": 1, "a": 2}` becomes `{"a":2,"b":1}`). Malformed input returns the text `null` (Trino raises an error). `trino_functions.rs:92` | yes | `parse_json` | `from_json` | `json` |
 | `json_format(j)` | `sqe-trino-functions` | Format / re-emit JSON. `trino_functions.rs:60` | yes | - | `to_json` | `to_json` |
 | `json_object(k1, v1, k2, v2, ...)` | `sqe-trino-functions` | Build a JSON object from key-value pairs. `trino_functions.rs:59` | yes | yes | yes | yes |
 | `json_array_length(j)` | `sqe-trino-functions` | Number of elements in a JSON array. NULL if not an array. `trino_functions.rs:91` | yes | yes | yes | `json_array_length` |
@@ -21,7 +21,35 @@ JSON columns are stored as `VARCHAR` (Iceberg has no native JSON type yet). Both
 | `json_array_contains(j, v)` | `sqe-trino-functions (ext)` | True if JSON array contains the value. `trino_functions_ext.rs:31` | yes | - | - | - |
 | `json_size(j, '$.path')` | `sqe-trino-functions (ext)` | Cardinality at the path. Object key count for objects; array length for arrays; `0` for primitives. `trino_functions_ext.rs:72` | yes | - | - | - |
 | `json_array_get(j, idx)` | `sqe-trino-functions (ext)` | 0-based element from a JSON array. `trino_functions_ext.rs:73` | yes | - | - | - |
-| `to_json(any)` | `sqe-trino-functions (ext)` | Serialize a SQL value (struct, array, map) as JSON. `trino_functions_ext.rs:80` | - | yes | yes | yes |
+| `to_json(any)` | `sqe-trino-functions (ext)` | Serialize a SQL value (struct, array, map) as JSON; the target of `CAST(x AS JSON)`, see below. NULL in, NULL out. `json_cast.rs` | - | yes | yes | yes |
+
+## CAST(x AS JSON)
+
+`CAST(x AS JSON)` is rewritten to `to_json(x)` and returns the text Trino 476 returns for the same cast:
+
+| Input | Result |
+|---|---|
+| `ARRAY[1, NULL, 3]` | `[1,null,3]` |
+| `ARRAY['a', 'b"c']` | `["a","b\"c"]` (strings escaped, control characters as `\u0001`) |
+| `ARRAY[1.5, 2.25]` (decimal) | `[1.50,2.25]` (the declared scale is kept) |
+| `ARRAY[DOUBLE '1e300', DOUBLE '0.0001']` | `[1.0E300,1.0E-4]` (Java `Double.toString` notation) |
+| `ARRAY[DOUBLE 'NaN']` | `["NaN"]` (also `"Infinity"`, `"-Infinity"`) |
+| `ARRAY[DATE '2024-01-02']` | `["2024-01-02"]` |
+| `ARRAY[TIMESTAMP '2024-01-02 03:04:05.123']` | `["2024-01-02 03:04:05.123"]` |
+| `MAP(ARRAY['b', 'a'], ARRAY[1, 2])` | `{"a":2,"b":1}` (keys stringified and sorted) |
+| `MAP(ARRAY[10, 9], ARRAY['x', 'y'])` | `{"10":"x","9":"y"}` |
+| `CAST(ROW(1, 'x') AS ROW(a INTEGER, b VARCHAR))` | `{"a":1,"b":"x"}` |
+| `'abc'` | `"abc"` |
+| `NULL` | SQL `NULL` |
+
+A cast of a value that is already JSON (`json_parse`, `json_extract`, `json_array_get`, a `JSON '...'` literal, a nested `CAST(.. AS JSON)`) returns the value unchanged. `JSON '<text>'` is read as `json_parse('<text>')`, so the literal comes back canonical too.
+
+Known differences from Trino:
+
+- **Anonymous rows**: `CAST(ROW(1, 'x') AS JSON)` gives `{"c0":1,"c1":"x"}`; Trino gives `{"":1,"":"x"}`. Name the fields with `CAST(ROW(..) AS ROW(a .., b ..))` to get the same output.
+- **JSON columns and JSON inside an array or map**: SQE stores JSON as `VARCHAR` with no type marker, so only a cast of a JSON-returning function is recognised as already JSON. `CAST(payload AS JSON)` on a stored `JSON` column encodes the text as a JSON string, `"{\"a\":1}"`, where Trino returns it unchanged, `{"a":1}`; likewise `CAST(ARRAY[json_parse('{"a":1}')] AS JSON)` gives `["{\"a\":1}"]`, where Trino embeds it, `[{"a":1}]`. Use the column directly, or `json_parse(payload)`, instead of casting it.
+- **Timestamp precision**: fractional seconds print without trailing zeros; Trino pads to the declared precision. A zoned timestamp ends in an offset (`+00:00`), not a zone name (`UTC`).
+- **Types Trino refuses**: varbinary, time and interval values are written as their quoted text; Trino raises "Cannot cast ... to json". Likewise `CAST(json AS VARCHAR)` returns the JSON text, where Trino raises an error.
 
 ## DataFusion JSON layer
 
