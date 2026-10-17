@@ -4,6 +4,8 @@
 
 /// In-process chaos worker for `distributed_failure_e2e` (finding 411).
 pub mod chaos_worker;
+/// Child processes with a deadline (`output_with_timeout`).
+pub mod process;
 /// Ranger Admin REST fixtures for `access_control_e2e`.
 pub mod ranger_fixture;
 /// The Spark 4.x interop container (`docker-compose.spark.yml`).

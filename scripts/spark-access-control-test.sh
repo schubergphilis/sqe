@@ -44,8 +44,13 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 # Two-phase bring-up. `--wait` treats an EXITED container as a failure, and the
 # one-shot setup jobs exit 0 on success, so they are started without `--wait` and
 # waited on by exit code below.
+#
+# `spark` depends on `data-seed`, so it is started with --no-deps; without it
+# compose runs the seed anyway, and `--wait` blocks on it.
 docker compose up -d keycloak-config bucket-init ranger-setup polaris-setup
-docker compose up -d --wait keycloak rustfs ranger-db ranger-admin polaris sqe spark
+docker compose up -d --wait --wait-timeout "$RANGER_TIMEOUT" \
+    keycloak rustfs ranger-db ranger-admin polaris sqe
+docker compose up -d --no-deps --wait --wait-timeout "$RANGER_TIMEOUT" spark
 
 wait_oneshot() { # service
     local svc=$1 deadline=$((SECONDS + RANGER_TIMEOUT)) cid state code
@@ -93,7 +98,9 @@ wait_for "keycloak"     "$KEYCLOAK_URL/realms/iceberg-ranger/.well-known/openid-
 # can run. One trivial query proves the JVM, the jars, and the Ranger plugin conf
 # all load, and fails here with a readable error rather than inside a test.
 echo "  probing spark-sql (first JVM start can take ~30s)..."
-if ! docker compose exec -T spark /opt/spark/bin/spark-sql -e "SELECT 1" >/tmp/spark-probe.log 2>&1; then
+# perl's alarm is the portable timeout: macOS has no `timeout(1)`.
+if ! perl -e 'alarm shift; exec @ARGV' 300 \
+    docker compose exec -T spark /opt/spark/bin/spark-sql -e "SELECT 1" >/tmp/spark-probe.log 2>&1; then
     echo "ERROR: spark-sql is not usable. Last lines:" >&2
     tail -20 /tmp/spark-probe.log >&2
     exit 1

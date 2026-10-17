@@ -787,15 +787,17 @@ impl RangerContainer {
     }
 
     fn compose(&self, args: &[&str]) -> anyhow::Result<()> {
-        let out = std::process::Command::new("docker")
-            .arg("compose")
-            .arg("--project-directory")
-            .arg(&self.stack_dir)
-            .arg("-f")
-            .arg(self.stack_dir.join("docker-compose.yml"))
-            .args(args)
-            .output()
-            .context("run docker compose")?;
+        let out = super::process::output_with_timeout(
+            std::process::Command::new("docker")
+                .arg("compose")
+                .arg("--project-directory")
+                .arg(&self.stack_dir)
+                .arg("-f")
+                .arg(self.stack_dir.join("docker-compose.yml"))
+                .args(args),
+            super::process::COMPOSE_TIMEOUT,
+        )
+        .context("run docker compose")?;
         if !out.status.success() {
             bail!(
                 "docker compose {:?} failed: {}",
