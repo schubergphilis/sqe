@@ -46,7 +46,10 @@ files regardless of strategy:
   delete files applying to it, even if the file is already at or above the
   target size. The threshold is the lever for delete-heavy Merge-on-Read
   tables, where the file itself is fine but every scan pays to apply a
-  stack of deletes against it.
+  stack of deletes against it. On a format-version 3 table each data file
+  has at most one deletion vector, so a threshold above 1 counts only
+  equality deletes (see
+  [Procedures](../sql-reference/procedures.md)).
 - **`rewrite_all => true`**. Forces a rewrite of every data file, including
   files already at or above the target size and partitions below
   `min_input_files`. It applies all deletes and re-encodes at the target

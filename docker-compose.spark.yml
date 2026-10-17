@@ -24,6 +24,9 @@ services:
   spark-iceberg:
     image: apache/spark:4.1.3
     container_name: sqe-spark-iceberg
+    # The image runs as `spark` with HOME=/nonexistent, where Ivy cannot
+    # write its resolution cache. Root, with the cache on the volume below.
+    user: root
     depends_on:
       polaris:
         condition: service_healthy
@@ -48,6 +51,12 @@ services:
       - |
         mkdir -p /opt/spark/conf
         cat >/opt/spark/conf/spark-defaults.conf <<'CONF'
+        spark.jars.ivy                                      /root/.ivy2
+        # Each spark-sql run gets its own in-memory Derby metastore. The default
+        # ./metastore_db is shared by the healthcheck and the tests' concurrent
+        # runs, and a collision corrupts it ("No class was registered for
+        # identifier"). Tables live in the REST catalog, not here.
+        spark.hadoop.javax.jdo.option.ConnectionURL         jdbc:derby:memory:metastore_db;create=true
         spark.jars.packages                                 org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:1.12.0,org.apache.hadoop:hadoop-aws:3.4.1,software.amazon.awssdk:bundle:2.54.17
         spark.sql.extensions                                org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
         spark.sql.catalog.rest                              org.apache.iceberg.spark.SparkCatalog
@@ -67,6 +76,27 @@ services:
         spark.hadoop.fs.s3a.secret.key                      s3admin
         spark.hadoop.fs.s3a.aws.credentials.provider        org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
         CONF
+        # The catalog's storage endpoint is the host-side http://localhost:19000
+        # (what SQE on the host uses), and Iceberg lets the table config the
+        # catalog returns override s3.endpoint above. Forward that port to
+        # RustFS so the same endpoint works in here.
+        python3 - <<'PY' &
+        import asyncio
+        async def pipe(r, w):
+            try:
+                while data := await r.read(65536):
+                    w.write(data)
+                    await w.drain()
+            finally:
+                w.close()
+        async def handle(cr, cw):
+            ur, uw = await asyncio.open_connection("rustfs", 9000)
+            await asyncio.gather(pipe(cr, uw), pipe(ur, cw), return_exceptions=True)
+        async def main():
+            server = await asyncio.start_server(handle, "127.0.0.1", 19000)
+            await server.serve_forever()
+        asyncio.run(main())
+        PY
         # Keep the container alive. The interop harness drives SQL via
         # `docker exec ... spark-sql`, not Connect, so we only need a
         # long-running process. `tail -f /dev/null` works and uses no CPU.

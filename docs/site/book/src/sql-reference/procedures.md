@@ -117,6 +117,13 @@ therefore rewrites broadly, since one equality delete can apply to many files.
 The option is off by default and is a no-op under `strategy => 'sort'`, which
 already rewrites the whole partition.
 
+On a format-version 3 table (the default for new tables) position deletes are
+deletion vectors: each data file has at most one, and every `DELETE` replaces
+it. A threshold above 1 is therefore never reached by SQE's own deletes, however
+many rows they remove; only equality deletes from other writers still add up.
+To rewrite a delete-heavy V3 table, use `rewrite_all => true` or a threshold of
+1, which rewrites every data file that has any deletes.
+
 ### Override the distribution mode for one call
 
 `distributed => 'auto'|'local'|'require'` overrides

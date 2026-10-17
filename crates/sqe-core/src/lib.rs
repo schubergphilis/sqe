@@ -13,6 +13,7 @@ pub mod ticket_signing;
 pub mod tls;
 pub mod txn_id;
 pub mod variant;
+pub mod variant_json_args;
 
 pub use process_memory::{
     check_process_headroom, enforced_memory_limit_bytes, enforced_memory_limit_source,

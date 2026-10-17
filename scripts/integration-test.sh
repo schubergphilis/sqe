@@ -72,6 +72,8 @@ if [ "$#" -eq 0 ] && [ "$DISTRIBUTED" != "1" ]; then
     # compaction_distributed_benchmark measures a distributed-vs-local ratio.
     SKIP_ARGS+=(--skip rewrite_data_files_distributed_parity)
     SKIP_ARGS+=(--skip compaction_distributed_benchmark)
+    # One worker on :50052 (see that file's header).
+    SKIP_ARGS+=(--skip variant_distributed)
     # A timing study, not a correctness test: it prints a before/after ratio.
     SKIP_ARGS+=(--skip compaction_sort_benchmark)
 fi
