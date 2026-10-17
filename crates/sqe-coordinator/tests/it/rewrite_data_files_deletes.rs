@@ -107,11 +107,14 @@ async fn seed_mor_table(
 ) {
     let _ = exec(handler, session, &format!("DROP TABLE IF EXISTS {table}")).await;
     // CTAS establishes the table + write.delete.mode; it also writes id=0.
+    // V2: this file covers position-delete rewrites; V3 deletion vectors are
+    // covered in v3_e2e.
     exec(
         handler,
         session,
         &format!(
-            "CREATE TABLE {table} TBLPROPERTIES ('write.delete.mode' = 'merge-on-read') \
+            "CREATE TABLE {table} \
+             TBLPROPERTIES ('write.delete.mode' = 'merge-on-read', 'format-version' = '2') \
              AS SELECT CAST(0 AS BIGINT) AS id"
         ),
     )
@@ -237,13 +240,16 @@ async fn rewrite_delete_file_threshold_triggers_on_delete_heavy_file() {
     let table = format!("{namespace}.{table_name}");
 
     let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {table}")).await;
-    // One data file (single INSERT) of 10 rows, Merge-on-Read deletes.
+    // One data file (single INSERT) of 10 rows, Merge-on-Read deletes. V2:
+    // on V3 each DELETE replaces the file's one deletion vector, so a data
+    // file never has more than one delete file and a threshold above 1 can
+    // never fire.
     exec(
         &handler,
         &session,
         &format!(
             "CREATE TABLE {table} (id BIGINT) \
-             TBLPROPERTIES ('write.delete.mode' = 'merge-on-read')"
+             TBLPROPERTIES ('write.delete.mode' = 'merge-on-read', 'format-version' = '2')"
         ),
     )
     .await;

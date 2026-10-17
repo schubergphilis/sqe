@@ -5,7 +5,8 @@
 //! harness that needs a running catalog.
 
 use sqe_sql::{
-    detect_ns_timestamp, extract_default_literal, is_v3_only_type, DefaultLiteral, NsTimestamp,
+    detect_ns_timestamp, extract_default_literal, is_v3_only_type, is_variant_type, DefaultLiteral,
+    NsTimestamp,
 };
 use sqlparser::ast::{ColumnOption, Statement};
 use sqlparser::dialect::GenericDialect;
@@ -68,6 +69,15 @@ fn plain_timestamp_does_not_trigger_v3() {
     let ty = column_type(&stmt, "ts");
     assert_eq!(detect_ns_timestamp(ty), None);
     assert!(!is_v3_only_type(ty));
+}
+
+#[test]
+fn variant_is_detected_in_create_table() {
+    let stmt = parse("CREATE TABLE events (v VARIANT, w variant, s VARCHAR)");
+    assert!(is_variant_type(column_type(&stmt, "v")));
+    assert!(is_v3_only_type(column_type(&stmt, "w")));
+    assert!(!is_variant_type(column_type(&stmt, "s")));
+    assert!(!is_v3_only_type(column_type(&stmt, "s")));
 }
 
 // ---------------------------------------------------------------------------

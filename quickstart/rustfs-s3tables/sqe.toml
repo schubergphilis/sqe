@@ -43,7 +43,7 @@ catalog_url = "http://rustfs:9000/iceberg"
 warehouse = "warehouse"
 require_vended_credentials = false
 metadata_cache_ttl_secs = 30
-default_table_format_version = 2
+default_table_format_version = 3
 
 # Client-side SigV4: RustFS signs the catalog under the S3 service name.
 [catalogs.rustfs.auth]

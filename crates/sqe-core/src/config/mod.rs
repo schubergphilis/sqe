@@ -2810,6 +2810,7 @@ pub struct CatalogConfig {
     #[serde(default = "default_authorization_recheck_secs")]
     pub authorization_recheck_secs: u64,
     /// Default Iceberg table format version for new tables (2 or 3).
+    /// Default: 3.
     #[serde(default = "default_table_format_version")]
     pub default_table_format_version: u8,
     /// Trust Iceberg sort order metadata for ALL columns, not just partition keys.
@@ -5841,8 +5842,10 @@ pub fn default_catalog_connect_timeout_secs() -> u64 {
 fn default_authorization_recheck_secs() -> u64 {
     10
 }
+/// V3, so `JSON` columns are variants (#849). A V3 table is unreadable by
+/// Trino < 481, Spark < 4.0 and Iceberg < 1.10; set 2 for those readers.
 fn default_table_format_version() -> u8 {
-    2
+    3
 }
 fn default_small_file_threshold_mb() -> u64 {
     3
@@ -7869,7 +7872,7 @@ partial_progress_batch = 5
                 request_timeout_secs: 30,
                 connect_timeout_secs: 5,
                 authorization_recheck_secs: 10,
-                default_table_format_version: 2,
+                default_table_format_version: 3,
                 trust_sort_order: false,
                 namespace_visibility_filter: true,
                 small_file_threshold_mb: 3,
@@ -9361,7 +9364,7 @@ s3_secret_key = "configured-secret"
                 request_timeout_secs: 30,
                 connect_timeout_secs: 5,
                 authorization_recheck_secs: 10,
-                default_table_format_version: 2,
+                default_table_format_version: 3,
                 trust_sort_order: false,
                 namespace_visibility_filter: true,
                 small_file_threshold_mb: 3,
@@ -9400,7 +9403,7 @@ s3_secret_key = "configured-secret"
                     request_timeout_secs: 30,
                     connect_timeout_secs: 5,
                     authorization_recheck_secs: 10,
-                    default_table_format_version: 2,
+                    default_table_format_version: 3,
                     trust_sort_order: false,
                     namespace_visibility_filter: true,
                     small_file_threshold_mb: 3,
@@ -9446,7 +9449,7 @@ s3_secret_key = "configured-secret"
                 request_timeout_secs: 30,
                 connect_timeout_secs: 5,
                 authorization_recheck_secs: 10,
-                default_table_format_version: 2,
+                default_table_format_version: 3,
                 trust_sort_order: false,
                 namespace_visibility_filter: true,
                 small_file_threshold_mb: 3,

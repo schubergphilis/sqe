@@ -63,8 +63,8 @@ pub use trino_compat::{
 };
 pub use tvf_named_args::rewrite_named_tvf_args;
 pub use v3_types::{
-    detect_ns_timestamp, extract_default_literal, is_tz_variant, is_v3_only_type, DefaultError,
-    DefaultLiteral, NsTimestamp,
+    detect_ns_timestamp, extract_default_literal, is_tz_variant, is_v3_only_type, is_variant_type,
+    DefaultError, DefaultLiteral, NsTimestamp,
 };
 pub use view_compat::{rewrite_view_compat, ViewCompat, ViewSecurity, VIEW_SECURITY_OPTION};
 
