@@ -1,4 +1,8 @@
-# Spark 3.5.4 + Kyuubi Authz 1.11.1 (shaded) + Iceberg 1.8.1
+# Spark 3.5.9 + Kyuubi Authz 1.11.1 (shaded) + Iceberg 1.12.0
+#
+# Iceberg 1.12 reads format-version 3 tables, the SQE default (#849). Spark 3.5
+# has no variant type, so a V3 table with a VARIANT / JSON column is not
+# readable here; the parity tables have none.
 #
 # WHY SPARK 3.5, NOT SPARK 4.0:
 # Spark 4.0 is Scala 2.13-only. kyuubi-spark-authz_2.13 is NOT published to
@@ -38,7 +42,8 @@ USER root
 # Download Iceberg Spark runtime + the shaded Kyuubi Authz jar (ranger deps
 # bundled) into $SPARK_HOME/jars/ so they are on the default classpath for
 # spark-sql.
-ARG ICEBERG_VERSION=1.8.1
+ARG ICEBERG_VERSION=1.12.0
+ARG AWS_SDK_VERSION=2.54.17
 ARG KYUUBI_VERSION=1.11.1
 ARG SCALA_VERSION=2.12
 ARG MAVEN_CENTRAL=https://repo1.maven.org/maven2
@@ -60,12 +65,12 @@ RUN set -eux; \
     # the REST catalog loads but the first table read dies with
     # ClassNotFoundException: software.amazon.awssdk.services.s3.model.S3Exception.
     curl -fsSL \
-      "${MAVEN_CENTRAL}/software/amazon/awssdk/bundle/2.24.6/bundle-2.24.6.jar" \
-      -o "${SPARK_HOME}/jars/aws-sdk-bundle-2.24.6.jar"; \
+      "${MAVEN_CENTRAL}/software/amazon/awssdk/bundle/${AWS_SDK_VERSION}/bundle-${AWS_SDK_VERSION}.jar" \
+      -o "${SPARK_HOME}/jars/aws-sdk-bundle-${AWS_SDK_VERSION}.jar"; \
     # url-connection-client: lightweight HTTP client S3FileIO defaults to.
     curl -fsSL \
-      "${MAVEN_CENTRAL}/software/amazon/awssdk/url-connection-client/2.24.6/url-connection-client-2.24.6.jar" \
-      -o "${SPARK_HOME}/jars/aws-url-connection-client-2.24.6.jar"; \
+      "${MAVEN_CENTRAL}/software/amazon/awssdk/url-connection-client/${AWS_SDK_VERSION}/url-connection-client-${AWS_SDK_VERSION}.jar" \
+      -o "${SPARK_HOME}/jars/aws-url-connection-client-${AWS_SDK_VERSION}.jar"; \
     echo "Jars downloaded OK"
 
 # Ranger plugin config directory: ranger-spark-security.xml and

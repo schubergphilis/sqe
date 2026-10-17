@@ -51,6 +51,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # in the binaries' `main` are the belt to this brace.
 ctor = "1"
 datafusion = { workspace = true }
+# `variant`: Iceberg V3 variant <-> JSON text, shared by the write path and
+# the client encoders.
+parquet-variant-compute = { workspace = true }
+parquet-variant-json = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]

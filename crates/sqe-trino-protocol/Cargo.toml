@@ -20,7 +20,7 @@ client = ["dep:reqwest", "dep:url", "dep:tokio", "dep:rustls"]
 # (decimal(p,s) -> Decimal128(p,s), integer widths, timestamps), and
 # `encode`: Arrow cells -> Trino JSON values (the server's and MCP's one
 # value encoding; review 803).
-arrow = ["dep:arrow-array", "dep:arrow-schema", "dep:arrow-cast", "dep:chrono", "dep:chrono-tz", "dep:base64"]
+arrow = ["dep:arrow-array", "dep:arrow-schema", "dep:arrow-cast", "dep:chrono", "dep:chrono-tz", "dep:base64", "dep:parquet-variant-compute", "dep:parquet-variant-json"]
 # `flight::FlightSqlClient` over `arrow_flight::sql::client::FlightSqlServiceClient`.
 flight = ["dep:arrow-flight", "dep:arrow-array", "dep:arrow-schema", "dep:tonic", "dep:futures"]
 
@@ -44,6 +44,9 @@ futures = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 chrono-tz = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
+# Iceberg V3 variant cells render as their JSON text (#849).
+parquet-variant-compute = { workspace = true, optional = true }
+parquet-variant-json = { workspace = true, optional = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]

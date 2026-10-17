@@ -598,11 +598,25 @@ fn advertised_schema_bytes(schema: &arrow_schema::Schema) -> Result<bytes::Bytes
 /// struct children), and ADBC refuses the stream when they do. Relaxing both
 /// sides to nullable makes them agree without planning twice. Map entries and
 /// keys stay non-null: the Arrow spec requires it.
+///
+/// A top-level Iceberg variant column is described as `Utf8` and streamed as
+/// its JSON text (#849): JDBC and ADBC clients have no variant type and
+/// would otherwise see a struct of two binaries.
 fn client_schema(schema: &arrow_schema::Schema) -> arrow_schema::SchemaRef {
     let fields: Vec<arrow_schema::FieldRef> = schema
         .fields()
         .iter()
-        .map(|f| Arc::new(nullable_field(f)))
+        .map(|f| {
+            if sqe_core::variant::is_variant_field(f) {
+                Arc::new(arrow_schema::Field::new(
+                    f.name(),
+                    arrow_schema::DataType::Utf8,
+                    true,
+                ))
+            } else {
+                Arc::new(nullable_field(f))
+            }
+        })
         .collect();
     Arc::new(arrow_schema::Schema::new_with_metadata(
         fields,
@@ -676,6 +690,10 @@ fn conform_batch(
         .map(|(column, field)| {
             if column.data_type() == field.data_type() {
                 Ok(Arc::clone(column))
+            } else if sqe_core::variant::is_variant_storage(column.data_type())
+                && field.data_type() == &arrow_schema::DataType::Utf8
+            {
+                sqe_core::variant::to_json(column.as_ref())
             } else {
                 arrow::compute::cast(column, field.data_type())
             }

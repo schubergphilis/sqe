@@ -174,13 +174,29 @@ object and a later implementation, or another engine, can honour it.
 
 ## Iceberg V3 type system
 
-These types only exist in format-version 3. Adding one to a CREATE TABLE auto-bumps the table to V3.
+These types only exist in format-version 3, the default for new tables. Adding one to a CREATE TABLE makes the table V3 even when the configured default is 2.
 
 | Type | Notes |
 |---|---|
 | `TIMESTAMP_NS`, `TIMESTAMP_NS WITH TIME ZONE` | Nanosecond precision timestamps. Arrow `Timestamp(Nanosecond, ...)`. |
+| `VARIANT` | Semi-structured value (object, array, string, number, boolean, null) in the Iceberg variant binary encoding. See [VARIANT](#variant) below. |
 | `GEOMETRY`, `GEOGRAPHY` | Stub types in V3; SQE accepts them in CREATE but does not yet provide spatial functions. |
 | Default values via `DEFAULT expr` | Existing rows in older snapshots inherit the default at read time. |
+
+### VARIANT
+
+```sql
+CREATE TABLE events (id BIGINT, payload VARIANT);
+INSERT INTO events VALUES (1, '{"user": "a", "tags": [1, 2]}'), (2, '"plain text"'), (3, NULL);
+```
+
+- **Writes parse text as JSON.** A string written to a `VARIANT` column is parsed as a JSON document: `'{"a": 1}'` stores an object and `'42'` stores a number. To store a JSON string, quote it: `'"text"'`. Text that is not valid JSON fails the statement; it is never stored as NULL. Other column types (numbers, booleans, structs, lists) are stored as the variant of their value.
+- **Reads return JSON text.** Clients have no variant type. The Trino protocol reports the column as `json` and sends each value as JSON text; Flight SQL / ADBC / JDBC return it as a UTF-8 string. `DESCRIBE` and `information_schema.columns` report `variant`, and `SHOW CREATE TABLE` prints `VARIANT`.
+- **The table becomes format-version 3.** `CREATE TABLE` and CTAS with a variant column create a V3 table. `ALTER TABLE ... ADD COLUMN c VARIANT` is refused on a V2 table. V3 tables can be read by Spark 4.0 with Iceberg 1.10 or later, and by Trino 481 or later; older readers cannot open them.
+- **`JSON` is a variant on a V3 table.** A `JSON` column, also inside a `STRUCT` or `ROW`, is stored as `VARIANT` when the table is format-version 3 and as a string otherwise. New tables are V3 by default (`catalog.default_table_format_version = 3`), so a plain `CREATE TABLE t (doc JSON)` stores a variant. A table is V2 when it asks for it with `WITH ('format-version' = '2')`, the Trino form `WITH (format_version = 2)` or `TBLPROPERTIES ('format-version' = '2')`, or when the configured default is 2; its `JSON` columns are strings, which readers without V3 support (Trino < 481, Spark < 4.0, Iceberg < 1.10) can open. `ALTER TABLE ... ADD COLUMN c JSON` adds a variant to a V3 table and a string to a V2 one. Asking for format-version 1 or 2 on a table with a V3-only column is an error.
+- **JSON functions read a variant.** `json_extract`, `json_extract_scalar`, the `json_get_*` functions and the other `json*` functions take a variant as its JSON text, so the same query works on a V2 `JSON` string and a V3 variant.
+- **Existing JSON columns are not converted.** Iceberg does not allow evolving a `string` column to `variant`, so a column that holds JSON text stays a string. To convert one, copy it into a table declared with a `VARIANT` column, where the write parses each value: `CREATE TABLE t2 (id BIGINT, doc VARIANT); INSERT INTO t2 SELECT id, doc FROM t1;`.
+- **Not yet:** variant path functions (`variant_get`), reading shredded variant files written by other engines, and nested variants (inside a `ROW` or `ARRAY`) on Flight SQL, which arrive as the raw storage struct.
 
 ## What CREATE / ALTER does NOT cover
 

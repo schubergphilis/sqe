@@ -159,7 +159,7 @@ CREATE TABLE events (
 - `JSON` columns store as `Utf8`. `CAST(json_col AS BIGINT|VARCHAR|DOUBLE)` rides DataFusion's built-in coercion. JSON-shaped extraction works through `json_extract`, `json_extract_scalar`, `json_array_length`, `json_parse`, `json_get_str`, `json_get_int`, `json_get_float`, `json_get_bool`.
 - `TIME` / `TIME(p)` maps to Arrow `Time64(Microsecond)` since Iceberg's `time` primitive is microsecond-only across V2 and V3. Precisions 0..=6 collapse to microsecond. `TIME(p > 6)` rejects with a clear NotImplemented; use `TIMESTAMP(9)` for sub-microsecond resolution.
 - `TIME WITH TIME ZONE` rejects at CREATE TABLE: Arrow has no equivalent. Use `TIMESTAMP WITH TIME ZONE` instead.
-- `TIMESTAMP_NS` (and `TIMESTAMP_NS WITH TIME ZONE`) is a V3-only nanosecond timestamp. SQE auto-upgrades the table to format-version 3 when one of these types appears in a CREATE.
+- `TIMESTAMP_NS` (and `TIMESTAMP_NS WITH TIME ZONE`) is a V3-only nanosecond timestamp. New tables are format-version 3 by default; with `default_table_format_version = 2`, a CREATE that uses one of these types still makes the table V3.
 - `localtime()` returns Time64. `EXTRACT(HOUR|MINUTE|SECOND FROM time_col)` works through the Trino-aliased `hour()` / `minute()` / `second()` UDFs. `year()` / `month()` / `day()` on a TIME column raise a clear plan error per Trino spec.
 
 ## Metadata Queries

@@ -303,6 +303,14 @@ pub fn arrow_value_to_json(array: &dyn arrow_array::Array, row: usize) -> serde_
                 .collect();
             serde_json::Value::Object(object)
         }
+        // An Iceberg V3 variant is sent as its JSON text, the way a `json`
+        // column is (#849).
+        DataType::Struct(_) if is_variant_storage(array.data_type()) => {
+            match variant_json(array, row) {
+                Ok(text) => serde_json::Value::String(text),
+                Err(e) => serde_json::Value::String(format!("<invalid variant: {e}>")),
+            }
+        }
         // A row is a JSON array of its field values, in field order.
         DataType::Struct(_) => serde_json::Value::Array(
             array
@@ -314,6 +322,39 @@ pub fn arrow_value_to_json(array: &dyn arrow_array::Array, row: usize) -> serde_
         ),
         _ => serde_json::Value::String(display(array, row)),
     }
+}
+
+/// True when `data_type` is Iceberg variant storage: a struct of `metadata`
+/// and `value` binaries, plus `typed_value` when the file was shredded.
+/// DataFusion drops the `arrow.parquet.variant` field extension through most
+/// expressions, so the shape is what is left to go on.
+pub fn is_variant_storage(data_type: &DataType) -> bool {
+    let DataType::Struct(fields) = data_type else {
+        return false;
+    };
+    let binary = |name: &str| {
+        fields.iter().any(|f| {
+            f.name() == name
+                && matches!(
+                    f.data_type(),
+                    DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+                )
+        })
+    };
+    let known = fields
+        .iter()
+        .all(|f| matches!(f.name().as_str(), "metadata" | "value" | "typed_value"));
+    known && binary("metadata") && (binary("value") || fields.len() == 2)
+}
+
+/// The JSON text of the variant at `row`.
+fn variant_json(
+    array: &dyn arrow_array::Array,
+    row: usize,
+) -> Result<String, arrow_schema::ArrowError> {
+    use parquet_variant_json::VariantToJson;
+    let variants = parquet_variant_compute::VariantArray::try_new(&array.slice(row, 1))?;
+    variants.try_value(0)?.to_json_string()
 }
 
 /// Every element of a list cell's child array as JSON.
@@ -517,6 +558,26 @@ mod tests {
             arrow_value_to_json(&b.finish(), 0),
             serde_json::json!({ "10": "x" })
         );
+    }
+
+    /// #849: a variant cell is sent as its JSON text, not as a row of two
+    /// binaries; a NULL variant is JSON null.
+    #[test]
+    fn variant_values_are_json_text() {
+        use std::sync::Arc;
+
+        use arrow_array::{Array, ArrayRef, StringArray};
+
+        let text: ArrayRef = Arc::new(StringArray::from(vec![Some(r#"{"a": [1, "x"]}"#), None]));
+        let variants = parquet_variant_compute::json_to_variant(&text)
+            .unwrap()
+            .into_inner();
+        assert!(is_variant_storage(variants.data_type()));
+        assert_eq!(
+            arrow_value_to_json(&variants, 0),
+            serde_json::Value::String(r#"{"a":[1,"x"]}"#.to_string())
+        );
+        assert_eq!(arrow_value_to_json(&variants, 1), serde_json::Value::Null);
     }
 
     #[test]
