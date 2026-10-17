@@ -11,7 +11,8 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, FieldRef};
+use datafusion::arrow;
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::common::{DataFusionError, Result as DFResult, ScalarValue};
 use datafusion::logical_expr::type_coercion::functions::fields_with_udf;
 use datafusion::logical_expr::{
@@ -60,7 +61,7 @@ impl VariantJsonArgs {
 
 /// `field` with a variant type replaced by the JSON text it is read as.
 fn as_text_field(field: &FieldRef) -> FieldRef {
-    if sqe_core::variant::is_variant_storage(field.data_type()) {
+    if crate::variant::is_variant_storage(field.data_type()) {
         Arc::new(Field::new(
             field.name(),
             DataType::Utf8,
@@ -72,7 +73,7 @@ fn as_text_field(field: &FieldRef) -> FieldRef {
 }
 
 fn as_text_type(data_type: &DataType) -> DataType {
-    if sqe_core::variant::is_variant_storage(data_type) {
+    if crate::variant::is_variant_storage(data_type) {
         DataType::Utf8
     } else {
         data_type.clone()
@@ -80,13 +81,12 @@ fn as_text_type(data_type: &DataType) -> DataType {
 }
 
 fn to_json_text(value: ColumnarValue) -> DFResult<ColumnarValue> {
-    let is_variant = sqe_core::variant::is_variant_storage(&value.data_type());
+    let is_variant = crate::variant::is_variant_storage(&value.data_type());
     if !is_variant {
         return Ok(value);
     }
     let to_json = |array: &dyn arrow::array::Array| {
-        sqe_core::variant::to_json(array)
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+        crate::variant::to_json(array).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     };
     Ok(match value {
         ColumnarValue::Array(array) => ColumnarValue::Array(to_json(array.as_ref())?),
@@ -129,7 +129,7 @@ impl ScalarUDFImpl for VariantJsonArgs {
             .iter()
             .zip(coerced)
             .map(|(original, coerced)| {
-                if sqe_core::variant::is_variant_storage(original) {
+                if crate::variant::is_variant_storage(original) {
                     original.clone()
                 } else {
                     coerced.data_type().clone()
@@ -189,8 +189,7 @@ mod tests {
             r#"{"a": {"b": 2}, "s": "x"}"#,
         )]));
         let variant =
-            sqe_core::variant::from_arrow(text.as_ref(), &sqe_core::variant::storage_type())
-                .unwrap();
+            crate::variant::from_arrow(text.as_ref(), &crate::variant::storage_type()).unwrap();
         let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
             "v",
             variant.data_type().clone(),
