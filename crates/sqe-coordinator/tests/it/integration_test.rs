@@ -360,19 +360,6 @@ async fn test_local_fallback_select() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:polaris+workers; a worker on :50052"]
 async fn test_distributed_select() {
-    let config = sqe_core::SqeConfig::load(&crate::common::test_config_path())
-        .expect("Failed to load test config");
-
-    let authenticator = sqe_auth::Authenticator::new(&config.auth)
-        .await
-        .expect("Failed to create authenticator");
-    let session = authenticator
-        .authenticate("root", "")
-        .await
-        .expect("Auth failed");
-
-    let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
-
     let worker_url = "http://localhost:50052";
     let socket = std::net::TcpStream::connect_timeout(
         &"127.0.0.1:50052".parse().unwrap(),
@@ -385,37 +372,18 @@ async fn test_distributed_select() {
          tests/sqe-test.toml) or use --ignored to skip."
     );
 
-    let registry = Arc::new(sqe_coordinator::worker_registry::WorkerRegistry::new(vec![
-        worker_url.to_string(),
-    ]));
-    registry.mark_healthy(worker_url).await;
-
-    let query_tracker = Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(
-        &config.query_history,
-    ));
-    let handler = sqe_coordinator::QueryHandler::new(
-        policy,
-        None,
-        config,
-        Some(registry),
-        None,
-        None,
-        None,
-        query_tracker,
-        None,
-        None,
-        None,
-        sqe_coordinator::RuntimeCatalogRegistry::default(),
-        sqe_core::SecretStore::default(),
-    )
-    .expect("Failed to create QueryHandler");
+    // `rig` zeroes both distribution thresholds. Under the defaults (4 files,
+    // 128 MiB) this one-file table is planned on the coordinator and no task
+    // ever reaches the worker.
+    let rig = crate::distributed_failure_e2e::rig(&[worker_url.to_string()], |_| {}).await;
+    let (session, handler) = (&rig.session, rig.handler.as_ref());
 
     let _ = handler
-        .execute(&session, "DROP TABLE IF EXISTS test_ns.dist_test", None)
+        .execute(session, "DROP TABLE IF EXISTS test_ns.dist_test", None)
         .await;
     handler
         .execute(
-            &session,
+            session,
             "CREATE TABLE test_ns.dist_test AS SELECT 1 as id, 'distributed' as name",
             None,
         )
@@ -423,14 +391,16 @@ async fn test_distributed_select() {
         .expect("CTAS should succeed");
 
     let batches = handler
-        .execute(&session, "SELECT * FROM test_ns.dist_test", None)
+        .execute(session, "SELECT * FROM test_ns.dist_test", None)
         .await
         .expect("Distributed SELECT should succeed");
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
 
+    // A distributed fragment's node_id is the URL of the worker that ran it;
+    // a local run records the coordinator's name.
     let tasks = handler
         .execute(
-            &session,
+            session,
             "SELECT node_id FROM system.runtime.tasks ORDER BY query_id DESC LIMIT 20",
             None,
         )
@@ -443,11 +413,8 @@ async fn test_distributed_select() {
             .as_any()
             .downcast_ref::<arrow_array::StringArray>()
             .expect("node_id should be string");
-        for i in 0..batch.num_rows() {
-            if col.value(i).contains("worker") {
-                worker_seen = true;
-                break;
-            }
+        if (0..batch.num_rows()).any(|i| col.value(i) == worker_url) {
+            worker_seen = true;
         }
     }
     assert!(
@@ -458,7 +425,7 @@ async fn test_distributed_select() {
     );
 
     let _ = handler
-        .execute(&session, "DROP TABLE test_ns.dist_test", None)
+        .execute(session, "DROP TABLE test_ns.dist_test", None)
         .await;
 }
 
