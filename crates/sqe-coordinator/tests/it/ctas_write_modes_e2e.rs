@@ -171,11 +171,12 @@ async fn ctas_delete_mode_mor_writes_position_deletes() {
     let name = "ctas_del_mor_371";
     let fq = format!("{ns}.{name}");
 
+    // V2: the position-delete path; V3 writes deletion vectors (v3_e2e).
     seed_three_files(
         &handler,
         &session,
         &fq,
-        "'write.delete.mode' = 'merge-on-read'",
+        "'write.delete.mode' = 'merge-on-read', 'format-version' = '2'",
     )
     .await;
     assert_eq!(live_data_file_count(&handler, &session, ns, name).await, 3);
@@ -535,11 +536,12 @@ async fn cow_rewrite_drops_superseded_position_deletes_376() {
     let fq = format!("{ns}.{name}");
 
     // MoR table: DELETE writes a position-delete file without rewriting data.
+    // V2, since V3 writes a deletion vector instead.
     seed_three_files(
         &handler,
         &session,
         &fq,
-        "'write.delete.mode' = 'merge-on-read'",
+        "'write.delete.mode' = 'merge-on-read', 'format-version' = '2'",
     )
     .await;
     exec(
