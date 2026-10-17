@@ -170,7 +170,8 @@ metadata_cache_ttl_secs = 30
 # [catalogs.*] entries the first one loaded sets the values.
 # request_timeout_secs = 30
 # connect_timeout_secs = 5
-default_table_format_version = 2  # 2 (default) or 3 for Iceberg v3 tables
+default_table_format_version = 3  # 3 (default) or 2 for readers without Iceberg v3
+                                  # (Trino < 481, Spark < 4.0, Iceberg < 1.10)
 # trust_sort_order = false  # default: only partition columns declared as pre-sorted (safe)
 # trust_sort_order = true   # trust ALL Iceberg sort order columns (faster but risky for mixed-writer tables)
 # Hide namespace NAMES the caller has no grants in from SHOW SCHEMAS,
