@@ -7102,9 +7102,9 @@ async fn lift_in_subqueries_enforced(
 impl WriteHandler {
     fn format_version(&self) -> FormatVersion {
         match self.config.catalog.default_table_format_version {
-            3 => FormatVersion::V3,
+            2 => FormatVersion::V2,
             1 => FormatVersion::V1,
-            _ => FormatVersion::V2,
+            _ => FormatVersion::V3,
         }
     }
 

@@ -21,7 +21,9 @@
     and Iceberg < 1.10 cannot read a V3 table: set
     `default_table_format_version = 2`, or create the table
     `WITH ('format-version' = '2')`, where those readers share the tables.
-    Existing tables keep their version.
+    Existing tables keep their version. The quickstarts and test configs
+    use 3; the Spark interop stack moves to Spark 4.1 with Iceberg 1.12 and
+    the Ranger quickstart's Spark 3.5 to Iceberg 1.12, both V3 readers.
 
 - `CREATE TABLE` refuses a `format-version` other than 1, 2 or 3, and
   refuses format-version 1 or 2 on a table with a V3-only column (variant,
