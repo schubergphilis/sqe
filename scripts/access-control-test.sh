@@ -48,7 +48,8 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 # that exit 0 on success -- so they are started without `--wait` and waited on
 # by exit code below, while `--wait` covers only the long-running services.
 docker compose up -d keycloak-config bucket-init ranger-setup polaris-setup
-docker compose up -d --wait keycloak rustfs ranger-db ranger-admin polaris
+docker compose up -d --wait --wait-timeout "$RANGER_TIMEOUT" \
+    keycloak rustfs ranger-db ranger-admin polaris
 
 # Wait for a one-shot setup container to exit, and fail on a non-zero code.
 # Their work (Ranger service-defs and roles, Keycloak realm, S3 bucket, Polaris

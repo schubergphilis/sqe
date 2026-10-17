@@ -4,6 +4,8 @@
 
 use std::process::Command;
 
+use super::process::{output_with_timeout, DOCKER_TIMEOUT, SPARK_SQL_TIMEOUT};
+
 /// Return `Some(reason)` when the Spark interop stack is not running and
 /// the test should skip. Returns `None` when it is ready for a live run.
 ///
@@ -18,18 +20,20 @@ pub fn spark_stack_skip_reason() -> Option<String> {
         return Some("SQE_SKIP_SPARK_INTEROP=1".to_string());
     }
 
-    let docker_ok = Command::new("docker")
-        .args(["version", "--format", "{{.Server.Version}}"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let docker_ok = output_with_timeout(
+        Command::new("docker").args(["version", "--format", "{{.Server.Version}}"]),
+        DOCKER_TIMEOUT,
+    )
+    .map(|o| o.status.success())
+    .unwrap_or(false);
     if !docker_ok {
         return Some("docker daemon is not reachable".to_string());
     }
 
-    let ps = Command::new("docker")
-        .args(["ps", "--format", "{{.Names}}"])
-        .output();
+    let ps = output_with_timeout(
+        Command::new("docker").args(["ps", "--format", "{{.Names}}"]),
+        DOCKER_TIMEOUT,
+    );
     match ps {
         Ok(o) if o.status.success() => {
             let names = String::from_utf8_lossy(&o.stdout);
@@ -66,7 +70,7 @@ fn workspace_root() -> std::path::PathBuf {
 /// line; callers parse the expected shape.
 pub fn spark_sql(sql: &str) -> std::io::Result<String> {
     let script = workspace_root().join("scripts").join("spark-interop.sh");
-    let out = Command::new(script).arg(sql).output()?;
+    let out = output_with_timeout(Command::new(script).arg(sql), SPARK_SQL_TIMEOUT)?;
     if !out.status.success() {
         return Err(std::io::Error::other(format!(
             "spark-interop.sh failed ({:?}): stderr={}",

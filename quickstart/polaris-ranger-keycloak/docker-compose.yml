@@ -347,32 +347,47 @@ services:
       - |
         set -eu
         # $$ escapes for docker-compose interpolation. Submit SQL over Trino HTTP
-        # and follow nextUri until terminal state.
+        # and follow nextUri until terminal state. Every wait is bounded: each
+        # request by --max-time, each statement by a page count, readiness by
+        # an attempt count.
         curl_config=$$(mktemp)
         trap 'rm -f "$$curl_config"' EXIT
         printf 'user = "%s:%s"\n' "$$SQE_SEED_USER" "$$SQE_SEED_PASSWORD" > "$$curl_config"
-        run_sql() {
-          sql="$$1"
-          body=$$(curl -sS --config "$$curl_config" -X POST "http://sqe:8080/v1/statement" \
+        # Prints the last response body; returns 0 only on FINISHED. A POST
+        # never reports FINISHED (results come from nextUri pages, #767), so
+        # the statement is always followed to its end, which also releases
+        # it instead of leaving it to the 5-minute idle eviction.
+        try_sql() {
+          body=$$(curl -sS --max-time 30 --config "$$curl_config" -X POST "http://sqe:8080/v1/statement" \
             -H "X-Trino-User: carol" \
             -H "X-Trino-Source: data-seed" \
-            --data-binary "$$sql")
-          while true; do
+            --data-binary "$$1") || return 1
+          pages=0
+          while [ $$pages -lt 600 ]; do
             state=$$(printf '%s' "$$body" | sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
             case "$$state" in
               FINISHED|FAILED) break ;;
             esac
             next=$$(printf '%s' "$$body" | sed -n 's/.*"nextUri"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
             [ -n "$$next" ] || break
-            body=$$(curl -sS --config "$$curl_config" "$$next")
+            body=$$(curl -sS --max-time 30 --config "$$curl_config" "$$next") || return 1
+            pages=$$((pages + 1))
           done
-          printf '%s' "$$body" | grep -q '"state":"FINISHED"' \
-            || { echo "SQL failed: $$sql"; echo "$$body"; exit 1; }
+          printf '%s' "$$body"
+          printf '%s' "$$body" | grep -q '"state":"FINISHED"'
+        }
+        run_sql() {
+          out=$$(try_sql "$$1") || { echo "SQL failed: $$1"; echo "$$out"; exit 1; }
         }
         echo "waiting for SQE Trino HTTP ..."
-        until curl -sS --config "$$curl_config" -X POST "http://sqe:8080/v1/statement" \
-            -H "X-Trino-User: carol" --data-binary "SELECT 1" \
-            | grep -q '"state":"FINISHED"'; do
+        attempts=0
+        until out=$$(try_sql "SELECT 1"); do
+          attempts=$$((attempts + 1))
+          if [ $$attempts -ge 60 ]; then
+            echo "SQE not ready after $$attempts attempts; last response:"
+            echo "$$out"
+            exit 1
+          fi
           sleep 3
         done
         echo "SQE ready, seeding data ..."

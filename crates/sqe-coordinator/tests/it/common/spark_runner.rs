@@ -195,12 +195,13 @@ pub const KYUUBI_SERVICE: &str = "query";
 pub async fn kyuubi_service_in_container() -> Option<String> {
     let file = compose_file();
     let out = tokio::task::spawn_blocking(move || {
-        std::process::Command::new("docker")
-            .args([
+        super::process::output_with_timeout(
+            std::process::Command::new("docker").args([
                 "compose", "-f", &file, "exec", "-T", "spark", "sh", "-c",
                 "sed -n '/ranger.plugin.spark.service.name/,/<\\/property>/p'                  /opt/spark/conf/ranger-spark-security.xml",
-            ])
-            .output()
+            ]),
+            super::process::DOCKER_TIMEOUT,
+        )
     })
     .await
     .ok()?
@@ -285,8 +286,8 @@ fn write_plugin_conf(service: &str) -> (String, String) {
     );
     // Content goes through argv, not the shell, so the XML needs no quoting.
     let script = r#"mkdir -p "$1" && printf '%s' "$2" > "$1"/ranger-spark-security.xml                     && rm -rf "$3" && mkdir -p "$3" && chmod -R 777 "$1" "$3""#;
-    let out = std::process::Command::new("docker")
-        .args([
+    let out = super::process::output_with_timeout(
+        std::process::Command::new("docker").args([
             "compose",
             "-f",
             &compose_file(),
@@ -302,9 +303,10 @@ fn write_plugin_conf(service: &str) -> (String, String) {
             &conf_dir,
             &xml,
             &cache_dir,
-        ])
-        .output()
-        .expect("write the ranger plugin conf into the spark container");
+        ]),
+        super::process::DOCKER_TIMEOUT,
+    )
+    .expect("write the ranger plugin conf into the spark container");
     assert!(
         out.status.success(),
         "writing {conf_dir} failed: {}",
@@ -366,7 +368,8 @@ fn run_blocking(
     }
     cmd.arg("-e").arg(sql);
 
-    let out = cmd.output().expect("spawn docker compose exec spark");
+    let out = super::process::output_with_timeout(&mut cmd, super::process::SPARK_SQL_TIMEOUT)
+        .expect("docker compose exec spark spark-sql");
     let raw = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
