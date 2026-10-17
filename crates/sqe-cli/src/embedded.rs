@@ -320,6 +320,10 @@ pub fn build_embedded_context_with_mask(
     // JSON functions: json_get, json_get_str, json_contains, etc.
     datafusion_functions_json::register_all(&mut ctx)
         .map_err(|e| anyhow::anyhow!("failed to register JSON functions: {e}"))?;
+    // A JSON column on a format v3 table is a variant; the `json*`
+    // functions read it as its JSON text (#849). After every JSON function
+    // is registered, so none is missed.
+    sqe_core::variant_json_args::accept_variant_in_json_functions(&ctx);
 
     // File-format TVFs for direct file access. The embedded CLI runs
     // in-process as the local user, who already has shell + filesystem
@@ -2007,6 +2011,42 @@ mod tests {
         let sql = format!("SELECT count(*) AS n FROM read_json('{}')", path.display());
         let result = client.execute(&sql).await.expect("query");
         assert_eq!(result.rows, vec![vec!["2".to_string()]]);
+    }
+
+    /// #849: a JSON column on a format v3 table is a variant. The JSON
+    /// functions read it as JSON text in embedded mode too, as they do on
+    /// the server.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn json_functions_read_a_variant_column() {
+        let text: arrow::array::ArrayRef = Arc::new(arrow::array::StringArray::from(vec![Some(
+            r#"{"a": {"b": 2}, "s": "x"}"#,
+        )]));
+        let variant =
+            sqe_core::variant::from_arrow(text.as_ref(), &sqe_core::variant::storage_type())
+                .expect("variant");
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("doc", variant.data_type().clone(), true),
+        ]));
+        let batch =
+            arrow::record_batch::RecordBatch::try_new(schema, vec![variant]).expect("batch");
+
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
+        client.ctx.register_batch("docs", batch).expect("register");
+        let result = client
+            .execute(
+                "SELECT json_get_int(doc, 'a', 'b') AS b, json_extract_scalar(doc, '$.s') AS s, \
+                 json_extract(doc, '$.a') AS a FROM docs",
+            )
+            .await
+            .expect("query");
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                "2".to_string(),
+                "x".to_string(),
+                r#"{"b":2}"#.to_string()
+            ]]
+        );
     }
 
     /// V8: `SELECT * FROM 'file.csv'` auto-detect via DataFusion's
