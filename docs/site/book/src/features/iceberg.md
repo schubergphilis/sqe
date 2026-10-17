@@ -158,6 +158,7 @@ SQE runs table maintenance through `CALL system.*` procedures, each committing t
 ## V3 features verified
 
 - **TIMESTAMP_NS / TIMESTAMPTZ_NS**: V3 nanosecond timestamps round-trip end-to-end.
+- **Variant**: `VARIANT` columns store unshredded variant values written from JSON text, survive CTAS and INSERT ... SELECT, and read back as JSON text ([details](../sql-reference/ddl.md#variant)). Shredded files written by other engines and variant path functions are not supported yet.
 - **Column defaults**: `CREATE TABLE ... DEFAULT <literal>` applies `write_default`; `ALTER TABLE ADD COLUMN ... DEFAULT` applies `initial_default`.
 - **Deletion vectors (V3)**: MoR DELETE on a V3 table writes one deletion vector per data file, never a position-delete file. A second DELETE on the same file merges its existing deletes into a new vector and retires the old one in the same commit, so a data file never carries two. The engine refuses any commit that would add a position-delete file to a V3 table.
 - **Equality deletes (V3)**: UPDATE with a declared identifier-field-id commits a single RowDelta with new data file plus equality-delete row.
@@ -167,7 +168,6 @@ SQE runs table maintenance through `CALL system.*` procedures, each committing t
 
 V3 features not available yet:
 
-- **Variant**: iceberg-rust reads and writes it since [#2188](https://github.com/apache/iceberg-rust/pull/2188), but SQE's SQL layer has no `VARIANT` type yet.
 - **Geometry / geography**: no iceberg-rust support, and pending DataFusion UDT [#12644](https://github.com/apache/datafusion/issues/12644).
 - **Vector / Embedding**: V3 spec not finalised.
 

@@ -44,12 +44,26 @@ pub fn detect_ns_timestamp(sql_type: &SqlType) -> Option<NsTimestamp> {
     }
 }
 
+/// True when a sqlparser `DataType` names the Iceberg V3 `VARIANT` type.
+///
+/// sqlparser has no `VARIANT` keyword, so it arrives as `DataType::Custom`.
+pub fn is_variant_type(sql_type: &SqlType) -> bool {
+    let SqlType::Custom(object_name, modifiers) = sql_type else {
+        return false;
+    };
+    object_name.0.len() == 1
+        && modifiers.is_empty()
+        && object_name.0[0]
+            .as_ident()
+            .is_some_and(|i| i.value.eq_ignore_ascii_case("VARIANT"))
+}
+
 /// True when a sqlparser `DataType` triggers format-version 3.
 ///
-/// Only nanosecond timestamps are V3-only in the current SQL surface.
-/// `Unknown` and variant types are handled at a different layer.
+/// Nanosecond timestamps and `VARIANT` are V3-only. `Unknown` is handled at
+/// a different layer.
 pub fn is_v3_only_type(sql_type: &SqlType) -> bool {
-    detect_ns_timestamp(sql_type).is_some()
+    detect_ns_timestamp(sql_type).is_some() || is_variant_type(sql_type)
 }
 
 /// Literal kinds we accept as column defaults.

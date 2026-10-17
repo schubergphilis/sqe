@@ -724,23 +724,52 @@ pub fn apply_stamped_schema(
             let target = stamped_schema.field(i).data_type();
             if col.data_type() == target {
                 Ok(col.clone())
+            } else if sqe_core::variant::is_variant_field(stamped_schema.field(i)) {
+                // A variant column takes JSON text (parsed, so invalid JSON
+                // fails the write) or any value Arrow can turn into a
+                // variant (#849).
+                sqe_core::variant::from_arrow(col.as_ref(), target).map_err(|e| {
+                    SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!(
+                            "Failed to write column '{}' as VARIANT from {:?}: {e}",
+                            stamped_schema.field(i).name(),
+                            col.data_type(),
+                        ),
+                    )
+                })
             } else {
                 // Checked, not safe (#834): a safe cast turns 'abc' -> Int64
                 // into NULL, so the INSERT succeeded and stored a value the
                 // user never wrote.
-                cast_with_options(col, target, &CastOptions { safe: false, ..Default::default() }).map_err(|e| {
-                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                        "Failed to cast column '{}' from {:?} to {:?}: {e}",
-                        stamped_schema.field(i).name(),
-                        col.data_type(),
-                        target,
-                    ))
+                cast_with_options(
+                    col,
+                    target,
+                    &CastOptions {
+                        safe: false,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| {
+                    SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!(
+                            "Failed to cast column '{}' from {:?} to {:?}: {e}",
+                            stamped_schema.field(i).name(),
+                            col.data_type(),
+                            target,
+                        ),
+                    )
                 })
             }
         })
         .collect();
-    RecordBatch::try_new(stamped_schema.clone(), new_columns?)
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to apply stamped schema: {e}")))
+    RecordBatch::try_new(stamped_schema.clone(), new_columns?).map_err(|e| {
+        SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!("Failed to apply stamped schema: {e}"),
+        )
+    })
 }
 
 /// Stamp a whole batch list against `iceberg_schema` (#600): the buffered
@@ -1200,6 +1229,42 @@ mod tests {
                 .expect_err("'abc' is not an Int64");
             assert!(format!("{err}").contains("Failed to cast column 'n'"), "err: {err}");
         }
+    }
+
+    /// #849: JSON text written into a variant column is parsed into variant
+    /// storage; invalid JSON fails the write instead of storing NULL.
+    #[test]
+    fn apply_stamped_schema_parses_json_into_variant() {
+        let text = |values: Vec<Option<&str>>| {
+            RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![arrow_schema::Field::new(
+                    "v",
+                    arrow_schema::DataType::Utf8,
+                    true,
+                )])),
+                vec![Arc::new(arrow_array::StringArray::from(values))],
+            )
+            .unwrap()
+        };
+        let target = Arc::new(ArrowSchema::new(vec![sqe_core::variant::field("v", true)]));
+
+        let out = apply_stamped_schema(text(vec![Some(r#"{"a": [1, 2]}"#), None]), &target)
+            .expect("valid JSON");
+        assert_eq!(
+            out.column(0).data_type(),
+            &sqe_core::variant::storage_type()
+        );
+        let json = sqe_core::variant::to_json(out.column(0).as_ref()).unwrap();
+        let json = json
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        assert_eq!(json.value(0), r#"{"a":[1,2]}"#);
+        assert!(arrow_array::Array::is_null(json, 1));
+
+        let err =
+            apply_stamped_schema(text(vec![Some("{oops")]), &target).expect_err("invalid JSON");
+        assert!(format!("{err}").contains("as VARIANT"), "err: {err}");
     }
 
     /// The checked cast still converts what fits, and a NULL stays NULL.

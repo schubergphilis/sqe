@@ -50,6 +50,11 @@ pub fn arrow_to_trino_type(dt: &DataType) -> String {
             }
             "map(varchar,varchar)".to_string()
         }
+        // Iceberg V3 variant: clients have no variant type, and the value is
+        // sent as JSON text (#849).
+        DataType::Struct(_) if sqe_trino_protocol::encode::is_variant_storage(dt) => {
+            "json".to_string()
+        }
         DataType::Struct(fields) => {
             let cols: Vec<String> = fields
                 .iter()
@@ -92,6 +97,10 @@ mod tests {
 
     #[test]
     fn test_arrow_to_trino_type_basic() {
+        assert_eq!(
+            arrow_to_trino_type(&sqe_core::variant::storage_type()),
+            "json"
+        );
         assert_eq!(arrow_to_trino_type(&DataType::Int64), "bigint");
         assert_eq!(arrow_to_trino_type(&DataType::Utf8), "varchar");
         assert_eq!(arrow_to_trino_type(&DataType::Boolean), "boolean");
