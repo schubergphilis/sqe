@@ -77,6 +77,10 @@ arrow-array = "59"
 arrow-cast = "59"
 arrow-buffer = "59"
 parquet = { version = "59", features = ["async", "object_store"] }
+# Iceberg V3 variant values (encode/decode, JSON). Already in the graph via
+# parquet's `variant_experimental` feature, which iceberg-rust enables.
+parquet-variant-compute = "59"
+parquet-variant-json = "59"
 object_store = { version = "0.13", features = ["aws", "http", "azure", "gcp"] }
 
 # Iceberg — apache/iceberg-rust main @ 119fad92c, with RisingWave

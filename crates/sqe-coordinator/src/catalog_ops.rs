@@ -656,14 +656,31 @@ impl CatalogOps {
                         .iter()
                         .any(|opt| matches!(opt.option, sqlparser::ast::ColumnOption::NotNull));
 
+                    // A variant column exists only from format-version 3, and
+                    // its storage struct is not a plain Iceberg struct (#849).
+                    let is_variant = sqe_sql::is_variant_type(&column_def.data_type);
+                    if is_variant && metadata.format_version() < iceberg::spec::FormatVersion::V3 {
+                        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
+                            "Cannot add VARIANT column '{}': table '{table_ident}' is Iceberg format {}, \
+                             and variant needs format v3",
+                            column_def.name.value,
+                            metadata.format_version()
+                        )));
+                    }
                     let arrow_type = sql_type_to_arrow(&column_def.data_type)?;
-                    let iceberg_type =
+                    let iceberg_type = if is_variant {
+                        iceberg::spec::Type::Variant(iceberg::spec::VariantType)
+                    } else {
                         iceberg::arrow::arrow_type_to_type(&arrow_type).map_err(|e| {
-                            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                                "Cannot convert type for column '{}': {e}",
-                                column_def.name.value
-                            ))
-                        })?;
+                            SqeError::with_code(
+                                SqeErrorCode::ExecutionFailed,
+                                format!(
+                                    "Cannot convert type for column '{}': {e}",
+                                    column_def.name.value
+                                ),
+                            )
+                        })?
+                    };
 
                     max_field_id += 1;
                     // Fold the new column name (unquoted -> lowercase) so it is

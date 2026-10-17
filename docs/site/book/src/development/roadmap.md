@@ -263,6 +263,7 @@ Iceberg V3 table format support landed end-to-end. The vendored fork at `vendor/
 | Default values (`ALTER TABLE ADD COLUMN ... DEFAULT`) | Done |
 | Schema evolution (`ALTER TABLE ADD/DROP COLUMN`, incl. nested struct fields) | Done |
 | Nanosecond timestamps (`TIMESTAMP_NS`, `TIMESTAMPTZ_NS`) | Done |
+| `VARIANT` columns (unshredded, JSON text in and out) | Done |
 | Partition evolution | Done |
 | Equality deletes + position deletes (MoR) | Done |
 
@@ -270,7 +271,7 @@ Iceberg V3 table format support landed end-to-end. The vendored fork at `vendor/
 
 | Feature | Blocker |
 |---|---|
-| Variant type | iceberg-rust [#2188](https://github.com/apache/iceberg-rust/pull/2188) not merged |
+| Shredded variant reads, variant path functions | SQE work, tracked in #849 |
 | Geometry type | DataFusion UDT [#12644](https://github.com/apache/datafusion/issues/12644) |
 | Vector / Embedding type | Iceberg V3 vector spec not finalised |
 | Multi-arg partition transforms | Iceberg Java spec alignment in progress |

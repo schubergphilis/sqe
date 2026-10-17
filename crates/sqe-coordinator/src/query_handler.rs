@@ -5614,6 +5614,14 @@ impl QueryHandler {
                 first = false;
                 let col_name = names.value(i);
                 let col_type = types.value(i);
+                // Variant storage displays as a struct of two binaries;
+                // render the type the DDL takes back (#849).
+                let col_type = if sqe_trino_compat::info_schema_compat::is_variant_display(col_type)
+                {
+                    "VARIANT"
+                } else {
+                    col_type
+                };
                 let nullable = nullables.value(i);
                 ddl.push_str(&format!("   {col_name} {col_type}"));
                 if nullable == "NO" {

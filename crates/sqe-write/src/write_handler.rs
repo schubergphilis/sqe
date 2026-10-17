@@ -1844,7 +1844,12 @@ impl WriteHandler {
         // the precision the format version can hold; the streaming sink casts
         // every batch onto the table schema (`apply_stamped_schema`), so the
         // ns values are narrowed to µs on write (#773).
-        let create_format_version = self.format_version();
+        // A variant column exists only from v3 (#849), so it upgrades the table.
+        let create_format_version = if arrow_schema_has_variant(output_schema.as_arrow()) {
+            FormatVersion::V3
+        } else {
+            self.format_version()
+        };
         let arrow_schema = Arc::new(timestamps_for_format_version(
             output_schema.as_arrow(),
             create_format_version,
@@ -2662,7 +2667,12 @@ impl WriteHandler {
             return Ok(vec![]);
         }
 
-        let format_version = self.format_version();
+        // A variant column exists only from v3 (#849).
+        let format_version = if schema_has_variant(&iceberg_schema) {
+            FormatVersion::V3
+        } else {
+            self.format_version()
+        };
         let props = self.format_version_props(format_version);
         let location = unique_table_location(catalog.as_ref(), &namespace, &name).await;
         let table_creation = TableCreation::builder()
@@ -7765,6 +7775,12 @@ pub fn sql_type_to_arrow(
         });
     }
 
+    // VARIANT (Iceberg V3) is stored as `Struct { metadata, value }`; the
+    // Iceberg conversion tags it with the variant extension (#849).
+    if sqe_sql::is_variant_type(sql_type) {
+        return Ok(sqe_core::variant::storage_type());
+    }
+
     match sql_type {
         SqlType::Boolean => Ok(DataType::Boolean),
         SqlType::TinyInt(_) | SqlType::Int8(_) => Ok(DataType::Int8),
@@ -8103,8 +8119,56 @@ fn partition_prune_cow_files(
 /// could not: nested struct fields then hit iceberg-rust's "Field id not found
 /// in metadata", which is the ROW/struct write failure in #321.
 fn arrow_schema_to_iceberg(arrow_schema: &ArrowSchema) -> sqe_core::Result<IcebergSchema> {
-    arrow_schema_to_schema_auto_assign_ids(arrow_schema)
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build Iceberg schema: {e}")))
+    arrow_schema_to_schema_auto_assign_ids(&tag_variant_fields(arrow_schema)).map_err(|e| {
+        SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!("Failed to build Iceberg schema: {e}"),
+        )
+    })
+}
+
+/// `arrow_schema` with every variant-shaped field tagged as a variant, so
+/// iceberg-rust creates an Iceberg `variant` column rather than a struct of
+/// two binaries (#849).
+fn tag_variant_fields(arrow_schema: &ArrowSchema) -> ArrowSchema {
+    let fields: Vec<arrow_schema::Field> = arrow_schema
+        .fields()
+        .iter()
+        .map(|f| sqe_core::variant::tag(f))
+        .collect();
+    ArrowSchema::new_with_metadata(fields, arrow_schema.metadata().clone())
+}
+
+/// True when an Arrow schema holds a variant at any depth: the table it
+/// creates must be format-version 3.
+pub(crate) fn arrow_schema_has_variant(arrow_schema: &ArrowSchema) -> bool {
+    arrow_schema
+        .fields()
+        .iter()
+        .any(|f| sqe_core::variant::contains_variant(f))
+}
+
+/// True when an Iceberg type is or holds a `variant`.
+fn type_has_variant(ty: &iceberg::spec::Type) -> bool {
+    use iceberg::spec::Type;
+    match ty {
+        Type::Variant(_) => true,
+        Type::Struct(s) => s.fields().iter().any(|f| type_has_variant(&f.field_type)),
+        Type::List(l) => type_has_variant(&l.element_field.field_type),
+        Type::Map(m) => {
+            type_has_variant(&m.key_field.field_type) || type_has_variant(&m.value_field.field_type)
+        }
+        Type::Primitive(_) => false,
+    }
+}
+
+/// True when an Iceberg schema holds a `variant` column at any depth.
+pub fn schema_has_variant(schema: &IcebergSchema) -> bool {
+    schema
+        .as_struct()
+        .fields()
+        .iter()
+        .any(|f| type_has_variant(&f.field_type))
 }
 
 /// Narrow nanosecond timestamps to microseconds when the target format
@@ -8182,8 +8246,13 @@ pub fn arrow_schema_to_iceberg_with_defaults(
     // attach column DEFAULTs to the top-level fields. DEFAULTs apply only to
     // top-level columns, so the nested IDs from the auto-assignment are
     // preserved unchanged.
-    let base = arrow_schema_to_schema_auto_assign_ids(arrow_schema)
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build Iceberg schema: {e}")))?;
+    let base =
+        arrow_schema_to_schema_auto_assign_ids(&tag_variant_fields(arrow_schema)).map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("Failed to build Iceberg schema: {e}"),
+            )
+        })?;
 
     let mut fields = Vec::with_capacity(column_defs.len());
 
@@ -8315,12 +8384,14 @@ pub fn requires_v3_features(
         return true;
     }
 
-    // A write_default or initial_default means V3 too.
-    iceberg_schema
-        .as_struct()
-        .fields()
-        .iter()
-        .any(|f| f.write_default.is_some() || f.initial_default.is_some())
+    // A variant nested in a ROW / ARRAY / MAP column, or a write_default or
+    // initial_default, means V3 too.
+    schema_has_variant(iceberg_schema)
+        || iceberg_schema
+            .as_struct()
+            .fields()
+            .iter()
+            .any(|f| f.write_default.is_some() || f.initial_default.is_some())
 }
 
 /// Build the table-properties map that signals the desired Iceberg format
@@ -9983,6 +10054,37 @@ mod tests {
             arrow_schema_to_iceberg_with_defaults(&ArrowSchema::new(arrow_fields), &ct.columns)
                 .unwrap();
         assert!(requires_v3_features(&ct.columns, &iceberg));
+    }
+
+    /// #849: VARIANT maps to an Iceberg variant, nested ones included, and
+    /// makes the table v3. The arrow fields carry no extension, as in a CTAS
+    /// whose column came out of an expression.
+    #[test]
+    fn test_variant_column_is_an_iceberg_variant_and_requires_v3() {
+        use iceberg::spec::Type;
+        let ct = parse_create_table("CREATE TABLE t (id BIGINT, v VARIANT, r ROW(x VARIANT))");
+        let arrow_fields: Vec<_> = ct
+            .columns
+            .iter()
+            .map(|c| {
+                let ty = sql_type_to_arrow(&c.data_type).unwrap();
+                Field::new(c.name.value.clone(), ty, true)
+            })
+            .collect();
+        let iceberg =
+            arrow_schema_to_iceberg_with_defaults(&ArrowSchema::new(arrow_fields), &ct.columns)
+                .unwrap();
+        let fields = iceberg.as_struct().fields();
+        assert!(matches!(fields[1].field_type.as_ref(), Type::Variant(_)));
+        let Type::Struct(row) = fields[2].field_type.as_ref() else {
+            panic!("ROW column expected, got {}", fields[2].field_type)
+        };
+        assert!(matches!(
+            row.fields()[0].field_type.as_ref(),
+            Type::Variant(_)
+        ));
+        assert!(requires_v3_features(&ct.columns, &iceberg));
+        assert!(schema_has_variant(&iceberg));
     }
 
     #[test]

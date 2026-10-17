@@ -33,6 +33,33 @@ const INTERNAL_CATALOGS: [&str; 2] = ["system", "datafusion"];
 /// Map a DataFusion Arrow type *display string* (as emitted by the built-in
 /// `information_schema.data_type` column) to a Trino SQL type name. Unknown
 /// inputs pass through unchanged rather than being mangled.
+/// True when an Arrow type display string is Iceberg variant storage,
+/// `Struct("metadata": Binary, "value": Binary)` (#849). DataFusion's
+/// `information_schema` only has the display form to go on.
+pub fn is_variant_display(t: &str) -> bool {
+    let Some(inner) = t.strip_prefix("Struct(").and_then(|r| r.strip_suffix(')')) else {
+        return false;
+    };
+    let binary = |rest: &str| {
+        let rest = rest.strip_prefix("non-null ").unwrap_or(rest);
+        rest.starts_with("Binary")
+            || rest.starts_with("LargeBinary")
+            || rest.starts_with("BinaryView")
+    };
+    let Some(rest) = inner.strip_prefix("\"metadata\": ") else {
+        return false;
+    };
+    let Some((metadata, value)) = rest.split_once(", \"value\": ") else {
+        return false;
+    };
+    // Nothing may follow `value` but a shredded file's `typed_value`.
+    let only_typed_value = match value.split_once(", \"") {
+        None => true,
+        Some((_, more)) => more.starts_with("typed_value\": "),
+    };
+    binary(metadata) && binary(value) && only_typed_value
+}
+
 pub fn arrow_display_to_trino_type(s: &str) -> String {
     let t = s.trim();
     if let Some(rest) = t
@@ -57,6 +84,9 @@ pub fn arrow_display_to_trino_type(s: &str) -> String {
     }
     if t.starts_with("List") || t.starts_with("LargeList") || t.starts_with("FixedSizeList") {
         return "array".to_string();
+    }
+    if is_variant_display(t) {
+        return "variant".to_string();
     }
     if t.starts_with("Struct") {
         return "row".to_string();
@@ -275,6 +305,22 @@ mod tests {
     #[test]
     fn composite_types_map_to_trino_kinds() {
         assert_eq!(arrow_display_to_trino_type("Struct([Field ...])"), "row");
+        assert_eq!(
+            arrow_display_to_trino_type(
+                r#"Struct("metadata": non-null Binary, "value": non-null Binary)"#
+            ),
+            "variant"
+        );
+        assert_eq!(
+            arrow_display_to_trino_type(r#"Struct("metadata": Utf8, "value": Binary)"#),
+            "row"
+        );
+        assert_eq!(
+            arrow_display_to_trino_type(
+                r#"Struct("metadata": Binary, "value": Binary, "x": Int32)"#
+            ),
+            "row"
+        );
         assert_eq!(arrow_display_to_trino_type("List(Field ...)"), "array");
         assert_eq!(arrow_display_to_trino_type("Map(Field ...)"), "map");
     }
