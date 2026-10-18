@@ -9,4 +9,4 @@
 # minimum supported Rust version, `rust-version` in Cargo.toml, is 1.99: the
 # atomics use `try_update`, which 1.99 stabilized when it deprecated
 # `fetch_update`.
-channel = "1.99.0"
+channel = "1.99.1"
