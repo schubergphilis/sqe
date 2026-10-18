@@ -210,8 +210,12 @@ connection = adbc_driver_flightsql.dbapi.connect(
         adbc_driver_manager.DatabaseOptions.USERNAME.value: "sp-admin",
         adbc_driver_manager.DatabaseOptions.PASSWORD.value: client_secret,
     },
+    autocommit=True,
 )
 ```
+
+ADBC's DB-API connection starts outside autocommit, so without
+`autocommit=True` the DML would sit in an open transaction until `commit()`.
 
 Both connections execute the same DDL and DML. Trino HTTP is valuable when the
 organization already has Trino clients, BI tools, or Python code. Flight SQL is
