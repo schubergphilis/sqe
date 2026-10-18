@@ -473,7 +473,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             }))
         } else {
             // A missing column, treating it as null.
-            self.build_always_true()
+            self.build_always_false()
         }
     }
 
@@ -493,7 +493,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             }))
         } else {
             // A missing column, treating it as null.
-            self.build_always_true()
+            self.build_always_false()
         }
     }
 
@@ -614,7 +614,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             }))
         } else {
             // A missing column, treating it as null.
-            self.build_always_true()
+            self.build_always_false()
         }
     }
 
@@ -688,7 +688,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             }))
         } else {
             // A missing column, treating it as null.
-            self.build_always_true()
+            self.build_always_false()
         }
     }
 }
