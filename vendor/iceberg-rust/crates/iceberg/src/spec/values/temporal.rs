@@ -98,15 +98,14 @@ pub(crate) mod timestamptz {
     }
 
     pub(crate) fn microseconds_to_datetimetz(micros: i64) -> DateTime<Utc> {
-        // Splitting into (secs, subsec) by hand is wrong for values before the Unix epoch:
-        // truncating division leaves a *negative* remainder, and casting that to `u32` yields a
-        // nonsensical subsecond count, so this used to panic for any timestamp before 1970.
-        // This shouldn't fail until the year 262000.
-        DateTime::from_timestamp_micros(micros).unwrap()
+        // Returns None only outside chrono's range (~year -262144 to +262142);
+        // unreachable for any realistic Iceberg timestamp.
+        DateTime::from_timestamp_micros(micros).expect(
+            "timestamp micros outside chrono's representable range (~year -262144..+262142)",
+        )
     }
 
     pub(crate) fn nanoseconds_to_datetimetz(nanos: i64) -> DateTime<Utc> {
-        // Infallible for every `i64`, and correct before the Unix epoch. See the note above.
         DateTime::from_timestamp_nanos(nanos)
     }
 

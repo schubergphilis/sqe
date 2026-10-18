@@ -217,8 +217,8 @@ mod tests {
 
     use arrow_array::cast::AsArray;
     use arrow_array::{
-        ArrayRef, Decimal128Array, Float32Array, Int32Array, Int64Array, LargeStringArray,
-        RecordBatch, StringArray,
+        ArrayRef, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
+        LargeStringArray, RecordBatch, StringArray,
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::TryStreamExt;
@@ -273,10 +273,9 @@ mod tests {
             .await
             .unwrap();
 
-        result[0].columns()[0]
-            .as_string_opt::<i32>()
-            .unwrap()
+        result
             .iter()
+            .flat_map(|batch| batch.column(0).as_string_opt::<i32>().unwrap().iter())
             .map(|v| v.map(ToOwned::to_owned))
             .collect::<Vec<_>>()
     }
@@ -901,6 +900,161 @@ mod tests {
                 .set_offset_index(Some(vec![]))
                 .build(),
         )
+    }
+
+    /// A `FileScanTask` built or deserialized outside `TableScan` carries an
+    /// un-normalized predicate, so a raw `Not(...)` can reach the reader.
+    #[tokio::test]
+    async fn test_not_predicate_read_returns_matching_rows() {
+        use arrow_array::Int32Array;
+
+        let schema = int_schema();
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("x", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap().to_string();
+        let file_path = format!("{table_location}/not_pred.parquet");
+
+        let file = File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), None).unwrap();
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(
+            (0..=10).collect::<Vec<i32>>(),
+        ))])
+        .unwrap();
+        writer.write(&batch).expect("Writing batch");
+        writer.close().unwrap();
+
+        // NOT(x > 5) == x <= 5, bound without rewriting, as a non-TableScan caller
+        // would supply it.
+        let predicate = (!Reference::new("x").greater_than(Datum::int(5)))
+            .bind(schema.clone(), false)
+            .unwrap();
+        assert!(
+            matches!(predicate, BoundPredicate::Not(_)),
+            "test must drive a raw Not(...) node"
+        );
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+            .with_row_group_filtering_enabled(true)
+            .build();
+
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(std::fs::metadata(&file_path).unwrap().len())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(file_path)
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema.clone())
+            .with_project_field_ids(vec![1])
+            .with_predicate(Some(predicate))
+            .with_case_sensitive(false)
+            .build()
+            .unwrap();
+
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let batches = reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+
+        let mut values = Vec::new();
+        for batch in &batches {
+            let col = batch
+                .column(0)
+                .as_primitive::<arrow_array::types::Int32Type>();
+            values.extend(col.values().iter().copied());
+        }
+
+        assert_eq!(values, (0..=5).collect::<Vec<i32>>());
+    }
+
+    #[tokio::test]
+    async fn test_not_predicate_read_through_page_index() {
+        use arrow_array::Int32Array;
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        use parquet::file::serialized_reader::ReadOptionsBuilder;
+
+        let schema = int_schema();
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("x", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap().to_string();
+        let file_path = format!("{table_location}/not_pred_pages.parquet");
+
+        let file = File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), None).unwrap();
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(
+            (0..100).collect::<Vec<i32>>(),
+        ))])
+        .unwrap();
+        writer.write(&batch).expect("Writing batch");
+        writer.close().unwrap();
+
+        {
+            let f = File::open(&file_path).unwrap();
+            let opts = ReadOptionsBuilder::new().with_page_index().build();
+            let rdr = SerializedFileReader::new_with_options(f, opts).unwrap();
+            assert!(
+                rdr.metadata().column_index().is_some(),
+                "fixture must carry a column index so the page-index path runs"
+            );
+        }
+
+        // NOT(x >= 50) == x < 50, as a non-TableScan caller would supply it.
+        let predicate = (!Reference::new("x").greater_than_or_equal_to(Datum::int(50)))
+            .bind(schema.clone(), false)
+            .unwrap();
+        assert!(matches!(predicate, BoundPredicate::Not(_)));
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+            .with_row_group_filtering_enabled(false)
+            .with_row_selection_enabled(true)
+            .build();
+
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(std::fs::metadata(&file_path).unwrap().len())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(file_path)
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema.clone())
+            .with_project_field_ids(vec![1])
+            .with_predicate(Some(predicate))
+            .with_case_sensitive(false)
+            .build()
+            .unwrap();
+
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let batches = reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+
+        let mut values = Vec::new();
+        for batch in &batches {
+            let col = batch
+                .column(0)
+                .as_primitive::<arrow_array::types::Int32Type>();
+            values.extend(col.values().iter().copied());
+        }
+
+        assert_eq!(values, (0..50).collect::<Vec<i32>>());
     }
 
     /// Testing suite regarding: https://github.com/apache/iceberg-rust/issues/2452
@@ -1760,5 +1914,90 @@ mod tests {
         )
         .await;
         assert_eq!(rows(&on), 1);
+    }
+
+    /// A column the file does not carry must filter exactly like a present
+    /// all-null column.
+    #[tokio::test]
+    async fn test_missing_column_predicates_evaluate_as_null_column() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::optional(1, "a", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::optional(2, "d", Type::Primitive(PrimitiveType::Double)).into(),
+                    NestedField::optional(3, "s", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let rows: Vec<Option<String>> = ["x", "y", "z"].map(|v| Some(v.to_string())).into();
+        // `setup_kleene_logic` writes `a` only, so `d` and `s` are missing from its file.
+        let (file_io, _, missing, _missing_dir) = setup_kleene_logic(rows.clone(), DataType::Utf8);
+        // A second file carries `d` and `s` as all-null columns.
+        let present_dir = TempDir::new().unwrap();
+        let present = present_dir.path().to_str().unwrap().to_string();
+        let field = |name: &str, data_type: DataType, id: i32| {
+            Field::new(name, data_type, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                id.to_string(),
+            )]))
+        };
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                field("a", DataType::Utf8, 1),
+                field("d", DataType::Float64, 2),
+                field("s", DataType::Utf8, 3),
+            ])),
+            vec![
+                Arc::new(StringArray::from(rows.clone())),
+                Arc::new(Float64Array::from(vec![None::<f64>; 3])),
+                Arc::new(StringArray::from(vec![None::<&str>; 3])),
+            ],
+        )
+        .unwrap();
+        let file = File::create(format!("{present}/1.parquet")).unwrap();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let d = || Reference::new("d");
+        let s = || Reference::new("s");
+        let cases = vec![
+            (d().is_null(), rows.clone()),
+            (d().is_not_null(), vec![]),
+            (d().is_nan(), vec![]),
+            (d().is_not_nan(), rows.clone()),
+            (d().less_than(Datum::double(1.0)), vec![]),
+            (d().less_than_or_equal_to(Datum::double(1.0)), vec![]),
+            (d().greater_than(Datum::double(1.0)), vec![]),
+            (d().greater_than_or_equal_to(Datum::double(1.0)), vec![]),
+            (d().equal_to(Datum::double(1.0)), vec![]),
+            (d().not_equal_to(Datum::double(1.0)), vec![]),
+            (d().is_in([Datum::double(1.0), Datum::double(2.0)]), vec![]),
+            (d().is_not_in([Datum::double(1.0)]), vec![]),
+            (s().starts_with(Datum::string("f")), vec![]),
+            (s().not_starts_with(Datum::string("f")), vec![]),
+        ];
+        for row_selection in [false, true] {
+            let reader = ArrowReaderBuilder::new(file_io.clone(), Runtime::current())
+                .with_row_selection_enabled(row_selection)
+                .build();
+            for (predicate, expected) in &cases {
+                for location in [&missing, &present] {
+                    let got = test_perform_read(
+                        predicate.clone(),
+                        schema.clone(),
+                        location.clone(),
+                        reader.clone(),
+                    )
+                    .await;
+                    assert_eq!(
+                        &got, expected,
+                        "{location} row_selection={row_selection} {predicate}"
+                    );
+                }
+            }
+        }
     }
 }
