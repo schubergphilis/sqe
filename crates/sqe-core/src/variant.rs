@@ -12,9 +12,11 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{make_array, Array, ArrayRef, StringBuilder};
+use datafusion::arrow::array::{
+    make_array, Array, ArrayRef, RecordBatch, RecordBatchOptions, StringBuilder,
+};
 use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::{DataType, Field};
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::error::ArrowError;
 use parquet_variant_compute::{cast_to_variant, json_to_variant, VariantArray};
 use parquet_variant_json::VariantToJson;
@@ -131,6 +133,72 @@ pub fn row_to_json(array: &dyn Array, row: usize) -> Result<Option<String>, Arro
     Ok(Some(variants.try_value(0)?.to_json_string()?))
 }
 
+/// Fold a shredded variant `input` (with `typed_value`) back into the
+/// unshredded storage `target`, so a file a shredding writer produced reads
+/// with the table's declared type.
+pub fn unshred(input: &dyn Array, target: &DataType) -> Result<ArrayRef, ArrowError> {
+    let variants = parquet_variant_compute::unshred_variant(&VariantArray::try_new(input)?)?;
+    let storage: ArrayRef = Arc::new(variants.into_inner());
+    if storage.data_type() == target {
+        Ok(storage)
+    } else {
+        cast(&storage, target)
+    }
+}
+
+/// True when `data_type` is variant storage with a `typed_value` group.
+pub fn is_shredded_storage(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Struct(fields) if fields.iter().any(|f| f.name() == "typed_value"))
+        && is_variant_storage(data_type)
+}
+
+/// `batch` with every top-level shredded variant column unshredded to
+/// [`storage_type`]; the batch itself when it has none.
+pub fn unshred_batch(batch: &RecordBatch) -> Result<RecordBatch, ArrowError> {
+    let schema = batch.schema();
+    if !schema
+        .fields()
+        .iter()
+        .any(|f| is_shredded_storage(f.data_type()))
+    {
+        return Ok(batch.clone());
+    }
+    let columns = schema
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .map(|(field, column)| {
+            if is_shredded_storage(field.data_type()) {
+                unshred(column.as_ref(), &storage_type())
+            } else {
+                Ok(Arc::clone(column))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    RecordBatch::try_new_with_options(
+        unshred_schema(&schema),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+}
+
+/// `schema` with every top-level shredded variant field declared as the
+/// unshredded [`storage_type`], the schema [`unshred_batch`] produces.
+pub fn unshred_schema(schema: &Schema) -> Arc<Schema> {
+    let fields: Vec<Arc<Field>> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            if is_shredded_storage(f.data_type()) {
+                Arc::new(tag(&f.as_ref().clone().with_data_type(storage_type())))
+            } else {
+                Arc::clone(f)
+            }
+        })
+        .collect();
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
 /// Convert `input` to variant storage of type `target`.
 ///
 /// Text is parsed as JSON, so `'{"a": 1}'` stores an object and invalid JSON
@@ -225,6 +293,27 @@ mod tests {
         );
         assert!(contains_variant(&list));
         assert!(!contains_variant(&Field::new("s", DataType::Utf8, true)));
+    }
+
+    #[test]
+    fn shredded_schema_reads_as_unshredded_storage() {
+        let shredded = DataType::Struct(
+            vec![
+                Field::new("metadata", DataType::Binary, false),
+                Field::new("value", DataType::Binary, true),
+                Field::new("typed_value", DataType::Int8, true),
+            ]
+            .into(),
+        );
+        assert!(is_shredded_storage(&shredded));
+        assert!(!is_shredded_storage(&storage_type()));
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("v", shredded, true),
+        ]);
+        let unshredded = unshred_schema(&schema);
+        assert_eq!(unshredded.field(0), schema.field(0));
+        assert_eq!(unshredded.field(1), &field("v", true));
     }
 
     #[test]

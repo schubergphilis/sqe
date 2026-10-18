@@ -877,7 +877,9 @@ async fn scan_streaming_inner(
     let out_schema: SchemaRef = match (&hive_ctx, &fill) {
         (Some(ctx), _) => Arc::clone(&ctx.1),
         (None, Some(fill)) => Arc::clone(fill.schema()),
-        (None, None) => Arc::clone(&first_schema),
+        // `emit_batch` unshreds a shredded variant, so the stream declares
+        // the unshredded storage.
+        (None, None) => sqe_core::variant::unshred_schema(&first_schema),
     };
 
     let (tx, rx) = mpsc::channel::<anyhow::Result<AccountedBatch>>(SCAN_CHANNEL_ITEM_CAPACITY);
@@ -999,6 +1001,16 @@ async fn scan_streaming_inner(
             hive: Option<&Arc<(sqe_planner::HiveScanDescriptor, SchemaRef)>>,
             fill: Option<&Arc<ProjectionFill>>,
         ) -> Option<usize> {
+            // A V3 variant a shredding writer produced decodes with a
+            // `typed_value` group; fold it back into the unshredded storage
+            // the coordinator plans against, before the fill casts by type.
+            let batch = match sqe_core::variant::unshred_batch(&batch) {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = tx.send(Err(ScanFault::classify(anyhow::anyhow!(e)))).await;
+                    return None;
+                }
+            };
             // Reshape to the declared projection (#831) before sizing, for the
             // same reason as the Hive columns below: a filled column allocates.
             let batch = match fill {

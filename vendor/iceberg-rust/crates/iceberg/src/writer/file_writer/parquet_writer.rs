@@ -193,6 +193,7 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             output_file,
             nan_value_count_visitor: NanValueCountVisitor::new_with_match_mode(self.match_mode),
             key_metadata,
+            written_columns: None,
         })
     }
 }
@@ -369,6 +370,28 @@ pub struct ParquetWriter {
     current_row_num: usize,
     nan_value_count_visitor: NanValueCountVisitor,
     key_metadata: Option<StandardKeyMetadata>,
+    /// SQE PATCH (v3-unknown): the batch columns written to the file when
+    /// the schema has `unknown` columns; `None` writes every column.
+    written_columns: Option<Vec<usize>>,
+}
+
+/// SQE PATCH (v3-unknown): true when `data_type` nests a Null (`unknown`)
+/// field inside a struct, list or map.
+fn contains_nested_null(data_type: &arrow_schema::DataType) -> bool {
+    use arrow_schema::DataType;
+    let null_or_nested = |f: &arrow_schema::Field| {
+        f.data_type() == &DataType::Null || contains_nested_null(f.data_type())
+    };
+    match data_type {
+        DataType::Struct(fields) => fields.iter().any(|f| null_or_nested(f)),
+        DataType::List(f)
+        | DataType::LargeList(f)
+        | DataType::ListView(f)
+        | DataType::LargeListView(f)
+        | DataType::FixedSizeList(f, _)
+        | DataType::Map(f, _) => null_or_nested(f),
+        _ => false,
+    }
 }
 
 /// Used to aggregate min and max value of each column.
@@ -725,7 +748,45 @@ impl FileWriter for ParquetWriter {
                     serde_json::to_string(self.schema.as_ref())
                         .expect("Iceberg schema serialization should not fail"),
                 );
-                Arc::new(schema.with_metadata(metadata))
+                // SQE PATCH (v3-unknown): the spec never writes a V3 `unknown`
+                // column to a data file, and Spark rejects a parquet column
+                // with the Null logical type. Top-level unknown columns are
+                // projected out; readers fill them with NULLs. A nested
+                // unknown field is refused rather than written as Null.
+                if let Some(field) = schema
+                    .fields()
+                    .iter()
+                    .find(|f| contains_nested_null(f.data_type()))
+                {
+                    return Err(Error::new(
+                        ErrorKind::FeatureUnsupported,
+                        format!(
+                            "Column `{}` has a nested unknown field, which cannot be written yet.",
+                            field.name()
+                        ),
+                    ));
+                }
+                if schema
+                    .fields()
+                    .iter()
+                    .any(|f| f.data_type() == &arrow_schema::DataType::Null)
+                {
+                    let kept: Vec<usize> = schema
+                        .fields()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, f)| f.data_type() != &arrow_schema::DataType::Null)
+                        .map(|(i, _)| i)
+                        .collect();
+                    let projected = schema.project(&kept).map_err(|err| {
+                        Error::new(ErrorKind::Unexpected, "Failed to drop unknown columns.")
+                            .with_source(err)
+                    })?;
+                    self.written_columns = Some(kept);
+                    Arc::new(projected.with_metadata(metadata))
+                } else {
+                    Arc::new(schema.with_metadata(metadata))
+                }
             };
             let inner_writer = self.output_file.writer().await?;
             let async_writer = AsyncFileWriter::new(inner_writer);
@@ -742,6 +803,17 @@ impl FileWriter for ParquetWriter {
             self.inner_writer.as_mut().unwrap()
         };
 
+        let projected;
+        let batch = match &self.written_columns {
+            Some(kept) => {
+                projected = batch.project(kept).map_err(|err| {
+                    Error::new(ErrorKind::Unexpected, "Failed to drop unknown columns.")
+                        .with_source(err)
+                })?;
+                &projected
+            }
+            None => batch,
+        };
         writer.write(batch).await.map_err(|err| {
             Error::new(
                 ErrorKind::Unexpected,
@@ -3369,5 +3441,73 @@ mod tests {
         let err = parquet_compression(CompressionCodec::Zstd(99)).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert!(err.to_string().contains("zstd"));
+    }
+
+    /// SQE PATCH (v3-unknown): a V3 `unknown` column is never written to the
+    /// data file; the other columns are.
+    #[tokio::test]
+    async fn test_parquet_writer_skips_unknown_column() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "u", Type::Primitive(PrimitiveType::Unknown)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema: ArrowSchemaRef = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        let to_write = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(Int64Array::from_iter_values(0..3)) as ArrayRef,
+            Arc::new(arrow_array::NullArray::new(3)) as ArrayRef,
+        ])?;
+
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+        let file_path = output_file.location().to_string();
+        let mut pw = ParquetWriterBuilder::new(WriterProperties::builder().build(), schema.clone())
+            .build(output_file)
+            .await?;
+        pw.write(&to_write).await?;
+        pw.write(&to_write).await?;
+        let res = pw.close().await?;
+        assert_eq!(res.len(), 1);
+
+        let bytes = file_io.new_input(&file_path)?.read().await?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap().build().unwrap();
+        let batches = reader.map(|b| b.unwrap()).collect::<Vec<_>>();
+        let read = concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(read.num_rows(), 6);
+        let names: Vec<_> = read.schema().fields().iter().map(|f| f.name().clone()).collect();
+        assert_eq!(names, vec!["id".to_string()]);
+        Ok(())
+    }
+
+    /// SQE PATCH (v3-unknown): a nested `unknown` field is refused, not
+    /// written as a Null column other engines cannot read.
+    #[test]
+    fn test_contains_nested_null() {
+        use arrow_schema::{DataType, Field, Fields};
+        let nested = DataType::Struct(Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("u", DataType::Null, true),
+        ]));
+        assert!(contains_nested_null(&nested));
+        assert!(contains_nested_null(&DataType::List(Arc::new(Field::new(
+            "element", nested, true
+        )))));
+        assert!(!contains_nested_null(&DataType::Null));
+        assert!(!contains_nested_null(&DataType::Struct(Fields::from(vec![
+            Field::new("a", DataType::Int32, true)
+        ]))));
     }
 }

@@ -5,9 +5,10 @@
 //! tests skip with the reason.
 
 use crate::common::spark_interop::{spark_sql, spark_stack_skip_reason};
+use object_store::ObjectStoreExt;
 
 /// Every row of `sql` as `col|col|...`, a variant cell as its JSON text.
-async fn sqe_rows(
+pub(crate) async fn sqe_rows(
     handler: &sqe_coordinator::QueryHandler,
     session: &sqe_core::Session,
     sql: &str,
@@ -38,7 +39,7 @@ async fn sqe_rows(
 }
 
 /// Spark's TSV output as `col|col|...` rows.
-fn spark_rows(sql: &str) -> Vec<String> {
+pub(crate) fn spark_rows(sql: &str) -> Vec<String> {
     spark_sql(sql)
         .unwrap_or_else(|e| panic!("spark: {sql}: {e}"))
         .lines()
@@ -132,4 +133,100 @@ async fn sqe_reads_a_spark_variant_table() {
         ],
         "SQE's rows of the Spark-written V3 table"
     );
+}
+
+/// Spark 4.1 with `write.parquet.shred-variants` writes consistently shaped
+/// objects with a `typed_value` group beside `value`. SQE reads the shredded
+/// fields back, not just the residual binary.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn sqe_reads_a_spark_shredded_variant_table() {
+    if let Some(reason) = spark_stack_skip_reason() {
+        eprintln!("skipping sqe_reads_a_spark_shredded_variant_table: {reason}");
+        return;
+    }
+    let fq = "default.variant_shredded_from_spark";
+    spark_sql(&format!(
+        r#"DROP TABLE IF EXISTS rest.{fq};
+           CREATE TABLE rest.{fq} (id INT, v VARIANT) USING iceberg
+             TBLPROPERTIES ('format-version' = '3',
+                            'write.parquet.shred-variants' = 'true');
+           INSERT INTO rest.{fq} VALUES
+             (1, parse_json('{{"a": 1, "s": "x"}}')),
+             (2, parse_json('{{"a": 2, "s": "y"}}')),
+             (3, parse_json('{{"a": 3, "s": "z", "extra": true}}')),
+             (4, parse_json('[1, 2]')),
+             (5, NULL);"#
+    ))
+    .expect("spark writes the shredded variant table");
+
+    // The data file must really be shredded, or this test proves nothing.
+    let files = spark_rows(&format!("SELECT file_path FROM rest.{fq}.files"));
+    let mut shredded = false;
+    for path in &files {
+        let (bucket, key) = split_s3(path);
+        let store = test_store(&bucket);
+        let bytes = store
+            .get(&object_store::path::Path::from(key.as_str()))
+            .await
+            .expect("get data file")
+            .bytes()
+            .await
+            .expect("read data file");
+        let reader = parquet::file::serialized_reader::SerializedFileReader::new(bytes)
+            .expect("parquet footer");
+        let schema = parquet::file::reader::FileReader::metadata(&reader)
+            .file_metadata()
+            .schema_descr()
+            .root_schema()
+            .clone();
+        shredded |= format!("{schema:?}").contains("typed_value");
+    }
+
+    let (session, handler) = crate::common::setup_handler().await;
+    let read = sqe_rows(
+        &handler,
+        &session,
+        &format!("SELECT id, v, json_get_int(v, 'a'), json_get_str(v, 's') FROM {fq} ORDER BY id"),
+    )
+    .await;
+    let _ = spark_sql(&format!("DROP TABLE IF EXISTS rest.{fq}"));
+    assert!(
+        shredded,
+        "Spark did not shred the variant column in {files:?}"
+    );
+    assert_eq!(
+        read,
+        vec![
+            r#"1|{"a":1,"s":"x"}|1|x"#,
+            r#"2|{"a":2,"s":"y"}|2|y"#,
+            r#"3|{"a":3,"extra":true,"s":"z"}|3|z"#,
+            "4|[1,2]|NULL|NULL",
+            "5|NULL|NULL|NULL",
+        ],
+        "SQE's rows of the shredded Spark-written V3 table"
+    );
+}
+
+/// A plain client on the test stack's RustFS, independent of SQE's reader.
+fn test_store(bucket: &str) -> object_store::aws::AmazonS3 {
+    object_store::aws::AmazonS3Builder::new()
+        .with_bucket_name(bucket)
+        .with_endpoint("http://localhost:19000")
+        .with_region("us-east-1")
+        .with_access_key_id("s3admin")
+        .with_secret_access_key("s3admin")
+        .with_virtual_hosted_style_request(false)
+        .with_allow_http(true)
+        .build()
+        .expect("build test S3 client")
+}
+
+/// Split `s3://bucket/key` into the bucket and the key.
+fn split_s3(uri: &str) -> (String, String) {
+    let rest = uri
+        .strip_prefix("s3://")
+        .unwrap_or_else(|| panic!("not an s3 uri: {uri}"));
+    let (bucket, key) = rest.split_once('/').expect("s3 uri has a key");
+    (bucket.to_string(), key.to_string())
 }
