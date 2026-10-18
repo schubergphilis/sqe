@@ -370,13 +370,14 @@ audit-licenses:
 # ── Benchmarks ────────────────────────────────────────────────────────────
 # One suite sweep per scale factor; the _trino variants add --compare-trino
 # and fail the run if a Trino outage silently skipped any comparison.
-# `make benchmark_sf<scale>` / `make benchmark_sf<scale>_trino`; make picks
-# the `_trino` rule for its shorter stem.
-benchmark_sf%:
-	@$(BENCH_ENV) $(BENCH_RUN) $* $(BENCH_SUITES)
-
+# `make benchmark_sf<scale>` / `make benchmark_sf<scale>_trino`. The `_trino`
+# rule must come first: GNU make 3.81 (macOS) takes the first matching
+# pattern, not the shortest stem, and would run scale `1_trino`.
 benchmark_sf%_trino:
 	@$(BENCH_ENV) TRINO_MEMORY=$(TRINO_MEMORY) $(BENCH_RUN) $* --compare-trino $(BENCH_SUITES)
+
+benchmark_sf%:
+	@$(BENCH_ENV) $(BENCH_RUN) $* $(BENCH_SUITES)
 
 benchmark_all:
 	@$(BENCH_ENV) $(BENCH_RUN) 0.1 $(BENCH_SUITES)
