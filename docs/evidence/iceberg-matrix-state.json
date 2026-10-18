@@ -10,12 +10,12 @@
     "group": "3rd Party",
     "docUrl": "https://docs.getsqe.com"
   },
-  "generatedAt": "2026-10-17T00:00:00Z",
-  "generatedBy": "Rescore against the pinned upstream rubric; evidence paths repaired after the crate and test moves.",
+  "generatedAt": "2026-10-18T00:00:00Z",
+  "generatedBy": "Rescore against the pinned upstream rubric; evidence paths repaired after the crate and test moves. 2026-10-18: unknown-type and shredded-variant measured against Spark 4.1 + Iceberg 1.12.",
   "score": {
-    "raw": 144,
+    "raw": 147,
     "max": 162,
-    "percent": 88.9
+    "percent": 90.7
   },
   "note": "Rescored on 2026-10-17 against upstream features.json (32 features). Only cells that apply to a version are scored, as the site shows them: position-deletes is V2-only now, so 54 cells, max 162. Removed upstream and dropped here: hive-metastore, nessie, polaris, hadoop-catalog, jdbc-catalog, vector-type, cdc-support. New: deletion-vectors, unknown-type, google-lakehouse. Gains: deletion vectors and row lineage on V3, unshredded VARIANT. Downgrade: unity-catalog to partial (read-only smoke). The old 167/189 is not comparable.",
   "support": {
@@ -350,15 +350,17 @@
       "evidence": "crates/sqe-core/src/variant.rs, crates/sqe-coordinator/tests/it/variant_e2e.rs::variant_column_stores_json_and_reads_it_back, crates/sqe-coordinator/tests/it/variant_e2e.rs::variant_survives_ctas_and_insert_select, crates/sqe-coordinator/tests/it/variant_e2e.rs::json_column_is_a_variant_on_a_v3_table, crates/sqe-coordinator/tests/it/variant_e2e.rs::json_functions_read_a_v3_json_column, crates/sqe-coordinator/tests/it/variant_spark_interop.rs::spark_reads_an_sqe_json_variant_table, crates/sqe-coordinator/tests/it/variant_spark_interop.rs::sqe_reads_a_spark_variant_table, crates/sqe-coordinator/tests/it/variant_distributed.rs::json_variant_column_scans_on_a_worker",
       "caveats": [
         "Field access goes through the variant's JSON text (json_* functions); no variant_get / typed path access yet.",
-        "Shredded variant files (typed_value) are not covered by a test; the Spark interop test reads Spark's default unshredded output.",
         "Compaction of a variant table is untested."
       ]
     },
     "sqe:shredded-variant:v3": {
-      "level": "none",
-      "notes": "SQE writes unshredded variants and cannot read shredded ones; unshred_variant in the Parquet readers is planned (#849 follow-up).",
-      "evidence": "crates/sqe-core/src/variant.rs",
-      "caveats": []
+      "level": "partial",
+      "notes": "SQE reads shredded variant files: Spark 4.1 + Iceberg 1.12 writes a table with write.parquet.shred-variants=true (the test asserts typed_value is in the parquet schema), and SQE folds typed_value back into the variant on the coordinator's direct read, on the iceberg-rust reader and on a worker. Variant manifest bounds are skipped rather than parsed as primitives. Objects, arrays, extra keys and NULLs read back as the same JSON text.",
+      "evidence": "crates/sqe-core/src/variant.rs, crates/sqe-catalog/src/iceberg_scan.rs, vendor/iceberg-rust/crates/iceberg/src/arrow/record_batch_transformer.rs, crates/sqe-coordinator/tests/it/variant_spark_interop.rs::sqe_reads_a_spark_shredded_variant_table, crates/sqe-coordinator/tests/it/variant_distributed.rs::shredded_variant_column_scans_on_a_worker",
+      "caveats": [
+        "Read-only: SQE writes unshredded variants and ignores write.parquet.shred-variants.",
+        "Shredded columns are unshredded on read, so typed_value gives no pruning or typed field access."
+      ]
     },
     "sqe:geometry-type:v3": {
       "level": "none",
@@ -373,11 +375,12 @@
       "caveats": []
     },
     "sqe:unknown-type:v3": {
-      "level": "unknown",
-      "notes": "Unmeasured. The vendored iceberg-rust maps Iceberg unknown to Arrow Null and information_schema reports it as 'unknown', so reading a table with such a column should work, but SQE DDL cannot declare the type and no test reads a table that has one.",
-      "evidence": "crates/sqe-catalog/src/info_schema.rs, vendor/iceberg-rust/crates/iceberg/src/arrow/schema.rs",
+      "level": "partial",
+      "notes": "Top-level unknown columns work across engines. SQE declares one as UNKNOWN or VOID, reads a Spark-written VOID column as NULLs, inserts around it and promotes it with ALTER COLUMN ... SET DATA TYPE, and Spark 4.1 + Iceberg 1.12 reads every stage. Unknown columns are never written to a data file, as the spec requires; readers fill them with NULLs.",
+      "evidence": "crates/sqe-write/src/write_handler.rs, crates/sqe-catalog/src/iceberg_scan.rs, vendor/iceberg-rust/crates/iceberg/src/writer/file_writer/parquet_writer.rs, crates/sqe-coordinator/tests/it/unknown_type_spark_interop.rs::unknown_column_reads_writes_and_promotes, crates/sqe-coordinator/tests/it/unknown_type_spark_interop.rs::sqe_declares_an_unknown_column_spark_reads_it, crates/sqe-coordinator/tests/it/unknown_type_spark_interop.rs::nested_unknown_field_is_refused_at_write",
       "caveats": [
-        "Needs a live test: read a V3 table with a Spark-written VOID / unknown column."
+        "Nested unknown fields (STRUCT<a INT, u VOID>) are not supported: SQE cannot read a Spark table with one, and refuses to write one.",
+        "information_schema reports the Arrow type name Null, not unknown."
       ]
     },
     "sqe:lineage:v3": {

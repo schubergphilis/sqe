@@ -2,9 +2,9 @@
 
 Current state of SQE against the [icebergmatrix.org](https://icebergmatrix.org) rubric, the de-facto reference engineers consult when picking an Iceberg engine. Data lives at [Neuw84/iceberg-matrix](https://github.com/Neuw84/iceberg-matrix).
 
-**Score: 144/162 (88.9%)**  |  **Stretch: 170/189 (90%)**
+**Score: 147/162 (90.7%)**  |  **Stretch: 170/189 (90%)**
 
-Last generated: 2026-10-17T00:00:00Z  |  Source: `Rescore against the pinned upstream rubric; evidence paths repaired after the crate and test moves.`
+Last generated: 2026-10-18T00:00:00Z  |  Source: `Rescore against the pinned upstream rubric; evidence paths repaired after the crate and test moves. 2026-10-18: unknown-type and shredded-variant measured against Spark 4.1 + Iceberg 1.12.`
 
 Regenerate: `python3 scripts/render-iceberg-matrix.py`. Source of truth: `docs/evidence/iceberg-matrix-state.json`.
 
@@ -32,7 +32,7 @@ Each feature is scored against V2 and V3 of the Iceberg spec (63 cells total). A
 | AWS EMR (Spark 7.12) | 180/189 | 95 |
 | OSS Spark 4.1 | 175/189 | 93 |
 | OSS Flink 2.2 | 153/189 | 81 |
-| **SQE (current)** | **144/162** | **88.9** |
+| **SQE (current)** | **147/162** | **90.7** |
 | Snowflake | 134/189 | 71 |
 | PyIceberg 0.11 | 130/189 | 69 |
 | Databricks DBR 17.3 | 103/189 | 54 |
@@ -106,7 +106,7 @@ Peer scores from icebergmatrix.org as of 2026-04-29.
 | Feature | V2 | V3 | V2 notes | V3 notes |
 |---|:---:|:---:|---|---|
 | Variant | n/a | P | V3-only feature | VARIANT columns (and JSON columns on V3 tables) store Iceberg variant, unshredded. JSON text is parsed on write (invalid JSON fails the writ |
-| Shredded Variant | n/a | . | V3-only feature | SQE writes unshredded variants and cannot read shredded ones; unshred_variant in the Parquet readers is planned (#849 follow-up). |
+| Shredded Variant | n/a | P | V3-only feature | SQE reads shredded variant files: Spark 4.1 + Iceberg 1.12 writes a table with write.parquet.shred-variants=true (the test asserts typed_val |
 | Geometry | n/a | . | V3-only feature | No GEOMETRY / GEOGRAPHY type in SQE DDL or the read path. |
 | Vector / Embedding | - | - |  |  |
 | Nanosecond Timestamps | n/a | F | V3-only feature | TIMESTAMP_NS(N) / TIMESTAMPTZ_NS(N) map to Iceberg timestamp_ns / timestamptz_ns and to Arrow nanosecond timestamps; CREATE, INSERT and SELE |
@@ -134,9 +134,11 @@ Cells marked `partial` or `unknown` have specific gaps documented in `docs/evide
 - **google-lakehouse (v3)**: Inferred from generic Iceberg REST catalog support; not measured against Google Lakehouse.
 - **google-lakehouse (v3)**: Iceberg data on GCS (gs://) through the table FileIO and Google OAuth for the REST endpoint are not verified.
 - **variant-type (v3)**: Field access goes through the variant's JSON text (json_* functions); no variant_get / typed path access yet.
-- **variant-type (v3)**: Shredded variant files (typed_value) are not covered by a test; the Spark interop test reads Spark's default unshredded output.
 - **variant-type (v3)**: Compaction of a variant table is untested.
-- **unknown-type (v3)**: Needs a live test: read a V3 table with a Spark-written VOID / unknown column.
+- **shredded-variant (v3)**: Read-only: SQE writes unshredded variants and ignores write.parquet.shred-variants.
+- **shredded-variant (v3)**: Shredded columns are unshredded on read, so typed_value gives no pruning or typed field access.
+- **unknown-type (v3)**: Nested unknown fields (STRUCT<a INT, u VOID>) are not supported: SQE cannot read a Spark table with one, and refuses to write one.
+- **unknown-type (v3)**: information_schema reports the Arrow type name Null, not unknown.
 
 ---
 
