@@ -28,7 +28,7 @@ Be precise about the boundary, because it is easy to overclaim.
   (`GetUnfilteredTableMetadata`). So "fine-grained" here means **table /
   database-level permission gating**, not cell-level filtering.
 - **SQE's own fine-grained path** (column masks, row filters) is the policy
-  engine: OPA/Cedar plan rewriting, applied before execution. That is a separate
+  engine: Apache Ranger policies applied by plan rewriting before execution. That is a separate
   mechanism, independent of the catalog. See the security-policy docs.
 
 ## What you get

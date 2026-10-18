@@ -37,7 +37,6 @@ No configuration. Pass an absolute or relative path:
 ```sql
 SELECT * FROM '/data/orders.parquet';
 SELECT * FROM read_csv('./report.csv');
-SELECT * FROM read_delta('/var/lake/orders');
 ```
 
 Catalog backends that store data on local disk (`hadoop` type, or any REST catalog with `file://` warehouse paths) work the same way.
@@ -177,7 +176,7 @@ SELECT * FROM read_parquet(
 SELECT * FROM read_csv('hf://datasets/foo/bar/data.csv?revision=v1.0');
 ```
 
-Glob expansion (`**/*.parquet`) on `hf://` is tracked for V12.2; today the path must point to a specific file.
+Glob expansion (`**/*.parquet`) is not supported on `hf://`; the path must point to a specific file.
 
 See [File-format TVFs](../features/file-format-tvfs.md) for the full path-form table.
 
@@ -276,7 +275,7 @@ Catalogs name tables; storage holds bytes. Iceberg already separates these in th
 
 ## Implementation references
 
-- `crates/sqe-catalog/src/file_tvf_common.rs`: shared inline-arg parsing for `read_parquet` / `read_csv` / `read_json` / `read_delta`. URL-scheme dispatch via `is_s3_path`, `is_http_path`, `is_hf_path`, `is_azure_path`, `is_gcs_path`.
+- `crates/sqe-catalog/src/file_tvf_common.rs`: shared inline-arg parsing for `read_parquet` / `read_csv` / `read_json`. URL-scheme dispatch via `is_s3_path`, `is_http_path`, `is_hf_path`, `is_azure_path`, `is_gcs_path`.
   - `register_s3_store_if_needed`, `register_azure_store_if_needed`, `register_gcs_store_if_needed`, `register_http_store_if_needed`: per-backend `SessionContext` registration.
   - `extract_bucket`, `extract_azure_container_account`, `extract_gcs_bucket`: URL parsers.
 - `crates/sqe-catalog/src/lazy_object_store.rs`: V10's lazy HTTPS object-store registry.

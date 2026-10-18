@@ -17,7 +17,7 @@ embedded side, the same binary scales to a multi-tenant cluster.
 |---|---|---|
 | Distributed execution | bespoke coordinator/worker scheduler over Arrow Flight | single-process |
 | Per-query OIDC bearer pass-through to Iceberg / S3 | yes | no |
-| OPA / Cedar policy enforcement (row filters, column masks) | yes | no |
+| Apache Ranger policy enforcement (row filters, column masks) | yes | no |
 | Multi-catalog: Polaris + Nessie + Glue + HMS + S3Tables in one engine | yes (V6) | extension-by-extension |
 | Per-catalog auth (SessionBearer, ClientCredentials, Anonymous, Static, Aws) | yes (V7) | no |
 | Iceberg V3 read + write (position deletes, manifest column stats) | yes | extension, read-only |
@@ -42,10 +42,10 @@ state.
 | `COPY tbl FROM 'file.csv'` | inverse via `INSERT INTO tbl SELECT * FROM read_csv(...)` | **done** (V8 pattern) |
 | Gzip / zstd / xz / bz2 compressed CSV / JSON | extension-based codec auto-detect for CSV (V12 follow-up); same path for JSON | **done** (V8 + V12 follow-up) |
 | `INSERT INTO ... VALUES (...)` | works against persistent SQLite catalog at `~/.sqe/warehouse/` | **done** (V5/V12) |
-| `CREATE TABLE ... AS SELECT ...` | works in both embedded and cluster modes; cross-format CTAS (Iceberg from Delta from Parquet from hf://) | **done** (V5+) |
-| `read_delta(path, ...)` (Delta Lake) | temporarily disabled for the DataFusion 54 bump; delta-rs has no DF 54 release yet. Module kept on disk, re-lands when delta-rs ships DF 54 | disabled (was V11) |
+| `CREATE TABLE ... AS SELECT ...` | works in both embedded and cluster modes; cross-format CTAS (Iceberg from Parquet, CSV, JSON, hf://) | **done** (V5+) |
+| `read_delta(path, ...)` (Delta Lake) | not available: the Delta reader was removed with the move to DataFusion 54. Convert to Iceberg or Parquet first | removed (was V11) |
 | HuggingFace `hf://` URLs in TVFs | `hf://datasets/<owner>/<name>/<path>`, `?revision=<rev>`, `@<rev>`, `@~parquet` view | **done** (V10/V12.1) |
-| HuggingFace glob (`hf://.../**/*.parquet`) | tree-API cache landed; HfObjectStore wiring is V12.2 | **partial** (V12.2 in progress) |
+| HuggingFace glob (`hf://.../**/*.parquet`) | not supported; `hf://` resolves single files only | not supported |
 
 ### SQL surface
 
@@ -60,11 +60,11 @@ state.
 | `COUNT(*) FILTER (WHERE ...)` | have | done |
 | `DESCRIBE table` | DataFusion-native + `.describe` dot-command shortcut | **done** (V9) |
 | `SUMMARIZE table` | per-column UNION ALL via `.summarize` dot-command | **done** (V9) |
-| `SELECT * EXCLUDE (col)` | works (DataFusion 54 native) | **done** (documented in V9) |
-| `SELECT * REPLACE (expr AS col)` | works (DataFusion 54 native) | **done** (documented in V9) |
+| `SELECT * EXCLUDE (col)` | works (DataFusion native) | **done** (documented in V9) |
+| `SELECT * REPLACE (expr AS col)` | works (DataFusion native) | **done** (documented in V9) |
 | `FROM tbl SELECT ...` (FROM-first) | missing | not planned (DataFusion parser does not support) |
 | Struct / list / map literals (`{a: 1}`, `[1, 2]`, `MAP {...}`) | partial (nested types work, syntax less ergonomic) | not planned |
-| Lambdas (`filter`, `transform`, `any_match`, `all_match`, `none_match`, `reduce`) | have | **done**: SQE parses with the DuckDB dialect, so `x -> expr` works. `filter` / `transform` alias DataFusion 54's `array_filter` / `array_transform`; `all_match` / `none_match` / `reduce` are SQE UDFs. All six array higher-order functions covered |
+| Lambdas (`filter`, `transform`, `any_match`, `all_match`, `none_match`, `reduce`) | have | **done**: SQE parses with the DuckDB dialect, so `x -> expr` works. `filter` / `transform` alias DataFusion's `array_filter` / `array_transform`; `all_match` / `none_match` / `reduce` are SQE UDFs. All six array higher-order functions covered |
 | List comprehensions | missing | not planned (DataFusion does not support) |
 | `PIVOT` / `UNPIVOT` | missing | not planned (DataFusion does not support) |
 | `QUALIFY` | have (DataFusion SQL planner handles it) | done (row was stale; verified working, test `sql_compat 06_qualify`) |
@@ -80,7 +80,7 @@ state.
 | `azure` (ADLS Gen2 / Blob) | full: shared key, SAS, Azurite emulator; `abfss://` + `azure://` + `az://` URL schemes; `azure_*` inline TVF args; `[storage.azure*]` config block | **done** |
 | `gcp` (GCS) | full: service-account JSON path or inline + ADC fallback; `gs://` + `gcs://` URL schemes; `gcs_*` inline TVF args; `[storage.gcs*]` config block | **done** |
 | `iceberg` | stronger than DuckDB (full read+write, V3, multi-catalog, OIDC vending, branches, MoR + CoW) | **done** |
-| `delta` (Delta Lake) | `read_delta()` TVF read-only; temporarily disabled for DF 54 (delta-rs has no DF 54 release yet) | disabled (was V11) |
+| `delta` (Delta Lake) | not available; the `read_delta()` reader was removed with the move to DataFusion 54 | removed (was V11) |
 | `parquet` | have | done |
 | `json` (functions) | `datafusion-functions-json` (json_get, json_as_text, ->, ->>, etc.) | **done** (V10 verify) |
 | `avro` | not supported; DataFusion is built without the avro feature | not planned |
@@ -138,75 +138,14 @@ Items 7, 10, 11.
 - JSON UDF surface verified against DuckDB; documented at
   [docs/features/json.md](../book/src/sql-reference/json.md).
 
-### V11: Delta Lake reader (disabled pending delta-rs DF 54)
+### V11: Delta Lake reader (removed)
 
 Item 6.
 
-- `read_delta(path, [version | timestamp])` wrapped `deltalake-core 0.32.1`.
-- Time travel via `version => '<u64>'` (`load_version`) or
-  `timestamp => '<RFC3339>'` (`load_with_datetime`); mutually exclusive.
-- S3 storage options propagate from inline TVF args with fallback to
-  `StorageConfig`.
-- Read-only. Writes were planned for a follow-up.
-
-The `read_delta` TVF is unwired for the DataFusion 54 bump. delta-rs has no
-DF 54 release yet, so its `DeltaTableProvider` does not satisfy DF 54's
-`TableProvider` trait. The module is kept on disk; it re-lands once delta-rs
-ships DF 54 support.
-
-### V12: hf:// in URL-table auto-detect ✅
-
-`SELECT * FROM 'hf://...'` (URL-table auto-detect) failed against V10 because
-DataFusion's `enable_url_table()` does not recognise the `hf` scheme. V12
-adds an SQL pre-rewriter that translates quoted `'hf://...'` literals to
-their HTTPS equivalent before DataFusion sees the SQL.
-
-### V12.1: hf:// inline revision + `@~parquet` view ✅
-
-Inline `@<revision>` syntax in addition to `?revision=<rev>`. Special-case
-`@~parquet`: HuggingFace's auto-generated parquet view lives on the
-`refs/convert/parquet` branch; the resolver URL-encodes the slashes:
-
-```sql
-SELECT * FROM read_parquet('hf://datasets/foo/bar@~parquet/data.parquet');
--- -> https://huggingface.co/datasets/foo/bar/resolve/refs%2Fconvert%2Fparquet/data.parquet
-```
-
-Slashes in arbitrary revisions get the same URL-encoding treatment.
-Conflicting `@<rev>` plus `?revision=<rev>` rejects with a clear error.
-
-### V12 follow-up: smarter `read_csv` ✅
-
-Extension-based delimiter detection (`.tsv` is tab, `.psv` is `|`, `.ssv` is
-`;`). Compression auto-detect from the path (`.gz`, `.bz2`, `.xz`, `.zst`).
-DuckDB-friendly aliases: `sep`, `delim`, `header`, `nullstr`, `compress`.
-`derive_file_extension` walks a `.csv.gz` path correctly so directory globs
-match `.csv.gz`.
-
-### V12.2: HuggingFace `ObjectStore` for globs (in progress)
-
-The HF tree-API cache shipped (`crates/sqe-catalog/src/hf_tree_cache.rs`)
-as the prerequisite. Next: a custom `HfObjectStore` that implements
-`ObjectStore::list` against the tree API, registered in
-`LazyHttpObjectStoreRegistry` for the `hf` scheme. With that in place,
-`SELECT * FROM 'hf://datasets/foo/bar/**/*.parquet'` flows through the
-standard DataFusion glob-expansion path. The V12 SQL pre-rewriter retires
-when V12.2 lands.
-
-See [`hf-glob-research.md`](../book/src/design-notes/hf-glob-research.md) for the design.
-
-V11 shipped the `read_delta()` TVF rather than a catalog backend, letting
-CLI users query a Delta root directly:
-
-```sql
-SELECT * FROM read_delta('/data/delta/sales');
-SELECT * FROM read_delta('s3://bucket/delta/orders', access_key => '...');
-SELECT * FROM read_delta('/data/delta/sales', version => '5');
-```
-
-The TVF is currently disabled for the DataFusion 54 bump (delta-rs has no
-DF 54 release yet) and re-lands once delta-rs catches up. Read-only; the
-writer pipeline was planned for a follow-up.
+V11 shipped a read-only `read_delta(path, [version | timestamp])` TVF on
+`deltalake-core`. It was removed with the move to DataFusion 54: delta-rs had
+no release for that DataFusion line. `read_delta` is not available; convert
+Delta tables to Iceberg or Parquet first.
 
 ### V12: hf:// in URL-table auto-detect
 
@@ -227,10 +166,9 @@ SELECT * FROM 'hf://datasets/squad/plain_text/train-00000-of-00001.parquet';
 SELECT * FROM 'hf://datasets/foo/bar/data.csv?revision=v1.0';
 ```
 
-Out of scope for V12 (deferred): glob patterns (`**/*.parquet`) and the
-`@~parquet` revision spec for HuggingFace's auto-generated parquet view.
-DuckDB supports both via their httpfs extension; SQE follows up once
-DataFusion's `ListingTableUrl` learns about virtual revisions.
+The `@~parquet` revision spec for HuggingFace's auto-generated parquet view
+followed in V12.1. Glob patterns (`**/*.parquet`) on `hf://` are not
+supported; DuckDB has them through its httpfs extension.
 
 ## Out of scope (DataFusion-blocked or niche)
 
@@ -247,9 +185,9 @@ block is upstream parser work or a positioning decision.
 | `spatial`, `vss`, `fts`, `excel` | niche; deferred until concrete demand |
 
 When DataFusion adds parser support upstream, we revisit. This repo now runs
-DataFusion 54. The bump is what forced `read_delta` offline: delta-rs has no
-DF 54 release yet, so its provider no longer satisfies the `TableProvider`
-trait. The vendored `iceberg-rust` fork tracks the same DataFusion line.
+DataFusion 55. The DataFusion 54 bump is what removed `read_delta`: delta-rs
+had no release for that line, so its provider did not satisfy the
+`TableProvider` trait.
 
 ## Audit appendix
 
@@ -266,7 +204,7 @@ work as:
 
 **Medium priority:**
 
-6. Delta Lake reader (V11; disabled pending delta-rs DF 54)
+6. Delta Lake reader (V11; removed with DataFusion 54)
 7. `httpfs`-equivalent (V10)
 8. PIVOT / UNPIVOT (out of scope, parser-blocked; QUALIFY now works)
 9. ASOF JOIN (out of scope, parser-blocked)

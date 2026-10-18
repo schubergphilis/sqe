@@ -5,7 +5,7 @@ Two layered JSON surfaces. Both are registered in every session.
 1. **Trino-named layer** in `sqe-trino-functions`: `json_extract`, `json_extract_scalar`, `json_array_length`, `json_parse`, `json_format`, `json_object`, `is_json_scalar`, `json_array_contains`, `json_size`, `json_array_get`, `to_json`. Maps directly to dbt-trino model expectations.
 2. **DataFusion JSON layer** via `datafusion-functions-json` (registered in `session_context.rs:361` and `embedded.rs:172`): `json_get`, `json_get_str`, `json_get_int`, `json_get_float`, `json_get_bool`, `json_get_json`, `json_get_array`, `json_contains`, `json_as_text`, `json_length`. Type-specific extractors that avoid an outer CAST.
 
-JSON columns are stored as `VARCHAR` (Iceberg has no native JSON type yet). Both layers parse on every call, so for hot paths consider extracting once into a typed column.
+A `JSON` column is stored as Iceberg `VARIANT` on a V3 table (the default for new tables) and as a string on a V2 table; either way it reads back as JSON text (see [DDL, VARIANT](./ddl.md#variant)). Both layers parse on every call, so for hot paths consider extracting once into a typed column.
 
 ## Trino-named layer
 
@@ -47,7 +47,7 @@ A cast of a value that is already JSON (`json_parse`, `json_extract`, `json_arra
 Known differences from Trino:
 
 - **Anonymous rows**: `CAST(ROW(1, 'x') AS JSON)` gives `{"c0":1,"c1":"x"}`; Trino gives `{"":1,"":"x"}`. Name the fields with `CAST(ROW(..) AS ROW(a .., b ..))` to get the same output.
-- **JSON columns and JSON inside an array or map**: SQE stores JSON as `VARCHAR` with no type marker, so only a cast of a JSON-returning function is recognised as already JSON. `CAST(payload AS JSON)` on a stored `JSON` column encodes the text as a JSON string, `"{\"a\":1}"`, where Trino returns it unchanged, `{"a":1}`; likewise `CAST(ARRAY[json_parse('{"a":1}')] AS JSON)` gives `["{\"a\":1}"]`, where Trino embeds it, `[{"a":1}]`. Use the column directly, or `json_parse(payload)`, instead of casting it.
+- **JSON columns and JSON inside an array or map**: on a V2 table SQE stores JSON as `VARCHAR` with no type marker, so only a cast of a JSON-returning function is recognised as already JSON. `CAST(payload AS JSON)` on a stored `JSON` column encodes the text as a JSON string, `"{\"a\":1}"`, where Trino returns it unchanged, `{"a":1}`; likewise `CAST(ARRAY[json_parse('{"a":1}')] AS JSON)` gives `["{\"a\":1}"]`, where Trino embeds it, `[{"a":1}]`. Use the column directly, or `json_parse(payload)`, instead of casting it.
 - **Timestamp precision**: fractional seconds print without trailing zeros; Trino pads to the declared precision. A zoned timestamp ends in an offset (`+00:00`), not a zone name (`UTC`).
 - **Types Trino refuses**: varbinary, time and interval values are written as their quoted text; Trino raises "Cannot cast ... to json". Likewise `CAST(json AS VARCHAR)` returns the JSON text, where Trino raises an error.
 
@@ -157,7 +157,7 @@ FROM events;
 
 ## Iceberg JSON column type
 
-Iceberg V3 has no native JSON primitive yet. SQE accepts `JSON` in CREATE TABLE and stores it as `VARCHAR` underneath. Predicates and projections work as text. When Iceberg adds a JSON primitive, the storage layout will change but the SQL surface stays the same.
+Iceberg has no JSON primitive. SQE accepts `JSON` in CREATE TABLE and stores it as `VARIANT` on a V3 table (the default) and as a string on a V2 table. Either way it reads back as JSON text, and the `json*` functions accept both. Existing string columns are not converted. See [DDL, VARIANT](./ddl.md#variant).
 
 ## What is not registered
 

@@ -32,7 +32,7 @@ Note the boundary: this quickstart demonstrates **table- and database-level** LF
 permission gating. SQE reads Iceberg data files from S3 directly with the
 caller's IAM credentials; it does not call Lake Formation's filtered
 credential-vending for column masking or row filtering. SQE's own column/row
-masking is a separate policy engine (OPA/Cedar plan rewriting).
+masking is a separate policy engine (Apache Ranger, via plan rewriting).
 
 ## What it demonstrates
 

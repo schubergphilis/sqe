@@ -2,15 +2,15 @@
   "state": [
     {
       "num": "${matrix.score.percent}%",
-      "label": "Iceberg matrix (${matrix.score.raw}/${matrix.score.max}), top five"
+      "label": "Iceberg matrix (${matrix.score.raw}/${matrix.score.max}), current rubric"
+    },
+    {
+      "num": "7/8",
+      "label": "benchmark suites faster than Trino 481 at SF1"
     },
     {
       "num": "6/7",
-      "label": "benchmark suites won vs Trino 465"
-    },
-    {
-      "num": "222/222",
-      "label": "queries pass at SF1"
+      "label": "suites faster at SF10 too"
     },
     {
       "num": "43/43",
@@ -18,6 +18,11 @@
     }
   ],
   "milestones": [
+    {
+      "date": "Oct 2026",
+      "title": "Iceberg V3 by default",
+      "body": "New tables are format-version 3. A <code>JSON</code> column is stored as an Iceberg <code>VARIANT</code> and reads back as JSON text; shredded variant files written by other engines (Spark) are read on the coordinator and on workers. Merge-on-read <code>DELETE</code> writes deletion vectors, and compaction triggers on the deleted-row share. Row lineage is maintained at write time, and V3 <code>unknown</code> columns are supported. Rescored against the current Iceberg matrix rubric: ${matrix.score.raw}/${matrix.score.max} (${matrix.score.percent}%)."
+    },
     {
       "date": "Aug 2026",
       "title": "MCP, governed by the caller's own token",
@@ -41,7 +46,7 @@
     {
       "date": "May 2026",
       "title": "DuckDB-class embedded mode",
-      "body": "File-format table functions (read_parquet / csv / json / avro), <code>SELECT * FROM 'file'</code> auto-detect, <code>COPY … TO</code>, a Delta Lake reader, and HuggingFace <code>hf://</code> URLs. The embedded persona that turned out DuckDB-shaped."
+      "body": "File-format table functions (read_parquet / csv / json), <code>SELECT * FROM 'file'</code> auto-detect, <code>COPY … TO</code>, and HuggingFace <code>hf://</code> URLs. The embedded persona that turned out DuckDB-shaped."
     },
     {
       "date": "May 2026",
@@ -66,15 +71,11 @@
     {
       "date": "Q1-Q2 2026",
       "title": "Iceberg matrix: 52% -> 88.4%",
-      "body": "Phased coverage work lifted the public Iceberg matrix score from a 52% baseline to ${matrix.score.percent}% (${matrix.score.raw}/${matrix.score.max}), V3 features end to end, partition evolution, merge-on-read deletes, bloom filters, and live catalog verification."
+      "body": "Phased coverage work lifted the public Iceberg matrix score from a 52% baseline to 88.4% (167/189, on the rubric of the time): V3 features end to end, partition evolution, merge-on-read deletes, bloom filters, and live catalog verification."
     }
   ],
   "roadmap": {
     "progress": [
-      {
-        "t": "HuggingFace glob (<code>hf://…/**/*.parquet</code>)",
-        "d": "A custom object store so globs enumerate files via the HF tree API and the SQL pre-rewriter retires."
-      },
       {
         "t": "Copy-on-write DML at TPC-E SF100",
         "d": "Parallelise per-file rewrite + streaming writes to keep the heaviest update under the harness cap."
@@ -82,13 +83,13 @@
       {
         "t": "Snowflake Horizon catalog, live test",
         "d": "REST-compatible today; a live integration test against a real Horizon endpoint is the open item."
-      },
-      {
-        "t": "Helm chart for Kubernetes",
-        "d": "A first-class chart for the coordinator + worker topology."
       }
     ],
     "planned": [
+      {
+        "t": "Variant path functions",
+        "d": "<code>variant_get</code>-style extraction on V3 <code>VARIANT</code> columns; today a variant reads back as JSON text for the <code>json*</code> functions."
+      },
       {
         "t": "Local data-file block cache",
         "d": "Alluxio-style caching of hot data files on workers."
@@ -104,28 +105,12 @@
       {
         "t": "Smart-CSV byte sampling",
         "d": "Sample bytes to infer delimiter/quote/header, beyond today's extension heuristics."
-      },
-      {
-        "t": "Semantic AI layer",
-        "d": "RDF/SPARQL, property-graph, and vector-search surfaces over the same engine."
       }
     ],
     "blocked": [
       {
-        "t": "Iceberg V3 Variant & shredded Variant",
-        "d": "Blocked upstream in iceberg-rust / arrow-rs."
-      },
-      {
         "t": "Iceberg V3 Geometry types",
         "d": "Needs a DataFusion user-defined type."
-      },
-      {
-        "t": "Iceberg V3 Vector / Embedding types",
-        "d": "Spec not finalised."
-      },
-      {
-        "t": "Iceberg V3 row lineage",
-        "d": "Deferred upstream."
       },
       {
         "t": "Multi-argument partition transforms (V3)",

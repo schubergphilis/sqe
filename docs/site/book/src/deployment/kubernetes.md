@@ -147,9 +147,12 @@ service:
   flightSqlPort: 50051
   trinoHttpPort: 8080
   metricsPort: 9090
+  mcpPort: 8098
 ```
 
-The Service publishes three ports: Flight SQL, Trino HTTP, and metrics. `healthPort` (9091) is a container port used by the probes and is NOT in the Service, so anything served there reaches no cluster client through it: the web UI and, when `[mcp] enabled = true` with `port = 0`, the `/mcp` endpoint. To expose MCP on Kubernetes today, either give it a dedicated `[mcp] port` and add a Service port plus ingress route for it, or add a port for `healthPort` yourself. Neither is in the chart yet. Put MCP behind the same TLS-terminating ingress as the rest of the public surface; `resource_uri` must be the HTTPS URL clients actually call, because it is the token audience.
+The Service publishes Flight SQL, Trino HTTP, and metrics, plus `mcpPort` when MCP is on. `healthPort` (9091) is a container port used by the probes and is NOT in the Service, so the web UI served there reaches no cluster client through it.
+
+MCP is off by default. Set `config.mcp.enabled: true` to render `[mcp]` into `sqe.toml` and add an `mcp` container port (`config.mcp.port`) and Service port (`service.mcpPort`), both 8098 by default. With `ingress.enabled` the chart also routes `/mcp` on the same host, and refuses to render unless `ingress.tls` is set. `config.mcp.auth.mode` must be `oauth` (which needs `config.mcp.authorization_servers`) or `static`; the chart refuses `anonymous`. Set `config.mcp.resource_uri` to the HTTPS URL clients actually call, because it is the token audience.
 
 ### Health Probes
 
