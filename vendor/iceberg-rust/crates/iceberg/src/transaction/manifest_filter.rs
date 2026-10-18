@@ -128,6 +128,9 @@ pub struct ManifestFilterManager {
     filtered_manifests: HashMap<String, ManifestFile>, // manifest_path -> filtered_manifest
     /// Tracking where files were deleted to validate retries quickly
     filtered_manifest_to_deleted_files: HashMap<String, Vec<DataFileIdentity>>,
+    /// Every file each filtered manifest marked deleted, including dangling deletes, so the
+    /// snapshot summary can account for them
+    filtered_manifest_to_removed_files: HashMap<String, Vec<DataFile>>,
     ///    this is only being used for the DeleteManifestFilterManager to detect orphaned deletes for removed data file paths
     removed_data_file_path: HashSet<String>,
 
@@ -146,6 +149,7 @@ impl ManifestFilterManager {
             fail_missing_delete_paths: false,
             filtered_manifests: HashMap::new(),
             filtered_manifest_to_deleted_files: HashMap::new(),
+            filtered_manifest_to_removed_files: HashMap::new(),
             removed_data_file_path: HashSet::new(),
             file_io,
             writer_context,
@@ -332,6 +336,8 @@ impl ManifestFilterManager {
 
         // Track deleted files for duplicate detection
         let mut deleted_files = HashMap::new();
+        // Every entry this manifest drops, whatever the reason, for the snapshot summary
+        let mut removed_files = HashMap::new();
 
         // Create an output path for the filtered manifest using writer context
         let partition_spec = manifest_meta_data.partition_spec.clone();
@@ -392,6 +398,9 @@ impl ManifestFilterManager {
                 if all_rows_match {
                     // Mark this entry as deleted
                     writer.add_delete_entry(entry.clone())?;
+                    removed_files
+                        .entry(identity.clone())
+                        .or_insert_with(|| file.clone());
 
                     // A dangling decision must not be promoted into `files_to_delete`: it is
                     // consulted for every later entry
@@ -438,6 +447,10 @@ impl ManifestFilterManager {
             filtered_manifest.manifest_path.clone(),
             deleted_file_identities,
         );
+        self.filtered_manifest_to_removed_files.insert(
+            filtered_manifest.manifest_path.clone(),
+            removed_files.into_values().collect(),
+        );
 
         Ok(filtered_manifest)
     }
@@ -474,6 +487,22 @@ impl ManifestFilterManager {
             }
         }
         deleted_files
+    }
+
+    /// Files that the filtered versions of `manifests` dropped, including dangling deletes,
+    /// each listed once. Callers use this to count the removals in the snapshot summary.
+    pub(crate) fn removed_files(&self, manifests: &[ManifestFile]) -> Vec<DataFile> {
+        let mut seen = HashSet::new();
+        manifests
+            .iter()
+            .filter_map(|manifest| {
+                self.filtered_manifest_to_removed_files
+                    .get(manifest.manifest_path.as_str())
+            })
+            .flatten()
+            .filter(|file| seen.insert(data_file_identity(file)))
+            .cloned()
+            .collect()
     }
 
     fn manifest_has_no_live_files(manifest: &ManifestFile) -> bool {

@@ -315,6 +315,9 @@ struct PreparedRewriteFiles {
     /// The exact parent manifests whose contents produced `output_manifests`.
     source_manifests: Vec<ManifestFile>,
     output_manifests: Vec<ManifestFile>,
+    /// Delete files the delete filter manager dropped while producing `output_manifests`,
+    /// kept so a retry that reuses them still counts the removals in its summary.
+    filtered_delete_files: Vec<DataFile>,
     format_version: FormatVersion,
     last_sequence_number: i64,
 }
@@ -817,7 +820,14 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
                 .await?
         {
             let summary = snapshot_producer
-                .prepare_summary(&ReplaceFilesOperation::<M>::new())
+                .summary_collector()
+                .and_then(|summary_collector| {
+                    snapshot_producer.build_summary(
+                        &ReplaceFilesOperation::<M>::new(),
+                        summary_collector,
+                        &prepared.filtered_delete_files,
+                    )
+                })
                 .map_err(|err| {
                     crate::Error::new(
                         crate::ErrorKind::Unexpected,
@@ -832,6 +842,7 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
                 state.prepared = Some(PreparedRewriteFiles {
                     source_manifests: current_manifests,
                     output_manifests: output_manifests.clone(),
+                    filtered_delete_files: prepared.filtered_delete_files,
                     format_version: table.metadata().format_version(),
                     last_sequence_number: table.metadata().last_sequence_number(),
                 });
@@ -869,23 +880,31 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
             affected_manifest_paths,
             self.manifest_load_concurrency,
         );
-        let summary = snapshot_producer
-            .prepare_summary(&operation)
-            .map_err(|err| {
-                crate::Error::new(
-                    crate::ErrorKind::Unexpected,
-                    "Failed to create snapshot summary.",
-                )
-                .with_source(err)
-            })?;
+        let summary_error = |err| {
+            crate::Error::new(
+                crate::ErrorKind::Unexpected,
+                "Failed to create snapshot summary.",
+            )
+            .with_source(err)
+        };
+        // Collect the summary inputs before `prepare_manifests` drains the added files, and
+        // finish it afterwards so it also counts the delete files the filter manager dropped.
+        let summary_collector = snapshot_producer
+            .summary_collector()
+            .map_err(summary_error)?;
         let output_manifests = snapshot_producer
             .prepare_manifests(&operation, &DefaultManifestProcess)
             .await?;
+        let filtered_delete_files = snapshot_producer.filtered_delete_files(&output_manifests);
+        let summary = snapshot_producer
+            .build_summary(&operation, summary_collector, &filtered_delete_files)
+            .map_err(summary_error)?;
         {
             let mut state = self.state.lock().expect("rewrite-files state poisoned");
             state.prepared = Some(PreparedRewriteFiles {
                 source_manifests: current_manifests,
                 output_manifests: output_manifests.clone(),
+                filtered_delete_files,
                 format_version: table.metadata().format_version(),
                 last_sequence_number: table.metadata().last_sequence_number(),
             });
@@ -2175,6 +2194,7 @@ mod tests {
         let prepared = PreparedRewriteFiles {
             source_manifests: vec![],
             output_manifests: vec![],
+            filtered_delete_files: vec![],
             format_version: FormatVersion::V2,
             last_sequence_number: 1,
         };
@@ -2769,8 +2789,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_delete_cleanup_sequence_override() {
+    /// `make_v2_table_with_delete_manifest` plus a later snapshot that reuses its manifest
+    /// list, so the table's last sequence number is newer than both delete files.
+    async fn make_v2_table_with_older_delete_files() -> Table {
         let table = make_v2_table_with_delete_manifest().await;
         let parent = table.metadata().current_snapshot().unwrap();
         let later_snapshot_id = PARENT_SNAPSHOT_ID + 1;
@@ -2800,7 +2821,12 @@ mod tests {
             .build()
             .unwrap()
             .metadata;
-        let table = table.with_metadata(Arc::new(metadata));
+        table.with_metadata(Arc::new(metadata))
+    }
+
+    #[tokio::test]
+    async fn test_delete_cleanup_sequence_override() {
+        let table = make_v2_table_with_older_delete_files().await;
         let added_file = DataFileBuilder::default()
             .content(DataContentType::Data)
             .file_path("test/compacted.parquet".to_string())
@@ -2859,6 +2885,145 @@ mod tests {
                 .iter()
                 .all(|status| *status == ManifestStatus::Deleted)
         );
+    }
+
+    fn assert_summary_values(snapshot: &Snapshot, expected: &[(&str, &str)]) {
+        let summary = &snapshot.summary().additional_properties;
+        for (key, value) in expected {
+            assert_eq!(
+                summary.get(*key).map(String::as_str),
+                Some(*value),
+                "{key} in {summary:?}"
+            );
+        }
+    }
+
+    /// The delete filter manager drops delete files older than every live data file. The
+    /// summary must count them; otherwise the stale totals carry into every later snapshot.
+    #[tokio::test]
+    async fn test_rewrite_summary_counts_delete_files_dropped_by_sequence_number() {
+        let table = make_v2_table_with_older_delete_files().await;
+        let added_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("test/compacted.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap();
+
+        let action = Transaction::new(&table)
+            .rewrite_files()
+            .add_data_files([added_file]);
+        let snapshot = committed_snapshot(Arc::new(action).commit(&table).await.unwrap());
+
+        let delete_statuses = delete_file_statuses(&table, &snapshot).await;
+        assert_eq!(delete_statuses, vec![
+            ManifestStatus::Deleted,
+            ManifestStatus::Deleted
+        ]);
+        assert_summary_values(&snapshot, &[
+            ("removed-delete-files", "2"),
+            ("removed-position-delete-files", "2"),
+            ("removed-position-deletes", "2"),
+            ("total-delete-files", "0"),
+            ("total-position-deletes", "0"),
+            ("total-files-size", "100"),
+        ]);
+    }
+
+    /// A retry that reuses the first attempt's manifests must still count the delete files
+    /// the first attempt's filter dropped, since the reused manifests no longer contain them.
+    #[tokio::test]
+    async fn test_rewrite_retry_summary_counts_filtered_delete_files() {
+        let base = retry_test_table();
+        let removed = retry_test_data_file("test/dangling-input.parquet");
+        let retained = retry_test_data_file("test/dangling-retained.parquet");
+        let data_manifest = write_retry_test_manifest(
+            &base,
+            "memory:///test/location/metadata/dangling-data.avro",
+            701,
+            1,
+            vec![removed.clone(), retained],
+        )
+        .await;
+        let delete_manifest = write_retry_test_added_delete_manifest(
+            &base,
+            "memory:///test/location/metadata/dangling-delete.avro",
+            701,
+            1,
+            retry_test_position_delete_file(
+                "test/dangling-position-delete.parquet",
+                Some(removed.file_path()),
+            ),
+        )
+        .await;
+        let snapshot = write_retry_test_snapshot(
+            &base,
+            "memory:///test/location/metadata/list-701.avro",
+            701,
+            1,
+            None,
+            vec![data_manifest.clone(), delete_manifest.clone()],
+            2,
+        )
+        .await;
+        let table_v1 = retry_test_table_at_snapshot(&base, snapshot);
+
+        // Removing the data file leaves the position delete that references it dangling.
+        let action = Arc::new(
+            Transaction::new(&table_v1)
+                .rewrite_files()
+                .set_new_data_file_sequence_number(1)
+                .delete_files([removed])
+                .add_data_files([retry_test_data_file("test/dangling-replacement.parquet")]),
+        );
+        let expected = [
+            ("removed-delete-files", "1"),
+            ("removed-position-delete-files", "1"),
+            ("removed-position-deletes", "1"),
+        ];
+        let first_snapshot =
+            committed_snapshot(Arc::clone(&action).commit(&table_v1).await.unwrap());
+        assert_summary_values(&first_snapshot, &expected);
+
+        let appended_manifest = write_retry_test_added_manifest(
+            &base,
+            "memory:///test/location/metadata/dangling-concurrent.avro",
+            702,
+            2,
+            retry_test_data_file("test/dangling-concurrent.parquet"),
+        )
+        .await;
+        let snapshot = write_retry_test_snapshot(
+            &table_v1,
+            "memory:///test/location/metadata/list-702.avro",
+            702,
+            2,
+            Some(701),
+            vec![
+                data_manifest.clone(),
+                delete_manifest.clone(),
+                appended_manifest,
+            ],
+            3,
+        )
+        .await;
+        let table_v2 = retry_test_table_at_snapshot(&table_v1, snapshot);
+
+        // Remove the original manifests as a tripwire: only the reuse path can commit now.
+        for manifest in [&data_manifest, &delete_manifest] {
+            table_v2
+                .file_io()
+                .delete(&manifest.manifest_path)
+                .await
+                .unwrap();
+        }
+        let retry_snapshot =
+            committed_snapshot(Arc::clone(&action).commit(&table_v2).await.unwrap());
+        assert_summary_values(&retry_snapshot, &expected);
     }
 
     #[tokio::test]
@@ -3386,6 +3551,15 @@ mod tests {
             (Some(DATA_A.to_string()), Some(4), ManifestStatus::Deleted),
             (Some(DATA_B.to_string()), Some(68), ManifestStatus::Existing),
         ]);
+        // The dropped DV is counted once in the summary; its neighbour is untouched.
+        assert_summary_values(snapshot, &[
+            ("removed-delete-files", "1"),
+            ("removed-position-deletes", "1"),
+            ("total-delete-files", "1"),
+            ("total-position-deletes", "1"),
+            ("total-data-files", "2"),
+            ("total-files-size", "556"),
+        ]);
 
         let action = Transaction::new(&table)
             .rewrite_files()
@@ -3425,6 +3599,11 @@ mod tests {
         assert_eq!(offsets_and_statuses, vec![
             (4, ManifestStatus::Deleted),
             (68, ManifestStatus::Existing),
+        ]);
+        // An explicitly removed DV is also dropped by the filter; count it only once.
+        assert_summary_values(snapshot, &[
+            ("removed-delete-files", "1"),
+            ("total-delete-files", "1"),
         ]);
     }
 }
