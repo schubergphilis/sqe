@@ -4,7 +4,7 @@
 
 Point SQE at an AWS Glue database that Lake Formation governs. Unlike the `aws-glue` quickstart (which lets SQE create the database, making the caller its owner to side-step LF), here the database is created by CloudFormation. In a Lake-Formation-enabled account that means it is governed with no grants, so SQE is denied until the principal is granted LF permissions explicitly.
 
-The run demonstrates the full arc: denial, the grant, and the same statements succeeding. Be precise about the boundary: LF governs the Glue catalog operations SQE calls (`CreateTable`, `GetTable`). SQE reads Iceberg data files straight from S3 with the caller's IAM credentials and does not enforce LF column-masking or row-filtering. Fine-grained access here means table/database-level permission gating, not cell-level filtering. SQE's own column/row masking is the OPA/Cedar policy engine, independent of the catalog.
+The run demonstrates the full arc: denial, the grant, and the same statements succeeding. Be precise about the boundary: LF governs the Glue catalog operations SQE calls (`CreateTable`, `GetTable`). SQE reads Iceberg data files straight from S3 with the caller's IAM credentials and does not enforce LF column-masking or row-filtering. Fine-grained access here means table/database-level permission gating, not cell-level filtering. SQE's own column/row masking is the Apache Ranger policy engine, independent of the catalog.
 
 ## Components
 

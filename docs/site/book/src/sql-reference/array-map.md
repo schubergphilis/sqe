@@ -172,7 +172,7 @@ SQE parses SQL with the DuckDB dialect, so lambda syntax (`x -> expr`) is accept
 - `none_match(array, x -> pred)`. True if no element matches.
 - `reduce(array, init, (s, x) -> combine, s -> finish)`. Left fold: threads an accumulator through the elements, then maps it to the result.
 
-`filter` and `transform` alias DataFusion 54's `array_filter` and `array_transform`; `any_match` is DataFusion's `array_any_match`. `all_match`, `none_match`, and `reduce` are SQE UDFs built on the same lambda machinery. Argument order, 1-based element binding, and NULL/empty-array semantics match Trino.
+`filter` and `transform` alias DataFusion's `array_filter` and `array_transform`; `any_match` is DataFusion's `array_any_match`. `all_match`, `none_match`, and `reduce` are SQE UDFs built on the same lambda machinery. Argument order, 1-based element binding, and NULL/empty-array semantics match Trino.
 
 ```sql
 SELECT filter(ARRAY[1, 2, 3, 4], x -> x > 2);                     -- [3, 4]

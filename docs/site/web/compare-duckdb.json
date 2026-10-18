@@ -31,7 +31,7 @@
       ]
     },
     {
-      "label": "OPA / Cedar policy (row filters, masks)",
+      "label": "Ranger policy (row filters, masks)",
       "cells": [
         {
           "t": "yes",
@@ -124,8 +124,8 @@
       "reason": "Partial, nested types work, the literal syntax is less ergonomic"
     },
     {
-      "feature": "List comprehensions, lambdas",
-      "reason": "DataFusion does not support them"
+      "feature": "List comprehensions",
+      "reason": "No DataFusion primitive; array lambdas (<code>x -&gt; expr</code>) do work through <code>filter</code>, <code>transform</code> and <code>reduce</code>"
     },
     {
       "feature": "<code>PIVOT</code> / <code>UNPIVOT</code>",
@@ -145,7 +145,7 @@
     },
     {
       "feature": "HuggingFace glob (<code>**/*.parquet</code>)",
-      "reason": "In progress, tree-API cache landed, object-store wiring next"
+      "reason": "Not supported; <code>hf://</code> resolves single files through a URL rewrite"
     }
   ]
 }

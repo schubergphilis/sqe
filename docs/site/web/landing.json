@@ -21,7 +21,7 @@
     },
     {
       "title": "Policy as plan rewriting",
-      "body": "Row filters and column masks via OPA or Cedar, enforced at the LogicalPlan layer before the optimizer runs.",
+      "body": "Row filters and column masks from Apache Ranger policies, shared with Spark and Kyuubi, enforced at the LogicalPlan layer before the optimizer runs.",
       "pillar": "identity"
     },
     {
@@ -117,7 +117,7 @@
       ]
     },
     {
-      "label": "OPA / Cedar at LogicalPlan",
+      "label": "Ranger policy at LogicalPlan",
       "cells": [
         {
           "t": "yes",
@@ -289,7 +289,7 @@
         },
         {
           "t": "out",
-          "s": "SQE 0.15.0 · local warehouse"
+          "s": "SQE 0.51.0 · local warehouse"
         },
         {
           "t": "sql",

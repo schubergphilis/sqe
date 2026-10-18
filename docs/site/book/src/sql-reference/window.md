@@ -140,11 +140,17 @@ The `, 0` argument fills the first row (where there is no predecessor) with zero
 
 `GROUPS` is rare but useful when ordering on a low-cardinality key produces many ties and you want "the previous distinct value group" semantics.
 
-## What is NOT supported (DataFusion blocked)
+## QUALIFY
 
-- `QUALIFY` clause (filtering on window-function output without a subquery). DataFusion's parser does not accept `QUALIFY`. Workaround: wrap the SELECT and filter in an outer query, as in the "Top N per group" example above.
+`QUALIFY` filters on window-function output without a wrapping subquery:
 
-The audit row lives in the [feature comparison](https://getsqe.com/compare/features). Tracked upstream as a parser enhancement.
+```sql
+SELECT region, mon, amt
+FROM sales
+QUALIFY row_number() OVER (PARTITION BY region ORDER BY amt DESC) = 1;
+```
+
+The audit row lives in the [feature comparison](https://getsqe.com/compare/features).
 
 ## Performance notes
 

@@ -14,7 +14,8 @@ noting semantic differences and gaps.
 > describing a state that no longer matched the code.
 >
 > - **`JSON` logical type → ✅.** `CREATE TABLE t(payload JSON)` aliases
->   to `Utf8`, so `CAST(json_col AS BIGINT|VARCHAR|DOUBLE)` rides
+>   to `Utf8` (since October 2026 only on V2 tables; on V3 tables, the
+>   default, `JSON` is stored as `VARIANT`), so `CAST(json_col AS BIGINT|VARCHAR|DOUBLE)` rides
 >   DataFusion's built-in coercion. JSON-shaped extraction stays
 >   available via `json_extract` / `json_extract_scalar` /
 >   `json_array_length` / `json_parse` / `json_get_str` /
@@ -97,8 +98,8 @@ noting semantic differences and gaps.
 - **Write distribution mode**. Distributed write path lands in Phase 3+.
 
 Items shipped in the 2026-05-04 SQL surface lift:
-- **MoR writes** are wired today. Set `TBLPROPERTIES ('write.delete.mode' = 'merge-on-read')`; SQE writes position-delete files (no PK) or equality-delete files (with PK) and commits via `FastAppendAction` / `RowDeltaAction`.
-- **`JSON` logical type** aliases to `Utf8`. `CAST(json_col AS T)` rides DataFusion's built-in coercion. Full JSON extraction works via the existing `json_*` UDFs.
+- **MoR writes** are wired today. Set `TBLPROPERTIES ('write.delete.mode' = 'merge-on-read')`; SQE writes position-delete files on V2 or deletion vectors on V3 (no PK), or equality-delete files (with PK), and commits via `FastAppendAction` / `RowDeltaAction`.
+- **`JSON` logical type** is stored as `VARIANT` on a V3 table (the default) and as `Utf8` on a V2 table; both read back as JSON text. `CAST(json_col AS T)` rides DataFusion's built-in coercion. Full JSON extraction works via the existing `json_*` UDFs.
 - **`TIME` / `TIME(p ≤ 6)`** maps to `Time64(Microsecond)`. `localtime()`, `hour()`, `minute()`, `second()` all work on TIME columns.
 
 ## How to Read This Document
@@ -255,7 +256,7 @@ Each section lists Trino functions with their SQE status:
 | `json_array_length(json)` | `json_array_length(json)` | ✅ | Trino compat UDF |
 | `is_json_scalar(json)` | `is_json_scalar(json)` | ✅ | Trino compat UDF |
 | `CAST(v AS JSON)` | `CAST(v AS JSON)` | ✅ | sqe-sql AST rewriter intercepts `CAST(... AS JSON)` and rewrites to `to_json(...)` before DataFusion's planner sees it (DataFusion does not recognize `JSON` as a target type for CAST). Skipped when the SQL does not contain `as json` |
-| `CAST(json AS type)` | `CAST(json_col AS type)` | ✅ | JSON aliases to `Utf8`; CAST rides DataFusion's built-in coercion. For typed extraction from JSONPath, use `json_get_int(j, '$')`, `json_get_str(j, '$')`, etc. |
+| `CAST(json AS type)` | `CAST(json_col AS type)` | ✅ | JSON reads back as JSON text (`VARIANT` on V3, `Utf8` on V2); CAST rides DataFusion's built-in coercion. For typed extraction from JSONPath, use `json_get_int(j, '$')`, `json_get_str(j, '$')`, etc. |
 
 **Note:** Core JSON extraction is now supported via `datafusion-functions-json` (registered at startup) plus Trino-aliased UDFs (`json_extract`, `json_extract_scalar`, `json_array_length`, `json_parse`). Full JSONPath syntax and JSON-typed columns remain unsupported — most Iceberg workloads use structured columns rather than JSON blobs.
 
@@ -446,7 +447,7 @@ Each section lists Trino functions with their SQE status:
 | `ARRAY(T)` | `List(T)` | ✅ | |
 | `MAP(K, V)` | `Map(K, V)` | ✅ | |
 | `ROW(fields...)` | `Struct(fields...)` | ✅ | Single-level and nested/parameterized ROW casts. `CAST(row(...) AS row(a int, b row(x int)))` is rewritten pre-parse to nested `named_struct(...)` (`rewrite_nested_row_cast`), which plans and serializes over the wire as a ROW. Full nested struct-value wire parity vs Trino's `[1,[10]]` array shape is per the rewrite's design, not stack-verified here |
-| `JSON` | `Utf8` | ✅ | `CREATE TABLE t(payload JSON)` aliases to `Utf8`. `CAST(json_col AS BIGINT|VARCHAR|DOUBLE)` rides DataFusion's built-in Utf8→target coercion. Full JSON extraction via `json_extract`, `json_extract_scalar`, `json_array_length`, `json_parse`, `json_get_str/int/float/bool` |
+| `JSON` | `Variant` (V3) / `Utf8` (V2) | ✅ | `CREATE TABLE t(payload JSON)` stores Iceberg `VARIANT` on a V3 table (the default) and `Utf8` on a V2 table; both read back as JSON text. `CAST(json_col AS BIGINT|VARCHAR|DOUBLE)` rides DataFusion's built-in Utf8→target coercion. Full JSON extraction via `json_extract`, `json_extract_scalar`, `json_array_length`, `json_parse`, `json_get_str/int/float/bool` |
 | `UUID` | `Utf8` | ✅ | `CREATE TABLE t(id UUID)` aliases UUID to Utf8 in `sql_type_to_arrow`. Equality, regex, and `CAST(... AS UUID)` work via the string form. No native UUID logical type (Arrow has none); UUIDv4 generation needs a UDF if required |
 | `IPADDRESS` | `VARCHAR` | ⚠️ | Stored as VARCHAR, no IP-specific functions (subnet containment, etc.) |
 | `HyperLogLog` | — | ❌ | Trino-specific sketch type |
@@ -477,7 +478,7 @@ Each section lists Trino functions with their SQE status:
 | ORC file format | — | ✅ | ❌ | Parquet only |
 | Copy-on-Write (CoW) | ✅ | ✅ | ✅ | DELETE/UPDATE/MERGE |
 | Merge-on-Read (MoR) reads | ✅ | ✅ | ✅ | Position deletes, equality deletes, and V3 deletion vectors all readable (RW fork has full read support) |
-| Merge-on-Read (MoR) writes | ✅ via `write.delete.mode='merge-on-read'` | ✅ | ✅ | `handle_delete_dispatch` routes by table property: position deletes when no PK declared, equality deletes with PK. Position deletes commit via `FastAppendAction`; equality deletes via `RowDeltaAction`. CoW remains the default |
+| Merge-on-Read (MoR) writes | ✅ via `write.delete.mode='merge-on-read'` | ✅ | ✅ | `handle_delete_dispatch` routes by table property: position deletes (V2) or one deletion vector per data file (V3) when no PK declared, equality deletes with PK. Position deletes commit via `FastAppendAction`; equality deletes and deletion vectors via `RowDeltaAction`. CoW remains the default |
 
 ## Engine Limitations & Roadmap
 
@@ -493,7 +494,7 @@ The ~4% remaining gap consists of features that require engine-level changes, sk
 | ORC file format | Strategic choice: `datafusion-orc` is read-only and experimental | Parquet-only is the long-term strategy for Iceberg workloads |
 | Sort order enforcement | Iceberg write-path: sort order metadata written but files not physically sorted | SQE planner + writer changes needed (~sort-on-write pass) |
 | Write distribution mode | Architectural: requires shuffle/repartition layer before write | Planned for distributed write path (Phase 3+) |
-| Iceberg V3 VARIANT type | Arrow `Variant` type proposal at `apache/arrow-rs#7142` not merged | Wait for upstream. SQE's JSON-as-Utf8 covers most JSON workloads in the meantime |
+| Variant path functions (`variant_get`) | `VARIANT` columns (unshredded writes, shredded reads) shipped; typed path access did not | Read fields through the JSON text with the `json*` functions |
 | `UNNEST ... WITH ORDINALITY` | DataFusion has no WITH ORDINALITY; needs table-factor AST surgery to synthesize the ordinal column | Deferred. Use a window `row_number()` over the unnested rows as a workaround |
 | Correlated scalar subqueries / non-decorrelating LATERAL | Fail physical planning ("Physical plan does not support ScalarSubquery / OuterReferenceColumn"). Only the UPDATE SET path has a decorrelation pass | Deferred. Rewrite as a join |
 
@@ -501,7 +502,7 @@ The ~4% remaining gap consists of features that require engine-level changes, sk
 
 | Feature | Status | What changed |
 |---|---|---|
-| `JSON` logical type / `CAST(json AS T)` | ✅ shipped | `SqlType::JSON → Utf8` in `sql_type_to_arrow` (write_handler.rs:3927). DataFusion's built-in coercion handles `CAST(json AS BIGINT|VARCHAR|DOUBLE)` |
+| `JSON` logical type / `CAST(json AS T)` | ✅ shipped | `SqlType::JSON → Utf8` in `sql_type_to_arrow` (since October 2026 only on V2 tables; V3 stores `VARIANT`). DataFusion's built-in coercion handles `CAST(json AS BIGINT|VARCHAR|DOUBLE)` |
 | `TIME` / `TIME(p)` / `EXTRACT(HOUR\|MINUTE\|SECOND ...)` | ✅ shipped | `SqlType::Time` arm collapses 0..=6 precision to `Time64(Microsecond)`. `localtime()` actually returns Time64 now (was incorrectly returning Timestamp). `extract_component` handles Time64Microsecond + Time64Nanosecond arrays/scalars; `year()/month()/day()` raise plan errors on TIME columns per Trino spec |
 | Merge-on-Read (MoR) writes | ✅ already wired | `handle_delete_dispatch` has shipped since Phase O+; the doc was stale. Set `TBLPROPERTIES ('write.delete.mode'='merge-on-read')` to opt in. CoW remains the default for backward compat |
 
@@ -550,7 +551,7 @@ Two real fixes plus three stale-doc flips:
 |---|---|---|---|
 | `CAST(v AS JSON)` | AST rewrite | ✅ | New `sqe_sql::rewrite_trino_compat(sql)` walks the parsed sqlparser AST and rewrites `Expr::Cast { data_type: JSON, expr }` to `Expr::Function { name: "to_json", args: [expr] }`. Wired into `execute_query` after time-travel pre-processing. Skips the AST walk + re-serialize when the SQL string does not contain `as json` (case-insensitive). DataFusion does not natively recognize `JSON` as a CAST target type, so without the rewrite users got "Unsupported SQL type JSON" at planning time |
 | `SHOW COLUMNS FROM ns.t` | new handler | ✅ | New `handle_show_columns` in query_handler.rs translates the Trino-style query into a SELECT against `information_schema.columns`, returning `(column_name, data_type, is_nullable)` ordered by ordinal_position. Same pattern as `handle_show_create_table`'s column lookup |
-| `CAST(json AS T)` | doc fix | ✅ | Already worked: JSON columns store as `Utf8`, DataFusion's built-in `Utf8 → T` coercion parses numeric / boolean strings into the target type. The doc had been misframing this as a syntax difference |
+| `CAST(json AS T)` | doc fix | ✅ | Already worked: JSON columns stored as `Utf8` (V2 tables today), DataFusion's built-in `Utf8 → T` coercion parses numeric / boolean strings into the target type. The doc had been misframing this as a syntax difference |
 | `EXPLAIN ANALYZE` | stale doc | ✅ | Already routed since Phase 2: `parse_and_classify` produces `StatementKind::Utility` with `Statement::Explain { analyze: true, .. }`, dispatched to `explain_handler.analyze()` which returns the per-operator timing breakdown. The "different keyword" caveat was a stale doc claim |
 | `CREATE TABLE (cols) WITH (foo = 'bar')` | stale doc | ✅ | Already handled: `merge_user_table_properties` in write_handler.rs merges both `TBLPROPERTIES (...)` and `WITH (...)` into the same table-property map (lines 589-590). Both spellings produce identical Iceberg metadata |
 

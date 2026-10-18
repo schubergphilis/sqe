@@ -39,7 +39,7 @@
 - [Access control: support matrix](./features/access-control-matrix.md)
 - [Access control: evaluation order, engine by engine](./features/access-control-evaluation-order.md)
 - [read\_parquet TVF](./features/read-parquet.md)
-- [File-format TVFs (read\_csv / read\_json / read\_delta)](./features/file-format-tvfs.md)
+- [File-format TVFs (read\_csv / read\_json)](./features/file-format-tvfs.md)
 - [Observability](./features/observability.md)
 - [Trino Compatibility](./features/trino-compatibility.md)
 - [Benchmark Suite](./features/benchmarks.md)

@@ -89,7 +89,7 @@ Function names are case-insensitive. SQE registers DataFusion built-ins plus a T
 
 | Function | Purpose | Page |
 |---|---|---|
-| `read_parquet`, `read_csv`, `read_json`, `read_delta` | Read external files (local, S3, HTTPS, `hf://`) | [Table-valued functions](../sql-reference/table-functions.md) |
+| `read_parquet`, `read_csv`, `read_json` | Read external files (local, S3, HTTPS, `hf://`) | [Table-valued functions](../sql-reference/table-functions.md) |
 | `SELECT * FROM 'file.ext'` | Quoted-string auto-detect by extension | [Table-valued functions](../sql-reference/table-functions.md) |
 | `table_snapshots`, `table_history`, `table_files`, `table_manifests`, `table_partitions`, `table_refs` | Iceberg metadata | [Table-valued functions](../sql-reference/table-functions.md) |
 | `generate_series`, `range`, `unnest` | Generators | [Table-valued functions](../sql-reference/table-functions.md) |
@@ -100,8 +100,8 @@ These are absent on purpose. The reasoning lives on the [SQL Reference overview]
 
 | Construct | Why it is out |
 |---|---|
-| `PIVOT`, `UNPIVOT`, `QUALIFY`, `ASOF JOIN`, FROM-first syntax | DataFusion's parser does not accept them. Tracked upstream. |
-| Lambda expressions, list comprehensions | No AST node for closures in DataFusion. |
+| `PIVOT`, `UNPIVOT`, `ASOF JOIN`, FROM-first syntax | DataFusion's parser does not accept them. Tracked upstream. |
+| List comprehensions | No AST node in DataFusion. Lambdas work in `filter`, `transform`, `any_match`, `all_match`, `none_match`, `reduce`. |
 | Oracle / Snowflake `DECODE` | Name collides with DataFusion's `decode(input, encoding)`. Use `CASE WHEN`. |
 | `IIF` (T-SQL) | Covered by `if` and `iff`, both registered. |
 | `postgres_table_scanner`, `mysql_table_scanner`, `sqlite_scanner` | Out of scope. SQE is Iceberg-first. |
