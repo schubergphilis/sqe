@@ -56,13 +56,49 @@ Upstream `testdata/` is vendored in full, so `cargo test -p iceberg --lib` runs 
 | — | Puffin blob range check | `puffin/reader.rs` |
 | — | `ManifestFile::load_manifest` shim over apache's `ManifestReader` | `spec/manifest_list/manifest_file.rs` |
 | — | V3 `unknown` columns are never written to a data file (top-level projected out, nested refused) (`SQE PATCH (v3-unknown)`) | `writer/file_writer/parquet_writer.rs` |
-| — | Shredded V3 variants read: variant manifest bounds skipped, `typed_value` storage accepted and unshredded on promote (`SQE PATCH (v3-shredded-variant)`) | `spec/manifest/_serde.rs`, `arrow/reader/projection.rs`, `arrow/record_batch_transformer.rs` |
+| — | Shredded V3 variants read: variant manifest bounds skipped, `typed_value` storage accepted and unshredded by `PromotePlan::Unshred` (`SQE PATCH (v3-shredded-variant)`) | `spec/manifest/_serde.rs`, `arrow/reader/projection.rs`, `arrow/record_batch_transformer.rs` |
 
 Dropped because the new base already has them: the INT96, `read_with_metrics`, NaN,
 equality-delete NULL, positional-delete wakeup and run-buffering, constant-column and
 temporal-partition-path backports; RW #186 #188 #190 #196 #208; sqe#388 (apache's
 `post_form` sets the content type); FileIO scheme shims; SQE's OpenDAL operator cache.
 RW's BigLake GCP token exchange was dropped (SQE does not use it).
+
+## Backported since the base
+
+Read-correctness fixes cherry-picked onto the tree above (2026-10-18), until the next
+full refresh picks them up:
+
+| Source | Commit | Fix |
+|---|---|---|
+| apache #2892 | `9a2111a91` | Pre-epoch `timestamptz` formatting |
+| apache #3247 | `615af68da` | BYTE_ARRAY page-index bounds decoded by field type |
+| apache #3256 | `fc682d7a0` | Decimal and fixed type string parsing |
+| apache #3314 | `ffa864bf2` | Page-index pruning dropped rows for INT32/INT64 decimals |
+| apache #3323 | `ecba0b537` | Day transform floors pre-epoch timestamps |
+| apache #2635 | `f2409e9f5` | Schema-added nested columns read as typed NULL arrays |
+| apache #3328 | `3c952e171` | Page-index pruning for FIXED_LEN_BYTE_ARRAY decimals |
+| apache #3327 | `1f3bc3405` | `-0.0` and `0.0` are distinct float literals |
+| apache #3386 | `e42840bc9` | FLBA decimal page-index tests |
+| apache #3070 | `d63e8610f` | Ambiguous case-insensitive field names are rejected |
+| apache #3255 | `050ddfda8` | Evolved nested structs reconciled by field id, not position (`PromotePlan`) |
+| apache #3334 | `2fddb1601` | Boolean literals rejected for non-boolean types |
+| apache #3303 | `9092073f9` | Nested field metadata stripped, container field names normalized |
+| apache #3364 | `693339072` | Short BYTE_ARRAY decimal row-group stats |
+| apache #3243 | `b154603a7` | Decimal and binary truncate literals |
+| apache #3416 | `a269dad56` | NOT rewritten out of the read predicate before pruning |
+| apache #3358 | `e6b2ed4fb` | Float partition values formatted like iceberg-java |
+| apache #2930 | `f83bec422` | UUID fields round-trip (`arrow.uuid` extension) |
+| RW | `c54989537` | `<`, `<=`, `NOT IN`, `NOT STARTS_WITH` never match a column missing from the file |
+| RW | `30a72274c` | Snapshot summaries count delete files dropped by the delete filter |
+
+The shredded-variant patch moved into #3255's plan as `PromotePlan::Unshred`. Local
+adjustments: #3303's variant test expects `value` required (this tree's storage
+layout), #3327's test uses the infallible `source_id` builder.
+
+Not taken: apache #3145 (makes `FileScanTaskDeleteFile` fields private and its builder
+fallible; needs an SQE API migration and collides with the DV patches), #3354 (Avro
+reader locking), #2904 and #3107.
 
 ## Fixes the merged test suite surfaced
 

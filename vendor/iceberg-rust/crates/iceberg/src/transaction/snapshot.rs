@@ -787,11 +787,10 @@ impl<'a> SnapshotProducer<'a> {
         Ok(result)
     }
 
-    // Returns a `Summary` of the current snapshot
-    pub(crate) fn prepare_summary<OP: SnapshotProduceOperation>(
-        &self,
-        snapshot_produce_operation: &OP,
-    ) -> Result<Summary> {
+    /// Collects the files this producer adds and removes explicitly. Call it before
+    /// `prepare_manifests`, which drains the added files, and pass the result to
+    /// [`Self::build_summary`].
+    pub(crate) fn summary_collector(&self) -> Result<SnapshotSummaryCollector> {
         let mut summary_collector = SnapshotSummaryCollector::default();
         let table_metadata = self.table.metadata_ref();
 
@@ -810,52 +809,85 @@ impl<'a> SnapshotProducer<'a> {
 
         summary_collector.set_partition_summary_limit(partition_summary_limit);
 
-        let partition_spec = |file: &DataFile| {
-            table_metadata
-                .partition_spec_by_id(file.partition_spec_id)
-                .cloned()
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        "File references an unknown partition spec",
-                    )
-                    .with_context("partition spec id", file.partition_spec_id.to_string())
-                    .with_context("file path", file.file_path())
-                })
-        };
-
         for data_file in &self.added_data_files {
-            summary_collector.add_file(
-                data_file,
-                table_metadata.current_schema().clone(),
-                partition_spec(data_file)?,
-            );
+            self.collect_file(&mut summary_collector, data_file, true)?;
         }
 
         for delete_file in &self.added_delete_files {
-            summary_collector.add_file(
-                delete_file,
-                table_metadata.current_schema().clone(),
-                partition_spec(delete_file)?,
-            );
+            self.collect_file(&mut summary_collector, delete_file, true)?;
         }
 
         for data_file in &self.removed_data_files {
-            summary_collector.remove_file(
-                data_file,
-                table_metadata.current_schema().clone(),
-                partition_spec(data_file)?,
-            );
+            self.collect_file(&mut summary_collector, data_file, false)?;
         }
 
         for delete_file in &self.removed_delete_files {
-            summary_collector.remove_file(
-                delete_file,
-                table_metadata.current_schema().clone(),
-                partition_spec(delete_file)?,
-            );
+            self.collect_file(&mut summary_collector, delete_file, false)?;
         }
 
+        Ok(summary_collector)
+    }
+
+    fn collect_file(
+        &self,
+        summary_collector: &mut SnapshotSummaryCollector,
+        file: &DataFile,
+        added: bool,
+    ) -> Result<()> {
+        let table_metadata = self.table.metadata();
+        let partition_spec = table_metadata
+            .partition_spec_by_id(file.partition_spec_id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "File references an unknown partition spec",
+                )
+                .with_context("partition spec id", file.partition_spec_id.to_string())
+                .with_context("file path", file.file_path())
+            })?;
+        let schema = table_metadata.current_schema().clone();
+        if added {
+            summary_collector.add_file(file, schema, partition_spec);
+        } else {
+            summary_collector.remove_file(file, schema, partition_spec);
+        }
+        Ok(())
+    }
+
+    /// Delete files that the delete filter manager dropped from `manifests` on its own, for
+    /// example because they are older than every live data file or reference only a removed
+    /// data file. Delete files this producer removes explicitly are already counted by
+    /// [`Self::summary_collector`], so they are left out.
+    pub(crate) fn filtered_delete_files(&self, manifests: &[ManifestFile]) -> Vec<DataFile> {
+        let Some(filter) = &self.delete_filter_manager else {
+            return vec![];
+        };
+        filter
+            .removed_files(manifests)
+            .into_iter()
+            .filter(|file| {
+                !self
+                    .removed_delete_file_identities
+                    .contains(&data_file_identity(file))
+            })
+            .collect()
+    }
+
+    /// Builds the snapshot summary from `summary_collector` (see [`Self::summary_collector`])
+    /// plus the delete files the delete filter manager dropped (see
+    /// [`Self::filtered_delete_files`]).
+    pub(crate) fn build_summary<OP: SnapshotProduceOperation>(
+        &self,
+        snapshot_produce_operation: &OP,
+        mut summary_collector: SnapshotSummaryCollector,
+        filtered_delete_files: &[DataFile],
+    ) -> Result<Summary> {
+        for delete_file in filtered_delete_files {
+            self.collect_file(&mut summary_collector, delete_file, false)?;
+        }
+
+        let table_metadata = self.table.metadata();
         let previous_snapshot = table_metadata.snapshot_for_ref(&self.target_branch);
 
         // User-supplied snapshot properties are applied first, then the computed
@@ -895,17 +927,24 @@ impl<'a> SnapshotProducer<'a> {
         snapshot_produce_operation: OP,
         process: MP,
     ) -> Result<ActionCommit> {
-        // Build the summary before `prepare_manifests`, which drains the added
-        // data and delete file vectors.
-        let summary = self
-            .prepare_summary(&snapshot_produce_operation)
-            .map_err(|err| {
-                Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.")
-                    .with_source(err)
-            })?;
+        // Collect the summary inputs before `prepare_manifests`, which drains the
+        // added data and delete file vectors, and finish the summary afterwards so
+        // it also counts the delete files the delete filter manager dropped.
+        let summary_error = |err| {
+            Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
+        };
+        let summary_collector = self.summary_collector().map_err(summary_error)?;
         let manifests = self
             .prepare_manifests(&snapshot_produce_operation, &process)
             .await?;
+        let filtered_delete_files = self.filtered_delete_files(&manifests);
+        let summary = self
+            .build_summary(
+                &snapshot_produce_operation,
+                summary_collector,
+                &filtered_delete_files,
+            )
+            .map_err(summary_error)?;
 
         self.commit_prepared(manifests, summary, 0).await
     }
