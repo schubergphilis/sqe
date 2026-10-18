@@ -28,7 +28,7 @@ See [S3 Credential Vending](../design-notes/s3vending.md) for precedence, expiry
 
 ### Fine-grained policy enforcement is off by default
 
-SQE parses the security SQL surface: `GRANT ... MASKED WITH`, `GRANT ... ROWS WHERE`, `SHOW EFFECTIVE GRANTS`, `CHECK ACCESS`. Plan-rewriting enforcement of row filters and column masks is shipped but off by default: the default `[policy] engine = "passthrough"` returns plans unmodified. Set `engine = "ranger"` (Apache Ranger fine-grained policies, row-filter + data-mask, shared with Spark/Kyuubi) or `engine = "in-memory"` (dev and tests) to turn enforcement on. The `opa` and `cedar` engines are defined in config but not yet wired (selecting them errors today).
+SQE parses the security SQL surface: `GRANT ... MASKED WITH`, `GRANT ... ROWS WHERE`, `SHOW EFFECTIVE GRANTS`, `CHECK ACCESS`. Plan-rewriting enforcement of row filters and column masks is shipped but off by default: the default `[policy] engine = "passthrough"` returns plans unmodified. Set `engine = "ranger"` (Apache Ranger fine-grained policies, row-filter + data-mask, shared with Spark/Kyuubi) or `engine = "in-memory"` (dev and tests) to turn enforcement on.
 
 The gap to know about is the default, not the capability: enforcement does nothing until you select an engine. See [Fine-grained access control](../features/fine-grained-access-control.md), [GRANT and REVOKE](../sql-reference/grant-revoke.md), and [Spark / Ranger Parity](../design-notes/sqe-spark-ranger-parity.md).
 
@@ -45,25 +45,25 @@ See [GRANT and REVOKE, Closing a gate](../sql-reference/grant-revoke.md#closing-
 
 ## Iceberg and types
 
-### Iceberg V3 advanced types are blocked upstream
+### Iceberg V3 gaps
 
-V3 landed end to end (default values, schema evolution, nanosecond timestamps, partition evolution, equality and position deletes). Five advanced features are still blocked on upstream work, not on SQE:
+V3 is the default format-version for new tables and landed end to end: default values, schema evolution, nanosecond timestamps, partition evolution, equality deletes, deletion vectors, row lineage, `VARIANT`, and top-level `UNKNOWN` / `VOID` columns. What is still missing:
 
-| Feature | Blocker |
+| Feature | Status |
 |---|---|
-| Variant type (and shredded variant) | iceberg-rust PR not merged |
-| Geometry type | DataFusion user-defined-type support |
-| Vector / embedding type | Iceberg V3 vector spec not finalised |
-| Multi-arg partition transforms | Iceberg Java spec alignment in progress |
-| Row lineage | Deferred upstream |
+| Geometry / geography types | Not supported. No SQE type and no DataFusion user-defined-type support. |
+| Multi-arg partition transforms | Not supported. `PARTITIONED BY` accepts single-source transforms only. |
+| Variant path functions (`variant_get`) | Not supported. Read fields through the variant's JSON text with the `json*` functions. |
+| Shredded variant writes | SQE reads shredded variant files written by other engines, but writes unshredded variants. |
+| Nested unknown fields | `STRUCT<a INT, u VOID>` is refused on write and cannot be read. |
 
-There is no SQE-side workaround. These unblock when the upstream dependency ships. See [Roadmap, V3 features still blocked upstream](../development/roadmap.md#phase-7---iceberg-v3-done).
+See [Iceberg Integration, V3 features verified](../features/iceberg.md#v3-features-verified) and [DDL, VARIANT](../sql-reference/ddl.md#variant).
 
 ## SQL and policy surface
 
 ### Statements DataFusion's parser does not accept
 
-`PIVOT`, `UNPIVOT`, `QUALIFY`, `ASOF JOIN`, and FROM-first syntax are not parseable. This is intentional and tracked upstream, not an SQE bug. Lambda expressions and list comprehensions have no AST node in DataFusion. The full list, with the reasoning for each, is on the [SQL Reference overview](../sql-reference/index.md#what-is-intentionally-not-in-sqe), and the [SQL cheat-sheet](sql-cheatsheet.md) carries the scannable version.
+`PIVOT`, `UNPIVOT`, `ASOF JOIN`, and FROM-first syntax are not parseable. This is tracked upstream, not an SQE bug. `QUALIFY` works. List comprehensions have no AST node in DataFusion; lambdas work in the higher-order array functions (`filter`, `transform`, `any_match`, `all_match`, `none_match`, `reduce`). The full list, with the reasoning for each, is on the [SQL Reference overview](../sql-reference/index.md#what-is-intentionally-not-in-sqe), and the [SQL cheat-sheet](sql-cheatsheet.md) carries the scannable version.
 
 ### read_parquet schema and write constraints
 

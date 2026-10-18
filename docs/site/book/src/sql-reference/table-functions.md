@@ -2,7 +2,7 @@
 
 A TVF returns a table you can use in a `FROM` clause. SQE ships two families:
 
-1. **File format readers**: `read_parquet`, `read_csv`, `read_json`, `read_delta`. Implemented in `crates/sqe-catalog/`.
+1. **File format readers**: `read_parquet`, `read_csv`, `read_json`. Implemented in `crates/sqe-catalog/`.
 2. **Iceberg metadata readers**: `table_snapshots`, `table_history`, `table_files`, `table_partitions`, `table_manifests`, `table_refs`. Implemented in `crates/sqe-catalog/src/iceberg_metadata_tvf.rs`.
 
 DataFusion contributes the generators (`generate_series`, `unnest`) and the URL-table auto-detect path (`SELECT * FROM 'file.parquet'`).
@@ -16,12 +16,11 @@ Detailed per-function docs: [File-format TVFs](../features/file-format-tvfs.md),
 | `read_parquet(path, ...)` | `sqe-catalog` | Parquet on local FS / S3 / HTTPS / `hf://`. Inline auth args. `read_parquet.rs` | Hive table only | `infer_schema`+stage | `parquet` source | `read_parquet` |
 | `read_csv(path, ...)` | `sqe-catalog` | DuckDB-style aliases (`sep`, `delim`, `header`, `nullstr`, `compress`). Smart defaults from extension. `read_csv.rs` | - | `infer_schema`+stage | `csv` source | `read_csv` |
 | `read_json(path, ...)` | `sqe-catalog` | NDJSON by default; `format => 'array'` for a top-level JSON array, `.zip` archives auto-route to the buffer path. `read_json.rs` | - | - | `json` source | `read_json` |
-| `read_delta(path, ...)` | `sqe-catalog` | Read-only Delta Lake reader. Time travel via `version => N` or `timestamp => 'RFC3339'`. `read_delta.rs` | via connector | - | native | via extension |
 | `SELECT * FROM 'file.ext'` | `datafusion-builtin` | Quoted-string auto-detect. Dispatches by extension to one of the readers above. Requires `enable_url_table()`. | - | - | - | yes |
 
 ### Common arguments
 
-All four file readers accept the same path scheme set: local, S3, HTTPS, `hf://`. Arguments are positional path + named keyword arguments:
+All three file readers accept the same path scheme set: local, S3, HTTPS, `hf://`. Arguments are positional path + named keyword arguments:
 
 ```sql
 SELECT * FROM read_parquet(
@@ -33,7 +32,7 @@ SELECT * FROM read_parquet(
 );
 ```
 
-The full keyword list per reader lives in [File-format TVFs](../features/file-format-tvfs.md). The same shape works for `read_csv`, `read_json`, `read_delta`.
+The full keyword list per reader lives in [File-format TVFs](../features/file-format-tvfs.md). The same shape works for `read_csv` and `read_json`. `read_delta` is not available: the Delta reader was removed with the move to DataFusion 54.
 
 ### Path schemes
 

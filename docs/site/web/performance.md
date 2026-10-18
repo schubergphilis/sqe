@@ -1,18 +1,18 @@
 ---
-title: Performance - SQE vs Trino 465
-description: SQE wins six of seven benchmark suites against Trino 465 at SF1, with 222/222 queries differentially validated. Decisive on smaller scales, closing fast at SF10+.
+title: Performance - SQE vs Trino 481
+description: SQE is faster than Trino 481 in seven of eight benchmark suites at SF1 and six of seven at SF10, every query differentially validated against Trino with DuckDB's dbgen/dsdgen as an independent data oracle.
 ---
 
-# Six of seven suites. Faster than Trino.
+# Seven of eight suites. Faster than Trino.
 
-Differentially validated against Trino, with DuckDB's official dsdgen as an independent data oracle.
+Differentially validated against Trino 481, with DuckDB's official dbgen/dsdgen as an independent data oracle.
 
-## Where we stand: Decisive up to SF1, closing fast at SF10+
+## Where we stand: ahead at SF1, and at SF10 too
 
-Decisive wins up to SF1, across six of seven industry suites.
+Faster than Trino at SF1 across seven of eight industry suites, and ahead at SF10 as of the latest run.
 
-SF10+ (distributed) is closing fast: on a forced-distribution rig, TPC-DS SF1 went from 4.4x slower than Trino to 1.7x faster after the dynamic-filter pushdown fix. SSB is next, shipping build-side key sets (bloom filters) to workers.
+The SF10 crossover is closed. SSB, the suite we trailed longest, is now at parity at SF10 after shipping build-side key sets to workers. TPC-H and TPC-DS lead at SF10.
 
 ## Benchmark note
 
-SSB is the one suite we still trail. Lineorder's uniform foreign-key distribution defeats row-group pruning, so the runtime filter only helps at row level. We show it honestly. Full per-query method plus the cross-scale charts: docs, or run it yourself via the benchmark quickstart.
+Two exceptions, shown rather than hidden: TPC-C's sub-second OLTP reads at SF1, where fixed dispatch overhead dominates, and the bank suite at SF10, where spill still degrades under an 8 GB pool. Full per-query method plus the cross-scale charts: docs, or run it yourself via the benchmark quickstart.

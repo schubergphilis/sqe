@@ -174,13 +174,13 @@ object and a later implementation, or another engine, can honour it.
 
 ## Iceberg V3 type system
 
-These types only exist in format-version 3, the default for new tables. Adding one to a CREATE TABLE makes the table V3 even when the configured default is 2.
+These types only exist in format-version 3, the default for new tables. A `TIMESTAMP_NS` or `VARIANT` column, or a `DEFAULT`, makes the table V3 even when the configured default is 2.
 
 | Type | Notes |
 |---|---|
 | `TIMESTAMP_NS`, `TIMESTAMP_NS WITH TIME ZONE` | Nanosecond precision timestamps. Arrow `Timestamp(Nanosecond, ...)`. |
 | `VARIANT` | Semi-structured value (object, array, string, number, boolean, null) in the Iceberg variant binary encoding. See [VARIANT](#variant) below. |
-| `GEOMETRY`, `GEOGRAPHY` | Stub types in V3; SQE accepts them in CREATE but does not yet provide spatial functions. |
+| `UNKNOWN` (also `VOID`) | A column declared before its type is known. Holds only NULLs, is never written to data files, and is promoted later with `ALTER COLUMN ... SET DATA TYPE`. Top-level only; a nested unknown field is refused. |
 | Default values via `DEFAULT expr` | Existing rows in older snapshots inherit the default at read time. |
 
 ### VARIANT

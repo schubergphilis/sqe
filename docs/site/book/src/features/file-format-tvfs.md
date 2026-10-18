@@ -1,12 +1,12 @@
 # File-format TVFs
 
-The four TVFs `read_parquet`, `read_csv`, `read_json`, and `read_delta` query files directly without registering an external table. They share a uniform calling convention and a uniform path-resolution layer (local filesystem, S3, HTTPS, HuggingFace `hf://`).
+The three TVFs `read_parquet`, `read_csv`, and `read_json` query files directly without registering an external table. They share a uniform calling convention and a uniform path-resolution layer (local filesystem, S3, HTTPS, HuggingFace `hf://`).
 
-This chapter covers `read_csv`, `read_json`, and `read_delta`. The dedicated `read_parquet` chapter covers Parquet specifically.
+This chapter covers `read_csv` and `read_json`. The dedicated `read_parquet` chapter covers Parquet specifically.
 
 ## Common path forms
 
-All four TVFs accept the same path shapes:
+All three TVFs accept the same path shapes:
 
 ```sql
 -- Local
@@ -120,32 +120,9 @@ SELECT * FROM read_json('/data/events.json.gz', format => 'array');
 SELECT * FROM read_json('/data/export.json.zip');
 ```
 
-## `read_delta`
+## Delta Lake
 
-```sql
-SELECT * FROM read_delta(
-    '<path>',
-    [access_key | secret_key | endpoint | region,]
-    [version => '<u64>',]
-    [timestamp => '<RFC3339>']
-);
-```
-
-Read-only Delta Lake reader, V11. Wraps `deltalake-core 0.32.1`. Time travel via `version` (snapshot id) or `timestamp` (RFC3339); the two are mutually exclusive.
-
-```sql
-SELECT * FROM read_delta('/data/delta/sales');
-
-SELECT * FROM read_delta('s3://bucket/delta/orders',
-    access_key => 'AKIA...');
-
--- Time travel
-SELECT * FROM read_delta('/data/delta/sales', version => '5');
-SELECT * FROM read_delta('/data/delta/sales',
-    timestamp => '2026-04-01T00:00:00Z');
-```
-
-Writes are not exposed. The Delta transaction pipeline is substantial; the read path covers the most common ad-hoc query case.
+`read_delta` is not available: the Delta reader was removed with the move to DataFusion 54. Convert to Iceberg or Parquet first.
 
 ## HuggingFace specifics
 
@@ -172,14 +149,13 @@ Default is `main` when neither is specified. Specifying both rejects with a clea
 SELECT * FROM read_parquet('hf://datasets/foo/bar@~parquet/default/train/0.parquet');
 ```
 
-Glob expansion (`**/*.parquet`) is on the V12.2 roadmap; today the path must point to a specific file.
+Glob expansion (`**/*.parquet`) is not supported for `hf://` paths; the path must point to a specific file.
 
 ## When to use which
 
 - **`read_parquet`**: ad-hoc queries against Parquet on disk, S3, HTTPS, or hf://. Anything Iceberg-aware that does not need the catalog.
 - **`read_csv`**: ETL ingestion, log analysis, dataset preview before deciding to load into Iceberg.
 - **`read_json`**: NDJSON logs, HuggingFace `train.jsonl` style splits.
-- **`read_delta`**: query a Delta Lake table without converting to Iceberg.
 
 For tables with metadata that you want to write back to, register them in a catalog. The TVFs are reads only.
 
@@ -188,6 +164,5 @@ For tables with metadata that you want to write back to, register them in a cata
 - `crates/sqe-catalog/src/read_parquet.rs`
 - `crates/sqe-catalog/src/read_csv.rs`
 - `crates/sqe-catalog/src/read_json.rs`
-- `crates/sqe-catalog/src/read_delta.rs`
 - `crates/sqe-catalog/src/file_tvf_common.rs`: shared parsing + S3 / HTTPS / hf:// resolver
 - `crates/sqe-catalog/src/lazy_object_store.rs`: V10's lazy HTTPS object-store registry

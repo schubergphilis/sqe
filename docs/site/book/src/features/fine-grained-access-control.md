@@ -10,7 +10,6 @@ The default `[policy] engine = "passthrough"` returns plans unmodified. Turn enf
 
 - `ranger` reads row-filter and column-mask policies from that Ranger instance and feeds the plan rewriter. This is the production path, and the one shared with Spark/Kyuubi.
 - `in-memory` keeps grants in a hash map, for development and tests.
-- `opa` and `cedar` are defined in config but not yet wired (selecting them errors today).
 
 ## Configure the Ranger backend
 

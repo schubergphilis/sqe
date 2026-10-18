@@ -1,12 +1,12 @@
 # SQL Feature Comparison: SQE vs Trino vs Spark SQL vs DuckDB
 
-SQE is built on **Apache DataFusion 54** which provides the SQL execution engine. All standard SQL features come from DataFusion; SQE adds catalog integration (Polaris / Iceberg / Glue / HMS / Nessie / S3 Tables / JDBC / Hadoop), pluggable auth, distributed execution, DDL routing, and a single-binary embedded mode that competes with DuckDB on laptop analytics.
+SQE is built on **Apache DataFusion 55** which provides the SQL execution engine. All standard SQL features come from DataFusion; SQE adds catalog integration (Polaris / Iceberg / Glue / HMS / Nessie / S3 Tables / JDBC / Hadoop), pluggable auth, distributed execution, DDL routing, and a single-binary embedded mode that competes with DuckDB on laptop analytics.
 
 > For a detailed function-by-function Trino compatibility matrix, see [trino-compatibility.md](trino-compatibility.md). For the audit-driven DuckDB compatibility track (V8 through V12.1, with status per item), see [duckdb-comparision.md](duckdb-comparision.md). For the embedded CLI reference, see [the CLI reference](https://docs.getsqe.com/getting-started/cli.html).
 
 ## Quick Summary
 
-| Category | SQE (DataFusion 54) | Trino | Spark SQL | DuckDB |
+| Category | SQE (DataFusion 55) | Trino | Spark SQL | DuckDB |
 |----------|:---:|:---:|:---:|:---:|
 | Window functions | ✅ Full | ✅ Full | ✅ Full | ✅ Full |
 | Aggregate functions | ✅ Full | ✅ Full | ✅ Full | ✅ Full |
@@ -20,15 +20,15 @@ SQE is built on **Apache DataFusion 54** which provides the SQL execution engine
 | DELETE | ✅ CoW + MoR (V12) | ✅ | ✅ | ✅ |
 | UPDATE | ✅ CoW + MoR (V12) | ✅ | ✅ | ✅ |
 | PIVOT/UNPIVOT | ❌ | ❌ | ⚠️ PIVOT only | ✅ |
-| QUALIFY | ❌ | ❌ | ❌ | ✅ |
+| QUALIFY | ✅ | ❌ | ❌ | ✅ |
 | Lambda expressions | ✅ (array higher-order) | ✅ | ✅ | ✅ |
 | GROUPING SETS | ✅ | ✅ | ✅ | ✅ |
 | Iceberg time travel | ✅ FOR VERSION / SYSTEM\_TIME AS OF | ✅ | ✅ | ⚠️ Read-only via extension |
 | Iceberg branches & tags | ✅ ALTER TABLE CREATE BRANCH / TAG | ⚠️ Limited | ✅ | ❌ |
 | Iceberg compaction (`rewrite_data_files`) | ✅ CALL system.rewrite_data_files() | ✅ OPTIMIZE | ✅ | ❌ |
 | Iceberg maintenance procedures | ✅ expire_snapshots / remove_orphan_files / rewrite_manifests | ✅ | ✅ | ❌ |
-| Delta Lake read | ✅ `read_delta()` (V11) | ⚠️ via connector | ✅ Native | ✅ via extension |
-| File-format TVFs | ✅ `read_parquet`/`read_csv`/`read_json`/`read_delta` | ⚠️ Hive table only | ✅ | ✅ |
+| Delta Lake read | ❌ removed with the move to DataFusion 54 | ⚠️ via connector | ✅ Native | ✅ via extension |
+| File-format TVFs | ✅ `read_parquet`/`read_csv`/`read_json` | ⚠️ Hive table only | ✅ | ✅ |
 | `SELECT * FROM 'file.ext'` auto-detect | ✅ (V8) | ❌ | ❌ | ✅ |
 | HuggingFace `hf://` URLs | ✅ TVF + auto-detect (V10/V12) | ❌ | ❌ | ✅ via extension |
 | HTTPS / `httpfs` | ✅ (V10) | ⚠️ HTTP table function | ❌ | ✅ via extension |
@@ -209,7 +209,7 @@ FROM orders;
 | `ARRAY` | ✅ | ✅ | ✅ |
 | `MAP` | ⚠️ Partial | ✅ | ✅ |
 | `STRUCT`/`ROW` | ✅ | ✅ | ✅ |
-| `JSON` type | ❌ | ✅ | ❌ |
+| `JSON` type | ✅ VARIANT on V3, string on V2 | ✅ | ❌ |
 | `UUID` type | ❌ | ✅ | ❌ |
 
 ---
@@ -362,11 +362,11 @@ FROM orders;
 | Hidden partitioning (transforms: bucket, truncate, year, month, day, hour) | ✅ | ✅ | ✅ |
 | Schema evolution (add / drop / rename / promote / set null) | ✅ | ✅ | ✅ |
 | Partition evolution (add / drop / rename partition field) | ✅ | ✅ | ✅ |
-| Iceberg V3 (column defaults, nanosecond timestamps, geometry/geography stubs) | ✅ | ⚠️ Partial | ⚠️ Partial |
+| Iceberg V3 (column defaults, nanosecond timestamps, deletion vectors, row lineage, VARIANT, unknown columns; no geometry/geography) | ✅ | ⚠️ Partial | ⚠️ Partial |
 | Time travel (`FOR VERSION AS OF`, `FOR SYSTEM_TIME AS OF`) | ✅ | ✅ | ✅ |
 | Snapshot queries (`table$snapshots`, `table_snapshots()` TVF) | ✅ Trino + DuckDB syntax | ✅ | ✅ |
 | Metadata TVFs (`table_history`, `table_files`, `table_partitions`, `table_manifests`, `table_refs`) | ✅ | ✅ | ✅ |
-| Merge-on-Read deletes (position + equality) | ✅ V12 | ✅ | ✅ |
+| Merge-on-Read deletes (position + equality on V2, deletion vectors on V3) | ✅ V12 | ✅ | ✅ |
 | Copy-on-Write deletes | ✅ default | ✅ | ✅ |
 | `CALL system.rewrite_data_files()` (compaction with bin-packing) | ✅ | ✅ OPTIMIZE | ✅ |
 | `CALL system.expire_snapshots()` | ✅ | ✅ | ✅ |
@@ -376,10 +376,10 @@ FROM orders;
 | Manifest caching (in-process moka cache) | ✅ | ✅ | ✅ |
 | Branches and tags (`ALTER TABLE CREATE BRANCH/TAG`, query `table@branch`) | ✅ | ⚠️ Limited | ✅ |
 | Position deletes | ✅ | ✅ | ✅ |
-| Equality deletes | ⚠️ Read; write deferred | ✅ | ✅ |
+| Equality deletes | ✅ read + write (with identifier fields) | ✅ | ✅ |
 | MERGE INTO (CoW + MoR) | ✅ V12 | ✅ | ✅ |
-| Row-level security | ✅ OPA / Cedar plan rewrite | ❌ needs Ranger | ❌ needs Ranger |
-| Column masking | ✅ OPA / Cedar plan rewrite | ❌ | ❌ |
+| Row-level security | ✅ Ranger policies, plan rewrite | ❌ needs Ranger | ❌ needs Ranger |
+| Column masking | ✅ Ranger policies, plan rewrite | ❌ | ❌ |
 | Per-user OIDC bearer to Polaris / S3 | ✅ | ❌ service account | ❌ service account |
 
 ---
@@ -392,7 +392,7 @@ FROM orders;
 | `SHOW SCHEMAS` | ✅ | ✅ | ✅ |
 | `SHOW TABLES` | ✅ | ✅ | ✅ |
 | `SHOW COLUMNS FROM ns.table` | ✅ Trino syntax (rewrites to `information_schema`) | ✅ | ✅ |
-| `SHOW CREATE TABLE` | ❌ | ✅ | ✅ |
+| `SHOW CREATE TABLE` | ✅ | ✅ | ✅ |
 | `DESCRIBE table` | ✅ DataFusion native | ✅ | ✅ |
 | `SUMMARIZE table` (column stats) | ✅ V9 | ❌ | ❌ |
 | CLI `.schema` / `.describe` / `.summarize` | ✅ embedded mode V9 | n/a | n/a |
@@ -413,7 +413,8 @@ FROM orders;
 | JDBC | ✅ via Flight SQL | ✅ native | ✅ Thrift |
 | ODBC | ✅ via Flight SQL | ✅ | ✅ |
 | Python (ADBC) | ✅ | ✅ trino-python | ✅ PySpark |
-| dbt | 🔜 dbt-sqe | ✅ dbt-trino | ✅ dbt-spark |
+| dbt | ✅ dbt-sqe | ✅ dbt-trino | ✅ dbt-spark |
+| MCP (AI clients) | ✅ OAuth resource server | ❌ | ❌ |
 
 ---
 
@@ -432,7 +433,7 @@ FROM orders;
 
 1. **Arrow-native**: no serialization overhead; Flight SQL transfers columnar Arrow batches directly
 2. **Rust performance**: no JVM GC pauses, lower memory footprint, faster startup
-3. **Fine-grained security**: row-level filters and column masks via OPA/Cedar policy engine, enforced at the query plan level before optimization
+3. **Fine-grained security**: row-level filters and column masks via Apache Ranger policies, enforced at the query plan level before optimization
 4. **Bearer token passthrough**: every query runs as the authenticated user against Polaris; no service account with god-mode access
 5. **Iceberg-native**: built specifically for Iceberg via iceberg-rust; no connector abstraction layer
 
@@ -443,19 +444,19 @@ The V8-V12 audit closed the file-format TVF and httpfs / hf:// gaps. SQE now mat
 1. **OIDC bearer-token passthrough**: every query runs as the authenticated user. No service account. DuckDB has no concept of an authenticated user.
 2. **Distributed execution**: coordinator + stateless workers, shuffle, spill across machines, adaptive sort. DuckDB is single-process.
 3. **Multi-catalog cluster**: Polaris, Nessie, AWS Glue, Hive Metastore, JDBC, AWS S3 Tables, Hadoop in one engine, behind one auth chain. DuckDB is extension-by-extension and runs on one machine.
-4. **Iceberg V3 read AND write**: position deletes, equality deletes, MoR + CoW for DELETE / UPDATE / MERGE, branches, tags, partition evolution, schema evolution, nanosecond timestamps, column defaults. DuckDB's Iceberg extension is read-only.
-5. **Trino HTTP wire compatibility**: dbt models that work against Trino 465 work against SQE without changes. DuckDB has no Trino wire support.
+4. **Iceberg V3 read AND write**: position deletes, equality deletes, deletion vectors, MoR + CoW for DELETE / UPDATE / MERGE, branches, tags, partition evolution, schema evolution, nanosecond timestamps, column defaults. DuckDB's Iceberg extension is read-only.
+5. **Trino HTTP wire compatibility**: dbt models that work against Trino work against SQE without changes. DuckDB has no Trino wire support.
 6. **One binary, two modes**: the same `sqe` binary serves both the embedded laptop persona and the cluster mode. Same SQL surface, same TVFs, same dot-commands. See [the CLI reference](https://docs.getsqe.com/getting-started/cli.html).
 
 ## What DuckDB still has that SQE does not
 
 The V12.x roadmap and parser-blocked items both feed this list. None of these are on the immediate roadmap.
 
-1. **PIVOT / UNPIVOT / QUALIFY / ASOF JOIN / FROM-first syntax**: DataFusion parser does not support. Tracked upstream.
-2. **List comprehensions**: no DataFusion primitive. Array lambdas all work now: SQE parses with the DuckDB dialect. `filter` / `transform` alias DataFusion 54's `array_filter` / `array_transform`, `any_match` is `array_any_match`, and `all_match` / `none_match` / `reduce` are SQE UDFs on the same machinery.
+1. **PIVOT / UNPIVOT / ASOF JOIN / FROM-first syntax**: DataFusion parser does not support. Tracked upstream.
+2. **List comprehensions**: no DataFusion primitive. Array lambdas all work now: SQE parses with the DuckDB dialect. `filter` / `transform` alias DataFusion's `array_filter` / `array_transform`, `any_match` is `array_any_match`, and `all_match` / `none_match` / `reduce` are SQE UDFs on the same machinery.
 3. **Spatial, vector search, full-text search, Excel, Postgres scanner**: out of scope for our positioning. Use the right tool for each.
-4. **A 30 MB binary**: SQE's embedded build lands around 180 MB. The floor is higher because DataFusion + iceberg-rust + AWS SDK + delta-rs add up.
-5. **Glob expansion on `hf://` URLs (`**/*.parquet`)**: V12.2 in progress; the HF tree-API cache prerequisite shipped on `feat/hf-tree-cache`.
+4. **A 30 MB binary**: SQE's embedded build lands around 180 MB. The floor is higher because DataFusion + iceberg-rust + AWS SDK add up.
+5. **Glob expansion on `hf://` URLs (`**/*.parquet`)**: not supported. `hf://` resolves single files only.
 6. **Smart-CSV inference deeper than extension**: DuckDB samples bytes to detect delimiter, quote, header. SQE's V12 follow-up uses extension-based heuristics; byte-sampling is a future enhancement.
 
 For the audit-driven detail with per-item status, see [`duckdb-comparision.md`](duckdb-comparision.md). For the user-facing "how did we get here" narrative, see [the blog](../blog/2026-05-07-accidentally-duckdb.md) and ebook chapter [16d "The DuckDB Drift"](../ebook/chapters/16d-the-duckdb-drift.md).
@@ -465,4 +466,4 @@ For the audit-driven detail with per-item status, see [`duckdb-comparision.md`](
 1. **No federated queries**: SQE reads only from Iceberg / Polaris / Glue / HMS / Nessie / S3 Tables / JDBC (Trino has 50+ connectors)
 2. **No UDFs in SQL**: custom functions require Rust; no CREATE FUNCTION support
 3. **Trino-style ASOF JOIN**: not yet implemented (DataFusion parser limitation)
-4. **PIVOT / UNPIVOT / QUALIFY**: parser-blocked upstream
+4. **PIVOT / UNPIVOT**: parser-blocked upstream

@@ -1,6 +1,6 @@
 # Connecting clients
 
-SQE speaks two wire protocols. Arrow Flight SQL is primary and Arrow-native, used by the CLI, ADBC drivers, and the dbt adapter. The Trino HTTP endpoint is an optional compatibility surface for existing Trino clients and BI tools. This page has copy-pasteable snippets for both.
+SQE speaks two wire protocols for SQL clients. Arrow Flight SQL is primary and Arrow-native, used by the CLI, ADBC drivers, and the dbt adapter. The Trino HTTP endpoint is an optional compatibility surface for existing Trino clients and BI tools. This page has copy-pasteable snippets for both. AI clients connect over the Model Context Protocol instead (see [Model Context Protocol](../deployment/mcp.md)), and an experimental Quack endpoint speaks the DuckDB wire protocol (see [Quack](../quickstart/quack.md)).
 
 The ports below are the defaults from [Configuration](../deployment/configuration.md): Flight SQL on `50051`, Trino HTTP on `8080`. Local test compose files remap them (`60051` and `28080`); use the ports your deployment actually exposes.
 

@@ -1,0 +1,30 @@
+{
+  "outsideRubricNote": "The current Iceberg matrix rubric no longer scores catalog rows for Polaris, Nessie, Hive Metastore, JDBC or Hadoop. SQE still supports them; the table below says how each is tested today.",
+  "outsideRubric": [
+    {
+      "catalog": "Apache Polaris",
+      "support": "Read + write",
+      "testing": "Primary target catalog: the Polaris + Keycloak and Ranger quickstarts run against it end to end."
+    },
+    {
+      "catalog": "Project Nessie",
+      "support": "Read + write (Iceberg REST)",
+      "testing": "Runnable quickstart and a live namespace round-trip test, run manually."
+    },
+    {
+      "catalog": "Hive Metastore",
+      "support": "Read + write",
+      "testing": "Live round-trip test against a standalone metastore container, run manually, not in CI."
+    },
+    {
+      "catalog": "JDBC (PostgreSQL)",
+      "support": "Read + write",
+      "testing": "Live round-trip tests, including a V3 table, run manually against PostgreSQL, not in CI."
+    },
+    {
+      "catalog": "Hadoop (storage-only)",
+      "support": "Read only",
+      "testing": "Auto-discovery unit test; object-store integration test run manually. Writes go through a real catalog."
+    }
+  ]
+}

@@ -173,12 +173,11 @@ exposed; the table is for inventory only.
 
 ## Authorization
 
-Out of the box, ATTACH and CREATE SECRET are open to any authenticated
-session. Lock them down through the same OPA / Cedar policy backend
-that gates GRANT and REVOKE: write a rule that denies
-`statement_kind == "attach"` for non-admin roles. The plan rewriter
-sees the statement before it reaches the registry, so a denied ATTACH
-errors at policy enforcement time, not at catalog build time.
+ATTACH, DETACH, CREATE SECRET, DROP SECRET, and SHOW SECRETS require
+an admin role from `[auth] admin_roles` (default `service_admin` and
+`catalog_admin`). Any other session gets a permission-denied error
+before the statement reaches the registry. An empty `admin_roles` list
+denies these statements to everyone.
 
 ## Lifecycle and persistence
 
@@ -307,9 +306,8 @@ for schema or table visibility.
 - No mTLS to attached REST catalogs. Bearer tokens only.
 - No KERBEROS for HMS. The HMS path uses the upstream Thrift client's
   default authentication.
-- Authorization is enforced through the policy backend (OPA / Cedar).
-  There is no built-in role check for ATTACH or CREATE SECRET out of
-  the box; operators wire it themselves through policy rules.
+- Authorization is a single admin-role check (`[auth] admin_roles`).
+  There is no finer per-catalog or per-secret permission.
 - The embedded CLI (`sqe-cli` ad-hoc mode) supports the same syntax
   as the cluster server. Embedded ATTACH targets the same in-memory
   registry but does not share state across CLI invocations.

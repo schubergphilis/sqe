@@ -18,7 +18,7 @@ This is the suite where SQE's caching layers shine: bloom filters on the few hig
 
 ## SF1
 
-The headline scale. The latest run sits at 1.3s; Trino takes 4.46s on the same data. Same numbers as the [book Results table](../../site/book/src/features/benchmarks.md#results-sf1-vs-trino-465).
+The headline scale. The latest run sits at 1.3s; Trino takes 4.46s on the same data. Same numbers as the [book Results table](../../site/book/src/features/benchmarks.md#results-vs-trino-481).
 
 ![ClickBench SF1 total](./charts/clickbench-sf1-total.png)
 

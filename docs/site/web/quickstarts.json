@@ -20,6 +20,11 @@
           "blurb": "Authenticated SQE MCP with read/write gates, protocol tests, and reusable AI client setup."
         },
         {
+          "name": "mcp-ranger-okta",
+          "title": "MCP with Ranger and Okta",
+          "blurb": "Okta browser login from Claude Code or Codex, Ranger policies per Okta group over the AWS Glue Data Catalog; SQE and Ranger only."
+        },
+        {
           "name": "nessie",
           "title": "Project Nessie",
           "blurb": "Nessie as the Iceberg REST catalog, auth-less, anonymous SQE."

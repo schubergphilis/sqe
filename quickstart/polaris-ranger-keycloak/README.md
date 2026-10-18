@@ -15,8 +15,8 @@ to Apache Spark + Kyuubi.
 
 This is the path for shops that already run Ranger as their authorization plane
 and want SQE and Spark to share one policy set rather than maintaining separate
-grants per engine. Pick it over the OPA/Cedar policy engine when Ranger is the
-existing source of truth.
+grants per engine. Ranger is SQE's policy engine for row filters and column
+masks.
 
 ## What you get
 
