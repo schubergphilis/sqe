@@ -190,7 +190,6 @@ Two orthogonal settings control access control, and both default to off:
 | `passthrough` (default) | No enforcement. Plans returned unmodified. | `PassthroughEnforcer` |
 | `in-memory` | Single-node dev and tests. Policies in a hash map. | `crates/sqe-policy/src/policy_store.rs` |
 | `ranger` | Apache Ranger fine-grained policies (row-filter + data-mask), requires `[policy.ranger].url`. | `crates/sqe-policy/src/ranger_store.rs` |
-| `opa` / `cedar` | Defined in config but not yet wired (selecting them errors today). | `crates/sqe-policy/src/opa.rs` (OPA) |
 
 Configure them in the engine TOML:
 

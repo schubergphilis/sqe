@@ -31,7 +31,7 @@ WHERE customer_id IN (SELECT customer_id FROM orders WHERE amount > 500);
 
 ### Higher-order array functions
 
-SQE parses SQL with the DuckDB dialect, so Trino-style lambda syntax (`x -> expr`) is accepted. The DuckDB dialect keeps the same identifier quoting as the default parser; it just adds lambda support. Two higher-order array functions are aliased onto DataFusion 54's built-ins:
+SQE parses SQL with the DuckDB dialect, so Trino-style lambda syntax (`x -> expr`) is accepted. The DuckDB dialect keeps the same identifier quoting as the default parser; it just adds lambda support. Two higher-order array functions are aliased onto DataFusion's built-ins:
 
 ```sql
 SELECT filter(ARRAY[1, 2, 3, 4], x -> x > 2);                  -- [3, 4]        (array_filter)
@@ -137,7 +137,7 @@ WHEN NOT MATCHED THEN INSERT (id, value) VALUES (source.id, source.value);
 
 All row-level write operations (DELETE, UPDATE, MERGE INTO) default to Copy-on-Write via the RisingWave iceberg-rust fork's `rewrite_files()` transaction API. Affected data files are read, filtered/transformed, and rewritten as new files in a single atomic commit.
 
-DELETE also supports Merge-on-Read when `write.delete.mode = 'merge-on-read'` is set on the table. SQE writes a position-delete file (or an equality-delete file when the table declares an identifier-field-id) and commits via `FastAppendAction` / `RowDeltaAction`. MoR avoids rewriting whole data files for small deletes against large tables.
+DELETE also supports Merge-on-Read when `write.delete.mode = 'merge-on-read'` is set on the table. On a V2 table SQE writes a position-delete file; on a V3 table it writes one deletion vector per data file and never a position-delete file. With an identifier-field-id declared, it writes an equality-delete file. It commits via `FastAppendAction` / `RowDeltaAction`. MoR avoids rewriting whole data files for small deletes against large tables.
 
 ## Data Types
 
@@ -146,7 +146,7 @@ SQE accepts the standard ANSI SQL type set plus a few Iceberg-specific extension
 ```sql
 CREATE TABLE events (
     id              BIGINT,
-    payload         JSON,                       -- Aliases to Utf8 underneath
+    payload         JSON,                       -- VARIANT on V3, string on V2
     occurred_at     TIMESTAMP(6),
     occurred_time   TIME(6),                    -- Time-of-day, microseconds
     occurred_at_tz  TIMESTAMP(6) WITH TIME ZONE,
@@ -156,7 +156,7 @@ CREATE TABLE events (
 );
 ```
 
-- `JSON` columns store as `Utf8`. `CAST(json_col AS BIGINT|VARCHAR|DOUBLE)` rides DataFusion's built-in coercion. JSON-shaped extraction works through `json_extract`, `json_extract_scalar`, `json_array_length`, `json_parse`, `json_get_str`, `json_get_int`, `json_get_float`, `json_get_bool`.
+- `JSON` columns store as Iceberg `VARIANT` on a V3 table and as a string on a V2 table; both read back as JSON text. `CAST(json_col AS BIGINT|VARCHAR|DOUBLE)` rides DataFusion's built-in coercion. JSON-shaped extraction works through `json_extract`, `json_extract_scalar`, `json_array_length`, `json_parse`, `json_get_str`, `json_get_int`, `json_get_float`, `json_get_bool`.
 - `TIME` / `TIME(p)` maps to Arrow `Time64(Microsecond)` since Iceberg's `time` primitive is microsecond-only across V2 and V3. Precisions 0..=6 collapse to microsecond. `TIME(p > 6)` rejects with a clear NotImplemented; use `TIMESTAMP(9)` for sub-microsecond resolution.
 - `TIME WITH TIME ZONE` rejects at CREATE TABLE: Arrow has no equivalent. Use `TIMESTAMP WITH TIME ZONE` instead.
 - `TIMESTAMP_NS` (and `TIMESTAMP_NS WITH TIME ZONE`) is a V3-only nanosecond timestamp. New tables are format-version 3 by default; with `default_table_format_version = 2`, a CREATE that uses one of these types still makes the table V3.

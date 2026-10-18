@@ -90,21 +90,7 @@ CSV-specific named args: `delimiter`, `has_header`, `quote`, `escape`, `comment`
 
 `read_csv` also accepts the DuckDB-style aliases `sep` / `delim` for the delimiter, `header` for `has_header`, `nullstr` for `null_regex`, and `compress` / `compression` for the codec. Delimiter and codec default from the path extension: `.csv` is comma, `.tsv` is tab, `.psv` is pipe, `.ssv` is semicolon, and a `.gz` / `.bz2` / `.xz` / `.zst` suffix is stripped before delimiter detection.
 
-### `read_delta()`
-
-`read_delta()` reads a Delta Lake table directly. It takes the same S3 credential args as the other TVFs plus time-travel args: `version` (a snapshot id) or `timestamp` (RFC3339). The two are mutually exclusive, and reads are read-only.
-
-```sql
--- Latest snapshot
-SELECT * FROM read_delta('/data/delta/transactions');
-
--- Time travel to a specific version
-SELECT * FROM read_delta('/data/delta/transactions', version => '12');
-
--- Land a Delta table into local Iceberg via CTAS
-CREATE TABLE iceberg.warehouse.legacy_sales AS
-    SELECT * FROM read_delta('/legacy/delta/sales');
-```
+`read_delta` is not available: the Delta reader was removed with the move to DataFusion 54. Convert to Iceberg or Parquet first.
 
 ### Auto-detect: `SELECT * FROM 'file.ext'`
 

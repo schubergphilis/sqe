@@ -17,7 +17,7 @@ graph LR
 
 ## Key Properties
 
-- **No service account.** Every query runs as the authenticated user. The user's bearer token passes through to the Polaris catalog (metadata) and on the write path. Read-path S3 access currently uses the configured `[storage]` credentials; per-user read-credential vending is on the roadmap (see [S3 credential vending](./design-notes/s3vending.md)).
+- **No service account.** Every query runs as the authenticated user. The user's bearer token passes through to the Polaris catalog (metadata) and on the write path. Read-path S3 access can use per-user, table-scoped credentials vended by the catalog (`[catalog] access_delegation = "vended-credentials"`); without it, reads use the configured `[storage]` credentials (see [S3 credential vending](./design-notes/s3vending.md)).
 - **Arrow-native** — columnar data flows from Parquet files through the entire query pipeline to the client. No row-based serialization anywhere.
 - **Iceberg-native** — built on iceberg-rust, not a connector bolted onto a generic engine. Partition pruning, metadata caching, and Iceberg v3 support are first-class.
 - **Fine-grained security** — row filters and column masks enforced at the logical plan level, before the optimizer runs. Invisible columns, transparent row filtering, no information leakage.
@@ -33,7 +33,6 @@ sqe-cli --embedded                    # ~/.sqe/warehouse persistent Iceberg cata
 sqe> SELECT * FROM '/data/sales.parquet' LIMIT 5;
 sqe> SELECT * FROM read_csv('s3://bucket/orders.tsv.gz');
 sqe> SELECT * FROM 'hf://datasets/squad/plain_text/train-00000-of-00001.parquet';
-sqe> SELECT * FROM read_delta('/data/delta/sales', version => '5');
 ```
 
 Full embedded reference: [Using the CLI](./getting-started/cli.md). DuckDB comparison: [getsqe.com/compare/duckdb](https://getsqe.com/compare/duckdb).
@@ -53,4 +52,4 @@ SQE_CONFIG=sqe.toml ./target/release/sqe-server
 
 ## Project Status
 
-SQE is production-ready for the data path against Apache Iceberg; the coordinator currently runs as a single replica (a single point of failure), and coordinator HA is on the roadmap (see [Kubernetes & Helm](./deployment/kubernetes.md)). The cluster mode runs distributed (coordinator + stateless workers) with OIDC bearer-token passthrough, Polaris / Nessie / Glue / HMS / S3 Tables / JDBC / Hadoop catalogs, and 147/162 (90.7%) on the public Iceberg matrix rubric. The embedded mode (V8 through V12.1) adds DuckDB-style file-format TVFs (`read_csv`, `read_json`, `read_delta`), HuggingFace `hf://` URLs, and a single-binary CLI for laptop analytics.
+SQE is production-ready for the data path against Apache Iceberg; the coordinator currently runs as a single replica (a single point of failure), and coordinator HA is on the roadmap (see [Kubernetes & Helm](./deployment/kubernetes.md)). The cluster mode runs distributed (coordinator + stateless workers) with OIDC bearer-token passthrough, Polaris / Nessie / Glue / HMS / S3 Tables / JDBC / Hadoop catalogs, and 147/162 (90.7%) on the public Iceberg matrix rubric. The embedded mode (V8 through V12.1) adds DuckDB-style file-format TVFs (`read_csv`, `read_json`), HuggingFace `hf://` URLs, and a single-binary CLI for laptop analytics.

@@ -9,7 +9,7 @@ SQE is built on the [iceberg-rust](https://github.com/apache/iceberg-rust) libra
 - **DataFusion**: 55
 - **Arrow**: 59
 - **Parquet**: 59
-- **Iceberg table format**: V2 and V3. V3 features verified end-to-end (TIMESTAMP_NS, column defaults, equality-delete UPDATE on identifier-fields, partition evolution).
+- **Iceberg table format**: V2 and V3. V3 is the default for new tables. V3 features verified end-to-end: TIMESTAMP_NS, column defaults, equality-delete UPDATE on identifier-fields, partition evolution, deletion vectors, row lineage, `VARIANT`, and top-level unknown columns.
 
 The matrix score against [icebergmatrix.org](https://icebergmatrix.org) is 147/162 (90.7%), rescored in October 2026 against the current rubric, which scores only the cells that apply to each format version. Scores from the older rubric (167/189) are not comparable. See [getsqe.com/compare/iceberg](https://getsqe.com/compare/iceberg) for the per-cell breakdown and the side-by-side V2/V3 comparison against every other engine on the public scoreboard.
 
@@ -161,6 +161,8 @@ SQE runs table maintenance through `CALL system.*` procedures, each committing t
 - **Variant**: `VARIANT` columns store unshredded variant values written from JSON text, survive CTAS and INSERT ... SELECT, and read back as JSON text ([details](../sql-reference/ddl.md#variant)). On a V3 table a `JSON` column is a variant too, and the `json*` functions read it. Shredded files written by other engines read the same as unshredded ones; SQE writes unshredded variants and has no variant path functions yet.
 - **Column defaults**: `CREATE TABLE ... DEFAULT <literal>` applies `write_default`; `ALTER TABLE ADD COLUMN ... DEFAULT` applies `initial_default`.
 - **Deletion vectors (V3)**: MoR DELETE on a V3 table writes one deletion vector per data file, never a position-delete file. A second DELETE on the same file merges its existing deletes into a new vector and retires the old one in the same commit, so a data file never carries two. The engine refuses any commit that would add a position-delete file to a V3 table.
+- **Row lineage (V3)**: new rows get a fresh `_row_id` at commit. CoW DELETE / UPDATE / MERGE, MoR UPDATE / MERGE and `rewrite_data_files` carry `_row_id` and `_last_updated_sequence_number` into the files they write.
+- **Unknown columns (V3)**: a top-level `UNKNOWN` or `VOID` column holds only NULLs, is never written to data files, and is promoted later with `ALTER COLUMN ... SET DATA TYPE`. A Spark-written `VOID` column reads as NULLs. Nested unknown fields are refused.
 - **Equality deletes (V3)**: UPDATE with a declared identifier-field-id commits a single RowDelta with new data file plus equality-delete row.
 - **Partition evolution (V3)**: `ALTER TABLE ADD/DROP/REPLACE PARTITION FIELD` evolves the spec on V3 tables, including with day(ts) on TIMESTAMP_NS columns.
 - **Time travel (V3)**: `FOR SYSTEM_TIME AS OF` and `FOR VERSION AS OF` work against V3 tables through the same snapshot walk as V2.
@@ -169,6 +171,7 @@ SQE runs table maintenance through `CALL system.*` procedures, each committing t
 V3 features not available yet:
 
 - **Geometry / geography**: no iceberg-rust support, and pending DataFusion UDT [#12644](https://github.com/apache/datafusion/issues/12644).
-- **Vector / Embedding**: V3 spec not finalised.
+- **Multi-arg partition transforms**: `PARTITIONED BY` accepts single-source transforms only.
+- **Variant path functions**: no `variant_get` yet.
 
 The deferred list is tracked in `docs/evidence/iceberg-matrix-state.json` under `caveats` for each cell.

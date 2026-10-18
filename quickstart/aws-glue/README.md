@@ -129,7 +129,7 @@ the same with or without Lake Formation. The dedicated
 LF-governed and grants the principal explicit LF permissions instead. That is
 table/database-level permission gating: SQE does not enforce LF column-masking
 or row-filtering (it reads S3 directly with the caller's credentials). SQE's own
-column/row masking is the OPA/Cedar policy engine, not Lake Formation.
+column/row masking is the Apache Ranger policy engine, not Lake Formation.
 
 ## Output
 

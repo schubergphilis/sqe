@@ -182,7 +182,7 @@ These are reliability fixes, not optional optimizations:
 ### Security hardening
 
 - Per-user OIDC. No shared service token for all users.
-- Ranger or OPA policy backend (`policy.engine` not `passthrough`).
+- Ranger policy backend (`policy.engine = "ranger"`, not `passthrough`).
 - `mask_key` configured for hash column masks.
 - Inline-credential TVFs disabled or restricted to admin roles.
 - Restrict catalog/execution error detail for untrusted clients if needed.
@@ -368,7 +368,7 @@ Route audit logs and traces through an OpenTelemetry Collector when possible. Au
 ### Before multi-tenant
 
 - [ ] Per-user identity end to end
-- [ ] Policy backend (Ranger/OPA) with `mask_key`
+- [ ] Policy backend (Ranger) with `mask_key`
 - [ ] DML policy fields in audit (when implemented)
 - [ ] Inline TVF credentials restricted
 

@@ -10,7 +10,7 @@ The embedded CLI runs an in-process DataFusion engine. No coordinator, no
 Polaris, no Keycloak, no network listeners. You only need Rust.
 
 ```bash
-# Install the CLI (Rust 1.85+: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh)
+# Install the CLI (Rust 1.99+: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh)
 cargo install --path crates/sqe-cli
 
 # Start an embedded session (persistent Iceberg catalog under ~/.sqe/warehouse)
@@ -22,7 +22,6 @@ Query local and remote files directly:
 ```sql
 sqe> SELECT * FROM '/data/sales.parquet' LIMIT 5;
 sqe> SELECT * FROM read_csv('s3://bucket/orders.tsv.gz');
-sqe> SELECT * FROM read_delta('/data/delta/sales', version => '5');
 ```
 
 Or run a single query without entering the shell:
@@ -41,13 +40,13 @@ multi-user, secured access.
 
 ### Prerequisites
 
-- **Rust** 1.85+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
-- A running data platform stack: **Keycloak**, **Polaris**, **MinIO/S3** (see the quickstart stack in `data-platform/quickstart/full/`)
+- **Rust** 1.99+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
+- A running data platform stack: **Keycloak**, **Polaris**, **MinIO/S3** (see the quickstart stack in `quickstart/polaris-keycloak-client-id/`)
 
 ### 1. Clone and Build
 
 ```bash
-git clone https://github.com/schuberg/sqe.git
+git clone https://github.com/schubergphilis/sqe.git
 cd sqe
 cargo build --release --bin sqe-server --bin sqe-cli
 ```
@@ -165,7 +164,7 @@ verified live against AWS deployments.
 
 For the operator-friendly version of the same content (BI tool
 connection, slim builds, cargo features), see
-[`QUICKSTART.md`](https://github.com/schuberg/sqe/blob/main/QUICKSTART.md)
+[`QUICKSTART.md`](https://github.com/schubergphilis/sqe/blob/main/QUICKSTART.md)
 in the repo root.
 
 ## Next Steps

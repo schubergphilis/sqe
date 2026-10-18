@@ -1,6 +1,6 @@
 # Roadmap
 
-SQE is developed in phases, each building on the previous. Last swept: 2026-07-05.
+SQE is developed in phases, each building on the previous. Last swept: 2026-10-18.
 
 ## Phase Overview
 
@@ -84,7 +84,7 @@ Native dbt support via `dbt-sqe` adapter over ADBC Flight SQL.
 
 ## Phase 3 - Row-Level Writes (Done)
 
-DELETE FROM, UPDATE, and MERGE INTO are implemented via Copy-on-Write using the iceberg-rust fork vendored at `vendor/iceberg-rust/` (DataFusion 54 rebase of `risingwavelabs/iceberg-rust`), which provides `rewrite_files()` transaction support.
+DELETE FROM, UPDATE, and MERGE INTO are implemented via Copy-on-Write using the iceberg-rust fork vendored at `vendor/iceberg-rust/` (apache `main` with the `risingwavelabs/iceberg-rust` row-level write stack merged on top), which provides `rewrite_files()` transaction support.
 
 ### Strategy: Copy-on-Write
 
@@ -128,7 +128,7 @@ Uses the iceberg-rust fork vendored at `vendor/iceberg-rust/` for `rewrite_files
 
 | File | Change |
 |---|---|
-| `Cargo.toml` | Vendored iceberg-rust fork (DataFusion 54 rebase) at `vendor/iceberg-rust/` |
+| `Cargo.toml` | Vendored iceberg-rust fork at `vendor/iceberg-rust/` |
 | `crates/sqe-coordinator/src/delete_handler.rs` | DELETE FROM execution via CoW |
 | `crates/sqe-coordinator/src/update_handler.rs` | UPDATE execution via CoW |
 | `crates/sqe-coordinator/src/merge_handler.rs` | MERGE INTO execution via CoW |
@@ -254,7 +254,7 @@ Not yet wired:
 
 ## Phase 7 - Iceberg V3 (Done)
 
-Iceberg V3 table format support landed end-to-end. The vendored fork at `vendor/iceberg-rust/` is rebased onto DataFusion 54 and carries V3 spec coverage. SQE Iceberg matrix score: 167/189 = 88.4% (per `docs/internal/design-archive/iceberg-matrix.md`).
+Iceberg V3 table format support landed end-to-end. V3 is the default format-version for new tables. The vendored fork at `vendor/iceberg-rust/` carries V3 spec coverage. SQE Iceberg matrix score: 147/162 (90.7%) on the current rubric, rescored in October 2026 (per `docs/evidence/iceberg-matrix-state.json`). The older 167/189 score used a different rubric and is not comparable.
 
 ### V3 Features Shipped
 
@@ -263,21 +263,24 @@ Iceberg V3 table format support landed end-to-end. The vendored fork at `vendor/
 | Default values (`ALTER TABLE ADD COLUMN ... DEFAULT`) | Done |
 | Schema evolution (`ALTER TABLE ADD/DROP COLUMN`, incl. nested struct fields) | Done |
 | Nanosecond timestamps (`TIMESTAMP_NS`, `TIMESTAMPTZ_NS`) | Done |
-| `VARIANT` columns (unshredded, JSON text in and out) | Done |
+| `VARIANT` columns (unshredded writes, shredded reads; JSON text in and out) | Done |
 | `JSON` stored as variant on V3 tables; `json*` functions read variants | Done |
 | Compaction trigger on the deleted-row share (`delete_ratio_threshold`), which counts deletion vectors | Done |
 | Partition evolution | Done |
 | Equality deletes + position deletes (MoR) | Done |
+| Deletion vectors (MoR DELETE on V3 writes one vector per data file) | Done |
+| Row lineage | Done |
+| Unknown/VOID columns (top-level) | Done |
 
-### V3 Features Still Blocked Upstream
+### V3 Features Not Yet Supported
 
-| Feature | Blocker |
+| Feature | Status |
 |---|---|
-| Shredded variant reads, variant path functions | SQE work, tracked in #849 |
-| Geometry type | DataFusion UDT [#12644](https://github.com/apache/datafusion/issues/12644) |
-| Vector / Embedding type | Iceberg V3 vector spec not finalised |
-| Multi-arg partition transforms | Iceberg Java spec alignment in progress |
-| Row lineage | Deferred upstream |
+| Variant path functions (`variant_get`) | SQE work, tracked in #849 |
+| Shredded variant writes | SQE writes unshredded; shredded files read |
+| Nested unknown fields | Refused on write, not readable |
+| Geometry / geography type | DataFusion UDT [#12644](https://github.com/apache/datafusion/issues/12644) |
+| Multi-arg partition transforms | Not started |
 
 ### Other Hardening
 
@@ -295,7 +298,7 @@ Iceberg V3 table format support landed end-to-end. The vendored fork at `vendor/
 `sqe-cli --embedded` turned out to be a DuckDB-class single-process engine with the same SQL surface as the distributed coordinator. The story is in the blog post `docs/site/blog/2026-05-07-accidentally-duckdb.md`.
 
 - Persistent SQLite-backed Iceberg warehouse at `~/.sqe/warehouse/`, surviving restarts
-- File-format table functions: `read_parquet`, `read_csv`, `read_json`, `read_avro`, `read_delta`, plus bare `'file.parquet'` paths
+- File-format table functions: `read_parquet`, `read_csv`, `read_json`, plus bare `'file.parquet'` paths (`read_delta` was removed with the move to DataFusion 54)
 - Remote sources: `s3://`, `https://`, HuggingFace `hf://` datasets
 - Cross-catalog joins across multiple `--catalog NAME=PATH` mounts
 - Runtime `ATTACH` / `CREATE SECRET` against any of the supported catalog backends
@@ -352,8 +355,8 @@ The Phase 10 plan called for systematic benchmarking against Trino. That work ha
 - **`sqe-bench` harness**: seven suites (TPC-H, TPC-DS, SSB, TPC-C, TPC-E, TPC-BB, ClickBench), 222 queries, JSON reports committed to `benchmarks/results/` with per-suite history plots at `docs/evidence/benchmark/`
 - **Differential validation**: `sqe-bench compare` runs every query against both engines on the same Iceberg tables and diffs the rows; vacuous results (0/0 agreement) are classified, not counted as passes
 - **Generator fidelity oracle**: generated data validated against DuckDB's official `dbgen`/`dsdgen` output; the oracle caught a TPC-C generator bug and a set of TPC-DS vocabulary gaps (see `docs/site/blog/2026-06-12-the-benchmark-that-lied.md`)
-- **SF1 verdict**: SQE wins six of seven suites vs Trino 465 (README receipts)
-- **SF10 clean-rig verdict**: dedicated host, cache off, DataFusion 54: TPC-H 1.2x, TPC-DS 1.9x, SSB still trailing at 0.5x (scan-bound star joins)
+- **SF1 verdict** (2026-07-09, vs Trino 481): SQE is faster on seven of eight suites; TPC-C's sub-second OLTP reads are the exception
+- **SF10 verdict** (2026-07-09, vs Trino 481): faster on six of seven suites, SSB at parity; TPC-H 1.7x, TPC-DS 1.5x; the bank suite is the exception
 - **Forced-distribution rig**: single worker, threshold zero, every fact scan over Flight; exposed and fixed the dynamic-filter pushdown gap to workers
 - **Attached golden tables for the read suites**: `scripts/benchmark-publish-iceberg.sh` publishes tpch/ssb/tpcds/tpcbb/clickbench/bank into a persistent Polaris once; `BENCH_DATA_SOURCE=attach` then runs tpch/ssb/tpcds/clickbench against the attached `golden` catalog with zero per-run load. Write suites (tpcc/tpce) still generate and load normally, as do bank (published to golden, but attach mode does not yet query it from there) and tpcbb (its own tables are not published, since it shares tpcds's namespace). Bank/tpcbb via attach, and a shallow-clone path that lets tpcc/tpce share golden data files while writing locally, are the deferred follow-up. See [Benchmark Suite](../features/benchmarks.md#fast-benchmark-runs-via-attached-golden-tables).
 

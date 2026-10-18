@@ -227,8 +227,7 @@ backend = "none"                # none (default) | polaris | ranger | chameleon
 
 [policy]
 # Fine-grained enforcement engine (row filters + column masks).
-# Wired: passthrough (default), in-memory, ranger.
-# opa and cedar are defined but not yet wired; selecting them errors at startup.
+# One of: passthrough (default), in-memory, ranger.
 engine = "passthrough"
 
 [session]
@@ -292,7 +291,7 @@ enabled = false                 # Enable query result caching (disabled by defau
 max_memory_mb = 128             # Total cache memory budget
 max_entry_mb = 5                # Max size per cached result
 ttl_secs = 300                  # Cache entry TTL
-# Cache semantics under policy engines (Ranger, OPA, Cedar, in-memory, plan rewriter):
+# Cache semantics under policy engines (Ranger, in-memory, plan rewriter):
 # Each cached entry is bound to the policy fingerprint active when it was produced.
 # A policy change (bundle update, row filter tighten, new mask) makes older entries
 # misses. ALTER TABLE and RENAME evict everything (tag-based masks live on the table,

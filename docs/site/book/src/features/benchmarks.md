@@ -22,39 +22,31 @@ For the longitudinal view (every benchmark JSON in `benchmarks/results/` plotted
 - **TPC-C and TPC-E** cover OLTP patterns: point lookups, small aggregates, indexed access by key ranges, plus write operations (DELETE, UPDATE) exercised via Copy-on-Write.
 - **TPC-BB** exercises semi-structured data alongside the TPC-DS schema, useful for validating string functions and JSON handling.
 
-## Results (SF1, vs Trino 465)
+## Results (vs Trino 481)
 
-The numbers below are the latest SF1 run, as of 2026-06-12, against Trino 465 on identical Iceberg tables and S3 storage. All 222 queries pass (222/222). SQE wins six of seven suites at SF1.
+The numbers below are the latest run, as of 2026-07-09, against Trino 481 on identical Iceberg tables and S3 storage, both engines capped at 12 GB on a dedicated 8-core host. SQE is faster on seven of eight suites at SF1 and on six of seven at SF10, where SSB is at parity.
 
-| Suite | SQE | Trino | Speedup | Pass |
-|---|---|---|---|---|
-| TPC-E (11) | 9.3s | 172.0s | 18.5x | 11/11 |
-| TPC-BB (10) | 28.0s | 255.7s | 9.1x | 10/10 |
-| TPC-C (8 read) | 0.41s | 2.65s | 6.5x | 8/8 |
-| TPC-DS (99) | 13.4s | 45.6s | 3.4x | 93/99 |
-| ClickBench (43) | 1.3s | 4.46s | 3.4x | 43/43 |
-| TPC-H (22) | 16.8s | 26.7s | 1.6x | 22/22 |
-| SSB (13) | 8.3s | 5.8s | 0.70x | 13/13 |
+| Suite | SF1 SQE | SF1 Trino | SF1 speedup | SF10 SQE | SF10 Trino | SF10 speedup |
+|---|---|---|---|---|---|---|
+| TPC-H (22) | 14.2s | 40.8s | 2.9x | 66.5s | 111.9s | 1.7x |
+| TPC-DS (99) | 49.3s | 114.9s | 2.3x | 216.6s | 320.5s | 1.5x |
+| SSB (13) | 5.2s | 7.3s | 1.4x | 20.4s | 21.4s | 1.0x |
+| ClickBench (43) | 3.1s | 7.3s | 2.4x | 10.0s | 31.6s | 3.2x |
+| TPC-E (11) | 3.8s | 11.6s | 3.0x | test-only | test-only | - |
+| TPC-BB (10) | 53.7s | 480.5s | 8.9x | 405.5s | 1429.7s | 3.5x |
+| Bank (8) | 10.5s | 19.8s | 1.9x | 370.5s | 85.5s | 0.23x |
+| TPC-C (8 read) | 5.6s | 4.3s | 0.77x | 5.0s | 18.0s | 3.6x |
 
-Run-to-run variance is real, so treat each figure as approximate. The rank order is stable across the last month of runs.
+Run-to-run variance is real, so treat each figure as approximate. The full per-query timeline is on [getsqe.com/performance](https://getsqe.com/performance).
 
 TPC-BB is lopsided. On the 2026-08-15 Flight SF1 run the suite is 63.1s and q01 alone is 35.5s (20 rows). The other nine queries share the remaining half. Quote q01 when you quote a TPC-BB total (issue #417). The README compare envelope that day is 56.3s vs Trino 290.3s, still 10/10.
 
 ### Where SQE trails
 
-SSB is the one suite SQE loses at SF1: 8.3s against Trino's 5.8s, a 0.70x result. SSB is a denormalized star schema built for fast star-join filtering. Trino ships build-side key sets (bloom filters) into its scans, which prunes the `lineorder` fact table before it is read. SQE's equivalent, shipping build-side key sets to distributed workers, is in progress. The `lineorder` fact has a uniform foreign-key distribution that defeats row-group min/max pruning, so the runtime filter only helps at row level today.
-
-TPC-DS has the most misses at SF1 (93/99). The six gaps are GROUPING SETS edge cases around grand-total row presence; they are the same six since March, not new regressions. TPC-E passes 11/11 but is the suite that historically needed the most work: it joins across 33 tables and uses IN-subquery patterns that DataFusion cannot always decorrelate, so deep-join queries dominate its run time.
-
-The SF1 wins are decisive. At SF10 the picture narrows. On the level rig (Trino 481, totals across runs, single-node / distributed-2-worker / Trino range):
-
-| Suite | SQE single-node | SQE distributed 2w | Trino 481 |
-|---|---|---|---|
-| TPC-H | 130.5s | 95.5s | 106.4s - 138.6s |
-| SSB | 42.0s | 53.6s | 28.0s - 41.1s |
-| TPC-DS | 543.9s | 338.3s | 328.4s - 468.0s |
-
-At SF10, TPC-H distributed (95.5s) lands inside Trino's range, roughly par to ahead. TPC-DS distributed (338.3s) sits inside Trino's range, close. SSB still trails at SF10, the same pattern as SF1. These are SF10 figures on a single rig, not the canonical SF1 results above.
+- **TPC-C at SF1 (0.77x)**: the read queries are sub-second, so fixed dispatch overhead dominates. At SF10 SQE is ahead (3.6x).
+- **Bank at SF10 (0.23x, 7/8)**: spill stalls under an 8 GB memory pool. A fix is in progress.
+- **ClickBench (40/43)**: three queries are pending a LIMIT-drop regression (q17).
+- **TPC-E at SF10**: the differential check needs about 14 GB for a 10M-row result, so SF10 is validated test-only.
 
 ### How it is validated
 
@@ -412,8 +404,8 @@ Benchmark JSON results are committed to `benchmarks/results/` for historical com
 ## Comparing against Trino
 
 The benchmark harness can run the same suite against a real Trino on the same
-data, so you can compare SQE and Trino directly. The [Results section](#results-sf1-vs-trino-465)
-above is the output of exactly this run at SF1. There are two modes:
+data, so you can compare SQE and Trino directly. The [Results section](#results-vs-trino-481)
+above is the output of exactly this run. There are two modes:
 
 - **Correctness parity**: `--compare-trino` diffs SQE's results against
   Trino's row-for-row. This is how SQL correctness is validated at scale, not
