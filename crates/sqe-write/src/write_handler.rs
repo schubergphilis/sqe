@@ -7921,6 +7921,18 @@ pub fn sql_type_to_arrow_for(
             })?;
             sql_type_to_arrow_for(&struct_type, json_as_variant)
         }
+        // Iceberg V3 `unknown` (Spark spells it `VOID`): a column declared
+        // before its type is known. It holds only NULLs, is never written to
+        // data files, and is promoted later with ALTER COLUMN SET DATA TYPE.
+        SqlType::Custom(name, modifiers)
+            if modifiers.is_empty()
+                && name.0.len() == 1
+                && name.0[0].as_ident().is_some_and(|i| {
+                    i.value.eq_ignore_ascii_case("unknown") || i.value.eq_ignore_ascii_case("void")
+                }) =>
+        {
+            Ok(DataType::Null)
+        }
         other => Err(SqeError::NotImplemented(format!(
             "SQL type not supported for CREATE TABLE: {other}"
         ))),

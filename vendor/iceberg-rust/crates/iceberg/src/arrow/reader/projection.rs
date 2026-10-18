@@ -142,7 +142,7 @@ impl ArrowReader {
         };
 
         if entering_variant && variant_field_id.is_some() {
-            Self::validate_unshredded_variant_storage(data_type)?;
+            Self::validate_variant_storage(data_type)?;
         }
 
         match data_type {
@@ -194,22 +194,18 @@ impl ArrowReader {
         Ok(())
     }
 
-    fn validate_unshredded_variant_storage(data_type: &DataType) -> Result<()> {
+    /// SQE PATCH (v3-shredded-variant): a shredded variant (Iceberg 1.12
+    /// `write.parquet.shred-variants`) carries a `typed_value` group beside
+    /// `value`. Its leaves are projected like the unshredded ones; the
+    /// consumer folds `typed_value` back into `value` (SQE's scan does it with
+    /// `parquet_variant_compute::unshred_variant`).
+    fn validate_variant_storage(data_type: &DataType) -> Result<()> {
         let DataType::Struct(fields) = data_type else {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!("Variant storage must be a Struct, got {data_type}"),
             ));
         };
-
-        if fields.iter().any(|field| field.name() == "typed_value") {
-            return Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                "Reading shredded variant columns is not supported yet: found a \
-                 `typed_value` sub-field. Only unshredded variants (metadata + value) \
-                 can be read.",
-            ));
-        }
 
         let is_binary = |data_type: &DataType| {
             matches!(
@@ -219,15 +215,20 @@ impl ArrowReader {
         };
         let metadata = fields.iter().find(|field| field.name() == "metadata");
         let value = fields.iter().find(|field| field.name() == "value");
-        if fields.len() != 2
+        let typed_value = fields.iter().find(|field| field.name() == "typed_value");
+        let known = fields
+            .iter()
+            .all(|field| matches!(field.name().as_str(), "metadata" | "value" | "typed_value"));
+        if !known
             || metadata.is_none_or(|field| !is_binary(field.data_type()))
-            || value.is_none_or(|field| !is_binary(field.data_type()))
+            || value.is_some_and(|field| !is_binary(field.data_type()))
+            || (value.is_none() && typed_value.is_none())
         {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
-                    "Unshredded variant storage must contain exactly binary `metadata` \
-                     and `value` fields, got {data_type}"
+                    "Variant storage must contain a binary `metadata` field and a binary \
+                     `value` and/or a `typed_value` field, got {data_type}"
                 ),
             ));
         }
@@ -1030,7 +1031,7 @@ message schema {
     }
 
     #[test]
-    fn test_variant_projection_validates_unshredded_storage() {
+    fn test_variant_projection_validates_storage() {
         let shredded = DataType::Struct(
             vec![
                 Arc::new(Field::new("metadata", DataType::Binary, false)),
@@ -1039,12 +1040,11 @@ message schema {
             ]
             .into(),
         );
-        let error = ArrowReader::validate_unshredded_variant_storage(&shredded).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::FeatureUnsupported);
+        ArrowReader::validate_variant_storage(&shredded).expect("shredded storage is readable");
 
         let malformed =
             DataType::Struct(vec![Arc::new(Field::new("metadata", DataType::Utf8, false))].into());
-        let error = ArrowReader::validate_unshredded_variant_storage(&malformed).unwrap_err();
+        let error = ArrowReader::validate_variant_storage(&malformed).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::DataInvalid);
     }
 
