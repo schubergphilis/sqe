@@ -37,7 +37,7 @@ use crate::writer::{new_upload_tracker, parse_parquet_compression, WriteCleanupG
 pub(crate) use crate::writer::collect_live_data_files;
 pub(crate) use sqe_compaction::{
     collect_live_delete_files, covered_position_deletes, delete_heavy_files,
-    pack_file_groups_partition_aware,
+    delete_ratio_heavy_files, pack_file_groups_partition_aware,
 };
 /// Delete-aware bin-pack/sort rewrite primitives moved to `sqe-compaction`
 /// (Phase 4c Task 1) so the worker-side `compact_file_group` action can reuse
@@ -64,6 +64,28 @@ use sqe_compaction::{
 /// pulling `QueryTracker` into the procedure AST. Returning owned `String`s
 /// keeps the closure simple and avoids lifetime gymnastics.
 pub type QueryHistoryFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
+/// Data files that either delete trigger marks for rewrite: at least
+/// `count` distinct delete files ([`delete_heavy_files`]), or a deleted-row
+/// share of at least `ratio` ([`delete_ratio_heavy_files`]). A count of 0
+/// and a ratio of 0 (or `None`) each mean that trigger is off, not "every
+/// file qualifies". Shared by both rewrite paths and by `table_health`, so
+/// the report and the rewrite can never disagree about which files are
+/// delete-heavy.
+pub(crate) fn delete_triggered_files(
+    tasks_by_path: &std::collections::HashMap<String, Vec<iceberg::scan::FileScanTask>>,
+    count: Option<usize>,
+    ratio: Option<f64>,
+) -> std::collections::HashSet<String> {
+    let mut out = match count {
+        Some(threshold) if threshold > 0 => delete_heavy_files(tasks_by_path, threshold),
+        _ => std::collections::HashSet::new(),
+    };
+    if let Some(ratio) = ratio.filter(|r| *r > 0.0) {
+        out.extend(delete_ratio_heavy_files(tasks_by_path, ratio));
+    }
+    out
+}
 
 /// Dispatcher for `CALL system.*` maintenance procedures.
 ///
@@ -261,6 +283,7 @@ impl MaintenanceHandler {
         strategy: Option<String>,
         sort_order: Option<String>,
         delete_file_threshold: Option<usize>,
+        delete_ratio_threshold: Option<f64>,
         rewrite_all: bool,
         snapshot_properties: Option<std::collections::HashMap<String, String>>,
     ) -> sqe_core::Result<RewriteOutcome> {
@@ -288,6 +311,7 @@ impl MaintenanceHandler {
             strategy,
             sort_order,
             delete_file_threshold,
+            delete_ratio_threshold,
             rewrite_all,
             snapshot_properties,
         )
@@ -313,6 +337,7 @@ impl MaintenanceHandler {
                 strategy,
                 sort_order,
                 delete_file_threshold,
+                delete_ratio_threshold,
                 distributed,
                 rewrite_all,
             } => {
@@ -364,6 +389,7 @@ impl MaintenanceHandler {
                             strategy.clone(),
                             sort_order.clone(),
                             *delete_file_threshold,
+                            *delete_ratio_threshold,
                             rewrite_all,
                             None,
                         )
@@ -380,6 +406,7 @@ impl MaintenanceHandler {
                             strategy.clone(),
                             sort_order.clone(),
                             *delete_file_threshold,
+                            *delete_ratio_threshold,
                             rewrite_all,
                             None,
                         )
@@ -969,6 +996,7 @@ impl MaintenanceHandler {
         strategy: Option<String>,
         sort_order: Option<String>,
         delete_file_threshold: Option<usize>,
+        delete_ratio_threshold: Option<f64>,
         rewrite_all: bool,
         snapshot_properties: Option<std::collections::HashMap<String, String>>,
     ) -> sqe_core::Result<RewriteOutcome> {
@@ -987,6 +1015,7 @@ impl MaintenanceHandler {
                     strategy.clone(),
                     sort_order.clone(),
                     delete_file_threshold,
+                    delete_ratio_threshold,
                     rewrite_all,
                     snapshot_properties.clone(),
                 )
@@ -1025,6 +1054,7 @@ impl MaintenanceHandler {
         strategy: Option<String>,
         sort_order: Option<String>,
         delete_file_threshold: Option<usize>,
+        delete_ratio_threshold: Option<f64>,
         rewrite_all: bool,
         snapshot_properties: Option<std::collections::HashMap<String, String>>,
     ) -> sqe_core::Result<RewriteOutcome> {
@@ -1110,16 +1140,20 @@ impl MaintenanceHandler {
         // tasks, so this count matches the read cost. These files are worth
         // rewriting even when they are already at or above the target size (to
         // apply the accumulated deletes and shed the delete-file layer), which
-        // bin-pack would otherwise leave alone. Empty unless the caller set a
-        // threshold. Moot under `strategy => 'sort'`, which already rewrites the
+        // bin-pack would otherwise leave alone. A file whose deleted-row share
+        // reaches `delete_ratio_threshold` qualifies too: on a V3 table each
+        // data file has at most one deletion vector, so the count alone never
+        // fires there. Empty unless the caller set a threshold. Moot under `strategy => 'sort'`, which already rewrites the
         // whole partition, so it is only computed for the bin-pack path.
-        let delete_heavy: std::collections::HashSet<String> =
-            match (sort_ctx.is_some(), delete_file_threshold) {
-                (false, Some(threshold)) if threshold > 0 => {
-                    delete_heavy_files(&read_plan.tasks_by_path, threshold)
-                }
-                _ => std::collections::HashSet::new(),
-            };
+        let delete_heavy: std::collections::HashSet<String> = if sort_ctx.is_some() {
+            std::collections::HashSet::new()
+        } else {
+            delete_triggered_files(
+                &read_plan.tasks_by_path,
+                delete_file_threshold,
+                delete_ratio_threshold,
+            )
+        };
 
         // Skip a table below `min_input_files` UNLESS a delete-heavy file makes
         // it worth rewriting anyway (apply accumulated deletes) or the caller
@@ -1524,6 +1558,7 @@ impl MaintenanceHandler {
         strategy: Option<String>,
         sort_order: Option<String>,
         delete_file_threshold: Option<usize>,
+        delete_ratio_threshold: Option<f64>,
         rewrite_all: bool,
         snapshot_properties: Option<std::collections::HashMap<String, String>>,
     ) -> sqe_core::Result<RewriteOutcome> {
@@ -1546,6 +1581,7 @@ impl MaintenanceHandler {
                     strategy.clone(),
                     sort_order.clone(),
                     delete_file_threshold,
+                    delete_ratio_threshold,
                     rewrite_all,
                     snapshot_properties.clone(),
                 )
@@ -1594,6 +1630,7 @@ impl MaintenanceHandler {
         strategy: Option<String>,
         sort_order: Option<String>,
         delete_file_threshold: Option<usize>,
+        delete_ratio_threshold: Option<f64>,
         rewrite_all: bool,
         snapshot_properties: Option<std::collections::HashMap<String, String>>,
     ) -> sqe_core::Result<RewriteOutcome> {
@@ -1669,13 +1706,15 @@ impl MaintenanceHandler {
             .map(|f| f.file_size_in_bytes() as i64)
             .sum();
 
-        let delete_heavy: std::collections::HashSet<String> =
-            match (sort_spec.is_some(), delete_file_threshold) {
-                (false, Some(threshold)) if threshold > 0 => {
-                    delete_heavy_files(&read_plan.tasks_by_path, threshold)
-                }
-                _ => std::collections::HashSet::new(),
-            };
+        let delete_heavy: std::collections::HashSet<String> = if sort_spec.is_some() {
+            std::collections::HashSet::new()
+        } else {
+            delete_triggered_files(
+                &read_plan.tasks_by_path,
+                delete_file_threshold,
+                delete_ratio_threshold,
+            )
+        };
 
         if input_count < min_input && delete_heavy.is_empty() && !rewrite_all {
             info!(
@@ -4445,6 +4484,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        None,
                         true, // rewrite_all: force the lone file into the rewrite
                         None,
                     )
@@ -4503,6 +4543,7 @@ mod tests {
                     &TableRef::parse("default.race_test").expect("parse table ref"),
                     None,
                     Some(1),
+                    None,
                     None,
                     None,
                     None,
@@ -4586,6 +4627,7 @@ mod tests {
                     &TableRef::parse(&format!("default.{name}")).expect("parse table ref"),
                     None,
                     Some(1),
+                    None,
                     None,
                     None,
                     None,
