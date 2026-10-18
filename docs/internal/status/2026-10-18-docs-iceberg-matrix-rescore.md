@@ -8,9 +8,9 @@
 - Downgrade: unity-catalog to partial (read-only smoke).
 - Platform: `SQE (0.51.0)`, docUrl `https://docs.getsqe.com`.
 
-Every evidence path and test symbol in the state file resolves on main. `docs/internal/design-archive/iceberg-matrix.md` is regenerated; `README.md`, the book index and `features/iceberg.md` carry the new score. The "fifth on the scoreboard" rank is dropped: it was measured on the old rubric. `scripts/render-iceberg-matrix-compare.py` was not rerun (its `gh api` call against the upstream repo 404s), so `iceberg-matrix-compare.md` still shows the old comparison.
+Every evidence path and test symbol in the state file resolves on main. `docs/internal/design-archive/iceberg-matrix.md` is regenerated; `README.md`, the book index and `features/iceberg.md` carry the new score. The "fifth on the scoreboard" rank is dropped: it was measured on the old rubric. `scripts/render-iceberg-matrix-compare.py` was not rerun, so `iceberg-matrix-compare.md` still shows the old comparison. Its `gh api` fetch 404s because upstream changed layout: `src/data/platforms/` is now a directory tree per vendor and platform instead of one JSON file per vendor (`oss.json`, `aws.json`, ...), and catalogs and ingestion moved to their own `src/data/catalogs/` and `src/data/ingestion/` trees. The getsqe.com/compare/iceberg page is built outside this repo and also still shows 167/189.
 
 **NEXT:**
 - Refresh the docs.getsqe.com pages the docUrl points at before submitting the state upstream.
-- Rerun `render-iceberg-matrix-compare.py` once its upstream fetch works, and re-derive the public rank.
+- Port `render-iceberg-matrix-compare.py` to the new upstream layout, regenerate the comparison, re-derive the public rank, and refresh getsqe.com/compare/iceberg from it.
 - Variant: typed path access (`variant_get`), a shredded-file read test, compaction of a variant table.
