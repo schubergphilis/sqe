@@ -2,9 +2,9 @@
 
 Current state of SQE against the [icebergmatrix.org](https://icebergmatrix.org) rubric, the de-facto reference engineers consult when picking an Iceberg engine. Data lives at [Neuw84/iceberg-matrix](https://github.com/Neuw84/iceberg-matrix).
 
-**Score: 167/189 (88.4%)**  |  **Stretch: 170/189 (90%)**
+**Score: 144/162 (88.9%)**  |  **Stretch: 170/189 (90%)**
 
-Last generated: 2026-06-03T00:00:00Z  |  Source: `chore/bump-iceberg-rust-9491dcab: re-validated against vendored RW fork c034b19105fa (snapshot-summary panic fix #161 + V3 puffin file reader). Both are bug-fixes; no cell flips. The V3 puffin read fix is not yet verified end-to-end (needs the docker-compose stack), so no V3 deletion-vector cell changes. Score holds 167/189.`
+Last generated: 2026-10-17T00:00:00Z  |  Source: `Rescore against the pinned upstream rubric; evidence paths repaired after the crate and test moves.`
 
 Regenerate: `python3 scripts/render-iceberg-matrix.py`. Source of truth: `docs/evidence/iceberg-matrix-state.json`.
 
@@ -31,8 +31,8 @@ Each feature is scored against V2 and V3 of the Iceberg spec (63 cells total). A
 |---|---:|---:|
 | AWS EMR (Spark 7.12) | 180/189 | 95 |
 | OSS Spark 4.1 | 175/189 | 93 |
-| **SQE (current)** | **167/189** | **88.4** |
 | OSS Flink 2.2 | 153/189 | 81 |
+| **SQE (current)** | **144/162** | **88.9** |
 | Snowflake | 134/189 | 71 |
 | PyIceberg 0.11 | 130/189 | 69 |
 | Databricks DBR 17.3 | 103/189 | 54 |
@@ -51,22 +51,22 @@ Peer scores from icebergmatrix.org as of 2026-04-29.
 
 | Feature | V2 | V3 | V2 notes | V3 notes |
 |---|:---:|:---:|---|---|
-| Position Deletes | F | F | PositionDeleteFileWriter + FastAppendAction (Step 8d). | MoR DELETE on V3 tables writes position-delete files alongside the existing data files; live data file count stays unchanged after DELETE (n |
-| Equality Deletes | F | F | DELETE with write.delete.mode=merge-on-read writes equality-delete files via EqualityDeleteFileWriter and commits through RowDeltaAction. Un | Equality-delete UPDATE on a V3 table with a declared identifier-field-id commits a single RowDelta with the new data file and the equality-d |
-| Merge-on-Read | F | F | All three DML kinds (DELETE, UPDATE, MERGE) route through RowDeltaAction when write.*.mode = merge-on-read. UPDATE emits one data file per b | MoR DELETE writes position-delete files; MoR UPDATE writes data + equality-delete in one RowDelta when the V3 table declares an identifier-f |
-| Copy-on-Write | F | F | DELETE/UPDATE/MERGE via RisingWave iceberg-rust fork rewrite_files(). | DELETE on a V3 table without a declared MoR property runs CoW: rewrites the matched files via RewriteFilesAction, drops the row from subsequ |
+| Position Deletes | F | - | MoR DELETE on a V2 table without identifier fields writes position-delete files (PositionDeleteFileWriter) and commits a RowDelta; data file |  |
+| Equality Deletes | F | F | DELETE with write.delete.mode=merge-on-read writes equality-delete files via EqualityDeleteFileWriter and commits through RowDeltaAction. Un | MoR UPDATE on a V3 table with a declared identifier field commits the new data file and an equality-delete file in one RowDelta; the SELECT  |
+| Merge-on-Read | F | F | All three DML kinds (DELETE, UPDATE, MERGE) route through RowDeltaAction when write.*.mode = merge-on-read. UPDATE emits one data file per b | MoR DELETE on a V3 table writes deletion vectors (never position-delete files); MoR UPDATE / MERGE write data plus equality deletes in one R |
+| Copy-on-Write | F | F | DELETE / UPDATE / MERGE in copy-on-write mode (the default) rewrite the affected files through ReplaceFilesAction. | DELETE on a V3 table without a declared MoR property runs CoW: rewrites the matched files via RewriteFilesAction, drops the row from subsequ |
 
 ### Table management
 
 | Feature | V2 | V3 | V2 notes | V3 notes |
 |---|:---:|:---:|---|---|
-| Schema Evolution | F | F | ADD/DROP/RENAME COLUMN, SET/DROP NOT NULL (Step 7.3). | ADD COLUMN with DEFAULT lands the new field with both write_default and initial_default on a V3 table; the column appears in information_sch |
+| Schema Evolution | F | F | ADD/DROP/RENAME COLUMN, SET/DROP NOT NULL (Step 7.3). | ALTER TABLE ADD COLUMN ... DEFAULT on a V3 table commits write_default and initial_default; rows written before the ALTER read the initial d |
 | Type Promotion / Widening | F | F | int->long, float->double, decimal widening. | ALTER TABLE ... ALTER COLUMN ... SET DATA TYPE widens columns on V3 tables (verified int -> bigint). The new type surfaces through informati |
-| Column Default Values | n/a | F | V3-only feature | CREATE TABLE ... DEFAULT <literal> applies write_default; ALTER TABLE ADD COLUMN ... DEFAULT applies initial_default. Function-call defaults |
-| Table Creation | F | F | CREATE TABLE, CTAS streaming. | CREATE TABLE auto-upgrades to format-version 3 when columns require V3 features (TIMESTAMP_NS, DEFAULT). Polaris materialises V3 metadata be |
+| Column Default Values | n/a | F | V3-only feature | CREATE TABLE ... DEFAULT <literal> and ALTER TABLE ADD COLUMN ... DEFAULT set write_default and initial_default. INSERT with a column list a |
+| Table Creation | F | F | CREATE TABLE, CTAS streaming. | CREATE TABLE is V3 when a column needs it (TIMESTAMP_NS, VARIANT, DEFAULT), when asked with WITH ('format-version' = '3') / TBLPROPERTIES, o |
 | Time Travel / Snapshots | F | F | FOR SYSTEM_TIME AS OF + 6 metadata TVFs (Step 8c). | FOR VERSION AS OF works end-to-end on V3 tables: the classifier strips the clause, apply_version_spec registers a snapshot-pinned provider u |
 | Table Maintenance | F | F | All four CALL system.* procedures ship with both parser unit tests and live e2e tests that go through docker-compose.test.yml (Polaris + Rus | CALL system.rewrite_data_files merges files on V3 tables with real Parquet re-encoding; row count preserved, file count drops, snapshot log  |
-| Branching & Tagging | F | F | Transaction::{create_branch, create_tag, drop_branch, drop_tag} in vendored iceberg-rust + ALTER TABLE ... CREATE BRANCH/TAG DDL + SET WRITE | Same transaction actions apply to V3 tables; ref semantics are format-version agnostic. |
+| Branching & Tagging | F | F | ALTER TABLE CREATE/DROP BRANCH and TAG with retention options, SET WRITE_BRANCH routes INSERT / DELETE / UPDATE to a branch, FOR VERSION AS  | Same transaction actions apply to V3 tables; ref semantics are format-version agnostic. |
 
 ### Partitioning
 
@@ -74,49 +74,49 @@ Peer scores from icebergmatrix.org as of 2026-04-29.
 |---|:---:|:---:|---|---|
 | Hidden Partitioning | F | F | CREATE TABLE ... PARTITIONED BY (...) accepts all six standard Iceberg transforms: identity (bare column), year/month/day/hour, bucket(N, co | Same SQL syntax as V2 (PARTITIONED BY) and the same writer path. Verified on a V3 table with a TIMESTAMP_NS column partitioned by day(ts): I |
 | Partition Evolution | F | F | ALTER TABLE ADD/DROP/REPLACE PARTITION FIELD evolves the partition spec end-to-end. Pre-parser in sqe-sql/partition_evolution.rs lifts the n | V3 metadata stores per-file partition_spec_id the same way V2 does; the same coordinator handler and writer path exercise V3 nanosec timesta |
-| Multi-Argument Transforms | n/a | . | V3-only feature | Spec not stable upstream. |
+| Multi-Argument Transforms | n/a | . | V3-only feature | PARTITIONED BY accepts only single-source transforms; a multi-source transform cannot be declared. |
 
 ### Read / write
 
 | Feature | V2 | V3 | V2 notes | V3 notes |
 |---|:---:|:---:|---|---|
-| Read Support | F | F | DataFusion 53 scan + predicate pushdown + projection. | SELECT against V3 tables works through the existing iceberg-rust scan path: TIMESTAMP_NS columns materialise as Arrow Timestamp(Nanosecond), |
+| Read Support | F | F | Iceberg scan with partition pruning, projection, row-group / page / RowFilter predicate pushdown and runtime join filters. | SELECT against V3 tables works through the existing iceberg-rust scan path: TIMESTAMP_NS columns materialise as Arrow Timestamp(Nanosecond), |
 | Write (INSERT) | F | F | Streaming INSERT and CTAS. | INSERT into V3 tables with TIMESTAMP_NS columns commits a snapshot through Polaris and the rows materialise on subsequent SELECT. INSERT rou |
-| Write (MERGE/UPDATE/DELETE) | F | F | All three DML ops via CoW rewrite_files(). | DELETE (CoW + MoR position), UPDATE (MoR equality), and MERGE INTO (MATCHED UPDATE + NOT MATCHED INSERT) all commit on V3 tables. Each path  |
-| Catalog Integration | F | F | Iceberg REST (Polaris primary). | V3 tables created by SQE materialise correctly in the Iceberg REST catalog: CREATE/INSERT/UPDATE/DELETE all commit, table metadata reloads c |
-| Statistics (Column Metrics) | F | F | Column metrics used for pruning and CBO. | SHOW STATS FOR works on V3 tables, returning per-column metrics from the active snapshot. Same DataFusion + iceberg-rust scan path as V2; V3 |
-| Bloom Filters & Puffin | F | F | All SQE data-file write paths (coordinator CTAS, streaming INSERT, MERGE, rewrite_data_files) build WriterProperties through the shared parq | V3 tables accept the bloom-filter property at CREATE TIME, the property survives the round-trip through Polaris, and SHOW CREATE TABLE re-em |
+| Write (MERGE/UPDATE/DELETE) | F | F | DELETE, UPDATE and MERGE INTO in copy-on-write or merge-on-read mode. | DELETE (CoW, and MoR via deletion vectors), UPDATE (CoW and MoR equality) and MERGE INTO commit on V3 tables; each path has a V3 e2e test. |
+| Catalog Integration | F | F | Iceberg REST (Polaris primary; Nessie, Glue / S3 Tables REST, Unity), native Glue and S3 Tables SDKs, HMS, JDBC and a read-only Hadoop backe | V3 tables created by SQE materialise correctly in the Iceberg REST catalog: CREATE/INSERT/UPDATE/DELETE all commit, table metadata reloads c |
+| Statistics (Column Metrics) | F | F | Manifest column metrics drive pruning and planning; writers emit them; optional Puffin NDV sidecars are written and consumed (query.puffin_s | SHOW STATS FOR works on V3 tables, returning per-column metrics from the active snapshot. Same DataFusion + iceberg-rust scan path as V2; V3 |
+| Bloom Filters & Puffin | F | F | Every data-file write path builds WriterProperties through build_writer_props, which emits Parquet bloom filters; the footer test re-reads t | Same writer helper as V2; the bloom property round-trips through Polaris on a V3 table. |
 
 ### Catalog support
 
 | Feature | V2 | V3 | V2 notes | V3 notes |
 |---|:---:|:---:|---|---|
-| Hive Metastore | F | F | iceberg-catalog-hms vendored from apache/iceberg-rust v0.9.0 into vendor/iceberg-rust/crates/catalog/hms/, wired behind the `hms` cargo feat | Same vendored iceberg-catalog-hms code path as V2 plus the format-version property forwarding proven on Polaris (HMS itself is format-versio |
+| Hive Metastore | - | - |  |  |
 | AWS Glue Catalog | F | F | Two parallel paths now ship: (1) iceberg-catalog-glue vendored from apache/iceberg-rust v0.9.0 (AWS SDK over the Glue API directly); (2) the | Same two parallel paths as V2: native AWS SDK via iceberg-catalog-glue, and the federated Glue Iceberg REST endpoint with SigV4 signing. Bot |
 | REST Catalog | F | F | Primary catalog type. Phase P added optional AWS SigV4 signing to the vendored `iceberg-catalog-rest` client (cargo feature `aws-sigv4`, on  | Iceberg REST catalogs accept V3 tables when SQE forwards format-version as a table property in CreateTableRequest. Verified end-to-end again |
-| Nessie | F | F | Works via iceberg-catalog-rest against Nessie's REST adapter; documented in docs/deployment.md Section 5b. | Nessie speaks Iceberg REST. Phase O brought up ghcr.io/projectnessie/nessie:0.107.5 via docker-compose.nessie.yml (the 0.76.x image line shi |
-| Polaris | F | F | Primary target catalog. | Apache Polaris 1.3.0-incubating round-trips V3 tables when SQE sets format-version in the CreateTableRequest properties map. CREATE/INSERT/S |
-| Unity Catalog | F | F | Unity Catalog OSS exposes an Iceberg REST adapter at /api/2.1/unity-catalog/iceberg/ that SQE reaches through the same iceberg-catalog-rest  | Same vendored iceberg-catalog-rest code path as V2 plus the format-version: 3 forwarding pattern proven on Polaris. Unity Catalog OSS is for |
-| Snowflake Horizon | P | P | Horizon is Polaris-based; REST wiring compatible; no live test. | Snowflake Horizon is Polaris-based; the REST surface is shared with Polaris which we verified end-to-end at format-version 3. No live test a |
-| Hadoop Catalog | P | P | Storage-only scanner walks warehouse paths for metadata/v*.metadata.json (feature `hadoop`). Read path only; writes defer to REST/HMS. | The hadoop-catalog scanner walks `metadata/v*.metadata.json`; format-version 1/2/3 are read by the same iceberg-rust deserializer. Read pari |
-| JDBC Catalog | F | F | iceberg-catalog-sql vendored from apache/iceberg-rust v0.9.0 (vendor/iceberg-rust/crates/catalog/sql/) uses sqlx::any to dispatch to SQLite/ | iceberg-catalog-sql vendored alongside the fork is format-version agnostic; the format-version: 3 property forwarding pattern proven on Pola |
+| Nessie | - | - |  |  |
+| Polaris | - | - |  |  |
+| Unity Catalog | P | P | SQE reaches Unity's Iceberg REST endpoint through the shared REST client, with the OIDC M2M provider for Databricks-hosted Unity. Only a rea | Same REST path as V2; Unity serves whatever metadata the writer produced. No V3 table read or written through Unity. |
+| Snowflake Horizon | P | P | Horizon implements the Iceberg REST API (Polaris-based); SQE's REST client speaks it. Not measured against Horizon. | Snowflake Horizon is Polaris-based; the REST surface is shared with Polaris which we verified end-to-end at format-version 3. No live test a |
+| Hadoop Catalog | - | - |  |  |
+| JDBC Catalog | - | - |  |  |
 
 ### V3 data types
 
 | Feature | V2 | V3 | V2 notes | V3 notes |
 |---|:---:|:---:|---|---|
-| Variant | n/a | . | V3-only feature | Deferred to next cycle. iceberg-rust #2188 not merged. |
-| Shredded Variant | n/a | . | V3-only feature | Deferred. Blocked on arrow-rs #9790. |
-| Geometry | n/a | . | V3-only feature | Deferred. Blocked on DataFusion UDT (#12644). |
-| Vector / Embedding | n/a | . | V3-only feature | Deferred. Iceberg V3 vector spec not finalised. |
-| Nanosecond Timestamps | n/a | F | V3-only feature | TIMESTAMP_NS(N) and TIMESTAMPTZ_NS(N) DDL route to PrimitiveType::TimestampNs/TimestamptzNs; Arrow bridge and INSERT/SELECT wiring covered b |
+| Variant | n/a | P | V3-only feature | VARIANT columns (and JSON columns on V3 tables) store Iceberg variant, unshredded. JSON text is parsed on write (invalid JSON fails the writ |
+| Shredded Variant | n/a | . | V3-only feature | SQE writes unshredded variants and cannot read shredded ones; unshred_variant in the Parquet readers is planned (#849 follow-up). |
+| Geometry | n/a | . | V3-only feature | No GEOMETRY / GEOGRAPHY type in SQE DDL or the read path. |
+| Vector / Embedding | - | - |  |  |
+| Nanosecond Timestamps | n/a | F | V3-only feature | TIMESTAMP_NS(N) / TIMESTAMPTZ_NS(N) map to Iceberg timestamp_ns / timestamptz_ns and to Arrow nanosecond timestamps; CREATE, INSERT and SELE |
 
 ### V3 advanced
 
 | Feature | V2 | V3 | V2 notes | V3 notes |
 |---|:---:|:---:|---|---|
-| Change Data Capture | n/a | F | V3-only feature | FOR INCREMENTAL BETWEEN SNAPSHOT works end-to-end on V3 tables: pre-classification strips the clause, the planner registers an IncrementalTa |
-| Lineage Tracking | n/a | . | V3-only feature | Deferred to next cycle. |
+| Change Data Capture | - | - |  |  |
+| Lineage Tracking | n/a | F | V3-only feature | Row lineage is maintained at write time on V3 tables: new rows inherit fresh _row_id from first-row-id at commit; CoW DELETE / UPDATE / MERG |
 
 ---
 
@@ -124,10 +124,19 @@ Peer scores from icebergmatrix.org as of 2026-04-29.
 
 Cells marked `partial` or `unknown` have specific gaps documented in `docs/evidence/iceberg-matrix-state.json` under `caveats`. Key ones:
 
-- **snowflake-horizon-catalog (v2)**: No live integration test.
-- **snowflake-horizon-catalog (v3)**: No live integration test against Horizon.
-- **hadoop-catalog (v2)**: Write path is race-prone on object stores without atomic rename; intentionally read-oriented.
-- **hadoop-catalog (v3)**: Read-only on V3 too; writes still defer to REST/HMS.
+- **unity-catalog (v2)**: Read-only: Unity OSS does not implement create / commit, and no Databricks-hosted write was tested.
+- **unity-catalog (v2)**: Both Unity tests are #[ignore] and annotated 'last verified: never in this tree'.
+- **unity-catalog (v3)**: Not measured on a V3 table; read-only smoke only.
+- **snowflake-horizon-catalog (v2)**: Inferred from generic Iceberg REST catalog support; not measured against Horizon.
+- **snowflake-horizon-catalog (v3)**: Inferred from generic Iceberg REST catalog support; not measured against Horizon.
+- **google-lakehouse (v2)**: Inferred from generic Iceberg REST catalog support; not measured against Google Lakehouse.
+- **google-lakehouse (v2)**: Iceberg data on GCS (gs://) through the table FileIO and Google OAuth for the REST endpoint are not verified.
+- **google-lakehouse (v3)**: Inferred from generic Iceberg REST catalog support; not measured against Google Lakehouse.
+- **google-lakehouse (v3)**: Iceberg data on GCS (gs://) through the table FileIO and Google OAuth for the REST endpoint are not verified.
+- **variant-type (v3)**: Field access goes through the variant's JSON text (json_* functions); no variant_get / typed path access yet.
+- **variant-type (v3)**: Shredded variant files (typed_value) are not covered by a test; the Spark interop test reads Spark's default unshredded output.
+- **variant-type (v3)**: Compaction of a variant table is untested.
+- **unknown-type (v3)**: Needs a live test: read a V3 table with a Spark-written VOID / unknown column.
 
 ---
 
