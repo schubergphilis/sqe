@@ -5340,6 +5340,15 @@ pub struct MaintenanceCompactionConfig {
     /// size alone would not warrant one.
     #[serde(default = "default_maintenance_delete_file_threshold")]
     pub delete_file_threshold: usize,
+    /// A file whose deleted rows are at least this share of its rows (0 < r
+    /// <= 1) is also delete-heavy. This is the trigger that works on V3
+    /// tables: a data file there carries at most one deletion vector, so the
+    /// delete-file count above never passes 1 however many rows are gone.
+    /// Counted from position deletes scoped to the one file (every deletion
+    /// vector, and V2 position delete files written for a single data file).
+    /// `0.0`, the default, turns it off.
+    #[serde(default)]
+    pub delete_ratio_threshold: f64,
     /// Rewrite strategy: `"binpack"` (default), `"sort"`, or `"zorder"`.
     #[serde(default = "default_maintenance_strategy")]
     pub strategy: String,
@@ -5351,6 +5360,7 @@ impl Default for MaintenanceCompactionConfig {
             target_file_size_bytes: default_maintenance_target_file_size_bytes(),
             min_input_files: default_maintenance_min_input_files(),
             delete_file_threshold: default_maintenance_delete_file_threshold(),
+            delete_ratio_threshold: 0.0,
             strategy: default_maintenance_strategy(),
         }
     }
@@ -5978,6 +5988,13 @@ impl SqeConfig {
     pub fn validate(&self) -> crate::error::Result<()> {
         let mut errors = Vec::new();
         self.quack_client.validate(&mut errors);
+        let ratio = self.maintenance.compaction.delete_ratio_threshold;
+        if !(0.0..=1.0).contains(&ratio) {
+            errors.push(format!(
+                "maintenance.compaction.delete_ratio_threshold must be between 0 and 1 \
+                 (0 turns it off), got {ratio}"
+            ));
+        }
         if let Err(error) = self.auth.validate_transport_providers() {
             errors.push(error);
         }
@@ -7483,6 +7500,7 @@ single_scheduler_acknowledged = false
 target_file_size_bytes = 268435456
 min_input_files = 3
 delete_file_threshold = 1
+delete_ratio_threshold = 0.3
 strategy = "sort"
 
 [maintenance.distribution]
@@ -7518,6 +7536,7 @@ partial_progress_batch = 5
         assert_eq!(compaction.target_file_size_bytes, 268_435_456);
         assert_eq!(compaction.min_input_files, 3);
         assert_eq!(compaction.delete_file_threshold, 1);
+        assert_eq!(compaction.delete_ratio_threshold, 0.3);
         assert_eq!(compaction.strategy, "sort");
 
         let dist = &cfg.maintenance.distribution;
@@ -7552,6 +7571,7 @@ partial_progress_batch = 5
         assert_eq!(c.target_file_size_bytes, 512 * 1024 * 1024);
         assert_eq!(c.min_input_files, 5);
         assert_eq!(c.delete_file_threshold, 2);
+        assert_eq!(c.delete_ratio_threshold, 0.0);
         assert_eq!(c.strategy, "binpack");
 
         let d = MaintenanceDistributionConfig::default();
@@ -8849,6 +8869,24 @@ s3_secret_key = "configured-secret"
             err.contains("auth.client_id") && err.contains("catalog.catalog_url"),
             "Expected multiple errors, got: {err}"
         );
+    }
+
+    #[test]
+    fn validate_rejects_a_delete_ratio_threshold_outside_zero_to_one() {
+        for bad in [-0.1, 1.5, f64::NAN] {
+            let mut config = valid_config();
+            config.maintenance.compaction.delete_ratio_threshold = bad;
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("delete_ratio_threshold"),
+                "{bad} must be rejected, got: {err}"
+            );
+        }
+        for good in [0.0, 0.3, 1.0] {
+            let mut config = valid_config();
+            config.maintenance.compaction.delete_ratio_threshold = good;
+            assert!(config.validate().is_ok(), "{good} must be accepted");
+        }
     }
 
     /// Regression for issue #6: distributed mode with no worker_secret used

@@ -28,9 +28,10 @@ pub use dispatch::{
 pub use progress::ProgressReporter;
 pub use rewrite::{
     collect_live_delete_files, covered_position_deletes, delete_heavy_files,
-    expected_rows_after_deletes, group_files_by_partition, is_live_delete_entry, pack_file_groups,
-    pack_file_groups_partition_aware, plan_delete_aware_read, rewrite_group, sort_group_stream,
-    DeleteAwareReadPlan, SortCtx, SortSpec,
+    delete_ratio_heavy_files, expected_rows_after_deletes, group_files_by_partition,
+    is_live_delete_entry, pack_file_groups, pack_file_groups_partition_aware,
+    plan_delete_aware_read, rewrite_group, sort_group_stream, DeleteAwareReadPlan, SortCtx,
+    SortSpec,
 };
 pub use wire::{
     sign, verify, CompactGroupFrame, CompactGroupRequest, CompactGroupResponse, S3Conn,

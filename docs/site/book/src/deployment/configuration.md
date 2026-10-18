@@ -390,6 +390,7 @@ single_scheduler_acknowledged = false       # required true for enabled=true + l
 target_file_size_bytes = 536870912   # 512 MiB
 min_input_files = 5
 delete_file_threshold = 2
+delete_ratio_threshold = 0.0      # 0 < r <= 1 rewrites files with that share of rows deleted (V3); 0 = off
 strategy = "binpack"             # "binpack" | "sort" | "zorder"
 
 [maintenance.distribution]
@@ -842,10 +843,12 @@ coordinator's config file, via `ALTER TABLE ... SET TBLPROPERTIES`:
 | `sqe.maintenance.compaction.target-file-size-bytes` | `maintenance.compaction.target_file_size_bytes` |
 | `sqe.maintenance.compaction.min-input-files` | `maintenance.compaction.min_input_files` |
 | `sqe.maintenance.compaction.delete-file-threshold` | `maintenance.compaction.delete_file_threshold` |
+| `sqe.maintenance.compaction.delete-ratio-threshold` | `maintenance.compaction.delete_ratio_threshold` |
 | `sqe.maintenance.compaction.strategy` | `maintenance.compaction.strategy` |
 
 An absent or blank property falls back to the global config value. A
-numeric override that fails to parse also falls back to the global
+numeric override that fails to parse (or, for the ratio, falls outside 0
+to 1) also falls back to the global
 value; the scheduler logs a warning naming the property and the rejected
 value rather than failing the whole tick over one bad property on one
 table. In active mode the resolved, per-table value is what both gates

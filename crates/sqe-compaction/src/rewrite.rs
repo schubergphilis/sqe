@@ -335,6 +335,63 @@ pub fn delete_heavy_files(
     out
 }
 
+/// Data file paths whose deleted-row share is at least `ratio`, keyed like
+/// [`delete_heavy_files`]. This is the V3 trigger: a table on deletion vectors
+/// holds at most one DV per data file, so a delete-file count never passes a
+/// threshold above 1 no matter how many rows are gone. The share is the
+/// deleted-row count over the data file's `record_count`.
+///
+/// Only position deletes scoped to this file (`referenced_data_file` names
+/// it) carry a row count that belongs to it alone, so only they are counted.
+/// Equality deletes, and position delete files that span several data files,
+/// say nothing about how many of this file's rows they remove, so a file
+/// whose deletes are all of those kinds never qualifies here (the count
+/// trigger still sees it). When the file has a deletion vector, the DV
+/// cardinality is the answer on its own: a DV is written merged with every
+/// earlier delete for that file, so adding older scoped position deletes on
+/// top would count rows twice. Without a DV the scoped position deletes are
+/// summed. A file whose record count is unknown or zero is skipped.
+pub fn delete_ratio_heavy_files(
+    tasks_by_path: &HashMap<String, Vec<iceberg::scan::FileScanTask>>,
+    ratio: f64,
+) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for (path, tasks) in tasks_by_path {
+        // A task split by byte range has no record count, so take any task
+        // that still carries one.
+        let Some(rows) = tasks.iter().filter_map(|t| t.record_count()).max() else {
+            continue;
+        };
+        if rows == 0 {
+            continue;
+        }
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut dv_rows: Option<u64> = None;
+        let mut scoped_rows: u64 = 0;
+        for d in tasks.iter().flat_map(|t| t.deletes().iter()) {
+            if !seen.insert(d.file_path.as_str()) {
+                continue;
+            }
+            if d.file_type != DataContentType::PositionDeletes
+                || d.referenced_data_file.as_deref() != Some(path.as_str())
+            {
+                continue;
+            }
+            let Some(n) = d.record_count else { continue };
+            if d.file_format == iceberg::spec::DataFileFormat::Puffin {
+                dv_rows = Some(dv_rows.map_or(n, |m| m.max(n)));
+            } else {
+                scoped_rows = scoped_rows.saturating_add(n);
+            }
+        }
+        let deleted = dv_rows.unwrap_or(scoped_rows);
+        if deleted > 0 && deleted as f64 / rows as f64 >= ratio {
+            out.insert(path.clone());
+        }
+    }
+    out
+}
+
 /// Group every file of a partition into a single group, one group per
 /// partition, ignoring file size. Used by the sort/z-order strategy: the whole
 /// partition must be sorted as one stream so the rolling writer can cut it into
@@ -975,5 +1032,184 @@ mod tests {
             .map(|g| g.iter().map(|f| f.file_size_in_bytes()).sum())
             .collect();
         assert!(sizes.contains(&850) && sizes.contains(&300));
+    }
+
+    /// A delete descriptor as the scan planner attaches it.
+    fn delete_desc(
+        path: &str,
+        file_type: DataContentType,
+        format: iceberg::spec::DataFileFormat,
+        referenced: Option<&str>,
+        rows: Option<u64>,
+    ) -> iceberg::scan::FileScanTaskDeleteFile {
+        iceberg::scan::FileScanTaskDeleteFile::builder()
+            .with_file_path(path.to_string())
+            .with_file_size_in_bytes(1)
+            .with_file_type(file_type)
+            .with_file_format(format)
+            .with_partition_spec_id(0)
+            .with_referenced_data_file(referenced.map(str::to_string))
+            .with_record_count(rows)
+            .build()
+    }
+
+    fn dv(path: &str, data: &str, rows: u64) -> iceberg::scan::FileScanTaskDeleteFile {
+        delete_desc(
+            path,
+            DataContentType::PositionDeletes,
+            iceberg::spec::DataFileFormat::Puffin,
+            Some(data),
+            Some(rows),
+        )
+    }
+
+    fn ratio_task(
+        data: &str,
+        rows: Option<u64>,
+        deletes: Vec<iceberg::scan::FileScanTaskDeleteFile>,
+    ) -> iceberg::scan::FileScanTask {
+        use iceberg::spec::{DataFileFormat, NestedField, PrimitiveType, Schema, Type};
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )
+                .into()])
+                .build()
+                .expect("schema"),
+        );
+        iceberg::scan::FileScanTask::builder()
+            .with_file_size_in_bytes(1)
+            .with_start(0)
+            .with_length(0)
+            .with_record_count(rows)
+            .with_data_file_path(data.to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema)
+            .with_project_field_ids(vec![1])
+            .with_deletes(deletes)
+            .with_case_sensitive(true)
+            .build()
+            .expect("scan task")
+    }
+
+    fn by_path(
+        tasks: Vec<iceberg::scan::FileScanTask>,
+    ) -> HashMap<String, Vec<iceberg::scan::FileScanTask>> {
+        let mut map: HashMap<String, Vec<iceberg::scan::FileScanTask>> = HashMap::new();
+        for t in tasks {
+            map.entry(t.data_file_path().to_string())
+                .or_default()
+                .push(t);
+        }
+        map
+    }
+
+    #[test]
+    fn ratio_flags_a_file_whose_dv_covers_the_share() {
+        let map = by_path(vec![
+            ratio_task("a", Some(100), vec![dv("a.puffin", "a", 40)]),
+            ratio_task("b", Some(100), vec![dv("b.puffin", "b", 10)]),
+            ratio_task("c", Some(100), vec![]),
+        ]);
+        let heavy = delete_ratio_heavy_files(&map, 0.3);
+        assert_eq!(heavy, HashSet::from(["a".to_string()]));
+        // The boundary is inclusive.
+        assert!(delete_ratio_heavy_files(&map, 0.4).contains("a"));
+        assert!(delete_ratio_heavy_files(&map, 0.41).is_empty());
+    }
+
+    #[test]
+    fn ratio_counts_a_delete_shared_by_split_tasks_once() {
+        // The same DV attached to two tasks of one file is one delete.
+        let map = by_path(vec![
+            ratio_task("a", Some(100), vec![dv("a.puffin", "a", 20)]),
+            ratio_task("a", None, vec![dv("a.puffin", "a", 20)]),
+        ]);
+        assert!(delete_ratio_heavy_files(&map, 0.3).is_empty());
+        assert!(delete_ratio_heavy_files(&map, 0.2).contains("a"));
+    }
+
+    #[test]
+    fn ratio_takes_the_dv_alone_over_older_scoped_position_deletes() {
+        // A DV is written merged with the file's earlier deletes, so the older
+        // scoped position delete file must not be added on top of it.
+        let older = delete_desc(
+            "a-pos.parquet",
+            DataContentType::PositionDeletes,
+            iceberg::spec::DataFileFormat::Parquet,
+            Some("a"),
+            Some(20),
+        );
+        let map = by_path(vec![ratio_task(
+            "a",
+            Some(100),
+            vec![older, dv("a.puffin", "a", 25)],
+        )]);
+        assert!(delete_ratio_heavy_files(&map, 0.3).is_empty());
+        assert!(delete_ratio_heavy_files(&map, 0.25).contains("a"));
+    }
+
+    #[test]
+    fn ratio_sums_scoped_position_deletes_without_a_dv() {
+        let pos = |p: &str, n| {
+            delete_desc(
+                p,
+                DataContentType::PositionDeletes,
+                iceberg::spec::DataFileFormat::Parquet,
+                Some("a"),
+                Some(n),
+            )
+        };
+        let map = by_path(vec![ratio_task(
+            "a",
+            Some(100),
+            vec![pos("p1", 20), pos("p2", 15)],
+        )]);
+        assert!(delete_ratio_heavy_files(&map, 0.35).contains("a"));
+        assert!(delete_ratio_heavy_files(&map, 0.36).is_empty());
+    }
+
+    #[test]
+    fn ratio_ignores_deletes_that_do_not_belong_to_the_file_alone() {
+        let equality = delete_desc(
+            "eq.parquet",
+            DataContentType::EqualityDeletes,
+            iceberg::spec::DataFileFormat::Parquet,
+            None,
+            Some(90),
+        );
+        let unscoped = delete_desc(
+            "pos-many.parquet",
+            DataContentType::PositionDeletes,
+            iceberg::spec::DataFileFormat::Parquet,
+            None,
+            Some(90),
+        );
+        let other_file = dv("b.puffin", "b", 90);
+        let no_count = delete_desc(
+            "a.puffin",
+            DataContentType::PositionDeletes,
+            iceberg::spec::DataFileFormat::Puffin,
+            Some("a"),
+            None,
+        );
+        let map = by_path(vec![ratio_task(
+            "a",
+            Some(100),
+            vec![equality, unscoped, other_file, no_count],
+        )]);
+        assert!(delete_ratio_heavy_files(&map, 0.01).is_empty());
+    }
+
+    #[test]
+    fn ratio_skips_files_with_unknown_or_zero_rows() {
+        let map = by_path(vec![
+            ratio_task("a", None, vec![dv("a.puffin", "a", 50)]),
+            ratio_task("b", Some(0), vec![dv("b.puffin", "b", 50)]),
+        ]);
+        assert!(delete_ratio_heavy_files(&map, 0.01).is_empty());
     }
 }

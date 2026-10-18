@@ -58,7 +58,9 @@ pub struct TableHealth {
     /// Number of live delete files (position + equality).
     pub delete_files: u64,
     /// Number of data files with at least `delete_file_threshold` distinct
-    /// delete files applying to them.
+    /// delete files applying to them, or a deleted-row share of at least
+    /// `delete_ratio_threshold` (the V3 signal: one deletion vector per data
+    /// file never reaches a count threshold above 1).
     pub delete_heavy_files: u64,
     /// Number of pure bin-pack groups meeting `min_input_files`
     /// (`group.len() >= min_input_files`, no forced inclusions). This is the
@@ -122,13 +124,13 @@ pub fn analyze_table_health(
     sizes.sort_unstable();
     let p50_file_bytes = sizes.get(sizes.len() / 2).copied().unwrap_or(0);
 
-    // Mirrors the guard in `rewrite_data_files_once`: a threshold of 0 means
-    // the delete-heavy override is off, not "every file qualifies".
-    let delete_heavy: HashSet<String> = if cfg.delete_file_threshold > 0 {
-        crate::maintenance::delete_heavy_files(tasks_by_path, cfg.delete_file_threshold)
-    } else {
-        HashSet::new()
-    };
+    // The same helper `rewrite_data_files_once` uses, so a threshold of 0 means
+    // that trigger is off, not "every file qualifies".
+    let delete_heavy: HashSet<String> = crate::maintenance::delete_triggered_files(
+        tasks_by_path,
+        Some(cfg.delete_file_threshold),
+        Some(cfg.delete_ratio_threshold),
+    );
 
     let no_force: HashSet<String> = HashSet::new();
     let groups = crate::maintenance::pack_file_groups_partition_aware(data, target, &no_force);
@@ -213,6 +215,7 @@ mod tests {
             target_file_size_bytes: target_bytes,
             min_input_files,
             delete_file_threshold,
+            delete_ratio_threshold: 0.0,
             strategy: "binpack".to_string(),
         }
     }
@@ -395,6 +398,53 @@ mod tests {
         let health =
             analyze_table_health(&files, &[], &tasks, &cfg(1000, 5, 0), &HashMap::new(), None);
         assert_eq!(health.delete_heavy_files, 0);
+    }
+
+    /// A V3 table: one deletion vector per data file, so the count trigger
+    /// (threshold 2) never fires, and the row-share trigger is what reports
+    /// the file whose DV covers 40 of its 100 rows.
+    #[test]
+    fn delete_heavy_files_counts_the_deleted_row_share() {
+        let with_dv = |data: &str, deleted: u64| {
+            let dv = FileScanTaskDeleteFile::builder()
+                .with_file_path(format!("{data}.puffin"))
+                .with_file_size_in_bytes(1)
+                .with_file_type(DataContentType::PositionDeletes)
+                .with_file_format(DataFileFormat::Puffin)
+                .with_partition_spec_id(0)
+                .with_referenced_data_file(Some(data.to_string()))
+                .with_record_count(Some(deleted))
+                .build();
+            FileScanTask::builder()
+                .with_file_size_in_bytes(1)
+                .with_start(0)
+                .with_length(0)
+                .with_record_count(Some(100))
+                .with_data_file_path(data.to_string())
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(minimal_schema())
+                .with_project_field_ids(vec![1])
+                .with_deletes(vec![dv])
+                .with_case_sensitive(true)
+                .build()
+                .expect("scan task")
+        };
+        let tasks = tasks_by_path(vec![with_dv("heavy", 40), with_dv("light", 10)]);
+        let files = vec![
+            data_file_of_size("heavy", 100),
+            data_file_of_size("light", 100),
+        ];
+        let off =
+            analyze_table_health(&files, &[], &tasks, &cfg(1000, 5, 2), &HashMap::new(), None);
+        assert_eq!(
+            off.delete_heavy_files, 0,
+            "the count alone never fires on V3"
+        );
+
+        let mut on = cfg(1000, 5, 2);
+        on.delete_ratio_threshold = 0.3;
+        let health = analyze_table_health(&files, &[], &tasks, &on, &HashMap::new(), None);
+        assert_eq!(health.delete_heavy_files, 1);
     }
 
     #[test]
