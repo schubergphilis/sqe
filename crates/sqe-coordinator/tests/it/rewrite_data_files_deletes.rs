@@ -335,6 +335,90 @@ async fn rewrite_delete_file_threshold_triggers_on_delete_heavy_file() {
     let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {table}")).await;
 }
 
+/// `delete_ratio_threshold`, the V3 trigger: a data file carries one deletion
+/// vector however many rows are gone, so the delete-file count never passes 1
+/// and the deleted-row share (DV cardinality over the file's row count) is the
+/// signal. Half of a single file's rows deleted: a 0.9 ratio leaves it alone, a
+/// 0.3 ratio rewrites it, and a second 0.3 pass skips because the rewrite shed
+/// the DV.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn rewrite_delete_ratio_threshold_triggers_on_v3_deletion_vector() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let namespace = "default";
+    let table_name = "rewrite_delete_ratio_v3";
+    let table = format!("{namespace}.{table_name}");
+
+    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {table}")).await;
+    exec(
+        &handler,
+        &session,
+        &format!(
+            "CREATE TABLE {table} (id BIGINT) \
+             TBLPROPERTIES ('write.delete.mode' = 'merge-on-read', 'format-version' = '3')"
+        ),
+    )
+    .await;
+    let values: Vec<String> = (0..10).map(|i| format!("({i})")).collect();
+    exec(
+        &handler,
+        &session,
+        &format!("INSERT INTO {table} VALUES {}", values.join(", ")),
+    )
+    .await;
+    assert_eq!(
+        live_data_file_count(&handler, &session, namespace, table_name).await,
+        1,
+        "setup: expected a single data file"
+    );
+    exec(
+        &handler,
+        &session,
+        &format!("DELETE FROM {table} WHERE id < 5"),
+    )
+    .await;
+    assert_eq!(count_rows(&handler, &session, &table).await, 5);
+
+    let call = |ratio: &str| {
+        format!(
+            "CALL system.rewrite_data_files(table => '{table}', min_input_files => 100, \
+             delete_ratio_threshold => {ratio})"
+        )
+    };
+
+    // Half the rows are deleted: below a 0.9 share, so the single file is
+    // still under min_input_files and skips.
+    let below = exec(&handler, &session, &call("0.9")).await;
+    assert!(
+        status_of(&below).contains("skipped"),
+        "a 50% deleted file must not reach a 0.9 ratio; got '{}'",
+        status_of(&below)
+    );
+
+    let ran = exec(&handler, &session, &call("0.3")).await;
+    assert!(
+        !status_of(&ran).contains("skipped"),
+        "a 50% deleted file must reach a 0.3 ratio and be rewritten; got '{}'",
+        status_of(&ran)
+    );
+    assert_eq!(
+        count_rows(&handler, &session, &table).await,
+        5,
+        "rewrite must apply the deletion vector, not resurrect rows"
+    );
+
+    // The rewrite applied the DV and dropped it, so nothing is deleted any
+    // more and the same ratio now skips.
+    let again = exec(&handler, &session, &call("0.3")).await;
+    assert!(
+        status_of(&again).contains("skipped"),
+        "after compaction the deletion vector is gone, so a second ratio pass must skip; got '{}'",
+        status_of(&again)
+    );
+
+    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {table}")).await;
+}
+
 /// Equality-delete path (the one the sequence-number pin exists for). A MoR
 /// UPDATE produces an equality delete plus a new data file; the rewrite must
 /// apply the equality delete (drop the stale row), keep the updated row, and

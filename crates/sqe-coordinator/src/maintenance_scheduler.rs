@@ -1008,9 +1008,10 @@ impl MaintenanceScheduler {
                 }
             };
 
-        // Resolve per-table overrides BEFORE computing health: three of the
-        // four overridable knobs (target_file_size_bytes, min_input_files,
-        // delete_file_threshold) directly determine eligibility. Computing
+        // Resolve per-table overrides BEFORE computing health: four of the
+        // five overridable knobs (target_file_size_bytes, min_input_files,
+        // delete_file_threshold, delete_ratio_threshold) directly determine
+        // eligibility. Computing
         // health from the GLOBAL config while the rewrite below uses the
         // per-table-resolved `params` would let a table that LOOSENS an
         // override (e.g. a lower `min-input-files`) get skipped by a gate
@@ -1021,6 +1022,7 @@ impl MaintenanceScheduler {
             target_file_size_bytes: params.target_file_size_bytes,
             min_input_files: params.min_input_files,
             delete_file_threshold: params.delete_file_threshold,
+            delete_ratio_threshold: params.delete_ratio_threshold,
             strategy: params.strategy.clone(),
         };
 
@@ -1308,6 +1310,7 @@ impl MaintenanceScheduler {
                 strategy,
                 None, // sort_order: not part of the Phase 4b per-table override surface.
                 Some(params.delete_file_threshold),
+                Some(params.delete_ratio_threshold),
                 false, // rewrite_all: not part of the Phase 4b per-table override surface; the scheduler never forces a full-table rewrite.
                 Some(snapshot_properties),
             )),
@@ -1321,6 +1324,7 @@ impl MaintenanceScheduler {
                     strategy,
                     None, // sort_order: not part of the Phase 4b per-table override surface.
                     Some(params.delete_file_threshold),
+                    Some(params.delete_ratio_threshold),
                     false, // rewrite_all: not part of the Phase 4b per-table override surface; the scheduler never forces a full-table rewrite.
                     Some(snapshot_properties),
                 ))
@@ -2088,11 +2092,12 @@ fn table_ref_from_ident(ident: &TableIdent) -> sqe_core::Result<TableRef> {
 /// overrides. Mirrors `MaintenanceCompactionConfig`'s shape (this is the
 /// per-table-resolved form of that global config), not `RewriteOutcome`
 /// (which is `rewrite_data_files`'s per-run RESULT, not its input params).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CompactionParams {
     pub target_file_size_bytes: u64,
     pub min_input_files: usize,
     pub delete_file_threshold: usize,
+    pub delete_ratio_threshold: f64,
     pub strategy: String,
 }
 
@@ -2104,6 +2109,9 @@ pub const COMPACTION_MIN_INPUT_FILES_PROPERTY: &str = "sqe.maintenance.compactio
 /// Table property that overrides `[maintenance.compaction].delete_file_threshold`.
 pub const COMPACTION_DELETE_FILE_THRESHOLD_PROPERTY: &str =
     "sqe.maintenance.compaction.delete-file-threshold";
+/// Table property that overrides `[maintenance.compaction].delete_ratio_threshold`.
+pub const COMPACTION_DELETE_RATIO_THRESHOLD_PROPERTY: &str =
+    "sqe.maintenance.compaction.delete-ratio-threshold";
 /// Table property that overrides `[maintenance.compaction].strategy`.
 pub const COMPACTION_STRATEGY_PROPERTY: &str = "sqe.maintenance.compaction.strategy";
 /// Table property that overrides `[maintenance.scheduler].schedule` (the
@@ -2156,6 +2164,11 @@ pub fn resolve_compaction_params(
             COMPACTION_DELETE_FILE_THRESHOLD_PROPERTY,
             cfg.delete_file_threshold,
         ),
+        delete_ratio_threshold: resolve_ratio_override(
+            table_props,
+            COMPACTION_DELETE_RATIO_THRESHOLD_PROPERTY,
+            cfg.delete_ratio_threshold,
+        ),
         strategy: table_props
             .get(COMPACTION_STRATEGY_PROPERTY)
             .map(|v| v.trim())
@@ -2192,6 +2205,26 @@ fn resolve_usize_override(
         Some(raw) => match raw.parse::<usize>() {
             Ok(v) => v,
             Err(_) => {
+                warn!(
+                    property = key,
+                    value = %raw,
+                    "resolve_compaction_params: malformed override, falling back to global config"
+                );
+                default
+            }
+        },
+    }
+}
+
+/// A share override in `[0, 1]`; `0` turns the trigger off for the table. A
+/// value that does not parse, or falls outside that range, is malformed and
+/// falls back to the global value like the integer overrides.
+fn resolve_ratio_override(table_props: &HashMap<String, String>, key: &str, default: f64) -> f64 {
+    match table_props.get(key) {
+        None => default,
+        Some(raw) => match raw.trim().parse::<f64>() {
+            Ok(v) if (0.0..=1.0).contains(&v) => v,
+            _ => {
                 warn!(
                     property = key,
                     value = %raw,
@@ -2397,6 +2430,7 @@ mod tests {
             target_file_size_bytes: 512 * 1024 * 1024,
             min_input_files: 5,
             delete_file_threshold: 2,
+            delete_ratio_threshold: 0.0,
             strategy: "binpack".to_string(),
         }
     }
@@ -2450,6 +2484,32 @@ mod tests {
     }
 
     #[test]
+    fn resolve_compaction_params_per_table_override_wins_delete_ratio_threshold() {
+        let cfg = default_compaction_cfg();
+        let mut props = HashMap::new();
+        props.insert(
+            COMPACTION_DELETE_RATIO_THRESHOLD_PROPERTY.to_string(),
+            "0.3".to_string(),
+        );
+        assert_eq!(
+            resolve_compaction_params(&cfg, &props).delete_ratio_threshold,
+            0.3
+        );
+        // Out of range or unparsable falls back to the global value.
+        for bad in ["1.5", "-0.1", "NaN", "lots"] {
+            props.insert(
+                COMPACTION_DELETE_RATIO_THRESHOLD_PROPERTY.to_string(),
+                bad.to_string(),
+            );
+            assert_eq!(
+                resolve_compaction_params(&cfg, &props).delete_ratio_threshold,
+                cfg.delete_ratio_threshold,
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
     fn resolve_compaction_params_per_table_override_wins_strategy() {
         let cfg = default_compaction_cfg();
         let mut props = HashMap::new();
@@ -2485,6 +2545,7 @@ mod tests {
                 target_file_size_bytes: 2048,
                 min_input_files: 7,
                 delete_file_threshold: 4,
+                delete_ratio_threshold: 0.0,
                 strategy: "zorder".to_string(),
             }
         );
