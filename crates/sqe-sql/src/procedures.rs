@@ -12,6 +12,7 @@
 //! - `system.rewrite_data_files(table => 'ns.t'[, target_file_size_bytes => N,
 //!   min_input_files => N, max_concurrent_file_group_rewrites => N,
 //!   strategy => 'binpack'|'sort', sort_order => '...', delete_file_threshold => N,
+//!   delete_ratio_threshold => R,
 //!   distributed => 'auto'|'local'|'require', rewrite_all => true])`
 //! - `system.expire_snapshots(table => 'ns.t'[, older_than => TIMESTAMP,
 //!   retain_last => N])`
@@ -42,8 +43,9 @@ use sqlparser::ast::{
 
 use sqe_core::{SqeError, SqeErrorCode};
 
-/// A parsed `CALL system.<proc>(...)` invocation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A parsed `CALL system.<proc>(...)` invocation. `PartialEq` only:
+/// `delete_ratio_threshold` is an `f64`.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ProcedureCall {
     /// Compact small data files via vendored `RewriteFilesAction`.
     RewriteDataFiles {
@@ -71,6 +73,14 @@ pub enum ProcedureCall {
         /// broadly. Off (`None`) by default. No-op under `strategy => 'sort'`,
         /// which already rewrites the whole partition.
         delete_file_threshold: Option<usize>,
+        /// Also rewrite any data file whose deleted rows are at least this share
+        /// of its rows, `0 < r <= 1`. The trigger for V3 tables, where a data
+        /// file carries at most one deletion vector and so never reaches a
+        /// delete-file count above 1. Counts position deletes scoped to the one
+        /// file (every deletion vector, and V2 position delete files written for
+        /// a single data file); equality deletes do not count. Off (`None`) by
+        /// default. No-op under `strategy => 'sort'`, like the count.
+        delete_ratio_threshold: Option<f64>,
         /// Per-call override of `[maintenance.distribution] mode` (Phase 4c
         /// Task 5): `'auto'`, `'local'`, or `'require'` (case-insensitive).
         /// `None` (default) means "use the configured `distribution.mode`".
@@ -771,6 +781,31 @@ fn expect_usize(expr: &Expr, field: &str) -> sqe_core::Result<usize> {
     })
 }
 
+/// Parse a share in `(0, 1]`, such as `0.3`. `0` is refused rather than
+/// read as "off": leaving the argument out already means off, and a caller
+/// who writes a ratio means to turn the trigger on.
+fn expect_ratio(expr: &Expr, field: &str) -> sqe_core::Result<f64> {
+    let raw = match expr {
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(n, _),
+            ..
+        }) => n.clone(),
+        other => {
+            return Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("Expected a number between 0 and 1 for '{field}', got: {other}"),
+            ))
+        }
+    };
+    match raw.parse::<f64>() {
+        Ok(v) if v > 0.0 && v <= 1.0 => Ok(v),
+        _ => Err(SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!("'{field}' must be greater than 0 and at most 1, got: {raw}"),
+        )),
+    }
+}
+
 fn expect_timestamp(expr: &Expr, field: &str) -> sqe_core::Result<DateTime<Utc>> {
     let s = match expr {
         Expr::Value(ValueWithSpan {
@@ -822,6 +857,9 @@ fn parse_rewrite_data_files(mut args: Vec<(String, Expr)>) -> sqe_core::Result<P
     let delete_file_threshold = take_option(&mut args, "delete_file_threshold", |e| {
         expect_usize(e, "delete_file_threshold")
     })?;
+    let delete_ratio_threshold = take_option(&mut args, "delete_ratio_threshold", |e| {
+        expect_ratio(e, "delete_ratio_threshold")
+    })?;
     let distributed = take_option(&mut args, "distributed", |e| {
         expect_string(e, "distributed")
     })?;
@@ -836,6 +874,7 @@ fn parse_rewrite_data_files(mut args: Vec<(String, Expr)>) -> sqe_core::Result<P
         strategy,
         sort_order,
         delete_file_threshold,
+        delete_ratio_threshold,
         distributed,
         rewrite_all,
     })
@@ -980,6 +1019,7 @@ mod tests {
                 strategy,
                 sort_order,
                 delete_file_threshold,
+                delete_ratio_threshold,
                 distributed,
                 rewrite_all,
             } => {
@@ -991,6 +1031,7 @@ mod tests {
                 assert!(strategy.is_none());
                 assert!(sort_order.is_none());
                 assert!(delete_file_threshold.is_none());
+                assert!(delete_ratio_threshold.is_none());
                 assert!(distributed.is_none());
                 assert!(rewrite_all.is_none());
             }
@@ -1045,6 +1086,41 @@ mod tests {
                 assert_eq!(delete_file_threshold, Some(3));
             }
             other => panic!("Expected RewriteDataFiles, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_rewrite_data_files_delete_ratio_threshold() {
+        for (arg, want) in [("0.3", 0.3), ("1", 1.0), ("1.0", 1.0)] {
+            let stmt = parse_first(&format!(
+                "CALL system.rewrite_data_files(table => 'ns.t', delete_ratio_threshold => {arg})"
+            ));
+            match try_parse_call(&stmt).unwrap().expect("match") {
+                ProcedureCall::RewriteDataFiles {
+                    delete_ratio_threshold,
+                    ..
+                } => assert_eq!(delete_ratio_threshold, Some(want), "{arg}"),
+                other => panic!("Expected RewriteDataFiles, got {other:?}"),
+            }
+        }
+        let stmt = parse_first("CALL system.rewrite_data_files(table => 'ns.t')");
+        match try_parse_call(&stmt).unwrap().expect("match") {
+            ProcedureCall::RewriteDataFiles {
+                delete_ratio_threshold,
+                ..
+            } => assert_eq!(delete_ratio_threshold, None),
+            other => panic!("Expected RewriteDataFiles, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_a_delete_ratio_threshold_outside_zero_to_one() {
+        for arg in ["0", "1.5", "-0.3", "'0.3'"] {
+            let stmt = parse_first(&format!(
+                "CALL system.rewrite_data_files(table => 'ns.t', delete_ratio_threshold => {arg})"
+            ));
+            let msg = try_parse_call(&stmt).unwrap_err().to_string();
+            assert!(msg.contains("delete_ratio_threshold"), "{arg}: {msg}");
         }
     }
 

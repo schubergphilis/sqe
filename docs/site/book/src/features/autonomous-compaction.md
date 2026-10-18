@@ -50,6 +50,14 @@ files regardless of strategy:
   has at most one deletion vector, so a threshold above 1 counts only
   equality deletes (see
   [Procedures](../sql-reference/procedures.md)).
+- **`delete_ratio_threshold => R`**. Rewrites any data file whose deleted
+  rows are at least share R of its rows (0 < R <= 1), counted from its
+  deletion vector or from V2 position delete files written for that one
+  file. This is the delete trigger for format-version 3 tables. 0.3, the
+  default of Spark's `delete-ratio-threshold`, is a reasonable start. The
+  scheduler reads it from `[maintenance.compaction] delete_ratio_threshold`
+  (off by default) or from the table property
+  `sqe.maintenance.compaction.delete-ratio-threshold`.
 - **`rewrite_all => true`**. Forces a rewrite of every data file, including
   files already at or above the target size and partitions below
   `min_input_files`. It applies all deletes and re-encodes at the target

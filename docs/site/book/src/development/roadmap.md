@@ -265,6 +265,7 @@ Iceberg V3 table format support landed end-to-end. The vendored fork at `vendor/
 | Nanosecond timestamps (`TIMESTAMP_NS`, `TIMESTAMPTZ_NS`) | Done |
 | `VARIANT` columns (unshredded, JSON text in and out) | Done |
 | `JSON` stored as variant on V3 tables; `json*` functions read variants | Done |
+| Compaction trigger on the deleted-row share (`delete_ratio_threshold`), which counts deletion vectors | Done |
 | Partition evolution | Done |
 | Equality deletes + position deletes (MoR) | Done |
 

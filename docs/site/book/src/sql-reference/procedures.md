@@ -10,7 +10,7 @@ Source: `crates/sqe-sql/src/procedures.rs`. Handlers in `crates/sqe-coordinator/
 
 | Procedure | Origin | Required args | Optional args | Notes |
 |---|---|---|---|---|
-| `system.rewrite_data_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `target_file_size_bytes => N`, `min_input_files => N`, `max_concurrent_file_group_rewrites => N`, `strategy => 'binpack'\|'sort'`, `sort_order => 'col ASC, ...'\|'zorder(a, b)'`, `delete_file_threshold => N`, `distributed => 'auto'\|'local'\|'require'`, `rewrite_all => true` | Compacts small data files (delete-aware). Default target 512 MiB, min 5 files per group, max 4 concurrent groups. `strategy => 'sort'` sorts a whole partition by `sort_order` (a column list or `zorder(...)`) via a spillable DataFusion sort and rolls output at the target size, producing files with disjoint key ranges. `delete_file_threshold => N` also rewrites any data file with at least N delete files applying to it, even when it is already large. `rewrite_all => true` forces a rewrite of every file regardless of size or file count. `distributed => ...` overrides `[maintenance.distribution] mode` for this one call (see [Configuration](../deployment/configuration.md) and [Distributed compaction](../design-notes/distributed-compaction.md)); omit it to use the configured mode. A manual `CALL` commits with no extra snapshot properties; the auto-compaction scheduler (see [Maintenance (auto-compaction)](../deployment/configuration.md#maintenance-auto-compaction)) calls this same handler internally and stamps `sqe.maintenance.job-id`/`principal`/`trigger` onto the snapshot it commits, so an autonomous compaction is attributable in the table's history while a manual one is not. |
+| `system.rewrite_data_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `target_file_size_bytes => N`, `min_input_files => N`, `max_concurrent_file_group_rewrites => N`, `strategy => 'binpack'\|'sort'`, `sort_order => 'col ASC, ...'\|'zorder(a, b)'`, `delete_file_threshold => N`, `delete_ratio_threshold => R`, `distributed => 'auto'\|'local'\|'require'`, `rewrite_all => true` | Compacts small data files (delete-aware). Default target 512 MiB, min 5 files per group, max 4 concurrent groups. `strategy => 'sort'` sorts a whole partition by `sort_order` (a column list or `zorder(...)`) via a spillable DataFusion sort and rolls output at the target size, producing files with disjoint key ranges. `delete_file_threshold => N` also rewrites any data file with at least N delete files applying to it, even when it is already large. `delete_ratio_threshold => R` (0 < R <= 1) rewrites any data file whose deleted rows are at least that share of its rows, the trigger that works on format-version 3 deletion vectors. `rewrite_all => true` forces a rewrite of every file regardless of size or file count. `distributed => ...` overrides `[maintenance.distribution] mode` for this one call (see [Configuration](../deployment/configuration.md) and [Distributed compaction](../design-notes/distributed-compaction.md)); omit it to use the configured mode. A manual `CALL` commits with no extra snapshot properties; the auto-compaction scheduler (see [Maintenance (auto-compaction)](../deployment/configuration.md#maintenance-auto-compaction)) calls this same handler internally and stamps `sqe.maintenance.job-id`/`principal`/`trigger` onto the snapshot it commits, so an autonomous compaction is attributable in the table's history while a manual one is not. |
 | `system.expire_snapshots` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `older_than => TIMESTAMP`, `retain_last => N` | Drops old snapshots. `older_than` and `retain_last` combine: a snapshot must be older than `older_than` and beyond the `retain_last` window before it is removed. First drops the `sqe-txn-*` branches a crashed coordinator left behind (see [Transactions](dml.md#transactions)); the result's `detail` reports `txn_branches_dropped`. |
 | `system.remove_orphan_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `older_than => TIMESTAMP` | Deletes files under the table prefix not referenced by any live snapshot. Default `older_than` is 3 days ago, to avoid racing with in-flight writes. |
 | `system.rewrite_manifests` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | - | Consolidates many small manifest files into fewer larger ones. Speeds up planning on large tables. |
@@ -121,8 +121,30 @@ On a format-version 3 table (the default for new tables) position deletes are
 deletion vectors: each data file has at most one, and every `DELETE` replaces
 it. A threshold above 1 is therefore never reached by SQE's own deletes, however
 many rows they remove; only equality deletes from other writers still add up.
-To rewrite a delete-heavy V3 table, use `rewrite_all => true` or a threshold of
-1, which rewrites every data file that has any deletes.
+On V3, use `delete_ratio_threshold` instead. It rewrites a data file once its
+deleted rows reach that share of its rows:
+
+```sql
+CALL system.rewrite_data_files(
+    table => 'analytics.events',
+    delete_ratio_threshold => 0.3
+);
+```
+
+The share is the deletion vector's cardinality over the data file's row count,
+so a file with 3 of its 10 rows deleted qualifies at 0.3. It also counts V2
+position delete files written for a single data file. When a file has both
+kinds, only the deletion vector counts, because it already holds the older
+deletes. Equality deletes and position delete files that span several data
+files are not counted, because their row count does not say how many of this
+file's rows they remove; `delete_file_threshold` still sees them. The value must
+be greater than 0 and at most 1. 0.3 is a reasonable start; Spark's
+`delete-ratio-threshold` uses the same default. Both thresholds can be given in
+one call, and a file meeting either one is rewritten. Like the count, the ratio
+is off by default and is a no-op under `strategy => 'sort'`.
+
+`rewrite_all => true`, or a count threshold of 1, still rewrites every data
+file that has any deletes.
 
 ### Override the distribution mode for one call
 
@@ -199,7 +221,7 @@ Returns one summary row:
 Column notes:
 
 - `small_files` counts live data files below `[maintenance.compaction].target_file_size_bytes` (default 512 MiB).
-- `eligible_groups` / `est_rewrite_bytes` report pure bin-pack debt: groups that meet `min_input_files` on file count alone. `delete_heavy_files` is a separate signal, files with at least `delete_file_threshold` delete files applying to them. A later `rewrite_data_files(delete_file_threshold => N)` call rewrites the union of both sets, so treat the two counts as additive, not `eligible_groups` already including delete-heavy files.
+- `eligible_groups` / `est_rewrite_bytes` report pure bin-pack debt: groups that meet `min_input_files` on file count alone. `delete_heavy_files` is a separate signal, files with at least `delete_file_threshold` delete files applying to them, or a deleted-row share of at least `[maintenance.compaction] delete_ratio_threshold`. `table_health` reads both thresholds from `[maintenance.compaction]`, not from a CALL argument. A later `rewrite_data_files(delete_file_threshold => N)` call rewrites the union of both sets, so treat the two counts as additive, not `eligible_groups` already including delete-heavy files.
 - `last_compaction_snapshot_ms` is always `NULL`. Active-mode compactions do stamp `sqe.maintenance.job-id`/`principal`/`trigger` onto the snapshot they commit (see the `system.rewrite_data_files` note above), but `table_health` does not yet read that snapshot property back; check the table's snapshot history directly for compaction attribution until a later phase wires this column up.
 - `maintenance_enabled` reflects the `sqe.maintenance.enabled` table property, i.e. whether the advisory/active scheduler would even consider this table. It does not mean a rewrite ran: advisory mode never mutates, and active mode may still find no eligible compaction debt on a given tick.
 
