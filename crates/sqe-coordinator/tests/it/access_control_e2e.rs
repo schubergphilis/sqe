@@ -1295,6 +1295,27 @@ async fn metadata_tvfs_answer_and_withhold_tag_masked_stats() {
     );
 }
 
+/// DataFusion's built-in generator TVFs answer under Ranger. Until #847 the
+/// tag gate did not recognise their provider and refused them with "tag state
+/// unknown"; they have no table and no column tags.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn builtin_generator_tvfs_answer() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    for user in [&ctx.carol, &ctx.alice, &ctx.bob] {
+        for sql in [
+            "SELECT value FROM generate_series(0, 9)",
+            "SELECT value FROM range(0, 10)",
+        ] {
+            let rows = total_rows(&exec_ok(&ctx, user, sql).await);
+            assert_eq!(rows, 10, "{}: {sql}", user.user.username);
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn tag_row_filter_restricts_rows() {

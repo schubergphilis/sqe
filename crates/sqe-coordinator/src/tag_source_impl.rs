@@ -133,15 +133,18 @@ impl TagSource for CacheTagSource {
 /// `IncrementalTableProvider` carries the properties of the same kind of load
 /// (#844); one built without them is `NotRecognised`, never untagged. A
 /// metadata TVF's output carries no column tags (the target's are applied
-/// inside the provider), so it is known-untagged (#846). Any other provider
-/// (Hive, views) is `NotRecognised` and goes to
-/// `CacheTagSource` / `HiveTagSource`.
+/// inside the provider), so it is known-untagged (#846), and so is
+/// DataFusion's `generate_series` / `range`, which computes its rows and
+/// reads no table (#847). Any other provider (Hive, views) is
+/// `NotRecognised` and goes to `CacheTagSource` / `HiveTagSource`.
 pub(crate) fn scan_column_tags(
     provider: &dyn datafusion::catalog::TableProvider,
 ) -> sqe_policy::plan_rewriter::ScanTagState {
     use sqe_policy::plan_rewriter::ScanTagState;
 
-    if sqe_catalog::iceberg_metadata_tvf::is_metadata_table_provider(provider) {
+    if sqe_catalog::iceberg_metadata_tvf::is_metadata_table_provider(provider)
+        || is_series_generator(provider)
+    {
         return ScanTagState::Known(HashMap::new());
     }
     let any = provider as &dyn std::any::Any;
@@ -169,6 +172,15 @@ pub(crate) fn scan_column_tags(
             ScanTagState::Unknown
         }
     }
+}
+
+/// DataFusion's built-in `generate_series` and `range` table functions both
+/// return a `GenerateSeriesTable`. Matched by type so that any other
+/// unrecognised provider still fails closed.
+fn is_series_generator(provider: &dyn datafusion::catalog::TableProvider) -> bool {
+    (provider as &dyn std::any::Any)
+        .downcast_ref::<datafusion::functions_table::generate_series::GenerateSeriesTable>()
+        .is_some()
 }
 
 /// Parse the `sqe.column-tags` property from a table's property map.
@@ -808,6 +820,33 @@ mod scan_column_tags_tests {
     fn an_incremental_scan_without_properties_is_not_recognised() {
         let provider = incremental_with(None);
         assert_eq!(scan_column_tags(&provider), ScanTagState::NotRecognised);
+    }
+
+    /// The provider DataFusion builds for `name(args)` in a FROM clause.
+    fn builtin_tvf(name: &str, args: &[i64]) -> Arc<dyn datafusion::catalog::TableProvider> {
+        use datafusion::logical_expr::lit;
+        let func = datafusion::functions_table::all_default_table_functions()
+            .into_iter()
+            .find(|f| f.name() == name)
+            .unwrap();
+        let args: Vec<_> = args.iter().map(|v| lit(*v)).collect();
+        let state = datafusion::prelude::SessionContext::new().state();
+        func.create_table_provider_with_args(datafusion::catalog::TableFunctionArgs::new(
+            &args, &state,
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn generate_series_and_range_are_known_untagged() {
+        for name in ["generate_series", "range"] {
+            let provider = builtin_tvf(name, &[0, 9]);
+            assert_eq!(
+                scan_column_tags(provider.as_ref()),
+                ScanTagState::Known(HashMap::new()),
+                "{name}"
+            );
+        }
     }
 
     #[test]
