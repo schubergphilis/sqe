@@ -538,6 +538,39 @@ RUST_LOG="${RUST_LOG:-sqe=info,warn}" \
     > "$SQE_LOG_FILE" 2>&1 &
 SQE_PID=$!
 
+# ── Cleanup handler ───────────────────────────────────────────
+# Installed as soon as the coordinator runs: a failure in any later setup
+# step (Trino start, catalog attach) otherwise exits under `set -e` and
+# leaves the coordinator holding :60051 for the next run.
+cleanup() {
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  Cleaning up..."
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    kill "$SQE_PID" 2>/dev/null || true
+    # Graceful shutdown can stall on open client connections; give it 15s.
+    for _ in $(seq 1 15); do
+        kill -0 "$SQE_PID" 2>/dev/null || break
+        sleep 1
+    done
+    kill -9 "$SQE_PID" 2>/dev/null || true
+    wait "$SQE_PID" 2>/dev/null || true
+    # Preserve the coordinator log so a post-mortem is possible after a
+    # crash or OOM kill. Old /tmp files are evicted by the OS in due course,
+    # and disk cost is negligible versus the debugging value on large-scale
+    # benchmark runs.
+    if [ -f "$SQE_LOG_FILE" ]; then
+        echo "Coordinator log preserved at: $SQE_LOG_FILE"
+    fi
+    if [ -n "${TRINO_CONTAINER:-}" ]; then
+        docker stop trino-bench 2>/dev/null || true
+    fi
+    rm -f "${SQE_CONFIG_EXT:-}" "${SQE_CONFIG_HIVE:-}"
+    # Don't tear down docker -- leave it for subsequent runs
+    echo "Done."
+}
+trap cleanup EXIT
+
 # Wait for coordinator to be ready
 echo -n "Waiting for SQE coordinator (may take a while on first build)..."
 for i in $(seq 1 300); do
@@ -663,6 +696,13 @@ TRINOEOF
     docker stop trino-bench 2>/dev/null || true
     sleep 1
 
+    if lsof -nP -iTCP:"$TRINO_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo " FAILED: Trino port $TRINO_PORT is already bound. Free it or pick another:"
+        echo "   lsof -nP -iTCP:$TRINO_PORT -sTCP:LISTEN"
+        echo "   TRINO_PORT=38090 make benchmark_sf1_trino"
+        exit 1
+    fi
+
     # Pull ahead of `docker run` so image download time does not eat the
     # readiness wait below (a first-time pull once silently disabled the
     # whole comparison).
@@ -705,30 +745,6 @@ TRINOEOF
     echo " done"
     echo "  Trino ${TRINO_IMAGE} on port ${TRINO_PORT}"
 fi
-
-# ── Cleanup handler ───────────────────────────────────────────
-cleanup() {
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "  Cleaning up..."
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    kill "$SQE_PID" 2>/dev/null || true
-    wait "$SQE_PID" 2>/dev/null || true
-    # Preserve the coordinator log so a post-mortem is possible after a
-    # crash or OOM kill. Old /tmp files are evicted by the OS in due course,
-    # and disk cost is negligible versus the debugging value on large-scale
-    # benchmark runs.
-    if [ -f "$SQE_LOG_FILE" ]; then
-        echo "Coordinator log preserved at: $SQE_LOG_FILE"
-    fi
-    if [ -n "$TRINO_CONTAINER" ]; then
-        docker stop trino-bench 2>/dev/null || true
-    fi
-    rm -f "${SQE_CONFIG_EXT:-}" "${SQE_CONFIG_HIVE:-}"
-    # Don't tear down docker -- leave it for subsequent runs
-    echo "Done."
-}
-trap cleanup EXIT
 
 # ── Attach golden catalog (BENCH_DATA_SOURCE=attach) ──────────
 # ATTACH is coordinator-wide and persists for the coordinator's lifetime, so
