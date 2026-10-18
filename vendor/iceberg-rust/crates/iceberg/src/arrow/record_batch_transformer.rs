@@ -46,6 +46,36 @@ use crate::spec::{
 };
 use crate::{Error, ErrorKind, Result};
 
+/// SQE PATCH (v3-shredded-variant): variant storage a shredding writer
+/// produced: binary `metadata` plus a `typed_value` group.
+fn is_shredded_variant(data_type: &DataType) -> bool {
+    let DataType::Struct(fields) = data_type else {
+        return false;
+    };
+    fields.iter().any(|f| f.name() == "typed_value")
+        && fields.iter().any(|f| f.name() == "metadata")
+        && fields
+            .iter()
+            .all(|f| matches!(f.name().as_str(), "metadata" | "value" | "typed_value"))
+}
+
+/// SQE PATCH (v3-shredded-variant): fold a shredded variant's `typed_value`
+/// back into `value` and return it as the unshredded `target_type`. A plain
+/// struct cast would drop `typed_value` and NULL every shredded row.
+fn unshred_to(source: &dyn ArrowArray, target_type: &DataType) -> Result<ArrayRef> {
+    let to_err = |e: arrow_schema::ArrowError| {
+        Error::new(ErrorKind::DataInvalid, "Failed to unshred a variant column").with_source(e)
+    };
+    let variants = parquet::variant::VariantArray::try_new(source).map_err(to_err)?;
+    let unshredded = parquet::variant::unshred_variant(&variants).map_err(to_err)?;
+    let storage: ArrayRef = Arc::new(unshredded.into_inner());
+    if storage.data_type() == target_type {
+        Ok(storage)
+    } else {
+        Ok(cast(&storage, target_type)?)
+    }
+}
+
 /// Create an Arrow Field with PARQUET_FIELD_ID_META_KEY metadata attached.
 fn field_with_id(
     name: impl Into<String>,
@@ -957,7 +987,14 @@ impl RecordBatchTransformer {
                     ColumnSource::Promote {
                         target_type,
                         source_index,
-                    } => cast(&*columns[*source_index], target_type)?,
+                    } => {
+                        let source = &columns[*source_index];
+                        if is_shredded_variant(source.data_type()) {
+                            unshred_to(source.as_ref(), target_type)?
+                        } else {
+                            cast(&**source, target_type)?
+                        }
+                    }
 
                     ColumnSource::Add { target_type, value } => {
                         Self::create_column(target_type, value.as_ref(), num_rows)?

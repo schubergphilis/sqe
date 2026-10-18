@@ -55,6 +55,8 @@ Upstream `testdata/` is vendored in full, so `cargo test -p iceberg --lib` runs 
 | — | `RowDeltaAction` (apache PR #2203; no upstream equivalent) | `transaction/row_delta.rs` |
 | — | Puffin blob range check | `puffin/reader.rs` |
 | — | `ManifestFile::load_manifest` shim over apache's `ManifestReader` | `spec/manifest_list/manifest_file.rs` |
+| — | V3 `unknown` columns are never written to a data file (top-level projected out, nested refused) (`SQE PATCH (v3-unknown)`) | `writer/file_writer/parquet_writer.rs` |
+| — | Shredded V3 variants read: variant manifest bounds skipped, `typed_value` storage accepted and unshredded on promote (`SQE PATCH (v3-shredded-variant)`) | `spec/manifest/_serde.rs`, `arrow/reader/projection.rs`, `arrow/record_batch_transformer.rs` |
 
 Dropped because the new base already has them: the INT96, `read_with_metrics`, NaN,
 equality-delete NULL, positional-delete wakeup and run-buffering, constant-column and

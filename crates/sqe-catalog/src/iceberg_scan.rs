@@ -2481,7 +2481,36 @@ fn conform_batch_to_projection(
                             field.name()
                         ))
                     })?;
-                columns.push(Arc::clone(decoded.column(pos)));
+                let column = decoded.column(pos);
+                // A V3 `unknown` column holds only NULLs and is never written
+                // to a data file, so a promoted column is normally missing
+                // from older files. Files SQE wrote before it dropped unknown
+                // columns still decode one as Arrow `Null`; read typed NULLs.
+                if column.data_type() == &arrow::datatypes::DataType::Null
+                    && field.data_type() != &arrow::datatypes::DataType::Null
+                {
+                    columns.push(arrow::array::new_null_array(field.data_type(), rows));
+                    continue;
+                }
+                // A V3 variant a shredding writer (Spark with
+                // `write.parquet.shred-variants`) produced decodes with a
+                // `typed_value` group beside `value`; fold it back into the
+                // declared unshredded storage.
+                if column.data_type() != field.data_type()
+                    && sqe_core::variant::is_variant_storage(column.data_type())
+                    && sqe_core::variant::is_variant_storage(field.data_type())
+                {
+                    let unshredded = sqe_core::variant::unshred(column.as_ref(), field.data_type())
+                        .map_err(|e| {
+                            DataFusionError::Internal(format!(
+                                "failed to unshred variant column `{}`: {e}",
+                                field.name()
+                            ))
+                        })?;
+                    columns.push(unshredded);
+                    continue;
+                }
+                columns.push(Arc::clone(column));
             }
             None => {
                 // A file written before `ADD COLUMN ... DEFAULT` reads the

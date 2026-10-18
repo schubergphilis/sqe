@@ -131,3 +131,57 @@ async fn json_variant_column_scans_on_a_worker() {
          system.runtime.tasks gained no worker task ({before} -> {after})"
     );
 }
+
+/// A variant Spark 4.1 shredded (`write.parquet.shred-variants`) scanned on a
+/// worker: the worker folds `typed_value` back into `value` before Flight,
+/// so the shredded fields arrive intact. Also needs the Spark container.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris+workers"]
+async fn shredded_variant_column_scans_on_a_worker() {
+    use crate::common::spark_interop::{spark_sql, spark_stack_skip_reason};
+    if let Some(reason) = spark_stack_skip_reason() {
+        eprintln!("skipping shredded_variant_column_scans_on_a_worker: {reason}");
+        return;
+    }
+    let fq = "default.variant_shredded_on_worker";
+    spark_sql(&format!(
+        r#"DROP TABLE IF EXISTS rest.{fq};
+           CREATE TABLE rest.{fq} (id INT, v VARIANT) USING iceberg
+             TBLPROPERTIES ('format-version' = '3',
+                            'write.parquet.shred-variants' = 'true');
+           INSERT INTO rest.{fq} VALUES
+             (1, parse_json('{{"a": 1, "s": "x"}}')),
+             (2, parse_json('{{"a": 2, "s": "y"}}')),
+             (3, parse_json('[1, 2]')),
+             (4, NULL);"#
+    ))
+    .expect("spark writes the shredded variant table");
+
+    let workers = worker_urls();
+    let rig = crate::distributed_failure_e2e::rig(&workers, |_| {}).await;
+    let (session, handler) = (&rig.session, rig.handler.as_ref());
+    let before = worker_task_count(&workers, handler, session).await;
+    let read = rows(
+        handler,
+        session,
+        &format!("SELECT id, v, json_get_int(v, 'a') FROM {fq} ORDER BY id"),
+    )
+    .await;
+    let after = worker_task_count(&workers, handler, session).await;
+    let _ = spark_sql(&format!("DROP TABLE IF EXISTS rest.{fq}"));
+
+    assert_eq!(
+        read,
+        vec![
+            r#"1|{"a":1,"s":"x"}|1"#,
+            r#"2|{"a":2,"s":"y"}|2"#,
+            "3|[1,2]|NULL",
+            "4|NULL|NULL",
+        ]
+    );
+    assert!(
+        after > before,
+        "the scan ran on the coordinator, not a worker: \
+         system.runtime.tasks gained no worker task ({before} -> {after})"
+    );
+}

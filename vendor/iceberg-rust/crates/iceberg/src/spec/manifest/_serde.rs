@@ -246,6 +246,14 @@ fn parse_bytes_entry(v: Vec<BytesEntry>, schema: &Schema) -> Result<HashMap<i32,
             .or_else(|| metadata_columns::get_metadata_field(entry.key).ok());
 
         if let Some(field) = field {
+            // SQE PATCH (v3-shredded-variant): a writer that shreds a V3
+            // variant stores its bounds as a serialized variant keyed by
+            // field path (Iceberg 1.12). There is no primitive Datum for it;
+            // skip the bound so the manifest stays readable and pruning on
+            // the column stays conservative.
+            if field.field_type.is_variant() {
+                continue;
+            }
             let data_type = field
                 .field_type
                 .as_primitive_type()
@@ -645,6 +653,40 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.get(&1), Some(&Datum::int(42)));
+        assert!(!result.contains_key(&2));
+    }
+
+    /// SQE PATCH (v3-shredded-variant): a shredding writer's variant bound
+    /// is skipped, not an error that makes the manifest unreadable.
+    #[test]
+    fn test_parse_bytes_entry_skips_variant_bound() {
+        use crate::spec::manifest::_serde::{BytesEntry, parse_bytes_entry};
+        use crate::spec::{NestedField, PrimitiveType, Schema, Type, VariantType};
+
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(2, "v", Type::Variant(VariantType)).into(),
+            ])
+            .build()
+            .unwrap();
+        let result = parse_bytes_entry(
+            vec![
+                BytesEntry {
+                    key: 1,
+                    value: serde_bytes::ByteBuf::from(7_i32.to_le_bytes().to_vec()),
+                },
+                BytesEntry {
+                    key: 2,
+                    value: serde_bytes::ByteBuf::from(vec![0x01, 0x00, 0x00]),
+                },
+            ],
+            &schema,
+        )
+        .unwrap();
+
+        assert_eq!(result.get(&1), Some(&Datum::int(7)));
         assert!(!result.contains_key(&2));
     }
 }
