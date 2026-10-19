@@ -818,3 +818,120 @@ async fn grant_policies_need_catalog_when_scoped() {
     assert!(err.to_string().contains("catalog_scoped"), "{err}");
     assert!(server.received_requests().await.unwrap().is_empty());
 }
+
+fn drop_for(
+    table: &str,
+    grantee: &str,
+    if_exists: bool,
+) -> sqe_sql::policy_ddl::DropPrincipalPolicyStatement {
+    sqe_sql::policy_ddl::DropPrincipalPolicyStatement {
+        table: table.to_string(),
+        principal: role(grantee),
+        if_exists,
+    }
+}
+
+/// `DROP POLICY ON TABLE ... FROM ROLE r` takes r out of every mask and
+/// filter policy on exactly that table. An SQE-written policy left empty is
+/// deleted; a hand-written one is kept, empty; other tables and access
+/// policies are not touched.
+#[tokio::test]
+async fn drop_principal_policies_removes_items() {
+    let server = MockServer::start().await;
+    mock_policy_list(
+        &server,
+        serde_json::json!([
+            {"id": 7, "name": "hand-written", "policyType": 1,
+             "resources": {"database": {"values": ["sales"]}, "table": {"values": ["orders"]},
+                           "column": {"values": ["amount"]}},
+             "dataMaskPolicyItems": [{"roles": ["support"], "dataMaskInfo": {"dataMaskType": "MASK_NULL"}}]},
+            {"id": 8, "name": "sqe-grant-filter-sales.orders", "policyType": 2,
+             "resources": {"database": {"values": ["sales"]}, "table": {"values": ["orders"]}},
+             "rowFilterPolicyItems": [{"roles": ["support", "analyst"], "rowFilterInfo": {"filterExpr": "1 = 0"}}]},
+            {"id": 9, "name": "sqe-grant-mask-sales.orders.note", "policyType": 1,
+             "resources": {"database": {"values": ["sales"]}, "table": {"values": ["orders"]},
+                           "column": {"values": ["note"]}},
+             "dataMaskPolicyItems": [{"roles": ["support"], "dataMaskInfo": {"dataMaskType": "CUSTOM", "valueExpr": "'x'"}}]},
+            {"id": 10, "name": "sqe-grant-filter-sales.returns", "policyType": 2,
+             "resources": {"database": {"values": ["sales"]}, "table": {"values": ["returns"]}},
+             "rowFilterPolicyItems": [{"roles": ["support"], "rowFilterInfo": {"filterExpr": "1 = 0"}}]},
+            {"id": 11, "name": "access", "policyType": 0,
+             "resources": {"database": {"values": ["sales"]}, "table": {"values": ["orders"]}},
+             "policyItems": [{"roles": ["support"]}]}
+        ]),
+    )
+    .await;
+    for id in [7, 8] {
+        Mock::given(method("PUT"))
+            .and(path(format!("/service/public/v2/api/policy/{id}")))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("DELETE"))
+        .and(path("/service/public/v2/api/policy/9"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let store = RangerStore::from_config(&cfg(&server.uri())).unwrap();
+    let changed = store
+        .drop_principal_policies(&drop_for("c.sales.orders", "support", false))
+        .await
+        .unwrap();
+    assert_eq!(changed, 3);
+    let puts: std::collections::HashMap<String, serde_json::Value> =
+        bodies(&server, wiremock::http::Method::PUT)
+            .await
+            .into_iter()
+            .collect();
+    assert_eq!(
+        puts["/service/public/v2/api/policy/7"]["dataMaskPolicyItems"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        puts["/service/public/v2/api/policy/8"]["rowFilterPolicyItems"][0]["roles"],
+        serde_json::json!(["analyst"])
+    );
+    assert_eq!(
+        bodies(&server, wiremock::http::Method::DELETE).await.len(),
+        1
+    );
+}
+
+/// Nothing to drop is an error, unless IF EXISTS, and writes nothing.
+#[tokio::test]
+async fn drop_principal_policies_with_nothing_to_drop() {
+    let server = MockServer::start().await;
+    mock_policy_list(
+        &server,
+        serde_json::json!([
+            {"id": 8, "name": "sqe-grant-filter-sales.orders", "policyType": 2,
+             "resources": {"database": {"values": ["sales"]}, "table": {"values": ["orders"]}},
+             "rowFilterPolicyItems": [{"roles": ["analyst"], "rowFilterInfo": {"filterExpr": "1 = 0"}}]}
+        ]),
+    )
+    .await;
+    let store = RangerStore::from_config(&cfg(&server.uri())).unwrap();
+    let err = store
+        .drop_principal_policies(&drop_for("sales.orders", "support", false))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("no column mask or row filter"),
+        "{err}"
+    );
+    let changed = store
+        .drop_principal_policies(&drop_for("sales.orders", "support", true))
+        .await
+        .unwrap();
+    assert_eq!(changed, 0);
+    assert!(server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| r.method == wiremock::http::Method::GET));
+}
