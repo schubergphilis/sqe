@@ -53,13 +53,26 @@ pub struct DropPolicyStatement {
     pub if_exists: bool,
 }
 
+/// `DROP POLICY [IF EXISTS] ON TABLE <t> FROM USER|ROLE|GROUP <name>`: take
+/// one principal's column masks and row filter off one table, the items
+/// `GRANT SELECT ... MASKED WITH / ROWS WHERE` wrote. They outlive REVOKE on
+/// purpose, so this is the statement that ends them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropPrincipalPolicyStatement {
+    pub table: String,
+    pub principal: PolicyPrincipal,
+    pub if_exists: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyDdlStatement {
     Create(CreatePolicyStatement),
     Drop(DropPolicyStatement),
+    DropForPrincipal(DropPrincipalPolicyStatement),
 }
 
-/// Parse `CREATE [OR REPLACE] POLICY` and `DROP POLICY [IF EXISTS]`.
+/// Parse `CREATE [OR REPLACE] POLICY`, `DROP POLICY [IF EXISTS] <name>` and
+/// `DROP POLICY [IF EXISTS] ON TABLE <t> FROM <principal>`.
 /// Returns `Ok(None)` for unrelated SQL.
 pub fn try_parse_policy_ddl(sql: &str) -> Result<Option<PolicyDdlStatement>> {
     let sql = sql.trim().trim_end_matches(';').trim();
@@ -69,6 +82,20 @@ pub fn try_parse_policy_ddl(sql: &str) -> Result<Option<PolicyDdlStatement>> {
         } else {
             (false, rest)
         };
+        if let Some(after) = strip_prefix_ci(rest.trim_start(), "ON TABLE ") {
+            let (table, rest) = take_name(after, "table name")?;
+            let rest = expect_kw(rest, "FROM")?;
+            let (principal, tail) =
+                parse_principal_kind(rest, "expected FROM USER, FROM ROLE, or FROM GROUP")?;
+            require_empty(tail)?;
+            return Ok(Some(PolicyDdlStatement::DropForPrincipal(
+                DropPrincipalPolicyStatement {
+                    table,
+                    principal,
+                    if_exists,
+                },
+            )));
+        }
         let (name, tail) = take_name(rest, "policy name")?;
         require_empty(tail)?;
         return Ok(Some(PolicyDdlStatement::Drop(DropPolicyStatement {
@@ -176,6 +203,11 @@ fn parse_row_filter(rest: &str) -> Result<(FineGrainedPolicyKind, PolicyPrincipa
 
 fn parse_principal(rest: &str) -> Result<(PolicyPrincipal, &str)> {
     let rest = expect_kw(rest, "TO")?;
+    parse_principal_kind(rest, "expected TO USER, TO ROLE, or TO GROUP")
+}
+
+/// `USER|ROLE|GROUP <name>`, after the TO / FROM keyword.
+fn parse_principal_kind<'a>(rest: &'a str, expected: &str) -> Result<(PolicyPrincipal, &'a str)> {
     let rest = rest.trim_start();
     let (kind, rest) = if let Some(after) = strip_prefix_ci(rest, "USER ") {
         (PolicyPrincipalKind::User, after)
@@ -184,7 +216,7 @@ fn parse_principal(rest: &str) -> Result<(PolicyPrincipal, &str)> {
     } else if let Some(after) = strip_prefix_ci(rest, "GROUP ") {
         (PolicyPrincipalKind::Group, after)
     } else {
-        return syntax("expected TO USER, TO ROLE, or TO GROUP");
+        return syntax(expected);
     };
     let (name, rest) = take_name(rest, "principal name")?;
     Ok((PolicyPrincipal { kind, name }, rest))
@@ -320,6 +352,43 @@ mod tests {
                 if_exists: true
             }))
         );
+    }
+
+    #[test]
+    fn parses_drop_for_principal() {
+        assert_eq!(
+            try_parse_policy_ddl("drop policy on table ac.orders from role engineer;").unwrap(),
+            Some(PolicyDdlStatement::DropForPrincipal(
+                DropPrincipalPolicyStatement {
+                    table: "ac.orders".to_string(),
+                    principal: PolicyPrincipal {
+                        kind: PolicyPrincipalKind::Role,
+                        name: "engineer".to_string(),
+                    },
+                    if_exists: false,
+                }
+            ))
+        );
+        let Some(PolicyDdlStatement::DropForPrincipal(stmt)) =
+            try_parse_policy_ddl("DROP POLICY IF EXISTS ON TABLE c.s.t FROM USER bob").unwrap()
+        else {
+            panic!("drop for principal")
+        };
+        assert!(stmt.if_exists);
+        assert_eq!(stmt.principal.kind, PolicyPrincipalKind::User);
+        // A quoted name is still a policy name, even one spelled ON.
+        assert!(matches!(
+            try_parse_policy_ddl(r#"DROP POLICY "ON""#).unwrap(),
+            Some(PolicyDdlStatement::Drop(_))
+        ));
+        for bad in [
+            "DROP POLICY ON TABLE s.t",
+            "DROP POLICY ON TABLE s.t TO ROLE r",
+            "DROP POLICY ON TABLE s.t FROM r",
+            "DROP POLICY ON TABLE s.t FROM ROLE r extra",
+        ] {
+            assert!(try_parse_policy_ddl(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

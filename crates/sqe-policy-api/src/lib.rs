@@ -355,6 +355,19 @@ pub trait PolicyStore: Send + Sync {
         ))
     }
 
+    /// Take one principal's column masks and row filter off one table, for
+    /// `DROP POLICY ON TABLE <t> FROM <principal>`. REVOKE never does this:
+    /// the principal may still read the table through a wider grant, so only
+    /// an explicit statement lifts a mask. Returns how many policies changed.
+    async fn drop_principal_policies(
+        &self,
+        _stmt: &sqe_sql::policy_ddl::DropPrincipalPolicyStatement,
+    ) -> sqe_core::Result<usize> {
+        Err(sqe_core::SqeError::NotImplemented(
+            "DROP POLICY ON TABLE ... FROM requires [policy] engine = \"ranger\"".to_string(),
+        ))
+    }
+
     /// Invalidate any cached policy decisions so the next `resolve()` call
     /// re-reads from the backing engine.
     ///

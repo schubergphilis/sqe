@@ -1758,6 +1758,84 @@ impl RangerStore {
         )
         .await
     }
+
+    /// `DROP POLICY ON TABLE <t> FROM <principal>`: take the principal out of
+    /// the mask and row-filter policies SQE created on exactly this table
+    /// (`sqe-grant-*`), and delete one left with no items. A policy written
+    /// by hand is never edited, even when it names the principal and GRANT
+    /// added an item to it: lifting a mask a security team set in Ranger
+    /// would show real values, so that stays a Ranger edit. Policies with
+    /// wildcards or value lists are not matched at all.
+    async fn drop_principal_policies_impl(
+        &self,
+        stmt: &sqe_sql::policy_ddl::DropPrincipalPolicyStatement,
+    ) -> sqe_core::Result<usize> {
+        let (database, table) =
+            ranger_table_resource(&stmt.table, self.catalog_scoped, "DROP POLICY ON TABLE")?;
+        let mut changed = 0;
+        let mut hand_written = Vec::new();
+        for policy in self.policies_for_service(&self.service_name).await? {
+            let Some(policy_type) = policy
+                .get("policyType")
+                .and_then(serde_json::Value::as_i64)
+                .filter(|t| *t == 1 || *t == 2)
+            else {
+                continue;
+            };
+            if !resource_is_exactly(&policy, "database", &database)
+                || !resource_is_exactly(&policy, "table", &table)
+            {
+                continue;
+            }
+            let key = grant_items_key(policy_type);
+            let mut items: Vec<serde_json::Value> = policy
+                .get(key)
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if !remove_principal_from_items(&mut items, &stmt.principal) {
+                continue;
+            }
+            let name = policy
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if !name.starts_with("sqe-grant-") {
+                hand_written.push(name.to_string());
+                continue;
+            }
+            changed += 1;
+            let id = policy_id(&policy)?;
+            let path = format!("/service/public/v2/api/policy/{id}");
+            if items.is_empty() {
+                self.send_policy_ddl(reqwest::Method::DELETE, &path, None)
+                    .await?;
+            } else {
+                let mut policy = policy;
+                policy[key] = serde_json::Value::Array(items);
+                self.send_policy_ddl(reqwest::Method::PUT, &path, Some(&policy))
+                    .await?;
+            }
+        }
+        if changed == 0 && !stmt.if_exists {
+            let mut message = format!(
+                "{} has no column mask or row filter on {} written by GRANT",
+                stmt.principal.name, stmt.table
+            );
+            if !hand_written.is_empty() {
+                message.push_str(&format!(
+                    "; it is named in Ranger policies written by hand ({}), which \
+                     DROP POLICY ... FROM does not edit",
+                    hand_written.join(", ")
+                ));
+            }
+            return Err(sqe_core::SqeError::with_code(
+                sqe_core::SqeErrorCode::ExecutionFailed,
+                message,
+            ));
+        }
+        Ok(changed)
+    }
 }
 
 fn policy_id(policy: &serde_json::Value) -> sqe_core::Result<i64> {
@@ -2024,6 +2102,13 @@ impl PolicyStore for RangerStore {
         stmt: &sqe_sql::policy_ddl::DropPolicyStatement,
     ) -> sqe_core::Result<()> {
         self.drop_policy_ddl(stmt).await
+    }
+
+    async fn drop_principal_policies(
+        &self,
+        stmt: &sqe_sql::policy_ddl::DropPrincipalPolicyStatement,
+    ) -> sqe_core::Result<usize> {
+        self.drop_principal_policies_impl(stmt).await
     }
 
     async fn set_grant_policies(
