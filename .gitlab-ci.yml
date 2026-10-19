@@ -1,14 +1,30 @@
 # SQE owns product inputs and checks; reusable controls live in Aikido.
 # Routine MRs never build release binaries/images. Opt in with SQE_FORCE_IMAGE_BUILD=1.
 # Tests, dependency gates and SAST remain blocking; publishing waits on test stage.
+#
+# SQE_CI_PROFILE sizes the Rust work. "minimal" = the test gate plus the cheap
+# xtask guards; "full" adds clippy, the sqe-catalog feature matrix and the
+# hakari drift check (ci/aikido-rust-extra.sh). MRs default to minimal so the
+# shared runners carry one workspace compile per pipeline, not two. Opt in per
+# MR with the `ci::full` label (then run a new pipeline) or the pipeline
+# variable SQE_CI_PROFILE=full. Main and tags always run full.
 workflow:
   rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && ($SQE_CI_PROFILE == "full" || $CI_MERGE_REQUEST_LABELS =~ /(^|,)ci::full(,|$)/)'
+      variables:
+        SQE_CI_PROFILE: "full"
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      variables:
+        SQE_CI_PROFILE: "minimal"
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
       auto_cancel:
         on_new_commit: none
     - if: '$CI_COMMIT_TAG'
+      variables:
+        SQE_CI_PROFILE: "full"
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      variables:
+        SQE_CI_PROFILE: "full"
 
 ci-config-sanity:
   variables:
