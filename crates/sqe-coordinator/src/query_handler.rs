@@ -7128,23 +7128,10 @@ impl QueryHandler {
         let backend = self.require_grant_backend()?;
         self.require_grant_authority(session, "REVOKE", backend)?;
         let grant_stmt = Self::extract_grant_statement(stmt)?;
-        // The grantee's masks and row filter on the table go with its SELECT,
-        // but only an admin removes them: lifting a mask can widen what a user
-        // reads through another grant. A delegate's REVOKE leaves them, which
-        // only restricts. Computed before the fields move into the revoke.
-        let clear_policies = match &self.policy_store {
-            Some(store)
-                if revoke_ends_table_select(stmt)
-                    && self.config.auth.has_admin_role(&session.user.roles) =>
-            {
-                Some((
-                    store.clone(),
-                    grant_table_name(&grant_stmt)?,
-                    policy_principal(&grant_stmt.grantee),
-                ))
-            }
-            _ => None,
-        };
+        // The masks and row filter a GRANT ... MASKED WITH wrote stay: the
+        // grantee may still read the table through a wider grant (a schema
+        // grant, a group), and lifting them would show it the real values. A
+        // mask behind no SELECT does nothing.
         let revoke_stmt = RevokeStatement {
             privilege: grant_stmt.privilege,
             catalog: grant_stmt.catalog,
@@ -7161,20 +7148,6 @@ impl QueryHandler {
         backend
             .revoke(session.access_token().expose(), &revoke_stmt)
             .await?;
-        // After the revoke, never before: a revoke that failed after its masks
-        // were lifted would leave SELECT with no mask.
-        if let Some((store, table, principal)) = clear_policies {
-            if let Err(e) = store.clear_grant_policies(&table, &principal).await {
-                self.invalidate_policy_cache();
-                if let Some(cache) = &self.query_cache {
-                    cache.invalidate_all();
-                }
-                return Err(SqeError::Execution(format!(
-                    "REVOKE succeeded, but removing the grantee's masks and row \
-                     filter on {table} failed; they still apply: {e}"
-                )));
-            }
-        }
         // Flush the policy cache only after the mutation succeeds so the
         // revoked grant stops working immediately (issue #207).
         self.invalidate_policy_cache();
@@ -8652,25 +8625,6 @@ fn policy_principal(grantee: &Grantee) -> sqe_sql::policy_ddl::PolicyPrincipal {
         kind,
         name: name.clone(),
     }
-}
-
-/// Whether a REVOKE ends the grantee's SELECT on one named table, the case in
-/// which the masks and row filter that came with the grant are removed too.
-/// `REVOKE INSERT` and schema-wide revokes leave them alone.
-fn revoke_ends_table_select(stmt: &Statement) -> bool {
-    use sqlparser::ast::{Action, GrantObjects, Privileges};
-    let Statement::Revoke(r) = stmt else {
-        return false;
-    };
-    let selects = match &r.privileges {
-        Privileges::All { .. } => true,
-        Privileges::Actions(actions) => actions
-            .iter()
-            .any(|a| matches!(a, Action::Select { columns: None })),
-    };
-    selects
-        && matches!(&r.objects, Some(GrantObjects::Tables(t)) if t.len() == 1 && t[0].0.len() >= 2)
-        && r.grantees.len() == 1
 }
 
 fn is_show_roles(stmt: &Statement) -> bool {
@@ -12326,24 +12280,6 @@ warehouse = "wh1"
             ),
             "DENY must never be confused with a grant or a revoke"
         );
-    }
-
-    /// Only a REVOKE that ends SELECT on one named table lifts the grantee's
-    /// masks and row filter; `REVOKE INSERT` or a schema-wide revoke keeps them.
-    #[test]
-    fn revoke_lifts_masks_only_when_it_ends_table_select() {
-        let ends = |sql: &str| {
-            let kind = sqe_sql::parse_and_classify(sql).expect("classify");
-            super::revoke_ends_table_select(kind.statement().expect("statement"))
-        };
-        assert!(ends("REVOKE SELECT ON s.t FROM ROLE r"));
-        assert!(ends("REVOKE SELECT, INSERT ON c.s.t FROM ROLE r"));
-        assert!(ends("REVOKE ALL PRIVILEGES ON s.t FROM USER u"));
-        assert!(!ends("REVOKE INSERT ON s.t FROM ROLE r"));
-        assert!(!ends("REVOKE SELECT ON t FROM ROLE r"));
-        assert!(!ends("REVOKE SELECT ON SCHEMA s FROM ROLE r"));
-        assert!(!ends("REVOKE SELECT ON s.t, s.u FROM ROLE r"));
-        assert!(!ends("GRANT SELECT ON s.t TO ROLE r"));
     }
 
     /// A GRANT carrying masks is a privilege change for the audit gate too.
