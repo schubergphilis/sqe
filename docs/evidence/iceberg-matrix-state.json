@@ -172,18 +172,14 @@
     "sqe:branching-tagging:v2": {
       "level": "full",
       "notes": "ALTER TABLE CREATE/DROP BRANCH and TAG with retention options, SET WRITE_BRANCH routes INSERT / DELETE / UPDATE to a branch, FOR VERSION AS OF '<ref>' reads it.",
-      "evidence": "vendor/iceberg-rust/crates/iceberg/src/transaction/branch.rs, crates/sqe-sql/src/ddl.rs, crates/sqe-coordinator/tests/it/integration_test.rs::test_write_branch_routes_writes_to_the_branch",
-      "caveats": [
-        "The e2e test covers branches; tags are covered by parser tests and the shared ref code path only."
-      ]
+      "evidence": "vendor/iceberg-rust/crates/iceberg/src/transaction/branch.rs, crates/sqe-sql/src/ddl.rs, crates/sqe-coordinator/tests/it/integration_test.rs::test_write_branch_routes_writes_to_the_branch, crates/sqe-coordinator/tests/it/integration_test.rs::test_iceberg_ref_tag_create_read_drop, crates/sqe-coordinator/tests/it/integration_test.rs::test_iceberg_ref_write_branch_refuses_a_tag",
+      "caveats": []
     },
     "sqe:branching-tagging:v3": {
       "level": "full",
-      "notes": "Same transaction actions apply to V3 tables; ref semantics are format-version agnostic.",
-      "evidence": "vendor/iceberg-rust/crates/iceberg/src/transaction/branch.rs",
-      "caveats": [
-        "No V3-specific branch test; ref semantics are format-version agnostic."
-      ]
+      "notes": "Same transaction actions apply to V3 tables: on a format-version 3 table, SET WRITE_BRANCH routes INSERT / DELETE / UPDATE to a branch and FOR VERSION AS OF '<ref>' reads it.",
+      "evidence": "vendor/iceberg-rust/crates/iceberg/src/transaction/branch.rs, crates/sqe-coordinator/tests/it/integration_test.rs::test_iceberg_ref_v3_branch_write_read",
+      "caveats": []
     },
     "sqe:read-support:v2": {
       "level": "full",
