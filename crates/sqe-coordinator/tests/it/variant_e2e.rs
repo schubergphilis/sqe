@@ -184,6 +184,11 @@ async fn variant_survives_ctas_and_insert_select() {
         .await
         .expect("INSERT into the added column");
 
+    let ddl = show_create(&handler, &session, dst).await;
+    assert!(
+        ddl.contains("v VARIANT") && ddl.contains("w VARIANT"),
+        "SHOW CREATE TABLE {dst}: {ddl}"
+    );
     assert_eq!(
         rows(
             &handler,
@@ -192,13 +197,6 @@ async fn variant_survives_ctas_and_insert_select() {
         )
         .await,
         vec![r#"1|{"k":[1,2]}|NULL"#, r#"2|{"k":[1,2]}|NULL"#, "3|[]|{}",]
-    );
-    // After the SELECT: SHOW CREATE TABLE on a CTAS table lists no columns
-    // until a query has read it, variant or not (#850).
-    let ddl = show_create(&handler, &session, dst).await;
-    assert!(
-        ddl.contains("v VARIANT") && ddl.contains("w VARIANT"),
-        "SHOW CREATE TABLE {dst}: {ddl}"
     );
 
     drop(&handler, &session, src).await;

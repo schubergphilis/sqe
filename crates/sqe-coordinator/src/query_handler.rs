@@ -5565,7 +5565,7 @@ impl QueryHandler {
     /// Handle SHOW CREATE TABLE by querying information_schema and reconstructing DDL.
     async fn handle_show_create_table(
         &self,
-        _session: &Session,
+        session: &Session,
         stmt: &Statement,
         ctx: &SessionContext,
         session_catalog: &Arc<SessionCatalog>,
@@ -5585,13 +5585,27 @@ impl QueryHandler {
         // back empty for tables outside the default catalog. (#2)
         let col_sql = info_schema_columns_query(&table_name);
 
+        // `information_schema.columns` lists tables from the listing
+        // snapshots, which only the pre-plan refresh fills, and every table
+        // commit (CTAS, INSERT, ALTER) drops the namespace's snapshot. Without
+        // the refresh, SHOW CREATE TABLE straight after a CTAS listed no
+        // columns until some other query re-listed the namespace (#850).
+        self.refresh_listing_snapshots(ctx, session_catalog, session, &col_sql)
+            .await;
         let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, &col_sql)
             .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to query column metadata: {e}")))?;
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to collect column metadata: {e}")))?;
+            .map_err(|e| {
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Failed to query column metadata: {e}"),
+                )
+            })?;
+        let batches = df.collect().await.map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("Failed to collect column metadata: {e}"),
+            )
+        })?;
 
         // Reconstruct CREATE TABLE DDL
         let mut ddl = format!("CREATE TABLE {table_name} (\n");
