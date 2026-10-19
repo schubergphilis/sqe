@@ -5,6 +5,21 @@
 #
 set -e
 
+# SQE_CI_PROFILE (set in .gitlab-ci.yml `workflow:`): MRs default to
+# "minimal", main and tags to "full". Minimal keeps the cheap xtask guards and
+# skips what compiles the workspace a second time next to the test gate:
+# clippy (a check-mode rebuild of every crate), the sqe-catalog feature
+# matrix, and the from-source cargo-hakari install.
+profile="${SQE_CI_PROFILE:-full}"
+echo "== SQE_CI_PROFILE=$profile =="
+if [ "$profile" = "minimal" ]; then
+  echo "minimal: skipping clippy, the sqe-catalog feature matrix and the hakari drift check"
+  echo "(label the MR ci::full and run a new pipeline to get them)"
+  cargo xtask matrix-report --min-percent 50
+  cargo xtask test-groups --check
+  exit 0
+fi
+
 # Clippy first, advisory (it was the platform's aikido-clippy-rust job; see
 # .gitlab-ci.yml). The feature-matrix checks below then reuse its
 # check-mode dependency artifacts instead of compiling the tree again.
