@@ -19,6 +19,21 @@ Many design notes under `docs/site/book/src/design-notes/` are history, not the 
 - `docs/internal/` -- working history (specs, plans, reviews, status). Never published
 - `docs/evidence/` -- generated artifacts (benchmark charts, perf JSON)
 
+## Build loop
+
+Rebuild time here is dominated by the 24-crate workspace chain, not by rustc: an edit in `sqe-core` recompiles ~15 crates (~1.5–3 min). Keep one feature set and one target dir.
+
+```bash
+cargo check-server   # type-check sqe-server only; fastest feedback
+cargo dev            # sqe-server + sqe-cli; the same command `make dev` runs
+cargo sweep -t 2     # reclaim old artifacts when target/ grows past ~50 GB
+```
+
+- **Don't mix feature sets.** `cargo build`, `make dev` (`--no-default-features`, two binaries) and `cargo clippy --all-features` each keep a separate copy of the whole dependency graph. A 2026-10-19 inspection found 86 fingerprints for `sqe-core` and a 128 GB `target/`; alternate between them and every build is a partial cold build.
+- **`incremental = false`** in `[profile.dev]`/`[profile.test]`: measured 2× faster (`sqe-core` edit 2m50 → 1m21) and it frees ~21 GB. Use `CARGO_INCREMENTAL=1` for a one-crate loop if you want it back.
+- **sccache stays off locally** (`.cargo/config.toml`): it misses on the crates that actually change. It only pays off in CI.
+- **One builder per tree.** Concurrent cargo runs (another session, `cargo audit`, a dep bump landing) serialise on the build lock and invalidate fingerprints; a dependency refresh costs one full rebuild per session.
+
 ## Integration tests
 
 ```bash

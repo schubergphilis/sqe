@@ -51,8 +51,26 @@ rustflags = ["-C", "linker=clang", "-C", "link-arg=-fuse-ld=mold"]
 # ── Release profile additions ─────────────────────────────────────────────
 # codegen-units, lto, strip are set in the workspace Cargo.toml [profile.release].
 
+# ── Canonical dev loop ────────────────────────────────────────────────────
+# Cargo keys every artifact on the exact feature set, so `cargo build` (default
+# features), `make dev` (--no-default-features, two binaries) and
+# `cargo clippy --all-features` each keep a *separate* copy of the whole
+# dependency graph in target/. Alternating between them is the single largest
+# avoidable source of recompiles here: a 2026-10-19 inspection found 86
+# distinct fingerprints for sqe-core alone and a 128 GB target/.
+#
+# Pick one loop and stay in it:
+#   cargo dev          # == `make dev`: sqe-server + sqe-cli, no default features
+#   cargo check-server # type-check the server only, no codegen/link (~1.5 min
+#                      # for the whole chain vs ~2-3 min for a real build)
+# Do not run bare `cargo build` / `cargo test` in a tree you also build with
+# `make` — it forks a second variant of every crate.
+
 # ── xtask alias ───────────────────────────────────────────────────────────
 # `cargo xtask <subcommand>` is the convention for repo-local dev tooling.
 # See `xtask/` crate for available subcommands (e.g., `cargo xtask matrix-report`).
 [alias]
 xtask = "run --package xtask --"
+dev = "build --no-default-features --bin sqe-server --bin sqe-cli"
+dev-server = "build --no-default-features --bin sqe-server"
+check-server = "check --no-default-features --bin sqe-server"
