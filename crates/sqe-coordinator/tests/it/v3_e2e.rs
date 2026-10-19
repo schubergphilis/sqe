@@ -264,10 +264,8 @@ async fn insert_then_select_round_trips_v3_table() {
 // required because DEFAULT is a V3 spec feature.
 //
 // A row inserted after the ALTER that omits the column gets its
-// write_default (#828). A row written BEFORE the ALTER should read the
-// initial_default but reads NULL: SQE's scan NULL-fills fields missing from
-// older files without consulting initial_default (#830), so that half is
-// not asserted yet.
+// write_default (#828). A row written BEFORE the ALTER reads the
+// initial_default (#830).
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:polaris"]
@@ -418,6 +416,75 @@ async fn create_table_default_applies_on_insert_and_merge() {
     let _ = handler
         .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
         .await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Cell: sqe:column-default-values:v3
+//
+// A quoted DEFAULT on a DATE / TIMESTAMP / DECIMAL / BINARY / BIGINT column
+// is stored as a value of that type and written by INSERT and MERGE INSERT
+// (#865). It used to be stored as a string literal, which panicked the
+// metadata writer at CREATE TABLE. A value that does not parse is an error.
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn typed_defaults_apply_on_insert_merge_and_alter() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let fq = "default.v3_typed_default";
+
+    reset_table(
+        &handler,
+        &session,
+        fq,
+        &format!(
+            "CREATE TABLE {fq} (id BIGINT, d DATE DEFAULT '2024-01-02', \
+             ts TIMESTAMP DEFAULT '2024-01-02 03:04:05', \
+             amt DECIMAL(10,2) DEFAULT '1.5', whole DECIMAL(10,2) DEFAULT 2, \
+             b BINARY DEFAULT X'01ab', n BIGINT DEFAULT '5')"
+        ),
+    )
+    .await;
+
+    for sql in [
+        format!("INSERT INTO {fq} (id) VALUES (1)"),
+        format!(
+            "MERGE INTO {fq} AS t USING (SELECT 2 AS id) AS s ON t.id = s.id \
+             WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id)"
+        ),
+        format!("ALTER TABLE {fq} ADD COLUMN later DATE DEFAULT '2025-06-07'"),
+        format!("INSERT INTO {fq} (id) VALUES (3)"),
+    ] {
+        handler.execute(&session, &sql, None).await.expect(&sql);
+    }
+
+    // Rows 1 and 2 predate the ALTER and read `later`'s initial_default.
+    let defaults = "2024-01-02|2024-01-02T03:04:05|1.50|2.00|01ab|5|2025-06-07";
+    let select = format!("SELECT * FROM {fq} ORDER BY id");
+    assert_eq!(
+        rendered_rows(&handler, &session, &select).await,
+        vec![
+            format!("1|{defaults}"),
+            format!("2|{defaults}"),
+            format!("3|{defaults}"),
+        ]
+    );
+
+    let bad = "default.v3_typed_default_bad";
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {bad}"), None)
+        .await;
+    let create_bad = format!("CREATE TABLE {bad} (id BIGINT, d DATE DEFAULT 'soon')");
+    let err = handler
+        .execute(&session, &create_bad, None)
+        .await
+        .expect_err("a DEFAULT that is not a date must be refused");
+    assert!(err.to_string().contains("not a valid date"), "{err}");
+
+    for t in [fq, bad] {
+        let _ = handler
+            .execute(&session, &format!("DROP TABLE IF EXISTS {t}"), None)
+            .await;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
