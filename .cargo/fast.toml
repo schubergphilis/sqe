@@ -1,0 +1,38 @@
+# Opt-in "fast loop" overrides. Loaded only by `scripts/dev-fast.sh` via
+#
+#     cargo +nightly -Zcodegen-backend --config .cargo/fast.toml build ...
+#
+# `codegen-backend` is a nightly-only profile key. Keeping it in a separate
+# file means the workspace manifest stays free of unstable keys, so stable
+# `cargo build`, CI and the Docker build never see it.
+#
+# Measured 2026-10-19 (M3 Pro, 36 GB, DataFusion 55.2, CARGO_INCREMENTAL=0),
+# `sqe-core` edit -> sqe-server binary, warm cache:
+#
+#   stable, jobs = 8 (default)                1 m 18 s
+#   nightly + -Zthreads=8                     1 m 07 s
+#   nightly + -Zthreads=8 + cranelift         0 m 36 s   <- this file
+#
+# Cold build: 4 m 11 s -> 2 m 41 s.
+#
+# These three crates stay on LLVM:
+#   * sqe-core - `#[ctor]` in tls.rs installs the ring provider before `main`;
+#                cranelift rejects the `global_asm!` sym operands it expands to.
+#   * opendal  - same, through its `auto-register-services` feature.
+#   * ctor     - its `section$start$`/`section$end$` Mach-O symbols are not
+#                emitted by cranelift, so the final link fails without this.
+#
+# Never ship, release or benchmark a cranelift build: it is a compile-time
+# optimisation for the inner loop only.
+
+[profile.dev]
+codegen-backend = "cranelift"
+
+[profile.dev.package.sqe-core]
+codegen-backend = "llvm"
+
+[profile.dev.package.opendal]
+codegen-backend = "llvm"
+
+[profile.dev.package.ctor]
+codegen-backend = "llvm"
