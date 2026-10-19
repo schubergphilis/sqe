@@ -13,9 +13,9 @@
   "generatedAt": "2026-10-18T00:00:00Z",
   "generatedBy": "Rescore against the pinned upstream rubric; evidence paths repaired after the crate and test moves. 2026-10-18: unknown-type and shredded-variant measured against Spark 4.1 + Iceberg 1.12.",
   "score": {
-    "raw": 147,
+    "raw": 148,
     "max": 162,
-    "percent": 90.7
+    "percent": 91.4
   },
   "note": "Rescored on 2026-10-17 against upstream features.json (32 features). Only cells that apply to a version are scored, as the site shows them: position-deletes is V2-only now, so 54 cells, max 162. Removed upstream and dropped here: hive-metastore, nessie, polaris, hadoop-catalog, jdbc-catalog, vector-type, cdc-support. New: deletion-vectors, unknown-type, google-lakehouse. Gains: deletion vectors and row lineage on V3, unshredded VARIANT. Downgrade: unity-catalog to partial (read-only smoke). The old 167/189 is not comparable.",
   "support": {
@@ -345,13 +345,10 @@
       ]
     },
     "sqe:variant-type:v3": {
-      "level": "partial",
-      "notes": "VARIANT columns (and JSON columns on V3 tables) store Iceberg variant, unshredded. JSON text is parsed on write (invalid JSON fails the write), values read back as JSON text, CTAS / INSERT SELECT keep the type, and the json_* functions accept a variant. Verified on the local Polaris stack, on the worker path, and across engines with Spark 4.1 + Iceberg 1.12 in both directions (Spark reads an SQE table after a merge-on-read DELETE; SQE reads a Spark-written VARIANT table).",
-      "evidence": "crates/sqe-core/src/variant.rs, crates/sqe-coordinator/tests/it/variant_e2e.rs::variant_column_stores_json_and_reads_it_back, crates/sqe-coordinator/tests/it/variant_e2e.rs::variant_survives_ctas_and_insert_select, crates/sqe-coordinator/tests/it/variant_e2e.rs::json_column_is_a_variant_on_a_v3_table, crates/sqe-coordinator/tests/it/variant_e2e.rs::json_functions_read_a_v3_json_column, crates/sqe-coordinator/tests/it/variant_spark_interop.rs::spark_reads_an_sqe_json_variant_table, crates/sqe-coordinator/tests/it/variant_spark_interop.rs::sqe_reads_a_spark_variant_table, crates/sqe-coordinator/tests/it/variant_distributed.rs::json_variant_column_scans_on_a_worker",
-      "caveats": [
-        "Field access goes through the variant's JSON text (json_* functions); no variant_get / typed path access yet.",
-        "Compaction of a variant table is untested."
-      ]
+      "level": "full",
+      "notes": "VARIANT columns (and JSON columns on V3 tables) store Iceberg variant, unshredded. JSON text is parsed on write (invalid JSON fails the write), values read back as JSON text, CTAS / INSERT SELECT keep the type, the json_* functions accept a variant, variant_get / try_variant_get read typed fields from the binary encoding (Spark semantics), and rewrite_data_files keeps every value. Verified on the local Polaris stack, on the worker path, and across engines with Spark 4.1 + Iceberg 1.12 in both directions (Spark reads an SQE table after a merge-on-read DELETE; SQE reads a Spark-written VARIANT table).",
+      "evidence": "crates/sqe-core/src/variant.rs, crates/sqe-coordinator/tests/it/variant_e2e.rs::variant_column_stores_json_and_reads_it_back, crates/sqe-coordinator/tests/it/variant_e2e.rs::variant_survives_ctas_and_insert_select, crates/sqe-coordinator/tests/it/variant_e2e.rs::json_column_is_a_variant_on_a_v3_table, crates/sqe-coordinator/tests/it/variant_e2e.rs::json_functions_read_a_v3_json_column, crates/sqe-coordinator/tests/it/variant_spark_interop.rs::spark_reads_an_sqe_json_variant_table, crates/sqe-coordinator/tests/it/variant_spark_interop.rs::sqe_reads_a_spark_variant_table, crates/sqe-coordinator/tests/it/variant_distributed.rs::json_variant_column_scans_on_a_worker, crates/sqe-core/src/variant_get.rs, crates/sqe-coordinator/tests/it/variant_e2e.rs::variant_get_reads_typed_fields, crates/sqe-coordinator/tests/it/variant_e2e.rs::rewrite_data_files_preserves_variant_values",
+      "caveats": []
     },
     "sqe:shredded-variant:v3": {
       "level": "partial",

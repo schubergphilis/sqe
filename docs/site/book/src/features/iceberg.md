@@ -158,7 +158,7 @@ SQE runs table maintenance through `CALL system.*` procedures, each committing t
 ## V3 features verified
 
 - **TIMESTAMP_NS / TIMESTAMPTZ_NS**: V3 nanosecond timestamps round-trip end-to-end.
-- **Variant**: `VARIANT` columns store unshredded variant values written from JSON text, survive CTAS and INSERT ... SELECT, and read back as JSON text ([details](../sql-reference/ddl.md#variant)). On a V3 table a `JSON` column is a variant too, and the `json*` functions read it. Shredded files written by other engines read the same as unshredded ones; SQE writes unshredded variants and has no variant path functions yet.
+- **Variant**: `VARIANT` columns store unshredded variant values written from JSON text, survive CTAS and INSERT ... SELECT, and read back as JSON text ([details](../sql-reference/ddl.md#variant)). On a V3 table a `JSON` column is a variant too, and the `json*` functions read it. `variant_get` / `try_variant_get` read a typed field without going through JSON text, and `rewrite_data_files` keeps every value. Shredded files written by other engines read the same as unshredded ones; SQE writes unshredded variants.
 - **Column defaults**: `CREATE TABLE ... DEFAULT <literal>` applies `write_default`; `ALTER TABLE ADD COLUMN ... DEFAULT` applies `initial_default`.
 - **Deletion vectors (V3)**: MoR DELETE on a V3 table writes one deletion vector per data file, never a position-delete file. A second DELETE on the same file merges its existing deletes into a new vector and retires the old one in the same commit, so a data file never carries two. The engine refuses any commit that would add a position-delete file to a V3 table.
 - **Row lineage (V3)**: new rows get a fresh `_row_id` at commit. CoW DELETE / UPDATE / MERGE, MoR UPDATE / MERGE and `rewrite_data_files` carry `_row_id` and `_last_updated_sequence_number` into the files they write.
@@ -172,6 +172,5 @@ V3 features not available yet:
 
 - **Geometry / geography**: no iceberg-rust support, and pending DataFusion UDT [#12644](https://github.com/apache/datafusion/issues/12644).
 - **Multi-arg partition transforms**: `PARTITIONED BY` accepts single-source transforms only.
-- **Variant path functions**: no `variant_get` yet.
 
 The deferred list is tracked in `docs/evidence/iceberg-matrix-state.json` under `caveats` for each cell.
