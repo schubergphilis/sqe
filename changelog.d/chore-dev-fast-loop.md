@@ -6,7 +6,7 @@
     nightly parallel frontend (`-Zthreads=8`) and, for the workspace crates,
     the cranelift codegen backend. Measured on an M3 Pro / 36 GB (2026-10-19,
     DataFusion 55.2), warm cache, `CARGO_INCREMENTAL=0`: a `sqe-core` edit
-    takes 36s instead of 1m18s, a `sqe-coordinator` edit 20s, and a cold build
+    takes 31-36s instead of 1m18s, a `sqe-coordinator` edit 20s, and a cold build
     2m41s instead of 4m11s. `sqe-core`, `opendal` and `ctor` stay on LLVM
     because they use `#[ctor]`, which cranelift cannot compile (`asm!` sym
     operands, plus the `section$start$`/`section$end$` Mach-O symbols it does

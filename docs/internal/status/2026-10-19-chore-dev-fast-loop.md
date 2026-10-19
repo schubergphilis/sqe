@@ -11,7 +11,7 @@ Measured on an M3 Pro / 36 GB (2026-10-19, DataFusion 55.2), warm cache,
 | --- | --- | --- | --- |
 | stable, `jobs = 8` (reference) | 1m18 | - | 4m11 |
 | nightly + `-Zthreads=8` | 1m07 | - | 3m50 |
-| nightly + `-Zthreads=8` + cranelift | **36s** | **20s** | **2m41** |
+| nightly + `-Zthreads=8` + cranelift | **31-36s** | **20s** | **2m41** |
 
 `-Zthreads` alone is a 14% win, so it is not worth a separate toolchain on its
 own. Cranelift is the real one: on a per-crate basis it compiles
@@ -39,12 +39,18 @@ the inverted dev-dependency edge `sqe-core -> sqe-trino-functions`. It was
 dev-only, so no build-time change; it just stops the base crate from appearing
 to depend on a crate above it.
 
-Not pursued, with reasons recorded in the MR: the cranelift backend for
-`sqe-core` itself (needs `#[ctor]` to go away, and that is a load-bearing
-pre-main guarantee for the rustls provider), `RUSTC_BOOTSTRAP=1` on stable
+Not pursued, with reasons recorded in the MR: `RUSTC_BOOTSTRAP=1` on stable
 instead of nightly (measured 2m13 warm / 4m48 cold - much worse, the 1.99
 frontend is not the reworked one), `jobs = 4/6` (3m09 / 1m55, worse), and
 `debug = 0` for first-party crates (no gain).
+
+Cranelift for `sqe-core` itself is not a missed win either, though it looked
+like one at 18s of the 34s. With the `#[ctor]` temporarily removed so cranelift
+would accept the crate, the same edit took 48.8s against 33.7s on LLVM:
+cranelift is roughly 2x faster than LLVM at `opt-level = 0` on ordinary
+workspace crates (`sqe-coordinator` 20.7s -> 12.5s) but slower on `sqe-core`,
+which monomorphises far more DataFusion generic code. So the `tls.rs` ctor
+keeps its load-bearing pre-main guarantee and there is nothing to trade for.
 
 **NEXT:** unchanged. CI-side follow-ups still open: sccache in the CI image,
 Dockerfile layer caching, and evaluating `cargo nextest` for the test loop.
