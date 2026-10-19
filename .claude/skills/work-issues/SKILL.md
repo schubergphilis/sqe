@@ -76,11 +76,20 @@ Agent output is a lead, not a fact:
   `DROP TAG IF EXISTS t`; SQE takes `DROP TAG t IF EXISTS`). The gate catches
   this; a mismatch with a documented upstream form is itself a finding.
 
-Investigation usually finds more than the issue says. Keep each MR to one
-concern, but **fix the findings**: group them by concern into the next
-branches of this batch, confirm each one by running before fixing it, and
-work them right after the current MR. Only a finding that is too big for the
+Investigation usually finds more than the issue says. **Fix the findings**;
+a "found, not fixed" list is not a deliverable. A finding about the code the
+current MR already touches (same feature, same files) goes into that MR,
+even when the MR started as tests only. A different concern becomes the next
+branch of this batch, worked right after. Only a finding too big for the
 batch becomes a drafted follow-up issue (filed on the user's OK).
+
+Confirm each finding by running it before fixing it: a failing test, or a
+throwaway probe test that runs the variants and prints the outcomes. Wrap
+each case in `catch_unwind` so one panic does not hide the rest, and end the
+probe with a `panic!` so the gate shows its output. A probe often finds the
+issue is bigger than the read-only report said (#865: "binary defaults
+refused" was really "every quoted DEFAULT on a non-string column panics
+CREATE TABLE"). Turn the probe into the real test, then delete it.
 
 While there, grep `openspec/changes/*/tasks.md` for open tasks in the same
 area: a one-assertion task that fits the branch is worth taking.
@@ -103,6 +112,10 @@ targets main. Never branch from the current `t3/` or feature branch.
   `rustfmt` or `cargo fmt` on the file or workspace; fix your hunks by hand
   (binding the SQL to a `let` keeps calls on one line).
 - `cargo check-server` for code changes; tests build in the gate.
+- Before pushing, clippy just the crates you changed:
+  `cargo clippy -p <crate> --all-targets -- -D warnings` (seconds when warm).
+  The pre-push hook lints the whole workspace in ~3 min and a lint it
+  catches (e.g. `manual_is_multiple_of`) costs a second full run.
 
 ## 4. Gate
 
@@ -142,6 +155,8 @@ git add <path> <path> ...                       # named paths; never -a, never s
 git commit -m "<type>(<scope>): <summary> (#N)" # signing may need Touch ID; check it succeeded
 git log --format='%G? %h' -1                     # G or U = signed
 . /tmp/sqe-env.sh && git push -u origin HEAD     # pre-push runs clippy: run in background
+# clippy refused? fix, amend (the commit is not pushed yet), push again
+# don't edit .rs files while it runs: it lints the working tree
 glab mr create --source-branch <branch> --target-branch main --title "<commit subject>" \
   --description "<what, Part of/Closes #N, gate command -> result, left open, findings>"
 ```
