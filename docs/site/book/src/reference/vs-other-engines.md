@@ -19,7 +19,7 @@ Choose Trino when you need its breadth: a wide connector catalog beyond Iceberg,
 
 Choose SQE when per-user identity to the catalog and storage matters, when JVM start time and GC pauses fight your autoscaling, or when maintaining a patched Trino fork for token passthrough is a cost you want to drop. See [Why SQE](../story/why-sqe.md) for the full account of that migration, and [GRANT and REVOKE](../sql-reference/grant-revoke.md#comparison) for the security comparison.
 
-A note on performance: as of 2026-07-09, SQE is faster than Trino 481 on seven of eight benchmark suites at SF1 and six of seven at SF10, on identical Iceberg tables and S3 storage, with every query differentially validated. The exceptions are TPC-C's sub-second OLTP reads at SF1 (0.77x) and the bank suite at SF10, where spill still degrades. SSB is at parity at SF10. The full table and method are on the [benchmark page](../features/benchmarks.md#results-vs-trino-481). Looking further out, SF100 is the open frontier ([Roadmap, Phase 10](../development/roadmap.md#phase-10---performance--benchmarks-done-sf100-next)). Measure on your workload.
+A note on performance: SQE is faster than Trino 481 on all eight benchmark suites at SF1 (2026-10-10) and on six of seven at SF10 (2026-07-09), on identical Iceberg tables and S3 storage, with every query differentially validated. The exception is the bank suite at SF10, where spill degraded in the July run. SSB is at parity at SF10. The full table and method are on the [benchmark page](../features/benchmarks.md#results-vs-trino-481). Looking further out, SF100 is the open frontier ([Roadmap, Phase 10](../development/roadmap.md#phase-10---performance--benchmarks-done-sf100-next)). Measure on your workload.
 
 ## SQE vs DuckDB
 
