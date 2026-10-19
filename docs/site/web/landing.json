@@ -213,65 +213,65 @@
   "bench": [
     {
       "suite": "TPC-H (22)",
-      "sqe": "14.2s",
-      "trino": "40.8s",
-      "speedup": "2.9x",
+      "sqe": "12.6s",
+      "trino": "32.6s",
+      "speedup": "2.6x",
       "pass": "22/22",
       "win": true
     },
     {
       "suite": "SSB (13)",
-      "sqe": "5.2s",
-      "trino": "7.3s",
-      "speedup": "1.4x",
+      "sqe": "3.2s",
+      "trino": "5.5s",
+      "speedup": "1.7x",
       "pass": "13/13",
       "win": true
     },
     {
       "suite": "TPC-DS (99)",
-      "sqe": "49.3s",
-      "trino": "114.9s",
-      "speedup": "2.3x",
-      "pass": "99/99",
+      "sqe": "34.2s",
+      "trino": "95.9s",
+      "speedup": "2.8x",
+      "pass": "98/99",
       "win": true
     },
     {
       "suite": "TPC-C (8 read)",
-      "sqe": "5.6s",
-      "trino": "4.3s",
-      "speedup": "0.77x slower",
+      "sqe": "1.1s",
+      "trino": "5.3s",
+      "speedup": "4.9x",
       "pass": "8/8",
-      "win": false
+      "win": true
     },
     {
       "suite": "TPC-E (11)",
-      "sqe": "3.8s",
-      "trino": "11.6s",
-      "speedup": "3.0x",
+      "sqe": "0.7s",
+      "trino": "4.8s",
+      "speedup": "7.2x",
       "pass": "11/11",
       "win": true
     },
     {
       "suite": "TPC-BB (10)",
-      "sqe": "53.7s",
-      "trino": "480.5s",
-      "speedup": "8.9x",
+      "sqe": "25.4s",
+      "trino": "96.5s",
+      "speedup": "3.8x",
       "pass": "10/10",
       "win": true
     },
     {
       "suite": "ClickBench (43)",
-      "sqe": "3.1s",
-      "trino": "7.3s",
-      "speedup": "2.4x",
-      "pass": "40/43",
+      "sqe": "1.7s",
+      "trino": "4.8s",
+      "speedup": "2.8x",
+      "pass": "41/43",
       "win": true
     },
     {
       "suite": "Bank (8)",
-      "sqe": "10.5s",
-      "trino": "19.8s",
-      "speedup": "1.9x",
+      "sqe": "12.0s",
+      "trino": "37.7s",
+      "speedup": "3.1x",
       "pass": "8/8",
       "win": true
     }
