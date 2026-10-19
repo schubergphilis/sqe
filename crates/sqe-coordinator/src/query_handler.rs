@@ -7570,7 +7570,9 @@ impl QueryHandler {
             session,
             match stmt {
                 PolicyDdlStatement::Create(_) => "CREATE POLICY",
-                PolicyDdlStatement::Drop(_) => "DROP POLICY",
+                PolicyDdlStatement::Drop(_) | PolicyDdlStatement::DropForPrincipal(_) => {
+                    "DROP POLICY"
+                }
             },
         )?;
         let store = self.policy_store.as_ref().ok_or_else(|| {
@@ -7583,6 +7585,12 @@ impl QueryHandler {
         match stmt {
             PolicyDdlStatement::Create(create) => store.create_policy(create).await?,
             PolicyDdlStatement::Drop(drop) => store.drop_policy(drop).await?,
+            // The one way to lift what GRANT ... MASKED WITH wrote: REVOKE
+            // leaves it (see handle_revoke), so a later plain GRANT brings
+            // the same masks back until an admin drops them here.
+            PolicyDdlStatement::DropForPrincipal(drop) => {
+                store.drop_principal_policies(drop).await?;
+            }
         }
         self.invalidate_policy_cache();
         if let Some(cache) = &self.query_cache {

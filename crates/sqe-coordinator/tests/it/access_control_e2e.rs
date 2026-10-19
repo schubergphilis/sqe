@@ -4458,5 +4458,135 @@ async fn grant_masked_with_per_role_items_survive_revoke() {
         left,
         "a refused GRANT writes no policy ({err})"
     );
+
+    // A plain GRANT to a role whose items survived its REVOKE reads through
+    // them: the masks belong to (table, role), not to one grant. bob holds
+    // analyst too, and analyst's item was written last, so it comes first.
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT SELECT ON {ORDERS} TO ROLE \"engineer\""),
+    )
+    .await;
+    wait_for_ssn(
+        &ctx,
+        &ctx.bob,
+        "bob reads masked after a plain re-GRANT",
+        &["v2", "v2"],
+    )
+    .await;
+
+    // Only an admin lifts them, and only by naming the role and table.
+    let err = ctx
+        .handler
+        .execute(
+            &ctx.bob,
+            &format!("DROP POLICY ON TABLE {ORDERS} FROM ROLE \"engineer\""),
+            None,
+        )
+        .await
+        .expect_err("DROP POLICY ... FROM is admin-only");
+    assert_eq!(
+        grant_policies_on_orders(&ctx.ranger).await,
+        left,
+        "a refused DROP POLICY changes nothing ({err})"
+    );
+
+    // Dropping analyst's items takes its mask and the EU row filter: the
+    // filter policy is left empty and deleted. bob now sees all three rows
+    // under the engineer mask, which the plain re-GRANT brought back.
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("DROP POLICY ON TABLE {ORDERS} FROM ROLE \"analyst\""),
+    )
+    .await;
+    let left = grant_policies_on_orders(&ctx.ranger).await;
+    assert_eq!(left.len(), 1, "only the mask policy is left: {left:?}");
+    let values = crate::common::eventually("bob reads under the engineer mask", || async {
+        match ctx
+            .handler
+            .execute(
+                &ctx.bob,
+                &format!("SELECT ssn FROM {ORDERS} ORDER BY id"),
+                None,
+            )
+            .await
+        {
+            Ok(b) if total_rows(&b) == 3 => Ok(col_strings(&b, "ssn")),
+            Ok(b) => Err(format!("expected 3 rows, got {:?}", col_strings(&b, "ssn"))),
+            Err(e) => Err(format!("{e}")),
+        }
+    })
+    .await;
+    assert!(
+        values.iter().all(|v| v.starts_with("eng-")),
+        "engineer's mask reapplies: {values:?}"
+    );
+
+    // Dropping engineer's items empties the mask policy, so it goes too, and
+    // bob reads every row unmasked.
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("DROP POLICY ON TABLE {ORDERS} FROM ROLE \"engineer\""),
+    )
+    .await;
+    let left = grant_policies_on_orders(&ctx.ranger).await;
+    assert!(
+        left.is_empty(),
+        "emptied grant policies are deleted: {left:?}"
+    );
+    let values = crate::common::eventually("bob reads unmasked", || async {
+        match ctx
+            .handler
+            .execute(
+                &ctx.bob,
+                &format!("SELECT ssn FROM {ORDERS} ORDER BY id"),
+                None,
+            )
+            .await
+        {
+            Ok(b) if total_rows(&b) == 3 => Ok(col_strings(&b, "ssn")),
+            Ok(b) => Err(format!("expected 3 rows, got {:?}", col_strings(&b, "ssn"))),
+            Err(e) => Err(format!("{e}")),
+        }
+    })
+    .await;
+    assert!(
+        values
+            .iter()
+            .all(|v| !v.starts_with("eng-") && v != "v2" && v != "ana"),
+        "no grant mask is left: {values:?}"
+    );
+
+    // Nothing left to drop: an error, unless IF EXISTS.
+    let err = ctx
+        .handler
+        .execute(
+            &ctx.carol,
+            &format!("DROP POLICY ON TABLE {ORDERS} FROM ROLE \"analyst\""),
+            None,
+        )
+        .await
+        .expect_err("nothing to drop");
+    assert!(
+        err.to_string().contains("no column mask or row filter"),
+        "{err}"
+    );
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("DROP POLICY IF EXISTS ON TABLE {ORDERS} FROM ROLE \"analyst\""),
+    )
+    .await;
+    let _ = ctx
+        .handler
+        .execute(
+            &ctx.carol,
+            &format!("REVOKE SELECT ON {ORDERS} FROM ROLE \"engineer\""),
+            None,
+        )
+        .await;
     delete_grant_policies_on_orders(&ctx.ranger).await;
 }
