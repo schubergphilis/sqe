@@ -444,13 +444,27 @@ pub async fn target_branch(
     Ok(Some(branch))
 }
 
-/// `branch` if `table` holds it. A table without a snapshot holds no
-/// branch, so a session branch cannot be written into an empty table.
+/// `branch` if `table` holds it as a branch. A table without a snapshot
+/// holds no branch, so a session branch cannot be written into an empty
+/// table. A tag is refused: the commit would move it and rewrite its
+/// retention as a branch's.
 fn existing_write_branch(table: &Table, branch: &str) -> sqe_core::Result<String> {
+    let ident = table.identifier();
+    if let Some(reference) = table.metadata().reference_by_name(branch) {
+        if !reference.is_branch() {
+            return Err(sqe_core::SqeError::with_code(
+                sqe_core::SqeErrorCode::InvalidArguments,
+                format!(
+                    "WRITE_BRANCH '{branch}' is a tag on {ident}; tags are read-only. \
+                     Create a branch from it with ALTER TABLE {ident} CREATE BRANCH \
+                     <name> AS OF VERSION <snapshot id>"
+                ),
+            ));
+        }
+    }
     if table.metadata().snapshot_for_ref(branch).is_some() {
         return Ok(branch.to_string());
     }
-    let ident = table.identifier();
     Err(sqe_core::SqeError::with_code(
         sqe_core::SqeErrorCode::InvalidArguments,
         format!(

@@ -3995,6 +3995,46 @@ async fn test_multi_table_transaction_commit() {
     }
 }
 
+// Test: WRITE_BRANCH naming a tag is refused, and the tag still points at
+// its snapshot. A write would otherwise move the tag and turn it into a
+// branch (#865).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn test_iceberg_ref_write_branch_refuses_a_tag() {
+    let (session, handler) = crate::common::setup_handler().await;
+    txn_tables(&handler, &session, "ref_wb_tag", "ref_wb_tag_unused").await;
+    let table = "test_ns.ref_wb_tag";
+    let create_tag = format!("ALTER TABLE {table} CREATE TAG rel1");
+    handler
+        .execute(&session, &create_tag, None)
+        .await
+        .expect("CREATE TAG");
+
+    let mut on_tag = session.clone();
+    on_tag.write_branch = Some("rel1".to_string());
+    let insert = format!("INSERT INTO {table} SELECT 4 as id");
+    let err = handler
+        .execute(&on_tag, &insert, None)
+        .await
+        .expect_err("a write to a tag");
+    assert!(err.to_string().contains("is a tag"), "{err}");
+
+    let tagged = format!("{table} FOR VERSION AS OF 'rel1'");
+    assert_eq!(txn_ids(&handler, &session, &tagged).await, vec![1, 2, 3]);
+    let drop_tag = format!("ALTER TABLE {table} DROP TAG IF EXISTS rel1");
+    handler
+        .execute(&session, &drop_tag, None)
+        .await
+        .expect("DROP TAG IF EXISTS before the name; the ref is still a tag");
+
+    for t in ["ref_wb_tag", "ref_wb_tag_unused"] {
+        handler
+            .execute(&session, &format!("DROP TABLE test_ns.{t}"), None)
+            .await
+            .expect("DROP TABLE cleanup should succeed");
+    }
+}
+
 // Test: with WRITE_BRANCH set outside a transaction, INSERT, DELETE and
 // UPDATE read and write the branch and never move main (#829). main gets a
 // row the branch lacks first, so a write that read main would carry it over.
