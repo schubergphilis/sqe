@@ -2024,7 +2024,10 @@ impl QueryHandler {
                     }
                 }
 
-                StatementKind::Grant(ref stmt) => self.handle_grant(session, stmt).await,
+                StatementKind::Grant(ref stmt) => self.handle_grant(session, stmt, None).await,
+                StatementKind::GrantWithPolicy(ref g) => {
+                    self.handle_grant(session, &g.grant, Some(g)).await
+                }
                 StatementKind::Revoke(ref stmt) => self.handle_revoke(session, stmt).await,
                 StatementKind::Deny(ref stmt) => self.handle_deny(session, stmt).await,
                 StatementKind::ShowGrants(ref target) => {
@@ -3476,7 +3479,10 @@ impl QueryHandler {
             // out of SQL text downstream.
             let grant_resources = if matches!(
                 &kind,
-                StatementKind::Grant(_) | StatementKind::Revoke(_) | StatementKind::Deny(_)
+                StatementKind::Grant(_)
+                    | StatementKind::GrantWithPolicy(_)
+                    | StatementKind::Revoke(_)
+                    | StatementKind::Deny(_)
             ) {
                 kind.statement()
                     .and_then(|ast_stmt| Self::extract_grant_statement(ast_stmt).ok())
@@ -7034,10 +7040,15 @@ impl QueryHandler {
     }
 
     /// Handle GRANT by delegating to the configured grant backend.
+    ///
+    /// `policy` carries the `MASKED WITH` / `ROWS WHERE` clauses when present;
+    /// they are written to the policy store before the grant, so a grant that
+    /// then fails leaves only restrictions behind, never an unmasked SELECT.
     async fn handle_grant(
         &self,
         session: &Session,
         stmt: &Statement,
+        policy: Option<&sqe_sql::grant_policy::GrantWithPolicy>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         // Gate BEFORE the backend is asked to do anything (issue #204). In
         // production the Polaris backend swaps the caller's token for a service
@@ -7064,6 +7075,33 @@ impl QueryHandler {
         // service token (issue #204) so it has no equivalent check of its own.
         grant_stmt.grantor = Some(session.user.username.clone());
         grant_stmt.grantor_is_admin = self.config.auth.has_admin_role(&session.user.roles);
+        if let Some(policy) = policy {
+            // Admin only, whatever `grant_authority` says: an item written for
+            // a role goes first in the column's policy, so for a user holding
+            // that role and a broader principal it decides. A delegate could
+            // shadow a stricter mask with a looser one (the #817 class).
+            self.require_admin(session, "GRANT ... MASKED WITH / ROWS WHERE")?;
+            let store = self.policy_store.as_ref().ok_or_else(|| {
+                SqeError::Execution(
+                    "GRANT ... MASKED WITH / ROWS WHERE is not available: no policy \
+                     backend is configured. It needs [policy] engine = \"ranger\"."
+                        .to_string(),
+                )
+            })?;
+            let spec = sqe_sql::grant_policy::GrantPolicySpec {
+                table: grant_table_name(&grant_stmt)?,
+                principal: policy_principal(&grant_stmt.grantee),
+                masks: policy.masks.clone(),
+                row_filter: policy.row_filter.clone(),
+            };
+            store.set_grant_policies(&spec).await?;
+            // The masks are live from here, so drop cached decisions now: if
+            // the grant below fails, the grantee's next read is already masked.
+            self.invalidate_policy_cache();
+            if let Some(cache) = &self.query_cache {
+                cache.invalidate_all();
+            }
+        }
         backend
             .grant(session.access_token().expose(), &grant_stmt)
             .await?;
@@ -7090,6 +7128,23 @@ impl QueryHandler {
         let backend = self.require_grant_backend()?;
         self.require_grant_authority(session, "REVOKE", backend)?;
         let grant_stmt = Self::extract_grant_statement(stmt)?;
+        // The grantee's masks and row filter on the table go with its SELECT,
+        // but only an admin removes them: lifting a mask can widen what a user
+        // reads through another grant. A delegate's REVOKE leaves them, which
+        // only restricts. Computed before the fields move into the revoke.
+        let clear_policies = match &self.policy_store {
+            Some(store)
+                if revoke_ends_table_select(stmt)
+                    && self.config.auth.has_admin_role(&session.user.roles) =>
+            {
+                Some((
+                    store.clone(),
+                    grant_table_name(&grant_stmt)?,
+                    policy_principal(&grant_stmt.grantee),
+                ))
+            }
+            _ => None,
+        };
         let revoke_stmt = RevokeStatement {
             privilege: grant_stmt.privilege,
             catalog: grant_stmt.catalog,
@@ -7106,6 +7161,20 @@ impl QueryHandler {
         backend
             .revoke(session.access_token().expose(), &revoke_stmt)
             .await?;
+        // After the revoke, never before: a revoke that failed after its masks
+        // were lifted would leave SELECT with no mask.
+        if let Some((store, table, principal)) = clear_policies {
+            if let Err(e) = store.clear_grant_policies(&table, &principal).await {
+                self.invalidate_policy_cache();
+                if let Some(cache) = &self.query_cache {
+                    cache.invalidate_all();
+                }
+                return Err(SqeError::Execution(format!(
+                    "REVOKE succeeded, but removing the grantee's masks and row \
+                     filter on {table} failed; they still apply: {e}"
+                )));
+            }
+        }
         // Flush the policy cache only after the mutation succeeds so the
         // revoked grant stops working immediately (issue #207).
         self.invalidate_policy_cache();
@@ -8556,6 +8625,54 @@ fn classify_materialized_view(stmt: &Statement) -> Option<MaterializedViewStmt> 
 /// `SHOW CURRENT ROLES`, `SHOW ROLE GRANTS`. sqlparser 0.62 has no dedicated
 /// AST node for these, so they land in the generic `ShowVariable` catch-all
 /// (`SHOW <idents>`); match the exact identifier sequences (#350).
+/// The dotted table a GRANT / REVOKE names, for the policy store.
+fn grant_table_name(stmt: &GrantStatement) -> sqe_core::Result<String> {
+    let table = stmt.table.as_deref().ok_or_else(|| {
+        SqeError::Execution("MASKED WITH and ROWS WHERE apply to exactly one table".to_string())
+    })?;
+    Ok([
+        stmt.catalog.as_deref(),
+        stmt.namespace.as_deref(),
+        Some(table),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("."))
+}
+
+fn policy_principal(grantee: &Grantee) -> sqe_sql::policy_ddl::PolicyPrincipal {
+    use sqe_sql::policy_ddl::{PolicyPrincipal, PolicyPrincipalKind};
+    let (kind, name) = match grantee {
+        Grantee::User(n) => (PolicyPrincipalKind::User, n),
+        Grantee::Role(n) => (PolicyPrincipalKind::Role, n),
+        Grantee::Group(n) => (PolicyPrincipalKind::Group, n),
+    };
+    PolicyPrincipal {
+        kind,
+        name: name.clone(),
+    }
+}
+
+/// Whether a REVOKE ends the grantee's SELECT on one named table, the case in
+/// which the masks and row filter that came with the grant are removed too.
+/// `REVOKE INSERT` and schema-wide revokes leave them alone.
+fn revoke_ends_table_select(stmt: &Statement) -> bool {
+    use sqlparser::ast::{Action, GrantObjects, Privileges};
+    let Statement::Revoke(r) = stmt else {
+        return false;
+    };
+    let selects = match &r.privileges {
+        Privileges::All { .. } => true,
+        Privileges::Actions(actions) => actions
+            .iter()
+            .any(|a| matches!(a, Action::Select { columns: None })),
+    };
+    selects
+        && matches!(&r.objects, Some(GrantObjects::Tables(t)) if t.len() == 1 && t[0].0.len() >= 2)
+        && r.grantees.len() == 1
+}
+
 fn is_show_roles(stmt: &Statement) -> bool {
     let Statement::ShowVariable { variable } = stmt else {
         return false;
@@ -12209,6 +12326,33 @@ warehouse = "wh1"
             ),
             "DENY must never be confused with a grant or a revoke"
         );
+    }
+
+    /// Only a REVOKE that ends SELECT on one named table lifts the grantee's
+    /// masks and row filter; `REVOKE INSERT` or a schema-wide revoke keeps them.
+    #[test]
+    fn revoke_lifts_masks_only_when_it_ends_table_select() {
+        let ends = |sql: &str| {
+            let kind = sqe_sql::parse_and_classify(sql).expect("classify");
+            super::revoke_ends_table_select(kind.statement().expect("statement"))
+        };
+        assert!(ends("REVOKE SELECT ON s.t FROM ROLE r"));
+        assert!(ends("REVOKE SELECT, INSERT ON c.s.t FROM ROLE r"));
+        assert!(ends("REVOKE ALL PRIVILEGES ON s.t FROM USER u"));
+        assert!(!ends("REVOKE INSERT ON s.t FROM ROLE r"));
+        assert!(!ends("REVOKE SELECT ON t FROM ROLE r"));
+        assert!(!ends("REVOKE SELECT ON SCHEMA s FROM ROLE r"));
+        assert!(!ends("REVOKE SELECT ON s.t, s.u FROM ROLE r"));
+        assert!(!ends("GRANT SELECT ON s.t TO ROLE r"));
+    }
+
+    /// A GRANT carrying masks is a privilege change for the audit gate too.
+    #[test]
+    fn grant_with_policy_is_classified_for_the_audit_gate() {
+        let kind =
+            sqe_sql::parse_and_classify("GRANT SELECT ON s.t TO ROLE r MASKED WITH (a = NULL)")
+                .expect("classify");
+        assert!(matches!(kind, sqe_sql::StatementKind::GrantWithPolicy(_)));
     }
 
     /// A denial is a privilege change and must land in the audit log as one.
