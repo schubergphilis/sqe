@@ -35,3 +35,7 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 [dev-dependencies]
 tokio = { workspace = true }
 datafusion-functions-json = { workspace = true }
+# `variant_json_args_test` needs the base crate's variant helpers and the
+# Trino UDF registry in one session. Dev-only: the dependency points down the
+# graph (feature crate -> core), never the other way.
+sqe-core = { path = "../sqe-core" }
