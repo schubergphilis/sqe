@@ -831,10 +831,10 @@ fn drop_for(
     }
 }
 
-/// `DROP POLICY ON TABLE ... FROM ROLE r` takes r out of every mask and
-/// filter policy on exactly that table. An SQE-written policy left empty is
-/// deleted; a hand-written one is kept, empty; other tables and access
-/// policies are not touched.
+/// `DROP POLICY ON TABLE ... FROM ROLE r` takes r out of the mask and filter
+/// policies SQE wrote on exactly that table, and deletes one left empty. A
+/// hand-written policy naming r, other tables and access policies are not
+/// touched.
 #[tokio::test]
 async fn drop_principal_policies_removes_items() {
     let server = MockServer::start().await;
@@ -861,14 +861,12 @@ async fn drop_principal_policies_removes_items() {
         ]),
     )
     .await;
-    for id in [7, 8] {
-        Mock::given(method("PUT"))
-            .and(path(format!("/service/public/v2/api/policy/{id}")))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&server)
-            .await;
-    }
+    Mock::given(method("PUT"))
+        .and(path("/service/public/v2/api/policy/8"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
     Mock::given(method("DELETE"))
         .and(path("/service/public/v2/api/policy/9"))
         .respond_with(ResponseTemplate::new(204))
@@ -881,33 +879,36 @@ async fn drop_principal_policies_removes_items() {
         .drop_principal_policies(&drop_for("c.sales.orders", "support", false))
         .await
         .unwrap();
-    assert_eq!(changed, 3);
-    let puts: std::collections::HashMap<String, serde_json::Value> =
-        bodies(&server, wiremock::http::Method::PUT)
-            .await
-            .into_iter()
-            .collect();
+    assert_eq!(changed, 2);
+    let puts = bodies(&server, wiremock::http::Method::PUT).await;
     assert_eq!(
-        puts["/service/public/v2/api/policy/7"]["dataMaskPolicyItems"],
-        serde_json::json!([])
+        puts.len(),
+        1,
+        "only the SQE filter policy is edited: {puts:?}"
     );
+    assert_eq!(puts[0].0, "/service/public/v2/api/policy/8");
     assert_eq!(
-        puts["/service/public/v2/api/policy/8"]["rowFilterPolicyItems"][0]["roles"],
+        puts[0].1["rowFilterPolicyItems"][0]["roles"],
         serde_json::json!(["analyst"])
     );
-    assert_eq!(
-        bodies(&server, wiremock::http::Method::DELETE).await.len(),
-        1
-    );
+    let deletes = bodies(&server, wiremock::http::Method::DELETE).await;
+    assert_eq!(deletes.len(), 1, "{deletes:?}");
+    assert_eq!(deletes[0].0, "/service/public/v2/api/policy/9");
 }
 
-/// Nothing to drop is an error, unless IF EXISTS, and writes nothing.
+/// Nothing to drop is an error, unless IF EXISTS, and writes nothing. A
+/// principal named only in a hand-written policy has nothing to drop, and
+/// the error names that policy.
 #[tokio::test]
 async fn drop_principal_policies_with_nothing_to_drop() {
     let server = MockServer::start().await;
     mock_policy_list(
         &server,
         serde_json::json!([
+            {"id": 7, "name": "security-team-ssn", "policyType": 1,
+             "resources": {"database": {"values": ["sales"]}, "table": {"values": ["orders"]},
+                           "column": {"values": ["ssn"]}},
+             "dataMaskPolicyItems": [{"roles": ["support"], "dataMaskInfo": {"dataMaskType": "MASK_NULL"}}]},
             {"id": 8, "name": "sqe-grant-filter-sales.orders", "policyType": 2,
              "resources": {"database": {"values": ["sales"]}, "table": {"values": ["orders"]}},
              "rowFilterPolicyItems": [{"roles": ["analyst"], "rowFilterInfo": {"filterExpr": "1 = 0"}}]}
@@ -918,11 +919,10 @@ async fn drop_principal_policies_with_nothing_to_drop() {
     let err = store
         .drop_principal_policies(&drop_for("sales.orders", "support", false))
         .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("no column mask or row filter"),
-        "{err}"
-    );
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no column mask or row filter"), "{err}");
+    assert!(err.contains("security-team-ssn"), "{err}");
     let changed = store
         .drop_principal_policies(&drop_for("sales.orders", "support", true))
         .await
