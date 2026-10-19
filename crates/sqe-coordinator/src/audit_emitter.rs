@@ -251,7 +251,10 @@ pub(crate) fn emit_statement_audit(audit: &AuditLogger, a: StatementAudit<'_>) {
             timing(a.duration, a.execution_ms),
             Some(stats(None)),
         ),
-        StatementKind::Grant(_) | StatementKind::Revoke(_) | StatementKind::Deny(_) => (
+        StatementKind::Grant(_)
+        | StatementKind::GrantWithPolicy(_)
+        | StatementKind::Revoke(_)
+        | StatementKind::Deny(_) => (
             AuditKind::Grant,
             a.grant_resources,
             None,

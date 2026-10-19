@@ -4275,3 +4275,178 @@ async fn a_dropped_column_does_not_bequeath_its_tags_to_a_new_one() {
          an unrelated new column. Got: {values:?}"
     );
 }
+
+/// Policies `GRANT ... MASKED WITH / ROWS WHERE` wrote on the orders fixture.
+/// They are named `sqe-grant-...`, not `PREFIX...`, so the bootstrap cleanup
+/// does not see them.
+async fn grant_policies_on_orders(ranger: &RangerAdmin) -> Vec<serde_json::Value> {
+    ranger
+        .get_policies(HIVE_SERVICE)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| {
+            p["name"]
+                .as_str()
+                .is_some_and(|n| n.starts_with("sqe-grant-") && n.contains("ac.orders"))
+        })
+        .collect()
+}
+
+async fn delete_grant_policies_on_orders(ranger: &RangerAdmin) {
+    for p in grant_policies_on_orders(ranger).await {
+        if let Some(name) = p["name"].as_str() {
+            let _ = ranger.delete_policy(HIVE_SERVICE, name).await;
+        }
+    }
+}
+
+/// Wait until `s` reads exactly `expected` from `SELECT ssn ... ORDER BY id`.
+async fn wait_for_ssn(ctx: &AcCtx, s: &Session, what: &str, expected: &[&str]) {
+    let sql = format!("SELECT ssn FROM {ORDERS} ORDER BY id");
+    crate::common::eventually(what, || async {
+        match ctx.handler.execute(s, &sql, None).await {
+            Ok(b) if col_strings(&b, "ssn") == expected => Ok(()),
+            Ok(b) => Err(format!("got {:?}", col_strings(&b, "ssn"))),
+            Err(e) => Err(format!("query failed: {e}")),
+        }
+    })
+    .await;
+}
+
+/// `GRANT SELECT ... MASKED WITH / ROWS WHERE`, live against Ranger.
+///
+/// Two roles masked on the same column share ONE Ranger policy (a second
+/// policy on the same resource is refused by Ranger), each with its own item.
+/// REVOKE removes only the revoked role's item, and the last REVOKE deletes
+/// the policy. bob holds engineer and analyst, alice only analyst.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn grant_masked_with_per_role_items_and_revoke_cleanup() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    delete_grant_policies_on_orders(&ctx.ranger).await;
+
+    // analyst first, engineer second: GRANT prepends, so the engineer item is
+    // evaluated first and bob (both roles) gets the engineer mask.
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!(
+            "GRANT SELECT ON {ORDERS} TO ROLE \"analyst\" \
+             MASKED WITH (ssn = 'ana') ROWS WHERE region = 'EU'"
+        ),
+    )
+    .await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!(
+            "GRANT SELECT ON {ORDERS} TO ROLE \"engineer\" \
+             MASKED WITH (ssn = concat('eng-', right({{col}}, 4)))"
+        ),
+    )
+    .await;
+
+    let masks: Vec<_> = grant_policies_on_orders(&ctx.ranger)
+        .await
+        .into_iter()
+        .filter(|p| p["policyType"] == 1)
+        .collect();
+    assert_eq!(masks.len(), 1, "one mask policy for both roles: {masks:?}");
+    assert_eq!(
+        masks[0]["dataMaskPolicyItems"].as_array().map(Vec::len),
+        Some(2),
+        "one item per role: {:?}",
+        masks[0]
+    );
+
+    // alice: analyst mask and the EU row filter.
+    wait_for_ssn(
+        &ctx,
+        &ctx.alice,
+        "alice's analyst mask + filter",
+        &["ana", "ana"],
+    )
+    .await;
+    // bob: the engineer item comes first. The analyst row filter still applies
+    // to him, since he holds analyst too.
+    wait_for_ssn(
+        &ctx,
+        &ctx.bob,
+        "bob's engineer mask",
+        &["eng-1111", "eng-3333"],
+    )
+    .await;
+
+    // REVOKE engineer: bob still reads through analyst, now with its mask.
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("REVOKE SELECT ON {ORDERS} FROM ROLE \"engineer\""),
+    )
+    .await;
+    wait_for_ssn(
+        &ctx,
+        &ctx.bob,
+        "bob falls back to the analyst mask",
+        &["ana", "ana"],
+    )
+    .await;
+    let masks: Vec<_> = grant_policies_on_orders(&ctx.ranger)
+        .await
+        .into_iter()
+        .filter(|p| p["policyType"] == 1)
+        .collect();
+    assert_eq!(
+        masks[0]["dataMaskPolicyItems"].as_array().map(Vec::len),
+        Some(1),
+        "REVOKE removes only the engineer item: {:?}",
+        masks[0]
+    );
+
+    // Re-GRANT analyst with a new expression replaces its item. The row filter
+    // is not named, so it stays.
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT SELECT ON {ORDERS} TO ROLE \"analyst\" MASKED WITH (ssn = 'v2')"),
+    )
+    .await;
+    wait_for_ssn(
+        &ctx,
+        &ctx.alice,
+        "alice sees the replaced mask",
+        &["v2", "v2"],
+    )
+    .await;
+
+    // The last REVOKE deletes both policies.
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("REVOKE SELECT ON {ORDERS} FROM ROLE \"analyst\""),
+    )
+    .await;
+    let left = grant_policies_on_orders(&ctx.ranger).await;
+    assert!(
+        left.is_empty(),
+        "empty grant policies are deleted: {left:?}"
+    );
+
+    // A non-admin cannot attach masks.
+    let err = ctx
+        .handler
+        .execute(
+            &ctx.bob,
+            &format!("GRANT SELECT ON {ORDERS} TO ROLE \"analyst\" MASKED WITH (ssn = 'x')"),
+            None,
+        )
+        .await
+        .expect_err("GRANT ... MASKED WITH is admin-only");
+    assert!(
+        grant_policies_on_orders(&ctx.ranger).await.is_empty(),
+        "a refused GRANT writes no policy ({err})"
+    );
+}

@@ -10,6 +10,7 @@ use crate::attach::{
     AttachStatement, CreateSecretStatement, DetachStatement, DropSecretStatement,
 };
 use crate::ddl::{try_parse_ref_ddl, RefDdl};
+use crate::grant_policy::{try_parse_grant_policy, GrantWithPolicy};
 use crate::metadata::UpdateType;
 use crate::partition_evolution::{try_parse_partition_evolution, PartitionEvolution};
 use crate::policy_ddl::{try_parse_policy_ddl, PolicyDdlStatement};
@@ -91,6 +92,9 @@ pub enum StatementKind {
     ShowViews(String),
     /// GRANT or DENY privilege statement
     Grant(Box<Statement>),
+    /// `GRANT SELECT ... MASKED WITH (...)` / `ROWS WHERE ...`: a grant that
+    /// also writes the grantee's column masks and row filter.
+    GrantWithPolicy(Box<GrantWithPolicy>),
     /// REVOKE privilege statement
     Revoke(Box<Statement>),
     /// `DENY <priv> ON <object> TO <grantee>`: an explicit denial, distinct from
@@ -272,6 +276,7 @@ impl StatementKind {
             StatementKind::ShowTables(_) => "showtables",
             StatementKind::ShowViews(_) => "showviews",
             StatementKind::Grant(_) => "grant",
+            StatementKind::GrantWithPolicy(_) => "grant",
             StatementKind::Revoke(_) => "revoke",
             StatementKind::Deny(_) => "deny",
             StatementKind::ShowGrants(_) => "showgrants",
@@ -485,6 +490,7 @@ impl StatementKind {
             | StatementKind::Call(s)
             | StatementKind::AlterTableProps(s)
             | StatementKind::Comment(s) => Some(s.as_ref()),
+            StatementKind::GrantWithPolicy(g) => Some(&g.grant),
             _ => None,
         }
     }
@@ -633,6 +639,11 @@ fn try_classify_custom(parser: &mut Parser, sql: &str) -> sqe_core::Result<Optio
         // sub-parser; returns None for every other CREATE/DROP).
         ["CREATE", ..] | ["DROP", ..] if try_parse_policy_ddl(body)?.is_some() => {
             try_parse_policy_ddl(body)?.map(|p| StatementKind::PolicyDdl(Box::new(p)))
+        }
+        // GRANT ... MASKED WITH (...) / ROWS WHERE ...: peek-only; a GRANT
+        // without either clause is left to the standard parse.
+        ["GRANT", ..] => {
+            try_parse_grant_policy(body)?.map(|g| StatementKind::GrantWithPolicy(Box::new(g)))
         }
         // SHOW CATALOGS [anything]: sqlparser reads it as a variable.
         ["SHOW", "CATALOGS", ..] => Some(StatementKind::ShowCatalogs),
@@ -1807,6 +1818,19 @@ mod tests {
     fn test_grant_is_grant() {
         let result = parse_and_classify("GRANT SELECT ON foo TO bar");
         assert!(matches!(result, Ok(StatementKind::Grant(_))));
+    }
+
+    #[test]
+    fn test_grant_masked_with_and_rows_where() {
+        let result = parse_and_classify(
+            "-- lead comment\n grant select on s.t to role r masked with (a = sha256(a)) rows where b = 1",
+        );
+        let Ok(StatementKind::GrantWithPolicy(g)) = result else {
+            panic!("expected GrantWithPolicy, got {result:?}");
+        };
+        assert_eq!(g.masks[0].column, "a");
+        assert_eq!(g.row_filter.as_deref(), Some("b = 1"));
+        assert!(parse_and_classify("GRANT SELECT ON s.t TO ROLE r MASKED WITH (a = )").is_err());
     }
 
     #[test]
