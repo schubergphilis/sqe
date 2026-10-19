@@ -76,9 +76,11 @@ Agent output is a lead, not a fact:
   `DROP TAG IF EXISTS t`; SQE takes `DROP TAG t IF EXISTS`). The gate catches
   this; a mismatch with a documented upstream form is itself a finding.
 
-Investigation usually finds more than the issue says. Keep the MR to its
-scope. List each extra finding with file:line and "confirmed by running" or
-"read only", and draft a follow-up issue; file it only on the user's OK.
+Investigation usually finds more than the issue says. Keep each MR to one
+concern, but **fix the findings**: group them by concern into the next
+branches of this batch, confirm each one by running before fixing it, and
+work them right after the current MR. Only a finding that is too big for the
+batch becomes a drafted follow-up issue (filed on the user's OK).
 
 While there, grep `openspec/changes/*/tasks.md` for open tasks in the same
 area: a one-assertion task that fits the branch is worth taking.
