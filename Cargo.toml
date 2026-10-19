@@ -277,13 +277,23 @@ flate2 = { version = "1" }
 [patch.crates-io]
 object_store = { path = "vendor/object_store" }
 
-# ── Dev profile: fast incremental builds ───────────────────────
+# ── Dev profile: fast rebuilds, minimal artifacts ──────────────
 [profile.dev]
 # Line-tables only — enough for backtraces/panics, much less to generate.
 debug = 1
 # Avoid one loose .o file per codegen unit. `unpacked` accumulated ~385k
 # objects under target/debug/deps and made Defender-scanned builds degrade.
 split-debuginfo = "off"
+# Measure first, incremental second. `sqe-core` is imported by every other
+# workspace crate, so any edit near the bottom rebuilds ~15 crates from
+# scratch and the incremental cache cannot amortise its own bookkeeping.
+# Measured on an M3 Pro / 36 GB (2026-10-19, DataFusion 55.2):
+#   edit sqe-core -> sqe-server:  2m50 incremental  vs  1m21 without
+#   edit sqe-server only:            32s            vs    23s
+# It also owned 21 GB of target/debug/incremental. Re-enable per invocation
+# with CARGO_INCREMENTAL=1 when you are iterating on a single crate and want
+# to trade the disk back for it.
+incremental = false
 
 # Third-party dependencies (the `*` glob matches every non-workspace crate)
 # carry no debuginfo. We almost never step into the ~760 upstream crates with a
@@ -300,6 +310,9 @@ debug = false
 [profile.test]
 debug = 1
 split-debuginfo = "off"
+# Same reasoning as [profile.dev]: the test profile compiles the whole
+# workspace graph too, and incremental there is slower than it is useful.
+incremental = false
 
 [profile.test.package."*"]
 debug = false

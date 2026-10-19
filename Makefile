@@ -91,7 +91,7 @@ TRINO_MEMORY   ?= 8g
 BENCH_RUN      := scripts/benchmark-make-run.sh
 BENCH_ENV       = PROFILE=$(BENCH_PROFILE) BENCH_LOG_DIR=$(BENCH_LOG_DIR)
 
-.PHONY: help all all_trino docs-and-image check dev release rustbook ebook \
+.PHONY: help all all_trino docs-and-image check check-server dev release rustbook ebook \
         ebook-pdf ebook-epub ebook-html \
         benchmark-charts test test-access-control test-access-control-spark \
         test-integration test-distributed test-integration-down \
@@ -108,7 +108,8 @@ help:
 	@echo "SQE build targets:"
 	@echo ""
 	@echo "  Code:"
-	@echo "    make check        Type-check all targets without linking (fastest feedback)"
+	@echo "    make check        Type-check all targets without linking (fastest full feedback)"
+	@echo "    make check-server Type-check sqe-server only; the fast inner loop"
 	@echo "    make dev          Debug build of sqe-cli + sqe-server (fast compile)"
 	@echo "    make release      Release build of sqe-cli + sqe-server (LTO, optimised)"
 	@echo "    make test         cargo test --workspace"
@@ -205,6 +206,13 @@ docs-and-image: dev rustbook ebook build sbom
 check:
 	$(CARGO) check --workspace --all-targets --exclude sqe-cli
 	$(CARGO) check --package sqe-cli --all-targets --no-default-features
+
+# Fast inner loop: type-check the server binary only, with the same feature set
+# `make dev` uses (so it does not fork a second copy of the dependency graph in
+# target/). ~1.5 min end to end after touching a crate near the bottom of the
+# graph, versus ~2-3 min for the real build plus link.
+check-server:
+	$(CARGO) check --no-default-features --bin $(BIN_SERVER)
 
 dev:
 	@echo "==> Building debug binaries ($(BIN_CLI), $(BIN_SERVER))"
