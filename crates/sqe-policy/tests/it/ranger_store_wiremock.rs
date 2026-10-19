@@ -580,3 +580,295 @@ async fn catalog_scoped_mask_through_the_rewriter_covers_one_catalog() {
         }
     }
 }
+
+// ── GRANT ... MASKED WITH / ROWS WHERE ────────────────────────────────
+
+/// The spec the coordinator builds for `GRANT SELECT ON <table> TO ROLE
+/// <grantee> <clauses>`; the clauses go through the real parser.
+fn grant_spec(table: &str, grantee: &str, clauses: &str) -> sqe_sql::grant_policy::GrantPolicySpec {
+    let g = sqe_sql::grant_policy::try_parse_grant_policy(&format!(
+        "GRANT SELECT ON {table} TO ROLE {grantee} {clauses}"
+    ))
+    .unwrap()
+    .unwrap();
+    sqe_sql::grant_policy::GrantPolicySpec {
+        table: table.to_string(),
+        principal: role(grantee),
+        masks: g.masks,
+        row_filter: g.row_filter,
+    }
+}
+
+fn role(name: &str) -> sqe_sql::policy_ddl::PolicyPrincipal {
+    sqe_sql::policy_ddl::PolicyPrincipal {
+        kind: sqe_sql::policy_ddl::PolicyPrincipalKind::Role,
+        name: name.into(),
+    }
+}
+
+async fn mock_policy_list(server: &MockServer, policies: serde_json::Value) {
+    Mock::given(method("GET"))
+        .and(path("/service/public/v2/api/policy"))
+        .and(query_param("serviceName", "hive"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(policies))
+        .mount(server)
+        .await;
+}
+
+async fn bodies(
+    server: &MockServer,
+    m: wiremock::http::Method,
+) -> Vec<(String, serde_json::Value)> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.method == m)
+        .map(|r| {
+            let body = serde_json::from_slice(&r.body).unwrap_or(serde_json::Value::Null);
+            (r.url.path().to_string(), body)
+        })
+        .collect()
+}
+
+/// With no policy on the column or table, GRANT creates one of each, and the
+/// policies it writes are ones the read path resolves for the grantee.
+#[tokio::test]
+async fn grant_policies_create_resolvable_policies_when_absent() {
+    let server = MockServer::start().await;
+    mock_policy_list(&server, serde_json::json!([])).await;
+    Mock::given(method("POST"))
+        .and(path("/service/public/v2/api/policy"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let store = RangerStore::from_config(&cfg(&server.uri())).unwrap();
+    store
+        .set_grant_policies(&grant_spec(
+            "c.sales.orders",
+            "analyst",
+            "MASKED WITH (amount = round(amount, -2)) ROWS WHERE region = 'EU'",
+        ))
+        .await
+        .unwrap();
+
+    let posted: Vec<serde_json::Value> = bodies(&server, wiremock::http::Method::POST)
+        .await
+        .into_iter()
+        .map(|(_, b)| b)
+        .collect();
+    let mask = posted.iter().find(|b| b["policyType"] == 1).unwrap();
+    assert_eq!(mask["name"], "sqe-grant-mask-sales.orders.amount");
+    assert_eq!(mask["resources"]["database"]["values"][0], "sales");
+    assert_eq!(mask["resources"]["column"]["values"][0], "amount");
+    assert_eq!(mask["dataMaskPolicyItems"][0]["roles"][0], "analyst");
+    assert_eq!(
+        mask["dataMaskPolicyItems"][0]["dataMaskInfo"]["dataMaskType"],
+        "CUSTOM"
+    );
+    assert_eq!(
+        mask["dataMaskPolicyItems"][0]["dataMaskInfo"]["valueExpr"],
+        "round(amount, -2)"
+    );
+    let filter = posted.iter().find(|b| b["policyType"] == 2).unwrap();
+    assert_eq!(filter["name"], "sqe-grant-filter-sales.orders");
+    assert!(filter["resources"].get("column").is_none());
+    assert_eq!(
+        filter["rowFilterPolicyItems"][0]["rowFilterInfo"]["filterExpr"],
+        "region = 'EU'"
+    );
+
+    // Serve what was written back as the bundle: the grantee must resolve it.
+    let read = MockServer::start().await;
+    let mut written = posted.clone();
+    for (i, p) in written.iter_mut().enumerate() {
+        p["id"] = serde_json::json!(i + 1);
+    }
+    Mock::given(method("GET"))
+        .and(path("/service/plugins/secure/policies/download/hive"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"policyVersion": 1, "policies": written})),
+        )
+        .mount(&read)
+        .await;
+    let reader = RangerStore::from_config(&cfg(&read.uri())).unwrap();
+    let policy = reader.resolve(&analyst(), "orders", "sales").await.unwrap();
+    assert!(policy.column_masks.contains_key("amount"), "{policy:?}");
+    assert_eq!(policy.row_filters.len(), 1);
+    assert!(policy.restricted_columns.is_empty(), "{policy:?}");
+}
+
+/// An existing policy on the column is edited in place: the grantee is split
+/// out of the item it shared, its new item goes first, and every field an
+/// admin set on the policy survives. No second policy (Ranger error 3010).
+#[tokio::test]
+async fn grant_policies_prepend_item_in_existing_policy() {
+    let server = MockServer::start().await;
+    mock_policy_list(
+        &server,
+        serde_json::json!([{
+            "id": 7, "name": "hand-written", "service": "hive", "policyType": 1,
+            "description": "set by hand", "policyPriority": 0, "isEnabled": true,
+            "resources": {"database": {"values": ["SALES"]}, "table": {"values": ["orders"]},
+                          "column": {"values": ["amount"]}},
+            "dataMaskPolicyItems": [
+                {"users": [], "roles": ["analyst", "support"], "groups": [],
+                 "accesses": [{"type": "select", "isAllowed": true}],
+                 "dataMaskInfo": {"dataMaskType": "MASK_NULL"}},
+                {"users": [], "roles": [], "groups": ["public"],
+                 "accesses": [{"type": "select", "isAllowed": true}],
+                 "dataMaskInfo": {"dataMaskType": "MASK_NULL"}}
+            ]
+        }]),
+    )
+    .await;
+    Mock::given(method("PUT"))
+        .and(path("/service/public/v2/api/policy/7"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let store = RangerStore::from_config(&cfg(&server.uri())).unwrap();
+    store
+        .set_grant_policies(&grant_spec(
+            "sales.orders",
+            "support",
+            "MASKED WITH (amount = 0)",
+        ))
+        .await
+        .unwrap();
+
+    let (_, put) = bodies(&server, wiremock::http::Method::PUT).await.remove(0);
+    assert_eq!(put["description"], "set by hand");
+    assert_eq!(put["name"], "hand-written");
+    let items = put["dataMaskPolicyItems"].as_array().unwrap();
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0]["roles"], serde_json::json!(["support"]));
+    assert_eq!(items[0]["dataMaskInfo"]["valueExpr"], "0");
+    assert_eq!(items[1]["roles"], serde_json::json!(["analyst"]));
+    assert_eq!(items[2]["groups"], serde_json::json!(["public"]));
+}
+
+/// A policy on a wildcard or a column list is a different resource
+/// signature: GRANT does not edit it and writes its own policy instead.
+#[tokio::test]
+async fn grant_policies_leave_wildcard_policies_alone() {
+    let server = MockServer::start().await;
+    mock_policy_list(
+        &server,
+        serde_json::json!([{
+            "id": 9, "name": "sqe-grant-mask-sales.orders.amount", "policyType": 1,
+            "resources": {"database": {"values": ["sales"]}, "table": {"values": ["orders"]},
+                          "column": {"values": ["*"]}},
+            "dataMaskPolicyItems": []
+        }]),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let store = RangerStore::from_config(&cfg(&server.uri())).unwrap();
+    store
+        .set_grant_policies(&grant_spec(
+            "sales.orders",
+            "support",
+            "MASKED WITH (amount = 0)",
+        ))
+        .await
+        .unwrap();
+    let (_, post) = bodies(&server, wiremock::http::Method::POST)
+        .await
+        .remove(0);
+    // The name the wildcard policy holds is taken, so the new one is suffixed.
+    assert_eq!(post["name"], "sqe-grant-mask-sales.orders.amount-2");
+}
+
+/// REVOKE takes the grantee out of every mask and filter policy on the
+/// table, deletes a policy it leaves empty, and touches no other table.
+#[tokio::test]
+async fn clear_grant_policies_removes_items_and_empty_policies() {
+    let server = MockServer::start().await;
+    mock_policy_list(
+        &server,
+        serde_json::json!([
+            {"id": 7, "policyType": 1,
+             "resources": {"database": {"values": ["sales"]}, "table": {"values": ["orders"]},
+                           "column": {"values": ["amount"]}},
+             "dataMaskPolicyItems": [{"roles": ["support"], "dataMaskInfo": {"dataMaskType": "MASK_NULL"}}]},
+            {"id": 8, "policyType": 2,
+             "resources": {"database": {"values": ["sales"]}, "table": {"values": ["orders"]}},
+             "rowFilterPolicyItems": [{"roles": ["support", "analyst"], "rowFilterInfo": {"filterExpr": "1 = 0"}}]},
+            {"id": 10, "policyType": 2,
+             "resources": {"database": {"values": ["sales"]}, "table": {"values": ["returns"]}},
+             "rowFilterPolicyItems": [{"roles": ["support"], "rowFilterInfo": {"filterExpr": "1 = 0"}}]},
+            {"id": 11, "policyType": 0,
+             "resources": {"database": {"values": ["sales"]}, "table": {"values": ["orders"]}},
+             "policyItems": [{"roles": ["support"]}]}
+        ]),
+    )
+    .await;
+    Mock::given(method("DELETE"))
+        .and(path("/service/public/v2/api/policy/7"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/service/public/v2/api/policy/8"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let store = RangerStore::from_config(&cfg(&server.uri())).unwrap();
+    let removed = store
+        .clear_grant_policies("c.sales.orders", &role("support"))
+        .await
+        .unwrap();
+    assert_eq!(removed, 2);
+    let (_, put) = bodies(&server, wiremock::http::Method::PUT).await.remove(0);
+    assert_eq!(
+        put["rowFilterPolicyItems"][0]["roles"],
+        serde_json::json!(["analyst"])
+    );
+    assert_eq!(
+        bodies(&server, wiremock::http::Method::DELETE).await.len(),
+        1
+    );
+}
+
+/// Scoped mode needs the catalog, as CREATE POLICY does: a policy written
+/// without one would never match.
+#[tokio::test]
+async fn grant_policies_need_catalog_when_scoped() {
+    let server = MockServer::start().await;
+    let store = RangerStore::from_config(&RangerPolicyConfig {
+        catalog_scoped: true,
+        ..cfg(&server.uri())
+    })
+    .unwrap();
+    let err = store
+        .set_grant_policies(&grant_spec("sales.orders", "support", "ROWS WHERE a = 1"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("catalog_scoped"), "{err}");
+    assert!(server.received_requests().await.unwrap().is_empty());
+}

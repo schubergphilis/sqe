@@ -1629,14 +1629,334 @@ impl RangerStore {
         }
         Ok(())
     }
+
+    /// `GRANT ... MASKED WITH / ROWS WHERE`. Ranger holds one mask policy per
+    /// column and one row-filter policy per table (a second is error 3010),
+    /// so the grantee gets an item in that policy rather than a policy of
+    /// its own.
+    async fn set_grant_policies_impl(
+        &self,
+        spec: &sqe_sql::grant_policy::GrantPolicySpec,
+    ) -> sqe_core::Result<()> {
+        let (database, table) = ranger_table_resource(
+            &spec.table,
+            self.catalog_scoped,
+            "GRANT ... MASKED WITH / ROWS WHERE",
+        )?;
+        let service = self.service_name.clone();
+        let policies = self.policies_for_service(&service).await?;
+        let mut names: HashSet<String> = policies
+            .iter()
+            .filter_map(|p| p.get("name").and_then(serde_json::Value::as_str))
+            .map(str::to_ascii_lowercase)
+            .collect();
+        for mask in &spec.masks {
+            let item = grant_item(
+                &spec.principal,
+                "dataMaskInfo",
+                serde_json::json!({"dataMaskType": MASK_TYPE_CUSTOM, "valueExpr": mask.expression}),
+            );
+            self.upsert_grant_item(
+                &service,
+                &policies,
+                &mut names,
+                (&database, &table, Some(&mask.column)),
+                &spec.principal,
+                item,
+            )
+            .await?;
+        }
+        if let Some(filter) = &spec.row_filter {
+            let item = grant_item(
+                &spec.principal,
+                "rowFilterInfo",
+                serde_json::json!({"filterExpr": filter}),
+            );
+            self.upsert_grant_item(
+                &service,
+                &policies,
+                &mut names,
+                (&database, &table, None),
+                &spec.principal,
+                item,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Put `item` first in the policy on this exact resource, after taking
+    /// the principal out of every item there; create the policy when there
+    /// is none. First is deliberate: Ranger applies the first item that
+    /// matches, so a user holding this role and a broader group must get the
+    /// mask written for the role. The existing policy is edited in place
+    /// (read-modify-write), so whatever an admin set on it by hand survives.
+    async fn upsert_grant_item(
+        &self,
+        service: &str,
+        policies: &[serde_json::Value],
+        names: &mut HashSet<String>,
+        (database, table, column): (&str, &str, Option<&str>),
+        principal: &sqe_sql::policy_ddl::PolicyPrincipal,
+        item: serde_json::Value,
+    ) -> sqe_core::Result<()> {
+        let policy_type = if column.is_some() { 1 } else { 2 };
+        let key = grant_items_key(policy_type);
+        let existing = policies
+            .iter()
+            .find(|p| is_grant_signature(p, policy_type, database, table, column));
+        if let Some(policy) = existing {
+            let id = policy_id(policy)?;
+            let mut policy = policy.clone();
+            let mut items: Vec<serde_json::Value> = policy
+                .get(key)
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            remove_principal_from_items(&mut items, principal);
+            items.insert(0, item);
+            policy[key] = serde_json::Value::Array(items);
+            return self
+                .send_policy_ddl(
+                    reqwest::Method::PUT,
+                    &format!("/service/public/v2/api/policy/{id}"),
+                    Some(&policy),
+                )
+                .await;
+        }
+
+        let base = match column {
+            Some(column) => format!("sqe-grant-mask-{database}.{table}.{column}"),
+            None => format!("sqe-grant-filter-{database}.{table}"),
+        };
+        let mut name = base.clone();
+        let mut n = 2;
+        while names.contains(&name.to_ascii_lowercase()) {
+            name = format!("{base}-{n}");
+            n += 1;
+        }
+        names.insert(name.to_ascii_lowercase());
+        let mut resources = serde_json::json!({
+            "database": {"values": [database]},
+            "table": {"values": [table]},
+        });
+        if let Some(column) = column {
+            resources["column"] = serde_json::json!({"values": [column]});
+        }
+        let mut body = serde_json::json!({
+            "service": service,
+            "name": name,
+            "isEnabled": true,
+            "policyType": policy_type,
+            "resources": resources,
+        });
+        body[key] = serde_json::json!([item]);
+        self.send_policy_ddl(
+            reqwest::Method::POST,
+            "/service/public/v2/api/policy",
+            Some(&body),
+        )
+        .await
+    }
+
+    /// `REVOKE SELECT` / `REVOKE ALL PRIVILEGES`: take the principal out of
+    /// every mask and row-filter policy on exactly this table, whoever wrote
+    /// it, and delete a policy left with no items.
+    async fn clear_grant_policies_impl(
+        &self,
+        table: &str,
+        principal: &sqe_sql::policy_ddl::PolicyPrincipal,
+    ) -> sqe_core::Result<usize> {
+        let (database, table) = ranger_table_resource(table, self.catalog_scoped, "REVOKE")?;
+        let mut removed = 0;
+        for policy in self.policies_for_service(&self.service_name).await? {
+            let Some(policy_type) = policy
+                .get("policyType")
+                .and_then(serde_json::Value::as_i64)
+                .filter(|t| *t == 1 || *t == 2)
+            else {
+                continue;
+            };
+            if !resource_is_exactly(&policy, "database", &database)
+                || !resource_is_exactly(&policy, "table", &table)
+            {
+                continue;
+            }
+            let key = grant_items_key(policy_type);
+            let mut items: Vec<serde_json::Value> = policy
+                .get(key)
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if !remove_principal_from_items(&mut items, principal) {
+                continue;
+            }
+            removed += 1;
+            let id = policy_id(&policy)?;
+            let path = format!("/service/public/v2/api/policy/{id}");
+            if items.is_empty() {
+                self.send_policy_ddl(reqwest::Method::DELETE, &path, None)
+                    .await?;
+            } else {
+                let mut policy = policy;
+                policy[key] = serde_json::Value::Array(items);
+                self.send_policy_ddl(reqwest::Method::PUT, &path, Some(&policy))
+                    .await?;
+            }
+        }
+        Ok(removed)
+    }
 }
 
-/// `catalog_scoped` keeps the catalog of `CREATE POLICY ... ON TABLE
-/// cat.ns.t` in the Ranger `database` (`cat.ns`), which is the key the read
-/// path resolves under `[policy.ranger] catalog_scoped`; without it the
-/// catalog is dropped, the Hive/Kyuubi convention. Scoped mode refuses a
-/// two-part name: the store does not know the session's catalog, and a policy
-/// written without one would never match.
+fn policy_id(policy: &serde_json::Value) -> sqe_core::Result<i64> {
+    policy
+        .get("id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| {
+            sqe_core::SqeError::with_code(
+                sqe_core::SqeErrorCode::ExecutionFailed,
+                "Ranger policy has no numeric id".to_string(),
+            )
+        })
+}
+
+/// The Ranger `(database, table)` values for a dotted table name.
+///
+/// `catalog_scoped` keeps the catalog of `cat.ns.t` in the Ranger `database`
+/// (`cat.ns`), which is the key the read path resolves under
+/// `[policy.ranger] catalog_scoped`; without it the catalog is dropped, the
+/// Hive/Kyuubi convention. Scoped mode refuses a two-part name: the store does
+/// not know the session's catalog, and a policy written without one would
+/// never match. `what` names the statement in the error.
+fn ranger_table_resource(
+    table: &str,
+    catalog_scoped: bool,
+    what: &str,
+) -> sqe_core::Result<(String, String)> {
+    let parts: Vec<&str> = table.split('.').map(|v| v.trim_matches('"')).collect();
+    if parts.len() < 2 {
+        return Err(sqe_core::SqeError::with_code(
+            sqe_core::SqeErrorCode::ExecutionFailed,
+            format!("{what} requires at least <schema>.<table>"),
+        ));
+    }
+    if catalog_scoped && parts.len() < 3 {
+        return Err(sqe_core::SqeError::with_code(
+            sqe_core::SqeErrorCode::ExecutionFailed,
+            format!(
+                "{what} needs <catalog>.<schema>.<table> when \
+                 [policy.ranger] catalog_scoped is on"
+            ),
+        ));
+    }
+    let table_name = parts[parts.len() - 1];
+    let namespace_start = usize::from(parts.len() >= 3 && !catalog_scoped);
+    let namespace = parts[namespace_start..parts.len() - 1].join(".");
+    Ok((namespace, table_name.to_string()))
+}
+
+/// The JSON key of a policy type's item list.
+fn grant_items_key(policy_type: i64) -> &'static str {
+    if policy_type == 1 {
+        "dataMaskPolicyItems"
+    } else {
+        "rowFilterPolicyItems"
+    }
+}
+
+/// Whether a resource entry of a Ranger policy is exactly one value, `want`
+/// (any case, as Ranger matches), with no exclusion. A wildcard or a list is a
+/// different resource signature, and not one a grant edits.
+fn resource_is_exactly(policy: &serde_json::Value, key: &str, want: &str) -> bool {
+    let Some(res) = policy.get("resources").and_then(|r| r.get(key)) else {
+        return false;
+    };
+    if res.get("isExcludes").and_then(serde_json::Value::as_bool) == Some(true) {
+        return false;
+    }
+    matches!(
+        res.get("values").and_then(serde_json::Value::as_array).map(Vec::as_slice),
+        Some([v]) if v.as_str().is_some_and(|v| v.eq_ignore_ascii_case(want))
+    )
+}
+
+/// Whether `policy` is a row-filter (`column == None`) or column-mask policy
+/// on exactly this resource: the signature Ranger allows one policy for
+/// (error 3010 on a second).
+fn is_grant_signature(
+    policy: &serde_json::Value,
+    policy_type: i64,
+    database: &str,
+    table: &str,
+    column: Option<&str>,
+) -> bool {
+    policy.get("policyType").and_then(serde_json::Value::as_i64) == Some(policy_type)
+        && resource_is_exactly(policy, "database", database)
+        && resource_is_exactly(policy, "table", table)
+        && match column {
+            Some(column) => resource_is_exactly(policy, "column", column),
+            None => policy
+                .get("resources")
+                .and_then(|r| r.get("column"))
+                .is_none(),
+        }
+}
+
+/// The principal-list key of a policy item for a principal kind.
+fn principal_key(kind: &sqe_sql::policy_ddl::PolicyPrincipalKind) -> &'static str {
+    use sqe_sql::policy_ddl::PolicyPrincipalKind;
+    match kind {
+        PolicyPrincipalKind::User => "users",
+        PolicyPrincipalKind::Role => "roles",
+        PolicyPrincipalKind::Group => "groups",
+    }
+}
+
+/// Take `principal` out of every item in `items`, splitting it out of items it
+/// shares, and drop the items it leaves with no principal. Returns whether it
+/// was present. Items that named no principal before are kept as they are.
+fn remove_principal_from_items(
+    items: &mut Vec<serde_json::Value>,
+    principal: &sqe_sql::policy_ddl::PolicyPrincipal,
+) -> bool {
+    let key = principal_key(&principal.kind);
+    let mut found = false;
+    items.retain_mut(|item| {
+        let Some(list) = item.get_mut(key).and_then(serde_json::Value::as_array_mut) else {
+            return true;
+        };
+        let before = list.len();
+        list.retain(|v| v.as_str() != Some(principal.name.as_str()));
+        if list.len() == before {
+            return true;
+        }
+        found = true;
+        ["users", "roles", "groups"].iter().any(|k| {
+            item.get(*k)
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|l| !l.is_empty())
+        })
+    });
+    found
+}
+
+/// One mask or row-filter item for a single principal.
+fn grant_item(
+    principal: &sqe_sql::policy_ddl::PolicyPrincipal,
+    info_key: &str,
+    info: serde_json::Value,
+) -> serde_json::Value {
+    let mut item = serde_json::json!({
+        "users": [],
+        "roles": [],
+        "groups": [],
+        "accesses": [{"type": "select", "isAllowed": true}],
+    });
+    item[principal_key(&principal.kind)] = serde_json::json!([principal.name]);
+    item[info_key] = info;
+    item
+}
+
 fn ranger_policy_body(
     stmt: &sqe_sql::policy_ddl::CreatePolicyStatement,
     service: &str,
@@ -1665,22 +1985,8 @@ fn ranger_policy_body(
             resources.insert("tag".into(), serde_json::json!({"values": [tag]}));
         }
         PolicyTarget::Table(table) => {
-            let parts: Vec<&str> = table.split('.').map(|v| v.trim_matches('"')).collect();
-            if parts.len() < 2 {
-                return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed,
-                    "CREATE POLICY ON TABLE requires at least <schema>.<table>".to_string(),
-                ));
-            }
-            if catalog_scoped && parts.len() < 3 {
-                return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed,
-                    "CREATE POLICY ON TABLE needs <catalog>.<schema>.<table> when \
-                     [policy.ranger] catalog_scoped is on"
-                        .to_string(),
-                ));
-            }
-            let table_name = parts[parts.len() - 1];
-            let namespace_start = usize::from(parts.len() >= 3 && !catalog_scoped);
-            let namespace = parts[namespace_start..parts.len() - 1].join(".");
+            let (namespace, table_name) =
+                ranger_table_resource(table, catalog_scoped, "CREATE POLICY ON TABLE")?;
             resources.insert(
                 "database".into(),
                 serde_json::json!({"values": [namespace]}),
@@ -1766,6 +2072,21 @@ impl PolicyStore for RangerStore {
         stmt: &sqe_sql::policy_ddl::DropPolicyStatement,
     ) -> sqe_core::Result<()> {
         self.drop_policy_ddl(stmt).await
+    }
+
+    async fn set_grant_policies(
+        &self,
+        spec: &sqe_sql::grant_policy::GrantPolicySpec,
+    ) -> sqe_core::Result<()> {
+        self.set_grant_policies_impl(spec).await
+    }
+
+    async fn clear_grant_policies(
+        &self,
+        table: &str,
+        principal: &sqe_sql::policy_ddl::PolicyPrincipal,
+    ) -> sqe_core::Result<usize> {
+        self.clear_grant_policies_impl(table, principal).await
     }
 
     async fn list_mask_policies(&self) -> sqe_core::Result<Vec<crate::MaskPolicyInfo>> {

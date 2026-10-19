@@ -10,7 +10,7 @@
 
 SQE-specific security extensions on top of the SQL standard `GRANT` / `REVOKE`. The base shapes are parsed by `sqlparser-rs`; SQE adds:
 
-- **Column masks**: `GRANT SELECT ON ... TO ... MASKED WITH expr`.
+- **Column masks**: `GRANT SELECT ON ... TO ... MASKED WITH (col = expr, ...)`.
 - **Row filters**: `GRANT SELECT ON ... TO ... ROWS WHERE expr`.
 - **Effective-grant inspection**: `SHOW EFFECTIVE GRANTS FOR USER "x"` returns the resolved policy for a user across roles and inheritance.
 - **Resource-scoped listing**: `SHOW GRANTS ON ns.table`.
@@ -103,24 +103,39 @@ removes, so it cannot widen access.
 ### Column masks (SQE extension)
 
 ```sql
-GRANT SELECT (id, name, email)
-    ON users
+GRANT SELECT
+    ON sales.users
     TO ROLE "support"
     MASKED WITH (
-        email = sha256(email)
+        email = md5({col}),
+        phone = concat('***', right(phone, 4))
     );
 ```
 
-The `MASKED WITH` clause is post-parse: SQE walks the AST after sqlparser succeeds and lifts the trailing extension into a `PolicyStatement` node. Anyone with the `support` role sees the masked email; the unmasked column never reaches the user's session. Plan optimization happens after the substitution so a `WHERE email = 'x@y.com'` predicate cannot bypass the mask.
+Each entry is `column = expression`. In the expression, `{col}` stands for the masked column; naming the column directly works too. Anyone with the `support` role sees the masked values. The real values never reach the user's session. Masks are applied before optimization, so a `WHERE email = 'x@y.com'` predicate cannot get around a mask.
 
 ### Row filters (SQE extension)
 
 ```sql
-GRANT SELECT ON orders TO ROLE "regional_eu"
+GRANT SELECT ON sales.orders TO ROLE "regional_eu"
     ROWS WHERE region = 'EU';
 ```
 
 The filter expression is injected as a `Filter` node directly above `TableScan` for the `orders` reference. DataFusion's predicate pushdown can move user `WHERE` clauses through the row filter (because filters compose), but cannot eliminate it.
+
+The two clauses can be combined, in either order: `GRANT SELECT ON t TO ROLE r MASKED WITH (...) ROWS WHERE ...`.
+
+### How masks and row filters are stored
+
+The clauses are recognised by the pre-parser in `crates/sqe-sql/src/grant_policy.rs`; the remaining `GRANT SELECT ON ... TO ...` goes through `sqlparser-rs` as usual. The masks and the filter are written as Ranger policies on the resource service (`[policy] engine = "ranger"`). Any other policy engine refuses the statement.
+
+- **Admin only.** Only a caller with an admin role can attach masks or a row filter. A delegate holding `WITH GRANT OPTION` cannot.
+- **Narrow shape.** `SELECT` only, with no column list, on exactly one schema-qualified table (`<catalog>.<schema>.<table>` when `[policy.ranger] catalog_scoped` is on), to exactly one grantee. `TO PUBLIC` is refused.
+- **One policy per resource, one item per grantee.** Ranger allows only one mask policy per column and one row-filter policy per table. SQE keeps one item per grantee in that policy. A repeated GRANT to the same grantee replaces that grantee's mask or filter and leaves the others alone. A clause the GRANT does not name stays as it was: re-granting with only `MASKED WITH` keeps an existing row filter.
+- **The latest GRANT is evaluated first.** Ranger applies the first item that matches the user, and a new item is put first. A user holding two masked roles therefore sees the mask from the role granted most recently.
+- **REVOKE removes them.** An admin's `REVOKE SELECT` or `REVOKE ALL` on the table, from that grantee, removes the grantee's masks and row filter. A policy with no items left is deleted. A non-admin REVOKE leaves them in place.
+- **Which policies are edited.** SQE edits only policies that cover exactly this table (and, for a mask, this column). Such a policy is edited even if it was written by hand in Ranger: GRANT adds the grantee's item to it, and REVOKE removes that item and deletes the policy if it is then empty. A policy written with wildcards or value lists is never changed. If it also matches the user, it can take precedence over the GRANT's mask or filter.
+- **Failure order.** GRANT writes the masks and filter before the privilege, and REVOKE drops the privilege before it removes them. A half-finished statement therefore leaves the user with more restrictions, never fewer.
 
 ### SHOW GRANTS
 
@@ -210,7 +225,7 @@ A short rationale:
 1. **Optimization safety**: filters added above `TableScan` survive predicate pushdown but cannot be eliminated. Connector-level hooks run after planning and can be bypassed by a clever WHERE clause.
 2. **Information leakage**: a user querying `column_that_is_masked = 'secret'` gets zero rows, exactly as if the column did not exist. PostgreSQL RLS uses the same model.
 3. **Auditability**: the rewritten plan is logged. Reviewers see exactly what filter was applied per query, per user.
-4. **Composability**: row filters from multiple grants AND together; column masks from multiple grants are applied innermost-out. The semantics are explicit instead of implementation-defined.
+4. **Composability**: within one Ranger policy the first matching item wins, and `GRANT ... MASKED WITH / ROWS WHERE` puts its item first. Row filters from separate policies on the same table AND together. The semantics are explicit instead of implementation-defined.
 
 ## Known gaps
 

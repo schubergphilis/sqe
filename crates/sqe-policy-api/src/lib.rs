@@ -342,6 +342,31 @@ pub trait PolicyStore: Send + Sync {
         ))
     }
 
+    /// Write a grantee's column masks and row filter on one table, for
+    /// `GRANT SELECT ... MASKED WITH (...) / ROWS WHERE ...`. Each one
+    /// replaces what the grantee held for that column (or the table's row
+    /// filter); everything else is left alone.
+    async fn set_grant_policies(
+        &self,
+        _spec: &sqe_sql::grant_policy::GrantPolicySpec,
+    ) -> sqe_core::Result<()> {
+        Err(sqe_core::SqeError::NotImplemented(
+            "GRANT ... MASKED WITH / ROWS WHERE requires [policy] engine = \"ranger\"".to_string(),
+        ))
+    }
+
+    /// Remove every column mask and row filter `principal` holds on one table,
+    /// for `REVOKE SELECT` / `REVOKE ALL PRIVILEGES`. Returns how many entries
+    /// were removed. A store with nothing to remove returns `Ok(0)`, so the
+    /// default does: a REVOKE must not fail on a backend that has no masks.
+    async fn clear_grant_policies(
+        &self,
+        _table: &str,
+        _principal: &sqe_sql::policy_ddl::PolicyPrincipal,
+    ) -> sqe_core::Result<usize> {
+        Ok(0)
+    }
+
     /// Invalidate any cached policy decisions so the next `resolve()` call
     /// re-reads from the backing engine.
     ///
