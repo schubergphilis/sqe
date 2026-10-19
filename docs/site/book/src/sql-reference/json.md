@@ -157,7 +157,7 @@ FROM events;
 
 ## Iceberg JSON column type
 
-Iceberg has no JSON primitive. SQE accepts `JSON` in CREATE TABLE and stores it as `VARIANT` on a V3 table (the default) and as a string on a V2 table. Either way it reads back as JSON text, and the `json*` functions accept both. Existing string columns are not converted. See [DDL, VARIANT](./ddl.md#variant).
+Iceberg has no JSON primitive. SQE accepts `JSON` in CREATE TABLE and stores it as `VARIANT` on a V3 table (the default) and as a string on a V2 table. Either way it reads back as JSON text, and the `json*` functions accept both. On a variant, `variant_get(j, '$.a.b', 'int')` reads a typed field without rendering the value as JSON text (it does not take a string column). Existing string columns are not converted. See [DDL, VARIANT](./ddl.md#variant).
 
 ## What is not registered
 

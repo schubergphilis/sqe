@@ -350,3 +350,140 @@ async fn json_functions_read_a_v3_json_column() {
     );
     drop(&handler, &session, fq).await;
 }
+
+/// `variant_get` reads typed fields of a stored variant column, a missing
+/// path is NULL, and without a type the result is a variant (#857).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn variant_get_reads_typed_fields() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let fq = "default.variant_get_fields";
+    drop(&handler, &session, fq).await;
+    for sql in [
+        format!("CREATE TABLE {fq} (id INT, v VARIANT)"),
+        format!(
+            r#"INSERT INTO {fq} VALUES
+               (1, '{{"n": 7, "s": "x", "d": 1.25, "a": {{"b": [10, 20]}}}}'),
+               (2, '{{"n": 8}}'), (3, NULL)"#
+        ),
+    ] {
+        handler.execute(&session, &sql, None).await.expect(&sql);
+    }
+    assert_eq!(
+        rows(
+            &handler,
+            &session,
+            &format!(
+                "SELECT id, variant_get(v, '$.n', 'int') + 1, variant_get(v, '$.s', 'string'), \
+                 variant_get(v, '$.d', 'decimal(5,2)'), variant_get(v, '$.a.b[1]', 'bigint'), \
+                 variant_get(v, '$.a') FROM {fq} ORDER BY id"
+            )
+        )
+        .await,
+        vec![
+            r#"1|8|x|1.25|20|{"b":[10,20]}"#,
+            "2|9|NULL|NULL|NULL|NULL",
+            "3|NULL|NULL|NULL|NULL|NULL",
+        ]
+    );
+    // In a predicate, too.
+    assert_eq!(
+        rows(
+            &handler,
+            &session,
+            &format!("SELECT id FROM {fq} WHERE variant_get(v, '$.n', 'int') > 7")
+        )
+        .await,
+        vec!["2"]
+    );
+    // A value that does not convert errors; try_variant_get gives NULL.
+    handler
+        .execute(
+            &session,
+            &format!("SELECT variant_get(v, '$.s', 'int') FROM {fq}"),
+            None,
+        )
+        .await
+        .expect_err("'x' is not an int");
+    assert_eq!(
+        rows(
+            &handler,
+            &session,
+            &format!("SELECT try_variant_get(v, '$.s', 'int') FROM {fq} WHERE id = 1")
+        )
+        .await,
+        vec!["NULL"]
+    );
+    drop(&handler, &session, fq).await;
+}
+
+/// `rewrite_data_files` merges the small files of a variant table and every
+/// value reads back the same, as JSON and through `variant_get` (#857).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn rewrite_data_files_preserves_variant_values() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let fq = "default.variant_compaction";
+    drop(&handler, &session, fq).await;
+    handler
+        .execute(
+            &session,
+            &format!("CREATE TABLE {fq} (id INT, v VARIANT)"),
+            None,
+        )
+        .await
+        .expect("CREATE TABLE with VARIANT");
+    // One file per INSERT; a mix of objects, arrays, scalars and NULLs.
+    let values = [
+        r#"'{"k": 0, "tags": ["a", "b"]}'"#,
+        "'[1, 2.5, null]'",
+        "'42'",
+        r#"'"text"'"#,
+        "NULL",
+        r#"'{"k": 5, "nested": {"deep": true}}'"#,
+    ];
+    for (i, value) in values.iter().enumerate() {
+        handler
+            .execute(
+                &session,
+                &format!("INSERT INTO {fq} VALUES ({i}, {value})"),
+                None,
+            )
+            .await
+            .expect("INSERT");
+    }
+    let select = format!("SELECT id, v, variant_get(v, '$.k', 'int') FROM {fq} ORDER BY id");
+    let before = rows(&handler, &session, &select).await;
+    assert_eq!(
+        before,
+        vec![
+            r#"0|{"k":0,"tags":["a","b"]}|0"#,
+            "1|[1,2.5,null]|NULL",
+            "2|42|NULL",
+            r#"3|"text"|NULL"#,
+            "4|NULL|NULL",
+            r#"5|{"k":5,"nested":{"deep":true}}|5"#,
+        ]
+    );
+    let files = "SELECT COUNT(*) FROM table_files('default', 'variant_compaction')";
+    assert_eq!(rows(&handler, &session, files).await, vec!["6"]);
+
+    handler
+        .execute(
+            &session,
+            &format!("CALL system.rewrite_data_files(table => '{fq}', min_input_files => 2)"),
+            None,
+        )
+        .await
+        .expect("rewrite_data_files on a variant table");
+
+    assert_eq!(
+        rows(&handler, &session, files).await,
+        vec!["1"],
+        "the six files merge into one"
+    );
+    assert_eq!(rows(&handler, &session, &select).await, before);
+    let ddl = show_create(&handler, &session, fq).await;
+    assert!(ddl.contains("v VARIANT"), "still a variant column: {ddl}");
+    drop(&handler, &session, fq).await;
+}

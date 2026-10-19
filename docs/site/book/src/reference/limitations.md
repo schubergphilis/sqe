@@ -53,7 +53,6 @@ V3 is the default format-version for new tables and landed end to end: default v
 |---|---|
 | Geometry / geography types | Not supported. No SQE type and no DataFusion user-defined-type support. |
 | Multi-arg partition transforms | Not supported. `PARTITIONED BY` accepts single-source transforms only. |
-| Variant path functions (`variant_get`) | Not supported. Read fields through the variant's JSON text with the `json*` functions. |
 | Shredded variant writes | SQE reads shredded variant files written by other engines, but writes unshredded variants. |
 | Nested unknown fields | `STRUCT<a INT, u VOID>` is refused on write and cannot be read. |
 

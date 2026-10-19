@@ -324,6 +324,7 @@ pub fn build_embedded_context_with_mask(
     // functions read it as its JSON text (#849). After every JSON function
     // is registered, so none is missed.
     sqe_core::variant_json_args::accept_variant_in_json_functions(&ctx);
+    sqe_core::variant_get::register_variant_functions(&ctx);
 
     // File-format TVFs for direct file access. The embedded CLI runs
     // in-process as the local user, who already has shell + filesystem
