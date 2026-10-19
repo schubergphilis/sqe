@@ -355,18 +355,6 @@ pub trait PolicyStore: Send + Sync {
         ))
     }
 
-    /// Remove every column mask and row filter `principal` holds on one table,
-    /// for `REVOKE SELECT` / `REVOKE ALL PRIVILEGES`. Returns how many entries
-    /// were removed. A store with nothing to remove returns `Ok(0)`, so the
-    /// default does: a REVOKE must not fail on a backend that has no masks.
-    async fn clear_grant_policies(
-        &self,
-        _table: &str,
-        _principal: &sqe_sql::policy_ddl::PolicyPrincipal,
-    ) -> sqe_core::Result<usize> {
-        Ok(0)
-    }
-
     /// Invalidate any cached policy decisions so the next `resolve()` call
     /// re-reads from the backing engine.
     ///

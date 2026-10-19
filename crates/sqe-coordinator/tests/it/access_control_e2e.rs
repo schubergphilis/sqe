@@ -4318,11 +4318,12 @@ async fn wait_for_ssn(ctx: &AcCtx, s: &Session, what: &str, expected: &[&str]) {
 ///
 /// Two roles masked on the same column share ONE Ranger policy (a second
 /// policy on the same resource is refused by Ranger), each with its own item.
-/// REVOKE removes only the revoked role's item, and the last REVOKE deletes
-/// the policy. bob holds engineer and analyst, alice only analyst.
+/// REVOKE leaves every item in place: bob holds engineer and analyst, so after
+/// engineer's SELECT is revoked he still reads through analyst, and he must
+/// still get the engineer mask, not the real values. alice holds only analyst.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:ranger; run scripts/access-control-test.sh"]
-async fn grant_masked_with_per_role_items_and_revoke_cleanup() {
+async fn grant_masked_with_per_role_items_survive_revoke() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
     let ctx = ac_setup().await;
@@ -4380,20 +4381,29 @@ async fn grant_masked_with_per_role_items_and_revoke_cleanup() {
     )
     .await;
 
-    // REVOKE engineer: bob still reads through analyst, now with its mask.
+    // REVOKE engineer: bob still reads through analyst, and the engineer item
+    // still applies to him. The policy cache is flushed by the REVOKE, so this
+    // read sees Ranger's state after it.
     exec_ok(
         &ctx,
         &ctx.carol,
         &format!("REVOKE SELECT ON {ORDERS} FROM ROLE \"engineer\""),
     )
     .await;
-    wait_for_ssn(
-        &ctx,
-        &ctx.bob,
-        "bob falls back to the analyst mask",
-        &["ana", "ana"],
-    )
-    .await;
+    let rows = ctx
+        .handler
+        .execute(
+            &ctx.bob,
+            &format!("SELECT ssn FROM {ORDERS} ORDER BY id"),
+            None,
+        )
+        .await
+        .expect("bob still reads through analyst");
+    assert_eq!(
+        col_strings(&rows, "ssn"),
+        ["eng-1111", "eng-3333"],
+        "REVOKE must not unmask a role that still reads another way"
+    );
     let masks: Vec<_> = grant_policies_on_orders(&ctx.ranger)
         .await
         .into_iter()
@@ -4401,8 +4411,8 @@ async fn grant_masked_with_per_role_items_and_revoke_cleanup() {
         .collect();
     assert_eq!(
         masks[0]["dataMaskPolicyItems"].as_array().map(Vec::len),
-        Some(1),
-        "REVOKE removes only the engineer item: {:?}",
+        Some(2),
+        "REVOKE keeps the engineer item: {:?}",
         masks[0]
     );
 
@@ -4422,7 +4432,8 @@ async fn grant_masked_with_per_role_items_and_revoke_cleanup() {
     )
     .await;
 
-    // The last REVOKE deletes both policies.
+    // The last REVOKE deletes nothing either: the mask and row-filter
+    // policies both stay.
     exec_ok(
         &ctx,
         &ctx.carol,
@@ -4430,10 +4441,7 @@ async fn grant_masked_with_per_role_items_and_revoke_cleanup() {
     )
     .await;
     let left = grant_policies_on_orders(&ctx.ranger).await;
-    assert!(
-        left.is_empty(),
-        "empty grant policies are deleted: {left:?}"
-    );
+    assert_eq!(left.len(), 2, "REVOKE deletes no grant policy: {left:?}");
 
     // A non-admin cannot attach masks.
     let err = ctx
@@ -4445,8 +4453,10 @@ async fn grant_masked_with_per_role_items_and_revoke_cleanup() {
         )
         .await
         .expect_err("GRANT ... MASKED WITH is admin-only");
-    assert!(
-        grant_policies_on_orders(&ctx.ranger).await.is_empty(),
+    assert_eq!(
+        grant_policies_on_orders(&ctx.ranger).await,
+        left,
         "a refused GRANT writes no policy ({err})"
     );
+    delete_grant_policies_on_orders(&ctx.ranger).await;
 }
