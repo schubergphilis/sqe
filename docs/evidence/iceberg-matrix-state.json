@@ -97,11 +97,9 @@
     },
     "sqe:column-default-values:v3": {
       "level": "full",
-      "notes": "CREATE TABLE ... DEFAULT <literal> and ALTER TABLE ADD COLUMN ... DEFAULT set write_default and initial_default. INSERT with a column list and MERGE INSERT write an omitted column's write_default. Rows in files that predate the column read its initial_default, in projections and in predicates, on both coordinator scan paths and on workers. Function-call defaults rejected with clear error.",
-      "evidence": "crates/sqe-coordinator/tests/it/v3_e2e.rs::create_table_default_applies_on_insert_and_merge, crates/sqe-coordinator/tests/it/v3_e2e.rs::alter_add_column_with_default_on_v3_table, crates/sqe-coordinator/tests/it/distributed_schema_evolution_e2e.rs::files_from_before_add_column_and_rename_read_correctly_on_a_worker",
-      "caveats": [
-        "Binary, fixed and UUID defaults are refused on INSERT rather than applied."
-      ]
+      "notes": "CREATE TABLE ... DEFAULT <literal> and ALTER TABLE ADD COLUMN ... DEFAULT set write_default and initial_default. INSERT with a column list and MERGE INSERT write an omitted column's write_default. Rows in files that predate the column read its initial_default, in projections and in predicates, on both coordinator scan paths and on workers. A quoted default on a DATE, TIMESTAMP, DECIMAL, BINARY or numeric column is stored as a value of the column's type (X'..' for bytes); binary, fixed and UUID defaults are written on INSERT and MERGE INSERT. Function-call defaults and values that do not parse as the column type are rejected with a clear error.",
+      "evidence": "crates/sqe-coordinator/tests/it/v3_e2e.rs::create_table_default_applies_on_insert_and_merge, crates/sqe-coordinator/tests/it/v3_e2e.rs::typed_defaults_apply_on_insert_merge_and_alter, crates/sqe-coordinator/tests/it/v3_e2e.rs::alter_add_column_with_default_on_v3_table, crates/sqe-coordinator/tests/it/distributed_schema_evolution_e2e.rs::files_from_before_add_column_and_rename_read_correctly_on_a_worker, crates/sqe-write/src/write_handler.rs#default_text_becomes_a_literal_of_the_column_type",
+      "caveats": []
     },
     "sqe:table-creation:v2": {
       "level": "full",
