@@ -115,6 +115,20 @@ fn boolean_default_is_extracted() {
 }
 
 #[test]
+fn hex_default_is_extracted_as_bytes() {
+    let stmt = parse("CREATE TABLE t (b BINARY DEFAULT X'01aB')");
+    let default = column_default(&stmt, "b").expect("DEFAULT present");
+    assert_eq!(
+        extract_default_literal(default).unwrap(),
+        DefaultLiteral::Bytes(vec![0x01, 0xab])
+    );
+
+    let stmt = parse("CREATE TABLE t (b BINARY DEFAULT X'012')");
+    let default = column_default(&stmt, "b").expect("DEFAULT present");
+    assert!(extract_default_literal(default).is_err());
+}
+
+#[test]
 fn function_default_is_rejected_with_clear_error() {
     let stmt = parse("CREATE TABLE t (ts TIMESTAMP DEFAULT current_timestamp())");
     let default = column_default(&stmt, "ts").expect("DEFAULT present");
