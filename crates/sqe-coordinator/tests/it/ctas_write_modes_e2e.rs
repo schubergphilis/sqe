@@ -433,6 +433,86 @@ async fn ctas_write_mode_properties_survive_to_metadata() {
     let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {fq}")).await;
 }
 
+/// The single DDL string `SHOW CREATE TABLE` returns.
+async fn show_create(
+    handler: &sqe_coordinator::QueryHandler,
+    session: &sqe_core::Session,
+    table: &str,
+) -> String {
+    let batches = exec(handler, session, &format!("SHOW CREATE TABLE {table}")).await;
+    batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("ddl")
+        .value(0)
+        .to_string()
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SHOW CREATE TABLE straight after a commit lists the columns (#850). Every
+// table commit drops the namespace's listing snapshot, and SHOW CREATE TABLE
+// read `information_schema.columns` without the pre-plan refresh that fills
+// it, so the body came back empty until some other query re-listed.
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn show_create_table_right_after_ctas_lists_columns_850() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let src = "default.show_create_src_850";
+    let dst = "default.show_create_ctas_850";
+    for t in [src, dst] {
+        let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {t}")).await;
+    }
+    exec(
+        &handler,
+        &session,
+        &format!("CREATE TABLE {src} (id INT, s VARCHAR)"),
+    )
+    .await;
+    exec(
+        &handler,
+        &session,
+        &format!("INSERT INTO {src} VALUES (1, 'a')"),
+    )
+    .await;
+    exec(
+        &handler,
+        &session,
+        &format!("CREATE TABLE {dst} AS SELECT id, s FROM {src}"),
+    )
+    .await;
+
+    let ddl = show_create(&handler, &session, dst).await;
+    assert!(
+        ddl.contains("   id ") && ddl.contains("   s "),
+        "SHOW CREATE TABLE right after CTAS: {ddl}"
+    );
+
+    // ALTER and INSERT are commits too; neither may empty the next SHOW CREATE.
+    exec(
+        &handler,
+        &session,
+        &format!("ALTER TABLE {dst} ADD COLUMN n BIGINT"),
+    )
+    .await;
+    exec(
+        &handler,
+        &session,
+        &format!("INSERT INTO {dst} VALUES (2, 'b', 3)"),
+    )
+    .await;
+    let ddl = show_create(&handler, &session, dst).await;
+    assert!(
+        ddl.contains("   id ") && ddl.contains("   s ") && ddl.contains("   n "),
+        "SHOW CREATE TABLE right after ALTER + INSERT: {ddl}"
+    );
+
+    for t in [src, dst] {
+        let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {t}")).await;
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Round trip over the upstream #179 path: a CoW rewrite on a table that
 // already carries delete manifests (from a prior MoR DELETE) must fold
