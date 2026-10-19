@@ -13,8 +13,9 @@
 //!   [AS OF VERSION 12345]
 //!   [WITH RETENTION (max_ref_age_ms => 86400000)]
 //!
-//! ALTER TABLE ns.t DROP BRANCH feature_x [IF EXISTS]
-//! ALTER TABLE ns.t DROP TAG v1 [IF EXISTS]
+//! ALTER TABLE ns.t DROP BRANCH [IF EXISTS] feature_x
+//! ALTER TABLE ns.t DROP TAG [IF EXISTS] v1
+//! ALTER TABLE ns.t DROP TAG v1 [IF EXISTS]   -- also accepted
 //! ```
 
 use sqe_core::{Result, SqeError, SqeErrorCode};
@@ -128,9 +129,7 @@ pub fn try_parse_ref_ddl(sql: &str) -> Result<Option<RefDdl>> {
         let after_drop = rest_trimmed[5..].trim_start();
         let after_drop_upper = after_drop.to_ascii_uppercase();
         if after_drop_upper.starts_with("BRANCH ") {
-            let after_kw = after_drop[7..].trim_start();
-            let (name, tail) = split_identifier(after_kw)?;
-            let if_exists = parse_if_exists(tail)?;
+            let (name, if_exists) = parse_drop_target(after_drop[7..].trim_start())?;
             return Ok(Some(RefDdl::DropBranch {
                 table,
                 name,
@@ -138,9 +137,7 @@ pub fn try_parse_ref_ddl(sql: &str) -> Result<Option<RefDdl>> {
             }));
         }
         if after_drop_upper.starts_with("TAG ") {
-            let after_kw = after_drop[4..].trim_start();
-            let (name, tail) = split_identifier(after_kw)?;
-            let if_exists = parse_if_exists(tail)?;
+            let (name, if_exists) = parse_drop_target(after_drop[4..].trim_start())?;
             return Ok(Some(RefDdl::DropTag {
                 table,
                 name,
@@ -150,6 +147,37 @@ pub fn try_parse_ref_ddl(sql: &str) -> Result<Option<RefDdl>> {
     }
 
     Ok(None)
+}
+
+/// The ref name and IF EXISTS of a DROP BRANCH / DROP TAG. IF EXISTS goes
+/// before the name in Iceberg's Spark syntax (`DROP TAG IF EXISTS v1`) and
+/// after it in SQE's original form (`DROP TAG v1 IF EXISTS`); both parse.
+fn parse_drop_target(after_kw: &str) -> Result<(String, bool)> {
+    if let Some(rest) = strip_keyword(after_kw, "IF").and_then(|r| strip_keyword(r, "EXISTS")) {
+        let (name, tail) = split_identifier(rest)?;
+        if !tail.trim().is_empty() {
+            return Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("unexpected tokens after branch/tag name: '{}'", tail.trim()),
+            ));
+        }
+        return Ok((name, true));
+    }
+    let (name, tail) = split_identifier(after_kw)?;
+    Ok((name, parse_if_exists(tail)?))
+}
+
+/// `s` after a leading `keyword` (any case) and the whitespace that follows
+/// it. A keyword with nothing after it is not stripped, so a ref named `if`
+/// still parses as a name.
+fn strip_keyword<'a>(s: &'a str, keyword: &str) -> Option<&'a str> {
+    let head = s.get(..keyword.len())?;
+    let rest = &s[keyword.len()..];
+    if !head.eq_ignore_ascii_case(keyword) || !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    (!rest.is_empty()).then_some(rest)
 }
 
 fn parse_if_exists(tail: &str) -> Result<bool> {
@@ -511,6 +539,54 @@ mod tests {
             }
             other => panic!("expected DropTag, got {other:?}"),
         }
+    }
+
+    // Iceberg's Spark syntax puts IF EXISTS before the name (#865).
+    #[test]
+    fn drop_ref_if_exists_before_the_name() {
+        let tag = try_parse_ref_ddl("ALTER TABLE t DROP TAG if  exists v1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            tag,
+            RefDdl::DropTag {
+                table: "t".to_string(),
+                name: "v1".to_string(),
+                if_exists: true,
+            }
+        );
+        let branch = try_parse_ref_ddl("ALTER TABLE t DROP BRANCH IF EXISTS stale")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            branch,
+            RefDdl::DropBranch {
+                table: "t".to_string(),
+                name: "stale".to_string(),
+                if_exists: true,
+            }
+        );
+    }
+
+    #[test]
+    fn drop_ref_named_if_is_a_name() {
+        let ddl = try_parse_ref_ddl("ALTER TABLE t DROP TAG if")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ddl,
+            RefDdl::DropTag {
+                table: "t".to_string(),
+                name: "if".to_string(),
+                if_exists: false,
+            }
+        );
+    }
+
+    #[test]
+    fn drop_ref_if_exists_on_both_sides_is_refused() {
+        let err = try_parse_ref_ddl("ALTER TABLE t DROP TAG IF EXISTS v1 IF EXISTS").unwrap_err();
+        assert!(err.to_string().contains("unexpected tokens"), "{err}");
     }
 
     #[test]

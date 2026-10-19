@@ -172,10 +172,8 @@
     "sqe:branching-tagging:v2": {
       "level": "full",
       "notes": "ALTER TABLE CREATE/DROP BRANCH and TAG with retention options, SET WRITE_BRANCH routes INSERT / DELETE / UPDATE to a branch, FOR VERSION AS OF '<ref>' reads it.",
-      "evidence": "vendor/iceberg-rust/crates/iceberg/src/transaction/branch.rs, crates/sqe-sql/src/ddl.rs, crates/sqe-coordinator/tests/it/integration_test.rs::test_write_branch_routes_writes_to_the_branch, crates/sqe-coordinator/tests/it/integration_test.rs::test_iceberg_ref_tag_create_read_drop",
-      "caveats": [
-        "DROP BRANCH / DROP TAG take IF EXISTS after the name (DROP TAG t IF EXISTS); the Iceberg Spark form DROP TAG IF EXISTS t is rejected."
-      ]
+      "evidence": "vendor/iceberg-rust/crates/iceberg/src/transaction/branch.rs, crates/sqe-sql/src/ddl.rs, crates/sqe-coordinator/tests/it/integration_test.rs::test_write_branch_routes_writes_to_the_branch, crates/sqe-coordinator/tests/it/integration_test.rs::test_iceberg_ref_tag_create_read_drop, crates/sqe-coordinator/tests/it/integration_test.rs::test_iceberg_ref_write_branch_refuses_a_tag",
+      "caveats": []
     },
     "sqe:branching-tagging:v3": {
       "level": "full",
