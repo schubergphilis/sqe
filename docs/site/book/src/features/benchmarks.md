@@ -24,18 +24,18 @@ For the longitudinal view (every benchmark JSON in `benchmarks/results/` plotted
 
 ## Results (vs Trino 481)
 
-The numbers below are the latest run, as of 2026-07-09, against Trino 481 on identical Iceberg tables and S3 storage, both engines capped at 12 GB on a dedicated 8-core host. SQE is faster on seven of eight suites at SF1 and on six of seven at SF10, where SSB is at parity.
+The numbers below compare SQE with Trino 481 on identical Iceberg tables and S3 storage. The SF1 columns are from the 2026-10-10 sweep. The SF10 columns are from the 2026-07-09 run, with both engines capped at 12 GB on a dedicated 8-core host; SF10 has not been re-run against Trino since. SQE is faster on all eight suites at SF1 and on six of seven at SF10, where SSB is at parity.
 
-| Suite | SF1 SQE | SF1 Trino | SF1 speedup | SF10 SQE | SF10 Trino | SF10 speedup |
+| Suite | SF1 SQE (Oct) | SF1 Trino (Oct) | SF1 speedup | SF10 SQE (Jul) | SF10 Trino (Jul) | SF10 speedup |
 |---|---|---|---|---|---|---|
-| TPC-H (22) | 14.2s | 40.8s | 2.9x | 66.5s | 111.9s | 1.7x |
-| TPC-DS (99) | 49.3s | 114.9s | 2.3x | 216.6s | 320.5s | 1.5x |
-| SSB (13) | 5.2s | 7.3s | 1.4x | 20.4s | 21.4s | 1.0x |
-| ClickBench (43) | 3.1s | 7.3s | 2.4x | 10.0s | 31.6s | 3.2x |
-| TPC-E (11) | 3.8s | 11.6s | 3.0x | test-only | test-only | - |
-| TPC-BB (10) | 53.7s | 480.5s | 8.9x | 405.5s | 1429.7s | 3.5x |
-| Bank (8) | 10.5s | 19.8s | 1.9x | 370.5s | 85.5s | 0.23x |
-| TPC-C (8 read) | 5.6s | 4.3s | 0.77x | 5.0s | 18.0s | 3.6x |
+| TPC-H (22) | 12.6s | 32.6s | 2.6x | 66.5s | 111.9s | 1.7x |
+| TPC-DS (99) | 34.2s | 95.9s | 2.8x | 216.6s | 320.5s | 1.5x |
+| SSB (13) | 3.2s | 5.5s | 1.7x | 20.4s | 21.4s | 1.0x |
+| ClickBench (43) | 1.7s | 4.8s | 2.8x | 10.0s | 31.6s | 3.2x |
+| TPC-E (11) | 0.7s | 4.8s | 7.2x | test-only | test-only | - |
+| TPC-BB (10) | 25.4s | 96.5s | 3.8x | 405.5s | 1429.7s | 3.5x |
+| Bank (8) | 12.0s | 37.7s | 3.1x | 370.5s | 85.5s | 0.23x |
+| TPC-C (8 read) | 1.1s | 5.3s | 4.9x | 5.0s | 18.0s | 3.6x |
 
 Run-to-run variance is real, so treat each figure as approximate. The full per-query timeline is on [getsqe.com/performance](https://getsqe.com/performance).
 
@@ -43,9 +43,9 @@ TPC-BB is lopsided. On the 2026-08-15 Flight SF1 run the suite is 63.1s and q01 
 
 ### Where SQE trails
 
-- **TPC-C at SF1 (0.77x)**: the read queries are sub-second, so fixed dispatch overhead dominates. At SF10 SQE is ahead (3.6x).
-- **Bank at SF10 (0.23x, 7/8)**: spill stalls under an 8 GB memory pool. A fix is in progress.
-- **ClickBench (40/43)**: three queries are pending a LIMIT-drop regression (q17).
+- **Bank at SF10 (0.23x, 7/8, July run)**: spill stalled under an 8 GB memory pool. The October memory-pool and spill fixes have not been measured at SF10 yet.
+- **ClickBench at SF1 (41/43)**: the other two queries return no rows on either engine, so they count as vacuous, not as passes.
+- **TPC-DS at SF1 (98/99)**: q64 returns no rows on either engine since a data-generator change; it was 2 rows before.
 - **TPC-E at SF10**: the differential check needs about 14 GB for a 10M-row result, so SF10 is validated test-only.
 
 ### How it is validated
