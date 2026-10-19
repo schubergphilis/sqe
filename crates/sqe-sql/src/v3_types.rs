@@ -81,6 +81,8 @@ pub enum DefaultLiteral {
     Bool(bool),
     /// UTF-8 string literal.
     String(String),
+    /// Hex byte-string literal (`X'0102'`), for BINARY and FIXED columns.
+    Bytes(Vec<u8>),
     /// Explicit SQL NULL.
     Null,
 }
@@ -102,7 +104,7 @@ impl std::error::Error for DefaultError {}
 
 /// Convert a sqlparser column-default `Expr` into a literal kind.
 ///
-/// Accepts integer, float, string, boolean, typed cast of the same, and
+/// Accepts integer, float, string, `X'hex'`, boolean, typed cast of the same, and
 /// `NULL`. Anything else (function calls like `current_timestamp()`,
 /// arithmetic, correlated subqueries) fails with `DefaultError` naming
 /// the accepted forms.
@@ -184,17 +186,30 @@ fn value_to_literal(value: &Value) -> Result<DefaultLiteral, DefaultError> {
         | Value::DollarQuotedString(sqlparser::ast::DollarQuotedString { value: s, .. }) => {
             Ok(DefaultLiteral::String(s.clone()))
         }
+        Value::HexStringLiteral(hex) => decode_hex(hex)
+            .map(DefaultLiteral::Bytes)
+            .ok_or_else(|| reject(&format!("`X'{hex}'` is not an even number of hex digits"))),
         Value::Boolean(b) => Ok(DefaultLiteral::Bool(*b)),
         Value::Null => Ok(DefaultLiteral::Null),
         _ => Err(reject(&format!("literal kind `{value}` is not supported"))),
     }
 }
 
+fn decode_hex(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
 fn reject(detail: &str) -> DefaultError {
     DefaultError {
         message: format!(
             "unsupported DEFAULT expression: {detail}. Accepted forms: integer, \
-             float, string, boolean, NULL, or a typed cast of the same"
+             float, string, X'hex', boolean, NULL, or a typed cast of the same"
         ),
     }
 }

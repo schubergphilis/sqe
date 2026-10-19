@@ -173,8 +173,8 @@ fn reorder_insert_select(
 ///
 /// The default goes through its Iceberg JSON form (decimals, dates and
 /// timestamps are strings there) and `arrow_cast` from text, so every type
-/// a text cast can parse is covered. Binary, fixed and UUID defaults cannot
-/// round-trip that way; they are refused instead of written as NULL.
+/// a text cast can parse is covered. Binary, fixed and UUID defaults are
+/// bytes, so they are written as a hex literal (`X'..'`) instead.
 pub(crate) fn omitted_column_sql(field: &iceberg::spec::NestedField) -> sqe_core::Result<String> {
     use iceberg::spec::{PrimitiveType, Type};
 
@@ -188,12 +188,6 @@ pub(crate) fn omitted_column_sql(field: &iceberg::spec::NestedField) -> sqe_core
             field.name, field.field_type
         ))
     };
-    if matches!(
-        field.field_type.as_ref(),
-        Type::Primitive(PrimitiveType::Binary | PrimitiveType::Fixed(_) | PrimitiveType::Uuid)
-    ) {
-        return Err(unsupported());
-    }
     let text = match default.clone().try_into_json(&field.field_type) {
         Ok(serde_json::Value::Bool(b)) => b.to_string(),
         Ok(serde_json::Value::Number(n)) => n.to_string(),
@@ -202,10 +196,20 @@ pub(crate) fn omitted_column_sql(field: &iceberg::spec::NestedField) -> sqe_core
     };
     let arrow_type =
         iceberg::arrow::type_to_arrow_type(&field.field_type).map_err(|_| unsupported())?;
-    Ok(format!(
-        "arrow_cast('{}', '{arrow_type}')",
-        text.replace('\'', "''")
-    ))
+    match field.field_type.as_ref() {
+        // The JSON form of binary and fixed is already hex; a UUID's is
+        // its hyphenated text, which is hex once the hyphens go.
+        Type::Primitive(PrimitiveType::Binary | PrimitiveType::Fixed(_) | PrimitiveType::Uuid) => {
+            Ok(format!(
+                "arrow_cast(X'{}', '{arrow_type}')",
+                text.replace('-', "")
+            ))
+        }
+        _ => Ok(format!(
+            "arrow_cast('{}', '{arrow_type}')",
+            text.replace('\'', "''")
+        )),
+    }
 }
 
 /// [`omitted_column_sql`] for every top-level column that has a
@@ -8416,7 +8420,7 @@ pub fn default_to_iceberg_literal(
     sql_literal: &sqe_sql::DefaultLiteral,
     target: &iceberg::spec::Type,
 ) -> Result<Option<iceberg::spec::Literal>, String> {
-    use iceberg::spec::{Literal, PrimitiveLiteral, PrimitiveType, Type};
+    use iceberg::spec::{Literal, PrimitiveType, Type};
     use sqe_sql::DefaultLiteral;
 
     let prim = match target {
@@ -8457,13 +8461,97 @@ pub fn default_to_iceberg_literal(
         (DefaultLiteral::Float(f), PrimitiveType::Double) => Some(Literal::double(*f)),
         (DefaultLiteral::Bool(b), PrimitiveType::Boolean) => Some(Literal::bool(*b)),
         (DefaultLiteral::String(s), PrimitiveType::String) => Some(Literal::string(s)),
-        // Fall back: wrap string-like literals as strings.
-        (DefaultLiteral::String(s), _) => {
-            Some(Literal::Primitive(PrimitiveLiteral::String(s.clone())))
+        (DefaultLiteral::Int(i), PrimitiveType::Decimal { .. }) => {
+            typed_default_from_text(&i.to_string(), target)?
         }
+        (DefaultLiteral::Float(f), PrimitiveType::Decimal { .. }) => {
+            typed_default_from_text(&f.to_string(), target)?
+        }
+        (DefaultLiteral::Bytes(b), PrimitiveType::Binary) => Some(Literal::binary(b.clone())),
+        (DefaultLiteral::Bytes(b), PrimitiveType::Fixed(len)) => {
+            if b.len() as u64 != *len {
+                return Err(format!(
+                    "DEFAULT literal has {} bytes; FIXED({len}) needs exactly {len}",
+                    b.len()
+                ));
+            }
+            Some(Literal::fixed(b.clone()))
+        }
+        // A quoted default for any other type is the value in text form
+        // ('2024-01-02', '1.50', hex for BINARY). It must become a literal
+        // of the column's own type: a string literal under a DATE column
+        // made the metadata writer panic.
+        (DefaultLiteral::String(s), _) => typed_default_from_text(s, target)?,
         _ => None,
     };
+    if let Some(lit) = &lit {
+        // The metadata writer serialises defaults with try_into_json and
+        // panics when that fails; refuse such a value here instead.
+        lit.clone()
+            .try_into_json(target)
+            .map_err(|e| format!("DEFAULT literal cannot be stored as {target}: {e}"))?;
+    }
     Ok(lit)
+}
+
+/// Parse a DEFAULT given as text into a literal of `target`, through the
+/// Iceberg JSON form. Numbers and booleans are read as JSON, everything else
+/// as a JSON string. Timestamps also take a space between date and time,
+/// and timestamptz takes `Z` or no offset as UTC.
+fn typed_default_from_text(
+    text: &str,
+    target: &iceberg::spec::Type,
+) -> Result<Option<iceberg::spec::Literal>, String> {
+    use iceberg::spec::{PrimitiveType, Type};
+
+    let invalid =
+        |e: &dyn std::fmt::Display| format!("'{text}' is not a valid {target} value: {e}");
+    let trimmed = text.trim();
+    let json = match target {
+        Type::Primitive(
+            PrimitiveType::Int
+            | PrimitiveType::Long
+            | PrimitiveType::Float
+            | PrimitiveType::Double
+            | PrimitiveType::Boolean,
+        ) => serde_json::from_str::<serde_json::Value>(&trimmed.to_ascii_lowercase())
+            .map_err(|e| invalid(&e))?,
+        Type::Primitive(
+            PrimitiveType::Timestamp
+            | PrimitiveType::TimestampNs
+            | PrimitiveType::Timestamptz
+            | PrimitiveType::TimestamptzNs,
+        ) => {
+            let mut ts = trimmed.replacen(' ', "T", 1);
+            if matches!(
+                target,
+                Type::Primitive(PrimitiveType::Timestamptz | PrimitiveType::TimestamptzNs)
+            ) {
+                if let Some(utc) = ts.strip_suffix('Z') {
+                    ts = format!("{utc}+00:00");
+                } else if !ts[ts.find('T').map_or(0, |t| t + 1)..].contains(['+', '-']) {
+                    ts.push_str("+00:00");
+                }
+            }
+            serde_json::Value::String(ts)
+        }
+        Type::Primitive(PrimitiveType::Decimal { precision, scale }) => {
+            // Rescaling to the column's scale rounds; refuse a value that
+            // would not be stored exactly.
+            let digits = trimmed.trim_start_matches(['+', '-']);
+            let (int_part, frac_part) = digits.split_once('.').unwrap_or((digits, ""));
+            let int_digits = int_part.trim_start_matches('0').len() as u32;
+            let frac_digits = frac_part.trim_end_matches('0').len() as u32;
+            if frac_digits > *scale || int_digits > precision.saturating_sub(*scale) {
+                return Err(invalid(&format!(
+                    "it does not fit DECIMAL({precision},{scale}) exactly"
+                )));
+            }
+            serde_json::Value::String(trimmed.to_string())
+        }
+        _ => serde_json::Value::String(trimmed.to_string()),
+    };
+    iceberg::spec::Literal::try_from_json(json, target).map_err(|e| invalid(&e))
 }
 
 /// Decide whether a CREATE TABLE definition requires Iceberg format-version 3.
@@ -10648,6 +10736,9 @@ SET c = ( \
                 None => f,
             }
         };
+        let ab = Literal::binary([1u8, 0xab]);
+        let uuid = Literal::uuid(Uuid::from_u128(0x0102));
+        let uuid_hex = "00000000000000000000000000000102";
         let cases = [
             (field(PrimitiveType::Int, Some(Literal::int(7))), "7"),
             (field(PrimitiveType::Long, Some(Literal::long(-3))), "-3"),
@@ -10662,6 +10753,9 @@ SET c = ( \
                 ),
                 "123.45",
             ),
+            (field(PrimitiveType::Binary, Some(ab.clone())), "01ab"),
+            (field(PrimitiveType::Fixed(2), Some(ab)), "01ab"),
+            (field(PrimitiveType::Uuid, Some(uuid)), uuid_hex),
             (field(PrimitiveType::String, None), ""),
         ];
         let ctx = DFSessionContext::new();
@@ -10686,13 +10780,62 @@ SET c = ( \
         }
     }
 
+    /// #865: a quoted DEFAULT on a non-string column becomes a literal of
+    /// the column's type. It used to stay a string literal, which made the
+    /// metadata writer panic at CREATE TABLE.
     #[test]
-    fn omitted_column_sql_refuses_a_default_it_cannot_cast_from_text() {
-        use iceberg::spec::{Literal, PrimitiveType, Type};
-        let f = NestedField::optional(1, "u", Type::Primitive(PrimitiveType::Uuid))
-            .with_write_default(Literal::uuid(Uuid::nil()));
-        let err = omitted_column_sql(&f).unwrap_err();
-        assert!(err.to_string().contains("list the column"), "{err}");
+    fn default_text_becomes_a_literal_of_the_column_type() {
+        use iceberg::spec::{PrimitiveType, Type};
+        use sqe_sql::DefaultLiteral;
+        let json = |lit: &DefaultLiteral, ty: PrimitiveType| {
+            let ty = Type::Primitive(ty);
+            default_to_iceberg_literal(lit, &ty)
+                .map(|l| l.map(|l| l.try_into_json(&ty).unwrap().to_string()))
+        };
+        let s = |v: &str| DefaultLiteral::String(v.to_string());
+        let bytes = || DefaultLiteral::Bytes(vec![1, 0xab]);
+        let dec = || PrimitiveType::Decimal {
+            precision: 10,
+            scale: 2,
+        };
+        let (ts, tstz) = (PrimitiveType::Timestamp, PrimitiveType::Timestamptz);
+        let at = "\"2024-01-02T03:04:05\"";
+        let at_utc = "\"2024-01-02T03:04:05+00:00\"";
+        let uuid = "f79c3e09-677c-4bbd-a479-3f349cb785e7";
+        let quoted_uuid = format!("\"{uuid}\"");
+        let cases = [
+            (s("2024-01-02"), PrimitiveType::Date, "\"2024-01-02\""),
+            (s("2024-01-02 03:04:05"), ts.clone(), at),
+            (s("2024-01-02T03:04:05"), ts, at),
+            (s("2024-01-02 03:04:05Z"), tstz.clone(), at_utc),
+            (s("2024-01-02 03:04:05"), tstz.clone(), at_utc),
+            (s("03:04:05"), PrimitiveType::Time, "\"03:04:05\""),
+            (s("1.5"), dec(), "\"1.50\""),
+            (DefaultLiteral::Int(2), dec(), "\"2.00\""),
+            (s("5"), PrimitiveType::Long, "5"),
+            (s("TRUE"), PrimitiveType::Boolean, "true"),
+            (s("01ab"), PrimitiveType::Binary, "\"01ab\""),
+            (bytes(), PrimitiveType::Binary, "\"01ab\""),
+            (bytes(), PrimitiveType::Fixed(2), "\"01ab\""),
+            (s(uuid), PrimitiveType::Uuid, quoted_uuid.as_str()),
+        ];
+        for (lit, ty, want) in cases {
+            let got = json(&lit, ty.clone()).unwrap_or_else(|e| panic!("{lit:?} as {ty}: {e}"));
+            assert_eq!(got.as_deref(), Some(want), "{lit:?} as {ty}");
+        }
+
+        for (lit, ty) in [
+            (s("not a date"), PrimitiveType::Date),
+            (s("five"), PrimitiveType::Long),
+            (s("1.555"), dec()),
+            (s("123456789"), dec()),
+            (s("0x01"), PrimitiveType::Binary),
+            (s("2024-01-02 03:04:05+02:00"), tstz),
+            (DefaultLiteral::Bytes(vec![1]), PrimitiveType::Fixed(2)),
+        ] {
+            let refused = json(&lit, ty.clone()).is_err();
+            assert!(refused, "{lit:?} as {ty} should be refused");
+        }
     }
 
     #[test]
