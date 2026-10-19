@@ -11,7 +11,7 @@
 #
 #   stable, jobs = 8 (default)                1 m 18 s
 #   nightly + -Zthreads=8                     1 m 07 s
-#   nightly + -Zthreads=8 + cranelift         0 m 36 s   <- this file
+#   nightly + -Zthreads=8 + cranelift     0 m 31-36 s   <- this file
 #
 # Cold build: 4 m 11 s -> 2 m 41 s.
 #
@@ -21,6 +21,12 @@
 #   * opendal  - same, through its `auto-register-services` feature.
 #   * ctor     - its `section$start$`/`section$end$` Mach-O symbols are not
 #                emitted by cranelift, so the final link fails without this.
+#
+# sqe-core is not a missed optimisation: measured 2026-10-19 with the ctor
+# removed and cranelift enabled for it, the same edit took 48.8s against 34s on
+# LLVM. Cranelift is ~2x faster on the ordinary workspace crates (~20.7s -> 12.5s
+# for sqe-coordinator) but slower on sqe-core, which monomorphises enormous
+# amounts of DataFusion generic code. Nothing is being left on the table here.
 #
 # Never ship, release or benchmark a cranelift build: it is a compile-time
 # optimisation for the inner loop only.
