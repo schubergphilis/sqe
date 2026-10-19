@@ -801,60 +801,6 @@ async fn grant_policies_leave_wildcard_policies_alone() {
     assert_eq!(post["name"], "sqe-grant-mask-sales.orders.amount-2");
 }
 
-/// REVOKE takes the grantee out of every mask and filter policy on the
-/// table, deletes a policy it leaves empty, and touches no other table.
-#[tokio::test]
-async fn clear_grant_policies_removes_items_and_empty_policies() {
-    let server = MockServer::start().await;
-    mock_policy_list(
-        &server,
-        serde_json::json!([
-            {"id": 7, "policyType": 1,
-             "resources": {"database": {"values": ["sales"]}, "table": {"values": ["orders"]},
-                           "column": {"values": ["amount"]}},
-             "dataMaskPolicyItems": [{"roles": ["support"], "dataMaskInfo": {"dataMaskType": "MASK_NULL"}}]},
-            {"id": 8, "policyType": 2,
-             "resources": {"database": {"values": ["sales"]}, "table": {"values": ["orders"]}},
-             "rowFilterPolicyItems": [{"roles": ["support", "analyst"], "rowFilterInfo": {"filterExpr": "1 = 0"}}]},
-            {"id": 10, "policyType": 2,
-             "resources": {"database": {"values": ["sales"]}, "table": {"values": ["returns"]}},
-             "rowFilterPolicyItems": [{"roles": ["support"], "rowFilterInfo": {"filterExpr": "1 = 0"}}]},
-            {"id": 11, "policyType": 0,
-             "resources": {"database": {"values": ["sales"]}, "table": {"values": ["orders"]}},
-             "policyItems": [{"roles": ["support"]}]}
-        ]),
-    )
-    .await;
-    Mock::given(method("DELETE"))
-        .and(path("/service/public/v2/api/policy/7"))
-        .respond_with(ResponseTemplate::new(204))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("PUT"))
-        .and(path("/service/public/v2/api/policy/8"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let store = RangerStore::from_config(&cfg(&server.uri())).unwrap();
-    let removed = store
-        .clear_grant_policies("c.sales.orders", &role("support"))
-        .await
-        .unwrap();
-    assert_eq!(removed, 2);
-    let (_, put) = bodies(&server, wiremock::http::Method::PUT).await.remove(0);
-    assert_eq!(
-        put["rowFilterPolicyItems"][0]["roles"],
-        serde_json::json!(["analyst"])
-    );
-    assert_eq!(
-        bodies(&server, wiremock::http::Method::DELETE).await.len(),
-        1
-    );
-}
-
 /// Scoped mode needs the catalog, as CREATE POLICY does: a policy written
 /// without one would never match.
 #[tokio::test]

@@ -1758,54 +1758,6 @@ impl RangerStore {
         )
         .await
     }
-
-    /// `REVOKE SELECT` / `REVOKE ALL PRIVILEGES`: take the principal out of
-    /// every mask and row-filter policy on exactly this table, whoever wrote
-    /// it, and delete a policy left with no items.
-    async fn clear_grant_policies_impl(
-        &self,
-        table: &str,
-        principal: &sqe_sql::policy_ddl::PolicyPrincipal,
-    ) -> sqe_core::Result<usize> {
-        let (database, table) = ranger_table_resource(table, self.catalog_scoped, "REVOKE")?;
-        let mut removed = 0;
-        for policy in self.policies_for_service(&self.service_name).await? {
-            let Some(policy_type) = policy
-                .get("policyType")
-                .and_then(serde_json::Value::as_i64)
-                .filter(|t| *t == 1 || *t == 2)
-            else {
-                continue;
-            };
-            if !resource_is_exactly(&policy, "database", &database)
-                || !resource_is_exactly(&policy, "table", &table)
-            {
-                continue;
-            }
-            let key = grant_items_key(policy_type);
-            let mut items: Vec<serde_json::Value> = policy
-                .get(key)
-                .and_then(serde_json::Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            if !remove_principal_from_items(&mut items, principal) {
-                continue;
-            }
-            removed += 1;
-            let id = policy_id(&policy)?;
-            let path = format!("/service/public/v2/api/policy/{id}");
-            if items.is_empty() {
-                self.send_policy_ddl(reqwest::Method::DELETE, &path, None)
-                    .await?;
-            } else {
-                let mut policy = policy;
-                policy[key] = serde_json::Value::Array(items);
-                self.send_policy_ddl(reqwest::Method::PUT, &path, Some(&policy))
-                    .await?;
-            }
-        }
-        Ok(removed)
-    }
 }
 
 fn policy_id(policy: &serde_json::Value) -> sqe_core::Result<i64> {
@@ -2079,14 +2031,6 @@ impl PolicyStore for RangerStore {
         spec: &sqe_sql::grant_policy::GrantPolicySpec,
     ) -> sqe_core::Result<()> {
         self.set_grant_policies_impl(spec).await
-    }
-
-    async fn clear_grant_policies(
-        &self,
-        table: &str,
-        principal: &sqe_sql::policy_ddl::PolicyPrincipal,
-    ) -> sqe_core::Result<usize> {
-        self.clear_grant_policies_impl(table, principal).await
     }
 
     async fn list_mask_policies(&self) -> sqe_core::Result<Vec<crate::MaskPolicyInfo>> {
