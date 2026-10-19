@@ -91,7 +91,7 @@ TRINO_MEMORY   ?= 8g
 BENCH_RUN      := scripts/benchmark-make-run.sh
 BENCH_ENV       = PROFILE=$(BENCH_PROFILE) BENCH_LOG_DIR=$(BENCH_LOG_DIR)
 
-.PHONY: help all all_trino docs-and-image check check-server dev release rustbook ebook \
+.PHONY: help all all_trino docs-and-image check check-server dev dev-fast release rustbook ebook \
         ebook-pdf ebook-epub ebook-html \
         benchmark-charts test test-access-control test-access-control-spark \
         test-integration test-distributed test-integration-down \
@@ -111,6 +111,8 @@ help:
 	@echo "    make check        Type-check all targets without linking (fastest full feedback)"
 	@echo "    make check-server Type-check sqe-server only; the fast inner loop"
 	@echo "    make dev          Debug build of sqe-cli + sqe-server (fast compile)"
+	@echo "    make dev-fast     Same, with nightly parallel frontend + cranelift (~2x"
+	@echo "                      faster warm; needs rustup toolchain install nightly)"
 	@echo "    make release      Release build of sqe-cli + sqe-server (LTO, optimised)"
 	@echo "    make test         cargo test --workspace"
 	@echo "    make test-integration     Integration suite vs the Polaris + RustFS test stack"
@@ -220,6 +222,18 @@ dev:
 	@echo ""
 	@echo "Binaries:"
 	@ls -lh $(DEBUG_BIN)/$(BIN_CLI) $(DEBUG_BIN)/$(BIN_SERVER)
+
+# Opt-in speed loop: nightly parallel frontend (-Zthreads) plus cranelift for
+# the workspace crates. Measured 2026-10-19: `sqe-core` edit -> sqe-server is
+# 31-36s instead of 1m18 (warm) and 2m41 instead of 4m11 (cold). Writes to
+# target/fast, so it does not invalidate the stable cache. Never ship or
+# benchmark these binaries; `make dev` remains the reference build.
+dev-fast:
+	@echo "==> Building $(BIN_SERVER) with the fast (nightly + cranelift) loop"
+	./scripts/dev-fast.sh
+	@echo ""
+	@echo "Binary (cranelift, do not ship or benchmark):"
+	@ls -lh target/fast/debug/$(BIN_SERVER)
 
 release:
 	@echo "==> Building release binaries ($(BIN_CLI), $(BIN_SERVER))"
