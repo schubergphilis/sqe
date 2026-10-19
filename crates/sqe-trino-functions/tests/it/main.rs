@@ -3,3 +3,4 @@
 
 mod column_input_test;
 mod trino_udf_test;
+mod variant_json_args_test;
