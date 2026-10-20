@@ -14,7 +14,9 @@ use tracing::{error, info};
 
 use sqe_catalog::{SessionCatalog, TableMetadataCache};
 use sqe_core::{Session, SqeConfig, SqeError, SqeErrorCode};
-use sqe_sql::{BranchRetention, PartitionEvolution, RefDdl, ReprojectScope, TableRef};
+use sqe_sql::{
+    BranchRetention, IdentifierFieldsDdl, PartitionEvolution, RefDdl, ReprojectScope, TableRef,
+};
 use tracing::instrument;
 
 use crate::ident::{
@@ -1712,6 +1714,109 @@ impl CatalogOps {
             .commit_schema_update(&table_ident, updates, vec![])
             .await?;
 
+        Ok(())
+    }
+
+    /// Execute `ALTER TABLE ... SET | DROP IDENTIFIER FIELDS`: commit a new
+    /// schema with the same fields and the new identifier set. The schema
+    /// builder enforces the spec rules (required, primitive, not float or
+    /// double, not inside a list, map or optional struct).
+    pub async fn apply_identifier_fields(
+        &self,
+        session: &Session,
+        ddl: &IdentifierFieldsDdl,
+    ) -> sqe_core::Result<()> {
+        let verb = if ddl.set { "SET" } else { "DROP" };
+        let err = |msg: String| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("ALTER TABLE {verb} IDENTIFIER FIELDS: {msg}"),
+            )
+        };
+        let object_name = parse_object_name(&ddl.table)?;
+        let table_ident = resolve_table_ident(&object_name, session)?;
+        let session_catalog = self
+            .session_catalog_for(session, catalog_qualifier(&object_name).as_deref())
+            .await?;
+        let table = session_catalog.load_table(&table_ident).await?;
+        let metadata = table.metadata();
+        let current = metadata.current_schema();
+
+        let mut listed = std::collections::BTreeSet::new();
+        for name in &ddl.columns {
+            let field = current
+                .field_by_name(name)
+                .ok_or_else(|| err(format!("column '{name}' not found")))?;
+            listed.insert(field.id);
+        }
+        let ids: std::collections::BTreeSet<i32> = if ddl.set {
+            listed
+        } else {
+            let existing: std::collections::BTreeSet<i32> =
+                current.identifier_field_ids().collect();
+            if let Some(name) = ddl
+                .columns
+                .iter()
+                .zip(&listed)
+                .find_map(|(n, id)| (!existing.contains(id)).then_some(n))
+            {
+                return Err(err(format!("column '{name}' is not an identifier field")));
+            }
+            existing.difference(&listed).copied().collect()
+        };
+
+        // A fresh builder: `with_identifier_field_ids` adds to the set, so
+        // it must not start from the current ids.
+        let new_schema_id = metadata
+            .schemas_iter()
+            .map(|s| s.schema_id())
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let new_schema = IcebergSchema::builder()
+            .with_schema_id(new_schema_id)
+            .with_fields(current.as_struct().fields().to_vec())
+            .with_identifier_field_ids(ids.iter().copied())
+            .build()
+            .map_err(|e| err(e.to_string()))?;
+
+        // The catalog reuses a structurally equal schema rather than adding
+        // one, and then rejects `SetCurrentSchema { -1 }` ("no schema has
+        // been added"; the same server behaviour as #832 for views). So an
+        // existing schema with these fields and ids is selected by id.
+        let same = metadata.schemas_iter().find(|s| {
+            s.as_struct() == new_schema.as_struct()
+                && s.identifier_field_ids()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    == ids
+        });
+        let updates = match same {
+            Some(s) if s.schema_id() == current.schema_id() => return Ok(()),
+            Some(s) => vec![TableUpdate::SetCurrentSchema {
+                schema_id: s.schema_id(),
+            }],
+            None => vec![
+                TableUpdate::AddSchema { schema: new_schema },
+                TableUpdate::SetCurrentSchema { schema_id: -1 },
+            ],
+        };
+        let requirements = vec![
+            TableRequirement::LastAssignedFieldIdMatch {
+                last_assigned_field_id: metadata.last_column_id(),
+            },
+            TableRequirement::CurrentSchemaIdMatch {
+                current_schema_id: current.schema_id(),
+            },
+        ];
+        info!(
+            username = %session.user.username,
+            table = %table_ident,
+            identifier_field_ids = ?ids,
+            "Setting identifier fields"
+        );
+        session_catalog
+            .commit_schema_update(&table_ident, updates, requirements)
+            .await?;
         Ok(())
     }
 

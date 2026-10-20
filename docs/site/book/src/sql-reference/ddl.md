@@ -93,6 +93,24 @@ ALTER TABLE events REPLACE PARTITION FIELD day(occurred_at) WITH hour(occurred_a
 ALTER TABLE events ADD PARTITION FIELD bucket(64, user_id);
 ```
 
+## Identifier fields (SQE / Iceberg-specific)
+
+Identifier fields are an Iceberg table's row key. With `write.update.mode`, `write.merge.mode` or `write.delete.mode` set to `merge-on-read`, UPDATE, MERGE and DELETE write equality deletes against them. Without identifier fields, UPDATE and MERGE fall back to copy-on-write and DELETE writes position deletes (V2) or deletion vectors (V3). SQE parses these in `crates/sqe-sql/src/identifier_fields.rs`.
+
+| Statement | Notes | Trino | Snowflake | Spark SQL |
+|---|---|---|---|---|
+| `ALTER TABLE t SET IDENTIFIER FIELDS col [, ...]` | Replace the identifier set. Parentheses are optional; `s.x` names a struct member. | - | - | yes |
+| `ALTER TABLE t DROP IDENTIFIER FIELDS col [, ...]` | Remove columns from the set. Each must currently be an identifier field. | - | - | yes |
+
+An identifier column must be `NOT NULL`, a primitive type other than `FLOAT` or `DOUBLE`, and not inside a list, map or nullable struct; SQE refuses anything else. The change commits a new schema, so files already written are not touched.
+
+```sql
+CREATE TABLE orders (id BIGINT NOT NULL, status VARCHAR)
+  WITH ('write.update.mode' = 'merge-on-read');
+ALTER TABLE orders SET IDENTIFIER FIELDS id;
+UPDATE orders SET status = 'shipped' WHERE id = 42;  -- equality delete + one new row
+```
+
 ## Branches and tags (SQE / Iceberg-specific)
 
 Iceberg branches are named pointers to a snapshot, like git branches. Tags are immutable named pointers. SQE parses these in `crates/sqe-sql/src/ddl.rs`.

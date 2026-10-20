@@ -113,7 +113,7 @@ pub fn try_parse_partition_evolution(sql: &str) -> Result<Option<PartitionEvolut
 /// Split a possibly-qualified identifier off the front of `input` and
 /// return `(identifier, remainder)`. Handles `name`, `schema.name`,
 /// `cat.schema.name`, and double-quoted identifiers.
-fn split_identifier(input: &str) -> Result<(String, &str)> {
+pub(crate) fn split_identifier(input: &str) -> Result<(String, &str)> {
     let trimmed = input.trim_start();
     if trimmed.is_empty() {
         return Err(SqeError::with_code(
@@ -151,7 +151,11 @@ fn split_identifier(input: &str) -> Result<(String, &str)> {
 /// slice of `original_rest` that comes after the keyword. Whitespace
 /// between words inside `kw` is matched flexibly (each space character
 /// in `kw` matches one or more whitespace characters in input).
-fn strip_keyword<'a>(upper_rest: &str, original_rest: &'a str, kw: &str) -> Option<&'a str> {
+pub(crate) fn strip_keyword<'a>(
+    upper_rest: &str,
+    original_rest: &'a str,
+    kw: &str,
+) -> Option<&'a str> {
     let kw_words: Vec<&str> = kw.split_whitespace().collect();
     let mut idx = 0usize;
     let upper_bytes = upper_rest.as_bytes();

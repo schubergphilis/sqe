@@ -656,15 +656,22 @@ async fn equality_delete_update_on_v3_table() {
         &session,
         &fq,
         &format!(
-            "CREATE TABLE {fq} (id BIGINT, ts TIMESTAMP_NS(9), v BIGINT) \
+            "CREATE TABLE {fq} (id BIGINT NOT NULL, ts TIMESTAMP_NS(9), v BIGINT) \
              TBLPROPERTIES ( \
                  'write.update.mode' = 'merge-on-read', \
-                 'write.delete.mode' = 'merge-on-read', \
-                 'write.identifier-field-ids' = '1' \
+                 'write.delete.mode' = 'merge-on-read' \
              )"
         ),
     )
     .await;
+    handler
+        .execute(
+            &session,
+            &format!("ALTER TABLE {fq} SET IDENTIFIER FIELDS id"),
+            None,
+        )
+        .await
+        .expect("SET IDENTIFIER FIELDS");
 
     for i in 0..3 {
         handler
@@ -688,6 +695,11 @@ async fn equality_delete_update_on_v3_table() {
         )
         .await
         .expect("UPDATE MoR equality");
+    let summary = latest_summary(&handler, &session, ns, name).await;
+    assert!(
+        summary.contains("added-equality-delete-files"),
+        "MoR UPDATE must write an equality delete: {summary}"
+    );
 
     // Row count unchanged; v must be 99 for id=1.
     let count = row_count(&handler, &session, &fq).await;
@@ -1440,23 +1452,37 @@ async fn row_lineage_survives_mor_update_and_merge_on_v3_table() {
         &session,
         &fq,
         &format!(
-            "CREATE TABLE {fq} (id BIGINT, ts TIMESTAMP_NS(9), v BIGINT) \
+            "CREATE TABLE {fq} (id BIGINT NOT NULL, ts TIMESTAMP_NS(9), v BIGINT) \
              TBLPROPERTIES ( \
                  'write.update.mode' = 'merge-on-read', \
                  'write.delete.mode' = 'merge-on-read', \
-                 'write.merge.mode' = 'merge-on-read', \
-                 'write.identifier-field-ids' = '1' \
+                 'write.merge.mode' = 'merge-on-read' \
              )"
         ),
     )
     .await;
-    run(format!("INSERT INTO {fq} VALUES (1, NULL, 10), (2, NULL, 20), (3, NULL, 30)")).await;
+    run(format!("ALTER TABLE {fq} SET IDENTIFIER FIELDS id")).await;
+    run(format!(
+        "INSERT INTO {fq} VALUES (1, NULL, 10), (2, NULL, 20), (3, NULL, 30)"
+    ))
+    .await;
     let start = lineage_by_id(&handler, &session, ns, name).await;
 
     run(format!("UPDATE {fq} SET v = 99 WHERE id = 1")).await;
+    let summary = latest_summary(&handler, &session, ns, name).await;
+    assert!(
+        summary.contains("added-equality-delete-files"),
+        "MoR UPDATE: {summary}"
+    );
     let after_update = lineage_by_id(&handler, &session, ns, name).await;
-    assert_eq!(after_update[&1].0, start[&1].0, "MoR UPDATE must keep _row_id");
-    assert!(after_update[&1].1 > start[&1].1, "MoR UPDATE needs a newer sequence number");
+    assert_eq!(
+        after_update[&1].0, start[&1].0,
+        "MoR UPDATE must keep _row_id"
+    );
+    assert!(
+        after_update[&1].1 > start[&1].1,
+        "MoR UPDATE needs a newer sequence number"
+    );
     assert_eq!(after_update[&2], start[&2]);
     assert_eq!(after_update[&3], start[&3]);
 
