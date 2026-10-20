@@ -22,6 +22,9 @@ url = { workspace = true }
 base64 = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The Trino type names and variant-to-JSON rendering the server uses, for
+# `typeof` and `to_json` (#848, #867). No `sqe-*` dependencies of its own.
+sqe-trino-protocol = { path = "../sqe-trino-protocol", features = ["arrow"] }
 
 # These four deps move here with the code — nothing else in the workspace
 # uses them, so pulling them out of sqe-coordinator's dep graph is the main

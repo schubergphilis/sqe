@@ -192,8 +192,7 @@ async fn test_from_unixtime() {
 async fn test_typeof() {
     let v = eval_str("SELECT typeof(42)").await;
     assert!(v.is_some(), "typeof returned None");
-    let t = v.unwrap();
-    assert!(t.contains("Int"), "Expected Int type name, got: {t}");
+    assert_eq!(v.as_deref(), Some("bigint"));
 }
 
 // ═══════════════════════════════════════════════════════════════

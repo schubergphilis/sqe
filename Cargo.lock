@@ -7260,6 +7260,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "sqe-core",
+ "sqe-trino-protocol",
  "tokio",
  "unicode-normalization",
  "url",

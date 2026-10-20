@@ -1,99 +1,12 @@
-use arrow_schema::DataType;
-
-/// The one Arrow-to-Trino-JSON value encoding lives in the wire crate so the
-/// MCP endpoint can share it without linking this server (review 803).
-pub use sqe_trino_protocol::encode::arrow_value_to_json;
-
-pub fn arrow_to_trino_type(dt: &DataType) -> String {
-    match dt {
-        DataType::Null => "unknown".to_string(),
-        DataType::Boolean => "boolean".to_string(),
-        DataType::Int8 | DataType::UInt8 => "tinyint".to_string(),
-        DataType::Int16 | DataType::UInt16 => "smallint".to_string(),
-        DataType::Int32 => "integer".to_string(),
-        // u64 nominally exceeds i64::MAX, but the only u64 columns SQE produces
-        // are computed aggregates -- count(*), approx_distinct(), row_number()
-        // OVER(...) -- whose values fit i64 in practice, and Trino itself types
-        // those as bigint. Mapping to bigint (not decimal(20,0)) matches Trino
-        // so BI clients see integer columns, not decimals. (#4)
-        DataType::UInt32 | DataType::Int64 | DataType::UInt64 => "bigint".to_string(),
-        DataType::Float16 | DataType::Float32 => "real".to_string(),
-        DataType::Float64 => "double".to_string(),
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "varchar".to_string(),
-        DataType::Binary
-        | DataType::LargeBinary
-        | DataType::BinaryView
-        | DataType::FixedSizeBinary(_) => "varbinary".to_string(),
-        DataType::Date32 | DataType::Date64 => "date".to_string(),
-        DataType::Time32(_) | DataType::Time64(_) => "time".to_string(),
-        // Report an explicit precision. SQE timestamps are microsecond-backed
-        // and rendered to 6 fractional digits, so timestamp(6) / timestamp(6)
-        // with time zone is the consistent, Trino-accurate type. (#5)
-        DataType::Timestamp(_, None) => "timestamp(6)".to_string(),
-        DataType::Timestamp(_, Some(_)) => "timestamp(6) with time zone".to_string(),
-        DataType::Duration(_) => "interval day to second".to_string(),
-        DataType::Interval(arrow_schema::IntervalUnit::YearMonth) => {
-            "interval year to month".to_string()
-        }
-        DataType::Interval(_) => "interval day to second".to_string(),
-        DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => format!("decimal({p},{s})"),
-        DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => {
-            format!("array({})", arrow_to_trino_type(f.data_type()))
-        }
-        DataType::Map(entries_field, _) => {
-            if let DataType::Struct(fields) = entries_field.data_type() {
-                if fields.len() == 2 {
-                    let key_type = arrow_to_trino_type(fields[0].data_type());
-                    let val_type = arrow_to_trino_type(fields[1].data_type());
-                    return format!("map({key_type},{val_type})");
-                }
-            }
-            "map(varchar,varchar)".to_string()
-        }
-        // Iceberg V3 variant: clients have no variant type, and the value is
-        // sent as JSON text (#849).
-        DataType::Struct(_) if sqe_trino_protocol::encode::is_variant_storage(dt) => {
-            "json".to_string()
-        }
-        DataType::Struct(fields) => {
-            let cols: Vec<String> = fields
-                .iter()
-                .map(|f| {
-                    format!(
-                        "{} {}",
-                        row_field_name(f.name()),
-                        arrow_to_trino_type(f.data_type())
-                    )
-                })
-                .collect();
-            format!("row({})", cols.join(","))
-        }
-        other => format!("{other:?}"),
-    }
-}
-
-/// A row field name as it appears in a `row(...)` type string: bare when it
-/// is a plain lowercase identifier, otherwise double-quoted with `"` doubled,
-/// so a name holding a space, comma, parenthesis or uppercase letter cannot
-/// be misread as part of the field's type.
-fn row_field_name(name: &str) -> String {
-    let plain = name
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-    if plain {
-        name.to_string()
-    } else {
-        format!("\"{}\"", name.replace('"', "\"\""))
-    }
-}
+/// The one Arrow-to-Trino-JSON value encoding and the Arrow-to-Trino type
+/// name live in the wire crate so the MCP endpoint and the function crate
+/// share them without linking this server (review 803, #867).
+pub use sqe_trino_protocol::encode::{arrow_to_trino_type, arrow_value_to_json};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::DataType;
 
     #[test]
     fn test_arrow_to_trino_type_basic() {
