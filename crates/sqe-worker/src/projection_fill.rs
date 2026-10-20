@@ -11,14 +11,15 @@
 //! When the ticket carries a projection fill, every batch is rebuilt here into
 //! the fill's schema: one slot per projected column, taken from the file by
 //! field id (by name for a file without field ids), cast when the type was
-//! promoted, and otherwise filled from the fill row -- the column's
+//! promoted, with NULLs for the `unknown` struct members no file stores, and
+//! otherwise filled from the fill row -- the column's
 //! `initial_default`, or NULL. This matches what the coordinator's own scan
 //! does in `sqe_catalog::iceberg_scan::conform_batch_to_projection`.
 
 use std::sync::Arc;
 
 use arrow::array::{new_null_array, ArrayRef, UInt32Array};
-use arrow::compute::{cast, take};
+use arrow::compute::take;
 use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::SchemaRef;
 use sqe_planner::ScanTask;
@@ -94,11 +95,10 @@ impl ProjectionFill {
             let column = match found {
                 Some(idx) => {
                     let column = batch.column(idx);
-                    if column.data_type() == field.data_type() {
-                        Arc::clone(column)
-                    } else {
-                        cast(column, field.data_type())?
-                    }
+                    // Casts a promoted column, and puts back the NULL
+                    // members of a struct whose `unknown` fields the file
+                    // never stores (#859).
+                    sqe_core::unknown::fill_unknown(column, field.data_type())?
                 }
                 None if self.fill[i].is_null(0) => new_null_array(field.data_type(), rows),
                 None => take(&self.fill[i], &UInt32Array::from(vec![0u32; rows]), None)?,
@@ -222,6 +222,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rows(&fill().conform(&file).unwrap()), vec!["eu|5|t"]);
+    }
+
+    /// No file stores a V3 `unknown` struct member (#859): the struct is
+    /// rebuilt in the declared type, the member reading NULL.
+    #[test]
+    fn a_struct_without_its_unknown_member_reads_it_as_null() {
+        use arrow::array::{Array, AsArray, StructArray};
+        use arrow_schema::Fields;
+        let declared = DataType::Struct(Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("u", DataType::Null, true),
+        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("s", declared.clone(), true)]));
+        let bytes = sqe_catalog::iceberg_scan::encode_projection_fill(&schema, &[]).unwrap();
+        let task = sqe_planner::ScanTask::builder(
+            "f",
+            vec!["s3://b/f.parquet".to_string()],
+            sqe_planner::ScanStorage::default(),
+        )
+        .with_projection(vec!["s".into()], vec![2])
+        .with_projection_fill(Some(bytes))
+        .build();
+        let fill = ProjectionFill::from_task(&task).unwrap().unwrap();
+
+        let stored = Fields::from(vec![Field::new("a", DataType::Int32, true)]);
+        let file = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![with_id(
+                "s",
+                DataType::Struct(stored.clone()),
+                2,
+            )])),
+            vec![Arc::new(StructArray::new(
+                stored,
+                vec![Arc::new(Int32Array::from(vec![10, 20]))],
+                None,
+            ))],
+        )
+        .unwrap();
+        let out = fill.conform(&file).unwrap();
+        assert_eq!(out.schema().field(0).data_type(), &declared);
+        let s = out.column(0).as_struct();
+        assert_eq!(s.column(1).logical_null_count(), 2);
+        let a = RecordBatch::try_from_iter([("a", Arc::clone(s.column(0)))]).unwrap();
+        assert_eq!(rows(&a), vec!["10", "20"]);
     }
 
     #[test]

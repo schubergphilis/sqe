@@ -138,34 +138,95 @@ async fn sqe_declares_an_unknown_column_spark_reads_it() {
     assert_eq!(sqe, promoted, "SQE's rows match Spark's");
 }
 
-/// An `unknown` field nested in a struct is not supported yet: SQE refuses
-/// to write one rather than produce a Null parquet column Spark cannot read.
+/// An `unknown` field nested in a struct, and in a list of structs (#859):
+/// Spark writes it, SQE reads it as NULL and writes rows around it, and
+/// Spark reads SQE's rows. No data file stores the nested field.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:polaris"]
-async fn nested_unknown_field_is_refused_at_write() {
+async fn nested_unknown_struct_spark_writes_sqe_reads() {
     if let Some(reason) = spark_stack_skip_reason() {
-        eprintln!("skipping nested_unknown_field_is_refused_at_write: {reason}");
+        eprintln!("skipping nested_unknown_struct_spark_writes_sqe_reads: {reason}");
         return;
     }
     let fq = "default.nested_unknown_from_spark";
     spark_sql(&format!(
         r#"DROP TABLE IF EXISTS rest.{fq};
-           CREATE TABLE rest.{fq} (id INT, s STRUCT<a: INT, u: VOID>) USING iceberg
-             TBLPROPERTIES ('format-version' = '3');
-           INSERT INTO rest.{fq} VALUES (1, named_struct('a', 10, 'u', NULL));"#
+           CREATE TABLE rest.{fq}
+             (id INT, s STRUCT<a: INT, u: VOID>, l ARRAY<STRUCT<b: INT, v: VOID>>)
+             USING iceberg TBLPROPERTIES ('format-version' = '3');
+           INSERT INTO rest.{fq} VALUES
+             (1, named_struct('a', 10, 'u', NULL), array(named_struct('b', 100, 'v', NULL)));"#
     ))
     .expect("spark writes the nested unknown table");
 
     let (session, handler) = crate::common::setup_handler().await;
-    let insert = format!("INSERT INTO {fq} VALUES (2, named_struct('a', 20, 'u', NULL))");
-    let refused = handler.execute(&session, &insert, None).await;
-    let spark = spark_rows(&format!("SELECT id, s.a, s.u FROM rest.{fq} ORDER BY id"));
+    let select =
+        format!("SELECT id, s.a, s.u IS NULL, l[1]['b'], l[1]['v'] IS NULL FROM {fq} ORDER BY id");
+    let before = sqe_rows(&handler, &session, &select).await;
+    let insert = format!(
+        "INSERT INTO {fq} VALUES (2, named_struct('a', 20, 'u', NULL), \
+         [named_struct('b', 200, 'v', NULL)])"
+    );
+    handler
+        .execute(&session, &insert, None)
+        .await
+        .expect("SQE writes around the nested unknown fields");
+    let after = sqe_rows(&handler, &session, &select).await;
+    let spark = spark_rows(&format!(
+        "SELECT id, s.a, s.u, l[0].b, l[0].v FROM rest.{fq} ORDER BY id"
+    ));
     let _ = spark_sql(&format!("DROP TABLE IF EXISTS rest.{fq}"));
 
-    let Err(err) = refused else {
-        panic!("the nested write is refused");
-    };
-    let err = format!("{err:?}");
-    assert!(err.contains("nested unknown field"), "{err}");
-    assert_eq!(spark, vec!["1|10|NULL"], "Spark's table is untouched");
+    assert_eq!(before, vec!["1|10|true|100|true"], "Spark's rows");
+    assert_eq!(
+        after,
+        vec!["1|10|true|100|true", "2|20|true|200|true"],
+        "rows after SQE's insert"
+    );
+    assert_eq!(
+        spark,
+        vec!["1|10|NULL|100|NULL", "2|20|NULL|200|NULL"],
+        "Spark reads SQE's rows"
+    );
+}
+
+/// SQE declares the nested `unknown` field itself and writes rows; Spark
+/// reads them (#859).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn nested_unknown_struct_sqe_creates_spark_reads() {
+    if let Some(reason) = spark_stack_skip_reason() {
+        eprintln!("skipping nested_unknown_struct_sqe_creates_spark_reads: {reason}");
+        return;
+    }
+    let (session, handler) = crate::common::setup_handler().await;
+    let fq = "default.nested_unknown_to_spark";
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+    for sql in [
+        format!("CREATE TABLE {fq} (id INT, s STRUCT<a INT, u UNKNOWN>)"),
+        format!("INSERT INTO {fq} VALUES (1, named_struct('a', 10, 'u', NULL))"),
+    ] {
+        handler.execute(&session, &sql, None).await.expect(&sql);
+    }
+    let spark = spark_rows(&format!(
+        "SELECT id, s.a, s.u, typeof(s) FROM rest.{fq} ORDER BY id"
+    ));
+    let sqe = sqe_rows(
+        &handler,
+        &session,
+        &format!("SELECT id, s.a, s.u IS NULL FROM {fq} ORDER BY id"),
+    )
+    .await;
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+
+    assert_eq!(
+        spark,
+        vec!["1|10|NULL|struct<a:int,u:void>"],
+        "Spark's rows"
+    );
+    assert_eq!(sqe, vec!["1|10|true"], "SQE's rows");
 }

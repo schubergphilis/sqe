@@ -117,3 +117,49 @@ async fn files_from_before_add_column_and_rename_read_correctly_on_a_worker() {
         .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
         .await;
 }
+
+/// No data file stores a V3 `unknown` field, top-level or nested (#859). The
+/// worker reads the narrower struct and must put the member back as NULL, as
+/// the coordinator's own scan does.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn unknown_fields_read_as_null_on_a_worker() {
+    let table = "default.dist_unknown_859";
+    let (session, setup) = crate::common::setup_handler().await;
+    let _ = setup
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
+        .await;
+    for sql in [
+        format!("CREATE TABLE {table} (id BIGINT, s STRUCT<a INT, u UNKNOWN>, w UNKNOWN)"),
+        format!("INSERT INTO {table} VALUES (1, named_struct('a', 10, 'u', NULL), NULL)"),
+        format!("INSERT INTO {table} VALUES (2, named_struct('a', 20, 'u', NULL), NULL)"),
+    ] {
+        setup
+            .execute(&session, &sql, None)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    let worker = spawn_chaos_worker(ChaosMode::PassThrough).await;
+    let rig = rig(std::slice::from_ref(&worker.url), |_| {}).await;
+    let fields = format!("SELECT id, s['a'], s['u'] IS NULL, w IS NULL FROM {table} ORDER BY id");
+    assert_eq!(
+        rendered_rows(&rig, &fields).await,
+        vec!["1|10|true|true", "2|20|true|true"]
+    );
+    assert!(
+        worker.do_gets() >= 1,
+        "the scan must have run on the worker"
+    );
+    // `w` is an Arrow NullArray, which has no null buffer, so `is_null` is
+    // false and it renders as empty text rather than `NULL`.
+    let star = format!("SELECT * FROM {table} ORDER BY id");
+    assert_eq!(
+        rendered_rows(&rig, &star).await,
+        vec!["1|{a: 10, u: }|", "2|{a: 20, u: }|"]
+    );
+
+    let _ = setup
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
+        .await;
+}

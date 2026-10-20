@@ -2510,6 +2510,21 @@ fn conform_batch_to_projection(
                     columns.push(unshredded);
                     continue;
                 }
+                // A nested `unknown` member is not in the file either (#859):
+                // the struct decodes without it, and reads it as NULLs.
+                if column.data_type() != field.data_type()
+                    && sqe_core::unknown::contains_unknown(field.data_type())
+                {
+                    let filled = sqe_core::unknown::fill_unknown(column, field.data_type())
+                        .map_err(|e| {
+                            DataFusionError::Internal(format!(
+                                "failed to fill unknown fields of column `{}`: {e}",
+                                field.name()
+                            ))
+                        })?;
+                    columns.push(filled);
+                    continue;
+                }
                 columns.push(Arc::clone(column));
             }
             None => {
@@ -2547,6 +2562,9 @@ fn conform_batch_to_projection(
 /// current schema: absent (added later), under another name (renamed) or as
 /// another type (promoted). Answered from the table's historic schemas, so a
 /// table whose projected columns never changed reports `false`.
+///
+/// A column that is or holds a V3 `unknown` field also counts: that field is
+/// never in a data file, so every file stores the column narrower (#859).
 fn projection_evolved(table: &Table, cols: &[String]) -> bool {
     let metadata = table.metadata();
     let current = metadata.current_schema();
@@ -2554,6 +2572,9 @@ fn projection_evolved(table: &Table, cols: &[String]) -> bool {
         let Some(field) = current.field_by_name(name) else {
             return false;
         };
+        if type_holds_unknown(&field.field_type) {
+            return true;
+        }
         metadata
             .schemas_iter()
             .any(|schema| match schema.field_by_id(field.id) {
@@ -2561,6 +2582,21 @@ fn projection_evolved(table: &Table, cols: &[String]) -> bool {
                 Some(old) => old.name != field.name || old.field_type != field.field_type,
             })
     })
+}
+
+/// True when `ty` is V3 `unknown` or holds an `unknown` field at any depth.
+fn type_holds_unknown(ty: &iceberg::spec::Type) -> bool {
+    use iceberg::spec::{PrimitiveType, Type};
+    match ty {
+        Type::Primitive(p) => *p == PrimitiveType::Unknown,
+        Type::Struct(s) => s.fields().iter().any(|f| type_holds_unknown(&f.field_type)),
+        Type::List(l) => type_holds_unknown(&l.element_field.field_type),
+        Type::Map(m) => {
+            type_holds_unknown(&m.key_field.field_type)
+                || type_holds_unknown(&m.value_field.field_type)
+        }
+        _ => false,
+    }
 }
 
 /// Encode a projection fill (#831) as an Arrow IPC stream: one row, in
@@ -3916,6 +3952,43 @@ mod projection_evolution_tests {
             "the column the file does not have must be NULL, never the first \
              column's values"
         );
+    }
+
+    /// No data file stores a V3 `unknown` struct member (#859). The struct
+    /// decodes without it and is rebuilt in the declared type.
+    #[test]
+    fn a_struct_without_its_unknown_member_reads_it_as_null() {
+        use arrow::array::{Array, AsArray, Int32Array, StructArray};
+        use arrow::datatypes::Fields;
+        let declared = DataType::Struct(Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("u", DataType::Null, true),
+        ]));
+        let target = Arc::new(Schema::new(vec![Field::new("s", declared.clone(), true)]));
+        let stored = Fields::from(vec![Field::new("a", DataType::Int32, true)]);
+        let decoded = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "s",
+                DataType::Struct(stored.clone()),
+                true,
+            )])),
+            vec![Arc::new(StructArray::new(
+                stored,
+                vec![Arc::new(Int32Array::from(vec![10, 20]))],
+                None,
+            ))],
+        )
+        .unwrap();
+        let out = conform_batch_to_projection(&decoded, &[Some(0)], &target, &[]).expect("conform");
+        assert_eq!(out.schema().field(0).data_type(), &declared);
+        let s = out.column(0).as_struct();
+        assert_eq!(
+            s.column(0)
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values(),
+            &[10, 20]
+        );
+        assert_eq!(s.column(1).logical_null_count(), 2);
     }
 
     /// ADD COLUMN: one of several projected columns is absent.
