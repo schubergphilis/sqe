@@ -13,8 +13,9 @@
 //! - dates and timestamps become strings: `"2024-01-02"`,
 //!   `"2024-01-02 03:04:05.123"`
 //!
-//! SQE carries JSON values as Utf8, so a string input is always encoded as a
-//! JSON string. The rewrite leaves `CAST` of a JSON-returning function
+//! A variant (an Iceberg V3 `JSON` or `VARIANT` column) is embedded as its
+//! JSON value, at any depth (#848). Other JSON values travel as Utf8, so a
+//! string input is always encoded as a JSON string. The rewrite leaves `CAST` of a JSON-returning function
 //! (`json_parse`, `json_extract`, ...) alone so that case stays the identity,
 //! as it is in Trino. Types Trino refuses to cast (varbinary, time,
 //! intervals) are written as their quoted display text instead of failing.
@@ -32,6 +33,7 @@ use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
 use datafusion::scalar::ScalarValue;
+use sqe_trino_protocol::encode;
 
 /// to_json(x) — serialize any value to compact JSON text, as Trino's
 /// `CAST(x AS JSON)` does. NULL in, NULL out.
@@ -138,6 +140,10 @@ fn write_json(array: &dyn Array, row: usize, out: &mut String) -> DFResult<()> {
         DataType::FixedSizeList(..) => {
             let list = array.as_fixed_size_list();
             write_elements(&list.value(row), out)?;
+        }
+        DataType::Struct(_) if encode::is_variant_storage(array.data_type()) => {
+            let text = encode::variant_json(array, row)?;
+            out.push_str(&text);
         }
         DataType::Struct(fields) => {
             let st = array.as_struct();
