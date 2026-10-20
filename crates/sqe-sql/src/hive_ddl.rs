@@ -207,7 +207,7 @@ fn extract(ct: &CreateTable) -> Result<HiveTableSpec, SqeError> {
 
     // Every option-list flavour flattens into one property map: Athena writes
     // TBLPROPERTIES, and sqlparser reports the shape it saw.
-    let table_properties: BTreeMap<String, String> = match &ct.table_options {
+    let mut table_properties: BTreeMap<String, String> = match &ct.table_options {
         CreateTableOptions::TableProperties(v)
         | CreateTableOptions::Options(v)
         | CreateTableOptions::Plain(v)
@@ -232,7 +232,13 @@ fn extract(ct: &CreateTable) -> Result<HiveTableSpec, SqeError> {
         database,
         name,
         if_not_exists: ct.if_not_exists,
-        comment: ct.comment.as_ref().map(ToString::to_string),
+        // sqlparser has no `COMMENT` clause on `CREATE EXTERNAL TABLE`; the
+        // Hive metastore keeps the table comment as the `comment` property.
+        comment: ct
+            .comment
+            .as_ref()
+            .map(ToString::to_string)
+            .or_else(|| table_properties.remove("comment")),
         columns,
         partition_keys,
         location,

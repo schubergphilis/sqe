@@ -22,8 +22,8 @@ use crate::ident::{
     schema_catalog_qualifier,
 };
 use crate::write_handler::{
-    default_to_iceberg_literal as alter_default_to_iceberg_literal, parse_partition_transform_sql,
-    sql_type_to_arrow, sql_type_to_arrow_for,
+    arrow_column_to_iceberg_type, default_to_iceberg_literal as alter_default_to_iceberg_literal,
+    parse_partition_transform_sql, sql_type_to_arrow, sql_type_to_arrow_for,
 };
 
 /// Per-table async lock used to serialize read-merge-commit sequences (see
@@ -675,28 +675,33 @@ impl CatalogOps {
                             metadata.format_version()
                         )));
                     }
+                    // Nested fields (struct, array, map) take the ids after
+                    // the column's own.
+                    let column_id = max_field_id + 1;
                     let iceberg_type = if is_variant {
+                        max_field_id = column_id;
                         iceberg::spec::Type::Variant(iceberg::spec::VariantType)
                     } else {
-                        iceberg::arrow::arrow_type_to_type(&arrow_type).map_err(|e| {
-                            SqeError::with_code(
-                                SqeErrorCode::ExecutionFailed,
-                                format!(
-                                    "Cannot convert type for column '{}': {e}",
-                                    column_def.name.value
-                                ),
-                            )
-                        })?
+                        let (ty, last_id) = arrow_column_to_iceberg_type(&tagged, max_field_id)
+                            .map_err(|e| {
+                                SqeError::with_code(
+                                    SqeErrorCode::ExecutionFailed,
+                                    format!(
+                                        "Cannot convert type for column '{}': {e}",
+                                        column_def.name.value
+                                    ),
+                                )
+                            })?;
+                        max_field_id = last_id;
+                        ty
                     };
-
-                    max_field_id += 1;
                     // Fold the new column name (unquoted -> lowercase) so it is
                     // consistent with CREATE TABLE and query-side folding (#337).
                     let col_name = fold_unquoted_ident(&column_def.name);
                     let mut new_field = if not_null {
-                        NestedField::required(max_field_id, &col_name, iceberg_type.clone())
+                        NestedField::required(column_id, &col_name, iceberg_type.clone())
                     } else {
-                        NestedField::optional(max_field_id, &col_name, iceberg_type.clone())
+                        NestedField::optional(column_id, &col_name, iceberg_type.clone())
                     };
 
                     // Extract a DEFAULT literal, if any, and set both defaults.

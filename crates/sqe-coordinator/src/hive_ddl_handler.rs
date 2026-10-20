@@ -733,7 +733,7 @@ impl HiveDdlHandler {
                 .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
             columns.push(HiveDescribedColumn {
                 name: column.name.clone(),
-                data_type: data_type.to_string(),
+                data_type: sqe_trino_compat::types::arrow_to_declared_trino_type(&data_type),
                 comment: column
                     .comment
                     .as_deref()

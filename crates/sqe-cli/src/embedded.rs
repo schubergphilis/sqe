@@ -2517,10 +2517,11 @@ mod tests {
         let (mut c, dir) = client_with_hive_root().await;
         let data = dir.path().join("data");
         c.execute(&format!(
-            "CREATE EXTERNAL TABLE lake.sales.orders (id BIGINT, amount DOUBLE) \
+            "CREATE EXTERNAL TABLE lake.sales.orders (id BIGINT COMMENT 'order''s id', \
+             amount DOUBLE, `select` STRING, `Ship To` STRING) \
              PARTITIONED BY (dt string) \
              ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE \
-             LOCATION 'file://{}'",
+             LOCATION 'file://{}' TBLPROPERTIES ('comment' = 'all orders')",
             data.display()
         ))
         .await
@@ -2565,8 +2566,20 @@ mod tests {
                 .iter()
                 .map(|c| c.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["id", "amount"]
+            vec!["id", "amount", "select", "Ship To"]
         );
+        // Names a bare identifier would fold or reject come back quoted;
+        // the column and table comments survive the round trip.
+        for needle in [
+            "`select` string",
+            "`Ship To` string",
+            "COMMENT 'order''s id'",
+        ] {
+            assert!(ddl.contains(needle), "missing {needle} in: {ddl}");
+        }
+        assert_eq!(reparsed.columns[0].comment.as_deref(), Some("order's id"));
+        assert_eq!(reparsed.comment.as_deref(), Some("all orders"));
+        assert!(!reparsed.table_properties.contains_key("comment"));
         assert_eq!(
             reparsed
                 .partition_keys
