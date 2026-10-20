@@ -835,3 +835,76 @@ async fn cow_rewrite_drops_superseded_position_deletes_376() {
 
     let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {fq}")).await;
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// CTAS from `CAST(.. AS TIMESTAMP WITH TIME ZONE)` writes a zoned Iceberg
+// column and keeps the instant. With no session zone the cast was naive,
+// so the column came out as `timestamp`.
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ctas_cast_with_time_zone_keeps_the_zone() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let t = "default.ctas_cast_with_time_zone";
+    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {t}")).await;
+    let ctas = format!(
+        "CREATE TABLE {t} AS SELECT 1 AS id, \
+         CAST('2024-01-02 03:04:05+02:00' AS TIMESTAMP WITH TIME ZONE) AS ts"
+    );
+    exec(&handler, &session, &ctas).await;
+
+    let sql = format!("SELECT arrow_typeof(ts) AS t, ts FROM {t}");
+    let batches = exec(&handler, &session, &sql).await;
+    let out = arrow::util::pretty::pretty_format_batches(&batches)
+        .unwrap()
+        .to_string();
+    assert!(out.contains("\"+00:00\")"), "zoned column expected:\n{out}");
+    assert!(
+        out.contains("2024-01-02T01:04:05Z"),
+        "instant changed:\n{out}"
+    );
+
+    let sql = format!(
+        "SELECT COUNT(*) FROM {t} \
+         WHERE ts = CAST('2024-01-02 01:04:05' AS TIMESTAMP WITH TIME ZONE)"
+    );
+    assert_eq!(scalar_i64(&handler, &session, &sql).await, 1);
+
+    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {t}")).await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// A filter on a cast column is pushed to Iceberg only when the cast is
+// exact. Pushed as `col = literal`, a lossy cast such as
+// `CAST(f AS INT) = 3` failed the query: "Can't convert datum from int
+// type to float type".
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ctas_cast_filter_keeps_rows_a_lossy_cast_matches() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let t = "default.ctas_cast_filter_lossy";
+    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {t}")).await;
+    let ctas = format!(
+        "CREATE TABLE {t} AS \
+         SELECT CAST(3.25 AS REAL) AS f, CAST(3.25 AS DOUBLE) AS x, '03' AS s, \
+         TIMESTAMP '2024-01-02 10:00:00' AS ts, 1 AS i \
+         UNION ALL SELECT CAST(3.4 AS REAL), CAST(3.4 AS DOUBLE), '3', \
+         TIMESTAMP '2024-01-02 23:00:00', 2"
+    );
+    exec(&handler, &session, &ctas).await;
+
+    for (filter, want) in [
+        ("CAST(f AS INT) = 3", 2),
+        ("CAST(x AS INT) = 3", 2),
+        ("CAST(s AS INT) = 3", 2),
+        ("CAST(ts AS DATE) = DATE '2024-01-02'", 2),
+        // A widening cast is still pushed and still exact.
+        ("CAST(i AS BIGINT) = 2", 1),
+    ] {
+        let sql = format!("SELECT COUNT(*) FROM {t} WHERE {filter}");
+        assert_eq!(scalar_i64(&handler, &session, &sql).await, want, "{filter}");
+    }
+
+    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {t}")).await;
+}

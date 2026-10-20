@@ -218,7 +218,7 @@ impl SqeTableProvider {
         Ok(filters
             .iter()
             .map(|f| {
-                if expr_to_predicate::is_filter_pushdown_supported(f) {
+                if expr_to_predicate::is_filter_pushdown_supported(f, Some(&self.schema)) {
                     // Inexact: DataFusion must still evaluate the filter after
                     // scanning because Iceberg predicate pushdown only prunes
                     // manifests and row-groups — it does not guarantee per-row
@@ -279,7 +279,8 @@ impl SqeTableProvider {
         };
 
         // Convert DataFusion filter expressions to an Iceberg predicate
-        let predicates = expr_to_predicate::convert_filters_to_predicate(filters);
+        let predicates =
+            expr_to_predicate::convert_filters_to_predicate_for(filters, Some(&self.schema));
         if let Some(ref pred) = predicates {
             debug!(predicate = %pred, "Pushing predicate down to Iceberg scan");
         }

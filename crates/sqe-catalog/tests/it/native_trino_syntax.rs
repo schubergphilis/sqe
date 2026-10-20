@@ -76,3 +76,37 @@ async fn row_constructor_is_a_positional_struct() {
         "\n{out}"
     );
 }
+
+/// `CAST(x AS TIMESTAMP WITH TIME ZONE)` keeps the zone: the engine session
+/// zone is UTC, so the value is zoned and an offset in the text is applied
+/// (Trino keeps the offset; Arrow has one zone per column, so SQE normalizes
+/// to UTC). With no session zone DataFusion typed it as a naive timestamp.
+#[tokio::test]
+async fn cast_with_time_zone_keeps_the_zone() {
+    let sql = "SELECT arrow_typeof(CAST('2024-01-02 03:04:05' AS TIMESTAMP WITH TIME ZONE)) AS t, \
+               CAST('2024-01-02 03:04:05+02:00' AS TIMESTAMP WITH TIME ZONE) AS v, \
+               arrow_typeof(CAST('2024-01-02 03:04:05' AS TIMESTAMP)) AS naive";
+    let out = rows(sql).await;
+    assert!(out.contains("| Timestamp(ns, \"+00:00\") "), "\n{out}");
+    assert!(out.contains("| 2024-01-02T01:04:05Z "), "\n{out}");
+    assert!(out.contains("| Timestamp(ns) "), "\n{out}");
+}
+
+/// A zoned literal compared with a naive column is cast on the literal side,
+/// so the column predicate still prunes files.
+#[tokio::test]
+async fn zoned_literal_filter_leaves_the_column_uncast() {
+    let ctx = SessionContext::new_with_config(sqe_catalog::engine_session_config());
+    let create = "CREATE TABLE tn (ts TIMESTAMP) AS VALUES (TIMESTAMP '2024-01-01 00:00:00')";
+    ctx.sql(create).await.unwrap().collect().await.unwrap();
+    for rhs in [
+        "CAST('2023-06-01 00:00:00' AS TIMESTAMP WITH TIME ZONE)",
+        "to_timestamp('2023-06-01 00:00:00')",
+    ] {
+        let sql = format!("EXPLAIN SELECT * FROM tn WHERE ts > {rhs}");
+        let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+        let out = pretty_format_batches(&batches).unwrap().to_string();
+        let expected = "Filter: tn.ts > TimestampNanosecond(1685577600000000000, None)";
+        assert!(out.contains(expected), "{rhs}\n{out}");
+    }
+}
