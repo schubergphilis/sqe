@@ -180,7 +180,7 @@ These types only exist in format-version 3, the default for new tables. A `TIMES
 |---|---|
 | `TIMESTAMP_NS`, `TIMESTAMP_NS WITH TIME ZONE` | Nanosecond precision timestamps. Arrow `Timestamp(Nanosecond, ...)`. |
 | `VARIANT` | Semi-structured value (object, array, string, number, boolean, null) in the Iceberg variant binary encoding. See [VARIANT](#variant) below. |
-| `UNKNOWN` (also `VOID`) | A column declared before its type is known. Holds only NULLs, is never written to data files, and is promoted later with `ALTER COLUMN ... SET DATA TYPE`. Top-level only; a nested unknown field is refused. |
+| `UNKNOWN` (also `VOID`) | A column declared before its type is known. Holds only NULLs, is never written to data files, and is promoted later with `ALTER COLUMN ... SET DATA TYPE`. Also allowed as a struct member, including a struct inside a list; an unknown list element or map key/value is refused. |
 | Default values via `DEFAULT expr` | Existing rows in older snapshots inherit the default at read time. |
 
 ### VARIANT

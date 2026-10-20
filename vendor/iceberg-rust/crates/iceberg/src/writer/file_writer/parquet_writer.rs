@@ -193,7 +193,7 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             output_file,
             nan_value_count_visitor: NanValueCountVisitor::new_with_match_mode(self.match_mode),
             key_metadata,
-            written_columns: None,
+            prune_unknown: false,
         })
     }
 }
@@ -370,26 +370,209 @@ pub struct ParquetWriter {
     current_row_num: usize,
     nan_value_count_visitor: NanValueCountVisitor,
     key_metadata: Option<StandardKeyMetadata>,
-    /// SQE PATCH (v3-unknown): the batch columns written to the file when
-    /// the schema has `unknown` columns; `None` writes every column.
-    written_columns: Option<Vec<usize>>,
+    /// SQE PATCH (v3-unknown): true when the schema holds an `unknown`
+    /// field at any depth; every batch is then pruned before it is written.
+    prune_unknown: bool,
 }
 
-/// SQE PATCH (v3-unknown): true when `data_type` nests a Null (`unknown`)
-/// field inside a struct, list or map.
-fn contains_nested_null(data_type: &arrow_schema::DataType) -> bool {
+/// SQE PATCH (v3-unknown): the spec never writes a V3 `unknown` field to a
+/// data file, and Spark rejects a parquet column with the Null logical type.
+/// `prune_unknown_type` drops every Null (`unknown`) member from `data_type`;
+/// `None` means the whole value is unknown. A struct left with no members,
+/// a list of unknown and a map with an unknown key or value cannot be
+/// written without the field, so they are refused.
+fn prune_unknown_type(
+    name: &str,
+    data_type: &arrow_schema::DataType,
+) -> Result<Option<arrow_schema::DataType>> {
     use arrow_schema::DataType;
-    let null_or_nested = |f: &arrow_schema::Field| {
-        f.data_type() == &DataType::Null || contains_nested_null(f.data_type())
+    let refuse = |what: &str| {
+        Error::new(
+            ErrorKind::FeatureUnsupported,
+            format!("Column `{name}` has {what}, which cannot be written to a data file."),
+        )
     };
+    let prune_field = |f: &arrow_schema::FieldRef| -> Result<Option<arrow_schema::FieldRef>> {
+        Ok(prune_unknown_type(name, f.data_type())?.map(|dt| {
+            if &dt == f.data_type() {
+                f.clone()
+            } else {
+                Arc::new(f.as_ref().clone().with_data_type(dt))
+            }
+        }))
+    };
+    let element = |f: &arrow_schema::FieldRef| match prune_field(f)? {
+        Some(f) => Ok(f),
+        None => Err(refuse("a list of unknown")),
+    };
+    Ok(Some(match data_type {
+        DataType::Null => return Ok(None),
+        DataType::Struct(fields) => {
+            let mut kept = Vec::with_capacity(fields.len());
+            for f in fields {
+                kept.extend(prune_field(f)?);
+            }
+            if kept.is_empty() && !fields.is_empty() {
+                return Err(refuse("a struct whose members are all unknown"));
+            }
+            DataType::Struct(kept.into())
+        }
+        DataType::List(f) => DataType::List(element(f)?),
+        DataType::LargeList(f) => DataType::LargeList(element(f)?),
+        DataType::FixedSizeList(f, n) => DataType::FixedSizeList(element(f)?, *n),
+        DataType::Map(f, sorted) => {
+            if let DataType::Struct(kv) = f.data_type()
+                && kv.iter().any(|f| f.data_type() == &DataType::Null)
+            {
+                return Err(refuse("a map with an unknown key or value"));
+            }
+            DataType::Map(element(f)?, *sorted)
+        }
+        other => other.clone(),
+    }))
+}
+
+/// SQE PATCH (v3-unknown): `array` without its `unknown` members, shaped as
+/// `prune_unknown_type` shapes its type; `None` when the array is unknown.
+fn prune_unknown_array(
+    name: &str,
+    array: &arrow_array::ArrayRef,
+) -> Result<Option<arrow_array::ArrayRef>> {
+    use arrow_array::{
+        Array, FixedSizeListArray, LargeListArray, ListArray, MapArray, StructArray,
+    };
+    use arrow_array::cast::AsArray;
+    use arrow_schema::DataType;
+    let Some(target) = prune_unknown_type(name, array.data_type())? else {
+        return Ok(None);
+    };
+    if &target == array.data_type() {
+        return Ok(Some(array.clone()));
+    }
+    let child = |a: &arrow_array::ArrayRef| -> Result<arrow_array::ArrayRef> {
+        prune_unknown_array(name, a)?.ok_or_else(|| {
+            Error::new(ErrorKind::Unexpected, "unknown child kept by prune_unknown_type")
+        })
+    };
+    let rebuild = |err: arrow_schema::ArrowError| {
+        Error::new(ErrorKind::Unexpected, "Failed to drop unknown fields.").with_source(err)
+    };
+    let pruned: arrow_array::ArrayRef = match &target {
+        DataType::Struct(fields) => {
+            let source = array.as_struct();
+            let mut children = Vec::with_capacity(fields.len());
+            for column in source.columns() {
+                children.extend(prune_unknown_array(name, column)?);
+            }
+            Arc::new(
+                StructArray::try_new(fields.clone(), children, source.nulls().cloned())
+                    .map_err(rebuild)?,
+            )
+        }
+        DataType::List(f) => {
+            let source = array.as_list::<i32>();
+            Arc::new(
+                ListArray::try_new(
+                    f.clone(),
+                    source.offsets().clone(),
+                    child(source.values())?,
+                    source.nulls().cloned(),
+                )
+                .map_err(rebuild)?,
+            )
+        }
+        DataType::LargeList(f) => {
+            let source = array.as_list::<i64>();
+            Arc::new(
+                LargeListArray::try_new(
+                    f.clone(),
+                    source.offsets().clone(),
+                    child(source.values())?,
+                    source.nulls().cloned(),
+                )
+                .map_err(rebuild)?,
+            )
+        }
+        DataType::FixedSizeList(f, n) => {
+            let source = array.as_fixed_size_list();
+            Arc::new(
+                FixedSizeListArray::try_new(
+                    f.clone(),
+                    *n,
+                    child(source.values())?,
+                    source.nulls().cloned(),
+                )
+                .map_err(rebuild)?,
+            )
+        }
+        DataType::Map(f, sorted) => {
+            let source = array.as_map();
+            let entries: arrow_array::ArrayRef = Arc::new(source.entries().clone());
+            Arc::new(
+                MapArray::try_new(
+                    f.clone(),
+                    source.offsets().clone(),
+                    child(&entries)?.as_struct().clone(),
+                    source.nulls().cloned(),
+                    *sorted,
+                )
+                .map_err(rebuild)?,
+            )
+        }
+        _ => {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                format!("Column `{name}` changed type while dropping unknown fields."),
+            ));
+        }
+    };
+    Ok(Some(pruned))
+}
+
+/// SQE PATCH (v3-unknown): `schema` without its `unknown` fields.
+fn prune_unknown_schema(schema: &arrow_schema::Schema) -> Result<arrow_schema::Schema> {
+    let mut fields = Vec::with_capacity(schema.fields().len());
+    for f in schema.fields() {
+        if let Some(dt) = prune_unknown_type(f.name(), f.data_type())? {
+            fields.push(f.as_ref().clone().with_data_type(dt));
+        }
+    }
+    Ok(arrow_schema::Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ))
+}
+
+/// SQE PATCH (v3-unknown): `batch` without its `unknown` fields.
+fn prune_unknown_batch(batch: &arrow_array::RecordBatch) -> Result<arrow_array::RecordBatch> {
+    let schema = Arc::new(prune_unknown_schema(batch.schema_ref())?);
+    let mut columns = Vec::with_capacity(schema.fields().len());
+    for (f, column) in batch.schema_ref().fields().iter().zip(batch.columns()) {
+        columns.extend(prune_unknown_array(f.name(), column)?);
+    }
+    arrow_array::RecordBatch::try_new_with_options(
+        schema,
+        columns,
+        &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .map_err(|err| {
+        Error::new(ErrorKind::Unexpected, "Failed to drop unknown fields.").with_source(err)
+    })
+}
+
+/// SQE PATCH (v3-unknown): true when `data_type` is or holds a Null
+/// (`unknown`) field.
+fn contains_null(data_type: &arrow_schema::DataType) -> bool {
+    use arrow_schema::DataType;
     match data_type {
-        DataType::Struct(fields) => fields.iter().any(|f| null_or_nested(f)),
+        DataType::Null => true,
+        DataType::Struct(fields) => fields.iter().any(|f| contains_null(f.data_type())),
         DataType::List(f)
         | DataType::LargeList(f)
         | DataType::ListView(f)
         | DataType::LargeListView(f)
         | DataType::FixedSizeList(f, _)
-        | DataType::Map(f, _) => null_or_nested(f),
+        | DataType::Map(f, _) => contains_null(f.data_type()),
         _ => false,
     }
 }
@@ -748,42 +931,12 @@ impl FileWriter for ParquetWriter {
                     serde_json::to_string(self.schema.as_ref())
                         .expect("Iceberg schema serialization should not fail"),
                 );
-                // SQE PATCH (v3-unknown): the spec never writes a V3 `unknown`
-                // column to a data file, and Spark rejects a parquet column
-                // with the Null logical type. Top-level unknown columns are
-                // projected out; readers fill them with NULLs. A nested
-                // unknown field is refused rather than written as Null.
-                if let Some(field) = schema
-                    .fields()
-                    .iter()
-                    .find(|f| contains_nested_null(f.data_type()))
-                {
-                    return Err(Error::new(
-                        ErrorKind::FeatureUnsupported,
-                        format!(
-                            "Column `{}` has a nested unknown field, which cannot be written yet.",
-                            field.name()
-                        ),
-                    ));
-                }
-                if schema
-                    .fields()
-                    .iter()
-                    .any(|f| f.data_type() == &arrow_schema::DataType::Null)
-                {
-                    let kept: Vec<usize> = schema
-                        .fields()
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, f)| f.data_type() != &arrow_schema::DataType::Null)
-                        .map(|(i, _)| i)
-                        .collect();
-                    let projected = schema.project(&kept).map_err(|err| {
-                        Error::new(ErrorKind::Unexpected, "Failed to drop unknown columns.")
-                            .with_source(err)
-                    })?;
-                    self.written_columns = Some(kept);
-                    Arc::new(projected.with_metadata(metadata))
+                // SQE PATCH (v3-unknown): `unknown` fields, top-level or
+                // nested, are left out of the file; readers fill them with
+                // NULLs.
+                if schema.fields().iter().any(|f| contains_null(f.data_type())) {
+                    self.prune_unknown = true;
+                    Arc::new(prune_unknown_schema(&schema)?.with_metadata(metadata))
                 } else {
                     Arc::new(schema.with_metadata(metadata))
                 }
@@ -803,16 +956,12 @@ impl FileWriter for ParquetWriter {
             self.inner_writer.as_mut().unwrap()
         };
 
-        let projected;
-        let batch = match &self.written_columns {
-            Some(kept) => {
-                projected = batch.project(kept).map_err(|err| {
-                    Error::new(ErrorKind::Unexpected, "Failed to drop unknown columns.")
-                        .with_source(err)
-                })?;
-                &projected
-            }
-            None => batch,
+        let pruned;
+        let batch = if self.prune_unknown {
+            pruned = prune_unknown_batch(batch)?;
+            &pruned
+        } else {
+            batch
         };
         writer.write(batch).await.map_err(|err| {
             Error::new(
@@ -3565,22 +3714,124 @@ mod tests {
         Ok(())
     }
 
-    /// SQE PATCH (v3-unknown): a nested `unknown` field is refused, not
-    /// written as a Null column other engines cannot read.
+    /// SQE PATCH (v3-unknown): a nested `unknown` struct member is left out
+    /// of the file, inside a struct column and inside a list of structs.
+    #[tokio::test]
+    async fn test_parquet_writer_skips_nested_unknown_field() -> Result<()> {
+        use arrow_array::cast::AsArray;
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
+
+        let member = |a: i32, u: i32| {
+            Type::Struct(StructType::new(vec![
+                NestedField::optional(a, "a", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(u, "u", Type::Primitive(PrimitiveType::Unknown)).into(),
+            ]))
+        };
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "s", member(4, 5)).into(),
+                    NestedField::optional(
+                        3,
+                        "l",
+                        Type::List(ListType::new(
+                            NestedField::list_element(6, member(7, 8), false).into(),
+                        )),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema: ArrowSchemaRef = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        let DataType::Struct(s_fields) = arrow_schema.field(1).data_type().clone() else {
+            unreachable!()
+        };
+        let DataType::List(l_field) = arrow_schema.field(2).data_type().clone() else {
+            unreachable!()
+        };
+        let DataType::Struct(l_fields) = l_field.data_type().clone() else {
+            unreachable!()
+        };
+        let members = |fields: &Fields, n: usize| {
+            StructArray::new(
+                fields.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..n as i32)) as ArrayRef,
+                    Arc::new(arrow_array::NullArray::new(n)) as ArrayRef,
+                ],
+                None,
+            )
+        };
+        let to_write = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(Int64Array::from_iter_values(0..2)) as ArrayRef,
+            Arc::new(members(&s_fields, 2)) as ArrayRef,
+            Arc::new(ListArray::new(
+                l_field,
+                arrow_buffer::OffsetBuffer::from_lengths([1, 2]),
+                Arc::new(members(&l_fields, 3)),
+                None,
+            )) as ArrayRef,
+        ])?;
+
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+        let file_path = output_file.location().to_string();
+        let mut pw = ParquetWriterBuilder::new(WriterProperties::builder().build(), schema.clone())
+            .build(output_file)
+            .await?;
+        pw.write(&to_write).await?;
+        let res = pw.close().await?;
+        assert_eq!(res.len(), 1);
+
+        let bytes = file_io.new_input(&file_path)?.read().await?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap().build().unwrap();
+        let batches = reader.map(|b| b.unwrap()).collect::<Vec<_>>();
+        let read = concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(read.num_rows(), 2);
+        let s = read.column(1).as_struct();
+        assert_eq!(s.num_columns(), 1);
+        assert_eq!(s.column_names(), vec!["a"]);
+        let l = read.column(2).as_list::<i32>();
+        assert_eq!(l.values().as_struct().column_names(), vec!["a"]);
+        assert_eq!(l.values().len(), 3);
+        Ok(())
+    }
+
+    /// SQE PATCH (v3-unknown): an unknown field that cannot be left out
+    /// without losing its parent is refused, not written as a Null column
+    /// other engines cannot read.
     #[test]
-    fn test_contains_nested_null() {
+    fn test_prune_unknown_type() {
         use arrow_schema::{DataType, Field, Fields};
         let nested = DataType::Struct(Fields::from(vec![
             Field::new("a", DataType::Int32, true),
             Field::new("u", DataType::Null, true),
         ]));
-        assert!(contains_nested_null(&nested));
-        assert!(contains_nested_null(&DataType::List(Arc::new(Field::new(
-            "element", nested, true
-        )))));
-        assert!(!contains_nested_null(&DataType::Null));
-        assert!(!contains_nested_null(&DataType::Struct(Fields::from(vec![
-            Field::new("a", DataType::Int32, true)
-        ]))));
+        let pruned = DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int32, true)]));
+        assert_eq!(prune_unknown_type("c", &nested).unwrap(), Some(pruned));
+        assert_eq!(prune_unknown_type("c", &DataType::Null).unwrap(), None);
+        assert_eq!(
+            prune_unknown_type("c", &DataType::Int32).unwrap(),
+            Some(DataType::Int32)
+        );
+        let all_unknown =
+            DataType::Struct(Fields::from(vec![Field::new("u", DataType::Null, true)]));
+        let list_of_unknown =
+            DataType::List(Arc::new(Field::new("element", DataType::Null, true)));
+        for refused in [all_unknown, list_of_unknown] {
+            let err = prune_unknown_type("c", &refused).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+        }
+        assert!(contains_null(&nested));
+        assert!(!contains_null(&DataType::Int32));
     }
 }
