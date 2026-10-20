@@ -72,6 +72,11 @@ ALTER TABLE analytics.events SET TBLPROPERTIES (
     'write.delete.mode' = 'merge-on-read',
     'write.parquet.bloom-filter-columns' = 'user_id,event_id'
 );
+-- The Iceberg spec form, as Spark writes it, works too:
+ALTER TABLE analytics.events SET TBLPROPERTIES (
+    'write.parquet.bloom-filter-enabled.column.user_id' = 'true',
+    'write.parquet.bloom-filter-fpp.column.user_id' = '0.05'
+);
 ```
 
 ## Partition evolution (SQE / Iceberg-specific)
