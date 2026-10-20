@@ -16,7 +16,7 @@ Functions for choosing between values, replacing nulls, and inspecting types. Mo
 | `nvl2(expr, when_not_null, when_null)` | `datafusion-builtin` | Three-arg form: branches on whether `expr IS NULL`. | - | `nvl2` | `nvl2` | - |
 | `greatest(a, b, ...)` | `datafusion-builtin` | Max of the arguments. NULLs ignored unless every argument is NULL. Variadic. | `greatest` | `greatest` | `greatest` | `greatest` |
 | `least(a, b, ...)` | `datafusion-builtin` | Min of the arguments. NULLs ignored unless every argument is NULL. Variadic. | `least` | `least` | `least` | `least` |
-| `typeof(expr)` | `sqe-trino-functions` | Returns the Arrow type as text (`"Int64"`, `"Utf8"`, `"Timestamp(Microsecond, None)"`). Trino spells the same way; result string differs by engine. `trino_functions.rs:1031` | `typeof` | - | - | `typeof` |
+| `typeof(expr)` | `sqe-trino-functions` | Returns the Trino type name, the one a client sees in the result metadata: `integer`, `varchar`, `decimal(5,2)`, `timestamp(6)`, `array(bigint)`; `variant` for a JSON or VARIANT column. An integer literal is `bigint` and a string literal `varchar`, where Trino says `integer` and `varchar(1)`. `arrow_typeof` returns the Arrow name. `trino_functions.rs` | `typeof` | - | - | `typeof` |
 | `try(expr)` | `sqe-trino-functions (ext)` | Catches errors from `expr` and returns NULL on failure. Handy for casting strings of unknown shape. `trino_functions_ext.rs:76` | `try` | `try_cast` (different shape) | - | - |
 | `arbitrary(col)` | `sqe-trino-functions (ext)` | Aggregate that returns one non-deterministic non-NULL value. Trino name. Equivalent to `any_value`. `trino_functions_ext.rs:68` | `arbitrary` | `any_value` | `any_value` | `any_value` |
 

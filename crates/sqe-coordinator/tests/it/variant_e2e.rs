@@ -104,11 +104,12 @@ async fn variant_column_stores_json_and_reads_it_back() {
     );
     let ddl = show_create(&handler, &session, fq).await;
     assert!(ddl.contains("v VARIANT"), "SHOW CREATE TABLE {fq}: {ddl}");
-    // typeof names the variant, not its struct storage.
+    // typeof names the variant, not its struct storage, and a column by its
+    // Trino type name (#867).
     let typeof_sql = format!("SELECT typeof(v), typeof(id) FROM {fq} WHERE id = 1");
     assert_eq!(
         rows(&handler, &session, &typeof_sql).await,
-        vec!["variant|Int32"]
+        vec!["variant|integer"]
     );
 
     // Invalid JSON fails the write; it is never stored as NULL.
@@ -351,6 +352,33 @@ async fn json_functions_read_a_v3_json_column() {
         )
         .await,
         vec![r#"{"b":2}|x|2"#]
+    );
+    drop(&handler, &session, fq).await;
+}
+
+/// `CAST(.. AS JSON)` of a v3 JSON column embeds the stored value, also
+/// inside an array, as Trino does (#848).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn cast_as_json_embeds_a_v3_json_column() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let fq = "default.cast_as_json_v3";
+    drop(&handler, &session, fq).await;
+    for sql in [
+        format!("CREATE TABLE {fq} (id INT, j JSON) WITH ('format-version' = '3')"),
+        format!(r#"INSERT INTO {fq} VALUES (1, '{{"a": 1}}'), (2, '"s"'), (3, NULL)"#),
+    ] {
+        handler.execute(&session, &sql, None).await.expect(&sql);
+    }
+    let select = format!("SELECT id, CAST(j AS JSON), to_json(j) FROM {fq} ORDER BY id");
+    assert_eq!(
+        rows(&handler, &session, &select).await,
+        vec![r#"1|{"a":1}|{"a":1}"#, r#"2|"s"|"s""#, "3|NULL|NULL"]
+    );
+    let nested = format!("SELECT CAST(ARRAY[j, j] AS JSON) FROM {fq} WHERE id = 1");
+    assert_eq!(
+        rows(&handler, &session, &nested).await,
+        vec![r#"[{"a":1},{"a":1}]"#]
     );
     drop(&handler, &session, fq).await;
 }

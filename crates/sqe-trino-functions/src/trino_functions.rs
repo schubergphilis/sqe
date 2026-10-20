@@ -23,6 +23,7 @@ use datafusion::logical_expr::{
     ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
 };
+use sqe_trino_protocol::encode;
 
 /// Register all Trino-compatible function aliases on a SessionContext.
 pub fn register_trino_functions(ctx: &datafusion::prelude::SessionContext) {
@@ -1167,16 +1168,20 @@ impl ScalarUDFImpl for TypeOf {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         use datafusion::common::ScalarValue;
 
-        // A variant is struct storage tagged on the field, not in the type
-        // (`sqe_core::variant::EXTENSION_NAME`; sqe-core is a dev-dependency).
-        let is_variant = args
+        // The Trino type name (#867). A variant is struct storage tagged on
+        // the field; most expressions drop the tag, so the shape counts too.
+        let data_type = match &args.args[0] {
+            ColumnarValue::Array(arr) => arr.data_type().clone(),
+            ColumnarValue::Scalar(sv) => sv.data_type(),
+        };
+        let tagged = args
             .arg_fields
             .first()
             .is_some_and(|f| f.extension_type_name() == Some("arrow.parquet.variant"));
-        let type_name = match &args.args[0] {
-            _ if is_variant => "variant".to_string(),
-            ColumnarValue::Array(arr) => format!("{:?}", arr.data_type()),
-            ColumnarValue::Scalar(sv) => format!("{:?}", sv.data_type()),
+        let type_name = if tagged || encode::is_variant_storage(&data_type) {
+            "variant".to_string()
+        } else {
+            encode::arrow_to_trino_type(&data_type)
         };
 
         // Return a scalar string — same value for every row.
@@ -2933,23 +2938,28 @@ mod tests {
 
     // ── typeof tests ──────────────────────────────────────────────────────────
 
+    /// `typeof` returns the Trino type name, the one a client sees in the
+    /// result's column metadata (#867). An integer literal is a bigint in
+    /// SQE, an integer in Trino.
     #[tokio::test]
-    async fn typeof_integer() {
-        let s = run_query_string("SELECT typeof(42)").await;
-        // DataFusion represents integer literals as Int64
-        assert!(
-            s.to_lowercase().contains("int"),
-            "expected type name containing 'int', got: {s}"
-        );
-    }
-
-    #[tokio::test]
-    async fn typeof_string() {
-        let s = run_query_string("SELECT typeof('hello')").await;
-        assert!(
-            s.to_lowercase().contains("utf8") || s.to_lowercase().contains("str"),
-            "expected type name for string, got: {s}"
-        );
+    async fn typeof_returns_trino_type_names() {
+        for (expr, want) in [
+            ("42", "bigint"),
+            ("CAST(1 AS INTEGER)", "integer"),
+            ("CAST(1 AS SMALLINT)", "smallint"),
+            ("CAST(1 AS DOUBLE)", "double"),
+            ("CAST(1 AS REAL)", "real"),
+            ("CAST(1.5 AS DECIMAL(5,2))", "decimal(5,2)"),
+            ("'hello'", "varchar"),
+            ("true", "boolean"),
+            ("DATE '2024-01-01'", "date"),
+            ("TIMESTAMP '2024-01-01 00:00:00'", "timestamp(6)"),
+            ("make_array(1, 2)", "array(bigint)"),
+            ("NULL", "unknown"),
+        ] {
+            let s = run_query_string(&format!("SELECT typeof({expr})")).await;
+            assert_eq!(s, want, "typeof({expr})");
+        }
     }
 
     // ── if() tests ────────────────────────────────────────────────────────────
