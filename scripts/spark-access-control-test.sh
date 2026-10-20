@@ -134,8 +134,8 @@ echo "  config: $RESOLVED_CONFIG"
 # filtered by its own MODULE NAME, one cargo invocation apiece.
 #
 # A bare substring like `spark_` would be wrong, not merely broad: under
-# `--ignored` it also matches `spark_reads_sqe_mor_updated_table` and
-# `spark_reads_sqe_equality_delete_file`, which live in other modules and need the
+# `--ignored` it also matches `mor_spark_interop_*` and
+# `spark_harness_reads_its_own_mor_delete`, which live in other modules and need the
 # separate `sqe-spark-iceberg` stack that scripts/spark-interop.sh brings up. They
 # would be force-run against THIS stack and fail for reasons that have nothing to
 # do with access control.

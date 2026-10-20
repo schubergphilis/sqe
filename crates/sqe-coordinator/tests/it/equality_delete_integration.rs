@@ -4,18 +4,11 @@
 //! touching a live catalog: mode resolution, default-is-CoW behaviour, and
 //! invalid-mode rejection.
 //!
-//! `#[ignore]`d tests need the docker-compose.test.yml stack (Polaris + RustFS)
-//! and Spark 4.x for interop. Run after boot:
-//!
-//! ```text
-//! ./scripts/start-spark-interop.sh
-//! cargo test --package sqe-coordinator --test it equality_delete_integration -- --ignored
-//! ```
-//!
-//! The Spark interop test (`spark_reads_sqe_equality_delete_file`) is NOT
-//! ignored. It self-skips with a diagnostic when the Spark container is
-//! not up, so plain `cargo test` on a developer box without the stack
-//! still passes.
+//! SQE-written equality deletes read back by Spark are tested in
+//! `mor_spark_interop`. The Spark harness smoke test here
+//! (`spark_harness_reads_its_own_mor_delete`) is NOT ignored. It
+//! self-skips with a diagnostic when the Spark container is not up, so
+//! plain `cargo test` on a developer box without the stack still passes.
 
 // ---------------------------------------------------------------------------
 // Dispatch-mode contract: the property string encodes which path we take.
@@ -62,32 +55,15 @@ fn write_delete_mode_accepted_values() {
 
 use crate::common::spark_interop::{spark_sql, spark_stack_skip_reason};
 
-/// Task 6.5: SQE writes an equality-delete file and Spark 4.x reads it.
-///
-/// Shape:
-///
-/// 1. SQE creates ns.t with IDENTIFIER FIELDS (id) and
-///    TBLPROPERTIES ('write.delete.mode' = 'merge-on-read').
-/// 2. SQE inserts 10 rows.
-/// 3. SQE runs DELETE FROM ns.t WHERE id IN (1,2,3) which writes one
-///    equality-delete file via RowDeltaAction.
-/// 4. Spark reads the same table via the shared Polaris catalog. COUNT(*)
-///    must be 7. COUNT(*) WHERE id IN (1,2,3) must be 0.
-///
-/// The SQE-side DDL/DML requires the live Polaris stack, so that phase is
-/// still guarded behind `#[ignore]` when we add it. Right now the test
-/// verifies the cross-engine read plumbing works: it creates a scratch
-/// table from Spark itself, round-trips through the catalog, and confirms
-/// Spark reads what it wrote. That is enough to lift the matrix caveat
-/// "no cross-engine read test executed" because the harness is wired.
-///
-/// Full SQE-writes-Spark-reads flow is tracked alongside the spec
-/// scenario "Equality delete read by Spark 4.1".
+/// Harness smoke: Spark creates a merge-on-read table in the shared
+/// Polaris catalog, deletes from it and reads the count back. SQE writes
+/// nothing here; the SQE-writes-Spark-reads tests (task 6.5) are in
+/// `mor_spark_interop`.
 #[test]
-fn spark_reads_sqe_equality_delete_file() {
+fn spark_harness_reads_its_own_mor_delete() {
     if let Some(reason) = spark_stack_skip_reason() {
         eprintln!(
-            "skipping spark_reads_sqe_equality_delete_file: {reason}. \
+            "skipping spark_harness_reads_its_own_mor_delete: {reason}. \
              Bring the stack up with ./scripts/start-spark-interop.sh to \
              exercise cross-engine Iceberg reads."
         );
@@ -104,11 +80,9 @@ fn spark_reads_sqe_equality_delete_file() {
         "spark SELECT 1 returned {out:?}, expected leading '1'"
     );
 
-    // Cross-engine table round-trip. Spark creates a MoR-configured
-    // table, inserts rows, deletes some via Iceberg's own DELETE (which
-    // writes equality deletes on V2), and reads back the count. This is
-    // the same commit mechanism SQE uses via RowDeltaAction, so a pass
-    // here means Spark's reader happily merges SQE-shaped delete files.
+    // Catalog round-trip. Spark creates a MoR-configured table, inserts
+    // rows, deletes some with its own DELETE (position deletes: the table
+    // has no identifier fields) and reads back the count.
     //
     // The table is dropped at the end so the test is re-runnable.
     //
@@ -153,9 +127,7 @@ fn spark_reads_sqe_equality_delete_file() {
 }
 
 // ---------------------------------------------------------------------------
-// Ignored: live-stack tests still pending an SQE-side setup path. These
-// stay behind `#[ignore]` until the SQE DML harness can write MoR tables
-// through QueryHandler against the same Polaris instance.
+// Ignored: concurrent-writer tests still pending a two-session harness.
 // ---------------------------------------------------------------------------
 
 /// Task 6.10: commit conflict when a concurrent writer advances the
@@ -180,16 +152,4 @@ fn concurrent_writer_produces_retryable_commit_conflict() {
 fn cow_update_delete_retries_on_concurrency_conflict() {
     // Implementation tracked alongside the spec scenario
     // "Partition-aware CoW writes retry on commit conflict".
-}
-
-/// Task 6.3 acceptance (live-stack variant).
-///
-/// DELETE on a MoR table with a declared primary key writes one equality
-/// delete file, rewrites zero data files, and subsequent reads exclude
-/// the deleted rows.
-#[test]
-#[ignore = "needs:polaris"]
-fn mor_delete_writes_one_equality_delete_file() {
-    // Implementation tracked alongside the spec scenario
-    // "DELETE by primary key writes equality delete".
 }
