@@ -148,6 +148,12 @@ fn reshape_describe_batch(batch: RecordBatch) -> RecordBatch {
     };
     let n = batch.num_rows();
     let empty: arrow_array::ArrayRef = Arc::new(StringArray::from(vec![""; n]));
+    // The coordinator's SHOW COLUMNS layout carries the column comment.
+    let comment = schema
+        .index_of("comment")
+        .ok()
+        .filter(|&i| schema.field(i).data_type() == &arrow_schema::DataType::Utf8)
+        .map_or_else(|| empty.clone(), |i| batch.column(i).clone());
     let out_schema = Arc::new(arrow_schema::Schema::new(vec![
         arrow_schema::Field::new("Column", arrow_schema::DataType::Utf8, false),
         arrow_schema::Field::new("Type", arrow_schema::DataType::Utf8, false),
@@ -159,8 +165,8 @@ fn reshape_describe_batch(batch: RecordBatch) -> RecordBatch {
         vec![
             batch.column(name_idx).clone(),
             batch.column(type_idx).clone(),
-            empty.clone(),
             empty,
+            comment,
         ],
     )
     .unwrap_or(batch)
@@ -252,6 +258,56 @@ mod tests {
             vec!["Column", "Type", "Extra", "Comment"]
         );
         assert_eq!(out[0].num_rows(), 2);
+    }
+
+    #[test]
+    fn describe_reshape_keeps_the_comment() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("column_name", DataType::Utf8, false),
+            Field::new("data_type", DataType::Utf8, false),
+            Field::new("is_nullable", DataType::Utf8, false),
+            Field::new("comment", DataType::Utf8, true),
+        ]));
+        let b = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["id", "name"])),
+                Arc::new(StringArray::from(vec!["bigint", "varchar"])),
+                Arc::new(StringArray::from(vec!["NO", "YES"])),
+                Arc::new(StringArray::from(vec![Some("order id"), None])),
+            ],
+        )
+        .unwrap();
+        let out = reshape_describe_to_trino(vec![b]);
+        let comment = out[0]
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(comment.value(0), "order id");
+        assert!(comment.is_null(1));
+    }
+
+    #[test]
+    fn trino_type_mapping_is_idempotent() {
+        // The coordinator maps DESCRIBE types to Trino names and the Trino
+        // front end maps them again; a second pass must not change them.
+        for arrow in [
+            "Int32",
+            "Int64",
+            "Utf8",
+            "Boolean",
+            "Date32",
+            "Decimal128(10, 2)",
+            "Timestamp(Microsecond, None)",
+            "Timestamp(Microsecond, Some(\"UTC\"))",
+            "List(Int64)",
+            "Struct(\"a\": Int32, \"b\": Utf8)",
+        ] {
+            let once = arrow_display_to_trino_type(arrow);
+            assert_ne!(once, arrow, "{arrow} did not map");
+            assert_eq!(arrow_display_to_trino_type(&once), once, "{arrow}");
+        }
     }
 
     // ── type mapping (ground truth from the live stack discriminator) ──────
