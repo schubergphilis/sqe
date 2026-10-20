@@ -1,7 +1,9 @@
 /// The one Arrow-to-Trino-JSON value encoding and the Arrow-to-Trino type
 /// name live in the wire crate so the MCP endpoint and the function crate
 /// share them without linking this server (review 803, #867).
-pub use sqe_trino_protocol::encode::{arrow_to_trino_type, arrow_value_to_json};
+pub use sqe_trino_protocol::encode::{
+    arrow_to_declared_trino_type, arrow_to_trino_type, arrow_value_to_json,
+};
 
 #[cfg(test)]
 mod tests {

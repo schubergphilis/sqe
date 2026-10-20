@@ -40,16 +40,34 @@ pub fn hive_spec_from_manifest(
         database: Some(m.database_name.clone()),
         name: m.name.clone(),
         if_not_exists: false,
-        comment: m.description.clone(),
-        columns: m.storage_descriptor.columns.iter().map(glue_to_hive).collect(),
+        comment: m
+            .description
+            .clone()
+            .or_else(|| m.parameters.get("comment").cloned()),
+        columns: m
+            .storage_descriptor
+            .columns
+            .iter()
+            .map(glue_to_hive)
+            .collect(),
         partition_keys: m.partition_keys.iter().map(glue_to_hive).collect(),
         location: m.storage_descriptor.location.clone(),
-        serde_class: m.storage_descriptor.serde_info.serialization_library.clone(),
+        serde_class: m
+            .storage_descriptor
+            .serde_info
+            .serialization_library
+            .clone(),
         serde_properties: m.storage_descriptor.serde_info.parameters.clone(),
         stored_as: None,
         input_format: m.storage_descriptor.input_format.clone(),
         output_format: m.storage_descriptor.output_format.clone(),
-        table_properties: m.parameters.clone(),
+        // The `comment` parameter is the table comment (above), not a property.
+        table_properties: m
+            .parameters
+            .iter()
+            .filter(|(k, _)| k.as_str() != "comment")
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
     }
 }
 
@@ -59,27 +77,25 @@ pub fn hive_spec_from_manifest(
 /// output must produce a `HiveTableSpec` equal to `spec`. Pinned by the
 /// embedded test `show_create_table_renders_athena_compatible_ddl`.
 pub fn render_hive_create_table_ddl(spec: &sqe_sql::hive_ddl::HiveTableSpec) -> String {
-    let table_ref = match (&spec.catalog, &spec.database) {
-        (Some(c), Some(d)) => format!("{c}.{d}.{}", spec.name),
-        (None, Some(d)) => format!("{d}.{}", spec.name),
-        _ => spec.name.clone(),
-    };
+    let parts: Vec<String> = [&spec.catalog, &spec.database]
+        .into_iter()
+        .flatten()
+        .chain(std::iter::once(&spec.name))
+        .cloned()
+        .collect();
+    let table_ref = sqe_sql::quote_qualified_if_needed(&parts, '`');
 
     let mut out = format!("CREATE EXTERNAL TABLE {table_ref} (\n");
     let cols: Vec<String> = spec
         .columns
         .iter()
-        .map(|c| format!("   {} {}", c.name, c.sql_type))
+        .map(|c| format!("   {}", column(c)))
         .collect();
     out.push_str(&cols.join(",\n"));
     out.push_str("\n)");
 
     if !spec.partition_keys.is_empty() {
-        let pk: Vec<String> = spec
-            .partition_keys
-            .iter()
-            .map(|c| format!("{} {}", c.name, c.sql_type))
-            .collect();
+        let pk: Vec<String> = spec.partition_keys.iter().map(column).collect();
         out.push_str(&format!("\nPARTITIONED BY ({})", pk.join(", ")));
     }
 
@@ -103,13 +119,34 @@ pub fn render_hive_create_table_ddl(spec: &sqe_sql::hive_ddl::HiveTableSpec) -> 
 
     out.push_str(&format!("\nLOCATION '{}'", sql_quote(&spec.location)));
 
-    if !spec.table_properties.is_empty() {
+    // sqlparser takes no `COMMENT` clause on `CREATE EXTERNAL TABLE`, so the
+    // table comment goes out the way the Hive metastore stores it: as the
+    // `comment` table property, which `try_extract_hive_table` lifts back.
+    let mut table_properties = spec.table_properties.clone();
+    if let Some(comment) = &spec.comment {
+        table_properties.insert("comment".to_string(), comment.clone());
+    }
+    if !table_properties.is_empty() {
         out.push_str(&format!(
             "\nTBLPROPERTIES ({})",
-            render_props(&spec.table_properties)
+            render_props(&table_properties)
         ));
     }
 
+    out
+}
+
+/// `name type [COMMENT '...']`, the name backtick-quoted when it is not a
+/// plain lowercase identifier (Athena's quoting).
+fn column(c: &sqe_sql::hive_ddl::HiveColumn) -> String {
+    let mut out = format!(
+        "{} {}",
+        sqe_sql::quote_ident_if_needed(&c.name, '`'),
+        c.sql_type
+    );
+    if let Some(comment) = &c.comment {
+        out.push_str(&format!(" COMMENT '{}'", sql_quote(comment)));
+    }
     out
 }
 

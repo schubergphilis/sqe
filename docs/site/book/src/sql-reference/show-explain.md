@@ -12,10 +12,10 @@ Source: `crates/sqe-sql/src/classifier.rs` (statement routing), `crates/sqe-coor
 | `SHOW SCHEMAS [IN cat]` | `sqlparser-rs` + `sqe-coordinator` | List namespaces. Filters by catalog if `IN` supplied. | yes | yes | yes | yes |
 | `SHOW TABLES [IN cat.ns]` | `sqlparser-rs` + `sqe-coordinator` | List tables. | yes | yes | yes | yes |
 | `SHOW VIEWS [IN cat.ns]` | `sqlparser-rs` + `sqe-coordinator` | List views. | yes | yes | yes | partial |
-| `SHOW COLUMNS FROM cat.ns.t` | `sqe-coordinator/query_handler.rs:1858` | Trino syntax. Rewrites to `information_schema.columns` query. | yes | yes | yes | yes |
-| `SHOW CREATE TABLE cat.ns.t` | `sqe-sql/classifier.rs` | Reconstruct the CREATE statement from current metadata. | yes | yes | yes | yes |
+| `SHOW COLUMNS FROM cat.ns.t` | `sqe-coordinator/query_handler.rs` (`columns_for_table`) | Same result as `DESCRIBE`. | yes | yes | yes | yes |
+| `SHOW CREATE TABLE cat.ns.t` | `sqe-coordinator/query_handler.rs` (`handle_show_create_table`) | Reconstruct the CREATE statement from current metadata, with Trino types and quoted names where needed; the output runs back as is. | yes | yes | yes | yes |
 | `SHOW STATS FOR cat.ns.t` | `sqe-sql/classifier.rs:166` | Per-column NDV, null fraction, min, max. From Iceberg manifest stats. | yes | - | partial | yes |
-| `DESCRIBE cat.ns.t` | `datafusion-builtin` | Three-column projection: `column_name`, `data_type`, `is_nullable`. | yes | yes | yes | yes |
+| `DESCRIBE cat.ns.t` | `sqe-coordinator/query_handler.rs` (`columns_for_table`) | `column_name`, `data_type` (Trino type name), `is_nullable`, `comment`. | yes | yes | yes | yes |
 | `SHOW GRANTS ON ...` | `sqe-sql/classifier.rs:186` | See [GRANT and REVOKE](./grant-revoke.md). | partial | yes | partial | - |
 | `SHOW EFFECTIVE GRANTS FOR USER "x"` | `sqe-sql/classifier.rs:174` | SQE-specific. See [GRANT and REVOKE](./grant-revoke.md). | - | - | - | - |
 
@@ -41,17 +41,15 @@ sqe> SHOW TABLES IN analytics;
 
 ## DESCRIBE vs SHOW COLUMNS
 
-Both work, slightly different shapes:
+Both return the same result:
 
 ```sql
 DESCRIBE analytics.events;
--- column_name | data_type | is_nullable
-
 SHOW COLUMNS FROM analytics.events;
--- column_name | data_type | is_nullable | extra
+-- column_name | data_type | is_nullable | comment
 ```
 
-`DESCRIBE` is DataFusion-native (3 columns). `SHOW COLUMNS` is Trino syntax, rewritten by SQE to query `information_schema.columns` directly so external dbt models that expect 4 columns work unmodified.
+`data_type` is the Trino type name (`bigint`, `array(integer)`, `row(x integer,y varchar)`, `variant`), the same spelling `typeof` returns and `SHOW CREATE TABLE` writes. On the Trino protocol the columns are `Column | Type | Extra | Comment`, as Trino returns them.
 
 ## SHOW STATS
 

@@ -127,7 +127,27 @@ impl SqlFrontDoor {
             Ok(statements) if statements.is_empty() => {
                 return Err(crate::token_scan::syntax_error("Empty SQL"));
             }
-            Ok(statements) => (statements, sql.to_string(), false),
+            // `row(t timestamp with time zone)` parses, but as a flattened
+            // modifier list no type mapper can read back; spell Trino
+            // nested column types the way sqlparser structures them.
+            Ok(statements) => {
+                let ddl = matches!(
+                    statements[0],
+                    Statement::CreateTable(_) | Statement::AlterTable(_)
+                );
+                let rewritten = if ddl {
+                    crate::rewrite_trino_ddl_types(sql)
+                } else {
+                    sql.to_string()
+                };
+                if rewritten == sql {
+                    (statements, rewritten, false)
+                } else {
+                    let statements =
+                        Parser::parse_sql(&GenericDialect {}, &rewritten).map_err(parse_error)?;
+                    (statements, rewritten, true)
+                }
+            }
             Err(first_err) => {
                 // Source-level fallbacks for Trino shapes sqlparser rejects.
                 // Each is parse-gated internally, so they compose; the order
@@ -136,6 +156,7 @@ impl SqlFrontDoor {
                 let rewritten = crate::rewrite_bare_table(&rewritten);
                 let rewritten = crate::rewrite_nested_row_cast(&rewritten);
                 let rewritten = crate::rewrite_trim_both_from(&rewritten);
+                let rewritten = crate::rewrite_trino_ddl_types(&rewritten);
                 // Trino `CREATE VIEW ... SECURITY DEFINER|INVOKER`: the Flight
                 // path folds it in `pre_parse_pipeline`; the Trino path enters
                 // here directly, so fold it here too (#768).
