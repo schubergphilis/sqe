@@ -209,7 +209,7 @@ async fn sqe_reads_a_spark_shredded_variant_table() {
 }
 
 /// A plain client on the test stack's RustFS, independent of SQE's reader.
-fn test_store(bucket: &str) -> object_store::aws::AmazonS3 {
+pub(crate) fn test_store(bucket: &str) -> object_store::aws::AmazonS3 {
     object_store::aws::AmazonS3Builder::new()
         .with_bucket_name(bucket)
         .with_endpoint("http://localhost:19000")
@@ -223,7 +223,7 @@ fn test_store(bucket: &str) -> object_store::aws::AmazonS3 {
 }
 
 /// Split `s3://bucket/key` into the bucket and the key.
-fn split_s3(uri: &str) -> (String, String) {
+pub(crate) fn split_s3(uri: &str) -> (String, String) {
     let rest = uri
         .strip_prefix("s3://")
         .unwrap_or_else(|| panic!("not an s3 uri: {uri}"));
