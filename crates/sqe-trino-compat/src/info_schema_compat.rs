@@ -30,101 +30,86 @@ use arrow_array::{Array, BooleanArray, RecordBatch, StringArray};
 /// client should never see.
 const INTERNAL_CATALOGS: [&str; 2] = ["system", "datafusion"];
 
-/// Map a DataFusion Arrow type *display string* (as emitted by the built-in
-/// `information_schema.data_type` column) to a Trino SQL type name. Unknown
-/// inputs pass through unchanged rather than being mangled.
-/// True when an Arrow type display string is Iceberg variant storage,
-/// `Struct("metadata": Binary, "value": Binary)` (#849). DataFusion's
-/// `information_schema` only has the display form to go on.
-pub fn is_variant_display(t: &str) -> bool {
-    let Some(inner) = t.strip_prefix("Struct(").and_then(|r| r.strip_suffix(')')) else {
-        return false;
-    };
-    let binary = |rest: &str| {
-        let rest = rest.strip_prefix("non-null ").unwrap_or(rest);
-        rest.starts_with("Binary")
-            || rest.starts_with("LargeBinary")
-            || rest.starts_with("BinaryView")
-    };
-    let Some(rest) = inner.strip_prefix("\"metadata\": ") else {
-        return false;
-    };
-    let Some((metadata, value)) = rest.split_once(", \"value\": ") else {
-        return false;
-    };
-    // Nothing may follow `value` but a shredded file's `typed_value`.
-    let only_typed_value = match value.split_once(", \"") {
-        None => true,
-        Some((_, more)) => more.starts_with("typed_value\": "),
-    };
-    binary(metadata) && binary(value) && only_typed_value
-}
-
+/// Map a DataFusion Arrow type display string to the declared Trino type
+/// name. The string is parsed back to the Arrow type and named by the same
+/// mapper as the wire columns and `typeof`, so `information_schema` agrees
+/// with what a client reads (`timestamp(6)`, `array(bigint)`,
+/// `row(a integer)`), except that a variant is `variant`, as declared.
+/// A string Arrow cannot parse passes through unchanged rather than being
+/// mangled.
 pub fn arrow_display_to_trino_type(s: &str) -> String {
-    let t = s.trim();
-    if let Some(rest) = t
-        .strip_prefix("Decimal128(")
-        .or_else(|| t.strip_prefix("Decimal256("))
-    {
-        return format_decimal(rest);
+    match parse_arrow_display(s) {
+        Some(dt) => sqe_trino_protocol::encode::arrow_to_declared_trino_type(&dt),
+        None => s.to_string(),
     }
-    if let Some(inner) = t.strip_prefix("Timestamp(") {
-        // A tz argument shows up as a second, comma-separated element.
-        return if inner.contains(',') {
-            "timestamp with time zone".to_string()
-        } else {
-            "timestamp".to_string()
-        };
-    }
-    if t.starts_with("Time32(") || t.starts_with("Time64(") {
-        return "time".to_string();
-    }
-    if t.starts_with("FixedSizeBinary") {
-        return "varbinary".to_string();
-    }
-    if t.starts_with("List") || t.starts_with("LargeList") || t.starts_with("FixedSizeList") {
-        return "array".to_string();
-    }
-    if is_variant_display(t) {
-        return "variant".to_string();
-    }
-    if t.starts_with("Struct") {
-        return "row".to_string();
-    }
-    if t.starts_with("Map") {
-        return "map".to_string();
-    }
-    let mapped = match t {
-        "Boolean" => "boolean",
-        "Int8" => "tinyint",
-        "Int16" => "smallint",
-        "Int32" => "integer",
-        "Int64" => "bigint",
-        "UInt8" => "smallint",
-        "UInt16" => "integer",
-        "UInt32" => "bigint",
-        "UInt64" => "decimal(20,0)",
-        "Float16" | "Float32" => "real",
-        "Float64" => "double",
-        "Utf8" | "LargeUtf8" | "Utf8View" => "varchar",
-        "Binary" | "LargeBinary" | "BinaryView" => "varbinary",
-        "Date32" | "Date64" => "date",
-        "Null" => "unknown",
-        // Unknown: pass through rather than mangle a type we don't recognize.
-        other => return other.to_string(),
-    };
-    mapped.to_string()
 }
 
-/// Render `Decimal128(10, 2)` / `Decimal256(p, s)` tails as `decimal(p,s)`.
-fn format_decimal(rest: &str) -> String {
-    let inner = rest.trim_end_matches(')');
-    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
-    if parts.len() == 2 {
-        format!("decimal({},{})", parts[0], parts[1])
-    } else {
-        "decimal".to_string()
+/// The column type `SHOW CREATE TABLE` writes for an Arrow type display
+/// string ([`sqe_trino_protocol::encode::arrow_to_ddl_trino_type`]), or the
+/// string unchanged when Arrow cannot parse it.
+pub fn arrow_display_to_ddl_type(s: &str) -> String {
+    match parse_arrow_display(s) {
+        Some(dt) => sqe_trino_protocol::encode::arrow_to_ddl_trino_type(&dt),
+        None => s.to_string(),
     }
+}
+
+/// The Arrow type behind a display string, as DataFusion's
+/// `information_schema` prints it.
+fn parse_arrow_display(s: &str) -> Option<arrow_schema::DataType> {
+    strip_field_metadata(s.trim()).parse().ok()
+}
+
+/// Drop the `, metadata: {..}` a nested field prints (Iceberg's
+/// `PARQUET:field_id` on every nested field), which Arrow's type parser
+/// does not read back. Quoted names and values are skipped whole, so a field
+/// named `metadata` or a value holding a brace is left alone.
+fn strip_field_metadata(s: &str) -> String {
+    const MARKER: &str = ", metadata: {";
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(c) = rest.chars().next() {
+        if c == '"' || c == '\'' {
+            let len = quoted_len(rest, c);
+            out.push_str(&rest[..len]);
+            rest = &rest[len..];
+        } else if rest.starts_with(MARKER) {
+            let mut body = &rest[MARKER.len()..];
+            while let Some(c) = body.chars().next() {
+                if c == '}' {
+                    body = &body[1..];
+                    break;
+                }
+                let len = if c == '"' || c == '\'' {
+                    quoted_len(body, c)
+                } else {
+                    c.len_utf8()
+                };
+                body = &body[len..];
+            }
+            rest = body;
+        } else {
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    out
+}
+
+/// Byte length of the quoted string `s` starts with, quotes included; a
+/// backslash escapes the next character. An unterminated quote runs to the end.
+fn quoted_len(s: &str, quote: char) -> usize {
+    let mut escaped = false;
+    for (i, c) in s.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == quote {
+            return i + c.len_utf8();
+        }
+    }
+    s.len()
 }
 
 /// Normalize an `information_schema` result for Trino clients: translate the
@@ -286,12 +271,67 @@ mod tests {
             ("LargeBinary", "varbinary"),
             ("Decimal128(10, 2)", "decimal(10,2)"),
             ("Time64(µs)", "time"),
-            ("Timestamp(µs)", "timestamp"),
-            ("Timestamp(µs, \"+00:00\")", "timestamp with time zone"),
+            ("Timestamp(µs)", "timestamp(6)"),
+            ("Timestamp(µs, \"+00:00\")", "timestamp(6) with time zone"),
         ];
         for (input, want) in cases {
             assert_eq!(arrow_display_to_trino_type(input), want, "input {input}");
         }
+    }
+
+    /// `information_schema` names every type as the wire columns do, read
+    /// from the Arrow type itself, except that a variant is `variant`.
+    #[test]
+    fn display_string_matches_the_wire_type_name() {
+        use arrow_schema::{Fields, TimeUnit};
+        use std::collections::HashMap;
+        let field_id = |f: Field, id: &str| {
+            f.with_metadata(HashMap::from([(
+                "PARQUET:field_id".to_string(),
+                id.to_string(),
+            )]))
+        };
+        let variant = DataType::Struct(Fields::from(vec![
+            Field::new("metadata", DataType::Binary, false),
+            Field::new("value", DataType::Binary, false),
+        ]));
+        let types = [
+            DataType::UInt8,
+            DataType::UInt64,
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Decimal128(38, 0),
+            DataType::List(Arc::new(field_id(
+                Field::new("element", DataType::Int64, false),
+                "3",
+            ))),
+            DataType::Struct(Fields::from(vec![
+                field_id(Field::new("a", DataType::Int32, true), "4"),
+                field_id(Field::new("Odd, name {", DataType::Utf8, true), "5"),
+            ])),
+            DataType::Map(
+                Arc::new(Field::new(
+                    "key_value",
+                    DataType::Struct(Fields::from(vec![
+                        field_id(Field::new("key", DataType::Utf8, false), "6"),
+                        field_id(Field::new("value", DataType::Float64, true), "7"),
+                    ])),
+                    false,
+                )),
+                false,
+            ),
+        ];
+        for dt in types {
+            assert_eq!(
+                arrow_display_to_trino_type(&dt.to_string()),
+                sqe_trino_protocol::encode::arrow_to_trino_type(&dt),
+                "display {dt}"
+            );
+        }
+        let nested = DataType::List(Arc::new(field_id(Field::new("v", variant, true), "8")));
+        assert_eq!(
+            arrow_display_to_trino_type(&nested.to_string()),
+            "array(variant)"
+        );
     }
 
     #[test]
@@ -304,7 +344,6 @@ mod tests {
 
     #[test]
     fn composite_types_map_to_trino_kinds() {
-        assert_eq!(arrow_display_to_trino_type("Struct([Field ...])"), "row");
         assert_eq!(
             arrow_display_to_trino_type(
                 r#"Struct("metadata": non-null Binary, "value": non-null Binary)"#
@@ -313,16 +352,34 @@ mod tests {
         );
         assert_eq!(
             arrow_display_to_trino_type(r#"Struct("metadata": Utf8, "value": Binary)"#),
-            "row"
+            "row(metadata varchar,value varbinary)"
         );
         assert_eq!(
             arrow_display_to_trino_type(
                 r#"Struct("metadata": Binary, "value": Binary, "x": Int32)"#
             ),
-            "row"
+            "row(metadata varbinary,value varbinary,x integer)"
         );
-        assert_eq!(arrow_display_to_trino_type("List(Field ...)"), "array");
-        assert_eq!(arrow_display_to_trino_type("Map(Field ...)"), "map");
+    }
+
+    /// SHOW CREATE TABLE keeps a timestamp's stored unit, so the table is
+    /// recreated as it was; the information_schema name stays the wire's.
+    #[test]
+    fn ddl_type_keeps_the_timestamp_unit() {
+        assert_eq!(arrow_display_to_ddl_type("Timestamp(ns)"), "timestamp(9)");
+        assert_eq!(
+            arrow_display_to_ddl_type("Timestamp(µs, \"UTC\")"),
+            "timestamp(6) with time zone"
+        );
+        assert_eq!(arrow_display_to_trino_type("Timestamp(ns)"), "timestamp(6)");
+        assert_eq!(
+            arrow_display_to_ddl_type(r#"Struct("metadata": Binary, "value": Binary)"#),
+            "variant"
+        );
+        assert_eq!(
+            arrow_display_to_ddl_type("SomeFutureType"),
+            "SomeFutureType"
+        );
     }
 
     // ── result normalization ───────────────────────────────────────────────

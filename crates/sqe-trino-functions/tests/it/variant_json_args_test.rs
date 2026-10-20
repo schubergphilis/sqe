@@ -102,14 +102,14 @@ async fn to_json_embeds_a_variant() {
     );
 }
 
-/// `typeof` names a variant `variant`, by its extension tag or, when an
-/// expression dropped the tag, by its storage shape (#849, #867).
+/// `typeof` names a variant `variant` at any depth, as DESCRIBE does, by its
+/// storage shape (#849, #867).
 #[tokio::test]
 async fn typeof_names_a_variant() {
     let ctx = session().await;
     assert_eq!(one(&ctx, "SELECT typeof(v) FROM t").await, "variant");
     assert_eq!(
         one(&ctx, "SELECT typeof(make_array(v)) FROM t").await,
-        "array(json)"
+        "array(variant)"
     );
 }

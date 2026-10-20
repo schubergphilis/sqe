@@ -513,6 +513,90 @@ async fn show_create_table_right_after_ctas_lists_columns_850() {
     }
 }
 
+/// `column|data_type` for every column of `table`, from DESCRIBE.
+async fn describe(
+    handler: &sqe_coordinator::QueryHandler,
+    session: &sqe_core::Session,
+    table: &str,
+) -> Vec<String> {
+    let batches = exec(handler, session, &format!("DESCRIBE {table}")).await;
+    let mut out = Vec::new();
+    for b in &batches {
+        let names = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name");
+        let types = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("type");
+        for i in 0..b.num_rows() {
+            out.push(format!("{}|{}", names.value(i), types.value(i)));
+        }
+    }
+    out
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SHOW CREATE TABLE writes Trino types that CREATE TABLE takes back. It
+// printed Arrow display strings (`Int32`, `Timestamp(ns)`), which no
+// CREATE TABLE parses, and an empty statement for a missing table.
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn show_create_table_round_trips_its_column_types() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let src = "default.show_create_types_src";
+    let copy = "default.show_create_types_copy";
+    for t in [src, copy] {
+        let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {t}")).await;
+    }
+    let ctas = format!(
+        "CREATE TABLE {src} AS SELECT CAST(1 AS INT) AS i, CAST(2 AS BIGINT) AS b, \
+         CAST(1.5 AS DECIMAL(10,2)) AS d, CAST(1 AS DOUBLE) AS f, true AS t, \
+         TIMESTAMP '2024-01-01 00:00:00' AS ts, 'x' AS s, DATE '2024-01-01' AS dt, \
+         named_struct('x', 1, 'y', 'a') AS r"
+    );
+    exec(&handler, &session, &ctas).await;
+
+    let ddl = show_create(&handler, &session, src).await;
+    for column in [
+        "   i integer",
+        "   b bigint",
+        "   d decimal(10,2)",
+        "   f double",
+        "   t boolean",
+        "   ts timestamp(9)",
+        "   s varchar",
+        "   dt date",
+        "   r row(x bigint,y varchar)",
+    ] {
+        assert!(ddl.contains(column), "missing `{column}` in: {ddl}");
+    }
+    let copy_ddl = ddl.replacen("show_create_types_src", "show_create_types_copy", 1);
+    exec(&handler, &session, &copy_ddl).await;
+    assert_eq!(
+        describe(&handler, &session, copy).await,
+        describe(&handler, &session, src).await
+    );
+
+    let missing_sql = "SHOW CREATE TABLE default.show_create_no_such";
+    let missing = handler
+        .execute(&session, missing_sql, None)
+        .await
+        .expect_err("SHOW CREATE TABLE of a missing table");
+    assert!(
+        missing.to_string().contains("table not found"),
+        "err: {missing}"
+    );
+
+    for t in [src, copy] {
+        let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {t}")).await;
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Round trip over the upstream #179 path: a CoW rewrite on a table that
 // already carries delete manifests (from a prior MoR DELETE) must fold

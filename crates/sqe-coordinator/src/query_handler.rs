@@ -5633,21 +5633,24 @@ impl QueryHandler {
                 }
                 first = false;
                 let col_name = names.value(i);
-                let col_type = types.value(i);
-                // Variant storage displays as a struct of two binaries;
-                // render the type the DDL takes back (#849).
-                let col_type = if sqe_trino_compat::info_schema_compat::is_variant_display(col_type)
-                {
-                    "VARIANT"
-                } else {
-                    col_type
-                };
+                // The Arrow display string, as the Trino type CREATE TABLE
+                // takes back: `integer`, `timestamp(9)`, `variant` (#849).
+                let col_type =
+                    sqe_trino_compat::info_schema_compat::arrow_display_to_ddl_type(types.value(i));
                 let nullable = nullables.value(i);
                 ddl.push_str(&format!("   {col_name} {col_type}"));
                 if nullable == "NO" {
                     ddl.push_str(" NOT NULL");
                 }
             }
+        }
+        // No columns: the table does not exist or is not visible. Say so,
+        // as the Hive path does, rather than print an empty CREATE TABLE.
+        if first {
+            return Err(SqeError::with_code(
+                SqeErrorCode::TableNotFound,
+                format!("table not found: {table_name}"),
+            ));
         }
         ddl.push_str("\n)");
 
