@@ -38,11 +38,10 @@
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    BinaryOperator, CastKind, DataType as SqlDataType, Expr, Function, FunctionArg,
+    AccessExpr, BinaryOperator, CastKind, DataType as SqlDataType, Expr, Function, FunctionArg,
     FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments, Ident,
-    LimitClause, ObjectName, OrderByKind, Query, Select, SelectItem,
-    SetExpr, Statement, TableFactor, TableFunctionArgs, Value, Visit, VisitMut, Visitor,
-    VisitorMut,
+    LimitClause, ObjectName, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, Subscript,
+    TableFactor, TableFunctionArgs, Value, Visit, VisitMut, Visitor, VisitorMut,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -233,7 +232,11 @@ pub fn apply_trino_compat(statements: &mut Vec<Statement>, source: &str) -> bool
             && w[1] == b'e'
             && (w[2].is_ascii_digit() || w[2] == b'+' || w[2] == b'-')
     });
+    // `].` / `).` -> rewrite_dot_after_subscript: `l[1].b` and `(s).a`,
+    // which DataFusion cannot plan.
+    let has_late_dot = lower.contains("].") || lower.contains(").");
     if !has_json_cast
+        && !has_late_dot
         && !has_exponent
         && !has_unicode_literal
         && !has_scalar_subquery
@@ -434,6 +437,9 @@ impl VisitorMut for TrinoCompatVisitor {
             self.rewrites += 1;
         }
         if rewrite_try_function(expr) {
+            self.rewrites += 1;
+        }
+        if rewrite_dot_after_subscript(expr) {
             self.rewrites += 1;
         }
         ControlFlow::Continue(())
@@ -1433,6 +1439,49 @@ fn rewrite_fetch_with_ties(query: &mut Query, quantity: Option<Expr>) -> bool {
     true
 }
 
+/// Rewrite a field access by dot that follows a subscript, `l[1].b`, to the
+/// subscript form `l[1]['b']`.
+///
+/// DataFusion folds the leading `a.b.c` run of a field-access chain into a
+/// compound identifier, but plans any later `.b` only when `b` is a string
+/// literal: `l[1].b` fails with "Dot access not supported for non-string
+/// expr". Trino and Spark accept it. A dot on a parenthesised root, `(s).a`,
+/// fails the same way. Every such `.b` becomes `['b']`, which DataFusion
+/// plans as the same named struct field access. An unquoted name is
+/// lowercased as DataFusion folds identifiers; a quoted one keeps its case.
+/// Returns true if the rewrite fired.
+fn rewrite_dot_after_subscript(expr: &mut Expr) -> bool {
+    let Expr::CompoundFieldAccess { root, access_chain } = expr else {
+        return false;
+    };
+    // The leading dots after an identifier root name a column (or a table
+    // and its column); DataFusion resolves those itself.
+    let skip = if matches!(**root, Expr::Identifier(_)) {
+        access_chain
+            .iter()
+            .position(|a| !matches!(a, AccessExpr::Dot(Expr::Identifier(_))))
+            .unwrap_or(access_chain.len())
+    } else {
+        0
+    };
+    let mut fired = false;
+    for access in access_chain.iter_mut().skip(skip) {
+        let AccessExpr::Dot(Expr::Identifier(ident)) = access else {
+            continue;
+        };
+        let name = if ident.quote_style.is_some() {
+            ident.value.clone()
+        } else {
+            ident.value.to_ascii_lowercase()
+        };
+        *access = AccessExpr::Subscript(Subscript::Index {
+            index: Expr::Value(Value::SingleQuotedString(name).into()),
+        });
+        fired = true;
+    }
+    fired
+}
+
 /// A bare unsigned integer literal expression.
 fn int_literal_expr(n: u64) -> Expr {
     Expr::Value(Value::Number(n.to_string(), false).into())
@@ -1990,6 +2039,37 @@ mod tests {
         let out = rewrite_trino_compat(&sql);
         // No panic/abort; the deep input is returned untouched.
         assert_eq!(out, sql);
+    }
+
+    #[test]
+    fn dot_after_a_subscript_becomes_a_named_subscript() {
+        for (sql, want) in [
+            ("SELECT l[1].b FROM t", "SELECT l[1]['b'] FROM t"),
+            ("SELECT l[1].b.c FROM t", "SELECT l[1]['b']['c'] FROM t"),
+            ("SELECT t.l[1].b FROM t", "SELECT t.l[1]['b'] FROM t"),
+            (r#"SELECT s.a[1]."B" FROM t"#, "SELECT s.a[1]['B'] FROM t"),
+            ("SELECT m['k'].B FROM t", "SELECT m['k']['b'] FROM t"),
+            ("SELECT (s).a FROM t", "SELECT (s)['a'] FROM t"),
+            (
+                "SELECT l[1].b[2].c FROM t",
+                "SELECT l[1]['b'][2]['c'] FROM t",
+            ),
+        ] {
+            assert_eq!(rewrite_trino_compat(sql), want, "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_leading_dot_run_is_left_to_the_planner() {
+        // Table and column qualifiers, and a struct field reached by plain
+        // dots, are a compound identifier DataFusion resolves itself.
+        for sql in [
+            "SELECT t.s.a FROM t",
+            "SELECT s.a FROM t",
+            "SELECT l[1] FROM t",
+        ] {
+            assert_eq!(rewrite_trino_compat(sql), sql);
+        }
     }
 
     #[test]
