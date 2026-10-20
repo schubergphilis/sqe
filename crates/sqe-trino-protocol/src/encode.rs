@@ -369,7 +369,37 @@ fn elements_to_json(elements: &dyn arrow_array::Array) -> serde_json::Value {
 /// The Trino type name of an Arrow type: the column type the server reports
 /// and what `typeof` returns. It lives here, next to the value encoding, so
 /// the function crate shares it without linking the server (#867).
+///
+/// A variant is `json` at any depth: clients have no variant type, and the
+/// value is sent as JSON text (#849).
 pub fn arrow_to_trino_type(dt: &DataType) -> String {
+    trino_type_name(dt, Spelling::Wire)
+}
+
+/// The Trino type name as declared: [`arrow_to_trino_type`], except that a
+/// variant is `variant`, at any depth. `typeof`, DESCRIBE and
+/// `information_schema.columns` report this one, so a VARIANT column reads
+/// back as declared while its values still travel as `json`.
+pub fn arrow_to_declared_trino_type(dt: &DataType) -> String {
+    trino_type_name(dt, Spelling::Declared)
+}
+
+/// The column type `SHOW CREATE TABLE` writes: [`arrow_to_declared_trino_type`]
+/// with a timestamp's precision taken from its unit, so a nanosecond column
+/// is recreated as `timestamp(9)`, not as the `timestamp(6)` its values are
+/// served at.
+pub fn arrow_to_ddl_trino_type(dt: &DataType) -> String {
+    trino_type_name(dt, Spelling::Ddl)
+}
+
+#[derive(Clone, Copy)]
+enum Spelling {
+    Wire,
+    Declared,
+    Ddl,
+}
+
+fn trino_type_name(dt: &DataType, spelling: Spelling) -> String {
     match dt {
         DataType::Null => "unknown".to_string(),
         DataType::Boolean => "boolean".to_string(),
@@ -393,9 +423,18 @@ pub fn arrow_to_trino_type(dt: &DataType) -> String {
         DataType::Time32(_) | DataType::Time64(_) => "time".to_string(),
         // Report an explicit precision. SQE timestamps are microsecond-backed
         // and rendered to 6 fractional digits, so timestamp(6) / timestamp(6)
-        // with time zone is the consistent, Trino-accurate type. (#5)
-        DataType::Timestamp(_, None) => "timestamp(6)".to_string(),
-        DataType::Timestamp(_, Some(_)) => "timestamp(6) with time zone".to_string(),
+        // with time zone is the consistent, Trino-accurate type. (#5) DDL
+        // keeps the stored unit, so the table is recreated as it was.
+        DataType::Timestamp(unit, tz) => {
+            let precision = match (spelling, unit) {
+                (Spelling::Ddl, arrow_schema::TimeUnit::Second) => 0,
+                (Spelling::Ddl, arrow_schema::TimeUnit::Millisecond) => 3,
+                (Spelling::Ddl, arrow_schema::TimeUnit::Nanosecond) => 9,
+                _ => 6,
+            };
+            let zone = if tz.is_some() { " with time zone" } else { "" };
+            format!("timestamp({precision}){zone}")
+        }
         DataType::Duration(_) => "interval day to second".to_string(),
         DataType::Interval(arrow_schema::IntervalUnit::YearMonth) => {
             "interval year to month".to_string()
@@ -403,21 +442,22 @@ pub fn arrow_to_trino_type(dt: &DataType) -> String {
         DataType::Interval(_) => "interval day to second".to_string(),
         DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => format!("decimal({p},{s})"),
         DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => {
-            format!("array({})", arrow_to_trino_type(f.data_type()))
+            format!("array({})", trino_type_name(f.data_type(), spelling))
         }
         DataType::Map(entries_field, _) => {
             if let DataType::Struct(fields) = entries_field.data_type() {
                 if fields.len() == 2 {
-                    let key_type = arrow_to_trino_type(fields[0].data_type());
-                    let val_type = arrow_to_trino_type(fields[1].data_type());
+                    let key_type = trino_type_name(fields[0].data_type(), spelling);
+                    let val_type = trino_type_name(fields[1].data_type(), spelling);
                     return format!("map({key_type},{val_type})");
                 }
             }
             "map(varchar,varchar)".to_string()
         }
-        // Iceberg V3 variant: clients have no variant type, and the value is
-        // sent as JSON text (#849).
-        DataType::Struct(_) if is_variant_storage(dt) => "json".to_string(),
+        DataType::Struct(_) if is_variant_storage(dt) => match spelling {
+            Spelling::Wire => "json".to_string(),
+            Spelling::Declared | Spelling::Ddl => "variant".to_string(),
+        },
         DataType::Struct(fields) => {
             let cols: Vec<String> = fields
                 .iter()
@@ -425,7 +465,7 @@ pub fn arrow_to_trino_type(dt: &DataType) -> String {
                     format!(
                         "{} {}",
                         row_field_name(f.name()),
-                        arrow_to_trino_type(f.data_type())
+                        trino_type_name(f.data_type(), spelling)
                     )
                 })
                 .collect();

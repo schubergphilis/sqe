@@ -103,7 +103,7 @@ async fn variant_column_stores_json_and_reads_it_back() {
         ]
     );
     let ddl = show_create(&handler, &session, fq).await;
-    assert!(ddl.contains("v VARIANT"), "SHOW CREATE TABLE {fq}: {ddl}");
+    assert!(ddl.contains("v variant"), "SHOW CREATE TABLE {fq}: {ddl}");
     // typeof names the variant, not its struct storage, and a column by its
     // Trino type name (#867).
     let typeof_sql = format!("SELECT typeof(v), typeof(id) FROM {fq} WHERE id = 1");
@@ -193,7 +193,7 @@ async fn variant_survives_ctas_and_insert_select() {
 
     let ddl = show_create(&handler, &session, dst).await;
     assert!(
-        ddl.contains("v VARIANT") && ddl.contains("w VARIANT"),
+        ddl.contains("v variant") && ddl.contains("w variant"),
         "SHOW CREATE TABLE {dst}: {ddl}"
     );
     assert_eq!(
@@ -298,7 +298,7 @@ async fn json_column_is_a_variant_on_a_v3_table() {
     );
     let ddl = show_create(&handler, &session, v3).await;
     assert!(
-        ddl.contains("j VARIANT") && ddl.contains("k VARIANT"),
+        ddl.contains("j variant") && ddl.contains("k variant"),
         "SHOW CREATE TABLE {v3}: {ddl}"
     );
     // A variant takes only JSON.
@@ -516,6 +516,6 @@ async fn rewrite_data_files_preserves_variant_values() {
     );
     assert_eq!(rows(&handler, &session, &select).await, before);
     let ddl = show_create(&handler, &session, fq).await;
-    assert!(ddl.contains("v VARIANT"), "still a variant column: {ddl}");
+    assert!(ddl.contains("v variant"), "still a variant column: {ddl}");
     drop(&handler, &session, fq).await;
 }

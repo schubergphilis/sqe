@@ -226,7 +226,15 @@ pub fn apply_trino_compat(statements: &mut Vec<Statement>, source: &str) -> bool
     // non-aggregated correlated scalar subquery, which DataFusion refuses at
     // plan time and Athena views use as a lookup in the select list.
     let has_scalar_subquery = lower.contains("(select");
+    // `1e0` -> rewrite_exponent_literal_to_double: a digit, `e`, then a digit
+    // or sign. An identifier such as `t1e2` only forces the walk.
+    let has_exponent = lower.as_bytes().windows(3).any(|w| {
+        (w[0].is_ascii_digit() || w[0] == b'.')
+            && w[1] == b'e'
+            && (w[2].is_ascii_digit() || w[2] == b'+' || w[2] == b'-')
+    });
     if !has_json_cast
+        && !has_exponent
         && !has_unicode_literal
         && !has_scalar_subquery
         && !has_dollar
@@ -402,6 +410,9 @@ impl VisitorMut for TrinoCompatVisitor {
             self.rewrites += 1;
         }
         if rewrite_utf8_typed_string(expr) {
+            self.rewrites += 1;
+        }
+        if rewrite_exponent_literal_to_double(expr) {
             self.rewrites += 1;
         }
         if rewrite_unicode_string_literal(expr) {
@@ -717,6 +728,34 @@ fn rewrite_listagg_within_group(expr: &mut Expr) -> bool {
 /// is the literal counterpart to `rewrite_cast_custom_to_varchar`, which
 /// already maps `CAST(.. AS UUID)` to VARCHAR. Returns true if the rewrite
 /// fired.
+/// Rewrite a numeric literal with an exponent (`1e0`, `2.5E-3`) to
+/// `CAST('<text>' AS DOUBLE)`.
+///
+/// Trino types such a literal as `double` and `1.5` as `decimal(2,1)`. SQE
+/// parses literals with `parse_float_as_decimal`, which gets `1.5` right but
+/// makes `1e0` a `decimal(1,0)`, and `1e300` fails as a decimal. Casting the
+/// text, not the number, parses it as a double directly. Returns true if the
+/// rewrite fired.
+fn rewrite_exponent_literal_to_double(expr: &mut Expr) -> bool {
+    let Expr::Value(value) = expr else {
+        return false;
+    };
+    let Value::Number(text, _) = &value.value else {
+        return false;
+    };
+    if !text.contains(['e', 'E']) {
+        return false;
+    }
+    *expr = Expr::Cast {
+        kind: sqlparser::ast::CastKind::Cast,
+        expr: Box::new(Expr::Value(Value::SingleQuotedString(text.clone()).into())),
+        data_type: SqlDataType::Double(sqlparser::ast::ExactNumberInfo::None),
+        array: false,
+        format: None,
+    };
+    true
+}
+
 fn rewrite_utf8_typed_string(expr: &mut Expr) -> bool {
     if let Expr::TypedString(ts) = expr {
         match ts.data_type {
@@ -2110,6 +2149,17 @@ mod tests {
         // A cast of the literal is then the identity.
         let out = rewrite_trino_compat(r#"SELECT CAST(JSON '[1]' AS JSON)"#);
         assert_eq!(out, "SELECT json_parse('[1]')");
+    }
+
+    #[test]
+    fn exponent_literal_is_a_double() {
+        // Trino types `1e0` as double; parse_float_as_decimal made it
+        // decimal(1,0). A plain decimal literal stays a decimal.
+        let out = rewrite_trino_compat("SELECT 1e0, -2.5E-3, 1.5, 42");
+        assert_eq!(
+            out,
+            "SELECT CAST('1e0' AS DOUBLE), -CAST('2.5E-3' AS DOUBLE), 1.5, 42"
+        );
     }
 
     #[test]
