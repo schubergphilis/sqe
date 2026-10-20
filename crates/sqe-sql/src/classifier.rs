@@ -11,6 +11,7 @@ use crate::attach::{
 };
 use crate::ddl::{try_parse_ref_ddl, RefDdl};
 use crate::grant_policy::{try_parse_grant_policy, GrantWithPolicy};
+use crate::identifier_fields::{try_parse_identifier_fields, IdentifierFieldsDdl};
 use crate::metadata::UpdateType;
 use crate::partition_evolution::{try_parse_partition_evolution, PartitionEvolution};
 use crate::policy_ddl::{try_parse_policy_ddl, PolicyDdlStatement};
@@ -179,6 +180,9 @@ pub enum StatementKind {
     /// variant carries the pre-parsed `PartitionEvolution` and routes through
     /// a dedicated coordinator handler.
     PartitionEvolution(Box<PartitionEvolution>),
+    /// `ALTER TABLE ... SET | DROP IDENTIFIER FIELDS <cols>` (Spark syntax).
+    /// sqlparser-rs has no AST for it.
+    IdentifierFields(Box<IdentifierFieldsDdl>),
     /// `ALTER TABLE ... SET TAGS / UNSET TAGS` and the Snowflake-compatible
     /// `MODIFY|ALTER COLUMN ... SET TAG / UNSET TAG` column-tag authoring DDL.
     SetTags(Box<SetTagsStatement>),
@@ -306,6 +310,7 @@ impl StatementKind {
             StatementKind::RefDdl(_) => "refddl",
             StatementKind::SetWriteBranch(_) => "setwritebranch",
             StatementKind::PartitionEvolution(_) => "partitionevolution",
+            StatementKind::IdentifierFields(_) => "identifierfields",
             StatementKind::SetTags(_) => "settags",
             StatementKind::SetMaskingPolicy(_) => "setmaskingpolicy",
             StatementKind::Attach(_) => "attach",
@@ -443,6 +448,7 @@ impl StatementKind {
             StatementKind::DropNestedColumn { .. }
             | StatementKind::RefDdl(_)
             | StatementKind::PartitionEvolution(_)
+            | StatementKind::IdentifierFields(_)
             | StatementKind::SetTags(_)
             | StatementKind::SetMaskingPolicy(_)
             | StatementKind::HivePartitionDdl(_) => U::AlterTable,
@@ -460,7 +466,7 @@ impl StatementKind {
     /// Borrow the underlying parsed `sqlparser::ast::Statement` when
     /// this kind wraps one. Returns `None` for variants that are
     /// pre-parsed into custom shapes (RefDdl, PartitionEvolution,
-    /// Procedure, ExplainFull, ShowSchemas, ShowTables, ShowStats,
+    /// IdentifierFields, Procedure, ExplainFull, ShowSchemas, ShowTables, ShowStats,
     /// ShowGrants, SetWriteBranch, Use, Truncate, Begin/Commit/Rollback).
     ///
     /// Used by the coordinator to walk the AST for cross-cutting
@@ -920,6 +926,9 @@ fn classify_alter_table_extension(body: &str) -> sqe_core::Result<Option<Stateme
     }
     if let Some(pe) = try_parse_partition_evolution(body)? {
         return Ok(Some(StatementKind::PartitionEvolution(Box::new(pe))));
+    }
+    if let Some(ddl) = try_parse_identifier_fields(body)? {
+        return Ok(Some(StatementKind::IdentifierFields(Box::new(ddl))));
     }
     // MODIFY|ALTER COLUMN ... SET|UNSET MASKING POLICY before the tag forms:
     // the tag parser returns Ok(None) for these (asserted by
@@ -1660,6 +1669,7 @@ mod tests {
             let _ = crate::ddl::try_parse_ref_ddl(sql);
             let _ = crate::tags::try_parse_set_tags(sql);
             let _ = crate::partition_evolution::try_parse_partition_evolution(sql);
+            let _ = crate::identifier_fields::try_parse_identifier_fields(sql);
             let _ = crate::hive_partitions::try_parse_hive_partition_ddl(sql);
         }
     }
@@ -3113,6 +3123,23 @@ mod tests {
             StatementKind::PartitionEvolution(b)
                 if matches!(*b, PartitionEvolution::ReplaceField { .. })
         ));
+    }
+
+    #[test]
+    fn classify_identifier_fields() {
+        let kind = parse_and_classify("ALTER TABLE ns.t SET IDENTIFIER FIELDS (id)").unwrap();
+        assert_eq!(kind.name(), "identifierfields");
+        assert!(!kind.allowed_in_transaction());
+        match kind {
+            StatementKind::IdentifierFields(ddl) => {
+                assert_eq!(ddl.table, "ns.t");
+                assert!(ddl.set);
+                assert_eq!(ddl.columns, vec!["id"]);
+            }
+            other => panic!("expected IdentifierFields, got {other:?}"),
+        }
+        let kind = parse_and_classify("ALTER TABLE ns.t DROP IDENTIFIER FIELDS id").unwrap();
+        assert!(matches!(kind, StatementKind::IdentifierFields(d) if !d.set));
     }
 
     #[test]

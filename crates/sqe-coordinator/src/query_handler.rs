@@ -1995,7 +1995,8 @@ impl QueryHandler {
                         // The only ALTER TABLE shape that reaches this
                         // catch-all: every other variant already has a
                         // dedicated StatementKind (AlterSchema, AlterTableProps,
-                        // SetTags, RefDdl, PartitionEvolution, DropNestedColumn,
+                        // SetTags, RefDdl, PartitionEvolution, IdentifierFields,
+                        // DropNestedColumn,
                         // and Rename above), so an AlterTable statement here is
                         // ADD PARTITION (or another op this release has no
                         // dedicated arm for). Only ADD PARTITION gets the
@@ -2213,6 +2214,13 @@ impl QueryHandler {
                 StatementKind::PartitionEvolution(evolution) => {
                     self.catalog_ops
                         .apply_partition_evolution(session, evolution)
+                        .await?;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
+                    Ok(vec![])
+                }
+                StatementKind::IdentifierFields(ddl) => {
+                    self.catalog_ops
+                        .apply_identifier_fields(session, ddl)
                         .await?;
                     crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
