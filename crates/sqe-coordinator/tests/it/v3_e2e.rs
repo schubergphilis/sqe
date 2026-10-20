@@ -92,7 +92,7 @@ async fn row_count(
 /// Helper: the current snapshot's summary as `table_snapshots` renders it
 /// (a JSON object). Picks the snapshot no other snapshot names as parent, so
 /// two commits in the same millisecond cannot tie.
-async fn latest_summary(
+pub(crate) async fn latest_summary(
     handler: &sqe_coordinator::QueryHandler,
     session: &sqe_core::Session,
     namespace: &str,
@@ -1296,7 +1296,7 @@ async fn statistics_on_v3_table() {
 // ─────────────────────────────────────────────────────────────────────────
 
 /// `id -> (_row_id, _last_updated_sequence_number)` for every live row.
-async fn lineage_by_id(
+pub(crate) async fn lineage_by_id(
     handler: &sqe_coordinator::QueryHandler,
     session: &sqe_core::Session,
     ns: &str,
