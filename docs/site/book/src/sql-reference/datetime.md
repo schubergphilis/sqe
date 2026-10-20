@@ -157,6 +157,16 @@ GROUP BY 1, 2, 3
 ORDER BY 1;
 ```
 
+## Session time zone
+
+Every SQE session runs in UTC. `SET TIME ZONE '<zone>'` succeeds, so client connection setup works, but it does not change the zone.
+
+- `CAST(x AS TIMESTAMP WITH TIME ZONE)` and `to_timestamp*` return zoned values (Arrow `Timestamp(*, "+00:00")`), the same type an Iceberg `timestamptz` column scans as.
+- An offset in the text is applied, and the value is stored in UTC: `CAST('2024-01-02 03:04:05+02:00' AS TIMESTAMP WITH TIME ZONE)` is `2024-01-02 01:04:05 UTC`. Trino keeps the `+02:00` offset; Arrow has one zone per column, so SQE does not.
+- `now()`, `current_timestamp` and `localtimestamp` return a timestamp without a zone, holding the query start time in UTC.
+- Trino clients receive zoned values as `2024-01-02 01:04:05.000000 UTC` (or `... +02:00` for a column stored with an offset zone), as Trino formats them.
+- Comparing a timestamp column with a zoned literal casts the literal, not the column, so the filter still prunes files.
+
 ## Iceberg V3 nanosecond timestamps
 
 `TIMESTAMP_NS` and `TIMESTAMP_NS WITH TIME ZONE` only exist in Iceberg format-version 3. New tables are V3 by default, and a CREATE TABLE with such a column is V3 even when the configured default is 2. All datetime functions operate on these the same way they operate on `TIMESTAMP(6)`; the underlying Arrow type is `Timestamp(Nanosecond, ...)` instead of `Timestamp(Microsecond, ...)`.
