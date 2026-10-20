@@ -104,6 +104,12 @@ async fn variant_column_stores_json_and_reads_it_back() {
     );
     let ddl = show_create(&handler, &session, fq).await;
     assert!(ddl.contains("v VARIANT"), "SHOW CREATE TABLE {fq}: {ddl}");
+    // typeof names the variant, not its struct storage.
+    let typeof_sql = format!("SELECT typeof(v), typeof(id) FROM {fq} WHERE id = 1");
+    assert_eq!(
+        rows(&handler, &session, &typeof_sql).await,
+        vec!["variant|Int32"]
+    );
 
     // Invalid JSON fails the write; it is never stored as NULL.
     let err = handler
