@@ -74,7 +74,7 @@ fn display(array: &dyn arrow_array::Array, row: usize) -> String {
 /// Numbers stay numbers (u64 included, Trino types them `bigint`), doubles
 /// follow Java's `Double.toString` notation switch, timestamps are
 /// `YYYY-MM-DD HH:MM:SS.ffffff` with a space separator and six fractional
-/// digits, binary is base64, intervals use Trino's `D HH:MM:SS.mmm` and `Y-M`
+/// digits (zoned ones add ` UTC` or ` +HH:MM`), binary is base64, intervals use Trino's `D HH:MM:SS.mmm` and `Y-M`
 /// literals. Arrays and rows are JSON arrays, maps JSON objects. Everything
 /// else falls back to Arrow's display string.
 pub fn arrow_value_to_json(array: &dyn arrow_array::Array, row: usize) -> serde_json::Value {
@@ -176,7 +176,20 @@ pub fn arrow_value_to_json(array: &dyn arrow_array::Array, row: usize) -> serde_
             // consistently regardless of the backing unit -- date_trunc emits 9
             // (nanosecond) while CAST emits 6, and the JDBC type is timestamp(6).
             // (#5)
-            serde_json::Value::String(normalize_timestamp_fraction(&s))
+            let s = normalize_timestamp_fraction(&s);
+            if tz.is_none() {
+                return serde_json::Value::String(s);
+            }
+            // Trino renders `timestamp with time zone` as `<local> <zone>`,
+            // space separated; the Python client splits on that space. Arrow
+            // writes the zone straight after the fraction (`Z`, `+02:00`).
+            let body_end = s.find('.').map_or(s.len(), |dot| dot + 7).min(s.len());
+            let (body, zone) = s.split_at(body_end);
+            let zone = match zone {
+                "" | "Z" | "+00:00" => "UTC",
+                z => z,
+            };
+            serde_json::Value::String(format!("{body} {zone}"))
         }
         DataType::Date32 | DataType::Date64 => serde_json::Value::String(display(array, row)),
         DataType::Utf8View => {
@@ -632,6 +645,28 @@ mod tests {
             arrow_value_to_json(&arr, 0),
             serde_json::Value::String("2024-03-20 08:00:00.500000".to_string())
         );
+    }
+
+    /// `timestamp with time zone` values are `<local> <zone>` like Trino's,
+    /// not Arrow's `...Z` / `...+02:00`: the Python client splits on the space.
+    #[test]
+    fn zoned_timestamp_renders_the_zone_after_a_space() {
+        use arrow_array::types::TimestampMicrosecondType;
+        let micros = 1_710_921_600_500_000i64;
+        let cases = [
+            ("+00:00", "2024-03-20 08:00:00.500000 UTC"),
+            ("UTC", "2024-03-20 08:00:00.500000 UTC"),
+            ("+02:00", "2024-03-20 10:00:00.500000 +02:00"),
+        ];
+        for (tz, expected) in cases {
+            let arr = arrow_array::PrimitiveArray::<TimestampMicrosecondType>::from(vec![micros])
+                .with_timezone(tz);
+            assert_eq!(
+                arrow_value_to_json(&arr, 0),
+                serde_json::json!(expected),
+                "{tz}"
+            );
+        }
     }
 
     #[test]

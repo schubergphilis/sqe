@@ -626,10 +626,16 @@ impl SqeSchemaProvider {
     ) -> DFResult<Option<Arc<dyn TableProvider>>> {
         let catalog_name = &self.warehouse;
 
+        // Same session zone as the query, or `now()` in a view body is naive
+        // while the same expression in the query is zoned.
         let mini_ctx = SessionContext::new_with_config(
             SessionConfig::new()
                 .with_information_schema(true)
-                .with_default_catalog_and_schema(catalog_name, VIEW_DEFAULT_SCHEMA),
+                .with_default_catalog_and_schema(catalog_name, VIEW_DEFAULT_SCHEMA)
+                .set_str(
+                    "datafusion.execution.time_zone",
+                    crate::session_tuning::ENGINE_TIME_ZONE,
+                ),
         );
 
         // The view's own namespace is always resolvable even when the

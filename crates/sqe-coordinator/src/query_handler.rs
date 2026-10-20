@@ -1946,7 +1946,8 @@ impl QueryHandler {
                         // connect (e.g. DBeaver, dbt). SQE has no per-session
                         // time-zone state, so the zone is accepted and recorded
                         // in the log but not applied: query timestamps are
-                        // evaluated in the engine default zone regardless. This
+                        // evaluated in UTC (`session_tuning::ENGINE_TIME_ZONE`)
+                        // regardless. This
                         // matches Trino's "statement succeeds" contract (it
                         // returns FINISHED with no rows) so the client's
                         // connection setup does not fail. Accepting only the
@@ -1960,7 +1961,7 @@ impl QueryHandler {
                             tracing::info!(
                                 requested_time_zone = %value,
                                 "SET TIME ZONE accepted as a no-op (SQE has no per-session zone; \
-                                 timestamps use the engine default zone)"
+                                 timestamps use UTC)"
                             );
                         }
                         Ok(Vec::new())

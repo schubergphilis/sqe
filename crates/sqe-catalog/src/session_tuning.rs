@@ -94,12 +94,22 @@ fn has_recursive_query(plan: &LogicalPlan) -> bool {
     found || walked.is_err()
 }
 
+/// The session zone of every SQE session. Without one DataFusion types
+/// `CAST(x AS TIMESTAMP WITH TIME ZONE)`, `now()` and `to_timestamp*` as naive
+/// timestamps, so the zone a Trino query asked for was dropped. `+00:00` is
+/// the zone iceberg-rust gives `timestamptz` columns, so these values compare
+/// and union with scanned columns without a cast. `SET TIME ZONE` does not
+/// change it (SQE has no per-session zone).
+pub const ENGINE_TIME_ZONE: &str = "+00:00";
+
 /// Engine-wide DataFusion session flags (decimal literals, DuckDB dialect,
-/// broadcast threshold, dynamic filter pushdown, Parquet predicate pushdown).
+/// session zone, broadcast threshold, dynamic filter pushdown, Parquet
+/// predicate pushdown).
 pub fn engine_session_config() -> SessionConfig {
     SessionConfig::new()
         // Parse numeric literals like 0.06 as DECIMAL instead of DOUBLE.
         .set_bool("datafusion.sql_parser.parse_float_as_decimal", true)
+        .set_str("datafusion.execution.time_zone", ENGINE_TIME_ZONE)
         // DuckDB dialect adds `x -> expr` lambda syntax without changing
         // identifier/quoting behaviour. See #354. The front door refuses text
         // this dialect tokenizes differently from the classifier (#683).

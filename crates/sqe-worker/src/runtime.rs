@@ -61,6 +61,10 @@ pub fn build_session_context_with_pool(
     let sort_spill_reservation = (memory_bytes / 4).max(1024 * 1024);
     let sort_in_place = (memory_bytes / 16).max(64 * 1024);
     let mut session_config = SessionConfig::new()
+        .set_str(
+            "datafusion.execution.time_zone",
+            sqe_catalog::session_tuning::ENGINE_TIME_ZONE,
+        )
         .set_bool("datafusion.execution.parquet.pushdown_filters", true)
         .set_bool("datafusion.execution.parquet.reorder_filters", true);
     {

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array,
-    StringArray, TimestampMicrosecondArray, UInt64Array,
+    StringArray, TimestampMicrosecondArray, TimestampNanosecondArray, UInt64Array,
 };
 use arrow::datatypes::{DataType, Schema, SchemaRef, TimeUnit};
 use datafusion::common::pruning::PruningStatistics;
@@ -61,25 +61,51 @@ impl<T: Borrow<DataFile>> IcebergManifestStatistics<T> {
     }
 }
 
+/// The bound as a scalar of the column's own type, or `None` when the two
+/// don't line up. A bound of another type (an Int64 min on a nanosecond
+/// timestamp column) fails the filter's interval analysis at planning.
+/// Files written before an `int -> long` or `float -> double` promotion
+/// carry the narrower bound, which is widened here.
 fn datum_to_scalar(datum: &Datum, data_type: &DataType) -> Option<ScalarValue> {
     match datum.literal() {
-        PrimitiveLiteral::Boolean(v) => Some(ScalarValue::Boolean(Some(*v))),
+        PrimitiveLiteral::Boolean(v) => match data_type {
+            DataType::Boolean => Some(ScalarValue::Boolean(Some(*v))),
+            _ => None,
+        },
         PrimitiveLiteral::Int(v) => match data_type {
             DataType::Date32 => Some(ScalarValue::Date32(Some(*v))),
-            _ => Some(ScalarValue::Int32(Some(*v))),
+            DataType::Int32 => Some(ScalarValue::Int32(Some(*v))),
+            DataType::Int64 => Some(ScalarValue::Int64(Some(i64::from(*v)))),
+            _ => None,
         },
         PrimitiveLiteral::Long(v) => match data_type {
-            DataType::Timestamp(TimeUnit::Microsecond, None) => {
-                Some(ScalarValue::TimestampMicrosecond(Some(*v), None))
+            DataType::Timestamp(TimeUnit::Microsecond, tz) => {
+                Some(ScalarValue::TimestampMicrosecond(Some(*v), tz.clone()))
             }
-            DataType::Timestamp(TimeUnit::Microsecond, Some(tz)) => Some(
-                ScalarValue::TimestampMicrosecond(Some(*v), Some(tz.clone())),
-            ),
-            _ => Some(ScalarValue::Int64(Some(*v))),
+            DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+                Some(ScalarValue::TimestampNanosecond(Some(*v), tz.clone()))
+            }
+            DataType::Time64(TimeUnit::Microsecond) => {
+                Some(ScalarValue::Time64Microsecond(Some(*v)))
+            }
+            DataType::Int64 => Some(ScalarValue::Int64(Some(*v))),
+            _ => None,
         },
-        PrimitiveLiteral::Float(v) => Some(ScalarValue::Float32(Some(v.0))),
-        PrimitiveLiteral::Double(v) => Some(ScalarValue::Float64(Some(v.0))),
-        PrimitiveLiteral::String(v) => Some(ScalarValue::Utf8(Some(v.clone()))),
+        PrimitiveLiteral::Float(v) => match data_type {
+            DataType::Float32 => Some(ScalarValue::Float32(Some(v.0))),
+            DataType::Float64 => Some(ScalarValue::Float64(Some(f64::from(v.0)))),
+            _ => None,
+        },
+        PrimitiveLiteral::Double(v) => match data_type {
+            DataType::Float64 => Some(ScalarValue::Float64(Some(v.0))),
+            _ => None,
+        },
+        PrimitiveLiteral::String(v) => match data_type {
+            DataType::Utf8 => Some(ScalarValue::Utf8(Some(v.clone()))),
+            DataType::LargeUtf8 => Some(ScalarValue::LargeUtf8(Some(v.clone()))),
+            DataType::Utf8View => Some(ScalarValue::Utf8View(Some(v.clone()))),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -183,6 +209,21 @@ fn build_bounds_array<T: Borrow<DataFile>>(
                 .iter()
                 .map(|s| match s {
                     Some(ScalarValue::TimestampMicrosecond(v, _)) => *v,
+                    _ => None,
+                })
+                .collect();
+            let a = if let Some(tz) = tz {
+                a.with_timezone(tz.clone())
+            } else {
+                a
+            };
+            Some(Arc::new(a) as ArrayRef)
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+            let a: TimestampNanosecondArray = scalars
+                .iter()
+                .map(|s| match s {
+                    Some(ScalarValue::TimestampNanosecond(v, _)) => *v,
                     _ => None,
                 })
                 .collect();
@@ -664,6 +705,42 @@ mod tests {
             sv,
             ScalarValue::TimestampMicrosecond(Some(1_700_000_000_000_000), None)
         );
+    }
+
+    #[test]
+    fn datum_to_scalar_keeps_the_column_type_for_nanos_and_time() {
+        let datum = Datum::long(1_704_157_445_000_000_000i64);
+        let ty = DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into()));
+        let sv = datum_to_scalar(&datum, &ty).unwrap();
+        assert_eq!(sv.data_type(), ty);
+        let ty = DataType::Time64(TimeUnit::Microsecond);
+        assert_eq!(datum_to_scalar(&datum, &ty).unwrap().data_type(), ty);
+        // A promoted column gets a widened bound; an unknown pairing none.
+        let sv = datum_to_scalar(&Datum::int(7), &DataType::Int64).unwrap();
+        assert_eq!(sv, ScalarValue::Int64(Some(7)));
+        assert!(datum_to_scalar(&datum, &DataType::Utf8).is_none());
+    }
+
+    #[test]
+    fn nanosecond_bounds_build_a_typed_statistics_array() {
+        use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+        use std::collections::HashMap;
+
+        let ty = DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into()));
+        let df = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_format(DataFileFormat::Parquet)
+            .file_path("f.parquet".into())
+            .file_size_in_bytes(1)
+            .record_count(1)
+            .partition_spec_id(0)
+            .partition(Struct::empty())
+            .lower_bounds(HashMap::from([(1, Datum::long(5))]))
+            .upper_bounds(HashMap::from([(1, Datum::long(9))]))
+            .build()
+            .unwrap();
+        let arr = build_bounds_array(&[df], 1, &ty, true).unwrap();
+        assert_eq!(arr.data_type(), &ty);
     }
 
     #[test]
