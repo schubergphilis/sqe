@@ -1167,7 +1167,14 @@ impl ScalarUDFImpl for TypeOf {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         use datafusion::common::ScalarValue;
 
+        // A variant is struct storage tagged on the field, not in the type
+        // (`sqe_core::variant::EXTENSION_NAME`; sqe-core is a dev-dependency).
+        let is_variant = args
+            .arg_fields
+            .first()
+            .is_some_and(|f| f.extension_type_name() == Some("arrow.parquet.variant"));
         let type_name = match &args.args[0] {
+            _ if is_variant => "variant".to_string(),
             ColumnarValue::Array(arr) => format!("{:?}", arr.data_type()),
             ColumnarValue::Scalar(sv) => format!("{:?}", sv.data_type()),
         };
