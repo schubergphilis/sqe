@@ -1168,21 +1168,14 @@ impl ScalarUDFImpl for TypeOf {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         use datafusion::common::ScalarValue;
 
-        // The Trino type name (#867). A variant is struct storage tagged on
-        // the field; most expressions drop the tag, so the shape counts too.
+        // The declared Trino type name, as DESCRIBE reports it (#867). A
+        // variant is struct storage tagged on the field; most expressions
+        // drop the tag, so the mapper goes by the shape.
         let data_type = match &args.args[0] {
             ColumnarValue::Array(arr) => arr.data_type().clone(),
             ColumnarValue::Scalar(sv) => sv.data_type(),
         };
-        let tagged = args
-            .arg_fields
-            .first()
-            .is_some_and(|f| f.extension_type_name() == Some("arrow.parquet.variant"));
-        let type_name = if tagged || encode::is_variant_storage(&data_type) {
-            "variant".to_string()
-        } else {
-            encode::arrow_to_trino_type(&data_type)
-        };
+        let type_name = encode::arrow_to_declared_trino_type(&data_type);
 
         // Return a scalar string — same value for every row.
         Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(type_name))))
