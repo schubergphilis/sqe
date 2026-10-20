@@ -23,7 +23,7 @@ DROP SCHEMA staging CASCADE;
 
 | Statement | Origin | Notes | Trino | Snowflake | Spark SQL | DuckDB |
 |---|---|---|---|---|---|---|
-| `CREATE TABLE t (col TYPE [DEFAULT expr], ...)` | `sqlparser-rs` + `sqe-sql` + `sqe-coordinator` | Iceberg V3 column defaults supported. | yes | yes | yes | yes |
+| `CREATE TABLE t (col TYPE [DEFAULT expr], ...)` | `sqlparser-rs` + `sqe-sql` + `sqe-coordinator` | Iceberg V3 column defaults supported. Nested types in the Trino form (`array(integer)`, `map(varchar, bigint)`, `row(x decimal(10,2), y varchar)`) and the Spark form (`ARRAY<INT>`, `MAP<VARCHAR, BIGINT>`, `STRUCT<x INT>`) both work, at any depth (`sqe-sql/ddl_types.rs`). | yes | yes | yes | yes |
 | `CREATE TABLE t (...) PARTITIONED BY (transform(col), ...)` | `sqe-sql/partition.rs` | Partition transforms: `bucket(N, col)`, `truncate(N, col)`, `year(col)`, `month(col)`, `day(col)`, `hour(col)`, identity (just `col`). | partial | - | yes | - |
 | `CREATE TABLE t AS SELECT ...` (CTAS) | `sqlparser-rs` + `sqe-coordinator` | Inferred schema; partitioning via `WITH (partitioning = ARRAY['day(ts)'])`. | yes | yes | yes | yes |
 | `CREATE OR REPLACE TABLE t AS SELECT ...` | `sqlparser-rs` + `sqe-coordinator` | Atomic replace. In-place snapshot replace when schema and partitioning match (table keeps UUID, grants, history; properties not re-applied). Staged table + swap otherwise. Self-referencing replace safe (reads old snapshot before swap). | yes | yes | partial | yes |
@@ -51,7 +51,7 @@ A column `DEFAULT` takes a literal and makes the table format-version 3. An `INS
 
 | Statement | Origin | Notes | Trino | Snowflake | Spark SQL | DuckDB |
 |---|---|---|---|---|---|---|
-| `ALTER TABLE t ADD COLUMN c TYPE [DEFAULT expr]` | `sqlparser-rs` + `sqe-coordinator` | New column. Rows written before the ALTER read the default, and a later INSERT or MERGE INSERT that omits the column writes it (V3). | yes | yes | yes | yes |
+| `ALTER TABLE t ADD COLUMN c TYPE [DEFAULT expr]` | `sqlparser-rs` + `sqe-coordinator` | New column, nested types included. Rows written before the ALTER read the default, and a later INSERT or MERGE INSERT that omits the column writes it (V3). | yes | yes | yes | yes |
 | `ALTER TABLE t DROP COLUMN [IF EXISTS] c` | `sqlparser-rs` + `sqe-coordinator` | Logical drop. Field id retained in old data files. | yes | yes | yes | yes |
 | `ALTER TABLE t RENAME COLUMN old TO new` | `sqlparser-rs` + `sqe-coordinator` | Iceberg field id stays the same; only the name changes. | yes | yes | yes | yes |
 | `ALTER TABLE t ALTER COLUMN c SET NOT NULL` | `sqlparser-rs` + `sqe-coordinator` | Tighten nullability. Fails if existing rows have NULL. | yes | yes | yes | yes |
@@ -191,7 +191,7 @@ INSERT INTO events VALUES (1, '{"user": "a", "tags": [1, 2]}'), (2, '"plain text
 ```
 
 - **Writes parse text as JSON.** A string written to a `VARIANT` column is parsed as a JSON document: `'{"a": 1}'` stores an object and `'42'` stores a number. To store a JSON string, quote it: `'"text"'`. Text that is not valid JSON fails the statement; it is never stored as NULL. Other column types (numbers, booleans, structs, lists) are stored as the variant of their value.
-- **Reads return JSON text.** Clients have no variant type. The Trino protocol reports the column as `json` and sends each value as JSON text; Flight SQL / ADBC / JDBC return it as a UTF-8 string. `DESCRIBE` and `information_schema.columns` report `variant`, and `SHOW CREATE TABLE` prints `VARIANT`.
+- **Reads return JSON text.** Clients have no variant type. The Trino protocol reports the column as `json` and sends each value as JSON text; Flight SQL / ADBC / JDBC return it as a UTF-8 string. `DESCRIBE`, `information_schema.columns`, `typeof` and `SHOW CREATE TABLE` report `variant`.
 - **The table becomes format-version 3.** `CREATE TABLE` and CTAS with a variant column create a V3 table. `ALTER TABLE ... ADD COLUMN c VARIANT` is refused on a V2 table. V3 tables can be read by Spark 4.0 with Iceberg 1.10 or later, and by Trino 481 or later; older readers cannot open them.
 - **`JSON` is a variant on a V3 table.** A `JSON` column, also inside a `STRUCT` or `ROW`, is stored as `VARIANT` when the table is format-version 3 and as a string otherwise. New tables are V3 by default (`catalog.default_table_format_version = 3`), so a plain `CREATE TABLE t (doc JSON)` stores a variant. A table is V2 when it asks for it with `WITH ('format-version' = '2')`, the Trino form `WITH (format_version = 2)` or `TBLPROPERTIES ('format-version' = '2')`, or when the configured default is 2; its `JSON` columns are strings, which readers without V3 support (Trino < 481, Spark < 4.0, Iceberg < 1.10) can open. `ALTER TABLE ... ADD COLUMN c JSON` adds a variant to a V3 table and a string to a V2 one. Asking for format-version 1 or 2 on a table with a V3-only column is an error.
 - **JSON functions read a variant.** `json_extract`, `json_extract_scalar`, the `json_get_*` functions and the other `json*` functions take a variant as its JSON text, so the same query works on a V2 `JSON` string and a V3 variant.

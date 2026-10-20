@@ -7895,14 +7895,58 @@ pub fn sql_type_to_arrow_for(
                 .collect::<sqe_core::Result<Vec<_>>>()?;
             Ok(DataType::Struct(arrow_fields.into()))
         }
-        // Trino's `ROW(a INT, b VARCHAR)` (#321). sqlparser does not parse this
-        // into `Struct`; it lands as a `Custom("ROW", [a, INT, b, VARCHAR])`
-        // type with a flattened name/type modifier list. Rebuild the equivalent
-        // `STRUCT<...>` text and reparse so field types go through sqlparser's
-        // grammar, then map via the Struct arm above. Parameterized field types
-        // (e.g. `decimal(10,2)`) do not survive sqlparser's modifier flattening
-        // -- the same limitation as the `CAST(.. AS ROW(..))` rewrite -- so a
-        // ROW field that needs parameters should use `STRUCT<...>` directly.
+        // ARRAY<T>; the front door spells Trino's `array(T)` this way. The
+        // element field is named as iceberg-rust names it.
+        SqlType::Array(elem) => {
+            use sqlparser::ast::ArrayElemTypeDef as Elem;
+            let inner = match elem {
+                Elem::AngleBracket(t) | Elem::Parenthesis(t) | Elem::SquareBracket(t, _) => t,
+                Elem::None => {
+                    return Err(SqeError::NotImplemented(
+                        "ARRAY needs an element type, e.g. ARRAY(INTEGER)".to_string(),
+                    ))
+                }
+            };
+            Ok(DataType::List(std::sync::Arc::new(
+                arrow_schema::Field::new(
+                    iceberg::spec::LIST_FIELD_NAME,
+                    sql_type_to_arrow_for(inner, json_as_variant)?,
+                    true,
+                ),
+            )))
+        }
+        // MAP(K, V); the front door spells Trino's `map<K, V>` this way.
+        // Entries are `key_value { key non-null, value }`, as iceberg-rust
+        // reads a map back.
+        SqlType::Map(key, value) => {
+            let entries = arrow_schema::Field::new(
+                iceberg::arrow::DEFAULT_MAP_FIELD_NAME,
+                DataType::Struct(
+                    vec![
+                        arrow_schema::Field::new(
+                            iceberg::spec::MAP_KEY_FIELD_NAME,
+                            sql_type_to_arrow_for(key, json_as_variant)?,
+                            false,
+                        ),
+                        arrow_schema::Field::new(
+                            iceberg::spec::MAP_VALUE_FIELD_NAME,
+                            sql_type_to_arrow_for(value, json_as_variant)?,
+                            true,
+                        ),
+                    ]
+                    .into(),
+                ),
+                false,
+            );
+            Ok(DataType::Map(std::sync::Arc::new(entries), false))
+        }
+        // Trino's `ROW(a INT, b VARCHAR)` (#321) when it reaches here as a
+        // `Custom("ROW", [a, INT, b, VARCHAR])` type with a flattened
+        // name/type modifier list. Rebuild the equivalent `STRUCT<...>` text
+        // and reparse, then map via the Struct arm above. The front door
+        // already rewrites ROW column types to `STRUCT<...>`
+        // (`sqe_sql::rewrite_trino_ddl_types`), parameterized fields included;
+        // this arm covers callers that parse the SQL themselves.
         SqlType::Custom(name, modifiers)
             if name.0.len() == 1
                 && name.0[0]
@@ -8152,6 +8196,44 @@ fn arrow_schema_to_iceberg(arrow_schema: &ArrowSchema) -> sqe_core::Result<Icebe
             format!("Failed to build Iceberg schema: {e}"),
         )
     })
+}
+
+/// The Iceberg type of a column added to a table whose highest field id is
+/// `last_id`, and the new highest id. A nested type (struct, list, map)
+/// needs a fresh id for every nested field, which
+/// `iceberg::arrow::arrow_type_to_type` cannot assign: it reads them from
+/// `PARQUET:field_id` metadata a DDL type does not carry.
+pub fn arrow_column_to_iceberg_type(
+    field: &arrow_schema::Field,
+    last_id: i32,
+) -> sqe_core::Result<(iceberg::spec::Type, i32)> {
+    let schema = arrow_schema_to_iceberg(&ArrowSchema::new(vec![field.clone()]))?;
+    let ty = shift_field_ids(&schema.as_struct().fields()[0].field_type, last_id);
+    Ok((ty, last_id + schema.highest_field_id()))
+}
+
+/// `ty` with every nested field id raised by `by`.
+fn shift_field_ids(ty: &iceberg::spec::Type, by: i32) -> iceberg::spec::Type {
+    use iceberg::spec::{ListType, MapType, NestedField, StructType, Type};
+    let shift = |f: &NestedField| {
+        let mut f = f.clone();
+        f.id += by;
+        f.field_type = Box::new(shift_field_ids(&f.field_type, by));
+        std::sync::Arc::new(f)
+    };
+    match ty {
+        Type::Struct(s) => Type::Struct(StructType::new(
+            s.fields().iter().map(|f| shift(f)).collect(),
+        )),
+        Type::List(l) => Type::List(ListType {
+            element_field: shift(&l.element_field),
+        }),
+        Type::Map(m) => Type::Map(MapType {
+            key_field: shift(&m.key_field),
+            value_field: shift(&m.value_field),
+        }),
+        other => other.clone(),
+    }
 }
 
 /// `arrow_schema` with every variant-shaped field tagged as a variant, so
@@ -9713,6 +9795,72 @@ mod tests {
             "nested struct field not mapped: {:?}",
             fields[0].data_type()
         );
+    }
+
+    #[test]
+    fn test_sql_type_to_arrow_array_and_map() {
+        let list_of = |dt: DataType| {
+            DataType::List(std::sync::Arc::new(arrow_schema::Field::new(
+                "element", dt, true,
+            )))
+        };
+        for decl in ["ARRAY<INT>", "INT[]"] {
+            assert_eq!(
+                sql_type_to_arrow(&col_sql_type(decl)).unwrap(),
+                list_of(DataType::Int32),
+                "{decl}"
+            );
+        }
+        let dt = sql_type_to_arrow(&col_sql_type("MAP(VARCHAR, ARRAY<BIGINT>)")).unwrap();
+        let DataType::Map(entries, false) = &dt else {
+            panic!("expected Map, got {dt:?}");
+        };
+        assert_eq!(entries.name(), "key_value");
+        assert!(!entries.is_nullable());
+        let DataType::Struct(kv) = entries.data_type() else {
+            panic!("map entries not a struct: {dt:?}");
+        };
+        assert_eq!(kv[0].name(), "key");
+        assert_eq!(kv[0].data_type(), &DataType::Utf8);
+        assert!(!kv[0].is_nullable());
+        assert_eq!(
+            (kv[1].name().as_str(), kv[1].data_type()),
+            ("value", &list_of(DataType::Int64))
+        );
+        // A JSON element of a v3 table is a variant, as in a struct field.
+        assert_eq!(
+            sql_type_to_arrow_for(&col_sql_type("ARRAY<JSON>"), true).unwrap(),
+            list_of(sqe_core::variant::storage_type())
+        );
+    }
+
+    #[test]
+    fn test_arrow_schema_to_iceberg_assigns_nested_list_and_map_field_ids() {
+        let arrow = arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new(
+                "a",
+                sql_type_to_arrow(&col_sql_type("ARRAY<STRUCT<x INT>>")).unwrap(),
+                true,
+            ),
+            arrow_schema::Field::new(
+                "m",
+                sql_type_to_arrow(&col_sql_type("MAP(VARCHAR, BIGINT)")).unwrap(),
+                true,
+            ),
+        ]);
+        let schema = arrow_schema_to_iceberg(&arrow).unwrap();
+        let ids: Vec<i32> = (1..=6)
+            .filter(|id| schema.field_by_id(*id).is_some())
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6], "{schema:?}");
+
+        // ALTER TABLE ADD COLUMN: a nested column numbers its fields after
+        // the table's highest id.
+        let (ty, last) = arrow_column_to_iceberg_type(arrow.field(1), 10).unwrap();
+        let iceberg::spec::Type::Map(m) = ty else {
+            panic!("expected a map: {ty:?}");
+        };
+        assert_eq!((m.key_field.id, m.value_field.id, last), (12, 13, 13));
     }
 
     #[test]

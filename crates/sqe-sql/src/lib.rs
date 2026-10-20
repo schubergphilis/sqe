@@ -5,6 +5,7 @@ pub mod catalog_qualifiers;
 pub mod classifier;
 pub mod ctas_compat;
 pub mod ddl;
+pub mod ddl_types;
 pub mod front_door;
 pub mod grant_policy;
 pub mod hive_ddl;
@@ -18,6 +19,7 @@ pub mod partition_evolution;
 pub mod pipeline_types;
 pub mod policy_ddl;
 pub mod procedures;
+pub mod quote;
 pub mod tags;
 pub mod time_travel;
 mod token_scan;
@@ -42,6 +44,7 @@ pub use classifier::{
 };
 pub use ctas_compat::rewrite_ctas_compat;
 pub use ddl::{try_parse_ref_ddl, BranchRetention, RefDdl};
+pub use ddl_types::rewrite_trino_ddl_types;
 pub use front_door::{
     classify_normalized, NormalizedSql, SqlFrontDoor, WireDialect, EXECUTION_DIALECT,
 };
@@ -56,6 +59,7 @@ pub use partition::{is_create_external_table, normalize_partitioned_by};
 pub use partition_evolution::{try_parse_partition_evolution, PartitionEvolution};
 pub use pipeline_types::{pre_parse_pipeline, ClassifiableSql, UserSql};
 pub use procedures::{try_parse_call, NamespaceRef, ProcedureCall, ReprojectScope, TableRef};
+pub use quote::{quote_ident_if_needed, quote_qualified_if_needed};
 pub use time_travel::{
     extract_incremental_spec, extract_time_travel_spec, IncrementalSpec, TimeTravelSpec, VersionRef,
 };

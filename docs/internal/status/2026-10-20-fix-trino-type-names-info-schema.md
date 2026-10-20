@@ -17,18 +17,23 @@ Decided, not changed:
 
 Known limit: the Arrow parser keeps `\"` escapes in a struct field name, so a field name containing a double quote does not round-trip through the display string and falls through unchanged.
 
-Gate:
-- `make test-integration FILTER=show_create` -> 2 passed (`show_create_table_round_trips_its_column_types`, `show_create_table_right_after_ctas_lists_columns_850`)
-- `make test-integration FILTER=variant_e2e` -> 9 passed, 0 failed
-- Unit: sqe-trino-protocol, sqe-trino-compat, sqe-trino-functions, sqe-sql lib all pass.
+Second commit (review findings, fixed here):
 
-The round-trip test (`show_create_table_round_trips_its_column_types`) covers scalar and row columns. Arrays and maps are left out: CREATE TABLE refuses `ARRAY(..)`, `ARRAY<..>` and `MAP(..)`, and ROW with parameterized field types (`sql_type_to_arrow_for` in `sqe-write/src/write_handler.rs` only handles STRUCT/ROW).
+- CREATE TABLE / ALTER TABLE ADD COLUMN take nested types. `sqe-sql/src/ddl_types.rs` rewrites Trino column types in the column list (`array(T)` -> `ARRAY<T>`, `map(K,V)` -> `MAP(K, V)`, `row(f T)` -> `STRUCT<f T>`, recursively) before parsing; it runs on parse failure and on a parsed CREATE/ALTER (a flattened `row(t timestamp with time zone)` parses but loses the field types). `sql_type_to_arrow_for` maps `Array` and `Map`. ADD COLUMN assigns nested field ids from `max_field_id` (`arrow_column_to_iceberg_type`).
+- SHOW CREATE TABLE quotes names that need it (`sqe-sql/src/quote.rs`: reserved words, uppercase, anything not `[a-z_][a-z0-9_]*`), resolves the table for TBLPROPERTIES through `resolve_table_ident` instead of splitting on `.`, and escapes quotes in property values.
+- DESCRIBE / SHOW COLUMNS on the coordinator return Trino names (Iceberg: `with_column_comments`; Hive: `describe_columns`). The Trino front end maps again; the mapping is idempotent (unit test `trino_type_mapping_is_idempotent`). The Trino reshape carries the comment column (was always "").
+- Hive SHOW CREATE TABLE backtick-quotes names, renders column comments, and the table comment as TBLPROPERTIES `comment` (sqlparser has no COMMENT clause on CREATE EXTERNAL TABLE; the Hive metastore stores it as that parameter). `try_extract_hive_table` lifts `comment` back into the spec. Round trip pinned by the embedded test `show_create_table_renders_athena_compatible_ddl`.
 
-Findings (confirmed on the stack, not fixed here):
-- CREATE TABLE lacks ARRAY/MAP and parameterized ROW field types: next branch.
-- `CAST(TIMESTAMP '..' AS TIMESTAMP WITH TIME ZONE)` yields `Timestamp(ns)` without a zone.
-- Integer arithmetic wraps silently on overflow.
-- DESCRIBE on the coordinator/Flight path still returns Arrow names.
-- SHOW CREATE TABLE does not quote column names (pre-existing).
+Deliberate: Flight SQL `information_schema.columns` keeps Arrow display names (DataFusion built-in): the Arrow schema is the Flight type system and dbt-sqe's `SQEColumn` reads those names.
 
-**NEXT:** CREATE TABLE support for ARRAY/MAP/parameterized ROW, then extend the round-trip test to arrays and maps; file the tz-cast and overflow issues on OK.
+Gate (after the last edit):
+- `make test-integration FILTER=nested_type_ddl` -> 1 passed (`nested_type_ddl_round_trips_through_show_create`: Trino and Spark nested types, INSERT + read, SHOW CREATE -> CREATE copy -> same DESCRIBE, ADD COLUMN array/row then INSERT + read, quoted `"select"` / `"My Col"`)
+- `FILTER=show_create` 3 passed, `FILTER=describe` 4 passed, `FILTER=variant_e2e` 9 passed, `FILTER=trino_metadata` 3 passed, `FILTER=ctas_write_modes` 10 passed
+- Hive: `cargo test -p sqe-coordinator --test it -- hive_`, `cargo test -p sqe-catalog --test it -- hive_`, `cargo test -p sqe-cli --bin sqe-cli -- show_create_table_renders_athena`
+- Unit: sqe-sql, sqe-trino-compat, sqe-write (`test_sql_type_to_arrow_array_and_map`, `test_arrow_schema_to_iceberg_assigns_nested_list_and_map_field_ids`)
+
+Next branches of this batch (different concern, worked right after this MR):
+- `fix/timestamptz-cast-zone`: `CAST(.. AS TIMESTAMP WITH TIME ZONE)` yields a zone-less timestamp because `datafusion.execution.time_zone` is unset.
+- `fix/integer-overflow-checked`: integer `+ - *` wraps silently; Trino fails. Once checked, revisit the bigint-literal rationale above.
+
+**NEXT:** the two branches above.

@@ -5573,10 +5573,11 @@ impl QueryHandler {
         use arrow_array::StringArray as ArrowStringArray;
 
         // Extract object name from the ShowCreate statement
-        let table_name = match stmt {
-            Statement::ShowCreate { obj_name, .. } => obj_name.to_string(),
-            _ => return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, "Expected ShowCreate statement".to_string())),
+        let Statement::ShowCreate { obj_name, .. } = stmt else {
+            let msg = "Expected ShowCreate statement".to_string();
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, msg));
         };
+        let table_name = obj_name.to_string();
 
         // Query information_schema.columns for the table's column definitions,
         // qualified by the table's catalog and schema so the lookup hits the
@@ -5608,7 +5609,12 @@ impl QueryHandler {
         })?;
 
         // Reconstruct CREATE TABLE DDL
-        let mut ddl = format!("CREATE TABLE {table_name} (\n");
+        // Names are quoted where an unquoted one would not come back the
+        // same: a reserved word, an uppercase letter, a space.
+        let mut ddl = format!(
+            "CREATE TABLE {} (\n",
+            sqe_sql::quote_qualified_if_needed(&split_qualified_identifier(&table_name), '"')
+        );
         let mut first = true;
         for batch in &batches {
             let names = batch
@@ -5632,7 +5638,7 @@ impl QueryHandler {
                     ddl.push_str(",\n");
                 }
                 first = false;
-                let col_name = names.value(i);
+                let col_name = sqe_sql::quote_ident_if_needed(names.value(i), '"');
                 // The Arrow display string, as the Trino type CREATE TABLE
                 // takes back: `integer`, `timestamp(9)`, `variant` (#849).
                 let col_type =
@@ -5658,15 +5664,9 @@ impl QueryHandler {
         // The Iceberg metadata exposes the property map; we filter out the
         // reserved keys that Iceberg manages internally so the round-trip
         // matches what the user actually set in CREATE TABLE.
-        let parts: Vec<&str> = table_name.split('.').collect();
-        let (ns, bare) = match parts.len() {
-            1 => ("default", parts[0]),
-            2 => (parts[0], parts[1]),
-            3 => (parts[1], parts[2]),
-            _ => ("default", parts[parts.len() - 1]),
-        };
-        let ns_ident = iceberg::NamespaceIdent::new(ns.to_string());
-        let table_ident = iceberg::TableIdent::new(ns_ident, bare.to_string());
+        // Resolved as every other statement resolves a name: quotes stripped,
+        // a bare name in the session schema.
+        let table_ident = crate::ident::resolve_table_ident(obj_name, session)?;
         if let Ok(table) = session_catalog.load_table(&table_ident).await {
             let props = table.metadata().properties();
             // Iceberg-internal property keys we never want to surface.
@@ -5688,7 +5688,11 @@ impl QueryHandler {
                 ddl.push_str("\nTBLPROPERTIES (\n");
                 let last = user_props.len() - 1;
                 for (i, (k, v)) in user_props.iter().enumerate() {
-                    ddl.push_str(&format!("   '{k}' = '{v}'"));
+                    ddl.push_str(&format!(
+                        "   '{}' = '{}'",
+                        k.replace('\'', "''"),
+                        v.replace('\'', "''")
+                    ));
                     if i != last {
                         ddl.push(',');
                     }
@@ -9477,7 +9481,11 @@ fn with_column_comments(
             let name = text(0, row);
             comment_b.append_option(comments.get(&name).map(String::as_str));
             name_b.append_value(name);
-            type_b.append_value(text(1, row));
+            // Trino names, as `information_schema.columns` reports them on
+            // the Trino wire; the mapping is idempotent.
+            type_b.append_value(
+                sqe_trino_compat::info_schema_compat::arrow_display_to_trino_type(&text(1, row)),
+            );
             nullable_b.append_value(text(2, row));
         }
     }

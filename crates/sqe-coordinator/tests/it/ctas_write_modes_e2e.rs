@@ -598,6 +598,89 @@ async fn show_create_table_round_trips_its_column_types() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// CREATE TABLE and ALTER TABLE ADD COLUMN take Trino's nested types
+// (`array(T)`, `map(K, V)`, `row(f T)` with parameterized fields), and
+// SHOW CREATE TABLE quotes the column names that need it, so the DDL it
+// prints creates the same table again.
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn nested_type_ddl_round_trips_through_show_create() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let src = "default.nested_type_ddl_src";
+    let copy = "default.nested_type_ddl_copy";
+    for t in [src, copy] {
+        let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {t}")).await;
+    }
+    let create = format!(
+        "CREATE TABLE {src} (id integer, a array(integer), b ARRAY(INT), \
+         m map(varchar, bigint), m2 MAP<VARCHAR, BIGINT>, \
+         r row(x decimal(10,2), y varchar), \"select\" varchar, \"My Col\" bigint)"
+    );
+    exec(&handler, &session, &create).await;
+    let expected = [
+        "id|integer",
+        "a|array(integer)",
+        "b|array(integer)",
+        "m|map(varchar,bigint)",
+        "m2|map(varchar,bigint)",
+        "r|row(x decimal(10,2),y varchar)",
+        "select|varchar",
+        "My Col|bigint",
+    ];
+    assert_eq!(describe(&handler, &session, src).await, expected);
+
+    let insert = format!(
+        "INSERT INTO {src} SELECT 1, make_array(1, 2), make_array(3), map(['k'], [7]), \
+         map(['j'], [8]), named_struct('x', CAST(1.5 AS DECIMAL(10,2)), 'y', 'v'), 's', 9"
+    );
+    exec(&handler, &session, &insert).await;
+    let sum = format!(
+        "SELECT CAST(cardinality(a) + a[2] + m['k'] + m2['j'] + \"My Col\" AS BIGINT) FROM {src}"
+    );
+    assert_eq!(
+        scalar_i64(&handler, &session, &sum).await,
+        2 + 2 + 7 + 8 + 9
+    );
+
+    let ddl = show_create(&handler, &session, src).await;
+    for column in [
+        "   a array(integer)",
+        "   m map(varchar,bigint)",
+        "   r row(x decimal(10,2),y varchar)",
+        "   \"select\" varchar",
+        "   \"My Col\" bigint",
+    ] {
+        assert!(ddl.contains(column), "missing `{column}` in: {ddl}");
+    }
+    let copy_ddl = ddl.replacen("nested_type_ddl_src", "nested_type_ddl_copy", 1);
+    exec(&handler, &session, &copy_ddl).await;
+    assert_eq!(describe(&handler, &session, copy).await, expected);
+
+    // ADD COLUMN with a nested type assigns fresh ids to the nested fields.
+    for add in ["l array(bigint)", "p row(q integer, t timestamp(6))"] {
+        let alter = format!("ALTER TABLE {src} ADD COLUMN {add}");
+        exec(&handler, &session, &alter).await;
+    }
+    let described = describe(&handler, &session, src).await;
+    assert_eq!(
+        described[expected.len()..],
+        ["l|array(bigint)", "p|row(q integer,t timestamp(6))"]
+    );
+    let insert = format!(
+        "INSERT INTO {src} (id, l, p) SELECT 2, make_array(40, 2), \
+         named_struct('q', 5, 't', TIMESTAMP '2024-01-01 00:00:00')"
+    );
+    exec(&handler, &session, &insert).await;
+    let sum = format!("SELECT CAST(l[1] + l[2] + p['q'] AS BIGINT) FROM {src} WHERE id = 2");
+    assert_eq!(scalar_i64(&handler, &session, &sum).await, 47);
+
+    for t in [src, copy] {
+        let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {t}")).await;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Round trip over the upstream #179 path: a CoW rewrite on a table that
 // already carries delete manifests (from a prior MoR DELETE) must fold
 // the deletes into the rewrite instead of resurrecting or dropping rows.
