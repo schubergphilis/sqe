@@ -122,7 +122,8 @@ SELECT try(CAST(payload AS BIGINT)) FROM events;
 
 | Operator | Notes |
 |---|---|
-| `expr.field` | Struct field access. |
+| `expr.field` | Struct field access, also after a subscript (`items[1].sku`). An unquoted name folds to lowercase; quote a mixed-case one (`items[1]."SKU"`). |
+| `expr['field']` | Struct field access by its exact name. |
 | `expr['key']` | Map subscript. |
 | `expr[index]` | Array subscript. 1-based, NULL on out-of-bounds. |
 
@@ -130,7 +131,8 @@ SELECT try(CAST(payload AS BIGINT)) FROM events;
 SELECT
     address.city,                          -- struct field
     settings['theme'],                     -- map lookup
-    tags[1]                                -- first array element
+    tags[1],                               -- first array element
+    items[1].sku                           -- field of the first struct element
 FROM users;
 ```
 
