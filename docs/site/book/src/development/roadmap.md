@@ -277,7 +277,7 @@ Iceberg V3 table format support landed end-to-end. V3 is the default format-vers
 | Feature | Status |
 |---|---|
 | Pruning and typed access on shredded variant fields | Shredded fields are unshredded on read |
-| Unknown list elements and map keys/values | Refused on write; unknown struct members work (#859) |
+| `ALTER COLUMN` on a nested field | `SET DATA TYPE` takes top-level columns only, so a nested unknown member cannot be promoted yet |
 | Geometry / geography type | DataFusion UDT [#12644](https://github.com/apache/datafusion/issues/12644) |
 | Multi-arg partition transforms | Not started |
 
