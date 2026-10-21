@@ -10,12 +10,12 @@
     "group": "3rd Party",
     "docUrl": "https://docs.getsqe.com"
   },
-  "generatedAt": "2026-10-20T00:00:00Z",
-  "generatedBy": "Rescore against the pinned upstream rubric; evidence paths repaired after the crate and test moves. 2026-10-18: unknown-type and shredded-variant measured against Spark 4.1 + Iceberg 1.12. 2026-10-20: merge-on-read deletes, deletion vectors and row lineage read back by Spark 4.1 + Iceberg 1.12 (mor_spark_interop); stub evidence removed.",
+  "generatedAt": "2026-10-21T00:00:00Z",
+  "generatedBy": "Rescore against the pinned upstream rubric; evidence paths repaired after the crate and test moves. 2026-10-18: unknown-type and shredded-variant measured against Spark 4.1 + Iceberg 1.12. 2026-10-20: merge-on-read deletes, deletion vectors and row lineage read back by Spark 4.1 + Iceberg 1.12 (mor_spark_interop); stub evidence removed. 2026-10-21: SQE writes shredded variants (write.parquet.shred-variants), read back by Spark 4.1 + Iceberg 1.12; shredded-variant:v3 to full.",
   "score": {
-    "raw": 148,
+    "raw": 149,
     "max": 162,
-    "percent": 91.4
+    "percent": 92.0
   },
   "note": "Rescored on 2026-10-17 against upstream features.json (32 features). Only cells that apply to a version are scored, as the site shows them: position-deletes is V2-only now, so 54 cells, max 162. Removed upstream and dropped here: hive-metastore, nessie, polaris, hadoop-catalog, jdbc-catalog, vector-type, cdc-support. New: deletion-vectors, unknown-type, google-lakehouse. Gains: deletion vectors and row lineage on V3, unshredded VARIANT. Downgrade: unity-catalog to partial (read-only smoke). The old 167/189 is not comparable.",
   "support": {
@@ -345,12 +345,12 @@
       "caveats": []
     },
     "sqe:shredded-variant:v3": {
-      "level": "partial",
-      "notes": "SQE reads shredded variant files: Spark 4.1 + Iceberg 1.12 writes a table with write.parquet.shred-variants=true (the test asserts typed_value is in the parquet schema), and SQE folds typed_value back into the variant on the coordinator's direct read, on the iceberg-rust reader and on a worker. Variant manifest bounds are skipped rather than parsed as primitives. Objects, arrays, extra keys and NULLs read back as the same JSON text.",
-      "evidence": "crates/sqe-core/src/variant.rs, crates/sqe-catalog/src/iceberg_scan.rs, vendor/iceberg-rust/crates/iceberg/src/arrow/record_batch_transformer.rs, crates/sqe-coordinator/tests/it/variant_spark_interop.rs::sqe_reads_a_spark_shredded_variant_table, crates/sqe-coordinator/tests/it/variant_distributed.rs::shredded_variant_column_scans_on_a_worker",
+      "level": "full",
+      "notes": "SQE reads and writes shredded variant files. Read: Spark 4.1 + Iceberg 1.12 writes a table with write.parquet.shred-variants=true (the test asserts typed_value is in the parquet schema), and SQE folds typed_value back into the variant on the coordinator's direct read, on the iceberg-rust reader and on a worker. Variant manifest bounds are skipped rather than parsed as primitives. Write: with write.parquet.shred-variants=true SQE infers a shredding per data file from its first batch (object fields of one primitive type, nested objects, or a whole-value primitive) and writes typed_value; rows that do not fit are written to the residual value unchanged. The test asserts typed_value in every file's footer, Spark 4.1 + Iceberg 1.12 reads the same JSON and typed field values as SQE, and rewrite_data_files keeps the shredding. Objects, arrays, extra keys and NULLs read back as the same JSON text.",
+      "evidence": "crates/sqe-core/src/variant.rs, crates/sqe-catalog/src/iceberg_scan.rs, crates/sqe-compaction/src/writer.rs, vendor/iceberg-rust/crates/iceberg/src/writer/file_writer/variant_shred.rs, vendor/iceberg-rust/crates/iceberg/src/arrow/record_batch_transformer.rs, crates/sqe-coordinator/tests/it/variant_spark_interop.rs::sqe_reads_a_spark_shredded_variant_table, crates/sqe-coordinator/tests/it/variant_spark_interop.rs::spark_reads_an_sqe_shredded_variant_table, crates/sqe-coordinator/tests/it/variant_distributed.rs::shredded_variant_column_scans_on_a_worker",
       "caveats": [
-        "Read-only: SQE writes unshredded variants and ignores write.parquet.shred-variants.",
-        "Shredded columns are unshredded on read, so typed_value gives no pruning or typed field access."
+        "Shredded columns are unshredded on read, so typed_value gives no pruning or typed field access.",
+        "Only top-level variant columns are shredded on write; a variant nested in a struct, list or map is written unshredded."
       ]
     },
     "sqe:geometry-type:v3": {

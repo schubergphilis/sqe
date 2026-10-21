@@ -28,7 +28,7 @@ sqe> SELECT snapshot_id, committed_at FROM s3tables.sales."orders$snapshots";
 
 ## Why it is cool
 
-**148/162 (91.4%) on the public [Iceberg matrix](https://icebergmatrix.org)** rubric, rescored in October 2026 (the old 167/189 used a rubric that is no longer comparable). V3 deletion vectors, row lineage, VARIANT (shredded files read, typed field access with `variant_get`), and top-level unknown columns are in. Per-cell breakdown in `docs/evidence/iceberg-matrix-state.json`.
+**149/162 (92.0%) on the public [Iceberg matrix](https://icebergmatrix.org)** rubric, rescored in October 2026 (the old 167/189 used a rubric that is no longer comparable). V3 deletion vectors, row lineage, VARIANT (shredded files read and written, typed field access with `variant_get`), and top-level unknown columns are in. Per-cell breakdown in `docs/evidence/iceberg-matrix-state.json`.
 
 **Wins all seven benchmark suites against Trino 465 at SF1** (measured on 2026-08-15). TPC-H, SSB, TPC-DS, TPC-C, TPC-E, TPC-BB, ClickBench. 222 of 222 queries pass, and the results are differentially validated: every query runs against both engines and the rows are diffed, with DuckDB's official `dsdgen` as an independent data oracle. Tables and method below.
 

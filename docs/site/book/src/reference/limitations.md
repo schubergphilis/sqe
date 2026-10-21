@@ -53,7 +53,7 @@ V3 is the default format-version for new tables and landed end to end: default v
 |---|---|
 | Geometry / geography types | Not supported. No SQE type and no DataFusion user-defined-type support. |
 | Multi-arg partition transforms | Not supported. `PARTITIONED BY` accepts single-source transforms only. |
-| Shredded variant writes | SQE reads shredded variant files written by other engines, but writes unshredded variants. |
+| Shredded variant reads | SQE writes and reads shredded variants, but unshreds on read: a shredded field gives no pruning or typed access, and only top-level variant columns are shredded on write. |
 | Unknown list elements and map keys/values | `ARRAY<VOID>`, a map with a `VOID` key or value, and a struct whose members are all unknown are refused on write. Unknown struct members (`STRUCT<a INT, u VOID>`) work. |
 
 See [Iceberg Integration, V3 features verified](../features/iceberg.md#v3-features-verified) and [DDL, VARIANT](../sql-reference/ddl.md#variant).
