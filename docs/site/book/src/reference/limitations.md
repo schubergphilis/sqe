@@ -54,7 +54,8 @@ V3 is the default format-version for new tables and landed end to end: default v
 | Geometry / geography types | Not supported. No SQE type and no DataFusion user-defined-type support. |
 | Multi-arg partition transforms | Not supported. `PARTITIONED BY` accepts single-source transforms only. |
 | Shredded variant reads | SQE writes and reads shredded variants, but unshreds on read: a shredded field gives no pruning or typed access, and only top-level variant columns are shredded on write. |
-| Unknown list elements and map keys/values | `ARRAY<VOID>`, a map with a `VOID` key or value, and a struct whose members are all unknown are refused on write. Unknown struct members (`STRUCT<a INT, u VOID>`) work. |
+| Unknown list elements and map keys/values | `ARRAY<VOID>`, a map with a `VOID` key or value, and a struct whose members are all unknown can be declared and read, but a row cannot be written: Parquet has no column for them, and Iceberg Java refuses the same writes. Unknown struct members (`STRUCT<a INT, u VOID>`) work. |
+| Nested type promotion | `ALTER COLUMN ... SET DATA TYPE` takes a top-level column; a field inside a struct cannot be promoted yet. |
 
 See [Iceberg Integration, V3 features verified](../features/iceberg.md#v3-features-verified) and [DDL, VARIANT](../sql-reference/ddl.md#variant).
 
