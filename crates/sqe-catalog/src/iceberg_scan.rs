@@ -2525,9 +2525,12 @@ fn conform_batch_to_projection(
                     continue;
                 }
                 // A nested `unknown` member is not in the file either (#859):
-                // the struct decodes without it, and reads it as NULLs.
+                // the struct decodes without it, and reads it as NULLs. A
+                // promoted member (`ALTER COLUMN s.a SET DATA TYPE`) is
+                // rebuilt the same way, member by member, and widened.
                 if column.data_type() != field.data_type()
-                    && sqe_core::unknown::contains_unknown(field.data_type())
+                    && (sqe_core::unknown::contains_unknown(field.data_type())
+                        || field.data_type().is_nested())
                 {
                     let filled = sqe_core::unknown::fill_unknown(column, field.data_type())
                         .map_err(|e| {
@@ -4025,6 +4028,44 @@ mod projection_evolution_tests {
             &DataType::Decimal128(10, 2),
             &DataType::Decimal128(12, 3)
         ));
+    }
+
+    /// A struct member promoted with `ALTER COLUMN s.a SET DATA TYPE` keeps
+    /// its old type in older files; it reads widened (#859).
+    #[test]
+    fn a_promoted_struct_member_reads_widened_from_an_older_file() {
+        use arrow::array::{AsArray, Float32Array, Int32Array, StructArray};
+        use arrow::datatypes::{Fields, Float64Type, Int64Type};
+        let declared = DataType::Struct(Fields::from(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("f", DataType::Float64, true),
+        ]));
+        let target = Arc::new(Schema::new(vec![Field::new("s", declared.clone(), true)]));
+        let stored = Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("f", DataType::Float32, true),
+        ]);
+        let decoded = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "s",
+                DataType::Struct(stored.clone()),
+                true,
+            )])),
+            vec![Arc::new(StructArray::new(
+                stored,
+                vec![
+                    Arc::new(Int32Array::from(vec![7])),
+                    Arc::new(Float32Array::from(vec![1.5])),
+                ],
+                None,
+            ))],
+        )
+        .unwrap();
+        let out = conform_batch_to_projection(&decoded, &[Some(0)], &target, &[]).expect("conform");
+        assert_eq!(out.schema().field(0).data_type(), &declared);
+        let s = out.column(0).as_struct();
+        assert_eq!(s.column(0).as_primitive::<Int64Type>().value(0), 7);
+        assert_eq!(s.column(1).as_primitive::<Float64Type>().value(0), 1.5);
     }
 
     /// No data file stores a V3 `unknown` struct member (#859). The struct

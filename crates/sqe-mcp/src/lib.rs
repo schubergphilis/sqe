@@ -2360,6 +2360,7 @@ fn is_change_surface(kind: &StatementKind) -> bool {
             | StatementKind::AlterTableProps(_)
             | StatementKind::Comment(_)
             | StatementKind::DropNestedColumn { .. }
+            | StatementKind::AlterNestedColumnType { .. }
             | StatementKind::PartitionEvolution(_)
             | StatementKind::RefDdl(_)
             | StatementKind::HivePartitionDdl(_)

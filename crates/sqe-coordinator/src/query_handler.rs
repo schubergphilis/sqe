@@ -2166,6 +2166,17 @@ impl QueryHandler {
                     crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
+                StatementKind::AlterNestedColumnType {
+                    table,
+                    path,
+                    data_type,
+                } => {
+                    self.catalog_ops
+                        .alter_nested_column_type(session, table, path, data_type)
+                        .await?;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
+                    Ok(vec![])
+                }
                 StatementKind::AlterTableProps(stmt) => {
                     // Policy-property writes were admin-gated before the
                     // catalog preflight (`sets_reserved_table_property`).
