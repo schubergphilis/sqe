@@ -263,7 +263,7 @@ Iceberg V3 table format support landed end-to-end. V3 is the default format-vers
 | Default values (`ALTER TABLE ADD COLUMN ... DEFAULT`) | Done |
 | Schema evolution (`ALTER TABLE ADD/DROP COLUMN`, incl. nested struct fields) | Done |
 | Nanosecond timestamps (`TIMESTAMP_NS`, `TIMESTAMPTZ_NS`) | Done |
-| `VARIANT` columns (unshredded writes, shredded reads; JSON text in and out) | Done |
+| `VARIANT` columns (JSON text in and out, `variant_get`, shredded reads and writes with `write.parquet.shred-variants`) | Done |
 | `JSON` stored as variant on V3 tables; `json*` functions read variants | Done |
 | Compaction trigger on the deleted-row share (`delete_ratio_threshold`), which counts deletion vectors | Done |
 | Partition evolution | Done |
@@ -276,8 +276,7 @@ Iceberg V3 table format support landed end-to-end. V3 is the default format-vers
 
 | Feature | Status |
 |---|---|
-| Variant path functions (`variant_get`) | SQE work, tracked in #849 |
-| Shredded variant writes | SQE writes unshredded; shredded files read |
+| Pruning and typed access on shredded variant fields | Shredded fields are unshredded on read |
 | Unknown list elements and map keys/values | Refused on write; unknown struct members work (#859) |
 | Geometry / geography type | DataFusion UDT [#12644](https://github.com/apache/datafusion/issues/12644) |
 | Multi-arg partition transforms | Not started |
