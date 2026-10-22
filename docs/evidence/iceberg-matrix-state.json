@@ -27,26 +27,22 @@
     },
     "sqe:equality-deletes:v2": {
       "level": "full",
-      "notes": "On a table with identifier fields, merge-on-read DELETE, UPDATE and MERGE write equality-delete files (EqualityDeleteFileWriter) and commit one RowDelta; no data file is rewritten. The tests assert added-equality-delete-files in the snapshot summary, then read the table from Spark 4.1 with Iceberg 1.12 and require the same rows as SQE. SQE has no DDL for identifier fields, so the test tables are created by Spark (ALTER TABLE ... SET IDENTIFIER FIELDS).",
-      "evidence": "crates/sqe-write/src/write_handler.rs#handle_delete_equality, crates/sqe-write/src/write_handler.rs#handle_update_equality, crates/sqe-coordinator/tests/it/mor_spark_interop.rs::mor_spark_interop_reads_sqe_v2_equality_delete, crates/sqe-coordinator/tests/it/mor_spark_interop.rs::mor_spark_interop_reads_sqe_v2_equality_delete_update, crates/sqe-coordinator/tests/it/mor_spark_interop.rs::mor_spark_interop_reads_sqe_v2_merge",
-      "caveats": [
-        "SQE cannot declare identifier fields itself (no ALTER TABLE ... SET IDENTIFIER FIELDS yet); a table needs another engine to set them before SQE writes equality deletes."
-      ]
+      "notes": "On a table with identifier fields, merge-on-read DELETE, UPDATE and MERGE write equality-delete files (EqualityDeleteFileWriter) and commit one RowDelta; no data file is rewritten. The tests assert added-equality-delete-files in the snapshot summary, then read the table from Spark 4.1 with Iceberg 1.12 and require the same rows as SQE. SQE declares identifier fields with ALTER TABLE ... SET | DROP IDENTIFIER FIELDS; identifier_fields_set_drop_switch_update_mode asserts that SET turns a copy-on-write UPDATE into an equality delete and DROP turns it back.",
+      "evidence": "crates/sqe-write/src/write_handler.rs#handle_delete_equality, crates/sqe-write/src/write_handler.rs#handle_update_equality, crates/sqe-coordinator/tests/it/mor_spark_interop.rs::mor_spark_interop_reads_sqe_v2_equality_delete, crates/sqe-coordinator/tests/it/mor_spark_interop.rs::mor_spark_interop_reads_sqe_v2_equality_delete_update, crates/sqe-coordinator/tests/it/mor_spark_interop.rs::mor_spark_interop_reads_sqe_v2_merge, crates/sqe-coordinator/tests/it/identifier_fields_e2e.rs::identifier_fields_set_drop_switch_update_mode",
+      "caveats": []
     },
     "sqe:equality-deletes:v3": {
       "level": "full",
       "notes": "Same as V2 on a V3 table: keyed merge-on-read DELETE, UPDATE and MERGE write equality-delete files in one RowDelta (summary asserts added-equality-delete-files), and Spark 4.1 with Iceberg 1.12 reads the same rows as SQE.",
-      "evidence": "crates/sqe-coordinator/tests/it/mor_spark_interop.rs::mor_spark_interop_reads_sqe_v3_equality_delete, crates/sqe-coordinator/tests/it/mor_spark_interop.rs::mor_spark_interop_reads_sqe_v3_equality_delete_update, crates/sqe-coordinator/tests/it/mor_spark_interop.rs::mor_spark_interop_reads_sqe_v3_merge",
-      "caveats": [
-        "SQE cannot declare identifier fields itself (no ALTER TABLE ... SET IDENTIFIER FIELDS yet); a table needs another engine to set them before SQE writes equality deletes."
-      ]
+      "evidence": "crates/sqe-coordinator/tests/it/mor_spark_interop.rs::mor_spark_interop_reads_sqe_v3_equality_delete, crates/sqe-coordinator/tests/it/mor_spark_interop.rs::mor_spark_interop_reads_sqe_v3_equality_delete_update, crates/sqe-coordinator/tests/it/mor_spark_interop.rs::mor_spark_interop_reads_sqe_v3_merge, crates/sqe-coordinator/tests/it/v3_e2e.rs::equality_delete_update_on_v3_table",
+      "caveats": []
     },
     "sqe:merge-on-read:v2": {
       "level": "full",
       "notes": "DELETE, UPDATE and MERGE route through RowDeltaAction when write.*.mode = merge-on-read. With identifier fields, UPDATE writes a data file plus an equality delete for the old keys, and MERGE composes MATCHED UPDATE, MATCHED DELETE and NOT MATCHED INSERT into one RowDelta. Without identifier fields UPDATE and MERGE fall back to copy-on-write and DELETE writes position deletes. Each Spark interop test asserts the merge-on-read summary before Spark reads the table back.",
       "evidence": "crates/sqe-write/src/write_handler.rs#handle_delete_mor, crates/sqe-write/src/write_handler.rs#handle_update_equality, crates/sqe-write/src/write_handler.rs#handle_merge_equality, crates/sqe-coordinator/tests/it/ctas_write_modes_e2e.rs::ctas_delete_mode_mor_writes_position_deletes, crates/sqe-coordinator/tests/it/mor_spark_interop.rs::mor_spark_interop_reads_sqe_v2_position_deletes, crates/sqe-coordinator/tests/it/mor_spark_interop.rs::mor_spark_interop_reads_sqe_v2_equality_delete_update, crates/sqe-coordinator/tests/it/mor_spark_interop.rs::mor_spark_interop_reads_sqe_v2_merge",
       "caveats": [
-        "UPDATE and MERGE are merge-on-read only on tables with identifier fields, which SQE cannot declare yet."
+        "UPDATE and MERGE are merge-on-read only on tables with identifier fields (ALTER TABLE ... SET IDENTIFIER FIELDS); without them they fall back to copy-on-write."
       ]
     },
     "sqe:merge-on-read:v3": {
@@ -54,7 +50,7 @@
       "notes": "MoR DELETE on a V3 table writes deletion vectors (never position-delete files); with identifier fields DELETE, UPDATE and MERGE write equality deletes in one RowDelta. Spark 4.1 with Iceberg 1.12 reads each result back with the same rows as SQE.",
       "evidence": "crates/sqe-coordinator/tests/it/mor_spark_interop.rs::mor_spark_interop_reads_sqe_v3_deletion_vectors, crates/sqe-coordinator/tests/it/mor_spark_interop.rs::mor_spark_interop_reads_sqe_v3_equality_delete_update, crates/sqe-coordinator/tests/it/mor_spark_interop.rs::mor_spark_interop_reads_sqe_v3_merge, crates/sqe-coordinator/tests/it/v3_e2e.rs::position_deletes_on_v3_table",
       "caveats": [
-        "UPDATE and MERGE are merge-on-read only on tables with identifier fields, which SQE cannot declare yet."
+        "UPDATE and MERGE are merge-on-read only on tables with identifier fields (ALTER TABLE ... SET IDENTIFIER FIELDS); without them they fall back to copy-on-write."
       ]
     },
     "sqe:copy-on-write:v2": {

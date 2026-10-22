@@ -136,7 +136,7 @@ Supported DML, both V2 and V3 verified:
 - **CREATE TABLE AS SELECT**: Apache Iceberg V2 and V3, including TIMESTAMP_NS columns and DEFAULT literals.
 - **INSERT INTO**: streaming, with proper schema validation against the catalog.
 - **DELETE FROM**: Copy-on-Write via `RewriteFilesAction`, or Merge-on-Read via `PositionDeleteFileWriter` when `write.delete.mode=merge-on-read`.
-- **UPDATE**: CoW or MoR (equality deletes when the table declares an identifier-field-id).
+- **UPDATE**: CoW or MoR (equality deletes when the table has identifier fields; declare them with `ALTER TABLE t SET IDENTIFIER FIELDS id`).
 - **MERGE INTO**: full WHEN MATCHED / WHEN NOT MATCHED semantics, dispatching to CoW or MoR based on the table's `write.merge.mode` (default copy-on-write).
 - **ALTER TABLE**: `ADD/DROP/RENAME COLUMN`, `SET/DROP NOT NULL`, type promotion, `ADD/DROP/REPLACE PARTITION FIELD` (partition evolution), `CREATE/DROP BRANCH/TAG`, `SET WRITE BRANCH`.
 

@@ -2361,6 +2361,7 @@ fn is_change_surface(kind: &StatementKind) -> bool {
             | StatementKind::Comment(_)
             | StatementKind::DropNestedColumn { .. }
             | StatementKind::PartitionEvolution(_)
+            | StatementKind::IdentifierFields(_)
             | StatementKind::RefDdl(_)
             | StatementKind::HivePartitionDdl(_)
             | StatementKind::MsckRepairTable(_)

@@ -33,7 +33,7 @@
 //!   deletes only), mirroring `rewrite_data_files_deletes.rs`'s
 //!   `seed_mor_table` / `rewrite_applies_position_deletes_and_consolidates`.
 //! - [`equality_delete_parity`]: `UPDATE` on a table with
-//!   `identifier_field_ids` (equality delete + a fresh data file), mirroring
+//!   identifier fields (equality delete + a fresh data file), mirroring
 //!   `rewrite_data_files_deletes.rs`'s `rewrite_applies_equality_deletes`.
 //!
 //! The third fixture targets a residual risk the two above never exercise:
@@ -408,9 +408,15 @@ async fn seed_equality_delete_fixture(
         handler,
         session,
         &format!(
-            "CREATE TABLE {table} (id BIGINT, v BIGINT) WITH (identifier_field_ids = 'id', \
-             'write.update.mode' = 'merge-on-read')"
+            "CREATE TABLE {table} (id BIGINT NOT NULL, v BIGINT) \
+             WITH ('write.update.mode' = 'merge-on-read')"
         ),
+    )
+    .await;
+    exec(
+        handler,
+        session,
+        &format!("ALTER TABLE {table} SET IDENTIFIER FIELDS id"),
     )
     .await;
     for i in 0..rows {
@@ -698,6 +704,13 @@ async fn equality_delete_parity() {
 
     seed_equality_delete_fixture(&handler, &session, &dist_table, ROWS, UPDATED_ID, NEW_V).await;
     seed_equality_delete_fixture(&handler, &session, &local_table, ROWS, UPDATED_ID, NEW_V).await;
+    for name in [dist_name, local_name] {
+        let summary = crate::v3_e2e::latest_summary(&handler, &session, namespace, name).await;
+        assert!(
+            summary.contains("added-equality-delete-files"),
+            "{name}: the fixture must hold an equality delete: {summary}"
+        );
+    }
 
     let pre_dist = collect_id_v_rows(&handler, &session, &dist_table).await;
     let pre_local = collect_id_v_rows(&handler, &session, &local_table).await;
