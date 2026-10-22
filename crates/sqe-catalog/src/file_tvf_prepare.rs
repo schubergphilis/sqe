@@ -37,16 +37,19 @@ use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use datafusion::catalog::{TableFunctionImpl, TableProvider};
+use datafusion::common::tree_node::Transformed;
+use datafusion::common::Column;
+use datafusion::dataframe::DataFrame;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
-use datafusion_expr::{lit, Expr};
-use futures::future::BoxFuture;
 use datafusion::sql::sqlparser::ast::{
     self as sql, FunctionArg, FunctionArgExpr, TableFactor, Visit, Visitor,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
+use datafusion_expr::{lit, when, Expr, LogicalPlan, Projection};
+use futures::future::BoxFuture;
 
 use crate::file_tvf_common::scalar_to_str;
 
@@ -103,12 +106,53 @@ fn planning_options() -> datafusion::execution::context::SQLOptions {
 /// Prepare the file table functions `sql` calls, then plan it: the one way
 /// a planner entry point should reach `ctx.sql`. Refuses DDL
 /// ([`planning_options`]).
-pub async fn plan_sql(ctx: &SessionContext, sql: &str) -> DFResult<datafusion::dataframe::DataFrame> {
+pub async fn plan_sql(
+    ctx: &SessionContext,
+    sql: &str,
+) -> DFResult<datafusion::dataframe::DataFrame> {
     in_statement(async {
         prepare_statement(ctx, sql).await?;
-        ctx.sql_with_options(sql, planning_options()).await
+        name_unknown_types(ctx.sql_with_options(sql, planning_options()).await?)
     })
     .await
+}
+
+/// `information_schema.columns` names each type by its Arrow display, so an
+/// Iceberg V3 `unknown` column (Arrow `Null`) read as `Null` over Flight SQL
+/// while DESCRIBE and the Trino endpoint said `unknown` (#859). Rewritten at
+/// the scan, before the optimizer pushes filters into it, so `WHERE
+/// data_type = 'unknown'` matches as well. Only the bare `Null` changes;
+/// nested types keep their Arrow display.
+fn name_unknown_types(df: DataFrame) -> DFResult<DataFrame> {
+    let (state, plan) = df.into_parts();
+    let plan = plan
+        .transform_up_with_subqueries(|node| {
+            let LogicalPlan::TableScan(scan) = &node else {
+                return Ok(Transformed::no(node));
+            };
+            let is_columns = scan.table_name.schema() == Some("information_schema")
+                && scan.table_name.table() == "columns";
+            let schema = Arc::clone(node.schema());
+            if !is_columns || schema.field_with_unqualified_name("data_type").is_err() {
+                return Ok(Transformed::no(node));
+            }
+            let exprs = schema
+                .iter()
+                .map(|(qualifier, field)| {
+                    let column = Expr::Column(Column::from((qualifier, field)));
+                    if field.name() != "data_type" {
+                        return Ok(column);
+                    }
+                    Ok(when(column.clone().eq(lit("Null")), lit("unknown"))
+                        .otherwise(column)?
+                        .alias_qualified(qualifier.cloned(), "data_type"))
+                })
+                .collect::<DFResult<Vec<_>>>()?;
+            let projection = Projection::try_new(exprs, Arc::new(node))?;
+            Ok(Transformed::yes(LogicalPlan::Projection(projection)))
+        })?
+        .data;
+    Ok(DataFrame::new(state, plan))
 }
 
 /// [`plan_sql`] for a session no policy governs (the embedded CLI: no auth,
@@ -120,7 +164,7 @@ pub async fn plan_sql_without_policy(
 ) -> DFResult<datafusion::dataframe::DataFrame> {
     in_statement(async {
         prepare_statement(ctx, sql).await?;
-        ctx.sql(sql).await
+        name_unknown_types(ctx.sql(sql).await?)
     })
     .await
 }
@@ -134,7 +178,7 @@ pub async fn plan_parsed(
 ) -> DFResult<datafusion::dataframe::DataFrame> {
     in_statement(async {
         prepare_parsed_statement(ctx, statement).await?;
-        ctx.sql_with_options(sql, planning_options()).await
+        name_unknown_types(ctx.sql_with_options(sql, planning_options()).await?)
     })
     .await
 }
@@ -669,13 +713,68 @@ mod tests {
         let analyzed = analyzed_schema(&ctx, df.logical_plan()).unwrap();
         assert_eq!(analyzed.field(0).data_type(), &DataType::Decimal128(8, 1));
         let batches = df.collect().await.unwrap();
-        assert_eq!(batches[0].schema().field(0).data_type(), analyzed.field(0).data_type());
+        assert_eq!(
+            batches[0].schema().field(0).data_type(),
+            analyzed.field(0).data_type()
+        );
+    }
+
+    /// #859: an unknown column (Arrow `Null`) is `unknown` in
+    /// `information_schema.columns`, in the projection and in a filter, also
+    /// from a subquery; other types keep their Arrow display.
+    #[tokio::test]
+    async fn information_schema_names_a_null_column_unknown() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        let ctx = SessionContext::new_with_config(
+            datafusion::prelude::SessionConfig::new().with_information_schema(true),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("u", DataType::Null, true),
+        ]));
+        let table = datafusion::datasource::MemTable::try_new(schema, vec![vec![]]).unwrap();
+        ctx.register_table("t", Arc::new(table)).unwrap();
+        let rows = |sql: &'static str| {
+            let ctx = ctx.clone();
+            async move {
+                let batches = plan_sql(&ctx, sql).await.unwrap().collect().await.unwrap();
+                datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+                    .unwrap()
+                    .to_string()
+            }
+        };
+        let all = rows(
+            "SELECT column_name, data_type FROM information_schema.columns \
+             WHERE table_name = 't' ORDER BY ordinal_position",
+        )
+        .await;
+        assert!(all.contains("| id          | Int32     |"), "{all}");
+        assert!(all.contains("| u           | unknown   |"), "{all}");
+        let filtered = rows(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_name = 't' AND data_type = 'unknown'",
+        )
+        .await;
+        assert!(
+            filtered.contains("| u ") && !filtered.contains("| id"),
+            "{filtered}"
+        );
+        let nested = rows(
+            "SELECT count(*) AS n FROM (SELECT c.data_type FROM information_schema.columns c \
+             WHERE c.table_name = 't') WHERE data_type = 'unknown'",
+        )
+        .await;
+        assert!(nested.contains("| 1 |"), "{nested}");
     }
 
     fn session_with(name: &str) -> (SessionContext, Arc<Recording>) {
         let ctx = SessionContext::new();
         let f = Arc::new(Recording::default());
-        FileTableFunctions::register(&ctx, name, Arc::clone(&f) as Arc<dyn PreparableTableFunction>);
+        FileTableFunctions::register(
+            &ctx,
+            name,
+            Arc::clone(&f) as Arc<dyn PreparableTableFunction>,
+        );
         (ctx, f)
     }
 
