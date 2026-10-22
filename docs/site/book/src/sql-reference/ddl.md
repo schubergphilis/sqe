@@ -57,7 +57,7 @@ A column `DEFAULT` takes a literal and makes the table format-version 3. An `INS
 | `ALTER TABLE t ALTER COLUMN c SET NOT NULL` | `sqlparser-rs` + `sqe-coordinator` | Tighten nullability. Fails if existing rows have NULL. | yes | yes | yes | yes |
 | `ALTER TABLE t ALTER COLUMN c DROP NOT NULL` | `sqlparser-rs` + `sqe-coordinator` | Loosen nullability. | yes | yes | yes | yes |
 | `ALTER TABLE t ALTER COLUMN c SET DEFAULT expr` | `sqlparser-rs` + `sqe-coordinator` | Iceberg V3 column default. | partial | yes | yes | yes |
-| `ALTER TABLE t ALTER COLUMN c TYPE new_type` | `sqlparser-rs` + `sqe-coordinator` | Type promotion only (e.g. INT -> BIGINT). Lossy changes rejected. | partial | partial | partial | partial |
+| `ALTER TABLE t ALTER COLUMN c TYPE new_type` | `sqlparser-rs` + `sqe-coordinator` | Iceberg type promotion only: INT -> BIGINT, REAL -> DOUBLE, a wider DECIMAL precision with the same scale, and (V3) UNKNOWN -> any primitive type. Any other change is rejected before it is committed. Top-level columns only. | partial | partial | partial | partial |
 | `ALTER TABLE t RENAME TO new_t` | `sqlparser-rs` + `sqe-coordinator` | Catalog rename. Different catalog support varies. | yes | yes | yes | yes |
 | `ALTER TABLE t SET TBLPROPERTIES (...)` | `sqlparser-rs` + `sqe-coordinator` | Set Iceberg properties (e.g. `write.delete.mode`). | yes | yes | yes | - |
 | `COMMENT ON TABLE t IS 'description'` | `sqlparser-rs` + `sqe-coordinator` | Stored in Iceberg properties. | yes | yes | yes | yes |
@@ -180,7 +180,7 @@ These types only exist in format-version 3, the default for new tables. A `TIMES
 |---|---|
 | `TIMESTAMP_NS`, `TIMESTAMP_NS WITH TIME ZONE` | Nanosecond precision timestamps. Arrow `Timestamp(Nanosecond, ...)`. |
 | `VARIANT` | Semi-structured value (object, array, string, number, boolean, null) in the Iceberg variant binary encoding. See [VARIANT](#variant) below. |
-| `UNKNOWN` (also `VOID`) | A column declared before its type is known. Holds only NULLs, is never written to data files, and is promoted later with `ALTER COLUMN ... SET DATA TYPE`. Also allowed as a struct member, including a struct inside a list; an unknown list element or map key/value is refused. |
+| `UNKNOWN` (also `VOID`) | A column declared before its type is known. Holds only NULLs, is never written to data files, and is promoted later with `ALTER COLUMN ... SET DATA TYPE`. Also allowed as a struct member, including a struct inside a list. An unknown list element or map key/value, or a struct whose members are all unknown, can be declared but no row can be written (Iceberg Java refuses the same). |
 | Default values via `DEFAULT expr` | Existing rows in older snapshots inherit the default at read time. |
 
 ### VARIANT

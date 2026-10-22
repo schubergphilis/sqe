@@ -230,3 +230,63 @@ async fn nested_unknown_struct_sqe_creates_spark_reads() {
     );
     assert_eq!(sqe, vec!["1|10|true"], "SQE's rows");
 }
+
+/// A list of unknown, a map with an unknown value and a struct whose members
+/// are all unknown can be declared and read, but no engine can write a row:
+/// Parquet has no column for them. SQE refuses the INSERT with a sentence
+/// naming the column, and Iceberg Java refuses it too.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn unknown_list_map_and_struct_are_declared_not_written() {
+    if let Some(reason) = spark_stack_skip_reason() {
+        eprintln!("skipping unknown_list_map_and_struct_are_declared_not_written: {reason}");
+        return;
+    }
+    let (session, handler) = crate::common::setup_handler().await;
+    let mut outcomes = Vec::new();
+    for (name, column, value) in [
+        ("unknown_list", "c ARRAY<UNKNOWN>", "[NULL]"),
+        ("unknown_map", "c MAP<VARCHAR, UNKNOWN>", "MAP {'k': NULL}"),
+        (
+            "unknown_struct",
+            "c STRUCT<u UNKNOWN>",
+            "named_struct('u', NULL)",
+        ),
+    ] {
+        let fq = format!("default.{name}");
+        let _ = handler
+            .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+            .await;
+        let create = format!("CREATE TABLE {fq} (id INT, {column})");
+        handler
+            .execute(&session, &create, None)
+            .await
+            .expect(&create);
+        let empty = sqe_rows(&handler, &session, &format!("SELECT count(*) FROM {fq}")).await;
+        let insert = format!("INSERT INTO {fq} VALUES (1, {value})");
+        let sqe = match handler.execute(&session, &insert, None).await {
+            Ok(_) => "accepted".to_string(),
+            Err(e) => e.to_string(),
+        };
+        let spark_count = spark_rows(&format!("SELECT count(*) FROM rest.{fq}"));
+        let spark_insert = spark_sql(&format!("INSERT INTO rest.{fq} (id) VALUES (1)"));
+        let _ = handler
+            .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+            .await;
+        outcomes.push(format!(
+            "{name}: sqe {} refuses={} spark {} refuses={}",
+            empty.join(","),
+            sqe.contains("Column `c` has") && sqe.contains("cannot be written to a data file"),
+            spark_count.join(","),
+            spark_insert.is_err(),
+        ));
+    }
+    assert_eq!(
+        outcomes,
+        [
+            "unknown_list: sqe 0 refuses=true spark 0 refuses=true",
+            "unknown_map: sqe 0 refuses=true spark 0 refuses=true",
+            "unknown_struct: sqe 0 refuses=true spark 0 refuses=true",
+        ]
+    );
+}

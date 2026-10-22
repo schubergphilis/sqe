@@ -11,11 +11,11 @@
     "docUrl": "https://docs.getsqe.com"
   },
   "generatedAt": "2026-10-21T00:00:00Z",
-  "generatedBy": "Rescore against the pinned upstream rubric; evidence paths repaired after the crate and test moves. 2026-10-18: unknown-type and shredded-variant measured against Spark 4.1 + Iceberg 1.12. 2026-10-20: merge-on-read deletes, deletion vectors and row lineage read back by Spark 4.1 + Iceberg 1.12 (mor_spark_interop); stub evidence removed. 2026-10-21: SQE writes shredded variants (write.parquet.shred-variants), read back by Spark 4.1 + Iceberg 1.12; shredded-variant:v3 to full.",
+  "generatedBy": "Rescore against the pinned upstream rubric; evidence paths repaired after the crate and test moves. 2026-10-18: unknown-type and shredded-variant measured against Spark 4.1 + Iceberg 1.12. 2026-10-20: merge-on-read deletes, deletion vectors and row lineage read back by Spark 4.1 + Iceberg 1.12 (mor_spark_interop); stub evidence removed. 2026-10-21: SQE writes shredded variants (write.parquet.shred-variants), read back by Spark 4.1 + Iceberg 1.12; shredded-variant:v3 to full. unknown-type:v3 to full: nested shapes measured against Iceberg Java (same refusals), promotion rules enforced.",
   "score": {
-    "raw": 149,
+    "raw": 150,
     "max": 162,
-    "percent": 92.0
+    "percent": 92.6
   },
   "note": "Rescored on 2026-10-17 against upstream features.json (32 features). Only cells that apply to a version are scored, as the site shows them: position-deletes is V2-only now, so 54 cells, max 162. Removed upstream and dropped here: hive-metastore, nessie, polaris, hadoop-catalog, jdbc-catalog, vector-type, cdc-support. New: deletion-vectors, unknown-type, google-lakehouse. Gains: deletion vectors and row lineage on V3, unshredded VARIANT. Downgrade: unity-catalog to partial (read-only smoke). The old 167/189 is not comparable.",
   "support": {
@@ -83,16 +83,18 @@
     },
     "sqe:type-promotion:v2": {
       "level": "full",
-      "notes": "int->long, float->double, decimal widening.",
-      "evidence": "crates/sqe-sql/src/ddl.rs",
+      "notes": "ALTER COLUMN ... SET DATA TYPE accepts int->long, float->double and decimal precision widening, refuses every other change before commit, and reads files written before the promotion as the new type (#859).",
+      "evidence": "crates/sqe-sql/src/ddl.rs, crates/sqe-coordinator/src/catalog_ops.rs#check_type_promotion, crates/sqe-catalog/src/iceberg_scan.rs#is_type_promotion, crates/sqe-coordinator/tests/it/v3_e2e.rs::type_promotion_widens_and_refuses_the_rest",
       "caveats": []
     },
     "sqe:type-promotion:v3": {
       "level": "full",
-      "notes": "ALTER TABLE ... ALTER COLUMN ... SET DATA TYPE widens columns on V3 tables (verified int -> bigint). The new type surfaces through information_schema.columns and the schema change commits through Polaris.",
-      "evidence": "crates/sqe-coordinator/tests/it/v3_e2e.rs::type_promotion_int_to_bigint_on_v3_table",
+      "notes": "ALTER TABLE ... ALTER COLUMN ... SET DATA TYPE widens columns on V3 tables (int -> bigint, real -> double, decimal precision widening, unknown -> any primitive; other changes are refused before commit, #859). The new type surfaces through information_schema.columns and the schema change commits through Polaris.",
+      "evidence": "crates/sqe-coordinator/tests/it/v3_e2e.rs::type_promotion_int_to_bigint_on_v3_table, crates/sqe-coordinator/src/catalog_ops.rs#check_type_promotion, crates/sqe-catalog/src/iceberg_scan.rs#is_type_promotion, crates/sqe-coordinator/tests/it/v3_e2e.rs::type_promotion_widens_and_refuses_the_rest",
       "caveats": [
-        "Nanosecond-to-microsecond narrowing not attempted (Iceberg spec rejects narrowing)."
+        "Nanosecond-to-microsecond narrowing not attempted (Iceberg spec rejects narrowing).",
+        "date -> timestamp (a V3 promotion) is refused: the reader path for it is untested.",
+        "Top-level columns only: ALTER COLUMN on a nested field does not parse."
       ]
     },
     "sqe:column-default-values:v3": {
@@ -366,12 +368,12 @@
       "caveats": []
     },
     "sqe:unknown-type:v3": {
-      "level": "partial",
-      "notes": "Top-level unknown columns work across engines. SQE declares one as UNKNOWN or VOID, reads a Spark-written VOID column as NULLs, inserts around it and promotes it with ALTER COLUMN ... SET DATA TYPE, and Spark 4.1 + Iceberg 1.12 reads every stage. Unknown columns and unknown struct members (also in a list of structs) are never written to a data file, as the spec requires; readers fill them with NULLs. Spark-written nested unknown members read in SQE, and Spark reads SQE's.",
-      "evidence": "crates/sqe-write/src/write_handler.rs, crates/sqe-catalog/src/iceberg_scan.rs, vendor/iceberg-rust/crates/iceberg/src/writer/file_writer/parquet_writer.rs, crates/sqe-coordinator/tests/it/unknown_type_spark_interop.rs::unknown_column_reads_writes_and_promotes, crates/sqe-coordinator/tests/it/unknown_type_spark_interop.rs::sqe_declares_an_unknown_column_spark_reads_it, crates/sqe-coordinator/tests/it/unknown_type_spark_interop.rs::nested_unknown_struct_spark_writes_sqe_reads, crates/sqe-coordinator/tests/it/unknown_type_spark_interop.rs::nested_unknown_struct_sqe_creates_spark_reads, crates/sqe-coordinator/tests/it/distributed_schema_evolution_e2e.rs::unknown_fields_read_as_null_on_a_worker",
+      "level": "full",
+      "notes": "Top-level unknown columns work across engines. SQE declares one as UNKNOWN or VOID, reads a Spark-written VOID column as NULLs, inserts around it and promotes it with ALTER COLUMN ... SET DATA TYPE, and Spark 4.1 + Iceberg 1.12 reads every stage. Unknown columns and unknown struct members (also in a list of structs) are never written to a data file, as the spec requires; readers fill them with NULLs. Spark-written nested unknown members read in SQE, and Spark reads SQE's. A list of unknown, a map with an unknown value and a struct whose members are all unknown can be declared and read by both engines; neither SQE nor Iceberg Java can write a row (Parquet has no column for them), and the test asserts both refuse. ALTER COLUMN ... SET DATA TYPE checks the spec's promotion rules, so unknown promotes to any primitive type and a narrowing is refused before commit. Iceberg Java 1.12 refuses unknown -> int in Spark, so SQE is the engine that promotes here.",
+      "evidence": "crates/sqe-write/src/write_handler.rs, crates/sqe-catalog/src/iceberg_scan.rs, vendor/iceberg-rust/crates/iceberg/src/writer/file_writer/parquet_writer.rs, crates/sqe-coordinator/tests/it/unknown_type_spark_interop.rs::unknown_column_reads_writes_and_promotes, crates/sqe-coordinator/tests/it/unknown_type_spark_interop.rs::sqe_declares_an_unknown_column_spark_reads_it, crates/sqe-coordinator/tests/it/unknown_type_spark_interop.rs::nested_unknown_struct_spark_writes_sqe_reads, crates/sqe-coordinator/tests/it/unknown_type_spark_interop.rs::nested_unknown_struct_sqe_creates_spark_reads, crates/sqe-coordinator/tests/it/distributed_schema_evolution_e2e.rs::unknown_fields_read_as_null_on_a_worker, crates/sqe-coordinator/tests/it/unknown_type_spark_interop.rs::unknown_list_map_and_struct_are_declared_not_written, crates/sqe-coordinator/tests/it/v3_e2e.rs::type_promotion_widens_and_refuses_the_rest, crates/sqe-coordinator/src/catalog_ops.rs#check_type_promotion",
       "caveats": [
-        "An unknown list element, an unknown map key or value, and a struct whose members are all unknown are refused on write.",
-        "information_schema reports the Arrow type name Null, not unknown."
+        "A nested unknown member cannot be promoted yet: ALTER COLUMN ... SET DATA TYPE takes top-level columns only.",
+        "information_schema names Arrow types for every column, so an unknown column shows as Null."
       ]
     },
     "sqe:lineage:v3": {
