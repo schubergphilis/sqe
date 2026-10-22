@@ -13,8 +13,9 @@ type Handler = sqe_coordinator::QueryHandler;
 type Session = sqe_core::Session;
 
 /// Spark creates `default.<name>` with `id` as the identifier field and
-/// every write mode merge-on-read. SQE has no DDL for identifier fields,
-/// and without one UPDATE and MERGE fall back to copy-on-write.
+/// every write mode merge-on-read. Without identifier fields, UPDATE and
+/// MERGE fall back to copy-on-write (SQE declares them with
+/// `ALTER TABLE ... SET IDENTIFIER FIELDS`, see identifier_fields_e2e.rs).
 fn spark_create_keyed_table(name: &str, format_version: u8) {
     let sql = format!(
         "DROP TABLE IF EXISTS rest.default.{name}; \

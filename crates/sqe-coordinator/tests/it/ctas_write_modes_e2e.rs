@@ -13,8 +13,9 @@
 //!   data files.
 //! - UPDATE/MERGE + `merge-on-read`: equality deletes when the table
 //!   declares identifier-field-ids, otherwise a DOCUMENTED fallback to
-//!   CoW (SQE DDL, including CTAS, has no way to declare a primary key,
-//!   so this fallback is the expected behaviour for every CTAS table).
+//!   CoW (a CTAS table has no identifier fields until
+//!   `ALTER TABLE ... SET IDENTIFIER FIELDS`, so this fallback is the
+//!   expected behaviour right after CTAS).
 //! - Property absent: CoW everywhere (Iceberg spec default).
 //!
 //! Every test is `#[ignore]` because each needs the running stack:
@@ -260,10 +261,10 @@ async fn ctas_delete_mode_default_is_cow() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// UPDATE: merge-on-read via CTAS property. CTAS tables cannot declare
-// identifier-field-ids (SQE DDL has no PRIMARY KEY / IDENTIFIER FIELDS
-// syntax), so the dispatcher's documented fallback to CoW must kick in:
-// correct results, no delete files.
+// UPDATE: merge-on-read via CTAS property. A CTAS table has no identifier
+// fields until `ALTER TABLE ... SET IDENTIFIER FIELDS` declares them, so
+// the dispatcher's documented fallback to CoW must kick in: correct
+// results, no delete files.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:polaris"]

@@ -14,7 +14,7 @@
 //! These tests assert both properties: deleted rows stay deleted (correctness)
 //! and the small files actually collapse (consolidation ran, not skipped).
 //!
-//! A DELETE on a CTAS table (which cannot declare identifier-field-ids) under
+//! A DELETE on a table without identifier fields (a fresh CTAS has none) under
 //! `write.delete.mode = merge-on-read` produces POSITION deletes and never
 //! rewrites data files (see ctas_write_modes_e2e.rs).
 //!
@@ -433,15 +433,21 @@ async fn rewrite_applies_equality_deletes() {
     let table = format!("{namespace}.{table_name}");
 
     let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {table}")).await;
-    // MoR UPDATE needs a primary key (identifier_field_ids) to build the
-    // equality delete; without it the dispatcher falls back to copy-on-write.
+    // MoR UPDATE needs identifier fields to build the equality delete;
+    // without them the dispatcher falls back to copy-on-write.
     exec(
         &handler,
         &session,
         &format!(
-            "CREATE TABLE {table} (id BIGINT, v BIGINT) WITH (identifier_field_ids = 'id', \
-             'write.update.mode' = 'merge-on-read')"
+            "CREATE TABLE {table} (id BIGINT NOT NULL, v BIGINT) \
+             WITH ('write.update.mode' = 'merge-on-read')"
         ),
+    )
+    .await;
+    exec(
+        &handler,
+        &session,
+        &format!("ALTER TABLE {table} SET IDENTIFIER FIELDS id"),
     )
     .await;
     // One data file per INSERT.
@@ -460,6 +466,11 @@ async fn rewrite_applies_equality_deletes() {
         &format!("UPDATE {table} SET v = 99 WHERE id = 5"),
     )
     .await;
+    let summary = crate::v3_e2e::latest_summary(&handler, &session, namespace, table_name).await;
+    assert!(
+        summary.contains("added-equality-delete-files"),
+        "the fixture must hold an equality delete, not a copy-on-write rewrite: {summary}"
+    );
     assert_eq!(count_rows(&handler, &session, &table).await, 8);
     assert_eq!(
         scalar_i64(

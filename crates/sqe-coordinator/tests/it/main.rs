@@ -49,6 +49,7 @@ mod hive_partition_ddl_test;
 mod hive_scan_tasks_test;
 mod hive_tag_source_test;
 mod hive_write_test;
+mod identifier_fields_e2e;
 mod in_subquery_view_rewrite;
 mod incremental_scan_e2e;
 mod insert_overwrite_e2e;
