@@ -2550,7 +2550,7 @@ impl SessionCatalog {
             // Conditional GET on the loadTable endpoint through the shared
             // REST helper (breaker check, trace headers, metrics, breaker
             // outcome). The helper treats 304 as success.
-            let url = self.table_url(table_ident);
+            let url = self.table_url(table_ident).await;
             match self
                 .rest_request(
                     sqe_core::CatalogOp::LoadTable,
@@ -2654,7 +2654,7 @@ impl SessionCatalog {
                         let http_client = self.http_client.clone();
                         let sigv4 = self.sigv4.clone();
                         let bearer_token = self.bearer_token.clone();
-                        let url = self.table_url(table_ident);
+                        let url = self.table_url(table_ident).await;
                         let table_cache = self.table_cache.clone();
                         let table_ident_log = table_ident.clone();
                         let generation = generation.clone();
@@ -2715,9 +2715,10 @@ impl SessionCatalog {
             .map_err(sqe_core::SqeError::Catalog)?;
 
         let started = Instant::now();
+        let url = self.table_url(table_ident).await;
         let mut req = self
             .http_client
-            .head(self.table_url(table_ident))
+            .head(url)
             .header("X-Request-ID", Uuid::new_v4().to_string());
         for (k, v) in trace_context_http_headers() {
             req = req.header(k, v);
@@ -2828,34 +2829,38 @@ impl SessionCatalog {
         }
     }
 
-    fn table_url(&self, table_ident: &TableIdent) -> String {
+    async fn table_url(&self, table_ident: &TableIdent) -> String {
         self.rest_url(&[
             "namespaces",
             &namespace_path_segment(table_ident.namespace()),
             "tables",
             table_ident.name(),
         ])
+        .await
     }
 
-    fn views_url(&self, namespace: &NamespaceIdent) -> String {
+    async fn views_url(&self, namespace: &NamespaceIdent) -> String {
         self.rest_url(&["namespaces", &namespace_path_segment(namespace), "views"])
+            .await
     }
 
-    fn view_url(&self, namespace: &NamespaceIdent, name: &str) -> String {
+    async fn view_url(&self, namespace: &NamespaceIdent, name: &str) -> String {
         self.rest_url(&[
             "namespaces",
             &namespace_path_segment(namespace),
             "views",
             name,
         ])
+        .await
     }
 
     /// `{rest_prefix}/{segments...}` with every segment percent-encoded as a
     /// path segment, so a table or view named `a/b?c%` and the `\u{1F}`
     /// namespace separator both travel as their escaped forms
-    /// (architecture review 311).
-    fn rest_url(&self, segments: &[&str]) -> String {
-        let prefix = self.rest_prefix();
+    /// (architecture review 311). The prefix is already in the server's
+    /// encoding and is parsed as part of the base, never re-encoded.
+    async fn rest_url(&self, segments: &[&str]) -> String {
+        let prefix = self.rest_prefix().await;
         match url::Url::parse(&prefix) {
             Ok(mut base) => {
                 if let Ok(mut path) = base.path_segments_mut() {
@@ -3270,10 +3275,33 @@ impl SessionCatalog {
         })
     }
 
-    /// Build the Polaris REST URL prefix for this warehouse.
-    fn rest_prefix(&self) -> String {
+    /// `{catalog_url}/v1[/{prefix}]`, the base of every raw REST URL.
+    ///
+    /// The prefix is the one the server advertised in `GET /v1/config`, the
+    /// same segment the iceberg client puts in its own requests, so the raw
+    /// calls address the table the client loaded (#873). It equals the
+    /// warehouse name on Polaris only; Nessie sends `main%7Cwarehouse`. A
+    /// server that advertises none gets no segment, as in the client. When
+    /// the config cannot be fetched, or the breaker is open (no fetch may go
+    /// out then), the warehouse name stands in; the request that follows is
+    /// refused or fails on the same connection anyway.
+    async fn rest_prefix(&self) -> String {
+        const BREAKER_OPEN: u8 = 2;
         let base = self.catalog_url.trim_end_matches('/');
-        format!("{base}/v1/{}", self.warehouse)
+        let prefix = match &self.inner {
+            CatalogHandle::Rest(_) if self.circuit_breaker.state_code() == BREAKER_OPEN => {
+                Some(self.warehouse.clone())
+            }
+            CatalogHandle::Rest(rest) => rest
+                .path_prefix()
+                .await
+                .unwrap_or_else(|_| Some(self.warehouse.clone())),
+            CatalogHandle::Other(_) => Some(self.warehouse.clone()),
+        };
+        match prefix {
+            Some(prefix) => format!("{base}/v1/{prefix}"),
+            None => format!("{base}/v1"),
+        }
     }
 
     /// Guard for methods that talk to the REST catalog directly
@@ -3314,7 +3342,7 @@ impl SessionCatalog {
         properties: &std::collections::HashMap<String, String>,
     ) -> sqe_core::Result<()> {
         self.require_rest_backend("create_view")?;
-        let url = self.views_url(namespace);
+        let url = self.views_url(namespace).await;
         let schema = view_schema_from_json(schema, 0)?;
         let version = sqe_view_version(1, schema.schema_id(), sql, namespace, &self.warehouse)?;
         let body = serde_json::to_value(CreateViewRequest {
@@ -3399,7 +3427,7 @@ impl SessionCatalog {
         })
         .map_err(|e| SqeError::execution_src(format!("Failed to serialize view commit: {e}"), e))?;
 
-        let url = self.view_url(namespace, name);
+        let url = self.view_url(namespace, name).await;
         debug!(url = %url, view = name, version = next_version_id, "Replacing view via Iceberg REST");
         self.rest_request(
             sqe_core::CatalogOp::Commit,
@@ -3418,7 +3446,7 @@ impl SessionCatalog {
     #[instrument(skip(self), fields(namespace = ?namespace, warehouse = %self.warehouse))]
     pub async fn list_views(&self, namespace: &NamespaceIdent) -> sqe_core::Result<Vec<String>> {
         self.require_rest_backend("list_views")?;
-        let url = self.views_url(namespace);
+        let url = self.views_url(namespace).await;
         let resp = self
             .rest_request(
                 sqe_core::CatalogOp::LoadView,
@@ -3452,7 +3480,7 @@ impl SessionCatalog {
         namespace: &NamespaceIdent,
         name: &str,
     ) -> sqe_core::Result<Option<iceberg::spec::ViewMetadata>> {
-        let url = self.view_url(namespace, name);
+        let url = self.view_url(namespace, name).await;
         let resp = match self
             .rest_request(
                 sqe_core::CatalogOp::LoadView,
@@ -3501,7 +3529,7 @@ impl SessionCatalog {
     #[instrument(skip(self), fields(namespace = ?namespace, view = %name, warehouse = %self.warehouse))]
     pub async fn drop_view(&self, namespace: &NamespaceIdent, name: &str) -> sqe_core::Result<()> {
         self.require_rest_backend("drop_view")?;
-        let url = self.view_url(namespace, name);
+        let url = self.view_url(namespace, name).await;
         debug!(url = %url, view = name, "Dropping view via Iceberg REST");
         self.rest_request(
             sqe_core::CatalogOp::DropView,
@@ -3539,7 +3567,7 @@ impl SessionCatalog {
         requirements: Vec<TableRequirement>,
     ) -> sqe_core::Result<()> {
         self.require_rest_backend("commit_schema_update")?;
-        let url = self.table_url(table_ident);
+        let url = self.table_url(table_ident).await;
 
         let body = serde_json::json!({
             "identifier": {
@@ -5910,20 +5938,22 @@ mod view_rest_tests {
         assert!(msg.contains("hive"), "{msg}");
     }
 
-    #[test]
-    fn rest_paths_are_percent_encoded() {
+    #[tokio::test]
+    async fn rest_paths_are_percent_encoded() {
         let session = SessionCatalog::for_test_with_backend(
             Arc::new(super::UnconfiguredCatalog),
             TableMetadataCache::new(0),
             "tok_paths",
         );
         let ns = NamespaceIdent::from_vec(vec!["a".to_string(), "b c".to_string()]).unwrap();
-        let url = session.view_url(&ns, "x/y?z%");
+        let url = session.view_url(&ns, "x/y?z%").await;
         assert_eq!(
             url,
             "http://127.0.0.1:1/v1/test-warehouse/namespaces/a%1Fb%20c/views/x%2Fy%3Fz%25"
         );
-        let table = session.table_url(&TableIdent::new(ns, "t".to_string()));
+        let table = session
+            .table_url(&TableIdent::new(ns, "t".to_string()))
+            .await;
         assert!(table.ends_with("/namespaces/a%1Fb%20c/tables/t"), "{table}");
     }
 
@@ -5980,7 +6010,15 @@ mod view_rest_tests {
             "create_view must be visible in the catalog latency histogram"
         );
 
-        let requests = server.received_requests().await.unwrap();
+        // The URL prefix comes from `GET /v1/config` (unmocked here, so the
+        // warehouse name stands in); the create is the only POST.
+        let requests: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method == wiremock::http::Method::POST)
+            .collect();
         assert_eq!(requests.len(), 1);
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(body["name"], "v");
@@ -6543,5 +6581,88 @@ mod vended_credentials_rest_tests {
         session.load_table_uncached(&orders()).await.unwrap();
         let after = loads(&server.received_requests().await.unwrap());
         assert_eq!(after, before + 1);
+    }
+}
+
+/// Raw REST calls address the `{prefix}` the server advertised, not the
+/// warehouse name (#873): Nessie answers `main%7Cwarehouse`, and the old
+/// `/v1/{warehouse}/...` HEAD got a 400 that read as access denied.
+#[cfg(test)]
+mod rest_prefix_tests {
+    use iceberg::{NamespaceIdent, TableIdent};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::SessionCatalog;
+
+    fn events() -> TableIdent {
+        TableIdent::new(
+            NamespaceIdent::new("demo".to_string()),
+            "events".to_string(),
+        )
+    }
+
+    /// A catalog whose config answers `overrides`, and a 204 table HEAD
+    /// under `table_path`.
+    async fn server_with(overrides: serde_json::Value, table_path: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "defaults": {}, "overrides": overrides
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path(table_path))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path("/v1/warehouse/namespaces/demo/tables/events"))
+            .respond_with(ResponseTemplate::new(400))
+            .expect(0)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn session(server: &MockServer, token: &str) -> SessionCatalog {
+        let cfg: sqe_core::config::CatalogConfig = toml::from_str(&format!(
+            "catalog_url = \"{}\"\nwarehouse = \"warehouse\"",
+            server.uri()
+        ))
+        .unwrap();
+        SessionCatalog::for_session_with(&cfg, &Default::default(), None, token)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn access_check_uses_the_advertised_prefix_verbatim() {
+        // Already percent-encoded on the wire; wiremock matches the raw path.
+        let server = server_with(
+            serde_json::json!({"prefix": "main%7Cwarehouse"}),
+            "/v1/main%7Cwarehouse/namespaces/demo/tables/events",
+        )
+        .await;
+        session(&server, "tok-prefix")
+            .await
+            .authorize_table_access(&events())
+            .await
+            .expect("HEAD under the advertised prefix");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn no_advertised_prefix_means_no_segment() {
+        let server = server_with(serde_json::json!({}), "/v1/namespaces/demo/tables/events").await;
+        session(&server, "tok-noprefix")
+            .await
+            .authorize_table_access(&events())
+            .await
+            .expect("HEAD without a prefix segment");
+        server.verify().await;
     }
 }
