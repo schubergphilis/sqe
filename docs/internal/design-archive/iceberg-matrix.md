@@ -2,9 +2,9 @@
 
 Current state of SQE against the [icebergmatrix.org](https://icebergmatrix.org) rubric, the de-facto reference engineers consult when picking an Iceberg engine. Data lives at [Neuw84/iceberg-matrix](https://github.com/Neuw84/iceberg-matrix).
 
-**Score: 147/162 (90.7%)**  |  **Stretch: 170/189 (90%)**
+**Score: 150/162 (92.6%)**  |  **Stretch: 170/189 (90%)**
 
-Last generated: 2026-10-18T00:00:00Z  |  Source: `Rescore against the pinned upstream rubric; evidence paths repaired after the crate and test moves. 2026-10-18: unknown-type and shredded-variant measured against Spark 4.1 + Iceberg 1.12.`
+Last generated: 2026-10-21T00:00:00Z  |  Source: `Rescore against the pinned upstream rubric; evidence paths repaired after the crate and test moves. 2026-10-18: unknown-type and shredded-variant measured against Spark 4.1 + Iceberg 1.12. 2026-10-20: merge-on-read deletes, deletion vectors and row lineage read back by Spark 4.1 + Iceberg 1.12 (mor_spark_interop); stub evidence removed. 2026-10-21: SQE writes shredded variants (write.parquet.shred-variants), read back by Spark 4.1 + Iceberg 1.12; shredded-variant:v3 to full. unknown-type:v3 to full: nested shapes measured against Iceberg Java (same refusals), promotion rules enforced.`
 
 Regenerate: `python3 scripts/render-iceberg-matrix.py`. Source of truth: `docs/evidence/iceberg-matrix-state.json`.
 
@@ -32,7 +32,7 @@ Each feature is scored against V2 and V3 of the Iceberg spec (63 cells total). A
 | AWS EMR (Spark 7.12) | 180/189 | 95 |
 | OSS Spark 4.1 | 175/189 | 93 |
 | OSS Flink 2.2 | 153/189 | 81 |
-| **SQE (current)** | **147/162** | **90.7** |
+| **SQE (current)** | **150/162** | **92.6** |
 | Snowflake | 134/189 | 71 |
 | PyIceberg 0.11 | 130/189 | 69 |
 | Databricks DBR 17.3 | 103/189 | 54 |
@@ -52,8 +52,8 @@ Peer scores from icebergmatrix.org as of 2026-04-29.
 | Feature | V2 | V3 | V2 notes | V3 notes |
 |---|:---:|:---:|---|---|
 | Position Deletes | F | - | MoR DELETE on a V2 table without identifier fields writes position-delete files (PositionDeleteFileWriter) and commits a RowDelta; data file |  |
-| Equality Deletes | F | F | DELETE with write.delete.mode=merge-on-read writes equality-delete files via EqualityDeleteFileWriter and commits through RowDeltaAction. Un | MoR UPDATE on a V3 table with a declared identifier field commits the new data file and an equality-delete file in one RowDelta; the SELECT  |
-| Merge-on-Read | F | F | All three DML kinds (DELETE, UPDATE, MERGE) route through RowDeltaAction when write.*.mode = merge-on-read. UPDATE emits one data file per b | MoR DELETE on a V3 table writes deletion vectors (never position-delete files); MoR UPDATE / MERGE write data plus equality deletes in one R |
+| Equality Deletes | F | F | On a table with identifier fields, merge-on-read DELETE, UPDATE and MERGE write equality-delete files (EqualityDeleteFileWriter) and commit  | Same as V2 on a V3 table: keyed merge-on-read DELETE, UPDATE and MERGE write equality-delete files in one RowDelta (summary asserts added-eq |
+| Merge-on-Read | F | F | DELETE, UPDATE and MERGE route through RowDeltaAction when write.*.mode = merge-on-read. With identifier fields, UPDATE writes a data file p | MoR DELETE on a V3 table writes deletion vectors (never position-delete files); with identifier fields DELETE, UPDATE and MERGE write equali |
 | Copy-on-Write | F | F | DELETE / UPDATE / MERGE in copy-on-write mode (the default) rewrite the affected files through ReplaceFilesAction. | DELETE on a V3 table without a declared MoR property runs CoW: rewrites the matched files via RewriteFilesAction, drops the row from subsequ |
 
 ### Table management
@@ -61,12 +61,12 @@ Peer scores from icebergmatrix.org as of 2026-04-29.
 | Feature | V2 | V3 | V2 notes | V3 notes |
 |---|:---:|:---:|---|---|
 | Schema Evolution | F | F | ADD/DROP/RENAME COLUMN, SET/DROP NOT NULL (Step 7.3). | ALTER TABLE ADD COLUMN ... DEFAULT on a V3 table commits write_default and initial_default; rows written before the ALTER read the initial d |
-| Type Promotion / Widening | F | F | int->long, float->double, decimal widening. | ALTER TABLE ... ALTER COLUMN ... SET DATA TYPE widens columns on V3 tables (verified int -> bigint). The new type surfaces through informati |
+| Type Promotion / Widening | F | F | ALTER COLUMN ... SET DATA TYPE accepts int->long, float->double and decimal precision widening, refuses every other change before commit, an | ALTER TABLE ... ALTER COLUMN ... SET DATA TYPE widens columns on V3 tables (int -> bigint, real -> double, decimal precision widening, unkno |
 | Column Default Values | n/a | F | V3-only feature | CREATE TABLE ... DEFAULT <literal> and ALTER TABLE ADD COLUMN ... DEFAULT set write_default and initial_default. INSERT with a column list a |
 | Table Creation | F | F | CREATE TABLE, CTAS streaming. | CREATE TABLE is V3 when a column needs it (TIMESTAMP_NS, VARIANT, DEFAULT), when asked with WITH ('format-version' = '3') / TBLPROPERTIES, o |
 | Time Travel / Snapshots | F | F | FOR SYSTEM_TIME AS OF + 6 metadata TVFs (Step 8c). | FOR VERSION AS OF works end-to-end on V3 tables: the classifier strips the clause, apply_version_spec registers a snapshot-pinned provider u |
 | Table Maintenance | F | F | All four CALL system.* procedures ship with both parser unit tests and live e2e tests that go through docker-compose.test.yml (Polaris + Rus | CALL system.rewrite_data_files merges files on V3 tables with real Parquet re-encoding; row count preserved, file count drops, snapshot log  |
-| Branching & Tagging | F | F | ALTER TABLE CREATE/DROP BRANCH and TAG with retention options, SET WRITE_BRANCH routes INSERT / DELETE / UPDATE to a branch, FOR VERSION AS  | Same transaction actions apply to V3 tables; ref semantics are format-version agnostic. |
+| Branching & Tagging | F | F | ALTER TABLE CREATE/DROP BRANCH and TAG with retention options, SET WRITE_BRANCH routes INSERT / DELETE / UPDATE to a branch, FOR VERSION AS  | Same transaction actions apply to V3 tables: on a format-version 3 table, SET WRITE_BRANCH routes INSERT / DELETE / UPDATE to a branch and F |
 
 ### Partitioning
 
@@ -85,7 +85,7 @@ Peer scores from icebergmatrix.org as of 2026-04-29.
 | Write (MERGE/UPDATE/DELETE) | F | F | DELETE, UPDATE and MERGE INTO in copy-on-write or merge-on-read mode. | DELETE (CoW, and MoR via deletion vectors), UPDATE (CoW and MoR equality) and MERGE INTO commit on V3 tables; each path has a V3 e2e test. |
 | Catalog Integration | F | F | Iceberg REST (Polaris primary; Nessie, Glue / S3 Tables REST, Unity), native Glue and S3 Tables SDKs, HMS, JDBC and a read-only Hadoop backe | V3 tables created by SQE materialise correctly in the Iceberg REST catalog: CREATE/INSERT/UPDATE/DELETE all commit, table metadata reloads c |
 | Statistics (Column Metrics) | F | F | Manifest column metrics drive pruning and planning; writers emit them; optional Puffin NDV sidecars are written and consumed (query.puffin_s | SHOW STATS FOR works on V3 tables, returning per-column metrics from the active snapshot. Same DataFusion + iceberg-rust scan path as V2; V3 |
-| Bloom Filters & Puffin | F | F | Every data-file write path builds WriterProperties through build_writer_props, which emits Parquet bloom filters; the footer test re-reads t | Same writer helper as V2; the bloom property round-trips through Polaris on a V3 table. |
+| Bloom Filters & Puffin | F | F | Every data-file write path builds WriterProperties through build_writer_props, which emits Parquet bloom filters; the footer test re-reads t | Same writer helper as V2; the bloom property round-trips through Polaris on a V3 table, and an SQE INSERT into a V3 table Spark configured w |
 
 ### Catalog support
 
@@ -105,8 +105,8 @@ Peer scores from icebergmatrix.org as of 2026-04-29.
 
 | Feature | V2 | V3 | V2 notes | V3 notes |
 |---|:---:|:---:|---|---|
-| Variant | n/a | P | V3-only feature | VARIANT columns (and JSON columns on V3 tables) store Iceberg variant, unshredded. JSON text is parsed on write (invalid JSON fails the writ |
-| Shredded Variant | n/a | P | V3-only feature | SQE reads shredded variant files: Spark 4.1 + Iceberg 1.12 writes a table with write.parquet.shred-variants=true (the test asserts typed_val |
+| Variant | n/a | F | V3-only feature | VARIANT columns (and JSON columns on V3 tables) store Iceberg variant, unshredded. JSON text is parsed on write (invalid JSON fails the writ |
+| Shredded Variant | n/a | F | V3-only feature | SQE reads and writes shredded variant files. Read: Spark 4.1 + Iceberg 1.12 writes a table with write.parquet.shred-variants=true (the test  |
 | Geometry | n/a | . | V3-only feature | No GEOMETRY / GEOGRAPHY type in SQE DDL or the read path. |
 | Vector / Embedding | - | - |  |  |
 | Nanosecond Timestamps | n/a | F | V3-only feature | TIMESTAMP_NS(N) / TIMESTAMPTZ_NS(N) map to Iceberg timestamp_ns / timestamptz_ns and to Arrow nanosecond timestamps; CREATE, INSERT and SELE |
@@ -133,12 +133,6 @@ Cells marked `partial` or `unknown` have specific gaps documented in `docs/evide
 - **google-lakehouse (v2)**: Iceberg data on GCS (gs://) through the table FileIO and Google OAuth for the REST endpoint are not verified.
 - **google-lakehouse (v3)**: Inferred from generic Iceberg REST catalog support; not measured against Google Lakehouse.
 - **google-lakehouse (v3)**: Iceberg data on GCS (gs://) through the table FileIO and Google OAuth for the REST endpoint are not verified.
-- **variant-type (v3)**: Field access goes through the variant's JSON text (json_* functions); no variant_get / typed path access yet.
-- **variant-type (v3)**: Compaction of a variant table is untested.
-- **shredded-variant (v3)**: Read-only: SQE writes unshredded variants and ignores write.parquet.shred-variants.
-- **shredded-variant (v3)**: Shredded columns are unshredded on read, so typed_value gives no pruning or typed field access.
-- **unknown-type (v3)**: Nested unknown fields (STRUCT<a INT, u VOID>) are not supported: SQE cannot read a Spark table with one, and refuses to write one.
-- **unknown-type (v3)**: information_schema reports the Arrow type name Null, not unknown.
 
 ---
 
