@@ -400,6 +400,24 @@ pub enum SqlBindStyle {
     QMark,
 }
 
+/// Run a `CREATE TABLE IF NOT EXISTS` for a catalog table.
+///
+/// SQE PATCH (sqe#872): Postgres can fail one of two concurrent
+/// `CREATE TABLE IF NOT EXISTS` for the same table (unique violation on
+/// `pg_type`), and SQE builds a catalog per session, so the first sessions
+/// against an empty database raced. The error only counts when the table
+/// still does not exist afterwards.
+async fn create_table_if_missing(pool: &AnyPool, table: &str, ddl: String) -> Result<()> {
+    let Err(e) = sqlx::query(AssertSqlSafe(ddl)).execute(pool).await else {
+        return Ok(());
+    };
+    let probe = format!("SELECT 1 FROM {table} LIMIT 0");
+    match sqlx::query(AssertSqlSafe(probe)).fetch_all(pool).await {
+        Ok(_) => Ok(()),
+        Err(_) => Err(from_sqlx_error(e).with_context("table", table)),
+    }
+}
+
 impl SqlCatalog {
     /// Create new sql catalog instance
     async fn new(
@@ -429,8 +447,11 @@ impl SqlCatalog {
             .await
             .map_err(from_sqlx_error)?;
 
-        sqlx::query(AssertSqlSafe(format!(
-            "CREATE TABLE IF NOT EXISTS {CATALOG_TABLE_NAME} (
+        create_table_if_missing(
+            &pool,
+            CATALOG_TABLE_NAME,
+            format!(
+                "CREATE TABLE IF NOT EXISTS {CATALOG_TABLE_NAME} (
                 {CATALOG_FIELD_CATALOG_NAME} VARCHAR(255) NOT NULL,
                 {CATALOG_FIELD_TABLE_NAMESPACE} VARCHAR(255) NOT NULL,
                 {CATALOG_FIELD_TABLE_NAME} VARCHAR(255) NOT NULL,
@@ -438,22 +459,23 @@ impl SqlCatalog {
                 {CATALOG_FIELD_PREVIOUS_METADATA_LOCATION_PROP} VARCHAR(1000),
                 {CATALOG_FIELD_RECORD_TYPE} VARCHAR(5),
                 PRIMARY KEY ({CATALOG_FIELD_CATALOG_NAME}, {CATALOG_FIELD_TABLE_NAMESPACE}, {CATALOG_FIELD_TABLE_NAME}))"
-        )))
-        .execute(&pool)
-        .await
-        .map_err(from_sqlx_error)?;
+            ),
+        )
+        .await?;
 
-        sqlx::query(AssertSqlSafe(format!(
-            "CREATE TABLE IF NOT EXISTS {NAMESPACE_TABLE_NAME} (
+        create_table_if_missing(
+            &pool,
+            NAMESPACE_TABLE_NAME,
+            format!(
+                "CREATE TABLE IF NOT EXISTS {NAMESPACE_TABLE_NAME} (
                 {CATALOG_FIELD_CATALOG_NAME} VARCHAR(255) NOT NULL,
                 {NAMESPACE_FIELD_NAME} VARCHAR(255) NOT NULL,
                 {NAMESPACE_FIELD_PROPERTY_KEY} VARCHAR(255),
                 {NAMESPACE_FIELD_PROPERTY_VALUE} VARCHAR(1000),
                 PRIMARY KEY ({CATALOG_FIELD_CATALOG_NAME}, {NAMESPACE_FIELD_NAME}, {NAMESPACE_FIELD_PROPERTY_KEY}))"
-        )))
-        .execute(&pool)
-        .await
-        .map_err(from_sqlx_error)?;
+            ),
+        )
+        .await?;
 
         let detected_schema_version = SchemaVersion::detect(&pool).await?;
         let expected_schema_version = properties.schema_version;
