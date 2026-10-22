@@ -26,6 +26,8 @@ use crate::spec::DataFileBuilder;
 
 mod parquet_writer;
 pub use parquet_writer::{ParquetWriter, ParquetWriterBuilder};
+// SQE PATCH (v3-shredded-variant)
+mod variant_shred;
 
 use crate::io::OutputFile;
 

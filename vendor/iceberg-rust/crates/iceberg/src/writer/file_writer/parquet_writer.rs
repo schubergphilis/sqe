@@ -34,6 +34,7 @@ use parquet::file::properties::{CdcOptions, WriterProperties};
 use parquet::file::statistics::Statistics;
 
 use super::{FileWriter, FileWriterBuilder};
+use super::variant_shred::VariantShredder;
 use crate::arrow::{
     ArrowFileReader, DEFAULT_MAP_FIELD_NAME, FieldMatchMode, NanValueCountVisitor,
     get_parquet_stat_max_as_datum, get_parquet_stat_min_as_datum,
@@ -60,6 +61,8 @@ pub struct ParquetWriterBuilder {
     schema: SchemaRef,
     match_mode: FieldMatchMode,
     encryption_manager: Option<Arc<EncryptionManager>>,
+    /// SQE PATCH (v3-shredded-variant): shred top-level variant columns.
+    shred_variants: bool,
 }
 
 impl ParquetWriterBuilder {
@@ -85,7 +88,16 @@ impl ParquetWriterBuilder {
             schema,
             match_mode,
             encryption_manager: None,
+            shred_variants: false,
         }
+    }
+
+    /// SQE PATCH (v3-shredded-variant): shred top-level variant columns into
+    /// `typed_value`, as the table property `write.parquet.shred-variants`
+    /// asks. The shredding schema is inferred per file from its first batch.
+    pub fn with_shred_variants(mut self, shred_variants: bool) -> Self {
+        self.shred_variants = shred_variants;
+        self
     }
 
     fn add_iceberg_schema_metadata(props: WriterProperties, schema: &Schema) -> WriterProperties {
@@ -194,6 +206,8 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             nan_value_count_visitor: NanValueCountVisitor::new_with_match_mode(self.match_mode),
             key_metadata,
             prune_unknown: false,
+            shred_variants: self.shred_variants,
+            shredder: None,
         })
     }
 }
@@ -216,6 +230,11 @@ struct IndexByParquetPathName {
     /// column. See the statistics loop in `to_data_file_builder`.
     variant_field_ids: HashSet<i32>,
 
+    /// SQE PATCH (v3-shredded-variant): `<variant path>.typed_value.` and
+    /// the variant's field id, so a shredded variant's size counts its
+    /// `typed_value` leaves.
+    typed_value_prefixes: Vec<(String, i32)>,
+
     field_names: Vec<String>,
 
     field_id: i32,
@@ -227,6 +246,7 @@ impl IndexByParquetPathName {
         Self {
             name_to_id: HashMap::new(),
             variant_field_ids: HashSet::new(),
+            typed_value_prefixes: Vec::new(),
             field_names: Vec::new(),
             field_id: 0,
         }
@@ -235,6 +255,15 @@ impl IndexByParquetPathName {
     /// Retrieves the internal field ID
     pub fn get(&self, name: &str) -> Option<&i32> {
         self.name_to_id.get(name)
+    }
+
+    /// SQE PATCH (v3-shredded-variant): the variant whose `typed_value`
+    /// holds the leaf at `name`.
+    fn typed_value_owner(&self, name: &str) -> Option<i32> {
+        self.typed_value_prefixes
+            .iter()
+            .find(|(prefix, _)| name.starts_with(prefix.as_str()))
+            .map(|(_, id)| *id)
     }
 
     /// Whether `field_id` is a variant column, i.e. one whose statistics come from two physical
@@ -272,6 +301,8 @@ impl IndexByParquetPathName {
     fn insert_current_variant_path(&mut self) -> Result<()> {
         let base = self.current_path();
         self.variant_field_ids.insert(self.field_id);
+        self.typed_value_prefixes
+            .push((format!("{base}.typed_value."), self.field_id));
         self.insert_path(format!("{base}.{VARIANT_METADATA_LEAF}"))?;
         self.insert_path(format!("{base}.{VARIANT_VALUE_LEAF}"))
     }
@@ -373,6 +404,10 @@ pub struct ParquetWriter {
     /// SQE PATCH (v3-unknown): true when the schema holds an `unknown`
     /// field at any depth; every batch is then pruned before it is written.
     prune_unknown: bool,
+    /// SQE PATCH (v3-shredded-variant): whether to shred variant columns,
+    /// and the shredding chosen from the file's first batch.
+    shred_variants: bool,
+    shredder: Option<VariantShredder>,
 }
 
 /// SQE PATCH (v3-unknown): the spec never writes a V3 `unknown` field to a
@@ -730,6 +765,12 @@ impl ParquetWriter {
                     let parquet_path = column_chunk_metadata.column_descr().path().string();
 
                     let Some(&field_id) = index_by_parquet_path.get(&parquet_path) else {
+                        // SQE PATCH (v3-shredded-variant): a shredded leaf
+                        // adds to its variant's size and nothing else.
+                        if let Some(id) = index_by_parquet_path.typed_value_owner(&parquet_path) {
+                            *per_col_size.entry(id).or_insert(0) +=
+                                column_chunk_metadata.compressed_size() as u64;
+                        }
                         continue;
                     };
 
@@ -934,11 +975,26 @@ impl FileWriter for ParquetWriter {
                 // SQE PATCH (v3-unknown): `unknown` fields, top-level or
                 // nested, are left out of the file; readers fill them with
                 // NULLs.
-                if schema.fields().iter().any(|f| contains_null(f.data_type())) {
-                    self.prune_unknown = true;
-                    Arc::new(prune_unknown_schema(&schema)?.with_metadata(metadata))
-                } else {
-                    Arc::new(schema.with_metadata(metadata))
+                let arrow_schema =
+                    if schema.fields().iter().any(|f| contains_null(f.data_type())) {
+                        self.prune_unknown = true;
+                        Arc::new(prune_unknown_schema(&schema)?.with_metadata(metadata))
+                    } else {
+                        Arc::new(schema.with_metadata(metadata))
+                    };
+                // SQE PATCH (v3-shredded-variant): the file is written with
+                // the shredded variant types its first batch chose.
+                if self.shred_variants {
+                    let first = if self.prune_unknown {
+                        prune_unknown_batch(batch)?
+                    } else {
+                        batch.clone()
+                    };
+                    self.shredder = VariantShredder::infer(&arrow_schema, &first)?;
+                }
+                match &self.shredder {
+                    Some(shredder) => shredder.schema(),
+                    None => arrow_schema,
                 }
             };
             let inner_writer = self.output_file.writer().await?;
@@ -962,6 +1018,14 @@ impl FileWriter for ParquetWriter {
             &pruned
         } else {
             batch
+        };
+        let shredded;
+        let batch = match &self.shredder {
+            Some(shredder) => {
+                shredded = shredder.shred(batch)?;
+                &shredded
+            }
+            None => batch,
         };
         writer.write(batch).await.map_err(|err| {
             Error::new(

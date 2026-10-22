@@ -164,23 +164,7 @@ async fn sqe_reads_a_spark_shredded_variant_table() {
     let files = spark_rows(&format!("SELECT file_path FROM rest.{fq}.files"));
     let mut shredded = false;
     for path in &files {
-        let (bucket, key) = split_s3(path);
-        let store = test_store(&bucket);
-        let bytes = store
-            .get(&object_store::path::Path::from(key.as_str()))
-            .await
-            .expect("get data file")
-            .bytes()
-            .await
-            .expect("read data file");
-        let reader = parquet::file::serialized_reader::SerializedFileReader::new(bytes)
-            .expect("parquet footer");
-        let schema = parquet::file::reader::FileReader::metadata(&reader)
-            .file_metadata()
-            .schema_descr()
-            .root_schema()
-            .clone();
-        shredded |= format!("{schema:?}").contains("typed_value");
+        shredded |= parquet_schema(path).await.contains("typed_value");
     }
 
     let (session, handler) = crate::common::setup_handler().await;
@@ -206,6 +190,123 @@ async fn sqe_reads_a_spark_shredded_variant_table() {
         ],
         "SQE's rows of the shredded Spark-written V3 table"
     );
+}
+
+/// SQE writes shredded variants when the table sets
+/// `write.parquet.shred-variants` (#858). Each data file infers its own
+/// shredding from its first batch, so the second INSERT shreds `a` as a
+/// string where the first shredded it as an integer. Spark 4.1 and SQE read
+/// every value back unchanged, and `rewrite_data_files` keeps the shredding.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn spark_reads_an_sqe_shredded_variant_table() {
+    if let Some(reason) = spark_stack_skip_reason() {
+        eprintln!("skipping spark_reads_an_sqe_shredded_variant_table: {reason}");
+        return;
+    }
+    let (session, handler) = crate::common::setup_handler().await;
+    let fq = "default.variant_shredded_to_spark";
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+    for sql in [
+        format!(
+            "CREATE TABLE {fq} (id INT, j JSON) \
+             WITH ('write.parquet.shred-variants' = 'true')"
+        ),
+        format!(
+            r#"INSERT INTO {fq} VALUES
+                 (1, '{{"a": 1, "s": "x", "o": {{"b": true}}}}'),
+                 (2, '{{"a": 2, "s": "y", "extra": [1, 2]}}'),
+                 (3, '[1, 2]'),
+                 (4, NULL)"#
+        ),
+        format!(r#"INSERT INTO {fq} VALUES (5, '{{"a": "five", "s": "z"}}')"#),
+    ] {
+        handler.execute(&session, &sql, None).await.expect(&sql);
+    }
+
+    let files = sqe_rows(
+        &handler,
+        &session,
+        "SELECT file_path FROM table_files('default', 'variant_shredded_to_spark')",
+    )
+    .await;
+    let mut unshredded = Vec::new();
+    for path in &files {
+        if !parquet_schema(path).await.contains("typed_value") {
+            unshredded.push(path.clone());
+        }
+    }
+
+    let want = vec![
+        r#"1|{"a":1,"o":{"b":true},"s":"x"}|1|true"#.to_string(),
+        r#"2|{"a":2,"extra":[1,2],"s":"y"}|2|NULL"#.to_string(),
+        "3|[1,2]|NULL|NULL".to_string(),
+        "4|NULL|NULL|NULL".to_string(),
+        r#"5|{"a":"five","s":"z"}|NULL|NULL"#.to_string(),
+    ];
+    let spark = spark_rows(&format!(
+        "SELECT id, to_json(j), try_variant_get(j, '$.a', 'int'), \
+                variant_get(j, '$.o.b', 'boolean') \
+         FROM rest.{fq} ORDER BY id"
+    ));
+    let sqe_sql = format!(
+        "SELECT id, j, json_get_int(j, 'a'), json_get_bool(j, 'o', 'b') FROM {fq} ORDER BY id"
+    );
+    let sqe = sqe_rows(&handler, &session, &sqe_sql).await;
+
+    handler
+        .execute(
+            &session,
+            &format!("CALL system.rewrite_data_files(table => '{fq}', min_input_files => 2)"),
+            None,
+        )
+        .await
+        .expect("rewrite_data_files on a shredded variant table");
+    let rewritten = sqe_rows(
+        &handler,
+        &session,
+        "SELECT file_path FROM table_files('default', 'variant_shredded_to_spark')",
+    )
+    .await;
+    let mut rewritten_shredded = true;
+    for path in &rewritten {
+        rewritten_shredded &= parquet_schema(path).await.contains("typed_value");
+    }
+    let after = sqe_rows(&handler, &session, &sqe_sql).await;
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+
+    assert_eq!(files.len(), 2, "one data file per INSERT: {files:?}");
+    assert!(unshredded.is_empty(), "not shredded: {unshredded:?}");
+    assert_eq!(spark, want, "Spark's rows of the shredded SQE table");
+    assert_eq!(sqe, want, "SQE's rows of its shredded table");
+    assert_eq!(rewritten.len(), 1, "the two files merge: {rewritten:?}");
+    assert!(rewritten_shredded, "the rewrite shreds: {rewritten:?}");
+    assert_eq!(after, want, "rows after rewrite_data_files");
+}
+
+/// The Parquet schema of the data file at `path`, as debug text.
+async fn parquet_schema(path: &str) -> String {
+    let (bucket, key) = split_s3(path);
+    let store = test_store(&bucket);
+    let bytes = store
+        .get(&object_store::path::Path::from(key.as_str()))
+        .await
+        .expect("get data file")
+        .bytes()
+        .await
+        .expect("read data file");
+    let reader =
+        parquet::file::serialized_reader::SerializedFileReader::new(bytes).expect("parquet footer");
+    let schema = parquet::file::reader::FileReader::metadata(&reader)
+        .file_metadata()
+        .schema_descr()
+        .root_schema()
+        .clone();
+    format!("{schema:?}")
 }
 
 /// A plain client on the test stack's RustFS, independent of SQE's reader.

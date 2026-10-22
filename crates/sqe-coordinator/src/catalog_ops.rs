@@ -821,12 +821,25 @@ impl CatalogOps {
                         ),
                         AlterColumnOperation::SetDataType { data_type, .. } => {
                             let arrow_type = sql_type_to_arrow(data_type)?;
+                            if !old_field.field_type.is_primitive() || arrow_type.is_nested() {
+                                return Err(SqeError::with_code(
+                                    SqeErrorCode::ExecutionFailed,
+                                    format!(
+                                        "Cannot change column '{col}' from {} to {data_type}: \
+                                         SET DATA TYPE promotes a primitive column to a \
+                                         primitive type",
+                                        old_field.field_type
+                                    ),
+                                ));
+                            }
                             let iceberg_type = iceberg::arrow::arrow_type_to_type(&arrow_type)
                                 .map_err(|e| {
-                                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                                        "Cannot convert type for column '{col}': {e}"
-                                    ))
+                                    SqeError::with_code(
+                                        SqeErrorCode::ExecutionFailed,
+                                        format!("Cannot convert type for column '{col}': {e}"),
+                                    )
                                 })?;
+                            check_type_promotion(col, &old_field.field_type, &iceberg_type)?;
                             NestedField::new(
                                 old_field.id,
                                 old_field.name.clone(),
@@ -2075,6 +2088,47 @@ fn remove_struct_subfield(
     Ok(Some(StructType::new(new_fields)))
 }
 
+/// Refuse a column type change the Iceberg spec does not allow as a
+/// promotion. Existing data files keep their old type, so any other change
+/// leaves every scan of the table failing. Allowed: the same type, int to
+/// long, float to double, a decimal to a wider precision with the same
+/// scale, and (V3) unknown to any primitive type.
+fn check_type_promotion(
+    column: &str,
+    from: &iceberg::spec::Type,
+    to: &iceberg::spec::Type,
+) -> sqe_core::Result<()> {
+    use iceberg::spec::{PrimitiveType as P, Type};
+
+    let allowed = match (from, to) {
+        _ if from == to => true,
+        (Type::Primitive(from), Type::Primitive(to)) => {
+            matches!(
+                (from, to),
+                (P::Unknown, _) | (P::Int, P::Long) | (P::Float, P::Double)
+            ) || matches!(
+                (from, to),
+                (
+                    P::Decimal { precision: p, scale: s },
+                    P::Decimal { precision: p2, scale: s2 },
+                ) if p2 > p && s2 == s
+            )
+        }
+        _ => false,
+    };
+    if allowed {
+        return Ok(());
+    }
+    Err(SqeError::with_code(
+        SqeErrorCode::ExecutionFailed,
+        format!(
+            "Cannot change column '{column}' from {from} to {to}: Iceberg only allows int to \
+         bigint, float to double, a decimal to a wider precision with the same scale, and \
+         unknown to a primitive type"
+        ),
+    ))
+}
+
 /// Return the per-key async lock, creating it on first use.
 ///
 /// The `std::Mutex` guards only the map insert/lookup and is dropped before the
@@ -2605,5 +2659,43 @@ mod tests {
         let qualified = TableRef::parse("sales.orders").unwrap();
         let ident = table_ref_to_ident(&qualified, &session);
         assert_eq!(ident.namespace().to_string(), "sales");
+    }
+
+    #[test]
+    fn type_promotion_follows_the_iceberg_spec() {
+        use iceberg::spec::{PrimitiveType as P, Type};
+        let t = |p: P| Type::Primitive(p);
+        let dec = |precision, scale| t(P::Decimal { precision, scale });
+        let allowed = [
+            (t(P::Int), t(P::Long)),
+            (t(P::Float), t(P::Double)),
+            (dec(10, 2), dec(12, 2)),
+            (t(P::Unknown), t(P::String)),
+            (t(P::Unknown), t(P::Int)),
+            (t(P::String), t(P::String)),
+        ];
+        for (from, to) in allowed {
+            assert!(
+                check_type_promotion("c", &from, &to).is_ok(),
+                "{from} -> {to}"
+            );
+        }
+        let refused = [
+            (t(P::String), t(P::Int)),
+            (t(P::Long), t(P::Int)),
+            (t(P::Int), t(P::String)),
+            (t(P::Double), t(P::Float)),
+            (dec(10, 2), dec(8, 2)),
+            (dec(10, 2), dec(12, 3)),
+            (t(P::Date), t(P::Timestamp)),
+            (t(P::Int), t(P::Unknown)),
+        ];
+        for (from, to) in refused {
+            let err = check_type_promotion("c", &from, &to).expect_err("refused");
+            assert!(
+                err.to_string().contains("Cannot change column 'c'"),
+                "{err}"
+            );
+        }
     }
 }
