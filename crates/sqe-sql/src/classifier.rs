@@ -152,6 +152,14 @@ pub enum StatementKind {
         path: Vec<String>,
         if_exists: bool,
     },
+    /// ALTER TABLE t ALTER COLUMN a.b [SET DATA] TYPE T — promote a nested
+    /// struct member. sqlparser rejects the dotted name like it does for
+    /// DROP COLUMN, so it is detected the same way. (#859)
+    AlterNestedColumnType {
+        table: String,
+        path: Vec<String>,
+        data_type: sqlparser::ast::DataType,
+    },
     /// TRUNCATE TABLE name — routes to DELETE FROM without WHERE
     Truncate(String),
     /// ANALYZE [catalog.][schema.]table [WITH (...)] — Trino table-statistics
@@ -300,6 +308,7 @@ impl StatementKind {
             StatementKind::ShowCreateTable(_) => "showcreatetable",
             StatementKind::ShowCreateSchema(_) => "showcreateschema",
             StatementKind::DropNestedColumn { .. } => "dropnestedcolumn",
+            StatementKind::AlterNestedColumnType { .. } => "alternestedcolumntype",
             StatementKind::Truncate(_) => "truncate",
             StatementKind::Analyze(_) => "analyze",
             StatementKind::Call(_) => "call",
@@ -446,6 +455,7 @@ impl StatementKind {
             StatementKind::Rollback => U::Rollback,
             StatementKind::Use(_) | StatementKind::SetCatalog(_) => U::Use,
             StatementKind::DropNestedColumn { .. }
+            | StatementKind::AlterNestedColumnType { .. }
             | StatementKind::RefDdl(_)
             | StatementKind::PartitionEvolution(_)
             | StatementKind::IdentifierFields(_)
@@ -559,6 +569,56 @@ fn detect_nested_drop_column(trimmed: &str) -> Option<(String, Vec<String>, bool
         return None;
     }
     Some((table_ref.to_string(), path, if_exists))
+}
+
+/// Detect `ALTER TABLE <table> ALTER COLUMN <a.b[.c]> [SET DATA] TYPE <type>`
+/// (a nested struct-member type change) and return the raw table reference,
+/// the dot-split member path and the parsed type. Returns `None` for a
+/// non-dotted column, which sqlparser handles. (#859)
+fn detect_nested_alter_column_type(
+    trimmed: &str,
+) -> sqe_core::Result<Option<(String, Vec<String>, sqlparser::ast::DataType)>> {
+    let upper = trimmed.to_ascii_uppercase();
+    let Some(idx) = upper.find("ALTER COLUMN") else {
+        return Ok(None);
+    };
+    let Some(table_ref) = strip_prefix_ci(trimmed[..idx].trim(), "ALTER TABLE") else {
+        return Ok(None);
+    };
+    let table_ref = strip_prefix_ci(table_ref.trim_start(), "IF EXISTS")
+        .unwrap_or(table_ref)
+        .trim();
+    let after = trimmed[idx + "ALTER COLUMN".len()..].trim_start();
+    let end = after.find(char::is_whitespace).unwrap_or(after.len());
+    let path_str = &after[..end];
+    if table_ref.is_empty() || !path_str.contains('.') {
+        return Ok(None);
+    }
+    let rest = after[end..].trim_start();
+    let Some(type_sql) =
+        strip_prefix_ci(rest, "SET DATA TYPE ").or_else(|| strip_prefix_ci(rest, "TYPE "))
+    else {
+        return Ok(None);
+    };
+    let path: Vec<String> = path_str
+        .split('.')
+        .map(|s| s.trim().trim_matches('"').to_string())
+        .collect();
+    if path.iter().any(String::is_empty) {
+        return Ok(None);
+    }
+    let type_sql = type_sql.trim().trim_end_matches(';');
+    let parse_error = crate::token_scan::parse_error;
+    let mut parser = Parser::new(&GenericDialect {})
+        .try_with_sql(type_sql)
+        .map_err(parse_error)?;
+    let data_type = parser.parse_data_type().map_err(parse_error)?;
+    if parser.peek_token().token != Token::EOF {
+        return Err(parse_error(ParserError::ParserError(format!(
+            "unexpected text after the type in ALTER COLUMN {path_str}: {type_sql}"
+        ))));
+    }
+    Ok(Some((table_ref.to_string(), path, data_type)))
 }
 
 /// Outcome of the shared tokenize-and-dispatch step: either an SQE-only
@@ -948,6 +1008,13 @@ fn classify_alter_table_extension(body: &str) -> sqe_core::Result<Option<Stateme
             table,
             path,
             if_exists,
+        }));
+    }
+    if let Some((table, path, data_type)) = detect_nested_alter_column_type(body)? {
+        return Ok(Some(StatementKind::AlterNestedColumnType {
+            table,
+            path,
+            data_type,
         }));
     }
     Ok(None)
@@ -2951,6 +3018,41 @@ mod tests {
             }
             other => panic!("expected DropNestedColumn, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_dotted_alter_column_type_classifies_to_alternestedcolumntype() {
+        for sql in [
+            "ALTER TABLE ns.t ALTER COLUMN s.a SET DATA TYPE BIGINT",
+            "alter table ns.t alter column s.a type bigint;",
+        ] {
+            match parse_and_classify(sql).unwrap() {
+                StatementKind::AlterNestedColumnType {
+                    table,
+                    path,
+                    data_type,
+                } => {
+                    assert_eq!(table, "ns.t", "{sql}");
+                    assert_eq!(path, ["s", "a"], "{sql}");
+                    assert_eq!(data_type.to_string().to_uppercase(), "BIGINT", "{sql}");
+                }
+                other => panic!("{sql}: expected AlterNestedColumnType, got {other:?}"),
+            }
+        }
+        let kind =
+            parse_and_classify("ALTER TABLE t ALTER COLUMN s.d SET DATA TYPE DECIMAL(12, 2)");
+        assert_eq!(kind.unwrap().name(), "alternestedcolumntype");
+        // A top-level column still goes to sqlparser.
+        let kind = parse_and_classify("ALTER TABLE t ALTER COLUMN a SET DATA TYPE BIGINT");
+        assert_eq!(kind.unwrap().name(), "alterschema");
+        // Trailing text after the type is a syntax error, not ignored.
+        let err =
+            parse_and_classify("ALTER TABLE t ALTER COLUMN s.a TYPE BIGINT junk").unwrap_err();
+        assert_eq!(
+            err.error_code(),
+            sqe_core::SqeErrorCode::SyntaxError,
+            "{err}"
+        );
     }
 
     #[test]

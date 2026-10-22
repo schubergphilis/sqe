@@ -290,3 +290,104 @@ async fn unknown_list_map_and_struct_are_declared_not_written() {
         ]
     );
 }
+
+/// `ALTER COLUMN s.a SET DATA TYPE` promotes a struct member, an `unknown`
+/// one included, keeping its field id: rows written before the change read
+/// widened in SQE and in Spark, and an illegal change is refused (#859).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn nested_type_promotion_reads_in_sqe_and_spark() {
+    if let Some(reason) = spark_stack_skip_reason() {
+        eprintln!("skipping nested_type_promotion_reads_in_sqe_and_spark: {reason}");
+        return;
+    }
+    let (session, handler) = crate::common::setup_handler().await;
+    let fq = "default.nested_type_promotion";
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+    let columns = "id INT, s STRUCT<a INT, f REAL, u UNKNOWN, d DECIMAL(10,2)>";
+    for sql in [
+        format!("CREATE TABLE {fq} ({columns})"),
+        format!(
+            "INSERT INTO {fq} VALUES (1, named_struct('a', 1, 'f', 1.5, 'u', NULL, 'd', 12.25))"
+        ),
+    ] {
+        handler.execute(&session, &sql, None).await.expect(&sql);
+    }
+
+    let mut refused = Vec::new();
+    for (column, to) in [
+        ("s.a", "VARCHAR"),
+        ("s.d", "DECIMAL(12,3)"),
+        ("s.nope", "BIGINT"),
+        ("id.x", "BIGINT"),
+    ] {
+        let alter = format!("ALTER TABLE {fq} ALTER COLUMN {column} SET DATA TYPE {to}");
+        match handler.execute(&session, &alter, None).await {
+            Ok(_) => refused.push(format!("{column} -> {to}: accepted")),
+            Err(e) => refused.push(format!(
+                "{column} -> {to}: {}",
+                e.to_string().contains(column)
+            )),
+        }
+    }
+    for (column, to) in [
+        ("s.a", "BIGINT"),
+        ("s.f", "DOUBLE"),
+        ("s.u", "INT"),
+        ("s.d", "DECIMAL(12,2)"),
+    ] {
+        let alter = format!("ALTER TABLE {fq} ALTER COLUMN {column} SET DATA TYPE {to}");
+        handler.execute(&session, &alter, None).await.expect(&alter);
+    }
+    let insert = format!(
+        "INSERT INTO {fq} VALUES \
+         (2, named_struct('a', 5000000000, 'f', 2.25, 'u', 7, 'd', 1234567890.12))"
+    );
+    handler
+        .execute(&session, &insert, None)
+        .await
+        .expect(&insert);
+
+    // The row helper renders neither decimals nor full float precision.
+    let select = format!(
+        "SELECT id, s.a, CAST(s.f AS VARCHAR), s.u, CAST(s.d AS VARCHAR), \
+         arrow_typeof(s.f), arrow_typeof(s.d) FROM {fq} ORDER BY id"
+    );
+    let sqe = sqe_rows(&handler, &session, &select).await;
+    let spark = spark_rows(&format!(
+        "SELECT id, s.a, s.f, s.u, s.d, typeof(s) FROM rest.{fq} ORDER BY id"
+    ));
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+
+    assert_eq!(
+        refused,
+        [
+            "s.a -> VARCHAR: true",
+            "s.d -> DECIMAL(12,3): true",
+            "s.nope -> BIGINT: true",
+            "id.x -> BIGINT: true",
+        ],
+        "refused type changes"
+    );
+    assert_eq!(
+        sqe,
+        [
+            "1|1|1.5|NULL|12.25|Float64|Decimal128(12, 2)",
+            "2|5000000000|2.25|7|1234567890.12|Float64|Decimal128(12, 2)",
+        ],
+        "SQE's rows"
+    );
+    let typ = "struct<a:bigint,f:double,u:int,d:decimal(12,2)>";
+    assert_eq!(
+        spark,
+        [
+            format!("1|1|1.5|NULL|12.25|{typ}"),
+            format!("2|5000000000|2.25|7|1234567890.12|{typ}"),
+        ],
+        "Spark's rows"
+    );
+}
