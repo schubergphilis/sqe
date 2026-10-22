@@ -118,7 +118,7 @@ Read-side optimizations:
 - **Column projection**: only requested columns leave Parquet.
 - **Predicate pushdown**: filters land at the row group level, the page-index level, and the Parquet `RowFilter`.
 - **Runtime filter pushdown**: Phase P shipped a `DynamicPredicate` API that absorbs DataFusion 54 hash-join build-side runtime filters into the same pruning surface. SF10 TPC-H lineitem-heavy queries saw `q06 -51%`, `q07 -31%`, `q14 -33%`. Engineering log at [Runtime filter pushdown](../design-notes/runtime-filter-pushdown.md).
-- **Bloom filter consultation**: `write.parquet.bloom-filter-columns` lands bloom offsets in the file footer; DataFusion consults them automatically for literal equality predicates at scan time.
+- **Bloom filter consultation**: `write.parquet.bloom-filter-columns` or the Iceberg spec key `write.parquet.bloom-filter-enabled.column.<col>` lands bloom offsets in the file footer; DataFusion consults them automatically for literal equality predicates at scan time.
 - **5-layer caching**: REST catalog cache, table metadata cache, manifest cache, SessionContext cache, OAuth token cache. Warm queries hit sub-millisecond planning.
 
 ## Write path
@@ -142,7 +142,12 @@ Supported DML, both V2 and V3 verified:
 
 DELETE reads `write.delete.mode`, UPDATE reads `write.update.mode`, and MERGE reads `write.merge.mode`. Each defaults to copy-on-write. CTAS and INSERT stream RecordBatches straight to Parquet at constant memory. Partitioned writes use a bounded fanout writer by default. It caps the number of open per-partition writers and the buffered bytes, both derived from the memory pool unless `fanout_max_open_writers` or `fanout_buffer_budget` is set, and flushes the least-recently-written writer when a limit is hit.
 
-The writer respects `write.parquet.bloom-filter-columns` and `write.parquet.bloom-filter-fpp` for any column the schema knows about. The footer-inspection test in `crates/sqe-catalog/src/parquet_writer_config.rs` proves bloom offsets land in the resulting Parquet file.
+The writer respects `write.parquet.bloom-filter-columns` and `write.parquet.bloom-filter-fpp` for any column the schema knows about. It also reads the Iceberg spec keys that Spark and other Iceberg writers set:
+
+- `write.parquet.bloom-filter-enabled.column.<col>` = `true` adds the column, `false` removes it even when the SQE list or `_sk` auto-detection picked it.
+- `write.parquet.bloom-filter-fpp.column.<col>` sets the false-positive probability for that column. On its own it does not enable a bloom.
+
+`<col>` is the full Iceberg name, so `s.x` for a struct member. Members of lists and maps get no bloom. `write.parquet.bloom-filter-max-bytes` is ignored: the Parquet writer sizes a filter from the row count. The footer-inspection test in `crates/sqe-compaction/src/parquet_writer_config.rs` proves bloom offsets land in the resulting Parquet file, and `bloom_spec_spark_interop` checks the footer of an SQE INSERT into a table Spark configured.
 
 ## Maintenance procedures
 

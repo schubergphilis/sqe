@@ -7,13 +7,22 @@
 //!
 //! ## Properties consumed
 //!
-//! - `write.parquet.bloom-filter-columns` (comma-separated top-level column
-//!   names). Explicit override; when set, only these columns get blooms.
+//! - `write.parquet.bloom-filter-columns` (comma-separated column names,
+//!   `s.x` for a struct member). Explicit override; when set, only these
+//!   columns (plus any spec key below) get blooms.
 //! - `write.parquet.bloom-filter-auto` (`true` / `false`). Default `true`.
-//!   When `bloom-filter-columns` is absent, auto-detects FK-shaped
+//!   When neither `bloom-filter-columns` nor a spec `enabled` key names a
+//!   column, auto-detects FK-shaped
 //!   integer columns (names ending in `_sk` or `_id`) and enables blooms
 //!   for them. Set to `false` to opt out entirely.
 //! - `write.parquet.bloom-filter-fpp` (float, 0 < fpp < 1). Default 0.01.
+//! - Iceberg spec keys, as Spark sets them:
+//!   `write.parquet.bloom-filter-enabled.column.<col>` (`true` adds the
+//!   column, `false` removes it whatever picked it) and
+//!   `write.parquet.bloom-filter-fpp.column.<col>` (per-column fpp).
+//!   `<col>` may be a struct member (`s.x`); list and map members are
+//!   skipped. `write.parquet.bloom-filter-max-bytes` is ignored: parquet-rs
+//!   sizes a filter from the row-group row count, not a byte cap.
 //!
 //! ## Auto-detection rationale
 //!
@@ -47,7 +56,7 @@
 
 use std::collections::HashMap;
 
-use iceberg::spec::{PrimitiveType, Schema as IcebergSchema, Type};
+use iceberg::spec::{PrimitiveType, Schema as IcebergSchema, StructType, Type};
 use iceberg::table::Table;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -56,8 +65,9 @@ use parquet::schema::types::ColumnPath;
 /// Iceberg table property that lists columns to get Parquet bloom filters.
 ///
 /// Value is a comma-separated list of column names (case-sensitive, matched
-/// against the top-level schema field names). When set, this list is the
-/// authoritative choice and auto-detection is skipped.
+/// against the full Iceberg field names, so `s.x` for a struct member).
+/// When set, this list and the spec `enabled` keys are the authoritative
+/// choice and auto-detection is skipped.
 pub const PROP_BLOOM_FILTER_COLUMNS: &str = "write.parquet.bloom-filter-columns";
 
 /// Iceberg table property to opt out of FK auto-detection.
@@ -72,6 +82,19 @@ pub const PROP_BLOOM_FILTER_AUTO: &str = "write.parquet.bloom-filter-auto";
 ///
 /// Defaults to [`DEFAULT_BLOOM_FILTER_FPP`] (1%) when absent or unparseable.
 pub const PROP_BLOOM_FILTER_FPP: &str = "write.parquet.bloom-filter-fpp";
+
+/// Iceberg spec key prefix: `write.parquet.bloom-filter-enabled.column.<col>`
+/// = `true` / `false`, with `<col>` the full Iceberg field name (`s.x` for a
+/// struct member). This is what Spark and the other Iceberg writers set.
+/// `true` adds the column to the SQE list; `false` removes it even when the
+/// SQE list or auto-detection picked it.
+pub const PROP_BLOOM_FILTER_ENABLED_COLUMN_PREFIX: &str =
+    "write.parquet.bloom-filter-enabled.column.";
+
+/// Iceberg spec key prefix: `write.parquet.bloom-filter-fpp.column.<col>`.
+/// Overrides `write.parquet.bloom-filter-fpp` for one column. On its own it
+/// does not enable a bloom, as in Iceberg Java.
+pub const PROP_BLOOM_FILTER_FPP_COLUMN_PREFIX: &str = "write.parquet.bloom-filter-fpp.column.";
 
 /// Default bloom filter FPP when the table property is absent or invalid.
 pub const DEFAULT_BLOOM_FILTER_FPP: f64 = 0.01;
@@ -110,41 +133,72 @@ pub fn build_writer_props(
 ) -> WriterProperties {
     let mut builder = WriterProperties::builder().set_compression(compression);
 
-    // Resolve which columns to bloom: explicit list wins; otherwise fall
-    // back to auto-detection unless the operator opted out via
-    // `write.parquet.bloom-filter-auto = false`.
-    let explicit = parse_bloom_filter_columns(properties);
-    let columns = if !explicit.is_empty() {
-        explicit
-    } else if parse_bloom_filter_auto(properties) {
-        auto_detect_fk_columns(schema)
-    } else {
-        Vec::new()
-    };
+    // Resolve which columns to bloom: the SQE list plus the Iceberg spec
+    // columns set to `true` win; otherwise fall back to auto-detection
+    // unless the operator opted out via `write.parquet.bloom-filter-auto =
+    // false`. A spec column set to `false` is removed last, whatever chose it.
+    let (spec_enabled, spec_disabled) = parse_spec_bloom_columns(properties);
+    let mut columns = parse_bloom_filter_columns(properties);
+    for col in spec_enabled {
+        if !columns.contains(&col) {
+            columns.push(col);
+        }
+    }
+    if columns.is_empty() && parse_bloom_filter_auto(properties) {
+        columns = auto_detect_fk_columns(schema);
+    }
+    columns.retain(|c| !spec_disabled.contains(c));
 
     if columns.is_empty() {
         return builder.build();
     }
 
-    let fpp = parse_bloom_filter_fpp(properties);
-    let schema_fields = schema.as_struct().fields();
-    let valid_names: Vec<&str> = schema_fields.iter().map(|f| f.name.as_str()).collect();
-
+    let default_fpp = parse_bloom_filter_fpp(properties);
     for col in &columns {
-        if valid_names.contains(&col.as_str()) {
-            let path = ColumnPath::new(vec![col.clone()]);
-            builder = builder
-                .set_column_bloom_filter_enabled(path.clone(), true)
-                .set_column_bloom_filter_fpp(path, fpp);
-        } else {
+        let Some(path) = bloom_column_path(schema, col) else {
             tracing::warn!(
                 column = %col,
-                "write.parquet.bloom-filter-columns references unknown column; skipping"
+                "bloom filter column is unknown, not primitive or inside a list/map; skipping"
             );
-        }
+            continue;
+        };
+        // The fpp setter also enables the bloom, so it only ever runs for a
+        // column that is enabled.
+        let fpp = parse_spec_column_fpp(properties, col).unwrap_or(default_fpp);
+        builder = builder
+            .set_column_bloom_filter_enabled(path.clone(), true)
+            .set_column_bloom_filter_fpp(path, fpp);
     }
 
     builder.build()
+}
+
+/// The Parquet column path of a primitive field reached through structs
+/// only. `name` is the full Iceberg name (`s.x` for a struct member), looked
+/// up through the schema rather than split on `.`, since a field name may
+/// itself contain a dot. List and map members get extra Parquet path
+/// segments (`list.element`, `key_value.key`) and are not supported.
+fn bloom_column_path(schema: &IcebergSchema, name: &str) -> Option<ColumnPath> {
+    let field = schema.field_by_name(name)?;
+    if !matches!(field.field_type.as_ref(), Type::Primitive(_)) {
+        return None;
+    }
+    struct_path(schema.as_struct(), field.id).map(ColumnPath::new)
+}
+
+fn struct_path(st: &StructType, id: i32) -> Option<Vec<String>> {
+    for f in st.fields() {
+        if f.id == id {
+            return Some(vec![f.name.clone()]);
+        }
+        if let Type::Struct(inner) = f.field_type.as_ref() {
+            if let Some(mut rest) = struct_path(inner, id) {
+                rest.insert(0, f.name.clone());
+                return Some(rest);
+            }
+        }
+    }
+    None
 }
 
 /// Pick FK-shaped integer columns from the schema for default bloom filtering.
@@ -222,6 +276,51 @@ pub fn parse_bloom_filter_columns(properties: &HashMap<String, String>) -> Vec<S
         }
     }
     out
+}
+
+/// Parse the Iceberg spec keys `write.parquet.bloom-filter-enabled.column.<col>`
+/// into the columns set to `true` and those set to `false`, each sorted by
+/// name. The value is case-insensitive; anything else is logged and ignored.
+pub fn parse_spec_bloom_columns(
+    properties: &HashMap<String, String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut keys: Vec<(&str, &str)> = properties
+        .iter()
+        .filter_map(|(k, v)| {
+            k.strip_prefix(PROP_BLOOM_FILTER_ENABLED_COLUMN_PREFIX)
+                .map(|col| (col, v.as_str()))
+        })
+        .collect();
+    keys.sort_unstable();
+    let (mut enabled, mut disabled) = (Vec::new(), Vec::new());
+    for (col, value) in keys {
+        match value.trim() {
+            v if v.eq_ignore_ascii_case("true") => enabled.push(col.to_string()),
+            v if v.eq_ignore_ascii_case("false") => disabled.push(col.to_string()),
+            v => tracing::warn!(
+                column = %col,
+                value = %v,
+                "write.parquet.bloom-filter-enabled.column value is not true/false; ignoring"
+            ),
+        }
+    }
+    (enabled, disabled)
+}
+
+/// Parse `write.parquet.bloom-filter-fpp.column.<col>`. `None` when absent
+/// or outside (0, 1); parquet-rs panics on such a value.
+pub fn parse_spec_column_fpp(properties: &HashMap<String, String>, column: &str) -> Option<f64> {
+    let key = format!("{PROP_BLOOM_FILTER_FPP_COLUMN_PREFIX}{column}");
+    let raw = properties.get(&key)?;
+    let fpp = raw
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|f| *f > 0.0 && *f < 1.0);
+    if fpp.is_none() {
+        tracing::warn!(column = %column, value = %raw, "invalid {key}; using the default fpp");
+    }
+    fpp
 }
 
 /// Parse `write.parquet.bloom-filter-fpp` or fall back to the default.
@@ -554,5 +653,166 @@ mod tests {
             name_col.bloom_filter_offset().is_none(),
             "name column should NOT carry a bloom filter offset; metadata: {name_col:?}"
         );
+    }
+
+    /// The bloom fpp on `path`, `None` when the column has no bloom.
+    fn bloom_fpp(w: &WriterProperties, path: &[&str]) -> Option<f64> {
+        let path = ColumnPath::new(path.iter().map(|s| s.to_string()).collect());
+        w.bloom_filter_properties(&path).map(|bf| bf.fpp())
+    }
+
+    fn spec_enabled(col: &str) -> String {
+        format!("{PROP_BLOOM_FILTER_ENABLED_COLUMN_PREFIX}{col}")
+    }
+
+    fn spec_fpp(col: &str) -> String {
+        format!("{PROP_BLOOM_FILTER_FPP_COLUMN_PREFIX}{col}")
+    }
+
+    fn props(pairs: &[(String, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.clone(), v.to_string()))
+            .collect()
+    }
+
+    /// #856: a table configured by Spark with the Iceberg spec key gets the
+    /// bloom from an SQE write. `id` is not `_sk`, so auto-detection cannot
+    /// pass this on its own.
+    #[test]
+    fn spec_enabled_key_enables_bloom() {
+        let w = build_writer_props(
+            &props(&[(spec_enabled("id"), "TRUE")]),
+            &schema_id_name(),
+            Compression::UNCOMPRESSED,
+        );
+        assert_eq!(bloom_fpp(&w, &["id"]), Some(DEFAULT_BLOOM_FILTER_FPP));
+        assert_eq!(bloom_fpp(&w, &["name"]), None);
+    }
+
+    #[test]
+    fn spec_fpp_key_overrides_the_table_fpp_for_its_column() {
+        let p = props(&[
+            (spec_enabled("id"), "true"),
+            (spec_enabled("name"), "true"),
+            (spec_fpp("id"), "0.2"),
+            (PROP_BLOOM_FILTER_FPP.to_string(), "0.05"),
+        ]);
+        let w = build_writer_props(&p, &schema_id_name(), Compression::UNCOMPRESSED);
+        assert_eq!(bloom_fpp(&w, &["id"]), Some(0.2));
+        assert_eq!(bloom_fpp(&w, &["name"]), Some(0.05));
+    }
+
+    /// parquet-rs panics on an fpp outside (0, 1); the writer must fall back.
+    #[test]
+    fn spec_fpp_out_of_range_falls_back_to_default() {
+        for bad in ["0", "1", "1.5", "-0.1", "NaN", "x"] {
+            let p = props(&[(spec_enabled("id"), "true"), (spec_fpp("id"), bad)]);
+            let w = build_writer_props(&p, &schema_id_name(), Compression::UNCOMPRESSED);
+            assert_eq!(
+                bloom_fpp(&w, &["id"]),
+                Some(DEFAULT_BLOOM_FILTER_FPP),
+                "{bad}"
+            );
+        }
+    }
+
+    /// As in Iceberg Java, an fpp key alone does not enable a bloom.
+    #[test]
+    fn spec_fpp_key_alone_does_not_enable_bloom() {
+        let p = props(&[(spec_fpp("id"), "0.2")]);
+        let w = build_writer_props(&p, &schema_id_name(), Compression::UNCOMPRESSED);
+        assert_eq!(bloom_fpp(&w, &["id"]), None);
+    }
+
+    /// `false` removes an auto-detected column and keeps the others.
+    #[test]
+    fn spec_disabled_key_removes_auto_detected_column() {
+        let p = props(&[(spec_enabled("ss_item_sk"), "false")]);
+        let w = build_writer_props(&p, &schema_fact_table(), Compression::UNCOMPRESSED);
+        assert_eq!(bloom_fpp(&w, &["ss_item_sk"]), None);
+        assert!(bloom_fpp(&w, &["ss_store_sk"]).is_some());
+    }
+
+    /// `false` also beats the SQE list.
+    #[test]
+    fn spec_disabled_key_beats_the_sqe_column_list() {
+        let p = props(&[
+            (PROP_BLOOM_FILTER_COLUMNS.to_string(), "id,name"),
+            (spec_enabled("id"), "false"),
+        ]);
+        let w = build_writer_props(&p, &schema_id_name(), Compression::UNCOMPRESSED);
+        assert_eq!(bloom_fpp(&w, &["id"]), None);
+        assert!(bloom_fpp(&w, &["name"]).is_some());
+    }
+
+    /// The SQE list and the spec keys add up, and together they replace
+    /// auto-detection as the SQE list alone does.
+    #[test]
+    fn spec_keys_and_sqe_list_are_a_union() {
+        let p = props(&[
+            (PROP_BLOOM_FILTER_COLUMNS.to_string(), "ss_quantity"),
+            (spec_enabled("transaction_id"), "true"),
+        ]);
+        let w = build_writer_props(&p, &schema_fact_table(), Compression::UNCOMPRESSED);
+        assert!(bloom_fpp(&w, &["ss_quantity"]).is_some());
+        assert!(bloom_fpp(&w, &["transaction_id"]).is_some());
+        assert_eq!(
+            bloom_fpp(&w, &["ss_item_sk"]),
+            None,
+            "auto-detection skipped"
+        );
+    }
+
+    #[test]
+    fn spec_key_with_a_non_boolean_value_is_ignored() {
+        let p = props(&[(spec_enabled("id"), "yes")]);
+        let w = build_writer_props(&p, &schema_id_name(), Compression::UNCOMPRESSED);
+        assert_eq!(bloom_fpp(&w, &["id"]), None);
+    }
+
+    /// A struct member is addressed by its full Iceberg name and gets the
+    /// nested Parquet path. A list element (its own Parquet path is
+    /// `tags.list.element`) and a whole struct are skipped.
+    #[test]
+    fn spec_key_on_struct_member_uses_the_nested_path() {
+        use iceberg::spec::ListType;
+
+        let schema = IcebergSchema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(
+                    2,
+                    "s",
+                    Type::Struct(StructType::new(vec![NestedField::optional(
+                        3,
+                        "x",
+                        Type::Primitive(PrimitiveType::Long),
+                    )
+                    .into()])),
+                )
+                .into(),
+                NestedField::optional(
+                    4,
+                    "tags",
+                    Type::List(ListType::new(
+                        NestedField::list_element(5, Type::Primitive(PrimitiveType::String), false)
+                            .into(),
+                    )),
+                )
+                .into(),
+            ])
+            .build()
+            .expect("schema");
+        let p = props(&[
+            (spec_enabled("s.x"), "true"),
+            (spec_enabled("s"), "true"),
+            (spec_enabled("tags.element"), "true"),
+        ]);
+        let w = build_writer_props(&p, &schema, Compression::UNCOMPRESSED);
+        assert!(bloom_fpp(&w, &["s", "x"]).is_some());
+        assert_eq!(bloom_fpp(&w, &["s"]), None);
+        assert_eq!(bloom_fpp(&w, &["tags", "list", "element"]), None);
+        assert_eq!(bloom_fpp(&w, &["tags", "element"]), None);
     }
 }
