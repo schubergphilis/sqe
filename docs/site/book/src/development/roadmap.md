@@ -278,7 +278,7 @@ Iceberg V3 table format support landed end-to-end. V3 is the default format-vers
 |---|---|
 | Variant path functions (`variant_get`) | SQE work, tracked in #849 |
 | Shredded variant writes | SQE writes unshredded; shredded files read |
-| Nested unknown fields | Refused on write, not readable |
+| Unknown list elements and map keys/values | Refused on write; unknown struct members work (#859) |
 | Geometry / geography type | DataFusion UDT [#12644](https://github.com/apache/datafusion/issues/12644) |
 | Multi-arg partition transforms | Not started |
 

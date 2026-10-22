@@ -363,10 +363,10 @@
     },
     "sqe:unknown-type:v3": {
       "level": "partial",
-      "notes": "Top-level unknown columns work across engines. SQE declares one as UNKNOWN or VOID, reads a Spark-written VOID column as NULLs, inserts around it and promotes it with ALTER COLUMN ... SET DATA TYPE, and Spark 4.1 + Iceberg 1.12 reads every stage. Unknown columns are never written to a data file, as the spec requires; readers fill them with NULLs.",
-      "evidence": "crates/sqe-write/src/write_handler.rs, crates/sqe-catalog/src/iceberg_scan.rs, vendor/iceberg-rust/crates/iceberg/src/writer/file_writer/parquet_writer.rs, crates/sqe-coordinator/tests/it/unknown_type_spark_interop.rs::unknown_column_reads_writes_and_promotes, crates/sqe-coordinator/tests/it/unknown_type_spark_interop.rs::sqe_declares_an_unknown_column_spark_reads_it, crates/sqe-coordinator/tests/it/unknown_type_spark_interop.rs::nested_unknown_field_is_refused_at_write",
+      "notes": "Top-level unknown columns work across engines. SQE declares one as UNKNOWN or VOID, reads a Spark-written VOID column as NULLs, inserts around it and promotes it with ALTER COLUMN ... SET DATA TYPE, and Spark 4.1 + Iceberg 1.12 reads every stage. Unknown columns and unknown struct members (also in a list of structs) are never written to a data file, as the spec requires; readers fill them with NULLs. Spark-written nested unknown members read in SQE, and Spark reads SQE's.",
+      "evidence": "crates/sqe-write/src/write_handler.rs, crates/sqe-catalog/src/iceberg_scan.rs, vendor/iceberg-rust/crates/iceberg/src/writer/file_writer/parquet_writer.rs, crates/sqe-coordinator/tests/it/unknown_type_spark_interop.rs::unknown_column_reads_writes_and_promotes, crates/sqe-coordinator/tests/it/unknown_type_spark_interop.rs::sqe_declares_an_unknown_column_spark_reads_it, crates/sqe-coordinator/tests/it/unknown_type_spark_interop.rs::nested_unknown_struct_spark_writes_sqe_reads, crates/sqe-coordinator/tests/it/unknown_type_spark_interop.rs::nested_unknown_struct_sqe_creates_spark_reads, crates/sqe-coordinator/tests/it/distributed_schema_evolution_e2e.rs::unknown_fields_read_as_null_on_a_worker",
       "caveats": [
-        "Nested unknown fields (STRUCT<a INT, u VOID>) are not supported: SQE cannot read a Spark table with one, and refuses to write one.",
+        "An unknown list element, an unknown map key or value, and a struct whose members are all unknown are refused on write.",
         "information_schema reports the Arrow type name Null, not unknown."
       ]
     },
