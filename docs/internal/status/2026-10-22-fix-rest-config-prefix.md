@@ -15,9 +15,14 @@ warehouse name, which is why nothing caught it.
   the table/view URL helpers are async and use that prefix verbatim (it is
   already percent-encoded, so it is parsed with the base, never re-encoded).
   No advertised prefix means no segment, as in the client. The warehouse
-  name stands in when the config fetch fails or the breaker is open, so an
-  open breaker still sends nothing.
-- Tests: `rest_prefix_tests` (Nessie-style encoded prefix; no prefix), both
-  assert the `/v1/warehouse/...` route gets zero requests.
+  name stands in when the config fetch fails or the breaker would refuse,
+  so an open breaker still sends nothing.
+- `crates/sqe-core/src/circuit_breaker.rs`: `would_refuse()`, a read-only
+  `check()`. The URL is built before the breaker admits the request; a
+  plain "is it open" test sent the recovery probe to `/v1/{warehouse}`, and
+  on a non-Polaris server the breaker could never close.
+- Tests: `rest_prefix_tests` (Nessie-style encoded prefix; no prefix; a
+  recovery probe), each asserting the `/v1/warehouse/...` route gets zero
+  requests; `would_refuse_matches_check_without_admitting`.
 
 **NEXT:** #866: run the Nessie, HMS and JDBC live tests in CI.
