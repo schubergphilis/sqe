@@ -391,3 +391,90 @@ async fn nested_type_promotion_reads_in_sqe_and_spark() {
         "Spark's rows"
     );
 }
+
+/// `ALTER COLUMN l.element` / `m.value` promote a list element and a map
+/// value, keeping their field ids: rows written before the change read
+/// widened in SQE and in Spark. A map key cannot change type (#869).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn list_element_and_map_value_promotion_reads_in_sqe_and_spark() {
+    if let Some(reason) = spark_stack_skip_reason() {
+        eprintln!("skipping list_element_and_map_value_promotion_reads_in_sqe_and_spark: {reason}");
+        return;
+    }
+    let (session, handler) = crate::common::setup_handler().await;
+    let fq = "default.list_map_type_promotion";
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+    for sql in [
+        format!("CREATE TABLE {fq} (id INT, l ARRAY<INT>, m MAP<INT, REAL>)"),
+        format!("INSERT INTO {fq} VALUES (1, make_array(1, 2), MAP {{1: 1.5}})"),
+    ] {
+        handler.execute(&session, &sql, None).await.expect(&sql);
+    }
+
+    let mut refused = Vec::new();
+    for (column, to) in [
+        ("l.element", "VARCHAR"),
+        ("m.key", "BIGINT"),
+        ("l.item", "BIGINT"),
+    ] {
+        let alter = format!("ALTER TABLE {fq} ALTER COLUMN {column} SET DATA TYPE {to}");
+        match handler.execute(&session, &alter, None).await {
+            Ok(_) => refused.push(format!("{column} -> {to}: accepted")),
+            Err(e) => refused.push(format!(
+                "{column} -> {to}: {}",
+                e.to_string().contains(column)
+            )),
+        }
+    }
+    for (column, to) in [("l.element", "BIGINT"), ("m.value", "DOUBLE")] {
+        let alter = format!("ALTER TABLE {fq} ALTER COLUMN {column} SET DATA TYPE {to}");
+        handler.execute(&session, &alter, None).await.expect(&alter);
+    }
+    let insert = format!("INSERT INTO {fq} VALUES (2, make_array(5000000000), MAP {{2: 2.25}})");
+    handler
+        .execute(&session, &insert, None)
+        .await
+        .expect(&insert);
+
+    // DataFusion indexes a map only with a literal key; each map holds one entry.
+    let select = format!(
+        "SELECT id, l[1], CAST(map_values(m)[1] AS VARCHAR), arrow_typeof(l), arrow_typeof(m) \
+         FROM {fq} ORDER BY id"
+    );
+    let sqe = sqe_rows(&handler, &session, &select).await;
+    let spark = spark_rows(&format!(
+        "SELECT id, l[0], m[id], typeof(l), typeof(m) FROM rest.{fq} ORDER BY id"
+    ));
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+
+    assert_eq!(
+        refused,
+        [
+            "l.element -> VARCHAR: true",
+            "m.key -> BIGINT: true",
+            "l.item -> BIGINT: true",
+        ],
+        "refused type changes"
+    );
+    assert_eq!(sqe.len(), 2, "SQE's rows: {sqe:?}");
+    for (row, prefix) in sqe.iter().zip(["1|1|1.5|", "2|5000000000|2.25|"]) {
+        assert!(row.starts_with(prefix), "SQE row {row}");
+        assert!(
+            row.contains("Int64") && row.contains("Float64"),
+            "SQE row {row}"
+        );
+    }
+    assert_eq!(
+        spark,
+        [
+            "1|1|1.5|array<bigint>|map<int,double>",
+            "2|5000000000|2.25|array<bigint>|map<int,double>",
+        ],
+        "Spark's rows"
+    );
+}

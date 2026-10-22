@@ -1090,8 +1090,9 @@ impl CatalogOps {
         Ok(())
     }
 
-    /// Promote a nested struct member:
-    /// `ALTER TABLE t ALTER COLUMN a.b[.c] SET DATA TYPE T` (#859).
+    /// Promote a nested struct member, list element or map value:
+    /// `ALTER TABLE t ALTER COLUMN a.b[.c] SET DATA TYPE T` (#859), with
+    /// `l.element` and `m.value` naming a list element and a map value (#869).
     ///
     /// The same promotions as a top-level column (`check_type_promotion`).
     /// Every field keeps its Iceberg id, so files written before the change
@@ -1104,7 +1105,7 @@ impl CatalogOps {
         path: &[String],
         data_type: &sqlparser::ast::DataType,
     ) -> sqe_core::Result<()> {
-        use iceberg::spec::{NestedField, Type};
+        use iceberg::spec::NestedField;
 
         let table_name = parse_object_name(table)?;
         let table_ident = resolve_table_ident(&table_name, session)?;
@@ -1149,16 +1150,14 @@ impl CatalogOps {
             ));
         };
         let f = &fields[idx];
-        let Type::Struct(inner) = &*f.field_type else {
+        if f.field_type.is_primitive() {
             return Err(SqeError::with_code(
                 SqeErrorCode::ExecutionFailed,
-                format!("Cannot change '{dotted}': column '{top}' is not a struct"),
+                format!("Cannot change '{dotted}': column '{top}' is not a struct, list or map"),
             ));
-        };
+        }
         let mut column: NestedField = (**f).clone();
-        column.field_type = Box::new(Type::Struct(set_struct_member_type(
-            inner, rest, &dotted, &new_type,
-        )?));
+        column.field_type = Box::new(set_nested_type(&f.field_type, rest, &dotted, &new_type)?);
         fields[idx] = StdArc::new(column);
 
         let new_schema_id = metadata
@@ -2194,53 +2193,75 @@ fn remove_struct_subfield(
     Ok(Some(StructType::new(new_fields)))
 }
 
-/// Rebuild `struct_type` with the member at `path` changed to `new_type`,
-/// keeping the id, name and nullability of that member and of every other
-/// field. `dotted` names the whole column path in errors. (#859)
-fn set_struct_member_type(
-    struct_type: &iceberg::spec::StructType,
+/// Rebuild the nested type `ty` with the field at `path` changed to
+/// `new_type`, keeping the id, name and nullability of that field and of
+/// every other one. A path step names a struct member, `element` for a list
+/// element or `value` for a map value; a map key cannot change type, as in
+/// Iceberg. `dotted` names the whole column path in errors. (#859, #869)
+fn set_nested_type(
+    ty: &iceberg::spec::Type,
     path: &[String],
     dotted: &str,
     new_type: &iceberg::spec::Type,
-) -> sqe_core::Result<iceberg::spec::StructType> {
-    use iceberg::spec::{NestedField, StructType, Type};
+) -> sqe_core::Result<iceberg::spec::Type> {
+    use iceberg::spec::{ListType, MapType, NestedField, NestedFieldRef, StructType, Type};
 
-    let (head, rest) = path.split_first().expect("path must be non-empty");
-    let Some(pos) = struct_type.fields().iter().position(|f| &f.name == head) else {
-        return Err(SqeError::with_code(
-            SqeErrorCode::ExecutionFailed,
-            format!("Nested field '{head}' of '{dotted}' not found"),
-        ));
-    };
-    let f = &struct_type.fields()[pos];
-    let field_type = if rest.is_empty() {
-        if !f.field_type.is_primitive() {
+    let Some((head, rest)) = path.split_first() else {
+        if !ty.is_primitive() {
             return Err(SqeError::with_code(
                 SqeErrorCode::ExecutionFailed,
                 format!(
-                    "Cannot change column '{dotted}' from {} to {new_type}: SET DATA TYPE \
-                     promotes a primitive column to a primitive type",
-                    f.field_type
+                    "Cannot change column '{dotted}' from {ty} to {new_type}: SET DATA TYPE \
+                     promotes a primitive column to a primitive type"
                 ),
             ));
         }
-        check_type_promotion(dotted, &f.field_type, new_type)?;
-        new_type.clone()
-    } else {
-        let Type::Struct(inner) = &*f.field_type else {
-            return Err(SqeError::with_code(
-                SqeErrorCode::ExecutionFailed,
-                format!("Cannot change '{dotted}': '{head}' is not a struct"),
-            ));
-        };
-        Type::Struct(set_struct_member_type(inner, rest, dotted, new_type)?)
+        check_type_promotion(dotted, ty, new_type)?;
+        return Ok(new_type.clone());
     };
-    // Clone rather than rebuild, so the member keeps its doc and defaults.
-    let mut member: NestedField = (**f).clone();
-    member.field_type = Box::new(field_type);
-    let mut fields = struct_type.fields().to_vec();
-    fields[pos] = StdArc::new(member);
-    Ok(StructType::new(fields))
+    // Clone rather than rebuild, so the field keeps its doc and defaults.
+    let set = |f: &NestedFieldRef| -> sqe_core::Result<NestedFieldRef> {
+        let mut field: NestedField = (**f).clone();
+        field.field_type = Box::new(set_nested_type(&f.field_type, rest, dotted, new_type)?);
+        Ok(StdArc::new(field))
+    };
+    match ty {
+        Type::Struct(struct_type) => {
+            let Some(pos) = struct_type.fields().iter().position(|f| &f.name == head) else {
+                return Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Nested field '{head}' of '{dotted}' not found"),
+                ));
+            };
+            let mut fields = struct_type.fields().to_vec();
+            fields[pos] = set(&fields[pos])?;
+            Ok(Type::Struct(StructType::new(fields)))
+        }
+        Type::List(list) if head == "element" => {
+            Ok(Type::List(ListType::new(set(&list.element_field)?)))
+        }
+        Type::Map(map) if head == "value" => Ok(Type::Map(MapType::new(
+            StdArc::clone(&map.key_field),
+            set(&map.value_field)?,
+        ))),
+        Type::Map(_) if head == "key" => Err(SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!("Cannot change '{dotted}': Iceberg does not allow a map key to change type"),
+        )),
+        Type::List(_) | Type::Map(_) => Err(SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!(
+                "Cannot change '{dotted}': '{head}' is not a field here; a list element is \
+                 'element' and a map value is 'value'"
+            ),
+        )),
+        Type::Primitive(_) | Type::Variant(_) => Err(SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!(
+                "Cannot change '{dotted}': the field before '{head}' is not a struct, list or map"
+            ),
+        )),
+    }
 }
 
 /// Refuse a column type change the Iceberg spec does not allow as a
@@ -2828,9 +2849,19 @@ mod tests {
         ]);
         let path = |p: &str| p.split('.').map(str::to_string).collect::<Vec<_>>();
 
-        let out =
-            set_struct_member_type(&outer, &path("in.x"), "s.in.x", &Type::Primitive(P::Long))
-                .expect("int -> long");
+        let outer = Type::Struct(outer);
+        let promote = |p: &str, dotted: &str, to: P| match set_nested_type(
+            &outer,
+            &path(p),
+            dotted,
+            &Type::Primitive(to),
+        ) {
+            Ok(Type::Struct(s)) => Ok(s),
+            Ok(other) => panic!("{p}: a struct stays a struct, got {other}"),
+            Err(e) => Err(e),
+        };
+
+        let out = promote("in.x", "s.in.x", P::Long).expect("int -> long");
         let ids: Vec<i32> = out.fields().iter().map(|f| f.id).collect();
         assert_eq!(ids, [2, 3]);
         let Type::Struct(promoted) = &*out.fields()[1].field_type else {
@@ -2844,9 +2875,7 @@ mod tests {
             Type::Primitive(P::Unknown)
         );
 
-        let out =
-            set_struct_member_type(&outer, &path("in.u"), "s.in.u", &Type::Primitive(P::String))
-                .expect("unknown -> string");
+        let out = promote("in.u", "s.in.u", P::String).expect("unknown -> string");
         let Type::Struct(promoted) = &*out.fields()[1].field_type else {
             panic!("in stays a struct");
         };
@@ -2859,9 +2888,74 @@ mod tests {
             ("nope", P::Long),
             ("a.x", P::Long),
         ] {
-            let err =
-                set_struct_member_type(&outer, &path(p), p, &Type::Primitive(to)).expect_err(p);
+            let err = promote(p, p, to).expect_err(p);
             assert!(err.to_string().contains(p), "{p}: {err}");
+        }
+    }
+
+    /// `l.element` and `m.value` promote a list element and a map value in
+    /// place; every id stays, the map key cannot change (#869).
+    #[test]
+    fn a_list_element_and_a_map_value_are_promoted_keeping_every_id() {
+        use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType as P, StructType, Type};
+        let leaf =
+            |id, name: &str, p| StdArc::new(NestedField::optional(id, name, Type::Primitive(p)));
+        let path = |p: &str| p.split('.').map(str::to_string).collect::<Vec<_>>();
+
+        let list = Type::List(ListType::new(StdArc::new(NestedField::required(
+            2,
+            "element",
+            Type::Primitive(P::Int),
+        ))));
+        let Type::List(out) = set_nested_type(
+            &list,
+            &path("element"),
+            "l.element",
+            &Type::Primitive(P::Long),
+        )
+        .expect("int -> long") else {
+            panic!("a list stays a list");
+        };
+        assert_eq!(out.element_field.id, 2);
+        assert!(out.element_field.required, "nullability kept");
+        assert_eq!(*out.element_field.field_type, Type::Primitive(P::Long));
+
+        let map = Type::Map(MapType::new(
+            StdArc::new(NestedField::required(3, "key", Type::Primitive(P::Int))),
+            StdArc::new(NestedField::optional(
+                4,
+                "value",
+                Type::Struct(StructType::new(vec![leaf(5, "f", P::Float)])),
+            )),
+        ));
+        let Type::Map(out) = set_nested_type(
+            &map,
+            &path("value.f"),
+            "m.value.f",
+            &Type::Primitive(P::Double),
+        )
+        .expect("float -> double") else {
+            panic!("a map stays a map");
+        };
+        assert_eq!((out.key_field.id, out.value_field.id), (3, 4));
+        assert_eq!(*out.key_field.field_type, Type::Primitive(P::Int));
+        let Type::Struct(value) = &*out.value_field.field_type else {
+            panic!("the value stays a struct");
+        };
+        assert_eq!(value.fields()[0].id, 5);
+        assert_eq!(*value.fields()[0].field_type, Type::Primitive(P::Double));
+
+        for (ty, p, to) in [
+            (&map, "key", P::Long),
+            (&map, "value", P::Long),
+            (&list, "item", P::Long),
+            (&list, "element", P::String),
+            (&list, "element.x", P::Long),
+        ] {
+            let dotted = format!("c.{p}");
+            let err =
+                set_nested_type(ty, &path(p), &dotted, &Type::Primitive(to)).expect_err(&dotted);
+            assert!(err.to_string().contains(&dotted), "{dotted}: {err}");
         }
     }
 

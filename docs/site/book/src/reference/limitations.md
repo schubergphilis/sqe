@@ -55,7 +55,7 @@ V3 is the default format-version for new tables and landed end to end: default v
 | Multi-arg partition transforms | Not supported. `PARTITIONED BY` accepts single-source transforms only. |
 | Shredded variant reads | SQE writes and reads shredded variants, but unshreds on read: a shredded field gives no pruning or typed access, and only top-level variant columns are shredded on write. |
 | Unknown list elements and map keys/values | `ARRAY<VOID>`, a map with a `VOID` key or value, and a struct whose members are all unknown can be declared and read, but a row cannot be written: Parquet has no column for them, and Iceberg Java refuses the same writes. Unknown struct members (`STRUCT<a INT, u VOID>`) work. |
-| Nested type promotion | `ALTER COLUMN s.a SET DATA TYPE` promotes a struct member; a list element or map value cannot be promoted yet. |
+| DATE to TIMESTAMP promotion | The Iceberg V3 spec allows it, but `ALTER COLUMN ... SET DATA TYPE` refuses it: Iceberg Java (Spark 4.1) refuses the same change, so no other engine could read the table afterwards. A map key never changes type. |
 
 See [Iceberg Integration, V3 features verified](../features/iceberg.md#v3-features-verified) and [DDL, VARIANT](../sql-reference/ddl.md#variant).
 
