@@ -2446,6 +2446,20 @@ fn resolve_projection_in_file(
 /// `target`, giving that column's index in the FILE. A column the file lacks
 /// reads its `initial-default` from `defaults` (same positions as `target`;
 /// empty when no projected column has one), and typed NULLs otherwise.
+/// The Iceberg type promotions a data file can lag behind: int to long, float
+/// to double, and a decimal widened to a larger precision with the same scale.
+fn is_type_promotion(
+    file: &arrow::datatypes::DataType,
+    table: &arrow::datatypes::DataType,
+) -> bool {
+    use arrow::datatypes::DataType as D;
+    match (file, table) {
+        (D::Int32, D::Int64) | (D::Float32, D::Float64) => true,
+        (D::Decimal128(p, s), D::Decimal128(p2, s2)) => p2 > p && s2 == s,
+        _ => false,
+    }
+}
+
 fn conform_batch_to_projection(
     decoded: &RecordBatch,
     resolved: &[Option<usize>],
@@ -2523,6 +2537,20 @@ fn conform_batch_to_projection(
                             ))
                         })?;
                     columns.push(filled);
+                    continue;
+                }
+                // A file written before `ALTER COLUMN ... SET DATA TYPE` keeps
+                // the old type; widen it to the promoted one (#859).
+                if is_type_promotion(column.data_type(), field.data_type()) {
+                    let widened = arrow::compute::cast(column, field.data_type()).map_err(|e| {
+                        DataFusionError::Internal(format!(
+                            "failed to widen column `{}` from {} to {}: {e}",
+                            field.name(),
+                            column.data_type(),
+                            field.data_type()
+                        ))
+                    })?;
+                    columns.push(widened);
                     continue;
                 }
                 columns.push(Arc::clone(column));
@@ -3952,6 +3980,51 @@ mod projection_evolution_tests {
             "the column the file does not have must be NULL, never the first \
              column's values"
         );
+    }
+
+    /// A file written before `ALTER COLUMN ... SET DATA TYPE` keeps the old
+    /// type; it reads widened to the promoted one (#859).
+    #[test]
+    fn a_promoted_column_reads_widened_from_an_older_file() {
+        use arrow::array::{Decimal128Array, Float32Array, Int32Array};
+        let target = Arc::new(Schema::new(vec![
+            Field::new("i", DataType::Int64, true),
+            Field::new("f", DataType::Float64, true),
+            Field::new("d", DataType::Decimal128(12, 2), true),
+        ]));
+        let decoded = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("i", DataType::Int32, true),
+                Field::new("f", DataType::Float32, true),
+                Field::new("d", DataType::Decimal128(10, 2), true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![7])),
+                Arc::new(Float32Array::from(vec![1.5])),
+                Arc::new(
+                    Decimal128Array::from(vec![1225])
+                        .with_precision_and_scale(10, 2)
+                        .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let resolved = [Some(0), Some(1), Some(2)];
+        let out = conform_batch_to_projection(&decoded, &resolved, &target, &[]).expect("conform");
+        assert_eq!(out.schema(), target);
+        use arrow::array::AsArray;
+        use arrow::datatypes::{Decimal128Type, Float64Type, Int64Type};
+        assert_eq!(out.column(0).as_primitive::<Int64Type>().value(0), 7);
+        assert_eq!(out.column(1).as_primitive::<Float64Type>().value(0), 1.5);
+        assert_eq!(
+            out.column(2).as_primitive::<Decimal128Type>().value(0),
+            1225
+        );
+        assert!(!is_type_promotion(&DataType::Int64, &DataType::Int32));
+        assert!(!is_type_promotion(
+            &DataType::Decimal128(10, 2),
+            &DataType::Decimal128(12, 3)
+        ));
     }
 
     /// No data file stores a V3 `unknown` struct member (#859). The struct
