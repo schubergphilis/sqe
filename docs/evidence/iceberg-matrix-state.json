@@ -245,18 +245,18 @@
     },
     "sqe:bloom-filters:v2": {
       "level": "full",
-      "notes": "Every data-file write path builds WriterProperties through build_writer_props, which emits Parquet bloom filters; the footer test re-reads the file and finds the bloom offset. DataFusion uses them at scan time. Puffin carries NDV sketches, not blooms.",
-      "evidence": "crates/sqe-compaction/src/parquet_writer_config.rs#build_writer_props, crates/sqe-compaction/src/parquet_writer_config.rs#writer_props_emit_bloom_filter_in_parquet_footer",
+      "notes": "Every data-file write path builds WriterProperties through build_writer_props, which emits Parquet bloom filters; the footer test re-reads the file and finds the bloom offset. DataFusion uses them at scan time. Puffin carries NDV sketches, not blooms. The Iceberg spec keys write.parquet.bloom-filter-enabled.column.<col> / -fpp.column.<col> are honoured too: an SQE INSERT into a table Spark configured writes blooms for exactly those columns, struct members included.",
+      "evidence": "crates/sqe-compaction/src/parquet_writer_config.rs#build_writer_props, crates/sqe-compaction/src/parquet_writer_config.rs#writer_props_emit_bloom_filter_in_parquet_footer, crates/sqe-coordinator/tests/it/bloom_spec_spark_interop.rs::bloom_spec_spark_interop_sqe_insert_writes_bloom_v2",
       "caveats": [
-        "SQE reads its own property names (write.parquet.bloom-filter-columns / -fpp / -auto), not Iceberg's write.parquet.bloom-filter-enabled.column.<col>, so a table configured by Spark does not get blooms from SQE writes unless auto-detection picks the column."
+        "write.parquet.bloom-filter-max-bytes is ignored: parquet-rs sizes a filter from the row count. Members of lists and maps get no bloom."
       ]
     },
     "sqe:bloom-filters:v3": {
       "level": "full",
-      "notes": "Same writer helper as V2; the bloom property round-trips through Polaris on a V3 table.",
-      "evidence": "crates/sqe-compaction/src/parquet_writer_config.rs#writer_props_emit_bloom_filter_in_parquet_footer, crates/sqe-coordinator/tests/it/v3_e2e.rs::bloom_filter_property_round_trips_on_v3_table",
+      "notes": "Same writer helper as V2; the bloom property round-trips through Polaris on a V3 table, and an SQE INSERT into a V3 table Spark configured with the Iceberg spec keys writes blooms for exactly those columns.",
+      "evidence": "crates/sqe-compaction/src/parquet_writer_config.rs#writer_props_emit_bloom_filter_in_parquet_footer, crates/sqe-coordinator/tests/it/v3_e2e.rs::bloom_filter_property_round_trips_on_v3_table, crates/sqe-coordinator/tests/it/bloom_spec_spark_interop.rs::bloom_spec_spark_interop_sqe_insert_writes_bloom_v3",
       "caveats": [
-        "SQE reads its own property names (write.parquet.bloom-filter-columns / -fpp / -auto), not Iceberg's write.parquet.bloom-filter-enabled.column.<col>, so a table configured by Spark does not get blooms from SQE writes unless auto-detection picks the column."
+        "write.parquet.bloom-filter-max-bytes is ignored: parquet-rs sizes a filter from the row count. Members of lists and maps get no bloom."
       ]
     },
     "sqe:aws-glue-catalog:v2": {

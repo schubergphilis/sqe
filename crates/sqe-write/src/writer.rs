@@ -654,8 +654,8 @@ mod tests {
 
     // Bloom filter unit tests live next to their implementation in
     // `sqe_compaction::parquet_writer_config`. The coordinator writer is a
-    // thin wrapper; end-to-end coverage runs in
-    // `tests/bloom_distributed_write.rs`.
+    // thin wrapper; the end-to-end footer check is the integration test
+    // `bloom_spec_spark_interop` in sqe-coordinator.
     //
     // `parse_parquet_compression`'s own unit test
     // (`lz4_string_maps_to_lz4_raw`) and the `BoundedFanoutWriter`/

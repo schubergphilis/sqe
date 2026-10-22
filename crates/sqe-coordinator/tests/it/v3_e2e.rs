@@ -864,8 +864,9 @@ async fn time_travel_on_v3_table() {
 // Setting write.parquet.bloom-filter-columns on a V3 table is accepted
 // by CREATE TABLE, INSERT round-trips, and the property surfaces back
 // through SHOW CREATE TABLE so users can verify their table's
-// configuration. The bloom-filter footer itself is checked by the
-// dedicated bloom test suite (Phase F).
+// configuration. The bloom-filter footer itself is checked by
+// `bloom_spec_spark_interop` and the unit tests in
+// sqe-compaction's parquet_writer_config.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:polaris"]
