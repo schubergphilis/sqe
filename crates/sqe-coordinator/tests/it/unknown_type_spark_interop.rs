@@ -70,8 +70,8 @@ async fn unknown_column_reads_writes_and_promotes() {
     ));
     let _ = spark_sql(&format!("DROP TABLE IF EXISTS rest.{fq}"));
 
-    // DataFusion's information_schema names Arrow types; unknown is Null.
-    assert_eq!(declared, vec!["id|Int32", "u|Null"], "declared types");
+    // information_schema keeps Arrow names, except unknown (Arrow Null).
+    assert_eq!(declared, vec!["id|Int32", "u|unknown"], "declared types");
     assert_eq!(before, vec!["1|NULL|true", "2|NULL|true"], "Spark's rows");
     assert_eq!(
         after,
