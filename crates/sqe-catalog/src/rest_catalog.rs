@@ -3282,14 +3282,15 @@ impl SessionCatalog {
     /// calls address the table the client loaded (#873). It equals the
     /// warehouse name on Polaris only; Nessie sends `main%7Cwarehouse`. A
     /// server that advertises none gets no segment, as in the client. When
-    /// the config cannot be fetched, or the breaker is open (no fetch may go
-    /// out then), the warehouse name stands in; the request that follows is
-    /// refused or fails on the same connection anyway.
+    /// the config cannot be fetched, or the breaker would refuse the request
+    /// (no fetch may go out then), the warehouse name stands in; the request
+    /// that follows is refused or fails on the same connection anyway. A
+    /// breaker due for its recovery probe does fetch, so the probe goes to
+    /// the right URL and can close it.
     async fn rest_prefix(&self) -> String {
-        const BREAKER_OPEN: u8 = 2;
         let base = self.catalog_url.trim_end_matches('/');
         let prefix = match &self.inner {
-            CatalogHandle::Rest(_) if self.circuit_breaker.state_code() == BREAKER_OPEN => {
+            CatalogHandle::Rest(_) if self.circuit_breaker.would_refuse() => {
                 Some(self.warehouse.clone())
             }
             CatalogHandle::Rest(rest) => rest
@@ -6664,5 +6665,71 @@ mod rest_prefix_tests {
             .await
             .expect("HEAD without a prefix segment");
         server.verify().await;
+    }
+
+    /// A breaker due for its recovery probe: the URL is built before the
+    /// probe is admitted, and must still carry the advertised prefix, or the
+    /// probe fails on a wrong URL and the breaker never closes.
+    #[tokio::test]
+    async fn recovery_probe_goes_to_the_advertised_prefix() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "defaults": {}, "overrides": {"prefix": "main%7Cwarehouse"}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/main%7Cwarehouse/namespaces/demo/views"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/warehouse/namespaces/demo/views"))
+            .respond_with(ResponseTemplate::new(400))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let breaker = Arc::new(super::CircuitBreaker::new(
+            "prefix-probe",
+            1,
+            Duration::ZERO,
+        ));
+        breaker.record_failure();
+        assert_eq!(breaker.state_label(), "open");
+        let session = SessionCatalog::new(
+            &server.uri(),
+            "warehouse",
+            "tok-probe",
+            &Default::default(),
+            None,
+            None,
+            Some(Arc::clone(&breaker)),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let schema = serde_json::json!({
+            "type": "struct", "schema-id": 0,
+            "fields": [{"id": 1, "name": "x", "required": false, "type": "int"}]
+        });
+        session
+            .create_view(
+                &NamespaceIdent::new("demo".to_string()),
+                "v",
+                "SELECT 1 AS x",
+                &schema,
+                &Default::default(),
+            )
+            .await
+            .expect("probe admitted under the advertised prefix");
+        server.verify().await;
+        assert_eq!(breaker.state_label(), "closed");
     }
 }
