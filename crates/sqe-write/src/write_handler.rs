@@ -1986,8 +1986,11 @@ impl WriteHandler {
         // Merge user TBLPROPERTIES / WITH options (see handle_ctas for why):
         // a CTAS must keep properties like write.parquet.bloom-filter-* that
         // drive the data write, matching the plain CREATE TABLE path.
-        let mut props = self.format_version_props(create_format_version);
-        merge_user_table_properties(&mut props, user_options);
+        let props = create_table_properties(
+            &self.config.catalog.backend,
+            create_format_version,
+            user_options,
+        );
         let table_creation = TableCreation::builder()
             .name(create_name.clone())
             .schema(iceberg_schema)
@@ -2556,12 +2559,15 @@ impl WriteHandler {
         // Merge in user-specified TBLPROPERTIES / WITH options so Polaris
         // stores them alongside the format-version directive. Without this
         // step CREATE TABLE silently drops every property the user typed.
-        let mut props = self.format_version_props(format_version);
         // sqlparser 0.62 folds the old `table_properties` (TBLPROPERTIES) and
         // `with_options` (WITH (...)) fields into a single `table_options`
         // enum. Extract the user options regardless of which syntax produced
         // them so CREATE TABLE keeps every property the user typed.
-        merge_user_table_properties(&mut props, create_table_options_as_slice(&ct.table_options));
+        let props = create_table_properties(
+            &self.config.catalog.backend,
+            format_version,
+            create_table_options_as_slice(&ct.table_options),
+        );
 
         // Translate any PARTITIONED BY (...) clause into an Iceberg
         // UnboundPartitionSpec. Identity transforms cover bare column
@@ -8770,6 +8776,27 @@ pub(crate) fn create_table_options_as_slice(
     }
 }
 
+/// The properties a CREATE TABLE / CTAS hands to `create_table`: the
+/// format-version directive for the backend plus every user TBLPROPERTIES /
+/// WITH option. A non-REST catalog rejects any reserved property, including a
+/// user's own `'format-version' = '3'`; the version it asked for is already in
+/// `TableCreation.format_version` (`plan_create_table_schema` reads the
+/// option), so the reserved keys are dropped there (#854).
+pub(crate) fn create_table_properties(
+    backend: &sqe_core::config::CatalogBackend,
+    format_version: FormatVersion,
+    options: &[sqlparser::ast::SqlOption],
+) -> std::collections::HashMap<String, String> {
+    let mut props = format_version_props_for_backend(backend, format_version);
+    merge_user_table_properties(&mut props, options);
+    if !matches!(backend, sqe_core::config::CatalogBackend::Rest) {
+        props.retain(|k, _| {
+            !iceberg::spec::TableProperties::RESERVED_PROPERTIES.contains(&k.as_str())
+        });
+    }
+    props
+}
+
 pub(crate) fn merge_user_table_properties(
     props: &mut std::collections::HashMap<String, String>,
     options: &[sqlparser::ast::SqlOption],
@@ -9471,6 +9498,44 @@ mod tests {
         assert!(
             s3tables.is_empty(),
             "S3 Tables backend must not carry the reserved format-version property"
+        );
+    }
+
+    /// A user's own `TBLPROPERTIES ('format-version' = '3')` is a reserved
+    /// property too: Glue rejected the CREATE TABLE with it (#854). The
+    /// version still reaches the table via `TableCreation.format_version`.
+    #[test]
+    fn a_user_format_version_option_is_dropped_for_non_rest_backends() {
+        use sqe_core::config::CatalogBackend;
+        use sqlparser::ast::{Expr, Ident, SqlOption, Value};
+
+        let options = [
+            SqlOption::KeyValue {
+                key: Ident::new("format-version"),
+                value: Expr::value(Value::SingleQuotedString("3".into())),
+            },
+            SqlOption::KeyValue {
+                key: Ident::new("write.delete.mode"),
+                value: Expr::value(Value::SingleQuotedString("merge-on-read".into())),
+            },
+        ];
+        let glue = CatalogBackend::Glue {
+            region: "eu-central-1".to_string(),
+            warehouse: String::new(),
+            endpoint: None,
+        };
+        let props = create_table_properties(&glue, FormatVersion::V3, &options);
+        assert_eq!(props.get("format-version"), None, "{props:?}");
+        assert_eq!(
+            props.get("write.delete.mode").map(String::as_str),
+            Some("merge-on-read")
+        );
+
+        let props = create_table_properties(&CatalogBackend::Rest, FormatVersion::V3, &options);
+        assert_eq!(props.get("format-version").map(String::as_str), Some("3"));
+        assert_eq!(
+            props.get("write.delete.mode").map(String::as_str),
+            Some("merge-on-read")
         );
     }
 

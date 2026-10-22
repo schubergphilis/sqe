@@ -44,7 +44,7 @@ mod glue {
     /// live AWS path. Glue databases are regional and need a real S3
     /// bucket to exist for the LocationUri.
     ///
-    /// last verified: never in this tree
+    /// last verified: 2026-10-22 (eu-central-1)
     #[tokio::test]
     #[ignore = "needs:aws; pre-created S3 bucket"]
     async fn live_glue_namespace_round_trip() {
@@ -766,7 +766,7 @@ mod s3_tables {
     /// the `/v1/config` `prefix` override:
     /// `<account-id>:s3tablescatalog/<bucket-name>`.
     ///
-    /// last verified: never in this tree
+    /// last verified: 2026-10-22 (eu-central-1)
     #[tokio::test]
     #[ignore = "needs:aws; pre-existing S3 Tables bucket"]
     async fn list_namespaces_via_glue_rest() {
