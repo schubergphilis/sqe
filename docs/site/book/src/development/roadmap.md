@@ -277,7 +277,7 @@ Iceberg V3 table format support landed end-to-end. V3 is the default format-vers
 | Feature | Status |
 |---|---|
 | Pruning and typed access on shredded variant fields | Shredded fields are unshredded on read |
-| `ALTER COLUMN` on a list element or map value | `SET DATA TYPE` promotes top-level columns and struct members (`s.a`), not `l.element` or `m.value` |
+| DATE to TIMESTAMP promotion | Refused: Iceberg Java refuses it too |
 | Geometry / geography type | DataFusion UDT [#12644](https://github.com/apache/datafusion/issues/12644) |
 | Multi-arg partition transforms | Not started |
 

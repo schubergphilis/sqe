@@ -85,12 +85,11 @@
     },
     "sqe:type-promotion:v3": {
       "level": "full",
-      "notes": "ALTER TABLE ... ALTER COLUMN ... SET DATA TYPE widens columns on V3 tables (int -> bigint, real -> double, decimal precision widening, unknown -> any primitive; other changes are refused before commit, #859). The new type surfaces through information_schema.columns and the schema change commits through Polaris.",
-      "evidence": "crates/sqe-coordinator/tests/it/v3_e2e.rs::type_promotion_int_to_bigint_on_v3_table, crates/sqe-coordinator/src/catalog_ops.rs#check_type_promotion, crates/sqe-catalog/src/iceberg_scan.rs#is_type_promotion, crates/sqe-coordinator/tests/it/v3_e2e.rs::type_promotion_widens_and_refuses_the_rest, crates/sqe-coordinator/tests/it/unknown_type_spark_interop.rs::nested_type_promotion_reads_in_sqe_and_spark, crates/sqe-coordinator/src/catalog_ops.rs#set_struct_member_type",
+      "notes": "ALTER TABLE ... ALTER COLUMN ... SET DATA TYPE widens columns on V3 tables (int -> bigint, real -> double, decimal precision widening, unknown -> any primitive; other changes are refused before commit, #859). Struct members, list elements and map values are promoted by dotted path (s.a, l.element, m.value; #869); a map key never changes type. The new type surfaces through information_schema.columns and the schema change commits through Polaris.",
+      "evidence": "crates/sqe-coordinator/tests/it/v3_e2e.rs::type_promotion_int_to_bigint_on_v3_table, crates/sqe-coordinator/src/catalog_ops.rs#check_type_promotion, crates/sqe-catalog/src/iceberg_scan.rs#is_type_promotion, crates/sqe-coordinator/tests/it/v3_e2e.rs::type_promotion_widens_and_refuses_the_rest, crates/sqe-coordinator/tests/it/unknown_type_spark_interop.rs::nested_type_promotion_reads_in_sqe_and_spark, crates/sqe-coordinator/src/catalog_ops.rs#set_nested_type, crates/sqe-coordinator/tests/it/unknown_type_spark_interop.rs::list_element_and_map_value_promotion_reads_in_sqe_and_spark",
       "caveats": [
         "Nanosecond-to-microsecond narrowing not attempted (Iceberg spec rejects narrowing).",
-        "date -> timestamp (a V3 promotion) is refused: the reader path for it is untested.",
-        "A list element or map value cannot be promoted; struct members can (ALTER COLUMN s.a SET DATA TYPE)."
+        "date -> timestamp (a V3 promotion) is refused: Iceberg Java 1.12 refuses it too, so no other engine could read such a table."
       ]
     },
     "sqe:column-default-values:v3": {
