@@ -1251,6 +1251,83 @@ async fn type_promotion_int_to_bigint_on_v3_table() {
         .await;
 }
 
+/// The other widenings read back, and a type change the spec does not
+/// allow is refused before it is committed: data files keep their old
+/// type, so an accepted narrowing left every scan of the table failing.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn type_promotion_widens_and_refuses_the_rest() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let fq = "default.v3_type_promo_rules";
+    reset_table(
+        &handler,
+        &session,
+        fq,
+        &format!(
+            "CREATE TABLE {fq} (id INT, f REAL, d DECIMAL(10,2), name VARCHAR, \
+             big BIGINT, s STRUCT<a INT>)"
+        ),
+    )
+    .await;
+    let insert =
+        format!("INSERT INTO {fq} VALUES (1, 1.5, 12.25, 'abc', 5000000000, named_struct('a', 1))");
+    handler
+        .execute(&session, &insert, None)
+        .await
+        .expect(&insert);
+
+    let mut refused = Vec::new();
+    for (column, to) in [
+        ("name", "INT"),
+        ("big", "INT"),
+        ("d", "DECIMAL(8,2)"),
+        ("d", "DECIMAL(12,3)"),
+        ("s", "STRUCT<a BIGINT>"),
+    ] {
+        let alter = format!("ALTER TABLE {fq} ALTER COLUMN {column} SET DATA TYPE {to}");
+        match handler.execute(&session, &alter, None).await {
+            Ok(_) => refused.push(format!("{column} -> {to}: accepted")),
+            Err(e) => refused.push(format!(
+                "{column} -> {to}: {}",
+                e.to_string()
+                    .contains(&format!("Cannot change column '{column}'"))
+            )),
+        }
+    }
+    for (column, to) in [("f", "DOUBLE"), ("d", "DECIMAL(12,2)")] {
+        let alter = format!("ALTER TABLE {fq} ALTER COLUMN {column} SET DATA TYPE {to}");
+        handler.execute(&session, &alter, None).await.expect(&alter);
+    }
+    let insert =
+        format!("INSERT INTO {fq} VALUES (2, 2.25, 1234567890.12, 'x', 1, named_struct('a', 2))");
+    handler
+        .execute(&session, &insert, None)
+        .await
+        .expect(&insert);
+    let select = format!("SELECT id, f, d, name, big, s.a FROM {fq} ORDER BY id");
+    let rows = rendered_rows(&handler, &session, &select).await;
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+
+    assert_eq!(
+        refused,
+        [
+            "name -> INT: true",
+            "big -> INT: true",
+            "d -> DECIMAL(8,2): true",
+            "d -> DECIMAL(12,3): true",
+            "s -> STRUCT<a BIGINT>: true",
+        ],
+        "refused type changes"
+    );
+    assert_eq!(
+        rows,
+        ["1|1.5|12.25|abc|5000000000|1", "2|2.25|1234567890.12|x|1|2"],
+        "rows after float -> double and decimal(10,2) -> decimal(12,2)"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Cell: sqe:statistics:v3
 //

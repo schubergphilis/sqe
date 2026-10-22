@@ -306,7 +306,8 @@ pub async fn write_data_files_streaming(
     let parquet_writer_builder = ParquetWriterBuilder::new(
         crate::parquet_writer_config::writer_props_for_table(table, compression),
         write_schema.clone(),
-    );
+    )
+    .with_shred_variants(shred_variants(table));
 
     // Roll output at the caller's requested size when given (compaction pins
     // this to `target_file_size_bytes` so a globally-sorted stream is cut into
@@ -491,6 +492,16 @@ pub async fn write_data_files_streaming(
     );
 
     Ok((data_files, total_rows))
+}
+
+/// Whether `table` asks for shredded variant columns
+/// (`write.parquet.shred-variants`, as Spark and Iceberg Java read it).
+pub fn shred_variants(table: &Table) -> bool {
+    table
+        .metadata()
+        .properties()
+        .get("write.parquet.shred-variants")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
 /// Whether a write into `table` must persist V3 row lineage: the table is V3

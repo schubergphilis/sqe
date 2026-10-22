@@ -57,7 +57,7 @@ A column `DEFAULT` takes a literal and makes the table format-version 3. An `INS
 | `ALTER TABLE t ALTER COLUMN c SET NOT NULL` | `sqlparser-rs` + `sqe-coordinator` | Tighten nullability. Fails if existing rows have NULL. | yes | yes | yes | yes |
 | `ALTER TABLE t ALTER COLUMN c DROP NOT NULL` | `sqlparser-rs` + `sqe-coordinator` | Loosen nullability. | yes | yes | yes | yes |
 | `ALTER TABLE t ALTER COLUMN c SET DEFAULT expr` | `sqlparser-rs` + `sqe-coordinator` | Iceberg V3 column default. | partial | yes | yes | yes |
-| `ALTER TABLE t ALTER COLUMN c TYPE new_type` | `sqlparser-rs` + `sqe-coordinator` | Type promotion only (e.g. INT -> BIGINT). Lossy changes rejected. | partial | partial | partial | partial |
+| `ALTER TABLE t ALTER COLUMN c TYPE new_type` | `sqlparser-rs` + `sqe-coordinator` | Iceberg type promotion only: INT -> BIGINT, REAL -> DOUBLE, a wider DECIMAL precision with the same scale, and (V3) UNKNOWN -> any primitive type. Any other change is rejected before it is committed. Top-level columns only. | partial | partial | partial | partial |
 | `ALTER TABLE t RENAME TO new_t` | `sqlparser-rs` + `sqe-coordinator` | Catalog rename. Different catalog support varies. | yes | yes | yes | yes |
 | `ALTER TABLE t SET TBLPROPERTIES (...)` | `sqlparser-rs` + `sqe-coordinator` | Set Iceberg properties (e.g. `write.delete.mode`). | yes | yes | yes | - |
 | `COMMENT ON TABLE t IS 'description'` | `sqlparser-rs` + `sqe-coordinator` | Stored in Iceberg properties. | yes | yes | yes | yes |
@@ -203,7 +203,7 @@ These types only exist in format-version 3, the default for new tables. A `TIMES
 |---|---|
 | `TIMESTAMP_NS`, `TIMESTAMP_NS WITH TIME ZONE` | Nanosecond precision timestamps. Arrow `Timestamp(Nanosecond, ...)`. |
 | `VARIANT` | Semi-structured value (object, array, string, number, boolean, null) in the Iceberg variant binary encoding. See [VARIANT](#variant) below. |
-| `UNKNOWN` (also `VOID`) | A column declared before its type is known. Holds only NULLs, is never written to data files, and is promoted later with `ALTER COLUMN ... SET DATA TYPE`. Also allowed as a struct member, including a struct inside a list; an unknown list element or map key/value is refused. |
+| `UNKNOWN` (also `VOID`) | A column declared before its type is known. Holds only NULLs, is never written to data files, and is promoted later with `ALTER COLUMN ... SET DATA TYPE`. Also allowed as a struct member, including a struct inside a list. An unknown list element or map key/value, or a struct whose members are all unknown, can be declared but no row can be written (Iceberg Java refuses the same). |
 | Default values via `DEFAULT expr` | Existing rows in older snapshots inherit the default at read time. |
 
 ### VARIANT
@@ -221,8 +221,8 @@ INSERT INTO events VALUES (1, '{"user": "a", "tags": [1, 2]}'), (2, '"plain text
 - **`variant_get` reads a typed field.** `variant_get(payload, '$.tags[1]', 'int')` reads one field straight from the variant encoding, without rendering the value as JSON text first. The path is `$` followed by `.field`, `['field']` or `[index]` steps, and must be a literal. The third argument names the result type: `boolean`, `tinyint`, `smallint`, `int`, `bigint`, `float`, `double`, `decimal(p,s)`, `string`, `binary`, `date`, `timestamp`, `timestamp_ntz`. Without it the result is a variant. A path that does not exist gives NULL. A value that does not convert to the type is an error; `try_variant_get` gives NULL instead. Both follow Spark's functions of the same names.
 - **Compaction keeps the values.** `CALL system.rewrite_data_files` on a table with a variant column rewrites it as variant, and every value reads back unchanged.
 - **Existing JSON columns are not converted.** Iceberg does not allow evolving a `string` column to `variant`, so a column that holds JSON text stays a string. To convert one, copy it into a table declared with a `VARIANT` column, where the write parses each value: `CREATE TABLE t2 (id BIGINT, doc VARIANT); INSERT INTO t2 SELECT id, doc FROM t1;`.
-- **Shredded files are read, not written.** A variant another engine wrote shredded (Spark with `write.parquet.shred-variants=true`) reads as the same JSON text as an unshredded one, on the coordinator and on workers. SQE always writes unshredded variants, and it unshreds on read, so a shredded field gives no pruning or typed access.
-- **Not yet:** variant path functions (`variant_get`), writing shredded variants, and nested variants (inside a `ROW` or `ARRAY`) on Flight SQL, which arrive as the raw storage struct.
+- **Shredded variants.** A table with `WITH ('write.parquet.shred-variants' = 'true')` is written shredded, as Spark and Iceberg Java write it: each data file infers its shredding from its first batch. A column whose values are all objects stores every field that has one type in every row (integer, double, string, boolean or date, also inside nested objects; at most 64 fields) in its own Parquet column. A column whose values are all one of those types is stored as that type. Arrays, decimals, timestamps and fields of mixed type stay in the binary value, and a later row whose field has another type is written unshredded, so no value changes type. Only top-level variant columns are shredded. A variant another engine wrote shredded reads as the same JSON text as an unshredded one, on the coordinator and on workers. SQE unshreds on read, so a shredded field gives no pruning or typed access yet.
+- **Not yet:** nested variants (inside a `ROW` or `ARRAY`) on Flight SQL, which arrive as the raw storage struct.
 
 ## What CREATE / ALTER does NOT cover
 
