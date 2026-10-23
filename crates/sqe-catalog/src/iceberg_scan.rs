@@ -2460,6 +2460,20 @@ fn is_type_promotion(
     }
 }
 
+/// A file another engine wrote carries no Arrow schema, so its BINARY
+/// columns (and geospatial WKB, sqe#863) decode as `Binary` where the table
+/// schema says `LargeBinary`. Same bytes, different offset width.
+fn is_binary_width_change(
+    file: &arrow::datatypes::DataType,
+    table: &arrow::datatypes::DataType,
+) -> bool {
+    use arrow::datatypes::DataType as D;
+    matches!(
+        (file, table),
+        (D::Binary | D::BinaryView, D::LargeBinary) | (D::LargeBinary | D::BinaryView, D::Binary)
+    )
+}
+
 fn conform_batch_to_projection(
     decoded: &RecordBatch,
     resolved: &[Option<usize>],
@@ -2544,7 +2558,9 @@ fn conform_batch_to_projection(
                 }
                 // A file written before `ALTER COLUMN ... SET DATA TYPE` keeps
                 // the old type; widen it to the promoted one (#859).
-                if is_type_promotion(column.data_type(), field.data_type()) {
+                if is_type_promotion(column.data_type(), field.data_type())
+                    || is_binary_width_change(column.data_type(), field.data_type())
+                {
                     let widened = arrow::compute::cast(column, field.data_type()).map_err(|e| {
                         DataFusionError::Internal(format!(
                             "failed to widen column `{}` from {} to {}: {e}",
@@ -4066,6 +4082,36 @@ mod projection_evolution_tests {
         let s = out.column(0).as_struct();
         assert_eq!(s.column(0).as_primitive::<Int64Type>().value(0), 7);
         assert_eq!(s.column(1).as_primitive::<Float64Type>().value(0), 1.5);
+    }
+
+    /// Spark writes no Arrow schema, so its BINARY and geospatial WKB columns
+    /// decode as `Binary`; the table schema says `LargeBinary` and keeps the
+    /// GeoArrow extension tag (sqe#863).
+    #[test]
+    fn a_binary_column_widens_to_the_declared_large_binary() {
+        use arrow::array::{Array, BinaryArray, LargeBinaryArray};
+        let tagged = Field::new("g", DataType::LargeBinary, true).with_metadata(
+            [(
+                "ARROW:extension:name".to_string(),
+                "geoarrow.wkb".to_string(),
+            )]
+            .into(),
+        );
+        let target = Arc::new(Schema::new(vec![tagged]));
+        let decoded = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("g", DataType::Binary, true)])),
+            vec![Arc::new(BinaryArray::from(vec![Some(&[1u8, 2][..]), None]))],
+        )
+        .unwrap();
+        let out = conform_batch_to_projection(&decoded, &[Some(0)], &target, &[]).expect("conform");
+        assert_eq!(out.schema(), target);
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        assert_eq!(col.value(0), &[1, 2]);
+        assert!(col.is_null(1));
     }
 
     /// No data file stores a V3 `unknown` struct member (#859). The struct

@@ -82,7 +82,7 @@ once_cell = { version = "1" }
 opentelemetry = { version = "0.33", features = ["testing"] }
 opentelemetry_sdk = { version = "0.33", features = ["rt-tokio", "testing"] }
 ordered-float = { version = "4", features = ["serde"] }
-parquet = { version = "59", features = ["arrow_canonical_extension_types", "encryption", "object_store", "variant_experimental"] }
+parquet = { version = "59", features = ["arrow_canonical_extension_types", "encryption", "geospatial", "object_store", "variant_experimental"] }
 percent-encoding = { version = "2" }
 portable-atomic = { version = "1", features = ["require-cas"] }
 prost-types = { version = "0.14" }

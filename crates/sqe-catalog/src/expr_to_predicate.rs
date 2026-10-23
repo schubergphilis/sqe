@@ -104,9 +104,17 @@ fn to_iceberg_predicate(expr: &Expr, schema: Option<&Schema>) -> TransformedResu
             }
         }
         Expr::Column(column) => {
-            let data_type = schema
-                .and_then(|s| s.field_with_name(column.name()).ok())
-                .map(|f| f.data_type().clone());
+            let field = schema.and_then(|s| s.field_with_name(column.name()).ok());
+            // A geospatial column's stats are a bounding box, not byte-wise
+            // bounds, and iceberg cannot bind a binary literal to it (sqe#863).
+            if field.is_some_and(|f| {
+                f.metadata()
+                    .get("ARROW:extension:name")
+                    .is_some_and(|n| n.starts_with("geoarrow."))
+            }) {
+                return TransformedResult::NotTransformed;
+            }
+            let data_type = field.map(|f| f.data_type().clone());
             TransformedResult::Column(Reference::new(column.name()), data_type)
         }
         Expr::Literal(literal, _) => match scalar_value_to_datum(literal) {
@@ -422,6 +430,30 @@ mod tests {
     }
 
     // ─── Comparison operators ──────────────────────────────────────
+
+    /// Filters on a geospatial column stay in DataFusion (sqe#863); the
+    /// rest of the conjunction still pushes down.
+    #[test]
+    fn a_geospatial_column_is_not_pushed_down() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        let geo = Field::new("g", DataType::LargeBinary, true).with_metadata(
+            [(
+                "ARROW:extension:name".to_string(),
+                "geoarrow.wkb".to_string(),
+            )]
+            .into(),
+        );
+        let schema = Schema::new(vec![Field::new("a", DataType::Int64, true), geo]);
+        let wkb = Expr::Literal(ScalarValue::LargeBinary(Some(vec![1, 2])), None);
+        let on_geo = binary(col("g"), Operator::Eq, wkb);
+        assert!(!is_filter_pushdown_supported(&on_geo, Some(&schema)));
+        let pred = convert_filters_to_predicate_for(
+            &[on_geo, binary(col("a"), Operator::Eq, lit_i64(1))],
+            Some(&schema),
+        )
+        .unwrap();
+        assert_eq!(pred, Reference::new("a").equal_to(Datum::long(1)));
+    }
 
     #[test]
     fn test_eq() {

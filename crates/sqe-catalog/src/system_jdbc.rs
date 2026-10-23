@@ -646,6 +646,8 @@ fn iceberg_type_to_jdbc(ty: &iceberg::spec::Type) -> (i32, &'static str) {
             PrimitiveType::Uuid => (12, "varchar"),
             PrimitiveType::Fixed(_) => (-3, "varbinary"),
             PrimitiveType::Binary => (-3, "varbinary"),
+            // V3 geospatial (sqe#863): read back as WKB bytes.
+            PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => (-3, "varbinary"),
             // V3 `unknown` (always-null column): java.sql.Types.NULL.
             PrimitiveType::Unknown => (0, "null"),
         },

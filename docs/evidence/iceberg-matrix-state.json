@@ -11,11 +11,11 @@
     "docUrl": "https://docs.getsqe.com"
   },
   "generatedAt": "2026-10-23T00:00:00Z",
-  "generatedBy": "Rescore against the pinned upstream rubric; evidence paths repaired after the crate and test moves. 2026-10-18: unknown-type and shredded-variant measured against Spark 4.1 + Iceberg 1.12. 2026-10-20: merge-on-read deletes, deletion vectors and row lineage read back by Spark 4.1 + Iceberg 1.12 (mor_spark_interop); stub evidence removed. 2026-10-21: SQE writes shredded variants (write.parquet.shred-variants), read back by Spark 4.1 + Iceberg 1.12; shredded-variant:v3 to full. unknown-type:v3 to full: nested shapes measured against Iceberg Java (same refusals), promotion rules enforced. 2026-10-22: list elements and map values promote with SET DATA TYPE (#869). 2026-10-23: rubric pin moved to d14d0f1341 (features.json unchanged since 2dd75e0aa2; the new commits add Dremio and catalog-side entries).",
+  "generatedBy": "Rescore against the pinned upstream rubric; evidence paths repaired after the crate and test moves. 2026-10-18: unknown-type and shredded-variant measured against Spark 4.1 + Iceberg 1.12. 2026-10-20: merge-on-read deletes, deletion vectors and row lineage read back by Spark 4.1 + Iceberg 1.12 (mor_spark_interop); stub evidence removed. 2026-10-21: SQE writes shredded variants (write.parquet.shred-variants), read back by Spark 4.1 + Iceberg 1.12; shredded-variant:v3 to full. unknown-type:v3 to full: nested shapes measured against Iceberg Java (same refusals), promotion rules enforced. 2026-10-22: list elements and map values promote with SET DATA TYPE (#869). 2026-10-23: rubric pin moved to d14d0f1341 (features.json unchanged since 2dd75e0aa2; the new commits add Dremio and catalog-side entries). geometry-type:v3 to partial: SQE reads Spark-written GEOMETRY / GEOGRAPHY columns (#863), writes refused.",
   "score": {
-    "raw": 150,
+    "raw": 152,
     "max": 162,
-    "percent": 92.6
+    "percent": 93.8
   },
   "note": "Rescored on 2026-10-17 against upstream features.json (32 features). Only cells that apply to a version are scored, as the site shows them: position-deletes is V2-only now, so 54 cells, max 162. Removed upstream and dropped here: hive-metastore, nessie, polaris, hadoop-catalog, jdbc-catalog, vector-type, cdc-support. New: deletion-vectors, unknown-type, google-lakehouse. Gains: deletion vectors and row lineage on V3, unshredded VARIANT. Downgrade: unity-catalog to partial (read-only smoke). The old 167/189 is not comparable.",
   "support": {
@@ -351,10 +351,15 @@
       ]
     },
     "sqe:geometry-type:v3": {
-      "level": "none",
-      "notes": "No GEOMETRY / GEOGRAPHY type in SQE DDL or the read path.",
-      "evidence": null,
-      "caveats": []
+      "level": "partial",
+      "notes": "SQE reads GEOMETRY and GEOGRAPHY columns. The vendored iceberg-rust carries the upstream geospatial types and the read support from apache/iceberg-rust #3341; a column reads as WKB bytes (LargeBinary tagged geoarrow.wkb), filters and joins on it run in DataFusion, and information_schema reports it as varbinary with udt_name geometry / geography. Verified against a table written by Spark 4.1 + Iceberg 1.12 (spark.sql.geospatial.enabled). Writes into a table with a geospatial column are refused with NOT_SUPPORTED.",
+      "evidence": "vendor/iceberg-rust/crates/iceberg/src/spec/geospatial.rs, crates/sqe-catalog/src/iceberg_scan.rs#is_binary_width_change, crates/sqe-catalog/src/expr_to_predicate.rs, crates/sqe-compaction/src/writer.rs#reject_geospatial_write, crates/sqe-catalog/src/info_schema.rs, crates/sqe-coordinator/tests/it/geo_spark_interop.rs::sqe_reads_a_spark_geospatial_table",
+      "caveats": [
+        "Read-only: INSERT, CTAS, MERGE/UPDATE/DELETE and compaction refuse a table with a geospatial column until the iceberg-rust writer computes geospatial bounds.",
+        "No GEOMETRY / GEOGRAPHY DDL: CREATE TABLE with one fails with 'SQL type not supported'.",
+        "No ST_* functions and no bounding-box pruning: a predicate on a geospatial column is never pushed into the scan.",
+        "Verified on the coordinator scan only. A worker decodes through the iceberg-rust reader (which the backported read support covers) and is not tested on a geospatial table yet."
+      ]
     },
     "sqe:nanosecond-timestamps:v3": {
       "level": "full",

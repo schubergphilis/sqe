@@ -72,7 +72,9 @@ parquet = { workspace = true, features = [
   "encryption",
   "variant_experimental",
   "arrow_canonical_extension_types",
+  "geospatial",
 ] }
+parquet-geospatial = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 roaring = { workspace = true }
