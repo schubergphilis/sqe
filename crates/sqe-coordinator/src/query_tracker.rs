@@ -87,7 +87,10 @@ pub struct QueryRecord {
     pub error_code: Option<String>,
     pub error_message: Option<String>,
     pub tables_touched: Vec<String>,
+    /// Bytes the scans decoded (their output).
     pub bytes_scanned: u64,
+    /// Bytes the scans fetched from storage.
+    pub physical_input_bytes: u64,
     pub rows_scanned: u64,
     pub spill_bytes: u64,
     pub peak_memory_bytes: u64,
@@ -277,6 +280,7 @@ impl QueryTracker {
             error_message: None,
             tables_touched: Vec::new(),
             bytes_scanned: 0,
+            physical_input_bytes: 0,
             rows_scanned: 0,
             spill_bytes: 0,
             peak_memory_bytes: 0,
@@ -403,6 +407,11 @@ impl QueryTracker {
     /// terminal record so it carries the count alongside the other stats.
     pub fn set_rows_written(&self, query_id: &Uuid, rows_written: u64) {
         self.update(query_id, |record| record.rows_written = Some(rows_written));
+    }
+
+    /// Record the bytes the statement's scans fetched from storage.
+    pub fn set_physical_input_bytes(&self, query_id: &Uuid, bytes: u64) {
+        self.update(query_id, |record| record.physical_input_bytes = bytes);
     }
 
     /// Cancel an in-flight query: fire its token and move the record to
