@@ -2084,14 +2084,14 @@ async fn run_with_lease_renewal<'a, T>(
 }
 
 /// Build a `sqe_sql::TableRef` from a discovered `TableIdent`, the reverse
-/// of `crate::maintenance::to_table_ident` (which this crate keeps private
-/// to that module). Round-trips correctly for the single-segment namespaces
-/// every table constructed in this codebase uses (`NamespaceIdent::new`);
-/// see `TableIdent`'s `Display` impl (`{namespace}.{name}`, and
-/// `NamespaceIdent`'s `Display` joins its segments with `.` too), which is
-/// exactly the 2-part form `TableRef::parse` accepts.
+/// of `crate::maintenance::to_table_ident`. Built field by field: parsing
+/// `ident.to_string()` would read a nested namespace `a.b.t` as catalog `a`.
 fn table_ref_from_ident(ident: &TableIdent) -> sqe_core::Result<TableRef> {
-    TableRef::parse(&ident.to_string())
+    Ok(TableRef {
+        catalog: None,
+        namespace: ident.namespace().join("."),
+        name: ident.name().to_string(),
+    })
 }
 
 /// Per-table compaction knobs after resolving `[maintenance.compaction]`
@@ -2624,6 +2624,15 @@ mod tests {
         assert_eq!(table_ref.namespace, "ns");
         assert_eq!(table_ref.name, "t");
         assert_eq!(table_ref.catalog, None);
+    }
+
+    #[test]
+    fn table_ref_from_ident_keeps_a_nested_namespace() {
+        let ns = iceberg::NamespaceIdent::from_strs(["a", "b"]).unwrap();
+        let table_ref = table_ref_from_ident(&TableIdent::new(ns, "t".to_string())).unwrap();
+        assert_eq!(table_ref.catalog, None);
+        assert_eq!(table_ref.namespace_parts(), vec!["a", "b"]);
+        assert_eq!(table_ref.name, "t");
     }
 
     #[test]
@@ -3367,6 +3376,7 @@ mod tests {
                 },
                 compaction: MaintenanceCompactionConfig::default(),
                 distribution: MaintenanceDistributionConfig::default(),
+                ..Default::default()
             };
             let principal = Arc::new(
                 MaintenancePrincipal::from_config(cfg.principal.as_ref().expect("principal set"))

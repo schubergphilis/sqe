@@ -16,7 +16,8 @@
 //!   distributed => 'auto'|'local'|'require', rewrite_all => true])`
 //! - `system.expire_snapshots(table => 'ns.t'[, older_than => TIMESTAMP,
 //!   retain_last => N])`
-//! - `system.remove_orphan_files(table => 'ns.t'[, older_than => TIMESTAMP])`
+//! - `system.remove_orphan_files(table => 'ns.t'[, older_than => TIMESTAMP,
+//!   dry_run => true])`
 //! - `system.rewrite_manifests(table => 'ns.t')`
 //! - `system.table_health(table => 'ns.t')` -- read-only compaction-debt
 //!   report (small/delete-heavy file counts, eligible rewrite groups,
@@ -109,6 +110,8 @@ pub enum ProcedureCall {
         /// Only consider files older than this timestamp.
         /// Default is 3 days before now, to avoid races with in-flight writes.
         older_than: Option<DateTime<Utc>>,
+        /// When true, list the orphan files and delete none. Default false.
+        dry_run: bool,
     },
     /// Consolidate small manifest files via vendored `RewriteManifestsAction`.
     RewriteManifests { table: TableRef },
@@ -279,31 +282,34 @@ impl ProcedureCall {
     }
 }
 
-/// A parsed 1- or 2-part namespace reference. Mirrors [`TableRef`] but with
-/// no `name` segment. Catalog prefix is retained for display; handlers
-/// resolve against the session's bound catalog.
+/// A parsed namespace reference: `ns`, `cat.ns`, or `cat.a.b` for a nested
+/// namespace (`a.b`). Mirrors [`TableRef`] but with no `name` segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamespaceRef {
     pub catalog: Option<String>,
+    /// Namespace levels joined with `.`; see [`Self::namespace_parts`].
     pub namespace: String,
 }
 
 impl NamespaceRef {
     pub fn parse(s: &str) -> sqe_core::Result<Self> {
-        let parts: Vec<&str> = s.split('.').map(|p| p.trim()).collect();
+        let parts = dotted_parts(s, "namespace")?;
         match parts.as_slice() {
             [ns] => Ok(Self {
                 catalog: None,
                 namespace: (*ns).to_string(),
             }),
-            [cat, ns] => Ok(Self {
+            [cat, ns @ ..] => Ok(Self {
                 catalog: Some((*cat).to_string()),
-                namespace: (*ns).to_string(),
+                namespace: ns.join("."),
             }),
-            _ => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                "Invalid namespace reference in CALL: '{s}' (expected 1 or 2 dotted parts)"
-            ))),
+            [] => unreachable!("split yields at least one part"),
         }
+    }
+
+    /// The namespace levels, for `NamespaceIdent::from_vec`.
+    pub fn namespace_parts(&self) -> Vec<String> {
+        self.namespace.split('.').map(str::to_string).collect()
     }
 
     pub fn as_string(&self) -> String {
@@ -314,23 +320,41 @@ impl NamespaceRef {
     }
 }
 
-/// A parsed 1-, 2-, or 3-part table reference.
+/// A parsed table reference: `t`, `ns.t`, `cat.ns.t`, or `cat.a.b.t` for a
+/// table in a nested namespace (`a.b`). A nested namespace needs the catalog
+/// prefix: `a.b.t` is catalog `a`.
 ///
-/// The catalog prefix is retained for display and audit but handlers resolve
-/// against the session's bound catalog regardless. Namespace defaults to
-/// `default` for single-part references, mirroring the engine's CREATE TABLE
-/// behaviour.
+/// Namespace defaults to `default` for single-part references, mirroring the
+/// engine's CREATE TABLE behaviour.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableRef {
     pub catalog: Option<String>,
+    /// Namespace levels joined with `.`; see [`Self::namespace_parts`].
     pub namespace: String,
     pub name: String,
 }
 
+/// Split a dotted CALL argument, refusing empty segments (`a..t`).
+fn dotted_parts<'a>(s: &'a str, what: &str) -> sqe_core::Result<Vec<&'a str>> {
+    let parts: Vec<&str> = s.split('.').map(|p| p.trim()).collect();
+    if parts.iter().any(|p| p.is_empty()) {
+        return Err(SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!("Invalid {what} reference in CALL: '{s}' (empty name segment)"),
+        ));
+    }
+    Ok(parts)
+}
+
 impl TableRef {
-    /// Construct from a 1-, 2-, or 3-part dotted string.
+    /// The namespace levels, for `NamespaceIdent::from_vec`.
+    pub fn namespace_parts(&self) -> Vec<String> {
+        self.namespace.split('.').map(str::to_string).collect()
+    }
+
+    /// Construct from a dotted string; see the type docs for the forms.
     pub fn parse(s: &str) -> sqe_core::Result<Self> {
-        let parts: Vec<&str> = s.split('.').map(|p| p.trim()).collect();
+        let parts = dotted_parts(s, "table")?;
         match parts.as_slice() {
             [name] => Ok(Self {
                 catalog: None,
@@ -342,14 +366,12 @@ impl TableRef {
                 namespace: (*ns).to_string(),
                 name: (*name).to_string(),
             }),
-            [cat, ns, name] => Ok(Self {
+            [cat, ns @ .., name] => Ok(Self {
                 catalog: Some((*cat).to_string()),
-                namespace: (*ns).to_string(),
+                namespace: ns.join("."),
                 name: (*name).to_string(),
             }),
-            _ => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                "Invalid table reference in CALL: '{s}' (expected 1, 2, or 3 dotted parts)"
-            ))),
+            [] => unreachable!("split yields at least one part"),
         }
     }
 
@@ -900,9 +922,15 @@ fn parse_remove_orphan_files(mut args: Vec<(String, Expr)>) -> sqe_core::Result<
     let older_than = take_option(&mut args, "older_than", |e| {
         expect_timestamp(e, "older_than")
     })?;
+    let dry_run =
+        take_option(&mut args, "dry_run", |e| expect_bool(e, "dry_run"))?.unwrap_or(false);
     expect_no_remaining(&args, "remove_orphan_files")?;
 
-    Ok(ProcedureCall::RemoveOrphanFiles { table, older_than })
+    Ok(ProcedureCall::RemoveOrphanFiles {
+        table,
+        older_than,
+        dry_run,
+    })
 }
 
 fn parse_rewrite_manifests(mut args: Vec<(String, Expr)>) -> sqe_core::Result<ProcedureCall> {
@@ -1002,8 +1030,31 @@ mod tests {
     }
 
     #[test]
-    fn tableref_rejects_four_part() {
-        assert!(TableRef::parse("a.b.c.d").is_err());
+    fn tableref_four_parts_is_catalog_and_nested_namespace() {
+        let r = TableRef::parse("cat.a.b.t").unwrap();
+        assert_eq!(r.catalog.as_deref(), Some("cat"));
+        assert_eq!(r.namespace, "a.b");
+        assert_eq!(r.namespace_parts(), vec!["a", "b"]);
+        assert_eq!(r.name, "t");
+        assert_eq!(r.as_string(), "cat.a.b.t");
+        let flat = TableRef::parse("ns.t").unwrap();
+        assert_eq!(flat.namespace_parts(), vec!["ns"]);
+    }
+
+    #[test]
+    fn tableref_rejects_empty_segments() {
+        assert!(TableRef::parse("cat.a..t").is_err());
+        assert!(TableRef::parse("cat..t").is_err());
+        assert!(TableRef::parse(".t").is_err());
+    }
+
+    #[test]
+    fn namespaceref_three_parts_is_catalog_and_nested_namespace() {
+        let r = NamespaceRef::parse("cat.a.b").unwrap();
+        assert_eq!(r.catalog.as_deref(), Some("cat"));
+        assert_eq!(r.namespace_parts(), vec!["a", "b"]);
+        assert_eq!(r.as_string(), "cat.a.b");
+        assert!(NamespaceRef::parse("cat..b").is_err());
     }
 
     #[test]
@@ -1185,11 +1236,26 @@ mod tests {
         let stmt = parse_first("CALL system.remove_orphan_files(table => 'ns.t')");
         let call = try_parse_call(&stmt).unwrap().expect("match");
         match call {
-            ProcedureCall::RemoveOrphanFiles { older_than, .. } => {
+            ProcedureCall::RemoveOrphanFiles {
+                older_than,
+                dry_run,
+                ..
+            } => {
                 assert!(older_than.is_none());
+                assert!(!dry_run, "deleting stays the default");
             }
             other => panic!("Expected RemoveOrphanFiles, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_remove_orphan_files_dry_run() {
+        let stmt = parse_first("CALL system.remove_orphan_files(table => 'ns.t', dry_run => true)");
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        assert!(matches!(
+            call,
+            ProcedureCall::RemoveOrphanFiles { dry_run: true, .. }
+        ));
     }
 
     #[test]

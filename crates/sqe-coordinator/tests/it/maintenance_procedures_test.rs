@@ -15,7 +15,7 @@
 use sqe_sql::{parse_and_classify, ProcedureCall, StatementKind};
 
 /// The root test session as a configured admin. Admin-tier procedures
-/// (expire_snapshots, remove_orphan_files, rollback/set_current) need an
+/// (a deleting remove_orphan_files, rollback/set_current) need an
 /// admin role, and root's client-credentials token carries none. The token
 /// stays root's, so Polaris still sees the real principal.
 fn as_admin(mut session: sqe_core::Session) -> sqe_core::Session {
@@ -448,6 +448,91 @@ async fn remove_orphan_files_respects_default_threshold() {
         "expected zero recent deletions, got status='{status}'"
     );
 
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
+        .await;
+}
+
+/// `dry_run => true` lists the orphans and deletes nothing, even with a
+/// cutoff inside the `orphan_min_age_secs` floor. The same cutoff on a
+/// deleting call is refused: a file younger than the floor may belong to a
+/// commit still in flight.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn remove_orphan_files_dry_run_lists_and_floor_refuses() {
+    use object_store::ObjectStoreExt;
+    let (session, handler) = crate::common::setup_handler().await;
+    let session = as_admin(session);
+    let table = "default.maint_orphan_dry_run_test";
+
+    let data_file = table_with_a_data_file(&handler, &session, table).await;
+    let (bucket, dir_key) = split_s3(&table_dir_of(&data_file));
+    let store = purge_test_store(&bucket);
+    let orphan_key = format!("{dir_key}/data/orphan-dry-run.parquet");
+    store
+        .put(
+            &object_store::path::Path::from(orphan_key.as_str()),
+            b"not referenced by any manifest".to_vec().into(),
+        )
+        .await
+        .expect("plant orphan");
+
+    let cutoff = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+    let dry = format!(
+        "CALL system.remove_orphan_files(table => '{table}', older_than => '{cutoff}', dry_run => true)"
+    );
+    let out = handler
+        .execute(&session, &dry, None)
+        .await
+        .expect("dry run");
+    let mut listed = Vec::new();
+    for b in &out {
+        let paths = b
+            .column_by_name("path")
+            .expect("path column")
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .expect("path is Utf8");
+        let actions = b
+            .column_by_name("action")
+            .expect("action column")
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .expect("action is Utf8");
+        for i in 0..b.num_rows() {
+            assert_eq!(actions.value(i), "would_delete");
+            listed.push(paths.value(i).to_string());
+        }
+    }
+    assert!(
+        listed.iter().any(|p| p.ends_with(&orphan_key)),
+        "dry run must list the planted orphan, got {listed:?}"
+    );
+    assert!(
+        exists(store.as_ref(), &orphan_key).await,
+        "a dry run must delete nothing"
+    );
+    let (_, data_key) = split_s3(&data_file);
+    assert!(exists(store.as_ref(), &data_key).await);
+
+    let deleting =
+        format!("CALL system.remove_orphan_files(table => '{table}', older_than => '{cutoff}')");
+    let err = handler
+        .execute(&session, &deleting, None)
+        .await
+        .expect_err("a cutoff inside the floor must be refused");
+    assert!(
+        err.to_string().contains("orphan_min_age_secs"),
+        "the refusal names the setting, got: {err}"
+    );
+    assert!(
+        exists(store.as_ref(), &orphan_key).await,
+        "a refused call must delete nothing"
+    );
+
+    let _ = store
+        .delete(&object_store::path::Path::from(orphan_key.as_str()))
+        .await;
     let _ = handler
         .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
         .await;
