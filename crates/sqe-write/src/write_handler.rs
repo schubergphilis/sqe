@@ -665,6 +665,71 @@ fn policy_admit_alias(nonce: &str) -> String {
     format!("__pol_admit_{nonce}")
 }
 
+/// Row-position column of the per-batch evaluators. The lifted `IN
+/// (subquery)` LEFT JOINs (and UPDATE's decorrelated joins) return rows in
+/// any order, while the callers line the result up with the batch by
+/// position, so every evaluator orders by this column. Without it a hash
+/// join's probe order deleted or updated the wrong rows.
+fn policy_pos_alias(nonce: &str) -> String {
+    format!("__pol_pos_{nonce}")
+}
+
+/// `batch` with a trailing `UInt64` row-position column named `pos`.
+fn with_row_position(batch: &RecordBatch, pos: &str) -> sqe_core::Result<RecordBatch> {
+    let mut fields: Vec<_> = batch.schema().fields().iter().cloned().collect();
+    fields.push(Arc::new(arrow_schema::Field::new(
+        pos,
+        arrow_schema::DataType::UInt64,
+        false,
+    )));
+    let mut columns = batch.columns().to_vec();
+    columns.push(Arc::new(arrow_array::UInt64Array::from_iter_values(
+        0..batch.num_rows() as u64,
+    )));
+    RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).map_err(|e| {
+        SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!("Failed to add row positions: {e}"),
+        )
+    })
+}
+
+/// One batch from an evaluator's output, which must hold exactly one row per
+/// input row: a join that dropped or repeated a row would misalign the
+/// result with the batch, so that fails the statement instead.
+fn concat_aligned(
+    batches: Vec<RecordBatch>,
+    expected: usize,
+    what: &str,
+) -> sqe_core::Result<Option<RecordBatch>> {
+    let Some(first) = batches.first() else {
+        return if expected == 0 {
+            Ok(None)
+        } else {
+            Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("{what} returned no rows for {expected} input rows"),
+            ))
+        };
+    };
+    let out = arrow::compute::concat_batches(&first.schema(), &batches).map_err(|e| {
+        SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!("Failed to combine {what} batches: {e}"),
+        )
+    })?;
+    if out.num_rows() != expected {
+        return Err(SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!(
+                "{what} returned {} rows for {expected} input rows",
+                out.num_rows()
+            ),
+        ));
+    }
+    Ok(Some(out))
+}
+
 /// Refuse user SQL that names the internal `__pol_` aliases. The per-call
 /// nonce already makes them unguessable.
 fn refuse_internal_policy_aliases<'a>(
@@ -787,8 +852,14 @@ fn policy_projection_sql(
     }
 
     let mut projections: Vec<String> = Vec::with_capacity(2 * schema.fields().len() + 1);
+    let pos = policy_pos_alias(nonce);
     for f in schema.fields() {
         let name = f.name();
+        if *name == pos {
+            // A row position, not data: never guarded, so hidden rows keep their place.
+            projections.push(format!("\"{name}\""));
+            continue;
+        }
         let mask = predicates.column_mask_sqls.get(name);
         let seen = match mask {
             Some(mask_sql) => format!("({mask_sql})"),
@@ -6312,68 +6383,32 @@ impl WriteHandler {
         table_ident: &TableIdent,
         predicates: &sqe_policy::write_predicates::WritePolicyPredicates,
     ) -> sqe_core::Result<RecordBatch> {
-        use arrow::compute::not;
-        use datafusion::arrow::array::BooleanArray;
-
-        // Register the batch as a scratch table so DataFusion can evaluate the
-        // predicate; the guard deregisters it on every exit path (509).
-        let scratch = ScratchTable::register(ctx, batch)?;
-        let orig_name = table_ident.name();
-
-        refuse_internal_policy_aliases("WHERE", [where_sql])?;
-        let nonce = uuid::Uuid::new_v4().simple().to_string();
-        let augmented_where =
-            augment_where_with_row_filter(where_sql, predicates, orig_name, &nonce);
-        let policy_from = build_policy_from_clause(
-            ctx,
-            scratch.qualified(),
-            orig_name,
-            &batch.schema(),
-            predicates,
-            &nonce,
-            false,
-        )
-        .await?;
-        let from_clause = &policy_from.sql;
-
-        // Execute: SELECT <where_clause> AS __match FROM __sqe_dml_<uuid>
-        // Alias the scratch table to the original target name (see apply_update
-        // for rationale) so correlated subqueries inside the WHERE clause can
-        // reference `tablename.col`.
-        // TRUE-only: a NULL verdict neither deletes the row nor reports it.
-        let eval_sql = format!(
-            "SELECT COALESCE(CAST(({augmented_where}) AS BOOLEAN), FALSE) AS __match \
-             FROM {from_clause}{joins_sql}"
-        );
-        let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, &eval_sql)
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to evaluate WHERE clause: {e}")))?;
-        let df = self.enforce_dml_eval(ctx, session, df).await?;
-        let result_batches: Vec<RecordBatch> = df
-            .collect()
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to collect WHERE evaluation: {e}")))?;
-        drop(scratch);
-
-        if result_batches.is_empty() || result_batches[0].num_rows() == 0 {
-            return Ok(batch.clone());
-        }
-
-        // Build a boolean mask: NOT <predicate> (rows to keep)
-        let mask_batch = &result_batches[0];
-        let match_col = mask_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| {
-                SqeError::with_code(SqeErrorCode::ExecutionFailed, "WHERE evaluation did not produce a boolean column")
-            })?;
-        let negated = not(match_col)
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to negate WHERE mask: {e}")))?;
+        let matched = self
+            .filter_batch_match(
+                ctx,
+                session,
+                batch,
+                where_sql,
+                joins_sql,
+                table_ident,
+                predicates,
+            )
+            .await?;
+        // Keep the rows that do not match. The mask has no NULLs (COALESCE).
+        let negated = arrow::compute::not(&matched).map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("Failed to negate WHERE mask: {e}"),
+            )
+        })?;
 
         // Apply the mask to the original batch
-        filter_record_batch(batch, &negated)
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to filter batch: {e}")))
+        filter_record_batch(batch, &negated).map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("Failed to filter batch: {e}"),
+            )
+        })
     }
 
     /// Evaluate a WHERE clause against a RecordBatch and return a BooleanArray indicating
@@ -6400,19 +6435,24 @@ impl WriteHandler {
     ) -> sqe_core::Result<arrow_array::BooleanArray> {
         use arrow_array::BooleanArray;
 
-        // Scratch table with a per-call unique name, deregistered on drop (509).
-        let scratch = ScratchTable::register(ctx, batch)?;
-        let orig_name = table_ident.name();
-
+        if batch.num_rows() == 0 {
+            return Ok(BooleanArray::from(Vec::<bool>::new()));
+        }
         refuse_internal_policy_aliases("WHERE", [where_sql])?;
         let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let pos = policy_pos_alias(&nonce);
+        let positioned = with_row_position(batch, &pos)?;
+        // Scratch table with a per-call unique name, deregistered on drop (509).
+        let scratch = ScratchTable::register(ctx, &positioned)?;
+        let orig_name = table_ident.name();
+
         let augmented_where =
             augment_where_with_row_filter(where_sql, predicates, orig_name, &nonce);
         let policy_from = build_policy_from_clause(
             ctx,
             scratch.qualified(),
             orig_name,
-            &batch.schema(),
+            &positioned.schema(),
             predicates,
             &nonce,
             false,
@@ -6423,26 +6463,33 @@ impl WriteHandler {
         // Alias the scratch table to the original target name so correlated
         // subqueries inside WHERE can reference `tablename.col`.
         // TRUE-only: a NULL verdict neither deletes the row nor reports it.
+        // Ordered by row position: the mask is applied to `batch` by position.
         let eval_sql = format!(
             "SELECT COALESCE(CAST(({augmented_where}) AS BOOLEAN), FALSE) AS __match \
-             FROM {from_clause}{joins_sql}"
+             FROM {from_clause}{joins_sql} ORDER BY \"{orig_name}\".\"{pos}\""
         );
         let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, &eval_sql)
             .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to evaluate WHERE clause: {e}")))?;
+            .map_err(|e| {
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Failed to evaluate WHERE clause: {e}"),
+                )
+            })?;
         let df = self.enforce_dml_eval(ctx, session, df).await?;
-        let result_batches: Vec<RecordBatch> = df
-            .collect()
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to collect WHERE evaluation: {e}")))?;
+        let result_batches: Vec<RecordBatch> = df.collect().await.map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("Failed to collect WHERE evaluation: {e}"),
+            )
+        })?;
         drop(scratch);
 
-        if result_batches.is_empty() || result_batches[0].num_rows() == 0 {
-            // No rows matched
-            return Ok(BooleanArray::from(vec![false; batch.num_rows()]));
-        }
-
-        let mask_batch = &result_batches[0];
+        let Some(mask_batch) =
+            concat_aligned(result_batches, batch.num_rows(), "WHERE evaluation")?
+        else {
+            return Ok(BooleanArray::from(Vec::<bool>::new()));
+        };
         let match_col = mask_batch
             .column(0)
             .as_any()
@@ -6476,8 +6523,14 @@ impl WriteHandler {
         table_ident: &TableIdent,
         predicates: &sqe_policy::write_predicates::WritePolicyPredicates,
     ) -> sqe_core::Result<RecordBatch> {
+        if batch.num_rows() == 0 {
+            return Ok(batch.clone());
+        }
+        let raw_nonce = uuid::Uuid::new_v4().simple().to_string();
+        let pos = policy_pos_alias(&raw_nonce);
+        let positioned = with_row_position(batch, &pos)?;
         // Scratch table with a per-call unique name, deregistered on drop (509).
-        let scratch = ScratchTable::register(ctx, batch)?;
+        let scratch = ScratchTable::register(ctx, &positioned)?;
         let orig_name = table_ident.name();
 
         // Best-effort decorrelation of any `ScalarSubquery` nodes in the SET
@@ -6498,9 +6551,11 @@ impl WriteHandler {
         // unguessable).
         refuse_internal_policy_aliases(
             "UPDATE",
-            assignment_map.values().map(String::as_str).chain([where_sql]),
+            assignment_map
+                .values()
+                .map(String::as_str)
+                .chain([where_sql]),
         )?;
-        let raw_nonce = uuid::Uuid::new_v4().simple().to_string();
 
         let augmented_where =
             augment_where_with_row_filter(where_sql, predicates, orig_name, &raw_nonce);
@@ -6574,33 +6629,41 @@ impl WriteHandler {
             ctx,
             scratch.qualified(),
             orig_name,
-            &batch.schema(),
+            &positioned.schema(),
             predicates,
             &raw_nonce,
             true,
         )
         .await?;
         let from_clause = &policy_from.sql;
+        // The joins reorder rows; ORDER BY the row position so the output
+        // lines up with `batch` (the MoR caller filters it by position).
         let select_sql = format!(
-            "SELECT {cols} FROM {from_clause}{joins}",
+            "SELECT {cols} FROM {from_clause}{joins} ORDER BY \"{orig_name}\".\"{pos}\"",
             cols = columns.join(", "),
             joins = joins_sql,
         );
         let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, &select_sql)
             .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to evaluate UPDATE: {e}")))?;
+            .map_err(|e| {
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Failed to evaluate UPDATE: {e}"),
+                )
+            })?;
         let df = self.enforce_dml_eval(ctx, session, df).await?;
-        let result_batches: Vec<RecordBatch> = df
-            .collect()
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to collect UPDATE results: {e}")))?;
+        let result_batches: Vec<RecordBatch> = df.collect().await.map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("Failed to collect UPDATE results: {e}"),
+            )
+        })?;
         drop(scratch);
 
-        // Return the first (and only) result batch
-        let out = result_batches
-            .into_iter()
-            .next()
-            .ok_or_else(|| SqeError::with_code(SqeErrorCode::ExecutionFailed, "UPDATE produced no output batches".to_string()))?;
+        let Some(out) = concat_aligned(result_batches, batch.num_rows(), "UPDATE evaluation")?
+        else {
+            return Ok(batch.clone());
+        };
         let Some(changed_idx) = out.schema().index_of(UPDATE_CHANGED_COLUMN).ok() else {
             return Ok(out);
         };
