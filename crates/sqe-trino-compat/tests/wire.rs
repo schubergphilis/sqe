@@ -843,6 +843,54 @@ async fn prepared_statement_round_trips_through_headers() {
     h.assert_golden("prepared_statement");
 }
 
+/// Portal request (parameter binding): a value bound with `EXECUTE ... USING`
+/// comes back unchanged as one row, whatever SQL it looks like, and a
+/// non-literal `USING` argument is refused by position.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn execute_using_binds_values_not_sql() {
+    let mut h = Harness::start().await;
+    let template = "q=SELECT+%3F+AS+v";
+    let long = "a'b".repeat(64 * 1024 / 3);
+    let long_arg = format!("'{}'", long.replace('\'', "''"));
+    let cases = [
+        ("'x''; DROP TABLE t; --'", json!("x'; DROP TABLE t; --")),
+        ("-5", json!(-5)),
+        (long_arg.as_str(), json!(long)),
+    ];
+    for (i, (arg, expected)) in cases.iter().enumerate() {
+        let req = h
+            .post_as("alice", &format!("EXECUTE q USING {arg}"))
+            .header("X-Trino-Prepared-Statement", template);
+        let posted = h.step(&format!("bind-{i}"), req).await;
+        let pages = h.follow(&format!("bind-{i}"), &posted).await;
+        assert_eq!(pages.last().expect("result page").state(), "FINISHED");
+        assert_eq!(all_rows(&pages), vec![json!([expected])], "case {i}");
+    }
+
+    // `1-?` bound to -5 is 1-(-5), not the comment `1--5`.
+    let req = h
+        .post_as("alice", "EXECUTE q USING -5")
+        .header("X-Trino-Prepared-Statement", "q=SELECT+1-%3F+AS+v");
+    let posted = h.step("negative", req).await;
+    let pages = h.follow("negative", &posted).await;
+    assert_eq!(all_rows(&pages), vec![json!([6])]);
+
+    for arg in ["lower('A')", "(SELECT 1)"] {
+        let req = h
+            .post_as("alice", &format!("EXECUTE q USING {arg}"))
+            .header("X-Trino-Prepared-Statement", template);
+        let posted = h.step("refused", req).await;
+        let pages = h.follow("refused", &posted).await;
+        let last = pages.last().unwrap_or(&posted);
+        assert_eq!(last.state(), "FAILED", "{arg}");
+        let message = last.body["error"]["message"].as_str().expect("message");
+        assert!(
+            message.contains("parameter 1 is not a literal"),
+            "{arg}: {message}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn use_and_session_statements_echo_headers() {
     let mut h = Harness::start().await;

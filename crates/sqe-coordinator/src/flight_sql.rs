@@ -3351,18 +3351,22 @@ fn arrow_value_to_sql_literal(array: &dyn arrow_array::Array, row: usize) -> Str
             .unwrap()
             .value(row)
             .to_string(),
-        DataType::Float32 => array
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .unwrap()
-            .value(row)
-            .to_string(),
-        DataType::Float64 => array
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .value(row)
-            .to_string(),
+        DataType::Float32 => {
+            let v = array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(row);
+            float_sql_literal(v.is_finite(), v.to_string(), "REAL")
+        }
+        DataType::Float64 => {
+            let v = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(row);
+            float_sql_literal(v.is_finite(), v.to_string(), "DOUBLE")
+        }
         DataType::Utf8 => {
             let a = array.as_any().downcast_ref::<StringArray>().unwrap();
             sql_quote_string(a.value(row))
@@ -3387,6 +3391,17 @@ fn arrow_value_to_sql_literal(array: &dyn arrow_array::Array, row: usize) -> Str
             let s = arrow::util::display::array_value_to_string(array, row).unwrap_or_default();
             sql_quote_string(&s)
         }
+    }
+}
+
+/// A finite float is a bare number. `NaN`, `inf` and `-inf` would read as
+/// identifiers (a column named `nan` would bind instead of the value), so
+/// they go in as a cast from a string.
+fn float_sql_literal(finite: bool, text: String, sql_type: &str) -> String {
+    if finite {
+        text
+    } else {
+        format!("CAST('{text}' AS {sql_type})")
     }
 }
 
@@ -4757,5 +4772,36 @@ catalog_url = ""
         let mut healthy = registry.healthy_workers().await;
         healthy.sort();
         assert_eq!(healthy, vec!["http://w1:50052", "http://w2:50052"]);
+    }
+
+    /// Bound floats render as values DataFusion reads back: a negative number
+    /// spliced after `-` stays an operand, and NaN / infinity are not read as
+    /// column names.
+    #[tokio::test]
+    async fn bound_float_literals_read_back_as_values() {
+        use arrow_array::{Float32Array, Float64Array};
+        let values = Float64Array::from(vec![-1.5, f64::NAN, f64::INFINITY, f64::NEG_INFINITY]);
+        let literals: Vec<String> = (0..values.len())
+            .map(|row| arrow_value_to_sql_literal(&values, row))
+            .collect();
+        assert_eq!(literals[1], "CAST('NaN' AS DOUBLE)");
+        assert_eq!(literals[2], "CAST('inf' AS DOUBLE)");
+        let real = Float32Array::from(vec![f32::NAN]);
+        assert_eq!(arrow_value_to_sql_literal(&real, 0), "CAST('NaN' AS REAL)");
+
+        let template = "SELECT 1-? AS a, ? AS b, ? AS c, ? AS d";
+        let sql = sqe_core::substitute_placeholders(template, &literals).unwrap();
+        let ctx = datafusion::prelude::SessionContext::new();
+        let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+        let column = |i: usize| {
+            batches[0]
+                .column(i)
+                .as_primitive::<arrow_array::types::Float64Type>()
+                .value(0)
+        };
+        assert_eq!(column(0), 2.5);
+        assert!(column(1).is_nan());
+        assert_eq!(column(2), f64::INFINITY);
+        assert_eq!(column(3), f64::NEG_INFINITY);
     }
 }
