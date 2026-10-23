@@ -10,7 +10,7 @@ Cells read `V2/V3`: `F` full, `P` partial, `?` unknown, `.` none, `-` the rubric
 
 | Rank | Engine | Score | % |
 |---:|---|---:|---:|
-| 1 | **SQE (self-rated)** | 150/162 | 92.6 |
+| 1 | **SQE (self-rated)** | 152/162 | 93.8 |
 | 2 | AWS EMR (8.1 Spark) | 147/162 | 90.7 |
 | 3 | Starburst (482-e) | 147/162 | 90.7 |
 | 4 | Dremio / SAP (26.x) | 146/162 | 90.1 |
@@ -110,7 +110,7 @@ Cells read `V2/V3`: `F` full, `P` partial, `?` unknown, `.` none, `-` the rubric
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | Variant Type | -/F | -/F | -/F | -/P | -/P | -/F | -/. | -/. | -/. | -/? |
 | Shredded Variant | -/F | -/. | -/P | -/. | -/P | -/F | -/. | -/. | -/. | -/? |
-| Geometry / Geo Types | -/. | -/. | -/F | -/. | -/. | -/P | -/. | -/. | -/P | -/? |
+| Geometry / Geo Types | -/P | -/. | -/F | -/. | -/. | -/P | -/. | -/. | -/P | -/? |
 | Nanosecond Timestamps | -/F | -/. | -/F | -/F | -/. | -/F | -/F | -/P | -/. | -/. |
 | Unknown Type | -/F | -/F | -/. | -/. | -/. | -/. | -/F | -/F | -/. | -/? |
 
@@ -176,7 +176,7 @@ Cells read `V2/V3`: `F` full, `P` partial, `?` unknown, `.` none, `-` the rubric
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | Variant Type | -/F | -/F | -/F | -/F | -/F | -/F | -/F | -/F | -/. | -/. | -/? |
 | Shredded Variant | -/F | -/P | -/F | -/F | -/F | -/? | -/F | -/F | -/. | -/. | -/? |
-| Geometry / Geo Types | -/. | -/F | -/F | -/. | -/F | -/? | -/F | -/F | -/. | -/. | -/? |
+| Geometry / Geo Types | -/P | -/F | -/F | -/. | -/F | -/? | -/F | -/F | -/. | -/. | -/? |
 | Nanosecond Timestamps | -/F | -/F | -/F | -/F | -/F | -/F | -/F | -/. | -/. | -/. | -/? |
 | Unknown Type | -/F | -/. | -/F | -/. | -/F | -/? | -/F | -/? | -/. | -/. | -/? |
 

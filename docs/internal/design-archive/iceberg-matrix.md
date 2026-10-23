@@ -2,7 +2,7 @@
 
 SQE rated against the [icebergmatrix.org](https://icebergmatrix.org) rubric ([Neuw84/iceberg-matrix](https://github.com/Neuw84/iceberg-matrix)).
 
-**Score: 150/162 (92.6%)** on 54 cells.
+**Score: 152/162 (93.8%)** on 54 cells.
 
 - SQE cells: `docs/evidence/iceberg-matrix-state.json`, last changed 2026-10-23.
 - Rubric and peer scores: `docs/evidence/iceberg-matrix-rubric.json`, upstream `d14d0f1341` fetched 2026-10-23.
@@ -30,7 +30,7 @@ Every engine scored on the same 54 cells. SQE rates itself; the other engines ar
 
 | Engine | Score | % |
 |---|---:|---:|
-| **SQE (self-rated)** | **150/162** | **92.6** |
+| **SQE (self-rated)** | **152/162** | **93.8** |
 | AWS EMR (8.1 Spark) | 147/162 | 90.7 |
 | Starburst (482-e) | 147/162 | 90.7 |
 | Dremio / SAP (26.x) | 146/162 | 90.1 |
@@ -106,7 +106,7 @@ Every engine scored on the same 54 cells. SQE rates itself; the other engines ar
 |---|:---:|:---:|---|---|
 | Variant Type | n/a | F | V3-only feature | VARIANT columns (and JSON columns on V3 tables) store Iceberg variant, unshredded. JSON text is parsed on write (invalid JSON fails the write), values read ... |
 | Shredded Variant | n/a | F | V3-only feature | SQE reads and writes shredded variant files. Read: Spark 4.1 + Iceberg 1.12 writes a table with write.parquet.shred-variants=true (the test asserts typed_value ... |
-| Geometry / Geo Types | n/a | . | V3-only feature | No GEOMETRY / GEOGRAPHY type in SQE DDL or the read path. |
+| Geometry / Geo Types | n/a | P | V3-only feature | SQE reads GEOMETRY and GEOGRAPHY columns. The vendored iceberg-rust carries the upstream geospatial types and the read support from apache/iceberg-rust #3341; ... |
 | Nanosecond Timestamps | n/a | F | V3-only feature | TIMESTAMP_NS(N) / TIMESTAMPTZ_NS(N) map to Iceberg timestamp_ns / timestamptz_ns and to Arrow nanosecond timestamps; CREATE, INSERT and SELECT round-trip ... |
 | Unknown Type | n/a | F | V3-only feature | Top-level unknown columns work across engines. SQE declares one as UNKNOWN or VOID, reads a Spark-written VOID column as NULLs, inserts around it and promotes ... |
 
@@ -132,7 +132,11 @@ Every cell below full, with its caveats. Each has a `[MATRIX]` issue.
 - **google-lakehouse (v3)**, partial: Google Lakehouse runtime catalog exposes the Iceberg REST API, which SQE's REST client speaks. Rated partial because the pairing has not been measured.
   - Inferred from generic Iceberg REST catalog support; not measured against Google Lakehouse.
   - Iceberg data on GCS (gs://) through the table FileIO and Google OAuth for the REST endpoint are not verified.
-- **geometry-type (v3)**, none: No GEOMETRY / GEOGRAPHY type in SQE DDL or the read path.
+- **geometry-type (v3)**, partial: SQE reads GEOMETRY and GEOGRAPHY columns. The vendored iceberg-rust carries the upstream geospatial types and the read support from apache/iceberg-rust #3341; a column reads as WKB bytes (LargeBinary tagged geoarrow.wkb), filters and joins on it run in DataFusion, and information_schema reports it as varbinary with udt_name geometry / geography. Verified against a table written by Spark 4.1 + Iceberg 1.12 (spark.sql.geospatial.enabled). Writes into a table with a geospatial column are refused with NOT_SUPPORTED.
+  - Read-only: INSERT, CTAS, MERGE/UPDATE/DELETE and compaction refuse a table with a geospatial column until the iceberg-rust writer computes geospatial bounds.
+  - No GEOMETRY / GEOGRAPHY DDL: CREATE TABLE with one fails with 'SQL type not supported'.
+  - No ST_* functions and no bounding-box pruning: a predicate on a geospatial column is never pushed into the scan.
+  - Verified on the coordinator scan only. A worker decodes through the iceberg-rust reader (which the backported read support covers) and is not tested on a geospatial table yet.
 
 ## Caveats on full cells
 

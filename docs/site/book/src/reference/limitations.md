@@ -51,7 +51,7 @@ V3 is the default format-version for new tables and landed end to end: default v
 
 | Feature | Status |
 |---|---|
-| Geometry / geography types | Not supported. No SQE type and no DataFusion user-defined-type support. |
+| Geometry / geography types | Read-only. Columns read as WKB bytes; `CREATE TABLE` with one, writes into the table and `ST_*` functions are not supported. |
 | Multi-arg partition transforms | Not supported. `PARTITIONED BY` accepts single-source transforms only. |
 | Shredded variant reads | SQE writes and reads shredded variants, but unshreds on read: a shredded field gives no pruning or typed access, and only top-level variant columns are shredded on write. |
 | Unknown list elements and map keys/values | `ARRAY<VOID>`, a map with a `VOID` key or value, and a struct whose members are all unknown can be declared and read, but a row cannot be written: Parquet has no column for them, and Iceberg Java refuses the same writes. Unknown struct members (`STRUCT<a INT, u VOID>`) work. |
