@@ -730,6 +730,69 @@ fn concat_aligned(
     Ok(Some(out))
 }
 
+/// The match mask for a batch of `rows` rows from the row positions a WHERE
+/// evaluation returned. A position out of range or returned twice means a
+/// join repeated a row, which would misattribute the match, so that fails the
+/// statement instead.
+fn mask_from_positions(
+    batches: &[RecordBatch],
+    rows: usize,
+) -> sqe_core::Result<arrow_array::BooleanArray> {
+    let mut mask = vec![false; rows];
+    for b in batches {
+        let positions = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .ok_or_else(|| {
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    "WHERE evaluation did not return row positions",
+                )
+            })?;
+        for p in positions.iter().flatten() {
+            match mask.get_mut(p as usize) {
+                Some(slot) if !*slot => *slot = true,
+                _ => {
+                    return Err(SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!("WHERE evaluation returned row {p} twice or out of {rows} rows"),
+                    ))
+                }
+            }
+        }
+    }
+    Ok(arrow_array::BooleanArray::from(mask))
+}
+
+/// `batch` with a trailing non-null boolean column `name` holding `mask`.
+fn with_match_column(
+    batch: &RecordBatch,
+    name: &str,
+    mask: &arrow_array::BooleanArray,
+) -> sqe_core::Result<RecordBatch> {
+    let mut fields: Vec<_> = batch.schema().fields().iter().cloned().collect();
+    fields.push(Arc::new(arrow_schema::Field::new(
+        name,
+        arrow_schema::DataType::Boolean,
+        false,
+    )));
+    let mut columns = batch.columns().to_vec();
+    columns.push(Arc::new(mask.clone()));
+    RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).map_err(|e| {
+        SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!("Failed to add the WHERE match column: {e}"),
+        )
+    })
+}
+
+/// Internal alias for the per-row WHERE verdict UPDATE reads instead of
+/// re-evaluating the WHERE inside its CASE expressions.
+fn policy_match_alias(nonce: &str) -> String {
+    format!("__pol_match_{nonce}")
+}
+
 /// Refuse user SQL that names the internal `__pol_` aliases. The per-call
 /// nonce already makes them unguessable.
 fn refuse_internal_policy_aliases<'a>(
@@ -853,10 +916,12 @@ fn policy_projection_sql(
 
     let mut projections: Vec<String> = Vec::with_capacity(2 * schema.fields().len() + 1);
     let pos = policy_pos_alias(nonce);
+    let matched = policy_match_alias(nonce);
     for f in schema.fields() {
         let name = f.name();
-        if *name == pos {
-            // A row position, not data: never guarded, so hidden rows keep their place.
+        if *name == pos || *name == matched {
+            // A row position or the WHERE verdict (already policy-checked),
+            // not data: never guarded, so hidden rows keep their place.
             projections.push(format!("\"{name}\""));
             continue;
         }
@@ -3986,13 +4051,12 @@ impl WriteHandler {
                                 }
                                 updated_this_attempt += matched;
                                 let out = self
-                                    .apply_update(
+                                    .apply_update_masked(
                                         ctx,
                                         session,
                                         batch,
                                         assignments,
-                                        where_sql,
-                                        joins_sql,
+                                        &mask,
                                         table_ident,
                                         predicates,
                                     )
@@ -4299,13 +4363,12 @@ impl WriteHandler {
                 // old END, then we filter to only the matched rows so we
                 // do not re-write the unchanged ones.
                 let full_rewrite = self
-                    .apply_update(
+                    .apply_update_masked(
                         ctx,
                         session,
                         &batch,
                         assignments,
-                        &where_sql,
-                        &joins_sql,
+                        &match_mask,
                         &table_ident,
                         &predicates,
                     )
@@ -6463,10 +6526,13 @@ impl WriteHandler {
         // Alias the scratch table to the original target name so correlated
         // subqueries inside WHERE can reference `tablename.col`.
         // TRUE-only: a NULL verdict neither deletes the row nor reports it.
-        // Ordered by row position: the mask is applied to `batch` by position.
+        // The predicate is a real WHERE, not a projected boolean: DataFusion
+        // decorrelates EXISTS / IN subqueries only in a Filter, so in the
+        // SELECT list a correlated EXISTS failed to plan. The matched row
+        // positions come back and become the mask below.
         let eval_sql = format!(
-            "SELECT COALESCE(CAST(({augmented_where}) AS BOOLEAN), FALSE) AS __match \
-             FROM {from_clause}{joins_sql} ORDER BY \"{orig_name}\".\"{pos}\""
+            "SELECT \"{orig_name}\".\"{pos}\" FROM {from_clause}{joins_sql} \
+             WHERE COALESCE(CAST(({augmented_where}) AS BOOLEAN), FALSE)"
         );
         let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, &eval_sql)
             .await
@@ -6485,32 +6551,17 @@ impl WriteHandler {
         })?;
         drop(scratch);
 
-        let Some(mask_batch) =
-            concat_aligned(result_batches, batch.num_rows(), "WHERE evaluation")?
-        else {
-            return Ok(BooleanArray::from(Vec::<bool>::new()));
-        };
-        let match_col = mask_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| {
-                SqeError::with_code(SqeErrorCode::ExecutionFailed, "WHERE evaluation did not produce a boolean column")
-            })?
-            .clone();
-
-        Ok(match_col)
+        mask_from_positions(&result_batches, batch.num_rows())
     }
 
-    /// Apply UPDATE SET assignments to a RecordBatch using DataFusion SQL evaluation.
-    ///
-    /// For each column, generates CASE WHEN <where> THEN <new_value> ELSE <old_value> END.
-    /// Unchanged columns pass through directly.
+    /// Apply UPDATE SET assignments to a RecordBatch: evaluates `where_sql`
+    /// with [`Self::filter_batch_match`], then [`Self::apply_update_masked`].
+    /// The write paths compute the mask themselves; the unit tests use this.
     ///
     /// `in_subquery_joins` carries the `LEFT JOIN ...` clauses produced by
-    /// [`Self::lift_in_subqueries`] and is appended to the outer SELECT's FROM
-    /// clause after any decorrelator-generated joins. Pass an empty string when
-    /// no lifted joins are needed.
+    /// [`Self::lift_in_subqueries`]. Pass an empty string when no lifted joins
+    /// are needed.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     async fn apply_update(
         &self,
@@ -6523,12 +6574,51 @@ impl WriteHandler {
         table_ident: &TableIdent,
         predicates: &sqe_policy::write_predicates::WritePolicyPredicates,
     ) -> sqe_core::Result<RecordBatch> {
+        let mask = self
+            .filter_batch_match(
+                ctx,
+                session,
+                batch,
+                where_sql,
+                in_subquery_joins,
+                table_ident,
+                predicates,
+            )
+            .await?;
+        self.apply_update_masked(
+            ctx,
+            session,
+            batch,
+            assignments,
+            &mask,
+            table_ident,
+            predicates,
+        )
+        .await
+    }
+
+    /// [`Self::apply_update`] for a batch whose WHERE verdict is already known:
+    /// `mask` comes from [`Self::filter_batch_match`] (row filter included),
+    /// and the CASE expressions read it as a column. The WHERE itself never
+    /// lands in the projection, where a correlated EXISTS cannot be planned.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_update_masked(
+        &self,
+        ctx: &DFSessionContext,
+        session: &Session,
+        batch: &RecordBatch,
+        assignments: &[sqlparser::ast::Assignment],
+        mask: &arrow_array::BooleanArray,
+        table_ident: &TableIdent,
+        predicates: &sqe_policy::write_predicates::WritePolicyPredicates,
+    ) -> sqe_core::Result<RecordBatch> {
         if batch.num_rows() == 0 {
             return Ok(batch.clone());
         }
         let raw_nonce = uuid::Uuid::new_v4().simple().to_string();
         let pos = policy_pos_alias(&raw_nonce);
-        let positioned = with_row_position(batch, &pos)?;
+        let matched = policy_match_alias(&raw_nonce);
+        let positioned = with_match_column(&with_row_position(batch, &pos)?, &matched, mask)?;
         // Scratch table with a per-call unique name, deregistered on drop (509).
         let scratch = ScratchTable::register(ctx, &positioned)?;
         let orig_name = table_ident.name();
@@ -6549,16 +6639,10 @@ impl WriteHandler {
         // The raw and admit aliases are internal: user SQL naming them is
         // refused outright (the per-call nonce below already makes them
         // unguessable).
-        refuse_internal_policy_aliases(
-            "UPDATE",
-            assignment_map
-                .values()
-                .map(String::as_str)
-                .chain([where_sql]),
-        )?;
+        refuse_internal_policy_aliases("UPDATE", assignment_map.values().map(String::as_str))?;
 
-        let augmented_where =
-            augment_where_with_row_filter(where_sql, predicates, orig_name, &raw_nonce);
+        // The WHERE verdict, row filter included (see `filter_batch_match`).
+        let augmented_where = format!("\"{orig_name}\".\"{matched}\"");
 
         // Build SELECT with CASE expressions for assigned columns. A column
         // the caller reads through a mask or the row-filter guard needs
@@ -6612,18 +6696,13 @@ impl WriteHandler {
         // `holding_summary` to be in scope; without the alias DataFusion only
         // sees `__sqe_dml_<uuid>` and fails to resolve the correlation.
         //
-        // Two join sources get appended to the outer FROM clause:
-        //   1. `extra_joins` from the decorrelator above: these provide the
-        //      `__corrN.__val` columns substituted into the SET expressions.
-        //   2. `in_subquery_joins` from `lift_in_subqueries`: these provide the
-        //      `__sqN.__matched` flags referenced from the rewritten WHERE.
-        // Decorrelator joins come first so any columns they introduce are in
-        // scope for the IN-subquery join ON clauses (not currently exercised,
-        // but preserves a consistent ordering).
+        // `extra_joins` from the decorrelator above provide the `__corrN.__val`
+        // columns substituted into the SET expressions. The WHERE's own joins
+        // (lifted IN subqueries) are not needed: its verdict is a column.
         let joins_sql = if extra_joins.is_empty() {
-            in_subquery_joins.to_string()
+            String::new()
         } else {
-            format!(" {}{}", extra_joins.join(" "), in_subquery_joins)
+            format!(" {}", extra_joins.join(" "))
         };
         let policy_from = build_policy_from_clause(
             ctx,
