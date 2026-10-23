@@ -864,6 +864,10 @@ impl AuditLogger {
                             None
                         }
                     };
+                    // Flush acks wait until rotation below has run: a caller
+                    // that logs again after `flush()` returns must land in
+                    // the next file, not be drained into this one.
+                    let mut acks: Vec<std::sync::mpsc::Sender<()>> = Vec::new();
                     match msg {
                         AuditMsg::Legacy(entry) => {
                             let mut batch = vec![*entry];
@@ -926,7 +930,8 @@ impl AuditLogger {
                                             &mut spool_lock(&spool_sink_worker),
                                             &path_owned,
                                         );
-                                        let _ = ack.send(());
+                                        acks.push(ack);
+                                        break;
                                     }
                                 }
                             }
@@ -1008,7 +1013,8 @@ impl AuditLogger {
                                             &mut spool_lock(&spool_sink_worker),
                                             &path_owned,
                                         );
-                                        let _ = ack.send(());
+                                        acks.push(ack);
+                                        break;
                                     }
                                 }
                             }
@@ -1039,7 +1045,7 @@ impl AuditLogger {
                                 &mut spool_lock(&spool_sink_worker),
                                 &path_owned,
                             );
-                            let _ = ack.send(());
+                            acks.push(ack);
                         }
                     }
                     // Every arm above ends flushed, so a rename here never
@@ -1085,6 +1091,9 @@ impl AuditLogger {
                             &mut spool_lock(&spool_sink_worker),
                             &path_owned,
                         );
+                    }
+                    for ack in acks {
+                        let _ = ack.send(());
                     }
                 }
                 Self::flush_sinks(
