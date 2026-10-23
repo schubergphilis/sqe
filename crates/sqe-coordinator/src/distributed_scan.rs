@@ -1943,9 +1943,8 @@ impl ExecutionPlan for CoordinatorLocalScanExec {
         self.input.execute(partition, context)
     }
 
-    fn metrics(&self) -> Option<MetricsSet> {
-        self.input.metrics()
-    }
+    // No `metrics()`: the wrapped scan is a child and reports its own. Passing
+    // them through counted every byte twice in plan walks and EXPLAIN ANALYZE.
 }
 
 /// Reassemble a worker fragment batch to the schema `DistributedScanExec`
