@@ -104,6 +104,10 @@ pub struct QueryInfo {
     pub text: Option<String>,
     pub query_hash: String,
     pub statement_type: String,
+    /// Byte length of the statement text, set when `omit_query_text` left
+    /// the text out of the log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_len: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -288,6 +292,7 @@ pub(crate) fn sample_query_event() -> AuditEvent {
             text: Some("SELECT 1".into()),
             query_hash: "abc".into(),
             statement_type: "query".into(),
+            text_len: None,
         }),
         session_id: Some("sess-1".into()),
         client_ip: Some("10.0.0.1".into()),
@@ -341,6 +346,7 @@ mod tests {
                 text: Some("SELECT 1".into()),
                 query_hash: "abc".into(),
                 statement_type: "query".into(),
+                text_len: None,
             }),
             session_id: Some("sess-1".into()),
             client_ip: Some("10.0.0.1".into()),

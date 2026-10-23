@@ -1736,6 +1736,7 @@ fn build_maintenance_audit_event(
             )),
             query_hash: sqe_metrics::audit::query_hash(&format!("maintenance-advisory:{}", ident)),
             statement_type: "maintenance_advisory".to_string(),
+            text_len: None,
         }),
         session_id: Some(job_id.to_string()),
         client_ip: None,
@@ -1789,6 +1790,7 @@ fn build_active_audit_event(
             )),
             query_hash: sqe_metrics::audit::query_hash(&format!("maintenance-active:{}", ident)),
             statement_type: "maintenance_active".to_string(),
+            text_len: None,
         }),
         session_id: Some(job_id.to_string()),
         client_ip: None,
@@ -1850,6 +1852,7 @@ fn build_partial_audit_event(
                 ident
             )),
             statement_type: "maintenance_active".to_string(),
+            text_len: None,
         }),
         session_id: Some(job_id.to_string()),
         client_ip: None,
@@ -1905,6 +1908,7 @@ fn build_failed_audit_event(
                 ident
             )),
             statement_type: "maintenance_active".to_string(),
+            text_len: None,
         }),
         session_id: Some(job_id.to_string()),
         client_ip: None,
@@ -1955,6 +1959,7 @@ fn build_skipped_audit_event(
                 ident
             )),
             statement_type: "maintenance_active".to_string(),
+            text_len: None,
         }),
         session_id: Some(job_id.to_string()),
         client_ip: None,
@@ -2016,6 +2021,7 @@ fn build_lease_audit_event(
             }),
             query_hash: sqe_metrics::audit::query_hash(&format!("maintenance-lease-{action}:{}", ident)),
             statement_type: "maintenance_lease".to_string(),
+            text_len: None,
         }),
         session_id: Some(job_id.to_string()),
         client_ip: None,

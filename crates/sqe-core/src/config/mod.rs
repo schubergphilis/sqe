@@ -4451,6 +4451,15 @@ pub struct AuditConfig {
     /// into the chain. Default: 1 GiB. 0 never deletes for space.
     #[serde(default = "default_audit_min_free_bytes")]
     pub min_free_bytes: u64,
+    /// Leave the SQL text out of every audit record. The query hash, the
+    /// statement type and the text's byte length (`text_len`) stay, so the
+    /// log still correlates repeated statements. Default: false.
+    #[serde(default)]
+    pub omit_query_text: bool,
+    /// Leave the actor's email and roles out of every audit record. The
+    /// username and OIDC subject stay. Default: false.
+    #[serde(default)]
+    pub omit_actor_identity: bool,
 }
 
 fn default_audit_format() -> String {
@@ -4494,6 +4503,8 @@ impl Default for AuditConfig {
             max_file_bytes: default_audit_max_file_bytes(),
             max_files: 0,
             min_free_bytes: default_audit_min_free_bytes(),
+            omit_query_text: false,
+            omit_actor_identity: false,
         }
     }
 }

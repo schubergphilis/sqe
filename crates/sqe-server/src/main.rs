@@ -1975,6 +1975,10 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
                 max_files: config.metrics.audit.max_files,
                 min_free_bytes: config.metrics.audit.min_free_bytes,
             },
+            privacy: sqe_metrics::audit::AuditPrivacy {
+                omit_query_text: config.metrics.audit.omit_query_text,
+                omit_actor_identity: config.metrics.audit.omit_actor_identity,
+            },
         },
     )
     .map_err(|e| anyhow::anyhow!(e))?;

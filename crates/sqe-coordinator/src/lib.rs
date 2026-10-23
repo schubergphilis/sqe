@@ -180,6 +180,7 @@ pub fn maybe_warn_superdebug(
             ),
             query_hash: sqe_metrics::audit::query_hash("superdebug_log_results_enabled"),
             statement_type: "superdebug_log_results_enabled".into(),
+            text_len: None,
         }),
         session_id: None,
         client_ip: None,

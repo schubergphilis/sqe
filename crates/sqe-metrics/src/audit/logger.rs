@@ -58,6 +58,9 @@ pub struct AuditEntry {
     pub query_hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query_text: Option<String>,
+    /// Byte length of `query_text`, set when `omit_query_text` left the text out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_text_len: Option<usize>,
     pub statement_type: String,
     pub duration_ms: u64,
     pub rows_returned: usize,
@@ -194,6 +197,7 @@ impl From<AuditEntry> for AuditEvent {
                 text: e.query_text,
                 query_hash: e.query_hash,
                 statement_type: e.statement_type,
+                text_len: e.query_text_len,
             }),
             session_id: e.session_id,
             client_ip: e.client_ip,
@@ -230,6 +234,7 @@ pub struct AuditLoggerOptions {
     pub fail_mode: AuditFailMode,
     pub dropped: Option<IntCounterVec>,
     pub rotation: AuditRotation,
+    pub privacy: AuditPrivacy,
 }
 
 impl Default for AuditLoggerOptions {
@@ -239,6 +244,35 @@ impl Default for AuditLoggerOptions {
             fail_mode: AuditFailMode::Open,
             dropped: None,
             rotation: AuditRotation::default(),
+            privacy: AuditPrivacy::default(),
+        }
+    }
+}
+
+/// Fields a deployment keeps out of the audit log altogether. Applied before
+/// the record is queued, so the hash chain covers the record as written and
+/// the verifier needs nothing extra. The query hash and statement type stay,
+/// so repeated statements still correlate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AuditPrivacy {
+    /// Drop the SQL text; keep its byte length in `text_len`.
+    pub omit_query_text: bool,
+    /// Drop the actor's email and roles; keep the username and subject.
+    pub omit_actor_identity: bool,
+}
+
+impl AuditPrivacy {
+    fn apply(&self, event: &mut AuditEvent) {
+        if self.omit_query_text {
+            if let Some(q) = event.query.as_mut() {
+                if let Some(text) = q.text.take() {
+                    q.text_len = Some(text.len());
+                }
+            }
+        }
+        if self.omit_actor_identity {
+            event.actor.email = None;
+            event.actor.roles.clear();
         }
     }
 }
@@ -451,6 +485,8 @@ pub struct AuditLogger {
     /// Shared with the worker; set once at startup before the logger is used.
     /// Written to for every canonical `Event` message, independent of `AuditFormat`.
     spool_sink: Arc<Mutex<Option<OcsfJsonlSink>>>,
+    /// Fields left out of every record, applied before the entry is queued.
+    privacy: AuditPrivacy,
 }
 
 /// Derive the OCSF file path from the native path.
@@ -723,6 +759,7 @@ impl AuditLogger {
         let fail_mode = options.fail_mode;
         let dropped = options.dropped;
         let rotation = options.rotation;
+        let privacy = options.privacy;
         let queue_capacity = options.queue_capacity.max(1);
         if path.is_empty() {
             return Ok(Self {
@@ -733,6 +770,7 @@ impl AuditLogger {
                 dropped,
                 gdpr: Arc::new(Mutex::new(None)),
                 spool_sink: Arc::new(Mutex::new(None)),
+                privacy,
             });
         }
 
@@ -1067,6 +1105,7 @@ impl AuditLogger {
             dropped,
             gdpr,
             spool_sink,
+            privacy,
         })
     }
 
@@ -1496,43 +1535,13 @@ impl AuditLogger {
         // Redaction runs on the caller side, before the entry is queued.
         // For `log_event`, the worker thread applies `redact_pii` (and GDPR
         // masking when configured) before writing to any sink.
-        let redacted = if entry.query_text.is_some() {
-            AuditEntry {
-                query_text: entry.query_text.as_deref().map(redact_pii),
-                timestamp: entry.timestamp.clone(),
-                username: entry.username.clone(),
-                session_id: entry.session_id.clone(),
-                query_hash: entry.query_hash.clone(),
-                statement_type: entry.statement_type.clone(),
-                duration_ms: entry.duration_ms,
-                rows_returned: entry.rows_returned,
-                status: entry.status.clone(),
-                client_ip: entry.client_ip.clone(),
-                tables_touched: entry.tables_touched.clone(),
-                row_filters_applied: entry.row_filters_applied,
-                columns_masked: entry.columns_masked.clone(),
-                columns_restricted: entry.columns_restricted.clone(),
-                policy_denied: entry.policy_denied,
-            }
+        let mut redacted = entry.clone();
+        if self.privacy.omit_query_text {
+            redacted.query_text_len = entry.query_text.as_ref().map(String::len);
+            redacted.query_text = None;
         } else {
-            AuditEntry {
-                timestamp: entry.timestamp.clone(),
-                username: entry.username.clone(),
-                session_id: entry.session_id.clone(),
-                query_hash: entry.query_hash.clone(),
-                query_text: None,
-                statement_type: entry.statement_type.clone(),
-                duration_ms: entry.duration_ms,
-                rows_returned: entry.rows_returned,
-                status: entry.status.clone(),
-                client_ip: entry.client_ip.clone(),
-                tables_touched: entry.tables_touched.clone(),
-                row_filters_applied: entry.row_filters_applied,
-                columns_masked: entry.columns_masked.clone(),
-                columns_restricted: entry.columns_restricted.clone(),
-                policy_denied: entry.policy_denied,
-            }
-        };
+            redacted.query_text = entry.query_text.as_deref().map(redact_pii);
+        }
 
         self.enqueue(tx, AuditMsg::Legacy(Box::new(redacted)))
     }
@@ -1548,6 +1557,8 @@ impl AuditLogger {
         let Some(ref tx) = self.tx else {
             return Ok(());
         };
+        let mut event = event;
+        self.privacy.apply(&mut event);
         self.enqueue(tx, AuditMsg::Event(Box::new(event)))
     }
 
@@ -1627,6 +1638,7 @@ mod tests {
             session_id: Some("sess-123".to_string()),
             query_hash: query_hash("SELECT 1"),
             query_text: Some("SELECT 1".to_string()),
+            query_text_len: None,
             statement_type: "query".to_string(),
             duration_ms: 42,
             rows_returned: 1,
@@ -1921,6 +1933,7 @@ mod tests {
             session_id: Some("sess-1".into()),
             query_hash: query_hash(sql),
             query_text: Some(sql.into()),
+            query_text_len: None,
             statement_type: "create_secret".into(),
             duration_ms: 3,
             rows_returned: 0,
@@ -1966,6 +1979,129 @@ mod tests {
         assert_eq!(ocsf["status_id"], 1, "{ocsf}");
     }
 
+    fn privacy_logger(path: &std::path::Path, privacy: AuditPrivacy) -> AuditLogger {
+        AuditLogger::with_options(
+            path.to_str().unwrap(),
+            crate::audit::AuditFormat::Both,
+            AuditLoggerOptions {
+                privacy,
+                ..AuditLoggerOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    /// `omit_query_text`: neither file holds the SQL, the hash, statement
+    /// type and byte length stay, and the chain still verifies.
+    #[test]
+    fn omit_query_text_drops_the_sql_and_keeps_hash_and_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let privacy = AuditPrivacy {
+            omit_query_text: true,
+            ..AuditPrivacy::default()
+        };
+        let logger = privacy_logger(&path, privacy);
+        let sql = "SELECT salary FROM hr.payroll WHERE name = 'Margot'";
+        let mut ev = crate::audit::sample_query_event();
+        ev.query = Some(crate::audit::QueryInfo {
+            text: Some(sql.into()),
+            query_hash: query_hash(sql),
+            statement_type: "query".into(),
+            text_len: None,
+        });
+        logger.log_event(ev);
+        logger.flush();
+
+        let native_bytes = std::fs::read(&path).unwrap();
+        crate::audit::verify_audit_bytes(&native_bytes).expect("native chain verifies");
+        let native_text = std::str::from_utf8(&native_bytes).unwrap();
+        let ocsf_text = std::fs::read_to_string(dir.path().join("audit.ocsf.jsonl")).unwrap();
+        for (name, text) in [("native", native_text), ("ocsf", ocsf_text.as_str())] {
+            assert!(!text.contains("Margot"), "{name} holds the SQL: {text}");
+            assert!(!text.contains("payroll"), "{name} holds the SQL: {text}");
+        }
+
+        let native: serde_json::Value = serde_json::from_str(native_text.trim()).unwrap();
+        assert!(native["query"].get("text").is_none(), "{native}");
+        assert_eq!(native["query"]["query_hash"], query_hash(sql));
+        assert_eq!(native["query"]["statement_type"], "query");
+        assert_eq!(native["query"]["text_len"], sql.len());
+
+        let ocsf: serde_json::Value = serde_json::from_str(ocsf_text.trim()).unwrap();
+        assert_eq!(ocsf["metadata"]["uid"], native["integrity"]["hash"]);
+        assert!(ocsf["unmapped"].get("query_text").is_none(), "{ocsf}");
+        assert_eq!(ocsf["unmapped"]["query_hash"], query_hash(sql));
+        assert_eq!(ocsf["unmapped"]["query_text_len"], sql.len());
+        // The actor is untouched unless omit_actor_identity is also set.
+        assert_eq!(native["actor"]["email"], "alice@corp.example");
+    }
+
+    /// The legacy redacting path (secret-bearing statements) honours
+    /// `omit_query_text` too, in both the native line and its OCSF twin.
+    #[test]
+    fn omit_query_text_covers_the_legacy_entry_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let privacy = AuditPrivacy {
+            omit_query_text: true,
+            ..AuditPrivacy::default()
+        };
+        let logger = privacy_logger(&path, privacy);
+        let sql = "CREATE SECRET s (TYPE s3, KEY_ID 'AKIAEXAMPLE', SECRET 'topsecretvalue')";
+        let mut entry = test_entry();
+        entry.query_hash = query_hash(sql);
+        entry.query_text = Some(sql.into());
+        entry.statement_type = "create_secret".into();
+        logger.log(&entry);
+        logger.flush();
+
+        let native_bytes = std::fs::read(&path).unwrap();
+        crate::audit::verify_audit_bytes(&native_bytes).expect("native chain verifies");
+        let native: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&native_bytes).unwrap().trim()).unwrap();
+        assert!(native.get("query_text").is_none(), "{native}");
+        assert_eq!(native["query_text_len"], sql.len());
+        assert_eq!(native["query_hash"], query_hash(sql));
+
+        let ocsf_text = std::fs::read_to_string(dir.path().join("audit.ocsf.jsonl")).unwrap();
+        assert!(!ocsf_text.contains("SECRET"), "{ocsf_text}");
+        let ocsf: serde_json::Value = serde_json::from_str(ocsf_text.trim()).unwrap();
+        assert_eq!(ocsf["metadata"]["uid"], native["integrity"]["hash"]);
+        assert_eq!(ocsf["unmapped"]["query_text_len"], sql.len());
+    }
+
+    /// `omit_actor_identity` drops email and roles; username and subject stay
+    /// so the record still names who ran the statement.
+    #[test]
+    fn omit_query_text_and_actor_identity_keep_username_and_subject() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let privacy = AuditPrivacy {
+            omit_query_text: true,
+            omit_actor_identity: true,
+        };
+        let logger = privacy_logger(&path, privacy);
+        let ev = crate::audit::sample_query_event();
+        let username = ev.actor.username.clone();
+        let subject = ev.actor.subject.clone();
+        logger.log_event(ev);
+        logger.flush();
+
+        let native_bytes = std::fs::read(&path).unwrap();
+        crate::audit::verify_audit_bytes(&native_bytes).expect("native chain verifies");
+        let native: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&native_bytes).unwrap().trim()).unwrap();
+        assert!(native["actor"].get("email").is_none(), "{native}");
+        assert!(native["actor"].get("roles").is_none(), "{native}");
+        assert_eq!(native["actor"]["username"], username);
+        assert_eq!(native["actor"]["subject"], serde_json::json!(subject));
+
+        let ocsf_text = std::fs::read_to_string(dir.path().join("audit.ocsf.jsonl")).unwrap();
+        assert!(!ocsf_text.contains("alice@corp.example"), "{ocsf_text}");
+        assert!(!ocsf_text.contains("analyst"), "{ocsf_text}");
+    }
+
     #[test]
     fn gdpr_tagged_column_is_masked_in_written_log() {
         use std::collections::HashMap;
@@ -2004,6 +2140,7 @@ mod tests {
             text: Some("SELECT id FROM users WHERE email = 'alice@x.io'".into()),
             query_hash: "h".into(),
             statement_type: "query".into(),
+            text_len: None,
         });
         logger.log_event(ev);
         logger.flush();
@@ -2051,6 +2188,7 @@ mod tests {
             text: Some("SELECT id FROM users WHERE email = 'leak@example.com'".into()),
             query_hash: "h".into(),
             statement_type: "query".into(),
+            text_len: None,
         });
         logger.log_event(ev);
         logger.flush();
@@ -2109,6 +2247,7 @@ mod tests {
             text: Some("SELECT id FROM users WHERE ssn = '123-45-6789'".into()),
             query_hash: "h".into(),
             statement_type: "query".into(),
+            text_len: None,
         });
         logger.log_event(ev);
         logger.flush();
@@ -2188,6 +2327,7 @@ mod tests {
             ),
             query_hash: "h".into(),
             statement_type: "query".into(),
+            text_len: None,
         });
         logger.log_event(ev);
         logger.flush();
@@ -2641,6 +2781,7 @@ mod tests {
             dropped: Some(dropped.clone()),
             gdpr: Arc::new(Mutex::new(None)),
             spool_sink: Arc::new(Mutex::new(None)),
+            privacy: AuditPrivacy::default(),
         };
 
         logger.log_event(crate::audit::sample_query_event());
