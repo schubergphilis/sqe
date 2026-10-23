@@ -271,6 +271,7 @@ fn maintenance_config(idp: &MockServer, min_input_files: usize) -> MaintenanceCo
             ..Default::default()
         },
         distribution: Default::default(),
+        ..Default::default()
     }
 }
 

@@ -2077,16 +2077,15 @@ async fn reproject_loaded_tags(
 }
 
 fn table_ref_to_ident(table: &TableRef, session: &Session) -> TableIdent {
-    let ns = if table.catalog.is_none() && table.namespace == "default" {
-        session
-            .default_schema
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(table.namespace.as_str())
-    } else {
-        table.namespace.as_str()
+    let ns = match session.default_schema.as_deref() {
+        Some(schema)
+            if table.catalog.is_none() && table.namespace == "default" && !schema.is_empty() =>
+        {
+            NamespaceIdent::new(schema.to_string())
+        }
+        _ => crate::maintenance::nested_namespace(table.namespace_parts()),
     };
-    TableIdent::new(NamespaceIdent::new(ns.to_string()), table.name.clone())
+    TableIdent::new(ns, table.name.clone())
 }
 
 async fn collect_reproject_targets(
@@ -2097,7 +2096,7 @@ async fn collect_reproject_targets(
     match scope {
         ReprojectScope::Table(table) => Ok(vec![table_ref_to_ident(table, session)]),
         ReprojectScope::Namespace(ns) => {
-            let ns_ident = NamespaceIdent::new(ns.namespace.clone());
+            let ns_ident = crate::maintenance::nested_namespace(ns.namespace_parts());
             session_catalog.list_tables(&ns_ident).await
         }
         ReprojectScope::Catalog(_) => {
