@@ -254,7 +254,7 @@ Not yet wired:
 
 ## Phase 7 - Iceberg V3 (Done)
 
-Iceberg V3 table format support landed end-to-end. V3 is the default format-version for new tables. The vendored fork at `vendor/iceberg-rust/` carries V3 spec coverage. SQE Iceberg matrix score: 147/162 (90.7%) on the current rubric, rescored in October 2026 (per `docs/evidence/iceberg-matrix-state.json`). The older 167/189 score used a different rubric and is not comparable.
+Iceberg V3 table format support landed end-to-end. V3 is the default format-version for new tables. The vendored fork at `vendor/iceberg-rust/` carries V3 spec coverage. SQE Iceberg matrix score: 150/162 (92.6%) on the current rubric, rescored in October 2026 (per `docs/evidence/iceberg-matrix-state.json`). The older 167/189 score used a different rubric and is not comparable.
 
 ### V3 Features Shipped
 
