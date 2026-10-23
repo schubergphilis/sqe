@@ -694,6 +694,16 @@ impl RestCatalog {
     pub async fn advertises_commit_transaction(&self) -> Result<bool> {
         self.inner.supports_endpoint(&V1_COMMIT_TRANSACTION).await
     }
+
+    /// The `{prefix}` path segment every request of this catalog uses: the
+    /// `prefix` from the merged `GET /v1/config` answer, verbatim (a server
+    /// may send it percent-encoded), or `None` when there is none. Lets a
+    /// caller that talks to the server directly build the same URLs.
+    ///
+    /// SQE PATCH (sqe#873).
+    pub async fn path_prefix(&self) -> Result<Option<String>> {
+        Ok(self.inner.client().await?.config.props.get("prefix").cloned())
+    }
 }
 
 /// Every operation forwards to its [`RestSessionCatalog`] equivalent with the

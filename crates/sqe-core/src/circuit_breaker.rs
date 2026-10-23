@@ -125,6 +125,27 @@ impl CircuitBreaker {
         self
     }
 
+    /// Whether [`check`](Self::check) would refuse a request right now, without
+    /// its side effects (no Open → Half-Open transition, no probe admitted).
+    /// For work that must not reach the backend unless the next `check` lets
+    /// a request through, e.g. a lazy config fetch made while building the
+    /// request's URL.
+    pub fn would_refuse(&self) -> bool {
+        let (since, window) = match self.state.load(Ordering::Acquire) {
+            STATE_CLOSED => return false,
+            STATE_OPEN => (
+                self.last_failure_ms.load(Ordering::Relaxed),
+                self.recovery_timeout.as_millis() as u64,
+            ),
+            STATE_HALF_OPEN => (
+                self.half_open_since_ms.load(Ordering::Acquire),
+                (self.probe_lease.as_millis() as u64).max(1),
+            ),
+            _ => return true,
+        };
+        now_millis().saturating_sub(since) < window
+    }
+
     /// Check whether a request may proceed.
     ///
     /// * `Ok(())` — circuit is Closed, or this thread won the Open → Half-Open
@@ -298,6 +319,28 @@ mod tests {
 
     fn cb() -> CircuitBreaker {
         CircuitBreaker::new("test", 3, Duration::from_secs(60))
+    }
+
+    #[test]
+    fn would_refuse_matches_check_without_admitting() {
+        let c = cb();
+        assert!(!c.would_refuse());
+        for _ in 0..3 {
+            c.record_failure();
+        }
+        assert!(c.would_refuse());
+        assert!(c.check().is_err());
+
+        // Recovery window elapsed: `check` would admit a probe, and asking
+        // `would_refuse` must not take it.
+        let elapsed = CircuitBreaker::new("elapsed", 1, Duration::ZERO)
+            .with_probe_lease(Duration::from_secs(60));
+        elapsed.record_failure();
+        assert!(!elapsed.would_refuse());
+        assert_eq!(elapsed.state_label(), "open");
+        assert!(elapsed.check().is_ok(), "the probe is still available");
+        assert!(elapsed.would_refuse(), "probe in flight");
+        assert!(elapsed.check().is_err());
     }
 
     #[test]
