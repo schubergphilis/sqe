@@ -1,0 +1,495 @@
+{
+  "source": "https://github.com/Neuw84/iceberg-matrix",
+  "sourceCommit": "d14d0f1341971cca8a8a218ca412d2cff28e3253",
+  "sourceLicense": "MIT",
+  "fetchedAt": "2026-10-23",
+  "generatedBy": "python3 scripts/render-iceberg-matrix-compare.py",
+  "scoring": "One cell per feature and applicable format version (introducedIn up to, not including, removedIn). full=3, partial=2, unknown=1, none=0; a cell an engine does not list counts as none.",
+  "cells": 54,
+  "max": 162,
+  "features": [
+    {
+      "id": "position-deletes",
+      "name": "Position Deletes",
+      "category": "row-level-operations",
+      "introducedIn": "v2",
+      "removedIn": "v3"
+    },
+    {
+      "id": "equality-deletes",
+      "name": "Equality Deletes",
+      "category": "row-level-operations",
+      "introducedIn": "v2"
+    },
+    {
+      "id": "merge-on-read",
+      "name": "Merge-on-Read",
+      "category": "row-level-operations",
+      "introducedIn": "v2"
+    },
+    {
+      "id": "copy-on-write",
+      "name": "Copy-on-Write",
+      "category": "row-level-operations",
+      "introducedIn": "v2"
+    },
+    {
+      "id": "schema-evolution",
+      "name": "Schema Evolution",
+      "category": "table-management",
+      "introducedIn": "v2"
+    },
+    {
+      "id": "type-promotion",
+      "name": "Type Promotion / Widening",
+      "category": "table-management",
+      "introducedIn": "v2"
+    },
+    {
+      "id": "column-default-values",
+      "name": "Column Default Values",
+      "category": "table-management",
+      "introducedIn": "v3"
+    },
+    {
+      "id": "table-creation",
+      "name": "Table Creation",
+      "category": "table-management",
+      "introducedIn": "v2"
+    },
+    {
+      "id": "hidden-partitioning",
+      "name": "Hidden Partitioning",
+      "category": "partitioning",
+      "introducedIn": "v2"
+    },
+    {
+      "id": "partition-evolution",
+      "name": "Partition Evolution",
+      "category": "partitioning",
+      "introducedIn": "v2"
+    },
+    {
+      "id": "multi-arg-transforms",
+      "name": "Multi-Argument Transforms",
+      "category": "partitioning",
+      "introducedIn": "v3"
+    },
+    {
+      "id": "time-travel",
+      "name": "Time Travel / Snapshots",
+      "category": "table-management",
+      "introducedIn": "v2"
+    },
+    {
+      "id": "table-maintenance",
+      "name": "Table Maintenance",
+      "category": "table-management",
+      "introducedIn": "v2"
+    },
+    {
+      "id": "branching-tagging",
+      "name": "Branching & Tagging",
+      "category": "table-management",
+      "introducedIn": "v2"
+    },
+    {
+      "id": "read-support",
+      "name": "Read Support",
+      "category": "read-write",
+      "introducedIn": "v2"
+    },
+    {
+      "id": "write-insert",
+      "name": "Write (INSERT)",
+      "category": "read-write",
+      "introducedIn": "v2"
+    },
+    {
+      "id": "write-merge-update-delete",
+      "name": "Write (MERGE/UPDATE/DELETE)",
+      "category": "read-write",
+      "introducedIn": "v2"
+    },
+    {
+      "id": "catalog-integration",
+      "name": "Catalog Integration",
+      "category": "read-write",
+      "introducedIn": "v2"
+    },
+    {
+      "id": "statistics",
+      "name": "Statistics (Column Metrics)",
+      "category": "read-write",
+      "introducedIn": "v2"
+    },
+    {
+      "id": "bloom-filters",
+      "name": "Bloom Filters & Puffin",
+      "category": "read-write",
+      "introducedIn": "v2"
+    },
+    {
+      "id": "aws-glue-catalog",
+      "name": "AWS Glue Catalog",
+      "category": "catalog-support",
+      "introducedIn": "v2"
+    },
+    {
+      "id": "rest-catalog",
+      "name": "REST Catalog",
+      "category": "catalog-support",
+      "introducedIn": "v2"
+    },
+    {
+      "id": "unity-catalog",
+      "name": "Unity Catalog",
+      "category": "catalog-support",
+      "introducedIn": "v2"
+    },
+    {
+      "id": "snowflake-horizon-catalog",
+      "name": "Snowflake Horizon Catalog",
+      "category": "catalog-support",
+      "introducedIn": "v2"
+    },
+    {
+      "id": "google-lakehouse",
+      "name": "Google Lakehouse",
+      "category": "catalog-support",
+      "introducedIn": "v2"
+    },
+    {
+      "id": "variant-type",
+      "name": "Variant Type",
+      "category": "v3-data-types",
+      "introducedIn": "v3"
+    },
+    {
+      "id": "shredded-variant",
+      "name": "Shredded Variant",
+      "category": "v3-data-types",
+      "introducedIn": "v3"
+    },
+    {
+      "id": "geometry-type",
+      "name": "Geometry / Geo Types",
+      "category": "v3-data-types",
+      "introducedIn": "v3"
+    },
+    {
+      "id": "nanosecond-timestamps",
+      "name": "Nanosecond Timestamps",
+      "category": "v3-data-types",
+      "introducedIn": "v3"
+    },
+    {
+      "id": "unknown-type",
+      "name": "Unknown Type",
+      "category": "v3-data-types",
+      "introducedIn": "v3"
+    },
+    {
+      "id": "lineage",
+      "name": "Lineage Tracking",
+      "category": "row-level-operations",
+      "introducedIn": "v3"
+    },
+    {
+      "id": "deletion-vectors",
+      "name": "Deletion Vectors",
+      "category": "row-level-operations",
+      "introducedIn": "v3"
+    }
+  ],
+  "peers": [
+    {
+      "key": "aws-emr",
+      "name": "AWS EMR (8.1 Spark)",
+      "file": "src/data/platforms/aws/s3buckets/emr/emr.json",
+      "raw": 147,
+      "max": 162,
+      "percent": 90.7
+    },
+    {
+      "key": "starburst",
+      "name": "Starburst (482-e)",
+      "file": "src/data/platforms/starburst/starburst/starburst.json",
+      "raw": 147,
+      "max": 162,
+      "percent": 90.7
+    },
+    {
+      "key": "dremio",
+      "name": "Dremio / SAP (26.x)",
+      "file": "src/data/platforms/dremio/dremio/dremio.json",
+      "raw": 146,
+      "max": 162,
+      "percent": 90.1
+    },
+    {
+      "key": "aws-glue",
+      "name": "AWS Glue (6.0)",
+      "file": "src/data/platforms/aws/s3buckets/glue/glue.json",
+      "raw": 145,
+      "max": 162,
+      "percent": 89.5
+    },
+    {
+      "key": "aws-emr@s3tables",
+      "name": "AWS EMR (8.1 Spark) (S3 Tables)",
+      "file": "src/data/platforms/aws/s3tables/emr/emr.json",
+      "raw": 143,
+      "max": 162,
+      "percent": 88.3
+    },
+    {
+      "key": "aws-glue@s3tables",
+      "name": "AWS Glue (6.0) (S3 Tables)",
+      "file": "src/data/platforms/aws/s3tables/glue/glue.json",
+      "raw": 141,
+      "max": 162,
+      "percent": 87.0
+    },
+    {
+      "key": "google-dataproc",
+      "name": "Google Managed Spark (3.0.13)",
+      "file": "src/data/platforms/gcp/dataproc/dataproc.json",
+      "raw": 139,
+      "max": 162,
+      "percent": 85.8
+    },
+    {
+      "key": "snowflake",
+      "name": "Snowflake",
+      "file": "src/data/platforms/snowflake/managed/snowflake/snowflake.json",
+      "raw": 138,
+      "max": 162,
+      "percent": 85.2
+    },
+    {
+      "key": "snowflake@external",
+      "name": "Snowflake (external)",
+      "file": "src/data/platforms/snowflake/external/snowflake/snowflake.json",
+      "raw": 138,
+      "max": 162,
+      "percent": 85.2
+    },
+    {
+      "key": "spark",
+      "name": "Spark (4.1)",
+      "file": "src/data/platforms/oss/spark/spark.json",
+      "raw": 138,
+      "max": 162,
+      "percent": 85.2
+    },
+    {
+      "key": "trino",
+      "name": "Trino (483)",
+      "file": "src/data/platforms/oss/trino/trino.json",
+      "raw": 130,
+      "max": 162,
+      "percent": 80.2
+    },
+    {
+      "key": "flink",
+      "name": "OSS Flink (2.3)",
+      "file": "src/data/platforms/oss/flink/flink.json",
+      "raw": 126,
+      "max": 162,
+      "percent": 77.8
+    },
+    {
+      "key": "aws-managed-flink",
+      "name": "AWS Managed Flink (2.3)",
+      "file": "src/data/platforms/aws/s3buckets/managed-flink/managed-flink.json",
+      "raw": 124,
+      "max": 162,
+      "percent": 76.5
+    },
+    {
+      "key": "aws-managed-flink@s3tables",
+      "name": "AWS Managed Flink (2.3) (S3 Tables)",
+      "file": "src/data/platforms/aws/s3tables/managed-flink/managed-flink.json",
+      "raw": 124,
+      "max": 162,
+      "percent": 76.5
+    },
+    {
+      "key": "doris",
+      "name": "Doris (4.2)",
+      "file": "src/data/platforms/oss/doris/doris.json",
+      "raw": 122,
+      "max": 162,
+      "percent": 75.3
+    },
+    {
+      "key": "duckdb",
+      "name": "DuckDB (1.5.5)",
+      "file": "src/data/platforms/oss/duckdb/duckdb.json",
+      "raw": 116,
+      "max": 162,
+      "percent": 71.6
+    },
+    {
+      "key": "pyiceberg",
+      "name": "PyIceberg (0.12.0)",
+      "file": "src/data/platforms/oss/pyiceberg/pyiceberg.json",
+      "raw": 113,
+      "max": 162,
+      "percent": 69.8
+    },
+    {
+      "key": "databricks",
+      "name": "Databricks (DBR 18.2)",
+      "file": "src/data/platforms/databricks/databricks/databricks.json",
+      "raw": 110,
+      "max": 162,
+      "percent": 67.9
+    },
+    {
+      "key": "aws-redshift-s3",
+      "name": "AWS Redshift (S3)",
+      "file": "src/data/platforms/aws/s3buckets/redshift-s3/redshift-s3.json",
+      "raw": 95,
+      "max": 162,
+      "percent": 58.6
+    },
+    {
+      "key": "oracle-26ai",
+      "name": "Oracle (26ai)",
+      "file": "src/data/platforms/oracle/oracle-26ai/oracle-26ai.json",
+      "raw": 95,
+      "max": 162,
+      "percent": 58.6
+    },
+    {
+      "key": "alibaba-realtime-flink",
+      "name": "Alibaba Cloud Realtime Compute Flink (VVR 11.x)",
+      "file": "src/data/platforms/alibaba/realtime-flink/realtime-flink.json",
+      "raw": 87,
+      "max": 162,
+      "percent": 53.7
+    },
+    {
+      "key": "alibaba-emr-spark",
+      "name": "Alibaba Cloud EMR Spark (EMR-5.21.0)",
+      "file": "src/data/platforms/alibaba/emr-spark/emr-spark.json",
+      "raw": 78,
+      "max": 162,
+      "percent": 48.1
+    },
+    {
+      "key": "daft",
+      "name": "Daft",
+      "file": "src/data/platforms/oss/daft/daft.json",
+      "raw": 70,
+      "max": 162,
+      "percent": 43.2
+    },
+    {
+      "key": "clickhouse",
+      "name": "ClickHouse (26.9)",
+      "file": "src/data/platforms/oss/clickhouse/clickhouse.json",
+      "raw": 67,
+      "max": 162,
+      "percent": 41.4
+    },
+    {
+      "key": "google-bigquery",
+      "name": "Google BigQuery",
+      "file": "src/data/platforms/gcp/bigquery/bigquery.json",
+      "raw": 60,
+      "max": 162,
+      "percent": 37.0
+    },
+    {
+      "key": "aws-athena",
+      "name": "AWS Athena SQL (v3)",
+      "file": "src/data/platforms/aws/s3buckets/athena/athena.json",
+      "raw": 54,
+      "max": 162,
+      "percent": 33.3
+    },
+    {
+      "key": "azure-fabric",
+      "name": "Microsoft Fabric (2.0)",
+      "file": "src/data/platforms/azure/fabric/fabric.json",
+      "raw": 54,
+      "max": 162,
+      "percent": 33.3
+    },
+    {
+      "key": "aws-athena@s3tables",
+      "name": "AWS Athena SQL (v3) (S3 Tables)",
+      "file": "src/data/platforms/aws/s3tables/athena/athena.json",
+      "raw": 52,
+      "max": 162,
+      "percent": 32.1
+    },
+    {
+      "key": "aws-aurora",
+      "name": "AWS Aurora PostgreSQL (17.11)",
+      "file": "src/data/platforms/aws/s3buckets/aurora/aurora.json",
+      "raw": 52,
+      "max": 162,
+      "percent": 32.1
+    },
+    {
+      "key": "aws-aurora@s3tables",
+      "name": "AWS Aurora PostgreSQL (17.11) (S3 Tables)",
+      "file": "src/data/platforms/aws/s3tables/aurora/aurora.json",
+      "raw": 52,
+      "max": 162,
+      "percent": 32.1
+    },
+    {
+      "key": "aws-redshift-s3@s3tables",
+      "name": "AWS Redshift (S3) (S3 Tables)",
+      "file": "src/data/platforms/aws/s3tables/redshift-s3/redshift-s3.json",
+      "raw": 50,
+      "max": 162,
+      "percent": 30.9
+    },
+    {
+      "key": "databend",
+      "name": "Databend (1.2.725)",
+      "file": "src/data/platforms/oss/databend/databend.json",
+      "raw": 48,
+      "max": 162,
+      "percent": 29.6
+    },
+    {
+      "key": "alibaba-hologres",
+      "name": "Alibaba Cloud Hologres (V4.2)",
+      "file": "src/data/platforms/alibaba/hologres/hologres.json",
+      "raw": 46,
+      "max": 162,
+      "percent": 28.4
+    },
+    {
+      "key": "spark-gluten",
+      "name": "Spark (4.1)",
+      "file": "src/data/platforms/oss/spark-gluten/spark-gluten.json",
+      "raw": 37,
+      "max": 162,
+      "percent": 22.8
+    },
+    {
+      "key": "spark-comet",
+      "name": "Spark (4.1)",
+      "file": "src/data/platforms/oss/spark-comet/spark-comet.json",
+      "raw": 35,
+      "max": 162,
+      "percent": 21.6
+    },
+    {
+      "key": "alibaba-maxcompute",
+      "name": "Alibaba Cloud MaxCompute",
+      "file": "src/data/platforms/alibaba/maxcompute/maxcompute.json",
+      "raw": 34,
+      "max": 162,
+      "percent": 21.0
+    }
+  ]
+}

@@ -1,7 +1,7 @@
 {
   "$schema": "https://icebergmatrix.org/schema/support-v1.json",
   "sourceRubric": "https://github.com/Neuw84/iceberg-matrix",
-  "sourceRubricCommit": "2dd75e0aa2c3ca1a7f9ab6efcbc28f6392c5d174",
+  "sourceRubricCommit": "d14d0f1341971cca8a8a218ca412d2cff28e3253",
   "platform": {
     "id": "sqe",
     "name": "SQE (0.51.0)",
@@ -10,8 +10,8 @@
     "group": "3rd Party",
     "docUrl": "https://docs.getsqe.com"
   },
-  "generatedAt": "2026-10-21T00:00:00Z",
-  "generatedBy": "Rescore against the pinned upstream rubric; evidence paths repaired after the crate and test moves. 2026-10-18: unknown-type and shredded-variant measured against Spark 4.1 + Iceberg 1.12. 2026-10-20: merge-on-read deletes, deletion vectors and row lineage read back by Spark 4.1 + Iceberg 1.12 (mor_spark_interop); stub evidence removed. 2026-10-21: SQE writes shredded variants (write.parquet.shred-variants), read back by Spark 4.1 + Iceberg 1.12; shredded-variant:v3 to full. unknown-type:v3 to full: nested shapes measured against Iceberg Java (same refusals), promotion rules enforced.",
+  "generatedAt": "2026-10-23T00:00:00Z",
+  "generatedBy": "Rescore against the pinned upstream rubric; evidence paths repaired after the crate and test moves. 2026-10-18: unknown-type and shredded-variant measured against Spark 4.1 + Iceberg 1.12. 2026-10-20: merge-on-read deletes, deletion vectors and row lineage read back by Spark 4.1 + Iceberg 1.12 (mor_spark_interop); stub evidence removed. 2026-10-21: SQE writes shredded variants (write.parquet.shred-variants), read back by Spark 4.1 + Iceberg 1.12; shredded-variant:v3 to full. unknown-type:v3 to full: nested shapes measured against Iceberg Java (same refusals), promotion rules enforced. 2026-10-22: list elements and map values promote with SET DATA TYPE (#869). 2026-10-23: rubric pin moved to d14d0f1341 (features.json unchanged since 2dd75e0aa2; the new commits add Dremio and catalog-side entries).",
   "score": {
     "raw": 150,
     "max": 162,
