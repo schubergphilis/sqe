@@ -1,196 +1,187 @@
 # Public Iceberg Matrix Comparison
 
-Side-by-side comparison of every Iceberg engine on the public scoreboard at [icebergmatrix.org](https://icebergmatrix.org). Source rubric: [Neuw84/iceberg-matrix](https://github.com/Neuw84/iceberg-matrix). SQE data lives in [`docs/iceberg-matrix-state.json`](../../evidence/iceberg-matrix-state.json) and is rendered in detail in [`docs/iceberg-matrix.md`](./iceberg-matrix.md).
+Side-by-side comparison of SQE with every engine on [icebergmatrix.org](https://icebergmatrix.org). Upstream data: [Neuw84/iceberg-matrix@d14d0f1341](https://github.com/Neuw84/iceberg-matrix/tree/d14d0f1341971cca8a8a218ca412d2cff28e3253) (MIT), fetched 2026-10-23. SQE data: [`docs/evidence/iceberg-matrix-state.json`](../../evidence/iceberg-matrix-state.json), rendered per cell in [`iceberg-matrix.md`](./iceberg-matrix.md).
 
-Each cell shows V2/V3 status. Glyphs:
+Every engine is scored on the same 54 cells: one per feature and format version the rubric applies to. full=3, partial=2, unknown=1, none=0; max 162. SQE rates itself; the other engines are rated by the upstream maintainers and contributors.
 
-- `F` full: feature works end-to-end with no significant caveats.
-- `P` partial: works with caveats; see per-engine cell notes for details.
-- `?` unknown: library primitives exist but no end-to-end verification.
-- `.` none: not implemented, blocked upstream, or not applicable.
-
-Cells like `./X` mean the feature is V3-only in the rubric (no V2 cell). Cells like `X/.` mean V2-only. Engines with no V3 column at all (e.g. `./.` row-wide) have not implemented V3 features yet.
+Cells read `V2/V3`: `F` full, `P` partial, `?` unknown, `.` none, `-` the rubric does not score that version.
 
 ## Scoreboard
 
-| Rank | Engine | Score | Coverage |
+| Rank | Engine | Score | % |
 |---:|---|---:|---:|
-| 1 | EMR (7.12.0 Spark) | 180/189 | 95.2% |
-| 2 | Glue (5.1) | 178/189 | 94.2% |
-| 3 | OSS Spark (4.1) | 175/189 | 92.6% |
-| 4 | Dataproc (2.3) | 174/189 | 92.1% |
-| 5 | SQE (0.15.0) **(this engine)** | 167/189 | 88.4% |
-| 6 | Managed Flink (1.20) | 157/189 | 83.1% |
-| 7 | OSS Flink (2.2.0) | 153/189 | 81.0% |
-| 8 | Doris (4.1) | 144/189 | 76.2% |
-| 9 | Snowflake | 134/189 | 70.9% |
-| 10 | PyIceberg (0.11.0) | 130/189 | 68.8% |
-| 11 | Databricks (DBR 17.3) | 103/189 | 54.5% |
-| 12 | DuckDB (1.5.2) | 88/189 | 46.6% |
-| 13 | Synapse (3.5) | 78/189 | 41.3% |
-| 14 | Daft | 77/189 | 40.7% |
-| 15 | Kafka Connect | 74/189 | 39.2% |
-| 16 | Fabric (1.3) | 72/189 | 38.1% |
-| 17 | Athena SQL (v3) | 59/189 | 31.2% |
-| 18 | Redshift (S3) | 49/189 | 25.9% |
-| 19 | ClickHouse (26.1) | 46/189 | 24.3% |
-| 20 | BigQuery | 40/189 | 21.2% |
-| 21 | Data Firehose | 26/189 | 13.8% |
-
-SQE sits at **167/189 (88.4%)**, fifth on the public scoreboard behind EMR Spark, AWS Glue Spark, OSS Spark, and Dataproc. SQE is the only entry in the top five that is not a Spark distribution.
-
----
-
-## OSS engines comparison
-
-SQE first, then Spark, Flink, PyIceberg, DuckDB, ClickHouse, Doris, Daft, and Kafka Connect (OSS streaming connector).
-
-### Read & write fundamentals
-
-| Feature | SQE | Spark | Flink | PyIce | DuckDB | CH | Doris | Daft | Kafka |
-| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| Read Support | F/F | F/F | F/F | F/F | F/P | F/. | F/F | F/? | ./. |
-| Write (INSERT) | F/F | F/F | F/F | F/F | F/P | ./. | F/F | F/? | F/F |
-| Write (MERGE/UPDATE/DELETE) | F/F | F/F | P/P | P/P | P/? | ./. | P/P | ./? | ./. |
-| Copy-on-Write | F/F | F/F | F/F | F/F | P/? | ./. | ./. | F/? | ./. |
-| Merge-on-Read | F/F | F/F | F/F | P/P | F/? | F/. | F/F | P/? | ./. |
-| Position Deletes | F/F | F/F | F/F | P/P | F/P | F/. | F/F | F/? | ./. |
-| Equality Deletes | F/F | F/F | F/F | P/. | F/. | P/. | F/. | ./? | ./. |
-
-### Schema & table evolution
-
-| Feature | SQE | Spark | Flink | PyIce | DuckDB | CH | Doris | Daft | Kafka |
-| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| Table Creation | F/F | F/F | F/F | F/F | F/? | ./. | F/F | F/? | P/P |
-| Schema Evolution | F/F | F/F | P/P | F/F | F/P | P/. | F/F | F/? | P/P |
-| Type Promotion / Widening | F/F | F/F | F/F | F/F | ./. | P/. | F/F | ./? | ./. |
-| Column Default Values | ./F | ./P | ./? | ./. | ./. | ./. | ./P | ./. | ./. |
-| Hidden Partitioning | F/F | F/F | P/P | F/F | F/P | F/. | F/F | F/? | P/P |
-| Partition Evolution | F/F | F/F | P/P | F/F | F/P | ?/. | F/F | F/? | ./. |
-| Multi-Argument Transforms | ./. | ./P | ./? | ./. | ./? | ./. | ./? | ./. | ./. |
-
-### Time, lineage, history
-
-| Feature | SQE | Spark | Flink | PyIce | DuckDB | CH | Doris | Daft | Kafka |
-| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| Time Travel / Snapshots | F/F | F/F | F/F | F/F | F/P | F/. | F/F | P/? | ./. |
-| Branching & Tagging | F/F | F/F | P/P | F/F | ./. | ./. | F/F | ./? | P/P |
-| Lineage Tracking | ./. | ./? | ./? | ./. | ./. | ./? | ./P | ./. | ./. |
-| Change Data Capture (CDC) | ./F | ./P | ./P | ./. | ./. | ./? | ./P | ./. | ./. |
-
-### Statistics & maintenance
-
-| Feature | SQE | Spark | Flink | PyIce | DuckDB | CH | Doris | Daft | Kafka |
-| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| Statistics (Column Metrics) | F/F | F/F | F/F | F/F | F/P | P/. | F/F | F/? | P/P |
-| Bloom Filters & Puffin | F/F | F/F | ?/? | ./. | ./. | ./. | ?/? | ./? | ./. |
-| Table Maintenance | F/F | F/F | P/P | P/P | ./. | ./. | F/F | ./? | ./. |
-
-### Catalog backends
-
-| Feature | SQE | Spark | Flink | PyIce | DuckDB | CH | Doris | Daft | Kafka |
-| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| Catalog Integration | F/F | F/F | F/F | F/F | F/P | F/. | F/F | F/? | F/F |
-| REST Catalog | F/F | F/F | F/F | F/F | F/P | F/. | F/F | F/? | F/F |
-| Polaris | F/F | F/F | F/F | F/F | F/P | P/. | P/P | P/? | P/P |
-| Nessie | F/F | F/F | F/F | P/P | ./. | ./. | ?/? | P/? | F/F |
-| Unity Catalog | F/F | F/F | P/P | P/P | P/? | P/. | P/P | P/? | ./. |
-| Snowflake Horizon Catalog | P/P | F/P | F/P | F/P | F/? | P/? | P/P | F/? | P/P |
-| Hive Metastore | F/F | F/F | F/F | F/F | ./. | ./. | F/F | F/? | F/F |
-| AWS Glue Catalog | F/F | F/F | F/F | F/F | F/P | F/. | P/P | F/? | F/F |
-| JDBC Catalog | F/F | F/F | F/F | ./. | ./. | ./. | P/P | ./. | P/P |
-| Hadoop Catalog | P/P | F/F | F/F | ./. | ./. | ./. | F/F | ./. | F/F |
-
-### V3 advanced types
-
-| Feature | SQE | Spark | Flink | PyIce | DuckDB | CH | Doris | Daft | Kafka |
-| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| Nanosecond Timestamps | ./F | ./. | ./? | ./F | ./. | ./. | ./. | ./. | ./. |
-| Variant Type | ./. | ./F | ./? | ./. | ./. | ./? | ./? | ./. | ./. |
-| Shredded Variant | ./. | ./P | ./? | ./. | ./. | ./? | ./? | ./. | ./. |
-| Geometry / Geo Types | ./. | ./? | ./? | ./. | ./F | ./? | ./? | ./. | ./. |
-| Vector / Embedding Type | ./. | ./? | ./? | ./. | ./. | ./? | ./? | ./. | ./. |
+| 1 | **SQE (self-rated)** | 150/162 | 92.6 |
+| 2 | AWS EMR (8.1 Spark) | 147/162 | 90.7 |
+| 3 | Starburst (482-e) | 147/162 | 90.7 |
+| 4 | Dremio / SAP (26.x) | 146/162 | 90.1 |
+| 5 | AWS Glue (6.0) | 145/162 | 89.5 |
+| 6 | AWS EMR (8.1 Spark) (S3 Tables) | 143/162 | 88.3 |
+| 7 | AWS Glue (6.0) (S3 Tables) | 141/162 | 87.0 |
+| 8 | Google Managed Spark (3.0.13) | 139/162 | 85.8 |
+| 9 | Snowflake | 138/162 | 85.2 |
+| 10 | Snowflake (external) | 138/162 | 85.2 |
+| 11 | Spark (4.1) | 138/162 | 85.2 |
+| 12 | Trino (483) | 130/162 | 80.2 |
+| 13 | OSS Flink (2.3) | 126/162 | 77.8 |
+| 14 | AWS Managed Flink (2.3) | 124/162 | 76.5 |
+| 15 | AWS Managed Flink (2.3) (S3 Tables) | 124/162 | 76.5 |
+| 16 | Doris (4.2) | 122/162 | 75.3 |
+| 17 | DuckDB (1.5.5) | 116/162 | 71.6 |
+| 18 | PyIceberg (0.12.0) | 113/162 | 69.8 |
+| 19 | Databricks (DBR 18.2) | 110/162 | 67.9 |
+| 20 | AWS Redshift (S3) | 95/162 | 58.6 |
+| 21 | Oracle (26ai) | 95/162 | 58.6 |
+| 22 | Alibaba Cloud Realtime Compute Flink (VVR 11.x) | 87/162 | 53.7 |
+| 23 | Alibaba Cloud EMR Spark (EMR-5.21.0) | 78/162 | 48.1 |
+| 24 | Daft | 70/162 | 43.2 |
+| 25 | ClickHouse (26.9) | 67/162 | 41.4 |
+| 26 | Google BigQuery | 60/162 | 37.0 |
+| 27 | AWS Athena SQL (v3) | 54/162 | 33.3 |
+| 28 | Microsoft Fabric (2.0) | 54/162 | 33.3 |
+| 29 | AWS Athena SQL (v3) (S3 Tables) | 52/162 | 32.1 |
+| 30 | AWS Aurora PostgreSQL (17.11) | 52/162 | 32.1 |
+| 31 | AWS Aurora PostgreSQL (17.11) (S3 Tables) | 52/162 | 32.1 |
+| 32 | AWS Redshift (S3) (S3 Tables) | 50/162 | 30.9 |
+| 33 | Databend (1.2.725) | 48/162 | 29.6 |
+| 34 | Alibaba Cloud Hologres (V4.2) | 46/162 | 28.4 |
+| 35 | Spark (4.1) | 37/162 | 22.8 |
+| 36 | Spark (4.1) | 35/162 | 21.6 |
+| 37 | Alibaba Cloud MaxCompute | 34/162 | 21.0 |
 
 ---
 
-## Cloud-managed engines comparison
+## Open-source engines
 
-SQE first, then Snowflake, Databricks, AWS, GCP, and Azure offerings. EMR / Glue / Dataproc are Spark-managed so they share the same upstream matrix data as OSS Spark with vendor-specific caveats.
+### Row-level operations
 
-### Read & write fundamentals
+| Feature | SQE | Spark | Trino | Flink | Doris | DuckDB | PyIce | Daft | CH | Dbend |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| Position Deletes | F/- | F/- | F/- | F/- | F/- | F/- | ./- | ./- | F/- | ?/- |
+| Equality Deletes | F/F | ./. | ./. | F/F | ./. | ./. | ./. | ./? | ./. | ?/. |
+| Merge-on-Read | F/F | F/F | F/F | F/F | F/F | F/F | ./. | ./? | F/. | ?/. |
+| Copy-on-Write | F/F | F/F | ./. | ./. | ./. | ./? | F/F | ./? | ./. | ./. |
+| Lineage Tracking | -/F | -/F | -/F | -/F | -/P | -/F | -/. | -/. | -/F | -/. |
+| Deletion Vectors | -/F | -/F | -/F | -/F | -/F | -/F | -/. | -/. | -/. | -/? |
 
-| Feature | SQE | Snow | DBX | EMR | Glue | Athena | RS-S3 | MFlink | Fire | BQ | DProc | Fabric | Syn |
-| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| Read Support | F/F | F/F | F/F | F/F | F/F | F/. | F/. | F/F | ./. | F/. | F/F | ?/? | P/? |
-| Write (INSERT) | F/F | F/F | F/F | F/F | F/F | F/. | F/. | F/F | F/. | F/. | F/F | ?/? | P/? |
-| Write (MERGE/UPDATE/DELETE) | F/F | F/F | F/F | F/F | F/F | F/. | F/. | P/P | F/. | F/. | F/F | ?/? | P/? |
-| Copy-on-Write | F/F | F/F | F/F | F/F | F/F | P/. | F/. | F/F | P/. | F/. | F/F | ?/? | P/? |
-| Merge-on-Read | F/F | P/F | ./F | F/F | F/F | F/. | F/. | F/F | P/. | P/. | F/F | ?/? | P/? |
-| Position Deletes | F/F | P/F | ./. | F/F | F/F | F/. | F/. | F/F | ./. | P/. | F/F | ?/? | P/? |
-| Equality Deletes | F/F | ./. | ./. | F/F | F/F | F/. | F/. | F/F | F/. | P/. | F/F | ?/? | P/? |
+### Table management
 
-### Schema & table evolution
+| Feature | SQE | Spark | Trino | Flink | Doris | DuckDB | PyIce | Daft | CH | Dbend |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| Schema Evolution | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/? | P/F | ./. |
+| Type Promotion / Widening | F/F | F/F | F/F | F/F | F/F | P/P | F/F | P/? | P/. | ./. |
+| Column Default Values | -/F | -/. | -/. | -/. | -/F | -/F | -/P | -/. | -/. | -/? |
+| Table Creation | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/? | F/F | P/? |
+| Time Travel / Snapshots | F/F | F/F | F/F | F/F | F/F | F/F | F/F | P/? | F/. | ./. |
+| Table Maintenance | F/F | F/F | F/F | P/P | F/F | ./. | P/P | ./? | P/. | ./. |
+| Branching & Tagging | F/F | F/F | P/P | P/P | F/F | ./. | F/F | ./? | ./. | ./. |
 
-| Feature | SQE | Snow | DBX | EMR | Glue | Athena | RS-S3 | MFlink | Fire | BQ | DProc | Fabric | Syn |
-| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| Table Creation | F/F | F/F | F/F | F/F | F/F | F/. | F/. | F/F | ./. | F/. | F/F | ?/? | P/? |
-| Schema Evolution | F/F | F/F | F/F | F/F | F/F | F/. | F/. | P/P | P/. | F/. | F/F | ?/? | P/? |
-| Type Promotion / Widening | F/F | F/F | ?/? | F/F | F/F | F/. | P/. | F/F | ./. | P/. | F/F | ?/? | P/? |
-| Column Default Values | ./F | ./F | ./. | ./F | ./F | ./. | ./. | ./? | ./. | ./. | ./F | ?/? | ./? |
-| Hidden Partitioning | F/F | P/F | P/P | F/F | F/F | F/. | F/. | P/P | F/. | P/. | F/F | ?/? | P/? |
-| Partition Evolution | F/F | P/P | P/P | F/F | F/F | F/. | P/. | P/P | ./. | ./. | F/F | ?/? | P/? |
-| Multi-Argument Transforms | ./. | ./? | ./. | ./F | ./F | ./. | ./. | ./? | ./. | ./. | ./F | ?/? | ./? |
+### Partitioning
 
-### Time, lineage, history
+| Feature | SQE | Spark | Trino | Flink | Doris | DuckDB | PyIce | Daft | CH | Dbend |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| Hidden Partitioning | F/F | F/F | F/F | P/P | F/F | F/F | F/F | F/? | F/F | ?/? |
+| Partition Evolution | F/F | F/F | F/F | P/P | F/F | F/P | F/F | F/? | P/. | ./. |
+| Multi-Argument Transforms | -/. | -/. | -/. | -/? | -/? | -/. | -/. | -/. | -/. | -/? |
 
-| Feature | SQE | Snow | DBX | EMR | Glue | Athena | RS-S3 | MFlink | Fire | BQ | DProc | Fabric | Syn |
-| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| Time Travel / Snapshots | F/F | F/F | F/F | F/F | F/F | F/. | F/. | F/F | ./. | F/. | F/F | ?/? | P/? |
-| Branching & Tagging | F/F | ./. | ./. | F/F | F/F | P/. | ./. | P/P | ./. | ./. | F/F | ?/? | P/? |
-| Lineage Tracking | ./. | ./F | ./F | ./F | ./F | ./. | ./. | ./? | ./. | ./. | ./? | ?/? | ./? |
-| Change Data Capture (CDC) | ./F | ./F | ./. | ./F | ./F | ./. | ./. | F/F | ./. | ./. | ./? | ?/? | ./? |
+### Read / write
 
-### Statistics & maintenance
+| Feature | SQE | Spark | Trino | Flink | Doris | DuckDB | PyIce | Daft | CH | Dbend |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| Read Support | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/? |
+| Write (INSERT) | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/? | P/. | P/? |
+| Write (MERGE/UPDATE/DELETE) | F/F | F/F | F/F | P/P | P/P | F/F | P/P | ./? | P/. | ./. |
+| Catalog Integration | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/? | F/. | F/? |
+| Statistics (Column Metrics) | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/? | P/. | P/? |
+| Bloom Filters & Puffin | F/F | F/F | P/P | F/F | ?/? | ./. | ./. | ./? | P/. | ?/? |
 
-| Feature | SQE | Snow | DBX | EMR | Glue | Athena | RS-S3 | MFlink | Fire | BQ | DProc | Fabric | Syn |
-| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| Statistics (Column Metrics) | F/F | F/F | ?/? | F/F | F/F | F/. | F/. | F/F | P/. | ?/. | F/F | ?/? | P/? |
-| Bloom Filters & Puffin | F/F | ./. | ./. | F/F | F/F | P/. | ./. | ?/? | ./. | ?/. | F/F | ?/? | P/? |
-| Table Maintenance | F/F | F/F | F/F | F/F | F/F | P/. | P/. | P/P | ./. | F/. | F/F | ?/? | P/? |
+### Catalog support
 
-### Catalog backends
+| Feature | SQE | Spark | Trino | Flink | Doris | DuckDB | PyIce | Daft | CH | Dbend |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| AWS Glue Catalog | F/F | F/F | F/F | F/F | P/P | F/F | F/F | F/? | F/. | F/? |
+| REST Catalog | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/? | P/. | F/? |
+| Unity Catalog | P/P | F/F | P/P | P/P | P/P | P/? | P/P | P/? | P/. | P/? |
+| Snowflake Horizon Catalog | P/P | F/P | P/P | F/P | P/P | F/? | F/P | F/? | P/? | P/? |
+| Google Lakehouse | P/P | P/P | P/P | P/P | P/P | P/P | P/P | P/? | P/? | P/? |
 
-| Feature | SQE | Snow | DBX | EMR | Glue | Athena | RS-S3 | MFlink | Fire | BQ | DProc | Fabric | Syn |
-| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| Catalog Integration | F/F | F/F | F/F | F/F | F/F | F/. | F/. | F/F | F/. | F/. | F/F | ?/? | P/? |
-| REST Catalog | F/F | F/F | F/F | F/F | F/F | ./. | ./. | F/F | ./. | ?/. | F/F | ?/? | P/? |
-| Polaris | F/F | F/F | ?/? | F/F | F/F | P/. | ./. | F/F | ./. | ./. | F/F | ?/? | ./. |
-| Nessie | F/F | ./. | ./. | F/F | F/F | ./. | ./. | F/F | ./. | ./. | F/F | ?/? | P/? |
-| Unity Catalog | F/F | P/P | F/F | P/P | P/P | P/. | ./. | P/P | ./. | ./. | P/P | ?/? | ./. |
-| Snowflake Horizon Catalog | P/P | F/F | P/P | F/P | P/? | P/. | ?/. | F/P | ./. | ./. | F/P | P/. | ./. |
-| Hive Metastore | F/F | ./. | P/P | F/F | F/F | ./. | ./. | F/F | ./. | ./. | F/F | ?/? | P/? |
-| AWS Glue Catalog | F/F | F/F | P/P | F/F | F/F | F/. | F/. | F/F | F/. | ./. | P/P | ?/? | ./. |
-| JDBC Catalog | F/F | ./. | ./. | F/F | F/F | ./. | ./. | F/F | ./. | ./. | F/F | ?/? | P/? |
-| Hadoop Catalog | P/P | ./. | ./. | F/F | F/F | ./. | ./. | F/F | ./. | ./. | F/F | ?/? | P/? |
+### V3 data types
 
-### V3 advanced types
-
-| Feature | SQE | Snow | DBX | EMR | Glue | Athena | RS-S3 | MFlink | Fire | BQ | DProc | Fabric | Syn |
-| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| Nanosecond Timestamps | ./F | ./F | ./. | ./F | ./F | ./. | ./. | ./? | ./. | ./. | ./F | ?/? | ./? |
-| Variant Type | ./. | ./F | ./F | ./F | ./F | ./. | ./. | ./? | ./. | ./. | ./F | ?/? | ./? |
-| Shredded Variant | ./. | ./? | ./? | ./? | ./? | ./. | ./. | ./? | ./. | ./. | ./? | ?/? | ./? |
-| Geometry / Geo Types | ./. | ./F | ./. | ./? | ./? | ./. | ./. | ./? | ./. | ./. | ./? | ?/? | ./? |
-| Vector / Embedding Type | ./. | ./? | ./? | ./? | ./? | ./. | ./. | ./? | ./. | ./. | ./? | ?/? | ./? |
+| Feature | SQE | Spark | Trino | Flink | Doris | DuckDB | PyIce | Daft | CH | Dbend |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| Variant Type | -/F | -/F | -/F | -/P | -/P | -/F | -/. | -/. | -/. | -/? |
+| Shredded Variant | -/F | -/. | -/P | -/. | -/P | -/F | -/. | -/. | -/. | -/? |
+| Geometry / Geo Types | -/. | -/. | -/F | -/. | -/. | -/P | -/. | -/. | -/P | -/? |
+| Nanosecond Timestamps | -/F | -/. | -/F | -/F | -/. | -/F | -/F | -/P | -/. | -/. |
+| Unknown Type | -/F | -/F | -/. | -/. | -/. | -/. | -/F | -/F | -/. | -/? |
 
 ---
 
-## How to read the cells
+## Managed and commercial engines
 
-A cell like `F/F` means full support on V2 and V3. `F/P` means full V2 with a known caveat on V3. `./F` means the feature is V3-only in the rubric. `./.` means neither version is supported (or not implemented yet). The exact caveats per engine live in the upstream platform JSONs at [`Neuw84/iceberg-matrix/src/data/platforms/`](https://github.com/Neuw84/iceberg-matrix/tree/main/src/data/platforms); SQE caveats live in [`docs/iceberg-matrix-state.json`](../../evidence/iceberg-matrix-state.json).
+### Row-level operations
 
-## SQE specifics
+| Feature | SQE | Starb | EMR | Dremio | Glue | DProc | Snow | DBX | Athena | BQ | Fabric |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| Position Deletes | F/- | F/- | F/- | F/- | F/- | F/- | F/- | ./- | F/- | P/- | ?/- |
+| Equality Deletes | F/F | ./. | ./. | ./. | ./. | ./. | ./. | ./. | ./. | P/. | ?/? |
+| Merge-on-Read | F/F | F/F | F/F | F/F | F/F | F/F | F/F | ./F | F/. | P/P | ?/? |
+| Copy-on-Write | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/F | ./. | F/. | ?/? |
+| Lineage Tracking | -/F | -/F | -/F | -/F | -/F | -/? | -/F | -/F | -/. | -/. | -/? |
+| Deletion Vectors | -/F | -/F | -/F | -/F | -/F | -/F | -/F | -/F | -/. | -/P | -/? |
 
-Every SQE cell maps to a concrete file path or test name in the repo. The full per-cell evidence and notes live in [`docs/iceberg-matrix.md`](./iceberg-matrix.md). The matrix engineering history sits in chapters 16b ("The Matrix and the Quiet Bug") and 16c ("Following Through") of the ebook in `docs/ebook/`.
+### Table management
 
-Regenerate this comparison: `python3 scripts/render-iceberg-matrix-compare.py`. The script fetches the latest platform JSONs from `Neuw84/iceberg-matrix` via `gh api` and joins them with our own `docs/iceberg-matrix-state.json`.
+| Feature | SQE | Starb | EMR | Dremio | Glue | DProc | Snow | DBX | Athena | BQ | Fabric |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| Schema Evolution | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/. | F/. | ?/? |
+| Type Promotion / Widening | F/F | F/F | F/P | F/P | F/P | F/F | F/F | F/P | F/. | P/. | ?/? |
+| Column Default Values | -/F | -/F | -/F | -/F | -/F | -/F | -/F | -/P | -/. | -/. | -/? |
+| Table Creation | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/. | F/. | ?/? |
+| Time Travel / Snapshots | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/. | F/. | ?/? |
+| Table Maintenance | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/F | P/. | F/. | ?/? |
+| Branching & Tagging | F/F | F/F | F/F | F/F | F/F | F/F | ./. | ./. | P/. | ./. | ?/? |
+
+### Partitioning
+
+| Feature | SQE | Starb | EMR | Dremio | Glue | DProc | Snow | DBX | Athena | BQ | Fabric |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| Hidden Partitioning | F/F | F/F | F/F | F/F | F/F | F/F | F/F | ./. | F/. | P/. | ?/? |
+| Partition Evolution | F/F | F/F | F/F | F/F | F/F | F/F | F/F | P/P | F/. | ./. | ?/? |
+| Multi-Argument Transforms | -/. | -/. | -/. | -/. | -/. | -/. | -/. | -/. | -/. | -/. | -/? |
+
+### Read / write
+
+| Feature | SQE | Starb | EMR | Dremio | Glue | DProc | Snow | DBX | Athena | BQ | Fabric |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| Read Support | F/F | F/F | F/F | F/F | F/F | F/F | P/P | P/P | F/. | F/P | ?/? |
+| Write (INSERT) | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/. | F/. | ?/? |
+| Write (MERGE/UPDATE/DELETE) | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/. | F/. | ?/? |
+| Catalog Integration | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/. | F/. | ?/? |
+| Statistics (Column Metrics) | F/F | F/F | F/F | F/F | F/F | F/F | F/F | P/P | F/. | ?/. | ?/? |
+| Bloom Filters & Puffin | F/F | F/F | F/F | F/F | F/F | F/F | ./. | ./. | P/. | ?/. | ?/? |
+
+### Catalog support
+
+| Feature | SQE | Starb | EMR | Dremio | Glue | DProc | Snow | DBX | Athena | BQ | Fabric |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| AWS Glue Catalog | F/F | F/F | F/F | F/F | F/F | P/P | F/F | P/P | F/. | P/. | ?/? |
+| REST Catalog | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/F | ./. | P/P | ?/? |
+| Unity Catalog | P/P | F/F | P/P | F/F | P/P | P/P | F/F | F/F | P/. | P/. | ?/? |
+| Snowflake Horizon Catalog | P/P | P/P | F/P | F/F | P/? | F/P | F/F | P/P | P/. | P/. | P/. |
+| Google Lakehouse | P/P | F/F | P/P | F/F | P/P | F/P | F/P | P/P | ?/? | F/P | ?/? |
+
+### V3 data types
+
+| Feature | SQE | Starb | EMR | Dremio | Glue | DProc | Snow | DBX | Athena | BQ | Fabric |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| Variant Type | -/F | -/F | -/F | -/F | -/F | -/F | -/F | -/F | -/. | -/. | -/? |
+| Shredded Variant | -/F | -/P | -/F | -/F | -/F | -/? | -/F | -/F | -/. | -/. | -/? |
+| Geometry / Geo Types | -/. | -/F | -/F | -/. | -/F | -/? | -/F | -/F | -/. | -/. | -/? |
+| Nanosecond Timestamps | -/F | -/F | -/F | -/F | -/F | -/F | -/F | -/. | -/. | -/. | -/? |
+| Unknown Type | -/F | -/. | -/F | -/. | -/F | -/? | -/F | -/? | -/. | -/. | -/? |
+
+---
+
+Per-cell notes and caveats live in the upstream platform files under [`src/data/platforms/`](https://github.com/Neuw84/iceberg-matrix/tree/d14d0f1341971cca8a8a218ca412d2cff28e3253/src/data/platforms) and, for SQE, in the state file.
+
+Regenerate: `python3 scripts/render-iceberg-matrix-compare.py`, then `python3 scripts/render-iceberg-matrix.py`.

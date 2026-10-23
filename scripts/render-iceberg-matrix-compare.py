@@ -1,347 +1,279 @@
-"""Render the public Iceberg matrix as a comparison Markdown doc.
+"""Snapshot the public Iceberg matrix and render the engine comparison.
 
-Fetches platform support files from the upstream public matrix repo
-(`Neuw84/iceberg-matrix`) using the `gh` CLI, joins them with our local
-`docs/evidence/iceberg-matrix-state.json`, and writes a side-by-side comparison
-table to `docs/internal/design-archive/iceberg-matrix-compare.md`.
+Fetches the rubric (`src/data/features.json`) and every platform file under
+`src/data/platforms/` from the upstream public matrix repo
+(`Neuw84/iceberg-matrix`, MIT) with the `gh` CLI, then writes:
+
+- `docs/evidence/iceberg-matrix-rubric.json`: the rubric features and every
+  engine's score at that upstream commit. `render-iceberg-matrix.py` reads it,
+  so the SQE page renders offline from a pinned snapshot.
+- `docs/internal/design-archive/iceberg-matrix-compare.md`: the side-by-side
+  comparison against SQE's `docs/evidence/iceberg-matrix-state.json`.
+
+Every engine is scored on the same cells SQE is: one cell per feature and
+format version the rubric applies to (`introducedIn` up to, not including,
+`removedIn`). A cell an engine does not list counts as none.
 
 Run from the repo root:
 
-    python3 scripts/render-iceberg-matrix-compare.py
+    python3 scripts/render-iceberg-matrix-compare.py [--ref <commit>]
 
-Requires `gh` CLI authenticated to GitHub. Caches the fetched JSONs
-in `/tmp/iceberg-matrix-data/` for subsequent runs.
+`--ref` defaults to upstream `main`. Fetched files are cached per commit in
+`/tmp/iceberg-matrix-data/<sha>/`.
 """
+import argparse
 import base64
-import glob
+import datetime
 import json
 import os
 import subprocess
 import sys
 from collections import OrderedDict
 
-DATA_DIR = '/tmp/iceberg-matrix-data'
+DATA_ROOT = '/tmp/iceberg-matrix-data'
+STATE = 'docs/evidence/iceberg-matrix-state.json'
+RUBRIC_OUT = 'docs/evidence/iceberg-matrix-rubric.json'
 OUT = 'docs/internal/design-archive/iceberg-matrix-compare.md'
 UPSTREAM_REPO = 'Neuw84/iceberg-matrix'
-UPSTREAM_DATA_PATH = 'src/data/platforms'
 UPSTREAM_FEATURES = 'src/data/features.json'
+UPSTREAM_PLATFORMS = 'src/data/platforms/'
 
-# Filenames that exist in the upstream platforms/ directory. Each one may
-# describe several platforms (e.g. aws.json describes EMR, Glue, Athena, ...).
-PLATFORM_FILES = [
-    'oss.json', 'snowflake.json', 'databricks.json',
-    'aws.json', 'aws-tables.json',
-    'gcp.json', 'azure.json',
-    'firehose.json', 'kafka-connect.json',
-]
+VERSIONS = ['v2', 'v3']
+GLYPH = {'full': 'F', 'partial': 'P', 'unknown': '?', 'none': '.'}
+SCORE = {'full': 3, 'partial': 2, 'unknown': 1, 'none': 0}
 
-
-def fetch_upstream_data():
-    """Pull the latest features.json + platform JSONs from the public matrix
-    repo via `gh api` and cache them under DATA_DIR. Skips files that are
-    already present so re-running is fast; delete DATA_DIR to force refresh.
-    """
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-    def _gh_get(path, dest):
-        if os.path.exists(dest):
-            return
-        result = subprocess.run(
-            ['gh', 'api', f'repos/{UPSTREAM_REPO}/contents/{path}'],
-            capture_output=True, text=True, check=True,
-        )
-        payload = json.loads(result.stdout)
-        with open(dest, 'w') as f:
-            f.write(base64.b64decode(payload['content']).decode())
-
-    try:
-        _gh_get(UPSTREAM_FEATURES, f'{DATA_DIR}/features.json')
-        for fname in PLATFORM_FILES:
-            _gh_get(f'{UPSTREAM_DATA_PATH}/{fname}', f'{DATA_DIR}/{fname}')
-    except subprocess.CalledProcessError as e:
-        print(
-            f'gh api call failed: {e.stderr}\n'
-            f'Make sure `gh auth status` reports an authenticated session.',
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    except FileNotFoundError:
-        print(
-            'gh CLI not found on PATH. Install it from https://cli.github.com '
-            'and run `gh auth login`.',
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-GLYPH = {
-    'full': 'F',
-    'partial': 'P',
-    '?': '?',
-    'unknown': '?',
-    'none': '.',
-}
-SCORE = {'full': 3, 'partial': 2, '?': 1, 'unknown': 1, 'none': 0}
-
-# Categories that group features (for readable subtables)
-CATEGORIES = OrderedDict([
-    ('Read & write fundamentals', [
-        'read-support', 'write-insert', 'write-merge-update-delete',
-        'copy-on-write', 'merge-on-read',
-        'position-deletes', 'equality-deletes',
-    ]),
-    ('Schema & table evolution', [
-        'table-creation', 'schema-evolution', 'type-promotion',
-        'column-default-values', 'hidden-partitioning',
-        'partition-evolution', 'multi-arg-transforms',
-    ]),
-    ('Time, lineage, history', [
-        'time-travel', 'branching-tagging', 'lineage', 'cdc-support',
-    ]),
-    ('Statistics & maintenance', [
-        'statistics', 'bloom-filters', 'table-maintenance',
-    ]),
-    ('Catalog backends', [
-        'catalog-integration', 'rest-catalog',
-        'polaris', 'nessie', 'unity-catalog',
-        'snowflake-horizon-catalog',
-        'hive-metastore', 'aws-glue-catalog',
-        'jdbc-catalog', 'hadoop-catalog',
-    ]),
-    ('V3 advanced types', [
-        'nanosecond-timestamps', 'variant-type', 'shredded-variant',
-        'geometry-type', 'vector-type',
-    ]),
+CATEGORY_NAMES = OrderedDict([
+    ('row-level-operations', 'Row-level operations'),
+    ('table-management', 'Table management'),
+    ('partitioning', 'Partitioning'),
+    ('read-write', 'Read / write'),
+    ('catalog-support', 'Catalog support'),
+    ('v3-data-types', 'V3 data types'),
 ])
 
-# Two column groups for readability: SQE first in each, then peers
-# OSS group includes SQE so SQE is always at the start.
-COL_GROUP_OSS = [
-    'sqe',
-    'spark', 'flink', 'pyiceberg', 'duckdb',
-    'clickhouse', 'doris', 'daft', 'kafka-connect',
-]
-COL_GROUP_CLOUD = [
-    'sqe',  # SQE first, repeated for cross-table comparison
-    'snowflake', 'databricks',
-    'aws-emr', 'aws-glue', 'aws-athena', 'aws-redshift-s3',
-    'aws-managed-flink', 'aws-firehose',
-    'google-bigquery', 'google-dataproc',
-    'azure-fabric', 'azure-synapse',
-]
+# Comparison columns, keyed by engine key (see `engine_key`). SQE leads each
+# group so every table reads against it.
+COL_GROUP_OSS = ['sqe', 'spark', 'trino', 'flink', 'doris', 'duckdb',
+                 'pyiceberg', 'daft', 'clickhouse', 'databend']
+COL_GROUP_CLOUD = ['sqe', 'starburst', 'aws-emr', 'dremio', 'aws-glue',
+                   'google-dataproc', 'snowflake', 'databricks',
+                   'aws-athena', 'google-bigquery', 'azure-fabric']
 
-# Short labels keep header rows tight
 SHORT = {
-    'sqe': 'SQE',
-    'spark': 'Spark',
-    'flink': 'Flink',
-    'pyiceberg': 'PyIce',
-    'duckdb': 'DuckDB',
-    'clickhouse': 'CH',
-    'doris': 'Doris',
-    'daft': 'Daft',
-    'kafka-connect': 'Kafka',
-    'snowflake': 'Snow',
-    'databricks': 'DBX',
-    'aws-emr': 'EMR',
-    'aws-glue': 'Glue',
-    'aws-athena': 'Athena',
-    'aws-redshift-s3': 'RS-S3',
-    'aws-tables': 'S3-T',
-    'aws-managed-flink': 'MFlink',
-    'aws-firehose': 'Fire',
-    'google-bigquery': 'BQ',
-    'google-dataproc': 'DProc',
-    'azure-fabric': 'Fabric',
-    'azure-synapse': 'Syn',
+    'sqe': 'SQE', 'spark': 'Spark', 'trino': 'Trino', 'flink': 'Flink',
+    'doris': 'Doris', 'duckdb': 'DuckDB', 'pyiceberg': 'PyIce', 'daft': 'Daft',
+    'clickhouse': 'CH', 'databend': 'Dbend', 'starburst': 'Starb',
+    'aws-emr': 'EMR', 'dremio': 'Dremio', 'aws-glue': 'Glue',
+    'google-dataproc': 'DProc', 'snowflake': 'Snow', 'databricks': 'DBX',
+    'aws-athena': 'Athena', 'google-bigquery': 'BQ', 'azure-fabric': 'Fabric',
 }
 
-def load_data():
-    features = json.load(open(f'{DATA_DIR}/features.json'))
-    feat_by_id = {f['id']: f for f in features['features']}
 
-    platforms = {}
-    for path in sorted(glob.glob(f'{DATA_DIR}/*.json')):
-        name = os.path.basename(path)
-        if name == 'features.json':
+def gh_json(path):
+    try:
+        result = subprocess.run(['gh', 'api', path], capture_output=True,
+                                text=True, check=True)
+    except FileNotFoundError:
+        sys.exit('gh CLI not found on PATH. Install it from https://cli.github.com '
+                 'and run `gh auth login`.')
+    except subprocess.CalledProcessError as e:
+        sys.exit(f'gh api {path} failed: {e.stderr}\n'
+                 'Make sure `gh auth status` reports an authenticated session.')
+    return json.loads(result.stdout)
+
+
+def fetch_upstream(ref):
+    """Resolve `ref` to a commit and cache the rubric and platform files."""
+    sha = gh_json(f'repos/{UPSTREAM_REPO}/commits/{ref}')['sha']
+    data_dir = os.path.join(DATA_ROOT, sha)
+    os.makedirs(data_dir, exist_ok=True)
+    tree = gh_json(f'repos/{UPSTREAM_REPO}/git/trees/{sha}?recursive=1')['tree']
+    paths = [UPSTREAM_FEATURES] + sorted(
+        t['path'] for t in tree
+        if t['path'].startswith(UPSTREAM_PLATFORMS) and t['path'].endswith('.json'))
+    for path in paths:
+        dest = os.path.join(data_dir, path.replace('/', '__'))
+        if os.path.exists(dest):
             continue
-        data = json.load(open(path))
-        if 'platforms' in data:
-            for p in data['platforms']:
-                platforms[p['id']] = {'name': p['name'], 'support': {}}
-            for cell_id, cell in data['support'].items():
-                pid = cell_id.split(':')[0]
-                if pid in platforms:
-                    platforms[pid]['support'][cell_id] = cell
+        payload = gh_json(f'repos/{UPSTREAM_REPO}/contents/{path}?ref={sha}')
+        with open(dest, 'w') as f:
+            f.write(base64.b64decode(payload['content']).decode())
+    return sha, data_dir, paths
 
-    sqe = json.load(open('docs/evidence/iceberg-matrix-state.json'))
-    platforms['sqe'] = {'name': sqe['platform']['name'], 'support': sqe['support']}
-    return features, feat_by_id, platforms
 
-def score_of(plat):
-    return sum(SCORE.get(c.get('level', 'none'), 0) for c in plat['support'].values())
+def rubric_cells(features):
+    """(feature id, version) pairs the rubric scores, in rubric order."""
+    cells = []
+    for feat in features:
+        lo = VERSIONS.index(feat['introducedIn'])
+        hi = VERSIONS.index(feat['removedIn']) if feat.get('removedIn') else len(VERSIONS)
+        cells += [(feat['id'], v) for v in VERSIONS[lo:hi]]
+    return cells
 
-def render_scoreboard(platforms):
-    rows = []
-    for pid, p in platforms.items():
-        s = score_of(p)
-        pct = 100.0 * s / 189
-        rows.append((pid, p['name'], s, pct))
-    rows.sort(key=lambda r: -r[2])
 
-    out = ['## Scoreboard\n']
-    out.append('| Rank | Engine | Score | Coverage |')
-    out.append('|---:|---|---:|---:|')
-    for i, (pid, name, s, pct) in enumerate(rows, 1):
-        marker = ' **(this engine)**' if pid == 'sqe' else ''
-        out.append(f'| {i} | {name}{marker} | {s}/189 | {pct:.1f}% |')
-    return '\n'.join(out)
+def engine_key(path, pid):
+    """Upstream ships some engines twice (AWS on S3 buckets and on S3 Tables,
+    Snowflake managed and external). The S3-bucket and managed files keep the
+    plain id; the others get a suffix."""
+    if '/s3tables/' in path:
+        return f'{pid}@s3tables', ' (S3 Tables)'
+    if '/snowflake/external/' in path:
+        return f'{pid}@external', ' (external)'
+    return pid, ''
 
-def cell_glyph(plat, fid, version, pid):
-    cell = plat['support'].get(f'{pid}:{fid}:{version}')
-    if cell is None:
-        return ''
-    return GLYPH.get(cell.get('level', 'none'), '.')
 
-def render_category_table(category, feature_ids, feat_by_id, platforms, col_ids,
-                           feature_versions):
-    """Render one category. Cells show V2/V3 glyphs.
+def score_of(support, pid, cells):
+    return sum(SCORE.get(support.get(f'{pid}:{fid}:{v}', {}).get('level', 'none'), 0)
+               for fid, v in cells)
 
-    feature_versions: dict mapping feature_id -> set of versions present in any
-    platform support file. We use this to show single-version cells properly
-    when a feature has no V2 entry in the rubric (V3-only types).
-    """
-    header = ['Feature']
-    sep = ['---']
-    for cid in col_ids:
-        header.append(SHORT.get(cid, cid))
-        sep.append(':---:')
 
-    lines = [
-        f'### {category}',
-        '',
-        '| ' + ' | '.join(header) + ' |',
-        '| ' + ' | '.join(sep) + ' |',
-    ]
-    for fid in feature_ids:
-        feat = feat_by_id.get(fid)
-        if not feat:
+def load(data_dir, paths):
+    features = json.load(open(os.path.join(data_dir, UPSTREAM_FEATURES.replace('/', '__'))))
+    features = features['features']
+    cells = rubric_cells(features)
+    engines = OrderedDict()
+    for path in paths[1:]:
+        data = json.load(open(os.path.join(data_dir, path.replace('/', '__'))))
+        for p in data['platforms']:
+            key, suffix = engine_key(path, p['id'])
+            name = p['name']
+            # Cloud names like "Managed Spark" or "Glue" need their vendor.
+            vendor = p.get('vendor', '')
+            if p.get('group') != '3rd Party' and vendor and vendor not in name:
+                name = f'{vendor} {name}'
+            engines[key] = {
+                'id': p['id'], 'name': name + suffix, 'file': path,
+                'support': {k: v for k, v in data['support'].items()
+                            if k.startswith(p['id'] + ':')},
+            }
+    sqe = json.load(open(STATE))
+    engines['sqe'] = {'id': 'sqe', 'name': 'SQE', 'file': STATE, 'support': sqe['support']}
+    return features, cells, engines, sqe
+
+
+def write_rubric(sha, features, cells, engines):
+    max_score = 3 * len(cells)
+    peers = []
+    for key, e in engines.items():
+        if key == 'sqe':
             continue
-        versions = feature_versions.get(fid, {'v2', 'v3'})
+        raw = score_of(e['support'], e['id'], cells)
+        peers.append({'key': key, 'name': e['name'], 'file': e['file'], 'raw': raw,
+                      'max': max_score, 'percent': round(100.0 * raw / max_score, 1)})
+    peers.sort(key=lambda p: (-p['raw'], p['name']))
+    doc = OrderedDict([
+        ('source', f'https://github.com/{UPSTREAM_REPO}'),
+        ('sourceCommit', sha),
+        ('sourceLicense', 'MIT'),
+        ('fetchedAt', datetime.date.today().isoformat()),
+        ('generatedBy', 'python3 scripts/render-iceberg-matrix-compare.py'),
+        ('scoring', 'One cell per feature and applicable format version '
+                    '(introducedIn up to, not including, removedIn). full=3, '
+                    'partial=2, unknown=1, none=0; a cell an engine does not list '
+                    'counts as none.'),
+        ('cells', len(cells)),
+        ('max', max_score),
+        ('features', [OrderedDict((k, f[k]) for k in
+                                  ('id', 'name', 'category', 'introducedIn', 'removedIn')
+                                  if k in f) for f in features]),
+        ('peers', peers),
+    ])
+    with open(RUBRIC_OUT, 'w') as f:
+        json.dump(doc, f, indent=2)
+        f.write('\n')
+    return peers
+
+
+def glyph(engine, fid, version):
+    cell = engine['support'].get(f"{engine['id']}:{fid}:{version}")
+    return GLYPH.get(cell.get('level', 'none'), '.') if cell else '.'
+
+
+def render_category(title, feats, engines, cols):
+    lines = [f'### {title}', '',
+             '| Feature | ' + ' | '.join(SHORT.get(c, c) for c in cols) + ' |',
+             '|---|' + ':---:|' * len(cols)]
+    for feat in feats:
+        lo = VERSIONS.index(feat['introducedIn'])
+        hi = VERSIONS.index(feat['removedIn']) if feat.get('removedIn') else len(VERSIONS)
         row = [feat['name']]
-        for cid in col_ids:
-            plat = platforms[cid]
-            v2g = cell_glyph(plat, fid, 'v2', cid) or '.'
-            v3g = cell_glyph(plat, fid, 'v3', cid) or '.'
-            if 'v2' not in versions and 'v3' in versions:
-                row.append(f'./{v3g}' if v3g else '.')
-            elif 'v2' in versions and 'v3' not in versions:
-                row.append(f'{v2g}/.' if v2g else '.')
-            else:
-                row.append(f'{v2g}/{v3g}')
+        for c in cols:
+            row.append('/'.join(glyph(engines[c], feat['id'], v) if lo <= i < hi else '-'
+                                for i, v in enumerate(VERSIONS)))
         lines.append('| ' + ' | '.join(row) + ' |')
     return '\n'.join(lines)
 
-def feature_versions(platforms):
-    """Determine which versions each feature is rated under across the rubric."""
-    out = {}
-    for plat in platforms.values():
-        for cell_id in plat['support']:
-            parts = cell_id.split(':')
-            if len(parts) == 3:
-                _, fid, ver = parts
-                out.setdefault(fid, set()).add(ver)
-    return out
 
 def main():
-    fetch_upstream_data()
-    _, feat_by_id, platforms = load_data()
-    feat_versions = feature_versions(platforms)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--ref', default='main', help='upstream commit or branch')
+    args = parser.parse_args()
 
-    out = []
-    out.append('# Public Iceberg Matrix Comparison')
-    out.append('')
-    out.append('Side-by-side comparison of every Iceberg engine on the public '
-               'scoreboard at [icebergmatrix.org](https://icebergmatrix.org). '
-               'Source rubric: [Neuw84/iceberg-matrix]'
-               '(https://github.com/Neuw84/iceberg-matrix). SQE data lives in '
-               '[`docs/evidence/iceberg-matrix-state.json`](../../evidence/iceberg-matrix-state.json) '
-               'and is rendered in detail in [`docs/internal/design-archive/iceberg-matrix.md`]'
-               '(./iceberg-matrix.md).')
-    out.append('')
-    out.append('Each cell shows V2/V3 status. Glyphs:')
-    out.append('')
-    out.append('- `F` full: feature works end-to-end with no significant caveats.')
-    out.append('- `P` partial: works with caveats; see per-engine cell notes for details.')
-    out.append('- `?` unknown: library primitives exist but no end-to-end verification.')
-    out.append('- `.` none: not implemented, blocked upstream, or not applicable.')
-    out.append('')
-    out.append('Cells like `./X` mean the feature is V3-only in the rubric (no V2 cell). '
-               'Cells like `X/.` mean V2-only. Engines with no V3 column at all (e.g. '
-               '`./.` row-wide) have not implemented V3 features yet.')
-    out.append('')
-    out.append(render_scoreboard(platforms))
-    out.append('')
-    sqe_score = score_of(platforms['sqe'])
-    sqe_pct = 100.0 * sqe_score / 189
-    out.append(f'SQE sits at **{sqe_score}/189 ({sqe_pct:.1f}%)**, fifth on the public '
-               'scoreboard behind EMR Spark, AWS Glue Spark, OSS Spark, and Dataproc. '
-               'SQE is the only entry in the top five that is not a Spark distribution.')
-    out.append('')
-    out.append('---')
-    out.append('')
-    out.append('## OSS engines comparison')
-    out.append('')
-    out.append('SQE first, then Spark, Flink, PyIceberg, DuckDB, ClickHouse, Doris, '
-               'Daft, and Kafka Connect (OSS streaming connector).')
-    out.append('')
-    for cat, feat_ids in CATEGORIES.items():
-        out.append(render_category_table(cat, feat_ids, feat_by_id, platforms,
-                                         COL_GROUP_OSS, feat_versions))
-        out.append('')
+    sha, data_dir, paths = fetch_upstream(args.ref)
+    features, cells, engines, sqe = load(data_dir, paths)
+    if {tuple(k.split(':')[1:]) for k in sqe['support']} != set(cells):
+        sys.exit(f'{STATE} does not cover exactly the rubric cells at {sha[:10]}; '
+                 'rescore it before rendering.')
+    peers = write_rubric(sha, features, cells, engines)
+    max_score = 3 * len(cells)
+    sqe_raw = score_of(sqe['support'], 'sqe', cells)
 
-    out.append('---')
-    out.append('')
-    out.append('## Cloud-managed engines comparison')
-    out.append('')
-    out.append('SQE first, then Snowflake, Databricks, AWS, GCP, and Azure offerings. '
-               'EMR / Glue / Dataproc are Spark-managed so they share the same upstream '
-               'matrix data as OSS Spark with vendor-specific caveats.')
-    out.append('')
-    for cat, feat_ids in CATEGORIES.items():
-        out.append(render_category_table(cat, feat_ids, feat_by_id, platforms,
-                                         COL_GROUP_CLOUD, feat_versions))
-        out.append('')
-
-    out.append('---')
-    out.append('')
-    out.append('## How to read the cells')
-    out.append('')
-    out.append('A cell like `F/F` means full support on V2 and V3. `F/P` means full '
-               'V2 with a known caveat on V3. `./F` means the feature is V3-only in '
-               'the rubric. `./.` means neither version is supported (or not '
-               'implemented yet). The exact caveats per engine live in the upstream '
-               'platform JSONs at '
-               '[`Neuw84/iceberg-matrix/src/data/platforms/`]'
-               '(https://github.com/Neuw84/iceberg-matrix/tree/main/src/data/platforms); '
-               'SQE caveats live in [`docs/evidence/iceberg-matrix-state.json`](../../evidence/iceberg-matrix-state.json).')
-    out.append('')
-    out.append('## SQE specifics')
-    out.append('')
-    out.append('Every SQE cell maps to a concrete file path or test name in the repo. '
-               'The full per-cell evidence and notes live in '
-               '[`docs/internal/design-archive/iceberg-matrix.md`](./iceberg-matrix.md). The matrix engineering '
-               'history sits in chapters 16b ("The Matrix and the Quiet Bug") and 16c '
-               '("Following Through") of the ebook in `docs/site/ebook/`.')
-    out.append('')
-    out.append('Regenerate this comparison: '
-               '`python3 scripts/render-iceberg-matrix-compare.py`. The script '
-               'fetches the latest platform JSONs from '
-               '`Neuw84/iceberg-matrix` via `gh api` and joins them with our '
-               'own `docs/evidence/iceberg-matrix-state.json`.')
+    rows = sorted(peers + [{'key': 'sqe', 'name': 'SQE', 'raw': sqe_raw}],
+                  key=lambda p: (-p['raw'], p['key'] != 'sqe', p['name']))
+    out = [
+        '# Public Iceberg Matrix Comparison',
+        '',
+        'Side-by-side comparison of SQE with every engine on '
+        '[icebergmatrix.org](https://icebergmatrix.org). Upstream data: '
+        f'[Neuw84/iceberg-matrix@{sha[:10]}](https://github.com/{UPSTREAM_REPO}/tree/{sha}) '
+        f'(MIT), fetched {datetime.date.today().isoformat()}. SQE data: '
+        '[`docs/evidence/iceberg-matrix-state.json`](../../evidence/iceberg-matrix-state.json), '
+        'rendered per cell in [`iceberg-matrix.md`](./iceberg-matrix.md).',
+        '',
+        f'Every engine is scored on the same {len(cells)} cells: one per feature and '
+        'format version the rubric applies to. full=3, partial=2, unknown=1, none=0; '
+        f'max {max_score}. SQE rates itself; the other engines are rated by the '
+        'upstream maintainers and contributors.',
+        '',
+        'Cells read `V2/V3`: `F` full, `P` partial, `?` unknown, `.` none, `-` the '
+        'rubric does not score that version.',
+        '',
+        '## Scoreboard',
+        '',
+        '| Rank | Engine | Score | % |',
+        '|---:|---|---:|---:|',
+    ]
+    for i, r in enumerate(rows, 1):
+        name = '**SQE (self-rated)**' if r['key'] == 'sqe' else r['name']
+        out.append(f"| {i} | {name} | {r['raw']}/{max_score} | "
+                   f"{100.0 * r['raw'] / max_score:.1f} |")
     out.append('')
 
-    open(OUT, 'w').write('\n'.join(out))
-    print(f'wrote {OUT} ({sum(len(l) for l in out)} chars)')
+    by_cat = OrderedDict((c, []) for c in CATEGORY_NAMES)
+    for feat in features:
+        by_cat.setdefault(feat['category'], []).append(feat)
+    for title, cols in (('Open-source engines', COL_GROUP_OSS),
+                        ('Managed and commercial engines', COL_GROUP_CLOUD)):
+        out += ['---', '', f'## {title}', '']
+        for cat, feats in by_cat.items():
+            out.append(render_category(CATEGORY_NAMES.get(cat, cat), feats, engines, cols))
+            out.append('')
+
+    out += [
+        '---',
+        '',
+        'Per-cell notes and caveats live in the upstream platform files under '
+        f'[`src/data/platforms/`](https://github.com/{UPSTREAM_REPO}/tree/{sha}/src/data/platforms) '
+        'and, for SQE, in the state file.',
+        '',
+        'Regenerate: `python3 scripts/render-iceberg-matrix-compare.py`, then '
+        '`python3 scripts/render-iceberg-matrix.py`.',
+        '',
+    ]
+    with open(OUT, 'w') as f:
+        f.write('\n'.join(out))
+    print(f'wrote {RUBRIC_OUT} and {OUT} (upstream {sha[:10]}, {len(peers)} engines)')
+
 
 if __name__ == '__main__':
     main()
