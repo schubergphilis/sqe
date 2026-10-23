@@ -212,3 +212,58 @@ async fn catalog_placeholder_opens_only_the_members_own_workspace() {
         );
     }
 }
+
+/// `read_csv` and `read_json` take the same `[storage]` key and the same
+/// prefix gate as `read_parquet`: inside the workspace's staging prefix they
+/// return the rows, the same file outside it is an error, never 0 rows.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn file_tvf_csv_and_json_read_inside_the_prefix_and_refuse_outside() {
+    crate::common::init_tracing();
+    let store = AmazonS3Builder::new()
+        .with_bucket_name(BUCKET)
+        .with_endpoint("http://localhost:19000")
+        .with_region("us-east-1")
+        .with_access_key_id("s3admin")
+        .with_secret_access_key("s3admin")
+        .with_virtual_hosted_style_request(false)
+        .with_allow_http(true)
+        .build()
+        .expect("S3 client");
+    let files = [
+        ("x.csv", "id\n1\n2\n3\n"),
+        ("x.json", "{\"id\":1}\n{\"id\":2}\n{\"id\":3}\n"),
+    ];
+    for dir in [format!("ingest/ws/{WS1}"), "ingest/other".to_string()] {
+        for (name, body) in files {
+            store
+                .put(
+                    &ObjectPath::from(format!("{dir}/{name}")),
+                    PutPayload::from(body.as_bytes().to_vec()),
+                )
+                .await
+                .expect("upload fixture");
+        }
+    }
+    let root = polaris_token("root", "s3cr3t").await;
+    let handler = handler(config());
+    let member = session("root", root, WS1);
+
+    for (func, name) in [("read_csv", "x.csv"), ("read_json", "x.json")] {
+        let count = |path: String| {
+            let sql = format!("SELECT id FROM {func}('{path}')");
+            let (handler, member) = (&handler, &member);
+            async move {
+                handler
+                    .execute(member, &sql, None)
+                    .await
+                    .map(|b| b.iter().map(|b| b.num_rows()).sum::<usize>())
+                    .map_err(|e| e.to_string())
+            }
+        };
+        let inside = format!("s3://{BUCKET}/ingest/ws/{WS1}/{name}");
+        assert_eq!(count(inside).await, Ok(3), "{func} inside the prefix");
+        let outside = format!("s3://{BUCKET}/ingest/other/{name}");
+        assert_refused(count(outside).await, &format!("{func} outside the prefix"));
+    }
+}

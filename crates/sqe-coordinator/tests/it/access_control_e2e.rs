@@ -1948,6 +1948,113 @@ async fn file_table_function_is_not_denied_for_unknown_tag_state() {
     );
 }
 
+/// A Ranger row filter reaches a file table function only through the scan's
+/// name: DataFusion names every `read_csv(...)` scan `read_csv()`, whatever
+/// the path. A filter on table `read_csv()` therefore applies to every CSV
+/// file the user reads, and not at all to the same rows read with
+/// `read_json`. Ranger never sees the path; the `[storage.tvf]` prefixes
+/// decide which files are readable.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn file_tvf_row_filter_keys_on_the_function_name_not_the_path() {
+    use object_store::{ObjectStoreExt, PutPayload};
+
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    let config = sqe_core::SqeConfig::load(&crate::common::ranger_config_path())
+        .expect("load tests/sqe-ranger-test.toml");
+    let storage = &config.storage;
+    let store = object_store::aws::AmazonS3Builder::new()
+        .with_bucket_name("warehouse")
+        .with_endpoint(&storage.s3_endpoint)
+        .with_region(&storage.s3_region)
+        .with_access_key_id(&storage.s3_access_key)
+        .with_secret_access_key(storage.s3_secret_key.expose())
+        .with_virtual_hosted_style_request(false)
+        .with_allow_http(true)
+        .build()
+        .expect("S3 client");
+    for user in [&ctx.bob.user.username, &ctx.alice.user.username] {
+        for (name, body) in [
+            ("f.csv", "id,country\n1,NL\n2,DE\n3,BE\n"),
+            (
+                "f.json",
+                "{\"id\":1,\"country\":\"NL\"}\n{\"id\":2,\"country\":\"DE\"}\n\
+                 {\"id\":3,\"country\":\"BE\"}\n",
+            ),
+        ] {
+            store
+                .put(
+                    &object_store::path::Path::from(format!("ingest/user/{user}/{name}")),
+                    PutPayload::from(body.as_bytes().to_vec()),
+                )
+                .await
+                .expect("upload fixture");
+        }
+    }
+
+    let (handler, _cache) = crate::common::setup_ranger_handler_with(|c| {
+        c.storage.tvf.allowed_object_store_prefixes =
+            vec!["s3://warehouse/ingest/user/{user}/".to_string()];
+        c.storage.tvf.allow_inline_credentials = false;
+    })
+    .await;
+    for user in [&ctx.bob.user.username, &ctx.alice.user.username] {
+        sqe_coordinator::session_context::invalidate_session_cache(user).await;
+    }
+
+    ctx.ranger
+        .create_policy(serde_json::json!({
+            "service": HIVE_SERVICE,
+            "name": format!("{PREFIX}file-tvf-rowfilter"),
+            "policyType": 2,
+            "isEnabled": true,
+            "resources": {
+                "database": {"values": ["*"]},
+                "table": {"values": ["read_csv()"]}
+            },
+            "rowFilterPolicyItems": [{
+                "roles": ["engineer"],
+                "accesses": [{"type": "select", "isAllowed": true}],
+                "rowFilterInfo": {"filterExpr": "country = 'NL'"}
+            }]
+        }))
+        .await
+        .expect("create read_csv() row filter");
+
+    let count_sql = |func: &str, session: &Session, file: &str| {
+        let user = &session.user.username;
+        format!("SELECT count(*) AS n FROM {func}('s3://warehouse/ingest/user/{user}/{file}')")
+    };
+    let csv_bob = count_sql("read_csv", &ctx.bob, "f.csv");
+    crate::common::eventually("bob's read_csv() row filter to apply", || async {
+        match handler.execute(&ctx.bob, &csv_bob, None).await {
+            Ok(b) if col_strings(&b, "n") == vec!["1".to_string()] => Ok(()),
+            Ok(b) => Err(format!("expected 1 row, got {:?}", col_strings(&b, "n"))),
+            Err(e) => Err(format!("query failed: {e}")),
+        }
+    })
+    .await;
+
+    // Same rows through read_json: the filter names read_csv(), so none applies.
+    let json_bob = handler
+        .execute(&ctx.bob, &count_sql("read_json", &ctx.bob, "f.json"), None)
+        .await
+        .expect("bob read_json");
+    assert_eq!(col_strings(&json_bob, "n"), vec!["3".to_string()]);
+
+    // alice is analyst-only: the engineer filter does not apply to her.
+    let csv_alice_sql = count_sql("read_csv", &ctx.alice, "f.csv");
+    let csv_alice = handler
+        .execute(&ctx.alice, &csv_alice_sql, None)
+        .await
+        .expect("alice read_csv");
+    assert_eq!(col_strings(&csv_alice, "n"), vec!["3".to_string()]);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn ranger_outage_fails_closed() {
