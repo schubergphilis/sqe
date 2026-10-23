@@ -640,6 +640,8 @@ impl ExecutionPlan for DistributedScanExec {
         }
 
         let mut task = self.scan_tasks[partition].clone();
+        let planned_bytes = planned_scan_bytes(&task);
+        let bytes_scanned = MetricBuilder::new(&self.metrics).counter("bytes_scanned", partition);
         let pushed_down_filters = self.pushed_down_filters.clone();
         let dynamic_filters_pushed =
             MetricBuilder::new(&self.metrics).counter("dynamic_filters_pushed", partition);
@@ -922,6 +924,8 @@ impl ExecutionPlan for DistributedScanExec {
             schema: schema_for_stream,
             inner: Box::pin(stream),
             baseline: BaselineMetrics::new(&self.metrics, partition),
+            bytes_scanned,
+            planned_bytes: Some(planned_bytes),
         }))
     }
 }
@@ -1593,12 +1597,28 @@ async fn dispatch_to_worker(
     Ok(flight_stream)
 }
 
+/// The file bytes a ticket hands its worker: the morsel's byte range, or
+/// the sum of its whole files. The worker does not report what it fetched,
+/// so this stands in for the scan's `bytes_scanned`.
+fn planned_scan_bytes(task: &ScanTask) -> usize {
+    let bytes = match (task.start_byte, task.end_byte) {
+        (Some(start), Some(end)) => end.saturating_sub(start),
+        _ => task.file_sizes_bytes.iter().sum(),
+    };
+    usize::try_from(bytes).unwrap_or(usize::MAX)
+}
+
 struct DistributedRecordBatchStream {
     schema: SchemaRef,
     inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>,
     /// Records output rows and coordinator-side poll time so the exec's
     /// `metrics()` reflect what actually flowed through this partition.
     baseline: BaselineMetrics,
+    /// The fragment's [`planned_scan_bytes`], added once the worker has
+    /// served it: at the first batch (a LIMIT may stop polling before the
+    /// end) or at the end of an empty stream. A failed fragment adds none.
+    bytes_scanned: datafusion::physical_plan::metrics::Count,
+    planned_bytes: Option<usize>,
 }
 
 impl Stream for DistributedRecordBatchStream {
@@ -1613,6 +1633,15 @@ impl Stream for DistributedRecordBatchStream {
             let _timer = this.baseline.elapsed_compute().timer();
             this.inner.as_mut().poll_next(cx)
         };
+        match &poll {
+            Poll::Ready(Some(Ok(_)) | None) => {
+                if let Some(bytes) = this.planned_bytes.take() {
+                    this.bytes_scanned.add(bytes);
+                }
+            }
+            Poll::Ready(Some(Err(_))) => this.planned_bytes = None,
+            Poll::Pending => {}
+        }
         this.baseline.record_poll(poll)
     }
 }
@@ -3146,6 +3175,56 @@ mod tests {
             "elapsed_compute must be recorded"
         );
         assert_eq!(*outcomes.lock().unwrap(), vec![FragmentOutcome::Finished]);
+    }
+
+    /// A served fragment reports the file bytes its ticket covered as
+    /// `bytes_scanned`, the counter the query stats read as physical input.
+    #[tokio::test]
+    async fn bytes_scanned_counts_planned_file_bytes() {
+        let schema = id_schema();
+        let whole_files = ScanTask::builder(
+            "f1",
+            vec!["s3://b/a.parquet".into(), "s3://b/b.parquet".into()],
+            sqe_planner::ScanStorage::default(),
+        )
+        .with_file_sizes(vec![1000, 500])
+        .build();
+        assert_eq!(planned_scan_bytes(&whole_files), 1500);
+        let morsel = ScanTask::builder(
+            "f2",
+            vec!["s3://b/a.parquet".into()],
+            sqe_planner::ScanStorage::default(),
+        )
+        .with_file_sizes(vec![1000])
+        .with_byte_range(200, 700)
+        .build();
+        assert_eq!(planned_scan_bytes(&morsel), 500);
+
+        let registry = two_healthy_workers().await;
+        for (items, expected) in [
+            (vec![Ok(one_row(1)), Ok(one_row(2))], 1500),
+            (vec![], 1500),
+            (vec![tonic_err(tonic::Status::permission_denied("no"))], 0),
+        ] {
+            let dispatcher = Arc::new(
+                ScriptedDispatcher::default().script("http://w1:50052", Scripted::Stream(items)),
+            );
+            let exec = DistributedScanExec::new(
+                vec![whole_files.clone()],
+                vec!["http://w1:50052".to_string()],
+                Arc::clone(&schema),
+            )
+            .with_worker_registry(Arc::clone(&registry))
+            .with_max_retries(0)
+            .with_dispatcher(Arc::clone(&dispatcher) as Arc<dyn FragmentDispatcher>);
+            let _ = collect(&exec).await;
+            let metrics = exec.metrics().expect("metrics");
+            let read = metrics
+                .sum_by_name("bytes_scanned")
+                .map(|v| v.as_usize())
+                .unwrap_or(0);
+            assert_eq!(read, expected);
+        }
     }
 
     #[tokio::test]
