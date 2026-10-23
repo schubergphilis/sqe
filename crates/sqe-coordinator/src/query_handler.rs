@@ -48,6 +48,8 @@ pub(crate) use admission::Admission;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PlanMetrics {
     pub(crate) bytes_scanned: u64,
+    /// The scans' `bytes_scanned` counters: bytes fetched from storage.
+    pub(crate) physical_input_bytes: u64,
     pub(crate) rows_scanned: u64,
     pub(crate) spill_bytes: u64,
     pub(crate) peak_memory_bytes: u64,
@@ -768,6 +770,23 @@ impl QueryHandler {
     /// Returns a reference to the query tracker.
     pub fn query_tracker(&self) -> &Arc<QueryTracker> {
         &self.query_tracker
+    }
+
+    /// The bytes statement `query_id` read, for the Trino `stats` of its
+    /// last page. Scans that ran on workers are not counted.
+    pub fn statement_bytes_probe(
+        &self,
+        query_id: uuid::Uuid,
+    ) -> sqe_trino_compat::server::StatementBytesProbe {
+        let tracker = Arc::clone(&self.query_tracker);
+        Arc::new(move || {
+            tracker
+                .get(&query_id)
+                .map(|r| sqe_trino_compat::server::StatementBytes {
+                    physical_input_bytes: r.physical_input_bytes,
+                    processed_bytes: r.bytes_scanned,
+                })
+        })
     }
 
     /// Finding 601: the scan-ticket signer; its public key is handed to
@@ -3266,6 +3285,8 @@ impl QueryHandler {
                 pm.spill_bytes,
                 pm.peak_memory_bytes,
             );
+            self.query_tracker
+                .set_physical_input_bytes(&query_id, pm.physical_input_bytes);
             if let Some(n) = rows_written {
                 self.query_tracker.set_rows_written(&query_id, n);
             }
@@ -8888,6 +8909,7 @@ pub(crate) fn extract_plan_metrics(plan: &Arc<dyn ExecutionPlan>) -> PlanMetrics
     use datafusion::physical_plan::metrics::MetricValue;
 
     let mut bytes_scanned: u64 = 0;
+    let mut physical_input_bytes: u64 = 0;
     let mut rows_scanned: u64 = 0;
     let mut spill_bytes: u64 = 0;
 
@@ -8897,6 +8919,11 @@ pub(crate) fn extract_plan_metrics(plan: &Arc<dyn ExecutionPlan>) -> PlanMetrics
         let is_scan = name.contains("Scan") || name.contains("Parquet") || name.contains("Csv");
 
         if let Some(metrics) = node.metrics() {
+            // `IcebergScanExec` and DataFusion's file scans (`DataSourceExec`)
+            // both count the bytes they fetch as `bytes_scanned`.
+            if let Some(read) = metrics.sum_by_name("bytes_scanned") {
+                physical_input_bytes += read.as_usize() as u64;
+            }
             // Scan nodes: accumulate bytes/rows scanned
             if is_scan {
                 if let Some(ob) = metrics.sum(|m| matches!(m.value(), MetricValue::OutputBytes(_)))
@@ -8921,6 +8948,7 @@ pub(crate) fn extract_plan_metrics(plan: &Arc<dyn ExecutionPlan>) -> PlanMetrics
 
     PlanMetrics {
         bytes_scanned,
+        physical_input_bytes,
         rows_scanned,
         spill_bytes,
         peak_memory_bytes: 0,

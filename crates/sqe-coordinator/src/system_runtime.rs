@@ -464,6 +464,7 @@ mod tests {
             error_message: None,
             tables_touched: Vec::new(),
             bytes_scanned: 0,
+            physical_input_bytes: 0,
             rows_scanned: 0,
             spill_bytes: 0,
             peak_memory_bytes: 0,

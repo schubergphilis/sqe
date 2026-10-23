@@ -91,6 +91,7 @@ mod trino_cli_test;
 mod trino_describe_test;
 mod trino_metadata_test;
 mod trino_session_catalog_test;
+mod trino_stats_bytes_e2e;
 mod tvf_catalog_placeholder_e2e;
 mod unknown_type_spark_interop;
 mod v3_e2e;

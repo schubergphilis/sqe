@@ -1219,18 +1219,25 @@ impl QueryHandlerAdapter {
             .and_then(classify_normalized)
             .map(|kind| matches!(kind, StatementKind::Query(_)))
             .unwrap_or(false);
-        if is_query {
+        let result = if is_query {
             let (schema, stream) = self
                 .handler
                 .execute_stream_with_id(session, sql, None, query_id)
                 .await?;
             let stream = stream.map(|res| res.map_err(sqe_core::SqeError::from));
-            return Ok(TrinoResultStream::new(schema, Box::pin(stream)));
-        }
-        self.handler
-            .execute_with_id(session, sql, None, query_id)
-            .await
-            .map(TrinoResultStream::from_batches)
+            TrinoResultStream::new(schema, Box::pin(stream))
+        } else {
+            self.handler
+                .execute_with_id(session, sql, None, query_id)
+                .await
+                .map(TrinoResultStream::from_batches)?
+        };
+        // The engine records the statement under `query_id`, so its bytes
+        // can be looked up there once the stream ends.
+        Ok(match query_id {
+            Some(id) => result.with_bytes(self.handler.statement_bytes_probe(id)),
+            None => result,
+        })
     }
 }
 

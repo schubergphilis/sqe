@@ -369,6 +369,8 @@ impl StreamFinalizer {
             pm.spill_bytes,
             pm.peak_memory_bytes,
         );
+        self.tracker
+            .set_physical_input_bytes(&self.query_id, pm.physical_input_bytes);
         if let Some(ref metrics) = self.metrics {
             metrics
                 .active_queries
