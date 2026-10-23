@@ -75,6 +75,7 @@ pub(crate) fn query_info(sql: &str, statement_type: String) -> QueryInfo {
         text: Some(sql.to_string()),
         query_hash: sqe_metrics::audit::query_hash(sql),
         statement_type,
+        text_len: None,
     }
 }
 
@@ -219,6 +220,7 @@ pub(crate) fn emit_statement_audit(audit: &AuditLogger, a: StatementAudit<'_>) {
             session_id: Some(session_log_id(&a.session.id)),
             query_hash: sqe_metrics::audit::query_hash(a.sql),
             query_text: Some(a.sql.to_string()),
+            query_text_len: None,
             statement_type: a.kind_name,
             duration_ms: a.duration.as_millis() as u64,
             rows_returned: a.rows,

@@ -30,9 +30,30 @@ superdebug_log_results = false      # NEVER true in production
 max_file_bytes        = 268435456  # rotate at 256 MiB; 0 = never
 max_files             = 0          # rotated files to keep; 0 = keep all
 min_free_bytes        = 1073741824 # below 1 GiB free, delete oldest rotated files; 0 = never
+omit_query_text       = false      # write no SQL text, only its hash and length
+omit_actor_identity   = false      # write no actor email or roles
 ```
 
 All keys are optional. The defaults above are the production-safe values.
+
+### `omit_query_text` and `omit_actor_identity`
+
+Redaction and GDPR masking lower the risk of SQL text in the log, but they still write
+whatever their patterns and tags miss. A deployment that ships the chain to a SIEM can
+keep the text out of the log altogether.
+
+With `omit_query_text = true`, no record holds statement text. The native `query.text` and
+the OCSF `unmapped.query_text` are absent. `query_hash` and `statement_type` stay, so
+repeated statements still correlate, and the text's byte length is written as
+`query.text_len` (OCSF `unmapped.query_text_len`). The legacy path for secret-bearing
+statements honours the setting too, with `query_text_len` in its flat record.
+
+With `omit_actor_identity = true`, the actor's `email` and `roles` are absent. The
+username and the OIDC subject (`actor.subject`, OCSF `actor.user.uid`) stay.
+
+Both settings apply before a record is chained. The chain verifies as usual, and the
+OCSF `metadata.uid` still equals the native `integrity.hash`. Neither setting touches
+`superdebug_log_results`, which writes result rows and must stay off.
 
 ### `format`
 

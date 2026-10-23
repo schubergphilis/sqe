@@ -202,6 +202,7 @@ pub fn dashboard_audit_event(
             text: Some("dashboard_access".into()),
             query_hash: sqe_metrics::audit::query_hash("dashboard_access"),
             statement_type: "dashboard_access".into(),
+            text_len: None,
         }),
         session_id: None,
         client_ip,

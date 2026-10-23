@@ -42,6 +42,9 @@ pub fn to_ocsf(event: &AuditEvent) -> Value {
         if let Some(t) = &q.text {
             unmapped.insert("query_text".into(), json!(t));
         }
+        if let Some(len) = q.text_len {
+            unmapped.insert("query_text_len".into(), json!(len));
+        }
     }
     if let Some(s) = &event.stats {
         unmapped.insert("bytes_scanned".into(), json!(s.bytes_scanned));
@@ -161,6 +164,7 @@ mod tests {
                 text: Some("SELECT 1".into()),
                 query_hash: "abc".into(),
                 statement_type: "query".into(),
+                text_len: None,
             }),
             session_id: Some("sess-1".into()),
             client_ip: Some("10.0.0.1".into()),

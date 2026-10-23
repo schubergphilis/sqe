@@ -1552,6 +1552,7 @@ impl HiveDdlHandler {
                 text: None,
                 query_hash: sqe_metrics::audit::query_hash(statement_type),
                 statement_type: statement_type.to_string(),
+                text_len: None,
             }),
             session_id: Some(session.id.clone()),
             client_ip: None,
