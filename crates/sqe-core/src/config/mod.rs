@@ -5163,10 +5163,17 @@ impl Default for SessionConfig {
 /// the maintenance principal is structurally never added to the
 /// interactive auth chain (`AuthConfig::providers`), only ever constructed
 /// from this dedicated block.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct MaintenanceConfig {
     #[serde(default)]
     pub mode: MaintenanceMode,
+    /// Floor for `CALL system.remove_orphan_files(older_than => ...)`, in
+    /// seconds: a cutoff newer than `now - orphan_min_age_secs` is refused,
+    /// so a wrong timestamp from a client cannot delete the files of a
+    /// commit still in flight. Default: one day. Applies to every caller,
+    /// admins included; a dry run is not subject to it.
+    #[serde(default = "default_orphan_min_age_secs")]
+    pub orphan_min_age_secs: u64,
     /// Dedicated service-principal credentials for the maintenance
     /// scheduler. `None` (the default) means advisory/active mode cannot
     /// run; see `validate()`. Never read by the interactive auth chain.
@@ -5178,6 +5185,23 @@ pub struct MaintenanceConfig {
     pub compaction: MaintenanceCompactionConfig,
     #[serde(default)]
     pub distribution: MaintenanceDistributionConfig,
+}
+
+fn default_orphan_min_age_secs() -> u64 {
+    24 * 60 * 60
+}
+
+impl Default for MaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            mode: MaintenanceMode::default(),
+            orphan_min_age_secs: default_orphan_min_age_secs(),
+            principal: None,
+            scheduler: MaintenanceSchedulerConfig::default(),
+            compaction: MaintenanceCompactionConfig::default(),
+            distribution: MaintenanceDistributionConfig::default(),
+        }
+    }
 }
 
 /// Gate for the maintenance subsystem. `Off` (default) constructs no

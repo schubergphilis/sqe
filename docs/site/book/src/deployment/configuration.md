@@ -358,6 +358,8 @@ omit_actor_identity = false     # true: no actor email or roles
 # unless mode is set. See "Maintenance (auto-compaction)" below.
 [maintenance]
 mode = "off"                    # "off" (default) | "advisory" | "active"
+orphan_min_age_secs = 86400     # a deleting remove_orphan_files refuses an
+                                # older_than newer than now minus this (one day)
 
 # Required only when mode != "off" (validation rejects mode without this block).
 # [maintenance.principal]

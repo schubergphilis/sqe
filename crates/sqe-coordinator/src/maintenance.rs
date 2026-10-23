@@ -427,9 +427,13 @@ impl MaintenanceHandler {
                 self.expire_snapshots(session, table, older_than_ms, *retain_last)
                     .await
             }
-            ProcedureCall::RemoveOrphanFiles { table, older_than } => {
+            ProcedureCall::RemoveOrphanFiles {
+                table,
+                older_than,
+                dry_run,
+            } => {
                 let older_than_ms = older_than.map(|t| t.timestamp_millis());
-                self.remove_orphan_files(session, table, older_than_ms)
+                self.remove_orphan_files(session, table, older_than_ms, *dry_run)
                     .await
             }
             ProcedureCall::RewriteManifests { table } => {
@@ -756,7 +760,7 @@ impl MaintenanceHandler {
         );
         let resource = sqe_metrics::audit::Resource {
             catalog: table_ref.catalog.clone(),
-            namespace: vec![table_ref.namespace.clone()],
+            namespace: table_ref.namespace_parts(),
             name: table_ref.name.clone(),
             object_type: sqe_metrics::audit::ObjectType::Table,
         };
@@ -2625,8 +2629,15 @@ impl MaintenanceHandler {
         session: &Session,
         table_ref: &TableRef,
         older_than_ms: Option<i64>,
+        dry_run: bool,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        const DEFAULT_OLDER_THAN_DAYS: i64 = 3;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let threshold_ms = orphan_cutoff_ms(
+            now_ms,
+            older_than_ms,
+            self.config.maintenance.orphan_min_age_secs,
+            dry_run,
+        )?;
 
         let catalog = self
             .create_catalog_bridge(session, table_ref.catalog.as_deref())
@@ -2634,23 +2645,45 @@ impl MaintenanceHandler {
         let ident = to_table_ident(table_ref);
         let table = load_table(&catalog, &ident).await?;
 
-        let threshold_ms = older_than_ms.unwrap_or_else(|| {
-            chrono::Utc::now().timestamp_millis() - DEFAULT_OLDER_THAN_DAYS * 24 * 60 * 60 * 1000
-        });
+        let action = iceberg::actions::RemoveOrphanFilesAction::new(table)
+            .older_than_ms(threshold_ms)
+            .dry_run(dry_run);
 
-        let action =
-            iceberg::actions::RemoveOrphanFilesAction::new(table).older_than_ms(threshold_ms);
-
-        let orphans = action
-            .execute()
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("remove_orphan_files execute failed: {e}")))?;
+        let orphans = action.execute().await.map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("remove_orphan_files execute failed: {e}"),
+            )
+        })?;
 
         info!(
             table = %ident,
             orphan_count = orphans.len(),
+            dry_run,
             "remove_orphan_files: completed"
         );
+
+        if dry_run {
+            let actions = vec!["would_delete"; orphans.len()];
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("path", DataType::Utf8, false),
+                Field::new("action", DataType::Utf8, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from(orphans)),
+                    Arc::new(StringArray::from(actions)),
+                ],
+            )
+            .map_err(|e| {
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Failed to build result batch: {e}"),
+                )
+            })?;
+            return Ok(vec![batch]);
+        }
 
         Ok(vec![summary_batch(
             "remove_orphan_files",
@@ -2746,7 +2779,7 @@ impl MaintenanceHandler {
         let catalog = self
             .create_catalog_bridge(session, namespace.catalog.as_deref())
             .await?;
-        let ns_ident = NamespaceIdent::new(namespace.namespace.clone());
+        let ns_ident = nested_namespace(namespace.namespace_parts());
 
         let table_idents = catalog.list_tables(&ns_ident).await.map_err(|e| {
             SqeError::Catalog(format!(
@@ -2915,8 +2948,30 @@ impl MaintenanceHandler {
         session: &Session,
         target_warehouse: Option<&str>,
     ) -> sqe_core::Result<Arc<dyn Catalog>> {
-        let session_catalog = match target_warehouse {
-            Some(warehouse)
+        let target =
+            maintenance_target_catalog(target_warehouse, session.default_catalog.as_deref());
+        let configured = target.and_then(|name| {
+            self.config
+                .flattened_catalogs()
+                .into_iter()
+                .find(|(n, c)| n == name && c.warehouse != self.config.catalog.warehouse)
+                .map(|(_, c)| c.clone())
+        });
+        let session_catalog = match (target, configured.as_ref()) {
+            // A `[catalogs.<name>]` entry other than the default: its own
+            // endpoint, warehouse and per-catalog auth, as SELECT uses.
+            (_, Some(cfg)) => {
+                crate::session_context::build_session_catalog(
+                    cfg,
+                    session,
+                    &self.config.storage,
+                    self.table_cache.as_ref(),
+                )
+                .await
+                .map_err(|e| SqeError::Catalog(e.to_string()))?
+                .0
+            }
+            (Some(warehouse), None)
                 if warehouse != self.config.catalog.warehouse
                     && self.config.query.catalog_discovery
                         == sqe_core::config::CatalogDiscovery::PolarisAuto =>
@@ -3403,8 +3458,13 @@ fn classify_commit_error(err: iceberg::Error, proc: &str) -> SqeError {
 }
 
 fn to_table_ident(table_ref: &TableRef) -> TableIdent {
-    let ns = NamespaceIdent::new(table_ref.namespace.clone());
+    let ns = nested_namespace(table_ref.namespace_parts());
     TableIdent::new(ns, table_ref.name.clone())
+}
+
+/// `NamespaceIdent` from a CALL reference's levels (`a.b` -> `["a", "b"]`).
+pub(crate) fn nested_namespace(parts: Vec<String>) -> NamespaceIdent {
+    NamespaceIdent::from_vec(parts).expect("a dotted name splits into at least one part")
 }
 
 pub(crate) async fn load_table(
@@ -3616,12 +3676,17 @@ pub(crate) fn procedure_tier(call: &ProcedureCall) -> ProcedureTier {
         ProcedureCall::SuggestBloomFilterColumns { .. }
         | ProcedureCall::TableHealth { .. }
         | ProcedureCall::RefreshCatalogCache { .. } => ProcedureTier::ReadOnly,
-        ProcedureCall::PurgeOrphanLocations { dry_run: true, .. } => ProcedureTier::ReadOnly,
-        ProcedureCall::RewriteDataFiles { .. } | ProcedureCall::RewriteManifests { .. } => {
-            ProcedureTier::TableWrite
-        }
-        ProcedureCall::ExpireSnapshots { .. }
-        | ProcedureCall::RemoveOrphanFiles { .. }
+        ProcedureCall::PurgeOrphanLocations { dry_run: true, .. }
+        | ProcedureCall::RemoveOrphanFiles { dry_run: true, .. } => ProcedureTier::ReadOnly,
+        // Each of these changes the table only through catalog commits made
+        // as the caller, and `expire_snapshots` deletes files only after its
+        // commit succeeded: the catalog's write check is the gate.
+        ProcedureCall::RewriteDataFiles { .. }
+        | ProcedureCall::RewriteManifests { .. }
+        | ProcedureCall::ExpireSnapshots { .. } => ProcedureTier::TableWrite,
+        // `remove_orphan_files` deletes from storage with no commit for the
+        // catalog to refuse, so its deleting form stays admin.
+        ProcedureCall::RemoveOrphanFiles { .. }
         | ProcedureCall::PurgeOrphanLocations { .. }
         | ProcedureCall::DropTable { .. }
         | ProcedureCall::RegisterTable { .. }
@@ -3629,6 +3694,47 @@ pub(crate) fn procedure_tier(call: &ProcedureCall) -> ProcedureTier {
         | ProcedureCall::RollbackToSnapshot { .. }
         | ProcedureCall::ReprojectColumnTags { .. } => ProcedureTier::Admin,
     }
+}
+
+/// The `remove_orphan_files` cutoff: only files older than it are orphans.
+/// Without `older_than` it is three days back, or the floor if that is older.
+/// A deleting call whose `older_than` is newer than `now - floor` is refused,
+/// so a wrong timestamp cannot delete the files of a commit in flight. A dry
+/// run deletes nothing and takes any cutoff.
+pub(crate) fn orphan_cutoff_ms(
+    now_ms: i64,
+    older_than_ms: Option<i64>,
+    floor_secs: u64,
+    dry_run: bool,
+) -> sqe_core::Result<i64> {
+    const DEFAULT_OLDER_THAN_MS: i64 = 3 * 24 * 60 * 60 * 1000;
+    let floor_ms = i64::try_from(floor_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+    let latest_allowed = now_ms.saturating_sub(floor_ms);
+    match older_than_ms {
+        None => Ok(now_ms
+            .saturating_sub(DEFAULT_OLDER_THAN_MS)
+            .min(latest_allowed)),
+        Some(cutoff) if dry_run || cutoff <= latest_allowed => Ok(cutoff),
+        Some(_) => Err(SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!(
+                "remove_orphan_files: older_than must be at least {floor_secs} seconds in the past \
+                 ([maintenance] orphan_min_age_secs), so files of a commit in flight are never \
+                 deleted; use dry_run => true to list newer files"
+            ),
+        )),
+    }
+}
+
+/// The catalog a procedure's table lives in. An explicit `catalog.ns.t` wins;
+/// an unqualified `ns.t` falls back to the session catalog (Trino
+/// `X-Trino-Catalog`, Flight default), the same scope a SELECT of that name
+/// reads.
+fn maintenance_target_catalog<'a>(
+    explicit: Option<&'a str>,
+    session_catalog: Option<&'a str>,
+) -> Option<&'a str> {
+    explicit.or_else(|| session_catalog.filter(|c| !c.is_empty()))
 }
 
 /// A session whose roles say "read-only" and nothing says otherwise. This is
@@ -3848,6 +3954,53 @@ mod purge_prefix_tests {
         assert!(err.to_string().contains("uses the same location"), "{err}");
     }
 
+    /// `CALL ...(table => 'cat.a.b.t')` loads `t` from the nested namespace
+    /// `a.b`. Before, a 4-part name was refused and the namespace was always
+    /// built as one level.
+    #[tokio::test]
+    async fn a_four_part_name_loads_from_a_nested_namespace() {
+        use super::{load_table, to_table_ident, TableRef};
+        use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+        use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
+
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            iceberg::memory::MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    [("warehouse".to_string(), "memory:///wh".to_string())].into(),
+                )
+                .await
+                .unwrap(),
+        );
+        let parent = NamespaceIdent::new("a".into());
+        let nested = NamespaceIdent::from_strs(["a", "b"]).unwrap();
+        for ns in [&parent, &nested] {
+            let props = Default::default();
+            catalog.create_namespace(ns, props).await.unwrap();
+        }
+        let schema = Schema::builder()
+            .with_fields(vec![NestedField::required(
+                1,
+                "x",
+                Type::Primitive(PrimitiveType::Long),
+            )
+            .into()])
+            .build()
+            .unwrap();
+        let creation = TableCreation::builder()
+            .name("t".to_string())
+            .location("memory:///wh/a/b/t".to_string())
+            .schema(schema)
+            .build();
+        catalog.create_table(&nested, creation).await.unwrap();
+
+        let table_ref = TableRef::parse("cat.a.b.t").unwrap();
+        let table = load_table(&catalog, &to_table_ident(&table_ref))
+            .await
+            .expect("the nested table loads");
+        assert_eq!(table.identifier().namespace(), &nested);
+    }
+
     #[tokio::test]
     async fn the_prefix_is_the_location_as_a_directory() {
         assert_eq!(
@@ -3980,8 +4133,11 @@ mod tests {
             procedure_tier(&table_call("rewrite_manifests")),
             ProcedureTier::TableWrite
         );
+        assert_eq!(
+            procedure_tier(&table_call("expire_snapshots")),
+            ProcedureTier::TableWrite
+        );
         for admin in [
-            "expire_snapshots",
             "remove_orphan_files",
             "drop_table",
             "set_current_snapshot(table => 'ns.t', snapshot_id => 1)",
@@ -3993,14 +4149,62 @@ mod tests {
             };
             assert_eq!(procedure_tier(&call), ProcedureTier::Admin, "{admin}");
         }
+        // Listing orphans deletes nothing; deleting them stays admin.
+        assert_eq!(
+            procedure_tier(&parse_call(
+                "CALL system.remove_orphan_files(table => 'ns.t', dry_run => true)"
+            )),
+            ProcedureTier::ReadOnly
+        );
+    }
+
+    #[test]
+    fn unqualified_procedure_tables_use_the_session_catalog() {
+        assert_eq!(
+            maintenance_target_catalog(Some("explicit"), Some("sales_wh")),
+            Some("explicit")
+        );
+        assert_eq!(
+            maintenance_target_catalog(None, Some("sales_wh")),
+            Some("sales_wh")
+        );
+        assert_eq!(maintenance_target_catalog(None, Some("")), None);
+        assert_eq!(maintenance_target_catalog(None, None), None);
+    }
+
+    #[test]
+    fn orphan_cutoff_enforces_the_floor_on_deleting_calls() {
+        const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+        let now = 100 * DAY_MS;
+        let floor = 24 * 60 * 60;
+        // Default: three days back, or the floor when that is older.
+        assert_eq!(
+            orphan_cutoff_ms(now, None, floor, false).unwrap(),
+            now - 3 * DAY_MS
+        );
+        assert_eq!(
+            orphan_cutoff_ms(now, None, 7 * 24 * 60 * 60, false).unwrap(),
+            now - 7 * DAY_MS
+        );
+        // At or beyond the floor: taken as given.
+        assert_eq!(
+            orphan_cutoff_ms(now, Some(now - DAY_MS), floor, false).unwrap(),
+            now - DAY_MS
+        );
+        // Inside the floor: refused, naming the setting.
+        let err = orphan_cutoff_ms(now, Some(now - DAY_MS + 1), floor, false).unwrap_err();
+        assert!(err.to_string().contains("orphan_min_age_secs"), "{err}");
+        assert!(orphan_cutoff_ms(now, Some(now), floor, false).is_err());
+        // A dry run deletes nothing, so any cutoff is fine.
+        assert_eq!(orphan_cutoff_ms(now, Some(now), floor, true).unwrap(), now);
     }
 
     #[tokio::test]
     async fn admin_tier_denies_empty_roles_and_non_admins() {
         let config = config_with_admins(&["sqe_admin"]);
-        let expire = table_call("expire_snapshots");
+        let drop = table_call("drop_table");
         let orphans = table_call("remove_orphan_files");
-        assert!(!gate(config.clone(), &session_with_roles(vec![]), &expire).await);
+        assert!(!gate(config.clone(), &session_with_roles(vec![]), &drop).await);
         assert!(
             !gate(
                 config.clone(),
@@ -4021,15 +4225,15 @@ mod tests {
             gate(
                 config.clone(),
                 &session_with_roles(vec!["sqe_admin"]),
-                &expire
+                &drop
             )
             .await
         );
         // The scheduler's minted session is a table writer, not an admin.
         let minted = session_with_roles(vec![]).with_maintenance_authority(true);
-        assert!(!gate(config.clone(), &minted, &expire).await);
+        assert!(!gate(config.clone(), &minted, &drop).await);
         // No admin roles configured at all: the admin tier is closed.
-        assert!(!gate(base_config(), &session_with_roles(vec!["admin"]), &expire).await);
+        assert!(!gate(base_config(), &session_with_roles(vec!["admin"]), &drop).await);
     }
 
     #[tokio::test]
