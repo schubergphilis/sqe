@@ -50,6 +50,7 @@ Upstream `testdata/` is vendored in full, so `cargo test -p iceberg --lib` runs 
 | — | Refresh-after-401 on `AuthSession::on_unauthorized` (replaces RW #157; apache has no refresh) | `catalog/rest/src/auth/` |
 | 5 | Loader feature gates + `Send + Sync` | `catalog/loader` |
 | — | sqlx 0.9 (`AssertSqlSafe`, `LIMIT 0` schema probe) | `catalog/sql` |
+| — | Concurrent catalog bootstrap: a failed `CREATE TABLE IF NOT EXISTS` is ignored when the table exists afterwards (`SQE PATCH (sqe#872)`) | `catalog/sql/src/catalog.rs` (`create_table_if_missing`) |
 | — | Ring-only TLS: no `default-https-client`, opendal no-provider transport installed on first use | root `Cargo.toml`, `storage/opendal` |
 | — | New-delete conflict guard on `ReplaceFilesAction` (`set_validate_from_snapshot_id`) | `transaction/replace_files.rs` |
 | — | `RowDeltaAction` (apache PR #2203; no upstream equivalent) | `transaction/row_delta.rs` |
