@@ -84,9 +84,10 @@ impl HeadroomBudget {
         }
     }
 
-    /// Refuse a sort's consumer ([`is_sorter`]) growth past an equal share
-    /// of the spillable bytes per registered sort consumer. Its first
-    /// reservation is exempt, as under [`Self::with_fair_share`].
+    /// Refuse a sort buffer's ([`is_sort_buffer`]) growth past an equal
+    /// share of the spillable bytes per registered sort consumer
+    /// ([`is_sorter`], merges included). Its first reservation is exempt, as
+    /// under [`Self::with_fair_share`].
     ///
     /// A partitioned sort runs one sorter per partition. Under a greedy
     /// budget the first sorters to fill take every spillable byte, and a
@@ -180,7 +181,7 @@ impl HeadroomBudget {
                 )));
             }
         }
-        if self.sort_share && held > 0 && is_sorter(consumer) {
+        if self.sort_share && held > 0 && is_sort_buffer(consumer) {
             let share = self.spillable_limit / charged.sorters.max(1);
             if held.saturating_add(additional) > share {
                 return Err(DataFusionError::ResourcesExhausted(format!(
@@ -235,16 +236,32 @@ impl HeadroomBudget {
 /// Whether `consumer` continues when its growth is refused: it spills, or
 /// it is a sort's merge reservation (DataFusion's `ExternalSorterMerge[n]`),
 /// whose spill-file merge then merges fewer files per pass.
+///
+/// Only the spill-file merge adapts; a merge refused while building output
+/// batches fails the query. The fair share (the sort-merge retry) still
+/// caps merges, because an uncapped spill merge starved the sorters that
+/// had not started yet (#784); the sort share does not (#874).
 fn adapts_when_refused(consumer: &MemoryConsumer) -> bool {
     consumer.can_spill() || consumer.name().starts_with("ExternalSorterMerge[")
 }
 
 /// Whether `consumer` belongs to a sort: DataFusion's `ExternalSorter[n]`
 /// (buffers, spills when refused) or `ExternalSorterMerge[n]` (merge
-/// reservation, merges fewer spill files per pass when refused).
+/// reservation). Both count towards the sort share, so the buffers' share
+/// leaves room for the merges; only a buffer is refused by it
+/// ([`is_sort_buffer`]).
 fn is_sorter(consumer: &MemoryConsumer) -> bool {
     let name = consumer.name();
     name.starts_with("ExternalSorter[") || name.starts_with("ExternalSorterMerge[")
+}
+
+/// Whether `consumer` is a sort's buffer, `ExternalSorter[n]`, the sort
+/// consumer that spills when refused. A merge reservation is never refused
+/// by a share (#874): its later growth while building output batches cannot
+/// adapt, so a refusal fails the query, and the share shrinks while sibling
+/// partitions are still registered.
+fn is_sort_buffer(consumer: &MemoryConsumer) -> bool {
+    consumer.name().starts_with("ExternalSorter[")
 }
 
 /// The node pool with a headroom: the wrapped pool still enforces the total
@@ -572,10 +589,11 @@ mod tests {
             "the refusal must be the error a sorter spills on: {err}"
         );
         assert!(err.to_string().contains("sort share"), "{err}");
-        // The merge reservation arrives in one piece, past the share.
+        // The merge reservation arrives in one piece, and may grow past the
+        // share (#874): only the total bounds it.
         budget.try_charge(&merge, 0, 300, "q").unwrap();
-        assert!(budget.try_charge(&merge, 300, 1, "q").is_err());
-        budget.release(&merge, 300);
+        budget.try_charge(&merge, 300, 1, "q").unwrap();
+        budget.release(&merge, 301);
         // An aggregate is not a sort: it grows to the spillable line.
         budget.try_charge(&agg, 0, 100, "q").unwrap();
         budget.try_charge(&agg, 100, 434, "q").unwrap();
@@ -588,5 +606,37 @@ mod tests {
         budget.unregister(&idle);
         budget.release(&idle, 266);
         budget.try_charge(&sorter, 266, 134, "q").unwrap();
+    }
+
+    /// #874, with CI's numbers: eight partitions, every buffer and merge
+    /// still registered, so the share is a sixteenth of the spillable bytes.
+    /// The merges count towards it (the buffers leave them room) but an
+    /// output merge growing past it is not refused: that growth cannot
+    /// adapt and failed the query.
+    #[test]
+    fn merges_count_towards_the_sort_share_but_are_not_refused_by_it() {
+        const MB: usize = 1024 * 1024;
+        let budget = HeadroomBudget::new(64 * MB, 20, true).with_sort_share();
+        let consumers: Vec<_> = (0..8)
+            .flat_map(|i| {
+                [
+                    MemoryConsumer::new(format!("ExternalSorter[{i}]")).with_can_spill(true),
+                    MemoryConsumer::new(format!("ExternalSorterMerge[{i}]")),
+                ]
+            })
+            .collect();
+        for consumer in &consumers {
+            budget.register(consumer);
+        }
+        let share = budget.spillable_limit / 16;
+        assert_eq!(share, 3_355_443);
+        let merge = &consumers[3];
+        budget.try_charge(merge, 0, 3_340_287, "q").unwrap();
+        budget
+            .try_charge(merge, 3_340_287, 49_120, "q")
+            .expect("an output merge grows past the share");
+        // The buffers' share is unchanged.
+        let sorter = &consumers[2];
+        assert_eq!(grow_until_refused(&budget, sorter, MB, 1), share);
     }
 }
