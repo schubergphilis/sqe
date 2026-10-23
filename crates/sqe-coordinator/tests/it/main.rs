@@ -67,6 +67,7 @@ mod maintenance_scheduler_test;
 mod mcp_access_control_e2e;
 mod mcp_describe_schema_e2e;
 mod mcp_listener_supervision_e2e;
+mod merge_rows_affected_e2e;
 mod mor_spark_interop;
 mod mor_update_merge_integration;
 mod multi_catalog_routing_test;
