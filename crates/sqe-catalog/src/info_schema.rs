@@ -602,6 +602,21 @@ fn iceberg_to_sql_type_info(t: &iceberg::spec::Type) -> SqlTypeInfo {
                 numeric_scale: None,
                 datetime_precision: None,
             },
+            // V3 geospatial (sqe#863): the scan returns WKB bytes, so
+            // clients see varbinary; udt_name keeps the logical type.
+            PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => SqlTypeInfo {
+                data_type: "varbinary".to_string(),
+                udt_name: if matches!(p, PrimitiveType::Geometry(_)) {
+                    "geometry"
+                } else {
+                    "geography"
+                }
+                .to_string(),
+                character_maximum_length: None,
+                numeric_precision: None,
+                numeric_scale: None,
+                datetime_precision: None,
+            },
             // V3 `unknown`: a column whose values are always null.
             PrimitiveType::Unknown => SqlTypeInfo {
                 data_type: "unknown".to_string(),
@@ -1164,6 +1179,14 @@ mod tests {
             ),
             (Type::Primitive(PrimitiveType::Binary), "varbinary"),
             (Type::Primitive(PrimitiveType::Uuid), "uuid"),
+            (
+                Type::Primitive(PrimitiveType::Geometry(Default::default())),
+                "varbinary",
+            ),
+            (
+                Type::Primitive(PrimitiveType::Geography(Default::default())),
+                "varbinary",
+            ),
         ];
         for (ty, expected) in cases {
             let info = super::iceberg_to_sql_type_info(ty);
