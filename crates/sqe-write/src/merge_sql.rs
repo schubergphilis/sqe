@@ -476,19 +476,30 @@ pub(crate) fn build_merge_select(
         qualified_target_ref,
         qualified_source_ref,
         on_rewritten,
-        None,
+        SelectMode::Rewrite,
     )
 }
 
-/// [`build_merge_select`], or with `with_check_row_filter` the
-/// [`build_merge_with_check_sql`] count over the same row classes.
+/// What [`merge_select`] projects over the classified FULL OUTER JOIN.
+enum SelectMode<'a> {
+    /// The surviving target rows ([`build_merge_select`]).
+    Rewrite,
+    /// COUNT of the claimed, kept rows outside this row filter
+    /// ([`build_merge_with_check_sql`]).
+    WithCheck(&'a str),
+    /// COUNT of the rows some clause claims ([`build_merge_claimed_count_sql`]).
+    ClaimedCount,
+}
+
+/// [`build_merge_select`], or one of the COUNT queries over the same row
+/// classes (see [`SelectMode`]).
 fn merge_select(
     classified: &ClassifiedMerge<'_>,
     names: &MergeNames<'_>,
     qualified_target_ref: &str,
     qualified_source_ref: &str,
     on_rewritten: &str,
-    with_check_row_filter: Option<&str>,
+    mode: SelectMode<'_>,
 ) -> String {
     let t_flag = present_flag(names.target_ref);
     let s_flag = present_flag(names.source_ref);
@@ -626,33 +637,34 @@ fn merge_select(
         keep_arms.join(" ")
     ));
 
-    // WITH CHECK variant: flag the rows some clause claimed (same first-match
-    // arms) and count the kept ones whose new values the caller's row filter
-    // rejects. Unclaimed rows pass through unchanged and are not checked.
-    let outer_projection = match with_check_row_filter {
-        Some(rf) => {
-            let claimed_arms: Vec<String> = classified
-                .matched
+    // The COUNT variants flag the rows some clause claimed (same first-match
+    // arms). WITH CHECK counts the kept ones whose new values the caller's
+    // row filter rejects; unclaimed rows pass through unchanged and are not
+    // checked. The claimed count includes DELETE rows (keep is FALSE).
+    let claimed_arms: Vec<String> = classified
+        .matched
+        .iter()
+        .map(|c| case_arm(&matched_cond, c.predicate.as_deref(), "TRUE"))
+        .chain(
+            classified
+                .not_matched
                 .iter()
-                .map(|c| case_arm(&matched_cond, c.predicate.as_deref(), "TRUE"))
-                .chain(
-                    classified
-                        .not_matched
-                        .iter()
-                        .map(|c| case_arm(&source_only_cond, c.predicate.as_deref(), "TRUE")),
-                )
-                .chain(
-                    classified
-                        .by_source
-                        .iter()
-                        .map(|c| case_arm(&target_only_cond, c.predicate.as_deref(), "TRUE")),
-                )
-                .collect();
-            let claimed = if claimed_arms.is_empty() {
-                "FALSE".to_string()
-            } else {
-                format!("CASE {} ELSE FALSE END", claimed_arms.join(" "))
-            };
+                .map(|c| case_arm(&source_only_cond, c.predicate.as_deref(), "TRUE")),
+        )
+        .chain(
+            classified
+                .by_source
+                .iter()
+                .map(|c| case_arm(&target_only_cond, c.predicate.as_deref(), "TRUE")),
+        )
+        .collect();
+    let claimed = if claimed_arms.is_empty() {
+        "FALSE".to_string()
+    } else {
+        format!("CASE {} ELSE FALSE END", claimed_arms.join(" "))
+    };
+    let outer_projection = match mode {
+        SelectMode::WithCheck(rf) => {
             inner_cols.push(format!("{claimed} AS {MERGE_CLAIMED_COLUMN}"));
             (
                 "COUNT(*)".to_string(),
@@ -662,7 +674,11 @@ fn merge_select(
                 ),
             )
         }
-        None => (
+        SelectMode::ClaimedCount => {
+            inner_cols.push(format!("{claimed} AS {MERGE_CLAIMED_COLUMN}"));
+            ("COUNT(*)".to_string(), MERGE_CLAIMED_COLUMN.to_string())
+        }
+        SelectMode::Rewrite => (
             names
                 .target_columns
                 .iter()
@@ -710,8 +726,29 @@ pub(crate) fn build_merge_with_check_sql(
         qualified_target_ref,
         qualified_source_ref,
         on_rewritten,
-        Some(rf),
+        SelectMode::WithCheck(rf),
     ))
+}
+
+/// The copy-on-write MERGE affected-row count: a COUNT of the rows some
+/// clause claims (updated, deleted or inserted). The rewrite itself only
+/// sees the rows that survive, so its row count is the size of the new table,
+/// not what the statement changed.
+pub(crate) fn build_merge_claimed_count_sql(
+    classified: &ClassifiedMerge<'_>,
+    names: &MergeNames<'_>,
+    qualified_target_ref: &str,
+    qualified_source_ref: &str,
+    on_rewritten: &str,
+) -> String {
+    merge_select(
+        classified,
+        names,
+        qualified_target_ref,
+        qualified_source_ref,
+        on_rewritten,
+        SelectMode::ClaimedCount,
+    )
 }
 
 /// Build the two COUNT queries used to detect a MERGE cardinality violation
