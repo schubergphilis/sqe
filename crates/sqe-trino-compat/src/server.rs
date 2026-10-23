@@ -213,11 +213,35 @@ pub type TrinoBatchStream =
 pub struct TrinoResultStream {
     pub schema: SchemaRef,
     pub stream: TrinoBatchStream,
+    /// Read once the stream has ended, for the last page's `stats`.
+    pub bytes: Option<StatementBytesProbe>,
 }
+
+/// Bytes a statement read: `stats.physicalInputBytes` (fetched from
+/// storage) and `stats.processedBytes` (decoded by the scans).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatementBytes {
+    pub physical_input_bytes: u64,
+    pub processed_bytes: u64,
+}
+
+/// Reports a finished statement's [`StatementBytes`]; `None` when the
+/// engine has no record of it.
+pub type StatementBytesProbe = Arc<dyn Fn() -> Option<StatementBytes> + Send + Sync>;
 
 impl TrinoResultStream {
     pub fn new(schema: SchemaRef, stream: TrinoBatchStream) -> Self {
-        Self { schema, stream }
+        Self {
+            schema,
+            stream,
+            bytes: None,
+        }
+    }
+
+    /// Report `probe`'s bytes in the last page's `stats`.
+    pub fn with_bytes(mut self, probe: StatementBytesProbe) -> Self {
+        self.bytes = Some(probe);
+        self
     }
 
     /// Wrap an already-materialized result. Used for the small, shape-rewritten
@@ -230,10 +254,10 @@ impl TrinoResultStream {
             .first()
             .map(|b| b.schema())
             .unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()));
-        Self {
+        Self::new(
             schema,
-            stream: Box::pin(futures::stream::iter(batches.into_iter().map(Ok))),
-        }
+            Box::pin(futures::stream::iter(batches.into_iter().map(Ok))),
+        )
     }
 
     /// Drain the stream. Only for the reshaping paths above, whose inputs
@@ -267,6 +291,8 @@ pub struct ReadyPage {
     pub processed_rows: usize,
     /// True when the stream ended and no rows remain after this page.
     pub is_last: bool,
+    /// The statement's bytes; zero until the last page.
+    pub bytes: StatementBytes,
 }
 
 /// Outcome of asking the cursor for a page token.
@@ -301,6 +327,7 @@ pub struct ResultCursor {
     update_type: Option<String>,
     update_count: Option<i64>,
     created_at: Instant,
+    bytes: Option<StatementBytesProbe>,
 }
 
 impl std::fmt::Debug for ResultCursor {
@@ -334,6 +361,7 @@ impl ResultCursor {
             update_type,
             update_count,
             created_at: Instant::now(),
+            bytes: result.bytes,
         }
     }
 
@@ -446,11 +474,18 @@ impl ResultCursor {
         }
 
         let processed_rows = self.rows_served + json_rows.len();
+        // The engine records the bytes when its stream ends, which is before
+        // the last page is built.
+        let bytes = match self.bytes.as_ref() {
+            Some(probe) if is_last => probe().unwrap_or_default(),
+            _ => StatementBytes::default(),
+        };
         Ok(Arc::new(ReadyPage {
             token: self.next_token,
             rows: json_rows,
             processed_rows,
             is_last,
+            bytes,
         }))
     }
 
@@ -2087,6 +2122,8 @@ fn build_page_response(
     let metrics = protocol::ExecutionMetrics {
         elapsed_millis: cursor.created_at.elapsed().as_millis() as u64,
         processed_rows: page.processed_rows as u64,
+        processed_bytes: page.bytes.processed_bytes,
+        physical_input_bytes: page.bytes.physical_input_bytes,
         ..protocol::ExecutionMetrics::default()
     };
     // The total page count is unknown while streaming; report "this page done,
@@ -5095,6 +5132,30 @@ mod tests {
         assert_eq!(resp.data.as_ref().unwrap()[0][0], serde_json::json!(3));
         assert_eq!(resp.stats.state, "FINISHED");
         assert_eq!(resp.stats.processed_rows, 3);
+    }
+
+    #[tokio::test]
+    async fn test_build_page_response_reports_bytes_on_the_last_page() {
+        let probe: StatementBytesProbe = Arc::new(|| {
+            Some(StatementBytes {
+                physical_input_bytes: 4096,
+                processed_bytes: 24,
+            })
+        });
+        let result = TrinoResultStream::from_batches(vec![int_batch(&[1, 2, 3])]).with_bytes(probe);
+        let mut cursor = ResultCursor::new(result, 2, None, None, None);
+        let p0 = page(&mut cursor, 0).await;
+        let p1 = page(&mut cursor, 1).await;
+
+        let first = build_page_response("http://localhost:8080", "q", "t", &cursor, &p0);
+        assert_eq!(first.stats.physical_input_bytes, 0);
+        assert_eq!(first.stats.processed_bytes, 0);
+        let last = build_page_response("http://localhost:8080", "q", "t", &cursor, &p1);
+        assert_eq!(last.stats.physical_input_bytes, 4096);
+        assert_eq!(last.stats.processed_bytes, 24);
+        let json = serde_json::to_value(&last).unwrap();
+        assert_eq!(json["stats"]["physicalInputBytes"], 4096);
+        assert_eq!(json["stats"]["processedBytes"], 24);
     }
 
     #[tokio::test]
