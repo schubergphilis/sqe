@@ -1,5 +1,7 @@
 """#771/#772: DDL goes through ExecuteUpdate, queries and DML through ExecuteQuery."""
 
+import decimal
+
 import pyarrow as pa
 import pytest
 
@@ -81,6 +83,36 @@ def test_empty_result_keeps_its_column_names():
     inner = FakeCursor(result=pa.table({"column_name": pa.array([], pa.string()), "n": pa.array([], pa.int64())}))
     table = SQEConnectionManager.get_result_from_cursor(_Cursor(inner).execute("select 1"))
     assert table.column_names == ("column_name", "n")
+
+
+def _agate(result):
+    return SQEConnectionManager.get_result_from_cursor(_Cursor(FakeCursor(result=result)).execute("select 1"))
+
+
+def test_column_types_follow_the_arrow_schema_not_the_values():
+    # agate's inference read a 0/1 integer column as Boolean and "001" as Number.
+    table = _agate(
+        pa.table(
+            {
+                "flag": pa.array([0, 1], pa.int64()),
+                "code": pa.array(["001", "1"], pa.string()),
+                "ok": pa.array([True, None], pa.bool_()),
+                "x": pa.array([1.5, None], pa.float64()),
+            }
+        )
+    )
+    assert [type(t).__name__ for t in table.column_types] == ["Integer", "Text", "Boolean", "Number"]
+    assert list(table.rows[0]) == [0, "001", True, decimal.Decimal("1.5")]
+    assert list(table.rows[1]) == [1, "1", None, None]
+
+
+def test_repeated_column_names_keep_every_column_and_limit_applies():
+    table = _agate(pa.Table.from_arrays([pa.array([1, 2, 3]), pa.array(["a", "b", "c"])], names=["n", "n"]))
+    assert len(table.columns) == 2
+    limited = SQEConnectionManager.get_result_from_cursor(
+        _Cursor(FakeCursor(result=pa.table({"n": [1, 2, 3]}))).execute("select 1"), limit=2
+    )
+    assert [r[0] for r in limited.rows] == [1, 2]
 
 
 def test_failed_metadata_read_raises_instead_of_returning_no_rows():

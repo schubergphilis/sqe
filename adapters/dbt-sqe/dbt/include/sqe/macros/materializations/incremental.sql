@@ -2,6 +2,8 @@
   {%- set existing_relation = load_cached_relation(this) -%}
   {%- set strategy = config.get('incremental_strategy', 'append') -%}
   {%- set unique_key = config.get('unique_key') -%}
+  {#- dbt takes one column name or a list of them. -#}
+  {%- set unique_keys = [unique_key] if unique_key is string else unique_key -%}
 
   {% if existing_relation is none %}
     {# First run — create the table #}
@@ -29,10 +31,18 @@
          table's CTAS and DROP autocommit, so they stay outside. #}
       {% do adapter.begin_transaction() %}
       {% call statement('delete') %}
+        {% if unique_keys | length == 1 %}
         DELETE FROM {{ this }}
-        WHERE {{ unique_key }} IN (
-          SELECT {{ unique_key }} FROM {{ tmp_relation }}
+        WHERE {{ unique_keys[0] }} IN (
+          SELECT {{ unique_keys[0] }} FROM {{ tmp_relation }}
         )
+        {% else %}
+        {# DELETE takes no correlated subquery; MERGE matches on every key. #}
+        MERGE INTO {{ this }} AS target
+        USING {{ tmp_relation }} AS source
+        ON {% for k in unique_keys %}target.{{ k }} = source.{{ k }}{% if not loop.last %} AND {% endif %}{% endfor %}
+        WHEN MATCHED THEN DELETE
+        {% endif %}
       {% endcall %}
       {# dbt fails a model that never runs statement('main'). #}
       {% call statement('main') %}
@@ -51,7 +61,7 @@
       {% call statement('main') %}
         MERGE INTO {{ this }} AS target
         USING ({{ compiled_code }}) AS source
-        ON target.{{ unique_key }} = source.{{ unique_key }}
+        ON {% for k in unique_keys %}target.{{ k }} = source.{{ k }}{% if not loop.last %} AND {% endif %}{% endfor %}
         WHEN MATCHED THEN UPDATE SET
           {% for col in merge_update_columns %}
             target.{{ col }} = source.{{ col }}{% if not loop.last %},{% endif %}
