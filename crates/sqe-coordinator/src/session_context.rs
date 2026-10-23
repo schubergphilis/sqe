@@ -152,7 +152,7 @@ pub(crate) async fn build_catalog_provider(
 /// [`SessionCatalog`] for `cat_cfg`. Shared by [`build_catalog_provider`] (read
 /// path) and [`discover_session_catalog`] (write path) so both resolve auth and
 /// storage identically — keep them on one code path to avoid silent divergence.
-async fn build_session_catalog(
+pub(crate) async fn build_session_catalog(
     cat_cfg: &sqe_core::config::CatalogConfig,
     session: &Session,
     global_storage: &sqe_core::config::StorageConfig,

@@ -444,6 +444,40 @@ async fn polaris_auto_lazy_hit() {
     assert_eq!(label_arr.value(0), "discovered");
 }
 
+/// A maintenance `CALL` on an unqualified `ns.t` resolves in the session
+/// catalog, as a SELECT of the same name does. Before, it always used the
+/// configured default warehouse, so a Trino client with `catalog=<sibling>`
+/// maintained (or failed to find) a table in the wrong warehouse.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn maintenance_call_uses_the_session_catalog() {
+    let _live = LIVE_STACK_LOCK.lock().await;
+    crate::common::init_tracing();
+    seed_discovery_warehouse().await;
+
+    let handler = make_handler(polaris_auto_config());
+    let call = "CALL system.table_health(table => 'disc_ns.probe_t')";
+
+    let mut in_sibling = live_session().await;
+    in_sibling.default_catalog = Some("discovery_test_wh".to_string());
+    let batches = handler
+        .execute(&in_sibling, call, None)
+        .await
+        .expect("table_health must find the table in the session catalog");
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert!(total_rows >= 1, "table_health reports the table");
+
+    let err = handler
+        .execute(&live_session().await, call, None)
+        .await
+        .expect_err("without the session catalog the default warehouse has no disc_ns");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Failed to load table") && msg.contains("probe_t"),
+        "the default-warehouse call must fail to find the table, got: {msg}"
+    );
+}
+
 /// #334: row-level mutations against a DISCOVERED (non-default) catalog must
 /// load and commit against the discovered warehouse, not the session-default
 /// one. Before the fix the UPDATE/DELETE/MERGE handlers used the passed

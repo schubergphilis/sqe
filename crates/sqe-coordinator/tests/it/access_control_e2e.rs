@@ -3275,6 +3275,92 @@ async fn insert_does_not_confer_storage_relocation() {
         .await;
 }
 
+/// `expire_snapshots` runs as the table's writer, not only as an admin, and
+/// the catalog still refuses a reader. SQE classifies the call as a table
+/// write; the gate that matters is the catalog commit made with the caller's
+/// own token, so a reader's call must fail AND leave the snapshots in place.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn expire_snapshots_runs_as_writer_and_refuses_reader() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    let short = "maint_owner_expire";
+    let fresh = format!("sales_wh.ac.{short}");
+    let _ = ctx
+        .handler
+        .execute(&ctx.carol, &format!("DROP TABLE IF EXISTS {fresh}"), None)
+        .await;
+    for setup in [
+        format!("CREATE TABLE {fresh} (id BIGINT)"),
+        format!("INSERT INTO {fresh} VALUES (1)"),
+        format!("INSERT INTO {fresh} VALUES (2)"),
+        format!("INSERT INTO {fresh} VALUES (3)"),
+        format!("GRANT SELECT ON {fresh} TO ROLE \"analyst\""),
+        format!("GRANT INSERT ON {fresh} TO ROLE \"engineer\""),
+    ] {
+        exec_ok(&ctx, &ctx.carol, &setup).await;
+    }
+
+    let mut carol = ctx.carol.clone();
+    carol.default_catalog = Some("sales_wh".to_string());
+    let snapshots_sql = format!("SELECT snapshot_id FROM table_snapshots('ac', '{short}')");
+    let before = total_rows(&exec_ok(&ctx, &carol, &snapshots_sql).await);
+    let msg = format!("three inserts leave three snapshots, got {before}");
+    assert!(before >= 3, "{msg}");
+
+    let expire = format!(
+        "CALL system.expire_snapshots(table => '{fresh}', \
+         older_than => '2999-01-01 00:00:00', retain_last => 1)"
+    );
+
+    // alice holds SELECT only (role analyst).
+    crate::common::eventually("alice's SELECT grant to apply", || async {
+        match ctx
+            .handler
+            .execute(&ctx.alice, &format!("SELECT id FROM {fresh}"), None)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("select failed: {e}")),
+        }
+    })
+    .await;
+    let err = ctx
+        .handler
+        .execute(&ctx.alice, &expire, None)
+        .await
+        .expect_err("a reader must not expire snapshots");
+    // Refused by the catalog commit, not by SQE's role-name heuristic.
+    let reason = err.to_string();
+    assert!(reason.contains("403"), "want Polaris's 403, got: {reason}");
+    let after_reader = total_rows(&exec_ok(&ctx, &carol, &snapshots_sql).await);
+    assert_eq!(
+        after_reader, before,
+        "the refused call must leave every snapshot; error was: {err}"
+    );
+
+    // bob holds INSERT through role engineer.
+    crate::common::eventually("bob's expire_snapshots to succeed", || async {
+        match ctx.handler.execute(&ctx.bob, &expire, None).await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("expire failed: {e}")),
+        }
+    })
+    .await;
+    let after_writer = total_rows(&exec_ok(&ctx, &carol, &snapshots_sql).await);
+    assert_eq!(after_writer, 1, "the writer keeps only the last snapshot");
+
+    for revoke in [
+        format!("REVOKE SELECT ON {fresh} FROM ROLE \"analyst\""),
+        format!("REVOKE INSERT ON {fresh} FROM ROLE \"engineer\""),
+        format!("DROP TABLE IF EXISTS {fresh}"),
+    ] {
+        let _ = ctx.handler.execute(&ctx.carol, &revoke, None).await;
+    }
+}
+
 /// `DENY` as a SQL statement, end to end against live Ranger.
 ///
 /// `ranger_deny_overrides_allow` proves deny PRECEDENCE, but it injects the deny
