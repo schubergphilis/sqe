@@ -4653,12 +4653,9 @@ impl WriteHandler {
         // before the rewrite (no new snapshot). With a BY SOURCE clause the
         // merge runs: every target row is unmatched-by-source.
         //
-        // The CoW affected-row count is normally the number of rows written,
-        // which is 0 after a BY SOURCE DELETE emptied the table. Count the
-        // claimed target rows instead, which is exact here: an empty source
-        // matches nothing and inserts nothing, so BY SOURCE is the only class
-        // that can change a row. The count runs per attempt (inside the retry
-        // closure) because it reads the target relation of that attempt.
+        // An empty source matches nothing and inserts nothing, so BY SOURCE is
+        // the only class that can change a row: the affected-row count is a
+        // plain scan of the target, no join needed.
         let mut empty_source_count_sql: Option<String> = None;
         if source_empty {
             if crate::merge_sql::empty_source_is_no_op(&classified) {
@@ -4704,6 +4701,19 @@ impl WriteHandler {
             &qualified_source_ref,
             &on_rewritten,
         );
+        // The rows the statement changed (updated, deleted, inserted). The
+        // rewrite writes the rows that survive, so its row count is the size
+        // of the new table, not this. The count runs per attempt (inside the
+        // retry closure) because it reads the target relation of that attempt.
+        let affected_count_sql = empty_source_count_sql.unwrap_or_else(|| {
+            crate::merge_sql::build_merge_claimed_count_sql(
+                &classified,
+                &merge_names,
+                &qualified_target_ref,
+                &qualified_source_ref,
+                &on_rewritten,
+            )
+        });
 
         info!(
             table = %table_ident,
@@ -4732,7 +4742,7 @@ impl WriteHandler {
             &table_ident,
             &qualified_target_ref[..],
             &select_sql[..],
-            empty_source_count_sql.as_deref(),
+            &affected_count_sql[..],
             cardinality_sql.as_ref(),
             with_check_sql.as_deref(),
             &merge_names,
@@ -4748,7 +4758,7 @@ impl WriteHandler {
                         table_ident,
                         qualified_target_ref,
                         select_sql,
-                        empty_source_count_sql,
+                        affected_count_sql,
                         cardinality_sql,
                         with_check_sql,
                         merge_names,
@@ -4803,14 +4813,11 @@ impl WriteHandler {
                             }
                         }
 
-                        let mut empty_source_affected: Option<usize> = None;
-                        if let Some(count_sql) = empty_source_count_sql {
-                            let label = "MERGE empty-source row count";
-                            let claimed =
-                                scalar_count(self.plan_merge_sql(ctx, session, count_sql, label).await?, label)
-                                    .await?;
-                            empty_source_affected = Some(claimed.max(0) as usize);
-                        }
+                        let label = "MERGE affected-row count";
+                        let claimed =
+                            scalar_count(self.plan_merge_sql(ctx, session, affected_count_sql, label).await?, label)
+                                .await?;
+                        let affected = claimed.max(0) as usize;
 
                         let df = self.plan_merge_sql(ctx, session, select_sql, "MERGE query").await?;
 
@@ -4872,14 +4879,14 @@ impl WriteHandler {
                             add: new_data_files,
                             remove: files_to_remove,
                             cleanup: Some(cleanup_guard),
-                            value: (total_rows, empty_source_affected),
+                            value: (total_rows, affected),
                         }))
                     }
                 },
             )
             .await?;
 
-        let Some((total_rows, empty_source_affected)) = outcome else {
+        let Some((total_rows, affected)) = outcome else {
             return affected_rows_batch(0);
         };
         // Row delta: carry the previous snapshot's Puffin NDV statistics as an
@@ -4894,10 +4901,6 @@ impl WriteHandler {
         self.after_commit(session, catalog.as_ref(), &table_ident)
             .await;
 
-        // With an empty source the rows the statement *changed* are the target
-        // rows a BY SOURCE clause claimed, counted before the rewrite; the
-        // rows it *wrote* (`total_rows`) is 0 after a BY SOURCE DELETE (501).
-        let affected = empty_source_affected.unwrap_or(total_rows);
         info!(table = %table_ident, total_rows, affected, "MERGE committed successfully");
         affected_rows_batch(affected as u64)
     }
@@ -14178,11 +14181,8 @@ s3_path_style = true
             )
             .await
             .expect("MERGE");
-            // CoW MERGE reports the rows it WROTE (the rewritten target: 3
-            // seed rows, one of them updated, plus the insert), not the rows
-            // the clauses touched; only the empty-source BY SOURCE path (501)
-            // counts claimed rows instead.
-            assert_eq!(n, 4, "rows written by the rewrite");
+            // The rows the clauses changed, not the 4 the rewrite wrote.
+            assert_eq!(n, 2, "one update plus one insert");
             assert_eq!(
                 rig.scan_id_v(&ident).await,
                 vec![(1, s("a")), (2, s("B")), (3, s("c")), (4, s("d"))]
@@ -14204,7 +14204,7 @@ s3_path_style = true
             )
             .await
             .expect("MERGE");
-            assert_eq!(n, 2, "rows written: the two survivors");
+            assert_eq!(n, 1, "the one deleted row, not the two survivors");
             assert_eq!(rig.scan_id_v(&ident).await, vec![(2, s("b")), (3, s("c"))]);
         }
 
@@ -14224,7 +14224,7 @@ s3_path_style = true
             )
             .await
             .expect("MERGE");
-            assert_eq!(n, 1, "rows written: the one updated survivor");
+            assert_eq!(n, 3, "one update plus two BY SOURCE deletes");
             assert_eq!(rig.scan_id_v(&ident).await, vec![(1, s("A"))]);
         }
 
@@ -14243,10 +14243,36 @@ s3_path_style = true
             )
             .await
             .expect("MERGE");
-            assert_eq!(n, 3, "rows written: all three target rows");
+            assert_eq!(n, 2, "id 1 matched, but no clause claims it");
             assert_eq!(
                 rig.scan_id_v(&ident).await,
                 vec![(1, s("a")), (2, s("gone")), (3, s("gone"))]
+            );
+        }
+
+        /// Each claimed row counts once, whichever clause claims it; an
+        /// unclaimed matched row does not count.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn merge_mixed_clauses_count_claimed_rows() {
+            let rig = SqliteRig::new().await;
+            let ident = seeded_id_v(&rig, "m6").await;
+            let h = handler(&rig);
+            let n = run_merge(
+                &h,
+                &rig,
+                "MERGE INTO default.m6 AS t USING src AS s ON t.id = s.id \
+                 WHEN MATCHED AND s.v = 'del' THEN DELETE \
+                 WHEN MATCHED AND s.v <> 'keep' THEN UPDATE SET v = s.v \
+                 WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
+                vec![id_v_batch(&[(1, "del"), (2, "B"), (3, "keep"), (4, "d")])],
+                None,
+            )
+            .await
+            .expect("MERGE");
+            assert_eq!(n, 3, "delete 1, update 2, insert 4; 3 is unclaimed");
+            assert_eq!(
+                rig.scan_id_v(&ident).await,
+                vec![(2, s("B")), (3, s("c")), (4, s("d"))]
             );
         }
 
