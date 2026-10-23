@@ -151,18 +151,13 @@ pub struct IncrementalPlan {
 /// snapshot ids that fall inside `(start, end]` in chronological order.
 ///
 /// Errors:
-/// - `start > end`: descending ranges are rejected at parse time but the
-///   resolver double-checks.
 /// - `end` snapshot id not present on the table.
 /// - `start` snapshot id not present on the table (unless `start == 0`, a
 ///   sentinel for "from the beginning of time").
+/// - `start` not an ancestor of `end`. Snapshot ids are random, so the
+///   order of the pair is decided by this parent-chain walk, never by
+///   comparing the ids.
 pub fn resolve_range(metadata: &TableMetadata, start: i64, end: i64) -> Result<Vec<i64>> {
-    if start > end {
-        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-            "FOR INCREMENTAL BETWEEN SNAPSHOT {start} AND SNAPSHOT {end}: start must be older than end"
-        )));
-    }
-
     // An open transaction's snapshot reads as absent (#821). Checking `end`
     // covers the walk below: a public snapshot's ancestors are all public.
     if metadata.snapshot_by_id(end).is_none()
@@ -557,7 +552,16 @@ mod tests {
     fn resolve_range_rejects_descending() {
         let md = metadata_with_snapshots(&[(100, None), (101, Some(100))]);
         let err = resolve_range(&md, 101, 100).unwrap_err();
-        assert!(err.to_string().contains("start must be older than end"));
+        assert!(err.to_string().contains("is not an ancestor"), "{err}");
+    }
+
+    #[test]
+    fn resolve_range_orders_by_parent_chain_not_by_id() {
+        // Snapshot ids are random: here the older snapshot holds the larger id.
+        let md = metadata_with_snapshots(&[(900, None), (500, Some(900)), (100, Some(500))]);
+        assert_eq!(resolve_range(&md, 900, 100).unwrap(), vec![500, 100]);
+        let err = resolve_range(&md, 100, 900).unwrap_err();
+        assert!(err.to_string().contains("is not an ancestor"), "{err}");
     }
 
     #[test]
