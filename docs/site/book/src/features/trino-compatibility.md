@@ -131,6 +131,7 @@ Connection conn = DriverManager.getConnection(url, props);
 BI tools that speak Trino connect through the same endpoint. Metabase uses the Trino JDBC driver, Superset uses the Trino SQLAlchemy dialect (`trino://user@host:8080/catalog`). Both drive a metadata handshake on connect (prepare a statement, enumerate catalogs and schemas, list tables, describe columns) before running a chart, and SQE now matches Trino's exact response shape at each step:
 
 - `PREPARE` and `DEALLOCATE PREPARE` are handled as session-control via the `X-Trino-Added-Prepare` / `X-Trino-Deallocated-Prepare` headers, so the JDBC connection test succeeds.
+- `EXECUTE name USING ...` binds literals only: numbers, strings, booleans, `NULL` and typed literals such as `DATE '2020-01-01'` or `DECIMAL '1.50'`. A function call, column or subquery in `USING` is refused with the parameter's position. The values are still written into the statement text, so they appear in the query log.
 - `SHOW TABLES` returns a single `Table` column, `SHOW SCHEMAS` a `Schema` column, and `SHOW CATALOGS` a `Catalog` column, so schema sync reads the right values.
 - `SHOW CATALOGS` and the `system.jdbc.*` / `system.metadata.*` tables enumerate every reachable catalog and skip the ones the caller is not authorized to list, and `SHOW TABLES` / `SHOW SCHEMAS` honor the session catalog (`X-Trino-Catalog`).
 - `DESCRIBE` and `SHOW COLUMNS` resolve double-quoted identifiers (`"catalog"."schema"."table"`), so field discovery works.

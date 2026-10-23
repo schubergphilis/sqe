@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 
 use sqe_core::substitute_placeholders;
-use sqlparser::ast::Expr;
+use sqlparser::ast::{Expr, UnaryOperator, Value};
 
 /// Parse `X-Trino-Prepared-Statement` header value(s) into a name->SQL map.
 ///
@@ -70,9 +70,51 @@ pub fn form_urlencode(s: &str) -> String {
 /// skips `?` inside strings, quoted identifiers, dollar quotes and `--` /
 /// `/* */` comments, so `SELECT ? /* why? */` binds exactly one value. A
 /// count mismatch is an error rather than a partial bind.
+///
+/// Only literals bind (see [`is_literal`]); a function call, column, subquery
+/// or any other expression is refused, naming its position, so a parameter is
+/// always a value and never SQL.
 pub fn bind_execute(template: &str, params: &[Expr]) -> Result<String, String> {
+    if let Some(position) = params.iter().position(|e| !is_literal(e)) {
+        return Err(format!(
+            "EXECUTE ... USING parameter {} is not a literal; only constants \
+             (numbers, strings, booleans, NULL, typed literals such as DATE '...') bind",
+            position + 1
+        ));
+    }
     let literals: Vec<String> = params.iter().map(Expr::to_string).collect();
     substitute_placeholders(template, &literals)
+}
+
+/// A constant `USING` argument: a number, a plain single-quoted string, a
+/// boolean, NULL, a hex string, a typed literal (`DATE '...'`,
+/// `DECIMAL '...'`), an interval over a literal, or a signed number. Strings
+/// that render with another quoting (dollar, escape, raw, triple) are refused:
+/// their text form depends on the dialect that reads it back.
+fn is_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Value(v) => is_plain_value(&v.value),
+        Expr::TypedString(ts) => matches!(ts.value.value, Value::SingleQuotedString(_)),
+        Expr::Interval(interval) => is_literal(&interval.value),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr,
+        } => matches!(expr.as_ref(), Expr::Value(v) if matches!(v.value, Value::Number(..))),
+        Expr::Nested(inner) => is_literal(inner),
+        _ => false,
+    }
+}
+
+fn is_plain_value(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Number(..)
+            | Value::SingleQuotedString(_)
+            | Value::NationalStringLiteral(_)
+            | Value::HexStringLiteral(_)
+            | Value::Boolean(_)
+            | Value::Null
+    )
 }
 
 #[cfg(test)]
@@ -162,6 +204,69 @@ mod tests {
             "SELECT 1 -- really?\n"
         );
         assert!(bind_execute("SELECT ? /* why? */", &exprs("1, 2")).is_err());
+    }
+
+    /// A string that looks like SQL stays one string literal: its quote is
+    /// doubled on the way back to text, so the bound statement parses as one
+    /// statement selecting the original value.
+    #[test]
+    fn bind_keeps_an_injection_string_a_single_literal() {
+        let out = bind_execute("SELECT ?", &exprs("'x''; DROP TABLE t; --'")).unwrap();
+        assert_eq!(out, "SELECT 'x''; DROP TABLE t; --'");
+        let statements = Parser::parse_sql(&GenericDialect {}, &out).expect("parse bound");
+        assert_eq!(statements.len(), 1);
+        assert_eq!(statements[0].to_string(), "SELECT 'x''; DROP TABLE t; --'");
+    }
+
+    /// `1-?` bound to `-5` reads `1-(-5)`, not the comment `1--5`.
+    #[test]
+    fn bind_negative_number_does_not_open_a_comment() {
+        let out = bind_execute("SELECT 1-? AS v, ? AS w", &exprs("-5, 2")).unwrap();
+        assert_eq!(out, "SELECT 1-(-5) AS v, 2 AS w");
+    }
+
+    #[test]
+    fn bind_long_string_round_trips() {
+        let value = "a'b".repeat(64 * 1024 / 3);
+        let quoted = format!("'{}'", value.replace('\'', "''"));
+        let out = bind_execute("SELECT ?", &exprs(&quoted)).unwrap();
+        assert_eq!(out, format!("SELECT {quoted}"));
+    }
+
+    #[test]
+    fn bind_accepts_typed_and_signed_literals() {
+        let out = bind_execute(
+            "SELECT ?, ?, ?, ?, ?, ?",
+            &exprs(
+                "DECIMAL '1.50', TIMESTAMP '2020-01-01 00:00:00', INTERVAL '1' DAY, +3, NULL, TRUE",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "SELECT DECIMAL '1.50', TIMESTAMP '2020-01-01 00:00:00', INTERVAL '1' DAY, +3, NULL, true"
+        );
+    }
+
+    /// Portal request: a function call, a subquery, a column or an
+    /// expression in `USING` is refused, naming the parameter position.
+    #[test]
+    fn bind_refuses_non_literal_expressions() {
+        for (list, position) in [
+            ("1, current_user", 2),
+            ("(SELECT secret FROM s)", 1),
+            ("1, 2, lower('A')", 3),
+            ("1 + 1", 1),
+            ("-col", 1),
+            ("$1", 1),
+        ] {
+            let template = vec!["?"; position].join(", ");
+            let err = bind_execute(&format!("SELECT {template}"), &exprs(list)).unwrap_err();
+            assert!(
+                err.contains(&format!("parameter {position} is not a literal")),
+                "{list}: {err}"
+            );
+        }
     }
 
     #[test]
