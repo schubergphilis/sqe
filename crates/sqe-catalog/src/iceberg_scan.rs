@@ -24,7 +24,7 @@ use datafusion::physical_plan::filter_pushdown::{
     PushedDown,
 };
 use datafusion::physical_plan::metrics::{
-    BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+    BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, RecordOutput,
 };
 use datafusion::physical_plan::statistics::StatisticsArgs;
 use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
@@ -3471,7 +3471,9 @@ impl Stream for IcebergRecordBatchStream {
             this.inner.as_mut().poll_next(cx)
         };
         if let Poll::Ready(Some(Ok(ref batch))) = poll {
-            this.baseline.record_output(batch.num_rows());
+            // Rows, batches and decoded bytes: `output_bytes` is what the
+            // Trino `processedBytes` stat and the audit `bytes_scanned` read.
+            batch.record_output(&this.baseline);
         }
         poll
     }
