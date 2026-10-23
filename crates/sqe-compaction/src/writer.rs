@@ -293,6 +293,8 @@ pub async fn write_data_files_streaming(
     // (see the delete-aware read plan) must persist them, so the data file's
     // schema is the table schema plus the two reserved lineage fields. Inserts
     // carry neither and write the table schema unchanged.
+    reject_geospatial_write(table.metadata().current_schema())?;
+
     let lineage = carries_row_lineage(table, &stream.schema());
     let write_schema = if lineage {
         schema_with_row_lineage(table.metadata().current_schema())?
@@ -502,6 +504,39 @@ pub fn shred_variants(table: &Table) -> bool {
         .properties()
         .get("write.parquet.shred-variants")
         .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
+/// Refuse to write data files for a schema with a GEOMETRY / GEOGRAPHY
+/// column (sqe#863). Reading these V3 types is supported; writing is not,
+/// because the vendored writer cannot yet compute the bounding-box bounds
+/// the spec requires, so files would commit without geo metadata.
+pub fn reject_geospatial_write(schema: &IcebergSchema) -> sqe_core::Result<()> {
+    use iceberg::spec::{PrimitiveType, Type};
+    fn find(ty: &Type) -> Option<&PrimitiveType> {
+        match ty {
+            Type::Primitive(p @ (PrimitiveType::Geometry(_) | PrimitiveType::Geography(_))) => {
+                Some(p)
+            }
+            Type::Primitive(_) | Type::Variant(_) => None,
+            Type::Struct(s) => s.fields().iter().find_map(|f| find(&f.field_type)),
+            Type::List(l) => find(&l.element_field.field_type),
+            Type::Map(m) => {
+                find(&m.key_field.field_type).or_else(|| find(&m.value_field.field_type))
+            }
+        }
+    }
+    for field in schema.as_struct().fields() {
+        if let Some(p) = find(&field.field_type) {
+            return Err(SqeError::with_code(
+                SqeErrorCode::NotSupported,
+                format!(
+                    "column '{}' has type {p}: SQE reads geospatial columns but cannot write them yet",
+                    field.name
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Whether a write into `table` must persist V3 row lineage: the table is V3
@@ -1130,6 +1165,40 @@ impl<B: IcebergWriterBuilder> BoundedFanoutWriter<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn geospatial_columns_refuse_writes() {
+        use iceberg::spec::{NestedField, PrimitiveType, StructType, Type};
+        let plain = IcebergSchema::builder()
+            .with_fields(vec![NestedField::optional(
+                1,
+                "b",
+                Type::Primitive(PrimitiveType::Binary),
+            )
+            .into()])
+            .build()
+            .unwrap();
+        assert!(reject_geospatial_write(&plain).is_ok());
+
+        let nested_geo = Type::Struct(StructType::new(vec![NestedField::optional(
+            3,
+            "g",
+            Type::Primitive(PrimitiveType::Geography(Default::default())),
+        )
+        .into()]));
+        for ty in [
+            Type::Primitive(PrimitiveType::Geometry(Default::default())),
+            nested_geo,
+        ] {
+            let schema = IcebergSchema::builder()
+                .with_fields(vec![NestedField::optional(2, "shape", ty).into()])
+                .build()
+                .unwrap();
+            let err = reject_geospatial_write(&schema).unwrap_err();
+            assert_eq!(err.error_code(), SqeErrorCode::NotSupported);
+            assert!(err.to_string().contains("'shape'"), "{err}");
+        }
+    }
 
     /// The reader emits `_last_updated_sequence_number` as a run-end encoded
     /// constant; the rewrite paths need plain longs, placed last for stamping.

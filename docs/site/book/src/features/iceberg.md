@@ -11,7 +11,7 @@ SQE is built on the [iceberg-rust](https://github.com/apache/iceberg-rust) libra
 - **Parquet**: 59
 - **Iceberg table format**: V2 and V3. V3 is the default for new tables. V3 features verified end-to-end: TIMESTAMP_NS, column defaults, equality-delete UPDATE on identifier-fields, partition evolution, deletion vectors, row lineage, `VARIANT`, and top-level unknown columns.
 
-The matrix score against [icebergmatrix.org](https://icebergmatrix.org) is 150/162 (92.6%), rescored in October 2026 against the current rubric, which scores only the cells that apply to each format version. Scores from the older rubric (167/189) are not comparable. See [getsqe.com/compare/iceberg](https://getsqe.com/compare/iceberg) for the per-cell breakdown and the side-by-side V2/V3 comparison against every other engine on the public scoreboard.
+The matrix score against [icebergmatrix.org](https://icebergmatrix.org) is 152/162 (93.8%), rescored in October 2026 against the current rubric, which scores only the cells that apply to each format version. Scores from the older rubric (167/189) are not comparable. See [getsqe.com/compare/iceberg](https://getsqe.com/compare/iceberg) for the per-cell breakdown and the side-by-side V2/V3 comparison against every other engine on the public scoreboard.
 
 ## Architecture
 
@@ -168,6 +168,7 @@ SQE runs table maintenance through `CALL system.*` procedures, each committing t
 - **Deletion vectors (V3)**: MoR DELETE on a V3 table writes one deletion vector per data file, never a position-delete file. A second DELETE on the same file merges its existing deletes into a new vector and retires the old one in the same commit, so a data file never carries two. The engine refuses any commit that would add a position-delete file to a V3 table.
 - **Row lineage (V3)**: new rows get a fresh `_row_id` at commit. CoW DELETE / UPDATE / MERGE, MoR UPDATE / MERGE and `rewrite_data_files` carry `_row_id` and `_last_updated_sequence_number` into the files they write.
 - **Unknown columns (V3)**: a top-level `UNKNOWN` or `VOID` column holds only NULLs, is never written to data files, and is promoted later with `ALTER COLUMN ... SET DATA TYPE`. A Spark-written `VOID` column reads as NULLs. An unknown struct member (`STRUCT<a INT, u VOID>`, also inside a list) works the same way in both directions, and is promoted with `ALTER COLUMN s.u SET DATA TYPE`. An unknown list element or map key/value, or a struct whose members are all unknown, can be declared and read but not written: Parquet has no column for them, and Iceberg Java refuses the same writes.
+- **Geometry / geography (V3), read-only**: SQE reads `GEOMETRY` and `GEOGRAPHY` columns written by another engine as WKB bytes (Arrow `LargeBinary` tagged `geoarrow.wkb`), so they can be selected, compared, joined on and passed to a client that decodes WKB. Verified against a table written by Spark 4.1 with Iceberg 1.12. A predicate on one is never pushed into the scan, so there is no bounding-box pruning yet. Writes into a table with a geospatial column fail with `NOT_SUPPORTED`.
 - **Equality deletes (V3)**: UPDATE with a declared identifier-field-id commits a single RowDelta with new data file plus equality-delete row.
 - **Partition evolution (V3)**: `ALTER TABLE ADD/DROP/REPLACE PARTITION FIELD` evolves the spec on V3 tables, including with day(ts) on TIMESTAMP_NS columns.
 - **Time travel (V3)**: `FOR SYSTEM_TIME AS OF` and `FOR VERSION AS OF` work against V3 tables through the same snapshot walk as V2.
@@ -175,7 +176,7 @@ SQE runs table maintenance through `CALL system.*` procedures, each committing t
 
 V3 features not available yet:
 
-- **Geometry / geography**: no iceberg-rust support, and pending DataFusion UDT [#12644](https://github.com/apache/datafusion/issues/12644).
+- **Geometry / geography writes and DDL**: `CREATE TABLE` with a `GEOMETRY` column and writes into a geospatial table wait for the iceberg-rust geospatial writer. There are no `ST_*` functions.
 - **Multi-arg partition transforms**: `PARTITIONED BY` accepts single-source transforms only.
 
 The deferred list is tracked in `docs/evidence/iceberg-matrix-state.json` under `caveats` for each cell.

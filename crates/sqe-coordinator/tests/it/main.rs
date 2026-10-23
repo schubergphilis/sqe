@@ -39,6 +39,7 @@ mod distributed_schema_evolution_e2e;
 mod equality_delete_integration;
 mod flight_sql_smoke;
 mod full_outer_window_join_test;
+mod geo_spark_interop;
 mod glue_v3_live_e2e;
 mod grant_dispatch_test;
 mod grant_introspection_gate_test;
