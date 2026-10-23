@@ -198,3 +198,58 @@ async fn trino_stats_report_bytes_for_read_parquet() {
     assert!(processed > 0, "processedBytes is 0: {stats}");
     assert_eq!(stats["processedRows"], 5000);
 }
+
+/// A distributed scan reports the file bytes its fragments covered as
+/// physical input and the rows the workers returned as processed bytes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn trino_stats_report_bytes_for_a_distributed_scan() {
+    use crate::common::chaos_worker::{spawn_chaos_worker, ChaosMode};
+
+    let (setup_session, setup) = crate::common::setup_handler().await;
+    let t = "default.trino_stats_bytes_dist";
+    for sql in [
+        format!("DROP TABLE IF EXISTS {t}"),
+        format!("CREATE TABLE {t} (id BIGINT, s VARCHAR)"),
+        format!("INSERT INTO {t} SELECT value, repeat('x', 64) FROM generate_series(1, 5000)"),
+        format!("INSERT INTO {t} SELECT value, repeat('y', 64) FROM generate_series(5001, 9000)"),
+    ] {
+        setup
+            .execute(&setup_session, &sql, None)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let files_sql = "SELECT CAST(SUM(file_size_in_bytes) AS BIGINT) \
+                     FROM table_files('default', 'trino_stats_bytes_dist')";
+    let batches = setup
+        .execute(&setup_session, files_sql, None)
+        .await
+        .expect("table_files");
+    let file_bytes = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64")
+        .value(0) as u64;
+
+    let worker = spawn_chaos_worker(ChaosMode::PassThrough).await;
+    let rig = crate::distributed_failure_e2e::rig(std::slice::from_ref(&worker.url), |_| {}).await;
+    let base_url = start_server(&rig.session, &rig.handler).await;
+
+    let stats = last_stats(&base_url, &format!("SELECT * FROM {t}")).await;
+    assert!(worker.do_gets() >= 1, "the scan never reached the worker");
+    let physical = stats["physicalInputBytes"]
+        .as_u64()
+        .expect("physicalInputBytes");
+    let processed = stats["processedBytes"].as_u64().expect("processedBytes");
+    assert!(
+        physical > 0 && physical <= file_bytes,
+        "physicalInputBytes {physical} not within the {file_bytes} bytes of data files"
+    );
+    assert!(processed > 0, "processedBytes is 0: {stats}");
+    assert_eq!(stats["processedRows"], 9000);
+
+    let _ = setup
+        .execute(&setup_session, &format!("DROP TABLE IF EXISTS {t}"), None)
+        .await;
+}
