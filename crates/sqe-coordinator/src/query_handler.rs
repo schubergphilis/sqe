@@ -8916,7 +8916,18 @@ pub(crate) fn extract_plan_metrics(plan: &Arc<dyn ExecutionPlan>) -> PlanMetrics
     let mut stack: Vec<Arc<dyn ExecutionPlan>> = vec![Arc::clone(plan)];
     while let Some(node) = stack.pop() {
         let name = node.name();
-        let is_scan = name.contains("Scan") || name.contains("Parquet") || name.contains("Csv");
+        // `DataSourceExec` is DataFusion's file scan (read_parquet, read_csv,
+        // ...) and also its in-memory source; only the file form is a scan.
+        let is_scan = name.contains("Scan")
+            || name.contains("Parquet")
+            || name.contains("Csv")
+            || node
+                .downcast_ref::<datafusion::datasource::source::DataSourceExec>()
+                .is_some_and(|d| {
+                    d.data_source()
+                        .downcast_ref::<datafusion::datasource::physical_plan::FileScanConfig>()
+                        .is_some()
+                });
 
         if let Some(metrics) = node.metrics() {
             // `IcebergScanExec` and DataFusion's file scans (`DataSourceExec`)
@@ -12892,5 +12903,107 @@ mod masking_policy_resolution_tests {
             ),
             format!("{}", plan.display_indent())
         );
+    }
+}
+
+#[cfg(test)]
+mod plan_metrics_tests {
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::execution::context::SessionContext;
+    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::prelude::ParquetReadOptions;
+
+    use super::extract_plan_metrics;
+    use crate::distributed_scan::CoordinatorLocalScanExec;
+
+    /// A 1000-row parquet file in a fresh temp directory.
+    fn parquet_file() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sqe-plan-metrics-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("t.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..1000))],
+        )
+        .expect("batch");
+        let file = std::fs::File::create(&path).expect("create");
+        let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema, None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+        path
+    }
+
+    async fn executed_scan(ctx: &SessionContext, path: &str) -> Arc<dyn ExecutionPlan> {
+        let df = ctx
+            .read_parquet(path, ParquetReadOptions::default())
+            .await
+            .expect("read_parquet");
+        let plan = df.create_physical_plan().await.expect("plan");
+        datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
+            .await
+            .expect("collect");
+        plan
+    }
+
+    /// A file table function scans through DataFusion's `DataSourceExec`,
+    /// whose name matched none of the scan patterns, so `processedBytes`
+    /// stayed 0 for `read_parquet` / `read_csv`.
+    #[tokio::test]
+    async fn extract_plan_metrics_counts_datasource_exec_output_bytes() {
+        let path = parquet_file();
+        let ctx = SessionContext::new();
+        let plan = executed_scan(&ctx, path.to_str().unwrap()).await;
+        let m = extract_plan_metrics(&plan);
+        assert_eq!(m.rows_scanned, 1000);
+        assert!(m.bytes_scanned > 0, "decoded bytes: {}", m.bytes_scanned);
+        assert!(
+            m.physical_input_bytes > 0,
+            "fetched bytes: {}",
+            m.physical_input_bytes
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// `CoordinatorLocalScanExec` used to pass its child's metrics through,
+    /// so the walk counted the wrapped scan twice.
+    #[tokio::test]
+    async fn extract_plan_metrics_does_not_double_count_coordinator_local_scan() {
+        let path = parquet_file();
+        let ctx = SessionContext::new();
+        let plain = extract_plan_metrics(&executed_scan(&ctx, path.to_str().unwrap()).await);
+
+        let df = ctx
+            .read_parquet(path.to_str().unwrap(), ParquetReadOptions::default())
+            .await
+            .expect("read_parquet");
+        let scan = df.create_physical_plan().await.expect("plan");
+        let wrapped: Arc<dyn ExecutionPlan> = Arc::new(CoordinatorLocalScanExec::new(scan, "test"));
+        datafusion::physical_plan::collect(Arc::clone(&wrapped), ctx.task_ctx())
+            .await
+            .expect("collect");
+        let m = extract_plan_metrics(&wrapped);
+        assert_eq!(m.rows_scanned, plain.rows_scanned);
+        assert_eq!(m.bytes_scanned, plain.bytes_scanned);
+        assert_eq!(m.physical_input_bytes, plain.physical_input_bytes);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// In-memory sources are `DataSourceExec` too, but not scans.
+    #[tokio::test]
+    async fn extract_plan_metrics_ignores_memory_sources() {
+        let ctx = SessionContext::new();
+        let df = ctx
+            .sql("SELECT * FROM (VALUES (1), (2)) v(x)")
+            .await
+            .unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
+            .await
+            .unwrap();
+        assert_eq!(extract_plan_metrics(&plan).bytes_scanned, 0);
     }
 }

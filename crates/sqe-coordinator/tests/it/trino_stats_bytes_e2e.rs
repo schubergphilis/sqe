@@ -84,6 +84,30 @@ async fn last_stats(base_url: &str, sql: &str) -> serde_json::Value {
     body["stats"].clone()
 }
 
+/// Start the Trino endpoint on a free port; returns its base URL.
+async fn start_server(
+    session: &sqe_core::Session,
+    handler: &Arc<sqe_coordinator::QueryHandler>,
+) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    drop(listener);
+    let node = sqe_trino_compat::server::NodeContext {
+        version: "test".to_string(),
+        ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        started_at: std::time::Instant::now(),
+    };
+    let _server = sqe_trino_compat::server::start_trino_server(
+        Arc::new(FixedAuth(session.clone())),
+        Arc::new(StreamingQuery(Arc::clone(handler))),
+        port,
+        node,
+        None,
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    format!("http://127.0.0.1:{port}")
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:polaris"]
 async fn trino_stats_report_the_bytes_a_select_read() {
@@ -113,23 +137,7 @@ async fn trino_stats_report_the_bytes_a_select_read() {
         .expect("Int64")
         .value(0) as u64;
 
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    drop(listener);
-    let node = sqe_trino_compat::server::NodeContext {
-        version: "test".to_string(),
-        ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        started_at: std::time::Instant::now(),
-    };
-    let _server = sqe_trino_compat::server::start_trino_server(
-        Arc::new(FixedAuth(session.clone())),
-        Arc::new(StreamingQuery(Arc::clone(&handler))),
-        port,
-        node,
-        None,
-    );
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    let base_url = format!("http://127.0.0.1:{port}");
+    let base_url = start_server(&session, &handler).await;
 
     let stats = last_stats(&base_url, &format!("SELECT * FROM {t}")).await;
     let physical = stats["physicalInputBytes"]
@@ -150,4 +158,43 @@ async fn trino_stats_report_the_bytes_a_select_read() {
     let _ = handler
         .execute(&session, &format!("DROP TABLE IF EXISTS {t}"), None)
         .await;
+}
+
+/// File TVFs scan through DataFusion's `DataSourceExec`, which the stats
+/// walk did not count as a scan: `read_parquet` reported 0 bytes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn trino_stats_report_bytes_for_read_parquet() {
+    use arrow_array::{RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+
+    let (session, handler) = crate::common::setup_handler().await;
+    let handler = Arc::new(handler);
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("stats.parquet");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("s", DataType::Utf8, false),
+    ]));
+    let ids: Vec<i64> = (1..=5000).collect();
+    let names: Vec<String> = ids.iter().map(|i| format!("row-{i}")).collect();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(names)),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&path).expect("create parquet");
+    let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema, None).expect("ArrowWriter");
+    writer.write(&batch).expect("write");
+    writer.close().expect("close");
+
+    let base_url = start_server(&session, &handler).await;
+    let sql = format!("SELECT * FROM read_parquet('{}')", path.display());
+    let stats = last_stats(&base_url, &sql).await;
+    let processed = stats["processedBytes"].as_u64().expect("processedBytes");
+    assert!(processed > 0, "processedBytes is 0: {stats}");
+    assert_eq!(stats["processedRows"], 5000);
 }
