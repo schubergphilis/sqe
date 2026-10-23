@@ -138,7 +138,10 @@ fn find_from(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
 /// placeholder count differs from the number of bound values, mirroring a JDBC
 /// `SQLException` rather than executing with a partial bind. Each value in
 /// `params` is inserted verbatim, so callers must pass already-quoted SQL
-/// literals (e.g. `'foo'`, `42`, `DATE '2020-01-01'`).
+/// literals (e.g. `'foo'`, `42`, `DATE '2020-01-01'`). The one exception is a
+/// literal starting with `-`, which goes in parenthesized: `1-?` bound to `-5`
+/// would otherwise read `1--5`, a line comment that swallows the rest of the
+/// line (and with it any predicate after the placeholder).
 pub fn substitute_placeholders(sql: &str, params: &[String]) -> Result<String, String> {
     let offsets = placeholder_offsets(sql);
     if offsets.len() != params.len() {
@@ -152,7 +155,13 @@ pub fn substitute_placeholders(sql: &str, params: &[String]) -> Result<String, S
     let mut last = 0usize;
     for (offset, literal) in offsets.iter().zip(params) {
         out.push_str(&sql[last..*offset]);
-        out.push_str(literal);
+        if literal.starts_with('-') {
+            out.push('(');
+            out.push_str(literal);
+            out.push(')');
+        } else {
+            out.push_str(literal);
+        }
         last = offset + 1;
     }
     out.push_str(&sql[last..]);
@@ -274,6 +283,20 @@ mod tests {
         let sql = "SELECT 'it''s ?', ?";
         let out = substitute_placeholders(sql, &["1".into()]).unwrap();
         assert_eq!(out, "SELECT 'it''s ?', 1");
+    }
+
+    /// `1-?` bound to `-5` must not become `1--5`, a line comment that drops
+    /// the predicate after it.
+    #[test]
+    fn substitute_placeholders_parenthesizes_negative_literals() {
+        let sql = "DELETE FROM t WHERE a = 1-? AND b = ?\nAND c = 1";
+        let out = substitute_placeholders(sql, &["-5".into(), "-2.5".into()]).unwrap();
+        assert_eq!(
+            out,
+            "DELETE FROM t WHERE a = 1-(-5) AND b = (-2.5)\nAND c = 1"
+        );
+        assert_eq!(placeholder_offsets(&out), Vec::<usize>::new());
+        assert!(!out.contains("--"));
     }
 
     #[test]
