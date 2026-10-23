@@ -13,7 +13,28 @@ from dbt.adapters.contracts.connection import (
     Credentials,
 )
 from dbt.adapters.sql import SQLConnectionManager
+from dbt_common.clients.agate_helper import Integer, Number
 from dbt_common.exceptions import DbtDatabaseError, DbtRuntimeError
+
+
+def _agate_type(arrow_type: pyarrow.DataType) -> agate.DataType:
+    """The agate type for an Arrow column, taken from the schema.
+
+    agate's own inference reads a 0/1 integer column as Boolean and a string
+    column of digits ("001") as Number; the Arrow type already says which it is.
+    """
+    t = pyarrow.types
+    if t.is_boolean(arrow_type):
+        return agate.Boolean()
+    if t.is_integer(arrow_type):
+        return Integer()
+    if t.is_floating(arrow_type) or t.is_decimal(arrow_type):
+        return Number()
+    if t.is_date(arrow_type):
+        return agate.Date()
+    if t.is_timestamp(arrow_type):
+        return agate.DateTime()
+    return agate.Text()
 
 
 @dataclass
@@ -266,23 +287,10 @@ class SQEConnectionManager(SQLConnectionManager):
         """
         table = cursor.fetch_arrow_table()
 
-        if table.num_rows == 0:
-            # agate needs one type per name; there are no values to infer from.
-            names = [field.name for field in table.schema]
-            return agate.Table(rows=[], column_names=names, column_types=[agate.Text()] * len(names))
-
-        columns = {}
-        for i, field in enumerate(table.schema):
-            col = table.column(i)
-            columns[field.name] = col.to_pylist()
-
-        num_rows = table.num_rows
+        names = [field.name for field in table.schema]
+        types = [_agate_type(field.type) for field in table.schema]
         if limit:
-            num_rows = min(num_rows, limit)
-
-        rows = []
-        col_names = list(columns.keys())
-        for i in range(num_rows):
-            rows.append([columns[name][i] for name in col_names])
-
-        return agate.Table(rows=rows, column_names=col_names)
+            table = table.slice(0, limit)
+        # By position: a dict keyed on name dropped a repeated column name.
+        rows = [list(row) for row in zip(*(col.to_pylist() for col in table.columns))]
+        return agate.Table(rows=rows, column_names=names, column_types=types)
