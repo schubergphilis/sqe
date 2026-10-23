@@ -378,12 +378,8 @@ pub fn extract_incremental_spec(sql: &str) -> Result<(String, Vec<IncrementalSpe
                 let (end_id, consumed_end) = parse_integer_token(&sql[after_and_kw..])?;
                 cursor = after_and_kw + consumed_end;
 
-                if start_id > end_id {
-                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                        "FOR INCREMENTAL BETWEEN SNAPSHOT {start_id} AND SNAPSHOT {end_id}: start must be older than end"
-                    )));
-                }
-
+                // No `start_id > end_id` check: snapshot ids are random, not
+                // ordered. The resolver orders the pair by the parent chain.
                 specs.push(IncrementalSpec {
                     table,
                     start: start_id,
@@ -546,14 +542,11 @@ mod tests {
     }
 
     #[test]
-    fn incremental_rejects_descending_range() {
+    fn incremental_accepts_a_numerically_descending_pair() {
+        // Snapshot ids are random: the older snapshot may hold the larger id.
         let input = "SELECT * FROM t FOR INCREMENTAL BETWEEN SNAPSHOT 102 AND SNAPSHOT 100";
-        let err = extract_incremental_spec(input).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("start must be older than end"),
-            "unexpected error: {msg}"
-        );
+        let (_sql, specs) = extract_incremental_spec(input).unwrap();
+        assert_eq!((specs[0].start, specs[0].end), (102, 100));
     }
 
     #[test]
