@@ -4,7 +4,176 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+## [0.52.0] — 2026-10-23
+
 ### Added
+
+- `[metrics.audit] omit_query_text` and `omit_actor_identity` keep the SQL text, the actor email and the roles out of the audit log
+
+    With `omit_query_text = true` no native or OCSF record holds statement text: `query_hash`, `statement_type` and the text's byte length (`query.text_len`, OCSF `unmapped.query_text_len`) stay. The legacy path for secret-bearing statements honours it too. `omit_actor_identity = true` drops the actor's `email` and `roles` and keeps the username and subject. Both apply before the record is chained, so the chain verifies and OCSF `metadata.uid` still equals the native `integrity.hash`. Both default to false.
+
+- `delete_ratio_threshold`: compaction rewrites a data file once its deleted rows reach a share of its rows
+
+    `CALL system.rewrite_data_files(..., delete_ratio_threshold => 0.3)`,
+    `[maintenance.compaction] delete_ratio_threshold` and the table property
+    `sqe.maintenance.compaction.delete-ratio-threshold` mark a data file as
+    delete-heavy when its deleted rows are at least that share of its rows.
+    On a format-version 3 table each data file has at most one deletion
+    vector, so `delete_file_threshold` (a count of delete files) never passes
+    1 there; the share counts the deletion vector's cardinality, and V2
+    position delete files written for one data file. Equality deletes are not
+    counted. A file meeting either threshold is rewritten, and `table_health`
+    reports both in `delete_heavy_files`. Off by default; the value must be
+    greater than 0 and at most 1.
+
+- `DROP POLICY [IF EXISTS] ON TABLE <t> FROM USER | ROLE | GROUP <name>` removes one grantee's column masks and row filter on a table
+
+    Masks and row filters written by `GRANT SELECT ... MASKED WITH / ROWS WHERE` belong to the grantee and the table. `REVOKE` leaves them, because the grantee may still read the table another way. A later plain `GRANT SELECT` therefore reads through them again. This statement is the explicit way to remove them. It is admin-only and leaves the privilege and other grantees' items alone. It edits only the `sqe-grant-*` policies SQE created, deleting one that ends up with no items. A mask or filter policy written by hand in Ranger is never edited, even if it names the grantee.
+
+- `CALL system.drop_table(table => 'ns.t', purge => true)` deletes the table's files (#836)
+
+    It used to return "not yet implemented". After the catalog drop, SQE
+    deletes everything under the table's location with the caller's own
+    storage credentials, synchronously, and writes an `AdminDdl` audit
+    event. It does not use the REST catalog's purge flag, which in Polaris
+    needs `DROP_WITH_PURGE_ENABLED` and deletes later with the catalog's
+    credentials. Before dropping anything it refuses when `gc.enabled` is
+    false, the location is a bucket root, a write path or the metadata file
+    sits outside the location, or another table in the catalog shares the
+    location (for example a second identifier from `register_table`). The
+    result gains a `purge` column; `status` is `dropped` or `purged`. SQL
+    `DROP TABLE ... PURGE` is unchanged.
+
+- `GRANT SELECT ... MASKED WITH (col = expr, ...)` and `... ROWS WHERE expr` attach column masks and a row filter to a grant
+
+    The syntax was documented but never parsed. It now writes Ranger policies on the resource service (`[policy] engine = "ranger"`). Ranger allows one mask policy per column and one row-filter policy per table, so each grantee gets its own item in that one policy. A repeated GRANT replaces that grantee's item and puts it first. `REVOKE` leaves the masks and row filter in place: the grantee may still read the table through a wider grant, and lifting the mask would show it the real values. Admin-only, `SELECT` without a column list, one schema-qualified table, one grantee. Ranger policies written by hand with wildcards or value lists are never edited.
+
+- Read Iceberg V3 GEOMETRY / GEOGRAPHY columns (#863)
+
+    The vendored iceberg-rust gains the upstream geospatial types (apache
+    `697abcee`) and the read support from apache/iceberg-rust #3341. A
+    geospatial column reads as WKB bytes (Arrow `LargeBinary` tagged
+    `geoarrow.wkb`); `information_schema` reports it as `varbinary` with
+    `udt_name` `geometry` / `geography`. Verified against a table written by
+    Spark 4.1 + Iceberg 1.12. A predicate on a geospatial column is never
+    pushed into the scan (no bounding-box pruning). Writes into a table with a
+    geospatial column fail with `NOT_SUPPORTED`, and `CREATE TABLE` with a
+    `GEOMETRY` column is still refused. Matrix 150/162 -> 152/162 (93.8%).
+
+- `ALTER TABLE ... SET | DROP IDENTIFIER FIELDS`: SQE can declare an Iceberg table's row key itself
+
+    Merge-on-read UPDATE and MERGE write equality deletes only on a table with identifier fields; without them they fall back to copy-on-write. SQE had no way to declare them, so a table needed Spark first, and the `write.identifier-field-ids` / `identifier_field_ids` table properties some tests used were never read: those tests ran copy-on-write. The new statement takes Spark's syntax (parentheses optional, `s.x` for a struct member), commits a new schema with the same fields, and reuses an existing schema when the set returns to an earlier one. A nullable, floating-point or unknown column is refused, and so is a DROP of a column that is not an identifier field. The four tests that set the dead property now use the DDL and assert `added-equality-delete-files`.
+
+- `ALTER COLUMN ... SET DATA TYPE` promotes a list element or a map value (#869)
+
+    A nested field is named with a dotted path: `l.element` for a list
+    element, `m.value` for a map value, and the path can continue into a
+    struct inside them (`m.value.f`). Field ids are kept, files written
+    before the change read as the new type in SQE and in Spark, and a map
+    key is refused because Iceberg never lets it change type.
+
+- `ALTER COLUMN s.a SET DATA TYPE` promotes a struct member (#859)
+
+    A dotted column path now changes the type of a field inside a struct,
+    with the same promotions as a top-level column (`INT` to `BIGINT`,
+    `REAL` to `DOUBLE`, a wider `DECIMAL` precision, `UNKNOWN` to any
+    primitive type). The member keeps its Iceberg field id, so rows written
+    before the change read as the new type in SQE and in Spark. A list
+    element or map value cannot be changed yet.
+
+- Shredded variant writes with `write.parquet.shred-variants` (#858)
+
+    A table that sets `write.parquet.shred-variants = true` now gets
+    shredded variant columns, as Spark and Iceberg Java write them. Each
+    data file infers its shredding from its first batch: object fields with
+    one integer, double, string, boolean or date type in every row (also in
+    nested objects, at most 64), or the whole value when every row is one
+    such type, go to `typed_value`. A row that is not an object, or whose
+    field has another type, is written to the residual `value`, so no value
+    changes type. Spark 4.1 + Iceberg
+    1.12 reads the files, and `rewrite_data_files` keeps the shredding.
+    Only top-level variant columns are shredded, and reads still unshred.
+
+- `VARIANT` columns (Iceberg V3) (#849)
+
+    `CREATE TABLE t (id BIGINT, v VARIANT)` creates a format-version 3
+    table with an Iceberg variant column, as do CTAS from a variant column
+    and `CREATE TABLE ... LIKE`. A string written to the column is parsed
+    as JSON (`'{"a": 1}'` is an object, `'"text"'` a JSON string); invalid
+    JSON fails the write rather than storing NULL. Values read back as JSON
+    text: the Trino protocol types the column `json`, Flight SQL returns a
+    string, and `DESCRIBE` / `information_schema` report `variant`.
+    `ALTER TABLE ... ADD COLUMN v VARIANT` is refused on a V2 table.
+    Existing JSON-as-string columns are not converted; Iceberg does not
+    allow evolving `string` to `variant`, so copy them with
+    `INSERT INTO <variant table> SELECT ...`.
+
+- `JSON` columns are Iceberg variants on format-version 3 tables (#849)
+
+    On a V3 table a `JSON` column, also inside `STRUCT` / `ROW`, is stored
+    as `VARIANT`; on a V1 / V2 table it stays a string. `CREATE TABLE` is
+    V3 when it has a V3-only column, when it asks for it with
+    `WITH ('format-version' = '3')`, Trino's `WITH (format_version = 3)` or
+    `TBLPROPERTIES`, or when `default_table_format_version = 3`.
+    `ALTER TABLE ... ADD COLUMN c JSON` on a V3 table adds a variant. The
+    `json*` functions (`json_extract`,
+    `json_extract_scalar`, `json_get_*`, ...) take a variant as its JSON
+    text, so queries read a V3 variant column like a V2 string column.
+
+- Table maintenance as the table's writer, a dry run and age floor for `remove_orphan_files`, session-catalog and nested-namespace table names in `CALL`
+
+    `expire_snapshots` no longer needs an admin role. It is a table write: SQE lets it through unless the session is explicitly read-only, and the real gate is the catalog commit made with the caller's own token, so a reader's call fails and leaves every snapshot in place. A role name that looks read-only is only a heuristic. `remove_orphan_files(..., dry_run => true)` lists the files it would delete (`action = 'would_delete'`) and deletes nothing; it needs read access only. A deleting `remove_orphan_files` stays admin, because it deletes from storage with no commit for the catalog to refuse, and it now refuses an `older_than` newer than `now - [maintenance].orphan_min_age_secs` (default 86400, one day). A table name without a catalog in a `CALL` resolves in the session's catalog (`X-Trino-Catalog`, the Flight SQL catalog), as a `SELECT` does, instead of the configured default warehouse. A name with four or more parts is a catalog, a nested namespace and a table: `cat.a.b.t` is table `t` in namespace `a.b`. The maintenance scheduler also keeps nested namespaces, where it used to read `a.b.t` as catalog `a`.
+
+- Trino `/v1/statement` reports `physicalInputBytes` and `processedBytes`
+
+    The last page of a statement now carries the bytes it read: `physicalInputBytes` is what the scans fetched from storage (Parquet footers, pages and delete files), and `processedBytes` is the decoded size of the rows the scans produced. Earlier pages and statements without a table scan report 0. A scan that runs on workers reports the file bytes its fragments were assigned as `physicalInputBytes`, not the bytes the workers fetched, so a projection or row-group pruning on a worker is not reflected.
+
+- `variant_get(v, '$.path', 'type')` and `try_variant_get` read a typed field of a VARIANT column (#857)
+
+    The field is read straight from the variant encoding with arrow's `variant_get` kernel, not through the value's JSON text as the `json*` functions do. The path is `$` followed by `.field`, `['field']` or `[index]` steps. The type is a Spark/SQL name (`int`, `bigint`, `double`, `decimal(p,s)`, `string`, `date`, `timestamp`, ...); without one the result is a variant. A missing path is NULL. A value that does not convert is an error for `variant_get` and NULL for `try_variant_get`, as in Spark. `rewrite_data_files` on a variant table is now covered by a test and keeps every value. Iceberg matrix `variant-type:v3` moves to full (148/162).
+
+- SQE Playground: DataFusion compiled to WebAssembly, running SQL in a browser tab with no server
+
+    `playground/` reads parquet and CSV over HTTP or S3 and copy-on-write Iceberg tables from a `metadata.json` URL, with a hand-written Iceberg read path because iceberg-rust cannot build for wasm32. Results stop at 2,000 rows and the scan is cancelled there, so `SELECT *` without a `LIMIT` on a large remote file returns at once. The crate is outside the cargo workspace and no CI job builds it, though its lockfile is in the SBOM and the license gate (its license comes from `playground/Cargo.toml` via `AIKIDO_SBOM_LICENSE_MANIFESTS`); `playground/README.md` has the build, the tests and the CORS requirements a data host must meet.
+
+- `query.max_cartesian_rows` refuses a read whose cross join or nested-loop join would compare more row pairs than the cap (#755)
+
+    Every join runs on the coordinator, which all tenants share. Memory
+    admission bounds a join's build side, but a cross join or a join with
+    no equal-key condition can hold a core until the query timeout. The new
+    `CartesianAdmissionRule` multiplies the two inputs' row-count statistics
+    at plan time and refuses the query with a resource error that names the
+    cap, never the estimates. Default 10,000,000,000; an input without
+    statistics is admitted; `0` turns the gate off. Equi-joins, aggregations
+    and the write path are not gated.
+
+- Integration tests for file table functions under a staging-only prefix
+
+    `read_csv` and `read_json` read a workspace's staging path with the `[storage]` key under `allow_inline_credentials = false`, and the same file outside `allowed_object_store_prefixes` is an error that names the setting, never 0 rows (`read_parquet` was already covered). A Ranger test pins how row filters reach file table functions: by the scan name (`read_csv()`), not the path, so a filter on `read_csv()` applies to every CSV file the user reads and not to the same rows read with `read_json`.
+
+- Iceberg V3 `unknown` columns
+
+    `CREATE TABLE t (id INT, u UNKNOWN)` (or Spark's spelling, `VOID`)
+    declares an all-NULL column of the V3 `unknown` type, and
+    `ALTER TABLE ... ALTER COLUMN u SET DATA TYPE <type>` promotes it.
+    SQE reads a Spark-written `VOID` column as NULLs, and files written
+    before a promotion read typed NULLs. As the spec requires, an unknown
+    column is never written to a data file, so Spark reads SQE's files.
+    An unknown field nested in a struct, list or map is not supported yet:
+    SQE refuses to write one.
+
+- Reading shredded Iceberg V3 variants
+
+    Spark with `write.parquet.shred-variants=true` stores a variant with a
+    `typed_value` group beside `value`. SQE now folds it back into the
+    variant on every read path (coordinator direct read, the iceberg-rust
+    reader and workers), so a shredded table reads the same JSON text as an
+    unshredded one. Variant manifest bounds no longer fail manifest loading.
+    SQE still writes unshredded variants.
+
+- The embedded `sqe-cli` passes a variant to the `json*` functions as its
+  JSON text, as the coordinator does, so `json_get_int(doc, ...)` works on a
+  V3 `JSON` column there too (#849)
 
 - Audit log rotation that keeps the hash chain (#838)
 
@@ -28,6 +197,156 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- Debug builds are ~2x faster: incremental compilation is off and there is one canonical dev command
+
+    `incremental = false` in `[profile.dev]` and `[profile.test]`. An edit in `sqe-core` recompiles ~15 crates from scratch, so the incremental cache never amortises its own bookkeeping: measured on an M3 Pro (2026-10-19, DataFusion 55.2), `sqe-core` -> `sqe-server` is 1m21 instead of 2m50, and a leaf edit in `sqe-server` is 23s instead of 32s. It also removes the 21 GB `target/debug/incremental` tree. `CARGO_INCREMENTAL=1` still turns it back on per invocation.
+
+    Adds `cargo dev` (identical to `make dev`), `cargo dev-server`, `cargo check-server` and `make check-server`. Cargo keys artifacts on the exact feature set, so alternating between `cargo build`, `make dev` and `cargo clippy --all-features` kept a separate copy of the whole dependency graph each (86 fingerprints for `sqe-core` alone, 128 GB of `target/` on one machine). `CLAUDE.md` now documents the single dev loop.
+
+- `make dev-fast`: opt-in rebuild loop that is ~2x faster than `make dev`
+
+    `scripts/dev-fast.sh` (also `make dev-fast`) builds `sqe-server` on the
+    nightly parallel frontend (`-Zthreads=8`) and, for the workspace crates,
+    the cranelift codegen backend. Measured on an M3 Pro / 36 GB (2026-10-19,
+    DataFusion 55.2), warm cache, `CARGO_INCREMENTAL=0`: a `sqe-core` edit
+    takes 31-36s instead of 1m18s, a `sqe-coordinator` edit 20s, and a cold build
+    2m41s instead of 4m11s. `sqe-core`, `opendal` and `ctor` stay on LLVM
+    because they use `#[ctor]`, which cranelift cannot compile (`asm!` sym
+    operands, plus the `section$start$`/`section$end$` Mach-O symbols it does
+    not emit, which break the final link). Artifacts go to `target/fast`, so
+    the stable cache in `target/debug` is untouched, and the profile overrides
+    live in `.cargo/fast.toml`, which only this script loads: stable builds,
+    CI and the Docker build never see the unstable `codegen-backend` key. The
+    binaries are a compile-time optimisation for the inner loop only - never
+    ship, release or benchmark them; `make dev` stays the reference build.
+
+- Dependency refresh: DataFusion 55.2, arrow 59.3.1, AWS SDK and other patch releases
+
+    DataFusion 55.1 enabled serde_json's `preserve_order` feature for the whole build and 55.2 no longer does. The workspace now enables it itself, so JSON objects keep their insertion order as before.
+
+- CHANGELOG entries are written as `changelog.d/` fragments and folded in at release
+
+    Merge requests no longer edit `CHANGELOG.md`; each adds
+    `changelog.d/<branch-slug>.md`, and `scripts/release.sh` folds the
+    fragments into `[Unreleased]` with `scripts/changelog-collect.py`. Open
+    merge requests no longer conflict on the top of the `[Unreleased]` lists.
+
+- The Iceberg matrix pages score every engine on the same rubric cells (#855)
+
+    `scripts/render-iceberg-matrix-compare.py` reads upstream's per-platform layout, scores all 36 upstream entries on the 54 cells SQE is scored on (max 162), and pins the rubric and peer scores in `docs/evidence/iceberg-matrix-rubric.json`. `scripts/render-iceberg-matrix.py` renders from that snapshot offline: the peer table no longer mixes /162 with /189, rows follow the rubric (Deletion Vectors, Unknown Type and Google Lakehouse were missing; dropped features are gone), and every open cell is listed with its caveats. The book's score reads 150/162 (92.6%).
+
+- The Iceberg matrix state is rescored against the current upstream rubric:
+  144/162 (88.9%). Only cells that apply to a format version count, removed
+  features are dropped, and deletion vectors, row lineage and unshredded
+  VARIANT on V3 are new gains. The old 167/189 used a rubric that is no
+  longer comparable.
+
+- Blog: "JSON columns are variants now", on V3 variant storage, Spark interop and shredded reads
+
+    The book no longer says shredded variant files are unsupported
+    (`sql-reference/ddl.md`, `features/iceberg.md`). The dlt blog post's
+    ADBC example passes `autocommit=True`, which its DML needs.
+
+- New tables are Iceberg format-version 3 by default (#849)
+
+    `catalog.default_table_format_version` now defaults to 3, so a plain
+    `CREATE TABLE t (doc JSON)` stores a variant. Trino < 481, Spark < 4.0
+    and Iceberg < 1.10 cannot read a V3 table: set
+    `default_table_format_version = 2`, or create the table
+    `WITH ('format-version' = '2')`, where those readers share the tables.
+    Existing tables keep their version. The quickstarts and test configs
+    use 3; the Spark interop stack moves to Spark 4.1 with Iceberg 1.12 and
+    the Ranger quickstart's Spark 3.5 to Iceberg 1.12, both V3 readers.
+
+- `CREATE TABLE` refuses a `format-version` other than 1, 2 or 3, and
+  refuses format-version 1 or 2 on a table with a V3-only column (variant,
+  nanosecond timestamp, DEFAULT) instead of creating a table whose
+  properties contradict its metadata.
+
+- Unknown lists, maps and all-unknown structs measured against Iceberg Java (#859)
+
+    `ARRAY<UNKNOWN>`, a map with an unknown value and a struct whose members
+    are all unknown can be declared and read, and SQE refuses to write a row
+    to them. Iceberg Java (Spark 4.1 + Iceberg 1.12) refuses the same writes,
+    because Parquet has no column for them; a test now asserts both. The
+    Iceberg matrix `unknown-type` cell moves to full.
+
+- Pre-commit hooks check Rust formatting, the supply chain, shell scripts, and clippy
+
+    Besides gitleaks and the file checks, a commit now runs a rustfmt
+    ratchet on staged `.rs` files: it fails on formatting drift that HEAD
+    does not already have, so the existing drift does not block commits.
+    Staging `Cargo.toml`, `Cargo.lock`, `deny.toml` or `.cargo/audit.toml`
+    runs the lockfile, `cargo hakari`, `cargo deny` and `cargo audit` checks;
+    a changed crate manifest also runs `cargo machete`. shellcheck runs at
+    warning severity, and clippy (warnings denied) runs at pre-push.
+    The whole tree passes every hook, so `make pre-commit-all`
+    (`pre-commit run --all-files`, both stages) is a usable gate: the
+    whitespace fixers skip generated output (benchmark reports, captured
+    plans, rendered diagrams, test data, the vendored mermaid bundle).
+    Re-run `pre-commit install` to add the pre-push hook.
+
+- `DROP TABLE ... PURGE` on an Iceberg table now deletes the table's data files (#841)
+
+    **Behaviour change.** Before, the statement removed the table from the
+    catalog, left every data file in storage and reported success. It now
+    runs the same purge as `CALL system.drop_table(table => ..., purge =>
+    true)`: the catalog drop, then every file under the table's location.
+    Like the CALL, it needs an admin role (`auth.admin_roles`, default
+    `service_admin` and `catalog_admin`); a caller without one is refused
+    with `AccessDenied` and nothing is dropped, so a job that ran
+    `DROP TABLE ... PURGE` under a non-admin role now fails instead of
+    keeping the files. It is also refused, with nothing dropped, when
+    another table shares the location. `DROP TABLE` without `PURGE` is
+    unchanged, the dbt-sqe adapter never sends `PURGE`, and Hive tables
+    still refuse it.
+
+- `to_iso8601` on a timestamp without a zone no longer ends in `Z`
+
+    `to_iso8601(TIMESTAMP '2024-01-02 03:04:05')` returned
+    `2024-01-02T03:04:05.000Z` and now returns `2024-01-02T03:04:05`, as
+    Trino does: the `Z` claimed UTC for a value that has no zone. The
+    fraction appears only when it is non-zero (`.123`, `.123456`), where
+    Trino pads to the column's declared precision, so a stored
+    `timestamp(6)` column still differs from Trino by its trailing zeros.
+    Queries, dbt models or views that compare these strings, or expect the
+    `Z`, see different text. Zoned timestamps are unchanged.
+
+- `to_json(NULL)` returns SQL NULL instead of the text `null`
+
+    Trino's `CAST(NULL AS JSON)` is NULL, and `CAST(x AS JSON)` is
+    rewritten to `to_json(x)`, so a NULL input now stays NULL. Queries
+    that compared the result with `'null'` see NULL instead. A NULL
+    nested in an array, map or row is still written as `null`.
+
+- `json_parse` and `JSON '...'` literals return Trino's canonical text
+
+    Output is compact with object keys sorted at every level:
+    `json_parse('{"b": 1, "a": 2}')` returns `{"a":2,"b":1}`, where it
+    kept the input's key order. A `JSON '<text>'` literal is now read as
+    `json_parse('<text>')`, so it comes back canonical too instead of
+    verbatim; a malformed literal gives the text `null` (Trino raises an
+    error).
+
+- Integration tests cover Iceberg tags (create, read with FOR VERSION AS OF,
+  drop) and branch writes on a format-version 3 table (#865)
+
+- Spark 4.1 with Iceberg 1.12 now reads back what SQE's merge-on-read writes
+  leave behind: V2 position deletes, V3 deletion vectors, equality deletes
+  from keyed DELETE, UPDATE and MERGE on V2 and V3, and V3 row lineage. Each
+  test checks the snapshot summary first, so a copy-on-write fallback cannot
+  pass. The Iceberg matrix cites these tests in place of the empty stub
+  tests it used to cite, and its cross-engine caveats are gone (#853, #855).
+
+- `delete_file_threshold` above 1 no longer fires on SQE's own deletes on
+  format-version 3 tables (#849)
+
+    On V3 position deletes are deletion vectors: each data file has at most
+    one, replaced on every `DELETE`. `rewrite_data_files(delete_file_threshold
+    => N)` and the scheduler's `delete_file_threshold` count delete files, so
+    for N > 1 they only see equality deletes. Use `rewrite_all => true` or a
+    threshold of 1 on a delete-heavy V3 table.
+
 - Light reads run while coordinator memory is red (#788)
 
     At red (>95% of the pool used) every statement was refused with
@@ -42,7 +361,511 @@ All notable changes to SQE are documented in this file.
     session and transaction control) is still refused at red.
     `pressure_admission_memory = "0"` restores the old refusal.
 
+### Removed
+
+- The unused multi-endpoint result builder in the Flight SQL service
+
+    `build_flight_info_distributed` and `QueryResultLocation` described
+    results fetched straight from workers, but nothing called them, and
+    they could never apply: workers only scan, and every join, aggregate
+    and sort runs on the coordinator, so a final result lives only there.
+    Results stay one stream from the coordinator (#810).
+
 ### Fixed
+
+- `sqe-core` no longer dev-depends on `sqe-trino-functions`
+
+    The `variant_json_args` test moved to
+    `crates/sqe-trino-functions/tests/it/variant_json_args_test.rs`. The
+    dependency pointed from the base crate back up at a crate that depends on
+    it, so every test build of `sqe-core` also compiled `sqe-trino-functions`
+    and `datafusion-functions-json`. Only the dev edge existed, so this does
+    not change build times; it removes a cycle from the graph that made
+    `cargo tree` and dependency tooling lie about layering.
+
+- The license gate passes again on `ctutils` 0.4.5
+
+    ctutils 0.4.5 (the RUSTSEC-2026-0385 fix) was published before deps.dev
+    indexed it, so the license check failed with "license evidence missing"
+    on main and every merge request. The shared CI pin moves to the aikido
+    revision that records its reviewed license for 0.4.x (Apache-2.0 OR MIT).
+
+- The direct Parquet read widens a `Binary` column to the table's
+  `LargeBinary` (and back), for files written without an Arrow schema such as
+  Spark's (#863)
+
+- Iceberg scans reported 0 output bytes
+
+    `IcebergScanExec` recorded only its output rows, so the audit record's `bytes_scanned`, `system.runtime.queries` and `EXPLAIN ANALYZE` showed 0 bytes for every Iceberg read. The scan now records output batches and bytes as DataFusion's own scans do.
+
+- The license gate passes again on `allocator-api2` 0.2.21
+
+    deps.dev has no record of the crate (it comes in through hashbrown),
+    so the license check could never find its license and failed with
+    "license evidence missing". The shared CI pin moves to the aikido
+    revision that records its reviewed license (MIT OR Apache-2.0).
+
+- The license gate passes again on base64, flatbuffers and lz4_flex
+
+    deps.dev has no record of base64 0.22.1 and 0.23.1, flatbuffers
+    25.12.19 or lz4_flex 0.14.0, so the license check reported "license
+    evidence missing" for each. The shared CI pin moves to the aikido
+    revision that records their reviewed licenses (base64: MIT OR
+    Apache-2.0, flatbuffers: Apache-2.0, lz4_flex: MIT).
+
+- Audit `flush()` returns only after the writer has rotated the file
+
+    The audit writer acknowledged a flush before its size check ran, and kept draining queued records into the file it was about to rotate. A record logged right after `flush()` could therefore land in the old generation, so a rotated file held more than its limit. The writer now stops draining at a flush and acknowledges it after rotation. `both_format_rotates_the_ocsf_file_at_the_same_generation` failed intermittently in CI because of this.
+
+- `make benchmark_sf<N>_trino` works under GNU make 3.81 (macOS)
+
+    make 3.81 takes the first matching pattern rule, so the plain
+    `benchmark_sf%` rule ran with scale `1_trino` and every suite failed to
+    load. The `_trino` rule now comes first. `scripts/benchmark-test.sh`
+    installs its cleanup as soon as the coordinator starts, so a failed
+    Trino start no longer leaves a coordinator on :60051, and it stops with
+    a `TRINO_PORT` hint when the Trino port is already taken.
+
+- The Ranger quickstart's `data-seed` finishes again, and every wait in the
+  access-control harnesses is bounded
+
+    Since results moved to `nextUri` pages (#767), a Trino `POST` never
+    reports `FINISHED`, so the seed's readiness probe (one `POST`, grep for
+    `FINISHED`) could never pass and looped forever. Each attempt also left
+    a statement holding 256 MB of the user's 1 GB budget until its 5-minute
+    idle eviction, so the loop kept the seed user at the limit. The probe
+    now follows `nextUri` to the end, every request has `--max-time`, and
+    readiness gives up after 60 attempts with the last response.
+    `make test-access-control-spark` started `spark` with its `data-seed`
+    dependency despite saying it does not, and `--wait` had no timeout, so
+    it hung for hours; it now starts `spark` with `--no-deps`, and every
+    `docker compose up --wait` in the access-control scripts has
+    `--wait-timeout`. The integration tests' `docker`, `spark-sql` and
+    `trino-cli` calls run through `output_with_timeout` and fail on expiry
+    instead of hanging the suite.
+
+- `Cargo.lock` on main parses again
+
+    The renovate merge `d7d1dea5` (2026-10-23) produced a lockfile with `borsh` 1.8.1 and `borsh-derive` 1.8.1 listed twice, the second `borsh-derive` pointing at a `syn 3.0.6` entry that does not exist. Every cargo command on main failed with "package `borsh` is specified twice in the lockfile". The stale pair is removed; `cargo metadata --locked` passes.
+
+- A quoted DEFAULT on a non-string column no longer crashes CREATE TABLE (#865)
+
+    `CREATE TABLE t (d DATE DEFAULT '2024-01-02')`, and the same on
+    TIMESTAMP, DECIMAL, BINARY or BIGINT columns or through
+    `ALTER TABLE ... ADD COLUMN`, stored the default as a string literal and
+    panicked in the metadata writer. The text is now parsed as the column's
+    type: timestamps take a space or `T`, timestamptz takes `Z` or no offset
+    as UTC, and a decimal must fit the column's precision and scale exactly.
+    A value that does not parse is an error. `DECIMAL DEFAULT 2` and
+    `BINARY DEFAULT X'01ab'` are accepted.
+- Binary, fixed and UUID column defaults are written on INSERT and MERGE
+  INSERT instead of being refused; a MERGE on such a table no longer fails
+  (#865)
+
+- dbt-sqe reads result columns with their Arrow types and takes a list `unique_key` (portal #42)
+
+    `run_query` and every other result dbt reads went through agate's type inference, which read a 0/1 integer column as Boolean (a model rendering it got `True`/`False`) and a string column of digits such as `"001"` as Number (`1`). The adapter now maps each column's agate type from the Arrow schema, and a repeated column name no longer drops a column. The `merge` and `delete+insert` incremental strategies took only a single-column `unique_key`: a list rendered as `['id', 'k']` into the SQL and failed to parse. Both now match on every key; a multi-key `delete+insert` deletes with `MERGE ... WHEN MATCHED THEN DELETE` inside the same transaction.
+
+- DELETE and UPDATE accept a correlated `EXISTS` subquery in the WHERE
+
+    `DELETE FROM t WHERE EXISTS (SELECT 1 FROM k WHERE k.id = t.id)`, its `NOT EXISTS` form and the same WHERE on UPDATE failed with "Physical plan does not support logical expression Exists". The WHERE was evaluated as an expression in a SELECT list, where DataFusion cannot decorrelate a subquery. It now runs as a WHERE clause that returns the positions of the matching rows, and UPDATE reads that verdict instead of evaluating the WHERE a second time. Row filters and column masks apply as before.
+
+- DELETE and UPDATE with `IN (subquery)` changed the wrong rows
+
+    Since v0.30.0 a `WHERE ... IN (SELECT ...)` or `NOT IN (SELECT ...)` in DELETE or UPDATE was evaluated through a join that returns the matched rows first, and the verdict was applied to the data file by position. `DELETE FROM t WHERE id IN (SELECT id FROM k)` with `k` holding id 2 deleted id 1, and a copy-on-write UPDATE overwrote the first row with the matched row's new values. Merge-on-read DELETE and UPDATE were affected the same way; literal `IN (...)` lists, scalar subqueries and MERGE were not. The evaluation now carries each row's position and orders by it, and fails the statement if the row count does not line up. Tables changed by such a statement on an affected release should be checked against their previous snapshot.
+
+- `EXECUTE ... USING` binds literals only, and a negative bound value no longer opens a `--` comment
+
+    `EXECUTE name USING ...` over the Trino HTTP API rendered any expression
+    back to SQL and spliced it into the template, so a function call or a
+    subquery ran as part of the statement. It now accepts numbers, strings,
+    booleans, `NULL`, typed literals (`DATE '...'`, `DECIMAL '...'`,
+    `TIMESTAMP '...'`), intervals and signed numbers, and refuses anything
+    else naming the parameter position. Both text binders (Trino `EXECUTE`
+    and Flight SQL prepared DML) put a negative value in parentheses: `1-?`
+    bound to `-5` used to read `1--5`, a line comment that dropped the rest
+    of the line, including any predicate after the placeholder. Flight SQL
+    binds NaN and infinity as `CAST('NaN' AS DOUBLE)` instead of a bare word
+    that parsed as a column name.
+
+- ADBC Flight SQL clients no longer refuse results with lists, structs
+  or constant columns with "inconsistent schema"
+
+    The schema a Flight SQL result announces and the one it streams
+    disagreed on nullability: for list items, for struct fields, and for
+    constants the planner had folded. Every column of a result is now
+    described as nullable on both sides, nested fields included. Map
+    entries and keys stay non-null, as the Arrow spec requires. The ADBC
+    driver compares the two schemas and refused the result when they
+    differed.
+
+- Arrow Flight SQL JDBC can now run `SHOW`, `DESCRIBE` and `EXPLAIN`
+  through a plain `Statement`
+
+    These statements used to announce no columns, and the driver read
+    that as an update with no result set ("Statement did not return a
+    result set"). They now announce their real columns. To learn the
+    columns, SQE runs the statement when the client asks for its
+    description, then runs it again when the client fetches the rows.
+    Only read-only statements are run this way, and the audit log
+    records both runs.
+
+- ADBC Flight SQL clients no longer refuse `SELECT 1 + 1`, `SHOW`,
+  `DESCRIBE` and `EXPLAIN` with "inconsistent schema"
+
+    The schema a Flight SQL result announces now matches the one it
+    streams. An unaliased expression column was announced as, for
+    example, `count(*)` but streamed as `_col0`, and `SHOW`, `DESCRIBE`
+    and `EXPLAIN` announced no columns while sending some. The ADBC
+    driver checks the two and refused the result. Aliased queries were
+    not affected. A statement whose columns are only known when it runs
+    now announces no schema, and the client takes the stream's.
+
+- Iceberg spec bloom keys are honoured on write (#856)
+
+    `write.parquet.bloom-filter-enabled.column.<col>` and
+    `write.parquet.bloom-filter-fpp.column.<col>`, the names Spark and other
+    Iceberg writers set, now drive SQE's Parquet bloom filters next to SQE's
+    own `write.parquet.bloom-filter-columns` / `-fpp` / `-auto`. `true` adds a
+    column, `false` removes it even when auto-detection picked it, and a
+    per-column fpp outside (0, 1) falls back to the table default instead of
+    panicking the writer. Struct members (`s.x`) get a bloom on their nested
+    Parquet path; list and map members are skipped, and
+    `write.parquet.bloom-filter-max-bytes` is ignored. Before, a table
+    configured by Spark silently got no blooms from SQE writes.
+
+- Iceberg V3 `unknown` struct members are read and written (#859)
+
+    A `STRUCT<a INT, u VOID>` column, also as a list element, used to be
+    refused on write, and SQE could not read a Spark table with one. The
+    parquet writer now leaves every `unknown` field out of the data file at
+    any depth, as the spec requires, and the coordinator scan and the worker
+    put the missing members back as NULLs. Spark 4.1 + Iceberg 1.12 reads
+    SQE's rows and SQE reads Spark's. An `unknown` list element, an
+    `unknown` map key or value, and a struct whose members are all
+    `unknown` are still refused on write.
+
+- Iceberg read correctness fixes from upstream iceberg-rust
+
+    The vendored iceberg-rust picks up 18 apache fixes and 2 RisingWave
+    fixes. Page-index pruning no longer drops rows for INT32/INT64
+    decimals, and it now prunes FIXED_LEN_BYTE_ARRAY decimals.
+    Nested struct columns added by schema evolution read as NULL, and
+    evolved nested structs are matched by field id, not position.
+    `<`, `<=`, `NOT IN` and `NOT STARTS_WITH` no longer match rows in files
+    written before the column existed. A `NOT` predicate on a scan task
+    built outside the table scan no longer prunes row groups that hold
+    matching rows or aborts page-index pruning. Day transforms of pre-epoch timestamps and
+    decimal and binary `truncate` literals are now correct. Float partition
+    values are formatted like iceberg-java. UUID columns round-trip and
+    carry the Arrow `arrow.uuid` extension, so Flight SQL clients such as
+    pyarrow return UUID values instead of 16 raw bytes.
+    Snapshot summaries count delete files the delete filter dropped.
+
+- `ALTER COLUMN ... SET DATA TYPE` refuses type changes Iceberg does not allow (#859)
+
+    Before, any type change was committed: `VARCHAR` to `INT`, `BIGINT` to
+    `INT` or a narrower `DECIMAL` went through, and every later scan of the
+    table failed because the data files keep the old type. Only the spec's
+    promotions are accepted now: `INT` to `BIGINT`, `REAL` to `DOUBLE`, a
+    `DECIMAL` to a wider precision with the same scale, and `UNKNOWN` to any
+    primitive type. A struct, list or map column, or a nested target type, is
+    refused with a message instead of "Field id not found".
+
+- A table read fails after `ALTER COLUMN ... SET DATA TYPE DOUBLE` or a wider `DECIMAL` (#859)
+
+    Data files written before the change keep the old type, and the scan
+    widened only `INT` to `BIGINT`. A `REAL` column promoted to `DOUBLE`, or
+    a `DECIMAL` promoted to a wider precision, failed every later query with
+    "failed to conform scan batch". Older files now read as the new type.
+
+- A cold or disabled metadata cache no longer refuses CDC incremental reads with "tag state unknown" (#844)
+
+    #842 read column tags off the Iceberg table planning loaded, but an
+    incremental read plans through its own provider, so it still fell back
+    to the metadata cache and was refused on a miss or with
+    `catalog.metadata_cache_ttl_secs = 0`. The incremental provider now
+    carries the table's properties. One built without them still falls back
+    to the cache, never to "untagged".
+
+- `FOR INCREMENTAL BETWEEN SNAPSHOT` resolves table names like a plain read (#845)
+
+    A catalog-qualified name (`catalog.namespace.table`) now reads that
+    catalog's table, a one-part name uses the session's default schema, and
+    a name that is not an Iceberg table is refused.
+
+- `FOR INCREMENTAL BETWEEN SNAPSHOT` refused valid ranges about half the time
+
+    The start and end snapshots were ordered by comparing their ids, but Iceberg snapshot ids are random. When the older snapshot drew the larger id, the read failed with "start must be older than end". The order is now decided only by walking the end snapshot's parent chain: a start that is not an ancestor of the end is still refused, with "is not an ancestor".
+
+- `information_schema.columns` reports an Iceberg `unknown` column as `unknown` (#859)
+
+    Over Flight SQL and the embedded CLI the `data_type` column showed
+    Arrow's `Null`, while `DESCRIBE`, `SHOW COLUMNS` and the Trino endpoint
+    already said `unknown`. A filter such as `WHERE data_type = 'unknown'`
+    matches too. Other types keep their names.
+
+- Concurrent sessions no longer fail on a fresh JDBC (Postgres) catalog (#872)
+
+    Each session builds its own JDBC catalog, and each build runs
+    `CREATE TABLE IF NOT EXISTS` for the catalog tables. Postgres can fail
+    one of two such statements racing for the same table, so the first
+    concurrent queries against an empty database could error. A failed
+    create is now ignored when the table exists afterwards.
+
+- `CAST(x AS JSON)` and `to_json` embed a V3 `JSON` or `VARIANT` value as JSON (#848)
+
+    They encoded the variant's binary storage,
+    `{"metadata":"1103...","value":"0202..."}`. A variant is now written as
+    its JSON value at any depth, so `CAST(ARRAY[j, j] AS JSON)` gives
+    `[{"a":1},{"a":1}]` as in Trino. A JSON column on a V2 table is still a
+    plain string and is still quoted.
+
+- `typeof` returns the Trino type name (#867)
+
+    It returned the Arrow name (`Int32`, `Utf8`); it now returns the name a
+    client sees in the result metadata (`integer`, `varchar`, `decimal(5,2)`,
+    `array(bigint)`). `arrow_typeof` still returns the Arrow name.
+
+- Copy-on-write MERGE reported the size of the rewritten table as `rows_affected`
+
+    A copy-on-write MERGE returned the number of rows it wrote, which is every row that survives the rewrite. A `WHEN MATCHED THEN DELETE` of 1 row in a 3-row table reported 2, and an update plus an insert into a 3-row table reported 4. MERGE now counts the rows its clauses claim (updated, deleted or inserted), as merge-on-read MERGE and the documentation already did. The count costs one extra COUNT pass over the merge join.
+
+- Iceberg metadata table functions (`table_snapshots`, `table_files`, ...) answer under a tag-aware policy store again (#846)
+
+    The policy rewriter looked up column tags for the scan under the function
+    name (`table_snapshots()`), which the metadata cache never holds, so every
+    call was refused with "tag state unknown", even for an admin. A metadata
+    table function's output columns carry no column tags. The target table's
+    tags are still applied inside the function: `table_files` and
+    `table_partitions` withhold the statistics of masked or restricted
+    columns, and withhold all of them when the tags are unreadable.
+
+- Clippy passes on the 1.99 toolchain
+
+    Ten lints new with the toolchain bump (`manual_is_multiple_of`,
+    `chunks_exact` with a constant size, one argument count) are fixed.
+
+- Shell scripts pass shellcheck at warning severity
+
+    Unchecked `cd`s exit on failure, dead variables are removed, and
+    `local x=$(...)` captures are split. The trino-compat captures keep
+    their old continue-on-failure behaviour with `|| true`; the AWS
+    quickstarts now stop when `aws sts get-caller-identity` fails
+    instead of deploying with an empty account.
+
+- Writes and views work on REST catalogs whose path prefix is not the warehouse name (#873)
+
+    SQE's own REST calls (the table access check before a write, ETag
+    revalidation, view DDL, schema updates) put the warehouse name in the
+    URL, where the Iceberg REST spec puts the `prefix` the server returns
+    from `GET /v1/config`. Polaris advertises the warehouse name, so only
+    other servers broke: on Nessie every `INSERT` failed with
+    "Authorization check failed for table". SQE now uses the advertised
+    prefix, the same one the Iceberg client uses for reads.
+
+- `SHOW CREATE TABLE` right after a CTAS, INSERT or ALTER lists the table's columns (#850)
+
+    Every table commit drops the namespace's cached table list, and `SHOW CREATE TABLE` read `information_schema.columns` without refreshing that list first. The first `SHOW CREATE TABLE` after a write came back with an empty column list until some other query re-listed the namespace. It now refreshes the list before the lookup, as `SHOW COLUMNS` and `DESCRIBE` already did.
+
+- A partitioned sort under a tight query quota no longer fails at random in its final merge (#874)
+
+    Each query's sorts split the spillable bytes evenly between their
+    buffers and merge reservations. A merge growing while it built output
+    batches was refused like a buffer, but it cannot spill, so the query
+    failed whenever sibling partitions had not finished yet. Merges still
+    count towards the split, which leaves them room, but are no longer
+    refused by it; the query quota still bounds them.
+
+- File TVF reads reported 0 bytes, and coordinator-local scans counted their bytes twice
+
+    `read_parquet`, `read_csv` and the other file table functions scan through DataFusion's `DataSourceExec`, which the bytes walk behind the audit record, `system.runtime.queries` and Trino's `processedBytes` did not treat as a scan. File-backed `DataSourceExec` nodes now count; in-memory sources (`VALUES`) still do not. `CoordinatorLocalScanExec` also passed its child's metrics through as its own, so a scan the coordinator ran itself was counted twice in the same walk and in `EXPLAIN ANALYZE`.
+
+- Distributed scans reported 0 `physicalInputBytes`
+
+    A scan that ran on workers had no `bytes_scanned` counter, so the audit record, `system.runtime.queries` and Trino's `physicalInputBytes` showed 0 fetched bytes for it. `DistributedScanExec` now counts the file bytes of each fragment it was served (the morsel's byte range, or its whole files) once the worker returns the first batch or ends an empty stream. A failed fragment counts nothing. `processedBytes` was already counted.
+
+- A struct field reached by dot after a subscript, `items[1].sku`, is read
+
+    DataFusion plans a dot only in the leading `t.s.a` run of a field
+    access, so `items[1].sku` and `(s).a` failed with "Dot access not
+    supported for non-string expr", although Trino and Spark accept both.
+    The SQL front door now rewrites each such `.field` to `['field']` on
+    every wire (Flight SQL, Trino HTTP, embedded, MCP). An unquoted name
+    folds to lowercase; a quoted one keeps its case.
+
+- `generate_series()` and `range()` answer under a tag-aware policy store (#847)
+
+    Under Ranger every query over DataFusion's built-in generator table
+    functions was refused with "tag state unknown": the tag gate did not
+    recognise their provider. They have no table and no column tags, so the
+    gate now answers them as untagged, matched by provider type. Any other
+    unrecognised provider is still refused.
+
+- A cold or disabled metadata cache no longer refuses governed Iceberg queries with "tag state unknown" (#842)
+
+    Since #840 an unknown tag state refuses the statement. The tags were read
+    from the table metadata cache, so `catalog.metadata_cache_ttl_secs = 0`
+    refused every governed query, and an eviction or a commit racing the
+    planning load refused single queries at random. The policy rewriter now
+    reads `sqe.column-tags` from the Iceberg table that was loaded, with the
+    caller's token, to plan the query. That needs no extra catalog call and
+    does not depend on the cache. Hive tables, views and anything else the
+    rewriter does not recognise still read their tags through the cache. An
+    unparseable `sqe.column-tags` is still unknown and still refuses the
+    statement.
+
+- `CAST(x AS TIMESTAMP WITH TIME ZONE)` keeps the zone (#848)
+
+    Sessions now run in UTC (`datafusion.execution.time_zone = '+00:00'`).
+    Before, the cast returned a timestamp without a zone. `to_timestamp*` now
+    returns zoned values as well, typed like an Iceberg `timestamptz` column.
+    View bodies and worker sessions use the same zone. An offset in the cast
+    text is applied, and the value is stored in UTC. `now()` and
+    `current_timestamp` still return a timestamp without a zone.
+
+- Trino clients receive zoned timestamps as `<local> <zone>` (#848)
+
+    `2024-01-02 01:04:05.000000 UTC` instead of Arrow's
+    `2024-01-02 01:04:05.000000Z`. The Python client splits the zone off at
+    the space.
+
+- Filters on nanosecond timestamp columns no longer fail (#848)
+
+    A filter on a V3 `timestamp_ns` / `timestamptz_ns` column failed while
+    planning ("Interval data types must be compatible ... Int64"), because
+    the manifest bounds came through as Int64 column statistics. After that,
+    the Iceberg pushdown failed with "Can't convert datum from timestamp type
+    to timestamptz_ns type". Statistics now take the column's own type, and a
+    pushed-down timestamp literal is converted to its column's unit and zone.
+    A literal with a sub-microsecond part on a microsecond column is no
+    longer truncated: that conjunct is left to DataFusion instead of
+    pruning with a rounded value.
+
+- A filter on a lossy `CAST(col AS ...)` no longer fails (#848)
+
+    File pruning treated `CAST(col AS t) = x` as `col = x`, so
+    `CAST(f AS INT) = 3` on a REAL column, `CAST(s AS INT) = 3` on a string
+    and `CAST(ts AS DATE) = DATE '...'` failed with "Can't convert datum
+    from int type to float type" and similar. Only casts that keep every
+    value (integer widening, string to string, the same timestamp unit and
+    zone) are pruned through now; any other cast is left to DataFusion.
+
+- `from_iso8601_timestamp` returned NULL for any input with a zone designator
+
+    `'2024-01-02T03:04:05Z'`, `'...+02:00'`, `'...+0200'` and `'...+02'`
+    are now parsed and returned as that instant in UTC wall clock, as are
+    `hh:mm` without seconds and a bare date (midnight). Input without a
+    designator is read as UTC, as before.
+
+- Clock functions in one statement read one instant
+
+    `now()`, `current_timestamp`, `localtimestamp` and `localtime` are
+    folded to the query start time, as Trino and DataFusion's own `now()`
+    do. Each call used to read the clock separately, so `SELECT now(),
+    current_timestamp` differed by microseconds.
+
+- `CAST(x AS JSON)` of an array, map or row returned a quoted display string
+
+    `CAST(ARRAY[1, 2] AS JSON)` returned `"[1, 2]"`. It now returns
+    `[1,2]`, and maps, rows, decimals, doubles, dates and timestamps are
+    written as Trino 476 writes them: maps as objects with sorted string
+    keys, named rows as objects, decimals at their scale (`1.50`),
+    doubles in Java notation (`1.0E300`, `"NaN"`), dates and timestamps
+    as strings. A cast of a value that is already JSON (`json_parse`,
+    `json_extract`, `json_array_get`, a nested cast) is the identity
+    rather than re-encoded as a JSON string.
+
+- Type names agree across information_schema, typeof and SHOW CREATE TABLE (#848, #867)
+
+    `information_schema.columns.data_type` now parses the Arrow type and names it with the same mapper as the Trino wire protocol, so nested and parameterized types read `timestamp(6)`, `array(bigint)`, `row(x bigint,y varchar)` and `map(varchar,bigint)` instead of a partial string translation. `typeof` names a variant `variant` at any depth (`array(variant)`, was `array(json)`), as DESCRIBE does. SHOW CREATE TABLE prints Trino types that CREATE TABLE accepts (`integer`, `timestamp(9)` for a nanosecond column, lowercase `variant`) instead of Arrow names, and fails with "table not found" for a missing table instead of printing an empty statement. An exponent literal such as `1e0` is now `double`, as in Trino, rather than a decimal.
+
+- CREATE TABLE and ALTER TABLE ADD COLUMN take nested types; SHOW CREATE TABLE output runs back as is (#848)
+
+    `array(integer)`, `ARRAY<INT>`, `INT[]`, `map(varchar, bigint)`, `MAP<VARCHAR, BIGINT>` and `row(x decimal(10,2), y varchar)` work in a column definition, at any depth, and ADD COLUMN gives the nested fields fresh Iceberg field ids. Before, arrays and maps were refused and a ROW with a parameterized field type failed to parse. SHOW CREATE TABLE double-quotes a column or table name that is reserved or not a plain lowercase identifier (`"select"`, `"My Col"`) and escapes quotes in property values. DESCRIBE and SHOW COLUMNS return Trino type names on every protocol, for Iceberg and Hive tables, and the Trino DESCRIBE result carries the column comment (it was always empty). Hive SHOW CREATE TABLE backtick-quotes names, keeps column comments, and renders the table comment as the `comment` table property, which CREATE EXTERNAL TABLE reads back as the table comment.
+
+- `typeof` on a variant column returns `variant` (#849)
+
+    It returned the Arrow storage type,
+    `Struct([Field { name: "metadata", ... }, Field { name: "value", ... }])`,
+    because a variant is tagged on the field, not in the data type.
+
+- `now()`, `date_format` and `element_at` no longer switch at random
+  between SQE's Trino version and DataFusion's own
+
+    DataFusion ships functions that claim these names too: `now` itself,
+    `to_char` (which takes `date_format` as an alias) and `map_extract`
+    (which takes `element_at`). A query with a memory quota rebuilds its
+    session, and the rebuild could hand the name back to DataFusion's
+    function. `now()` then returned nanoseconds instead of microseconds,
+    `date_format` read its pattern as `to_char` syntax, and `element_at`
+    on a map returned a list. Which one a query got depended on chance.
+    SQE now takes the names away from those built-ins, so every query
+    runs the same function.
+
+- `current_timestamp` now returns the same type as `now()`, as in Trino
+
+    It is the same function now. It returns `timestamp(6)` (microseconds,
+    as Iceberg stores them) instead of DataFusion's nanosecond timestamp
+    with a `+00:00` zone.
+
+- Unknown tag state refuses the statement instead of returning no rows (#840)
+
+    When a table's column tags could not be read (metadata cache miss,
+    disabled cache, malformed `sqe.column-tags`), the policy rewriter
+    injected a deny-all row filter. The query succeeded with the right
+    schema and 0 rows, and a CTAS over it created an empty table, with only
+    a WARN in the coordinator log. The statement now fails with
+    `AccessDenied`: `tag state unknown for table <name>: its column tags
+    could not be read, ...`. It still fails closed. File table functions and
+    reserved virtual relations (`information_schema`, `system`) are
+    unaffected, since they carry no tags. A client that relied on the empty
+    result now sees an error.
+
+- The coordinator-to-worker link uses the configured keepalive and frame size (#810)
+
+    The pooled worker channel set HTTP/2 keepalive to a hard-coded 30 s
+    ping with a 30 s timeout. It ignored `[coordinator.transport]`, had no
+    TCP keepalive and kept h2's 16 KB frames. It now takes
+    `http2_keepalive_interval_secs`, `http2_keepalive_timeout_secs`,
+    `tcp_keepalive_secs` and `max_frame_size` from the same section the
+    Flight SQL server uses. With the defaults, an unanswered ping drops the
+    link after 10 s instead of 30 s.
+
+- `test_distributed_select` passes against a running worker
+
+    It planned a one-file table under the default distribution thresholds
+    (4 files, 128 MiB), so the scan stayed on the coordinator, and it looked
+    for "worker" in `system.runtime.tasks.node_id`, which holds the worker's
+    URL. It now builds its handler with `distributed_failure_e2e::rig`,
+    which zeroes both thresholds, and matches `node_id` against the worker
+    URL.
+
+- `CREATE TABLE ... TBLPROPERTIES ('format-version' = '3')` works on Glue, S3 Tables, HMS and JDBC catalogs (#854)
+
+    The native catalogs reject the reserved `format-version` property, and a
+    user's own option was passed through to them. CREATE TABLE and CTAS now
+    drop reserved properties for non-REST backends; the version still reaches
+    the table. A live test creates, writes and reads a V3 table through AWS
+    Glue.
+
+- `SET WRITE_BRANCH` to a tag is refused; a write used to move the tag and
+  turn it into a branch (#865)
+- `DROP BRANCH` / `DROP TAG` accept Iceberg's `IF EXISTS <name>` order as
+  well as `<name> IF EXISTS` (#865)
+
+- A scan memory wait test no longer fails on a loaded CI runner
+
+    `a_later_denial_keeps_the_budget_an_earlier_wait_left` measured its
+    300 ms wait budget in real time, so oversleep on a busy runner spent
+    the margin and the second admission failed. It now runs on tokio's
+    paused clock, where the waits are exact.
+
+- The Spark interop stack (`docker-compose.spark.yml`) starts and stays
+  healthy: Ivy could not write its cache under the image's
+  `HOME=/nonexistent`, Spark could not reach the storage endpoint the catalog
+  returns (`localhost:19000`, which overrides the client's `s3.endpoint`), and
+  concurrent `spark-sql` runs corrupted the shared local Derby metastore
 
 - rustls 0.23.46 for RUSTSEC-2026-0346, -0347, -0348 and -0349
 
@@ -125,6 +948,20 @@ All notable changes to SQE are documented in this file.
     before spilling (400 MB of a 1 GB `max_query_memory`, where it could
     take 800 MB before), so large sorts spill sooner. Writes (CTAS, INSERT
     with a sort) run without a per-query quota and are unchanged.
+
+### Security
+
+- Bump `ctutils` 0.4.3 -> 0.4.5 for RUSTSEC-2026-0385
+
+    `ctutils` (via `digest` -> `hmac`, used by SigV4 signing and SQE's own HMACs) generated branches in its constant-time mask functions before 0.4.4. `cargo deny` and `cargo audit` fail on it.
+
+- Distrusted emSign intermediates are no longer accepted in TLS certificate checks
+
+    `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382), `webpki-roots` 1.0.10
+    (RUSTSEC-2026-0381) and `webpki-root-certs` 1.0.10 (RUSTSEC-2026-0383)
+    reject certificate paths through the emSign
+    intermediates whose private keys are now public. The dbt-sqe adapter's
+    lock takes `certifi` 2026.10.19 (GHSA-6q48-6c7w-9gw2).
 
 ## [0.51.0] — 2026-10-13
 
