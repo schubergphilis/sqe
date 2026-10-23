@@ -15,7 +15,10 @@ Built from three layers, in this order:
 The DataFusion integration moved out of iceberg-rust on 2026-09-17 (apache #3228). It
 is vendored separately in `../datafusion-iceberg`.
 
-Geometry / geography types are not in any upstream yet.
+Geometry / geography is backported from apache ahead of the next re-vendor (sqe#863):
+`697abcee` (the types, part 1 of 3) and PR #3341 at `a7af50d5` (read as `LargeBinary`
+tagged `geoarrow.wkb`, part 2). Part 3, the writer, is still a draft upstream, so SQE
+refuses writes. A re-vendor past these commits drops the backport.
 
 ## Crates
 
