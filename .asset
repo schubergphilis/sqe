@@ -37,3 +37,15 @@ type = "harbor"
 repo = "repo.sovereign-data.org/chameleon"
 username_var = "REGISTRY_USERNAME"
 password_var = "REGISTRY_PASSWORD"
+
+# ctutils 0.4.5 (RUSTSEC-2026-0385 fix) was published on 2026-10-23, before
+# deps.dev indexed it, so aikido-reputation reports it as unresolved. It is the
+# RustCrypto crate (github.com/RustCrypto/utils, Apache-2.0 OR MIT), not a
+# slopsquat. Short expiry: once deps.dev has the version the waiver matches
+# nothing and should be removed.
+[[finding_suppression]]
+rule = "reputation-unresolved"
+path = "cargo/ctutils"
+owner = "VPF Data&AI"
+reason = "RustCrypto ctutils 0.4.5, published 2026-10-23 for RUSTSEC-2026-0385; deps.dev indexing lag, not an unknown package"
+expires = "2026-11-06"
