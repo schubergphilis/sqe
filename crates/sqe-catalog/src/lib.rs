@@ -87,3 +87,4 @@ pub fn storage_factory() -> std::sync::Arc<dyn iceberg::io::StorageFactory> {
 mod scoped_table;
 #[cfg(test)]
 pub(crate) mod test_fixtures;
+pub mod variant_prune;

@@ -22,7 +22,7 @@ Available at `http://coordinator:9090/metrics` in Prometheus text format.
 | `sqe_scan_files_total` | Counter | `outcome` | Iceberg files planned, read, or pruned |
 | `sqe_scan_bytes_total` | Counter | `stage` | Iceberg bytes planned and read |
 | `sqe_scan_rows_total` | Counter | `stage` | Iceberg rows before filters, decoded, and returned by scans |
-| `sqe_scan_row_groups_pruned_total` | Counter | none | Parquet row groups skipped by bloom pruning |
+| `sqe_scan_row_groups_pruned_total` | Counter | none | Parquet row groups skipped by bloom pruning or shredded variant statistics |
 | `sqe_s3_requests_total` | Counter | `operation`, `status` | S3 request outcomes |
 | `sqe_s3_bytes_read_total` | Counter | none | Bytes read from S3, including local Iceberg scans |
 | `sqe_s3_bytes_written_total` | Counter | none | Bytes written to S3 |
