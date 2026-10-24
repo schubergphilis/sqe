@@ -174,7 +174,20 @@ async fn sqe_reads_a_spark_shredded_variant_table() {
         &format!("SELECT id, v, json_get_int(v, 'a'), json_get_str(v, 's') FROM {fq} ORDER BY id"),
     )
     .await;
+    // Shredded statistics may prune these filters (#870); on a Spark-written
+    // file they must still return the rows a full scan returns.
+    let mut filtered = Vec::new();
+    for filter in [
+        "variant_get(v, '$.a', 'bigint') >= 2",
+        "2 > try_variant_get(v, '$.a', 'int')",
+        "variant_get(v, '$.s', 'string') = 'z'",
+        "variant_get(v, '$.a', 'bigint') > 100",
+    ] {
+        let sql = format!("SELECT count(*), min(id) FROM {fq} WHERE {filter}");
+        filtered.push(sqe_rows(&handler, &session, &sql).await.join(","));
+    }
     let _ = spark_sql(&format!("DROP TABLE IF EXISTS rest.{fq}"));
+    assert_eq!(filtered, vec!["2|2", "1|1", "1|3", "0|NULL"]);
     assert!(
         shredded,
         "Spark did not shred the variant column in {files:?}"

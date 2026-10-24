@@ -673,7 +673,7 @@ impl MetricsRegistry {
         let scan_row_groups_pruned_total = register_int_counter(
             &registry,
             "sqe_scan_row_groups_pruned_total",
-            "Iceberg row groups pruned by bloom filters",
+            "Iceberg row groups pruned by bloom filters and shredded variant statistics",
         )?;
 
         // Latency
