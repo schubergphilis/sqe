@@ -70,6 +70,7 @@ pub(crate) struct IcebergScanMetrics {
     pub rows_output: u64,
     pub rows_filtered_dynamic: u64,
     pub row_groups_pruned_bloom: u64,
+    pub row_groups_pruned_variant: u64,
 }
 
 type OpenStreamResult = (
@@ -9079,6 +9080,9 @@ pub(crate) fn extract_iceberg_scan_metrics(plan: &Arc<dyn ExecutionPlan>) -> Ice
             result.row_groups_pruned_bloom = result
                 .row_groups_pruned_bloom
                 .saturating_add(named("row_groups_pruned_bloom"));
+            result.row_groups_pruned_variant = result
+                .row_groups_pruned_variant
+                .saturating_add(named("row_groups_pruned_variant"));
         }
         for child in node.children() {
             stack.push(Arc::clone(child));
