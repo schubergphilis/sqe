@@ -224,6 +224,9 @@ impl SqeTableProvider {
                     // manifests and row-groups — it does not guarantee per-row
                     // correctness for all expression types.
                     TableProviderFilterPushDown::Inexact
+                } else if crate::variant_prune::is_variant_prune_filter(f, &self.schema) {
+                    // A shredded variant comparison prunes row groups (sqe#870).
+                    TableProviderFilterPushDown::Inexact
                 } else {
                     TableProviderFilterPushDown::Unsupported
                 }
@@ -278,6 +281,28 @@ impl SqeTableProvider {
             None => self.schema.clone(),
         };
 
+        // Shredded variant comparisons (sqe#870) prune row groups and stay out
+        // of `df_filters`: those go to workers, which decode them without the
+        // variant functions and would lose every other filter with them.
+        let mut variant_prunes = Vec::new();
+        let filters: Vec<Expr> = filters
+            .iter()
+            .filter(|f| {
+                if expr_to_predicate::is_filter_pushdown_supported(f, Some(&self.schema)) {
+                    return true;
+                }
+                match crate::variant_prune::VariantPrune::from_expr(f, &self.schema) {
+                    Some(prune) => {
+                        variant_prunes.push(prune);
+                        false
+                    }
+                    None => true,
+                }
+            })
+            .cloned()
+            .collect();
+        let filters = filters.as_slice();
+
         // Convert DataFusion filter expressions to an Iceberg predicate
         let predicates =
             expr_to_predicate::convert_filters_to_predicate_for(filters, Some(&self.schema));
@@ -291,7 +316,8 @@ impl SqeTableProvider {
             projected_columns,
             predicates,
             filters.to_vec(),
-        );
+        )
+        .with_variant_prunes(variant_prunes);
         if let Some(sid) = self.snapshot_id {
             exec = exec.with_snapshot_id(sid);
         }

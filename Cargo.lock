@@ -6769,6 +6769,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
  "parquet",
+ "parquet-variant-compute",
  "prometheus",
  "regex",
  "reqwest 0.12.28",

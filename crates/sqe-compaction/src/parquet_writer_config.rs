@@ -23,6 +23,9 @@
 //!   `<col>` may be a struct member (`s.x`); list and map members are
 //!   skipped. `write.parquet.bloom-filter-max-bytes` is ignored: parquet-rs
 //!   sizes a filter from the row-group row count, not a byte cap.
+//! - `write.parquet.row-group-size-bytes` (positive integer). Caps a row
+//!   group at roughly this many bytes. Unset keeps the parquet-rs default
+//!   (a row-count cap only), so existing tables write as before.
 //!
 //! ## Auto-detection rationale
 //!
@@ -96,6 +99,10 @@ pub const PROP_BLOOM_FILTER_ENABLED_COLUMN_PREFIX: &str =
 /// does not enable a bloom, as in Iceberg Java.
 pub const PROP_BLOOM_FILTER_FPP_COLUMN_PREFIX: &str = "write.parquet.bloom-filter-fpp.column.";
 
+/// Iceberg table property: target row-group size in bytes. Honoured only
+/// when set; see [`parse_row_group_size_bytes`].
+pub const PROP_ROW_GROUP_SIZE_BYTES: &str = "write.parquet.row-group-size-bytes";
+
 /// Default bloom filter FPP when the table property is absent or invalid.
 pub const DEFAULT_BLOOM_FILTER_FPP: f64 = 0.01;
 
@@ -132,6 +139,9 @@ pub fn build_writer_props(
     compression: Compression,
 ) -> WriterProperties {
     let mut builder = WriterProperties::builder().set_compression(compression);
+    if let Some(bytes) = parse_row_group_size_bytes(properties) {
+        builder = builder.set_max_row_group_bytes(Some(bytes));
+    }
 
     // Resolve which columns to bloom: the SQE list plus the Iceberg spec
     // columns set to `true` win; otherwise fall back to auto-detection
@@ -332,6 +342,15 @@ pub fn parse_bloom_filter_fpp(properties: &HashMap<String, String>) -> f64 {
         .unwrap_or(DEFAULT_BLOOM_FILTER_FPP)
 }
 
+/// `write.parquet.row-group-size-bytes` when it is a positive integer.
+/// Absent or unparseable leaves the parquet-rs default in place.
+pub fn parse_row_group_size_bytes(properties: &HashMap<String, String>) -> Option<usize> {
+    properties
+        .get(PROP_ROW_GROUP_SIZE_BYTES)
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +418,19 @@ mod tests {
                     .is_none(),
                 "{non_fk} should NOT be auto-bloomed (only _sk integer columns auto-bloom)"
             );
+        }
+    }
+
+    #[test]
+    fn row_group_size_bytes_is_honoured_only_when_set() {
+        let schema = schema_fact_table();
+        let unset = build_writer_props(&HashMap::new(), &schema, Compression::UNCOMPRESSED);
+        assert_eq!(unset.max_row_group_bytes(), None);
+
+        for (value, want) in [("262144", Some(262_144)), ("0", None), ("lots", None)] {
+            let props = HashMap::from([(PROP_ROW_GROUP_SIZE_BYTES.to_string(), value.to_string())]);
+            let w = build_writer_props(&props, &schema, Compression::UNCOMPRESSED);
+            assert_eq!(w.max_row_group_bytes(), want, "{value}");
         }
     }
 
