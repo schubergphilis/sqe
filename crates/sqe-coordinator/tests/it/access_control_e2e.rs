@@ -1055,6 +1055,96 @@ async fn hash_mask_is_keyed_hmac() {
     assert_eq!(col_strings(&alice, "email"), vec!["a@x", "b@x", "c@x"]);
 }
 
+/// Bound parameters (prepared statements, `EXECUTE ... USING`) go through
+/// the same policy rewrite as literal SQL: masks apply to a bound SELECT,
+/// and a reader's bound write is denied like a literal one.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn bound_params_keep_masks_and_write_denials() {
+    use datafusion::scalar::ScalarValue;
+
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+    ctx.ranger
+        .create_policy(hive_mask_policy(
+            &format!("{PREFIX}bound-mask-amount"),
+            "amount",
+            serde_json::json!({"dataMaskType": "MASK_NULL"}),
+        ))
+        .await
+        .expect("create amount mask");
+
+    let eu = || vec![ScalarValue::Utf8(Some("EU".to_string()))];
+    let sql = format!("SELECT amount FROM {ORDERS} WHERE region = $1 ORDER BY id");
+    let bob = crate::common::eventually("bob's mask to apply to a bound SELECT", || async {
+        match ctx
+            .handler
+            .execute_bound_with_id(&ctx.bob, &sql, eu(), None, None)
+            .await
+        {
+            Ok(b) if col_strings(&b, "amount").iter().all(|v| v == "NULL") => Ok(b),
+            Ok(b) => Err(format!(
+                "amount not masked: {:?}",
+                col_strings(&b, "amount")
+            )),
+            Err(e) => Err(format!("query failed: {e}")),
+        }
+    })
+    .await;
+    assert_eq!(total_rows(&bob), 2, "the bound filter keeps the EU rows");
+    let alice = ctx
+        .handler
+        .execute_bound_with_id(&ctx.alice, &sql, eu(), None, None)
+        .await
+        .expect("alice reads unmasked");
+    assert_eq!(col_strings(&alice, "amount"), vec!["10.00", "30.00"]);
+
+    // alice holds SELECT only: bound writes are denied.
+    let update = format!("UPDATE {ORDERS} SET amount = $1 WHERE id = $2");
+    let params = vec![ScalarValue::Float64(Some(0.0)), ScalarValue::Int64(Some(1))];
+    let denied = ctx
+        .handler
+        .execute_bound_with_id(&ctx.alice, &update, params, None, None)
+        .await;
+    assert!(
+        denied.is_err(),
+        "alice holds SELECT only; bound UPDATE must be denied"
+    );
+    let insert = format!(
+        "INSERT INTO {ORDERS} VALUES ($1, 'x', 0.0, '000-00-0000', 'z@x', DATE '2020-01-01')"
+    );
+    let denied = ctx
+        .handler
+        .execute_bound_with_id(
+            &ctx.alice,
+            &insert,
+            vec![ScalarValue::Int64(Some(9))],
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        denied.is_err(),
+        "alice holds SELECT only; bound INSERT must be denied"
+    );
+
+    // Read back as alice: carol is in role engineer, so the mask nulls her
+    // amounts too.
+    let after = exec_ok(
+        &ctx,
+        &ctx.alice,
+        &format!("SELECT id, amount FROM {ORDERS} ORDER BY id"),
+    )
+    .await;
+    assert_eq!(col_strings(&after, "id"), vec!["1", "2", "3"]);
+    assert_eq!(
+        col_strings(&after, "amount"),
+        vec!["10.00", "20.00", "30.00"]
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn resource_row_filter_restricts_rows() {

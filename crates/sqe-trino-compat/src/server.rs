@@ -726,6 +726,23 @@ pub trait TrinoQueryExecutor: Send + Sync + 'static {
         self.execute(session, sql).await
     }
 
+    /// [`Self::execute_with_query_id`] for an `EXECUTE ... USING`: `sql` is
+    /// the template with `$1..$N` placeholders and `params` are the values
+    /// to bind into its plan, by position. The values must never be spliced
+    /// into the text. The default refuses, so an executor without plan
+    /// binding cannot fall back to text substitution.
+    async fn execute_bound_with_query_id(
+        &self,
+        _session: &Session,
+        _sql: &str,
+        _params: Vec<datafusion::scalar::ScalarValue>,
+        _query_id: &str,
+    ) -> Result<TrinoResultStream, sqe_core::SqeError> {
+        Err(sqe_core::SqeError::NotImplemented(
+            "EXECUTE ... USING is not supported by this executor".into(),
+        ))
+    }
+
     /// Memory pool the buffered result page is charged to, so Trino-path
     /// memory is visible to the same limit as every other consumer. `None`
     /// (the default) disables accounting; the coordinator returns its
@@ -1329,8 +1346,14 @@ enum ExecPlan {
         kind: protocol::DescribeKind,
         template: String,
     },
-    /// Hand the normalized (and, for `EXECUTE`, bound) SQL to the executor.
+    /// Hand the normalized SQL to the executor.
     Sql(String),
+    /// `EXECUTE ... USING`: the normalized template, with `$1..$N`
+    /// placeholders, and the values the executor binds into its plan.
+    Bound {
+        sql: String,
+        params: Vec<datafusion::scalar::ScalarValue>,
+    },
 }
 
 /// A statement after the front door and the protocol-level dispatch.
@@ -1358,9 +1381,10 @@ struct ResolvedStatement {
 ///   `RESET SESSION` and `SHOW SESSION` use the same list.
 /// - `PREPARE` has already had its body parsed by the classifier, so a
 ///   malformed body fails here, at PREPARE time, with a `SYNTAX_ERROR`.
-/// - `EXECUTE` binds the parsed `USING` expressions into the header-carried
-///   template through the shared comment-aware scanner, then normalizes the
-///   bound text. `DEALLOCATE` and `DESCRIBE OUTPUT|INPUT` of an unknown name
+/// - `EXECUTE` numbers the header-carried template's placeholders through
+///   the shared comment-aware scanner, normalizes it, and carries the
+///   parsed `USING` values beside it to be bound into the plan.
+///   `DEALLOCATE` and `DESCRIBE OUTPUT|INPUT` of an unknown name
 ///   are `NOT_FOUND`, as in Trino.
 fn resolve_statement(
     sql: &str,
@@ -1596,23 +1620,33 @@ fn resolve_statement(
     })
 }
 
-/// Bind `params` into `template` and normalize the bound statement: the
-/// executed text of an `EXECUTE` is the template, not the `EXECUTE` itself,
-/// so the front door runs on it once here.
+/// Resolve an `EXECUTE`: the executed text is the template, not the
+/// `EXECUTE` itself, so the front door runs on it once here. Its `?`
+/// placeholders are numbered and the `USING` values travel beside it, to be
+/// bound into the plan; they never enter the SQL text.
 fn resolve_bound_sql(
     door: &sqe_sql::SqlFrontDoor,
     template: &str,
     params: &[sqlparser::ast::Expr],
     query_id: &str,
 ) -> Result<ResolvedStatement, Box<TrinoError>> {
-    let bound = prepared::bind_execute(template, params)
+    let (numbered, values) = prepared::bind_execute(template, params)
         .map_err(|msg| TrinoError::user_error(msg, Some(query_id)))?;
     let normalized = door
-        .normalize(&bound)
+        .normalize(&numbered)
         .map_err(|e| TrinoError::from_sqe_error(&e, Some(query_id)))?;
+    let facts = StatementFacts::from_normalized(&normalized);
+    let sql = normalized.into_parts().0;
     Ok(ResolvedStatement {
-        facts: StatementFacts::from_normalized(&normalized),
-        plan: ExecPlan::Sql(normalized.into_parts().0),
+        facts,
+        plan: if values.is_empty() {
+            ExecPlan::Sql(sql)
+        } else {
+            ExecPlan::Bound {
+                sql,
+                params: values,
+            }
+        },
         session_update: None,
     })
 }
@@ -2323,6 +2357,11 @@ async fn run_statement<Q: TrinoQueryExecutor>(
             build_show_session_batches(show_session_props, like.as_deref()),
         )),
         ExecPlan::Sql(sql) => handler.execute_with_query_id(session, sql, query_id).await,
+        ExecPlan::Bound { sql, params } => {
+            handler
+                .execute_bound_with_query_id(session, sql, params.clone(), query_id)
+                .await
+        }
     }
 }
 
@@ -3426,6 +3465,20 @@ mod tests {
             self.ids.lock().push(query_id.to_string());
             self.execute(session, sql).await
         }
+
+        /// Recorded as `<sql> <- <values>`: the text and the values arrive
+        /// apart, and a test can assert both.
+        async fn execute_bound_with_query_id(
+            &self,
+            session: &Session,
+            sql: &str,
+            params: Vec<datafusion::scalar::ScalarValue>,
+            query_id: &str,
+        ) -> Result<TrinoResultStream, sqe_core::SqeError> {
+            let recorded = format!("{sql} <- {params:?}");
+            self.execute_with_query_id(session, &recorded, query_id)
+                .await
+        }
     }
 
     fn recording_state(
@@ -4311,7 +4364,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let seen = seen.lock();
         assert_eq!(seen.len(), 1, "executor should run exactly once");
-        assert_eq!(seen[0], "SELECT * FROM t WHERE a = 5");
+        assert_eq!(seen[0], "SELECT * FROM t WHERE a = $1 <- [Int64(5)]");
     }
 
     #[tokio::test]
@@ -4447,9 +4500,10 @@ mod tests {
         assert!(err.message.contains("SELEC"), "{}", err.message);
     }
 
-    /// Finding 708: `EXECUTE` binds the parsed `USING` expressions through the
-    /// shared comment-aware scanner; a `?` inside a comment is not a
-    /// placeholder. `EXECUTE IMMEDIATE` carries the template inline.
+    /// Finding 708: `EXECUTE` numbers the template's placeholders through
+    /// the shared comment-aware scanner; a `?` inside a comment is not a
+    /// placeholder. `EXECUTE IMMEDIATE` carries the template inline. The
+    /// values reach the executor beside the text, never in it (finding 406).
     #[tokio::test]
     async fn submit_execute_binds_parameters_comment_aware() {
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -4485,8 +4539,8 @@ mod tests {
         assert_eq!(
             *seen,
             vec![
-                "SELECT 1 AS v /* why? */".to_string(),
-                "SELECT 42 AS a, 'x' AS b".to_string(),
+                "SELECT $1 AS v /* why? */ <- [Int64(1)]".to_string(),
+                "SELECT $1 AS a, $2 AS b <- [Int64(42), Utf8(\"x\")]".to_string(),
             ]
         );
     }

@@ -42,14 +42,15 @@ type PreparedKey = (String, Uuid);
 
 /// One prepared statement.
 pub struct PreparedStatement {
-    /// The SQL as the client sent it (`?` or `$n` placeholders). Used for the
-    /// audit record and for the text path of non-query statements.
+    /// The SQL as the client sent it (`?` or `$n` placeholders). Run as is
+    /// when it has no placeholders.
     pub sql: String,
     /// `sql` with `?` placeholders rewritten to `$1..$N`; what was planned.
     pub numbered_sql: String,
     /// The plan built once at prepare time, still carrying placeholders.
     /// `None` for statements the streaming path does not run (DML, DDL,
-    /// SHOW, ...), which execute through the buffered text path instead.
+    /// SHOW, ...), which plan `numbered_sql` on every execution with the
+    /// bind applied to each plan instead.
     pub plan: Option<StoredPlan>,
     /// Inferred type of each positional parameter; `None` where DataFusion
     /// had no context to infer one (accepts any bind).
@@ -180,8 +181,8 @@ impl PreparedStatement {
     }
 
     /// True when the stored plan holds vended credentials that are due for
-    /// refresh: run the statement through the text path instead, so the
-    /// tables are reloaded (fresh keys) rather than scanned with dead ones.
+    /// refresh: plan `numbered_sql` again instead, so the tables are
+    /// reloaded (fresh keys) rather than scanned with dead ones.
     pub fn stored_plan_credentials_expired(&self) -> bool {
         self.plan_credentials_usable_until
             .is_some_and(|until| std::time::SystemTime::now() >= until)
@@ -290,84 +291,7 @@ impl PreparedStatement {
     }
 }
 
-/// Check one bound value against the placeholder type DataFusion inferred.
-///
-/// Exact matches pass. Nulls become a typed null. Values in the same type
-/// family (any integer or float for a numeric placeholder, any string
-/// encoding for a string placeholder, ...) are cast with DataFusion's strict
-/// cast, so an out-of-range integer is an error rather than a silent wrap.
-/// A string bound to a date, time or timestamp placeholder is parsed; a
-/// string bound to a numeric or boolean placeholder is rejected outright, as
-/// is any other cross-family bind. The rejection happens here, before the
-/// plan is bound or executed.
-pub fn coerce_param(
-    value: ScalarValue,
-    expected: &DataType,
-    position: usize,
-) -> Result<ScalarValue, String> {
-    let actual = value.data_type();
-    if &actual == expected {
-        return Ok(value);
-    }
-    if value.is_null() {
-        return ScalarValue::try_from(expected)
-            .map_err(|e| format!("parameter ${position}: cannot build null of {expected}: {e}"));
-    }
-    let compatible = match (family(&actual), family(expected)) {
-        (Some(a), Some(e)) if a == e => true,
-        (Some(Family::String), Some(Family::Date | Family::Time | Family::Timestamp)) => true,
-        _ => false,
-    };
-    if !compatible {
-        return Err(format!(
-            "parameter ${position}: expected {expected}, got {actual}"
-        ));
-    }
-    value
-        .cast_to(expected)
-        .map_err(|e| format!("parameter ${position}: cannot convert {actual} to {expected}: {e}"))
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Family {
-    Boolean,
-    Numeric,
-    String,
-    Binary,
-    Date,
-    Time,
-    Timestamp,
-    Duration,
-    Interval,
-}
-
-fn family(dt: &DataType) -> Option<Family> {
-    use DataType::*;
-    Some(match dt {
-        Boolean => Family::Boolean,
-        Int8
-        | Int16
-        | Int32
-        | Int64
-        | UInt8
-        | UInt16
-        | UInt32
-        | UInt64
-        | Float16
-        | Float32
-        | Float64
-        | Decimal128(_, _)
-        | Decimal256(_, _) => Family::Numeric,
-        Utf8 | LargeUtf8 | Utf8View => Family::String,
-        Binary | LargeBinary | BinaryView | FixedSizeBinary(_) => Family::Binary,
-        Date32 | Date64 => Family::Date,
-        Time32(_) | Time64(_) => Family::Time,
-        Timestamp(_, _) => Family::Timestamp,
-        Duration(_) => Family::Duration,
-        Interval(_) => Family::Interval,
-        _ => return None,
-    })
-}
+pub use sqe_core::coerce_param;
 
 /// Bounded, idle-expiring store of prepared statements.
 #[derive(Clone)]

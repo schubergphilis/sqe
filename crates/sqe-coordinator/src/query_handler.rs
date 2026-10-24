@@ -12,6 +12,7 @@ use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion::physical_plan::{execute_stream, ExecutionPlan};
 use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use datafusion::prelude::SessionContext;
+use datafusion::scalar::ScalarValue;
 use futures::TryStreamExt;
 use tracing::Instrument;
 use tracing::{debug, info, warn, Span};
@@ -1353,6 +1354,30 @@ impl QueryHandler {
         })
     }
 
+    /// [`Self::execute_with_id`] for a statement with `$1..$N` placeholders
+    /// and the values bound to them (portal request §1, finding 406).
+    ///
+    /// The values never enter SQL text: every plan the statement makes,
+    /// its own and those its write executor derives (a MERGE's source, a
+    /// DELETE's filter), binds them as typed scalars before policy
+    /// enforcement ([`sqe_catalog::txn::with_params`]). A value whose type
+    /// does not fit its placeholder is refused before anything runs, naming
+    /// the position. Audit, history and lineage record `numbered_sql`, the
+    /// text with its markers.
+    pub fn execute_bound_with_id<'a>(
+        &'a self,
+        session: &'a Session,
+        numbered_sql: &'a str,
+        params: Vec<ScalarValue>,
+        client_ip: Option<String>,
+        query_id: Option<uuid::Uuid>,
+    ) -> futures::future::BoxFuture<'a, sqe_core::Result<Vec<RecordBatch>>> {
+        Box::pin(sqe_catalog::txn::with_params(
+            params,
+            self.execute_with_id(session, numbered_sql, client_ip, query_id),
+        ))
+    }
+
     /// Flight SQL `BeginTransaction` (#824): open a transaction whose id the
     /// client carries on every later request. Refused when the session is
     /// already in one (a `BEGIN` on the stored session, or the request's).
@@ -1753,8 +1778,13 @@ impl QueryHandler {
 
         // Check result cache for read queries (before execution). Never
         // inside a transaction: its reads see its own uncommitted writes,
-        // which the cache key does not capture (#821).
-        if matches!(&kind, StatementKind::Query(_)) && session.transaction_id.is_none() {
+        // which the cache key does not capture (#821). Never for a bound
+        // statement either: the key is the text, which holds `$n`, not the
+        // values.
+        let cacheable = matches!(&kind, StatementKind::Query(_))
+            && session.transaction_id.is_none()
+            && sqe_catalog::txn::params().is_none();
+        if cacheable {
             if let Some(ref cache) = self.query_cache {
                 let policy_fingerprint = self.policy_enforcer.policy_fingerprint();
                 let authorized = cache
@@ -3300,7 +3330,7 @@ impl QueryHandler {
             }
 
             if let Some(ref cache) = self.query_cache {
-                if matches!(&kind, StatementKind::Query(_)) && session.transaction_id.is_none() {
+                if cacheable {
                     if let Ok(ref batches) = result {
                         cache.store_bound(
                             &ResultCache::session_scope(session),
@@ -3651,6 +3681,25 @@ impl QueryHandler {
         Box::pin(sqe_catalog::txn::scope(
             txn,
             self.execute_stream_inner(session, sql, None, client_ip, query_id),
+        ))
+    }
+
+    /// [`Self::execute_stream_with_id`] for a query with `$1..$N`
+    /// placeholders and the values bound to them; see
+    /// [`Self::execute_bound_with_id`]. Binding happens at planning, so the
+    /// stream returned needs no scope.
+    pub fn execute_bound_stream_with_id<'a>(
+        &'a self,
+        session: &'a Session,
+        numbered_sql: &'a str,
+        params: Vec<ScalarValue>,
+        client_ip: Option<String>,
+        query_id: Option<uuid::Uuid>,
+    ) -> futures::future::BoxFuture<'a, sqe_core::Result<(SchemaRef, SendableRecordBatchStream)>>
+    {
+        Box::pin(sqe_catalog::txn::with_params(
+            params,
+            self.execute_stream_with_id(session, numbered_sql, client_ip, query_id),
         ))
     }
 
