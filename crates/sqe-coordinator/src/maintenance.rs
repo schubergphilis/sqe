@@ -864,8 +864,9 @@ impl MaintenanceHandler {
     /// Procedures are tiered by blast radius, see [`procedure_tier`]:
     /// - read-only procedures need nothing beyond the table access Polaris
     ///   already enforced when the metadata loaded;
-    /// - table-write procedures (compaction, manifest rewrite) commit through
-    ///   the caller's own token, so Polaris is the backstop; the engine only
+    /// - table-write procedures (compaction, manifest rewrite, snapshot
+    ///   expiry, orphan removal) commit through the caller's own token, and
+    ///   delete files only after that commit, so Polaris is the backstop; the engine only
     ///   refuses sessions whose roles are explicitly read-only, plus grants
     ///   the scheduler's minted maintenance session;
     /// - admin procedures delete data files or history without a catalog
@@ -2589,6 +2590,9 @@ impl MaintenanceHandler {
             .commit(catalog.as_ref())
             .await
             .map_err(|e| classify_commit_error(e, "expire_snapshots"))?;
+        // Before the cleanup: a cached handle would still list the snapshots
+        // whose files are about to go.
+        self.invalidate_table_cache(&ident).await;
 
         // The old fork's `clear_expire_files(true)` deleted the now-unreachable
         // manifests / data files as part of the action; apache does it as a
@@ -2624,6 +2628,15 @@ impl MaintenanceHandler {
         )?])
     }
 
+    /// Drop the shared metadata cache entry for a table this handler just
+    /// committed to, so the next read loads the new metadata.
+    async fn invalidate_table_cache(&self, ident: &TableIdent) {
+        if let Some(tc) = &self.table_cache {
+            tc.invalidate(&format!("{}.{}", ident.namespace(), ident.name()))
+                .await;
+        }
+    }
+
     async fn remove_orphan_files(
         &self,
         session: &Session,
@@ -2643,7 +2656,33 @@ impl MaintenanceHandler {
             .create_catalog_bridge(session, table_ref.catalog.as_deref())
             .await?;
         let ident = to_table_ident(table_ref);
-        let table = load_table(&catalog, &ident).await?;
+        let mut table = load_table(&catalog, &ident).await?;
+
+        // Deleting from storage makes no commit the catalog could refuse, so
+        // make one first, as the caller: a reader's call stops here with the
+        // catalog's refusal before any file goes. The action then runs on the
+        // committed metadata, which lists the metadata file just written.
+        if !dry_run {
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .update_table_properties()
+                .set(
+                    ORPHAN_FILES_LAST_RUN_PROPERTY.to_string(),
+                    now_ms.to_string(),
+                )
+                .apply(tx)
+                .map_err(|e| {
+                    SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!("remove_orphan_files apply failed: {e}"),
+                    )
+                })?;
+            table = tx
+                .commit(catalog.as_ref())
+                .await
+                .map_err(|e| classify_commit_error(e, "remove_orphan_files"))?;
+            self.invalidate_table_cache(&ident).await;
+        }
 
         let action = iceberg::actions::RemoveOrphanFilesAction::new(table)
             .older_than_ms(threshold_ms)
@@ -3506,6 +3545,11 @@ pub(crate) async fn collect_health_inputs(
 /// snapshot.
 pub(crate) const MAINTENANCE_SNAPSHOT_PROPERTY_PREFIX: &str = "sqe.maintenance.";
 
+/// Table property a deleting `remove_orphan_files` commits (epoch ms of the
+/// run) before it deletes: the commit is the caller's write check.
+pub(crate) const ORPHAN_FILES_LAST_RUN_PROPERTY: &str =
+    "sqe.maintenance.remove-orphan-files.last-run-ms";
+
 /// Timestamp (epoch ms) of the most recent snapshot in `table`'s snapshot
 /// log whose summary carries any `sqe.maintenance.*` property, or `None` if
 /// no snapshot ever did. Feeds
@@ -3679,15 +3723,14 @@ pub(crate) fn procedure_tier(call: &ProcedureCall) -> ProcedureTier {
         ProcedureCall::PurgeOrphanLocations { dry_run: true, .. }
         | ProcedureCall::RemoveOrphanFiles { dry_run: true, .. } => ProcedureTier::ReadOnly,
         // Each of these changes the table only through catalog commits made
-        // as the caller, and `expire_snapshots` deletes files only after its
-        // commit succeeded: the catalog's write check is the gate.
+        // as the caller, and `expire_snapshots` and `remove_orphan_files`
+        // delete files only after their commit succeeded: the catalog's write
+        // check is the gate.
         ProcedureCall::RewriteDataFiles { .. }
         | ProcedureCall::RewriteManifests { .. }
-        | ProcedureCall::ExpireSnapshots { .. } => ProcedureTier::TableWrite,
-        // `remove_orphan_files` deletes from storage with no commit for the
-        // catalog to refuse, so its deleting form stays admin.
-        ProcedureCall::RemoveOrphanFiles { .. }
-        | ProcedureCall::PurgeOrphanLocations { .. }
+        | ProcedureCall::ExpireSnapshots { .. }
+        | ProcedureCall::RemoveOrphanFiles { .. } => ProcedureTier::TableWrite,
+        ProcedureCall::PurgeOrphanLocations { .. }
         | ProcedureCall::DropTable { .. }
         | ProcedureCall::RegisterTable { .. }
         | ProcedureCall::SetCurrentSnapshot { .. }
@@ -4137,8 +4180,11 @@ mod tests {
             procedure_tier(&table_call("expire_snapshots")),
             ProcedureTier::TableWrite
         );
+        assert_eq!(
+            procedure_tier(&table_call("remove_orphan_files")),
+            ProcedureTier::TableWrite
+        );
         for admin in [
-            "remove_orphan_files",
             "drop_table",
             "set_current_snapshot(table => 'ns.t', snapshot_id => 1)",
         ] {
@@ -4149,7 +4195,7 @@ mod tests {
             };
             assert_eq!(procedure_tier(&call), ProcedureTier::Admin, "{admin}");
         }
-        // Listing orphans deletes nothing; deleting them stays admin.
+        // Listing orphans deletes nothing and commits nothing.
         assert_eq!(
             procedure_tier(&parse_call(
                 "CALL system.remove_orphan_files(table => 'ns.t', dry_run => true)"
@@ -4203,7 +4249,8 @@ mod tests {
     async fn admin_tier_denies_empty_roles_and_non_admins() {
         let config = config_with_admins(&["sqe_admin"]);
         let drop = table_call("drop_table");
-        let orphans = table_call("remove_orphan_files");
+        let orphans =
+            parse_call("CALL system.purge_orphan_locations(namespace => 'ns', dry_run => false)");
         assert!(!gate(config.clone(), &session_with_roles(vec![]), &drop).await);
         assert!(
             !gate(
