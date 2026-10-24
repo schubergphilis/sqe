@@ -33,7 +33,7 @@ use datafusion::physical_plan::{
 };
 use datafusion_expr::ColumnarValue;
 use futures::{Stream, StreamExt, TryStreamExt};
-use iceberg::arrow::DecodeGate;
+use iceberg::arrow::{DecodeGate, RowGroupPruner};
 use iceberg::expr::Predicate;
 use iceberg::scan::{FileScanTask, FileScanTaskStream};
 use iceberg::spec::{DataFile, DataFileFormat, ManifestContentType};
@@ -332,6 +332,10 @@ pub struct IcebergScanExec {
     /// for per-row evaluation, shared by every partition. Fresh whenever the
     /// filters are replaced.
     sealed_filters: SealedFilterCache,
+    /// Comparisons on shredded variant fields (sqe#870), checked against
+    /// each row group's statistics. Kept apart from `df_filters`: those are
+    /// sent to workers, which decode them without the variant functions.
+    variant_prunes: Arc<[crate::variant_prune::VariantPrune]>,
 }
 
 /// Per-filter slot holding a dynamic filter's first sealed snapshot after
@@ -580,6 +584,7 @@ impl IcebergScanExec {
             static_plan: Arc::new(tokio::sync::OnceCell::new()),
             split_assignments: Arc::new(tokio::sync::OnceCell::new()),
             sealed_filters: new_sealed_filter_cache(0),
+            variant_prunes: Arc::from(Vec::new()),
         }
     }
 
@@ -632,6 +637,13 @@ impl IcebergScanExec {
     #[must_use = "with_cached_statistics consumes self; bind the returned scan"]
     pub fn with_cached_statistics(mut self, stats: datafusion::common::Statistics) -> Self {
         self.cached_statistics = Some(stats);
+        self
+    }
+
+    /// Prune row groups on comparisons with shredded variant fields (sqe#870).
+    #[must_use = "with_variant_prunes consumes self; bind the returned scan"]
+    pub fn with_variant_prunes(mut self, prunes: Vec<crate::variant_prune::VariantPrune>) -> Self {
+        self.variant_prunes = Arc::from(prunes);
         self
     }
 
@@ -894,6 +906,7 @@ impl IcebergScanExec {
             static_plan: self.static_plan.clone(),
             split_assignments: self.split_assignments.clone(),
             sealed_filters,
+            variant_prunes: self.variant_prunes.clone(),
         }
     }
 
@@ -1261,6 +1274,7 @@ impl ExecutionPlan for IcebergScanExec {
         if let Some(cached) = &self.cached_statistics {
             let scan_reduces_rows = self.predicates.is_some()
                 || !self.df_filters.is_empty()
+                || !self.variant_prunes.is_empty()
                 || !self.pushed_down_filters.is_empty();
             return Ok(Arc::new(degrade_row_count_for_filtered_scan(
                 cached.clone(),
@@ -1517,6 +1531,22 @@ impl ExecutionPlan for IcebergScanExec {
             MetricBuilder::new(&self.metrics).counter("dynamic_filters_pending", partition);
         let row_groups_pruned_bloom =
             MetricBuilder::new(&self.metrics).counter("row_groups_pruned_bloom", partition);
+        let row_groups_pruned_variant =
+            MetricBuilder::new(&self.metrics).counter("row_groups_pruned_variant", partition);
+        // Shredded variant comparisons (sqe#870), checked on both read paths.
+        let variant_pruner: Option<Arc<crate::variant_prune::VariantRowGroupPruner>> =
+            (!self.variant_prunes.is_empty()).then(|| {
+                let iceberg_schema = snapshot_schema(&table, snapshot_id);
+                let prunes: Vec<_> = self
+                    .variant_prunes
+                    .iter()
+                    .map(|p| p.clone().with_field_id(&iceberg_schema))
+                    .collect();
+                Arc::new(crate::variant_prune::VariantRowGroupPruner::new(
+                    Arc::from(prunes),
+                    row_groups_pruned_variant.clone(),
+                ))
+            });
         let filter_wait_time =
             MetricBuilder::new(&self.metrics).subset_time("filter_wait_time", partition);
         debug!(table=%table.identifier(), predicates=?predicates, snapshot_id=?snapshot_id, pushed_filters=pushed_down_filters.len(), "Executing IcebergScanExec");
@@ -1825,6 +1855,7 @@ impl ExecutionPlan for IcebergScanExec {
                 let rows_prefilter = rows_prefilter.clone();
                 let rows_decoded = rows_decoded.clone();
                 let direct_decode_gate = Arc::clone(&decode_gate);
+                let direct_variant_pruner = variant_pruner.clone();
                 let per_file_stream = futures::stream::iter(
                     file_entries.into_owned().into_iter().map(move |(path, size)| {
                         let file_io = file_io.clone();
@@ -1837,6 +1868,7 @@ impl ExecutionPlan for IcebergScanExec {
                         let rows_prefilter = rows_prefilter.clone();
                         let rows_decoded = rows_decoded.clone();
                         let decode_gate = Arc::clone(&direct_decode_gate);
+                        let variant_pruner = direct_variant_pruner.clone();
                         async move {
                             debug!(path = %path, size = size, "Direct-read: reading file");
 
@@ -1860,6 +1892,14 @@ impl ExecutionPlan for IcebergScanExec {
                             let reader_opts = ArrowReaderOptions::new().with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required);
                             let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(bytes, reader_opts)
                                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                            let builder = match &variant_pruner {
+                                Some(pruner) => {
+                                    let groups = builder.metadata().num_row_groups();
+                                    let kept = pruner.select(builder.metadata(), (0..groups).collect());
+                                    if kept.len() < groups { builder.with_row_groups(kept) } else { builder }
+                                }
+                                None => builder,
+                            };
 
                             // Apply column projection by mapping column names to Parquet indices.
                             // For COUNT(*) queries, projection is Some([]) (empty list) -- we read
@@ -2068,6 +2108,9 @@ impl ExecutionPlan for IcebergScanExec {
             // decodes share the scan-wide permit budget and reserve their
             // estimated working set against the query pool.
             sb = sb.with_decode_gate(Arc::clone(&decode_gate) as Arc<dyn DecodeGate>);
+            if let Some(pruner) = &variant_pruner {
+                sb = sb.with_row_group_pruner(Arc::clone(pruner) as Arc<dyn RowGroupPruner>);
+            }
             // Fetch/decode pipelining (sqe#scan-fetch-pipeline): stage subtask fetch and
             // decode under separate bounds so I/O depth is not capped by
             // the decode permits. 0 keeps single-stage admission.

@@ -33,7 +33,7 @@ use futures::{SinkExt, StreamExt, TryStreamExt};
 pub use task::*;
 
 pub use crate::arrow::{ScanMetrics, ScanResult};
-use crate::arrow::{ArrowReaderBuilder, DEFAULT_TASK_SPLIT_TARGET_SIZE, DecodeGate};
+use crate::arrow::{ArrowReaderBuilder, DEFAULT_TASK_SPLIT_TARGET_SIZE, DecodeGate, RowGroupPruner};
 use crate::delete_file_index::DeleteFileIndex;
 use crate::error::invalid_data;
 use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
@@ -167,6 +167,9 @@ pub struct TableScanBuilder<'a> {
     /// SQE PATCH (sqe#scan-fetch-pipeline): fetch/decode pipelining depth, forwarded to
     /// the arrow reader. `0` disables staging.
     fetch_ahead: usize,
+    /// SQE PATCH (sqe#870): engine-side row-group pruning, forwarded to the
+    /// arrow reader.
+    row_group_pruner: Option<Arc<dyn RowGroupPruner>>,
 }
 
 impl<'a> TableScanBuilder<'a> {
@@ -195,6 +198,7 @@ impl<'a> TableScanBuilder<'a> {
             bloom_probe_max_values:
                 crate::expr::sbbf_row_group_evaluator::DEFAULT_BLOOM_PROBE_MAX_VALUES,
             fetch_ahead: 0,
+            row_group_pruner: None,
         }
     }
 
@@ -277,6 +281,13 @@ impl<'a> TableScanBuilder<'a> {
         dynamic_predicate: Arc<dyn DynamicPredicate>,
     ) -> Self {
         self.dynamic_predicate = Some(dynamic_predicate);
+        self
+    }
+
+    /// SQE PATCH (sqe#870): attach a [`RowGroupPruner`] the reader consults
+    /// once per file scan task. See [`crate::arrow::RowGroupPruner`].
+    pub fn with_row_group_pruner(mut self, pruner: Arc<dyn RowGroupPruner>) -> Self {
+        self.row_group_pruner = Some(pruner);
         self
     }
 
@@ -449,6 +460,7 @@ impl<'a> TableScanBuilder<'a> {
                         bloom_filter_probing_enabled: self.bloom_filter_probing_enabled,
                         bloom_probe_max_values: self.bloom_probe_max_values,
                         fetch_ahead: self.fetch_ahead,
+                        row_group_pruner: self.row_group_pruner.clone(),
                     });
                 };
                 current_snapshot_id.clone()
@@ -540,6 +552,7 @@ impl<'a> TableScanBuilder<'a> {
             bloom_filter_probing_enabled: self.bloom_filter_probing_enabled,
             bloom_probe_max_values: self.bloom_probe_max_values,
             fetch_ahead: self.fetch_ahead,
+            row_group_pruner: self.row_group_pruner,
         })
     }
 }
@@ -596,6 +609,9 @@ pub struct TableScan {
     /// SQE PATCH (sqe#scan-fetch-pipeline): fetch/decode pipelining depth (see
     /// [`TableScanBuilder::with_fetch_ahead`]). Forwarded to the reader.
     fetch_ahead: usize,
+    /// SQE PATCH (sqe#870): engine-side row-group pruning (see
+    /// [`TableScanBuilder::with_row_group_pruner`]). Forwarded to the reader.
+    row_group_pruner: Option<Arc<dyn RowGroupPruner>>,
 }
 
 impl TableScan {
@@ -777,6 +793,10 @@ impl TableScan {
 
         if let Some(decode_gate) = self.decode_gate.clone() {
             arrow_reader_builder = arrow_reader_builder.with_decode_gate(decode_gate);
+        }
+
+        if let Some(pruner) = self.row_group_pruner.clone() {
+            arrow_reader_builder = arrow_reader_builder.with_row_group_pruner(pruner);
         }
 
         arrow_reader_builder.build().read(tasks)

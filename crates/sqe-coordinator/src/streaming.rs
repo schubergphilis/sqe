@@ -260,7 +260,7 @@ impl StreamFinalizer {
             .inc_by(scan.rows_filtered_dynamic);
         metrics
             .scan_row_groups_pruned_total
-            .inc_by(scan.row_groups_pruned_bloom);
+            .inc_by(scan.row_groups_pruned_bloom + scan.row_groups_pruned_variant);
         metrics
             .files_pruned_minmax
             .inc_by(scan.files_pruned_minmax as f64);
