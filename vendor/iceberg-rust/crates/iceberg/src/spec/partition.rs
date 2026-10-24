@@ -35,7 +35,7 @@ pub(crate) const DEFAULT_PARTITION_SPEC_ID: i32 = 0;
 
 /// Partition fields capture the transform from table data to partition values.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, TypedBuilder)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", try_from = "PartitionFieldSerde")]
 pub struct PartitionField {
     /// A source column id from the table’s schema
     pub source_id: i32,
@@ -265,7 +265,7 @@ impl PartitionKey {
 pub type UnboundPartitionSpecRef = Arc<UnboundPartitionSpec>;
 /// Unbound partition field can be built without a schema and later bound to a schema.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, TypedBuilder)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", try_from = "UnboundPartitionFieldSerde")]
 pub struct UnboundPartitionField {
     /// A source column id from the table’s schema
     pub source_id: i32,
@@ -278,6 +278,84 @@ pub struct UnboundPartitionField {
     pub name: String,
     /// A transform that is applied to the source column to produce a partition value.
     pub transform: Transform,
+}
+
+// SQE PATCH (sqe#864): the V3 spec lets a partition field name its sources
+// as `source-ids` instead of `source-id`. iceberg-java writes `source-ids`
+// only for a multi-argument field, but a one-element list is legal and means
+// the same as `source-id`. A field with several sources cannot be held by the
+// single `source_id` below, so it is refused with an error naming the field
+// rather than read through its first id, which would prune on the wrong
+// column and drop the other ids on the next commit. Serialization is
+// unchanged: `source-id` is always written.
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct PartitionFieldSerde {
+    source_id: Option<i32>,
+    source_ids: Option<Vec<i32>>,
+    field_id: i32,
+    name: String,
+    transform: Transform,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct UnboundPartitionFieldSerde {
+    source_id: Option<i32>,
+    source_ids: Option<Vec<i32>>,
+    field_id: Option<i32>,
+    name: String,
+    transform: Transform,
+}
+
+impl TryFrom<PartitionFieldSerde> for PartitionField {
+    type Error = String;
+
+    fn try_from(value: PartitionFieldSerde) -> std::result::Result<Self, Self::Error> {
+        Ok(PartitionField {
+            source_id: single_source_id(&value.name, value.source_id, value.source_ids)?,
+            field_id: value.field_id,
+            name: value.name,
+            transform: value.transform,
+        })
+    }
+}
+
+impl TryFrom<UnboundPartitionFieldSerde> for UnboundPartitionField {
+    type Error = String;
+
+    fn try_from(value: UnboundPartitionFieldSerde) -> std::result::Result<Self, Self::Error> {
+        Ok(UnboundPartitionField {
+            source_id: single_source_id(&value.name, value.source_id, value.source_ids)?,
+            field_id: value.field_id,
+            name: value.name,
+            transform: value.transform,
+        })
+    }
+}
+
+fn single_source_id(
+    name: &str,
+    source_id: Option<i32>,
+    source_ids: Option<Vec<i32>>,
+) -> std::result::Result<i32, String> {
+    match (source_id, source_ids) {
+        (Some(id), None) => Ok(id),
+        (None, Some(ids)) => match ids.as_slice() {
+            [id] => Ok(*id),
+            [] => Err(format!(
+                "partition field `{name}` has an empty `source-ids`"
+            )),
+            _ => Err(format!(
+                "partition field `{name}` has a multi-argument transform over source ids \
+                 {ids:?}; multi-argument partition transforms are not supported"
+            )),
+        },
+        (Some(_), Some(_)) => Err(format!(
+            "partition field `{name}` sets both `source-id` and `source-ids`"
+        )),
+        (None, None) => Err(format!("partition field `{name}` is missing `source-id`")),
+    }
 }
 
 /// Unbound partition spec can be built without a schema and later bound to a schema.
@@ -798,6 +876,52 @@ mod tests {
         assert_eq!(1002, partition_spec.fields[2].field_id);
         assert_eq!("id_truncate", partition_spec.fields[2].name);
         assert_eq!(Transform::Truncate(4), partition_spec.fields[2].transform);
+    }
+
+    #[test]
+    fn test_partition_field_source_ids() {
+        let field = |sources: &str| {
+            format!(r#"{{ {sources}, "field-id": 1000, "name": "p", "transform": "identity" }}"#)
+        };
+
+        // A one-element `source-ids` reads like `source-id`, bound and unbound,
+        // and is written back as `source-id`.
+        let bound: PartitionField = serde_json::from_str(&field(r#""source-ids": [3]"#)).unwrap();
+        assert_eq!(3, bound.source_id);
+        let written = serde_json::to_value(&bound).unwrap();
+        assert_eq!(Some(3), written["source-id"].as_i64().map(|id| id as i32));
+        assert!(written.get("source-ids").is_none());
+        let unbound: UnboundPartitionField =
+            serde_json::from_str(&field(r#""source-ids": [3]"#)).unwrap();
+        assert_eq!(3, unbound.source_id);
+        assert_eq!(Some(1000), unbound.field_id);
+
+        // A multi-argument field is refused by name, never read through its
+        // first id.
+        for sources in [
+            r#""source-ids": [3, 4]"#,
+            r#""source-ids": []"#,
+            r#""source-id": 3, "source-ids": [3]"#,
+            r#""name-only": true"#,
+        ] {
+            let err = serde_json::from_str::<PartitionField>(&field(sources)).unwrap_err();
+            assert!(
+                err.to_string().contains("partition field `p`"),
+                "{sources}: {err}"
+            );
+            let err = serde_json::from_str::<UnboundPartitionField>(&field(sources)).unwrap_err();
+            assert!(
+                err.to_string().contains("partition field `p`"),
+                "{sources}: {err}"
+            );
+        }
+        let err = serde_json::from_str::<PartitionField>(&field(r#""source-ids": [3, 4]"#))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("[3, 4]") && err.contains("multi-argument"),
+            "{err}"
+        );
     }
 
     #[test]

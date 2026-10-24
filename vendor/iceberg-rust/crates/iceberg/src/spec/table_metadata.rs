@@ -3053,6 +3053,25 @@ mod tests {
         check_table_metadata_serde(&metadata_str, expected);
     }
 
+    // SQE PATCH (sqe#864): V3 metadata naming a partition source as
+    // `source-ids` loads when there is one source and fails when there are
+    // several. The untagged `TableMetadataEnum` replaces the field's error
+    // with its generic one, as for every other malformed field.
+    #[test]
+    fn test_table_metadata_v3_partition_source_ids() {
+        let metadata_str =
+            fs::read_to_string("testdata/table_metadata/TableMetadataV3ValidMinimal.json").unwrap();
+        let expected = serde_json::from_str::<TableMetadata>(&metadata_str).unwrap();
+
+        let single = metadata_str.replace(r#""source-id": 1,"#, r#""source-ids": [1],"#);
+        assert_ne!(single, metadata_str);
+        assert_eq!(serde_json::from_str::<TableMetadata>(&single).unwrap(), expected);
+
+        let multi = metadata_str.replace(r#""source-id": 1,"#, r#""source-ids": [1, 2],"#);
+        assert_ne!(multi, metadata_str);
+        assert!(serde_json::from_str::<TableMetadata>(&multi).is_err());
+    }
+
     #[test]
     fn test_table_metadata_v2_file_valid() {
         let metadata =
