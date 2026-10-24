@@ -226,6 +226,71 @@ aikido-clippy-rust:
   rules:
     - when: never
 
+# Live round trips against the catalogs outside the Iceberg matrix rubric that
+# SQE still advertises (#866): Nessie (Iceberg REST), Hive Metastore (Thrift)
+# and JDBC on PostgreSQL. They were #[ignore] tests run by hand, so a
+# regression waited for the next manual run. Extends aikido-rust-extra for the
+# deps image, its warm target dir and the build env. GitLab `services:`
+# sidecars, not docker-in-docker. Images are pinned by digest; the tags match
+# docker-compose.{test,nessie,hms}.yml, which run the same tests locally. The
+# tests only create and drop namespaces, so Nessie needs no S3 service.
+catalog-live-tests:
+  extends: aikido-rust-extra
+  services:
+    - name: "postgres:17-alpine@sha256:eee6c6e1b0894fa4fe0075eb054af9fd1cf39a35321c2d4110626cfe506411fb"
+      alias: postgres
+      variables:
+        POSTGRES_USER: iceberg
+        POSTGRES_PASSWORD: iceberg
+        POSTGRES_DB: iceberg_catalog
+    - name: "ghcr.io/projectnessie/nessie:0.108.3@sha256:219709df809fcfac7abe0491b2070c8d56178ed29828fb30968a4365b62bcc8a"
+      alias: nessie
+      variables:
+        NESSIE_VERSION_STORE_TYPE: IN_MEMORY
+        QUARKUS_HTTP_PORT: "19120"
+        NESSIE_CATALOG_DEFAULT_WAREHOUSE: warehouse
+        NESSIE_CATALOG_WAREHOUSES_WAREHOUSE_LOCATION: "s3://warehouse/"
+    - name: "apache/hive:standalone-metastore-4.1.0@sha256:cc898f60aff301a5b8811b9fcd7631822ffde82180f0d47ef1c24e287e4a9845"
+      alias: hive-metastore
+      variables:
+        SERVICE_NAME: metastore
+        DB_DRIVER: derby
+        SERVICE_OPTS: "-Dmetastore.warehouse.dir=file:///opt/hive/warehouse"
+  variables:
+    SQE_TEST_PG_URL: "postgres://iceberg:iceberg@postgres:5432/iceberg_catalog"
+    SQE_TEST_NESSIE_URI: "http://nessie:19120/iceberg/"
+    SQE_TEST_HMS_URI: "hive-metastore:9083"
+  script:
+    - |
+      set -euo pipefail
+      # The runner stops waiting on a service after 30s and starts the job
+      # anyway; HMS runs schematool first and takes about a minute. Wait on
+      # every port, bounded, rather than fail the first test.
+      bash -c '
+        for hp in postgres:5432 nessie:19120 hive-metastore:9083; do
+          host=${hp%:*}; port=${hp#*:}
+          for i in $(seq 1 180); do
+            if (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; then
+              echo "$hp up after ${i}s"; break
+            fi
+            if [ "$i" = 180 ]; then echo "$hp not up after 180s"; exit 1; fi
+            sleep 1
+          done
+        done'
+      cargo test -p sqe-catalog --features hms,sql-postgres --test it -- \
+        --ignored nessie:: hms:: sql_postgres::
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - "crates/sqe-catalog/**/*"
+        - "vendor/iceberg-rust/**/*"
+        - "Cargo.lock"
+        - ".gitlab-ci.yml"
+        - "docker-compose.nessie.yml"
+        - "docker-compose.hms.yml"
+
 vendored-profile-drift:
   stage: test
   image: alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a

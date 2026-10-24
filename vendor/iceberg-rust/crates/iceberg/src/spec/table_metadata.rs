@@ -835,7 +835,7 @@ pub(super) mod _serde {
     use crate::spec::{
         EncryptedKey, INITIAL_ROW_ID, PartitionField, PartitionSpec, PartitionSpecRef,
         PartitionStatisticsFile, Schema, SchemaRef, Snapshot, SnapshotReference, SnapshotRetention,
-        SortOrder, StatisticsFile,
+        SortOrder, StatisticsFile, UnboundPartitionSpec,
     };
     use crate::{Error, ErrorKind};
 
@@ -1270,10 +1270,14 @@ pub(super) mod _serde {
                     .collect::<HashMap<_, _>>()
             } else if let Some(partition_spec) = value.partition_spec {
                 // Option 2: Fall back to 'partition_spec'
-                let spec = PartitionSpec::builder(current_schema.clone())
-                    .with_spec_id(DEFAULT_PARTITION_SPEC_ID)
-                    .add_unbound_fields(partition_spec.into_iter().map(|f| f.into_unbound()))?
-                    .build()?;
+                let spec = UnboundPartitionSpec {
+                    spec_id: Some(DEFAULT_PARTITION_SPEC_ID),
+                    fields: partition_spec
+                        .into_iter()
+                        .map(|f| f.into_unbound())
+                        .collect(),
+                }
+                .bind(current_schema.clone())?;
 
                 HashMap::from_iter(vec![(DEFAULT_PARTITION_SPEC_ID, Arc::new(spec))])
             } else {
@@ -3053,6 +3057,25 @@ mod tests {
         check_table_metadata_serde(&metadata_str, expected);
     }
 
+    // SQE PATCH (sqe#864): V3 metadata naming a partition source as
+    // `source-ids` loads when there is one source and fails when there are
+    // several. The untagged `TableMetadataEnum` replaces the field's error
+    // with its generic one, as for every other malformed field.
+    #[test]
+    fn test_table_metadata_v3_partition_source_ids() {
+        let metadata_str =
+            fs::read_to_string("testdata/table_metadata/TableMetadataV3ValidMinimal.json").unwrap();
+        let expected = serde_json::from_str::<TableMetadata>(&metadata_str).unwrap();
+
+        let single = metadata_str.replace(r#""source-id": 1,"#, r#""source-ids": [1],"#);
+        assert_ne!(single, metadata_str);
+        assert_eq!(serde_json::from_str::<TableMetadata>(&single).unwrap(), expected);
+
+        let multi = metadata_str.replace(r#""source-id": 1,"#, r#""source-ids": [1, 2],"#);
+        assert_ne!(multi, metadata_str);
+        assert!(serde_json::from_str::<TableMetadata>(&multi).is_err());
+    }
+
     #[test]
     fn test_table_metadata_v2_file_valid() {
         let metadata =
@@ -3347,6 +3370,33 @@ mod tests {
         };
 
         check_table_metadata_serde(&metadata, expected);
+    }
+
+    #[test]
+    fn test_table_metadata_v1_legacy_partition_spec_with_void_fields() {
+        let mut metadata: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string("testdata/table_metadata/TableMetadataV1Valid.json").unwrap(),
+        )
+        .unwrap();
+        // What a format version 1 spec keeps after identity(x) was removed twice.
+        metadata["partition-spec"] = serde_json::json!([
+            {"name": "x", "transform": "void", "source-id": 1, "field-id": 1000},
+            {"name": "x_null", "transform": "void", "source-id": 1, "field-id": 1001},
+        ]);
+
+        let metadata: TableMetadata = serde_json::from_value(metadata).unwrap();
+
+        let fields = metadata.default_partition_spec().fields();
+        assert_eq!(
+            fields
+                .iter()
+                .map(|f| (f.field_id, f.name.as_str(), f.transform))
+                .collect::<Vec<_>>(),
+            vec![
+                (1000, "x", Transform::Void),
+                (1001, "x_null", Transform::Void)
+            ]
+        );
     }
 
     #[test]
