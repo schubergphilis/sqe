@@ -8187,8 +8187,37 @@ fn extract_partition_eq_constraints(
                     Some(PartitionConstraintValue::Str(s.clone()))
                 }
                 Value::Boolean(b) => Some(PartitionConstraintValue::Bool(*b)),
+                // A bound statement keeps `$n` in its text; prune on the
+                // value bound to it (`txn::with_params`).
+                Value::Placeholder(id) => {
+                    let n = id
+                        .strip_prefix('$')?
+                        .parse::<usize>()
+                        .ok()?
+                        .checked_sub(1)?;
+                    bound_constraint(sqe_catalog::txn::params()?.get(n)?)
+                }
                 _ => None,
             },
+            _ => None,
+        }
+    }
+    fn bound_constraint(
+        value: &datafusion::scalar::ScalarValue,
+    ) -> Option<PartitionConstraintValue> {
+        use datafusion::scalar::ScalarValue as S;
+        match value {
+            S::Int8(Some(v)) => Some(PartitionConstraintValue::Int(i64::from(*v))),
+            S::Int16(Some(v)) => Some(PartitionConstraintValue::Int(i64::from(*v))),
+            S::Int32(Some(v)) => Some(PartitionConstraintValue::Int(i64::from(*v))),
+            S::Int64(Some(v)) => Some(PartitionConstraintValue::Int(*v)),
+            S::UInt8(Some(v)) => Some(PartitionConstraintValue::Int(i64::from(*v))),
+            S::UInt16(Some(v)) => Some(PartitionConstraintValue::Int(i64::from(*v))),
+            S::UInt32(Some(v)) => Some(PartitionConstraintValue::Int(i64::from(*v))),
+            S::Utf8(Some(s)) | S::LargeUtf8(Some(s)) | S::Utf8View(Some(s)) => {
+                Some(PartitionConstraintValue::Str(s.clone()))
+            }
+            S::Boolean(Some(b)) => Some(PartitionConstraintValue::Bool(*b)),
             _ => None,
         }
     }
