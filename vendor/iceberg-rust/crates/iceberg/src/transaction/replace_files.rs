@@ -27,7 +27,7 @@ use super::snapshot::{DefaultManifestProcess, SnapshotProducer, data_file_identi
 use crate::error::Result;
 use crate::spec::{
     DataContentType, DataFile, FormatVersion, ManifestContentType, ManifestEntry, ManifestFile,
-    ManifestStatus, Operation, UNASSIGNED_SEQUENCE_NUMBER,
+    ManifestStatus, Operation, UNASSIGNED_SEQUENCE_NUMBER, is_computed_summary_property,
 };
 use crate::table::Table;
 use crate::transaction::snapshot::SnapshotProduceOperation;
@@ -353,6 +353,7 @@ pub struct ReplaceFilesAction<M: ReplaceFilesMode> {
     // below are properties used to create SnapshotProducer when commit
     commit_uuid: Option<Uuid>,
     snapshot_properties: HashMap<String, String>,
+    inherit_parent_snapshot_properties: bool,
     added_data_files: Vec<DataFile>,
     added_delete_files: Vec<DataFile>,
     removed_data_files: Vec<DataFile>,
@@ -387,6 +388,7 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
         Self {
             commit_uuid: None,
             snapshot_properties: HashMap::new(),
+            inherit_parent_snapshot_properties: false,
             added_data_files: Vec::new(),
             added_delete_files: Vec::new(),
             removed_data_files: Vec::new(),
@@ -536,6 +538,33 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
             .to_vec())
     }
 
+    /// Summary properties for a snapshot committed on top of `table`'s target branch.
+    fn snapshot_properties(&self, table: &Table) -> HashMap<String, String> {
+        if !self.inherit_parent_snapshot_properties {
+            return self.snapshot_properties.clone();
+        }
+
+        let target_branch = self
+            .target_branch
+            .as_deref()
+            .unwrap_or(crate::spec::MAIN_BRANCH);
+        let mut properties: HashMap<String, String> = table
+            .metadata()
+            .snapshot_for_ref(target_branch)
+            .map(|parent| {
+                parent
+                    .summary()
+                    .additional_properties
+                    .iter()
+                    .filter(|(key, _)| !is_computed_summary_property(key))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        properties.extend(self.snapshot_properties.clone());
+        properties
+    }
+
     fn new_snapshot_producer<'a>(
         &self,
         table: &'a Table,
@@ -547,7 +576,7 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
             table,
             commit_uuid,
             snapshot_id,
-            self.snapshot_properties.clone(),
+            self.snapshot_properties(table),
             self.added_data_files.clone(),
             self.added_delete_files.clone(),
             self.removed_data_files.clone(),
@@ -682,6 +711,21 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
         }
 
         Ok(Some(delta))
+    }
+}
+
+impl ReplaceFilesAction<Rewrite> {
+    /// Copy the custom summary properties of the target branch head onto the new snapshot.
+    ///
+    /// The head is read every time the action is applied, including transaction retries that
+    /// rebase onto a newer head, so the values always come from the snapshot that becomes this
+    /// commit's parent. A rewrite leaves table data unchanged, so writer-owned markers on the
+    /// parent, such as a commit watermark, still describe the new snapshot. Properties computed
+    /// by snapshot production (`added-*`, `total-*`, partition summaries) are not copied, and
+    /// properties from [`Self::set_snapshot_properties`] take precedence.
+    pub fn set_inherit_parent_snapshot_properties(mut self, inherit: bool) -> Self {
+        self.inherit_parent_snapshot_properties = inherit;
+        self
     }
 }
 
@@ -1500,6 +1544,112 @@ mod tests {
                 .additional_properties
                 .get("total-files-size"),
             Some(&"400".to_string())
+        );
+    }
+
+    fn with_summary_properties<const N: usize>(
+        snapshot: Snapshot,
+        properties: [(&str, &str); N],
+    ) -> Snapshot {
+        let mut summary = snapshot.summary().clone();
+        summary
+            .additional_properties
+            .extend(properties.map(|(key, value)| (key.to_string(), value.to_string())));
+        Snapshot::builder()
+            .with_snapshot_id(snapshot.snapshot_id())
+            .with_parent_snapshot_id(snapshot.parent_snapshot_id())
+            .with_timestamp_ms(snapshot.timestamp_ms())
+            .with_sequence_number(snapshot.sequence_number())
+            .with_schema_id(0)
+            .with_manifest_list(snapshot.manifest_list())
+            .with_summary(summary)
+            .build()
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_files_inherits_parent_snapshot_properties_on_rebase() {
+        // S401 holds the planned file and a writer marker plus a stale per-commit metric.
+        let base = retry_test_table();
+        let removed = retry_test_data_file("test/inherit-removed.parquet");
+        let replacement = retry_test_data_file("test/inherit-replacement.parquet");
+        let original_manifest = write_retry_test_manifest(
+            &base,
+            "memory:///test/location/metadata/inherit-original.avro",
+            401,
+            1,
+            vec![removed.clone()],
+        )
+        .await;
+        let snapshot = write_retry_test_snapshot(
+            &base,
+            "memory:///test/location/metadata/inherit-list-401.avro",
+            401,
+            1,
+            None,
+            vec![original_manifest.clone()],
+            1,
+        )
+        .await;
+        let snapshot = with_summary_properties(snapshot, [
+            ("writer.watermark", "41"),
+            ("added-equality-deletes", "5"),
+        ]);
+        let table_v1 = retry_test_table_at_snapshot(&base, snapshot);
+
+        let mut action = Transaction::new(&table_v1)
+            .rewrite_files()
+            .set_inherit_parent_snapshot_properties(true)
+            .delete_files([removed])
+            .add_data_files([replacement]);
+        action.set_snapshot_properties(HashMap::from([(
+            "rewrite.job".to_string(),
+            "j1".to_string(),
+        )]));
+        let action = Arc::new(action);
+
+        let first = committed_snapshot(Arc::clone(&action).commit(&table_v1).await.unwrap());
+        let properties = &first.summary().additional_properties;
+        assert_eq!(
+            properties.get("writer.watermark").map(String::as_str),
+            Some("41")
+        );
+        assert_eq!(
+            properties.get("rewrite.job").map(String::as_str),
+            Some("j1")
+        );
+        assert!(!properties.contains_key("added-equality-deletes"));
+
+        // S402 appends with a newer marker before the commit lands; the retry rebases onto it.
+        let appended_manifest = write_retry_test_added_manifest(
+            &base,
+            "memory:///test/location/metadata/inherit-appended.avro",
+            402,
+            2,
+            retry_test_data_file("test/inherit-appended.parquet"),
+        )
+        .await;
+        let snapshot = write_retry_test_snapshot(
+            &table_v1,
+            "memory:///test/location/metadata/inherit-list-402.avro",
+            402,
+            2,
+            Some(401),
+            vec![original_manifest, appended_manifest],
+            2,
+        )
+        .await;
+        let snapshot = with_summary_properties(snapshot, [("writer.watermark", "42")]);
+        let table_v2 = retry_test_table_at_snapshot(&table_v1, snapshot);
+
+        let second = committed_snapshot(Arc::clone(&action).commit(&table_v2).await.unwrap());
+        assert_eq!(second.parent_snapshot_id(), Some(402));
+        assert_eq!(
+            second
+                .summary()
+                .additional_properties
+                .get("writer.watermark")
+                .map(String::as_str),
+            Some("42")
         );
     }
 
@@ -3192,6 +3342,197 @@ mod tests {
                 "test/old-spec-survivor.parquet".to_string(),
                 ManifestStatus::Existing,
             ),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn test_replace_adds_file_with_non_default_partition_spec_id() {
+        let base = make_v2_minimal_table();
+        let metadata = base
+            .metadata()
+            .clone()
+            .into_builder(Some("memory:///test/location/metadata/v1.json".to_string()))
+            .set_location("memory:///test/location".to_string())
+            .add_partition_spec(UnboundPartitionSpec::builder().with_spec_id(1).build())
+            .unwrap()
+            .set_default_partition_spec(-1)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let table = base.with_metadata(Arc::new(metadata));
+        assert_eq!(table.metadata().default_partition_spec_id(), 1);
+
+        let old_spec = table.metadata().partition_spec_by_id(0).unwrap().clone();
+        let make_old_file = |path: &str| {
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(path.to_string())
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(100)
+                .record_count(1)
+                .partition_spec_id(0)
+                .partition(Struct::from_iter([Some(Literal::long(300))]))
+                .build()
+                .unwrap()
+        };
+        let removed = make_old_file("test/old-spec-removed.parquet");
+        let survivor = make_old_file("test/old-spec-survivor.parquet");
+        let manifest_path = "memory:///test/location/metadata/old-spec-data.avro";
+        let mut manifest_writer = ManifestWriterBuilder::new(
+            table.file_io().new_output(manifest_path).unwrap(),
+            Some(PARENT_SNAPSHOT_ID),
+            table.metadata().current_schema().clone(),
+            old_spec.as_ref().clone(),
+        )
+        .build_v2_data();
+        for file in [removed.clone(), survivor.clone()] {
+            manifest_writer
+                .add_entry(
+                    ManifestEntry::builder()
+                        .status(ManifestStatus::Added)
+                        .data_file(file)
+                        .build(),
+                )
+                .unwrap();
+        }
+        let manifest_file = manifest_writer.write_manifest_file().await.unwrap();
+
+        let manifest_list_path = "memory:///test/location/metadata/old-spec-manifest-list.avro";
+        let output = table
+            .file_io()
+            .new_output(manifest_list_path)
+            .unwrap()
+            .writer()
+            .await
+            .unwrap();
+        let mut manifest_list_writer =
+            ManifestListWriter::v2(output, PARENT_SNAPSHOT_ID, None, PARENT_SEQUENCE_NUMBER);
+        manifest_list_writer
+            .add_manifests([manifest_file].into_iter())
+            .unwrap();
+        manifest_list_writer.close().await.unwrap();
+
+        let parent_snapshot = Snapshot::builder()
+            .with_snapshot_id(PARENT_SNAPSHOT_ID)
+            .with_timestamp_ms(table.metadata().last_updated_ms() + 1)
+            .with_sequence_number(PARENT_SEQUENCE_NUMBER)
+            .with_schema_id(table.metadata().current_schema_id())
+            .with_manifest_list(manifest_list_path)
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: [
+                    ("total-data-files".to_string(), "2".to_string()),
+                    ("total-records".to_string(), "2".to_string()),
+                    ("total-files-size".to_string(), "200".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            })
+            .build();
+        let metadata = table
+            .metadata()
+            .clone()
+            .into_builder(Some("memory:///test/location/metadata/v2.json".to_string()))
+            .add_snapshot(parent_snapshot)
+            .unwrap()
+            .set_ref(
+                MAIN_BRANCH,
+                SnapshotReference::new(
+                    PARENT_SNAPSHOT_ID,
+                    SnapshotRetention::branch(None, None, None),
+                ),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let table = table.with_metadata(Arc::new(metadata));
+
+        let compacted = make_old_file("test/old-spec-compacted.parquet");
+        let default_spec_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("test/default-spec-added.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(1)
+            .partition(Struct::empty())
+            .build()
+            .unwrap();
+
+        // An unknown spec id is rejected before any manifest is written.
+        let mut unknown_spec_file = compacted.clone();
+        unknown_spec_file.partition_spec_id = 9999;
+        let err = Arc::new(
+            Transaction::new(&table)
+                .rewrite_files()
+                .add_data_files([unknown_spec_file]),
+        )
+        .commit(&table)
+        .await
+        .err()
+        .expect("unknown partition spec must be rejected");
+        assert!(
+            err.to_string()
+                .contains("Data file references an unknown partition spec"),
+            "{err}"
+        );
+
+        // Partition values are validated against the file's own spec, not the default spec.
+        let mut mismatched_partition_file = compacted.clone();
+        mismatched_partition_file.partition = Struct::empty();
+        let err = Arc::new(
+            Transaction::new(&table)
+                .rewrite_files()
+                .add_data_files([mismatched_partition_file]),
+        )
+        .commit(&table)
+        .await
+        .err()
+        .expect("partition value not matching the file's spec must be rejected");
+        assert!(
+            err.to_string()
+                .contains("Partition value is not compatible with partition type"),
+            "{err}"
+        );
+
+        let action = Transaction::new(&table)
+            .rewrite_files()
+            .delete_files([removed, survivor])
+            .add_data_files([compacted, default_spec_file]);
+        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let updates = action_commit.take_updates();
+        let TableUpdate::AddSnapshot { snapshot } = &updates[0] else {
+            unreachable!()
+        };
+        let manifest_list = table
+            .manifest_list_reader(&SnapshotRef::new(snapshot.clone()))
+            .load()
+            .await
+            .unwrap();
+
+        let mut added = Vec::new();
+        for manifest_file in manifest_list.entries() {
+            let manifest = manifest_file.load_manifest(table.file_io()).await.unwrap();
+            for entry in manifest.entries() {
+                assert_eq!(
+                    entry.data_file().partition_spec_id,
+                    manifest_file.partition_spec_id,
+                    "every entry must match its manifest's spec"
+                );
+                if entry.status() == ManifestStatus::Added {
+                    added.push((
+                        manifest_file.partition_spec_id,
+                        entry.file_path().to_string(),
+                    ));
+                }
+            }
+        }
+        added.sort();
+        assert_eq!(added, vec![
+            (0, "test/old-spec-compacted.parquet".to_string()),
+            (1, "test/default-spec-added.parquet".to_string()),
         ]);
     }
 
