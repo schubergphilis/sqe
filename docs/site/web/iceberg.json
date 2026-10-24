@@ -9,22 +9,22 @@
     {
       "catalog": "Project Nessie",
       "support": "Read + write (Iceberg REST)",
-      "testing": "Runnable quickstart and a live namespace round-trip test, run manually."
+      "testing": "Runnable quickstart, and a live namespace round-trip test in CI against a Nessie service container."
     },
     {
       "catalog": "Hive Metastore",
       "support": "Read + write",
-      "testing": "Live round-trip test against a standalone metastore container, run manually, not in CI."
+      "testing": "Live namespace round-trip test in CI against a standalone metastore service container."
     },
     {
       "catalog": "JDBC (PostgreSQL)",
       "support": "Read + write",
-      "testing": "Live round-trip tests, including a V3 table, run manually against PostgreSQL, not in CI."
+      "testing": "Live round-trip tests, including a V3 table, in CI against a PostgreSQL service container."
     },
     {
       "catalog": "Hadoop (storage-only)",
       "support": "Read only",
-      "testing": "Auto-discovery unit test; object-store integration test run manually. Writes go through a real catalog."
+      "testing": "Read-only by design: a Hadoop table has no catalog to commit through, so SQE writes only through a real catalog. Auto-discovery unit test; object-store integration test run manually."
     }
   ]
 }
