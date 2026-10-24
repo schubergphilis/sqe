@@ -163,10 +163,10 @@ The current Iceberg matrix rubric no longer scores catalog rows for Polaris, Nes
 | Catalog | Support | Testing |
 |---|---|---|
 | Apache Polaris | Read + write | Primary target catalog: the Polaris + Keycloak and Ranger quickstarts run against it end to end. |
-| Project Nessie | Read + write (Iceberg REST) | Runnable quickstart and a live namespace round-trip test, run manually. |
-| Hive Metastore | Read + write | Live round-trip test against a standalone metastore container, run manually, not in CI. |
-| JDBC (PostgreSQL) | Read + write | Live round-trip tests, including a V3 table, run manually against PostgreSQL, not in CI. |
-| Hadoop (storage-only) | Read only | Auto-discovery unit test; object-store integration test run manually. Writes go through a real catalog. |
+| Project Nessie | Read + write (Iceberg REST) | Runnable quickstart, and a live namespace round-trip test in CI against a Nessie service container. |
+| Hive Metastore | Read + write | Live namespace round-trip test in CI against a standalone metastore service container. |
+| JDBC (PostgreSQL) | Read + write | Live round-trip tests, including a V3 table, in CI against a PostgreSQL service container. |
+| Hadoop (storage-only) | Read only | Read-only by design: a Hadoop table has no catalog to commit through, so SQE writes only through a real catalog. Auto-discovery unit test; object-store integration test run manually. |
 
 Source: `docs/site/web/iceberg.json`.
 
