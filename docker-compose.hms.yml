@@ -40,8 +40,10 @@ services:
       - "19083:9083"
     healthcheck:
       # No HTTP endpoint; the server just listens on the Thrift port.
-      # `bash` ships in this image, used here to TCP-probe.
-      test: ["CMD-SHELL", "bash -c 'cat < /dev/tcp/localhost/9083 || exit 1'"]
+      # `bash` ships in this image, used here to TCP-probe. Only open the
+      # port: a Thrift server never speaks first, so `cat < /dev/tcp/...`
+      # blocked until the timeout and the container never turned healthy.
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/9083' || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 30
