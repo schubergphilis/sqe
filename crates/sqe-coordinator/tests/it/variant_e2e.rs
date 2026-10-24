@@ -6,6 +6,7 @@
 
 use arrow::array::AsArray;
 use arrow_array::Array;
+use object_store::ObjectStoreExt;
 
 /// Every row of `sql` as `col|col|...`, a variant cell as its JSON text and
 /// NULL as `NULL`.
@@ -518,4 +519,147 @@ async fn rewrite_data_files_preserves_variant_values() {
     let ddl = show_create(&handler, &session, fq).await;
     assert!(ddl.contains("v variant"), "still a variant column: {ddl}");
     drop(&handler, &session, fq).await;
+}
+
+/// The row groups of every data file of `table` (in `default`), and the
+/// largest file's size.
+async fn row_groups(
+    handler: &sqe_coordinator::QueryHandler,
+    session: &sqe_core::Session,
+    table: &str,
+) -> (usize, i64) {
+    let sql =
+        format!("SELECT file_path, file_size_in_bytes FROM table_files('default', '{table}')");
+    let mut groups = 0;
+    let mut largest = 0;
+    for row in rows(handler, session, &sql).await {
+        let (path, size) = row.split_once('|').expect("path|size");
+        let (bucket, key) = crate::variant_spark_interop::split_s3(path);
+        let bytes = crate::variant_spark_interop::test_store(&bucket)
+            .get(&object_store::path::Path::from(key.as_str()))
+            .await
+            .expect("get data file")
+            .bytes()
+            .await
+            .expect("read data file");
+        let reader =
+            parquet::file::serialized_reader::SerializedFileReader::new(bytes).expect("footer");
+        groups += parquet::file::reader::FileReader::metadata(&reader).num_row_groups();
+        largest = largest.max(size.parse::<i64>().expect("size"));
+    }
+    (groups, largest)
+}
+
+/// The scan's output rows in `EXPLAIN ANALYZE sql`.
+async fn scan_output_rows(
+    handler: &sqe_coordinator::QueryHandler,
+    session: &sqe_core::Session,
+    sql: &str,
+) -> i64 {
+    let analyze = format!("EXPLAIN ANALYZE {sql}");
+    let batches = handler
+        .execute(session, &analyze, None)
+        .await
+        .expect(&analyze);
+    let mut out = None;
+    for batch in &batches {
+        let ops = batch
+            .column_by_name("operation")
+            .expect("operation")
+            .as_string::<i32>();
+        let output = batch.column_by_name("output_rows").expect("output_rows");
+        let output = output.as_primitive::<arrow::datatypes::Int64Type>();
+        for r in 0..batch.num_rows() {
+            if ops.value(r) == "IcebergScanExec" {
+                assert!(out.is_none(), "one scan in {sql}");
+                out = Some(output.value(r));
+            }
+        }
+    }
+    out.unwrap_or_else(|| panic!("no IcebergScanExec in EXPLAIN ANALYZE {sql}"))
+}
+
+/// A comparison on a shredded variant field skips the row groups whose
+/// statistics exclude it (#870), on the small-file direct read and on the
+/// vendored reader, and returns what the unpruned scan returns.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn prunes_shredded_row_groups() {
+    let (session, handler) = crate::common::setup_handler().await;
+    // The small table is read whole into memory; the large one's file is
+    // over the 3 MiB direct-read threshold and goes through the vendored
+    // reader. The padding is incompressible so the file really is large.
+    for (table, n) in [
+        ("variant_prune_small", 20_000_i64),
+        ("variant_prune_large", 300_000),
+    ] {
+        let fq = format!("default.{table}");
+        drop(&handler, &session, &fq).await;
+        let create = format!(
+            "CREATE TABLE {fq} (id BIGINT, v VARIANT) \
+             WITH ('write.parquet.shred-variants' = 'true', \
+                   'write.parquet.row-group-size-bytes' = '262144')"
+        );
+        handler
+            .execute(&session, &create, None)
+            .await
+            .expect(&create);
+        let insert = format!(
+            r#"INSERT INTO {fq} SELECT value, '{{"a": ' || value || ', "pad": "' || md5(CAST(value AS VARCHAR)) || '"}}' FROM range(0, {n})"#
+        );
+        handler
+            .execute(&session, &insert, None)
+            .await
+            .expect(&insert);
+
+        let (groups, largest) = row_groups(&handler, &session, table).await;
+        assert!(
+            groups > 2,
+            "{table}: several row groups to prune, got {groups}"
+        );
+        let direct = largest < 3 * 1024 * 1024;
+        assert_eq!(direct, n == 20_000, "{table}: largest file {largest} bytes");
+
+        let cut = n - 100;
+        let pruned = format!(
+            "SELECT count(*), min(id) FROM {fq} WHERE variant_get(v, '$.a', 'bigint') >= {cut}"
+        );
+        // `+ 0` is not a shape the scan prunes on: the full-scan baseline.
+        let baseline = format!(
+            "SELECT count(*), min(id) FROM {fq} WHERE variant_get(v, '$.a', 'bigint') + 0 >= {cut}"
+        );
+        let want = vec![format!("100|{cut}")];
+        assert_eq!(
+            rows(&handler, &session, &pruned).await,
+            want,
+            "{table}: pruned"
+        );
+        assert_eq!(
+            rows(&handler, &session, &baseline).await,
+            want,
+            "{table}: baseline"
+        );
+
+        assert_eq!(
+            scan_output_rows(&handler, &session, &baseline).await,
+            n,
+            "{table}: baseline reads every row"
+        );
+        let read = scan_output_rows(&handler, &session, &pruned).await;
+        assert!(read < n / 2, "{table}: pruned scan read {read} of {n} rows");
+
+        // The literal on the left and `try_variant_get` prune the same way.
+        let flipped =
+            format!("SELECT count(*) FROM {fq} WHERE {cut} <= try_variant_get(v, '$.a', 'bigint')");
+        assert_eq!(
+            rows(&handler, &session, &flipped).await,
+            vec!["100"],
+            "{table}: flipped"
+        );
+        assert!(
+            scan_output_rows(&handler, &session, &flipped).await < n / 2,
+            "{table}: flipped prunes"
+        );
+        drop(&handler, &session, &fq).await;
+    }
 }

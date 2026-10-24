@@ -218,6 +218,8 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 sqlparser = { workspace = true }
+# variant_prune tests shred a variant column the way the writer does.
+parquet-variant-compute = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
 tracing-subscriber = { workspace = true }

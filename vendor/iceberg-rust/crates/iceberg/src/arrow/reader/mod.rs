@@ -34,6 +34,24 @@ use crate::util::available_parallelism;
 /// worker threads.
 pub const DEFAULT_TASK_SPLIT_TARGET_SIZE: u64 = 128 * 1024 * 1024;
 
+/// SQE PATCH (sqe#870): engine-side row-group pruning for conditions an
+/// Iceberg [`crate::expr::Predicate`] cannot express, such as a comparison on
+/// a shredded variant field (whose Parquet leaves carry no field id).
+///
+/// The reader calls [`RowGroupPruner::select`] once per file scan (sub)task,
+/// after byte-range selection and before predicate, bloom and page-index
+/// pruning, with the row groups still in play. It must return a subset of
+/// `candidates`; a row group it drops is never read. Returning `candidates`
+/// unchanged is always correct.
+pub trait RowGroupPruner: Send + Sync + std::fmt::Debug {
+    /// The row groups of `candidates` that may hold a matching row.
+    fn select(
+        &self,
+        metadata: &parquet::file::metadata::ParquetMetaData,
+        candidates: Vec<usize>,
+    ) -> Vec<usize>;
+}
+
 /// SQE PATCH (sqe#367): admission control for file scan task decode work.
 ///
 /// The reader calls [`DecodeGate::admit`] before dispatching each file scan
@@ -87,6 +105,8 @@ pub(crate) struct SqeReadOptions {
     /// SQE PATCH (sqe#scan-fetch-pipeline): fetch/decode pipelining depth;
     /// `0` disables staging.
     pub(crate) fetch_ahead: usize,
+    /// SQE PATCH (sqe#870): engine-side row-group pruning.
+    pub(crate) row_group_pruner: Option<Arc<dyn RowGroupPruner>>,
 }
 
 impl Default for SqeReadOptions {
@@ -99,6 +119,7 @@ impl Default for SqeReadOptions {
             bloom_probe_max_values:
                 crate::expr::sbbf_row_group_evaluator::DEFAULT_BLOOM_PROBE_MAX_VALUES,
             fetch_ahead: 0,
+            row_group_pruner: None,
         }
     }
 }
@@ -199,6 +220,13 @@ impl ArrowReaderBuilder {
     /// conjunct may carry and still be bloom-probed.
     pub fn with_bloom_probe_max_values(mut self, max_values: usize) -> Self {
         self.sqe.bloom_probe_max_values = max_values;
+        self
+    }
+
+    /// SQE PATCH (sqe#870): attach a [`RowGroupPruner`] consulted once per
+    /// file scan (sub)task. Ignored when row group filtering is disabled.
+    pub fn with_row_group_pruner(mut self, pruner: Arc<dyn RowGroupPruner>) -> Self {
+        self.sqe.row_group_pruner = Some(pruner);
         self
     }
 

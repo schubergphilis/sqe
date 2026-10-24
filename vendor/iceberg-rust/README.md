@@ -62,6 +62,7 @@ Upstream `testdata/` is vendored in full, so `cargo test -p iceberg --lib` runs 
 | — | `ManifestFile::load_manifest` shim over apache's `ManifestReader` | `spec/manifest_list/manifest_file.rs` |
 | — | V3 `unknown` columns are never written to a data file (top-level projected out, nested refused) (`SQE PATCH (v3-unknown)`) | `writer/file_writer/parquet_writer.rs` |
 | — | Shredded V3 variants read: variant manifest bounds skipped, `typed_value` storage accepted and unshredded by `PromotePlan::Unshred` (`SQE PATCH (v3-shredded-variant)`) | `spec/manifest/_serde.rs`, `arrow/reader/projection.rs`, `arrow/record_batch_transformer.rs` |
+| — | `RowGroupPruner`: an engine hook that drops row groups after the byte-range selection and before the predicate, for conditions iceberg-rust cannot express (shredded variant fields) (`SQE PATCH (sqe#870)`) | `arrow/reader/mod.rs`, `arrow/reader/pipeline.rs`, `scan/mod.rs` |
 
 Dropped because the new base already has them: the INT96, `read_with_metrics`, NaN,
 equality-delete NULL, positional-delete wakeup and run-buffering, constant-column and

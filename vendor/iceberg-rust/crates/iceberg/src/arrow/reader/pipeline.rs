@@ -36,7 +36,7 @@ use arrow_array::RecordBatch;
 
 use super::row_lineage::synthesize_row_id_column;
 use super::{
-    ArrowFileReader, ArrowReader, ParquetReadOptions, SqeReadOptions,
+    ArrowFileReader, ArrowReader, ParquetReadOptions, RowGroupPruner, SqeReadOptions,
     add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
     find_leaf_by_field_id,
 };
@@ -87,6 +87,7 @@ impl ArrowReader {
             dynamic_predicate: sqe.dynamic_predicate.clone(),
             bloom_filter_probing_enabled: sqe.bloom_filter_probing_enabled,
             bloom_probe_max_values: sqe.bloom_probe_max_values,
+            row_group_pruner: sqe.row_group_pruner.clone(),
         };
 
         // Fast-path for single concurrency to avoid overhead of try_flatten_unordered.
@@ -400,6 +401,8 @@ struct FileScanTaskReader {
     /// SQE PATCH (sqe#369): SBBF membership probing controls.
     bloom_filter_probing_enabled: bool,
     bloom_probe_max_values: usize,
+    /// SQE PATCH (sqe#870): engine-side row-group pruning.
+    row_group_pruner: Option<Arc<dyn RowGroupPruner>>,
 }
 
 impl FileScanTaskReader {
@@ -881,6 +884,23 @@ impl FileScanTaskReader {
                 task.length(),
             )?;
             selected_row_group_indices = Some(byte_range_filtered_row_groups);
+        }
+
+        // SQE PATCH (sqe#870): engine-side row-group pruning runs first, so
+        // every selection built below (predicate row groups, bloom probing,
+        // page-index row selection, positional deletes) already sees it.
+        if self.row_group_filtering_enabled
+            && let Some(pruner) = &self.row_group_pruner
+        {
+            let metadata = record_batch_stream_builder.metadata();
+            let candidates = selected_row_group_indices
+                .clone()
+                .unwrap_or_else(|| (0..metadata.num_row_groups()).collect());
+            let before = candidates.len();
+            let kept = pruner.select(metadata, candidates);
+            if kept.len() < before {
+                selected_row_group_indices = Some(kept);
+            }
         }
 
         if let Some(predicate) = final_predicate {
@@ -2872,6 +2892,92 @@ mod tests {
         // Groups 1 and 2 survive at physical positions 2..6 -> _row_id 102..106, not a
         // per-group restart at 100.
         assert_row_id_column(&batches, &[Some(102), Some(103), Some(104), Some(105)]);
+    }
+
+    /// SQE PATCH (sqe#870): drops one row group and records the candidates it saw.
+    #[derive(Debug)]
+    struct DropRowGroup {
+        drop: usize,
+        seen: std::sync::Mutex<Vec<Vec<usize>>>,
+    }
+
+    impl crate::arrow::RowGroupPruner for DropRowGroup {
+        fn select(
+            &self,
+            _metadata: &parquet::file::metadata::ParquetMetaData,
+            candidates: Vec<usize>,
+        ) -> Vec<usize> {
+            self.seen.lock().unwrap().push(candidates.clone());
+            candidates.into_iter().filter(|&i| i != self.drop).collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_row_group_pruner_skips_row_groups() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let tmp_dir = TempDir::new().unwrap();
+        let dir = tmp_dir.path().to_str().unwrap();
+
+        // 6 rows, 2 per row group -> 3 row groups.
+        let file_path = format!("{dir}/row_group_pruner.parquet");
+        let field = Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "1".to_string(),
+        )]));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![field]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(
+            vec![1, 2, 3, 4, 5, 6],
+        ))])
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2))
+            .build();
+        let file = File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let read = |task: FileScanTask, pruner: Arc<DropRowGroup>| async move {
+            let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+                .with_row_group_pruner(pruner)
+                .build();
+            let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+            reader
+                .read(tasks)
+                .unwrap()
+                .stream()
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .unwrap()
+        };
+
+        // The whole file: the pruner sees every row group and the dropped one
+        // is never read. Survivors keep their global positions.
+        let pruner = Arc::new(DropRowGroup {
+            drop: 1,
+            seen: Default::default(),
+        });
+        let batches = read(row_id_task(file_path.clone(), Some(0)), pruner.clone()).await;
+        assert_eq!(*pruner.seen.lock().unwrap(), vec![vec![0, 1, 2]]);
+        assert_row_id_column(&batches, &[Some(0), Some(1), Some(4), Some(5)]);
+
+        // A byte range past row group 0: the pruner sees only the groups the
+        // range selected.
+        let metadata = SerializedFileReader::new(File::open(&file_path).unwrap())
+            .unwrap()
+            .metadata()
+            .clone();
+        let start = 4 + metadata.row_group(0).compressed_size() as u64;
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
+        let task = row_id_task_with_options(file_path, Some(0), start, file_size - start, vec![]);
+        let pruner = Arc::new(DropRowGroup {
+            drop: 2,
+            seen: Default::default(),
+        });
+        let batches = read(task, pruner.clone()).await;
+        assert_eq!(*pruner.seen.lock().unwrap(), vec![vec![1, 2]]);
+        assert_row_id_column(&batches, &[Some(2), Some(3)]);
     }
 
     /// Writes a positional delete file (`file_path` + `pos` reserved columns) marking the
