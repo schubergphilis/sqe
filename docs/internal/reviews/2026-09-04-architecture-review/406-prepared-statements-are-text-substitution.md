@@ -4,8 +4,20 @@
 - Severity: medium
 - Category: architecture
 - Effort: M (days)
-- Status: open
+- Status: fixed (queries in #656; every other path on branch `feat/bound-parameters-in-plan`, 2026-10-24)
 - Issue: #586
+
+## Resolution (2026-10-24)
+
+#656 bound Flight SQL prepared queries into the plan and kept the rest as
+text on purpose. `feat/bound-parameters-in-plan` reverses that: Trino
+`EXECUTE ... USING`, Flight SQL prepared DML and DDL, and the re-plan after
+vended credentials expire all plan with `$1..$N` markers and bind typed
+values (`sqe_core::bind_params`), carried in the task-local statement scope
+so a write's derived plans bind them too. `substitute_placeholders` and
+`render_bound_sql` are removed; the query log holds the markers. Known
+limits are listed in
+`docs/internal/status/2026-10-24-feat-bound-parameters-in-plan.md`.
 
 ## Problem
 

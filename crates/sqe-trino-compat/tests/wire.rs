@@ -171,6 +171,36 @@ impl TrinoQueryExecutor for DfExecutor {
         Ok(TrinoResultStream::new(schema, Box::pin(mapped)))
     }
 
+    /// As the engine does: plan the numbered template, then bind the values
+    /// into the plan.
+    async fn execute_bound_with_query_id(
+        &self,
+        _session: &Session,
+        sql: &str,
+        params: Vec<datafusion::scalar::ScalarValue>,
+        _query_id: &str,
+    ) -> Result<TrinoResultStream, SqeError> {
+        let plan = self
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .map_err(|e| SqeError::Execution(e.to_string()))?;
+        let plan = sqe_core::bind_params(plan, &params).map_err(SqeError::Execution)?;
+        let df = self
+            .ctx
+            .execute_logical_plan(plan)
+            .await
+            .map_err(|e| SqeError::Execution(e.to_string()))?;
+        let stream = df
+            .execute_stream()
+            .await
+            .map_err(|e| SqeError::Execution(e.to_string()))?;
+        let schema = stream.schema();
+        let mapped = stream.map(|r| r.map_err(|e| SqeError::Execution(e.to_string())));
+        Ok(TrinoResultStream::new(schema, Box::pin(mapped)))
+    }
+
     fn memory_pool(&self) -> Option<Arc<dyn MemoryPool>> {
         Some(self.ctx.runtime_env().memory_pool.clone())
     }
@@ -874,6 +904,29 @@ async fn execute_using_binds_values_not_sql() {
     let posted = h.step("negative", req).await;
     let pages = h.follow("negative", &posted).await;
     assert_eq!(all_rows(&pages), vec![json!([6])]);
+
+    // A bound value filters a table like a literal would.
+    let req = h.post_as("alice", "EXECUTE q USING 3").header(
+        "X-Trino-Prepared-Statement",
+        "q=SELECT+name+FROM+t+WHERE+id+%3D+%3F",
+    );
+    let posted = h.step("filter", req).await;
+    let pages = h.follow("filter", &posted).await;
+    assert_eq!(all_rows(&pages), vec![json!(["row-3"])]);
+
+    // A value that does not fit its placeholder's type is refused by
+    // position and type; the value itself is never echoed.
+    let req = h.post_as("alice", "EXECUTE q USING 'secret-value'").header(
+        "X-Trino-Prepared-Statement",
+        "q=SELECT+name+FROM+t+WHERE+id+%3D+%3F",
+    );
+    let posted = h.step("wrong-type", req).await;
+    let pages = h.follow("wrong-type", &posted).await;
+    let last = pages.last().unwrap_or(&posted);
+    assert_eq!(last.state(), "FAILED");
+    let message = last.body["error"]["message"].as_str().expect("message");
+    assert!(message.contains("parameter $1"), "{message}");
+    assert!(!message.contains("secret-value"), "{message}");
 
     for arg in ["lower('A')", "(SELECT 1)"] {
         let req = h
