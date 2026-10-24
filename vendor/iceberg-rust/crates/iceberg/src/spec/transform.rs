@@ -221,6 +221,11 @@ impl Transform {
             (Self::Hour, PrimitiveLiteral::Int(ordinal)) => Self::human_hour(ordinal),
             (_, value) => {
                 let field_type = field_type.as_primitive_type().unwrap();
+                // SQE PATCH: a file written before an `int` -> `long` (or `float` ->
+                // `double`) promotion keeps the narrow literal, and the datum arm
+                // panics on a type/literal mismatch. Widen it first, so a DELETE that
+                // removes such a file can build its partition summary path.
+                let value = value.promote_to(field_type).unwrap_or(value);
                 Datum::new(field_type.clone(), value).to_human_string()
             }
         }
@@ -411,6 +416,14 @@ impl Transform {
             self,
             Transform::Void | Transform::Bucket(_) | Transform::Unknown
         )
+    }
+
+    /// Whether a partition field with this transform may be named after its source column.
+    ///
+    /// Void is allowed because removing an identity field from a format version 1 spec leaves
+    /// a void field that keeps the identity field's name.
+    pub(crate) fn may_share_name_with_source(&self) -> bool {
+        matches!(self, Transform::Identity | Transform::Void)
     }
 
     /// Return the unique transform name to check if similar transforms for the same source field
@@ -1320,6 +1333,25 @@ mod tests {
                 Some(&Literal::string("unformatted"))
             ),
             "unformatted"
+        );
+    }
+
+    /// A partition value written before an `int` -> `long` or `float` -> `double`
+    /// promotion keeps its narrow literal; it renders under the promoted type
+    /// instead of panicking on the type/literal mismatch.
+    #[test]
+    fn test_to_human_string_widens_promoted_values() {
+        assert_eq!(
+            Transform::Identity
+                .to_human_string(&Type::Primitive(PrimitiveType::Long), Some(&Literal::int(7))),
+            "7"
+        );
+        assert_eq!(
+            Transform::Identity.to_human_string(
+                &Type::Primitive(PrimitiveType::Double),
+                Some(&Literal::float(1.5_f32))
+            ),
+            "1.5"
         );
     }
 

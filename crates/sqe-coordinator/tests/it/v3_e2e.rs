@@ -1328,6 +1328,77 @@ async fn type_promotion_widens_and_refuses_the_rest() {
     );
 }
 
+/// Files written before an int -> long (or float -> double) promotion keep
+/// the narrow type in their partition tuple and column bounds. Pruning
+/// compared those against the widened predicate literal, got no ordering
+/// and dropped the file, so filters on a promoted column lost rows (before
+/// the fix `p = 2` returned nothing and `p >= 2` only the new row). A DELETE
+/// that removed such a file panicked building its partition summary path.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn type_promotion_keeps_old_files_in_filtered_scans() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let fq = "default.v3_type_promo_pruning";
+    reset_table(
+        &handler,
+        &session,
+        fq,
+        &format!("CREATE TABLE {fq} (id INT, p INT, f REAL) PARTITIONED BY (p)"),
+    )
+    .await;
+    let insert = format!("INSERT INTO {fq} VALUES (1, 1, 1.5), (2, 2, 2.5), (3, 3, 3.5)");
+    handler
+        .execute(&session, &insert, None)
+        .await
+        .expect(&insert);
+    for (column, to) in [("p", "BIGINT"), ("id", "BIGINT"), ("f", "DOUBLE")] {
+        let alter = format!("ALTER TABLE {fq} ALTER COLUMN {column} SET DATA TYPE {to}");
+        handler.execute(&session, &alter, None).await.expect(&alter);
+    }
+    let insert = format!("INSERT INTO {fq} VALUES (4, 4, 4.5)");
+    handler
+        .execute(&session, &insert, None)
+        .await
+        .expect(&insert);
+
+    let mut results = Vec::new();
+    for filter in [
+        "p = 2",
+        "p >= 2",
+        "p IN (1, 3)",
+        "id > 1 AND id < 4",
+        "f > 2.0",
+    ] {
+        let select = format!("SELECT id FROM {fq} WHERE {filter} ORDER BY id");
+        let ids = rendered_rows(&handler, &session, &select).await.join(",");
+        results.push(format!("{filter}: {ids}"));
+    }
+    let delete = format!("DELETE FROM {fq} WHERE p = 1");
+    handler
+        .execute(&session, &delete, None)
+        .await
+        .expect(&delete);
+    let select = format!("SELECT id FROM {fq} ORDER BY id");
+    let ids = rendered_rows(&handler, &session, &select).await.join(",");
+    results.push(format!("after DELETE p = 1: {ids}"));
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+
+    assert_eq!(
+        results,
+        [
+            "p = 2: 2",
+            "p >= 2: 2,3,4",
+            "p IN (1, 3): 1,3",
+            "id > 1 AND id < 4: 2,3",
+            "f > 2.0: 2,3,4",
+            "after DELETE p = 1: 2,3,4",
+        ],
+        "filters on promoted columns"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Cell: sqe:statistics:v3
 //
