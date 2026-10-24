@@ -906,6 +906,14 @@ impl QueryHandler {
                 {
                     return Ok(sc);
                 }
+                // The session's own default that neither config nor Polaris
+                // builds (a Hive root or an ATTACHed catalog after `USE`): keep
+                // the session catalog, as before such a default was resolved
+                // by name. The caller chose it; refusing would break every
+                // unqualified SHOW under that `USE`.
+                if session.default_catalog.as_deref() == Some(name.as_str()) {
+                    return self.session_catalog(session).await;
+                }
                 // Deliberately an error, not a fallback to the session catalog.
                 // Falling back is what produced the bug this replaces: the answer
                 // described a DIFFERENT catalog than the one named, and reported
@@ -5706,9 +5714,19 @@ impl QueryHandler {
         // reserved keys that Iceberg manages internally so the round-trip
         // matches what the user actually set in CREATE TABLE.
         // Resolved as every other statement resolves a name: quotes stripped,
-        // a bare name in the session schema.
+        // a bare name in the session schema. The table loads from the catalog
+        // the name resolves in (its qualifier, else the session default):
+        // `session_catalog` is the config default's, and read another
+        // catalog's table of the same name, or none.
         let table_ident = crate::ident::resolve_table_ident(obj_name, session)?;
-        if let Ok(table) = session_catalog.load_table(&table_ident).await {
+        let qualifier = crate::ident::catalog_qualifier(obj_name);
+        // Best effort, like the load: an ATTACHed catalog has columns but no
+        // `SessionCatalog`, and its DDL prints without properties.
+        let props_table = match self.show_catalog(session, qualifier.as_deref()).await {
+            Ok(props_catalog) => props_catalog.load_table(&table_ident).await.ok(),
+            Err(_) => None,
+        };
+        if let Some(table) = props_table {
             let props = table.metadata().properties();
             // Iceberg-internal property keys we never want to surface.
             const SUPPRESSED_PREFIXES: &[&str] = &[
@@ -10362,6 +10380,13 @@ enum ShowCatalogTarget {
 /// the session already resolves to". A name is matched against both the catalog's
 /// KEY and its `warehouse`, because a legacy single-catalog deployment is keyed
 /// `iceberg` while operators name it by its warehouse.
+///
+/// "The session catalog" is the config default even when the session names
+/// another default (`USE sales_wh.ac`): `create_session_context` hands back the
+/// config default's `SessionCatalog` and only registers the session's own
+/// catalog with DataFusion. A session default other than the config default is
+/// therefore resolved by name, or `SHOW CREATE TABLE ns.t` read the config
+/// default's table of that name, or none.
 fn show_catalog_target(
     named: Option<&str>,
     session_default: Option<&str>,
@@ -10370,9 +10395,7 @@ fn show_catalog_target(
     let Some(named) = named.or(session_default) else {
         return ShowCatalogTarget::Session;
     };
-    let effective_default = session_default
-        .map(str::to_string)
-        .unwrap_or_else(|| config.resolve_default_catalog());
+    let effective_default = config.resolve_default_catalog();
     if named == effective_default {
         return ShowCatalogTarget::Session;
     }
@@ -11775,19 +11798,27 @@ warehouse = "wh1"
             show_catalog_target(None, None, &config),
             ShowCatalogTarget::Session
         );
-        // A session that overrides the default is honoured over the config.
+        // The config default stays the session catalog when the session
+        // overrides its default: that is the catalog `session_catalog()` returns.
+        assert_eq!(
+            show_catalog_target(Some("ops_wh"), Some("sales_wh"), &config),
+            ShowCatalogTarget::Session
+        );
+    }
+
+    #[test]
+    fn a_session_default_override_is_resolved_by_name() {
+        // `session_catalog()` returns the config default's catalog (ops_wh)
+        // even under `USE sales_wh.ns`. Answering `Session` here read ops_wh:
+        // SHOW CREATE TABLE printed no TBLPROPERTIES for a sales_wh table.
+        let config = two_catalog_config();
         assert_eq!(
             show_catalog_target(Some("sales_wh"), Some("sales_wh"), &config),
-            ShowCatalogTarget::Session
+            ShowCatalogTarget::Named("sales_wh".to_string())
         );
         assert_eq!(
             show_catalog_target(None, Some("sales_wh"), &config),
-            ShowCatalogTarget::Session
-        );
-        // ... and a catalog that is NOT the session's override is named.
-        assert_eq!(
-            show_catalog_target(Some("ops_wh"), Some("sales_wh"), &config),
-            ShowCatalogTarget::Named("ops_wh".to_string())
+            ShowCatalogTarget::Named("sales_wh".to_string())
         );
     }
 

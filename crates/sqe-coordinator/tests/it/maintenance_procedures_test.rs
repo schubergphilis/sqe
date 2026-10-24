@@ -15,8 +15,7 @@
 use sqe_sql::{parse_and_classify, ProcedureCall, StatementKind};
 
 /// The root test session as a configured admin. Admin-tier procedures
-/// (a deleting remove_orphan_files, rollback/set_current) need an
-/// admin role, and root's client-credentials token carries none. The token
+/// (rollback/set_current, drop/register) need an admin role, and root's client-credentials token carries none. The token
 /// stays root's, so Polaris still sees the real principal.
 fn as_admin(mut session: sqe_core::Session) -> sqe_core::Session {
     session.user.roles = vec!["service_admin".to_string()];
