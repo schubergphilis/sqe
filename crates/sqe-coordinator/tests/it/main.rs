@@ -30,6 +30,7 @@ mod attach_rest_test;
 mod audit_e2e_test;
 mod audit_planning_failure_test;
 mod bloom_spec_spark_interop;
+mod bound_params_e2e;
 mod catalog_discovery_test;
 mod compaction_benchmark;
 mod compaction_distributed_benchmark;

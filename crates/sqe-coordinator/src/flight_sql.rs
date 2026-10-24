@@ -1383,9 +1383,10 @@ impl SqeFlightSqlService {
     /// planning exactly as the SQL path does. The bind is not consumed, so
     /// the next execution without a re-bind reuses it.
     ///
-    /// Statements without a stored plan (DML, DDL, metadata) still execute
-    /// through the buffered text path; their bound values are rendered as SQL
-    /// literals into the original text.
+    /// Statements without a stored plan (DML, DDL, metadata), and a query
+    /// whose stored plan's credentials expired, plan their `numbered_sql`
+    /// again with the bind applied to every plan they make
+    /// ([`sqe_catalog::txn::with_params`]); the values never enter the text.
     async fn run_prepared_into_flight_response(
         &self,
         session: &sqe_core::Session,
@@ -1394,7 +1395,7 @@ impl SqeFlightSqlService {
         query_id: Option<uuid::Uuid>,
     ) -> Result<Response<FlightStream>, Status> {
         // A stored plan whose tables' vended keys are due for refresh is not
-        // run: the text path below re-plans, which reloads the tables.
+        // run: the path below re-plans, which reloads the tables.
         if statement.plan.is_some() && !statement.stored_plan_credentials_expired() {
             let plan = statement
                 .bound_plan()
@@ -1412,9 +1413,21 @@ impl SqeFlightSqlService {
                 .map_err(|e| sqe_error_to_status(&e, None))?;
             return self.stream_to_flight_response(schema, stream);
         }
-        let sql = render_bound_sql(statement)?;
-        self.run_sql_into_flight_response(session, &sql, client_ip, query_id)
-            .await
+        match required_bind(statement)? {
+            Some(params) => {
+                let run = self.run_sql_into_flight_response(
+                    session,
+                    &statement.numbered_sql,
+                    client_ip,
+                    query_id,
+                );
+                sqe_catalog::txn::with_params(params, run).await
+            }
+            None => {
+                self.run_sql_into_flight_response(session, &statement.sql, client_ip, query_id)
+                    .await
+            }
+        }
     }
 
     // -----------------------------------------------------------------
@@ -2613,22 +2626,34 @@ impl FlightSqlService for SqeFlightSqlService {
         let client_ip = Some(self.extract_client_ip(&request));
 
         // Prepared DML: bind whatever parameters the DoPut stream carries,
-        // then run the statement through the buffered path with the bound
-        // values rendered as literals (these statement kinds have no stored
-        // plan; see `run_prepared_into_flight_response`).
+        // then run its `$n` text through the buffered path with the values
+        // bound into every plan it makes (these statement kinds have no
+        // stored plan; see `run_prepared_into_flight_response`).
         let (_, statement) = self
             .prepared_from_handle(&session, &query.prepared_statement_handle)
             .await?;
         self.bind_prepared_from_stream(&statement, request.into_inner())
             .await?;
         let session = in_request_transaction(session, statement.transaction_handle())?;
-        let sql = render_bound_sql(&statement)?;
-
-        let batches = self
-            .query_handler
-            .execute(&session, &sql, client_ip)
-            .await
-            .map_err(|e| sqe_error_to_status(&e, None))?;
+        let batches = match required_bind(&statement)? {
+            Some(params) => {
+                self.query_handler
+                    .execute_bound_with_id(
+                        &session,
+                        &statement.numbered_sql,
+                        params,
+                        client_ip,
+                        None,
+                    )
+                    .await
+            }
+            None => {
+                self.query_handler
+                    .execute(&session, &statement.sql, client_ip)
+                    .await
+            }
+        }
+        .map_err(|e| sqe_error_to_status(&e, None))?;
 
         let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
         Ok(rows)
@@ -3261,157 +3286,23 @@ where
     Ok(values)
 }
 
-/// Render a prepared statement's bound values into its original text for the
-/// buffered (non-query) path, which has no stored plan to bind into.
-fn render_bound_sql(statement: &PreparedStatement) -> Result<String, Status> {
+/// A prepared statement's bound values, for a path that plans its
+/// `numbered_sql` again (DML, DDL, a query whose stored plan's credentials
+/// expired). `None` when it has no parameters; an error when it has some and
+/// nothing is bound.
+fn required_bind(
+    statement: &PreparedStatement,
+) -> Result<Option<Vec<datafusion::scalar::ScalarValue>>, Status> {
     if statement.param_count() == 0 {
-        return Ok(statement.sql.clone());
+        return Ok(None);
     }
-    let values = statement.bound_values().ok_or_else(|| {
+    statement.bound_values().map(Some).ok_or_else(|| {
         Status::failed_precondition(format!(
             "prepared statement has {} parameters but no values are bound",
             statement.param_count()
         ))
-    })?;
-    let literals = values
-        .iter()
-        .map(|value| {
-            value
-                .to_array()
-                .map(|array| arrow_value_to_sql_literal(array.as_ref(), 0))
-                .map_err(|e| Status::internal(format!("Failed to render bound parameter: {e}")))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    sqe_core::substitute_placeholders(&statement.sql, &literals).map_err(Status::invalid_argument)
+    })
 }
-
-/// Render one Arrow scalar as a SQL literal usable in textual substitution.
-///
-/// Strings are single-quoted with embedded quotes escaped. Binary is
-/// rendered as `X'<hex>'`. Numerics and booleans are formatted literally.
-/// Unsupported / structured types fall back to a quoted display string;
-/// the caller is expected to reject those before relying on the result.
-fn arrow_value_to_sql_literal(array: &dyn arrow_array::Array, row: usize) -> String {
-    use arrow_array::*;
-    use arrow_schema::DataType;
-
-    if array.is_null(row) {
-        return "NULL".to_string();
-    }
-    match array.data_type() {
-        DataType::Boolean => {
-            let a = array.as_any().downcast_ref::<BooleanArray>().unwrap();
-            if a.value(row) { "TRUE" } else { "FALSE" }.to_string()
-        }
-        DataType::Int8 => array
-            .as_any()
-            .downcast_ref::<Int8Array>()
-            .unwrap()
-            .value(row)
-            .to_string(),
-        DataType::Int16 => array
-            .as_any()
-            .downcast_ref::<Int16Array>()
-            .unwrap()
-            .value(row)
-            .to_string(),
-        DataType::Int32 => array
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap()
-            .value(row)
-            .to_string(),
-        DataType::Int64 => array
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .value(row)
-            .to_string(),
-        DataType::UInt8 => array
-            .as_any()
-            .downcast_ref::<UInt8Array>()
-            .unwrap()
-            .value(row)
-            .to_string(),
-        DataType::UInt16 => array
-            .as_any()
-            .downcast_ref::<UInt16Array>()
-            .unwrap()
-            .value(row)
-            .to_string(),
-        DataType::UInt32 => array
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .unwrap()
-            .value(row)
-            .to_string(),
-        DataType::UInt64 => array
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap()
-            .value(row)
-            .to_string(),
-        DataType::Float32 => {
-            let v = array
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .unwrap()
-                .value(row);
-            float_sql_literal(v.is_finite(), v.to_string(), "REAL")
-        }
-        DataType::Float64 => {
-            let v = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .unwrap()
-                .value(row);
-            float_sql_literal(v.is_finite(), v.to_string(), "DOUBLE")
-        }
-        DataType::Utf8 => {
-            let a = array.as_any().downcast_ref::<StringArray>().unwrap();
-            sql_quote_string(a.value(row))
-        }
-        DataType::LargeUtf8 => {
-            let a = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
-            sql_quote_string(a.value(row))
-        }
-        DataType::Binary => {
-            let a = array.as_any().downcast_ref::<BinaryArray>().unwrap();
-            format!("X'{}'", hex::encode(a.value(row)))
-        }
-        DataType::LargeBinary => {
-            let a = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
-            format!("X'{}'", hex::encode(a.value(row)))
-        }
-        _ => {
-            // Fall back to display rendering wrapped in single quotes so the
-            // result is still syntactically valid SQL. Callers that need
-            // exact type fidelity should round-trip through DataFusion's
-            // ParamValues path (deferred follow-up).
-            let s = arrow::util::display::array_value_to_string(array, row).unwrap_or_default();
-            sql_quote_string(&s)
-        }
-    }
-}
-
-/// A finite float is a bare number. `NaN`, `inf` and `-inf` would read as
-/// identifiers (a column named `nan` would bind instead of the value), so
-/// they go in as a cast from a string.
-fn float_sql_literal(finite: bool, text: String, sql_type: &str) -> String {
-    if finite {
-        text
-    } else {
-        format!("CAST('{text}' AS {sql_type})")
-    }
-}
-
-fn sql_quote_string(s: &str) -> String {
-    let escaped = s.replace('\'', "''");
-    format!("'{escaped}'")
-}
-
-// `?` placeholder substitution lives in `sqe_core::substitute_placeholders`,
-// shared with the Trino HTTP `EXECUTE ... USING` path.
 
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -3667,11 +3558,6 @@ mod tests {
         assert!(super::like_match("a_c", "abc"));
         assert!(!super::like_match("a_c", "abbc"));
         assert!(!super::like_match("a_c", "ac"));
-    }
-
-    #[test]
-    fn sql_quote_string_escapes_quotes() {
-        assert_eq!(super::sql_quote_string("o'malley"), "'o''malley'");
     }
 
     // -----------------------------------------------------------------------
@@ -4774,25 +4660,31 @@ catalog_url = ""
         assert_eq!(healthy, vec!["http://w1:50052", "http://w2:50052"]);
     }
 
-    /// Bound floats render as values DataFusion reads back: a negative number
-    /// spliced after `-` stays an operand, and NaN / infinity are not read as
-    /// column names.
+    /// Bound floats come back as values: a negative number after `-` stays an
+    /// operand, `1 - $1` (whose placeholder DataFusion types Int64) does not
+    /// truncate `-1.5`, and NaN / infinity survive. Values never pass through
+    /// SQL text.
     #[tokio::test]
-    async fn bound_float_literals_read_back_as_values() {
-        use arrow_array::{Float32Array, Float64Array};
-        let values = Float64Array::from(vec![-1.5, f64::NAN, f64::INFINITY, f64::NEG_INFINITY]);
-        let literals: Vec<String> = (0..values.len())
-            .map(|row| arrow_value_to_sql_literal(&values, row))
+    async fn bound_float_values_read_back_as_values() {
+        use datafusion::scalar::ScalarValue;
+        let values: Vec<ScalarValue> = [-1.5, f64::NAN, f64::INFINITY, f64::NEG_INFINITY]
+            .into_iter()
+            .map(|v| ScalarValue::Float64(Some(v)))
             .collect();
-        assert_eq!(literals[1], "CAST('NaN' AS DOUBLE)");
-        assert_eq!(literals[2], "CAST('inf' AS DOUBLE)");
-        let real = Float32Array::from(vec![f32::NAN]);
-        assert_eq!(arrow_value_to_sql_literal(&real, 0), "CAST('NaN' AS REAL)");
-
-        let template = "SELECT 1-? AS a, ? AS b, ? AS c, ? AS d";
-        let sql = sqe_core::substitute_placeholders(template, &literals).unwrap();
         let ctx = datafusion::prelude::SessionContext::new();
-        let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+        let plan = ctx
+            .state()
+            .create_logical_plan("SELECT 1-$1 AS a, $2 AS b, $3 AS c, $4 AS d")
+            .await
+            .unwrap();
+        let plan = sqe_core::bind_params(plan, &values).unwrap();
+        let batches = ctx
+            .execute_logical_plan(plan)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         let column = |i: usize| {
             batches[0]
                 .column(i)

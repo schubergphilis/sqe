@@ -112,9 +112,24 @@ pub async fn plan_sql(
 ) -> DFResult<datafusion::dataframe::DataFrame> {
     in_statement(async {
         prepare_statement(ctx, sql).await?;
-        name_unknown_types(ctx.sql_with_options(sql, planning_options()).await?)
+        let df = ctx.sql_with_options(sql, planning_options()).await?;
+        name_unknown_types(bind_statement_params(df)?)
     })
     .await
+}
+
+/// Bind the statement's parameter values ([`crate::txn::with_params`]) into
+/// a plan just made from SQL text. Every planner entry point calls it, so a
+/// statement whose executor plans several derived queries (a MERGE's source
+/// and its checks, a DELETE's filter) binds each one, before the policy
+/// enforcer sees the plan.
+fn bind_statement_params(df: DataFrame) -> DFResult<DataFrame> {
+    let Some(params) = crate::txn::params() else {
+        return Ok(df);
+    };
+    let (state, plan) = df.into_parts();
+    let plan = sqe_core::bind_params(plan, &params).map_err(DataFusionError::Plan)?;
+    Ok(DataFrame::new(state, plan))
 }
 
 /// `information_schema.columns` names each type by its Arrow display, so an
@@ -164,7 +179,7 @@ pub async fn plan_sql_without_policy(
 ) -> DFResult<datafusion::dataframe::DataFrame> {
     in_statement(async {
         prepare_statement(ctx, sql).await?;
-        name_unknown_types(ctx.sql(sql).await?)
+        name_unknown_types(bind_statement_params(ctx.sql(sql).await?)?)
     })
     .await
 }
@@ -178,7 +193,8 @@ pub async fn plan_parsed(
 ) -> DFResult<datafusion::dataframe::DataFrame> {
     in_statement(async {
         prepare_parsed_statement(ctx, statement).await?;
-        name_unknown_types(ctx.sql_with_options(sql, planning_options()).await?)
+        let df = ctx.sql_with_options(sql, planning_options()).await?;
+        name_unknown_types(bind_statement_params(df)?)
     })
     .await
 }
@@ -213,7 +229,11 @@ pub async fn create_logical_plan(
                 registry.prepare_statement(sql).await?;
             }
         }
-        state.create_logical_plan(sql).await
+        let plan = state.create_logical_plan(sql).await?;
+        match crate::txn::params() {
+            Some(params) => sqe_core::bind_params(plan, &params).map_err(DataFusionError::Plan),
+            None => Ok(plan),
+        }
     })
     .await
 }

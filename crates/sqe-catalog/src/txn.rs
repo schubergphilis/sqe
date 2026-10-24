@@ -237,15 +237,23 @@ impl TxnScope {
 }
 
 /// What a statement runs in: an explicit transaction, or the session's
-/// `WRITE_BRANCH` for a data write outside one (#829). Never both.
+/// `WRITE_BRANCH` for a data write outside one (#829). Never both. Plus the
+/// values bound to the statement's `$n` placeholders, if any ([`with_params`]).
 #[derive(Clone, Default)]
 struct StatementScope {
     txn: Option<Arc<TxnScope>>,
     write_branch: Option<Arc<str>>,
+    params: Option<Arc<[datafusion::scalar::ScalarValue]>>,
 }
 
 tokio::task_local! {
     static CURRENT: StatementScope;
+}
+
+/// The bound values of the enclosing [`with_params`], kept when a nested
+/// scope sets the transaction or branch.
+fn inherited_params() -> Option<Arc<[datafusion::scalar::ScalarValue]>> {
+    CURRENT.try_with(|s| s.params.clone()).ok().flatten()
 }
 
 /// Run `f` inside `txn`'s scope. `None` runs it outside any transaction,
@@ -255,8 +263,29 @@ pub async fn scope<F: Future>(txn: Option<Arc<TxnScope>>, f: F) -> F::Output {
     let scope = StatementScope {
         txn,
         write_branch: None,
+        params: inherited_params(),
     };
     CURRENT.scope(scope, f).await
+}
+
+/// Run the statement `f` with `params` bound to its `$1..$N` placeholders.
+/// Every plan the statement makes through `file_tvf_prepare`'s planning
+/// entry points binds them, so a write that plans its source, filter and
+/// checks from generated SQL binds each of those plans; the values never
+/// enter SQL text.
+pub async fn with_params<F: Future>(
+    params: Vec<datafusion::scalar::ScalarValue>,
+    f: F,
+) -> F::Output {
+    let mut scope = CURRENT.try_with(StatementScope::clone).unwrap_or_default();
+    scope.params = Some(params.into());
+    CURRENT.scope(scope, f).await
+}
+
+/// The values bound to the current statement's placeholders
+/// ([`with_params`]).
+pub fn params() -> Option<Arc<[datafusion::scalar::ScalarValue]>> {
+    inherited_params()
 }
 
 /// Run the data write `f` on the session's `WRITE_BRANCH` (#829): inside
@@ -274,7 +303,12 @@ pub async fn write_scope<F: Future>(
         Some(_) => None,
         None => write_branch.map(Arc::from),
     };
-    CURRENT.scope(StatementScope { txn, write_branch }, f).await
+    let scope = StatementScope {
+        txn,
+        write_branch,
+        params: inherited_params(),
+    };
+    CURRENT.scope(scope, f).await
 }
 
 /// The transaction the current task runs in, if any.

@@ -1137,7 +1137,7 @@ impl TrinoQueryExecutor for QueryHandlerAdapter {
         session: &sqe_core::Session,
         sql: &str,
     ) -> Result<TrinoResultStream, sqe_core::SqeError> {
-        self.execute_as(session, sql, None).await
+        self.execute_as(session, sql, None, None).await
     }
 
     /// The Trino query id is a UUID this server minted; the engine records
@@ -1150,8 +1150,21 @@ impl TrinoQueryExecutor for QueryHandlerAdapter {
         sql: &str,
         query_id: &str,
     ) -> Result<TrinoResultStream, sqe_core::SqeError> {
-        self.execute_as(session, sql, uuid::Uuid::parse_str(query_id).ok())
+        self.execute_as(session, sql, None, uuid::Uuid::parse_str(query_id).ok())
             .await
+    }
+
+    /// `EXECUTE ... USING`: the engine binds `params` into the plan of the
+    /// numbered template and records the template, never the values.
+    async fn execute_bound_with_query_id(
+        &self,
+        session: &sqe_core::Session,
+        sql: &str,
+        params: Vec<datafusion::scalar::ScalarValue>,
+        query_id: &str,
+    ) -> Result<TrinoResultStream, sqe_core::SqeError> {
+        let query_id = uuid::Uuid::parse_str(query_id).ok();
+        self.execute_as(session, sql, Some(params), query_id).await
     }
 
     fn memory_pool(&self) -> Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>> {
@@ -1185,12 +1198,15 @@ impl QueryHandlerAdapter {
     /// SELECTs stream through [`QueryHandler::execute_stream_with_id`] so the
     /// Trino path never holds more than one page of a result (#621); every
     /// other statement kind (DML counts, DDL, SHOW, ...) takes the buffered
-    /// `execute_with_id` path exactly as Flight SQL does. `query_id` is the
-    /// id the engine records the statement under (`None`: engine-minted).
+    /// `execute_with_id` path exactly as Flight SQL does. `params` are the
+    /// values of an `EXECUTE ... USING`, bound into the plan of `sql`.
+    /// `query_id` is the id the engine records the statement under (`None`:
+    /// engine-minted).
     async fn execute_as(
         &self,
         session: &sqe_core::Session,
         sql: &str,
+        params: Option<Vec<datafusion::scalar::ScalarValue>>,
         query_id: Option<uuid::Uuid>,
     ) -> Result<TrinoResultStream, sqe_core::SqeError> {
         use futures::StreamExt;
@@ -1219,18 +1235,32 @@ impl QueryHandlerAdapter {
             .and_then(classify_normalized)
             .map(|kind| matches!(kind, StatementKind::Query(_)))
             .unwrap_or(false);
+        let handler = &self.handler;
         let result = if is_query {
-            let (schema, stream) = self
-                .handler
-                .execute_stream_with_id(session, sql, None, query_id)
-                .await?;
+            let (schema, stream) = match params {
+                Some(params) => {
+                    handler
+                        .execute_bound_stream_with_id(session, sql, params, None, query_id)
+                        .await?
+                }
+                None => {
+                    handler
+                        .execute_stream_with_id(session, sql, None, query_id)
+                        .await?
+                }
+            };
             let stream = stream.map(|res| res.map_err(sqe_core::SqeError::from));
             TrinoResultStream::new(schema, Box::pin(stream))
         } else {
-            self.handler
-                .execute_with_id(session, sql, None, query_id)
-                .await
-                .map(TrinoResultStream::from_batches)?
+            match params {
+                Some(params) => {
+                    handler
+                        .execute_bound_with_id(session, sql, params, None, query_id)
+                        .await
+                }
+                None => handler.execute_with_id(session, sql, None, query_id).await,
+            }
+            .map(TrinoResultStream::from_batches)?
         };
         // The engine records the statement under `query_id`, so its bytes
         // can be looked up there once the stream ends.
