@@ -151,7 +151,7 @@ mod hms {
     /// so concurrent runs don't collide, and cleans up on success.
     /// Failure leaves the namespace behind for inspection.
     ///
-    /// last verified: never in this tree
+    /// last verified: 2026-10-24; runs in CI (`catalog-live-tests`)
     #[tokio::test]
     #[ignore = "needs:hms"]
     async fn hms_namespace_round_trip() {
@@ -310,7 +310,7 @@ mod sql_postgres {
     /// Default `SQE_TEST_PG_URL` matches the docker-compose service:
     /// `postgres://iceberg:iceberg@localhost:15432/iceberg_catalog`.
     ///
-    /// last verified: never in this tree
+    /// last verified: 2026-10-24; runs in CI (`catalog-live-tests`)
     #[tokio::test]
     #[ignore = "needs:postgres"]
     async fn jdbc_postgres_namespace_roundtrip() {
@@ -381,7 +381,7 @@ mod sql_postgres {
     /// existing `jdbc_postgres_namespace_roundtrip` proves the
     /// library layer; this proves the SQE engine dispatcher.
     ///
-    /// last verified: never in this tree
+    /// last verified: 2026-10-24; runs in CI (`catalog-live-tests`)
     #[tokio::test]
     #[ignore = "needs:postgres"]
     async fn for_session_dispatches_through_jdbc_backend() {
@@ -499,7 +499,7 @@ warehouse = "{warehouse}"
     /// PostgreSQL because the docker-compose stack already runs it for
     /// the V2 round-trip, so this test rides the same infrastructure.
     ///
-    /// last verified: never in this tree
+    /// last verified: 2026-10-24; runs in CI (`catalog-live-tests`)
     #[tokio::test]
     #[ignore = "needs:postgres"]
     async fn jdbc_postgres_v3_table_format_version_roundtrip() {
@@ -675,7 +675,7 @@ mod nessie {
     /// and prepends it to subsequent paths automatically; we don't have
     /// to thread it through.
     ///
-    /// last verified: never in this tree
+    /// last verified: 2026-10-24; runs in CI (`catalog-live-tests`)
     #[tokio::test]
     #[ignore = "needs:nessie"]
     async fn nessie_namespace_round_trip() {

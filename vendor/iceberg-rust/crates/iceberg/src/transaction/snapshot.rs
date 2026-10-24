@@ -195,8 +195,15 @@ impl<'a> SnapshotProducer<'a> {
         }
     }
 
+    /// Validate added files against the partition spec each file declares.
+    ///
+    /// Files may use any spec registered in the table metadata, not only the default one: a
+    /// rewrite can legitimately preserve the spec of the files it replaces. Added manifests are
+    /// later written per spec, so every spec id is resolved here before any manifest is written.
     pub(crate) fn validate_added_files(&self, files: &[DataFile]) -> Result<()> {
-        let is_v3 = self.table.metadata().format_version() >= FormatVersion::V3;
+        let metadata = self.table.metadata();
+        let is_v3 = metadata.format_version() >= FormatVersion::V3;
+        let mut partition_types: HashMap<i32, (Arc<PartitionSpec>, StructType)> = HashMap::new();
         for data_file in files {
             // SQE PATCH (V3 deletion vectors): "Position delete files must not
             // be added to v3 tables" (spec, Row-level Deletes). A V3 position
@@ -214,18 +221,35 @@ impl<'a> SnapshotProducer<'a> {
                     data_file.file_path()
                 ));
             }
-            // Check if the data file partition spec id matches the table default partition spec id.
-            // Check if the data file partition spec id matches the table default partition spec id.
-            if self.table.metadata().default_partition_spec_id() != data_file.partition_spec_id {
-                return Err(invalid_data!(
-                    "Data file partition spec id does not match table default partition spec id"
-                ));
+            let spec_id = data_file.partition_spec_id;
+            if let std::collections::hash_map::Entry::Vacant(entry) = partition_types.entry(spec_id)
+            {
+                let spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "Data file references an unknown partition spec",
+                    )
+                    .with_context("partition spec id", spec_id.to_string())
+                    .with_context("file path", data_file.file_path())
+                })?;
+                let partition_type = if spec_id == metadata.default_partition_spec_id() {
+                    metadata.default_partition_type().clone()
+                } else {
+                    spec.partition_type(metadata.current_schema())
+                        .map_err(|err| {
+                            Error::new(
+                                ErrorKind::DataInvalid,
+                                "Cannot bind data file partition spec to the current schema",
+                            )
+                            .with_context("partition spec id", spec_id.to_string())
+                            .with_context("file path", data_file.file_path())
+                            .with_source(err)
+                        })?
+                };
+                entry.insert((spec.clone(), partition_type));
             }
-            Self::validate_partition_value(
-                data_file.partition(),
-                self.table.metadata().default_partition_type(),
-                self.table.metadata().default_partition_spec(),
-            )?;
+            let (spec, partition_type) = &partition_types[&spec_id];
+            Self::validate_partition_value(data_file.partition(), partition_type, spec)?;
         }
 
         Ok(())
@@ -514,9 +538,35 @@ impl<'a> SnapshotProducer<'a> {
         Ok(())
     }
 
+    /// Write added files into manifests, one per partition spec, since a manifest may only
+    /// contain files of a single spec.
+    async fn write_added_manifests(
+        &self,
+        added_files: Vec<DataFile>,
+        data_sequence_number: Option<i64>,
+    ) -> Result<Vec<ManifestFile>> {
+        let mut files_by_spec: BTreeMap<i32, Vec<DataFile>> = BTreeMap::new();
+        for file in added_files {
+            files_by_spec
+                .entry(file.partition_spec_id)
+                .or_default()
+                .push(file);
+        }
+
+        let mut manifests = Vec::with_capacity(files_by_spec.len());
+        for (spec_id, files) in files_by_spec {
+            manifests.push(
+                self.write_added_manifest(files, spec_id, data_sequence_number)
+                    .await?,
+            );
+        }
+        Ok(manifests)
+    }
+
     async fn write_added_manifest(
         &self,
         added_files: Vec<DataFile>,
+        partition_spec_id: i32,
         data_sequence_number: Option<i64>,
     ) -> Result<ManifestFile> {
         let Some(first_file) = added_files.first() else {
@@ -558,8 +608,7 @@ impl<'a> SnapshotProducer<'a> {
                 builder.build()
             }
         });
-        let mut writer =
-            self.new_manifest_writer(content, self.table.metadata().default_partition_spec_id())?;
+        let mut writer = self.new_manifest_writer(content, partition_spec_id)?;
         for entry in manifest_entries {
             writer.add_entry(entry)?;
         }
@@ -676,16 +725,16 @@ impl<'a> SnapshotProducer<'a> {
 
         if !self.added_data_files.is_empty() {
             let added_files = std::mem::take(&mut self.added_data_files);
-            let added_manifest = self
-                .write_added_manifest(added_files, self.new_data_file_sequence_number)
+            let added_manifests = self
+                .write_added_manifests(added_files, self.new_data_file_sequence_number)
                 .await?;
-            manifest_files.push(added_manifest);
+            manifest_files.extend(added_manifests);
         }
 
         if !self.added_delete_files.is_empty() {
             let added_files = std::mem::take(&mut self.added_delete_files);
-            let added_manifest = self.write_added_manifest(added_files, None).await?;
-            manifest_files.push(added_manifest);
+            let added_manifests = self.write_added_manifests(added_files, None).await?;
+            manifest_files.extend(added_manifests);
         }
 
         let deleted_entries = snapshot_produce_operation.delete_entries(self).await?;

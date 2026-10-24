@@ -63,6 +63,7 @@ Upstream `testdata/` is vendored in full, so `cargo test -p iceberg --lib` runs 
 | — | V3 `unknown` columns are never written to a data file (top-level projected out, nested refused) (`SQE PATCH (v3-unknown)`) | `writer/file_writer/parquet_writer.rs` |
 | — | Shredded V3 variants read: variant manifest bounds skipped, `typed_value` storage accepted and unshredded by `PromotePlan::Unshred` (`SQE PATCH (v3-shredded-variant)`) | `spec/manifest/_serde.rs`, `arrow/reader/projection.rs`, `arrow/record_batch_transformer.rs` |
 | — | `RowGroupPruner`: an engine hook that drops row groups after the byte-range selection and before the predicate, for conditions iceberg-rust cannot express (shredded variant fields) (`SQE PATCH (sqe#870)`) | `arrow/reader/mod.rs`, `arrow/reader/pipeline.rs`, `scan/mod.rs` |
+| — | V3 `source-ids` read on partition fields: one id reads as `source-id`, several are refused by field name; `source-id` is always written (`SQE PATCH (sqe#864)`; apache #3267 carries the list but its bound field still holds one id) | `spec/partition.rs` |
 
 Dropped because the new base already has them: the INT96, `read_with_metrics`, NaN,
 equality-delete NULL, positional-delete wakeup and run-buffering, constant-column and
@@ -98,13 +99,40 @@ full refresh picks them up:
 | RW | `c54989537` | `<`, `<=`, `NOT IN`, `NOT STARTS_WITH` never match a column missing from the file |
 | RW | `30a72274c` | Snapshot summaries count delete files dropped by the delete filter |
 
+Round 2 (2026-10-24):
+
+| Source | Commit | Fix |
+|---|---|---|
+| apache #3502 | `aa9986fe` | NaN row-group bounds might match inequalities |
+| apache #3476 | `217e66db` | Float JSON values read like iceberg-java |
+| apache #3473 | `464225dc` | Empty projections prune data columns |
+| apache #3483 | `5c271576` | Promoted (int -> long, float -> double) partition values and bounds widened before pruning |
+| apache #3431 | `1c05452b` | Partition specs produced by spec evolution accepted |
+| apache #3413 | `e4b9c3ef` | Highest matching partition field id reused |
+| RW #261 | `35266e28` | `rewrite_files` inherits parent snapshot properties |
+| RW #262 | `6155e752` | Added files written into per-spec manifests |
+| RW #246 | `5d8df5e5` | Snapshot summary totals never wrap below zero |
+
+Two SQE patches came with round 2, both for files written before an `int` -> `long` or
+`float` -> `double` promotion: `Transform::to_human_string` widens the partition literal
+before formatting it (a DELETE removing such a file panicked building the summary
+partition path), and `ManifestWriter::write_manifest_file` widens carried-over partition
+literals to the manifest's partition type, as iceberg-java's projected read does (the
+commit failed with "value is not compatible with type").
+
 The shredded-variant patch moved into #3255's plan as `PromotePlan::Unshred`. Local
 adjustments: #3303's variant test expects `value` required (this tree's storage
-layout), #3327's test uses the infallible `source_id` builder.
+layout), #3327's test uses the infallible `source_id` builder. Round 2: #3483 keeps
+this tree's `scan/mod.rs` and drops its scan-level fixtures (covered by the SQE
+`type_promotion_keeps_old_files_in_filtered_scans` integration test); #3431 keeps the
+`allow_non_primitive_void_source` flag; #3413 keys on a single `source_id`; #262 keeps
+the V3 deletion-vector check in `validate_added_files`.
 
 Not taken: apache #3145 (makes `FileScanTaskDeleteFile` fields private and its builder
 fallible; needs an SQE API migration and collides with the DV patches), #3354 (Avro
-reader locking), #2904 and #3107.
+reader locking), #2904 (already here as the sqe#358 patch in `scan/mod.rs`), #3107, and
+#3267 (`UnboundPartitionField` source-ids; changes the partition builder API, deferred to
+sqe#864).
 
 ## Fixes the merged test suite surfaced
 

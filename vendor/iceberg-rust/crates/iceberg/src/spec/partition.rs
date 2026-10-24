@@ -35,7 +35,7 @@ pub(crate) const DEFAULT_PARTITION_SPEC_ID: i32 = 0;
 
 /// Partition fields capture the transform from table data to partition values.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, TypedBuilder)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", try_from = "PartitionFieldSerde")]
 pub struct PartitionField {
     /// A source column id from the table’s schema
     pub source_id: i32,
@@ -265,7 +265,7 @@ impl PartitionKey {
 pub type UnboundPartitionSpecRef = Arc<UnboundPartitionSpec>;
 /// Unbound partition field can be built without a schema and later bound to a schema.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, TypedBuilder)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", try_from = "UnboundPartitionFieldSerde")]
 pub struct UnboundPartitionField {
     /// A source column id from the table’s schema
     pub source_id: i32,
@@ -278,6 +278,84 @@ pub struct UnboundPartitionField {
     pub name: String,
     /// A transform that is applied to the source column to produce a partition value.
     pub transform: Transform,
+}
+
+// SQE PATCH (sqe#864): the V3 spec lets a partition field name its sources
+// as `source-ids` instead of `source-id`. iceberg-java writes `source-ids`
+// only for a multi-argument field, but a one-element list is legal and means
+// the same as `source-id`. A field with several sources cannot be held by the
+// single `source_id` below, so it is refused with an error naming the field
+// rather than read through its first id, which would prune on the wrong
+// column and drop the other ids on the next commit. Serialization is
+// unchanged: `source-id` is always written.
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct PartitionFieldSerde {
+    source_id: Option<i32>,
+    source_ids: Option<Vec<i32>>,
+    field_id: i32,
+    name: String,
+    transform: Transform,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct UnboundPartitionFieldSerde {
+    source_id: Option<i32>,
+    source_ids: Option<Vec<i32>>,
+    field_id: Option<i32>,
+    name: String,
+    transform: Transform,
+}
+
+impl TryFrom<PartitionFieldSerde> for PartitionField {
+    type Error = String;
+
+    fn try_from(value: PartitionFieldSerde) -> std::result::Result<Self, Self::Error> {
+        Ok(PartitionField {
+            source_id: single_source_id(&value.name, value.source_id, value.source_ids)?,
+            field_id: value.field_id,
+            name: value.name,
+            transform: value.transform,
+        })
+    }
+}
+
+impl TryFrom<UnboundPartitionFieldSerde> for UnboundPartitionField {
+    type Error = String;
+
+    fn try_from(value: UnboundPartitionFieldSerde) -> std::result::Result<Self, Self::Error> {
+        Ok(UnboundPartitionField {
+            source_id: single_source_id(&value.name, value.source_id, value.source_ids)?,
+            field_id: value.field_id,
+            name: value.name,
+            transform: value.transform,
+        })
+    }
+}
+
+fn single_source_id(
+    name: &str,
+    source_id: Option<i32>,
+    source_ids: Option<Vec<i32>>,
+) -> std::result::Result<i32, String> {
+    match (source_id, source_ids) {
+        (Some(id), None) => Ok(id),
+        (None, Some(ids)) => match ids.as_slice() {
+            [id] => Ok(*id),
+            [] => Err(format!(
+                "partition field `{name}` has an empty `source-ids`"
+            )),
+            _ => Err(format!(
+                "partition field `{name}` has a multi-argument transform over source ids \
+                 {ids:?}; multi-argument partition transforms are not supported"
+            )),
+        },
+        (Some(_), Some(_)) => Err(format!(
+            "partition field `{name}` sets both `source-id` and `source-ids`"
+        )),
+        (None, None) => Err(format!("partition field `{name}` is missing `source-id`")),
+    }
 }
 
 /// Unbound partition spec can be built without a schema and later bound to a schema.
@@ -300,6 +378,9 @@ impl UnboundPartitionSpec {
     }
 
     /// Bind this unbound partition spec to a schema.
+    ///
+    /// Unlike [`PartitionSpecBuilder::add_unbound_field`], this accepts redundant fields, such
+    /// as two time granularities of one column, because spec evolution produces them.
     pub fn bind(self, schema: impl Into<SchemaRef>) -> Result<PartitionSpec> {
         PartitionSpecBuilder::new_from_unbound(self, schema)?.build()
     }
@@ -483,8 +564,8 @@ impl PartitionSpecBuilder {
             Self::new(schema).with_spec_id(unbound.spec_id.unwrap_or(DEFAULT_PARTITION_SPEC_ID));
 
         for field in unbound.fields {
-            builder = builder
-                .add_unbound_field_with_compatibility(field, allow_non_primitive_void_source)?;
+            builder =
+                builder.add_field_allowing_redundancy(field, allow_non_primitive_void_source)?;
         }
         Ok(builder)
     }
@@ -536,17 +617,24 @@ impl PartitionSpecBuilder {
     ///
     /// If partition field id is set, it is used as the field id.
     /// Otherwise, a new `field_id` is assigned.
+    ///
+    /// Rejects a field that is redundant with an existing one, such as a second time
+    /// granularity of the same column. [`UnboundPartitionSpec::bind`] accepts such fields.
     pub fn add_unbound_field(self, field: UnboundPartitionField) -> Result<Self> {
-        self.add_unbound_field_with_compatibility(field, false)
+        self.check_name_set_and_unique(&field.name)?;
+        self.check_for_redundant_partitions(field.source_id, &field.transform)?;
+        self.add_field_allowing_redundancy(field, false)
     }
 
-    fn add_unbound_field_with_compatibility(
+    /// Same as [`Self::add_unbound_field`] without the redundancy check, as Java's
+    /// `PartitionSpec.Builder.add` does. Used to bind persisted specs, where evolution can leave
+    /// several time granularities or void fields for one column.
+    fn add_field_allowing_redundancy(
         mut self,
         field: UnboundPartitionField,
         allow_non_primitive_void_source: bool,
     ) -> Result<Self> {
         self.check_name_set_and_unique(&field.name)?;
-        self.check_for_redundant_partitions(field.source_id, &field.transform)?;
         Self::check_name_does_not_collide_with_schema(&field, &self.schema)?;
         Self::check_transform_compatibility(&field, &self.schema, allow_non_primitive_void_source)?;
         if let Some(partition_field_id) = field.field_id {
@@ -623,19 +711,19 @@ impl PartitionSpecBuilder {
     /// Ensure that the partition name is unique among columns in the schema.
     /// Duplicate names are allowed if:
     /// 1. The column is sourced from the column with the same name.
-    /// 2. AND the transformation is identity
+    /// 2. AND [`Transform::may_share_name_with_source`] holds for the transform.
     fn check_name_does_not_collide_with_schema(
         field: &UnboundPartitionField,
         schema: &Schema,
     ) -> Result<()> {
         match schema.field_by_name(field.name.as_str()) {
             Some(schema_collision) => {
-                if field.transform == Transform::Identity {
+                if field.transform.may_share_name_with_source() {
                     if schema_collision.id == field.source_id {
                         Ok(())
                     } else {
                         Err(invalid_data!(
-                            "Cannot create identity partition sourced from different field in schema. Field name '{}' has id `{}` in schema but partition source id is `{}`",
+                            "Cannot create identity or void partition sourced from different field in schema. Field name '{}' has id `{}` in schema but partition source id is `{}`",
                             field.name,
                             schema_collision.id,
                             field.source_id
@@ -643,7 +731,7 @@ impl PartitionSpecBuilder {
                     }
                 } else {
                     Err(invalid_data!(
-                        "Cannot create partition with name: '{}' that conflicts with schema field and is not an identity transform.",
+                        "Cannot create partition with name: '{}' that conflicts with schema field and is not an identity or void transform.",
                         field.name
                     ))
                 }
@@ -798,6 +886,52 @@ mod tests {
         assert_eq!(1002, partition_spec.fields[2].field_id);
         assert_eq!("id_truncate", partition_spec.fields[2].name);
         assert_eq!(Transform::Truncate(4), partition_spec.fields[2].transform);
+    }
+
+    #[test]
+    fn test_partition_field_source_ids() {
+        let field = |sources: &str| {
+            format!(r#"{{ {sources}, "field-id": 1000, "name": "p", "transform": "identity" }}"#)
+        };
+
+        // A one-element `source-ids` reads like `source-id`, bound and unbound,
+        // and is written back as `source-id`.
+        let bound: PartitionField = serde_json::from_str(&field(r#""source-ids": [3]"#)).unwrap();
+        assert_eq!(3, bound.source_id);
+        let written = serde_json::to_value(&bound).unwrap();
+        assert_eq!(Some(3), written["source-id"].as_i64().map(|id| id as i32));
+        assert!(written.get("source-ids").is_none());
+        let unbound: UnboundPartitionField =
+            serde_json::from_str(&field(r#""source-ids": [3]"#)).unwrap();
+        assert_eq!(3, unbound.source_id);
+        assert_eq!(Some(1000), unbound.field_id);
+
+        // A multi-argument field is refused by name, never read through its
+        // first id.
+        for sources in [
+            r#""source-ids": [3, 4]"#,
+            r#""source-ids": []"#,
+            r#""source-id": 3, "source-ids": [3]"#,
+            r#""name-only": true"#,
+        ] {
+            let err = serde_json::from_str::<PartitionField>(&field(sources)).unwrap_err();
+            assert!(
+                err.to_string().contains("partition field `p`"),
+                "{sources}: {err}"
+            );
+            let err = serde_json::from_str::<UnboundPartitionField>(&field(sources)).unwrap_err();
+            assert!(
+                err.to_string().contains("partition field `p`"),
+                "{sources}: {err}"
+            );
+        }
+        let err = serde_json::from_str::<PartitionField>(&field(r#""source-ids": [3, 4]"#))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("[3, 4]") && err.contains("multi-argument"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1494,6 +1628,148 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.message().contains("redundant partition"));
+    }
+
+    fn ts_schema() -> Schema {
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "ts", Type::Primitive(PrimitiveType::Timestamptz)).into(),
+                NestedField::required(2, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap()
+    }
+
+    fn ts_field(field_id: i32, name: &str, transform: Transform) -> UnboundPartitionField {
+        UnboundPartitionField {
+            source_id: 1,
+            field_id: Some(field_id),
+            name: name.to_string(),
+            transform,
+        }
+    }
+
+    #[test]
+    fn test_add_unbound_field_rejects_second_time_granularity() {
+        let err = PartitionSpec::builder(ts_schema())
+            .add_unbound_field(ts_field(1000, "ts_day", Transform::Day))
+            .unwrap()
+            .add_unbound_field(ts_field(1001, "ts_hour", Transform::Hour))
+            .unwrap_err();
+        assert!(err.message().contains("redundant partition"));
+    }
+
+    #[test]
+    fn test_bind_accepts_evolved_spec_fields() {
+        let fields = vec![
+            ts_field(1000, "ts_day", Transform::Day),
+            ts_field(1001, "ts_hour", Transform::Hour),
+            ts_field(1002, "ts", Transform::Void),
+            ts_field(1003, "ts_null", Transform::Void),
+        ];
+        let unbound = UnboundPartitionSpec {
+            spec_id: Some(1),
+            fields: fields.clone(),
+        };
+
+        let spec = unbound.bind(ts_schema()).unwrap();
+
+        let expected = PartitionSpec {
+            spec_id: 1,
+            fields: fields
+                .into_iter()
+                .map(|f| PartitionField {
+                    source_id: 1,
+                    field_id: f.field_id.unwrap(),
+                    name: f.name,
+                    transform: f.transform,
+                })
+                .collect(),
+        };
+        assert_eq!(spec, expected);
+    }
+
+    #[test]
+    fn test_bind_rejects_void_field_named_after_other_column() {
+        let unbound = UnboundPartitionSpec {
+            spec_id: Some(1),
+            fields: vec![ts_field(1000, "id", Transform::Void)],
+        };
+
+        let err = unbound.bind(ts_schema()).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.message().contains("Field name 'id'"));
+    }
+
+    #[test]
+    fn test_bind_accepts_identical_fields_with_different_names() {
+        let bucket_field = |field_id: i32, name: &str| UnboundPartitionField {
+            source_id: 2,
+            field_id: Some(field_id),
+            name: name.to_string(),
+            transform: Transform::Bucket(16),
+        };
+        let unbound = UnboundPartitionSpec {
+            spec_id: Some(1),
+            fields: vec![
+                bucket_field(1000, "id_bucket"),
+                bucket_field(1001, "id_bucket_2"),
+            ],
+        };
+
+        let spec = unbound.bind(ts_schema()).unwrap();
+
+        let expected = PartitionSpec {
+            spec_id: 1,
+            fields: vec![
+                PartitionField {
+                    source_id: 2,
+                    field_id: 1000,
+                    name: "id_bucket".to_string(),
+                    transform: Transform::Bucket(16),
+                },
+                PartitionField {
+                    source_id: 2,
+                    field_id: 1001,
+                    name: "id_bucket_2".to_string(),
+                    transform: Transform::Bucket(16),
+                },
+            ],
+        };
+        assert_eq!(spec, expected);
+    }
+
+    #[test]
+    fn test_bind_rejects_repeated_partition_name() {
+        let unbound = UnboundPartitionSpec {
+            spec_id: Some(1),
+            fields: vec![
+                ts_field(1000, "ts_part", Transform::Day),
+                ts_field(1001, "ts_part", Transform::Hour),
+            ],
+        };
+
+        let err = unbound.bind(ts_schema()).unwrap_err();
+
+        assert!(
+            err.message()
+                .contains("Cannot use partition name more than once")
+        );
+    }
+
+    #[test]
+    fn test_add_unbound_field_checks_name_before_redundancy() {
+        let err = PartitionSpec::builder(ts_schema())
+            .add_unbound_field(ts_field(1000, "ts_part", Transform::Day))
+            .unwrap()
+            .add_unbound_field(ts_field(1001, "ts_part", Transform::Hour))
+            .unwrap_err();
+
+        assert!(
+            err.message()
+                .contains("Cannot use partition name more than once")
+        );
     }
 
     #[test]
