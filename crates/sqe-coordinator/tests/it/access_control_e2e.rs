@@ -3468,6 +3468,108 @@ async fn expire_snapshots_runs_as_writer_and_refuses_reader() {
     }
 }
 
+/// A deleting `remove_orphan_files` commits a table property as the caller
+/// before it deletes anything, so the catalog refuses a reader and admits a
+/// writer, neither holding an SQE admin role. The commit adds no snapshot.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn remove_orphan_files_runs_as_writer_and_refuses_reader() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    let short = "maint_owner_orphans";
+    let fresh = format!("sales_wh.ac.{short}");
+    let _ = ctx
+        .handler
+        .execute(&ctx.carol, &format!("DROP TABLE IF EXISTS {fresh}"), None)
+        .await;
+    for setup in [
+        format!("CREATE TABLE {fresh} (id BIGINT)"),
+        format!("INSERT INTO {fresh} VALUES (1)"),
+        format!("GRANT SELECT ON {fresh} TO ROLE \"analyst\""),
+        format!("GRANT INSERT ON {fresh} TO ROLE \"engineer\""),
+    ] {
+        exec_ok(&ctx, &ctx.carol, &setup).await;
+    }
+
+    let mut carol = ctx.carol.clone();
+    carol.default_catalog = Some("sales_wh".to_string());
+    let snapshots_sql = format!("SELECT snapshot_id FROM table_snapshots('ac', '{short}')");
+    let before = total_rows(&exec_ok(&ctx, &carol, &snapshots_sql).await);
+    let show_create = format!("SHOW CREATE TABLE {fresh}");
+    let last_run = "sqe.maintenance.remove-orphan-files.last-run-ms";
+    let ddl = |batches: Vec<RecordBatch>| -> String {
+        batches
+            .iter()
+            .flat_map(|b| {
+                (0..b.num_rows()).map(|r| crate::common::fmt_val(b.column(0).as_ref(), r))
+            })
+            .collect()
+    };
+    exec_ok(
+        &ctx,
+        &carol,
+        &format!("ALTER TABLE {fresh} SET TBLPROPERTIES ('orphan.probe' = '1')"),
+    )
+    .await;
+    let seeded = ddl(exec_ok(&ctx, &carol, &show_create).await);
+    assert!(
+        seeded.contains("orphan.probe"),
+        "SHOW CREATE lists properties: {seeded}"
+    );
+    let remove = format!("CALL system.remove_orphan_files(table => '{fresh}')");
+
+    // alice holds SELECT only (role analyst).
+    crate::common::eventually("alice's SELECT grant to apply", || async {
+        match ctx
+            .handler
+            .execute(&ctx.alice, &format!("SELECT id FROM {fresh}"), None)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("select failed: {e}")),
+        }
+    })
+    .await;
+    let err = ctx
+        .handler
+        .execute(&ctx.alice, &remove, None)
+        .await
+        .expect_err("a reader must not remove orphan files");
+    let reason = err.to_string();
+    assert!(reason.contains("403"), "want Polaris's 403, got: {reason}");
+    let after_reader = ddl(exec_ok(&ctx, &carol, &show_create).await);
+    assert!(
+        !after_reader.contains(last_run),
+        "the refused call committed nothing: {after_reader}"
+    );
+
+    // bob holds INSERT through role engineer.
+    crate::common::eventually("bob's remove_orphan_files to succeed", || async {
+        match ctx.handler.execute(&ctx.bob, &remove, None).await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("remove_orphan_files failed: {e}")),
+        }
+    })
+    .await;
+    let after_writer = ddl(exec_ok(&ctx, &carol, &show_create).await);
+    assert!(
+        after_writer.contains(last_run),
+        "the writer's run records itself: {after_writer}"
+    );
+    let snapshots = total_rows(&exec_ok(&ctx, &carol, &snapshots_sql).await);
+    assert_eq!(snapshots, before, "the property commit adds no snapshot");
+
+    for revoke in [
+        format!("REVOKE SELECT ON {fresh} FROM ROLE \"analyst\""),
+        format!("REVOKE INSERT ON {fresh} FROM ROLE \"engineer\""),
+        format!("DROP TABLE IF EXISTS {fresh}"),
+    ] {
+        let _ = ctx.handler.execute(&ctx.carol, &revoke, None).await;
+    }
+}
+
 /// `DENY` as a SQL statement, end to end against live Ranger.
 ///
 /// `ranger_deny_overrides_allow` proves deny PRECEDENCE, but it injects the deny
