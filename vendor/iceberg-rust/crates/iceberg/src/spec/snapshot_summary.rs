@@ -53,6 +53,39 @@ const TOTAL_FILE_SIZE: &str = "total-files-size";
 const CHANGED_PARTITION_COUNT_PROP: &str = "changed-partition-count";
 const CHANGED_PARTITION_PREFIX: &str = "partitions.";
 
+/// Summary keys that snapshot production recomputes for every new snapshot.
+const COMPUTED_SUMMARY_PROPERTIES: [&str; 23] = [
+    ADDED_DATA_FILES,
+    ADDED_DELETE_FILES,
+    ADDED_EQUALITY_DELETES,
+    ADDED_FILE_SIZE,
+    ADDED_POSITION_DELETES,
+    ADDED_POSITION_DELETE_FILES,
+    ADDED_RECORDS,
+    DELETED_DATA_FILES,
+    DELETED_RECORDS,
+    ADDED_EQUALITY_DELETE_FILES,
+    REMOVED_DELETE_FILES,
+    REMOVED_EQUALITY_DELETES,
+    REMOVED_EQUALITY_DELETE_FILES,
+    REMOVED_FILE_SIZE,
+    REMOVED_POSITION_DELETES,
+    REMOVED_POSITION_DELETE_FILES,
+    TOTAL_EQUALITY_DELETES,
+    TOTAL_POSITION_DELETES,
+    TOTAL_DATA_FILES,
+    TOTAL_DELETE_FILES,
+    TOTAL_RECORDS,
+    TOTAL_FILE_SIZE,
+    CHANGED_PARTITION_COUNT_PROP,
+];
+
+/// Returns whether snapshot production computes `key`, so a value copied from
+/// another snapshot's summary would be stale.
+pub(crate) fn is_computed_summary_property(key: &str) -> bool {
+    key.starts_with(CHANGED_PARTITION_PREFIX) || COMPUTED_SUMMARY_PROPERTIES.contains(&key)
+}
+
 /// `SnapshotSummaryCollector` collects and aggregates snapshot update metrics.
 /// It gathers metrics about added or removed data files and manifests, and tracks
 /// partition-specific updates.
@@ -493,6 +526,15 @@ fn truncate_table_summary(mut summary: Summary, previous_summary: &Summary) -> R
     Ok(summary)
 }
 
+/// Largest value a `total-*` summary property may hold. Totals are stored as decimal strings, and
+/// other Iceberg engines only support up to `i64::MAX` (no real table gets near this bound).
+const MAX_SUMMARY_TOTAL: u64 = i64::MAX as u64;
+
+/// Rolls `total_property` forward from the previous snapshot's summary:
+/// `previous total + added - removed`. With no previous snapshot, the total starts from zero.
+///
+/// When the total cannot be known, it is left out of the summary to prevent invalid unsigned math,
+/// e.g. when `removed` exceeds `previous total + added` and would wrap below zero.
 fn update_totals(
     summary: &mut Summary,
     previous_summary: Option<&Summary>,
@@ -504,7 +546,14 @@ fn update_totals(
         None => 0,
         Some(prev_summary) => match prev_summary.additional_properties.get(total_property) {
             Some(value_str) => match value_str.parse::<u64>() {
-                Ok(v) => v,
+                Ok(v) if v <= MAX_SUMMARY_TOTAL => v,
+                Ok(v) => {
+                    tracing::warn!(
+                        "Property '{total_property}' in the previous snapshot summary is {v}, above i64::MAX; \
+                         this is a total from an earlier commit that wrapped around. Skipping total computation.",
+                    );
+                    return;
+                }
                 Err(parse_err) => {
                     tracing::warn!(
                         "Property '{total_property}' could not be parsed in the previous snapshot summary: {parse_err}. \
@@ -549,20 +598,19 @@ fn update_totals(
         return;
     };
 
-    // Like iceberg-java's `updateTotal`, only record a non-negative total: a
-    // removal larger than the known total (e.g. removing from a table whose
-    // earlier snapshots carried no totals) must not underflow, which panics
-    // in debug and writes u64::MAX into the metadata in release.
     let Some(new_total) = previous_total
         .checked_add(added)
-        .and_then(|t| t.checked_sub(removed))
+        .and_then(|total| total.checked_sub(removed))
+        .filter(|total| *total <= MAX_SUMMARY_TOTAL)
     else {
         tracing::warn!(
-            "'{total_property}' would go negative ({previous_total} + {added} - {removed}). \
-             Skipping total computation."
+            "Property '{total_property}' would be negative or out of range \
+             ({previous_total} + {added} - {removed}): the previous snapshot's total does not \
+             include what this commit removes. Skipping total computation.",
         );
         return;
     };
+
     summary
         .additional_properties
         .insert(total_property.to_string(), new_total.to_string());
@@ -1303,5 +1351,124 @@ mod tests {
         assert_eq!(props.get(TOTAL_FILE_SIZE).unwrap(), "800");
         assert_eq!(props.get(TOTAL_POSITION_DELETES).unwrap(), "2");
         assert_eq!(props.get(TOTAL_EQUALITY_DELETES).unwrap(), "1");
+    }
+
+    fn summary_with(operation: Operation, properties: &[(&str, &str)]) -> Summary {
+        Summary {
+            operation,
+            additional_properties: properties
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_update_totals_skipped_instead_of_wrapping_when_removals_exceed_previous_total() {
+        // Numbers from a production compaction commit and its parent. The
+        // table's appender resets `total-*` to its own `added-*` on every
+        // commit. So the parent claimed `total-data-files=2` while the
+        // compaction removed 255 files. The old arithmetic committed
+        // `2 + 31 - 255` as total-data-files=18446744073709551394, and
+        // `18282 + 3320626 - 14296637` as total-files-size=18446744073698593887.
+        let previous_summary = summary_with(Operation::Append, &[
+            (TOTAL_DATA_FILES, "2"),
+            (TOTAL_RECORDS, "5"),
+            (TOTAL_FILE_SIZE, "18282"),
+        ]);
+        let summary = summary_with(Operation::Replace, &[
+            (ADDED_DATA_FILES, "31"),
+            (DELETED_DATA_FILES, "255"),
+            (ADDED_RECORDS, "90575"),
+            (DELETED_RECORDS, "90575"),
+            (ADDED_FILE_SIZE, "3320626"),
+            (REMOVED_FILE_SIZE, "14296637"),
+        ]);
+
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
+        let props = &updated.additional_properties;
+
+        // A total that would go negative is omitted, as in iceberg-java...
+        assert!(
+            !props.contains_key(TOTAL_DATA_FILES),
+            "negative total-data-files must be omitted, got {props:?}"
+        );
+        assert!(
+            !props.contains_key(TOTAL_FILE_SIZE),
+            "negative total-files-size must be omitted, got {props:?}"
+        );
+        // ...a total that stays non-negative still rolls forward...
+        assert_eq!(props.get(TOTAL_RECORDS).unwrap(), "5");
+        // ...and the commit's own deltas are unaffected.
+        assert_eq!(props.get(ADDED_DATA_FILES).unwrap(), "31");
+        assert_eq!(props.get(DELETED_DATA_FILES).unwrap(), "255");
+    }
+
+    #[test]
+    fn test_update_totals_written_when_removals_exactly_cancel_previous_total() {
+        // Zero is a real total (the commit removed everything), not an underflow.
+        let previous_summary = summary_with(Operation::Append, &[
+            (TOTAL_DATA_FILES, "10"),
+            (TOTAL_RECORDS, "100"),
+        ]);
+        let summary = summary_with(Operation::Delete, &[
+            (DELETED_DATA_FILES, "10"),
+            (DELETED_RECORDS, "100"),
+        ]);
+
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
+        let props = &updated.additional_properties;
+
+        assert_eq!(props.get(TOTAL_DATA_FILES).unwrap(), "0");
+        assert_eq!(props.get(TOTAL_RECORDS).unwrap(), "0");
+    }
+
+    #[test]
+    fn test_update_totals_skipped_when_previous_total_is_a_wrapped_value() {
+        // Snapshots committed before this fix can carry wrapped totals near
+        // u64::MAX. Rolling one forward would copy it into every later commit,
+        // and iceberg-java cannot parse it anyway. Treat it as unknown.
+        let previous_summary = summary_with(Operation::Replace, &[
+            (TOTAL_DATA_FILES, "18446744073709551394"),
+            (TOTAL_RECORDS, "5"),
+        ]);
+        let summary = summary_with(Operation::Append, &[
+            (ADDED_DATA_FILES, "1"),
+            (ADDED_RECORDS, "83"),
+        ]);
+
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
+        let props = &updated.additional_properties;
+
+        assert!(
+            !props.contains_key(TOTAL_DATA_FILES),
+            "a wrapped previous total must not be rolled forward, got {props:?}"
+        );
+        assert_eq!(props.get(TOTAL_RECORDS).unwrap(), "88");
+    }
+
+    #[test]
+    fn test_update_totals_bounded_by_i64_max() {
+        let max = i64::MAX.to_string();
+        let max_minus_one = (i64::MAX - 1).to_string();
+        let previous_summary = summary_with(Operation::Append, &[
+            (TOTAL_RECORDS, max.as_str()),
+            (TOTAL_FILE_SIZE, max_minus_one.as_str()),
+        ]);
+        let summary = summary_with(Operation::Append, &[
+            (ADDED_RECORDS, "1"),
+            (ADDED_FILE_SIZE, "1"),
+        ]);
+
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
+        let props = &updated.additional_properties;
+
+        // One past i64::MAX cannot be read by iceberg-java, so it is omitted...
+        assert!(
+            !props.contains_key(TOTAL_RECORDS),
+            "a total above i64::MAX must be omitted, got {props:?}"
+        );
+        // ...but i64::MAX itself is still a valid total.
+        assert_eq!(props.get(TOTAL_FILE_SIZE).unwrap(), &max);
     }
 }

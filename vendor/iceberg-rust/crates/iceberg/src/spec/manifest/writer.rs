@@ -32,8 +32,8 @@ use crate::io::{FileMetadata, FileWrite, OutputFile};
 use crate::spec::manifest::_serde::{ManifestEntryV1, ManifestEntryV2};
 use crate::spec::manifest::{manifest_schema_v1, manifest_schema_v2};
 use crate::spec::{
-    DataContentType, DataFile, FieldSummary, ManifestEntry, ManifestFile, ManifestMetadata,
-    ManifestStatus, PrimitiveLiteral, SchemaRef, StructType, Type,
+    DataContentType, DataFile, FieldSummary, Literal, ManifestEntry, ManifestFile,
+    ManifestMetadata, ManifestStatus, PrimitiveLiteral, SchemaRef, Struct, StructType, Type,
 };
 
 /// Placeholder for snapshot ID. The field with this value must be replaced
@@ -546,6 +546,16 @@ impl ManifestWriter {
             }
         }
 
+        // SQE PATCH: an existing or deleted entry carried over from a manifest
+        // written before an `int` -> `long` (or `float` -> `double`) promotion keeps
+        // its narrow partition literal, which neither the partition summary nor the
+        // Avro encoding accepts under the promoted type. iceberg-java reads such
+        // entries through the current partition type, so they come back widened;
+        // widen them here the same way.
+        for entry in &mut self.manifest_entries {
+            entry.data_file.partition =
+                promote_partition_literals(&entry.data_file.partition, &partition_type);
+        }
         let partition_summary = self.construct_partition_summaries(&partition_type)?;
         // Write manifest entries
         for entry in std::mem::take(&mut self.manifest_entries) {
@@ -592,6 +602,21 @@ impl ManifestWriter {
             first_row_id: self.first_row_id,
         })
     }
+}
+
+/// Widens each primitive literal in `partition` that a promotion made narrower than
+/// its field in `partition_type`; every other value is copied through unchanged.
+fn promote_partition_literals(partition: &Struct, partition_type: &StructType) -> Struct {
+    partition
+        .iter()
+        .zip(partition_type.fields())
+        .map(|(value, field)| match (value, field.field_type.as_primitive_type()) {
+            (Some(Literal::Primitive(literal)), Some(target)) => Some(Literal::Primitive(
+                literal.promote_to(target).unwrap_or_else(|| literal.clone()),
+            )),
+            (value, _) => value.cloned(),
+        })
+        .collect()
 }
 
 struct PartitionFieldStats {
@@ -1059,5 +1084,92 @@ mod tests {
             (0.7..=1.4).contains(&ratio),
             "estimate {estimated} should stay calibrated to actual length {actual}, ratio {ratio:.3}"
         );
+    }
+
+    /// An entry carried over from a manifest written before `p` was promoted from
+    /// `int` to `long` keeps an `int` partition literal. Rewriting it under the
+    /// promoted spec widens it, in the entry and in the partition summary, instead
+    /// of failing with "value is not compatible with type".
+    #[tokio::test]
+    async fn test_existing_entry_partition_widened_after_promotion() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::optional(
+                    1,
+                    "p",
+                    Type::Primitive(PrimitiveType::Long),
+                ))])
+                .build()
+                .unwrap(),
+        );
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .add_partition_field("p", "p", crate::spec::Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        let entry = |status, partition: i32| ManifestEntry {
+            status,
+            snapshot_id: Some(1),
+            sequence_number: Some(1),
+            file_sequence_number: Some(1),
+            data_file: DataFile {
+                content: DataContentType::Data,
+                file_path: format!("s3://b/t/data/p={partition}.parquet"),
+                file_format: DataFileFormat::Parquet,
+                partition: Struct::from_iter([Some(Literal::int(partition))]),
+                record_count: 1,
+                file_size_in_bytes: 100,
+                column_sizes: HashMap::new(),
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                nan_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
+                key_metadata: None,
+                split_offsets: None,
+                equality_ids: None,
+                sort_order_id: None,
+                partition_spec_id: 0,
+                first_row_id: None,
+                referenced_data_file: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+            },
+        };
+
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.path().join("promoted_manifest.avro");
+        let io = FileIO::new_with_fs();
+        let output_file = io.new_output(path.to_str().unwrap()).unwrap();
+        let mut writer = ManifestWriterBuilder::new(output_file, Some(2), schema, partition_spec)
+            .build_v2_data();
+        writer
+            .add_existing_entry(entry(ManifestStatus::Existing, 3))
+            .unwrap();
+        writer
+            .add_delete_entry(entry(ManifestStatus::Deleted, 1))
+            .unwrap();
+        let manifest_file = writer.write_manifest_file().await.unwrap();
+
+        let summary = &manifest_file.partitions.unwrap()[0];
+        assert_eq!(
+            summary.lower_bound.as_ref().map(|b| b.to_vec()),
+            Some(Datum::long(1).to_bytes().unwrap().to_vec())
+        );
+        assert_eq!(
+            summary.upper_bound.as_ref().map(|b| b.to_vec()),
+            Some(Datum::long(3).to_bytes().unwrap().to_vec())
+        );
+        let manifest = Manifest::parse_avro(fs::read(path).unwrap().as_slice()).unwrap();
+        let partitions: Vec<_> = manifest
+            .entries()
+            .iter()
+            .map(|e| e.data_file.partition.clone())
+            .collect();
+        assert_eq!(partitions, [
+            Struct::from_iter([Some(Literal::long(3))]),
+            Struct::from_iter([Some(Literal::long(1))]),
+        ]);
     }
 }
