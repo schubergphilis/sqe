@@ -136,8 +136,8 @@
     },
     "sqe:multi-arg-transforms:v3": {
       "level": "none",
-      "notes": "PARTITIONED BY accepts only single-source transforms; a multi-source transform cannot be declared.",
-      "evidence": "crates/sqe-write/src/write_handler.rs#build_partition_spec",
+      "notes": "PARTITIONED BY accepts only single-source transforms; a multi-source transform cannot be declared. Metadata naming a field's source as a one-element source-ids list loads; a field with several source ids is refused by name. The V3 spec defines no multi-argument transform yet, so there is no such table to read.",
+      "evidence": "crates/sqe-write/src/write_handler.rs#build_partition_spec, vendor/iceberg-rust/crates/iceberg/src/spec/partition.rs::tests::test_partition_field_source_ids",
       "caveats": []
     },
     "sqe:time-travel:v2": {
