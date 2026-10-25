@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! SQE PATCH (v3-shredded-variant): shred top-level variant columns on
-//! write when the table sets `write.parquet.shred-variants`.
+//! SQE PATCH (v3-shredded-variant): shred variant columns on write when the
+//! table sets `write.parquet.shred-variants`, top-level or nested in a
+//! struct, list or map.
 //!
 //! The shredding schema is inferred per data file from its first batch:
 //! a column whose values are all objects shreds every field that has one
@@ -33,14 +34,18 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, StructArray};
+use arrow_array::cast::AsArray;
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, LargeListArray, ListArray, MapArray, RecordBatch, StructArray,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use parquet::variant::{Variant, VariantArray, shred_variant};
 
 use crate::{Error, ErrorKind, Result};
 
-/// Most fields shredded in one variant column, so a wide document does not
-/// turn into thousands of Parquet leaves.
+/// Most fields shredded in one variant value, so a wide document does not
+/// turn into thousands of Parquet leaves. A nested variant (one per list
+/// element type, map value type or struct member) has its own budget.
 const MAX_SHREDDED_FIELDS: usize = 64;
 
 const VARIANT_EXTENSION: &str = "arrow.parquet.variant";
@@ -159,11 +164,183 @@ impl Plan {
     }
 }
 
+/// Where the variants in one column are, and how each is shredded.
+#[derive(Debug)]
+enum Node {
+    /// A variant value, shredded as `Plan` into `typed_value` of the type.
+    Variant(Plan, DataType),
+    /// A struct; `None` for a member with nothing to shred.
+    Struct(Vec<Option<Node>>),
+    /// A list (or large list) of elements.
+    List(Box<Node>),
+    /// A map; the node of its entries struct.
+    Map(Box<Node>),
+}
+
+impl Node {
+    /// The shredding of `array`, a column declared as `field`, or `None`
+    /// when no variant in it has anything to shred.
+    fn infer(field: &Field, array: &ArrayRef) -> Result<Option<Node>> {
+        if is_variant(field) {
+            return infer_variant(array);
+        }
+        let node = match field.data_type() {
+            DataType::Struct(fields) => {
+                let Some(array) = array.as_struct_opt() else {
+                    return Ok(None);
+                };
+                let members = fields
+                    .iter()
+                    .zip(array.columns())
+                    .map(|(f, column)| Node::infer(f, column))
+                    .collect::<Result<Vec<_>>>()?;
+                if members.iter().all(Option::is_none) {
+                    return Ok(None);
+                }
+                Node::Struct(members)
+            }
+            DataType::List(element) => match array.as_list_opt::<i32>() {
+                Some(list) => match Node::infer(element, list.values())? {
+                    Some(node) => Node::List(Box::new(node)),
+                    None => return Ok(None),
+                },
+                None => return Ok(None),
+            },
+            DataType::LargeList(element) => match array.as_list_opt::<i64>() {
+                Some(list) => match Node::infer(element, list.values())? {
+                    Some(node) => Node::List(Box::new(node)),
+                    None => return Ok(None),
+                },
+                None => return Ok(None),
+            },
+            DataType::Map(entries, _) => match array.as_map_opt() {
+                Some(map) => {
+                    let entries_array: ArrayRef = Arc::new(map.entries().clone());
+                    match Node::infer(entries, &entries_array)? {
+                        Some(node) => Node::Map(Box::new(node)),
+                        None => return Ok(None),
+                    }
+                }
+                None => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        Ok(Some(node))
+    }
+
+    /// `array` with the variants this node covers shredded. Every rebuilt
+    /// field keeps its name, nullability and metadata (the field id).
+    fn shred(&self, array: &ArrayRef) -> Result<ArrayRef> {
+        match self {
+            Node::Variant(plan, as_type) => shred_column(array, plan, as_type),
+            Node::Struct(members) => {
+                let (fields, mut children, nulls) = array.as_struct().clone().into_parts();
+                let mut rebuilt: Vec<Arc<Field>> = fields.iter().cloned().collect();
+                for (i, member) in members.iter().enumerate() {
+                    if let Some(node) = member {
+                        children[i] = node.shred(&children[i])?;
+                        rebuilt[i] = Arc::new(
+                            fields[i]
+                                .as_ref()
+                                .clone()
+                                .with_data_type(children[i].data_type().clone()),
+                        );
+                    }
+                }
+                Ok(Arc::new(
+                    StructArray::try_new(rebuilt.into(), children, nulls).map_err(to_err)?,
+                ))
+            }
+            Node::List(node) => match array.data_type() {
+                DataType::List(element) => {
+                    let list = array.as_list::<i32>();
+                    let values = node.shred(list.values())?;
+                    let element = with_type(element, values.data_type());
+                    Ok(Arc::new(
+                        ListArray::try_new(
+                            element,
+                            list.offsets().clone(),
+                            values,
+                            list.nulls().cloned(),
+                        )
+                        .map_err(to_err)?,
+                    ))
+                }
+                DataType::LargeList(element) => {
+                    let list = array.as_list::<i64>();
+                    let values = node.shred(list.values())?;
+                    let element = with_type(element, values.data_type());
+                    Ok(Arc::new(
+                        LargeListArray::try_new(
+                            element,
+                            list.offsets().clone(),
+                            values,
+                            list.nulls().cloned(),
+                        )
+                        .map_err(to_err)?,
+                    ))
+                }
+                other => Err(Error::new(
+                    ErrorKind::Unexpected,
+                    format!("A shredded variant list is {other}, not a list"),
+                )),
+            },
+            Node::Map(node) => {
+                let DataType::Map(entries_field, sorted) = array.data_type() else {
+                    return Err(Error::new(
+                        ErrorKind::Unexpected,
+                        format!("A shredded variant map is {}, not a map", array.data_type()),
+                    ));
+                };
+                let map = array.as_map();
+                let entries: ArrayRef = Arc::new(map.entries().clone());
+                let entries = node.shred(&entries)?;
+                let entries_field = with_type(entries_field, entries.data_type());
+                Ok(Arc::new(
+                    MapArray::try_new(
+                        entries_field,
+                        map.offsets().clone(),
+                        entries.as_struct().clone(),
+                        map.nulls().cloned(),
+                        *sorted,
+                    )
+                    .map_err(to_err)?,
+                ))
+            }
+        }
+    }
+}
+
+fn with_type(field: &Arc<Field>, data_type: &DataType) -> Arc<Field> {
+    Arc::new(field.as_ref().clone().with_data_type(data_type.clone()))
+}
+
+/// The shredding of one variant `array`, or `None` when it is shredded
+/// already or nothing in it has one type.
+fn infer_variant(array: &ArrayRef) -> Result<Option<Node>> {
+    let variants = VariantArray::try_new(array.as_ref()).map_err(to_err)?;
+    if variants.typed_value_column().is_some() {
+        return Ok(None);
+    }
+    let mut shape = Shape::Unseen;
+    for row in 0..variants.len() {
+        if variants.is_valid(row) {
+            shape = observe(shape, &variants.value(row));
+        }
+    }
+    Ok(
+        Plan::from_shape(&shape, &mut MAX_SHREDDED_FIELDS.clone()).map(|plan| {
+            let as_type = plan.shredding_type();
+            Node::Variant(plan, as_type)
+        }),
+    )
+}
+
 /// One file's shredding: which columns, and the schema the file is written
 /// with.
 #[derive(Debug)]
 pub(crate) struct VariantShredder {
-    columns: Vec<(usize, Plan, DataType)>,
+    columns: Vec<(usize, Node)>,
     schema: SchemaRef,
 }
 
@@ -177,22 +354,8 @@ impl VariantShredder {
     pub(crate) fn infer(schema: &SchemaRef, batch: &RecordBatch) -> Result<Option<Self>> {
         let mut columns = Vec::new();
         for (index, field) in schema.fields().iter().enumerate() {
-            if !is_variant(field) {
-                continue;
-            }
-            let variants = VariantArray::try_new(batch.column(index).as_ref()).map_err(to_err)?;
-            if variants.typed_value_column().is_some() {
-                continue;
-            }
-            let mut shape = Shape::Unseen;
-            for row in 0..variants.len() {
-                if variants.is_valid(row) {
-                    shape = observe(shape, &variants.value(row));
-                }
-            }
-            if let Some(plan) = Plan::from_shape(&shape, &mut MAX_SHREDDED_FIELDS.clone()) {
-                let as_type = plan.shredding_type();
-                columns.push((index, plan, as_type));
+            if let Some(node) = Node::infer(field, batch.column(index))? {
+                columns.push((index, node));
             }
         }
         if columns.is_empty() {
@@ -240,8 +403,8 @@ impl VariantShredder {
 
     fn shred_columns(&self, batch: &RecordBatch) -> Result<Vec<ArrayRef>> {
         let mut columns = batch.columns().to_vec();
-        for (index, plan, as_type) in &self.columns {
-            columns[*index] = shred_column(batch.column(*index), plan, as_type)?;
+        for (index, node) in &self.columns {
+            columns[*index] = node.shred(batch.column(*index))?;
         }
         Ok(columns)
     }
@@ -395,5 +558,86 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn nested_shredded_variants_shred_in_structs_lists_and_maps() {
+        let rows = [Some(r#"{"a": 1}"#), Some(r#"{"a": 2}"#), None];
+        let flat = variant_batch(&rows);
+        let variant_field = flat.schema().field(0).clone();
+        let variant = flat.column(0).clone();
+        let id = |field: Field, id: &str| {
+            let mut metadata = field.metadata().clone();
+            metadata.insert("PARQUET:field_id".to_string(), id.to_string());
+            field.with_metadata(metadata)
+        };
+
+        // `s STRUCT<v VARIANT>`
+        let member = id(variant_field.clone(), "2");
+        let s: ArrayRef = Arc::new(
+            StructArray::try_new(vec![member.clone()].into(), vec![variant.clone()], None).unwrap(),
+        );
+        // `l ARRAY<VARIANT>`, one element per row
+        let element = Arc::new(id(variant_field.clone().with_name("element"), "4"));
+        let offsets = arrow_buffer::OffsetBuffer::from_lengths([1; 3]);
+        let l: ArrayRef = Arc::new(
+            ListArray::try_new(element, offsets.clone(), variant.clone(), None).unwrap(),
+        );
+        // `m MAP<STRING, VARIANT>`, one entry per row
+        let keys: ArrayRef = Arc::new(StringArray::from(vec!["k"; 3]));
+        let entry_fields = vec![
+            id(Field::new("key", DataType::Utf8, false), "6"),
+            id(variant_field.clone().with_name("value"), "7"),
+        ];
+        let entries = StructArray::try_new(entry_fields.into(), vec![keys, variant], None).unwrap();
+        let entries_field = Arc::new(Field::new("key_value", entries.data_type().clone(), false));
+        let m: ArrayRef =
+            Arc::new(MapArray::try_new(entries_field, offsets, entries, None, false).unwrap());
+
+        let schema = Arc::new(Schema::new(vec![
+            id(Field::new("s", s.data_type().clone(), true), "1"),
+            id(Field::new("l", l.data_type().clone(), true), "3"),
+            id(Field::new("m", m.data_type().clone(), true), "5"),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![s, l, m]).unwrap();
+        let shredder = VariantShredder::infer(&schema, &batch)
+            .unwrap()
+            .expect("shreds");
+        let out = shredder.shred(&batch).unwrap();
+        assert_eq!(out.schema(), shredder.schema());
+
+        let s = out.column(0).as_struct();
+        let l = out.column(1).as_list::<i32>();
+        let m = out.column(2).as_map();
+        let shredded = [
+            s.column(0).clone(),
+            l.values().clone(),
+            m.values().clone(),
+        ];
+        for column in &shredded {
+            let DataType::Struct(fields) = typed_value(column).data_type().clone() else {
+                panic!("object typed_value");
+            };
+            assert_eq!(fields[0].name(), "a");
+            assert_eq!(json_rows(column), json_rows(flat.column(0)));
+        }
+        // The rebuilt fields keep their field ids and the extension.
+        let DataType::Struct(members) = out.schema().field(0).data_type().clone() else {
+            panic!("struct");
+        };
+        assert_eq!(members[0].metadata(), member.metadata());
+        let DataType::List(element) = out.schema().field(1).data_type().clone() else {
+            panic!("list");
+        };
+        assert_eq!(element.metadata().get("PARQUET:field_id").unwrap(), "4");
+        assert!(is_variant(&element));
+        let DataType::Map(entries, _) = out.schema().field(2).data_type().clone() else {
+            panic!("map");
+        };
+        let DataType::Struct(entry_fields) = entries.data_type().clone() else {
+            panic!("entries");
+        };
+        assert_eq!(entry_fields[1].metadata().get("PARQUET:field_id").unwrap(), "7");
+        assert!(is_variant(&entry_fields[1]));
     }
 }

@@ -13,9 +13,10 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    make_array, Array, ArrayRef, RecordBatch, RecordBatchOptions, StringBuilder,
+    make_array, Array, ArrayRef, AsArray, LargeListArray, ListArray, MapArray, RecordBatch,
+    RecordBatchOptions, StringBuilder, StructArray,
 };
-use datafusion::arrow::compute::cast;
+use datafusion::arrow::compute::{cast, cast_with_options, CastOptions};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::error::ArrowError;
 use parquet_variant_compute::{cast_to_variant, json_to_variant, VariantArray};
@@ -152,45 +153,80 @@ pub fn is_shredded_storage(data_type: &DataType) -> bool {
         && is_variant_storage(data_type)
 }
 
-/// `batch` with every top-level shredded variant column unshredded to
-/// [`storage_type`]; the batch itself when it has none.
+/// True when `data_type` holds a shredded variant at any depth.
+pub fn contains_shredded(data_type: &DataType) -> bool {
+    if is_shredded_storage(data_type) {
+        return true;
+    }
+    match data_type {
+        DataType::Struct(fields) => fields.iter().any(|f| contains_shredded(f.data_type())),
+        DataType::List(f)
+        | DataType::LargeList(f)
+        | DataType::FixedSizeList(f, _)
+        | DataType::Map(f, _) => contains_shredded(f.data_type()),
+        _ => false,
+    }
+}
+
+/// `field` with every shredded variant in it, at any depth, declared as the
+/// unshredded [`storage_type`]. Names, nullability and field ids stay.
+fn unshred_field(field: &Field) -> Field {
+    if is_shredded_storage(field.data_type()) {
+        return tag(&field.clone().with_data_type(storage_type()));
+    }
+    let unshred = |f: &Arc<Field>| Arc::new(unshred_field(f));
+    let data_type = match field.data_type() {
+        DataType::Struct(fields) => DataType::Struct(fields.iter().map(unshred).collect()),
+        DataType::List(f) => DataType::List(unshred(f)),
+        DataType::LargeList(f) => DataType::LargeList(unshred(f)),
+        DataType::FixedSizeList(f, n) => DataType::FixedSizeList(unshred(f), *n),
+        DataType::Map(f, sorted) => DataType::Map(unshred(f), *sorted),
+        _ => return field.clone(),
+    };
+    field.clone().with_data_type(data_type)
+}
+
+/// `batch` with every shredded variant unshredded to [`storage_type`], at
+/// any depth (a variant in a struct, list or map too); the batch itself when
+/// it has none.
 pub fn unshred_batch(batch: &RecordBatch) -> Result<RecordBatch, ArrowError> {
     let schema = batch.schema();
     if !schema
         .fields()
         .iter()
-        .any(|f| is_shredded_storage(f.data_type()))
+        .any(|f| contains_shredded(f.data_type()))
     {
         return Ok(batch.clone());
     }
-    let columns = schema
+    let unshredded = unshred_schema(&schema);
+    let columns = unshredded
         .fields()
         .iter()
         .zip(batch.columns())
         .map(|(field, column)| {
-            if is_shredded_storage(field.data_type()) {
-                unshred(column.as_ref(), &storage_type())
-            } else {
+            if column.data_type() == field.data_type() {
                 Ok(Arc::clone(column))
+            } else {
+                crate::unknown::fill_unknown(column, field.data_type())
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
     RecordBatch::try_new_with_options(
-        unshred_schema(&schema),
+        unshredded,
         columns,
         &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
     )
 }
 
-/// `schema` with every top-level shredded variant field declared as the
+/// `schema` with every shredded variant field, at any depth, declared as the
 /// unshredded [`storage_type`], the schema [`unshred_batch`] produces.
 pub fn unshred_schema(schema: &Schema) -> Arc<Schema> {
     let fields: Vec<Arc<Field>> = schema
         .fields()
         .iter()
         .map(|f| {
-            if is_shredded_storage(f.data_type()) {
-                Arc::new(tag(&f.as_ref().clone().with_data_type(storage_type())))
+            if contains_shredded(f.data_type()) {
+                Arc::new(unshred_field(f))
             } else {
                 Arc::clone(f)
             }
@@ -218,6 +254,115 @@ pub fn from_arrow(input: &dyn Array, target: &DataType) -> Result<ArrayRef, Arro
         Ok(storage)
     } else {
         cast(&storage, target)
+    }
+}
+
+/// Convert `input` to the type of `target`, a field that holds a variant
+/// somewhere inside a struct, list or map. Each variant takes
+/// [`from_arrow`] (JSON text is parsed); everything else is cast checked,
+/// so a value that does not fit is an error, never a silent NULL.
+pub fn from_arrow_nested(input: &ArrayRef, target: &Field) -> Result<ArrayRef, ArrowError> {
+    if input.data_type() == target.data_type() {
+        return Ok(Arc::clone(input));
+    }
+    if is_variant_field(target) {
+        return from_arrow(input.as_ref(), target.data_type());
+    }
+    let checked = CastOptions {
+        safe: false,
+        ..Default::default()
+    };
+    if !contains_variant(target) {
+        return cast_with_options(input, target.data_type(), &checked);
+    }
+    let mismatch = || {
+        ArrowError::CastError(format!(
+            "cannot write {} as {}",
+            input.data_type(),
+            target.data_type()
+        ))
+    };
+    match target.data_type() {
+        DataType::Struct(fields) => {
+            let source = input.as_struct_opt().ok_or_else(mismatch)?;
+            let DataType::Struct(source_fields) = source.data_type() else {
+                return Err(mismatch());
+            };
+            // By name when every member is there, else by position.
+            let by_name = fields
+                .iter()
+                .all(|f| source_fields.iter().any(|s| s.name() == f.name()));
+            if !by_name && source_fields.len() != fields.len() {
+                return Err(mismatch());
+            }
+            let children = fields
+                .iter()
+                .enumerate()
+                .map(|(i, field)| {
+                    let idx = if by_name {
+                        source_fields
+                            .iter()
+                            .position(|s| s.name() == field.name())
+                            .unwrap_or(i)
+                    } else {
+                        i
+                    };
+                    from_arrow_nested(source.column(idx), field)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Arc::new(StructArray::try_new(
+                fields.clone(),
+                children,
+                source.nulls().cloned(),
+            )?))
+        }
+        DataType::List(element) => {
+            let source = match input.data_type() {
+                DataType::List(_) => Arc::clone(input),
+                DataType::LargeList(f) | DataType::FixedSizeList(f, _) => {
+                    cast(input, &DataType::List(Arc::clone(f)))?
+                }
+                _ => return Err(mismatch()),
+            };
+            let source = source.as_list::<i32>();
+            let values = from_arrow_nested(source.values(), element)?;
+            Ok(Arc::new(ListArray::try_new(
+                Arc::clone(element),
+                source.offsets().clone(),
+                values,
+                source.nulls().cloned(),
+            )?))
+        }
+        DataType::LargeList(element) => {
+            let source = match input.data_type() {
+                DataType::LargeList(_) => Arc::clone(input),
+                DataType::List(f) | DataType::FixedSizeList(f, _) => {
+                    cast(input, &DataType::LargeList(Arc::clone(f)))?
+                }
+                _ => return Err(mismatch()),
+            };
+            let source = source.as_list::<i64>();
+            let values = from_arrow_nested(source.values(), element)?;
+            Ok(Arc::new(LargeListArray::try_new(
+                Arc::clone(element),
+                source.offsets().clone(),
+                values,
+                source.nulls().cloned(),
+            )?))
+        }
+        DataType::Map(entries, sorted) => {
+            let source = input.as_map_opt().ok_or_else(mismatch)?;
+            let source_entries: ArrayRef = Arc::new(source.entries().clone());
+            let converted = from_arrow_nested(&source_entries, entries)?;
+            Ok(Arc::new(MapArray::try_new(
+                Arc::clone(entries),
+                source.offsets().clone(),
+                converted.as_struct().clone(),
+                source.nulls().cloned(),
+                *sorted,
+            )?))
+        }
+        _ => Err(mismatch()),
     }
 }
 
@@ -314,6 +459,119 @@ mod tests {
         let unshredded = unshred_schema(&schema);
         assert_eq!(unshredded.field(0), schema.field(0));
         assert_eq!(unshredded.field(1), &field("v", true));
+    }
+
+    /// `json` stored as a variant and shredded as `as_type`: the values that
+    /// fit live only in `typed_value`.
+    fn shredded(json: &[Option<&str>], as_type: &DataType) -> ArrayRef {
+        let stored = from_arrow(&StringArray::from(json.to_vec()), &storage_type()).unwrap();
+        let variants = VariantArray::try_new(stored.as_ref()).unwrap();
+        let shredded = parquet_variant_compute::shred_variant(&variants, as_type).unwrap();
+        let array: ArrayRef = Arc::new(shredded.into_inner());
+        assert!(is_shredded_storage(array.data_type()));
+        array
+    }
+
+    #[test]
+    fn nested_shredded_variant_reads_every_value() {
+        let json = [Some("1"), Some("\"x\""), None, Some("{\"a\": 2}")];
+        let inner = shredded(&json, &DataType::Int64);
+        let want = json_of(&StringArray::from(json.to_vec()));
+
+        // `s STRUCT<v VARIANT>`: the variant keeps its field id.
+        let v = Field::new("v", inner.data_type().clone(), true)
+            .with_metadata([("PARQUET:field_id".to_string(), "7".to_string())].into());
+        let s: ArrayRef = Arc::new(
+            datafusion::arrow::array::StructArray::try_new(
+                vec![v.clone()].into(),
+                vec![Arc::clone(&inner)],
+                None,
+            )
+            .unwrap(),
+        );
+        // `l ARRAY<VARIANT>`: one value per row.
+        let element = Field::new("element", inner.data_type().clone(), true);
+        let l: ArrayRef = Arc::new(
+            datafusion::arrow::array::ListArray::try_new(
+                Arc::new(element.clone()),
+                datafusion::arrow::buffer::OffsetBuffer::from_lengths([1; 4]),
+                Arc::clone(&inner),
+                None,
+            )
+            .unwrap(),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", s.data_type().clone(), true),
+            Field::new("l", l.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![s, l]).unwrap();
+        assert!(contains_shredded(schema.field(0).data_type()));
+
+        let out = unshred_batch(&batch).unwrap();
+        assert_eq!(out.schema(), unshred_schema(&schema));
+        assert!(!out
+            .schema()
+            .fields()
+            .iter()
+            .any(|f| contains_shredded(f.data_type())));
+
+        let DataType::Struct(members) = out.schema().field(0).data_type().clone() else {
+            panic!("struct expected")
+        };
+        assert_eq!(members[0].as_ref(), &tag(&v.with_data_type(storage_type())));
+        let s_values = out.column(0).as_struct().column(0).clone();
+        let l_values = out.column(1).as_list::<i32>().values().clone();
+        for values in [s_values, l_values] {
+            assert_eq!(values.data_type(), &storage_type());
+            let got: Vec<_> = (0..values.len())
+                .map(|i| row_to_json(values.as_ref(), i).unwrap())
+                .collect();
+            assert_eq!(got, want);
+        }
+    }
+
+    #[test]
+    fn nested_variant_members_take_json_text() {
+        let text: ArrayRef = Arc::new(StringArray::from(vec![Some(r#"{"a": 1}"#), None]));
+        // `STRUCT<v JSON, n BIGINT>` from `named_struct('v', <text>, 'n', 1)`.
+        let source: ArrayRef = Arc::new(
+            StructArray::try_new(
+                vec![
+                    Field::new("v", DataType::Utf8, true),
+                    Field::new("n", DataType::Int32, true),
+                ]
+                .into(),
+                vec![
+                    text,
+                    Arc::new(datafusion::arrow::array::Int32Array::from(vec![1, 2])),
+                ],
+                None,
+            )
+            .unwrap(),
+        );
+        let target = Field::new(
+            "s",
+            DataType::Struct(vec![field("v", true), Field::new("n", DataType::Int64, true)].into()),
+            true,
+        );
+        let out = from_arrow_nested(&source, &target).unwrap();
+        assert_eq!(out.data_type(), target.data_type());
+        let v = out.as_struct().column(0).clone();
+        assert_eq!(
+            row_to_json(v.as_ref(), 0).unwrap().as_deref(),
+            Some(r#"{"a":1}"#)
+        );
+        assert_eq!(row_to_json(v.as_ref(), 1).unwrap(), None);
+
+        // `ARRAY<JSON>`: invalid JSON fails the write, never a silent NULL.
+        let list = Field::new_list("l", field("element", true), true);
+        let bad: ArrayRef = Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            datafusion::arrow::buffer::OffsetBuffer::from_lengths([1]),
+            Arc::new(StringArray::from(vec!["{not json"])),
+            None,
+        ));
+        assert!(from_arrow_nested(&bad, &list).is_err());
     }
 
     #[test]

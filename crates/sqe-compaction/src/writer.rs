@@ -784,6 +784,19 @@ pub fn apply_stamped_schema(
                         ),
                     )
                 })
+            } else if sqe_core::variant::contains_variant(stamped_schema.field(i)) {
+                // A struct, list or map with a variant inside: the same,
+                // member by member (#870).
+                sqe_core::variant::from_arrow_nested(col, stamped_schema.field(i)).map_err(|e| {
+                    SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!(
+                            "Failed to write column '{}' with a nested VARIANT from {:?}: {e}",
+                            stamped_schema.field(i).name(),
+                            col.data_type(),
+                        ),
+                    )
+                })
             } else {
                 // Checked, not safe (#834): a safe cast turns 'abc' -> Int64
                 // into NULL, so the INSERT succeeded and stored a value the
