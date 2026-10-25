@@ -28,8 +28,8 @@
 ## 4. Follow-ups
 
 - [ ] 4.1 `variant_get`, `parse_json`, `typeof` on variant
-- [ ] 4.2 Read shredded variants (`unshred_variant`)
+- [x] 4.2 Read shredded variants (`unshred_variant`), top-level and nested in structs, lists and maps
 - [ ] 4.3 Nested variants over Flight as JSON text
-- [ ] 4.4 Spark 4 / Iceberg 1.10 interop test (local Spark stack is Iceberg 1.7)
-- [ ] 4.5 Worker-path scan of a variant table
+- [x] 4.4 Spark 4 / Iceberg 1.10 interop test (`variant_spark_interop.rs`, Spark 4.1 + Iceberg 1.12)
+- [x] 4.5 Worker-path scan of a variant table (`variant_distributed.rs`)
 - [x] 4.6 `default_table_format_version` defaults to 3; docs name the opt-out
