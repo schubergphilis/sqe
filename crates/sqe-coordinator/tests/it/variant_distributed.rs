@@ -251,3 +251,58 @@ async fn prunes_shredded_row_groups_on_a_worker() {
         "the worker read {read_pruned} of {n} rows: no row group was pruned"
     );
 }
+
+/// Variants SQE shredded inside a struct, a list and a map, scanned on a
+/// worker (#870): the worker folds each nested `typed_value` back into
+/// `value` before Flight. Runs against an in-process worker.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn nested_shredded_variant_scans_on_a_worker() {
+    use crate::common::chaos_worker::{spawn_chaos_worker, ChaosMode};
+    let worker = spawn_chaos_worker(ChaosMode::PassThrough).await;
+    let rig = crate::distributed_failure_e2e::rig(std::slice::from_ref(&worker.url), |_| {}).await;
+    let (session, handler) = (&rig.session, rig.handler.as_ref());
+    let fq = "default.variant_nested_shredded_on_worker";
+    let _ = handler
+        .execute(session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+    for sql in [
+        format!(
+            "CREATE TABLE {fq} (id INT, s STRUCT<v JSON>, l ARRAY<JSON>, m MAP<VARCHAR, JSON>) \
+             WITH ('write.parquet.shred-variants' = 'true')"
+        ),
+        format!(
+            r#"INSERT INTO {fq} VALUES
+                 (1, named_struct('v', '{{"a": 1, "s": "x"}}'), make_array('{{"a": 1}}', '[1, 2]'), map(['k'], ['{{"a": 1}}'])),
+                 (2, named_struct('v', '"text"'), make_array('{{"a": 3}}'), map(['k'], ['{{"a": 4}}'])),
+                 (3, NULL, NULL, NULL)"#
+        ),
+    ] {
+        handler.execute(session, &sql, None).await.expect(&sql);
+    }
+
+    let sql = format!(
+        "SELECT id, s['v'], l[2], map_extract(m, 'k')[1], json_get_int(s['v'], 'a') \
+         FROM {fq} ORDER BY id"
+    );
+    let before = worker.do_gets();
+    let read = rows(handler, session, &sql).await;
+    let after = worker.do_gets();
+    let _ = handler
+        .execute(session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+
+    assert_eq!(
+        read,
+        vec![
+            r#"1|{"a":1,"s":"x"}|[1,2]|{"a":1}|1"#,
+            r#"2|"text"|NULL|{"a":4}|NULL"#,
+            "3|NULL|NULL|NULL|NULL",
+        ]
+    );
+    assert!(
+        after > before,
+        "the scan ran on the coordinator, not a worker: \
+         the worker got no do_get ({before} -> {after})"
+    );
+}

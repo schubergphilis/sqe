@@ -43,6 +43,16 @@ pub fn fill_unknown(array: &ArrayRef, target: &DataType) -> Result<ArrayRef, Arr
     if array.data_type() == target {
         return Ok(Arc::clone(array));
     }
+    // A shredded variant decodes with a `typed_value` group the declared
+    // storage lacks. Fold it back in, at any depth: the struct rebuild below
+    // would otherwise keep `metadata` and `value` and drop `typed_value`,
+    // and with it every value the writer shredded (#870).
+    if crate::variant::is_shredded_storage(array.data_type())
+        && crate::variant::is_variant_storage(target)
+        && !crate::variant::is_shredded_storage(target)
+    {
+        return crate::variant::unshred(array.as_ref(), target);
+    }
     if array.data_type() == &DataType::Null || target == &DataType::Null {
         return Ok(new_null_array(target, array.len()));
     }
