@@ -185,3 +185,69 @@ async fn shredded_variant_column_scans_on_a_worker() {
          system.runtime.tasks gained no worker task ({before} -> {after})"
     );
 }
+
+/// A comparison on a shredded variant field prunes row groups on the worker
+/// too (#870): the coordinator sends the prune in the scan ticket, since the
+/// worker has no variant functions to run the filter with. The worker ships
+/// every row of the groups it keeps, so the rows it sends show what it read.
+/// The worker runs in-process, so it is the code in this tree, not a compose
+/// image.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn prunes_shredded_row_groups_on_a_worker() {
+    use crate::common::chaos_worker::{spawn_chaos_worker, ChaosMode};
+    let worker = spawn_chaos_worker(ChaosMode::PassThrough).await;
+    let rig = crate::distributed_failure_e2e::rig(std::slice::from_ref(&worker.url), |_| {}).await;
+    let (session, handler) = (&rig.session, rig.handler.as_ref());
+    let fq = "default.variant_prune_on_worker";
+    let n = 20_000_u64;
+    let _ = handler
+        .execute(session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+    for sql in [
+        format!(
+            "CREATE TABLE {fq} (id BIGINT, v VARIANT) \
+             WITH ('write.parquet.shred-variants' = 'true', \
+                   'write.parquet.row-group-size-bytes' = '262144')"
+        ),
+        format!(
+            r#"INSERT INTO {fq} SELECT value, '{{"a": ' || value || ', "pad": "' || md5(CAST(value AS VARCHAR)) || '"}}' FROM range(0, {n})"#
+        ),
+    ] {
+        handler.execute(session, &sql, None).await.expect(&sql);
+    }
+
+    let cut = n - 100;
+    let pruned = format!(
+        "SELECT count(*), min(id) FROM {fq} WHERE variant_get(v, '$.a', 'bigint') >= {cut}"
+    );
+    // `+ 0` is not a shape the scan prunes on: the full-scan baseline.
+    let baseline = format!(
+        "SELECT count(*), min(id) FROM {fq} WHERE variant_get(v, '$.a', 'bigint') + 0 >= {cut}"
+    );
+    let before = worker.do_gets();
+    let shipped = worker.rows_sent();
+    let got = rows(handler, session, &pruned).await;
+    let read_pruned = worker.rows_sent() - shipped;
+    let after = worker.do_gets();
+    let shipped = worker.rows_sent();
+    let full = rows(handler, session, &baseline).await;
+    let read_full = worker.rows_sent() - shipped;
+    let _ = handler
+        .execute(session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+
+    let want = vec![format!("100|{cut}")];
+    assert_eq!(got, want, "pruned");
+    assert_eq!(full, want, "baseline");
+    assert!(
+        after > before,
+        "the scan ran on the coordinator, not a worker: \
+         the worker got no do_get ({before} -> {after})"
+    );
+    assert_eq!(read_full, n, "the baseline worker scan ships every row");
+    assert!(
+        read_pruned < n / 2,
+        "the worker read {read_pruned} of {n} rows: no row group was pruned"
+    );
+}

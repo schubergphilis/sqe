@@ -5052,6 +5052,20 @@ impl QueryHandler {
             )
         })?;
 
+        // 6a'. Shredded variant prunes (sqe#870): workers decode the pushed
+        // predicate without the variant functions, so the row-group filters
+        // travel as their own ticket field. Same gate as the predicate.
+        let variant_prunes = if self.config.query.distributed_scan_pushdown {
+            iceberg_scan.variant_prunes_wire().map_err(|e| {
+                SqeError::with_code(
+                    SqeErrorCode::InternalError,
+                    format!("encoding the scan's variant prunes: {e}"),
+                )
+            })?
+        } else {
+            None
+        };
+
         // 6b. Push the scan predicate and (when safe) the query LIMIT into each
         // ScanTask (#233). Both are pure optimizations: the authoritative
         // FilterExec / GlobalLimitExec remain above DistributedScanExec (the
@@ -5185,6 +5199,7 @@ impl QueryHandler {
                     .with_projection(projected_cols.clone(), projected_field_ids.clone())
                     .with_predicate_proto(predicate_proto.clone())
                     .with_projection_fill(projection_fill.clone())
+                    .with_variant_prunes(variant_prunes.clone())
                     .with_limit(scan_limit)
                     .build()]
                 } else {
@@ -5204,6 +5219,7 @@ impl QueryHandler {
                             .with_projection(projected_cols.clone(), projected_field_ids.clone())
                             .with_predicate_proto(predicate_proto.clone())
                             .with_projection_fill(projection_fill.clone())
+                            .with_variant_prunes(variant_prunes.clone())
                             .with_limit(scan_limit);
                             if let (Some(start), Some(end)) = (m.start_byte, m.end_byte) {
                                 builder = builder.with_byte_range(start, end);

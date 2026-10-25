@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::scan_morsel::{
     SCAN_TASK_VERSION_CURRENT, SCAN_TASK_VERSION_V1, SCAN_TASK_VERSION_V2, SCAN_TASK_VERSION_V3,
-    SCAN_TASK_VERSION_V4,
+    SCAN_TASK_VERSION_V4, SCAN_TASK_VERSION_V5,
 };
 
 /// File format of a Hive external table's data files.
@@ -223,7 +223,7 @@ impl ScanCredentials {
 pub struct ScanTask {
     /// Ticket encoding version. `1` = whole-file (pre-morsel); `2` = optional
     /// row-group / byte-range morsel fields; `3` = `hive`; `4` =
-    /// `projection_fill`. Workers reject
+    /// `projection_fill`; `5` = `variant_prunes`. Workers reject
     /// unsupported versions. Missing field deserializes as v1 for old
     /// coordinators.
     ///
@@ -359,6 +359,17 @@ pub struct ScanTask {
         with = "predicate_wire"
     )]
     pub projection_fill: Option<Vec<u8>>,
+    /// Shredded variant prunes (sqe#870): JSON written by
+    /// `sqe_catalog::variant_prune::encode_prunes`. The worker drops the row
+    /// groups whose shredded statistics exclude a filter; the coordinator
+    /// keeps the filter itself, so an ignored prune only costs reads.
+    #[serde(
+        rename = "variant_prunes_b64",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "predicate_wire"
+    )]
+    pub variant_prunes: Option<Vec<u8>>,
 }
 
 /// Wire codec for [`ScanTask::predicate_proto`]: writes base64, reads either
@@ -494,6 +505,12 @@ impl ScanTaskBuilder {
         self
     }
 
+    /// Shredded variant prunes (sqe#870); see [`ScanTask::variant_prunes`].
+    pub fn with_variant_prunes(mut self, prunes: Option<Vec<u8>>) -> Self {
+        self.task.variant_prunes = prunes;
+        self
+    }
+
     /// Per-fragment row LIMIT hint (#233).
     pub fn with_limit(mut self, limit: Option<usize>) -> Self {
         self.task.limit = limit;
@@ -539,6 +556,7 @@ impl std::fmt::Debug for ScanTask {
             .field("limit", &self.limit)
             .field("hive", &self.hive.as_ref().map(|h| h.format))
             .field("has_projection_fill", &self.projection_fill.is_some())
+            .field("has_variant_prunes", &self.variant_prunes.is_some())
             .finish()
     }
 }
@@ -579,6 +597,7 @@ impl ScanTask {
                 limit: None,
                 hive: None,
                 projection_fill: None,
+                variant_prunes: None,
             },
         }
     }
@@ -589,7 +608,9 @@ impl ScanTask {
     ///
     /// - v2: any morsel field (`morsel_id`, `row_group_*`, `start_byte`,
     ///   `end_byte`);
-    /// - v3: `hive`.
+    /// - v3: `hive`;
+    /// - v4: `projection_fill`;
+    /// - v5: `variant_prunes`.
     ///
     /// `predicate_proto`, `limit`, `projected_field_ids`, `credentials`,
     /// `audience` and `expires_at` do not raise the version: an old worker
@@ -606,6 +627,9 @@ impl ScanTask {
         }
         if self.projection_fill.is_some() {
             required = required.max(SCAN_TASK_VERSION_V4);
+        }
+        if self.variant_prunes.is_some() {
+            required = required.max(SCAN_TASK_VERSION_V5);
         }
         required
     }
@@ -653,6 +677,9 @@ impl ScanTask {
         }
         if required >= SCAN_TASK_VERSION_V4 && self.projection_fill.is_some() {
             fields.push("projection_fill");
+        }
+        if required >= SCAN_TASK_VERSION_V5 && self.variant_prunes.is_some() {
+            fields.push("variant_prunes");
         }
         fields
     }
@@ -747,7 +774,7 @@ impl ScanTask {
     pub fn validate_version(&self) -> Result<(), String> {
         match self.version {
             SCAN_TASK_VERSION_V1 | SCAN_TASK_VERSION_V2 | SCAN_TASK_VERSION_V3
-            | SCAN_TASK_VERSION_V4 => Ok(()),
+            | SCAN_TASK_VERSION_V4 | SCAN_TASK_VERSION_V5 => Ok(()),
             other => Err(format!(
                 "unsupported ScanTask version {other}; this worker supports \
                  {SCAN_TASK_VERSION_V1}..={SCAN_TASK_VERSION_CURRENT}"
@@ -798,6 +825,7 @@ mod tests {
             limit: None,
             hive: None,
             projection_fill: None,
+            variant_prunes: None,
         }
     }
 
@@ -856,18 +884,19 @@ mod tests {
     }
 
     #[test]
-    fn version_four_is_accepted_and_five_is_not() {
+    fn version_five_is_accepted_and_six_is_not() {
         let mut task = task_with_predicate(None);
         for v in [
             SCAN_TASK_VERSION_V1,
             SCAN_TASK_VERSION_V2,
             SCAN_TASK_VERSION_V3,
             SCAN_TASK_VERSION_V4,
+            SCAN_TASK_VERSION_V5,
         ] {
             task.version = v;
             assert!(task.validate_version().is_ok(), "v{v} must be accepted");
         }
-        task.version = 5;
+        task.version = 6;
         assert!(
             task.validate_version().is_err(),
             "an unknown version must be refused, not read as the newest known one"
@@ -889,6 +918,30 @@ mod tests {
         assert_eq!(back.projection_fill, Some(vec![1, 2, 3]));
         // A v3 worker refuses it by version, before any field is read.
         assert!(ScanTask::decode_for_worker(&bytes, SCAN_TASK_VERSION_V3).is_err());
+    }
+
+    #[test]
+    fn variant_prunes_make_the_task_v5_and_round_trip() {
+        let task = built(
+            ScanTask::builder("f", vec!["s3://b/f.parquet".to_string()], storage())
+                .with_variant_prunes(Some(vec![1, 2, 3])),
+        );
+        assert_eq!(task.version, SCAN_TASK_VERSION_V5);
+        let bytes = task.to_bytes().unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(text.contains("\"variant_prunes_b64\":\"AQID\""), "{text}");
+        let back = ScanTask::decode_for_worker(&bytes, SCAN_TASK_VERSION_CURRENT).unwrap();
+        assert_eq!(back.variant_prunes, Some(vec![1, 2, 3]));
+        assert!(ScanTask::decode_for_worker(&bytes, SCAN_TASK_VERSION_V4).is_err());
+        // Without prunes the ticket keeps its older version and bytes.
+        let plain = built(ScanTask::builder(
+            "f",
+            vec!["s3://b/f.parquet".to_string()],
+            storage(),
+        ));
+        assert_eq!(plain.version, SCAN_TASK_VERSION_V1);
+        let text = String::from_utf8(plain.to_bytes().unwrap()).unwrap();
+        assert!(!text.contains("variant_prunes"), "{text}");
     }
 
     fn storage() -> ScanStorage {
@@ -1215,6 +1268,7 @@ mod tests {
             limit: None,
             hive: None,
             projection_fill: None,
+            variant_prunes: None,
         };
 
         let bytes = task.to_bytes().unwrap();
@@ -1253,6 +1307,7 @@ mod tests {
             limit: None,
             hive: None,
             projection_fill: None,
+            variant_prunes: None,
         };
 
         let bytes = task.to_bytes().unwrap();
@@ -1315,6 +1370,7 @@ mod tests {
             limit: None,
             hive: None,
             projection_fill: None,
+            variant_prunes: None,
         };
         let debug_output = format!("{task:?}");
         // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS's documented example key, asserting it is redacted
@@ -1353,6 +1409,7 @@ mod tests {
             limit: Some(42),
             hive: None,
             projection_fill: None,
+            variant_prunes: None,
         };
 
         let bytes = task.to_bytes().unwrap();

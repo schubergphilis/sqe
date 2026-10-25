@@ -31,10 +31,11 @@ use parquet::basic::{
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
 use parquet::schema::types::SchemaDescriptor;
+use serde::{Deserialize, Serialize};
 
 /// The SQL type a `variant_get` call reads the field as, for the types
 /// whose Parquet statistics order matches SQL order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Target {
     Int32,
     Int64,
@@ -62,7 +63,7 @@ impl Target {
 
 /// The literal side of the comparison, in the domain the leaf's statistics
 /// are compared in.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 enum Bound {
     Int(i64),
     Bytes(Vec<u8>),
@@ -70,7 +71,7 @@ enum Bound {
 }
 
 /// The comparison, with the field on the left.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Cmp {
     Eq,
     Lt,
@@ -115,7 +116,11 @@ impl Cmp {
 }
 
 /// One `variant_get(col, '$.path', 'type') <op> literal` filter.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Plain data, so a distributed scan sends it to the workers in the scan
+/// ticket ([`encode_prunes`]); the filter expression itself does not travel,
+/// as workers decode the pushed predicate without the variant functions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VariantPrune {
     column: String,
     field_id: Option<i32>,
@@ -428,6 +433,21 @@ pub fn is_variant_prune_filter(expr: &Expr, schema: &Schema) -> bool {
     VariantPrune::from_expr(expr, schema).is_some()
 }
 
+/// The prunes as scan-ticket bytes (JSON), or `None` when there are none.
+/// Resolve each field id first ([`VariantPrune::with_field_id`]): the worker
+/// has no table schema to resolve a renamed column against.
+pub fn encode_prunes(prunes: &[VariantPrune]) -> serde_json::Result<Option<Vec<u8>>> {
+    if prunes.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_vec(prunes).map(Some)
+}
+
+/// Reads the bytes [`encode_prunes`] wrote.
+pub fn decode_prunes(bytes: &[u8]) -> serde_json::Result<Vec<VariantPrune>> {
+    serde_json::from_slice(bytes)
+}
+
 /// Drops the row groups any of the filters excludes, for the reader hook.
 #[derive(Debug)]
 pub struct VariantRowGroupPruner {
@@ -695,6 +715,37 @@ mod tests {
             int(6),
         );
         assert_eq!(kept(&meta, as_int), vec![3]);
+    }
+
+    /// The ticket encoding a worker reads prunes exactly as the coordinator
+    /// built them, field id included.
+    #[test]
+    fn prunes_round_trip_through_the_ticket_encoding() {
+        let s = schema();
+        let prunes: Vec<VariantPrune> = [
+            a_bigint(Operator::Gt, 6),
+            cmp(
+                get("variant_get", "v", "$.a.b", "string"),
+                Operator::Eq,
+                text("x"),
+            ),
+            cmp(
+                get("variant_get", "v", "$.a", "boolean"),
+                Operator::Eq,
+                Expr::Literal(ScalarValue::Boolean(Some(true)), None),
+            ),
+        ]
+        .iter()
+        .map(|e| VariantPrune::from_expr(e, &s).expect("prunable"))
+        .map(|mut p| {
+            p.field_id = Some(7);
+            p
+        })
+        .collect();
+        let bytes = encode_prunes(&prunes).unwrap().expect("non-empty");
+        assert_eq!(decode_prunes(&bytes).unwrap(), prunes);
+        assert_eq!(encode_prunes(&[]).unwrap(), None);
+        assert!(decode_prunes(b"not json").is_err());
     }
 
     #[test]

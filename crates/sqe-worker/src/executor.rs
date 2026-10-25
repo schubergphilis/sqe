@@ -10,10 +10,12 @@ use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool};
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::create_physical_expr;
+use datafusion::physical_plan::metrics::Count;
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use datafusion_proto::bytes::Serializeable;
 use futures::{Stream, StreamExt, TryStreamExt};
+use iceberg::arrow::RowGroupPruner;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt};
@@ -1699,6 +1701,44 @@ async fn open_parquet_stream(
             }
         }
 
+        // Shredded variant prunes (sqe#870): the coordinator's row-group
+        // filter on `variant_get(..) <op> literal`, sent as plain data since
+        // the worker has no variant functions. Narrows like #369 above.
+        if let (Some(bytes), true) = (
+            task.variant_prunes.as_deref(),
+            row_group_prune::pruning_enabled(),
+        ) {
+            match sqe_catalog::variant_prune::decode_prunes(bytes) {
+                Ok(prunes) => {
+                    let candidates: Vec<usize> = match selected {
+                        Some(ref groups) => groups.clone(),
+                        None => (0..n_groups).collect(),
+                    };
+                    let before = candidates.len();
+                    let pruner = sqe_catalog::variant_prune::VariantRowGroupPruner::new(
+                        Arc::from(prunes),
+                        Count::new(),
+                    );
+                    let kept = pruner.select(meta, candidates);
+                    debug!(
+                        fragment_id = %task.fragment_id,
+                        file = %file_path,
+                        candidates = before,
+                        kept = kept.len(),
+                        "Shredded variant row-group pruning applied"
+                    );
+                    selected = Some(kept);
+                }
+                // Pruning is an optimisation; a ticket it cannot read scans
+                // every row group and the coordinator's filter still applies.
+                Err(e) => warn!(
+                    fragment_id = %task.fragment_id,
+                    error = %e,
+                    "Ignoring undecodable variant prunes"
+                ),
+            }
+        }
+
         // `Some(groups)` is an explicit selection and is applied verbatim, even
         // when empty: an empty selection means "this morsel owns no row groups"
         // and must read nothing. `None` means no morsel restriction was given,
@@ -2086,6 +2126,7 @@ mod tests {
         ScanTask {
             hive: None,
             projection_fill: None,
+            variant_prunes: None,
             version: 1,
             morsel_id: None,
             row_group_start: None,
@@ -2487,6 +2528,7 @@ mod tests {
         ScanTask {
             hive: None,
             projection_fill: None,
+            variant_prunes: None,
             version: 1,
             morsel_id: None,
             row_group_start: None,
