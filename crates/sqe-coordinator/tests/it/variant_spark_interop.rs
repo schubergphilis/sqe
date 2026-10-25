@@ -302,6 +302,100 @@ async fn scan_files(
     out.unwrap_or_else(|| panic!("no IcebergScanExec in {explain}"))
 }
 
+/// SQE writes variant manifest bounds for its shredded files (#870): its own
+/// files are pruned like Spark's, `rewrite_data_files` writes bounds for the
+/// merged file, and Spark 4.1 reads the table with the bounds in place.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn sqe_prunes_its_own_files_on_variant_bounds() {
+    if let Some(reason) = spark_stack_skip_reason() {
+        eprintln!("skipping sqe_prunes_its_own_files_on_variant_bounds: {reason}");
+        return;
+    }
+    let (session, handler) = crate::common::setup_handler().await;
+    let fq = "default.variant_bounds_from_sqe";
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+    for sql in [
+        format!(
+            "CREATE TABLE {fq} (id INT, v JSON) \
+             WITH ('write.parquet.shred-variants' = 'true')"
+        ),
+        format!(
+            r#"INSERT INTO {fq} VALUES (1, '{{"a": 1, "s": "a"}}'), (2, '{{"a": 3, "s": "b"}}')"#
+        ),
+        format!(
+            r#"INSERT INTO {fq} VALUES (3, '{{"a": 10, "s": "c"}}'), (4, '{{"a": 12, "s": "d"}}')"#
+        ),
+        // `$.a` mixes types: no bound for it, `$.s` still gets one.
+        format!(
+            r#"INSERT INTO {fq} VALUES (5, '{{"a": 7, "s": "e"}}'), (6, '{{"a": "seven", "s": "f"}}')"#
+        ),
+    ] {
+        handler.execute(&session, &sql, None).await.expect(&sql);
+    }
+
+    let mut got = Vec::new();
+    let filters = [
+        "try_variant_get(v, '$.a', 'bigint') >= 9",
+        // `+ 0` is not a shape the scan prunes on: the full-scan baseline.
+        "try_variant_get(v, '$.a', 'bigint') + 0 >= 9",
+        "variant_get(v, '$.s', 'string') = 'd'",
+        "try_variant_get(v, '$.a', 'int') < 2",
+    ];
+    for filter in filters {
+        let sql = format!("SELECT count(*), min(id) FROM {fq} WHERE {filter}");
+        let rows = sqe_rows(&handler, &session, &sql).await.join(",");
+        let (scanned, total) = scan_files(&handler, &session, &sql).await;
+        got.push(format!("{rows} files {scanned}/{total}"));
+    }
+    let spark_count =
+        |filter: &str| format!("SELECT count(*), min(id) FROM rest.{fq} WHERE {filter};");
+    let spark = spark_rows(&format!(
+        "{} {}",
+        spark_count(filters[0]),
+        spark_count(filters[2])
+    ));
+
+    handler
+        .execute(
+            &session,
+            &format!("CALL system.rewrite_data_files(table => '{fq}', min_input_files => 2)"),
+            None,
+        )
+        .await
+        .expect("rewrite_data_files on a shredded variant table");
+    for filter in [
+        "variant_get(v, '$.s', 'string') = 'd'",
+        "variant_get(v, '$.s', 'string') = 'z'",
+    ] {
+        let sql = format!("SELECT count(*), min(id) FROM {fq} WHERE {filter}");
+        let rows = sqe_rows(&handler, &session, &sql).await.join(",");
+        let (scanned, total) = scan_files(&handler, &session, &sql).await;
+        got.push(format!("rewritten {rows} files {scanned}/{total}"));
+    }
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+
+    assert_eq!(
+        got,
+        vec![
+            // The first file's bounds [1, 3] exclude it; the mixed file stays.
+            "2|3 files 2/3",
+            "2|3 files 3/3",
+            // `$.s` bounds [a, b] and [e, f] exclude two files.
+            "1|4 files 1/3",
+            "1|1 files 2/3",
+            // The merged file's `$.s` bounds are [a, f].
+            "rewritten 1|4 files 1/1",
+            "rewritten 0|NULL files 0/1",
+        ]
+    );
+    assert_eq!(spark, vec!["2|3", "1|4"], "Spark's rows with SQE's bounds");
+}
+
 /// SQE writes shredded variants when the table sets
 /// `write.parquet.shred-variants` (#858). Each data file infers its own
 /// shredding from its first batch, so the second INSERT shreds `a` as a
