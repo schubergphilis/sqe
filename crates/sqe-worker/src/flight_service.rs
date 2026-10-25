@@ -1841,6 +1841,7 @@ mod tests {
         sqe_planner::ScanTask {
             hive: None,
             projection_fill: None,
+            variant_prunes: None,
             version: 1,
             morsel_id: None,
             row_group_start: None,

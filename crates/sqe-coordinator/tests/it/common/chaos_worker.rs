@@ -84,6 +84,7 @@ struct Shared {
     do_gets: AtomicUsize,
     active_streams: Arc<AtomicUsize>,
     frames_sent: Arc<AtomicU64>,
+    rows_sent: Arc<AtomicU64>,
 }
 
 /// The Flight service the coordinator dials. Cloning shares the counters.
@@ -116,6 +117,10 @@ impl ChaosHandle {
     /// Flight frames actually handed to the coordinator.
     pub fn frames_sent(&self) -> u64 {
         self.worker.shared.frames_sent.load(Ordering::SeqCst)
+    }
+    /// Rows in the record batches handed to the coordinator.
+    pub fn rows_sent(&self) -> u64 {
+        self.worker.shared.rows_sent.load(Ordering::SeqCst)
     }
     /// Poll until `active_streams()` is zero or `within` elapses.
     pub async fn wait_streams_closed(&self, within: Duration) -> bool {
@@ -165,6 +170,7 @@ pub async fn spawn_chaos_worker(mode: ChaosMode) -> ChaosHandle {
             do_gets: AtomicUsize::new(0),
             active_streams: Arc::new(AtomicUsize::new(0)),
             frames_sent: Arc::new(AtomicU64::new(0)),
+            rows_sent: Arc::new(AtomicU64::new(0)),
         }),
     };
 
@@ -235,10 +241,14 @@ impl FlightService for ChaosWorker {
         shared.active_streams.fetch_add(1, Ordering::SeqCst);
         let guard = ActiveGuard(Arc::clone(&shared.active_streams));
         let frames = Arc::clone(&shared.frames_sent);
-        let counted = inner_stream.inspect(move |_| {
+        let rows = Arc::clone(&shared.rows_sent);
+        let counted = inner_stream.inspect(move |item| {
             // The closure owns the guard, so dropping the stream drops it.
             let _keep = &guard;
             frames.fetch_add(1, Ordering::SeqCst);
+            if let Ok(data) = item {
+                rows.fetch_add(batch_rows(data), Ordering::SeqCst);
+            }
         });
 
         let stream: BoxStream<FlightData> = match mode {
@@ -332,4 +342,13 @@ impl FlightService for ChaosWorker {
     ) -> Result<Response<Self::ListActionsStream>, Status> {
         self.shared.inner.list_actions(request).await
     }
+}
+
+/// The row count in a record-batch frame's IPC header; 0 for a schema or
+/// dictionary frame.
+fn batch_rows(data: &FlightData) -> u64 {
+    arrow_ipc::root_as_message(&data.data_header)
+        .ok()
+        .and_then(|m| m.header_as_record_batch())
+        .map_or(0, |b| b.length().max(0) as u64)
 }
