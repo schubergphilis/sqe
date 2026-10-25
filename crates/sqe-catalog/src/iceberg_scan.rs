@@ -852,6 +852,23 @@ impl IcebergScanExec {
             initial_default_scalars(&self.table, self.snapshot_id, cols, &self.projected_schema)?;
         encode_projection_fill(&self.projected_schema, &defaults).map(Some)
     }
+    /// The shredded variant prunes (sqe#870) as scan-ticket bytes, with each
+    /// field id resolved against the scanned snapshot, or `None` when the
+    /// scan has none. Workers decode the pushed predicate without the variant
+    /// functions, so the prunes travel as their own ticket field.
+    pub fn variant_prunes_wire(&self) -> DFResult<Option<Vec<u8>>> {
+        if self.variant_prunes.is_empty() {
+            return Ok(None);
+        }
+        let iceberg_schema = snapshot_schema(&self.table, self.snapshot_id);
+        let prunes: Vec<_> = self
+            .variant_prunes
+            .iter()
+            .map(|p| p.clone().with_field_id(&iceberg_schema))
+            .collect();
+        crate::variant_prune::encode_prunes(&prunes)
+            .map_err(|e| DataFusionError::External(Box::new(e)))
+    }
     pub fn pushed_down_filters(&self) -> &[Arc<dyn PhysicalExpr>] {
         &self.pushed_down_filters
     }

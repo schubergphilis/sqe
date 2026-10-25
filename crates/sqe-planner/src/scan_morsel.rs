@@ -23,7 +23,10 @@ pub const SCAN_TASK_VERSION_V3: u32 = 3;
 /// only when the fill is present, so tickets for tables whose projected
 /// columns never evolved stay byte-identical to v3.
 pub const SCAN_TASK_VERSION_V4: u32 = 4;
-pub const SCAN_TASK_VERSION_CURRENT: u32 = SCAN_TASK_VERSION_V4;
+/// `5` = optional shredded variant prunes (sqe#870): the row-group filters a
+/// worker applies from shredded variant statistics. Bumped only when present.
+pub const SCAN_TASK_VERSION_V5: u32 = 5;
+pub const SCAN_TASK_VERSION_CURRENT: u32 = SCAN_TASK_VERSION_V5;
 
 /// Default target compressed size for a morsel (128 MiB).
 pub const DEFAULT_MORSEL_TARGET_BYTES: u64 = 128 * 1024 * 1024;
