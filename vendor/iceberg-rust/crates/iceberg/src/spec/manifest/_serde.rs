@@ -148,8 +148,14 @@ impl DataFileSerde {
             value_counts: Some(to_i64_entry(value.value_counts)?),
             null_value_counts: Some(to_i64_entry(value.null_value_counts)?),
             nan_value_counts: Some(to_i64_entry(value.nan_value_counts)?),
-            lower_bounds: Some(to_bytes_entry(value.lower_bounds)?),
-            upper_bounds: Some(to_bytes_entry(value.upper_bounds)?),
+            lower_bounds: Some(to_bytes_entry_with_variant(
+                value.lower_bounds,
+                value.variant_lower_bounds,
+            )?),
+            upper_bounds: Some(to_bytes_entry_with_variant(
+                value.upper_bounds,
+                value.variant_upper_bounds,
+            )?),
             key_metadata: value.key_metadata.map(serde_bytes::ByteBuf::from),
             split_offsets: value.split_offsets,
             equality_ids: value.equality_ids,
@@ -179,6 +185,16 @@ impl DataFileSerde {
             })
             .transpose()?
             .unwrap_or(Struct::empty());
+        let (lower_bounds, variant_lower_bounds) = self
+            .lower_bounds
+            .map(|v| parse_bytes_entry_with_variant(v, schema))
+            .transpose()?
+            .unwrap_or_default();
+        let (upper_bounds, variant_upper_bounds) = self
+            .upper_bounds
+            .map(|v| parse_bytes_entry_with_variant(v, schema))
+            .transpose()?
+            .unwrap_or_default();
         Ok(super::DataFile {
             content: self.content.try_into()?,
             file_path: self.file_path,
@@ -206,16 +222,10 @@ impl DataFileSerde {
                 .map(parse_i64_entry)
                 .transpose()?
                 .unwrap_or_default(),
-            lower_bounds: self
-                .lower_bounds
-                .map(|v| parse_bytes_entry(v, schema))
-                .transpose()?
-                .unwrap_or_default(),
-            upper_bounds: self
-                .upper_bounds
-                .map(|v| parse_bytes_entry(v, schema))
-                .transpose()?
-                .unwrap_or_default(),
+            lower_bounds,
+            upper_bounds,
+            variant_lower_bounds,
+            variant_upper_bounds,
             key_metadata: self.key_metadata.map(|v| v.to_vec()),
             split_offsets: self.split_offsets,
             equality_ids: self.equality_ids,
@@ -237,8 +247,21 @@ struct BytesEntry {
     value: serde_bytes::ByteBuf,
 }
 
+/// The bounds map of a manifest entry; a variant column's bound is
+/// returned apart, as its raw bytes.
+type ParsedBounds = (HashMap<i32, Datum>, HashMap<i32, Vec<u8>>);
+
+#[cfg(test)]
 fn parse_bytes_entry(v: Vec<BytesEntry>, schema: &Schema) -> Result<HashMap<i32, Datum>, Error> {
+    parse_bytes_entry_with_variant(v, schema).map(|(m, _)| m)
+}
+
+fn parse_bytes_entry_with_variant(
+    v: Vec<BytesEntry>,
+    schema: &Schema,
+) -> Result<ParsedBounds, Error> {
     let mut m = HashMap::with_capacity(v.len());
+    let mut variant = HashMap::new();
     for entry in v {
         // First try to find the field in the schema, or check if it's a reserved metadata field
         let field = schema
@@ -249,9 +272,10 @@ fn parse_bytes_entry(v: Vec<BytesEntry>, schema: &Schema) -> Result<HashMap<i32,
             // SQE PATCH (v3-shredded-variant): a writer that shreds a V3
             // variant stores its bounds as a serialized variant keyed by
             // field path (Iceberg 1.12). There is no primitive Datum for it;
-            // skip the bound so the manifest stays readable and pruning on
-            // the column stays conservative.
+            // keep the bytes apart, for variant pruning and to write them
+            // back unchanged.
             if field.field_type.is_variant() {
+                variant.insert(entry.key, entry.value.into_vec());
                 continue;
             }
             let data_type = field
@@ -271,7 +295,21 @@ fn parse_bytes_entry(v: Vec<BytesEntry>, schema: &Schema) -> Result<HashMap<i32,
         }
         // We ignore the entry if the field is not found in schema or metadata columns (schema evolution).
     }
-    Ok(m)
+    Ok((m, variant))
+}
+
+/// SQE PATCH (v3-shredded-variant): `to_bytes_entry` plus the variant
+/// bounds, written back as they were read.
+fn to_bytes_entry_with_variant(
+    v: impl IntoIterator<Item = (i32, Datum)>,
+    variant: HashMap<i32, Vec<u8>>,
+) -> Result<Vec<BytesEntry>, Error> {
+    let mut bs = to_bytes_entry(v)?;
+    bs.extend(variant.into_iter().map(|(key, value)| BytesEntry {
+        key,
+        value: serde_bytes::ByteBuf::from(value),
+    }));
+    Ok(bs)
 }
 
 fn to_bytes_entry(v: impl IntoIterator<Item = (i32, Datum)>) -> Result<Vec<BytesEntry>, Error> {
@@ -390,6 +428,8 @@ mod tests {
             nan_value_counts: HashMap::new(),
             lower_bounds: HashMap::from([(1,Datum::int(1)),(2,Datum::string("a")),(3,Datum::string("AC/DC"))]),
             upper_bounds: HashMap::from([(1,Datum::int(1)),(2,Datum::string("a")),(3,Datum::string("AC/DC"))]),
+            variant_lower_bounds: Default::default(),
+            variant_upper_bounds: Default::default(),
             key_metadata: None,
             split_offsets: Some(vec![4]),
             equality_ids: None,
@@ -657,11 +697,12 @@ mod tests {
     }
 
     /// SQE PATCH (v3-shredded-variant): a shredding writer's variant bound
-    /// is skipped, not an error that makes the manifest unreadable.
+    /// is kept as its bytes, not an error that makes the manifest
+    /// unreadable, and written back unchanged.
     #[test]
-    fn test_parse_bytes_entry_skips_variant_bound() {
-        use crate::spec::manifest::_serde::{BytesEntry, parse_bytes_entry};
-        use crate::spec::{NestedField, PrimitiveType, Schema, Type, VariantType};
+    fn test_variant_bound_is_kept_and_written_back() {
+        use crate::spec::VariantType;
+        use crate::spec::manifest::_serde::{BytesEntry, parse_bytes_entry_with_variant};
 
         let schema = Schema::builder()
             .with_schema_id(0)
@@ -671,22 +712,48 @@ mod tests {
             ])
             .build()
             .unwrap();
-        let result = parse_bytes_entry(
-            vec![
-                BytesEntry {
-                    key: 1,
-                    value: serde_bytes::ByteBuf::from(7_i32.to_le_bytes().to_vec()),
-                },
-                BytesEntry {
-                    key: 2,
-                    value: serde_bytes::ByteBuf::from(vec![0x01, 0x00, 0x00]),
-                },
-            ],
-            &schema,
-        )
-        .unwrap();
-
+        // Spark 4.1 + Iceberg 1.12's bound for `{"a": 5, "o": {"b": 1.5}, "s": "x"}`.
+        let bound = vec![
+            0x11, 0x03, 0x00, 0x06, 0x11, 0x17, b'$', b'[', b'\'', b'a', b'\'', b']', b'$', b'[',
+            b'\'', b'o', b'\'', b']', b'[', b'\'', b'b', b'\'', b']', b'$', b'[', b'\'', b's',
+            b'\'', b']', 0x02, 0x03, 0x00, 0x01, 0x02, 0x00, 0x02, 0x08, 0x0A, 0x0C, 0x05, 0x20,
+            0x01, 0x0F, 0x00, 0x00, 0x00, 0x05, b'x',
+        ];
+        let entries = vec![
+            BytesEntry {
+                key: 1,
+                value: serde_bytes::ByteBuf::from(7_i32.to_le_bytes().to_vec()),
+            },
+            BytesEntry {
+                key: 2,
+                value: serde_bytes::ByteBuf::from(bound.clone()),
+            },
+        ];
+        let (result, variant) = parse_bytes_entry_with_variant(entries, &schema).unwrap();
         assert_eq!(result.get(&1), Some(&Datum::int(7)));
         assert!(!result.contains_key(&2));
+        assert_eq!(variant.get(&2), Some(&bound));
+
+        let mut file = data_files().remove(0);
+        file.variant_lower_bounds = variant.clone();
+        file.variant_upper_bounds = variant;
+        let mut buffer = Vec::new();
+        write_data_files_to_avro(
+            &mut buffer,
+            vec![file.clone()].into_iter(),
+            &StructType::new(vec![]),
+            FormatVersion::V2,
+        )
+        .unwrap();
+        let read = read_data_files_from_avro(
+            &mut Cursor::new(buffer),
+            &Arc::new(schema),
+            0,
+            &StructType::new(vec![]),
+            FormatVersion::V2,
+        )
+        .unwrap();
+        assert_eq!(read[0].variant_lower_bounds(), file.variant_lower_bounds());
+        assert_eq!(read[0].variant_upper_bounds(), file.variant_upper_bounds());
     }
 }

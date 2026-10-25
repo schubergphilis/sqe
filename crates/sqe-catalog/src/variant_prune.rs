@@ -25,12 +25,14 @@ use datafusion::logical_expr::{Expr, Operator};
 use datafusion::physical_plan::metrics::Count;
 use datafusion::scalar::ScalarValue;
 use iceberg::arrow::RowGroupPruner;
+use iceberg::spec::DataFile;
 use parquet::basic::{
     ColumnOrder, ConvertedType, LogicalType, Repetition, SortOrder, Type as PhysicalType,
 };
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
 use parquet::schema::types::SchemaDescriptor;
+use parquet::variant::{Variant, VariantMetadata};
 use serde::{Deserialize, Serialize};
 
 /// The SQL type a `variant_get` call reads the field as, for the types
@@ -238,6 +240,43 @@ impl VariantPrune {
             None => false,
         }
     }
+
+    /// True when the data file's manifest bounds for the field exclude the
+    /// filter. The spec makes a variant field's bounds cover every non-null
+    /// value of the field in the file, and forbids them over mixed types, so
+    /// no residual check is needed here; a missing bound keeps the file.
+    pub fn excludes_file(&self, file: &DataFile) -> bool {
+        let Some(id) = self.field_id else {
+            return false;
+        };
+        let (Some(lower), Some(upper)) = (
+            file.variant_lower_bounds().get(&id),
+            file.variant_upper_bounds().get(&id),
+        ) else {
+            return false;
+        };
+        let key = normalized_path(&self.path);
+        match (
+            manifest_bound(lower, &key, self.target),
+            manifest_bound(upper, &key, self.target),
+        ) {
+            (Some(min), Some(max)) => self.cmp.excludes(&min, &max, &self.value),
+            _ => false,
+        }
+    }
+}
+
+/// The data files, by path, whose manifest bounds exclude any of `prunes`.
+/// The prunes need their field ids (`with_field_id`).
+pub fn files_excluded_by<'a>(
+    files: impl IntoIterator<Item = &'a DataFile>,
+    prunes: &[VariantPrune],
+) -> std::collections::HashSet<String> {
+    files
+        .into_iter()
+        .filter(|file| prunes.iter().any(|p| p.excludes_file(file)))
+        .map(|file| file.file_path().to_string())
+        .collect()
 }
 
 /// The Parquet leaves one shredded field path reads.
@@ -424,6 +463,49 @@ fn bound_of(literal: &ScalarValue, target: Target) -> Option<Bound> {
             Target::Utf8,
             ScalarValue::Utf8(v) | ScalarValue::LargeUtf8(v) | ScalarValue::Utf8View(v),
         ) => v.as_ref().map(|s| Bound::Bytes(s.as_bytes().to_vec())),
+        _ => None,
+    }
+}
+
+/// `["a", "b"]` as the manifest's normalized JSON path key `$['a']['b']`.
+/// `parse_path` refuses quotes, so no step needs escaping.
+fn normalized_path(path: &[String]) -> String {
+    path.iter()
+        .fold(String::from("$"), |key, step| format!("{key}['{step}']"))
+}
+
+/// The bound at `key` in a manifest variant bound (variant metadata followed
+/// by an object keyed by path), when its type reads as the target without
+/// conversion: any integer width for an integer target, a string, a date, a
+/// boolean. Anything else (a decimal, a float, another type) gives `None`.
+fn manifest_bound(bytes: &[u8], key: &str, target: Target) -> Option<Bound> {
+    let metadata = VariantMetadata::try_new(bytes).ok()?;
+    let value = bytes.get(metadata.size()..)?;
+    let bounds = Variant::try_new_with_metadata(metadata, value).ok()?;
+    let int = match bounds.get_object_field(key)? {
+        Variant::Int8(v) => i64::from(v),
+        Variant::Int16(v) => i64::from(v),
+        Variant::Int32(v) => i64::from(v),
+        Variant::Int64(v) => v,
+        Variant::String(s) if target == Target::Utf8 => {
+            return Some(Bound::Bytes(s.as_bytes().to_vec()))
+        }
+        Variant::ShortString(s) if target == Target::Utf8 => {
+            return Some(Bound::Bytes(s.as_str().as_bytes().to_vec()))
+        }
+        Variant::Date(d) if target == Target::Date32 => {
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?;
+            return Some(Bound::Int((d - epoch).num_days()));
+        }
+        Variant::BooleanTrue if target == Target::Boolean => return Some(Bound::Bool(true)),
+        Variant::BooleanFalse if target == Target::Boolean => return Some(Bound::Bool(false)),
+        _ => return None,
+    };
+    match target {
+        Target::Int64 => Some(Bound::Int(int)),
+        // Reading a value out of `int` range errors (or is NULL); only prune
+        // when the bound fits.
+        Target::Int32 => i32::try_from(int).is_ok().then_some(Bound::Int(int)),
         _ => None,
     }
 }
@@ -876,5 +958,145 @@ mod tests {
                 .metadata(),
         );
         assert_eq!(kept(&meta, a_bigint(Operator::Gt, 100)), vec![0]);
+    }
+
+    /// The bound Spark 4.1 / Iceberg 1.12 wrote for `{"a":5,"s":"x","o":{"b":1.5}}`:
+    /// `$['a']` int8 5, `$['o']['b']` decimal4 1.5, `$['s']` short string "x".
+    const SPARK_BOUND: &str = "110300061117245B2761275D245B276F275D5B2762275D245B2773275D02030001020002080A0C0520010F0000000578";
+
+    fn spark_file(field_id: i32) -> DataFile {
+        let bound: Vec<u8> = (0..SPARK_BOUND.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&SPARK_BOUND[i..i + 2], 16).expect("hex"))
+            .collect();
+        file_with_bounds(field_id, bound.clone(), bound)
+    }
+
+    fn file_with_bounds(field_id: i32, lower: Vec<u8>, upper: Vec<u8>) -> DataFile {
+        use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+        use std::collections::HashMap;
+
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_format(DataFileFormat::Parquet)
+            .file_path("f.parquet".into())
+            .file_size_in_bytes(1)
+            .record_count(1)
+            .partition_spec_id(0)
+            .partition(Struct::empty())
+            .variant_lower_bounds(HashMap::from([(field_id, lower)]))
+            .variant_upper_bounds(HashMap::from([(field_id, upper)]))
+            .build()
+            .expect("data file")
+    }
+
+    fn file_prune(filter: Expr) -> VariantPrune {
+        let mut p = VariantPrune::from_expr(&filter, &schema()).expect("prune");
+        p.field_id = Some(2);
+        p
+    }
+
+    #[test]
+    fn manifest_bounds_exclude_a_file() {
+        let file = spark_file(2);
+        let a_int = |op, v| cmp(get("variant_get", "v", "$.a", "int"), op, int(v));
+        assert!(file_prune(a_bigint(Operator::GtEq, 9)).excludes_file(&file));
+        assert!(file_prune(a_int(Operator::Lt, 5)).excludes_file(&file));
+        assert!(!file_prune(a_int(Operator::Eq, 5)).excludes_file(&file));
+        assert!(!file_prune(a_bigint(Operator::LtEq, 5)).excludes_file(&file));
+
+        let s = |v| {
+            cmp(
+                get("variant_get", "v", "$.s", "varchar"),
+                Operator::Eq,
+                text(v),
+            )
+        };
+        assert!(file_prune(s("y")).excludes_file(&file));
+        assert!(!file_prune(s("x")).excludes_file(&file));
+
+        let excluded = files_excluded_by([&file], &[file_prune(a_bigint(Operator::Gt, 5))]);
+        assert_eq!(excluded.into_iter().collect::<Vec<_>>(), vec!["f.parquet"]);
+    }
+
+    #[test]
+    fn manifest_bounds_keep_a_file_they_cannot_judge() {
+        let file = spark_file(2);
+        // A decimal bound is not read as an integer.
+        let ob = cmp(
+            get("variant_get", "v", "$.o.b", "bigint"),
+            Operator::Gt,
+            int(100),
+        );
+        assert!(!file_prune(ob).excludes_file(&file));
+        // A path with no bound.
+        let z = cmp(
+            get("variant_get", "v", "$.z", "bigint"),
+            Operator::Gt,
+            int(100),
+        );
+        assert!(!file_prune(z).excludes_file(&file));
+        // An int bound is not read as a string.
+        let a = cmp(
+            get("variant_get", "v", "$.a", "varchar"),
+            Operator::Eq,
+            text("z"),
+        );
+        assert!(!file_prune(a).excludes_file(&file));
+        // Another field's bounds, or no field id.
+        assert!(!file_prune(a_bigint(Operator::Gt, 100)).excludes_file(&spark_file(3)));
+        let mut no_id = file_prune(a_bigint(Operator::Gt, 100));
+        no_id.field_id = None;
+        assert!(!no_id.excludes_file(&file));
+    }
+
+    #[test]
+    fn manifest_bounds_read_dates_and_booleans() {
+        use parquet::variant::VariantBuilder;
+        let bound = |day: u32, flag: bool| {
+            let mut builder = VariantBuilder::new();
+            let mut object = builder.new_object();
+            object.insert("$['b']", flag);
+            object.insert(
+                "$['d']",
+                chrono::NaiveDate::from_ymd_opt(2026, 10, day).expect("date"),
+            );
+            object.finish();
+            let (metadata, value) = builder.finish();
+            [metadata, value].concat()
+        };
+        // Dates 2026-10-01..2026-10-05; `b` is false in both bounds.
+        let file = file_with_bounds(2, bound(1, false), bound(5, false));
+        let date = |op, d: &str| {
+            let literal = Expr::Literal(
+                ScalarValue::Date32(Some(
+                    (chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").expect("date")
+                        - chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch"))
+                    .num_days() as i32,
+                )),
+                None,
+            );
+            cmp(get("variant_get", "v", "$.d", "date"), op, literal)
+        };
+        assert!(file_prune(date(Operator::Gt, "2026-10-05")).excludes_file(&file));
+        assert!(!file_prune(date(Operator::Eq, "2026-10-03")).excludes_file(&file));
+        let flag = |v: bool| {
+            cmp(
+                get("variant_get", "v", "$.b", "boolean"),
+                Operator::Eq,
+                Expr::Literal(ScalarValue::Boolean(Some(v)), None),
+            )
+        };
+        assert!(file_prune(flag(true)).excludes_file(&file));
+        assert!(!file_prune(flag(false)).excludes_file(&file));
+    }
+
+    #[test]
+    fn normalizes_a_path_like_the_manifest() {
+        assert_eq!(normalized_path(&[]), "$");
+        assert_eq!(
+            normalized_path(&["o".to_string(), "b".to_string()]),
+            "$['o']['b']"
+        );
     }
 }
