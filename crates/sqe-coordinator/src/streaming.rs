@@ -202,6 +202,8 @@ impl StreamFinalizer {
         self.query_span
             .record("sqe.scan.files_pruned_dynamic", scan.files_pruned_dynamic);
         self.query_span
+            .record("sqe.scan.files_pruned_variant", scan.files_pruned_variant);
+        self.query_span
             .record("sqe.scan.bytes_read", scan.bytes_read);
         self.query_span
             .record("sqe.scan.rows_decoded", scan.rows_decoded);
@@ -234,6 +236,10 @@ impl StreamFinalizer {
             .scan_files_total
             .with_label_values(&["pruned_dynamic"])
             .inc_by(scan.files_pruned_dynamic);
+        metrics
+            .scan_files_total
+            .with_label_values(&["pruned_variant"])
+            .inc_by(scan.files_pruned_variant);
         metrics
             .scan_bytes_total
             .with_label_values(&["planned"])

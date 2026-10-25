@@ -258,6 +258,8 @@ mod tests {
                 nan_value_counts: HashMap::new(),
                 lower_bounds: HashMap::new(),
                 upper_bounds: HashMap::new(),
+                variant_lower_bounds: Default::default(),
+                variant_upper_bounds: Default::default(),
                 key_metadata: None,
                 split_offsets: None,
                 equality_ids: None,

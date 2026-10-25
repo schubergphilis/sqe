@@ -63,6 +63,8 @@ pub(crate) struct IcebergScanMetrics {
     pub files_read: u64,
     pub files_pruned_minmax: u64,
     pub files_pruned_dynamic: u64,
+    /// Files whose variant manifest bounds excluded a filter (#870).
+    pub files_pruned_variant: u64,
     pub bytes_planned: u64,
     pub bytes_read: u64,
     pub rows_prefilter: u64,
@@ -3839,6 +3841,7 @@ impl QueryHandler {
             sqe.scan.files_read = tracing::field::Empty,
             sqe.scan.files_pruned_minmax = tracing::field::Empty,
             sqe.scan.files_pruned_dynamic = tracing::field::Empty,
+            sqe.scan.files_pruned_variant = tracing::field::Empty,
             sqe.scan.bytes_read = tracing::field::Empty,
             sqe.scan.rows_decoded = tracing::field::Empty,
             error.message = tracing::field::Empty,
@@ -9071,13 +9074,19 @@ pub(crate) fn extract_iceberg_scan_metrics(plan: &Arc<dyn ExecutionPlan>) -> Ice
             };
             let planned = named("data_files_planned");
             let pruned_dynamic = named("files_pruned_dynamic");
+            // Dropped from the plan like a min/max-pruned file, counted apart.
+            let pruned_variant = named("files_pruned_variant");
             result.files_total = result.files_total.saturating_add(table_files);
             result.files_planned = result.files_planned.saturating_add(planned);
-            result.files_pruned_minmax = result
-                .files_pruned_minmax
-                .saturating_add(table_files.saturating_sub(planned));
+            result.files_pruned_minmax = result.files_pruned_minmax.saturating_add(
+                table_files
+                    .saturating_sub(planned)
+                    .saturating_sub(pruned_variant),
+            );
             result.files_pruned_dynamic =
                 result.files_pruned_dynamic.saturating_add(pruned_dynamic);
+            result.files_pruned_variant =
+                result.files_pruned_variant.saturating_add(pruned_variant);
             result.files_read = result
                 .files_read
                 .saturating_add(planned.saturating_sub(pruned_dynamic));

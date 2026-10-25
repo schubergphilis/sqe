@@ -214,6 +214,9 @@ struct StaticScanPlan {
     /// Share of the planned files' bytes held by the projected columns (see
     /// [`projected_byte_share`]); scales the vendored reader's admissions.
     projected_share: f64,
+    /// Files dropped because their manifest variant bounds exclude a
+    /// shredded variant comparison (sqe#870).
+    variant_files_pruned: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -644,6 +647,9 @@ impl IcebergScanExec {
     #[must_use = "with_variant_prunes consumes self; bind the returned scan"]
     pub fn with_variant_prunes(mut self, prunes: Vec<crate::variant_prune::VariantPrune>) -> Self {
         self.variant_prunes = Arc::from(prunes);
+        // The prunes also drop files from the static plan.
+        self.static_plan = Arc::new(tokio::sync::OnceCell::new());
+        self.split_assignments = Arc::new(tokio::sync::OnceCell::new());
         self
     }
 
@@ -860,12 +866,7 @@ impl IcebergScanExec {
         if self.variant_prunes.is_empty() {
             return Ok(None);
         }
-        let iceberg_schema = snapshot_schema(&self.table, self.snapshot_id);
-        let prunes: Vec<_> = self
-            .variant_prunes
-            .iter()
-            .map(|p| p.clone().with_field_id(&iceberg_schema))
-            .collect();
+        let prunes = resolve_variant_prunes(&self.variant_prunes, &self.table, self.snapshot_id);
         crate::variant_prune::encode_prunes(&prunes)
             .map_err(|e| DataFusionError::External(Box::new(e)))
     }
@@ -984,6 +985,26 @@ impl IcebergScanExec {
             .try_collect()
             .await?;
         let mut pruned_count = 0usize;
+        if !self.variant_prunes.is_empty() {
+            let prunes =
+                resolve_variant_prunes(&self.variant_prunes, &self.table, self.snapshot_id);
+            let paths = result.iter().map(|(p, _)| p.clone()).collect();
+            if let Ok(files) = collect_data_files_for_pruning(
+                &self.table,
+                self.snapshot_id,
+                &paths,
+                DEFAULT_MANIFEST_CONCURRENCY,
+            )
+            .await
+            {
+                let excluded = crate::variant_prune::files_excluded_by(
+                    files.iter().map(|f| f.as_ref()),
+                    &prunes,
+                );
+                pruned_count += excluded.len();
+                result.retain(|(path, _)| !excluded.contains(path));
+            }
+        }
         if !self.df_filters.is_empty() {
             if let Ok(data_files) = self.collect_data_files().await {
                 let planned: std::collections::HashSet<String> =
@@ -1000,10 +1021,10 @@ impl IcebergScanExec {
                         &self.projected_schema,
                         &ischema,
                     );
-                    pruned_count = pc;
-                    if pruned_count > 0 {
+                    pruned_count += pc;
+                    if pc > 0 {
                         debug!(
-                            pruned = pruned_count,
+                            pruned = pc,
                             remaining = kept.len(),
                             "File-level min/max pruning"
                         );
@@ -1471,6 +1492,7 @@ impl ExecutionPlan for IcebergScanExec {
         }
         let total_partitions = self.target_partitions;
         let static_plan_cache = self.static_plan.clone();
+        let variant_prunes = self.variant_prunes.clone();
         let split_assignments = self.split_assignments.clone();
         let table = self.table.clone();
         let schema = self.projected_schema.clone();
@@ -1550,15 +1572,12 @@ impl ExecutionPlan for IcebergScanExec {
             MetricBuilder::new(&self.metrics).counter("row_groups_pruned_bloom", partition);
         let row_groups_pruned_variant =
             MetricBuilder::new(&self.metrics).counter("row_groups_pruned_variant", partition);
+        let files_pruned_variant =
+            MetricBuilder::new(&self.metrics).counter("files_pruned_variant", partition);
         // Shredded variant comparisons (sqe#870), checked on both read paths.
         let variant_pruner: Option<Arc<crate::variant_prune::VariantRowGroupPruner>> =
             (!self.variant_prunes.is_empty()).then(|| {
-                let iceberg_schema = snapshot_schema(&table, snapshot_id);
-                let prunes: Vec<_> = self
-                    .variant_prunes
-                    .iter()
-                    .map(|p| p.clone().with_field_id(&iceberg_schema))
-                    .collect();
+                let prunes = resolve_variant_prunes(&self.variant_prunes, &table, snapshot_id);
                 Arc::new(crate::variant_prune::VariantRowGroupPruner::new(
                     Arc::from(prunes),
                     row_groups_pruned_variant.clone(),
@@ -1611,8 +1630,13 @@ impl ExecutionPlan for IcebergScanExec {
             let static_plan = {
                 let _t = planning_time.timer();
                 shared_static_scan_plan(&static_plan_cache, &table, snapshot_id,
-                    projection.as_deref(), predicates.as_ref(), Some(&static_planning_runs)).await?
+                    projection.as_deref(), predicates.as_ref(), &variant_prunes,
+                    Some(&static_planning_runs)).await?
             };
+            // The plan is shared by every partition; count it once.
+            if partition == 0 {
+                files_pruned_variant.add(static_plan.variant_files_pruned);
+            }
             decode_gate.set_projected_share(static_plan.projected_share);
             // Borrow the sorted table-wide list. Whole-file readers allocate
             // only their assigned slice; split readers never copy this list.
@@ -2922,6 +2946,7 @@ async fn shared_static_scan_plan(
     snapshot_id: Option<i64>,
     projection: Option<&[String]>,
     predicates: Option<&Predicate>,
+    variant_prunes: &[crate::variant_prune::VariantPrune],
     planning_runs: Option<&datafusion::physical_plan::metrics::Count>,
 ) -> DFResult<Arc<StaticScanPlan>> {
     cache
@@ -2929,7 +2954,7 @@ async fn shared_static_scan_plan(
             if let Some(runs) = planning_runs {
                 runs.add(1);
             }
-            plan_static_scan(table, snapshot_id, projection, predicates)
+            plan_static_scan(table, snapshot_id, projection, predicates, variant_prunes)
                 .await
                 .map(Arc::new)
         })
@@ -2937,11 +2962,26 @@ async fn shared_static_scan_plan(
         .cloned()
 }
 
+/// The scan's variant prunes with their columns' field ids in the scanned
+/// snapshot's schema.
+fn resolve_variant_prunes(
+    prunes: &[crate::variant_prune::VariantPrune],
+    table: &Table,
+    snapshot_id: Option<i64>,
+) -> Vec<crate::variant_prune::VariantPrune> {
+    let schema = snapshot_schema(table, snapshot_id);
+    prunes
+        .iter()
+        .map(|p| p.clone().with_field_id(&schema))
+        .collect()
+}
+
 async fn plan_static_scan(
     table: &Table,
     snapshot_id: Option<i64>,
     projection: Option<&[String]>,
     predicates: Option<&Predicate>,
+    variant_prunes: &[crate::variant_prune::VariantPrune],
 ) -> DFResult<StaticScanPlan> {
     let mut sb = table.scan().with_task_split_target_size(None);
     if let Some(sid) = snapshot_id {
@@ -2964,6 +3004,26 @@ async fn plan_static_scan(
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     tasks.sort_by(|a, b| a.data_file_path().cmp(b.data_file_path()));
+    // Files whose manifest variant bounds exclude a shredded variant
+    // comparison (sqe#870). Only files a writer gave variant bounds to
+    // (Spark/Iceberg 1.12) can go; on a manifest read failure all stay.
+    let mut variant_files_pruned = 0;
+    if !variant_prunes.is_empty() && !tasks.is_empty() {
+        let prunes = resolve_variant_prunes(variant_prunes, table, snapshot_id);
+        let paths = tasks
+            .iter()
+            .map(|t| t.data_file_path().to_string())
+            .collect();
+        if let Ok(files) =
+            collect_data_files_for_pruning(table, snapshot_id, &paths, DEFAULT_MANIFEST_CONCURRENCY)
+                .await
+        {
+            let excluded =
+                crate::variant_prune::files_excluded_by(files.iter().map(|f| f.as_ref()), &prunes);
+            variant_files_pruned = excluded.len();
+            tasks.retain(|t| !excluded.contains(t.data_file_path()));
+        }
+    }
     let mut file_entries: Vec<_> = tasks
         .iter()
         .map(|t| (t.data_file_path().to_string(), t.file_size_in_bytes()))
@@ -2979,6 +3039,7 @@ async fn plan_static_scan(
         file_entries,
         has_deletes,
         projected_share,
+        variant_files_pruned,
     })
 }
 
@@ -4625,8 +4686,9 @@ mod manifest_statistics_tests {
         let table = fake_iceberg_table(dir.path(), false).await;
         let scan = IcebergScanExec::new(table.clone(), Arc::new(arrow_schema(&table)), None, None)
             .with_target_partitions(8);
-        let requests = (0..8)
-            .map(|_| shared_static_scan_plan(&scan.static_plan, &table, None, None, None, None));
+        let requests = (0..8).map(|_| {
+            shared_static_scan_plan(&scan.static_plan, &table, None, None, None, &[], None)
+        });
         let plans = futures::future::join_all(requests).await;
         let first = plans[0].as_ref().unwrap();
         for plan in &plans {
@@ -4676,6 +4738,7 @@ mod manifest_statistics_tests {
             Some(FAKE_SNAPSHOT_ID),
             Some(&projection),
             Some(&predicate),
+            &[],
         )
         .await
         .unwrap();
@@ -4688,7 +4751,9 @@ mod manifest_statistics_tests {
 
         let delete_dir = tempfile::tempdir().unwrap();
         let deletes = fake_iceberg_table(delete_dir.path(), true).await;
-        let delete_plan = plan_static_scan(&deletes, None, None, None).await.unwrap();
+        let delete_plan = plan_static_scan(&deletes, None, None, None, &[])
+            .await
+            .unwrap();
         assert!(delete_plan.has_deletes);
         assert!(delete_plan.tasks.iter().any(|t| !t.deletes().is_empty()));
     }
@@ -4701,12 +4766,12 @@ mod manifest_statistics_tests {
         let cache = tokio::sync::OnceCell::new();
         let invalid = vec!["missing_column".to_string()];
         assert!(
-            shared_static_scan_plan(&cache, &table, None, Some(&invalid), None, None)
+            shared_static_scan_plan(&cache, &table, None, Some(&invalid), None, &[], None)
                 .await
                 .is_err()
         );
         assert!(cache.get().is_none());
-        let valid = shared_static_scan_plan(&cache, &table, None, None, None, None)
+        let valid = shared_static_scan_plan(&cache, &table, None, None, None, &[], None)
             .await
             .unwrap();
         assert_eq!(valid.tasks.len(), FAKE_FILES.len());
@@ -4800,14 +4865,20 @@ mod manifest_statistics_tests {
         }));
         assert!(futures::poll!(initializer.as_mut()).is_pending());
         let mut waiter = Box::pin(shared_static_scan_plan(
-            &cache, &table, None, None, None, None,
+            &cache,
+            &table,
+            None,
+            None,
+            None,
+            &[],
+            None,
         ));
         assert!(futures::poll!(waiter.as_mut()).is_pending());
         drop(waiter);
         drop(initializer);
         let plan = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            shared_static_scan_plan(&cache, &table, None, None, None, None),
+            shared_static_scan_plan(&cache, &table, None, None, None, &[], None),
         )
         .await
         .unwrap()

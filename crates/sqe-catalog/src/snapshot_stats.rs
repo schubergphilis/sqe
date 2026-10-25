@@ -266,6 +266,12 @@ fn snapshot_metadata_bytes(files: &SnapshotFiles) -> usize {
                     bytes = bytes.saturating_add(heap(datum.literal()));
                 }
             }
+            for bounds in [file.variant_lower_bounds(), file.variant_upper_bounds()] {
+                bytes = bytes.saturating_add(map_bytes(bounds));
+                for bound in bounds.values() {
+                    bytes = bytes.saturating_add(bound.capacity());
+                }
+            }
             bytes = bytes.saturating_add(std::mem::size_of_val(file.partition().fields()));
             for value in file.partition().iter().flatten() {
                 bytes = bytes.saturating_add(match value {

@@ -205,6 +205,103 @@ async fn sqe_reads_a_spark_shredded_variant_table() {
     );
 }
 
+/// Spark 4.1 / Iceberg 1.12 writes variant bounds into the manifest: per
+/// shredded path, the min and max over the file, and none for a path whose
+/// values mix types. SQE skips the files those bounds exclude (#870), and
+/// keeps a file without bounds.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn sqe_prunes_spark_files_on_variant_bounds() {
+    if let Some(reason) = spark_stack_skip_reason() {
+        eprintln!("skipping sqe_prunes_spark_files_on_variant_bounds: {reason}");
+        return;
+    }
+    let fq = "default.variant_bounds_from_spark";
+    // `COALESCE(1)`: one data file per INSERT, so three files.
+    let insert = |rows: &str| {
+        format!(
+            "INSERT INTO rest.{fq} SELECT /*+ COALESCE(1) */ id, parse_json(j) \
+             FROM VALUES {rows} AS t(id, j);"
+        )
+    };
+    spark_sql(&format!(
+        r#"DROP TABLE IF EXISTS rest.{fq};
+           CREATE TABLE rest.{fq} (id INT, v VARIANT) USING iceberg
+             TBLPROPERTIES ('format-version' = '3',
+                            'write.parquet.shred-variants' = 'true');
+           {}
+           {}
+           {}"#,
+        insert(r#"(1, '{"a": 1, "s": "a"}'), (2, '{"a": 3, "s": "b"}')"#),
+        insert(r#"(3, '{"a": 10, "s": "c"}'), (4, '{"a": 12, "s": "d"}')"#),
+        // `$.a` mixes types: Spark writes no bound for it.
+        insert(r#"(5, '{"a": 7}'), (6, '{"a": "seven"}')"#),
+    ))
+    .expect("spark writes the variant table");
+
+    let (session, handler) = crate::common::setup_handler().await;
+    let mut got = Vec::new();
+    for filter in [
+        "try_variant_get(v, '$.a', 'bigint') >= 9",
+        // `+ 0` is not a shape the scan prunes on: the full-scan baseline.
+        "try_variant_get(v, '$.a', 'bigint') + 0 >= 9",
+        "variant_get(v, '$.s', 'string') = 'd'",
+        "try_variant_get(v, '$.a', 'int') < 2",
+    ] {
+        let sql = format!("SELECT count(*), min(id) FROM {fq} WHERE {filter}");
+        let rows = sqe_rows(&handler, &session, &sql).await.join(",");
+        let (scanned, total) = scan_files(&handler, &session, &sql).await;
+        got.push(format!("{rows} files {scanned}/{total}"));
+    }
+    let _ = spark_sql(&format!("DROP TABLE IF EXISTS rest.{fq}"));
+    assert_eq!(
+        got,
+        vec![
+            // The first file's bounds [1, 3] exclude it; the mixed file stays.
+            "2|3 files 2/3",
+            "2|3 files 3/3",
+            // The third file has no `$.s` at all, so no bound: it stays.
+            "1|4 files 2/3",
+            "1|1 files 2/3",
+        ]
+    );
+}
+
+/// `files_scanned` and `files_total` of the single Iceberg scan in
+/// `EXPLAIN FULL sql`.
+async fn scan_files(
+    handler: &sqe_coordinator::QueryHandler,
+    session: &sqe_core::Session,
+    sql: &str,
+) -> (i32, i32) {
+    use arrow::array::AsArray;
+    let explain = format!("EXPLAIN FULL {sql}");
+    let batches = handler
+        .execute(session, &explain, None)
+        .await
+        .expect(&explain);
+    let mut out = None;
+    for batch in &batches {
+        let ops = batch
+            .column_by_name("operation")
+            .expect("operation")
+            .as_string::<i32>();
+        let scanned = batch
+            .column_by_name("files_scanned")
+            .expect("files_scanned");
+        let scanned = scanned.as_primitive::<arrow::datatypes::Int32Type>();
+        let total = batch.column_by_name("files_total").expect("files_total");
+        let total = total.as_primitive::<arrow::datatypes::Int32Type>();
+        for r in 0..batch.num_rows() {
+            if ops.value(r) == "IcebergScanExec" {
+                assert!(out.is_none(), "one scan in {sql}");
+                out = Some((scanned.value(r), total.value(r)));
+            }
+        }
+    }
+    out.unwrap_or_else(|| panic!("no IcebergScanExec in {explain}"))
+}
+
 /// SQE writes shredded variants when the table sets
 /// `write.parquet.shred-variants` (#858). Each data file infers its own
 /// shredding from its first batch, so the second INSERT shreds `a` as a
