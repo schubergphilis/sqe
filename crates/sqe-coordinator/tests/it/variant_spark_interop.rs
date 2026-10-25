@@ -398,6 +398,79 @@ async fn spark_reads_an_sqe_shredded_variant_table() {
     assert_eq!(after, want, "rows after rewrite_data_files");
 }
 
+/// A variant in a struct, a list or a map shreds too (#870): SQE writes a
+/// `typed_value` group under each nested variant, and both SQE and Spark 4.1
+/// read every value back. Spark itself shreds only top-level variants, so
+/// the nested shredded files here are SQE's.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn spark_reads_an_sqe_nested_shredded_variant_table() {
+    if let Some(reason) = spark_stack_skip_reason() {
+        eprintln!("skipping spark_reads_an_sqe_nested_shredded_variant_table: {reason}");
+        return;
+    }
+    let (session, handler) = crate::common::setup_handler().await;
+    let fq = "default.variant_nested_shredded_to_spark";
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+    for sql in [
+        format!(
+            "CREATE TABLE {fq} (id INT, s STRUCT<v JSON>, l ARRAY<JSON>, m MAP<VARCHAR, JSON>) \
+             WITH ('write.parquet.shred-variants' = 'true')"
+        ),
+        format!(
+            r#"INSERT INTO {fq} VALUES
+                 (1, named_struct('v', '{{"a": 1, "s": "x"}}'), make_array('{{"a": 1}}', '{{"a": 2}}'), map(['k'], ['{{"a": 1}}'])),
+                 (2, named_struct('v', '{{"a": 2, "s": "y"}}'), make_array('{{"a": 3}}'), map(['k'], ['{{"a": 4}}'])),
+                 (3, NULL, NULL, NULL)"#
+        ),
+    ] {
+        handler.execute(&session, &sql, None).await.expect(&sql);
+    }
+
+    let files = sqe_rows(
+        &handler,
+        &session,
+        "SELECT file_path FROM table_files('default', 'variant_nested_shredded_to_spark')",
+    )
+    .await;
+    let mut schemas = Vec::new();
+    for path in &files {
+        schemas.push(parquet_schema(path).await);
+    }
+
+    let want = vec![
+        r#"1|{"a":1,"s":"x"}|{"a":1}|{"a":1}|1"#.to_string(),
+        r#"2|{"a":2,"s":"y"}|{"a":3}|{"a":4}|2"#.to_string(),
+        "3|NULL|NULL|NULL|NULL".to_string(),
+    ];
+    let spark = spark_rows(&format!(
+        "SELECT id, to_json(s.v), to_json(l[0]), to_json(m['k']), \
+                variant_get(s.v, '$.a', 'int') \
+         FROM rest.{fq} ORDER BY id"
+    ));
+    let sqe = sqe_rows(
+        &handler,
+        &session,
+        &format!(
+            "SELECT id, s['v'], l[1], map_extract(m, 'k')[1], json_get_int(s['v'], 'a') \
+             FROM {fq} ORDER BY id"
+        ),
+    )
+    .await;
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+
+    assert_eq!(files.len(), 1, "one data file: {files:?}");
+    // One `typed_value` group per nested variant: in `s`, `l` and `m`.
+    let typed = schemas[0].matches("typed_value").count();
+    assert!(typed >= 3, "nested variants not shredded:\n{}", schemas[0]);
+    assert_eq!(sqe, want, "SQE's rows of its nested shredded table");
+    assert_eq!(spark, want, "Spark's rows of the nested shredded SQE table");
+}
+
 /// The Parquet schema of the data file at `path`, as debug text.
 async fn parquet_schema(path: &str) -> String {
     let (bucket, key) = split_s3(path);

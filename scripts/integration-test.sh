@@ -72,8 +72,10 @@ if [ "$#" -eq 0 ] && [ "$DISTRIBUTED" != "1" ]; then
     # compaction_distributed_benchmark measures a distributed-vs-local ratio.
     SKIP_ARGS+=(--skip rewrite_data_files_distributed_parity)
     SKIP_ARGS+=(--skip compaction_distributed_benchmark)
-    # One worker on :50052 (see that file's header).
-    SKIP_ARGS+=(--skip variant_distributed)
+    # One worker on :50052 (see variant_distributed.rs's header). The other
+    # tests in that file run an in-process worker and stay in.
+    SKIP_ARGS+=(--skip json_variant_column_scans_on_a_worker)
+    SKIP_ARGS+=(--skip shredded_variant_column_scans_on_a_worker)
     # A timing study, not a correctness test: it prints a before/after ratio.
     SKIP_ARGS+=(--skip compaction_sort_benchmark)
 fi
