@@ -294,6 +294,7 @@ pub async fn write_data_files_streaming(
     // schema is the table schema plus the two reserved lineage fields. Inserts
     // carry neither and write the table schema unchanged.
     reject_geospatial_write(table.metadata().current_schema())?;
+    reject_unknown_transform_write(table.metadata().default_partition_spec())?;
 
     let lineage = carries_row_lineage(table, &stream.schema());
     let write_schema = if lineage {
@@ -537,6 +538,30 @@ pub fn reject_geospatial_write(schema: &IcebergSchema) -> sqe_core::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Refuse to write data files under a partition spec with a transform SQE
+/// does not know, such as a multi-argument one (sqe#864). The spec lets
+/// readers ignore such a field but forbids writers to commit under it; the
+/// vendored commit refuses too, this only fails before any file is uploaded.
+pub fn reject_unknown_transform_write(spec: &iceberg::spec::PartitionSpec) -> sqe_core::Result<()> {
+    let Some(field) = spec
+        .fields()
+        .iter()
+        .find(|f| spec.unknown_transform(f.field_id).is_some())
+    else {
+        return Ok(());
+    };
+    let transform = spec
+        .unknown_transform(field.field_id)
+        .map_or("unknown", |u| u.transform.as_str());
+    Err(SqeError::with_code(
+        SqeErrorCode::NotSupported,
+        format!(
+            "partition field '{}' uses transform '{transform}': SQE reads this table but cannot write it",
+            field.name
+        ),
+    ))
 }
 
 /// Whether a write into `table` must persist V3 row lineage: the table is V3
@@ -1210,6 +1235,29 @@ mod tests {
             let err = reject_geospatial_write(&schema).unwrap_err();
             assert_eq!(err.error_code(), SqeErrorCode::NotSupported);
             assert!(err.to_string().contains("'shape'"), "{err}");
+        }
+    }
+
+    #[test]
+    fn unknown_transforms_refuse_writes() {
+        let spec_json = |transform: &str, sources: &str| {
+            format!(
+                r#"{{"spec-id":0,"fields":[{{{sources},"field-id":1000,"name":"p","transform":"{transform}"}}]}}"#
+            )
+        };
+        let known: iceberg::spec::PartitionSpec =
+            serde_json::from_str(&spec_json("bucket[4]", r#""source-id":1"#)).unwrap();
+        assert!(reject_unknown_transform_write(&known).is_ok());
+
+        for (transform, sources) in [
+            ("zorder", r#""source-ids":[1,2]"#),
+            ("hilbert", r#""source-id":1"#),
+        ] {
+            let spec: iceberg::spec::PartitionSpec =
+                serde_json::from_str(&spec_json(transform, sources)).unwrap();
+            let err = reject_unknown_transform_write(&spec).unwrap_err();
+            assert_eq!(err.error_code(), SqeErrorCode::NotSupported);
+            assert!(err.to_string().contains(&format!("'{transform}'")), "{err}");
         }
     }
 

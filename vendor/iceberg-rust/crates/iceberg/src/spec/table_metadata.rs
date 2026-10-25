@@ -3058,9 +3058,9 @@ mod tests {
     }
 
     // SQE PATCH (sqe#864): V3 metadata naming a partition source as
-    // `source-ids` loads when there is one source and fails when there are
-    // several. The untagged `TableMetadataEnum` replaces the field's error
-    // with its generic one, as for every other malformed field.
+    // `source-ids` loads when there is one source. With several, the field is
+    // read as an unknown transform, ignored for filtering, and written back
+    // with its `source-ids`.
     #[test]
     fn test_table_metadata_v3_partition_source_ids() {
         let metadata_str =
@@ -3073,7 +3073,12 @@ mod tests {
 
         let multi = metadata_str.replace(r#""source-id": 1,"#, r#""source-ids": [1, 2],"#);
         assert_ne!(multi, metadata_str);
-        assert!(serde_json::from_str::<TableMetadata>(&multi).is_err());
+        let metadata = serde_json::from_str::<TableMetadata>(&multi).unwrap();
+        let spec = metadata.default_partition_spec();
+        assert_eq!(spec.fields()[0].transform, Transform::Unknown);
+        assert_eq!(spec.source_ids(&spec.fields()[0]), vec![1, 2]);
+        let written = serde_json::to_string(&metadata).unwrap();
+        assert!(written.contains(r#""source-ids":[1,2]"#), "{written}");
     }
 
     #[test]
@@ -3743,10 +3748,7 @@ mod tests {
             table_metadata.sort_orders,
             HashMap::from([(
                 0,
-                Arc::new(SortOrder {
-                    order_id: 0,
-                    fields: vec![]
-                })
+                Arc::new(SortOrder::new(0, vec![]))
             )])
         );
     }

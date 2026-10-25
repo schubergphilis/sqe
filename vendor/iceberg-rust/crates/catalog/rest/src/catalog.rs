@@ -4108,10 +4108,7 @@ mod tests {
             table.metadata().history()
         );
         assert_eq!(
-            vec![&Arc::new(SortOrder {
-                order_id: 0,
-                fields: vec![],
-            })],
+            vec![&Arc::new(SortOrder::new(0, vec![]))],
             table.metadata().sort_orders_iter().collect::<Vec<_>>()
         );
 
@@ -4439,10 +4436,7 @@ mod tests {
         assert!(table.metadata().current_snapshot().is_none());
         assert!(table.metadata().history().is_empty());
         assert_eq!(
-            vec![&Arc::new(SortOrder {
-                order_id: 0,
-                fields: vec![],
-            })],
+            vec![&Arc::new(SortOrder::new(0, vec![]))],
             table.metadata().sort_orders_iter().collect::<Vec<_>>()
         );
 
@@ -4643,10 +4637,7 @@ mod tests {
         assert!(table.metadata().current_snapshot().is_none());
         assert!(table.metadata().history().is_empty());
         assert_eq!(
-            vec![&Arc::new(SortOrder {
-                order_id: 0,
-                fields: vec![],
-            })],
+            vec![&Arc::new(SortOrder::new(0, vec![]))],
             table.metadata().sort_orders_iter().collect::<Vec<_>>()
         );
 
