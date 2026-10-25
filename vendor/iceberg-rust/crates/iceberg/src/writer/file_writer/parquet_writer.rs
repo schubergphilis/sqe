@@ -1020,7 +1020,7 @@ impl FileWriter for ParquetWriter {
             batch
         };
         let shredded;
-        let batch = match &self.shredder {
+        let batch = match self.shredder.as_mut() {
             Some(shredder) => {
                 shredded = shredder.shred(batch)?;
                 &shredded
@@ -1062,14 +1062,23 @@ impl FileWriter for ParquetWriter {
         } else {
             let parquet_metadata = Arc::new(metadata);
 
-            Ok(vec![Self::parquet_to_data_file_builder(
+            let mut builder = Self::parquet_to_data_file_builder(
                 self.schema,
                 parquet_metadata,
                 written_size,
                 self.output_file.location().to_string(),
                 self.nan_value_count_visitor.nan_value_counts,
                 self.key_metadata,
-            )?])
+            )?;
+            // SQE PATCH (v3-shredded-variant): the bounds of each shredded
+            // variant path, as Iceberg Java writes them.
+            if let Some(shredder) = &self.shredder {
+                let (lower, upper) = shredder.variant_bounds();
+                builder
+                    .variant_lower_bounds(lower)
+                    .variant_upper_bounds(upper);
+            }
+            Ok(vec![builder])
         }
     }
 }
