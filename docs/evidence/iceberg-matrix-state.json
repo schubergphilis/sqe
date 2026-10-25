@@ -11,11 +11,11 @@
     "docUrl": "https://docs.getsqe.com"
   },
   "generatedAt": "2026-10-23T00:00:00Z",
-  "generatedBy": "Rescore against the pinned upstream rubric; evidence paths repaired after the crate and test moves. 2026-10-18: unknown-type and shredded-variant measured against Spark 4.1 + Iceberg 1.12. 2026-10-20: merge-on-read deletes, deletion vectors and row lineage read back by Spark 4.1 + Iceberg 1.12 (mor_spark_interop); stub evidence removed. 2026-10-21: SQE writes shredded variants (write.parquet.shred-variants), read back by Spark 4.1 + Iceberg 1.12; shredded-variant:v3 to full. unknown-type:v3 to full: nested shapes measured against Iceberg Java (same refusals), promotion rules enforced. 2026-10-22: list elements and map values promote with SET DATA TYPE (#869). 2026-10-23: rubric pin moved to d14d0f1341 (features.json unchanged since 2dd75e0aa2; the new commits add Dremio and catalog-side entries). geometry-type:v3 to partial: SQE reads Spark-written GEOMETRY / GEOGRAPHY columns (#863), writes refused. 2026-10-24: shredded variant statistics prune row groups on the coordinator (#870); level unchanged. 2026-10-25: variant manifest bounds prune data files (#870); level unchanged. 2026-10-25: variants nested in structs, lists and maps are shredded on write and read back by Spark 4.1 + Iceberg 1.12 (#870). 2026-10-25: SQE writes variant manifest bounds for its shredded files (#870); level unchanged.",
+  "generatedBy": "Rescore against the pinned upstream rubric; evidence paths repaired after the crate and test moves. 2026-10-18: unknown-type and shredded-variant measured against Spark 4.1 + Iceberg 1.12. 2026-10-20: merge-on-read deletes, deletion vectors and row lineage read back by Spark 4.1 + Iceberg 1.12 (mor_spark_interop); stub evidence removed. 2026-10-21: SQE writes shredded variants (write.parquet.shred-variants), read back by Spark 4.1 + Iceberg 1.12; shredded-variant:v3 to full. unknown-type:v3 to full: nested shapes measured against Iceberg Java (same refusals), promotion rules enforced. 2026-10-22: list elements and map values promote with SET DATA TYPE (#869). 2026-10-23: rubric pin moved to d14d0f1341 (features.json unchanged since 2dd75e0aa2; the new commits add Dremio and catalog-side entries). geometry-type:v3 to partial: SQE reads Spark-written GEOMETRY / GEOGRAPHY columns (#863), writes refused. 2026-10-24: shredded variant statistics prune row groups on the coordinator (#870); level unchanged. 2026-10-25: variant manifest bounds prune data files (#870); level unchanged. 2026-10-25: variants nested in structs, lists and maps are shredded on write and read back by Spark 4.1 + Iceberg 1.12 (#870). 2026-10-25: SQE writes variant manifest bounds for its shredded files (#870); level unchanged. 2026-10-25: multi-arg-transforms:v3 to partial: multi-argument and unknown transforms read, ignored for pruning and kept on round trip; writes refused as the spec requires (#864).",
   "score": {
-    "raw": 152,
+    "raw": 154,
     "max": 162,
-    "percent": 93.8
+    "percent": 95.1
   },
   "note": "Rescored on 2026-10-17 against upstream features.json (32 features). Only cells that apply to a version are scored, as the site shows them: position-deletes is V2-only now, so 54 cells, max 162. Removed upstream and dropped here: hive-metastore, nessie, polaris, hadoop-catalog, jdbc-catalog, vector-type, cdc-support. New: deletion-vectors, unknown-type, google-lakehouse. Gains: deletion vectors and row lineage on V3, unshredded VARIANT. Downgrade: unity-catalog to partial (read-only smoke). The old 167/189 is not comparable.",
   "support": {
@@ -135,10 +135,13 @@
       "caveats": []
     },
     "sqe:multi-arg-transforms:v3": {
-      "level": "none",
-      "notes": "PARTITIONED BY accepts only single-source transforms; a multi-source transform cannot be declared. Metadata naming a field's source as a one-element source-ids list loads; a field with several source ids is refused by name. The V3 spec defines no multi-argument transform yet, so there is no such table to read.",
-      "evidence": "crates/sqe-write/src/write_handler.rs#build_partition_spec, vendor/iceberg-rust/crates/iceberg/src/spec/partition.rs::tests::test_partition_field_source_ids",
-      "caveats": []
+      "level": "partial",
+      "notes": "Reads follow the spec for unknown and multi-argument transforms: a partition or sort field with several source-ids, or a transform name SQE does not know, loads as an unknown transform, is ignored for file pruning, and keeps its original name and source-ids when the metadata is written back. Manifests of such a table decode with the partition type their writer recorded. Writes are refused, as the spec requires: no data or delete file commits under a spec with an unknown transform, and partition evolution refuses to carry such a field. PARTITIONED BY accepts only single-source transforms.",
+      "evidence": "vendor/iceberg-rust/crates/iceberg/src/scan/mod.rs::tests::test_scan_ignores_multi_argument_partition_field, vendor/iceberg-rust/crates/iceberg/src/spec/table_metadata_builder.rs::tests::test_multi_argument_transforms_survive_a_metadata_commit, vendor/iceberg-rust/crates/iceberg/src/spec/partition.rs::tests::test_partition_spec_keeps_unknown_transforms, vendor/iceberg-rust/crates/iceberg/src/transaction/append.rs::tests::test_fast_append_refuses_unknown_transform_spec, crates/sqe-compaction/src/writer.rs::tests::unknown_transforms_refuse_writes, crates/sqe-catalog/src/iceberg_metadata_tvf.rs::tests::test_multi_argument_partition_field_governed_by_any_source",
+      "caveats": [
+        "Verified on hand-built metadata and manifests; no engine writes a multi-argument transform yet, so no table from another writer has been read",
+        "Read-only: SQE cannot write to a table whose default spec has an unknown transform until that field is dropped"
+      ]
     },
     "sqe:time-travel:v2": {
       "level": "full",

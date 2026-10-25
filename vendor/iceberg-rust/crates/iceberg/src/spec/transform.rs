@@ -472,6 +472,10 @@ impl Transform {
         name: &str,
         predicate: &BoundPredicate,
     ) -> Result<Option<Predicate>> {
+        // SQE PATCH (sqe#864): see `project`.
+        if *self == Transform::Unknown {
+            return Ok(None);
+        }
         let func = create_transform_function(self)?;
 
         match self {
@@ -599,6 +603,13 @@ impl Transform {
     /// value should match `bucket(10, 37) as bs`, and we project `a = 10` to
     /// `bs = bucket(10, 37)`
     pub fn project(&self, name: &str, predicate: &BoundPredicate) -> Result<Option<Predicate>> {
+        // SQE PATCH (sqe#864): a field with an unknown transform is ignored
+        // for filtering, as the spec requires of readers. Without this, the
+        // missing transform function failed every scan with a predicate on
+        // the field's source column before the `_ => Ok(None)` arm below.
+        if *self == Transform::Unknown {
+            return Ok(None);
+        }
         let func = create_transform_function(self)?;
 
         match self {
@@ -1180,6 +1191,41 @@ impl FromStr for Transform {
         };
 
         Ok(t)
+    }
+}
+
+impl Transform {
+    // SQE PATCH (sqe#864): the spec requires v3 readers to read tables whose
+    // partition or sort fields use a transform they do not know, ignoring the
+    // field. `FromStr` refuses such names, so table metadata and manifest
+    // headers parse transforms through this instead. Only the exact spec
+    // forms are known; `bucketv2[4]` or `bucket[x]` is a future transform,
+    // not a malformed bucket.
+    pub(crate) fn parse_tolerant(s: &str) -> Transform {
+        fn bracketed(s: &str, prefix: &str) -> Option<u32> {
+            s.strip_prefix(prefix)?
+                .strip_prefix('[')?
+                .strip_suffix(']')?
+                .parse()
+                .ok()
+        }
+        match s {
+            "identity" => Transform::Identity,
+            "year" => Transform::Year,
+            "month" => Transform::Month,
+            "day" => Transform::Day,
+            "hour" => Transform::Hour,
+            "void" => Transform::Void,
+            v => {
+                if let Some(n) = bracketed(v, "bucket") {
+                    Transform::Bucket(n)
+                } else if let Some(w) = bracketed(v, "truncate") {
+                    Transform::Truncate(w)
+                } else {
+                    Transform::Unknown
+                }
+            }
+        }
     }
 }
 
