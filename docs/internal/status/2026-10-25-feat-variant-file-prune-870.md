@@ -1,0 +1,22 @@
+**STATUS 2026-10-25: variant manifest bounds prune data files (`feat/variant-file-prune-870`, part of #870).**
+
+- **Vendor (`SQE PATCH (v3-shredded-variant)`)**: `DataFile` gains `variant_lower_bounds` / `variant_upper_bounds` (`HashMap<i32, Vec<u8>>`, the raw spec bytes: variant metadata followed by an object keyed by normalized path `$['a']['b']`). `_serde.rs` used to skip a variant field's bound; `parse_bytes_entry_with_variant` now keeps it apart from the primitive `Datum` bounds, and `to_bytes_entry_with_variant` writes it back, so a manifest rewrite (compaction, delete) no longer drops Spark's bounds. Primitive-bound consumers (`pruning_stats.rs`, metadata TVFs, maintenance log) never see a variant bound. 40 test `DataFile` literals got the two fields. Vendor unit `test_variant_bound_is_kept_and_written_back` uses the exact bytes Spark 4.1 / Iceberg 1.12 wrote and round-trips them through Avro.
+- **`sqe-catalog/src/variant_prune.rs`**: `VariantPrune::excludes_file` decodes the bound with `parquet::variant` (no new dependency edge), takes the field at the normalized path, and reads it as the target only without conversion: any integer width for int/bigint (int only when the bound fits i32), string, date, boolean. A decimal, float or other type keeps the file. The spec forbids bounds over mixed types, so no residual check is needed. `files_excluded_by` is shared by both planners.
+- **Wiring (`iceberg_scan.rs`)**: `plan_static_scan` drops the excluded tasks before `file_entries` are derived, so the direct and split paths both skip them; `StaticScanPlan::variant_files_pruned` feeds the new `files_pruned_variant` metric, counted once from partition 0. `data_file_info_with_pruning_stats` (distributed planning) drops the same files and adds them to its pruned count (which the min/max pruning used to overwrite; now both add). `with_variant_prunes` resets the cached static plan and split assignments, like `with_snapshot_id`. `snapshot_stats.rs` counts the variant bound bytes in the cache weight.
+- **Scan stats (`query_handler.rs`, `streaming.rs`)**: `files_pruned_minmax` is `table files - planned`, so a variant-pruned file would have been reported as min/max pruned (review finding). It is now subtracted there and reported as `files_pruned_variant`: span field `sqe.scan.files_pruned_variant` and `sqe_scan_files_total{outcome="pruned_variant"}`. SQE's `EXPLAIN ANALYZE` lists no named metrics; `EXPLAIN FULL` shows the drop in `files_scanned`.
+
+Probe (Spark 4.1 + Iceberg 1.12, `write.parquet.shred-variants`): one file per row unless the INSERT is hinted `COALESCE(1)`; a two-row file gets bounds `[1, 3]` for `$['a']`; a file where `$.a` is `7` and `"seven"` gets no bound at all, as the spec says.
+
+Gates:
+- `make test-integration FILTER=variant_spark_interop` -> 5 passed, none skipped. New `sqe_prunes_spark_files_on_variant_bounds`: Spark writes three files (a in [1,3] with s in [a,b]; a in [10,12] with s in [c,d]; a mixed int/string with no s). `EXPLAIN FULL` files_scanned/files_total: `>= 9` reads 2/3 (the `+ 0` baseline 3/3, same `2|3`), `$.s = 'd'` 2/3, `int < 2` 2/3, results equal the full scan.
+- Unit: `cargo test -p sqe-catalog --lib` -> 683 passed (4 new: Spark bound bytes exclude/keep, undecidable bounds kept, date and boolean bounds, path normalization). Vendor `cargo test -p iceberg --lib` -> 2139 passed. Clippy clean on sqe-catalog and sqe-coordinator. `cargo xtask matrix-report --print-only` -> 152/162.
+- Vendor `cargo clippy -p iceberg --lib` (in `vendor/iceberg-rust`) reports 3 lints, all in files this branch does not touch (`error.rs`, `values/literal.rs`, `transaction/row_delta.rs`); vendor is outside the pre-commit and pre-push lint.
+
+Open:
+- SQE writes no variant bounds; its own and compacted files are never file-pruned. Next branch: emit bounds from the shredder for paths whose values all landed in `typed_value`.
+- The distributed planner path has no integration test of its own (it shares `files_excluded_by` with the local path); `variant_distributed` needs a worker.
+- Typed read without unshredding, Spark multi-row-group pruning evidence.
+
+Rebased on !1542 (worker row-group pruning): its two field-id resolutions now call `resolve_variant_prunes`, and the matrix caveat, which still said a worker reads every row group, now lists `prunes_shredded_row_groups_on_a_worker`.
+
+**NEXT:** SQE writer emits variant manifest bounds (#870).
