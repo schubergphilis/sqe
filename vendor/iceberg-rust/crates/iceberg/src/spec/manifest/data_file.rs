@@ -120,6 +120,16 @@ pub struct DataFile {
     /// - [Binary single-value serialization](https://iceberg.apache.org/spec/#binary-single-value-serialization)
     #[builder(default)]
     pub(crate) upper_bounds: HashMap<i32, Datum>,
+    /// SQE PATCH (v3-shredded-variant): the lower bounds of variant columns,
+    /// as stored in the manifest (variant metadata followed by an object
+    /// keyed by normalized JSON path). Kept apart from `lower_bounds`
+    /// because no primitive `Datum` holds them, and written back unchanged.
+    #[builder(default)]
+    pub(crate) variant_lower_bounds: HashMap<i32, Vec<u8>>,
+    /// SQE PATCH (v3-shredded-variant): the upper bounds of variant columns,
+    /// in the same encoding as `variant_lower_bounds`.
+    #[builder(default)]
+    pub(crate) variant_upper_bounds: HashMap<i32, Vec<u8>>,
     /// field id: 131
     ///
     /// Implementation-specific key metadata for encryption
@@ -325,6 +335,18 @@ impl DataFile {
     /// persist while keeping the remaining file metadata unchanged.
     pub fn upper_bounds_mut(&mut self) -> &mut HashMap<i32, Datum> {
         &mut self.upper_bounds
+    }
+
+    /// SQE PATCH (v3-shredded-variant): variant column lower bounds, keyed
+    /// by field id, in the manifest's serialized variant encoding.
+    pub fn variant_lower_bounds(&self) -> &HashMap<i32, Vec<u8>> {
+        &self.variant_lower_bounds
+    }
+
+    /// SQE PATCH (v3-shredded-variant): variant column upper bounds, keyed
+    /// by field id, in the manifest's serialized variant encoding.
+    pub fn variant_upper_bounds(&self) -> &HashMap<i32, Vec<u8>> {
+        &self.variant_upper_bounds
     }
     /// Get the Implementation-specific key metadata for the data file.
     pub fn key_metadata(&self) -> Option<&[u8]> {
