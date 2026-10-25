@@ -31,7 +31,7 @@
 //! written unshredded: its whole value goes to `value` and its top-level
 //! `typed_value` is NULL, which the shredding spec allows.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
@@ -39,7 +39,9 @@ use arrow_array::{
     Array, ArrayRef, BooleanArray, LargeListArray, ListArray, MapArray, RecordBatch, StructArray,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use parquet::variant::{Variant, VariantArray, shred_variant};
+use chrono::NaiveDate;
+use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use parquet::variant::{Variant, VariantArray, VariantBuilder, shred_variant};
 
 use crate::{Error, ErrorKind, Result};
 
@@ -336,12 +338,138 @@ fn infer_variant(array: &ArrayRef) -> Result<Option<Node>> {
     )
 }
 
+/// Longest string bound written, in bytes. A path whose smallest or largest
+/// string is longer gets no bound, so a long text value does not bloat every
+/// manifest entry.
+const MAX_STRING_BOUND: usize = 64;
+
+/// One value of a variant manifest bound.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Scalar {
+    Int(i64),
+    Str(String),
+    Bool(bool),
+    Date(NaiveDate),
+}
+
+impl Scalar {
+    /// `value` as a bound of a path shredded as `shape`, or `None` when it
+    /// has another type. A double never bounds: NaN and -0.0 have no safe
+    /// order, and no reader prunes on one.
+    fn of(shape: &Shape, value: &Variant<'_, '_>) -> Option<Scalar> {
+        Some(match (shape, value) {
+            (Shape::Int, Variant::Int8(v)) => Scalar::Int(i64::from(*v)),
+            (Shape::Int, Variant::Int16(v)) => Scalar::Int(i64::from(*v)),
+            (Shape::Int, Variant::Int32(v)) => Scalar::Int(i64::from(*v)),
+            (Shape::Int, Variant::Int64(v)) => Scalar::Int(*v),
+            (Shape::Str, Variant::String(s)) => Scalar::Str(s.to_string()),
+            (Shape::Str, Variant::ShortString(s)) => Scalar::Str(s.as_str().to_string()),
+            (Shape::Bool, Variant::BooleanTrue) => Scalar::Bool(true),
+            (Shape::Bool, Variant::BooleanFalse) => Scalar::Bool(false),
+            (Shape::Date, Variant::Date(d)) => Scalar::Date(*d),
+            _ => return None,
+        })
+    }
+
+    fn fits_a_bound(&self) -> bool {
+        !matches!(self, Scalar::Str(s) if s.len() > MAX_STRING_BOUND)
+    }
+}
+
+/// Per shredded path (its object keys), the smallest and largest non-null
+/// value in the file, or `None` once a value of another type was seen there.
+type PathBounds = BTreeMap<Vec<String>, Option<(Scalar, Scalar)>>;
+
+/// Widens `bounds` by the values `value` holds at the paths `plan` shreds.
+/// It reads the values themselves, not `typed_value`, so a row written
+/// unshredded (a misfit) still counts.
+fn observe_bounds(
+    plan: &Plan,
+    value: &Variant<'_, '_>,
+    path: &mut Vec<String>,
+    bounds: &mut PathBounds,
+) {
+    match (plan, value) {
+        (_, Variant::Null) => {}
+        (Plan::Object(fields), Variant::Object(object)) => {
+            for (name, field_plan) in fields {
+                if let Some(field) = object.get(name) {
+                    path.push(name.clone());
+                    observe_bounds(field_plan, &field, path, bounds);
+                    path.pop();
+                }
+            }
+        }
+        // A non-object has no value at any field path.
+        (Plan::Object(_), _) => {}
+        (Plan::Primitive(shape), value) => {
+            let seen = Scalar::of(shape, value);
+            match (bounds.get_mut(path.as_slice()), seen) {
+                (Some(Some((lower, upper))), Some(seen)) => {
+                    if seen < *lower {
+                        *lower = seen;
+                    } else if seen > *upper {
+                        *upper = seen;
+                    }
+                }
+                (Some(slot), None) => *slot = None,
+                (Some(None), Some(_)) => {}
+                (None, seen) => {
+                    bounds.insert(path.clone(), seen.map(|s| (s.clone(), s)));
+                }
+            }
+        }
+    }
+}
+
+/// The manifest key of a path, `$['a']['b']` as Iceberg Java writes it, or
+/// `None` for the whole value or a key whose escaping is not settled.
+fn bound_key(path: &[String]) -> Option<String> {
+    if path.is_empty() || path.iter().any(|step| step.contains(['\'', '\\'])) {
+        return None;
+    }
+    Some(
+        path.iter()
+            .fold(String::from("$"), |key, step| format!("{key}['{step}']")),
+    )
+}
+
+/// A variant manifest bound: variant metadata followed by an object keyed by
+/// path.
+fn encode_bound<'a>(entries: impl Iterator<Item = (&'a str, &'a Scalar)>) -> Vec<u8> {
+    let mut builder = VariantBuilder::new();
+    let mut object = builder.new_object();
+    for (key, scalar) in entries {
+        match scalar {
+            Scalar::Int(v) => object.insert(key, *v),
+            Scalar::Str(s) => object.insert(key, s.as_str()),
+            Scalar::Bool(b) => object.insert(key, *b),
+            Scalar::Date(d) => object.insert(key, *d),
+        }
+    }
+    object.finish();
+    let (mut bytes, value) = builder.finish();
+    bytes.extend_from_slice(&value);
+    bytes
+}
+
+/// The bounds of one top-level shredded variant column.
+#[derive(Debug)]
+struct ColumnBounds {
+    index: usize,
+    field_id: i32,
+    paths: PathBounds,
+}
+
 /// One file's shredding: which columns, and the schema the file is written
 /// with.
 #[derive(Debug)]
 pub(crate) struct VariantShredder {
     columns: Vec<(usize, Node)>,
     schema: SchemaRef,
+    /// Manifest bounds of the top-level variant columns, the only ones a
+    /// reader looks a bound up for.
+    bounds: Vec<ColumnBounds>,
 }
 
 fn is_variant(field: &Field) -> bool {
@@ -361,9 +489,27 @@ impl VariantShredder {
         if columns.is_empty() {
             return Ok(None);
         }
+        let bounds = columns
+            .iter()
+            .filter(|(_, node)| matches!(node, Node::Variant(..)))
+            .filter_map(|(index, _)| {
+                let field_id = schema
+                    .field(*index)
+                    .metadata()
+                    .get(PARQUET_FIELD_ID_META_KEY)?
+                    .parse()
+                    .ok()?;
+                Some(ColumnBounds {
+                    index: *index,
+                    field_id,
+                    paths: PathBounds::new(),
+                })
+            })
+            .collect();
         let mut shredder = Self {
             columns,
             schema: schema.clone(),
+            bounds,
         };
         // The file schema is the shape `shred_variant` produces.
         let first = shredder.shred_columns(batch)?;
@@ -389,8 +535,23 @@ impl VariantShredder {
         self.schema.clone()
     }
 
-    /// `batch` with its variant columns shredded.
-    pub(crate) fn shred(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    /// `batch` with its variant columns shredded; its values widen the
+    /// manifest bounds.
+    pub(crate) fn shred(&mut self, batch: &RecordBatch) -> Result<RecordBatch> {
+        for column in &mut self.bounds {
+            let Some((_, Node::Variant(plan, _))) =
+                self.columns.iter().find(|(index, _)| *index == column.index)
+            else {
+                continue;
+            };
+            let variants = VariantArray::try_new(batch.column(column.index)).map_err(to_err)?;
+            let mut path = Vec::new();
+            for row in 0..variants.len() {
+                if variants.is_valid(row) {
+                    observe_bounds(plan, &variants.value(row), &mut path, &mut column.paths);
+                }
+            }
+        }
         let columns = self.shred_columns(batch)?;
         RecordBatch::try_new(self.schema.clone(), columns).map_err(|e| {
             Error::new(
@@ -399,6 +560,32 @@ impl VariantShredder {
             )
             .with_source(e)
         })
+    }
+
+    /// The file's variant manifest bounds (lower, upper) by field id: for
+    /// each top-level shredded column, every path whose values all have
+    /// the type it is shredded as. A column with no such path has none.
+    pub(crate) fn variant_bounds(&self) -> (HashMap<i32, Vec<u8>>, HashMap<i32, Vec<u8>>) {
+        let (mut lower, mut upper) = (HashMap::new(), HashMap::new());
+        for column in &self.bounds {
+            let kept: Vec<(String, &Scalar, &Scalar)> = column
+                .paths
+                .iter()
+                .filter_map(|(path, bounds)| {
+                    let (min, max) = bounds.as_ref()?;
+                    let key = bound_key(path)?;
+                    (min.fits_a_bound() && max.fits_a_bound()).then_some((key, min, max))
+                })
+                .collect();
+            if kept.is_empty() {
+                continue;
+            }
+            let min = kept.iter().map(|(key, min, _)| (key.as_str(), *min));
+            lower.insert(column.field_id, encode_bound(min));
+            let max = kept.iter().map(|(key, _, max)| (key.as_str(), *max));
+            upper.insert(column.field_id, encode_bound(max));
+        }
+        (lower, upper)
     }
 
     fn shred_columns(&self, batch: &RecordBatch) -> Result<Vec<ArrayRef>> {
@@ -498,7 +685,7 @@ mod tests {
             None,
         ];
         let batch = variant_batch(&rows);
-        let shredder = VariantShredder::infer(&batch.schema(), &batch)
+        let mut shredder = VariantShredder::infer(&batch.schema(), &batch)
             .unwrap()
             .expect("shreds");
         let out = shredder.shred(&batch).unwrap();
@@ -515,7 +702,7 @@ mod tests {
     #[test]
     fn a_value_of_another_type_is_not_cast() {
         let batch = variant_batch(&[Some(r#"{"a": 1}"#), Some(r#"{"a": 2}"#)]);
-        let shredder = VariantShredder::infer(&batch.schema(), &batch)
+        let mut shredder = VariantShredder::infer(&batch.schema(), &batch)
             .unwrap()
             .expect("shreds");
         // Later batches of the same file: a boolean and a double at `a`
@@ -539,7 +726,7 @@ mod tests {
     #[test]
     fn primitive_columns_shred_and_mixed_ones_do_not() {
         let ints = variant_batch(&[Some("1"), Some("2"), None]);
-        let shredder = VariantShredder::infer(&ints.schema(), &ints)
+        let mut shredder = VariantShredder::infer(&ints.schema(), &ints)
             .unwrap()
             .expect("shreds");
         let out = shredder.shred(&ints).unwrap();
@@ -600,7 +787,7 @@ mod tests {
             id(Field::new("m", m.data_type().clone(), true), "5"),
         ]));
         let batch = RecordBatch::try_new(schema.clone(), vec![s, l, m]).unwrap();
-        let shredder = VariantShredder::infer(&schema, &batch)
+        let mut shredder = VariantShredder::infer(&schema, &batch)
             .unwrap()
             .expect("shreds");
         let out = shredder.shred(&batch).unwrap();
@@ -639,5 +826,95 @@ mod tests {
         };
         assert_eq!(entry_fields[1].metadata().get("PARQUET:field_id").unwrap(), "7");
         assert!(is_variant(&entry_fields[1]));
+    }
+
+    /// `rows` as the variant column `v` with field id 2.
+    fn variant_batch_with_id(rows: &[Option<&str>]) -> RecordBatch {
+        let batch = variant_batch(rows);
+        let field = batch.schema().field(0).clone();
+        let mut metadata = field.metadata().clone();
+        metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string());
+        let field = field.with_metadata(metadata);
+        RecordBatch::try_new(Arc::new(Schema::new(vec![field])), batch.columns().to_vec())
+            .unwrap()
+    }
+
+    /// The bound at `key` of field 2, decoded the way a reader does.
+    fn bound_at(bounds: &HashMap<i32, Vec<u8>>, key: &str) -> Option<Scalar> {
+        let bytes = bounds.get(&2)?;
+        let metadata = parquet::variant::VariantMetadata::try_new(bytes).unwrap();
+        let value = &bytes[metadata.size()..];
+        let object = Variant::try_new_with_metadata(metadata, value).unwrap();
+        let field = object.get_object_field(key)?;
+        [Shape::Int, Shape::Str, Shape::Bool, Shape::Date]
+            .iter()
+            .find_map(|shape| Scalar::of(shape, &field))
+    }
+
+    /// Writes `batches` through one shredder, as one data file.
+    fn file_bounds(batches: &[RecordBatch]) -> (HashMap<i32, Vec<u8>>, HashMap<i32, Vec<u8>>) {
+        let mut shredder = VariantShredder::infer(&batches[0].schema(), &batches[0])
+            .unwrap()
+            .expect("shreds");
+        for batch in batches {
+            shredder.shred(batch).unwrap();
+        }
+        shredder.variant_bounds()
+    }
+
+    #[test]
+    fn bounds_cover_every_value_at_a_shredded_path() {
+        let first = variant_batch_with_id(&[
+            Some(r#"{"a": 3, "s": "m", "b": true, "o": {"x": 5}}"#),
+            Some(r#"{"a": 1, "s": "z", "o": {"x": -2}}"#),
+            None,
+        ]);
+        let later = variant_batch_with_id(&[
+            Some(r#"{"a": 7, "s": "c", "b": true, "o": {"x": null}}"#),
+            None,
+            Some(r#""not an object""#),
+        ]);
+        let (lower, upper) = file_bounds(&[first, later]);
+        let range = |key| (bound_at(&lower, key), bound_at(&upper, key));
+        let s = |v: &str| Some(Scalar::Str(v.to_string()));
+        assert_eq!(range("$['a']"), (Some(Scalar::Int(1)), Some(Scalar::Int(7))));
+        assert_eq!(range("$['s']"), (s("c"), s("z")));
+        let yes = Some(Scalar::Bool(true));
+        assert_eq!(range("$['b']"), (yes.clone(), yes));
+        assert_eq!(
+            range("$['o']['x']"),
+            (Some(Scalar::Int(-2)), Some(Scalar::Int(5)))
+        );
+    }
+
+    #[test]
+    fn a_value_of_another_type_drops_the_path_bound() {
+        let first = variant_batch_with_id(&[Some(r#"{"a": 1, "s": "x"}"#)]);
+        // The row is written unshredded; its `s` still widens the bound.
+        let later = variant_batch_with_id(&[Some(r#"{"a": "one", "s": "y"}"#)]);
+        let (lower, upper) = file_bounds(&[first, later]);
+        assert_eq!(bound_at(&lower, "$['a']"), None);
+        assert_eq!(bound_at(&upper, "$['a']"), None);
+        assert_eq!(bound_at(&lower, "$['s']"), Some(Scalar::Str("x".into())));
+        assert_eq!(bound_at(&upper, "$['s']"), Some(Scalar::Str("y".into())));
+    }
+
+    #[test]
+    fn doubles_long_strings_and_quoted_keys_get_no_bound() {
+        let long = "x".repeat(MAX_STRING_BOUND + 1);
+        let row = format!(r#"{{"f": 1.5, "l": "{long}", "it's": 1, "n": 2}}"#);
+        let (lower, upper) = file_bounds(&[variant_batch_with_id(&[Some(&row)])]);
+        for key in ["$['f']", "$['l']", "$['it's']"] {
+            assert_eq!(bound_at(&lower, key), None, "{key}");
+        }
+        assert_eq!(bound_at(&lower, "$['n']"), Some(Scalar::Int(2)));
+        assert_eq!(bound_at(&upper, "$['n']"), Some(Scalar::Int(2)));
+
+        // Nothing boundable: no entry for the column at all.
+        let (lower, upper) = file_bounds(&[variant_batch_with_id(&[Some(r#"{"f": 1.5}"#)])]);
+        assert!(lower.is_empty() && upper.is_empty());
+        // No field id: no bounds.
+        let (lower, _) = file_bounds(&[variant_batch(&[Some(r#"{"a": 1}"#)])]);
+        assert!(lower.is_empty());
     }
 }
