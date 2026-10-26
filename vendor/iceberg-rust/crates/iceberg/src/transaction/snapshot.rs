@@ -232,6 +232,19 @@ impl<'a> SnapshotProducer<'a> {
                     .with_context("partition spec id", spec_id.to_string())
                     .with_context("file path", data_file.file_path())
                 })?;
+                // SQE PATCH (sqe#864): "Writers must not commit data using a
+                // partition spec that contains a field with an unknown
+                // transform" (spec, Partition Transforms). Such a spec loads
+                // so the table stays readable, but its partition values
+                // cannot be computed here.
+                if spec.has_unknown_transform() {
+                    return Err(Error::new(
+                        ErrorKind::FeatureUnsupported,
+                        "Cannot commit data under a partition spec with an unknown transform",
+                    )
+                    .with_context("partition spec id", spec_id.to_string())
+                    .with_context("file path", data_file.file_path()));
+                }
                 let partition_type = if spec_id == metadata.default_partition_spec_id() {
                     metadata.default_partition_type().clone()
                 } else {

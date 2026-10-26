@@ -1093,10 +1093,15 @@ impl TableMetadataBuilder {
         let schema = self.get_current_schema()?.clone();
         let sort_order = Arc::unwrap_or_clone(self.get_default_sort_order()?);
 
+        // SQE PATCH (sqe#864): rebinding goes through the unbound form, which
+        // has no room for unknown-transform records; carry them over.
+        let default_spec = Arc::unwrap_or_clone(self.metadata.default_spec);
         self.metadata.default_spec = Arc::new(
-            Arc::unwrap_or_clone(self.metadata.default_spec)
+            default_spec
+                .clone()
                 .into_unbound()
-                .bind_for_existing_metadata(schema.clone())?,
+                .bind_for_existing_metadata(schema.clone())?
+                .with_unknown_transforms_of(&default_spec),
         );
         self.metadata.default_partition_type =
             self.metadata.default_spec.partition_type(&schema)?;
@@ -3842,5 +3847,62 @@ mod tests {
             .collect();
         assert_eq!(fields, vec![(1, 1006), (2, 1007)]);
         assert_eq!(result.metadata.last_partition_id, 1007);
+    }
+
+    // SQE PATCH (sqe#864): table metadata whose default spec and sort order
+    // use a multi-argument transform loads, survives a metadata change and is
+    // written back with its `source-ids`.
+    #[test]
+    fn test_multi_argument_transforms_survive_a_metadata_commit() {
+        let metadata = builder_without_changes(FormatVersion::V3)
+            .build()
+            .unwrap()
+            .metadata;
+        let mut json = serde_json::to_value(&metadata).unwrap();
+        json["partition-specs"][0]["fields"] = serde_json::json!([
+            {"source-ids": [1, 2], "field-id": 1000, "name": "xy_zorder", "transform": "zorder"}
+        ]);
+        json["sort-orders"] = serde_json::json!([{
+            "order-id": 1,
+            "fields": [{"source-ids": [3, 1], "transform": "zorder",
+                        "direction": "desc", "null-order": "nulls-first"}]
+        }]);
+        let metadata: TableMetadata = serde_json::from_value(json).unwrap();
+        assert!(metadata.default_partition_spec().has_unknown_transform());
+        assert_eq!(
+            metadata.default_sort_order().fields[0].transform,
+            Transform::Unknown
+        );
+
+        let result = metadata
+            .into_builder(Some(
+                "s3://bucket/test/location/metadata/v1.json".to_string(),
+            ))
+            .set_properties(HashMap::from([("k".to_string(), "v".to_string())]))
+            .unwrap()
+            .build()
+            .unwrap();
+        let written = serde_json::to_value(&result.metadata).unwrap();
+        assert_eq!(
+            written["partition-specs"][0]["fields"][0]["source-ids"],
+            serde_json::json!([1, 2])
+        );
+        assert!(written["partition-specs"][0]["fields"][0].get("source-id").is_none());
+        assert_eq!(
+            written["partition-specs"][0]["fields"][0]["transform"],
+            "zorder"
+        );
+        assert_eq!(
+            written["sort-orders"][0]["fields"][0]["source-ids"],
+            serde_json::json!([3, 1])
+        );
+        assert_eq!(
+            result
+                .metadata
+                .default_partition_spec()
+                .unknown_transform(1000)
+                .map(|u| u.source_ids.clone()),
+            Some(vec![1, 2])
+        );
     }
 }

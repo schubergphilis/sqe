@@ -21,8 +21,9 @@ use std::sync::Arc;
 use typed_builder::TypedBuilder;
 
 use super::{FormatVersion, ManifestContentType, PartitionSpec, Schema};
-use crate::error::{Result, invalid_data};
-use crate::spec::{PartitionField, SchemaId, SchemaRef};
+use crate::error::{invalid_data, Result};
+use crate::spec::partition::RawPartitionField;
+use crate::spec::{SchemaId, SchemaRef};
 
 /// Meta data of a manifest that is stored in the key-value metadata of the Avro file
 #[derive(Debug, PartialEq, Clone, Eq, TypedBuilder)]
@@ -65,7 +66,9 @@ impl ManifestMetadata {
                 let bs = meta.get("partition-spec").ok_or_else(|| {
                     invalid_data!("partition-spec is required in manifest metadata but not found")
                 })?;
-                serde_json::from_slice::<Vec<PartitionField>>(bs).map_err(|err| {
+                // SQE PATCH (sqe#864): raw fields, so a field with an unknown
+                // or multi-argument transform is kept instead of refused.
+                serde_json::from_slice::<Vec<RawPartitionField>>(bs).map_err(|err| {
                     invalid_data!("Fail to parse partition spec in manifest metadata")
                         .with_source(err)
                 })?
@@ -80,10 +83,25 @@ impl ManifestMetadata {
                 })
                 .transpose()?
                 .unwrap_or(0);
-            PartitionSpec::builder(schema.clone())
-                .with_spec_id(spec_id)
-                .add_unbound_fields(fields.into_iter().map(|f| f.into_unbound()))?
-                .build()?
+            let raw_spec = PartitionSpec::from_raw_fields(spec_id, fields).map_err(|err| {
+                invalid_data!("Fail to parse partition spec in manifest metadata: {err}")
+            })?;
+            if raw_spec.has_unknown_transform() {
+                // Validate against the schema like any spec, then carry the
+                // unknown-transform records the unbound form cannot hold.
+                raw_spec
+                    .clone()
+                    .into_unbound()
+                    .bind_for_existing_metadata(schema.clone())?
+                    .with_unknown_transforms_of(&raw_spec)
+            } else {
+                PartitionSpec::builder(schema.clone())
+                    .with_spec_id(spec_id)
+                    .add_unbound_fields(
+                        raw_spec.fields().iter().cloned().map(|f| f.into_unbound()),
+                    )?
+                    .build()?
+            }
         };
         let format_version = if let Some(bs) = meta.get("format-version") {
             serde_json::from_slice::<FormatVersion>(bs).map_err(|err| {

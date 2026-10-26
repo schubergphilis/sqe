@@ -1804,6 +1804,28 @@ impl CatalogOps {
             }
         };
 
+        // A field with a transform SQE does not know (a multi-argument one,
+        // sqe#864) lost its original name and extra sources in the unbound
+        // copy above; carrying it into the new spec would rewrite it as a
+        // single-source `unknown` field. Dropping it is fine.
+        if let Some(f) = fields
+            .iter()
+            .find(|f| f.transform == iceberg::spec::Transform::Unknown)
+        {
+            let transform = f
+                .field_id
+                .and_then(|id| current_spec.unknown_transform(id))
+                .map_or("unknown", |u| u.transform.as_str());
+            return Err(SqeError::with_code(
+                SqeErrorCode::NotSupported,
+                format!(
+                    "ALTER TABLE PARTITION FIELD: partition field '{}' uses transform '{transform}', \
+                     which SQE cannot carry into a new spec; drop that field first",
+                    f.name
+                ),
+            ));
+        }
+
         let new_spec_id = current_spec_id + 1;
         let new_spec: UnboundPartitionSpec = UnboundPartitionSpec::builder()
             .with_spec_id(new_spec_id)
