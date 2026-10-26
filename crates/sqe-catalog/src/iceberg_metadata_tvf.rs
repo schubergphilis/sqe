@@ -793,9 +793,7 @@ fn int_map_to_json(map: &HashMap<i32, u64>, keep: impl Fn(i32) -> bool) -> Strin
 }
 
 /// Serialise a `{field_id: Datum}` bound map to a JSON object, keeping only
-/// the field ids `keep` accepts. Datum's Display renders numbers bare and
-/// strings quoted, so each value is already a valid JSON value. Keys are
-/// sorted for deterministic output.
+/// the field ids `keep` accepts. Keys are sorted for deterministic output.
 fn bounds_map_to_json(
     map: &HashMap<i32, iceberg::spec::Datum>,
     keep: impl Fn(i32) -> bool,
@@ -803,19 +801,39 @@ fn bounds_map_to_json(
     let mut pairs: Vec<String> = map
         .iter()
         .filter(|(k, _)| keep(**k))
-        .map(|(k, v)| format!("\"{}\":{}", k, v))
+        .map(|(k, v)| format!("\"{}\":{}", k, datum_json(v)))
         .collect();
     pairs.sort();
     format!("{{{}}}", pairs.join(","))
 }
 
-/// Render a data file's partition tuple as `[v1,v2,...]`, with the value of
-/// every partition field with a source column `gov` governs shown as `null`.
-/// A multi-argument field (sqe#864) has several sources; any one hides it.
+/// One bound as a JSON value. Booleans, integers, decimals and finite floats
+/// are bare numbers; everything else is a JSON string: string bounds escaped,
+/// and date, time, timestamp, UUID, binary (uppercase hex) and NaN / inf
+/// bounds in Datum's Display form, which leaves them unquoted.
+fn datum_json(d: &iceberg::spec::Datum) -> String {
+    use iceberg::spec::{PrimitiveLiteral as L, PrimitiveType as T};
+    match (d.data_type(), d.literal()) {
+        (_, L::Boolean(_))
+        | (T::Int, L::Int(_))
+        | (T::Long, L::Long(_))
+        | (T::Decimal { .. }, L::Int128(_)) => d.to_string(),
+        (_, L::Float(v)) if v.is_finite() => d.to_string(),
+        (_, L::Double(v)) if v.is_finite() => d.to_string(),
+        (_, L::String(s)) => serde_json::Value::from(s.as_str()).to_string(),
+        _ => serde_json::Value::from(d.to_string()).to_string(),
+    }
+}
+
+/// Render a data file's partition tuple as a JSON array `[v1,v2,...]`, with
+/// the value of every partition field with a source column `gov` governs
+/// shown as `null`. A multi-argument field (sqe#864) has several sources;
+/// any one hides it.
 fn partition_key(table: &Table, df: &iceberg::spec::DataFile, gov: &StatsGovernance) -> String {
     let metadata = table.metadata();
     let schema = metadata.current_schema();
     let spec = metadata.partition_spec_by_id(df.partition_spec_id());
+    let partition_type = spec.and_then(|s| s.partition_type(schema).ok());
     let parts: Vec<String> = df
         .partition()
         .fields()
@@ -825,10 +843,25 @@ fn partition_key(table: &Table, df: &iceberg::spec::DataFile, gov: &StatsGoverna
             if partition_field_governed(spec.map(|s| s.as_ref()), i, schema, gov) {
                 return "null".to_string();
             }
-            f.as_ref().map_or("null".to_string(), |v| format!("{v:?}"))
+            let ty = partition_type.as_ref().and_then(|t| t.fields().get(i));
+            f.as_ref()
+                .map_or("null".to_string(), |v| partition_value_json(v, ty))
         })
         .collect();
     format!("[{}]", parts.join(","))
+}
+
+/// One partition value in the Iceberg spec's single-value JSON form (dates
+/// as `"2026-10-26"`, binary as hex, decimals as strings). A value whose
+/// type is unknown or does not match becomes its Debug form as a JSON string.
+fn partition_value_json(
+    v: &iceberg::spec::Literal,
+    field: Option<&iceberg::spec::NestedFieldRef>,
+) -> String {
+    field
+        .and_then(|f| v.clone().try_into_json(&f.field_type).ok())
+        .unwrap_or_else(|| serde_json::Value::from(format!("{v:?}")))
+        .to_string()
 }
 
 /// Whether `gov` governs a source column of partition field `i` of `spec`.
@@ -1448,6 +1481,69 @@ mod tests {
         assert!(gov.all);
         assert_eq!(rendered(&gov), "{}");
         assert!(gov.governs(Some("id")));
+    }
+
+    #[test]
+    fn test_bounds_json_is_valid_for_every_type() {
+        use iceberg::spec::Datum;
+        let map = HashMap::from([
+            (1, Datum::bool(true)),
+            (2, Datum::int(-3)),
+            (3, Datum::long(7)),
+            (4, Datum::decimal_from_str("-1.50").unwrap()),
+            (5, Datum::double(2.5)),
+            (6, Datum::double(f64::NAN)),
+            (7, Datum::float(f32::NEG_INFINITY)),
+            (8, Datum::string("a \"q\" \\ b")),
+            (9, Datum::date_from_ymd(2026, 10, 26).unwrap()),
+            (10, Datum::time_micros(1_000_000).unwrap()),
+            (11, Datum::timestamp_micros(0)),
+            (12, Datum::timestamptz_micros(0)),
+            (13, Datum::uuid(uuid::Uuid::from_u128(1))),
+            (14, Datum::binary([0x00, 0xAB])),
+            (15, Datum::fixed([0x01])),
+        ]);
+        let out = bounds_map_to_json(&map, |_| true);
+        let v: serde_json::Value =
+            serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid JSON {out}: {e}"));
+
+        assert_eq!(v["1"], serde_json::json!(true));
+        assert_eq!(v["2"], serde_json::json!(-3));
+        assert_eq!(v["3"], serde_json::json!(7));
+        assert_eq!(v["4"], serde_json::json!(-1.5));
+        assert_eq!(v["5"], serde_json::json!(2.5));
+        assert_eq!(v["6"], serde_json::json!("NaN"));
+        assert_eq!(v["7"], serde_json::json!("-inf"));
+        assert_eq!(v["8"], serde_json::json!("a \"q\" \\ b"));
+        assert_eq!(v["9"], serde_json::json!("2026-10-26"));
+        assert_eq!(v["10"], serde_json::json!("00:00:01"));
+        assert!(v["11"].as_str().unwrap().starts_with("1970-01-01"), "{out}");
+        assert!(v["12"].as_str().unwrap().starts_with("1970-01-01"), "{out}");
+        let uuid = "00000000-0000-0000-0000-000000000001";
+        assert_eq!(v["13"], serde_json::json!(uuid));
+        assert_eq!(v["14"], serde_json::json!("00AB"));
+        assert_eq!(v["15"], serde_json::json!("01"));
+        assert!(out.contains("\"4\":-1.50"), "decimal scale kept: {out}");
+    }
+
+    #[test]
+    fn test_partition_values_render_as_json() {
+        use iceberg::spec::{Literal, NestedField, PrimitiveType, Type};
+        let field = |ty| Arc::new(NestedField::optional(1000, "p", Type::Primitive(ty)));
+        let date = field(PrimitiveType::Date);
+        let text = field(PrimitiveType::String);
+        let long = field(PrimitiveType::Long);
+        let bin = field(PrimitiveType::Binary);
+
+        let json = |v: Literal, f| partition_value_json(&v, f);
+        assert_eq!(json(Literal::date(0), Some(&date)), "\"1970-01-01\"");
+        assert_eq!(json(Literal::string("a\"b"), Some(&text)), r#""a\"b""#);
+        assert_eq!(json(Literal::long(7), Some(&long)), "7");
+        assert_eq!(json(Literal::binary([0xAB]), Some(&bin)), "\"ab\"");
+        // Unknown or mismatched type: still a JSON string.
+        let parse = |s: String| serde_json::from_str::<serde_json::Value>(&s).unwrap();
+        assert!(parse(json(Literal::int(3), None)).is_string());
+        assert!(parse(json(Literal::int(3), Some(&text))).is_string());
     }
 
     #[test]
