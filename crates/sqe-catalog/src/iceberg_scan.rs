@@ -851,7 +851,7 @@ impl IcebergScanExec {
         let Some(cols) = self.projection.as_deref() else {
             return Ok(None);
         };
-        if cols.is_empty() || !projection_evolved(&self.table, cols) {
+        if cols.is_empty() || !projection_evolved(&self.table, self.snapshot_id, cols) {
             return Ok(None);
         }
         let defaults =
@@ -2705,17 +2705,17 @@ fn conform_batch_to_projection(
 }
 
 /// Whether some data file may store a projected column differently from the
-/// current schema: absent (added later), under another name (renamed) or as
-/// another type (promoted). Answered from the table's historic schemas, so a
-/// table whose projected columns never changed reports `false`.
+/// scanned snapshot's schema: absent (added later), under another name
+/// (renamed) or as another type (promoted). Answered from the table's historic
+/// schemas, so a table whose projected columns never changed reports `false`.
 ///
 /// A column that is or holds a V3 `unknown` field also counts: that field is
 /// never in a data file, so every file stores the column narrower (#859).
-fn projection_evolved(table: &Table, cols: &[String]) -> bool {
+fn projection_evolved(table: &Table, snapshot_id: Option<i64>, cols: &[String]) -> bool {
     let metadata = table.metadata();
-    let current = metadata.current_schema();
+    let scanned = snapshot_schema(table, snapshot_id);
     cols.iter().any(|name| {
-        let Some(field) = current.field_by_name(name) else {
+        let Some(field) = scanned.field_by_name(name) else {
             return false;
         };
         if type_holds_unknown(&field.field_type) {
