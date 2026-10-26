@@ -211,8 +211,8 @@ async fn sqe_reads_a_spark_geospatial_table() {
     );
 }
 
-/// Per-file `(lower_bounds, upper_bounds)` of the test table. Field ids:
-/// 1 id, 2 b, 3 g, 4 h.
+/// Per-file `(lower_bounds, upper_bounds)` of the test table, with the
+/// quotes around binary bound values removed. Field ids: 1 id, 2 b, 3 g, 4 h.
 async fn file_bounds(
     handler: &sqe_coordinator::QueryHandler,
     session: &sqe_core::Session,
@@ -223,7 +223,12 @@ async fn file_bounds(
         .into_iter()
         .map(|row| {
             let (lo, hi) = row.split_once('|').expect("two columns");
-            (lo.to_string(), hi.to_string())
+            let unquote = |s: &str| {
+                s.replace(":\"", ":")
+                    .replace("\",", ",")
+                    .replace("\"}", "}")
+            };
+            (unquote(lo), unquote(hi))
         })
         .collect()
 }
