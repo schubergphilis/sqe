@@ -2098,6 +2098,8 @@ fn reassemble_worker_batch(
 /// Whether a worker column of type `from` may be conformed to the planned
 /// `to`: the same values under another offset width or view layout, an
 /// Iceberg type promotion (int to long, float to double, a wider decimal),
+/// a `timestamptz` under another zone label (a file without an Arrow schema
+/// decodes as `"UTC"`, the plan says `"+00:00"`; both hold UTC instants),
 /// typed NULLs, or a nested type `fill_unknown` rebuilds member by member
 /// (a struct's `unknown` members, a shredded variant). Anything else is a
 /// worker that projected the wrong column, and stays an error.
@@ -2113,6 +2115,7 @@ fn is_conformable(from: &arrow_schema::DataType, to: &arrow_schema::DataType) ->
         | (D::Int32, D::Int64)
         | (D::Float32, D::Float64) => true,
         (D::Decimal128(p, s), D::Decimal128(p2, s2)) => p2 >= p && s2 == s,
+        (D::Timestamp(u, Some(_)), D::Timestamp(u2, Some(_))) => u == u2,
         (D::Struct(_), D::Struct(_))
         | (
             D::List(_) | D::LargeList(_) | D::ListView(_) | D::LargeListView(_),
@@ -2274,6 +2277,42 @@ mod tests {
             .unwrap();
             let err = reassemble_worker_batch(worker, &schema(&["a"])).unwrap_err();
             assert!(err.to_string().contains("cannot be read as Int64"), "{err}");
+        }
+
+        #[test]
+        fn utc_timestamp_relabels_and_another_unit_is_refused() {
+            // A Spark or Databricks file has no Arrow schema, so a worker
+            // decodes `timestamptz` as `"UTC"`; the plan says `"+00:00"`.
+            // Both hold UTC instants: a relabel, never a refusal.
+            use arrow_array::{Array, TimestampMicrosecondArray};
+            use arrow_schema::TimeUnit;
+            let micros = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+            let file = Schema::new(vec![Field::new("ts", micros, true)]);
+            let values = TimestampMicrosecondArray::from(vec![Some(1_700_000_000_000_000), None])
+                .with_timezone("UTC");
+            let worker = RecordBatch::try_new(Arc::new(file), vec![Arc::new(values)]).unwrap();
+            let planned = DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into()));
+            let field = Field::new("ts", planned, true);
+            let expected: SchemaRef = Arc::new(Schema::new(vec![field]));
+            let out = reassemble_worker_batch(worker.clone(), &expected).unwrap();
+            assert_eq!(out.schema(), expected);
+            let ts = out
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>();
+            let ts = ts.unwrap();
+            assert_eq!(ts.value(0), 1_700_000_000_000_000);
+            assert!(ts.is_null(1));
+
+            // Another unit is not a relabel: the values would change.
+            let nanos = DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into()));
+            let field = Field::new("ts", nanos, true);
+            let expected: SchemaRef = Arc::new(Schema::new(vec![field]));
+            let err = reassemble_worker_batch(worker, &expected).unwrap_err();
+            assert!(
+                err.to_string().contains("cannot be read as Timestamp"),
+                "{err}"
+            );
         }
     }
     use arrow_schema::{DataType, Field, Schema};
