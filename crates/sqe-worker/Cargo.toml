@@ -17,6 +17,8 @@ sqe-planner = { path = "../sqe-planner" }
 sqe-compaction = { path = "../sqe-compaction" }
 sqe-metrics = { path = "../sqe-metrics" }
 sqe-spill = { path = "../sqe-spill" }
+# The ST_* functions, so a pushed-down predicate that calls one decodes.
+sqe-geo = { path = "../sqe-geo" }
 iceberg = { workspace = true }
 datafusion = { workspace = true }
 datafusion-proto = { workspace = true }
