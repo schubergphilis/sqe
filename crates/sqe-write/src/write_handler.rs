@@ -7916,6 +7916,39 @@ pub fn sql_type_to_arrow(
     sql_type_to_arrow_for(sql_type, false)
 }
 
+/// The Iceberg type of a `GEOMETRY` / `GEOGRAPHY` column type; `None` for
+/// any other type (#863). An invalid CRS, algorithm or argument count is an
+/// error.
+pub fn geospatial_iceberg_type(
+    sql_type: &sqlparser::ast::DataType,
+) -> Option<sqe_core::Result<iceberg::spec::Type>> {
+    let ty = sqe_sql::geospatial_type(sql_type)?;
+    let parsed = serde_json::from_value::<iceberg::spec::PrimitiveType>(ty.into())
+        .map(iceberg::spec::Type::Primitive)
+        .map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("Invalid column type {sql_type}: {e}"),
+            )
+        });
+    Some(parsed)
+}
+
+/// [`sql_type_to_arrow_for`] for a STRUCT field, ARRAY element or MAP key or
+/// value. A geospatial type is refused there: the Iceberg type is set on
+/// top-level columns only, and a nested one would silently become binary.
+fn nested_sql_type_to_arrow(
+    sql_type: &sqlparser::ast::DataType,
+    json_as_variant: bool,
+) -> sqe_core::Result<arrow_schema::DataType> {
+    if sqe_sql::geospatial_type(sql_type).is_some() {
+        return Err(SqeError::NotImplemented(format!(
+            "{sql_type} is supported as a top-level column only, not inside STRUCT, ARRAY or MAP"
+        )));
+    }
+    sql_type_to_arrow_for(sql_type, json_as_variant)
+}
+
 /// Convert a sqlparser SQL data type to an Arrow DataType. With
 /// `json_as_variant` (a format v3 table) `JSON` is stored as an Iceberg
 /// variant, also inside STRUCT / ROW fields; without it, as a string (#849).
@@ -7942,6 +7975,12 @@ pub fn sql_type_to_arrow_for(
     // Iceberg conversion tags it with the variant extension (#849).
     if sqe_sql::is_variant_type(sql_type) {
         return Ok(sqe_core::variant::storage_type());
+    }
+
+    // GEOMETRY / GEOGRAPHY (Iceberg V3) hold WKB bytes (#863).
+    if let Some(geo) = geospatial_iceberg_type(sql_type) {
+        geo?;
+        return Ok(DataType::Binary);
     }
 
     match sql_type {
@@ -8039,7 +8078,7 @@ pub fn sql_type_to_arrow_for(
                         .unwrap_or_else(|| format!("col{i}"));
                     Ok(arrow_schema::Field::new(
                         name,
-                        sql_type_to_arrow_for(&sf.field_type, json_as_variant)?,
+                        nested_sql_type_to_arrow(&sf.field_type, json_as_variant)?,
                         true,
                     ))
                 })
@@ -8061,7 +8100,7 @@ pub fn sql_type_to_arrow_for(
             Ok(DataType::List(std::sync::Arc::new(
                 arrow_schema::Field::new(
                     iceberg::spec::LIST_FIELD_NAME,
-                    sql_type_to_arrow_for(inner, json_as_variant)?,
+                    nested_sql_type_to_arrow(inner, json_as_variant)?,
                     true,
                 ),
             )))
@@ -8076,12 +8115,12 @@ pub fn sql_type_to_arrow_for(
                     vec![
                         arrow_schema::Field::new(
                             iceberg::spec::MAP_KEY_FIELD_NAME,
-                            sql_type_to_arrow_for(key, json_as_variant)?,
+                            nested_sql_type_to_arrow(key, json_as_variant)?,
                             false,
                         ),
                         arrow_schema::Field::new(
                             iceberg::spec::MAP_VALUE_FIELD_NAME,
-                            sql_type_to_arrow_for(value, json_as_variant)?,
+                            nested_sql_type_to_arrow(value, json_as_variant)?,
                             true,
                         ),
                     ]
@@ -8573,7 +8612,8 @@ pub(crate) fn plan_create_table_schema(
                 SqeErrorCode::ExecutionFailed,
                 format!(
                     "format-version {v} was requested, but the table has a column \
-                     (variant, nanosecond timestamp or DEFAULT) that needs format v3"
+                     (variant, geometry, geography, nanosecond timestamp or DEFAULT) \
+                     that needs format v3"
                 ),
             ))
         }
@@ -8621,6 +8661,11 @@ pub fn arrow_schema_to_iceberg_with_defaults(
 
     for (base_field, col_def) in base.as_struct().fields().iter().zip(column_defs.iter()) {
         let mut field: NestedField = (**base_field).clone();
+        // A geospatial column is binary in Arrow; its Iceberg type comes from
+        // the column type.
+        if let Some(geo) = geospatial_iceberg_type(&col_def.data_type) {
+            field.field_type = Box::new(geo?);
+        }
         let iceberg_type = field.field_type.as_ref().clone();
 
         // Pull the DEFAULT from the column def (if any) and lift it into
@@ -10668,6 +10713,52 @@ mod tests {
             default,
         )?;
         Ok((iceberg, version))
+    }
+
+    #[test]
+    fn geospatial_columns_get_their_iceberg_type_and_need_v3() {
+        let sql = "CREATE TABLE t (id BIGINT, g GEOMETRY(4326), m GEOMETRY(3857), \
+                   h GEOGRAPHY, k GEOGRAPHY('OGC:CRS84', karney))";
+        let (schema, version) = plan(sql, FormatVersion::V2).unwrap();
+        assert_eq!(version, FormatVersion::V3);
+        let types: Vec<String> = schema
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|f| f.field_type.to_string())
+            .collect();
+        assert_eq!(
+            types,
+            [
+                "long",
+                "geometry(OGC:CRS84)",
+                "geometry(EPSG:3857)",
+                "geography(OGC:CRS84, spherical)",
+                "geography(OGC:CRS84, karney)",
+            ]
+        );
+
+        let v2 = "CREATE TABLE t (g GEOMETRY) WITH ('format-version' = '2')";
+        let err = plan(v2, FormatVersion::V3).unwrap_err().to_string();
+        assert!(err.contains("needs format v3"), "{err}");
+    }
+
+    #[test]
+    fn invalid_or_nested_geospatial_columns_are_refused() {
+        let invalid = "Invalid column type";
+        let nested = "top-level column only";
+        for (cols, want) in [
+            ("g GEOMETRY(1, 2)", invalid),
+            ("h GEOGRAPHY(4326, flat)", invalid),
+            ("g GEOMETRY DEFAULT X'00'", "DEFAULT"),
+            ("s STRUCT<g GEOMETRY>", nested),
+            ("a ARRAY<GEOGRAPHY>", nested),
+            ("m MAP(VARCHAR, GEOMETRY)", nested),
+        ] {
+            let sql = format!("CREATE TABLE t ({cols})");
+            let err = plan(&sql, FormatVersion::V3).unwrap_err().to_string();
+            assert!(err.contains(want), "{sql}: {err}");
+        }
     }
 
     fn is_variant_column(schema: &IcebergSchema, idx: usize) -> bool {
