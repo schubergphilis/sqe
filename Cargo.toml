@@ -38,6 +38,7 @@ exclude = [
     "vendor/datafusion-iceberg",
     "vendor/sqlite-rs",
     "vendor/object_store",
+    "vendor/zstd",
     "playground",
 ]
 
@@ -286,8 +287,17 @@ flate2 = { version = "1" }
 # declares Apache-2.0, the one of the two SQE takes it under. DataFusion 55 is
 # on the 0.13 trait line, so SQE cannot take 0.14 alone. Drop this patch and
 # vendor/object_store when DataFusion moves to object_store 0.14 (!1133).
+#
+# zstd 0.14.3 as published, relabeled 0.13.4 with its examples, tests and
+# dev-dependencies left out. arrow/parquet 59, DataFusion 55 and apache-avro
+# require zstd ^0.13, whose zstd-safe 7.3.0 carries RUSTSEC-2026-0395..0406
+# (fixed in zstd-safe 8.2.0) and which itself carries RUSTSEC-2026-0391
+# (fixed in 0.14.3). 0.14 only adds API over 0.13, so the 0.13 callers build
+# unchanged against it. Drop this patch and vendor/zstd when DataFusion moves
+# to arrow 60 (zstd 0.14, DataFusion 56).
 [patch.crates-io]
 object_store = { path = "vendor/object_store" }
+zstd = { path = "vendor/zstd" }
 
 # ── Dev profile: fast rebuilds, minimal artifacts ──────────────
 [profile.dev]

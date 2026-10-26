@@ -6,3 +6,10 @@
 #
 # Record why it does not apply (or what mitigates it) in the MR that adds it.
 # scripts/check-advisory-ignores.py fails when a review date passes.
+
+# vendor/zstd is zstd 0.14.3 relabeled 0.13.4. The advisories filed against
+# the zstd crate name do not apply to its code: 0391 is fixed in 0.14.3, and
+# 0392/0393 were fixed in 0.8.0 and 0.4.10.
+RUSTSEC-2026-0391  # review-by 2027-01-26 owner=sqe-maintainers
+RUSTSEC-2026-0392  # review-by 2027-01-26 owner=sqe-maintainers
+RUSTSEC-2026-0393  # review-by 2027-01-26 owner=sqe-maintainers
