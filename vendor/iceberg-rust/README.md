@@ -17,8 +17,10 @@ is vendored separately in `../datafusion-iceberg`.
 
 Geometry / geography is backported from apache ahead of the next re-vendor (sqe#863):
 `697abcee` (the types, part 1 of 3) and PR #3341 at `a7af50d5` (read as `LargeBinary`
-tagged `geoarrow.wkb`, part 2). Part 3, the writer, is still a draft upstream, so SQE
-refuses writes. A re-vendor past these commits drops the backport.
+tagged `geoarrow.wkb`, part 2). Part 3, the writer (PR #3342), is still a draft
+upstream; its `parquet_writer.rs` change is carried as `SQE PATCH (sqe#863)`: no byte-wise
+min/max for geospatial columns, and a geometry column's bounds taken from the parquet
+bounding box. A re-vendor past these commits drops the backport.
 
 ## Crates
 

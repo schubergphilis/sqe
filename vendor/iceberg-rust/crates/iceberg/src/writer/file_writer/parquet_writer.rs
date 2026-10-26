@@ -45,7 +45,7 @@ use crate::error::invalid_data;
 use crate::io::{FileIO, FileWrite, OutputFile};
 use crate::spec::{
     DataContentType, DataFileBuilder, DataFileFormat, Datum, ListType, Literal, MapType,
-    NestedFieldRef, PartitionSpec, PrimitiveType, Schema, SchemaRef, SchemaVisitor, Struct,
+    NestedFieldRef, PartitionSpec, PrimitiveLiteral, PrimitiveType, Schema, SchemaRef, SchemaVisitor, Struct,
     StructType, TableMetadata, TableProperties, Type, VariantType, visit_schema,
 };
 use crate::transform::create_transform_function;
@@ -669,6 +669,13 @@ impl MinMaxColAggregator {
             ));
         };
 
+        // SQE PATCH (sqe#863, from apache/iceberg-rust #3342): a geospatial
+        // bound is a bounding-box corner, not the smallest WKB value, so the
+        // ordered min/max never applies. `GeoBoundsAggregator` writes them.
+        if matches!(ty, PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) {
+            return Ok(());
+        }
+
         if value.min_is_exact() {
             let Some(min_datum) = get_parquet_stat_min_as_datum(&ty, value)? else {
                 return Err(Error::new(
@@ -697,6 +704,107 @@ impl MinMaxColAggregator {
     /// Returns lower and upper bounds
     fn produce(self) -> (HashMap<i32, Datum>, HashMap<i32, Datum>) {
         (self.lower_bounds, self.upper_bounds)
+    }
+}
+
+/// SQE PATCH (sqe#863): bounds of a geometry column, the union of the
+/// bounding boxes parquet records per column chunk. The spec stores the
+/// lower bound as the point (xmin, ymin[, zmin][, mmin]) and the upper bound
+/// as (xmax, ymax[, zmax][, mmax]), each coordinate a little-endian double;
+/// when m is present without z, z is NaN.
+///
+/// Bounds are optional, and a bound that is too tight makes readers skip
+/// files that match, so any doubt drops them: a chunk holding values but no
+/// bounding box, or a non-finite x/y, leaves the column without bounds. A
+/// z or m range is kept only when every chunk has one. Geography gets no
+/// bounds: parquet does not compute its bounding box, and one that crosses
+/// the antimeridian would need xmin > xmax.
+#[derive(Default)]
+struct GeoBoundsAggregator {
+    /// `None` once the column cannot have bounds.
+    boxes: HashMap<i32, Option<GeoBox>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GeoBox {
+    x: (f64, f64),
+    y: (f64, f64),
+    z: Option<(f64, f64)>,
+    m: Option<(f64, f64)>,
+}
+
+impl GeoBox {
+    fn from_parquet(bbox: &parquet::geospatial::bounding_box::BoundingBox) -> Option<Self> {
+        let range = |lo: f64, hi: f64| (lo.is_finite() && hi.is_finite() && lo <= hi).then_some((lo, hi));
+        let optional = |lo: Option<f64>, hi: Option<f64>| match (lo, hi) {
+            (Some(lo), Some(hi)) => range(lo, hi),
+            _ => None,
+        };
+        Some(Self {
+            x: range(bbox.get_xmin(), bbox.get_xmax())?,
+            y: range(bbox.get_ymin(), bbox.get_ymax())?,
+            z: optional(bbox.get_zmin(), bbox.get_zmax()),
+            m: optional(bbox.get_mmin(), bbox.get_mmax()),
+        })
+    }
+
+    fn union(self, other: Self) -> Self {
+        let both = |a: (f64, f64), b: (f64, f64)| (a.0.min(b.0), a.1.max(b.1));
+        Self {
+            x: both(self.x, other.x),
+            y: both(self.y, other.y),
+            z: self.z.zip(other.z).map(|(a, b)| both(a, b)),
+            m: self.m.zip(other.m).map(|(a, b)| both(a, b)),
+        }
+    }
+
+    /// The spec's point serialization of one corner.
+    fn corner(&self, pick: impl Fn((f64, f64)) -> f64) -> Vec<u8> {
+        let mut coords = vec![pick(self.x), pick(self.y)];
+        match (self.z, self.m) {
+            (Some(z), Some(m)) => coords.extend([pick(z), pick(m)]),
+            (Some(z), None) => coords.push(pick(z)),
+            (None, Some(m)) => coords.extend([f64::NAN, pick(m)]),
+            (None, None) => {}
+        }
+        coords.iter().flat_map(|c| c.to_le_bytes()).collect()
+    }
+}
+
+impl GeoBoundsAggregator {
+    fn update(
+        &mut self,
+        field_id: i32,
+        chunk: &parquet::file::metadata::ColumnChunkMetaData,
+    ) {
+        let null_count = chunk.statistics().and_then(|s| s.null_count_opt());
+        if null_count == Some(chunk.num_values() as u64) {
+            // Only nulls: nothing to bound.
+            return;
+        }
+        let chunk_box = chunk
+            .geo_statistics()
+            .and_then(|s| s.bounding_box())
+            .and_then(GeoBox::from_parquet);
+        let entry = self.boxes.entry(field_id).or_insert(chunk_box);
+        *entry = entry.zip(chunk_box).map(|(a, b)| a.union(b));
+    }
+
+    fn produce(self, schema: &Schema) -> (HashMap<i32, Datum>, HashMap<i32, Datum>) {
+        let mut lower = HashMap::new();
+        let mut upper = HashMap::new();
+        for (field_id, geo_box) in self.boxes {
+            let (Some(geo_box), Some(field)) = (geo_box, schema.field_by_id(field_id)) else {
+                continue;
+            };
+            let Type::Primitive(ty @ PrimitiveType::Geometry(_)) = field.field_type.as_ref() else {
+                continue;
+            };
+            let bound = |bytes| Datum::new(ty.clone(), PrimitiveLiteral::Binary(bytes));
+            lower.insert(field_id, bound(geo_box.corner(|r| r.0)));
+            upper.insert(field_id, bound(geo_box.corner(|r| r.1)));
+        }
+        (lower, upper)
     }
 }
 
@@ -758,7 +866,13 @@ impl ParquetWriter {
             let mut per_col_size: HashMap<i32, u64> = HashMap::new();
             let mut per_col_val_num: HashMap<i32, u64> = HashMap::new();
             let mut per_col_null_val_num: HashMap<i32, u64> = HashMap::new();
-            let mut min_max_agg = MinMaxColAggregator::new(schema);
+            let mut min_max_agg = MinMaxColAggregator::new(schema.clone());
+            let mut geo_agg = GeoBoundsAggregator::default();
+            let is_geometry = |field_id| {
+                schema.field_by_id(field_id).is_some_and(|f| {
+                    matches!(*f.field_type, Type::Primitive(PrimitiveType::Geometry(_)))
+                })
+            };
 
             for row_group in metadata.row_groups() {
                 for column_chunk_metadata in row_group.columns() {
@@ -824,13 +938,21 @@ impl ParquetWriter {
 
                         min_max_agg.update(field_id, statistics)?;
                     }
+
+                    if is_geometry(field_id) {
+                        geo_agg.update(field_id, column_chunk_metadata);
+                    }
                 }
             }
+            let (mut lower_bounds, mut upper_bounds) = min_max_agg.produce();
+            let (geo_lower, geo_upper) = geo_agg.produce(&schema);
+            lower_bounds.extend(geo_lower);
+            upper_bounds.extend(geo_upper);
             (
                 per_col_size,
                 per_col_val_num,
                 per_col_null_val_num,
-                min_max_agg.produce(),
+                (lower_bounds, upper_bounds),
             )
         };
 
@@ -3429,6 +3551,137 @@ mod tests {
                 Some(&parquet::basic::LogicalType::Uuid)
             )
         );
+    }
+
+    // SQE PATCH (sqe#863): geometry columns get bounding-box bounds, unioned
+    // over row groups; geography and all-null columns get none.
+    #[tokio::test]
+    async fn test_parquet_writer_geospatial_bounds() -> Result<()> {
+        use parquet_geospatial::testing::{wkb_point_xy, wkb_point_xyzm};
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
+        let geometry = || Type::Primitive(PrimitiveType::Geometry(GeometryType::default()));
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "g", geometry()).into(),
+                    NestedField::optional(2, "g_zm", geometry()).into(),
+                    NestedField::optional(
+                        3,
+                        "h",
+                        Type::Primitive(PrimitiveType::Geography(GeographyType::default())),
+                    )
+                    .into(),
+                    NestedField::optional(4, "g_null", geometry()).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema: ArrowSchemaRef = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        let column = |values: Vec<Option<Vec<u8>>>| {
+            Arc::new(arrow_array::LargeBinaryArray::from_iter(values)) as ArrayRef
+        };
+        let g = [(1.0, 2.0), (5.0, -3.0), (-4.0, 10.0), (0.0, 0.0)];
+        let batch = RecordBatch::try_new(arrow_schema, vec![
+            column(g.iter().map(|&(x, y)| Some(wkb_point_xy(x, y))).collect()),
+            column(vec![
+                Some(wkb_point_xyzm(1.0, 1.0, 7.0, 100.0)),
+                None,
+                Some(wkb_point_xyzm(2.0, 3.0, -7.0, 50.0)),
+                None,
+            ]),
+            column(g.iter().map(|&(x, y)| Some(wkb_point_xy(x, y))).collect()),
+            column(vec![None; 4]),
+        ])
+        .unwrap();
+
+        // Two rows per row group, so the bounds are a union of two boxes.
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2))
+            .build();
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+        let mut pw = ParquetWriterBuilder::new(props, schema.clone())
+            .build(output_file)
+            .await?;
+        pw.write(&batch).await?;
+        let data_file = pw
+            .close()
+            .await?
+            .into_iter()
+            .next()
+            .unwrap()
+            .content(DataContentType::Data)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .build()
+            .unwrap();
+
+        let point = |coords: &[f64]| -> Vec<u8> {
+            coords.iter().flat_map(|c| c.to_le_bytes()).collect()
+        };
+        let bound = |bounds: &HashMap<i32, Datum>, id: i32| match bounds.get(&id).map(|d| d.literal()) {
+            Some(PrimitiveLiteral::Binary(bytes)) => Some(bytes.clone()),
+            other => {
+                assert!(other.is_none(), "field {id}: {other:?}");
+                None
+            }
+        };
+        assert_eq!(bound(data_file.lower_bounds(), 1), Some(point(&[-4.0, -3.0])));
+        assert_eq!(bound(data_file.upper_bounds(), 1), Some(point(&[5.0, 10.0])));
+        assert_eq!(bound(data_file.lower_bounds(), 2), Some(point(&[1.0, 1.0, -7.0, 50.0])));
+        assert_eq!(bound(data_file.upper_bounds(), 2), Some(point(&[2.0, 3.0, 7.0, 100.0])));
+        for id in [3, 4] {
+            assert_eq!(bound(data_file.lower_bounds(), id), None, "field {id}");
+            assert_eq!(bound(data_file.upper_bounds(), id), None, "field {id}");
+        }
+        assert_eq!(data_file.null_value_counts()[&4], 4);
+        Ok(())
+    }
+
+    #[test]
+    fn test_geo_box_corners() {
+        let point = |coords: &[f64]| -> Vec<u8> {
+            coords.iter().flat_map(|c| c.to_le_bytes()).collect()
+        };
+        let xy = GeoBox {
+            x: (0.0, 1.0),
+            y: (2.0, 3.0),
+            z: None,
+            m: None,
+        };
+        let with_z = GeoBox {
+            z: Some((4.0, 5.0)),
+            ..xy
+        };
+        let with_m = GeoBox {
+            m: Some((6.0, 7.0)),
+            ..xy
+        };
+        assert_eq!(xy.corner(|r| r.0), point(&[0.0, 2.0]));
+        assert_eq!(with_z.corner(|r| r.1), point(&[1.0, 3.0, 5.0]));
+        // m without z: z is NaN.
+        let lower = with_m.corner(|r| r.0);
+        assert_eq!(lower.len(), 32);
+        assert!(f64::from_le_bytes(lower[16..24].try_into().unwrap()).is_nan());
+        assert_eq!(f64::from_le_bytes(lower[24..32].try_into().unwrap()), 6.0);
+        // A z range survives only when both sides have one.
+        let wider = GeoBox {
+            x: (-1.0, 0.5),
+            ..with_z
+        };
+        assert_eq!(xy.union(wider), GeoBox {
+            x: (-1.0, 1.0),
+            ..xy
+        });
+        assert_eq!(with_z.union(wider).z, Some((4.0, 5.0)));
     }
 
     #[test]
