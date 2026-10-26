@@ -5796,6 +5796,9 @@ impl QueryHandler {
             Err(_) => None,
         };
         if let Some(table) = props_table {
+            if let Some(partitioned_by) = render_partitioned_by(table.metadata()) {
+                ddl.push_str(&partitioned_by);
+            }
             let props = table.metadata().properties();
             // Iceberg-internal property keys we never want to surface.
             const SUPPRESSED_PREFIXES: &[&str] = &[
@@ -8930,10 +8933,43 @@ fn parse_timestamp_str(s: &str) -> sqe_core::Result<i64> {
             return Ok(dt.and_utc().timestamp_millis());
         }
     }
-    Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-        "Cannot parse time travel timestamp '{s}'. \
+    Err(SqeError::with_code(
+        SqeErrorCode::ExecutionFailed,
+        format!(
+            "Cannot parse time travel timestamp '{s}'. \
          Use format 'YYYY-MM-DD HH:MM:SS', 'YYYY-MM-DD', or epoch milliseconds."
-    )))
+        ),
+    ))
+}
+
+/// `PARTITIONED BY (...)` for the table's default partition spec, in the
+/// transform syntax CREATE TABLE takes back (`region`, `month(ts)`,
+/// `bucket(16, id)`). `None` for an unpartitioned table. A field whose
+/// source column or transform SQE cannot name drops the whole clause:
+/// a partial spec would round-trip as a different table.
+fn render_partitioned_by(metadata: &iceberg::spec::TableMetadata) -> Option<String> {
+    use iceberg::spec::Transform;
+    let spec = metadata.default_partition_spec();
+    if spec.fields().is_empty() {
+        return None;
+    }
+    let schema = metadata.current_schema();
+    let mut parts = Vec::with_capacity(spec.fields().len());
+    for field in spec.fields() {
+        let col = sqe_sql::quote_ident_if_needed(schema.name_by_field_id(field.source_id)?, '"');
+        parts.push(match field.transform {
+            Transform::Identity => col,
+            Transform::Year => format!("year({col})"),
+            Transform::Month => format!("month({col})"),
+            Transform::Day => format!("day({col})"),
+            Transform::Hour => format!("hour({col})"),
+            Transform::Bucket(n) => format!("bucket({n}, {col})"),
+            Transform::Truncate(w) => format!("truncate({w}, {col})"),
+            Transform::Void => format!("void({col})"),
+            Transform::Unknown => return None,
+        });
+    }
+    Some(format!("\nPARTITIONED BY ({})", parts.join(", ")))
 }
 
 /// Find the latest Iceberg snapshot with `timestamp_ms <= target_ms`.
@@ -11633,6 +11669,58 @@ mod tests {
             ])
             .build()
             .unwrap()
+    }
+
+    fn metadata_partitioned_by(
+        fields: &[(i32, &str, iceberg::spec::Transform)],
+    ) -> iceberg::spec::TableMetadata {
+        use iceberg::spec::{
+            FormatVersion, NestedField, PrimitiveType, SortOrder, TableMetadataBuilder, Type,
+            UnboundPartitionSpec,
+        };
+        let schema = iceberg::spec::Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "region", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(3, "ts", Type::Primitive(PrimitiveType::Timestamp)).into(),
+                NestedField::required(4, "Odd Col", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+        let mut spec = UnboundPartitionSpec::builder();
+        for (source_id, name, transform) in fields {
+            spec = spec
+                .add_partition_field(*source_id, *name, *transform)
+                .unwrap();
+        }
+        TableMetadataBuilder::new(
+            schema,
+            spec.build(),
+            SortOrder::unsorted_order(),
+            "memory://t".to_string(),
+            FormatVersion::V2,
+            Default::default(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata
+    }
+
+    #[test]
+    fn show_create_table_renders_the_partition_spec() {
+        use iceberg::spec::Transform;
+        assert_eq!(render_partitioned_by(&metadata_partitioned_by(&[])), None);
+        let metadata = metadata_partitioned_by(&[
+            (2, "region", Transform::Identity),
+            (3, "ts_month", Transform::Month),
+            (1, "id_bucket", Transform::Bucket(16)),
+            (4, "odd_trunc", Transform::Truncate(4)),
+        ]);
+        assert_eq!(
+            render_partitioned_by(&metadata).as_deref(),
+            Some("\nPARTITIONED BY (region, month(ts), bucket(16, id), truncate(4, \"Odd Col\"))")
+        );
     }
 
     #[test]
