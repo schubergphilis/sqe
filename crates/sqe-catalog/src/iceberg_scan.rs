@@ -2558,6 +2558,20 @@ fn is_binary_width_change(
     )
 }
 
+/// A file another engine wrote carries no Arrow schema, so the parquet reader
+/// labels a UTC-adjusted timestamp `"UTC"` where the table schema says
+/// `"+00:00"`. Both hold UTC instants, so the cast only relabels.
+fn is_timezone_relabel(
+    file: &arrow::datatypes::DataType,
+    table: &arrow::datatypes::DataType,
+) -> bool {
+    use arrow::datatypes::DataType as D;
+    matches!(
+        (file, table),
+        (D::Timestamp(u, Some(_)), D::Timestamp(u2, Some(_))) if u == u2
+    )
+}
+
 fn conform_batch_to_projection(
     decoded: &RecordBatch,
     resolved: &[Option<usize>],
@@ -2644,6 +2658,7 @@ fn conform_batch_to_projection(
                 // the old type; widen it to the promoted one (#859).
                 if is_type_promotion(column.data_type(), field.data_type())
                     || is_binary_width_change(column.data_type(), field.data_type())
+                    || is_timezone_relabel(column.data_type(), field.data_type())
                 {
                     let widened = arrow::compute::cast(column, field.data_type()).map_err(|e| {
                         DataFusionError::Internal(format!(
@@ -4234,6 +4249,32 @@ mod projection_evolution_tests {
             .downcast_ref::<LargeBinaryArray>()
             .unwrap();
         assert_eq!(col.value(0), &[1, 2]);
+        assert!(col.is_null(1));
+    }
+
+    /// Databricks and Spark write no Arrow schema, so a timestamptz column
+    /// decodes labelled `"UTC"`; the table schema says `"+00:00"`.
+    #[test]
+    fn a_utc_timestamp_relabels_to_the_declared_offset() {
+        use arrow::array::{Array, AsArray, TimestampMicrosecondArray};
+        use arrow::datatypes::{TimeUnit, TimestampMicrosecondType};
+        let declared = DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into()));
+        let target = Arc::new(Schema::new(vec![Field::new("ts", declared, true)]));
+        let decoded = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            )])),
+            vec![Arc::new(
+                TimestampMicrosecondArray::from(vec![Some(1_000_000), None]).with_timezone("UTC"),
+            )],
+        )
+        .unwrap();
+        let out = conform_batch_to_projection(&decoded, &[Some(0)], &target, &[]).expect("conform");
+        assert_eq!(out.schema(), target);
+        let col = out.column(0).as_primitive::<TimestampMicrosecondType>();
+        assert_eq!(col.value(0), 1_000_000);
         assert!(col.is_null(1));
     }
 
