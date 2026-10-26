@@ -26,7 +26,7 @@ use datafusion::error::Result;
 use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
-use futures::future::try_join_all;
+use futures::future::join_all;
 use iceberg::arrow::arrow_schema_to_schema_auto_assign_ids;
 use iceberg::inspect::MetadataTableType;
 use iceberg::spec::FormatVersion;
@@ -74,7 +74,11 @@ impl IcebergSchemaProvider {
             .map(|tbl| tbl.name().to_string())
             .collect();
 
-        let providers = try_join_all(
+        // SQE patch: a table that fails to load is skipped, not fatal. A
+        // Unity Catalog namespace lists its Delta tables too, and loading one
+        // answers 400 "not an Iceberg compatible table"; one such table must
+        // not fail the whole catalog.
+        let providers = join_all(
             table_names
                 .iter()
                 .map(|name| {
@@ -82,11 +86,21 @@ impl IcebergSchemaProvider {
                 })
                 .collect::<Vec<_>>(),
         )
-        .await?;
+        .await;
 
         let tables = Arc::new(DashMap::new());
         for (name, provider) in table_names.into_iter().zip(providers) {
-            tables.insert(name, Arc::new(provider));
+            match provider {
+                Ok(provider) => {
+                    tables.insert(name, Arc::new(provider));
+                }
+                Err(e) => tracing::warn!(
+                    namespace = %namespace,
+                    table = %name,
+                    error = %e,
+                    "skipping a table that does not load as Iceberg"
+                ),
+            }
         }
 
         Ok(IcebergSchemaProvider {

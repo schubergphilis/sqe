@@ -2,7 +2,12 @@
 
 apache/datafusion-iceberg @ `b12e9871` (2026-09-24), vendored unmodified apart from
 the `iceberg` / `iceberg-catalog-rest` paths in `Cargo.toml`, which point at
-`../iceberg-rust`. Only `crates/datafusion` is vendored.
+`../iceberg-rust`, and one SQE patch. Only `crates/datafusion` is vendored.
+
+SQE patch: `IcebergSchemaProvider::try_new` (`src/schema.rs`) skips a table that
+fails to load, with a `tracing` warning, where upstream fails the whole catalog. A
+Unity Catalog namespace lists its Delta tables too, and each answers 400 "not an
+Iceberg compatible table". Carry the patch over on a re-vendor.
 
 This is the DataFusion integration that apache moved out of iceberg-rust on
 2026-09-17. It is not published to crates.io (the crates.io `datafusion-iceberg` is an

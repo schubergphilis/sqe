@@ -36,6 +36,7 @@ futures = "0.3"
 iceberg = { workspace = true }
 parquet = "59.2"
 tokio = { workspace = true }
+tracing = { workspace = true }
 uuid = { version = "1.18", features = ["v7"] }
 
 [dev-dependencies]
