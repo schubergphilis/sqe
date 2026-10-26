@@ -9,6 +9,7 @@ members = [
     "crates/sqe-policy",
     "crates/sqe-planner",
     "crates/sqe-trino-functions",
+    "crates/sqe-geo",
     "crates/sqe-write",
     "crates/sqe-coordinator",
     "crates/sqe-server",
@@ -84,6 +85,14 @@ parquet-variant-json = "59"
 # WKB parsing for Iceberg V3 geospatial writes. Already in the graph via
 # parquet's `geospatial` feature, which iceberg-rust enables.
 parquet-geospatial = "59"
+# Planar geometry for the ST_* functions (sqe-geo). `wkb` and `geo-traits`
+# are already in the graph via parquet-geospatial. `geo` without its default
+# features: no triangulation (earcut, spade) and no rayon threads.
+geo = { version = "0.33", default-features = false }
+geo-traits = "0.3"
+geo-types = "0.7"
+wkb = "0.9"
+wkt = "0.14"
 object_store = { version = "0.13", features = ["aws", "http", "azure", "gcp"] }
 
 # Iceberg — apache/iceberg-rust main @ 119fad92c, with RisingWave

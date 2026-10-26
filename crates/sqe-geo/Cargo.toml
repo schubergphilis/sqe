@@ -1,0 +1,27 @@
+[package]
+name = "sqe-geo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+description = "ST_* scalar functions over WKB geometry columns (Iceberg V3 GEOMETRY / GEOGRAPHY)"
+
+# Its own crate so the geometry algorithms (and `geo`'s dependency tree) do
+# not recompile with the coordinator, and so the worker can register the
+# same functions to decode a pushed-down predicate without linking the
+# coordinator.
+
+[dependencies]
+arrow = { workspace = true }
+datafusion = { workspace = true }
+geo = { workspace = true }
+geo-traits = { workspace = true }
+geo-types = { workspace = true }
+serde_json = { workspace = true }
+wkb = { workspace = true }
+wkt = { workspace = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -58,6 +58,7 @@ futures-io = { version = "0.3" }
 futures-sink = { version = "0.3" }
 futures-task = { version = "0.3" }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
+geo-types = { version = "0.7", features = ["rstar_0_12"] }
 getrandom = { version = "0.3", default-features = false, features = ["std", "wasm_js"] }
 hashbrown-582f2526e08bb6a0 = { package = "hashbrown", version = "0.14", default-features = false, features = ["raw"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }

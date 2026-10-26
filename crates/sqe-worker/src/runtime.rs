@@ -78,7 +78,13 @@ pub fn build_session_context_with_pool(
         "Configured DataFusion sort spill reservation (merge headroom)"
     );
 
-    Ok(SessionContext::new_with_config_rt(session_config, runtime))
+    let ctx = SessionContext::new_with_config_rt(session_config, runtime);
+    // The functions a pushed-down predicate may call beyond DataFusion's
+    // built-ins. Keep in step with `scan_pushdown::worker_task_ctx` on the
+    // coordinator, which drops a conjunct this list cannot decode. Not the
+    // variant functions: a variant prune rides its own ticket field.
+    sqe_geo::register_geo_functions(&ctx);
+    Ok(ctx)
 }
 
 #[cfg(test)]
