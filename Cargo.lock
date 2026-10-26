@@ -6847,6 +6847,7 @@ dependencies = [
  "hmac",
  "iceberg",
  "parquet",
+ "parquet-geospatial",
  "serde",
  "serde_json",
  "sha2 0.11.1",
