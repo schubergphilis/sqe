@@ -25,7 +25,8 @@ use crate::ident::{
 };
 use crate::write_handler::{
     arrow_column_to_iceberg_type, default_to_iceberg_literal as alter_default_to_iceberg_literal,
-    parse_partition_transform_sql, sql_type_to_arrow, sql_type_to_arrow_for,
+    geospatial_iceberg_type, parse_partition_transform_sql, sql_type_to_arrow,
+    sql_type_to_arrow_for,
 };
 
 /// Per-table async lock used to serialize read-merge-commit sequences (see
@@ -677,10 +678,23 @@ impl CatalogOps {
                             metadata.format_version()
                         )));
                     }
+                    let geo = geospatial_iceberg_type(&column_def.data_type).transpose()?;
+                    if !v3 && geo.is_some() {
+                        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
+                            "Cannot add {} column '{}': table '{table_ident}' is Iceberg format {}, \
+                             and geospatial types need format v3",
+                            column_def.data_type,
+                            column_def.name.value,
+                            metadata.format_version()
+                        )));
+                    }
                     // Nested fields (struct, array, map) take the ids after
                     // the column's own.
                     let column_id = max_field_id + 1;
-                    let iceberg_type = if is_variant {
+                    let iceberg_type = if let Some(geo) = geo {
+                        max_field_id = column_id;
+                        geo
+                    } else if is_variant {
                         max_field_id = column_id;
                         iceberg::spec::Type::Variant(iceberg::spec::VariantType)
                     } else {

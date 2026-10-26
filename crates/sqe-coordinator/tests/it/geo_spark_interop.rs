@@ -1,7 +1,8 @@
 //! Iceberg V3 geospatial columns across engines (#863): Spark 4.1 with
 //! Iceberg 1.12 (`spark.sql.geospatial.enabled`) writes GEOMETRY and
 //! GEOGRAPHY columns; SQE reads them back as WKB bytes, writes into the table
-//! with geometry bounds, and compacts it. Needs the integration stack and the Spark container
+//! with geometry bounds, and compacts it. SQE creates a geospatial table that
+//! Spark reads. Needs the integration stack and the Spark container
 //! (`./scripts/start-spark-interop.sh`); without the container the test skips
 //! with the reason.
 
@@ -130,18 +131,6 @@ async fn sqe_reads_a_spark_geospatial_table() {
     let compacted_bounds = file_bounds(&handler, &session).await;
     let compacted_read = spark_geo_rows(fq);
     let _ = spark_sql(&format!("DROP TABLE IF EXISTS rest.{fq}"));
-    // SQE has no GEOMETRY / GEOGRAPHY DDL yet: declaring one is an error,
-    // never a silently different column type.
-    let ddl = handler
-        .execute(
-            &session,
-            "CREATE TABLE default.geo_from_sqe (id INT, g GEOMETRY)",
-            None,
-        )
-        .await;
-    let _ = handler
-        .execute(&session, "DROP TABLE IF EXISTS default.geo_from_sqe", None)
-        .await;
 
     assert_eq!(
         read,
@@ -157,13 +146,6 @@ async fn sqe_reads_a_spark_geospatial_table() {
         "filter on geospatial columns"
     );
     assert_eq!(joined, vec!["1".to_string()], "join on a geospatial column");
-    let ddl_err = ddl.expect_err("CREATE TABLE with a GEOMETRY column is refused");
-    assert!(
-        ddl_err
-            .to_string()
-            .contains("not supported for CREATE TABLE: GEOMETRY"),
-        "unexpected error: {ddl_err}"
-    );
     insert.expect("SQE inserts WKB into the geospatial columns");
     let sqe_file = sqe_file_bounds
         .iter()
@@ -209,6 +191,109 @@ async fn sqe_reads_a_spark_geospatial_table() {
         compacted_read, expected_spark,
         "Spark reads the compacted file"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn spark_reads_an_sqe_geospatial_table() {
+    if let Some(reason) = spark_stack_skip_reason() {
+        eprintln!("skipping spark_reads_an_sqe_geospatial_table: {reason}");
+        return;
+    }
+    let (session, handler) = crate::common::setup_handler().await;
+    let run = |sql: String| {
+        let (handler, session) = (&handler, &session);
+        async move { handler.execute(session, &sql, None).await }
+    };
+    for t in ["geo_from_sqe", "geo_from_sqe_ctas", "geo_from_sqe_v2"] {
+        let _ = run(format!("DROP TABLE IF EXISTS default.{t}")).await;
+    }
+
+    // SRID 4326 is Iceberg's default CRS; other SRIDs are EPSG codes. The
+    // table becomes format v3 without asking.
+    let create = run("CREATE TABLE default.geo_from_sqe \
+         (id INT, g GEOMETRY(4326), m GEOMETRY(3857), h GEOGRAPHY(4326))"
+        .to_string())
+    .await;
+    let insert = run(format!(
+        "INSERT INTO default.geo_from_sqe VALUES (1, X'{POINT_1_2}', X'{POINT_5_6}', X'{POINT_1_2}')"
+    ))
+    .await;
+    let add = run("ALTER TABLE default.geo_from_sqe ADD COLUMN k GEOGRAPHY".to_string()).await;
+    let described = spark_sql(
+        "SET spark.sql.geospatial.enabled = true; DESCRIBE TABLE rest.default.geo_from_sqe;",
+    )
+    .expect("spark describes the SQE table");
+    let spark_read = spark_sql(
+        "SET spark.sql.geospatial.enabled = true;
+         SELECT id, hex(ST_AsBinary(g)), hex(ST_AsBinary(m)), hex(ST_AsBinary(h)), k
+         FROM rest.default.geo_from_sqe ORDER BY id;",
+    )
+    .expect("spark reads the SQE table");
+
+    // A geospatial column of a v2 table is refused, also through ALTER.
+    let v2 = run("CREATE TABLE default.geo_from_sqe_v2 (id INT, g GEOMETRY) \
+         WITH ('format-version' = '2')"
+        .to_string())
+    .await;
+    let v2_create = "CREATE TABLE default.geo_from_sqe_v2 (id INT) WITH ('format-version' = '2')";
+    let _ = run(v2_create.to_string()).await;
+    let v2_add = run("ALTER TABLE default.geo_from_sqe_v2 ADD COLUMN g GEOMETRY".to_string()).await;
+    // CTAS keeps the geospatial types: the scan tags the columns as WKB.
+    let ctas = run(
+        "CREATE TABLE default.geo_from_sqe_ctas AS SELECT id, g, h FROM default.geo_from_sqe"
+            .to_string(),
+    )
+    .await;
+    let ctas_types = spark_sql(
+        "SET spark.sql.geospatial.enabled = true; DESCRIBE TABLE rest.default.geo_from_sqe_ctas;",
+    );
+    for t in ["geo_from_sqe", "geo_from_sqe_ctas", "geo_from_sqe_v2"] {
+        let _ = run(format!("DROP TABLE IF EXISTS default.{t}")).await;
+    }
+
+    create.expect("CREATE TABLE with geospatial columns");
+    insert.expect("INSERT into the SQE geospatial table");
+    add.expect("ALTER TABLE ADD COLUMN GEOGRAPHY");
+    assert_spark_types(
+        &described,
+        &[
+            ("g", "geometry(4326)"),
+            ("m", "geometry(3857)"),
+            ("h", "geography(4326)"),
+            ("k", "geography(4326)"),
+        ],
+    );
+    let rows: Vec<&str> = spark_read
+        .lines()
+        .filter(|l| l.starts_with(|c: char| c.is_ascii_digit()))
+        .collect();
+    let point_5_6 = POINT_5_6.to_uppercase();
+    let expected = format!("1\t{POINT_1_2_UPPER}\t{point_5_6}\t{POINT_1_2_UPPER}\tNULL");
+    assert_eq!(rows, [expected], "Spark reads SQE's geospatial table");
+    let v2_err = v2.expect_err("a v2 table with a GEOMETRY column is refused");
+    assert!(v2_err.to_string().contains("needs format v3"), "{v2_err}");
+    let v2_add_err = v2_add.expect_err("ADD COLUMN GEOMETRY on a v2 table is refused");
+    let v2_add_err = v2_add_err.to_string();
+    assert!(v2_add_err.contains("types need format v3"), "{v2_add_err}");
+    ctas.expect("CTAS from the geospatial table");
+    let ctas_types = ctas_types.expect("spark describes the CTAS table");
+    assert_spark_types(
+        &ctas_types,
+        &[("g", "geometry(4326)"), ("h", "geography(4326)")],
+    );
+}
+
+/// Assert each `(column, type)` is a row of Spark's `DESCRIBE TABLE` output.
+fn assert_spark_types(described: &str, expected: &[(&str, &str)]) {
+    for (name, ty) in expected {
+        assert!(
+            described
+                .lines()
+                .any(|l| l.split('\t').map(str::trim).eq([*name, *ty, ""])),
+            "Spark's type of {name} is not {ty}: {described}"
+        );
+    }
 }
 
 /// Per-file `(lower_bounds, upper_bounds)` of the test table, with the

@@ -58,12 +58,48 @@ pub fn is_variant_type(sql_type: &SqlType) -> bool {
             .is_some_and(|i| i.value.eq_ignore_ascii_case("VARIANT"))
 }
 
+/// The Iceberg type string of a `GEOMETRY` / `GEOGRAPHY` column type, e.g.
+/// `geometry(EPSG:3857)` or `geography(OGC:CRS84, spherical)`; `None` for
+/// any other type (#863).
+///
+/// The CRS is an SRID number or a quoted CRS string. SRIDs map as Spark
+/// writes them: 4326 is Iceberg's default `OGC:CRS84`, 0 is `SRID:0`, any
+/// other n is `EPSG:n`. A geography takes an optional second argument, the
+/// edge interpolation algorithm (default `spherical`). The caller parses the
+/// string as an Iceberg type, which rejects a bad CRS, algorithm or arity.
+pub fn geospatial_type(sql_type: &SqlType) -> Option<String> {
+    let SqlType::Custom(object_name, modifiers) = sql_type else {
+        return None;
+    };
+    if object_name.0.len() != 1 {
+        return None;
+    }
+    let name = object_name.0[0].as_ident()?.value.to_ascii_lowercase();
+    if name != "geometry" && name != "geography" {
+        return None;
+    }
+    let crs = |m: &String| match m.as_str() {
+        "4326" => "OGC:CRS84".to_string(),
+        "0" => "SRID:0".to_string(),
+        n if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => format!("EPSG:{n}"),
+        other => other.to_string(),
+    };
+    let mut params: Vec<String> = modifiers.iter().take(1).map(crs).collect();
+    params.extend(modifiers.iter().skip(1).cloned());
+    if params.is_empty() {
+        return Some(name);
+    }
+    Some(format!("{name}({})", params.join(", ")))
+}
+
 /// True when a sqlparser `DataType` triggers format-version 3.
 ///
-/// Nanosecond timestamps and `VARIANT` are V3-only. `Unknown` is handled at
-/// a different layer.
+/// Nanosecond timestamps, `VARIANT`, `GEOMETRY` and `GEOGRAPHY` are V3-only.
+/// `Unknown` is handled at a different layer.
 pub fn is_v3_only_type(sql_type: &SqlType) -> bool {
-    detect_ns_timestamp(sql_type).is_some() || is_variant_type(sql_type)
+    detect_ns_timestamp(sql_type).is_some()
+        || is_variant_type(sql_type)
+        || geospatial_type(sql_type).is_some()
 }
 
 /// Literal kinds we accept as column defaults.
@@ -292,6 +328,35 @@ mod tests {
             panic!("expected CreateTable");
         };
         assert!(is_v3_only_type(&ct.columns[0].data_type));
+    }
+
+    #[test]
+    fn geospatial_types_map_to_iceberg_type_strings() {
+        let cases = [
+            ("GEOMETRY", Some("geometry")),
+            ("geometry(4326)", Some("geometry(OGC:CRS84)")),
+            ("GEOMETRY(0)", Some("geometry(SRID:0)")),
+            ("GEOMETRY(3857)", Some("geometry(EPSG:3857)")),
+            ("GEOMETRY('EPSG:28992')", Some("geometry(EPSG:28992)")),
+            ("GEOGRAPHY", Some("geography")),
+            ("Geography(4326)", Some("geography(OGC:CRS84)")),
+            (
+                "GEOGRAPHY('OGC:CRS84', karney)",
+                Some("geography(OGC:CRS84, karney)"),
+            ),
+            ("BYTEA", None),
+            ("VARIANT", None),
+        ];
+        for (decl, want) in cases {
+            let stmt = parse_create(&format!("CREATE TABLE t (g {decl})"));
+            let sqlparser::ast::Statement::CreateTable(ct) = stmt else {
+                panic!("expected CreateTable");
+            };
+            let ty = &ct.columns[0].data_type;
+            assert_eq!(geospatial_type(ty).as_deref(), want, "{decl}");
+            let v3 = want.is_some() || decl == "VARIANT";
+            assert_eq!(is_v3_only_type(ty), v3, "{decl}");
+        }
     }
 
     #[test]
