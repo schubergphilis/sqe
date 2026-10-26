@@ -197,12 +197,13 @@ object and a later implementation, or another engine, can honour it.
 
 ## Iceberg V3 type system
 
-These types only exist in format-version 3, the default for new tables. A `TIMESTAMP_NS` or `VARIANT` column, or a `DEFAULT`, makes the table V3 even when the configured default is 2.
+These types only exist in format-version 3, the default for new tables. A `TIMESTAMP_NS`, `VARIANT`, `GEOMETRY` or `GEOGRAPHY` column, or a `DEFAULT`, makes the table V3 even when the configured default is 2.
 
 | Type | Notes |
 |---|---|
 | `TIMESTAMP_NS`, `TIMESTAMP_NS WITH TIME ZONE` | Nanosecond precision timestamps. Arrow `Timestamp(Nanosecond, ...)`. |
 | `VARIANT` | Semi-structured value (object, array, string, number, boolean, null) in the Iceberg variant binary encoding. See [VARIANT](#variant) below. |
+| `GEOMETRY[(crs)]`, `GEOGRAPHY[(crs[, algorithm])]` | Spatial values as WKB bytes. See [GEOMETRY and GEOGRAPHY](#geometry-and-geography) below. |
 | `UNKNOWN` (also `VOID`) | A column declared before its type is known. Holds only NULLs, is never written to data files, and is promoted later with `ALTER COLUMN ... SET DATA TYPE`. Also allowed as a struct member, including a struct inside a list; a member is promoted with `ALTER COLUMN s.u SET DATA TYPE`. An unknown list element or map key/value, or a struct whose members are all unknown, can be declared but no row can be written (Iceberg Java refuses the same). |
 | Default values via `DEFAULT expr` | Existing rows in older snapshots inherit the default at read time. |
 
@@ -223,6 +224,21 @@ INSERT INTO events VALUES (1, '{"user": "a", "tags": [1, 2]}'), (2, '"plain text
 - **Existing JSON columns are not converted.** Iceberg does not allow evolving a `string` column to `variant`, so a column that holds JSON text stays a string. To convert one, copy it into a table declared with a `VARIANT` column, where the write parses each value: `CREATE TABLE t2 (id BIGINT, doc VARIANT); INSERT INTO t2 SELECT id, doc FROM t1;`.
 - **Shredded variants.** A table with `WITH ('write.parquet.shred-variants' = 'true')` is written shredded, as Spark and Iceberg Java write it: each data file infers its shredding from its first batch. A column whose values are all objects stores every field that has one type in every row (integer, double, string, boolean or date, also inside nested objects; at most 64 fields) in its own Parquet column. A column whose values are all one of those types is stored as that type. Arrays, decimals, timestamps and fields of mixed type stay in the binary value, and a later row whose field has another type is written unshredded, so no value changes type. Only top-level variant columns are shredded. A variant another engine wrote shredded reads as the same JSON text as an unshredded one, on the coordinator and on workers. SQE unshreds on read, so a shredded field gives no pruning or typed access yet.
 - **Not yet:** nested variants (inside a `ROW` or `ARRAY`) on Flight SQL, which arrive as the raw storage struct.
+
+### GEOMETRY and GEOGRAPHY
+
+```sql
+CREATE TABLE places (id BIGINT, shape GEOMETRY(4326), area GEOGRAPHY);
+INSERT INTO places VALUES (1, X'0101000000000000000000F03F0000000000000040', NULL);
+ALTER TABLE places ADD COLUMN footprint GEOMETRY(3857);
+```
+
+- **The CRS.** The argument is an SRID or a quoted CRS string such as `'EPSG:28992'`. SRIDs map as Spark maps them: 4326 is Iceberg's default `OGC:CRS84`, 0 is `SRID:0`, and any other number n is `EPSG:n`. Without an argument the CRS is `OGC:CRS84`.
+- **The geography algorithm.** `GEOGRAPHY` takes the edge interpolation algorithm as a second argument: `spherical` (the default), `vincenty`, `thomas`, `andoyer` or `karney`. Spark's DDL takes no second argument.
+- **Values are WKB.** A write must give well-known binary; anything else fails the statement with the column and row. A read returns the WKB bytes.
+- **The table becomes format-version 3.** `ALTER TABLE ... ADD COLUMN` with a geospatial type is refused on a V2 table. CTAS from a geospatial table keeps the types.
+- **Top-level columns only.** A geospatial type inside a `STRUCT`, `ARRAY` or `MAP` is refused.
+- **Not yet:** `ST_*` functions, and pruning on the bounding box.
 
 ## What CREATE / ALTER does NOT cover
 
