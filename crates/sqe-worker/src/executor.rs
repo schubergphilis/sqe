@@ -364,9 +364,13 @@ async fn pre_admit(
 /// `Expr` bytes. Returns `None` when no predicate was pushed or when decoding
 /// fails. A decode failure is non-fatal: the worker simply ships every
 /// projected row and the coordinator's authoritative `FilterExec` filters them.
-fn decode_pushed_predicate(task: &ScanTask) -> Option<Expr> {
+///
+/// Function calls resolve against `session_ctx`. `Expr::from_bytes` decodes
+/// against an empty registry, so any call (`abs`, `ST_Intersects`) failed
+/// the decode and the whole predicate was dropped (#863).
+fn decode_pushed_predicate(task: &ScanTask, session_ctx: &SessionContext) -> Option<Expr> {
     let bytes = task.predicate_proto.as_ref()?;
-    match Expr::from_bytes(bytes) {
+    match Expr::from_bytes_with_ctx(bytes, &session_ctx.task_ctx()) {
         Ok(expr) => Some(expr),
         Err(e) => {
             warn!(
@@ -855,7 +859,7 @@ async fn scan_streaming_inner(
     let scan_budget = scan_budget.unwrap_or_else(|| default_scan_budget(&session_ctx));
 
     // Decode the coordinator's pushed-down predicate once (#233).
-    let predicate = decode_pushed_predicate(&task);
+    let predicate = decode_pushed_predicate(&task, &session_ctx);
     let row_limit = task.limit;
 
     let first_path = task.data_file_paths[0].clone();
@@ -2359,7 +2363,7 @@ mod tests {
     #[test]
     fn decode_pushed_predicate_none_when_absent() {
         let task = task_with_predicate(None, None);
-        assert!(decode_pushed_predicate(&task).is_none());
+        assert!(decode_pushed_predicate(&task, &SessionContext::new()).is_none());
     }
 
     #[test]
@@ -2367,7 +2371,36 @@ mod tests {
         let expr = col("a").gt(lit(5i64));
         let bytes = expr.to_bytes().unwrap().to_vec();
         let task = task_with_predicate(Some(bytes), None);
-        let decoded = decode_pushed_predicate(&task).expect("decode");
+        let decoded = decode_pushed_predicate(&task, &SessionContext::new()).expect("decode");
+        assert_eq!(decoded, expr);
+    }
+
+    /// A predicate that calls a function decodes against the worker's
+    /// session: a built-in and an `ST_*` function. Before #863 the decode
+    /// used an empty registry and dropped the whole predicate.
+    #[test]
+    fn decode_pushed_predicate_resolves_function_calls() {
+        use datafusion::execution::FunctionRegistry;
+        let config = sqe_core::config::WorkerConfig {
+            spill_to_disk: false,
+            ..Default::default()
+        };
+        let (ctx, _pool) = crate::runtime::build_session_context(&config).expect("session");
+        let st = ctx
+            .udf("st_intersects")
+            .expect("ST_Intersects registered on the worker");
+        let abs = ctx.udf("abs").expect("built-in");
+        let expr = abs
+            .call(vec![col("a")])
+            .gt(lit(5i64))
+            .and(st.call(vec![col("g"), col("g")]));
+        let bytes = expr.to_bytes().unwrap().to_vec();
+        assert!(
+            Expr::from_bytes(&bytes).is_err(),
+            "the empty registry fails"
+        );
+        let task = task_with_predicate(Some(bytes), None);
+        let decoded = decode_pushed_predicate(&task, &ctx).expect("decode");
         assert_eq!(decoded, expr);
     }
 
@@ -2376,7 +2409,7 @@ mod tests {
         // A corrupt predicate must not abort the scan: decode returns None and
         // the worker ships every row (coordinator filters authoritatively).
         let task = task_with_predicate(Some(vec![0xde, 0xad, 0xbe, 0xef]), None);
-        assert!(decode_pushed_predicate(&task).is_none());
+        assert!(decode_pushed_predicate(&task, &SessionContext::new()).is_none());
     }
 
     #[test]
