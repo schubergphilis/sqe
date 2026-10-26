@@ -21,6 +21,7 @@ arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
 iceberg = { workspace = true }
 parquet = { workspace = true }
+parquet-geospatial = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
