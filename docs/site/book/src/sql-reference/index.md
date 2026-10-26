@@ -45,6 +45,7 @@ The two registration entry points are `crates/sqe-coordinator/src/session_contex
 - [Date and time](./datetime.md): timestamp construction, extraction, formatting, parsing, arithmetic, time-zone handling.
 - [Array, map, struct](./array-map.md): the 40+ functions from `datafusion-functions-nested` plus Trino aggregate constructors (`map_agg`, `histogram`).
 - [JSON](./json.md): two layered surfaces: Trino-named (`json_extract`, `json_parse`) and the `datafusion-functions-json` `json_get_*` family.
+- [Geospatial](./geospatial.md): `ST_*` constructors, accessors, measures and predicates over WKB geometry.
 - [Encoding, hashing, URL](./encoding-url.md): base64, hex, `md5`, `sha224..512`, `url_extract_*`, `url_encode`, `url_decode`.
 
 ### Aggregate and window

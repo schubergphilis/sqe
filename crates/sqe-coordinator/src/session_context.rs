@@ -773,6 +773,8 @@ pub async fn create_session_context(
             sqe_core::variant_json_args::accept_variant_in_json_functions(&ctx);
             // Typed field access that skips the JSON text (#857).
             sqe_core::variant_get::register_variant_functions(&ctx);
+            // ST_* over WKB geometry values (#863).
+            sqe_geo::register_geo_functions(&ctx);
 
             // Register the read_parquet() table-valued function so users can
             // query external Parquet files directly from SQL:
@@ -1718,6 +1720,7 @@ allowed_object_store_prefixes = ["s3://shared-landing/"]
         datafusion_functions_json::register_all(&mut ctx).expect("register json udfs");
         sqe_core::variant_json_args::accept_variant_in_json_functions(&ctx);
         sqe_core::variant_get::register_variant_functions(&ctx);
+        sqe_geo::register_geo_functions(&ctx);
         // A function claiming a key another one holds can take it back when
         // a query's session is rebuilt for its memory quota.
         let shadowed = sqe_trino_functions::overrides::shadowed_keys(&ctx.state());

@@ -48,11 +48,23 @@ use datafusion_proto::bytes::Serializeable;
 /// reconstructs a single predicate. Serialization failures are non-fatal: the
 /// caller treats `None` as "ship every projected row" and relies on the
 /// coordinator's `FilterExec`.
+///
+/// A conjunct the worker cannot decode is left out: it calls a function the
+/// worker does not register (a Trino or JSON UDF). The worker drops a
+/// predicate it cannot decode as a whole, so one such call would cost every
+/// other conjunct. Leaving out an `AND` conjunct only widens the filter.
 pub fn serialize_scan_predicate(df_filters: &[datafusion::logical_expr::Expr]) -> Option<Vec<u8>> {
-    if df_filters.is_empty() {
-        return None;
-    }
-    let combined = df_filters.iter().cloned().reduce(|a, b| a.and(b))?;
+    let ctx = worker_task_ctx();
+    let combined = df_filters
+        .iter()
+        .flat_map(datafusion::logical_expr::utils::split_conjunction)
+        .filter(|e| {
+            e.to_bytes()
+                .and_then(|b| Expr::from_bytes_with_ctx(&b, ctx))
+                .is_ok()
+        })
+        .cloned()
+        .reduce(|a, b| a.and(b))?;
     match combined.to_bytes() {
         Ok(bytes) => Some(bytes.to_vec()),
         Err(e) => {
@@ -64,6 +76,19 @@ pub fn serialize_scan_predicate(df_filters: &[datafusion::logical_expr::Expr]) -
             None
         }
     }
+}
+
+/// The functions a worker decodes a pushed predicate against: DataFusion's
+/// built-ins plus what `sqe_worker::runtime::build_session_context`
+/// registers. Keep the two in step.
+fn worker_task_ctx() -> &'static datafusion::execution::TaskContext {
+    static CTX: std::sync::LazyLock<Arc<datafusion::execution::TaskContext>> =
+        std::sync::LazyLock::new(|| {
+            let ctx = datafusion::prelude::SessionContext::new();
+            sqe_geo::register_geo_functions(&ctx);
+            ctx.task_ctx()
+        });
+    &CTX
 }
 
 /// Returns `true` when the expression is a bare `true` literal — the state a
@@ -384,6 +409,25 @@ mod tests {
         let decoded = datafusion::logical_expr::Expr::from_bytes(&bytes).expect("decode");
         let expected = col("a").gt(lit(5i64)).and(col("b").lt(lit(10i64)));
         assert_eq!(decoded, expected);
+    }
+
+    /// A conjunct calling a function the worker lacks is left out; the
+    /// built-in and `ST_*` conjuncts still ship (#863).
+    #[test]
+    fn predicate_drops_only_the_conjunct_a_worker_cannot_decode() {
+        use datafusion::execution::FunctionRegistry;
+        let ctx = datafusion::prelude::SessionContext::new();
+        sqe_trino_functions::register_trino_functions(&ctx);
+        sqe_geo::register_geo_functions(&ctx);
+        let call = |name: &str, args| ctx.udf(name).unwrap().call(args);
+        let builtin = call("abs", vec![col("a")]).gt(lit(5i64));
+        let geo = call("st_intersects", vec![col("g"), col("g")]);
+        let trino = call("year", vec![col("d")]).eq(lit(2026i64));
+        let filters = vec![builtin.clone().and(trino.clone()), geo.clone()];
+        let bytes = serialize_scan_predicate(&filters).unwrap();
+        let decoded = Expr::from_bytes_with_ctx(&bytes, worker_task_ctx()).expect("decode");
+        assert_eq!(decoded, builtin.and(geo));
+        assert!(serialize_scan_predicate(&[trino]).is_none());
     }
 
     #[test]

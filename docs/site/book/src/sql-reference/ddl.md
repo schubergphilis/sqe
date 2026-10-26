@@ -238,7 +238,8 @@ ALTER TABLE places ADD COLUMN footprint GEOMETRY(3857);
 - **Values are WKB.** A write must give well-known binary; anything else fails the statement with the column and row. A read returns the WKB bytes.
 - **The table becomes format-version 3.** `ALTER TABLE ... ADD COLUMN` with a geospatial type is refused on a V2 table. CTAS from a geospatial table keeps the types.
 - **Top-level columns only.** A geospatial type inside a `STRUCT`, `ARRAY` or `MAP` is refused.
-- **Not yet:** `ST_*` functions, and pruning on the bounding box.
+- **Functions.** The `ST_*` functions read and build these values; see [Geospatial](./geospatial.md).
+- **Not yet:** pruning on the bounding box.
 
 ## What CREATE / ALTER does NOT cover
 

@@ -41,6 +41,7 @@ sqe-core = { path = "../sqe-core" }
 sqe-catalog = { path = "../sqe-catalog", default-features = false, features = ["rest", "rest-sigv4", "hadoop", "hive-external", "sql-sqlite-rs"] }
 sqe-sql = { path = "../sqe-sql" }
 sqe-trino-functions = { path = "../sqe-trino-functions" }
+sqe-geo = { path = "../sqe-geo" }
 # Shared Trino HTTP + Flight SQL clients (review 705). Replaces the
 # hand-rolled `http.rs` / `flight.rs` clients and the dependency on the
 # whole `sqe-trino-compat` server crate that they carried for two structs.

@@ -59,6 +59,7 @@
   - [Date and time](./sql-reference/datetime.md)
   - [Array, map, struct](./sql-reference/array-map.md)
   - [JSON](./sql-reference/json.md)
+  - [Geospatial](./sql-reference/geospatial.md)
   - [Encoding, hashing, URL](./sql-reference/encoding-url.md)
   - [Aggregate functions](./sql-reference/aggregate.md)
   - [Window functions](./sql-reference/window.md)
