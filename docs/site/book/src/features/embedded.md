@@ -1,22 +1,30 @@
 # Embedded mode
 
-SQE can run the full query engine in-process, with no server and no network.
-`sqe-cli` in embedded mode starts DataFusion, the Iceberg reader, and the same
-SQL planner locally, inside the CLI process. This is the fastest path for
-querying a warehouse from a laptop, a CI job, or a script.
+SQE can run the query engine in-process, with no server and no network.
+`sqe-cli --embedded` starts DataFusion, the Iceberg reader and writer, and the
+SQE function set inside the CLI process. It is the fastest path for querying a
+warehouse from a laptop, a CI job, or a script.
 
-Four warehouse modes:
+Embedded mode is not the coordinator in a smaller box. It plans SQL with
+DataFusion directly, plus a set of SQE statements (ATTACH, secrets, schema
+DDL, CTAS, `SHOW TABLES IN`). The Iceberg row-level DML, table maintenance
+and time travel of the cluster are not part of it yet. The
+[support table](#what-embedded-mode-supports) below lists what runs.
+
+Catalog choices:
 
 - **In-memory** (`--memory`): a transient DataFusion catalog. Nothing is
   persisted. Good for ad-hoc SQL and testing SQL functions.
-- **Filesystem warehouse** (`--warehouse PATH`): an Iceberg warehouse on local
-  disk or object storage with **no catalog service**. SQE walks the path for
-  `metadata.json` files and treats the prefix as the catalog. The "Iceberg
-  without a catalog" case.
-- **Persistent SQLite catalog** (`--catalog-backend sqlite`): a durable
-  single-node catalog backed by a local SQLite file. Survives restarts.
-- **Cloud catalogs embedded**: Glue and S3 Tables can be attached directly,
-  with no coordinator, using the standard AWS credential chain.
+- **Local warehouse** (`--warehouse PATH`, default `~/.sqe/warehouse/`): a
+  SQLite-backed Iceberg catalog named `iceberg`, with metadata in
+  `PATH/sqe.db` and data under `PATH/iceberg/`. Survives restarts.
+- **Several local catalogs** (`--catalog NAME=PATH`, repeatable): one SQLite
+  catalog per name, joinable in one query.
+- **Glue and S3 Tables** (`--catalog-backend glue|s3tables`): attached
+  read-only, with the standard AWS credential chain.
+- **Any other catalog at the prompt**: `ATTACH ... (TYPE iceberg_rest)` mounts
+  a REST catalog such as Polaris, Nessie or Unity Catalog. See
+  [Using the CLI](../getting-started/cli.md#catalog-backends).
 
 See the quickstarts:
 
@@ -40,29 +48,24 @@ sqe-cli --embedded --memory -e "SELECT 1 AS one"
 +-----+
 ```
 
-## Filesystem warehouse (no catalog service)
-
-Point at a directory; SQE reads the Iceberg metadata directly. No Polaris, no
-Glue, no metastore.
+## Local warehouse
 
 ```bash
 sqe-cli --embedded --warehouse /data/warehouse \
-    -e "SELECT COUNT(*) FROM sales.orders"
+    -e "SELECT COUNT(*) FROM iceberg.sales.orders"
 ```
 
-This is the catalog-free Hadoop mode. Writes need atomic rename, which object
-stores do not all provide, so this mode is read-oriented; for writes use a real
-catalog. The same backend powers the `[catalog.backend] type = "hadoop"` server
-config.
+The catalog is a single-process SQLite file. Two embedded sessions writing the
+same warehouse at once will conflict.
 
 ## Cloud catalogs embedded
 
 The embedded engine can attach a Glue or S3 Tables catalog directly, with no
-coordinator. Pass `--catalog-backend` plus the cloud warehouse; credentials come
+coordinator. Pass `--catalog-backend` plus the cloud warehouse. Credentials come
 from the standard AWS provider chain (`AWS_PROFILE`, instance profile, SSO).
-These catalogs attach read-only (query, not write); use the server for writes.
-Requires the `aws` cargo feature, which is off by default to keep the AWS SDK
-out of standard builds: `cargo install --path crates/sqe-cli --features aws`.
+These catalogs attach read-only. Requires the `aws` cargo feature, which is off
+by default to keep the AWS SDK out of standard builds:
+`cargo install --path crates/sqe-cli --features aws`.
 
 ```bash
 # AWS Glue Data Catalog (warehouse is an s3:// prefix)
@@ -84,10 +87,8 @@ override with `--catalog-name`.
 
 ## Writing data
 
-The embedded engine ships the same Iceberg write path as the cluster: DDL,
-CTAS, `INSERT`, `UPDATE`, `DELETE`, `MERGE INTO`, all against the local
-SQLite-backed catalog. A laptop session can build real Iceberg tables, not
-just read them.
+Schemas, tables, CTAS and `INSERT` write real Iceberg tables into the local
+warehouse or an attached catalog:
 
 ```sql
 CREATE SCHEMA iceberg.sales;
@@ -99,43 +100,47 @@ CREATE TABLE iceberg.sales.orders (
     total  DECIMAL(18,2)
 );
 
--- Land external data straight into Iceberg. CTAS streams, so a file
--- larger than memory still loads without OOM.
+INSERT INTO iceberg.sales.orders VALUES (1, 'eu', NOW(), 99.95);
+
+-- Land external data straight into Iceberg.
 CREATE TABLE iceberg.sales.orders_2026 AS
 SELECT id, region, ts, total
 FROM read_parquet('s3://bucket/2026/*.parquet')
 WHERE total > 0;
-
-INSERT INTO iceberg.sales.orders VALUES (1, 'eu', NOW(), 99.95);
-
-UPDATE iceberg.sales.orders SET total = total * 1.21 WHERE region = 'eu';
-
-DELETE FROM iceberg.sales.orders WHERE id < 100;
-
-MERGE INTO iceberg.sales.orders t
-USING iceberg.sales.orders_2026 s ON t.id = s.id
-WHEN MATCHED THEN UPDATE SET total = s.total
-WHEN NOT MATCHED THEN INSERT (id, region, ts, total)
-                    VALUES (s.id, s.region, s.ts, s.total);
 ```
 
-Default DML mode is Copy-on-Write. Opt a table into Merge-on-Read with the
-standard Iceberg properties:
+CTAS into an Iceberg catalog runs as two commits. The first creates the empty
+table from the query's schema, the second inserts the rows. When the insert
+fails, the empty table is dropped again. `CREATE TABLE IF NOT EXISTS ... AS`
+skips an existing table. `CREATE OR REPLACE TABLE ... AS` is refused: drop the
+table first.
 
-```sql
-ALTER TABLE iceberg.sales.orders
-SET TBLPROPERTIES ('write.delete.mode' = 'merge-on-read');
-```
+Tables in the warehouse are valid Iceberg. Point a cluster deployment (or any
+other Iceberg reader) at the same catalog later and they come along unchanged.
+`UPDATE`, `DELETE`, `MERGE INTO`, `ALTER TABLE`, branches and tags run there.
+Exporting results to plain files goes through `COPY ... TO`; see
+[Using the CLI](../getting-started/cli.md).
 
-Branching, tagging, and time travel work from the embedded prompt too;
-see [DML](../sql-reference/dml.md) for `SET WRITE_BRANCH` and
-`FOR VERSION AS OF`, and [DDL](../sql-reference/ddl.md) for
-`CREATE BRANCH` / `CREATE TAG`. Exporting results to plain files goes
-through `COPY ... TO`; see [Using the CLI](../getting-started/cli.md).
+## What embedded mode supports
 
-Tables in the warehouse are valid Iceberg. Point a cluster deployment (or
-any other Iceberg reader) at the same path later and they come along
-unchanged.
+| Statement | Embedded | Cluster |
+|---|---|---|
+| `SELECT`, joins, aggregates, file TVFs | yes | yes |
+| `CREATE SCHEMA` / `DROP SCHEMA` | yes | yes |
+| `CREATE TABLE` with a column list | yes | yes |
+| `CREATE TABLE` with `PARTITIONED BY` or `TBLPROPERTIES` | no | yes |
+| `CREATE TABLE ... AS` (CTAS) | yes, two commits | yes |
+| `INSERT INTO` | yes | yes |
+| `UPDATE`, `DELETE`, `MERGE INTO` | no | yes |
+| `ALTER TABLE` | no | yes |
+| `DROP TABLE` | yes | yes |
+| `CREATE VIEW` in an Iceberg catalog | no | yes |
+| `SHOW TABLES [IN schema]`, `DESCRIBE`, `SHOW CREATE TABLE` | yes | yes |
+| `FOR VERSION AS OF` / `FOR SYSTEM_TIME AS OF` | no | yes |
+| Metadata tables (`orders$snapshots`) | no | yes |
+| `CREATE BRANCH` / `CREATE TAG`, `SET WRITE_BRANCH` | no | yes |
+| `CALL system.*` procedures | no | yes |
+| `ATTACH` / `DETACH`, `CREATE SECRET` | yes | yes |
 
 ## Cookbook
 
@@ -153,6 +158,8 @@ SELECT * FROM '/tmp/unknown.parquet' LIMIT 10;
 Pull a public dataset into a local Iceberg table:
 
 ```sql
+CREATE SCHEMA iceberg.demo;
+
 CREATE TABLE iceberg.demo.titanic AS
 SELECT * FROM read_csv(
     'https://raw.githubusercontent.com/datasets/titanic/main/data/titanic.csv'
@@ -199,20 +206,18 @@ sqe-cli --embedded --file daily-report.sql --stop-on-error
 
 ## Differences from cluster mode
 
-The embedded prompt speaks the same SQL surface as the coordinator's Flight
-SQL endpoint: same parser, same planner, same Trino-compat function set,
-same Iceberg V2/V3 readers and writers. What changes is the deployment
-shape, and a few things fall away with it:
+The embedded prompt shares the coordinator's SQL front door and function set:
+the same Trino-compat functions, the same file TVFs, the same Iceberg readers.
+Statements go to DataFusion's planner rather than the coordinator's query and
+write handlers, which is why the statements marked "no" above are cluster-only.
+Beyond that:
 
-- **No auth.** No OIDC, no bearer tokens, no per-user identity, no policy
-  enforcement. The process runs as the Unix user.
-- **Local catalogs plus read-only Glue / S3 Tables.** Shared REST catalogs
-  (Polaris, Nessie, Unity) and writes to cloud catalogs need the cluster
-  path.
-- **Single-node execution.** No worker fan-out, no distributed shuffle.
-  The query memory pool is capped by `--memory-limit` (default 1GB).
-- **Single writer.** The SQLite catalog is a single-process catalog. Two
-  embedded sessions writing the same warehouse at once will conflict.
+- **No auth.** No OIDC, no per-user identity, no policy enforcement. The
+  process runs as the Unix user. An attached REST catalog uses the secret you
+  give it, and a bearer token in a secret is not refreshed.
+- **Single-node execution.** No workers. The query memory pool is capped by
+  `--memory-limit` (default 1GB).
+- **Single writer.** The SQLite catalog is a single-process catalog.
 - **No observability endpoints.** Prometheus metrics, OpenTelemetry, and
   the audit log live in the server.
 
@@ -220,13 +225,14 @@ shape, and a few things fall away with it:
 
 - `crates/sqe-cli/tests/cli_smoke.rs`: binary-level flag parsing, exit codes,
   mutually-exclusive flag rejection, and the `--embedded --memory` happy path.
+- Unit tests in `crates/sqe-cli/src/embedded.rs` cover the persistent
+  warehouse across a restart, ATTACH, schema DDL, CTAS into an Iceberg catalog
+  and `SHOW TABLES IN`.
 - The catalog spec parser (`NAME=PATH`) is validated for empty names, missing
   separators, and dotted names.
 
 ## Notes
 
-- `--memory` and `--warehouse` are mutually exclusive.
+- `--memory`, `--warehouse` and `--catalog` are mutually exclusive.
 - Local-path TVFs (`read_csv` and friends) work in embedded mode; the embedded
   engine enables `allow_local_paths` so a laptop user can read local files.
-- Embedded mode authenticates the OS user against the configured catalog's
-  credential source, not OIDC; there is no server to pass tokens through.
