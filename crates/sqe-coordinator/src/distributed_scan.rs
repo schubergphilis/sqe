@@ -1990,6 +1990,13 @@ impl ExecutionPlan for CoordinatorLocalScanExec {
 ///
 /// A batch missing an expected column fails loudly (fails closed, no silent
 /// wrong results).
+///
+/// Every batch is rebuilt in the expected schema. A worker without a
+/// projection fill streams the file's own types, and a file another engine
+/// wrote has no Arrow schema: its BINARY and geospatial WKB columns decode as
+/// `Binary` where the plan says `LargeBinary` (sqe#863). Such a column is
+/// cast the way the coordinator's own scan conforms it; passing it through
+/// handed the plan's operators a type they were not planned for.
 fn reassemble_worker_batch(
     batch: RecordBatch,
     expected_schema: &SchemaRef,
@@ -2003,24 +2010,26 @@ fn reassemble_worker_batch(
             &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
         )?);
     }
+    if batch.schema() == *expected_schema {
+        return Ok(batch);
+    }
     let positional_names_match = batch.num_columns() == expected_cols
         && expected_schema
             .fields()
             .iter()
             .zip(batch.schema().fields())
             .all(|(e, a)| e.name() == a.name());
-    if positional_names_match {
-        return Ok(batch);
-    }
     let all_expected_present = expected_schema
         .fields()
         .iter()
         .all(|f| batch.schema().column_with_name(f.name()).is_some());
-    if all_expected_present {
+    let columns = if positional_names_match {
+        batch.columns().to_vec()
+    } else if all_expected_present {
         // Select the expected columns by name from the worker batch. Handles
         // both a full-width batch (narrow) and a projected batch whose file
         // order differs from the plan's projection order (reorder).
-        let columns: Vec<_> = expected_schema
+        expected_schema
             .fields()
             .iter()
             .map(|f| {
@@ -2031,20 +2040,15 @@ fn reassemble_worker_batch(
                     ))
                 })
             })
-            .collect::<DFResult<Vec<_>>>()?;
-        Ok(RecordBatch::try_new(expected_schema.clone(), columns)?)
+            .collect::<DFResult<Vec<_>>>()?
     } else if batch.num_columns() == expected_cols {
         // Width matches but some expected names are absent: field-ID
         // projection (#43) on a pre-rename file ships the file's OLD column
         // names. The worker projected the right columns by field ID, so
-        // accept them positionally; `try_new` still validates the data types
-        // against the expected schema.
-        Ok(RecordBatch::try_new(
-            expected_schema.clone(),
-            batch.columns().to_vec(),
-        )?)
+        // accept them positionally.
+        batch.columns().to_vec()
     } else {
-        Err(DataFusionError::Internal(format!(
+        return Err(DataFusionError::Internal(format!(
             "Worker batch ({} columns: {:?}) cannot satisfy the expected scan schema \
              ({} columns: {:?})",
             batch.num_columns(),
@@ -2060,7 +2064,62 @@ fn reassemble_worker_batch(
                 .iter()
                 .map(|f| f.name().clone())
                 .collect::<Vec<_>>(),
-        )))
+        )));
+    };
+    let columns = expected_schema
+        .fields()
+        .iter()
+        .zip(columns)
+        .map(|(f, c)| {
+            if c.data_type() == f.data_type() {
+                return Ok(c);
+            }
+            let refused = |why: String| {
+                DataFusionError::Internal(format!(
+                    "worker column '{}' ({}) cannot be read as {}: {why}",
+                    f.name(),
+                    c.data_type(),
+                    f.data_type()
+                ))
+            };
+            if !is_conformable(c.data_type(), f.data_type()) {
+                return Err(refused("not a width change or type promotion".into()));
+            }
+            sqe_core::unknown::fill_unknown(&c, f.data_type()).map_err(|e| refused(e.to_string()))
+        })
+        .collect::<DFResult<Vec<_>>>()?;
+    Ok(RecordBatch::try_new_with_options(
+        expected_schema.clone(),
+        columns,
+        &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )?)
+}
+
+/// Whether a worker column of type `from` may be conformed to the planned
+/// `to`: the same values under another offset width or view layout, an
+/// Iceberg type promotion (int to long, float to double, a wider decimal),
+/// typed NULLs, or a nested type `fill_unknown` rebuilds member by member
+/// (a struct's `unknown` members, a shredded variant). Anything else is a
+/// worker that projected the wrong column, and stays an error.
+fn is_conformable(from: &arrow_schema::DataType, to: &arrow_schema::DataType) -> bool {
+    use arrow_schema::DataType as D;
+    match (from, to) {
+        (D::Null, _) | (_, D::Null) => true,
+        (
+            D::Binary | D::LargeBinary | D::BinaryView,
+            D::Binary | D::LargeBinary | D::BinaryView,
+        )
+        | (D::Utf8 | D::LargeUtf8 | D::Utf8View, D::Utf8 | D::LargeUtf8 | D::Utf8View)
+        | (D::Int32, D::Int64)
+        | (D::Float32, D::Float64) => true,
+        (D::Decimal128(p, s), D::Decimal128(p2, s2)) => p2 >= p && s2 == s,
+        (D::Struct(_), D::Struct(_))
+        | (
+            D::List(_) | D::LargeList(_) | D::ListView(_) | D::LargeListView(_),
+            D::List(_) | D::LargeList(_) | D::ListView(_) | D::LargeListView(_),
+        )
+        | (D::Map(..), D::Map(..)) => true,
+        _ => false,
     }
 }
 
@@ -2164,6 +2223,57 @@ mod tests {
             let projected_worker = batch(&["a"]);
             let expected = schema(&["a", "b"]);
             assert!(reassemble_worker_batch(projected_worker, &expected).is_err());
+        }
+
+        #[test]
+        fn binary_column_widens_to_the_planned_large_binary() {
+            // A Spark-written file has no Arrow schema, so its WKB decodes as
+            // `Binary`; the plan says `LargeBinary` with the GeoArrow tag
+            // (sqe#863). Same name, same width: it used to pass through.
+            use arrow_array::cast::AsArray;
+            use arrow_array::{Array, BinaryArray};
+            let wkb: &[u8] = &[1, 1, 0];
+            let file = Schema::new(vec![Field::new("g", DataType::Binary, true)]);
+            let worker = RecordBatch::try_new(
+                Arc::new(file),
+                vec![Arc::new(BinaryArray::from(vec![Some(wkb), None]))],
+            )
+            .unwrap();
+            let tag = std::collections::HashMap::from([(
+                "ARROW:extension:name".to_string(),
+                "geoarrow.wkb".to_string(),
+            )]);
+            let field = Field::new("g", DataType::LargeBinary, true).with_metadata(tag);
+            let expected: SchemaRef = Arc::new(Schema::new(vec![field]));
+            let out = reassemble_worker_batch(worker, &expected).unwrap();
+            assert_eq!(out.schema(), expected);
+            let g = out.column(0).as_binary::<i64>();
+            assert_eq!(g.value(0), wkb);
+            assert!(g.is_null(1));
+        }
+
+        #[test]
+        fn promoted_column_is_cast_and_a_wrong_type_refused() {
+            use arrow_array::{Int32Array, StringArray};
+            let int_field = Field::new("a", DataType::Int32, false);
+            let ints = Arc::new(Schema::new(vec![int_field]));
+            let seven = Arc::new(Int32Array::from(vec![7]));
+            let worker = RecordBatch::try_new(ints, vec![seven]).unwrap();
+            let out = reassemble_worker_batch(worker, &schema(&["a"])).unwrap();
+            let a = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            assert_eq!(a.value(0), 7);
+
+            // A string where the plan wants a BIGINT is a worker that
+            // projected the wrong column: an error, never a cast.
+            let str_field = Field::new("a", DataType::Utf8, false);
+            let strings = Schema::new(vec![str_field]);
+            let worker = RecordBatch::try_new(
+                Arc::new(strings),
+                vec![Arc::new(StringArray::from(vec!["7"]))],
+            )
+            .unwrap();
+            let err = reassemble_worker_batch(worker, &schema(&["a"])).unwrap_err();
+            assert!(err.to_string().contains("cannot be read as Int64"), "{err}");
         }
     }
     use arrow_schema::{DataType, Field, Schema};

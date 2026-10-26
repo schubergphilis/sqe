@@ -296,6 +296,92 @@ fn assert_spark_types(described: &str, expected: &[(&str, &str)]) {
     }
 }
 
+/// A Spark-written geospatial table scanned on a worker: the worker streams
+/// the WKB back over Flight with its GeoArrow tag, and a predicate on a
+/// geometry column reaches the worker without pruning a file on the
+/// geometry's bounding box. Runs against an in-process worker.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn spark_geospatial_table_scans_on_a_worker() {
+    use crate::common::chaos_worker::{spawn_chaos_worker, ChaosMode};
+    if let Some(reason) = spark_stack_skip_reason() {
+        eprintln!("skipping spark_geospatial_table_scans_on_a_worker: {reason}");
+        return;
+    }
+    let fq = "default.geo_on_worker";
+    // Two INSERTs, two data files.
+    spark_sql(&format!(
+        r#"SET spark.sql.geospatial.enabled = true;
+           DROP TABLE IF EXISTS rest.{fq};
+           CREATE TABLE rest.{fq} (id INT, g GEOMETRY(4326), h GEOGRAPHY(4326))
+             USING iceberg TBLPROPERTIES ('format-version' = '3');
+           INSERT INTO rest.{fq} VALUES
+             (1, ST_SetSRID(ST_GeomFromWKB(X'{POINT_1_2}'), 4326),
+                 ST_SetSRID(ST_GeogFromWKB(X'{POINT_1_2}'), 4326)),
+             (2, NULL, NULL);
+           INSERT INTO rest.{fq} VALUES
+             (3, ST_SetSRID(ST_GeomFromWKB(X'{POINT_5_6}'), 4326),
+                 ST_SetSRID(ST_GeogFromWKB(X'{POINT_5_6}'), 4326));"#
+    ))
+    .expect("spark writes the geospatial table");
+
+    let worker = spawn_chaos_worker(ChaosMode::PassThrough).await;
+    let rig = crate::distributed_failure_e2e::rig(std::slice::from_ref(&worker.url), |_| {}).await;
+    let (session, handler) = (&rig.session, rig.handler.as_ref());
+
+    let before = worker.do_gets();
+    let tagged = handler
+        .execute(session, &format!("SELECT g, h FROM {fq}"), None)
+        .await
+        .expect("select geospatial columns");
+    let read = sqe_rows(
+        handler,
+        session,
+        &format!(
+            "SELECT id, arrow_cast(encode(g, 'hex'), 'Utf8'), \
+                    arrow_cast(encode(h, 'hex'), 'Utf8') \
+             FROM {fq} ORDER BY id"
+        ),
+    )
+    .await;
+    // The match's WKB (`01...`) sorts above its file's bounds (`00...`, the
+    // box corner as doubles), so a byte-wise min/max prune would drop it.
+    let filtered = sqe_rows(
+        handler,
+        session,
+        &format!("SELECT id FROM {fq} WHERE g = X'{POINT_5_6}' ORDER BY id"),
+    )
+    .await;
+    let after = worker.do_gets();
+    let _ = spark_sql(&format!("DROP TABLE IF EXISTS rest.{fq}"));
+
+    let schema = tagged.first().expect("one batch").schema();
+    for name in ["g", "h"] {
+        let field = schema.field_with_name(name).unwrap();
+        let ext = field.metadata().get("ARROW:extension:name");
+        assert_eq!(
+            ext.map(String::as_str),
+            Some("geoarrow.wkb"),
+            "{name}: {field:?}"
+        );
+    }
+    assert_eq!(
+        read,
+        vec![
+            format!("1|{POINT_1_2}|{POINT_1_2}"),
+            "2|NULL|NULL".to_string(),
+            format!("3|{POINT_5_6}|{POINT_5_6}"),
+        ],
+        "the worker's rows of the geospatial table"
+    );
+    assert_eq!(filtered, vec!["3".to_string()], "filter on geometry");
+    assert!(
+        after > before,
+        "the scan ran on the coordinator, not a worker: \
+         the worker got no do_get ({before} -> {after})"
+    );
+}
+
 /// Per-file `(lower_bounds, upper_bounds)` of the test table, with the
 /// quotes around binary bound values removed. Field ids: 1 id, 2 b, 3 g, 4 h.
 async fn file_bounds(
