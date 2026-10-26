@@ -278,7 +278,7 @@ Iceberg V3 table format support landed end-to-end. V3 is the default format-vers
 |---|---|
 | Pruning and typed access on shredded variant fields | Shredded fields are unshredded on read |
 | DATE to TIMESTAMP promotion | Refused: Iceberg Java refuses it too |
-| Geometry / geography type | Read-only (WKB). Writes and DDL wait for the iceberg-rust geospatial writer |
+| Geometry / geography type | Read and written as WKB, geometry bounds in the manifest. DDL, `ST_*` and bounding-box pruning not started |
 | Multi-arg partition transforms | Not started |
 
 ### Other Hardening

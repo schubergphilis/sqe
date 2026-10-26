@@ -293,7 +293,6 @@ pub async fn write_data_files_streaming(
     // (see the delete-aware read plan) must persist them, so the data file's
     // schema is the table schema plus the two reserved lineage fields. Inserts
     // carry neither and write the table schema unchanged.
-    reject_geospatial_write(table.metadata().current_schema())?;
 
     let lineage = carries_row_lineage(table, &stream.schema());
     let write_schema = if lineage {
@@ -339,11 +338,21 @@ pub async fn write_data_files_streaming(
     let iceberg_schema = metadata.current_schema();
     let stamped_schema = build_stamped_schema(&write_schema)?;
     let partition_spec = metadata.default_partition_spec().clone();
+    let geospatial = holds_geospatial(&iceberg::spec::Type::Struct(
+        write_schema.as_struct().clone(),
+    ));
     // Stamping is positional: put the lineage columns last, in schema order.
     let stamp = |batch: RecordBatch| -> sqe_core::Result<RecordBatch> {
-        let batch = if lineage { lineage_columns_last(batch)? } else { batch };
+        let batch = if lineage {
+            lineage_columns_last(batch)?
+        } else {
+            batch
+        };
         let batch = apply_stamped_schema(batch, &stamped_schema)?;
         check_required_columns(&batch, &write_schema)?;
+        if geospatial {
+            check_geospatial_wkb(&batch, &write_schema)?;
+        }
         Ok(batch)
     };
 
@@ -506,37 +515,100 @@ pub fn shred_variants(table: &Table) -> bool {
         .is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
-/// Refuse to write data files for a schema with a GEOMETRY / GEOGRAPHY
-/// column (sqe#863). Reading these V3 types is supported; writing is not,
-/// because the vendored writer cannot yet compute the bounding-box bounds
-/// the spec requires, so files would commit without geo metadata.
-pub fn reject_geospatial_write(schema: &IcebergSchema) -> sqe_core::Result<()> {
+/// Whether `ty` is or holds a GEOMETRY / GEOGRAPHY value.
+fn holds_geospatial(ty: &iceberg::spec::Type) -> bool {
     use iceberg::spec::{PrimitiveType, Type};
-    fn find(ty: &Type) -> Option<&PrimitiveType> {
-        match ty {
-            Type::Primitive(p @ (PrimitiveType::Geometry(_) | PrimitiveType::Geography(_))) => {
-                Some(p)
-            }
-            Type::Primitive(_) | Type::Variant(_) => None,
-            Type::Struct(s) => s.fields().iter().find_map(|f| find(&f.field_type)),
-            Type::List(l) => find(&l.element_field.field_type),
-            Type::Map(m) => {
-                find(&m.key_field.field_type).or_else(|| find(&m.value_field.field_type))
-            }
+    match ty {
+        Type::Primitive(p) => matches!(p, PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)),
+        Type::Variant(_) => false,
+        Type::Struct(s) => s.fields().iter().any(|f| holds_geospatial(&f.field_type)),
+        Type::List(l) => holds_geospatial(&l.element_field.field_type),
+        Type::Map(m) => {
+            holds_geospatial(&m.key_field.field_type) || holds_geospatial(&m.value_field.field_type)
         }
     }
-    for field in schema.as_struct().fields() {
-        if let Some(p) = find(&field.field_type) {
-            return Err(SqeError::with_code(
-                SqeErrorCode::NotSupported,
-                format!(
-                    "column '{}' has type {p}: SQE reads geospatial columns but cannot write them yet",
-                    field.name
-                ),
-            ));
-        }
+}
+
+/// Refuse a batch whose GEOMETRY / GEOGRAPHY values are not WKB (sqe#863).
+/// SQE takes geospatial values as plain bytes, so nothing upstream checks
+/// them; a file holding anything else would fail every reader that decodes
+/// it, and parquet would leave it without a bounding box.
+pub fn check_geospatial_wkb(
+    batch: &RecordBatch,
+    iceberg_schema: &IcebergSchema,
+) -> sqe_core::Result<()> {
+    let fields = iceberg_schema.as_struct().fields();
+    for (field, col) in fields.iter().zip(batch.columns()) {
+        check_wkb(&field.name, &field.field_type, col)?;
     }
     Ok(())
+}
+
+fn check_wkb(
+    name: &str,
+    ty: &iceberg::spec::Type,
+    array: &arrow_array::ArrayRef,
+) -> sqe_core::Result<()> {
+    use arrow_array::cast::AsArray;
+    use arrow_array::Array;
+    use iceberg::spec::{PrimitiveType, Type};
+    if !holds_geospatial(ty) {
+        return Ok(());
+    }
+    let invalid = |row: usize, err: String| {
+        SqeError::with_code(
+            SqeErrorCode::InvalidCast,
+            format!("column '{name}' (row {row}) is not a valid WKB {ty}: {err}"),
+        )
+    };
+    // Null slots are skipped: the column's nullability is checked elsewhere.
+    let check = |row: usize, wkb: Option<&[u8]>| {
+        let Some(wkb) = wkb else { return Ok(()) };
+        let mut bounder = parquet_geospatial::bounding::GeometryBounder::empty();
+        let parsed = bounder.update_wkb(wkb);
+        parsed.map_err(|e| invalid(row, e.to_string()))
+    };
+    match ty {
+        Type::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
+            if let Some(a) = array.as_binary_opt::<i64>() {
+                a.iter().enumerate().try_for_each(|(row, v)| check(row, v))
+            } else if let Some(a) = array.as_binary_opt::<i32>() {
+                a.iter().enumerate().try_for_each(|(row, v)| check(row, v))
+            } else if let Some(a) = array.as_binary_view_opt() {
+                a.iter().enumerate().try_for_each(|(row, v)| check(row, v))
+            } else {
+                let got = array.data_type();
+                Err(invalid(0, format!("expected binary values, got {got}")))
+            }
+        }
+        Type::Struct(s) => {
+            let Some(a) = array.as_struct_opt() else {
+                return Ok(());
+            };
+            for (field, col) in s.fields().iter().zip(a.columns()) {
+                check_wkb(&format!("{name}.{}", field.name), &field.field_type, col)?;
+            }
+            Ok(())
+        }
+        Type::List(l) => {
+            let values = match (array.as_list_opt::<i32>(), array.as_list_opt::<i64>()) {
+                (Some(a), _) => a.values(),
+                (_, Some(a)) => a.values(),
+                _ => return Ok(()),
+            };
+            let element = &l.element_field.field_type;
+            check_wkb(&format!("{name}.element"), element, values)
+        }
+        Type::Map(m) => {
+            let Some(a) = array.as_map_opt() else {
+                return Ok(());
+            };
+            check_wkb(&format!("{name}.key"), &m.key_field.field_type, a.keys())?;
+            let value = &m.value_field.field_type;
+            check_wkb(&format!("{name}.value"), value, a.values())
+        }
+        Type::Primitive(_) | Type::Variant(_) => Ok(()),
+    }
 }
 
 /// Whether a write into `table` must persist V3 row lineage: the table is V3
@@ -1179,37 +1251,58 @@ impl<B: IcebergWriterBuilder> BoundedFanoutWriter<B> {
 mod tests {
     use super::*;
 
+    /// Geospatial columns take WKB, top-level or nested, and refuse other
+    /// bytes; a BINARY column takes anything (sqe#863).
     #[test]
-    fn geospatial_columns_refuse_writes() {
+    fn geospatial_writes_require_wkb() {
+        use arrow_array::{ArrayRef, BinaryArray, StructArray};
         use iceberg::spec::{NestedField, PrimitiveType, StructType, Type};
-        let plain = IcebergSchema::builder()
-            .with_fields(vec![NestedField::optional(
-                1,
-                "b",
-                Type::Primitive(PrimitiveType::Binary),
-            )
-            .into()])
+        let point: Vec<u8> = [1u8, 1, 0, 0, 0]
+            .into_iter()
+            .chain(1.5f64.to_le_bytes())
+            .chain((-2.0f64).to_le_bytes())
+            .collect();
+        let geometry = Type::Primitive(PrimitiveType::Geometry(Default::default()));
+        let geography = Type::Primitive(PrimitiveType::Geography(Default::default()));
+        let h = NestedField::optional(4, "h", geography);
+        let s_type = Type::Struct(StructType::new(vec![h.into()]));
+        let schema = IcebergSchema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "b", Type::Primitive(PrimitiveType::Binary)).into(),
+                NestedField::optional(2, "g", geometry).into(),
+                NestedField::optional(3, "s", s_type).into(),
+            ])
             .build()
             .unwrap();
-        assert!(reject_geospatial_write(&plain).is_ok());
+        assert!(holds_geospatial(&Type::Struct(schema.as_struct().clone())));
+        let stamped = build_stamped_schema(&schema).unwrap();
+        let batch = |b: &[u8], g: &[u8], h: &[u8]| {
+            let binary = |v: &[u8]| Arc::new(BinaryArray::from(vec![Some(v), None])) as ArrayRef;
+            let s_fields = arrow_schema::Fields::from(vec![arrow_schema::Field::new(
+                "h",
+                arrow_schema::DataType::Binary,
+                true,
+            )]);
+            let s = StructArray::new(s_fields.clone(), vec![binary(h)], None);
+            let input = Arc::new(ArrowSchema::new(vec![
+                arrow_schema::Field::new("b", arrow_schema::DataType::Binary, true),
+                arrow_schema::Field::new("g", arrow_schema::DataType::Binary, true),
+                arrow_schema::Field::new("s", arrow_schema::DataType::Struct(s_fields), true),
+            ]));
+            let columns = vec![binary(b), binary(g), Arc::new(s) as ArrayRef];
+            let batch = RecordBatch::try_new(input, columns).unwrap();
+            // The insert path widens BINARY to the table's LARGE BINARY first.
+            apply_stamped_schema(batch, &stamped).unwrap()
+        };
 
-        let nested_geo = Type::Struct(StructType::new(vec![NestedField::optional(
-            3,
-            "g",
-            Type::Primitive(PrimitiveType::Geography(Default::default())),
-        )
-        .into()]));
-        for ty in [
-            Type::Primitive(PrimitiveType::Geometry(Default::default())),
-            nested_geo,
+        check_geospatial_wkb(&batch(b"anything", &point, &point), &schema).unwrap();
+        for (bad, column) in [
+            (batch(b"x", b"not wkb", &point), "'g'"),
+            (batch(b"x", &point, &point[..9]), "'s.h'"),
         ] {
-            let schema = IcebergSchema::builder()
-                .with_fields(vec![NestedField::optional(2, "shape", ty).into()])
-                .build()
-                .unwrap();
-            let err = reject_geospatial_write(&schema).unwrap_err();
-            assert_eq!(err.error_code(), SqeErrorCode::NotSupported);
-            assert!(err.to_string().contains("'shape'"), "{err}");
+            let err = check_geospatial_wkb(&bad, &schema).unwrap_err();
+            assert_eq!(err.error_code(), SqeErrorCode::InvalidCast);
+            assert!(err.to_string().contains(column), "{err}");
         }
     }
 
