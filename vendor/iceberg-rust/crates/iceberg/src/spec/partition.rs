@@ -18,6 +18,7 @@
 /*!
  * Partitioning
  */
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use itertools::Itertools;
@@ -64,12 +65,16 @@ pub type PartitionSpecRef = Arc<PartitionSpec>;
 /// [`UnboundPartitionSpec`] is that the former has field ids assigned,
 /// while field ids are optional for [`UnboundPartitionSpec`].
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
-#[serde(rename_all = "kebab-case")]
+#[serde(try_from = "PartitionSpecSerde", into = "PartitionSpecSerde")]
 pub struct PartitionSpec {
     /// Identifier for PartitionSpec
     spec_id: i32,
     /// Details of the partition spec
     fields: Vec<PartitionField>,
+    /// SQE PATCH (sqe#864): the transform name and every source id of each
+    /// field with a [`Transform::Unknown`] transform, keyed by partition field
+    /// id, so the spec is written back exactly as it was read.
+    unknown_transforms: BTreeMap<i32, UnknownTransform>,
 }
 
 impl PartitionSpec {
@@ -93,7 +98,99 @@ impl PartitionSpec {
         Self {
             spec_id: DEFAULT_PARTITION_SPEC_ID,
             fields: vec![],
+            unknown_transforms: BTreeMap::new(),
         }
+    }
+
+    /// SQE PATCH (sqe#864): the transform name and source ids of a field whose
+    /// transform this reader does not know, such as a multi-argument
+    /// transform. `None` for a field with a known transform.
+    pub fn unknown_transform(&self, field_id: i32) -> Option<&UnknownTransform> {
+        self.unknown_transforms.get(&field_id)
+    }
+
+    /// SQE PATCH (sqe#864): true if any field uses a transform this reader
+    /// does not know. The spec forbids committing data with such a spec.
+    pub fn has_unknown_transform(&self) -> bool {
+        self.fields
+            .iter()
+            .any(|f| f.transform == Transform::Unknown)
+    }
+
+    /// SQE PATCH (sqe#864): every source column id of a partition field. A
+    /// multi-argument field keeps its first id in [`PartitionField::source_id`]
+    /// only so the struct can hold it; never resolve such a field through that
+    /// single id.
+    pub fn source_ids(&self, field: &PartitionField) -> Vec<i32> {
+        match self.unknown_transforms.get(&field.field_id) {
+            Some(unknown) if field.transform == Transform::Unknown => unknown.source_ids.clone(),
+            _ => vec![field.source_id],
+        }
+    }
+
+    /// Carry the unknown-transform records of `other` over to this spec,
+    /// keeping only those that still name one of its unknown-transform fields.
+    pub(crate) fn with_unknown_transforms_of(mut self, other: &PartitionSpec) -> Self {
+        self.unknown_transforms = other
+            .unknown_transforms
+            .iter()
+            .filter(|(field_id, _)| {
+                self.fields
+                    .iter()
+                    .any(|f| f.field_id == **field_id && f.transform == Transform::Unknown)
+            })
+            .map(|(field_id, unknown)| (*field_id, unknown.clone()))
+            .collect();
+        self
+    }
+
+    /// Build a spec from the raw JSON fields of table metadata or a manifest
+    /// header, without validating them against a schema.
+    pub(crate) fn from_raw_fields(
+        spec_id: i32,
+        raw: Vec<RawPartitionField>,
+    ) -> std::result::Result<Self, String> {
+        let mut fields = Vec::with_capacity(raw.len());
+        let mut unknown_transforms = BTreeMap::new();
+        for f in raw {
+            let what = format!("partition field `{}`", f.name);
+            let (source_id, transform, unknown) =
+                resolve_sources(&what, f.source_id, f.source_ids, &f.transform)?;
+            if let Some(unknown) = unknown {
+                unknown_transforms.insert(f.field_id, unknown);
+            }
+            fields.push(PartitionField {
+                source_id,
+                field_id: f.field_id,
+                name: f.name,
+                transform,
+            });
+        }
+        Ok(PartitionSpec {
+            spec_id,
+            fields,
+            unknown_transforms,
+        })
+    }
+
+    fn to_raw_fields(&self) -> Vec<RawPartitionField> {
+        self.fields
+            .iter()
+            .map(|f| {
+                let (source_id, source_ids, transform) = raw_sources(
+                    f.source_id,
+                    f.transform,
+                    self.unknown_transforms.get(&f.field_id),
+                );
+                RawPartitionField {
+                    source_id,
+                    source_ids,
+                    field_id: f.field_id,
+                    name: f.name.clone(),
+                    transform,
+                }
+            })
+            .collect()
     }
 
     /// Returns if the partition spec is unpartitioned.
@@ -283,11 +380,13 @@ pub struct UnboundPartitionField {
 // SQE PATCH (sqe#864): the V3 spec lets a partition field name its sources
 // as `source-ids` instead of `source-id`. iceberg-java writes `source-ids`
 // only for a multi-argument field, but a one-element list is legal and means
-// the same as `source-id`. A field with several sources cannot be held by the
-// single `source_id` below, so it is refused with an error naming the field
-// rather than read through its first id, which would prune on the wrong
-// column and drop the other ids on the next commit. Serialization is
-// unchanged: `source-id` is always written.
+// the same as `source-id`. A lone field with several sources cannot be held
+// by the single `source_id` below, so it is refused with an error naming the
+// field rather than read through its first id, which would prune on the
+// wrong column and drop the other ids on the next commit. Serialization is
+// unchanged: `source-id` is always written. A whole `PartitionSpec` (table
+// metadata, manifest headers) reads multi-argument fields through
+// `RawPartitionField` instead and keeps them.
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct PartitionFieldSerde {
@@ -355,6 +454,121 @@ fn single_source_id(
             "partition field `{name}` sets both `source-id` and `source-ids`"
         )),
         (None, None) => Err(format!("partition field `{name}` is missing `source-id`")),
+    }
+}
+
+/// SQE PATCH (sqe#864): a partition or sort field whose transform this reader
+/// does not know: a transform name from a newer spec, or any transform over
+/// several source columns (the spec defines none yet, but lets v3 metadata
+/// carry them). Readers ignore such a field; writers must not commit data
+/// under a partition spec that has one.
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+pub struct UnknownTransform {
+    /// Every source column id, in order. One entry for a single-argument
+    /// transform.
+    pub source_ids: Vec<i32>,
+    /// The transform as written in the metadata, such as `zorder`.
+    pub transform: String,
+}
+
+impl UnknownTransform {
+    /// True if the transform takes more than one source column.
+    pub fn is_multi_argument(&self) -> bool {
+        self.source_ids.len() > 1
+    }
+}
+
+/// One partition field as JSON, before its transform is resolved.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct RawPartitionField {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_id: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_ids: Option<Vec<i32>>,
+    field_id: i32,
+    name: String,
+    transform: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct PartitionSpecSerde {
+    spec_id: i32,
+    fields: Vec<RawPartitionField>,
+}
+
+impl TryFrom<PartitionSpecSerde> for PartitionSpec {
+    type Error = String;
+
+    fn try_from(value: PartitionSpecSerde) -> std::result::Result<Self, Self::Error> {
+        PartitionSpec::from_raw_fields(value.spec_id, value.fields)
+    }
+}
+
+impl From<PartitionSpec> for PartitionSpecSerde {
+    fn from(spec: PartitionSpec) -> Self {
+        PartitionSpecSerde {
+            spec_id: spec.spec_id,
+            fields: spec.to_raw_fields(),
+        }
+    }
+}
+
+/// Resolve the `source-id` / `source-ids` pair and the transform name of a
+/// partition or sort field (`what` names it in errors). Returns the id the
+/// field struct holds, its transform, and the unknown-transform record to
+/// keep beside it. A field over several sources is always
+/// [`Transform::Unknown`], even under a known name: every known transform
+/// takes one argument, so reading it through its first id would prune and
+/// sort on the wrong values.
+pub(crate) fn resolve_sources(
+    what: &str,
+    source_id: Option<i32>,
+    source_ids: Option<Vec<i32>>,
+    transform: &str,
+) -> std::result::Result<(i32, Transform, Option<UnknownTransform>), String> {
+    let ids = match (source_id, source_ids) {
+        (Some(id), None) => vec![id],
+        (None, Some(ids)) if !ids.is_empty() => ids,
+        (None, Some(_)) => return Err(format!("{what} has an empty `source-ids`")),
+        (Some(_), Some(_)) => {
+            return Err(format!("{what} sets both `source-id` and `source-ids`"));
+        }
+        (None, None) => return Err(format!("{what} is missing `source-id`")),
+    };
+    let transform_kind = if ids.len() == 1 {
+        Transform::parse_tolerant(transform)
+    } else {
+        Transform::Unknown
+    };
+    let unknown = (transform_kind == Transform::Unknown).then(|| UnknownTransform {
+        source_ids: ids.clone(),
+        transform: transform.to_string(),
+    });
+    Ok((ids[0], transform_kind, unknown))
+}
+
+/// The JSON `source-id`, `source-ids` and `transform` of a field: the spec
+/// writes `source-ids` only for a multi-argument transform.
+pub(crate) fn raw_sources(
+    source_id: i32,
+    transform: Transform,
+    unknown: Option<&UnknownTransform>,
+) -> (Option<i32>, Option<Vec<i32>>, String) {
+    match unknown {
+        Some(unknown) if transform == Transform::Unknown => {
+            if unknown.is_multi_argument() {
+                (
+                    None,
+                    Some(unknown.source_ids.clone()),
+                    unknown.transform.clone(),
+                )
+            } else {
+                (Some(unknown.source_ids[0]), None, unknown.transform.clone())
+            }
+        }
+        _ => (Some(source_id), None, transform.to_string()),
     }
 }
 
@@ -664,6 +878,7 @@ impl PartitionSpecBuilder {
         Ok(PartitionSpec {
             spec_id: self.spec_id.unwrap_or(DEFAULT_PARTITION_SPEC_ID),
             fields,
+            unknown_transforms: BTreeMap::new(),
         })
     }
 
@@ -753,6 +968,13 @@ impl PartitionSpecBuilder {
                 field.source_id
             )
         })?;
+
+        // SQE PATCH (sqe#864): a reader cannot type-check a transform it does
+        // not know, and a multi-argument field holds only its first source
+        // here. Readers ignore such a field, so it is accepted as written.
+        if field.transform == Transform::Unknown {
+            return Ok(());
+        }
 
         // The spec requires partition source columns to be primitive for every
         // transform, `void` included.
@@ -932,6 +1154,122 @@ mod tests {
             err.contains("[3, 4]") && err.contains("multi-argument"),
             "{err}"
         );
+    }
+
+    // SQE PATCH (sqe#864): a whole spec keeps multi-argument and unknown
+    // transforms, reads them as `Transform::Unknown`, and writes them back
+    // exactly as read.
+    #[test]
+    fn test_partition_spec_keeps_unknown_transforms() {
+        let json = serde_json::json!({
+            "spec-id": 3,
+            "fields": [
+                {"source-id": 1, "field-id": 1000, "name": "id_bucket", "transform": "bucket[4]"},
+                {"source-ids": [1, 2], "field-id": 1001, "name": "id_ts_zorder", "transform": "zorder"},
+                {"source-ids": [2, 1], "field-id": 1002, "name": "ts_id_bucket", "transform": "bucket[8]"},
+                {"source-id": 2, "field-id": 1003, "name": "ts_v2", "transform": "bucketv2[4]"},
+                {"source-ids": [2], "field-id": 1004, "name": "ts_day", "transform": "day"}
+            ]
+        });
+        let spec: PartitionSpec = serde_json::from_value(json.clone()).unwrap();
+        let transforms: Vec<_> = spec.fields().iter().map(|f| f.transform).collect();
+        assert_eq!(
+            transforms,
+            vec![
+                Transform::Bucket(4),
+                Transform::Unknown,
+                // A known name over several sources is still unknown: every known
+                // transform takes one argument.
+                Transform::Unknown,
+                Transform::Unknown,
+                Transform::Day,
+            ]
+        );
+        assert!(spec.has_unknown_transform());
+        assert_eq!(
+            spec.unknown_transform(1001),
+            Some(&UnknownTransform {
+                source_ids: vec![1, 2],
+                transform: "zorder".to_string(),
+            })
+        );
+        assert!(spec.unknown_transform(1001).unwrap().is_multi_argument());
+        assert!(!spec.unknown_transform(1003).unwrap().is_multi_argument());
+        assert_eq!(spec.unknown_transform(1000), None);
+        assert_eq!(spec.source_ids(&spec.fields()[2]), vec![2, 1]);
+        assert_eq!(spec.source_ids(&spec.fields()[0]), vec![1]);
+
+        // Written back as read, except that a one-element `source-ids` is
+        // written as `source-id`, as the spec asks.
+        let mut expected = json;
+        expected["fields"][4] = serde_json::json!(
+            {"source-id": 2, "field-id": 1004, "name": "ts_day", "transform": "day"}
+        );
+        assert_eq!(serde_json::to_value(&spec).unwrap(), expected);
+
+        // Binding to a schema keeps the fields; rebinding through the unbound
+        // form needs the records carried over.
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "ts", Type::Primitive(PrimitiveType::Timestamp)).into(),
+            ])
+            .build()
+            .unwrap();
+        let rebound = spec
+            .clone()
+            .into_unbound()
+            .bind_for_existing_metadata(schema.clone())
+            .unwrap()
+            .with_unknown_transforms_of(&spec);
+        assert_eq!(rebound, spec);
+
+        // Unknown fields have no knowable result type; the reader guesses
+        // string and takes the written type from the manifest instead.
+        let partition_type = spec.partition_type(&schema).unwrap();
+        assert_eq!(
+            *partition_type.fields()[1].field_type,
+            Type::Primitive(PrimitiveType::String)
+        );
+
+        // Malformed sources are still refused, naming the field.
+        for sources in [
+            serde_json::json!({"source-ids": []}),
+            serde_json::json!({"source-id": 1, "source-ids": [1, 2]}),
+            serde_json::json!({}),
+        ] {
+            let mut field = serde_json::json!(
+                {"field-id": 1000, "name": "p", "transform": "zorder"}
+            );
+            field
+                .as_object_mut()
+                .unwrap()
+                .extend(sources.as_object().unwrap().clone());
+            let err = serde_json::from_value::<PartitionSpec>(serde_json::json!(
+                {"spec-id": 0, "fields": [field]}
+            ))
+            .unwrap_err();
+            assert!(err.to_string().contains("partition field `p`"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_parse_tolerant_transform() {
+        for (name, expected) in [
+            ("identity", Transform::Identity),
+            ("bucket[16]", Transform::Bucket(16)),
+            ("truncate[3]", Transform::Truncate(3)),
+            ("year", Transform::Year),
+            ("void", Transform::Void),
+            ("bucketv2[16]", Transform::Unknown),
+            ("bucket[x]", Transform::Unknown),
+            ("bucket16", Transform::Unknown),
+            ("truncate[3", Transform::Unknown),
+            ("zorder", Transform::Unknown),
+            ("unknown", Transform::Unknown),
+        ] {
+            assert_eq!(Transform::parse_tolerant(name), expected, "{name}");
+        }
     }
 
     #[test]
@@ -1294,6 +1632,7 @@ mod tests {
                     name: "partition".to_string(),
                     transform,
                 }],
+                unknown_transforms: BTreeMap::new(),
             };
             assert_eq!(
                 spec.partition_type(&schema).unwrap(),
@@ -1403,21 +1742,27 @@ mod tests {
             .build()
             .unwrap();
 
-        assert_eq!(spec, PartitionSpec {
-            spec_id: 1,
-            fields: vec![PartitionField {
-                source_id: 1,
-                field_id: 1000,
-                name: "id_bucket[16]".to_string(),
-                transform: Transform::Bucket(16),
-            }],
-        });
+        assert_eq!(
+            spec,
+            PartitionSpec {
+                spec_id: 1,
+                fields: vec![PartitionField {
+                    source_id: 1,
+                    field_id: 1000,
+                    name: "id_bucket[16]".to_string(),
+                    transform: Transform::Bucket(16),
+                }],
+                unknown_transforms: BTreeMap::new(),
+            }
+        );
         assert_eq!(
             spec.partition_type(&schema).unwrap(),
-            StructType::new(vec![
-                NestedField::optional(1000, "id_bucket[16]", Type::Primitive(PrimitiveType::Int))
-                    .into()
-            ])
+            StructType::new(vec![NestedField::optional(
+                1000,
+                "id_bucket[16]",
+                Type::Primitive(PrimitiveType::Int)
+            )
+            .into()])
         )
     }
 
@@ -1685,6 +2030,7 @@ mod tests {
                     transform: f.transform,
                 })
                 .collect(),
+            unknown_transforms: BTreeMap::new(),
         };
         assert_eq!(spec, expected);
     }
@@ -1736,6 +2082,7 @@ mod tests {
                     transform: Transform::Bucket(16),
                 },
             ],
+            unknown_transforms: BTreeMap::new(),
         };
         assert_eq!(spec, expected);
     }

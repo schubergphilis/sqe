@@ -810,7 +810,8 @@ fn bounds_map_to_json(
 }
 
 /// Render a data file's partition tuple as `[v1,v2,...]`, with the value of
-/// every partition field whose source column `gov` governs shown as `null`.
+/// every partition field with a source column `gov` governs shown as `null`.
+/// A multi-argument field (sqe#864) has several sources; any one hides it.
 fn partition_key(table: &Table, df: &iceberg::spec::DataFile, gov: &StatsGovernance) -> String {
     let metadata = table.metadata();
     let schema = metadata.current_schema();
@@ -821,16 +822,31 @@ fn partition_key(table: &Table, df: &iceberg::spec::DataFile, gov: &StatsGoverna
         .iter()
         .enumerate()
         .map(|(i, f)| {
-            let source = spec
-                .and_then(|s| s.fields().get(i))
-                .and_then(|pf| schema.name_by_field_id(pf.source_id));
-            if gov.governs(source) {
+            if partition_field_governed(spec.map(|s| s.as_ref()), i, schema, gov) {
                 return "null".to_string();
             }
             f.as_ref().map_or("null".to_string(), |v| format!("{v:?}"))
         })
         .collect();
     format!("[{}]", parts.join(","))
+}
+
+/// Whether `gov` governs a source column of partition field `i` of `spec`.
+/// A field missing from the spec has no known source, which `governs` treats
+/// as governed whenever any column is.
+fn partition_field_governed(
+    spec: Option<&iceberg::spec::PartitionSpec>,
+    i: usize,
+    schema: &iceberg::spec::Schema,
+    gov: &StatsGovernance,
+) -> bool {
+    match spec.and_then(|s| s.fields().get(i).map(|pf| (s, pf))) {
+        Some((s, pf)) => s
+            .source_ids(pf)
+            .into_iter()
+            .any(|id| gov.governs(schema.name_by_field_id(id))),
+        None => gov.governs(None),
+    }
 }
 
 async fn build_files_batch(
@@ -1392,6 +1408,34 @@ mod tests {
         let out = int_map_to_json(&counts, |id| !gov.governs(schema.name_by_field_id(id)));
         assert_eq!(out, "{\"1\":10}");
         assert!(!gov.all);
+    }
+
+    #[test]
+    fn test_multi_argument_partition_field_governed_by_any_source() {
+        // zorder over (id, ssn): ssn is masked, so the field's value is hidden
+        // even though its first source, id, is not (sqe#864).
+        let spec: iceberg::spec::PartitionSpec = serde_json::from_str(
+            r#"{"spec-id":0,"fields":[
+                {"source-ids":[1,2],"field-id":1000,"name":"z","transform":"zorder"},
+                {"source-id":1,"field-id":1001,"name":"id_part","transform":"identity"}]}"#,
+        )
+        .unwrap();
+        let schema = governed_schema();
+        let mut policy = ResolvedPolicy::default();
+        policy
+            .column_masks
+            .insert("ssn".to_string(), sqe_policy_api::MaskType::Nullify);
+        let gov = StatsGovernance::from_policy(&policy);
+        assert!(partition_field_governed(Some(&spec), 0, &schema, &gov));
+        assert!(!partition_field_governed(Some(&spec), 1, &schema, &gov));
+        assert!(
+            partition_field_governed(Some(&spec), 2, &schema, &gov),
+            "unknown field"
+        );
+        assert!(partition_field_governed(None, 0, &schema, &gov));
+
+        let open = StatsGovernance::from_policy(&ResolvedPolicy::default());
+        assert!(!partition_field_governed(Some(&spec), 0, &schema, &open));
     }
 
     #[test]
