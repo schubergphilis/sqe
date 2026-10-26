@@ -19,12 +19,14 @@
  * Sorting
  */
 use core::fmt;
+use std::collections::BTreeMap;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
+use super::partition::{raw_sources, resolve_sources, UnknownTransform};
 use super::transform::Transform;
 use crate::error::Result;
 use crate::spec::{PrimitiveType, Schema, Type};
@@ -97,7 +99,7 @@ impl fmt::Display for SortField {
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Builder, Default)]
-#[serde(rename_all = "kebab-case")]
+#[serde(try_from = "SortOrderSerde", into = "SortOrderSerde")]
 #[builder(setter(prefix = "with"))]
 #[builder(build_fn(skip))]
 /// A sort order is defined by a sort order id and a list of sort fields.
@@ -109,6 +111,84 @@ pub struct SortOrder {
     /// Details of the sort
     #[builder(setter(each(name = "with_sort_field")), default)]
     pub fields: Vec<SortField>,
+    /// SQE PATCH (sqe#864): the transform name and every source id of each
+    /// field with a [`Transform::Unknown`] transform, keyed by its position in
+    /// `fields`, so the order is written back exactly as it was read.
+    #[builder(setter(skip))]
+    unknown_transforms: BTreeMap<usize, UnknownTransform>,
+}
+
+/// One sort field as JSON, before its transform is resolved.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct RawSortField {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_id: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_ids: Option<Vec<i32>>,
+    transform: String,
+    direction: SortDirection,
+    null_order: NullOrder,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct SortOrderSerde {
+    order_id: i64,
+    fields: Vec<RawSortField>,
+}
+
+impl TryFrom<SortOrderSerde> for SortOrder {
+    type Error = String;
+
+    fn try_from(value: SortOrderSerde) -> std::result::Result<Self, Self::Error> {
+        let mut fields = Vec::with_capacity(value.fields.len());
+        let mut unknown_transforms = BTreeMap::new();
+        for (pos, f) in value.fields.into_iter().enumerate() {
+            let what = format!("sort field {pos} of sort order {}", value.order_id);
+            let (source_id, transform, unknown) =
+                resolve_sources(&what, f.source_id, f.source_ids, &f.transform)?;
+            if let Some(unknown) = unknown {
+                unknown_transforms.insert(pos, unknown);
+            }
+            fields.push(SortField {
+                source_id,
+                transform,
+                direction: f.direction,
+                null_order: f.null_order,
+            });
+        }
+        Ok(SortOrder {
+            order_id: value.order_id,
+            fields,
+            unknown_transforms,
+        })
+    }
+}
+
+impl From<SortOrder> for SortOrderSerde {
+    fn from(order: SortOrder) -> Self {
+        let fields = order
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(pos, f)| {
+                let (source_id, source_ids, transform) =
+                    raw_sources(f.source_id, f.transform, order.unknown_transforms.get(&pos));
+                RawSortField {
+                    source_id,
+                    source_ids,
+                    transform,
+                    direction: f.direction,
+                    null_order: f.null_order,
+                }
+            })
+            .collect();
+        SortOrderSerde {
+            order_id: order.order_id,
+            fields,
+        }
+    }
 }
 
 impl SortOrder {
@@ -124,6 +204,23 @@ impl SortOrder {
         SortOrder {
             order_id: SortOrder::UNSORTED_ORDER_ID,
             fields: Vec::new(),
+            unknown_transforms: BTreeMap::new(),
+        }
+    }
+
+    /// SQE PATCH (sqe#864): the transform name and source ids of the sort
+    /// field at `position` if its transform is unknown to this reader.
+    pub fn unknown_transform(&self, position: usize) -> Option<&UnknownTransform> {
+        self.unknown_transforms.get(&position)
+    }
+
+    /// SQE PATCH (sqe#864): build a sort order from its parts, as a struct
+    /// literal did before the order carried unknown-transform records.
+    pub fn new(order_id: i64, fields: Vec<SortField>) -> SortOrder {
+        SortOrder {
+            order_id,
+            fields,
+            unknown_transforms: BTreeMap::new(),
         }
     }
 
@@ -136,10 +233,7 @@ impl SortOrder {
 
     /// Set the order id for the sort order
     pub fn with_order_id(self, order_id: i64) -> SortOrder {
-        SortOrder {
-            order_id,
-            fields: self.fields,
-        }
+        SortOrder { order_id, ..self }
     }
 }
 
@@ -160,10 +254,9 @@ impl SortOrderBuilder {
                     SortOrder::UNSORTED_ORDER_ID
                 ),
             )),
-            (maybe_order_id, [..]) => Ok(SortOrder {
-                order_id: maybe_order_id.unwrap_or(1),
-                fields: fields.to_vec(),
-            }),
+            (maybe_order_id, [..]) => {
+                Ok(SortOrder::new(maybe_order_id.unwrap_or(1), fields.to_vec()))
+            }
         }
     }
 
@@ -184,6 +277,10 @@ impl SortOrderBuilder {
                         format!("Cannot find source column for sort field: {sort_field}"),
                     ));
                 }
+                // SQE PATCH (sqe#864): a reader cannot type-check a transform
+                // it does not know, and a multi-argument field holds only its
+                // first source here. Readers ignore such a field.
+                Some(_) if sort_field.transform == Transform::Unknown => {}
                 Some(source_field) => {
                     let source_type = source_field.field_type.as_ref();
 
@@ -359,10 +456,7 @@ mod tests {
                 .with_sort_field(sort_field.clone())
                 .build_unbound()
                 .expect("Expected an Ok value"),
-            SortOrder {
-                order_id: 2,
-                fields: vec![sort_field]
-            }
+            SortOrder::new(2, vec![sort_field])
         )
     }
 
@@ -381,10 +475,7 @@ mod tests {
                 .with_sort_field(sort_field.clone())
                 .build_unbound()
                 .expect("Expected an Ok value"),
-            SortOrder {
-                order_id: 1,
-                fields: vec![sort_field]
-            }
+            SortOrder::new(1, vec![sort_field])
         )
     }
 
@@ -574,10 +665,7 @@ mod tests {
 
         assert_eq!(
             sort_order_builder_result.expect("Expected an Ok value"),
-            SortOrder {
-                order_id: 1,
-                fields: vec![sort_field],
-            }
+            SortOrder::new(1, vec![sort_field])
         )
     }
 }
