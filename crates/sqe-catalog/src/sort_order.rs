@@ -153,15 +153,15 @@ mod tests {
 
     #[test]
     fn test_identity_sort_ascending() {
-        let sort_order = SortOrder {
-            order_id: 1,
-            fields: vec![SortField {
+        let sort_order = SortOrder::new(
+            1,
+            vec![SortField {
                 source_id: 1,
                 transform: Transform::Identity,
                 direction: SortDirection::Ascending,
                 null_order: NullOrder::Last,
             }],
-        };
+        );
         let exprs =
             iceberg_sort_to_physical(&sort_order, &make_iceberg_schema(), &make_arrow_schema())
                 .unwrap();
@@ -172,15 +172,15 @@ mod tests {
 
     #[test]
     fn test_identity_sort_descending_nulls_first() {
-        let sort_order = SortOrder {
-            order_id: 1,
-            fields: vec![SortField {
+        let sort_order = SortOrder::new(
+            1,
+            vec![SortField {
                 source_id: 2,
                 transform: Transform::Identity,
                 direction: SortDirection::Descending,
                 null_order: NullOrder::First,
             }],
-        };
+        );
         let exprs =
             iceberg_sort_to_physical(&sort_order, &make_iceberg_schema(), &make_arrow_schema())
                 .unwrap();
@@ -191,9 +191,9 @@ mod tests {
 
     #[test]
     fn test_multi_column_sort() {
-        let sort_order = SortOrder {
-            order_id: 1,
-            fields: vec![
+        let sort_order = SortOrder::new(
+            1,
+            vec![
                 SortField {
                     source_id: 1,
                     transform: Transform::Identity,
@@ -207,7 +207,7 @@ mod tests {
                     null_order: NullOrder::First,
                 },
             ],
-        };
+        );
         let exprs =
             iceberg_sort_to_physical(&sort_order, &make_iceberg_schema(), &make_arrow_schema())
                 .unwrap();
@@ -216,9 +216,9 @@ mod tests {
 
     #[test]
     fn test_non_identity_transform_stops_prefix() {
-        let sort_order = SortOrder {
-            order_id: 1,
-            fields: vec![
+        let sort_order = SortOrder::new(
+            1,
+            vec![
                 SortField {
                     source_id: 1,
                     transform: Transform::Identity,
@@ -232,7 +232,7 @@ mod tests {
                     null_order: NullOrder::Last,
                 },
             ],
-        };
+        );
         let exprs =
             iceberg_sort_to_physical(&sort_order, &make_iceberg_schema(), &make_arrow_schema())
                 .unwrap();

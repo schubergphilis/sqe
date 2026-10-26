@@ -945,7 +945,7 @@ pub mod tests {
 
     use super::resolve_field_id;
     use crate::arrow::ArrowReaderBuilder;
-    use crate::expr::{BoundPredicate, Reference};
+    use crate::expr::{BoundPredicate, Predicate, Reference};
     use crate::io::{FileIO, OutputFile};
     use crate::metadata_columns::{
         RESERVED_COL_NAME_DELETE_FILE_PATH, RESERVED_COL_NAME_DELETE_FILE_POS,
@@ -956,7 +956,8 @@ pub mod tests {
     use crate::scan::{FileScanTask, FileScanTaskDeleteFile};
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Datum,
-        FormatVersion, Literal, MAIN_BRANCH, ManifestEntry, ManifestFile, ManifestListWriter,
+        FormatVersion, Literal, MAIN_BRANCH, Manifest, ManifestEntry, ManifestFile,
+        ManifestListWriter,
         ManifestStatus, ManifestWriterBuilder, MappedField, NameMapping, NestedField, NullOrder,
         Operation, PartitionSpec, PrimitiveType, Schema, Snapshot, SortDirection, SortField,
         SortOrder, Struct, StructType, Summary, TableMetadata, TableMetadataBuilder,
@@ -3035,6 +3036,134 @@ pub mod tests {
 
         assert_eq!(batches[0].num_columns(), 0);
         assert_eq!(batches[0].num_rows(), 1024);
+    }
+
+    // SQE PATCH (sqe#864): swap the fields of the fixture's only partition
+    // spec, keeping its snapshots and files.
+    fn with_partition_fields(fixture: &mut TableTestFixture, fields: serde_json::Value) {
+        let mut json = serde_json::to_value(fixture.table.metadata()).unwrap();
+        json["partition-specs"][0]["fields"] = fields;
+        let metadata: TableMetadata = serde_json::from_value(json).unwrap();
+        fixture.table = Table::builder()
+            .metadata(metadata)
+            .identifier(fixture.table.identifier().clone())
+            .file_io(fixture.table.file_io().clone())
+            .metadata_location(fixture.table.metadata_location().unwrap())
+            .runtime(test_runtime())
+            .build()
+            .unwrap();
+    }
+
+    // Rewrite the `partition-spec` header of every manifest the fixture wrote,
+    // as an engine that writes multi-argument transforms would have.
+    fn rewrite_manifest_partition_specs(fixture: &TableTestFixture, spec_fields: &str) {
+        let dir = format!("{}/metadata", fixture.table_location);
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_str().unwrap();
+            if !name.starts_with("manifest_") || !name.ends_with(".avro") {
+                continue;
+            }
+            let bytes = fs::read(&path).unwrap();
+            let reader = apache_avro::Reader::new(&bytes[..]).unwrap();
+            let schema = reader.writer_schema().clone();
+            let meta = reader.user_metadata().clone();
+            let values: Vec<_> = reader.map(|v| v.unwrap()).collect();
+            let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+            for (key, value) in meta {
+                let value = match key.as_str() {
+                    "partition-spec" => spec_fields.as_bytes().to_vec(),
+                    _ => value,
+                };
+                writer.add_user_metadata(key, value).unwrap();
+            }
+            for value in values {
+                writer.append(value).unwrap();
+            }
+            fs::write(&path, writer.into_inner().unwrap()).unwrap();
+        }
+    }
+
+    async fn count_rows(table: &Table, predicate: Predicate) -> usize {
+        let batches: Vec<_> = table
+            .scan()
+            .with_filter(predicate)
+            .build()
+            .unwrap()
+            .to_arrow()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    // SQE PATCH (sqe#864): the spec requires v3 readers to read a table whose
+    // partition spec uses a transform they do not know, ignoring the field
+    // when filtering. Every row of the fixture has x = 1, but its manifests
+    // record partition values 100 and 300.
+    #[tokio::test]
+    async fn test_scan_ignores_multi_argument_partition_field() {
+        let mut fixture = TableTestFixture::new();
+        // `x_part` rather than `x`: only identity and void fields may share a
+        // name with their source column.
+        with_partition_fields(
+            &mut fixture,
+            serde_json::json!([
+                {"source-id": 1, "field-id": 1000, "name": "x_part", "transform": "identity"}
+            ]),
+        );
+        fixture.setup_manifest_files().await;
+        let x_is_1 = || Reference::new("x").equal_to(Datum::long(1));
+
+        // Under the identity spec the partition values prune both live files.
+        assert_eq!(count_rows(&fixture.table, x_is_1()).await, 0);
+
+        // The same files under a multi-argument spec: the field cannot be
+        // evaluated, so nothing is pruned and the row filter does the work.
+        let multi_arg = r#"[{"source-ids": [1, 2], "field-id": 1000, "name": "x_part", "transform": "zorder"}]"#;
+        rewrite_manifest_partition_specs(&fixture, multi_arg);
+        with_partition_fields(&mut fixture, serde_json::from_str(multi_arg).unwrap());
+        let spec = fixture.table.metadata().default_partition_spec().clone();
+        assert_eq!(spec.fields()[0].transform, Transform::Unknown);
+        assert_eq!(spec.source_ids(&spec.fields()[0]), vec![1, 2]);
+
+        assert_eq!(count_rows(&fixture.table, x_is_1()).await, 2048);
+        assert_eq!(
+            count_rows(&fixture.table, Reference::new("x").equal_to(Datum::long(2))).await,
+            0
+        );
+
+        // The manifest keeps the written partition values, typed from the
+        // manifest's own Avro schema rather than guessed from the transform.
+        let manifest_path = fs::read_dir(format!("{}/metadata", fixture.table_location))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("manifest_")
+            })
+            .unwrap();
+        let manifest = Manifest::parse_avro(&fs::read(manifest_path).unwrap()).unwrap();
+        assert_eq!(
+            manifest.metadata().partition_spec().unknown_transform(1000).unwrap().source_ids,
+            vec![1, 2]
+        );
+        let mut values: Vec<_> = manifest
+            .entries()
+            .iter()
+            .map(|e| e.data_file().partition().fields()[0].clone())
+            .collect();
+        values.sort_by_key(|v| format!("{v:?}"));
+        assert_eq!(values, vec![
+            Some(Literal::long(100)),
+            Some(Literal::long(200)),
+            Some(Literal::long(300)),
+        ]);
     }
 
     #[tokio::test]

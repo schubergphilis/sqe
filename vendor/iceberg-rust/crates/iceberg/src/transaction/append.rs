@@ -887,6 +887,48 @@ mod tests {
         assert!(Arc::new(action).commit(&table).await.is_err());
     }
 
+    // SQE PATCH (sqe#864): a table whose spec has a multi-argument transform
+    // loads, but no file may be committed under that spec.
+    #[tokio::test]
+    async fn test_fast_append_refuses_unknown_transform_spec() {
+        let metadata_str = fs::read_to_string(format!(
+            "{}/testdata/table_metadata/TableMetadataV3ValidMinimal.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let multi = metadata_str
+            .replace(r#""source-id": 1,"#, r#""source-ids": [1, 2],"#)
+            .replace(r#""transform": "identity""#, r#""transform": "zorder""#);
+        let metadata: TableMetadata = serde_json::from_str(&multi).unwrap();
+        let table = Table::builder()
+            .metadata(metadata)
+            .metadata_location("memory:///test/location/metadata/v1.json")
+            .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
+            .file_io(FileIO::new_with_memory())
+            .runtime(test_runtime())
+            .build()
+            .unwrap();
+        assert!(table.metadata().default_partition_spec().has_unknown_transform());
+
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("test/zorder.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::string("z"))]))
+            .build()
+            .unwrap();
+        let action = Transaction::new(&table)
+            .fast_append()
+            .add_data_files(vec![data_file]);
+        let Err(err) = Arc::new(action).commit(&table).await else {
+            panic!("commit under a spec with an unknown transform succeeded");
+        };
+        assert!(err.to_string().contains("unknown transform"), "{err}");
+    }
+
     #[tokio::test]
     async fn test_fast_append_to_existing_void_non_primitive_partition() {
         let table = make_v3_minimal_table();

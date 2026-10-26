@@ -34,10 +34,74 @@ use apache_avro::{Reader as AvroReader, from_value};
 pub use writer::*;
 
 use super::{
-    Datum, FormatVersion, ManifestContentType, PartitionSpec, PrimitiveType, Schema, Struct, Type,
-    UNASSIGNED_SEQUENCE_NUMBER,
+    Datum, FormatVersion, ManifestContentType, NestedField, PartitionSpec, PrimitiveType, Schema,
+    Struct, StructType, Transform, Type, UNASSIGNED_SEQUENCE_NUMBER,
 };
-use crate::error::{Result, invalid_data};
+use crate::error::{invalid_data, Result};
+
+// SQE PATCH (sqe#864): the type of a partition value under a transform this
+// reader does not know cannot come from the spec (`partition_type` guesses
+// string), and a wrong reader type makes Avro schema resolution fail on the
+// whole manifest. The writer schema in the file says what was written, so
+// those fields take their type from it. The value is still kept: the spec
+// says unknown transforms count when testing partition equality.
+fn partition_type_for_reading(
+    metadata: &ManifestMetadata,
+    writer_schema: &apache_avro::Schema,
+) -> Result<StructType> {
+    let spec = &metadata.partition_spec;
+    let spec_type = spec.partition_type(&metadata.schema)?;
+    if !spec.has_unknown_transform() {
+        return Ok(spec_type);
+    }
+    let written = written_partition_type(writer_schema)?;
+    let fields = spec_type
+        .fields()
+        .iter()
+        .zip(spec.fields())
+        .map(|(field, partition_field)| {
+            if partition_field.transform != Transform::Unknown {
+                return Ok(field.clone());
+            }
+            let written_field = written.field_by_id(field.id).ok_or_else(|| {
+                invalid_data!(
+                    "Manifest writer schema has no value for partition field `{}` (id {})",
+                    field.name,
+                    field.id
+                )
+            })?;
+            Ok(Arc::new(NestedField::optional(
+                field.id,
+                &field.name,
+                (*written_field.field_type).clone(),
+            )))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(StructType::new(fields))
+}
+
+/// The `data_file.partition` record of a manifest's Avro writer schema.
+fn written_partition_type(writer_schema: &apache_avro::Schema) -> Result<Schema> {
+    fn record_field<'a>(
+        schema: &'a apache_avro::Schema,
+        name: &str,
+    ) -> Option<&'a apache_avro::Schema> {
+        match schema {
+            apache_avro::Schema::Record(record) => record
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| &f.schema),
+            _ => None,
+        }
+    }
+    let partition = record_field(writer_schema, "data_file")
+        .and_then(|data_file| record_field(data_file, "partition"))
+        .ok_or_else(|| {
+            invalid_data!("Manifest writer schema has no `data_file.partition` record")
+        })?;
+    crate::avro::avro_schema_to_schema(partition)
+}
 
 /// A manifest contains metadata and a list of entries.
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -56,7 +120,7 @@ impl Manifest {
         let metadata = ManifestMetadata::parse(meta)?;
 
         // Parse manifest entries
-        let partition_type = metadata.partition_spec.partition_type(&metadata.schema)?;
+        let partition_type = partition_type_for_reading(&metadata, reader.writer_schema())?;
         // Wrap the partition type once and share it across all entries: the
         // per-entry conversion needs a `&Type`, and building it here keeps the
         // lazily-populated field-name lookup from being rebuilt for every entry.
@@ -131,7 +195,7 @@ impl Manifest {
 /// Serialize a DataFile to a JSON string.
 pub fn serialize_data_file_to_json(
     data_file: DataFile,
-    partition_type: &super::StructType,
+    partition_type: &StructType,
     format_version: FormatVersion,
 ) -> Result<String> {
     let partition_struct_type = Type::Struct(partition_type.clone());
@@ -144,7 +208,7 @@ pub fn serialize_data_file_to_json(
 pub fn deserialize_data_file_from_json(
     json: &str,
     partition_spec_id: i32,
-    partition_type: &super::StructType,
+    partition_type: &StructType,
     schema: &Schema,
 ) -> Result<DataFile> {
     let serde = serde_json::from_str::<_serde::DataFileSerde>(json)
