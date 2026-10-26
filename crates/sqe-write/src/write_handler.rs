@@ -1075,7 +1075,10 @@ impl WriteHandler {
             };
 
             let tx = Transaction::new(&table);
-            let mut action = tx.rewrite_files();
+            // Every caller changes table data, so the snapshot is an
+            // `overwrite`. A `replace` tells incremental readers (Spark
+            // streaming, Databricks) the data did not change, and they skip it.
+            let mut action = tx.overwrite_files();
             if let Some(branch) = &target_branch {
                 action = action.set_target_branch(branch.clone());
             }
@@ -14259,6 +14262,28 @@ s3_path_style = true
                     .get()
                     <= 1
             );
+        }
+
+        /// A CoW rewrite changes data, so it must not be a `replace`
+        /// snapshot: incremental readers skip those as compaction.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn cow_delete_and_update_commit_overwrite_snapshots() {
+            let rig = SqliteRig::new().await;
+            let ident = seeded_id_v(&rig, "cow_op").await;
+            let h = handler(&rig);
+            let op = |table: &IcebergTable| {
+                let snapshot = table.metadata().current_snapshot().expect("snapshot");
+                snapshot.summary().operation.clone()
+            };
+            let overwrite = iceberg::spec::Operation::Overwrite;
+
+            let sql = "DELETE FROM default.cow_op WHERE id = 2";
+            run_delete(&h, &rig, sql).await.expect(sql);
+            assert_eq!(op(&rig.load(&ident).await), overwrite);
+
+            let sql = "UPDATE default.cow_op SET v = 'x' WHERE id = 3";
+            run_update(&h, &rig, sql).await.expect(sql);
+            assert_eq!(op(&rig.load(&ident).await), overwrite);
         }
 
         #[tokio::test(flavor = "multi_thread")]

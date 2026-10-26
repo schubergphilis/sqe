@@ -2297,6 +2297,55 @@ mod tests {
         );
     }
 
+    /// A Unity Catalog namespace also lists Delta tables, which fail to load
+    /// as Iceberg. One table that does not load must not fail the ATTACH.
+    #[tokio::test]
+    async fn attach_skips_a_table_that_does_not_load() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().to_str().unwrap();
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
+        let attach = format!("ATTACH '{path}' AS skipcat (TYPE sqlite)");
+
+        for sql in [
+            attach.as_str(),
+            "CREATE SCHEMA skipcat.ns",
+            "CREATE TABLE skipcat.ns.good (id INT)",
+            "INSERT INTO skipcat.ns.good VALUES (7)",
+            "CREATE TABLE skipcat.ns.bad (id INT)",
+            "DETACH skipcat",
+        ] {
+            client.execute(sql).await.expect(sql);
+        }
+
+        // Remove the metadata of `bad`, so loading it fails.
+        let mut dirs = vec![tmp.path().to_path_buf()];
+        let mut removed = 0;
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read_dir") {
+                let p = entry.expect("entry").path();
+                if p.is_dir() {
+                    dirs.push(p);
+                } else if p.to_string_lossy().contains("/bad/")
+                    && p.to_string_lossy().ends_with(".metadata.json")
+                {
+                    std::fs::remove_file(&p).expect("remove metadata");
+                    removed += 1;
+                }
+            }
+        }
+        assert!(removed > 0, "found the metadata of `bad`");
+
+        client
+            .execute(&attach)
+            .await
+            .expect("ATTACH skips the broken table");
+        let r = client
+            .execute("SELECT id FROM skipcat.ns.good")
+            .await
+            .expect("good reads");
+        assert_eq!(r.rows, vec![vec!["7".to_string()]]);
+    }
+
     #[tokio::test]
     async fn attach_duplicate_catalog_errors() {
         let tmp = tempfile::tempdir().expect("tempdir");
