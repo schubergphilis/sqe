@@ -771,9 +771,26 @@ async fn build_iceberg_rest(
             Secret::Bearer { token } => {
                 props.insert("token".to_string(), token.clone());
             }
+            Secret::OAuth2 {
+                client_id,
+                client_secret,
+                token_url,
+                scope,
+            } => {
+                props.extend(oauth2_props(
+                    client_id.as_deref(),
+                    client_secret,
+                    token_url.as_deref(),
+                    scope.as_deref(),
+                ));
+                // A fixed token would be sent until it expired; the
+                // credential is what renews it.
+                props.remove("token");
+            }
             other => {
                 return Err(format!(
-                    "secret '{secret_ref}' is type {} but TYPE iceberg_rest expects bearer",
+                    "secret '{secret_ref}' is type {} but TYPE iceberg_rest expects bearer \
+                     or oauth2",
                     other.type_name()
                 ));
             }
@@ -808,6 +825,32 @@ async fn build_iceberg_rest(
     _secrets: &SecretStore,
 ) -> Result<Arc<dyn iceberg::Catalog>, String> {
     Err("TYPE iceberg_rest requires the `rest` cargo feature on sqe-catalog".to_string())
+}
+
+/// The REST catalog props for an OAuth2 client-credentials secret. The
+/// catalog exchanges `credential` (`id:secret`, or the bare secret) for a
+/// token at `oauth2-server-uri`, and exchanges it again after a 401.
+/// Without `TOKEN_URL` the catalog uses the deprecated `v1/oauth/tokens`
+/// endpoint of the REST server itself; without `SCOPE`, scope `catalog`.
+#[cfg(feature = "rest")]
+fn oauth2_props(
+    client_id: Option<&str>,
+    client_secret: &str,
+    token_url: Option<&str>,
+    scope: Option<&str>,
+) -> Vec<(String, String)> {
+    let credential = match client_id {
+        Some(id) => format!("{id}:{client_secret}"),
+        None => client_secret.to_string(),
+    };
+    let mut out = vec![("credential".to_string(), credential)];
+    if let Some(url) = token_url {
+        out.push(("oauth2-server-uri".to_string(), url.to_string()));
+    }
+    if let Some(scope) = scope {
+        out.push(("scope".to_string(), scope.to_string()));
+    }
+    out
 }
 
 /// Map ATTACH `S3_*` options to the `s3.*` catalog FileIO props the REST

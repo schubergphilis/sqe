@@ -207,6 +207,8 @@ sqe> SELECT * FROM prod_cat.sales.orders LIMIT 5;
 sqe> DETACH prod_cat;
 ```
 
+A bearer token stops working when it expires. For a catalog that issues short-lived tokens, store the client credential instead: `CREATE SECRET prod (TYPE oauth2, CLIENT_ID 'app', CLIENT_SECRET '...', TOKEN_URL 'https://idp.example.com/token', SCOPE 'catalog')`. The REST client fetches a token with it and fetches a new one when the catalog answers 401.
+
 Supported `TYPE` values are `iceberg_rest`, `glue`, `s3tables`, `hms`, `jdbc`, `sqlite`, and `hadoop`. See [Runtime catalog management](../operations/catalogs.md) for the full reference. The matrix of where each backend can be reached:
 
 | Backend | Cluster (TOML) | Embedded (`--catalog`) | Embedded (`ATTACH`) |
