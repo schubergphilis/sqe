@@ -1946,16 +1946,19 @@ mod tests {
             r.columns,
             vec!["table_schema".to_string(), "table_name".to_string()]
         );
-        // The iceberg-datafusion bridge exposes the user table plus
-        // metadata pseudo-tables ($snapshots, $manifests). We only
-        // require the main table is visible — the pseudo-tables are
-        // a useful side benefit but their exact set is upstream's
-        // concern, not ours.
+        // Metadata pseudo-tables ($snapshots, $manifests) are not
+        // listed (`WritableIcebergCatalog` drops them); only the main
+        // table has to be visible here.
         assert!(
             r.rows
                 .iter()
                 .any(|row| row == &vec!["test_ns".to_string(), "greetings".to_string()]),
             "fresh client should see the pre-existing greetings table; got rows: {:?}",
+            r.rows,
+        );
+        assert!(
+            r.rows.iter().all(|row| !row[1].contains('$')),
+            "metadata tables must not be listed; got rows: {:?}",
             r.rows,
         );
     }
