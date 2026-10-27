@@ -1750,6 +1750,13 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
         authenticator.clone(),
     ));
 
+    // Finding 601 / L4: one ticket-signing key for the whole coordinator.
+    // The query path and the scheduler's maintenance handler both sign
+    // worker requests with it, and workers pin only one key. Loaded before
+    // the worker registry: its health check admits a worker only once the
+    // worker verifies with this key.
+    let ticket_signer = Arc::new(sqe_coordinator::load_ticket_signer(&config.coordinator));
+
     let worker_registry = Arc::new(
         sqe_coordinator::worker_registry::WorkerRegistry::with_options_and_failures(
             config.coordinator.worker_urls.clone(),
@@ -1763,7 +1770,8 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
             )?,
             config.coordinator.max_workers,
             config.coordinator.health_check_max_failures,
-        ),
+        )
+        .with_ticket_public_key(ticket_signer.public_key_b64()),
     );
 
     if distributed {
@@ -2086,11 +2094,6 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
     };
 
     let audit = Arc::new(audit_logger);
-
-    // Finding 601 / L4: one ticket-signing key for the whole coordinator.
-    // The query path and the scheduler's maintenance handler both sign
-    // worker requests with it, and workers pin only one key.
-    let ticket_signer = Arc::new(sqe_coordinator::load_ticket_signer(&config.coordinator));
 
     // Advisory/active auto-compaction scheduler (Phase 4a, Task 5). `Off`
     // mode (the default) constructs NOTHING here: neither the dedicated

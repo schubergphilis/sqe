@@ -141,6 +141,13 @@ pub struct WorkerRegistry {
     /// mismatched worker heartbeating every few seconds produces one warning
     /// per (worker, reason) rather than one per interval.
     logged_hello_rejections: Arc<DashMap<String, String>>,
+    /// This coordinator's scan-ticket public key. The health check marks a
+    /// worker healthy only once the worker verifies with it (see
+    /// [`ticket_key_ready`]); `None` skips the comparison.
+    ticket_public_key: Option<String>,
+    /// Workers answering with another scan-ticket key: since when, and
+    /// whether that was already logged at `warn!`.
+    ticket_key_waits: Arc<DashMap<String, (Instant, bool)>>,
 }
 
 #[derive(Debug)]
@@ -422,7 +429,18 @@ impl WorkerRegistry {
             max_consecutive_failures,
             recovery_quiet_period: DEFAULT_RECOVERY_QUIET_PERIOD,
             logged_hello_rejections: Arc::new(DashMap::new()),
+            ticket_public_key: None,
+            ticket_key_waits: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Health-check workers against this coordinator's scan-ticket key: a
+    /// worker still pinned to a previous coordinator's key is left out of the
+    /// pool until its heartbeat re-pins it.
+    #[must_use = "with_ticket_public_key consumes self; bind the returned registry"]
+    pub fn with_ticket_public_key(mut self, public_key_b64: impl Into<String>) -> Self {
+        self.ticket_public_key = Some(public_key_b64.into());
+        self
     }
 
     /// Finding 609: set how long an evicted worker that still reports
@@ -481,6 +499,22 @@ impl WorkerRegistry {
         }
         self.logged_hello_rejections
             .insert(url.to_string(), reason.to_string());
+        true
+    }
+
+    /// Record a health check that found `url` on another scan-ticket key.
+    /// Returns `true` once per wait, when it has lasted longer than
+    /// `TICKET_KEY_WAIT_WARN_AFTER` (the caller logs at `warn!`).
+    fn note_ticket_key_wait(&self, url: &str) -> bool {
+        let mut wait = self
+            .ticket_key_waits
+            .entry(url.to_string())
+            .or_insert((Instant::now(), false));
+        let (since, warned) = wait.value_mut();
+        if *warned || since.elapsed() < TICKET_KEY_WAIT_WARN_AFTER {
+            return false;
+        }
+        *warned = true;
         true
     }
 
@@ -749,7 +783,22 @@ impl WorkerRegistry {
 
         for (url, result) in results {
             match result {
-                Ok(()) => self.mark_healthy(&url).await,
+                Ok(true) => {
+                    self.ticket_key_waits.remove(&url);
+                    self.mark_healthy(&url).await;
+                }
+                // Alive, but it would refuse this coordinator's tickets: after
+                // a restart the key is new and the worker re-pins on its next
+                // heartbeat (which registers it). Not a failure, not healthy.
+                // A worker that never heartbeats here stays out for good, so
+                // a wait past `TICKET_KEY_WAIT_WARN_AFTER` is reported once.
+                Ok(false) => {
+                    if self.note_ticket_key_wait(&url) {
+                        warn!(worker = %url, "Worker still verifies scan tickets with another coordinator's key; it gets no scans until it heartbeats to this coordinator");
+                    } else {
+                        debug!(worker = %url, "Worker holds another scan-ticket key; waiting for its heartbeat");
+                    }
+                }
                 Err(e) => {
                     debug!(worker = %url, error = %e, "Health check failed");
                     self.channel_pool.invalidate(&url);
@@ -759,10 +808,12 @@ impl WorkerRegistry {
         }
     }
 
+    /// `Ok(true)` when the worker answers and verifies tickets with this
+    /// coordinator's key; `Ok(false)` when it answers but still holds another.
     async fn health_check_worker(
         &self,
         url: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         use arrow_flight::flight_service_client::FlightServiceClient;
         use arrow_flight::Action;
 
@@ -776,8 +827,13 @@ impl WorkerRegistry {
                 r#type: "health_check".to_string(),
                 body: bytes::Bytes::new(),
             };
-            let _response = client.do_action(tonic::Request::new(action)).await?;
-            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+            let mut replies = client
+                .do_action(tonic::Request::new(action))
+                .await?
+                .into_inner();
+            let body = replies.message().await?.map(|r| r.body).unwrap_or_default();
+            let expected = self.ticket_public_key.as_deref();
+            Ok::<bool, Box<dyn std::error::Error + Send + Sync>>(ticket_key_ready(&body, expected))
         };
 
         match tokio::time::timeout(HEALTH_CHECK_TIMEOUT, check).await {
@@ -797,9 +853,59 @@ impl WorkerRegistry {
 /// responsive.
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long a worker may answer with another scan-ticket key before the wait
+/// is logged at `warn!`: several heartbeat intervals, so a coordinator
+/// restart alone stays quiet.
+const TICKET_KEY_WAIT_WARN_AFTER: Duration = Duration::from_secs(60);
+
+/// Whether a worker's `health_check` reply shows it verifies tickets with
+/// `expected`. The worker answers `ok <public key>`, `ok unpinned` before its
+/// first heartbeat, or plain `ok` (no Ed25519 pin, or a build predating the
+/// key in the reply), which is taken as ready as it always was.
+fn ticket_key_ready(body: &[u8], expected: Option<&str>) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    match std::str::from_utf8(body).map(str::trim) {
+        Ok("ok") | Ok("") => true,
+        Ok(reply) => reply.strip_prefix("ok ") == Some(expected),
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A coordinator that restarted has a new key; a worker still pinned to
+    /// the old one refused every ticket until its next heartbeat.
+    #[test]
+    fn health_check_reply_must_name_this_coordinators_key() {
+        assert!(ticket_key_ready(b"ok KEY", Some("KEY")));
+        assert!(!ticket_key_ready(b"ok OLD", Some("KEY")));
+        assert!(!ticket_key_ready(b"ok unpinned", Some("KEY")));
+        // A worker without the key in its reply keeps today's behaviour.
+        assert!(ticket_key_ready(b"ok", Some("KEY")));
+        assert!(ticket_key_ready(b"", Some("KEY")));
+        assert!(ticket_key_ready(b"ok OLD", None));
+    }
+
+    /// A worker on another key is reported once, and only after the wait
+    /// outlasted a restart's heartbeat.
+    #[test]
+    fn a_long_ticket_key_wait_is_reported_once() {
+        let registry = WorkerRegistry::new(vec![]);
+        assert!(
+            !registry.note_ticket_key_wait("w"),
+            "a fresh wait stays quiet"
+        );
+        let long_ago = Instant::now() - TICKET_KEY_WAIT_WARN_AFTER - Duration::from_secs(1);
+        registry
+            .ticket_key_waits
+            .insert("w".to_string(), (long_ago, false));
+        assert!(registry.note_ticket_key_wait("w"));
+        assert!(!registry.note_ticket_key_wait("w"), "reported once");
+    }
 
     #[tokio::test]
     async fn test_empty_registry() {
