@@ -880,6 +880,16 @@ impl SqlClient for EmbeddedClient {
                         return Ok(result);
                     }
                 }
+                sqe_sql::StatementKind::Ctas(ref stmt) => {
+                    if let Some(result) = self.embedded_handle_iceberg_ctas(stmt).await? {
+                        return Ok(result);
+                    }
+                }
+                sqe_sql::StatementKind::ShowTables(_) => {
+                    if let Some(result) = self.embedded_handle_show_tables_in(&exec_sql).await? {
+                        return Ok(result);
+                    }
+                }
                 _ => {}
             },
             // Our own classifier rejected this statement with a specific,
@@ -904,13 +914,23 @@ impl SqlClient for EmbeddedClient {
             Err(_) => {}
         }
 
+        self.run_datafusion(&exec_sql).await
+    }
+}
+
+impl EmbeddedClient {
+    /// Plan and run `exec_sql` (front-door normalized) on DataFusion.
+    async fn run_datafusion(
+        &self,
+        exec_sql: &str,
+    ) -> Result<QueryResult, Box<dyn std::error::Error>> {
         // V12: pre-rewrite `'hf://...'` quoted literals to their HTTPS
         // equivalent. This makes `SELECT * FROM 'hf://...'` (URL-table
         // auto-detect) flow through V10's LazyHttpObjectStoreRegistry the
         // same way `SELECT * FROM 'https://...'` already does. The TVF
         // path (`read_csv('hf://...')`) is unaffected; it does its own
         // rewrite via `rewrite_hf_path_in_place` inside the TVF.
-        let rewritten = sqe_catalog::file_tvf_common::rewrite_hf_urls_in_sql(&exec_sql)?;
+        let rewritten = sqe_catalog::file_tvf_common::rewrite_hf_urls_in_sql(exec_sql)?;
         // DF54: named TVF arguments (`delimiter => ';'`) are no longer
         // accepted by DataFusion directly.  Convert them to the positional
         // `'key=value'` form that `parse_file_tvf_args` understands, exactly
@@ -1203,6 +1223,147 @@ impl EmbeddedClient {
             columns: vec![],
             rows: vec![],
         }))
+    }
+
+    /// The session's default catalog, which a one- or two-part name resolves in.
+    fn default_catalog(&self) -> String {
+        self.ctx
+            .state()
+            .config()
+            .options()
+            .catalog
+            .default_catalog
+            .clone()
+    }
+
+    /// `CREATE TABLE <cat>.<ns>.<t> AS <query>` where `<cat>` is a
+    /// `WritableIcebergCatalog`. DataFusion's CTAS registers a filled
+    /// `MemTable`, which the Iceberg schema provider refuses ("register_table
+    /// does not support tables with data"). It accepts an empty one, so the
+    /// table is created from the query's schema with `LIMIT 0` and filled by
+    /// an `INSERT`, the path a plain INSERT already takes. The two steps are
+    /// not one commit: a failing INSERT drops the empty table again.
+    /// `Ok(None)` means "not ours" and falls through to `ctx.sql`.
+    async fn embedded_handle_iceberg_ctas(
+        &self,
+        stmt: &sqlparser::ast::Statement,
+    ) -> Result<Option<QueryResult>, Box<dyn std::error::Error>> {
+        let sqlparser::ast::Statement::CreateTable(ct) = stmt else {
+            return Ok(None);
+        };
+        let Some(query) = ct.query.as_ref() else {
+            return Ok(None);
+        };
+        let parts: Vec<&str> = ct
+            .name
+            .0
+            .iter()
+            .filter_map(|p| p.as_ident().map(|i| i.value.as_str()))
+            .collect();
+        let catalog = match parts.as_slice() {
+            [catalog, _, _] => catalog.to_string(),
+            [_] | [_, _] => self.default_catalog(),
+            _ => return Ok(None),
+        };
+        if ct.temporary || !ct.columns.is_empty() || !self.iceberg_catalogs.contains_key(&catalog) {
+            return Ok(None);
+        }
+        let name = &ct.name;
+        if ct.or_replace {
+            return Err(format!(
+                "CREATE OR REPLACE TABLE ... AS is not supported for Iceberg catalog \
+                 `{catalog}` in embedded mode; DROP TABLE {name} first"
+            )
+            .into());
+        }
+        let empty = QueryResult {
+            columns: vec![],
+            rows: vec![],
+        };
+        if self.ctx.table_exist(name.to_string().as_str())? {
+            if ct.if_not_exists {
+                return Ok(Some(empty));
+            }
+            return Err(format!("table {name} already exists").into());
+        }
+        self.run_datafusion(&format!(
+            "CREATE TABLE {name} AS SELECT * FROM ({query}) AS __sqe_ctas LIMIT 0"
+        ))
+        .await?;
+        // The error is not `Send`, so only its text crosses the cleanup await.
+        let failure = match self
+            .run_datafusion(&format!("INSERT INTO {name} {query}"))
+            .await
+        {
+            Ok(_) => return Ok(Some(empty)),
+            Err(e) => e.to_string(),
+        };
+        let _ = self
+            .run_datafusion(&format!("DROP TABLE IF EXISTS {name}"))
+            .await;
+        Err(failure.into())
+    }
+
+    /// `SHOW TABLES {IN|FROM} [<catalog>.]<schema> [LIKE '<pattern>']`.
+    /// DataFusion only answers the unscoped form ("SHOW TABLES IN not
+    /// supported"), so the scoped form is answered from
+    /// `information_schema.tables` in the same four columns. `Ok(None)`: no
+    /// scope, DataFusion's own `SHOW TABLES` applies.
+    async fn embedded_handle_show_tables_in(
+        &self,
+        sql: &str,
+    ) -> Result<Option<QueryResult>, Box<dyn std::error::Error>> {
+        use sqlparser::ast::{ShowStatementFilter, ShowStatementFilterPosition, Statement};
+
+        let Ok(mut stmts) =
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, sql)
+        else {
+            return Ok(None);
+        };
+        let Some(Statement::ShowTables { show_options, .. }) = stmts.pop() else {
+            return Ok(None);
+        };
+        let Some(parent) = show_options.show_in.and_then(|si| si.parent_name) else {
+            return Ok(None);
+        };
+        let parts: Vec<String> = parent
+            .0
+            .iter()
+            .filter_map(|p| p.as_ident().map(|i| i.value.clone()))
+            .collect();
+        let (catalog, schema) = match parts.as_slice() {
+            [schema] => (self.default_catalog(), schema.clone()),
+            [catalog, schema] => (catalog.clone(), schema.clone()),
+            _ => return Err(format!("SHOW TABLES IN takes [catalog.]schema, got {parent}").into()),
+        };
+        if self.ctx.catalog(&catalog).is_none() {
+            return Err(format!("catalog `{catalog}` not found").into());
+        }
+        let literal = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        let mut query = format!(
+            "SELECT table_catalog, table_schema, table_name, table_type \
+             FROM information_schema.tables WHERE table_catalog = {} AND table_schema = {}",
+            literal(&catalog),
+            literal(&schema)
+        );
+        let filter = match show_options.filter_position {
+            Some(
+                ShowStatementFilterPosition::Infix(f) | ShowStatementFilterPosition::Suffix(f),
+            ) => Some(f),
+            None => None,
+        };
+        match filter {
+            Some(ShowStatementFilter::Like(p)) => {
+                query.push_str(&format!(" AND table_name LIKE {}", literal(&p)));
+            }
+            Some(ShowStatementFilter::ILike(p)) => {
+                query.push_str(&format!(" AND table_name ILIKE {}", literal(&p)));
+            }
+            Some(other) => return Err(format!("SHOW TABLES: unsupported filter {other}").into()),
+            None => {}
+        }
+        query.push_str(" ORDER BY table_name");
+        self.run_datafusion(&query).await.map(Some)
     }
 
     /// `DROP TABLE` against a Hive root: delete the manifest, never the
@@ -2296,6 +2457,103 @@ mod tests {
             "namespace 'myns' must appear in information_schema; got {:?}",
             r.rows
         );
+    }
+
+    /// CTAS into an Iceberg catalog used to fail with "register_table does
+    /// not support tables with data"; IF NOT EXISTS skips an existing table.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ctas_into_an_iceberg_catalog_writes_the_rows() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().to_str().unwrap();
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
+        for sql in [
+            format!("ATTACH '{path}' AS ice (TYPE sqlite)"),
+            "CREATE SCHEMA ice.s1".to_string(),
+            "CREATE TABLE ice.s1.t AS SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS v(id, name)"
+                .to_string(),
+            "CREATE TABLE IF NOT EXISTS ice.s1.t AS SELECT 9 AS id, 'z' AS name".to_string(),
+        ] {
+            client
+                .execute(&sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        let r = client
+            .execute("SELECT id, name FROM ice.s1.t ORDER BY id")
+            .await
+            .expect("select");
+        assert_eq!(
+            r.rows,
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["2".to_string(), "b".to_string()]
+            ]
+        );
+        let err = client
+            .execute("CREATE TABLE ice.s1.t AS SELECT 1 AS id")
+            .await
+            .expect_err("an existing table without IF NOT EXISTS");
+        assert!(err.to_string().contains("already exists"), "{err}");
+
+        // A failing INSERT leaves no empty table behind. The cast only fails
+        // on a row, so the empty CREATE (`LIMIT 0`) succeeds first.
+        let err = client
+            .execute("CREATE TABLE ice.s1.bad AS SELECT CAST(v AS INT) AS id FROM (VALUES ('x')) AS t(v)")
+            .await
+            .expect_err("the cast fails");
+        assert!(err.to_string().to_lowercase().contains("cast"), "{err}");
+        let r = client
+            .execute("SELECT count(*) FROM information_schema.tables WHERE table_name = 'bad'")
+            .await
+            .expect("count");
+        assert_eq!(r.rows, vec![vec!["0".to_string()]]);
+    }
+
+    /// `SHOW TABLES IN|FROM [catalog.]schema [LIKE ...]` was "SHOW TABLES IN
+    /// not supported" in embedded mode.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn show_tables_in_a_schema() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().to_str().unwrap();
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
+        for sql in [
+            format!("ATTACH '{path}' AS ice (TYPE sqlite)"),
+            "CREATE SCHEMA ice.s1".to_string(),
+            "CREATE SCHEMA ice.s2".to_string(),
+            "CREATE TABLE ice.s1.orders (id BIGINT)".to_string(),
+            "CREATE TABLE ice.s1.items (id BIGINT)".to_string(),
+            "CREATE TABLE ice.s2.other (id BIGINT)".to_string(),
+        ] {
+            client
+                .execute(&sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        let names = |r: QueryResult| -> Vec<String> {
+            r.rows
+                .into_iter()
+                .map(|row| row[2].clone())
+                .filter(|n| !n.contains('$'))
+                .collect()
+        };
+        for sql in ["SHOW TABLES IN ice.s1", "SHOW TABLES FROM ice.s1"] {
+            let r = client
+                .execute(sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(r.columns[2], "table_name");
+            assert_eq!(names(r), vec!["items", "orders"], "{sql}");
+        }
+        let r = client
+            .execute("SHOW TABLES IN ice.s1 LIKE 'ord%'")
+            .await
+            .expect("like");
+        assert_eq!(names(r), vec!["orders"]);
+        let err = client
+            .execute("SHOW TABLES IN nope.s1")
+            .await
+            .expect_err("unknown catalog");
+        assert!(err.to_string().contains("nope"), "{err}");
     }
 
     /// A Unity Catalog namespace also lists Delta tables, which fail to load
