@@ -1007,8 +1007,11 @@ mod tests {
     }
 
     /// Run `sql` under a `CAP` quota while another query holds all of the
-    /// `4 * CAP` coordinator pool, with the rerun armed. The hog lets go
-    /// after `release` when given.
+    /// `4 * CAP` coordinator pool, with the rerun armed. When `release` is
+    /// given the hog lets go that long after the query was refused and took
+    /// the rerun gate. A wall-clock release from the start raced a slow
+    /// runner: the first attempt could reach its reservation after the hog
+    /// had gone, and then nothing was refused or rerun.
     async fn run_beside_a_full_pool(
         sql: &str,
         query: QueryConfig,
@@ -1026,6 +1029,7 @@ mod tests {
         let ctx = crate::query_memory::with_query_limit(base, CAP, 20);
         let logical = ctx.state().create_logical_plan(sql).await.unwrap();
         let plan = ctx.state().create_physical_plan(&logical).await.unwrap();
+        let gate = RerunGate::default();
         let fallback = JoinFallback::new(
             &ctx,
             Arc::clone(&shared),
@@ -1035,16 +1039,19 @@ mod tests {
             &query,
             None,
             uuid::Uuid::nil(),
-            RerunGate::default(),
+            Arc::clone(&gate),
         );
         let replanned = ReplannedPlan::default();
         let stream = execute_stream(Arc::clone(&plan), sort_task_context(&ctx, &plan)).unwrap();
         let stream = FallbackStream::wrap(stream, plan, fallback, replanned.clone());
         let hog = tokio::spawn(async move {
-            match release {
-                Some(after) => tokio::time::sleep(after).await,
-                None => std::future::pending().await,
+            let Some(after) = release else {
+                return std::future::pending().await;
+            };
+            while gate.try_lock().is_ok() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
+            tokio::time::sleep(after).await;
             drop(hog);
         });
         let result = stream.try_collect().await;
