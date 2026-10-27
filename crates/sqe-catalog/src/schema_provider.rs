@@ -498,6 +498,7 @@ impl SchemaProvider for SqeSchemaProvider {
             }
             Err(e) if table_error_is_not_iceberg(&e) => {
                 debug!(table = name, error = %e, "Listed name is not an Iceberg table");
+                crate::file_tvf_prepare::note_not_iceberg(&self.namespace, name);
                 return Ok(None);
             }
             Err(e) => {

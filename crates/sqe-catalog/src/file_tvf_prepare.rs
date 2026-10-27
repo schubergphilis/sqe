@@ -74,6 +74,55 @@ tokio::task_local! {
 #[derive(Default)]
 struct StatementProviders {
     inner: Mutex<HashMap<String, Arc<dyn TableProvider>>>,
+    /// `(namespace, table)` names the catalog listed but would not load as
+    /// Iceberg during this statement; see [`note_not_iceberg`].
+    not_iceberg: Mutex<Vec<(String, String)>>,
+}
+
+/// Record that the catalog listed `namespace.table` but refused to load it
+/// as an Iceberg table (Unity Catalog's Delta tables). The schema provider
+/// resolves such a name to no table, so DataFusion's planner reports it as
+/// "not found" while `SHOW TABLES` lists it; [`explain_not_iceberg`] uses
+/// the note to say what the table is instead. Outside a statement scope it
+/// does nothing.
+pub(crate) fn note_not_iceberg(namespace: &str, table: &str) {
+    let _ = STATEMENT_PROVIDERS.try_with(|scope| {
+        scope
+            .not_iceberg
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((namespace.to_string(), table.to_string()));
+    });
+}
+
+/// Reword DataFusion's `table '<name>' not found` for a name this statement
+/// noted with [`note_not_iceberg`]. Every other error passes through.
+fn explain_not_iceberg(error: DataFusionError) -> DataFusionError {
+    let Ok(Some(name)) = STATEMENT_PROVIDERS.try_with(|scope| {
+        let noted = scope
+            .not_iceberg
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let DataFusionError::Plan(message) = error.find_root() else {
+            return None;
+        };
+        let name = message
+            .strip_prefix("table '")?
+            .strip_suffix("' not found")?;
+        let reference = datafusion::common::TableReference::parse_str(name);
+        noted
+            .iter()
+            .any(|(ns, table)| {
+                reference.table() == table && reference.schema().is_some_and(|s| s == ns)
+            })
+            .then(|| name.to_string())
+    }) else {
+        return error;
+    };
+    DataFusionError::Plan(format!(
+        "table '{name}' is not an Iceberg table: the catalog lists it but does not \
+         serve it as Iceberg (a Delta table in Unity Catalog, for example)"
+    ))
 }
 
 /// Run `fut`, one statement's execution or planning, with a statement-scoped
@@ -112,7 +161,10 @@ pub async fn plan_sql(
 ) -> DFResult<datafusion::dataframe::DataFrame> {
     in_statement(async {
         prepare_statement(ctx, sql).await?;
-        let df = ctx.sql_with_options(sql, planning_options()).await?;
+        let df = ctx
+            .sql_with_options(sql, planning_options())
+            .await
+            .map_err(explain_not_iceberg)?;
         name_unknown_types(bind_statement_params(df)?)
     })
     .await
@@ -179,7 +231,8 @@ pub async fn plan_sql_without_policy(
 ) -> DFResult<datafusion::dataframe::DataFrame> {
     in_statement(async {
         prepare_statement(ctx, sql).await?;
-        name_unknown_types(bind_statement_params(ctx.sql(sql).await?)?)
+        let df = ctx.sql(sql).await.map_err(explain_not_iceberg)?;
+        name_unknown_types(bind_statement_params(df)?)
     })
     .await
 }
@@ -193,7 +246,10 @@ pub async fn plan_parsed(
 ) -> DFResult<datafusion::dataframe::DataFrame> {
     in_statement(async {
         prepare_parsed_statement(ctx, statement).await?;
-        let df = ctx.sql_with_options(sql, planning_options()).await?;
+        let df = ctx
+            .sql_with_options(sql, planning_options())
+            .await
+            .map_err(explain_not_iceberg)?;
         name_unknown_types(bind_statement_params(df)?)
     })
     .await
@@ -229,7 +285,10 @@ pub async fn create_logical_plan(
                 registry.prepare_statement(sql).await?;
             }
         }
-        let plan = state.create_logical_plan(sql).await?;
+        let plan = state
+            .create_logical_plan(sql)
+            .await
+            .map_err(explain_not_iceberg)?;
         match crate::txn::params() {
             Some(params) => sqe_core::bind_params(plan, &params).map_err(DataFusionError::Plan),
             None => Ok(plan),
