@@ -149,10 +149,10 @@ Every cell below full, with its caveats. Each has a `[MATRIX]` issue.
 - **aws-glue-catalog (v3)**: The live AWS test is #[ignore] (needs AWS credentials and a warehouse bucket) and runs locally only; CI does not run it.
 - **unity-catalog (v2)**: The live run needs a Databricks workspace and a user token; it runs by hand, not in CI.
 - **unity-catalog (v2)**: The Databricks user's token is passed through to Unity Catalog and lives about an hour; a long session needs a fresh login.
-- **unity-catalog (v2)**: The embedded CLI does not run DDL on an ATTACHed Unity catalog yet; the coordinator does.
+- **unity-catalog (v2)**: The embedded CLI only reads an ATTACHed Unity catalog yet (no UPDATE, DELETE, MERGE or ALTER; CREATE TABLE with plain columns only); the coordinator does all of it.
 - **unity-catalog (v3)**: The live run needs a Databricks workspace and a user token; it runs by hand, not in CI.
 - **unity-catalog (v3)**: The Databricks user's token is passed through to Unity Catalog and lives about an hour; a long session needs a fresh login.
-- **unity-catalog (v3)**: The embedded CLI does not run DDL on an ATTACHed Unity catalog yet; the coordinator does.
+- **unity-catalog (v3)**: The embedded CLI only reads an ATTACHed Unity catalog yet (no UPDATE, DELETE, MERGE or ALTER; CREATE TABLE with plain columns only); the coordinator does all of it.
 - **unity-catalog (v3)**: DESCRIBE shows a Databricks GEOMETRY column as varbinary; the values read as geometry.
 - **unity-catalog (v3)**: A merge-on-read table with live delete files is scanned on the coordinator only until it is compacted.
 - **shredded-variant (v3)**: Shredded columns are unshredded on read, so typed_value gives no typed field access. Its statistics prune row groups, on the coordinator and on a worker, only for a variant_get / try_variant_get comparison with a literal. SQE writes variant manifest bounds only for top-level shredded columns, and none for a double path or a string over 64 bytes.
