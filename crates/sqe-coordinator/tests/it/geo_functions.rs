@@ -115,6 +115,111 @@ async fn st_functions_over_an_sqe_geometry_table() {
     assert!(err.contains("GEOGRAPHY"), "{err}");
 }
 
+/// DESCRIBE and SHOW CREATE TABLE print a geospatial column's type with its
+/// CRS (`geometry(3857)`), not its `varbinary` storage, and the DDL SHOW
+/// CREATE prints re-creates the same table: same types, same format version.
+/// Catalog-owned properties stay out of it. `ST_SRID` reads the CRS.
+#[tokio::test]
+#[ignore = "needs:polaris"]
+async fn geospatial_types_round_trip_through_describe_and_show_create() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let fq = "default.geo_ddl_round_trip";
+    let copy = "default.geo_ddl_round_trip_copy";
+    for t in [fq, copy] {
+        let _ = handler
+            .execute(&session, &format!("DROP TABLE IF EXISTS {t}"), None)
+            .await;
+    }
+    for sql in [
+        format!(
+            "CREATE TABLE {fq} (id INT, g GEOMETRY(4326), m GEOMETRY(3857), z GEOMETRY(0), \
+             e GEOMETRY('ESRI:102100'), h GEOGRAPHY(4326), k GEOGRAPHY('OGC:CRS84', karney)) \
+             TBLPROPERTIES ('sqe.probe' = 'yes', 'databricks.probe' = 'x', \
+             'io.unitycatalog.tableId' = 'x')"
+        ),
+        format!(
+            "INSERT INTO {fq} VALUES (1, ST_Point(1, 2), ST_Point(1, 2), ST_Point(1, 2), \
+             ST_Point(1, 2), ST_Point(1, 2), ST_Point(1, 2)), (2, NULL, NULL, NULL, NULL, NULL, NULL)"
+        ),
+    ] {
+        handler.execute(&session, &sql, None).await.expect(&sql);
+    }
+
+    let types = |rows: Vec<String>| {
+        rows.into_iter()
+            .map(|r| r.split('|').take(2).collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>()
+    };
+    let described = types(sqe_rows(&handler, &session, &format!("DESCRIBE {fq}")).await);
+    let ddl = sqe_rows(&handler, &session, &format!("SHOW CREATE TABLE {fq}")).await;
+    let ddl = ddl.first().cloned().unwrap_or_default();
+    // Re-create the table from the printed DDL under another name.
+    let body = &ddl[ddl.find(" (").expect("column list")..];
+    let recreate = format!("CREATE TABLE {copy}{body}");
+    handler
+        .execute(&session, &recreate, None)
+        .await
+        .expect(&recreate);
+    let copied = types(sqe_rows(&handler, &session, &format!("DESCRIBE {copy}")).await);
+    let copied_ddl = sqe_rows(&handler, &session, &format!("SHOW CREATE TABLE {copy}")).await;
+    let srids = sqe_rows(
+        &handler,
+        &session,
+        &format!(
+            "SELECT id, ST_SRID(g), ST_SRID(m), ST_SRID(z), ST_SRID(e), ST_SRID(h), \
+             ST_SRID(ST_Point(0, 0)) FROM {fq} ORDER BY id"
+        ),
+    )
+    .await;
+    for t in [fq, copy] {
+        let _ = handler
+            .execute(&session, &format!("DROP TABLE IF EXISTS {t}"), None)
+            .await;
+    }
+
+    assert_eq!(
+        described,
+        vec![
+            "id integer",
+            "g geometry(4326)",
+            "m geometry(3857)",
+            "z geometry(0)",
+            "e geometry('ESRI:102100')",
+            "h geography(4326)",
+            "k geography(4326, karney)",
+        ],
+        "DESCRIBE {fq}"
+    );
+    for want in [
+        "g geometry(4326)",
+        "k geography(4326, karney)",
+        "'format-version' = '3'",
+        "'sqe.probe' = 'yes'",
+    ] {
+        assert!(ddl.contains(want), "SHOW CREATE TABLE lacks {want}: {ddl}");
+    }
+    for hidden in ["databricks.", "io.unitycatalog."] {
+        assert!(
+            !ddl.contains(hidden),
+            "SHOW CREATE TABLE shows {hidden}: {ddl}"
+        );
+    }
+    assert_eq!(copied, described, "the table SHOW CREATE's DDL re-creates");
+    assert_eq!(
+        copied_ddl.first().map(|d| &d[d.find(" (").unwrap_or(0)..]),
+        Some(body),
+        "SHOW CREATE of the copy"
+    );
+    assert_eq!(
+        srids,
+        vec![
+            "1|4326|3857|0|0|4326|0".to_string(),
+            "2|NULL|NULL|NULL|NULL|NULL|0".to_string(),
+        ],
+        "ST_SRID"
+    );
+}
+
 /// An `ST_*` query over a worker scan: the worker ships the geometry column
 /// as WKB and the coordinator evaluates the functions. The table provider
 /// does not push an `ST_*` filter down yet, so the worker ships every row;

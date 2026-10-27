@@ -49,7 +49,13 @@ SHOW COLUMNS FROM analytics.events;
 -- column_name | data_type | is_nullable | comment
 ```
 
-`data_type` is the Trino type name (`bigint`, `array(integer)`, `row(x integer,y varchar)`, `variant`), the same spelling `typeof` returns and `SHOW CREATE TABLE` writes. On the Trino protocol the columns are `Column | Type | Extra | Comment`, as Trino returns them.
+`data_type` is the Trino type name (`bigint`, `array(integer)`, `row(x integer,y varchar)`, `variant`), the same spelling `typeof` returns and `SHOW CREATE TABLE` writes. A geospatial column shows its type and CRS (`geometry(4326)`, `geography(4326, karney)`), not its `varbinary` storage. On the Trino protocol the columns are `Column | Type | Extra | Comment`, as Trino returns them.
+
+## SHOW CREATE TABLE
+
+The DDL runs back as is and re-creates the same table: column types, `PARTITIONED BY`, and a `TBLPROPERTIES` list that always names the `format-version`, because the server's default version is configurable. A sort order prints as a comment line (`-- sort order: region ASC NULLS FIRST`), since CREATE TABLE has no clause for it.
+
+Properties the catalog owns are left out: storage paths bound to the table's location (`write.data.path`, `write.metadata.path`), object-storage layout (`write.object-storage.*`), snapshot retention (`gc.*`, `history.expire.*`) and Unity Catalog's identity and feature keys (`databricks.*`, `io.unitycatalog.*`). Copied into a new table, the paths would point it at the old table's files. Set retention on the new table explicitly if it needs it.
 
 ## SHOW STATS
 
