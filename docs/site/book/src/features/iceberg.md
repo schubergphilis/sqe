@@ -91,7 +91,7 @@ All 25 compared reads match in embedded mode (`ATTACH` in `sqe-cli`), against a 
 
 Known gaps from the same run:
 
-- The embedded CLI does not run DDL on an attached Unity catalog yet. Reads and DML work; CREATE and ALTER go through the coordinator.
+- The embedded CLI only reads an attached Unity catalog yet. It refuses UPDATE, DELETE, MERGE and ALTER, and its CREATE TABLE takes plain columns only; writes go through the coordinator.
 - `DESCRIBE` reports a Databricks `GEOMETRY` column as `varbinary`. The values read as geometry.
 - `SHOW CREATE TABLE` prints Unity's internal table properties (`databricks.*`, `io.unitycatalog.tableId`, the storage paths) and no clustering clause.
 - A Databricks user token lives about an hour. A longer session needs a fresh login, or an `ATTACH` with an [oauth2 secret](../operations/catalogs.md#example-rest-catalog-with-an-oauth2-client-credential) that refreshes a service principal's token. That trades the user's grants for the principal's.

@@ -52,8 +52,9 @@ user's token is passed through to Unity Catalog. There is no service
 account. The token lives about an hour, so a long run may need a fresh
 `databricks auth login`.
 
-The write phases run through the coordinator because the embedded CLI does
-not run DDL on an attached catalog yet.
+The write phases run through the coordinator because the embedded CLI only
+reads an attached catalog yet: it refuses UPDATE, DELETE, MERGE and ALTER,
+and CREATE TABLE only takes plain columns.
 
 Output goes to `$OUT` (default `/tmp/sqe-dbx-interop`): `phase-X.txt`,
 `compare-<mode>.txt`, `probes-<mode>.txt`. `compare` exits non-zero on any
