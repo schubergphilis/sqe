@@ -42,6 +42,8 @@ The coordinator sends workers a `ScanTask`, a lightweight JSON message containin
 
 Workers don't need access to Polaris or Keycloak. The coordinator resolves table metadata, applies security, and provides the worker with direct S3 credentials and file paths.
 
+A `ScanTask` carries data files only, never delete files. The coordinator therefore scans a snapshot that has position deletes, deletion vectors or equality deletes itself, where the Iceberg reader applies them. A merge-on-read table with live deletes runs on the coordinator until it is compacted.
+
 ## Health Checking
 
 The coordinator monitors workers with a background health check task:

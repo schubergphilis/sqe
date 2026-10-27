@@ -201,7 +201,8 @@ SF10 numbers, the clean-rig methodology, and the per-shape guidance on when dist
 | Backend | Status |
 |---|---|
 | Iceberg REST (Polaris, Lakeformation) | Done - default |
-| Unity Catalog OSS (REST-compatible) | Done |
+| Databricks Unity Catalog (Iceberg REST, user token passthrough) | Done - read, write and DML both ways, live-verified 2026-10-27 |
+| Unity Catalog OSS (REST-compatible) | Done - read-only upstream |
 | Snowflake Horizon (REST-compatible) | Done |
 | AWS Glue | Done |
 | AWS S3 Tables | Done |
@@ -254,7 +255,7 @@ Not yet wired:
 
 ## Phase 7 - Iceberg V3 (Done)
 
-Iceberg V3 table format support landed end-to-end. V3 is the default format-version for new tables. The vendored fork at `vendor/iceberg-rust/` carries V3 spec coverage. SQE Iceberg matrix score: 152/162 (93.8%) on the current rubric, rescored in October 2026 (per `docs/evidence/iceberg-matrix-state.json`). The older 167/189 score used a different rubric and is not comparable.
+Iceberg V3 table format support landed end-to-end. V3 is the default format-version for new tables. The vendored fork at `vendor/iceberg-rust/` carries V3 spec coverage. SQE Iceberg matrix score: 156/162 (96.3%) on the current rubric, rescored in October 2026 (per `docs/evidence/iceberg-matrix-state.json`). The older 167/189 score used a different rubric and is not comparable.
 
 ### V3 Features Shipped
 
