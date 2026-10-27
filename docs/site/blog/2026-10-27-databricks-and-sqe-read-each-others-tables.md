@@ -73,7 +73,7 @@ The cost is real. A merge-on-read table with live deletes now scans on one node 
 
 None of these change a value, and all of them are on the list.
 
-- The embedded CLI does not run DDL on an attached catalog yet. Reads and DML work. CREATE and ALTER go through the coordinator.
+- The embedded CLI only reads an attached catalog yet. It refuses UPDATE, DELETE, MERGE and ALTER, and its CREATE TABLE takes plain columns only. Writes go through the coordinator. (An earlier version of this post said DML worked embedded. It does not: the run only ever wrote through the coordinator.)
 - `DESCRIBE` shows a Databricks `GEOMETRY` column as `varbinary`. The values still read as geometry, and `ST_AsText` and `ST_Area` match Databricks.
 - `SHOW CREATE TABLE` prints Unity's internal table properties, including the storage paths, and no clustering clause.
 - SQE has no `ST_SRID`, so the run cannot compare the SRID column for column.

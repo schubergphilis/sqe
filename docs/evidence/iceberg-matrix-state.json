@@ -294,7 +294,7 @@
       "caveats": [
         "The live run needs a Databricks workspace and a user token; it runs by hand, not in CI.",
         "The Databricks user's token is passed through to Unity Catalog and lives about an hour; a long session needs a fresh login.",
-        "The embedded CLI does not run DDL on an ATTACHed Unity catalog yet; the coordinator does."
+        "The embedded CLI only reads an ATTACHed Unity catalog yet (no UPDATE, DELETE, MERGE or ALTER; CREATE TABLE with plain columns only); the coordinator does all of it."
       ]
     },
     "sqe:unity-catalog:v3": {
@@ -304,7 +304,7 @@
       "caveats": [
         "The live run needs a Databricks workspace and a user token; it runs by hand, not in CI.",
         "The Databricks user's token is passed through to Unity Catalog and lives about an hour; a long session needs a fresh login.",
-        "The embedded CLI does not run DDL on an ATTACHed Unity catalog yet; the coordinator does.",
+        "The embedded CLI only reads an ATTACHed Unity catalog yet (no UPDATE, DELETE, MERGE or ALTER; CREATE TABLE with plain columns only); the coordinator does all of it.",
         "DESCRIBE shows a Databricks GEOMETRY column as varbinary; the values read as geometry.",
         "A merge-on-read table with live delete files is scanned on the coordinator only until it is compacted."
       ]
