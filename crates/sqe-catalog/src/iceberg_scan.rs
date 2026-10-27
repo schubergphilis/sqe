@@ -956,10 +956,9 @@ impl IcebergScanExec {
 
     /// True when the planned snapshot references any delete manifests.
     ///
-    /// Used by distributed scan morsel planning (Phase 2): sub-file byte/row-group
-    /// morsels are only safe for delete-free snapshots. When deletes exist the
-    /// coordinator must keep file-level tasks so iceberg-rust's delete pipeline
-    /// still sees whole files.
+    /// The coordinator scans such a snapshot locally: a worker ticket carries
+    /// only data file paths, and the worker's plain Parquet reader would not
+    /// apply the delete files.
     pub async fn snapshot_has_deletes(&self) -> datafusion::error::Result<bool> {
         snapshot_has_delete_files(&self.table, self.snapshot_id).await
     }

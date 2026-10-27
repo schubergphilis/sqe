@@ -4905,6 +4905,20 @@ impl QueryHandler {
             });
         }
 
+        // A worker reads the data files of its ticket with a plain Parquet
+        // reader: the ticket carries no delete files, so position deletes,
+        // deletion vectors and equality deletes would not be applied and the
+        // deleted rows would come back. Scan a snapshot with delete manifests
+        // locally, where iceberg-rust applies them. An error reading the
+        // manifest list counts as "has deletes".
+        if iceberg_scan.snapshot_has_deletes().await.unwrap_or(true) {
+            debug!("Snapshot has delete files, executing locally");
+            return Ok(DistributionDecision::Local {
+                reason: "has_delete_files",
+                scan_node: Some(scan_node),
+            });
+        }
+
         // Check if the scan is large enough to benefit from distribution.
         // Use the configured file-count threshold as a fast proxy (no file size
         // metadata needed at this point).
@@ -5103,46 +5117,19 @@ impl QueryHandler {
 
         // 7. Plan scan morsels, then bin-pack into worker tasks.
         //
-        // Delete-free snapshots: large files are split into byte-range morsels
-        // (~target size) so one multi-GB Parquet file fans out across workers.
-        // The worker resolves each byte range to row groups at open time.
-        // Snapshots with delete files keep file-level morsels only — sub-file
-        // ranges would skip delete application (same gate as embedded
-        // `use_split_assignment` in iceberg_scan.rs).
+        // Large files are split into byte-range morsels (~target size) so one
+        // multi-GB Parquet file fans out across workers. The worker resolves
+        // each byte range to row groups at open time. The snapshot has no
+        // delete files: `decide_iceberg_distribution` keeps those local.
         let target_size_bytes = sqe_core::parse_memory_limit(&self.config.query.target_task_size)
             .unwrap_or(256 * 1024 * 1024) as u64;
         let morsel_target = sqe_planner::DEFAULT_MORSEL_TARGET_BYTES.min(target_size_bytes);
         let morsel_max = sqe_planner::DEFAULT_MORSEL_MAX_BYTES.max(morsel_target);
 
-        let allow_subfile_split = match iceberg_scan.snapshot_has_deletes().await {
-            Ok(has_deletes) => {
-                if has_deletes {
-                    debug!(
-                        "Snapshot has delete files — keeping file-level morsels \
-                         (no sub-file byte ranges)"
-                    );
-                }
-                !has_deletes
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "Failed to probe snapshot deletes; keeping file-level morsels"
-                );
-                false
-            }
-        };
-
-        let morsels = sqe_planner::plan_scan_morsels(
-            &file_info,
-            morsel_target,
-            morsel_max,
-            allow_subfile_split,
-        );
+        let morsels = sqe_planner::plan_scan_morsels(&file_info, morsel_target, morsel_max, true);
         debug!(
             morsel_count = morsels.len(),
             file_count = file_info.len(),
-            allow_subfile_split,
             morsel_target,
             "Planned scan morsels for distribution"
         );
