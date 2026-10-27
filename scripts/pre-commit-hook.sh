@@ -7,7 +7,8 @@
 #   deny              cargo-deny advisories, bans, sources (deny.toml)
 #   audit             cargo-audit RUSTSEC advisories (.cargo/audit.toml)
 #   machete           no unused dependencies (cargo-machete)
-#   clippy            clippy on the whole workspace, warnings denied
+#   clippy            clippy on the crates changed since origin/main, warnings denied
+#   clippy-all        clippy on the whole workspace, warnings denied
 #
 # rustfmt is a ratchet, not a full check: about 275 files on main carry
 # rustfmt drift, and reformatting them all in one change would bury every
@@ -59,6 +60,51 @@ check_rustfmt() {
     fi
 }
 
+clippy_workspace() {
+    cargo clippy --workspace --all-targets --exclude sqe-cli -- -D warnings
+    cargo clippy --package sqe-cli --all-targets --no-default-features -- -D warnings
+}
+
+# Clippy on the crates the branch changes since it left origin/main
+# (CLIPPY_BASE overrides the base). A change outside crates/ and xtask/
+# that can move every crate's lints (Cargo.toml, Cargo.lock, .cargo/,
+# clippy.toml, rust-toolchain.toml) lints the whole workspace, as does a
+# missing base. Dependents of a changed crate are not linted: the MR
+# pipeline compiles the workspace, and `make lint` lints all of it.
+check_clippy() {
+    local base files crates=() crate
+    base=${CLIPPY_BASE:-$(git merge-base HEAD origin/main 2>/dev/null || true)}
+    if [ -z "$base" ]; then
+        echo "clippy: no merge base with origin/main, linting the workspace" >&2
+        clippy_workspace
+        return
+    fi
+    files=$(git diff --name-only "$base" HEAD)
+    if grep -qE '^(Cargo\.(toml|lock)|\.cargo/|clippy\.toml|rust-toolchain\.toml)' <<<"$files"; then
+        echo "clippy: workspace-wide change, linting the workspace" >&2
+        clippy_workspace
+        return
+    fi
+    while read -r crate; do
+        [ -n "$crate" ] && [ -f "$crate/Cargo.toml" ] && crates+=("$(basename "$crate")")
+    done < <(grep -oE '^(crates/[^/]+|xtask)/' <<<"$files" | sed 's:/$::' | sort -u)
+    if [ "${#crates[@]}" -eq 0 ]; then
+        echo "clippy: no crate changed since $(git rev-parse --short "$base")" >&2
+        return
+    fi
+    echo "clippy: ${crates[*]}" >&2
+    local args=()
+    for crate in "${crates[@]}"; do
+        [ "$crate" = sqe-cli ] || args+=(--package "$crate")
+    done
+    if [ "${#args[@]}" -gt 0 ]; then
+        cargo clippy "${args[@]}" --all-targets -- -D warnings
+    fi
+    if printf '%s\n' "${crates[@]}" | grep -qx sqe-cli; then
+        cargo clippy --package sqe-cli --all-targets --no-default-features -- -D warnings
+    fi
+}
+
 case "${1:-}" in
     rustfmt)
         shift
@@ -84,11 +130,13 @@ case "${1:-}" in
         cargo machete --with-metadata crates/sqe-*
         ;;
     clippy)
-        cargo clippy --workspace --all-targets --exclude sqe-cli -- -D warnings
-        cargo clippy --package sqe-cli --all-targets --no-default-features -- -D warnings
+        check_clippy
+        ;;
+    clippy-all)
+        clippy_workspace
         ;;
     *)
-        echo "usage: $0 {rustfmt FILE...|lockfile|hakari|deny|audit|machete|clippy}" >&2
+        echo "usage: $0 {rustfmt FILE...|lockfile|hakari|deny|audit|machete|clippy|clippy-all}" >&2
         exit 2
         ;;
 esac
