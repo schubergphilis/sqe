@@ -13,7 +13,10 @@
 #   and cargo-deny + cargo-audit must pass. A changed crate manifest also
 #   runs cargo-machete. Each takes 5-30 s and needs no compile.
 # - Shell: shellcheck at warning severity on staged scripts.
-# - Pre-push: clippy on the whole workspace, warnings denied.
+# - Pre-push: clippy on the crates the branch changed since origin/main,
+#   warnings denied; a Cargo.toml/Cargo.lock/toolchain change lints the
+#   whole workspace. MR pipelines skip clippy (minimal profile), so this is
+#   the only lint before merge. `make lint` lints the whole workspace.
 #
 # Semgrep, grype, trivy, and syft stay in CI: they need the aikido-tools
 # image and are too heavy for a commit hook.
@@ -24,7 +27,8 @@
 # Run against staged files:
 #   pre-commit run
 #   make pre-commit
-# Run every hook on every file, clippy included (the tree passes clean):
+# Run every hook on every file, clippy on the whole workspace included
+# (the tree passes clean):
 #   make pre-commit-all
 # Skip one hook for a single commit or push: SKIP=clippy git push
 
@@ -133,9 +137,9 @@ repos:
         pass_filenames: false
 
       - id: clippy
-        name: clippy (warnings denied)
+        name: clippy on changed crates (warnings denied)
         entry: scripts/pre-commit-hook.sh clippy
         language: system
-        types: [rust]
+        files: (\.rs|Cargo\.toml|Cargo\.lock|clippy\.toml|rust-toolchain\.toml)$
         pass_filenames: false
         stages: [pre-push]
