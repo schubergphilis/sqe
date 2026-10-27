@@ -26,7 +26,12 @@ pub const SCAN_TASK_VERSION_V4: u32 = 4;
 /// `5` = optional shredded variant prunes (sqe#870): the row-group filters a
 /// worker applies from shredded variant statistics. Bumped only when present.
 pub const SCAN_TASK_VERSION_V5: u32 = 5;
-pub const SCAN_TASK_VERSION_CURRENT: u32 = SCAN_TASK_VERSION_V5;
+/// `6` = optional delete tasks: the Iceberg file scan task of every data file
+/// in the ticket that has delete files, so the worker applies them. A V5
+/// worker would read those files without their deletes, so it must refuse.
+/// Bumped only when present.
+pub const SCAN_TASK_VERSION_V6: u32 = 6;
+pub const SCAN_TASK_VERSION_CURRENT: u32 = SCAN_TASK_VERSION_V6;
 
 /// Default target compressed size for a morsel (128 MiB).
 pub const DEFAULT_MORSEL_TARGET_BYTES: u64 = 128 * 1024 * 1024;
@@ -204,14 +209,26 @@ pub fn plan_file_byte_morsels(
 
 /// Expand a list of whole files into scan morsels for distributed assignment.
 ///
-/// When `allow_subfile_split` is false (delete-bearing snapshots), every file
-/// stays as one morsel. Otherwise files larger than `target_bytes` are
-/// byte-range split so a multi-gigabyte file becomes many worker tasks.
+/// When `allow_subfile_split` is false, every file stays as one morsel.
+/// Otherwise files larger than `target_bytes` are byte-range split so a
+/// multi-gigabyte file becomes many worker tasks.
 pub fn plan_scan_morsels(
     files: &[(String, u64)],
     target_bytes: u64,
     max_bytes: u64,
     allow_subfile_split: bool,
+) -> Vec<ScanMorsel> {
+    plan_scan_morsels_by_file(files, target_bytes, max_bytes, |_| allow_subfile_split)
+}
+
+/// [`plan_scan_morsels`] with the split decision made per file path. A data
+/// file with position deletes or a deletion vector stays whole: each morsel
+/// of it would load the file's deletes again.
+pub fn plan_scan_morsels_by_file(
+    files: &[(String, u64)],
+    target_bytes: u64,
+    max_bytes: u64,
+    allow_subfile_split: impl Fn(&str) -> bool,
 ) -> Vec<ScanMorsel> {
     const DECODED_FACTOR: u64 = 4;
     let mut out = Vec::with_capacity(files.len());
@@ -222,7 +239,7 @@ pub fn plan_scan_morsels(
             target_bytes,
             max_bytes,
             DECODED_FACTOR,
-            allow_subfile_split,
+            allow_subfile_split(path),
         ));
     }
     out

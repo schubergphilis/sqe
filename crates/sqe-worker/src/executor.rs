@@ -42,6 +42,7 @@ use sqe_metrics::{MetricsRegistry, WorkerMetricsRegistry};
 use sqe_planner::{classify_anyhow_error, ScanTask, WorkerFault};
 
 use crate::credential_channel::RefreshableCredentials;
+use crate::delete_files::DeleteFiles;
 use crate::projection_fill::ProjectionFill;
 
 /// A scan error classified while it was still typed (review finding 602).
@@ -788,11 +789,14 @@ pub async fn execute_scan_streaming_with_store(
 /// loop, after that first prefetch had already been issued with the original
 /// store, so credentials refreshed during file one were not applied until
 /// file three (finding 611, `credential_refresh_mid_scan`).
+///
+/// The task's delete files follow the same credentials as the data files.
 fn apply_refreshed_credentials(
     task: &ScanTask,
     credential_rx: Option<&mut watch::Receiver<Option<RefreshableCredentials>>>,
     store_factory: Option<&ObjectStoreFactory>,
     store: &mut Arc<dyn ObjectStore>,
+    deletes: &mut Option<DeleteFiles>,
 ) {
     let (Some(rx), Some(factory)) = (credential_rx, store_factory) else {
         return;
@@ -815,6 +819,16 @@ fn apply_refreshed_credentials(
             error = %e,
             "Failed to rebuild object store with refreshed credentials"
         ),
+    }
+    if let Some(current) = deletes.as_ref() {
+        match current.with_credentials(task, &creds) {
+            Ok(d) => *deletes = Some(d),
+            Err(e) => warn!(
+                fragment_id = %task.fragment_id,
+                error = %e,
+                "Failed to rebuild delete-file reader with refreshed credentials"
+            ),
+        }
     }
 }
 
@@ -872,6 +886,11 @@ async fn scan_streaming_inner(
         None
     };
 
+    // Position deletes and deletion vectors of the task's data files, read
+    // before each file opens (`ScanTask::delete_tasks`).
+    let deletes =
+        DeleteFiles::from_task(&task).map_err(|e| ScanFault::tag(WorkerFault::TaskInvalid, e))?;
+
     let start = std::time::Instant::now();
     let scan_budget = scan_budget.unwrap_or_else(|| default_scan_budget(&session_ctx));
 
@@ -890,6 +909,7 @@ async fn scan_streaming_inner(
         task.file_sizes_bytes.first().copied(),
         coordinator_metrics.as_deref(),
         hive_ctx.as_ref(),
+        deletes.as_ref(),
     )
     .await
     .map_err(ScanFault::classify)?;
@@ -1225,12 +1245,16 @@ async fn scan_streaming_inner(
             None
         };
         let mut idx = 1usize;
+        let mut deletes = deletes;
 
         // Kept alongside `hive_ctx` (which the batch loop still needs) so the
         // prefetch closure has its own handle to clone per open.
         let hive_for_prefetch = hive_ctx.clone();
 
-        let start_next_open = |idx: usize, store: Arc<dyn ObjectStore>| -> PendingOpen {
+        let start_next_open = |idx: usize,
+                               store: Arc<dyn ObjectStore>,
+                               deletes: Option<DeleteFiles>|
+         -> PendingOpen {
             let task = task.clone();
             let footer_cache = footer_cache.clone();
             let predicate = predicate.clone();
@@ -1251,6 +1275,7 @@ async fn scan_streaming_inner(
                     size,
                     coordinator_metrics.as_deref(),
                     hive_for_open.as_ref(),
+                    deletes.as_ref(),
                 )
                 .await
             })
@@ -1268,8 +1293,9 @@ async fn scan_streaming_inner(
                 credential_rx.as_mut(),
                 store_factory.as_ref(),
                 &mut store,
+                &mut deletes,
             );
-            let fut = start_next_open(idx, store.clone());
+            let fut = start_next_open(idx, store.clone(), deletes.clone());
             idx += 1;
             Some(fut)
         } else {
@@ -1338,8 +1364,9 @@ async fn scan_streaming_inner(
                     credential_rx.as_mut(),
                     store_factory.as_ref(),
                     &mut store,
+                    &mut deletes,
                 );
-                pending = Some(start_next_open(idx, store.clone()));
+                pending = Some(start_next_open(idx, store.clone(), deletes.clone()));
                 idx += 1;
             }
         }
@@ -1398,8 +1425,9 @@ async fn scan_streaming_inner(
 /// instead, so they read every file column and let the plan above the scan
 /// discard what it does not need. Narrowing here would shift ordinals and bind
 /// the wrong column.
-// Eight arguments: the seven `open_parquet_stream` already takes, plus the Hive
-// descriptor that decides which reader opens the file. Grouping them into a
+// Nine arguments: seven of the eight `open_parquet_stream` takes, plus the Hive
+// descriptor that decides which reader opens the file and the delete files
+// whose loaded vector becomes the eighth. Grouping them into a
 // struct would only move the same list somewhere else, and the same `#[allow]`
 // is what `execute_scan_streaming_with_store` uses one layer up.
 #[allow(clippy::too_many_arguments)]
@@ -1412,9 +1440,14 @@ async fn open_task_stream(
     known_size: Option<u64>,
     coordinator_metrics: Option<&MetricsRegistry>,
     hive: Option<&Arc<(sqe_planner::HiveScanDescriptor, SchemaRef)>>,
+    deletes: Option<&DeleteFiles>,
 ) -> OpenedFile {
     let hive = match hive {
         None => {
+            let deleted = match deletes {
+                Some(d) => d.load(file_path).await?,
+                None => None,
+            };
             return open_parquet_stream(
                 task,
                 file_path,
@@ -1423,8 +1456,9 @@ async fn open_task_stream(
                 predicate,
                 known_size,
                 coordinator_metrics,
+                deleted.as_ref(),
             )
-            .await
+            .await;
         }
         Some(h) => h,
     };
@@ -1438,6 +1472,7 @@ async fn open_task_stream(
             predicate,
             known_size,
             coordinator_metrics,
+            None,
         )
         .await;
     }
@@ -1469,6 +1504,7 @@ async fn open_task_stream(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[allow(deprecated)] // parquet 59.2.0 deprecated ParquetObjectReader in favour of a
                      // hand-written AsyncFileReader / SpawnedReader. Unlike the DataFusion 55
                      // statistics deprecation, this one is behaviour-identical if left alone: the
@@ -1484,6 +1520,7 @@ async fn open_parquet_stream(
     predicate: Option<&Expr>,
     known_size: Option<u64>,
     coordinator_metrics: Option<&MetricsRegistry>,
+    deleted: Option<&iceberg::delete_vector::DeleteVector>,
 ) -> OpenedFile {
     debug!(file = %file_path, "Reading Parquet file");
     let object_key = s3_url_to_key(file_path)?;
@@ -1784,6 +1821,17 @@ async fn open_parquet_stream(
         // when empty: an empty selection means "this morsel owns no row groups"
         // and must read nothing. `None` means no morsel restriction was given,
         // so the whole file is read.
+        //
+        // Deleted rows are skipped with a row selection over the groups that
+        // remain, so it is computed after every narrowing above.
+        let selection = deleted.map(|dv| {
+            let group_rows: Vec<i64> = meta.row_groups().iter().map(|rg| rg.num_rows()).collect();
+            let groups: Vec<usize> = match selected {
+                Some(ref groups) => groups.clone(),
+                None => (0..n_groups).collect(),
+            };
+            crate::delete_files::row_selection(dv, &group_rows, &groups)
+        });
         if let Some(groups) = selected {
             debug!(
                 fragment_id = %task.fragment_id,
@@ -1793,6 +1841,15 @@ async fn open_parquet_stream(
                 "Applying morsel row-group selection"
             );
             builder = builder.with_row_groups(groups);
+        }
+        if let Some(selection) = selection {
+            debug!(
+                fragment_id = %task.fragment_id,
+                file = %file_path,
+                deleted = deleted.map_or(0, |dv| dv.len()),
+                "Skipping deleted rows"
+            );
+            builder = builder.with_row_selection(selection);
         }
     }
 
@@ -2269,6 +2326,7 @@ mod tests {
             hive: None,
             projection_fill: None,
             variant_prunes: None,
+            delete_tasks: None,
             version: 1,
             morsel_id: None,
             row_group_start: None,
@@ -2747,6 +2805,7 @@ mod tests {
             hive: None,
             projection_fill: None,
             variant_prunes: None,
+            delete_tasks: None,
             version: 1,
             morsel_id: None,
             row_group_start: None,
@@ -2782,6 +2841,7 @@ mod tests {
             None,
             Some(size),
             None,
+            None,
         )
         .await
         .expect("open should succeed");
@@ -2806,6 +2866,7 @@ mod tests {
             None,
             None,
             None, // size unknown -> fall back to head() exactly once
+            None,
             None,
         )
         .await
@@ -2838,6 +2899,7 @@ mod tests {
             None,
             Some(size),
             None,
+            None,
         )
         .await
         .expect("open should succeed");
@@ -2868,6 +2930,7 @@ mod tests {
             None,
             None,
             Some(size),
+            None,
             None,
         )
         .await
@@ -2933,6 +2996,7 @@ mod tests {
             None,
             Some(&predicate),
             Some(size),
+            None,
             None,
         )
         .await
@@ -3009,6 +3073,7 @@ mod tests {
             Some(&predicate),
             Some(size),
             None,
+            None,
         )
         .await
         .expect("open should succeed");
@@ -3072,6 +3137,7 @@ mod tests {
             None,
             None,
             Some(size),
+            None,
             None,
         )
         .await

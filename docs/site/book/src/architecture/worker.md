@@ -42,7 +42,7 @@ The coordinator sends workers a `ScanTask`, a lightweight JSON message containin
 
 Workers don't need access to Polaris or Keycloak. The coordinator resolves table metadata, applies security, and provides the worker with direct S3 credentials and file paths.
 
-A `ScanTask` carries data files only, never delete files. The coordinator therefore scans a snapshot that has position deletes, deletion vectors or equality deletes itself, where the Iceberg reader applies them. A merge-on-read table with live deletes runs on the coordinator until it is compacted.
+A `ScanTask` carries the delete files of each data file it lists (`delete_tasks`, ticket version 6). Before a data file opens, the worker loads its position-delete files and deletion vector through the ticket's S3 credentials and skips the deleted rows with a Parquet row selection. A data file with deletes is never split into byte-range morsels, so its deletes load once per scan. Equality deletes are not row positions: the coordinator scans a snapshot that has them itself, where the Iceberg reader applies them, and a worker refuses a ticket that carries one.
 
 ## Health Checking
 

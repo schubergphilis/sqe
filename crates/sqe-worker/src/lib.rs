@@ -3,6 +3,7 @@ pub mod bootstrap;
 pub mod compaction;
 pub mod config_reload;
 pub mod credential_channel;
+pub mod delete_files;
 pub mod executor;
 pub mod flight_service;
 pub mod heartbeat;

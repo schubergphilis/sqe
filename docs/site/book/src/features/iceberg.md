@@ -87,7 +87,7 @@ The interop run in `scripts/interop/databricks-uc/` checks both directions again
 | Databricks DML on SQE tables | DELETE, UPDATE and INSERT, including a deletion vector on an SQE-written V3 table |
 | SQE DML on Databricks tables | DELETE, UPDATE, MERGE and INSERT, on V2 and V3 tables |
 
-All 25 compared reads match in embedded mode (`ATTACH` in `sqe-cli`), against a single coordinator, and against a coordinator with a worker. The distributed run found a real bug: a worker read its data files without the table's delete files, so rows that Databricks had deleted with a deletion vector came back. A snapshot with delete files is now scanned on the coordinator.
+All 25 compared reads match in embedded mode (`ATTACH` in `sqe-cli`), against a single coordinator, and against a coordinator with a worker. The distributed run found a real bug: a worker read its data files without the table's delete files, so rows that Databricks had deleted with a deletion vector came back. A scan ticket now carries each data file's position deletes and deletion vector, and the worker skips those rows. A snapshot with equality deletes is still scanned on the coordinator.
 
 Known gaps from the same run:
 
