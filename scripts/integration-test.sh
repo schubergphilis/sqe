@@ -54,16 +54,19 @@ echo "Running integration tests..."
 # Skip the test here unless the caller passes
 # their own filter args ($# > 0 implies an explicit test name was selected).
 SKIP_ARGS=()
-if [ "$#" -eq 0 ] && [ "$DISTRIBUTED" != "1" ]; then
-    SKIP_ARGS=(--skip test_distributed_select)
+if [ "$#" -eq 0 ]; then
     # The deep-OR stack-overflow guards (in_subquery_or_stack_overflow.rs
     # prod_stack_4k..32k) are release-only via #[cfg_attr(debug_assertions,
     # ignore)], but `--ignored` force-runs ignored tests, and in a debug
     # build the overflow is an OS-level SIGABRT that kills the whole test
-    # binary. Skip them here (this script runs the debug profile); they run
-    # via `cargo test --release -p sqe-coordinator --test
-    # in_subquery_or_stack_overflow`.
+    # binary. Skip them here (this script runs the debug profile), in the
+    # distributed run too: there the abort ended the run before any
+    # distributed test. They run via `cargo test --release -p sqe-coordinator
+    # --test in_subquery_or_stack_overflow`.
     SKIP_ARGS+=(--skip prod_stack_4k --skip prod_stack_8k --skip prod_stack_16k --skip prod_stack_32k)
+fi
+if [ "$#" -eq 0 ] && [ "$DISTRIBUTED" != "1" ]; then
+    SKIP_ARGS+=(--skip test_distributed_select)
     # Tests that need live sqe-worker processes, not just the test stack. They
     # were added after the test_distributed_select skip above was written, so a
     # default run reported four failures that no healthy machine could avoid.
