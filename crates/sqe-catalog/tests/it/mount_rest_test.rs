@@ -15,7 +15,7 @@ use sqe_core::{Secret, SecretStore};
 use sqe_sql::{CatalogKind, OptionValue};
 use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Standard `/v1/config` body the iceberg-rest catalog reads on first
@@ -188,6 +188,146 @@ async fn build_iceberg_rest_with_bearer_secret() {
         .list_namespaces(None)
         .await
         .expect("list_namespaces with bearer secret");
+}
+
+#[tokio::test]
+async fn build_iceberg_rest_with_oauth2_secret() {
+    let server = MockServer::start().await;
+
+    // The client exchanges the service credential at TOKEN_URL first.
+    // A body mismatch leaves the token request unmatched (404) and the
+    // build fails.
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .and(body_string_contains("grant_type=client_credentials"))
+        .and(body_string_contains("client_id=sp-app"))
+        .and(body_string_contains("client_secret=sp-s3cr"))
+        .and(body_string_contains("scope=all-apis"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"access_token":"oauth-tok","token_type":"bearer","expires_in":3600}"#,
+        ))
+        .expect(1..)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/config"))
+        .and(header("Authorization", "Bearer oauth-tok"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(CONFIG_BODY))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces"))
+        .and(header("Authorization", "Bearer oauth-tok"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(EMPTY_NAMESPACES))
+        .mount(&server)
+        .await;
+
+    let secrets = SecretStore::new();
+    secrets
+        .create(
+            "uc",
+            Secret::OAuth2 {
+                client_id: Some("sp-app".to_string()),
+                client_secret: "sp-s3cr".to_string(),
+                token_url: Some(format!("{}/oauth/token", server.uri())),
+                scope: Some("all-apis".to_string()),
+            },
+        )
+        .expect("create secret");
+
+    let mut options = BTreeMap::new();
+    options.insert(
+        "WAREHOUSE".to_string(),
+        OptionValue::String("my_wh".to_string()),
+    );
+    options.insert(
+        "SECRET".to_string(),
+        OptionValue::SecretRef("uc".to_string()),
+    );
+
+    let catalog = build_catalog(&server.uri(), CatalogKind::IcebergRest, &options, &secrets)
+        .await
+        .expect("build_catalog with oauth2 secret");
+
+    catalog
+        .list_namespaces(None)
+        .await
+        .expect("list_namespaces with oauth2 secret");
+}
+
+#[tokio::test]
+async fn oauth2_secret_renews_an_expired_token() {
+    let server = MockServer::start().await;
+
+    // The first exchange hands out a token the catalog later rejects;
+    // the second hands out a fresh one.
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"access_token":"tok-old","token_type":"bearer","expires_in":3600}"#,
+        ))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"access_token":"tok-new","token_type":"bearer","expires_in":3600}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/config"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(CONFIG_BODY))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces"))
+        .and(header("Authorization", "Bearer tok-old"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces"))
+        .and(header("Authorization", "Bearer tok-new"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(EMPTY_NAMESPACES))
+        .mount(&server)
+        .await;
+
+    let secrets = SecretStore::new();
+    secrets
+        .create(
+            "uc",
+            Secret::OAuth2 {
+                client_id: Some("sp-app".to_string()),
+                client_secret: "sp-s3cr".to_string(),
+                token_url: Some(format!("{}/oauth/token", server.uri())),
+                scope: None,
+            },
+        )
+        .expect("create secret");
+
+    let mut options = BTreeMap::new();
+    options.insert(
+        "WAREHOUSE".to_string(),
+        OptionValue::String("my_wh".to_string()),
+    );
+    options.insert(
+        "SECRET".to_string(),
+        OptionValue::SecretRef("uc".to_string()),
+    );
+
+    let catalog = build_catalog(&server.uri(), CatalogKind::IcebergRest, &options, &secrets)
+        .await
+        .expect("build_catalog with oauth2 secret");
+
+    catalog
+        .list_namespaces(None)
+        .await
+        .expect("a 401 re-exchanges the credential and retries");
 }
 
 #[tokio::test]

@@ -41,7 +41,7 @@ takes a bare identifier so it can be looked up in the secret store.
 
 | `TYPE` value     | `<location>` shape                            | Required options          | Optional options                |
 |------------------|-----------------------------------------------|---------------------------|---------------------------------|
-| `iceberg_rest`   | URL of the Iceberg REST endpoint              | `WAREHOUSE`               | `SECRET` (bearer)               |
+| `iceberg_rest`   | URL of the Iceberg REST endpoint              | `WAREHOUSE`               | `SECRET` (bearer or oauth2)     |
 | `glue`           | empty string (region drives discovery)        | `WAREHOUSE`               | `SECRET` (aws), `REGION`        |
 | `s3tables`       | empty string                                  | `TABLE_BUCKET_ARN`        | `SECRET` (aws), `ENDPOINT_URL`  |
 | `hms`            | Thrift URI (`thrift://host:9083`)             | `WAREHOUSE`               |                                 |
@@ -54,10 +54,14 @@ takes a bare identifier so it can be looked up in the secret store.
 | `TYPE` value | Required keys                                | Used by                |
 |--------------|----------------------------------------------|------------------------|
 | `bearer`     | `TOKEN`                                      | `iceberg_rest`         |
+| `oauth2`     | `CLIENT_SECRET`; optional `CLIENT_ID`, `TOKEN_URL`, `SCOPE` | `iceberg_rest` |
 | `basic`      | `USERNAME`, `PASSWORD`                       | `jdbc`                 |
 | `aws`        | any of `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY`, `SESSION_TOKEN`, `REGION`, `PROFILE` | `glue`, `s3tables` |
 
-A bearer secret stores one token. A basic secret stores a username
+A bearer secret stores one token. When that token expires, the catalog
+stops answering until someone replaces the secret. An oauth2 secret
+stores a client credential instead, and the REST client trades it for
+a token itself. A basic secret stores a username
 and password. An AWS secret can hold any combination of credential
 fields; missing fields fall through to the standard AWS credential
 chain (env vars, profile, IMDS).
@@ -80,6 +84,35 @@ The token never appears in plan history or query logs after the
 `CREATE SECRET` statement; subsequent statements reference it by
 name. The token bytes are zeroized when the secret is dropped or
 the coordinator exits cleanly.
+
+## Example: REST catalog with an OAuth2 client credential
+
+Short-lived tokens, such as a Databricks Unity Catalog token, expire
+within the hour. An oauth2 secret holds the service principal's client
+ID and secret. The catalog runs the OAuth2 client-credentials grant at
+`TOKEN_URL` and sends the returned token as a bearer. On a 401 it
+fetches a new token and retries the request once.
+
+```sql
+CREATE SECRET uc_sp (TYPE oauth2,
+  CLIENT_ID = 'a1b2c3d4-...',
+  CLIENT_SECRET = 'dose...',
+  TOKEN_URL = 'https://workspace.example.com/oidc/v1/token',
+  SCOPE = 'all-apis');
+
+ATTACH 'https://workspace.example.com/api/2.1/unity-catalog/iceberg-rest' AS uc
+  (TYPE iceberg_rest, WAREHOUSE 'main', SECRET uc_sp);
+```
+
+Without `TOKEN_URL`, the client posts to the catalog's own
+`<location>/v1/oauth/tokens` endpoint, as Polaris expects. Without
+`SCOPE`, it asks for the `catalog` scope. Without `CLIENT_ID`, it
+sends only the client secret.
+
+The client secret works like a service account: every session that
+reads through the attached catalog uses the principal's grants, not
+the querying user's. Give the principal only the grants the catalog
+needs.
 
 ## Example: AWS Glue with explicit credentials
 
