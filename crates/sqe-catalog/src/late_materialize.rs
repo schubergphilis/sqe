@@ -163,17 +163,14 @@ pub fn build_row_filter(
     parquet_schema: &SchemaDescriptor,
 ) -> RowFilter {
     // Build a ProjectionMask that selects only the predicate columns
-    // from the full Parquet schema.
+    // from the full Parquet schema. `ProjectionMask::roots` takes root
+    // indices; `columns()` lists leaves, so a struct column before the
+    // predicate column shifted the index onto another column.
+    let roots = parquet_schema.root_schema().get_fields();
     let predicate_col_indices: Vec<usize> = predicate_schema
         .fields()
         .iter()
-        .filter_map(|field| {
-            // Find the root column index in the Parquet schema
-            parquet_schema
-                .columns()
-                .iter()
-                .position(|col| col.name() == field.name().as_str())
-        })
+        .filter_map(|field| roots.iter().position(|root| root.name() == field.name()))
         .collect();
 
     let projection_mask = ProjectionMask::roots(parquet_schema, predicate_col_indices);

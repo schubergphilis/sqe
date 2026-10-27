@@ -5040,10 +5040,18 @@ impl QueryHandler {
         // by-name safety net for order/width drift (workers emit projected
         // columns in parquet FILE order, which may differ from the plan's
         // projection order).
-        let (projected_cols, projected_field_ids) = scan_task_projection(
-            iceberg_scan.projection(),
-            iceberg_scan.table().metadata().current_schema(),
+        //
+        // The names are those of the scanned snapshot's schema: a time-travel
+        // scan resolved against the current schema lost a renamed column
+        // (name-only fallback, NULL on files with physical names such as
+        // Databricks' `col-N`) and read a dropped-and-re-added column through
+        // the new column's field id.
+        let scanned_schema = sqe_catalog::iceberg_scan::snapshot_schema(
+            iceberg_scan.table(),
+            iceberg_scan.snapshot_id(),
         );
+        let (projected_cols, projected_field_ids) =
+            scan_task_projection(iceberg_scan.projection(), &scanned_schema);
 
         // 6a. The declared projection plus each column's initial default, for
         // workers whose files predate a projected column (#831). `None` unless

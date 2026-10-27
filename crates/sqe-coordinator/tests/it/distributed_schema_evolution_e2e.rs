@@ -118,6 +118,83 @@ async fn files_from_before_add_column_and_rename_read_correctly_on_a_worker() {
         .await;
 }
 
+/// Time travel to a snapshot from before a column was dropped and re-added
+/// under the same name, and before another was renamed and its old name
+/// reused. The worker's field ids came from the current schema: `d` resolved
+/// to the new column (absent from the old file, so NULL) and `name` to the
+/// new `name` column. The coordinator's own scan read both right.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn time_travel_reads_the_snapshot_columns_on_a_worker() {
+    let table = "default.dist_time_travel_evolve";
+    let (session, setup) = crate::common::setup_handler().await;
+    let run = |sql: String| {
+        let setup = &setup;
+        let session = &session;
+        async move {
+            setup
+                .execute(session, &sql, None)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        }
+    };
+    let _ = setup
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
+        .await;
+    run(format!(
+        "CREATE TABLE {table} (id BIGINT, name STRING, d DATE)"
+    ))
+    .await;
+    run(format!(
+        "INSERT INTO {table} VALUES (1, 'a', DATE '2026-01-01'), (2, 'b', DATE '2026-02-01')"
+    ))
+    .await;
+    let snapshots =
+        run("SELECT snapshot_id FROM default.\"dist_time_travel_evolve$snapshots\"".into()).await;
+    let old = arrow::util::display::array_value_to_string(snapshots[0].column(0), 0).unwrap();
+    run(format!("ALTER TABLE {table} DROP COLUMN d")).await;
+    run(format!("ALTER TABLE {table} ADD COLUMN d STRING")).await;
+    run(format!("ALTER TABLE {table} RENAME COLUMN name TO label")).await;
+    run(format!("ALTER TABLE {table} ADD COLUMN name STRING")).await;
+    run(format!(
+        "INSERT INTO {table} VALUES (3, 'c', 'new-d', 'new-name')"
+    ))
+    .await;
+
+    let worker = spawn_chaos_worker(ChaosMode::PassThrough).await;
+    let rig = rig(std::slice::from_ref(&worker.url), |_| {}).await;
+    let at_old = format!("SELECT id, name, d FROM {table} FOR VERSION AS OF {old} ORDER BY id");
+    assert_eq!(
+        rendered_rows(&rig, &at_old).await,
+        vec!["1|a|2026-01-01", "2|b|2026-02-01"],
+        "the old snapshot's `name` and `d`, not the columns that reuse the names"
+    );
+    assert!(
+        worker.do_gets() >= 1,
+        "the scan must have run on the worker"
+    );
+    let now = format!("SELECT id, label, d, name FROM {table} ORDER BY id");
+    assert_eq!(
+        rendered_rows(&rig, &now).await,
+        vec!["1|a|NULL|NULL", "2|b|NULL|NULL", "3|c|new-d|new-name"]
+    );
+    // The old files store `name` and `d` under the names the new columns
+    // reuse. A worker predicate bound by name filtered the old columns.
+    for (filter, ids) in [
+        ("name IS NULL", vec!["1", "2"]),
+        ("d IS NULL", vec!["1", "2"]),
+        ("name = 'a'", vec![]),
+        ("label = 'a'", vec!["1"]),
+    ] {
+        let sql = format!("SELECT id FROM {table} WHERE {filter} ORDER BY id");
+        assert_eq!(rendered_rows(&rig, &sql).await, ids, "{filter}");
+    }
+
+    let _ = setup
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
+        .await;
+}
+
 /// No data file stores a V3 `unknown` field, top-level or nested (#859). The
 /// worker reads the narrower struct and must put the member back as NULL, as
 /// the coordinator's own scan does.

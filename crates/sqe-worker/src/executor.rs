@@ -1542,16 +1542,36 @@ async fn open_parquet_stream(
     // the worker decodes predicate columns first and skips non-matching rows.
     // Skipping this is always safe: the coordinator keeps the authoritative
     // FilterExec above the distributed scan.
+    // Columns are matched by field id first; see `predicate_in_file_names`.
+    let in_file_names = predicate.and_then(|predicate| {
+        predicate_in_file_names(
+            predicate,
+            builder.schema(),
+            &task.projected_columns,
+            &task.projected_field_ids,
+        )
+    });
+    if predicate.is_some() && in_file_names.is_none() {
+        debug!(
+            fragment_id = %task.fragment_id,
+            file = %file_path,
+            "Pushed predicate names a column this file lacks; reading without it"
+        );
+    }
+    let (predicate, projection) = match &in_file_names {
+        Some((predicate, projection)) => (Some(predicate), projection.as_slice()),
+        None => (None, task.projected_columns.as_slice()),
+    };
     let pruning_predicate: Option<Arc<dyn PhysicalExpr>> = if let Some(predicate) = predicate {
         let file_schema = builder.schema().clone();
         let built = build_physical_predicate(predicate, &file_schema, &task.fragment_id);
         if let Some(ref filter) = built {
             if late_materialize::is_late_materialization_beneficial(
                 Some(filter.as_ref()),
-                &task.projected_columns,
+                projection,
             ) {
                 let classification =
-                    late_materialize::classify_columns(filter.as_ref(), &task.projected_columns);
+                    late_materialize::classify_columns(filter.as_ref(), projection);
                 let predicate_schema =
                     late_materialize::build_predicate_schema(&classification, &file_schema);
                 match late_materialize::remap_predicate_columns(filter, &predicate_schema) {
@@ -1943,6 +1963,72 @@ fn resolve_scan_projection(
     }
 }
 
+/// The pushed predicate and the projection in this file's column names.
+///
+/// The coordinator names columns as the scanned schema does; a file keeps the
+/// names it was written with (Databricks writes `col-1`, `col-2`, ...). Bound
+/// by name, the predicate failed on such files, and after `RENAME COLUMN name
+/// TO label` + `ADD COLUMN name` it bound the old column: the RowFilter then
+/// dropped rows before the coordinator's filter saw them. Each predicate
+/// column is renamed to the file column carrying its field id.
+///
+/// `None` when a predicate column has no match in this file (added after it
+/// was written, or not projected): the worker reads without the predicate and
+/// the coordinator's filter decides. A file or sender without field ids keeps
+/// the names unchanged, as [`resolve_scan_projection`] does.
+fn predicate_in_file_names(
+    predicate: &Expr,
+    file_schema: &arrow_schema::Schema,
+    projected_columns: &[String],
+    projected_field_ids: &[i32],
+) -> Option<(Expr, Vec<String>)> {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+
+    let unchanged = || Some((predicate.clone(), projected_columns.to_vec()));
+    if projected_field_ids.is_empty() || projected_field_ids.len() != projected_columns.len() {
+        return unchanged();
+    }
+    let mut id_to_name = std::collections::HashMap::with_capacity(file_schema.fields().len());
+    for field in file_schema.fields() {
+        let Some(id) = field
+            .metadata()
+            .get(PARQUET_FIELD_ID_META_KEY)
+            .and_then(|id| id.parse::<i32>().ok())
+        else {
+            return unchanged();
+        };
+        id_to_name.insert(id, field.name().clone());
+    }
+    if id_to_name.is_empty() {
+        return unchanged();
+    }
+    let in_file: std::collections::HashMap<&str, Option<&String>> = projected_columns
+        .iter()
+        .zip(projected_field_ids)
+        .map(|(name, id)| (name.as_str(), id_to_name.get(id)))
+        .collect();
+
+    let renamed = predicate
+        .clone()
+        .transform_up(|expr| match expr {
+            Expr::Column(mut column) => match in_file.get(column.name.as_str()) {
+                Some(Some(file_name)) => {
+                    column.name = (*file_name).clone();
+                    Ok(Transformed::yes(Expr::Column(column)))
+                }
+                _ => datafusion::common::plan_err!("{} is not in this file", column.name),
+            },
+            other => Ok(Transformed::no(other)),
+        })
+        .ok()?
+        .data;
+    let projection = projected_columns
+        .iter()
+        .filter_map(|name| in_file.get(name.as_str()).copied().flatten().cloned())
+        .collect();
+    Some((renamed, projection))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2117,6 +2203,41 @@ mod tests {
         let indices =
             resolve_scan_projection(&schema, &[1, 3], &["id".to_string(), "email".to_string()]);
         assert_eq!(indices, vec![0]);
+    }
+
+    /// The file stores field 2 as `name`; the table renamed it to `label` and
+    /// added a new `name` (field 4). Databricks names the columns `col-N`.
+    #[test]
+    fn predicate_columns_bind_by_field_id() {
+        let projected = ["id".to_string(), "label".to_string(), "name".to_string()];
+        let ids = [1, 2, 4];
+        let file = Schema::new(vec![stamped("id", 1), stamped("name", 2)]);
+
+        let (expr, projection) =
+            predicate_in_file_names(&col("label").eq(lit("a")), &file, &projected, &ids).unwrap();
+        assert_eq!(expr, col("name").eq(lit("a")));
+        assert_eq!(projection, ["id", "name"]);
+        // The new `name` is not in this file, and the file's `name` is another
+        // field: no predicate rather than the wrong column.
+        assert!(predicate_in_file_names(&col("name").is_null(), &file, &projected, &ids).is_none());
+
+        let dbx = Schema::new(vec![stamped("col-1", 1), stamped("col-2", 2)]);
+        let (expr, _) =
+            predicate_in_file_names(&col("label").eq(lit("a")), &dbx, &projected, &ids).unwrap();
+        assert_eq!(expr, col("col-2").eq(lit("a")));
+    }
+
+    /// Without field ids on either side, names stay as they are.
+    #[test]
+    fn predicate_names_unchanged_without_field_ids() {
+        let projected = ["a".to_string()];
+        let plain = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
+        let pred = col("a").gt(lit(5i64));
+        let (expr, projection) = predicate_in_file_names(&pred, &plain, &projected, &[1]).unwrap();
+        assert_eq!((expr, projection), (pred.clone(), vec!["a".to_string()]));
+        let file = Schema::new(vec![stamped("b", 1)]);
+        let (expr, _) = predicate_in_file_names(&pred, &file, &projected, &[]).unwrap();
+        assert_eq!(expr, pred);
     }
 
     // -------------------------------------------------------------------------
@@ -2741,6 +2862,81 @@ mod tests {
         // Predicate a > 5 -> rows a=6..=10 survive -> exactly 5 rows.
         let predicate = col("a").gt(lit(5i64));
 
+        let (stream, _schema, _bytes) = open_parquet_stream(
+            &task,
+            &task.data_file_paths[0],
+            store,
+            None,
+            Some(&predicate),
+            Some(size),
+            None,
+        )
+        .await
+        .expect("open should succeed");
+
+        let batches: Vec<_> = stream.collect().await;
+        let rows: usize = batches
+            .into_iter()
+            .map(|r| r.expect("batch ok").num_rows())
+            .sum();
+        assert_eq!(rows, 5, "RowFilter should keep only rows where a > 5");
+    }
+
+    /// A struct column before the predicate column: `a` is parquet leaf 2 but
+    /// root 1. The RowFilter took the leaf position as a root index, read `b`
+    /// (100..=1000) as `a`, and kept every row.
+    #[tokio::test]
+    async fn open_parquet_stream_predicate_after_a_struct_column() {
+        use arrow_array::{Int64Array, StructArray};
+        use arrow_schema::Fields;
+        use datafusion::logical_expr::{col, lit};
+        use parquet::arrow::ArrowWriter;
+
+        let members = Fields::from(vec![
+            Field::new("x", DataType::Int64, false),
+            Field::new("y", DataType::Int64, false),
+        ]);
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Struct(members.clone()), false),
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let a: Vec<i64> = (1..=10).collect();
+        let b: Vec<i64> = a.iter().map(|v| v * 100).collect();
+        let s = StructArray::new(
+            members,
+            vec![
+                Arc::new(Int64Array::from(a.clone())),
+                Arc::new(Int64Array::from(b.clone())),
+            ],
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(s),
+                Arc::new(Int64Array::from(a)),
+                Arc::new(Int64Array::from(b)),
+            ],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut buf, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        let size = buf.len() as u64;
+        let inner = Arc::new(InMemory::new());
+        inner
+            .put(&OsPath::from("data/f.parquet"), PutPayload::from(buf))
+            .await
+            .unwrap();
+        let store: Arc<dyn ObjectStore> = inner;
+
+        let mut task = scan_task_for_blob();
+        task.projected_columns = vec!["a".to_string(), "b".to_string()];
+        let predicate = col("a").gt(lit(5i64));
         let (stream, _schema, _bytes) = open_parquet_stream(
             &task,
             &task.data_file_paths[0],
