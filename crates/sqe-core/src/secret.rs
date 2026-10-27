@@ -80,6 +80,16 @@ pub enum Secret {
     Bearer { token: String },
     /// Basic auth (HMS over SASL/PLAIN, JDBC, etc.).
     Basic { username: String, password: String },
+    /// OAuth2 client credentials for an Iceberg REST endpoint. The REST
+    /// catalog exchanges them for a token at `token_url` and again after a
+    /// 401, so the catalog outlives any one token.
+    #[serde(rename = "oauth2")]
+    OAuth2 {
+        client_id: Option<String>,
+        client_secret: String,
+        token_url: Option<String>,
+        scope: Option<String>,
+    },
 }
 
 impl std::fmt::Debug for Secret {
@@ -113,6 +123,25 @@ impl std::fmt::Debug for Secret {
                     &if password.is_empty() { "None" } else { "<set>" },
                 )
                 .finish(),
+            Self::OAuth2 {
+                client_id,
+                client_secret,
+                token_url,
+                scope,
+            } => f
+                .debug_struct("Secret::OAuth2")
+                .field("client_id", client_id)
+                .field(
+                    "client_secret",
+                    &if client_secret.is_empty() {
+                        "None"
+                    } else {
+                        "<set>"
+                    },
+                )
+                .field("token_url", token_url)
+                .field("scope", scope)
+                .finish(),
         }
     }
 }
@@ -130,6 +159,7 @@ impl Secret {
             Self::Aws { .. } => "aws",
             Self::Bearer { .. } => "bearer",
             Self::Basic { .. } => "basic",
+            Self::OAuth2 { .. } => "oauth2",
         }
     }
 }
@@ -155,6 +185,7 @@ impl Drop for Secret {
             }
             Self::Bearer { token } => token.zeroize(),
             Self::Basic { password, .. } => password.zeroize(),
+            Self::OAuth2 { client_secret, .. } => client_secret.zeroize(),
         }
     }
 }
@@ -395,6 +426,34 @@ mod tests {
         assert!(!d.contains("ey-very-secret-jwt"), "leaked: {d}");
         assert!(d.contains("<set>"), "presence sentinel missing: {d}");
         assert!(d.contains("Bearer"), "variant tag missing: {d}");
+    }
+
+    #[test]
+    fn oauth2_debug_does_not_leak_client_secret() {
+        let s = Secret::OAuth2 {
+            client_id: Some("sp-client".to_string()),
+            client_secret: "very-secret-client-value".to_string(),
+            token_url: Some("https://idp.example.com/token".to_string()),
+            scope: Some("all-apis".to_string()),
+        };
+        let d = format!("{:?}", s);
+        assert!(!d.contains("very-secret-client-value"), "leaked: {d}");
+        assert!(d.contains("<set>") && d.contains("sp-client"), "{d}");
+        assert_eq!(s.type_name(), "oauth2");
+    }
+
+    #[test]
+    fn oauth2_persists_with_its_kind_tag() {
+        let s = Secret::OAuth2 {
+            client_id: None,
+            client_secret: "x".to_string(),
+            token_url: None,
+            scope: None,
+        };
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(json.contains(r#""kind":"oauth2""#), "{json}");
+        let back: Secret = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(back, Secret::OAuth2 { .. }));
     }
 
     #[test]

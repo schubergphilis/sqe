@@ -99,6 +99,7 @@ pub enum SecretKind {
     Aws,
     Bearer,
     Basic,
+    OAuth2,
 }
 
 impl SecretKind {
@@ -108,6 +109,7 @@ impl SecretKind {
             "aws" => Some(Self::Aws),
             "bearer" => Some(Self::Bearer),
             "basic" => Some(Self::Basic),
+            "oauth2" => Some(Self::OAuth2),
             _ => None,
         }
     }
@@ -118,6 +120,7 @@ impl SecretKind {
             Self::Aws => "aws",
             Self::Bearer => "bearer",
             Self::Basic => "basic",
+            Self::OAuth2 => "oauth2",
         }
     }
 }
@@ -191,6 +194,12 @@ pub fn build_secret_from_stmt(stmt: &CreateSecretStatement) -> Result<Secret, Sq
         SecretKind::Basic => Secret::Basic {
             username: get_str("USERNAME")?,
             password: get_str("PASSWORD")?,
+        },
+        SecretKind::OAuth2 => Secret::OAuth2 {
+            client_id: get_opt("CLIENT_ID"),
+            client_secret: get_str("CLIENT_SECRET")?,
+            token_url: get_opt("TOKEN_URL"),
+            scope: get_opt("SCOPE"),
         },
     };
     Ok(secret)
@@ -610,6 +619,36 @@ mod tests {
         assert_eq!(SecretKind::parse("aws"), Some(SecretKind::Aws));
         assert_eq!(SecretKind::parse("bearer"), Some(SecretKind::Bearer));
         assert_eq!(SecretKind::parse("basic"), Some(SecretKind::Basic));
+        assert_eq!(SecretKind::parse("oauth2"), Some(SecretKind::OAuth2));
+    }
+
+    #[test]
+    fn oauth2_secret_needs_a_client_secret() {
+        let stmt = try_parse_create_secret(
+            "CREATE SECRET uc (TYPE oauth2, CLIENT_ID 'sp', CLIENT_SECRET 's3cr', \
+             TOKEN_URL 'https://idp.example.com/token', SCOPE 'all-apis')",
+        )
+        .expect("parse")
+        .expect("create secret");
+        match &build_secret_from_stmt(&stmt).expect("build") {
+            Secret::OAuth2 {
+                client_id,
+                client_secret,
+                token_url,
+                scope,
+            } => {
+                assert_eq!(client_id.as_deref(), Some("sp"));
+                assert_eq!(client_secret, "s3cr");
+                assert_eq!(token_url.as_deref(), Some("https://idp.example.com/token"));
+                assert_eq!(scope.as_deref(), Some("all-apis"));
+            }
+            other => panic!("expected OAuth2, got {}", other.type_name()),
+        }
+        let stmt = try_parse_create_secret("CREATE SECRET uc (TYPE oauth2, CLIENT_ID 'sp')")
+            .expect("parse")
+            .expect("create secret");
+        let err = build_secret_from_stmt(&stmt).expect_err("no CLIENT_SECRET");
+        assert!(err.to_string().contains("CLIENT_SECRET"), "{err}");
     }
 
     #[test]
@@ -627,7 +666,12 @@ mod tests {
 
     #[test]
     fn secret_kind_name_round_trip() {
-        for k in [SecretKind::Aws, SecretKind::Bearer, SecretKind::Basic] {
+        for k in [
+            SecretKind::Aws,
+            SecretKind::Bearer,
+            SecretKind::Basic,
+            SecretKind::OAuth2,
+        ] {
             assert_eq!(SecretKind::parse(k.name()), Some(k));
         }
     }
