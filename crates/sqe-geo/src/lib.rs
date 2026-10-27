@@ -59,6 +59,9 @@ pub fn geo_udfs() -> Vec<ScalarUDF> {
     Op::ALL
         .iter()
         .map(|op| ScalarUDF::new_from_impl(StFunction::new(*op)))
+        .chain(std::iter::once(ScalarUDF::new_from_impl(StSrid {
+            signature: Signature::user_defined(Volatility::Immutable),
+        })))
         .collect()
 }
 
@@ -87,6 +90,80 @@ pub fn is_geography(field: &Field) -> bool {
                 .map(|e| e != "planar")
         })
         .unwrap_or(false)
+}
+
+/// The CRS and edge model a `geoarrow.wkb` field carries; `None` for any
+/// other field. An absent CRS is `OGC:CRS84`, the Iceberg default; a PROJJSON
+/// object CRS is kept as its JSON text.
+fn wkb_crs_and_edges(field: &Field) -> Option<(String, Option<String>)> {
+    if field.metadata().get(EXTENSION_NAME).map(String::as_str) != Some(GEOARROW_WKB) {
+        return None;
+    }
+    let meta = field
+        .metadata()
+        .get(EXTENSION_METADATA)
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+    let crs = match meta.as_ref().and_then(|m| m.get("crs")) {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(other) if !other.is_null() => other.to_string(),
+        _ => "OGC:CRS84".to_string(),
+    };
+    let edges = meta
+        .as_ref()
+        .and_then(|m| m.get("edges"))
+        .and_then(|e| e.as_str())
+        .filter(|e| *e != "planar")
+        .map(str::to_string);
+    Some((crs, edges))
+}
+
+/// The SRID a CRS string names: `OGC:CRS84` is 4326, `EPSG:n` and
+/// `SRID:n` are n. Anything else (another authority, PROJJSON) is 0, as
+/// PostGIS reports an unknown SRID.
+fn srid_of_crs(crs: &str) -> i64 {
+    if crs.eq_ignore_ascii_case("OGC:CRS84") {
+        return 4326;
+    }
+    let Some((authority, code)) = crs.split_once(':') else {
+        return 0;
+    };
+    if authority.eq_ignore_ascii_case("EPSG") || authority.eq_ignore_ascii_case("SRID") {
+        code.parse().unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+/// The SRID of a `geoarrow.wkb` field's values, from its CRS; 0 for an
+/// untagged field (a computed geometry carries no CRS).
+pub fn field_srid(field: &Field) -> i64 {
+    wkb_crs_and_edges(field).map_or(0, |(crs, _)| srid_of_crs(&crs))
+}
+
+/// The type a `geoarrow.wkb` field has in CREATE TABLE, in the SRID form
+/// Spark's DESCRIBE prints and SQE's DDL reads back: `geometry(4326)`,
+/// `geometry(3857)`, `geography(4326, karney)`. `None` for any other field.
+/// A CRS the numeric form cannot say round-trips quoted:
+/// `geometry('ESRI:102100')`. A geography's default `spherical` edges are
+/// left out, as Spark leaves them out.
+pub fn ddl_type(field: &Field) -> Option<String> {
+    let (crs, edges) = wkb_crs_and_edges(field)?;
+    let srid = srid_of_crs(&crs);
+    // `GEOMETRY(0)` reads back as `SRID:0` and `GEOMETRY(n)` as `EPSG:n`
+    // (n = 4326 as OGC:CRS84), so the number is exact for those three.
+    let exact = crs.eq_ignore_ascii_case("OGC:CRS84")
+        || crs.eq_ignore_ascii_case("SRID:0")
+        || (srid != 0 && crs.eq_ignore_ascii_case(&format!("EPSG:{srid}")));
+    let crs_arg = if exact {
+        srid.to_string()
+    } else {
+        format!("'{}'", crs.replace('\'', "''"))
+    };
+    Some(match edges {
+        None => format!("geometry({crs_arg})"),
+        Some(e) if e == "spherical" => format!("geography({crs_arg})"),
+        Some(e) => format!("geography({crs_arg}, {e})"),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -279,6 +356,54 @@ impl Op {
                 | Op::NumPoints
                 | Op::IsEmpty
         )
+    }
+}
+
+/// `ST_SRID(g)`: the SRID of the column's CRS (see [`field_srid`]), NULL
+/// for a NULL value. The SRID is a property of the column, not of the WKB
+/// bytes, so it comes from the argument's field metadata.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct StSrid {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for StSrid {
+    fn name(&self) -> &str {
+        "st_srid"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        match arg_types {
+            [DataType::Binary | DataType::LargeBinary | DataType::BinaryView] => {
+                Ok(arg_types.to_vec())
+            }
+            [DataType::Null] => Ok(vec![DataType::Binary]),
+            [t] => plan_err!("st_srid: argument 1 must be a geometry (WKB binary), got {t}"),
+            _ => plan_err!("st_srid takes 1 argument(s), got {}", arg_types.len()),
+        }
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Int32)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let srid = args.arg_fields.first().map_or(0, |f| field_srid(f)) as i32;
+        match &args.args[0] {
+            ColumnarValue::Scalar(v) => Ok(ColumnarValue::Scalar(ScalarValue::Int32(
+                (!v.is_null()).then_some(srid),
+            ))),
+            ColumnarValue::Array(a) => {
+                let out: arrow::array::Int32Array = (0..a.len())
+                    .map(|i| a.is_valid(i).then_some(srid))
+                    .collect();
+                Ok(ColumnarValue::Array(Arc::new(out)))
+            }
+        }
     }
 }
 
@@ -935,5 +1060,101 @@ mod tests {
         ctx.sql("SELECT ST_Area(ST_GeomFromBinary(ST_AsBinary(geo))) FROM t")
             .await
             .unwrap();
+    }
+
+    /// A `geoarrow.wkb` field as the scan tags it; `meta` is the extension
+    /// metadata JSON, `None` for no metadata at all.
+    fn wkb_field(meta: Option<&str>) -> Field {
+        let mut m = std::collections::HashMap::from([(
+            EXTENSION_NAME.to_string(),
+            GEOARROW_WKB.to_string(),
+        )]);
+        if let Some(meta) = meta {
+            m.insert(EXTENSION_METADATA.to_string(), meta.to_string());
+        }
+        Field::new("g", DataType::LargeBinary, true).with_metadata(m)
+    }
+
+    /// DESCRIBE / SHOW CREATE types, in the form `geospatial_type` in
+    /// sqe-sql reads back to the same Iceberg type.
+    #[test]
+    fn ddl_type_and_srid_from_field_metadata() {
+        let cases = [
+            (Some(r#"{"crs":"OGC:CRS84"}"#), "geometry(4326)", 4326),
+            (None, "geometry(4326)", 4326),
+            (Some(r#"{"crs":"EPSG:3857"}"#), "geometry(3857)", 3857),
+            (Some(r#"{"crs":"SRID:0"}"#), "geometry(0)", 0),
+            (
+                Some(r#"{"crs":"SRID:4326"}"#),
+                "geometry('SRID:4326')",
+                4326,
+            ),
+            (
+                Some(r#"{"crs":"ESRI:102100"}"#),
+                "geometry('ESRI:102100')",
+                0,
+            ),
+            (
+                Some(r#"{"crs":"OGC:CRS84","edges":"spherical"}"#),
+                "geography(4326)",
+                4326,
+            ),
+            (
+                Some(r#"{"crs":"EPSG:4258","edges":"karney"}"#),
+                "geography(4258, karney)",
+                4258,
+            ),
+            (
+                Some(r#"{"crs":"OGC:CRS84","edges":"planar"}"#),
+                "geometry(4326)",
+                4326,
+            ),
+        ];
+        for (meta, ddl, srid) in cases {
+            let f = wkb_field(meta);
+            assert_eq!(ddl_type(&f).as_deref(), Some(ddl), "{meta:?}");
+            assert_eq!(field_srid(&f), srid, "{meta:?}");
+        }
+        let plain = Field::new("b", DataType::LargeBinary, true);
+        assert_eq!(ddl_type(&plain), None);
+        assert_eq!(field_srid(&plain), 0);
+    }
+
+    #[tokio::test]
+    async fn st_srid_reads_the_column_crs() {
+        let wkb = encode(&Geometry::Point(Point::new(1.0, 2.0))).unwrap();
+        let col: ArrayRef = Arc::new(LargeBinaryArray::from_iter([Some(wkb.as_slice()), None]));
+        let schema = Arc::new(Schema::new(vec![
+            wkb_field(Some(r#"{"crs":"OGC:CRS84"}"#)).with_name("g"),
+            wkb_field(Some(r#"{"crs":"EPSG:3857"}"#)).with_name("m"),
+        ]));
+        let ctx = ctx();
+        ctx.register_batch(
+            "t",
+            RecordBatch::try_new(schema, vec![col.clone(), col]).unwrap(),
+        )
+        .unwrap();
+        let out = ctx
+            .sql("SELECT ST_SRID(g), ST_SRID(m), ST_SRID(ST_Point(1, 2)) FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let ints = |i: usize| {
+            out[0]
+                .column(i)
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ints(0), vec![Some(4326), None]);
+        assert_eq!(ints(1), vec![Some(3857), None]);
+        assert_eq!(
+            ints(2),
+            vec![Some(0), Some(0)],
+            "a computed geometry has no CRS"
+        );
+        assert_eq!(one("SELECT ST_SRID(NULL)").await, "");
     }
 }
