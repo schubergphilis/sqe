@@ -1178,11 +1178,33 @@ mod tests {
         assert_eq!(strings(&batches, "table_name"), ["orders", "orders"]);
         assert_eq!(strings(&batches, "column_name"), ["id", "data"]);
 
-        let error = ctx
-            .sql("SELECT * FROM lake.sales.customers")
+        // Read directly, it is named for what it is, not "not found"; a name
+        // the catalog does not have still is.
+        let error = crate::file_tvf_prepare::plan_sql(&ctx, "SELECT * FROM lake.sales.customers")
             .await
             .expect_err("a name that is not an Iceberg table resolves to no table");
-        assert!(error.to_string().contains("not found"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("table 'lake.sales.customers' is not an Iceberg table"),
+            "{error}"
+        );
+        Mock::given(method("GET"))
+            .and(path(table_path("sales", "nope")))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": {"message": "Table does not exist: sales.nope", "type": "NoSuchTableException", "code": 404}
+            })))
+            .mount(&server)
+            .await;
+        let error = crate::file_tvf_prepare::plan_sql(&ctx, "SELECT * FROM lake.sales.nope")
+            .await
+            .expect_err("an absent table");
+        assert!(
+            error
+                .to_string()
+                .contains("table 'lake.sales.nope' not found"),
+            "{error}"
+        );
     }
 
     /// A catalog that cannot list namespaces contributes no rows to any of
