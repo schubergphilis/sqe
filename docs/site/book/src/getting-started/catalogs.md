@@ -177,7 +177,7 @@ The block accepts the same keys as the top-level `[storage]` block: `s3_endpoint
 
 Today storage overrides apply at scan / write time. The `client_credentials` token is fetched once at session-build time and reused for the session lifetime; refresh-on-expiry is a future change.
 
-## REST: Polaris, Nessie, Unity OSS, AWS Glue REST, AWS S3 Tables REST
+## REST: Polaris, Nessie, Unity Catalog, AWS Glue REST, AWS S3 Tables REST
 
 The default. Most production deployments speak Iceberg REST.
 
@@ -207,7 +207,8 @@ IMDS).
 |---------|---------------|------|
 | Apache Polaris | `https://polaris/api/catalog` | OIDC bearer |
 | Project Nessie 0.107+ | `https://nessie/api/v1/iceberg` | bearer / anonymous |
-| Unity Catalog OSS | `https://unity/api/2.1/unity-catalog/iceberg` | bearer (Databricks) / anonymous (OSS) |
+| Databricks Unity Catalog | `https://<workspace>/api/2.1/unity-catalog/iceberg-rest` | Databricks user token, passed through ([interop](../features/iceberg.md#databricks-unity-catalog-interop)) |
+| Unity Catalog OSS | `https://unity/api/2.1/unity-catalog/iceberg` | anonymous (read-only) |
 | AWS Glue Iceberg REST | `https://glue.<region>.amazonaws.com/iceberg` | AWS SigV4 (auto-detected) |
 | AWS S3 Tables REST | `https://s3tables.<region>.amazonaws.com/iceberg/v1` | AWS SigV4 (auto-detected) |
 | RustFS S3 Tables 1.0.0-rc.6+ | `http://rustfs:9000/iceberg` | AWS SigV4, service `s3` (`auth.type = "aws"`, `signing_name = "s3"`) |

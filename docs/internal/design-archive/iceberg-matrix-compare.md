@@ -1,6 +1,6 @@
 # Public Iceberg Matrix Comparison
 
-Side-by-side comparison of SQE with every engine on [icebergmatrix.org](https://icebergmatrix.org). Upstream data: [Neuw84/iceberg-matrix@d14d0f1341](https://github.com/Neuw84/iceberg-matrix/tree/d14d0f1341971cca8a8a218ca412d2cff28e3253) (MIT), fetched 2026-10-23. SQE data: [`docs/evidence/iceberg-matrix-state.json`](../../evidence/iceberg-matrix-state.json), rendered per cell in [`iceberg-matrix.md`](./iceberg-matrix.md).
+Side-by-side comparison of SQE with every engine on [icebergmatrix.org](https://icebergmatrix.org). Upstream data: [Neuw84/iceberg-matrix@027f151356](https://github.com/Neuw84/iceberg-matrix/tree/027f1513563f1453ee4d04f3b7b36ff2464a4a6a) (MIT), fetched 2026-10-27. SQE data: [`docs/evidence/iceberg-matrix-state.json`](../../evidence/iceberg-matrix-state.json), rendered per cell in [`iceberg-matrix.md`](./iceberg-matrix.md).
 
 Every engine is scored on the same 54 cells: one per feature and format version the rubric applies to. full=3, partial=2, unknown=1, none=0; max 162. SQE rates itself; the other engines are rated by the upstream maintainers and contributors.
 
@@ -10,7 +10,7 @@ Cells read `V2/V3`: `F` full, `P` partial, `?` unknown, `.` none, `-` the rubric
 
 | Rank | Engine | Score | % |
 |---:|---|---:|---:|
-| 1 | **SQE (self-rated)** | 152/162 | 93.8 |
+| 1 | **SQE (self-rated)** | 156/162 | 96.3 |
 | 2 | AWS EMR (8.1 Spark) | 147/162 | 90.7 |
 | 3 | Starburst (482-e) | 147/162 | 90.7 |
 | 4 | Dremio / SAP (26.x) | 146/162 | 90.1 |
@@ -26,7 +26,7 @@ Cells read `V2/V3`: `F` full, `P` partial, `?` unknown, `.` none, `-` the rubric
 | 14 | AWS Managed Flink (2.3) | 124/162 | 76.5 |
 | 15 | AWS Managed Flink (2.3) (S3 Tables) | 124/162 | 76.5 |
 | 16 | Doris (4.2) | 122/162 | 75.3 |
-| 17 | DuckDB (1.5.5) | 116/162 | 71.6 |
+| 17 | DuckDB (2.0.0) | 121/162 | 74.7 |
 | 18 | PyIceberg (0.12.0) | 113/162 | 69.8 |
 | 19 | Databricks (DBR 18.2) | 110/162 | 67.9 |
 | 20 | AWS Redshift (S3) | 95/162 | 58.6 |
@@ -59,7 +59,7 @@ Cells read `V2/V3`: `F` full, `P` partial, `?` unknown, `.` none, `-` the rubric
 | Position Deletes | F/- | F/- | F/- | F/- | F/- | F/- | ./- | ./- | F/- | ?/- |
 | Equality Deletes | F/F | ./. | ./. | F/F | ./. | ./. | ./. | ./? | ./. | ?/. |
 | Merge-on-Read | F/F | F/F | F/F | F/F | F/F | F/F | ./. | ./? | F/. | ?/. |
-| Copy-on-Write | F/F | F/F | ./. | ./. | ./. | ./? | F/F | ./? | ./. | ./. |
+| Copy-on-Write | F/F | F/F | ./. | ./. | ./. | ./. | F/F | ./? | ./. | ./. |
 | Lineage Tracking | -/F | -/F | -/F | -/F | -/P | -/F | -/. | -/. | -/F | -/. |
 | Deletion Vectors | -/F | -/F | -/F | -/F | -/F | -/F | -/. | -/. | -/. | -/? |
 
@@ -72,7 +72,7 @@ Cells read `V2/V3`: `F` full, `P` partial, `?` unknown, `.` none, `-` the rubric
 | Column Default Values | -/F | -/. | -/. | -/. | -/F | -/F | -/P | -/. | -/. | -/? |
 | Table Creation | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/? | F/F | P/? |
 | Time Travel / Snapshots | F/F | F/F | F/F | F/F | F/F | F/F | F/F | P/? | F/. | ./. |
-| Table Maintenance | F/F | F/F | F/F | P/P | F/F | ./. | P/P | ./? | P/. | ./. |
+| Table Maintenance | F/F | F/F | F/F | P/P | F/F | P/. | P/P | ./? | P/. | ./. |
 | Branching & Tagging | F/F | F/F | P/P | P/P | F/F | ./. | F/F | ./? | ./. | ./. |
 
 ### Partitioning
@@ -80,8 +80,8 @@ Cells read `V2/V3`: `F` full, `P` partial, `?` unknown, `.` none, `-` the rubric
 | Feature | SQE | Spark | Trino | Flink | Doris | DuckDB | PyIce | Daft | CH | Dbend |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | Hidden Partitioning | F/F | F/F | F/F | P/P | F/F | F/F | F/F | F/? | F/F | ?/? |
-| Partition Evolution | F/F | F/F | F/F | P/P | F/F | F/P | F/F | F/? | P/. | ./. |
-| Multi-Argument Transforms | -/. | -/. | -/. | -/? | -/? | -/. | -/. | -/. | -/. | -/? |
+| Partition Evolution | F/F | F/F | F/F | P/P | F/F | F/F | F/F | F/? | P/. | ./. |
+| Multi-Argument Transforms | -/P | -/. | -/. | -/? | -/? | -/. | -/. | -/. | -/. | -/? |
 
 ### Read / write
 
@@ -100,7 +100,7 @@ Cells read `V2/V3`: `F` full, `P` partial, `?` unknown, `.` none, `-` the rubric
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | AWS Glue Catalog | F/F | F/F | F/F | F/F | P/P | F/F | F/F | F/? | F/. | F/? |
 | REST Catalog | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/? | P/. | F/? |
-| Unity Catalog | P/P | F/F | P/P | P/P | P/P | P/? | P/P | P/? | P/. | P/? |
+| Unity Catalog | F/F | F/F | P/P | P/P | P/P | P/? | P/P | P/? | P/. | P/? |
 | Snowflake Horizon Catalog | P/P | F/P | P/P | F/P | P/P | F/? | F/P | F/? | P/? | P/? |
 | Google Lakehouse | P/P | P/P | P/P | P/P | P/P | P/P | P/P | P/? | P/? | P/? |
 
@@ -112,7 +112,7 @@ Cells read `V2/V3`: `F` full, `P` partial, `?` unknown, `.` none, `-` the rubric
 | Shredded Variant | -/F | -/. | -/P | -/. | -/P | -/F | -/. | -/. | -/. | -/? |
 | Geometry / Geo Types | -/P | -/. | -/F | -/. | -/. | -/P | -/. | -/. | -/P | -/? |
 | Nanosecond Timestamps | -/F | -/. | -/F | -/F | -/. | -/F | -/F | -/P | -/. | -/. |
-| Unknown Type | -/F | -/F | -/. | -/. | -/. | -/. | -/F | -/F | -/. | -/? |
+| Unknown Type | -/F | -/F | -/. | -/. | -/. | -/F | -/F | -/F | -/. | -/? |
 
 ---
 
@@ -147,7 +147,7 @@ Cells read `V2/V3`: `F` full, `P` partial, `?` unknown, `.` none, `-` the rubric
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | Hidden Partitioning | F/F | F/F | F/F | F/F | F/F | F/F | F/F | ./. | F/. | P/. | ?/? |
 | Partition Evolution | F/F | F/F | F/F | F/F | F/F | F/F | F/F | P/P | F/. | ./. | ?/? |
-| Multi-Argument Transforms | -/. | -/. | -/. | -/. | -/. | -/. | -/. | -/. | -/. | -/. | -/? |
+| Multi-Argument Transforms | -/P | -/. | -/. | -/. | -/. | -/. | -/. | -/. | -/. | -/. | -/? |
 
 ### Read / write
 
@@ -166,7 +166,7 @@ Cells read `V2/V3`: `F` full, `P` partial, `?` unknown, `.` none, `-` the rubric
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | AWS Glue Catalog | F/F | F/F | F/F | F/F | F/F | P/P | F/F | P/P | F/. | P/. | ?/? |
 | REST Catalog | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/F | ./. | P/P | ?/? |
-| Unity Catalog | P/P | F/F | P/P | F/F | P/P | P/P | F/F | F/F | P/. | P/. | ?/? |
+| Unity Catalog | F/F | F/F | P/P | F/F | P/P | P/P | F/F | F/F | P/. | P/. | ?/? |
 | Snowflake Horizon Catalog | P/P | P/P | F/P | F/F | P/? | F/P | F/F | P/P | P/. | P/. | P/. |
 | Google Lakehouse | P/P | F/F | P/P | F/F | P/P | F/P | F/P | P/P | ?/? | F/P | ?/? |
 
@@ -182,6 +182,6 @@ Cells read `V2/V3`: `F` full, `P` partial, `?` unknown, `.` none, `-` the rubric
 
 ---
 
-Per-cell notes and caveats live in the upstream platform files under [`src/data/platforms/`](https://github.com/Neuw84/iceberg-matrix/tree/d14d0f1341971cca8a8a218ca412d2cff28e3253/src/data/platforms) and, for SQE, in the state file.
+Per-cell notes and caveats live in the upstream platform files under [`src/data/platforms/`](https://github.com/Neuw84/iceberg-matrix/tree/027f1513563f1453ee4d04f3b7b36ff2464a4a6a/src/data/platforms) and, for SQE, in the state file.
 
 Regenerate: `python3 scripts/render-iceberg-matrix-compare.py`, then `python3 scripts/render-iceberg-matrix.py`.
