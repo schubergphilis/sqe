@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -954,18 +955,29 @@ impl IcebergScanExec {
         Ok(result)
     }
 
-    /// True when the planned snapshot references any delete manifests.
+    /// [`Self::data_file_info`] plus the planner's file scan task of every
+    /// listed data file that has delete files, keyed by data file path.
     ///
-    /// The coordinator scans such a snapshot locally: a worker ticket carries
-    /// only data file paths, and the worker's plain Parquet reader would not
-    /// apply the delete files.
-    pub async fn snapshot_has_deletes(&self) -> datafusion::error::Result<bool> {
-        snapshot_has_delete_files(&self.table, self.snapshot_id).await
+    /// A distributed scan ships those tasks in the worker ticket
+    /// (`ScanTask::delete_tasks`) so the worker applies the deletes; the
+    /// planner already matched each delete file to the data files it covers.
+    pub async fn data_file_plan(
+        &self,
+    ) -> Result<(Vec<(String, u64)>, HashMap<String, FileScanTask>), iceberg::Error> {
+        let (result, _, delete_tasks) = self.plan_data_files().await?;
+        Ok((result, delete_tasks))
     }
 
     pub async fn data_file_info_with_pruning_stats(
         &self,
     ) -> Result<(Vec<(String, u64)>, usize), iceberg::Error> {
+        let (result, pruned_count, _) = self.plan_data_files().await?;
+        Ok((result, pruned_count))
+    }
+
+    async fn plan_data_files(
+        &self,
+    ) -> Result<(Vec<(String, u64)>, usize, HashMap<String, FileScanTask>), iceberg::Error> {
         let mut sb = self.table.scan();
         if let Some(sid) = self.snapshot_id {
             sb = sb.snapshot_id(sid);
@@ -977,12 +989,16 @@ impl IcebergScanExec {
             sb = sb.with_filter(pred.clone());
         }
         let scan = sb.build()?;
-        let mut result: Vec<(String, u64)> = scan
-            .plan_files()
-            .await?
-            .map_ok(|t| (t.data_file_path().to_string(), t.length()))
-            .try_collect()
-            .await?;
+        let tasks: Vec<FileScanTask> = scan.plan_files().await?.try_collect().await?;
+        let mut result: Vec<(String, u64)> = Vec::with_capacity(tasks.len());
+        let mut delete_tasks: HashMap<String, FileScanTask> = HashMap::new();
+        for task in tasks {
+            let path = task.data_file_path().to_string();
+            result.push((path.clone(), task.length()));
+            if !task.deletes().is_empty() {
+                delete_tasks.insert(path, task);
+            }
+        }
         let mut pruned_count = 0usize;
         if !self.variant_prunes.is_empty() {
             let prunes =
@@ -1034,7 +1050,12 @@ impl IcebergScanExec {
                 }
             }
         }
-        Ok((result, pruned_count))
+        if !delete_tasks.is_empty() {
+            let kept: std::collections::HashSet<&str> =
+                result.iter().map(|(p, _)| p.as_str()).collect();
+            delete_tasks.retain(|path, _| kept.contains(path.as_str()));
+        }
+        Ok((result, pruned_count, delete_tasks))
     }
 
     /// Load all live data files (with full column statistics) for the current snapshot.

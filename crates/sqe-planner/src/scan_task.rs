@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::scan_morsel::{
     SCAN_TASK_VERSION_CURRENT, SCAN_TASK_VERSION_V1, SCAN_TASK_VERSION_V2, SCAN_TASK_VERSION_V3,
-    SCAN_TASK_VERSION_V4, SCAN_TASK_VERSION_V5,
+    SCAN_TASK_VERSION_V4, SCAN_TASK_VERSION_V5, SCAN_TASK_VERSION_V6,
 };
 
 /// File format of a Hive external table's data files.
@@ -223,7 +223,7 @@ impl ScanCredentials {
 pub struct ScanTask {
     /// Ticket encoding version. `1` = whole-file (pre-morsel); `2` = optional
     /// row-group / byte-range morsel fields; `3` = `hive`; `4` =
-    /// `projection_fill`; `5` = `variant_prunes`. Workers reject
+    /// `projection_fill`; `5` = `variant_prunes`; `6` = `delete_tasks`. Workers reject
     /// unsupported versions. Missing field deserializes as v1 for old
     /// coordinators.
     ///
@@ -370,6 +370,21 @@ pub struct ScanTask {
         with = "predicate_wire"
     )]
     pub variant_prunes: Option<Vec<u8>>,
+    /// Delete tasks: JSON written by
+    /// `sqe_catalog::delete_tasks::encode`, the Iceberg file scan task (delete
+    /// files included) of every data file in this ticket that has position
+    /// deletes, deletion vectors or equality deletes. The worker reads those
+    /// files through iceberg-rust's reader, which applies the deletes; files
+    /// without an entry keep the plain Parquet path. Unlike the prunes this is
+    /// not an optimisation: a worker that ignored it would return deleted rows,
+    /// which is why it raises the version.
+    #[serde(
+        rename = "delete_tasks_b64",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "predicate_wire"
+    )]
+    pub delete_tasks: Option<Vec<u8>>,
 }
 
 /// Wire codec for [`ScanTask::predicate_proto`]: writes base64, reads either
@@ -511,6 +526,13 @@ impl ScanTaskBuilder {
         self
     }
 
+    /// Iceberg file scan tasks of the files with deletes; see
+    /// [`ScanTask::delete_tasks`].
+    pub fn with_delete_tasks(mut self, tasks: Option<Vec<u8>>) -> Self {
+        self.task.delete_tasks = tasks;
+        self
+    }
+
     /// Per-fragment row LIMIT hint (#233).
     pub fn with_limit(mut self, limit: Option<usize>) -> Self {
         self.task.limit = limit;
@@ -557,6 +579,7 @@ impl std::fmt::Debug for ScanTask {
             .field("hive", &self.hive.as_ref().map(|h| h.format))
             .field("has_projection_fill", &self.projection_fill.is_some())
             .field("has_variant_prunes", &self.variant_prunes.is_some())
+            .field("has_delete_tasks", &self.delete_tasks.is_some())
             .finish()
     }
 }
@@ -598,6 +621,7 @@ impl ScanTask {
                 hive: None,
                 projection_fill: None,
                 variant_prunes: None,
+                delete_tasks: None,
             },
         }
     }
@@ -610,7 +634,8 @@ impl ScanTask {
     ///   `end_byte`);
     /// - v3: `hive`;
     /// - v4: `projection_fill`;
-    /// - v5: `variant_prunes`.
+    /// - v5: `variant_prunes`;
+    /// - v6: `delete_tasks`.
     ///
     /// `predicate_proto`, `limit`, `projected_field_ids`, `credentials`,
     /// `audience` and `expires_at` do not raise the version: an old worker
@@ -630,6 +655,9 @@ impl ScanTask {
         }
         if self.variant_prunes.is_some() {
             required = required.max(SCAN_TASK_VERSION_V5);
+        }
+        if self.delete_tasks.is_some() {
+            required = required.max(SCAN_TASK_VERSION_V6);
         }
         required
     }
@@ -680,6 +708,9 @@ impl ScanTask {
         }
         if required >= SCAN_TASK_VERSION_V5 && self.variant_prunes.is_some() {
             fields.push("variant_prunes");
+        }
+        if required >= SCAN_TASK_VERSION_V6 && self.delete_tasks.is_some() {
+            fields.push("delete_tasks");
         }
         fields
     }
@@ -774,7 +805,7 @@ impl ScanTask {
     pub fn validate_version(&self) -> Result<(), String> {
         match self.version {
             SCAN_TASK_VERSION_V1 | SCAN_TASK_VERSION_V2 | SCAN_TASK_VERSION_V3
-            | SCAN_TASK_VERSION_V4 | SCAN_TASK_VERSION_V5 => Ok(()),
+            | SCAN_TASK_VERSION_V4 | SCAN_TASK_VERSION_V5 | SCAN_TASK_VERSION_V6 => Ok(()),
             other => Err(format!(
                 "unsupported ScanTask version {other}; this worker supports \
                  {SCAN_TASK_VERSION_V1}..={SCAN_TASK_VERSION_CURRENT}"
@@ -826,6 +857,7 @@ mod tests {
             hive: None,
             projection_fill: None,
             variant_prunes: None,
+            delete_tasks: None,
         }
     }
 
@@ -884,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    fn version_five_is_accepted_and_six_is_not() {
+    fn version_six_is_accepted_and_seven_is_not() {
         let mut task = task_with_predicate(None);
         for v in [
             SCAN_TASK_VERSION_V1,
@@ -892,11 +924,12 @@ mod tests {
             SCAN_TASK_VERSION_V3,
             SCAN_TASK_VERSION_V4,
             SCAN_TASK_VERSION_V5,
+            SCAN_TASK_VERSION_V6,
         ] {
             task.version = v;
             assert!(task.validate_version().is_ok(), "v{v} must be accepted");
         }
-        task.version = 6;
+        task.version = 7;
         assert!(
             task.validate_version().is_err(),
             "an unknown version must be refused, not read as the newest known one"
@@ -942,6 +975,29 @@ mod tests {
         assert_eq!(plain.version, SCAN_TASK_VERSION_V1);
         let text = String::from_utf8(plain.to_bytes().unwrap()).unwrap();
         assert!(!text.contains("variant_prunes"), "{text}");
+    }
+
+    #[test]
+    fn delete_tasks_make_the_task_v6_and_a_v5_worker_refuses_it() {
+        let task = built(
+            ScanTask::builder("f", vec!["s3://b/f.parquet".to_string()], storage())
+                .with_delete_tasks(Some(vec![1, 2, 3])),
+        );
+        assert_eq!(task.version, SCAN_TASK_VERSION_V6);
+        let bytes = task.to_bytes().unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(text.contains("\"delete_tasks_b64\":\"AQID\""), "{text}");
+        let back = ScanTask::decode_for_worker(&bytes, SCAN_TASK_VERSION_CURRENT).unwrap();
+        assert_eq!(back.delete_tasks, Some(vec![1, 2, 3]));
+        // A V5 worker would read the file without its deletes: it must refuse.
+        assert!(ScanTask::decode_for_worker(&bytes, SCAN_TASK_VERSION_V5).is_err());
+        let plain = built(ScanTask::builder(
+            "f",
+            vec!["s3://b/f.parquet".to_string()],
+            storage(),
+        ));
+        let text = String::from_utf8(plain.to_bytes().unwrap()).unwrap();
+        assert!(!text.contains("delete_tasks"), "{text}");
     }
 
     fn storage() -> ScanStorage {
@@ -1269,6 +1325,7 @@ mod tests {
             hive: None,
             projection_fill: None,
             variant_prunes: None,
+            delete_tasks: None,
         };
 
         let bytes = task.to_bytes().unwrap();
@@ -1308,6 +1365,7 @@ mod tests {
             hive: None,
             projection_fill: None,
             variant_prunes: None,
+            delete_tasks: None,
         };
 
         let bytes = task.to_bytes().unwrap();
@@ -1371,6 +1429,7 @@ mod tests {
             hive: None,
             projection_fill: None,
             variant_prunes: None,
+            delete_tasks: None,
         };
         let debug_output = format!("{task:?}");
         // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS's documented example key, asserting it is redacted
@@ -1410,6 +1469,7 @@ mod tests {
             hive: None,
             projection_fill: None,
             variant_prunes: None,
+            delete_tasks: None,
         };
 
         let bytes = task.to_bytes().unwrap();

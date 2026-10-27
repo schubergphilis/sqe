@@ -67,7 +67,7 @@ The regression test writes a V2 table with position deletes and a V3 table with 
 
 After the fix, the distributed run matched 25 of 25.
 
-The cost is real. A merge-on-read table with live deletes now scans on one node until it is compacted. The proper fix carries the delete files in the ticket and applies them on the worker. That is the next change.
+That check had a cost. A merge-on-read table with live deletes scanned on one node until it was compacted. The follow-up removed it. The ticket now carries each data file's delete files, and the worker loads the position deletes and deletion vector of a file before it opens it, then skips those rows in the Parquet reader. A data file with deletes is read whole rather than split into byte ranges, so its deletes load once. Equality deletes are not row positions, and a snapshot that has them still scans on the coordinator. The same regression test now asserts the opposite of before: after the delete, the scan must reach the worker, and the deleted rows must stay gone.
 
 ## What else the run found
 

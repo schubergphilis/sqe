@@ -4889,7 +4889,7 @@ impl QueryHandler {
 
         // Get data file paths and sizes from the scan manifest metadata. This
         // is infrastructure (catalog / object store), not policy.
-        let file_info = iceberg_scan.data_file_info().await.map_err(|e| {
+        let (file_info, delete_tasks) = iceberg_scan.data_file_plan().await.map_err(|e| {
             SqeError::with_code(
                 SqeErrorCode::CatalogError,
                 format!("listing data files for distribution failed: {e}"),
@@ -4905,16 +4905,18 @@ impl QueryHandler {
             });
         }
 
-        // A worker reads the data files of its ticket with a plain Parquet
-        // reader: the ticket carries no delete files, so position deletes,
-        // deletion vectors and equality deletes would not be applied and the
-        // deleted rows would come back. Scan a snapshot with delete manifests
-        // locally, where iceberg-rust applies them. An error reading the
-        // manifest list counts as "has deletes".
-        if iceberg_scan.snapshot_has_deletes().await.unwrap_or(true) {
-            debug!("Snapshot has delete files, executing locally");
+        // Position deletes and deletion vectors ride the ticket
+        // (`ScanTask::delete_tasks`) and the worker applies them. Equality
+        // deletes do not: the worker would need the equality columns read and
+        // compared, so a scan that has any stays here, where iceberg-rust
+        // applies them.
+        if delete_tasks
+            .values()
+            .any(sqe_catalog::delete_tasks::has_equality_deletes)
+        {
+            debug!("Scan has equality delete files, executing locally");
             return Ok(DistributionDecision::Local {
-                reason: "has_delete_files",
+                reason: "has_equality_deletes",
                 scan_node: Some(scan_node),
             });
         }
@@ -5004,6 +5006,7 @@ impl QueryHandler {
         Ok(DistributionDecision::Distribute(DistributionCandidate {
             scan_node,
             file_info,
+            delete_tasks,
             credentials,
         }))
     }
@@ -5023,16 +5026,15 @@ impl QueryHandler {
         let DistributionCandidate {
             scan_node,
             file_info,
+            delete_tasks,
             credentials,
         } = candidate;
-        let iceberg_scan = scan_node
-            .downcast_ref::<IcebergScanExec>()
-            .ok_or_else(|| {
-                SqeError::with_code(
-                    SqeErrorCode::InternalError,
-                    "distribution candidate is not an IcebergScanExec",
-                )
-            })?;
+        let iceberg_scan = scan_node.downcast_ref::<IcebergScanExec>().ok_or_else(|| {
+            SqeError::with_code(
+                SqeErrorCode::InternalError,
+                "distribution candidate is not an IcebergScanExec",
+            )
+        })?;
         let num_workers = healthy.len();
 
         // 6. Get projected columns + Iceberg field IDs from the scan. Field
@@ -5119,14 +5121,19 @@ impl QueryHandler {
         //
         // Large files are split into byte-range morsels (~target size) so one
         // multi-GB Parquet file fans out across workers. The worker resolves
-        // each byte range to row groups at open time. The snapshot has no
-        // delete files: `decide_iceberg_distribution` keeps those local.
+        // each byte range to row groups at open time. A data file with
+        // position deletes or a deletion vector stays whole, so its deletes
+        // are loaded once; equality deletes never reach this point
+        // (`decide_iceberg_distribution` keeps those local).
         let target_size_bytes = sqe_core::parse_memory_limit(&self.config.query.target_task_size)
             .unwrap_or(256 * 1024 * 1024) as u64;
         let morsel_target = sqe_planner::DEFAULT_MORSEL_TARGET_BYTES.min(target_size_bytes);
         let morsel_max = sqe_planner::DEFAULT_MORSEL_MAX_BYTES.max(morsel_target);
 
-        let morsels = sqe_planner::plan_scan_morsels(&file_info, morsel_target, morsel_max, true);
+        let morsels =
+            sqe_planner::plan_scan_morsels_by_file(&file_info, morsel_target, morsel_max, |path| {
+                !delete_tasks.contains_key(path)
+            });
         debug!(
             morsel_count = morsels.len(),
             file_count = file_info.len(),
@@ -5165,10 +5172,28 @@ impl QueryHandler {
             s3_allow_http: storage.s3_endpoint.starts_with("http://"),
             credentials,
         };
+        // The delete tasks of a ticket's data files, encoded for the worker.
+        let encode_deletes = |paths: &[String]| -> Result<Option<Vec<u8>>, SqeError> {
+            let tasks: Vec<iceberg::scan::FileScanTask> = paths
+                .iter()
+                .filter_map(|p| delete_tasks.get(p).cloned())
+                .collect();
+            if tasks.is_empty() {
+                return Ok(None);
+            }
+            sqe_catalog::delete_tasks::encode(&tasks)
+                .map(Some)
+                .map_err(|e| {
+                    SqeError::with_code(
+                        SqeErrorCode::InternalError,
+                        format!("encoding delete files for a scan task: {e}"),
+                    )
+                })
+        };
         let scan_tasks: Vec<sqe_planner::ScanTask> = morsel_groups
             .into_iter()
             .filter(|group| !group.is_empty())
-            .flat_map(|group| {
+            .flat_map(|group| -> Vec<Result<sqe_planner::ScanTask, SqeError>> {
                 let group_morsels: Vec<&sqe_planner::ScanMorsel> = group
                     .iter()
                     .filter_map(|(id, _)| morsel_by_id.get(id.as_str()).copied())
@@ -5188,7 +5213,11 @@ impl QueryHandler {
                         group_morsels.iter().map(|m| m.file_path.clone()).collect();
                     let file_sizes_bytes: Vec<u64> =
                         group_morsels.iter().map(|m| m.file_size_bytes).collect();
-                    vec![sqe_planner::ScanTask::builder(
+                    let deletes = match encode_deletes(&data_file_paths) {
+                        Ok(d) => d,
+                        Err(e) => return vec![Err(e)],
+                    };
+                    vec![Ok(sqe_planner::ScanTask::builder(
                         uuid::Uuid::now_v7().to_string(),
                         data_file_paths,
                         scan_storage.clone(),
@@ -5198,8 +5227,9 @@ impl QueryHandler {
                     .with_predicate_proto(predicate_proto.clone())
                     .with_projection_fill(projection_fill.clone())
                     .with_variant_prunes(variant_prunes.clone())
+                    .with_delete_tasks(deletes)
                     .with_limit(scan_limit)
-                    .build()]
+                    .build())]
                 } else {
                     // Byte-range morsels: one ScanTask per morsel (single file
                     // + range). The builder derives v2 from the range fields so
@@ -5207,6 +5237,7 @@ impl QueryHandler {
                     group_morsels
                         .into_iter()
                         .map(|m| {
+                            let deletes = encode_deletes(std::slice::from_ref(&m.file_path))?;
                             let mut builder = sqe_planner::ScanTask::builder(
                                 uuid::Uuid::now_v7().to_string(),
                                 vec![m.file_path.clone()],
@@ -5218,16 +5249,17 @@ impl QueryHandler {
                             .with_predicate_proto(predicate_proto.clone())
                             .with_projection_fill(projection_fill.clone())
                             .with_variant_prunes(variant_prunes.clone())
+                            .with_delete_tasks(deletes)
                             .with_limit(scan_limit);
                             if let (Some(start), Some(end)) = (m.start_byte, m.end_byte) {
                                 builder = builder.with_byte_range(start, end);
                             }
-                            builder.build()
+                            Ok(builder.build())
                         })
                         .collect()
                 }
             })
-            .collect();
+            .collect::<Result<_, SqeError>>()?;
 
         if scan_tasks.is_empty() {
             // `file_info` was non-empty, so morsel planning produced nothing
@@ -9290,6 +9322,9 @@ pub(crate) enum DistributionDecision {
 pub(crate) struct DistributionCandidate {
     scan_node: Arc<dyn ExecutionPlan>,
     file_info: Vec<(String, u64)>,
+    /// The planner's task of every data file in `file_info` that has
+    /// position deletes or deletion vectors, keyed by data file path.
+    delete_tasks: std::collections::HashMap<String, iceberg::scan::FileScanTask>,
     credentials: sqe_planner::ScanCredentials,
 }
 
