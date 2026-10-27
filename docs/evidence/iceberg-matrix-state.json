@@ -1,23 +1,23 @@
 {
   "$schema": "https://icebergmatrix.org/schema/support-v1.json",
   "sourceRubric": "https://github.com/Neuw84/iceberg-matrix",
-  "sourceRubricCommit": "d14d0f1341971cca8a8a218ca412d2cff28e3253",
+  "sourceRubricCommit": "027f1513563f1453ee4d04f3b7b36ff2464a4a6a",
   "platform": {
     "id": "sqe",
-    "name": "SQE (0.51.0)",
+    "name": "SQE (0.52.0)",
     "vendor": "Schuberg Philis",
     "category": "open-source",
     "group": "3rd Party",
     "docUrl": "https://docs.getsqe.com"
   },
-  "generatedAt": "2026-10-23T00:00:00Z",
-  "generatedBy": "Rescore against the pinned upstream rubric; evidence paths repaired after the crate and test moves. 2026-10-18: unknown-type and shredded-variant measured against Spark 4.1 + Iceberg 1.12. 2026-10-20: merge-on-read deletes, deletion vectors and row lineage read back by Spark 4.1 + Iceberg 1.12 (mor_spark_interop); stub evidence removed. 2026-10-21: SQE writes shredded variants (write.parquet.shred-variants), read back by Spark 4.1 + Iceberg 1.12; shredded-variant:v3 to full. unknown-type:v3 to full: nested shapes measured against Iceberg Java (same refusals), promotion rules enforced. 2026-10-22: list elements and map values promote with SET DATA TYPE (#869). 2026-10-23: rubric pin moved to d14d0f1341 (features.json unchanged since 2dd75e0aa2; the new commits add Dremio and catalog-side entries). geometry-type:v3 to partial: SQE reads Spark-written GEOMETRY / GEOGRAPHY columns (#863), writes refused. 2026-10-24: shredded variant statistics prune row groups on the coordinator (#870); level unchanged. 2026-10-25: variant manifest bounds prune data files (#870); level unchanged. 2026-10-25: variants nested in structs, lists and maps are shredded on write and read back by Spark 4.1 + Iceberg 1.12 (#870). 2026-10-25: SQE writes variant manifest bounds for its shredded files (#870); level unchanged. 2026-10-25: multi-arg-transforms:v3 to partial: multi-argument and unknown transforms read, ignored for pruning and kept on round trip; writes refused as the spec requires (#864). 2026-10-25: SQE writes GEOMETRY / GEOGRAPHY columns with geometry bounding-box bounds, read back by Spark 4.1 + Iceberg 1.12 (#863); level unchanged (no DDL). 2026-10-26: GEOMETRY / GEOGRAPHY DDL (CREATE TABLE, ADD COLUMN, CTAS), read back by Spark 4.1 + Iceberg 1.12 (#863); level unchanged (worker scan untested). 2026-10-26: a worker scans a Spark-written geospatial table; the coordinator conforms Binary worker batches to the planned LargeBinary (#863). Level stays partial: no ST_* functions and no spatial file pruning. 2026-10-26: planar ST_* functions over GEOMETRY values, results written back into a geometry column (#863); level unchanged (no spatial file pruning).",
+  "generatedAt": "2026-10-27T00:00:00Z",
+  "generatedBy": "Rescore against the pinned upstream rubric; evidence paths repaired after the crate and test moves. 2026-10-18: unknown-type and shredded-variant measured against Spark 4.1 + Iceberg 1.12. 2026-10-20: merge-on-read deletes, deletion vectors and row lineage read back by Spark 4.1 + Iceberg 1.12 (mor_spark_interop); stub evidence removed. 2026-10-21: SQE writes shredded variants (write.parquet.shred-variants), read back by Spark 4.1 + Iceberg 1.12; shredded-variant:v3 to full. unknown-type:v3 to full: nested shapes measured against Iceberg Java (same refusals), promotion rules enforced. 2026-10-22: list elements and map values promote with SET DATA TYPE (#869). 2026-10-23: rubric pin moved to d14d0f1341 (features.json unchanged since 2dd75e0aa2; the new commits add Dremio and catalog-side entries). geometry-type:v3 to partial: SQE reads Spark-written GEOMETRY / GEOGRAPHY columns (#863), writes refused. 2026-10-24: shredded variant statistics prune row groups on the coordinator (#870); level unchanged. 2026-10-25: variant manifest bounds prune data files (#870); level unchanged. 2026-10-25: variants nested in structs, lists and maps are shredded on write and read back by Spark 4.1 + Iceberg 1.12 (#870). 2026-10-25: SQE writes variant manifest bounds for its shredded files (#870); level unchanged. 2026-10-25: multi-arg-transforms:v3 to partial: multi-argument and unknown transforms read, ignored for pruning and kept on round trip; writes refused as the spec requires (#864). 2026-10-25: SQE writes GEOMETRY / GEOGRAPHY columns with geometry bounding-box bounds, read back by Spark 4.1 + Iceberg 1.12 (#863); level unchanged (no DDL). 2026-10-26: GEOMETRY / GEOGRAPHY DDL (CREATE TABLE, ADD COLUMN, CTAS), read back by Spark 4.1 + Iceberg 1.12 (#863); level unchanged (worker scan untested). 2026-10-26: a worker scans a Spark-written geospatial table; the coordinator conforms Binary worker batches to the planned LargeBinary (#863). Level stays partial: no ST_* functions and no spatial file pruning. 2026-10-26: planar ST_* functions over GEOMETRY values, results written back into a geometry column (#863); level unchanged (no spatial file pruning). 2026-10-27: rubric pin moved to 027f151356 (features unchanged; peer entries updated). unity-catalog:v2/v3 to full: a live run against Databricks-hosted Unity Catalog (scripts/interop/databricks-uc/) where Databricks writes V2 and V3 tables SQE reads, SQE writes tables Databricks reads, and both engines run DELETE / UPDATE / MERGE on the other's tables; 25 reads compared value by value in embedded, coordinator-local and distributed mode, all equal. The run found that workers did not apply delete files (fixed in !1570).",
   "score": {
-    "raw": 154,
+    "raw": 156,
     "max": 162,
-    "percent": 95.1
+    "percent": 96.3
   },
-  "note": "Rescored on 2026-10-17 against upstream features.json (32 features). Only cells that apply to a version are scored, as the site shows them: position-deletes is V2-only now, so 54 cells, max 162. Removed upstream and dropped here: hive-metastore, nessie, polaris, hadoop-catalog, jdbc-catalog, vector-type, cdc-support. New: deletion-vectors, unknown-type, google-lakehouse. Gains: deletion vectors and row lineage on V3, unshredded VARIANT. Downgrade: unity-catalog to partial (read-only smoke). The old 167/189 is not comparable.",
+  "note": "Rescored on 2026-10-17 against upstream features.json (32 features). Only cells that apply to a version are scored, as the site shows them: position-deletes is V2-only now, so 54 cells, max 162. Removed upstream and dropped here: hive-metastore, nessie, polaris, hadoop-catalog, jdbc-catalog, vector-type, cdc-support. New: deletion-vectors, unknown-type, google-lakehouse. Gains: deletion vectors and row lineage on V3, unshredded VARIANT. Downgrade: unity-catalog to partial (read-only smoke); back to full on 2026-10-27 after the live Databricks run. The old 167/189 is not comparable.",
   "support": {
     "sqe:position-deletes:v2": {
       "level": "full",
@@ -288,20 +288,25 @@
       "caveats": []
     },
     "sqe:unity-catalog:v2": {
-      "level": "partial",
-      "notes": "SQE reaches Unity's Iceberg REST endpoint through the shared REST client, with the OIDC M2M provider for Databricks-hosted Unity. Only a read-only smoke against Unity OSS exists; writes are not verified.",
-      "evidence": "crates/sqe-catalog/tests/it/backends_integration.rs::unity_catalog::list_via_unity_rest, crates/sqe-catalog/tests/it/backends_integration.rs::unity_catalog::unity_catalog_m2m_auth_obtains_token, crates/sqe-auth/src/oidc_m2m.rs, quickstart/unity-oss/",
+      "level": "full",
+      "notes": "Verified on 2026-10-27 against Databricks-hosted Unity Catalog through its Iceberg REST endpoint, with the Databricks user's OIDC token validated against the workspace JWKS and passed through (no service account). Databricks writes Iceberg tables (all scalar types including TIMESTAMP_NTZ and BINARY, nested types, liquid clustering, schema evolution) that SQE reads; SQE writes a format-version 2 table, a CTAS and a partitioned table that Databricks reads; Databricks runs DELETE / UPDATE / INSERT on SQE's tables and SQE runs DELETE / UPDATE / MERGE / INSERT on Databricks'. Every read is compared value by value on both engines: 25 of 25 equal in embedded, coordinator-local and distributed mode. Unity OSS is still read-only (no create / commit upstream).",
+      "evidence": "scripts/interop/databricks-uc/run.py, scripts/interop/databricks-uc/compare.tsv, crates/sqe-coordinator/tests/it/distributed_delete_files.rs::deleted_rows_stay_deleted_with_workers, crates/sqe-catalog/tests/it/backends_integration.rs::unity_catalog::list_via_unity_rest",
       "caveats": [
-        "Read-only: Unity OSS does not implement create / commit, and no Databricks-hosted write was tested.",
-        "Both Unity tests are #[ignore] and annotated 'last verified: never in this tree'."
+        "The live run needs a Databricks workspace and a user token; it runs by hand, not in CI.",
+        "The Databricks user's token is passed through to Unity Catalog and lives about an hour; a long session needs a fresh login.",
+        "The embedded CLI does not run DDL on an ATTACHed Unity catalog yet; the coordinator does."
       ]
     },
     "sqe:unity-catalog:v3": {
-      "level": "partial",
-      "notes": "Same REST path as V2; Unity serves whatever metadata the writer produced. No V3 table read or written through Unity.",
-      "evidence": "crates/sqe-catalog/tests/it/backends_integration.rs::unity_catalog::list_via_unity_rest, crates/sqe-write/src/write_handler.rs#format_version_properties",
+      "level": "full",
+      "notes": "Same live run, on V3 tables. SQE reads Databricks deletion vectors, VARIANT and GEOMETRY(4326) columns; Databricks reads SQE-written V3 tables including VARIANT and GEOMETRY, and SQE's deletes on them. Databricks wrote a deletion vector into an SQE-written partitioned V3 table and SQE reads it correctly on every path since workers stopped receiving snapshots with delete files (!1570).",
+      "evidence": "scripts/interop/databricks-uc/run.py, scripts/interop/databricks-uc/compare.tsv, crates/sqe-coordinator/tests/it/distributed_delete_files.rs::deleted_rows_stay_deleted_with_workers, crates/sqe-catalog/tests/it/backends_integration.rs::unity_catalog::list_via_unity_rest, crates/sqe-coordinator/src/query_handler.rs#decide_iceberg_distribution",
       "caveats": [
-        "Not measured on a V3 table; read-only smoke only."
+        "The live run needs a Databricks workspace and a user token; it runs by hand, not in CI.",
+        "The Databricks user's token is passed through to Unity Catalog and lives about an hour; a long session needs a fresh login.",
+        "The embedded CLI does not run DDL on an ATTACHed Unity catalog yet; the coordinator does.",
+        "DESCRIBE shows a Databricks GEOMETRY column as varbinary; the values read as geometry.",
+        "A merge-on-read table with live delete files is scanned on the coordinator only until it is compacted."
       ]
     },
     "sqe:snowflake-horizon-catalog:v2": {

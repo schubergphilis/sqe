@@ -2,10 +2,10 @@
 
 SQE rated against the [icebergmatrix.org](https://icebergmatrix.org) rubric ([Neuw84/iceberg-matrix](https://github.com/Neuw84/iceberg-matrix)).
 
-**Score: 152/162 (93.8%)** on 54 cells.
+**Score: 156/162 (96.3%)** on 54 cells.
 
-- SQE cells: `docs/evidence/iceberg-matrix-state.json`, last changed 2026-10-23.
-- Rubric and peer scores: `docs/evidence/iceberg-matrix-rubric.json`, upstream `d14d0f1341` fetched 2026-10-23.
+- SQE cells: `docs/evidence/iceberg-matrix-state.json`, last changed 2026-10-27.
+- Rubric and peer scores: `docs/evidence/iceberg-matrix-rubric.json`, upstream `027f151356` fetched 2026-10-27.
 - Regenerate: `python3 scripts/render-iceberg-matrix-compare.py` (refreshes the rubric snapshot and [the engine comparison](./iceberg-matrix-compare.md)), then `python3 scripts/render-iceberg-matrix.py`.
 
 ---
@@ -30,7 +30,7 @@ Every engine scored on the same 54 cells. SQE rates itself; the other engines ar
 
 | Engine | Score | % |
 |---|---:|---:|
-| **SQE (self-rated)** | **152/162** | **93.8** |
+| **SQE (self-rated)** | **156/162** | **96.3** |
 | AWS EMR (8.1 Spark) | 147/162 | 90.7 |
 | Starburst (482-e) | 147/162 | 90.7 |
 | Dremio / SAP (26.x) | 146/162 | 90.1 |
@@ -77,7 +77,7 @@ Every engine scored on the same 54 cells. SQE rates itself; the other engines ar
 |---|:---:|:---:|---|---|
 | Hidden Partitioning | F | F | CREATE TABLE ... PARTITIONED BY (...) accepts all six standard Iceberg transforms: identity (bare column), year/month/day/hour, bucket(N, col), truncate(L, ... | Same SQL syntax as V2 (PARTITIONED BY) and the same writer path. Verified on a V3 table with a TIMESTAMP_NS column partitioned by day(ts): INSERT routes ... |
 | Partition Evolution | F | F | ALTER TABLE ADD/DROP/REPLACE PARTITION FIELD evolves the partition spec end-to-end. Pre-parser in sqe-sql/partition_evolution.rs lifts the non-standard syntax ... | V3 metadata stores per-file partition_spec_id the same way V2 does; the same coordinator handler and writer path exercise V3 nanosec timestamp partitioning ... |
-| Multi-Argument Transforms | n/a | . | V3-only feature | PARTITIONED BY accepts only single-source transforms; a multi-source transform cannot be declared. |
+| Multi-Argument Transforms | n/a | P | V3-only feature | Reads follow the spec for unknown and multi-argument transforms: a partition or sort field with several source-ids, or a transform name SQE does not know, ... |
 
 ### Read / write
 
@@ -96,7 +96,7 @@ Every engine scored on the same 54 cells. SQE rates itself; the other engines ar
 |---|:---:|:---:|---|---|
 | AWS Glue Catalog | F | F | Two parallel paths now ship: (1) iceberg-catalog-glue vendored from apache/iceberg-rust v0.9.0 (AWS SDK over the Glue API directly); (2) the federated Glue ... | Same two parallel paths as V2: native AWS SDK via iceberg-catalog-glue, and the federated Glue Iceberg REST endpoint with SigV4 signing. Both are ... |
 | REST Catalog | F | F | Primary catalog type. Phase P added optional AWS SigV4 signing to the vendored `iceberg-catalog-rest` client (cargo feature `aws-sigv4`, on by default in SQE), ... | Iceberg REST catalogs accept V3 tables when SQE forwards format-version as a table property in CreateTableRequest. Verified end-to-end against Polaris (Apache ... |
-| Unity Catalog | P | P | SQE reaches Unity's Iceberg REST endpoint through the shared REST client, with the OIDC M2M provider for Databricks-hosted Unity. Only a read-only smoke ... | Same REST path as V2; Unity serves whatever metadata the writer produced. No V3 table read or written through Unity. |
+| Unity Catalog | F | F | Verified on 2026-10-27 against Databricks-hosted Unity Catalog through its Iceberg REST endpoint, with the Databricks user's OIDC token validated against the ... | Same live run, on V3 tables. SQE reads Databricks deletion vectors, VARIANT and GEOMETRY(4326) columns; Databricks reads SQE-written V3 tables including ... |
 | Snowflake Horizon Catalog | P | P | Horizon implements the Iceberg REST API (Polaris-based); SQE's REST client speaks it. Not measured against Horizon. | Snowflake Horizon is Polaris-based; the REST surface is shared with Polaris which we verified end-to-end at format-version 3. No live test against a Horizon ... |
 | Google Lakehouse | P | P | Google Lakehouse runtime catalog exposes the Iceberg REST API, which SQE's REST client speaks. Rated partial because the pairing has not been measured. | Google Lakehouse runtime catalog exposes the Iceberg REST API, which SQE's REST client speaks. Rated partial because the pairing has not been measured. |
 
@@ -116,12 +116,9 @@ Every engine scored on the same 54 cells. SQE rates itself; the other engines ar
 
 Every cell below full, with its caveats. Each has a `[MATRIX]` issue.
 
-- **multi-arg-transforms (v3)**, none: PARTITIONED BY accepts only single-source transforms; a multi-source transform cannot be declared.
-- **unity-catalog (v2)**, partial: SQE reaches Unity's Iceberg REST endpoint through the shared REST client, with the OIDC M2M provider for Databricks-hosted Unity. Only a read-only smoke against Unity OSS exists; writes are not verified.
-  - Read-only: Unity OSS does not implement create / commit, and no Databricks-hosted write was tested.
-  - Both Unity tests are #[ignore] and annotated 'last verified: never in this tree'.
-- **unity-catalog (v3)**, partial: Same REST path as V2; Unity serves whatever metadata the writer produced. No V3 table read or written through Unity.
-  - Not measured on a V3 table; read-only smoke only.
+- **multi-arg-transforms (v3)**, partial: Reads follow the spec for unknown and multi-argument transforms: a partition or sort field with several source-ids, or a transform name SQE does not know, loads as an unknown transform, is ignored for file pruning, and keeps its original name and source-ids when the metadata is written back. Manifests of such a table decode with the partition type their writer recorded. Writes are refused, as the spec requires: no data or delete file commits under a spec with an unknown transform, and partition evolution refuses to carry such a field. PARTITIONED BY accepts only single-source transforms.
+  - Verified on hand-built metadata and manifests; no engine writes a multi-argument transform yet, so no table from another writer has been read
+  - Read-only: SQE cannot write to a table whose default spec has an unknown transform until that field is dropped
 - **snowflake-horizon-catalog (v2)**, partial: Horizon implements the Iceberg REST API (Polaris-based); SQE's REST client speaks it. Not measured against Horizon.
   - Inferred from generic Iceberg REST catalog support; not measured against Horizon.
 - **snowflake-horizon-catalog (v3)**, partial: Snowflake Horizon is Polaris-based; the REST surface is shared with Polaris which we verified end-to-end at format-version 3. No live test against a Horizon endpoint.
@@ -132,11 +129,11 @@ Every cell below full, with its caveats. Each has a `[MATRIX]` issue.
 - **google-lakehouse (v3)**, partial: Google Lakehouse runtime catalog exposes the Iceberg REST API, which SQE's REST client speaks. Rated partial because the pairing has not been measured.
   - Inferred from generic Iceberg REST catalog support; not measured against Google Lakehouse.
   - Iceberg data on GCS (gs://) through the table FileIO and Google OAuth for the REST endpoint are not verified.
-- **geometry-type (v3)**, partial: SQE reads GEOMETRY and GEOGRAPHY columns. The vendored iceberg-rust carries the upstream geospatial types and the read support from apache/iceberg-rust #3341; a column reads as WKB bytes (LargeBinary tagged geoarrow.wkb), filters and joins on it run in DataFusion, and information_schema reports it as varbinary with udt_name geometry / geography. Verified against a table written by Spark 4.1 + Iceberg 1.12 (spark.sql.geospatial.enabled). Writes into a table with a geospatial column are refused with NOT_SUPPORTED.
-  - Read-only: INSERT, CTAS, MERGE/UPDATE/DELETE and compaction refuse a table with a geospatial column until the iceberg-rust writer computes geospatial bounds.
-  - No GEOMETRY / GEOGRAPHY DDL: CREATE TABLE with one fails with 'SQL type not supported'.
-  - No ST_* functions and no bounding-box pruning: a predicate on a geospatial column is never pushed into the scan.
-  - Verified on the coordinator scan only. A worker decodes through the iceberg-rust reader (which the backported read support covers) and is not tested on a geospatial table yet.
+- **geometry-type (v3)**, partial: SQE reads GEOMETRY and GEOGRAPHY columns. The vendored iceberg-rust carries the upstream geospatial types and the read support from apache/iceberg-rust #3341; a column reads as WKB bytes (LargeBinary tagged geoarrow.wkb), filters and joins on it run in DataFusion, and information_schema reports it as LargeBinary (DataFusion's built-in provider answers it). Verified against a table written by Spark 4.1 + Iceberg 1.12 (spark.sql.geospatial.enabled). SQE also writes into such a table (INSERT, UPDATE and rewrite_data_files tested): values must be valid WKB, parquet tags the column as GEOMETRY / GEOGRAPHY, and a geometry column's manifest bounds are its bounding box (the vendored parquet writer carries the bounds from apache/iceberg-rust #3342). Spark 4.1 reads the rows SQE wrote and the compacted file. SQE creates such columns too: CREATE TABLE and ALTER TABLE ADD COLUMN take GEOMETRY[(crs)] and GEOGRAPHY[(crs[, algorithm])], with SRIDs mapped as Spark maps them (4326 is OGC:CRS84, n is EPSG:n); the table becomes format v3, and CTAS keeps the types. Spark 4.1 describes and reads an SQE-created table. A worker scans a Spark-written geospatial table too: the coordinator conforms the worker's Binary batches to the planned LargeBinary and keeps the GeoArrow tag, and a filter on the geometry column does not prune on its bounds. Thirty planar ST_* functions (sqe-geo) read and build WKB values: constructors, accessors, area / length / distance / centroid and the DE-9IM predicates; a geometry result writes into a GEOMETRY column, and the measures and predicates refuse a GEOGRAPHY value at planning time.
+  - A GEOGRAPHY column gets no manifest bounds: parquet computes no bounding box for it, and its byte-wise min/max would be wrong. Iceberg Java leaves the bounds out too when it has none.
+  - A geospatial column is top-level only: SQE refuses one inside STRUCT, ARRAY or MAP.
+  - No bounding-box pruning: a predicate on a geospatial column, ST_* included, is never pushed into the scan.
+  - The ST_* functions are planar only; there are no spherical GEOGRAPHY functions.
 
 ## Caveats on full cells
 
@@ -150,8 +147,15 @@ Every cell below full, with its caveats. Each has a `[MATRIX]` issue.
 - **bloom-filters (v3)**: write.parquet.bloom-filter-max-bytes is ignored: parquet-rs sizes a filter from the row count. Members of lists and maps get no bloom.
 - **aws-glue-catalog (v2)**: The live AWS tests are #[ignore] (need AWS credentials and a warehouse bucket) and run locally only; CI does not run them.
 - **aws-glue-catalog (v3)**: The live AWS test is #[ignore] (needs AWS credentials and a warehouse bucket) and runs locally only; CI does not run it.
-- **shredded-variant (v3)**: Shredded columns are unshredded on read, so typed_value gives no pruning or typed field access.
-- **shredded-variant (v3)**: Only top-level variant columns are shredded on write; a variant nested in a struct, list or map is written unshredded.
+- **unity-catalog (v2)**: The live run needs a Databricks workspace and a user token; it runs by hand, not in CI.
+- **unity-catalog (v2)**: The Databricks user's token is passed through to Unity Catalog and lives about an hour; a long session needs a fresh login.
+- **unity-catalog (v2)**: The embedded CLI does not run DDL on an ATTACHed Unity catalog yet; the coordinator does.
+- **unity-catalog (v3)**: The live run needs a Databricks workspace and a user token; it runs by hand, not in CI.
+- **unity-catalog (v3)**: The Databricks user's token is passed through to Unity Catalog and lives about an hour; a long session needs a fresh login.
+- **unity-catalog (v3)**: The embedded CLI does not run DDL on an ATTACHed Unity catalog yet; the coordinator does.
+- **unity-catalog (v3)**: DESCRIBE shows a Databricks GEOMETRY column as varbinary; the values read as geometry.
+- **unity-catalog (v3)**: A merge-on-read table with live delete files is scanned on the coordinator only until it is compacted.
+- **shredded-variant (v3)**: Shredded columns are unshredded on read, so typed_value gives no typed field access. Its statistics prune row groups, on the coordinator and on a worker, only for a variant_get / try_variant_get comparison with a literal. SQE writes variant manifest bounds only for top-level shredded columns, and none for a double path or a string over 64 bytes.
 - **lineage (v3)**: MoR DELETE is not a lineage case (deleted rows have no successor).
 
 ---

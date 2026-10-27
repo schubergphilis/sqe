@@ -112,6 +112,22 @@ The wrinkle was that the OSS image is read-only at the version we tested. List n
 
 We pinned the docker image to `unitycatalog/unitycatalog:main-2f2e32d` so the test does not break the next time someone ships breaking changes to `main`. Score 158 to 162. Same MR as the bloom filter probe, different gap.
 
+## Unity Catalog, the hosted one
+
+The OSS smoke did not survive the October rescore. A read-only list of a seeded table says the endpoint answers. It says nothing about whether SQE and Databricks agree on what is in a table. We dropped `unity-catalog:v2/v3` back to partial and wrote down what full would take: a live workspace, both engines writing, both engines reading, and the rows compared.
+
+The run lives in `scripts/interop/databricks-uc/`. Databricks creates tables through its SQL warehouse: every scalar type, nested types, a clustered table, schema evolution, a V3 table with deletion vectors, a variant, a geometry. SQE creates its own set through the same Unity catalog. Then each engine runs DELETE, UPDATE and MERGE on the other's tables. Twenty-five reads run on both engines, and a Python script compares the rows value by value. Timestamps compare as epoch microseconds, because the Databricks statement API prints milliseconds and a string compare would hide a lost digit.
+
+There is no service account anywhere in it. The user logs in to Databricks, SQE validates the user's token against the workspace JWKS, and the same token goes to Unity Catalog. Unity vends the storage credentials. SQE never holds a key of its own.
+
+Embedded mode matched 25 of 25. A single coordinator matched 25 of 25. A coordinator with one worker matched 23.
+
+The two misses were the same table. SQE had written a partitioned V3 table, and Databricks had updated one row in it with a deletion vector. Read through the worker, the old row came back next to the new one. The worker reads the data files in its scan ticket with a plain Parquet reader, and the ticket has no field for delete files. It never had. Every merge-on-read table large enough to cross the distribution threshold had been returning deleted rows on workers. The other deletion-vector tables in the run matched only because SQE's own copy-on-write DML had rewritten their files and dropped the vectors.
+
+The fix was one check in the distribution decision: a snapshot with delete manifests stays on the coordinator, where iceberg-rust applies the deletes. The regression test writes position deletes and deletion vectors through an in-process worker, and a control asserts that the same table without deletes does reach the worker. With the check disabled, the test fails the way the run did. Carrying delete files in the ticket is the real fix, and it is next.
+
+Score 154 to 156. The number moved by two. The bug mattered more than the cells. SQE could have found it alone: it writes deletion vectors too. No test had ever read one through a worker. The second engine wrote the table that did.
+
 ## The loader refactor pays for itself
 
 By Phase O we had four backend modules in `crates/sqe-catalog/src/backends/`: `glue.rs`, `hms.rs`, `sql.rs`, and `hadoop.rs`. Each was a thin wrapper around an upstream catalog crate. Each had its own `BackendConfig` struct with the same three or four fields under different names. Each had its own `build_catalog()` method that did the same shape of work: read props, construct an upstream builder, call `.load()`.

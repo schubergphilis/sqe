@@ -11,7 +11,7 @@ SQE is built on the [iceberg-rust](https://github.com/apache/iceberg-rust) libra
 - **Parquet**: 59
 - **Iceberg table format**: V2 and V3. V3 is the default for new tables. V3 features verified end-to-end: TIMESTAMP_NS, column defaults, equality-delete UPDATE on identifier-fields, partition evolution, deletion vectors, row lineage, `VARIANT`, and top-level unknown columns.
 
-The matrix score against [icebergmatrix.org](https://icebergmatrix.org) is 152/162 (93.8%), rescored in October 2026 against the current rubric, which scores only the cells that apply to each format version. Scores from the older rubric (167/189) are not comparable. See [getsqe.com/compare/iceberg](https://getsqe.com/compare/iceberg) for the per-cell breakdown and the side-by-side V2/V3 comparison against every other engine on the public scoreboard.
+The matrix score against [icebergmatrix.org](https://icebergmatrix.org) is 156/162 (96.3%), rescored in October 2026 against the current rubric, which scores only the cells that apply to each format version. Scores from the older rubric (167/189) are not comparable. See [getsqe.com/compare/iceberg](https://getsqe.com/compare/iceberg) for the per-cell breakdown and the side-by-side V2/V3 comparison against every other engine on the public scoreboard.
 
 ## Architecture
 
@@ -43,7 +43,8 @@ SQE keeps the catalog choice as a runtime configuration concern. Every catalog b
 | Project Nessie 0.107+ | `rest` | Iceberg REST | bearer / anonymous | live verified |
 | AWS Glue (Iceberg REST) | `rest` | Iceberg REST + AWS SigV4 | AWS provider chain | live verified |
 | AWS S3 Tables (REST) | `rest` | Iceberg REST + AWS SigV4 (`s3tables` signing) | AWS provider chain | live verified |
-| Unity Catalog OSS | `rest` | Iceberg REST | bearer (Databricks) / anonymous (OSS) | live verified, read-only on OSS |
+| Databricks Unity Catalog | `rest` | Iceberg REST | Databricks user token, passed through | live verified: read, write and DML both ways ([interop run](#databricks-unity-catalog-interop)) |
+| Unity Catalog OSS | `rest` | Iceberg REST | anonymous | live verified, read-only |
 | AWS Glue (native SDK) | `glue` | aws-sdk-glue | AWS provider chain | live verified eu-central-1 |
 | AWS S3 Tables (native SDK) | `s3tables` | aws-sdk-s3tables | AWS provider chain | live verified eu-west-1 |
 | Hive Metastore | `hms` | Thrift | none / Kerberos | live verified |
@@ -59,6 +60,42 @@ Two SQE-only patches sit on top of the vendored loader. The first feature-gates 
 Live integration tests for HMS, Nessie, JDBC Postgres, AWS Glue, AWS S3 Tables, and Unity OSS live in `crates/sqe-catalog/tests/backends_integration.rs`. Each is `#[ignore]` and runs against a docker-compose overlay or a real cloud account configured via `.env`. Glue and S3 Tables are also live-verified (2026-05-05) against AWS account `123456789012` in eu-central-1 and eu-west-1.
 
 The AWS REST endpoints share the OSS Iceberg REST code path. Phase P added an `aws-sigv4` cargo feature to the vendored `iceberg-catalog-rest` crate that swaps the OAuth/Bearer authenticator for an AWS SigV4 signer when `rest.sigv4-enabled=true` lands in the catalog properties (or in the server's `/v1/config` defaults). The signer reads credentials from the standard AWS provider chain.
+
+## Databricks Unity Catalog interop
+
+Databricks-hosted Unity Catalog serves its managed Iceberg tables over the Iceberg REST protocol at `/api/2.1/unity-catalog/iceberg-rest`. SQE reaches it with the `rest` backend and no service account. The user signs in to Databricks, SQE validates the user's token against the workspace JWKS (a `bearer_token` auth provider), and the same token goes to Unity Catalog, which vends short-lived storage credentials for the tables that user may read.
+
+```toml
+[[auth.providers]]
+type = "bearer_token"
+jwks_url = "https://<region>.cloud.databricks.com/oidc/jwks.json"
+issuer = "https://<workspace host>/oidc"
+audience = "<workspace id>"
+user_claim = "sub"
+
+[catalogs.dbx]
+catalog_url = "https://<workspace host>/api/2.1/unity-catalog/iceberg-rest"
+warehouse = "<Unity catalog name>"
+```
+
+The interop run in `scripts/interop/databricks-uc/` checks both directions against a live workspace. Each engine writes tables, the other reads them, both run DML on the other's tables, and every read runs on both engines with the rows compared value by value. Wrong values fail the run, not only errors.
+
+| Direction | What it covers |
+|---|---|
+| Databricks writes, SQE reads | every scalar type including `TIMESTAMP_NTZ` and `BINARY`, structs, arrays, maps, liquid clustering, schema evolution (add, widen, rename), V3 deletion vectors, `VARIANT`, `GEOMETRY(4326)` |
+| SQE writes, Databricks reads | CREATE, CTAS, INSERT, UPDATE, DELETE, MERGE, ADD COLUMN, a partitioned table, V2 and V3 tables, `VARIANT`, `GEOMETRY` |
+| Databricks DML on SQE tables | DELETE, UPDATE and INSERT, including a deletion vector on an SQE-written V3 table |
+| SQE DML on Databricks tables | DELETE, UPDATE, MERGE and INSERT, on V2 and V3 tables |
+
+All 25 compared reads match in embedded mode (`ATTACH` in `sqe-cli`), against a single coordinator, and against a coordinator with a worker. The distributed run found a real bug: a worker read its data files without the table's delete files, so rows that Databricks had deleted with a deletion vector came back. A snapshot with delete files is now scanned on the coordinator.
+
+Known gaps from the same run:
+
+- The embedded CLI does not run DDL on an attached Unity catalog yet. Reads and DML work; CREATE and ALTER go through the coordinator.
+- `DESCRIBE` reports a Databricks `GEOMETRY` column as `varbinary`. The values read as geometry.
+- `SHOW CREATE TABLE` prints Unity's internal table properties (`databricks.*`, `io.unitycatalog.tableId`, the storage paths) and no clustering clause.
+- A Databricks user token lives about an hour. A longer session needs a fresh login, or an `ATTACH` with an [oauth2 secret](../operations/catalogs.md#example-rest-catalog-with-an-oauth2-client-credential) that refreshes a service principal's token. That trades the user's grants for the principal's.
+- A Delta table listed in the same Unity schema is refused with "not an Iceberg table". SQE reads Iceberg only.
 
 ## Catalog REST surface
 
