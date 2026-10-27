@@ -98,7 +98,7 @@ BENCH_ENV       = PROFILE=$(BENCH_PROFILE) BENCH_LOG_DIR=$(BENCH_LOG_DIR)
         audit audit-advisories deps-check lock-maintenance dbt-sqe-lock metrics-layering-check \
         audit-deny audit-licenses \
         benchmark_all benchmark_all_trino \
-        clippy fmt fmt-check pre-commit pre-commit-all clean clean-rust clean-rustbook \
+        clippy lint fmt fmt-check pre-commit pre-commit-all clean clean-rust clean-rustbook \
         clean-ebook clean-benchmark-charts clean-images check-tools maintain \
         build build-sqe sbom sbom-sqe sqe-config images \
         login buildx-builder push push-sqe leak-scan
@@ -128,6 +128,7 @@ help:
 	@echo "    make fmt-check    cargo fmt --all --check"
 	@echo "    make pre-commit   commit hooks on staged files: gitleaks, rustfmt ratchet, supply chain, shellcheck"
 	@echo "    make pre-commit-all  every hook on every file, clippy included"
+	@echo "    make lint         clippy on the whole workspace (pre-push lints changed crates only)"
 	@echo ""
 	@echo "  Supply chain:"
 	@echo "    make audit        cargo audit + cargo deny check (advisories, bans, sources)"
@@ -425,7 +426,7 @@ fmt-check:
 
 # The hooks in .pre-commit-config.yaml: gitleaks (Aikido aikido-secret-scan
 # analog), file hygiene, a rustfmt ratchet, supply-chain checks on dependency
-# changes, shellcheck, and clippy at pre-push.
+# changes, shellcheck, and clippy on the changed crates at pre-push.
 # Requires `pre-commit` on PATH (`pipx install pre-commit` / `brew install pre-commit`).
 pre-commit:
 	@echo "==> Running pre-commit hooks"
@@ -434,7 +435,13 @@ pre-commit:
 pre-commit-all:
 	@echo "==> Running every pre-commit hook on every file"
 	pre-commit run --all-files
-	pre-commit run --all-files --hook-stage pre-push
+	$(MAKE) lint
+
+# Clippy on the whole workspace with the pre-push hook's feature sets. The
+# hook itself lints only the crates the branch changed; run this before a
+# change that moves an API other crates use.
+lint:
+	scripts/pre-commit-hook.sh clippy-all
 
 # ── Container image: build / SBOM / config / push ─────────────────────────
 # Build context is the repo root (the Dockerfile COPYs Cargo.toml, crates/,
