@@ -1,9 +1,9 @@
-//! A snapshot with delete files is scanned on the coordinator, not on a
-//! worker. A worker ticket carries only data file paths and the worker reads
-//! them with a plain Parquet reader, so position deletes and deletion vectors
-//! would not be applied there and the deleted rows would come back. Found by
-//! the Databricks Unity Catalog interop run: a deletion vector Databricks
-//! wrote into an SQE table was ignored by the distributed read.
+//! A snapshot with position delete files or deletion vectors is scanned on
+//! the workers, and the deleted rows stay deleted. The ticket carries each
+//! data file's delete tasks (`ScanTask::delete_tasks`) and the worker skips
+//! the deleted positions. Found by the Databricks Unity Catalog interop run:
+//! a deletion vector Databricks wrote into an SQE table was ignored by the
+//! distributed read, and the first fix kept such snapshots on the coordinator.
 //!
 //! Runs against an in-process worker, so it tests the code in this tree.
 
@@ -27,8 +27,8 @@ async fn ids(
 async fn deleted_rows_stay_deleted_with_workers() {
     use crate::common::chaos_worker::{spawn_chaos_worker, ChaosMode};
     let worker = spawn_chaos_worker(ChaosMode::PassThrough).await;
-    // `rig` zeroes the distribution thresholds, so without the gate these
-    // small tables would be scanned on the worker.
+    // `rig` zeroes the distribution thresholds, so these small tables are
+    // scanned on the worker.
     let rig = crate::distributed_failure_e2e::rig(std::slice::from_ref(&worker.url), |_| {}).await;
     let (session, handler) = (&rig.session, rig.handler.as_ref());
 
@@ -85,10 +85,9 @@ async fn deleted_rows_stay_deleted_with_workers() {
 
         assert_eq!(all, vec!["2", "4"], "v{version}: deleted rows came back");
         assert_eq!(us, vec!["2", "4"], "v{version}: filtered read");
-        // Until a ticket carries delete files, the scan must stay local.
-        assert_eq!(
-            after, before,
-            "v{version}: a snapshot with delete files was sent to a worker"
+        assert!(
+            after > before,
+            "v{version}: a snapshot with delete files stayed on the coordinator"
         );
     }
 }
