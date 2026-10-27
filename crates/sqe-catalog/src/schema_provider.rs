@@ -267,6 +267,17 @@ fn should_try_view_after_table_error(error: &sqe_core::SqeError) -> bool {
     error.error_code() == sqe_core::SqeErrorCode::TableNotFound
 }
 
+/// A catalog that answers 400 to loading a name it listed is saying the name
+/// is not an Iceberg table: Unity Catalog lists its Delta tables in the
+/// Iceberg REST namespace and refuses to load them ("not an Iceberg
+/// compatible table"). Such a name resolves to no table, as an absent one
+/// does. Raised instead, it failed every `information_schema.columns` read
+/// of the catalog, because DataFusion loads every listed table for it and
+/// stops at the first error. 401/403 and 5xx are not this case.
+fn table_error_is_not_iceberg(error: &sqe_core::SqeError) -> bool {
+    matches!(error, sqe_core::SqeError::CatalogHttp { status: 400, .. })
+}
+
 /// DataFusion `SchemaProvider` that maps an Iceberg namespace to a DataFusion schema.
 ///
 /// Tables are loaded lazily when `table()` is called (async, so it may talk
@@ -484,6 +495,10 @@ impl SchemaProvider for SqeSchemaProvider {
             },
             Err(e) if should_try_view_after_table_error(&e) => {
                 debug!(table = name, error = %e, "Not found as table, trying view");
+            }
+            Err(e) if table_error_is_not_iceberg(&e) => {
+                debug!(table = name, error = %e, "Listed name is not an Iceberg table");
+                return Ok(None);
             }
             Err(e) => {
                 // Swallowing a Polaris 403 here turns AccessDenied into
@@ -880,6 +895,19 @@ mod tests {
 
         assert!(should_try_view_after_table_error(&missing));
         assert!(!should_try_view_after_table_error(&denied));
+    }
+
+    #[test]
+    fn only_a_bad_request_marks_a_listed_name_as_not_iceberg() {
+        let http = |status| sqe_core::SqeError::CatalogHttp {
+            status,
+            op: sqe_core::CatalogOp::Other,
+            body: "Failed to load table".into(),
+        };
+        assert!(table_error_is_not_iceberg(&http(400)));
+        for status in [401, 403, 404, 500, 503] {
+            assert!(!table_error_is_not_iceberg(&http(status)), "{status}");
+        }
     }
 
     /// Review 806: a failed refresh keeps the previous names and records the
