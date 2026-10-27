@@ -32,6 +32,7 @@ INSERT INTO places SELECT id + 100, ST_Centroid(shape), NULL FROM places;
 | `ST_Centroid(g)` | geometry | |
 | `ST_Intersects`, `ST_Contains`, `ST_Within`, `ST_Disjoint`, `ST_Equals`, `ST_Touches`, `ST_Crosses`, `ST_Overlaps` `(a, b)` | boolean | DE-9IM predicates. |
 | `ST_DWithin(a, b, d)` | boolean | `ST_Distance(a, b) <= d`. |
+| `ST_SRID(g)` | integer | The SRID of the column's CRS: 4326 for `OGC:CRS84`, n for `EPSG:n`. 0 for any other CRS and for a computed geometry, which carries none. |
 
 Every function returns NULL for a NULL argument. Bytes that are not WKB are an error, and so is a non-binary argument where a geometry is expected.
 
@@ -40,5 +41,6 @@ Every function returns NULL for a NULL argument. Bytes that are not WKB are an e
 - **All math is planar.** Coordinates are treated as Cartesian, whatever the column's CRS. Areas and distances are in the units of the coordinates, so degrees for `OGC:CRS84`.
 - **Planar functions refuse `GEOGRAPHY`.** A `GEOGRAPHY` column has spherical edges, and planar math on it gives wrong answers near the poles and the antimeridian. Measures and predicates on it fail at planning time. The formatting and accessor functions (`ST_AsText`, `ST_AsBinary`, `ST_X`, `ST_Y`, `ST_GeometryType`, `ST_NumPoints`, `ST_IsEmpty`) work. To accept planar math anyway, wrap the value: `ST_Area(ST_GeomFromBinary(ST_AsBinary(geo)))`.
 - **Results carry no CRS.** A geometry result is plain WKB. Written into a `GEOMETRY` column it takes that column's CRS.
+- **The CRS belongs to the column.** `DESCRIBE` and `SHOW CREATE TABLE` print it in the form the DDL takes back, as Spark prints it: `geometry(4326)`, `geometry(3857)`, `geography(4326)`, `geography(4326, karney)`. A CRS without an SRID is quoted: `geometry('ESRI:102100')`.
 - **No empty points.** `ST_GeomFromText('POINT EMPTY')` is refused, and so is an empty point in WKB. Empty collections work.
 - **No spatial pruning yet.** An `ST_*` filter is evaluated after the scan; it does not prune files on their bounding boxes and is not pushed to a worker.

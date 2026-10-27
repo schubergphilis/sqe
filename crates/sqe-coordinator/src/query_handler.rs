@@ -5805,8 +5805,15 @@ impl QueryHandler {
             if let Some(partitioned_by) = render_partitioned_by(table.metadata()) {
                 ddl.push_str(&partitioned_by);
             }
+            if let Some(sort_order) = render_sort_order(table.metadata()) {
+                ddl.push_str(&sort_order);
+            }
             let props = table.metadata().properties();
-            // Iceberg-internal property keys we never want to surface.
+            // Iceberg-internal property keys we never want to surface, and
+            // keys the catalog owns: storage paths bound to this table's
+            // location, and the retention, layout and identity settings a
+            // managed catalog (Unity Catalog) stamps on every table. Copied
+            // into a new table they would point it at this table's files.
             const SUPPRESSED_PREFIXES: &[&str] = &[
                 "current-",
                 "snapshot-count",
@@ -5815,12 +5822,30 @@ impl QueryHandler {
                 "format-version",
                 "default-",
                 "owner",
+                "write.data.path",
+                "write.metadata.path",
+                "write.object-storage.",
+                "gc.",
+                "history.expire.",
+                "databricks.",
+                "io.unitycatalog.",
             ];
-            let mut user_props: Vec<(&String, &String)> = props
+            let mut user_props: Vec<(String, String)> = props
                 .iter()
                 .filter(|(k, _)| !SUPPRESSED_PREFIXES.iter().any(|pre| k.starts_with(pre)))
+                .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
-            user_props.sort_by(|a, b| a.0.cmp(b.0));
+            // The version is metadata, not a property; CREATE TABLE reads it
+            // back through this key. Always printed: the server's default
+            // version is configurable, so leaving it out could re-create a
+            // v2 table as v3, or a v3 one as v2.
+            let version = match table.metadata().format_version() {
+                iceberg::spec::FormatVersion::V1 => "1",
+                iceberg::spec::FormatVersion::V2 => "2",
+                iceberg::spec::FormatVersion::V3 => "3",
+            };
+            user_props.push(("format-version".to_string(), version.to_string()));
+            user_props.sort_by(|a, b| a.0.cmp(&b.0));
             if !user_props.is_empty() {
                 ddl.push_str("\nTBLPROPERTIES (\n");
                 let last = user_props.len() - 1;
@@ -8971,6 +8996,45 @@ fn render_partitioned_by(metadata: &iceberg::spec::TableMetadata) -> Option<Stri
     Some(format!("\nPARTITIONED BY ({})", parts.join(", ")))
 }
 
+/// The table's default sort order as an SQL comment line
+/// (`-- sort order: region ASC NULLS FIRST, bucket(16, id) DESC NULLS LAST`).
+/// SQE's CREATE TABLE has no clause that sets a sort order, so a comment
+/// shows it and the DDL still reads back. `None` when the table is unsorted.
+fn render_sort_order(metadata: &iceberg::spec::TableMetadata) -> Option<String> {
+    use iceberg::spec::{NullOrder, SortDirection, Transform};
+    let order = metadata.default_sort_order();
+    if order.is_unsorted() {
+        return None;
+    }
+    let schema = metadata.current_schema();
+    let fields: Vec<String> = order
+        .fields
+        .iter()
+        .map(|f| {
+            let col = schema
+                .name_by_field_id(f.source_id)
+                .map(|n| sqe_sql::quote_ident_if_needed(n, '"'))
+                .unwrap_or_else(|| format!("<field {}>", f.source_id));
+            let expr = match f.transform {
+                Transform::Identity => col,
+                Transform::Bucket(n) => format!("bucket({n}, {col})"),
+                Transform::Truncate(w) => format!("truncate({w}, {col})"),
+                other => format!("{other}({col})"),
+            };
+            let dir = match f.direction {
+                SortDirection::Ascending => "ASC",
+                SortDirection::Descending => "DESC",
+            };
+            let nulls = match f.null_order {
+                NullOrder::First => "NULLS FIRST",
+                NullOrder::Last => "NULLS LAST",
+            };
+            format!("{expr} {dir} {nulls}")
+        })
+        .collect();
+    Some(format!("\n-- sort order: {}", fields.join(", ")))
+}
+
 /// Find the latest Iceberg snapshot with `timestamp_ms <= target_ms`.
 ///
 /// Returns an error when the table has no snapshot at or before the given timestamp.
@@ -9787,8 +9851,13 @@ async fn single_table_columns(
     let mut nullable_b = StringBuilder::new();
     for field in table.schema().fields() {
         name_b.append_value(field.name());
-        // As DataFusion's `information_schema.columns` renders them.
-        type_b.append_value(field.data_type().to_string());
+        // As DataFusion's `information_schema.columns` renders them, except
+        // a geospatial column: its type lives in the `geoarrow.wkb` field
+        // metadata, and its storage type would print as `varbinary`.
+        match sqe_geo::ddl_type(field) {
+            Some(geo) => type_b.append_value(geo),
+            None => type_b.append_value(field.data_type().to_string()),
+        }
         nullable_b.append_value(if field.is_nullable() { "YES" } else { "NO" });
     }
     let schema = Arc::new(Schema::new(vec![
@@ -11791,6 +11860,71 @@ mod tests {
         assert_eq!(
             render_partitioned_by(&metadata).as_deref(),
             Some("\nPARTITIONED BY (region, month(ts), bucket(16, id), truncate(4, \"Odd Col\"))")
+        );
+    }
+
+    #[test]
+    fn show_create_table_renders_the_sort_order_as_a_comment() {
+        use iceberg::spec::{
+            NullOrder, SortDirection, SortField, SortOrder, TableMetadataBuilder, Transform,
+        };
+        assert_eq!(render_sort_order(&metadata_partitioned_by(&[])), None);
+        let unsorted = metadata_partitioned_by(&[]);
+        let schema = unsorted.current_schema().as_ref().clone();
+        let field = |id, transform, direction, null_order| {
+            SortField::builder()
+                .source_id(id)
+                .transform(transform)
+                .direction(direction)
+                .null_order(null_order)
+                .build()
+        };
+        let order = SortOrder::builder()
+            .with_order_id(1)
+            .with_sort_field(field(
+                2,
+                Transform::Identity,
+                SortDirection::Ascending,
+                NullOrder::First,
+            ))
+            .with_sort_field(field(
+                1,
+                Transform::Bucket(16),
+                SortDirection::Descending,
+                NullOrder::Last,
+            ))
+            .with_sort_field(field(
+                3,
+                Transform::Day,
+                SortDirection::Ascending,
+                NullOrder::Last,
+            ))
+            .with_sort_field(field(
+                4,
+                Transform::Identity,
+                SortDirection::Descending,
+                NullOrder::First,
+            ))
+            .build(&schema)
+            .unwrap();
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            iceberg::spec::UnboundPartitionSpec::builder().build(),
+            order,
+            "memory://t".to_string(),
+            iceberg::spec::FormatVersion::V2,
+            Default::default(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        assert_eq!(
+            render_sort_order(&metadata).as_deref(),
+            Some(
+                "\n-- sort order: region ASC NULLS FIRST, bucket(16, id) DESC NULLS LAST, \
+                 day(ts) ASC NULLS LAST, \"Odd Col\" DESC NULLS FIRST"
+            )
         );
     }
 
