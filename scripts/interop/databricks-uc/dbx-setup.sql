@@ -1,0 +1,33 @@
+-- Phase A, Databricks SQL: tables Databricks writes and SQE reads.
+-- One statement per line; @S@ is the schema (`catalog`.schema).
+DROP TABLE IF EXISTS @S@.dbx_run_basic;
+CREATE TABLE @S@.dbx_run_basic (id INT, name STRING, amount DECIMAL(10,2), ts TIMESTAMP, ntz TIMESTAMP_NTZ, d DATE, flag BOOLEAN, big BIGINT, dbl DOUBLE, bin BINARY) USING ICEBERG;
+INSERT INTO @S@.dbx_run_basic VALUES (1, 'a', 1.50, TIMESTAMP '2026-01-02 03:04:05.123456', TIMESTAMP_NTZ '2026-01-02 03:04:05.123456', DATE '2026-01-02', true, 9007199254740993, 1.5, X'CAFE'), (2, 'b', NULL, NULL, NULL, NULL, false, NULL, NULL, NULL), (3, 'c', -3.25, TIMESTAMP '1969-12-31 23:59:59', TIMESTAMP_NTZ '1969-12-31 23:59:59', DATE '1900-01-01', NULL, -1, 0.0, X'');
+INSERT INTO @S@.dbx_run_basic VALUES (4, 'd', 4.00, TIMESTAMP '2026-06-30 12:00:00', TIMESTAMP_NTZ '2026-06-30 12:00:00', DATE '2026-06-30', true, 4, 4.25, X'00FF');
+DROP TABLE IF EXISTS @S@.dbx_run_nested;
+CREATE TABLE @S@.dbx_run_nested (id INT, s STRUCT<a: INT, b: STRING>, arr ARRAY<INT>, m MAP<STRING, INT>, arr_s ARRAY<STRUCT<x: DOUBLE>>) USING ICEBERG;
+INSERT INTO @S@.dbx_run_nested VALUES (1, named_struct('a', 1, 'b', 'x'), array(1, 2, NULL), map('k', 1, 'j', 2), array(named_struct('x', 1.0D))), (2, NULL, array(), map(), NULL);
+DROP TABLE IF EXISTS @S@.dbx_run_part;
+CREATE TABLE @S@.dbx_run_part (id INT, region STRING, ts TIMESTAMP) USING ICEBERG CLUSTER BY (region) TBLPROPERTIES ('iceberg.enableDeletionVectors' = 'false', 'iceberg.enableRowTracking' = 'false');
+INSERT INTO @S@.dbx_run_part VALUES (1, 'eu', TIMESTAMP '2026-01-01 00:00:00'), (2, 'us', TIMESTAMP '2026-02-01 00:00:00'), (3, 'eu', TIMESTAMP '2026-03-01 00:00:00');
+DROP TABLE IF EXISTS @S@.dbx_run_v3;
+CREATE TABLE @S@.dbx_run_v3 (id INT, name STRING) USING ICEBERG TBLPROPERTIES ('format-version' = '3');
+INSERT INTO @S@.dbx_run_v3 SELECT CAST(id AS INT), concat('n', id) FROM range(1, 101);
+DELETE FROM @S@.dbx_run_v3 WHERE id % 10 = 0;
+UPDATE @S@.dbx_run_v3 SET name = 'dbx-upd' WHERE id IN (5, 15);
+DROP TABLE IF EXISTS @S@.dbx_run_variant;
+CREATE TABLE @S@.dbx_run_variant (id INT, v VARIANT) USING ICEBERG TBLPROPERTIES ('format-version' = '3');
+INSERT INTO @S@.dbx_run_variant VALUES (1, parse_json('{"a": 1, "b": [1, 2], "c": {"d": "x"}}')), (2, parse_json('42')), (3, NULL);
+DROP TABLE IF EXISTS @S@.dbx_run_geo;
+CREATE TABLE @S@.dbx_run_geo (id INT, g GEOMETRY(4326)) USING ICEBERG TBLPROPERTIES ('format-version' = '3');
+INSERT INTO @S@.dbx_run_geo VALUES (1, st_geomfromtext('POINT(1 2)', 4326)), (2, st_geomfromtext('POLYGON((0 0,4 0,4 3,0 3,0 0))', 4326)), (3, NULL);
+DROP TABLE IF EXISTS @S@.dbx_run_evo;
+CREATE TABLE @S@.dbx_run_evo (id INT, name STRING, amount DECIMAL(10,2)) USING ICEBERG;
+INSERT INTO @S@.dbx_run_evo VALUES (1, 'a', 1.50), (2, 'b', 2.25);
+ALTER TABLE @S@.dbx_run_evo ADD COLUMN extra STRING;
+INSERT INTO @S@.dbx_run_evo VALUES (3, 'c', 3.00, 'x3');
+ALTER TABLE @S@.dbx_run_evo ALTER COLUMN id TYPE BIGINT;
+INSERT INTO @S@.dbx_run_evo VALUES (4000000000, 'd', 4.00, 'x4');
+ALTER TABLE @S@.dbx_run_evo RENAME COLUMN name TO label;
+ALTER TABLE @S@.dbx_run_evo ADD COLUMN d STRING;
+INSERT INTO @S@.dbx_run_evo VALUES (5, 'e', 5.00, 'x5', 'new-d');

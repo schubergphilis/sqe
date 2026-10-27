@@ -1,0 +1,29 @@
+# Phase E: name <TAB> SQE SQL <TAB> Databricks SQL ("=" when identical). @S@ is the schema.
+# Timestamps compare as epoch microseconds (the Databricks statement API prints milliseconds).
+# Databricks-written tables
+basic_values	SELECT id, name, amount, CAST(ts AS BIGINT), CAST(ntz AS BIGINT), CAST(d AS STRING), flag, big, dbl, upper(encode(bin, 'hex')) FROM @S@.dbx_run_basic ORDER BY id	SELECT id, name, amount, unix_micros(ts), unix_micros(CAST(ntz AS TIMESTAMP)), CAST(d AS STRING), flag, big, dbl, hex(bin) FROM @S@.dbx_run_basic ORDER BY id
+basic_ts_filter	SELECT id FROM @S@.dbx_run_basic WHERE ts > TIMESTAMP '2026-01-01 00:00:00 UTC' ORDER BY id	SELECT id FROM @S@.dbx_run_basic WHERE ts > TIMESTAMP '2026-01-01 00:00:00 UTC' ORDER BY id
+basic_ntz_filter	SELECT id FROM @S@.dbx_run_basic WHERE ntz < TIMESTAMP '2000-01-01 00:00:00' ORDER BY id	SELECT id FROM @S@.dbx_run_basic WHERE ntz < TIMESTAMP_NTZ '2000-01-01 00:00:00' ORDER BY id
+basic_agg	SELECT count(*), sum(amount), min(d), max(big) FROM @S@.dbx_run_basic	=
+nested_fields	SELECT id, s.a, s.b, arr[1], arr[3], cardinality(arr), m['k'], m['j'], cardinality(m), arr_s[1].x FROM @S@.dbx_run_nested ORDER BY id	SELECT id, s.a, s.b, try_element_at(arr, 1), try_element_at(arr, 3), size(arr), m['k'], m['j'], size(m), try_element_at(arr_s, 1).x FROM @S@.dbx_run_nested ORDER BY id
+part_group	SELECT region, count(*), CAST(min(ts) AS BIGINT) FROM @S@.dbx_run_part GROUP BY region ORDER BY region	SELECT region, count(*), unix_micros(min(ts)) FROM @S@.dbx_run_part GROUP BY region ORDER BY region
+part_filter	SELECT id FROM @S@.dbx_run_part WHERE ts >= TIMESTAMP '2026-02-01 00:00:00 UTC' AND region = 'eu' ORDER BY id	=
+v3_dv_agg	SELECT count(*), sum(id), min(id), max(id) FROM @S@.dbx_run_v3	=
+v3_dv_rows	SELECT id, name FROM @S@.dbx_run_v3 WHERE id IN (5, 10, 11, 12, 13, 15, 20, 200) ORDER BY id	=
+v3_dv_names	SELECT name, count(*) FROM @S@.dbx_run_v3 WHERE name NOT LIKE 'n%' GROUP BY name ORDER BY name	=
+variant_paths	SELECT id, variant_get(v, '$.a', 'int'), variant_get(v, '$.c.d', 'string'), variant_get(v, '$.b[1]', 'int'), v IS NULL FROM @S@.dbx_run_variant ORDER BY id	SELECT id, variant_get(v, '$.a', 'int'), variant_get(v, '$.c.d', 'string'), variant_get(v, '$.b[1]', 'int'), v IS NULL FROM @S@.dbx_run_variant ORDER BY id
+geo_wkt	SELECT id, ST_AsText(g), ST_Area(g) FROM @S@.dbx_run_geo ORDER BY id	SELECT id, st_astext(g), st_area(g) FROM @S@.dbx_run_geo ORDER BY id
+evo_rows	SELECT id, label, amount, extra, d FROM @S@.dbx_run_evo ORDER BY id	=
+evo_filter	SELECT id FROM @S@.dbx_run_evo WHERE id > 2 ORDER BY id	=
+evo_agg	SELECT sum(id), sum(amount), count(extra), count(d) FROM @S@.dbx_run_evo	=
+# SQE-written tables
+sqe_basic_values	SELECT id, name, amount, CAST(ts AS BIGINT), CAST(d AS STRING), cardinality(tags), tags[1], s.a, s.b, note FROM @S@.sqe_basic ORDER BY id	SELECT id, name, amount, unix_micros(CAST(ts AS TIMESTAMP)), CAST(d AS STRING), size(tags), try_element_at(tags, 1), s.a, s.b, note FROM @S@.sqe_basic ORDER BY id
+sqe_ctas	SELECT id, name, amount FROM @S@.sqe_ctas ORDER BY id	=
+sqe_part_rows	SELECT id, region, CAST(ts AS BIGINT) FROM @S@.sqe_part ORDER BY id	SELECT id, region, unix_micros(CAST(ts AS TIMESTAMP)) FROM @S@.sqe_part ORDER BY id
+sqe_part_filter	SELECT id FROM @S@.sqe_part WHERE region = 'eu' ORDER BY id	=
+sqe_variant_paths	SELECT id, variant_get(v, '$.a', 'int'), variant_get(v, '$.b[1]', 'int'), v IS NULL FROM @S@.sqe_variant ORDER BY id	SELECT id, variant_get(v, '$.a', 'int'), variant_get(v, '$.b[1]', 'int'), v IS NULL FROM @S@.sqe_variant ORDER BY id
+sqe_geo	SELECT id, ST_AsText(g), ST_Area(g) FROM @S@.sqe_geo ORDER BY id	SELECT id, st_astext(g), st_area(g) FROM @S@.sqe_geo ORDER BY id
+sqe_v2_rows	SELECT id, name FROM @S@.sqe_v2 ORDER BY id	=
+sqe_v3_agg	SELECT count(*), sum(id), CAST(max(ts) AS BIGINT) FROM @S@.sqe_v3	SELECT count(*), sum(id), unix_micros(max(ts)) FROM @S@.sqe_v3
+sqe_v3_rows	SELECT id, name FROM @S@.sqe_v3 WHERE id IN (1, 2, 3, 10, 11, 20, 21, 22, 51) ORDER BY id	=
+sqe_evo_rows	SELECT id, label, v, extra FROM @S@.sqe_evo ORDER BY id	=

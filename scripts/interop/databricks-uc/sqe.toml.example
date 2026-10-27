@@ -1,0 +1,52 @@
+# SQE coordinator for the Databricks Unity Catalog interop run.
+# Replace every <...>. The Databricks user's token is the bearer token:
+# SQE validates it against the workspace JWKS and passes it through to Unity
+# Catalog. There is no service account.
+#
+# Coordinator-local: drop worker_urls and the [query] block.
+# Distributed: start a worker first (`sqe-server --mode worker`) on a copy of
+# this file with the [worker] block below and the same worker_secret, then
+# this coordinator.
+#
+# [worker]
+# coordinator_url = "http://127.0.0.1:50061"
+# flight_port = 50071
+# advertise_url = "http://127.0.0.1:50071"
+# worker_secret = "<the same random hex>"
+
+[coordinator]
+flight_sql_port = 50061
+mode = "coordinator"
+worker_urls = ["http://127.0.0.1:50071"]
+worker_secret = "<random hex, the same on the worker>"
+distributed_credentials = "vended"
+
+[auth]
+keycloak_url = "http://unused.invalid"
+realm = "unused"
+client_id = "unused"
+client_secret = ""
+
+[[auth.providers]]
+type = "bearer_token"
+jwks_url = "https://<region>.cloud.databricks.com/oidc/jwks.json"
+issuer = "https://<workspace host>/oidc"
+audience = "<workspace id>"
+user_claim = "sub"
+roles_claim = "roles"
+
+[catalogs.dbx]
+catalog_url = "https://<workspace host>/api/2.1/unity-catalog/iceberg-rest"
+warehouse = "<UC catalog>"
+metadata_cache_ttl_secs = 30
+
+[storage]
+s3_region = "<bucket region>"
+
+[policy]
+engine = "passthrough"
+
+# Every scan goes to the worker, so the distributed path is what is tested.
+[query]
+distribution_threshold = "0"
+distribution_file_threshold = 0
