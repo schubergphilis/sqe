@@ -84,6 +84,7 @@ def sqe(sql_text, mode, fmt, tok):
     else:
         cmd = [SQE_CLI, "-p", SQE_PORT, "--token", tok, "--file", script, "--format", fmt]
     try:
+        # nosemgrep: opt.aikido.semgrep-rules.python.lang.security.audit.dangerous-subprocess-use-audit, opt.aikido.semgrep-rules.python.lang.security.audit.dangerous-subprocess-use-tainted-env-args -- operator's own sqe-cli binary (SQE_CLI), argv list, no shell
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     finally:
         os.unlink(script)
