@@ -35,11 +35,12 @@ pub mod worker_protocol;
 pub use cartesian_admission::CartesianAdmissionRule;
 pub use join_strategy::{BuildSizeEstimate, JoinStrategyRule, DEFAULT_HASH_JOIN_THRESHOLD};
 pub use scan_morsel::{
-    group_row_groups_into_morsels, plan_file_byte_morsels, plan_scan_morsels, RowGroupSlice,
-    ScanMorsel, DEFAULT_MORSEL_MAX_BYTES, DEFAULT_MORSEL_TARGET_BYTES, SCAN_TASK_VERSION_CURRENT,
-    SCAN_TASK_VERSION_V1, SCAN_TASK_VERSION_V2, SCAN_TASK_VERSION_V5,
+    group_row_groups_into_morsels, plan_file_byte_morsels, plan_scan_morsels,
+    plan_scan_morsels_by_file, RowGroupSlice, ScanMorsel, DEFAULT_MORSEL_MAX_BYTES,
+    DEFAULT_MORSEL_TARGET_BYTES, SCAN_TASK_VERSION_CURRENT, SCAN_TASK_VERSION_V1,
+    SCAN_TASK_VERSION_V2, SCAN_TASK_VERSION_V5,
 };
-pub use scan_morsel::{SCAN_TASK_VERSION_V3, SCAN_TASK_VERSION_V4};
+pub use scan_morsel::{SCAN_TASK_VERSION_V3, SCAN_TASK_VERSION_V4, SCAN_TASK_VERSION_V6};
 pub use scan_task::{
     HiveScanDescriptor, HiveScanFormat, ScanCredentials, ScanStorage, ScanTask, ScanTaskBuilder,
     TicketSecret,

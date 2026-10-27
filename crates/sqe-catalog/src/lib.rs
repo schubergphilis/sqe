@@ -84,6 +84,8 @@ pub fn storage_factory() -> std::sync::Arc<dyn iceberg::io::StorageFactory> {
     std::sync::Arc::new(iceberg_storage_opendal::OpenDalResolvingStorageFactory::new())
 }
 
+pub mod delete_tasks;
+
 mod scoped_table;
 #[cfg(test)]
 pub(crate) mod test_fixtures;

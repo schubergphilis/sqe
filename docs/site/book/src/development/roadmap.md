@@ -270,6 +270,7 @@ Iceberg V3 table format support landed end-to-end. V3 is the default format-vers
 | Partition evolution | Done |
 | Equality deletes + position deletes (MoR) | Done |
 | Deletion vectors (MoR DELETE on V3 writes one vector per data file) | Done |
+| Workers apply position deletes and deletion vectors (equality deletes scan on the coordinator) | Done |
 | Row lineage | Done |
 | Unknown/VOID columns (top-level) | Done |
 

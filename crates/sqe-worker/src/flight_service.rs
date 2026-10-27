@@ -1871,6 +1871,7 @@ mod tests {
             hive: None,
             projection_fill: None,
             variant_prunes: None,
+            delete_tasks: None,
             version: 1,
             morsel_id: None,
             row_group_start: None,

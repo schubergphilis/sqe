@@ -154,7 +154,7 @@ Every cell below full, with its caveats. Each has a `[MATRIX]` issue.
 - **unity-catalog (v3)**: The Databricks user's token is passed through to Unity Catalog and lives about an hour; a long session needs a fresh login.
 - **unity-catalog (v3)**: The embedded CLI only reads an ATTACHed Unity catalog yet (no UPDATE, DELETE, MERGE or ALTER; CREATE TABLE with plain columns only); the coordinator does all of it.
 - **unity-catalog (v3)**: DESCRIBE shows a Databricks GEOMETRY column as varbinary; the values read as geometry.
-- **unity-catalog (v3)**: A merge-on-read table with live delete files is scanned on the coordinator only until it is compacted.
+- **unity-catalog (v3)**: A snapshot with equality delete files is scanned on the coordinator only; position deletes and deletion vectors are applied on the workers.
 - **shredded-variant (v3)**: Shredded columns are unshredded on read, so typed_value gives no typed field access. Its statistics prune row groups, on the coordinator and on a worker, only for a variant_get / try_variant_get comparison with a literal. SQE writes variant manifest bounds only for top-level shredded columns, and none for a double path or a string over 64 bytes.
 - **lineage (v3)**: MoR DELETE is not a lineage case (deleted rows have no successor).
 
