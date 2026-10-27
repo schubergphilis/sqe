@@ -5,10 +5,12 @@ use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
+use datafusion::common::tree_node::TreeNode;
 use datafusion::common::DFSchema;
 use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool};
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::Expr;
+use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion::physical_expr::create_physical_expr;
 use datafusion::physical_plan::metrics::Count;
 use datafusion::physical_plan::PhysicalExpr;
@@ -581,9 +583,24 @@ fn build_physical_predicate(
             return None;
         }
     };
+    // The predicate is typed by the scanned table schema, the file by its
+    // writer: an `int` since promoted to `bigint`, or a timestamptz the file
+    // labels "UTC" where the plan says "+00:00". Bound as-is, the comparison
+    // failed at evaluation and took the whole scan down; coerce it against the
+    // file's types the way the planner coerces against the table's.
+    let predicate = match predicate
+        .clone()
+        .rewrite(&mut TypeCoercionRewriter::new(&df_schema))
+    {
+        Ok(coerced) => coerced.data,
+        Err(e) => {
+            warn!(fragment_id = %fragment_id, error = %e, "Predicate coercion to file types failed");
+            return None;
+        }
+    };
     let ctx = SessionContext::new();
     match create_physical_expr(
-        predicate,
+        &predicate,
         &df_schema,
         ctx.state().execution_props(),
         // DataFusion 55 added a planning context for subqueries and lambda
@@ -2545,6 +2562,53 @@ mod tests {
         ]));
         let physical = build_physical_predicate(&expr, &file_schema, "frag-test");
         assert!(physical.is_some(), "predicate should bind to file schema");
+    }
+
+    /// A Databricks file stores `id` as `int` after the table promoted it to
+    /// `bigint`, and its timestamptz as "UTC" where the plan says "+00:00".
+    /// The predicate must evaluate against those file types, not fail.
+    #[test]
+    fn build_physical_predicate_coerces_to_file_types() {
+        use arrow_array::{Int32Array, TimestampMicrosecondArray};
+        use datafusion::scalar::ScalarValue;
+
+        let file_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 3])),
+                Arc::new(TimestampMicrosecondArray::from(vec![0, 2_000_000]).with_timezone("UTC")),
+            ],
+        )
+        .unwrap();
+        let ts_lit = lit(ScalarValue::TimestampMicrosecond(
+            Some(1_000_000),
+            Some("+00:00".into()),
+        ));
+        for expr in [col("id").gt(lit(2i64)), col("ts").gt(ts_lit)] {
+            let physical = build_physical_predicate(&expr, &file_schema, "frag-test")
+                .unwrap_or_else(|| panic!("{expr} should bind to the file schema"));
+            let mask = physical
+                .evaluate(&batch)
+                .and_then(|v| v.into_array(batch.num_rows()))
+                .unwrap_or_else(|e| panic!("{expr} should evaluate: {e}"));
+            let mask = mask
+                .as_any()
+                .downcast_ref::<arrow_array::BooleanArray>()
+                .unwrap();
+            assert_eq!(
+                mask.iter().collect::<Vec<_>>(),
+                [Some(false), Some(true)],
+                "{expr}"
+            );
+        }
     }
 
     #[test]

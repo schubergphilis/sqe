@@ -1380,8 +1380,12 @@ impl FlightService for WorkerFlightService {
         match action.r#type.as_str() {
             "health_check" => {
                 debug!("Health check OK");
+                // `ok <key>` names the scan-ticket key this worker verifies
+                // with. A coordinator that restarted holds a new key until the
+                // next heartbeat re-pins it; it must not send tickets before.
+                let body = health_check_body(self.ticket_pin.as_deref());
                 let result = arrow_flight::Result {
-                    body: bytes::Bytes::from_static(b"ok"),
+                    body: bytes::Bytes::from(body),
                 };
                 Ok(Response::new(Box::pin(stream::once(async { Ok(result) }))))
             }
@@ -1634,10 +1638,35 @@ impl FlightService for WorkerFlightService {
     }
 }
 
+/// The `health_check` reply: `ok <public key>` when this worker verifies
+/// tickets against a pinned key, `ok unpinned` while it waits for its first
+/// heartbeat, plain `ok` when it has no Ed25519 pin at all. The coordinator's
+/// `worker_registry::ticket_key_ready` reads it.
+fn health_check_body(pin: Option<&crate::ticket_pin::TicketKeyPin>) -> String {
+    match pin.map(|p| p.verifier()) {
+        Some(Some(verifier)) => format!("ok {}", verifier.public_key_b64()),
+        Some(None) => "ok unpinned".to_string(),
+        None => "ok".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::{Duration, Utc};
+
+    #[test]
+    fn health_check_names_the_pinned_ticket_key() {
+        let pin = crate::ticket_pin::TicketKeyPin::floating();
+        assert_eq!(health_check_body(None), "ok");
+        assert_eq!(health_check_body(Some(&pin)), "ok unpinned");
+        let signer = sqe_core::ticket_signing::TicketSigner::generate().unwrap();
+        pin.pin_b64(signer.public_key_b64()).unwrap();
+        assert_eq!(
+            health_check_body(Some(&pin)),
+            format!("ok {}", signer.public_key_b64())
+        );
+    }
     use datafusion::prelude::SessionContext;
     use tonic::Request;
 
