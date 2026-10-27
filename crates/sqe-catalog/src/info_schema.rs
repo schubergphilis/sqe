@@ -1120,6 +1120,71 @@ mod tests {
         );
     }
 
+    /// Unity Catalog lists its Delta tables in the Iceberg REST namespace and
+    /// answers 400 to loading them. DataFusion's own
+    /// `information_schema.columns` loads every listed table and stops at the
+    /// first error, so one such table used to fail the whole read. It now
+    /// lists the Iceberg tables, and the Delta name resolves to no table.
+    #[tokio::test]
+    async fn builtin_columns_skip_a_listed_name_that_is_not_iceberg() {
+        use datafusion::catalog::CatalogProvider;
+        use datafusion::prelude::SessionConfig;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(table_path("sales", "customers")))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": {
+                    "message": "Table 'test-warehouse.sales.customers' is not an Iceberg compatible table.",
+                    "type": "BadRequestException",
+                    "code": 400
+                }
+            })))
+            .mount(&server)
+            .await;
+        polaris(&server).await;
+        let catalog = session(
+            &server,
+            "info-schema-builtin-not-iceberg",
+            TableMetadataCache::new(0),
+        )
+        .await;
+        let provider = crate::catalog_provider::SqeCatalogProvider::try_new_with_options(
+            catalog,
+            sqe_core::config::StorageConfig::default(),
+            WAREHOUSE.to_string(),
+            false,
+            false,
+        )
+        .await
+        .expect("provider");
+        provider.refresh_all_namespaces().await;
+        let provider: Arc<dyn CatalogProvider> = Arc::new(provider);
+        let ctx =
+            SessionContext::new_with_config(SessionConfig::new().with_information_schema(true));
+        ctx.register_catalog("lake", provider);
+
+        let batches = ctx
+            .sql(
+                "SELECT table_name, column_name FROM information_schema.columns \
+                 WHERE table_catalog = 'lake' AND table_schema = 'sales' \
+                 ORDER BY table_name, ordinal_position",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .expect("one table that is not Iceberg does not fail the read");
+        assert_eq!(strings(&batches, "table_name"), ["orders", "orders"]);
+        assert_eq!(strings(&batches, "column_name"), ["id", "data"]);
+
+        let error = ctx
+            .sql("SELECT * FROM lake.sales.customers")
+            .await
+            .expect_err("a name that is not an Iceberg table resolves to no table");
+        assert!(error.to_string().contains("not found"), "{error}");
+    }
+
     /// A catalog that cannot list namespaces contributes no rows to any of
     /// the three tables instead of failing them.
     #[tokio::test]

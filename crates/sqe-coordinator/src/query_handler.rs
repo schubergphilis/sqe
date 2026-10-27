@@ -5705,34 +5705,13 @@ impl QueryHandler {
         };
         let table_name = obj_name.to_string();
 
-        // Query information_schema.columns for the table's column definitions,
-        // qualified by the table's catalog and schema so the lookup hits the
-        // right catalog (a 3-part name, or a 2-part name under the session
-        // catalog) instead of only the default. Without this the body came
-        // back empty for tables outside the default catalog. (#2)
-        let col_sql = info_schema_columns_query(&table_name);
-
-        // `information_schema.columns` lists tables from the listing
-        // snapshots, which only the pre-plan refresh fills, and every table
-        // commit (CTAS, INSERT, ALTER) drops the namespace's snapshot. Without
-        // the refresh, SHOW CREATE TABLE straight after a CTAS listed no
-        // columns until some other query re-listed the namespace (#850).
-        self.refresh_listing_snapshots(ctx, session_catalog, session, &col_sql)
+        // The table's column definitions, from the table alone; see
+        // `single_table_columns`. The refresh resolves a namespace created
+        // since this provider listed (a CTAS just before, #850).
+        let probe = format!("SELECT * FROM {table_name}");
+        self.refresh_listing_snapshots(ctx, session_catalog, session, &probe)
             .await;
-        let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, &col_sql)
-            .await
-            .map_err(|e| {
-                SqeError::with_code(
-                    SqeErrorCode::ExecutionFailed,
-                    format!("Failed to query column metadata: {e}"),
-                )
-            })?;
-        let batches = df.collect().await.map_err(|e| {
-            SqeError::with_code(
-                SqeErrorCode::ExecutionFailed,
-                format!("Failed to collect column metadata: {e}"),
-            )
-        })?;
+        let batches = single_table_columns(ctx, &table_name).await?;
 
         // Reconstruct CREATE TABLE DDL
         // Names are quoted where an unquoted one would not come back the
@@ -6105,30 +6084,23 @@ impl QueryHandler {
         }
 
         self.deny_hidden_table(session, table_name).await?;
-        let col_sql = info_schema_columns_query(table_name);
 
         let (ctx, session_catalog) = self.create_session_context(session).await?;
-        // `information_schema.columns` enumerates every catalog's schemas and
-        // tables through the synchronous listing hooks, which only serve
-        // snapshots (review 806); fill them first or a Hive table's columns
-        // come back empty.
-        self.refresh_listing_snapshots(&ctx, &session_catalog, session, &col_sql)
+        // The schema lookups serve snapshots (review 806); fill the ones
+        // this name touches first.
+        let probe = format!("SELECT * FROM {table_name}");
+        self.refresh_listing_snapshots(&ctx, &session_catalog, session, &probe)
             .await;
-        let df = sqe_catalog::file_tvf_prepare::plan_sql(&ctx, &col_sql).await.map_err(|e| {
-            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("failed to query information_schema.columns: {e}"))
-        })?;
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("failed to collect column metadata: {e}")))?;
+        let batches = single_table_columns(&ctx, table_name).await?;
         // Iceberg keeps a per-column `doc`; `information_schema.columns`
         // does not carry it, so fetch the (cached) table metadata for the
         // comments. Best effort: a table that is not an Iceberg table, or
         // one this catalog cannot load, simply has no comments.
         let comments = match parts.as_slice() {
-            [.., schema, table] => self
-                .iceberg_column_comments(session, &parts, schema, table)
-                .await,
+            [.., schema, table] => {
+                self.iceberg_column_comments(session, &parts, schema, table)
+                    .await
+            }
             _ => std::collections::HashMap::new(),
         };
         with_column_comments(batches, &comments)
@@ -9751,30 +9723,67 @@ fn split_qualified_identifier(name: &str) -> Vec<String> {
     parts
 }
 
-fn info_schema_columns_query(table_name: &str) -> String {
+/// The `column_name, data_type, is_nullable` rows that
+/// `information_schema.columns` gives for one table, read from that table
+/// alone. The `information_schema` read loads every table of every catalog
+/// and fails on the first one that does not load (a name the caller may list
+/// but not read), so `DESCRIBE t` failed because of some other table. The
+/// name resolves as a `SELECT` resolves it: a missing catalog and schema come
+/// from the session defaults. A table that does not exist has no rows.
+async fn single_table_columns(
+    ctx: &SessionContext,
+    table_name: &str,
+) -> sqe_core::Result<Vec<RecordBatch>> {
     let parts = split_qualified_identifier(table_name);
-    let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
-    let (catalog, schema, bare) = match parts.as_slice() {
-        [t] => (None, None, *t),
-        [s, t] => (None, Some(*s), *t),
-        [c, s, t] => (Some(*c), Some(*s), *t),
+    let reference = match parts.as_slice() {
+        [t] => TableReference::bare(t.as_str()),
+        [s, t] => TableReference::partial(s.as_str(), t.as_str()),
         // More than 3 parts: take the last three as catalog.schema.table.
-        [.., c, s, t] => (Some(*c), Some(*s), *t),
-        [] => (None, None, table_name),
+        [.., c, s, t] => TableReference::full(c.as_str(), s.as_str(), t.as_str()),
+        [] => TableReference::bare(table_name),
     };
-    let esc_lit = |s: &str| s.replace('\'', "''");
-    let from = match catalog {
-        Some(c) => format!("\"{}\".information_schema.columns", c.replace('"', "\"\"")),
-        None => "information_schema.columns".to_string(),
+    let state = ctx.state();
+    let defaults = &state.config_options().catalog;
+    let resolved = reference.resolve(&defaults.default_catalog, &defaults.default_schema);
+    let table = match ctx
+        .catalog(&resolved.catalog)
+        .and_then(|catalog| catalog.schema(&resolved.schema))
+    {
+        Some(schema) => schema.table(&resolved.table).await.map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("failed to load {table_name} for its columns: {e}"),
+            )
+        })?,
+        None => None,
     };
-    let mut where_clause = format!("table_name = '{}'", esc_lit(bare));
-    if let Some(s) = schema {
-        where_clause.push_str(&format!(" AND table_schema = '{}'", esc_lit(s)));
+    let Some(table) = table else {
+        return Ok(Vec::new());
+    };
+    let mut name_b = StringBuilder::new();
+    let mut type_b = StringBuilder::new();
+    let mut nullable_b = StringBuilder::new();
+    for field in table.schema().fields() {
+        name_b.append_value(field.name());
+        // As DataFusion's `information_schema.columns` renders them.
+        type_b.append_value(field.data_type().to_string());
+        nullable_b.append_value(if field.is_nullable() { "YES" } else { "NO" });
     }
-    format!(
-        "SELECT column_name, data_type, is_nullable \
-         FROM {from} WHERE {where_clause} ORDER BY ordinal_position"
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("column_name", DataType::Utf8, false),
+        Field::new("data_type", DataType::Utf8, false),
+        Field::new("is_nullable", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(name_b.finish()) as ArrayRef,
+            Arc::new(type_b.finish()) as ArrayRef,
+            Arc::new(nullable_b.finish()) as ArrayRef,
+        ],
     )
+    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
+    Ok(vec![batch])
 }
 
 /// Build a `TableReference` from a `sqlparser::ast::ObjectName`, for
@@ -11393,75 +11402,107 @@ mod tests {
         assert_eq!(resolve("1700000000000"), 1_700_000_000_000);
     }
 
-    #[test]
-    fn info_schema_columns_query_qualifies_by_catalog_and_schema() {
-        // Bare name: default catalog's information_schema, no schema filter.
-        let bare = info_schema_columns_query("fct_revenue_monthly");
-        assert!(bare.contains("FROM information_schema.columns"));
-        assert!(bare.contains("table_name = 'fct_revenue_monthly'"));
-        assert!(!bare.contains("table_schema ="));
-
-        // 2-part: adds a schema filter, default catalog.
-        let two = info_schema_columns_query("gold.fct_revenue_monthly");
-        assert!(two.contains("FROM information_schema.columns"));
-        assert!(two.contains("table_name = 'fct_revenue_monthly'"));
-        assert!(two.contains("table_schema = 'gold'"));
-
-        // 3-part: qualifies the information_schema reference with the catalog.
-        let three = info_schema_columns_query("ws_energy_co.gold.fct_revenue_monthly");
-        assert!(three.contains("\"ws_energy_co\".information_schema.columns"));
-        assert!(three.contains("table_schema = 'gold'"));
-        assert!(three.contains("table_name = 'fct_revenue_monthly'"));
+    /// A context with `ws_energy_co.gold.fct_revenue_monthly` (`id` not
+    /// null, `name` nullable), `ws_energy_co.gold."col""umn"` under schema
+    /// `we.ird`, and `ws_energy_co` / `gold` as the session defaults.
+    fn single_table_ctx() -> SessionContext {
+        use datafusion::catalog::SchemaProvider;
+        use datafusion::datasource::MemTable;
+        let config = datafusion::prelude::SessionConfig::new()
+            .with_default_catalog_and_schema("ws_energy_co", "gold")
+            .with_create_default_catalog_and_schema(true)
+            .with_information_schema(true);
+        let ctx = SessionContext::new_with_config(config);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let table = Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap());
+        ctx.register_table("fct_revenue_monthly", table.clone())
+            .unwrap();
+        let catalog = ctx.catalog("ws_energy_co").unwrap();
+        let weird = Arc::new(datafusion::catalog::MemorySchemaProvider::new());
+        weird
+            .register_table(r#"col"umn"#.to_string(), table)
+            .unwrap();
+        catalog.register_schema("we.ird", weird).unwrap();
+        ctx
     }
 
-    #[test]
-    fn info_schema_columns_query_unquotes_double_quoted_identifiers() {
+    fn column_rows(batches: &[RecordBatch]) -> Vec<(String, String, String)> {
+        let text = |b: &RecordBatch, c: usize, r: usize| {
+            arrow::util::display::array_value_to_string(b.column(c), r).unwrap()
+        };
+        batches
+            .iter()
+            .flat_map(|b| {
+                (0..b.num_rows()).map(move |r| (text(b, 0, r), text(b, 1, r), text(b, 2, r)))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn single_table_columns_reads_the_named_table_as_information_schema_does() {
+        let ctx = single_table_ctx();
+        let expected = vec![
+            ("id".to_string(), "Int64".to_string(), "NO".to_string()),
+            ("name".to_string(), "Utf8".to_string(), "YES".to_string()),
+        ];
+        // The rows DataFusion's `information_schema.columns` gives the table.
+        let builtin = ctx
+            .sql(
+                "SELECT column_name, data_type, is_nullable FROM information_schema.columns \
+                 WHERE table_name = 'fct_revenue_monthly' ORDER BY ordinal_position",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(column_rows(&builtin), expected);
+        // Bare, 2-part and 3-part names resolve as a SELECT resolves them.
+        for name in [
+            "fct_revenue_monthly",
+            "gold.fct_revenue_monthly",
+            "ws_energy_co.gold.fct_revenue_monthly",
+        ] {
+            let rows = column_rows(&single_table_columns(&ctx, name).await.unwrap());
+            assert_eq!(rows, expected, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn single_table_columns_unquotes_double_quoted_identifiers() {
         // #327: the Starburst/Trino JDBC driver emits
         // `DESCRIBE "cat"."schema"."table"` for field discovery. The quoted
-        // form must resolve identically to the unquoted form -- otherwise the
-        // quote characters leak into the WHERE filter, nothing matches, and
-        // DESCRIBE/SHOW COLUMNS silently return 0 rows (Metabase syncs 0
-        // fields). Each part is unquoted the same way the SELECT planner does.
-        let unquoted = info_schema_columns_query("ws_energy_co.gold.fct_revenue_monthly");
-        let quoted = info_schema_columns_query(r#""ws_energy_co"."gold"."fct_revenue_monthly""#);
-        assert_eq!(
-            quoted, unquoted,
-            "quoted 3-part name must resolve like the unquoted form"
-        );
-
-        // A single quoted part is enough to break the naive split; cover it.
-        let partial = info_schema_columns_query(r#"ws_energy_co.gold."fct_revenue_monthly""#);
-        assert_eq!(partial, unquoted, "one quoted part must still resolve");
-
-        // Quoted single identifier (no qualifier).
-        let bare = info_schema_columns_query(r#""fct_revenue_monthly""#);
-        assert!(bare.contains("table_name = 'fct_revenue_monthly'"));
-        assert!(!bare.contains('"'), "no quote chars should leak: {bare}");
-
-        // An embedded dot inside a quoted part is one identifier, not a
-        // qualifier boundary; an embedded `""` is a literal quote.
-        let dotted = info_schema_columns_query(r#""we.ird"."col""umn""#);
-        assert!(
-            dotted.contains("table_schema = 'we.ird'"),
-            "dot stays in part: {dotted}"
-        );
-        assert!(
-            dotted.contains(r#"table_name = 'col"umn'"#),
-            "doubled quote collapses: {dotted}"
-        );
+        // form must resolve as the unquoted form does; otherwise DESCRIBE /
+        // SHOW COLUMNS return 0 rows (Metabase syncs 0 fields).
+        let ctx = single_table_ctx();
+        for name in [
+            r#""ws_energy_co"."gold"."fct_revenue_monthly""#,
+            r#"ws_energy_co.gold."fct_revenue_monthly""#,
+            r#""fct_revenue_monthly""#,
+            // A dot inside a quoted part is one identifier, not a qualifier
+            // boundary; an embedded `""` is a literal quote.
+            r#""we.ird"."col""umn""#,
+        ] {
+            let rows = column_rows(&single_table_columns(&ctx, name).await.unwrap());
+            assert_eq!(rows.len(), 2, "{name}: {rows:?}");
+        }
     }
 
-    #[test]
-    fn info_schema_columns_query_escapes_injection() {
-        // Single quotes in the (client-supplied) name are escaped as SQL
-        // string literals; double quotes in the catalog ident are doubled.
-        let q = info_schema_columns_query("ev'il.sch'ema.ta'ble");
-        assert!(q.contains("table_name = 'ta''ble'"));
-        assert!(q.contains("table_schema = 'sch''ema'"));
-        // A well-formed quoted catalog whose value embeds a `"` (written `""`):
-        // the value is `ca"t`, re-doubled when injected into the quoted FROM.
-        let q2 = info_schema_columns_query(r#""ca""t".s.t"#);
-        assert!(q2.contains("\"ca\"\"t\".information_schema.columns"));
+    #[tokio::test]
+    async fn single_table_columns_of_a_missing_table_is_empty() {
+        let ctx = single_table_ctx();
+        for name in [
+            "nope",
+            "gold.nope",
+            "nope.nope",
+            "nope.gold.fct_revenue_monthly",
+        ] {
+            let rows = column_rows(&single_table_columns(&ctx, name).await.unwrap());
+            assert!(rows.is_empty(), "{name}: {rows:?}");
+        }
     }
 
     /// Build a minimal session for timeout tests.
