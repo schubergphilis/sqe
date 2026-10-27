@@ -40,9 +40,11 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
+use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
-use iceberg::{Catalog, NamespaceIdent};
 use datafusion_iceberg::IcebergCatalogProvider;
+use iceberg::inspect::MetadataTableType;
+use iceberg::{Catalog, NamespaceIdent};
 
 /// A `CatalogProvider` over an iceberg::Catalog that supports both
 /// reads and namespace-level writes.
@@ -82,7 +84,7 @@ impl WritableIcebergCatalog {
         let schemas: DashMap<String, Arc<dyn SchemaProvider>> = DashMap::new();
         for name in upstream.schema_names() {
             if let Some(provider) = upstream.schema(&name) {
-                schemas.insert(name, provider);
+                schemas.insert(name, BaseTablesOnly::wrap(provider));
             }
         }
         Ok(Self {
@@ -167,7 +169,8 @@ impl WritableIcebergCatalog {
         let provider = upstream
             .schema(name)
             .ok_or_else(|| anyhow::anyhow!("schema {name} disappeared between create and read"))?;
-        self.schemas.insert(name.to_string(), provider);
+        self.schemas
+            .insert(name.to_string(), BaseTablesOnly::wrap(provider));
         Ok(())
     }
 
@@ -196,5 +199,88 @@ impl WritableIcebergCatalog {
             .map_err(|e| anyhow::anyhow!("drop_namespace({name}): {e}"))?;
         self.schemas.remove(name);
         Ok(())
+    }
+}
+
+/// The upstream `IcebergSchemaProvider` lists `t$snapshots`, `t$manifests`
+/// and `t$history` next to every table `t`, so `SHOW TABLES` and
+/// `information_schema.tables` held four rows per table, all `BASE TABLE`.
+/// Trino and Spark list base tables only. This wrapper drops the metadata
+/// names from the listing; `t$snapshots` still resolves when queried.
+#[derive(Debug)]
+struct BaseTablesOnly(Arc<dyn SchemaProvider>);
+
+impl BaseTablesOnly {
+    fn wrap(inner: Arc<dyn SchemaProvider>) -> Arc<dyn SchemaProvider> {
+        Arc::new(Self(inner))
+    }
+}
+
+fn is_metadata_table_name(name: &str) -> bool {
+    name.split_once('$')
+        .is_some_and(|(_, kind)| MetadataTableType::try_from(kind).is_ok())
+}
+
+#[async_trait::async_trait]
+impl SchemaProvider for BaseTablesOnly {
+    fn owner_name(&self) -> Option<&str> {
+        self.0.owner_name()
+    }
+
+    fn table_names(&self) -> Vec<String> {
+        self.0
+            .table_names()
+            .into_iter()
+            .filter(|name| !is_metadata_table_name(name))
+            .collect()
+    }
+
+    async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        self.0.table(name).await
+    }
+
+    async fn table_type(&self, name: &str) -> DFResult<Option<TableType>> {
+        self.0.table_type(name).await
+    }
+
+    fn register_table(
+        &self,
+        name: String,
+        table: Arc<dyn TableProvider>,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        self.0.register_table(name, table)
+    }
+
+    fn deregister_table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        self.0.deregister_table(name)
+    }
+
+    fn table_exist(&self, name: &str) -> bool {
+        self.0.table_exist(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::Schema;
+    use datafusion::catalog::MemorySchemaProvider;
+    use datafusion::datasource::empty::EmptyTable;
+
+    #[tokio::test]
+    async fn listing_drops_metadata_tables_but_they_still_resolve() {
+        let inner = Arc::new(MemorySchemaProvider::new());
+        let empty: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(Arc::new(Schema::empty())));
+        for name in ["t", "t$snapshots", "t$manifests", "t$history", "cost$eur"] {
+            inner
+                .register_table(name.to_string(), empty.clone())
+                .unwrap();
+        }
+        let wrapped = BaseTablesOnly::wrap(inner);
+        let mut names = wrapped.table_names();
+        names.sort();
+        assert_eq!(names, vec!["cost$eur".to_string(), "t".to_string()]);
+        assert!(wrapped.table_exist("t$snapshots"));
+        assert!(wrapped.table("t$history").await.unwrap().is_some());
     }
 }
