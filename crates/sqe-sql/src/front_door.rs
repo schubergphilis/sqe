@@ -17,7 +17,8 @@
 //!    fallbacks (`rewrite_paren_less_values`, `rewrite_bare_table`,
 //!    `rewrite_nested_row_cast`) and parse once more.
 //! 3. Run the AST rewriters on the single AST: `information_schema` catalog
-//!    qualification (when a session catalog is known), the Trino-compat
+//!    qualification (when a session catalog is known), bare `FROM t` to
+//!    `SELECT * FROM t` ([`crate::from_first`]), the Trino-compat
 //!    rewriter, and `_colN` aliasing of anonymous output columns.
 //! 4. Return the AST plus the serialized text. The text is the user's own
 //!    when nothing changed (sqlparser's `Display` does not reproduce every
@@ -176,6 +177,8 @@ impl SqlFrontDoor {
                 ast_rewritten |= metadata::qualify_information_schema(stmt, catalog);
             }
         }
+        // Before the column aliasing: a bare `FROM t` has no projection yet.
+        ast_rewritten |= crate::from_first::expand_from_first_select(&mut statements);
         ast_rewritten |= crate::trino_compat::apply_trino_compat(&mut statements, &sql);
         ast_rewritten |= crate::trino_compat::apply_anonymous_column_aliases(&mut statements);
 
