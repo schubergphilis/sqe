@@ -281,6 +281,24 @@ impl ExecutionPlan for IcebergWriteExec {
             Arc::clone(&context),
         )?;
 
+        // SQE patch: the input of a NOT NULL column is nullable whenever it
+        // comes from a query or an omitted column, and the parquet writer
+        // stores the zeroed value slot of a NULL, so the row read back as 0.
+        // Refuse the batch instead, with the coordinator's message.
+        let required: Vec<(usize, String)> = schema
+            .as_struct()
+            .fields()
+            .iter()
+            .filter(|field| field.required)
+            .filter_map(|field| {
+                self.input
+                    .schema()
+                    .index_of(&field.name)
+                    .ok()
+                    .map(|index| (index, field.name.clone()))
+            })
+            .collect();
+
         // Create write stream
         let stream = futures::stream::once(async move {
             let mut task_writer = task_writer;
@@ -288,6 +306,13 @@ impl ExecutionPlan for IcebergWriteExec {
 
             while let Some(batch) = input_stream.next().await {
                 let batch = batch?;
+                for (index, name) in &required {
+                    if batch.column(*index).null_count() > 0 {
+                        return Err(DataFusionError::Execution(format!(
+                            "NULL value not allowed for NOT NULL column: {name}"
+                        )));
+                    }
+                }
                 task_writer.write(batch).await?;
             }
 
