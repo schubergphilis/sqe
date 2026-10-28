@@ -6947,6 +6947,7 @@ dependencies = [
  "sqe-sql",
  "sqe-trino-functions",
  "sqe-trino-protocol",
+ "sqe-write",
  "sqlparser",
  "tempfile",
  "tokio",

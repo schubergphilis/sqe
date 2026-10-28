@@ -1719,6 +1719,31 @@ impl SessionCatalog {
         }
     }
 
+    /// Wrap a catalog the embedded CLI opened itself (a local SQLite
+    /// warehouse, an attached catalog) so the `sqe-write` DML handlers can
+    /// load and commit through it. There is no user token: the local user
+    /// owns the catalog and the files, as for every other embedded statement.
+    pub fn local(
+        inner: Arc<dyn iceberg::Catalog>,
+        warehouse: &str,
+        storage_config: &StorageConfig,
+    ) -> Self {
+        Self {
+            inner: CatalogHandle::Other(inner),
+            catalog_url: String::new(),
+            warehouse: warehouse.to_string(),
+            bearer_token: String::new(),
+            token_fingerprint: "local".to_string(),
+            storage_config: storage_config.clone(),
+            http_client: shared_http_client(),
+            sigv4: None,
+            extra_props: HashMap::new(),
+            circuit_breaker: user_circuit_breaker("local", warehouse),
+            require_vended_credentials: false,
+            table_cache: TableMetadataCache::new(0),
+        }
+    }
+
     /// Create a new per-session catalog configured with the user's bearer token.
     ///
     /// The `bearer_token` is set as the `token` property in the REST catalog config,

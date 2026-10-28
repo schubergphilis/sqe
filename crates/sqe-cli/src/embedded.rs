@@ -890,6 +890,17 @@ impl SqlClient for EmbeddedClient {
                         return Ok(result);
                     }
                 }
+                // DataFusion's DML hooks are not implemented by the Iceberg
+                // table provider ("DELETE not supported for Base table"), so
+                // DELETE / UPDATE / MERGE on a writable Iceberg catalog run
+                // through the server's write path instead.
+                sqe_sql::StatementKind::Delete(ref stmt)
+                | sqe_sql::StatementKind::Update(ref stmt)
+                | sqe_sql::StatementKind::Merge(ref stmt) => {
+                    if let Some(result) = self.embedded_handle_iceberg_dml(stmt).await? {
+                        return Ok(result);
+                    }
+                }
                 _ => {}
             },
             // Our own classifier rejected this statement with a specific,
@@ -1302,6 +1313,134 @@ impl EmbeddedClient {
             .run_datafusion(&format!("DROP TABLE IF EXISTS {name}"))
             .await;
         Err(failure.into())
+    }
+
+    /// DELETE / UPDATE / MERGE on a table in a `WritableIcebergCatalog`,
+    /// through `sqe-write`'s handlers: the same copy-on-write and
+    /// merge-on-read paths (`write.delete.mode` / `write.update.mode` /
+    /// `write.merge.mode`) the server runs. Embedded mode has no policy
+    /// enforcer, so no row filter or mask applies. `Ok(None)`: the target
+    /// is not in a writable Iceberg catalog, DataFusion answers.
+    async fn embedded_handle_iceberg_dml(
+        &self,
+        stmt: &sqlparser::ast::Statement,
+    ) -> Result<Option<QueryResult>, Box<dyn std::error::Error>> {
+        use sqe_write::write_handler::{
+            delete_target_object_name, update_target_object_name, WriteHandler,
+        };
+        use sqlparser::ast::{Statement, TableFactor};
+
+        let name = match stmt {
+            Statement::Delete(_) => delete_target_object_name(stmt)?,
+            Statement::Update(_) => update_target_object_name(stmt)?,
+            Statement::Merge(m) => match &m.table {
+                TableFactor::Table { name, .. } => name,
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        let parts: Vec<&str> = name
+            .0
+            .iter()
+            .filter_map(|p| p.as_ident().map(|i| i.value.as_str()))
+            .collect();
+        let catalog_name = match parts.as_slice() {
+            [catalog, _, _] => catalog.to_string(),
+            [_] | [_, _] => self.default_catalog(),
+            _ => return Ok(None),
+        };
+        let Some(writable) = self.iceberg_catalogs.get(&catalog_name) else {
+            return Ok(None);
+        };
+        let catalog = Arc::new(sqe_catalog::SessionCatalog::local(
+            writable.client(),
+            &catalog_name,
+            &self.storage,
+        ));
+
+        // The write handlers register their scratch tables under DataFusion's
+        // built-in `datafusion.public`, which the embedded context renames to
+        // `default.default`. Add it back, empty, on the first DML.
+        if self.ctx.catalog("datafusion").is_none() {
+            use datafusion::catalog::{
+                CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider,
+            };
+            let scratch = MemoryCatalogProvider::new();
+            scratch.register_schema("public", Arc::new(MemorySchemaProvider::new()))?;
+            self.ctx.register_catalog("datafusion", Arc::new(scratch));
+        }
+
+        let options = self.ctx.state().config().options().clone();
+        let mut session = sqe_core::Session::new(
+            std::env::var("USER").unwrap_or_else(|_| "sqe-embedded".to_string()),
+            sqe_core::SecretString::new(String::new()),
+            None,
+            chrono::DateTime::<chrono::Utc>::MAX_UTC,
+            Vec::new(),
+        );
+        session.default_catalog = Some(catalog_name);
+        session.default_schema = Some(options.catalog.default_schema.clone());
+
+        let handler = WriteHandler::new(sqe_core::SqeConfig::embedded_defaults());
+        let mut plan_out = None;
+        let mut policy_summary = None;
+        let batches = match stmt {
+            Statement::Delete(_) => {
+                handler
+                    .dispatch_delete_on(
+                        &session,
+                        stmt,
+                        catalog,
+                        &self.ctx,
+                        &mut plan_out,
+                        &mut policy_summary,
+                    )
+                    .await?
+            }
+            Statement::Update(_) => {
+                handler
+                    .dispatch_update_on(
+                        &session,
+                        stmt,
+                        catalog,
+                        &self.ctx,
+                        &mut plan_out,
+                        &mut policy_summary,
+                    )
+                    .await?
+            }
+            Statement::Merge(m) => {
+                let source_sql = sqe_write::merge_sql::merge_source_sql(&m.source)?;
+                // Through the wrappers, so a `read_parquet(...)` source has its
+                // provider built before planning.
+                sqe_catalog::file_tvf_prepare::prepare_statement(&self.ctx, &source_sql).await?;
+                let source =
+                    sqe_catalog::file_tvf_prepare::plan_sql_without_policy(&self.ctx, &source_sql)
+                        .await?;
+                let source_plan = source.logical_plan().clone();
+                let source_schema = Arc::new(source_plan.schema().as_arrow().clone());
+                let source_batches = source.collect().await?;
+                handler
+                    .dispatch_merge_on(
+                        &session,
+                        stmt,
+                        source_batches,
+                        Some(source_schema),
+                        catalog,
+                        &self.ctx,
+                        Some(source_plan),
+                        &mut plan_out,
+                        &mut policy_summary,
+                    )
+                    .await?
+            }
+            _ => return Ok(None),
+        };
+        let schema = batches
+            .first()
+            .map(|b| b.schema())
+            .unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()));
+        Ok(Some(record_batches_to_query_result(&schema, &batches)))
     }
 
     /// `SHOW TABLES {IN|FROM} [<catalog>.]<schema> [LIKE '<pattern>']`.

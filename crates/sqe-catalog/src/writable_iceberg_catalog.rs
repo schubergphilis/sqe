@@ -68,6 +68,12 @@ pub struct WritableIcebergCatalog {
 }
 
 impl WritableIcebergCatalog {
+    /// The iceberg catalog behind this provider, for writes that commit
+    /// through `sqe-write` rather than DataFusion's DML hooks.
+    pub fn client(&self) -> Arc<dyn Catalog> {
+        self.catalog.clone()
+    }
+
     /// Build a writable catalog by snapshotting the current set of
     /// namespaces in `client`. New namespaces created later through
     /// this provider's `register_schema` are added to the cache; the

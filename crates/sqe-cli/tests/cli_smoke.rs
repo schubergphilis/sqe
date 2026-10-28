@@ -114,3 +114,44 @@ fn embedded_memory_syntax_error_exits_nonzero() {
         .assert()
         .failure();
 }
+
+#[test]
+fn embedded_warehouse_delete_update_merge() {
+    // DELETE, UPDATE and MERGE run through the server's write handlers and
+    // commit to the warehouse: a second process reads the result back.
+    let wh = tempfile::tempdir().expect("tempdir");
+    let wh_path = wh.path().to_str().expect("utf-8 path");
+    let script = wh.path().join("dml.sql");
+    std::fs::write(
+        &script,
+        "CREATE SCHEMA iceberg.s;\n\
+         CREATE TABLE iceberg.s.t (id INT, v VARCHAR);\n\
+         INSERT INTO iceberg.s.t VALUES (1, 'a'), (2, 'b'), (3, 'c');\n\
+         DELETE FROM iceberg.s.t WHERE id = 1;\n\
+         UPDATE iceberg.s.t SET v = 'z' WHERE id = 2;\n\
+         MERGE INTO iceberg.s.t t USING (SELECT * FROM (VALUES (3, 'm'), (4, 'n')) AS s(id, v)) s \
+         ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v \
+         WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v);\n",
+    )
+    .expect("write script");
+    bin()
+        .args(["--embedded", "--warehouse", wh_path, "--file"])
+        .arg(&script)
+        .timeout(std::time::Duration::from_secs(120))
+        .assert()
+        .success();
+
+    let out = bin()
+        .args([
+            "--embedded",
+            "--warehouse",
+            wh_path,
+            "-e",
+            "SELECT string_agg(CAST(id AS VARCHAR) || v, ',' ORDER BY id) AS rows FROM iceberg.s.t",
+        ])
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(stdout.contains("2z,3m,4n"), "unexpected rows: {stdout}");
+}
