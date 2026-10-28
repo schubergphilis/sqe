@@ -69,10 +69,13 @@ pub fn project_with_partition(
         schema_to_arrow_schema(table_schema.as_ref()).map_err(to_datafusion_error)?;
     let input_schema_cleaned =
         strip_metadata_from_schema(&input_schema).map_err(to_datafusion_error)?;
-    let expected_schema_cleaned = strip_metadata_from_schema(&expected_arrow_schema)
-        .map_err(to_datafusion_error)?;
+    let expected_schema_cleaned =
+        strip_metadata_from_schema(&expected_arrow_schema).map_err(to_datafusion_error)?;
 
-    if input_schema_cleaned != expected_schema_cleaned {
+    // SQE patch: `contains`, not `!=`. A non-nullable input column (a
+    // literal, `SELECT 1`) writes into a nullable table column; upstream's
+    // exact comparison refused every such INSERT into a partitioned table.
+    if !expected_schema_cleaned.contains(&input_schema_cleaned) {
         return plan_err!(
             "Input schema does not match Iceberg table schema.\n\
              Expected schema: {expected_schema_cleaned}\n\
@@ -107,6 +110,13 @@ pub struct PartitionExpr {
     calculator: Arc<PartitionValueCalculator>,
     partition_spec: Arc<PartitionSpec>,
     table_schema: IcebergSchemaRef,
+    /// SQE patch: one input per top-level table column, in table order.
+    /// Upstream declared no children, so DataFusion's projection merge
+    /// (`ProjectionExec` over `ProjectionExec`) moved the expression below
+    /// the projection that produced the columns and evaluated it on that
+    /// projection's input: a zero-column batch for `INSERT ... SELECT 1, ...`
+    /// and an index-out-of-bounds panic in the calculator.
+    columns: Vec<Arc<dyn PhysicalExpr>>,
 }
 
 impl PartitionExpr {
@@ -153,15 +163,23 @@ impl PartitionExpr {
         partition_spec: Arc<PartitionSpec>,
         table_schema: IcebergSchemaRef,
     ) -> Result<Self> {
-        let calculator = PartitionValueCalculator::try_new(
-            partition_spec.as_ref(),
-            table_schema.as_ref(),
-        )
-        .map_err(to_datafusion_error)?;
+        let calculator =
+            PartitionValueCalculator::try_new(partition_spec.as_ref(), table_schema.as_ref())
+                .map_err(to_datafusion_error)?;
+        let columns = table_schema
+            .as_struct()
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                Arc::new(Column::new(&field.name, index)) as Arc<dyn PhysicalExpr>
+            })
+            .collect();
         Ok(Self {
             calculator: Arc::new(calculator),
             partition_spec,
             table_schema,
+            columns,
         })
     }
 
@@ -185,6 +203,7 @@ impl PartialEq for PartitionExpr {
     fn eq(&self, other: &Self) -> bool {
         self.partition_spec == other.partition_spec
             && self.table_schema == other.table_schema
+            && self.columns == other.columns
     }
 }
 
@@ -200,22 +219,55 @@ impl PhysicalExpr for PartitionExpr {
     }
 
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
+        // The calculator reads source columns by table position, so hand it
+        // the table's columns as the children produce them.
+        let arrays = self
+            .columns
+            .iter()
+            .map(|c| c.evaluate(batch)?.into_array(batch.num_rows()))
+            .collect::<Result<Vec<_>>>()?;
+        let fields: Vec<datafusion::arrow::datatypes::Field> = arrays
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                datafusion::arrow::datatypes::Field::new(
+                    format!("c{i}"),
+                    a.data_type().clone(),
+                    true,
+                )
+            })
+            .collect();
+        let table_batch = RecordBatch::try_new_with_options(
+            Arc::new(ArrowSchema::new(fields)),
+            arrays,
+            &datafusion::arrow::array::RecordBatchOptions::new()
+                .with_row_count(Some(batch.num_rows())),
+        )?;
         let array = self
             .calculator
-            .calculate(batch)
+            .calculate(&table_batch)
             .map_err(to_datafusion_error)?;
         Ok(ColumnarValue::Array(array))
     }
 
     fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
-        vec![]
+        self.columns.iter().collect()
     }
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn PhysicalExpr>>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        Ok(self)
+        if children.len() != self.columns.len() {
+            return plan_err!(
+                "PartitionExpr expects {} children, got {}",
+                self.columns.len(),
+                children.len()
+            );
+        }
+        let mut expr = self.as_ref().clone();
+        expr.columns = children;
+        Ok(Arc::new(expr))
     }
 
     fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

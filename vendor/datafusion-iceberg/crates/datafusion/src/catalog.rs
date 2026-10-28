@@ -83,6 +83,18 @@ impl IcebergCatalogProvider {
 
         Ok(IcebergCatalogProvider { schemas })
     }
+
+    /// SQE patch: the schema provider of one namespace, loaded fresh. SQE
+    /// creates tables outside DataFusion and reloads only the namespace the
+    /// new table landed in, not every namespace of the catalog.
+    pub async fn schema_provider(
+        client: Arc<dyn Catalog>,
+        namespace: NamespaceIdent,
+    ) -> Result<Arc<dyn SchemaProvider>> {
+        Ok(Arc::new(
+            IcebergSchemaProvider::try_new(client, namespace).await?,
+        ))
+    }
 }
 
 impl CatalogProvider for IcebergCatalogProvider {

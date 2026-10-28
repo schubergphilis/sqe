@@ -15,7 +15,8 @@
 //!    returned already classified.
 //! 2. Parse with sqlparser. Only when that fails, run the source-level
 //!    fallbacks (`rewrite_paren_less_values`, `rewrite_bare_table`,
-//!    `rewrite_nested_row_cast`) and parse once more.
+//!    `rewrite_nested_row_cast`, `PARTITIONED BY` and the Spark CREATE TABLE
+//!    clause order) and parse once more.
 //! 3. Run the AST rewriters on the single AST: `information_schema` catalog
 //!    qualification (when a session catalog is known), bare `FROM t` to
 //!    `SELECT * FROM t` ([`crate::from_first`]), the Trino-compat
@@ -31,9 +32,9 @@
 //! comment was one SELECT to the classifier and an INSERT to the planner.
 //!
 //! Callers that need the SQE clauses sqlparser cannot see (`FOR VERSION AS
-//! OF`, `FOR INCREMENTAL BETWEEN`, `PARTITIONED BY (...)`) must run
-//! [`crate::pre_parse_pipeline`] first: those extractors return specs the
-//! coordinator needs, so they stay outside the front door.
+//! OF`, `FOR INCREMENTAL BETWEEN`) must run [`crate::pre_parse_pipeline`]
+//! first: those extractors return specs the coordinator needs, so they stay
+//! outside the front door.
 
 use sqlparser::ast::Statement;
 use sqlparser::dialect::GenericDialect;
@@ -158,6 +159,11 @@ impl SqlFrontDoor {
                 let rewritten = crate::rewrite_nested_row_cast(&rewritten);
                 let rewritten = crate::rewrite_trim_both_from(&rewritten);
                 let rewritten = crate::rewrite_trino_ddl_types(&rewritten);
+                // `PARTITIONED BY (day(ts))` and the Spark clause order. The
+                // Flight path runs both in `pre_parse_pipeline`; the embedded
+                // CLI and the Trino path enter here directly.
+                let rewritten = crate::partition::normalize_partitioned_by(&rewritten);
+                let rewritten = crate::partition::reorder_create_table_clauses(&rewritten);
                 // Trino `CREATE VIEW ... SECURITY DEFINER|INVOKER`: the Flight
                 // path folds it in `pre_parse_pipeline`; the Trino path enters
                 // here directly, so fold it here too (#768).
@@ -347,6 +353,23 @@ mod tests {
         assert!(!n.source_rewritten());
         assert!(!n.ast_rewritten());
         assert_eq!(n.sql(), "SELECT * FROM t WHERE x = 1");
+    }
+
+    #[test]
+    fn partitioned_by_transforms_and_spark_clause_order_parse() {
+        let door = SqlFrontDoor::new(WireDialect::Embedded);
+        for sql in [
+            "CREATE TABLE c.s.t (id INT, ts TIMESTAMP) PARTITIONED BY (day(ts))",
+            "CREATE TABLE c.s.t (id INT) PARTITIONED BY (bucket(4, id)) \
+             TBLPROPERTIES ('write.delete.mode' = 'merge-on-read')",
+        ] {
+            let n = door.normalize(sql).unwrap();
+            assert!(n.source_rewritten(), "{sql}");
+            let Some(Statement::CreateTable(ct)) = n.statement() else {
+                panic!("{sql}: not a CREATE TABLE");
+            };
+            assert!(ct.partition_by.is_some(), "{sql}");
+        }
     }
 
     #[test]
