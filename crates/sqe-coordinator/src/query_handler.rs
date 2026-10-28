@@ -11224,6 +11224,18 @@ mod tests {
     }
 
     #[test]
+    fn merge_source_sql_table_function_keeps_its_arguments() {
+        let src = merge_source_of(
+            "MERGE INTO t tgt USING read_parquet('/d/f.parquet') src ON tgt.id = src.id \
+             WHEN MATCHED THEN UPDATE SET v = src.v",
+        );
+        assert_eq!(
+            merge_source_sql(&src).unwrap(),
+            "SELECT * FROM read_parquet('/d/f.parquet')"
+        );
+    }
+
+    #[test]
     fn merge_source_sql_subquery_without_column_list_is_unchanged() {
         // The historical (green) subquery path: names its own columns via AS,
         // so no wrapping is needed and the SQL stays byte-identical.
