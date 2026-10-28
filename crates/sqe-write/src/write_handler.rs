@@ -2126,7 +2126,10 @@ impl WriteHandler {
         // a CTAS must keep properties like write.parquet.bloom-filter-* that
         // drive the data write, matching the plain CREATE TABLE path.
         let props = create_table_properties(
-            &self.config.catalog.backend,
+            matches!(
+                self.config.catalog.backend,
+                sqe_core::config::CatalogBackend::Rest
+            ),
             create_format_version,
             user_options,
         );
@@ -2644,6 +2647,52 @@ impl WriteHandler {
             return self.handle_create_table_like(session, ct, like_kind).await;
         }
 
+        // Resolve the target catalog: an explicit 3-part qualifier wins, else the
+        // session's connection catalog (Trino `catalog=...` header / Flight
+        // default), else the configured default warehouse. Without the session
+        // fallback a dbt/Trino client connected with catalog=ws_team_a issuing an
+        // unqualified statement resolves against the default warehouse.
+        let target_catalog = resolve_target_catalog(catalog_qualifier(&ct.name), session);
+        let session_catalog = self
+            .resolve_session_catalog(session, target_catalog.as_deref())
+            .await?;
+        let rest_catalog = matches!(
+            self.config.catalog.backend,
+            sqe_core::config::CatalogBackend::Rest
+        );
+        self.handle_create_table_on(session, stmt, session_catalog, rest_catalog)
+            .await
+    }
+
+    /// [`Self::handle_create_table`] against a catalog the caller already
+    /// resolved, as the embedded CLI does. `rest_catalog` says whether the
+    /// catalog speaks the Iceberg REST protocol: a REST create carries the
+    /// format version only as the reserved `format-version` property, which
+    /// a local catalog (SQLite) refuses. `CREATE TABLE ... (LIKE src)` is not
+    /// handled here.
+    pub async fn handle_create_table_on(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        session_catalog: Arc<SessionCatalog>,
+        rest_catalog: bool,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let ct = match stmt {
+            Statement::CreateTable(ct) => ct,
+            other => {
+                return Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Expected CreateTable statement, got: {other}"),
+                ));
+            }
+        };
+        if ct.like.is_some() {
+            return Err(SqeError::with_code(
+                SqeErrorCode::NotSupported,
+                "CREATE TABLE ... LIKE runs on a coordinator only",
+            ));
+        }
+
         let table_ident = resolve_table_ident(&ct.name, session)?;
         let namespace = table_ident.namespace().clone();
         let name = table_ident.name().to_string();
@@ -2673,15 +2722,6 @@ impl WriteHandler {
             "Creating empty table"
         );
 
-        // Resolve the target catalog: an explicit 3-part qualifier wins, else the
-        // session's connection catalog (Trino `catalog=...` header / Flight
-        // default), else the configured default warehouse. Without the session
-        // fallback a dbt/Trino client connected with catalog=ws_team_a issuing an
-        // unqualified statement resolves against the default warehouse.
-        let target_catalog = resolve_target_catalog(catalog_qualifier(&ct.name), session);
-        let session_catalog = self
-            .resolve_session_catalog(session, target_catalog.as_deref())
-            .await?;
         let catalog: Arc<dyn Catalog> = session_catalog.as_catalog();
 
         // Defense-in-depth: make sure the namespace exists in THIS catalog before
@@ -2703,7 +2743,7 @@ impl WriteHandler {
         // enum. Extract the user options regardless of which syntax produced
         // them so CREATE TABLE keeps every property the user typed.
         let props = create_table_properties(
-            &self.config.catalog.backend,
+            rest_catalog,
             format_version,
             create_table_options_as_slice(&ct.table_options),
         );
@@ -9060,15 +9100,20 @@ pub(crate) fn create_table_options_as_slice(
 /// WITH option. A non-REST catalog rejects any reserved property, including a
 /// user's own `'format-version' = '3'`; the version it asked for is already in
 /// `TableCreation.format_version` (`plan_create_table_schema` reads the
-/// option), so the reserved keys are dropped there (#854).
+/// option), so the reserved keys are dropped there (#854). `rest_catalog`:
+/// the catalog speaks the Iceberg REST protocol.
 pub(crate) fn create_table_properties(
-    backend: &sqe_core::config::CatalogBackend,
+    rest_catalog: bool,
     format_version: FormatVersion,
     options: &[sqlparser::ast::SqlOption],
 ) -> std::collections::HashMap<String, String> {
-    let mut props = format_version_props_for_backend(backend, format_version);
+    let mut props = if rest_catalog {
+        format_version_properties(format_version)
+    } else {
+        std::collections::HashMap::new()
+    };
     merge_user_table_properties(&mut props, options);
-    if !matches!(backend, sqe_core::config::CatalogBackend::Rest) {
+    if !rest_catalog {
         props.retain(|k, _| {
             !iceberg::spec::TableProperties::RESERVED_PROPERTIES.contains(&k.as_str())
         });
@@ -9785,7 +9830,6 @@ mod tests {
     /// version still reaches the table via `TableCreation.format_version`.
     #[test]
     fn a_user_format_version_option_is_dropped_for_non_rest_backends() {
-        use sqe_core::config::CatalogBackend;
         use sqlparser::ast::{Expr, Ident, SqlOption, Value};
 
         let options = [
@@ -9798,19 +9842,14 @@ mod tests {
                 value: Expr::value(Value::SingleQuotedString("merge-on-read".into())),
             },
         ];
-        let glue = CatalogBackend::Glue {
-            region: "eu-central-1".to_string(),
-            warehouse: String::new(),
-            endpoint: None,
-        };
-        let props = create_table_properties(&glue, FormatVersion::V3, &options);
+        let props = create_table_properties(false, FormatVersion::V3, &options);
         assert_eq!(props.get("format-version"), None, "{props:?}");
         assert_eq!(
             props.get("write.delete.mode").map(String::as_str),
             Some("merge-on-read")
         );
 
-        let props = create_table_properties(&CatalogBackend::Rest, FormatVersion::V3, &options);
+        let props = create_table_properties(true, FormatVersion::V3, &options);
         assert_eq!(props.get("format-version").map(String::as_str), Some("3"));
         assert_eq!(
             props.get("write.delete.mode").map(String::as_str),

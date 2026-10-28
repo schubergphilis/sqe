@@ -7,8 +7,9 @@ warehouse from a laptop, a CI job, or a script.
 
 Embedded mode is not the coordinator in a smaller box. It plans SQL with
 DataFusion directly, plus a set of SQE statements (ATTACH, secrets, schema
-DDL, CTAS, `SHOW TABLES IN`). The Iceberg row-level DML, table maintenance
-and time travel of the cluster are not part of it yet. The
+DDL, CTAS, `SHOW TABLES IN`). `CREATE TABLE`, `UPDATE`, `DELETE` and `MERGE`
+on an Iceberg catalog run on the cluster's own handlers. `ALTER TABLE`, table
+maintenance and time travel are not part of it yet. The
 [support table](#what-embedded-mode-supports) below lists what runs.
 
 Catalog choices:
@@ -120,6 +121,14 @@ A table's `write.delete.mode` picks copy-on-write or merge-on-read, the same as
 on a coordinator. Embedded mode has no access policy, so nothing filters or
 masks the rows these statements read.
 
+`CREATE TABLE` with a column list runs on the cluster's DDL handler too.
+`PARTITIONED BY` transforms (`day(ts)`, `bucket(16, id)`), `TBLPROPERTIES` or
+`WITH (...)` options and nested `STRUCT`, `ARRAY` and `MAP` columns all reach
+the table metadata. New tables are format version 3 unless an option picks
+`'format-version' = '2'`. A CTAS with `PARTITIONED BY` or options is refused,
+because the CTAS path would drop them: create the table first, then
+`INSERT INTO ... SELECT`. `CREATE TABLE ... LIKE` runs on a coordinator only.
+
 Tables in the warehouse are valid Iceberg. Point a cluster deployment (or any
 other Iceberg reader) at the same catalog later and they come along unchanged.
 `ALTER TABLE`, branches and tags run there.
@@ -133,14 +142,15 @@ Exporting results to plain files goes through `COPY ... TO`; see
 | `SELECT`, joins, aggregates, file TVFs | yes | yes |
 | `CREATE SCHEMA` / `DROP SCHEMA` | yes | yes |
 | `CREATE TABLE` with a column list | yes | yes |
-| `CREATE TABLE` with `PARTITIONED BY` or `TBLPROPERTIES` | no | yes |
+| `CREATE TABLE` with `PARTITIONED BY` or `TBLPROPERTIES` | yes | yes |
 | `CREATE TABLE ... AS` (CTAS) | yes, two commits | yes |
 | `INSERT INTO` | yes | yes |
 | `UPDATE`, `DELETE`, `MERGE INTO` | yes | yes |
 | `ALTER TABLE` | no | yes |
 | `DROP TABLE` | yes | yes |
 | `CREATE VIEW` in an Iceberg catalog | no | yes |
-| `SHOW TABLES [IN schema]`, `DESCRIBE`, `SHOW CREATE TABLE` | yes | yes |
+| `SHOW TABLES [IN schema]`, `DESCRIBE` | yes | yes |
+| `SHOW CREATE TABLE` | Hive tables only | yes |
 | `FOR VERSION AS OF` / `FOR SYSTEM_TIME AS OF` | no | yes |
 | Metadata tables (`orders$snapshots`) | no | yes |
 | `CREATE BRANCH` / `CREATE TAG`, `SET WRITE_BRANCH` | no | yes |
@@ -213,8 +223,9 @@ sqe-cli --embedded --file daily-report.sql --stop-on-error
 
 The embedded prompt shares the coordinator's SQL front door and function set:
 the same Trino-compat functions, the same file TVFs, the same Iceberg readers.
-Statements go to DataFusion's planner rather than the coordinator's query and
-write handlers, which is why the statements marked "no" above are cluster-only.
+Reads and `INSERT` go to DataFusion's planner. `CREATE TABLE`, `UPDATE`,
+`DELETE` and `MERGE` on an Iceberg catalog go to the coordinator's write
+handlers. The statements marked "no" above are cluster-only.
 Beyond that:
 
 - **No auth.** No OIDC, no per-user identity, no policy enforcement. The
