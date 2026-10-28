@@ -10687,39 +10687,9 @@ fn parse_show_tables_namespace(filter: &str) -> Option<String> {
 
 /// Build the SELECT SQL that materialises a MERGE source relation.
 ///
-/// The MERGE source is executed as a standalone query so the resulting
-/// batches can be registered as a scratch MemTable and joined against the
-/// target. The tricky case is a derived table (`USING (...) AS s(c1, c2)`):
-/// the source alias's *column list* renames the projected columns, and that
-/// rename must survive into the executed SQL. Otherwise a `VALUES` source
-/// keeps its synthetic `column1`/`column2` names and later references to
-/// `s.c1` fail to resolve (issue #360).
-///
-/// A subquery source that names its own columns (`SELECT a AS c1 ...`) works
-/// even without the alias list, which is why the table/subquery MERGE paths
-/// were already green. Wrapping the subquery in
-/// `SELECT * FROM (<subquery>) AS s(c1, c2)` applies the alias column list
-/// uniformly, fixing both `VALUES` sources and column-list subquery sources.
-/// When the derived source has no alias column list, the SQL is emitted
-/// byte-for-byte as before so the existing passing paths cannot regress.
-fn merge_source_sql(source: &TableFactor) -> Result<String, SqeError> {
-    match source {
-        TableFactor::Table { name, .. } => Ok(format!("SELECT * FROM {name}")),
-        TableFactor::Derived {
-            subquery, alias, ..
-        } => match alias {
-            // Derived source carries an explicit column-alias list, e.g.
-            // `AS s(id, v)`. Re-apply it by wrapping the subquery: the alias's
-            // Display renders `AS s (id, v)` with correct quoting/case.
-            Some(a) if !a.columns.is_empty() => Ok(format!("SELECT * FROM ({subquery}) {a}")),
-            // No column-alias list: preserve the original behaviour exactly.
-            _ => Ok(format!("{subquery}")),
-        },
-        other => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-            "Unsupported MERGE source: {other}"
-        ))),
-    }
-}
+// The MERGE source SQL; shared with the embedded CLI, so it lives in
+// `sqe-write`.
+use sqe_write::merge_sql::merge_source_sql;
 
 #[cfg(test)]
 mod show_stats_policy_tests {

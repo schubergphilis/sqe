@@ -927,7 +927,48 @@ pub(crate) fn resolve_insert_expr(
 /// What a NOT MATCHED INSERT writes into target column `col` when the clause
 /// does not supply it: the column's `write_default`, else NULL (#828).
 pub(crate) fn omitted_value<'a>(names: &MergeNames<'a>, col: &str) -> &'a str {
-    names.column_defaults.get(col).map_or("NULL", String::as_str)
+    names
+        .column_defaults
+        .get(col)
+        .map_or("NULL", String::as_str)
+}
+
+/// The SQL that produces a MERGE statement's source rows.
+///
+/// The MERGE source is executed as a standalone query so the resulting
+/// batches can be registered as a scratch MemTable and joined against the
+/// target. The tricky case is a derived table (`USING (...) AS s(c1, c2)`):
+/// the source alias's *column list* renames the projected columns, and that
+/// rename must survive into the executed SQL. Otherwise a `VALUES` source
+/// keeps its synthetic `column1`/`column2` names and later references to
+/// `s.c1` fail to resolve (issue #360).
+///
+/// A subquery source that names its own columns (`SELECT a AS c1 ...`) works
+/// even without the alias list, which is why the table/subquery MERGE paths
+/// were already green. Wrapping the subquery in
+/// `SELECT * FROM (<subquery>) AS s(c1, c2)` applies the alias column list
+/// uniformly, fixing both `VALUES` sources and column-list subquery sources.
+/// When the derived source has no alias column list, the SQL is emitted
+/// byte-for-byte as before so the existing passing paths cannot regress.
+pub fn merge_source_sql(source: &sqlparser::ast::TableFactor) -> Result<String, SqeError> {
+    use sqlparser::ast::TableFactor;
+    match source {
+        TableFactor::Table { name, .. } => Ok(format!("SELECT * FROM {name}")),
+        TableFactor::Derived {
+            subquery, alias, ..
+        } => match alias {
+            // Derived source carries an explicit column-alias list, e.g.
+            // `AS s(id, v)`. Re-apply it by wrapping the subquery: the alias's
+            // Display renders `AS s (id, v)` with correct quoting/case.
+            Some(a) if !a.columns.is_empty() => Ok(format!("SELECT * FROM ({subquery}) {a}")),
+            // No column-alias list: preserve the original behaviour exactly.
+            _ => Ok(format!("{subquery}")),
+        },
+        other => Err(SqeError::with_code(
+            sqe_core::SqeErrorCode::ExecutionFailed,
+            format!("Unsupported MERGE source: {other}"),
+        )),
+    }
 }
 
 #[cfg(test)]
