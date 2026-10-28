@@ -63,7 +63,7 @@ See [Iceberg Integration, V3 features verified](../features/iceberg.md#v3-featur
 
 ### Statements DataFusion's parser does not accept
 
-`PIVOT`, `UNPIVOT`, `ASOF JOIN`, and FROM-first syntax are not parseable. This is tracked upstream, not an SQE bug. `QUALIFY` works. List comprehensions have no AST node in DataFusion; lambdas work in the higher-order array functions (`filter`, `transform`, `any_match`, `all_match`, `none_match`, `reduce`). The full list, with the reasoning for each, is on the [SQL Reference overview](../sql-reference/index.md#what-is-intentionally-not-in-sqe), and the [SQL cheat-sheet](sql-cheatsheet.md) carries the scannable version.
+`PIVOT`, `UNPIVOT` and `ASOF JOIN` are not parseable. FROM-first works only as a bare `FROM t` (with `ORDER BY` / `LIMIT`) or `FROM t SELECT ...`. This is tracked upstream, not an SQE bug. `QUALIFY` works. List comprehensions have no AST node in DataFusion; lambdas work in the higher-order array functions (`filter`, `transform`, `any_match`, `all_match`, `none_match`, `reduce`). The full list, with the reasoning for each, is on the [SQL Reference overview](../sql-reference/index.md#what-is-intentionally-not-in-sqe), and the [SQL cheat-sheet](sql-cheatsheet.md) carries the scannable version.
 
 ### read_parquet schema and write constraints
 

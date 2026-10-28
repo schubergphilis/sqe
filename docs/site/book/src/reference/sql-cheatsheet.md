@@ -100,7 +100,8 @@ These are absent on purpose. The reasoning lives on the [SQL Reference overview]
 
 | Construct | Why it is out |
 |---|---|
-| `PIVOT`, `UNPIVOT`, `ASOF JOIN`, FROM-first syntax | DataFusion's parser does not accept them. Tracked upstream. |
+| `PIVOT`, `UNPIVOT`, `ASOF JOIN` | DataFusion's parser does not accept them. Tracked upstream. |
+| `FROM t WHERE ...` | Bare `FROM t` and `FROM t SELECT ...` work; a `WHERE` after a bare `FROM t` does not parse. |
 | List comprehensions | No AST node in DataFusion. Lambdas work in `filter`, `transform`, `any_match`, `all_match`, `none_match`, `reduce`. |
 | Oracle / Snowflake `DECODE` | Name collides with DataFusion's `decode(input, encoding)`. Use `CASE WHEN`. |
 | `IIF` (T-SQL) | Covered by `if` and `iff`, both registered. |
