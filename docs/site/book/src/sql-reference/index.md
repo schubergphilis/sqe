@@ -74,7 +74,7 @@ The two registration entry points are `crates/sqe-coordinator/src/session_contex
 
 Some functions appear in the dialect comparison columns as missing. The reasoning:
 
-- **`PIVOT`, `UNPIVOT`, `ASOF JOIN`, FROM-first syntax**: DataFusion's parser does not accept them. Tracked upstream. `QUALIFY` does work (see [Window functions](./window.md)).
+- **`PIVOT`, `UNPIVOT`, `ASOF JOIN`**: DataFusion's parser does not accept them. FROM-first works in two forms: `FROM t` reads as `SELECT * FROM t`, and `FROM t SELECT a`; a `WHERE` or `GROUP BY` after a bare `FROM t` does not parse. Tracked upstream. `QUALIFY` does work (see [Window functions](./window.md)).
 - **List comprehensions**: DataFusion has no AST node for them. Lambdas work in the higher-order array functions (`filter`, `transform`, `any_match`, `all_match`, `none_match`, `reduce`); see [Array and map functions](./array-map.md#lambda-functions).
 - **Oracle / Snowflake `DECODE`**: name collides with DataFusion's binary `decode(input, encoding)` helper. `CASE WHEN` covers the use case.
 - **`IIF` (T-SQL)**: covered by `if` (Trino) and `iff` (Snowflake), both registered.
