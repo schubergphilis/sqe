@@ -180,6 +180,22 @@ impl WritableIcebergCatalog {
         Ok(())
     }
 
+    /// Reload the cached schema provider of namespace `name` from the
+    /// catalog. A table created outside DataFusion (the embedded CLI's
+    /// `CREATE TABLE` through SQE's write handler) is not in the cached
+    /// listing until this runs.
+    pub async fn refresh_namespace(&self, name: &str) -> anyhow::Result<()> {
+        let provider = IcebergCatalogProvider::schema_provider(
+            self.catalog.clone(),
+            NamespaceIdent::new(name.to_string()),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("reload schema {name}: {e}"))?;
+        self.schemas
+            .insert(name.to_string(), BaseTablesOnly::wrap(provider));
+        Ok(())
+    }
+
     /// `DROP SCHEMA [IF EXISTS] <name>` on this catalog, on the async path.
     /// `CASCADE` is not implemented: the iceberg catalog refuses to drop a
     /// non-empty namespace and SQE does not delete tables on its behalf.

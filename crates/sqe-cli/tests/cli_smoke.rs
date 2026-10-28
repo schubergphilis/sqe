@@ -155,3 +155,105 @@ fn embedded_warehouse_delete_update_merge() {
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
     assert!(stdout.contains("2z,3m,4n"), "unexpected rows: {stdout}");
 }
+
+/// The newest `*.metadata.json` of `iceberg.<ns>.<table>` under `wh`.
+fn latest_metadata(wh: &std::path::Path, ns: &str, table: &str) -> serde_json::Value {
+    let dir = wh.join("iceberg").join(ns).join(table).join("metadata");
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
+        .collect();
+    files.sort();
+    let last = files.last().expect("a metadata file");
+    serde_json::from_slice(&std::fs::read(last).expect("read metadata")).expect("metadata json")
+}
+
+#[test]
+fn embedded_warehouse_create_table_keeps_partitioning_and_properties() {
+    // CREATE TABLE runs through the server's DDL handler: the partition
+    // transform, the table property, nested columns and the format version
+    // all land in the table metadata, and the table is usable at once.
+    let wh = tempfile::tempdir().expect("tempdir");
+    let wh_path = wh.path().to_str().expect("utf-8 path");
+    let script = wh.path().join("ddl.sql");
+    std::fs::write(
+        &script,
+        "CREATE SCHEMA iceberg.s;\n\
+         CREATE TABLE iceberg.s.ev (id INT, ts TIMESTAMP, info STRUCT<a: INT, b: VARCHAR>, \
+         tags ARRAY<VARCHAR>) PARTITIONED BY (day(ts)) \
+         TBLPROPERTIES ('write.delete.mode' = 'merge-on-read');\n\
+         INSERT INTO iceberg.s.ev SELECT 1, TIMESTAMP '2026-01-01 10:00:00', \
+         named_struct('a', 7, 'b', 'x'), ['p', 'q'];\n\
+         CREATE TABLE iceberg.s.v2 (id INT) WITH ('format-version' = '2');\n\
+         CREATE TABLE IF NOT EXISTS iceberg.s.v2 (id INT);\n",
+    )
+    .expect("write script");
+    bin()
+        .args(["--embedded", "--warehouse", wh_path, "--file"])
+        .arg(&script)
+        .timeout(std::time::Duration::from_secs(120))
+        .assert()
+        .success();
+
+    let out = bin()
+        .args([
+            "--embedded",
+            "--warehouse",
+            wh_path,
+            "-e",
+            "SELECT CAST(id AS VARCHAR) || ':' || CAST(info['a'] AS VARCHAR) || ':' || tags[2] AS r \
+             FROM iceberg.s.ev",
+        ])
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(stdout.contains("1:7:q"), "unexpected rows: {stdout}");
+
+    let ev = latest_metadata(wh.path(), "s", "ev");
+    assert_eq!(ev["format-version"], 3, "{ev}");
+    assert_eq!(
+        ev["properties"]["write.delete.mode"], "merge-on-read",
+        "{ev}"
+    );
+    let spec = &ev["partition-specs"][0]["fields"][0];
+    assert_eq!(spec["transform"], "day", "{ev}");
+    // The INSERT computed the partition value (vendored `PartitionExpr`).
+    let day = wh.path().join("iceberg/s/ev/data/ts_day=2026-01-01");
+    assert!(day.is_dir(), "no partition directory {}", day.display());
+    // The local catalog refuses reserved properties; the option still picks
+    // the format version.
+    assert_eq!(latest_metadata(wh.path(), "s", "v2")["format-version"], 2);
+}
+
+#[test]
+fn embedded_warehouse_ctas_refuses_partitioning_it_would_drop() {
+    let wh = tempfile::tempdir().expect("tempdir");
+    let wh_path = wh.path().to_str().expect("utf-8 path");
+    bin()
+        .args([
+            "--embedded",
+            "--warehouse",
+            wh_path,
+            "-e",
+            "CREATE SCHEMA iceberg.s",
+        ])
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .success();
+    bin()
+        .args([
+            "--embedded",
+            "--warehouse",
+            wh_path,
+            "-e",
+            "CREATE TABLE iceberg.s.t PARTITIONED BY (id) AS SELECT 1 AS id",
+        ])
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "CREATE TABLE ... AS with PARTITIONED BY",
+        ));
+}

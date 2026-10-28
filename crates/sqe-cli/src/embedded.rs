@@ -645,6 +645,10 @@ pub struct EmbeddedClient {
     /// answer to "is `spec.catalog` a Hive root at all": a name absent from
     /// this map is either not attached or is some other kind of catalog.
     hive_roots: HashMap<String, Arc<sqe_catalog::hive::provider::HiveCatalogProvider>>,
+    /// The `iceberg_catalogs` attached with `TYPE iceberg_rest`. A REST
+    /// `CREATE TABLE` carries its format version as a table property, which
+    /// a local catalog refuses.
+    rest_catalogs: std::collections::HashSet<String>,
     /// The engine's object-store configuration, as resolved once from
     /// `--s3-*` flags and the environment. Held so a Hive root attached
     /// after start-up reads with the same endpoint and credentials the file
@@ -667,6 +671,7 @@ impl EmbeddedClient {
             attached_catalogs: HashMap::new(),
             hive_manifest_cache: Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
             hive_roots: HashMap::new(),
+            rest_catalogs: std::collections::HashSet::new(),
             storage,
         })
     }
@@ -703,6 +708,7 @@ impl EmbeddedClient {
             attached_catalogs: HashMap::new(),
             hive_manifest_cache: Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
             hive_roots: HashMap::new(),
+            rest_catalogs: std::collections::HashSet::new(),
             storage,
         })
     }
@@ -730,6 +736,7 @@ impl EmbeddedClient {
             attached_catalogs: HashMap::new(),
             hive_manifest_cache: Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
             hive_roots: HashMap::new(),
+            rest_catalogs: std::collections::HashSet::new(),
             storage,
         })
     }
@@ -885,6 +892,11 @@ impl SqlClient for EmbeddedClient {
                         return Ok(result);
                     }
                 }
+                sqe_sql::StatementKind::CreateTable(ref stmt) => {
+                    if let Some(result) = self.embedded_handle_iceberg_create_table(stmt).await? {
+                        return Ok(result);
+                    }
+                }
                 sqe_sql::StatementKind::ShowTables(_) => {
                     if let Some(result) = self.embedded_handle_show_tables_in(&exec_sql).await? {
                         return Ok(result);
@@ -1009,6 +1021,9 @@ impl EmbeddedClient {
         // So CREATE SCHEMA / DROP SCHEMA on this catalog reach its async
         // namespace methods (review 806); removed again on DETACH.
         self.iceberg_catalogs.insert(stmt.name.clone(), provider);
+        if stmt.kind == sqe_sql::CatalogKind::IcebergRest {
+            self.rest_catalogs.insert(stmt.name.clone());
+        }
 
         let secret_ref = stmt
             .options
@@ -1029,6 +1044,7 @@ impl EmbeddedClient {
     ) -> Result<QueryResult, Box<dyn std::error::Error>> {
         if self.attached_catalogs.contains_key(&stmt.name) {
             self.iceberg_catalogs.remove(&stmt.name);
+            self.rest_catalogs.remove(&stmt.name);
         }
         if self.attached_catalogs.remove(&stmt.name).is_none() {
             return Err(format!("catalog '{}' is not attached", stmt.name).into());
@@ -1287,6 +1303,23 @@ impl EmbeddedClient {
             )
             .into());
         }
+        // The CTAS below runs through DataFusion's CREATE TABLE, which would
+        // drop both silently.
+        if ct.partition_by.is_some()
+            || ct.cluster_by.is_some()
+            || !matches!(
+                ct.hive_distribution,
+                sqlparser::ast::HiveDistributionStyle::NONE
+            )
+            || !matches!(ct.table_options, sqlparser::ast::CreateTableOptions::None)
+        {
+            return Err(format!(
+                "CREATE TABLE ... AS with PARTITIONED BY, WITH or TBLPROPERTIES is not \
+                 supported for Iceberg catalog `{catalog}` in embedded mode; CREATE TABLE \
+                 {name} with a column list first, then INSERT INTO {name} SELECT ..."
+            )
+            .into());
+        }
         let empty = QueryResult {
             columns: vec![],
             rows: vec![],
@@ -1339,24 +1372,9 @@ impl EmbeddedClient {
             },
             _ => return Ok(None),
         };
-        let parts: Vec<&str> = name
-            .0
-            .iter()
-            .filter_map(|p| p.as_ident().map(|i| i.value.as_str()))
-            .collect();
-        let catalog_name = match parts.as_slice() {
-            [catalog, _, _] => catalog.to_string(),
-            [_] | [_, _] => self.default_catalog(),
-            _ => return Ok(None),
-        };
-        let Some(writable) = self.iceberg_catalogs.get(&catalog_name) else {
+        let Some((catalog_name, catalog)) = self.writable_target(name) else {
             return Ok(None);
         };
-        let catalog = Arc::new(sqe_catalog::SessionCatalog::local(
-            writable.client(),
-            &catalog_name,
-            &self.storage,
-        ));
 
         // The write handlers register their scratch tables under DataFusion's
         // built-in `datafusion.public`, which the embedded context renames to
@@ -1370,17 +1388,7 @@ impl EmbeddedClient {
             self.ctx.register_catalog("datafusion", Arc::new(scratch));
         }
 
-        let options = self.ctx.state().config().options().clone();
-        let mut session = sqe_core::Session::new(
-            std::env::var("USER").unwrap_or_else(|_| "sqe-embedded".to_string()),
-            sqe_core::SecretString::new(String::new()),
-            None,
-            chrono::DateTime::<chrono::Utc>::MAX_UTC,
-            Vec::new(),
-        );
-        session.default_catalog = Some(catalog_name);
-        session.default_schema = Some(options.catalog.default_schema.clone());
-
+        let session = self.write_session(catalog_name);
         let handler = WriteHandler::new(sqe_core::SqeConfig::embedded_defaults());
         let mut plan_out = None;
         let mut policy_summary = None;
@@ -1441,6 +1449,87 @@ impl EmbeddedClient {
             .map(|b| b.schema())
             .unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()));
         Ok(Some(record_batches_to_query_result(&schema, &batches)))
+    }
+
+    /// `CREATE TABLE` with a column list in a `WritableIcebergCatalog`,
+    /// through `sqe-write`'s handler: `PARTITIONED BY` transforms,
+    /// `TBLPROPERTIES` / `WITH` options, nested types and the format version
+    /// all as on a coordinator. DataFusion's own CREATE TABLE drops the
+    /// partitioning and the properties. `Ok(None)`: not an Iceberg target,
+    /// DataFusion answers.
+    async fn embedded_handle_iceberg_create_table(
+        &self,
+        stmt: &sqlparser::ast::Statement,
+    ) -> Result<Option<QueryResult>, Box<dyn std::error::Error>> {
+        let sqlparser::ast::Statement::CreateTable(ct) = stmt else {
+            return Ok(None);
+        };
+        if ct.temporary || ct.external || ct.query.is_some() {
+            return Ok(None);
+        }
+        let Some((catalog_name, catalog)) = self.writable_target(&ct.name) else {
+            return Ok(None);
+        };
+        let rest_catalog = self.rest_catalogs.contains(&catalog_name);
+        let session = self.write_session(catalog_name.clone());
+        let handler =
+            sqe_write::write_handler::WriteHandler::new(sqe_core::SqeConfig::embedded_defaults());
+        handler
+            .handle_create_table_on(&session, stmt, catalog, rest_catalog)
+            .await?;
+
+        // The new table (and a namespace the handler created) is not in the
+        // catalog's cached listing yet.
+        let ident = sqe_write::ident::resolve_table_ident(&ct.name, &session)?;
+        let namespace = ident.namespace().as_ref().join(".");
+        if let Some(writable) = self.iceberg_catalogs.get(&catalog_name) {
+            writable.refresh_namespace(&namespace).await?;
+        }
+        Ok(Some(QueryResult {
+            columns: vec![],
+            rows: vec![],
+        }))
+    }
+
+    /// The catalog a one- to three-part table name lands in, when that is a
+    /// writable Iceberg catalog: its name and a `SessionCatalog` over it.
+    fn writable_target(
+        &self,
+        name: &sqlparser::ast::ObjectName,
+    ) -> Option<(String, Arc<sqe_catalog::SessionCatalog>)> {
+        let parts: Vec<&str> = name
+            .0
+            .iter()
+            .filter_map(|p| p.as_ident().map(|i| i.value.as_str()))
+            .collect();
+        let catalog_name = match parts.as_slice() {
+            [catalog, _, _] => catalog.to_string(),
+            [_] | [_, _] => self.default_catalog(),
+            _ => return None,
+        };
+        let writable = self.iceberg_catalogs.get(&catalog_name)?;
+        let catalog = Arc::new(sqe_catalog::SessionCatalog::local(
+            writable.client(),
+            &catalog_name,
+            &self.storage,
+        ));
+        Some((catalog_name, catalog))
+    }
+
+    /// The session the write handlers run as: the Unix user, no token, the
+    /// target catalog and the session's default schema.
+    fn write_session(&self, catalog_name: String) -> sqe_core::Session {
+        let options = self.ctx.state().config().options().clone();
+        let mut session = sqe_core::Session::new(
+            std::env::var("USER").unwrap_or_else(|_| "sqe-embedded".to_string()),
+            sqe_core::SecretString::new(String::new()),
+            None,
+            chrono::DateTime::<chrono::Utc>::MAX_UTC,
+            Vec::new(),
+        );
+        session.default_catalog = Some(catalog_name);
+        session.default_schema = Some(options.catalog.default_schema.clone());
+        session
     }
 
     /// `SHOW TABLES {IN|FROM} [<catalog>.]<schema> [LIKE '<pattern>']`.
