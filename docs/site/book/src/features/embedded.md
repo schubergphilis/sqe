@@ -115,9 +115,14 @@ fails, the empty table is dropped again. `CREATE TABLE IF NOT EXISTS ... AS`
 skips an existing table. `CREATE OR REPLACE TABLE ... AS` is refused: drop the
 table first.
 
+`UPDATE`, `DELETE` and `MERGE INTO` run on the cluster's own write handlers.
+A table's `write.delete.mode` picks copy-on-write or merge-on-read, the same as
+on a coordinator. Embedded mode has no access policy, so nothing filters or
+masks the rows these statements read.
+
 Tables in the warehouse are valid Iceberg. Point a cluster deployment (or any
 other Iceberg reader) at the same catalog later and they come along unchanged.
-`UPDATE`, `DELETE`, `MERGE INTO`, `ALTER TABLE`, branches and tags run there.
+`ALTER TABLE`, branches and tags run there.
 Exporting results to plain files goes through `COPY ... TO`; see
 [Using the CLI](../getting-started/cli.md).
 
@@ -131,7 +136,7 @@ Exporting results to plain files goes through `COPY ... TO`; see
 | `CREATE TABLE` with `PARTITIONED BY` or `TBLPROPERTIES` | no | yes |
 | `CREATE TABLE ... AS` (CTAS) | yes, two commits | yes |
 | `INSERT INTO` | yes | yes |
-| `UPDATE`, `DELETE`, `MERGE INTO` | no | yes |
+| `UPDATE`, `DELETE`, `MERGE INTO` | yes | yes |
 | `ALTER TABLE` | no | yes |
 | `DROP TABLE` | yes | yes |
 | `CREATE VIEW` in an Iceberg catalog | no | yes |

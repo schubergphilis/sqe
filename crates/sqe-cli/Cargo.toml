@@ -47,6 +47,8 @@ sqe-geo = { path = "../sqe-geo" }
 # whole `sqe-trino-compat` server crate that they carried for two structs.
 sqe-trino-protocol = { path = "../sqe-trino-protocol", features = ["client", "flight"] }
 sqe-policy = { path = "../sqe-policy" }
+# Embedded DELETE / UPDATE / MERGE run through the server's write handlers.
+sqe-write = { path = "../sqe-write" }
 arrow = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-array = { workspace = true }

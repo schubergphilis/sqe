@@ -6829,6 +6829,29 @@ impl SqeConfig {
         Ok(config)
     }
 
+    /// The configuration the embedded CLI's write path runs with when no
+    /// `--config` file is given. Embedded mode has no coordinator, OIDC
+    /// provider or REST catalog: the sections that name them are required
+    /// by the struct but never dialled. Everything else is the default.
+    pub fn embedded_defaults() -> Self {
+        toml::from_str(
+            r#"
+[coordinator]
+flight_sql_port = 0
+trino_http_port = 0
+
+[auth]
+token_endpoint = "http://127.0.0.1:9/unused"
+client_id = "sqe-embedded"
+
+[catalog]
+catalog_url = "http://127.0.0.1:9/unused"
+warehouse = "sqe-embedded"
+"#,
+        )
+        .expect("the embedded default config parses")
+    }
+
     /// Merged, redacted TOML for `sqe-server --print-config`.
     pub fn load_redacted_toml(path: &str) -> crate::error::Result<String> {
         let content = std::fs::read_to_string(path)
@@ -7194,6 +7217,12 @@ fn validate_urls(config: &SqeConfig, errors: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn embedded_defaults_parse() {
+        let config = super::SqeConfig::embedded_defaults();
+        assert_eq!(config.catalog.warehouse, "sqe-embedded");
+    }
+
     #[test]
     fn unsupported_mtls_provider_fails_configuration_validation() {
         let mtls = AuthProviderConfig::Mtls {
