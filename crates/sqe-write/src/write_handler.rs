@@ -3837,7 +3837,22 @@ impl WriteHandler {
             }
             Err(_) => catalog,
         };
+        self.dispatch_delete_on(session, stmt, catalog, ctx, plan_out, policy_summary_out)
+            .await
+    }
 
+    /// [`Self::handle_delete_dispatch`] against a catalog the caller already
+    /// resolved. The embedded CLI holds its catalogs itself and has no
+    /// coordinator session layer to resolve them through.
+    pub async fn dispatch_delete_on(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        catalog: Arc<SessionCatalog>,
+        ctx: &DFSessionContext,
+        plan_out: &mut Option<sqe_lineage::PlanOrHint>,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
         // Peek at the target table to read its properties. Any parse or
         // load error falls through to the default CoW path, which surfaces
         // the error at that point.
@@ -4146,7 +4161,21 @@ impl WriteHandler {
             }
             Err(_) => catalog,
         };
+        self.dispatch_update_on(session, stmt, catalog, ctx, plan_out, policy_summary_out)
+            .await
+    }
 
+    /// [`Self::handle_update_dispatch`] against a catalog the caller already
+    /// resolved (the embedded CLI).
+    pub async fn dispatch_update_on(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        catalog: Arc<SessionCatalog>,
+        ctx: &DFSessionContext,
+        plan_out: &mut Option<sqe_lineage::PlanOrHint>,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
         // Peek at the target table to read its properties.
         let Ok(table_factor_name) = update_target_object_name(stmt) else {
             return self
@@ -5182,7 +5211,35 @@ impl WriteHandler {
             },
             _ => catalog,
         };
+        self.dispatch_merge_on(
+            session,
+            stmt,
+            source_batches,
+            source_schema_hint,
+            catalog,
+            ctx,
+            source_plan,
+            plan_out,
+            policy_summary_out,
+        )
+        .await
+    }
 
+    /// [`Self::handle_merge_dispatch`] against a catalog the caller already
+    /// resolved (the embedded CLI).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn dispatch_merge_on(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        source_batches: Vec<RecordBatch>,
+        source_schema_hint: Option<arrow_schema::SchemaRef>,
+        catalog: Arc<SessionCatalog>,
+        ctx: &DFSessionContext,
+        source_plan: Option<LogicalPlan>,
+        plan_out: &mut Option<sqe_lineage::PlanOrHint>,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
         // Peek at the target table to read its properties.
         let merge_table = match stmt {
             Statement::Merge(merge) => &merge.table,
