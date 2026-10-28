@@ -264,7 +264,7 @@ regex = "1"
 futures = "0.3"
 tokio-util = "0.7"
 # Non-poisoning mutex for lifecycle state touched from request handlers (#643).
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 # Puffin NDV sketches — pure-Rust Apache DataSketches theta implementation.
 # Used by `crates/sqe-catalog/src/puffin_stats.rs` to write theta sketches
