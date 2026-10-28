@@ -36,6 +36,17 @@ use iceberg::table::Table;
 
 use crate::to_datafusion_error;
 
+/// SQE patch: `schema` with every top-level field nullable.
+fn top_level_nullable(schema: &ArrowSchema) -> ArrowSchema {
+    ArrowSchema::new(
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone().with_nullable(true))
+            .collect::<Vec<_>>(),
+    )
+}
+
 /// Extends an ExecutionPlan with partition value calculations for Iceberg tables.
 ///
 /// This function takes an input ExecutionPlan and extends it with an additional column
@@ -67,14 +78,17 @@ pub fn project_with_partition(
     // Strip metadata from both schemas before comparison to ignore metadata differences
     let expected_arrow_schema =
         schema_to_arrow_schema(table_schema.as_ref()).map_err(to_datafusion_error)?;
-    let input_schema_cleaned =
-        strip_metadata_from_schema(&input_schema).map_err(to_datafusion_error)?;
-    let expected_schema_cleaned =
-        strip_metadata_from_schema(&expected_arrow_schema).map_err(to_datafusion_error)?;
+    let input_schema_cleaned = top_level_nullable(
+        &strip_metadata_from_schema(&input_schema).map_err(to_datafusion_error)?,
+    );
+    let expected_schema_cleaned = top_level_nullable(
+        &strip_metadata_from_schema(&expected_arrow_schema).map_err(to_datafusion_error)?,
+    );
 
-    // SQE patch: `contains`, not `!=`. A non-nullable input column (a
-    // literal, `SELECT 1`) writes into a nullable table column; upstream's
-    // exact comparison refused every such INSERT into a partitioned table.
+    // SQE patch: `contains` without top-level nullability. Upstream's exact
+    // comparison refused a literal (`SELECT 1`) into a nullable column and
+    // any query into a NOT NULL column; `IcebergWriteExec` refuses a real
+    // NULL in a required column at run time.
     if !expected_schema_cleaned.contains(&input_schema_cleaned) {
         return plan_err!(
             "Input schema does not match Iceberg table schema.\n\

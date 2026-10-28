@@ -228,6 +228,60 @@ fn embedded_warehouse_create_table_keeps_partitioning_and_properties() {
 }
 
 #[test]
+fn embedded_warehouse_insert_refuses_null_in_not_null_column() {
+    // A NULL from a query or an omitted column used to be stored as 0.
+    let wh = tempfile::tempdir().expect("tempdir");
+    let wh_path = wh.path().to_str().expect("utf-8 path");
+    let script = wh.path().join("setup.sql");
+    std::fs::write(
+        &script,
+        "CREATE SCHEMA iceberg.s;\n\
+         CREATE TABLE iceberg.s.t (id INT NOT NULL, v VARCHAR);\n\
+         CREATE TABLE iceberg.s.p (id INT NOT NULL, ts TIMESTAMP) PARTITIONED BY (day(ts));\n\
+         INSERT INTO iceberg.s.t VALUES (1, 'a');\n\
+         INSERT INTO iceberg.s.p SELECT id, TIMESTAMP '2026-01-01 10:00:00' FROM iceberg.s.t;\n",
+    )
+    .expect("write script");
+    bin()
+        .args(["--embedded", "--warehouse", wh_path, "--file"])
+        .arg(&script)
+        .arg("--stop-on-error")
+        .timeout(std::time::Duration::from_secs(120))
+        .assert()
+        .success();
+
+    for sql in [
+        "INSERT INTO iceberg.s.t SELECT CAST(NULL AS INT), 'b'",
+        "INSERT INTO iceberg.s.t (v) VALUES ('c')",
+        "INSERT INTO iceberg.s.p SELECT CAST(NULL AS INT), TIMESTAMP '2026-01-02 10:00:00'",
+    ] {
+        bin()
+            .args(["--embedded", "--warehouse", wh_path, "-e", sql])
+            .timeout(std::time::Duration::from_secs(60))
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "NULL value not allowed for NOT NULL column: id",
+            ));
+    }
+
+    let out = bin()
+        .args([
+            "--embedded",
+            "--warehouse",
+            wh_path,
+            "-e",
+            "SELECT (SELECT string_agg(CAST(id AS VARCHAR), ',') FROM iceberg.s.t) || '|' || \
+             (SELECT string_agg(CAST(id AS VARCHAR), ',') FROM iceberg.s.p) AS r",
+        ])
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(stdout.contains("1|1"), "unexpected rows: {stdout}");
+}
+
+#[test]
 fn embedded_warehouse_ctas_refuses_partitioning_it_would_drop() {
     let wh = tempfile::tempdir().expect("tempdir");
     let wh_path = wh.path().to_str().expect("utf-8 path");

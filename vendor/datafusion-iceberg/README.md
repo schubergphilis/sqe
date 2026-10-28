@@ -2,7 +2,7 @@
 
 apache/datafusion-iceberg @ `b12e9871` (2026-09-24), vendored unmodified apart from
 the `iceberg` / `iceberg-catalog-rest` paths in `Cargo.toml`, which point at
-`../iceberg-rust`, and four SQE patches. Only `crates/datafusion` is vendored.
+`../iceberg-rust`, and five SQE patches. Only `crates/datafusion` is vendored.
 
 SQE patch: `IcebergSchemaProvider::try_new` (`src/schema.rs`) skips a table that
 fails to load, with a `tracing` warning, where upstream fails the whole catalog. A
@@ -15,9 +15,15 @@ handler, outside DataFusion, and reloads only that namespace afterwards. Carry i
 over on a re-vendor.
 
 SQE patch: `project_with_partition` (`src/physical_plan/project.rs`) checks the
-input schema with `Schema::contains` instead of `!=`, so a non-nullable input
-column writes into a nullable table column. Upstream refused every
-`INSERT ... SELECT 1, ...` into a partitioned table.
+input schema with `Schema::contains` instead of `!=`, after making every
+top-level field nullable on both sides. Upstream refused every
+`INSERT ... SELECT 1, ...` into a partitioned table, and every query into a
+NOT NULL column of one.
+
+SQE patch: `IcebergWriteExec` (`src/physical_plan/write.rs`) refuses a batch with
+a NULL in a required top-level column, with the coordinator's message. The
+input of a NOT NULL column is nullable whenever it comes from a query or an
+omitted column, and the parquet writer stored the NULL as 0.
 
 SQE patch: `PartitionExpr` (`src/physical_plan/project.rs`) has one `Column`
 child per top-level table column. Upstream declared none, so DataFusion's
