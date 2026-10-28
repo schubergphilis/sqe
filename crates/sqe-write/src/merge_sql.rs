@@ -953,6 +953,15 @@ pub(crate) fn omitted_value<'a>(names: &MergeNames<'a>, col: &str) -> &'a str {
 pub fn merge_source_sql(source: &sqlparser::ast::TableFactor) -> Result<String, SqeError> {
     use sqlparser::ast::TableFactor;
     match source {
+        // A table function (`read_parquet('f.parquet')`) keeps its arguments.
+        TableFactor::Table {
+            name,
+            args: Some(args),
+            ..
+        } => {
+            let args: Vec<String> = args.args.iter().map(ToString::to_string).collect();
+            Ok(format!("SELECT * FROM {name}({})", args.join(", ")))
+        }
         TableFactor::Table { name, .. } => Ok(format!("SELECT * FROM {name}")),
         TableFactor::Derived {
             subquery, alias, ..

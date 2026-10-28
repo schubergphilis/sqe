@@ -1411,7 +1411,12 @@ impl EmbeddedClient {
             }
             Statement::Merge(m) => {
                 let source_sql = sqe_write::merge_sql::merge_source_sql(&m.source)?;
-                let source = self.ctx.sql(&source_sql).await?;
+                // Through the wrappers, so a `read_parquet(...)` source has its
+                // provider built before planning.
+                sqe_catalog::file_tvf_prepare::prepare_statement(&self.ctx, &source_sql).await?;
+                let source =
+                    sqe_catalog::file_tvf_prepare::plan_sql_without_policy(&self.ctx, &source_sql)
+                        .await?;
                 let source_plan = source.logical_plan().clone();
                 let source_schema = Arc::new(source_plan.schema().as_arrow().clone());
                 let source_batches = source.collect().await?;
