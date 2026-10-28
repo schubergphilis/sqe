@@ -6,6 +6,7 @@ pub mod classifier;
 pub mod ctas_compat;
 pub mod ddl;
 pub mod ddl_types;
+pub mod from_first;
 pub mod front_door;
 pub mod grant_policy;
 pub mod hive_ddl;

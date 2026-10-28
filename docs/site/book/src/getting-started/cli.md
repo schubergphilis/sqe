@@ -365,6 +365,9 @@ SELECT * EXCLUDE (secret, internal_id) FROM users;
 SELECT * REPLACE (UPPER(name) AS name, total / 100 AS total)
 FROM orders;
 
+-- FROM-first: a bare FROM selects every column.
+FROM iceberg.staging.events ORDER BY ts DESC LIMIT 10;
+
 -- Native column-level metadata.
 DESCRIBE iceberg.staging.events;
 ```
