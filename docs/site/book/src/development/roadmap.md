@@ -304,6 +304,7 @@ Iceberg V3 table format support landed end-to-end. V3 is the default format-vers
 - Cross-catalog joins across multiple `--catalog NAME=PATH` mounts
 - Runtime `ATTACH` / `CREATE SECRET` against any of the supported catalog backends
 - `UPDATE`, `DELETE` and `MERGE INTO` on the warehouse and on attached Iceberg catalogs, through the coordinator's write handlers (copy-on-write or merge-on-read per table)
+- `CREATE TABLE` on the warehouse and on attached Iceberg catalogs, through the coordinator's DDL handler: `PARTITIONED BY` transforms, `TBLPROPERTIES` / `WITH` options, nested columns, format version 3 by default
 - Quack RPC (`sqe-quack-wire` / `sqe-quack-server` / `sqe-quack-client`): a pure-Rust port of DuckDB's BinarySerializer, so DuckDB clients can talk to SQE over HTTP
 
 Full reference: [Embedded CLI](../getting-started/cli.md).
