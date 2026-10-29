@@ -448,6 +448,20 @@ fn embedded_warehouse_ctas_refuses_partitioning_it_would_drop() {
 }
 
 #[test]
+
+fn embedded_warehouse_partitioned_by_bare_columns() {
+    // `PARTITIONED BY (region, id)` parsed as a Hive partition column list,
+    // which the DDL handler never reads: the table came out unpartitioned
+    // with no error.
+    let wh = tempfile::tempdir().expect("tempdir");
+    let wh_path = wh.path().to_str().expect("utf-8 path");
+    let script = wh.path().join("parts.sql");
+    std::fs::write(
+        &script,
+        "CREATE SCHEMA iceberg.s;\n\
+         CREATE TABLE iceberg.s.t (id INT, region VARCHAR) PARTITIONED BY (region, id);\n\
+         INSERT INTO iceberg.s.t VALUES (1, 'eu'), (2, 'us');\n",
+
 fn embedded_warehouse_metadata_tables() {
     // `cat.ns."t$snapshots"` and friends read the named catalog's metadata;
     // the TVFs they rewrite to were never registered in embedded mode.
@@ -470,6 +484,15 @@ fn embedded_warehouse_metadata_tables() {
         .assert()
         .success();
 
+<<<<<<< crates/sqe-cli/tests/cli_smoke.rs
+    let t = latest_metadata(wh.path(), "s", "t");
+    let fields = &t["partition-specs"][0]["fields"];
+    assert_eq!(fields[0]["name"], "region", "{t}");
+    assert_eq!(fields[0]["transform"], "identity", "{t}");
+    assert_eq!(fields[1]["name"], "id", "{t}");
+    let eu = wh.path().join("iceberg/s/t/data/region=eu/id=1");
+    assert!(eu.is_dir(), "no partition directory {}", eu.display());
+=======
     let out = bin()
         .args([
             "--embedded",
@@ -499,4 +522,5 @@ fn embedded_warehouse_metadata_tables() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("'nope' is not an Iceberg catalog"));
+>>>>>>> crates/sqe-cli/tests/cli_smoke.rs
 }
