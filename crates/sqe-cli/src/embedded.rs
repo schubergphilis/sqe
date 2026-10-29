@@ -906,6 +906,11 @@ impl SqlClient for EmbeddedClient {
                 // table provider ("DELETE not supported for Base table"), so
                 // DELETE / UPDATE / MERGE on a writable Iceberg catalog run
                 // through the server's write path instead.
+                sqe_sql::StatementKind::Insert(ref stmt) => {
+                    if let Some(result) = self.embedded_handle_iceberg_insert(stmt).await? {
+                        return Ok(result);
+                    }
+                }
                 sqe_sql::StatementKind::Delete(ref stmt)
                 | sqe_sql::StatementKind::Update(ref stmt)
                 | sqe_sql::StatementKind::Merge(ref stmt) => {
@@ -1334,18 +1339,98 @@ impl EmbeddedClient {
             "CREATE TABLE {name} AS SELECT * FROM ({query}) AS __sqe_ctas LIMIT 0"
         ))
         .await?;
-        // The error is not `Send`, so only its text crosses the cleanup await.
-        let failure = match self
-            .run_datafusion(&format!("INSERT INTO {name} {query}"))
-            .await
-        {
-            Ok(_) => return Ok(Some(empty)),
-            Err(e) => e.to_string(),
+        // The rows go through the same writer as a plain INSERT. The error
+        // is not `Send`, so only its text crosses the cleanup await.
+        let insert_sql = format!("INSERT INTO {name} {query}");
+        let inserted = match sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::GenericDialect {},
+            &insert_sql,
+        ) {
+            Ok(stmts) if stmts.len() == 1 => self
+                .embedded_handle_iceberg_insert(&stmts[0])
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            _ => self
+                .run_datafusion(&insert_sql)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+        };
+        let failure = match inserted {
+            Ok(()) => return Ok(Some(empty)),
+            Err(e) => e,
         };
         let _ = self
             .run_datafusion(&format!("DROP TABLE IF EXISTS {name}"))
             .await;
         Err(failure.into())
+    }
+
+    /// The write handlers register their scratch tables under DataFusion's
+    /// built-in `datafusion.public`, which the embedded context renames to
+    /// `default.default`. Add it back, empty, on the first write.
+    fn ensure_write_scratch_catalog(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.ctx.catalog("datafusion").is_none() {
+            use datafusion::catalog::{
+                CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider,
+            };
+            let scratch = MemoryCatalogProvider::new();
+            scratch.register_schema("public", Arc::new(MemorySchemaProvider::new()))?;
+            self.ctx.register_catalog("datafusion", Arc::new(scratch));
+        }
+        Ok(())
+    }
+
+    /// INSERT into a table in a `WritableIcebergCatalog`, through
+    /// `sqe-write`'s streaming writer, as on a coordinator. The source is
+    /// planned as a standalone query and the writer matches it to the table
+    /// by position. DataFusion's own INSERT types a `VALUES` list against
+    /// the table schema, whose list fields carry `PARQUET:field_id`
+    /// metadata, and an `ARRAY[...]` literal then fails to build its batch.
+    /// `Ok(None)`: not a writable Iceberg target, DataFusion answers.
+    async fn embedded_handle_iceberg_insert(
+        &self,
+        stmt: &sqlparser::ast::Statement,
+    ) -> Result<Option<QueryResult>, Box<dyn std::error::Error>> {
+        use sqlparser::ast::{Statement, TableObject};
+
+        let Statement::Insert(ins) = stmt else {
+            return Ok(None);
+        };
+        let TableObject::TableName(name) = &ins.table else {
+            return Ok(None);
+        };
+        let Some(source) = ins.source.as_ref() else {
+            return Ok(None);
+        };
+        let Some((catalog_name, catalog)) = self.writable_target(name) else {
+            return Ok(None);
+        };
+        self.ensure_write_scratch_catalog()?;
+
+        let select_sql = sqe_sql::rewrite_named_tvf_args(&source.to_string());
+        let session = self.write_session(catalog_name);
+        let handler =
+            sqe_write::write_handler::WriteHandler::new(sqe_core::SqeConfig::embedded_defaults());
+        let mut plan_out = None;
+        let mut policy_summary = None;
+        let batches = handler
+            .handle_insert_streaming_on(
+                &session,
+                stmt,
+                catalog,
+                &self.ctx,
+                &select_sql,
+                &mut plan_out,
+                &mut policy_summary,
+            )
+            .await?;
+        let schema = batches
+            .first()
+            .map(|b| b.schema())
+            .unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()));
+        Ok(Some(record_batches_to_query_result(&schema, &batches)))
     }
 
     /// DELETE / UPDATE / MERGE on a table in a `WritableIcebergCatalog`,
@@ -1375,18 +1460,7 @@ impl EmbeddedClient {
         let Some((catalog_name, catalog)) = self.writable_target(name) else {
             return Ok(None);
         };
-
-        // The write handlers register their scratch tables under DataFusion's
-        // built-in `datafusion.public`, which the embedded context renames to
-        // `default.default`. Add it back, empty, on the first DML.
-        if self.ctx.catalog("datafusion").is_none() {
-            use datafusion::catalog::{
-                CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider,
-            };
-            let scratch = MemoryCatalogProvider::new();
-            scratch.register_schema("public", Arc::new(MemorySchemaProvider::new()))?;
-            self.ctx.register_catalog("datafusion", Arc::new(scratch));
-        }
+        self.ensure_write_scratch_catalog()?;
 
         let session = self.write_session(catalog_name);
         let handler = WriteHandler::new(sqe_core::SqeConfig::embedded_defaults());
