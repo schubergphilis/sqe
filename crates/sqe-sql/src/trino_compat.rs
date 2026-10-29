@@ -1233,13 +1233,13 @@ fn rewrite_metadata_dollar_table(factor: &mut TableFactor) -> bool {
         bare_table_in_last.split('.').map(str::to_string).collect()
     };
 
-    // The metadata TVFs take (namespace, table). SQE models a single-level
-    // namespace plus an optional catalog prefix that handlers resolve against
-    // the session's bound catalog regardless (the metadata TVFs use the
-    // session's effective catalog). So the namespace is the segment
-    // immediately before the table; any catalog (or higher) prefix is dropped.
-    // Passing the catalog-qualified `catalog.schema` as the namespace made
-    // Polaris fail to load the table (#317).
+    // The metadata TVFs take (namespace, table) plus an optional catalog.
+    // SQE models a single-level namespace, so the namespace is the segment
+    // immediately before the table. Passing the catalog-qualified
+    // `catalog.schema` as the namespace made Polaris fail to load the table
+    // (#317), so the catalog travels as a third argument instead: the
+    // coordinator ignores it (its TVFs are bound to the session's effective
+    // catalog), embedded mode picks the named catalog with it.
     let n = segments.len();
     if n < 2 {
         // Single-segment `"tbl$snapshots"` with no namespace. The TVFs require
@@ -1248,18 +1248,20 @@ fn rewrite_metadata_dollar_table(factor: &mut TableFactor) -> bool {
         // which is the correct behaviour.
         return false;
     }
+    let catalog = (n >= 3).then(|| segments[n - 3].clone());
     let namespace = segments[n - 2].clone();
     let table_name = segments[n - 1].clone();
 
-    // Build the TableFunctionArgs (two string-literal args).
-    let args_vec = vec![
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
-            Value::SingleQuotedString(namespace).into(),
-        ))),
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
-            Value::SingleQuotedString(table_name).into(),
-        ))),
-    ];
+    // Build the TableFunctionArgs (string-literal args).
+    let args_vec = [Some(namespace), Some(table_name), catalog]
+        .into_iter()
+        .flatten()
+        .map(|arg| {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
+                Value::SingleQuotedString(arg).into(),
+            )))
+        })
+        .collect();
 
     // Replace the table name and attach args.
     *name = ObjectName::from(vec![Ident::new(tvf_name)]);
@@ -1956,28 +1958,27 @@ mod tests {
 
     #[test]
     fn dollar_table_three_segment_namespace() {
-        // catalog.schema.table format: three quoted parts. The catalog prefix
-        // is dropped -- the metadata TVF resolves against the session's bound
-        // catalog (like every other table op in SQE), and Iceberg/Polaris wants
-        // the bare schema as the namespace, not `catalog.schema`. Passing the
-        // catalog-qualified namespace made Polaris fail with "table does not
-        // exist" (#317).
+        // catalog.schema.table format: three quoted parts. Iceberg/Polaris
+        // wants the bare schema as the namespace, not `catalog.schema`
+        // (passing the catalog-qualified namespace made Polaris fail with
+        // "table does not exist", #317), so the catalog moves to a third
+        // argument.
         let out = rewrite_trino_compat(r#"SELECT * FROM "cat"."schema"."t$snapshots""#);
         let lower = out.to_ascii_lowercase();
         assert!(
-            lower.contains("table_snapshots('schema', 't')"),
-            "catalog should be dropped, leaving the bare schema, got: {out}"
+            lower.contains("table_snapshots('schema', 't', 'cat')"),
+            "catalog should be the third argument, got: {out}"
         );
     }
 
     #[test]
     fn dollar_table_three_segment_single_ident() {
-        // The single-identifier dotted form must drop the catalog the same way.
+        // The single-identifier dotted form splits the same way.
         let out = rewrite_trino_compat(r#"SELECT * FROM "cat.schema.t$snapshots""#);
         let lower = out.to_ascii_lowercase();
         assert!(
-            lower.contains("table_snapshots('schema', 't')"),
-            "catalog should be dropped from the single-ident form, got: {out}"
+            lower.contains("table_snapshots('schema', 't', 'cat')"),
+            "catalog should be the third argument in the single-ident form, got: {out}"
         );
     }
 
