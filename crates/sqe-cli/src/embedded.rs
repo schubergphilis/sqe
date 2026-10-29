@@ -701,7 +701,7 @@ impl EmbeddedClient {
         let (ctx, iceberg_catalogs) =
             build_embedded_context_with_warehouse(memory_limit_bytes, mode, &storage, mask_key)
                 .await?;
-        Ok(Self {
+        let client = Self {
             ctx,
             iceberg_catalogs,
             secrets: SecretStore::new(),
@@ -710,7 +710,81 @@ impl EmbeddedClient {
             hive_roots: HashMap::new(),
             rest_catalogs: std::collections::HashSet::new(),
             storage,
-        })
+        };
+        client.register_metadata_tvfs();
+        Ok(client)
+    }
+
+    /// (Re)register the Iceberg metadata TVFs the `"t$snapshots"` rewrite
+    /// calls (`table_snapshots`, `table_files`, ...) over the current
+    /// writable catalogs. Called again after ATTACH and DETACH, since the
+    /// resolver holds a copy of the catalog map.
+    ///
+    /// `cat.ns."t$snapshots"` reads catalog `cat`. A bare `ns."t$snapshots"`
+    /// reads the only Iceberg catalog, and is refused when there are several
+    /// rather than guessed. No metadata policy: embedded mode has no policy
+    /// engine.
+    fn register_metadata_tvfs(&self) {
+        use datafusion::catalog::TableFunctionImpl;
+        use sqe_catalog::iceberg_metadata_tvf::{
+            MetadataCatalogResolver, TableFilesFunction, TableHistoryFunction,
+            TableManifestsFunction, TablePartitionsFunction, TableRefsFunction,
+            TableSnapshotsFunction,
+        };
+        let catalogs = self.iceberg_catalogs.clone();
+        let storage = self.storage.clone();
+        let resolve: MetadataCatalogResolver = Arc::new(move |name: Option<&str>| {
+            let (name, writable) = match name {
+                Some(name) => catalogs.get_key_value(name).ok_or_else(|| {
+                    datafusion::error::DataFusionError::Plan(format!(
+                        "metadata table: '{name}' is not an Iceberg catalog"
+                    ))
+                })?,
+                None if catalogs.len() == 1 => catalogs.iter().next().expect("one catalog"),
+                None => {
+                    return Err(datafusion::error::DataFusionError::Plan(
+                        "metadata table: qualify the table with its catalog, \
+                         e.g. iceberg.ns.\"t$snapshots\""
+                            .to_string(),
+                    ))
+                }
+            };
+            Ok(Arc::new(sqe_catalog::SessionCatalog::local(
+                writable.client(),
+                name,
+                &storage,
+            )))
+        });
+        let r = || resolve.clone();
+        let functions: [(&str, Arc<dyn TableFunctionImpl>); 6] = [
+            (
+                "table_snapshots",
+                Arc::new(TableSnapshotsFunction::with_catalog_resolver(r())),
+            ),
+            (
+                "table_manifests",
+                Arc::new(TableManifestsFunction::with_catalog_resolver(r())),
+            ),
+            (
+                "table_history",
+                Arc::new(TableHistoryFunction::with_catalog_resolver(r())),
+            ),
+            (
+                "table_files",
+                Arc::new(TableFilesFunction::with_catalog_resolver(r())),
+            ),
+            (
+                "table_partitions",
+                Arc::new(TablePartitionsFunction::with_catalog_resolver(r())),
+            ),
+            (
+                "table_refs",
+                Arc::new(TableRefsFunction::with_catalog_resolver(r())),
+            ),
+        ];
+        for (name, function) in functions {
+            self.ctx.register_udtf(name, function);
+        }
     }
 
     pub async fn with_backend_and_policy(
@@ -1029,6 +1103,7 @@ impl EmbeddedClient {
         if stmt.kind == sqe_sql::CatalogKind::IcebergRest {
             self.rest_catalogs.insert(stmt.name.clone());
         }
+        self.register_metadata_tvfs();
 
         let secret_ref = stmt
             .options
@@ -1050,6 +1125,7 @@ impl EmbeddedClient {
         if self.attached_catalogs.contains_key(&stmt.name) {
             self.iceberg_catalogs.remove(&stmt.name);
             self.rest_catalogs.remove(&stmt.name);
+            self.register_metadata_tvfs();
         }
         if self.attached_catalogs.remove(&stmt.name).is_none() {
             return Err(format!("catalog '{}' is not attached", stmt.name).into());
