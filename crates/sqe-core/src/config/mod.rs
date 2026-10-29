@@ -2626,8 +2626,9 @@ fn default_challenge_timeout() -> u64 {
 /// `crates/sqe-catalog/src/backends/`; selecting one routes the
 /// engine session manager through that backend's iceberg::Catalog
 /// implementation instead of through the REST client. REST-specific
-/// SessionCatalog methods (view DDL, commit_schema_update through
-/// raw REST) error out under non-REST backends.
+/// SessionCatalog methods (view DDL through raw REST) error out under
+/// non-REST backends; `commit_schema_update` falls back to the trait's
+/// `update_table`.
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase", tag = "type")]
 pub enum CatalogBackend {
