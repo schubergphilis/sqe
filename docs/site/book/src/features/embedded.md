@@ -110,6 +110,10 @@ FROM read_parquet('s3://bucket/2026/*.parquet')
 WHERE total > 0;
 ```
 
+`INSERT` into an Iceberg catalog runs on the cluster's insert handler: the
+source is planned as a plain query and written the same way a coordinator
+writes it, so `VALUES` rows with `ARRAY` columns need no casts.
+
 CTAS into an Iceberg catalog runs as two commits. The first creates the empty
 table from the query's schema, the second inserts the rows. When the insert
 fails, the empty table is dropped again. `CREATE TABLE IF NOT EXISTS ... AS`
@@ -223,7 +227,7 @@ sqe-cli --embedded --file daily-report.sql --stop-on-error
 
 The embedded prompt shares the coordinator's SQL front door and function set:
 the same Trino-compat functions, the same file TVFs, the same Iceberg readers.
-Reads and `INSERT` go to DataFusion's planner. `CREATE TABLE`, `UPDATE`,
+Reads go to DataFusion's planner. `CREATE TABLE`, `INSERT`, CTAS, `UPDATE`,
 `DELETE` and `MERGE` on an Iceberg catalog go to the coordinator's write
 handlers. The statements marked "no" above are cluster-only.
 Beyond that:
