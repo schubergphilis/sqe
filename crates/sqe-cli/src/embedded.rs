@@ -657,8 +657,11 @@ pub struct EmbeddedClient {
     hive_roots: HashMap<String, Arc<sqe_catalog::hive::provider::HiveCatalogProvider>>,
     /// The `iceberg_catalogs` attached with `TYPE iceberg_rest`. A REST
     /// `CREATE TABLE` carries its format version as a table property, which
-    /// a local catalog refuses.
-    rest_catalogs: std::collections::HashSet<String>,
+    /// a local catalog refuses. The value is the REST `SessionCatalog` the
+    /// view DDL runs on (the `iceberg::Catalog` trait has no view
+    /// operations), `None` for an OAuth2 attach: the view endpoints are
+    /// called directly and need a bearer token to send.
+    rest_catalogs: HashMap<String, Option<Arc<sqe_catalog::SessionCatalog>>>,
     /// The engine's object-store configuration, as resolved once from
     /// `--s3-*` flags and the environment. Held so a Hive root attached
     /// after start-up reads with the same endpoint and credentials the file
@@ -681,7 +684,7 @@ impl EmbeddedClient {
             attached_catalogs: HashMap::new(),
             hive_manifest_cache: Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
             hive_roots: HashMap::new(),
-            rest_catalogs: std::collections::HashSet::new(),
+            rest_catalogs: HashMap::new(),
             storage,
         })
     }
@@ -718,7 +721,7 @@ impl EmbeddedClient {
             attached_catalogs: HashMap::new(),
             hive_manifest_cache: Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
             hive_roots: HashMap::new(),
-            rest_catalogs: std::collections::HashSet::new(),
+            rest_catalogs: HashMap::new(),
             storage,
         };
         client.register_metadata_tvfs();
@@ -820,7 +823,7 @@ impl EmbeddedClient {
             attached_catalogs: HashMap::new(),
             hive_manifest_cache: Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
             hive_roots: HashMap::new(),
-            rest_catalogs: std::collections::HashSet::new(),
+            rest_catalogs: HashMap::new(),
             storage,
         })
     }
@@ -974,6 +977,17 @@ impl SqlClient for EmbeddedClient {
                         return Ok(result);
                     }
                 }
+                // DataFusion's CREATE VIEW hands a `ViewTable` to the schema
+                // provider's `register_table`, and the Iceberg one turns any
+                // provider into a new, empty Iceberg *table*. So a view in an
+                // Iceberg catalog never reaches `ctx.sql`: a REST catalog
+                // gets a real Iceberg view, any other is refused.
+                sqe_sql::StatementKind::CreateView(ref stmt)
+                | sqe_sql::StatementKind::DropView(ref stmt) => {
+                    if let Some(result) = self.embedded_handle_iceberg_view_ddl(stmt).await? {
+                        return Ok(result);
+                    }
+                }
                 sqe_sql::StatementKind::ShowCreateTable(ref stmt) => {
                     if let Some(result) = self.embedded_handle_show_create_hive_table(stmt).await? {
                         return Ok(result);
@@ -1122,11 +1136,20 @@ impl EmbeddedClient {
         .await
         .map_err(|e| format!("ATTACH failed: {e}"))?;
 
-        let provider = Arc::new(
+        let mut provider =
             sqe_catalog::writable_iceberg_catalog::WritableIcebergCatalog::try_new(catalog.clone())
                 .await
-                .map_err(|e| format!("ATTACH: failed to wrap catalog '{}': {e}", stmt.name))?,
-        );
+                .map_err(|e| format!("ATTACH: failed to wrap catalog '{}': {e}", stmt.name))?;
+        let views = if stmt.kind == sqe_sql::CatalogKind::IcebergRest {
+            let views = self.rest_view_catalog(stmt).await?;
+            if let Some(views) = &views {
+                provider = provider.with_views(Arc::clone(views), &stmt.name);
+            }
+            Some(views)
+        } else {
+            None
+        };
+        let provider = Arc::new(provider);
 
         self.ctx.register_catalog(
             stmt.name.clone(),
@@ -1135,8 +1158,8 @@ impl EmbeddedClient {
         // So CREATE SCHEMA / DROP SCHEMA on this catalog reach its async
         // namespace methods (review 806); removed again on DETACH.
         self.iceberg_catalogs.insert(stmt.name.clone(), provider);
-        if stmt.kind == sqe_sql::CatalogKind::IcebergRest {
-            self.rest_catalogs.insert(stmt.name.clone());
+        if let Some(views) = views {
+            self.rest_catalogs.insert(stmt.name.clone(), views);
         }
         self.register_metadata_tvfs();
 
@@ -1151,6 +1174,40 @@ impl EmbeddedClient {
             columns: vec![],
             rows: vec![],
         })
+    }
+
+    /// The REST `SessionCatalog` view DDL and view reads of an
+    /// `iceberg_rest` attach run on, built from the same properties as the
+    /// attached catalog (URI, warehouse, token, prefix, S3 options). `None`
+    /// for an OAuth2 secret: the view endpoints are called directly, and
+    /// only the vendored client knows the token it exchanged.
+    async fn rest_view_catalog(
+        &self,
+        stmt: &sqe_sql::AttachStatement,
+    ) -> Result<Option<Arc<sqe_catalog::SessionCatalog>>, Box<dyn std::error::Error>> {
+        let mut props =
+            sqe_catalog::mount::rest_attach_props(&stmt.location, &stmt.options, &self.secrets)
+                .map_err(|e| format!("ATTACH failed: {e}"))?;
+        if props.contains_key("credential") {
+            return Ok(None);
+        }
+        let uri = props.remove("uri").unwrap_or_default();
+        let warehouse = props.remove("warehouse").unwrap_or_default();
+        let token = props.remove("token").unwrap_or_default();
+        let catalog = sqe_catalog::SessionCatalog::new_with_props(
+            &uri,
+            &warehouse,
+            &token,
+            &self.storage,
+            None,
+            None,
+            None,
+            false,
+            props,
+        )
+        .await
+        .map_err(|e| format!("ATTACH: views of catalog '{}': {e}", stmt.name))?;
+        Ok(Some(Arc::new(catalog)))
     }
 
     fn embedded_handle_detach(
@@ -1666,7 +1723,7 @@ impl EmbeddedClient {
         let Some((catalog_name, catalog)) = self.writable_target(&ct.name) else {
             return Ok(None);
         };
-        let rest_catalog = self.rest_catalogs.contains(&catalog_name);
+        let rest_catalog = self.rest_catalogs.contains_key(&catalog_name);
         let session = self.write_session(catalog_name.clone());
         let handler =
             sqe_write::write_handler::WriteHandler::new(sqe_core::SqeConfig::embedded_defaults());
@@ -1685,6 +1742,115 @@ impl EmbeddedClient {
             columns: vec![],
             rows: vec![],
         }))
+    }
+
+    /// `CREATE [OR REPLACE] VIEW` / `DROP VIEW [IF EXISTS]` naming a
+    /// `WritableIcebergCatalog`. On an `iceberg_rest` attach this is an
+    /// Iceberg view, written through `CatalogOps` as on a coordinator: the
+    /// body's analyzed schema, its normalized SQL, `OR REPLACE` as one
+    /// `replaceView` commit. Any other Iceberg catalog (the SQLite
+    /// warehouse) has no view operations, so CREATE is refused and DROP
+    /// finds nothing. `Ok(None)`: not an Iceberg target, DataFusion's own
+    /// session view applies.
+    async fn embedded_handle_iceberg_view_ddl(
+        &self,
+        stmt: &sqlparser::ast::Statement,
+    ) -> Result<Option<QueryResult>, Box<dyn std::error::Error>> {
+        use sqlparser::ast::{ObjectType, Statement};
+
+        let (name, create) = match stmt {
+            Statement::CreateView(cv) => (&cv.name, Some(cv)),
+            Statement::Drop {
+                object_type: ObjectType::View,
+                names,
+                ..
+            } => match names.as_slice() {
+                [name] => (name, None),
+                _ if names.iter().any(|n| self.iceberg_target(n).is_some()) => {
+                    return Err("DROP VIEW names one Iceberg view at a time".into());
+                }
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        let Some(catalog_name) = self.iceberg_target(name) else {
+            return Ok(None);
+        };
+        if let Some(cv) = create {
+            if cv.materialized {
+                return Err("materialized views are not supported".into());
+            }
+            if cv.temporary {
+                return Err(format!(
+                    "CREATE TEMPORARY VIEW {name}: a temporary view lives in the session; \
+                     name it without the Iceberg catalog `{catalog_name}`"
+                )
+                .into());
+            }
+        }
+        let views = match self.rest_catalogs.get(&catalog_name) {
+            Some(Some(views)) => Arc::clone(views),
+            Some(None) => {
+                return Err(format!(
+                    "view {name}: catalog `{catalog_name}` was attached with an OAuth2 secret, \
+                     and embedded mode reaches the Iceberg view endpoints with a bearer \
+                     token only; attach it with TOKEN or a bearer SECRET"
+                )
+                .into());
+            }
+            None => {
+                return match stmt {
+                    Statement::Drop {
+                        if_exists: true, ..
+                    } => Ok(Some(QueryResult {
+                        columns: vec![],
+                        rows: vec![],
+                    })),
+                    Statement::Drop { .. } => Err(format!(
+                        "view {name} does not exist: catalog `{catalog_name}` stores no views"
+                    )
+                    .into()),
+                    _ => Err(format!(
+                        "CREATE VIEW {name}: catalog `{catalog_name}` stores no Iceberg views; \
+                         create the view in an ATTACHed iceberg_rest catalog"
+                    )
+                    .into()),
+                };
+            }
+        };
+
+        let session = self.write_session(catalog_name);
+        let ops = sqe_write::catalog_ops::CatalogOps::new(sqe_core::SqeConfig::embedded_defaults())
+            .with_session_catalog(views);
+        match create {
+            Some(cv) => {
+                let schema = self.view_body_schema(&cv.query.to_string()).await?;
+                let schema_json = sqe_write::view_schema::arrow_schema_to_iceberg_json(&schema);
+                ops.create_view(&session, stmt, &schema_json).await?;
+            }
+            None => ops.drop_view(&session, stmt).await?,
+        }
+        Ok(Some(QueryResult {
+            columns: vec![],
+            rows: vec![],
+        }))
+    }
+
+    /// The schema a view body produces, planned as a query would be: the
+    /// analyzed (type-coerced) schema, not the planned one, as the
+    /// coordinator's `get_schema` derives it.
+    async fn view_body_schema(
+        &self,
+        body: &str,
+    ) -> Result<arrow_schema::SchemaRef, Box<dyn std::error::Error>> {
+        let sql = sqe_sql::rewrite_named_tvf_args(body);
+        for provider in self.hive_roots.values() {
+            provider.refresh_referenced(&sql, None, None).await;
+        }
+        sqe_catalog::file_tvf_prepare::prepare_statement(&self.ctx, &sql).await?;
+        let df = sqe_catalog::file_tvf_prepare::plan_sql_without_policy(&self.ctx, &sql).await?;
+        let schema = sqe_catalog::file_tvf_prepare::analyzed_schema(&self.ctx, df.logical_plan())?;
+        Ok(Arc::new(schema.as_arrow().clone()))
     }
 
     /// `ALTER TABLE` on a writable Iceberg catalog: rename, column and nested
@@ -1803,6 +1969,19 @@ impl EmbeddedClient {
         &self,
         name: &sqlparser::ast::ObjectName,
     ) -> Option<(String, Arc<sqe_catalog::SessionCatalog>)> {
+        let catalog_name = self.iceberg_target(name)?;
+        let writable = self.iceberg_catalogs.get(&catalog_name)?;
+        let catalog = Arc::new(sqe_catalog::SessionCatalog::local(
+            writable.client(),
+            &catalog_name,
+            &self.storage,
+        ));
+        Some((catalog_name, catalog))
+    }
+
+    /// The catalog a one- to three-part name lands in, when that is one of
+    /// `iceberg_catalogs`.
+    fn iceberg_target(&self, name: &sqlparser::ast::ObjectName) -> Option<String> {
         let parts: Vec<&str> = name
             .0
             .iter()
@@ -1813,13 +1992,9 @@ impl EmbeddedClient {
             [_] | [_, _] => self.default_catalog(),
             _ => return None,
         };
-        let writable = self.iceberg_catalogs.get(&catalog_name)?;
-        let catalog = Arc::new(sqe_catalog::SessionCatalog::local(
-            writable.client(),
-            &catalog_name,
-            &self.storage,
-        ));
-        Some((catalog_name, catalog))
+        self.iceberg_catalogs
+            .contains_key(&catalog_name)
+            .then_some(catalog_name)
     }
 
     /// Run `stripped`, a statement whose time-travel clauses were removed,
@@ -3058,6 +3233,187 @@ mod tests {
         );
         let result = client.execute(&sql).await.expect("query");
         assert_eq!(result.rows, vec![vec!["2".to_string()]]);
+    }
+
+    // ------------------------------------------------------------------
+    // Iceberg views on an ATTACHed iceberg_rest catalog
+    // ------------------------------------------------------------------
+
+    /// A stored view `ns.v` with body `body`, as the REST catalog's
+    /// LoadViewResponse returns it.
+    fn load_view_response(body: &str) -> serde_json::Value {
+        serde_json::json!({
+            "metadata-location": "s3://bucket/ns/v/metadata/00001.json",
+            "metadata": {
+                "view-uuid": "fa6506c3-7681-40c8-86dc-e36561f83385",
+                "format-version": 1,
+                "location": "s3://bucket/ns/v",
+                "current-version-id": 1,
+                "properties": {},
+                "versions": [{
+                    "version-id": 1,
+                    "timestamp-ms": 1_573_518_431_292_i64,
+                    "schema-id": 0,
+                    "summary": {"engine-name": "sqe"},
+                    "default-namespace": ["ns"],
+                    "default-catalog": "wh",
+                    "representations": [{"type": "sql", "sql": body, "dialect": "sqe"}]
+                }],
+                "version-log": [{"version-id": 1, "timestamp-ms": 1_573_518_431_292_i64}],
+                "schemas": [{
+                    "type": "struct",
+                    "schema-id": 0,
+                    "fields": [{"id": 1, "name": "x", "required": true, "type": "long"}]
+                }]
+            },
+            "config": {}
+        })
+    }
+
+    /// CREATE VIEW, a read through the view, CREATE OR REPLACE VIEW and
+    /// DROP VIEW against a mock REST catalog attached as `pol` over
+    /// warehouse `wh`, so the view's `default-catalog` differs from the
+    /// name the body is read under.
+    #[tokio::test]
+    async fn iceberg_rest_view_lifecycle() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "overrides": {}, "defaults": {}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"namespaces": [["ns"]]})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/ns/tables"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"identifiers": []})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/namespaces/ns/views"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(load_view_response("SELECT 1 AS x")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/ns/views/v"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(load_view_response("SELECT 1 AS x")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/namespaces/ns/views/v"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(load_view_response("SELECT 2 AS x")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1/namespaces/ns/views/v"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
+        client
+            .execute(&format!(
+                "ATTACH '{}' AS pol (TYPE iceberg_rest, WAREHOUSE 'wh', TOKEN 't0k')",
+                server.uri()
+            ))
+            .await
+            .expect("attach");
+
+        client
+            .execute("CREATE VIEW pol.ns.v AS SELECT CAST(1 AS BIGINT) AS x")
+            .await
+            .expect("create view");
+        let requests = server.received_requests().await.expect("recording on");
+        let create = requests
+            .iter()
+            .find(|r| r.method.as_str() == "POST" && r.url.path() == "/v1/namespaces/ns/views")
+            .expect("CREATE VIEW posts to the views endpoint");
+        assert_eq!(
+            create
+                .headers
+                .get("authorization")
+                .map(|v| v.to_str().unwrap()),
+            Some("Bearer t0k"),
+            "view calls carry the attach's bearer token"
+        );
+        let body: serde_json::Value = create.body_json().expect("json body");
+        assert_eq!(body["name"], "v");
+        assert_eq!(body["schema"]["fields"][0]["name"], "x");
+        assert_eq!(body["schema"]["fields"][0]["type"], "long");
+        let version = &body["view-version"];
+        assert_eq!(version["default-catalog"], "wh");
+        assert_eq!(version["default-namespace"], serde_json::json!(["ns"]));
+        assert_eq!(version["representations"][0]["dialect"], "sqe");
+        assert_eq!(
+            version["representations"][0]["sql"],
+            "SELECT CAST(1 AS BIGINT) AS x"
+        );
+
+        let rows = client
+            .execute("SELECT x FROM pol.ns.v")
+            .await
+            .expect("read through the view");
+        assert_eq!(rows.rows, vec![vec!["1".to_string()]]);
+
+        client
+            .execute("CREATE OR REPLACE VIEW pol.ns.v AS SELECT CAST(2 AS BIGINT) AS x")
+            .await
+            .expect("replace view");
+        let requests = server.received_requests().await.expect("recording on");
+        let commit = requests
+            .iter()
+            .find(|r| r.method.as_str() == "POST" && r.url.path() == "/v1/namespaces/ns/views/v")
+            .expect("OR REPLACE commits to the existing view");
+        let body: serde_json::Value = commit.body_json().expect("json body");
+        assert_eq!(body["requirements"][0]["type"], "assert-view-uuid");
+        assert_eq!(
+            body["requirements"][0]["uuid"],
+            "fa6506c3-7681-40c8-86dc-e36561f83385"
+        );
+
+        client
+            .execute("DROP VIEW pol.ns.v")
+            .await
+            .expect("drop view");
+        let requests = server.received_requests().await.expect("recording on");
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.method.as_str() == "DELETE"
+                    && r.url.path() == "/v1/namespaces/ns/views/v"),
+            "DROP VIEW deletes the view"
+        );
+
+        let err = client
+            .execute("SELECT * FROM pol.ns.missing")
+            .await
+            .expect_err("an unknown name is still not found");
+        assert!(err.to_string().contains("not found"), "{err}");
+
+        let err = client
+            .execute("CREATE MATERIALIZED VIEW pol.ns.m AS SELECT 1")
+            .await
+            .expect_err("materialized views are refused");
+        assert!(err.to_string().contains("materialized"), "{err}");
     }
 
     // ------------------------------------------------------------------

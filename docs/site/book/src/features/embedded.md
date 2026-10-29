@@ -10,6 +10,7 @@ DataFusion directly, plus a set of SQE statements (ATTACH, secrets, schema
 DDL, CTAS, `SHOW TABLES IN`). `CREATE TABLE`, `ALTER TABLE`, `UPDATE`,
 `DELETE` and `MERGE` on an Iceberg catalog run on the cluster's own handlers.
 Time travel reads Iceberg tables pinned to a snapshot, branch or tag.
+`CREATE VIEW` stores Iceberg views in an attached REST catalog.
 Table maintenance is not part of it yet. The
 [support table](#what-embedded-mode-supports) below lists what runs.
 
@@ -141,6 +142,20 @@ FIELDS`, `CREATE BRANCH` / `CREATE TAG` and `RENAME TO` each land as one
 Iceberg commit. A rename stays inside its catalog. `SET TAGS` and masking
 policies need a cluster, because embedded mode has no policy engine.
 
+`CREATE [OR REPLACE] VIEW` and `DROP VIEW [IF EXISTS]` store an Iceberg view
+in a catalog attached with `TYPE iceberg_rest`, through the same code as a
+coordinator. The view records the body's SQL, its column types and the
+catalog's warehouse, and `OR REPLACE` lands as one commit that keeps the
+view's history. `SELECT` and `DESCRIBE` read through the view. Qualify the
+tables in the body with the attach name (`pol.sales.orders`), because the
+session default catalog is the in-memory one. The body is stored as written,
+so a coordinator that knows the catalog under another name cannot resolve
+it. Views need a bearer `TOKEN` or bearer `SECRET` on the attach; an OAuth2
+attach refuses them. The SQLite warehouse stores no views: `CREATE VIEW`
+there fails, and an unqualified `CREATE VIEW v` is still a session view.
+`SHOW TABLES` and `SHOW CREATE TABLE` do not list or render Iceberg views
+yet.
+
 Tables in the warehouse are valid Iceberg. Point a cluster deployment (or any
 other Iceberg reader) at the same catalog later and they come along unchanged.
 Exporting results to plain files goes through `COPY ... TO`; see
@@ -160,7 +175,7 @@ Exporting results to plain files goes through `COPY ... TO`; see
 | `ALTER TABLE` (columns, properties, partitions, rename) | yes | yes |
 | `ALTER TABLE ... SET TAGS`, masking policies | no | yes |
 | `DROP TABLE` | yes | yes |
-| `CREATE VIEW` in an Iceberg catalog | no | yes |
+| `CREATE VIEW` / `DROP VIEW` in an Iceberg catalog | REST catalogs | yes |
 | `SHOW TABLES [IN schema]`, `DESCRIBE` | yes | yes |
 | `SHOW CREATE TABLE` | yes | yes |
 | `FOR VERSION AS OF` / `FOR SYSTEM_TIME AS OF` | Iceberg tables | yes |

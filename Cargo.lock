@@ -7005,6 +7005,7 @@ dependencies = [
  "sqlparser",
  "tempfile",
  "tokio",
+ "wiremock",
  "workspace-hack",
 ]
 
