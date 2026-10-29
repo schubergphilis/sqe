@@ -682,3 +682,30 @@ fn embedded_warehouse_time_travel() {
             "time travel reads Iceberg tables only",
         ));
 }
+
+#[test]
+fn embedded_warehouse_refuses_create_view() {
+    // The SQLite catalog stores no views. CREATE VIEW used to "succeed" by
+    // registering an empty Iceberg table under the view's name.
+    let wh = tempfile::tempdir().expect("tempdir");
+    let wh_path = wh.path().to_str().expect("utf-8 path");
+    let run = |sql: &str| {
+        bin()
+            .args(["--embedded", "--warehouse", wh_path, "-e", sql])
+            .timeout(std::time::Duration::from_secs(60))
+            .assert()
+    };
+    run("CREATE SCHEMA iceberg.s").success();
+    run("CREATE VIEW iceberg.s.v AS SELECT 1 AS x")
+        .failure()
+        .stderr(predicate::str::contains("stores no Iceberg views"));
+    run("SHOW TABLES IN iceberg.s")
+        .success()
+        .stdout(predicate::str::contains(" v ").not());
+    run("DROP VIEW IF EXISTS iceberg.s.v").success();
+    run("DROP VIEW iceberg.s.v")
+        .failure()
+        .stderr(predicate::str::contains("stores no views"));
+    // A session view is still a DataFusion view.
+    run("CREATE VIEW sv AS SELECT 1 AS x").success();
+}

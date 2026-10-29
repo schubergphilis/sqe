@@ -641,18 +641,7 @@ impl SqeSchemaProvider {
         sql: String,
     ) -> DFResult<Option<Arc<dyn TableProvider>>> {
         let catalog_name = &self.warehouse;
-
-        // Same session zone as the query, or `now()` in a view body is naive
-        // while the same expression in the query is zoned.
-        let mini_ctx = SessionContext::new_with_config(
-            SessionConfig::new()
-                .with_information_schema(true)
-                .with_default_catalog_and_schema(catalog_name, VIEW_DEFAULT_SCHEMA)
-                .set_str(
-                    "datafusion.execution.time_zone",
-                    crate::session_tuning::ENGINE_TIME_ZONE,
-                ),
-        );
+        let mini_ctx = view_planning_context(catalog_name);
 
         // The view's own namespace is always resolvable even when the
         // owning provider's list was built before it existed.
@@ -732,21 +721,47 @@ impl SqeSchemaProvider {
             }
         };
 
-        let (state, plan) = df.into_parts();
-        let plan = match &self.catalog_name {
-            Some(session_name) => {
-                qualify_view_scans(plan, session_name, VIEW_DEFAULT_SCHEMA, &[catalog_name])?
-            }
-            None => qualify_view_scans(plan, catalog_name, VIEW_DEFAULT_SCHEMA, &[])?,
+        let view = match &self.catalog_name {
+            Some(session_name) => view_table(df, name, sql, session_name, &[catalog_name])?,
+            None => view_table(df, name, sql, catalog_name, &[])?,
         };
-        let plan = state.optimize(&plan).map_err(|e| {
-            datafusion::error::DataFusionError::External(
-                format!("Failed to optimize view '{name}' plan: {e}").into(),
-            )
-        })?;
-
-        Ok(Some(Arc::new(ViewTable::new(plan, Some(sql)))))
+        Ok(Some(view))
     }
+}
+
+/// The `SessionContext` a view body is planned in, with `catalog` as its
+/// default catalog. Same session zone as the query, or `now()` in a view
+/// body is naive while the same expression in the query is zoned. The
+/// caller registers the catalogs the body may name.
+pub(crate) fn view_planning_context(catalog: &str) -> SessionContext {
+    SessionContext::new_with_config(
+        SessionConfig::new()
+            .with_information_schema(true)
+            .with_default_catalog_and_schema(catalog, VIEW_DEFAULT_SCHEMA)
+            .set_str(
+                "datafusion.execution.time_zone",
+                crate::session_tuning::ENGINE_TIME_ZONE,
+            ),
+    )
+}
+
+/// The `ViewTable` for view `name`, from its body planned in a
+/// [`view_planning_context`]: scans named by the table they resolved to
+/// ([`qualify_view_scans`], `session_name` being the catalog's name in the
+/// reading session and `aliases` its other names), then optimized.
+pub(crate) fn view_table(
+    df: datafusion::dataframe::DataFrame,
+    name: &str,
+    sql: String,
+    session_name: &str,
+    aliases: &[&str],
+) -> DFResult<Arc<dyn TableProvider>> {
+    let (state, plan) = df.into_parts();
+    let plan = qualify_view_scans(plan, session_name, VIEW_DEFAULT_SCHEMA, aliases)?;
+    let plan = state.optimize(&plan).map_err(|e| {
+        DataFusionError::External(format!("Failed to optimize view '{name}' plan: {e}").into())
+    })?;
+    Ok(Arc::new(ViewTable::new(plan, Some(sql))))
 }
 
 #[cfg(test)]
