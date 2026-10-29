@@ -603,4 +603,5 @@ fn embedded_warehouse_show_create_table_round_trips() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("table not found: iceberg.s.nope"));
+
 }
