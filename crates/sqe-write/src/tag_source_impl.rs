@@ -40,7 +40,7 @@ use sqe_policy::TagSource;
 use sqe_sql::tags::{ColumnTagOp, TagAction};
 
 /// Iceberg table property key holding the column->tag-label JSON map.
-pub(crate) const PROP_KEY: &str = "sqe.column-tags";
+pub const PROP_KEY: &str = "sqe.column-tags";
 
 /// Tag source backed by the coordinator's shared `TableMetadataCache`.
 ///
@@ -137,7 +137,7 @@ impl TagSource for CacheTagSource {
 /// DataFusion's `generate_series` / `range`, which computes its rows and
 /// reads no table (#847). Any other provider (Hive, views) is
 /// `NotRecognised` and goes to `CacheTagSource` / `HiveTagSource`.
-pub(crate) fn scan_column_tags(
+pub fn scan_column_tags(
     provider: &dyn datafusion::catalog::TableProvider,
 ) -> sqe_policy::plan_rewriter::ScanTagState {
     use sqe_policy::plan_rewriter::ScanTagState;
@@ -193,7 +193,7 @@ fn is_series_generator(provider: &dyn datafusion::catalog::TableProvider) -> boo
 /// * Malformed JSON or wrong shape → `Err` (unknown). Callers must not treat
 ///   this as empty: the rewriter fail-closes, and SET/UNSET TAGS must refuse
 ///   rather than wipe existing tags.
-pub(crate) fn parse_column_tags(
+pub fn parse_column_tags(
     props: &HashMap<String, String>,
 ) -> Result<HashMap<String, Vec<String>>, serde_json::Error> {
     let raw = match props.get(PROP_KEY) {
