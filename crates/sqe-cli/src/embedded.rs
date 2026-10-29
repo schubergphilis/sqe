@@ -918,6 +918,18 @@ impl SqlClient for EmbeddedClient {
                         return Ok(result);
                     }
                 }
+                ref alter @ (sqe_sql::StatementKind::Rename(_)
+                | sqe_sql::StatementKind::AlterSchema(_)
+                | sqe_sql::StatementKind::AlterTableProps(_)
+                | sqe_sql::StatementKind::DropNestedColumn { .. }
+                | sqe_sql::StatementKind::AlterNestedColumnType { .. }
+                | sqe_sql::StatementKind::RefDdl(_)
+                | sqe_sql::StatementKind::PartitionEvolution(_)
+                | sqe_sql::StatementKind::IdentifierFields(_)) => {
+                    if let Some(result) = self.embedded_handle_iceberg_alter(alter).await? {
+                        return Ok(result);
+                    }
+                }
                 _ => {}
             },
             // Our own classifier rejected this statement with a specific,
@@ -1565,6 +1577,116 @@ impl EmbeddedClient {
         }))
     }
 
+    /// `ALTER TABLE` on a writable Iceberg catalog: rename, column and nested
+    /// column changes, table properties, branches and tags, partition
+    /// evolution and identifier fields run on the cluster's `CatalogOps`.
+    /// `None` for any other target, which falls through to DataFusion.
+    /// `SET TAGS` and masking policies stay cluster-only: embedded mode has
+    /// no policy engine to enforce them.
+    async fn embedded_handle_iceberg_alter(
+        &self,
+        kind: &sqe_sql::StatementKind,
+    ) -> Result<Option<QueryResult>, Box<dyn std::error::Error>> {
+        use sqe_sql::{PartitionEvolution, RefDdl, StatementKind as K};
+        let table = match kind {
+            K::Rename(stmt) | K::AlterSchema(stmt) | K::AlterTableProps(stmt) => {
+                match stmt.as_ref() {
+                    sqlparser::ast::Statement::AlterTable(at) => at.name.clone(),
+                    _ => return Ok(None),
+                }
+            }
+            K::DropNestedColumn { table, .. } | K::AlterNestedColumnType { table, .. } => {
+                sqe_write::catalog_ops::parse_object_name(table)?
+            }
+            K::RefDdl(ddl) => match ddl.as_ref() {
+                RefDdl::CreateBranch { table, .. }
+                | RefDdl::CreateTag { table, .. }
+                | RefDdl::DropBranch { table, .. }
+                | RefDdl::DropTag { table, .. } => {
+                    sqe_write::catalog_ops::parse_object_name(table)?
+                }
+            },
+            K::PartitionEvolution(evolution) => match evolution.as_ref() {
+                PartitionEvolution::AddField { table, .. }
+                | PartitionEvolution::DropField { table, .. }
+                | PartitionEvolution::ReplaceField { table, .. } => {
+                    sqe_write::catalog_ops::parse_object_name(table)?
+                }
+            },
+            K::IdentifierFields(ddl) => sqe_write::catalog_ops::parse_object_name(&ddl.table)?,
+            _ => return Ok(None),
+        };
+        let Some((catalog_name, catalog)) = self.writable_target(&table) else {
+            return Ok(None);
+        };
+        let session = self.write_session(catalog_name.clone());
+        let ops = sqe_write::catalog_ops::CatalogOps::new(sqe_core::SqeConfig::embedded_defaults())
+            .with_session_catalog(catalog);
+
+        // Namespaces whose cached listing the statement changes.
+        let source = sqe_write::ident::resolve_table_ident(&table, &session)?;
+        let mut namespaces = vec![source.namespace().as_ref().join(".")];
+        match kind {
+            K::Rename(stmt) => {
+                if let Some(dest) = rename_destination(stmt) {
+                    // The rename runs inside the source catalog; a target
+                    // in another catalog would land there silently.
+                    if let [dest_catalog, _, _] = dest.0.as_slice() {
+                        let dest_catalog = dest_catalog.as_ident().map(|i| i.value.as_str());
+                        if dest_catalog != Some(catalog_name.as_str()) {
+                            return Err(format!(
+                                "ALTER TABLE ... RENAME cannot move a table to another \
+                                 catalog: {table} -> {dest}"
+                            )
+                            .into());
+                        }
+                    }
+                    if dest.0.len() > 1 {
+                        let dest = sqe_write::ident::resolve_table_ident(dest, &session)?;
+                        namespaces.push(dest.namespace().as_ref().join("."));
+                    }
+                }
+                ops.rename_table(&session, stmt).await?;
+            }
+            K::AlterSchema(stmt) => ops.alter_table_schema(&session, stmt).await?,
+            K::AlterTableProps(stmt) => ops.set_table_properties(&session, stmt).await?,
+            K::DropNestedColumn {
+                table,
+                path,
+                if_exists,
+            } => {
+                ops.drop_nested_column(&session, table, path, *if_exists)
+                    .await?
+            }
+            K::AlterNestedColumnType {
+                table,
+                path,
+                data_type,
+            } => {
+                ops.alter_nested_column_type(&session, table, path, data_type)
+                    .await?
+            }
+            K::RefDdl(ddl) => ops.apply_ref_ddl(&session, ddl).await?,
+            K::PartitionEvolution(evolution) => {
+                ops.apply_partition_evolution(&session, evolution).await?
+            }
+            K::IdentifierFields(ddl) => ops.apply_identifier_fields(&session, ddl).await?,
+            _ => return Ok(None),
+        }
+
+        // The table providers hold the metadata they loaded; reload them.
+        if let Some(writable) = self.iceberg_catalogs.get(&catalog_name) {
+            namespaces.dedup();
+            for namespace in &namespaces {
+                writable.refresh_namespace(namespace).await?;
+            }
+        }
+        Ok(Some(QueryResult {
+            columns: vec![],
+            rows: vec![],
+        }))
+    }
+
     /// The catalog a one- to three-part table name lands in, when that is a
     /// writable Iceberg catalog: its name and a `SessionCatalog` over it.
     fn writable_target(
@@ -1807,6 +1929,20 @@ fn record_batches_to_query_result(
 /// check that does the job: a textual prefix match, not a parse attempt,
 /// so a statement this crate cannot classify for any other reason is never
 /// mistaken for one of ours.
+/// The new name in `ALTER TABLE ... RENAME TO <name>`.
+fn rename_destination(stmt: &sqlparser::ast::Statement) -> Option<&sqlparser::ast::ObjectName> {
+    let sqlparser::ast::Statement::AlterTable(at) = stmt else {
+        return None;
+    };
+    at.operations.iter().find_map(|op| match op {
+        sqlparser::ast::AlterTableOperation::RenameTable { table_name } => match table_name {
+            sqlparser::ast::RenameTableNameKind::As(name)
+            | sqlparser::ast::RenameTableNameKind::To(name) => Some(name),
+        },
+        _ => None,
+    })
+}
+
 fn looks_like_create_external_table(sql: &str) -> bool {
     sqe_sql::is_create_external_table(sql)
 }
