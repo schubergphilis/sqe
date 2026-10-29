@@ -15,7 +15,6 @@ pub mod identifier_fields;
 pub mod metadata;
 pub mod nested_row_cast;
 pub mod paren_less_values;
-pub mod trim_compat;
 pub mod partition;
 pub mod partition_evolution;
 pub mod pipeline_types;
@@ -25,6 +24,7 @@ pub mod quote;
 pub mod tags;
 pub mod time_travel;
 mod token_scan;
+pub mod trim_compat;
 pub mod trino_compat;
 pub mod tvf_named_args;
 pub mod v3_types;
@@ -41,8 +41,8 @@ pub use catalog_qualifiers::{
     extract_schema_qualifiers_from_sql, pinned_table_schema_from_sql,
 };
 pub use classifier::{
-    hidden_write, parse_and_classify, parse_and_classify_typed, CheckAccessParams, ShowEffectivePolicyParams,
-    ShowGrantsTarget, StatementKind,
+    hidden_write, parse_and_classify, parse_and_classify_typed, CheckAccessParams,
+    ShowEffectivePolicyParams, ShowGrantsTarget, StatementKind,
 };
 pub use ctas_compat::rewrite_ctas_compat;
 pub use ddl::{try_parse_ref_ddl, BranchRetention, RefDdl};
@@ -57,15 +57,16 @@ pub use metadata::{
 };
 pub use nested_row_cast::rewrite_nested_row_cast;
 pub use paren_less_values::rewrite_paren_less_values;
-pub use trim_compat::rewrite_trim_both_from;
 pub use partition::{is_create_external_table, normalize_partitioned_by};
 pub use partition_evolution::{try_parse_partition_evolution, PartitionEvolution};
 pub use pipeline_types::{pre_parse_pipeline, ClassifiableSql, UserSql};
 pub use procedures::{try_parse_call, NamespaceRef, ProcedureCall, ReprojectScope, TableRef};
 pub use quote::{quote_ident_if_needed, quote_qualified_if_needed};
 pub use time_travel::{
-    extract_incremental_spec, extract_time_travel_spec, IncrementalSpec, TimeTravelSpec, VersionRef,
+    extract_incremental_spec, extract_time_travel_spec, replace_table_reference,
+    resolve_timestamp_expr, time_travel_millis, IncrementalSpec, TimeTravelSpec, VersionRef,
 };
+pub use trim_compat::rewrite_trim_both_from;
 pub use trino_compat::{
     alias_anonymous_select_columns, check_expression_depth, rewrite_trino_compat,
 };

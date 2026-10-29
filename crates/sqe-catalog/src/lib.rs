@@ -33,6 +33,7 @@ mod send_erased;
 pub mod session_tuning;
 #[cfg(feature = "sql-sqlite-rs")]
 pub mod sqlite_rs_catalog;
+pub mod time_travel;
 pub mod txn;
 pub mod vended_credentials;
 pub use session_tuning::{engine_context, engine_session_config};
