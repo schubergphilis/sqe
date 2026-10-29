@@ -2,7 +2,7 @@
 
 apache/datafusion-iceberg @ `b12e9871` (2026-09-24), vendored unmodified apart from
 the `iceberg` / `iceberg-catalog-rest` paths in `Cargo.toml`, which point at
-`../iceberg-rust`, and five SQE patches. Only `crates/datafusion` is vendored.
+`../iceberg-rust`, and six SQE patches. Only `crates/datafusion` is vendored.
 
 SQE patch: `IcebergSchemaProvider::try_new` (`src/schema.rs`) skips a table that
 fails to load, with a `tracing` warning, where upstream fails the whole catalog. A
@@ -29,6 +29,13 @@ SQE patch: `PartitionExpr` (`src/physical_plan/project.rs`) has one `Column`
 child per top-level table column. Upstream declared none, so DataFusion's
 projection merge evaluated it on the input of the projection below, a
 zero-column batch, and the partition calculator panicked.
+
+SQE patch: `IcebergTableScan::new` (`src/physical_plan/scan.rs`) keeps only the
+pushed-down predicates that bind to the scanned schema
+(`convert_filters_to_bindable_predicate` in `expr_to_predicate.rs`). iceberg-rust
+builds no accessor for a list or map field, so `tags IS NOT NULL` failed the whole
+scan with "Accessor for Field tags not found". The filters stay `Inexact`, and
+DataFusion still applies a dropped one above the scan.
 
 This is the DataFusion integration that apache moved out of iceberg-rust on
 2026-09-17. It is not published to crates.io (the crates.io `datafusion-iceberg` is an

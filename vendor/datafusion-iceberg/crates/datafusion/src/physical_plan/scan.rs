@@ -33,7 +33,7 @@ use futures::{Stream, TryStreamExt};
 use iceberg::expr::Predicate;
 use iceberg::table::Table;
 
-use super::expr_to_predicate::convert_filters_to_predicate;
+use super::expr_to_predicate::convert_filters_to_bindable_predicate;
 use crate::to_datafusion_error;
 
 /// Manages the scanning process of an Iceberg [`Table`], encapsulating the
@@ -71,7 +71,11 @@ impl IcebergTableScan {
         };
         let plan_properties = Self::compute_properties(output_schema.clone());
         let projection = get_column_names(schema.clone(), projection);
-        let predicates = convert_filters_to_predicate(filters);
+        let iceberg_schema = snapshot_id
+            .and_then(|id| table.metadata().snapshot_by_id(id))
+            .and_then(|s| s.schema(table.metadata()).ok())
+            .unwrap_or_else(|| table.metadata().current_schema().clone());
+        let predicates = convert_filters_to_bindable_predicate(filters, &iceberg_schema);
 
         Self {
             table,

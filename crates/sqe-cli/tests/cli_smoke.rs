@@ -282,6 +282,52 @@ fn embedded_warehouse_insert_refuses_null_in_not_null_column() {
 }
 
 #[test]
+fn embedded_warehouse_insert_values_and_filter_on_array_column() {
+    // INSERT ... VALUES typed the rows against a list type without the
+    // element's field id and failed; a predicate on a list column failed to
+    // bind in the Iceberg scan.
+    let wh = tempfile::tempdir().expect("tempdir");
+    let wh_path = wh.path().to_str().expect("utf-8 path");
+    let script = wh.path().join("arrays.sql");
+    std::fs::write(
+        &script,
+        "CREATE SCHEMA iceberg.s;\n\
+         CREATE TABLE iceberg.s.t (id INT, tags ARRAY<VARCHAR>, v VARCHAR);\n\
+         INSERT INTO iceberg.s.t VALUES (1, ARRAY['a', 'b'], 'x');\n\
+         INSERT INTO iceberg.s.t (id, tags) VALUES (5, ARRAY['z']);\n\
+         INSERT INTO iceberg.s.t VALUES (2, NULL, 'y'), (3, ARRAY[], 'w');\n\
+         CREATE TABLE iceberg.s.c AS SELECT id, tags FROM iceberg.s.t WHERE tags IS NOT NULL;\n\
+         INSERT INTO iceberg.s.c SELECT id + 10, tags FROM iceberg.s.t WHERE tags IS NOT NULL;\n",
+    )
+    .expect("write script");
+    bin()
+        .args(["--embedded", "--warehouse", wh_path, "--file"])
+        .arg(&script)
+        .arg("--stop-on-error")
+        .timeout(std::time::Duration::from_secs(120))
+        .assert()
+        .success();
+
+    let out = bin()
+        .args([
+            "--embedded",
+            "--warehouse",
+            wh_path,
+            "-e",
+            "SELECT string_agg(CAST(id AS VARCHAR) || '=' || array_to_string(tags, '+'), ',' \
+             ORDER BY id) AS r FROM iceberg.s.c",
+        ])
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("1=a+b,3=,5=z,11=a+b,13=,15=z"),
+        "unexpected rows: {stdout}"
+    );
+}
+
+#[test]
 fn embedded_warehouse_ctas_refuses_partitioning_it_would_drop() {
     let wh = tempfile::tempdir().expect("tempdir");
     let wh_path = wh.path().to_str().expect("utf-8 path");
