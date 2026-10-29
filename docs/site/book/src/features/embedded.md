@@ -161,7 +161,7 @@ Exporting results to plain files goes through `COPY ... TO`; see
 | `DROP TABLE` | yes | yes |
 | `CREATE VIEW` in an Iceberg catalog | no | yes |
 | `SHOW TABLES [IN schema]`, `DESCRIBE` | yes | yes |
-| `SHOW CREATE TABLE` | Hive tables only | yes |
+| `SHOW CREATE TABLE` | yes | yes |
 | `FOR VERSION AS OF` / `FOR SYSTEM_TIME AS OF` | no | yes |
 | Metadata tables (`orders$snapshots`) | yes | yes |
 | `CREATE BRANCH` / `CREATE TAG`, `SET WRITE_BRANCH` | no | yes |
