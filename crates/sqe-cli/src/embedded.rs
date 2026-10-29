@@ -597,9 +597,11 @@ async fn attach_sqlite_catalog(
 /// S3 Tables) attached read-only under `catalog_name`.
 ///
 /// The catalog is built through the shared `sqe_catalog` backend
-/// constructor and wrapped in `iceberg-datafusion`'s read-only
-/// `IcebergCatalogProvider`, so `SELECT` works but writes do not (use
-/// the server for writes). Credentials come from the AWS provider
+/// constructor and mounted through `iceberg-datafusion`'s
+/// `IcebergCatalogProvider`, wrapped in `read_only_catalog::ReadOnlyCatalog` so `SELECT`
+/// works and every write is refused (use the server for writes); the
+/// provider alone would create, drop and insert into the real tables.
+/// Credentials come from the AWS provider
 /// chain (`AWS_PROFILE`, SSO, instance profile). Requires the `aws`
 /// cargo feature on `sqe-cli`; without it the backend constructor
 /// returns a clear "requires the ... cargo feature" error.
@@ -617,7 +619,10 @@ pub async fn build_embedded_context_with_backend(
     let provider = datafusion_iceberg::IcebergCatalogProvider::try_new(catalog)
         .await
         .map_err(|e| anyhow::anyhow!("failed to attach `{catalog_name}` catalog: {e}"))?;
-    ctx.register_catalog(catalog_name, Arc::new(provider));
+    ctx.register_catalog(
+        catalog_name,
+        crate::read_only_catalog::ReadOnlyCatalog::wrap(catalog_name, Arc::new(provider)),
+    );
     Ok(ctx)
 }
 
@@ -662,6 +667,11 @@ pub struct EmbeddedClient {
     /// operations), `None` for an OAuth2 attach: the view endpoints are
     /// called directly and need a bearer token to send.
     rest_catalogs: HashMap<String, Option<Arc<sqe_catalog::SessionCatalog>>>,
+    /// The `--catalog-backend glue|s3tables` catalog, mounted through
+    /// `read_only_catalog::ReadOnlyCatalog`. Held by name because the
+    /// context's `DynamicFileCatalog` wraps every catalog, so a downcast
+    /// cannot find the read-only wrapper.
+    read_only_catalog: Option<String>,
     /// The engine's object-store configuration, as resolved once from
     /// `--s3-*` flags and the environment. Held so a Hive root attached
     /// after start-up reads with the same endpoint and credentials the file
@@ -685,6 +695,7 @@ impl EmbeddedClient {
             hive_manifest_cache: Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
             hive_roots: HashMap::new(),
             rest_catalogs: HashMap::new(),
+            read_only_catalog: None,
             storage,
         })
     }
@@ -722,6 +733,7 @@ impl EmbeddedClient {
             hive_manifest_cache: Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
             hive_roots: HashMap::new(),
             rest_catalogs: HashMap::new(),
+            read_only_catalog: None,
             storage,
         };
         client.register_metadata_tvfs();
@@ -824,6 +836,7 @@ impl EmbeddedClient {
             hive_manifest_cache: Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
             hive_roots: HashMap::new(),
             rest_catalogs: HashMap::new(),
+            read_only_catalog: Some(catalog_name.to_string()),
             storage,
         })
     }
@@ -960,6 +973,7 @@ impl SqlClient for EmbeddedClient {
                 // work at all for a Hive table instead of always failing
                 // with the wrong reason.
                 sqe_sql::StatementKind::Drop(ref stmt) => {
+                    self.refuse_drop_on_read_only(stmt)?;
                     if let Some(result) = self.embedded_handle_drop_hive_table(stmt).await? {
                         return Ok(result);
                     }
@@ -973,6 +987,7 @@ impl SqlClient for EmbeddedClient {
                 // 806). Any other catalog falls through to `ctx.sql`.
                 sqe_sql::StatementKind::CreateSchema(ref stmt)
                 | sqe_sql::StatementKind::DropSchema(ref stmt) => {
+                    self.refuse_drop_on_read_only(stmt)?;
                     if let Some(result) = self.embedded_handle_iceberg_schema_ddl(stmt).await? {
                         return Ok(result);
                     }
@@ -984,6 +999,7 @@ impl SqlClient for EmbeddedClient {
                 // gets a real Iceberg view, any other is refused.
                 sqe_sql::StatementKind::CreateView(ref stmt)
                 | sqe_sql::StatementKind::DropView(ref stmt) => {
+                    self.refuse_drop_on_read_only(stmt)?;
                     if let Some(result) = self.embedded_handle_iceberg_view_ddl(stmt).await? {
                         return Ok(result);
                     }
@@ -1977,6 +1993,45 @@ impl EmbeddedClient {
             &self.storage,
         ));
         Some((catalog_name, catalog))
+    }
+
+    /// Refuse `DROP TABLE` / `DROP VIEW` / `DROP SCHEMA` on a read-only
+    /// backend catalog. Its schemas refuse `deregister_table`, but DataFusion
+    /// reports any error there as "Table '...' doesn't exist", which is
+    /// false, and `DynamicFileCatalog` answers `DROP SCHEMA` with "not
+    /// implemented" before the catalog sees it.
+    fn refuse_drop_on_read_only(
+        &self,
+        stmt: &datafusion::sql::sqlparser::ast::Statement,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use datafusion::sql::sqlparser::ast::{ObjectType, Statement};
+        let Statement::Drop {
+            object_type, names, ..
+        } = stmt
+        else {
+            return Ok(());
+        };
+        let catalog_parts = match object_type {
+            ObjectType::Table | ObjectType::View => 3,
+            ObjectType::Schema => 2,
+            _ => return Ok(()),
+        };
+        for name in names {
+            let catalog = match name.0.as_slice() {
+                [catalog, ..] if name.0.len() == catalog_parts => match catalog.as_ident() {
+                    Some(ident) => ident.value.clone(),
+                    None => continue,
+                },
+                _ => self.default_catalog(),
+            };
+            if self.read_only_catalog.as_deref() == Some(catalog.as_str()) {
+                return Err(format!(
+                    "catalog `{catalog}` is attached read-only; use the server for writes"
+                )
+                .into());
+            }
+        }
+        Ok(())
     }
 
     /// The catalog a one- to three-part name lands in, when that is one of
@@ -4127,5 +4182,72 @@ mod tests {
             !msg.contains("hive_external") && !msg.contains("Hive external table"),
             "an unrelated parse failure must not be reframed as a Hive diagnostic: {msg}"
         );
+    }
+
+    /// A `--catalog-backend glue|s3tables` catalog is shared with every other
+    /// engine, so embedded mode only reads it. Unwrapped, the datafusion-iceberg
+    /// provider turned `CREATE TABLE` / `CREATE VIEW` into new Glue tables,
+    /// `DROP TABLE` into a real drop and `INSERT` into a commit.
+    #[tokio::test]
+    async fn backend_catalog_refuses_every_write() {
+        use datafusion::catalog::{
+            CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider,
+        };
+        use datafusion::datasource::MemTable;
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow_array::Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+        let s = Arc::new(MemorySchemaProvider::new());
+        s.register_table(
+            "t".into(),
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()),
+        )
+        .unwrap();
+        let catalog = Arc::new(MemoryCatalogProvider::new());
+        catalog.register_schema("s", s).unwrap();
+
+        let mut c = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
+        c.ctx.register_catalog(
+            "glue",
+            crate::read_only_catalog::ReadOnlyCatalog::wrap("glue", catalog),
+        );
+        c.read_only_catalog = Some("glue".into());
+
+        for sql in [
+            "CREATE TABLE glue.s.x (id BIGINT)",
+            "CREATE TABLE glue.s.x AS SELECT 1 AS id",
+            "CREATE VIEW glue.s.v AS SELECT 1 AS id",
+            "DROP TABLE glue.s.t",
+            "DROP TABLE IF EXISTS glue.s.t",
+            "DROP VIEW IF EXISTS glue.s.t",
+            "INSERT INTO glue.s.t VALUES (2)",
+            "DELETE FROM glue.s.t",
+            "UPDATE glue.s.t SET id = 3",
+            "TRUNCATE TABLE glue.s.t",
+            "CREATE SCHEMA glue.y",
+            "DROP SCHEMA glue.s CASCADE",
+        ] {
+            let err = c.execute(sql).await.expect_err(sql);
+            assert!(
+                format!("{err}").contains("catalog `glue` is attached read-only"),
+                "{sql}: {err}"
+            );
+        }
+
+        let rows = c.execute("SELECT id FROM glue.s.t").await.expect("select");
+        assert_eq!(rows.rows, vec![vec!["1".to_string()]]);
+        let tables = c
+            .execute("SHOW TABLES IN glue.s")
+            .await
+            .expect("show tables");
+        assert_eq!(tables.rows.len(), 1, "{:?}", tables.rows);
     }
 }
