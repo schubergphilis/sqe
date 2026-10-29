@@ -357,3 +357,35 @@ fn embedded_warehouse_ctas_refuses_partitioning_it_would_drop() {
             "CREATE TABLE ... AS with PARTITIONED BY",
         ));
 }
+
+#[test]
+fn embedded_warehouse_partitioned_by_bare_columns() {
+    // `PARTITIONED BY (region, id)` parsed as a Hive partition column list,
+    // which the DDL handler never reads: the table came out unpartitioned
+    // with no error.
+    let wh = tempfile::tempdir().expect("tempdir");
+    let wh_path = wh.path().to_str().expect("utf-8 path");
+    let script = wh.path().join("parts.sql");
+    std::fs::write(
+        &script,
+        "CREATE SCHEMA iceberg.s;\n\
+         CREATE TABLE iceberg.s.t (id INT, region VARCHAR) PARTITIONED BY (region, id);\n\
+         INSERT INTO iceberg.s.t VALUES (1, 'eu'), (2, 'us');\n",
+    )
+    .expect("write script");
+    bin()
+        .args(["--embedded", "--warehouse", wh_path, "--file"])
+        .arg(&script)
+        .arg("--stop-on-error")
+        .timeout(std::time::Duration::from_secs(120))
+        .assert()
+        .success();
+
+    let t = latest_metadata(wh.path(), "s", "t");
+    let fields = &t["partition-specs"][0]["fields"];
+    assert_eq!(fields[0]["name"], "region", "{t}");
+    assert_eq!(fields[0]["transform"], "identity", "{t}");
+    assert_eq!(fields[1]["name"], "id", "{t}");
+    let eu = wh.path().join("iceberg/s/t/data/region=eu/id=1");
+    assert!(eu.is_dir(), "no partition directory {}", eu.display());
+}
