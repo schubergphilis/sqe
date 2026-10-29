@@ -9,7 +9,8 @@ Embedded mode is not the coordinator in a smaller box. It plans SQL with
 DataFusion directly, plus a set of SQE statements (ATTACH, secrets, schema
 DDL, CTAS, `SHOW TABLES IN`). `CREATE TABLE`, `ALTER TABLE`, `UPDATE`,
 `DELETE` and `MERGE` on an Iceberg catalog run on the cluster's own handlers.
-Table maintenance and time travel are not part of it yet. The
+Time travel reads Iceberg tables pinned to a snapshot, branch or tag.
+Table maintenance is not part of it yet. The
 [support table](#what-embedded-mode-supports) below lists what runs.
 
 Catalog choices:
@@ -162,9 +163,9 @@ Exporting results to plain files goes through `COPY ... TO`; see
 | `CREATE VIEW` in an Iceberg catalog | no | yes |
 | `SHOW TABLES [IN schema]`, `DESCRIBE` | yes | yes |
 | `SHOW CREATE TABLE` | yes | yes |
-| `FOR VERSION AS OF` / `FOR SYSTEM_TIME AS OF` | no | yes |
+| `FOR VERSION AS OF` / `FOR SYSTEM_TIME AS OF` | Iceberg tables | yes |
 | Metadata tables (`orders$snapshots`) | yes | yes |
-| `CREATE BRANCH` / `CREATE TAG`, `SET WRITE_BRANCH` | no | yes |
+| `CREATE BRANCH` / `CREATE TAG` | yes | yes |
 | `SET WRITE_BRANCH` | no | yes |
 | `CALL system.*` procedures | no | yes |
 | `ATTACH` / `DETACH`, `CREATE SECRET` | yes | yes |
