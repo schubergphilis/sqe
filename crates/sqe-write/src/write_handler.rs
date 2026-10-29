@@ -38,6 +38,34 @@ use crate::writer::{
 };
 use sqe_compaction::write_memory::{TrackedBatchBuffer, WriteReservation};
 
+/// Target table, explicit column list and OVERWRITE flag of an INSERT.
+fn insert_target(stmt: &Statement) -> sqe_core::Result<(&ObjectName, &[ObjectName], bool)> {
+    match stmt {
+        Statement::Insert(ins) => {
+            if ins.partitioned.is_some() {
+                return Err(SqeError::NotImplemented(
+                    "INSERT OVERWRITE with a static PARTITION (col=val) clause is not supported; \
+                     omit the PARTITION clause for dynamic partition overwrite"
+                        .into(),
+                ));
+            }
+            match &ins.table {
+                sqlparser::ast::TableObject::TableName(name) => {
+                    Ok((name, &ins.columns, ins.overwrite))
+                }
+                other => Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("INSERT INTO table functions not supported: {other}"),
+                )),
+            }
+        }
+        other => Err(SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!("Expected Insert statement, got: {other}"),
+        )),
+    }
+}
+
 /// Check an INSERT's projected columns against the target table's schema
 /// before execution starts (architecture review 505).
 ///
@@ -2415,32 +2443,41 @@ impl WriteHandler {
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
         policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let (table_name, explicit_columns, overwrite) = match stmt {
-            Statement::Insert(ins) => {
-                if ins.partitioned.is_some() {
-                    return Err(SqeError::NotImplemented(
-                        "INSERT OVERWRITE with a static PARTITION (col=val) clause is not supported; \
-                         omit the PARTITION clause for dynamic partition overwrite"
-                            .into(),
-                    ));
-                }
-                match &ins.table {
-                    sqlparser::ast::TableObject::TableName(name) => {
-                        (name, &ins.columns, ins.overwrite)
-                    }
-                    other => {
-                        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                            "INSERT INTO table functions not supported: {other}"
-                        )));
-                    }
-                }
-            }
-            other => {
-                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "Expected Insert statement, got: {other}"
-                )));
-            }
-        };
+        let (table_name, _, _) = insert_target(stmt)?;
+        let target_catalog = resolve_target_catalog(catalog_qualifier(table_name), session);
+        // Keep the resolved `SessionCatalog`, not only the erased bridge:
+        // `commit_written_files` needs it for the post-commit cache
+        // invalidation (507).
+        let session_catalog = self
+            .resolve_session_catalog(session, target_catalog.as_deref())
+            .await?;
+        self.handle_insert_streaming_on(
+            session,
+            stmt,
+            session_catalog,
+            ctx,
+            select_sql,
+            plan_out,
+            policy_summary_out,
+        )
+        .await
+    }
+
+    /// [`Self::handle_insert_streaming`] against a catalog the caller already
+    /// resolved. The embedded CLI holds its catalogs itself and has no
+    /// coordinator session layer to resolve them through.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn handle_insert_streaming_on(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        session_catalog: Arc<SessionCatalog>,
+        ctx: &DFSessionContext,
+        select_sql: &str,
+        plan_out: &mut Option<sqe_lineage::PlanOrHint>,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let (table_name, explicit_columns, overwrite) = insert_target(stmt)?;
 
         let table_ident = resolve_table_ident(table_name, session)?;
 
@@ -2452,12 +2489,6 @@ impl WriteHandler {
         );
 
         let target_catalog = resolve_target_catalog(catalog_qualifier(table_name), session);
-        // Keep the resolved `SessionCatalog`, not only the erased bridge:
-        // `commit_written_files` needs it for the post-commit cache
-        // invalidation (507).
-        let session_catalog = self
-            .resolve_session_catalog(session, target_catalog.as_deref())
-            .await?;
         session_catalog.admit_txn_write(&table_ident).await?;
         let catalog: Arc<dyn Catalog> = session_catalog.as_catalog();
         let table = catalog

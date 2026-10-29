@@ -51,6 +51,23 @@ pub fn convert_filters_to_predicate(filters: &[Expr]) -> Option<Predicate> {
         .reduce(Predicate::and)
 }
 
+/// SQE PATCH: [`convert_filters_to_predicate`], keeping only the predicates
+/// that bind to `schema`. iceberg-rust builds no accessor for a list or map
+/// column, so `tags IS NOT NULL` on an `ARRAY` column failed the whole scan
+/// with "Accessor for Field tags not found". The filters are pushed down
+/// `Inexact`, so DataFusion still applies a dropped one.
+pub(crate) fn convert_filters_to_bindable_predicate(
+    filters: &[Expr],
+    schema: &iceberg::spec::SchemaRef,
+) -> Option<Predicate> {
+    use iceberg::expr::Bind;
+    filters
+        .iter()
+        .filter_map(convert_filter_to_predicate)
+        .filter(|p| p.bind(schema.clone(), true).is_ok())
+        .reduce(Predicate::and)
+}
+
 fn convert_filter_to_predicate(expr: &Expr) -> Option<Predicate> {
     match to_iceberg_predicate(expr) {
         TransformedResult::Predicate(predicate) => Some(predicate),
