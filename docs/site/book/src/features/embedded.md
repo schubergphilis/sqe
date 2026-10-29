@@ -7,9 +7,9 @@ warehouse from a laptop, a CI job, or a script.
 
 Embedded mode is not the coordinator in a smaller box. It plans SQL with
 DataFusion directly, plus a set of SQE statements (ATTACH, secrets, schema
-DDL, CTAS, `SHOW TABLES IN`). `CREATE TABLE`, `UPDATE`, `DELETE` and `MERGE`
-on an Iceberg catalog run on the cluster's own handlers. `ALTER TABLE`, table
-maintenance and time travel are not part of it yet. The
+DDL, CTAS, `SHOW TABLES IN`). `CREATE TABLE`, `ALTER TABLE`, `UPDATE`,
+`DELETE` and `MERGE` on an Iceberg catalog run on the cluster's own handlers.
+Table maintenance and time travel are not part of it yet. The
 [support table](#what-embedded-mode-supports) below lists what runs.
 
 Catalog choices:
@@ -133,9 +133,15 @@ the table metadata. New tables are format version 3 unless an option picks
 because the CTAS path would drop them: create the table first, then
 `INSERT INTO ... SELECT`. `CREATE TABLE ... LIKE` runs on a coordinator only.
 
+`ALTER TABLE` runs on the cluster's DDL handler as well. Columns can be added,
+dropped, renamed and retyped, nested `STRUCT` fields included. `SET
+TBLPROPERTIES`, `ADD` / `DROP` / `REPLACE PARTITION FIELD`, `SET IDENTIFIER
+FIELDS`, `CREATE BRANCH` / `CREATE TAG` and `RENAME TO` each land as one
+Iceberg commit. A rename stays inside its catalog. `SET TAGS` and masking
+policies need a cluster, because embedded mode has no policy engine.
+
 Tables in the warehouse are valid Iceberg. Point a cluster deployment (or any
 other Iceberg reader) at the same catalog later and they come along unchanged.
-`ALTER TABLE`, branches and tags run there.
 Exporting results to plain files goes through `COPY ... TO`; see
 [Using the CLI](../getting-started/cli.md).
 
@@ -150,7 +156,8 @@ Exporting results to plain files goes through `COPY ... TO`; see
 | `CREATE TABLE ... AS` (CTAS) | yes, two commits | yes |
 | `INSERT INTO` | yes | yes |
 | `UPDATE`, `DELETE`, `MERGE INTO` | yes | yes |
-| `ALTER TABLE` | no | yes |
+| `ALTER TABLE` (columns, properties, partitions, rename) | yes | yes |
+| `ALTER TABLE ... SET TAGS`, masking policies | no | yes |
 | `DROP TABLE` | yes | yes |
 | `CREATE VIEW` in an Iceberg catalog | no | yes |
 | `SHOW TABLES [IN schema]`, `DESCRIBE` | yes | yes |
@@ -158,6 +165,7 @@ Exporting results to plain files goes through `COPY ... TO`; see
 | `FOR VERSION AS OF` / `FOR SYSTEM_TIME AS OF` | no | yes |
 | Metadata tables (`orders$snapshots`) | yes | yes |
 | `CREATE BRANCH` / `CREATE TAG`, `SET WRITE_BRANCH` | no | yes |
+| `SET WRITE_BRANCH` | no | yes |
 | `CALL system.*` procedures | no | yes |
 | `ATTACH` / `DETACH`, `CREATE SECRET` | yes | yes |
 
@@ -232,9 +240,9 @@ sqe-cli --embedded --file daily-report.sql --stop-on-error
 
 The embedded prompt shares the coordinator's SQL front door and function set:
 the same Trino-compat functions, the same file TVFs, the same Iceberg readers.
-Reads go to DataFusion's planner. `CREATE TABLE`, `INSERT`, CTAS, `UPDATE`,
-`DELETE` and `MERGE` on an Iceberg catalog go to the coordinator's write
-handlers. The statements marked "no" above are cluster-only.
+Reads go to DataFusion's planner. `CREATE TABLE`, `ALTER TABLE`, `INSERT`,
+CTAS, `UPDATE`, `DELETE` and `MERGE` on an Iceberg catalog go to the
+coordinator's write handlers. The statements marked "no" above are cluster-only.
 Beyond that:
 
 - **No auth.** No OIDC, no per-user identity, no policy enforcement. The

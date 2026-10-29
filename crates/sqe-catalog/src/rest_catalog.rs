@@ -3331,7 +3331,7 @@ impl SessionCatalog {
     }
 
     /// Guard for methods that talk to the REST catalog directly
-    /// (view DDL, raw `commit_schema_update`). These bypass the
+    /// (view DDL). These bypass the
     /// iceberg::Catalog trait, so they only function under
     /// `CatalogHandle::Rest`. Returns an error pointing at the
     /// backend mismatch rather than letting a downstream HTTP call
@@ -3592,7 +3592,19 @@ impl SessionCatalog {
         updates: Vec<TableUpdate>,
         requirements: Vec<TableRequirement>,
     ) -> sqe_core::Result<()> {
-        self.require_rest_backend("commit_schema_update")?;
+        // A non-REST backend (the embedded SQLite catalog) takes the same
+        // update list through `Catalog::update_table`, whose `apply` checks
+        // the requirements the REST server would check.
+        if let CatalogHandle::Other(catalog) = &self.inner {
+            let commit =
+                iceberg::TableCommit::from_parts(table_ident.clone(), requirements, updates);
+            catalog.update_table(commit).await.map_err(|e| {
+                SqeError::Catalog(format!("schema update for '{table_ident}': {e}"))
+            })?;
+            info!(table = %table_ident, "Schema update committed");
+            self.invalidate_table_all_tokens(table_ident).await;
+            return Ok(());
+        }
         let url = self.table_url(table_ident).await;
 
         let body = serde_json::json!({
@@ -5752,10 +5764,6 @@ mod other_backend_tests {
             session.list_views(&sales()).await.err(),
             session.load_view_sql(&sales(), "v").await.err(),
             session.drop_view(&sales(), "v").await.err(),
-            session
-                .commit_schema_update(&orders(), Vec::new(), Vec::new())
-                .await
-                .err(),
         ];
         for err in errors {
             let err = err.expect("REST-only operation must fail on an Other handle");
@@ -5764,6 +5772,21 @@ mod other_backend_tests {
             assert!(text.contains("Other"), "{text}");
         }
         assert!(backend.calls().is_empty());
+    }
+
+    /// A schema update on an `Other` handle goes through the trait's
+    /// `update_table` (the embedded SQLite catalog's ALTER TABLE path).
+    #[tokio::test]
+    async fn other_handle_commits_schema_update_through_update_table() {
+        let backend = Arc::new(RecordingCatalog::default());
+        let session = session_over(backend.clone(), TableMetadataCache::new(0));
+
+        session
+            .commit_schema_update(&orders(), Vec::new(), Vec::new())
+            .await
+            .unwrap();
+
+        assert_eq!(backend.calls(), ["update_table"]);
     }
 
     /// The `SessionCatalogBridge` forwards every namespace and table
