@@ -328,6 +328,95 @@ fn embedded_warehouse_insert_values_and_filter_on_array_column() {
 }
 
 #[test]
+fn embedded_warehouse_alter_table() {
+    // ALTER TABLE runs on the server's catalog DDL: columns, nested columns,
+    // properties, partition evolution, identifier fields, tags and a rename
+    // all reach the table metadata, and the table stays readable.
+    let wh = tempfile::tempdir().expect("tempdir");
+    let wh_path = wh.path().to_str().expect("utf-8 path");
+    let script = wh.path().join("alter.sql");
+    std::fs::write(
+        &script,
+        "CREATE SCHEMA iceberg.s;\n\
+         CREATE TABLE iceberg.s.t (id INT NOT NULL, v VARCHAR, info STRUCT<a: INT, b: INT>);\n\
+         INSERT INTO iceberg.s.t SELECT 1, 'a', named_struct('a', 1, 'b', 2);\n\
+         ALTER TABLE iceberg.s.t ADD COLUMN n BIGINT;\n\
+         ALTER TABLE iceberg.s.t RENAME COLUMN v TO label;\n\
+         ALTER TABLE iceberg.s.t ALTER COLUMN info.a SET DATA TYPE BIGINT;\n\
+         ALTER TABLE iceberg.s.t DROP COLUMN info.b;\n\
+         ALTER TABLE iceberg.s.t SET TBLPROPERTIES ('write.delete.mode' = 'merge-on-read');\n\
+         ALTER TABLE iceberg.s.t ADD PARTITION FIELD bucket(4, id);\n\
+         ALTER TABLE iceberg.s.t SET IDENTIFIER FIELDS id;\n\
+         ALTER TABLE iceberg.s.t CREATE TAG v1;\n\
+         ALTER TABLE iceberg.s.t RENAME TO t2;\n\
+         INSERT INTO iceberg.s.t2 SELECT 2, 'b', named_struct('a', CAST(5 AS BIGINT)), 7;\n",
+    )
+    .expect("write script");
+    bin()
+        .args(["--embedded", "--warehouse", wh_path, "--file"])
+        .arg(&script)
+        .arg("--stop-on-error")
+        .timeout(std::time::Duration::from_secs(120))
+        .assert()
+        .success();
+
+    let out = bin()
+        .args([
+            "--embedded",
+            "--warehouse",
+            wh_path,
+            "-e",
+            "SELECT string_agg(CAST(id AS VARCHAR) || ':' || label || ':' || \
+             CAST(info['a'] AS VARCHAR) || ':' || COALESCE(CAST(n AS VARCHAR), '-'), ',' \
+             ORDER BY id) AS r FROM iceberg.s.t2",
+        ])
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("1:a:1:-,2:b:5:7"),
+        "unexpected rows: {stdout}"
+    );
+
+    // The rename moves the catalog entry, not the files.
+    let meta = latest_metadata(wh.path(), "s", "t");
+    assert_eq!(
+        meta["properties"]["write.delete.mode"], "merge-on-read",
+        "{meta}"
+    );
+    assert!(meta["refs"]["v1"]["type"] == "tag", "{meta}");
+    // The `schemas` array is not ordered by id; pick the current one.
+    let schema = meta["schemas"]
+        .as_array()
+        .and_then(|s| {
+            s.iter()
+                .find(|s| s["schema-id"] == meta["current-schema-id"])
+        })
+        .expect("the current schema");
+    let names: Vec<&str> = schema["fields"]
+        .as_array()
+        .expect("fields")
+        .iter()
+        .filter_map(|f| f["name"].as_str())
+        .collect();
+    assert_eq!(names, ["id", "label", "info", "n"], "{schema}");
+    assert_eq!(
+        schema["identifier-field-ids"],
+        serde_json::json!([1]),
+        "{schema}"
+    );
+    let info = &schema["fields"][2]["type"]["fields"];
+    assert_eq!(info.as_array().map(Vec::len), Some(1), "{schema}");
+    assert_eq!(info[0]["type"], "long", "{schema}");
+    let spec = meta["partition-specs"]
+        .as_array()
+        .and_then(|s| s.iter().find(|s| s["spec-id"] == meta["default-spec-id"]))
+        .expect("the default spec");
+    assert_eq!(spec["fields"][0]["transform"], "bucket[4]", "{meta}");
+}
+
+#[test]
 fn embedded_warehouse_ctas_refuses_partitioning_it_would_drop() {
     let wh = tempfile::tempdir().expect("tempdir");
     let wh_path = wh.path().to_str().expect("utf-8 path");
