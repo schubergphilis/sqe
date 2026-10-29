@@ -6,8 +6,10 @@
 //! OVERWRITE, UPDATE, DELETE, MERGE), [`writer`] (Parquet data and position
 //! delete files), [`merge_sql`] and [`merge_target_provider`] (MERGE
 //! rewriting), [`puffin_carry`] (statistics carry-forward), [`hive_write`]
-//! (Hive external tables), plus the [`ident`] and [`commit`] helpers those
-//! share with the coordinator's maintenance code.
+//! (Hive external tables), [`catalog_ops`] (DROP, RENAME, ALTER and the
+//! other catalog DDL) with [`tag_source_impl`] (the `sqe.column-tags`
+//! property), plus the [`ident`] and [`commit`] helpers those share with the
+//! coordinator's maintenance code.
 //!
 //! It depends on the shared tier (sqe-core, sqe-catalog, sqe-policy,
 //! sqe-compaction, ...) but not on the coordinator. The coordinator reaches
@@ -16,6 +18,7 @@
 //! module here under its old `sqe_coordinator::` path, so downstream code
 //! compiles unchanged.
 
+pub mod catalog_ops;
 pub mod commit;
 pub mod hive_write;
 pub mod ident;
@@ -23,6 +26,7 @@ pub mod merge_sql;
 pub mod merge_target_provider;
 mod policy_view;
 pub mod puffin_carry;
+pub mod tag_source_impl;
 pub mod write_handler;
 pub mod writer;
 
