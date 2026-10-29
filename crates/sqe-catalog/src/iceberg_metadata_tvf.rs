@@ -14,6 +14,12 @@
 //! Each function is implemented as [`TableFunctionImpl`] — the same pattern
 //! as [`crate::read_parquet::ReadParquetFunction`].
 //!
+//! An optional third argument names the catalog: the `"t$snapshots"` rewrite
+//! turns `cat.ns."t$snapshots"` into `table_snapshots('ns', 't', 'cat')`. The
+//! coordinator builds the functions with `new` over the session's effective
+//! catalog and ignores the argument; embedded mode builds them with
+//! `with_catalog_resolver` and reads the named catalog.
+//!
 //! ## Authorization (#750)
 //!
 //! Two gates. `IcebergMetadataProvider::scan` calls
@@ -345,6 +351,53 @@ fn ident_for(namespace: &str, table_name: &str) -> TableIdent {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Catalog the target table is loaded from
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Picks the catalog a metadata TVF loads its target from, given the
+/// optional catalog name the `$snapshots` rewrite passes as a third argument
+/// (`cat.ns."t$snapshots"` -> `table_snapshots('ns', 't', 'cat')`).
+pub type MetadataCatalogResolver =
+    Arc<dyn Fn(Option<&str>) -> DFResult<Arc<SessionCatalog>> + Send + Sync>;
+
+#[derive(Clone)]
+enum CatalogSource {
+    /// One catalog for every call; a catalog argument is ignored. The
+    /// coordinator binds the session's effective catalog (#317).
+    Fixed(Arc<SessionCatalog>),
+    /// The catalog argument picks one (embedded mode, several catalogs).
+    Resolver(MetadataCatalogResolver),
+}
+
+impl std::fmt::Debug for CatalogSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fixed(_) => f.write_str("CatalogSource::Fixed"),
+            Self::Resolver(_) => f.write_str("CatalogSource::Resolver"),
+        }
+    }
+}
+
+impl CatalogSource {
+    /// The catalog and table a call names: `(namespace, table)` plus an
+    /// optional trailing catalog name.
+    fn target(&self, fn_name: &str, exprs: &[Expr]) -> DFResult<(Arc<SessionCatalog>, TableIdent)> {
+        let (table_args, catalog) = match exprs {
+            [ns, table, Expr::Literal(ScalarValue::Utf8(Some(c)) | ScalarValue::LargeUtf8(Some(c)), _)] => {
+                (vec![ns.clone(), table.clone()], Some(c.as_str()))
+            }
+            _ => (exprs.to_vec(), None),
+        };
+        let (namespace, table_name) = parse_two_string_args(fn_name, &table_args)?;
+        let catalog = match self {
+            Self::Fixed(catalog) => Arc::clone(catalog),
+            Self::Resolver(resolve) => resolve(catalog)?,
+        };
+        Ok((catalog, ident_for(&namespace, &table_name)))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Shared argument parsing
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -401,22 +454,31 @@ fn snapshots_schema() -> Arc<Schema> {
 /// Returns one row per Iceberg snapshot for the given table.
 #[derive(Debug)]
 pub struct TableSnapshotsFunction {
-    session_catalog: Arc<SessionCatalog>,
+    catalogs: CatalogSource,
 }
 
 impl TableSnapshotsFunction {
     pub fn new(session_catalog: Arc<SessionCatalog>) -> Self {
-        Self { session_catalog }
+        Self {
+            catalogs: CatalogSource::Fixed(session_catalog),
+        }
+    }
+
+    /// Load the target from the catalog `resolve` picks.
+    pub fn with_catalog_resolver(resolve: MetadataCatalogResolver) -> Self {
+        Self {
+            catalogs: CatalogSource::Resolver(resolve),
+        }
     }
 }
 
 impl TableFunctionImpl for TableSnapshotsFunction {
     fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
-        let (namespace, table_name) = parse_two_string_args("table_snapshots", exprs)?;
+        let (catalog, ident) = self.catalogs.target("table_snapshots", exprs)?;
         Ok(Arc::new(IcebergMetadataProvider {
             schema: snapshots_schema(),
-            catalog: Arc::clone(&self.session_catalog),
-            ident: ident_for(&namespace, &table_name),
+            catalog,
+            ident,
             kind: MetadataKind::Snapshots,
             policy: None,
         }))
@@ -516,22 +578,31 @@ fn manifests_schema() -> Arc<Schema> {
 /// If the table has no current snapshot the result is empty.
 #[derive(Debug)]
 pub struct TableManifestsFunction {
-    session_catalog: Arc<SessionCatalog>,
+    catalogs: CatalogSource,
 }
 
 impl TableManifestsFunction {
     pub fn new(session_catalog: Arc<SessionCatalog>) -> Self {
-        Self { session_catalog }
+        Self {
+            catalogs: CatalogSource::Fixed(session_catalog),
+        }
+    }
+
+    /// Load the target from the catalog `resolve` picks.
+    pub fn with_catalog_resolver(resolve: MetadataCatalogResolver) -> Self {
+        Self {
+            catalogs: CatalogSource::Resolver(resolve),
+        }
     }
 }
 
 impl TableFunctionImpl for TableManifestsFunction {
     fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
-        let (namespace, table_name) = parse_two_string_args("table_manifests", exprs)?;
+        let (catalog, ident) = self.catalogs.target("table_manifests", exprs)?;
         Ok(Arc::new(IcebergMetadataProvider {
             schema: manifests_schema(),
-            catalog: Arc::clone(&self.session_catalog),
-            ident: ident_for(&namespace, &table_name),
+            catalog,
+            ident,
             kind: MetadataKind::Manifests,
             policy: None,
         }))
@@ -639,22 +710,31 @@ fn history_schema() -> Arc<Schema> {
 /// `$history` metadata table.
 #[derive(Debug)]
 pub struct TableHistoryFunction {
-    session_catalog: Arc<SessionCatalog>,
+    catalogs: CatalogSource,
 }
 
 impl TableHistoryFunction {
     pub fn new(session_catalog: Arc<SessionCatalog>) -> Self {
-        Self { session_catalog }
+        Self {
+            catalogs: CatalogSource::Fixed(session_catalog),
+        }
+    }
+
+    /// Load the target from the catalog `resolve` picks.
+    pub fn with_catalog_resolver(resolve: MetadataCatalogResolver) -> Self {
+        Self {
+            catalogs: CatalogSource::Resolver(resolve),
+        }
     }
 }
 
 impl TableFunctionImpl for TableHistoryFunction {
     fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
-        let (namespace, table_name) = parse_two_string_args("table_history", exprs)?;
+        let (catalog, ident) = self.catalogs.target("table_history", exprs)?;
         Ok(Arc::new(IcebergMetadataProvider {
             schema: history_schema(),
-            catalog: Arc::clone(&self.session_catalog),
-            ident: ident_for(&namespace, &table_name),
+            catalog,
+            ident,
             kind: MetadataKind::History,
             policy: None,
         }))
@@ -745,14 +825,22 @@ fn files_schema() -> Arc<Schema> {
 /// statistics (sizes, value counts) are serialised as JSON strings.
 #[derive(Debug)]
 pub struct TableFilesFunction {
-    session_catalog: Arc<SessionCatalog>,
+    catalogs: CatalogSource,
     policy: Option<MetadataPolicy>,
 }
 
 impl TableFilesFunction {
     pub fn new(session_catalog: Arc<SessionCatalog>) -> Self {
         Self {
-            session_catalog,
+            catalogs: CatalogSource::Fixed(session_catalog),
+            policy: None,
+        }
+    }
+
+    /// Load the target from the catalog `resolve` picks.
+    pub fn with_catalog_resolver(resolve: MetadataCatalogResolver) -> Self {
+        Self {
+            catalogs: CatalogSource::Resolver(resolve),
             policy: None,
         }
     }
@@ -766,11 +854,11 @@ impl TableFilesFunction {
 
 impl TableFunctionImpl for TableFilesFunction {
     fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
-        let (namespace, table_name) = parse_two_string_args("table_files", exprs)?;
+        let (catalog, ident) = self.catalogs.target("table_files", exprs)?;
         Ok(Arc::new(IcebergMetadataProvider {
             schema: files_schema(),
-            catalog: Arc::clone(&self.session_catalog),
-            ident: ident_for(&namespace, &table_name),
+            catalog,
+            ident,
             kind: MetadataKind::Files,
             policy: self.policy.clone(),
         }))
@@ -1005,14 +1093,22 @@ fn partitions_schema() -> Arc<Schema> {
 /// aggregated record count, file count, and total size.
 #[derive(Debug)]
 pub struct TablePartitionsFunction {
-    session_catalog: Arc<SessionCatalog>,
+    catalogs: CatalogSource,
     policy: Option<MetadataPolicy>,
 }
 
 impl TablePartitionsFunction {
     pub fn new(session_catalog: Arc<SessionCatalog>) -> Self {
         Self {
-            session_catalog,
+            catalogs: CatalogSource::Fixed(session_catalog),
+            policy: None,
+        }
+    }
+
+    /// Load the target from the catalog `resolve` picks.
+    pub fn with_catalog_resolver(resolve: MetadataCatalogResolver) -> Self {
+        Self {
+            catalogs: CatalogSource::Resolver(resolve),
             policy: None,
         }
     }
@@ -1027,11 +1123,11 @@ impl TablePartitionsFunction {
 
 impl TableFunctionImpl for TablePartitionsFunction {
     fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
-        let (namespace, table_name) = parse_two_string_args("table_partitions", exprs)?;
+        let (catalog, ident) = self.catalogs.target("table_partitions", exprs)?;
         Ok(Arc::new(IcebergMetadataProvider {
             schema: partitions_schema(),
-            catalog: Arc::clone(&self.session_catalog),
-            ident: ident_for(&namespace, &table_name),
+            catalog,
+            ident,
             kind: MetadataKind::Partitions,
             policy: self.policy.clone(),
         }))
@@ -1149,22 +1245,31 @@ fn refs_schema() -> Arc<Schema> {
 /// At minimum the `main` branch is always reported when it exists.
 #[derive(Debug)]
 pub struct TableRefsFunction {
-    session_catalog: Arc<SessionCatalog>,
+    catalogs: CatalogSource,
 }
 
 impl TableRefsFunction {
     pub fn new(session_catalog: Arc<SessionCatalog>) -> Self {
-        Self { session_catalog }
+        Self {
+            catalogs: CatalogSource::Fixed(session_catalog),
+        }
+    }
+
+    /// Load the target from the catalog `resolve` picks.
+    pub fn with_catalog_resolver(resolve: MetadataCatalogResolver) -> Self {
+        Self {
+            catalogs: CatalogSource::Resolver(resolve),
+        }
     }
 }
 
 impl TableFunctionImpl for TableRefsFunction {
     fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
-        let (namespace, table_name) = parse_two_string_args("table_refs", exprs)?;
+        let (catalog, ident) = self.catalogs.target("table_refs", exprs)?;
         Ok(Arc::new(IcebergMetadataProvider {
             schema: refs_schema(),
-            catalog: Arc::clone(&self.session_catalog),
-            ident: ident_for(&namespace, &table_name),
+            catalog,
+            ident,
             kind: MetadataKind::Refs,
             policy: None,
         }))
@@ -1283,6 +1388,45 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("exactly 2 arguments"));
+    }
+
+    // ── CatalogSource ────────────────────────────────────────────────────────
+
+    /// A resolver that records the catalog name it was asked for and stops.
+    fn recording_source() -> (CatalogSource, Arc<std::sync::Mutex<Vec<Option<String>>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        let source = CatalogSource::Resolver(Arc::new(move |catalog: Option<&str>| {
+            record.lock().unwrap().push(catalog.map(str::to_string));
+            Err(DataFusionError::Plan("resolver reached".to_string()))
+        }));
+        (source, seen)
+    }
+
+    #[test]
+    fn third_argument_names_the_catalog() {
+        let (source, seen) = recording_source();
+        let exprs = vec![str_literal("ns"), str_literal("t"), str_literal("other")];
+        let err = source.target("table_snapshots", &exprs).unwrap_err();
+        assert!(err.to_string().contains("resolver reached"), "{err}");
+        assert_eq!(*seen.lock().unwrap(), [Some("other".to_string())]);
+    }
+
+    #[test]
+    fn two_arguments_ask_for_the_default_catalog() {
+        let (source, seen) = recording_source();
+        let exprs = vec![str_literal("ns"), str_literal("t")];
+        source.target("table_snapshots", &exprs).unwrap_err();
+        assert_eq!(*seen.lock().unwrap(), [None]);
+    }
+
+    #[test]
+    fn a_bad_table_argument_fails_before_the_resolver() {
+        let (source, seen) = recording_source();
+        let exprs = vec![str_literal("ns")];
+        let err = source.target("table_snapshots", &exprs).unwrap_err();
+        assert!(err.to_string().contains("exactly 2 arguments"), "{err}");
+        assert!(seen.lock().unwrap().is_empty());
     }
 
     // ── snapshots_schema ─────────────────────────────────────────────────────
