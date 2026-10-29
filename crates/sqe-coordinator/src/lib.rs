@@ -11,13 +11,11 @@
 pub(crate) mod adaptive_sort;
 pub(crate) mod audit_emitter;
 pub(crate) mod audit_resources;
-pub(crate) mod buffered_result;
 pub mod audit_tag_adapter;
-pub(crate) mod catalog_ops;
+pub(crate) mod buffered_result;
 pub mod channel_pool;
 pub(crate) mod compaction_dispatch;
 pub mod credential_refresh;
-pub(crate) mod ticket_credentials;
 pub(crate) mod dim_build_swap;
 pub(crate) mod distributed_scan;
 pub(crate) mod explain;
@@ -58,7 +56,7 @@ pub mod streaming;
 pub(crate) mod suggest_bloom;
 pub(crate) mod system_runtime;
 pub mod table_health;
-pub mod tag_source_impl;
+pub(crate) mod ticket_credentials;
 pub mod tls;
 pub mod transport;
 pub(crate) mod txn_registry;
@@ -70,10 +68,12 @@ pub mod worker_registry;
 /// `docs/internal/plans/2026-09-07-coordinator-crate-split.md`). Re-exported
 /// under the old module paths so `crate::write_handler::…` inside this crate
 /// and `sqe_coordinator::writer::…` in its integration tests compile
-/// unchanged; new code should import from `sqe_write` directly.
+/// unchanged; new code should import from `sqe_write` directly. `catalog_ops`
+/// and `tag_source_impl` followed on 2026-10-28 so the embedded CLI can run
+/// `ALTER TABLE` through the same code.
 pub use sqe_write::{
-    commit, hive_write, ident, merge_sql, merge_target_provider, puffin_carry, write_handler,
-    writer,
+    catalog_ops, commit, hive_write, ident, merge_sql, merge_target_provider, puffin_carry,
+    tag_source_impl, write_handler, writer,
 };
 
 /// In-process test rigs (architecture review 513), owned by `sqe-write` since

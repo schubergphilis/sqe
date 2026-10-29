@@ -2,7 +2,7 @@
 
 Data Definition Language: schemas, tables, views, columns, partitions, branches, tags. Most statements parse via `sqlparser-rs`; SQE adds branch / tag / partition-evolution syntax that `sqlparser-rs` does not natively understand.
 
-Source: `crates/sqe-sql/src/classifier.rs`, `crates/sqe-sql/src/ddl.rs`, `crates/sqe-sql/src/partition.rs`, `crates/sqe-sql/src/partition_evolution.rs`. Coordinator handlers in `crates/sqe-coordinator/src/catalog_ops.rs`.
+Source: `crates/sqe-sql/src/classifier.rs`, `crates/sqe-sql/src/ddl.rs`, `crates/sqe-sql/src/partition.rs`, `crates/sqe-sql/src/partition_evolution.rs`. Handlers in `crates/sqe-write/src/catalog_ops.rs`.
 
 ## Schema
 

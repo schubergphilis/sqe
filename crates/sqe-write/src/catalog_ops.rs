@@ -26,7 +26,7 @@ use crate::ident::{
 use crate::write_handler::{
     arrow_column_to_iceberg_type, default_to_iceberg_literal as alter_default_to_iceberg_literal,
     geospatial_iceberg_type, parse_partition_transform_sql, sql_type_to_arrow,
-    sql_type_to_arrow_for,
+    sql_type_to_arrow_for, CatalogDiscovery,
 };
 
 /// Per-table async lock used to serialize read-merge-commit sequences (see
@@ -53,6 +53,9 @@ pub struct CatalogOps {
     /// Projects column tags into Ranger's tag store so engines other than SQE can
     /// see them. `NoopTagProjector` unless `[policy.ranger] project-tags` is on.
     tag_projector: StdArc<dyn sqe_policy::tag_projector::TagProjector>,
+    /// The coordinator's Polaris discovery for a non-default catalog
+    /// qualifier, the same hook `WriteHandler` takes. `None` refuses one.
+    catalog_discovery: Option<Arc<dyn CatalogDiscovery>>,
 }
 
 impl CatalogOps {
@@ -63,7 +66,15 @@ impl CatalogOps {
             table_cache: None,
             table_locks: StdArc::new(std::sync::Mutex::new(HashMap::new())),
             tag_projector,
+            catalog_discovery: None,
         }
+    }
+
+    /// Resolve non-default catalog qualifiers through `discovery`.
+    #[must_use = "with_catalog_discovery consumes self; bind the returned ops"]
+    pub fn with_catalog_discovery(mut self, discovery: Arc<dyn CatalogDiscovery>) -> Self {
+        self.catalog_discovery = Some(discovery);
+        self
     }
 
     /// A Ranger tag projector when `project-tags` is on, otherwise a no-op.
@@ -166,15 +177,19 @@ impl CatalogOps {
                 names, if_exists, ..
             } => (names, *if_exists),
             other => {
-                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "Expected DROP TABLE statement, got: {other}"
-                )));
+                return Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Expected DROP TABLE statement, got: {other}"),
+                ));
             }
         };
 
         // DROP TABLE supports multiple names, but we handle one at a time
         let table_name = names.first().ok_or_else(|| {
-            SqeError::with_code(SqeErrorCode::ExecutionFailed, "DROP TABLE requires at least one table name".to_string())
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                "DROP TABLE requires at least one table name".to_string(),
+            )
         })?;
 
         let table_ident = resolve_table_ident(table_name, session)?;
@@ -286,9 +301,10 @@ impl CatalogOps {
                 ..
             } => (schema_name, *if_not_exists),
             other => {
-                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "Expected CREATE SCHEMA statement, got: {other}"
-                )));
+                return Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Expected CREATE SCHEMA statement, got: {other}"),
+                ));
             }
         };
 
@@ -357,14 +373,18 @@ impl CatalogOps {
                 ..
             } => (names, *if_exists),
             other => {
-                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "Expected DROP SCHEMA statement, got: {other}"
-                )));
+                return Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Expected DROP SCHEMA statement, got: {other}"),
+                ));
             }
         };
 
         let schema_name_obj = names.first().ok_or_else(|| {
-            SqeError::with_code(SqeErrorCode::ExecutionFailed, "DROP SCHEMA requires at least one schema name".to_string())
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                "DROP SCHEMA requires at least one schema name".to_string(),
+            )
         })?;
 
         let target_catalog =
@@ -404,9 +424,10 @@ impl CatalogOps {
         let (source_name, operations) = match stmt {
             Statement::AlterTable(at) => (&at.name, &at.operations),
             other => {
-                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "Expected ALTER TABLE statement, got: {other}"
-                )));
+                return Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Expected ALTER TABLE statement, got: {other}"),
+                ));
             }
         };
 
@@ -453,10 +474,13 @@ impl CatalogOps {
             .unwrap_or(self.config.catalog.warehouse.as_str());
         if let Some(dest_catalog) = catalog_qualifier(dest_obj_name) {
             if dest_catalog != src_catalog {
-                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "RENAME across catalogs is not supported: source catalog \
+                return Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!(
+                        "RENAME across catalogs is not supported: source catalog \
                      '{src_catalog}', destination catalog '{dest_catalog}'"
-                )));
+                    ),
+                ));
             }
         }
 
@@ -504,9 +528,10 @@ impl CatalogOps {
                 view_properties(cv, &session.user.username),
             ),
             other => {
-                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "Expected CREATE VIEW statement, got: {other}"
-                )));
+                return Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Expected CREATE VIEW statement, got: {other}"),
+                ));
             }
         };
 
@@ -553,14 +578,18 @@ impl CatalogOps {
                 ..
             } => (names, *if_exists),
             other => {
-                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "Expected DROP VIEW statement, got: {other}"
-                )));
+                return Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Expected DROP VIEW statement, got: {other}"),
+                ));
             }
         };
 
         let view_name = names.first().ok_or_else(|| {
-            SqeError::with_code(SqeErrorCode::ExecutionFailed, "DROP VIEW requires at least one view name".to_string())
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                "DROP VIEW requires at least one view name".to_string(),
+            )
         })?;
 
         let view_ident = resolve_table_ident(view_name, session)?;
@@ -606,9 +635,10 @@ impl CatalogOps {
         let (table_name, operations) = match stmt {
             Statement::AlterTable(at) => (&at.name, &at.operations),
             other => {
-                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "Expected ALTER TABLE statement, got: {other}"
-                )));
+                return Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Expected ALTER TABLE statement, got: {other}"),
+                ));
             }
         };
 
@@ -729,10 +759,13 @@ impl CatalogOps {
                     });
                     if let Some(expr) = default_expr {
                         let sql_literal = sqe_sql::extract_default_literal(expr).map_err(|e| {
-                            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                                "Invalid DEFAULT for column '{}': {e}",
-                                column_def.name.value
-                            ))
+                            SqeError::with_code(
+                                SqeErrorCode::ExecutionFailed,
+                                format!(
+                                    "Invalid DEFAULT for column '{}': {e}",
+                                    column_def.name.value
+                                ),
+                            )
                         })?;
                         match alter_default_to_iceberg_literal(&sql_literal, &iceberg_type) {
                             Ok(Some(lit)) => {
@@ -742,10 +775,13 @@ impl CatalogOps {
                             }
                             Ok(None) => {}
                             Err(msg) => {
-                                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                                    "DEFAULT literal for column '{}': {msg}",
-                                    column_def.name.value
-                                )));
+                                return Err(SqeError::with_code(
+                                    SqeErrorCode::ExecutionFailed,
+                                    format!(
+                                        "DEFAULT literal for column '{}': {msg}",
+                                        column_def.name.value
+                                    ),
+                                ));
                             }
                         }
                     }
@@ -774,9 +810,10 @@ impl CatalogOps {
                             }
                             None if *if_exists => {}
                             None => {
-                                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                                    "Column '{col}' not found in table '{table_ident}'"
-                                )));
+                                return Err(SqeError::with_code(
+                                    SqeErrorCode::ExecutionFailed,
+                                    format!("Column '{col}' not found in table '{table_ident}'"),
+                                ));
                             }
                         }
                     }
@@ -793,9 +830,10 @@ impl CatalogOps {
                         .iter()
                         .position(|f| f.name == old_name)
                         .ok_or_else(|| {
-                            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                                "Column '{old_name}' not found in table '{table_ident}'"
-                            ))
+                            SqeError::with_code(
+                                SqeErrorCode::ExecutionFailed,
+                                format!("Column '{old_name}' not found in table '{table_ident}'"),
+                            )
                         })?;
                     let old_field = &fields[pos];
                     let renamed = NestedField::new(
@@ -815,9 +853,10 @@ impl CatalogOps {
                     let col_folded = fold_unquoted_ident(column_name);
                     let col = col_folded.as_str();
                     let pos = fields.iter().position(|f| f.name == col).ok_or_else(|| {
-                        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                            "Column '{col}' not found in table '{table_ident}'"
-                        ))
+                        SqeError::with_code(
+                            SqeErrorCode::ExecutionFailed,
+                            format!("Column '{col}' not found in table '{table_ident}'"),
+                        )
                     })?;
                     let old_field = &fields[pos];
                     let new_field = match op {
@@ -891,7 +930,12 @@ impl CatalogOps {
             .with_fields(fields)
             .with_identifier_field_ids(current_schema.identifier_field_ids())
             .build()
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build new schema: {e}")))?;
+            .map_err(|e| {
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Failed to build new schema: {e}"),
+                )
+            })?;
 
         // Commit via SessionCatalog::commit_schema_update which makes a direct REST
         // POST call. We use this rather than TableCommit::builder().build() because
@@ -914,15 +958,19 @@ impl CatalogOps {
         // an untagged table adds no property write.
         let current_tags = crate::tag_source_impl::parse_column_tags(metadata.properties())
             .map_err(|e| {
-                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "malformed sqe.column-tags JSON on table '{table_ident}': {e}"
-                ))
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("malformed sqe.column-tags JSON on table '{table_ident}': {e}"),
+                )
             })?;
         let rewritten_tags =
             crate::tag_source_impl::rewrite_tag_keys(&current_tags, &tag_key_changes);
         if let Some(ref new_tags) = rewritten_tags {
             let json = serde_json::to_string(new_tags).map_err(|e| {
-                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("failed to serialize column tags: {e}"))
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("failed to serialize column tags: {e}"),
+                )
             })?;
             let mut tag_updates = HashMap::new();
             tag_updates.insert(crate::tag_source_impl::PROP_KEY.to_string(), json);
@@ -1047,16 +1095,18 @@ impl CatalogOps {
             if if_exists {
                 return Ok(());
             }
-            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                "Column '{top}' not found in table '{table_ident}'"
-            )));
+            return Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("Column '{top}' not found in table '{table_ident}'"),
+            ));
         };
 
         let field = &fields[idx];
         let Type::Struct(inner) = &*field.field_type else {
-            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                "Cannot drop '{dotted}': column '{top}' is not a struct"
-            )));
+            return Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("Cannot drop '{dotted}': column '{top}' is not a struct"),
+            ));
         };
         match remove_struct_subfield(inner, rest, if_exists)? {
             // Subfield removed: rebuild the struct column, keeping id/required.
@@ -1084,7 +1134,12 @@ impl CatalogOps {
             .with_fields(fields)
             .with_identifier_field_ids(current_schema.identifier_field_ids())
             .build()
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build new schema: {e}")))?;
+            .map_err(|e| {
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Failed to build new schema: {e}"),
+                )
+            })?;
 
         let updates = vec![
             TableUpdate::AddSchema { schema: new_schema },
@@ -1222,9 +1277,10 @@ impl CatalogOps {
         let (table_name, operations) = match stmt {
             Statement::AlterTable(at) => (&at.name, &at.operations),
             other => {
-                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "Expected ALTER TABLE statement, got: {other}"
-                )));
+                return Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Expected ALTER TABLE statement, got: {other}"),
+                ));
             }
         };
 
@@ -1349,9 +1405,10 @@ impl CatalogOps {
                 ..
             } => {
                 if existing.is_some() && !create_or_replace {
-                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                        "tag '{ref_name}' already exists (use CREATE OR REPLACE TAG)"
-                    )));
+                    return Err(SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!("tag '{ref_name}' already exists (use CREATE OR REPLACE TAG)"),
+                    ));
                 }
                 let snap_id = resolve_snapshot_id(&table, *snapshot_id)?;
                 vec![TableUpdate::SetSnapshotRef {
@@ -1374,23 +1431,26 @@ impl CatalogOps {
                         );
                         return Ok(());
                     }
-                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                        "reference '{ref_name}' does not exist"
-                    )));
+                    return Err(SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!("reference '{ref_name}' does not exist"),
+                    ));
                 }
                 // If a DropBranch targets a tag (or vice versa), report a helpful error
                 // so users don't silently clobber a reference of the wrong kind.
                 if let Some(existing) = existing {
                     match (ddl, &existing.retention) {
                         (RefDdl::DropBranch { .. }, SnapshotRetention::Tag { .. }) => {
-                            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                                "'{ref_name}' is a tag, not a branch; use DROP TAG"
-                            )));
+                            return Err(SqeError::with_code(
+                                SqeErrorCode::ExecutionFailed,
+                                format!("'{ref_name}' is a tag, not a branch; use DROP TAG"),
+                            ));
                         }
                         (RefDdl::DropTag { .. }, SnapshotRetention::Branch { .. }) => {
-                            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                                "'{ref_name}' is a branch, not a tag; use DROP BRANCH"
-                            )));
+                            return Err(SqeError::with_code(
+                                SqeErrorCode::ExecutionFailed,
+                                format!("'{ref_name}' is a branch, not a tag; use DROP BRANCH"),
+                            ));
                         }
                         _ => {}
                     }
@@ -1450,15 +1510,22 @@ impl CatalogOps {
         let table = session_catalog.load_table(&table_ident).await?;
         let current = crate::tag_source_impl::parse_column_tags(table.metadata().properties())
             .map_err(|e| {
-                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "malformed sqe.column-tags JSON on table '{table_ident}': {e}; \
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!(
+                        "malformed sqe.column-tags JSON on table '{table_ident}': {e}; \
                      refusing to apply SET/UNSET TAGS so existing tags are not wiped"
-                ))
+                    ),
+                )
             })?;
 
         let new_map = crate::tag_source_impl::apply_tag_ops(&current, &stmt.ops);
-        let json = serde_json::to_string(&new_map)
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("failed to serialize column tags: {e}")))?;
+        let json = serde_json::to_string(&new_map).map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("failed to serialize column tags: {e}"),
+            )
+        })?;
 
         let mut updates = HashMap::new();
         updates.insert(crate::tag_source_impl::PROP_KEY.to_string(), json);
@@ -1512,15 +1579,18 @@ impl CatalogOps {
                 // projection exists to close, and it would be invisible because the
                 // statement reported success.
                 let previous = serde_json::to_string(&current).map_err(|e| {
-                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                        "column tags were committed and the Ranger projection failed \
+                    SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!(
+                            "column tags were committed and the Ranger projection failed \
                          ({project_err}), and the previous tag map could not be \
                          serialized to roll back ({e}). The Iceberg property and the \
                          Ranger tag store are now inconsistent, so this table's tags \
                          apply in SQE but not in other engines. RE-RUN this statement \
                          once Ranger is reachable: the projection is idempotent and \
                          the property already carries the tag, so a repeat converges."
-                    ))
+                        ),
+                    )
                 })?;
                 let mut revert = HashMap::new();
                 revert.insert(crate::tag_source_impl::PROP_KEY.to_string(), previous);
@@ -1534,23 +1604,29 @@ impl CatalogOps {
                 {
                     Ok(_) => {
                         self.invalidate_table_all_tokens(&table_ident).await;
-                        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                            "could not project column tags into Ranger \
+                        return Err(SqeError::with_code(
+                            SqeErrorCode::ExecutionFailed,
+                            format!(
+                                "could not project column tags into Ranger \
                              ({project_err}); the tag change was rolled back and \
                              nothing was applied"
-                        )));
+                            ),
+                        ));
                     }
                     Err(revert_err) => {
                         self.invalidate_table_all_tokens(&table_ident).await;
-                        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                            "column tags were committed, the Ranger projection failed \
+                        return Err(SqeError::with_code(
+                            SqeErrorCode::ExecutionFailed,
+                            format!(
+                                "column tags were committed, the Ranger projection failed \
                              ({project_err}), and the rollback ALSO failed \
                              ({revert_err}). The Iceberg property and the Ranger tag \
                              store are now inconsistent, so this table's tags apply in \
                              SQE but not in other engines. RE-RUN this statement once \
                              Ranger is reachable: the projection is idempotent and the \
                              property already carries the tag, so a repeat converges."
-                        )));
+                            ),
+                        ));
                     }
                 }
             }
@@ -1582,9 +1658,10 @@ impl CatalogOps {
         let table = session_catalog.load_table(&table_ident).await?;
         let tags = crate::tag_source_impl::parse_column_tags(table.metadata().properties())
             .map_err(|e| {
-                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "malformed sqe.column-tags JSON on table '{table_ident}': {e}"
-                ))
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("malformed sqe.column-tags JSON on table '{table_ident}': {e}"),
+                )
             })?;
         Ok((table_ident, tags))
     }
@@ -1649,7 +1726,12 @@ impl CatalogOps {
                 std::sync::Arc::new(arrow_array::StringArray::from(messages)),
             ],
         )
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("reproject_column_tags summary: {e}")))?;
+        .map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("reproject_column_tags summary: {e}"),
+            )
+        })?;
         Ok(vec![batch])
     }
 
@@ -1807,10 +1889,13 @@ impl CatalogOps {
                 }
                 fields.remove(pos);
                 if fields.iter().any(|f| f.name == new_field.name) {
-                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                        "ALTER TABLE REPLACE PARTITION FIELD: target field '{}' already exists",
-                        new_field.name
-                    )));
+                    return Err(SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!(
+                            "ALTER TABLE REPLACE PARTITION FIELD: target field '{}' already exists",
+                            new_field.name
+                        ),
+                    ));
                 }
                 new_field.field_id = Some(next_field_id);
                 fields.push(new_field);
@@ -1845,7 +1930,10 @@ impl CatalogOps {
             .with_spec_id(new_spec_id)
             .add_partition_fields(fields)
             .map_err(|e| {
-                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Invalid partition spec after evolution: {e}"))
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Invalid partition spec after evolution: {e}"),
+                )
             })?
             .build();
 
@@ -2016,14 +2104,20 @@ impl CatalogOps {
                     && self.config.query.catalog_discovery
                         == sqe_core::config::CatalogDiscovery::PolarisAuto =>
             {
-                crate::session_context::discover_session_catalog(
-                    warehouse,
-                    &self.config,
-                    session,
-                    self.table_cache.as_ref(),
-                )
-                .await
-                .ok_or_else(|| {
+                let discovered = match &self.catalog_discovery {
+                    Some(discovery) => {
+                        discovery
+                            .discover_session_catalog(
+                                warehouse,
+                                &self.config,
+                                session,
+                                self.table_cache.as_ref(),
+                            )
+                            .await
+                    }
+                    None => None,
+                };
+                discovered.ok_or_else(|| {
                     SqeError::Catalog(format!(
                         "Unknown catalog '{warehouse}': not resolvable via Polaris \
                          (nonexistent or not authorized for this user)"
@@ -2112,6 +2206,11 @@ async fn reproject_loaded_tags(
     }
 }
 
+/// `NamespaceIdent` from a CALL reference's levels (`a.b` -> `["a", "b"]`).
+fn nested_namespace(parts: Vec<String>) -> NamespaceIdent {
+    NamespaceIdent::from_vec(parts).expect("a dotted name splits into at least one part")
+}
+
 fn table_ref_to_ident(table: &TableRef, session: &Session) -> TableIdent {
     let ns = match session.default_schema.as_deref() {
         Some(schema)
@@ -2119,7 +2218,7 @@ fn table_ref_to_ident(table: &TableRef, session: &Session) -> TableIdent {
         {
             NamespaceIdent::new(schema.to_string())
         }
-        _ => crate::maintenance::nested_namespace(table.namespace_parts()),
+        _ => nested_namespace(table.namespace_parts()),
     };
     TableIdent::new(ns, table.name.clone())
 }
@@ -2132,7 +2231,7 @@ async fn collect_reproject_targets(
     match scope {
         ReprojectScope::Table(table) => Ok(vec![table_ref_to_ident(table, session)]),
         ReprojectScope::Namespace(ns) => {
-            let ns_ident = crate::maintenance::nested_namespace(ns.namespace_parts());
+            let ns_ident = nested_namespace(ns.namespace_parts());
             session_catalog.list_tables(&ns_ident).await
         }
         ReprojectScope::Catalog(_) => {
@@ -2201,9 +2300,10 @@ fn remove_struct_subfield(
         }
         // Recurse into the nested struct.
         let Type::Struct(inner) = &*f.field_type else {
-            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                "Cannot drop nested column: '{head}' is not a struct"
-            )));
+            return Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("Cannot drop nested column: '{head}' is not a struct"),
+            ));
         };
         match remove_struct_subfield(inner, rest, if_exists)? {
             Some(new_inner) => new_fields.push(StdArc::new(NestedField::new(
@@ -2221,9 +2321,10 @@ fn remove_struct_subfield(
         if if_exists {
             return Ok(None);
         }
-        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-            "Nested field '{head}' not found"
-        )));
+        return Err(SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!("Nested field '{head}' not found"),
+        ));
     }
     Ok(Some(StructType::new(new_fields)))
 }
@@ -2386,9 +2487,10 @@ fn parse_namespace_from_object_name(name: &ObjectName) -> sqe_core::Result<Names
     match parts.len() {
         1 => Ok(NamespaceIdent::new(parts[0].clone())),
         2 => Ok(NamespaceIdent::new(parts[1].clone())),
-        n => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-            "Invalid schema reference with {n} parts: {name}"
-        ))),
+        n => Err(SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!("Invalid schema reference with {n} parts: {name}"),
+        )),
     }
 }
 
@@ -2412,9 +2514,10 @@ fn resolve_snapshot_id(table: &iceberg::table::Table, given: Option<i64>) -> sqe
             if table.metadata().snapshot_by_id(id).is_none()
                 || sqe_catalog::txn::txn_private_snapshots(table.metadata()).contains(&id)
             {
-                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "snapshot id {id} not found in table history"
-                )));
+                return Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("snapshot id {id} not found in table history"),
+                ));
             }
             Ok(id)
         }
@@ -2441,9 +2544,10 @@ fn parse_object_name(s: &str) -> sqe_core::Result<ObjectName> {
         .map(|p| sqlparser::ast::Ident::new(p.trim_matches('"')))
         .collect();
     if idents.is_empty() {
-        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-            "invalid table reference: '{s}'"
-        )));
+        return Err(SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!("invalid table reference: '{s}'"),
+        ));
     }
     Ok(ObjectName::from(idents))
 }
@@ -2480,7 +2584,7 @@ fn is_table_not_found(err: &iceberg::Error) -> bool {
 /// on a missing-namespace state table can surface as an error on some
 /// catalog backends rather than a clean `Ok(false)`, and that case is
 /// "state table absent" too (see maintenance_log.rs's best-effort skip).
-pub(crate) fn is_namespace_not_found(err: &iceberg::Error) -> bool {
+pub fn is_namespace_not_found(err: &iceberg::Error) -> bool {
     is_namespace_not_found_msg(&err.to_string().to_lowercase())
 }
 
@@ -2793,7 +2897,10 @@ mod tests {
             tags: &sqe_policy::tag_projector::ColumnTags,
         ) -> sqe_core::Result<()> {
             if self.fail {
-                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, "ranger down"));
+                return Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    "ranger down",
+                ));
             }
             self.calls.lock().unwrap().push((
                 table.database.clone(),
