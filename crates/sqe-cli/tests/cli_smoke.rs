@@ -532,3 +532,76 @@ fn embedded_warehouse_metadata_tables() {
         .failure()
         .stderr(predicate::str::contains("'nope' is not an Iceberg catalog"));
 }
+
+/// The DDL `SHOW CREATE TABLE` prints for `table`, read from the JSON output.
+fn show_create(wh_path: &str, table: &str) -> String {
+    let out = bin()
+        .args(["--embedded", "--warehouse", wh_path, "-f", "json", "-e"])
+        .arg(format!("SHOW CREATE TABLE {table}"))
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    let row: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json row");
+    row["Create Table"]
+        .as_str()
+        .expect("Create Table")
+        .to_string()
+}
+
+#[test]
+fn embedded_warehouse_show_create_table_round_trips() {
+    // SHOW CREATE TABLE on an Iceberg table prints the columns, partition
+    // spec and properties as the server does, and the printed DDL creates
+    // the same table again.
+    let wh = tempfile::tempdir().expect("tempdir");
+    let wh_path = wh.path().to_str().expect("utf-8 path");
+    let script = wh.path().join("ddl.sql");
+    std::fs::write(
+        &script,
+        "CREATE SCHEMA iceberg.s;\n\
+         CREATE TABLE iceberg.s.t (id INT NOT NULL, \"Name\" VARCHAR, ts TIMESTAMP(6), \
+         amt DECIMAL(10,2)) PARTITIONED BY (day(ts), bucket(4, id)) \
+         TBLPROPERTIES ('write.format.default' = 'parquet');\n",
+    )
+    .expect("write script");
+    bin()
+        .args([
+            "--embedded",
+            "--warehouse",
+            wh_path,
+            "--stop-on-error",
+            "--file",
+        ])
+        .arg(&script)
+        .timeout(std::time::Duration::from_secs(120))
+        .assert()
+        .success();
+
+    let ddl = show_create(wh_path, "iceberg.s.t");
+    assert_eq!(
+        ddl,
+        "CREATE TABLE iceberg.s.t (\n   id integer NOT NULL,\n   \"Name\" varchar,\n   \
+         ts timestamp(6),\n   amt decimal(10,2)\n)\n\
+         PARTITIONED BY (day(ts), bucket(4, id))\n\
+         TBLPROPERTIES (\n   'format-version' = '3',\n   'write.format.default' = 'parquet'\n)"
+    );
+
+    let copy = ddl.replacen("iceberg.s.t ", "iceberg.s.t2 ", 1);
+    bin()
+        .args(["--embedded", "--warehouse", wh_path, "-e"])
+        .arg(&copy)
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .success();
+    assert_eq!(show_create(wh_path, "iceberg.s.t2"), copy);
+
+    bin()
+        .args(["--embedded", "--warehouse", wh_path, "-e"])
+        .arg("SHOW CREATE TABLE iceberg.s.nope")
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("table not found: iceberg.s.nope"));
+
+}

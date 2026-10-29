@@ -5733,14 +5733,7 @@ impl QueryHandler {
             .await;
         let batches = single_table_columns(ctx, &table_name).await?;
 
-        // Reconstruct CREATE TABLE DDL
-        // Names are quoted where an unquoted one would not come back the
-        // same: a reserved word, an uppercase letter, a space.
-        let mut ddl = format!(
-            "CREATE TABLE {} (\n",
-            sqe_sql::quote_qualified_if_needed(&split_qualified_identifier(&table_name), '"')
-        );
-        let mut first = true;
+        let mut columns = Vec::new();
         for batch in &batches {
             let names = batch
                 .column(0)
@@ -5756,39 +5749,37 @@ impl QueryHandler {
                 .column(2)
                 .as_any()
                 .downcast_ref::<ArrowStringArray>()
-                .ok_or_else(|| SqeError::with_code(SqeErrorCode::ExecutionFailed, "Unexpected is_nullable type".to_string()))?;
+                .ok_or_else(|| {
+                    SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        "Unexpected is_nullable type".to_string(),
+                    )
+                })?;
 
             for i in 0..batch.num_rows() {
-                if !first {
-                    ddl.push_str(",\n");
-                }
-                first = false;
-                let col_name = sqe_sql::quote_ident_if_needed(names.value(i), '"');
-                // The Arrow display string, as the Trino type CREATE TABLE
-                // takes back: `integer`, `timestamp(9)`, `variant` (#849).
-                let col_type =
-                    sqe_trino_compat::info_schema_compat::arrow_display_to_ddl_type(types.value(i));
-                let nullable = nullables.value(i);
-                ddl.push_str(&format!("   {col_name} {col_type}"));
-                if nullable == "NO" {
-                    ddl.push_str(" NOT NULL");
-                }
+                columns.push(sqe_catalog::show_create::DdlColumn {
+                    name: names.value(i).to_string(),
+                    // The Arrow display string, as the Trino type CREATE
+                    // TABLE takes back: `integer`, `timestamp(9)`, `variant`
+                    // (#849).
+                    ddl_type: sqe_trino_compat::info_schema_compat::arrow_display_to_ddl_type(
+                        types.value(i),
+                    ),
+                    nullable: nullables.value(i) != "NO",
+                });
             }
         }
         // No columns: the table does not exist or is not visible. Say so,
         // as the Hive path does, rather than print an empty CREATE TABLE.
-        if first {
+        if columns.is_empty() {
             return Err(SqeError::with_code(
                 SqeErrorCode::TableNotFound,
                 format!("table not found: {table_name}"),
             ));
         }
-        ddl.push_str("\n)");
 
-        // Append TBLPROPERTIES (k = 'v', ...) for any user-set properties.
-        // The Iceberg metadata exposes the property map; we filter out the
-        // reserved keys that Iceberg manages internally so the round-trip
-        // matches what the user actually set in CREATE TABLE.
+        // The partitioning, sort order and user-set properties come from the
+        // Iceberg metadata.
         // Resolved as every other statement resolves a name: quotes stripped,
         // a bare name in the session schema. The table loads from the catalog
         // the name resolves in (its qualifier, else the session default):
@@ -5802,68 +5793,11 @@ impl QueryHandler {
             Ok(props_catalog) => props_catalog.load_table(&table_ident).await.ok(),
             Err(_) => None,
         };
-        if let Some(table) = props_table {
-            if let Some(partitioned_by) = render_partitioned_by(table.metadata()) {
-                ddl.push_str(&partitioned_by);
-            }
-            if let Some(sort_order) = render_sort_order(table.metadata()) {
-                ddl.push_str(&sort_order);
-            }
-            let props = table.metadata().properties();
-            // Iceberg-internal property keys we never want to surface, and
-            // keys the catalog owns: storage paths bound to this table's
-            // location, and the retention, layout and identity settings a
-            // managed catalog (Unity Catalog) stamps on every table. Copied
-            // into a new table they would point it at this table's files.
-            const SUPPRESSED_PREFIXES: &[&str] = &[
-                "current-",
-                "snapshot-count",
-                "last-",
-                "uuid",
-                "format-version",
-                "default-",
-                "owner",
-                "write.data.path",
-                "write.metadata.path",
-                "write.object-storage.",
-                "gc.",
-                "history.expire.",
-                "databricks.",
-                "io.unitycatalog.",
-            ];
-            let mut user_props: Vec<(String, String)> = props
-                .iter()
-                .filter(|(k, _)| !SUPPRESSED_PREFIXES.iter().any(|pre| k.starts_with(pre)))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            // The version is metadata, not a property; CREATE TABLE reads it
-            // back through this key. Always printed: the server's default
-            // version is configurable, so leaving it out could re-create a
-            // v2 table as v3, or a v3 one as v2.
-            let version = match table.metadata().format_version() {
-                iceberg::spec::FormatVersion::V1 => "1",
-                iceberg::spec::FormatVersion::V2 => "2",
-                iceberg::spec::FormatVersion::V3 => "3",
-            };
-            user_props.push(("format-version".to_string(), version.to_string()));
-            user_props.sort_by(|a, b| a.0.cmp(&b.0));
-            if !user_props.is_empty() {
-                ddl.push_str("\nTBLPROPERTIES (\n");
-                let last = user_props.len() - 1;
-                for (i, (k, v)) in user_props.iter().enumerate() {
-                    ddl.push_str(&format!(
-                        "   '{}' = '{}'",
-                        k.replace('\'', "''"),
-                        v.replace('\'', "''")
-                    ));
-                    if i != last {
-                        ddl.push(',');
-                    }
-                    ddl.push('\n');
-                }
-                ddl.push(')');
-            }
-        }
+        let ddl = sqe_catalog::show_create::render_create_table(
+            &split_qualified_identifier(&table_name),
+            &columns,
+            props_table.as_ref().map(|t| t.metadata()),
+        );
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "Create Table",
@@ -8967,75 +8901,6 @@ fn parse_timestamp_str(s: &str) -> sqe_core::Result<i64> {
     ))
 }
 
-/// `PARTITIONED BY (...)` for the table's default partition spec, in the
-/// transform syntax CREATE TABLE takes back (`region`, `month(ts)`,
-/// `bucket(16, id)`). `None` for an unpartitioned table. A field whose
-/// source column or transform SQE cannot name drops the whole clause:
-/// a partial spec would round-trip as a different table.
-fn render_partitioned_by(metadata: &iceberg::spec::TableMetadata) -> Option<String> {
-    use iceberg::spec::Transform;
-    let spec = metadata.default_partition_spec();
-    if spec.fields().is_empty() {
-        return None;
-    }
-    let schema = metadata.current_schema();
-    let mut parts = Vec::with_capacity(spec.fields().len());
-    for field in spec.fields() {
-        let col = sqe_sql::quote_ident_if_needed(schema.name_by_field_id(field.source_id)?, '"');
-        parts.push(match field.transform {
-            Transform::Identity => col,
-            Transform::Year => format!("year({col})"),
-            Transform::Month => format!("month({col})"),
-            Transform::Day => format!("day({col})"),
-            Transform::Hour => format!("hour({col})"),
-            Transform::Bucket(n) => format!("bucket({n}, {col})"),
-            Transform::Truncate(w) => format!("truncate({w}, {col})"),
-            Transform::Void => format!("void({col})"),
-            Transform::Unknown => return None,
-        });
-    }
-    Some(format!("\nPARTITIONED BY ({})", parts.join(", ")))
-}
-
-/// The table's default sort order as an SQL comment line
-/// (`-- sort order: region ASC NULLS FIRST, bucket(16, id) DESC NULLS LAST`).
-/// SQE's CREATE TABLE has no clause that sets a sort order, so a comment
-/// shows it and the DDL still reads back. `None` when the table is unsorted.
-fn render_sort_order(metadata: &iceberg::spec::TableMetadata) -> Option<String> {
-    use iceberg::spec::{NullOrder, SortDirection, Transform};
-    let order = metadata.default_sort_order();
-    if order.is_unsorted() {
-        return None;
-    }
-    let schema = metadata.current_schema();
-    let fields: Vec<String> = order
-        .fields
-        .iter()
-        .map(|f| {
-            let col = schema
-                .name_by_field_id(f.source_id)
-                .map(|n| sqe_sql::quote_ident_if_needed(n, '"'))
-                .unwrap_or_else(|| format!("<field {}>", f.source_id));
-            let expr = match f.transform {
-                Transform::Identity => col,
-                Transform::Bucket(n) => format!("bucket({n}, {col})"),
-                Transform::Truncate(w) => format!("truncate({w}, {col})"),
-                other => format!("{other}({col})"),
-            };
-            let dir = match f.direction {
-                SortDirection::Ascending => "ASC",
-                SortDirection::Descending => "DESC",
-            };
-            let nulls = match f.null_order {
-                NullOrder::First => "NULLS FIRST",
-                NullOrder::Last => "NULLS LAST",
-            };
-            format!("{expr} {dir} {nulls}")
-        })
-        .collect();
-    Some(format!("\n-- sort order: {}", fields.join(", ")))
-}
-
 /// Find the latest Iceberg snapshot with `timestamp_ms <= target_ms`.
 ///
 /// Returns an error when the table has no snapshot at or before the given timestamp.
@@ -11155,6 +11020,7 @@ mod show_stats_policy_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqe_catalog::show_create::{render_partitioned_by, render_sort_order};
     use sqe_core::config::QueryConfig;
     use sqe_core::session::Session;
 
