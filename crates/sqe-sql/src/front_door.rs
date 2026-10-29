@@ -142,6 +142,17 @@ impl SqlFrontDoor {
                 } else {
                     sql.to_string()
                 };
+                // Bare `PARTITIONED BY (id)` parses too, as a Hive partition
+                // column list the DDL handler never reads, so the table came
+                // out unpartitioned. Rewrite it to `PARTITION BY` as the
+                // Flight path's `pre_parse_pipeline` does for every
+                // statement. `CREATE EXTERNAL TABLE` is left alone.
+                let rewritten = if matches!(statements[0], Statement::CreateTable(_)) {
+                    let rewritten = crate::partition::normalize_partitioned_by(&rewritten);
+                    crate::partition::reorder_create_table_clauses(&rewritten)
+                } else {
+                    rewritten
+                };
                 if rewritten == sql {
                     (statements, rewritten, false)
                 } else {
@@ -290,6 +301,7 @@ pub fn classify_normalized(normalized: NormalizedSql) -> sqe_core::Result<Statem
 mod tests {
     use super::*;
     use sqe_core::SqeErrorCode;
+    use sqlparser::ast::HiveDistributionStyle;
 
     const DIALECTS: [WireDialect; 3] = [
         WireDialect::Trino,
@@ -370,6 +382,44 @@ mod tests {
             };
             assert!(ct.partition_by.is_some(), "{sql}");
         }
+    }
+
+    #[test]
+    fn bare_column_partitioned_by_becomes_partition_by() {
+        // `PARTITIONED BY (id)` already parses, as a Hive partition column
+        // list, so the parse-failure fallbacks never rewrote it.
+        for d in DIALECTS {
+            let door = SqlFrontDoor::new(d);
+            for sql in [
+                "CREATE TABLE c.s.t (id INT, v VARCHAR) PARTITIONED BY (id)",
+                "CREATE TABLE c.s.t (id INT, v VARCHAR) PARTITIONED BY (v, id)",
+            ] {
+                let n = door.normalize(sql).unwrap();
+                let Some(Statement::CreateTable(ct)) = n.statement() else {
+                    panic!("{sql}: not a CREATE TABLE");
+                };
+                assert!(ct.partition_by.is_some(), "{d:?} {sql}");
+                assert!(
+                    matches!(ct.hive_distribution, HiveDistributionStyle::NONE),
+                    "{d:?} {sql}"
+                );
+            }
+        }
+        // External tables keep the Hive column list.
+        let n = SqlFrontDoor::new(WireDialect::Embedded)
+            .normalize(
+                "CREATE EXTERNAL TABLE s.t (id INT) PARTITIONED BY (dt STRING) \
+                 STORED AS PARQUET LOCATION '/tmp/t'",
+            )
+            .unwrap();
+        let Some(Statement::CreateTable(ct)) = n.statement() else {
+            panic!("not a CREATE TABLE");
+        };
+        assert!(ct.partition_by.is_none());
+        assert!(matches!(
+            ct.hive_distribution,
+            HiveDistributionStyle::PARTITIONED { .. }
+        ));
     }
 
     #[test]
