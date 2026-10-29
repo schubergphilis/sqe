@@ -430,6 +430,143 @@ fn parse_integer_token(input: &str) -> Result<(i64, usize)> {
     Ok((id, leading_ws + end))
 }
 
+/// Replace every whole-token, case-insensitive occurrence of the table
+/// reference `needle` in `sql` with `replacement`. The callers swap the
+/// table a stripped time-travel or incremental clause named for the alias
+/// its pinned provider is registered under. A match inside a longer
+/// identifier (`t` in `t2` or `s.t.id`) is left alone.
+pub fn replace_table_reference(sql: &str, needle: &str, replacement: &str) -> String {
+    if needle.is_empty() {
+        return sql.to_string();
+    }
+    let sql_upper = sql.to_uppercase();
+    let needle_upper = needle.to_uppercase();
+    let mut out = String::with_capacity(sql.len());
+    let mut cursor = 0usize;
+    while let Some(pos) = sql_upper[cursor..].find(needle_upper.as_str()) {
+        let abs = cursor + pos;
+        // Verify word boundary. The character preceding `abs` must not be an
+        // identifier character, and the character after `abs + needle.len()`
+        // must also not be an identifier character (letter, digit, `_`, `.`).
+        let pre_ok = abs == 0 || !is_ident_char(sql.as_bytes()[abs - 1]);
+        let end = abs + needle.len();
+        let post_ok = end == sql.len() || !is_ident_char(sql.as_bytes()[end]);
+        if pre_ok && post_ok {
+            out.push_str(&sql[cursor..abs]);
+            out.push_str(replacement);
+            cursor = end;
+        } else {
+            // Advance by one byte past the start of this match so we can keep
+            // searching for later occurrences.
+            out.push_str(&sql[cursor..=abs]);
+            cursor = abs + 1;
+        }
+    }
+    out.push_str(&sql[cursor..]);
+    out
+}
+
+fn is_ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'.'
+}
+
+/// Epoch milliseconds for the raw argument of a `FOR TIMESTAMP AS OF` /
+/// `FOR SYSTEM_TIME AS OF` clause ([`VersionRef::Timestamp`]): a
+/// `TIMESTAMP '...'` literal, a quoted string or epoch millis.
+pub fn time_travel_millis(raw: &str) -> Result<i64> {
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+    let expr = Parser::new(&GenericDialect {})
+        .try_with_sql(raw)
+        .and_then(|mut p| p.parse_expr())
+        .map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("FOR TIMESTAMP AS OF: cannot parse timestamp '{raw}': {e}"),
+            )
+        })?;
+    resolve_timestamp_expr(&expr)
+}
+
+/// Resolve a SQL timestamp expression to epoch milliseconds.
+///
+/// Supports:
+/// - `TIMESTAMP '2026-01-01 00:00:00'` (TypedString)
+/// - `'2026-01-01'` (bare string literal)
+/// - `CAST('...' AS TIMESTAMP)` (Cast)
+/// - Raw integer literals (treated as epoch ms directly)
+pub fn resolve_timestamp_expr(expr: &sqlparser::ast::Expr) -> Result<i64> {
+    use sqlparser::ast::{Expr, Value, ValueWithSpan};
+
+    match expr {
+        // sqlparser 0.62: TypedString is a tuple variant whose `value` is a
+        // ValueWithSpan; pull the string out (non-string typed literals are
+        // rejected by the catch-all arm below).
+        Expr::TypedString(ts) => match ts.value.clone().into_string() {
+            Some(s) => parse_timestamp_str(&s),
+            None => Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!(
+                    "Unsupported time travel expression: {expr}. \
+                     Use TIMESTAMP '2026-01-01 00:00:00' or epoch milliseconds."
+                ),
+            )),
+        },
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
+            ..
+        }) => parse_timestamp_str(s),
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(n, _),
+            ..
+        }) => n.parse::<i64>().map_err(|_| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("Cannot parse time travel integer expression: {n}"),
+            )
+        }),
+        Expr::Cast { expr: inner, .. } => resolve_timestamp_expr(inner),
+        other => Err(SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!(
+                "Unsupported time travel expression: {other}. \
+                 Use TIMESTAMP '2026-01-01 00:00:00' or epoch milliseconds."
+            ),
+        )),
+    }
+}
+
+/// Parse a timestamp string into epoch milliseconds.
+///
+/// Tries common formats: `YYYY-MM-DD HH:MM:SS`, `YYYY-MM-DDTHH:MM:SS`, `YYYY-MM-DD`.
+fn parse_timestamp_str(s: &str) -> Result<i64> {
+    // Try as raw epoch milliseconds
+    if let Ok(n) = s.parse::<i64>() {
+        return Ok(n);
+    }
+    // Try ISO datetime with space separator
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Ok(dt.and_utc().timestamp_millis());
+    }
+    // Try ISO datetime with T separator
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+        return Ok(dt.and_utc().timestamp_millis());
+    }
+    // Try date-only (midnight)
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        if let Some(dt) = d.and_hms_opt(0, 0, 0) {
+            return Ok(dt.and_utc().timestamp_millis());
+        }
+    }
+    Err(SqeError::with_code(
+        SqeErrorCode::ExecutionFailed,
+        format!(
+            "Cannot parse time travel timestamp '{s}'. \
+             Use format 'YYYY-MM-DD HH:MM:SS', 'YYYY-MM-DD', or epoch milliseconds."
+        ),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

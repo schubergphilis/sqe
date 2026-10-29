@@ -17,6 +17,7 @@ use futures::TryStreamExt;
 use tracing::Instrument;
 use tracing::{debug, info, warn, Span};
 
+use sqe_catalog::time_travel::find_snapshot_at_timestamp;
 use sqe_catalog::{IcebergScanExec, SessionCatalog};
 use sqe_core::{QueryConfig, SecretStore, Session, SqeConfig, SqeError, SqeErrorCode};
 use sqlparser::ast::{Statement, TableFactor};
@@ -26,7 +27,7 @@ use sqe_policy::grants::{
     AccessCheck, GrantBackend, GrantFilter, GrantStatement, Grantee, RevokeStatement,
 };
 use sqe_policy::{PolicyEnforcer, PolicyStore};
-use sqe_sql::StatementKind;
+use sqe_sql::{replace_table_reference, resolve_timestamp_expr, StatementKind};
 
 use crate::catalog_ops::CatalogOps;
 use crate::credential_refresh::CredentialRefreshTracker;
@@ -6582,9 +6583,6 @@ impl QueryHandler {
         session_catalog: &Arc<SessionCatalog>,
         prefetch_concurrency: usize,
     ) -> sqe_core::Result<String> {
-        use iceberg::spec::SnapshotRetention;
-        use sqe_sql::VersionRef;
-
         let parts: Vec<&str> = spec.table.split('.').collect();
         let (namespace, bare_table) = match parts.len() {
             1 => ("default", parts[0]),
@@ -6601,83 +6599,11 @@ impl QueryHandler {
         let ns_ident = iceberg::NamespaceIdent::new(namespace.to_string());
         let table_ident = iceberg::TableIdent::new(ns_ident, bare_table.to_string());
         let iceberg_table = session_catalog.load_table(&table_ident).await?;
-        let metadata = iceberg_table.metadata();
-
-        // An open transaction's branch and the snapshots only it reaches
-        // read as absent (#821): uncommitted writes are visible to no one
-        // but the transaction itself, which reads them through its pin.
-        let snapshot_id = match &spec.version {
-            VersionRef::SnapshotId(id) => {
-                if metadata.snapshot_by_id(*id).is_none()
-                    || sqe_catalog::txn::txn_private_snapshots(metadata).contains(id)
-                {
-                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                        "FOR VERSION AS OF {id}: snapshot id not found on {}",
-                        spec.table
-                    )));
-                }
-                *id
-            }
-            VersionRef::Named(name) => {
-                sqe_catalog::txn::reject_txn_ref(name)?;
-                match metadata.reference_by_name(name) {
-                    None => {
-                        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                            "FOR VERSION AS OF '{name}': no branch or tag with that name on {}",
-                            spec.table
-                        )));
-                    }
-                    Some(reference) => {
-                        // If another ref with the same name exists with a different
-                        // retention kind, prefer the tag. Iceberg uses a single
-                        // namespace for branch and tag names, so this only applies
-                        // in migration scenarios where someone creates a tag that
-                        // shadows a branch (or vice versa).
-                        if matches!(reference.retention, SnapshotRetention::Branch { .. }) {
-                            tracing::debug!(
-                                table = %spec.table,
-                                ref_name = %name,
-                                snapshot_id = reference.snapshot_id,
-                                "FOR VERSION AS OF resolved to branch"
-                            );
-                        } else {
-                            tracing::debug!(
-                                table = %spec.table,
-                                ref_name = %name,
-                                snapshot_id = reference.snapshot_id,
-                                "FOR VERSION AS OF resolved to tag"
-                            );
-                        }
-                        reference.snapshot_id
-                    }
-                }
-            }
-            VersionRef::Timestamp(raw) => {
-                // `FOR TIMESTAMP AS OF` / `FOR SYSTEM_TIME AS OF`: parse the
-                // captured argument (a `TIMESTAMP '...'` literal, a quoted
-                // string, or epoch millis) with the same resolver the AST path
-                // uses, then pick the latest snapshot at or before that time.
-                use sqlparser::dialect::GenericDialect;
-                use sqlparser::parser::Parser;
-                let expr = Parser::new(&GenericDialect {})
-                    .try_with_sql(raw)
-                    .and_then(|mut p| p.parse_expr())
-                    .map_err(|e| {
-                        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                            "FOR TIMESTAMP AS OF: cannot parse timestamp '{raw}': {e}"
-                        ))
-                    })?;
-                let target_ms = resolve_timestamp_expr(&expr)?;
-                let snapshot_id = find_snapshot_at_timestamp(metadata, target_ms)?;
-                tracing::info!(
-                    table = %spec.table,
-                    target_ms,
-                    snapshot_id,
-                    "Time travel (FOR TIMESTAMP AS OF): pinned snapshot"
-                );
-                snapshot_id
-            }
-        };
+        let snapshot_id = sqe_catalog::time_travel::resolve_version_snapshot(
+            iceberg_table.metadata(),
+            &spec.version,
+            &spec.table,
+        )?;
 
         tracing::info!(
             table = %spec.table,
@@ -8794,136 +8720,6 @@ fn is_read_only_result_set(kind: &StatementKind) -> bool {
         },
         _ => false,
     }
-}
-
-fn replace_table_reference(sql: &str, needle: &str, replacement: &str) -> String {
-    if needle.is_empty() {
-        return sql.to_string();
-    }
-    let sql_upper = sql.to_uppercase();
-    let needle_upper = needle.to_uppercase();
-    let mut out = String::with_capacity(sql.len());
-    let mut cursor = 0usize;
-    while let Some(pos) = sql_upper[cursor..].find(needle_upper.as_str()) {
-        let abs = cursor + pos;
-        // Verify word boundary. The character preceding `abs` must not be an
-        // identifier character, and the character after `abs + needle.len()`
-        // must also not be an identifier character (letter, digit, `_`, `.`).
-        let pre_ok = abs == 0 || !is_ident_char(sql.as_bytes()[abs - 1]);
-        let end = abs + needle.len();
-        let post_ok = end == sql.len() || !is_ident_char(sql.as_bytes()[end]);
-        if pre_ok && post_ok {
-            out.push_str(&sql[cursor..abs]);
-            out.push_str(replacement);
-            cursor = end;
-        } else {
-            // Advance by one byte past the start of this match so we can keep
-            // searching for later occurrences.
-            out.push_str(&sql[cursor..=abs]);
-            cursor = abs + 1;
-        }
-    }
-    out.push_str(&sql[cursor..]);
-    out
-}
-
-fn is_ident_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'.'
-}
-
-/// Resolve a SQL timestamp expression to epoch milliseconds.
-///
-/// Supports:
-/// - `TIMESTAMP '2026-01-01 00:00:00'` (TypedString)
-/// - `'2026-01-01'` (bare string literal)
-/// - `CAST('...' AS TIMESTAMP)` (Cast)
-/// - Raw integer literals (treated as epoch ms directly)
-fn resolve_timestamp_expr(expr: &sqlparser::ast::Expr) -> sqe_core::Result<i64> {
-    use sqlparser::ast::{Expr, Value, ValueWithSpan};
-
-    match expr {
-        // sqlparser 0.62: TypedString is a tuple variant whose `value` is a
-        // ValueWithSpan; pull the string out (non-string typed literals are
-        // rejected by the catch-all arm below).
-        Expr::TypedString(ts) => match ts.value.clone().into_string() {
-            Some(s) => parse_timestamp_str(&s),
-            None => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                "Unsupported time travel expression: {expr}. \
-                 Use TIMESTAMP '2026-01-01 00:00:00' or epoch milliseconds."
-            ))),
-        },
-        Expr::Value(ValueWithSpan {
-            value: Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
-            ..
-        }) => parse_timestamp_str(s),
-        Expr::Value(ValueWithSpan {
-            value: Value::Number(n, _),
-            ..
-        }) => n.parse::<i64>().map_err(|_| {
-            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Cannot parse time travel integer expression: {n}"))
-        }),
-        Expr::Cast { expr: inner, .. } => resolve_timestamp_expr(inner),
-        other => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-            "Unsupported time travel expression: {other}. \
-             Use TIMESTAMP '2026-01-01 00:00:00' or epoch milliseconds."
-        ))),
-    }
-}
-
-/// Parse a timestamp string into epoch milliseconds.
-///
-/// Tries common formats: `YYYY-MM-DD HH:MM:SS`, `YYYY-MM-DDTHH:MM:SS`, `YYYY-MM-DD`.
-fn parse_timestamp_str(s: &str) -> sqe_core::Result<i64> {
-    // Try as raw epoch milliseconds
-    if let Ok(n) = s.parse::<i64>() {
-        return Ok(n);
-    }
-    // Try ISO datetime with space separator
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
-        return Ok(dt.and_utc().timestamp_millis());
-    }
-    // Try ISO datetime with T separator
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
-        return Ok(dt.and_utc().timestamp_millis());
-    }
-    // Try date-only (midnight)
-    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        if let Some(dt) = d.and_hms_opt(0, 0, 0) {
-            return Ok(dt.and_utc().timestamp_millis());
-        }
-    }
-    Err(SqeError::with_code(
-        SqeErrorCode::ExecutionFailed,
-        format!(
-            "Cannot parse time travel timestamp '{s}'. \
-         Use format 'YYYY-MM-DD HH:MM:SS', 'YYYY-MM-DD', or epoch milliseconds."
-        ),
-    ))
-}
-
-/// Find the latest Iceberg snapshot with `timestamp_ms <= target_ms`.
-///
-/// Returns an error when the table has no snapshot at or before the given timestamp.
-fn find_snapshot_at_timestamp(
-    metadata: &iceberg::spec::TableMetadata,
-    target_ms: i64,
-) -> sqe_core::Result<i64> {
-    let mut best: Option<(i64, i64)> = None; // (snapshot_id, timestamp_ms)
-
-    for snap in metadata.snapshots() {
-        let snap_ts = snap.timestamp_ms();
-        if snap_ts <= target_ms && (best.is_none() || snap_ts > best.unwrap().1) {
-            best = Some((snap.snapshot_id(), snap_ts));
-        }
-    }
-
-    best.map(|(id, _)| id).ok_or_else(|| {
-        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-            "No Iceberg snapshot found at or before timestamp {}ms. \
-             The table may not have existed yet at that point in time.",
-            target_ms
-        ))
-    })
 }
 
 /// Best-effort extraction of ORDER BY column names from SQL text.
