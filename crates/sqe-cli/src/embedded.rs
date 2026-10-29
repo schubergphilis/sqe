@@ -260,6 +260,13 @@ pub fn build_embedded_context(
     build_embedded_context_with_mask(memory_limit_bytes, storage, None)
 }
 
+/// The memory catalog and schema DataFusion creates as the session default.
+/// They stay registered when a session switches its default to an Iceberg
+/// catalog, so time travel registers its one-statement pinned providers
+/// here.
+const TT_CATALOG: &str = "default";
+const TT_SCHEMA: &str = "default";
+
 /// Like [`build_embedded_context`], with an explicit HMAC mask key (from
 /// `[policy] mask_key` in a loaded `sqe.toml`).
 pub fn build_embedded_context_with_mask(
@@ -269,7 +276,7 @@ pub fn build_embedded_context_with_mask(
 ) -> anyhow::Result<SessionContext> {
     let session_config = sqe_catalog::engine_session_config()
         .with_information_schema(true)
-        .with_default_catalog_and_schema("default", "default");
+        .with_default_catalog_and_schema(TT_CATALOG, TT_SCHEMA);
 
     let pool_size = memory_limit_bytes.max(64 * 1024 * 1024);
     let pool = Arc::new(FairSpillPool::new(pool_size));
@@ -579,7 +586,10 @@ async fn attach_sqlite_catalog(
 
     let provider = Arc::new(WritableIcebergCatalog::try_new(catalog).await?);
 
-    ctx.register_catalog(name, Arc::clone(&provider) as Arc<dyn datafusion::catalog::CatalogProvider>);
+    ctx.register_catalog(
+        name,
+        Arc::clone(&provider) as Arc<dyn datafusion::catalog::CatalogProvider>,
+    );
     Ok(provider)
 }
 
@@ -886,6 +896,14 @@ impl SqlClient for EmbeddedClient {
         // front door parsed the statement; a statement it cannot parse falls
         // through verbatim so DataFusion's own grammar (`CREATE EXTERNAL
         // TABLE ... STORED AS`, `COPY`) and error messages still apply.
+        // `FOR {VERSION|TIMESTAMP|SYSTEM_TIME} AS OF` parses in neither the
+        // front door nor DataFusion ("Expected: one of UPDATE or SHARE"), so
+        // it is stripped first and the rest of the statement runs against
+        // snapshot-pinned providers.
+        let (stripped, specs) = sqe_sql::extract_time_travel_spec(sql)?;
+        if !specs.is_empty() {
+            return self.embedded_time_travel(&stripped, &specs).await;
+        }
         let mut exec_sql = sql.to_string();
         // Intercept ATTACH / DETACH / CREATE SECRET / DROP SECRET / SHOW SECRETS
         // before DataFusion's parser sees the SQL — these are SQE-specific
@@ -1293,8 +1311,15 @@ impl EmbeddedClient {
         use datafusion::sql::sqlparser::ast::{ObjectType, SchemaName, Statement};
 
         enum Ddl<'a> {
-            Create { name: &'a datafusion::sql::sqlparser::ast::ObjectName, if_not_exists: bool },
-            Drop { name: &'a datafusion::sql::sqlparser::ast::ObjectName, if_exists: bool, cascade: bool },
+            Create {
+                name: &'a datafusion::sql::sqlparser::ast::ObjectName,
+                if_not_exists: bool,
+            },
+            Drop {
+                name: &'a datafusion::sql::sqlparser::ast::ObjectName,
+                if_exists: bool,
+                cascade: bool,
+            },
         }
         let ddl = match stmt {
             Statement::CreateSchema {
@@ -1342,7 +1367,11 @@ impl EmbeddedClient {
             }
             Ddl::Drop {
                 if_exists, cascade, ..
-            } => catalog.drop_namespace(schema_name, if_exists, cascade).await?,
+            } => {
+                catalog
+                    .drop_namespace(schema_name, if_exists, cascade)
+                    .await?
+            }
         }
         Ok(Some(QueryResult {
             columns: vec![],
@@ -1791,6 +1820,110 @@ impl EmbeddedClient {
             &self.storage,
         ));
         Some((catalog_name, catalog))
+    }
+
+    /// Run `stripped`, a statement whose time-travel clauses were removed,
+    /// with each `specs` table swapped for a provider pinned to the snapshot
+    /// its clause names. The pinned providers live in the memory catalog for
+    /// this one statement and are deregistered on success and on error, so a
+    /// later plain read sees the current table again.
+    async fn embedded_time_travel(
+        &mut self,
+        stripped: &str,
+        specs: &[sqe_sql::TimeTravelSpec],
+    ) -> Result<QueryResult, Box<dyn std::error::Error>> {
+        let mut sql = stripped.to_string();
+        let mut pinned = Vec::with_capacity(specs.len());
+        for spec in specs {
+            match self.pin_time_travel_table(spec).await {
+                Ok(alias) => {
+                    let qualified = format!("\"{TT_CATALOG}\".\"{TT_SCHEMA}\".{alias}");
+                    sql = sqe_sql::replace_table_reference(&sql, &spec.table, &qualified);
+                    pinned.push(alias);
+                }
+                Err(e) => {
+                    self.unpin_time_travel_tables(pinned);
+                    return Err(e);
+                }
+            }
+        }
+        // The stripped statement goes back through `execute`, so an
+        // `INSERT ... SELECT ... FOR VERSION AS OF` still reaches the
+        // Iceberg write path.
+        let result = Box::pin(self.execute(&sql)).await;
+        self.unpin_time_travel_tables(pinned);
+        result
+    }
+
+    fn unpin_time_travel_tables(&self, aliases: Vec<String>) {
+        for alias in aliases {
+            let _ = self
+                .ctx
+                .deregister_table(datafusion::common::TableReference::full(
+                    TT_CATALOG, TT_SCHEMA, alias,
+                ));
+        }
+    }
+
+    /// Load the Iceberg table `spec` names, resolve its clause to a snapshot
+    /// and register a provider pinned to that snapshot. Returns the alias it
+    /// is registered under in `TT_CATALOG.TT_SCHEMA`.
+    async fn pin_time_travel_table(
+        &self,
+        spec: &sqe_sql::TimeTravelSpec,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+        static NEXT_ALIAS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        let name = Parser::new(&GenericDialect {})
+            .try_with_sql(&spec.table)?
+            .parse_object_name(false)?;
+        let parts = object_name_parts(&name);
+        let (catalog, schema, table) = match parts.as_slice() {
+            [catalog, schema, table] => (catalog.clone(), schema.clone(), table.clone()),
+            [schema, table] => (self.default_catalog(), schema.clone(), table.clone()),
+            [table] => {
+                let schema = self
+                    .ctx
+                    .state()
+                    .config()
+                    .options()
+                    .catalog
+                    .default_schema
+                    .clone();
+                (self.default_catalog(), schema, table.clone())
+            }
+            _ => return Err(format!("time travel: cannot resolve table {}", spec.table).into()),
+        };
+        let Some(writable) = self.iceberg_catalogs.get(&catalog) else {
+            return Err(format!(
+                "time travel reads Iceberg tables only; {} is not in an Iceberg catalog",
+                spec.table
+            )
+            .into());
+        };
+        let ident = iceberg::TableIdent::new(iceberg::NamespaceIdent::new(schema), table.clone());
+        let iceberg_table = iceberg::Catalog::load_table(writable.client().as_ref(), &ident)
+            .await
+            .map_err(|e| format!("time travel: cannot load {}: {e}", spec.table))?;
+        let snapshot_id = sqe_catalog::time_travel::resolve_version_snapshot(
+            iceberg_table.metadata(),
+            &spec.version,
+            &spec.table,
+        )?;
+        let provider = datafusion_iceberg::IcebergStaticTableProvider::try_new_from_table_snapshot(
+            iceberg_table,
+            snapshot_id,
+        )
+        .await?;
+        let n = NEXT_ALIAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let alias = format!("__sqe_ver_{n}");
+        self.ctx.register_table(
+            datafusion::common::TableReference::full(TT_CATALOG, TT_SCHEMA, alias.as_str()),
+            Arc::new(provider),
+        )?;
+        Ok(alias)
     }
 
     /// The session the write handlers run as: the Unix user, no token, the

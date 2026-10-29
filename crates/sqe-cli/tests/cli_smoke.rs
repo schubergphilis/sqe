@@ -603,5 +603,82 @@ fn embedded_warehouse_show_create_table_round_trips() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("table not found: iceberg.s.nope"));
+}
 
+#[test]
+fn embedded_warehouse_time_travel() {
+    // `FOR VERSION AS OF` / `FOR SYSTEM_TIME AS OF` failed to parse
+    // ("Expected: one of UPDATE or SHARE") in embedded mode.
+    let wh = tempfile::tempdir().expect("tempdir");
+    let wh_path = wh.path().to_str().expect("utf-8 path");
+    let script = wh.path().join("tt.sql");
+    std::fs::write(
+        &script,
+        "CREATE SCHEMA iceberg.s;\n\
+         CREATE TABLE iceberg.s.t (id INT);\n\
+         INSERT INTO iceberg.s.t VALUES (1);\n\
+         ALTER TABLE iceberg.s.t CREATE TAG first;\n\
+         INSERT INTO iceberg.s.t VALUES (2);\n",
+    )
+    .expect("write script");
+    bin()
+        .args(["--embedded", "--warehouse", wh_path, "--file"])
+        .arg(&script)
+        .arg("--stop-on-error")
+        .timeout(std::time::Duration::from_secs(120))
+        .assert()
+        .success();
+
+    let run = |sql: &str| {
+        bin()
+            .args([
+                "--embedded",
+                "--warehouse",
+                wh_path,
+                "-f",
+                "json",
+                "-e",
+                sql,
+            ])
+            .timeout(std::time::Duration::from_secs(60))
+            .assert()
+    };
+    let stdout =
+        |sql: &str| String::from_utf8_lossy(&run(sql).success().get_output().stdout).to_string();
+    let first: serde_json::Value = serde_json::from_str(
+        stdout(
+            "SELECT CAST(snapshot_id AS VARCHAR) AS id FROM iceberg.s.\"t$snapshots\" \
+             ORDER BY committed_at LIMIT 1",
+        )
+        .lines()
+        .find(|l| l.starts_with('{'))
+        .expect("snapshot row"),
+    )
+    .expect("json row");
+    let first = first["id"].as_str().expect("snapshot id").to_string();
+
+    let count = |sql: &str| {
+        stdout(&format!(
+            "SELECT 'n=' || CAST(count(*) AS VARCHAR) AS r FROM {sql}"
+        ))
+    };
+    assert!(count(&format!("iceberg.s.t FOR VERSION AS OF {first}")).contains("n=1"));
+    assert!(count("iceberg.s.t FOR VERSION AS OF 'first'").contains("n=1"));
+    assert!(count("iceberg.s.t FOR SYSTEM_TIME AS OF '2999-01-01'").contains("n=2"));
+    // The pinned provider is gone after the statement: a plain read is current.
+    assert!(count("iceberg.s.t").contains("n=2"));
+
+    run("SELECT * FROM iceberg.s.t FOR SYSTEM_TIME AS OF '2000-01-01'")
+        .failure()
+        .stderr(predicate::str::contains("No Iceberg snapshot found"));
+    run("SELECT * FROM iceberg.s.t FOR VERSION AS OF 42")
+        .failure()
+        .stderr(predicate::str::contains(
+            "snapshot id not found on iceberg.s.t",
+        ));
+    run("SELECT * FROM default.default.m FOR VERSION AS OF 1")
+        .failure()
+        .stderr(predicate::str::contains(
+            "time travel reads Iceberg tables only",
+        ));
 }
