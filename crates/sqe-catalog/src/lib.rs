@@ -4,6 +4,7 @@ pub mod aws_config;
 pub mod backends;
 #[cfg(feature = "rest")]
 pub mod catalog_provider;
+pub mod eliminate_cross_join;
 pub mod expr_to_predicate;
 pub mod file_tvf_common;
 pub mod file_tvf_prepare;
@@ -29,21 +30,19 @@ pub mod read_csv;
 pub mod rest_catalog;
 pub mod runtime_bridge;
 mod send_erased;
-pub mod txn;
-pub mod vended_credentials;
 pub mod session_tuning;
-pub mod eliminate_cross_join;
 #[cfg(feature = "sql-sqlite-rs")]
 pub mod sqlite_rs_catalog;
+pub mod txn;
+pub mod vended_credentials;
 pub use session_tuning::{engine_context, engine_session_config};
-#[cfg(feature = "rest")]
-pub mod schema_provider;
-#[cfg(feature = "rest")]
-pub mod table_provider;
 pub mod read_json;
 mod read_json_buffer;
 pub mod read_parquet;
 pub mod scan_memory;
+#[cfg(feature = "rest")]
+pub mod schema_provider;
+pub mod show_create;
 pub mod snapshot_stats;
 pub mod sort_order;
 #[cfg(feature = "rest")]
@@ -52,6 +51,8 @@ pub mod system_catalog;
 pub mod system_jdbc;
 #[cfg(feature = "rest")]
 pub mod system_metadata;
+#[cfg(feature = "rest")]
+pub mod table_provider;
 pub mod writable_iceberg_catalog;
 
 pub use access_control::AccessControlClient;
@@ -59,8 +60,6 @@ pub use access_control::AccessControlClient;
 pub use aws_config::build_aws_config;
 #[cfg(feature = "rest")]
 pub use catalog_provider::SqeCatalogProvider;
-pub use sqe_core::circuit_breaker;
-pub use sqe_core::CircuitBreaker;
 pub use footer_cache::FooterCache;
 pub use iceberg_scan::coalesce_file_entries;
 pub use iceberg_scan::IcebergScanExec;
@@ -70,6 +69,8 @@ pub use rest_catalog::{
     invalidate_rest_catalog_cache_all, invalidate_rest_catalog_cache_for_token,
     rest_catalog_token_fingerprint, SessionCatalog, TableMetadataCache,
 };
+pub use sqe_core::circuit_breaker;
+pub use sqe_core::CircuitBreaker;
 #[cfg(feature = "rest")]
 pub use system_catalog::{SystemCatalogEntry, SystemCatalogProvider};
 

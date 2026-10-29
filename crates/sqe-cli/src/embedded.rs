@@ -960,6 +960,11 @@ impl SqlClient for EmbeddedClient {
                     if let Some(result) = self.embedded_handle_show_create_hive_table(stmt).await? {
                         return Ok(result);
                     }
+                    if let Some(result) =
+                        self.embedded_handle_show_create_iceberg_table(stmt).await?
+                    {
+                        return Ok(result);
+                    }
                 }
                 sqe_sql::StatementKind::Ctas(ref stmt) => {
                     if let Some(result) = self.embedded_handle_iceberg_ctas(stmt).await? {
@@ -1958,6 +1963,72 @@ impl EmbeddedClient {
             .await?;
         let spec = sqe_catalog::hive::hive_spec_from_manifest(catalog, &manifest);
         let ddl = sqe_catalog::hive::render_hive_create_table_ddl(&spec);
+
+        Ok(Some(QueryResult {
+            columns: vec!["Create Table".to_string()],
+            rows: vec![vec![ddl]],
+        }))
+    }
+
+    /// `SHOW CREATE TABLE` for a table in an Iceberg catalog, rendered as
+    /// the coordinator renders it: the columns from the table's schema, then
+    /// its `PARTITIONED BY`, sort order and `TBLPROPERTIES` from the Iceberg
+    /// metadata. `Ok(None)` when the name is not in an Iceberg catalog.
+    async fn embedded_handle_show_create_iceberg_table(
+        &mut self,
+        stmt: &sqlparser::ast::Statement,
+    ) -> Result<Option<QueryResult>, Box<dyn std::error::Error>> {
+        let sqlparser::ast::Statement::ShowCreate { obj_name, .. } = stmt else {
+            return Ok(None);
+        };
+        let parts = object_name_parts(obj_name);
+        let (catalog, schema, table) = match parts.as_slice() {
+            [c, s, t] => (c.clone(), s.clone(), t.clone()),
+            [s, t] => (self.default_catalog(), s.clone(), t.clone()),
+            [t] => {
+                let options = self.ctx.state().config().options().clone();
+                (
+                    options.catalog.default_catalog.clone(),
+                    options.catalog.default_schema.clone(),
+                    t.clone(),
+                )
+            }
+            _ => return Ok(None),
+        };
+        let Some(writable) = self.iceberg_catalogs.get(&catalog).cloned() else {
+            return Ok(None);
+        };
+
+        let provider = match self.ctx.catalog(&catalog).and_then(|c| c.schema(&schema)) {
+            Some(s) => s.table(&table).await?,
+            None => None,
+        };
+        let Some(provider) = provider else {
+            return Err(format!("table not found: {}", parts.join(".")).into());
+        };
+        let columns: Vec<sqe_catalog::show_create::DdlColumn> = provider
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| sqe_catalog::show_create::DdlColumn {
+                name: field.name().clone(),
+                // A geospatial column's type lives in its field metadata;
+                // its storage type would print as `varbinary`.
+                ddl_type: sqe_geo::ddl_type(field).unwrap_or_else(|| {
+                    sqe_trino_protocol::encode::arrow_to_ddl_trino_type(field.data_type())
+                }),
+                nullable: field.is_nullable(),
+            })
+            .collect();
+
+        let ident = iceberg::TableIdent::new(iceberg::NamespaceIdent::new(schema), table);
+        let metadata_table =
+            iceberg::Catalog::load_table(writable.client().as_ref(), &ident).await?;
+        let ddl = sqe_catalog::show_create::render_create_table(
+            &parts,
+            &columns,
+            Some(metadata_table.metadata()),
+        );
 
         Ok(Some(QueryResult {
             columns: vec!["Create Table".to_string()],
