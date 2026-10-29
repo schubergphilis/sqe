@@ -404,6 +404,24 @@ pub struct TableCommit {
 }
 
 impl TableCommit {
+    /// Build a commit from raw requirements and updates.
+    ///
+    /// SQE PATCH (embedded-alter): SQE's ALTER TABLE builds `TableUpdate`s
+    /// itself and posts them to REST catalogs as raw JSON; this hands the
+    /// same lists to a non-REST [`Catalog::update_table`] (the embedded
+    /// SQLite catalog), whose `apply` checks the requirements.
+    pub fn from_parts(
+        ident: TableIdent,
+        requirements: Vec<TableRequirement>,
+        updates: Vec<TableUpdate>,
+    ) -> Self {
+        Self {
+            ident,
+            requirements,
+            updates,
+        }
+    }
+
     /// Return the table identifier.
     pub fn identifier(&self) -> &TableIdent {
         &self.ident
