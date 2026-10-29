@@ -95,6 +95,7 @@ impl WritableIcebergCatalog {
             session_catalog,
             name: name.to_string(),
             schemas: Arc::downgrade(&self.schemas),
+            listed: DashMap::new(),
         };
         // `self` is new, so the cell is still empty.
         let _ = self.views.set(source);
@@ -233,6 +234,37 @@ impl WritableIcebergCatalog {
         Ok(())
     }
 
+    /// Re-list the Iceberg views of `namespace`, so `SHOW TABLES` and
+    /// information_schema show them (`table_names` is synchronous and serves
+    /// this snapshot). A no-op without [`Self::with_views`]; a server without
+    /// the view endpoints lists none.
+    pub async fn refresh_views(&self, namespace: &str) -> anyhow::Result<()> {
+        let Some(source) = self.views.get() else {
+            return Ok(());
+        };
+        let ns = NamespaceIdent::new(namespace.to_string());
+        let views = match source.session_catalog.list_views(&ns).await {
+            Ok(views) => views,
+            Err(e) if e.is_not_found() || server_has_no_views(&e) => Vec::new(),
+            Err(e) => anyhow::bail!("list views of {namespace}: {e}"),
+        };
+        source.listed.insert(namespace.to_string(), views);
+        Ok(())
+    }
+
+    /// [`Self::refresh_views`] for every namespace, one request each. A
+    /// namespace that fails does not stop the others; the first error is
+    /// returned.
+    pub async fn refresh_all_views(&self) -> anyhow::Result<()> {
+        let mut first_err = None;
+        for namespace in self.schema_names() {
+            if let Err(e) = self.refresh_views(&namespace).await {
+                first_err.get_or_insert(e);
+            }
+        }
+        first_err.map_or(Ok(()), Err)
+    }
+
     /// `DROP SCHEMA [IF EXISTS] <name>` on this catalog, on the async path.
     /// `CASCADE` is not implemented: the iceberg catalog refuses to drop a
     /// non-empty namespace and SQE does not delete tables on its behalf.
@@ -259,6 +291,9 @@ impl WritableIcebergCatalog {
             .await
             .map_err(|e| anyhow::anyhow!("drop_namespace({name}): {e}"))?;
         self.schemas.remove(name);
+        if let Some(views) = self.views.get() {
+            views.listed.remove(name);
+        }
         Ok(())
     }
 }
@@ -290,6 +325,19 @@ struct ViewSource {
     /// The catalog's schemas, to plan a body against. Weak: every schema
     /// provider in the map holds this source.
     schemas: Weak<SchemaMap>,
+    /// The views of each namespace as last listed by
+    /// [`WritableIcebergCatalog::refresh_views`], for the synchronous
+    /// `table_names` / `table_exist`. A view missing here still loads by
+    /// name.
+    listed: DashMap<String, Vec<String>>,
+}
+
+impl ViewSource {
+    fn is_listed(&self, namespace: &str, name: &str) -> bool {
+        self.listed
+            .get(namespace)
+            .is_some_and(|views| views.iter().any(|v| v == name))
+    }
 }
 
 impl ViewSource {
@@ -305,7 +353,7 @@ impl ViewSource {
         namespace: &'a str,
         name: &'a str,
     ) -> futures::future::BoxFuture<'a, DFResult<Option<Arc<dyn TableProvider>>>> {
-        Box::pin(async move {
+        let plan = async move {
             let ns = NamespaceIdent::new(namespace.to_string());
             let sql = match self.session_catalog.load_view_sql(&ns, name).await {
                 Ok(Some(sql)) => sql,
@@ -333,7 +381,13 @@ impl ViewSource {
                 })?;
             crate::schema_provider::view_table(df, name, sql, &self.name, &[&self.warehouse])
                 .map(Some)
-        })
+        };
+        Box::pin(crate::schema_provider::plan_view_guarded(
+            &self.warehouse,
+            namespace,
+            name,
+            plan,
+        ))
     }
 }
 
@@ -376,11 +430,24 @@ impl SchemaProvider for BaseTablesOnly {
     }
 
     fn table_names(&self) -> Vec<String> {
-        self.inner
+        let mut names: Vec<String> = self
+            .inner
             .table_names()
             .into_iter()
             .filter(|name| !is_metadata_table_name(name))
-            .collect()
+            .collect();
+        if let Some(listed) = self
+            .views
+            .get()
+            .and_then(|views| views.listed.get(&self.namespace))
+        {
+            for view in listed.iter() {
+                if !names.contains(view) {
+                    names.push(view.clone());
+                }
+            }
+        }
+        names
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
@@ -396,6 +463,15 @@ impl SchemaProvider for BaseTablesOnly {
     async fn table_type(&self, name: &str) -> DFResult<Option<TableType>> {
         if let Some(kind) = self.inner.table_type(name).await? {
             return Ok(Some(kind));
+        }
+        // A listed view answers without loading and planning its body, so
+        // information_schema does not plan every view it lists.
+        if self
+            .views
+            .get()
+            .is_some_and(|views| views.is_listed(&self.namespace, name))
+        {
+            return Ok(Some(TableType::View));
         }
         Ok(self.table(name).await?.map(|t| t.table_type()))
     }
@@ -414,6 +490,10 @@ impl SchemaProvider for BaseTablesOnly {
 
     fn table_exist(&self, name: &str) -> bool {
         self.inner.table_exist(name)
+            || self
+                .views
+                .get()
+                .is_some_and(|views| views.is_listed(&self.namespace, name))
     }
 }
 

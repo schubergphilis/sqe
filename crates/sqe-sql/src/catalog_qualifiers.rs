@@ -59,6 +59,47 @@ pub fn extract_catalog_qualifiers_from_sql(sql: &str) -> Vec<String> {
     all.into_iter().collect()
 }
 
+/// Rename catalog `from` to `to` in every 3-part relation (`from.ns.t`) and
+/// 4-part column reference (`from.ns.t.c`) of `node`. An unquoted `from`
+/// matches case-insensitively, a quoted one exactly. `to` is quoted when it
+/// is not a plain lowercase identifier. Returns true when a name changed.
+///
+/// A view body stored by an embedded session names the catalog by its
+/// `ATTACH ... AS` name; every reader resolves the warehouse name, so the
+/// body is stored with that instead, and shown with the attach name again.
+pub fn rename_catalog<V: sqlparser::ast::VisitMut>(node: &mut V, from: &str, to: &str) -> bool {
+    use sqlparser::ast::{visit_expressions_mut, visit_relations_mut, Expr, Ident};
+
+    let matches = |ident: &Ident| match ident.quote_style {
+        None => ident.value.eq_ignore_ascii_case(from),
+        Some(_) => ident.value == from,
+    };
+    let renamed = || match crate::quote::quote_ident_if_needed(to, '"') == to {
+        true => Ident::new(to),
+        false => Ident::with_quote('"', to),
+    };
+    let mut changed = false;
+    let _ = visit_relations_mut(node, |name: &mut ObjectName| {
+        if let [first, _, _] = name.0.as_mut_slice() {
+            if first.as_ident().is_some_and(matches) {
+                *first = sqlparser::ast::ObjectNamePart::Identifier(renamed());
+                changed = true;
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    let _ = visit_expressions_mut(node, |expr: &mut Expr| {
+        if let Expr::CompoundIdentifier(parts) = expr {
+            if parts.len() == 4 && matches(&parts[0]) {
+                parts[0] = renamed();
+                changed = true;
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    changed
+}
+
 /// Collect every distinct `(catalog, schema)` pair from schema-qualified
 /// table references in `sql`: `ns.t` yields `(None, "ns")`, `cat.ns.t`
 /// yields `(Some("cat"), "ns")`. Bare names contribute nothing. Returns an
@@ -260,6 +301,27 @@ mod tests {
     use super::*;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
+
+    #[test]
+    fn rename_catalog_rewrites_three_part_relations_and_four_part_columns() {
+        let mut stmt = parse(
+            "SELECT POL.ns.t.id, x.y FROM pol.ns.t JOIN ns.u ON true \
+             JOIN \"Pol\".ns.w ON true JOIN other.ns.t ON true \
+             WHERE id IN (SELECT id FROM pol.ns.s)",
+        );
+        assert!(rename_catalog(&mut stmt, "pol", "test_warehouse"));
+        assert_eq!(
+            stmt.to_string(),
+            "SELECT test_warehouse.ns.t.id, x.y FROM test_warehouse.ns.t JOIN ns.u ON true \
+             JOIN \"Pol\".ns.w ON true JOIN other.ns.t ON true \
+             WHERE id IN (SELECT id FROM test_warehouse.ns.s)"
+        );
+
+        let mut stmt = parse("SELECT * FROM wh.ns.t");
+        assert!(rename_catalog(&mut stmt, "wh", "My-Lake"));
+        assert_eq!(stmt.to_string(), "SELECT * FROM \"My-Lake\".ns.t");
+        assert!(!rename_catalog(&mut stmt, "absent", "x"));
+    }
 
     fn parse(sql: &str) -> Statement {
         let dialect = GenericDialect {};
