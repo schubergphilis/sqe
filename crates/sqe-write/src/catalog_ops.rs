@@ -56,6 +56,9 @@ pub struct CatalogOps {
     /// The coordinator's Polaris discovery for a non-default catalog
     /// qualifier, the same hook `WriteHandler` takes. `None` refuses one.
     catalog_discovery: Option<Arc<dyn CatalogDiscovery>>,
+    /// Every operation runs against this catalog instead of one built from
+    /// the session. The embedded CLI holds its catalogs itself.
+    fixed_catalog: Option<Arc<SessionCatalog>>,
 }
 
 impl CatalogOps {
@@ -67,7 +70,16 @@ impl CatalogOps {
             table_locks: StdArc::new(std::sync::Mutex::new(HashMap::new())),
             tag_projector,
             catalog_discovery: None,
+            fixed_catalog: None,
         }
+    }
+
+    /// Run every operation against `catalog`, whatever the statement's
+    /// catalog qualifier says.
+    #[must_use = "with_session_catalog consumes self; bind the returned ops"]
+    pub fn with_session_catalog(mut self, catalog: Arc<SessionCatalog>) -> Self {
+        self.fixed_catalog = Some(catalog);
+        self
     }
 
     /// Resolve non-default catalog qualifiers through `discovery`.
@@ -2098,6 +2110,9 @@ impl CatalogOps {
         session: &Session,
         target_warehouse: Option<&str>,
     ) -> sqe_core::Result<Arc<SessionCatalog>> {
+        if let Some(catalog) = &self.fixed_catalog {
+            return Ok(catalog.clone());
+        }
         match target_warehouse {
             Some(warehouse)
                 if warehouse != self.config.catalog.warehouse
@@ -2538,7 +2553,7 @@ fn branch_retention(spec: &BranchRetention) -> SnapshotRetention {
 }
 
 /// Parse a dotted string like `ns.t` into a sqlparser `ObjectName`.
-fn parse_object_name(s: &str) -> sqe_core::Result<ObjectName> {
+pub fn parse_object_name(s: &str) -> sqe_core::Result<ObjectName> {
     let idents: Vec<sqlparser::ast::Ident> = s
         .split('.')
         .map(|p| sqlparser::ast::Ident::new(p.trim_matches('"')))
