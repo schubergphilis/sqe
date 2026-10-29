@@ -3420,6 +3420,69 @@ mod tests {
     // Phase F: ATTACH / DETACH / CREATE SECRET / DROP SECRET / SHOW SECRETS
     // ------------------------------------------------------------------
 
+    /// An attach without TOKEN (a local Nessie, an open dev Polaris) sends
+    /// its view calls with no `Authorization` header, not `Bearer `.
+    #[tokio::test]
+    async fn anonymous_rest_attach_sends_no_authorization_on_views() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"overrides": {}, "defaults": {}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"namespaces": [["ns"]]})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/ns/tables"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"identifiers": []})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/namespaces/ns/views"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(load_view_response("SELECT 1 AS x")),
+            )
+            .mount(&server)
+            .await;
+
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
+        client
+            .execute(&format!(
+                "ATTACH '{}' AS anon (TYPE iceberg_rest, WAREHOUSE 'wh')",
+                server.uri()
+            ))
+            .await
+            .expect("attach");
+        client
+            .execute("CREATE VIEW anon.ns.v AS SELECT CAST(1 AS BIGINT) AS x")
+            .await
+            .expect("create view");
+        let requests = server.received_requests().await.expect("recording on");
+        let create = requests
+            .iter()
+            .find(|r| r.method.as_str() == "POST" && r.url.path() == "/v1/namespaces/ns/views")
+            .expect("CREATE VIEW posts to the views endpoint");
+        assert!(
+            create.headers.get("authorization").is_none(),
+            "anonymous attach sent {:?}",
+            create.headers.get("authorization")
+        );
+    }
+
     #[tokio::test]
     async fn create_bearer_secret_then_show() {
         let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
