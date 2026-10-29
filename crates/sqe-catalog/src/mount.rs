@@ -735,12 +735,33 @@ async fn build_iceberg_rest(
     options: &BTreeMap<String, OptionValue>,
     secrets: &SecretStore,
 ) -> Result<Arc<dyn iceberg::Catalog>, String> {
+    use iceberg::CatalogBuilder;
+    use iceberg_catalog_rest::RestCatalogBuilder;
+
+    let props = rest_attach_props(location, options, secrets)?;
+    let catalog = RestCatalogBuilder::default()
+        .with_storage_factory(crate::storage_factory())
+        .load("sqe-attached-rest".to_string(), props)
+        .await
+        .map_err(|e| format!("Iceberg REST catalog open failed: {e}"))?;
+
+    Ok(Arc::new(catalog))
+}
+
+/// The REST catalog properties `ATTACH ... (TYPE iceberg_rest)` opens its
+/// catalog with: `uri`, `warehouse`, the `token` (or the OAuth2 credential
+/// props), `prefix` and the S3 FileIO options. Public so a caller that
+/// talks to the same server directly (embedded view DDL) authenticates and
+/// resolves the prefix exactly as the attached catalog does.
+#[cfg(feature = "rest")]
+pub fn rest_attach_props(
+    location: &str,
+    options: &BTreeMap<String, OptionValue>,
+    secrets: &SecretStore,
+) -> Result<std::collections::HashMap<String, String>, String> {
     use std::collections::HashMap;
 
-    use iceberg::CatalogBuilder;
-    use iceberg_catalog_rest::{
-        RestCatalogBuilder, REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE,
-    };
+    use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE};
 
     let trimmed = location.trim();
     if trimmed.is_empty() {
@@ -808,14 +829,7 @@ async fn build_iceberg_rest(
     for (k, v) in s3_props_from_options(options) {
         props.insert(k, v);
     }
-
-    let catalog = RestCatalogBuilder::default()
-        .with_storage_factory(crate::storage_factory())
-        .load("sqe-attached-rest".to_string(), props)
-        .await
-        .map_err(|e| format!("Iceberg REST catalog open failed: {e}"))?;
-
-    Ok(Arc::new(catalog))
+    Ok(props)
 }
 
 #[cfg(not(feature = "rest"))]

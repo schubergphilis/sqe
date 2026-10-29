@@ -36,7 +36,7 @@
 //! along — for free. Less code, fewer corner cases, no parser
 //! dialect to maintain.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 
 use dashmap::DashMap;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
@@ -45,6 +45,10 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion_iceberg::IcebergCatalogProvider;
 use iceberg::inspect::MetadataTableType;
 use iceberg::{Catalog, NamespaceIdent};
+
+use crate::rest_catalog::SessionCatalog;
+
+type SchemaMap = DashMap<String, Arc<dyn SchemaProvider>>;
 
 /// A `CatalogProvider` over an iceberg::Catalog that supports both
 /// reads and namespace-level writes.
@@ -64,7 +68,12 @@ pub struct WritableIcebergCatalog {
     /// DDL bypass path) won't be reflected without a rebuild. For
     /// embedded single-process workflows that's acceptable; the
     /// cluster path uses richer caching with TTL eviction.
-    schemas: DashMap<String, Arc<dyn SchemaProvider>>,
+    schemas: Arc<SchemaMap>,
+    /// Where a name that is not a table is looked up as an Iceberg view;
+    /// unset for a catalog without views. Shared with every schema
+    /// provider in `schemas`, so [`Self::with_views`] reaches the ones
+    /// already built.
+    views: Arc<OnceLock<ViewSource>>,
 }
 
 impl WritableIcebergCatalog {
@@ -72,6 +81,32 @@ impl WritableIcebergCatalog {
     /// through `sqe-write` rather than DataFusion's DML hooks.
     pub fn client(&self) -> Arc<dyn Catalog> {
         self.catalog.clone()
+    }
+
+    /// Resolve Iceberg views of this catalog through `session_catalog`, a
+    /// REST `SessionCatalog` over the same server: a name that is not a
+    /// table loads the view's SQL and plans it with this catalog
+    /// registered as `name` (the session's name for it) and as the
+    /// warehouse. The `iceberg::Catalog` trait has no view operations, so
+    /// without this a view reads as a missing table.
+    pub fn with_views(self, session_catalog: Arc<SessionCatalog>, name: &str) -> Self {
+        let source = ViewSource {
+            warehouse: session_catalog.warehouse().to_string(),
+            session_catalog,
+            name: name.to_string(),
+            schemas: Arc::downgrade(&self.schemas),
+        };
+        // `self` is new, so the cell is still empty.
+        let _ = self.views.set(source);
+        self
+    }
+
+    fn wrap(&self, namespace: &str, provider: Arc<dyn SchemaProvider>) -> Arc<dyn SchemaProvider> {
+        Arc::new(BaseTablesOnly {
+            inner: provider,
+            namespace: namespace.to_string(),
+            views: Arc::clone(&self.views),
+        })
     }
 
     /// Build a writable catalog by snapshotting the current set of
@@ -87,16 +122,18 @@ impl WritableIcebergCatalog {
         let upstream = IcebergCatalogProvider::try_new(client.clone())
             .await
             .map_err(|e| anyhow::anyhow!("IcebergCatalogProvider build failed: {e}"))?;
-        let schemas: DashMap<String, Arc<dyn SchemaProvider>> = DashMap::new();
+        let this = Self {
+            catalog: client,
+            schemas: Arc::new(DashMap::new()),
+            views: Arc::new(OnceLock::new()),
+        };
         for name in upstream.schema_names() {
             if let Some(provider) = upstream.schema(&name) {
-                schemas.insert(name, BaseTablesOnly::wrap(provider));
+                this.schemas
+                    .insert(name.clone(), this.wrap(&name, provider));
             }
         }
-        Ok(Self {
-            catalog: client,
-            schemas,
-        })
+        Ok(this)
     }
 }
 
@@ -176,7 +213,7 @@ impl WritableIcebergCatalog {
             .schema(name)
             .ok_or_else(|| anyhow::anyhow!("schema {name} disappeared between create and read"))?;
         self.schemas
-            .insert(name.to_string(), BaseTablesOnly::wrap(provider));
+            .insert(name.to_string(), self.wrap(name, provider));
         Ok(())
     }
 
@@ -192,7 +229,7 @@ impl WritableIcebergCatalog {
         .await
         .map_err(|e| anyhow::anyhow!("reload schema {name}: {e}"))?;
         self.schemas
-            .insert(name.to_string(), BaseTablesOnly::wrap(provider));
+            .insert(name.to_string(), self.wrap(name, provider));
         Ok(())
     }
 
@@ -206,7 +243,9 @@ impl WritableIcebergCatalog {
         cascade: bool,
     ) -> anyhow::Result<()> {
         if cascade {
-            anyhow::bail!("DROP SCHEMA ... CASCADE is not implemented for embedded iceberg catalogs");
+            anyhow::bail!(
+                "DROP SCHEMA ... CASCADE is not implemented for embedded iceberg catalogs"
+            );
         }
         if !self.schemas.contains_key(name) {
             if if_exists {
@@ -229,12 +268,99 @@ impl WritableIcebergCatalog {
 /// `information_schema.tables` held four rows per table, all `BASE TABLE`.
 /// Trino and Spark list base tables only. This wrapper drops the metadata
 /// names from the listing; `t$snapshots` still resolves when queried.
+///
+/// It is also where a name that is not a table falls back to the catalog's
+/// Iceberg views, when it has a [`ViewSource`].
 #[derive(Debug)]
-struct BaseTablesOnly(Arc<dyn SchemaProvider>);
+struct BaseTablesOnly {
+    inner: Arc<dyn SchemaProvider>,
+    namespace: String,
+    views: Arc<OnceLock<ViewSource>>,
+}
 
-impl BaseTablesOnly {
-    fn wrap(inner: Arc<dyn SchemaProvider>) -> Arc<dyn SchemaProvider> {
-        Arc::new(Self(inner))
+/// The view side of a REST catalog: its `SessionCatalog` for the view
+/// endpoints, and the names a view body may call the catalog by.
+#[derive(Debug)]
+struct ViewSource {
+    session_catalog: Arc<SessionCatalog>,
+    /// The catalog's name in this session (the `ATTACH ... AS` name).
+    name: String,
+    /// The warehouse, which a body written by another engine names.
+    warehouse: String,
+    /// The catalog's schemas, to plan a body against. Weak: every schema
+    /// provider in the map holds this source.
+    schemas: Weak<SchemaMap>,
+}
+
+impl ViewSource {
+    /// View `name` in `namespace` as a `ViewTable`, or `None` when there is
+    /// no such view. Planned like the coordinator's (`view_planning_context`,
+    /// `view_table`), against this catalog only: a body naming another
+    /// catalog does not resolve.
+    ///
+    /// Boxed for the same reason as `SqeSchemaProvider::plan_view`: the
+    /// future holds a `DataFrame` across awaits.
+    fn view<'a>(
+        &'a self,
+        namespace: &'a str,
+        name: &'a str,
+    ) -> futures::future::BoxFuture<'a, DFResult<Option<Arc<dyn TableProvider>>>> {
+        Box::pin(async move {
+            let ns = NamespaceIdent::new(namespace.to_string());
+            let sql = match self.session_catalog.load_view_sql(&ns, name).await {
+                Ok(Some(sql)) => sql,
+                Ok(None) => return Ok(None),
+                Err(e) if e.is_not_found() || server_has_no_views(&e) => return Ok(None),
+                // A 403, a 5xx or an unsupported view dialect reaches the
+                // user as itself, not as "table not found".
+                Err(e) => return Err(DataFusionError::External(Box::new(e))),
+            };
+            let Some(schemas) = self.schemas.upgrade() else {
+                return Ok(None);
+            };
+            let ctx = crate::schema_provider::view_planning_context(&self.name);
+            let planning: Arc<dyn CatalogProvider> = Arc::new(ViewPlanningCatalog(schemas));
+            ctx.register_catalog(&self.name, Arc::clone(&planning));
+            if self.warehouse != self.name {
+                ctx.register_catalog(&self.warehouse, planning);
+            }
+            let df = crate::file_tvf_prepare::plan_sql(&ctx, &sql)
+                .await
+                .map_err(|e| {
+                    DataFusionError::External(
+                        format!("Failed to plan view '{name}' SQL: {e}").into(),
+                    )
+                })?;
+            crate::schema_provider::view_table(df, name, sql, &self.name, &[&self.warehouse])
+                .map(Some)
+        })
+    }
+}
+
+/// A REST server without the view endpoints answers a view lookup with 400,
+/// 405 or 501; for it every name is simply not a view.
+fn server_has_no_views(e: &sqe_core::SqeError) -> bool {
+    matches!(
+        e,
+        sqe_core::SqeError::CatalogHttp {
+            status: 400 | 405 | 501,
+            ..
+        }
+    )
+}
+
+/// The catalog a view body is planned against: the same schema providers
+/// the session reads, so a view over a view resolves too.
+#[derive(Debug)]
+struct ViewPlanningCatalog(Arc<SchemaMap>);
+
+impl CatalogProvider for ViewPlanningCatalog {
+    fn schema_names(&self) -> Vec<String> {
+        self.0.iter().map(|e| e.key().clone()).collect()
+    }
+
+    fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+        self.0.get(name).map(|e| e.value().clone())
     }
 }
 
@@ -246,11 +372,11 @@ fn is_metadata_table_name(name: &str) -> bool {
 #[async_trait::async_trait]
 impl SchemaProvider for BaseTablesOnly {
     fn owner_name(&self) -> Option<&str> {
-        self.0.owner_name()
+        self.inner.owner_name()
     }
 
     fn table_names(&self) -> Vec<String> {
-        self.0
+        self.inner
             .table_names()
             .into_iter()
             .filter(|name| !is_metadata_table_name(name))
@@ -258,11 +384,20 @@ impl SchemaProvider for BaseTablesOnly {
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        self.0.table(name).await
+        if let Some(table) = self.inner.table(name).await? {
+            return Ok(Some(table));
+        }
+        match self.views.get() {
+            Some(views) => views.view(&self.namespace, name).await,
+            None => Ok(None),
+        }
     }
 
     async fn table_type(&self, name: &str) -> DFResult<Option<TableType>> {
-        self.0.table_type(name).await
+        if let Some(kind) = self.inner.table_type(name).await? {
+            return Ok(Some(kind));
+        }
+        Ok(self.table(name).await?.map(|t| t.table_type()))
     }
 
     fn register_table(
@@ -270,15 +405,15 @@ impl SchemaProvider for BaseTablesOnly {
         name: String,
         table: Arc<dyn TableProvider>,
     ) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        self.0.register_table(name, table)
+        self.inner.register_table(name, table)
     }
 
     fn deregister_table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        self.0.deregister_table(name)
+        self.inner.deregister_table(name)
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        self.0.table_exist(name)
+        self.inner.table_exist(name)
     }
 }
 
@@ -298,7 +433,11 @@ mod tests {
                 .register_table(name.to_string(), empty.clone())
                 .unwrap();
         }
-        let wrapped = BaseTablesOnly::wrap(inner);
+        let wrapped = BaseTablesOnly {
+            inner,
+            namespace: "ns".to_string(),
+            views: Arc::new(OnceLock::new()),
+        };
         let mut names = wrapped.table_names();
         names.sort();
         assert_eq!(names, vec!["cost$eur".to_string(), "t".to_string()]);
