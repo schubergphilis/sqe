@@ -163,11 +163,16 @@ Exporting results to plain files goes through `COPY ... TO`; see
 | `SHOW TABLES [IN schema]`, `DESCRIBE` | yes | yes |
 | `SHOW CREATE TABLE` | Hive tables only | yes |
 | `FOR VERSION AS OF` / `FOR SYSTEM_TIME AS OF` | no | yes |
-| Metadata tables (`orders$snapshots`) | no | yes |
-| `CREATE BRANCH` / `CREATE TAG` | yes | yes |
+| Metadata tables (`orders$snapshots`) | yes | yes |
+| `CREATE BRANCH` / `CREATE TAG`, `SET WRITE_BRANCH` | no | yes |
 | `SET WRITE_BRANCH` | no | yes |
 | `CALL system.*` procedures | no | yes |
 | `ATTACH` / `DETACH`, `CREATE SECRET` | yes | yes |
+
+Metadata tables (`$snapshots`, `$history`, `$manifests`, `$files`,
+`$partitions`, `$refs`) read the catalog named in front of the table:
+`SELECT * FROM iceberg.sales."orders$snapshots"`. Without a catalog the
+table resolves only when exactly one Iceberg catalog is mounted.
 
 ## Cookbook
 

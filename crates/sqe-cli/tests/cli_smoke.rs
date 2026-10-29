@@ -446,3 +446,57 @@ fn embedded_warehouse_ctas_refuses_partitioning_it_would_drop() {
             "CREATE TABLE ... AS with PARTITIONED BY",
         ));
 }
+
+#[test]
+fn embedded_warehouse_metadata_tables() {
+    // `cat.ns."t$snapshots"` and friends read the named catalog's metadata;
+    // the TVFs they rewrite to were never registered in embedded mode.
+    let wh = tempfile::tempdir().expect("tempdir");
+    let wh_path = wh.path().to_str().expect("utf-8 path");
+    let script = wh.path().join("meta.sql");
+    std::fs::write(
+        &script,
+        "CREATE SCHEMA iceberg.s;\n\
+         CREATE TABLE iceberg.s.t (id INT, v VARCHAR);\n\
+         INSERT INTO iceberg.s.t VALUES (1, 'a');\n\
+         INSERT INTO iceberg.s.t VALUES (2, 'b');\n",
+    )
+    .expect("write script");
+    bin()
+        .args(["--embedded", "--warehouse", wh_path, "--file"])
+        .arg(&script)
+        .arg("--stop-on-error")
+        .timeout(std::time::Duration::from_secs(120))
+        .assert()
+        .success();
+
+    let out = bin()
+        .args([
+            "--embedded",
+            "--warehouse",
+            wh_path,
+            "-e",
+            "SELECT 'n=' || CAST((SELECT count(*) FROM iceberg.s.\"t$snapshots\") AS VARCHAR) \
+             || '/' || CAST((SELECT count(*) FROM iceberg.s.\"t$history\") AS VARCHAR) \
+             || '/' || CAST((SELECT count(*) FROM iceberg.s.\"t$files\") AS VARCHAR) \
+             || '/' || CAST((SELECT count(*) FROM iceberg.s.\"t$refs\") AS VARCHAR) AS r",
+        ])
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(stdout.contains("n=2/2/2/1"), "unexpected counts: {stdout}");
+
+    bin()
+        .args([
+            "--embedded",
+            "--warehouse",
+            wh_path,
+            "-e",
+            "SELECT * FROM nope.s.\"t$snapshots\"",
+        ])
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("'nope' is not an Iceberg catalog"));
+}
