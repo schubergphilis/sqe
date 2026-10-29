@@ -27,6 +27,7 @@ pub mod merge_target_provider;
 mod policy_view;
 pub mod puffin_carry;
 pub mod tag_source_impl;
+pub mod view_schema;
 pub mod write_handler;
 pub mod writer;
 

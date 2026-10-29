@@ -414,9 +414,15 @@ async fn authenticate_raw_request(
     sigv4: Option<&RawSigner>,
     bearer_token: &str,
 ) -> sqe_core::Result<reqwest::Request> {
-    let build_err =
-        |e: reqwest::Error| SqeError::catalog_src(format!("Failed to build catalog request: {e}"), e);
+    let build_err = |e: reqwest::Error| {
+        SqeError::catalog_src(format!("Failed to build catalog request: {e}"), e)
+    };
     let Some(signer) = sigv4 else {
+        // An anonymous catalog (an embedded ATTACH without TOKEN) gets no
+        // `Authorization` header, not an empty `Bearer `.
+        if bearer_token.is_empty() {
+            return req.build().map_err(build_err);
+        }
         return req.bearer_auth(bearer_token).build().map_err(build_err);
     };
     let mut req = req.build().map_err(build_err)?;
