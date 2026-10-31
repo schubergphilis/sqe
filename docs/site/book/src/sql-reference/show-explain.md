@@ -14,6 +14,7 @@ Source: `crates/sqe-sql/src/classifier.rs` (statement routing), `crates/sqe-coor
 | `SHOW VIEWS [IN cat.ns]` | `sqlparser-rs` + `sqe-coordinator` | List views. | yes | yes | yes | partial |
 | `SHOW COLUMNS FROM cat.ns.t` | `sqe-coordinator/query_handler.rs` (`columns_for_table`) | Same result as `DESCRIBE`. | yes | yes | yes | yes |
 | `SHOW CREATE TABLE cat.ns.t` | `sqe-coordinator/query_handler.rs` (`handle_show_create_table`) | Reconstruct the CREATE statement from current metadata, with Trino types and quoted names where needed; the output runs back as is. | yes | yes | yes | yes |
+| `SHOW CREATE VIEW cat.ns.v` | `sqe-coordinator/query_handler.rs` (`handle_show_create_table`) | `CREATE VIEW cat.ns.v AS` followed by the stored body of the Iceberg view. | yes | yes | yes | - |
 | `SHOW STATS FOR cat.ns.t` | `sqe-sql/classifier.rs:166` | Per-column NDV, null fraction, min, max. From Iceberg manifest stats. | yes | - | partial | yes |
 | `DESCRIBE cat.ns.t` | `sqe-coordinator/query_handler.rs` (`columns_for_table`) | `column_name`, `data_type` (Trino type name), `is_nullable`, `comment`. | yes | yes | yes | yes |
 | `SHOW GRANTS ON ...` | `sqe-sql/classifier.rs:186` | See [GRANT and REVOKE](./grant-revoke.md). | partial | yes | partial | - |
@@ -56,6 +57,10 @@ SHOW COLUMNS FROM analytics.events;
 The DDL runs back as is and re-creates the same table: column types, `PARTITIONED BY`, and a `TBLPROPERTIES` list that always names the `format-version`, because the server's default version is configurable. A sort order prints as a comment line (`-- sort order: region ASC NULLS FIRST`), since CREATE TABLE has no clause for it.
 
 Properties the catalog owns are left out: storage paths bound to the table's location (`write.data.path`, `write.metadata.path`), object-storage layout (`write.object-storage.*`), snapshot retention (`gc.*`, `history.expire.*`) and Unity Catalog's identity and feature keys (`databricks.*`, `io.unitycatalog.*`). Copied into a new table, the paths would point it at the old table's files. Set retention on the new table explicitly if it needs it.
+
+## SHOW CREATE VIEW
+
+Prints `CREATE VIEW <name> AS` and the view's SQL as the catalog stores it, in a column named `Create View`. As in Trino, the two statements do not stand in for each other: `SHOW CREATE TABLE` on a view fails with `is a view, not a table`, and `SHOW CREATE VIEW` on a table fails with `is a table, not a view`. The MCP tool `get_table_ddl` handles both: on a view it returns the `SHOW CREATE VIEW` output.
 
 ## SHOW STATS
 

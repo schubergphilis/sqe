@@ -5720,11 +5720,55 @@ impl QueryHandler {
         use arrow_array::StringArray as ArrowStringArray;
 
         // Extract object name from the ShowCreate statement
-        let Statement::ShowCreate { obj_name, .. } = stmt else {
+        let Statement::ShowCreate { obj_type, obj_name } = stmt else {
             let msg = "Expected ShowCreate statement".to_string();
             return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, msg));
         };
         let table_name = obj_name.to_string();
+
+        // An Iceberg view renders its stored body, as written. Looked up
+        // before the column path below, which succeeds on a view too and
+        // would print it as a table. The wrong kind fails the way Trino
+        // fails it.
+        let want_view = matches!(obj_type, sqlparser::ast::ShowCreateObject::View);
+        let view_body = self
+            .show_create_view_body(session, obj_name)
+            .await
+            .or_else(|e| if want_view { Err(e) } else { Ok(None) })?;
+        match (view_body, want_view) {
+            (Some(body), true) => {
+                let ddl = format!("CREATE VIEW {table_name} AS\n{body}");
+                let schema = Arc::new(Schema::new(vec![Field::new(
+                    "Create View",
+                    DataType::Utf8,
+                    false,
+                )]));
+                let result = RecordBatch::try_new(
+                    schema,
+                    vec![Arc::new(ArrowStringArray::from(vec![ddl.as_str()])) as ArrayRef],
+                )
+                .map_err(|e| {
+                    SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!("Failed to build result batch: {e}"),
+                    )
+                })?;
+                return Ok(vec![result]);
+            }
+            (Some(_), false) => {
+                return Err(SqeError::with_code(
+                    SqeErrorCode::SemanticError,
+                    format!("Relation '{table_name}' is a view, not a table"),
+                ));
+            }
+            (None, true) => {
+                return Err(SqeError::with_code(
+                    SqeErrorCode::SemanticError,
+                    format!("Relation '{table_name}' is a table, not a view"),
+                ));
+            }
+            (None, false) => {}
+        }
 
         // The table's column definitions, from the table alone; see
         // `single_table_columns`. The refresh resolves a namespace created
@@ -5812,6 +5856,27 @@ impl QueryHandler {
         .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build result batch: {e}")))?;
 
         Ok(vec![result])
+    }
+
+    /// The stored SQL of the Iceberg view `obj_name` names, or `None` when
+    /// it names no view. Resolved like the table path resolves it: the
+    /// name's catalog qualifier, else the session default. A catalog with
+    /// no `SessionCatalog` (an ATTACHed one) or no view endpoints holds no
+    /// views SQE can show.
+    async fn show_create_view_body(
+        &self,
+        session: &Session,
+        obj_name: &sqlparser::ast::ObjectName,
+    ) -> sqe_core::Result<Option<String>> {
+        let ident = crate::ident::resolve_table_ident(obj_name, session)?;
+        let qualifier = crate::ident::catalog_qualifier(obj_name);
+        let Ok(catalog) = self.show_catalog(session, qualifier.as_deref()).await else {
+            return Ok(None);
+        };
+        if !catalog.is_rest_backend() {
+            return Ok(None);
+        }
+        catalog.load_view_sql(ident.namespace(), ident.name()).await
     }
 
     /// Handle SHOW CREATE SCHEMA <name> by reconstructing the namespace DDL
