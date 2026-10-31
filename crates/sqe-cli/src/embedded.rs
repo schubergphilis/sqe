@@ -664,9 +664,8 @@ pub struct EmbeddedClient {
     /// `CREATE TABLE` carries its format version as a table property, which
     /// a local catalog refuses. The value is the REST `SessionCatalog` the
     /// view DDL runs on (the `iceberg::Catalog` trait has no view
-    /// operations), `None` for an OAuth2 attach: the view endpoints are
-    /// called directly and need a bearer token to send.
-    rest_catalogs: HashMap<String, Option<Arc<sqe_catalog::SessionCatalog>>>,
+    /// operations).
+    rest_catalogs: HashMap<String, Arc<sqe_catalog::SessionCatalog>>,
     /// The `--catalog-backend glue|s3tables` catalog, mounted through
     /// `read_only_catalog::ReadOnlyCatalog`. Held by name because the
     /// context's `DynamicFileCatalog` wraps every catalog, so a downcast
@@ -1158,9 +1157,7 @@ impl EmbeddedClient {
                 .map_err(|e| format!("ATTACH: failed to wrap catalog '{}': {e}", stmt.name))?;
         let views = if stmt.kind == sqe_sql::CatalogKind::IcebergRest {
             let views = self.rest_view_catalog(stmt).await?;
-            if let Some(views) = &views {
-                provider = provider.with_views(Arc::clone(views), &stmt.name);
-            }
+            provider = provider.with_views(Arc::clone(&views), &stmt.name);
             Some(views)
         } else {
             None
@@ -1197,19 +1194,16 @@ impl EmbeddedClient {
 
     /// The REST `SessionCatalog` view DDL and view reads of an
     /// `iceberg_rest` attach run on, built from the same properties as the
-    /// attached catalog (URI, warehouse, token, prefix, S3 options). `None`
-    /// for an OAuth2 secret: the view endpoints are called directly, and
-    /// only the vendored client knows the token it exchanged.
+    /// attached catalog (URI, warehouse, token or OAuth2 credential, prefix,
+    /// S3 options). With an OAuth2 secret the raw view calls carry the token
+    /// the catalog's own client exchanged.
     async fn rest_view_catalog(
         &self,
         stmt: &sqe_sql::AttachStatement,
-    ) -> Result<Option<Arc<sqe_catalog::SessionCatalog>>, Box<dyn std::error::Error>> {
+    ) -> Result<Arc<sqe_catalog::SessionCatalog>, Box<dyn std::error::Error>> {
         let mut props =
             sqe_catalog::mount::rest_attach_props(&stmt.location, &stmt.options, &self.secrets)
                 .map_err(|e| format!("ATTACH failed: {e}"))?;
-        if props.contains_key("credential") {
-            return Ok(None);
-        }
         let uri = props.remove("uri").unwrap_or_default();
         let warehouse = props.remove("warehouse").unwrap_or_default();
         let token = props.remove("token").unwrap_or_default();
@@ -1226,7 +1220,7 @@ impl EmbeddedClient {
         )
         .await
         .map_err(|e| format!("ATTACH: views of catalog '{}': {e}", stmt.name))?;
-        Ok(Some(Arc::new(catalog)))
+        Ok(Arc::new(catalog))
     }
 
     fn embedded_handle_detach(
@@ -1808,15 +1802,7 @@ impl EmbeddedClient {
             }
         }
         let views = match self.rest_catalogs.get(&catalog_name) {
-            Some(Some(views)) => Arc::clone(views),
-            Some(None) => {
-                return Err(format!(
-                    "view {name}: catalog `{catalog_name}` was attached with an OAuth2 secret, \
-                     and embedded mode reaches the Iceberg view endpoints with a bearer \
-                     token only; attach it with TOKEN or a bearer SECRET"
-                )
-                .into());
-            }
+            Some(views) => Arc::clone(views),
             None => {
                 return match stmt {
                     Statement::Drop {
@@ -2456,7 +2442,7 @@ impl EmbeddedClient {
         view: &str,
         parts: &[String],
     ) -> Result<QueryResult, Box<dyn std::error::Error>> {
-        let Some(Some(views)) = self.rest_catalogs.get(catalog) else {
+        let Some(views) = self.rest_catalogs.get(catalog) else {
             return Err(format!("view not found: {}", parts.join(".")).into());
         };
         let ns = iceberg::NamespaceIdent::new(schema.to_string());
