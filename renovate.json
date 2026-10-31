@@ -65,7 +65,11 @@
       "minimumReleaseAge": "7 days"
     },
     {
-      "description": "DataFusion/Arrow/Parquet are API-coupled and pinned in lockstep with the vendored iceberg-rust fork. Group into one reviewed PR (overrides the rule above); a version skew here breaks the build, and a bump usually means re-checking the vendor rebase.",
+      "description": [
+        "DataFusion/Arrow/Parquet are API-coupled and pinned in lockstep with the vendored iceberg-rust fork. Group into one reviewed PR (overrides the rule above); a version skew here breaks the build, and a bump usually means re-checking the vendor rebase.",
+        "parquet-* (variant, geospatial) is listed explicitly: with only `parquet` it fell into the preset 'arrow-rs monorepo' group and arrived as a separate MR (!1465) that could not build without the core bump (!1133).",
+        "separateMajorMinor is off for this group: the Arrow major (!1133) and the sqlparser 0.x minor (!1107) each need the DataFusion release that moves to them, so split MRs can never merge alone."
+      ],
       "matchManagers": ["cargo"],
       "matchPackageNames": [
         "datafusion",
@@ -73,10 +77,12 @@
         "arrow",
         "arrow-*",
         "parquet",
+        "parquet-*",
         "object_store",
         "sqlparser"
       ],
       "groupName": "datafusion/arrow stack",
+      "separateMajorMinor": false,
       "labels": ["dependencies", "datafusion-stack"],
       "automerge": false,
       "minimumReleaseAge": "7 days"
