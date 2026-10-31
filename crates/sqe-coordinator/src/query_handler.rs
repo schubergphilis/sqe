@@ -3046,9 +3046,10 @@ impl QueryHandler {
                             0,
                         )?;
                     }
-                    let (_, session_catalog) = self.create_session_context(session).await?;
-                    self.handle_comment_on(session, stmt, &session_catalog)
-                        .await
+                    self.handle_comment_on(session, stmt).await?;
+                    // DESCRIBE and information_schema read the comment.
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
+                    Ok(vec![])
                 }
 
                 // SHOW STATS FOR table — Trino per-column stats result set
@@ -7920,12 +7921,7 @@ impl QueryHandler {
     /// - `COMMENT ON TABLE t IS 'text'` → sets property `"comment"` = text
     /// - `COMMENT ON COLUMN t.col IS 'text'` → sets property `"comment.<col>"` = text
     /// - `IS NULL` removes the comment (stores empty string)
-    async fn handle_comment_on(
-        &self,
-        session: &Session,
-        stmt: &Statement,
-        session_catalog: &Arc<SessionCatalog>,
-    ) -> sqe_core::Result<Vec<RecordBatch>> {
+    async fn handle_comment_on(&self, session: &Session, stmt: &Statement) -> sqe_core::Result<()> {
         use crate::ident::resolve_table_ident;
         use sqlparser::ast::CommentObject;
 
@@ -7974,6 +7970,12 @@ impl QueryHandler {
         };
 
         let table_ident = resolve_table_ident(&table_ref_parts, session)?;
+        // The catalog the name resolves in (its qualifier, else the session
+        // default), as for SHOW CREATE TABLE. The session's default catalog
+        // alone made `COMMENT ON COLUMN cat.ns.t.c` fail with "does not
+        // exist" for any `cat` but the default.
+        let qualifier = crate::ident::catalog_qualifier(&table_ref_parts);
+        let catalog = self.show_catalog(session, qualifier.as_deref()).await?;
 
         let comment_value = comment_text.clone().unwrap_or_default();
 
@@ -7988,11 +7990,9 @@ impl QueryHandler {
             updates: std::collections::HashMap::from([(prop_key, comment_value)]),
         }];
 
-        session_catalog
+        catalog
             .commit_schema_update(&table_ident, updates, vec![])
-            .await?;
-
-        Ok(vec![])
+            .await
     }
 
     /// Handle `SHOW STATS FOR <table>` by reading the current snapshot summary.

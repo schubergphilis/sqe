@@ -478,6 +478,42 @@ async fn maintenance_call_uses_the_session_catalog() {
     );
 }
 
+/// `COMMENT ON COLUMN cat.ns.t.c` and `COMMENT ON TABLE cat.ns.t` commit to
+/// the catalog the name qualifies, not the session default. Before, both went
+/// to the default warehouse and failed with "does not exist" on a table a
+/// SELECT of the same name reads.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn comment_on_a_discovered_catalog_table() {
+    let _live = LIVE_STACK_LOCK.lock().await;
+    crate::common::init_tracing();
+    seed_discovery_warehouse().await;
+
+    let handler = make_handler(polaris_auto_config());
+    let session = live_session().await;
+    for sql in [
+        "COMMENT ON COLUMN discovery_test_wh.disc_ns.probe_t.label IS 'probe label'",
+        "COMMENT ON TABLE discovery_test_wh.disc_ns.probe_t IS 'probe table'",
+    ] {
+        handler
+            .execute(&session, sql, None)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    let batches = handler
+        .execute(&session, "DESCRIBE discovery_test_wh.disc_ns.probe_t", None)
+        .await
+        .expect("describe the commented table");
+    let rendered = arrow::util::pretty::pretty_format_batches(&batches)
+        .expect("render")
+        .to_string();
+    assert!(
+        rendered.contains("probe label"),
+        "the column comment must land on the discovered table, got:\n{rendered}"
+    );
+}
+
 /// #334: row-level mutations against a DISCOVERED (non-default) catalog must
 /// load and commit against the discovered warehouse, not the session-default
 /// one. Before the fix the UPDATE/DELETE/MERGE handlers used the passed
