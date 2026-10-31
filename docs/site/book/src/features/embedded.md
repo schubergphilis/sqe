@@ -159,8 +159,9 @@ VIEW` in the session; a view another client creates later reads fine but
 appears in `SHOW TABLES` only after the next attach. A view whose body
 reaches itself, directly or through other views, fails to read with
 `references itself through a -> b -> a` instead of recursing, and so does a
-chain more than 32 views deep. Views need a bearer `TOKEN` or bearer
-`SECRET` on the attach; an OAuth2 attach refuses them. The SQLite warehouse
+chain more than 32 views deep. Views work with a bearer `TOKEN`, a bearer
+`SECRET` or an oauth2 `SECRET` on the attach; with oauth2 the view calls
+use the token the catalog exchanged and renew it after a 401. The SQLite warehouse
 stores no views: `CREATE VIEW` there fails, and an unqualified `CREATE VIEW
 v` is still a session view.
 
