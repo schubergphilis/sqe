@@ -76,6 +76,7 @@ mod mor_spark_interop;
 mod mor_update_merge_integration;
 mod multi_catalog_routing_test;
 mod namespace_staleness_test;
+mod order_by_hidden_sort_key_e2e;
 mod partition_e2e;
 mod partition_evolution_e2e;
 mod quack_e2e;
