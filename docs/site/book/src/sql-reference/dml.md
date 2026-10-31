@@ -98,6 +98,7 @@ TRUNCATE TABLE staging.tmp;
 | `MERGE INTO t USING s ON cond WHEN MATCHED THEN UPDATE SET ... WHEN NOT MATCHED THEN INSERT (...) VALUES (...)` | `sqlparser-rs` + `sqe-coordinator` | CoW or MoR. Multiple `WHEN MATCHED` branches with extra predicates allowed. Returns `rows_affected`. Retries on conflict. |
 | `MERGE INTO t USING s ON cond WHEN MATCHED THEN DELETE` | `sqlparser-rs` + `sqe-coordinator` | Delete matched rows. Returns `rows_affected`. Retries on conflict. |
 | `MERGE INTO t USING s ON cond WHEN MATCHED AND pred THEN UPDATE SET ... WHEN MATCHED THEN DELETE` | `sqlparser-rs` + `sqe-coordinator` | Conditional MATCHED branches. Returns `rows_affected`. Retries on conflict. |
+| `MERGE INTO t USING s ON cond WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *` | `sqe-sql` + `sqe-coordinator` | Spark and Databricks form: every target column is set from the source column of the same name. The source must have every target column (extra source columns are ignored); otherwise the statement fails. `UPDATE SET *` is refused in a `WHEN NOT MATCHED BY SOURCE` clause. |
 | `MERGE INTO t USING (empty source) ...` | `sqe-coordinator` | If `WHEN NOT MATCHED BY SOURCE` clauses exist, they apply (source is empty, so all target rows match that condition). Returns claimed-row count (number of target rows affected by BY SOURCE clauses). | - |
 
 ```sql

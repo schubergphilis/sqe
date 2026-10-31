@@ -23,6 +23,8 @@
 //! `WHEN MATCHED AND <cond>` clauses plus a predicated
 //! `WHEN NOT MATCHED AND <cond> THEN INSERT`.
 
+use std::borrow::Cow;
+
 use sqe_core::SqeError;
 use sqe_policy::write_predicates::WritePolicyPredicates;
 use sqlparser::ast::{
@@ -206,11 +208,71 @@ pub(crate) fn guarded_on(names: &MergeNames<'_>, on_rewritten: &str) -> String {
     }
 }
 
-/// A MERGE clause action after validation against its clause kind.
+/// A MERGE clause action after validation against its clause kind. The
+/// assignments are owned only when `UPDATE SET *` was expanded.
 pub(crate) enum MergeOp<'a> {
-    Update(&'a [Assignment]),
+    Update(Cow<'a, [Assignment]>),
     Delete,
     Insert(&'a [ObjectName], &'a MergeInsertKind),
+}
+
+/// `INSERT *` is `INSERT ROW` with every target column required in the source.
+static INSERT_ROW: MergeInsertKind = MergeInsertKind::Row;
+
+/// Is this the `__sqe_merge_star__` marker the front door left for `*`?
+fn is_star_marker(name: &ObjectName) -> bool {
+    matches!(
+        name.0.as_slice(),
+        [part] if part.as_ident().is_some_and(|i| i.value == sqe_sql::MERGE_STAR_MARKER)
+    )
+}
+
+/// The target columns `UPDATE SET *` / `INSERT *` stand for: every user
+/// column (not the V3 row-lineage columns the handler appends), each of which
+/// must exist in the source, as in Spark.
+fn star_columns<'n>(names: &'n MergeNames<'_>, form: &str) -> sqe_core::Result<Vec<&'n String>> {
+    let cols: Vec<&String> = names
+        .target_columns
+        .iter()
+        .filter(|c| {
+            c.as_str() != iceberg::metadata_columns::RESERVED_COL_NAME_ROW_ID
+                && c.as_str()
+                    != iceberg::metadata_columns::RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER
+        })
+        .collect();
+    let missing: Vec<&str> = cols
+        .iter()
+        .filter(|c| !names.source_columns.contains(c))
+        .map(|c| c.as_str())
+        .collect();
+    if !missing.is_empty() {
+        return Err(SqeError::with_code(
+            sqe_core::SqeErrorCode::InvalidArguments,
+            format!(
+                "MERGE {form} needs every target column in the source; the source has no {}",
+                missing.join(", ")
+            ),
+        ));
+    }
+    Ok(cols)
+}
+
+/// `UPDATE SET *` as explicit `col = <source alias>."col"` assignments.
+fn expand_update_star(names: &MergeNames<'_>) -> sqe_core::Result<Vec<Assignment>> {
+    use sqlparser::ast::{AssignmentTarget, Expr, Ident};
+    Ok(star_columns(names, "UPDATE SET *")?
+        .into_iter()
+        .map(|col| Assignment {
+            target: AssignmentTarget::ColumnName(ObjectName::from(vec![Ident::with_quote(
+                '"',
+                col.as_str(),
+            )])),
+            value: Expr::CompoundIdentifier(vec![
+                Ident::new(names.s_alias),
+                Ident::with_quote('"', col.as_str()),
+            ]),
+        })
+        .collect())
 }
 
 /// One clause with its optional predicate rewritten to scratch-table refs.
@@ -342,12 +404,44 @@ pub(crate) fn classify_merge_clauses<'a>(
             .predicate
             .as_ref()
             .map(|p| rewrite_aliases(format!("{p}"), names));
+        // `UPDATE SET *` / `INSERT *`, left as a marker by the front door.
+        let update_star = matches!(
+            &clause.action,
+            MergeAction::Update(u) if matches!(
+                u.assignments.as_slice(),
+                [a] if matches!(&a.target, sqlparser::ast::AssignmentTarget::ColumnName(n) if is_star_marker(n))
+            )
+        );
+        let insert_star = matches!(
+            &clause.action,
+            MergeAction::Insert(i) if matches!(i.columns.as_slice(), [c] if is_star_marker(c))
+        );
         let (class, op) = match (&clause.clause_kind, &clause.action) {
+            (MergeClauseKind::NotMatchedBySource, MergeAction::Update(_)) if update_star => {
+                return Err(SqeError::with_code(
+                    sqe_core::SqeErrorCode::InvalidArguments,
+                    "UPDATE SET * is not allowed in a WHEN NOT MATCHED BY SOURCE clause: \
+                     there is no source row to copy from"
+                        .to_string(),
+                ));
+            }
+            (MergeClauseKind::Matched, MergeAction::Update(_)) if update_star => (
+                &mut out.matched,
+                MergeOp::Update(Cow::Owned(expand_update_star(names)?)),
+            ),
+            (
+                MergeClauseKind::NotMatched | MergeClauseKind::NotMatchedByTarget,
+                MergeAction::Insert(_),
+            ) if insert_star => {
+                star_columns(names, "INSERT *")?;
+                (&mut out.not_matched, MergeOp::Insert(&[], &INSERT_ROW))
+            }
             // sqlparser 0.62: MergeAction::Update is a tuple variant holding
             // MergeUpdateExpr; Delete is a struct variant carrying a token.
-            (MergeClauseKind::Matched, MergeAction::Update(update_expr)) => {
-                (&mut out.matched, MergeOp::Update(&update_expr.assignments))
-            }
+            (MergeClauseKind::Matched, MergeAction::Update(update_expr)) => (
+                &mut out.matched,
+                MergeOp::Update(Cow::Borrowed(&update_expr.assignments)),
+            ),
             (MergeClauseKind::Matched, MergeAction::Delete { .. }) => {
                 (&mut out.matched, MergeOp::Delete)
             }
@@ -360,7 +454,7 @@ pub(crate) fn classify_merge_clauses<'a>(
             ),
             (MergeClauseKind::NotMatchedBySource, MergeAction::Update(update_expr)) => (
                 &mut out.by_source,
-                MergeOp::Update(&update_expr.assignments),
+                MergeOp::Update(Cow::Borrowed(&update_expr.assignments)),
             ),
             (MergeClauseKind::NotMatchedBySource, MergeAction::Delete { .. }) => {
                 (&mut out.by_source, MergeOp::Delete)
@@ -2315,6 +2409,123 @@ mod tests {
             pair2 <= matched2,
             "unique keys must not violate: {pair2} vs {matched2}"
         );
+    }
+
+    /// Spark `UPDATE SET *` / `INSERT *`, as the front door rewrites them,
+    /// update and insert every target column from the same-named source
+    /// column.
+    #[tokio::test]
+    async fn update_set_star_and_insert_star_copy_every_column() {
+        let sql = sqe_sql::rewrite_merge_star(
+            "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET * \
+             WHEN NOT MATCHED THEN INSERT *",
+        );
+        let clauses = merge_clauses(&sql);
+        let ctx = SessionContext::new();
+        ctx.register_batch(
+            "__merge_target_x",
+            id_v_batch(vec![Some(1), Some(3)], vec![Some("old"), Some("keep")]),
+        )
+        .unwrap();
+        // The source has an extra column and a different column order.
+        let sschema = Arc::new(Schema::new(vec![
+            Field::new("extra", DataType::Utf8, true),
+            Field::new("v", DataType::Utf8, true),
+            Field::new("id", DataType::Int32, true),
+        ]));
+        let source = RecordBatch::try_new(
+            sschema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("x"), Some("y")])),
+                Arc::new(StringArray::from(vec![Some("new"), Some("ins")])),
+                Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
+            ],
+        )
+        .unwrap();
+        ctx.register_batch("__merge_source_x", source).unwrap();
+
+        let tc = cols(&["id", "v"]);
+        let sc = cols(&["extra", "v", "id"]);
+        let n = names(&tc, &sc);
+        let classified = classify_merge_clauses(&clauses, &n).expect("classify");
+        assert_eq!(classified.counts(), (1, 1, 0));
+        let select = build_merge_select(
+            &classified,
+            &n,
+            "__merge_target_x",
+            "__merge_source_x",
+            "__merge_target_x.id = __merge_source_x.id",
+        );
+        let rows = id_v_rows(&run_sql(&ctx, &select).await);
+        assert_eq!(
+            rows,
+            vec![
+                (Some(1), Some("new".to_string())),
+                (Some(2), Some("ins".to_string())),
+                (Some(3), Some("keep".to_string())),
+            ],
+            "{select}"
+        );
+    }
+
+    #[test]
+    fn star_forms_require_every_target_column_in_the_source() {
+        let tc = cols(&["id", "v", "note"]);
+        let sc = cols(&["id", "v"]);
+        let n = names(&tc, &sc);
+        for (form, sql) in [
+            (
+                "UPDATE SET *",
+                "MERGE INTO tgt AS t USING src AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET *",
+            ),
+            (
+                "INSERT *",
+                "MERGE INTO tgt AS t USING src AS s ON t.id = s.id WHEN NOT MATCHED THEN INSERT *",
+            ),
+        ] {
+            let clauses = merge_clauses(&sqe_sql::rewrite_merge_star(sql));
+            let Err(err) = classify_merge_clauses(&clauses, &n) else {
+                panic!("{form} with a missing source column must fail");
+            };
+            let msg = err.to_string();
+            assert!(msg.contains(form) && msg.contains("note"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn update_set_star_is_refused_when_not_matched_by_source() {
+        let sql = sqe_sql::rewrite_merge_star(
+            "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+             WHEN NOT MATCHED BY SOURCE THEN UPDATE SET *",
+        );
+        let clauses = merge_clauses(&sql);
+        let tc = cols(&["id", "v"]);
+        let n = names(&tc, &tc);
+        assert!(classify_merge_clauses(&clauses, &n).is_err());
+    }
+
+    /// The V3 row-lineage columns the handler appends are not star columns.
+    #[test]
+    fn update_set_star_skips_row_lineage_columns() {
+        let sql = sqe_sql::rewrite_merge_star(
+            "MERGE INTO tgt AS t USING src AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET *",
+        );
+        let clauses = merge_clauses(&sql);
+        let tc = cols(&[
+            "id",
+            "v",
+            iceberg::metadata_columns::RESERVED_COL_NAME_ROW_ID,
+            iceberg::metadata_columns::RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
+        ]);
+        let sc = cols(&["id", "v"]);
+        let n = names(&tc, &sc);
+        let classified = classify_merge_clauses(&clauses, &n).expect("classify");
+        let MergeOp::Update(assignments) = &classified.matched[0].op else {
+            panic!("expected an UPDATE");
+        };
+        let targets: Vec<String> = assignments.iter().map(|a| a.target.to_string()).collect();
+        assert_eq!(targets, vec!["\"id\"", "\"v\""]);
     }
 
     use arrow_array::Int64Array;
