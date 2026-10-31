@@ -1165,6 +1165,9 @@ impl EmbeddedClient {
         } else {
             None
         };
+        // So SHOW TABLES lists the views. A listing the server refuses only
+        // leaves them unlisted: each still loads by name.
+        let _ = provider.refresh_all_views().await;
         let provider = Arc::new(provider);
 
         self.ctx.register_catalog(
@@ -1835,16 +1838,33 @@ impl EmbeddedClient {
             }
         };
 
-        let session = self.write_session(catalog_name);
+        let warehouse = views.warehouse().to_string();
+        let session = self.write_session(catalog_name.clone());
         let ops = sqe_write::catalog_ops::CatalogOps::new(sqe_core::SqeConfig::embedded_defaults())
             .with_session_catalog(views);
         match create {
             Some(cv) => {
                 let schema = self.view_body_schema(&cv.query.to_string()).await?;
                 let schema_json = sqe_write::view_schema::arrow_schema_to_iceberg_json(&schema);
-                ops.create_view(&session, stmt, &schema_json).await?;
+                // The body names this catalog by its attach name, which only
+                // this session knows; store it under the warehouse name,
+                // which a coordinator or another engine resolves.
+                let mut stored = stmt.clone();
+                if let Statement::CreateView(cv) = &mut stored {
+                    sqe_sql::rename_catalog(&mut cv.query, &catalog_name, &warehouse);
+                }
+                ops.create_view(&session, &stored, &schema_json).await?;
             }
             None => ops.drop_view(&session, stmt).await?,
+        }
+
+        // SHOW TABLES serves the catalog's view listing; the statement
+        // succeeded even if the re-list does not.
+        let ident = sqe_write::ident::resolve_table_ident(name, &session)?;
+        if let Some(writable) = self.iceberg_catalogs.get(&catalog_name) {
+            let _ = writable
+                .refresh_views(&ident.namespace().as_ref().join("."))
+                .await;
         }
         Ok(Some(QueryResult {
             columns: vec![],
@@ -2341,8 +2361,13 @@ impl EmbeddedClient {
         &mut self,
         stmt: &sqlparser::ast::Statement,
     ) -> Result<Option<QueryResult>, Box<dyn std::error::Error>> {
-        let sqlparser::ast::Statement::ShowCreate { obj_name, .. } = stmt else {
+        let sqlparser::ast::Statement::ShowCreate { obj_type, obj_name } = stmt else {
             return Ok(None);
+        };
+        let want_view = match obj_type {
+            sqlparser::ast::ShowCreateObject::View => true,
+            sqlparser::ast::ShowCreateObject::Table => false,
+            _ => return Ok(None),
         };
         let parts = object_name_parts(obj_name);
         let (catalog, schema, table) = match parts.as_slice() {
@@ -2367,8 +2392,29 @@ impl EmbeddedClient {
             None => None,
         };
         let Some(provider) = provider else {
-            return Err(format!("table not found: {}", parts.join(".")).into());
+            let kind = if want_view { "view" } else { "table" };
+            return Err(format!("{kind} not found: {}", parts.join(".")).into());
         };
+        let is_view = provider.table_type() == datafusion::datasource::TableType::View;
+        match (want_view, is_view) {
+            (true, true) => {
+                return self
+                    .embedded_show_create_iceberg_view(&catalog, &schema, &table, &parts)
+                    .await
+                    .map(Some);
+            }
+            (false, true) => {
+                return Err(
+                    format!("Relation '{}' is a view, not a table", parts.join(".")).into(),
+                );
+            }
+            (true, false) => {
+                return Err(
+                    format!("Relation '{}' is a table, not a view", parts.join(".")).into(),
+                );
+            }
+            (false, false) => {}
+        }
         let columns: Vec<sqe_catalog::show_create::DdlColumn> = provider
             .schema()
             .fields()
@@ -2397,6 +2443,39 @@ impl EmbeddedClient {
             columns: vec!["Create Table".to_string()],
             rows: vec![vec![ddl]],
         }))
+    }
+
+    /// `SHOW CREATE VIEW` on an Iceberg view: its stored SQL, with the
+    /// warehouse name it is stored under (see
+    /// [`Self::embedded_handle_iceberg_view_ddl`]) shown as this session's
+    /// name for the catalog again.
+    async fn embedded_show_create_iceberg_view(
+        &self,
+        catalog: &str,
+        schema: &str,
+        view: &str,
+        parts: &[String],
+    ) -> Result<QueryResult, Box<dyn std::error::Error>> {
+        let Some(Some(views)) = self.rest_catalogs.get(catalog) else {
+            return Err(format!("view not found: {}", parts.join(".")).into());
+        };
+        let ns = iceberg::NamespaceIdent::new(schema.to_string());
+        let Some(body) = views.load_view_sql(&ns, view).await? else {
+            return Err(format!("view not found: {}", parts.join(".")).into());
+        };
+        // A body another engine wrote may not parse here; show it as stored.
+        let dialect = sqlparser::dialect::GenericDialect {};
+        let body = match sqlparser::parser::Parser::parse_sql(&dialect, &body).as_deref_mut() {
+            Ok([query]) => {
+                sqe_sql::rename_catalog(query, views.warehouse(), catalog);
+                query.to_string()
+            }
+            _ => body,
+        };
+        Ok(QueryResult {
+            columns: vec!["Create View".to_string()],
+            rows: vec![vec![format!("CREATE VIEW {} AS\n{body}", parts.join("."))]],
+        })
     }
 }
 
@@ -3383,6 +3462,34 @@ mod tests {
             .respond_with(ResponseTemplate::new(204))
             .mount(&server)
             .await;
+        // `v2` is stored the way this session writes a body over `pol.ns.v`:
+        // under the warehouse name.
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/ns/views/v2"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(load_view_response("SELECT x FROM wh.ns.v")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/ns/views/selfie"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(load_view_response("SELECT * FROM wh.ns.selfie")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/ns/views"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "identifiers": [
+                    {"namespace": ["ns"], "name": "v"},
+                    {"namespace": ["ns"], "name": "v2"}
+                ]
+            })))
+            .mount(&server)
+            .await;
 
         let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
         client
@@ -3393,6 +3500,78 @@ mod tests {
             .await
             .expect("attach");
 
+        let tables = client
+            .execute("SHOW TABLES IN pol.ns")
+            .await
+            .expect("show tables");
+        let mut listed: Vec<(String, String)> = tables
+            .rows
+            .iter()
+            .map(|r| (r[2].clone(), r[3].clone()))
+            .collect();
+        listed.sort();
+        assert_eq!(
+            listed,
+            vec![
+                ("v".to_string(), "VIEW".to_string()),
+                ("v2".to_string(), "VIEW".to_string())
+            ],
+            "the attach lists the namespace's views"
+        );
+
+        let rows = client
+            .execute("SELECT x FROM pol.ns.v2")
+            .await
+            .expect("a view over a view, named by the warehouse");
+        assert_eq!(rows.rows, vec![vec!["1".to_string()]]);
+        let ddl = client
+            .execute("SHOW CREATE VIEW pol.ns.v2")
+            .await
+            .expect("show create view");
+        assert_eq!(ddl.columns, vec!["Create View".to_string()]);
+        assert_eq!(
+            ddl.rows,
+            vec![vec![
+                "CREATE VIEW pol.ns.v2 AS\nSELECT x FROM pol.ns.v".to_string()
+            ]],
+            "the stored warehouse name shows as the attach name"
+        );
+        let err = client
+            .execute("SHOW CREATE TABLE pol.ns.v2")
+            .await
+            .expect_err("SHOW CREATE TABLE on a view");
+        assert!(
+            err.to_string()
+                .contains("Relation 'pol.ns.v2' is a view, not a table"),
+            "{err}"
+        );
+        let err = client
+            .execute("SELECT * FROM pol.ns.selfie")
+            .await
+            .expect_err("a view over itself");
+        assert!(
+            err.to_string().contains(
+                "view wh.ns.selfie references itself through wh.ns.selfie -> wh.ns.selfie"
+            ),
+            "{err}"
+        );
+
+        client
+            .execute("CREATE VIEW pol.ns.v3 AS SELECT x FROM pol.ns.v")
+            .await
+            .expect("create a view over a view");
+        let requests = server.received_requests().await.expect("recording on");
+        let stored = requests
+            .iter()
+            .filter(|r| r.method.as_str() == "POST" && r.url.path() == "/v1/namespaces/ns/views")
+            .map(|r| r.body_json::<serde_json::Value>().expect("json body"))
+            .find(|b| b["name"] == "v3")
+            .expect("CREATE VIEW v3 posted");
+        assert_eq!(
+            stored["view-version"]["representations"][0]["sql"], "SELECT x FROM wh.ns.v",
+            "the body is stored under the warehouse name"
+        );
+
         client
             .execute("CREATE VIEW pol.ns.v AS SELECT CAST(1 AS BIGINT) AS x")
             .await
@@ -3400,7 +3579,11 @@ mod tests {
         let requests = server.received_requests().await.expect("recording on");
         let create = requests
             .iter()
-            .find(|r| r.method.as_str() == "POST" && r.url.path() == "/v1/namespaces/ns/views")
+            .find(|r| {
+                r.method.as_str() == "POST"
+                    && r.url.path() == "/v1/namespaces/ns/views"
+                    && r.body_json::<serde_json::Value>().unwrap()["name"] == "v"
+            })
             .expect("CREATE VIEW posts to the views endpoint");
         assert_eq!(
             create

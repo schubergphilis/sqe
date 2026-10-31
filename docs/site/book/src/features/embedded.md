@@ -148,13 +148,21 @@ coordinator. The view records the body's SQL, its column types and the
 catalog's warehouse, and `OR REPLACE` lands as one commit that keeps the
 view's history. `SELECT` and `DESCRIBE` read through the view. Qualify the
 tables in the body with the attach name (`pol.sales.orders`), because the
-session default catalog is the in-memory one. The body is stored as written,
-so a coordinator that knows the catalog under another name cannot resolve
-it. Views need a bearer `TOKEN` or bearer `SECRET` on the attach; an OAuth2
-attach refuses them. The SQLite warehouse stores no views: `CREATE VIEW`
-there fails, and an unqualified `CREATE VIEW v` is still a session view.
-`SHOW TABLES` and `SHOW CREATE TABLE` do not list or render Iceberg views
-yet.
+session default catalog is the in-memory one. The stored body names the
+warehouse instead of the attach name (`pol.sales.orders` is stored as
+`<warehouse>.sales.orders`), so a coordinator or another attach that knows
+the catalog under a different name still resolves it. `SHOW CREATE VIEW`
+renders the body with the attach name again. `SHOW TABLES` and
+`information_schema.tables` list the views with type `VIEW`. The list is
+read when the catalog is attached and after each `CREATE VIEW` or `DROP
+VIEW` in the session; a view another client creates later reads fine but
+appears in `SHOW TABLES` only after the next attach. A view whose body
+reaches itself, directly or through other views, fails to read with
+`references itself through a -> b -> a` instead of recursing, and so does a
+chain more than 32 views deep. Views need a bearer `TOKEN` or bearer
+`SECRET` on the attach; an OAuth2 attach refuses them. The SQLite warehouse
+stores no views: `CREATE VIEW` there fails, and an unqualified `CREATE VIEW
+v` is still a session view.
 
 Tables in the warehouse are valid Iceberg. Point a cluster deployment (or any
 other Iceberg reader) at the same catalog later and they come along unchanged.
@@ -178,6 +186,7 @@ Exporting results to plain files goes through `COPY ... TO`; see
 | `CREATE VIEW` / `DROP VIEW` in an Iceberg catalog | REST catalogs | yes |
 | `SHOW TABLES [IN schema]`, `DESCRIBE` | yes | yes |
 | `SHOW CREATE TABLE` | yes | yes |
+| `SHOW CREATE VIEW` on an Iceberg view | REST catalogs | columns only |
 | `FOR VERSION AS OF` / `FOR SYSTEM_TIME AS OF` | Iceberg tables | yes |
 | Metadata tables (`orders$snapshots`) | yes | yes |
 | `CREATE BRANCH` / `CREATE TAG` | yes | yes |
