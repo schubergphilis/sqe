@@ -890,6 +890,38 @@ async fn test_create_and_drop_view() {
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 2, "Engineering dept has Alice and Bob");
 
+    // SHOW CREATE VIEW renders the stored body; the wrong kind fails as in
+    // Trino.
+    let batches = handler
+        .execute(&session, "SHOW CREATE VIEW test_ns.eng_view", None)
+        .await
+        .expect("SHOW CREATE VIEW should succeed");
+    let ddl = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .expect("string column")
+        .value(0)
+        .to_string();
+    assert_eq!(batches[0].schema().field(0).name(), "Create View");
+    assert!(
+        ddl.starts_with("CREATE VIEW test_ns.eng_view AS\n"),
+        "{ddl}"
+    );
+    assert!(ddl.contains("WHERE dept_id = 10"), "{ddl}");
+    let err = handler
+        .execute(&session, "SHOW CREATE TABLE test_ns.eng_view", None)
+        .await
+        .expect_err("SHOW CREATE TABLE on a view")
+        .to_string();
+    assert!(err.contains("is a view, not a table"), "{err}");
+    let err = handler
+        .execute(&session, "SHOW CREATE VIEW test_ns.employees", None)
+        .await
+        .expect_err("SHOW CREATE VIEW on a table")
+        .to_string();
+    assert!(err.contains("is a table, not a view"), "{err}");
+
     // DROP VIEW
     handler
         .execute(&session, "DROP VIEW test_ns.eng_view", None)
