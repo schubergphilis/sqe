@@ -5,6 +5,7 @@ mod embedded;
 mod error_render;
 mod flight;
 mod http;
+mod read_only_catalog;
 mod script;
 
 use clap::{Parser, ValueEnum};
