@@ -170,8 +170,60 @@ pub(crate) fn restore_single_partition_root(
     let fetch = plan.fetch();
     match ordering {
         Some(ordering) => Arc::new(SortPreservingMergeExec::new(ordering, plan).with_fetch(fetch)),
-        None => Arc::new(CoalescePartitionsExec::new(plan).with_fetch(fetch)),
+        None => match merge_below_order_hiding_root(&plan) {
+            Some(merged) => merged,
+            None => Arc::new(CoalescePartitionsExec::new(plan).with_fetch(fetch)),
+        },
     }
+}
+
+/// `SELECT expr FROM t ORDER BY col` with `col` not selected plans as
+/// `ProjectionExec[expr]` over a per-partition `SortExec` on `col`. The
+/// projection drops the sort column, so the root reports no ordering and a
+/// `CoalescePartitionsExec` at the root would interleave the sorted partitions:
+/// rows come back unordered.
+///
+/// Walk down from the root through operators that work row by row within a
+/// partition and keep row order (`ProjectionExec`, `FilterExec`,
+/// `CooperativeExec`, none carrying a fetch). If that reaches a
+/// `preserve_partitioning` `SortExec`, merge its partitions right there with a
+/// `SortPreservingMergeExec` (carrying the sort's fetch, so a TopK stays a
+/// global top `n`), then rebuild the operators above on the single merged
+/// partition. Running them on one partition instead of many gives the same rows
+/// in the same order, since none of them depends on partitioning.
+///
+/// Returns `None` when no such sort is found; the caller then coalesces.
+fn merge_below_order_hiding_root(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+    use datafusion::physical_plan::coop::CooperativeExec;
+    use datafusion::physical_plan::filter::FilterExec;
+    use datafusion::physical_plan::sorts::sort::SortExec;
+
+    if let Some(sort) = plan.downcast_ref::<SortExec>() {
+        if !sort.preserve_partitioning() {
+            return None;
+        }
+        let merged = SortPreservingMergeExec::new(sort.expr().clone(), Arc::clone(plan))
+            .with_fetch(sort.fetch());
+        return Some(Arc::new(merged));
+    }
+    let row_wise = plan.downcast_ref::<ProjectionExec>().is_some()
+        || plan.downcast_ref::<FilterExec>().is_some()
+        || plan.downcast_ref::<CooperativeExec>().is_some();
+    if !row_wise || plan.fetch().is_some() {
+        return None;
+    }
+    let children = plan.children();
+    let [child] = children.as_slice() else {
+        return None;
+    };
+    let child = Arc::clone(*child);
+    if child.output_partitioning().partition_count() != plan.output_partitioning().partition_count()
+    {
+        return None;
+    }
+    let merged_child = merge_below_order_hiding_root(&child)?;
+    datafusion::physical_plan::replace_children_if_necessary(Arc::clone(plan), vec![merged_child])
+        .ok()
 }
 
 /// Restore a global `LIMIT` that DataFusion's `LimitPushdown` stranded as a
@@ -541,6 +593,70 @@ mod tests {
             restored.downcast_ref::<CoalescePartitionsExec>().is_some(),
             "unordered multi-partition root must be coalesced"
         );
+    }
+
+    /// `ProjectionExec[val]` over a per-partition `SortExec` on `id`: the plan of
+    /// `SELECT val FROM t ORDER BY id`, whose root hides the sort column.
+    fn projection_hiding_sort(fetch: Option<usize>) -> Arc<dyn ExecutionPlan> {
+        use datafusion::physical_expr::expressions::col;
+        use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+        use datafusion::physical_plan::sorts::sort::SortExec;
+        let input = repartitioned(8);
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new_default(
+            col("id", &schema()).unwrap(),
+        )])
+        .unwrap();
+        let sort: Arc<dyn ExecutionPlan> = Arc::new(
+            SortExec::new(ordering, input)
+                .with_preserve_partitioning(true)
+                .with_fetch(fetch),
+        );
+        let val = col("val", &sort.schema()).unwrap();
+        Arc::new(ProjectionExec::try_new(vec![(val, "val".to_string())], sort).unwrap())
+    }
+
+    #[test]
+    fn root_hiding_the_sort_column_is_merged_below_the_projection() {
+        // SELECT val FROM t ORDER BY id: coalescing at the root would interleave
+        // the sorted partitions. The merge must sit on the sort, under the
+        // projection.
+        let root = projection_hiding_sort(None);
+        assert!(root.output_partitioning().partition_count() > 1);
+        assert!(root.output_ordering().is_none());
+
+        let restored = restore_single_partition_root(root);
+
+        assert_eq!(restored.output_partitioning().partition_count(), 1);
+        assert!(
+            restored.downcast_ref::<ProjectionExec>().is_some(),
+            "the projection stays at the root"
+        );
+        let child = Arc::clone(restored.children()[0]);
+        let merge = child
+            .downcast_ref::<SortPreservingMergeExec>()
+            .expect("the sorted partitions must be merged in order, not coalesced");
+        assert_eq!(merge.fetch(), None);
+    }
+
+    #[test]
+    fn root_hiding_a_topk_sort_carries_the_fetch_onto_the_merge() {
+        // SELECT val FROM t ORDER BY id LIMIT 5: each partition keeps its own top
+        // 5; the merge must cap the merged stream at 5.
+        let restored = restore_single_partition_root(projection_hiding_sort(Some(5)));
+
+        let child = Arc::clone(restored.children()[0]);
+        let merge = child
+            .downcast_ref::<SortPreservingMergeExec>()
+            .expect("merged in order");
+        assert_eq!(merge.fetch(), Some(5));
+    }
+
+    #[test]
+    fn unordered_projection_root_is_still_coalesced() {
+        // No sort under the projection: nothing to preserve.
+        let root = identity_projection(repartitioned(8));
+        let restored = restore_single_partition_root(root);
+        assert!(restored.downcast_ref::<CoalescePartitionsExec>().is_some());
     }
 
     #[test]
