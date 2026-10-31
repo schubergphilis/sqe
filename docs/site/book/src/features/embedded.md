@@ -186,7 +186,7 @@ Exporting results to plain files goes through `COPY ... TO`; see
 | `CREATE VIEW` / `DROP VIEW` in an Iceberg catalog | REST catalogs | yes |
 | `SHOW TABLES [IN schema]`, `DESCRIBE` | yes | yes |
 | `SHOW CREATE TABLE` | yes | yes |
-| `SHOW CREATE VIEW` on an Iceberg view | REST catalogs | columns only |
+| `SHOW CREATE VIEW` on an Iceberg view | REST catalogs | yes |
 | `FOR VERSION AS OF` / `FOR SYSTEM_TIME AS OF` | Iceberg tables | yes |
 | Metadata tables (`orders$snapshots`) | yes | yes |
 | `CREATE BRANCH` / `CREATE TAG` | yes | yes |
