@@ -704,6 +704,31 @@ impl RestCatalog {
     pub async fn path_prefix(&self) -> Result<Option<String>> {
         Ok(self.inner.client().await?.config.props.get("prefix").cloned())
     }
+
+    /// The bearer token this catalog's requests carry now, exchanging the
+    /// credential for one when none is cached; `None` when the catalog sends
+    /// no bearer. Lets a caller that talks to the server directly
+    /// authenticate as this catalog does; on a 401, report the token with
+    /// [`Self::bearer_token_rejected`] before asking again.
+    ///
+    /// SQE PATCH (embedded OAuth2 views).
+    pub async fn bearer_token(&self) -> Result<Option<String>> {
+        self.inner.client().await?.http_client.bearer_token().await
+    }
+
+    /// The server answered 401 to a request carrying `token`. Returns `true`
+    /// when the session dropped it, so the next [`Self::bearer_token`]
+    /// exchanges the credential again and a retry can succeed.
+    ///
+    /// SQE PATCH (embedded OAuth2 views).
+    pub async fn bearer_token_rejected(&self, token: &str) -> Result<bool> {
+        self.inner
+            .client()
+            .await?
+            .http_client
+            .bearer_token_rejected(token)
+            .await
+    }
 }
 
 /// Every operation forwards to its [`RestSessionCatalog`] equivalent with the

@@ -658,11 +658,33 @@ pub async fn invalidate_rest_catalog_cache_all() {
 /// Must stay in lockstep with `SessionCatalog::new`
 /// (`{url}-{warehouse}-vended{n}-deleg{n}-{fp}`: fingerprint last).
 /// Do not use [`sqe_core::Session::token_fingerprint`]: that string also
-/// prefixes the username and will not match these keys.
+/// prefixes the username and will not match these keys. An OAuth2 catalog
+/// (no bearer) is fingerprinted from [`oauth2_identity`] instead, so read a
+/// session's value from `SessionCatalog::token_fingerprint`.
 pub fn rest_catalog_token_fingerprint(bearer: &str) -> String {
     use sha2::{Digest, Sha256};
     let hash = hex::encode(Sha256::digest(bearer.as_bytes()));
     hash[..16].to_string()
+}
+
+/// The identity of a catalog that exchanges an OAuth2 `credential` for its
+/// own tokens (no session bearer): the credential plus where and for what it
+/// is exchanged. It stands in for the empty bearer in the fingerprint, so two
+/// credentials never share a cached catalog, table entries or a breaker.
+fn oauth2_identity(bearer_token: &str, props: &HashMap<String, String>) -> Option<String> {
+    if !bearer_token.is_empty() {
+        return None;
+    }
+    let credential = props.get("credential")?;
+    // Every prop the vendored client sends with the exchange.
+    let prop = |k: &str| props.get(k).map(String::as_str).unwrap_or_default();
+    Some(format!(
+        "oauth2\n{credential}\n{}\n{}\n{}\n{}",
+        prop("oauth2-server-uri"),
+        prop("scope"),
+        prop("audience"),
+        prop("resource")
+    ))
 }
 
 /// Keys whose last `-` segment equals `token_fingerprint`.
@@ -2163,7 +2185,10 @@ impl SessionCatalog {
         require_vended_credentials: bool,
         extra_props: HashMap<String, String>,
     ) -> sqe_core::Result<Self> {
-        let token_fingerprint = rest_catalog_token_fingerprint(bearer_token);
+        let token_fingerprint = match oauth2_identity(bearer_token, &extra_props) {
+            Some(identity) => rest_catalog_token_fingerprint(&identity),
+            None => rest_catalog_token_fingerprint(bearer_token),
+        };
 
         info!(
             catalog_url = catalog_url,
@@ -2362,6 +2387,66 @@ impl SessionCatalog {
     /// (Glue/HMS/JDBC/Hadoop) have no caller to scope a namespace list to.
     pub fn is_rest_backend(&self) -> bool {
         matches!(self.inner, CatalogHandle::Rest(_))
+    }
+
+    /// The vendored client when it exchanges an OAuth2 credential for its
+    /// own tokens: no session bearer, no SigV4, a `credential` property.
+    fn oauth2_client(&self) -> Option<&RestCatalog> {
+        match &self.inner {
+            CatalogHandle::Rest(rest)
+                if self.sigv4.is_none()
+                    && oauth2_identity(&self.bearer_token, &self.extra_props).is_some() =>
+            {
+                Some(rest)
+            }
+            _ => None,
+        }
+    }
+
+    /// The bearer SQE's raw HEAD/GET/POST calls carry: the session token,
+    /// or for an OAuth2 catalog the token its client exchanged (cached in
+    /// the client; exchanged on first use).
+    async fn raw_bearer(&self) -> sqe_core::Result<String> {
+        let Some(rest) = self.oauth2_client() else {
+            return Ok(self.bearer_token.clone());
+        };
+        rest.bearer_token()
+            .await
+            .map(Option::unwrap_or_default)
+            .map_err(|e| classify_iceberg_catalog_error("OAuth2 token exchange failed", e))
+    }
+
+    /// Send a raw catalog request with [`Self::raw_bearer`]. An OAuth2
+    /// token the server rejects with 401 (expired) is dropped from the
+    /// client and the request is sent once more with a fresh one, as the
+    /// vendored client does for its own calls. The outer error is a request
+    /// that could not be built or authenticated; the inner one a transport
+    /// failure, left to the caller to classify.
+    async fn execute_raw(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> sqe_core::Result<Result<reqwest::Response, reqwest::Error>> {
+        // Only an OAuth2 catalog can retry; the bearer and SigV4 paths stay
+        // one send with no copy.
+        let retry = self.oauth2_client().and_then(|_| req.try_clone());
+        let token = self.raw_bearer().await?;
+        let sent = authenticate_raw_request(req, self.sigv4.as_deref(), &token).await?;
+        let resp = match self.http_client.execute(sent).await {
+            Ok(resp) => resp,
+            Err(e) => return Ok(Err(e)),
+        };
+        if resp.status() != reqwest::StatusCode::UNAUTHORIZED || token.is_empty() {
+            return Ok(Ok(resp));
+        }
+        let (Some(rest), Some(retry)) = (self.oauth2_client(), retry) else {
+            return Ok(Ok(resp));
+        };
+        if !rest.bearer_token_rejected(&token).await.unwrap_or(false) {
+            return Ok(Ok(resp));
+        }
+        let token = self.raw_bearer().await?;
+        let sent = authenticate_raw_request(retry, None, &token).await?;
+        Ok(self.http_client.execute(sent).await)
     }
 
     /// Probe whether this session's caller may see `namespace` at all.
@@ -2684,7 +2769,8 @@ impl SessionCatalog {
                     if cached {
                         let http_client = self.http_client.clone();
                         let sigv4 = self.sigv4.clone();
-                        let bearer_token = self.bearer_token.clone();
+                        // Best effort like the HEAD itself: no token, no ETag.
+                        let bearer_token = self.raw_bearer().await.unwrap_or_default();
                         let url = self.table_url(table_ident).await;
                         let table_cache = self.table_cache.clone();
                         let table_ident_log = table_ident.clone();
@@ -2754,10 +2840,7 @@ impl SessionCatalog {
         for (k, v) in trace_context_http_headers() {
             req = req.header(k, v);
         }
-        let req =
-            authenticate_raw_request(req, self.sigv4.as_deref(), &self.bearer_token).await?;
-
-        let response = self.http_client.execute(req).await.map_err(|e| {
+        let response = self.execute_raw(req).await?.map_err(|e| {
             record_breaker_class(&self.circuit_breaker, transport_failure_class(&e));
             SqeError::catalog_src(format!("Failed to authorize table {table_ident}: {e}"), e)
         })?;
@@ -2944,10 +3027,7 @@ impl SessionCatalog {
         if let Some(body) = body {
             req = req.json(&body);
         }
-        let req =
-            authenticate_raw_request(req, self.sigv4.as_deref(), &self.bearer_token).await?;
-
-        let resp = match self.http_client.execute(req).await {
+        let resp = match self.execute_raw(req).await? {
             Ok(resp) => resp,
             Err(e) => {
                 record_breaker_class(&self.circuit_breaker, transport_failure_class(&e));
@@ -5889,12 +5969,12 @@ mod view_rest_tests {
     use std::time::Duration;
 
     use iceberg::{NamespaceIdent, TableIdent};
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{
-        select_view_sql, sqe_view_version, view_replace_updates, view_schema_from_json,
-        SessionCatalog, TableMetadataCache,
+        oauth2_identity, rest_catalog_token_fingerprint, select_view_sql, sqe_view_version,
+        view_replace_updates, view_schema_from_json, SessionCatalog, TableMetadataCache,
     };
     use crate::circuit_breaker::CircuitBreaker;
 
@@ -6195,6 +6275,124 @@ mod view_rest_tests {
             .with_label_values(&["load_view", "err"])
             .get_sample_count();
         assert_eq!((ok, failed), (1, 2));
+    }
+
+    fn oauth2_token_response(token: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": token,
+            "token_type": "Bearer",
+            "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+            "expires_in": 3600,
+        }))
+    }
+
+    async fn oauth2_session(server: &MockServer, credential: &str) -> SessionCatalog {
+        SessionCatalog::new_with_props(
+            &server.uri(),
+            WAREHOUSE,
+            "",
+            &sqe_core::config::StorageConfig::default(),
+            None,
+            None,
+            None,
+            false,
+            HashMap::from([("credential".to_string(), credential.to_string())]),
+        )
+        .await
+        .expect("construct session catalog")
+    }
+
+    /// An OAuth2 catalog (no session bearer, a `credential`) sends its raw
+    /// view calls with the token its client exchanged, and on a 401 drops
+    /// that token, exchanges a new one and retries once.
+    #[tokio::test]
+    async fn oauth2_raw_calls_carry_the_exchanged_token_and_refresh_on_401() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/oauth/tokens"))
+            .respond_with(oauth2_token_response("tok-1"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/oauth/tokens"))
+            .respond_with(oauth2_token_response("tok-2"))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "defaults": {}, "overrides": {"prefix": "wh"}
+            })))
+            .mount(&server)
+            .await;
+        let doc = serde_json::json!({
+            "metadata-location": "s3://bucket/sales/v/metadata/v2.json",
+            "metadata": view_metadata_json(1, &[("sqe", "SELECT 1 AS x")]),
+        });
+        // The first token reads one view, then is rejected as expired.
+        Mock::given(method("GET"))
+            .and(path("/v1/wh/namespaces/sales/views/v"))
+            .and(header("authorization", "Bearer tok-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(doc.clone()))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/wh/namespaces/sales/views/v"))
+            .and(header("authorization", "Bearer tok-1"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("expired"))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/wh/namespaces/sales/views/v"))
+            .and(header("authorization", "Bearer tok-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(doc))
+            .mount(&server)
+            .await;
+
+        let session = oauth2_session(&server, "client:secret").await;
+        for _ in 0..2 {
+            assert_eq!(
+                session.load_view_sql(&sales(), "v").await.unwrap(),
+                Some("SELECT 1 AS x".to_string())
+            );
+        }
+        let exchanges = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/v1/oauth/tokens")
+            .count();
+        assert_eq!(exchanges, 2, "one exchange, one refresh after the 401");
+    }
+
+    /// Two OAuth2 credentials on one catalog never share a fingerprint
+    /// (cached catalog, table entries, breaker); a bearer catalog keeps the
+    /// bearer's.
+    #[test]
+    fn oauth2_identity_keys_on_the_credential() {
+        let props = |c: &str| HashMap::from([("credential".to_string(), c.to_string())]);
+        let a = oauth2_identity("", &props("a:1")).unwrap();
+        let b = oauth2_identity("", &props("b:2")).unwrap();
+        assert_ne!(
+            rest_catalog_token_fingerprint(&a),
+            rest_catalog_token_fingerprint(&b)
+        );
+        assert_ne!(
+            rest_catalog_token_fingerprint(&a),
+            rest_catalog_token_fingerprint("")
+        );
+        let mut aud = props("a:1");
+        aud.insert("audience".to_string(), "other".to_string());
+        assert_ne!(Some(a.clone()), oauth2_identity("", &aud));
+        assert!(oauth2_identity("tok", &props("a:1")).is_none());
+        assert!(oauth2_identity("", &HashMap::new()).is_none());
     }
 
     /// `CREATE OR REPLACE VIEW` on an existing view is one `replaceView`
