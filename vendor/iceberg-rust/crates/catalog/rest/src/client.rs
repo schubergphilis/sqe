@@ -170,20 +170,35 @@ impl HttpClient {
     /// back, so it works for any [`AuthSession`].
     #[cfg(test)]
     pub(crate) async fn token(&self) -> Option<String> {
+        self.bearer_token().await.ok().flatten()
+    }
+
+    /// SQE PATCH (embedded OAuth2 views): the bearer token `session` would
+    /// attach, with authentication errors (a failed exchange) passed on.
+    pub(crate) async fn bearer_token(&self) -> Result<Option<String>> {
         let mut request = HttpRequest::build(
             self.client
                 .request(Method::GET, "http://localhost/token-probe"),
-        )
-        .ok()?;
-        self.auth_session.authenticate(&mut request).await.ok()?;
+        )?;
+        self.auth_session.authenticate(&mut request).await?;
         let request = request.into_inner();
-        request
+        Ok(request
             .headers()
-            .get(reqwest::header::AUTHORIZATION)?
-            .to_str()
-            .ok()?
-            .strip_prefix("Bearer ")
-            .map(str::to_string)
+            .get(reqwest::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(str::to_string))
+    }
+
+    /// SQE PATCH (embedded OAuth2 views): `token` drew a 401; let the session
+    /// drop it. `true` when a retry with a fresh token can succeed.
+    pub(crate) async fn bearer_token_rejected(&self, token: &str) -> Result<bool> {
+        let request = HttpRequest::build(
+            self.client
+                .request(Method::GET, "http://localhost/token-probe")
+                .bearer_auth(token),
+        )?;
+        self.auth_session.on_unauthorized(&request).await
     }
 
     #[inline]
