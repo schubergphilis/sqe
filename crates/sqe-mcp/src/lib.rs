@@ -1116,11 +1116,19 @@ async fn call_tool(
         .session
         .clone()
         .with_source(Some(source_label(name, client)));
-    let result = if is_metadata_tool(name) {
+    let mut result = if is_metadata_tool(name) {
         state.executor.execute_metadata(&session, &sql).await
     } else {
         state.executor.execute(&session, &sql).await
     };
+    // `SHOW CREATE TABLE` refuses a view, as Trino does; the DDL of a view
+    // is its `SHOW CREATE VIEW`.
+    if name == "get_table_ddl"
+        && matches!(&result, Err(e) if e.to_string().contains("is a view, not a table"))
+    {
+        let view_sql = format!("SHOW CREATE VIEW {}", table_ref(&args)?);
+        result = state.executor.execute_metadata(&session, &view_sql).await;
+    }
     match result {
         Ok(batches) => {
             let batches = if show_catalogs {
@@ -4576,6 +4584,56 @@ mod tests {
         assert_eq!(executor.query_lane.load(Ordering::SeqCst), 0);
         // SHOW SCHEMAS + 135 SHOW TABLES + one SHOW VIEWS per schema on the page.
         assert_eq!(executor.metadata_lane.load(Ordering::SeqCst), 1 + 135 + 135);
+    }
+
+    /// `SHOW CREATE TABLE` refuses a view, so `get_table_ddl` asks for the
+    /// view's DDL instead.
+    #[tokio::test]
+    async fn get_table_ddl_falls_back_to_show_create_view() {
+        struct ViewDdl(Mutex<Vec<String>>);
+        #[async_trait]
+        impl QueryExecutor for ViewDdl {
+            async fn execute(&self, _s: &Session, sql: &str) -> Result<Vec<RecordBatch>, SqeError> {
+                self.0.lock().unwrap().push(sql.to_string());
+                if sql.starts_with("SHOW CREATE TABLE") {
+                    return Err(SqeError::with_code(
+                        SqeErrorCode::SemanticError,
+                        "Relation 'glue.bi.v' is a view, not a table".to_string(),
+                    ));
+                }
+                let schema = Arc::new(Schema::new(vec![Field::new(
+                    "Create View",
+                    DataType::Utf8,
+                    false,
+                )]));
+                let column = StringArray::from(vec!["CREATE VIEW glue.bi.v AS\nSELECT 1"]);
+                Ok(vec![
+                    RecordBatch::try_new(schema, vec![Arc::new(column)]).unwrap()
+                ])
+            }
+        }
+        let executor = Arc::new(ViewDdl(Mutex::new(Vec::new())));
+        let state = McpServerState::new(Arc::new(MockAuth), executor.clone(), static_config(false));
+        let auth = AuthContext {
+            session: local_session("mcp-reader".into(), vec![]),
+            scopes: None,
+        };
+        let result = call_tool(
+            &state,
+            &auth,
+            None,
+            &json!({"name": "get_table_ddl", "arguments": {"catalog": "glue", "schema": "bi", "table": "v"}}),
+        )
+        .await
+        .unwrap();
+        assert_ne!(result["isError"], true, "{result}");
+        assert!(
+            result.to_string().contains("CREATE VIEW glue.bi.v"),
+            "{result}"
+        );
+        let asked = executor.0.lock().unwrap().clone();
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert!(asked[1].starts_with("SHOW CREATE VIEW"), "{asked:?}");
     }
 
     /// `list_tables` carries the kind of every name from one `SHOW VIEWS`, so an
