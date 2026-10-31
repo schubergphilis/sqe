@@ -632,7 +632,12 @@ impl SqeSchemaProvider {
         name: &'a str,
         sql: String,
     ) -> futures::future::BoxFuture<'a, DFResult<Option<Arc<dyn TableProvider>>>> {
-        Box::pin(self.plan_view_inner(name, sql))
+        Box::pin(plan_view_guarded(
+            &self.warehouse,
+            &self.namespace,
+            name,
+            self.plan_view_inner(name, sql),
+        ))
     }
 
     async fn plan_view_inner(
@@ -745,6 +750,46 @@ pub(crate) fn view_planning_context(catalog: &str) -> SessionContext {
     )
 }
 
+tokio::task_local! {
+    /// The views this task is planning, outermost first, as folded
+    /// `warehouse.namespace.view` keys. A view body naming a view already on
+    /// the stack would plan forever.
+    static VIEWS_IN_PLANNING: Vec<String>;
+}
+
+/// Deepest chain of views over views a query may plan.
+const MAX_VIEW_DEPTH: usize = 32;
+
+/// Run `plan`, the planning of view `warehouse.namespace.name`, refusing a
+/// view whose body reaches itself (`CREATE OR REPLACE VIEW v AS SELECT *
+/// FROM v`, or `a` over `b` over `a`). A view body plans in the reading task,
+/// so the task-local stack sees every nested view load.
+pub(crate) async fn plan_view_guarded<T>(
+    warehouse: &str,
+    namespace: &str,
+    name: &str,
+    plan: impl std::future::Future<Output = DFResult<T>>,
+) -> DFResult<T> {
+    let key = format!("{warehouse}.{namespace}.{name}").to_ascii_lowercase();
+    let mut stack = VIEWS_IN_PLANNING.try_with(Clone::clone).unwrap_or_default();
+    if let Some(start) = stack.iter().position(|k| *k == key) {
+        let mut cycle = stack[start..].to_vec();
+        cycle.push(key);
+        return Err(DataFusionError::Plan(format!(
+            "view {} references itself through {}",
+            cycle[0],
+            cycle.join(" -> ")
+        )));
+    }
+    if stack.len() >= MAX_VIEW_DEPTH {
+        return Err(DataFusionError::Plan(format!(
+            "view {key} nests more than {MAX_VIEW_DEPTH} views deep"
+        )));
+    }
+    stack.push(key);
+    VIEWS_IN_PLANNING.scope(stack, plan).await
+}
+
 /// The `ViewTable` for view `name`, from its body planned in a
 /// [`view_planning_context`]: scans named by the table they resolved to
 /// ([`qualify_view_scans`], `session_name` being the catalog's name in the
@@ -767,6 +812,42 @@ pub(crate) fn view_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plan view `views[0]`, whose body names `views[1]`, and so on.
+    fn plan_chain(
+        views: &'static [&'static str],
+    ) -> futures::future::BoxFuture<'static, DFResult<()>> {
+        Box::pin(plan_view_guarded("WH", "ns", views[0], async move {
+            match views.get(1) {
+                Some(_) => plan_chain(&views[1..]).await,
+                None => Ok(()),
+            }
+        }))
+    }
+
+    #[tokio::test]
+    async fn view_planning_refuses_a_view_that_reaches_itself() {
+        let err = plan_chain(&["v", "V"]).await.unwrap_err().to_string();
+        assert!(
+            err.contains("view wh.ns.v references itself through wh.ns.v -> wh.ns.v"),
+            "{err}"
+        );
+        let err = plan_chain(&["a", "b", "a"]).await.unwrap_err().to_string();
+        assert!(err.contains("wh.ns.a -> wh.ns.b -> wh.ns.a"), "{err}");
+
+        // A view used twice side by side is no cycle, and the stack does
+        // not outlive the planning that pushed it.
+        plan_chain(&["a", "b"]).await.unwrap();
+        plan_chain(&["a", "b"]).await.unwrap();
+        static DEEP: [&str; 40] = [
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
+            "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25",
+            "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37",
+            "v38", "v39",
+        ];
+        let err = plan_chain(&DEEP).await.unwrap_err().to_string();
+        assert!(err.contains("more than 32 views deep"), "{err}");
+    }
 
     /// DDL is visible to every session, so it drops every principal's
     /// snapshot of the namespace, and only that namespace's.

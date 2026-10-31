@@ -309,7 +309,7 @@ Iceberg V3 table format support landed end-to-end. V3 is the default format-vers
 - `ALTER TABLE` on the warehouse and on attached Iceberg catalogs, through the coordinator's DDL handler: column add, drop, rename and type change (nested fields included), `SET TBLPROPERTIES`, partition evolution, identifier fields, branches and tags, `RENAME TO`
 - `SHOW CREATE TABLE` on Iceberg tables, rendered by the same code as on a coordinator: columns, `PARTITIONED BY`, sort order and `TBLPROPERTIES`, and the printed DDL creates the table again
 - Time travel (`FOR VERSION AS OF <snapshot id | 'branch' | 'tag'>`, `FOR TIMESTAMP AS OF`, `FOR SYSTEM_TIME AS OF`) on the warehouse and on attached Iceberg catalogs, resolved by the same code as the coordinator
-- `CREATE [OR REPLACE] VIEW` / `DROP VIEW` on attached Iceberg REST catalogs, stored by the coordinator's view code and read back through the view; the SQLite warehouse, which stores no views, refuses them
+- `CREATE [OR REPLACE] VIEW` / `DROP VIEW` on attached Iceberg REST catalogs, stored by the coordinator's view code and read back through the view; `SHOW TABLES` and `information_schema` list them, `SHOW CREATE VIEW` renders the body, the stored body names the warehouse rather than the attach name, and a view that reaches itself fails instead of recursing (on the coordinator too); the SQLite warehouse, which stores no views, refuses them
 - Quack RPC (`sqe-quack-wire` / `sqe-quack-server` / `sqe-quack-client`): a pure-Rust port of DuckDB's BinarySerializer, so DuckDB clients can talk to SQE over HTTP
 
 Full reference: [Embedded CLI](../getting-started/cli.md).
