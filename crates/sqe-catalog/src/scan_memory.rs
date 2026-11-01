@@ -38,6 +38,20 @@
 //! Without a per-query quota the pool's own `reserved()` is the whole
 //! node's charge, so every denial counts as the query's own and stays
 //! immediate.
+//!
+//! The fetch stage is also bounded in bytes, not only in subtasks
+//! ([`FetchBudget`]): fetch-ahead is `3 x num_cpus` subtasks, which at a
+//! 3 GB quota and ~25 MB projected subtasks held ~0.8 GB of unspillable
+//! reservations before a single row reached a sort; with the 4x decode
+//! estimate on top, a 150M-row sort spilled 165 runs where the same query
+//! untracked spilled 77. A fetch admission over the budget waits rather
+//! than fails. That is not the "own-quota denial never waits" case above:
+//! the bytes it waits for are held by this scan node's own earlier subtasks,
+//! which release them when they move to their decode admission. That move
+//! needs a decode permit, and decode permits wait on downstream backpressure,
+//! so this is the same wait the fetch permits already impose, counted in
+//! bytes instead of subtasks; it adds no new wait cycle. The time spent
+//! waiting shows as the scan's `fetch_budget_wait` metric.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -46,6 +60,7 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::memory_pool::{
     MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
 };
+use datafusion::physical_plan::metrics::Time;
 use futures::future::BoxFuture;
 use iceberg::arrow::DecodeGate;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -58,6 +73,24 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// corrected to the actual decoded size where the batches are visible (the
 /// direct-read path), and released at subtask end on the vendored path.
 pub const DECODE_MEMORY_ESTIMATE_FACTOR: u64 = 4;
+
+/// Multiplier for the vendored reader's decode admission. That reader
+/// streams a subtask one row group at a time, so it holds the projected
+/// compressed column chunks of the current row group plus the pages and
+/// batches being decoded, not the whole subtask decompressed. Measured on
+/// 150M rows (~25 MB projected subtasks, 44 in flight), a scan with nothing
+/// downstream peaked at 1.2 GiB RSS untracked, about 1x per subtask in
+/// flight; 4x reserved twice that and starved the query's sorts. 2x keeps
+/// a margin. The direct-read path reads whole files and keeps
+/// [`DECODE_MEMORY_ESTIMATE_FACTOR`], corrected to the decoded size.
+pub const STREAMING_DECODE_FACTOR: u64 = 2;
+
+/// Share of a finite memory pool, in percent, that one scan node's fetch
+/// stage may hold ([`FetchBudget`]).
+pub const FETCH_BUDGET_PERCENT: usize = 10;
+
+/// Smallest fetch budget, so a small pool still pipelines a few subtasks.
+pub const FETCH_BUDGET_FLOOR_BYTES: usize = 64 * 1024 * 1024;
 
 const PPM: u32 = 1_000_000;
 
@@ -82,6 +115,52 @@ pub fn decode_tracking_enabled() -> bool {
     })
 }
 
+/// Byte bound on one scan node's fetch stage, shared by every partition:
+/// `FETCH_BUDGET_PERCENT` of the pool's limit, at least
+/// `FETCH_BUDGET_FLOOR_BYTES`. Counted in KiB permits. One admission takes
+/// at most the whole budget, so a subtask larger than the budget still runs,
+/// alone.
+#[derive(Debug)]
+pub struct FetchBudget {
+    kib: Arc<Semaphore>,
+    cap_kib: u32,
+}
+
+impl FetchBudget {
+    /// The budget for a scan whose memory comes from `pool`; `None` when the
+    /// pool has no finite limit.
+    pub fn for_pool(pool: &dyn MemoryPool) -> Option<Arc<Self>> {
+        match pool.memory_limit() {
+            MemoryLimit::Finite(limit) => Some(Self::with_bytes(
+                (limit / 100)
+                    .saturating_mul(FETCH_BUDGET_PERCENT)
+                    .max(FETCH_BUDGET_FLOOR_BYTES),
+            )),
+            _ => None,
+        }
+    }
+
+    /// A budget of `bytes` (rounded down to KiB, at least 1 KiB).
+    pub fn with_bytes(bytes: usize) -> Arc<Self> {
+        let cap_kib = u32::try_from(bytes / 1024).unwrap_or(u32::MAX).max(1);
+        Arc::new(Self {
+            kib: Arc::new(Semaphore::new(cap_kib as usize)),
+            cap_kib,
+        })
+    }
+
+    async fn acquire(&self, bytes: u64) -> DFResult<OwnedSemaphorePermit> {
+        let kib = u32::try_from(bytes.div_ceil(1024))
+            .unwrap_or(u32::MAX)
+            .clamp(1, self.cap_kib);
+        self.kib
+            .clone()
+            .acquire_many_owned(kib)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))
+    }
+}
+
 /// Admission gate for one scan node's decode work: a shared concurrency
 /// bound plus a per-decode memory reservation. Implements the vendored
 /// reader's [`DecodeGate`] hook and is used directly by the direct-read
@@ -99,6 +178,8 @@ pub struct ScanDecodeGate {
     label: String,
     /// `false` = permits only, no pool reservations (escape hatch).
     track_memory: bool,
+    /// Byte bound on the fetch stage, shared scan-wide; unset = permits only.
+    fetch_budget: std::sync::OnceLock<(Arc<FetchBudget>, Time)>,
     /// Share of a split's bytes the scan's projection actually reads, in
     /// parts per million (see [`Self::set_projected_share`]). Applied to the
     /// vendored reader's admissions only.
@@ -130,6 +211,7 @@ impl ScanDecodeGate {
             pool,
             label,
             track_memory,
+            fetch_budget: std::sync::OnceLock::new(),
             projected_share_ppm: AtomicU32::new(PPM),
             memory_wait_ms: AtomicU64::new(0),
             waited_ms: AtomicU64::new(0),
@@ -151,6 +233,7 @@ impl ScanDecodeGate {
             pool,
             label,
             track_memory,
+            fetch_budget: std::sync::OnceLock::new(),
             projected_share_ppm: AtomicU32::new(PPM),
             memory_wait_ms: AtomicU64::new(0),
             waited_ms: AtomicU64::new(0),
@@ -175,6 +258,13 @@ impl ScanDecodeGate {
     fn projected(&self, estimated_bytes: u64) -> u64 {
         let ppm = u64::from(self.projected_share_ppm.load(Ordering::Relaxed));
         (u128::from(estimated_bytes) * u128::from(ppm) / u128::from(PPM)) as u64
+    }
+
+    /// Bound the fetch stage by `budget` (see [`FetchBudget`]), adding the
+    /// time admissions wait on it to `wait`. The first call wins; the budget
+    /// is scan-wide, so every partition's gate gets the same one.
+    pub fn set_fetch_budget(&self, budget: Arc<FetchBudget>, wait: Time) {
+        let _ = self.fetch_budget.set((budget, wait));
     }
 
     /// Let an admission the node pool refuses wait up to `wait` for other
@@ -242,14 +332,24 @@ impl ScanDecodeGate {
             .acquire_owned()
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let reservation = if self.track_memory {
+        let (budget, reservation) = if self.track_memory {
+            let budget = match self.fetch_budget.get() {
+                Some((budget, wait)) => {
+                    let start = std::time::Instant::now();
+                    let permit = budget.acquire(estimated_bytes).await?;
+                    wait.add_elapsed(start);
+                    Some(permit)
+                }
+                None => None,
+            };
             let estimate = usize::try_from(estimated_bytes).unwrap_or(usize::MAX);
-            Some(self.reserve(estimate).await?)
+            (budget, Some(self.reserve(estimate).await?))
         } else {
-            None
+            (None, None)
         };
         Ok(DecodeAdmission {
             _permit: permit,
+            _budget: budget,
             reservation,
         })
     }
@@ -259,6 +359,12 @@ impl ScanDecodeGate {
     /// permit is released on denial, so a rejected query never wedges the
     /// scan.
     pub async fn admit(&self, estimated_bytes: u64) -> DFResult<DecodeAdmission> {
+        self.admit_scaled(estimated_bytes, DECODE_MEMORY_ESTIMATE_FACTOR)
+            .await
+    }
+
+    /// [`Self::admit`] reserving `factor` x `estimated_bytes`.
+    async fn admit_scaled(&self, estimated_bytes: u64, factor: u64) -> DFResult<DecodeAdmission> {
         let permit = self
             .permits
             .clone()
@@ -267,14 +373,14 @@ impl ScanDecodeGate {
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let reservation = if self.track_memory {
             let estimate =
-                usize::try_from(estimated_bytes.saturating_mul(DECODE_MEMORY_ESTIMATE_FACTOR))
-                    .unwrap_or(usize::MAX);
+                usize::try_from(estimated_bytes.saturating_mul(factor)).unwrap_or(usize::MAX);
             Some(self.reserve(estimate).await?)
         } else {
             None
         };
         Ok(DecodeAdmission {
             _permit: permit,
+            _budget: None,
             reservation,
         })
     }
@@ -283,7 +389,8 @@ impl ScanDecodeGate {
 impl DecodeGate for ScanDecodeGate {
     fn admit(&self, estimated_bytes: u64) -> BoxFuture<'_, iceberg::Result<Box<dyn Any + Send>>> {
         Box::pin(async move {
-            let admission = ScanDecodeGate::admit(self, self.projected(estimated_bytes))
+            let admission = self
+                .admit_scaled(self.projected(estimated_bytes), STREAMING_DECODE_FACTOR)
                 .await
                 .map_err(refused)?;
             Ok(Box::new(admission) as Box<dyn Any + Send>)
@@ -322,6 +429,8 @@ fn refused(error: DataFusionError) -> iceberg::Error {
 #[derive(Debug)]
 pub struct DecodeAdmission {
     _permit: OwnedSemaphorePermit,
+    /// Fetch-budget share, fetch admissions only.
+    _budget: Option<OwnedSemaphorePermit>,
     reservation: Option<MemoryReservation>,
 }
 
@@ -533,7 +642,7 @@ mod tests {
         let (gate, pool) = gate(1 << 30, 4, true);
         gate.set_projected_share(0.25);
         let vendored = DecodeGate::admit(gate.as_ref(), 4096).await.expect("admits");
-        let scaled = 1024 * DECODE_MEMORY_ESTIMATE_FACTOR as usize;
+        let scaled = 1024 * STREAMING_DECODE_FACTOR as usize;
         assert_eq!(pool.reserved(), scaled);
         // The direct-read path holds whole files and stays unscaled.
         let direct = gate.admit(4096).await.expect("admits");
@@ -733,13 +842,90 @@ mod tests {
         let (gate, pool) = gate(1 << 30, 4, true);
         gate.set_projected_share(0.0);
         let low = DecodeGate::admit(gate.as_ref(), 3200).await.expect("admits");
-        assert_eq!(pool.reserved(), 100 * DECODE_MEMORY_ESTIMATE_FACTOR as usize);
+        assert_eq!(pool.reserved(), 100 * STREAMING_DECODE_FACTOR as usize);
         drop(low);
         for share in [2.0, f64::NAN] {
             gate.set_projected_share(share);
             let full = DecodeGate::admit(gate.as_ref(), 1000).await.expect("admits");
-            assert_eq!(pool.reserved(), 1000 * DECODE_MEMORY_ESTIMATE_FACTOR as usize);
+            assert_eq!(pool.reserved(), 1000 * STREAMING_DECODE_FACTOR as usize);
             drop(full);
         }
+    }
+
+    #[tokio::test]
+    async fn fetch_admission_over_the_budget_waits_for_an_earlier_one() {
+        let (gate, pool) = staged_gate(1 << 30, 4, 8, true);
+        let wait = Time::new();
+        gate.set_fetch_budget(FetchBudget::with_bytes(100 * 1024), wait.clone());
+        let first = gate.admit_fetch(60 * 1024).await.expect("fits the budget");
+        let mut second = Box::pin(gate.admit_fetch(60 * 1024));
+        assert!(
+            second.as_mut().now_or_never().is_none(),
+            "120 KiB in flight over a 100 KiB budget must park"
+        );
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(first);
+        });
+        let second = second.await.expect("admitted once the first released");
+        release.await.unwrap();
+        assert!(wait.value() > 0, "the wait is recorded");
+        assert_eq!(pool.reserved(), 60 * 1024);
+        drop(second);
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_fetch_larger_than_the_budget_runs_alone() {
+        let (gate, _pool) = staged_gate(1 << 30, 4, 8, true);
+        gate.set_fetch_budget(FetchBudget::with_bytes(64 * 1024), Time::new());
+        let big = gate
+            .admit_fetch(1 << 20)
+            .await
+            .expect("clamped to the whole budget");
+        let mut next = Box::pin(gate.admit_fetch(1024));
+        assert!(
+            next.as_mut().now_or_never().is_none(),
+            "the big one holds it all"
+        );
+        drop(big);
+        next.await.expect("admitted after the big one");
+    }
+
+    #[tokio::test]
+    async fn the_decode_upgrade_never_waits_on_the_fetch_budget() {
+        let (gate, _pool) = staged_gate(1 << 30, 4, 8, true);
+        gate.set_fetch_budget(FetchBudget::with_bytes(64 * 1024), Time::new());
+        let _fetch = gate
+            .admit_fetch(64 * 1024)
+            .await
+            .expect("takes the whole budget");
+        let decode = DecodeGate::admit(gate.as_ref(), 64 * 1024).now_or_never();
+        assert!(
+            matches!(decode, Some(Ok(_))),
+            "decode admission ignores the budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn untracked_gate_ignores_the_fetch_budget() {
+        let (gate, _pool) = staged_gate(1 << 30, 4, 8, false);
+        gate.set_fetch_budget(FetchBudget::with_bytes(64 * 1024), Time::new());
+        let _a = gate.admit_fetch(1 << 20).await.expect("admits");
+        assert!(gate.admit_fetch(1 << 20).now_or_never().is_some());
+    }
+
+    #[test]
+    fn fetch_budget_is_a_share_of_a_finite_pool_with_a_floor() {
+        let pool = GreedyMemoryPool::new(3 << 30);
+        let budget = FetchBudget::for_pool(&pool).expect("finite pool");
+        assert_eq!(
+            budget.cap_kib as usize,
+            (3usize << 30) / 100 * FETCH_BUDGET_PERCENT / 1024
+        );
+        let small = FetchBudget::for_pool(&GreedyMemoryPool::new(1 << 20)).expect("finite");
+        assert_eq!(small.cap_kib as usize, FETCH_BUDGET_FLOOR_BYTES / 1024);
+        let unbounded = datafusion::execution::memory_pool::UnboundedMemoryPool::default();
+        assert!(FetchBudget::for_pool(&unbounded).is_none());
     }
 }
