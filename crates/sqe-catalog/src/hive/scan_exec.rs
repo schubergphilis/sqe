@@ -38,6 +38,7 @@ use url::Url;
 
 use arrow_schema::SchemaRef;
 use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::Statistics;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::session_state::SessionState;
@@ -46,6 +47,7 @@ use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::statistics::{ChildStats, StatisticsArgs};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan,
@@ -467,6 +469,25 @@ impl ExecutionPlan for HiveScanExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    /// The wrapped scan's row count and sizes, passed through. DataFusion 55
+    /// reads statistics through these two methods (the deprecated
+    /// `partition_statistics` is no longer called); without them this node
+    /// reports nothing and a small table is never broadcast in a join.
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> DFResult<Arc<Statistics>> {
+        Ok(input_stats
+            .first()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(Statistics::new_unknown(&self.schema()))))
     }
 
     /// SQE PATCH (DataFusion 55): owns no expressions of its own. The wrapped
