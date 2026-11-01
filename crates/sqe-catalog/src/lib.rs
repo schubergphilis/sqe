@@ -22,6 +22,8 @@ pub mod info_schema;
 pub mod late_materialize;
 pub mod lazy_object_store;
 pub mod mount;
+pub mod parallel_probe_scan;
+pub mod parallel_scan;
 pub mod physical_to_predicate;
 pub mod pruning_stats;
 pub mod puffin_stats;

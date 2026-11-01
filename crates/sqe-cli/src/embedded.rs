@@ -300,6 +300,23 @@ pub fn build_embedded_context_with_mask(
         .map_err(|e| anyhow::anyhow!("failed to build runtime env: {e}"))?;
 
     let ctx = sqe_catalog::engine_context(session_config, runtime);
+    // Iceberg scans fan out the way the coordinator's post-planning pass fans
+    // them out: an `IcebergScanExec` starts as one partition (see the #131
+    // note in `SqeTableProvider::scan`), and these two rules bump it to
+    // `target_partitions` after join modes are decided, so no hash build is
+    // coalesced. Appended after DataFusion's own physical rules. No byte
+    // threshold: the coordinator's `distribution_threshold` exists to keep
+    // small scans off workers, and in-process there is no hand-off to save.
+    let ctx = SessionContext::new_with_state(
+        datafusion::execution::SessionStateBuilder::new_from_existing(ctx.state())
+            .with_physical_optimizer_rule(Arc::new(
+                sqe_catalog::parallel_probe_scan::ParallelProbeScanRule::new(),
+            ))
+            .with_physical_optimizer_rule(Arc::new(
+                sqe_catalog::parallel_scan::ParallelScanRule::new(0),
+            ))
+            .build(),
+    );
 
     // V8: enable `SELECT * FROM 'file.parquet'` auto-detection. The wrapped
     // catalog list resolves quoted-string table names against
