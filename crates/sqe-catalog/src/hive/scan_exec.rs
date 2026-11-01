@@ -37,6 +37,7 @@ use object_store::ObjectMeta;
 use url::Url;
 
 use arrow_schema::SchemaRef;
+use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::Statistics;
 use datafusion::error::Result as DFResult;
@@ -301,6 +302,21 @@ impl ExecutionPlan for LazyPartitionScanExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         Vec::new()
+    }
+
+    /// Nothing is listed at plan time, so there are no file statistics, but
+    /// `execute` never emits more than `limit` rows: report that as an
+    /// inexact row count. Without it the scan reports nothing, and a join
+    /// against `(SELECT .. FROM hive_table LIMIT n)` is hash-partitioned
+    /// instead of broadcasting the small side.
+    fn statistics_from_inputs(
+        &self,
+        _input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> DFResult<Arc<Statistics>> {
+        let mut stats = Statistics::new_unknown(&self.schema());
+        stats.num_rows = Precision::Inexact(self.parts.limit);
+        Ok(Arc::new(stats))
     }
 
     fn apply_expressions(
