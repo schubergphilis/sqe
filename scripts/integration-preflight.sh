@@ -35,6 +35,10 @@ PORTS=(18181 19000 15432)
 COMPOSE_ARGS=( -f "$ROOT_DIR/docker-compose.test.yml" )
 if [ "$DISTRIBUTED" = "1" ]; then
     PORTS+=(60051 28080 29090 60061 29091 60062 29092)
+    # The native workers integration-test.sh starts on the host: Flight, then
+    # metrics + health (metrics+1) per worker. A leftover worker from an
+    # aborted run shows up here as a non-Docker holder.
+    PORTS+=(50052 50053 19191 19192 19193 19194)
     COMPOSE_ARGS+=( -f "$ROOT_DIR/docker-compose.distributed.yml" )
 fi
 

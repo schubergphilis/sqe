@@ -28,6 +28,87 @@ docker compose "${COMPOSE_ARGS[@]}" up -d
 # ── Bootstrap (idempotent) ────────────────────────────────────
 "$BOOTSTRAP_SCRIPT"
 
+# ── Native workers (DISTRIBUTED=1) ────────────────────────────
+# Six tests dispatch to workers the TEST process dials directly:
+# test_distributed_select, rewrite_data_files_distributed_parity (x3),
+# compaction_distributed_benchmark and json/shredded_variant_column_scans_on_a_worker.
+# They cannot use the overlay's worker containers: the test coordinator hands
+# each worker an S3 connection built from tests/sqe-test.toml
+# (s3_endpoint = http://localhost:19000), and `localhost` inside a container
+# is the container. So the workers run natively on this host, on :50052 and
+# :50053, the URLs those tests dial by default.
+#
+# Each worker gets its own metrics port (health is metrics+1), spill dir and
+# advertise URL. The advertise URL must equal the URL the coordinator dials:
+# a scan ticket's audience is checked against it verbatim. No coordinator_url,
+# so no heartbeat: the tests build a static worker registry.
+#
+# Set SQE_IT_WORKER_URLS to run against workers you started yourself; the
+# script then starts none.
+WORKER_PIDS=()
+stop_workers() {
+    for pid in ${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}; do
+        kill "$pid" 2>/dev/null || true
+    done
+    for pid in ${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}; do
+        wait "$pid" 2>/dev/null || true
+    done
+}
+trap stop_workers EXIT
+
+if [ "$DISTRIBUTED" = "1" ] && [ -z "${SQE_IT_WORKER_URLS:-}" ]; then
+    # The `cargo dev-server` build, so it shares the `make dev` cache.
+    echo "Building sqe-server for the native workers..."
+    cargo build --no-default-features --bin sqe-server
+    WORKER_BIN="$ROOT_DIR/target/debug/sqe-server"
+    WORKER_URLS=""
+    i=0
+    for port in 50052 50053; do
+        metrics_port=$((19191 + 2 * i))
+        log="/tmp/sqe-it-worker-$port.log"
+        spill="/tmp/sqe-it-worker-$port-spill"
+        rm -rf "$spill"
+        echo "Starting native worker on :$port (log: $log)"
+        RUST_LOG="${WORKER_RUST_LOG:-sqe=info,warn}" \
+        SQE_WORKER__FLIGHT_PORT="$port" \
+        SQE_WORKER__ADVERTISE_URL="http://localhost:$port" \
+        SQE_WORKER__ALLOW_UNAUTHENTICATED=true \
+        SQE_WORKER__SPILL_DIR="$spill" \
+        SQE_METRICS__PROMETHEUS_PORT="$metrics_port" \
+            "$WORKER_BIN" --mode worker --config "$ROOT_DIR/tests/sqe-test.toml" \
+            > "$log" 2>&1 &
+        WORKER_PIDS+=("$!")
+        WORKER_URLS="${WORKER_URLS:+$WORKER_URLS,}http://localhost:$port"
+        i=$((i + 1))
+    done
+    # Wait until every worker ACCEPTS on its Flight port: a test that dials a
+    # worker still booting fails with "worker unreachable". Not /readyz: the
+    # worker marks itself ready just before it binds Flight.
+    i=0
+    for port in 50052 50053; do
+        pid="${WORKER_PIDS[$i]}"
+        for _ in $(seq 1 60); do
+            (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break
+            if ! kill -0 "$pid" 2>/dev/null; then
+                echo "ERROR: native worker on :$port exited during startup:" >&2
+                tail -30 "/tmp/sqe-it-worker-$port.log" >&2
+                exit 1
+            fi
+            sleep 1
+        done
+        if ! (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+            echo "ERROR: native worker on :$port not accepting after 60s:" >&2
+            tail -30 "/tmp/sqe-it-worker-$port.log" >&2
+            exit 1
+        fi
+        i=$((i + 1))
+    done
+    echo "Native workers up: $WORKER_URLS"
+    # compaction_distributed_benchmark defaults to four workers; two is enough
+    # for its row-count guardrails.
+    export SQE_IT_WORKER_URLS="$WORKER_URLS"
+fi
+
 # ── Run integration tests ─────────────────────────────────────
 # Clean up any stale log files from aborted previous runs
 rm -f /tmp/sqe-test-*.log
@@ -50,7 +131,8 @@ echo "Running integration tests..."
 # :50052 (issue #122 — local-fallback masking distributed dispatch bugs).
 # Default (DISTRIBUTED=0): this script targets docker-compose.test.yml (no worker);
 # distributed coverage is exercised via DISTRIBUTED=1 or scripts/test.sh scenario distributed.
-# When DISTRIBUTED=1 the distributed compose overlay is used and the skip is omitted.
+# When DISTRIBUTED=1 the distributed compose overlay is used, the native workers
+# above are started and the skip is omitted.
 # Skip the test here unless the caller passes
 # their own filter args ($# > 0 implies an explicit test name was selected).
 SKIP_ARGS=()
