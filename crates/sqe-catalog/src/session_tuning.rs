@@ -18,15 +18,20 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::eliminate_cross_join::EliminateCrossJoin;
 
+mod sorted_row_number;
+
+pub use sorted_row_number::{SortedRowNumberExec, SortedRowNumberRule};
+
 /// A context for user SQL: `config` and `runtime`, planned by
 /// [`EngineQueryPlanner`], with SQE's [`EliminateCrossJoin`] in place of
-/// DataFusion's.
+/// DataFusion's and [`SortedRowNumberRule`] after DataFusion's physical rules.
 pub fn engine_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> SessionContext {
     let state = SessionStateBuilder::new()
         .with_config(config)
         .with_runtime_env(runtime)
         .with_default_features()
         .with_optimizer_rules(engine_optimizer_rules())
+        .with_physical_optimizer_rule(Arc::new(SortedRowNumberRule))
         .with_query_planner(Arc::new(EngineQueryPlanner))
         .build();
     SessionContext::new_with_state(state)
