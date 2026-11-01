@@ -131,6 +131,30 @@ this tree's `scan/mod.rs` and drops its scan-level fixtures (covered by the SQE
 `allow_non_primitive_void_source` flag; #3413 keys on a single `source_id`; #262 keeps
 the V3 deletion-vector check in `validate_added_files`.
 
+Round 3 (2026-11-01):
+
+| Source | Commit | Fix |
+|---|---|---|
+| apache #3539 | `36aa0e43` | Parquet writer skips NaN when it tracks min/max |
+| apache #3437 | `de0a6ac8` | Nested struct fields of files without field ids read as null |
+| apache #3432 | `1ee5c72a` | Dropped-source partition values (int, long, uuid, decimal) render instead of panicking |
+| apache #3420 | `b5cc6a1c` | Partition field name check skipped for a dropped source column |
+| apache #3144 | `2135b377` | `IN` predicates prune when every literal falls outside the bounds on either side |
+| RW #264 | `9b1bce2d` | Manifest bounds on non-primitive fields are ignored, not an error |
+| RW #269 | `c61e1f32` | Writers stamp the unpartitioned spec id on their files |
+
+Round 3 adjustments: #3144 keeps this tree's fallible `bytes_to_datum` (an undecodable
+bound keeps the file); #3432's summary fix lives in `collect_file` (this tree has no
+`transaction/snapshot/mod.rs`), it also covers `int` -> `long` promotion, and its
+partition-path test is replaced by a `Datum` display test in `spec/values/tests.rs`;
+RW #264 keeps the shredded-variant branch ahead of the primitive check.
+
+Deferred to a separate change, measured with the engine bench: apache #3277 (data-file
+opens on the IO runtime; collides with this tree's pipeline patches), #3516 and #3454
+(scan and delete-selection perf), and RW #263 (one delete manifest per spec). RW #265
+(deleting duplicate data file references) rewrites the commit path that carries SQE's
+own summary patches; until then such a delete fails with "referenced multiple times".
+
 Not taken: apache #3145 (makes `FileScanTaskDeleteFile` fields private and its builder
 fallible; needs an SQE API migration and collides with the DV patches), #3354 (Avro
 reader locking), #2904 (already here as the sqe#358 patch in `scan/mod.rs`), #3107, and

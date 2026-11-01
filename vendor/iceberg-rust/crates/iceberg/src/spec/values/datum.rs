@@ -300,8 +300,16 @@ impl Display for Datum {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match (&self.r#type, &self.literal) {
             (_, PrimitiveLiteral::Boolean(val)) => write!(f, "{val}"),
-            (PrimitiveType::Int, PrimitiveLiteral::Int(val)) => write!(f, "{val}"),
-            (PrimitiveType::Long, PrimitiveLiteral::Long(val)) => write!(f, "{val}"),
+            // A dropped partition source reads back as `Unknown`, and a promoted
+            // one (int -> long) pairs a `Long` type with an `Int` literal.
+            (
+                PrimitiveType::Int | PrimitiveType::Long | PrimitiveType::Unknown,
+                PrimitiveLiteral::Int(val),
+            ) => write!(f, "{val}"),
+            (
+                PrimitiveType::Int | PrimitiveType::Long | PrimitiveType::Unknown,
+                PrimitiveLiteral::Long(val),
+            ) => write!(f, "{val}"),
             (_, PrimitiveLiteral::Float(val)) => write!(f, "{val}"),
             (_, PrimitiveLiteral::Double(val)) => write!(f, "{val}"),
             (PrimitiveType::Date, PrimitiveLiteral::Int(val)) => {
@@ -323,7 +331,7 @@ impl Display for Datum {
                 write!(f, "{}", timestamptz::nanoseconds_to_datetimetz(*val))
             }
             (_, PrimitiveLiteral::String(val)) => write!(f, r#""{val}""#),
-            (PrimitiveType::Uuid, PrimitiveLiteral::UInt128(val)) => {
+            (PrimitiveType::Uuid | PrimitiveType::Unknown, PrimitiveLiteral::UInt128(val)) => {
                 write!(f, "{}", uuid::Uuid::from_u128(*val))
             }
             (_, PrimitiveLiteral::Binary(val)) => display_bytes(val, f),
@@ -336,6 +344,8 @@ impl Display for Datum {
             ) => {
                 write!(f, "{}", decimal_from_i128_with_scale(*val, *scale))
             }
+            // The scale lives on the dropped source type, so only the unscaled value is left.
+            (PrimitiveType::Unknown, PrimitiveLiteral::Int128(val)) => write!(f, "{val}"),
             // A value that didn't fit the target type during a narrowing conversion
             // (e.g. `Transform::Day` producing a day-since-epoch outside `i32`'s range
             // for an extreme source timestamp). These are real, persisted partition
