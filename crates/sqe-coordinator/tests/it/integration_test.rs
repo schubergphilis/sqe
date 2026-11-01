@@ -355,8 +355,8 @@ async fn test_local_fallback_select() {
 // when the worker is unreachable and check system.runtime.tasks to
 // confirm at least one task ran on a worker node.
 //
-// Wired into CI via scripts/integration-test.sh (DISTRIBUTED=1) +
-// dedicated distributed-smoke job in .gitlab-ci.yml (Q-05).
+// `make test-distributed` (scripts/integration-test.sh with DISTRIBUTED=1)
+// starts a native worker on :50052 for it. There is no CI job.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:polaris+workers; a worker on :50052"]
 async fn test_distributed_select() {
@@ -368,8 +368,8 @@ async fn test_distributed_select() {
     assert!(
         socket.is_ok(),
         "worker unreachable at {worker_url}: distributed test must fail loudly, \
-         not fall back to local. Start the worker (cargo run -p sqe-worker -- \
-         tests/sqe-test.toml) or use --ignored to skip."
+         not fall back to local. Run it through `make test-distributed`, which \
+         starts the worker."
     );
 
     // `rig` zeroes both distribution thresholds. Under the defaults (4 files,

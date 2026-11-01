@@ -249,10 +249,9 @@ pub async fn setup_handler_with_workers(
         assert!(
             reachable,
             "worker unreachable at {url}: a distributed test must fail loudly, not fall \
-             back to local execution. Start a worker there, e.g.:\n  \
-             SQE_WORKER__FLIGHT_PORT={} cargo run -p sqe-worker -- {}\n\
-             or pass --ignored to skip.",
-            port,
+             back to local execution. Run it through `make test-distributed`, which \
+             starts native workers on :50052 and :50053; a worker on :{port} must use \
+             {} and set SQE_WORKER__ADVERTISE_URL={url}.",
             test_config_path(),
         );
     }

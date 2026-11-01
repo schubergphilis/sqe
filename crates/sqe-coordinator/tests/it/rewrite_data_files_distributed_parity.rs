@@ -77,16 +77,11 @@
 //! and a container cannot reach the test host's `localhost`. A worker
 //! process running natively on the same host as this test binary can.
 //!
+//! `make test-distributed` starts both workers (see the "Native workers" block
+//! in `scripts/integration-test.sh` for the env each one needs):
+//!
 //! ```text
-//! docker compose -f docker-compose.test.yml up -d
-//! ./scripts/bootstrap-test.sh
-//!
-//! # Two workers, same test config, distinct ports:
-//! cargo run -p sqe-worker -- tests/sqe-test.toml &
-//! SQE_WORKER__FLIGHT_PORT=50053 cargo run -p sqe-worker -- tests/sqe-test.toml &
-//!
-//! cargo test -p sqe-coordinator --test it -- --ignored \
-//!   rewrite_data_files_distributed_parity --test-threads=1 --nocapture
+//! make test-distributed FILTER=rewrite_data_files_distributed_parity
 //! ```
 //!
 //! Both worker processes use the test config's empty `worker_secret`, which
