@@ -3,14 +3,13 @@
 //! coordinator still sees variant storage, renders it as JSON and runs the
 //! JSON functions on it.
 //!
-//! Needs the `docker-compose.test.yml` stack plus a native `sqe-worker` on
-//! `http://localhost:50052` (override with `SQE_IT_WORKER_URLS`,
-//! comma-separated). `scripts/integration-test.sh` skips this file by default:
+//! The two `*_scans_on_a_worker` tests need the `docker-compose.test.yml`
+//! stack plus a native worker on `http://localhost:50052` (override with
+//! `SQE_IT_WORKER_URLS`, comma-separated). `make test-integration` skips them;
+//! `make test-distributed` starts the workers and runs them:
 //!
 //! ```text
-//! SQE_WORKER__FLIGHT_PORT=50052 SQE_WORKER__ALLOW_UNAUTHENTICATED=true \
-//!   cargo run -p sqe-server -- --mode worker --config tests/sqe-test.toml &
-//! cargo test -p sqe-coordinator --test it -- --ignored variant_distributed
+//! make test-distributed FILTER=variant_distributed
 //! ```
 
 use arrow_array::Array;

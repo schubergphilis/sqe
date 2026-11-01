@@ -243,10 +243,15 @@ release:
 	@echo "Binaries:"
 	@ls -lh $(RELEASE_BIN)/$(BIN_CLI) $(RELEASE_BIN)/$(BIN_SERVER)
 
+# 32 MiB test-thread stacks, as CI runs them (AIKIDO_RUST_MIN_STACK in
+# .gitlab-ci.yml). Rust's 2 MiB default is too small for some debug-build
+# tests, and a stack overflow aborts the whole test binary, not one test.
+UNIT_RUST_MIN_STACK ?= 33554432
+
 test:
 	@echo "==> Running unit tests"
-	$(CARGO) test --workspace --exclude sqe-cli
-	$(CARGO) test --package sqe-cli --no-default-features
+	RUST_MIN_STACK=$(UNIT_RUST_MIN_STACK) $(CARGO) test --workspace --exclude sqe-cli
+	RUST_MIN_STACK=$(UNIT_RUST_MIN_STACK) $(CARGO) test --package sqe-cli --no-default-features
 
 # ── Integration suites (LOCAL ONLY — see issue #387) ──────────────────────
 # The `integration-test` and `distributed-smoke` CI jobs are gone: they needed a
