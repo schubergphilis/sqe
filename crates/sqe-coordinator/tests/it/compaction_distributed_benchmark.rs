@@ -40,22 +40,14 @@
 //!
 //! ## Running this test (default synthetic wiring-smoke mode)
 //!
-//! Needs Polaris + RustFS plus N live `sqe-worker` processes (default 4, at
-//! `:50052`-`:50055`; override count/ports via `SQE_IT_WORKER_URLS`) -- same
-//! native-worker setup as `rewrite_data_files_distributed_parity.rs`
-//! documents, just more of them:
+//! Needs Polaris + RustFS plus N live native `sqe-server --mode worker`
+//! processes (default 4, at `:50052`-`:50055`; override count/ports via
+//! `SQE_IT_WORKER_URLS`). `make test-distributed` starts two, on `:50052` and
+//! `:50053`, and points `SQE_IT_WORKER_URLS` at them (see the "Native
+//! workers" block in `scripts/integration-test.sh` for the env each needs):
 //!
 //! ```text
-//! docker compose -f docker-compose.test.yml up -d
-//! ./scripts/bootstrap-test.sh
-//!
-//! cargo run -p sqe-worker -- tests/sqe-test.toml &
-//! SQE_WORKER__FLIGHT_PORT=50053 cargo run -p sqe-worker -- tests/sqe-test.toml &
-//! SQE_WORKER__FLIGHT_PORT=50054 cargo run -p sqe-worker -- tests/sqe-test.toml &
-//! SQE_WORKER__FLIGHT_PORT=50055 cargo run -p sqe-worker -- tests/sqe-test.toml &
-//!
-//! cargo test -p sqe-coordinator --test it -- --ignored \
-//!   distributed_rewrite_wall_clock_ratio --nocapture
+//! make test-distributed FILTER=distributed_rewrite_wall_clock_ratio
 //! ```
 
 use std::time::Instant;
