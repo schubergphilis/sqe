@@ -44,7 +44,7 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion_iceberg::IcebergCatalogProvider;
 use iceberg::inspect::MetadataTableType;
-use iceberg::{Catalog, NamespaceIdent};
+use iceberg::{Catalog, NamespaceIdent, TableIdent};
 
 use crate::rest_catalog::SessionCatalog;
 
@@ -105,6 +105,7 @@ impl WritableIcebergCatalog {
     fn wrap(&self, namespace: &str, provider: Arc<dyn SchemaProvider>) -> Arc<dyn SchemaProvider> {
         Arc::new(BaseTablesOnly {
             inner: provider,
+            catalog: Arc::clone(&self.catalog),
             namespace: namespace.to_string(),
             views: Arc::clone(&self.views),
         })
@@ -309,6 +310,10 @@ impl WritableIcebergCatalog {
 #[derive(Debug)]
 struct BaseTablesOnly {
     inner: Arc<dyn SchemaProvider>,
+    /// The catalog `inner` reads, so a base table is scanned through SQE's
+    /// own [`crate::table_provider::SqeTableProvider`] rather than the
+    /// vendored `IcebergTableProvider`.
+    catalog: Arc<dyn Catalog>,
     namespace: String,
     views: Arc<OnceLock<ViewSource>>,
 }
@@ -451,6 +456,27 @@ impl SchemaProvider for BaseTablesOnly {
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        // A base table reads through `SqeTableProvider`, the provider the
+        // coordinator uses: its `IcebergScanExec` splits large files into
+        // byte ranges and the parallel-scan rules fan it out, where the
+        // vendored `IcebergTableScan` is always one partition and reloads
+        // the table from the catalog on every scan. `$snapshots` and the
+        // other metadata tables stay on the vendored provider.
+        if !is_metadata_table_name(name) && self.inner.table_exist(name) {
+            let ident = TableIdent::new(
+                NamespaceIdent::new(self.namespace.clone()),
+                name.to_string(),
+            );
+            let table = self
+                .catalog
+                .load_table(&ident)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let provider = crate::table_provider::SqeTableProvider::try_new(table)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            return Ok(Some(Arc::new(provider)));
+        }
         if let Some(table) = self.inner.table(name).await? {
             return Ok(Some(table));
         }
@@ -515,6 +541,7 @@ mod tests {
         }
         let wrapped = BaseTablesOnly {
             inner,
+            catalog: memory_catalog().await,
             namespace: "ns".to_string(),
             views: Arc::new(OnceLock::new()),
         };
@@ -523,5 +550,63 @@ mod tests {
         assert_eq!(names, vec!["cost$eur".to_string(), "t".to_string()]);
         assert!(wrapped.table_exist("t$snapshots"));
         assert!(wrapped.table("t$history").await.unwrap().is_some());
+    }
+
+    async fn memory_catalog() -> Arc<dyn Catalog> {
+        use iceberg::CatalogBuilder;
+        Arc::new(
+            iceberg::memory::MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    [("warehouse".to_string(), "memory:///wh".to_string())].into(),
+                )
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// A base table reads through `SqeTableProvider` (parallel, byte-range
+    /// split scan), not the vendored one-partition `IcebergTableProvider`.
+    #[tokio::test]
+    async fn base_tables_read_through_sqe_table_provider() {
+        use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
+        use iceberg::TableCreation;
+
+        let catalog = memory_catalog().await;
+        let ns = NamespaceIdent::new("ns".into());
+        catalog
+            .create_namespace(&ns, Default::default())
+            .await
+            .unwrap();
+        let schema = IcebergSchema::builder()
+            .with_fields(vec![NestedField::optional(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            )
+            .into()])
+            .build()
+            .unwrap();
+        catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name("t".into())
+                    .schema(schema)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let writable = WritableIcebergCatalog::try_new(catalog).await.unwrap();
+        let schema = writable.schema("ns").expect("namespace listed");
+        let table = schema.table("t").await.unwrap().expect("table resolves");
+        let any: &dyn std::any::Any = table.as_ref();
+        assert!(
+            any.downcast_ref::<crate::table_provider::SqeTableProvider>()
+                .is_some(),
+            "base table should be an SqeTableProvider"
+        );
+        assert!(schema.table("missing").await.unwrap().is_none());
     }
 }

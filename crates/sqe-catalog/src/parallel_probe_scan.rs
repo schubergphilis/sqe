@@ -37,7 +37,7 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::scalar_subquery::ScalarSubqueryExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
-use sqe_catalog::iceberg_scan::IcebergScanExec;
+use crate::iceberg_scan::IcebergScanExec;
 use tracing::debug;
 
 /// Physical optimizer rule that parallelizes the probe-side Iceberg scan of
