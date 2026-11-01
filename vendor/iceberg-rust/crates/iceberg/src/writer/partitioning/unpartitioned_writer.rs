@@ -20,6 +20,7 @@
 use std::marker::PhantomData;
 
 use crate::Result;
+use crate::spec::PartitionKey;
 use crate::writer::{
     DefaultInput, DefaultOutput, IcebergWriter, IcebergWriterBuilder, PositionDeleteInput,
 };
@@ -28,6 +29,12 @@ use crate::writer::{
 ///
 /// This writer lazily creates the underlying writer on the first write operation
 /// and writes all data to a single file (or set of files if rolling).
+///
+/// Written files take their `partition_spec_id` from the partition key passed to the inner
+/// builder; without one they get spec id 0. That is only correct for a table that was never
+/// partitioned. A table whose spec evolved to unpartitioned (in format v2, removing every field
+/// creates a new, empty spec with a non-zero id) needs [`Self::new_with_partition_key`], or
+/// commits that require added files to match the default spec will reject the output.
 ///
 /// # Type Parameters
 ///
@@ -42,6 +49,7 @@ where
     <O as IntoIterator>::Item: Clone,
 {
     inner_builder: B,
+    partition_key: Option<PartitionKey>,
     writer: Option<B::R>,
     output: Vec<<O as IntoIterator>::Item>,
     _phantom: PhantomData<I>,
@@ -54,13 +62,28 @@ where
     O: IntoIterator + FromIterator<<O as IntoIterator>::Item>,
     <O as IntoIterator>::Item: Send + Clone,
 {
-    /// Create a new `UnpartitionedWriter`.
+    /// Create a new `UnpartitionedWriter` whose files get spec id 0.
+    ///
+    /// Prefer [`Self::new_with_partition_key`] when the table's unpartitioned spec may have a
+    /// non-zero id.
     pub fn new(inner_builder: B) -> Self {
         Self {
             inner_builder,
+            partition_key: None,
             writer: None,
             output: Vec::new(),
             _phantom: PhantomData,
+        }
+    }
+
+    /// Create a new `UnpartitionedWriter` whose files carry `partition_key`'s spec id.
+    ///
+    /// `partition_key` should hold the table's unpartitioned spec and an empty `Struct`.
+    /// Location generators treat such a key as no key, so file paths stay flat.
+    pub fn new_with_partition_key(inner_builder: B, partition_key: PartitionKey) -> Self {
+        Self {
+            partition_key: Some(partition_key),
+            ..Self::new(inner_builder)
         }
     }
 
@@ -78,7 +101,7 @@ where
     pub async fn write(&mut self, input: I) -> Result<()> {
         // Lazily create writer on first write
         if self.writer.is_none() {
-            self.writer = Some(self.inner_builder.build(None).await?);
+            self.writer = Some(self.inner_builder.build(self.partition_key.clone()).await?);
         }
 
         // Write directly to inner writer
@@ -94,7 +117,7 @@ where
     /// See [`IcebergWriter::write_with_position`] for details.
     pub async fn write_with_position(&mut self, input: I) -> Result<Vec<PositionDeleteInput>> {
         if self.writer.is_none() {
-            self.writer = Some(self.inner_builder.build(None).await?);
+            self.writer = Some(self.inner_builder.build(self.partition_key.clone()).await?);
         }
 
         self.writer
@@ -186,7 +209,11 @@ mod tests {
         );
         let writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
 
-        let mut writer = UnpartitionedWriter::new(writer_builder);
+        let spec = crate::spec::PartitionSpec::builder(schema.clone())
+            .with_spec_id(1)
+            .build()?;
+        let partition_key = PartitionKey::new(spec, schema.clone(), Struct::empty());
+        let mut writer = UnpartitionedWriter::new_with_partition_key(writer_builder, partition_key);
 
         // Write two batches
         let batch1 = RecordBatch::try_new(arrow_schema.clone(), vec![
@@ -203,10 +230,15 @@ mod tests {
 
         let data_files = writer.close().await?;
 
-        // Verify files have empty partition and correct format
+        // Verify files have the key's spec id, empty partition, flat path and correct format
         assert!(!data_files.is_empty());
         for file in &data_files {
+            assert_eq!(file.partition_spec_id(), 1);
             assert_eq!(file.partition, Struct::empty());
+            assert_eq!(
+                std::path::Path::new(file.file_path()).parent(),
+                Some(temp_dir.path())
+            );
             assert_eq!(file.file_format, DataFileFormat::Parquet);
             assert_eq!(file.record_count, 4);
         }

@@ -2321,3 +2321,20 @@ fn test_datum_to_human_string_float_matches_java() {
     // 2097152.25, halfway between 2097152.2 and 2097152.3.
     assert_eq!(float(f32::from_bits(0x4a00_0001)), "2097152.2");
 }
+
+#[test]
+fn display_partition_values_of_a_dropped_or_promoted_source() {
+    // A dropped partition source reads back as `Unknown`; these rendered
+    // through `unreachable!()` and panicked while writing the commit summary.
+    let show = |ty, lit| Datum::new(ty, lit).to_string();
+    assert_eq!(show(PrimitiveType::Unknown, PrimitiveLiteral::Int(7)), "7");
+    assert_eq!(show(PrimitiveType::Unknown, PrimitiveLiteral::Long(7)), "7");
+    assert_eq!(show(PrimitiveType::Unknown, PrimitiveLiteral::Int128(123)), "123");
+    assert_eq!(
+        show(PrimitiveType::Unknown, PrimitiveLiteral::UInt128(0)),
+        "00000000-0000-0000-0000-000000000000"
+    );
+    // int -> long promotion keeps the file's Int literal.
+    assert_eq!(show(PrimitiveType::Long, PrimitiveLiteral::Int(5)), "5");
+    assert_eq!(show(PrimitiveType::Int, PrimitiveLiteral::Long(5)), "5");
+}

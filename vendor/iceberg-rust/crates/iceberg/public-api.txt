@@ -3588,6 +3588,7 @@ pub struct iceberg::writer::partitioning::unpartitioned_writer::UnpartitionedWri
 impl<B, I, O> iceberg::writer::partitioning::unpartitioned_writer::UnpartitionedWriter<B, I, O> where B: iceberg::writer::IcebergWriterBuilder<I, O>, I: core::marker::Send + 'static, O: core::iter::traits::collect::IntoIterator + core::iter::traits::collect::FromIterator<<O as core::iter::traits::collect::IntoIterator>::Item>, <O as core::iter::traits::collect::IntoIterator>::Item: core::marker::Send + core::clone::Clone
 pub async fn iceberg::writer::partitioning::unpartitioned_writer::UnpartitionedWriter<B, I, O>::close(self) -> iceberg::Result<O>
 pub fn iceberg::writer::partitioning::unpartitioned_writer::UnpartitionedWriter<B, I, O>::new(inner_builder: B) -> Self
+pub fn iceberg::writer::partitioning::unpartitioned_writer::UnpartitionedWriter<B, I, O>::new_with_partition_key(inner_builder: B, partition_key: iceberg::spec::PartitionKey) -> Self
 pub async fn iceberg::writer::partitioning::unpartitioned_writer::UnpartitionedWriter<B, I, O>::write(&mut self, input: I) -> iceberg::Result<()>
 pub trait iceberg::writer::partitioning::PartitioningWriter<I, O>: core::marker::Send + 'static
 pub fn iceberg::writer::partitioning::PartitioningWriter::close<'async_trait>(self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = iceberg::Result<O>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait

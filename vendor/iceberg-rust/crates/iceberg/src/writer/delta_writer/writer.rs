@@ -90,6 +90,7 @@ where
 {
     type R = DeltaWriter<DB::R, PDB::R, EDB::R>;
 
+    /// Passes `partition_key` to each inner builder; see their docs for what `None` means.
     async fn build(&self, partition_key: Option<PartitionKey>) -> Result<Self::R> {
         Self::R::try_new(
             self.data_writer_builder
@@ -351,7 +352,9 @@ mod tests {
     use crate::Result;
     use crate::arrow::{arrow_schema_to_schema, schema_to_arrow_schema};
     use crate::io::FileIO;
-    use crate::spec::{DataContentType, DataFileFormat, NestedField, PrimitiveType, Schema, Type};
+    use crate::spec::{
+        DataContentType, DataFileFormat, NestedField, PartitionSpec, PrimitiveType, Schema, Type,
+    };
     use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
     use crate::writer::base_writer::equality_delete_writer::{
         EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
@@ -363,6 +366,7 @@ mod tests {
         DefaultFileNameGenerator, DefaultLocationGenerator,
     };
     use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+    use crate::writer::task_writer::TaskWriter;
     use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 
     type WriterBuildersResult = (
@@ -630,6 +634,86 @@ mod tests {
             Arc::new(StringArray::from(vec!["k"])),
         ])?;
         assert_eq!(expected_batches, res);
+
+        Ok(())
+    }
+
+    /// Data and delete files written through `TaskWriter` must carry the unpartitioned spec's id,
+    /// not spec 0, when that spec has a non-zero id (left by removing every partition field).
+    #[tokio::test]
+    async fn test_delta_writer_in_task_writer_uses_unpartitioned_spec_id() -> Result<()> {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()?,
+        );
+        let temp_dir = TempDir::new()?;
+        let file_io = FileIO::new_with_fs();
+        let location_gen =
+            DefaultLocationGenerator::with_data_location(temp_dir.path().to_string_lossy().into());
+        let file_name_gen =
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
+        let (data_builder, position_delete_builder, equality_delete_builder, _) =
+            create_writer_builders(schema.clone(), &file_io, location_gen, file_name_gen)?;
+        let delta_builder = DeltaWriterBuilder::new(
+            data_builder,
+            position_delete_builder,
+            equality_delete_builder,
+            vec![1, 2],
+            schema.clone(),
+        );
+        let partition_spec = Arc::new(
+            PartitionSpec::builder(schema.clone())
+                .with_spec_id(1)
+                .build()?,
+        );
+        let mut task_writer = TaskWriter::new(delta_builder, false, schema, partition_spec);
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                1.to_string(),
+            )])),
+            Field::new("name", DataType::Utf8, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                2.to_string(),
+            )])),
+            Field::new("op", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                3.to_string(),
+            )])),
+        ]));
+        // Deleting a row written by this writer yields a position delete; deleting an unseen
+        // row yields an equality delete.
+        task_writer
+            .write(RecordBatch::try_new(arrow_schema.clone(), vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["a"])),
+                Arc::new(Int32Array::from(vec![INSERT_OP])),
+            ])?)
+            .await?;
+        task_writer
+            .write(RecordBatch::try_new(arrow_schema, vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(Int32Array::from(vec![DELETE_OP, DELETE_OP])),
+            ])?)
+            .await?;
+        let files = task_writer.close().await?;
+
+        let mut contents: Vec<_> = files.iter().map(|f| f.content_type()).collect();
+        contents.sort_by_key(|c| *c as i32);
+        assert_eq!(contents, vec![
+            DataContentType::Data,
+            DataContentType::PositionDeletes,
+            DataContentType::EqualityDeletes,
+        ]);
+        for file in &files {
+            assert_eq!(file.partition_spec_id(), 1, "{:?}", file.content_type());
+        }
 
         Ok(())
     }
