@@ -114,6 +114,12 @@ fn to_iceberg_predicate(expr: &Expr, schema: Option<&Schema>) -> TransformedResu
             }) {
                 return TransformedResult::NotTransformed;
             }
+            // Iceberg builds accessors for primitive fields only: a
+            // predicate on a list, struct or map column fails to bind
+            // ("Accessor for Field tags not found"), even `IS NOT NULL`.
+            if field.is_some_and(|f| f.data_type().is_nested()) {
+                return TransformedResult::NotTransformed;
+            }
             let data_type = field.map(|f| f.data_type().clone());
             TransformedResult::Column(Reference::new(column.name()), data_type)
         }
@@ -453,6 +459,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pred, Reference::new("a").equal_to(Datum::long(1)));
+    }
+
+    /// Iceberg cannot bind a predicate on a nested column, so `tags IS NOT
+    /// NULL` on a list stays in DataFusion; the rest of the conjunction
+    /// still pushes down.
+    #[test]
+    fn a_nested_column_is_not_pushed_down() {
+        use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema};
+        use std::sync::Arc;
+        let list = DataType::List(Arc::new(Field::new("element", DataType::Utf8, true)));
+        let strct = DataType::Struct(Fields::from(vec![Field::new("x", DataType::Int64, true)]));
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("tags", list, true),
+            Field::new("s", strct, true),
+        ]);
+        for nested in ["tags", "s"] {
+            let is_null = Expr::IsNotNull(Box::new(col(nested)));
+            assert!(
+                !is_filter_pushdown_supported(&is_null, Some(&schema)),
+                "{nested}"
+            );
+            let pred = convert_filters_to_predicate_for(
+                &[is_null, binary(col("a"), Operator::Eq, lit_i64(1))],
+                Some(&schema),
+            )
+            .unwrap();
+            assert_eq!(pred, Reference::new("a").equal_to(Datum::long(1)));
+        }
     }
 
     #[test]
