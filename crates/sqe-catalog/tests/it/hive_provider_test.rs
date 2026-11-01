@@ -2422,6 +2422,57 @@ async fn a_limited_scan_reads_projected_partitions_newest_first_and_stops_at_the
     assert_eq!(n, 3, "an unlimited scan still reads every partition");
 }
 
+/// DataFusion 55 reads a node's statistics through `statistics_from_inputs`.
+/// The lazy scan lists nothing at plan time, but it never returns more than
+/// `limit` rows, so it reports that bound. With no row count at all, a join
+/// against a limited Hive scan is never broadcast. `HiveScanExec` around it
+/// must pass the bound through unchanged.
+#[tokio::test]
+async fn a_limited_lazy_scan_reports_its_limit_as_the_row_bound() {
+    use datafusion::common::stats::Precision;
+    use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+    use datafusion::physical_plan::ExecutionPlan;
+
+    let f = partitioned_csv_root().await;
+    {
+        let store = fixture_store(&f.root);
+        let mut m = store.get("sales", "orders").await.unwrap();
+        m.parameters
+            .insert("projection.enabled".into(), "true".into());
+        m.parameters
+            .insert("projection.dt.type".into(), "enum".into());
+        m.parameters.insert(
+            "projection.dt.values".into(),
+            "2026-01-01,2026-01-02".into(),
+        );
+        store.put(&m, false).await.unwrap();
+    }
+    let ctx = SessionContext::new();
+    register_hive_root(&ctx, &f).await;
+
+    let plan = ctx
+        .sql("SELECT id, dt FROM lake.sales.orders LIMIT 1")
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+
+    fn find<'a>(plan: &'a Arc<dyn ExecutionPlan>, name: &str) -> Option<&'a Arc<dyn ExecutionPlan>> {
+        if plan.name() == name {
+            return Some(plan);
+        }
+        plan.children().into_iter().find_map(|c| find(c, name))
+    }
+    for name in ["LazyPartitionScanExec", "HiveScanExec"] {
+        let node = find(&plan, name).unwrap_or_else(|| panic!("no {name} in the plan"));
+        let stats = StatisticsContext::new()
+            .compute(node.as_ref(), &StatisticsArgs::new())
+            .expect("statistics");
+        assert_eq!(stats.num_rows, Precision::Inexact(1), "{name}");
+    }
+}
+
 /// A compression probe that fails to list (a credential outage, the SSO
 /// portal answering 429 under a burst) must not be remembered as
 /// "uncompressed": that guess was cached for a gzipped JSON table and every
