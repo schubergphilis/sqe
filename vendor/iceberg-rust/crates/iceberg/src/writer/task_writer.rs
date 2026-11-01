@@ -57,7 +57,7 @@ use arrow_array::RecordBatch;
 
 use crate::Result;
 use crate::arrow::RecordBatchPartitionSplitter;
-use crate::spec::{DataFile, PartitionSpecRef, SchemaRef};
+use crate::spec::{DataFile, PartitionKey, PartitionSpecRef, SchemaRef, Struct};
 use crate::writer::partitioning::PartitioningWriter;
 use crate::writer::partitioning::clustered_writer::ClusteredWriter;
 use crate::writer::partitioning::fanout_writer::FanoutWriter;
@@ -122,7 +122,17 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
         partition_splitter: Option<RecordBatchPartitionSplitter>,
     ) -> Self {
         let writer = if partition_spec.is_unpartitioned() {
-            SupportedWriter::Unpartitioned(UnpartitionedWriter::new(writer_builder))
+            // Carry the spec so files get its id, which is non-zero after a spec evolves
+            // to unpartitioned. See `UnpartitionedWriter`.
+            let partition_key = PartitionKey::new(
+                partition_spec.as_ref().clone(),
+                schema.clone(),
+                Struct::empty(),
+            );
+            SupportedWriter::Unpartitioned(UnpartitionedWriter::new_with_partition_key(
+                writer_builder,
+                partition_key,
+            ))
         } else if fanout_enabled {
             SupportedWriter::Fanout(FanoutWriter::new(writer_builder))
         } else {
@@ -363,7 +373,8 @@ mod tests {
     use crate::arrow::{PROJECTED_PARTITION_VALUE_COLUMN, RecordBatchPartitionSplitter};
     use crate::io::FileIO;
     use crate::spec::{
-        DataFile, DataFileFormat, NestedField, PartitionSpec, PrimitiveLiteral, PrimitiveType, Type,
+        DataFile, DataFileFormat, NestedField, PartitionSpec, PrimitiveLiteral, PrimitiveType,
+        Struct, Type,
     };
     use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
     use crate::writer::file_writer::ParquetWriterBuilder;
@@ -458,13 +469,32 @@ mod tests {
         Ok(DataFileWriterBuilder::new(rolling_writer_builder))
     }
 
+    /// An unpartitioned spec with a non-zero id, as left by removing every partition field.
+    fn evolved_unpartitioned_spec(schema: Arc<crate::spec::Schema>) -> Result<Arc<PartitionSpec>> {
+        Ok(Arc::new(
+            PartitionSpec::builder(schema).with_spec_id(1).build()?,
+        ))
+    }
+
+    fn assert_files_use_unpartitioned_spec(data_files: &[DataFile], temp_dir: &TempDir) {
+        for data_file in data_files {
+            assert_eq!(data_file.partition_spec_id(), 1);
+            assert_eq!(data_file.partition(), &Struct::empty());
+            assert_eq!(
+                std::path::Path::new(data_file.file_path()).parent(),
+                Some(temp_dir.path()),
+                "unpartitioned files should not get a partition directory"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_task_writer_unpartitioned() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let schema = create_test_schema()?;
         let arrow_schema = create_arrow_schema();
 
-        let partition_spec = Arc::new(PartitionSpec::builder(schema.clone()).build()?);
+        let partition_spec = evolved_unpartitioned_spec(schema.clone())?;
 
         let writer_builder = create_writer_builder(&temp_dir, schema.clone())?;
         let mut task_writer = TaskWriter::new(writer_builder, false, schema, partition_spec);
@@ -480,6 +510,7 @@ mod tests {
 
         assert!(!data_files.is_empty());
         assert_eq!(data_files[0].record_count(), 3);
+        assert_files_use_unpartitioned_spec(&data_files, &temp_dir);
 
         Ok(())
     }
@@ -605,7 +636,7 @@ mod tests {
         let schema = create_test_schema()?;
         let arrow_schema = create_arrow_schema();
 
-        let partition_spec = Arc::new(PartitionSpec::builder(schema.clone()).build()?);
+        let partition_spec = evolved_unpartitioned_spec(schema.clone())?;
 
         let writer_builder = create_writer_builder(&temp_dir, schema.clone())?;
         let mut task_writer = TaskWriter::new(writer_builder, false, schema, partition_spec);
@@ -621,6 +652,7 @@ mod tests {
 
         assert_eq!(positions.len(), 3);
         assert!(!data_files.is_empty());
+        assert_files_use_unpartitioned_spec(&data_files, &temp_dir);
 
         let file_path = data_files[0].file_path();
         for (i, pos) in positions.iter().enumerate() {

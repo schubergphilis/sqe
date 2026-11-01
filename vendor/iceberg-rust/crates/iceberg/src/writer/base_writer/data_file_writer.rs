@@ -64,6 +64,9 @@ where
 {
     type R = DataFileWriter<B, L, F>;
 
+    /// With `partition_key` set to `None`, written files get spec id 0. If the table's
+    /// unpartitioned spec has a non-zero id (e.g. after removing all partition fields), pass a key
+    /// with that spec and an empty `Struct` instead.
     async fn build(&self, partition_key: Option<PartitionKey>) -> Result<Self::R> {
         Ok(DataFileWriter {
             inner: Some(self.inner.build()),
