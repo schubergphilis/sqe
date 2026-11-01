@@ -89,7 +89,7 @@ use datafusion::physical_plan::joins::{
     SortMergeJoinExec, SymmetricHashJoinExec,
 };
 use datafusion::physical_plan::ExecutionPlan;
-use sqe_catalog::iceberg_scan::IcebergScanExec;
+use crate::iceberg_scan::IcebergScanExec;
 use tracing::debug;
 
 use crate::parallel_probe_scan::{

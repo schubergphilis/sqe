@@ -35,8 +35,10 @@ pub(crate) mod join_fallback;
 pub(crate) mod query_memory;
 pub mod metrics_history;
 pub mod mode;
-pub(crate) mod parallel_probe_scan;
-pub(crate) mod parallel_scan;
+// The parallel-scan rules live in `sqe-catalog` so embedded mode (sqe-cli)
+// runs them too; re-exported under their old paths.
+pub(crate) use sqe_catalog::parallel_probe_scan;
+pub(crate) use sqe_catalog::parallel_scan;
 pub mod policy_wiring;
 pub(crate) mod post_planning;
 pub(crate) mod prepared_statements;
