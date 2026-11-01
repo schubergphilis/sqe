@@ -322,6 +322,10 @@ pub struct IcebergScanExec {
     /// clone) of this scan node, sized `scan_fetch_ahead`. Rebuilt by
     /// [`IcebergScanExec::with_scan_fetch_ahead`] at planning time.
     fetch_permits: Arc<tokio::sync::Semaphore>,
+    /// Byte bound on the fetch stage, shared like `fetch_permits`, sized from
+    /// the memory pool at first `execute` (`None` inside = unbounded pool).
+    /// Rebuilt with `fetch_permits`.
+    fetch_budget: Arc<std::sync::OnceLock<Option<Arc<crate::scan_memory::FetchBudget>>>>,
     /// Bounded wait (ms) for a decode admission the node pool refused while
     /// the query's quota had room (#788). Sourced from `[catalog]
     /// scan_memory_wait_ms`. 0 fails fast. Default 30000.
@@ -583,6 +587,7 @@ impl IcebergScanExec {
             decode_permits,
             scan_fetch_ahead,
             fetch_permits,
+            fetch_budget: Arc::new(std::sync::OnceLock::new()),
             scan_memory_wait_ms: tuning.scan_memory_wait_ms,
             table_reloader: None,
             static_plan: Arc::new(tokio::sync::OnceCell::new()),
@@ -747,6 +752,7 @@ impl IcebergScanExec {
     pub fn with_scan_fetch_ahead(mut self, fetch_ahead: usize) -> Self {
         self.scan_fetch_ahead = fetch_ahead;
         self.fetch_permits = Arc::new(tokio::sync::Semaphore::new(fetch_ahead.max(1)));
+        self.fetch_budget = Arc::new(std::sync::OnceLock::new());
         self
     }
 
@@ -920,6 +926,7 @@ impl IcebergScanExec {
             decode_permits: self.decode_permits.clone(),
             scan_fetch_ahead: self.scan_fetch_ahead,
             fetch_permits: self.fetch_permits.clone(),
+            fetch_budget: self.fetch_budget.clone(),
             scan_memory_wait_ms: self.scan_memory_wait_ms,
             table_reloader: self.table_reloader.clone(),
             static_plan: self.static_plan.clone(),
@@ -1553,6 +1560,18 @@ impl ExecutionPlan for IcebergScanExec {
             )
         };
         decode_gate.set_memory_wait(std::time::Duration::from_millis(self.scan_memory_wait_ms));
+        if scan_fetch_ahead > 0 {
+            let pool = context.runtime_env().memory_pool.clone();
+            if let Some(budget) = self
+                .fetch_budget
+                .get_or_init(|| crate::scan_memory::FetchBudget::for_pool(pool.as_ref()))
+            {
+                decode_gate.set_fetch_budget(
+                    Arc::clone(budget),
+                    MetricBuilder::new(&self.metrics).subset_time("fetch_budget_wait", partition),
+                );
+            }
+        }
         let static_planning_runs =
             MetricBuilder::new(&self.metrics).counter("static_planning_runs", partition);
         let baseline = BaselineMetrics::new(&self.metrics, partition);
