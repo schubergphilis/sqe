@@ -3,6 +3,7 @@
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
+use datafusion::common::Statistics;
 use datafusion::datasource::TableType;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionContext;
@@ -10,6 +11,7 @@ use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::physical_plan::statistics::{ChildStats, StatisticsArgs};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use std::sync::Arc;
 
@@ -128,6 +130,24 @@ impl ExecutionPlan for ScopedExec {
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.inner]
     }
+    // The file scan's row count and sizes, passed through. Without them the
+    // wrapper reports nothing, and DataFusion never broadcasts a small file
+    // table in a join: every row of the other side is hashed across
+    // partitions instead. DataFusion 55 reads statistics through these two
+    // methods; the deprecated `partition_statistics` is no longer called.
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        Ok(input_stats
+            .first()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(Statistics::new_unknown(&self.schema()))))
+    }
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -238,5 +258,29 @@ mod tests {
             })
             .collect();
         assert_eq!(values, vec![11, 22]);
+    }
+
+    // A wrapper that hides the scan's row count turns every join against a
+    // small file into a partitioned hash join (no broadcast).
+    #[tokio::test]
+    async fn scoped_scan_reports_the_inner_row_count() {
+        use datafusion::common::stats::Precision;
+        use datafusion::datasource::MemTable;
+        use datafusion::physical_plan::statistics::StatisticsContext;
+
+        let ctx = SessionContext::new();
+        let batch = arrow::record_batch::RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as arrow::array::ArrayRef,
+        )])
+        .unwrap();
+        let mem = MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap();
+        let scoped = ScopedTable::bind(Arc::new(mem), ctx.runtime_env());
+        let plan = scoped.scan(&ctx.state(), None, &[], None).await.unwrap();
+        assert_eq!(plan.name(), "ScopedFileScan");
+        let stats = StatisticsContext::new()
+            .compute(plan.as_ref(), &StatisticsArgs::new())
+            .unwrap();
+        assert_eq!(stats.num_rows, Precision::Exact(3));
     }
 }
