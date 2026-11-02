@@ -70,21 +70,30 @@ res: dict = {"engine": engine, "size": size, "query": query, "mem": mem, "storag
 if engine == "duckdb":
     import duckdb
     con = duckdb.connect()
-    con.execute(f"SET memory_limit = '{mem.upper()}B'")
-    con.execute(f"SET threads = {THREADS}")
-    con.execute(f"SET temp_directory = '{TMP}'")
-    con.execute("INSTALL httpfs")  # a no-op once cached; before t1, so untimed
-    con.execute("LOAD httpfs")
+
+    def duck(sql):
+        """Every statement is built from this script's own arguments and
+        environment (memory, threads, S3 settings, local paths) and the
+        constant queries in queries.py; DuckDB SET/CREATE SECRET/COPY take no
+        bind parameters."""
+        # nosemgrep: opt.aikido.semgrep-rules.python.sqlalchemy.security.sqlalchemy-execute-raw-query, opt.aikido.semgrep-rules.python.lang.security.audit.formatted-sql-query -- in-process DuckDB, operator-supplied config only
+        return con.execute(sql)
+
+    duck(f"SET memory_limit = '{mem.upper()}B'")
+    duck(f"SET threads = {THREADS}")
+    duck(f"SET temp_directory = '{TMP}'")
+    duck("INSTALL httpfs")  # a no-op once cached; before t1, so untimed
+    duck("LOAD httpfs")
     host = ENDPOINT.split("://", 1)[1]
-    con.execute(f"CREATE SECRET bench_s3 (TYPE s3, KEY_ID '{KEY}', SECRET '{SECRET}', "
-                f"REGION '{REGION}', ENDPOINT '{host}', URL_STYLE 'path', USE_SSL false)")
-    con.execute(f"CREATE VIEW sales AS SELECT * FROM read_parquet('{SALES}/*.parquet')")
-    con.execute(f"CREATE VIEW products AS SELECT * FROM read_parquet('{PRODUCTS}')")
+    duck(f"CREATE SECRET bench_s3 (TYPE s3, KEY_ID '{KEY}', SECRET '{SECRET}', "
+         f"REGION '{REGION}', ENDPOINT '{host}', URL_STYLE 'path', USE_SSL false)")
+    duck(f"CREATE VIEW sales AS SELECT * FROM read_parquet('{SALES}/*.parquet')")
+    duck(f"CREATE VIEW products AS SELECT * FROM read_parquet('{PRODUCTS}')")
     res["version"] = duckdb.__version__
     t1 = time.perf_counter()
-    con.execute(f"COPY ({SQL[query]}) TO '{OUT}.parquet' (FORMAT parquet)")
+    duck(f"COPY ({SQL[query]}) TO '{OUT}.parquet' (FORMAT parquet)")
     t2 = time.perf_counter()
-    res["rows_out"] = con.execute(f"SELECT COUNT(*) FROM read_parquet('{OUT}.parquet')").fetchone()[0]
+    res["rows_out"] = duck(f"SELECT COUNT(*) FROM read_parquet('{OUT}.parquet')").fetchone()[0]
 
 elif engine == "polars":
     os.environ.setdefault("POLARS_MAX_THREADS", str(THREADS))
