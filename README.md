@@ -146,6 +146,8 @@ scripts/validate-generator-tpcds.py --ours data/tpcds/sf1 --dsdgen-db /tmp/dsdge
 
 Reruns of four read-only suites (TPC-H, SSB, TPC-DS, ClickBench) do not need a fresh load every time. The unified harness `scripts/benchmark.sh` orchestrates the setup and runs the suites, with profiles in `benchmarks/profiles/<name>.toml`. For example: `BENCH_PROFILE=local BENCH_SCALE=1 scripts/benchmark.sh tpch ssb tpcds clickbench`. Credentials come from environment variables or AWS profiles, never stored in the TOML file. Alternatively, `scripts/benchmark-publish-iceberg.sh` publishes Iceberg tables once into a persistent Polaris; `BENCH_DATA_SOURCE=attach ./scripts/benchmark-test.sh tpch` then attaches that catalog read-only and skips generate and load entirely. TPC-C, TPC-E, bank, and TPC-BB still generate and load normally in attach mode: TPC-C/TPC-E are write suites, bank is published to golden but attach mode does not yet query it from there, and TPC-BB's own tables (it shares TPC-DS's namespace) are not published. Bank/TPC-BB via attach, and a shallow-clone path for TPC-C/TPC-E, are the deferred follow-up. Full usage in [Benchmark Suite](docs/site/book/src/features/benchmarks.md#unified-harness-benchmarksh-sqe-bench-run).
 
+For a laptop-sized comparison with single-machine engines, [`quickstart/engine-bench`](quickstart/engine-bench/README.md) runs the public engine-bench workload against SQE embedded (Parquet and Iceberg) and on Polaris, next to DuckDB and Polars, and checks every answer against DuckDB's.
+
 ## Architecture
 
 ```

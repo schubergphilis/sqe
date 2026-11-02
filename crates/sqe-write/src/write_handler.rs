@@ -8630,27 +8630,37 @@ pub fn schema_has_variant(schema: &IcebergSchema) -> bool {
         .any(|f| type_has_variant(&f.field_type))
 }
 
-/// Narrow nanosecond timestamps to microseconds when the target format
-/// version cannot store them: Iceberg `timestamp_ns`/`timestamptz_ns` exist
-/// only from v3 (#773). V3 targets are returned unchanged.
+/// Map timestamp columns onto a precision the target format version stores.
+///
+/// Iceberg has only microsecond timestamps (plus nanosecond from v3), so
+/// second and millisecond timestamps widen to microseconds on every version.
+/// That is lossless, and it is what a Parquet `timestamp(s)` / `timestamp(ms)`
+/// column read by `read_parquet` arrives as, so CTAS from such a file used to
+/// fail with "Unsupported Arrow data type: Timestamp(ms)". Nanosecond
+/// timestamps narrow to microseconds below v3: `timestamp_ns` /
+/// `timestamptz_ns` exist only from v3 (#773).
 // ponytail: top-level columns only; recurse into struct/list/map if a nested
-// ns timestamp ever reaches a v2 CTAS.
+// non-µs timestamp ever reaches a CTAS.
 pub(crate) fn timestamps_for_format_version(
     arrow_schema: &ArrowSchema,
     format_version: FormatVersion,
 ) -> ArrowSchema {
     use arrow_schema::{DataType, TimeUnit};
-    if format_version == FormatVersion::V3 {
-        return arrow_schema.clone();
-    }
     let fields: Vec<arrow_schema::Field> = arrow_schema
         .fields()
         .iter()
         .map(|f| match f.data_type() {
-            DataType::Timestamp(TimeUnit::Nanosecond, tz) => f
+            DataType::Timestamp(TimeUnit::Second | TimeUnit::Millisecond, tz) => f
                 .as_ref()
                 .clone()
                 .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, tz.clone())),
+            DataType::Timestamp(TimeUnit::Nanosecond, tz)
+                if format_version != FormatVersion::V3 =>
+            {
+                f.as_ref()
+                    .clone()
+                    .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, tz.clone()))
+            }
             _ => f.as_ref().clone(),
         })
         .collect();
@@ -10557,6 +10567,72 @@ mod tests {
         // V3 keeps nanoseconds.
         let v3 = timestamps_for_format_version(&ns, FormatVersion::V3);
         assert_eq!(v3.field(0).data_type(), &DataType::Timestamp(TimeUnit::Nanosecond, None));
+    }
+
+    #[test]
+    fn test_timestamps_for_format_version_widens_s_and_ms_to_us() {
+        // A Parquet timestamp(s) column reads as Timestamp(ms); Iceberg has no
+        // ms type, so CTAS from such a file failed before the widening.
+        use arrow_array::{TimestampMillisecondArray, TimestampSecondArray};
+        use arrow_schema::Field;
+        use iceberg::spec::{PrimitiveType, Type};
+
+        let coarse = ArrowSchema::new(vec![
+            Field::new("ts_s", DataType::Timestamp(TimeUnit::Second, None), true),
+            Field::new(
+                "ts_ms",
+                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                true,
+            ),
+        ]);
+        assert!(arrow_schema_to_iceberg(&coarse).is_err());
+
+        for version in [FormatVersion::V2, FormatVersion::V3] {
+            let widened = timestamps_for_format_version(&coarse, version);
+            assert_eq!(
+                widened.field(0).data_type(),
+                &DataType::Timestamp(TimeUnit::Microsecond, None)
+            );
+            assert_eq!(
+                widened.field(1).data_type(),
+                &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+            );
+            let iceberg = arrow_schema_to_iceberg(&widened).unwrap();
+            let fields = iceberg.as_struct().fields();
+            assert!(matches!(
+                *fields[0].field_type,
+                Type::Primitive(PrimitiveType::Timestamp)
+            ));
+            assert!(matches!(
+                *fields[1].field_type,
+                Type::Primitive(PrimitiveType::Timestamptz)
+            ));
+
+            // The sink casts the coarse batches onto the µs table schema
+            // without losing a value.
+            let stamped = sqe_compaction::writer::build_stamped_schema(&iceberg).unwrap();
+            let batch = RecordBatch::try_new(
+                Arc::new(coarse.clone()),
+                vec![
+                    Arc::new(TimestampSecondArray::from(vec![1_700_000_000i64])),
+                    Arc::new(
+                        TimestampMillisecondArray::from(vec![1_700_000_000_123i64])
+                            .with_timezone("UTC"),
+                    ),
+                ],
+            )
+            .unwrap();
+            let cast = sqe_compaction::writer::apply_stamped_schema(batch, &stamped).unwrap();
+            let col = |i: usize| {
+                cast.column(i)
+                    .as_any()
+                    .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+                    .unwrap()
+                    .value(0)
+            };
+            assert_eq!(col(0), 1_700_000_000_000_000);
+            assert_eq!(col(1), 1_700_000_000_123_000);
+        }
     }
 
     #[test]
