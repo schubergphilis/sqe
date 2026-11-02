@@ -56,6 +56,10 @@ pub mod system_jdbc;
 pub mod system_metadata;
 #[cfg(feature = "rest")]
 pub mod table_provider;
+// Views resolve through the REST `SessionCatalog` and base tables scan
+// through `SqeTableProvider`, both REST-only; sqe-cli and the coordinator,
+// its only users, always build with `rest`.
+#[cfg(feature = "rest")]
 pub mod writable_iceberg_catalog;
 
 pub use access_control::AccessControlClient;
