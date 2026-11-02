@@ -170,6 +170,20 @@ pub const SCAN_CHANNEL_ITEM_CAPACITY: usize = 16;
 /// the coordinator's operators are tuned for.
 const SCAN_READER_BATCH_SIZE: usize = 8192;
 
+/// Reader batch size for a file whose row groups hold `group_rows` rows.
+///
+/// The parquet reader sizes its decode buffers for the full batch size, and a
+/// batch never spans row groups, so a file of 1024-row groups read at 8192
+/// would allocate (and charge the scan budget) 8x what each batch holds.
+/// Capping at the largest row group keeps buffers no larger than a batch can
+/// fill.
+fn scan_batch_size(group_rows: impl Iterator<Item = i64>) -> usize {
+    let largest = group_rows.max().unwrap_or(0);
+    usize::try_from(largest)
+        .unwrap_or(SCAN_READER_BATCH_SIZE)
+        .clamp(1, SCAN_READER_BATCH_SIZE)
+}
+
 /// Per-file batch stream returned by [`open_task_stream`].
 ///
 /// The item error is `anyhow` rather than `ParquetError` because a Hive task
@@ -1870,7 +1884,14 @@ async fn open_parquet_stream(
     // Decode DataFusion-sized batches. Unset, the parquet reader emits its
     // 1024-row default: 8x the batches, each paying per-batch overhead in
     // the Flight encoder and in every coordinator operator above the scan.
-    let stream = builder.with_batch_size(SCAN_READER_BATCH_SIZE).build()?;
+    let batch_size = scan_batch_size(
+        builder
+            .metadata()
+            .row_groups()
+            .iter()
+            .map(|rg| rg.num_rows()),
+    );
+    let stream = builder.with_batch_size(batch_size).build()?;
     let schema = stream.schema().clone();
 
     if let Some(cm) = coordinator_metrics {
@@ -2114,6 +2135,17 @@ fn predicate_in_file_names(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Small row groups shrink the batch to the largest group; large ones and
+    /// odd metadata (no groups, negative counts) keep the full batch size.
+    #[test]
+    fn scan_batch_size_caps_at_the_largest_row_group() {
+        assert_eq!(scan_batch_size([1024, 1024].into_iter()), 1024);
+        assert_eq!(scan_batch_size([100, 3000, 7].into_iter()), 3000);
+        assert_eq!(scan_batch_size([1_000_000].into_iter()), 8192);
+        assert_eq!(scan_batch_size(std::iter::empty()), 1);
+        assert_eq!(scan_batch_size([-5].into_iter()), 8192);
+    }
 
     /// The two lanes sum to the capacity rounded up to whole units, and the
     /// fetch lane is a quarter of the units, at least one once there are two.
