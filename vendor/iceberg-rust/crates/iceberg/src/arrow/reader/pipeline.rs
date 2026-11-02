@@ -88,6 +88,7 @@ impl ArrowReader {
             bloom_filter_probing_enabled: sqe.bloom_filter_probing_enabled,
             bloom_probe_max_values: sqe.bloom_probe_max_values,
             row_group_pruner: sqe.row_group_pruner.clone(),
+            string_view: sqe.string_view,
         };
 
         // Fast-path for single concurrency to avoid overhead of try_flatten_unordered.
@@ -404,6 +405,8 @@ struct FileScanTaskReader {
     bloom_probe_max_values: usize,
     /// SQE PATCH (sqe#870): engine-side row-group pruning.
     row_group_pruner: Option<Arc<dyn RowGroupPruner>>,
+    /// SQE PATCH (string view): decode top-level strings as `Utf8View`.
+    string_view: bool,
 }
 
 impl FileScanTaskReader {
@@ -510,6 +513,29 @@ impl FileScanTaskReader {
             )?
         } else {
             arrow_metadata
+        };
+
+        // SQE PATCH (string view): decode top-level string columns straight
+        // into `Utf8View` via the same schema hint. The transformer's target
+        // schema is view-mapped to match (`with_string_view` below), so these
+        // columns pass through instead of being cast back.
+        let arrow_metadata = match self
+            .string_view
+            .then(|| crate::arrow::string_view_schema(arrow_metadata.schema()))
+            .flatten()
+        {
+            Some(view_schema) => {
+                let options = ArrowReaderOptions::new().with_schema(Arc::new(view_schema));
+                ArrowReaderMetadata::try_new(Arc::clone(arrow_metadata.metadata()), options)
+                    .map_err(|e| {
+                        Error::new(
+                            ErrorKind::Unexpected,
+                            "Failed to create ArrowReaderMetadata with string-view schema",
+                        )
+                        .with_source(e)
+                    })?
+            }
+            None => arrow_metadata,
         };
 
         let project_pos = task.project_field_ids().contains(&RESERVED_FIELD_ID_POS);
@@ -679,7 +705,8 @@ impl FileScanTaskReader {
         // that come back from the file, such as type promotion, default column insertion,
         // column re-ordering, partition constants, and virtual field addition (like _file)
         let mut record_batch_transformer_builder =
-            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids());
+            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids())
+                .with_string_view(self.string_view);
 
         // Add the _file metadata column if it's in the projected fields
         if task.project_field_ids().contains(&RESERVED_FIELD_ID_FILE) {

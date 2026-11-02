@@ -705,6 +705,7 @@ pub(super) enum MembershipSet {
     Int64(FnvHashSet<i64>),
     Date32(FnvHashSet<i32>),
     Utf8(FnvHashSet<String>),
+    Utf8View(FnvHashSet<String>),
 }
 
 impl MembershipSet {
@@ -736,7 +737,7 @@ impl MembershipSet {
             Some(set)
         }
 
-        use arrow_array::{Date32Array, Int32Array, Int64Array, StringArray};
+        use arrow_array::{Date32Array, Int32Array, Int64Array, StringArray, StringViewArray};
         match column_type {
             DataType::Int32 => typed_values(literals, column_type, |a: &Int32Array, i| a.value(i))
                 .map(MembershipSet::Int32),
@@ -750,12 +751,19 @@ impl MembershipSet {
                 a.value(i).to_string()
             })
             .map(MembershipSet::Utf8),
+            // SQE PATCH (string view): the same set over a view-decoded column.
+            DataType::Utf8View => {
+                typed_values(literals, column_type, |a: &StringViewArray, i| {
+                    a.value(i).to_string()
+                })
+                .map(MembershipSet::Utf8View)
+            }
             _ => None,
         }
     }
 
     pub(super) fn eval(&self, column: &dyn Array) -> std::result::Result<BooleanArray, ArrowError> {
-        use arrow_array::{Date32Array, Int32Array, Int64Array, StringArray};
+        use arrow_array::{Date32Array, Int32Array, Int64Array, StringArray, StringViewArray};
 
         fn check<A: Array + 'static>(
             column: &dyn Array,
@@ -785,6 +793,9 @@ impl MembershipSet {
                 check::<Date32Array>(column, |a, i| set.contains(&a.value(i)))
             }
             MembershipSet::Utf8(set) => check::<StringArray>(column, |a, i| set.contains(a.value(i))),
+            MembershipSet::Utf8View(set) => {
+                check::<StringViewArray>(column, |a, i| set.contains(a.value(i)))
+            }
         }
     }
 }

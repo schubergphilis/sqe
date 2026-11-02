@@ -503,6 +503,20 @@ where
     }
 }
 
+/// A string result column as `StringArray`, whatever its layout. Iceberg
+/// scans hand back `Utf8View` (`[catalog] string_view`, the default) and
+/// literals stay `Utf8`; the in-process handler returns whichever the plan
+/// produced (only the Flight wire casts to `Utf8`).
+#[allow(dead_code)]
+pub fn utf8(col: &dyn arrow_array::Array) -> arrow_array::StringArray {
+    use arrow_array::cast::AsArray as _;
+    let col = arrow_array::make_array(col.to_data());
+    arrow::compute::cast(&col, &arrow_schema::DataType::Utf8)
+        .expect("column should be a string")
+        .as_string::<i32>()
+        .clone()
+}
+
 /// Format a single cell value from an Arrow column for display / comparison.
 // Used by sql_compat_test.rs; integration_test.rs uses print_results instead.
 #[allow(dead_code)]

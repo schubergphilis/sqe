@@ -1414,14 +1414,15 @@ fn apply_mask(
             match data_type {
                 // Utf8 column: mask directly (UDF returns Utf8 == column type).
                 DataType::Utf8 => mask_expr(col(column_name)),
-                // LargeUtf8 column: the UDF only accepts Utf8, and the output
-                // must be LargeUtf8 to match the column type. Cast in and back.
-                DataType::LargeUtf8 => Expr::Cast(Cast::new(
+                // LargeUtf8 / Utf8View column (Iceberg scans read strings as
+                // Utf8View by default): the UDF only accepts Utf8, and the
+                // output must keep the column type. Cast in and back.
+                DataType::LargeUtf8 | DataType::Utf8View => Expr::Cast(Cast::new(
                     Box::new(mask_expr(Expr::Cast(Cast::new(
                         Box::new(col(column_name)),
                         DataType::Utf8,
                     )))),
-                    DataType::LargeUtf8,
+                    data_type.clone(),
                 )),
                 // Non-string column: a char-class mask is meaningless; fall back
                 // to a typed NULL so the value is hidden AND output type ==
@@ -1984,6 +1985,56 @@ mod tests {
             matches!(expr, Expr::Cast(_)),
             "Expected Cast for Redact on Int64, got: {expr:?}"
         );
+    }
+
+    /// Iceberg scans read strings as Utf8View by default. PartialMask used to
+    /// handle only Utf8/LargeUtf8 and replaced a Utf8View column with NULL,
+    /// so the mask silently showed nothing instead of the unmasked tail.
+    #[tokio::test]
+    async fn test_apply_mask_partial_on_utf8_view_masks_and_keeps_the_type() {
+        use datafusion::arrow::array::{Array, AsArray, StringViewArray};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::prelude::SessionContext;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ssn",
+            DataType::Utf8View,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringViewArray::from(vec![
+                Some("111-11-1111"),
+                None,
+            ]))],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_batch("t", batch).unwrap();
+
+        let mask = MaskType::PartialMask {
+            show_first: 0,
+            show_last: 4,
+            upper: 'x',
+            lower: 'x',
+            digit: 'x',
+        };
+        let expr = apply_mask("ssn", &DataType::Utf8View, &mask, None).alias("ssn");
+        let out = ctx
+            .table("t")
+            .await
+            .unwrap()
+            .select(vec![expr])
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let ssn = out[0].column(0);
+        assert_eq!(ssn.data_type(), &DataType::Utf8View);
+        let ssn = ssn.as_string_view();
+        assert_eq!(ssn.value(0), "xxx-xx-1111");
+        assert!(ssn.is_null(1));
     }
 
     #[test]

@@ -72,7 +72,8 @@ impl SqeTableProvider {
         let table_name = table.identifier().name().to_string();
         debug!(table = %table_name, snapshot_id, "Creating SqeTableProvider");
 
-        let schema = Self::arrow_schema_for(&table, snapshot_id)?;
+        let tuning = ScanTuning::default();
+        let schema = Self::arrow_schema_for(&table, snapshot_id, tuning.string_view)?;
 
         Ok(Self {
             table,
@@ -80,7 +81,7 @@ impl SqeTableProvider {
             prom_metrics: None,
             trust_sort_order: false,
             snapshot_id,
-            tuning: ScanTuning::default(),
+            tuning,
             reloader: None,
         })
     }
@@ -104,7 +105,20 @@ impl SqeTableProvider {
     /// for callers that adjust one value.
     #[must_use = "with_tuning consumes self; bind the returned provider"]
     pub fn with_tuning(mut self, tuning: ScanTuning) -> Self {
+        let relayout = tuning.string_view != self.tuning.string_view;
         self.tuning = tuning.normalized();
+        // The string layout is part of the declared schema, so a change
+        // re-derives it (same snapshot, same fields).
+        if relayout {
+            match Self::arrow_schema_for(&self.table, self.snapshot_id, self.tuning.string_view) {
+                Ok(schema) => self.schema = schema,
+                Err(e) => warn!(
+                    table = %self.table.identifier(),
+                    error = %e,
+                    "Could not re-derive the schema for the string layout; keeping the current one"
+                ),
+            }
+        }
         self
     }
 
@@ -157,7 +171,7 @@ impl SqeTableProvider {
     #[must_use = "with_snapshot_id consumes self; bind the returned provider"]
     pub fn with_snapshot_id(mut self, snapshot_id: i64) -> Self {
         self.snapshot_id = Some(snapshot_id);
-        match Self::arrow_schema_for(&self.table, Some(snapshot_id)) {
+        match Self::arrow_schema_for(&self.table, Some(snapshot_id), self.tuning.string_view) {
             Ok(schema) => self.schema = schema,
             Err(e) => warn!(
                 table = %self.table.identifier(),
@@ -170,10 +184,12 @@ impl SqeTableProvider {
     }
 
     /// Arrow schema for `snapshot_id` (the snapshot's own schema; the table's
-    /// current schema when `None` or when the snapshot has no schema id).
+    /// current schema when `None` or when the snapshot has no schema id),
+    /// with top-level strings as `Utf8View` when `string_view` is set.
     fn arrow_schema_for(
         table: &Table,
         snapshot_id: Option<i64>,
+        string_view: bool,
     ) -> sqe_core::Result<ArrowSchemaRef> {
         let iceberg_schema = crate::iceberg_scan::snapshot_schema(table, snapshot_id);
         let schema = schema_to_arrow_schema(&iceberg_schema).map_err(|e| {
@@ -185,6 +201,11 @@ impl SqeTableProvider {
                 e,
             )
         })?;
+        if string_view {
+            if let Some(view) = iceberg::arrow::string_view_schema(&schema) {
+                return Ok(Arc::new(view));
+            }
+        }
         Ok(Arc::new(schema))
     }
 
@@ -636,6 +657,7 @@ mod snapshot_schema_tests {
             runtime_filter_bloom_max_values: 11,
             scan_fetch_ahead: Some(13),
             scan_memory_wait_ms: 17,
+            string_view: false,
         };
         let provider = SqeTableProvider::try_new(evolved_table())
             .await
@@ -697,8 +719,14 @@ mod snapshot_schema_tests {
         assert_eq!(direct.schema, chained.schema);
         let iceberg_schema =
             crate::iceberg_scan::snapshot_schema(&direct.table, Some(SNAP_X_AND_Y));
-        let expected = iceberg::arrow::schema_to_arrow_schema(&iceberg_schema).unwrap();
+        let plain = iceberg::arrow::schema_to_arrow_schema(&iceberg_schema).unwrap();
+        // Default tuning reads strings as Utf8View; the field ids stay.
+        let expected = iceberg::arrow::string_view_schema(&plain).unwrap_or(plain);
         assert_eq!(direct.schema.as_ref(), &expected);
+        assert_eq!(
+            direct.schema.field_with_name("y").unwrap().data_type(),
+            &arrow::datatypes::DataType::Utf8View
+        );
     }
 
     /// Pinning the current snapshot, or an id the metadata does not know,

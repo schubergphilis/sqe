@@ -520,6 +520,46 @@ col_case!(
     "json_parse(view_a)",
     [s("null"), s("null"), None]
 );
+// `Signature::any` UDFs get no coercion, so a scanned Utf8View column used to
+// reach a `StringArray` downcast and fail.
+col_case!(
+    col_codepoint_view,
+    "codepoint(substr(view_a, 1, 1))",
+    [s("82"), s("84"), None]
+);
+col_case!(
+    col_json_format_view,
+    "json_format(view_a)",
+    [s("Robert"), s("Tymczak"), None]
+);
+col_case!(
+    col_date_parse_view,
+    "date_parse(arrow_cast(substr(iso_date, 1, 4), 'Utf8View'), '%Y')",
+    [s("2024-01-01T00:00:00"), s("2024-01-01T00:00:00"), None]
+);
+
+#[tokio::test]
+async fn contains_accepts_utf8_view_haystack_and_list_items() {
+    let ctx = harness_ctx().await;
+    sqe_trino_functions::coverage_fns::register_coverage_fns(&ctx);
+    let df = ctx
+        .sql(
+            "SELECT contains(view_a, 'ob'), \
+                    contains(make_array(arrow_cast(view_a, 'Utf8View')), 'Robert') \
+             FROM t ORDER BY rid",
+        )
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let render = |c: usize| -> Vec<Option<String>> {
+        let a = batches[0].column(c);
+        (0..a.len())
+            .map(|i| (!a.is_null(i)).then(|| array_value_to_string(a, i).unwrap()))
+            .collect()
+    };
+    assert_eq!(render(0), vec![s("true"), s("false"), None]);
+    assert_eq!(render(1), vec![s("true"), s("false"), None]);
+}
 col_case!(
     col_date_diff_mixed_scalar_array,
     "date_diff('day', date_a, DATE '2024-03-20')",

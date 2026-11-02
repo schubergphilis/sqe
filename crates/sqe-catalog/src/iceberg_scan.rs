@@ -40,7 +40,8 @@ use iceberg::scan::{FileScanTask, FileScanTaskStream};
 use iceberg::spec::{DataFile, DataFileFormat, ManifestContentType};
 use iceberg::table::Table;
 use parquet::arrow::arrow_reader::{
-    ArrowPredicate, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowFilter,
+    ArrowPredicate, ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+    RowFilter,
 };
 use parquet::arrow::ProjectionMask;
 use tracing::{debug, info_span, warn};
@@ -151,6 +152,10 @@ pub struct ScanTuning {
     /// How long (ms) a decode admission refused by the node pool waits for
     /// memory while its query's own quota has room (#788). `0` fails fast.
     pub scan_memory_wait_ms: u64,
+    /// Declare string columns `Utf8View` (`[catalog] string_view`). The
+    /// provider's schema carries the choice; the scan reads views exactly
+    /// when its projected schema holds one.
+    pub string_view: bool,
 }
 
 impl Default for ScanTuning {
@@ -166,6 +171,7 @@ impl Default for ScanTuning {
             runtime_filter_bloom_max_values: 65536,
             scan_fetch_ahead: None,
             scan_memory_wait_ms: DEFAULT_SCAN_MEMORY_WAIT_MS,
+            string_view: true,
         }
     }
 }
@@ -188,6 +194,7 @@ impl ScanTuning {
             runtime_filter_bloom_max_values: catalog.runtime_filters.bloom_max_values,
             scan_fetch_ahead: catalog.scan_fetch_ahead,
             scan_memory_wait_ms: catalog.scan_memory_wait_ms,
+            string_view: catalog.string_view,
         }
         .normalized()
     }
@@ -635,7 +642,17 @@ impl IcebergScanExec {
             runtime_filter_bloom_max_values: self.runtime_filter_bloom_max_values,
             scan_fetch_ahead: Some(self.scan_fetch_ahead),
             scan_memory_wait_ms: self.scan_memory_wait_ms,
+            string_view: self.reads_string_view(),
         }
+    }
+
+    /// Whether this scan decodes strings as `Utf8View`: exactly when its
+    /// declared projected schema holds a top-level view column.
+    fn reads_string_view(&self) -> bool {
+        self.projected_schema
+            .fields()
+            .iter()
+            .any(|f| f.data_type() == &arrow::datatypes::DataType::Utf8View)
     }
 
     /// Attach pre-computed statistics aggregated from Iceberg manifests.
@@ -1523,6 +1540,9 @@ impl ExecutionPlan for IcebergScanExec {
         let split_assignments = self.split_assignments.clone();
         let table = self.table.clone();
         let schema = self.projected_schema.clone();
+        // Read strings as `Utf8View` exactly when the declared schema does:
+        // the provider schema stays the one source of truth for the layout.
+        let string_view = self.reads_string_view();
         let projection = self.projection.clone();
         let predicates = self.predicates.clone();
         let snapshot_id = self.snapshot_id;
@@ -1970,8 +1990,23 @@ impl ExecutionPlan for IcebergScanExec {
                             // Parse Parquet from the in-memory bytes.
                             // `bytes::Bytes` implements `ChunkReader` so this works directly.
                             let reader_opts = ArrowReaderOptions::new().with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required);
-                            let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(bytes, reader_opts)
+                            let reader_md = ArrowReaderMetadata::load(&bytes, reader_opts.clone())
                                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                            // String view: decode strings straight into the
+                            // `Utf8View` layout the declared schema asks for,
+                            // so row filters see the type they were planned on.
+                            let reader_md = match string_view
+                                .then(|| iceberg::arrow::string_view_schema(reader_md.schema()))
+                                .flatten()
+                            {
+                                Some(view) => ArrowReaderMetadata::try_new(
+                                    Arc::clone(reader_md.metadata()),
+                                    reader_opts.with_schema(Arc::new(view)),
+                                )
+                                .map_err(|e| DataFusionError::External(Box::new(e)))?,
+                                None => reader_md,
+                            };
+                            let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(bytes, reader_md);
                             let builder = match &variant_pruner {
                                 Some(pruner) => {
                                     let groups = builder.metadata().num_row_groups();
@@ -2201,6 +2236,7 @@ impl ExecutionPlan for IcebergScanExec {
             // decode under separate bounds so I/O depth is not capped by
             // the decode permits. 0 keeps single-stage admission.
             sb = sb.with_fetch_ahead(scan_fetch_ahead);
+            sb = sb.with_string_view(string_view);
             // Bloom-filter row-group probing (issue #369): the vendored
             // reader tests sealed runtime-filter key sets against parquet
             // SBBFs and prunes row groups where every key is bloom-negative.
@@ -2603,6 +2639,20 @@ fn is_binary_width_change(
     )
 }
 
+/// String columns read as `Utf8View` (the scan's string-view mode) meet a
+/// file or code path that still yields `Utf8` / `LargeUtf8`, or the other
+/// way round. Same strings, different layout.
+fn is_string_layout_change(
+    file: &arrow::datatypes::DataType,
+    table: &arrow::datatypes::DataType,
+) -> bool {
+    use arrow::datatypes::DataType as D;
+    matches!(
+        (file, table),
+        (D::Utf8 | D::LargeUtf8, D::Utf8View) | (D::Utf8View, D::Utf8 | D::LargeUtf8)
+    )
+}
+
 /// A file another engine wrote carries no Arrow schema, so the parquet reader
 /// labels a UTC-adjusted timestamp `"UTC"` where the table schema says
 /// `"+00:00"`. Both hold UTC instants, so the cast only relabels.
@@ -2703,6 +2753,7 @@ fn conform_batch_to_projection(
                 // the old type; widen it to the promoted one (#859).
                 if is_type_promotion(column.data_type(), field.data_type())
                     || is_binary_width_change(column.data_type(), field.data_type())
+                    || is_string_layout_change(column.data_type(), field.data_type())
                     || is_timezone_relabel(column.data_type(), field.data_type())
                 {
                     let widened = arrow::compute::cast(column, field.data_type()).map_err(|e| {

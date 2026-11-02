@@ -685,6 +685,31 @@ pub(crate) fn str_transform(
     lift1(&a, |s| Ok(f(s)))
 }
 
+/// Cast `Utf8View` / `LargeUtf8` arguments to `Utf8` and pass the rest through.
+///
+/// For UDFs declared with `Signature::any`, which DataFusion never coerces,
+/// whose bodies read `StringArray`. Iceberg and Parquet scans hand strings
+/// over as `Utf8View` by default, so without this such a function fails on a
+/// plain table column.
+pub(crate) fn utf8_string_args(args: Vec<ColumnarValue>) -> DFResult<Vec<ColumnarValue>> {
+    args.into_iter()
+        .map(|cv| match cv {
+            ColumnarValue::Array(a)
+                if matches!(a.data_type(), DataType::Utf8View | DataType::LargeUtf8) =>
+            {
+                Ok(ColumnarValue::Array(arrow::compute::cast(
+                    &a,
+                    &DataType::Utf8,
+                )?))
+            }
+            ColumnarValue::Scalar(ScalarValue::Utf8View(s) | ScalarValue::LargeUtf8(s)) => {
+                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(s)))
+            }
+            other => Ok(other),
+        })
+        .collect()
+}
+
 /// Apply a per-string transform across two string `ColumnarValue`s.
 pub(crate) fn str_transform_2(
     fn_name: &str,

@@ -107,6 +107,8 @@ pub(crate) struct SqeReadOptions {
     pub(crate) fetch_ahead: usize,
     /// SQE PATCH (sqe#870): engine-side row-group pruning.
     pub(crate) row_group_pruner: Option<Arc<dyn RowGroupPruner>>,
+    /// SQE PATCH (string view): decode top-level string columns as `Utf8View`.
+    pub(crate) string_view: bool,
 }
 
 impl Default for SqeReadOptions {
@@ -120,6 +122,7 @@ impl Default for SqeReadOptions {
                 crate::expr::sbbf_row_group_evaluator::DEFAULT_BLOOM_PROBE_MAX_VALUES,
             fetch_ahead: 0,
             row_group_pruner: None,
+            string_view: false,
         }
     }
 }
@@ -227,6 +230,16 @@ impl ArrowReaderBuilder {
     /// file scan (sub)task. Ignored when row group filtering is disabled.
     pub fn with_row_group_pruner(mut self, pruner: Arc<dyn RowGroupPruner>) -> Self {
         self.sqe.row_group_pruner = Some(pruner);
+        self
+    }
+
+    /// SQE PATCH (string view): decode top-level string columns as
+    /// `Utf8View` instead of `Utf8`. The parquet reader then builds views
+    /// over the page buffers rather than copying every value into an offset
+    /// buffer, and DataFusion's view-aware group-by and comparison kernels
+    /// apply. Nested string members keep `Utf8`.
+    pub fn with_string_view(mut self, enabled: bool) -> Self {
+        self.sqe.string_view = enabled;
         self
     }
 
