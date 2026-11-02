@@ -1296,7 +1296,12 @@ async fn build_jdbc(
     build_jdbc_sqlx(url_form, warehouse, options, secrets).await
 }
 
-#[cfg(not(any(feature = "sql", feature = "sql-postgres", feature = "sql-sqlite")))]
+// Only `build_jdbc`'s sqlite-rs path calls this; without `sql-sqlite-rs` the
+// stub `build_jdbc` below answers every `TYPE jdbc` itself.
+#[cfg(all(
+    feature = "sql-sqlite-rs",
+    not(any(feature = "sql", feature = "sql-postgres", feature = "sql-sqlite"))
+))]
 async fn build_jdbc_sqlx(
     url_form: &str,
     _warehouse: &str,
