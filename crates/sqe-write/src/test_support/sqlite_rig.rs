@@ -49,8 +49,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
 use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
-use arrow_schema::Schema as ArrowSchema;
+use arrow_schema::{DataType, Schema as ArrowSchema};
 use chrono::Utc;
 use futures::TryStreamExt;
 use iceberg::spec::{DataFile, TableMetadataBuilder, Transform, UnboundPartitionSpec};
@@ -477,26 +478,30 @@ pub fn id_v_pairs(batches: &[RecordBatch]) -> Vec<(i64, Option<String>)> {
             .as_any()
             .downcast_ref::<Int64Array>()
             .expect("id is Int64");
-        let vs = batch
-            .column(v_idx)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap_or_else(|| panic!("v is Utf8, got {:?}", batch.column(v_idx).data_type()));
-        for i in 0..batch.num_rows() {
-            let v = if vs.is_null(i) {
-                None
-            } else {
-                Some(vs.value(i).to_string())
-            };
-            out.push((ids.value(i), v));
-        }
+        // Iceberg scans read strings as Utf8View; rows written in-process
+        // stay Utf8. Accept both so the helper follows the scan's type.
+        let column = batch.column(v_idx);
+        let vs: Vec<Option<String>> = match column.data_type() {
+            DataType::Utf8 => column
+                .as_string::<i32>()
+                .iter()
+                .map(|v| v.map(str::to_string))
+                .collect(),
+            DataType::Utf8View => column
+                .as_string_view()
+                .iter()
+                .map(|v| v.map(str::to_string))
+                .collect(),
+            other => panic!("v is Utf8 or Utf8View, got {other:?}"),
+        };
+        out.extend(ids.values().iter().copied().zip(vs));
     }
     out
 }
 
 /// Schema `(id BIGINT NOT NULL, v VARCHAR)`, the shape most rig tests use.
 pub fn id_v_schema() -> Arc<ArrowSchema> {
-    use arrow_schema::{DataType, Field};
+    use arrow_schema::Field;
     Arc::new(ArrowSchema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("v", DataType::Utf8, true),
