@@ -19,11 +19,11 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, FixedSizeBinaryBuilder,
-    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
-    LargeStringArray, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array,
-    UInt8Array,
+    Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
+    FixedSizeBinaryBuilder, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+    Int8Array, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -191,6 +191,25 @@ fn encode_column(array: &ArrayRef) -> DFResult<Vec<[u8; KEY_BYTES_PER_COL]>> {
                 out[i] = prefix_key(a.value(i).as_bytes());
             }
         }
+        // Iceberg and Parquet scans read strings as Utf8View by default.
+        DataType::Utf8View => {
+            let a = array.as_any().downcast_ref::<StringViewArray>().unwrap();
+            for i in 0..n {
+                if a.is_null(i) {
+                    continue;
+                }
+                out[i] = prefix_key(a.value(i).as_bytes());
+            }
+        }
+        DataType::BinaryView => {
+            let a = array.as_any().downcast_ref::<BinaryViewArray>().unwrap();
+            for i in 0..n {
+                if a.is_null(i) {
+                    continue;
+                }
+                out[i] = prefix_key(a.value(i));
+            }
+        }
         DataType::Binary => {
             let a = array.as_any().downcast_ref::<BinaryArray>().unwrap();
             for i in 0..n {
@@ -348,6 +367,21 @@ mod tests {
         assert!(out[0] < out[1]);
         // "ab" < "aba": shorter prefix sorts first
         assert!(out[2] < out[3]);
+    }
+
+    /// Scans read strings as Utf8View; the view key must equal the Utf8 key.
+    #[test]
+    fn utf8_view_and_binary_view_match_their_plain_keys() {
+        let vals = vec![Some("aaa"), None, Some("aba")];
+        let plain = z(vec![Arc::new(StringArray::from(vals.clone())) as ArrayRef]);
+        let view = z(vec![Arc::new(StringViewArray::from(vals)) as ArrayRef]);
+        assert_eq!(plain, view);
+        let bin = z(vec![Arc::new(BinaryViewArray::from(vec![
+            Some(b"aaa".as_slice()),
+            None,
+            Some(b"aba"),
+        ])) as ArrayRef]);
+        assert_eq!(plain, bin);
     }
 
     #[test]

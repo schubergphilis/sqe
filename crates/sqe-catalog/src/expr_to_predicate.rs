@@ -335,8 +335,12 @@ fn scalar_value_to_datum(value: &ScalarValue) -> Option<Datum> {
         ScalarValue::Float64(Some(v)) => Some(Datum::double(*v)),
         ScalarValue::Utf8(Some(v)) => Some(Datum::string(v.clone())),
         ScalarValue::LargeUtf8(Some(v)) => Some(Datum::string(v.clone())),
+        // A view-typed column (string-view scans, `read_parquet`) coerces its
+        // literals to the view type; same value, so it must push down too.
+        ScalarValue::Utf8View(Some(v)) => Some(Datum::string(v.clone())),
         ScalarValue::Binary(Some(v)) => Some(Datum::binary(v.clone())),
         ScalarValue::LargeBinary(Some(v)) => Some(Datum::binary(v.clone())),
+        ScalarValue::BinaryView(Some(v)) => Some(Datum::binary(v.clone())),
         ScalarValue::Date32(Some(v)) => Some(Datum::date(*v)),
         ScalarValue::Date64(Some(v)) => Some(Datum::date((*v / MILLIS_PER_DAY) as i32)),
         ScalarValue::TimestampMicrosecond(Some(v), None) => Some(Datum::timestamp_micros(*v)),

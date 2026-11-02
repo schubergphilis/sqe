@@ -670,6 +670,11 @@ fn nullable_type(data_type: &arrow_schema::DataType) -> arrow_schema::DataType {
                 *sorted,
             )
         }
+        // View layouts are an engine-internal choice (string-view scans,
+        // `read_parquet`); JDBC and older ADBC/pyarrow clients switch on
+        // `Utf8` / `Binary`, so the wire carries the classic layout.
+        DataType::Utf8View => DataType::Utf8,
+        DataType::BinaryView => DataType::Binary,
         other => other.clone(),
     }
 }

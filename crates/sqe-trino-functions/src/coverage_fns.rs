@@ -243,13 +243,24 @@ impl ScalarUDFImpl for Contains {
     fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Boolean)
     }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let rows = args.number_rows;
         let first = args.args[0].to_array(rows)?;
 
         // Trino `contains(array, element)`: three-valued membership test.
         if let Some(list) = first.as_any().downcast_ref::<ListArray>() {
+            // Compare in the list's item type: a 'x' literal is Utf8 while a
+            // scanned array<string> holds Utf8View, and ScalarValue equality
+            // is type-strict.
             let elems = args.args[1].to_array(rows)?;
+            let item = list.value_type();
+            let elems = if elems.data_type() != &item
+                && arrow::compute::can_cast_types(elems.data_type(), &item)
+            {
+                arrow::compute::cast(&elems, &item)?
+            } else {
+                elems
+            };
             let mut out: Vec<Option<bool>> = Vec::with_capacity(rows);
             for i in 0..rows {
                 if list.is_null(i) || elems.is_null(i) {
@@ -284,6 +295,8 @@ impl ScalarUDFImpl for Contains {
         }
 
         // Preserve DataFusion's string `contains(haystack, needle)`.
+        args.args = crate::helpers::utf8_string_args(std::mem::take(&mut args.args))?;
+        let first = args.args[0].to_array(rows)?;
         let haystack = first
             .as_any()
             .downcast_ref::<StringArray>()

@@ -919,6 +919,28 @@ pub fn schema_to_arrow_schema(schema: &Schema) -> Result<ArrowSchema> {
     }
 }
 
+/// SQE PATCH (string view): `schema` with every top-level `Utf8` / `LargeUtf8`
+/// field retyped to `Utf8View`, keeping each field's name, nullability and
+/// metadata (the parquet field id among it). `None` when no field changes.
+///
+/// Nested string members keep their type: parquet's schema hint and the
+/// nested promote paths are not exercised with view children.
+pub fn string_view_schema(schema: &ArrowSchema) -> Option<ArrowSchema> {
+    let mut changed = false;
+    let fields: Vec<FieldRef> = schema
+        .fields()
+        .iter()
+        .map(|f| match f.data_type() {
+            DataType::Utf8 | DataType::LargeUtf8 => {
+                changed = true;
+                Arc::new(f.as_ref().clone().with_data_type(DataType::Utf8View))
+            }
+            _ => Arc::clone(f),
+        })
+        .collect();
+    changed.then(|| ArrowSchema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
 /// Convert iceberg type to an arrow type.
 pub fn type_to_arrow_type(ty: &Type) -> Result<DataType> {
     let mut converter = ToArrowSchemaConverter;

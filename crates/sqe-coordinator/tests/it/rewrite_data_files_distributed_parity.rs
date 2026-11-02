@@ -502,11 +502,7 @@ async fn collect_id_region_v_rows(
             .as_any()
             .downcast_ref::<Int64Array>()
             .expect("id Int64Array");
-        let regions = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("region StringArray");
+        let regions = crate::common::utf8(batch.column(1));
         let vs = batch
             .column(2)
             .as_any()
