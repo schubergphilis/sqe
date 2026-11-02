@@ -20,8 +20,9 @@ use std::sync::Arc;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
     FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray,
-    LargeListArray, LargeStringArray, ListArray, MapArray, StringArray, StructArray,
-    Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray, new_null_array,
+    LargeListArray, LargeStringArray, ListArray, MapArray, StringArray, StringViewArray,
+    StructArray, Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray,
+    new_null_array,
 };
 use arrow_buffer::{BooleanBuffer, Buffer};
 use arrow_schema::{DataType, FieldRef, TimeUnit};
@@ -291,6 +292,9 @@ impl SchemaWithPartnerVisitor<ArrayRef> for ArrowArrayToIcebergStructConverter {
                 if let Some(array) = partner.as_any().downcast_ref::<LargeStringArray>() {
                     Ok(array.iter().map(|v| v.map(Literal::string)).collect())
                 } else if let Some(array) = partner.as_any().downcast_ref::<StringArray>() {
+                    Ok(array.iter().map(|v| v.map(Literal::string)).collect())
+                } else if let Some(array) = partner.as_any().downcast_ref::<StringViewArray>() {
+                    // SQE PATCH (string view): scans may decode strings as views.
                     Ok(array.iter().map(|v| v.map(Literal::string)).collect())
                 } else {
                     Err(invalid_data!("The partner is not a string array"))
@@ -600,6 +604,10 @@ pub(crate) fn create_primitive_array_single_element(
         (DataType::Utf8, Some(PrimitiveLiteral::String(v))) => {
             Ok(Arc::new(StringArray::from(vec![v.as_str()])))
         }
+        // SQE PATCH (string view): constants of a view-typed scan column.
+        (DataType::Utf8View, Some(PrimitiveLiteral::String(v))) => {
+            Ok(Arc::new(StringViewArray::from(vec![v.as_str()])))
+        }
         (DataType::Binary, Some(PrimitiveLiteral::Binary(v))) => {
             Ok(Arc::new(BinaryArray::from_vec(vec![v.as_slice()])))
         }
@@ -711,6 +719,11 @@ pub(crate) fn create_primitive_array_repeated(
         }
         (DataType::Utf8, Some(PrimitiveLiteral::String(value))) => Arc::new(
             StringArray::from_iter_values(std::iter::repeat_n(value.as_str(), num_rows)),
+        ),
+        // SQE PATCH (string view): defaults and identity-partition constants
+        // of a view-typed scan column.
+        (DataType::Utf8View, Some(PrimitiveLiteral::String(value))) => Arc::new(
+            StringViewArray::from_iter_values(std::iter::repeat_n(value.as_str(), num_rows)),
         ),
         (DataType::Binary, Some(PrimitiveLiteral::Binary(value))) => Arc::new(
             BinaryArray::from_iter_values(std::iter::repeat_n(value.as_slice(), num_rows)),

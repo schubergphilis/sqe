@@ -1361,8 +1361,9 @@ impl ScalarUDFImpl for DateParse {
         ))
     }
 
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         use datafusion::common::ScalarValue;
+        args.args = crate::helpers::utf8_string_args(std::mem::take(&mut args.args))?;
 
         let pattern = match &args.args[1] {
             ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => s.clone(),
@@ -1620,8 +1621,9 @@ impl ScalarUDFImpl for JsonFormat {
         Ok(DataType::Utf8)
     }
 
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         use datafusion::common::ScalarValue;
+        args.args = crate::helpers::utf8_string_args(std::mem::take(&mut args.args))?;
 
         // Identity pass-through: SQE stores JSON as Utf8 strings.
         match &args.args[0] {
@@ -2111,8 +2113,9 @@ impl ScalarUDFImpl for TrinoCodepoint {
         Ok(DataType::Int32)
     }
 
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         use datafusion::common::ScalarValue;
+        args.args = crate::helpers::utf8_string_args(std::mem::take(&mut args.args))?;
         let [arg] = take_function_args::<1>("codepoint", &args.args)?;
         let one = |s: &str| -> DFResult<i32> {
             let mut chars = s.chars();

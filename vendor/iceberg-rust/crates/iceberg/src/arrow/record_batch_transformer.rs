@@ -559,6 +559,7 @@ pub(crate) struct RecordBatchTransformerBuilder {
     constant_fields: HashMap<i32, ColumnConstant>,
     virtual_fields: HashSet<i32>,
     require_source_fields: HashSet<i32>,
+    string_view: bool,
 }
 
 /// How a metadata (or identity-partition) column's values are supplied.
@@ -631,7 +632,16 @@ impl RecordBatchTransformerBuilder {
             constant_fields: HashMap::new(),
             virtual_fields: HashSet::new(),
             require_source_fields: HashSet::new(),
+            string_view: false,
         }
+    }
+
+    /// SQE PATCH (string view): emit top-level string columns as `Utf8View`
+    /// (see `crate::arrow::string_view_schema`), matching a reader that
+    /// decodes them that way.
+    pub(crate) fn with_string_view(mut self, enabled: bool) -> Self {
+        self.string_view = enabled;
+        self
     }
 
     /// Add a scalar constant value for a specific field ID.
@@ -735,6 +745,7 @@ impl RecordBatchTransformerBuilder {
             constant_fields: self.constant_fields,
             virtual_fields: self.virtual_fields,
             require_source_fields: self.require_source_fields,
+            string_view: self.string_view,
             batch_transform: None,
         }
     }
@@ -785,6 +796,9 @@ pub(crate) struct RecordBatchTransformer {
     // Field IDs that must resolve from the source file; see `with_required_source_fields`.
     require_source_fields: HashSet<i32>,
 
+    // SQE PATCH (string view): top-level strings target `Utf8View`.
+    string_view: bool,
+
     // BatchTransform gets lazily constructed based on the schema of
     // the first RecordBatch we receive from the file
     batch_transform: Option<BatchTransform>,
@@ -828,6 +842,7 @@ impl RecordBatchTransformer {
                     &self.constant_fields,
                     &self.virtual_fields,
                     &self.require_source_fields,
+                    self.string_view,
                 )?);
 
                 self.process_record_batch(record_batch)?
@@ -849,8 +864,20 @@ impl RecordBatchTransformer {
         constant_fields: &HashMap<i32, ColumnConstant>,
         virtual_fields: &HashSet<i32>,
         require_source_fields: &HashSet<i32>,
+        string_view: bool,
     ) -> Result<BatchTransform> {
-        let mapped_unprojected_arrow_schema = Arc::new(schema_to_arrow_schema(snapshot_schema)?);
+        let mut mapped_unprojected_arrow_schema = schema_to_arrow_schema(snapshot_schema)?;
+        // SQE PATCH (string view): target `Utf8View` for top-level strings, so a
+        // column the reader decoded as views passes through, a file that still
+        // yields `Utf8` is cast once, and defaults/identity constants are built
+        // as views (`create_primitive_array_repeated`).
+        if string_view
+            && let Some(view_schema) =
+                crate::arrow::string_view_schema(&mapped_unprojected_arrow_schema)
+        {
+            mapped_unprojected_arrow_schema = view_schema;
+        }
+        let mapped_unprojected_arrow_schema = Arc::new(mapped_unprojected_arrow_schema);
         let field_id_to_mapped_schema_map =
             Self::build_field_id_to_arrow_schema_map(&mapped_unprojected_arrow_schema)?;
 

@@ -139,10 +139,7 @@ async fn test_ctas_roundtrip() {
     let name_col = batch
         .column_by_name("name")
         .expect("should have 'name' column");
-    let name_arr = name_col
-        .as_any()
-        .downcast_ref::<arrow_array::StringArray>()
-        .expect("name column should be Utf8");
+    let name_arr = crate::common::utf8(name_col);
     assert_eq!(name_arr.value(0), "hello");
 
     // Cleanup
@@ -606,10 +603,7 @@ async fn test_read_parquet_local_file() {
             .as_any()
             .downcast_ref::<arrow_array::Int64Array>()
             .expect("'id' column should be Int64");
-        let name_arr = name_col
-            .as_any()
-            .downcast_ref::<arrow_array::StringArray>()
-            .expect("'name' column should be Utf8");
+        let name_arr = crate::common::utf8(name_col);
 
         for row in 0..batch.num_rows() {
             ids.push(id_arr.value(row));
@@ -669,12 +663,11 @@ fn assert_three_known_rows(batches: &[arrow_array::RecordBatch]) {
             .as_any()
             .downcast_ref::<arrow_array::Int64Array>()
             .expect("'id' column should be Int64");
-        let name_arr = batch
-            .column_by_name("name")
-            .expect("batch should have 'name' column")
-            .as_any()
-            .downcast_ref::<arrow_array::StringArray>()
-            .expect("'name' column should be Utf8");
+        let name_arr = crate::common::utf8(
+            batch
+                .column_by_name("name")
+                .expect("batch should have 'name' column"),
+        );
         for row in 0..batch.num_rows() {
             ids.push(id_arr.value(row));
             names.push(name_arr.value(row).to_string());
@@ -1022,13 +1015,9 @@ async fn test_inner_join() {
 
     // First row should be Alice in Engineering
     let batch = &batches[0];
-    let name = batch
-        .column_by_name("name")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap()
-        .value(0);
+    let name = crate::common::utf8(batch.column_by_name("name").unwrap())
+        .value(0)
+        .to_string();
     assert_eq!(name, "Alice");
 
     teardown_join_fixture(&session, &handler).await;
@@ -1361,13 +1350,9 @@ async fn test_subquery_where() {
 
     // Top earner is Eve
     let batch = &batches[0];
-    let name = batch
-        .column_by_name("name")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap()
-        .value(0);
+    let name = crate::common::utf8(batch.column_by_name("name").unwrap())
+        .value(0)
+        .to_string();
     assert_eq!(name, "Eve");
 
     teardown_join_fixture(&session, &handler).await;
@@ -1472,13 +1457,9 @@ async fn test_order_limit_offset() {
     assert_eq!(rows, 3, "LIMIT 3 with OFFSET 1");
 
     let batch = &batches[0];
-    let first = batch
-        .column_by_name("name")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap()
-        .value(0);
+    let first = crate::common::utf8(batch.column_by_name("name").unwrap())
+        .value(0)
+        .to_string();
     assert_eq!(first, "Alice", "After offset, first is Alice (2nd highest)");
 
     teardown_join_fixture(&session, &handler).await;
@@ -1579,13 +1560,9 @@ async fn test_string_functions() {
     assert_eq!(rows, 3);
 
     let batch = &batches[0];
-    let upper = batch
-        .column_by_name("upper_name")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap()
-        .value(0);
+    let upper = crate::common::utf8(batch.column_by_name("upper_name").unwrap())
+        .value(0)
+        .to_string();
     assert_eq!(upper, "ALICE");
 
     teardown_join_fixture(&session, &handler).await;
@@ -3315,12 +3292,11 @@ async fn test_merge_insert_and_update() {
             .as_any()
             .downcast_ref::<Int64Array>()
             .expect("id should be Int64");
-        let val_col = batch
-            .column_by_name("val")
-            .expect("should have 'val' column")
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("val should be Utf8");
+        let val_col = crate::common::utf8(
+            batch
+                .column_by_name("val")
+                .expect("should have 'val' column"),
+        );
         for row in 0..batch.num_rows() {
             rows.push((id_col.value(row), val_col.value(row).to_string()));
         }
