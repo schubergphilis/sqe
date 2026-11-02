@@ -19,8 +19,10 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use crate::eliminate_cross_join::EliminateCrossJoin;
 
 mod sorted_row_number;
+mod top_row_number;
 
 pub use sorted_row_number::{SortedRowNumberExec, SortedRowNumberRule};
+pub use top_row_number::TopRowNumberRule;
 
 /// A context for user SQL: `config` and `runtime`, planned by
 /// [`EngineQueryPlanner`], with SQE's [`EliminateCrossJoin`] in place of
@@ -38,7 +40,9 @@ pub fn engine_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> Sessio
 }
 
 /// DataFusion's default logical rules, with `eliminate_cross_join` swapped
-/// for SQE's copy that keeps unplaced `ON` keys (apache/datafusion#26058).
+/// for SQE's copy that keeps unplaced `ON` keys (apache/datafusion#26058),
+/// and [`TopRowNumberRule`] last, after projections are pruned, so the
+/// aggregate it builds carries only the columns the query reads.
 fn engine_optimizer_rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     let mut rules = Optimizer::new().rules;
     for rule in rules.iter_mut() {
@@ -46,6 +50,7 @@ fn engine_optimizer_rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
             *rule = Arc::new(EliminateCrossJoin::new());
         }
     }
+    rules.push(Arc::new(TopRowNumberRule));
     rules
 }
 
