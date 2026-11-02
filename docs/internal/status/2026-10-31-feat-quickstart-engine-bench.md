@@ -37,6 +37,10 @@ not as a backport. `first_value(... ORDER BY ...) GROUP BY` is no way out
 either: 73 s and 3.7 GiB, since its groups accumulator keeps a
 `Vec<ScalarValue>` per group.
 
-**NEXT:** Polaris fixed-overhead trace (q1/q2 phases); a q3 rewrite only if
-a plain hash aggregate is at least 2x under the window sort; then embedded
-Iceberg scan through `SqeTableProvider`, `target_partitions` over Flight.
+The q3 rewrite is its own branch, `feat/top-row-number`: `rn = 1` as a hash
+aggregate, ~8.9 s -> ~5.6 s at 3 GiB, same rows as DuckDB (a plain `max()`
+per customer, the floor for that shape, is 3.6-3.9 s).
+
+**NEXT:** Polaris fixed-overhead trace (q1/q2 phases); re-run q3 at 150M
+once `feat/top-row-number` merges; then embedded Iceberg scan through
+`SqeTableProvider`, `target_partitions` over Flight.
