@@ -170,6 +170,9 @@ pub struct TableScanBuilder<'a> {
     /// SQE PATCH (sqe#870): engine-side row-group pruning, forwarded to the
     /// arrow reader.
     row_group_pruner: Option<Arc<dyn RowGroupPruner>>,
+    /// SQE PATCH (string view): decode top-level strings as `Utf8View`,
+    /// forwarded to the arrow reader.
+    string_view: bool,
 }
 
 impl<'a> TableScanBuilder<'a> {
@@ -199,7 +202,15 @@ impl<'a> TableScanBuilder<'a> {
                 crate::expr::sbbf_row_group_evaluator::DEFAULT_BLOOM_PROBE_MAX_VALUES,
             fetch_ahead: 0,
             row_group_pruner: None,
+            string_view: false,
         }
+    }
+
+    /// SQE PATCH (string view): decode top-level string columns as
+    /// `Utf8View`. See [`crate::arrow::ArrowReaderBuilder::with_string_view`].
+    pub fn with_string_view(mut self, enabled: bool) -> Self {
+        self.string_view = enabled;
+        self
     }
 
     /// SQE PATCH (sqe#scan-fetch-pipeline): enable fetch/decode pipelining with up to
@@ -461,6 +472,7 @@ impl<'a> TableScanBuilder<'a> {
                         bloom_probe_max_values: self.bloom_probe_max_values,
                         fetch_ahead: self.fetch_ahead,
                         row_group_pruner: self.row_group_pruner.clone(),
+                        string_view: self.string_view,
                     });
                 };
                 current_snapshot_id.clone()
@@ -553,6 +565,7 @@ impl<'a> TableScanBuilder<'a> {
             bloom_probe_max_values: self.bloom_probe_max_values,
             fetch_ahead: self.fetch_ahead,
             row_group_pruner: self.row_group_pruner,
+            string_view: self.string_view,
         })
     }
 }
@@ -612,6 +625,8 @@ pub struct TableScan {
     /// SQE PATCH (sqe#870): engine-side row-group pruning (see
     /// [`TableScanBuilder::with_row_group_pruner`]). Forwarded to the reader.
     row_group_pruner: Option<Arc<dyn RowGroupPruner>>,
+    /// SQE PATCH (string view): see [`TableScanBuilder::with_string_view`].
+    string_view: bool,
 }
 
 impl TableScan {
@@ -780,7 +795,9 @@ impl TableScan {
                 .with_bloom_filter_probing_enabled(self.bloom_filter_probing_enabled)
                 .with_bloom_probe_max_values(self.bloom_probe_max_values)
                 // SQE PATCH (sqe#scan-fetch-pipeline)
-                .with_fetch_ahead(self.fetch_ahead);
+                .with_fetch_ahead(self.fetch_ahead)
+                // SQE PATCH (string view)
+                .with_string_view(self.string_view);
 
         if let Some(batch_size) = self.batch_size {
             arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);

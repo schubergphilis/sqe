@@ -2885,6 +2885,14 @@ pub struct CatalogConfig {
     /// Default: 30000.
     #[serde(default = "default_scan_memory_wait_ms")]
     pub scan_memory_wait_ms: u64,
+    /// Declare and decode Iceberg string columns as Arrow `Utf8View`
+    /// instead of `Utf8`. Filters, joins, aggregates and sorts on strings
+    /// skip a copy of every value; the Flight SQL wire still carries `Utf8`.
+    /// `false` restores the classic layout (A/B escape hatch).
+    ///
+    /// Default: true.
+    #[serde(default = "default_true")]
+    pub string_view: bool,
     /// Two-tier dynamic runtime-filter pushdown tuning (issue #132).
     #[serde(default)]
     pub runtime_filters: RuntimeFiltersConfig,
@@ -7965,6 +7973,7 @@ partial_progress_batch = 5
                 manifest_concurrency: 64,
                 scan_fetch_ahead: None,
                 scan_memory_wait_ms: default_scan_memory_wait_ms(),
+                string_view: true,
                 runtime_filters: RuntimeFiltersConfig::default(),
                 auth: None,
                 storage: None,
@@ -9475,6 +9484,7 @@ s3_secret_key = "configured-secret"
                 manifest_concurrency: 64,
                 scan_fetch_ahead: None,
                 scan_memory_wait_ms: default_scan_memory_wait_ms(),
+                string_view: true,
                 runtime_filters: RuntimeFiltersConfig::default(),
                 auth: None,
                 storage: None,
@@ -9514,6 +9524,7 @@ s3_secret_key = "configured-secret"
                     manifest_concurrency: 64,
                     scan_fetch_ahead: None,
                     scan_memory_wait_ms: default_scan_memory_wait_ms(),
+                    string_view: true,
                     runtime_filters: RuntimeFiltersConfig::default(),
                     auth: None,
                     storage: None,
@@ -9560,6 +9571,7 @@ s3_secret_key = "configured-secret"
                 manifest_concurrency: 64,
                 scan_fetch_ahead: None,
                 scan_memory_wait_ms: default_scan_memory_wait_ms(),
+                string_view: true,
                 runtime_filters: RuntimeFiltersConfig::default(),
                 auth: None,
                 storage: None,

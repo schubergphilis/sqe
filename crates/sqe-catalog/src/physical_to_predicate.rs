@@ -658,9 +658,9 @@ fn scalar_to_datum(scalar: &ScalarValue) -> Option<Datum> {
         ScalarValue::Int64(Some(v)) => Some(Datum::long(*v)),
         ScalarValue::Float32(Some(v)) => Some(Datum::float(*v)),
         ScalarValue::Float64(Some(v)) => Some(Datum::double(*v)),
-        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
-            Some(Datum::string(s.clone()))
-        }
+        ScalarValue::Utf8(Some(s))
+        | ScalarValue::LargeUtf8(Some(s))
+        | ScalarValue::Utf8View(Some(s)) => Some(Datum::string(s.clone())),
         ScalarValue::Date32(Some(d)) => Some(Datum::date(*d)),
         // Decimal values are intentionally not handled in v1 of the
         // converter. iceberg's `Datum::decimal` expects a `fastnum`

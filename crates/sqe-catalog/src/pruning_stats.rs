@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array,
-    StringArray, TimestampMicrosecondArray, TimestampNanosecondArray, UInt64Array,
+    LargeStringArray, StringArray, StringViewArray, TimestampMicrosecondArray,
+    TimestampNanosecondArray, UInt64Array,
 };
 use arrow::datatypes::{DataType, Schema, SchemaRef, TimeUnit};
 use datafusion::common::pruning::PruningStatistics;
@@ -189,6 +190,28 @@ fn build_bounds_array<T: Borrow<DataFile>>(
                 .iter()
                 .map(|s| match s {
                     Some(ScalarValue::Utf8(v)) => v.as_deref(),
+                    _ => None,
+                })
+                .collect();
+            Some(Arc::new(a) as ArrayRef)
+        }
+        // Iceberg scans read strings as Utf8View by default; without this arm
+        // every string predicate lost manifest min/max file pruning.
+        DataType::Utf8View => {
+            let a: StringViewArray = scalars
+                .iter()
+                .map(|s| match s {
+                    Some(ScalarValue::Utf8View(v)) => v.as_deref(),
+                    _ => None,
+                })
+                .collect();
+            Some(Arc::new(a) as ArrayRef)
+        }
+        DataType::LargeUtf8 => {
+            let a: LargeStringArray = scalars
+                .iter()
+                .map(|s| match s {
+                    Some(ScalarValue::LargeUtf8(v)) => v.as_deref(),
                     _ => None,
                 })
                 .collect();
@@ -741,6 +764,33 @@ mod tests {
             .unwrap();
         let arr = build_bounds_array(&[df], 1, &ty, true).unwrap();
         assert_eq!(arr.data_type(), &ty);
+    }
+
+    /// Scans read strings as Utf8View by default, so string min/max pruning
+    /// must build view (and large) arrays, not give up.
+    #[test]
+    fn string_bounds_build_view_and_large_arrays() {
+        use arrow::array::AsArray;
+        use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+        use std::collections::HashMap;
+
+        let df = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_format(DataFileFormat::Parquet)
+            .file_path("f.parquet".into())
+            .file_size_in_bytes(1)
+            .record_count(1)
+            .partition_spec_id(0)
+            .partition(Struct::empty())
+            .lower_bounds(HashMap::from([(1, Datum::string("alpha"))]))
+            .upper_bounds(HashMap::from([(1, Datum::string("zulu"))]))
+            .build()
+            .unwrap();
+        let lo =
+            build_bounds_array(std::slice::from_ref(&df), 1, &DataType::Utf8View, false).unwrap();
+        assert_eq!(lo.as_string_view().value(0), "alpha");
+        let hi = build_bounds_array(&[df], 1, &DataType::LargeUtf8, true).unwrap();
+        assert_eq!(hi.as_string::<i64>().value(0), "zulu");
     }
 
     #[test]

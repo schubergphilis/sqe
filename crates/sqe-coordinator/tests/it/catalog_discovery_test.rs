@@ -435,12 +435,11 @@ async fn polaris_auto_lazy_hit() {
         .expect("'id' is Int64");
     assert_eq!(id_arr.value(0), 42);
 
-    let label_arr = batch
-        .column_by_name("label")
-        .expect("'label' column must exist")
-        .as_any()
-        .downcast_ref::<arrow_array::StringArray>()
-        .expect("'label' is Utf8");
+    let label_arr = crate::common::utf8(
+        batch
+            .column_by_name("label")
+            .expect("'label' column must exist"),
+    );
     assert_eq!(label_arr.value(0), "discovered");
 }
 
@@ -738,12 +737,8 @@ async fn polaris_auto_in_session_reuse() {
     let rows2: usize = batches2.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows2, 1, "second query: probe_t still has one row");
 
-    let label_arr = batches2[0]
-        .column_by_name("label")
-        .expect("'label' column")
-        .as_any()
-        .downcast_ref::<arrow_array::StringArray>()
-        .expect("'label' is Utf8");
+    let label_arr =
+        crate::common::utf8(batches2[0].column_by_name("label").expect("'label' column"));
     assert_eq!(label_arr.value(0), "discovered");
 }
 
