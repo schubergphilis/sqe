@@ -27,7 +27,9 @@ client_id = "root"
 client_secret = "@POLARIS_ROOT_SECRET@"
 
 [query]
-max_result_rows = 10_000_000
+# 0 = unlimited: q3 and q4 return ~15M rows at 150m, past any fixed cap
+# that would still mean something in production.
+max_result_rows = 0
 max_query_memory = "@MEM_LIMIT@"
 per_user_memory_budget = "0"
 timeout_secs = 1800

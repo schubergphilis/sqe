@@ -13,6 +13,17 @@
     is checked against DuckDB's. `./run.sh --check` asserts that every run
     finished and every answer matches.
 
+- `make bench` / `make bench-smoke`, and `STORAGE=s3` for engine-bench: every engine reads the same Parquet from S3
+
+    `make bench` runs engine-bench at 150M rows with Spark, the setup of the
+    upstream write-up; `make bench-smoke` runs 10M rows with `--check`.
+    `STORAGE=s3` (`BENCH_STORAGE=s3`) copies the data into RustFS and points
+    `sqe-parquet`, DuckDB, Polars and Spark at it, so they read over the same
+    path as `sqe-polaris`, and records the bytes each run read from the store.
+    Results go to `OUTPUT-s3.md`. `bench.py run --budget-for polars=8` raises
+    the kill threshold for one engine, and failed runs now keep their first
+    exception lines rather than only the stack frames.
+
 ### Fixed
 
 - CTAS from Parquet with `timestamp[ms]` or `timestamp[s]` columns failed with "Unsupported Arrow data type: Timestamp(ms)"
