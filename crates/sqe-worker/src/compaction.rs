@@ -37,7 +37,8 @@ use iceberg::TableIdent;
 use sqe_compaction::wire::{CompactGroupRequest, CompactGroupResponse, S3Conn};
 use sqe_compaction::writer::{new_upload_tracker, parse_parquet_compression, UploadedPaths};
 use sqe_compaction::{
-    collect_live_delete_files, plan_delete_aware_read, rewrite_group, ProgressReporter, SortCtx,
+    collect_live_delete_files, plan_delete_aware_read, rewrite_group, DeleteAwareReadPlan,
+    ProgressReporter, SortCtx,
 };
 use sqe_core::{Result as SqeResult, SqeError, SqeErrorCode};
 use tokio_util::sync::CancellationToken;
@@ -92,6 +93,9 @@ pub struct GroupRewriteCtx {
     /// `request.s3` by the caller ([`build_file_io`]) and used both to pin
     /// the `StaticTable` and to delete orphan uploads on the failure path.
     pub file_io: FileIO,
+    /// Worker-wide read plans, shared by the groups of one job
+    /// ([`CompactionPlanCache`]).
+    pub plan_cache: Arc<CompactionPlanCache>,
 }
 
 /// What a best-effort orphan cleanup managed to do.
@@ -336,24 +340,132 @@ fn parse_table_ident(table_ident: &str) -> SqeResult<TableIdent> {
     })
 }
 
-/// Rewrite one file group against an already-pinned [`IcebergTable`]. Split
-/// out from [`compact_file_group`] so the snapshot-pin assertion and the
-/// group-resolution guard are reachable in tests without needing a real
-/// `StaticTable::from_metadata_file` load (see the unit tests below); the
-/// public entry point below is the thin S3/StaticTable-loading wrapper
-/// around this.
-///
-/// `tracker` is supplied by the caller rather than allocated here (finding
-/// 608): the RPC layer must be able to read the uploaded-path list on the
-/// failure path, which means it has to outlive this future.
-async fn compact_pinned_table(
-    session_ctx: &SessionContext,
+/// The table, read plan and live delete files one compaction job needs,
+/// pinned to one snapshot. Every group of the job reads through the same
+/// pinned job: the read plan covers the whole table, so building it per group
+/// made a job cost groups x manifests (measured: 393 ms of a 420 ms group,
+/// 200-file table, debug build).
+pub(crate) struct PinnedJob {
     table: IcebergTable,
-    request: &CompactGroupRequest,
-    progress_tx: Option<tokio::sync::mpsc::Sender<u64>>,
-    tracker: UploadedPaths,
-    cancel: &CancellationToken,
-) -> SqeResult<CompactGroupResponse> {
+    plan: DeleteAwareReadPlan,
+    live_deletes: Vec<DataFile>,
+    arrow_schema: arrow_schema::SchemaRef,
+}
+
+/// Identifies one pinned job. The credential fingerprint keeps a request
+/// from reading through a `FileIO` built from different credentials (another
+/// principal, or credentials re-vended mid-job): a mismatch costs one more
+/// plan, never a shared store.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PlanKey {
+    job_id: String,
+    metadata_location: String,
+    snapshot_id: i64,
+    credentials: u64,
+}
+
+struct PlanSlot {
+    cell: Arc<tokio::sync::OnceCell<Arc<PinnedJob>>>,
+    last_used: std::time::Instant,
+}
+
+/// Worker-wide cache of [`PinnedJob`]s, so the groups of one compaction job
+/// plan the table once per worker instead of once per group.
+///
+/// Concurrent groups of the same job share a single in-flight build
+/// (`OnceCell`); a failed build (snapshot mismatch, unreadable manifest) is
+/// not cached, so the next group retries. Entries idle longer than
+/// `idle_ttl` go, and at `capacity` the least recently used idle entry is
+/// evicted. An entry a group still holds is never evicted, so the cache can
+/// briefly exceed `capacity` when that many jobs run at once.
+pub struct CompactionPlanCache {
+    slots: std::sync::Mutex<HashMap<PlanKey, PlanSlot>>,
+    hasher: std::hash::RandomState,
+    capacity: usize,
+    idle_ttl: std::time::Duration,
+}
+
+impl Default for CompactionPlanCache {
+    fn default() -> Self {
+        Self::new(4, std::time::Duration::from_secs(300))
+    }
+}
+
+impl CompactionPlanCache {
+    pub fn new(capacity: usize, idle_ttl: std::time::Duration) -> Self {
+        Self {
+            slots: std::sync::Mutex::new(HashMap::new()),
+            hasher: std::hash::RandomState::new(),
+            capacity: capacity.max(1),
+            idle_ttl,
+        }
+    }
+
+    fn key(&self, request: &CompactGroupRequest) -> PlanKey {
+        use std::hash::BuildHasher;
+        let s3 = &request.s3;
+        let credentials = self.hasher.hash_one((
+            &s3.endpoint,
+            &s3.region,
+            &s3.access_key,
+            &s3.secret_key,
+            &s3.session_token,
+            s3.path_style,
+            s3.allow_http,
+        ));
+        PlanKey {
+            job_id: request.job_id.clone(),
+            metadata_location: request.metadata_location.clone(),
+            snapshot_id: request.snapshot_id,
+            credentials,
+        }
+    }
+
+    /// The cell for `key`, created if absent. The lock is held only for the
+    /// lookup; callers await the build outside it.
+    fn slot(&self, key: PlanKey) -> Arc<tokio::sync::OnceCell<Arc<PinnedJob>>> {
+        let now = std::time::Instant::now();
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        // A cell referenced only by the map is idle: no group is using it.
+        let idle = |s: &PlanSlot| Arc::strong_count(&s.cell) == 1;
+        let ttl = self.idle_ttl;
+        slots.retain(|_, s| !idle(s) || now.duration_since(s.last_used) < ttl);
+        if let Some(slot) = slots.get_mut(&key) {
+            slot.last_used = now;
+            return Arc::clone(&slot.cell);
+        }
+        while slots.len() >= self.capacity {
+            let oldest = slots
+                .iter()
+                .filter(|(_, s)| idle(s))
+                .min_by_key(|(_, s)| s.last_used)
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(k) => {
+                    slots.remove(&k);
+                }
+                None => break,
+            }
+        }
+        let cell = Arc::new(tokio::sync::OnceCell::new());
+        slots.insert(
+            key,
+            PlanSlot {
+                cell: Arc::clone(&cell),
+                last_used: now,
+            },
+        );
+        cell
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.slots.lock().unwrap().len()
+    }
+}
+
+/// Pin `table` to the request's snapshot and plan its delete-aware read.
+async fn pin_job(table: IcebergTable, request: &CompactGroupRequest) -> SqeResult<PinnedJob> {
     // Snapshot pin assertion. The coordinator planned this group's file list
     // and delete accounting against a specific snapshot; if the table has
     // since advanced (or the metadata_location resolves to a different
@@ -375,8 +487,6 @@ async fn compact_pinned_table(
             "compact_file_group: failed to plan delete-aware read: {e}"
         ))
     })?;
-
-    let group = resolve_group_data_files(&plan.tasks_by_path, &request.group_file_paths)?;
     let live_deletes = collect_live_delete_files(&table).await?;
 
     let arrow_schema: arrow_schema::SchemaRef = Arc::new(
@@ -385,6 +495,51 @@ async fn compact_pinned_table(
                 SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("compact_file_group: schema conversion failed: {e}"))
             })?,
     );
+
+    Ok(PinnedJob {
+        table,
+        plan,
+        live_deletes,
+        arrow_schema,
+    })
+}
+
+/// Pin `table` and rewrite one group against it, without the cache. Keeps
+/// the snapshot-pin assertion and the group-resolution guard reachable in
+/// tests without a real `StaticTable::from_metadata_file` load.
+#[cfg(test)]
+async fn compact_pinned_table(
+    session_ctx: &SessionContext,
+    table: IcebergTable,
+    request: &CompactGroupRequest,
+    progress_tx: Option<tokio::sync::mpsc::Sender<u64>>,
+    tracker: UploadedPaths,
+    cancel: &CancellationToken,
+) -> SqeResult<CompactGroupResponse> {
+    let job = pin_job(table, request).await?;
+    rewrite_pinned_group(session_ctx, &job, request, progress_tx, tracker, cancel).await
+}
+
+/// Rewrite one file group against an already-pinned job.
+///
+/// `tracker` is supplied by the caller rather than allocated here (finding
+/// 608): the RPC layer must be able to read the uploaded-path list on the
+/// failure path, which means it has to outlive this future.
+async fn rewrite_pinned_group(
+    session_ctx: &SessionContext,
+    job: &PinnedJob,
+    request: &CompactGroupRequest,
+    progress_tx: Option<tokio::sync::mpsc::Sender<u64>>,
+    tracker: UploadedPaths,
+    cancel: &CancellationToken,
+) -> SqeResult<CompactGroupResponse> {
+    let PinnedJob {
+        table,
+        plan,
+        live_deletes,
+        arrow_schema,
+    } = job;
+    let group = resolve_group_data_files(&plan.tasks_by_path, &request.group_file_paths)?;
 
     let sort_ctx: Option<SortCtx> = request.sort.as_ref().map(|s| SortCtx {
         runtime: session_ctx.runtime_env(),
@@ -431,10 +586,10 @@ async fn compact_pinned_table(
     // control returns *here*, so the caller's orphan cleanup runs instead of
     // the task simply vanishing.
     let rewrite = rewrite_group(
-        &table,
-        &plan,
-        &live_deletes,
-        &arrow_schema,
+        table,
+        plan,
+        live_deletes,
+        arrow_schema,
         sort_ctx.as_ref(),
         group,
         compression,
@@ -444,12 +599,19 @@ async fn compact_pinned_table(
     );
     tokio::pin!(rewrite);
 
+    let rewrite_started = std::time::Instant::now();
     let (new_files, _old_files, rows_written) = tokio::select! {
         biased;
         () = cancel.cancelled() => return Err(cancelled_error(request, "the group rewrite")),
         result = &mut rewrite => result
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("compact_file_group: rewrite failed: {e}")))?,
     };
+    tracing::debug!(
+        job_id = %request.job_id,
+        group_id = request.group_id,
+        rewrite_ms = rewrite_started.elapsed().as_millis() as u64,
+        "compact_file_group rewrite"
+    );
 
     let partition_type = table.metadata().default_partition_type().clone();
     let format_version = table.metadata().format_version();
@@ -488,8 +650,9 @@ async fn compact_pinned_table(
 /// executor for Phase 4c distributed compaction.
 ///
 /// Pins a `StaticTable` to `ctx.request.metadata_location` using the
-/// caller-built `FileIO`, then delegates to [`compact_pinned_table`] for the
-/// snapshot check, delete-aware rewrite, and Avro encoding. The worker never
+/// caller-built `FileIO` and plans its delete-aware read, once per job per
+/// worker through `ctx.plan_cache`, then rewrites the group against it
+/// (snapshot check, delete-aware rewrite, Avro encoding). The worker never
 /// obtains a catalog token and never commits; the coordinator commits the
 /// returned `DataFile`s.
 ///
@@ -515,39 +678,57 @@ pub async fn run_group_rewrite(ctx: GroupRewriteCtx) -> SqeResult<CompactGroupRe
         tracker,
         cancel,
         file_io,
+        plan_cache,
     } = ctx;
 
     let ident = parse_table_ident(&request.table_ident)?;
 
-    // Metadata load is an unbounded network read against the table's object
-    // store: check the token before it and race it against the load, so a
-    // group cancelled while its worker is stuck on a slow/hanging S3 does not
-    // sit there until the TCP timeout.
+    // Metadata load and planning are unbounded network reads against the
+    // table's object store: check the token before them and race it against
+    // them, so a group cancelled while its worker is stuck on a slow/hanging
+    // S3 does not sit there until the TCP timeout. Dropping a cell's build
+    // mid-way is safe: the next group of the job takes the build over.
     if cancel.is_cancelled() {
         return Err(cancelled_error(&request, "startup"));
     }
-    let static_table = tokio::select! {
-        biased;
-        () = cancel.cancelled() => return Err(cancelled_error(&request, "the table metadata load")),
-        loaded = StaticTable::from_metadata_file(&request.metadata_location, ident, file_io) => {
-            loaded.map_err(|e| {
-                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "compact_file_group: failed to load table metadata '{}': {e}",
-                    request.metadata_location
-                ))
-            })?
+    let cell = plan_cache.slot(plan_cache.key(&request));
+    let started = std::time::Instant::now();
+    let mut built = false;
+    let job = {
+        let built = &mut built;
+        let request = &request;
+        let build = cell.get_or_try_init(move || async move {
+            *built = true;
+            let static_table =
+                StaticTable::from_metadata_file(&request.metadata_location, ident, file_io)
+                    .await
+                    .map_err(|e| {
+                        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
+                            "compact_file_group: failed to load table metadata '{}': {e}",
+                            request.metadata_location
+                        ))
+                    })?;
+            pin_job(static_table.into_table(), request)
+                .await
+                .map(Arc::new)
+        });
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                return Err(cancelled_error(request, "the table metadata load and read plan"));
+            }
+            job = build => Arc::clone(job?),
         }
     };
+    tracing::info!(
+        job_id = %request.job_id,
+        group_id = request.group_id,
+        plan_reused = !built,
+        plan_ms = started.elapsed().as_millis() as u64,
+        "compact_file_group read plan"
+    );
 
-    compact_pinned_table(
-        &session_ctx,
-        static_table.into_table(),
-        &request,
-        progress_tx,
-        tracker,
-        &cancel,
-    )
-    .await
+    rewrite_pinned_group(&session_ctx, &job, &request, progress_tx, tracker, &cancel).await
 }
 
 /// Convenience entry point for callers that do not supervise the rewrite:
@@ -568,6 +749,7 @@ pub async fn compact_file_group(
         tracker: new_upload_tracker(),
         cancel: CancellationToken::new(),
         file_io,
+        plan_cache: Arc::new(CompactionPlanCache::default()),
     })
     .await
 }
@@ -908,12 +1090,87 @@ mod tests {
             tracker: new_upload_tracker(),
             cancel,
             file_io: memory_io(),
+            plan_cache: Arc::new(CompactionPlanCache::default()),
         })
         .await
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("cancelled"), "{msg}");
         assert!(msg.contains("job-1"), "error must name the job: {msg}");
+    }
+
+    // ---- per-job read plan cache ----------------------------------------
+
+    #[test]
+    fn plan_cache_shares_a_cell_per_job_snapshot_and_credentials() {
+        let cache = CompactionPlanCache::default();
+        let a = sample_request(vec!["s3://bucket/data/f1.parquet".to_string()], 555);
+        let mut other_group = a.clone();
+        other_group.group_id = 9;
+        other_group.group_file_paths = vec!["s3://bucket/data/f2.parquet".to_string()];
+        let cell = cache.slot(cache.key(&a));
+        assert!(Arc::ptr_eq(&cell, &cache.slot(cache.key(&other_group))));
+
+        let mut other_job = a.clone();
+        other_job.job_id = "job-2".to_string();
+        let mut other_snapshot = a.clone();
+        other_snapshot.snapshot_id = 556;
+        let mut other_creds = a.clone();
+        other_creds.s3.session_token = "rotated".to_string();
+        for req in [&other_job, &other_snapshot, &other_creds] {
+            assert!(!Arc::ptr_eq(&cell, &cache.slot(cache.key(req))));
+        }
+    }
+
+    /// A snapshot mismatch must fail every group, not get cached as a plan
+    /// or poison the cell for a later, valid build.
+    #[tokio::test]
+    async fn plan_cache_does_not_cache_a_failed_pin() {
+        let cache = CompactionPlanCache::default();
+        let request = sample_request(vec!["s3://bucket/data/f1.parquet".to_string()], 999);
+        let cell = cache.slot(cache.key(&request));
+        let err = cell
+            .get_or_try_init(|| async {
+                pin_job(local_table_with_snapshot(555), &request)
+                    .await
+                    .map(Arc::new)
+            })
+            .await
+            .err()
+            .expect("mismatched snapshot must fail");
+        assert!(err.to_string().contains("snapshot mismatch"), "{err}");
+        assert!(cell.get().is_none(), "a failed pin must not be cached");
+    }
+
+    #[test]
+    fn plan_cache_evicts_idle_entries_but_never_one_in_use() {
+        let cache = CompactionPlanCache::new(2, std::time::Duration::from_secs(300));
+        let req = |job: &str| {
+            let mut r = sample_request(vec![], 1);
+            r.job_id = job.to_string();
+            r
+        };
+        let held = cache.slot(cache.key(&req("held")));
+        drop(cache.slot(cache.key(&req("idle"))));
+        drop(cache.slot(cache.key(&req("new"))));
+        assert_eq!(cache.len(), 2);
+        // "idle" went; "held" stayed because a group still holds its cell.
+        assert!(Arc::ptr_eq(&held, &cache.slot(cache.key(&req("held")))));
+
+        // Every entry in use: the cache grows past capacity instead of
+        // evicting a plan a running group depends on.
+        let _a = cache.slot(cache.key(&req("a")));
+        let _b = cache.slot(cache.key(&req("b")));
+        assert!(cache.len() >= 3);
+
+        let expired = CompactionPlanCache::new(4, std::time::Duration::ZERO);
+        drop(expired.slot(expired.key(&req("x"))));
+        drop(expired.slot(expired.key(&req("y"))));
+        assert_eq!(
+            expired.len(),
+            1,
+            "idle past the TTL is swept on the next lookup"
+        );
     }
 
     // ---- SortSpecWire wiring (no I/O) ----------------------------------

@@ -28,7 +28,8 @@ use sqe_spill::{ByteBudget, BytePermit, MemoryGovernor, SpillManager};
 use tokio_util::sync::CancellationToken;
 
 use crate::compaction::{
-    build_file_io, delete_orphan_uploads, run_group_rewrite, CleanupOutcome, GroupRewriteCtx,
+    build_file_io, delete_orphan_uploads, run_group_rewrite, CleanupOutcome, CompactionPlanCache,
+    GroupRewriteCtx,
 };
 use crate::credential_channel::{CredentialStore, RefreshableCredentials};
 use crate::executor::{self, ObjectStoreFactory};
@@ -378,6 +379,9 @@ pub struct WorkerFlightService {
     /// (`worker.compaction_timeout_secs`, finding 608). `None` means the
     /// operator disabled it with 0.
     compaction_timeout: Option<std::time::Duration>,
+    /// Read plans shared by the `compact_file_group` calls of one job, so a
+    /// job plans the table once per worker rather than once per group.
+    compaction_plans: Arc<CompactionPlanCache>,
     /// Process identity and load counters the heartbeat reports (finding 609).
     status: Arc<WorkerStatus>,
     /// Builds the object store a scan reads through, initially and on every
@@ -691,6 +695,7 @@ impl WorkerFlightService {
             compaction_timeout: Some(std::time::Duration::from_secs(
                 DEFAULT_COMPACTION_TIMEOUT_SECS,
             )),
+            compaction_plans: Arc::new(CompactionPlanCache::default()),
             status: WorkerStatus::new(),
             store_factory: executor::s3_object_store_factory(),
             scan_budget,
@@ -1490,6 +1495,7 @@ impl FlightService for WorkerFlightService {
                         tracker: tracker.clone(),
                         cancel: cancel.clone(),
                         file_io: file_io.clone(),
+                        plan_cache: Arc::clone(&self.compaction_plans),
                     },
                     deadline,
                 );
