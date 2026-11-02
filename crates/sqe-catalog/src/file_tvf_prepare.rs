@@ -85,6 +85,8 @@ struct StatementProviders {
 /// "not found" while `SHOW TABLES` lists it; [`explain_not_iceberg`] uses
 /// the note to say what the table is instead. Outside a statement scope it
 /// does nothing.
+// Its only caller is the REST schema provider.
+#[cfg_attr(not(feature = "rest"), allow(dead_code))]
 pub(crate) fn note_not_iceberg(namespace: &str, table: &str) {
     let _ = STATEMENT_PROVIDERS.try_with(|scope| {
         scope
