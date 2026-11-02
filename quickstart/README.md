@@ -111,6 +111,7 @@ validated from a clean state.
 | Quickstart | What it shows | Status |
 |---|---|---|
 | [`benchmark`](./benchmark/) | Generate + load + run TPC-H / TPC-DS / SSB against SQE, with per-query timings (`sqe-bench`) | **validated 2026-06-07** |
+| [`engine-bench`](./engine-bench/) | The public engine-bench workload against SQE embedded (Parquet and local Iceberg) and a native coordinator on Polaris + S3, next to DuckDB and Polars, with every answer checked against DuckDB's | **validated 2026-10-31** |
 
 ## Design
 
