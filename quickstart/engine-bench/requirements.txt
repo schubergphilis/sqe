@@ -1,0 +1,10 @@
+# The engine-bench October 22, 2026 versions (upstream requirements.txt),
+# without pyspark: WITH_SPARK=1 adds pyspark==4.2.0.
+duckdb==2.0.0
+polars==2.0.0
+pyarrow==26.0.0
+psutil==7.2.2
+numpy==2.5.4
+# sqe-polaris client: Arrow Flight SQL over ADBC (the dbt-sqe adapter's driver)
+adbc-driver-flightsql==1.12.0
+adbc-driver-manager==1.12.0

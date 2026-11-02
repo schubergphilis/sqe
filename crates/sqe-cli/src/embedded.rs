@@ -1107,6 +1107,21 @@ impl EmbeddedClient {
         &self,
         exec_sql: &str,
     ) -> Result<QueryResult, Box<dyn std::error::Error>> {
+        let df = self.plan_datafusion(exec_sql).await?;
+        // Snapshot the DataFrame schema before collecting so we still
+        // emit column names when the query produces zero batches (an
+        // optimizer collapse like `WHERE FALSE` yields an EmptyExec).
+        let schema = df.schema().as_arrow().clone();
+        let batches = df.collect().await?;
+        Ok(record_batches_to_query_result(&schema, &batches))
+    }
+
+    /// Plan one statement the way [`Self::run_datafusion`] runs it, without
+    /// executing it.
+    async fn plan_datafusion(
+        &self,
+        exec_sql: &str,
+    ) -> Result<datafusion::dataframe::DataFrame, Box<dyn std::error::Error>> {
         // V12: pre-rewrite `'hf://...'` quoted literals to their HTTPS
         // equivalent. This makes `SELECT * FROM 'hf://...'` (URL-table
         // auto-detect) flow through V10's LazyHttpObjectStoreRegistry the
@@ -1135,14 +1150,7 @@ impl EmbeddedClient {
         sqe_catalog::file_tvf_prepare::prepare_statement(&self.ctx, &rewritten).await?;
         // Embedded mode has no policy, and `CREATE TABLE ... AS` /
         // `CREATE EXTERNAL TABLE` here are DataFusion's own DDL.
-        let df =
-            sqe_catalog::file_tvf_prepare::plan_sql_without_policy(&self.ctx, &rewritten).await?;
-        // Snapshot the DataFrame schema before collecting so we still
-        // emit column names when the query produces zero batches (an
-        // optimizer collapse like `WHERE FALSE` yields an EmptyExec).
-        let schema = df.schema().as_arrow().clone();
-        let batches = df.collect().await?;
-        Ok(record_batches_to_query_result(&schema, &batches))
+        Ok(sqe_catalog::file_tvf_prepare::plan_sql_without_policy(&self.ctx, &rewritten).await?)
     }
 }
 
@@ -1544,10 +1552,31 @@ impl EmbeddedClient {
             }
             return Err(format!("table {name} already exists").into());
         }
-        self.run_datafusion(&format!(
-            "CREATE TABLE {name} AS SELECT * FROM ({query}) AS __sqe_ctas LIMIT 0"
-        ))
-        .await?;
+        // Iceberg stores no second or millisecond timestamps, and a Parquet
+        // `timestamp(s)` column reads as Timestamp(ms), so `CREATE TABLE AS
+        // SELECT * FROM read_parquet(...)` was refused with "Unsupported
+        // Arrow data type: Timestamp(ms)". Create the empty table with those
+        // columns widened to microseconds instead; the INSERT below casts the
+        // rows onto the table schema, which loses nothing.
+        let probe = self
+            .plan_datafusion(&format!("SELECT * FROM ({query}) AS __sqe_ctas LIMIT 0"))
+            .await?;
+        match widen_coarse_timestamps(probe.schema().as_arrow()) {
+            Some(widened) => {
+                self.ctx.register_table(
+                    name.to_string().as_str(),
+                    Arc::new(datafusion::datasource::empty::EmptyTable::new(Arc::new(
+                        widened,
+                    ))),
+                )?;
+            }
+            None => {
+                self.run_datafusion(&format!(
+                    "CREATE TABLE {name} AS SELECT * FROM ({query}) AS __sqe_ctas LIMIT 0"
+                ))
+                .await?;
+            }
+        }
         // The rows go through the same writer as a plain INSERT. The error
         // is not `Send`, so only its text crosses the cleanup await.
         let insert_sql = format!("INSERT INTO {name} {query}");
@@ -2480,6 +2509,40 @@ impl EmbeddedClient {
             rows: vec![vec![format!("CREATE VIEW {} AS\n{body}", parts.join("."))]],
         })
     }
+}
+
+/// `schema` with its second and millisecond timestamp columns widened to
+/// microseconds, the coarsest precision Iceberg stores, or `None` when it has
+/// none. Nanosecond columns stay: the Iceberg schema provider upgrades the
+/// table to v3 for them.
+// ponytail: top-level columns only, like the coordinator's
+// `timestamps_for_format_version`.
+fn widen_coarse_timestamps(schema: &arrow_schema::Schema) -> Option<arrow_schema::Schema> {
+    use arrow_schema::{DataType, TimeUnit};
+    let coarse = |f: &arrow_schema::Field| {
+        matches!(
+            f.data_type(),
+            DataType::Timestamp(TimeUnit::Second | TimeUnit::Millisecond, _)
+        )
+    };
+    if !schema.fields().iter().any(|f| coarse(f)) {
+        return None;
+    }
+    let fields: Vec<arrow_schema::Field> = schema
+        .fields()
+        .iter()
+        .map(|f| match f.data_type() {
+            DataType::Timestamp(_, tz) if coarse(f) => f
+                .as_ref()
+                .clone()
+                .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, tz.clone())),
+            _ => f.as_ref().clone(),
+        })
+        .collect();
+    Some(arrow_schema::Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ))
 }
 
 /// Render a sequence of [`RecordBatch`]es into the CLI's column-name +
@@ -3888,6 +3951,49 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(r.rows, vec![vec!["0".to_string()]]);
+    }
+
+    /// A Parquet `timestamp(s)` / `timestamp(ms)` column reads as
+    /// Timestamp(ms), which Iceberg cannot store: CTAS from such a file
+    /// failed with "Unsupported Arrow data type: Timestamp(ms)". The column
+    /// now lands as a microsecond timestamp with every value intact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ctas_widens_millisecond_timestamps_to_micros() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().to_str().unwrap();
+        let file = tmp.path().join("coarse.parquet");
+        let file = file.to_str().unwrap();
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
+        for sql in [
+            format!(
+                "COPY (SELECT 1 AS id, arrow_cast(TIMESTAMP '2026-06-01 12:34:56.789', \
+                 'Timestamp(Millisecond, None)') AS ts) TO '{file}'"
+            ),
+            format!("ATTACH '{path}/wh' AS ice (TYPE sqlite)"),
+            "CREATE SCHEMA ice.s1".to_string(),
+            format!("CREATE TABLE ice.s1.t AS SELECT * FROM read_parquet('{file}')"),
+        ] {
+            client
+                .execute(&sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        let r = client
+            .execute("SELECT id, CAST(ts AS VARCHAR), arrow_typeof(ts) FROM ice.s1.t")
+            .await
+            .expect("select");
+        assert_eq!(r.rows.len(), 1, "{:?}", r.rows);
+        assert_eq!(r.rows[0][0], "1");
+        assert!(
+            r.rows[0][1].starts_with("2026-06-01T12:34:56.789"),
+            "{:?}",
+            r.rows
+        );
+        assert!(
+            r.rows[0][2].contains("Microsecond") || r.rows[0][2].contains("µs"),
+            "{:?}",
+            r.rows
+        );
     }
 
     /// `SHOW TABLES IN|FROM [catalog.]schema [LIKE ...]` was "SHOW TABLES IN

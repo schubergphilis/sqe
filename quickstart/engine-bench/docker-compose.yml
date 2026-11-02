@@ -1,0 +1,94 @@
+# SQE quickstart: engine-bench, the Polaris leg.
+#
+# Only the catalog and the object store run in Docker: RustFS (S3) holds the
+# Iceberg data and metadata, Polaris is the Iceberg REST catalog. SQE itself
+# runs as a native sqe-server on the host, so its timings and RSS are measured
+# the same way as the embedded runs and the other engines (no container or VM
+# in between). run.sh renders sqe.toml from sqe.toml.tmpl and bench.py starts
+# a fresh sqe-server for every query.
+#
+# Ports are offset (38181 / 39000) so this stack runs next to the integration
+# stack (18181 / 19000) and the Ranger stack (28181).
+
+services:
+  rustfs:
+    image: rustfs/rustfs:1.0.0-alpha.89
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:-s3admin}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:-s3adminpw}
+    volumes:
+      - rustfs-data:/data
+    ports:
+      - "127.0.0.1:${RUSTFS_PORT:-39000}:9000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  bucket-init:
+    image: amazon/aws-cli:2.37.4
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        aws s3api head-bucket --bucket warehouse --endpoint-url http://rustfs:9000 2>/dev/null \
+          || aws s3 mb s3://warehouse --endpoint-url http://rustfs:9000
+        echo "bucket ready"
+    environment:
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-s3admin}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-s3adminpw}
+    restart: "no"
+    depends_on:
+      rustfs:
+        condition: service_healthy
+
+  # In-memory persistence: a Polaris restart forgets the tables (the files
+  # stay in RustFS). `bench.py load` checks the row count and reloads when the
+  # catalog comes back empty.
+  polaris:
+    image: apache/polaris:1.7.0
+    environment:
+      POLARIS_PERSISTENCE_TYPE: in-memory
+      POLARIS_BOOTSTRAP_CREDENTIALS: iceberg,root,${POLARIS_ROOT_SECRET:-polaris-root-secret}
+      POLARIS_PRODUCTION_READINESS_CHECKS_ENABLED: "false"
+      QUARKUS_HTTP_PORT: "8181"
+      QUARKUS_MANAGEMENT_PORT: "8182"
+      polaris.realm-context.realms: iceberg
+      polaris.realm-context.default-realm: iceberg
+      polaris.realm-context.require-header: "false"
+      # Polaris writes table metadata itself; give it the store's credentials.
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-s3admin}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-s3adminpw}
+    ports:
+      - "127.0.0.1:${POLARIS_PORT:-38181}:8181"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8182/q/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    depends_on:
+      bucket-init:
+        condition: service_completed_successfully
+
+  # One-shot: catalog `bench` on s3://warehouse/, and CATALOG_MANAGE_CONTENT
+  # for the root principal's service_admin role. Idempotent.
+  polaris-setup:
+    image: curlimages/curl:8.22.0
+    entrypoint: ["sh", "/bootstrap.sh"]
+    environment:
+      POLARIS_ROOT_SECRET: ${POLARIS_ROOT_SECRET:-polaris-root-secret}
+      S3_HOST_ENDPOINT: http://localhost:${RUSTFS_PORT:-39000}
+    volumes:
+      - ./bootstrap.sh:/bootstrap.sh:ro
+    restart: "no"
+    profiles: ["setup"]
+    depends_on:
+      polaris:
+        condition: service_healthy
+
+volumes:
+  rustfs-data:
