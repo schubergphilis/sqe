@@ -2178,6 +2178,12 @@ impl ExecutionPlan for IcebergScanExec {
             if let Some(sid) = snapshot_id { sb = sb.snapshot_id(sid); }
             if let Some(ref cols) = projection { sb = sb.select(cols.iter().map(|s| s.as_str())); }
             if let Some(pred) = predicates { sb = sb.with_filter(pred); }
+            // Decode in the session's batch size. Left unset, the parquet
+            // reader falls back to its 1024-row default: 8x the batches
+            // DataFusion expects, and every operator above the scan pays per
+            // batch (a 150M-row aggregate spent 2.5x the CPU of a plain
+            // parquet scan).
+            sb = sb.with_batch_size(Some(context.session_config().batch_size()));
             // Split a large single data file into byte-range subtasks so its row
             // groups decode in parallel (issue #131). The scan exec stays at one
             // output partition; this is purely intra-scan decode fan-out, so the
