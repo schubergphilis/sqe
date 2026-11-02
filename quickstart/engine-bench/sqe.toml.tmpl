@@ -1,0 +1,54 @@
+# sqe-server config for the engine-bench Polaris leg. run.sh renders it to
+# .work/sqe.toml, filling in the @PLACEHOLDERS@ from .env.
+#
+# Bench posture, not a deployment template: the client_credentials provider
+# logs every Flight user in as Polaris's root principal, and local paths are
+# readable so the load can read_parquet() the generated data and the queries
+# can COPY their answers to .work/.
+
+[coordinator]
+flight_sql_port = @SQE_FLIGHT_PORT@
+trino_http_port = @SQE_TRINO_PORT@
+# The same 3 GB the embedded runs get (--memory-limit 3GB) and DuckDB / Polars
+# get from upstream's run_engine.py; spill keeps big sorts inside it.
+memory_limit = "@MEM_LIMIT@"
+spill_to_disk = true
+spill_dir = "@WORK@/spill"
+spill_compression = "lz4"
+
+[metrics]
+# /healthz is served on this port + 1.
+prometheus_port = @SQE_METRICS_PORT@
+
+[[auth.providers]]
+type = "client_credentials"
+token_endpoint = "http://localhost:@POLARIS_PORT@/api/catalog/v1/oauth/tokens"
+client_id = "root"
+client_secret = "@POLARIS_ROOT_SECRET@"
+
+[query]
+# 0 = unlimited: q3 and q4 return ~15M rows at 150m, past any fixed cap
+# that would still mean something in production.
+max_result_rows = 0
+max_query_memory = "@MEM_LIMIT@"
+per_user_memory_budget = "0"
+timeout_secs = 1800
+
+# The SQL catalog name is the table key: polaris.bench_10m.sales.
+[catalogs.polaris]
+polaris_url = "http://localhost:@POLARIS_PORT@/api/catalog"
+warehouse = "bench"
+
+[catalog]
+polaris_url = "http://localhost:@POLARIS_PORT@/api/catalog"
+warehouse = "bench"
+
+[storage]
+s3_endpoint = "http://localhost:@RUSTFS_PORT@"
+s3_access_key = "@S3_ACCESS_KEY@"
+s3_secret_key = "@S3_SECRET_KEY@"
+s3_region = "us-east-1"
+s3_path_style = true
+
+[storage.tvf]
+allow_local_paths = true
