@@ -18,7 +18,25 @@ The run also showed three gaps, not fixed in this MR:
 - The coordinator rejects `COPY ... TO`. Left as is: it would write the
   server's filesystem as the server process.
 
-**NEXT:** embedded Iceberg scan through `SqeTableProvider` + the parallel scan
-rules (stacked on this branch); then `target_partitions` as an allow-listed,
-capped session property over Flight; COPY TO only behind an explicit,
-canonicalised output root if wanted.
+**2026-11-02: `make bench`, `STORAGE=s3`.** Locally `sqe-polaris` was the
+only engine reading through the Docker Desktop port forward (~220 MB/s), so
+its gap to the others was mostly transport. With `STORAGE=s3` every engine
+reads the same 3.36 GB of Parquet from RustFS. 150M rows, medians: SQE on
+Parquet 9.92 s geomean (0.9x DuckDB), SQE on Polaris 11.91 s (1.1x), DuckDB
+10.69 s, Spark 27.70 s. Polars is killed on q3 at 4.5 GiB (it finishes in
+35.5 s at 8 GiB). On q1 every engine reads 1.57-1.74 GB from the store, so
+SQE does not over-read; `sqe-polaris` pays a fixed 1.5-2 s on q1/q2 on top
+(being traced).
+
+q3 (latest row per customer, 15M partitions) is a full sort of 150M rows with
+4.3 GB of spill. DataFusion 55.2's `WindowTopN` does not match `rn = 1` and
+its `PartitionedTopK` keeps one heap per key: past 5 minutes and 6 GB at 15M
+keys, and it errors instead of spilling. The upstream rework (main, after
+55.2) is 6.5k changed lines on arrow 60, so it arrives with DataFusion 56,
+not as a backport. `first_value(... ORDER BY ...) GROUP BY` is no way out
+either: 73 s and 3.7 GiB, since its groups accumulator keeps a
+`Vec<ScalarValue>` per group.
+
+**NEXT:** Polaris fixed-overhead trace (q1/q2 phases); a q3 rewrite only if
+a plain hash aggregate is at least 2x under the window sort; then embedded
+Iceberg scan through `SqeTableProvider`, `target_partitions` over Flight.

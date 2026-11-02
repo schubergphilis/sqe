@@ -91,8 +91,20 @@ TRINO_MEMORY   ?= 8g
 BENCH_RUN      := scripts/benchmark-make-run.sh
 BENCH_ENV       = PROFILE=$(BENCH_PROFILE) BENCH_LOG_DIR=$(BENCH_LOG_DIR)
 
+# `make bench` runs quickstart/engine-bench (github.com/firfircelik/engine-bench)
+# with the setup of its "150M rows under a 4.5 GiB cap" write-up: 150M rows,
+# 3 reps, 3g and 8 threads per engine, a 4.5 GiB process-tree watchdog, SQE x3
+# next to DuckDB, Polars and Spark. Polars is expected to be killed on the
+# window query at 150M, so this target does not assert that every run finished;
+# `make bench-smoke` (10M, no Spark) does.
+BENCH_ROWS_M   ?= 150
+BENCH_REPS     ?= 3
+BENCH_SPARK    ?= 1
+BENCH_ENGINES  ?=
+BENCH_STORAGE  ?= local
+
 .PHONY: help all all_trino docs-and-image check check-server dev dev-fast release rustbook ebook \
-        ebook-pdf ebook-epub ebook-html \
+        ebook-pdf ebook-epub ebook-html bench bench-smoke \
         benchmark-charts test test-access-control test-access-control-spark \
         test-integration test-distributed test-integration-down \
         audit audit-advisories deps-check lock-maintenance dbt-sqe-lock metrics-layering-check \
@@ -137,6 +149,9 @@ help:
 	@echo "    make audit-licenses    cargo deny check licenses (needs a [licenses] allow list)"
 	@echo ""
 	@echo "  Benchmarks (bring up their own Polaris + RustFS stack):"
+	@echo "    make bench             engine-bench: SQE vs DuckDB, Polars, Spark at 150M rows,"
+	@echo "                           4.5 GiB cap (~1 h; knobs BENCH_ROWS_M BENCH_REPS BENCH_SPARK BENCH_ENGINES BENCH_STORAGE)"
+	@echo "    make bench-smoke       engine-bench at 10M rows without Spark, asserts every run + answer"
 	@echo "    make benchmark_sf0.1   All suites at SF0.1 (fast smoke)"
 	@echo "    make benchmark_sf1     All suites at SF1"
 	@echo "    make benchmark_sf10    All suites at SF10 (heavy)"
@@ -242,6 +257,15 @@ release:
 	@echo ""
 	@echo "Binaries:"
 	@ls -lh $(RELEASE_BIN)/$(BIN_CLI) $(RELEASE_BIN)/$(BIN_SERVER)
+
+# Depends on `release` so the bench never times a binary older than the tree
+# (a no-op when it is current). run.sh writes quickstart/engine-bench/OUTPUT.md.
+bench: release
+	cd quickstart/engine-bench && SIZE=$(BENCH_ROWS_M) REPS=$(BENCH_REPS) WITH_SPARK=$(BENCH_SPARK) STORAGE=$(BENCH_STORAGE) \
+	  $(if $(BENCH_ENGINES),ENGINES=$(BENCH_ENGINES)) ./run.sh
+
+bench-smoke: release
+	cd quickstart/engine-bench && SIZE=10 REPS=3 WITH_SPARK=0 ./run.sh --check
 
 # 32 MiB test-thread stacks, as CI runs them (AIKIDO_RUST_MIN_STACK in
 # .gitlab-ci.yml). Rust's 2 MiB default is too small for some debug-build

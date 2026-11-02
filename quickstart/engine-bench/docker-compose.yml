@@ -44,6 +44,25 @@ services:
       rustfs:
         condition: service_healthy
 
+  # One-shot, STORAGE=s3 only: copy the generated Parquet into RustFS so every
+  # engine reads the same files from S3. Runs on the compose network, so the
+  # copy does not go through the host port forward. `aws s3 sync` skips files
+  # already there. Usage: docker compose run --rm data-upload sales_10m
+  data-upload:
+    image: amazon/aws-cli:2.37.4
+    entrypoint: ["sh", "-c", 'aws s3 sync /data s3://warehouse/engine-bench/data --endpoint-url http://rustfs:9000 --only-show-errors --exclude "*" --include "$$0/*.parquet" --include products.parquet && echo "uploaded $$0"']
+    environment:
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-s3admin}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-s3adminpw}
+    volumes:
+      - ./.work/engine-bench/data:/data:ro
+    restart: "no"
+    profiles: ["setup"]
+    depends_on:
+      bucket-init:
+        condition: service_completed_successfully
+
   # In-memory persistence: a Polaris restart forgets the tables (the files
   # stay in RustFS). `bench.py load` checks the row count and reloads when the
   # catalog comes back empty.

@@ -46,9 +46,30 @@ Polars', with no container or VM in between.
   binaries. Do not benchmark debug or `make dev-fast` builds.
 - About 1 GB of disk for 10M rows (Parquet, two Iceberg copies, outputs), and
   8 GB of RAM (a run waits until 5 GiB is free). Each engine is capped at 3 GB and killed at 4.5 GiB.
-- Java 17+ only for `WITH_SPARK=1`.
+- Java 17 or 21, only for `WITH_SPARK=1`. Spark 4.x does not start on a newer
+  default JVM, so on macOS `run.sh` picks 21 (else 17) through `java_home`;
+  set `SPARK_JAVA_HOME` to choose another.
+- For 150M rows: about 15 GB of disk (3.2 GB of Parquet plus two Iceberg
+  copies and the outputs) and an hour.
 
 ## Run it
+
+From the repository root, `make bench` runs the setup of the upstream
+write-up ("DuckDB 2.0 vs Polars vs Spark on one machine: 150M rows under a
+4.5 GiB cap"): 150M rows, 3 reps, Spark included. It runs `make release`
+first, so it never times a binary older than the tree. Polars is expected to
+be killed on the window query at that size, as in the write-up, so this target
+reports killed runs rather than failing on them. `make bench-smoke` (10M, no
+Spark) asserts that every run finished and every answer matches.
+
+```bash
+make bench                                        # 150M rows, 3 reps, all engines + Spark
+make bench BENCH_ROWS_M=50 BENCH_SPARK=0          # 50M rows, no Spark
+make bench BENCH_ENGINES=sqe-parquet,duckdb BENCH_SPARK=0   # two engines
+make bench-smoke                                  # 10M rows, --check
+```
+
+Or call `run.sh` directly:
 
 ```bash
 cd quickstart/engine-bench
@@ -57,6 +78,7 @@ SIZE=50 REPS=5 ./run.sh           # 50M rows
 ENGINES=sqe-polaris,duckdb ./run.sh
 WITH_SPARK=1 ./run.sh             # add Spark
 MAX_BUSY_PCT=50 ./run.sh          # a laptop that never idles below 30% CPU
+STORAGE=s3 ./run.sh               # every engine reads the Parquet from RustFS (S3); writes OUTPUT-s3.md
 ./run.sh --check                  # run, then assert every run finished and every answer matches
 ./run.sh --down                   # stop Polaris + RustFS and drop the volume
 ./run.sh --clean                  # --down, and delete .work/
@@ -66,6 +88,38 @@ Everything the run produces lives in `.work/` (gitignored): the upstream
 checkout and its `data/` and `out/`, the Iceberg warehouse, the rendered
 `sqe.toml`, server logs, and the raw runs as JSON lines in
 `.work/results/<size>-<timestamp>.jsonl`.
+
+### Local files or S3
+
+By default every engine except `sqe-polaris` reads local Parquet, while
+`sqe-polaris` reads its Iceberg tables from RustFS in Docker. That is not a
+like-for-like comparison: on macOS every byte from RustFS crosses the Docker
+Desktop port forward (about 220 MB/s here), and a local read does not.
+`STORAGE=s3` (or `make bench BENCH_STORAGE=s3`) puts every engine on the same
+path. `run.sh` copies the generated Parquet into
+`s3://warehouse/engine-bench/data/` (a one-shot `data-upload` container on the
+compose network, skipped for files already there), and then:
+
+- `sqe-parquet` reads `read_parquet('s3://...')` with the store's endpoint and
+  keys from `SQE_STORAGE__S3_*`.
+- `duckdb`, `polars` and `spark` run `run_engine_s3.py`, upstream's runner
+  with the two table paths pointed at S3 (DuckDB `httpfs` with an S3 secret,
+  Polars `storage_options`, Spark `s3a://` with `hadoop-aws`). Answers are
+  still written locally, so `validate` compares them the same way.
+- `sqe-polaris` is unchanged. `sqe-iceberg` is local-only and is refused.
+
+Each record carries `storage` and `s3_read_gb`, the bytes RustFS sent during
+that run, read from the container's network counters. The results go to
+`OUTPUT-s3.md`, next to the local `OUTPUT.md`.
+
+### Per-engine kill threshold
+
+The watchdog kills any process tree above `--budget-gib` (4.5 GiB, upstream's
+cap). `bench.py run --budget-for polars=8` raises that threshold for one
+engine, for instance to see whether Polars, which has no memory limit of its
+own, finishes the window query at all. `--mem` (the 3 GB the other engines
+are told to stay under) is unchanged. A run with an exception carries
+`budget_gib` in its record, so it is never mistaken for a capped run.
 
 ## How it works
 
