@@ -148,6 +148,7 @@ def watch(cmd, stdin_text, watched_extra, budget, floor, timeout, env=None):
     in_f.write(stdin_text or "")
     in_f.seek(0)
     t0 = time.perf_counter()
+    # nosemgrep: opt.aikido.semgrep-rules.python.lang.security.audit.dangerous-subprocess-use-audit -- argv list from ENGINES (local engine binaries), no shell
     proc = subprocess.Popen(cmd, stdin=in_f, stdout=out_f, stderr=err_f, text=True,
                             cwd=UPSTREAM, env=env or os.environ.copy())
     p = psutil.Process(proc.pid)
@@ -217,6 +218,7 @@ def copy_time(stderr):
 
 def cli_version():
     try:
+        # nosemgrep: opt.aikido.semgrep-rules.python.lang.security.audit.dangerous-subprocess-use-audit, opt.aikido.semgrep-rules.python.lang.security.audit.dangerous-subprocess-use-tainted-env-args -- operator's own sqe-cli binary (SQE_CLI), argv list, no shell
         return subprocess.run([SQE_CLI, "--version"], capture_output=True, text=True).stdout.strip()
     except OSError:
         return None
@@ -226,6 +228,7 @@ def cli_version():
 
 def healthy():
     try:
+        # nosemgrep: opt.aikido.semgrep-rules.python.lang.security.audit.dynamic-urllib-use-detected -- fixed loopback health endpoint of the local sqe-server
         with urllib.request.urlopen(f"http://127.0.0.1:{HEALTH_PORT}/healthz", timeout=1) as r:
             return r.status == 200
     except OSError:
@@ -238,6 +241,7 @@ def start_server(tag):
     os.makedirs(LOGS, exist_ok=True)
     log = open(os.path.join(LOGS, f"sqe-server-{tag}.log"), "w")
     t0 = time.perf_counter()
+    # nosemgrep: opt.aikido.semgrep-rules.python.lang.security.audit.dangerous-subprocess-use-audit, opt.aikido.semgrep-rules.python.lang.security.audit.dangerous-subprocess-use-tainted-env-args -- operator's own sqe-server binary (SQE_SERVER), argv list, no shell
     proc = subprocess.Popen([SQE_SERVER, "--mode", "coordinator", "--config", SQE_CONFIG],
                             stdout=log, stderr=subprocess.STDOUT, cwd=WORK,
                             env=dict(os.environ, RUST_LOG=os.environ.get("RUST_LOG", "warn")))
@@ -426,11 +430,13 @@ def load(a):
             server, _ = start_server(f"load-{a.size}")
             try:
                 ns = f"{POLARIS_CATALOG}.{namespace(a.size)}"
+                # nosemgrep: opt.aikido.semgrep-rules.python.lang.security.audit.dangerous-subprocess-use-audit -- operator's own sqe-cli binary (flight_cmd), argv list, no shell
                 res = subprocess.run(flight_cmd(), input=f"SELECT COUNT(*) AS n FROM {ns}.sales;\n",
                                      capture_output=True, text=True, env=flight_env())
                 if loaded_rows(res.stdout) == want and not a.force:
                     print(f"{engine}: {a.size} already loaded ({want} rows)")
                     continue
+                # nosemgrep: opt.aikido.semgrep-rules.python.lang.security.audit.dangerous-subprocess-use-audit -- operator's own sqe-cli binary (flight_cmd), argv list, no shell
                 res = subprocess.run(flight_cmd(), input=load_script(ns, a.size, True),
                                      capture_output=True, text=True, env=flight_env())
             finally:
@@ -445,6 +451,7 @@ def load(a):
 
 
 def run_cli_embedded_iceberg(size, script):
+    # nosemgrep: opt.aikido.semgrep-rules.python.lang.security.audit.dangerous-subprocess-use-audit, opt.aikido.semgrep-rules.python.lang.security.audit.dangerous-subprocess-use-tainted-env-args -- operator's own sqe-cli binary (SQE_CLI), argv list, no shell
     return subprocess.run([SQE_CLI, "--embedded", "--warehouse", warehouse(size),
                            "--memory-limit", "4GB", "-f", "table"],
                           input=script, capture_output=True, text=True)
@@ -528,6 +535,7 @@ def validate(a):
         vals = {}
         for e in engines:
             try:
+                # nosemgrep: opt.aikido.semgrep-rules.python.sqlalchemy.security.sqlalchemy-execute-raw-query, opt.aikido.semgrep-rules.python.lang.security.audit.formatted-sql-query -- in-process DuckDB; CHECK is a constant and the path is the bench's own output file
                 vals[e] = con.execute(f"SELECT {CHECK[q]} FROM read_parquet('{output_path(e, a.size, q)}')").fetchone()
             except Exception:  # noqa: BLE001  (no output: the run failed or was skipped)
                 vals[e] = None
