@@ -166,6 +166,10 @@ pub type ScanBatchStream =
 /// scheduling guard so a burst of tiny batches cannot monopolise the runtime.
 pub const SCAN_CHANNEL_ITEM_CAPACITY: usize = 16;
 
+/// Rows per decoded scan batch: DataFusion's default `batch_size`, the size
+/// the coordinator's operators are tuned for.
+const SCAN_READER_BATCH_SIZE: usize = 8192;
+
 /// Per-file batch stream returned by [`open_task_stream`].
 ///
 /// The item error is `anyhow` rather than `ParquetError` because a Hive task
@@ -1862,7 +1866,11 @@ async fn open_parquet_stream(
     // fields(M)" during Flight decode (the !327 regression, introduced when
     // the streaming path replaced the buffering path that took the schema
     // from `batches[0].schema()`).
-    let stream = builder.build()?;
+    //
+    // Decode DataFusion-sized batches. Unset, the parquet reader emits its
+    // 1024-row default: 8x the batches, each paying per-batch overhead in
+    // the Flight encoder and in every coordinator operator above the scan.
+    let stream = builder.with_batch_size(SCAN_READER_BATCH_SIZE).build()?;
     let schema = stream.schema().clone();
 
     if let Some(cm) = coordinator_metrics {
