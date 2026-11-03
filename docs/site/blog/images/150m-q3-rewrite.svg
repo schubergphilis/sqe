@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1290" height="600" viewBox="0 0 1290 600" font-family="Helvetica Neue, Helvetica, Arial, sans-serif">
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#52514e"/></marker></defs>
+<rect width="1290" height="600" fill="#fcfcfb"/>
+<text x="40" y="52" font-size="26" font-weight="600" fill="#0b0b0b">Latest order per customer: a sort or a group-by</text>
+<text x="40" y="82" font-size="16" fill="#52514e">ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY ts DESC, order_id DESC) = 1, on 150M rows and 15M customers.</text>
+<text x="40" y="199.0" font-size="20" font-weight="600" fill="#0b0b0b">Window</text>
+<rect x="160" y="140" width="205" height="104" rx="8" fill="#ffffff" stroke="#c3c2b7" stroke-width="1.5"/>
+<text x="174" y="168" font-size="16" font-weight="600" fill="#0b0b0b">Scan</text>
+<text x="174" y="192" font-size="14" fill="#52514e">customer_id, ts, order_id</text>
+<text x="174" y="212" font-size="14" fill="#52514e">and the other columns</text>
+<rect x="465" y="140" width="205" height="104" rx="8" fill="#eaf2fc" stroke="#2a78d6" stroke-width="2"/>
+<text x="479" y="168" font-size="16" font-weight="600" fill="#0b0b0b">Sort</text>
+<text x="479" y="192" font-size="14" fill="#52514e">all 150M rows by</text>
+<text x="479" y="212" font-size="14" fill="#52514e">customer_id, ts, order_id</text>
+<text x="479" y="232" font-size="14" fill="#52514e">4.3 GB spilled to disk</text>
+<line x1="365" y1="192.0" x2="463" y2="192.0" stroke="#52514e" stroke-width="2" marker-end="url(#ah)"/>
+<text x="415.0" y="182.0" font-size="13" fill="#0b0b0b" text-anchor="middle">150M rows</text>
+<rect x="770" y="140" width="205" height="104" rx="8" fill="#ffffff" stroke="#c3c2b7" stroke-width="1.5"/>
+<text x="784" y="168" font-size="16" font-weight="600" fill="#0b0b0b">ROW_NUMBER</text>
+<text x="784" y="192" font-size="14" fill="#52514e">number the rows of</text>
+<text x="784" y="212" font-size="14" fill="#52514e">each customer</text>
+<line x1="670" y1="192.0" x2="768" y2="192.0" stroke="#52514e" stroke-width="2" marker-end="url(#ah)"/>
+<text x="720.0" y="182.0" font-size="13" fill="#0b0b0b" text-anchor="middle">150M rows</text>
+<rect x="1045" y="140" width="205" height="104" rx="8" fill="#ffffff" stroke="#c3c2b7" stroke-width="1.5"/>
+<text x="1059" y="168" font-size="16" font-weight="600" fill="#0b0b0b">Filter rn = 1</text>
+<text x="1059" y="192" font-size="14" fill="#52514e">keeps 15M rows</text>
+<line x1="975" y1="192.0" x2="1043" y2="192.0" stroke="#52514e" stroke-width="2" marker-end="url(#ah)"/>
+<text x="1010.0" y="182.0" font-size="13" fill="#0b0b0b" text-anchor="middle">150M rows</text>
+<text x="160" y="278" font-size="15" fill="#0b0b0b">Wall 8.57 s, peak RSS 2.47 GiB (sqe-parquet)</text>
+<text x="40" y="419.0" font-size="20" font-weight="600" fill="#0b0b0b">Group-by</text>
+<rect x="160" y="360" width="205" height="104" rx="8" fill="#ffffff" stroke="#c3c2b7" stroke-width="1.5"/>
+<text x="174" y="388" font-size="16" font-weight="600" fill="#0b0b0b">Scan</text>
+<text x="174" y="412" font-size="14" fill="#52514e">customer_id, ts, order_id</text>
+<text x="174" y="432" font-size="14" fill="#52514e">and the other columns</text>
+<rect x="465" y="360" width="205" height="104" rx="8" fill="#eaf2fc" stroke="#2a78d6" stroke-width="2"/>
+<text x="479" y="388" font-size="16" font-weight="600" fill="#0b0b0b">Partial aggregate</text>
+<text x="479" y="412" font-size="14" fill="#52514e">per thread: keep the row</text>
+<text x="479" y="432" font-size="14" fill="#52514e">with the largest (ts,</text>
+<text x="479" y="452" font-size="14" fill="#52514e">order_id) per customer</text>
+<line x1="365" y1="412.0" x2="463" y2="412.0" stroke="#52514e" stroke-width="2" marker-end="url(#ah)"/>
+<text x="415.0" y="402.0" font-size="13" fill="#0b0b0b" text-anchor="middle">150M rows</text>
+<rect x="770" y="360" width="205" height="104" rx="8" fill="#ffffff" stroke="#c3c2b7" stroke-width="1.5"/>
+<text x="784" y="388" font-size="16" font-weight="600" fill="#0b0b0b">Repartition</text>
+<text x="784" y="412" font-size="14" fill="#52514e">by customer_id</text>
+<line x1="670" y1="412.0" x2="768" y2="412.0" stroke="#52514e" stroke-width="2" marker-end="url(#ah)"/>
+<rect x="1045" y="360" width="205" height="104" rx="8" fill="#eaf2fc" stroke="#2a78d6" stroke-width="2"/>
+<text x="1059" y="388" font-size="16" font-weight="600" fill="#0b0b0b">Final aggregate</text>
+<text x="1059" y="412" font-size="14" fill="#52514e">best of the partial rows</text>
+<text x="1059" y="432" font-size="14" fill="#52514e">15M rows, spills if</text>
+<text x="1059" y="452" font-size="14" fill="#52514e">it runs out of memory</text>
+<line x1="975" y1="412.0" x2="1043" y2="412.0" stroke="#52514e" stroke-width="2" marker-end="url(#ah)"/>
+<text x="160" y="498" font-size="15" fill="#0b0b0b">Wall 4.90 s, peak RSS 2.14 GiB (sqe-parquet)</text>
+<line x1="40" y1="315" x2="1250" y2="315" stroke="#e1e0d9" stroke-width="1"/>
+<text x="40" y="550" font-size="14" fill="#52514e">The rewrite applies to rn = 1, rn &lt;= 1 and rn &lt; 2 over fixed-width columns. Any other bound, a second window function, or a string or</text>
+<text x="40" y="572" font-size="14" fill="#52514e">list column keeps the window plan. The benchmark checks the result against DuckDB&#8217;s on every run.</text>
+</svg>
