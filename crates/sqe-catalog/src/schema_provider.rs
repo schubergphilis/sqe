@@ -10,7 +10,7 @@ use datafusion::datasource::ViewTable;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{LogicalPlan, SubqueryAlias, TableScanBuilder};
-use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::prelude::SessionContext;
 use iceberg::NamespaceIdent;
 use moka::sync::Cache as SyncCache;
 use tracing::{debug, error, warn};
@@ -513,10 +513,15 @@ impl SchemaProvider for SqeSchemaProvider {
         if !self.session_catalog.is_rest_backend() {
             return Ok(None);
         }
-        match self.session_catalog.load_view_sql(&ns_ident, name).await {
-            Ok(Some(sql)) => {
-                debug!(view = name, sql = %sql, "Loaded view SQL, planning...");
-                return self.plan_view(name, sql).await;
+        match self.session_catalog.load_view_body(&ns_ident, name).await {
+            Ok(Some(body)) => {
+                debug!(
+                    view = name,
+                    sql = %body.sql,
+                    default_schema = %body.default_schema,
+                    "Loaded view SQL, planning..."
+                );
+                return self.plan_view(name, body).await;
             }
             Ok(None) => {}
             Err(e) if e.is_not_found() => {
@@ -535,8 +540,9 @@ impl SchemaProvider for SqeSchemaProvider {
     }
 }
 
-/// The schema a view body's unqualified table names resolve in.
-const VIEW_DEFAULT_SCHEMA: &str = "default";
+/// The schema a view body's unqualified table names resolve in when its
+/// version names no `default-namespace`.
+pub(crate) const VIEW_DEFAULT_SCHEMA: &str = "default";
 
 /// Name every table scan in a view body by the table it actually resolved
 /// to (`catalog.schema.table`). The scan keeps the name as written, and the
@@ -630,29 +636,36 @@ impl SqeSchemaProvider {
     fn plan_view<'a>(
         &'a self,
         name: &'a str,
-        sql: String,
+        body: crate::rest_catalog::ViewBody,
     ) -> futures::future::BoxFuture<'a, DFResult<Option<Arc<dyn TableProvider>>>> {
         Box::pin(plan_view_guarded(
             &self.warehouse,
             &self.namespace,
             name,
-            self.plan_view_inner(name, sql),
+            self.plan_view_inner(name, body),
         ))
     }
 
     async fn plan_view_inner(
         &self,
         name: &str,
-        sql: String,
+        body: crate::rest_catalog::ViewBody,
     ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        let crate::rest_catalog::ViewBody {
+            sql,
+            default_schema,
+        } = body;
         let catalog_name = &self.warehouse;
-        let mini_ctx = view_planning_context(catalog_name);
+        let mini_ctx = view_planning_context(catalog_name, &default_schema)?;
 
-        // The view's own namespace is always resolvable even when the
-        // owning provider's list was built before it existed.
+        // The view's own namespace and the one its body was written against
+        // are always resolvable, even when the owning provider's list was
+        // built before they existed.
         let mut namespaces = self.known_namespaces.clone();
-        if !namespaces.contains(&self.namespace) {
-            namespaces.push(self.namespace.clone());
+        for ns in [&self.namespace, &default_schema] {
+            if !namespaces.contains(ns) {
+                namespaces.push(ns.clone());
+            }
         }
         let planning_catalog: Arc<dyn datafusion::catalog::CatalogProvider> =
             Arc::new(self.planning_catalog_provider(
@@ -727,27 +740,29 @@ impl SqeSchemaProvider {
         };
 
         let view = match &self.catalog_name {
-            Some(session_name) => view_table(df, name, sql, session_name, &[catalog_name])?,
-            None => view_table(df, name, sql, catalog_name, &[])?,
+            Some(session_name) => view_table(
+                df,
+                name,
+                sql,
+                session_name,
+                &default_schema,
+                &[catalog_name],
+            )?,
+            None => view_table(df, name, sql, catalog_name, &default_schema, &[])?,
         };
         Ok(Some(view))
     }
 }
 
-/// The `SessionContext` a view body is planned in, with `catalog` as its
-/// default catalog. Same session zone as the query, or `now()` in a view
-/// body is naive while the same expression in the query is zoned. The
-/// caller registers the catalogs the body may name.
-pub(crate) fn view_planning_context(catalog: &str) -> SessionContext {
-    SessionContext::new_with_config(
-        SessionConfig::new()
-            .with_information_schema(true)
-            .with_default_catalog_and_schema(catalog, VIEW_DEFAULT_SCHEMA)
-            .set_str(
-                "datafusion.execution.time_zone",
-                crate::session_tuning::ENGINE_TIME_ZONE,
-            ),
-    )
+/// The `SessionContext` a view body is planned in, with `catalog.schema` as
+/// the default for its unqualified names, `schema` being the version's
+/// `default-namespace`. The engine's flags, rules and functions, as a user
+/// statement plans with: under a bare `SessionConfig` `year()` and `if()` did
+/// not resolve, lambdas did not parse and `0.06` was a DOUBLE
+/// (ai-portal-data#357, #359). The caller registers the catalogs the body
+/// may name.
+pub(crate) fn view_planning_context(catalog: &str, schema: &str) -> DFResult<SessionContext> {
+    crate::session_tuning::view_planning_context(catalog, schema)
 }
 
 tokio::task_local! {
@@ -793,16 +808,21 @@ pub(crate) async fn plan_view_guarded<T>(
 /// The `ViewTable` for view `name`, from its body planned in a
 /// [`view_planning_context`]: scans named by the table they resolved to
 /// ([`qualify_view_scans`], `session_name` being the catalog's name in the
-/// reading session and `aliases` its other names), then optimized.
+/// reading session, `schema` the one the body was planned in and `aliases`
+/// the catalog's other names), then optimized. `schema` must be the planning
+/// context's default schema: the policy rewriter governs a scan by the name
+/// this gives it, so naming `t` from `marts` as `default.t` would apply the
+/// wrong table's policies.
 pub(crate) fn view_table(
     df: datafusion::dataframe::DataFrame,
     name: &str,
     sql: String,
     session_name: &str,
+    schema: &str,
     aliases: &[&str],
 ) -> DFResult<Arc<dyn TableProvider>> {
     let (state, plan) = df.into_parts();
-    let plan = qualify_view_scans(plan, session_name, VIEW_DEFAULT_SCHEMA, aliases)?;
+    let plan = qualify_view_scans(plan, session_name, schema, aliases)?;
     let plan = state.optimize(&plan).map_err(|e| {
         DataFusionError::External(format!("Failed to optimize view '{name}' plan: {e}").into())
     })?;

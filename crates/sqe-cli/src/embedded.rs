@@ -3665,7 +3665,10 @@ mod tests {
         assert_eq!(body["schema"]["fields"][0]["type"], "long");
         let version = &body["view-version"];
         assert_eq!(version["default-catalog"], "wh");
-        assert_eq!(version["default-namespace"], serde_json::json!(["ns"]));
+        // The schema the body's unqualified names resolve in: the creating
+        // session's (no USE here, so `default`), not the view's own
+        // namespace (ai-portal-data#357).
+        assert_eq!(version["default-namespace"], serde_json::json!(["default"]));
         assert_eq!(version["representations"][0]["dialect"], "sqe");
         assert_eq!(
             version["representations"][0]["sql"],
