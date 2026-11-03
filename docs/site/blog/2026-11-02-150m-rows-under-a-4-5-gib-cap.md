@@ -1,6 +1,6 @@
 ---
 title: "150M rows under a 4.5 GiB cap: SQE next to DuckDB, Polars and Spark"
-description: "We reran the engine-bench workload from \"DuckDB 2.0 vs Polars vs Spark on one machine\" unchanged, with SQE added in three modes. Every answer matches DuckDB's. SQE on Parquet has the lowest geomean query time and finishes every run. Its lead over DuckDB comes from memory under the cap, not raw speed. Tracing the slow cells found two fixes: a window rewrite and a scan filter that held memory for nothing."
+description: "A response to \"DuckDB 2.0 vs Polars vs Spark on one machine\": we reran its engine-bench workload unchanged, with SQE added. Every answer matches DuckDB's and SQE finishes every run under the cap. One of its leads over DuckDB held up under a closer look and one did not. The benchmark also found two problems in SQE, and both are now fixed."
 pubDate: "2026-11-02"
 author: "Jacob Verhoeks"
 tags:
@@ -12,9 +12,11 @@ tags:
   - "iceberg"
 ---
 
-Firat Celik's [DuckDB 2.0 vs Polars vs Spark on one machine: 150M rows under a 4.5 GiB cap](https://dev.to/firfircelik/duckdb-20-vs-polars-vs-spark-on-one-machine-150m-rows-under-a-45-gib-cap-h38) is the kind of benchmark we like. It is small and it is honest. It has four queries a data engineer writes every week, a fresh process per run and a watchdog that kills any engine whose process tree goes above 4.5 GiB. The scripts are public in [engine-bench](https://github.com/firfircelik/engine-bench), with pinned versions and a seeded data generator.
+Firat Celik's [DuckDB 2.0 vs Polars vs Spark on one machine: 150M rows under a 4.5 GiB cap](https://dev.to/firfircelik/duckdb-20-vs-polars-vs-spark-on-one-machine-150m-rows-under-a-45-gib-cap-h38) asks a question most data teams run into: which engine still finishes when memory is tight. Firat ran four queries a data engineer writes every week over 150M rows, with a fresh process per run and a watchdog that kills any engine whose process tree goes above 4.5 GiB. The scripts are public in [engine-bench](https://github.com/firfircelik/engine-bench), with pinned versions and a seeded data generator. Anyone can rerun them.
 
-So we ran it with SQE added. The upstream queries, data and runners stay unchanged. DuckDB 2.0.0, Polars 2.0.0 and PySpark 4.2.0 are the versions the article used. Every engine's answer is checked against DuckDB's, and all of them match.
+We did, with SQE added. SQE is our SQL engine for Apache Iceberg, built on Apache DataFusion. We wanted to see where it stands on a workload we did not design, and to learn from whatever broke. The upstream queries, data and runners stay unchanged, at the article's versions: DuckDB 2.0.0, Polars 2.0.0 and PySpark 4.2.0. Every engine's answer is checked against DuckDB's, and all of them match.
+
+Our results table says SQE takes about half DuckDB's time on the two heavy queries. One of those leads held up. The other came from a busy laptop. Below is how we told them apart, how the article's findings look on our machine, and the two problems the benchmark found in SQE.
 
 ## The setup
 
@@ -53,11 +55,15 @@ Median seconds to read, compute and write the answer. Lower is better.
 
 Polars wins the filter by 30 ms. SQE on Parquet has the lowest median on the other three queries. All three SQE modes and DuckDB finish every run of every query; Polars and Spark do not.
 
-The two heavy queries show SQE well ahead of DuckDB, so we checked both gaps. We ran the two engines alone, alternating, and measured CPU time and busy cores as well as wall time.
+Those medians flatter SQE on the two heavy queries, so we checked both gaps before writing them down. We ran SQE and DuckDB alone, alternating, and measured CPU time and busy cores next to wall time.
 
 On the window query the gap is noise. Alone, SQE took 4.8 to 4.9 s and DuckDB 4.4 to 5.1 s. The 9.03 s median above came from runs with less free memory on the laptop. DuckDB spills 2.9 GB on this query and SQE 1.4 GB, so DuckDB loses more when the spill files no longer fit in the page cache.
 
-On the group-by the gap is real, and it is a memory result. Both engines spend about 30 CPU seconds on q4. The query has 15M groups in 150M rows, so almost every row starts a new group. DataFusion's partial aggregate notices that after the first batches and steps aside: it passed 149.1M of the 150M rows through untouched. The rows are hash-partitioned by `customer_id` to 8 final aggregates, each group lives in one of them, and SQE stays near 2 GiB at any memory setting. DuckDB needs 10 to 11 GiB for the same query without a limit, and then the two are level: 3.0 to 3.2 s against SQE's 3.3 to 3.5 s. Under the 3 GB setting DuckDB spills about 6 GB and keeps 4 to 5 cores busy where SQE keeps 7.5, which costs it 5 to 8 s. The credit goes to DataFusion's aggregate, and it shows only because the run caps memory. The cap is what the article tests, so the result counts, but with memory to spare neither engine is faster.
+On the group-by the gap is real, and it comes from memory. Both engines spend about 30 CPU seconds on q4. What differs is how many cores each one keeps busy under the cap.
+
+The query has 15M groups in 150M rows, so almost every row starts a new group. Pre-aggregating such rows saves nothing, and DataFusion's partial aggregate notices that after the first batches: it passed 149.1M of the 150M rows straight through. The rows are then hash-partitioned by `customer_id` to 8 final aggregates, so each group is held once. SQE stays near 2 GiB at any memory setting.
+
+DuckDB needs 10 to 11 GiB for the same query without a limit, and then the two engines are level: 3.0 to 3.2 s against SQE's 3.3 to 3.5 s. Under the 3 GB setting DuckDB spills about 6 GB and keeps 4 to 5 cores busy where SQE keeps 7.5. That costs it 5 to 8 s. The credit belongs to DataFusion's aggregate. A memory cap is exactly what the article tests, so the result counts. Give DuckDB the memory it asks for and the two finish together.
 
 ## Memory
 
@@ -96,15 +102,15 @@ Our machine is not the article's, so the first check is whether the three engine
 | `q3_window_latest` | 7.92 | 9.93 | killed | killed | 46.29 (2/3) | 37.11 (2/3) |
 | `q4_highcard_agg` | 7.91 | 8.62 | 4.21 (1/3) | 4.50 (1/3) | 39.70 | 36.08 |
 
-A fraction is the number of finished runs where not all three finished. They keep it. The light queries land within 15% of the article's times. On the heavy ones DuckDB is 9 to 25% slower here and Spark 9 to 20% faster. Polars fails on the same query in the same way. Memory moves even less: DuckDB peaks at 3.0 GiB on the heavy queries there and 3.3 GiB here.
+A fraction such as (2/3) counts the finished runs where not every run finished. The three engines keep their shape. The light queries land within 15% of the article's times. On the heavy ones DuckDB is 9 to 25% slower here and Spark 9 to 20% faster. Polars fails on the same query in the same way. Memory moves even less: DuckDB peaks at 3.0 GiB on the heavy queries there and 3.3 GiB here.
 
-The article went further than the four-query run, and two of its follow-ups belong next to our numbers. Polars 2.0.0 with a 3 GiB out-of-core budget (`POLARS_OOC_MEMORY_BUDGET_MB=3072`) was still killed on the window query, and with the cap raised to 9 GiB it was killed at 9.04 to 9.54 GiB. Polars 2.1.0 finished it with a budget: 18.78 s at 3.34 GiB with 3072 MB, 20.11 s at 1.29 GiB with 1024 MB. The article's max-timestamp rewrite of the query ran in 5.12 s on Polars. DuckDB with `memory_limit=1GB` finished the window query in 14.97 s at 1.12 GiB and the group-by in 13.94 s at 1.08 GiB. We have not run SQE at 1 GB yet, so the table above is no answer to that one.
+The article went further than the four-query run, and two of its follow-ups belong next to our numbers. Polars 2.0.0 with a 3 GiB out-of-core budget (`POLARS_OOC_MEMORY_BUDGET_MB=3072`) was still killed on the window query, and with the cap raised to 9 GiB it was killed at 9.04 to 9.54 GiB. Polars 2.1.0 finished it with a budget: 18.78 s at 3.34 GiB with 3072 MB, 20.11 s at 1.29 GiB with 1024 MB. The article's max-timestamp rewrite of the query ran in 5.12 s on Polars. DuckDB with `memory_limit=1GB` finished the window query in 14.97 s at 1.12 GiB and the group-by in 13.94 s at 1.08 GiB. We have not run SQE at 1 GB yet.
 
-The article's verdict on Polars stays true for any engine: "Fast and close to the edge is a fine place for a notebook and a bad place for a scheduled job." Polars at 4.0 GiB on the group-by finished one run in three. The margin under the cap matters as much as the time.
+The article's verdict on Polars holds for any engine: "Fast and close to the edge is a fine place for a notebook and a bad place for a scheduled job." Polars on the group-by shows why, peaking at 4.0 GiB and finishing one run in three. We hold SQE to the same bar, so we watch peak memory as closely as time.
 
-## What tracing found
+## What the benchmark found in SQE
 
-The first full run did not look like the table above. Two cells were slow, and tracing each one gave a fix.
+Our first full run did not look like the tables above. SQE was slow on the window query, and its Iceberg scan used more memory than it needed. We traced both, and both are now fixed in SQE. A benchmark someone else wrote finds the cases you did not think to test.
 
 ### The window query sorted 150M rows to keep 15M
 
@@ -112,7 +118,9 @@ The first full run did not look like the table above. Two cells were slow, and t
 
 ![The window plan sorts all 150M rows, numbers them and keeps 15M. The group-by plan keeps the best row per customer in a partial and a final hash aggregate.](images/150m-q3-rewrite.png)
 
-The article worked around the same query on Polars by hand, with a max-timestamp rewrite. SQE now does that rewrite in the planner. A logical rule turns the filter over the window into a group-by on the partition key. For each customer the aggregate keeps the ordering key of the best row seen so far, in Arrow's row format, so comparing a new row with the current best is one byte comparison. It keeps that row's other columns next to the key, and decodes any column that is itself an `ORDER BY` key from the key instead of storing it twice. Because it runs inside DataFusion's hash aggregate, it gets the partial and final stages, memory accounting and spilling that every group-by has.
+The article worked around the same query on Polars by hand, with a max-timestamp rewrite. SQE now does that rewrite in the planner, so nobody has to write it by hand. A logical rule turns the filter over the window into a group-by on the partition key.
+
+For each customer the aggregate keeps the best row seen so far. Its sort key is stored in Arrow's row format, so comparing a new row with the current best is one byte comparison. Because the rule runs inside DataFusion's hash aggregate, it gets the partial and final stages, memory accounting and spilling that every group-by has.
 
 The rewrite applies only when the result stays the same: `rn = 1`, `rn <= 1` or `rn < 2`, one window function, and fixed-width columns. Another bound, a second window function in the same node, or a string or list column keeps the window plan. Among rows that tie on every `ORDER BY` key the first one seen wins, which is as arbitrary as the window's own choice.
 
@@ -126,7 +134,7 @@ SQE also keeps a `FilterExec` above every scan. DataFusion removes that filter o
 
 ![Before: the RowFilter evaluates the predicate and hands 12.0M rows to the FilterExec, which checks them again. After: the RowFilter keeps only deletes and the join filter, the FilterExec checks 150M rows, and peak memory drops by 0.7 GiB.](images/150m-scan-row-filter.png)
 
-A check done twice is cheap. The memory was not. When the Parquet reader in arrow-rs runs a `RowFilter`, it caches the predicate columns it decoded, so it need not decode them again for the output. It caches only columns that are also in the output, and here they always were: the `FilterExec` above needs `status` to check it again. The cache defaults to 100 MB per row group, the Iceberg path does not change that default, and the scan decodes about one file per core at a time. We have not profiled the cache on its own. What we measured is the result of turning the `RowFilter` off, on the 150M-row Polaris table with one coordinator and a fresh server per run:
+Checking each row twice costs little CPU. The real cost was memory. When the Parquet reader in arrow-rs runs a `RowFilter`, it caches the predicate columns it decoded, so it need not decode them again for the output. It caches only columns that are also in the output, and here they always were: the `FilterExec` above needs `status` to check it again. The cache defaults to 100 MB per row group, the Iceberg path does not change that default, and the scan decodes about one file per core at a time. We have not profiled the cache on its own. What we measured is the result of turning the `RowFilter` off, on the 150M-row Polaris table with one coordinator and a fresh server per run:
 
 | Predicate | Rows kept | Peak RSS with `RowFilter` | without |
 |---|---:|---:|---:|
@@ -151,9 +159,9 @@ So the scan predicate still prunes files, row groups and pages. It is no longer 
 
 ## Why Polaris is slower
 
-The `sqe-polaris` column is not a slower engine. It is the same engine reading through a different path. The other engines read Parquet from local disk. `sqe-polaris` reads Iceberg data from RustFS in Docker, and on macOS every byte from a container crosses the Docker Desktop port forward, which moves about 220 MB/s here. The time also includes a catalog round trip, an Arrow Flight SQL fetch and the client writing the result.
+The `sqe-polaris` column runs the same engine through a different path. The other engines read Parquet from local disk. `sqe-polaris` reads Iceberg data from RustFS in Docker, and on macOS every byte from a container crosses the Docker Desktop port forward, which moves about 220 MB/s here. The time also includes a catalog round trip, an Arrow Flight SQL fetch and the client writing the result.
 
-The harness can put every engine on the same path. `STORAGE=s3` copies the Parquet into RustFS and points DuckDB, Polars, Spark and `sqe-parquet` at `s3://`. In that mode, measured this morning before both fixes, the gap closes. Median q1 query time was 8.0 s on DuckDB, 7.4 s on Polars, 7.6 s on `sqe-parquet` and 9.4 s on `sqe-polaris`. The port forward is the bottleneck for everyone. The Polaris path is still the one SQE is built for: a catalog, a policy-checked plan and the user's own credentials.
+The harness can put every engine on the same path. `STORAGE=s3` copies the Parquet into RustFS and points DuckDB, Polars, Spark and `sqe-parquet` at `s3://`. In that mode, measured on 2 November before both fixes, the gap closes. Median q1 query time was 8.0 s on DuckDB, 7.4 s on Polars, 7.6 s on `sqe-parquet` and 9.4 s on `sqe-polaris`. The port forward is the bottleneck for everyone. The Polaris path is still the one SQE is built for: a catalog, a policy-checked plan and the user's own credentials.
 
 ## Run it yourself
 
@@ -165,4 +173,6 @@ make bench BENCH_STORAGE=s3               # every engine reads from RustFS
 make bench-smoke                          # 10M rows, no Spark, fails on any mismatch
 ```
 
-The article ends with "If your job fits on one machine, measure it on one machine before you start a cluster for it." We agree, and we would add one thing: check the answers on every run. Both fixes above changed how a query executes, and the only evidence that they kept the result is that all 24 cells still match DuckDB's.
+The article ends with "If your job fits on one machine, measure it on one machine before you start a cluster for it." We agree. The harness also checks every answer, and that check carried our two fixes: both changed how a query runs, and the proof they kept the result is that all 24 cells still match DuckDB's.
+
+Thanks to Firat for publishing the scripts and the raw numbers. Next on our list are SQE at the article's 1 GB setting and larger data, published the same way.
