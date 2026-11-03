@@ -20,6 +20,7 @@ fi
 ACCOUNT_ID='(^|[^0-9])[0-9]{12}([^0-9]|$)'
 if grep -rnaIE "$ACCOUNT_ID" quickstart tests \
      --exclude-dir=.venv --exclude-dir=node_modules --exclude-dir=target \
+     --exclude-dir=.work \
      --include='*.md' --include='*.toml' --include='*.json' --include='*.yml' \
      --include='*.yaml' --include='*.sh' --include='*.py' --include='*.rs' \
      --include='*.sql' --include='*.env' --include='*.properties' \

@@ -1,0 +1,141 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="845" viewBox="0 0 1200 845" font-family="Helvetica Neue, Helvetica, Arial, sans-serif">
+<rect width="1200" height="845" fill="#fcfcfb"/>
+<text x="40" y="52" font-size="26" font-weight="600" fill="#0b0b0b">Peak memory per query, 150M rows</text>
+<text x="40" y="82" font-size="16" fill="#52514e">Median peak RSS of the whole process tree, GiB. The watchdog kills a run above 4.5 GiB.</text>
+<rect x="40" y="100" width="14" height="14" rx="3" fill="#2a78d6"/>
+<text x="62" y="112" font-size="15" fill="#52514e">SQE</text>
+<rect x="116.6" y="100" width="14" height="14" rx="3" fill="#898781"/>
+<text x="138.6" y="112" font-size="15" fill="#52514e">Engines from the article</text>
+<line x1="365.4" y1="107" x2="391.4" y2="107" stroke="#d03b3b" stroke-width="2" stroke-dasharray="5 4"/>
+<text x="399.4" y="112" font-size="15" fill="#52514e">4.5 GiB kill threshold</text>
+<text x="40" y="161" font-size="18" font-weight="600" fill="#0b0b0b">q1_filter_agg</text>
+<line x1="170.0" y1="179" x2="170.0" y2="419" stroke="#c3c2b7" stroke-width="1"/>
+<text x="170.0" y="439" font-size="13" fill="#898781" text-anchor="middle">0</text>
+<line x1="248.0" y1="179" x2="248.0" y2="419" stroke="#e1e0d9" stroke-width="1"/>
+<text x="248.0" y="439" font-size="13" fill="#898781" text-anchor="middle">1</text>
+<line x1="326.0" y1="179" x2="326.0" y2="419" stroke="#e1e0d9" stroke-width="1"/>
+<text x="326.0" y="439" font-size="13" fill="#898781" text-anchor="middle">2</text>
+<line x1="404.0" y1="179" x2="404.0" y2="419" stroke="#e1e0d9" stroke-width="1"/>
+<text x="404.0" y="439" font-size="13" fill="#898781" text-anchor="middle">3</text>
+<line x1="482.0" y1="179" x2="482.0" y2="419" stroke="#e1e0d9" stroke-width="1"/>
+<text x="482.0" y="439" font-size="13" fill="#898781" text-anchor="middle">4</text>
+<line x1="560.0" y1="179" x2="560.0" y2="419" stroke="#e1e0d9" stroke-width="1"/>
+<text x="560.0" y="439" font-size="13" fill="#898781" text-anchor="middle">5</text>
+<text x="160" y="204.0" font-size="14" fill="#52514e" text-anchor="end">sqe-parquet</text>
+<path d="M170,190.0 H181.6 Q185.6,190.0 185.6,194.0 V204.0 Q185.6,208.0 181.6,208.0 H170 Z" fill="#2a78d6"/>
+<text x="193.6" y="204.0" font-size="13" fill="#0b0b0b">0.20</text>
+<text x="160" y="244.0" font-size="14" fill="#52514e" text-anchor="end">sqe-iceberg</text>
+<path d="M170,230.0 H220.6 Q224.6,230.0 224.6,234.0 V244.0 Q224.6,248.0 220.6,248.0 H170 Z" fill="#2a78d6"/>
+<text x="232.6" y="244.0" font-size="13" fill="#0b0b0b">0.70</text>
+<text x="160" y="284.0" font-size="14" fill="#52514e" text-anchor="end">sqe-polaris</text>
+<path d="M170,270.0 H223.7 Q227.7,270.0 227.7,274.0 V284.0 Q227.7,288.0 223.7,288.0 H170 Z" fill="#2a78d6"/>
+<text x="235.7" y="284.0" font-size="13" fill="#0b0b0b">0.74</text>
+<text x="160" y="324.0" font-size="14" fill="#52514e" text-anchor="end">DuckDB</text>
+<path d="M170,310.0 H219.8 Q223.8,310.0 223.8,314.0 V324.0 Q223.8,328.0 219.8,328.0 H170 Z" fill="#898781"/>
+<text x="231.8" y="324.0" font-size="13" fill="#0b0b0b">0.69</text>
+<text x="160" y="364.0" font-size="14" fill="#52514e" text-anchor="end">Polars</text>
+<path d="M170,350.0 H268.2 Q272.2,350.0 272.2,354.0 V364.0 Q272.2,368.0 268.2,368.0 H170 Z" fill="#898781"/>
+<text x="280.2" y="364.0" font-size="13" fill="#0b0b0b">1.31</text>
+<text x="160" y="404.0" font-size="14" fill="#52514e" text-anchor="end">Spark</text>
+<path d="M170,390.0 H287.7 Q291.7,390.0 291.7,394.0 V404.0 Q291.7,408.0 287.7,408.0 H170 Z" fill="#898781"/>
+<text x="299.7" y="404.0" font-size="13" fill="#0b0b0b">1.56</text>
+<line x1="521.0" y1="173" x2="521.0" y2="419" stroke="#d03b3b" stroke-width="2" stroke-dasharray="5 4"/>
+<text x="620" y="161" font-size="18" font-weight="600" fill="#0b0b0b">q2_join_agg</text>
+<line x1="750.0" y1="179" x2="750.0" y2="419" stroke="#c3c2b7" stroke-width="1"/>
+<text x="750.0" y="439" font-size="13" fill="#898781" text-anchor="middle">0</text>
+<line x1="828.0" y1="179" x2="828.0" y2="419" stroke="#e1e0d9" stroke-width="1"/>
+<text x="828.0" y="439" font-size="13" fill="#898781" text-anchor="middle">1</text>
+<line x1="906.0" y1="179" x2="906.0" y2="419" stroke="#e1e0d9" stroke-width="1"/>
+<text x="906.0" y="439" font-size="13" fill="#898781" text-anchor="middle">2</text>
+<line x1="984.0" y1="179" x2="984.0" y2="419" stroke="#e1e0d9" stroke-width="1"/>
+<text x="984.0" y="439" font-size="13" fill="#898781" text-anchor="middle">3</text>
+<line x1="1062.0" y1="179" x2="1062.0" y2="419" stroke="#e1e0d9" stroke-width="1"/>
+<text x="1062.0" y="439" font-size="13" fill="#898781" text-anchor="middle">4</text>
+<line x1="1140.0" y1="179" x2="1140.0" y2="419" stroke="#e1e0d9" stroke-width="1"/>
+<text x="1140.0" y="439" font-size="13" fill="#898781" text-anchor="middle">5</text>
+<text x="740" y="204.0" font-size="14" fill="#52514e" text-anchor="end">sqe-parquet</text>
+<path d="M750,190.0 H756.9 Q760.9,190.0 760.9,194.0 V204.0 Q760.9,208.0 756.9,208.0 H750 Z" fill="#2a78d6"/>
+<text x="768.9" y="204.0" font-size="13" fill="#0b0b0b">0.14</text>
+<text x="740" y="244.0" font-size="14" fill="#52514e" text-anchor="end">sqe-iceberg</text>
+<path d="M750,230.0 H800.6 Q804.6,230.0 804.6,234.0 V244.0 Q804.6,248.0 800.6,248.0 H750 Z" fill="#2a78d6"/>
+<text x="812.6" y="244.0" font-size="13" fill="#0b0b0b">0.70</text>
+<text x="740" y="284.0" font-size="14" fill="#52514e" text-anchor="end">sqe-polaris</text>
+<path d="M750,270.0 H846.6 Q850.6,270.0 850.6,274.0 V284.0 Q850.6,288.0 846.6,288.0 H750 Z" fill="#2a78d6"/>
+<text x="858.6" y="284.0" font-size="13" fill="#0b0b0b">1.29</text>
+<text x="740" y="324.0" font-size="14" fill="#52514e" text-anchor="end">DuckDB</text>
+<path d="M750,310.0 H777.2 Q781.2,310.0 781.2,314.0 V324.0 Q781.2,328.0 777.2,328.0 H750 Z" fill="#898781"/>
+<text x="789.2" y="324.0" font-size="13" fill="#0b0b0b">0.40</text>
+<text x="740" y="364.0" font-size="14" fill="#52514e" text-anchor="end">Polars</text>
+<path d="M750,350.0 H915.3 Q919.3,350.0 919.3,354.0 V364.0 Q919.3,368.0 915.3,368.0 H750 Z" fill="#898781"/>
+<text x="927.3" y="364.0" font-size="13" fill="#0b0b0b">2.17</text>
+<text x="740" y="404.0" font-size="14" fill="#52514e" text-anchor="end">Spark</text>
+<path d="M750,390.0 H861.4 Q865.4,390.0 865.4,394.0 V404.0 Q865.4,408.0 861.4,408.0 H750 Z" fill="#898781"/>
+<text x="873.4" y="404.0" font-size="13" fill="#0b0b0b">1.48</text>
+<line x1="1101.0" y1="173" x2="1101.0" y2="419" stroke="#d03b3b" stroke-width="2" stroke-dasharray="5 4"/>
+<text x="40" y="511" font-size="18" font-weight="600" fill="#0b0b0b">q3_window_latest</text>
+<line x1="170.0" y1="529" x2="170.0" y2="769" stroke="#c3c2b7" stroke-width="1"/>
+<text x="170.0" y="789" font-size="13" fill="#898781" text-anchor="middle">0</text>
+<line x1="248.0" y1="529" x2="248.0" y2="769" stroke="#e1e0d9" stroke-width="1"/>
+<text x="248.0" y="789" font-size="13" fill="#898781" text-anchor="middle">1</text>
+<line x1="326.0" y1="529" x2="326.0" y2="769" stroke="#e1e0d9" stroke-width="1"/>
+<text x="326.0" y="789" font-size="13" fill="#898781" text-anchor="middle">2</text>
+<line x1="404.0" y1="529" x2="404.0" y2="769" stroke="#e1e0d9" stroke-width="1"/>
+<text x="404.0" y="789" font-size="13" fill="#898781" text-anchor="middle">3</text>
+<line x1="482.0" y1="529" x2="482.0" y2="769" stroke="#e1e0d9" stroke-width="1"/>
+<text x="482.0" y="789" font-size="13" fill="#898781" text-anchor="middle">4</text>
+<line x1="560.0" y1="529" x2="560.0" y2="769" stroke="#e1e0d9" stroke-width="1"/>
+<text x="560.0" y="789" font-size="13" fill="#898781" text-anchor="middle">5</text>
+<text x="160" y="554.0" font-size="14" fill="#52514e" text-anchor="end">sqe-parquet</text>
+<path d="M170,540.0 H332.9 Q336.9,540.0 336.9,544.0 V554.0 Q336.9,558.0 332.9,558.0 H170 Z" fill="#2a78d6"/>
+<text x="344.9" y="554.0" font-size="13" fill="#0b0b0b">2.14</text>
+<text x="160" y="594.0" font-size="14" fill="#52514e" text-anchor="end">sqe-iceberg</text>
+<path d="M170,580.0 H315.8 Q319.8,580.0 319.8,584.0 V594.0 Q319.8,598.0 315.8,598.0 H170 Z" fill="#2a78d6"/>
+<text x="327.8" y="594.0" font-size="13" fill="#0b0b0b">1.92</text>
+<text x="160" y="634.0" font-size="14" fill="#52514e" text-anchor="end">sqe-polaris</text>
+<path d="M170,620.0 H396.1 Q400.1,620.0 400.1,624.0 V634.0 Q400.1,638.0 396.1,638.0 H170 Z" fill="#2a78d6"/>
+<text x="408.1" y="634.0" font-size="13" fill="#0b0b0b">2.95</text>
+<text x="160" y="674.0" font-size="14" fill="#52514e" text-anchor="end">DuckDB</text>
+<path d="M170,660.0 H425.0 Q429.0,660.0 429.0,664.0 V674.0 Q429.0,678.0 425.0,678.0 H170 Z" fill="#898781"/>
+<text x="437.0" y="674.0" font-size="13" fill="#0b0b0b">3.32</text>
+<text x="160" y="714.0" font-size="14" fill="#52514e" text-anchor="end">Polars</text>
+<text x="178" y="714.0" font-size="13" fill="#0b0b0b">killed in 3 of 3 runs, at 4.50 to 4.69 GiB</text>
+<text x="160" y="748.0" font-size="14" fill="#52514e" text-anchor="end">Spark</text>
+<text x="160" y="763.0" font-size="12" fill="#898781" text-anchor="end">2 of 3 finished</text>
+<path d="M170,740.0 H451.5 Q455.5,740.0 455.5,744.0 V754.0 Q455.5,758.0 451.5,758.0 H170 Z" fill="#898781"/>
+<text x="463.5" y="754.0" font-size="13" fill="#0b0b0b">3.66</text>
+<line x1="521.0" y1="523" x2="521.0" y2="769" stroke="#d03b3b" stroke-width="2" stroke-dasharray="5 4"/>
+<text x="620" y="511" font-size="18" font-weight="600" fill="#0b0b0b">q4_highcard_agg</text>
+<line x1="750.0" y1="529" x2="750.0" y2="769" stroke="#c3c2b7" stroke-width="1"/>
+<text x="750.0" y="789" font-size="13" fill="#898781" text-anchor="middle">0</text>
+<line x1="828.0" y1="529" x2="828.0" y2="769" stroke="#e1e0d9" stroke-width="1"/>
+<text x="828.0" y="789" font-size="13" fill="#898781" text-anchor="middle">1</text>
+<line x1="906.0" y1="529" x2="906.0" y2="769" stroke="#e1e0d9" stroke-width="1"/>
+<text x="906.0" y="789" font-size="13" fill="#898781" text-anchor="middle">2</text>
+<line x1="984.0" y1="529" x2="984.0" y2="769" stroke="#e1e0d9" stroke-width="1"/>
+<text x="984.0" y="789" font-size="13" fill="#898781" text-anchor="middle">3</text>
+<line x1="1062.0" y1="529" x2="1062.0" y2="769" stroke="#e1e0d9" stroke-width="1"/>
+<text x="1062.0" y="789" font-size="13" fill="#898781" text-anchor="middle">4</text>
+<line x1="1140.0" y1="529" x2="1140.0" y2="769" stroke="#e1e0d9" stroke-width="1"/>
+<text x="1140.0" y="789" font-size="13" fill="#898781" text-anchor="middle">5</text>
+<text x="740" y="554.0" font-size="14" fill="#52514e" text-anchor="end">sqe-parquet</text>
+<path d="M750,540.0 H904.3 Q908.3,540.0 908.3,544.0 V554.0 Q908.3,558.0 904.3,558.0 H750 Z" fill="#2a78d6"/>
+<text x="916.3" y="554.0" font-size="13" fill="#0b0b0b">2.03</text>
+<text x="740" y="594.0" font-size="14" fill="#52514e" text-anchor="end">sqe-iceberg</text>
+<path d="M750,580.0 H884.1 Q888.1,580.0 888.1,584.0 V594.0 Q888.1,598.0 884.1,598.0 H750 Z" fill="#2a78d6"/>
+<text x="896.1" y="594.0" font-size="13" fill="#0b0b0b">1.77</text>
+<text x="740" y="634.0" font-size="14" fill="#52514e" text-anchor="end">sqe-polaris</text>
+<path d="M750,620.0 H988.6 Q992.6,620.0 992.6,624.0 V634.0 Q992.6,638.0 988.6,638.0 H750 Z" fill="#2a78d6"/>
+<text x="1000.6" y="634.0" font-size="13" fill="#0b0b0b">3.11</text>
+<text x="740" y="674.0" font-size="14" fill="#52514e" text-anchor="end">DuckDB</text>
+<path d="M750,660.0 H1001.1 Q1005.1,660.0 1005.1,664.0 V674.0 Q1005.1,678.0 1001.1,678.0 H750 Z" fill="#898781"/>
+<text x="1013.1" y="674.0" font-size="13" fill="#0b0b0b">3.27</text>
+<text x="740" y="708.0" font-size="14" fill="#52514e" text-anchor="end">Polars</text>
+<text x="740" y="723.0" font-size="12" fill="#898781" text-anchor="end">1 of 3 finished</text>
+<path d="M750,700.0 H1057.2 Q1061.2,700.0 1061.2,704.0 V714.0 Q1061.2,718.0 1057.2,718.0 H750 Z" fill="#898781"/>
+<text x="1069.2" y="714.0" font-size="13" fill="#0b0b0b">3.99</text>
+<text x="740" y="754.0" font-size="14" fill="#52514e" text-anchor="end">Spark</text>
+<path d="M750,740.0 H1028.4 Q1032.4,740.0 1032.4,744.0 V754.0 Q1032.4,758.0 1028.4,758.0 H750 Z" fill="#898781"/>
+<text x="1040.4" y="754.0" font-size="13" fill="#0b0b0b">3.62</text>
+<line x1="1101.0" y1="523" x2="1101.0" y2="769" stroke="#d03b3b" stroke-width="2" stroke-dasharray="5 4"/>
+<text x="40" y="821" font-size="13" fill="#898781">engine-bench, 3 runs per cell, 8 threads, 3 GB memory setting (Polars: defaults). Apple M3 Pro, 36 GiB. Axis in GiB.</text>
+</svg>

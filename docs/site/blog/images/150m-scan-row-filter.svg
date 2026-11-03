@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1290" height="600" viewBox="0 0 1290 600" font-family="Helvetica Neue, Helvetica, Arial, sans-serif">
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#52514e"/></marker></defs>
+<rect width="1290" height="600" fill="#fcfcfb"/>
+<text x="40" y="52" font-size="26" font-weight="600" fill="#0b0b0b">Where the Iceberg scan evaluates the WHERE clause</text>
+<text x="40" y="82" font-size="16" fill="#52514e">q2 variant with status = 'cancelled' (8% of 150M rows), Polaris table, one coordinator. Numbers from EXPLAIN ANALYZE and peak RSS.</text>
+<text x="40" y="199.0" font-size="20" font-weight="600" fill="#0b0b0b">Before</text>
+<rect x="160" y="140" width="205" height="104" rx="8" fill="#ffffff" stroke="#c3c2b7" stroke-width="1.5"/>
+<text x="174" y="168" font-size="16" font-weight="600" fill="#0b0b0b">Prune</text>
+<text x="174" y="192" font-size="14" fill="#52514e">files, row groups, pages</text>
+<text x="174" y="212" font-size="14" fill="#52514e">stats, bloom, page index</text>
+<text x="174" y="232" font-size="14" fill="#52514e">using the predicate</text>
+<rect x="465" y="140" width="205" height="104" rx="8" fill="#eaf2fc" stroke="#2a78d6" stroke-width="2"/>
+<text x="479" y="168" font-size="16" font-weight="600" fill="#0b0b0b">Decode + RowFilter</text>
+<text x="479" y="192" font-size="14" fill="#52514e">status = 'cancelled'</text>
+<text x="479" y="212" font-size="14" fill="#52514e">+ equality deletes</text>
+<text x="479" y="232" font-size="14" fill="#52514e">+ join runtime filter</text>
+<line x1="365" y1="192.0" x2="463" y2="192.0" stroke="#52514e" stroke-width="2" marker-end="url(#ah)"/>
+<rect x="770" y="140" width="205" height="104" rx="8" fill="#ffffff" stroke="#c3c2b7" stroke-width="1.5"/>
+<text x="784" y="168" font-size="16" font-weight="600" fill="#0b0b0b">FilterExec</text>
+<text x="784" y="192" font-size="14" fill="#52514e">status = 'cancelled'</text>
+<text x="784" y="212" font-size="14" fill="#52514e">again, on 12.0M rows</text>
+<text x="784" y="232" font-size="14" fill="#52514e">22 ms</text>
+<line x1="670" y1="192.0" x2="768" y2="192.0" stroke="#52514e" stroke-width="2" marker-end="url(#ah)"/>
+<text x="720.0" y="182.0" font-size="13" fill="#0b0b0b" text-anchor="middle">12.0M rows</text>
+<rect x="1045" y="140" width="205" height="104" rx="8" fill="#ffffff" stroke="#c3c2b7" stroke-width="1.5"/>
+<text x="1059" y="168" font-size="16" font-weight="600" fill="#0b0b0b">Aggregate</text>
+<text x="1059" y="192" font-size="14" fill="#52514e">group by category, brand</text>
+<line x1="975" y1="192.0" x2="1043" y2="192.0" stroke="#52514e" stroke-width="2" marker-end="url(#ah)"/>
+<text x="160" y="278" font-size="15" fill="#0b0b0b">Peak RSS 1.90 to 1.92 GiB</text>
+<text x="40" y="419.0" font-size="20" font-weight="600" fill="#0b0b0b">After</text>
+<rect x="160" y="360" width="205" height="104" rx="8" fill="#ffffff" stroke="#c3c2b7" stroke-width="1.5"/>
+<text x="174" y="388" font-size="16" font-weight="600" fill="#0b0b0b">Prune</text>
+<text x="174" y="412" font-size="14" fill="#52514e">files, row groups, pages</text>
+<text x="174" y="432" font-size="14" fill="#52514e">stats, bloom, page index</text>
+<text x="174" y="452" font-size="14" fill="#52514e">using the predicate</text>
+<rect x="465" y="360" width="205" height="104" rx="8" fill="#eaf2fc" stroke="#2a78d6" stroke-width="2"/>
+<text x="479" y="388" font-size="16" font-weight="600" fill="#0b0b0b">Decode + RowFilter</text>
+<text x="479" y="412" font-size="14" fill="#52514e">equality deletes</text>
+<text x="479" y="432" font-size="14" fill="#52514e">+ join runtime filter</text>
+<text x="479" y="452" font-size="14" fill="#52514e">(only when present)</text>
+<line x1="365" y1="412.0" x2="463" y2="412.0" stroke="#52514e" stroke-width="2" marker-end="url(#ah)"/>
+<rect x="770" y="360" width="205" height="104" rx="8" fill="#ffffff" stroke="#c3c2b7" stroke-width="1.5"/>
+<text x="784" y="388" font-size="16" font-weight="600" fill="#0b0b0b">FilterExec</text>
+<text x="784" y="412" font-size="14" fill="#52514e">status = 'cancelled'</text>
+<text x="784" y="432" font-size="14" fill="#52514e">on 150M rows</text>
+<text x="784" y="452" font-size="14" fill="#52514e">868 ms</text>
+<line x1="670" y1="412.0" x2="768" y2="412.0" stroke="#52514e" stroke-width="2" marker-end="url(#ah)"/>
+<text x="720.0" y="402.0" font-size="13" fill="#0b0b0b" text-anchor="middle">150M rows</text>
+<rect x="1045" y="360" width="205" height="104" rx="8" fill="#ffffff" stroke="#c3c2b7" stroke-width="1.5"/>
+<text x="1059" y="388" font-size="16" font-weight="600" fill="#0b0b0b">Aggregate</text>
+<text x="1059" y="412" font-size="14" fill="#52514e">group by category, brand</text>
+<line x1="975" y1="412.0" x2="1043" y2="412.0" stroke="#52514e" stroke-width="2" marker-end="url(#ah)"/>
+<text x="160" y="498" font-size="15" fill="#0b0b0b">Peak RSS 1.20 to 1.25 GiB</text>
+<line x1="40" y1="315" x2="1250" y2="315" stroke="#e1e0d9" stroke-width="1"/>
+<text x="40" y="550" font-size="14" fill="#52514e">Every filter SQE pushes into a scan is inexact, so the FilterExec always runs. Before, the RowFilter did the same check one step earlier</text>
+<text x="40" y="572" font-size="14" fill="#52514e">and held decoded predicate columns while it did. After, the scan decodes more rows and the FilterExec does more work, and the process uses 0.7 GiB less.</text>
+</svg>
