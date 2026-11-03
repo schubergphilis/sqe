@@ -551,6 +551,18 @@ impl CatalogOps {
         let namespace = view_ident.namespace();
         let name = view_ident.name();
         let select_sql = format!("{query}");
+        // The schema the body was planned in (the session's, as for any
+        // statement), recorded as the version's `default-namespace` so a
+        // reader resolves its unqualified names to the same tables
+        // (ai-portal-data#357).
+        let default_namespace = NamespaceIdent::new(
+            session
+                .default_schema
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("default")
+                .to_string(),
+        );
 
         info!(
             username = %session.user.username,
@@ -566,11 +578,25 @@ impl CatalogOps {
 
         if or_replace {
             session_catalog
-                .create_or_replace_view(namespace, name, &select_sql, schema_json, &properties)
+                .create_or_replace_view(
+                    namespace,
+                    name,
+                    &select_sql,
+                    &default_namespace,
+                    schema_json,
+                    &properties,
+                )
                 .await
         } else {
             session_catalog
-                .create_view(namespace, name, &select_sql, schema_json, &properties)
+                .create_view(
+                    namespace,
+                    name,
+                    &select_sql,
+                    &default_namespace,
+                    schema_json,
+                    &properties,
+                )
                 .await
         }
     }
