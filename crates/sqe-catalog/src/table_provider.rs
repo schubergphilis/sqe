@@ -658,6 +658,7 @@ mod snapshot_schema_tests {
             scan_fetch_ahead: Some(13),
             scan_memory_wait_ms: 17,
             string_view: false,
+            static_row_filter: true,
         };
         let provider = SqeTableProvider::try_new(evolved_table())
             .await
