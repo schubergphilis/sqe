@@ -109,6 +109,7 @@ mod variant_distributed;
 mod variant_e2e;
 mod variant_spark_interop;
 mod vended_credentials_e2e;
+mod view_planner_parity_e2e;
 mod view_policy_session_catalog_e2e;
 mod view_replace_nested_e2e;
 mod write_shape_e2e;

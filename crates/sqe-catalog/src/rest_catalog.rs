@@ -3122,6 +3122,27 @@ fn select_view_sql(
     ))
 }
 
+/// A view's SQL and the schema its unqualified table names resolve in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewBody {
+    pub sql: String,
+    /// The current version's `default-namespace`, levels joined by `.` as
+    /// the catalog provider names schemas; `default` when it is empty.
+    pub default_schema: String,
+}
+
+/// The schema a view body was written against: its current version's
+/// `default-namespace`. An empty one (the spec requires the field, not a
+/// level) keeps the schema every SQE session starts in.
+fn view_default_schema(metadata: &iceberg::spec::ViewMetadata) -> String {
+    let levels = metadata.current_version().default_namespace().as_ref();
+    if levels.is_empty() {
+        crate::schema_provider::VIEW_DEFAULT_SCHEMA.to_string()
+    } else {
+        levels.join(".")
+    }
+}
+
 /// `loadView` response body: the metadata document plus its location.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -3157,7 +3178,7 @@ fn sqe_view_version(
     version_id: i32,
     schema_id: i32,
     sql: &str,
-    namespace: &NamespaceIdent,
+    default_namespace: &NamespaceIdent,
     default_catalog: &str,
 ) -> sqe_core::Result<iceberg::spec::ViewVersion> {
     let representation: iceberg::spec::ViewRepresentation = iceberg::spec::SqlViewRepresentation {
@@ -3188,7 +3209,7 @@ fn sqe_view_version(
         .with_summary(summary)
         .with_representations(representations)
         .with_default_catalog(Some(default_catalog.to_string()))
-        .with_default_namespace(namespace.clone())
+        .with_default_namespace(default_namespace.clone())
         .build())
 }
 
@@ -3443,20 +3464,29 @@ impl SessionCatalog {
     /// `CreateViewRequest`: the schema parsed into [`iceberg::spec::Schema`]
     /// and one [`iceberg::spec::ViewVersion`] carrying a single `sqe`-dialect
     /// SQL representation, `default-catalog` = this warehouse and
-    /// `default-namespace` = the view's namespace.
+    /// `default-namespace` = `default_namespace`, the schema `sql` was
+    /// planned in (the creating session's), which is where a reader resolves
+    /// its unqualified names.
     #[instrument(skip(self, sql, schema), fields(namespace = ?namespace, view = %name, warehouse = %self.warehouse))]
     pub async fn create_view(
         &self,
         namespace: &NamespaceIdent,
         name: &str,
         sql: &str,
+        default_namespace: &NamespaceIdent,
         schema: &serde_json::Value,
         properties: &std::collections::HashMap<String, String>,
     ) -> sqe_core::Result<()> {
         self.require_rest_backend("create_view")?;
         let url = self.views_url(namespace).await;
         let schema = view_schema_from_json(schema, 0)?;
-        let version = sqe_view_version(1, schema.schema_id(), sql, namespace, &self.warehouse)?;
+        let version = sqe_view_version(
+            1,
+            schema.schema_id(),
+            sql,
+            default_namespace,
+            &self.warehouse,
+        )?;
         let body = serde_json::to_value(CreateViewRequest {
             name,
             schema: &schema,
@@ -3500,13 +3530,14 @@ impl SessionCatalog {
         namespace: &NamespaceIdent,
         name: &str,
         sql: &str,
+        default_namespace: &NamespaceIdent,
         schema: &serde_json::Value,
         properties: &std::collections::HashMap<String, String>,
     ) -> sqe_core::Result<()> {
         self.require_rest_backend("create_or_replace_view")?;
         let Some(existing) = self.load_view_metadata(namespace, name).await? else {
             return self
-                .create_view(namespace, name, sql, schema, properties)
+                .create_view(namespace, name, sql, default_namespace, schema, properties)
                 .await;
         };
 
@@ -3522,7 +3553,13 @@ impl SessionCatalog {
             .map_or(1, |id| id + 1);
         let schema = view_schema_from_json(schema, next_schema_id)?;
         let mut updates = view_replace_updates(&existing, schema, |schema_id| {
-            sqe_view_version(next_version_id, schema_id, sql, namespace, &self.warehouse)
+            sqe_view_version(
+                next_version_id,
+                schema_id,
+                sql,
+                default_namespace,
+                &self.warehouse,
+            )
         })?;
         if !properties.is_empty() {
             updates.push(iceberg::ViewUpdate::SetProperties {
@@ -3628,9 +3665,28 @@ impl SessionCatalog {
         namespace: &NamespaceIdent,
         name: &str,
     ) -> sqe_core::Result<Option<String>> {
+        Ok(self
+            .load_view_body(namespace, name)
+            .await?
+            .map(|body| body.sql))
+    }
+
+    /// [`Self::load_view_sql`] plus the schema the body's unqualified names
+    /// resolve in, from the version's `default-namespace` (Iceberg view
+    /// spec). Planning a body anywhere else reads a different table, or none
+    /// (ai-portal-data#357).
+    #[instrument(skip(self), fields(namespace = ?namespace, view = %name, warehouse = %self.warehouse))]
+    pub async fn load_view_body(
+        &self,
+        namespace: &NamespaceIdent,
+        name: &str,
+    ) -> sqe_core::Result<Option<ViewBody>> {
         self.require_rest_backend("load_view_sql")?;
         match self.load_view_metadata(namespace, name).await? {
-            Some(metadata) => select_view_sql(&metadata, name).map(Some),
+            Some(metadata) => Ok(Some(ViewBody {
+                sql: select_view_sql(&metadata, name)?,
+                default_schema: view_default_schema(&metadata),
+            })),
             None => Ok(None),
         }
     }
@@ -5840,11 +5896,11 @@ mod other_backend_tests {
 
         let errors = [
             session
-                .create_view(&sales(), "v", "SELECT 1", &schema, &props)
+                .create_view(&sales(), "v", "SELECT 1", &sales(), &schema, &props)
                 .await
                 .err(),
             session
-                .create_or_replace_view(&sales(), "v", "SELECT 1", &schema, &props)
+                .create_or_replace_view(&sales(), "v", "SELECT 1", &sales(), &schema, &props)
                 .await
                 .err(),
             session.list_views(&sales()).await.err(),
@@ -5974,7 +6030,8 @@ mod view_rest_tests {
 
     use super::{
         oauth2_identity, rest_catalog_token_fingerprint, select_view_sql, sqe_view_version,
-        view_replace_updates, view_schema_from_json, SessionCatalog, TableMetadataCache,
+        view_default_schema, view_replace_updates, view_schema_from_json, SessionCatalog,
+        TableMetadataCache,
     };
     use crate::circuit_breaker::CircuitBreaker;
 
@@ -6046,6 +6103,25 @@ mod view_rest_tests {
         );
         let md = metadata(2, &[("sqe", "SELECT 1 AS x")]);
         assert_eq!(select_view_sql(&md, "v").unwrap(), "SELECT 2 AS x");
+    }
+
+    /// A body's unqualified names resolve in the current version's
+    /// `default-namespace`, levels joined as the catalog names schemas; an
+    /// empty one keeps `default` (ai-portal-data#357).
+    #[test]
+    fn view_default_schema_is_the_current_versions_default_namespace() {
+        let with_namespace = |current: i32, v2_namespace: serde_json::Value| {
+            let mut doc = view_metadata_json(current, &[("sqe", "SELECT 1 AS x")]);
+            doc["versions"][0]["default-namespace"] = serde_json::json!(["pg3_gold__marts"]);
+            doc["versions"][1]["default-namespace"] = v2_namespace;
+            serde_json::from_value::<iceberg::spec::ViewMetadata>(doc).expect("valid view")
+        };
+        let md = with_namespace(1, serde_json::json!(["sales"]));
+        assert_eq!(view_default_schema(&md), "pg3_gold__marts");
+        let md = with_namespace(2, serde_json::json!(["a", "b"]));
+        assert_eq!(view_default_schema(&md), "a.b");
+        let md = with_namespace(2, serde_json::json!([]));
+        assert_eq!(view_default_schema(&md), "default");
     }
 
     #[test]
@@ -6130,6 +6206,7 @@ mod view_rest_tests {
                 &sales(),
                 "v",
                 "SELECT 1 AS x",
+                &NamespaceIdent::new("staging".to_string()),
                 &view_schema_json(),
                 &HashMap::from([("comment".to_string(), "c".to_string())]),
             )
@@ -6165,9 +6242,11 @@ mod view_rest_tests {
             "SELECT 1 AS x"
         );
         assert_eq!(body["view-version"]["default-catalog"], WAREHOUSE);
+        // The schema the body was planned in, not the view's own namespace
+        // (ai-portal-data#357).
         assert_eq!(
             body["view-version"]["default-namespace"],
-            serde_json::json!(["sales"])
+            serde_json::json!(["staging"])
         );
         assert_eq!(body["properties"]["comment"], "c");
         assert!(
@@ -6201,6 +6280,7 @@ mod view_rest_tests {
                 &sales(),
                 "v",
                 "SELECT 1",
+                &sales(),
                 &view_schema_json(),
                 &HashMap::new(),
             )
@@ -6421,6 +6501,7 @@ mod view_rest_tests {
                 &sales(),
                 "v",
                 "SELECT 3 AS x",
+                &sales(),
                 &view_schema_json(),
                 &HashMap::new(),
             )
@@ -6976,6 +7057,7 @@ mod rest_prefix_tests {
                 &NamespaceIdent::new("demo".to_string()),
                 "v",
                 "SELECT 1 AS x",
+                &NamespaceIdent::new("demo".to_string()),
                 &schema,
                 &Default::default(),
             )
