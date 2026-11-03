@@ -173,6 +173,9 @@ pub struct TableScanBuilder<'a> {
     /// SQE PATCH (string view): decode top-level strings as `Utf8View`,
     /// forwarded to the arrow reader.
     string_view: bool,
+    /// SQE PATCH (static row filter): the scan predicate as a per-row
+    /// `RowFilter`, forwarded to the arrow reader.
+    static_row_filter: bool,
 }
 
 impl<'a> TableScanBuilder<'a> {
@@ -203,6 +206,7 @@ impl<'a> TableScanBuilder<'a> {
             fetch_ahead: 0,
             row_group_pruner: None,
             string_view: false,
+            static_row_filter: true,
         }
     }
 
@@ -210,6 +214,14 @@ impl<'a> TableScanBuilder<'a> {
     /// `Utf8View`. See [`crate::arrow::ArrowReaderBuilder::with_string_view`].
     pub fn with_string_view(mut self, enabled: bool) -> Self {
         self.string_view = enabled;
+        self
+    }
+
+    /// SQE PATCH (static row filter): whether the scan predicate also filters
+    /// rows inside surviving row groups. See
+    /// [`crate::arrow::ArrowReaderBuilder::with_static_row_filter`].
+    pub fn with_static_row_filter(mut self, enabled: bool) -> Self {
+        self.static_row_filter = enabled;
         self
     }
 
@@ -473,6 +485,7 @@ impl<'a> TableScanBuilder<'a> {
                         fetch_ahead: self.fetch_ahead,
                         row_group_pruner: self.row_group_pruner.clone(),
                         string_view: self.string_view,
+                        static_row_filter: self.static_row_filter,
                     });
                 };
                 current_snapshot_id.clone()
@@ -566,6 +579,7 @@ impl<'a> TableScanBuilder<'a> {
             fetch_ahead: self.fetch_ahead,
             row_group_pruner: self.row_group_pruner,
             string_view: self.string_view,
+            static_row_filter: self.static_row_filter,
         })
     }
 }
@@ -627,6 +641,9 @@ pub struct TableScan {
     row_group_pruner: Option<Arc<dyn RowGroupPruner>>,
     /// SQE PATCH (string view): see [`TableScanBuilder::with_string_view`].
     string_view: bool,
+    /// SQE PATCH (static row filter): see
+    /// [`TableScanBuilder::with_static_row_filter`].
+    static_row_filter: bool,
 }
 
 impl TableScan {
@@ -797,7 +814,9 @@ impl TableScan {
                 // SQE PATCH (sqe#scan-fetch-pipeline)
                 .with_fetch_ahead(self.fetch_ahead)
                 // SQE PATCH (string view)
-                .with_string_view(self.string_view);
+                .with_string_view(self.string_view)
+                // SQE PATCH (static row filter)
+                .with_static_row_filter(self.static_row_filter);
 
         if let Some(batch_size) = self.batch_size {
             arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);
@@ -3181,6 +3200,52 @@ pub mod tests {
             Some(Literal::long(200)),
             Some(Literal::long(300)),
         ]);
+    }
+
+    /// SQE PATCH (static row filter): with the flag off the predicate no
+    /// longer filters rows inside a surviving row group, so the scan returns
+    /// a superset holding every matching row; with it on (the default) only
+    /// matching rows come back.
+    #[tokio::test]
+    async fn test_static_row_filter_off_returns_superset() {
+        async fn y_values(fixture: &TableTestFixture, static_row_filter: bool) -> Vec<i64> {
+            let table_scan = fixture
+                .table
+                .scan()
+                .with_filter(Reference::new("y").less_than(Datum::long(3)))
+                .with_static_row_filter(static_row_filter)
+                .build()
+                .unwrap();
+            let batches: Vec<_> = table_scan
+                .to_arrow()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            batches
+                .iter()
+                .flat_map(|b| {
+                    let ys = b.column_by_name("y").unwrap();
+                    let ys = ys.as_any().downcast_ref::<Int64Array>().unwrap();
+                    ys.values().to_vec()
+                })
+                .collect()
+        }
+
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        let filtered = y_values(&fixture, true).await;
+        assert!(!filtered.is_empty());
+        assert!(filtered.iter().all(|y| *y < 3));
+
+        let unfiltered = y_values(&fixture, false).await;
+        assert!(unfiltered.len() > filtered.len());
+        assert_eq!(
+            unfiltered.iter().filter(|y| **y < 3).count(),
+            filtered.len()
+        );
     }
 
     #[tokio::test]

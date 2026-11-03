@@ -156,6 +156,11 @@ pub struct ScanTuning {
     /// provider's schema carries the choice; the scan reads views exactly
     /// when its projected schema holds one.
     pub string_view: bool,
+    /// Evaluate the scan's static predicate as a per-row parquet `RowFilter`
+    /// too (`[catalog] scan_static_row_filter`). Off: the predicate prunes
+    /// row groups and pages, and the `FilterExec` above the scan (every
+    /// pushed filter is `Inexact`) filters rows.
+    pub static_row_filter: bool,
 }
 
 impl Default for ScanTuning {
@@ -172,6 +177,7 @@ impl Default for ScanTuning {
             scan_fetch_ahead: None,
             scan_memory_wait_ms: DEFAULT_SCAN_MEMORY_WAIT_MS,
             string_view: true,
+            static_row_filter: false,
         }
     }
 }
@@ -195,6 +201,7 @@ impl ScanTuning {
             scan_fetch_ahead: catalog.scan_fetch_ahead,
             scan_memory_wait_ms: catalog.scan_memory_wait_ms,
             string_view: catalog.string_view,
+            static_row_filter: catalog.scan_static_row_filter,
         }
         .normalized()
     }
@@ -337,6 +344,9 @@ pub struct IcebergScanExec {
     /// the query's quota had room (#788). Sourced from `[catalog]
     /// scan_memory_wait_ms`. 0 fails fast. Default 30000.
     scan_memory_wait_ms: u64,
+    /// Whether the reader also filters rows with the static predicate
+    /// (`[catalog] scan_static_row_filter`). See [`ScanTuning::static_row_filter`].
+    static_row_filter: bool,
     /// Reloads `table` from its catalog as the same principal, for fresh
     /// vended credentials when a distributed scan outlives its keys. `None`
     /// for tables not loaded through a session catalog.
@@ -596,6 +606,7 @@ impl IcebergScanExec {
             fetch_permits,
             fetch_budget: Arc::new(std::sync::OnceLock::new()),
             scan_memory_wait_ms: tuning.scan_memory_wait_ms,
+            static_row_filter: tuning.static_row_filter,
             table_reloader: None,
             static_plan: Arc::new(tokio::sync::OnceCell::new()),
             split_assignments: Arc::new(tokio::sync::OnceCell::new()),
@@ -621,7 +632,8 @@ impl IcebergScanExec {
                 tuning.runtime_filter_bloom_probe,
                 tuning.runtime_filter_bloom_max_values,
             )
-            .with_scan_memory_wait_ms(tuning.scan_memory_wait_ms);
+            .with_scan_memory_wait_ms(tuning.scan_memory_wait_ms)
+            .with_static_row_filter(tuning.static_row_filter);
         if let Some(fetch_ahead) = tuning.scan_fetch_ahead {
             exec = exec.with_scan_fetch_ahead(fetch_ahead);
         }
@@ -643,6 +655,7 @@ impl IcebergScanExec {
             scan_fetch_ahead: Some(self.scan_fetch_ahead),
             scan_memory_wait_ms: self.scan_memory_wait_ms,
             string_view: self.reads_string_view(),
+            static_row_filter: self.static_row_filter,
         }
     }
 
@@ -734,6 +747,15 @@ impl IcebergScanExec {
     #[must_use = "with_scan_memory_wait_ms consumes self; bind the returned scan"]
     pub fn with_scan_memory_wait_ms(mut self, wait_ms: u64) -> Self {
         self.scan_memory_wait_ms = wait_ms;
+        self
+    }
+
+    /// Whether the reader also filters rows with the static predicate
+    /// (`[catalog] scan_static_row_filter`). Pushed filters are `Inexact`, so
+    /// the `FilterExec` above the scan keeps results the same either way.
+    #[must_use = "with_static_row_filter consumes self; bind the returned scan"]
+    pub fn with_static_row_filter(mut self, enabled: bool) -> Self {
+        self.static_row_filter = enabled;
         self
     }
 
@@ -945,6 +967,7 @@ impl IcebergScanExec {
             fetch_permits: self.fetch_permits.clone(),
             fetch_budget: self.fetch_budget.clone(),
             scan_memory_wait_ms: self.scan_memory_wait_ms,
+            static_row_filter: self.static_row_filter,
             table_reloader: self.table_reloader.clone(),
             static_plan: self.static_plan.clone(),
             split_assignments: self.split_assignments.clone(),
@@ -1543,6 +1566,7 @@ impl ExecutionPlan for IcebergScanExec {
         // Read strings as `Utf8View` exactly when the declared schema does:
         // the provider schema stays the one source of truth for the layout.
         let string_view = self.reads_string_view();
+        let static_row_filter = self.static_row_filter;
         let projection = self.projection.clone();
         let predicates = self.predicates.clone();
         let snapshot_id = self.snapshot_id;
@@ -2237,6 +2261,8 @@ impl ExecutionPlan for IcebergScanExec {
             // the decode permits. 0 keeps single-stage admission.
             sb = sb.with_fetch_ahead(scan_fetch_ahead);
             sb = sb.with_string_view(string_view);
+            // The static predicate prunes; the FilterExec above filters rows.
+            sb = sb.with_static_row_filter(static_row_filter);
             // Bloom-filter row-group probing (issue #369): the vendored
             // reader tests sealed runtime-filter key sets against parquet
             // SBBFs and prunes row groups where every key is bloom-negative.

@@ -2893,6 +2893,18 @@ pub struct CatalogConfig {
     /// Default: true.
     #[serde(default = "default_true")]
     pub string_view: bool,
+    /// Also evaluate a scan's own `WHERE` predicate as a per-row parquet
+    /// `RowFilter` inside each surviving row group. Off by default, like
+    /// DataFusion's `pushdown_filters`: the predicate still prunes files, row
+    /// groups and pages, and the filter above the scan drops the rest. On a
+    /// 150M-row Polaris table the `RowFilter` raised peak memory by 55-110%
+    /// whether the predicate kept 92% or 8% of the rows, and no query got
+    /// faster. Equality deletes and join runtime filters are applied per row
+    /// either way.
+    ///
+    /// Default: false.
+    #[serde(default)]
+    pub scan_static_row_filter: bool,
     /// Two-tier dynamic runtime-filter pushdown tuning (issue #132).
     #[serde(default)]
     pub runtime_filters: RuntimeFiltersConfig,
@@ -7974,6 +7986,7 @@ partial_progress_batch = 5
                 scan_fetch_ahead: None,
                 scan_memory_wait_ms: default_scan_memory_wait_ms(),
                 string_view: true,
+                scan_static_row_filter: false,
                 runtime_filters: RuntimeFiltersConfig::default(),
                 auth: None,
                 storage: None,
@@ -9485,6 +9498,7 @@ s3_secret_key = "configured-secret"
                 scan_fetch_ahead: None,
                 scan_memory_wait_ms: default_scan_memory_wait_ms(),
                 string_view: true,
+                scan_static_row_filter: false,
                 runtime_filters: RuntimeFiltersConfig::default(),
                 auth: None,
                 storage: None,
@@ -9525,6 +9539,7 @@ s3_secret_key = "configured-secret"
                     scan_fetch_ahead: None,
                     scan_memory_wait_ms: default_scan_memory_wait_ms(),
                     string_view: true,
+                    scan_static_row_filter: false,
                     runtime_filters: RuntimeFiltersConfig::default(),
                     auth: None,
                     storage: None,
@@ -9572,6 +9587,7 @@ s3_secret_key = "configured-secret"
                 scan_fetch_ahead: None,
                 scan_memory_wait_ms: default_scan_memory_wait_ms(),
                 string_view: true,
+                scan_static_row_filter: false,
                 runtime_filters: RuntimeFiltersConfig::default(),
                 auth: None,
                 storage: None,
