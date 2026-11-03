@@ -133,6 +133,41 @@ pub fn engine_session_config() -> SessionConfig {
         .set_bool("datafusion.execution.parquet.reorder_filters", true)
 }
 
+/// The functions every SQE statement plans with on top of DataFusion's:
+/// Trino's library (`year`, `if`, `date_parse`, ...), the JSON functions,
+/// variant access and `ST_*`. The coordinator's session and every context
+/// that plans a view body register this one set, so a view plans with the
+/// names of the statement that reads it (ai-portal-data#359). Functions bound
+/// to the session's user (`current_user()`) are not in it.
+pub fn register_engine_functions(ctx: &mut SessionContext) -> Result<()> {
+    sqe_trino_functions::register_trino_functions(ctx);
+    sqe_trino_functions::register_extended_trino_functions(ctx);
+    datafusion_functions_json::register_all(ctx)?;
+    // A JSON column of a v3 table is a variant; the json_* functions read it
+    // as its JSON text (#849).
+    sqe_core::variant_json_args::accept_variant_in_json_functions(ctx);
+    // Typed field access that skips the JSON text (#857).
+    sqe_core::variant_get::register_variant_functions(ctx);
+    // ST_* over WKB geometry values (#863).
+    sqe_geo::register_geo_functions(ctx);
+    Ok(())
+}
+
+/// The context a view body is planned in: the engine's flags, rules and
+/// function set, with `catalog.schema` as the default for unqualified names.
+/// The plan is only planned and optimized here; it runs in the reading
+/// session, so the runtime is a throwaway.
+pub fn view_planning_context(catalog: &str, schema: &str) -> Result<SessionContext> {
+    let mut ctx = engine_context(
+        engine_session_config()
+            .with_information_schema(true)
+            .with_default_catalog_and_schema(catalog, schema),
+        Arc::new(RuntimeEnv::default()),
+    );
+    register_engine_functions(&mut ctx)?;
+    Ok(ctx)
+}
+
 /// SQE sends ROLLUP / CUBE / GROUPING SETS to DataFusion as written; these
 /// pin the empty-input semantics that SQE used to patch with a rewrite
 /// (apache/datafusion#21570). Run on the engine config with several input
