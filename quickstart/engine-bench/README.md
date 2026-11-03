@@ -21,6 +21,9 @@ runners. Every engine's answer is checked against DuckDB's.
 | `sqe-polaris` | A native `sqe-server` coordinator; the client is Arrow Flight SQL (ADBC) | Iceberg tables in the Polaris REST catalog, data in S3 (RustFS in Docker). |
 | `duckdb`, `polars` | Upstream's `run_engine.py` | The generated Parquet files. |
 | `spark` (opt-in) | Upstream's `run_engine.py`, PySpark local mode | The generated Parquet files. |
+| `sqe-embedded-polaris` (opt-in) | `sqe-cli --embedded`, `ATTACH ... (TYPE iceberg_rest)` to Polaris | The same Polaris tables as `sqe-polaris`, with no server. |
+| `duckdb-polaris` (opt-in) | `run_engine_polaris.py`: DuckDB's `iceberg` extension, `ATTACH` to Polaris | The same Polaris tables. |
+| `polars-polaris` (opt-in) | `run_engine_polaris.py`: `pl.scan_iceberg` on tables pyiceberg loads from Polaris | The same Polaris tables. |
 
 ## What you get
 
@@ -30,6 +33,7 @@ runners. Every engine's answer is checked against DuckDB's.
 | `bench.py` | The runner. One fresh process per run, peak RSS of the whole process tree sampled every 50 ms, a kill above 4.5 GiB, the same as upstream's `bench.py`. Subcommands `load`, `run`, `validate`, `summary`. |
 | `docker-compose.yml` + `bootstrap.sh` | RustFS (S3) and Polaris 1.7.0, and a one-shot that creates the `bench` catalog and grants the root principal `CATALOG_MANAGE_CONTENT`. |
 | `sqe.toml.tmpl` | The coordinator config for the Polaris leg, rendered to `.work/sqe.toml`. |
+| `run_engine_polaris.py` | DuckDB and Polars reading the Polaris tables over the Iceberg REST API (`POLARIS_READERS=1`). |
 
 Only the catalog and the object store run in Docker. SQE runs natively in every
 mode, so its timings and memory are measured the same way as DuckDB's and
@@ -79,6 +83,9 @@ ENGINES=sqe-polaris,duckdb ./run.sh
 WITH_SPARK=1 ./run.sh             # add Spark
 MAX_BUSY_PCT=50 ./run.sh          # a laptop that never idles below 30% CPU
 STORAGE=s3 ./run.sh               # every engine reads the Parquet from RustFS (S3); writes OUTPUT-s3.md
+POLARIS_READERS=1 ./run.sh        # add the three *-polaris readers; writes OUTPUT-polaris.md
+BUDGET_FOR=polars=8 ./run.sh      # a per-engine kill threshold (see below)
+OUTPUT=/tmp/x.md ./run.sh         # write the captured output somewhere else
 ./run.sh --check                  # run, then assert every run finished and every answer matches
 ./run.sh --down                   # stop Polaris + RustFS and drop the volume
 ./run.sh --clean                  # --down, and delete .work/
@@ -112,12 +119,38 @@ Each record carries `storage` and `s3_read_gb`, the bytes RustFS sent during
 that run, read from the container's network counters. The results go to
 `OUTPUT-s3.md`, next to the local `OUTPUT.md`.
 
+### Every engine on one Iceberg REST catalog
+
+`POLARIS_READERS=1` adds three engines that read the Iceberg tables
+`bench.py load` wrote to Polaris, `polaris.bench_<size>.sales` and
+`.products`, so they read the same snapshot `sqe-polaris` reads:
+
+- `sqe-embedded-polaris`: `sqe-cli --embedded` with `CREATE SECRET (TYPE
+  oauth2)` and `ATTACH '<catalog uri>' AS polaris (TYPE iceberg_rest, ...)`.
+  The ATTACH carries the S3 endpoint and keys (`S3_ENDPOINT`, `S3_REGION`,
+  `S3_PATH_STYLE`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`): an attached catalog does
+  not take them from `SQE_STORAGE__*`.
+- `duckdb-polaris`: DuckDB's `iceberg` extension with an `iceberg` secret
+  (OAuth2 client credentials) and an `s3` secret, `ATTACH 'bench' AS polaris
+  (TYPE iceberg, ..., ACCESS_DELEGATION_MODE 'none')`.
+- `polars-polaris`: pyiceberg's REST catalog loads the tables and
+  `pl.scan_iceberg` reads them, planned by `polars-iceberg` (the
+  `polars[iceberg]` extra). Polars' native reader gets the S3 settings as
+  `storage_options`; it does not take them from the pyiceberg FileIO.
+
+Polaris here has no STS, so none of them asks for vended credentials: they all
+read RustFS with the static keys from `.env`. The timed window is the same for
+all four: opening the catalog (token, `/v1/config`) is setup; loading the
+table metadata, scanning, computing and writing the answer is `query_s`. These
+runs are recorded as `storage: s3` with `s3_read_gb`, whatever `STORAGE` says,
+and the results go to `OUTPUT-polaris.md` (or `OUTPUT-s3-polaris.md`).
+
 ### Per-engine kill threshold
 
 The watchdog kills any process tree above `--budget-gib` (4.5 GiB, upstream's
 cap). `bench.py run --budget-for polars=8` raises that threshold for one
 engine, for instance to see whether Polars, which has no memory limit of its
-own, finishes the window query at all. `--mem` (the 3 GB the other engines
+own, finishes the window query at all; `run.sh` passes `BUDGET_FOR` through. `--mem` (the 3 GB the other engines
 are told to stay under) is unchanged. A run with an exception carries
 `budget_gib` in its record, so it is never mistaken for a capped run.
 
@@ -151,6 +184,8 @@ How each SQE engine runs one query:
   RSS figure covers server and client together. The server's own start-up is
   recorded as `server_start_s` and is not in `wall_s`, since the other engines
   have no server to start.
+- **`sqe-embedded-polaris`**: the `sqe-parquet` script with an `ATTACH` to
+  Polaris in front and the two views over `polaris.bench_<size>.*`.
 
 ## Configuration explained
 
