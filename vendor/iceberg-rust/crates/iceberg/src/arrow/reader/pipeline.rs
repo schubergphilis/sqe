@@ -89,6 +89,7 @@ impl ArrowReader {
             bloom_probe_max_values: sqe.bloom_probe_max_values,
             row_group_pruner: sqe.row_group_pruner.clone(),
             string_view: sqe.string_view,
+            static_row_filter: sqe.static_row_filter,
         };
 
         // Fast-path for single concurrency to avoid overhead of try_flatten_unordered.
@@ -407,6 +408,9 @@ struct FileScanTaskReader {
     row_group_pruner: Option<Arc<dyn RowGroupPruner>>,
     /// SQE PATCH (string view): decode top-level strings as `Utf8View`.
     string_view: bool,
+    /// SQE PATCH (static row filter): see
+    /// [`crate::arrow::ArrowReaderBuilder::with_static_row_filter`].
+    static_row_filter: bool,
 }
 
 impl FileScanTaskReader {
@@ -874,6 +878,22 @@ impl FileScanTaskReader {
         // AND the task predicate, the equality-delete predicate and the dynamic
         // predicate into one filter for the min/max, bloom, page-index and
         // row-filter pruning paths.
+        //
+        // SQE PATCH (static row filter): the per-row `RowFilter` takes the
+        // task predicate only when `static_row_filter` is on. Equality
+        // deletes always go in (the `RowFilter` is what drops deleted rows),
+        // and so does the dynamic predicate (join keys, selective by
+        // construction). Pruning keeps using all three.
+        let row_filter_predicate = if self.static_row_filter {
+            None
+        } else {
+            Some(
+                [delete_predicate.clone(), dynamic_bound_predicate.clone()]
+                    .into_iter()
+                    .flatten()
+                    .reduce(BoundPredicate::and),
+            )
+        };
         let final_predicate = [
             task.predicate().cloned(),
             delete_predicate,
@@ -945,13 +965,41 @@ impl FileScanTaskReader {
                 use_position_fallback,
             )?;
 
-            let row_filter = ArrowReader::get_row_filter(
-                &predicate,
-                record_batch_stream_builder.parquet_schema(),
-                &iceberg_field_ids,
-                &field_id_map,
-            )?;
-            record_batch_stream_builder = record_batch_stream_builder.with_row_filter(row_filter);
+            // `None`: the whole predicate filters rows. `Some(None)`: no
+            // `RowFilter`. `Some(Some(p))`: only deletes and dynamic, with
+            // their own decode mask so the static predicate's columns are
+            // not decoded twice.
+            match row_filter_predicate {
+                None => {
+                    let row_filter = ArrowReader::get_row_filter(
+                        &predicate,
+                        record_batch_stream_builder.parquet_schema(),
+                        &iceberg_field_ids,
+                        &field_id_map,
+                    )?;
+                    record_batch_stream_builder =
+                        record_batch_stream_builder.with_row_filter(row_filter);
+                }
+                Some(None) => {}
+                Some(Some(row_predicate)) => {
+                    let row_predicate = row_predicate.rewrite_not();
+                    let (row_field_ids, row_field_id_map) =
+                        ArrowReader::build_field_id_set_and_map(
+                            record_batch_stream_builder.parquet_schema(),
+                            record_batch_stream_builder.schema(),
+                            &row_predicate,
+                            use_position_fallback,
+                        )?;
+                    let row_filter = ArrowReader::get_row_filter(
+                        &row_predicate,
+                        record_batch_stream_builder.parquet_schema(),
+                        &row_field_ids,
+                        &row_field_id_map,
+                    )?;
+                    record_batch_stream_builder =
+                        record_batch_stream_builder.with_row_filter(row_filter);
+                }
+            }
 
             if self.row_group_filtering_enabled {
                 let predicate_filtered_row_groups = ArrowReader::get_selected_row_group_indices(
