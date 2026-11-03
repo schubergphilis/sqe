@@ -475,6 +475,7 @@ warehouse = "{warehouse}"
                 &ns,
                 "should_not_create",
                 "SELECT 1",
+                &ns,
                 &serde_json::json!({}),
                 &std::collections::HashMap::new(),
             )
