@@ -79,6 +79,7 @@ pub fn iceberg::arrow::ArrowReaderBuilder::with_range_coalesce_bytes(self, range
 pub fn iceberg::arrow::ArrowReaderBuilder::with_range_fetch_concurrency(self, range_fetch_concurrency: usize) -> Self
 pub fn iceberg::arrow::ArrowReaderBuilder::with_row_group_filtering_enabled(self, row_group_filtering_enabled: bool) -> Self
 pub fn iceberg::arrow::ArrowReaderBuilder::with_row_selection_enabled(self, row_selection_enabled: bool) -> Self
+pub fn iceberg::arrow::ArrowReaderBuilder::with_static_row_filter(self, enabled: bool) -> Self
 pub struct iceberg::arrow::PartitionValueCalculator
 impl iceberg::arrow::PartitionValueCalculator
 pub fn iceberg::arrow::PartitionValueCalculator::calculate(&self, batch: &arrow_array::record_batch::RecordBatch) -> iceberg::Result<arrow_array::array::ArrayRef>
@@ -1373,6 +1374,7 @@ pub fn iceberg::scan::TableScanBuilder<'a>::with_filter(self, predicate: iceberg
 pub fn iceberg::scan::TableScanBuilder<'a>::with_manifest_entry_concurrency_limit(self, limit: usize) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::with_row_group_filtering_enabled(self, row_group_filtering_enabled: bool) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::with_row_selection_enabled(self, row_selection_enabled: bool) -> Self
+pub fn iceberg::scan::TableScanBuilder<'a>::with_static_row_filter(self, enabled: bool) -> Self
 pub type iceberg::scan::ArrowRecordBatchStream = futures_core::stream::BoxStream<'static, iceberg::Result<arrow_array::record_batch::RecordBatch>>
 pub type iceberg::scan::FileScanTaskStream = futures_core::stream::BoxStream<'static, iceberg::Result<iceberg::scan::FileScanTask>>
 pub mod iceberg::sensitive

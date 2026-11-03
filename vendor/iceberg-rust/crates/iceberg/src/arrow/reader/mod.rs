@@ -109,6 +109,9 @@ pub(crate) struct SqeReadOptions {
     pub(crate) row_group_pruner: Option<Arc<dyn RowGroupPruner>>,
     /// SQE PATCH (string view): decode top-level string columns as `Utf8View`.
     pub(crate) string_view: bool,
+    /// SQE PATCH (static row filter): evaluate the scan's own predicate as
+    /// a per-row parquet `RowFilter`.
+    pub(crate) static_row_filter: bool,
 }
 
 impl Default for SqeReadOptions {
@@ -123,6 +126,7 @@ impl Default for SqeReadOptions {
             fetch_ahead: 0,
             row_group_pruner: None,
             string_view: false,
+            static_row_filter: true,
         }
     }
 }
@@ -240,6 +244,22 @@ impl ArrowReaderBuilder {
     /// apply. Nested string members keep `Utf8`.
     pub fn with_string_view(mut self, enabled: bool) -> Self {
         self.sqe.string_view = enabled;
+        self
+    }
+
+    /// SQE PATCH (static row filter): whether the task's own predicate also
+    /// becomes a per-row parquet `RowFilter` (default `true`, as upstream).
+    ///
+    /// With `false` the predicate still prunes row groups, pages and bloom
+    /// probes, but rows inside surviving row groups come back unfiltered, so
+    /// the caller must apply the predicate itself (DataFusion's
+    /// `pushdown_filters = false`). A predicate most rows pass costs more as
+    /// a `RowFilter` than as a filter above the scan: every batch is decoded,
+    /// evaluated and re-sliced into a fragmented selection. Equality deletes
+    /// and the dynamic predicate always stay in the `RowFilter`; deletes
+    /// rely on it for correctness.
+    pub fn with_static_row_filter(mut self, enabled: bool) -> Self {
+        self.sqe.static_row_filter = enabled;
         self
     }
 

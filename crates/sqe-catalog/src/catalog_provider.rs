@@ -926,6 +926,7 @@ mod tests {
             scan_fetch_ahead: Some(13),
             scan_memory_wait_ms: 17,
             string_view: false,
+            static_row_filter: true,
         };
         let provider = provider.with_tuning(tuning.clone());
         assert_eq!(provider.tuning(), &tuning);

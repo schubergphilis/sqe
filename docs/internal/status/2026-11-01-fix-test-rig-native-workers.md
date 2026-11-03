@@ -30,7 +30,11 @@ Fix:
 - `make test` sets `RUST_MIN_STACK=33554432`, as CI does
   (`AIKIDO_RUST_MIN_STACK`).
 
-Verified: pending, `make test-distributed` after the engine-bench runs finish.
+Verified 2026-11-01: `make test-distributed` passes 349 of 349 (before: 343
+passed, the six above failed). `compaction_distributed_benchmark` now runs over
+two registered workers and reports local 1.78 s, distributed 22.5 s (ratio
+0.08x) on its synthetic wiring-smoke table.
 
-**NEXT:** run `make test-distributed`; expect the six tests above to pass and
-`compaction_distributed_benchmark` to report a ratio over two workers.
+**NEXT:** find where the distributed rewrite spends its 20 s on a table that
+rewrites locally in under 2 s (the ratio is informational; the absolute gap is
+a fixed cost, not data volume).
