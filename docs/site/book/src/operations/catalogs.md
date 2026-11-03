@@ -41,7 +41,7 @@ takes a bare identifier so it can be looked up in the secret store.
 
 | `TYPE` value     | `<location>` shape                            | Required options          | Optional options                |
 |------------------|-----------------------------------------------|---------------------------|---------------------------------|
-| `iceberg_rest`   | URL of the Iceberg REST endpoint              | `WAREHOUSE`               | `SECRET` (bearer or oauth2)     |
+| `iceberg_rest`   | URL of the Iceberg REST endpoint              | `WAREHOUSE`               | `SECRET` (bearer or oauth2), `PREFIX`, `S3_*` |
 | `glue`           | empty string (region drives discovery)        | `WAREHOUSE`               | `SECRET` (aws), `REGION`        |
 | `s3tables`       | empty string                                  | `TABLE_BUCKET_ARN`        | `SECRET` (aws), `ENDPOINT_URL`  |
 | `hms`            | Thrift URI (`thrift://host:9083`)             | `WAREHOUSE`               |                                 |
@@ -65,6 +65,35 @@ a token itself. A basic secret stores a username
 and password. An AWS secret can hold any combination of credential
 fields; missing fields fall through to the standard AWS credential
 chain (env vars, profile, IMDS).
+
+## Object store of an `iceberg_rest` catalog
+
+The REST catalog hands back table locations; reading the files under them
+needs S3 settings. These options set them:
+
+| Option             | Sets                                   |
+|--------------------|----------------------------------------|
+| `S3_ENDPOINT`      | endpoint URL, for RustFS, MinIO, StorageGRID and other S3-compatible stores |
+| `S3_REGION`        | signing region                         |
+| `S3_ACCESS_KEY`    | access key id                          |
+| `S3_SECRET_KEY`    | secret access key                      |
+| `S3_SESSION_TOKEN` | STS session token, with temporary keys |
+| `S3_PATH_STYLE`    | `'true'` for path-style requests       |
+
+Credentials the catalog vends (`X-Iceberg-Access-Delegation`) replace
+these keys for the tables it vends them for.
+
+On a cluster, an ATTACH with no `S3_*` option falls back to the standard
+AWS credential chain. It never borrows the coordinator's `[storage]` keys,
+because every query runs as its user.
+
+In embedded mode (`sqe-cli --embedded`), an ATTACH with no `S3_*` option
+reads the store the CLI is configured for: `--s3-endpoint` and the other
+`--s3-*` flags, `SQE_STORAGE__S3_*`, then `AWS_*`. Name any `S3_*` option
+and the ATTACH uses only its own options, nothing from the CLI's settings.
+So a catalog whose data sits on another store than the CLI's (a remote AWS
+catalog while the CLI points at a local MinIO, say) is attached with its
+own `S3_ENDPOINT`, `S3_REGION` and keys.
 
 ## Example: REST catalog with bearer token
 

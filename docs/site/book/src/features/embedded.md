@@ -26,7 +26,9 @@ Catalog choices:
 - **Glue and S3 Tables** (`--catalog-backend glue|s3tables`): attached
   read-only, with the standard AWS credential chain.
 - **Any other catalog at the prompt**: `ATTACH ... (TYPE iceberg_rest)` mounts
-  a REST catalog such as Polaris, Nessie or Unity Catalog. See
+  a REST catalog such as Polaris, Nessie or Unity Catalog. Its data files
+  are read from the store the CLI is configured for, unless the ATTACH names
+  its own `S3_*` options. See
   [Using the CLI](../getting-started/cli.md#catalog-backends).
 
 See the quickstarts:
