@@ -193,6 +193,18 @@ def sqe_failed(res):
     return res["exit"] != 0 or any(l.startswith("Error:") for l in res["stderr"].splitlines())
 
 
+def failure_reason(tail):
+    """The line of a stderr tail that names the error. A JVM failure ends in
+    stack frames (`at ...`, `... 1 more`), and Py4J wraps the real cause, so
+    prefer an `<Something>Exception:` / `<Something>Error:` line that is not
+    the Py4J wrapper, then any such line, then the last line."""
+    named = [l.strip() for l in tail
+             if re.search(r"[\w.$]+(Exception|Error)\w*:", l)
+             and not l.lstrip().startswith(("at ", "..."))]
+    specific = [l for l in named if "Py4JJavaError" not in l]
+    return (specific or named or [l.strip() for l in tail[-1:]] or [""])[0]
+
+
 def stderr_tail(res):
     """The last stderr lines, with the S3 keys masked: an engine error can echo
     the statement that carried them (DuckDB's CREATE SECRET), and the tail ends
@@ -648,8 +660,9 @@ def summary(a):
         if fails:
             print("\nFailed runs:\n")
             for r in fails:
+                reason = failure_reason(r.get("stderr_tail") or [])
                 print(f"- {r['engine']} {r['query']} rep {r['rep']}: {r['status']}"
-                      + (f" ({r['stderr_tail'][-1][:160]})" if r.get("stderr_tail") else ""))
+                      + (f" ({reason[:160]})" if reason else ""))
 
 
 def main():
