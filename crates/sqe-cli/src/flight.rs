@@ -1,7 +1,6 @@
 //! Flight SQL backend for the CLI, over the shared
 //! `sqe_trino_protocol::flight::FlightSqlClient` (review 705).
 
-use arrow::util::display::{ArrayFormatter, FormatOptions};
 use arrow_array::RecordBatch;
 use sqe_trino_protocol::flight::{ChannelOptions, FlightSqlClient};
 
@@ -46,34 +45,9 @@ impl SqlClient for FlightClient {
 }
 
 fn batches_to_result(batches: &[RecordBatch]) -> Result<QueryResult, Box<dyn std::error::Error>> {
-    if batches.is_empty() {
-        return Ok(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        });
+    match batches.first() {
+        None => Ok(QueryResult::empty()),
+        Some(first) => QueryResult::from_batches(&first.schema(), batches)
+            .map_err(|e| format!("Cannot format the result: {e}").into()),
     }
-
-    let schema = batches[0].schema();
-    let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-    let opts = FormatOptions::default();
-
-    let mut rows = Vec::new();
-    for batch in batches {
-        let formatters: Vec<ArrayFormatter> = (0..batch.num_columns())
-            .map(|i| {
-                ArrayFormatter::try_new(batch.column(i).as_ref(), &opts)
-                    .map_err(|e| format!("Cannot format column {i}: {e}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        for row in 0..batch.num_rows() {
-            let cells: Vec<String> = formatters
-                .iter()
-                .map(|fmt| fmt.value(row).to_string())
-                .collect();
-            rows.push(cells);
-        }
-    }
-
-    Ok(QueryResult { columns, rows })
 }
