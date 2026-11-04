@@ -88,10 +88,16 @@ pub fn compare_results(
             }
 
             // Normalize: trim trailing zeros from decimal-like strings
-            // "123.4500" == "123.45", "100.00" == "100"
-            let a_norm = a.trim_end_matches('0').trim_end_matches('.');
-            let e_norm = e.trim_end_matches('0').trim_end_matches('.');
-            if a_norm == e_norm {
+            // "123.4500" == "123.45", "100.00" == "100". Only after a '.':
+            // trimming "100" to "1" made 100 and 1 compare equal.
+            fn trim_fraction(s: &str) -> &str {
+                if s.contains('.') {
+                    s.trim_end_matches('0').trim_end_matches('.')
+                } else {
+                    s
+                }
+            }
+            if trim_fraction(a) == trim_fraction(e) {
                 continue;
             }
 
@@ -393,6 +399,17 @@ mod tests {
             Arc::new(StringArray::from(vec!["wrong"])) as Arc<dyn Array>,
         )]);
         let csv = "name\ncorrect\n";
+        let status = compare_results(&[batch], csv, 1e-4).unwrap();
+        assert!(matches!(status, CompareStatus::Fail(_)), "{status:?}");
+    }
+
+    #[test]
+    fn integer_trailing_zeros_are_significant() {
+        let batch = make_batch(vec![(
+            "id",
+            Arc::new(Int64Array::from(vec![100i64])) as Arc<dyn Array>,
+        )]);
+        let csv = "id\n1\n";
         let status = compare_results(&[batch], csv, 1e-4).unwrap();
         assert!(matches!(status, CompareStatus::Fail(_)), "{status:?}");
     }
