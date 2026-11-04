@@ -169,6 +169,14 @@ fn web_page_domain(scale: f64) -> i32 {
     super::tpcds::web_page_rows(scale) as i32
 }
 
+/// Click and review users are TPC-DS customers (q10 matches them against
+/// the sales channels' customer keys). The customer table grows
+/// sublinearly above SF1, so `scale * 100,000` would leave half the users
+/// without a customer at SF10.
+fn user_domain(scale: f64) -> i32 {
+    super::tpcds::customer_rows(scale) as i32
+}
+
 /// Click dates fall in the 1998-2003 sales window of `date_dim`, like every
 /// TPC-DS fact date key. `scale * 73,049` ran past the 73,049-row date_dim
 /// from SF2 up, and put clicks in years with no sales at every scale.
@@ -188,7 +196,7 @@ fn stream_web_clickstreams(scale: f64) -> (SchemaRef, super::BatchIterator) {
     // TPC-DS SF1 has 18,000 items, 60 web pages, 100,000 customers.
     let num_items = item_domain(scale);
     let num_web_pages = web_page_domain(scale);
-    let num_users = ((scale * 100_000.0) as i32).max(1);
+    let num_users = user_domain(scale);
     let num_date_sks = click_date_domain();
     let num_time_sks = 86_400i32; // seconds in a day
     let num_sales = ((scale * 720_000.0) as i64).max(1); // web_sales rows at SF1
@@ -288,7 +296,7 @@ fn stream_product_reviews(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let total = super::scaled(scale, 100_000.0);
     let total = total.max(1);
     let num_items = item_domain(scale);
-    let num_users = ((scale * 100_000.0) as i32).max(1);
+    let num_users = user_domain(scale);
     let num_orders = ((scale * 720_000.0) as i64).max(1);
 
     let mut rng = StdRng::seed_from_u64(seed_for_table("product_reviews"));
@@ -629,16 +637,20 @@ mod tests {
     /// Web page and click date keys join the TPC-DS `web_page` and
     /// `date_dim` rows at every scale, and dates stay in the sales window.
     #[test]
-    fn web_page_and_date_keys_stay_inside_their_tables() {
+    fn web_page_date_and_user_keys_stay_inside_their_tables() {
         assert_eq!(web_page_domain(0.01), 1);
         assert_eq!(web_page_domain(1.0), 60);
+        assert_eq!(web_page_domain(10.0), 200);
         assert_eq!(click_date_domain(), 2_191);
+        assert_eq!(user_domain(1.0), 100_000);
+        assert_eq!(user_domain(10.0), 500_000);
 
         use arrow_array::Array;
         let (_, clicks) = generate_web_clickstreams(0.1);
         for (col, domain) in [
             ("wcs_web_page_sk", 1..=web_page_domain(0.1)),
             ("wcs_click_date_sk", 1..=click_date_domain()),
+            ("wcs_user_sk", 1..=user_domain(0.1)),
         ] {
             let mut keys_seen = 0;
             for b in &clicks {
