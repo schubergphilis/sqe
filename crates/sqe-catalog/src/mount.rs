@@ -882,6 +882,7 @@ fn s3_props_from_options(options: &BTreeMap<String, OptionValue>) -> Vec<(String
         ("S3_REGION", "s3.region"),
         ("S3_ACCESS_KEY", "s3.access-key-id"),
         ("S3_SECRET_KEY", "s3.secret-access-key"),
+        ("S3_SESSION_TOKEN", "s3.session-token"),
         ("S3_PATH_STYLE", "s3.path-style-access"),
     ] {
         if let Some(v) = options.get(opt_key).and_then(OptionValue::as_str) {
@@ -1448,6 +1449,7 @@ mod s3_option_tests {
         o.insert("S3_REGION".to_string(), opt("us-east-1"));
         o.insert("S3_ACCESS_KEY".to_string(), opt("ak"));
         o.insert("S3_SECRET_KEY".to_string(), opt("sk"));
+        o.insert("S3_SESSION_TOKEN".to_string(), opt("st"));
         o.insert("S3_PATH_STYLE".to_string(), opt("true"));
         let props: std::collections::HashMap<_, _> =
             s3_props_from_options(&o).into_iter().collect();
@@ -1466,6 +1468,10 @@ mod s3_option_tests {
         assert_eq!(
             props.get("s3.secret-access-key").map(String::as_str),
             Some("sk")
+        );
+        assert_eq!(
+            props.get("s3.session-token").map(String::as_str),
+            Some("st")
         );
         assert_eq!(
             props.get("s3.path-style-access").map(String::as_str),
