@@ -27,6 +27,10 @@ worker_secret = ""              # Shared secret for worker heartbeat auth (empty
 debug = false                   # When true, error messages include internal details (dev only)
 flight_compression = "lz4"      # IPC compression for client DoGet responses
 shuffle_compression = "zstd"    # IPC compression for internal DoExchange shuffle
+spill_dir = "/tmp/sqe-coordinator-spill"  # Where sorts, aggregates and joins spill
+spill_compression = "lz4"       # Spill file codec: "lz4", "zstd" or "none"
+spill_max_bytes = "100GB"       # Disk cap for spill files; a query that would
+                                # spill past it fails, naming this setting
 session_context_cache_ttl_secs = 60  # Per-user SessionContext cache TTL. Also the
                                 # passive backstop for catalog-set discovery: a
                                 # catalog created/rebound out-of-band appears within
