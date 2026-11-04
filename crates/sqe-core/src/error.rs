@@ -365,9 +365,46 @@ impl SqeError {
                 record_text_classification("execution", code);
                 code
             }
+            // A write path wraps the object store's reply in a generic
+            // `ExecutionFailed` (`Close writer error: ...`), so a refused
+            // `PutObject` reached the client as an execution failure (#880).
+            // Only that generic code is refined, and only by the store's own
+            // refusal tokens; every other typed code stands as built.
+            SqeError::Sourced {
+                code: SqeErrorCode::ExecutionFailed,
+                message,
+                source,
+            } => storage_refusal(&message.to_lowercase())
+                .or_else(|| storage_refusal(&source.to_string().to_lowercase()))
+                .unwrap_or(SqeErrorCode::ExecutionFailed),
             SqeError::Sourced { code, .. } => *code,
         }
     }
+}
+
+/// The code for an object store's refusal, read from its error text.
+///
+/// The engine's own storage credentials come first: an S3 reply to an
+/// expired key also says `AccessDenied`, and telling the client the *user*
+/// lacks a grant would be wrong. Then the store's refusal of the caller's
+/// credential: OpenDAL's `PermissionDenied` kind and S3's `AccessDenied`
+/// code, which are spelled without a space and so missed the "access
+/// denied" pattern (#880).
+fn storage_refusal(lower: &str) -> Option<SqeErrorCode> {
+    if lower.contains("storage credentials expired or unavailable")
+        || lower.contains("error occurred while loading credentials")
+        || lower.contains("expiredtoken")
+        || lower.contains("invalidaccesskeyid")
+        || lower.contains("invalidclienttokenid")
+        || lower.contains("security token included in the request is invalid")
+        || lower.contains("security token included in the request is expired")
+    {
+        return Some(SqeErrorCode::StorageCredentialsUnavailable);
+    }
+    if lower.contains("permissiondenied") || lower.contains("accessdenied") {
+        return Some(SqeErrorCode::AccessDenied);
+    }
+    None
 }
 
 impl From<DataFusionError> for SqeError {
@@ -795,14 +832,7 @@ fn classify_execution_error(msg: &str) -> SqeErrorCode {
     // two texts are SQE's own (`aws_config::storage_credentials_unavailable`)
     // and the SDK's; the rest are what S3 and STS answer to a key or token
     // that is expired, invalid or unknown.
-    if lower.contains("storage credentials expired or unavailable")
-        || lower.contains("error occurred while loading credentials")
-        || lower.contains("expiredtoken")
-        || lower.contains("invalidaccesskeyid")
-        || lower.contains("invalidclienttokenid")
-        || lower.contains("security token included in the request is invalid")
-        || lower.contains("security token included in the request is expired")
-    {
+    if let Some(SqeErrorCode::StorageCredentialsUnavailable) = storage_refusal(&lower) {
         return SqeErrorCode::StorageCredentialsUnavailable;
     }
     // Auth/access patterns must run before any other keyword check.
@@ -825,6 +855,7 @@ fn classify_execution_error(msg: &str) -> SqeErrorCode {
         || lower.contains("access denied")
         || lower.contains("permission denied")
         || lower.contains("not authorized")
+        || storage_refusal(&lower) == Some(SqeErrorCode::AccessDenied)
     {
         return SqeErrorCode::AccessDenied;
     }
@@ -1268,6 +1299,52 @@ mod tests {
              headers: {\"content-type\": \"application/json\"} }".to_string(),
         );
         assert_eq!(err.error_code(), SqeErrorCode::AccessDenied);
+    }
+
+    /// #880: a reader's DELETE wrote with a read-only vended credential and
+    /// the store refused the upload. The write path wraps that as a typed
+    /// `ExecutionFailed`; the client must see `AccessDenied`.
+    #[test]
+    fn storage_refusal_in_a_typed_write_error_is_access_denied() {
+        let text = "Close writer error: Unexpected => Failed to close parquet writer, \
+                    source: PermissionDenied (persistent) at write, context: { \
+                    service: s3, path: ns/t/data/00000-0.parquet } => S3Error { \
+                    code: \"AccessDenied\", message: \"\", resource: \"\", request_id: \"\" }";
+        let typed = SqeError::with_code(SqeErrorCode::ExecutionFailed, text);
+        assert_eq!(typed.error_code(), SqeErrorCode::AccessDenied);
+        assert_eq!(
+            SqeError::Execution(text.to_string()).error_code(),
+            SqeErrorCode::AccessDenied
+        );
+    }
+
+    /// The engine's expired key also gets `AccessDenied` from S3; it stays
+    /// a credentials problem, not the user's grant.
+    #[test]
+    fn expired_engine_key_in_a_typed_write_error_is_not_access_denied() {
+        let typed = SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            "Write error: PermissionDenied => S3Error { code: \"ExpiredToken\" } AccessDenied",
+        );
+        assert_eq!(
+            typed.error_code(),
+            SqeErrorCode::StorageCredentialsUnavailable
+        );
+    }
+
+    /// Only the generic code is refined: a typed code other than
+    /// `ExecutionFailed` stands, and a write error without a refusal stays
+    /// `ExecutionFailed`.
+    #[test]
+    fn typed_codes_other_than_execution_failed_are_not_refined() {
+        let conflict =
+            SqeError::with_code(SqeErrorCode::CommitConflict, "commit failed: AccessDenied");
+        assert_eq!(conflict.error_code(), SqeErrorCode::CommitConflict);
+        let plain = SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            "Close writer error: disk full",
+        );
+        assert_eq!(plain.error_code(), SqeErrorCode::ExecutionFailed);
     }
 
     #[test]

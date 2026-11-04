@@ -1,0 +1,9 @@
+**STATUS 2026-11-04: a storage refusal during a write reports `AccessDenied` (`fix/storage-access-denied-code`, #880 part 2, portal request §8).**
+
+The #880 triage blamed a pattern miss in `classify_execution_error`. That was half of it: the write paths (`sqe-compaction/src/writer.rs` `Close writer error`, `sqe-write/src/writer.rs` and ~420 other sites) build `SqeError::with_code(ExecutionFailed, ...)`, and `error_code()` returned that code without reading the text, so even a matching pattern would never have run. Now `error_code()` refines a typed `ExecutionFailed` (and only that code) with `storage_refusal`: engine-credential texts first (`StorageCredentialsUnavailable`), then OpenDAL's `PermissionDenied` and S3's `AccessDenied` (`AccessDenied`). `classify_execution_error` shares the same helper, so its own credential block is now that call and the unspaced tokens are added.
+
+Callers that absorb `AccessDenied` (`namespaces_or_empty_on_denial`, `catalog_provider` namespace probes) handle catalog listings, where a refusal already means "nothing visible"; a Hive listing refused by the store now reads as empty there too. `quack_executor` routes a `Sourced` error by its raw `code`, not `error_code()`, so the DuckDB-wire path still reports such a refusal as an execution error.
+
+Gates: `cargo test -p sqe-core --lib` 545 passed (new: `storage_refusal_in_a_typed_write_error_is_access_denied`, `expired_engine_key_in_a_typed_write_error_is_not_access_denied`, `typed_codes_other_than_execution_failed_are_not_refined`); `cargo clippy -p sqe-core --all-targets -D warnings` clean. Not run live: needs a credential-vending catalog where a reader's credential cannot write.
+
+**NEXT:** #880 part 1: check write access with Polaris as the caller before a DELETE / UPDATE / MERGE writes its first file.
