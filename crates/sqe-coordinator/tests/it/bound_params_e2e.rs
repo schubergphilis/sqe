@@ -202,8 +202,43 @@ async fn bound_param_of_the_wrong_type_is_refused_without_echoing_it() {
         assert!(!record.sql.contains(secret), "query log echoes the value");
     }
 
+    // INSERT plans its source on its own, so these placeholders are typed
+    // from the target columns: in table order, and through the reorder an
+    // explicit column list adds (portal request §1).
+    for sql in [
+        format!("INSERT INTO {t} VALUES ($2, 'EU', $1)"),
+        format!("INSERT INTO {t} (value, id) VALUES ($1, $2)"),
+        format!("INSERT INTO {t} SELECT $2, 'EU', $1"),
+    ] {
+        let id = uuid::Uuid::new_v4();
+        let err = handler
+            .execute_bound_with_id(&session, &sql, vec![utf8(secret), int(2)], None, Some(id))
+            .await
+            .expect_err("a string that is not a number does not bind to BIGINT");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("parameter $1"),
+            "{sql}: error names the position: {msg}"
+        );
+        assert!(
+            !msg.contains(secret),
+            "{sql}: error echoes the value: {msg}"
+        );
+        if let Some(record) = handler.query_tracker().get(&id) {
+            let logged = record.error_message.clone().unwrap_or_default();
+            assert!(
+                !logged.contains(secret),
+                "{sql}: query log echoes the value: {logged}"
+            );
+        }
+    }
+
+    // A string that is a number is parsed into the column's type.
+    let sql = format!("INSERT INTO {t} (value, id) VALUES ($1, $2)");
+    bound(&handler, &session, &sql, vec![utf8("42"), int(3)]).await;
+
     assert_eq!(
         rows(&handler, &session, t).await,
-        vec!["1|EU|10".to_string()]
+        vec!["1|EU|10".to_string(), "3|NULL|42".to_string()]
     );
 }

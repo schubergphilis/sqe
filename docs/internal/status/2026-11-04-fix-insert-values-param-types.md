@@ -1,0 +1,11 @@
+**STATUS 2026-11-04: INSERT source placeholders typed from the target columns (`fix/insert-values-param-types`, portal request §1).**
+
+The portal checked bound parameters live: a wrong type for `WHERE id = ?` or `UPDATE … SET v = ?` is refused naming the position only, but `INSERT … VALUES (?, ?)` failed in the write's cast (`Cannot cast string '…' to value of Int32 type`), quoting the value in the answer and twice in SQE's log. The INSERT source is planned standalone (`handle_insert_streaming_on` → `plan_sql(ctx, &effective_sql)`), so nothing gives DataFusion a type for a placeholder that feeds a column directly.
+
+`sqe_core::type_insert_placeholders` (sql_params.rs) walks the source from its output down through pass-through projections and subquery aliases (the `__sqe_insert_src` reorder an explicit column list adds), following each column to its input position, and types the untyped placeholders it finds in `VALUES` or an input-less `SELECT` (under an alias or the cast `VALUES` adds for mixed rows). The INSERT handler runs the source's planning under `txn::with_insert_target(table column types)`, and `file_tvf_prepare::bind_statement_params` applies it before `bind_params`, so the existing check parses a numeric string and refuses the rest naming the position only. Placeholders inside expressions (`VALUES (? + 1)`) and other source shapes keep DataFusion's inference.
+
+Behaviour change: the check is `bind_params`' (the one UPDATE already uses), so a value of another type family is refused, not cast: an integer bound to a STRING column, a DATE to a TIMESTAMP column. Before, the write cast those.
+
+Gates: `cargo test -p sqe-core --lib -- sql_params` 16 passed (new: `insert_source_placeholders_take_the_target_types`, `insert_placeholders_leave_expressions_and_other_shapes`); `make test-integration FILTER=bound_param` with `bound_param_of_the_wrong_type_is_refused_without_echoing_it` extended to INSERT VALUES (table order, explicit column list) and INSERT SELECT, and a numeric string parsed into BIGINT.
+
+**NEXT:** a Flight SQL prepared DML statement has no plan at prepare time, so `do_action_create_prepared_statement` advertises every parameter as untyped (`Utf8` in `parameter_schema`); a prepared INSERT could advertise the target column types found here, so drivers send typed values.
