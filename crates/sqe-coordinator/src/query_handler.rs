@@ -4290,6 +4290,42 @@ impl QueryHandler {
         }
     }
 
+    /// The parameter types a Flight SQL client is told for a prepared
+    /// statement that has no stored plan. INSERT, UPDATE and DELETE are
+    /// planned once to read them: DataFusion types an INSERT's `VALUES`
+    /// placeholders from the target columns. Any other statement, or one
+    /// that does not plan here (a MERGE, a Hive target), stays untyped:
+    /// preparing it must not start failing. The types are advisory; the
+    /// values are coerced when the statement runs.
+    pub async fn dml_parameter_types(
+        &self,
+        session: &Session,
+        numbered_sql: &str,
+        param_count: usize,
+    ) -> Vec<Option<DataType>> {
+        let untyped = vec![None; param_count];
+        if param_count == 0 {
+            return untyped;
+        }
+        let is_dml = matches!(
+            classify_user_sql(session, numbered_sql),
+            Ok(StatementKind::Insert(_) | StatementKind::Update(_) | StatementKind::Delete(_))
+        );
+        if !is_dml {
+            return untyped;
+        }
+        match self
+            .prepared_parameter_types(session, numbered_sql, param_count)
+            .await
+        {
+            Ok(types) => types,
+            Err(e) => {
+                debug!(error = %e, "prepared DML parameters left untyped");
+                untyped
+            }
+        }
+    }
+
     /// Plan a (placeholder-numbered) statement and return the inferred type of
     /// each bind parameter in positional order. `None` for a parameter whose
     /// type DataFusion could not infer.

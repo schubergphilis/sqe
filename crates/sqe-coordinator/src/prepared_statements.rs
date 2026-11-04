@@ -53,7 +53,9 @@ pub struct PreparedStatement {
     /// bind applied to each plan instead.
     pub plan: Option<StoredPlan>,
     /// Inferred type of each positional parameter; `None` where DataFusion
-    /// had no context to infer one (accepts any bind).
+    /// had no context to infer one (accepts any bind). Without a stored
+    /// plan the types are only advertised: [`Self::bind`] accepts any value
+    /// and the execution coerces it against the plan it makes.
     pub param_types: Vec<Option<DataType>>,
     /// Output schema advertised to the client.
     pub dataset_schema: SchemaRef,
@@ -215,18 +217,21 @@ impl PreparedStatement {
     /// The `parameter_schema` for `ActionCreatePreparedStatementResult`:
     /// one nullable field per placeholder, named `$n`. A parameter whose type
     /// could not be inferred is advertised as `Utf8`, the most permissive
-    /// type a driver can build a bind vector for.
+    /// type a driver can build a bind vector for. A view type (a string
+    /// column is planned as `Utf8View`) is advertised as its plain form,
+    /// which every driver can build; the bind casts it back.
     pub fn parameter_schema(&self) -> Schema {
         Schema::new(
             self.param_types
                 .iter()
                 .enumerate()
                 .map(|(i, dt)| {
-                    Field::new(
-                        format!("${}", i + 1),
-                        dt.clone().unwrap_or(DataType::Utf8),
-                        true,
-                    )
+                    let advertised = match dt {
+                        None | Some(DataType::Utf8View) => DataType::Utf8,
+                        Some(DataType::BinaryView) => DataType::Binary,
+                        Some(other) => other.clone(),
+                    };
+                    Field::new(format!("${}", i + 1), advertised, true)
                 })
                 .collect::<Vec<_>>(),
         )
@@ -239,6 +244,11 @@ impl PreparedStatement {
     /// Validate and store a bind. Rejects a wrong arity or a value whose Arrow
     /// type cannot stand in for the inferred placeholder type; see
     /// [`coerce_param`]. Replaces any earlier bind.
+    ///
+    /// A statement without a stored plan (DML) keeps the values as bound:
+    /// each execution plans the statement and coerces them there, which
+    /// also parses a string bound to a numeric column. Checking them here
+    /// against the advertised types would refuse that.
     pub fn bind(&self, values: Vec<ScalarValue>) -> Result<(), String> {
         if values.len() != self.param_types.len() {
             return Err(format!(
@@ -247,13 +257,14 @@ impl PreparedStatement {
                 values.len()
             ));
         }
+        let planned = self.plan.is_some();
         let coerced = values
             .into_iter()
             .zip(self.param_types.iter())
             .enumerate()
             .map(|(i, (value, expected))| match expected {
-                Some(expected) => coerce_param(value, expected, i + 1),
-                None => Ok(value),
+                Some(expected) if planned => coerce_param(value, expected, i + 1),
+                _ => Ok(value),
             })
             .collect::<Result<Vec<_>, _>>()?;
         *self
@@ -453,6 +464,82 @@ mod tests {
         );
         stmt.bind(vec![ScalarValue::Boolean(Some(true))]).unwrap();
         assert!(stmt.bound_plan().is_ok());
+    }
+
+    /// `dml_parameter_types` relies on DataFusion typing an INSERT's
+    /// `VALUES` placeholders from the target columns, and on a plan-less
+    /// statement taking a bind the advertised type would refuse: a string
+    /// for a BIGINT column is parsed when the INSERT runs.
+    #[tokio::test]
+    async fn insert_placeholders_are_advertised_but_bind_stays_lenient() {
+        use datafusion::datasource::MemTable;
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("region", DataType::Utf8, true),
+        ]));
+        ctx.register_table(
+            "t",
+            Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("table")),
+        )
+        .expect("register");
+        let sql = "INSERT INTO t VALUES (?, ?)";
+        let (numbered, n) = sqe_core::number_placeholders(sql);
+        let insert = ctx
+            .state()
+            .create_logical_plan(&numbered)
+            .await
+            .expect("plans");
+        let types = PreparedStatement::param_types_from_plan(&insert, n).expect("types");
+        assert_eq!(types, vec![Some(DataType::Int64), Some(DataType::Utf8)]);
+
+        let stmt = PreparedStatement::new(
+            sql.to_string(),
+            numbered,
+            None,
+            types,
+            Arc::new(Schema::empty()),
+        );
+        assert_eq!(
+            stmt.parameter_schema().field(0).data_type(),
+            &DataType::Int64
+        );
+        stmt.bind(vec![
+            ScalarValue::Utf8(Some("10".into())),
+            ScalarValue::Utf8(Some("EU".into())),
+        ])
+        .expect("a plan-less statement keeps the bind for execution to coerce");
+        assert_eq!(
+            stmt.bound_values().unwrap()[0],
+            ScalarValue::Utf8(Some("10".into()))
+        );
+        assert!(stmt.bind(vec![]).is_err(), "arity is still checked");
+    }
+
+    #[test]
+    fn view_types_are_advertised_in_their_plain_form() {
+        let stmt = PreparedStatement::new(
+            "SELECT 1".to_string(),
+            "SELECT 1".to_string(),
+            None,
+            vec![Some(DataType::Utf8View), Some(DataType::BinaryView), None],
+            Arc::new(Schema::empty()),
+        );
+        let advertised: Vec<DataType> = stmt
+            .parameter_schema()
+            .fields()
+            .iter()
+            .map(|f| f.data_type().clone())
+            .collect();
+        assert_eq!(
+            advertised,
+            vec![DataType::Utf8, DataType::Binary, DataType::Utf8]
+        );
+        // A planned Utf8View placeholder takes the Utf8 a driver sends.
+        assert_eq!(
+            coerce_param(ScalarValue::Utf8(Some("EU".into())), &DataType::Utf8View, 1),
+            Ok(ScalarValue::Utf8View(Some("EU".into())))
+        );
     }
 
     #[tokio::test]
