@@ -279,6 +279,8 @@ fn is_sort_buffer(consumer: &MemoryConsumer) -> bool {
 pub struct HeadroomPool {
     inner: Arc<dyn MemoryPool>,
     budget: HeadroomBudget,
+    /// The setting a refusal names.
+    setting: &'static str,
 }
 
 impl HeadroomPool {
@@ -295,6 +297,26 @@ impl HeadroomPool {
         Arc::new(Self {
             inner,
             budget: HeadroomBudget::new(limit, headroom_percent, false),
+            setting: "coordinator.unspillable_headroom_percent",
+        })
+    }
+
+    /// Wrap the pool of an engine with no per-query pool of its own (the
+    /// embedded engine): [`Self::wrap`] plus the sort share
+    /// ([`HeadroomBudget::with_sort_share`]) the coordinator gives every
+    /// query's pool. Without it the first sorters of a partitioned sort take
+    /// every spillable byte and a sibling refused while it holds nothing
+    /// fails the query. `setting` names the limit in a refusal.
+    pub fn wrap_single_query(
+        inner: Arc<dyn MemoryPool>,
+        limit: usize,
+        headroom_percent: u8,
+        setting: &'static str,
+    ) -> Arc<dyn MemoryPool> {
+        Arc::new(Self {
+            inner,
+            budget: HeadroomBudget::new(limit, headroom_percent, false).with_sort_share(),
+            setting,
         })
     }
 }
@@ -339,7 +361,7 @@ impl MemoryPool for HeadroomPool {
             reservation.consumer(),
             reservation.size(),
             additional,
-            "coordinator.unspillable_headroom_percent",
+            self.setting,
         )?;
         if let Err(error) = self.inner.try_grow(reservation, additional) {
             self.budget.release(reservation.consumer(), additional);

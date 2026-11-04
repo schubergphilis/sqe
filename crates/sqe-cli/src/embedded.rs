@@ -276,6 +276,12 @@ const TT_SCHEMA: &str = "default";
 /// partition's cap shrank with them: q3 of the engine bench (150M rows,
 /// 3 GB) spilled its final aggregate 88-96 times where the coordinator, on
 /// the same data and limit, did not spill at all.
+///
+/// The coordinator also caps each sort at a share of the spillable bytes,
+/// in the per-query pool it builds for every statement. This engine has no
+/// per-query pool, so the share sits on this one: a greedy pool without it
+/// lets the first sort partitions take every spillable byte and fails the
+/// query on a sibling that cannot start.
 fn embedded_memory_pool(memory_limit_bytes: usize) -> Arc<dyn MemoryPool> {
     const TOP_CONSUMERS_IN_ERROR: usize = 5;
     let pool_size = memory_limit_bytes.max(64 * 1024 * 1024);
@@ -283,10 +289,11 @@ fn embedded_memory_pool(memory_limit_bytes: usize) -> Arc<dyn MemoryPool> {
         GreedyMemoryPool::new(pool_size),
         std::num::NonZeroUsize::new(TOP_CONSUMERS_IN_ERROR).expect("non-zero const"),
     ));
-    sqe_core::memory_headroom::HeadroomPool::wrap(
+    sqe_core::memory_headroom::HeadroomPool::wrap_single_query(
         tracked,
         pool_size,
         sqe_core::memory_headroom::DEFAULT_UNSPILLABLE_HEADROOM_PERCENT,
+        "sqe-cli --memory-limit",
     )
 }
 
@@ -1649,6 +1656,19 @@ impl EmbeddedClient {
     /// the table schema, whose list fields carry `PARQUET:field_id`
     /// metadata, and an `ARRAY[...]` literal then fails to build its batch.
     /// `Ok(None)`: not a writable Iceberg target, DataFusion answers.
+    /// The config the write and DDL handlers run under: the embedded
+    /// defaults with `query.max_query_memory` set to this engine's pool
+    /// (`--memory-limit`), so a sort-on-write is admitted against the memory
+    /// the engine has, not the server's 256 MB default.
+    fn handler_config(&self) -> sqe_core::SqeConfig {
+        use datafusion::execution::memory_pool::MemoryLimit;
+        let mut config = sqe_core::SqeConfig::embedded_defaults();
+        if let MemoryLimit::Finite(bytes) = self.ctx.runtime_env().memory_pool.memory_limit() {
+            config.query.max_query_memory = bytes.to_string();
+        }
+        config
+    }
+
     async fn embedded_handle_iceberg_insert(
         &self,
         stmt: &sqlparser::ast::Statement,
@@ -1671,8 +1691,7 @@ impl EmbeddedClient {
 
         let select_sql = sqe_sql::rewrite_named_tvf_args(&source.to_string());
         let session = self.write_session(catalog_name);
-        let handler =
-            sqe_write::write_handler::WriteHandler::new(sqe_core::SqeConfig::embedded_defaults());
+        let handler = sqe_write::write_handler::WriteHandler::new(self.handler_config());
         let mut plan_out = None;
         let mut policy_summary = None;
         let batches = handler
@@ -1723,7 +1742,7 @@ impl EmbeddedClient {
         self.ensure_write_scratch_catalog()?;
 
         let session = self.write_session(catalog_name);
-        let handler = WriteHandler::new(sqe_core::SqeConfig::embedded_defaults());
+        let handler = WriteHandler::new(self.handler_config());
         let mut plan_out = None;
         let mut policy_summary = None;
         let batches = match stmt {
@@ -1806,8 +1825,7 @@ impl EmbeddedClient {
         };
         let rest_catalog = self.rest_catalogs.contains_key(&catalog_name);
         let session = self.write_session(catalog_name.clone());
-        let handler =
-            sqe_write::write_handler::WriteHandler::new(sqe_core::SqeConfig::embedded_defaults());
+        let handler = sqe_write::write_handler::WriteHandler::new(self.handler_config());
         handler
             .handle_create_table_on(&session, stmt, catalog, rest_catalog)
             .await?;
@@ -2708,6 +2726,56 @@ mod tests {
         );
         scan.try_grow(10 * MIB)
             .expect("the scan still has the unspillable headroom");
+    }
+
+    /// The coordinator's per-query sort share: each partition's sort buffer
+    /// stops at its share of the spillable bytes, so the last partition to
+    /// start still finds room instead of failing the query.
+    #[test]
+    fn embedded_pool_keeps_a_sort_share_for_every_partition() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+        const MIB: usize = 1024 * 1024;
+        let pool = embedded_memory_pool(100 * MIB);
+        let sorters: Vec<_> = (0..4)
+            .map(|i| {
+                MemoryConsumer::new(format!("ExternalSorter[{i}]"))
+                    .with_can_spill(true)
+                    .register(&pool)
+            })
+            .collect();
+        // 80 MiB spillable over 4 sorts.
+        for sorter in &sorters[..3] {
+            sorter.try_grow(MIB).expect("first reservation");
+            let err = sorter
+                .try_grow(60 * MIB)
+                .expect_err("a sort stops at its 20 MiB share");
+            let refusal = err.to_string();
+            assert!(
+                refusal.contains("sqe-cli --memory-limit sort share"),
+                "the refusal names the embedded limit: {refusal}"
+            );
+            sorter.try_grow(19 * MIB).expect("up to the share");
+        }
+        sorters[3]
+            .try_grow(20 * MIB)
+            .expect("the last partition still gets its share");
+        let agg = MemoryConsumer::new("agg")
+            .with_can_spill(true)
+            .register(&pool);
+        agg.try_grow(1)
+            .expect_err("the shares filled the spillable bytes");
+    }
+
+    /// Writes plan their sort-on-write gate against `--memory-limit`, not
+    /// the server's 256 MB `query.max_query_memory` default.
+    #[tokio::test]
+    async fn handler_config_takes_the_memory_limit() {
+        let client = EmbeddedClient::new(3 * 1024 * 1024 * 1024).unwrap();
+        let config = client.handler_config();
+        assert_eq!(
+            sqe_core::parse_memory_limit(&config.query.max_query_memory).unwrap(),
+            3 * 1024 * 1024 * 1024
+        );
     }
 
     #[test]
