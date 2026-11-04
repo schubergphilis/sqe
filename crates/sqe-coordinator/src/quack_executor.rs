@@ -105,8 +105,11 @@ pub fn sqe_error_to_query_error(err: SqeError) -> QueryError {
         // "SQE-POLICY: access denied" masking branch live (606: it used to fall
         // through to Execution, so the full denial reason reached the client);
         // everything else (catalog/exec/storage boundaries) surfaces as
-        // Execution.
-        SqeError::Sourced { ref code, .. } => match *code {
+        // Execution. The code is `error_code()`'s, not the raw one: a write
+        // the object store refused is built as `ExecutionFailed` and only
+        // `error_code()` reads it as `AccessDenied` (#880), so the raw code
+        // sent the store's reply to the client unmasked.
+        SqeError::Sourced { .. } => match err.error_code() {
             sqe_core::SqeErrorCode::InternalError => QueryError::Internal(msg),
             sqe_core::SqeErrorCode::AccessDenied => QueryError::Policy(msg),
             _ => QueryError::Execution(msg),
@@ -235,5 +238,30 @@ mod tests {
             "no such table",
         ));
         assert!(matches!(mapped, QueryError::Execution(_)));
+    }
+
+    /// #880: a write the object store refused is built as `ExecutionFailed`
+    /// (`Close writer error: ...`); `error_code()` reads it as AccessDenied,
+    /// so it is masked like any other denial. An expired engine credential
+    /// is not the user's denial and stays Execution.
+    #[test]
+    fn storage_refusal_routes_on_the_refined_code() {
+        let mapped = sqe_error_to_query_error(sourced(
+            sqe_core::SqeErrorCode::ExecutionFailed,
+            "Close writer error: PermissionDenied (persistent) at write => AccessDenied",
+        ));
+        assert!(matches!(mapped, QueryError::Policy(_)), "{mapped:?}");
+
+        let mapped = sqe_error_to_query_error(sourced(
+            sqe_core::SqeErrorCode::ExecutionFailed,
+            "Close writer error: ExpiredToken: the provided token has expired",
+        ));
+        assert!(matches!(mapped, QueryError::Execution(_)), "{mapped:?}");
+
+        let mapped = sqe_error_to_query_error(sourced(
+            sqe_core::SqeErrorCode::ExecutionFailed,
+            "division by zero",
+        ));
+        assert!(matches!(mapped, QueryError::Execution(_)), "{mapped:?}");
     }
 }
