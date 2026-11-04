@@ -18,8 +18,9 @@ fn print_table(result: &QueryResult) {
 
     // Compute column widths
     let mut widths: Vec<usize> = result.columns.iter().map(|c| c.len()).collect();
-    for row in &result.rows {
+    for (r, row) in result.rows.iter().enumerate() {
         for (i, cell) in row.iter().enumerate() {
+            let cell = table_cell(result, r, i, cell);
             if let Some(w) = widths.get_mut(i) {
                 if cell.len() > *w {
                     *w = cell.len();
@@ -48,14 +49,14 @@ fn print_table(result: &QueryResult) {
     println!("{border}");
 
     // Rows
-    for row in &result.rows {
+    for (r, row) in result.rows.iter().enumerate() {
         let cells: Vec<String> = row
             .iter()
             .enumerate()
             .map(|(i, v)| {
                 format!(
                     " {:width$} ",
-                    v,
+                    table_cell(result, r, i, v),
                     width = widths.get(i).copied().unwrap_or(0)
                 )
             })
@@ -65,6 +66,15 @@ fn print_table(result: &QueryResult) {
 
     println!("{border}");
     eprintln!("({} rows)", result.rows.len());
+}
+
+/// The table shows NULL as `NULL`, so it differs from an empty string.
+fn table_cell<'a>(result: &QueryResult, row: usize, column: usize, value: &'a str) -> &'a str {
+    if result.is_null(row, column) {
+        "NULL"
+    } else {
+        value
+    }
 }
 
 fn print_separated(result: &QueryResult, sep: char) {
@@ -88,13 +98,51 @@ fn sep_escape(value: &str, sep: char) -> String {
 }
 
 fn print_json(result: &QueryResult) {
-    for row in &result.rows {
-        let obj: serde_json::Map<String, serde_json::Value> = result
-            .columns
-            .iter()
-            .zip(row.iter())
-            .map(|(col, val)| (col.clone(), serde_json::Value::String(val.clone())))
-            .collect();
-        println!("{}", serde_json::to_string(&obj).unwrap_or_default());
+    for line in json_lines(result) {
+        println!("{line}");
+    }
+}
+
+/// One JSON object per row. Values stay display strings; NULL is `null`.
+fn json_lines(result: &QueryResult) -> Vec<String> {
+    result
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(r, row)| {
+            let obj: serde_json::Map<String, serde_json::Value> = result
+                .columns
+                .iter()
+                .zip(row.iter())
+                .enumerate()
+                .map(|(i, (col, val))| {
+                    let value = if result.is_null(r, i) {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Value::String(val.clone())
+                    };
+                    (col.clone(), value)
+                })
+                .collect();
+            serde_json::to_string(&obj).unwrap_or_default()
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_prints_null_apart_from_an_empty_string() {
+        let mut result = QueryResult::text(
+            vec!["n".to_string(), "e".to_string()],
+            vec![vec![String::new(), String::new()]],
+        );
+        result.nulls.insert((0, 0));
+        let expected = r#"{"n":null,"e":""}"#;
+        assert_eq!(json_lines(&result), vec![expected.to_string()]);
+        assert_eq!(table_cell(&result, 0, 0, ""), "NULL");
+        assert_eq!(table_cell(&result, 0, 1, ""), "");
     }
 }

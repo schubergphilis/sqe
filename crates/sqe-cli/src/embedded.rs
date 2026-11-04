@@ -39,7 +39,6 @@ use std::sync::Arc;
 
 use sqe_core::SecretStore;
 
-use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool, TrackConsumersPool};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -1146,7 +1145,7 @@ impl EmbeddedClient {
         // optimizer collapse like `WHERE FALSE` yields an EmptyExec).
         let schema = df.schema().as_arrow().clone();
         let batches = df.collect().await?;
-        Ok(record_batches_to_query_result(&schema, &batches))
+        Ok(QueryResult::from_batches(&schema, &batches)?)
     }
 
     /// Plan one statement the way [`Self::run_datafusion`] runs it, without
@@ -1292,10 +1291,7 @@ impl EmbeddedClient {
             .map(|s| s.to_string());
         self.attached_catalogs.insert(stmt.name.clone(), secret_ref);
 
-        Ok(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        })
+        Ok(QueryResult::empty())
     }
 
     /// The REST `SessionCatalog` view DDL and view reads of an
@@ -1348,10 +1344,7 @@ impl EmbeddedClient {
         // but our tracking no longer considers it attached — queries that
         // try to resolve it will fail at plan time once the provider is
         // removed from our accounting.
-        Ok(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        })
+        Ok(QueryResult::empty())
     }
 
     fn embedded_handle_create_secret(
@@ -1367,10 +1360,7 @@ impl EmbeddedClient {
         self.secrets
             .create(&stmt.name, secret)
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        Ok(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        })
+        Ok(QueryResult::empty())
     }
 
     fn embedded_handle_drop_secret(
@@ -1387,10 +1377,7 @@ impl EmbeddedClient {
         self.secrets
             .drop_secret(&stmt.name, &in_use)
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        Ok(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        })
+        Ok(QueryResult::empty())
     }
 
     fn embedded_handle_show_secrets(&self) -> Result<QueryResult, Box<dyn std::error::Error>> {
@@ -1398,13 +1385,13 @@ impl EmbeddedClient {
             .secrets
             .list()
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        Ok(QueryResult {
-            columns: vec!["name".to_string(), "type".to_string()],
-            rows: listed
+        Ok(QueryResult::text(
+            vec!["name".to_string(), "type".to_string()],
+            listed
                 .into_iter()
                 .map(|(name, type_name)| vec![name, type_name.to_string()])
                 .collect(),
-        })
+        ))
     }
 
     /// `CREATE EXTERNAL TABLE` in embedded mode: write `spec`'s sidecar
@@ -1466,10 +1453,7 @@ impl EmbeddedClient {
         // for up to `cache_ttl` (60s in `attach_hive_root`).
         provider.invalidate_table_names(&database);
 
-        Ok(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        })
+        Ok(QueryResult::empty())
     }
 
     /// `CREATE SCHEMA <cat>.<ns>` / `DROP SCHEMA <cat>.<ns>` where `<cat>` is
@@ -1549,10 +1533,7 @@ impl EmbeddedClient {
                     .await?
             }
         }
-        Ok(Some(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        }))
+        Ok(Some(QueryResult::empty()))
     }
 
     /// The session's default catalog, which a one- or two-part name resolves in.
@@ -1623,10 +1604,7 @@ impl EmbeddedClient {
             )
             .into());
         }
-        let empty = QueryResult {
-            columns: vec![],
-            rows: vec![],
-        };
+        let empty = QueryResult::empty();
         if self.ctx.table_exist(name.to_string().as_str())? {
             if ct.if_not_exists {
                 return Ok(Some(empty));
@@ -1761,7 +1739,7 @@ impl EmbeddedClient {
             .first()
             .map(|b| b.schema())
             .unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()));
-        Ok(Some(record_batches_to_query_result(&schema, &batches)))
+        Ok(Some(QueryResult::from_batches(&schema, &batches)?))
     }
 
     /// DELETE / UPDATE / MERGE on a table in a `WritableIcebergCatalog`,
@@ -1853,7 +1831,7 @@ impl EmbeddedClient {
             .first()
             .map(|b| b.schema())
             .unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()));
-        Ok(Some(record_batches_to_query_result(&schema, &batches)))
+        Ok(Some(QueryResult::from_batches(&schema, &batches)?))
     }
 
     /// `CREATE TABLE` with a column list in a `WritableIcebergCatalog`,
@@ -1889,10 +1867,7 @@ impl EmbeddedClient {
         if let Some(writable) = self.iceberg_catalogs.get(&catalog_name) {
             writable.refresh_namespace(&namespace).await?;
         }
-        Ok(Some(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        }))
+        Ok(Some(QueryResult::empty()))
     }
 
     /// `CREATE [OR REPLACE] VIEW` / `DROP VIEW [IF EXISTS]` naming a
@@ -1945,10 +1920,7 @@ impl EmbeddedClient {
                 return match stmt {
                     Statement::Drop {
                         if_exists: true, ..
-                    } => Ok(Some(QueryResult {
-                        columns: vec![],
-                        rows: vec![],
-                    })),
+                    } => Ok(Some(QueryResult::empty())),
                     Statement::Drop { .. } => Err(format!(
                         "view {name} does not exist: catalog `{catalog_name}` stores no views"
                     )
@@ -1990,10 +1962,7 @@ impl EmbeddedClient {
                 .refresh_views(&ident.namespace().as_ref().join("."))
                 .await;
         }
-        Ok(Some(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        }))
+        Ok(Some(QueryResult::empty()))
     }
 
     /// The schema a view body produces, planned as a query would be: the
@@ -2117,10 +2086,7 @@ impl EmbeddedClient {
                 writable.refresh_namespace(namespace).await?;
             }
         }
-        Ok(Some(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        }))
+        Ok(Some(QueryResult::empty()))
     }
 
     /// The catalog a one- to three-part table name lands in, when that is a
@@ -2439,10 +2405,7 @@ impl EmbeddedClient {
         }
         provider.invalidate_table_names(database);
 
-        Ok(Some(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        }))
+        Ok(Some(QueryResult::empty()))
     }
 
     /// `SHOW CREATE TABLE` against a Hive root: render Athena/Glue-style DDL
@@ -2471,10 +2434,10 @@ impl EmbeddedClient {
         let spec = sqe_catalog::hive::hive_spec_from_manifest(catalog, &manifest);
         let ddl = sqe_catalog::hive::render_hive_create_table_ddl(&spec);
 
-        Ok(Some(QueryResult {
-            columns: vec!["Create Table".to_string()],
-            rows: vec![vec![ddl]],
-        }))
+        Ok(Some(QueryResult::text(
+            vec!["Create Table".to_string()],
+            vec![vec![ddl]],
+        )))
     }
 
     /// `SHOW CREATE TABLE` for a table in an Iceberg catalog, rendered as
@@ -2563,10 +2526,10 @@ impl EmbeddedClient {
             Some(metadata_table.metadata()),
         );
 
-        Ok(Some(QueryResult {
-            columns: vec!["Create Table".to_string()],
-            rows: vec![vec![ddl]],
-        }))
+        Ok(Some(QueryResult::text(
+            vec!["Create Table".to_string()],
+            vec![vec![ddl]],
+        )))
     }
 
     /// `SHOW CREATE VIEW` on an Iceberg view: its stored SQL, with the
@@ -2596,10 +2559,10 @@ impl EmbeddedClient {
             }
             _ => body,
         };
-        Ok(QueryResult {
-            columns: vec!["Create View".to_string()],
-            rows: vec![vec![format!("CREATE VIEW {} AS\n{body}", parts.join("."))]],
-        })
+        Ok(QueryResult::text(
+            vec!["Create View".to_string()],
+            vec![vec![format!("CREATE VIEW {} AS\n{body}", parts.join("."))]],
+        ))
     }
 }
 
@@ -2635,36 +2598,6 @@ fn widen_coarse_timestamps(schema: &arrow_schema::Schema) -> Option<arrow_schema
         fields,
         schema.metadata().clone(),
     ))
-}
-
-/// Render a sequence of [`RecordBatch`]es into the CLI's column-name +
-/// stringified-row shape. Column names come from the input `schema`
-/// even when `batches` is empty, matching what the network clients do.
-fn record_batches_to_query_result(
-    schema: &arrow_schema::Schema,
-    batches: &[RecordBatch],
-) -> QueryResult {
-    let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-
-    let mut rows = Vec::new();
-    for batch in batches {
-        let formatters: Vec<_> = batch
-            .columns()
-            .iter()
-            .map(|col| {
-                arrow::util::display::ArrayFormatter::try_new(col.as_ref(), &Default::default())
-            })
-            .collect::<Result<_, _>>()
-            .unwrap_or_default();
-        for row_idx in 0..batch.num_rows() {
-            let row: Vec<String> = formatters
-                .iter()
-                .map(|f| f.value(row_idx).to_string())
-                .collect();
-            rows.push(row);
-        }
-    }
-    QueryResult { columns, rows }
 }
 
 /// True when `sql`, after skipping leading whitespace and SQL comments,
@@ -3086,6 +3019,25 @@ mod tests {
         // embedded included (finding 700); DataFusion's `Int64(1)` is gone.
         assert_eq!(result.columns, vec!["_col0".to_string()]);
         assert!(result.rows.is_empty());
+    }
+
+    /// A NULL cell is marked, so `-f json` prints `null` and an empty string
+    /// stays `""`. Both used to render as `""`.
+    #[tokio::test]
+    async fn embedded_client_marks_null_cells() {
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
+        let sql = "SELECT CAST(NULL AS DECIMAL(7,2)) AS n, '' AS e, 1 AS one \
+                   UNION ALL SELECT 2.50, NULL, 2 ORDER BY one";
+        let result = client.execute(sql).await.expect("query");
+        assert_eq!(result.rows.len(), 2);
+        let marked: Vec<Vec<bool>> = (0..2)
+            .map(|r| (0..3).map(|c| result.is_null(r, c)).collect())
+            .collect();
+        assert_eq!(
+            marked,
+            vec![vec![true, false, false], vec![false, true, false]]
+        );
+        assert_eq!(result.rows[0][1], "");
     }
 
     /// Finding 700: Trino shapes that only the Trino HTTP door used to accept
@@ -4737,7 +4689,7 @@ mod tests {
             arrow_schema::DataType::Int64,
             false,
         )]));
-        let batch = RecordBatch::try_new(
+        let batch = arrow_array::RecordBatch::try_new(
             Arc::clone(&schema),
             vec![Arc::new(arrow_array::Int64Array::from(vec![1]))],
         )

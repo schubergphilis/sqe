@@ -481,6 +481,12 @@ sqe-cli -e "SELECT 1 AS a, 'hello' AS b;" --format json
 {"a":"1","b":"hello"}
 ```
 
+### NULL values
+
+SQL NULL is `null` in JSON and `NULL` in the table. CSV and TSV print an
+empty field, so NULL and an empty string look the same there; use
+`--format json` when the difference matters.
+
 ## Authentication
 
 ### Username/Password
