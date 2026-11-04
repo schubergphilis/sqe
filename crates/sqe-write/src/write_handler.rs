@@ -2516,9 +2516,22 @@ impl WriteHandler {
             )?
         };
 
-        let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, &effective_sql)
-            .await
-            .map_err(SqeError::planning)?;
+        // The source is planned on its own, so a bound placeholder written
+        // straight into a column (`VALUES (?, ?)`) has no type until it
+        // meets the table; give it the column's, so a wrong value is refused
+        // at binding instead of failing in the write's cast, whose error
+        // quotes it. `effective_sql` yields the table's columns in order.
+        let target_types: Vec<_> = build_arrow_schema_for_table(&table)?
+            .fields()
+            .iter()
+            .map(|f| f.data_type().clone())
+            .collect();
+        let df = sqe_catalog::txn::with_insert_target(
+            target_types,
+            sqe_catalog::file_tvf_prepare::plan_sql(ctx, &effective_sql),
+        )
+        .await
+        .map_err(SqeError::planning)?;
 
         // 505: fail a mis-shaped INSERT here, at planning time, before the
         // stream starts and before the writer opens its first parquet part.

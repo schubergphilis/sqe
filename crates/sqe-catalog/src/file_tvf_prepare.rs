@@ -182,6 +182,10 @@ fn bind_statement_params(df: DataFrame) -> DFResult<DataFrame> {
         return Ok(df);
     };
     let (state, plan) = df.into_parts();
+    let plan = match crate::txn::insert_target() {
+        Some(target) => sqe_core::type_insert_placeholders(plan, &target)?,
+        None => plan,
+    };
     let plan = sqe_core::bind_params(plan, &params).map_err(DataFusionError::Plan)?;
     Ok(DataFrame::new(state, plan))
 }
