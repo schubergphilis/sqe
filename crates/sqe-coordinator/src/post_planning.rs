@@ -37,10 +37,13 @@
 //!    per `query.sort_mode`.
 //! 8. `SortMemoryRule` -- FAIL CLOSED when remaining `SortExec`s cannot
 //!    reserve merge headroom (ExternalSorterMerge is non-spillable).
-//! 9. `StripSelfJoinDynamicFiltersRule` -- q95-class inlist blowup; runs
-//!    before distribution so the worker predicate and the coordinator join
-//!    agree on which dynamic filters exist.
-//! 10. (outside this module) `QueryHandler::try_distribute`.
+//! 9. `SettleDynamicFiltersRule` -- re-attaches scan dynamic filters that
+//!    rules 1-8 orphaned by rebuilding a join or a TopK sort (#787); see
+//!    `sqe_catalog::dynamic_filter_wiring`.
+//! 10. `StripSelfJoinDynamicFiltersRule` -- q95-class inlist blowup; runs
+//!     before distribution so the worker predicate and the coordinator join
+//!     agree on which dynamic filters exist.
+//! 11. (outside this module) `QueryHandler::try_distribute`.
 //!
 //! # Failure policy
 //!
@@ -156,6 +159,10 @@ pub fn post_planning_rules(
     steps.push(Step::fail(
         sqe_planner::SortMemoryRule::new(sqe_planner::sort_grant_bytes(&query.max_query_memory)),
         "Sort memory admission failed",
+    ));
+    // After every rule that rebuilds a hash join or a TopK sort (#787).
+    steps.push(Step::fallback(
+        sqe_catalog::dynamic_filter_wiring::SettleDynamicFiltersRule::new(),
     ));
     steps.push(Step::fallback(StripSelfJoinDynamicFiltersRule));
     steps
@@ -287,7 +294,7 @@ impl PhysicalOptimizerRule for StripSelfJoinDynamicFiltersRule {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-        plan.transform_up(|node| {
+        let stripped = plan.transform_up(|node| {
             let Some(hj) = node.downcast_ref::<HashJoinExec>() else {
                 return Ok(Transformed::no(node));
             };
@@ -320,8 +327,11 @@ impl PhysicalOptimizerRule for StripSelfJoinDynamicFiltersRule {
                 "Stripped dynamic filter from Iceberg self-join HashJoinExec (q95-class)"
             );
             Ok(Transformed::yes(Arc::new(rebuilt) as Arc<dyn ExecutionPlan>))
-        })
-        .map(|t| t.data)
+        })?;
+        // The probe scan still holds the stripped filter; nothing updates
+        // it, so it would wait out runtime_filter_wait_ms for nothing. Drop
+        // it without re-pushing, which would hand the join a fresh one (#787).
+        sqe_catalog::dynamic_filter_wiring::settle_dynamic_filters(stripped.data, None)
     }
 
     fn name(&self) -> &str {
@@ -455,6 +465,7 @@ mod tests {
             "CartesianAdmissionRule",
             "AdaptiveSortRule",
             "SortMemoryRule",
+            "SettleDynamicFiltersRule",
             "StripSelfJoinDynamicFiltersRule",
         ]);
         assert_eq!(names, expected, "post-planning rule order drifted");

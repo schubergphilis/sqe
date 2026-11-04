@@ -28,7 +28,10 @@ use datafusion::logical_expr::{BinaryExpr, Expr, ExprSchemable, LogicalPlan, Ope
 /// already pushed into a scan, and the projection, group-by and window
 /// partition expressions a filter can be substituted through. Aggregate
 /// arguments and sort keys only ever run above the filter, so they are
-/// skipped.
+/// skipped. A TopK or aggregate dynamic filter built from them does reach
+/// the Iceberg scan, below the row filter, but every scan-side evaluation
+/// of a dynamic filter treats an error as "keep the rows" (#787), so a
+/// hidden row cannot surface through it.
 pub(crate) fn plan_has_fallible_predicate(plan: &LogicalPlan) -> bool {
     let mut found = false;
     // The closure never fails; a traversal error is treated as fallible.
