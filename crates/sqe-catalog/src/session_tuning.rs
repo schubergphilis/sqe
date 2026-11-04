@@ -18,25 +18,35 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::eliminate_cross_join::EliminateCrossJoin;
 
+mod decimal_rounding;
 mod sorted_row_number;
 mod top_row_number;
 
+pub use decimal_rounding::{
+    register_decimal_rounding, register_rescale, DecimalRoundingRule, RescaleUdf, RoundedAvg,
+    RESCALE,
+};
 pub use sorted_row_number::{SortedRowNumberExec, SortedRowNumberRule};
 pub use top_row_number::TopRowNumberRule;
 
 /// A context for user SQL: `config` and `runtime`, planned by
 /// [`EngineQueryPlanner`], with SQE's [`EliminateCrossJoin`] in place of
 /// DataFusion's and [`SortedRowNumberRule`] after DataFusion's physical rules.
+/// Decimal division, `avg` and decimal casts round half away from zero
+/// ([`DecimalRoundingRule`], [`RoundedAvg`]).
 pub fn engine_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> SessionContext {
     let state = SessionStateBuilder::new()
         .with_config(config)
         .with_runtime_env(runtime)
         .with_default_features()
+        .with_analyzer_rule(Arc::new(DecimalRoundingRule))
         .with_optimizer_rules(engine_optimizer_rules())
         .with_physical_optimizer_rule(Arc::new(SortedRowNumberRule))
         .with_query_planner(Arc::new(EngineQueryPlanner))
         .build();
-    SessionContext::new_with_state(state)
+    let ctx = SessionContext::new_with_state(state);
+    register_decimal_rounding(&ctx);
+    ctx
 }
 
 /// DataFusion's default logical rules, with `eliminate_cross_join` swapped

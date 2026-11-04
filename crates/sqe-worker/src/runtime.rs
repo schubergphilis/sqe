@@ -84,6 +84,8 @@ pub fn build_session_context_with_pool(
     // coordinator, which drops a conjunct this list cannot decode. Not the
     // variant functions: a variant prune rides its own ticket field.
     sqe_geo::register_geo_functions(&ctx);
+    // A decimal cast in a filter rounds through `__sqe_rescale`.
+    sqe_catalog::session_tuning::register_rescale(&ctx);
     Ok(ctx)
 }
 
