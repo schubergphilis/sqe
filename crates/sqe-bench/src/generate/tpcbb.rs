@@ -155,6 +155,14 @@ fn random_time_str(rng: &mut StdRng) -> String {
     )
 }
 
+/// Item keys are drawn from `1..=item_domain(scale)`: the rows of the TPC-DS
+/// `item` table they join (q01, q03, q04). A linear `scale * 18,000` matched
+/// it only up to SF1. The item table grows sublinearly above SF1, so at SF100
+/// ~89% of the click and review item keys had no item row (#785).
+fn item_domain(scale: f64) -> i32 {
+    super::tpcds::item_rows(scale) as i32
+}
+
 // ---------------------------------------------------------------------------
 // Table generators
 // ---------------------------------------------------------------------------
@@ -165,7 +173,7 @@ fn stream_web_clickstreams(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let total = total.max(1);
     // Use a realistic number of items / web pages / users tied to scale factor.
     // TPC-DS SF1 has ~18,000 items, ~2,040 web pages, ~100,000 customers.
-    let num_items = ((scale * 18_000.0) as i32).max(1);
+    let num_items = item_domain(scale);
     let num_web_pages = ((scale * 2_040.0) as i32).max(1);
     let num_users = ((scale * 100_000.0) as i32).max(1);
     let num_date_sks = ((scale * 73_049.0) as i32).max(1); // TPC-DS date_dim rows at SF1
@@ -266,7 +274,7 @@ fn stream_product_reviews(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let schema = product_reviews_schema();
     let total = super::scaled(scale, 100_000.0);
     let total = total.max(1);
-    let num_items = ((scale * 18_000.0) as i32).max(1);
+    let num_items = item_domain(scale);
     let num_users = ((scale * 100_000.0) as i32).max(1);
     let num_orders = ((scale * 720_000.0) as i64).max(1);
 
@@ -575,6 +583,33 @@ mod tests {
         for i in 0..rating_col.len() {
             let v = rating_col.value(i);
             assert!((1..=5).contains(&v), "rating {v} out of range");
+        }
+    }
+
+    /// The item keys follow the TPC-DS item table, linear up to SF1 and
+    /// sublinear above it, so every key joins an item row (#785).
+    #[test]
+    fn item_keys_stay_inside_the_item_table() {
+        assert_eq!(item_domain(0.01), 180);
+        assert_eq!(item_domain(1.0), 18_000);
+        assert_eq!(item_domain(10.0), 102_000);
+        assert_eq!(item_domain(100.0), 204_000);
+
+        use arrow_array::Array;
+        let domain = 1..=item_domain(0.01);
+        let (_, clicks) = generate_web_clickstreams(0.01);
+        let (_, reviews) = generate_product_reviews(0.01);
+        for (batches, col) in [(&clicks, "wcs_item_sk"), (&reviews, "pr_item_sk")] {
+            for b in batches {
+                let keys = b.column_by_name(col).unwrap();
+                let keys = keys.as_any().downcast_ref::<Int32Array>().unwrap();
+                for i in 0..b.num_rows() {
+                    if keys.is_valid(i) {
+                        let key = keys.value(i);
+                        assert!(domain.contains(&key), "item key {key} outside {domain:?}");
+                    }
+                }
+            }
         }
     }
 

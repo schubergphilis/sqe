@@ -645,7 +645,8 @@ fn sublinear_above_sf1(sf: f64, sf1_rows: f64, points: &[(f64, f64)]) -> usize {
 }
 
 // 180 / 18,000; sf10 102,000; sf100 204,000; sf1000 300,000.
-fn item_rows(sf: f64) -> usize {
+// tpcbb draws its item keys from the same domain.
+pub(super) fn item_rows(sf: f64) -> usize {
     sublinear_above_sf1(
         sf,
         18_000.0,
