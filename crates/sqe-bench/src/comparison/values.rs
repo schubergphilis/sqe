@@ -5,10 +5,13 @@
 //! module compares the rows themselves, order-independently, with numeric
 //! rules that absorb the engines' type differences but not wrong numbers:
 //!
-//! - Exact numbers (integers, decimals) compare exactly after rounding both
-//!   sides half-up to the smaller of the two scales. DataFusion's
-//!   `avg(decimal(7,2))` is `decimal(11,6)` where Trino's is `decimal(7,2)`;
-//!   12.345000 and 12.35 are the same answer, 12.34 and 12.35 are not.
+//! - Exact numbers (integers, decimals) match when one true value could
+//!   round half-up to both: `|a - b| < ½·10^-sa + ½·10^-sb`. At equal scales
+//!   that is equality. DataFusion's `avg(decimal(7,2))` is `decimal(11,6)`
+//!   where Trino's is `decimal(7,2)`: 12.345000 and 12.35 are the same
+//!   answer, 12.34 and 12.35 are not. Rounding the wider side to the
+//!   narrower scale instead would round twice: 1.20649747… is 1.2064975 at
+//!   scale 7 and 1.206497 at scale 6, but 1.2064975 re-rounds to 1.206498.
 //! - Floating point (on either side) compares with a relative tolerance:
 //!   aggregation order changes the last bits.
 //! - Everything else compares by its display string; NULL only equals NULL.
@@ -75,8 +78,13 @@ fn rule(sqe: &DataType, trino: &DataType) -> Rule {
 #[derive(Clone, Debug, PartialEq)]
 enum Cell {
     Null,
-    /// Unscaled value at the column's rule scale.
-    Exact(i128),
+    /// `key`: the unscaled value rounded to the column's rule scale, for
+    /// sorting; `value` at `scale`: the cell as the engine returned it.
+    Exact {
+        key: i128,
+        value: i128,
+        scale: i8,
+    },
     Float(f64),
     Text(String),
 }
@@ -86,7 +94,7 @@ impl Cell {
     fn key(&self) -> String {
         match self {
             Cell::Null => String::new(),
-            Cell::Exact(v) => format!("e{v:040}"),
+            Cell::Exact { key, .. } => format!("e{key:040}"),
             Cell::Float(v) => {
                 let v = if *v == 0.0 { 0.0 } else { *v };
                 format!("f{v:.*e}", FLOAT_KEY_DIGITS - 1)
@@ -95,10 +103,10 @@ impl Cell {
         }
     }
 
-    fn display(&self, scale: i8) -> String {
+    fn display(&self) -> String {
         match self {
             Cell::Null => "NULL".to_string(),
-            Cell::Exact(v) => format_unscaled(*v, scale),
+            Cell::Exact { value, scale, .. } => format_unscaled(*value, *scale),
             Cell::Float(v) => v.to_string(),
             Cell::Text(s) => s.clone(),
         }
@@ -109,9 +117,33 @@ impl Cell {
             (Cell::Float(a), Cell::Float(b)) => {
                 (a - b).abs() <= FLOAT_ABS_TOL.max(FLOAT_REL_TOL * a.abs().max(b.abs()))
             }
+            (
+                Cell::Exact {
+                    key: ka,
+                    value: a,
+                    scale: sa,
+                },
+                Cell::Exact {
+                    key: kb,
+                    value: b,
+                    scale: sb,
+                },
+            ) => same_rounded_value(*a, *sa, *b, *sb).unwrap_or(ka == kb),
             _ => self == other,
         }
     }
+}
+
+/// Whether one true value rounds half-up to both `a` (at scale `sa`) and `b`
+/// (at `sb`). Rounding to `u = 10^-s` maps `[a - u/2, a + u/2)` to `a`, so the
+/// two half-open intervals meet when `|a - b| < (ua + ub) / 2`. `None` when
+/// the common scale overflows `i128`.
+fn same_rounded_value(a: i128, sa: i8, b: i128, sb: i8) -> Option<bool> {
+    let common = sa.max(sb);
+    let (a, b) = (rescale(a, sa, common)?, rescale(b, sb, common)?);
+    let unit = |s: i8| 10i128.checked_pow(u32::from((common - s) as u8));
+    let band = unit(sa)?.checked_add(unit(sb)?)?;
+    Some(a.checked_sub(b)?.unsigned_abs().checked_mul(2)? < band.unsigned_abs())
 }
 
 /// Split a decimal display string ("-12.3450") into (unscaled, scale).
@@ -159,8 +191,9 @@ fn cell(array: &dyn Array, row: usize, rule: Rule) -> Cell {
             .map(Cell::Float)
             .unwrap_or(Cell::Text(text)),
         Rule::Exact(to) => parse_exact(&text)
-            .and_then(|(v, from)| rescale(v, from, to))
-            .map(Cell::Exact)
+            .and_then(|(value, scale)| {
+                rescale(value, scale, to).map(|key| Cell::Exact { key, value, scale })
+            })
             .unwrap_or(Cell::Text(text)),
     }
 }
@@ -226,17 +259,13 @@ pub fn value_diff(sqe: &[RecordBatch], trino: &[RecordBatch]) -> Option<String> 
         if let Some(col) = bad {
             differing += 1;
             if first.is_none() {
-                let scale = match rules[col] {
-                    Rule::Exact(s) => s,
-                    _ => 0,
-                };
                 first = Some(format!(
                     "sorted row {}, column {} `{}`: SQE {} vs Trino {}",
                     i + 1,
                     col + 1,
                     sqe_cols[col].0,
-                    ra[col].display(scale),
-                    rb[col].display(scale)
+                    ra[col].display(),
+                    rb[col].display()
                 ));
             }
         }
@@ -313,6 +342,41 @@ mod tests {
         )]);
         let trino = batch(vec![("avg", dec(vec![Some(1235), Some(-100), None], 7, 2))]);
         assert_eq!(value_diff(&[sqe], &[trino]), None);
+    }
+
+    #[test]
+    fn rounded_values_at_different_scales_are_not_rounded_twice() {
+        // TPC-DS q12 revenueratio, 1493.54 * 100 / 123791.39 = 1.20649747...:
+        // SQE plans scale 7, Trino scale 6, both round half-up.
+        let sqe = batch(vec![("r", dec(vec![Some(12_064_975)], 28, 7))]);
+        let trino = batch(vec![("r", dec(vec![Some(1_206_497)], 38, 6))]);
+        assert_eq!(value_diff(&[sqe], &[trino]), None);
+        // Negative values mirror it.
+        assert_eq!(
+            same_rounded_value(-12_064_975, 7, -1_206_497, 6),
+            Some(true)
+        );
+        // 1.2064976 is past the band: no true value rounds to both.
+        let sqe = batch(vec![("r", dec(vec![Some(12_064_976)], 28, 7))]);
+        let trino = batch(vec![("r", dec(vec![Some(1_206_497)], 38, 6))]);
+        let d = value_diff(&[sqe], &[trino]).expect("1.2064976 vs 1.206497 must differ");
+        assert!(d.contains("SQE 1.2064976 vs Trino 1.206497"), "{d}");
+        // Lower edge: 1.2064965 (true value in [1.20649645, 1.20649655))
+        // overlaps 1.206497's [1.2064965, 1.2064975); 1.2064964 does not.
+        assert_eq!(same_rounded_value(12_064_965, 7, 1_206_497, 6), Some(true));
+        assert_eq!(same_rounded_value(12_064_964, 7, 1_206_497, 6), Some(false));
+        // Equal scales compare exactly; one unit apart is a difference.
+        assert_eq!(same_rounded_value(1234, 2, 1235, 2), Some(false));
+        // TPC-DS q58 ss_dev: same scale, different digits.
+        assert_eq!(
+            same_rounded_value(11_112_967, 6, 11_113_000, 6),
+            Some(false)
+        );
+        // q61: SQE scale 8 carries fewer true digits than Trino's.
+        assert_eq!(
+            same_rounded_value(8_685_003_100, 8, 8_685_003_126, 8),
+            Some(false)
+        );
     }
 
     #[test]
