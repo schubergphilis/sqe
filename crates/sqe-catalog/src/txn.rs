@@ -244,6 +244,9 @@ struct StatementScope {
     txn: Option<Arc<TxnScope>>,
     write_branch: Option<Arc<str>>,
     params: Option<Arc<[datafusion::scalar::ScalarValue]>>,
+    /// The column types an INSERT source writes, position by position, while
+    /// that source is planned ([`with_insert_target`]).
+    insert_target: Option<Arc<[datafusion::arrow::datatypes::DataType]>>,
 }
 
 tokio::task_local! {
@@ -264,6 +267,7 @@ pub async fn scope<F: Future>(txn: Option<Arc<TxnScope>>, f: F) -> F::Output {
         txn,
         write_branch: None,
         params: inherited_params(),
+        insert_target: None,
     };
     CURRENT.scope(scope, f).await
 }
@@ -288,6 +292,27 @@ pub fn params() -> Option<Arc<[datafusion::scalar::ScalarValue]>> {
     inherited_params()
 }
 
+/// Plan the INSERT source `f` knowing the column types it writes,
+/// position by position, so the statement's placeholders that feed a
+/// column directly (`VALUES (?, ?)`, `SELECT ?, ?`) are typed from it when
+/// they are bound (`sqe_core::type_insert_placeholders`). Wrap only the
+/// planning of the source itself: every plan made inside the scope is
+/// typed against these columns.
+pub async fn with_insert_target<F: Future>(
+    types: Vec<datafusion::arrow::datatypes::DataType>,
+    f: F,
+) -> F::Output {
+    let mut scope = CURRENT.try_with(StatementScope::clone).unwrap_or_default();
+    scope.insert_target = Some(types.into());
+    CURRENT.scope(scope, f).await
+}
+
+/// The column types of the INSERT source being planned
+/// ([`with_insert_target`]).
+pub fn insert_target() -> Option<Arc<[datafusion::arrow::datatypes::DataType]>> {
+    CURRENT.try_with(|s| s.insert_target.clone()).ok().flatten()
+}
+
 /// Run the data write `f` on the session's `WRITE_BRANCH` (#829): inside
 /// `txn` when there is one (the branch is then ignored; a transaction
 /// refuses writes with a branch set), else on `write_branch`. While it
@@ -307,6 +332,7 @@ pub async fn write_scope<F: Future>(
         txn,
         write_branch,
         params: inherited_params(),
+        insert_target: None,
     };
     CURRENT.scope(scope, f).await
 }
