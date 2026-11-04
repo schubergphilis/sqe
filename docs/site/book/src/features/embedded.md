@@ -275,7 +275,9 @@ Beyond that:
   process runs as the Unix user. An attached REST catalog uses the secret you
   give it, and a bearer token in a secret is not refreshed.
 - **Single-node execution.** No workers. The query memory pool is capped by
-  `--memory-limit` (default 1GB).
+  `--memory-limit` (default 1GB) and shared like the coordinator's default
+  pool: first come, first served, with the top 20% kept for consumers that
+  cannot spill, such as the scan's decodes.
 - **Single writer.** The SQLite catalog is a single-process catalog.
 - **No observability endpoints.** Prometheus metrics, OpenTelemetry, and
   the audit log live in the server.
