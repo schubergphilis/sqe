@@ -1963,10 +1963,17 @@ impl QueryHandler {
                         let inner = statement.to_string();
                         let (ctx, _) = self.create_session_context(session).await?;
                         if *analyze {
-                            self.explain_handler.analyze(session, &inner, &ctx).await
+                            // It runs the query: same quota, sort share and
+                            // join fallback as the query itself (#788).
+                            let (ctx, fallback) = self.explain_execution(ctx, &query_id, quota);
+                            self.explain_handler
+                                .analyze(session, &inner, &ctx, fallback)
+                                .await
                         } else {
                             let is_admin = self.config.auth.has_admin_role(&session.user.roles);
-                            self.explain_handler.plan(session, &inner, &ctx, is_admin).await
+                            self.explain_handler
+                                .plan(session, &inner, &ctx, is_admin)
+                                .await
                         }
                     } else if let sqlparser::ast::Statement::ShowColumns { show_options, .. } =
                         stmt.as_ref()
@@ -2701,7 +2708,10 @@ impl QueryHandler {
 
                 StatementKind::ExplainFull(inner) => {
                     let (ctx, _) = self.create_session_context(session).await?;
-                    self.explain_handler.full(session, inner, &ctx).await
+                    let (ctx, fallback) = self.explain_execution(ctx, &query_id, quota);
+                    self.explain_handler
+                        .full(session, inner, &ctx, fallback)
+                        .await
                 }
 
                 StatementKind::Delete(stmt) => {
@@ -4679,6 +4689,31 @@ impl QueryHandler {
     /// under the query's own quota, so a retry gets a fresh quota. `None`
     /// too for a query admitted under pressure: retrying a query that did
     /// not fit the pressure cap only spends more of a red pool.
+    /// The context and join fallback an EXPLAIN ANALYZE / FULL runs its plan
+    /// with: the query pool `execute_query` builds (`max_query_memory`, the
+    /// sort share) and, once the enforced plan is known, the same fallback.
+    /// They ran on the session's shared pool, outside the query's cap, so a
+    /// full sort that completes as a query failed when explained (#788).
+    fn explain_execution(
+        &self,
+        ctx: SessionContext,
+        query_id: &uuid::Uuid,
+        quota: crate::query_memory::QueryQuota,
+    ) -> (
+        SessionContext,
+        impl FnOnce(LogicalPlan) -> Option<crate::join_fallback::JoinFallback> + '_,
+    ) {
+        let shared_pool = Arc::clone(&ctx.runtime_env().memory_pool);
+        let ctx =
+            crate::query_memory::with_query_quota(ctx, quota, self.unspillable_headroom_percent);
+        let query_id = *query_id;
+        let fallback_ctx = ctx.clone();
+        let fallback = move |logical| {
+            self.join_fallback(&fallback_ctx, shared_pool, logical, &query_id, quota)
+        };
+        (ctx, fallback)
+    }
+
     fn join_fallback(
         &self,
         ctx: &SessionContext,
