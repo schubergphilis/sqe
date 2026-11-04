@@ -241,6 +241,10 @@ pub struct QueryComparison {
     pub sqe_error: Option<String>,
     pub trino_error: Option<String>,
     pub status: CompareStatusReport,
+    /// First differing value when the row counts match but the rows do not
+    /// (status `ValueDiff`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_diff: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -267,6 +271,9 @@ pub enum CompareStatusReport {
     /// Trino. SQE is correct, so this counts as a pass.
     DialectDiff,
     RowDiff,
+    /// Same row count, different values (see `comparison::values`). Counts
+    /// as a failure: a row-count match alone used to report these as Match.
+    ValueDiff,
     SqeFailed,
     TrinoFailed,
     BothFailed,
@@ -302,6 +309,9 @@ pub struct ComparisonSummary {
     #[serde(default)]
     pub dialect_diff: usize,
     pub row_diff: usize,
+    /// Same row count, different values.
+    #[serde(default)]
+    pub value_diff: usize,
     pub sqe_failed: usize,
     pub trino_failed: usize,
     pub both_failed: usize,

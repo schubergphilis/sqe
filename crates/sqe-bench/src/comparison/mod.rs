@@ -1,6 +1,7 @@
 //! Side-by-side benchmark comparison: run identical queries against SQE and Trino.
 
 pub mod classify;
+pub mod values;
 
 use crate::client::BenchClient;
 use crate::query::QualifyTables;
@@ -140,6 +141,14 @@ pub async fn run_comparison(
 
         let canonical = canonical_rows(expected_rows.as_ref(), benchmark, &query_name, scale);
         let status = classify_status(&sqe_error, &trino_error, sqe_rows, trino_rows, canonical);
+        let (status, value_diff) = values::refine_status(
+            status,
+            sqe_result.as_deref().ok(),
+            trino_result.as_deref().ok(),
+        );
+        if let Some(diff) = &value_diff {
+            info!("  {} value diff: {}", query_name, diff);
+        }
 
         let speedup = if sqe_time_ms > 0 {
             trino_time_ms as f64 / sqe_time_ms as f64
@@ -163,6 +172,7 @@ pub async fn run_comparison(
             sqe_error,
             trino_error,
             status,
+            value_diff,
         });
     }
 
@@ -192,6 +202,10 @@ pub async fn run_comparison(
         .iter()
         .filter(|c| matches!(c.status, CompareStatusReport::RowDiff))
         .count();
+    let value_diff = comparisons
+        .iter()
+        .filter(|c| matches!(c.status, CompareStatusReport::ValueDiff))
+        .count();
     let sqe_failed = comparisons
         .iter()
         .filter(|c| matches!(c.status, CompareStatusReport::SqeFailed))
@@ -219,6 +233,7 @@ pub async fn run_comparison(
                     | CompareStatusReport::VacuousBug
                     | CompareStatusReport::DialectDiff
                     | CompareStatusReport::RowDiff
+                    | CompareStatusReport::ValueDiff
             )
         })
         .map(|c| c.speedup)
@@ -251,6 +266,7 @@ pub async fn run_comparison(
             vacuous_bug,
             dialect_diff,
             row_diff,
+            value_diff,
             sqe_failed,
             trino_failed,
             both_failed,
@@ -282,6 +298,7 @@ pub async fn run_comparison(
             CompareStatusReport::VacuousBug => "VACUOUS BUG",
             CompareStatusReport::DialectDiff => "DIALECT OK",
             CompareStatusReport::RowDiff => "DIFF",
+            CompareStatusReport::ValueDiff => "VALUE DIFF",
             CompareStatusReport::SqeFailed => "FAIL SQE",
             CompareStatusReport::TrinoFailed => "FAIL Trino",
             CompareStatusReport::BothFailed => "FAIL Both",
@@ -298,7 +315,7 @@ pub async fn run_comparison(
         );
     }
     println!(
-        "\n**Total:** SQE {}ms, Trino {}ms, Avg speedup {:.1}x, Matched {}/{} ({} vacuous: 0 rows on both engines, {} expected-empty: canonically 0, {} vacuous-bug: canonically non-zero but empty, {} dialect-diff: SQE matches canonical, Trino diverges)\n",
+        "\n**Total:** SQE {}ms, Trino {}ms, Avg speedup {:.1}x, Matched {}/{} ({} vacuous: 0 rows on both engines, {} expected-empty: canonically 0, {} vacuous-bug: canonically non-zero but empty, {} dialect-diff: SQE matches canonical, Trino diverges, {} value-diff: same row count, different values)\n",
         report.summary.sqe_total_ms,
         report.summary.trino_total_ms,
         report.summary.avg_speedup,
@@ -307,8 +324,16 @@ pub async fn run_comparison(
         report.summary.vacuous,
         report.summary.expected_empty,
         report.summary.vacuous_bug,
-        report.summary.dialect_diff
+        report.summary.dialect_diff,
+        report.summary.value_diff
     );
+    for q in report.queries.iter().filter(|q| q.value_diff.is_some()) {
+        println!(
+            "- {} value diff: {}",
+            q.query_name,
+            q.value_diff.as_deref().unwrap_or_default()
+        );
+    }
 
     Ok(report)
 }
