@@ -13,11 +13,16 @@ WITH clicks AS (
     FROM store_sales
     GROUP BY ss_item_sk
 )
+-- The casts give the measures the original's types for a DECIMAL(7,2)
+-- ss_net_paid: SUM -> DECIMAL(17,2), AVG -> DECIMAL(11,6). The products are
+-- DECIMAL(38,2), so the weighted sum cannot overflow before the original's
+-- does; the final cast fails where the original's sum would exceed 17 digits.
+-- AVG truncates to 6 decimals, and so does the decimal division.
 SELECT i.i_item_id, i.i_item_desc, i.i_category, i.i_class,
        SUM(c.click_count * s.sale_count) AS click_sales_count,
-       SUM(c.click_count * s.net_paid) AS total_net_revenue,
-       SUM(c.click_count * s.net_paid)
-         / NULLIF(SUM(c.click_count * s.paid_count), 0) AS avg_sale_amount
+       CAST(SUM(c.click_count * s.net_paid) AS DECIMAL(17, 2)) AS total_net_revenue,
+       CAST(SUM(c.click_count * s.net_paid)
+         / NULLIF(SUM(c.click_count * s.paid_count), 0) AS DECIMAL(11, 6)) AS avg_sale_amount
 FROM clicks c
 JOIN sales s ON s.ss_item_sk = c.wcs_item_sk
 JOIN item i ON i.i_item_sk = c.wcs_item_sk
