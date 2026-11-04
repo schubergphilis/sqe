@@ -163,14 +163,32 @@ pub(crate) fn is_quota_refusal(error: &DataFusionError) -> bool {
     false
 }
 
+/// The DataFusion setting a spill past the disk manager's cap names. SQE
+/// sets that cap from `coordinator.spill_max_bytes`, which is the knob an
+/// operator can turn.
+const DATAFUSION_SPILL_CAP: &str = "datafusion.runtime.max_temp_directory_size";
+
 /// Preserve resource refusal through buffered, streaming and Flight paths.
+/// A spill refused by `coordinator.spill_max_bytes` arrives as an I/O error
+/// naming DataFusion's setting; it is a resource refusal too, and names
+/// SQE's.
 pub(crate) fn execution_error(error: &DataFusionError) -> sqe_core::SqeError {
+    let message = error.to_string();
+    if message.contains(DATAFUSION_SPILL_CAP) {
+        return sqe_core::SqeError::with_code(
+            sqe_core::SqeErrorCode::ResourceExhausted,
+            format!(
+                "Query execution failed: {}",
+                message.replace(DATAFUSION_SPILL_CAP, "coordinator.spill_max_bytes")
+            ),
+        );
+    }
     let code = if is_resources_exhausted(error) {
         sqe_core::SqeErrorCode::ResourceExhausted
     } else {
         sqe_core::SqeErrorCode::ExecutionFailed
     };
-    sqe_core::SqeError::with_code(code, format!("Query execution failed: {error}"))
+    sqe_core::SqeError::with_code(code, format!("Query execution failed: {message}"))
 }
 
 /// Clone session state for one execution, preserving catalogs, object stores,
@@ -379,6 +397,22 @@ mod tests {
             .unwrap();
         assert_eq!(light[0].num_rows(), 1);
         assert_eq!(shared.reserved(), 0);
+    }
+
+    #[test]
+    fn a_spill_past_the_disk_cap_names_spill_max_bytes() {
+        // The text DataFusion 55's disk manager returns, wrapped as the
+        // spill writer wraps it.
+        let refused = DataFusionError::IoError(std::io::Error::other(
+            "The used disk space during the spilling process has exceeded the allowable \
+             limit of 1.0 MB. Please try increasing the config: \
+             `datafusion.runtime.max_temp_directory_size`.",
+        ));
+        let err = execution_error(&refused.context("ExternalSorter"));
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::ResourceExhausted);
+        let text = err.to_string();
+        assert!(text.contains("`coordinator.spill_max_bytes`"), "{text}");
+        assert!(!text.contains("max_temp_directory_size"), "{text}");
     }
 
     #[test]
