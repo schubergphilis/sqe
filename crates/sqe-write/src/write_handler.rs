@@ -1922,6 +1922,7 @@ impl WriteHandler {
             catalog,
             table_ident,
             &committed,
+            committed.file_io(),
             op,
             sketches,
             self.metrics.as_deref(),
