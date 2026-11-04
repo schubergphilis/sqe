@@ -6,7 +6,6 @@ SQE embedded path with process startup included; this is not SF100 qualification
 """
 import argparse
 import json
-import math
 from pathlib import Path
 import re
 import statistics
@@ -34,9 +33,21 @@ def main():
         folder = Path(folder)
         conn = duckdb.connect()
         conn.execute("SET memory_limit='512MB'")
-        conn.execute("CREATE TABLE item AS SELECT n::INTEGER i_item_sk, 'item-'||n i_item_id, 'description-'||n i_item_desc, 'category' i_category, 'class' i_class FROM range(1, ?) t(n)", [args.keys + 1])
-        conn.execute("CREATE TABLE web_clickstreams AS SELECT (n%?+1)::INTEGER wcs_item_sk, CASE WHEN n%4=0 THEN NULL ELSE n END wcs_sales_sk FROM range(?) t(n)", [args.keys, args.rows])
-        conn.execute("CREATE TABLE store_sales AS SELECT (n%?+1)::INTEGER ss_item_sk, CASE WHEN n%7=0 THEN NULL ELSE (n%100+1)/100.0 END::DOUBLE ss_net_paid FROM range(?) t(n)", [args.keys, args.rows])
+        # The edge cases the rewrite must preserve:
+        # - item: pairs of surrogate keys share an i_item_id (TPC-DS keeps
+        #   revisions of one item), and every third revision has its own
+        #   description, so a group can hold one key or two.
+        # - Both facts reference keys past the item table (no item row), and
+        #   some NULL item keys.
+        # - store_sales has no rows for keys divisible by 17 (clicks without
+        #   sales), and keys past the click range (sales without clicks).
+        # - ss_net_paid is DECIMAL(7,2) like TPC-DS, with NULLs, negative
+        #   values (every fifth key only has refunds, so its average is
+        #   negative and truncates toward zero), and an item (key 2) whose
+        #   every value is NULL.
+        conn.execute("CREATE TABLE item AS SELECT n::INTEGER i_item_sk, 'item-'||(n//2) i_item_id, CASE WHEN n%3=0 THEN 'description-alt-'||n ELSE 'description-'||(n//2) END i_item_desc, 'category-'||(n%5) i_category, 'class' i_class FROM range(1, ?) t(n)", [args.keys + 1])
+        conn.execute("CREATE TABLE web_clickstreams AS SELECT CASE WHEN n%11=0 THEN NULL ELSE n%?+1 END::INTEGER wcs_item_sk, CASE WHEN n%4=0 THEN NULL ELSE n END::BIGINT wcs_sales_sk FROM range(?) t(n)", [args.keys + 10, args.rows])
+        conn.execute("CREATE TABLE store_sales AS SELECT CASE WHEN n%13=0 THEN NULL ELSE n%?+1 END::INTEGER ss_item_sk, CASE WHEN n%?+1=2 OR n%7=0 THEN NULL WHEN (n%?+1)%5=0 THEN -(n%997)/100 ELSE ((n%1000)-100)/100 END::DECIMAL(7,2) ss_net_paid FROM range(?) t(n) WHERE (n%?+1)%17<>0", [args.keys + 20, args.keys + 20, args.keys + 20, args.rows, args.keys + 20])
         exports = {
             'item': "COPY item TO ? (FORMAT PARQUET)",
             'web_clickstreams': "COPY web_clickstreams TO ? (FORMAT PARQUET)",
@@ -62,24 +73,43 @@ def main():
             elapsed = (time.perf_counter() - start) * 1000
             return [json.loads(line) for line in completed.stdout.splitlines()], elapsed
 
-        # Compare every group. ORDER BY ties may choose different groups at the
-        # LIMIT boundary, and float accumulation order may differ slightly.
+        # Compare every group, exactly: ORDER BY ties may choose different
+        # groups at the LIMIT boundary, so the comparison drops the ORDER BY
+        # and LIMIT. Decimal sums are exact, so there is no tolerance.
+        # sqe-cli's JSON prints NULL as "", so the NULL flags are explicit.
+        group = ('i_item_id', 'i_item_desc', 'i_category', 'i_class')
         results = []
         for sql in queries.values():
-            rows, _ = execute(sql[:sql.rfind('ORDER BY')])
-            rows.sort(key=lambda row: row['i_item_id'])
+            body = sql[:sql.rfind('ORDER BY')]
+            rows, _ = execute(
+                'SELECT *, total_net_revenue IS NULL AS revenue_is_null, '
+                f'avg_sale_amount IS NULL AS avg_is_null FROM ({body}) q'
+            )
+            rows.sort(key=lambda row: tuple(row[k] for k in group))
             results.append(rows)
         if len(results[0]) != len(results[1]):
-            raise AssertionError('group counts differ')
+            raise AssertionError(('group counts differ', len(results[0]), len(results[1])))
         for before, after in zip(*results):
-            for field in before:
-                if field in ('total_net_revenue', 'avg_sale_amount'):
-                    if before[field] != after[field] and not math.isclose(
-                        float(before[field]), float(after[field]), rel_tol=1e-9, abs_tol=1e-8,
-                    ):
-                        raise AssertionError((field, before[field], after[field]))
-                elif before[field] != after[field]:
-                    raise AssertionError((field, before[field], after[field]))
+            if before != after:
+                raise AssertionError((before, after))
+        types = []
+        for sql in queries.values():
+            body = sql[:sql.rfind('ORDER BY')]
+            rows, _ = execute(
+                'SELECT arrow_typeof(click_sales_count) c, arrow_typeof(total_net_revenue) s, '
+                f'arrow_typeof(avg_sale_amount) a FROM ({body}) LIMIT 1'
+            )
+            types.append(rows)
+        if types[0] != types[1]:
+            raise AssertionError(('output types differ', types))
+        rows = results[0]
+        coverage = {
+            'groups': len(rows),
+            'null_revenue_groups': sum(r['revenue_is_null'] == 'true' for r in rows),
+            'negative_revenue_groups': sum(r['total_net_revenue'].startswith('-') for r in rows),
+        }
+        if not (coverage['null_revenue_groups'] and coverage['negative_revenue_groups']):
+            raise AssertionError(('the fixture lost an edge case', coverage))
         timings = {key: [] for key in queries}
         for repetition in range(args.repetitions):
             order = list(queries) if repetition % 2 == 0 else list(reversed(queries))
@@ -93,6 +123,7 @@ def main():
             'engine': 'SQE embedded; process startup included',
             'fixture_rows_per_fact': args.rows, 'item_keys': args.keys,
             'full_result_groups_checked': len(results[0]),
+            'output_types': types[0], 'coverage': coverage,
             'measurements_ms': timings, 'medians_ms': medians,
             'speedup': medians['original'] / medians['preaggregated'],
         }, indent=2))
