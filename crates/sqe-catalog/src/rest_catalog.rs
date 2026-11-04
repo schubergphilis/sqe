@@ -7,7 +7,7 @@ use iceberg::table::Table;
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent, TableRequirement, TableUpdate};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogBuilder};
 use moka::future::Cache as MokaCache;
-use tracing::{debug, info, instrument, warn, Instrument};
+use tracing::{debug, error, info, instrument, warn, Instrument};
 use uuid::Uuid;
 
 use sqe_core::config::{CatalogConfig, SqeConfig, StorageConfig};
@@ -3789,84 +3789,116 @@ impl SessionCatalog {
         Ok(())
     }
 
-    /// Refuse a DELETE / UPDATE / MERGE before it writes any file when the
-    /// catalog would refuse its commit (#880).
+    /// Refuse a statement that writes to `table` before it writes any file
+    /// when the caller may not write it (#880).
     ///
     /// With vended credentials a caller who may read but not write gets a
     /// read-only storage credential: Polaris's delegated `loadTable` falls
     /// back from write to read delegation instead of refusing, so the
     /// statement used to plan, write data files and fail on the first
-    /// `PutObject`. This asks the catalog, as the caller, with a commit that
-    /// changes nothing: `main` set to the snapshot it already points at
-    /// (guarded by `assert-ref-snapshot-id`), checked against the same
-    /// `SET_TABLE_SNAPSHOT_REF` privilege the real commit needs; a table with
-    /// no snapshot gets a requirements-only commit (`UPDATE_TABLE`). Polaris
-    /// commits nothing when the metadata does not change.
+    /// `PutObject`. Two questions, both asked as the caller:
     ///
-    /// Only a 403 refuses. Any other failure (a race on `main`, a catalog
-    /// that rejects the shape) lets the statement run as before; the real
-    /// commit still decides. Runs only for a REST catalog with vended
-    /// credentials, the setup that writes before it learns the answer.
+    /// 1. The catalog, on every REST catalog: a commit setting `main` to the
+    ///    snapshot it already points at (requirements only when there is no
+    ///    `main`), guarded by an `assert-table-uuid` that can never match.
+    ///    Polaris authorizes the update (`SET_TABLE_SNAPSHOT_REF` /
+    ///    `UPDATE_TABLE`) before it checks requirements, so a reader gets
+    ///    403 and a writer 409; a catalog that applied the update anyway
+    ///    would change nothing.
+    /// 2. The object store, when the catalog vends credentials: write and
+    ///    delete an empty object under the table's data path with the
+    ///    table's own FileIO. This catches a principal that holds
+    ///    `TABLE_WRITE_PROPERTIES` but not `TABLE_WRITE_DATA`, who passes the
+    ///    catalog question but gets read-only keys.
+    ///
+    /// Only a refusal (403 / `AccessDenied`) refuses; any other failure lets
+    /// the statement run and the real commit decides. A pass is cached for
+    /// [`WRITE_CHECK_TTL`] per token, catalog and table; a grant revoked
+    /// inside that window is still refused by the real commit.
     pub async fn check_write_access(
         &self,
         table_ident: &TableIdent,
         table: &Table,
     ) -> sqe_core::Result<()> {
-        if !matches!(self.inner, CatalogHandle::Rest(_)) || !self.vends_credentials() {
+        if !matches!(self.inner, CatalogHandle::Rest(_)) {
             return Ok(());
         }
         let metadata = table.metadata();
-        let uuid = TableRequirement::UuidMatch {
-            uuid: metadata.uuid(),
+        let key = format!(
+            "{}|{}|{}|{}",
+            self.token_fingerprint,
+            self.catalog_url,
+            self.warehouse,
+            metadata.uuid()
+        );
+        if WRITE_CHECK_PASSES.contains_key(&key) {
+            return Ok(());
+        }
+        let refusal = match self.catalog_write_check(table_ident, table).await {
+            Some(e) => Some(e),
+            None if self.vends_credentials() => storage_write_check(table_ident, table).await,
+            None => None,
         };
-        let main = metadata
+        if let Some(e) = refusal {
+            info!(table = %table_ident, error = %e, "write refused before any file was written");
+            return Err(SqeError::with_code(
+                SqeErrorCode::AccessDenied,
+                format!(
+                    "Access denied: no write access to table '{table_ident}'; \
+                     nothing was written"
+                ),
+            ));
+        }
+        WRITE_CHECK_PASSES.insert(key, ());
+        Ok(())
+    }
+
+    /// The catalog half of [`Self::check_write_access`]: `Some` with the
+    /// refusal when the catalog answers 403, `None` otherwise.
+    async fn catalog_write_check(
+        &self,
+        table_ident: &TableIdent,
+        table: &Table,
+    ) -> Option<SqeError> {
+        let metadata = table.metadata();
+        // A uuid the table can never have: a compliant catalog fails the
+        // requirement, after authorizing the update, and commits nothing.
+        let wrong_uuid = uuid::Uuid::from_u128(metadata.uuid().as_u128() ^ u128::MAX);
+        let requirements = serde_json::json!([
+            { "type": "assert-table-uuid", "uuid": wrong_uuid.to_string() }
+        ]);
+        let updates = match metadata
             .refs_iter()
             .find(|(name, _)| *name == iceberg::spec::MAIN_BRANCH)
-            .map(|(_, reference)| reference.clone());
-        let mut result = match &main {
-            Some(reference) => {
-                let requirements = vec![
-                    uuid.clone(),
-                    TableRequirement::RefSnapshotIdMatch {
-                        r#ref: iceberg::spec::MAIN_BRANCH.to_string(),
-                        snapshot_id: Some(reference.snapshot_id),
-                    },
-                ];
-                let updates = vec![TableUpdate::SetSnapshotRef {
-                    ref_name: iceberg::spec::MAIN_BRANCH.to_string(),
-                    reference: reference.clone(),
-                }];
-                self.post_noop_commit(table_ident, requirements, updates)
-                    .await
-            }
-            None => Ok(()),
+        {
+            Some((_, reference)) => serde_json::to_value(vec![TableUpdate::SetSnapshotRef {
+                ref_name: iceberg::spec::MAIN_BRANCH.to_string(),
+                reference: reference.clone(),
+            }])
+            .unwrap_or_else(|_| serde_json::json!([])),
+            None => serde_json::json!([]),
         };
-        // No `main` yet, or `main` moved since `table` was loaded: the
-        // requirements-only commit still asks the question.
-        if main.is_none() || matches!(result, Err(SqeError::IcebergCommitConflict(_))) {
-            result = self
-                .post_noop_commit(table_ident, vec![uuid], Vec::new())
-                .await;
-        }
-        match result {
-            Ok(()) => Ok(()),
-            Err(e) if e.error_code() == SqeErrorCode::AccessDenied => {
-                info!(table = %table_ident, error = %e, "write refused before any file was written");
-                Err(SqeError::with_code(
-                    SqeErrorCode::AccessDenied,
-                    format!(
-                        "Access denied: no write access to table '{table_ident}'; \
-                         nothing was written"
-                    ),
-                ))
+        match self
+            .post_noop_commit(table_ident, requirements, updates)
+            .await
+        {
+            Err(SqeError::IcebergCommitConflict(_)) => None,
+            Err(e) if e.error_code() == SqeErrorCode::AccessDenied => Some(e),
+            Ok(()) => {
+                error!(
+                    table = %table_ident,
+                    "catalog accepted a commit whose assert-table-uuid cannot match; \
+                     it does not check requirements"
+                );
+                None
             }
             Err(e) => {
                 warn!(
                     table = %table_ident,
                     error = %e,
-                    "write access check inconclusive; the commit decides"
+                    "catalog write check inconclusive; the commit decides"
                 );
-                Ok(())
+                None
             }
         }
     }
@@ -3885,8 +3917,8 @@ impl SessionCatalog {
     async fn post_noop_commit(
         &self,
         table_ident: &TableIdent,
-        requirements: Vec<TableRequirement>,
-        updates: Vec<TableUpdate>,
+        requirements: serde_json::Value,
+        updates: serde_json::Value,
     ) -> sqe_core::Result<()> {
         let url = self.table_url(table_ident).await;
         let body = serde_json::json!({
@@ -3894,10 +3926,8 @@ impl SessionCatalog {
                 "namespace": table_ident.namespace().as_ref(),
                 "name": table_ident.name(),
             },
-            "requirements": serde_json::to_value(&requirements)
-                .map_err(|e| SqeError::execution_src(format!("Failed to serialize requirements: {e}"), e))?,
-            "updates": serde_json::to_value(&updates)
-                .map_err(|e| SqeError::execution_src(format!("Failed to serialize updates: {e}"), e))?,
+            "requirements": requirements,
+            "updates": updates,
         });
         self.rest_request(
             sqe_core::CatalogOp::Commit,
@@ -3917,6 +3947,101 @@ impl SessionCatalog {
             session: self.clone(),
         })
     }
+}
+
+/// How long a passed [`SessionCatalog::check_write_access`] is remembered.
+const WRITE_CHECK_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Passed write checks, keyed by token fingerprint, catalog and table uuid.
+static WRITE_CHECK_PASSES: std::sync::LazyLock<moka::sync::Cache<String, ()>> =
+    std::sync::LazyLock::new(|| {
+        moka::sync::Cache::builder()
+            .max_capacity(10_000)
+            .time_to_live(WRITE_CHECK_TTL)
+            .build()
+    });
+
+/// The storage half of [`SessionCatalog::check_write_access`]: write and
+/// delete an empty object under the table's data path with the table's
+/// FileIO (the vended keys). `Some` with the refusal when the store says
+/// access denied, `None` otherwise.
+async fn storage_write_check(table_ident: &TableIdent, table: &Table) -> Option<SqeError> {
+    let metadata = table.metadata();
+    let data_path = metadata
+        .properties()
+        .get(iceberg::spec::TableProperties::PROPERTY_WRITE_DATA_LOCATION)
+        .cloned()
+        .unwrap_or_else(|| format!("{}/data", metadata.location().trim_end_matches('/')));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let path = format!(
+        "{}/.sqe-write-check-{nanos:x}",
+        data_path.trim_end_matches('/')
+    );
+    let file_io = table.file_io();
+    let written = match file_io.new_output(&path) {
+        Ok(output) => output.write(bytes::Bytes::new()).await,
+        Err(e) => Err(e),
+    };
+    match written {
+        Ok(()) => {
+            if let Err(e) = file_io.delete(&path).await {
+                warn!(table = %table_ident, path = %path, error = %e, "write check object not deleted");
+            }
+            None
+        }
+        Err(e) => {
+            let e = SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("write check at '{path}': {e}"),
+            );
+            if e.error_code() == SqeErrorCode::AccessDenied {
+                Some(e)
+            } else {
+                warn!(table = %table_ident, error = %e, "storage write check inconclusive; the write decides");
+                None
+            }
+        }
+    }
+}
+
+/// A v2 table at `location` on the local file system; for the storage
+/// probe test.
+#[cfg(test)]
+fn local_table_at(location: &str) -> Table {
+    let metadata: iceberg::spec::TableMetadata = serde_json::from_value(serde_json::json!({
+        "format-version": 2,
+        "table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
+        "location": location,
+        "last-sequence-number": 0,
+        "last-updated-ms": 1602638573874_i64,
+        "last-column-id": 1,
+        "current-schema-id": 0,
+        "schemas": [{"type": "struct", "schema-id": 0,
+                     "fields": [{"id": 1, "name": "x", "required": true, "type": "long"}]}],
+        "default-spec-id": 0,
+        "partition-specs": [{"spec-id": 0, "fields": []}],
+        "last-partition-id": 999,
+        "default-sort-order-id": 0,
+        "sort-orders": [{"order-id": 0, "fields": []}],
+        "properties": {},
+        "current-snapshot-id": -1,
+        "snapshots": []
+    }))
+    .expect("table metadata");
+    Table::builder()
+        .runtime(iceberg::Runtime::current())
+        .metadata(metadata)
+        .identifier(TableIdent::new(
+            NamespaceIdent::new("ns".to_string()),
+            "t".to_string(),
+        ))
+        .file_io(iceberg::io::FileIO::new_with_fs())
+        .disable_cache()
+        .build()
+        .expect("table")
 }
 
 /// Bridge type that implements iceberg's `Catalog` trait by delegating
@@ -7039,23 +7164,14 @@ mod vended_credentials_rest_tests {
     }
 
     const ORDERS_PATH: &str = "/v1/wh/namespaces/sales/tables/orders";
+    const ORDERS_UUID: &str = "b55d9dda-6561-423a-8bfc-787980ce421f";
 
     fn commit_body(r: &wiremock::Request) -> serde_json::Value {
         serde_json::from_slice(&r.body).unwrap_or_default()
     }
 
-    fn sets_main(r: &wiremock::Request) -> bool {
+    fn is_commit(r: &wiremock::Request) -> bool {
         r.method == wiremock::http::Method::POST
-            && commit_body(r)["updates"]
-                .as_array()
-                .is_some_and(|u| !u.is_empty())
-    }
-
-    fn requirements_only(r: &wiremock::Request) -> bool {
-        r.method == wiremock::http::Method::POST
-            && commit_body(r)["updates"]
-                .as_array()
-                .is_some_and(|u| u.is_empty())
     }
 
     fn commits(reqs: &[wiremock::Request]) -> Vec<serde_json::Value> {
@@ -7072,14 +7188,32 @@ mod vended_credentials_rest_tests {
             .unwrap()
     }
 
-    /// #880: a reader's DELETE / UPDATE / MERGE is refused before it writes.
-    /// The question is a commit that changes nothing: `main` set to the
-    /// snapshot it already holds, guarded by `assert-ref-snapshot-id`.
+    /// Static keys, so only the catalog half runs (no object-store probe
+    /// against the fixture's `s3://` location).
+    async fn static_session(server: &MockServer, token: &str) -> SessionCatalog {
+        let mut body: serde_json::Value = serde_json::from_str(LOAD_TABLE_RESPONSE).unwrap();
+        body["config"] = serde_json::json!({});
+        Mock::given(method("GET"))
+            .and(path(ORDERS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+        let cfg = catalog_config(server, "");
+        SessionCatalog::for_session_with(&cfg, &static_storage(), None, token)
+            .await
+            .unwrap()
+    }
+
+    /// #880: a reader's write is refused before it writes. The question is
+    /// a commit that cannot apply: `main` set to the snapshot it already
+    /// holds, guarded by an `assert-table-uuid` that can never match. With
+    /// vended credentials a catalog refusal ends the check before the
+    /// object-store probe.
     #[tokio::test]
     async fn write_check_refuses_a_reader_with_access_denied() {
         let server = mock_catalog(serde_json::json!({})).await;
         Mock::given(path(ORDERS_PATH))
-            .and(sets_main)
+            .and(is_commit)
             .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
                 "error": {"message": "Principal 'analyst' is not authorized for op 'SET_TABLE_SNAPSHOT_REF'",
                           "type": "ForbiddenException", "code": 403}
@@ -7098,14 +7232,14 @@ mod vended_credentials_rest_tests {
 
         let sent = commits(&server.received_requests().await.unwrap());
         assert_eq!(sent.len(), 1, "{sent:?}");
-        let snapshot = 3497810964824022504_i64;
+        let wrong = uuid::Uuid::from_u128(
+            uuid::Uuid::parse_str(ORDERS_UUID).unwrap().as_u128() ^ u128::MAX,
+        );
         assert_eq!(
             sent[0]["requirements"],
-            serde_json::json!([
-                {"type": "assert-table-uuid", "uuid": "b55d9dda-6561-423a-8bfc-787980ce421f"},
-                {"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": snapshot},
-            ])
+            serde_json::json!([{"type": "assert-table-uuid", "uuid": wrong.to_string()}])
         );
+        let snapshot = 3497810964824022504_i64;
         assert_eq!(
             sent[0]["updates"],
             serde_json::json!([
@@ -7114,67 +7248,54 @@ mod vended_credentials_rest_tests {
         );
     }
 
+    /// The failed requirement (409) is a writer's answer, on any REST
+    /// catalog; the pass is cached, so a second check sends nothing.
     #[tokio::test]
-    async fn write_check_passes_a_writer() {
-        let server = mock_catalog(serde_json::json!({})).await;
-        let mut body: serde_json::Value = serde_json::from_str(LOAD_TABLE_RESPONSE).unwrap();
-        body["config"] = serde_json::json!({});
-        Mock::given(path(ORDERS_PATH))
-            .and(sets_main)
-            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+    async fn write_check_passes_a_writer_and_caches_the_pass() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "defaults": {}, "overrides": {"prefix": "wh"}
+            })))
             .mount(&server)
             .await;
-        let session = vending_session(&server, "tok-writer").await;
+        Mock::given(path(ORDERS_PATH))
+            .and(is_commit)
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": {"message": "Requirement failed: UUID does not match",
+                          "type": "CommitFailedException", "code": 409}
+            })))
+            .mount(&server)
+            .await;
+        let session = static_session(&server, "tok-writer").await;
         let table = session.load_table(&orders()).await.unwrap();
-        session
-            .check_write_access(&orders(), &table)
-            .await
-            .expect("a writer passes");
+        for _ in 0..2 {
+            session
+                .check_write_access(&orders(), &table)
+                .await
+                .expect("a writer passes");
+        }
         assert_eq!(commits(&server.received_requests().await.unwrap()).len(), 1);
     }
 
-    /// `main` moved since the table was loaded (409): the requirements-only
-    /// commit still asks, and its 403 refuses.
-    #[tokio::test]
-    async fn write_check_retries_without_the_ref_after_a_conflict() {
-        let server = mock_catalog(serde_json::json!({})).await;
-        Mock::given(path(ORDERS_PATH))
-            .and(sets_main)
-            .respond_with(ResponseTemplate::new(409))
-            .mount(&server)
-            .await;
-        Mock::given(path(ORDERS_PATH))
-            .and(requirements_only)
-            .respond_with(ResponseTemplate::new(403))
-            .mount(&server)
-            .await;
-        let session = vending_session(&server, "tok-race").await;
-        let table = session.load_table(&orders()).await.unwrap();
-        let err = session
-            .check_write_access(&orders(), &table)
-            .await
-            .expect_err("the fallback's 403 refuses");
-        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::AccessDenied);
-        let sent = commits(&server.received_requests().await.unwrap());
-        assert_eq!(sent.len(), 2, "{sent:?}");
-        assert_eq!(
-            sent[1]["requirements"],
-            serde_json::json!([
-                {"type": "assert-table-uuid", "uuid": "b55d9dda-6561-423a-8bfc-787980ce421f"},
-            ])
-        );
-    }
-
-    /// Anything but a 403 leaves the decision to the real commit.
+    /// Anything but a 403 or 409 leaves the decision to the real commit.
     #[tokio::test]
     async fn write_check_is_inconclusive_on_other_errors() {
-        let server = mock_catalog(serde_json::json!({})).await;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "defaults": {}, "overrides": {"prefix": "wh"}
+            })))
+            .mount(&server)
+            .await;
         Mock::given(path(ORDERS_PATH))
-            .and(sets_main)
+            .and(is_commit)
             .respond_with(ResponseTemplate::new(400))
             .mount(&server)
             .await;
-        let session = vending_session(&server, "tok-400").await;
+        let session = static_session(&server, "tok-400").await;
         let table = session.load_table(&orders()).await.unwrap();
         session
             .check_write_access(&orders(), &table)
@@ -7182,24 +7303,48 @@ mod vended_credentials_rest_tests {
             .expect("a 400 does not refuse");
     }
 
-    /// Static keys: the engine's credential writes, so no check is sent.
+    /// Static keys no longer skip the catalog half: a 403 refuses there too.
     #[tokio::test]
-    async fn write_check_is_skipped_without_vending() {
-        let server = mock_catalog(serde_json::json!({})).await;
-        let mut body: serde_json::Value = serde_json::from_str(LOAD_TABLE_RESPONSE).unwrap();
-        body["config"] = serde_json::json!({});
+    async fn write_check_asks_the_catalog_without_vending() {
+        let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path(ORDERS_PATH))
-            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "defaults": {}, "overrides": {"prefix": "wh"}
+            })))
             .mount(&server)
             .await;
-        let cfg = catalog_config(&server, "");
-        let session = SessionCatalog::for_session_with(&cfg, &static_storage(), None, "tok-static")
-            .await
-            .unwrap();
+        Mock::given(path(ORDERS_PATH))
+            .and(is_commit)
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let session = static_session(&server, "tok-static").await;
         let table = session.load_table(&orders()).await.unwrap();
-        session.check_write_access(&orders(), &table).await.unwrap();
-        assert!(commits(&server.received_requests().await.unwrap()).is_empty());
+        let err = session
+            .check_write_access(&orders(), &table)
+            .await
+            .expect_err("a 403 refuses");
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::AccessDenied);
+    }
+
+    /// The storage half writes and deletes one empty object under the
+    /// table's data path, leaving nothing behind.
+    #[tokio::test]
+    async fn storage_probe_writes_and_deletes_one_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = format!("file://{}", dir.path().display());
+        let table = super::local_table_at(&location);
+        assert!(super::storage_write_check(&orders(), &table)
+            .await
+            .is_none());
+        let data = dir.path().join("data");
+        assert!(data.is_dir(), "the probe wrote under {}", data.display());
+        assert_eq!(
+            std::fs::read_dir(&data).unwrap().count(),
+            0,
+            "probe deleted"
+        );
     }
 }
 
