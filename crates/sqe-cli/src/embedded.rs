@@ -315,6 +315,10 @@ pub fn build_embedded_context_with_mask(
             .with_physical_optimizer_rule(Arc::new(
                 sqe_catalog::parallel_scan::ParallelScanRule::new(0),
             ))
+            // Re-attach the scan filters those two orphaned (#787).
+            .with_physical_optimizer_rule(Arc::new(
+                sqe_catalog::dynamic_filter_wiring::SettleDynamicFiltersRule::new(),
+            ))
             .build(),
     );
 

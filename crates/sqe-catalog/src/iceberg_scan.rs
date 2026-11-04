@@ -270,6 +270,14 @@ pub struct IcebergScanExec {
     /// These are `PhysicalExpr`s (not logical `Expr`s) because they come from the
     /// physical optimizer, after logical-to-physical conversion has already occurred.
     pushed_down_filters: Vec<Arc<dyn PhysicalExpr>>,
+    /// `expression_id`s of the pushed filters that tighten progressively
+    /// while this scan streams (a TopK bound, an aggregate's bound) rather
+    /// than sealing once (a hash join's build side). They depend on this
+    /// scan's own output, so the stream-open wait skips them and readers
+    /// re-sample them instead of freezing the first snapshot. Set by
+    /// [`crate::dynamic_filter_wiring::settle_dynamic_filters`]; empty means
+    /// every filter is treated as join-sealed (#787).
+    progressive_filter_ids: Arc<[u64]>,
     /// Concurrency for direct manifest walks (column-stats pruning path).
     ///
     /// The primary scan planner goes through `Table::scan().plan_files()` which
@@ -592,6 +600,7 @@ impl IcebergScanExec {
             trust_sort_order: false,
             small_file_threshold_bytes: tuning.small_file_threshold_bytes,
             pushed_down_filters: vec![],
+            progressive_filter_ids: Arc::from(Vec::new()),
             manifest_concurrency: tuning.manifest_concurrency,
             direct_read_concurrency: tuning.prefetch_concurrency,
             target_partitions: DEFAULT_TARGET_PARTITIONS,
@@ -932,6 +941,32 @@ impl IcebergScanExec {
         self.clone_with_pushed_filters(Vec::new())
     }
 
+    /// Ids of the pushed filters that tighten while this scan streams; see
+    /// the `progressive_filter_ids` field.
+    pub fn progressive_filter_ids(&self) -> &[u64] {
+        &self.progressive_filter_ids
+    }
+
+    /// Clone this scan keeping only the pushed filters `keep` accepts and
+    /// marking the ids in `progressive` as progressive. Used by
+    /// [`crate::dynamic_filter_wiring::settle_dynamic_filters`] to drop filters
+    /// whose producer a later rule replaced (#787).
+    pub fn clone_with_settled_filters(
+        &self,
+        keep: impl Fn(&Arc<dyn PhysicalExpr>) -> bool,
+        progressive: Vec<u64>,
+    ) -> Self {
+        let filters = self
+            .pushed_down_filters
+            .iter()
+            .filter(|f| keep(f))
+            .cloned()
+            .collect();
+        let mut scan = self.clone_with_pushed_filters(filters);
+        scan.progressive_filter_ids = Arc::from(progressive);
+        scan
+    }
+
     /// Create a copy of this scan with additional dynamic filters pushed down
     /// from parent operators (e.g., `HashJoinExec` build-side bounds).
     ///
@@ -951,6 +986,7 @@ impl IcebergScanExec {
             trust_sort_order: self.trust_sort_order,
             small_file_threshold_bytes: self.small_file_threshold_bytes,
             pushed_down_filters: filters,
+            progressive_filter_ids: self.progressive_filter_ids.clone(),
             manifest_concurrency: self.manifest_concurrency,
             direct_read_concurrency: self.direct_read_concurrency,
             target_partitions: self.target_partitions,
@@ -1505,8 +1541,20 @@ impl ExecutionPlan for IcebergScanExec {
                 .downcast_ref::<DynamicFilterPhysicalExpr>()
                 .is_some()
             {
-                // Dynamic filter from hash join — accept it
-                dynamic_filters.push(Arc::clone(&pf.filter));
+                // Dynamic filter (join, TopK or aggregate bound) — accept it.
+                // A post-phase re-run re-pushes filters this scan already
+                // holds (a SortExec pushes its TopK filter on every pass), so
+                // skip one whose shared state is already stored (#787).
+                let id = pf.filter.expression_id();
+                let held = id.is_some()
+                    && self
+                        .pushed_down_filters
+                        .iter()
+                        .chain(dynamic_filters.iter())
+                        .any(|f| f.expression_id() == id);
+                if !held {
+                    dynamic_filters.push(Arc::clone(&pf.filter));
+                }
                 filter_results.push(PushedDown::Yes);
             } else {
                 // Static filter — leave it for FilterExec to handle
@@ -1575,6 +1623,15 @@ impl ExecutionPlan for IcebergScanExec {
         let direct_read_concurrency = self.direct_read_concurrency;
         let pushed_down_filters = self.pushed_down_filters.clone();
         let sealed_filters = self.sealed_filters.clone();
+        // Per pushed filter: true when it tightens while this scan streams
+        // (TopK / aggregate bound) instead of sealing once (#787).
+        let progressive: Arc<[bool]> = pushed_down_filters
+            .iter()
+            .map(|f| {
+                f.expression_id()
+                    .is_some_and(|id| self.progressive_filter_ids.contains(&id))
+            })
+            .collect();
         let runtime_filter_clustering_skip = self.runtime_filter_clustering_skip;
         let runtime_filter_uniform_threshold = self.runtime_filter_uniform_threshold;
         let runtime_filter_wait_ms = self.runtime_filter_wait_ms;
@@ -1821,9 +1878,18 @@ impl ExecutionPlan for IcebergScanExec {
             // Waited AFTER manifest planning so that I/O overlaps the join
             // build sides, and BEFORE either reader path samples the dynamic
             // filters. Bounded; see wait_for_dynamic_filters.
-            if !pushed_down_filters.is_empty() && runtime_filter_wait_ms > 0 {
+            // Only join filters are awaited: a progressive filter can only
+            // tighten once this scan emits rows, so waiting on it burns the
+            // whole deadline (#787: 100 ms per partition on every TopK).
+            let awaited: Vec<Arc<dyn PhysicalExpr>> = pushed_down_filters
+                .iter()
+                .zip(progressive.iter())
+                .filter(|(_, p)| !**p)
+                .map(|(f, _)| Arc::clone(f))
+                .collect();
+            if !awaited.is_empty() && runtime_filter_wait_ms > 0 {
                 let _t = filter_wait_time.timer();
-                let waited = wait_for_dynamic_filters(&pushed_down_filters, runtime_filter_wait_ms).await;
+                let waited = wait_for_dynamic_filters(&awaited, runtime_filter_wait_ms).await;
                 if waited > 0 {
                     debug!(waited_ms = waited, "Waited for dynamic filters to seal");
                 }
@@ -1852,7 +1918,17 @@ impl ExecutionPlan for IcebergScanExec {
                 // hasn't finished yet). Early batches pass unfiltered; later
                 // batches get the actual bounds once the build side completes.
                 let mut resolved_filters: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
+                // Progressive filters (TopK / aggregate bounds) are still open
+                // at stream open, since they tighten on this scan's own rows.
+                // The reader gets the live filter instead, which re-reads the
+                // current bound on every evaluation (#787). They take no
+                // part in the file pruning below, which runs before any row.
+                let mut live_filters: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
                 for (idx, filter) in pushed_down_filters.iter().enumerate() {
+                    if progressive[idx] {
+                        live_filters.push(Arc::clone(filter));
+                        continue;
+                    }
                     if let Some(dynamic) = filter.downcast_ref::<DynamicFilterPhysicalExpr>() {
                         match dynamic.current() {
                             Ok(expr) => {
@@ -1974,6 +2050,7 @@ impl ExecutionPlan for IcebergScanExec {
                 });
 
                 let concurrency = direct_read_concurrency.max(1);
+                resolved_filters.extend(live_filters);
                 let resolved_filters = Arc::new(resolved_filters);
                 let bytes_scanned = bytes_scanned.clone();
                 let rows_prefilter = rows_prefilter.clone();
@@ -2436,7 +2513,13 @@ impl ExecutionPlan for IcebergScanExec {
                 // re-checks, so a cached (slightly stale) snapshot can only pass
                 // extra rows, never drop a match. The cache is scan-wide
                 // (`sealed_filters`), so all partitions share one snapshot.
+                // DataFusion 55.2 now caches `current()` per generation, but
+                // the collapse below is ours and still costs a set build.
+                // Progressive filters (TopK / aggregate bounds) never seal:
+                // they skip the cache and re-read `current()` per batch, or
+                // the first, loosest bound would stick (#787).
                 let resolved_cache = sealed_filters.clone();
+                let progressive = progressive.clone();
                 let filter_concurrency = std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(8);
@@ -2449,6 +2532,7 @@ impl ExecutionPlan for IcebergScanExec {
                         let rows_passed_filter_pending = rows_passed_filter_pending.clone();
                         let dynamic_filters_skipped = dynamic_filters_skipped.clone();
                         let resolved_cache = resolved_cache.clone();
+                        let progressive = progressive.clone();
                         async move {
                             let batch = batch_res?;
                             // The Tier-2 membership-filter evaluation is pure CPU and
@@ -2473,6 +2557,15 @@ impl ExecutionPlan for IcebergScanExec {
                                     // once present we never call `current()` again
                                     // (that call is the whole cost).
                                     let resolved = match slot.snapshot.get() {
+                                        // A TopK / aggregate bound tightens
+                                        // as rows arrive: read the live one.
+                                        // DataFusion caches `current()` per
+                                        // generation, so between updates this
+                                        // is a lock read (#787).
+                                        _ if progressive[idx] => match dynamic.current() {
+                                            Ok(e) if !is_trivial_true(&e) => Some((e, false)),
+                                            _ => None,
+                                        },
                                         Some(e) => Some(e.clone()),
                                         None => match dynamic.current() {
                                             // Build side not sealed yet: the
