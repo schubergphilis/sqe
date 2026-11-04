@@ -1628,6 +1628,43 @@ const Q85_CDEMO_SK: i32 = 15;
 const Q85_2000_DATE_SK: i32 = 800;
 const Q85_SALES_PRICE: f64 = 125.0;
 
+/// q64 pairs a store's 1999 and 2000 sales of one returned item that is in
+/// `cs_ui` (catalog sales beating twice their refunds), priced 65..=74 in one
+/// of six colours, sold under a cdemo whose marital status differs from the
+/// buyer's current one. About 22 items qualify at SF1 and a 1999 and a 2000
+/// row at the same store is a ~5-pair expectation, so a seed can land on 0
+/// (ours did; official SF1 has 2 rows). Planted: item 6 is purple at 69.00,
+/// store tickets 7 (1999, two returns) and 8 (2000, one return) sell it at
+/// store 1 to customer 7 under cdemo 1 ('S') while customer 7's current cdemo
+/// is 9 ('M'), and catalog order 7 sells it with a 10.00 return.
+const Q64_ITEM: i32 = 6;
+const Q64_CUSTOMER: i32 = 7;
+const Q64_STORE_SK: i32 = 1;
+const Q64_1999_TICKET: i32 = 7;
+const Q64_2000_TICKET: i32 = 8;
+const Q64_CATALOG_ORDER: i32 = 7;
+/// OUR date_dim: year = 1998 + (sk - 1) / 366, so sk 500 is 1999, sk 900 2000.
+const Q64_1999_DATE_SK: i32 = 500;
+const Q64_2000_DATE_SK: i32 = 900;
+/// cdemo sk 1 is 'S', sk 9 is 'M' (see stream_customer_demographics).
+const Q64_SALE_CDEMO_SK: i32 = 1;
+const Q64_CUSTOMER_CDEMO_SK: i32 = 9;
+const Q64_ITEM_PRICE: f64 = 69.0;
+const Q64_ITEM_COLOR: &str = "purple";
+/// Catalog quantity and refund of the planted pair: 99 units at a list price
+/// of at least 1.50 is 148.50 or more, well over twice the 10.00 refund.
+const Q64_CATALOG_QUANTITY: i32 = 99;
+const Q64_CATALOG_REFUND: f64 = 10.0;
+
+impl FkDims {
+    /// Every key the q64 plant pins exists at this scale.
+    fn q64_active(&self) -> bool {
+        self.items >= Q64_ITEM
+            && self.customers >= Q64_CUSTOMER
+            && self.cdemos >= Q64_CUSTOMER_CDEMO_SK
+    }
+}
+
 /// Maximum line items per ticket/order. Lines are uniform in 1..=25 so the
 /// `HAVING count(*) BETWEEN 15 AND 20` windows in q34/q46/q68/q73/q79 match
 /// a healthy fraction of tickets. The old generator emitted exactly one line
@@ -1735,6 +1772,8 @@ fn planted_sale_date(salt: u64, ticket: i32, dims: FkDims) -> Option<i32> {
             Q25_STORE_TICKET if q25 => Some(Q25_APR_2001_DATE_SK),
             Q17_STORE_TICKET if q17 => Some(Q17_2001Q1_DATE_SK),
             Q29_STORE_TICKET if q29 => Some(Q29_SALE_DATE_SK),
+            Q64_1999_TICKET if dims.q64_active() => Some(Q64_1999_DATE_SK),
+            Q64_2000_TICKET if dims.q64_active() => Some(Q64_2000_DATE_SK),
             _ => None,
         },
         CATALOG_ORDER_SALT => match ticket {
@@ -1851,6 +1890,24 @@ fn basket_and_rng(salt: u64, ticket: i32, channel_upper: i32, dims: FkDims) -> (
     // is ('M', 'Advanced Degree').
     if salt == WEB_ORDER_SALT && ticket == Q85_WEB_ORDER && dims.cdemos >= Q85_CDEMO_SK {
         b.cdemo_sk = Some(Q85_CDEMO_SK);
+    }
+    // q64: item 6 at store 1 in 1999 and 2000, every q64 join key non-null.
+    if dims.q64_active()
+        && salt == STORE_TICKET_SALT
+        && (ticket == Q64_1999_TICKET || ticket == Q64_2000_TICKET)
+    {
+        b.items[0] = Q64_ITEM;
+        b.channel_sk = Q64_STORE_SK;
+        b.customer_sk = Some(Q64_CUSTOMER);
+        b.cdemo_sk = Some(Q64_SALE_CDEMO_SK);
+        b.hdemo_sk = Some(1);
+        b.addr_sk = Some(1);
+        b.promo_sk = Some(1);
+    }
+    // q64's cs_ui leg: a catalog sale of item 6 that outweighs its refund.
+    if dims.q64_active() && salt == CATALOG_ORDER_SALT && ticket == Q64_CATALOG_ORDER {
+        b.items[0] = Q64_ITEM;
+        b.quantities[0] = Q64_CATALOG_QUANTITY;
     }
     // Planted sale dates live in `planted_sale_date`, applied by
     // `basket_head`, so the date index sees them too.
@@ -2242,6 +2299,7 @@ fn stream_store_returns(scale: f64) -> (SchemaRef, super::BatchIterator) {
         stores >= Q24_STORE_SK && dims.customers >= Q24_CUSTOMER && dims.items >= Q24_ITEM;
     let q17_active = dims.customers >= Q17_CUSTOMER && dims.items >= Q17_ITEM;
     let q29_active = dims.customers >= Q29_CUSTOMER && dims.items >= Q29_ITEM;
+    let q64_active = dims.q64_active();
     let seed = seed_for_table("store_returns");
     // Pick a fully-emitted sales ticket and return one of its actual line
     // items so (sr_ticket_number, sr_item_sk) joins store_sales
@@ -2256,6 +2314,10 @@ fn stream_store_returns(scale: f64) -> (SchemaRef, super::BatchIterator) {
             1 if q24_active => Some(Q24_STORE_TICKET),
             2 if q17_active => Some(Q17_STORE_TICKET),
             3 if q29_active => Some(Q29_STORE_TICKET),
+            // Two returns on the 1999 ticket, one on the 2000 ticket, so q64's
+            // `cs2.cnt <= cs1.cnt` holds even if a random return adds one.
+            4 | 5 if q64_active => Some(Q64_1999_TICKET),
+            6 if q64_active => Some(Q64_2000_TICKET),
             _ => None,
         };
         if let Some(t) = planted {
@@ -2394,15 +2456,21 @@ fn stream_catalog_returns(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let pages = catalog_page_rows(scale) as i32;
     let modes = ship_mode_rows(scale) as i32;
     let max_order = returnable_tickets(scale, 1_441_548.0);
+    let q64_active = dims.q64_active();
     let seed = seed_for_table("catalog_returns");
     // Returns lag the sale by <=120 days; a uniform draw over the rest of
     // the calendar starved the early years and emptied q91's Nov-1998
     // catalog-returns window. Same bound as the ship_date fields above.
     let head = move |row: usize| {
-        let (ticket, lag) = hashed_return(seed, row, max_order);
+        let (mut ticket, lag) = hashed_return(seed, row, max_order);
+        // Row 0 returns q64's planted catalog line (see Q64_CATALOG_ORDER).
+        let planted = row == 0 && q64_active;
+        if planted {
+            ticket = Q64_CATALOG_ORDER;
+        }
         ReturnHead {
             ticket,
-            line: None,
+            line: planted.then_some(0),
             ret_date: lagged_return_date(CATALOG_ORDER_SALT, ticket, lag, dims),
         }
     };
@@ -2417,10 +2485,16 @@ fn stream_catalog_returns(scale: f64) -> (SchemaRef, super::BatchIterator) {
         move |_row, h, b, rng| {
             let order = h.ticket;
             let ret_date = h.ret_date;
-            let line = rng.random_range(0..b.lines);
+            let line = h.line.unwrap_or_else(|| rng.random_range(0..b.lines));
             let item_sk = b.items[line];
             let qty = rng.random_range(1..=b.quantities[line]);
             let amt = rng.random_range(10..500i32) as f64;
+            // The planted q64 return is small, so its line passes cs_ui.
+            let amt = if h.line.is_some() {
+                Q64_CATALOG_REFUND
+            } else {
+                amt
+            };
             let tax = amt * 0.08;
             vec![
                 i!(ret_date),
@@ -2748,6 +2822,12 @@ fn stream_item(scale: f64) -> (SchemaRef, super::BatchIterator) {
             // (dsdgen: ~11%). Log-uniform reproduces the skew.
             let price_ln = rng.random_range(0.09_f64.ln()..99.99_f64.ln());
             let price = (price_ln.exp() * 100.0).round() / 100.0;
+            // i_item_sk 6 (row 5) is q64's planted item, inside 65..=74.
+            let price = if row == (Q64_ITEM - 1) as usize {
+                Q64_ITEM_PRICE
+            } else {
+                price
+            };
             let wc = price * 0.6;
             // i_manufact is derived from a neighborhood of i_manufact_id (spread
             // MANUFACT_LABEL_SPREAD) so the same manufact string spans several ids
@@ -2801,14 +2881,15 @@ fn stream_item(scale: f64) -> (SchemaRef, super::BatchIterator) {
                 s!(format!("manufact#{manufact_label}")),
                 s!(random_str(rng, ITEM_SIZES)),
                 s!(random_id(rng)),
-                // i_item_sk 3 (row 2) is forced to peach for the q24 plant; the
-                // draw is kept so the rest of the color histogram is unshifted.
+                // i_item_sk 3 (row 2) is forced to peach for the q24 plant and
+                // i_item_sk 6 to purple for q64; the draw is kept so the rest
+                // of the color histogram is unshifted.
                 s!({
                     let c = weighted_str(rng, ITEM_COLOR_WEIGHTS);
-                    if row == 2 {
-                        "peach"
-                    } else {
-                        c
+                    match row {
+                        2 => "peach",
+                        r if r == (Q64_ITEM - 1) as usize => Q64_ITEM_COLOR,
+                        _ => c,
                     }
                 }),
                 s!(random_str(rng, ITEM_UNITS)),
@@ -2844,10 +2925,18 @@ fn stream_customer(scale: f64) -> (SchemaRef, super::BatchIterator) {
             } else {
                 addr_draw
             };
+            // Customer Q64_CUSTOMER's current cdemo is 'M' while the planted
+            // q64 sales use an 'S' cdemo; the draw is kept for parity.
+            let cdemo_draw = rng.random_range(1..=cdemos);
+            let cdemo_sk = if row as i32 == Q64_CUSTOMER - 1 && cdemos >= Q64_CUSTOMER_CDEMO_SK {
+                Q64_CUSTOMER_CDEMO_SK
+            } else {
+                cdemo_draw
+            };
             vec![
                 i!(sk),
                 s!(random_id(rng)),
-                i!(rng.random_range(1..=cdemos)),
+                i!(cdemo_sk),
                 i!(rng.random_range(1..=hdemos)),
                 i!(addr_sk),
                 i!(random_date_sk(rng)),
@@ -4774,6 +4863,95 @@ mod tests {
         assert!(
             col_i32(&srb, &srsch, "sr_ticket_number").contains(&Some(Q24_STORE_TICKET)),
             "no store return for the q24 planted ticket"
+        );
+    }
+
+    #[test]
+    fn q64_coincidence_is_planted() {
+        // SF0.01 is the smallest scale the plant must survive; the SF1 gate
+        // (TPC-DS compare vs Trino) checks the query itself.
+        let scale = 0.01;
+        let dims = FkDims::at(scale);
+        assert!(dims.q64_active(), "q64 plant inactive at SF{scale}");
+        let item = (Q64_ITEM - 1) as usize;
+        let (isch, ib) = generate_item(scale);
+        assert_eq!(col_str(&ib, &isch, "i_color")[item], Q64_ITEM_COLOR);
+        let price = col_f64(&ib, &isch, "i_current_price")[item];
+        assert!((65.0..=74.0).contains(&price), "q64 item price {price}");
+
+        let (dsch, db) = generate_date_dim();
+        let years = col_i32(&db, &dsch, "d_year");
+        assert_eq!(years[(Q64_1999_DATE_SK - 1) as usize], Some(1999));
+        assert_eq!(years[(Q64_2000_DATE_SK - 1) as usize], Some(2000));
+
+        let (cdsch, cdb) = generate_customer_demographics(scale);
+        let marital = col_str(&cdb, &cdsch, "cd_marital_status");
+        assert_ne!(
+            marital[(Q64_SALE_CDEMO_SK - 1) as usize],
+            marital[(Q64_CUSTOMER_CDEMO_SK - 1) as usize],
+            "q64 needs cd1.marital <> cd2.marital"
+        );
+        let (csch, cb) = generate_customer(scale);
+        assert_eq!(
+            col_i32(&cb, &csch, "c_current_cdemo_sk")[(Q64_CUSTOMER - 1) as usize],
+            Some(Q64_CUSTOMER_CDEMO_SK)
+        );
+
+        let stores = store_rows(scale) as i32;
+        for (ticket, date) in [
+            (Q64_1999_TICKET, Q64_1999_DATE_SK),
+            (Q64_2000_TICKET, Q64_2000_DATE_SK),
+        ] {
+            let b = basket(STORE_TICKET_SALT, ticket, stores, dims);
+            assert_eq!(b.date_sk, date, "ticket {ticket} date");
+            assert_eq!(b.items[0], Q64_ITEM, "ticket {ticket} item");
+            assert_eq!(b.channel_sk, Q64_STORE_SK, "ticket {ticket} store");
+            assert_eq!(b.customer_sk, Some(Q64_CUSTOMER), "ticket {ticket}");
+            assert_eq!(b.cdemo_sk, Some(Q64_SALE_CDEMO_SK), "ticket {ticket}");
+            assert!(
+                b.hdemo_sk.is_some() && b.addr_sk.is_some() && b.promo_sk.is_some(),
+                "ticket {ticket}: a NULL key drops the q64 row"
+            );
+        }
+        let (srsch, srb) = generate_store_returns(scale);
+        let sr_ticket = col_i32(&srb, &srsch, "sr_ticket_number");
+        let sr_item = col_i32(&srb, &srsch, "sr_item_sk");
+        let returns_of = |t: i32| {
+            sr_ticket
+                .iter()
+                .zip(&sr_item)
+                .filter(|&(&tk, &it)| tk == Some(t) && it == Some(Q64_ITEM))
+                .count()
+        };
+        let (r1999, r2000) = (returns_of(Q64_1999_TICKET), returns_of(Q64_2000_TICKET));
+        assert!(
+            r2000 >= 1 && r1999 >= r2000,
+            "q64 needs cs2.cnt <= cs1.cnt: 1999 {r1999}, 2000 {r2000}"
+        );
+
+        // cs_ui: the planted catalog line's list price beats twice its refund.
+        let (cssch, csb) = generate_catalog_sales(scale);
+        let cs_order = col_i32(&csb, &cssch, "cs_order_number");
+        let cs_item = col_i32(&csb, &cssch, "cs_item_sk");
+        let list = col_f64(&csb, &cssch, "cs_ext_list_price");
+        let sale: f64 = (0..cs_order.len())
+            .filter(|&i| cs_order[i] == Some(Q64_CATALOG_ORDER) && cs_item[i] == Some(Q64_ITEM))
+            .map(|i| list[i])
+            .sum();
+        let (crsch, crb) = generate_catalog_returns(scale);
+        let cr_order = col_i32(&crb, &crsch, "cr_order_number");
+        let cr_item = col_i32(&crb, &crsch, "cr_item_sk");
+        let cash = col_f64(&crb, &crsch, "cr_refunded_cash");
+        let charge = col_f64(&crb, &crsch, "cr_reversed_charge");
+        let credit = col_f64(&crb, &crsch, "cr_store_credit");
+        let planted: Vec<f64> = (0..cr_order.len())
+            .filter(|&i| cr_order[i] == Some(Q64_CATALOG_ORDER) && cr_item[i] == Some(Q64_ITEM))
+            .map(|i| cash[i] + charge[i] + credit[i])
+            .collect();
+        assert!(!planted.is_empty(), "no catalog return for q64's order");
+        assert!(
+            planted.iter().all(|&r| sale > 2.0 * r),
+            "q64 catalog pair fails cs_ui: sale {sale}, refunds {planted:?}"
         );
     }
 
