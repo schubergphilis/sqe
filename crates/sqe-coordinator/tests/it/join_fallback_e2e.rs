@@ -71,14 +71,21 @@ async fn mock_polaris() -> wiremock::MockServer {
     server
 }
 
-struct Fixture {
+pub(crate) struct Fixture {
     _mock: wiremock::MockServer,
     _dirs: Vec<tempfile::TempDir>,
-    handler: QueryHandler,
-    session: Session,
+    pub(crate) handler: QueryHandler,
+    pub(crate) session: Session,
 }
 
 async fn fixture(join_fallback: bool) -> Fixture {
+    fixture_with(|config| config.query.join_fallback = join_fallback).await
+}
+
+/// Tables `lake.t.a(k, x)` and `lake.t.b(k, y)` of [`ROWS`] rows each, on a
+/// handler capped at [`CAP`] per query and spilling to a temp dir, with
+/// `tune` applied to the config last.
+pub(crate) async fn fixture_with(tune: impl FnOnce(&mut SqeConfig)) -> Fixture {
     crate::common::init_tracing();
     let root = tempfile::tempdir().expect("tempdir");
     let data_a = tempfile::tempdir().expect("tempdir");
@@ -96,8 +103,8 @@ async fn fixture(join_fallback: bool) -> Fixture {
     config.storage.tvf.allow_local_paths = true;
     config.query.max_query_memory = CAP.to_string();
     config.query.per_user_memory_budget = "0".to_string();
-    config.query.join_fallback = join_fallback;
     config.coordinator.spill_dir = spill.path().display().to_string();
+    tune(&mut config);
     let tracker = Arc::new(QueryTracker::new(&config.query_history));
     let handler = QueryHandler::new(
         Arc::new(PassthroughEnforcer),

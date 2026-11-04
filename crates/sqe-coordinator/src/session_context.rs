@@ -324,7 +324,13 @@ pub async fn create_session_context(
 
             let session_config = sqe_catalog::engine_session_config()
                 .with_information_schema(true)
-                .with_default_catalog_and_schema(&default_catalog, &session_schema);
+                .with_default_catalog_and_schema(&default_catalog, &session_schema)
+                // `coordinator.spill_compression` (#788): DataFusion writes
+                // spill files uncompressed unless told otherwise.
+                .set_str(
+                    "datafusion.execution.spill_compression",
+                    config.coordinator.spill_compression.spill_codec(),
+                );
 
             // Dynamic-filter membership pushdown sizing. DataFusion only
             // materializes the build-side key set as an IN-list (extractable,

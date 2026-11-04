@@ -90,6 +90,7 @@ mod runtime_catalog_test;
 mod show_stats_policy_e2e;
 mod spark_access_control_e2e;
 mod spark_mask_parity_e2e;
+mod spill_settings_e2e;
 mod sql_compat_test;
 mod subscript_dot_access_e2e;
 mod table_files_json_e2e;
