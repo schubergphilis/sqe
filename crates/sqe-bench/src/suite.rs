@@ -195,6 +195,11 @@ async fn run_suite_with_queries(
                 trino_rows,
                 canonical,
             );
+            let (status, value_diff) = crate::comparison::values::refine_status(
+                status,
+                run.result.as_deref().ok(),
+                trino_run.result.as_deref().ok(),
+            );
             let speedup = if sqe_time_ms > 0 {
                 trino_time_ms as f64 / sqe_time_ms as f64
             } else {
@@ -212,6 +217,7 @@ async fn run_suite_with_queries(
                 sqe_error,
                 trino_error,
                 status,
+                value_diff,
             });
         }
     }
@@ -255,6 +261,7 @@ fn build_comparison_report(
     let vacuous_bug = count(&|c| matches!(c.status, CompareStatusReport::VacuousBug));
     let dialect_diff = count(&|c| matches!(c.status, CompareStatusReport::DialectDiff));
     let row_diff = count(&|c| matches!(c.status, CompareStatusReport::RowDiff));
+    let value_diff = count(&|c| matches!(c.status, CompareStatusReport::ValueDiff));
     let sqe_failed = count(&|c| matches!(c.status, CompareStatusReport::SqeFailed));
     let trino_failed = count(&|c| matches!(c.status, CompareStatusReport::TrinoFailed));
     let both_failed = count(&|c| matches!(c.status, CompareStatusReport::BothFailed));
@@ -273,6 +280,7 @@ fn build_comparison_report(
                     | CompareStatusReport::VacuousBug
                     | CompareStatusReport::DialectDiff
                     | CompareStatusReport::RowDiff
+                    | CompareStatusReport::ValueDiff
             )
         })
         .map(|c| c.speedup)
@@ -305,6 +313,7 @@ fn build_comparison_report(
             vacuous_bug,
             dialect_diff,
             row_diff,
+            value_diff,
             sqe_failed,
             trino_failed,
             both_failed,
