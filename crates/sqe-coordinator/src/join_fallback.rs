@@ -662,10 +662,19 @@ mod tests {
     use super::*;
     use datafusion::arrow::array::Int64Array;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::catalog::streaming::StreamingTable;
+    use datafusion::common::stats::Precision;
     use datafusion::datasource::MemTable;
     use datafusion::execution::memory_pool::GreedyMemoryPool;
     use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-    use datafusion::physical_plan::displayable;
+    use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+    use datafusion::physical_plan::joins::SortMergeJoinExec;
+    use datafusion::physical_plan::repartition::RepartitionExec;
+    use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+    use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion::physical_plan::streaming::PartitionStream;
+    use datafusion::physical_plan::{displayable, Partitioning};
     use datafusion::prelude::SessionConfig;
     use futures::TryStreamExt;
 
@@ -673,7 +682,8 @@ mod tests {
     const CAP: usize = 16 * 1024 * 1024;
 
     /// A session over `shared` with two `ROWS`-row tables, `l` and `r`,
-    /// joining one to one on `id`.
+    /// joining one to one on `id`, and `l_nostats`: `l`'s rows behind a scan
+    /// that reports no statistics.
     fn session(shared: Arc<dyn MemoryPool>) -> SessionContext {
         let runtime = Arc::new(
             RuntimeEnvBuilder::new()
@@ -705,7 +715,13 @@ mod tests {
                     )
                     .unwrap()
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            if name == "l" {
+                let no_stats = NoStats(Arc::clone(&schema), batches.clone());
+                let table = StreamingTable::try_new(Arc::clone(&schema), vec![Arc::new(no_stats)]);
+                ctx.register_table("l_nostats", Arc::new(table.unwrap()))
+                    .unwrap();
+            }
             ctx.register_table(
                 name,
                 Arc::new(MemTable::try_new(Arc::clone(&schema), vec![batches]).unwrap()),
@@ -713,6 +729,25 @@ mod tests {
             .unwrap();
         }
         ctx
+    }
+
+    /// `batches` behind a `StreamingTable`, whose scan reports no statistics:
+    /// the stand-in for a table without metadata stats.
+    #[derive(Debug)]
+    struct NoStats(SchemaRef, Vec<RecordBatch>);
+
+    impl PartitionStream for NoStats {
+        fn schema(&self) -> &SchemaRef {
+            &self.0
+        }
+
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let batches = self.1.clone().into_iter().map(Ok);
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&self.0),
+                futures::stream::iter(batches),
+            ))
+        }
     }
 
     const JOIN: &str = "SELECT l.id, r.v FROM l JOIN r ON l.id = r.id";
@@ -806,6 +841,133 @@ mod tests {
             2,
             "{shape}"
         );
+        drop(plan);
+        assert_eq!(shared.reserved(), 0, "both attempts released their memory");
+    }
+
+    /// Byte-size precision of the first hash join's build side in `sql`'s
+    /// first-attempt plan: what `JoinStrategyRule` reads (join_strategy.rs).
+    async fn build_precision(sql: &str) -> Precision<usize> {
+        let shared: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * CAP));
+        let ctx = session(shared);
+        let frame = ctx.sql(sql).await.unwrap();
+        let plan = frame.create_physical_plan().await.unwrap();
+        let join = find_hash_join(&plan).expect("the first attempt hash-joins");
+        StatisticsContext::new()
+            .compute(join.left().as_ref(), &StatisticsArgs::new())
+            .unwrap()
+            .total_byte_size
+    }
+
+    fn find_hash_join(plan: &Arc<dyn ExecutionPlan>) -> Option<&HashJoinExec> {
+        plan.downcast_ref::<HashJoinExec>()
+            .or_else(|| plan.children().into_iter().find_map(find_hash_join))
+    }
+
+    /// Every sort-merge join input reaches a multi-partition hash
+    /// repartition before anything funnels it to one partition. Scoped to
+    /// the joins: an aggregate above them may still coalesce its output.
+    fn assert_joins_stay_partitioned(plan: &Arc<dyn ExecutionPlan>) {
+        let shape = displayable(plan.as_ref()).indent(false).to_string();
+        let mut joins = 0;
+        let mut stack = vec![Arc::clone(plan)];
+        while let Some(node) = stack.pop() {
+            if node.downcast_ref::<SortMergeJoinExec>().is_some() {
+                joins += 1;
+                for input in node.children() {
+                    assert_partitioned_input(input, &shape);
+                }
+            }
+            stack.extend(node.children().into_iter().cloned());
+        }
+        assert!(joins > 0, "no sort-merge join: {shape}");
+    }
+
+    fn assert_partitioned_input(input: &Arc<dyn ExecutionPlan>, shape: &str) {
+        let mut node = Arc::clone(input);
+        loop {
+            if let Some(repartition) = node.downcast_ref::<RepartitionExec>() {
+                let partitioning = repartition.partitioning();
+                assert!(
+                    matches!(partitioning, Partitioning::Hash(_, n) if *n > 1),
+                    "join input repartitioned as {partitioning:?}: {shape}"
+                );
+                return;
+            }
+            assert!(
+                node.downcast_ref::<CoalescePartitionsExec>().is_none()
+                    && node.downcast_ref::<SortPreservingMergeExec>().is_none(),
+                "a join input funnels to one partition: {shape}"
+            );
+            // A nested join's output is already hash-partitioned on its key.
+            if node.downcast_ref::<SortMergeJoinExec>().is_some() {
+                return;
+            }
+            let children = node.children();
+            assert_eq!(children.len(), 1, "unexpected join input: {shape}");
+            node = Arc::clone(children[0]);
+        }
+    }
+
+    /// The fallback rescues a too-large build whatever its estimate says:
+    /// Exact (the plain tables), Inexact (behind a filter) and Absent (a
+    /// scan without statistics). Each first attempt keeps the hash join,
+    /// overflows the quota, and the sort-merge retry completes the join
+    /// without funnelling an input to one partition (#784).
+    #[tokio::test]
+    async fn the_fallback_covers_every_build_estimate() {
+        let expected_sum: i64 = (0..ROWS).map(|i| i * 2).sum();
+        let cases = [
+            ("exact", JOIN),
+            (
+                "inexact",
+                "SELECT l.id, r.v FROM (SELECT * FROM l WHERE id >= 0) l JOIN r ON l.id = r.id",
+            ),
+            (
+                "absent",
+                "SELECT l.id, r.v FROM l_nostats l JOIN r ON l.id = r.id",
+            ),
+        ];
+        for (precision, sql) in cases {
+            let estimate = build_precision(sql).await;
+            let matches = match precision {
+                "exact" => matches!(estimate, Precision::Exact(_)),
+                "inexact" => matches!(estimate, Precision::Inexact(_)),
+                _ => matches!(estimate, Precision::Absent),
+            };
+            assert!(matches, "{precision}: build estimate {estimate:?}");
+
+            let (result, replanned, shared) = run(sql, true).await;
+            let batches = result.unwrap_or_else(|e| panic!("{precision}: {e}"));
+            assert_eq!(
+                sum_v(&batches),
+                (ROWS as usize, expected_sum),
+                "{precision}"
+            );
+            let plan = replanned.take().expect("the retry ran");
+            assert_joins_stay_partitioned(&plan);
+            drop(plan);
+            assert_eq!(shared.reserved(), 0, "{precision}: memory released");
+        }
+    }
+
+    /// A q09-shaped chain of joins: the retry plans both as sort-merge joins
+    /// and neither funnels an input to one partition (#784).
+    #[tokio::test]
+    async fn a_join_chain_falls_back_without_a_single_partition_input() {
+        let sql = "SELECT l.id, r.v FROM l JOIN r ON l.id = r.id \
+                   JOIN l_nostats n ON r.id = n.id";
+        let (result, replanned, shared) = run(sql, true).await;
+        let batches = result.expect("the sort-merge retry completes the chain");
+        assert_eq!(
+            sum_v(&batches),
+            (ROWS as usize, (0..ROWS).map(|i| i * 2).sum())
+        );
+        let plan = replanned.take().expect("the retry ran");
+        let shape = displayable(plan.as_ref()).indent(false).to_string();
+        assert_eq!(shape.matches("SortMergeJoin").count(), 2, "{shape}");
+        assert!(!shape.contains("HashJoinExec"), "{shape}");
+        assert_joins_stay_partitioned(&plan);
         drop(plan);
         assert_eq!(shared.reserved(), 0, "both attempts released their memory");
     }
