@@ -41,7 +41,8 @@ The provisioning levers, all in [Configuration](configuration.md) and detailed i
 | `memory_limit` | `[coordinator]` / `[worker]` | Total DataFusion runtime memory for the role. The primary lever. |
 | `spill_to_disk` | `[worker]` | Allow large sorts and joins to spill rather than OOM. |
 | `spill_dir` | `[coordinator]` / `[worker]` | Where spill files land. Size and speed of this disk matter under heavy spill. |
-| `spill_compression` | `[coordinator]` / `[worker]` | `zstd`, `lz4`, or `none`. Trades CPU for spill I/O. |
+| `spill_compression` | `[coordinator]` | `lz4` (default), `zstd`, or `none`. Trades CPU for spill I/O. |
+| `spill_max_bytes` | `[coordinator]` | Disk cap for spill files (default `100GB`). Keep it below the free space on `spill_dir`. |
 | `hash_join_memory_threshold` | `[optimizer]` | Build-side size above which a hash join becomes a sort-merge join. |
 | `broadcast_threshold` | `[optimizer]` | Join side size below which a broadcast join is used (no shuffle). |
 | `max_query_memory` | `[query]` | Per-query memory cap, independent of the runtime pool. |
