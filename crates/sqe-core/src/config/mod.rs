@@ -5827,7 +5827,7 @@ fn default_memory_limit_auto_fraction() -> f64 {
     0.7
 }
 fn default_unspillable_headroom_percent() -> u8 {
-    20
+    crate::memory_headroom::DEFAULT_UNSPILLABLE_HEADROOM_PERCENT
 }
 fn default_spill_compression() -> FlightCompression {
     FlightCompression::Lz4

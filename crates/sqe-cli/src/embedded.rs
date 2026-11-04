@@ -41,7 +41,7 @@ use sqe_core::SecretStore;
 
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
-use datafusion::execution::memory_pool::FairSpillPool;
+use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool, TrackConsumersPool};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::SessionContext;
 use sqe_core::config::StorageConfig;
@@ -267,6 +267,29 @@ pub fn build_embedded_context(
 const TT_CATALOG: &str = "default";
 const TT_SCHEMA: &str = "default";
 
+/// The embedded engine's memory pool: the coordinator's default, greedy with
+/// an unspillable headroom ([`sqe_core::memory_headroom`]).
+///
+/// It used to be a `FairSpillPool`, which splits the pool minus every
+/// unspillable byte evenly across the registered spillable consumers. The
+/// Iceberg scan's decode admissions are unspillable, so each aggregate
+/// partition's cap shrank with them: q3 of the engine bench (150M rows,
+/// 3 GB) spilled its final aggregate 88-96 times where the coordinator, on
+/// the same data and limit, did not spill at all.
+fn embedded_memory_pool(memory_limit_bytes: usize) -> Arc<dyn MemoryPool> {
+    const TOP_CONSUMERS_IN_ERROR: usize = 5;
+    let pool_size = memory_limit_bytes.max(64 * 1024 * 1024);
+    let tracked = Arc::new(TrackConsumersPool::new(
+        GreedyMemoryPool::new(pool_size),
+        std::num::NonZeroUsize::new(TOP_CONSUMERS_IN_ERROR).expect("non-zero const"),
+    ));
+    sqe_core::memory_headroom::HeadroomPool::wrap(
+        tracked,
+        pool_size,
+        sqe_core::memory_headroom::DEFAULT_UNSPILLABLE_HEADROOM_PERCENT,
+    )
+}
+
 /// Like [`build_embedded_context`], with an explicit HMAC mask key (from
 /// `[policy] mask_key` in a loaded `sqe.toml`).
 pub fn build_embedded_context_with_mask(
@@ -278,8 +301,7 @@ pub fn build_embedded_context_with_mask(
         .with_information_schema(true)
         .with_default_catalog_and_schema(TT_CATALOG, TT_SCHEMA);
 
-    let pool_size = memory_limit_bytes.max(64 * 1024 * 1024);
-    let pool = Arc::new(FairSpillPool::new(pool_size));
+    let pool = embedded_memory_pool(memory_limit_bytes);
     // V10: wrap DataFusion's default ObjectStoreRegistry so
     // `read_csv('https://...')`, `read_parquet('https://...')`, etc. lazily
     // build an HttpStore for the URL's scheme://host on first request. Keeps
@@ -2651,6 +2673,41 @@ mod tests {
                 .find(|(k, _)| *k == name)
                 .map(|(_, v)| v.to_string())
         }
+    }
+
+    /// The embedded pool is the coordinator's: a busy aggregate is not capped
+    /// at a share by idle spillable siblings or by the scan's unspillable
+    /// bytes, stops at the headroom line, and the scan keeps the headroom.
+    #[test]
+    fn embedded_pool_is_greedy_with_unspillable_headroom() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+        const MIB: usize = 1024 * 1024;
+        let pool = embedded_memory_pool(100 * MIB);
+        let _idle: Vec<_> = (0..8)
+            .map(|i| {
+                MemoryConsumer::new(format!("idle-agg-{i}"))
+                    .with_can_spill(true)
+                    .register(&pool)
+            })
+            .collect();
+        let scan = MemoryConsumer::new("iceberg-scan-decode:t").register(&pool);
+        scan.try_grow(15 * MIB).expect("the scan admits");
+        let agg = MemoryConsumer::new("agg")
+            .with_can_spill(true)
+            .register(&pool);
+        // A FairSpillPool would cap this at (100 - 15) / 9 MiB.
+        agg.try_grow(75 * MIB)
+            .expect("one aggregate may take the spillable bytes");
+        let err = agg.try_grow(6 * MIB).expect_err("spillable stops at 80%");
+        assert!(
+            matches!(
+                err,
+                datafusion::error::DataFusionError::ResourcesExhausted(_)
+            ),
+            "the refusal is the one operators spill on: {err}"
+        );
+        scan.try_grow(10 * MIB)
+            .expect("the scan still has the unspillable headroom");
     }
 
     #[test]
