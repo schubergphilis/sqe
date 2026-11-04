@@ -3956,6 +3956,8 @@ impl WriteHandler {
                 .handle_delete(session, stmt, catalog, ctx, policy_summary_out)
                 .await;
         };
+        // A reader is refused here, before any data or delete file (#880).
+        catalog.check_write_access(&table_ident, &table).await?;
 
         // Capture lineage: a DELETE rewrites the target in place, so the
         // OL plan is `target -> target` with identity column lineage. We
@@ -4277,6 +4279,8 @@ impl WriteHandler {
                 .handle_update(session, stmt, catalog, ctx, policy_summary_out)
                 .await;
         };
+        // A reader is refused here, before any data or delete file (#880).
+        catalog.check_write_access(&table_ident, &table).await?;
 
         // Capture lineage: UPDATE rewrites target rows in place. v1 emits
         // identity column lineage; richer per-column SET-expression tracing
@@ -5384,6 +5388,8 @@ impl WriteHandler {
                 )
                 .await;
         };
+        // A reader is refused here, before any data or delete file (#880).
+        catalog.check_write_access(&table_ident, &table).await?;
 
         // Capture lineage. The MERGE source SELECT was already planned and
         // executed by the caller. We re-wrap that source plan as a synthetic

@@ -1,0 +1,5 @@
+### Fixed
+
+- DELETE, UPDATE, MERGE and TRUNCATE by a caller who may read a table but not write it are refused with `ACCESS_DENIED` before any file is written (#880)
+
+    With vended credentials Polaris answers a reader's delegated `loadTable` with read-only keys instead of a refusal, so the statement planned, wrote data or delete files and only failed at the first `PutObject`, leaving orphan files behind. On a REST catalog that vends credentials the engine now sends a commit that changes nothing first (`assert-table-uuid` + `assert-ref-snapshot-id main` with `set-snapshot-ref main` to the same snapshot; requirements only when there is no `main` or the ref moved). Polaris authorizes the update and refuses a reader with 403; for a writer nothing changes. Only a 403 refuses; any other answer logs a warning and leaves the decision to the real commit. Limits: a principal with `TABLE_WRITE_PROPERTIES` but not `TABLE_WRITE_DATA` passes the check and still fails at the object store; INSERT and CTAS are not checked.
