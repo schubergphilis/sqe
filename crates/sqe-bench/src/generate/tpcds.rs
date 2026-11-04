@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow_array::{Date32Array, Float64Array, Int32Array, RecordBatch, StringArray};
+use arrow_array::{Date32Array, Decimal128Array, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -25,8 +25,15 @@ fn schema(fields: &[(&str, DataType)]) -> SchemaRef {
 fn i32() -> DataType {
     DataType::Int32
 }
-fn f64() -> DataType {
-    DataType::Float64
+// Numeric types follow the TPC-DS spec (benchmarks/schemas/tpcds.sql): money
+// is decimal(7,2), GMT offsets and tax rates decimal(5,2), p_cost
+// decimal(15,2). Float64 here made every SUM order-dependent and gave
+// DataFusion a different plan and result type than Trino or Spark would see.
+fn money() -> DataType {
+    DataType::Decimal128(7, 2)
+}
+fn dec5_2() -> DataType {
+    DataType::Decimal128(5, 2)
 }
 fn str() -> DataType {
     DataType::Utf8
@@ -52,18 +59,18 @@ fn store_sales_schema() -> SchemaRef {
         ("ss_promo_sk", i32()),
         ("ss_ticket_number", i32()),
         ("ss_quantity", i32()),
-        ("ss_wholesale_cost", f64()),
-        ("ss_list_price", f64()),
-        ("ss_sales_price", f64()),
-        ("ss_ext_discount_amt", f64()),
-        ("ss_ext_sales_price", f64()),
-        ("ss_ext_wholesale_cost", f64()),
-        ("ss_ext_list_price", f64()),
-        ("ss_ext_tax", f64()),
-        ("ss_coupon_amt", f64()),
-        ("ss_net_paid", f64()),
-        ("ss_net_paid_inc_tax", f64()),
-        ("ss_net_profit", f64()),
+        ("ss_wholesale_cost", money()),
+        ("ss_list_price", money()),
+        ("ss_sales_price", money()),
+        ("ss_ext_discount_amt", money()),
+        ("ss_ext_sales_price", money()),
+        ("ss_ext_wholesale_cost", money()),
+        ("ss_ext_list_price", money()),
+        ("ss_ext_tax", money()),
+        ("ss_coupon_amt", money()),
+        ("ss_net_paid", money()),
+        ("ss_net_paid_inc_tax", money()),
+        ("ss_net_profit", money()),
     ])
 }
 
@@ -80,15 +87,15 @@ fn store_returns_schema() -> SchemaRef {
         ("sr_reason_sk", i32()),
         ("sr_ticket_number", i32()),
         ("sr_return_quantity", i32()),
-        ("sr_return_amt", f64()),
-        ("sr_return_tax", f64()),
-        ("sr_return_amt_inc_tax", f64()),
-        ("sr_fee", f64()),
-        ("sr_return_ship_cost", f64()),
-        ("sr_refunded_cash", f64()),
-        ("sr_reversed_charge", f64()),
-        ("sr_store_credit", f64()),
-        ("sr_net_loss", f64()),
+        ("sr_return_amt", money()),
+        ("sr_return_tax", money()),
+        ("sr_return_amt_inc_tax", money()),
+        ("sr_fee", money()),
+        ("sr_return_ship_cost", money()),
+        ("sr_refunded_cash", money()),
+        ("sr_reversed_charge", money()),
+        ("sr_store_credit", money()),
+        ("sr_net_loss", money()),
     ])
 }
 
@@ -113,21 +120,21 @@ fn catalog_sales_schema() -> SchemaRef {
         ("cs_promo_sk", i32()),
         ("cs_order_number", i32()),
         ("cs_quantity", i32()),
-        ("cs_wholesale_cost", f64()),
-        ("cs_list_price", f64()),
-        ("cs_sales_price", f64()),
-        ("cs_ext_discount_amt", f64()),
-        ("cs_ext_sales_price", f64()),
-        ("cs_ext_wholesale_cost", f64()),
-        ("cs_ext_list_price", f64()),
-        ("cs_ext_tax", f64()),
-        ("cs_coupon_amt", f64()),
-        ("cs_ext_ship_cost", f64()),
-        ("cs_net_paid", f64()),
-        ("cs_net_paid_inc_tax", f64()),
-        ("cs_net_paid_inc_ship", f64()),
-        ("cs_net_paid_inc_ship_tax", f64()),
-        ("cs_net_profit", f64()),
+        ("cs_wholesale_cost", money()),
+        ("cs_list_price", money()),
+        ("cs_sales_price", money()),
+        ("cs_ext_discount_amt", money()),
+        ("cs_ext_sales_price", money()),
+        ("cs_ext_wholesale_cost", money()),
+        ("cs_ext_list_price", money()),
+        ("cs_ext_tax", money()),
+        ("cs_coupon_amt", money()),
+        ("cs_ext_ship_cost", money()),
+        ("cs_net_paid", money()),
+        ("cs_net_paid_inc_tax", money()),
+        ("cs_net_paid_inc_ship", money()),
+        ("cs_net_paid_inc_ship_tax", money()),
+        ("cs_net_profit", money()),
     ])
 }
 
@@ -151,15 +158,15 @@ fn catalog_returns_schema() -> SchemaRef {
         ("cr_reason_sk", i32()),
         ("cr_order_number", i32()),
         ("cr_return_quantity", i32()),
-        ("cr_return_amount", f64()),
-        ("cr_return_tax", f64()),
-        ("cr_return_amt_inc_tax", f64()),
-        ("cr_fee", f64()),
-        ("cr_return_ship_cost", f64()),
-        ("cr_refunded_cash", f64()),
-        ("cr_reversed_charge", f64()),
-        ("cr_store_credit", f64()),
-        ("cr_net_loss", f64()),
+        ("cr_return_amount", money()),
+        ("cr_return_tax", money()),
+        ("cr_return_amt_inc_tax", money()),
+        ("cr_fee", money()),
+        ("cr_return_ship_cost", money()),
+        ("cr_refunded_cash", money()),
+        ("cr_reversed_charge", money()),
+        ("cr_store_credit", money()),
+        ("cr_net_loss", money()),
     ])
 }
 
@@ -184,21 +191,21 @@ fn web_sales_schema() -> SchemaRef {
         ("ws_promo_sk", i32()),
         ("ws_order_number", i32()),
         ("ws_quantity", i32()),
-        ("ws_wholesale_cost", f64()),
-        ("ws_list_price", f64()),
-        ("ws_sales_price", f64()),
-        ("ws_ext_discount_amt", f64()),
-        ("ws_ext_sales_price", f64()),
-        ("ws_ext_wholesale_cost", f64()),
-        ("ws_ext_list_price", f64()),
-        ("ws_ext_tax", f64()),
-        ("ws_coupon_amt", f64()),
-        ("ws_ext_ship_cost", f64()),
-        ("ws_net_paid", f64()),
-        ("ws_net_paid_inc_tax", f64()),
-        ("ws_net_paid_inc_ship", f64()),
-        ("ws_net_paid_inc_ship_tax", f64()),
-        ("ws_net_profit", f64()),
+        ("ws_wholesale_cost", money()),
+        ("ws_list_price", money()),
+        ("ws_sales_price", money()),
+        ("ws_ext_discount_amt", money()),
+        ("ws_ext_sales_price", money()),
+        ("ws_ext_wholesale_cost", money()),
+        ("ws_ext_list_price", money()),
+        ("ws_ext_tax", money()),
+        ("ws_coupon_amt", money()),
+        ("ws_ext_ship_cost", money()),
+        ("ws_net_paid", money()),
+        ("ws_net_paid_inc_tax", money()),
+        ("ws_net_paid_inc_ship", money()),
+        ("ws_net_paid_inc_ship_tax", money()),
+        ("ws_net_profit", money()),
     ])
 }
 
@@ -219,15 +226,15 @@ fn web_returns_schema() -> SchemaRef {
         ("wr_reason_sk", i32()),
         ("wr_order_number", i32()),
         ("wr_return_quantity", i32()),
-        ("wr_return_amt", f64()),
-        ("wr_return_tax", f64()),
-        ("wr_return_amt_inc_tax", f64()),
-        ("wr_fee", f64()),
-        ("wr_return_ship_cost", f64()),
-        ("wr_refunded_cash", f64()),
-        ("wr_reversed_charge", f64()),
-        ("wr_account_credit", f64()),
-        ("wr_net_loss", f64()),
+        ("wr_return_amt", money()),
+        ("wr_return_tax", money()),
+        ("wr_return_amt_inc_tax", money()),
+        ("wr_fee", money()),
+        ("wr_return_ship_cost", money()),
+        ("wr_refunded_cash", money()),
+        ("wr_reversed_charge", money()),
+        ("wr_account_credit", money()),
+        ("wr_net_loss", money()),
     ])
 }
 
@@ -295,8 +302,8 @@ fn item_schema() -> SchemaRef {
         ("i_rec_start_date", date()),
         ("i_rec_end_date", date()),
         ("i_item_desc", str()),
-        ("i_current_price", f64()),
-        ("i_wholesale_cost", f64()),
+        ("i_current_price", money()),
+        ("i_wholesale_cost", money()),
         ("i_brand_id", i32()),
         ("i_brand", str()),
         ("i_class_id", i32()),
@@ -351,7 +358,7 @@ fn customer_address_schema() -> SchemaRef {
         ("ca_state", str()),
         ("ca_zip", str()),
         ("ca_country", str()),
-        ("ca_gmt_offset", f64()),
+        ("ca_gmt_offset", dec5_2()),
         ("ca_location_type", str()),
     ])
 }
@@ -409,8 +416,9 @@ fn store_schema() -> SchemaRef {
         ("s_state", str()),
         ("s_zip", str()),
         ("s_country", str()),
-        ("s_gmt_offset", f64()),
-        ("s_tax_percentage", f64()),
+        ("s_gmt_offset", dec5_2()),
+        // Sic: the spec DDL (and Trino's tpcds connector) spell it this way.
+        ("s_tax_precentage", dec5_2()),
     ])
 }
 
@@ -454,8 +462,8 @@ fn web_site_schema() -> SchemaRef {
         ("web_state", str()),
         ("web_zip", str()),
         ("web_country", str()),
-        ("web_gmt_offset", f64()),
-        ("web_tax_percentage", f64()),
+        ("web_gmt_offset", dec5_2()),
+        ("web_tax_percentage", dec5_2()),
     ])
 }
 
@@ -493,7 +501,7 @@ fn warehouse_schema() -> SchemaRef {
         ("w_state", str()),
         ("w_zip", str()),
         ("w_country", str()),
-        ("w_gmt_offset", f64()),
+        ("w_gmt_offset", dec5_2()),
     ])
 }
 
@@ -504,7 +512,7 @@ fn promotion_schema() -> SchemaRef {
         ("p_start_date_sk", i32()),
         ("p_end_date_sk", i32()),
         ("p_item_sk", i32()),
-        ("p_cost", f64()),
+        ("p_cost", DataType::Decimal128(15, 2)),
         ("p_response_target", i32()),
         ("p_promo_name", str()),
         ("p_channel_dmail", str()),
@@ -579,8 +587,8 @@ fn call_center_schema() -> SchemaRef {
         ("cc_state", str()),
         ("cc_zip", str()),
         ("cc_country", str()),
-        ("cc_gmt_offset", f64()),
-        ("cc_tax_percentage", f64()),
+        ("cc_gmt_offset", dec5_2()),
+        ("cc_tax_percentage", dec5_2()),
     ])
 }
 
@@ -674,7 +682,7 @@ fn store_rows(sf: f64) -> usize {
 fn web_site_rows(sf: f64) -> usize {
     super::scaled(sf, 30.0)
 } // 1 / 30
-fn web_page_rows(sf: f64) -> usize {
+pub(super) fn web_page_rows(sf: f64) -> usize {
     super::scaled(sf, 60.0)
 } // 1 / 60
   // 1 / 5; sf10 10; sf100 15; sf1000 20.
@@ -720,7 +728,9 @@ const BATCH_SIZE: usize = 10_000;
 
 // TPC-DS date range: 1998-01-01 to 2003-12-31
 const DS_DATE_START: i32 = 10227; // days since epoch for 1998-01-01
-const DS_DATE_RANGE: i32 = 2191; // ~6 years
+/// `d_date_sk` 1..=DS_DATE_RANGE is the 1998-2003 sales window; every fact
+/// date key (and tpcbb's click dates) is drawn from it.
+pub(super) const DS_DATE_RANGE: i32 = 2191; // ~6 years
 
 fn seed_for_table(name: &str) -> u64 {
     name.bytes()
@@ -750,6 +760,13 @@ fn seed_salt() -> u64 {
 
 fn random_date(rng: &mut StdRng) -> i32 {
     DS_DATE_START + rng.random_range(0..DS_DATE_RANGE)
+}
+
+/// Round to whole cents. Prices are rounded before the extended amounts are
+/// derived from them, so `ext_sales_price = sales_price * quantity` and
+/// `net_paid_inc_tax = net_paid + ext_tax` hold exactly in the decimal data.
+fn cents(x: f64) -> f64 {
+    (x * 100.0).round() / 100.0
 }
 
 /// Random `d_date_sk` surrogate key for fact tables, constrained to the
@@ -1980,6 +1997,7 @@ where
 
 enum ColVal {
     I32(Option<i32>),
+    /// A decimal column's value; `cols_to_arrays` rounds it to the scale.
     F64(Option<f64>),
     Str(Option<String>),
     Date(Option<i32>),
@@ -2022,15 +2040,27 @@ fn cols_to_arrays(
                         .collect();
                     Arc::new(Int32Array::from(v)) as Arc<dyn arrow_array::Array>
                 }
-                DataType::Float64 => {
-                    let v: Vec<Option<f64>> = col
+                DataType::Decimal128(precision, scale) => {
+                    // Row builders compute in f64; round to the column's
+                    // scale here, as dsdgen rounds to cents.
+                    let factor = 10_f64.powi(i32::from(*scale));
+                    let v: Vec<Option<i128>> = col
                         .into_iter()
                         .map(|c| match c {
-                            ColVal::F64(x) => x,
+                            ColVal::F64(x) => x.map(|x| (x * factor).round() as i128),
                             other => mismatch(field, &other),
                         })
                         .collect();
-                    Arc::new(Float64Array::from(v)) as Arc<dyn arrow_array::Array>
+                    let array = Decimal128Array::from(v)
+                        .with_precision_and_scale(*precision, *scale)
+                        .expect("valid decimal precision/scale");
+                    // with_precision_and_scale checks the type, not the
+                    // values. An overflowing value would be written as a
+                    // corrupt decimal, so fail generation instead.
+                    if let Err(e) = array.validate_decimal_precision(*precision) {
+                        panic!("generator bug: column '{}': {e}", field.name());
+                    }
+                    Arc::new(array) as Arc<dyn arrow_array::Array>
                 }
                 DataType::Date32 => {
                     let v: Vec<Option<i32>> = col
@@ -2104,9 +2134,9 @@ fn stream_store_sales(scale: f64) -> (SchemaRef, super::BatchIterator) {
             let item_sk = b.items[line - 1];
             let qty = b.quantities[line - 1];
             let wc = rng.random_range(10..500i32) as f64 / 10.0;
-            let lp = wc * 1.5;
-            let sp = lp * rng.random_range(50..100i32) as f64 / 100.0;
-            let tax = sp * 0.08;
+            let lp = cents(wc * 1.5);
+            let sp = cents(lp * rng.random_range(50..100i32) as f64 / 100.0);
+            let tax = cents(sp * qty as f64 * 0.08);
             vec![
                 i!(b.date_sk),
                 i!(rng.random_range(0..86400i32)),
@@ -2244,10 +2274,10 @@ fn stream_catalog_sales(scale: f64) -> (SchemaRef, super::BatchIterator) {
             let item_sk = b.items[line - 1];
             let qty = b.quantities[line - 1];
             let wc = rng.random_range(10..500i32) as f64 / 10.0;
-            let lp = wc * 1.5;
-            let sp = lp * rng.random_range(50..100i32) as f64 / 100.0;
-            let tax = sp * 0.08;
-            let ship = sp * 0.05 * qty as f64;
+            let lp = cents(wc * 1.5);
+            let sp = cents(lp * rng.random_range(50..100i32) as f64 / 100.0);
+            let tax = cents(sp * qty as f64 * 0.08);
+            let ship = cents(sp * 0.05 * qty as f64);
             let ship_date = (b.date_sk + rng.random_range(1..=120i32)).min(DS_DATE_RANGE);
             vec![
                 i!(b.date_sk),
@@ -2381,16 +2411,15 @@ fn stream_web_sales(scale: f64) -> (SchemaRef, super::BatchIterator) {
             // capped ws_sales_price at ~$74, leaving q85's 100-150 and 150-200
             // price arms structurally empty.
             let wc = rng.random_range(100..10_000i32) as f64 / 100.0;
-            let lp = ((wc * rng.random_range(100..300i32) as f64 / 100.0) * 100.0).round() / 100.0;
-            let mut sp =
-                ((lp * rng.random_range(0..=100i32) as f64 / 100.0) * 100.0).round() / 100.0;
+            let lp = cents(wc * rng.random_range(100..300i32) as f64 / 100.0);
+            let mut sp = cents(lp * rng.random_range(0..=100i32) as f64 / 100.0);
             // q85 filters ws_sales_price BETWEEN 100 AND 150. Draw after the
             // rng so non-planted lines keep parity; then pin the planted order.
             if order == Q85_WEB_ORDER && line == 1 {
                 sp = Q85_SALES_PRICE;
             }
-            let tax = sp * 0.08;
-            let ship = sp * 0.05 * qty as f64;
+            let tax = cents(sp * qty as f64 * 0.08);
+            let ship = cents(sp * 0.05 * qty as f64);
             let ship_date = (b.date_sk + rng.random_range(1..=120i32)).min(DS_DATE_RANGE);
             vec![
                 i!(b.date_sk),
@@ -3792,6 +3821,97 @@ mod tests {
         assert_eq!(income_band_schema().fields().len(), 3);
     }
 
+    /// Every numeric column has the spec type from the TPC-DS DDL: money as
+    /// decimal(7,2), never a double. A Float64 money column made SUMs
+    /// order-dependent and gave Trino-compare a different result type.
+    #[test]
+    fn decimal_columns_match_the_spec_ddl() {
+        let ddl = include_str!("../../../../benchmarks/schemas/tpcds.sql");
+        let spec: std::collections::HashMap<&str, (u8, i8)> = ddl
+            .lines()
+            .filter_map(|line| {
+                let mut words = line.split_whitespace();
+                let name = words.next()?;
+                let ty = words.next()?.trim_end_matches(',');
+                let (p, s) = ty
+                    .strip_prefix("DECIMAL(")?
+                    .strip_suffix(')')?
+                    .split_once(',')?;
+                Some((name, (p.parse().ok()?, s.parse().ok()?)))
+            })
+            .collect();
+        assert_eq!(spec.len(), 80, "DDL parse lost decimal columns");
+
+        let mut seen = 0;
+        for table in TpcdsGenerator.tables() {
+            let (sch, _) =
+                stream_tpcds_table(&table.name, 0.01, &super::super::GenerateConfig::default())
+                    .unwrap();
+            for field in sch.fields() {
+                let name = field.name().as_str();
+                match (field.data_type(), spec.get(name)) {
+                    (DataType::Decimal128(p, s), Some(&(sp, ss))) => {
+                        assert_eq!((*p, *s), (sp, ss), "{}.{name}", table.name);
+                        seen += 1;
+                    }
+                    (DataType::Decimal128(..), None) => {
+                        panic!("{}.{name} is decimal, the spec says not", table.name)
+                    }
+                    (other, Some(_)) => {
+                        panic!("{}.{name} is {other:?}, the spec says decimal", table.name)
+                    }
+                    (DataType::Float32 | DataType::Float64, None) => {
+                        panic!("{}.{name} is a float; TPC-DS has none", table.name)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(seen, spec.len(), "a spec decimal column is missing");
+    }
+
+    /// The extended amounts are exact in cents, as in dsdgen output: queries
+    /// that compare or subtract them (net_paid - ext_tax, ...) must not see
+    /// a rounding residue.
+    #[test]
+    fn extended_amounts_are_exact_in_cents() {
+        fn cents_of(batches: &[RecordBatch], sch: &SchemaRef, name: &str) -> Vec<i128> {
+            let idx = sch.index_of(name).unwrap();
+            batches
+                .iter()
+                .flat_map(|b| {
+                    let a = b
+                        .column(idx)
+                        .as_any()
+                        .downcast_ref::<Decimal128Array>()
+                        .unwrap();
+                    a.values().to_vec()
+                })
+                .collect()
+        }
+        for (table, p) in [
+            ("store_sales", "ss"),
+            ("catalog_sales", "cs"),
+            ("web_sales", "ws"),
+        ] {
+            let (sch, it) =
+                stream_tpcds_table(table, 0.01, &super::super::GenerateConfig::default()).unwrap();
+            let batches: Vec<RecordBatch> = it.collect();
+            let qty = col_i32(&batches, &sch, &format!("{p}_quantity"));
+            let price = cents_of(&batches, &sch, &format!("{p}_sales_price"));
+            let ext = cents_of(&batches, &sch, &format!("{p}_ext_sales_price"));
+            let paid = cents_of(&batches, &sch, &format!("{p}_net_paid"));
+            let tax = cents_of(&batches, &sch, &format!("{p}_ext_tax"));
+            let inc_tax = cents_of(&batches, &sch, &format!("{p}_net_paid_inc_tax"));
+            assert!(!qty.is_empty(), "{table} generated no rows");
+            for i in 0..qty.len() {
+                let q = i128::from(qty[i].unwrap());
+                assert_eq!(ext[i], price[i] * q, "{table} row {i}");
+                assert_eq!(inc_tax[i], paid[i] + tax[i], "{table} row {i}");
+            }
+        }
+    }
+
     #[test]
     fn test_generate_store_sales_sf001() {
         let (sch, batches) = generate_store_sales(0.01);
@@ -3931,6 +4051,7 @@ mod tests {
             .collect()
     }
 
+    /// A decimal column's values as f64, for range and membership checks.
     fn col_f64(batches: &[RecordBatch], sch: &SchemaRef, name: &str) -> Vec<f64> {
         use arrow_array::Array as _;
         let idx = sch.index_of(name).unwrap();
@@ -3940,9 +4061,12 @@ mod tests {
                 let a = b
                     .column(idx)
                     .as_any()
-                    .downcast_ref::<arrow_array::Float64Array>()
+                    .downcast_ref::<Decimal128Array>()
                     .unwrap();
-                (0..a.len()).map(|i| a.value(i)).collect::<Vec<_>>()
+                let factor = 10_f64.powi(i32::from(a.scale()));
+                (0..a.len())
+                    .map(|i| a.value(i) as f64 / factor)
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
