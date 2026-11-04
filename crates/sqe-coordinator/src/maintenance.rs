@@ -1460,15 +1460,8 @@ impl MaintenanceHandler {
         // Compaction rewrites files, not rows: the previous snapshot's Puffin
         // NDV statistics stay exact for the new one, so re-register them
         // (architecture review 512). Best effort; the data commit is done.
-        crate::puffin_carry::carry_forward_statistics(
-            catalog.as_ref(),
-            &ident,
-            &committed,
-            crate::puffin_carry::CarryOp::Rewrite,
-            None,
-            self.metrics.as_deref(),
-        )
-        .await;
+        carry_rewrite_statistics(catalog, &ident, &table, &committed, self.metrics.as_deref())
+            .await;
 
         // After the commit, invalidate the shared TableMetadataCache entry so
         // subsequent load_table calls (including the table_files TVF used by
@@ -2470,15 +2463,7 @@ impl MaintenanceHandler {
 
         // Same as the local path: carry the previous snapshot's Puffin NDV
         // statistics onto the compacted snapshot (architecture review 512).
-        crate::puffin_carry::carry_forward_statistics(
-            catalog.as_ref(),
-            ident,
-            &committed,
-            crate::puffin_carry::CarryOp::Rewrite,
-            None,
-            metrics,
-        )
-        .await;
+        carry_rewrite_statistics(catalog, ident, table, &committed, metrics).await;
 
         let cache_key = format!("{}.{}", ident.namespace(), ident.name());
         if let Some(tc) = table_cache {
@@ -2763,12 +2748,11 @@ impl MaintenanceHandler {
 
         // Manifest rewrite touches no data: the previous snapshot's Puffin
         // NDV statistics remain exact for the new one (architecture review 512).
-        crate::puffin_carry::carry_forward_statistics(
-            catalog.as_ref(),
+        carry_rewrite_statistics(
+            &catalog,
             &ident,
+            &table,
             &committed,
-            crate::puffin_carry::CarryOp::Rewrite,
-            None,
             self.metrics.as_deref(),
         )
         .await;
@@ -3547,6 +3531,35 @@ async fn reload_committed(
         ));
     }
     Ok(reloaded)
+}
+
+/// Carry the previous snapshot's Puffin statistics onto the snapshot
+/// `committed` made (a rewrite: the NDVs stay exact). Best effort, like the
+/// carry itself.
+///
+/// The sidecars are read and written through a fresh `loadTable`'s
+/// `FileIO`: the table a REST commit returns has no vended credential, and
+/// `loaded`'s may have expired during a long rewrite. `loaded` is the
+/// fallback when the reload fails.
+async fn carry_rewrite_statistics(
+    catalog: &Arc<dyn Catalog>,
+    ident: &TableIdent,
+    loaded: &IcebergTable,
+    committed: &IcebergTable,
+    metrics: Option<&sqe_metrics::MetricsRegistry>,
+) {
+    let reloaded = load_table(catalog, ident).await.ok();
+    let io = reloaded.as_ref().unwrap_or(loaded).file_io();
+    crate::puffin_carry::carry_forward_statistics(
+        catalog.as_ref(),
+        ident,
+        committed,
+        io,
+        crate::puffin_carry::CarryOp::Rewrite,
+        None,
+        metrics,
+    )
+    .await;
 }
 
 /// Collect the three inputs [`crate::table_health::analyze_table_health`]

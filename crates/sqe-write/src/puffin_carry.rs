@@ -41,6 +41,7 @@
 
 use std::collections::HashMap;
 
+use iceberg::io::FileIO;
 use iceberg::spec::StatisticsFile;
 use iceberg::table::Table as IcebergTable;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -362,10 +363,17 @@ fn record(metrics: Option<&MetricsRegistry>, op: CarryOp, outcome: &'static str)
 /// snapshot is the one to annotate and that snapshot's parent is the one to
 /// carry from. No reload happens here, so a concurrent commit landing after
 /// ours cannot make us annotate the wrong snapshot.
+///
+/// `io` reads the previous sidecar and writes the new one. It is not
+/// `committed.file_io()`: a REST commit response carries no storage config,
+/// so on a credential-vending catalog the committed table has no credential
+/// and every read and write here failed (logged as `write_failed`, the
+/// statistics silently gone). Pass the `FileIO` of a table from `loadTable`.
 pub async fn carry_forward_statistics(
     catalog: &dyn Catalog,
     table_ident: &TableIdent,
     committed: &IcebergTable,
+    io: &FileIO,
     op: CarryOp,
     new_sketches: Option<&ColumnSketches>,
     metrics: Option<&MetricsRegistry>,
@@ -388,7 +396,7 @@ pub async fn carry_forward_statistics(
         .and_then(|parent| metadata.statistics_for_snapshot(parent))
     {
         Some(prev_file) => {
-            let blobs = match read_ndv_blobs(committed.file_io(), prev_file).await {
+            let blobs = match read_ndv_blobs(io, prev_file).await {
                 Ok(blobs) => blobs,
                 Err(e) => {
                     warn!(
@@ -430,21 +438,16 @@ pub async fn carry_forward_statistics(
         None => format!("{}/metadata", metadata.location().trim_end_matches('/')),
     };
 
-    let stats_file = match write_puffin_sidecar_from_blobs(
-        committed.file_io(),
-        &base_dir,
-        &blobs,
-        snapshot_id,
-        sequence_number,
-    )
-    .await
-    {
-        Ok(f) => f,
-        Err(e) => {
-            warn!(table = %table_ident, error = %e, "puffin: sidecar write failed");
-            return record(metrics, op, "write_failed");
-        }
-    };
+    let stats_file =
+        match write_puffin_sidecar_from_blobs(io, &base_dir, &blobs, snapshot_id, sequence_number)
+            .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(table = %table_ident, error = %e, "puffin: sidecar write failed");
+                return record(metrics, op, "write_failed");
+            }
+        };
 
     match commit_statistics_with_retry(catalog, table_ident, stats_file.clone()).await {
         Ok(_) => {
@@ -464,11 +467,7 @@ pub async fn carry_forward_statistics(
                 path = %stats_file.statistics_path,
                 "puffin: statistics commit failed; deleting staged sidecar"
             );
-            if let Err(del) = committed
-                .file_io()
-                .delete(&stats_file.statistics_path)
-                .await
-            {
+            if let Err(del) = io.delete(&stats_file.statistics_path).await {
                 warn!(
                     path = %stats_file.statistics_path,
                     error = %del,
