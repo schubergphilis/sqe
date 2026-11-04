@@ -1,6 +1,7 @@
 pub mod circuit_breaker;
 pub mod config;
 pub mod error;
+pub mod memory_headroom;
 pub mod process_memory;
 pub mod runtime;
 pub mod secret;
