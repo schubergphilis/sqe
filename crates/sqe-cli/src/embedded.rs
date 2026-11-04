@@ -1154,6 +1154,52 @@ impl EmbeddedClient {
     }
 }
 
+/// The ATTACH an `iceberg_rest` catalog opens with in embedded mode. An
+/// ATTACH that names no `S3_*` option reads the engine's own object store,
+/// the one `--s3-endpoint` / `SQE_STORAGE__S3_*` / `AWS_*` configured, so
+/// those settings fill the `S3_*` options; without them the catalog's FileIO
+/// fell back to the ambient AWS chain and failed with "region is missing"
+/// against a custom endpoint. Any `S3_*` option means the ATTACH describes
+/// its own store and nothing is mixed in. Credentials the catalog vends
+/// still replace these keys.
+///
+/// The server does not do this: there the configured keys are the
+/// coordinator's, and a user's ATTACH must not borrow them.
+fn with_storage_fallback<'a>(
+    stmt: &'a sqe_sql::AttachStatement,
+    storage: &StorageConfig,
+) -> std::borrow::Cow<'a, sqe_sql::AttachStatement> {
+    use sqe_sql::OptionValue;
+    use std::borrow::Cow;
+
+    if stmt.kind != sqe_sql::CatalogKind::IcebergRest
+        || stmt.options.keys().any(|k| k.starts_with("S3_"))
+    {
+        return Cow::Borrowed(stmt);
+    }
+    let path_style = if storage.s3_path_style { "true" } else { "" };
+    let fill = [
+        ("S3_ENDPOINT", storage.s3_endpoint.as_str()),
+        ("S3_REGION", storage.s3_region.as_str()),
+        ("S3_ACCESS_KEY", storage.s3_access_key.as_str()),
+        ("S3_SECRET_KEY", storage.s3_secret_key.expose()),
+        ("S3_SESSION_TOKEN", storage.s3_session_token.expose()),
+        ("S3_PATH_STYLE", path_style),
+    ];
+    if fill.iter().all(|(_, v)| v.is_empty()) {
+        return Cow::Borrowed(stmt);
+    }
+    let mut filled = stmt.clone();
+    for (key, value) in fill {
+        if !value.is_empty() {
+            filled
+                .options
+                .insert(key.to_string(), OptionValue::String(value.to_string()));
+        }
+    }
+    Cow::Owned(filled)
+}
+
 impl EmbeddedClient {
     async fn embedded_handle_attach(
         &mut self,
@@ -1167,6 +1213,8 @@ impl EmbeddedClient {
             .into());
         }
 
+        let filled = with_storage_fallback(stmt, &self.storage);
+        let stmt: &sqe_sql::AttachStatement = &filled;
         let catalog = sqe_catalog::mount::build_catalog(
             &stmt.location,
             stmt.kind,
@@ -2641,6 +2689,71 @@ fn writable_store(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rest_attach(options: &[(&str, &str)]) -> sqe_sql::AttachStatement {
+        sqe_sql::AttachStatement {
+            name: "polaris".to_string(),
+            location: "http://localhost:8181/api/catalog".to_string(),
+            kind: sqe_sql::CatalogKind::IcebergRest,
+            options: options
+                .iter()
+                .map(|(k, v)| (k.to_string(), sqe_sql::OptionValue::String(v.to_string())))
+                .collect(),
+        }
+    }
+
+    fn minio_storage() -> StorageConfig {
+        StorageConfig {
+            s3_endpoint: "http://127.0.0.1:9000".to_string(),
+            s3_region: "us-east-1".to_string(),
+            s3_access_key: "ak".to_string(),
+            s3_secret_key: sqe_core::SecretString::new("sk".to_string()),
+            s3_path_style: true,
+            ..Default::default()
+        }
+    }
+
+    fn opt<'a>(stmt: &'a sqe_sql::AttachStatement, key: &str) -> Option<&'a str> {
+        stmt.options.get(key).and_then(sqe_sql::OptionValue::as_str)
+    }
+
+    #[test]
+    fn rest_attach_without_s3_options_reads_the_engine_store() {
+        let stmt = rest_attach(&[("WAREHOUSE", "bench")]);
+        let filled = with_storage_fallback(&stmt, &minio_storage());
+        assert_eq!(opt(&filled, "S3_ENDPOINT"), Some("http://127.0.0.1:9000"));
+        assert_eq!(opt(&filled, "S3_REGION"), Some("us-east-1"));
+        assert_eq!(opt(&filled, "S3_ACCESS_KEY"), Some("ak"));
+        assert_eq!(opt(&filled, "S3_SECRET_KEY"), Some("sk"));
+        assert_eq!(opt(&filled, "S3_PATH_STYLE"), Some("true"));
+        // Unset settings stay absent rather than becoming empty props.
+        assert_eq!(opt(&filled, "S3_SESSION_TOKEN"), None);
+        assert_eq!(opt(&filled, "WAREHOUSE"), Some("bench"));
+    }
+
+    #[test]
+    fn rest_attach_with_any_s3_option_is_left_alone() {
+        let stmt = rest_attach(&[
+            ("WAREHOUSE", "bench"),
+            ("S3_ENDPOINT", "https://s3.eu-west-1.amazonaws.com"),
+        ]);
+        let filled = with_storage_fallback(&stmt, &minio_storage());
+        assert!(matches!(filled, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(opt(&filled, "S3_ACCESS_KEY"), None);
+        assert_eq!(opt(&filled, "S3_REGION"), None);
+    }
+
+    #[test]
+    fn unconfigured_store_and_other_kinds_are_left_alone() {
+        let stmt = rest_attach(&[("WAREHOUSE", "bench")]);
+        let filled = with_storage_fallback(&stmt, &StorageConfig::default());
+        assert!(matches!(filled, std::borrow::Cow::Borrowed(_)));
+
+        let mut glue = rest_attach(&[]);
+        glue.kind = sqe_sql::CatalogKind::Glue;
+        let filled = with_storage_fallback(&glue, &minio_storage());
+        assert!(matches!(filled, std::borrow::Cow::Borrowed(_)));
+    }
 
     /// A stub environment, so these tests never touch process-global
     /// `std::env` and cannot race the rest of the binary.
