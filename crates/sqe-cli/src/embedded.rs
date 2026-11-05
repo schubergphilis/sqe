@@ -693,6 +693,9 @@ pub struct EmbeddedClient {
     /// optional secret name they reference. Used by `DROP SECRET` to guard
     /// against removing secrets while catalogs depend on them.
     attached_catalogs: HashMap<String, Option<String>>,
+    /// Attached catalogs whose unquoted identifiers fold to upper case
+    /// (`ATTACH ... (IDENTIFIER_CASE 'upper')`, Snowflake Horizon).
+    upper_case_catalogs: sqe_sql::identifier_case::UpperCaseCatalogs,
     /// Manifest cache shared by every Hive root attached in this process,
     /// the single-process embedded equivalent of the coordinator's one
     /// `HiveMetadataCache` instance (`main.rs`). One instance per
@@ -740,6 +743,7 @@ impl EmbeddedClient {
             iceberg_catalogs: HashMap::new(),
             secrets: SecretStore::new(),
             attached_catalogs: HashMap::new(),
+            upper_case_catalogs: Default::default(),
             hive_manifest_cache: Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
             hive_roots: HashMap::new(),
             rest_catalogs: HashMap::new(),
@@ -778,6 +782,7 @@ impl EmbeddedClient {
             iceberg_catalogs,
             secrets: SecretStore::new(),
             attached_catalogs: HashMap::new(),
+            upper_case_catalogs: Default::default(),
             hive_manifest_cache: Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
             hive_roots: HashMap::new(),
             rest_catalogs: HashMap::new(),
@@ -881,6 +886,7 @@ impl EmbeddedClient {
             iceberg_catalogs: HashMap::new(),
             secrets: SecretStore::new(),
             attached_catalogs: HashMap::new(),
+            upper_case_catalogs: Default::default(),
             hive_manifest_cache: Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
             hive_roots: HashMap::new(),
             rest_catalogs: HashMap::new(),
@@ -973,6 +979,7 @@ impl SqlClient for EmbeddedClient {
         // before DataFusion's parser sees the SQL — these are SQE-specific
         // syntax extensions that DataFusion has no AST for.
         match sqe_sql::SqlFrontDoor::new(sqe_sql::WireDialect::Embedded)
+            .with_upper_case_catalogs(self.upper_case_catalogs.clone())
             .normalize(sql)
             .and_then(|normalized| {
                 exec_sql = normalized.sql().to_string();
@@ -1245,6 +1252,8 @@ impl EmbeddedClient {
             .into());
         }
 
+        let upper_case = sqe_sql::attach::identifier_case_is_upper(&stmt.options)
+            .map_err(|e| format!("ATTACH failed: {e}"))?;
         let filled = with_storage_fallback(stmt, &self.storage);
         let stmt: &sqe_sql::AttachStatement = &filled;
         let catalog = sqe_catalog::mount::build_catalog(
@@ -1290,6 +1299,9 @@ impl EmbeddedClient {
             .and_then(|v| v.as_secret_ref())
             .map(|s| s.to_string());
         self.attached_catalogs.insert(stmt.name.clone(), secret_ref);
+        if upper_case {
+            self.upper_case_catalogs.insert(stmt.name.clone());
+        }
 
         Ok(QueryResult::empty())
     }
@@ -1337,6 +1349,7 @@ impl EmbeddedClient {
         if self.attached_catalogs.remove(&stmt.name).is_none() {
             return Err(format!("catalog '{}' is not attached", stmt.name).into());
         }
+        self.upper_case_catalogs.remove(&stmt.name);
         // DataFusion 53.1 has no deregister_catalog. In embedded mode
         // enable_url_table() wraps the catalog list in DynamicFileCatalog
         // so the downcast to MemoryCatalogProviderList always fails.

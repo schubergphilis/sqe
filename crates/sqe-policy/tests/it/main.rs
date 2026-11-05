@@ -3,6 +3,7 @@
 
 mod default_scope_policy;
 mod guard_ab;
+mod identifier_case_policy;
 mod policy_fingerprint;
 mod ranger_grants_wiremock;
 mod ranger_store_wiremock;

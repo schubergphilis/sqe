@@ -203,7 +203,7 @@ SF10 numbers, the clean-rig methodology, and the per-shape guidance on when dist
 | Iceberg REST (Polaris, Lakeformation) | Done - default |
 | Databricks Unity Catalog (Iceberg REST, user token passthrough) | Done - read, write and DML both ways, live-verified 2026-10-27 |
 | Unity Catalog OSS (REST-compatible) | Done - read-only upstream |
-| Snowflake Horizon (Iceberg REST, user token passthrough) | Done - read, write and DML both ways, live-verified 2026-11-05 |
+| Snowflake Horizon (Iceberg REST, user token passthrough) | Done - read, write and DML both ways, live-verified 2026-11-05; `identifier_case = "upper"` folds unquoted names the Snowflake way |
 | AWS Glue | Done |
 | AWS S3 Tables | Done |
 | Nessie | Done |
