@@ -200,6 +200,15 @@ async fn run_suite_with_queries(
                 run.result.as_deref().ok(),
                 trino_run.result.as_deref().ok(),
             );
+            crate::comparison::dump::dump_if_differs(
+                benchmark,
+                scale,
+                &query.id,
+                &trino_sql,
+                &status,
+                run.result.as_deref().ok(),
+                trino_run.result.as_deref().ok(),
+            );
             let speedup = if sqe_time_ms > 0 {
                 trino_time_ms as f64 / sqe_time_ms as f64
             } else {
