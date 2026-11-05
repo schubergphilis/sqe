@@ -13,3 +13,12 @@
     10 s). ATTACH loads at most 16 tables of a namespace at a time. Horizon
     throttled the old unbounded fan-out, and every throttled table dropped out
     of the attached catalog with only a log warning.
+
+- Snowflake-written tables with a VARIANT or nested column read again
+
+    Snowflake writes parquet files with no offset index on VARIANT and nested
+    columns. SQE loaded the page index as required, so every read of such a
+    table failed with "missing offset index", even `SELECT id`. The page index
+    is now optional in the vendored Iceberg reader, the small-file scan path
+    and the worker: an incomplete index is dropped and the file reads without
+    page pruning.

@@ -1,10 +1,11 @@
-**STATUS 2026-11-05: Snowflake Horizon reads in embedded mode (`fix/snowflake-horizon-interop`).**
+**STATUS 2026-11-05: Snowflake Horizon reads: embedded mode, partial page index (`fix/snowflake-horizon-interop`).**
 
 First live run against a Snowflake account's Horizon Iceberg REST endpoint.
 The coordinator (`bearer_passthrough`, `[catalog] access_delegation =
-"vended-credentials"`) read every probe table as it was: V2 and V3, VARIANT,
-GEOMETRY, GEOGRAPHY, identity and month/bucket/truncate partitions, nested
-object/array/map and the scalar types. Embedded mode had two gaps, both fixed
+"vended-credentials"`) loaded and planned every probe table: V2 and V3,
+VARIANT, GEOMETRY, GEOGRAPHY, identity and month/bucket/truncate partitions,
+nested object/array/map and the scalar types. The tables were still empty
+then, so this proved schemas, not data. Embedded mode had two gaps, both fixed
 here:
 
 - No way to request vended credentials: new ATTACH option `ACCESS_DELEGATION`
@@ -14,6 +15,15 @@ here:
   throttled tables vanished silently. Vendored REST client replays 429s
   (`SQE PATCH (catalog-429)`, `client.rs`), and datafusion-iceberg's
   `IcebergSchemaProvider::try_new` loads 16 tables at a time.
+
+Seeding the probe tables surfaced a third: Snowflake writes no offset index
+for VARIANT and nested columns, and SQE loaded the page index as
+`PageIndexPolicy::Required` (vendored reader via `PageIndexPolicy::from(true)`,
+`iceberg_scan.rs` small-file path, worker executor), so any read of such a
+table failed with "missing offset index". All three are `Optional` now
+(`SQE PATCH (partial-page-index)`); VARIANT paths and struct/array/map values
+then read correctly. Snowflake also pins an Iceberg GEOMETRY column to SRID
+4326, and SQE reads it as `geometry(4326)` with correct WKT and area.
 
 Environment findings, not SQE bugs: an external volume encrypted with a
 customer KMS key fails, because Snowflake's down-scoped vended session lacks
