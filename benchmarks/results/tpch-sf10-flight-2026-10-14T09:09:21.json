@@ -1,0 +1,24 @@
+{
+  "benchmark": "tpch",
+  "scale_factor": 10.0,
+  "protocol": "flight",
+  "timestamp": "2026-10-14T09:09:21",
+  "summary": {
+    "total": 1,
+    "pass": 0,
+    "fail": 0,
+    "diff": 0,
+    "skip": 0,
+    "error": 1,
+    "total_duration_ms": 9
+  },
+  "queries": [
+    {
+      "id": "q09",
+      "status": "error",
+      "duration_ms": 9,
+      "rows": 0,
+      "message": "query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'iceberg.tpch_sf10.part' not found\""
+    }
+  ]
+}
