@@ -54,11 +54,17 @@ pub const RESCALE: &str = "__sqe_rescale";
 pub fn register_decimal_rounding(ctx: &SessionContext) {
     register_rescale(ctx);
     ctx.register_udaf(AggregateUDF::new_from_impl(RoundedAvg::new()));
+    ctx.register_udaf(AggregateUDF::new_from_impl(
+        super::decimal_arithmetic::TrinoSum::new(),
+    ));
 }
 
 /// Register [`RescaleUdf`] on `ctx`.
 pub fn register_rescale(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::new_from_impl(RescaleUdf::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(
+        super::decimal_arithmetic::DecimalArithUdf::new(),
+    ));
 }
 
 /// `__sqe_rescale(x, '<arrow type>', safe)`: cast `x` to the type named by
@@ -607,6 +613,7 @@ mod tests {
     use datafusion::prelude::SessionContext;
 
     use super::{DecimalRoundingRule, RESCALE};
+    use crate::file_tvf_prepare::analyzed_schema;
     use crate::session_tuning::{engine_context, engine_session_config};
 
     /// `t(g, m DECIMAL(7,2), x DECIMAL(10,3))` over four partitions, so a
@@ -697,17 +704,17 @@ mod tests {
         assert!(out.contains("| 3 | -0.006667 |"), "\n{out}");
     }
 
-    /// p1 + s2 + 5 > 38: the guard digit goes through Decimal256 and the
-    /// result keeps its Decimal128 type.
+    /// The dividend needs more than 38 digits once scaled: the quotient goes
+    /// through Decimal256 and keeps Trino's `decimal(38,8)`.
     #[tokio::test]
     async fn wide_decimal_division_rounds_through_decimal256() {
         let ctx = ctx();
         let sql = "SELECT CAST(2 AS DECIMAL(38,10)) / CAST(3 AS DECIMAL(38,2)) AS q";
-        assert_eq!(value(&ctx, sql).await, "0.66666666666667");
-        let df = ctx.sql(sql).await.unwrap();
+        assert_eq!(value(&ctx, sql).await, "0.66666667");
+        let plan = ctx.sql(sql).await.unwrap().into_optimized_plan().unwrap();
         assert_eq!(
-            df.schema().field(0).data_type(),
-            &DataType::Decimal128(38, 14)
+            plan.schema().field(0).data_type(),
+            &DataType::Decimal128(38, 8)
         );
     }
 
@@ -814,23 +821,46 @@ mod tests {
         assert!(plan.contains(RESCALE), "\n{plan}");
     }
 
-    /// Column names and types are DataFusion's, so a client sees the same
-    /// schema with or without the rewrite. The one exception, the type of
-    /// `avg(decimal)`, is asserted in `avg_of_decimals_rounds_half_away_from_zero`.
+    /// Column names are DataFusion's, so a client sees the same columns with
+    /// or without the rewrite; the types are Trino's.
     #[tokio::test]
-    async fn rewrite_keeps_column_names_and_types() {
+    async fn rewrite_keeps_column_names() {
         let ctx = ctx();
         let plain = SessionContext::new_with_config(engine_session_config());
         plain.register_table("t", table()).unwrap();
-        for sql in [
-            "SELECT m / 3.00, CAST(x AS DECIMAL(10,2)) AS c, CAST(x AS INT) AS i FROM t",
-            "SELECT g, avg(g), sum(x) / count(x) FROM t GROUP BY g",
-            "SELECT CAST(x AS DECIMAL(10,1)) AS c, count(*) FROM t GROUP BY CAST(x AS DECIMAL(10,1))",
+        let d = DataType::Decimal128;
+        for (sql, types) in [
+            (
+                "SELECT m / 3.00, CAST(x AS DECIMAL(10,2)) AS c, CAST(x AS INT) AS i FROM t",
+                vec![d(13, 6), d(10, 2), DataType::Int32],
+            ),
+            (
+                "SELECT g, avg(g), sum(x) / count(x) FROM t GROUP BY g",
+                vec![DataType::Int64, DataType::Float64, d(38, 6)],
+            ),
+            (
+                "SELECT CAST(x AS DECIMAL(10,1)) AS c, count(*) FROM t GROUP BY CAST(x AS DECIMAL(10,1))",
+                vec![d(10, 1), DataType::Int64],
+            ),
         ] {
             let ours = ctx.sql(sql).await.unwrap();
             let theirs = plain.sql(sql).await.unwrap();
-            assert_eq!(ours.schema().as_arrow(), theirs.schema().as_arrow(), "{sql}");
-            ours.collect().await.unwrap();
+            let analyzed = analyzed_schema(&ctx, ours.logical_plan()).unwrap();
+            let names = |s: &datafusion::common::DFSchema| {
+                s.fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(names(&analyzed), names(theirs.schema()), "{sql}");
+            let got: Vec<DataType> = analyzed
+                .fields()
+                .iter()
+                .map(|f| f.data_type().clone())
+                .collect();
+            assert_eq!(got, types, "{sql}");
+            let batches = ours.collect().await.unwrap();
+            assert_eq!(batches[0].schema().as_ref(), analyzed.as_arrow(), "{sql}");
         }
     }
 
