@@ -58,6 +58,8 @@
     Snowflake writes `ts, id, region` into a table declared `id, region, ts`,
     and a worker without a projection fill bound those columns by position:
     a distributed `SELECT id, region, ts` read `id` as NULL and `region` as
-    the id. The coordinator now sends the fill on every projected scan, so
-    the worker matches columns by field id. Workers older than scan task
-    version 4 refuse such tasks.
+    the id. The coordinator now sends the column list and the fill on every
+    scan that reads columns, `SELECT *` included, so the worker matches
+    columns by field id. Only `COUNT(*)` scans go without. The coordinator
+    already refuses to register a worker with an older scan-ticket version,
+    so a mixed cluster fails at startup, not at query time.

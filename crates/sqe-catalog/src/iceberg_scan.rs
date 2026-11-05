@@ -900,7 +900,8 @@ impl IcebergScanExec {
         self.projection.as_deref()
     }
     /// The projection fill a distributed worker conforms every batch to
-    /// (#831), or `None` for an unprojected or `COUNT(*)` scan.
+    /// (#831), or `None` for a `COUNT(*)` scan. An unprojected scan gets a
+    /// fill over every declared column ([`Self::output_columns`]).
     ///
     /// Sent even when no projected column ever changed. A parquet projection
     /// emits columns in the file's order, and that order is the writer's
@@ -909,15 +910,32 @@ impl IcebergScanExec {
     /// its first file's layout, so a task mixing writers bound the second
     /// file's columns by position.
     pub fn projection_fill(&self) -> DFResult<Option<Vec<u8>>> {
-        let Some(cols) = self.projection.as_deref() else {
-            return Ok(None);
-        };
+        let cols = self.output_columns();
         if cols.is_empty() {
             return Ok(None);
         }
         let defaults =
-            initial_default_scalars(&self.table, self.snapshot_id, cols, &self.projected_schema)?;
+            initial_default_scalars(&self.table, self.snapshot_id, &cols, &self.projected_schema)?;
         encode_projection_fill(&self.projected_schema, &defaults).map(Some)
+    }
+    /// The columns this scan emits, in output order: the projection, or every
+    /// column of the declared schema when the scan is unprojected. Empty only
+    /// for a `COUNT(*)` scan (`Some([])`).
+    ///
+    /// An unprojected scan needs the full list as much as a projected one: a
+    /// worker reading it without names or a fill emits each file's own column
+    /// order, so a file Snowflake rewrote (`ts, id, region`, plus its
+    /// row-lineage columns) bound by position against `id, region, ts`.
+    pub fn output_columns(&self) -> Vec<String> {
+        match self.projection.as_deref() {
+            Some(cols) => cols.to_vec(),
+            None => self
+                .projected_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect(),
+        }
     }
     /// The shredded variant prunes (sqe#870) as scan-ticket bytes, with each
     /// field id resolved against the scanned snapshot, or `None` when the
@@ -4351,8 +4369,32 @@ mod projection_evolution_tests {
             .collect();
         assert_eq!(fields, ["region", "id"]);
 
-        let count_star = IcebergScanExec::new(unevolved_table(), schema, Some(vec![]), None);
+        let count_star =
+            IcebergScanExec::new(unevolved_table(), Arc::clone(&schema), Some(vec![]), None);
+        assert!(count_star.output_columns().is_empty());
         assert!(count_star.projection_fill().unwrap().is_none());
+    }
+
+    /// An unprojected scan (`projection == None`) reads every declared
+    /// column, and its worker binds them by position just the same: it gets
+    /// the full column list and a fill in the declared order.
+    #[tokio::test]
+    async fn an_unprojected_scan_gets_the_declared_columns_and_a_fill() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, true),
+        ]));
+        let scan = IcebergScanExec::new(unevolved_table(), schema, None, None);
+        assert_eq!(scan.output_columns(), ["id", "region"]);
+        let fill = scan.projection_fill().unwrap().expect("a fill");
+        let decoded = decode_projection_fill(&fill).unwrap();
+        let fields: Vec<String> = decoded
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(fields, ["id", "region"]);
     }
 
     /// THE ONE THAT MATTERS. Every projected column is absent from the file.

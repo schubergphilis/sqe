@@ -59,31 +59,39 @@ Fixes it took, all in this MR:
   and maintenance path.
 - Distributed: a worker without a projection fill labelled batches with the
   first file's column order. A Snowflake-written file (`ts, id,
-  METADATA$RL_ROW_ID, region, ...`) bound by position. The fill is now sent
-  on every projected scan (`IcebergScanExec::projection_fill`), closing the
-  worker-path gap left by !784.
+  METADATA$RL_ROW_ID, region, ...`) bound by position. The column list and
+  the fill are now sent on every scan that reads columns, unprojected
+  `SELECT *` included (`IcebergScanExec::output_columns` /
+  `projection_fill`), closing the worker-path gap left by !784. Only
+  `COUNT(*)` goes without.
 
 Snowflake quirks, not SQE bugs: `ST_AREA` on an Iceberg GEOMETRY is negative
 whichever engine wrote it; Snowflake parquet carries row-lineage columns
 (`METADATA$RL_*`, field ids 2147483539/40) in a non-schema order.
 
-Snowflake's DELETE / UPDATE / MERGE are copy-on-write on V2 and V3 (no delete
-files in any snapshot). A merge-on-read SQE table (`write.delete.mode`) covers
-the other direction: SQE's DELETE writes a deletion vector, Snowflake reads
-the table correctly, and a later Snowflake DELETE folds the vector into a
-rewritten file that SQE reads back. The harness keeps one such table
+Snowflake's DELETE / UPDATE / MERGE were copy-on-write on the harness's small
+tables (no delete files in any snapshot). That is a size effect, not a rule:
+with `ICEBERG_MERGE_ON_READ_BEHAVIOR = 'enabled'` a 4M-row table gets V2
+position deletes and V3 deletion vectors. Reading those failed in SQE with
+"cannot skip miniblock of size 512", a parquet decoder limit fixed by
+parquet 59.3.2 (!1662). A merge-on-read SQE table (`write.delete.mode`)
+covers the other direction: SQE's DELETE writes a deletion vector, Snowflake
+reads the table correctly, and a later Snowflake DELETE folds the vector into
+a rewritten file that SQE reads back. The harness keeps one such table
 (`sqe_v3_mor`), so the compare is 33/33 in all three modes.
 
 Regression check on the same build: the Databricks UC harness
 (`scripts/interop/databricks-uc/`, catalog `pg3-bronze`) ran phases A-D with
 0 errors and 27/27 in embedded, coordinator-local and distributed mode.
 Its V3 tables carry Databricks deletion vectors, so the always-sent fill
-works alongside worker-applied deletes. The fill has one cost: a worker older
-than scan ticket V4 now refuses every projected scan, so upgrade workers
-before or together with the coordinator.
+works alongside worker-applied deletes. The always-sent fill is no rollout
+risk: the coordinator refuses to register a worker with an older scan-ticket
+version (`WorkerHello::check_compat`), so a mixed cluster fails at startup,
+not at query time.
 
 Still open: `$files` has no `content` column, so delete files and deletion
-vectors are not listed; the case-folding gap above.
+vectors are not listed; the case-folding gap above (drafted as a follow-up
+issue to #337: a per-catalog fold has to resolve before policy rewriting).
 
 **NEXT:** merge this MR, then the harness MR (matrix cells
 `sqe:snowflake-horizon-catalog:v2/v3` to measured) and the blog post.
