@@ -149,7 +149,9 @@ async fn table_health_reports_small_and_delete_files_without_write_privilege() {
     let after_files = exec(
         &handler,
         &session,
-        &format!("SELECT COUNT(*) FROM table_files('{namespace}', '{table_name}')"),
+        &format!(
+            "SELECT COUNT(*) FROM table_files('{namespace}', '{table_name}') WHERE content = 0"
+        ),
     )
     .await;
     let after_count = after_files[0]

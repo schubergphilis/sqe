@@ -125,7 +125,7 @@ async fn trino_stats_report_the_bytes_a_select_read() {
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
     let files_sql =
-        "SELECT CAST(SUM(file_size_in_bytes) AS BIGINT) FROM table_files('default', 'trino_stats_bytes')";
+        "SELECT CAST(SUM(file_size_in_bytes) AS BIGINT) FROM table_files('default', 'trino_stats_bytes') WHERE content = 0";
     let batches = handler
         .execute(&session, files_sql, None)
         .await
@@ -220,7 +220,7 @@ async fn trino_stats_report_bytes_for_a_distributed_scan() {
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
     let files_sql = "SELECT CAST(SUM(file_size_in_bytes) AS BIGINT) \
-                     FROM table_files('default', 'trino_stats_bytes_dist')";
+                     FROM table_files('default', 'trino_stats_bytes_dist') WHERE content = 0";
     let batches = setup
         .execute(&setup_session, files_sql, None)
         .await

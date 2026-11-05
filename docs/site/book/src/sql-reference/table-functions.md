@@ -53,7 +53,7 @@ Six TVFs that expose Iceberg internal state without leaving SQL. Useful for obse
 |---|---|---|---|---|---|
 | `table_snapshots(ns, table)` | `sqe-catalog` | One row per snapshot, in Trino's `$snapshots` column shape. Columns: `committed_at`, `snapshot_id`, `parent_id`, `operation`, `manifest_list`, `summary`. `iceberg_metadata_tvf.rs:93` | `t$snapshots` | - | `t.snapshots` |
 | `table_history(ns, table)` | `sqe-catalog` | Linear snapshot history. Columns: `made_current_at`, `snapshot_id`, `parent_id`, `is_current_ancestor`. `iceberg_metadata_tvf.rs:356` | `t$history` | - | `t.history` |
-| `table_files(ns, table)` | `sqe-catalog` | One row per data file in the current snapshot. Columns: `file_path`, `file_format`, `record_count`, `file_size_in_bytes`, `column_sizes`, `value_counts`, `null_value_counts`, `partition`, `lower_bounds`, `upper_bounds`. `partition` is a JSON array of the partition values (Iceberg's single-value JSON form: dates as `"2026-10-26"`, binary as lowercase hex). `lower_bounds` / `upper_bounds` are JSON maps of `{field_id: value}`: numbers and booleans bare, every other type a JSON string (dates, timestamps and UUIDs as text, binary as uppercase hex). They let you verify a compaction produced a prunable layout (after a sort compaction the output files carry disjoint ranges on the sort column). `iceberg_metadata_tvf.rs` | `t$files` | - | `t.files` |
+| `table_files(ns, table)` | `sqe-catalog` | One row per live file in the current snapshot, data and delete files alike, as Spark's `files` and Trino's `$files`. Columns: `file_path`, `file_format`, `record_count`, `file_size_in_bytes`, `column_sizes`, `value_counts`, `null_value_counts`, `partition`, `lower_bounds`, `upper_bounds`, `content`, `referenced_data_file`, `content_offset`, `content_size_in_bytes`, `equality_ids`, `spec_id`. `content` is the Iceberg content type: 0 data, 1 position deletes, 2 equality deletes. A V3 deletion vector is `content = 1` with `file_format` Puffin, the data file it applies to in `referenced_data_file`, and its blob's place in `content_offset` / `content_size_in_bytes`. `equality_ids` is a JSON array of the field ids an equality delete matches on. Spark and Trino put `content` first; SQE appends the newer columns so positional readers keep working. `WHERE content = 0` gives the data files alone. `partition` is a JSON array of the partition values (Iceberg's single-value JSON form: dates as `"2026-10-26"`, binary as lowercase hex). `lower_bounds` / `upper_bounds` are JSON maps of `{field_id: value}`: numbers and booleans bare, every other type a JSON string (dates, timestamps and UUIDs as text, binary as uppercase hex). They let you verify a compaction produced a prunable layout (after a sort compaction the output files carry disjoint ranges on the sort column). `iceberg_metadata_tvf.rs` | `t$files` | - | `t.files` |
 | `table_manifests(ns, table)` | `sqe-catalog` | One row per manifest in the current snapshot. `iceberg_metadata_tvf.rs:217` | `t$manifests` | - | `t.manifests` |
 | `table_partitions(ns, table)` | `sqe-catalog` | Per-partition aggregate. `iceberg_metadata_tvf.rs:622` | `t$partitions` | - | `t.partitions` |
 | `table_refs(ns, table)` | `sqe-catalog` | One row per branch / tag. Columns: `name`, `type`, `snapshot_id`, `max_ref_age_ms`. `iceberg_metadata_tvf.rs:768` | `t$refs` | - | `t.refs` |
@@ -70,10 +70,12 @@ SELECT * FROM table_snapshots('analytics', 'events');
 
 ### Examples
 
-What's the current snapshot's row count?
+How many rows do the current snapshot's data files hold, and how many of them are deleted?
 
 ```sql
-SELECT SUM(record_count) AS rows
+SELECT
+  SUM(record_count) FILTER (WHERE content = 0) AS rows_written,
+  SUM(record_count) FILTER (WHERE content = 1) AS rows_position_deleted
 FROM table_files('analytics', 'events');
 ```
 

@@ -197,7 +197,9 @@ async fn live_data_file_count(
     let b = exec(
         handler,
         session,
-        &format!("SELECT COUNT(*) FROM table_files('{namespace}', '{table_name}')"),
+        &format!(
+            "SELECT COUNT(*) FROM table_files('{namespace}', '{table_name}') WHERE content = 0"
+        ),
     )
     .await;
     b[0].column(0)
@@ -220,7 +222,7 @@ async fn max_file_size_bytes(
     let b = exec(
         handler,
         session,
-        &format!("SELECT MAX(file_size_in_bytes) FROM table_files('{namespace}', '{table_name}')"),
+        &format!("SELECT MAX(file_size_in_bytes) FROM table_files('{namespace}', '{table_name}') WHERE content = 0"),
     )
     .await;
     b[0].column(0)
@@ -549,7 +551,7 @@ async fn partition_record_counts(
     let b = exec(
         handler,
         session,
-        &format!("SELECT partition, record_count FROM table_files('{namespace}', '{table_name}')"),
+        &format!("SELECT partition, record_count FROM table_files('{namespace}', '{table_name}') WHERE content = 0"),
     )
     .await;
     let mut out = Vec::new();

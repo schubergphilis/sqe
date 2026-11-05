@@ -168,7 +168,7 @@ async fn v3_table_round_trips_through_glue() {
         let files = rows(
             &handler,
             &session,
-            &format!("SELECT file_path FROM table_files('{ns}', 'events')"),
+            &format!("SELECT file_path FROM table_files('{ns}', 'events') WHERE content = 0"),
         )
         .await;
         (read, table.metadata().format_version(), files)

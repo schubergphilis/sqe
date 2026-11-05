@@ -140,7 +140,7 @@ None of these change a value.
 
 - `ST_AREA` on an Iceberg `GEOMETRY` comes back negative in Snowflake, whichever engine wrote the table: -12 for the rectangle whose literal gives 12. The harness compares the absolute value.
 - An external volume encrypted with a customer KMS key does not work. The credentials Horizon vends cannot decrypt, so even loading a table fails with 403. Snowflake-managed storage works.
-- `$files` lists data files only. Delete files and deletion vectors show in the `$snapshots` summary instead. Spark and Trino list them in `files` with a `content` column, and SQE should too.
+- `$files` listed data files only, so Snowflake's delete files showed only in the `$snapshots` summary. Spark's `files` and Trino's `$files` list every live file with a `content` column, and SQE's does now too: 0 for data, 1 for position deletes and deletion vectors, 2 for equality deletes.
 
 ## Why run it by hand
 

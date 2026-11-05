@@ -498,7 +498,8 @@ async fn rewrite_data_files_preserves_variant_values() {
             r#"5|{"k":5,"nested":{"deep":true}}|5"#,
         ]
     );
-    let files = "SELECT COUNT(*) FROM table_files('default', 'variant_compaction')";
+    let files =
+        "SELECT COUNT(*) FROM table_files('default', 'variant_compaction') WHERE content = 0";
     assert_eq!(rows(&handler, &session, files).await, vec!["6"]);
 
     handler
@@ -529,7 +530,7 @@ async fn row_groups(
     table: &str,
 ) -> (usize, i64) {
     let sql =
-        format!("SELECT file_path, file_size_in_bytes FROM table_files('default', '{table}')");
+        format!("SELECT file_path, file_size_in_bytes FROM table_files('default', '{table}') WHERE content = 0");
     let mut groups = 0;
     let mut largest = 0;
     for row in rows(handler, session, &sql).await {

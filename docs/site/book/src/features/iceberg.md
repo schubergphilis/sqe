@@ -141,7 +141,6 @@ Known gaps from the same run:
 - A row filter on a Snowflake column quotes it (`"REGION" = 'EU'`). Policy expressions are not folded, and an unquoted name fails the query.
 - The interop harness runs without `identifier_case` and quotes every Snowflake name, so the option is checked by a separate probe, not by the 40-read compare.
 - Snowflake rewrites small tables copy-on-write whatever the table's merge-on-read setting. Its delete files appear only on large tables with `ICEBERG_MERGE_ON_READ_BEHAVIOR = 'enabled'`; the harness uses 1M rows.
-- `$files` lists data files only. Delete files and deletion vectors show in the `$snapshots` summary. Spark's `files` and Trino's `$files` list delete files too, with a `content` column (0 data, 1 position deletes, 2 equality deletes).
 - `ST_AREA` on an Iceberg `GEOMETRY` comes back negative in Snowflake, whichever engine wrote the table.
 - An external volume encrypted with a customer KMS key fails: the credentials Horizon vends lack `kms:Decrypt`. Use Snowflake-managed storage.
 - A Horizon access token lives about an hour.

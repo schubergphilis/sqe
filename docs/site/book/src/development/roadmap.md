@@ -305,7 +305,7 @@ Iceberg V3 table format support landed end-to-end. V3 is the default format-vers
 - Runtime `ATTACH` / `CREATE SECRET` against any of the supported catalog backends
 - `UPDATE`, `DELETE` and `MERGE INTO` on the warehouse and on attached Iceberg catalogs, through the coordinator's write handlers (copy-on-write or merge-on-read per table)
 - `CREATE TABLE` on the warehouse and on attached Iceberg catalogs, through the coordinator's DDL handler: `PARTITIONED BY` transforms, `TBLPROPERTIES` / `WITH` options, nested columns, format version 3 by default
-- Iceberg metadata tables (`"t$snapshots"`, `$history`, `$manifests`, `$files`, `$partitions`, `$refs`) on the warehouse and on attached Iceberg catalogs, read from the catalog the table name is qualified with
+- Iceberg metadata tables (`"t$snapshots"`, `$history`, `$manifests`, `$files`, `$partitions`, `$refs`) on the warehouse and on attached Iceberg catalogs, read from the catalog the table name is qualified with; `$files` lists delete files and deletion vectors with Iceberg's `content` column, as Spark and Trino do
 - `ALTER TABLE` on the warehouse and on attached Iceberg catalogs, through the coordinator's DDL handler: column add, drop, rename and type change (nested fields included), `SET TBLPROPERTIES`, partition evolution, identifier fields, branches and tags, `RENAME TO`
 - `SHOW CREATE TABLE` on Iceberg tables, rendered by the same code as on a coordinator: columns, `PARTITIONED BY`, sort order and `TBLPROPERTIES`, and the printed DDL creates the table again
 - Time travel (`FOR VERSION AS OF <snapshot id | 'branch' | 'tag'>`, `FOR TIMESTAMP AS OF`, `FOR SYSTEM_TIME AS OF`) on the warehouse and on attached Iceberg catalogs, resolved by the same code as the coordinator
