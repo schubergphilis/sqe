@@ -2496,6 +2496,10 @@ impl WriteHandler {
             .load_table(&table_ident)
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
+        // A caller who may not write is refused here, before any file (#880).
+        session_catalog
+            .check_write_access(&table_ident, &table)
+            .await?;
         if overwrite {
             self.refuse_replace_under_policy(
                 session,
@@ -2981,6 +2985,10 @@ impl WriteHandler {
             .load_table(&table_ident)
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
+        // A caller who may not write is refused here, before any file (#880).
+        session_catalog
+            .check_write_access(&table_ident, &table)
+            .await?;
 
         // The streaming sink re-stamps every batch onto the table schema, so the
         // adapter's declared schema is only the stream contract, not the write
@@ -3111,6 +3119,8 @@ impl WriteHandler {
         };
 
         let table = catalog.load_table(&table_ident).await?;
+        // A caller who may not write is refused here, before any file (#880).
+        catalog.check_write_access(&table_ident, &table).await?;
 
         let where_clause = &delete.selection;
         // Snapshot-independent setup (schema + policy predicates) runs once;
@@ -3327,6 +3337,8 @@ impl WriteHandler {
         };
 
         let table = catalog.load_table(&table_ident).await?;
+        // A caller who may not write is refused here, before any file (#880).
+        catalog.check_write_access(&table_ident, &table).await?;
 
         let old_data_files = self.collect_data_files(&table).await?;
 
@@ -3700,6 +3712,8 @@ impl WriteHandler {
             }
         };
         let table = catalog.load_table(&table_ident).await?;
+        // A caller who may not write is refused here, before any file (#880).
+        catalog.check_write_access(&table_ident, &table).await?;
 
         // Equality deletes require declared identifier-field-ids (primary key).
         let identifier_field_ids: Vec<i32> = table
@@ -3956,8 +3970,6 @@ impl WriteHandler {
                 .handle_delete(session, stmt, catalog, ctx, policy_summary_out)
                 .await;
         };
-        // A reader is refused here, before any data or delete file (#880).
-        catalog.check_write_access(&table_ident, &table).await?;
 
         // Capture lineage: a DELETE rewrites the target in place, so the
         // OL plan is `target -> target` with identity column lineage. We
@@ -4027,6 +4039,8 @@ impl WriteHandler {
         };
 
         let table = catalog.load_table(&table_ident).await?;
+        // A caller who may not write is refused here, before any file (#880).
+        catalog.check_write_access(&table_ident, &table).await?;
 
         // Snapshot-independent setup runs once. Schema, policy predicates, and
         // lifted IN-subqueries do not depend on the data snapshot, so they are
@@ -4279,8 +4293,6 @@ impl WriteHandler {
                 .handle_update(session, stmt, catalog, ctx, policy_summary_out)
                 .await;
         };
-        // A reader is refused here, before any data or delete file (#880).
-        catalog.check_write_access(&table_ident, &table).await?;
 
         // Capture lineage: UPDATE rewrites target rows in place. v1 emits
         // identity column lineage; richer per-column SET-expression tracing
@@ -4355,6 +4367,8 @@ impl WriteHandler {
             }
         };
         let table = catalog.load_table(&table_ident).await?;
+        // A caller who may not write is refused here, before any file (#880).
+        catalog.check_write_access(&table_ident, &table).await?;
 
         // MoR UPDATE requires declared identifier-field-ids (primary key)
         // so we can emit an equality delete for the old row. Without a PK
@@ -4678,6 +4692,8 @@ impl WriteHandler {
         // commit conflict the whole merge re-runs against the reloaded
         // snapshot, because rewritten files are snapshot-specific (506).
         let table = catalog.load_table(&table_ident).await?;
+        // A caller who may not write is refused here, before any file (#880).
+        catalog.check_write_access(&table_ident, &table).await?;
 
         // Column names for the merge SQL come from the table's current schema.
         // The per-attempt target relation derives its own Arrow schema from the
@@ -5388,8 +5404,6 @@ impl WriteHandler {
                 )
                 .await;
         };
-        // A reader is refused here, before any data or delete file (#880).
-        catalog.check_write_access(&table_ident, &table).await?;
 
         // Capture lineage. The MERGE source SELECT was already planned and
         // executed by the caller. We re-wrap that source plan as a synthetic
@@ -5549,6 +5563,8 @@ impl WriteHandler {
         let on_sql = format!("{on_expr}");
 
         let table = catalog.load_table(&table_ident).await?;
+        // A caller who may not write is refused here, before any file (#880).
+        catalog.check_write_access(&table_ident, &table).await?;
         let identifier_field_ids: Vec<i32> = table
             .metadata()
             .current_schema()
