@@ -1,6 +1,7 @@
-//! Decimal results round half away from zero, as in Trino and PostgreSQL,
-//! where DataFusion truncates: `2.00 / 3.00` is 0.666667 (not 0.666666),
-//! `avg` of 0.01, 0.01, 0.00 is 0.006667, `CAST(7.5 AS INT)` is 8.
+//! Decimal results round half away from zero, as in Trino, where DataFusion
+//! truncates: `2.00 / 3.00` is 0.666667 (not 0.666666), `CAST(7.5 AS INT)`
+//! is 8. `avg(decimal(p,s))` has Trino's type `decimal(p,s)`, not
+//! DataFusion's `decimal(p+4,s+4)`: `avg` of 0.01, 0.01, 0.00 is 0.01.
 //!
 //! Three pieces, all registered by `engine_context`:
 //!
@@ -14,8 +15,9 @@
 //!   division gets one guard digit on its dividend and is rounded back to
 //!   its planned type; a cast to a smaller decimal scale, or from a decimal
 //!   to an integer, rounds through [`RescaleUdf`].
-//! - [`RoundedAvg`]: DataFusion's `avg`, whose final division rounds. Count,
-//!   sum and state are DataFusion's own; only the last step differs.
+//! - [`RoundedAvg`]: DataFusion's `avg` with Trino's decimal result type,
+//!   whose final division rounds. Count, sum and state are DataFusion's own;
+//!   only the result type and the last step differ.
 
 use std::sync::Arc;
 
@@ -304,10 +306,11 @@ fn decimal_scale(t: &DataType) -> Option<i8> {
     decimal_parts(t).map(|(_, s)| s)
 }
 
-/// DataFusion's `avg` (and `mean`), rounding its decimal result half away
-/// from zero. The wrapped accumulators keep DataFusion's state, so partial
-/// and final aggregates, windows and spilled states are unchanged; only the
-/// final `sum / count` is computed here.
+/// DataFusion's `avg` (and `mean`), returning the input decimal type as
+/// Trino does and rounding half away from zero. The wrapped accumulators
+/// keep DataFusion's state, so partial and final aggregates, windows and
+/// spilled states are unchanged; only the final `sum / count` is computed
+/// here.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct RoundedAvg {
     inner: Avg,
@@ -338,8 +341,14 @@ impl AggregateUDFImpl for RoundedAvg {
         self.inner.signature()
     }
 
+    /// Trino's type: `avg(decimal(p,s))` is `decimal(p,s)`, where DataFusion
+    /// widens to `decimal(p+4,s+4)`. The mean of values that fit `(p,s)`
+    /// fits too.
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        self.inner.return_type(arg_types)
+        match arg_types {
+            [t @ (DataType::Decimal128(..) | DataType::Decimal256(..))] => Ok(t.clone()),
+            _ => self.inner.return_type(arg_types),
+        }
     }
 
     fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
@@ -608,8 +617,9 @@ mod tests {
             Field::new("m", DataType::Decimal128(7, 2), true),
             Field::new("x", DataType::Decimal128(10, 3), true),
         ]));
-        // g=1: 0.01 0.01 0.00 -> 0.006667; g=2: 0.02 0.01 -0.01 -> 0.006667;
-        // g=3: -0.01 -0.01 0.00 -> -0.006667.
+        // avg, sum/3: g=1: 0.01 0.01 0.00 -> 0.01, 0.006667;
+        // g=2: 0.02 0.01 -0.01 -> 0.01, 0.006667;
+        // g=3: -0.01 -0.01 0.00 -> -0.01, -0.006667.
         let rows: [(i64, i128, i128); 9] = [
             (1, 1, 1234),
             (1, 1, 1226),
@@ -703,49 +713,57 @@ mod tests {
 
     #[tokio::test]
     async fn avg_of_decimals_rounds_half_away_from_zero() {
+        // Trino's type: avg(decimal(7,2)) is decimal(7,2), so 0.00666...
+        // rounds to 0.01 (truncation gave 0.00).
         let ctx = ctx();
         let grouped = rows(&ctx, "SELECT g, avg(m) AS a FROM t GROUP BY g ORDER BY g").await;
-        for line in [
-            "| 1 | 0.006667  |",
-            "| 2 | 0.006667  |",
-            "| 3 | -0.006667 |",
-        ] {
+        for line in ["| 1 | 0.01  |", "| 2 | 0.01  |", "| 3 | -0.01 |"] {
             assert!(grouped.contains(line), "{line}\n{grouped}");
         }
         assert_eq!(
             value(&ctx, "SELECT avg(m) FROM t WHERE g = 1").await,
-            "0.006667"
+            "0.01"
         );
         assert_eq!(
             value(&ctx, "SELECT mean(m) FROM t WHERE g = 3").await,
-            "-0.006667"
+            "-0.01"
         );
         assert_eq!(
             value(&ctx, "SELECT avg(DISTINCT m) FROM t WHERE g = 2").await,
-            "0.006667"
+            "0.01"
         );
         let window = rows(
             &ctx,
             "SELECT DISTINCT g, avg(m) OVER (PARTITION BY g) AS a FROM t ORDER BY g",
         )
         .await;
-        assert!(window.contains("| 1 | 0.006667  |"), "\n{window}");
-        assert!(window.contains("| 3 | -0.006667 |"), "\n{window}");
-        // Sliding frame: retract keeps the same state.
+        assert!(window.contains("| 1 | 0.01  |"), "\n{window}");
+        assert!(window.contains("| 3 | -0.01 |"), "\n{window}");
+        // Sliding frame: retract keeps the same state. At 1.226 the frame
+        // holds 0.00 and 0.01, an exact half: 0.005 rounds away to 0.01.
         let sliding = rows(
             &ctx,
             "SELECT x, avg(m) OVER (ORDER BY x ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS a \
              FROM t WHERE g = 1 ORDER BY x",
         )
         .await;
-        assert!(sliding.contains("| 1.234 | 0.006667 |"), "\n{sliding}");
-        // The result type is DataFusion's; only the last digit changes.
+        assert!(sliding.contains("| 1.225 | 0.00 |"), "\n{sliding}");
+        assert!(sliding.contains("| 1.226 | 0.01 |"), "\n{sliding}");
+        assert!(sliding.contains("| 1.234 | 0.01 |"), "\n{sliding}");
+        // -0.005 rounds away from zero too.
+        assert_eq!(
+            value(&ctx, "SELECT avg(m) FROM t WHERE g = 3 AND x > 0").await,
+            "-0.01"
+        );
         let df = ctx.sql("SELECT avg(m) FROM t").await.unwrap();
         assert_eq!(
             df.schema().field(0).data_type(),
-            &DataType::Decimal128(11, 6)
+            &DataType::Decimal128(7, 2)
         );
         assert_eq!(df.schema().field(0).name(), "avg(t.m)");
+        // Integers still average to a double, as in Trino.
+        let df = ctx.sql("SELECT avg(g) FROM t").await.unwrap();
+        assert_eq!(df.schema().field(0).data_type(), &DataType::Float64);
     }
 
     #[tokio::test]
@@ -797,7 +815,8 @@ mod tests {
     }
 
     /// Column names and types are DataFusion's, so a client sees the same
-    /// schema with or without the rewrite.
+    /// schema with or without the rewrite. The one exception, the type of
+    /// `avg(decimal)`, is asserted in `avg_of_decimals_rounds_half_away_from_zero`.
     #[tokio::test]
     async fn rewrite_keeps_column_names_and_types() {
         let ctx = ctx();
@@ -805,7 +824,7 @@ mod tests {
         plain.register_table("t", table()).unwrap();
         for sql in [
             "SELECT m / 3.00, CAST(x AS DECIMAL(10,2)) AS c, CAST(x AS INT) AS i FROM t",
-            "SELECT g, avg(m), sum(x) / count(x) FROM t GROUP BY g",
+            "SELECT g, avg(g), sum(x) / count(x) FROM t GROUP BY g",
             "SELECT CAST(x AS DECIMAL(10,1)) AS c, count(*) FROM t GROUP BY CAST(x AS DECIMAL(10,1))",
         ] {
             let ours = ctx.sql(sql).await.unwrap();
