@@ -164,13 +164,13 @@ impl AsyncFileReader for ArrowFileReader {
             let reader = ParquetMetaDataReader::new()
                 .with_prefetch_hint(self.parquet_read_options.metadata_size_hint())
                 // Set the page policy first because it updates both column and offset policies.
-                .with_page_index_policy(PageIndexPolicy::from(
+                .with_page_index_policy(preload_policy(
                     self.parquet_read_options.preload_page_index(),
                 ))
-                .with_column_index_policy(PageIndexPolicy::from(
+                .with_column_index_policy(preload_policy(
                     self.parquet_read_options.preload_column_index(),
                 ))
-                .with_offset_index_policy(PageIndexPolicy::from(
+                .with_offset_index_policy(preload_policy(
                     self.parquet_read_options.preload_offset_index(),
                 ))
                 .with_metadata_options(metadata_options)
@@ -438,5 +438,30 @@ mod tests {
         assert_eq!(result[0], expected_0);
         assert_eq!(result[1], expected_1);
         assert_eq!(result[2], expected_2);
+    }
+}
+
+/// SQE PATCH (partial-page-index): a page index is loaded when present and
+/// dropped when incomplete. `PageIndexPolicy::from(true)` is `Required`, which
+/// fails the whole file when any column chunk lacks an offset index. Snowflake
+/// writes such files (no offset index on VARIANT and nested columns), so every
+/// read of a Snowflake table with one of those columns failed with "missing
+/// offset index". Without the index the reader only loses page pruning.
+pub(crate) fn preload_policy(preload: bool) -> PageIndexPolicy {
+    if preload {
+        PageIndexPolicy::Optional
+    } else {
+        PageIndexPolicy::Skip
+    }
+}
+
+#[cfg(test)]
+mod preload_policy_tests {
+    use super::*;
+
+    #[test]
+    fn an_incomplete_page_index_is_optional_not_required() {
+        assert_eq!(preload_policy(true), PageIndexPolicy::Optional);
+        assert_eq!(preload_policy(false), PageIndexPolicy::Skip);
     }
 }

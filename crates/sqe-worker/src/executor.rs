@@ -1582,13 +1582,17 @@ async fn open_parquet_stream(
             })
             .await
             .map_err(|e| anyhow::anyhow!("Footer cache error: {e}"))?;
+        // Optional, not Required: Snowflake writes files with no offset index
+        // on VARIANT and nested columns, and Required fails the whole file.
         let reader_opts = ArrowReaderOptions::new()
-            .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required);
+            .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Optional);
         let arrow_meta = ArrowReaderMetadata::try_new(cached_meta, reader_opts)?;
         ParquetRecordBatchStreamBuilder::new_with_metadata(reader, arrow_meta)
     } else {
+        // Optional, not Required: Snowflake writes files with no offset index
+        // on VARIANT and nested columns, and Required fails the whole file.
         let reader_opts = ArrowReaderOptions::new()
-            .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required);
+            .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Optional);
         ParquetRecordBatchStreamBuilder::new_with_options(reader, reader_opts).await?
     };
 
