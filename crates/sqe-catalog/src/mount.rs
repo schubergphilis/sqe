@@ -829,7 +829,44 @@ pub fn rest_attach_props(
     for (k, v) in s3_props_from_options(options) {
         props.insert(k, v);
     }
+
+    // Ask the catalog to vend table-scoped storage credentials. Snowflake
+    // Horizon (and Polaris) vend only when the request carries
+    // `X-Iceberg-Access-Delegation`; without it the table loads but every
+    // data read fails with "failed to load signing credential". Opt-in, as
+    // in Trino and Spark: a Polaris without STS answers the header with an
+    // error. Vended keys replace any static S3 keys per table
+    // (`SQE PATCH (vended-credentials)` in the vendored REST client).
+    if access_delegation_from_options(options)? {
+        props.insert(
+            crate::rest_catalog::ACCESS_DELEGATION_HEADER_PROP.to_string(),
+            "vended-credentials".to_string(),
+        );
+    }
     Ok(props)
+}
+
+/// The ATTACH `ACCESS_DELEGATION` option (DuckDB's `ACCESS_DELEGATION_MODE`
+/// spelling is accepted too): `true` for vended credentials, `false` for
+/// `none` or when absent. Remote signing is not supported.
+#[cfg(feature = "rest")]
+fn access_delegation_from_options(options: &BTreeMap<String, OptionValue>) -> Result<bool, String> {
+    let Some((key, value)) = ["ACCESS_DELEGATION", "ACCESS_DELEGATION_MODE"]
+        .into_iter()
+        .find_map(|k| options.get(k).map(|v| (k, v)))
+    else {
+        return Ok(false);
+    };
+    let value = value
+        .as_str()
+        .ok_or_else(|| format!("option `{key}` takes a string"))?;
+    match value.to_ascii_lowercase().replace('_', "-").as_str() {
+        "vended-credentials" => Ok(true),
+        "none" => Ok(false),
+        other => Err(format!(
+            "option `{key}` must be 'vended-credentials' or 'none', got '{other}'"
+        )),
+    }
 }
 
 #[cfg(not(feature = "rest"))]
@@ -1483,6 +1520,53 @@ mod s3_option_tests {
     fn absent_s3_options_yield_no_props() {
         let o: BTreeMap<String, OptionValue> = BTreeMap::new();
         assert!(s3_props_from_options(&o).is_empty());
+    }
+
+    fn rest_props(
+        extra: &[(&str, &str)],
+    ) -> Result<std::collections::HashMap<String, String>, String> {
+        let mut o = BTreeMap::new();
+        o.insert("WAREHOUSE".to_string(), opt("wh"));
+        for (k, v) in extra {
+            o.insert((*k).to_string(), opt(v));
+        }
+        rest_attach_props(
+            "https://catalog.example/api/catalog",
+            &o,
+            &SecretStore::default(),
+        )
+    }
+
+    const HEADER: &str = crate::rest_catalog::ACCESS_DELEGATION_HEADER_PROP;
+
+    #[test]
+    fn access_delegation_is_opt_in() {
+        assert!(!rest_props(&[]).unwrap().contains_key(HEADER));
+        assert!(!rest_props(&[("ACCESS_DELEGATION", "none")])
+            .unwrap()
+            .contains_key(HEADER));
+    }
+
+    #[test]
+    fn access_delegation_sends_the_vended_credentials_header() {
+        for (key, value) in [
+            ("ACCESS_DELEGATION", "vended-credentials"),
+            ("ACCESS_DELEGATION", "VENDED_CREDENTIALS"),
+            ("ACCESS_DELEGATION_MODE", "vended_credentials"),
+        ] {
+            let props = rest_props(&[(key, value)]).unwrap();
+            assert_eq!(
+                props.get(HEADER).map(String::as_str),
+                Some("vended-credentials"),
+                "{key} = {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn access_delegation_rejects_remote_signing_and_typos() {
+        let err = rest_props(&[("ACCESS_DELEGATION", "remote-signing")]).unwrap_err();
+        assert!(err.contains("ACCESS_DELEGATION"), "{err}");
     }
 }
 

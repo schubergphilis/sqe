@@ -48,12 +48,14 @@ Upstream `testdata/` is vendored in full, so `cargo test -p iceberg --lib` runs 
 | 10 | Strict-metrics residual elimination | `scan/context.rs` |
 | — | Intra-file row-group split (#131), `FileScanTask::with_byte_range` | `arrow/reader/pipeline.rs`, `scan/task.rs` |
 | — | Hash-set membership for large `IN` row filters | `arrow/reader/predicate_visitor.rs` |
+| — | A page index is `Optional`, not `Required`: an incomplete one (Snowflake writes no offset index for VARIANT and nested columns) is dropped instead of failing the file with "missing offset index" (`SQE PATCH (partial-page-index)`) | `arrow/reader/file_reader.rs` (`preload_policy`) |
 | — | Read amplification: 64 KiB footer prefetch and 64 KiB range-coalesce gap (upstream 512 KiB / 1 MiB) | `arrow/reader/mod.rs` |
 | 2 | REST SigV4 as an `AuthManager` (`rest.sigv4-enabled`, server-advertised, never replaces a bearer) | `catalog/rest/src/sigv4.rs` |
 | — | Vended credentials win: `storage-credentials` longest-prefix selection, vended `s3.*`/`gcs.*`/`adls.sas-token*` keys replace local static keys in table FileIO (`SQE PATCH (vended-credentials)`) | `catalog/rest/src/catalog.rs` (`table_file_io_props`) |
 | — | `RestCatalog::path_prefix`: the server-advertised `{prefix}`, for SQE's raw REST calls (`SQE PATCH (sqe#873)`) | `catalog/rest/src/catalog.rs` |
 | — | Empty-token guards (#2) and W3C trace propagation | `catalog/rest/src/auth/oauth2.rs`, `client.rs` |
 | — | Refresh-after-401 on `AuthSession::on_unauthorized` (replaces RW #157; apache has no refresh) | `catalog/rest/src/auth/` |
+| — | 429 Too Many Requests replayed up to 6 times, `Retry-After` honoured (capped 10 s), else jittered backoff; Snowflake Horizon throttles bursts (`SQE PATCH (catalog-429)`) | `catalog/rest/src/client.rs` (`send_throttled`) |
 | 5 | Loader feature gates + `Send + Sync` | `catalog/loader` |
 | — | sqlx 0.9 (`AssertSqlSafe`, `LIMIT 0` schema probe) | `catalog/sql` |
 | — | Concurrent catalog bootstrap: a failed `CREATE TABLE IF NOT EXISTS` is ignored when the table exists afterwards (`SQE PATCH (sqe#872)`) | `catalog/sql/src/catalog.rs` (`create_table_if_missing`) |
