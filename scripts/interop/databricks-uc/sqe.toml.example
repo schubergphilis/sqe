@@ -35,6 +35,11 @@ audience = "<workspace id>"
 user_claim = "sub"
 roles_claim = "roles"
 
+# The legacy [catalog] block must exist; with [catalogs.*] present a
+# placeholder URL is enough and it is dropped at startup.
+[catalog]
+catalog_url = "http://unused.invalid"
+
 [catalogs.dbx]
 catalog_url = "https://<workspace host>/api/2.1/unity-catalog/iceberg-rest"
 warehouse = "<UC catalog>"

@@ -122,6 +122,32 @@ impl WriteCleanupGuard {
     pub fn mark_committed(&self) {
         self.committed.store(true, Ordering::Release);
     }
+
+    /// Keep the files when the commit failed with an unknown outcome
+    /// ([`commit_outcome_unknown`]): the catalog may have applied it, and
+    /// deleting files a committed snapshot references breaks the table. An
+    /// orphan from a commit that did not land is only wasted storage.
+    ///
+    /// Call it on the commit error before the guard drops, e.g.
+    /// `.inspect_err(|e| guard.keep_if_outcome_unknown(e))`.
+    pub fn keep_if_outcome_unknown(&self, err: &impl std::fmt::Display) {
+        let msg = err.to_string();
+        if commit_outcome_unknown(&msg) {
+            warn!(
+                op = self.op,
+                error = %msg,
+                "commit outcome unknown; keeping this write's data files"
+            );
+            self.mark_committed();
+        }
+    }
+}
+
+/// Whether a commit error says the catalog could not report the outcome
+/// (iceberg-rust's "the commit state is unknown", for a 5xx or a timeout on
+/// the commit request).
+pub fn commit_outcome_unknown(msg: &str) -> bool {
+    msg.to_lowercase().contains("commit state is unknown")
 }
 
 impl Drop for WriteCleanupGuard {

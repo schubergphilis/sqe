@@ -5146,8 +5146,11 @@ impl QueryHandler {
             iceberg_scan.table(),
             iceberg_scan.snapshot_id(),
         );
+        // An unprojected scan sends its full column list too: without names
+        // the worker emits each file's own column order (#831 follow-up).
+        let output_columns = iceberg_scan.output_columns();
         let (projected_cols, projected_field_ids) =
-            scan_task_projection(iceberg_scan.projection(), &scanned_schema);
+            scan_task_projection(&output_columns, &scanned_schema);
 
         // 6a. The declared projection plus each column's initial default, for
         // workers whose files predate a projected column (#831). `None` unless
@@ -9250,12 +9253,12 @@ pub fn replace_scan_in_plan(
 }
 
 /// Derive the worker-side projection for a `ScanTask` from the scan's
-/// projection and the table's Iceberg schema.
+/// output columns (`IcebergScanExec::output_columns`: the projection, or the
+/// full declared schema when unprojected) and the table's Iceberg schema.
 ///
 /// Returns `(projected_columns, projected_field_ids)`:
-/// - both empty when the scan is unprojected (`SELECT *`) or the projection
-///   is empty (`COUNT(*)` -- workers return full columns, the reassembly
-///   path drops them),
+/// - both empty for a `COUNT(*)` scan (no columns -- workers return full
+///   columns, the reassembly path drops them),
 /// - field IDs only when EVERY projected column resolves to an Iceberg field
 ///   ID; a partial mapping would silently project the wrong columns on
 ///   post-evolution files, so incomplete IDs degrade to name-only projection.
@@ -9266,10 +9269,10 @@ pub fn replace_scan_in_plan(
 /// these columns and ships batches that match that schema (modulo column
 /// order, which reassembly normalizes by name).
 fn scan_task_projection(
-    projection: Option<&[String]>,
+    columns: &[String],
     iceberg_schema: &iceberg::spec::Schema,
 ) -> (Vec<String>, Vec<i32>) {
-    let projected_cols: Vec<String> = projection.map(<[String]>::to_vec).unwrap_or_default();
+    let projected_cols: Vec<String> = columns.to_vec();
     if projected_cols.is_empty() {
         return (projected_cols, Vec::new());
     }
@@ -11617,24 +11620,17 @@ mod tests {
         // so the ScanTask projection derived here agrees with the schema
         // DistributedScanExec advertises: no 16-vs-2 width mismatch.
         let proj = vec!["c".to_string(), "a".to_string()];
-        let (cols, ids) = scan_task_projection(Some(&proj), &iceberg_schema_abc());
+        let (cols, ids) = scan_task_projection(&proj, &iceberg_schema_abc());
         assert_eq!(cols, vec!["c".to_string(), "a".to_string()]);
         assert_eq!(ids, vec![3, 1], "field IDs parallel the projected columns");
     }
 
     #[test]
-    fn scan_task_projection_unprojected_scan_sends_nothing() {
-        let (cols, ids) = scan_task_projection(None, &iceberg_schema_abc());
-        assert!(cols.is_empty());
-        assert!(ids.is_empty());
-    }
-
-    #[test]
     fn scan_task_projection_count_star_sends_nothing() {
-        // COUNT(*) scans carry Some([]) — workers return full columns and the
+        // COUNT(*) scans carry no columns: workers return full columns and the
         // reassembly path drops them (expected schema has 0 fields).
         let proj: Vec<String> = vec![];
-        let (cols, ids) = scan_task_projection(Some(&proj), &iceberg_schema_abc());
+        let (cols, ids) = scan_task_projection(&proj, &iceberg_schema_abc());
         assert!(cols.is_empty());
         assert!(ids.is_empty());
     }
@@ -11645,7 +11641,7 @@ mod tests {
         // happen, but fail safe): partial IDs would project the wrong parquet
         // columns, so the IDs are dropped and the name fallback is used.
         let proj = vec!["a".to_string(), "ghost".to_string()];
-        let (cols, ids) = scan_task_projection(Some(&proj), &iceberg_schema_abc());
+        let (cols, ids) = scan_task_projection(&proj, &iceberg_schema_abc());
         assert_eq!(cols, vec!["a".to_string(), "ghost".to_string()]);
         assert!(ids.is_empty(), "incomplete ID mapping must send no IDs");
     }

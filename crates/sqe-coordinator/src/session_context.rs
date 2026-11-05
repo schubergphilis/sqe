@@ -1148,6 +1148,16 @@ impl crate::write_handler::CatalogDiscovery for PolarisCatalogDiscovery {
         discover_session_catalog(warehouse, config, session, table_cache).await
     }
 
+    async fn configured_session_catalog(
+        &self,
+        name: &str,
+        config: &SqeConfig,
+        session: &Session,
+        table_cache: Option<&TableMetadataCache>,
+    ) -> Option<Arc<SessionCatalog>> {
+        configured_session_catalog(name, config, session, table_cache).await
+    }
+
     async fn invalidate_session_cache(&self, username: &str) {
         invalidate_session_cache(username).await
     }
