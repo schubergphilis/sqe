@@ -2966,6 +2966,27 @@ pub struct CatalogConfig {
     /// the static fallback. REST backend only.
     #[serde(default)]
     pub access_delegation: AccessDelegation,
+    /// How unquoted identifiers that name this catalog's objects fold.
+    /// `"lower"` (default) is SQE's own rule (#337). `"upper"` is Snowflake's:
+    /// a table Snowflake created as `t (id INT)` is `T` with a column `ID`,
+    /// and `SELECT id FROM sf.s.t` then reads it without quotes. Columns fold
+    /// only in a statement whose tables all live in upper-case catalogs; a
+    /// join with another catalog folds the table names and leaves columns to
+    /// be quoted. A quoted name is used as written in either mode.
+    #[serde(default)]
+    pub identifier_case: IdentifierCase,
+}
+
+/// How a catalog folds unquoted identifiers (`[catalogs.<name>]
+/// identifier_case`).
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum IdentifierCase {
+    /// Fold to lower case (SQE, DataFusion, Polaris, Unity Catalog).
+    #[default]
+    Lower,
+    /// Fold to upper case (Snowflake Horizon).
+    Upper,
 }
 
 /// Value of the Iceberg REST `X-Iceberg-Access-Delegation` header SQE asks
@@ -6037,6 +6058,16 @@ impl SqeConfig {
         out
     }
 
+    /// The catalogs configured with `identifier_case = "upper"`, by the
+    /// name the engine registers them under.
+    pub fn upper_case_catalogs(&self) -> Vec<String> {
+        self.flattened_catalogs()
+            .into_iter()
+            .filter(|(_, c)| c.identifier_case == IdentifierCase::Upper)
+            .map(|(name, _)| name)
+            .collect()
+    }
+
     /// The name of the catalog that DataFusion treats as the
     /// "default" for unqualified table names. Resolution order:
     /// 1. `query.default_catalog` if set and non-empty.
@@ -8023,6 +8054,7 @@ partial_progress_batch = 5
                 storage: None,
                 require_vended_credentials: false,
                 access_delegation: AccessDelegation::None,
+                identifier_case: IdentifierCase::Lower,
             },
             catalogs: HashMap::new(),
             storage: StorageConfig::default(),
@@ -9535,6 +9567,7 @@ s3_secret_key = "configured-secret"
                 storage: None,
                 require_vended_credentials: false,
                 access_delegation: AccessDelegation::None,
+                identifier_case: IdentifierCase::Lower,
             },
         );
         let flat = cfg.flattened_catalogs();
@@ -9576,6 +9609,7 @@ s3_secret_key = "configured-secret"
                     storage: None,
                     require_vended_credentials: false,
                     access_delegation: AccessDelegation::None,
+                    identifier_case: IdentifierCase::Lower,
                 },
             );
         }
@@ -9624,6 +9658,7 @@ s3_secret_key = "configured-secret"
                 storage: None,
                 require_vended_credentials: false,
                 access_delegation: AccessDelegation::None,
+                identifier_case: IdentifierCase::Lower,
             },
         );
         let flat = cfg.flattened_catalogs();
@@ -12029,6 +12064,27 @@ audience = "polaris"
             cfg.catalog.effective_access_delegation(),
             AccessDelegation::VendedCredentials
         );
+    }
+
+    /// `identifier_case` defaults to lower, and only the catalogs that say
+    /// `"upper"` are listed for the front door.
+    #[test]
+    fn identifier_case_default_and_upper_case_catalogs() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let cfg = load_with_env();
+        assert_eq!(cfg.catalog.identifier_case, IdentifierCase::Lower);
+        assert!(cfg.upper_case_catalogs().is_empty());
+
+        let toml = format!(
+            "{MINIMAL_TOML}\n[catalogs.sf]\ncatalog_url = \"https://sf.example.com/polaris/api/catalog\"\n\
+             warehouse = \"DB\"\nidentifier_case = \"upper\"\n\
+             [catalogs.polaris]\ncatalog_url = \"https://polaris.example.com\"\nwarehouse = \"wh\"\n"
+        );
+        let cfg = SqeConfig::load_from_str(&toml).expect("named catalogs");
+        assert_eq!(cfg.upper_case_catalogs(), vec!["sf".to_string()]);
+
+        let bad = toml.replace("\"upper\"", "\"mixed\"");
+        assert!(SqeConfig::load_from_str(&bad).is_err());
     }
 
     #[test]
