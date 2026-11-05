@@ -2,12 +2,16 @@
 
 apache/datafusion-iceberg @ `b12e9871` (2026-09-24), vendored unmodified apart from
 the `iceberg` / `iceberg-catalog-rest` paths in `Cargo.toml`, which point at
-`../iceberg-rust`, and six SQE patches. Only `crates/datafusion` is vendored.
+`../iceberg-rust`, and seven SQE patches. Only `crates/datafusion` is vendored.
 
 SQE patch: `IcebergSchemaProvider::try_new` (`src/schema.rs`) skips a table that
 fails to load, with a `tracing` warning, where upstream fails the whole catalog. A
 Unity Catalog namespace lists its Delta tables too, and each answers 400 "not an
 Iceberg compatible table". Carry the patch over on a re-vendor.
+
+SQE patch (catalog-429): the same `try_new` loads at most 16 tables at a time
+(`LOAD_CONCURRENCY`) where upstream fans out over the whole namespace at once.
+Snowflake Horizon answers that burst with 429 Too Many Requests.
 
 SQE patch: `IcebergCatalogProvider::schema_provider` (`src/catalog.rs`) builds the
 provider of one namespace. The embedded CLI creates tables through SQE's write

@@ -213,16 +213,39 @@ impl HttpClient {
     pub(crate) async fn query_catalog(&self, request: HttpRequest) -> Result<HttpResponse> {
         // A request with a streaming body cannot be replayed; it gets no retry.
         let retry = request.try_clone();
-        let (response, sent) = self.send_authenticated(request).await?;
+        let (response, sent) = self.send_throttled(request).await?;
         if response.status() != reqwest::StatusCode::UNAUTHORIZED {
             return Ok(response);
         }
         match retry {
             Some(retry) if self.auth_session.on_unauthorized(&sent).await? => {
-                Ok(self.send_authenticated(retry).await?.0)
+                Ok(self.send_throttled(retry).await?.0)
             }
             _ => Ok(response),
         }
+    }
+
+    /// SQE PATCH (catalog-429): sends `request`, replaying it while the
+    /// catalog answers 429 Too Many Requests. Snowflake Horizon throttles a
+    /// burst of `loadTable` calls (ATTACH loads a namespace concurrently) and
+    /// a throttled table used to vanish from the attach. A 429 means the
+    /// server did not process the request, so a replay is safe even for a
+    /// commit. Waits `Retry-After` seconds when given (capped), else backs off
+    /// exponentially; gives up after `MAX_429_RETRIES` and returns the 429.
+    async fn send_throttled(&self, request: HttpRequest) -> Result<(HttpResponse, HttpRequest)> {
+        let mut next = request.try_clone();
+        let (mut response, mut sent) = self.send_authenticated(request).await?;
+        let mut attempt = 0u32;
+        while response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+            && attempt < MAX_429_RETRIES
+        {
+            let Some(request) = next else { break };
+            next = request.try_clone();
+            tokio::time::sleep(throttle_delay(response.headers(), attempt)).await;
+            attempt += 1;
+            (response, sent) = self.send_authenticated(request).await?;
+        }
+        Ok((response, sent))
     }
 
     /// Authenticates and sends `request`, returning the response together
@@ -394,6 +417,34 @@ pub(crate) fn deserialize_unexpected_catalog_error(
     err.with_context("json", String::from_utf8_lossy(bytes))
 }
 
+/// SQE PATCH (catalog-429): replays of a throttled catalog request.
+const MAX_429_RETRIES: u32 = 6;
+/// First backoff without `Retry-After`; doubles per attempt (0.25 s .. 8 s).
+const BASE_429_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+/// Upper bound on any single wait, `Retry-After` included.
+const MAX_429_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long to wait before replaying a 429: the `Retry-After` seconds when
+/// the server sends them (an HTTP date is not parsed), else exponential
+/// backoff with jitter so concurrent table loads do not retry in lockstep.
+fn throttle_delay(headers: &HeaderMap, attempt: u32) -> std::time::Duration {
+    if let Some(secs) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return std::time::Duration::from_secs(secs).min(MAX_429_DELAY);
+    }
+    let backoff = BASE_429_DELAY.saturating_mul(1 << attempt.min(5));
+    // Up to +50 % jitter from the clock's sub-second nanos; no rng dependency.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let jitter = backoff.mul_f64(f64::from(nanos % 1000) / 2000.0);
+    (backoff + jitter).min(MAX_429_DELAY)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,6 +488,77 @@ mod tests {
             .unwrap_err();
 
         assert!(format!("{err:?}").contains(&url), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_a_throttled_request_is_replayed_after_retry_after() {
+        // SQE PATCH (catalog-429): Horizon answers a loadTable burst with 429.
+        // Two 429s, then the server recovers. A raw socket, one connection per
+        // request (`Connection: close`), so the sequence is deterministic.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let replies: [&[u8]; 3] = [
+                b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                b"HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
+            ];
+            for reply in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                std::io::Write::write_all(&mut stream, reply).unwrap();
+            }
+        });
+        let url = format!("http://{addr}/v1/ns/tables/t");
+        let client =
+            HttpClient::new(&RestCatalogConfig::builder().uri(url.clone()).build()).unwrap();
+        let request = HttpRequest::build(client.request(Method::GET, &url)).unwrap();
+
+        let response = client.query_catalog(request).await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.body(), b"{}");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_request_throttled_past_the_limit_returns_the_429() {
+        let mut server = mockito::Server::new_async().await;
+        let throttled = server
+            .mock("GET", "/v1/config")
+            .with_status(429)
+            .with_header("retry-after", "0")
+            .expect(1 + MAX_429_RETRIES as usize)
+            .create_async()
+            .await;
+        let client =
+            HttpClient::new(&RestCatalogConfig::builder().uri(server.url()).build()).unwrap();
+        let url = format!("{}/v1/config", server.url());
+        let request = HttpRequest::build(client.request(Method::GET, &url)).unwrap();
+
+        let response = client.query_catalog(request).await.unwrap();
+        assert_eq!(response.status(), 429);
+        throttled.assert_async().await;
+    }
+
+    #[test]
+    fn test_throttle_delay_honours_retry_after_and_caps_backoff() {
+        let mut headers = HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "3".parse().unwrap());
+        assert_eq!(
+            throttle_delay(&headers, 0),
+            std::time::Duration::from_secs(3)
+        );
+        headers.insert(reqwest::header::RETRY_AFTER, "3600".parse().unwrap());
+        assert_eq!(throttle_delay(&headers, 0), MAX_429_DELAY);
+
+        let none = HeaderMap::new();
+        let first = throttle_delay(&none, 0);
+        assert!(
+            first >= BASE_429_DELAY && first <= BASE_429_DELAY.mul_f64(1.5),
+            "{first:?}"
+        );
+        assert!(throttle_delay(&none, 30) <= MAX_429_DELAY);
     }
 
     #[tokio::test]
