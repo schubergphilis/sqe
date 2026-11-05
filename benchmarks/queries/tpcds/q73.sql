@@ -23,5 +23,8 @@ FROM (
 ) dnt, customer
 WHERE ss_customer_sk = c_customer_sk
   AND cnt BETWEEN 1 AND 5
-ORDER BY cnt DESC, c_last_name, c_first_name, c_salutation, c_preferred_cust_flag
+-- ss_ticket_number breaks the ties the spec's order leaves: one customer can
+-- hold several tickets with the same cnt, and the LIMIT cuts through them.
+ORDER BY cnt DESC, c_last_name, c_first_name, c_salutation, c_preferred_cust_flag,
+         ss_ticket_number
 LIMIT 1000;

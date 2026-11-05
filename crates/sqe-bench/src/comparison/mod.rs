@@ -1,6 +1,7 @@
 //! Side-by-side benchmark comparison: run identical queries against SQE and Trino.
 
 pub mod classify;
+pub mod dump;
 pub mod values;
 
 use crate::client::BenchClient;
@@ -149,6 +150,15 @@ pub async fn run_comparison(
         if let Some(diff) = &value_diff {
             info!("  {} value diff: {}", query_name, diff);
         }
+        dump::dump_if_differs(
+            benchmark,
+            scale,
+            &query_name,
+            &sql,
+            &status,
+            sqe_result.as_deref().ok(),
+            trino_result.as_deref().ok(),
+        );
 
         let speedup = if sqe_time_ms > 0 {
             trino_time_ms as f64 / sqe_time_ms as f64
