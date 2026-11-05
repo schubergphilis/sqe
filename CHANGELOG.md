@@ -4,6 +4,1331 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+## [0.53.0] — 2026-11-05
+
+### Added
+
+- Blog post "Half the bugs were in the benchmark" (#785, #787, #788)
+
+    What the Polaris readers and the SF1 Trino comparison found: the embedded memory pool, the orphaned TopK dynamic filter, `EXPLAIN ANALYZE` outside the query's memory cap and the unapplied spill compression in SQE, and in the benchmark generator the TPCx-BB item domain, floats for money, linear dimension growth, the empty q64, the comparator that matched 100 with 1 and the row-count-only Trino check.
+
+- Databricks Unity Catalog interop harness (`scripts/interop/databricks-uc/`)
+
+    Databricks and SQE each write Iceberg tables into one Unity Catalog
+    schema, run DELETE, UPDATE and MERGE on the other's tables, and compare
+    25 reads value by value. The run is manual and needs a workspace token.
+    On 2026-10-27 all 25 reads matched in embedded, coordinator and
+    distributed mode. The Iceberg matrix now rates Unity Catalog full on V2
+    and V3 (156/162).
+
+- Per-catalog `identifier_case = "upper"` and `ATTACH ... (IDENTIFIER_CASE 'upper')` fold unquoted names the Snowflake way
+
+    A Snowflake Horizon table is stored as `SALES.ORDERS` with column `ID`,
+    while SQE folds unquoted names to lower case, so it had to be written
+    `sf."SALES"."ORDERS"` and `"ID"`. With the option set, the front door
+    folds unquoted names for that catalog to upper case before planning and
+    before policy rewriting: schema and table parts always, columns, aliases
+    and CTE names when every table in the statement is in an upper-case
+    catalog, and `USE sf.sales` folds its schema. Quoted names, function and type names, `information_schema` and
+    metadata-table columns are left alone. Masks bind case-insensitively as
+    before; a row-filter expression on a Snowflake column quotes it, and an
+    unquoted one fails the query rather than dropping the filter.
+
+- `SHOW CREATE VIEW` on the coordinator renders the view's SQL
+
+    `SHOW CREATE VIEW cat.ns.v` returns `CREATE VIEW cat.ns.v AS` and the
+    stored body of the Iceberg view, in a column named `Create View`. It
+    printed the view's columns as a `CREATE TABLE` before.
+
+- `ALTER TABLE` in embedded mode
+
+    On the `--warehouse` catalog and on attached Iceberg catalogs,
+    `sqe-cli --embedded` now runs `ALTER TABLE` on the coordinator's DDL
+    handler: `ADD`, `DROP`, `RENAME` and `ALTER COLUMN ... SET DATA TYPE`
+    (nested `STRUCT` fields included), `SET TBLPROPERTIES`, partition
+    evolution, `SET IDENTIFIER FIELDS`, `CREATE BRANCH` / `CREATE TAG` and
+    `RENAME TO`. On a non-REST catalog such as the embedded SQLite one, the
+    schema commit goes through the catalog's own `update_table` instead of
+    failing with "requires the REST catalog backend". `SET TAGS` and masking
+    policies still need a cluster.
+
+- Embedded `CREATE TABLE` keeps partitioning, table properties and nested columns
+
+    `sqe-cli --embedded` handed `CREATE TABLE` to DataFusion, which could not
+    parse `PARTITIONED BY (day(ts))` or `STRUCT<...>` columns and refused
+    `TBLPROPERTIES` and `WITH (...)`. On the `--warehouse` catalog and on
+    attached Iceberg catalogs such as Unity it now runs through the
+    coordinator's `sqe-write` DDL handler. New embedded tables are format
+    version 3, as on a coordinator, where they used to be version 2;
+    `WITH ('format-version' = '2')` keeps version 2. `CREATE TABLE ... LIKE`
+    still runs on a coordinator only, and a CTAS with `PARTITIONED BY` or
+    options is refused instead of dropping them.
+
+- Iceberg views in `sqe-cli --embedded`
+
+    `CREATE [OR REPLACE] VIEW` and `DROP VIEW [IF EXISTS]` on a catalog
+    attached with `TYPE iceberg_rest` store an Iceberg view through the
+    coordinator's view code: the body's analyzed schema, an `sqe` SQL
+    representation, `default-catalog` = the warehouse, and `OR REPLACE` as
+    one `replaceView` commit. `SELECT` and `DESCRIBE` read through the view;
+    its body resolves the catalog under the attach name or the warehouse
+    name. Views need a bearer token on
+    the attach; an OAuth2 attach refuses them. `SHOW TABLES` does not list
+    views yet.
+
+- Embedded `UPDATE`, `DELETE` and `MERGE INTO` on Iceberg catalogs
+
+    `sqe-cli --embedded` used to hand these statements to DataFusion, which
+    refused them ("not supported for Base table"). They now run through the
+    coordinator's `sqe-write` handlers, on the `--warehouse` catalog and on
+    attached catalogs such as Unity. A table's `write.delete.mode` picks
+    copy-on-write or merge-on-read, as on a coordinator. Embedded mode has no
+    access policy. `sqe-cli` now depends on `sqe-write`, which adds 11
+    crates to its build.
+
+- Iceberg metadata tables in embedded mode
+
+    `sqe-cli --embedded` now answers `$snapshots`, `$history`,
+    `$manifests`, `$files`, `$partitions` and `$refs` on the `--warehouse`
+    catalog and on attached Iceberg catalogs, for example
+    `SELECT * FROM iceberg.s."t$snapshots"`. They failed with "table
+    function 'table_snapshots' not found". The catalog in front of the
+    table name picks the catalog that is read; an unqualified name works
+    only when one Iceberg catalog is mounted. Cluster behaviour is
+    unchanged.
+
+- Embedded Iceberg views on an OAuth2 attach
+
+    `sqe-cli --embedded` refused `CREATE VIEW`, view reads and `SHOW CREATE
+    VIEW` on a catalog attached with an oauth2 `SECRET`, because the view
+    endpoints are called directly and only the catalog client held the
+    exchanged token. They now carry that token, and after a 401 the expired
+    token is dropped, a new one exchanged and the request sent once more.
+
+- Embedded `SHOW CREATE TABLE` for Iceberg tables
+
+    `sqe-cli --embedded` answered `SHOW CREATE TABLE` for Hive tables only.
+    On the `--warehouse` catalog and on attached Iceberg catalogs it now
+    prints the same DDL as a coordinator: the columns, `PARTITIONED BY`, the
+    sort order as a comment and `TBLPROPERTIES`. The rendering moved from the
+    coordinator to `sqe_catalog::show_create`, so both print the same text,
+    and the printed DDL creates the table again.
+
+- Time travel in `sqe-cli --embedded`
+
+    `SELECT ... FROM iceberg.s.t FOR VERSION AS OF <snapshot id>`, `FOR
+    VERSION AS OF 'branch-or-tag'`, `FOR TIMESTAMP AS OF` and `FOR
+    SYSTEM_TIME AS OF` now read the table at that snapshot, on the warehouse
+    and on attached Iceberg catalogs. Before, the clause failed to parse
+    ("Expected: one of UPDATE or SHARE"). The snapshot is resolved by the
+    same code as the coordinator, so both answer the same snapshot and fail
+    with the same message. A table outside an Iceberg catalog errors with
+    `time travel reads Iceberg tables only`.
+
+- Embedded `SHOW TABLES`, `information_schema` and `SHOW CREATE VIEW` see Iceberg views
+
+    On a catalog attached with `TYPE iceberg_rest`, `sqe-cli --embedded`
+    lists the catalog's views with type `VIEW`. The list is read at attach
+    and after each `CREATE VIEW` / `DROP VIEW` in the session.
+    `SHOW CREATE VIEW` renders `CREATE VIEW <name> AS <body>`. `SHOW CREATE
+    TABLE` on a view, and `SHOW CREATE VIEW` on a table, fail with a message
+    that says which one it is.
+
+- `CREATE TABLE` and `ALTER TABLE ADD COLUMN` take GEOMETRY and GEOGRAPHY columns (#863)
+
+    `GEOMETRY[(crs)]` and `GEOGRAPHY[(crs[, algorithm])]` create Iceberg V3
+    geospatial columns, where they used to fail with "SQL type not
+    supported". The CRS is an SRID or a quoted CRS string; SRIDs map as Spark
+    maps them (4326 is Iceberg's default `OGC:CRS84`, 0 is `SRID:0`, any
+    other n is `EPSG:n`). The geography algorithm defaults to `spherical`.
+    A table with such a column becomes format v3, and asking for v2 is an
+    error, also on `ADD COLUMN`. CTAS from a geospatial table keeps the
+    types. Spark 4.1 with Iceberg 1.12 describes and reads an SQE-created
+    table. A geospatial type inside STRUCT, ARRAY or MAP is refused.
+
+- `ST_*` functions over GEOMETRY values (#863)
+
+    Thirty planar functions from the new `sqe-geo` crate: constructors
+    (`ST_GeomFromText`, `ST_GeomFromBinary`, `ST_Point`, `ST_MakeEnvelope`),
+    output (`ST_AsText`, `ST_AsBinary`), accessors (`ST_X`, `ST_Y`, the
+    bounding box, `ST_GeometryType`, `ST_NumPoints`, `ST_IsEmpty`,
+    `ST_IsValid`), measures (`ST_Area`, `ST_Length`, `ST_Distance`,
+    `ST_Centroid`, `ST_Envelope`) and the DE-9IM predicates plus
+    `ST_DWithin`. They take and return WKB, so a result writes into a
+    GEOMETRY column. All math is planar: on a GEOGRAPHY column the measures
+    and predicates fail at planning time unless the value is wrapped in
+    `ST_GeomFromBinary(ST_AsBinary(...))`. Registered in the coordinator,
+    the embedded CLI and the workers. No bounding-box pruning yet.
+
+- SQE writes GEOMETRY and GEOGRAPHY columns (#863)
+
+    INSERT, UPDATE and `rewrite_data_files` now write into an Iceberg V3
+    table with a geospatial column, where they used to fail with
+    `NOT_SUPPORTED`. A value must be valid WKB; anything else fails the write
+    with the column and row. Parquet tags the column as GEOMETRY / GEOGRAPHY,
+    and each data file carries a geometry column's bounding box as its
+    manifest bounds, as the Iceberg spec defines them. A geography column
+    gets no bounds. Spark 4.1 with Iceberg 1.12 reads the rows SQE writes and
+    the files compaction writes. `CREATE TABLE` with a geospatial column is
+    still not supported, and there are no `ST_*` functions.
+
+- Iceberg tables with multi-argument or unknown transforms are readable (#864)
+
+    A partition or sort field that lists several `source-ids`, or names a
+    transform SQE does not know, no longer stops the table from loading. As
+    the V3 spec asks of readers, SQE reads such a table and ignores the
+    field when it prunes files: a predicate on a source column scans every
+    file. The field keeps its original transform name and source ids when
+    SQE writes the metadata back, and manifests decode with the partition
+    type their writer recorded. Writes into such a table are refused, as
+    the spec requires of writers: no data or delete file commits under a
+    spec with an unknown transform, and `ALTER TABLE ... PARTITION FIELD`
+    asks to drop that field first. `$partitions` and `$files` hide a
+    multi-argument field's value when any of its source columns is masked
+    or restricted.
+
+- `CREATE SECRET (TYPE oauth2, ...)` for Iceberg REST catalogs whose tokens expire
+
+    A bearer secret holds one token, and an `ATTACH`ed REST catalog stops
+    answering once that token expires (a Databricks Unity Catalog token
+    lasts an hour). An oauth2 secret holds a client credential instead:
+    `CLIENT_SECRET` (required), plus `CLIENT_ID`, `TOKEN_URL` and `SCOPE`.
+    The REST client runs the OAuth2 client-credentials grant at
+    `TOKEN_URL` (default `<location>/v1/oauth/tokens`), sends the returned
+    token as a bearer, and fetches a new one when the catalog answers 401.
+    `SHOW SECRETS` lists the kind as `oauth2`; the client secret is
+    redacted in debug output and zeroized on drop.
+
+- `quickstart/engine-bench`: the engine-bench workload against SQE embedded and on Polaris, next to DuckDB and Polars
+
+    Runs the public engine-bench workload (a seeded 10M-row star schema and four
+    queries: filtered rollup, fact-to-dimension join, latest row per customer,
+    one row per customer) unchanged against three ways of running SQE:
+    `sqe-cli --embedded` over `read_parquet()`, `sqe-cli --embedded` on a local
+    Iceberg warehouse, and a native `sqe-server` coordinator on Polaris 1.7.0 +
+    RustFS with an ADBC Flight SQL client. DuckDB and Polars (and Spark with
+    `WITH_SPARK=1`) run through upstream's own runners. Every run is a fresh
+    process with the upstream 4.5 GiB process-tree watchdog, and every answer
+    is checked against DuckDB's. `./run.sh --check` asserts that every run
+    finished and every answer matches.
+
+- `make bench` / `make bench-smoke`, and `STORAGE=s3` for engine-bench: every engine reads the same Parquet from S3
+
+    `make bench` runs engine-bench at 150M rows with Spark, the setup of the
+    upstream write-up; `make bench-smoke` runs 10M rows with `--check`.
+    `STORAGE=s3` (`BENCH_STORAGE=s3`) copies the data into RustFS and points
+    `sqe-parquet`, DuckDB, Polars and Spark at it, so they read over the same
+    path as `sqe-polaris`, and records the bytes each run read from the store.
+    Results go to `OUTPUT-s3.md`. `bench.py run --budget-for polars=8` raises
+    the kill threshold for one engine, and failed runs now keep their first
+    exception lines rather than only the stack frames.
+
+- Variant manifest bounds prune data files (#870)
+
+    Iceberg 1.12 writers (Spark 4.1) store, per shredded variant path, the
+    minimum and maximum over the data file in the manifest's lower and upper
+    bounds. The vendored iceberg-rust used to drop those bounds on read; it
+    now keeps them on `DataFile::variant_lower_bounds` /
+    `variant_upper_bounds` and writes them back when a manifest is
+    rewritten. A `variant_get` / `try_variant_get` comparison with a literal
+    (int, bigint, string, date, boolean) now skips the data files whose
+    bounds exclude it, on the local scan and in distributed scan planning.
+    A file without a bound for the path, or with a bound of another type, is
+    read. The skipped files are counted as `pruned_variant` in
+    `sqe_scan_files_total` and as `sqe.scan.files_pruned_variant` on the
+    query span, not as min/max pruned. SQE does not write variant bounds
+    yet, so only files from another writer are skipped.
+
+- Variants nested in a struct, a list or a map are shredded on write (#870)
+
+    With `write.parquet.shred-variants = 'true'`, a `JSON` / `VARIANT` field
+    inside a `STRUCT`, an `ARRAY` element or a `MAP` value now gets its own
+    `typed_value`, inferred per data file like a top-level variant. Spark 4.1 +
+    Iceberg 1.12 reads the result. JSON text in such a nested field (for
+    example `named_struct('v', '{"a": 1}')`) is parsed on INSERT; invalid JSON
+    fails the write.
+
+- Shredded variant fields prune row groups (#870)
+
+    A comparison of `variant_get(v, '$.path', '<type>')` or
+    `try_variant_get` with a literal (`=`, `<`, `<=`, `>`, `>=`, literal on
+    either side) now skips the row groups whose shredded `typed_value`
+    statistics exclude it, on the coordinator's direct read and on the
+    iceberg-rust reader (new vendor hook `RowGroupPruner`). Supported types:
+    int, bigint, string, date, boolean, on a top-level field or a nested
+    object path. A row group is kept whenever a row could hold the value
+    outside `typed_value`: a residual `value`, a mismatched type, or a field
+    that is not shredded. The new `row_groups_pruned_variant` scan metric
+    shows up in `EXPLAIN ANALYZE`. Limits: data files are not pruned (variant
+    manifest bounds are still skipped), and a worker scan reads every row
+    group.
+
+- Distributed workers prune row groups on shredded variant fields (#870)
+
+    A `variant_get(v, '$.path', '<type>') <op> literal` filter now skips row
+    groups on the worker as well as on the coordinator. The coordinator sends
+    the prune as plain data in the scan ticket (new field `variant_prunes`,
+    ticket version 5; the field id is resolved first, so a renamed column
+    still prunes). Tickets without it keep their older version and bytes.
+    The coordinator still refuses workers that report an older ticket version
+    at hello, so upgrade workers before the coordinator.
+
+- SQE writes variant manifest bounds for shredded files (#870)
+
+    With `write.parquet.shred-variants`, each shredded data file SQE writes,
+    compaction included, now carries, per shredded path of a top-level
+    variant column, the minimum and maximum value in the manifest's lower
+    and upper bounds, as Spark 4.1 / Iceberg 1.12 write them. The bounds are
+    taken from the values themselves, so a row written unshredded still
+    counts, and a path that holds a value of another type gets no bound.
+    SQE's own files are now skipped by a `variant_get` / `try_variant_get`
+    comparison the bounds exclude, before and after `rewrite_data_files`.
+    Integer, string (up to 64 bytes), boolean and date paths get bounds;
+    double paths do not.
+
+- `SQE_BENCH_DUMP_DIFFS=<dir>` writes the SQL and both engines' result sets for every query that differs in the Trino compare
+
+- `ST_SRID(g)` returns the SRID of a geometry column's CRS
+
+    4326 for `OGC:CRS84`, n for `EPSG:n`, 0 for any other CRS and for a
+    computed geometry, which carries no CRS. NULL for a NULL value.
+
+- `MERGE ... UPDATE SET *` and `INSERT *`
+
+    The Spark and Databricks shorthand now parses and runs in both write
+    modes: `WHEN MATCHED THEN UPDATE SET *` sets every target column from
+    the source column of the same name, and `WHEN NOT MATCHED THEN INSERT *`
+    inserts every target column the same way. Column order may differ and
+    extra source columns are ignored; a source missing a target column fails
+    the statement, as in Spark. `UPDATE SET *` is refused in a
+    `WHEN NOT MATCHED BY SOURCE` clause.
+
+- `coordinator.spill_max_bytes` caps the disk used by spill files
+
+    Default `100GB`, the DataFusion default that applied before. A query
+    that would spill past it fails with a resources-exhausted error that
+    names `coordinator.spill_max_bytes`; before, the error named
+    `datafusion.runtime.max_temp_directory_size`, which no SQE config sets.
+
+- Snowflake Horizon interop harness (`scripts/interop/snowflake-horizon/`)
+
+    Snowflake and SQE each write Iceberg tables into one Horizon schema, run
+    DELETE, UPDATE and MERGE on the other's tables, and compare 40 reads
+    value by value. They include a merge-on-read table whose SQE deletion
+    vector Snowflake must apply, and two 1M-row merge-on-read Snowflake
+    tables whose position deletes and deletion vectors SQE must apply. The
+    run is manual and needs a Snowflake user with a key pair. On 2026-11-05
+    all 40 reads matched in embedded, coordinator and distributed mode, and
+    the Databricks harness still matched 27 of 27 on the same build. The
+    Iceberg matrix now rates Snowflake Horizon full on V2 and V3 (158/162).
+
+### Changed
+
+- The pre-push clippy hook lints only the crates a branch changed
+
+    The hook linted the whole workspace on every push, about three minutes
+    even for a one-crate change. It now lints the crates changed since the
+    branch left `origin/main` (18 s warm for a four-crate change). A change
+    to `Cargo.toml`, `Cargo.lock`, `.cargo/`, `clippy.toml` or
+    `rust-toolchain.toml` still lints the whole workspace, and so does a
+    branch with no merge base. `make lint` lints the whole workspace;
+    `make pre-commit-all` now calls it.
+
+- Renovate groups the whole DataFusion/Arrow stack into one MR
+
+    The `parquet-*` crates (variant, geospatial) and the sqlparser 0.x
+    minor arrived as MRs of their own, apart from the Arrow major. None of
+    them can build without the DataFusion release that moves to the same
+    versions, so they stayed open and red. The stack rule now matches
+    `parquet-*` and keeps major and minor updates of the group together.
+
+- Toolchain refresh: Docker build images on Rust 1.99.1, Cargo.lock refreshed within semver bounds
+
+    The `Dockerfile` and `Dockerfile.bench` builder images move from `rust:1.99.0` to `rust:1.99.1`,
+    matching `rust-toolchain.toml`, and the `cargo-chef` image digest is refreshed. `make
+    lock-maintenance` moved 65 dependencies to their newest semver-compatible release (aws-sdk-*,
+    aws-lc-rs, tonic 0.14.9, icu 2.4, arrow-flight 59.3.2 and others); the workspace-hack needed no
+    change. The vendored `datafusion-physical-plan` TopK dynamic filter calls `try_update` instead of
+    the `fetch_update` that Rust 1.99 deprecated, which removes the one warning in a release build,
+    and its `rust-version` is raised to 1.99 to match. Major upgrades (arrow/parquet 60, sqlparser
+    0.63) wait for a DataFusion release that uses them.
+
+- `SHOW CREATE TABLE` on a view fails, as in Trino
+
+    `SHOW CREATE TABLE` on a view fails with `is a view, not a table`, and
+    `SHOW CREATE VIEW` on a table with `is a table, not a view`. The MCP
+    tool `get_table_ddl` returns the `SHOW CREATE VIEW` output for a view.
+
+- Iceberg scans read string columns as `Utf8View`
+
+    The Iceberg reader decoded every string column into `Utf8` (one offset
+    buffer, every value copied), then DataFusion's string kernels worked on
+    that copy. Scans now decode top-level strings as `Utf8View`, the layout
+    DataFusion already uses for plain Parquet, and the reader, its predicate
+    pushdown and the missing-column defaults all produce views. On a 150M-row
+    group-by over `status IN (...)` (3 GiB memory limit) wall time drops from
+    1.08 s to 0.95 s, CPU from 9.3 s to 7.5 s, peak memory from 1.22 GiB to
+    1.15 GiB. Flight SQL still reports `Utf8`/`Binary` in its schemas.
+    `[catalog] string_view = false` restores the old layout.
+
+- A table writer can run a deleting `system.remove_orphan_files` without an SQE admin role
+
+    The deleting call moved from the admin tier to the table-write tier, next to `rewrite_data_files` and `expire_snapshots`. Before it deletes anything it commits the table property `sqe.maintenance.remove-orphan-files.last-run-ms` as the caller, so the catalog decides: a reader gets the catalog's 403 and nothing is deleted. Every deleting run, an admin's included, now adds one metadata version (no snapshot). The dry run stays read-only. `purge_orphan_locations` stays admin-only.
+
+- "First row per partition" (`ROW_NUMBER() OVER (PARTITION BY p ORDER BY o) = 1`) runs as a hash aggregate instead of a window over a full sort
+
+    The window sorted the whole input by `p, o` to keep one row per
+    partition. SQE now plans it as a group-by on `p` that keeps the row
+    sorting first by `o`, with partial and final stages, memory accounting
+    and spilling. "Latest row per customer" over 150M rows and 15M customers
+    goes from ~8.9 s to ~5.6 s at a 3 GiB memory limit, with the same rows.
+    `rn = 1`, `rn <= 1` and `rn < 2` are rewritten; any other bound, OR,
+    RANK, a missing `PARTITION BY`, or a string or list column keeps the
+    window plan. Among rows that tie on every `ORDER BY` key, one is kept,
+    as arbitrary as the window's choice.
+
+- `avg(decimal(p,s))` returns `decimal(p,s)`, as in Trino (#785)
+
+    DataFusion widened it to `decimal(p+4,s+4)`: `avg` of 0.01, 0.01, 0.00 over a `decimal(7,2)` column gave 0.006667 as `decimal(11,6)`. It is now 0.01 as `decimal(7,2)`, rounded half away from zero. `avg` keeps DataFusion's count and sum state and computes only the final division. `avg` over integers still returns a double.
+
+- Decimal arithmetic and `sum` return Trino's result types (#785)
+
+    DataFusion takes decimal result types from arrow: `a / b` has scale `s1 + 4`, `a * b` precision `p1 + p2 + 1`, an integer operand is `decimal(20,0)` and `sum(decimal(p,s))` is `decimal(p+10,s)`. SQE now follows Trino (and Spark): a division has at least six decimals, a result that needs more than 38 digits gives up scale (down to six) before integer digits, an integer is `decimal(10,0)` and a bigint `decimal(19,0)`, and `sum` returns `decimal(38,s)`. Every result rounds half away from zero, and a result past 38 digits raises an error instead of returning an invalid value. `2.00 / 3.00` stays `0.666667`; `CAST(2 AS DECIMAL(7,2)) / CAST(3 AS DECIMAL(7,2))` is `0.6666666667` as `decimal(17,10)` instead of `0.666667` as `decimal(13,6)`. `%` keeps arrow's type, which is Trino's.
+
+- Decimal division, `avg` over decimals and decimal-to-integer casts round half away from zero (#785)
+
+    DataFusion truncated all three: `2.00 / 3.00` gave 0.666666, `avg` of 0.01, 0.01, 0.00 gave 0.006666 and `CAST(7.5 AS INT)` gave 7. They now give 0.666667, 0.006667 and 8, as Trino and PostgreSQL do. Result types do not change, only the last digit. A division gets one guard digit on its dividend and rounds back to its planned type (through `Decimal256` when the `Decimal128` guard could overflow). `avg` keeps DataFusion's count and sum state and rounds only the final division. Float-to-integer casts still truncate.
+
+- `table_files` / `$files` lists delete files and deletion vectors, with Iceberg's `content` column
+
+    It listed data files only, so a merge-on-read table's position deletes,
+    deletion vectors and equality deletes showed only as counts in the
+    `$snapshots` summary. It now lists every live file of the current
+    snapshot, as Spark's `files` and Trino's `$files` do, with new columns
+    `content` (0 data, 1 position deletes, 2 equality deletes),
+    `referenced_data_file`, `content_offset`, `content_size_in_bytes`,
+    `equality_ids` and `spec_id`. A V3 deletion vector is `content = 1` in
+    Puffin. The new columns are appended after the old ten. A query that
+    counts or sums data files adds `WHERE content = 0`.
+
+- Iceberg scans on the coordinator and in embedded mode no longer evaluate their own `WHERE` predicate as a per-row parquet `RowFilter`
+
+    The predicate still prunes files, row groups and pages, and the filter
+    above the scan drops the remaining rows, as DataFusion does with
+    `pushdown_filters = false`. With the `RowFilter`, peak memory rose by
+    55-110% on a 150M-row Polaris table, whether the predicate kept 92% or
+    8% of the rows (engine-bench q2 2.0 -> 1.26 GiB, q1 1.4 -> 0.66 GiB), and
+    no query got faster. Equality deletes and join runtime filters stay in
+    the `RowFilter`, since deletes depend on it. Every pushed filter is
+    `Inexact`, so a `FilterExec` always re-applies the predicate. Set
+    `scan_static_row_filter = true` in a catalog's section
+    (`[catalogs.<name>]`) to bring back the old behaviour. Distributed
+    worker scans read parquet through their own path and are unchanged.
+
+- `ROW_NUMBER() OVER (PARTITION BY ...)` over sorted input runs in one vectorised pass
+
+    A window whose every expression is `row_number()` over the same partition keys, with input already sorted on those keys, now counts rows per key run instead of keeping per-partition state. On 150M rows with 15M keys the window's CPU drops from about 39 s to under 0.5 s, the query's total CPU from 80 s to 50 s, and its wall time from 11.4-11.8 s to 7.6-8.9 s. Set `SQE_SORTED_ROW_NUMBER=off` to use DataFusion's window exec.
+
+- Workers scan merge-on-read tables with position deletes and deletion vectors
+
+    The scan ticket (version 6) carries the Iceberg delete tasks of each data
+    file it lists. Before a data file opens, the worker loads its
+    position-delete files and deletion vector and skips those rows with a
+    Parquet row selection, computed after the morsel and row-group pruning.
+    A data file with deletes is never split into byte-range morsels, so its
+    deletes load once. Such snapshots used to be scanned on the coordinator
+    until they were compacted. A snapshot with equality deletes still is,
+    and a worker refuses a ticket that carries one. A version 5 worker
+    refuses a version 6 ticket rather than read without the deletes.
+
+- Catalog DDL (`CatalogOps`) moved from `sqe-coordinator` to `sqe-write`
+
+    `catalog_ops` and `tag_source_impl` now live in `sqe-write`, next to the
+    write handler, so the embedded CLI can run `ALTER TABLE` through the same
+    code as a coordinator. The coordinator re-exports both modules under their
+    old paths and passes its Polaris catalog discovery in through the
+    existing `CatalogDiscovery` hook. No behaviour change.
+
+- The Nessie, Hive Metastore and JDBC (PostgreSQL) catalog live tests run in CI (#866)
+
+    A new `catalog-live-tests` job runs the five live round-trip tests against Postgres, Nessie and Hive Metastore service containers, pinned by digest, whenever `sqe-catalog`, the vendored iceberg-rust or the CI file changes. They used to run only by hand, so a regression waited for the next manual run. The Hadoop catalog stays read-only by design, and the site's catalog table now says so.
+
+- The join fallback is tested for every build estimate and for a chain of joins (#784)
+
+    New unit tests drive the fallback with an exact, an inexact (behind a filter) and an absent (a scan without statistics) build-side estimate. Each one keeps the hash join on the first attempt, overflows the query quota, and completes on the sort-merge retry with the right answer and all memory released. A two-join chain retries as two sort-merge joins. The tests also check the retry plan: every sort-merge join input stays hash-partitioned and never passes through a single-partition `CoalescePartitionsExec` or `SortPreservingMergeExec`.
+
+- The TPCBB q01 pre-aggregation prototype matches the original query exactly, including its output types (#785)
+
+    The candidate in `benchmarks/experiments/` now casts its measures to the original's types (`DECIMAL(17,2)` sum, `DECIMAL(11,6)` average). Its fixture has the edge cases the rewrite must keep: `DECIMAL(7,2)` amounts with NULLs and refunds, an item whose amounts are all NULL, NULL and dangling item keys, items with clicks but no sales, and item revisions that share an `i_item_id`. The harness compares every group exactly, with explicit NULL flags and the output types, instead of within a float tolerance.
+
+### Fixed
+
+- The `ci-deps-image` job builds again
+
+    The aikido deps-image script pruned the workspace with a Python helper,
+    and the deps image has no Python, so the job failed (job 5660962). The
+    shared CI pin moves to the aikido revision that prunes with a shell
+    script.
+
+- Embedded mode docs list what runs in-process
+
+    The embedded mode page claimed the full cluster write path (UPDATE,
+    DELETE, MERGE, ALTER, branches, tags, time travel) and described
+    `--warehouse` as a catalog-free path scan. It now describes the SQLite
+    warehouse that `--warehouse` really creates, adds a statement support
+    table for embedded versus cluster mode, and points REST catalogs
+    (Polaris, Nessie, Unity) at `ATTACH`.
+
+- The Unity Catalog interop docs no longer claim the embedded CLI runs DML on an attached catalog
+
+    It only reads one: UPDATE, DELETE, MERGE and ALTER are refused, and
+    CREATE TABLE takes plain columns only. Writes go through the coordinator.
+
+- engine-bench's summary names the error of a failed run instead of its last stack frame
+
+    A failed Spark run printed `... 1 more` in OUTPUT.md. The summary now
+    picks the line that names the error and skips the Py4J wrapper, for
+    instance `SparkOutOfMemoryError: [UNABLE_TO_ACQUIRE_MEMORY]`.
+
+- `make leak-scan` no longer fails on gitignored `.work/` directories under `quickstart/`
+
+    After a local `make bench`, test files in the bench's Python venv tripped
+    the account-id check, although they are never committed.
+
+- Embedded `INSERT` into a partitioned Iceberg table
+
+    The vendored DataFusion Iceberg writer refused a non-nullable input
+    column (`INSERT ... SELECT 1, ...`) for a nullable table column, and its
+    partition-value expression declared no inputs, so DataFusion's projection
+    merge evaluated it on an empty batch and the CLI panicked. Both are SQE
+    patches in `vendor/datafusion-iceberg`.
+
+- Embedded `CREATE VIEW` on an Iceberg catalog no longer creates an empty table
+
+    On the SQLite warehouse, `CREATE VIEW iceberg.s.v`
+    registered an empty Iceberg table named `v`. The SQLite catalog stores no
+    views, so the statement now fails with `stores no Iceberg views`; `DROP
+    VIEW IF EXISTS` there is a no-op.
+
+- `MERGE INTO ... USING read_parquet('f.parquet')` keeps the function's arguments
+
+    The MERGE source was rebuilt as `SELECT * FROM read_parquet` without its
+    arguments, on the coordinator and in embedded mode, and failed with
+    "table not found".
+
+- REST catalogs attached with different OAuth2 credentials no longer share
+  cached state
+
+    With no session bearer, every OAuth2 catalog on the same URL and
+    warehouse had the same fingerprint, so a second attach with another
+    credential could reuse the first one's cached catalog, table entries and
+    circuit breaker. The fingerprint now covers the credential, its token
+    endpoint, scope, audience and resource.
+
+- Embedded view bodies are stored under the warehouse name
+
+    `CREATE VIEW pol.ns.v AS SELECT * FROM pol.ns.t` stored `pol.ns.t`
+    verbatim, so a coordinator or another attach that names the catalog
+    differently could not read the view. The body now names the warehouse
+    (`<warehouse>.ns.t`), which every reader resolves, and `SHOW CREATE VIEW`
+    maps it back to the attach name.
+
+- A view that references itself fails instead of recursing
+
+    `CREATE OR REPLACE VIEW v AS SELECT * FROM v`, or a longer cycle through
+    other views, recursed on read on both the coordinator and the embedded
+    engine. Planning a view now tracks the views already being planned and
+    fails with `view w.ns.v references itself through w.ns.v -> w.ns.v`, and
+    a chain deeper than 32 views fails too.
+
+- A predicate pushed to a worker is no longer dropped whole when one conjunct calls a function (#863)
+
+    The worker decoded the pushed predicate against an empty function
+    registry, so any function call failed the decode and the worker shipped
+    every row, including for the plain conjuncts next to it. The worker now
+    decodes against its own session, and the coordinator leaves out only the
+    conjuncts the worker cannot decode. Results were never wrong: the
+    coordinator filters again.
+
+- Paths that only handled `Utf8` strings now accept `Utf8View`, found while
+  switching the scan default:
+    - a partial mask (`MASK_SHOW_LAST_4` and friends) on a `Utf8View` column
+      returned NULL instead of the masked value
+    - manifest min/max file pruning skipped every `Utf8View` and `LargeUtf8`
+      string column
+    - z-order compaction refused a `Utf8View` or `BinaryView` sort column
+    - `date_parse`, `json_format`, `codepoint` and string `contains` failed on
+      a `Utf8View` column; array `contains` never matched a string literal
+      against `Utf8View` items
+
+- `SHOW CREATE TABLE` printed no `TBLPROPERTIES` for a table outside the config default catalog
+
+    The properties were read from the config default's catalog, so `SHOW CREATE TABLE sales_wh.ns.t` (or `ns.t` under `USE sales_wh.ns`) found no table, or a same-named table in the default catalog, and printed its properties. `SHOW SCHEMAS` / `SHOW TABLES` with no `FROM` under a session default other than the config default read the config default the same way, as did time travel and `SHOW STATS` / `ANALYZE` on a 2-part name. All now resolve the session's catalog by name. A session default that config and Polaris cannot build (a Hive root, an ATTACHed catalog) keeps the old answer.
+
+- `expire_snapshots` now evicts the table from the coordinator's table cache after its commit, so the next query does not plan against expired snapshots
+
+- CTAS from Parquet with `timestamp[ms]` or `timestamp[s]` columns failed with "Unsupported Arrow data type: Timestamp(ms)"
+
+    Iceberg stores timestamps in microseconds (nanoseconds only in format
+    version 3), so the table schema now widens second and millisecond
+    timestamps to microseconds, on the coordinator write path and in embedded
+    `CREATE TABLE ... AS SELECT`. Nanosecond timestamps are narrowed to
+    microseconds below format version 3, as before.
+
+- Nested shredded variants read back every value (#870)
+
+    A shredded variant inside a struct, list or map lost its `typed_value` on
+    read, so the shredded fields came back missing. The coordinator and the
+    workers now fold the nested `typed_value` back into the variant, as they
+    already did for a top-level column.
+
+- Data-file writes honour `write.parquet.row-group-size-bytes` (#870)
+
+    SQE's write path built its Parquet properties without the table's row
+    group size, so every file got the parquet-rs row-count cap whatever the
+    table said. A positive value now caps each row group at that many bytes;
+    tables without the property write as before.
+
+- `sqe-bench --compare-trino` no longer rounds a decimal result twice when the two engines return it at different scales (#785)
+
+    The value comparator rounded the wider side half-up to the narrower scale. A value that both engines had already rounded correctly then differed: TPC-DS q12's `revenueratio` is 1.20649747..., SQE returns 1.2064975 at scale 7, Trino 1.206497 at scale 6, and 1.2064975 re-rounds to 1.206498. Two exact numbers now match when one true value could round to both (`|a - b| < ½·10^-sa + ½·10^-sb`). At equal scales that is still exact equality, so a wrong cent is still a value diff, and so is the q58/q78 `ss_dev` mismatch.
+
+- TPC-DS q35, q73 and q75 in the Trino compare sort deterministically
+
+    Their ORDER BY left rows tied on every key, and the LIMIT cut through the ties, so SQE and Trino each kept different but equally valid rows. q35 and q75 now sort on the keys the TPC-DS spec lists; q73 adds `ss_ticket_number` after the spec's keys, because one customer can hold two tickets with the same count.
+
+- The benchmark's Trino comparison checks values, not only row counts (#785)
+
+    A query that returned the right number of rows with a wrong value was reported as a match. Both engines' rows are now sorted and compared cell by cell. Integers and decimals compare exactly after rounding both sides half-up to the smaller scale, so DataFusion's `avg(decimal(7,2))` at scale 6 matches Trino's at scale 2. A float on either side compares within a relative tolerance of 1e-6. A mismatch gets the new status `ValueDiff` with the first differing cell and the count of differing rows, in the compare JSON (`value_diff`) and in the summary. It does not fail the run. On TPC-DS SF1 it flags 12 of the 99 queries and on TPCx-BB SF1 one of 10; most differ in the last digit because DataFusion truncates decimal division and casts where Trino rounds.
+
+- `sqe-catalog` compiles without the `rest` feature again
+
+    The writable embedded catalog needs the REST session catalog and table
+    provider, so it is now built only with `rest`, like them.
+
+- `sqe-cli -f json` prints SQL NULL as `null` instead of `""`, and the table shows `NULL` on every backend
+
+    The Flight and embedded backends rendered a NULL cell as an empty string, so `-f json` could not tell NULL from `''` and the table showed a blank. The HTTP backend printed the text `NULL`, which a `'NULL'` string matched. The result now carries which cells are NULL: `-f json` prints `null`, the table prints `NULL`, and CSV/TSV print an empty field on all three backends (HTTP printed `NULL` there before). The embedded backend no longer swallows an Arrow formatting error into an empty result; it reports it.
+
+- `COMMENT ON` writes to the catalog the name qualifies
+
+    `COMMENT ON COLUMN cat.ns.t.c` and `COMMENT ON TABLE cat.ns.t` committed
+    to the session's default catalog whatever `cat` named, so on any other
+    catalog they failed with "Table does not exist" on a table a `SELECT` of
+    the same name reads. The comment now lands in the named catalog (an
+    unqualified name still resolves in the session catalog), and `DESCRIBE`
+    shows it on the next statement.
+
+- Distributed compaction plans the table once per job per worker, not once per file group
+
+    A worker rewriting a file group loaded the table metadata, planned a
+    delete-aware read of the whole table and listed every live delete file,
+    then used the part of that plan covering its two or three files. Every
+    group repeated it, so a job cost groups x manifests: on a 200-file table,
+    planning was 393 ms of a 420 ms group. Workers now keep the pinned table,
+    read plan and live delete files per (job, metadata location, snapshot,
+    credentials) and share them across the job's groups, with one in-flight
+    build per job. A failed build, such as a snapshot mismatch, is not cached.
+    The 100-group distributed benchmark drops from 22.8 s to 2.9 s; 98 of 100
+    groups reuse the plan. The cache holds four jobs and drops a job's plan
+    after five idle minutes, never while a group is using it.
+
+- A prepared statement advertises the result types its stream carries, so ADBC accepts a decimal expression's result
+
+- `CAST(x AS DECIMAL(p,s))` to a smaller scale inside a comparison compared the unrounded value (#785)
+
+    DataFusion's `unwrap_cast_in_comparison` dropped the cast, so `WHERE CAST(x AS DECIMAL(10,2)) = 1.23` ran as `x = 1.230` and missed 1.225, 1.226 and 1.234. A scale-reducing decimal cast now rounds through an internal `__sqe_rescale` function the optimizer leaves in place. Workers decode it in a pushed-down predicate.
+
+- DESCRIBE and SHOW CREATE TABLE print geospatial types with their CRS
+
+    A GEOMETRY or GEOGRAPHY column printed as its `varbinary` storage, so
+    the DDL SHOW CREATE TABLE produced re-created the column as binary. Both
+    now print the Spark spelling the DDL accepts back: `geometry(4326)`,
+    `geometry(3857)`, `geography(4326, karney)`, and a quoted CRS such as
+    `geometry('ESRI:102100')` when it has no SRID.
+
+- SHOW CREATE TABLE output re-creates the same table on any catalog
+
+    It always names the `format-version`, since the server default is
+    configurable, and prints a table's sort order as a comment line. Keys
+    the catalog owns stay out of `TBLPROPERTIES`: `write.data.path`,
+    `write.metadata.path`, `write.object-storage.*`, `gc.*`,
+    `history.expire.*`, `databricks.*` and `io.unitycatalog.*`. Copied
+    into a new table, the paths pointed it at the old table's files.
+    Retention keys set by hand are hidden too; set them on the copy again.
+
+- A distributed scan no longer returns rows that delete files removed
+
+    A worker reads the data files in its scan ticket with a plain Parquet
+    reader, and the ticket carries no delete files, so position deletes,
+    deletion vectors and equality deletes were not applied. A merge-on-read
+    table read through workers returned its deleted rows. The coordinator now
+    scans a snapshot that has delete manifests itself, where iceberg-rust
+    applies them (`has_delete_files` in the distribution decision). Snapshots
+    without delete files still go to the workers. Found by the Databricks
+    Unity Catalog interop run: a deletion vector Databricks wrote into an
+    SQE table was ignored.
+
+- DELETE, UPDATE, MERGE and TRUNCATE by a caller who may read a table but not write it are refused with `ACCESS_DENIED` before any file is written (#880)
+
+    With vended credentials Polaris answers a reader's delegated `loadTable` with read-only keys instead of a refusal, so the statement planned, wrote data or delete files and only failed at the first `PutObject`, leaving orphan files behind. On a REST catalog that vends credentials the engine now sends a commit that changes nothing first (`assert-table-uuid` + `assert-ref-snapshot-id main` with `set-snapshot-ref main` to the same snapshot; requirements only when there is no `main` or the ref moved). Polaris authorizes the update and refuses a reader with 403; for a writer nothing changes. Only a 403 refuses; any other answer logs a warning and leaves the decision to the real commit. Limits: a principal with `TABLE_WRITE_PROPERTIES` but not `TABLE_WRITE_DATA` passes the check and still fails at the object store; INSERT and CTAS are not checked.
+
+- Embedded `ATTACH ... (TYPE iceberg_rest)` reads its data files from the store the CLI is configured for
+
+    An ATTACH with no `S3_*` option now takes the endpoint, region, keys,
+    session token and path style from `--s3-*`, `SQE_STORAGE__S3_*` or
+    `AWS_*`. Before, its FileIO fell back to the ambient AWS chain and failed
+    with "region is missing" against RustFS or MinIO unless the ATTACH spelled
+    every setting out. An ATTACH that names any `S3_*` option still uses only
+    its own options, and vended credentials still replace the keys. The
+    server is unchanged: a user's ATTACH never borrows the coordinator's
+    keys. New ATTACH option `S3_SESSION_TOKEN` for temporary keys. The book
+    now documents the `S3_*` options.
+
+- `sqe-cli --embedded --catalog-backend glue|s3tables` no longer writes to the shared catalog
+
+    These catalogs were documented as read-only, but the datafusion-iceberg
+    provider they were mounted through is writable: `CREATE TABLE` and
+    `CREATE VIEW` created a table in Glue or S3 Tables, `DROP TABLE` dropped
+    the real table, and `INSERT` committed to it. The catalog, its schemas and
+    its tables are now wrapped so every write (`CREATE` / `DROP` of a table,
+    view or schema, `INSERT`, `DELETE`, `UPDATE`, `TRUNCATE`) fails with
+    "catalog `glue` is attached read-only; use the server for writes".
+    `SELECT`, `DESCRIBE` and `SHOW TABLES` are unchanged.
+
+- Embedded mode: `CREATE TABLE ... AS` into an Iceberg catalog, and `SHOW TABLES IN`
+
+    In `sqe-cli --embedded`, CTAS into a `--warehouse` or attached Iceberg
+    catalog failed with "register_table does not support tables with
+    data". The table is now created empty from the query's schema and then
+    filled by an `INSERT`. A failing `INSERT` drops the empty table again.
+    `IF NOT EXISTS` skips an existing table. `CREATE OR REPLACE TABLE ... AS`
+    is refused with a clear error. `SHOW TABLES {IN|FROM} [catalog.]schema
+    [LIKE '...']` failed with "SHOW TABLES IN not supported" and now lists
+    the tables of that schema.
+
+- Embedded Iceberg scans use every core
+
+    `sqe-cli --embedded` read Iceberg tables through the vendored
+    `IcebergTableProvider`. That provider scans in one partition and reloads
+    the table from the catalog on every scan. Base tables now read through
+    `SqeTableProvider`, the coordinator's provider. The parallel-scan
+    physical rules now live in `sqe-catalog` and run in embedded mode too.
+    On the 10M-row engine-bench, the Iceberg geomean drops from 0.56 s to
+    0.36 s, and a filtered aggregate from 0.51 s to 0.16 s. Metadata tables
+    (`t$snapshots` and others) still read through the vendored provider.
+
+- A filter on a list, struct or map column of an Iceberg table no longer fails
+
+    `WHERE tags IS NOT NULL` on an `ARRAY` column was pushed into the Iceberg
+    scan, and Iceberg cannot bind a predicate on a nested field, so the query
+    failed with `DataInvalid: Accessor for Field tags not found`. Such
+    filters now stay in DataFusion. The rest of the conjunction still pushes
+    down.
+
+- Embedded `INSERT` stored NULL as 0 in a `NOT NULL` column
+
+    On the `--warehouse` catalog and on attached Iceberg catalogs,
+    `INSERT ... SELECT` with a NULL, or an `INSERT` that left a `NOT NULL`
+    column out of its column list, committed the row with 0 in that column.
+    The vendored DataFusion Iceberg writer now refuses the batch with the
+    coordinator's message, `NULL value not allowed for NOT NULL column`. A
+    query into a `NOT NULL` column of a partitioned table is accepted when
+    it has no NULLs, where it used to be refused at plan time.
+
+- Embedded mode (`sqe-cli --embedded`) shares its memory pool the way the coordinator does
+
+    The embedded engine built a `FairSpillPool`, which splits the pool, minus
+    every byte held by consumers that cannot spill, evenly across all
+    registered spillable consumers. An Iceberg scan's decode reservations
+    cannot spill, so each aggregate partition got a small slice: the engine
+    bench's q3 (150M rows, 3 GB) spilled its final aggregate 96 times, where
+    the coordinator, on the same data and limit, did not spill. The embedded
+    pool is now the coordinator's default: first come, first served, with the
+    top 20% kept for consumers that cannot spill. Each sort partition is
+    capped at its share of the spillable bytes, as in the coordinator's
+    per-query pool, so the last partition of a sort to start still finds
+    room. Writes in embedded mode admit a sort-on-write against
+    `--memory-limit` instead of the server's 256 MB `max_query_memory`
+    default. Embedded mode still has no join-fallback retry like the
+    coordinator's; the bench's join query (q2) runs without spills at 3 GB.
+
+- `EXPLAIN ANALYZE` and `EXPLAIN FULL` run under the query's memory cap and join fallback (#788)
+
+    Both statements run the query to collect operator metrics, but they ran
+    it on the session's shared pool, outside the per-query pool every SELECT
+    gets. Any user could exceed `query.max_query_memory` that way, sorts had
+    no per-partition share, and a join that the query completes through the
+    sort-merge retry (#784) was not retried. The metrics therefore described
+    a different execution from the query's: on the engine bench, a full
+    `ORDER BY` of 150M rows at 3 GB completes as a query but failed as
+    `EXPLAIN ANALYZE` once its merges took the whole pool. Both statements
+    now run with the query's pool, sort share and join fallback, report the
+    retry's plan when the fallback replans, and a memory refusal returns the
+    `ResourceExhausted` error code.
+
+- Flight SQL prepared INSERT, UPDATE and DELETE advertise their parameter types
+
+    A prepared DML statement has no stored plan, so its `parameter_schema`
+    advertised every parameter as `Utf8` and a driver bound a BIGINT column
+    as a string. The statement is now planned once at prepare time to read
+    the types: an INSERT's `VALUES` placeholders take the target columns'
+    types, and a `WHERE col = ?` takes the column's. A statement that does
+    not plan there (a MERGE) stays `Utf8`, as before. The bind of a
+    prepared DML statement is still not checked against these types, so a
+    client that sends `"10"` for a BIGINT column keeps working: the value is
+    coerced when the statement runs.
+
+    String and binary parameters are advertised as `Utf8` / `Binary`, never
+    as the `Utf8View` / `BinaryView` the planner uses, for every prepared
+    statement.
+
+- A bare `FROM t` returns every column instead of "0 rows"
+
+    sqlparser reads DuckDB's `FROM t` as a SELECT with an empty projection,
+    and DataFusion planned zero output columns, so every client printed
+    "0 rows". The SQL front door now rewrites it to `SELECT * FROM t`, in
+    CTEs, subqueries, set-operation branches and `INSERT ... FROM t` too,
+    on every protocol. `FROM t SELECT a` already worked. A `WHERE` after a
+    bare `FROM t` still does not parse.
+
+- A worker scan of a table another engine wrote no longer fails on its BINARY or geospatial columns (#863)
+
+    A Parquet file without an Arrow schema (Spark, Trino) decodes BINARY and
+    GEOMETRY / GEOGRAPHY WKB as `Binary`, where SQE plans the column as
+    `LargeBinary`. The coordinator's own scan widened the column; a batch
+    streamed back from a worker kept the narrow type, and the first function
+    over the column failed with `Function 'encode' returned value of type
+    'Utf8' while ... 'LargeUtf8'` was promised. The coordinator now rebuilds
+    every worker batch in the planned schema: a width change or an Iceberg
+    type promotion is cast, and the GeoArrow tag is restored. A column of any
+    other type is still an error.
+
+- `SHOW TABLES` and `information_schema.tables` list base tables only for
+  ATTACHed and embedded Iceberg catalogs
+
+    Every table `t` was listed four times: `t`, `t$snapshots`,
+    `t$manifests` and `t$history`, all as `BASE TABLE`. The metadata tables
+    are no longer listed.
+
+- Filters on a column promoted from `INT` to `BIGINT` (or `REAL` to `DOUBLE`) no longer drop rows from files written before the promotion, and DELETE on such a table no longer crashes
+
+    Pruning compared the old files' narrow partition values and column bounds against the widened predicate and skipped them: after `ALTER COLUMN p SET DATA TYPE BIGINT`, `WHERE p = 2` returned nothing for rows written before the change. A DELETE that removed one of those files panicked, and once that was fixed its commit failed with "value is not compatible with type". Backports apache/iceberg-rust #3483 and two SQE vendor patches.
+
+- Iceberg backport round 2: NaN row-group bounds no longer prune `<`/`>` filters (#3502); float values in JSON metadata read like iceberg-java (#3476); a scan with an empty projection no longer reads data columns (#3473); partition specs produced by spec evolution load (#3431) and reuse the highest matching field id (#3413); `rewrite_files` keeps the parent snapshot's properties, added files go into a manifest per partition spec, and snapshot summary totals never wrap below zero (RisingWave #261, #262, #246)
+
+- Vendored iceberg-rust: third round of upstream correctness fixes
+
+    Seven fixes from apache/iceberg-rust and RisingWave's fork:
+    - The Parquet writer skips NaN when it tracks column min/max.
+    - Nested struct fields of files written without field ids read as NULL.
+    - A DELETE or rewrite of files whose partition source column was later
+      dropped no longer panics while it writes the snapshot summary.
+    - Partition specs whose source column was dropped pass the name check.
+    - `IN` lists prune files and row groups when every value falls outside
+      the bounds, on either side.
+    - Manifest bounds on nested fields are ignored instead of failing the
+      manifest read.
+    - Writers stamp the unpartitioned spec id on the files they write.
+
+    The IO-runtime and scan/delete perf patches follow in a separate change.
+    `vendor/iceberg-rust/README.md` lists every pick.
+
+- `information_schema.columns`, `DESCRIBE`, `SHOW COLUMNS` and `SHOW CREATE TABLE` work on Databricks Unity Catalog
+
+    Unity Catalog lists its Delta tables in the Iceberg REST namespace and
+    answers 400 ("not an Iceberg compatible table") to loading them.
+    `information_schema.columns` loads every listed table and stopped at the
+    first error, so one Delta table failed every column read of the catalog.
+    A 400 on loading a listed name now resolves to no table, as an absent
+    name does; 401, 403 and 5xx still fail. `DESCRIBE`, `SHOW COLUMNS` and
+    `SHOW CREATE TABLE` read the columns of the named table alone instead
+    of the whole `information_schema`, so another table that does not load
+    no longer fails them, and a bare name resolves as a `SELECT` resolves
+    it: in the session's default catalog and schema.
+
+- Embedded `INSERT ... VALUES` into an `ARRAY` column, and filters on `ARRAY` columns
+
+    On the `--warehouse` catalog and on attached Iceberg catalogs,
+    `INSERT ... VALUES (1, ARRAY['a'])` failed with "column types must match
+    schema types": DataFusion typed the rows against the table's list type,
+    which carries the element's Iceberg field id. Embedded `INSERT` and the
+    insert step of CTAS now run on the coordinator's insert handler, which
+    plans the source as a plain query. A query with a predicate on a list or
+    map column, such as `WHERE tags IS NOT NULL`, failed with "Accessor for
+    Field tags not found"; the Iceberg scan now skips a predicate it cannot
+    bind and DataFusion applies it above the scan.
+
+- A bound parameter in `INSERT ... VALUES` or `INSERT ... SELECT ?` is typed from its target column
+
+    The INSERT source is planned on its own, so DataFusion left a placeholder
+    written straight into a column untyped: a string bound to a BIGINT
+    column then failed in the write's cast, and that error quoted the value
+    in the answer and in the log. The placeholder now takes the column's
+    type, with or without an explicit column list, so a numeric string is
+    parsed and anything else is refused before the write as
+    `parameter $n: cannot convert Utf8 to Int64`, as `UPDATE ... SET c = ?`
+    already was. The check is the same as for UPDATE: a value of another
+    type family (an integer for a STRING column, a DATE for a TIMESTAMP)
+    is refused rather than cast.
+
+- A query on a Delta table in Databricks Unity Catalog says the table is not an Iceberg table
+
+    Unity Catalog lists its Delta tables in the Iceberg REST namespace and
+    refuses to load them as Iceberg. Since column metadata learned to skip
+    those tables, a `SELECT` from one failed with "table not found" while
+    `SHOW TABLES` still listed it. The error now names the table and says
+    the catalog lists it but does not serve it as Iceberg. A name the
+    catalog does not know still fails with "not found".
+
+- `ORDER BY` a column the query does not select returned unordered rows
+
+    `SELECT id + 0 AS r FROM t ORDER BY id` came back as interleaved sorted
+    runs when the scan read the table as more than one partition (a table
+    with several data files). The projection hides the sort column, so the
+    partitions were concatenated instead of merged in order. They are now
+    merged in order beneath the projection; `ORDER BY ... LIMIT` keeps its
+    global cap.
+
+- `remove_orphan_files` and the file cleanup of `expire_snapshots` work on a credential-vending catalog
+
+    Both commit first (a table property, or the expiry) and then read or
+    delete files. They did that through the table the commit returned, but a
+    REST commit's response carries no storage config, so that table had only
+    the catalog's own storage properties: with vended credentials and no
+    static warehouse key, a deleting `remove_orphan_files` failed with
+    "failed to load signing credential" and an expiry's cleanup could not
+    delete. The file step now runs on a reload of the table, which vends the
+    caller's credential. If another writer committed in between, the file
+    step is refused with `COMMIT_CONFLICT` and nothing is deleted.
+
+- Reads of Iceberg tables written by Snowflake (and Databricks Photon) no longer fail with "cannot skip miniblock of size 512" when a delete applies
+
+    parquet 59.3.1 could not skip rows inside a `DELTA_BINARY_PACKED`
+    miniblock wider than its skip buffer (32 values for INT32, 64 for
+    INT64; apache/arrow-rs#9793). Snowflake writes 512-value miniblocks and
+    Photon 256-value ones, and skipping is what a row selection does: applying
+    a position delete or deletion vector, or a page-index predicate. A
+    merge-on-read table from either engine therefore failed on any read that
+    crossed a deleted row. arrow and parquet move to 59.3.2, which carries the
+    upstream fix (apache/arrow-rs#11021, backported in #11754). A hand-encoded
+    512-value page in `sqe-catalog` guards the dependency against a downgrade.
+
+- Iceberg V3 tables whose partition spec names a field's source as `source-ids` load (#864)
+
+    The V3 spec lets a partition field list its sources as `source-ids` instead of `source-id`. SQE only read `source-id`, so such a table failed to load. A one-element `source-ids` now reads like `source-id`.
+
+- `PARTITIONED BY (col, ...)` with bare column names was ignored in embedded mode and on the Trino HTTP path
+
+    `CREATE TABLE ... PARTITIONED BY (region, id)` created an unpartitioned
+    table with no error. The clause parsed as a Hive partition column list,
+    which the DDL handler does not read, so only transforms such as
+    `bucket(4, id)` or `day(ts)` took effect. The front door now rewrites
+    the clause to `PARTITION BY` for every `CREATE TABLE`, as the Flight
+    path already did. `CREATE EXTERNAL TABLE` keeps the Hive form.
+
+- `CREATE TABLE ... PARTITIONED BY (...) TBLPROPERTIES (...)` parses
+
+    SQE rewrites `PARTITIONED BY` to `PARTITION BY` for the transform list,
+    and sqlparser only takes `LOCATION`, `WITH (...)` and `TBLPROPERTIES`
+    before `PARTITION BY`. The Spark and Databricks order failed with
+    "found: TBLPROPERTIES". The table clauses of a `CREATE TABLE` are now put
+    in the order the parser takes, and `USING iceberg` is dropped (every
+    table SQE creates is an Iceberg table). Another provider, such as
+    `USING delta`, still fails.
+- `SHOW CREATE TABLE` shows the partition spec of an Iceberg table
+
+    The DDL had no `PARTITIONED BY` clause, so replaying it created an
+    unpartitioned table. It now renders the default partition spec with the
+    transforms `CREATE TABLE` takes: identity, `year`, `month`, `day`,
+    `hour`, `bucket(N, col)`, `truncate(W, col)` and `void`.
+
+- Compaction and `rewrite_manifests` keep Puffin NDV statistics on a credential-vending catalog
+
+    After a rewrite, the previous snapshot's statistics are carried onto the
+    new snapshot. The sidecar was read and written through the table the
+    commit returned, but a REST commit's response carries no storage config,
+    so on a vending catalog without a static warehouse key the carry failed
+    and, being best effort, dropped the statistics without an error. The
+    carry now uses the `FileIO` of a fresh table load, which holds the
+    caller's vended credential.
+
+- Quack: a write the object store refused is reported as an access denial
+
+    Over the Quack protocol the error routing read the raw error code, so a
+    refused `PutObject` (built as an execution failure and only refined to
+    `ACCESS_DENIED` by the error's code) reached the client as `SQE-EXEC`
+    with the store's reply in full. It now routes on the refined code and
+    is answered `SQE-POLICY: access denied`, like every other denial; the
+    detail stays in the server log.
+
+- The SQLite write-rig tests pass again now that Iceberg scans return Utf8View
+
+    `feat/iceberg-string-view` made Iceberg scans read strings as Utf8View.
+    The rig's `id_v_pairs` helper still required Utf8 and panicked, failing
+    eleven `write_handler::tests::committing` tests on main since that merge.
+    The helper now accepts both string types. Test-only; no runtime change.
+
+- `ROLLUP`, `CUBE` and `GROUPING SETS` no longer return duplicate groups or subtotals out of order when the `WHERE` clause pins a grouped column
+
+    `WHERE s_state = 'TN' GROUP BY ROLLUP (i_item_id, s_state)` let DataFusion treat `s_state` as constant above the rollup, though the rollup emits it as NULL in its subtotal rows. The final aggregate then assumed sorted input and emitted some groups more than once, and `ORDER BY i_item_id, s_state` sorted on `i_item_id` alone. At SF10 the q27 aggregate gave 92,435 to 94,122 rows for 87,989 groups, varying from run to run. SQE now carries apache/datafusion#24422 in `vendor/datafusion-physical-plan` until DataFusion 56 ships it.
+
+- Iceberg scans reserve less memory, leaving more for sorts and joins
+
+    The streaming reader now reserves 2x a read task's projected bytes instead of 4x, and data fetched ahead of decoding is capped at 10% of the memory limit (at least 64 MiB) per scan. A fetch over the cap waits instead of failing. On a 150M-row "latest row per key" query with a 3 GB limit, the sort spills 99 times instead of 165, and a plain scan peaks at 0.74 GiB instead of 1.22 GiB.
+
+- Worker scans of files with small row groups no longer over-allocate decode buffers
+
+    The 8192-row scan batch is now capped at the file's largest row group.
+    A batch never spans row groups, so a file of 1024-row groups was decoded
+    into buffers eight times larger than each batch and charged to the scan
+    memory budget at that size.
+
+- Iceberg and worker scans emit full-size batches
+
+    The Iceberg scan and the worker's parquet reader decoded 1024-row batches, the parquet crate's default, instead of DataFusion's 8192. Every operator above the scan paid its per-batch cost eight times over. On a 150M-row `GROUP BY` the scan now produces 18 K batches instead of 146 K and the query uses 25% less CPU.
+
+- A join against a `LIMIT`ed Hive scan can broadcast the limited side
+
+    A Hive scan under `LIMIT` with more than one partition reads lazily
+    (`LazyPartitionScanExec`) and lists nothing at plan time, so it reported
+    no row count and DataFusion never broadcast it in a join. It never returns
+    more than `limit` rows, and now reports that as an inexact row count. An
+    integration test also pins that a join against a small `read_parquet()`
+    file broadcasts the file through the coordinator's planning rules, on
+    whichever side of the join the query names it.
+
+- A small file or Hive table in a join is broadcast again instead of hash-partitioned
+
+    The scan wrappers around `read_parquet()` and the other file readers
+    (`ScopedFileScan`) and around Hive scans (`HiveScanExec`,
+    `HiveLocalScanExec`) reported no statistics under DataFusion 55, which
+    reads them through `statistics_from_inputs` and no longer calls
+    `partition_statistics`. With no row count, DataFusion never picks a
+    `CollectLeft` join, so every row of the large side was hashed across
+    partitions. They now pass their input's statistics through. On the
+    engine-bench `q2_join_agg` (150M sales rows joined to a 50,000-row
+    products file, embedded) the query went from 4.9 s and 4.0 GiB peak to
+    1.5 s and 0.14 GiB, same answer. A Hive scan under a `LIMIT` still reads
+    lazily and reports no row count.
+
+- Snowflake Horizon catalogs attach and read in embedded mode
+
+    `ATTACH ... (TYPE iceberg_rest, ACCESS_DELEGATION 'vended-credentials')`
+    sends `X-Iceberg-Access-Delegation`. Horizon and Polaris vend storage
+    credentials only when asked, so without it every data read failed with
+    "failed to load signing credential". The option is off by default, as in
+    Trino and Spark. The coordinator already had `[catalog] access_delegation`.
+
+    The REST catalog client now replays a request the catalog answers with 429
+    Too Many Requests, up to six times, honouring `Retry-After` (capped at
+    10 s). ATTACH loads at most 16 tables of a namespace at a time. Horizon
+    throttled the old unbounded fan-out, and every throttled table dropped out
+    of the attached catalog with only a log warning.
+
+- Snowflake-written tables with a VARIANT or nested column read again
+
+    Snowflake writes parquet files with no offset index on VARIANT and nested
+    columns. SQE loaded the page index as required, so every read of such a
+    table failed with "missing offset index", even `SELECT id`. The page index
+    is now optional in the vendored Iceberg reader, the small-file scan path
+    and the worker: an incomplete index is dropped and the file reads without
+    page pruning.
+
+- Writes to a `[catalogs.<name>]` catalog go to that catalog
+
+    `INSERT`, `CREATE TABLE` and the other writes resolved a catalog-qualified
+    target through the legacy `[catalog]` entry and its warehouse, so a write
+    to `sf.schema.t` reached the wrong endpoint. They now use the named
+    catalog's own endpoint, warehouse and auth, as reads already did.
+
+- Creating a table in a catalog that places tables itself
+
+    Snowflake Horizon refuses a `CREATE TABLE` that names a location (HTTP
+    400). SQE sent one on every create. On that refusal it now sends the
+    create again without the location and lets the catalog choose it.
+
+- Commits to Snowflake Horizon no longer fail when they come close together
+
+    Horizon refuses a commit that follows the previous one within about half
+    a second: a 409 "concurrently modified" with no failed requirement, or a
+    500 "Indeterminate result during conflict resolution check" that it never
+    applied. Schema commits (ALTER TABLE) now send the same request again,
+    up to four times, 500 ms apart. Data commits back off at least 500 ms on
+    such a 409.
+
+    A commit whose outcome is unknown is retried only when the table provably
+    did not move: SQE waits a second, reloads the table and compares its
+    metadata location with the one the commit was based on. A moved table,
+    or one without a metadata location, returns the original error. Every
+    write and maintenance path now keeps its written files when the outcome
+    is unknown, because a commit that landed references them.
+
+- Distributed scans of files whose column order differs from the table schema
+
+    A worker emits a file's columns in the order the file stores them.
+    Snowflake writes `ts, id, region` into a table declared `id, region, ts`,
+    and a worker without a projection fill bound those columns by position:
+    a distributed `SELECT id, region, ts` read `id` as NULL and `region` as
+    the id. The coordinator now sends the column list and the fill on every
+    scan that reads columns, `SELECT *` included, so the worker matches
+    columns by field id. Only `COUNT(*)` scans go without. The coordinator
+    already refuses to register a worker with an older scan-ticket version,
+    so a mixed cluster fails at startup, not at query time.
+
+- `coordinator.spill_compression` now applies to spill files
+
+    The setting was logged at startup but never passed to DataFusion, so
+    the coordinator wrote every spill file uncompressed. Each coordinator
+    session now sets `datafusion.execution.spill_compression` from it:
+    `lz4` (the default) writes `lz4_frame`, `zstd` writes `zstd`, `none`
+    writes uncompressed.
+
+- A write the object store refuses reports `ACCESS_DENIED`, not `EXECUTION_FAILED` (#880)
+
+    With credential vending, a reader's `DELETE`, `UPDATE` or `MERGE` gets a
+    read-only credential and fails on its first upload. The write path wrapped
+    the store's reply (`PermissionDenied (persistent) ... S3Error AccessDenied`)
+    in a typed `ExecutionFailed`, which no text classifier ever read, so the
+    client saw an execution failure. A typed `ExecutionFailed` whose text
+    carries the store's refusal (OpenDAL `PermissionDenied`, S3 `AccessDenied`)
+    now reports `AccessDenied` (gRPC `PERMISSION_DENIED`, Trino
+    `PERMISSION_DENIED`); an expired or invalid engine key still reports
+    `StorageCredentialsUnavailable`. Other typed codes are unchanged. The
+    statement is still refused only once the store says no; refusing it
+    before the first file is written is part 1 of #880.
+
+- `table_files` returns valid JSON in `partition`, `lower_bounds` and `upper_bounds`
+
+    Bounds on date, time, timestamp, UUID and binary columns came out
+    unquoted, string bounds with a `"` or `\` were not escaped, and NaN or
+    infinite float bounds were bare words, so the column did not parse as
+    JSON. Those bounds are now JSON strings. The `partition` column of
+    `table_files` and `table_partitions` printed Rust's internal Debug form;
+    it is now a JSON array in Iceberg's single-value JSON form.
+
+- `make test-distributed` starts the native workers its distributed tests dial
+
+    Six tests (`test_distributed_select`, the three
+    `rewrite_data_files_distributed_parity` cases,
+    `distributed_rewrite_wall_clock_ratio`,
+    `json_variant_column_scans_on_a_worker`) failed with "worker unreachable at
+    http://localhost:50052" because nothing started a worker there.
+    `scripts/integration-test.sh` now starts two `sqe-server --mode worker`
+    processes on `:50052` and `:50053` when `DISTRIBUTED=1`, waits until they
+    accept, and stops them on exit. `make test` sets `RUST_MIN_STACK` to
+    32 MiB, as CI does.
+
+- A distributed time-travel query reads the columns of the snapshot it asks for
+
+    The coordinator resolved a worker's columns against the table's current
+    schema. After a column was renamed, or dropped and re-added under the same
+    name, `FOR VERSION AS OF` an older snapshot returned NULL for those
+    columns, or read the newer column, whenever the scan ran on a worker. The
+    coordinator's own scan was correct. Both now use the snapshot's schema.
+
+- A worker no longer drops rows when a filter names a renamed column's old name
+
+    The worker bound the pushed filter to file columns by name. After
+    `RENAME COLUMN name TO label` and `ADD COLUMN name`, a filter on the new
+    `name` ran against the old column in older files, and `WHERE name IS NULL`
+    returned no rows. The worker now matches filter columns by field id and
+    skips the filter on a file that lacks the column. Files with physical
+    column names, such as Databricks' `col-1`, now get row-group pruning and
+    late materialization on a worker too.
+
+- A worker filters the right column in a file with a struct column before it
+
+    The worker's row filter found a filter column by its position among the
+    file's leaf columns and read it as a top-level column. With a struct
+    column earlier in the file it evaluated another column and could keep
+    or drop the wrong rows.
+
+- `ORDER BY ... LIMIT` and join dynamic filters reach the Iceberg scan again (#787)
+
+    The parallel-scan and parallel-probe rules re-run `EnsureRequirements`,
+    which rebuilds the TopK sort with a new dynamic filter. The scan kept the
+    old one: nothing updated it, so it never pruned, and every scan partition
+    waited 100 ms for it to seal before reading. `StarSchemaReorderRule` and
+    the self-join strip orphaned join filters the same way.
+
+    A new physical rule, `SettleDynamicFiltersRule`, runs after the
+    parallel rules (coordinator and embedded). It drops scan filters that no
+    plan node produces any more and re-runs DataFusion's post-optimization
+    filter pushdown, so the rebuilt sort or join hands the scan a live
+    filter. TopK and aggregate filters are marked progressive: the scan does
+    not wait for them, and the Parquet row filter reads the current bound on
+    every batch, so rows past it skip decoding the payload columns. File
+    pruning at stream open does not use them yet (no bound exists then). A
+    scan also no longer keeps two copies of a filter pushed twice.
+
+    The Iceberg predicate built from a dynamic filter now converts
+    `col IS [NOT] NULL`. The default descending TopK bound is
+    `col IS NULL OR col > t`, and without the null arm none of it reached
+    row-group pruning. Range comparisons on `FLOAT` / `DOUBLE` no longer
+    convert at all: Parquet min/max statistics leave NaN out, so a row
+    group holding NaN could be pruned for `x > t` while NaN sorts above
+    every number. This also covers join bounds on float keys, which had
+    the same hole before.
+
+    On a 150M-row Polaris table, an integer-key `ORDER BY customer_id
+    DESC|ASC LIMIT 10` decodes about 60 M rows instead of 150 M and runs in
+    2.5-2.7 s instead of 3.8 s (embedded, same binary, pushdown off vs on).
+    A `DOUBLE` key (`ORDER BY price LIMIT 10`) still decodes every row; it
+    gets the removed 840 ms filter wait and a TopK fed about 90 K rows
+    instead of 150 M.
+
+    Joins that `StarSchemaReorderRule` reorders now get dynamic filters,
+    which they lost before. `DistributedScanExec` (worker scans) is not
+    covered yet.
+
+- TPCBB click and review item keys stay inside the TPC-DS item table above SF1 (#785)
+
+    `web_clickstreams` and `product_reviews` drew item keys from `1..=scale * 18,000`, but the TPC-DS `item` table grows sublinearly above SF1 (102,000 rows at SF10, 204,000 at SF100). Above SF1 most keys had no item row: about 43% at SF10 and 89% at SF100. The item joins in q01, q03 and q04 silently lost those rows. Both generators now use the item table's row count. Data at SF1 and below is unchanged. SF10 and larger TPCBB datasets must be regenerated, and their q01, q03 and q04 now match about 1.8 times as many click and review rows at SF10 and 9 times as many at SF100, so those queries get slower than in earlier results.
+
+- TPC-DS `q64` returns rows on generated data at every scale (#785)
+
+    `q64` needs one item, priced 65 to 74 in one of six colours, that a store sold and had returned in both 1999 and 2000, that also sits in the catalog sales whose list price beats twice their refunds, and that was sold under a demographic whose marital status differs from the buyer's current one. About five such pairs exist at SF1 on random data, and our seed had none, so the query came back empty on both SQE and Trino (official SF1: 2 rows). The generator now plants that coincidence like the `q17`, `q24`, `q25` and `q29` ones: item 6, store tickets 7 and 8 at store 1, customer 7, and catalog order 7 with a small return. TPC-DS data must be regenerated.
+
+- The TPC-DS generator writes money and rate columns as the spec's `DECIMAL`, not `DOUBLE`, and TPCBB click keys join their dimension tables (#785)
+
+    All 80 decimal columns of the TPC-DS schema were `Float64`. They now have the spec types from `benchmarks/schemas/tpcds.sql`: money as `DECIMAL(7,2)`, GMT offsets and tax rates as `DECIMAL(5,2)`, `p_cost` as `DECIMAL(15,2)`. Sums no longer depend on summation order, and queries get the same result types as on Trino or Spark. Prices are rounded to cents before the extended amounts are derived, so `ext_sales_price = sales_price * quantity` and `net_paid_inc_tax = net_paid + ext_tax` hold exactly. `ext_tax` is now the tax on the whole line instead of on one unit. The store tax column is renamed `s_tax_precentage`, the spelling in the spec. TPCBB drew `wcs_web_page_sk` from `SF x 2,040` keys, where `web_page` has 60 rows at SF1, and `wcs_click_date_sk` from `SF x 73,049` keys, beyond `date_dim` from SF2 up. Both now come from the TPC-DS tables, with click dates in the 1998-2003 sales window. Data generated before this change must be regenerated, and TPC-DS and TPCBB results from older data are not comparable with newer ones. The `sqe-bench` result comparator no longer treats `100` and `1` as equal: it trims trailing zeros only after a decimal point.
+
+- TPC-DS dimension tables have the official row counts above SF1, and generated keys cover their whole dimension table (#785)
+
+    `customer`, `customer_address`, `store`, `web_site`, `web_page`, `promotion`, `reason`, `call_center` and `catalog_page` grew linearly with the scale factor, where dsdgen grows them much more slowly: at SF10 the generator wrote 1M customers instead of 500,000 and 600 web pages instead of 200, and at SF100 10M customers instead of 2M. They now follow the official counts at every published scale from SF10 to SF100,000, interpolated between them as dsdgen does. `item` and `warehouse` gained the points above SF1,000, where they used to stay flat. Promotions drew their item from the first 18,000 items at every scale, and catalog sales and returns drew their catalog page from a fixed 11,718. Both now use the dimension's row count. Exclusive ranges never drew the last ship mode, household demographic, date, item class, manufacturer, store market or birth month, so `q18`'s `c_birth_month IN (..., 12, ...)` never matched a December birthday. TPCBB click and review users are now TPC-DS customer keys at every scale. Data at SF0.01 to SF1 keeps its row counts but has new values, so it must be regenerated too.
+
+- SQE reads a `timestamptz` column that Databricks or Spark wrote
+
+    A Parquet file without an Arrow schema decodes a UTC-adjusted timestamp
+    as `Timestamp(us, "UTC")`, where SQE plans the column as `"+00:00"`. The
+    scan refused the batch with `column types must match schema types`. Both
+    labels hold UTC instants, so the scan now relabels the column.
+
+- A copy-on-write DELETE, UPDATE, MERGE, INSERT OVERWRITE or truncate commits an `overwrite` snapshot, not a `replace`
+
+    `replace` means the data did not change (compaction). Incremental readers,
+    such as Spark streaming and Databricks, skip those snapshots, so they
+    missed the rows SQE deleted or changed. Compaction still commits
+    `replace`.
+
+- ATTACH of an Iceberg REST catalog no longer fails on one table that does not load
+
+    A Unity Catalog namespace also lists its Delta tables, and loading one
+    answers 400 `not an Iceberg compatible table`. The attached catalog now
+    skips such a table with a warning; the other tables stay readable. The
+    vendored `datafusion-iceberg` carries this as an SQE patch.
+
+- A view body plans like the statement that reads it (ai-portal-data#357, #359)
+
+    An Iceberg view resolved unqualified names in schema `default`, whatever
+    its version's `default-namespace` said, and SQE recorded the view's own
+    namespace there rather than the schema the body was written in. A view
+    created under `USE cat.staging` over `orders` therefore failed or read
+    `default.orders`. SQE now records the creating session's schema as
+    `default-namespace` and plans the body in it; the policy rewriter
+    qualifies the body's scans with the same schema, so it governs the table
+    the view actually reads.
+
+    The body also planned in a bare DataFusion context: `year()`, `if()`
+    and the other Trino functions, the JSON, variant and geo functions were
+    unknown, lambdas did not parse, and `0.06` was a `DOUBLE` where a query
+    has a `DECIMAL`. A view body now plans with the statement's parser
+    dialect, session options and function set, shared through
+    `session_tuning::register_engine_functions`.
+
+    A view SQE created before this change recorded its own namespace, so its
+    unqualified names now resolve there rather than in `default`. Recreate
+    or qualify such a view if its body meant a table in `default`.
+
+- Distributed scans no longer fail on files written with older column types
+
+    Since workers bind pushed predicates by field id, a predicate typed by
+    the table schema met the file's own types: an `int` column since
+    promoted to `bigint`, or a timestamptz the file labels `UTC` where the
+    plan says `+00:00`. The comparison failed at evaluation and the whole
+    scan errored. Workers now coerce the predicate against the file's
+    types before binding it.
+
+- No "Invalid scan task signature" errors right after a coordinator restart
+
+    A restarted coordinator signs scan tickets with a new key, and the
+    worker learns that key from its next heartbeat. The health check
+    marked the worker ready before then. Workers now name the ticket key
+    they hold in the health check reply, and the coordinator waits until
+    it is its own key before it sends scans there. A worker that stays on
+    another coordinator's key for more than a minute is logged as a warning.
+
+- `make test-distributed` without a filter no longer aborts before the distributed tests
+
+    The debug-only stack-overflow repros are now skipped in the distributed
+    run as well.
+
+- A distributed scan reads a `timestamptz` column that Databricks, Spark or pyarrow wrote
+
+    A worker decodes such a column as `Timestamp(us, "UTC")`, where the plan
+    says `"+00:00"`. The coordinator refused the worker's batch with `not a
+    width change or type promotion`, so the query failed whenever the scan
+    was distributed. Both labels hold UTC instants; the coordinator now
+    relabels the column, as the local scan does since the Unity Catalog
+    interop fix. Another time unit is still refused.
+
+- The write-access check from #880 now covers INSERT, streaming ingest and every DELETE / UPDATE / MERGE path, runs on every REST catalog, and refuses a caller whose vended keys are read-only even when the catalog lets the commit through
+
+    The first version ran only in the DELETE / UPDATE / MERGE dispatchers (not on their fallback paths, not on INSERT or ingest) and only with vended credentials, and a principal with `TABLE_WRITE_PROPERTIES` but not `TABLE_WRITE_DATA` passed it and still failed at the first `PutObject`. Every write handler now asks twice, as the caller, right after it loads the target. First the catalog, on every REST catalog: a commit setting `main` to the snapshot it already holds, guarded by an `assert-table-uuid` that can never match, so a compliant catalog authorizes the update, answers a reader 403 and a writer 409, and commits nothing. Then, when the catalog vends credentials, the object store: an empty object is written and deleted under the table's data path with the vended keys. Only a refusal refuses; any other answer logs a warning and the real commit decides. A pass is remembered for 60 seconds per token and table; a grant revoked inside that window is still refused by the real commit.
+
+- `clipboard-win` 5.4.1, which was yanked, is now 5.4.3
+
+    `cargo deny` warned about the yanked crate. It comes in only through
+    `rustyline` in `sqe-cli` (Windows clipboard support). Lockfile change only.
+
+- The Hive Metastore compose stack turns healthy (#866)
+
+    Its healthcheck read from the Thrift port, and a Thrift server never speaks first, so every probe hung until it timed out and `docker compose up --wait` never returned. The probe now only opens the port.
+
+- The join-fallback rerun test no longer races a slow CI runner
+
+    `a_query_refused_by_a_full_pool_reruns_once_there_is_room` released the
+    other query's memory 300 ms after the start. When the first attempt
+    reached its reservation later than that, nothing was refused and the
+    test failed with "the query ran again". The memory is now released
+    after the query was refused and holds the rerun gate.
+
+### Security
+
+- Prepared statements bind their values into the plan on every path; no value becomes SQL text (finding 406)
+
+    Trino `EXECUTE name USING ...`, Flight SQL prepared DML and DDL, and the
+    re-plan of a prepared query whose vended credentials expired used to
+    splice each value into the statement as a literal. They now plan the
+    statement with `$1..$N` markers and bind typed values with DataFusion's
+    `with_param_values`, as Flight SQL prepared queries already did. Every
+    plan a write derives (a MERGE source, an UPDATE or DELETE filter, the
+    partition pruning of a DELETE) binds the same values, before policy
+    enforcement, so Ranger masks and row filters apply as they do to
+    literal SQL. The query log, audit and lineage record the statement with
+    its markers. A value whose type does not fit its placeholder is refused
+    before execution, naming the position and types but not the value; a
+    placeholder assigned in `UPDATE ... SET` or a MERGE clause takes the
+    target column's type. `substitute_placeholders` and `render_bound_sql`
+    are removed. Results of bound statements are not cached. Limits: a
+    DataFusion execution error can still quote a value (a placeholder in a
+    position DataFusion does not type, then a failing cast), and Trino
+    `EXECUTE` of a template with markers in DDL (`DEFAULT`, table
+    properties) now fails where text substitution ran it.
+
+- zstd runs the 0.14.3 code on zstd-safe 8.2.0, which fixes RUSTSEC-2026-0391 and RUSTSEC-2026-0395 to 0406
+
+    arrow/parquet 59, DataFusion 55 and apache-avro require zstd ^0.13. That
+    line pulled in zstd-safe 7.3.0, which carries the unsoundness advisories
+    (use-after-free, double free, uninitialized memory), and zstd 0.13.3
+    carried the reused-context leak. `vendor/zstd` is zstd 0.14.3 as
+    published, labeled 0.13.4 and patched in with `[patch.crates-io]`. 0.14
+    only adds API over 0.13, so the callers build unchanged. cargo-audit
+    still matches the 0.13.4 label against RUSTSEC-2026-0391; that one ignore
+    is recorded with a review date. Drop the patch when DataFusion 56 moves
+    to arrow 60.
+
 ## [0.52.0] — 2026-10-23
 
 ### Added
