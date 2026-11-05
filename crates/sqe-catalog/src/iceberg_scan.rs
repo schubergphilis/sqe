@@ -2090,7 +2090,9 @@ impl ExecutionPlan for IcebergScanExec {
 
                             // Parse Parquet from the in-memory bytes.
                             // `bytes::Bytes` implements `ChunkReader` so this works directly.
-                            let reader_opts = ArrowReaderOptions::new().with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required);
+                            // Optional, not Required: Snowflake writes files with no offset index
+                            // on VARIANT and nested columns, and Required fails the whole file.
+                            let reader_opts = ArrowReaderOptions::new().with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Optional);
                             let reader_md = ArrowReaderMetadata::load(&bytes, reader_opts.clone())
                                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
                             // String view: decode strings straight into the
