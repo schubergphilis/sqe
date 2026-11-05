@@ -433,7 +433,7 @@ async fn spark_reads_an_sqe_shredded_variant_table() {
     let files = sqe_rows(
         &handler,
         &session,
-        "SELECT file_path FROM table_files('default', 'variant_shredded_to_spark')",
+        "SELECT file_path FROM table_files('default', 'variant_shredded_to_spark') WHERE content = 0",
     )
     .await;
     let mut unshredded = Vec::new();
@@ -471,7 +471,7 @@ async fn spark_reads_an_sqe_shredded_variant_table() {
     let rewritten = sqe_rows(
         &handler,
         &session,
-        "SELECT file_path FROM table_files('default', 'variant_shredded_to_spark')",
+        "SELECT file_path FROM table_files('default', 'variant_shredded_to_spark') WHERE content = 0",
     )
     .await;
     let mut rewritten_shredded = true;
@@ -526,7 +526,7 @@ async fn spark_reads_an_sqe_nested_shredded_variant_table() {
     let files = sqe_rows(
         &handler,
         &session,
-        "SELECT file_path FROM table_files('default', 'variant_nested_shredded_to_spark')",
+        "SELECT file_path FROM table_files('default', 'variant_nested_shredded_to_spark') WHERE content = 0",
     )
     .await;
     let mut schemas = Vec::new();

@@ -41,7 +41,7 @@ async fn file_count(
     let b = exec(
         handler,
         session,
-        &format!("SELECT COUNT(*) FROM table_files('{ns}', '{t}')"),
+        &format!("SELECT COUNT(*) FROM table_files('{ns}', '{t}') WHERE content = 0"),
     )
     .await;
     b[0].column(0)

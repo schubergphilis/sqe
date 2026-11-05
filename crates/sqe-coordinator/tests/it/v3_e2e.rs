@@ -35,7 +35,9 @@ async fn live_data_file_count(
     let batches = handler
         .execute(
             session,
-            &format!("SELECT COUNT(*) FROM table_files('{namespace}', '{table}')"),
+            &format!(
+                "SELECT COUNT(*) FROM table_files('{namespace}', '{table}') WHERE content = 0"
+            ),
             None,
         )
         .await
@@ -594,13 +596,46 @@ async fn position_deletes_on_v3_table() {
 
     // Position-delete mode never rewrites data files; the live data
     // file count must therefore stay at 3 after the DELETE. (CoW would
-    // drop it to 2.) The position-delete file itself sits in the
-    // delete manifest and is invisible to `table_files`.
+    // drop it to 2.) The deletion vector itself is a `content = 1` row.
     let files_after = live_data_file_count(&handler, &session, ns, name).await;
     assert_eq!(
         files_after, 3,
         "MoR DELETE on V3 table must NOT rewrite data files: \
          before={files_before} after={files_after}"
+    );
+
+    // `table_files` lists the vector, as Spark's `files` and Trino's
+    // `$files` do: content 1, a Puffin file, the data file it applies to,
+    // and the blob's offset and length.
+    let dv = handler
+        .execute(
+            &session,
+            &format!(
+                "SELECT file_format, referenced_data_file, content_offset, \
+                 content_size_in_bytes FROM table_files('{ns}', '{name}') \
+                 WHERE content = 1"
+            ),
+            None,
+        )
+        .await
+        .expect("table_files delete rows");
+    let dv_rows: usize = dv.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(dv_rows, 1, "one deletion vector after one DELETE");
+    let dv = &dv[dv.iter().position(|b| b.num_rows() > 0).unwrap()];
+    let format = dv
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .unwrap();
+    assert!(
+        format.value(0).eq_ignore_ascii_case("puffin"),
+        "{}",
+        format.value(0)
+    );
+    assert!(!dv.column(1).is_null(0), "a DV names its data file");
+    assert!(
+        !dv.column(2).is_null(0) && !dv.column(3).is_null(0),
+        "a DV has offset and size"
     );
     let summary = latest_summary(&handler, &session, ns, name).await;
     assert!(summary.contains("\"added-dvs\":\"1\""), "one DV: {summary}");
