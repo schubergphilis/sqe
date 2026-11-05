@@ -3752,11 +3752,15 @@ impl QueryHandler {
     /// carries its `$n` placeholders (no values are bound yet). Returns
     /// `None` for statement kinds the streaming path does not run (DML, DDL,
     /// metadata); those keep executing through the buffered text path.
+    ///
+    /// The schema is the analyzed one, the types the stream will carry (the
+    /// analyzer types decimal arithmetic, #785); a plan whose placeholders
+    /// the analyzer cannot type yet keeps the planned schema.
     pub async fn plan_prepared_statement(
         &self,
         session: &Session,
         numbered_sql: &str,
-    ) -> sqe_core::Result<Option<LogicalPlan>> {
+    ) -> sqe_core::Result<Option<(LogicalPlan, SchemaRef)>> {
         reject_oversized_sql(&self.config.query, numbered_sql)?;
         let kind = classify_user_sql(session, numbered_sql)?;
         // Inside a transaction a stored plan would pin the tables it loaded
@@ -3771,7 +3775,9 @@ impl QueryHandler {
         let (plan, _tt_cleanup) = self
             .plan_sql_for_stream(&ctx, &session_catalog, session, numbered_sql, None)
             .await?;
-        Ok(Some(plan))
+        let schema = sqe_catalog::file_tvf_prepare::analyzed_schema(&ctx, &plan)
+            .unwrap_or_else(|_| Arc::clone(plan.schema()));
+        Ok(Some((plan, Arc::new(schema.as_arrow().clone()))))
     }
 
     #[tracing::instrument(

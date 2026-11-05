@@ -11,17 +11,19 @@ use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::optimizer::{Optimizer, OptimizerRule};
+use datafusion::optimizer::{Analyzer, AnalyzerRule, Optimizer, OptimizerRule};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::eliminate_cross_join::EliminateCrossJoin;
 
+mod decimal_arithmetic;
 mod decimal_rounding;
 mod sorted_row_number;
 mod top_row_number;
 
+pub use decimal_arithmetic::{DecimalArithUdf, DecimalArithmeticRule, TrinoSum, DECIMAL_ARITH};
 pub use decimal_rounding::{
     register_decimal_rounding, register_rescale, DecimalRoundingRule, RescaleUdf, RoundedAvg,
     RESCALE,
@@ -32,14 +34,16 @@ pub use top_row_number::TopRowNumberRule;
 /// A context for user SQL: `config` and `runtime`, planned by
 /// [`EngineQueryPlanner`], with SQE's [`EliminateCrossJoin`] in place of
 /// DataFusion's and [`SortedRowNumberRule`] after DataFusion's physical rules.
-/// Decimal division, `avg` and decimal casts round half away from zero
-/// ([`DecimalRoundingRule`], [`RoundedAvg`]).
+/// Decimal arithmetic and `sum` take Trino's result types
+/// ([`DecimalArithmeticRule`], [`TrinoSum`]); decimal division, `avg` and
+/// decimal casts round half away from zero ([`DecimalRoundingRule`],
+/// [`RoundedAvg`]).
 pub fn engine_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> SessionContext {
     let state = SessionStateBuilder::new()
         .with_config(config)
         .with_runtime_env(runtime)
         .with_default_features()
-        .with_analyzer_rule(Arc::new(DecimalRoundingRule))
+        .with_analyzer_rules(engine_analyzer_rules())
         .with_optimizer_rules(engine_optimizer_rules())
         .with_physical_optimizer_rule(Arc::new(SortedRowNumberRule))
         .with_query_planner(Arc::new(EngineQueryPlanner))
@@ -47,6 +51,20 @@ pub fn engine_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> Sessio
     let ctx = SessionContext::new_with_state(state);
     register_decimal_rounding(&ctx);
     ctx
+}
+
+/// DataFusion's analyzer rules with [`DecimalArithmeticRule`] before type
+/// coercion, so coercion types every parent against Trino's decimal types,
+/// and [`DecimalRoundingRule`] after it.
+fn engine_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
+    let mut rules = Analyzer::new().rules;
+    let at = rules
+        .iter()
+        .position(|r| r.name() == "type_coercion")
+        .unwrap_or(rules.len());
+    rules.insert(at, Arc::new(DecimalArithmeticRule));
+    rules.push(Arc::new(DecimalRoundingRule));
+    rules
 }
 
 /// DataFusion's default logical rules, with `eliminate_cross_join` swapped
