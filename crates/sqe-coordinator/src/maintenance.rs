@@ -1453,6 +1453,7 @@ impl MaintenanceHandler {
         let committed = tx_applied
             .commit(catalog.as_ref())
             .await
+            .inspect_err(|e| cleanup_guard.keep_if_outcome_unknown(e))
             .map_err(|e| classify_commit_error(e, "rewrite_data_files"))?;
         cleanup_guard.mark_committed();
         let new_snapshot_id = committed.metadata().current_snapshot_id();

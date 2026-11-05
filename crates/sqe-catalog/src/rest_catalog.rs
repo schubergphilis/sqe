@@ -3056,6 +3056,44 @@ impl SessionCatalog {
     }
 }
 
+/// Sends of one schema/metadata commit, the first included.
+const SCHEMA_COMMIT_ATTEMPTS: u32 = 4;
+/// First pause before a resend; doubles each time (500, 1000, 2000 ms).
+const SCHEMA_COMMIT_BACKOFF_MS: u64 = 500;
+
+/// True when a schema commit cannot apply twice: it asserts the current
+/// schema id and its own updates change that id. Had a first send landed
+/// despite an error, a resend fails on the requirement instead.
+fn schema_commit_guards_itself(updates: &[TableUpdate], requirements: &[TableRequirement]) -> bool {
+    requirements
+        .iter()
+        .any(|r| matches!(r, TableRequirement::CurrentSchemaIdMatch { .. }))
+        && updates
+            .iter()
+            .any(|u| matches!(u, TableUpdate::SetCurrentSchema { .. }))
+}
+
+/// Whether a refused schema/metadata commit may be sent again, unchanged.
+///
+/// Snowflake Horizon refuses a commit that reaches a table within about half
+/// a second of that table's previous commit, as a 409 "concurrently
+/// modified" or a 500 "Indeterminate result during conflict resolution
+/// check". Neither applied, and the same body succeeds half a second later.
+///
+/// - A 409 conflict never applied, so it may go again, except "Requirement
+///   failed": the table really moved, and the same body fails the same way.
+/// - A 5xx's outcome is unknown. It goes again only when `guarded`
+///   ([`schema_commit_guards_itself`]), so it can never apply twice.
+fn schema_commit_may_resend(e: &SqeError, guarded: bool) -> bool {
+    match e {
+        SqeError::IcebergCommitConflict(msg) => {
+            !msg.to_ascii_lowercase().contains("requirement failed")
+        }
+        SqeError::CatalogHttp { status, .. } => *status >= 500 && guarded,
+        _ => false,
+    }
+}
+
 /// Typed error for a non-2xx Iceberg REST answer. Status codes carry the
 /// classification ([`SqeError::error_code`]); a 409 on a commit is the
 /// retryable [`SqeError::IcebergCommitConflict`].
@@ -3761,15 +3799,38 @@ impl SessionCatalog {
         });
 
         debug!(url = %url, table = %table_ident, "Committing schema update via Iceberg REST");
-        self.rest_request(
-            sqe_core::CatalogOp::Commit,
-            reqwest::Method::POST,
-            &url,
-            Some(body),
-            &[],
-        )
-        .await
-        .map_err(|e| match e {
+        let guarded = schema_commit_guards_itself(&updates, &requirements);
+        let mut attempt = 1;
+        let result = loop {
+            let sent = self
+                .rest_request(
+                    sqe_core::CatalogOp::Commit,
+                    reqwest::Method::POST,
+                    &url,
+                    Some(body.clone()),
+                    &[],
+                )
+                .await;
+            match sent {
+                Err(e)
+                    if attempt < SCHEMA_COMMIT_ATTEMPTS
+                        && schema_commit_may_resend(&e, guarded) =>
+                {
+                    let backoff = SCHEMA_COMMIT_BACKOFF_MS << (attempt - 1);
+                    warn!(
+                        table = %table_ident,
+                        attempt,
+                        backoff_ms = backoff,
+                        error = %e,
+                        "schema commit refused; sending it again unchanged"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                    attempt += 1;
+                }
+                other => break other,
+            }
+        };
+        result.map_err(|e| match e {
             SqeError::CatalogHttp { status, op, body } => SqeError::CatalogHttp {
                 status,
                 op,
@@ -4266,6 +4327,52 @@ impl Catalog for SessionCatalogBridge {
             self.session.invalidate_table_all_tokens(&ident).await;
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod schema_commit_resend_tests {
+    use super::{map_rest_status, schema_commit_guards_itself, schema_commit_may_resend};
+    use iceberg::{TableRequirement, TableUpdate};
+    use sqe_core::CatalogOp;
+
+    const HORIZON_500: &str = r#"{"error":{"message":"Unknown error status for identifier S.t: UNEXPECTED_ERROR_SIGNALED with extraInfo: Indeterminate result during conflict resolution check","type":"IllegalStateException","code":500}}"#;
+    const HORIZON_409: &str = r#"{"error":{"message":"Failed to commit Table or View S.t because it was concurrently modified","type":"CommitConflictException","code":409}}"#;
+    const REQUIREMENT_409: &str = r#"{"error":{"message":"Requirement failed: current schema changed: expected id 2 != 3","type":"CommitFailedException","code":409}}"#;
+
+    fn alter_parts() -> (Vec<TableUpdate>, Vec<TableRequirement>) {
+        (
+            vec![TableUpdate::SetCurrentSchema { schema_id: -1 }],
+            vec![TableRequirement::CurrentSchemaIdMatch {
+                current_schema_id: 0,
+            }],
+        )
+    }
+
+    /// An ALTER asserts the schema id it replaces, so it cannot apply twice;
+    /// a property or spec commit without requirements can.
+    #[test]
+    fn only_a_schema_id_assert_with_a_schema_switch_guards_itself() {
+        let (updates, requirements) = alter_parts();
+        assert!(schema_commit_guards_itself(&updates, &requirements));
+        assert!(!schema_commit_guards_itself(&updates, &[]));
+        assert!(!schema_commit_guards_itself(&[], &requirements));
+    }
+
+    /// Horizon's two refusals go again; a failed requirement and an
+    /// unguarded 5xx do not, nor does any other status.
+    #[test]
+    fn horizon_refusals_resend_and_nothing_else_does() {
+        let conflict = map_rest_status(CatalogOp::Commit, 409, HORIZON_409.into());
+        let unknown = map_rest_status(CatalogOp::Commit, 500, HORIZON_500.into());
+        let requirement = map_rest_status(CatalogOp::Commit, 409, REQUIREMENT_409.into());
+        let bad_request = map_rest_status(CatalogOp::Commit, 400, "bad".into());
+
+        assert!(schema_commit_may_resend(&conflict, false));
+        assert!(schema_commit_may_resend(&unknown, true));
+        assert!(!schema_commit_may_resend(&unknown, false));
+        assert!(!schema_commit_may_resend(&requirement, true));
+        assert!(!schema_commit_may_resend(&bad_request, true));
     }
 }
 
