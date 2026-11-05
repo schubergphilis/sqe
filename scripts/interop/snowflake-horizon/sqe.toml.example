@@ -1,0 +1,64 @@
+# SQE coordinator for the Snowflake Horizon interop run.
+# Replace every <...>. The bearer token is a Horizon access token minted from
+# the Snowflake user's key pair (`run.py token`); SQE passes it through to
+# Horizon. There is no service account.
+#
+# bearer_passthrough, not bearer_token: a Horizon access token is opaque to
+# SQE (there is no public JWKS to validate it against), so the coordinator
+# forwards it and Horizon is the one that authenticates it. Use this provider
+# on a test rig only.
+#
+# Coordinator-local: drop worker_urls, worker_secret and the [query] block.
+# Distributed: start a worker first (`sqe-server --mode worker`), then this
+# coordinator. The worker's file is a full copy of this one (it still needs
+# [coordinator], [auth] and the catalogs) plus the two blocks below: the
+# metrics port moves so it does not collide with the coordinator's.
+#
+# [worker]
+# coordinator_url = "http://127.0.0.1:50061"
+# flight_port = 50071
+# advertise_url = "http://127.0.0.1:50071"
+# worker_secret = "<the same random hex>"
+#
+# [metrics]
+# prometheus_port = 9190
+
+[coordinator]
+flight_sql_port = 50061
+mode = "coordinator"
+worker_urls = ["http://127.0.0.1:50071"]
+worker_secret = "<random hex, the same on the worker>"
+distributed_credentials = "vended"
+
+[auth]
+keycloak_url = "http://unused.invalid"
+realm = "unused"
+client_id = "unused"
+client_secret = ""
+
+[[auth.providers]]
+type = "bearer_passthrough"
+user = "sf-interop"
+
+# The legacy [catalog] block must exist; with [catalogs.*] present a
+# placeholder URL is enough and it is dropped at startup.
+[catalog]
+catalog_url = "http://unused.invalid"
+
+# Horizon vends storage credentials only when asked for them.
+[catalogs.sf]
+catalog_url = "https://<orgname>-<accountname>.snowflakecomputing.com/polaris/api/catalog"
+warehouse = "SQE_INTEROP"
+metadata_cache_ttl_secs = 30
+access_delegation = "vended-credentials"
+
+[storage]
+s3_region = "<region of the Snowflake account>"
+
+[policy]
+engine = "passthrough"
+
+# Every scan goes to the worker, so the distributed path is what is tested.
+[query]
+distribution_threshold = "0"
+distribution_file_threshold = 0
