@@ -269,6 +269,124 @@ mod grouping_sets_empty_input {
     }
 }
 
+/// apache/datafusion#24421, backported in `vendor/datafusion-physical-plan`:
+/// a filter that pins a grouped column (`k2 = 'TN'`) must not make that
+/// column constant above a ROLLUP, which emits it as NULL in its subtotal
+/// rows. TPC-DS q27 at SF10 returned duplicate `(i_item_id, s_state)` groups
+/// and subtotals in the wrong order.
+#[cfg(test)]
+mod grouping_sets_constant_key {
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::util::pretty::pretty_format_batches;
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+
+    const ROLLUP: &str = "SELECT k1, k2, GROUPING(k2) AS g, SUM(v) AS s FROM t \
+                          WHERE k2 = 'TN' GROUP BY ROLLUP (k1, k2)";
+
+    fn ctx() -> SessionContext {
+        let ctx = SessionContext::new_with_config(
+            super::engine_session_config()
+                .with_target_partitions(4)
+                .with_batch_size(8),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k1", DataType::Utf8, true),
+            Field::new("k2", DataType::Utf8, true),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        // Every k1 appears in every partition, in both states, so each
+        // group's partial states meet in the final aggregate.
+        let partitions = (0..4)
+            .map(|p| {
+                let k1: Vec<String> = (0..200).map(|i| format!("item{:03}", i % 50)).collect();
+                let k2: Vec<&str> = (0..200)
+                    .map(|i| if i % 4 == 3 { "TX" } else { "TN" })
+                    .collect();
+                let v: Vec<i64> = (0..200).map(|i| i + p).collect();
+                vec![
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            Arc::new(StringArray::from(k1)),
+                            Arc::new(StringArray::from(k2)),
+                            Arc::new(Int64Array::from(v)),
+                        ],
+                    )
+                    .unwrap(),
+                ]
+            })
+            .collect();
+        ctx.register_table(
+            "t",
+            Arc::new(MemTable::try_new(schema, partitions).unwrap()),
+        )
+        .unwrap();
+        ctx
+    }
+
+    async fn rows(ctx: &SessionContext, sql: &str) -> String {
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        pretty_format_batches(&batches).unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn order_by_keeps_the_rolled_up_key() {
+        let ctx = ctx();
+        let plan = rows(&ctx, &format!("EXPLAIN {ROLLUP} ORDER BY k1, k2")).await;
+        assert!(
+            plan.contains("SortExec: expr=[k1@0 ASC NULLS LAST, k2@1 ASC NULLS LAST]"),
+            "the sort must keep k2\n{plan}"
+        );
+        assert!(
+            !plan.contains("ordering_mode"),
+            "no sorted-input aggregate\n{plan}"
+        );
+
+        // Detail row before the subtotal for each k1, as Trino returns them.
+        let out = rows(
+            &ctx,
+            &format!("SELECT k1, k2, g FROM ({ROLLUP}) ORDER BY k1, k2 LIMIT 4"),
+        )
+        .await;
+        let expected = "\
++---------+----+---+
+| k1      | k2 | g |
++---------+----+---+
+| item000 | TN | 0 |
+| item000 |    | 1 |
+| item001 | TN | 0 |
+| item001 |    | 1 |
++---------+----+---+";
+        assert_eq!(out, expected, "\n{out}");
+    }
+
+    #[tokio::test]
+    async fn every_group_comes_out_once() {
+        let ctx = ctx();
+        let out = rows(
+            &ctx,
+            &format!(
+                "SELECT COUNT(*) AS n, COUNT(DISTINCT (k1, k2, g)) AS d, SUM(s) AS total \
+                 FROM ({ROLLUP})"
+            ),
+        )
+        .await;
+        // 50 detail rows, 50 subtotals, 1 grand total. Each level sums the
+        // same TN rows: 3 * the TN sum over all partitions.
+        let tn_sum: i64 = (0..4)
+            .flat_map(|p| (0..200).filter(|i| i % 4 != 3).map(move |i| i + p))
+            .sum();
+        assert!(
+            out.contains(&format!("| 101 | 101 | {} |", 3 * tn_sum)),
+            "\n{out}"
+        );
+    }
+}
+
 /// apache/datafusion#26054: a MIN/MAX in the recursive term of a recursive
 /// CTE must give the same value on every iteration.
 #[cfg(test)]
