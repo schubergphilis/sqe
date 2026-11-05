@@ -1,18 +1,22 @@
 ---
-title: Performance - SQE vs Trino 481
-description: SQE is faster than Trino 481 in all eight benchmark suites at SF1 and six of seven at SF10, every query differentially validated against Trino with DuckDB's dbgen/dsdgen as an independent data oracle.
+title: Performance - SQE vs Trino 481, DuckDB, Polars and Spark
+description: SQE is faster than Trino 481 in all eight benchmark suites at SF1 and in three of four at SF10, every answer checked against Trino. On 150M rows under a 4.5 GiB cap it finishes every run with a lower geomean than DuckDB and Spark, where Polars is killed on the window query.
 ---
 
-# Eight of eight suites. Faster than Trino.
+# Eight of eight suites at SF1. Faster than Trino.
 
-Differentially validated against Trino 481, with DuckDB's official dbgen/dsdgen as an independent data oracle.
+Every answer is checked against Trino 481. Since 4 November the check compares every value, not only the row count, on data generated to the TPC specs and checked against their official row counts.
 
-## Where we stand: ahead at SF1, and at SF10 too
+## Where we stand against Trino
 
-Faster than Trino at SF1 across all eight industry suites (10 October 2026 sweep), and on six of seven at SF10 (9 July 2026, the latest SF10 run).
+Faster than Trino at SF1 across all eight industry suites (2 and 4 November 2026). At SF10, rerun on 4 November on the fixed data generator, SQE leads on three of four suites: TPC-H 1.3x, TPC-DS 1.8x and TPCx-BB 4.3x, by total time.
 
-The SF10 crossover is closed. SSB, the suite we trailed longest, is now at parity at SF10 after shipping build-side key sets to workers. TPC-H and TPC-DS lead at SF10.
+SSB is the exception, shown rather than hidden. At SF10 it takes SQE 27.9 s against Trino's 11.8 s. It was at parity in July, so SSB lost ground, and its trace is next. TPC-DS matches Trino on 91 of 99 queries at SF10. Six of the eight differences are decimal digits: Trino keeps the input's scale for `avg` and carries fewer digits in some quotients.
+
+## Against DuckDB, Polars and Spark
+
+On the public engine-bench workload, 150M rows under a 4.5 GiB kill threshold, SQE on Parquet has the lowest geomean: 1.79 s against DuckDB's 2.77 s, Polars killed on the window query and Spark at 16.55 s. Every engine's answer matches DuckDB's. All three SQE modes finish every run under the cap; on Parquet SQE peaks at 2.1 GiB. With every engine reading from S3, SQE over Polaris is no slower than DuckDB on any query.
 
 ## Benchmark note
 
-One exception, shown rather than hidden: the bank suite at SF10, where spill degraded under an 8 GB pool in the July run; the October spill fixes have not been measured at SF10 yet. TPC-C's sub-second reads, which trailed at SF1 in July, are now 4.9x faster than Trino. Full per-query method plus the cross-scale charts: docs, or run it yourself via the benchmark quickstart.
+The SF10 runs are from one laptop, with SQE native and Trino in Docker under a 10 GB cap. Treat them as one data point, not a final result. Bank, ClickBench, TPC-C and TPC-E have not been rerun at SF10 since July, when they ran on a dedicated 8-core host. Full per-query method plus the cross-scale charts: docs, or run it yourself via the benchmark quickstart.
