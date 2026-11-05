@@ -17,7 +17,7 @@ The method is the same as before. Each engine writes, the other reads, both run 
 
 ## No service account
 
-Snowflake has no browser login for a machine client, so the user has a key pair. The private key signs a JWT, and Horizon's token endpoint trades that JWT for an access token scoped to one Snowflake role. SQE passes the token through to Horizon on every call. Horizon decides what the role may see and vends short-lived storage credentials for those tables. SQE holds no key of its own.
+A machine client has no browser to log in with, so the user has a key pair. The private key signs a JWT, and Horizon's token endpoint trades that JWT for an access token scoped to one Snowflake role. SQE passes the token through to Horizon on every call. Horizon decides what the role may see and vends short-lived storage credentials for those tables. SQE holds no key of its own.
 
 ```toml
 [[auth.providers]]
@@ -83,7 +83,7 @@ The bug was older than Snowflake. An earlier fix had moved the coordinator's sma
 
 Snowflake's DELETE, UPDATE and MERGE are copy-on-write on V2 and on V3. The run checked every snapshot, and none of them had a delete file. So the run cannot show SQE reading a deletion vector that Snowflake wrote, because Snowflake does not write one.
 
-The other direction works. One of SQE's tables is merge-on-read, so SQE's DELETE on it writes a deletion vector. Snowflake reads that table correctly. A later Snowflake DELETE on it folds the vector into a rewritten file, and SQE reads that back too.
+The other direction works. One of SQE's tables is merge-on-read, so SQE's DELETE on it writes a deletion vector. Snowflake reads that table and drops the deleted rows, and the compare checks it in every SQE mode. In a separate probe, Snowflake ran its own DELETE on the same table, and SQE read the result back correctly.
 
 ## 33, 33, 33
 
