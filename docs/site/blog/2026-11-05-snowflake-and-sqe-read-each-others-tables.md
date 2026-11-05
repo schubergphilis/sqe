@@ -97,14 +97,23 @@ The other direction works too. One of SQE's tables is merge-on-read, so SQE's DE
 
 After those fixes, embedded matched 40 of 40, the single coordinator 40 of 40, and the coordinator with a worker 40 of 40. The worker scanned all 40 reads. We ran the Databricks harness again on the same build, to check that the fill, the commit changes and the parquet upgrade broke nothing there. It matched 27 of 27 in all three modes, including Databricks' own deletion vectors read on the worker.
 
+## Names
+
+Both engines match names exactly, but they fold unquoted names in opposite directions. Snowflake upper-cases them and SQE lower-cases them, as PostgreSQL and Trino do. So every Snowflake table needed quotes in SQE: `sf."SALES"."ORDERS"`, `"ID"`. The harness quotes every name, and nobody would write queries that way.
+
+A catalog now sets `identifier_case = "upper"`, or `IDENTIFIER_CASE 'upper'` on `ATTACH`. SQE then folds unquoted names for that catalog the Snowflake way, so `SELECT id FROM sf.sales.orders` finds `SALES.ORDERS` and its `ID` column. `USE sf.sales` folds too. Columns fold only when every table in the statement is in an upper-case catalog. A join with a lower-case catalog folds the table names and leaves the columns to be quoted.
+
+The fold runs before policy rewriting, so a folded query is governed exactly like the same query quoted by hand. A mask on `ssn` still covers `SSN`. A row filter is not folded, so it quotes its Snowflake column: `"REGION" = 'EU'`. An unquoted `region` there names a column that does not exist, and the query fails. It never returns the rows the filter was meant to hide.
+
+The fold copies Snowflake's cost along with its rule. A table SQE writes with lower-case names into that catalog needs quotes in SQE, just as it does in Snowflake.
+
 ## What else the run found
 
 None of these change a value.
 
-- Snowflake upper-cases unquoted names, and SQE folds them to lower case. A Snowflake table is `sf."SALES"."ORDERS"` from SQE, and an SQE table is `"orders"` from Snowflake. A catalog set to `identifier_case = "upper"` folds the Snowflake way, so `sf.sales.orders` works unquoted.
 - `ST_AREA` on an Iceberg `GEOMETRY` comes back negative in Snowflake, whichever engine wrote the table: -12 for the rectangle whose literal gives 12. The harness compares the absolute value.
 - An external volume encrypted with a customer KMS key does not work. The credentials Horizon vends cannot decrypt, so even loading a table fails with 403. Snowflake-managed storage works.
-- `$files` lists data files only. Delete files and deletion vectors show in the `$snapshots` summary instead.
+- `$files` lists data files only. Delete files and deletion vectors show in the `$snapshots` summary instead. Spark and Trino list them in `files` with a `content` column, and SQE should too.
 
 ## Why run it by hand
 
