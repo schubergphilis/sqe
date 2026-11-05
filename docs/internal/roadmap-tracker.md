@@ -94,7 +94,7 @@
 - [ ] Helm chart for Kubernetes deployment
 - [ ] CoW DML scales to TPC-E SF100 (`cow-dml-parallel-streaming`: parallelise per-file rewrite + stream writes + drop double-WHERE; targets `trade_result_update_holding` under 120 s at SF100)
 - [ ] Parallel + streaming generation for the other 6 benchmarks (SSB, TPC-DS, TPC-C, TPC-E, TPC-BB, ClickBench)
-- [x] Snowflake Horizon catalog: live integration test against a real Snowflake account (`scripts/interop/snowflake-horizon/`, 2026-11-05: read, write and DML both ways, 33/33 compared reads in embedded, coordinator and distributed mode)
+- [x] Snowflake Horizon catalog: live integration test against a real Snowflake account (`scripts/interop/snowflake-horizon/`, 2026-11-05: read, write and DML both ways, 40/40 compared reads in embedded, coordinator and distributed mode, including Snowflake position deletes and deletion vectors on 1M-row merge-on-read tables)
 - [ ] V12.2: custom `HfObjectStore` plugged into `LazyHttpObjectStoreRegistry` so `SELECT * FROM 'hf://datasets/foo/bar/**/*.parquet'` enumerates files via the HF tree API and the V12 SQL pre-rewriter retires (design in `docs/site/book/src/design-notes/hf-glob-research.md`)
 
 ## Planned

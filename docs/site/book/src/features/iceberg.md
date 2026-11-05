@@ -119,21 +119,23 @@ The interop run in `scripts/interop/snowflake-horizon/` follows the Databricks r
 
 | Direction | What it covers |
 |---|---|
-| Snowflake writes, SQE reads | scalar types including `TIMESTAMP_LTZ`, `TIMESTAMP_NTZ`, nanosecond timestamps, `BINARY` and `TIME`, `OBJECT`, `ARRAY` and `MAP`, identity and month partitions, schema evolution, V3 `VARIANT`, `GEOMETRY(4326)` and `GEOGRAPHY` |
+| Snowflake writes, SQE reads | scalar types including `TIMESTAMP_LTZ`, `TIMESTAMP_NTZ`, nanosecond timestamps, `BINARY` and `TIME`, `OBJECT`, `ARRAY` and `MAP`, identity and month partitions, schema evolution, V3 `VARIANT`, `GEOMETRY(4326)` and `GEOGRAPHY`, position deletes (V2) and deletion vectors (V3) from merge-on-read DML |
 | SQE writes, Snowflake reads | CREATE, CTAS, INSERT, UPDATE, DELETE, MERGE, ALTER, V2 and V3 tables, `VARIANT`, `GEOMETRY`, a deletion vector from a merge-on-read DELETE |
 | Snowflake DML on SQE tables | DELETE, UPDATE and INSERT, including a DELETE over SQE's deletion vector |
 | SQE DML on Snowflake tables | DELETE, UPDATE and MERGE, on V2 and V3 tables |
 
-All 33 reads match in embedded mode, against a single coordinator, and against a coordinator with a worker. The run found three things SQE now handles:
+All 40 reads match in embedded mode, against a single coordinator, and against a coordinator with a worker. The run found four things SQE now handles:
 
 - **Table placement.** Horizon refuses a `CREATE TABLE` that names a location. SQE resends the create without one, and Horizon places the table.
 - **Commit pacing.** A commit that follows the previous one within about half a second is refused, with a 409 that names no failed requirement or a 500 "Indeterminate result". Neither was applied. SQE resends schema commits, backs data commits off at least 500 ms, and retries an unknown outcome only after a reload shows the table did not move.
-- **File layout.** Snowflake writes parquet columns in an order of its own and adds row-lineage columns. A worker matched columns by position and returned values under the wrong names. Every projected worker scan now carries a projection fill, and the worker matches by field id.
+- **File layout.** Snowflake writes parquet columns in an order of its own and adds row-lineage columns. A worker matched columns by position and returned values under the wrong names. Every worker scan that reads columns now carries a projection fill, `SELECT *` included, and the worker matches by field id.
+- **Delete files.** Snowflake encodes integer columns with 512-value `DELTA_BINARY_PACKED` miniblocks, and parquet before 59.3.2 could not skip rows inside one. Applying a Snowflake position delete or deletion vector failed with "cannot skip miniblock of size 512". SQE now builds against parquet 59.3.2.
 
 Known gaps from the same run:
 
 - Snowflake upper-cases unquoted names and SQE folds them to lower case, so quote Snowflake's names: `sf."SALES"."ORDERS"`.
-- Snowflake's DELETE, UPDATE and MERGE are copy-on-write on V2 and V3. The run covers Snowflake reading SQE's deletion vectors, not the reverse.
+- Snowflake rewrites small tables copy-on-write whatever the table's merge-on-read setting. Its delete files appear only on large tables with `ICEBERG_MERGE_ON_READ_BEHAVIOR = 'enabled'`; the harness uses 1M rows.
+- `$files` lists data files only. Delete files and deletion vectors show in the `$snapshots` summary.
 - `ST_AREA` on an Iceberg `GEOMETRY` comes back negative in Snowflake, whichever engine wrote the table.
 - An external volume encrypted with a customer KMS key fails: the credentials Horizon vends lack `kms:Decrypt`. Use Snowflake-managed storage.
 - A Horizon access token lives about an hour.

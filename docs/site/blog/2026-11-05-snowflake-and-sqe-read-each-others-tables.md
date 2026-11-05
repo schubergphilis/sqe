@@ -1,6 +1,6 @@
 ---
 title: "Snowflake and SQE read each other's tables"
-description: "A live run against Snowflake's Horizon catalog: each engine writes Iceberg tables the other reads, both run DML on the other's tables, and 33 reads are compared value by value. All 33 match in every SQE mode. Getting there took seven fixes, among them a distributed read that put one column's values under another column's name."
+description: "A live run against Snowflake's Horizon catalog: each engine writes Iceberg tables the other reads, both run DML on the other's tables, and 40 reads are compared value by value. All 40 match in every SQE mode. Getting there took eight fixes, among them a distributed read that put one column's values under another column's name and a parquet decoder that could not apply Snowflake's deletion vectors."
 pubDate: "2026-11-05"
 author: "Jacob Verhoeks"
 tags:
@@ -46,11 +46,11 @@ Snowflake also pins an Iceberg `GEOMETRY` column to SRID 4326. SQE reads it as `
 
 The harness is in `scripts/interop/snowflake-horizon/`, a Python driver and five SQL files.
 
-1. Snowflake creates its tables: the scalar types including `TIMESTAMP_LTZ`, `TIMESTAMP_NTZ` and nanosecond timestamps, `BINARY` and `TIME`, objects, arrays and maps, identity and month partitions, a table with schema changes, and V3 tables with `VARIANT`, `GEOMETRY` and `GEOGRAPHY`. Then it runs DELETE and UPDATE on them.
+1. Snowflake creates its tables: the scalar types including `TIMESTAMP_LTZ`, `TIMESTAMP_NTZ` and nanosecond timestamps, `BINARY` and `TIME`, objects, arrays and maps, identity and month partitions, a table with schema changes, and V3 tables with `VARIANT`, `GEOMETRY` and `GEOGRAPHY`, and two merge-on-read tables of a million rows each. Then it runs DELETE and UPDATE on them.
 2. SQE creates its own set in the same schema with CREATE, CTAS, INSERT, UPDATE, DELETE, MERGE and ALTER.
 3. Snowflake runs DELETE, UPDATE and INSERT on SQE's tables.
 4. SQE runs DELETE, UPDATE and MERGE on Snowflake's tables.
-5. Thirty-three reads run on both engines, and the rows are compared value by value.
+5. Forty reads run on both engines, and the rows are compared value by value.
 6. SQE's metadata commands run against the result.
 
 Phase 5 runs once per SQE mode: the embedded CLI, a single coordinator, and a coordinator with one worker. In the last mode every scan goes to the worker.
@@ -71,23 +71,31 @@ A 409 is the easy case: the commit did not happen, so wait and send it again. SQ
 
 With writes working, embedded and the single coordinator matched every read. The coordinator with a worker did not. One table came back with `region` holding `1`, which was the value of `id`.
 
-SQE had written that table, partitioned by region. Snowflake had then run DELETE and UPDATE on the `eu` rows. Snowflake's DML on Iceberg is copy-on-write: it rewrites the affected data files. The rewritten files are Snowflake's files, and Snowflake writes parquet columns in an order of its own. It also adds two row-lineage columns, `METADATA$RL_ROW_ID` and `METADATA$RL_LAST_UPDATED_SEQUENCE_NUMBER`, that are not in the table schema. The table now held files from two writers with two column orders.
+SQE had written that table, partitioned by region. Snowflake had then run DELETE and UPDATE on the `eu` rows. On a table that small, Snowflake's DML is copy-on-write: it rewrites the affected data files. The rewritten files are Snowflake's files, and Snowflake writes parquet columns in an order of its own. It also adds two row-lineage columns, `METADATA$RL_ROW_ID` and `METADATA$RL_LAST_UPDATED_SEQUENCE_NUMBER`, that are not in the table schema. The table now held files from two writers with two column orders.
 
 The coordinator reads every file by Iceberg field id and never noticed. A worker conforms each batch to the planned schema with a projection fill that the coordinator sends in the scan ticket. The coordinator sent that fill only when the table's schema had evolved. This table had not evolved, so the worker got no fill, labelled each batch with the column order of the first file it opened, and bound the other files by position.
 
-The fix is to always send the fill when the scan projects columns. The worker then matches every file by field id, whatever its column order. The cost is compatibility: the fill needs scan ticket V4, so a worker older than that refuses projected scans. Upgrade the workers with the coordinator.
+The fix is to send the fill on every scan that reads columns, `SELECT *` included. Only `COUNT(*)` goes without, because it reads no column. The worker then matches every file by field id, whatever its column order. A worker too old to apply the fill never sees one: the coordinator checks the scan ticket version when a worker registers and refuses an older one, so a mixed cluster fails at startup and not in a query.
 
 The bug was older than Snowflake. An earlier fix had moved the coordinator's small-file path to field ids and left the worker path for later. It took a second engine rewriting part of a table to make a file order SQE had never written.
 
 ## Deletion vectors
 
-Snowflake's DELETE, UPDATE and MERGE are copy-on-write on V2 and on V3. The run checked every snapshot, and none of them had a delete file. So the run cannot show SQE reading a deletion vector that Snowflake wrote, because Snowflake does not write one.
+The first run found no delete file in any Snowflake snapshot. Snowflake had run DELETE and UPDATE on V2 and V3 tables, and every snapshot was a rewrite. We wrote it down as "Snowflake's DML is copy-on-write" and nearly published that.
 
-The other direction works. One of SQE's tables is merge-on-read, so SQE's DELETE on it writes a deletion vector. Snowflake reads that table and drops the deleted rows, and the compare checks it in every SQE mode. In a separate probe, Snowflake ran its own DELETE on the same table, and SQE read the result back correctly.
+It was wrong. The tables were a hundred rows each, and on a table that size Snowflake rewrites the file whatever the setting. With the table property `ICEBERG_MERGE_ON_READ_BEHAVIOR = 'enabled'` and a million rows, the same DELETE writes a position delete file on V2 and a deletion vector on V3. The snapshot summaries say so: `added-position-delete-files` on one, `added-dvs` on the other. A later UPDATE replaces the vector.
 
-## 33, 33, 33
+SQE could not read either table. Every read that crossed a deleted row failed with "cannot skip miniblock of size 512". Snowflake encodes integer columns as `DELTA_BINARY_PACKED` with 512-value miniblocks. Applying a delete means skipping rows, and the parquet crate could not skip into the middle of a miniblock that wide. The small tables never showed it, because a rewritten file has no deletes to skip.
 
-After those fixes, embedded matched 33 of 33, the single coordinator 33 of 33, and the coordinator with a worker 33 of 33. The worker scanned all 33 reads. We ran the Databricks harness again on the same build, to check that the fill and the commit changes broke nothing there. It matched 27 of 27 in all three modes, including Databricks' own deletion vectors read on the worker.
+The bug was not ours, and it was already fixed. Databricks Photon writes 256-value miniblocks, the same rejection was reported there ([apache/arrow-rs#11018](https://github.com/apache/arrow-rs/issues/11018)), and the fix ([#11021](https://github.com/apache/arrow-rs/pull/11021), backported in [#11754](https://github.com/apache/arrow-rs/pull/11754)) shipped in parquet 59.3.2. SQE was on 59.3.1. It is on 59.3.2 now, with a test that hand-encodes a 512-value page and skips inside it, so a downgrade fails the build.
+
+The harness keeps both tables. Seven reads check them: an aggregate over all million rows, a range across the deleted ids, point lookups at the deleted multiples of 100000 and their neighbours, and a `SELECT *` on V3. All seven match in every mode.
+
+The other direction works too. One of SQE's tables is merge-on-read, so SQE's DELETE on it writes a deletion vector. Snowflake reads that table and drops the deleted rows, and the compare checks it in every SQE mode. In a separate probe, Snowflake ran its own DELETE on the same table, and SQE read the result back correctly.
+
+## 40, 40, 40
+
+After those fixes, embedded matched 40 of 40, the single coordinator 40 of 40, and the coordinator with a worker 40 of 40. The worker scanned all 40 reads. We ran the Databricks harness again on the same build, to check that the fill, the commit changes and the parquet upgrade broke nothing there. It matched 27 of 27 in all three modes, including Databricks' own deletion vectors read on the worker.
 
 ## What else the run found
 
