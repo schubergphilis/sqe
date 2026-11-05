@@ -10,7 +10,7 @@ Cells read `V2/V3`: `F` full, `P` partial, `?` unknown, `.` none, `-` the rubric
 
 | Rank | Engine | Score | % |
 |---:|---|---:|---:|
-| 1 | **SQE (self-rated)** | 156/162 | 96.3 |
+| 1 | **SQE (self-rated)** | 158/162 | 97.5 |
 | 2 | AWS EMR (8.1 Spark) | 147/162 | 90.7 |
 | 3 | Starburst (482-e) | 147/162 | 90.7 |
 | 4 | Dremio / SAP (26.x) | 146/162 | 90.1 |
@@ -101,7 +101,7 @@ Cells read `V2/V3`: `F` full, `P` partial, `?` unknown, `.` none, `-` the rubric
 | AWS Glue Catalog | F/F | F/F | F/F | F/F | P/P | F/F | F/F | F/? | F/. | F/? |
 | REST Catalog | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/? | P/. | F/? |
 | Unity Catalog | F/F | F/F | P/P | P/P | P/P | P/? | P/P | P/? | P/. | P/? |
-| Snowflake Horizon Catalog | P/P | F/P | P/P | F/P | P/P | F/? | F/P | F/? | P/? | P/? |
+| Snowflake Horizon Catalog | F/F | F/P | P/P | F/P | P/P | F/? | F/P | F/? | P/? | P/? |
 | Google Lakehouse | P/P | P/P | P/P | P/P | P/P | P/P | P/P | P/? | P/? | P/? |
 
 ### V3 data types
@@ -167,7 +167,7 @@ Cells read `V2/V3`: `F` full, `P` partial, `?` unknown, `.` none, `-` the rubric
 | AWS Glue Catalog | F/F | F/F | F/F | F/F | F/F | P/P | F/F | P/P | F/. | P/. | ?/? |
 | REST Catalog | F/F | F/F | F/F | F/F | F/F | F/F | F/F | F/F | ./. | P/P | ?/? |
 | Unity Catalog | F/F | F/F | P/P | F/F | P/P | P/P | F/F | F/F | P/. | P/. | ?/? |
-| Snowflake Horizon Catalog | P/P | P/P | F/P | F/F | P/? | F/P | F/F | P/P | P/. | P/. | P/. |
+| Snowflake Horizon Catalog | F/F | P/P | F/P | F/F | P/? | F/P | F/F | P/P | P/. | P/. | P/. |
 | Google Lakehouse | P/P | F/F | P/P | F/F | P/P | F/P | F/P | P/P | ?/? | F/P | ?/? |
 
 ### V3 data types

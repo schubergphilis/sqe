@@ -10,12 +10,12 @@
     "group": "3rd Party",
     "docUrl": "https://docs.getsqe.com"
   },
-  "generatedAt": "2026-10-27T00:00:00Z",
-  "generatedBy": "Rescore against the pinned upstream rubric; evidence paths repaired after the crate and test moves. 2026-10-18: unknown-type and shredded-variant measured against Spark 4.1 + Iceberg 1.12. 2026-10-20: merge-on-read deletes, deletion vectors and row lineage read back by Spark 4.1 + Iceberg 1.12 (mor_spark_interop); stub evidence removed. 2026-10-21: SQE writes shredded variants (write.parquet.shred-variants), read back by Spark 4.1 + Iceberg 1.12; shredded-variant:v3 to full. unknown-type:v3 to full: nested shapes measured against Iceberg Java (same refusals), promotion rules enforced. 2026-10-22: list elements and map values promote with SET DATA TYPE (#869). 2026-10-23: rubric pin moved to d14d0f1341 (features.json unchanged since 2dd75e0aa2; the new commits add Dremio and catalog-side entries). geometry-type:v3 to partial: SQE reads Spark-written GEOMETRY / GEOGRAPHY columns (#863), writes refused. 2026-10-24: shredded variant statistics prune row groups on the coordinator (#870); level unchanged. 2026-10-25: variant manifest bounds prune data files (#870); level unchanged. 2026-10-25: variants nested in structs, lists and maps are shredded on write and read back by Spark 4.1 + Iceberg 1.12 (#870). 2026-10-25: SQE writes variant manifest bounds for its shredded files (#870); level unchanged. 2026-10-25: multi-arg-transforms:v3 to partial: multi-argument and unknown transforms read, ignored for pruning and kept on round trip; writes refused as the spec requires (#864). 2026-10-25: SQE writes GEOMETRY / GEOGRAPHY columns with geometry bounding-box bounds, read back by Spark 4.1 + Iceberg 1.12 (#863); level unchanged (no DDL). 2026-10-26: GEOMETRY / GEOGRAPHY DDL (CREATE TABLE, ADD COLUMN, CTAS), read back by Spark 4.1 + Iceberg 1.12 (#863); level unchanged (worker scan untested). 2026-10-26: a worker scans a Spark-written geospatial table; the coordinator conforms Binary worker batches to the planned LargeBinary (#863). Level stays partial: no ST_* functions and no spatial file pruning. 2026-10-26: planar ST_* functions over GEOMETRY values, results written back into a geometry column (#863); level unchanged (no spatial file pruning). 2026-10-27: rubric pin moved to 027f151356 (features unchanged; peer entries updated). unity-catalog:v2/v3 to full: a live run against Databricks-hosted Unity Catalog (scripts/interop/databricks-uc/) where Databricks writes V2 and V3 tables SQE reads, SQE writes tables Databricks reads, and both engines run DELETE / UPDATE / MERGE on the other's tables; 25 reads compared value by value in embedded, coordinator-local and distributed mode, all equal. The run found that workers did not apply delete files (fixed in !1570). 2026-10-27: workers apply position deletes and deletion vectors carried in the scan ticket; equality deletes stay on the coordinator. Levels unchanged.",
+  "generatedAt": "2026-11-05T00:00:00Z",
+  "generatedBy": "Rescore against the pinned upstream rubric; evidence paths repaired after the crate and test moves. 2026-10-18: unknown-type and shredded-variant measured against Spark 4.1 + Iceberg 1.12. 2026-10-20: merge-on-read deletes, deletion vectors and row lineage read back by Spark 4.1 + Iceberg 1.12 (mor_spark_interop); stub evidence removed. 2026-10-21: SQE writes shredded variants (write.parquet.shred-variants), read back by Spark 4.1 + Iceberg 1.12; shredded-variant:v3 to full. unknown-type:v3 to full: nested shapes measured against Iceberg Java (same refusals), promotion rules enforced. 2026-10-22: list elements and map values promote with SET DATA TYPE (#869). 2026-10-23: rubric pin moved to d14d0f1341 (features.json unchanged since 2dd75e0aa2; the new commits add Dremio and catalog-side entries). geometry-type:v3 to partial: SQE reads Spark-written GEOMETRY / GEOGRAPHY columns (#863), writes refused. 2026-10-24: shredded variant statistics prune row groups on the coordinator (#870); level unchanged. 2026-10-25: variant manifest bounds prune data files (#870); level unchanged. 2026-10-25: variants nested in structs, lists and maps are shredded on write and read back by Spark 4.1 + Iceberg 1.12 (#870). 2026-10-25: SQE writes variant manifest bounds for its shredded files (#870); level unchanged. 2026-10-25: multi-arg-transforms:v3 to partial: multi-argument and unknown transforms read, ignored for pruning and kept on round trip; writes refused as the spec requires (#864). 2026-10-25: SQE writes GEOMETRY / GEOGRAPHY columns with geometry bounding-box bounds, read back by Spark 4.1 + Iceberg 1.12 (#863); level unchanged (no DDL). 2026-10-26: GEOMETRY / GEOGRAPHY DDL (CREATE TABLE, ADD COLUMN, CTAS), read back by Spark 4.1 + Iceberg 1.12 (#863); level unchanged (worker scan untested). 2026-10-26: a worker scans a Spark-written geospatial table; the coordinator conforms Binary worker batches to the planned LargeBinary (#863). Level stays partial: no ST_* functions and no spatial file pruning. 2026-10-26: planar ST_* functions over GEOMETRY values, results written back into a geometry column (#863); level unchanged (no spatial file pruning). 2026-10-27: rubric pin moved to 027f151356 (features unchanged; peer entries updated). unity-catalog:v2/v3 to full: a live run against Databricks-hosted Unity Catalog (scripts/interop/databricks-uc/) where Databricks writes V2 and V3 tables SQE reads, SQE writes tables Databricks reads, and both engines run DELETE / UPDATE / MERGE on the other's tables; 25 reads compared value by value in embedded, coordinator-local and distributed mode, all equal. The run found that workers did not apply delete files (fixed in !1570). 2026-10-27: workers apply position deletes and deletion vectors carried in the scan ticket; equality deletes stay on the coordinator. Levels unchanged. 2026-11-05: snowflake-horizon-catalog:v2/v3 to full: the same kind of live run against a Snowflake account's Horizon endpoint (scripts/interop/snowflake-horizon/); 33 reads compared value by value in embedded, coordinator-local and distributed mode, all equal, including a deletion vector from SQE's merge-on-read DELETE read by Snowflake. The run found that Horizon refuses explicit table locations, refuses commits paced under about half a second, and writes parquet columns out of schema order (the distributed worker matched them by position; fixed by always sending the projection fill). The Databricks run was repeated on the same build: 27 of 27 equal in all three modes.",
   "score": {
-    "raw": 156,
+    "raw": 158,
     "max": 162,
-    "percent": 96.3
+    "percent": 97.5
   },
   "note": "Rescored on 2026-10-17 against upstream features.json (32 features). Only cells that apply to a version are scored, as the site shows them: position-deletes is V2-only now, so 54 cells, max 162. Removed upstream and dropped here: hive-metastore, nessie, polaris, hadoop-catalog, jdbc-catalog, vector-type, cdc-support. New: deletion-vectors, unknown-type, google-lakehouse. Gains: deletion vectors and row lineage on V3, unshredded VARIANT. Downgrade: unity-catalog to partial (read-only smoke); back to full on 2026-10-27 after the live Databricks run. The old 167/189 is not comparable.",
   "support": {
@@ -294,7 +294,7 @@
       "caveats": [
         "The live run needs a Databricks workspace and a user token; it runs by hand, not in CI.",
         "The Databricks user's token is passed through to Unity Catalog and lives about an hour; a long session needs a fresh login.",
-        "The embedded CLI only reads an ATTACHed Unity catalog yet (no UPDATE, DELETE, MERGE or ALTER; CREATE TABLE with plain columns only); the coordinator does all of it."
+        "The embedded CLI runs CREATE (with PARTITIONED BY and table properties), CTAS, INSERT, UPDATE, DELETE and MERGE on an ATTACHed Unity catalog; it refuses ALTER, which goes through the coordinator."
       ]
     },
     "sqe:unity-catalog:v3": {
@@ -304,25 +304,31 @@
       "caveats": [
         "The live run needs a Databricks workspace and a user token; it runs by hand, not in CI.",
         "The Databricks user's token is passed through to Unity Catalog and lives about an hour; a long session needs a fresh login.",
-        "The embedded CLI only reads an ATTACHed Unity catalog yet (no UPDATE, DELETE, MERGE or ALTER; CREATE TABLE with plain columns only); the coordinator does all of it.",
+        "The embedded CLI runs CREATE (with PARTITIONED BY and table properties), CTAS, INSERT, UPDATE, DELETE and MERGE on an ATTACHed Unity catalog; it refuses ALTER, which goes through the coordinator.",
         "DESCRIBE shows a Databricks GEOMETRY column as varbinary; the values read as geometry.",
         "A snapshot with equality delete files is scanned on the coordinator only; position deletes and deletion vectors are applied on the workers."
       ]
     },
     "sqe:snowflake-horizon-catalog:v2": {
-      "level": "partial",
-      "notes": "Horizon implements the Iceberg REST API (Polaris-based); SQE's REST client speaks it. Not measured against Horizon.",
-      "evidence": "crates/sqe-catalog/src/rest_catalog.rs",
+      "level": "full",
+      "notes": "Verified on 2026-11-05 against a Snowflake account's Horizon Iceberg REST endpoint, with a Horizon access token minted from the Snowflake user's key pair and passed through (no service account), storage credentials vended. Snowflake writes Iceberg tables (scalar types including TIMESTAMP_LTZ / NTZ, BINARY and TIME, nested OBJECT / ARRAY / MAP, identity + month partitions, schema evolution) that SQE reads; SQE writes tables with CREATE, CTAS, INSERT, UPDATE, DELETE, MERGE and ALTER that Snowflake reads; Snowflake runs DELETE / UPDATE / INSERT on SQE's tables and SQE runs DELETE / UPDATE / MERGE on Snowflake's. Every read is compared value by value on both engines: 33 of 33 equal in embedded, coordinator-local and distributed mode.",
+      "evidence": "scripts/interop/snowflake-horizon/run.py, scripts/interop/snowflake-horizon/compare.tsv, crates/sqe-write/src/commit.rs#commit_with_retry, crates/sqe-catalog/src/rest_catalog.rs#schema_commit_may_resend, crates/sqe-catalog/src/iceberg_scan.rs#projection_fill",
       "caveats": [
-        "Inferred from generic Iceberg REST catalog support; not measured against Horizon."
+        "The live run needs a Snowflake account and a key pair; it runs by hand, not in CI.",
+        "Snowflake upper-cases unquoted names and SQE folds them to lower case, so Snowflake-created tables are addressed with quoted names.",
+        "Horizon refuses commits that follow each other within about half a second; SQE retries them, so bursts of small writes are slower than against Polaris.",
+        "The harness runs SQE's write phases through the coordinator. The embedded CLI ran CREATE, INSERT, DELETE and UPDATE on an ATTACHed Horizon catalog in a spot check, not the full write phase; ALTER goes through the coordinator."
       ]
     },
     "sqe:snowflake-horizon-catalog:v3": {
-      "level": "partial",
-      "notes": "Snowflake Horizon is Polaris-based; the REST surface is shared with Polaris which we verified end-to-end at format-version 3. No live test against a Horizon endpoint.",
-      "evidence": "crates/sqe-write/src/write_handler.rs#format_version_properties",
+      "level": "full",
+      "notes": "Same live run, on V3 tables. SQE reads Snowflake's VARIANT (paths and NULLs), GEOMETRY(4326), GEOGRAPHY and nanosecond timestamps, and the copy-on-write snapshots Snowflake's DELETE and UPDATE produce; Snowflake reads SQE-written V3 tables including VARIANT and GEOMETRY, SQE's deletes and MERGE on them, and a deletion vector from SQE's merge-on-read DELETE, which a later Snowflake DELETE folds into a rewritten file that SQE reads back. Snowflake-written files carry row-lineage columns and a column order of their own; SQE matches by field id on every path, the distributed worker included.",
+      "evidence": "scripts/interop/snowflake-horizon/run.py, scripts/interop/snowflake-horizon/compare.tsv, crates/sqe-catalog/src/iceberg_scan.rs#projection_fill, crates/sqe-worker/src/projection_fill.rs",
       "caveats": [
-        "Inferred from generic Iceberg REST catalog support; not measured against Horizon."
+        "The live run needs a Snowflake account and a key pair; it runs by hand, not in CI.",
+        "Snowflake's ST_AREA on an Iceberg GEOMETRY is negative whichever engine wrote it; SQE's is positive.",
+        "Snowflake's own DELETE, UPDATE and MERGE are copy-on-write on V2 and V3 and write no delete files, so SQE reading a Snowflake-written deletion vector is not covered.",
+        "The $files metadata table lists data files only; delete files and deletion vectors show in the $snapshots summary."
       ]
     },
     "sqe:google-lakehouse:v2": {

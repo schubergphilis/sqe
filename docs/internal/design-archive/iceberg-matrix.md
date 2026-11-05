@@ -2,9 +2,9 @@
 
 SQE rated against the [icebergmatrix.org](https://icebergmatrix.org) rubric ([Neuw84/iceberg-matrix](https://github.com/Neuw84/iceberg-matrix)).
 
-**Score: 156/162 (96.3%)** on 54 cells.
+**Score: 158/162 (97.5%)** on 54 cells.
 
-- SQE cells: `docs/evidence/iceberg-matrix-state.json`, last changed 2026-10-27.
+- SQE cells: `docs/evidence/iceberg-matrix-state.json`, last changed 2026-11-05.
 - Rubric and peer scores: `docs/evidence/iceberg-matrix-rubric.json`, upstream `027f151356` fetched 2026-10-27.
 - Regenerate: `python3 scripts/render-iceberg-matrix-compare.py` (refreshes the rubric snapshot and [the engine comparison](./iceberg-matrix-compare.md)), then `python3 scripts/render-iceberg-matrix.py`.
 
@@ -30,7 +30,7 @@ Every engine scored on the same 54 cells. SQE rates itself; the other engines ar
 
 | Engine | Score | % |
 |---|---:|---:|
-| **SQE (self-rated)** | **156/162** | **96.3** |
+| **SQE (self-rated)** | **158/162** | **97.5** |
 | AWS EMR (8.1 Spark) | 147/162 | 90.7 |
 | Starburst (482-e) | 147/162 | 90.7 |
 | Dremio / SAP (26.x) | 146/162 | 90.1 |
@@ -97,7 +97,7 @@ Every engine scored on the same 54 cells. SQE rates itself; the other engines ar
 | AWS Glue Catalog | F | F | Two parallel paths now ship: (1) iceberg-catalog-glue vendored from apache/iceberg-rust v0.9.0 (AWS SDK over the Glue API directly); (2) the federated Glue ... | Same two parallel paths as V2: native AWS SDK via iceberg-catalog-glue, and the federated Glue Iceberg REST endpoint with SigV4 signing. Both are ... |
 | REST Catalog | F | F | Primary catalog type. Phase P added optional AWS SigV4 signing to the vendored `iceberg-catalog-rest` client (cargo feature `aws-sigv4`, on by default in SQE), ... | Iceberg REST catalogs accept V3 tables when SQE forwards format-version as a table property in CreateTableRequest. Verified end-to-end against Polaris (Apache ... |
 | Unity Catalog | F | F | Verified on 2026-10-27 against Databricks-hosted Unity Catalog through its Iceberg REST endpoint, with the Databricks user's OIDC token validated against the ... | Same live run, on V3 tables. SQE reads Databricks deletion vectors, VARIANT and GEOMETRY(4326) columns; Databricks reads SQE-written V3 tables including ... |
-| Snowflake Horizon Catalog | P | P | Horizon implements the Iceberg REST API (Polaris-based); SQE's REST client speaks it. Not measured against Horizon. | Snowflake Horizon is Polaris-based; the REST surface is shared with Polaris which we verified end-to-end at format-version 3. No live test against a Horizon ... |
+| Snowflake Horizon Catalog | F | F | Verified on 2026-11-05 against a Snowflake account's Horizon Iceberg REST endpoint, with a Horizon access token minted from the Snowflake user's key pair and ... | Same live run, on V3 tables. SQE reads Snowflake's VARIANT (paths and NULLs), GEOMETRY(4326), GEOGRAPHY and nanosecond timestamps, and the copy-on-write ... |
 | Google Lakehouse | P | P | Google Lakehouse runtime catalog exposes the Iceberg REST API, which SQE's REST client speaks. Rated partial because the pairing has not been measured. | Google Lakehouse runtime catalog exposes the Iceberg REST API, which SQE's REST client speaks. Rated partial because the pairing has not been measured. |
 
 ### V3 data types
@@ -119,10 +119,6 @@ Every cell below full, with its caveats. Each has a `[MATRIX]` issue.
 - **multi-arg-transforms (v3)**, partial: Reads follow the spec for unknown and multi-argument transforms: a partition or sort field with several source-ids, or a transform name SQE does not know, loads as an unknown transform, is ignored for file pruning, and keeps its original name and source-ids when the metadata is written back. Manifests of such a table decode with the partition type their writer recorded. Writes are refused, as the spec requires: no data or delete file commits under a spec with an unknown transform, and partition evolution refuses to carry such a field. PARTITIONED BY accepts only single-source transforms.
   - Verified on hand-built metadata and manifests; no engine writes a multi-argument transform yet, so no table from another writer has been read
   - Read-only: SQE cannot write to a table whose default spec has an unknown transform until that field is dropped
-- **snowflake-horizon-catalog (v2)**, partial: Horizon implements the Iceberg REST API (Polaris-based); SQE's REST client speaks it. Not measured against Horizon.
-  - Inferred from generic Iceberg REST catalog support; not measured against Horizon.
-- **snowflake-horizon-catalog (v3)**, partial: Snowflake Horizon is Polaris-based; the REST surface is shared with Polaris which we verified end-to-end at format-version 3. No live test against a Horizon endpoint.
-  - Inferred from generic Iceberg REST catalog support; not measured against Horizon.
 - **google-lakehouse (v2)**, partial: Google Lakehouse runtime catalog exposes the Iceberg REST API, which SQE's REST client speaks. Rated partial because the pairing has not been measured.
   - Inferred from generic Iceberg REST catalog support; not measured against Google Lakehouse.
   - Iceberg data on GCS (gs://) through the table FileIO and Google OAuth for the REST endpoint are not verified.
@@ -149,12 +145,20 @@ Every cell below full, with its caveats. Each has a `[MATRIX]` issue.
 - **aws-glue-catalog (v3)**: The live AWS test is #[ignore] (needs AWS credentials and a warehouse bucket) and runs locally only; CI does not run it.
 - **unity-catalog (v2)**: The live run needs a Databricks workspace and a user token; it runs by hand, not in CI.
 - **unity-catalog (v2)**: The Databricks user's token is passed through to Unity Catalog and lives about an hour; a long session needs a fresh login.
-- **unity-catalog (v2)**: The embedded CLI only reads an ATTACHed Unity catalog yet (no UPDATE, DELETE, MERGE or ALTER; CREATE TABLE with plain columns only); the coordinator does all of it.
+- **unity-catalog (v2)**: The embedded CLI runs CREATE (with PARTITIONED BY and table properties), CTAS, INSERT, UPDATE, DELETE and MERGE on an ATTACHed Unity catalog; it refuses ALTER, which goes through the coordinator.
 - **unity-catalog (v3)**: The live run needs a Databricks workspace and a user token; it runs by hand, not in CI.
 - **unity-catalog (v3)**: The Databricks user's token is passed through to Unity Catalog and lives about an hour; a long session needs a fresh login.
-- **unity-catalog (v3)**: The embedded CLI only reads an ATTACHed Unity catalog yet (no UPDATE, DELETE, MERGE or ALTER; CREATE TABLE with plain columns only); the coordinator does all of it.
+- **unity-catalog (v3)**: The embedded CLI runs CREATE (with PARTITIONED BY and table properties), CTAS, INSERT, UPDATE, DELETE and MERGE on an ATTACHed Unity catalog; it refuses ALTER, which goes through the coordinator.
 - **unity-catalog (v3)**: DESCRIBE shows a Databricks GEOMETRY column as varbinary; the values read as geometry.
 - **unity-catalog (v3)**: A snapshot with equality delete files is scanned on the coordinator only; position deletes and deletion vectors are applied on the workers.
+- **snowflake-horizon-catalog (v2)**: The live run needs a Snowflake account and a key pair; it runs by hand, not in CI.
+- **snowflake-horizon-catalog (v2)**: Snowflake upper-cases unquoted names and SQE folds them to lower case, so Snowflake-created tables are addressed with quoted names.
+- **snowflake-horizon-catalog (v2)**: Horizon refuses commits that follow each other within about half a second; SQE retries them, so bursts of small writes are slower than against Polaris.
+- **snowflake-horizon-catalog (v2)**: The harness runs SQE's write phases through the coordinator. The embedded CLI ran CREATE, INSERT, DELETE and UPDATE on an ATTACHed Horizon catalog in a spot check, not the full write phase; ALTER goes through the coordinator.
+- **snowflake-horizon-catalog (v3)**: The live run needs a Snowflake account and a key pair; it runs by hand, not in CI.
+- **snowflake-horizon-catalog (v3)**: Snowflake's ST_AREA on an Iceberg GEOMETRY is negative whichever engine wrote it; SQE's is positive.
+- **snowflake-horizon-catalog (v3)**: Snowflake's own DELETE, UPDATE and MERGE are copy-on-write on V2 and V3 and write no delete files, so SQE reading a Snowflake-written deletion vector is not covered.
+- **snowflake-horizon-catalog (v3)**: The $files metadata table lists data files only; delete files and deletion vectors show in the $snapshots summary.
 - **shredded-variant (v3)**: Shredded columns are unshredded on read, so typed_value gives no typed field access. Its statistics prune row groups, on the coordinator and on a worker, only for a variant_get / try_variant_get comparison with a literal. SQE writes variant manifest bounds only for top-level shredded columns, and none for a double path or a string over 64 bytes.
 - **lineage (v3)**: MoR DELETE is not a lineage case (deleted rows have no successor).
 
