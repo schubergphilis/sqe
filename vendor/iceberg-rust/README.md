@@ -54,6 +54,7 @@ Upstream `testdata/` is vendored in full, so `cargo test -p iceberg --lib` runs 
 | — | `RestCatalog::path_prefix`: the server-advertised `{prefix}`, for SQE's raw REST calls (`SQE PATCH (sqe#873)`) | `catalog/rest/src/catalog.rs` |
 | — | Empty-token guards (#2) and W3C trace propagation | `catalog/rest/src/auth/oauth2.rs`, `client.rs` |
 | — | Refresh-after-401 on `AuthSession::on_unauthorized` (replaces RW #157; apache has no refresh) | `catalog/rest/src/auth/` |
+| — | 429 Too Many Requests replayed up to 6 times, `Retry-After` honoured (capped 10 s), else jittered backoff; Snowflake Horizon throttles bursts (`SQE PATCH (catalog-429)`) | `catalog/rest/src/client.rs` (`send_throttled`) |
 | 5 | Loader feature gates + `Send + Sync` | `catalog/loader` |
 | — | sqlx 0.9 (`AssertSqlSafe`, `LIMIT 0` schema probe) | `catalog/sql` |
 | — | Concurrent catalog bootstrap: a failed `CREATE TABLE IF NOT EXISTS` is ignored when the table exists afterwards (`SQE PATCH (sqe#872)`) | `catalog/sql/src/catalog.rs` (`create_table_if_missing`) |
