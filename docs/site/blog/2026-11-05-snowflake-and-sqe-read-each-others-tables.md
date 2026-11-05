@@ -101,7 +101,7 @@ After those fixes, embedded matched 40 of 40, the single coordinator 40 of 40, a
 
 None of these change a value.
 
-- Snowflake upper-cases unquoted names, and SQE folds them to lower case. A Snowflake table is `sf."SALES"."ORDERS"` from SQE, and an SQE table is `"orders"` from Snowflake.
+- Snowflake upper-cases unquoted names, and SQE folds them to lower case. A Snowflake table is `sf."SALES"."ORDERS"` from SQE, and an SQE table is `"orders"` from Snowflake. A catalog set to `identifier_case = "upper"` folds the Snowflake way, so `sf.sales.orders` works unquoted.
 - `ST_AREA` on an Iceberg `GEOMETRY` comes back negative in Snowflake, whichever engine wrote the table: -12 for the rectangle whose literal gives 12. The harness compares the absolute value.
 - An external volume encrypted with a customer KMS key does not work. The credentials Horizon vends cannot decrypt, so even loading a table fails with 403. Snowflake-managed storage works.
 - `$files` lists data files only. Delete files and deletion vectors show in the `$snapshots` summary instead.

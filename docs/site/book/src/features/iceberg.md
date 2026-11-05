@@ -111,9 +111,12 @@ user = "<label for the audit log>"
 catalog_url = "https://<orgname>-<accountname>.snowflakecomputing.com/polaris/api/catalog"
 warehouse = "<Snowflake database>"
 access_delegation = "vended-credentials"
+identifier_case = "upper"     # unquoted names fold to upper case, as in Snowflake
 ```
 
-`bearer_passthrough` belongs on a test rig. Horizon publishes no JWKS for its access tokens, so SQE cannot validate them itself and leaves that to Horizon. The embedded CLI attaches the same endpoint with `ACCESS_DELEGATION 'vended-credentials'` ([example](../operations/catalogs.md#example-snowflake-horizon)).
+`bearer_passthrough` belongs on a test rig. Horizon publishes no JWKS for its access tokens, so SQE cannot validate them itself and leaves that to Horizon. The embedded CLI attaches the same endpoint with `ACCESS_DELEGATION 'vended-credentials'` and `IDENTIFIER_CASE 'upper'` ([example](../operations/catalogs.md#example-snowflake-horizon)).
+
+Snowflake folds unquoted names to upper case and SQE folds them to lower case. With `identifier_case = "upper"`, SQE folds unquoted names for that catalog the Snowflake way, so `SELECT id FROM sf.sales.orders` finds `SALES.ORDERS` and its `ID` column. Without it, quote Snowflake's names: `sf."SALES"."ORDERS"`. The [identifier case](../operations/catalogs.md#identifier-case) section lists what folds and how policies bind.
 
 The interop run in `scripts/interop/snowflake-horizon/` follows the Databricks run: each engine writes, the other reads, both run DML on the other's tables, and 33 reads are compared value by value.
 
@@ -133,7 +136,7 @@ All 40 reads match in embedded mode, against a single coordinator, and against a
 
 Known gaps from the same run:
 
-- Snowflake upper-cases unquoted names and SQE folds them to lower case, so quote Snowflake's names: `sf."SALES"."ORDERS"`.
+- A table SQE writes with lower-case names needs quotes in Snowflake (`"sqe_orders"`, `"id"`), and in SQE too when the catalog sets `identifier_case = "upper"`.
 - Snowflake rewrites small tables copy-on-write whatever the table's merge-on-read setting. Its delete files appear only on large tables with `ICEBERG_MERGE_ON_READ_BEHAVIOR = 'enabled'`; the harness uses 1M rows.
 - `$files` lists data files only. Delete files and deletion vectors show in the `$snapshots` summary.
 - `ST_AREA` on an Iceberg `GEOMETRY` comes back negative in Snowflake, whichever engine wrote the table.
