@@ -45,6 +45,9 @@ pub struct AttachedCatalog {
     /// Tracked so DROP SECRET can refuse to drop a secret while
     /// catalogs depend on it.
     pub secret_ref: Option<String>,
+    /// `IDENTIFIER_CASE 'upper'`: unquoted identifiers for this catalog
+    /// fold to upper case (Snowflake Horizon).
+    pub upper_case: bool,
 }
 
 impl std::fmt::Debug for AttachedCatalog {
@@ -120,6 +123,11 @@ impl RuntimeCatalogRegistry {
             }
         }
 
+        // Validate IDENTIFIER_CASE before connecting, so a typo never
+        // leaves a half-built catalog behind.
+        let upper_case =
+            sqe_sql::attach::identifier_case_is_upper(&stmt.options).map_err(|e| e.to_string())?;
+
         // 2) Build the iceberg::Catalog via the per-backend dispatch.
         let catalog = build_catalog(&stmt.location, stmt.kind, &stmt.options, secrets).await?;
 
@@ -154,6 +162,7 @@ impl RuntimeCatalogRegistry {
                     catalog,
                     provider,
                     secret_ref,
+                    upper_case,
                 },
             );
         }
@@ -189,6 +198,19 @@ impl RuntimeCatalogRegistry {
         let mut names: Vec<_> = r.keys().cloned().collect();
         names.sort();
         Ok(names)
+    }
+
+    /// Names of attached catalogs declared `IDENTIFIER_CASE 'upper'`.
+    pub fn upper_case_names(&self) -> Vec<String> {
+        self.inner
+            .read()
+            .map(|r| {
+                r.values()
+                    .filter(|c| c.upper_case)
+                    .map(|c| c.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// All attached `(name, provider)` pairs, sorted by name.
@@ -661,6 +683,7 @@ mod hive_lane_tests {
                 catalog: iceberg_catalog,
                 provider,
                 secret_ref: None,
+                upper_case: false,
             },
         );
 

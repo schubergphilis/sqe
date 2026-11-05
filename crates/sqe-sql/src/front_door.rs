@@ -80,6 +80,7 @@ pub enum WireDialect {
 pub struct SqlFrontDoor {
     dialect: WireDialect,
     session_catalog: Option<String>,
+    upper_case_catalogs: crate::identifier_case::UpperCaseCatalogs,
 }
 
 impl SqlFrontDoor {
@@ -87,7 +88,20 @@ impl SqlFrontDoor {
         Self {
             dialect,
             session_catalog: None,
+            upper_case_catalogs: Default::default(),
         }
+    }
+
+    /// Catalogs whose unquoted identifiers fold to upper case
+    /// (`identifier_case = "upper"`, see [`crate::identifier_case`]). Only the
+    /// engine's own door, the one whose text is planned, needs them: the
+    /// classification-only doors classify the same statement either way.
+    pub fn with_upper_case_catalogs(
+        mut self,
+        catalogs: crate::identifier_case::UpperCaseCatalogs,
+    ) -> Self {
+        self.upper_case_catalogs = catalogs;
+        self
     }
 
     /// The session's default catalog. When set, two-part
@@ -200,6 +214,13 @@ impl SqlFrontDoor {
         }
         // Before the column aliasing: a bare `FROM t` has no projection yet.
         ast_rewritten |= crate::from_first::expand_from_first_select(&mut statements);
+        // Before the Trino-compat pass and the `_colN` aliasing, which read
+        // and add column names.
+        ast_rewritten |= crate::identifier_case::fold_upper_case_identifiers(
+            &mut statements,
+            &self.upper_case_catalogs,
+            self.session_catalog.as_deref(),
+        );
         ast_rewritten |= crate::trino_compat::apply_trino_compat(&mut statements, &sql);
         ast_rewritten |= crate::trino_compat::apply_anonymous_column_aliases(&mut statements);
 
