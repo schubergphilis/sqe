@@ -266,7 +266,7 @@ async fn rewrite_data_files_actually_compacts_parquet() {
     let pre_files = handler
         .execute(
             &session,
-            "SELECT COUNT(*) FROM table_files('default', 'maint_rewrite_compaction_test')",
+            "SELECT COUNT(*) FROM table_files('default', 'maint_rewrite_compaction_test') WHERE content = 0",
             None,
         )
         .await
@@ -335,7 +335,7 @@ async fn rewrite_data_files_actually_compacts_parquet() {
     let post_files = handler
         .execute(
             &session,
-            "SELECT COUNT(*) FROM table_files('default', 'maint_rewrite_compaction_test')",
+            "SELECT COUNT(*) FROM table_files('default', 'maint_rewrite_compaction_test') WHERE content = 0",
             None,
         )
         .await
@@ -876,7 +876,7 @@ async fn table_with_a_data_file(
     let files = handler
         .execute(
             session,
-            &format!("SELECT file_path FROM table_files('{ns}', '{name}')"),
+            &format!("SELECT file_path FROM table_files('{ns}', '{name}') WHERE content = 0"),
             None,
         )
         .await

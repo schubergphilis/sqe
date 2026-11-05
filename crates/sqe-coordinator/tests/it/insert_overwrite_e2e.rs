@@ -67,7 +67,7 @@ async fn live_data_file_count(
     scalar_i64(
         handler,
         session,
-        &format!("SELECT COUNT(*) FROM table_files('{namespace}', '{table}')"),
+        &format!("SELECT COUNT(*) FROM table_files('{namespace}', '{table}') WHERE content = 0"),
     )
     .await
 }

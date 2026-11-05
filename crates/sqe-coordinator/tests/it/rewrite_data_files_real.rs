@@ -39,7 +39,9 @@ async fn live_data_file_count(
     let batches = handler
         .execute(
             session,
-            &format!("SELECT COUNT(*) FROM table_files('{namespace}', '{table_name}')"),
+            &format!(
+                "SELECT COUNT(*) FROM table_files('{namespace}', '{table_name}') WHERE content = 0"
+            ),
             None,
         )
         .await

@@ -33,8 +33,8 @@
 use arrow_array::{Array, Int64Array, StringArray};
 use std::collections::HashMap;
 
-/// Count live data files via the `table_files` TVF. Position/equality
-/// delete files do not appear here, so this measures exactly the
+/// Count live data files via the `table_files` TVF (`content = 0` drops
+/// position/equality delete files), so this measures exactly the
 /// "did the engine rewrite data files" question.
 async fn live_data_file_count(
     handler: &sqe_coordinator::QueryHandler,
@@ -45,7 +45,9 @@ async fn live_data_file_count(
     let batches = handler
         .execute(
             session,
-            &format!("SELECT COUNT(*) FROM table_files('{namespace}', '{table}')"),
+            &format!(
+                "SELECT COUNT(*) FROM table_files('{namespace}', '{table}') WHERE content = 0"
+            ),
             None,
         )
         .await
