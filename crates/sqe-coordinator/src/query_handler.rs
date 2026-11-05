@@ -147,9 +147,17 @@ fn reject_oversized_sql(query: &QueryConfig, sql: &str) -> sqe_core::Result<()> 
 /// The session catalog is passed so an unqualified `information_schema.<x>`
 /// resolves against the catalog the client selected rather than the engine
 /// default (#2), for every protocol.
-fn engine_front_door(session: &Session) -> sqe_sql::SqlFrontDoor {
+///
+/// `upper` lists the catalogs configured with `identifier_case = "upper"`:
+/// this door is the one whose text is planned and whose AST the DML handlers
+/// read, so it is where their unquoted names fold.
+fn engine_front_door(
+    session: &Session,
+    upper: &sqe_sql::identifier_case::UpperCaseCatalogs,
+) -> sqe_sql::SqlFrontDoor {
     sqe_sql::SqlFrontDoor::new(sqe_sql::WireDialect::Flight)
         .with_session_catalog(session.default_catalog.clone())
+        .with_upper_case_catalogs(upper.clone())
 }
 
 /// Classify user SQL through the pre-parse pipeline and the front door.
@@ -161,9 +169,13 @@ fn engine_front_door(session: &Session) -> sqe_sql::SqlFrontDoor {
 /// Replaces the `parse_and_classify_typed(pre_parse_pipeline(..))` call every
 /// entry point used to spell out (issue #117 kept the ordering; this keeps it
 /// and adds the normalization).
-fn classify_user_sql(session: &Session, sql: &str) -> sqe_core::Result<StatementKind> {
+fn classify_user_sql(
+    session: &Session,
+    sql: &str,
+    upper: &sqe_sql::identifier_case::UpperCaseCatalogs,
+) -> sqe_core::Result<StatementKind> {
     let classifiable = sqe_sql::pre_parse_pipeline(&sqe_sql::UserSql::from(sql))?;
-    let normalized = engine_front_door(session).normalize(classifiable.as_str())?;
+    let normalized = engine_front_door(session, upper).normalize(classifiable.as_str())?;
     sqe_sql::classify_normalized(normalized)
 }
 
@@ -173,8 +185,12 @@ fn classify_user_sql(session: &Session, sql: &str) -> sqe_core::Result<Statement
 /// aliasing, `information_schema` qualification. The DF54 named-TVF-argument
 /// rewrite stays separate because it is a DataFusion version shim, not
 /// dialect normalization.
-fn normalize_for_planning(session: &Session, sql: &str) -> sqe_core::Result<String> {
-    let normalized = engine_front_door(session).normalize(sql)?;
+fn normalize_for_planning(
+    session: &Session,
+    sql: &str,
+    upper: &sqe_sql::identifier_case::UpperCaseCatalogs,
+) -> sqe_core::Result<String> {
+    let normalized = engine_front_door(session, upper).normalize(sql)?;
     Ok(sqe_sql::rewrite_named_tvf_args(normalized.sql()))
 }
 
@@ -736,6 +752,19 @@ impl QueryHandler {
     /// Propagates the cache into the sub-handlers (`CatalogOps`, `WriteHandler`)
     /// so that DDL and write paths also share the same global cache.
     #[must_use = "with_table_cache consumes self; bind the returned QueryHandler"]
+    /// The catalogs configured with `identifier_case = "upper"`, for the
+    /// engine's front door. Rebuilt per statement: a handful of catalogs, and
+    /// the config stays the single source.
+    fn upper_case_catalogs(&self) -> sqe_sql::identifier_case::UpperCaseCatalogs {
+        let mut names = self.config.upper_case_catalogs();
+        names.extend(self.runtime_catalogs.upper_case_names());
+        if names.is_empty() {
+            return Default::default();
+        }
+        sqe_sql::identifier_case::UpperCaseCatalogs::new(names)
+            .with_default_catalog(Some(self.config.resolve_default_catalog()))
+    }
+
     pub fn with_table_cache(mut self, cache: sqe_catalog::TableMetadataCache) -> Self {
         self.catalog_ops = self.catalog_ops.with_table_cache(cache.clone());
         self.write_handler = self.write_handler.with_table_cache(cache.clone());
@@ -1334,7 +1363,7 @@ impl QueryHandler {
             // transaction keeps refusing it below.
             let autocommit = session
                 .in_client_transaction()
-                .then(|| classify_user_sql(session, sql).ok())
+                .then(|| classify_user_sql(session, sql, &self.upper_case_catalogs()).ok())
                 .flatten()
                 .filter(|kind| !kind.allowed_in_transaction())
                 .map(|_| session.clone().with_transaction_id(None));
@@ -1347,7 +1376,7 @@ impl QueryHandler {
                 .write_branch
                 .clone()
                 .filter(|_| txn.is_none())
-                .filter(|_| classify_user_sql(session, sql).is_ok_and(|k| k.is_data_write()));
+                .filter(|_| classify_user_sql(session, sql, &self.upper_case_catalogs()).is_ok_and(|k| k.is_data_write()));
             sqe_catalog::txn::write_scope(
                 txn,
                 write_branch,
@@ -1521,7 +1550,7 @@ impl QueryHandler {
         error: &SqeError,
     ) {
         if let Some(ref audit) = self.audit {
-            let kind = classify_user_sql(session, sql).ok();
+            let kind = classify_user_sql(session, sql, &self.upper_case_catalogs()).ok();
             crate::audit_emitter::emit_failed_statement(
                 audit,
                 session,
@@ -1589,7 +1618,7 @@ impl QueryHandler {
         let failed = |e: SqeError| {
             self.audit_failure(session, sql, start, client_ip.clone(), caller_query_id, e)
         };
-        let kind = classify_user_sql(session, sql).map_err(failed)?;
+        let kind = classify_user_sql(session, sql, &self.upper_case_catalogs()).map_err(failed)?;
         let kind_name = kind.name().to_string();
         self.refuse_under_pressure(&admission, matches!(kind, StatementKind::Query(_)), sql)
             .map_err(failed)?;
@@ -3762,7 +3791,7 @@ impl QueryHandler {
         numbered_sql: &str,
     ) -> sqe_core::Result<Option<(LogicalPlan, SchemaRef)>> {
         reject_oversized_sql(&self.config.query, numbered_sql)?;
-        let kind = classify_user_sql(session, numbered_sql)?;
+        let kind = classify_user_sql(session, numbered_sql, &self.upper_case_catalogs())?;
         // Inside a transaction a stored plan would pin the tables it loaded
         // to the transaction's branch for every later execution (#821).
         if !matches!(kind, StatementKind::Query(_)) || session.transaction_id.is_some() {
@@ -3821,7 +3850,7 @@ impl QueryHandler {
         let start = std::time::Instant::now();
         let failed =
             |e: SqeError| self.audit_failure(session, sql, start, client_ip.clone(), query_id, e);
-        let kind = classify_user_sql(session, sql).map_err(failed)?;
+        let kind = classify_user_sql(session, sql, &self.upper_case_catalogs()).map_err(failed)?;
         let kind_name = kind.name().to_string();
         if !matches!(kind, StatementKind::Query(_)) {
             return Err(SqeError::NotImplemented(
@@ -4157,7 +4186,7 @@ impl QueryHandler {
         // (CAST(v AS JSON) -> to_json(v), the $-suffix metadata-table
         // rewrite, ...), `_colN` aliasing and `information_schema`
         // qualification.
-        let sql = normalize_for_planning(session, &sql)?;
+        let sql = normalize_for_planning(session, &sql, &self.upper_case_catalogs())?;
         let sql = sql.as_str();
 
         let plan_span = tracing::info_span!(
@@ -4205,7 +4234,7 @@ impl QueryHandler {
 
         // Pre-parse pipeline then the SQL front door; see `pipeline_types.rs`
         // for the trust-boundary contract (issue #117).
-        let kind = classify_user_sql(session, sql)?;
+        let kind = classify_user_sql(session, sql, &self.upper_case_catalogs())?;
 
         if matches!(kind, StatementKind::Query(_)) {
             // get_flight_info plans the result schema WITHOUT executing, so it
@@ -4314,7 +4343,7 @@ impl QueryHandler {
             return untyped;
         }
         let is_dml = matches!(
-            classify_user_sql(session, numbered_sql),
+            classify_user_sql(session, numbered_sql, &self.upper_case_catalogs()),
             Ok(StatementKind::Insert(_) | StatementKind::Update(_) | StatementKind::Delete(_))
         );
         if !is_dml {
@@ -4341,7 +4370,7 @@ impl QueryHandler {
         numbered_sql: &str,
         param_count: usize,
     ) -> sqe_core::Result<Vec<Option<DataType>>> {
-        let kind = classify_user_sql(session, numbered_sql)?;
+        let kind = classify_user_sql(session, numbered_sql, &self.upper_case_catalogs())?;
         if let Some(stmt) = kind.statement() {
             self.preflight_resolve_catalogs(stmt, session).await?;
         }
@@ -4565,7 +4594,7 @@ impl QueryHandler {
             // Trino-compat AST rewrites (`CAST(v AS JSON)` -> `to_json(v)`,
             // ...), `_colN` aliasing and `information_schema` qualification,
             // through the same front door every entry point uses.
-            let sql = normalize_for_planning(session, &sql)?;
+            let sql = normalize_for_planning(session, &sql, &self.upper_case_catalogs())?;
             let sql = sql.as_str();
 
             // Plan the query via DataFusion's SQL planner
@@ -12523,8 +12552,8 @@ warehouse = "wh1"
             ),
         ] {
             let ran = async {
-                let kind = classify_user_sql(&session, &sql)?;
-                let text = normalize_for_planning(&session, &sql)?;
+                let kind = classify_user_sql(&session, &sql, &Default::default())?;
+                let text = normalize_for_planning(&session, &sql, &Default::default())?;
                 let df = sqe_catalog::file_tvf_prepare::plan_sql(&ctx, &text)
                     .await
                     .map_err(SqeError::planning)?;
