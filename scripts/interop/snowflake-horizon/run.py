@@ -70,6 +70,7 @@ def token():
     """A Horizon access token, minted from the key pair. Lives about an hour; reuse it for 40 minutes."""
     if _token["value"] and time.time() - _token["at"] < 2400:
         return _token["value"]
+    # nosemgrep: opt.aikido.semgrep-rules.python.lang.security.audit.dangerous-subprocess-use-audit, opt.aikido.semgrep-rules.python.lang.security.audit.dangerous-subprocess-use-tainted-env-args -- operator's own Snowflake CLI (SNOW), argv list, no shell
     jwt = subprocess.run([SNOW, "connection", "generate-jwt", "-x", "--account", ACCOUNT, "--user", USER,
                           "--private-key-file", KEY, "--silent"],
                          check=True, capture_output=True, text=True).stdout.strip()
