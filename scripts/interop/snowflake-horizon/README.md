@@ -100,12 +100,20 @@ and its own `[metrics] prometheus_port`. Start the worker first.
   `SF_RUN_NS`).
 - **VALUES.** Snowflake refuses `PARSE_JSON` and structured casts inside
   `VALUES`, so phase A inserts with `SELECT ... UNION ALL`.
-- **Copy-on-write DML.** Snowflake's DELETE, UPDATE and MERGE rewrite data
-  files on V2 and V3 and write no delete files, so the run cannot test SQE
-  reading a Snowflake deletion vector. The other direction is covered:
-  `sqe_v3_mor` is merge-on-read, SQE's DELETE on it writes a deletion
-  vector (the phase F `$snapshots` probe must show `added-dvs` 1), and
-  phase E checks that Snowflake applies it.
+- **Merge-on-read DML.** Snowflake rewrites small tables copy-on-write
+  whatever the table setting, so `SF_RUN_V2` / `SF_RUN_V3` never get a
+  delete file. `SF_RUN_MOR_V2` / `SF_RUN_MOR_V3` hold 1M rows with
+  `ICEBERG_MERGE_ON_READ_BEHAVIOR = 'enabled'`: Snowflake's DELETE writes a
+  position delete file (V2) or a deletion vector (V3), and the `mor_*`
+  compare rows check that SQE applies them. The phase F `$snapshots`
+  probes must show `total-delete-files` above 0. Reading them needs parquet
+  59.3.2 or later (Snowflake writes 512-value `DELTA_BINARY_PACKED`
+  miniblocks; 59.3.1 fails with "cannot skip miniblock of size 512").
+  The other direction: `sqe_v3_mor` is merge-on-read, SQE's DELETE on it
+  writes a deletion vector (the `$snapshots` probe must show `added-dvs`
+  1), and phase E checks that Snowflake applies it.
+- **Checksums.** The redactor masks any 12-digit number as an AWS account
+  id, so the `mor_*_agg` rows sum `ID % 997` instead of `ID`.
 
 ## Snowflake behaviour SQE handles
 
