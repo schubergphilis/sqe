@@ -324,7 +324,13 @@ pub async fn create_session_context(
 
             let session_config = sqe_catalog::engine_session_config()
                 .with_information_schema(true)
-                .with_default_catalog_and_schema(&default_catalog, &session_schema);
+                .with_default_catalog_and_schema(&default_catalog, &session_schema)
+                // `coordinator.spill_compression` (#788): DataFusion writes
+                // spill files uncompressed unless told otherwise.
+                .set_str(
+                    "datafusion.execution.spill_compression",
+                    config.coordinator.spill_compression.spill_codec(),
+                );
 
             // Dynamic-filter membership pushdown sizing. DataFusion only
             // materializes the build-side key set as an IN-list (extractable,
@@ -756,25 +762,12 @@ pub async fn create_session_context(
                 ctx.register_udf(udf);
             }
 
-            // Register Trino-compatible function aliases (year(), month(), day_of_week(), etc.)
-            // so Trino SQL and dbt models work without modification.
-            sqe_trino_functions::register_trino_functions(&ctx);
-
-            // Register extended Trino-compatible functions (soundex, regexp_extract, word_stem, etc.)
-            sqe_trino_functions::register_extended_trino_functions(&ctx);
-
-            // Register JSON functions from datafusion-functions-json crate.
-            // Provides: json_get, json_get_str, json_get_int, json_get_float, json_get_bool,
-            //           json_get_json, json_get_array, json_contains, json_as_text, json_length
-            datafusion_functions_json::register_all(&mut ctx)
-                .map_err(|e| Arc::new(SqeError::Config(format!("Failed to register JSON functions: {e}"))))?;
-            // A JSON column of a v3 table is a variant; the json_* functions
-            // read it as its JSON text (#849).
-            sqe_core::variant_json_args::accept_variant_in_json_functions(&ctx);
-            // Typed field access that skips the JSON text (#857).
-            sqe_core::variant_get::register_variant_functions(&ctx);
-            // ST_* over WKB geometry values (#863).
-            sqe_geo::register_geo_functions(&ctx);
+            // Trino's library (year(), if(), date_parse, ...), the JSON
+            // functions, variant access and ST_*: the one set a view body
+            // also plans with (ai-portal-data#359), so Trino SQL, dbt models
+            // and views over them work without modification.
+            sqe_catalog::session_tuning::register_engine_functions(&mut ctx)
+                .map_err(|e| Arc::new(SqeError::Config(format!("Failed to register engine functions: {e}"))))?;
 
             // Register the read_parquet() table-valued function so users can
             // query external Parquet files directly from SQL:
@@ -1153,6 +1146,16 @@ impl crate::write_handler::CatalogDiscovery for PolarisCatalogDiscovery {
         table_cache: Option<&TableMetadataCache>,
     ) -> Option<Arc<SessionCatalog>> {
         discover_session_catalog(warehouse, config, session, table_cache).await
+    }
+
+    async fn configured_session_catalog(
+        &self,
+        name: &str,
+        config: &SqeConfig,
+        session: &Session,
+        table_cache: Option<&TableMetadataCache>,
+    ) -> Option<Arc<SessionCatalog>> {
+        configured_session_catalog(name, config, session, table_cache).await
     }
 
     async fn invalidate_session_cache(&self, username: &str) {

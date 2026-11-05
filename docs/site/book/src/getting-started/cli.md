@@ -207,6 +207,8 @@ sqe> SELECT * FROM prod_cat.sales.orders LIMIT 5;
 sqe> DETACH prod_cat;
 ```
 
+An `iceberg_rest` ATTACH reads its data files from the store the CLI is configured for (`--s3-endpoint`, `SQE_STORAGE__S3_*`, `AWS_*`), so a Polaris on a local MinIO needs no S3 options in the ATTACH. A catalog on another store names its own: `S3_ENDPOINT`, `S3_REGION`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_SESSION_TOKEN`, `S3_PATH_STYLE`. Once any of these is set, the CLI's settings are not used. See [Object store of an `iceberg_rest` catalog](../operations/catalogs.md#object-store-of-an-iceberg_rest-catalog).
+
 A bearer token stops working when it expires. For a catalog that issues short-lived tokens, store the client credential instead: `CREATE SECRET prod (TYPE oauth2, CLIENT_ID 'app', CLIENT_SECRET '...', TOKEN_URL 'https://idp.example.com/token', SCOPE 'catalog')`. The REST client fetches a token with it and fetches a new one when the catalog answers 401.
 
 Supported `TYPE` values are `iceberg_rest`, `glue`, `s3tables`, `hms`, `jdbc`, `sqlite`, and `hadoop`. See [Runtime catalog management](../operations/catalogs.md) for the full reference. The matrix of where each backend can be reached:
@@ -478,6 +480,12 @@ sqe-cli -e "SELECT 1 AS a, 'hello' AS b;" --format json
 ```json
 {"a":"1","b":"hello"}
 ```
+
+### NULL values
+
+SQL NULL is `null` in JSON and `NULL` in the table. CSV and TSV print an
+empty field, so NULL and an empty string look the same there; use
+`--format json` when the difference matters.
 
 ## Authentication
 

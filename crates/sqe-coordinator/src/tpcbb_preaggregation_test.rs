@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{ArrayRef, Decimal128Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use datafusion::prelude::SessionContext;
 
 #[tokio::test]
@@ -42,16 +42,21 @@ async fn preaggregation_preserves_fact_join_multiplicity_and_nulls() {
             Arc::new(Int32Array::from(vec![1, 1, 1, 2, 2, 3, 5])) as ArrayRef,
         ),
         (
+            // decimal(7,2) like the generated table, in cents.
             "ss_net_paid",
-            Arc::new(Float64Array::from(vec![
-                Some(10.0),
-                Some(20.0),
-                None,
-                Some(5.0),
-                None,
-                None,
-                Some(99.0),
-            ])) as ArrayRef,
+            Arc::new(
+                Decimal128Array::from(vec![
+                    Some(1_000),
+                    Some(2_000),
+                    None,
+                    Some(500),
+                    None,
+                    None,
+                    Some(9_900),
+                ])
+                .with_precision_and_scale(7, 2)
+                .unwrap(),
+            ) as ArrayRef,
         ),
     ])
     .unwrap();

@@ -86,6 +86,7 @@ fn worker_task_ctx() -> &'static datafusion::execution::TaskContext {
         std::sync::LazyLock::new(|| {
             let ctx = datafusion::prelude::SessionContext::new();
             sqe_geo::register_geo_functions(&ctx);
+            sqe_catalog::session_tuning::register_rescale(&ctx);
             ctx.task_ctx()
         });
     &CTX

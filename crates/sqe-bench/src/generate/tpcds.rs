@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow_array::{Date32Array, Float64Array, Int32Array, RecordBatch, StringArray};
+use arrow_array::{Date32Array, Decimal128Array, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -25,8 +25,15 @@ fn schema(fields: &[(&str, DataType)]) -> SchemaRef {
 fn i32() -> DataType {
     DataType::Int32
 }
-fn f64() -> DataType {
-    DataType::Float64
+// Numeric types follow the TPC-DS spec (benchmarks/schemas/tpcds.sql): money
+// is decimal(7,2), GMT offsets and tax rates decimal(5,2), p_cost
+// decimal(15,2). Float64 here made every SUM order-dependent and gave
+// DataFusion a different plan and result type than Trino or Spark would see.
+fn money() -> DataType {
+    DataType::Decimal128(7, 2)
+}
+fn dec5_2() -> DataType {
+    DataType::Decimal128(5, 2)
 }
 fn str() -> DataType {
     DataType::Utf8
@@ -52,18 +59,18 @@ fn store_sales_schema() -> SchemaRef {
         ("ss_promo_sk", i32()),
         ("ss_ticket_number", i32()),
         ("ss_quantity", i32()),
-        ("ss_wholesale_cost", f64()),
-        ("ss_list_price", f64()),
-        ("ss_sales_price", f64()),
-        ("ss_ext_discount_amt", f64()),
-        ("ss_ext_sales_price", f64()),
-        ("ss_ext_wholesale_cost", f64()),
-        ("ss_ext_list_price", f64()),
-        ("ss_ext_tax", f64()),
-        ("ss_coupon_amt", f64()),
-        ("ss_net_paid", f64()),
-        ("ss_net_paid_inc_tax", f64()),
-        ("ss_net_profit", f64()),
+        ("ss_wholesale_cost", money()),
+        ("ss_list_price", money()),
+        ("ss_sales_price", money()),
+        ("ss_ext_discount_amt", money()),
+        ("ss_ext_sales_price", money()),
+        ("ss_ext_wholesale_cost", money()),
+        ("ss_ext_list_price", money()),
+        ("ss_ext_tax", money()),
+        ("ss_coupon_amt", money()),
+        ("ss_net_paid", money()),
+        ("ss_net_paid_inc_tax", money()),
+        ("ss_net_profit", money()),
     ])
 }
 
@@ -80,15 +87,15 @@ fn store_returns_schema() -> SchemaRef {
         ("sr_reason_sk", i32()),
         ("sr_ticket_number", i32()),
         ("sr_return_quantity", i32()),
-        ("sr_return_amt", f64()),
-        ("sr_return_tax", f64()),
-        ("sr_return_amt_inc_tax", f64()),
-        ("sr_fee", f64()),
-        ("sr_return_ship_cost", f64()),
-        ("sr_refunded_cash", f64()),
-        ("sr_reversed_charge", f64()),
-        ("sr_store_credit", f64()),
-        ("sr_net_loss", f64()),
+        ("sr_return_amt", money()),
+        ("sr_return_tax", money()),
+        ("sr_return_amt_inc_tax", money()),
+        ("sr_fee", money()),
+        ("sr_return_ship_cost", money()),
+        ("sr_refunded_cash", money()),
+        ("sr_reversed_charge", money()),
+        ("sr_store_credit", money()),
+        ("sr_net_loss", money()),
     ])
 }
 
@@ -113,21 +120,21 @@ fn catalog_sales_schema() -> SchemaRef {
         ("cs_promo_sk", i32()),
         ("cs_order_number", i32()),
         ("cs_quantity", i32()),
-        ("cs_wholesale_cost", f64()),
-        ("cs_list_price", f64()),
-        ("cs_sales_price", f64()),
-        ("cs_ext_discount_amt", f64()),
-        ("cs_ext_sales_price", f64()),
-        ("cs_ext_wholesale_cost", f64()),
-        ("cs_ext_list_price", f64()),
-        ("cs_ext_tax", f64()),
-        ("cs_coupon_amt", f64()),
-        ("cs_ext_ship_cost", f64()),
-        ("cs_net_paid", f64()),
-        ("cs_net_paid_inc_tax", f64()),
-        ("cs_net_paid_inc_ship", f64()),
-        ("cs_net_paid_inc_ship_tax", f64()),
-        ("cs_net_profit", f64()),
+        ("cs_wholesale_cost", money()),
+        ("cs_list_price", money()),
+        ("cs_sales_price", money()),
+        ("cs_ext_discount_amt", money()),
+        ("cs_ext_sales_price", money()),
+        ("cs_ext_wholesale_cost", money()),
+        ("cs_ext_list_price", money()),
+        ("cs_ext_tax", money()),
+        ("cs_coupon_amt", money()),
+        ("cs_ext_ship_cost", money()),
+        ("cs_net_paid", money()),
+        ("cs_net_paid_inc_tax", money()),
+        ("cs_net_paid_inc_ship", money()),
+        ("cs_net_paid_inc_ship_tax", money()),
+        ("cs_net_profit", money()),
     ])
 }
 
@@ -151,15 +158,15 @@ fn catalog_returns_schema() -> SchemaRef {
         ("cr_reason_sk", i32()),
         ("cr_order_number", i32()),
         ("cr_return_quantity", i32()),
-        ("cr_return_amount", f64()),
-        ("cr_return_tax", f64()),
-        ("cr_return_amt_inc_tax", f64()),
-        ("cr_fee", f64()),
-        ("cr_return_ship_cost", f64()),
-        ("cr_refunded_cash", f64()),
-        ("cr_reversed_charge", f64()),
-        ("cr_store_credit", f64()),
-        ("cr_net_loss", f64()),
+        ("cr_return_amount", money()),
+        ("cr_return_tax", money()),
+        ("cr_return_amt_inc_tax", money()),
+        ("cr_fee", money()),
+        ("cr_return_ship_cost", money()),
+        ("cr_refunded_cash", money()),
+        ("cr_reversed_charge", money()),
+        ("cr_store_credit", money()),
+        ("cr_net_loss", money()),
     ])
 }
 
@@ -184,21 +191,21 @@ fn web_sales_schema() -> SchemaRef {
         ("ws_promo_sk", i32()),
         ("ws_order_number", i32()),
         ("ws_quantity", i32()),
-        ("ws_wholesale_cost", f64()),
-        ("ws_list_price", f64()),
-        ("ws_sales_price", f64()),
-        ("ws_ext_discount_amt", f64()),
-        ("ws_ext_sales_price", f64()),
-        ("ws_ext_wholesale_cost", f64()),
-        ("ws_ext_list_price", f64()),
-        ("ws_ext_tax", f64()),
-        ("ws_coupon_amt", f64()),
-        ("ws_ext_ship_cost", f64()),
-        ("ws_net_paid", f64()),
-        ("ws_net_paid_inc_tax", f64()),
-        ("ws_net_paid_inc_ship", f64()),
-        ("ws_net_paid_inc_ship_tax", f64()),
-        ("ws_net_profit", f64()),
+        ("ws_wholesale_cost", money()),
+        ("ws_list_price", money()),
+        ("ws_sales_price", money()),
+        ("ws_ext_discount_amt", money()),
+        ("ws_ext_sales_price", money()),
+        ("ws_ext_wholesale_cost", money()),
+        ("ws_ext_list_price", money()),
+        ("ws_ext_tax", money()),
+        ("ws_coupon_amt", money()),
+        ("ws_ext_ship_cost", money()),
+        ("ws_net_paid", money()),
+        ("ws_net_paid_inc_tax", money()),
+        ("ws_net_paid_inc_ship", money()),
+        ("ws_net_paid_inc_ship_tax", money()),
+        ("ws_net_profit", money()),
     ])
 }
 
@@ -219,15 +226,15 @@ fn web_returns_schema() -> SchemaRef {
         ("wr_reason_sk", i32()),
         ("wr_order_number", i32()),
         ("wr_return_quantity", i32()),
-        ("wr_return_amt", f64()),
-        ("wr_return_tax", f64()),
-        ("wr_return_amt_inc_tax", f64()),
-        ("wr_fee", f64()),
-        ("wr_return_ship_cost", f64()),
-        ("wr_refunded_cash", f64()),
-        ("wr_reversed_charge", f64()),
-        ("wr_account_credit", f64()),
-        ("wr_net_loss", f64()),
+        ("wr_return_amt", money()),
+        ("wr_return_tax", money()),
+        ("wr_return_amt_inc_tax", money()),
+        ("wr_fee", money()),
+        ("wr_return_ship_cost", money()),
+        ("wr_refunded_cash", money()),
+        ("wr_reversed_charge", money()),
+        ("wr_account_credit", money()),
+        ("wr_net_loss", money()),
     ])
 }
 
@@ -295,8 +302,8 @@ fn item_schema() -> SchemaRef {
         ("i_rec_start_date", date()),
         ("i_rec_end_date", date()),
         ("i_item_desc", str()),
-        ("i_current_price", f64()),
-        ("i_wholesale_cost", f64()),
+        ("i_current_price", money()),
+        ("i_wholesale_cost", money()),
         ("i_brand_id", i32()),
         ("i_brand", str()),
         ("i_class_id", i32()),
@@ -351,7 +358,7 @@ fn customer_address_schema() -> SchemaRef {
         ("ca_state", str()),
         ("ca_zip", str()),
         ("ca_country", str()),
-        ("ca_gmt_offset", f64()),
+        ("ca_gmt_offset", dec5_2()),
         ("ca_location_type", str()),
     ])
 }
@@ -409,8 +416,9 @@ fn store_schema() -> SchemaRef {
         ("s_state", str()),
         ("s_zip", str()),
         ("s_country", str()),
-        ("s_gmt_offset", f64()),
-        ("s_tax_percentage", f64()),
+        ("s_gmt_offset", dec5_2()),
+        // Sic: the spec DDL (and Trino's tpcds connector) spell it this way.
+        ("s_tax_precentage", dec5_2()),
     ])
 }
 
@@ -454,8 +462,8 @@ fn web_site_schema() -> SchemaRef {
         ("web_state", str()),
         ("web_zip", str()),
         ("web_country", str()),
-        ("web_gmt_offset", f64()),
-        ("web_tax_percentage", f64()),
+        ("web_gmt_offset", dec5_2()),
+        ("web_tax_percentage", dec5_2()),
     ])
 }
 
@@ -493,7 +501,7 @@ fn warehouse_schema() -> SchemaRef {
         ("w_state", str()),
         ("w_zip", str()),
         ("w_country", str()),
-        ("w_gmt_offset", f64()),
+        ("w_gmt_offset", dec5_2()),
     ])
 }
 
@@ -504,7 +512,7 @@ fn promotion_schema() -> SchemaRef {
         ("p_start_date_sk", i32()),
         ("p_end_date_sk", i32()),
         ("p_item_sk", i32()),
-        ("p_cost", f64()),
+        ("p_cost", DataType::Decimal128(15, 2)),
         ("p_response_target", i32()),
         ("p_promo_name", str()),
         ("p_channel_dmail", str()),
@@ -579,8 +587,8 @@ fn call_center_schema() -> SchemaRef {
         ("cc_state", str()),
         ("cc_zip", str()),
         ("cc_country", str()),
-        ("cc_gmt_offset", f64()),
-        ("cc_tax_percentage", f64()),
+        ("cc_gmt_offset", dec5_2()),
+        ("cc_tax_percentage", dec5_2()),
     ])
 }
 
@@ -622,19 +630,27 @@ fn inventory_rows(sf: f64) -> usize {
     261 * item_rows(sf) * warehouse_rows(sf) / 2
 }
 
+/// The scale factors dsdgen publishes row counts for above sf1.
+const DSDGEN_SCALES: [f64; 8] = [
+    10.0, 100.0, 300.0, 1_000.0, 3_000.0, 10_000.0, 30_000.0, 100_000.0,
+];
+
 /// Linear up to sf1 (both validated reference points), then the official
-/// dsdgen counts at the published scale points, interpolated linearly
-/// between them and held flat past the last one.
+/// dsdgen counts at [`DSDGEN_SCALES`], interpolated linearly between them
+/// (as dsdgen does for scales it does not list) and held flat past the last.
 ///
-/// item and warehouse both grow far slower than linearly above sf1. Scaling
-/// them linearly made inventory, their product, quadratic: 1.17B rows at
-/// sf10 instead of 133M, and sorting it on load spilled 14 GiB.
-fn sublinear_above_sf1(sf: f64, sf1_rows: f64, points: &[(f64, f64)]) -> usize {
+/// Every scaling dimension grows slower than linearly above sf1. Scaling
+/// item and warehouse linearly made inventory, their product, quadratic:
+/// 1.17B rows at sf10 instead of 133M, and sorting it on load spilled
+/// 14 GiB. Linear customer and web_page were 2x and 3x the official count
+/// at sf10, 5x and 3x at sf100. The counts were read from Trino's tpcds
+/// connector (a dsdgen port) with `count(*)` per published scale.
+fn sublinear_above_sf1(sf: f64, sf1_rows: f64, counts: &[f64; 8]) -> usize {
     if sf <= 1.0 {
         return super::scaled(sf, sf1_rows);
     }
     let mut prev = (1.0, sf1_rows);
-    for &(scale, rows) in points {
+    for (&scale, &rows) in DSDGEN_SCALES.iter().zip(counts) {
         if sf <= scale {
             let t = (sf - prev.0) / (scale - prev.0);
             return (prev.1 + t * (rows - prev.1)).round() as usize;
@@ -644,51 +660,100 @@ fn sublinear_above_sf1(sf: f64, sf1_rows: f64, points: &[(f64, f64)]) -> usize {
     prev.1 as usize
 }
 
-// 180 / 18,000; sf10 102,000; sf100 204,000; sf1000 300,000.
-fn item_rows(sf: f64) -> usize {
+// Official sf0.01 / sf1 counts in the comments; the arrays are the counts at
+// DSDGEN_SCALES. Below sf1 these are linear with a floor of 1 row.
+
+// 180 / 18,000. tpcbb draws its item keys from the same domain.
+pub(super) fn item_rows(sf: f64) -> usize {
     sublinear_above_sf1(
         sf,
         18_000.0,
-        &[(10.0, 102_000.0), (100.0, 204_000.0), (1000.0, 300_000.0)],
+        &[
+            102_000.0, 204_000.0, 264_000.0, 300_000.0, 360_000.0, 402_000.0, 462_000.0, 502_000.0,
+        ],
     )
 }
-
-// Linear dimensions. 1,000 / 100,000 etc.
-fn customer_rows(sf: f64) -> usize {
-    super::scaled(sf, 100_000.0)
-} // 1,000 / 100,000
+// 1,000 / 100,000. tpcbb draws its user keys from the same domain.
+pub(super) fn customer_rows(sf: f64) -> usize {
+    sublinear_above_sf1(
+        sf,
+        100_000.0,
+        &[
+            500_000.0,
+            2_000_000.0,
+            5_000_000.0,
+            12_000_000.0,
+            30_000_000.0,
+            65_000_000.0,
+            80_000_000.0,
+            100_000_000.0,
+        ],
+    )
+}
+// 500 / 50,000
 fn customer_address_rows(sf: f64) -> usize {
-    super::scaled(sf, 50_000.0)
-} // 500 / 50,000
+    sublinear_above_sf1(
+        sf,
+        50_000.0,
+        &[
+            250_000.0,
+            1_000_000.0,
+            2_500_000.0,
+            6_000_000.0,
+            15_000_000.0,
+            32_500_000.0,
+            40_000_000.0,
+            50_000_000.0,
+        ],
+    )
+}
 
 // Linear below sf1, fixed at 1,920,800 from sf1 up. 19,208 / 1,920,800.
 fn customer_demographics_rows(sf: f64) -> usize {
     (sf * 1_920_800.0).clamp(1.0, 1_920_800.0) as usize
 }
 
-// Linear with a floor of 1 row. Official sf0.01 / sf1 counts:
+// 1 / 12
 fn store_rows(sf: f64) -> usize {
-    super::scaled(sf, 12.0)
-} // 1 / 12
-fn web_site_rows(sf: f64) -> usize {
-    super::scaled(sf, 30.0)
-} // 1 / 30
-fn web_page_rows(sf: f64) -> usize {
-    super::scaled(sf, 60.0)
-} // 1 / 60
-  // 1 / 5; sf10 10; sf100 15; sf1000 20.
-fn warehouse_rows(sf: f64) -> usize {
-    sublinear_above_sf1(sf, 5.0, &[(10.0, 10.0), (100.0, 15.0), (1000.0, 20.0)])
+    let counts = [
+        102.0, 402.0, 804.0, 1_002.0, 1_350.0, 1_500.0, 1_704.0, 1_902.0,
+    ];
+    sublinear_above_sf1(sf, 12.0, &counts)
 }
+// 1 / 30. Not monotonic in dsdgen either: 42 at sf10, 24 at sf100.
+fn web_site_rows(sf: f64) -> usize {
+    let counts = [42.0, 24.0, 42.0, 54.0, 66.0, 78.0, 84.0, 96.0];
+    sublinear_above_sf1(sf, 30.0, &counts)
+}
+// 1 / 60. tpcbb draws its click page keys from the same domain.
+pub(super) fn web_page_rows(sf: f64) -> usize {
+    let counts = [
+        200.0, 2_040.0, 2_604.0, 3_000.0, 3_600.0, 4_002.0, 4_602.0, 5_004.0,
+    ];
+    sublinear_above_sf1(sf, 60.0, &counts)
+}
+// 1 / 5
+fn warehouse_rows(sf: f64) -> usize {
+    let counts = [10.0, 15.0, 17.0, 20.0, 22.0, 25.0, 27.0, 30.0];
+    sublinear_above_sf1(sf, 5.0, &counts)
+}
+// 3 / 300
 fn promotion_rows(sf: f64) -> usize {
-    super::scaled(sf, 300.0)
-} // 3 / 300
+    let counts = [
+        500.0, 1_000.0, 1_300.0, 1_500.0, 1_800.0, 2_000.0, 2_300.0, 2_500.0,
+    ];
+    sublinear_above_sf1(sf, 300.0, &counts)
+}
+// 1 / 35
 fn reason_rows(sf: f64) -> usize {
-    super::scaled(sf, 35.0)
-} // 1 / 35
+    let counts = [45.0, 55.0, 60.0, 65.0, 67.0, 70.0, 72.0, 75.0];
+    sublinear_above_sf1(sf, 35.0, &counts)
+}
+// 1 / 6
 fn call_center_rows(sf: f64) -> usize {
-    super::scaled(sf, 6.0)
-} // 1 / 6
+    let counts = [24.0, 30.0, 36.0, 42.0, 48.0, 54.0, 60.0, 60.0];
+    sublinear_above_sf1(sf, 6.0, &counts)
+}
 
 // Fixed at every scale (identical at sf0.01 and sf1).
 fn date_dim_rows(_sf: f64) -> usize {
@@ -706,9 +771,15 @@ fn income_band_rows(_sf: f64) -> usize {
 fn ship_mode_rows(_sf: f64) -> usize {
     20
 }
-// catalog_page only steps up above sf1; both reference points are 11,718.
-fn catalog_page_rows(_sf: f64) -> usize {
-    11_718
+// Fixed at 11,718 up to sf1 (both reference points), dsdgen counts above.
+fn catalog_page_rows(sf: f64) -> usize {
+    if sf <= 1.0 {
+        return 11_718;
+    }
+    let counts = [
+        12_000.0, 20_400.0, 26_000.0, 30_000.0, 36_000.0, 40_000.0, 46_000.0, 50_000.0,
+    ];
+    sublinear_above_sf1(sf, 11_718.0, &counts)
 }
 
 // ---------------------------------------------------------------------------
@@ -719,7 +790,9 @@ const BATCH_SIZE: usize = 10_000;
 
 // TPC-DS date range: 1998-01-01 to 2003-12-31
 const DS_DATE_START: i32 = 10227; // days since epoch for 1998-01-01
-const DS_DATE_RANGE: i32 = 2191; // ~6 years
+/// `d_date_sk` 1..=DS_DATE_RANGE is the 1998-2003 sales window; every fact
+/// date key (and tpcbb's click dates) is drawn from it.
+pub(super) const DS_DATE_RANGE: i32 = 2191; // ~6 years
 
 fn seed_for_table(name: &str) -> u64 {
     name.bytes()
@@ -749,6 +822,13 @@ fn seed_salt() -> u64 {
 
 fn random_date(rng: &mut StdRng) -> i32 {
     DS_DATE_START + rng.random_range(0..DS_DATE_RANGE)
+}
+
+/// Round to whole cents. Prices are rounded before the extended amounts are
+/// derived from them, so `ext_sales_price = sales_price * quantity` and
+/// `net_paid_inc_tax = net_paid + ext_tax` hold exactly in the decimal data.
+fn cents(x: f64) -> f64 {
+    (x * 100.0).round() / 100.0
 }
 
 /// Random `d_date_sk` surrogate key for fact tables, constrained to the
@@ -1548,6 +1628,43 @@ const Q85_CDEMO_SK: i32 = 15;
 const Q85_2000_DATE_SK: i32 = 800;
 const Q85_SALES_PRICE: f64 = 125.0;
 
+/// q64 pairs a store's 1999 and 2000 sales of one returned item that is in
+/// `cs_ui` (catalog sales beating twice their refunds), priced 65..=74 in one
+/// of six colours, sold under a cdemo whose marital status differs from the
+/// buyer's current one. About 22 items qualify at SF1 and a 1999 and a 2000
+/// row at the same store is a ~5-pair expectation, so a seed can land on 0
+/// (ours did; official SF1 has 2 rows). Planted: item 6 is purple at 69.00,
+/// store tickets 7 (1999, two returns) and 8 (2000, one return) sell it at
+/// store 1 to customer 7 under cdemo 1 ('S') while customer 7's current cdemo
+/// is 9 ('M'), and catalog order 7 sells it with a 10.00 return.
+const Q64_ITEM: i32 = 6;
+const Q64_CUSTOMER: i32 = 7;
+const Q64_STORE_SK: i32 = 1;
+const Q64_1999_TICKET: i32 = 7;
+const Q64_2000_TICKET: i32 = 8;
+const Q64_CATALOG_ORDER: i32 = 7;
+/// OUR date_dim: year = 1998 + (sk - 1) / 366, so sk 500 is 1999, sk 900 2000.
+const Q64_1999_DATE_SK: i32 = 500;
+const Q64_2000_DATE_SK: i32 = 900;
+/// cdemo sk 1 is 'S', sk 9 is 'M' (see stream_customer_demographics).
+const Q64_SALE_CDEMO_SK: i32 = 1;
+const Q64_CUSTOMER_CDEMO_SK: i32 = 9;
+const Q64_ITEM_PRICE: f64 = 69.0;
+const Q64_ITEM_COLOR: &str = "purple";
+/// Catalog quantity and refund of the planted pair: 99 units at a list price
+/// of at least 1.50 is 148.50 or more, well over twice the 10.00 refund.
+const Q64_CATALOG_QUANTITY: i32 = 99;
+const Q64_CATALOG_REFUND: f64 = 10.0;
+
+impl FkDims {
+    /// Every key the q64 plant pins exists at this scale.
+    fn q64_active(&self) -> bool {
+        self.items >= Q64_ITEM
+            && self.customers >= Q64_CUSTOMER
+            && self.cdemos >= Q64_CUSTOMER_CDEMO_SK
+    }
+}
+
 /// Maximum line items per ticket/order. Lines are uniform in 1..=25 so the
 /// `HAVING count(*) BETWEEN 15 AND 20` windows in q34/q46/q68/q73/q79 match
 /// a healthy fraction of tickets. The old generator emitted exactly one line
@@ -1655,6 +1772,8 @@ fn planted_sale_date(salt: u64, ticket: i32, dims: FkDims) -> Option<i32> {
             Q25_STORE_TICKET if q25 => Some(Q25_APR_2001_DATE_SK),
             Q17_STORE_TICKET if q17 => Some(Q17_2001Q1_DATE_SK),
             Q29_STORE_TICKET if q29 => Some(Q29_SALE_DATE_SK),
+            Q64_1999_TICKET if dims.q64_active() => Some(Q64_1999_DATE_SK),
+            Q64_2000_TICKET if dims.q64_active() => Some(Q64_2000_DATE_SK),
             _ => None,
         },
         CATALOG_ORDER_SALT => match ticket {
@@ -1771,6 +1890,24 @@ fn basket_and_rng(salt: u64, ticket: i32, channel_upper: i32, dims: FkDims) -> (
     // is ('M', 'Advanced Degree').
     if salt == WEB_ORDER_SALT && ticket == Q85_WEB_ORDER && dims.cdemos >= Q85_CDEMO_SK {
         b.cdemo_sk = Some(Q85_CDEMO_SK);
+    }
+    // q64: item 6 at store 1 in 1999 and 2000, every q64 join key non-null.
+    if dims.q64_active()
+        && salt == STORE_TICKET_SALT
+        && (ticket == Q64_1999_TICKET || ticket == Q64_2000_TICKET)
+    {
+        b.items[0] = Q64_ITEM;
+        b.channel_sk = Q64_STORE_SK;
+        b.customer_sk = Some(Q64_CUSTOMER);
+        b.cdemo_sk = Some(Q64_SALE_CDEMO_SK);
+        b.hdemo_sk = Some(1);
+        b.addr_sk = Some(1);
+        b.promo_sk = Some(1);
+    }
+    // q64's cs_ui leg: a catalog sale of item 6 that outweighs its refund.
+    if dims.q64_active() && salt == CATALOG_ORDER_SALT && ticket == Q64_CATALOG_ORDER {
+        b.items[0] = Q64_ITEM;
+        b.quantities[0] = Q64_CATALOG_QUANTITY;
     }
     // Planted sale dates live in `planted_sale_date`, applied by
     // `basket_head`, so the date index sees them too.
@@ -1979,6 +2116,7 @@ where
 
 enum ColVal {
     I32(Option<i32>),
+    /// A decimal column's value; `cols_to_arrays` rounds it to the scale.
     F64(Option<f64>),
     Str(Option<String>),
     Date(Option<i32>),
@@ -2021,15 +2159,27 @@ fn cols_to_arrays(
                         .collect();
                     Arc::new(Int32Array::from(v)) as Arc<dyn arrow_array::Array>
                 }
-                DataType::Float64 => {
-                    let v: Vec<Option<f64>> = col
+                DataType::Decimal128(precision, scale) => {
+                    // Row builders compute in f64; round to the column's
+                    // scale here, as dsdgen rounds to cents.
+                    let factor = 10_f64.powi(i32::from(*scale));
+                    let v: Vec<Option<i128>> = col
                         .into_iter()
                         .map(|c| match c {
-                            ColVal::F64(x) => x,
+                            ColVal::F64(x) => x.map(|x| (x * factor).round() as i128),
                             other => mismatch(field, &other),
                         })
                         .collect();
-                    Arc::new(Float64Array::from(v)) as Arc<dyn arrow_array::Array>
+                    let array = Decimal128Array::from(v)
+                        .with_precision_and_scale(*precision, *scale)
+                        .expect("valid decimal precision/scale");
+                    // with_precision_and_scale checks the type, not the
+                    // values. An overflowing value would be written as a
+                    // corrupt decimal, so fail generation instead.
+                    if let Err(e) = array.validate_decimal_precision(*precision) {
+                        panic!("generator bug: column '{}': {e}", field.name());
+                    }
+                    Arc::new(array) as Arc<dyn arrow_array::Array>
                 }
                 DataType::Date32 => {
                     let v: Vec<Option<i32>> = col
@@ -2103,9 +2253,9 @@ fn stream_store_sales(scale: f64) -> (SchemaRef, super::BatchIterator) {
             let item_sk = b.items[line - 1];
             let qty = b.quantities[line - 1];
             let wc = rng.random_range(10..500i32) as f64 / 10.0;
-            let lp = wc * 1.5;
-            let sp = lp * rng.random_range(50..100i32) as f64 / 100.0;
-            let tax = sp * 0.08;
+            let lp = cents(wc * 1.5);
+            let sp = cents(lp * rng.random_range(50..100i32) as f64 / 100.0);
+            let tax = cents(sp * qty as f64 * 0.08);
             vec![
                 i!(b.date_sk),
                 i!(rng.random_range(0..86400i32)),
@@ -2149,6 +2299,7 @@ fn stream_store_returns(scale: f64) -> (SchemaRef, super::BatchIterator) {
         stores >= Q24_STORE_SK && dims.customers >= Q24_CUSTOMER && dims.items >= Q24_ITEM;
     let q17_active = dims.customers >= Q17_CUSTOMER && dims.items >= Q17_ITEM;
     let q29_active = dims.customers >= Q29_CUSTOMER && dims.items >= Q29_ITEM;
+    let q64_active = dims.q64_active();
     let seed = seed_for_table("store_returns");
     // Pick a fully-emitted sales ticket and return one of its actual line
     // items so (sr_ticket_number, sr_item_sk) joins store_sales
@@ -2163,6 +2314,10 @@ fn stream_store_returns(scale: f64) -> (SchemaRef, super::BatchIterator) {
             1 if q24_active => Some(Q24_STORE_TICKET),
             2 if q17_active => Some(Q17_STORE_TICKET),
             3 if q29_active => Some(Q29_STORE_TICKET),
+            // Two returns on the 1999 ticket, one on the 2000 ticket, so q64's
+            // `cs2.cnt <= cs1.cnt` holds even if a random return adds one.
+            4 | 5 if q64_active => Some(Q64_1999_TICKET),
+            6 if q64_active => Some(Q64_2000_TICKET),
             _ => None,
         };
         if let Some(t) = planted {
@@ -2233,6 +2388,8 @@ fn stream_catalog_sales(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let dims = FkDims::at(scale);
     let ccs = call_center_rows(scale) as i32;
     let whs = warehouse_rows(scale) as i32;
+    let pages = catalog_page_rows(scale) as i32;
+    let modes = ship_mode_rows(scale) as i32;
     sales_batches(
         catalog_sales_schema(),
         total,
@@ -2243,10 +2400,10 @@ fn stream_catalog_sales(scale: f64) -> (SchemaRef, super::BatchIterator) {
             let item_sk = b.items[line - 1];
             let qty = b.quantities[line - 1];
             let wc = rng.random_range(10..500i32) as f64 / 10.0;
-            let lp = wc * 1.5;
-            let sp = lp * rng.random_range(50..100i32) as f64 / 100.0;
-            let tax = sp * 0.08;
-            let ship = sp * 0.05 * qty as f64;
+            let lp = cents(wc * 1.5);
+            let sp = cents(lp * rng.random_range(50..100i32) as f64 / 100.0);
+            let tax = cents(sp * qty as f64 * 0.08);
+            let ship = cents(sp * 0.05 * qty as f64);
             let ship_date = (b.date_sk + rng.random_range(1..=120i32)).min(DS_DATE_RANGE);
             vec![
                 i!(b.date_sk),
@@ -2261,8 +2418,8 @@ fn stream_catalog_sales(scale: f64) -> (SchemaRef, super::BatchIterator) {
                 ColVal::I32(b.ship_hdemo_sk),
                 ColVal::I32(b.ship_addr_sk),
                 i!(b.channel_sk),
-                i!(rng.random_range(1..11_718i32)),
-                i!(rng.random_range(1..20i32)),
+                i!(rng.random_range(1..=pages)),
+                i!(rng.random_range(1..=modes)),
                 i!(rng.random_range(1..=whs)),
                 i!(item_sk),
                 ColVal::I32(b.promo_sk),
@@ -2296,16 +2453,24 @@ fn stream_catalog_returns(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let ccs = call_center_rows(scale) as i32;
     let whs = warehouse_rows(scale) as i32;
     let reasons = reason_rows(scale) as i32;
+    let pages = catalog_page_rows(scale) as i32;
+    let modes = ship_mode_rows(scale) as i32;
     let max_order = returnable_tickets(scale, 1_441_548.0);
+    let q64_active = dims.q64_active();
     let seed = seed_for_table("catalog_returns");
     // Returns lag the sale by <=120 days; a uniform draw over the rest of
     // the calendar starved the early years and emptied q91's Nov-1998
     // catalog-returns window. Same bound as the ship_date fields above.
     let head = move |row: usize| {
-        let (ticket, lag) = hashed_return(seed, row, max_order);
+        let (mut ticket, lag) = hashed_return(seed, row, max_order);
+        // Row 0 returns q64's planted catalog line (see Q64_CATALOG_ORDER).
+        let planted = row == 0 && q64_active;
+        if planted {
+            ticket = Q64_CATALOG_ORDER;
+        }
         ReturnHead {
             ticket,
-            line: None,
+            line: planted.then_some(0),
             ret_date: lagged_return_date(CATALOG_ORDER_SALT, ticket, lag, dims),
         }
     };
@@ -2320,10 +2485,16 @@ fn stream_catalog_returns(scale: f64) -> (SchemaRef, super::BatchIterator) {
         move |_row, h, b, rng| {
             let order = h.ticket;
             let ret_date = h.ret_date;
-            let line = rng.random_range(0..b.lines);
+            let line = h.line.unwrap_or_else(|| rng.random_range(0..b.lines));
             let item_sk = b.items[line];
             let qty = rng.random_range(1..=b.quantities[line]);
             let amt = rng.random_range(10..500i32) as f64;
+            // The planted q64 return is small, so its line passes cs_ui.
+            let amt = if h.line.is_some() {
+                Q64_CATALOG_REFUND
+            } else {
+                amt
+            };
             let tax = amt * 0.08;
             vec![
                 i!(ret_date),
@@ -2338,8 +2509,8 @@ fn stream_catalog_returns(scale: f64) -> (SchemaRef, super::BatchIterator) {
                 ColVal::I32(b.ship_hdemo_sk),
                 ColVal::I32(b.ship_addr_sk),
                 i!(b.channel_sk),
-                i!(rng.random_range(1..11_718i32)),
-                i!(rng.random_range(1..20i32)),
+                i!(rng.random_range(1..=pages)),
+                i!(rng.random_range(1..=modes)),
                 i!(rng.random_range(1..=whs)),
                 i!(rng.random_range(1..=reasons)),
                 i!(order),
@@ -2366,6 +2537,7 @@ fn stream_web_sales(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let wpages = web_page_rows(scale) as i32;
     let wsites = web_site_rows(scale) as i32;
     let whs = warehouse_rows(scale) as i32;
+    let modes = ship_mode_rows(scale) as i32;
     sales_batches(
         web_sales_schema(),
         total,
@@ -2380,16 +2552,15 @@ fn stream_web_sales(scale: f64) -> (SchemaRef, super::BatchIterator) {
             // capped ws_sales_price at ~$74, leaving q85's 100-150 and 150-200
             // price arms structurally empty.
             let wc = rng.random_range(100..10_000i32) as f64 / 100.0;
-            let lp = ((wc * rng.random_range(100..300i32) as f64 / 100.0) * 100.0).round() / 100.0;
-            let mut sp =
-                ((lp * rng.random_range(0..=100i32) as f64 / 100.0) * 100.0).round() / 100.0;
+            let lp = cents(wc * rng.random_range(100..300i32) as f64 / 100.0);
+            let mut sp = cents(lp * rng.random_range(0..=100i32) as f64 / 100.0);
             // q85 filters ws_sales_price BETWEEN 100 AND 150. Draw after the
             // rng so non-planted lines keep parity; then pin the planted order.
             if order == Q85_WEB_ORDER && line == 1 {
                 sp = Q85_SALES_PRICE;
             }
-            let tax = sp * 0.08;
-            let ship = sp * 0.05 * qty as f64;
+            let tax = cents(sp * qty as f64 * 0.08);
+            let ship = cents(sp * 0.05 * qty as f64);
             let ship_date = (b.date_sk + rng.random_range(1..=120i32)).min(DS_DATE_RANGE);
             vec![
                 i!(b.date_sk),
@@ -2406,7 +2577,7 @@ fn stream_web_sales(scale: f64) -> (SchemaRef, super::BatchIterator) {
                 ColVal::I32(b.ship_addr_sk),
                 i!(rng.random_range(1..=wpages)),
                 i!(b.channel_sk),
-                i!(rng.random_range(1..20i32)),
+                i!(rng.random_range(1..=modes)),
                 i!(rng.random_range(1..=whs)),
                 ColVal::I32(b.promo_sk),
                 i!(order),
@@ -2651,13 +2822,19 @@ fn stream_item(scale: f64) -> (SchemaRef, super::BatchIterator) {
             // (dsdgen: ~11%). Log-uniform reproduces the skew.
             let price_ln = rng.random_range(0.09_f64.ln()..99.99_f64.ln());
             let price = (price_ln.exp() * 100.0).round() / 100.0;
+            // i_item_sk 6 (row 5) is q64's planted item, inside 65..=74.
+            let price = if row == (Q64_ITEM - 1) as usize {
+                Q64_ITEM_PRICE
+            } else {
+                price
+            };
             let wc = price * 0.6;
             // i_manufact is derived from a neighborhood of i_manufact_id (spread
             // MANUFACT_LABEL_SPREAD) so the same manufact string spans several ids
             // and vice versa; q41's correlated subquery bridges items on
             // `i_manufact = i1.i_manufact`, which collapses to id equality (0 rows)
             // when the string is a bijection with the id.
-            let manufact_id = rng.random_range(1..1000i32);
+            let manufact_id = rng.random_range(1..=1000i32);
             let manufact_label = ((manufact_id
                 + rng.random_range(0..MANUFACT_LABEL_SPREAD) * MANUFACT_LABEL_STRIDE)
                 % 1000)
@@ -2667,7 +2844,7 @@ fn stream_item(scale: f64) -> (SchemaRef, super::BatchIterator) {
             // class vocabulary; i_class_id stays independent like dsdgen's.
             let cat = rng.random_range(0..CATEGORIES.len());
             let class_idx = rng.random_range(0..CATEGORY_CLASSES[cat].len());
-            let class_id = rng.random_range(1..16i32);
+            let class_id = rng.random_range(1..=16i32);
             // Plant i_item_sk 1 as a Women/maternity item (CATEGORIES[0] /
             // CATEGORY_CLASSES[0][2]) for the q54 coincidence (see
             // PLANTED_Q54_TICKETS); the draws above are kept for parity.
@@ -2704,14 +2881,15 @@ fn stream_item(scale: f64) -> (SchemaRef, super::BatchIterator) {
                 s!(format!("manufact#{manufact_label}")),
                 s!(random_str(rng, ITEM_SIZES)),
                 s!(random_id(rng)),
-                // i_item_sk 3 (row 2) is forced to peach for the q24 plant; the
-                // draw is kept so the rest of the color histogram is unshifted.
+                // i_item_sk 3 (row 2) is forced to peach for the q24 plant and
+                // i_item_sk 6 to purple for q64; the draw is kept so the rest
+                // of the color histogram is unshifted.
                 s!({
                     let c = weighted_str(rng, ITEM_COLOR_WEIGHTS);
-                    if row == 2 {
-                        "peach"
-                    } else {
-                        c
+                    match row {
+                        2 => "peach",
+                        r if r == (Q64_ITEM - 1) as usize => Q64_ITEM_COLOR,
+                        _ => c,
                     }
                 }),
                 s!(random_str(rng, ITEM_UNITS)),
@@ -2728,6 +2906,7 @@ fn stream_customer(scale: f64) -> (SchemaRef, super::BatchIterator) {
     // FK ranges must track dimension cardinality at this scale;
     // sf1-sized ranges empty out dimension joins at small scales.
     let cdemos = customer_demographics_rows(scale) as i32;
+    let hdemos = household_demographics_rows(scale) as i32;
     let addrs = customer_address_rows(scale) as i32;
     generate_batches(
         customer_schema(),
@@ -2746,11 +2925,19 @@ fn stream_customer(scale: f64) -> (SchemaRef, super::BatchIterator) {
             } else {
                 addr_draw
             };
+            // Customer Q64_CUSTOMER's current cdemo is 'M' while the planted
+            // q64 sales use an 'S' cdemo; the draw is kept for parity.
+            let cdemo_draw = rng.random_range(1..=cdemos);
+            let cdemo_sk = if row as i32 == Q64_CUSTOMER - 1 && cdemos >= Q64_CUSTOMER_CDEMO_SK {
+                Q64_CUSTOMER_CDEMO_SK
+            } else {
+                cdemo_draw
+            };
             vec![
                 i!(sk),
                 s!(random_id(rng)),
-                i!(rng.random_range(1..=cdemos)),
-                i!(rng.random_range(1..7200i32)),
+                i!(cdemo_sk),
+                i!(rng.random_range(1..=hdemos)),
                 i!(addr_sk),
                 i!(random_date_sk(rng)),
                 i!(random_date_sk(rng)),
@@ -2759,12 +2946,12 @@ fn stream_customer(scale: f64) -> (SchemaRef, super::BatchIterator) {
                 s!(random_name(rng)),
                 s!(random_str(rng, YN)),
                 i!(rng.random_range(1..28i32)),
-                i!(rng.random_range(1..12i32)),
+                i!(rng.random_range(1..=12i32)),
                 i!(rng.random_range(1920..2000i32)),
                 s!("US"),
                 s!(random_id(rng)),
                 s!(format!("{}@{}.com", random_name(rng), random_name(rng))),
-                i!(rng.random_range(1..73049i32)),
+                i!(rng.random_range(1..=73_049i32)),
             ]
         },
     )
@@ -2890,7 +3077,7 @@ fn stream_store(scale: f64) -> (SchemaRef, super::BatchIterator) {
             // Official sf1: s_closed_date_sk is set on 3 of every 12 rows
             // (positions 0, 3, 4), NULL elsewhere; the single sf0.01 row has one.
             let closed = if matches!(row % 12, 0 | 3 | 4) {
-                i!(rng.random_range(1..73049i32))
+                i!(rng.random_range(1..=73_049i32))
             } else {
                 ColVal::I32(None)
             };
@@ -2917,7 +3104,7 @@ fn stream_store(scale: f64) -> (SchemaRef, super::BatchIterator) {
                 s!(random_name(rng)),
                 // s_store_sk 3 (row 2) is forced to market 8 for the q24 plant.
                 i!({
-                    let m = rng.random_range(1..10i32);
+                    let m = rng.random_range(1..=10i32);
                     if row == 2 {
                         8
                     } else {
@@ -2970,8 +3157,8 @@ fn stream_catalog_page(scale: f64) -> (SchemaRef, super::BatchIterator) {
             vec![
                 i!(sk),
                 s!(random_id(rng)),
-                i!(rng.random_range(1..73049i32)),
-                i!(rng.random_range(1..73049i32)),
+                i!(rng.random_range(1..=73_049i32)),
+                i!(rng.random_range(1..=73_049i32)),
                 s!(random_str(rng, DEPT)),
                 i!(rng.random_range(1..100i32)),
                 i!(sk),
@@ -2995,7 +3182,7 @@ fn stream_web_site(scale: f64) -> (SchemaRef, super::BatchIterator) {
             let close = if row % 6 == 0 {
                 ColVal::I32(None)
             } else {
-                i!(rng.random_range(1..73049i32))
+                i!(rng.random_range(1..=73_049i32))
             };
             vec![
                 i!(sk),
@@ -3003,7 +3190,7 @@ fn stream_web_site(scale: f64) -> (SchemaRef, super::BatchIterator) {
                 d!(random_date(rng)),
                 scd2_rec_end_date(row, rng),
                 s!(random_name(rng)),
-                i!(rng.random_range(1..73049i32)),
+                i!(rng.random_range(1..=73_049i32)),
                 close,
                 s!("Unknown"),
                 s!(random_name(rng)),
@@ -3057,8 +3244,8 @@ fn stream_web_page(scale: f64) -> (SchemaRef, super::BatchIterator) {
                 s!(random_id(rng)),
                 d!(random_date(rng)),
                 scd2_rec_end_date(row, rng),
-                i!(rng.random_range(1..73049i32)),
-                i!(rng.random_range(1..73049i32)),
+                i!(rng.random_range(1..=73_049i32)),
+                i!(rng.random_range(1..=73_049i32)),
                 s!(random_str(rng, YN)),
                 customer,
                 s!(format!("http://{}.com/{}", random_name(rng), sk)),
@@ -3120,6 +3307,7 @@ fn stream_warehouse(scale: f64) -> (SchemaRef, super::BatchIterator) {
 
 fn stream_promotion(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let total = promotion_rows(scale);
+    let items = item_rows(scale) as i32;
     generate_batches(
         promotion_schema(),
         total,
@@ -3129,9 +3317,9 @@ fn stream_promotion(scale: f64) -> (SchemaRef, super::BatchIterator) {
             vec![
                 i!(sk),
                 s!(random_id(rng)),
-                i!(rng.random_range(1..73049i32)),
-                i!(rng.random_range(1..73049i32)),
-                i!(rng.random_range(1..18_000i32)),
+                i!(rng.random_range(1..=73_049i32)),
+                i!(rng.random_range(1..=73_049i32)),
+                i!(rng.random_range(1..=items)),
                 f!(rng.random_range(0..1_000_000i32) as f64 / 100.0),
                 i!(1),
                 s!(random_name(rng)),
@@ -3216,7 +3404,7 @@ fn stream_call_center(scale: f64) -> (SchemaRef, super::BatchIterator) {
                 d!(random_date(rng)),
                 scd2_rec_end_date(row, rng),
                 ColVal::I32(None),
-                i!(rng.random_range(1..73049i32)),
+                i!(rng.random_range(1..=73_049i32)),
                 s!(random_name(rng)),
                 s!(random_str(rng, CC_CLASSES)),
                 i!(rng.random_range(100..5000i32)),
@@ -3754,8 +3942,75 @@ mod tests {
         assert_eq!(inventory_rows(100.0), 399_330_000);
         // Between and beyond the published points.
         assert_eq!(item_rows(5.5), 60_000);
-        assert_eq!(item_rows(3000.0), 300_000);
-        assert_eq!(warehouse_rows(3000.0), 20);
+        assert_eq!(item_rows(3000.0), 360_000);
+        assert_eq!(warehouse_rows(3000.0), 22);
+        assert_eq!(item_rows(200_000.0), 502_000);
+    }
+
+    #[test]
+    fn dimensions_follow_official_counts_above_sf1() {
+        // count(*) from Trino's tpcds connector (a dsdgen port) at sf10,
+        // sf100 and sf1000. Linear scaling put 1M customers and 600 web
+        // pages at sf10.
+        let official: &[(&str, [usize; 3])] = &[
+            ("customer", [500_000, 2_000_000, 12_000_000]),
+            ("customer_address", [250_000, 1_000_000, 6_000_000]),
+            ("store", [102, 402, 1_002]),
+            ("web_site", [42, 24, 54]),
+            ("web_page", [200, 2_040, 3_000]),
+            ("warehouse", [10, 15, 20]),
+            ("promotion", [500, 1_000, 1_500]),
+            ("reason", [45, 55, 65]),
+            ("call_center", [24, 30, 42]),
+            ("catalog_page", [12_000, 20_400, 30_000]),
+            ("item", [102_000, 204_000, 300_000]),
+        ];
+        let gen = TpcdsGenerator;
+        for (name, counts) in official {
+            let t = gen.tables().into_iter().find(|t| t.name == *name).unwrap();
+            for (sf, want) in [10.0, 100.0, 1000.0].into_iter().zip(counts) {
+                assert_eq!((t.row_count)(sf), *want, "{name} at sf{sf}");
+            }
+        }
+        // Between published points dsdgen interpolates; sf30 sits 2/9 of
+        // the way from sf10 to sf100.
+        assert_eq!(customer_rows(30.0), 833_333);
+        assert_eq!(catalog_page_rows(0.01), 11_718);
+    }
+
+    #[test]
+    fn small_domains_reach_their_last_value() {
+        // Exclusive ranges never drew the last value: ship mode 20, item
+        // class 16, birth month 12 (q18 filters on it). Keys with large
+        // domains are only checked to stay inside their table.
+        let cfg = super::super::GenerateConfig::default();
+        let cases: &[(&str, f64, &str, i32, bool)] = &[
+            ("catalog_sales", 0.01, "cs_ship_mode_sk", 20, true),
+            ("catalog_returns", 0.01, "cr_ship_mode_sk", 20, true),
+            ("web_sales", 0.01, "ws_ship_mode_sk", 20, true),
+            ("item", 0.01, "i_class_id", 16, true),
+            ("customer", 0.01, "c_birth_month", 12, true),
+            ("catalog_sales", 0.01, "cs_catalog_page_sk", 11_718, false),
+            ("customer", 0.01, "c_current_hdemo_sk", 7_200, false),
+            ("promotion", 10.0, "p_item_sk", 102_000, false),
+        ];
+        for &(table, sf, col, last, must_reach) in cases {
+            let (sch, it) = stream_tpcds_table(table, sf, &cfg).unwrap();
+            let batches: Vec<RecordBatch> = it.collect();
+            let values: Vec<i32> = col_i32(&batches, &sch, col).into_iter().flatten().collect();
+            assert!(
+                values.iter().all(|v| (1..=last).contains(v)),
+                "{col} outside 1..={last}"
+            );
+            if must_reach {
+                assert_eq!(values.iter().max(), Some(&last), "{table}.{col}");
+            }
+        }
+        // Promotions were drawn from the first 18,000 items at every scale.
+        let (sch, it) = stream_tpcds_table("promotion", 10.0, &cfg).unwrap();
+        let batches: Vec<RecordBatch> = it.collect();
+        let items = col_i32(&batches, &sch, "p_item_sk");
+        assert!(items.iter().flatten().any(|&sk| sk > 18_000));
     }
 
     #[test]
@@ -3789,6 +4044,97 @@ mod tests {
         assert_eq!(customer_demographics_schema().fields().len(), 9);
         // income_band: 3 columns
         assert_eq!(income_band_schema().fields().len(), 3);
+    }
+
+    /// Every numeric column has the spec type from the TPC-DS DDL: money as
+    /// decimal(7,2), never a double. A Float64 money column made SUMs
+    /// order-dependent and gave Trino-compare a different result type.
+    #[test]
+    fn decimal_columns_match_the_spec_ddl() {
+        let ddl = include_str!("../../../../benchmarks/schemas/tpcds.sql");
+        let spec: std::collections::HashMap<&str, (u8, i8)> = ddl
+            .lines()
+            .filter_map(|line| {
+                let mut words = line.split_whitespace();
+                let name = words.next()?;
+                let ty = words.next()?.trim_end_matches(',');
+                let (p, s) = ty
+                    .strip_prefix("DECIMAL(")?
+                    .strip_suffix(')')?
+                    .split_once(',')?;
+                Some((name, (p.parse().ok()?, s.parse().ok()?)))
+            })
+            .collect();
+        assert_eq!(spec.len(), 80, "DDL parse lost decimal columns");
+
+        let mut seen = 0;
+        for table in TpcdsGenerator.tables() {
+            let (sch, _) =
+                stream_tpcds_table(&table.name, 0.01, &super::super::GenerateConfig::default())
+                    .unwrap();
+            for field in sch.fields() {
+                let name = field.name().as_str();
+                match (field.data_type(), spec.get(name)) {
+                    (DataType::Decimal128(p, s), Some(&(sp, ss))) => {
+                        assert_eq!((*p, *s), (sp, ss), "{}.{name}", table.name);
+                        seen += 1;
+                    }
+                    (DataType::Decimal128(..), None) => {
+                        panic!("{}.{name} is decimal, the spec says not", table.name)
+                    }
+                    (other, Some(_)) => {
+                        panic!("{}.{name} is {other:?}, the spec says decimal", table.name)
+                    }
+                    (DataType::Float32 | DataType::Float64, None) => {
+                        panic!("{}.{name} is a float; TPC-DS has none", table.name)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(seen, spec.len(), "a spec decimal column is missing");
+    }
+
+    /// The extended amounts are exact in cents, as in dsdgen output: queries
+    /// that compare or subtract them (net_paid - ext_tax, ...) must not see
+    /// a rounding residue.
+    #[test]
+    fn extended_amounts_are_exact_in_cents() {
+        fn cents_of(batches: &[RecordBatch], sch: &SchemaRef, name: &str) -> Vec<i128> {
+            let idx = sch.index_of(name).unwrap();
+            batches
+                .iter()
+                .flat_map(|b| {
+                    let a = b
+                        .column(idx)
+                        .as_any()
+                        .downcast_ref::<Decimal128Array>()
+                        .unwrap();
+                    a.values().to_vec()
+                })
+                .collect()
+        }
+        for (table, p) in [
+            ("store_sales", "ss"),
+            ("catalog_sales", "cs"),
+            ("web_sales", "ws"),
+        ] {
+            let (sch, it) =
+                stream_tpcds_table(table, 0.01, &super::super::GenerateConfig::default()).unwrap();
+            let batches: Vec<RecordBatch> = it.collect();
+            let qty = col_i32(&batches, &sch, &format!("{p}_quantity"));
+            let price = cents_of(&batches, &sch, &format!("{p}_sales_price"));
+            let ext = cents_of(&batches, &sch, &format!("{p}_ext_sales_price"));
+            let paid = cents_of(&batches, &sch, &format!("{p}_net_paid"));
+            let tax = cents_of(&batches, &sch, &format!("{p}_ext_tax"));
+            let inc_tax = cents_of(&batches, &sch, &format!("{p}_net_paid_inc_tax"));
+            assert!(!qty.is_empty(), "{table} generated no rows");
+            for i in 0..qty.len() {
+                let q = i128::from(qty[i].unwrap());
+                assert_eq!(ext[i], price[i] * q, "{table} row {i}");
+                assert_eq!(inc_tax[i], paid[i] + tax[i], "{table} row {i}");
+            }
+        }
     }
 
     #[test]
@@ -3930,6 +4276,7 @@ mod tests {
             .collect()
     }
 
+    /// A decimal column's values as f64, for range and membership checks.
     fn col_f64(batches: &[RecordBatch], sch: &SchemaRef, name: &str) -> Vec<f64> {
         use arrow_array::Array as _;
         let idx = sch.index_of(name).unwrap();
@@ -3939,9 +4286,12 @@ mod tests {
                 let a = b
                     .column(idx)
                     .as_any()
-                    .downcast_ref::<arrow_array::Float64Array>()
+                    .downcast_ref::<Decimal128Array>()
                     .unwrap();
-                (0..a.len()).map(|i| a.value(i)).collect::<Vec<_>>()
+                let factor = 10_f64.powi(i32::from(a.scale()));
+                (0..a.len())
+                    .map(|i| a.value(i) as f64 / factor)
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -4513,6 +4863,95 @@ mod tests {
         assert!(
             col_i32(&srb, &srsch, "sr_ticket_number").contains(&Some(Q24_STORE_TICKET)),
             "no store return for the q24 planted ticket"
+        );
+    }
+
+    #[test]
+    fn q64_coincidence_is_planted() {
+        // SF0.01 is the smallest scale the plant must survive; the SF1 gate
+        // (TPC-DS compare vs Trino) checks the query itself.
+        let scale = 0.01;
+        let dims = FkDims::at(scale);
+        assert!(dims.q64_active(), "q64 plant inactive at SF{scale}");
+        let item = (Q64_ITEM - 1) as usize;
+        let (isch, ib) = generate_item(scale);
+        assert_eq!(col_str(&ib, &isch, "i_color")[item], Q64_ITEM_COLOR);
+        let price = col_f64(&ib, &isch, "i_current_price")[item];
+        assert!((65.0..=74.0).contains(&price), "q64 item price {price}");
+
+        let (dsch, db) = generate_date_dim();
+        let years = col_i32(&db, &dsch, "d_year");
+        assert_eq!(years[(Q64_1999_DATE_SK - 1) as usize], Some(1999));
+        assert_eq!(years[(Q64_2000_DATE_SK - 1) as usize], Some(2000));
+
+        let (cdsch, cdb) = generate_customer_demographics(scale);
+        let marital = col_str(&cdb, &cdsch, "cd_marital_status");
+        assert_ne!(
+            marital[(Q64_SALE_CDEMO_SK - 1) as usize],
+            marital[(Q64_CUSTOMER_CDEMO_SK - 1) as usize],
+            "q64 needs cd1.marital <> cd2.marital"
+        );
+        let (csch, cb) = generate_customer(scale);
+        assert_eq!(
+            col_i32(&cb, &csch, "c_current_cdemo_sk")[(Q64_CUSTOMER - 1) as usize],
+            Some(Q64_CUSTOMER_CDEMO_SK)
+        );
+
+        let stores = store_rows(scale) as i32;
+        for (ticket, date) in [
+            (Q64_1999_TICKET, Q64_1999_DATE_SK),
+            (Q64_2000_TICKET, Q64_2000_DATE_SK),
+        ] {
+            let b = basket(STORE_TICKET_SALT, ticket, stores, dims);
+            assert_eq!(b.date_sk, date, "ticket {ticket} date");
+            assert_eq!(b.items[0], Q64_ITEM, "ticket {ticket} item");
+            assert_eq!(b.channel_sk, Q64_STORE_SK, "ticket {ticket} store");
+            assert_eq!(b.customer_sk, Some(Q64_CUSTOMER), "ticket {ticket}");
+            assert_eq!(b.cdemo_sk, Some(Q64_SALE_CDEMO_SK), "ticket {ticket}");
+            assert!(
+                b.hdemo_sk.is_some() && b.addr_sk.is_some() && b.promo_sk.is_some(),
+                "ticket {ticket}: a NULL key drops the q64 row"
+            );
+        }
+        let (srsch, srb) = generate_store_returns(scale);
+        let sr_ticket = col_i32(&srb, &srsch, "sr_ticket_number");
+        let sr_item = col_i32(&srb, &srsch, "sr_item_sk");
+        let returns_of = |t: i32| {
+            sr_ticket
+                .iter()
+                .zip(&sr_item)
+                .filter(|&(&tk, &it)| tk == Some(t) && it == Some(Q64_ITEM))
+                .count()
+        };
+        let (r1999, r2000) = (returns_of(Q64_1999_TICKET), returns_of(Q64_2000_TICKET));
+        assert!(
+            r2000 >= 1 && r1999 >= r2000,
+            "q64 needs cs2.cnt <= cs1.cnt: 1999 {r1999}, 2000 {r2000}"
+        );
+
+        // cs_ui: the planted catalog line's list price beats twice its refund.
+        let (cssch, csb) = generate_catalog_sales(scale);
+        let cs_order = col_i32(&csb, &cssch, "cs_order_number");
+        let cs_item = col_i32(&csb, &cssch, "cs_item_sk");
+        let list = col_f64(&csb, &cssch, "cs_ext_list_price");
+        let sale: f64 = (0..cs_order.len())
+            .filter(|&i| cs_order[i] == Some(Q64_CATALOG_ORDER) && cs_item[i] == Some(Q64_ITEM))
+            .map(|i| list[i])
+            .sum();
+        let (crsch, crb) = generate_catalog_returns(scale);
+        let cr_order = col_i32(&crb, &crsch, "cr_order_number");
+        let cr_item = col_i32(&crb, &crsch, "cr_item_sk");
+        let cash = col_f64(&crb, &crsch, "cr_refunded_cash");
+        let charge = col_f64(&crb, &crsch, "cr_reversed_charge");
+        let credit = col_f64(&crb, &crsch, "cr_store_credit");
+        let planted: Vec<f64> = (0..cr_order.len())
+            .filter(|&i| cr_order[i] == Some(Q64_CATALOG_ORDER) && cr_item[i] == Some(Q64_ITEM))
+            .map(|i| cash[i] + charge[i] + credit[i])
+            .collect();
+        assert!(!planted.is_empty(), "no catalog return for q64's order");
+        assert!(
+            planted.iter().all(|&r| sale > 2.0 * r),
+            "q64 catalog pair fails cs_ui: sale {sale}, refunds {planted:?}"
         );
     }
 

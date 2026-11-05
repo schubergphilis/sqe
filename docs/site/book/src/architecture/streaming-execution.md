@@ -29,8 +29,11 @@ Configuration in `sqe.toml`:
 [coordinator]
 memory_limit = "512MB"
 spill_dir = "/tmp/sqe-spill"
-spill_compression = "zstd"  # lz4, zstd, or none
+spill_compression = "lz4"   # lz4 (default), zstd, or none
+spill_max_bytes = "100GB"   # disk cap for one coordinator's spill files
 ```
+
+A query that would spill past `spill_max_bytes` fails with a resources-exhausted error that names the setting.
 
 ### Late Materialization
 
@@ -166,8 +169,9 @@ Per-operator behavior:
 | Field | Section | Default | Description |
 |-------|---------|---------|-------------|
 | `memory_limit` | `[coordinator]` / `[worker]` | `8GB` | Maximum memory for the DataFusion runtime |
-| `spill_dir` | `[coordinator]` / `[worker]` | `/tmp/sqe-spill` | Directory for spill files |
-| `spill_compression` | `[coordinator]` / `[worker]` | `zstd` | Compression for spill files (lz4, zstd, none) |
+| `spill_dir` | `[coordinator]` / `[worker]` | `/tmp/sqe-coordinator-spill` / `/tmp/sqe-spill` | Directory for spill files |
+| `spill_compression` | `[coordinator]` | `lz4` | Compression for spill files (lz4, zstd, none) |
+| `spill_max_bytes` | `[coordinator]` | `100GB` | Disk cap for the coordinator's spill files; a query that would spill past it fails |
 | `hash_join_memory_threshold` | `[optimizer]` | `256MB` | Build-side size above which hash join is rewritten to sort-merge join |
 | `broadcast_threshold` | `[optimizer]` | `10MB` | Join side size below which broadcast join is used |
 | `coalesce_threshold` | `[storage]` | `1MB` | Maximum gap between byte ranges to coalesce into one S3 GET |

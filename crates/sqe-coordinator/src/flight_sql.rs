@@ -2705,16 +2705,22 @@ impl FlightSqlService for SqeFlightSqlService {
             Vec<Option<arrow_schema::DataType>>,
             arrow_schema::SchemaRef,
         ) = match &plan {
-            Some(plan) => (
+            Some((plan, schema)) => (
                 PreparedStatement::param_types_from_plan(plan, numbered_count)
                     .map_err(Status::internal)?,
-                Arc::new(plan.schema().as_arrow().clone()),
+                Arc::clone(schema),
             ),
             // DML, DDL and metadata statements have no streaming plan;
-            // their result schema is the one `get_schema` advertises and
-            // their parameters are untyped until bound.
+            // their result schema is the one `get_schema` advertises. An
+            // INSERT / UPDATE / DELETE advertises the parameter types
+            // DataFusion infers (an INSERT's from its target columns), so a
+            // driver binds a BIGINT column as Int64, not Utf8; anything
+            // else is untyped. The bind is not checked against these
+            // types: the values are coerced when the statement runs.
             None => (
-                vec![None; numbered_count],
+                self.query_handler
+                    .dml_parameter_types(&session, &numbered_sql, numbered_count)
+                    .await,
                 self.query_handler
                     .get_schema(&session, sql)
                     .await
@@ -2724,7 +2730,7 @@ impl FlightSqlService for SqeFlightSqlService {
         let statement = PreparedStatement::new(
             sql.clone(),
             numbered_sql,
-            plan,
+            plan.map(|(plan, _)| plan),
             param_types,
             Arc::clone(&dataset_schema),
         )

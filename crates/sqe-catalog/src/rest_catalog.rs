@@ -7,7 +7,7 @@ use iceberg::table::Table;
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent, TableRequirement, TableUpdate};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogBuilder};
 use moka::future::Cache as MokaCache;
-use tracing::{debug, info, instrument, warn, Instrument};
+use tracing::{debug, error, info, instrument, warn, Instrument};
 use uuid::Uuid;
 
 use sqe_core::config::{CatalogConfig, SqeConfig, StorageConfig};
@@ -3056,6 +3056,44 @@ impl SessionCatalog {
     }
 }
 
+/// Sends of one schema/metadata commit, the first included.
+const SCHEMA_COMMIT_ATTEMPTS: u32 = 4;
+/// First pause before a resend; doubles each time (500, 1000, 2000 ms).
+const SCHEMA_COMMIT_BACKOFF_MS: u64 = 500;
+
+/// True when a schema commit cannot apply twice: it asserts the current
+/// schema id and its own updates change that id. Had a first send landed
+/// despite an error, a resend fails on the requirement instead.
+fn schema_commit_guards_itself(updates: &[TableUpdate], requirements: &[TableRequirement]) -> bool {
+    requirements
+        .iter()
+        .any(|r| matches!(r, TableRequirement::CurrentSchemaIdMatch { .. }))
+        && updates
+            .iter()
+            .any(|u| matches!(u, TableUpdate::SetCurrentSchema { .. }))
+}
+
+/// Whether a refused schema/metadata commit may be sent again, unchanged.
+///
+/// Snowflake Horizon refuses a commit that reaches a table within about half
+/// a second of that table's previous commit, as a 409 "concurrently
+/// modified" or a 500 "Indeterminate result during conflict resolution
+/// check". Neither applied, and the same body succeeds half a second later.
+///
+/// - A 409 conflict never applied, so it may go again, except "Requirement
+///   failed": the table really moved, and the same body fails the same way.
+/// - A 5xx's outcome is unknown. It goes again only when `guarded`
+///   ([`schema_commit_guards_itself`]), so it can never apply twice.
+fn schema_commit_may_resend(e: &SqeError, guarded: bool) -> bool {
+    match e {
+        SqeError::IcebergCommitConflict(msg) => {
+            !msg.to_ascii_lowercase().contains("requirement failed")
+        }
+        SqeError::CatalogHttp { status, .. } => *status >= 500 && guarded,
+        _ => false,
+    }
+}
+
 /// Typed error for a non-2xx Iceberg REST answer. Status codes carry the
 /// classification ([`SqeError::error_code`]); a 409 on a commit is the
 /// retryable [`SqeError::IcebergCommitConflict`].
@@ -3122,6 +3160,27 @@ fn select_view_sql(
     ))
 }
 
+/// A view's SQL and the schema its unqualified table names resolve in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewBody {
+    pub sql: String,
+    /// The current version's `default-namespace`, levels joined by `.` as
+    /// the catalog provider names schemas; `default` when it is empty.
+    pub default_schema: String,
+}
+
+/// The schema a view body was written against: its current version's
+/// `default-namespace`. An empty one (the spec requires the field, not a
+/// level) keeps the schema every SQE session starts in.
+fn view_default_schema(metadata: &iceberg::spec::ViewMetadata) -> String {
+    let levels = metadata.current_version().default_namespace().as_ref();
+    if levels.is_empty() {
+        crate::schema_provider::VIEW_DEFAULT_SCHEMA.to_string()
+    } else {
+        levels.join(".")
+    }
+}
+
 /// `loadView` response body: the metadata document plus its location.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -3157,7 +3216,7 @@ fn sqe_view_version(
     version_id: i32,
     schema_id: i32,
     sql: &str,
-    namespace: &NamespaceIdent,
+    default_namespace: &NamespaceIdent,
     default_catalog: &str,
 ) -> sqe_core::Result<iceberg::spec::ViewVersion> {
     let representation: iceberg::spec::ViewRepresentation = iceberg::spec::SqlViewRepresentation {
@@ -3188,7 +3247,7 @@ fn sqe_view_version(
         .with_summary(summary)
         .with_representations(representations)
         .with_default_catalog(Some(default_catalog.to_string()))
-        .with_default_namespace(namespace.clone())
+        .with_default_namespace(default_namespace.clone())
         .build())
 }
 
@@ -3443,20 +3502,29 @@ impl SessionCatalog {
     /// `CreateViewRequest`: the schema parsed into [`iceberg::spec::Schema`]
     /// and one [`iceberg::spec::ViewVersion`] carrying a single `sqe`-dialect
     /// SQL representation, `default-catalog` = this warehouse and
-    /// `default-namespace` = the view's namespace.
+    /// `default-namespace` = `default_namespace`, the schema `sql` was
+    /// planned in (the creating session's), which is where a reader resolves
+    /// its unqualified names.
     #[instrument(skip(self, sql, schema), fields(namespace = ?namespace, view = %name, warehouse = %self.warehouse))]
     pub async fn create_view(
         &self,
         namespace: &NamespaceIdent,
         name: &str,
         sql: &str,
+        default_namespace: &NamespaceIdent,
         schema: &serde_json::Value,
         properties: &std::collections::HashMap<String, String>,
     ) -> sqe_core::Result<()> {
         self.require_rest_backend("create_view")?;
         let url = self.views_url(namespace).await;
         let schema = view_schema_from_json(schema, 0)?;
-        let version = sqe_view_version(1, schema.schema_id(), sql, namespace, &self.warehouse)?;
+        let version = sqe_view_version(
+            1,
+            schema.schema_id(),
+            sql,
+            default_namespace,
+            &self.warehouse,
+        )?;
         let body = serde_json::to_value(CreateViewRequest {
             name,
             schema: &schema,
@@ -3500,13 +3568,14 @@ impl SessionCatalog {
         namespace: &NamespaceIdent,
         name: &str,
         sql: &str,
+        default_namespace: &NamespaceIdent,
         schema: &serde_json::Value,
         properties: &std::collections::HashMap<String, String>,
     ) -> sqe_core::Result<()> {
         self.require_rest_backend("create_or_replace_view")?;
         let Some(existing) = self.load_view_metadata(namespace, name).await? else {
             return self
-                .create_view(namespace, name, sql, schema, properties)
+                .create_view(namespace, name, sql, default_namespace, schema, properties)
                 .await;
         };
 
@@ -3522,7 +3591,13 @@ impl SessionCatalog {
             .map_or(1, |id| id + 1);
         let schema = view_schema_from_json(schema, next_schema_id)?;
         let mut updates = view_replace_updates(&existing, schema, |schema_id| {
-            sqe_view_version(next_version_id, schema_id, sql, namespace, &self.warehouse)
+            sqe_view_version(
+                next_version_id,
+                schema_id,
+                sql,
+                default_namespace,
+                &self.warehouse,
+            )
         })?;
         if !properties.is_empty() {
             updates.push(iceberg::ViewUpdate::SetProperties {
@@ -3628,9 +3703,28 @@ impl SessionCatalog {
         namespace: &NamespaceIdent,
         name: &str,
     ) -> sqe_core::Result<Option<String>> {
+        Ok(self
+            .load_view_body(namespace, name)
+            .await?
+            .map(|body| body.sql))
+    }
+
+    /// [`Self::load_view_sql`] plus the schema the body's unqualified names
+    /// resolve in, from the version's `default-namespace` (Iceberg view
+    /// spec). Planning a body anywhere else reads a different table, or none
+    /// (ai-portal-data#357).
+    #[instrument(skip(self), fields(namespace = ?namespace, view = %name, warehouse = %self.warehouse))]
+    pub async fn load_view_body(
+        &self,
+        namespace: &NamespaceIdent,
+        name: &str,
+    ) -> sqe_core::Result<Option<ViewBody>> {
         self.require_rest_backend("load_view_sql")?;
         match self.load_view_metadata(namespace, name).await? {
-            Some(metadata) => select_view_sql(&metadata, name).map(Some),
+            Some(metadata) => Ok(Some(ViewBody {
+                sql: select_view_sql(&metadata, name)?,
+                default_schema: view_default_schema(&metadata),
+            })),
             None => Ok(None),
         }
     }
@@ -3705,15 +3799,38 @@ impl SessionCatalog {
         });
 
         debug!(url = %url, table = %table_ident, "Committing schema update via Iceberg REST");
-        self.rest_request(
-            sqe_core::CatalogOp::Commit,
-            reqwest::Method::POST,
-            &url,
-            Some(body),
-            &[],
-        )
-        .await
-        .map_err(|e| match e {
+        let guarded = schema_commit_guards_itself(&updates, &requirements);
+        let mut attempt = 1;
+        let result = loop {
+            let sent = self
+                .rest_request(
+                    sqe_core::CatalogOp::Commit,
+                    reqwest::Method::POST,
+                    &url,
+                    Some(body.clone()),
+                    &[],
+                )
+                .await;
+            match sent {
+                Err(e)
+                    if attempt < SCHEMA_COMMIT_ATTEMPTS
+                        && schema_commit_may_resend(&e, guarded) =>
+                {
+                    let backoff = SCHEMA_COMMIT_BACKOFF_MS << (attempt - 1);
+                    warn!(
+                        table = %table_ident,
+                        attempt,
+                        backoff_ms = backoff,
+                        error = %e,
+                        "schema commit refused; sending it again unchanged"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                    attempt += 1;
+                }
+                other => break other,
+            }
+        };
+        result.map_err(|e| match e {
             SqeError::CatalogHttp { status, op, body } => SqeError::CatalogHttp {
                 status,
                 op,
@@ -3733,6 +3850,157 @@ impl SessionCatalog {
         Ok(())
     }
 
+    /// Refuse a statement that writes to `table` before it writes any file
+    /// when the caller may not write it (#880).
+    ///
+    /// With vended credentials a caller who may read but not write gets a
+    /// read-only storage credential: Polaris's delegated `loadTable` falls
+    /// back from write to read delegation instead of refusing, so the
+    /// statement used to plan, write data files and fail on the first
+    /// `PutObject`. Two questions, both asked as the caller:
+    ///
+    /// 1. The catalog, on every REST catalog: a commit setting `main` to the
+    ///    snapshot it already points at (requirements only when there is no
+    ///    `main`), guarded by an `assert-table-uuid` that can never match.
+    ///    Polaris authorizes the update (`SET_TABLE_SNAPSHOT_REF` /
+    ///    `UPDATE_TABLE`) before it checks requirements, so a reader gets
+    ///    403 and a writer 409; a catalog that applied the update anyway
+    ///    would change nothing.
+    /// 2. The object store, when the catalog vends credentials: write and
+    ///    delete an empty object under the table's data path with the
+    ///    table's own FileIO. This catches a principal that holds
+    ///    `TABLE_WRITE_PROPERTIES` but not `TABLE_WRITE_DATA`, who passes the
+    ///    catalog question but gets read-only keys.
+    ///
+    /// Only a refusal (403 / `AccessDenied`) refuses; any other failure lets
+    /// the statement run and the real commit decides. A pass is cached for
+    /// [`WRITE_CHECK_TTL`] per token, catalog and table; a grant revoked
+    /// inside that window is still refused by the real commit.
+    pub async fn check_write_access(
+        &self,
+        table_ident: &TableIdent,
+        table: &Table,
+    ) -> sqe_core::Result<()> {
+        if !matches!(self.inner, CatalogHandle::Rest(_)) {
+            return Ok(());
+        }
+        let metadata = table.metadata();
+        let key = format!(
+            "{}|{}|{}|{}",
+            self.token_fingerprint,
+            self.catalog_url,
+            self.warehouse,
+            metadata.uuid()
+        );
+        if WRITE_CHECK_PASSES.contains_key(&key) {
+            return Ok(());
+        }
+        let refusal = match self.catalog_write_check(table_ident, table).await {
+            Some(e) => Some(e),
+            None if self.vends_credentials() => storage_write_check(table_ident, table).await,
+            None => None,
+        };
+        if let Some(e) = refusal {
+            info!(table = %table_ident, error = %e, "write refused before any file was written");
+            return Err(SqeError::with_code(
+                SqeErrorCode::AccessDenied,
+                format!(
+                    "Access denied: no write access to table '{table_ident}'; \
+                     nothing was written"
+                ),
+            ));
+        }
+        WRITE_CHECK_PASSES.insert(key, ());
+        Ok(())
+    }
+
+    /// The catalog half of [`Self::check_write_access`]: `Some` with the
+    /// refusal when the catalog answers 403, `None` otherwise.
+    async fn catalog_write_check(
+        &self,
+        table_ident: &TableIdent,
+        table: &Table,
+    ) -> Option<SqeError> {
+        let metadata = table.metadata();
+        // A uuid the table can never have: a compliant catalog fails the
+        // requirement, after authorizing the update, and commits nothing.
+        let wrong_uuid = uuid::Uuid::from_u128(metadata.uuid().as_u128() ^ u128::MAX);
+        let requirements = serde_json::json!([
+            { "type": "assert-table-uuid", "uuid": wrong_uuid.to_string() }
+        ]);
+        let updates = match metadata
+            .refs_iter()
+            .find(|(name, _)| *name == iceberg::spec::MAIN_BRANCH)
+        {
+            Some((_, reference)) => serde_json::to_value(vec![TableUpdate::SetSnapshotRef {
+                ref_name: iceberg::spec::MAIN_BRANCH.to_string(),
+                reference: reference.clone(),
+            }])
+            .unwrap_or_else(|_| serde_json::json!([])),
+            None => serde_json::json!([]),
+        };
+        match self
+            .post_noop_commit(table_ident, requirements, updates)
+            .await
+        {
+            Err(SqeError::IcebergCommitConflict(_)) => None,
+            Err(e) if e.error_code() == SqeErrorCode::AccessDenied => Some(e),
+            Ok(()) => {
+                error!(
+                    table = %table_ident,
+                    "catalog accepted a commit whose assert-table-uuid cannot match; \
+                     it does not check requirements"
+                );
+                None
+            }
+            Err(e) => {
+                warn!(
+                    table = %table_ident,
+                    error = %e,
+                    "catalog write check inconclusive; the commit decides"
+                );
+                None
+            }
+        }
+    }
+
+    /// True when this session asks the catalog for vended credentials.
+    fn vends_credentials(&self) -> bool {
+        self.require_vended_credentials
+            || self
+                .extra_props
+                .get(ACCESS_DELEGATION_HEADER_PROP)
+                .is_some_and(|v| v == "vended-credentials")
+    }
+
+    /// POST a commit to the REST table endpoint; for [`Self::check_write_access`].
+    /// No cache eviction: the commit changes nothing.
+    async fn post_noop_commit(
+        &self,
+        table_ident: &TableIdent,
+        requirements: serde_json::Value,
+        updates: serde_json::Value,
+    ) -> sqe_core::Result<()> {
+        let url = self.table_url(table_ident).await;
+        let body = serde_json::json!({
+            "identifier": {
+                "namespace": table_ident.namespace().as_ref(),
+                "name": table_ident.name(),
+            },
+            "requirements": requirements,
+            "updates": updates,
+        });
+        self.rest_request(
+            sqe_core::CatalogOp::Commit,
+            reqwest::Method::POST,
+            &url,
+            Some(body),
+            &[],
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// Return a bridge that implements iceberg's `Catalog` trait.
     /// This is useful for passing to iceberg-datafusion providers.
     pub fn as_catalog(self: &Arc<Self>) -> Arc<SessionCatalogBridge> {
@@ -3740,6 +4008,101 @@ impl SessionCatalog {
             session: self.clone(),
         })
     }
+}
+
+/// How long a passed [`SessionCatalog::check_write_access`] is remembered.
+const WRITE_CHECK_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Passed write checks, keyed by token fingerprint, catalog and table uuid.
+static WRITE_CHECK_PASSES: std::sync::LazyLock<moka::sync::Cache<String, ()>> =
+    std::sync::LazyLock::new(|| {
+        moka::sync::Cache::builder()
+            .max_capacity(10_000)
+            .time_to_live(WRITE_CHECK_TTL)
+            .build()
+    });
+
+/// The storage half of [`SessionCatalog::check_write_access`]: write and
+/// delete an empty object under the table's data path with the table's
+/// FileIO (the vended keys). `Some` with the refusal when the store says
+/// access denied, `None` otherwise.
+async fn storage_write_check(table_ident: &TableIdent, table: &Table) -> Option<SqeError> {
+    let metadata = table.metadata();
+    let data_path = metadata
+        .properties()
+        .get(iceberg::spec::TableProperties::PROPERTY_WRITE_DATA_LOCATION)
+        .cloned()
+        .unwrap_or_else(|| format!("{}/data", metadata.location().trim_end_matches('/')));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let path = format!(
+        "{}/.sqe-write-check-{nanos:x}",
+        data_path.trim_end_matches('/')
+    );
+    let file_io = table.file_io();
+    let written = match file_io.new_output(&path) {
+        Ok(output) => output.write(bytes::Bytes::new()).await,
+        Err(e) => Err(e),
+    };
+    match written {
+        Ok(()) => {
+            if let Err(e) = file_io.delete(&path).await {
+                warn!(table = %table_ident, path = %path, error = %e, "write check object not deleted");
+            }
+            None
+        }
+        Err(e) => {
+            let e = SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("write check at '{path}': {e}"),
+            );
+            if e.error_code() == SqeErrorCode::AccessDenied {
+                Some(e)
+            } else {
+                warn!(table = %table_ident, error = %e, "storage write check inconclusive; the write decides");
+                None
+            }
+        }
+    }
+}
+
+/// A v2 table at `location` on the local file system; for the storage
+/// probe test.
+#[cfg(test)]
+fn local_table_at(location: &str) -> Table {
+    let metadata: iceberg::spec::TableMetadata = serde_json::from_value(serde_json::json!({
+        "format-version": 2,
+        "table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
+        "location": location,
+        "last-sequence-number": 0,
+        "last-updated-ms": 1602638573874_i64,
+        "last-column-id": 1,
+        "current-schema-id": 0,
+        "schemas": [{"type": "struct", "schema-id": 0,
+                     "fields": [{"id": 1, "name": "x", "required": true, "type": "long"}]}],
+        "default-spec-id": 0,
+        "partition-specs": [{"spec-id": 0, "fields": []}],
+        "last-partition-id": 999,
+        "default-sort-order-id": 0,
+        "sort-orders": [{"order-id": 0, "fields": []}],
+        "properties": {},
+        "current-snapshot-id": -1,
+        "snapshots": []
+    }))
+    .expect("table metadata");
+    Table::builder()
+        .runtime(iceberg::Runtime::current())
+        .metadata(metadata)
+        .identifier(TableIdent::new(
+            NamespaceIdent::new("ns".to_string()),
+            "t".to_string(),
+        ))
+        .file_io(iceberg::io::FileIO::new_with_fs())
+        .disable_cache()
+        .build()
+        .expect("table")
 }
 
 /// Bridge type that implements iceberg's `Catalog` trait by delegating
@@ -3964,6 +4327,52 @@ impl Catalog for SessionCatalogBridge {
             self.session.invalidate_table_all_tokens(&ident).await;
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod schema_commit_resend_tests {
+    use super::{map_rest_status, schema_commit_guards_itself, schema_commit_may_resend};
+    use iceberg::{TableRequirement, TableUpdate};
+    use sqe_core::CatalogOp;
+
+    const HORIZON_500: &str = r#"{"error":{"message":"Unknown error status for identifier S.t: UNEXPECTED_ERROR_SIGNALED with extraInfo: Indeterminate result during conflict resolution check","type":"IllegalStateException","code":500}}"#;
+    const HORIZON_409: &str = r#"{"error":{"message":"Failed to commit Table or View S.t because it was concurrently modified","type":"CommitConflictException","code":409}}"#;
+    const REQUIREMENT_409: &str = r#"{"error":{"message":"Requirement failed: current schema changed: expected id 2 != 3","type":"CommitFailedException","code":409}}"#;
+
+    fn alter_parts() -> (Vec<TableUpdate>, Vec<TableRequirement>) {
+        (
+            vec![TableUpdate::SetCurrentSchema { schema_id: -1 }],
+            vec![TableRequirement::CurrentSchemaIdMatch {
+                current_schema_id: 0,
+            }],
+        )
+    }
+
+    /// An ALTER asserts the schema id it replaces, so it cannot apply twice;
+    /// a property or spec commit without requirements can.
+    #[test]
+    fn only_a_schema_id_assert_with_a_schema_switch_guards_itself() {
+        let (updates, requirements) = alter_parts();
+        assert!(schema_commit_guards_itself(&updates, &requirements));
+        assert!(!schema_commit_guards_itself(&updates, &[]));
+        assert!(!schema_commit_guards_itself(&[], &requirements));
+    }
+
+    /// Horizon's two refusals go again; a failed requirement and an
+    /// unguarded 5xx do not, nor does any other status.
+    #[test]
+    fn horizon_refusals_resend_and_nothing_else_does() {
+        let conflict = map_rest_status(CatalogOp::Commit, 409, HORIZON_409.into());
+        let unknown = map_rest_status(CatalogOp::Commit, 500, HORIZON_500.into());
+        let requirement = map_rest_status(CatalogOp::Commit, 409, REQUIREMENT_409.into());
+        let bad_request = map_rest_status(CatalogOp::Commit, 400, "bad".into());
+
+        assert!(schema_commit_may_resend(&conflict, false));
+        assert!(schema_commit_may_resend(&unknown, true));
+        assert!(!schema_commit_may_resend(&unknown, false));
+        assert!(!schema_commit_may_resend(&requirement, true));
+        assert!(!schema_commit_may_resend(&bad_request, true));
     }
 }
 
@@ -5840,11 +6249,11 @@ mod other_backend_tests {
 
         let errors = [
             session
-                .create_view(&sales(), "v", "SELECT 1", &schema, &props)
+                .create_view(&sales(), "v", "SELECT 1", &sales(), &schema, &props)
                 .await
                 .err(),
             session
-                .create_or_replace_view(&sales(), "v", "SELECT 1", &schema, &props)
+                .create_or_replace_view(&sales(), "v", "SELECT 1", &sales(), &schema, &props)
                 .await
                 .err(),
             session.list_views(&sales()).await.err(),
@@ -5974,7 +6383,8 @@ mod view_rest_tests {
 
     use super::{
         oauth2_identity, rest_catalog_token_fingerprint, select_view_sql, sqe_view_version,
-        view_replace_updates, view_schema_from_json, SessionCatalog, TableMetadataCache,
+        view_default_schema, view_replace_updates, view_schema_from_json, SessionCatalog,
+        TableMetadataCache,
     };
     use crate::circuit_breaker::CircuitBreaker;
 
@@ -6046,6 +6456,25 @@ mod view_rest_tests {
         );
         let md = metadata(2, &[("sqe", "SELECT 1 AS x")]);
         assert_eq!(select_view_sql(&md, "v").unwrap(), "SELECT 2 AS x");
+    }
+
+    /// A body's unqualified names resolve in the current version's
+    /// `default-namespace`, levels joined as the catalog names schemas; an
+    /// empty one keeps `default` (ai-portal-data#357).
+    #[test]
+    fn view_default_schema_is_the_current_versions_default_namespace() {
+        let with_namespace = |current: i32, v2_namespace: serde_json::Value| {
+            let mut doc = view_metadata_json(current, &[("sqe", "SELECT 1 AS x")]);
+            doc["versions"][0]["default-namespace"] = serde_json::json!(["pg3_gold__marts"]);
+            doc["versions"][1]["default-namespace"] = v2_namespace;
+            serde_json::from_value::<iceberg::spec::ViewMetadata>(doc).expect("valid view")
+        };
+        let md = with_namespace(1, serde_json::json!(["sales"]));
+        assert_eq!(view_default_schema(&md), "pg3_gold__marts");
+        let md = with_namespace(2, serde_json::json!(["a", "b"]));
+        assert_eq!(view_default_schema(&md), "a.b");
+        let md = with_namespace(2, serde_json::json!([]));
+        assert_eq!(view_default_schema(&md), "default");
     }
 
     #[test]
@@ -6130,6 +6559,7 @@ mod view_rest_tests {
                 &sales(),
                 "v",
                 "SELECT 1 AS x",
+                &NamespaceIdent::new("staging".to_string()),
                 &view_schema_json(),
                 &HashMap::from([("comment".to_string(), "c".to_string())]),
             )
@@ -6165,9 +6595,11 @@ mod view_rest_tests {
             "SELECT 1 AS x"
         );
         assert_eq!(body["view-version"]["default-catalog"], WAREHOUSE);
+        // The schema the body was planned in, not the view's own namespace
+        // (ai-portal-data#357).
         assert_eq!(
             body["view-version"]["default-namespace"],
-            serde_json::json!(["sales"])
+            serde_json::json!(["staging"])
         );
         assert_eq!(body["properties"]["comment"], "c");
         assert!(
@@ -6201,6 +6633,7 @@ mod view_rest_tests {
                 &sales(),
                 "v",
                 "SELECT 1",
+                &sales(),
                 &view_schema_json(),
                 &HashMap::new(),
             )
@@ -6421,6 +6854,7 @@ mod view_rest_tests {
                 &sales(),
                 "v",
                 "SELECT 3 AS x",
+                &sales(),
                 &view_schema_json(),
                 &HashMap::new(),
             )
@@ -6835,6 +7269,190 @@ mod vended_credentials_rest_tests {
         let after = loads(&server.received_requests().await.unwrap());
         assert_eq!(after, before + 1);
     }
+
+    const ORDERS_PATH: &str = "/v1/wh/namespaces/sales/tables/orders";
+    const ORDERS_UUID: &str = "b55d9dda-6561-423a-8bfc-787980ce421f";
+
+    fn commit_body(r: &wiremock::Request) -> serde_json::Value {
+        serde_json::from_slice(&r.body).unwrap_or_default()
+    }
+
+    fn is_commit(r: &wiremock::Request) -> bool {
+        r.method == wiremock::http::Method::POST
+    }
+
+    fn commits(reqs: &[wiremock::Request]) -> Vec<serde_json::Value> {
+        reqs.iter()
+            .filter(|r| r.method == wiremock::http::Method::POST && r.url.path() == ORDERS_PATH)
+            .map(commit_body)
+            .collect()
+    }
+
+    async fn vending_session(server: &MockServer, token: &str) -> SessionCatalog {
+        let cfg = catalog_config(server, "access_delegation = \"vended-credentials\"");
+        SessionCatalog::for_session_with(&cfg, &static_storage(), None, token)
+            .await
+            .unwrap()
+    }
+
+    /// Static keys, so only the catalog half runs (no object-store probe
+    /// against the fixture's `s3://` location).
+    async fn static_session(server: &MockServer, token: &str) -> SessionCatalog {
+        let mut body: serde_json::Value = serde_json::from_str(LOAD_TABLE_RESPONSE).unwrap();
+        body["config"] = serde_json::json!({});
+        Mock::given(method("GET"))
+            .and(path(ORDERS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+        let cfg = catalog_config(server, "");
+        SessionCatalog::for_session_with(&cfg, &static_storage(), None, token)
+            .await
+            .unwrap()
+    }
+
+    /// #880: a reader's write is refused before it writes. The question is
+    /// a commit that cannot apply: `main` set to the snapshot it already
+    /// holds, guarded by an `assert-table-uuid` that can never match. With
+    /// vended credentials a catalog refusal ends the check before the
+    /// object-store probe.
+    #[tokio::test]
+    async fn write_check_refuses_a_reader_with_access_denied() {
+        let server = mock_catalog(serde_json::json!({})).await;
+        Mock::given(path(ORDERS_PATH))
+            .and(is_commit)
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": {"message": "Principal 'analyst' is not authorized for op 'SET_TABLE_SNAPSHOT_REF'",
+                          "type": "ForbiddenException", "code": 403}
+            })))
+            .mount(&server)
+            .await;
+        let session = vending_session(&server, "tok-reader").await;
+        let table = session.load_table(&orders()).await.unwrap();
+
+        let err = session
+            .check_write_access(&orders(), &table)
+            .await
+            .expect_err("a 403 refuses");
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::AccessDenied);
+        assert!(err.to_string().contains("no write access"), "{err}");
+
+        let sent = commits(&server.received_requests().await.unwrap());
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let wrong = uuid::Uuid::from_u128(
+            uuid::Uuid::parse_str(ORDERS_UUID).unwrap().as_u128() ^ u128::MAX,
+        );
+        assert_eq!(
+            sent[0]["requirements"],
+            serde_json::json!([{"type": "assert-table-uuid", "uuid": wrong.to_string()}])
+        );
+        let snapshot = 3497810964824022504_i64;
+        assert_eq!(
+            sent[0]["updates"],
+            serde_json::json!([
+                {"action": "set-snapshot-ref", "ref-name": "main", "snapshot-id": snapshot, "type": "branch"},
+            ])
+        );
+    }
+
+    /// The failed requirement (409) is a writer's answer, on any REST
+    /// catalog; the pass is cached, so a second check sends nothing.
+    #[tokio::test]
+    async fn write_check_passes_a_writer_and_caches_the_pass() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "defaults": {}, "overrides": {"prefix": "wh"}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(path(ORDERS_PATH))
+            .and(is_commit)
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": {"message": "Requirement failed: UUID does not match",
+                          "type": "CommitFailedException", "code": 409}
+            })))
+            .mount(&server)
+            .await;
+        let session = static_session(&server, "tok-writer").await;
+        let table = session.load_table(&orders()).await.unwrap();
+        for _ in 0..2 {
+            session
+                .check_write_access(&orders(), &table)
+                .await
+                .expect("a writer passes");
+        }
+        assert_eq!(commits(&server.received_requests().await.unwrap()).len(), 1);
+    }
+
+    /// Anything but a 403 or 409 leaves the decision to the real commit.
+    #[tokio::test]
+    async fn write_check_is_inconclusive_on_other_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "defaults": {}, "overrides": {"prefix": "wh"}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(path(ORDERS_PATH))
+            .and(is_commit)
+            .respond_with(ResponseTemplate::new(400))
+            .mount(&server)
+            .await;
+        let session = static_session(&server, "tok-400").await;
+        let table = session.load_table(&orders()).await.unwrap();
+        session
+            .check_write_access(&orders(), &table)
+            .await
+            .expect("a 400 does not refuse");
+    }
+
+    /// Static keys no longer skip the catalog half: a 403 refuses there too.
+    #[tokio::test]
+    async fn write_check_asks_the_catalog_without_vending() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "defaults": {}, "overrides": {"prefix": "wh"}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(path(ORDERS_PATH))
+            .and(is_commit)
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let session = static_session(&server, "tok-static").await;
+        let table = session.load_table(&orders()).await.unwrap();
+        let err = session
+            .check_write_access(&orders(), &table)
+            .await
+            .expect_err("a 403 refuses");
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::AccessDenied);
+    }
+
+    /// The storage half writes and deletes one empty object under the
+    /// table's data path, leaving nothing behind.
+    #[tokio::test]
+    async fn storage_probe_writes_and_deletes_one_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = format!("file://{}", dir.path().display());
+        let table = super::local_table_at(&location);
+        assert!(super::storage_write_check(&orders(), &table)
+            .await
+            .is_none());
+        let data = dir.path().join("data");
+        assert!(data.is_dir(), "the probe wrote under {}", data.display());
+        assert_eq!(
+            std::fs::read_dir(&data).unwrap().count(),
+            0,
+            "probe deleted"
+        );
+    }
 }
 
 /// Raw REST calls address the `{prefix}` the server advertised, not the
@@ -6976,6 +7594,7 @@ mod rest_prefix_tests {
                 &NamespaceIdent::new("demo".to_string()),
                 "v",
                 "SELECT 1 AS x",
+                &NamespaceIdent::new("demo".to_string()),
                 &schema,
                 &Default::default(),
             )

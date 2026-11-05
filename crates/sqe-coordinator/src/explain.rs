@@ -24,6 +24,8 @@ use sqe_catalog::IcebergScanExec;
 use sqe_core::{Session, SqeError, SqeErrorCode};
 use sqe_policy::PolicyEnforcer;
 
+use crate::join_fallback::{FallbackStream, JoinFallback, ReplannedPlan};
+
 pub struct ExplainHandler {
     pub policy_enforcer: Arc<dyn PolicyEnforcer>,
     /// The same `QueryConfig` `query_handler` plans with, so EXPLAIN output
@@ -145,6 +147,7 @@ impl ExplainHandler {
         session: &Session,
         inner_sql: &str,
         ctx: &SessionContext,
+        fallback: impl FnOnce(LogicalPlan) -> Option<JoinFallback>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let total_start = std::time::Instant::now();
 
@@ -172,9 +175,19 @@ impl ExplainHandler {
         let physical = self.apply_plan_shape_rules(ctx, physical)?;
         let physical_plan_ms = physical_plan_start.elapsed().as_secs_f64() * 1000.0;
 
-        // Execute — populates metrics on each node in-place
+        // Execute — populates metrics on each node in-place. Same query pool
+        // and join fallback as the SELECT path (#788); `physical` becomes the
+        // plan that ran.
         let execute_start = std::time::Instant::now();
-        drain_capped(&physical, ctx, self.query_config.max_result_rows, "EXPLAIN ANALYZE").await?;
+        let fallback = fallback(enforced);
+        let physical = drain_capped(
+            &physical,
+            ctx,
+            self.query_config.max_result_rows,
+            "EXPLAIN ANALYZE",
+            fallback,
+        )
+        .await?;
         let execute_ms = execute_start.elapsed().as_secs_f64() * 1000.0;
 
         let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
@@ -282,6 +295,7 @@ impl ExplainHandler {
         session: &Session,
         inner_sql: &str,
         ctx: &SessionContext,
+        fallback: impl FnOnce(LogicalPlan) -> Option<JoinFallback>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let total_start = std::time::Instant::now();
 
@@ -309,9 +323,18 @@ impl ExplainHandler {
         let physical = self.apply_plan_shape_rules(ctx, physical)?;
         let physical_plan_ms = physical_plan_start.elapsed().as_secs_f64() * 1000.0;
 
-        // Execute — populates per-node metrics in-place
+        // Execute — populates per-node metrics in-place, under the SELECT
+        // path's query pool and join fallback (#788).
         let execute_start = std::time::Instant::now();
-        drain_capped(&physical, ctx, self.query_config.max_result_rows, "EXPLAIN FULL").await?;
+        let fallback = fallback(enforced);
+        let physical = drain_capped(
+            &physical,
+            ctx,
+            self.query_config.max_result_rows,
+            "EXPLAIN FULL",
+            fallback,
+        )
+        .await?;
         let execute_ms = execute_start.elapsed().as_secs_f64() * 1000.0;
 
         let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
@@ -730,21 +753,32 @@ fn walk_full(node: &Arc<dyn ExecutionPlan>, rows: &mut Vec<FullRow>) {
 /// with the SELECT path's error once more than `max_rows` rows have streamed
 /// (`0` = uncapped). EXPLAIN ANALYZE / FULL used `collect()`, which buffered
 /// the entire result the buffered SELECT path refuses to buffer (#734).
+///
+/// `ctx` carries the statement's query pool and `fallback` is the SELECT
+/// path's join fallback (#784), so the plan runs under the same memory rules
+/// as the query it explains (#788). Returns the plan that produced the rows:
+/// the retry's when the fallback replanned, whose metrics are the ones to
+/// report.
 async fn drain_capped(
     plan: &Arc<dyn ExecutionPlan>,
     ctx: &SessionContext,
     max_rows: usize,
     what: &str,
-) -> sqe_core::Result<()> {
+    fallback: Option<JoinFallback>,
+) -> sqe_core::Result<Arc<dyn ExecutionPlan>> {
     use futures::TryStreamExt;
     let fail = |e: datafusion::error::DataFusionError| {
-        SqeError::with_code(
-            SqeErrorCode::ExecutionFailed,
-            format!("{what} execution failed: {e}"),
-        )
+        let code = if crate::query_memory::is_resources_exhausted(&e) {
+            SqeErrorCode::ResourceExhausted
+        } else {
+            SqeErrorCode::ExecutionFailed
+        };
+        SqeError::with_code(code, format!("{what} execution failed: {e}"))
     };
     let task = crate::join_fallback::sort_task_context(ctx, plan);
-    let mut stream = execute_stream(Arc::clone(plan), task).map_err(fail)?;
+    let stream = execute_stream(Arc::clone(plan), task).map_err(fail)?;
+    let replanned = ReplannedPlan::default();
+    let mut stream = FallbackStream::wrap(stream, Arc::clone(plan), fallback, replanned.clone());
     let mut rows: usize = 0;
     while let Some(batch) = stream.try_next().await.map_err(fail)? {
         rows = rows.saturating_add(batch.num_rows());
@@ -759,7 +793,7 @@ async fn drain_capped(
             ));
         }
     }
-    Ok(())
+    Ok(replanned.take().unwrap_or_else(|| Arc::clone(plan)))
 }
 
 #[cfg(test)]
@@ -812,13 +846,13 @@ mod tests {
                 None,
             );
             let err = handler
-                .analyze(&session, "SELECT 1", &ctx)
+                .analyze(&session, "SELECT 1", &ctx, |_| None)
                 .await
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("EXPLAIN ANALYZE is not available"), "{err}");
             let err = handler
-                .full(&session, "SELECT 1", &ctx)
+                .full(&session, "SELECT 1", &ctx, |_| None)
                 .await
                 .unwrap_err()
                 .to_string();
@@ -837,13 +871,13 @@ mod tests {
             .create_physical_plan()
             .await
             .unwrap();
-        drain_capped(&plan, &ctx, 0, "EXPLAIN ANALYZE")
+        drain_capped(&plan, &ctx, 0, "EXPLAIN ANALYZE", None)
             .await
             .unwrap();
-        drain_capped(&plan, &ctx, 5, "EXPLAIN ANALYZE")
+        drain_capped(&plan, &ctx, 5, "EXPLAIN ANALYZE", None)
             .await
             .unwrap();
-        let err = drain_capped(&plan, &ctx, 2, "EXPLAIN ANALYZE")
+        let err = drain_capped(&plan, &ctx, 2, "EXPLAIN ANALYZE", None)
             .await
             .unwrap_err()
             .to_string();

@@ -575,7 +575,10 @@ pub async fn try_acquire(
                 let new_path = new_file.file_path().to_string();
                 let delete_targets: Vec<DataFile> = rows.into_iter().map(|r| r.data_file).collect();
 
-                match commit_cas(catalog, &table, delete_targets, new_file).await? {
+                match commit_cas(catalog, &table, delete_targets, new_file)
+                    .await
+                    .inspect_err(|e| cleanup_guard.keep_if_outcome_unknown(e))?
+                {
                     CasOutcome::Committed => {
                         cleanup_guard.mark_committed();
                         if let Some(prev) = &stolen_from {
@@ -667,7 +670,10 @@ pub async fn renew(
         let new_path = new_file.file_path().to_string();
         let delete_targets: Vec<DataFile> = rows.into_iter().map(|r| r.data_file).collect();
 
-        match commit_cas(catalog, &table, delete_targets, new_file).await? {
+        match commit_cas(catalog, &table, delete_targets, new_file)
+            .await
+            .inspect_err(|e| cleanup_guard.keep_if_outcome_unknown(e))?
+        {
             CasOutcome::Committed => {
                 cleanup_guard.mark_committed();
                 handle.expires_at_ms = expires_at_ms;
@@ -773,7 +779,10 @@ pub async fn release(
         let (new_file, cleanup_guard) =
             write_lease_file(&table, &row, "maintenance-lease-release").await?;
 
-        match commit_cas(catalog, &table, delete_targets, new_file).await? {
+        match commit_cas(catalog, &table, delete_targets, new_file)
+            .await
+            .inspect_err(|e| cleanup_guard.keep_if_outcome_unknown(e))?
+        {
             CasOutcome::Committed => {
                 cleanup_guard.mark_committed();
                 return Ok(());

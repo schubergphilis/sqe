@@ -11,32 +11,60 @@ use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::optimizer::{Optimizer, OptimizerRule};
+use datafusion::optimizer::{Analyzer, AnalyzerRule, Optimizer, OptimizerRule};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::eliminate_cross_join::EliminateCrossJoin;
 
+mod decimal_arithmetic;
+mod decimal_rounding;
 mod sorted_row_number;
 mod top_row_number;
 
+pub use decimal_arithmetic::{DecimalArithUdf, DecimalArithmeticRule, TrinoSum, DECIMAL_ARITH};
+pub use decimal_rounding::{
+    register_decimal_rounding, register_rescale, DecimalRoundingRule, RescaleUdf, RoundedAvg,
+    RESCALE,
+};
 pub use sorted_row_number::{SortedRowNumberExec, SortedRowNumberRule};
 pub use top_row_number::TopRowNumberRule;
 
 /// A context for user SQL: `config` and `runtime`, planned by
 /// [`EngineQueryPlanner`], with SQE's [`EliminateCrossJoin`] in place of
 /// DataFusion's and [`SortedRowNumberRule`] after DataFusion's physical rules.
+/// Decimal arithmetic and `sum` take Trino's result types
+/// ([`DecimalArithmeticRule`], [`TrinoSum`]); decimal division, `avg` and
+/// decimal casts round half away from zero ([`DecimalRoundingRule`],
+/// [`RoundedAvg`]).
 pub fn engine_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> SessionContext {
     let state = SessionStateBuilder::new()
         .with_config(config)
         .with_runtime_env(runtime)
         .with_default_features()
+        .with_analyzer_rules(engine_analyzer_rules())
         .with_optimizer_rules(engine_optimizer_rules())
         .with_physical_optimizer_rule(Arc::new(SortedRowNumberRule))
         .with_query_planner(Arc::new(EngineQueryPlanner))
         .build();
-    SessionContext::new_with_state(state)
+    let ctx = SessionContext::new_with_state(state);
+    register_decimal_rounding(&ctx);
+    ctx
+}
+
+/// DataFusion's analyzer rules with [`DecimalArithmeticRule`] before type
+/// coercion, so coercion types every parent against Trino's decimal types,
+/// and [`DecimalRoundingRule`] after it.
+fn engine_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
+    let mut rules = Analyzer::new().rules;
+    let at = rules
+        .iter()
+        .position(|r| r.name() == "type_coercion")
+        .unwrap_or(rules.len());
+    rules.insert(at, Arc::new(DecimalArithmeticRule));
+    rules.push(Arc::new(DecimalRoundingRule));
+    rules
 }
 
 /// DataFusion's default logical rules, with `eliminate_cross_join` swapped
@@ -133,6 +161,41 @@ pub fn engine_session_config() -> SessionConfig {
         .set_bool("datafusion.execution.parquet.reorder_filters", true)
 }
 
+/// The functions every SQE statement plans with on top of DataFusion's:
+/// Trino's library (`year`, `if`, `date_parse`, ...), the JSON functions,
+/// variant access and `ST_*`. The coordinator's session and every context
+/// that plans a view body register this one set, so a view plans with the
+/// names of the statement that reads it (ai-portal-data#359). Functions bound
+/// to the session's user (`current_user()`) are not in it.
+pub fn register_engine_functions(ctx: &mut SessionContext) -> Result<()> {
+    sqe_trino_functions::register_trino_functions(ctx);
+    sqe_trino_functions::register_extended_trino_functions(ctx);
+    datafusion_functions_json::register_all(ctx)?;
+    // A JSON column of a v3 table is a variant; the json_* functions read it
+    // as its JSON text (#849).
+    sqe_core::variant_json_args::accept_variant_in_json_functions(ctx);
+    // Typed field access that skips the JSON text (#857).
+    sqe_core::variant_get::register_variant_functions(ctx);
+    // ST_* over WKB geometry values (#863).
+    sqe_geo::register_geo_functions(ctx);
+    Ok(())
+}
+
+/// The context a view body is planned in: the engine's flags, rules and
+/// function set, with `catalog.schema` as the default for unqualified names.
+/// The plan is only planned and optimized here; it runs in the reading
+/// session, so the runtime is a throwaway.
+pub fn view_planning_context(catalog: &str, schema: &str) -> Result<SessionContext> {
+    let mut ctx = engine_context(
+        engine_session_config()
+            .with_information_schema(true)
+            .with_default_catalog_and_schema(catalog, schema),
+        Arc::new(RuntimeEnv::default()),
+    );
+    register_engine_functions(&mut ctx)?;
+    Ok(ctx)
+}
+
 /// SQE sends ROLLUP / CUBE / GROUPING SETS to DataFusion as written; these
 /// pin the empty-input semantics that SQE used to patch with a rewrite
 /// (apache/datafusion#21570). Run on the engine config with several input
@@ -221,6 +284,124 @@ mod grouping_sets_empty_input {
         // Eight groups plus the grand total; the total (a NULL, s 12) ranks first.
         assert_eq!(out.lines().filter(|l| l.starts_with("| ")).count() - 1, 9, "\n{out}");
         assert!(out.contains("|    | 12 | 1  |"), "grand total row\n{out}");
+    }
+}
+
+/// apache/datafusion#24421, backported in `vendor/datafusion-physical-plan`:
+/// a filter that pins a grouped column (`k2 = 'TN'`) must not make that
+/// column constant above a ROLLUP, which emits it as NULL in its subtotal
+/// rows. TPC-DS q27 at SF10 returned duplicate `(i_item_id, s_state)` groups
+/// and subtotals in the wrong order.
+#[cfg(test)]
+mod grouping_sets_constant_key {
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::util::pretty::pretty_format_batches;
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+
+    const ROLLUP: &str = "SELECT k1, k2, GROUPING(k2) AS g, SUM(v) AS s FROM t \
+                          WHERE k2 = 'TN' GROUP BY ROLLUP (k1, k2)";
+
+    fn ctx() -> SessionContext {
+        let ctx = SessionContext::new_with_config(
+            super::engine_session_config()
+                .with_target_partitions(4)
+                .with_batch_size(8),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k1", DataType::Utf8, true),
+            Field::new("k2", DataType::Utf8, true),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        // Every k1 appears in every partition, in both states, so each
+        // group's partial states meet in the final aggregate.
+        let partitions = (0..4)
+            .map(|p| {
+                let k1: Vec<String> = (0..200).map(|i| format!("item{:03}", i % 50)).collect();
+                let k2: Vec<&str> = (0..200)
+                    .map(|i| if i % 4 == 3 { "TX" } else { "TN" })
+                    .collect();
+                let v: Vec<i64> = (0..200).map(|i| i + p).collect();
+                vec![
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            Arc::new(StringArray::from(k1)),
+                            Arc::new(StringArray::from(k2)),
+                            Arc::new(Int64Array::from(v)),
+                        ],
+                    )
+                    .unwrap(),
+                ]
+            })
+            .collect();
+        ctx.register_table(
+            "t",
+            Arc::new(MemTable::try_new(schema, partitions).unwrap()),
+        )
+        .unwrap();
+        ctx
+    }
+
+    async fn rows(ctx: &SessionContext, sql: &str) -> String {
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        pretty_format_batches(&batches).unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn order_by_keeps_the_rolled_up_key() {
+        let ctx = ctx();
+        let plan = rows(&ctx, &format!("EXPLAIN {ROLLUP} ORDER BY k1, k2")).await;
+        assert!(
+            plan.contains("SortExec: expr=[k1@0 ASC NULLS LAST, k2@1 ASC NULLS LAST]"),
+            "the sort must keep k2\n{plan}"
+        );
+        assert!(
+            !plan.contains("ordering_mode"),
+            "no sorted-input aggregate\n{plan}"
+        );
+
+        // Detail row before the subtotal for each k1, as Trino returns them.
+        let out = rows(
+            &ctx,
+            &format!("SELECT k1, k2, g FROM ({ROLLUP}) ORDER BY k1, k2 LIMIT 4"),
+        )
+        .await;
+        let expected = "\
++---------+----+---+
+| k1      | k2 | g |
++---------+----+---+
+| item000 | TN | 0 |
+| item000 |    | 1 |
+| item001 | TN | 0 |
+| item001 |    | 1 |
++---------+----+---+";
+        assert_eq!(out, expected, "\n{out}");
+    }
+
+    #[tokio::test]
+    async fn every_group_comes_out_once() {
+        let ctx = ctx();
+        let out = rows(
+            &ctx,
+            &format!(
+                "SELECT COUNT(*) AS n, COUNT(DISTINCT (k1, k2, g)) AS d, SUM(s) AS total \
+                 FROM ({ROLLUP})"
+            ),
+        )
+        .await;
+        // 50 detail rows, 50 subtotals, 1 grand total. Each level sums the
+        // same TN rows: 3 * the TN sum over all partitions.
+        let tn_sum: i64 = (0..4)
+            .flat_map(|p| (0..200).filter(|i| i % 4 != 3).map(move |i| i + p))
+            .sum();
+        assert!(
+            out.contains(&format!("| 101 | 101 | {} |", 3 * tn_sum)),
+            "\n{out}"
+        );
     }
 }
 

@@ -75,8 +75,34 @@ where
 {
     const MAX_ATTEMPTS: u32 = 4;
     let mut last_err: Option<iceberg::Error> = None;
+    // Set once an attempt's outcome is unknown: the metadata location that
+    // attempt was built on, and its error. From then on a reload that shows
+    // any other location ends the loop with that error (see
+    // [`UnknownOutcome`]).
+    let mut unknown: Option<UnknownOutcome> = None;
     for attempt in 1..=MAX_ATTEMPTS {
-        let table = retry_transient_load(table_ident, op, || catalog.load_table(table_ident)).await?;
+        let table =
+            match retry_transient_load(table_ident, op, || catalog.load_table(table_ident)).await {
+                Ok(table) => table,
+                Err(e) => return Err(unknown.map_or(e, |u| u.error)),
+            };
+        if let Some(u) = unknown.take() {
+            if !u.table_unchanged(&table) {
+                warn!(
+                    table = %table_ident,
+                    op,
+                    "the table moved after a commit with an unknown outcome; not retrying"
+                );
+                return Err(u.error);
+            }
+            info!(
+                table = %table_ident,
+                op,
+                "the table did not move after a commit with an unknown outcome; retrying it"
+            );
+            unknown = Some(u);
+        }
+        let base = table.metadata_location().map(str::to_string);
         match build_and_commit(table).await {
             Ok(t) => {
                 if attempt > 1 {
@@ -89,13 +115,30 @@ where
                 }
                 return Ok(t);
             }
+            Err(e) if is_unknown_outcome(&e) && attempt < MAX_ATTEMPTS => {
+                warn!(
+                    table = %table_ident,
+                    op,
+                    attempt,
+                    settle_ms = UNKNOWN_OUTCOME_SETTLE_MS,
+                    error = %e,
+                    "commit outcome unknown; reloading the table to see whether it applied"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(UNKNOWN_OUTCOME_SETTLE_MS))
+                    .await;
+                // A second unknown outcome keeps the first one's base: the
+                // retry was built on the same, unchanged location.
+                unknown = Some(unknown.unwrap_or(UnknownOutcome { base, error: e }));
+            }
             Err(e) => {
                 let retryable = commit_attempt_is_retryable(&e);
                 if !retryable || attempt == MAX_ATTEMPTS {
-                    last_err = Some(e);
+                    // An earlier unknown outcome is the error that matters:
+                    // the caller must not treat its files as uncommitted.
+                    last_err = Some(unknown.map_or(e, |u| u.error));
                     break;
                 }
-                let sleep_ms = conflict_backoff_ms(attempt);
+                let sleep_ms = commit_backoff_ms(attempt, &e);
                 warn!(
                     table = %table_ident,
                     op,
@@ -115,6 +158,61 @@ where
             "commit_with_retry exhausted attempts without capturing an error",
         )
     }))
+}
+
+/// How long to wait after a commit with an unknown outcome before reloading
+/// the table to see whether it applied.
+pub(crate) const UNKNOWN_OUTCOME_SETTLE_MS: u64 = 1000;
+
+/// Floor on the backoff after a catalog refused a commit without naming a
+/// failed requirement.
+const PACED_COMMIT_BACKOFF_MS: u64 = 500;
+
+/// A commit attempt whose outcome the catalog could not report: the metadata
+/// location it was built on and the error it got.
+///
+/// Snowflake Horizon answers a commit sent within about half a second of the
+/// previous one on the same table with a 500 ("Indeterminate result during
+/// conflict resolution check") that did not apply the commit; the same body
+/// succeeds a moment later. Every other catalog's 5xx on a commit means the
+/// same thing to us: the commit may or may not have landed. Reloading the
+/// table tells the two apart. Iceberg commits are compare-and-swap on the
+/// metadata location, so a table still at the attempt's base location did not
+/// take the commit and a retry cannot apply the data twice. A table at any
+/// other location may hold it, and from then on the write stops with the
+/// original error rather than rebuild on top of it.
+struct UnknownOutcome {
+    base: Option<String>,
+    error: iceberg::Error,
+}
+
+impl UnknownOutcome {
+    fn table_unchanged(&self, reloaded: &IcebergTable) -> bool {
+        self.base.is_some() && reloaded.metadata_location() == self.base.as_deref()
+    }
+}
+
+/// Whether the catalog could not say if a commit applied.
+pub fn is_unknown_outcome(e: &iceberg::Error) -> bool {
+    sqe_compaction::writer::commit_outcome_unknown(&e.to_string())
+}
+
+/// Backoff before retrying commit `attempt` after `e`.
+///
+/// [`conflict_backoff_ms`], floored at [`PACED_COMMIT_BACKOFF_MS`] when the
+/// catalog refused the commit without a failed requirement. Snowflake Horizon
+/// answers a commit within about half a second of the previous one with a 409
+/// "concurrently modified" that names no requirement and applies nothing;
+/// retrying after 50 ms only draws the same 409 again. A real conflict
+/// ("Requirement failed: ...") keeps the short backoff.
+pub(crate) fn commit_backoff_ms(attempt: u32, e: &impl std::fmt::Display) -> u64 {
+    let backoff = conflict_backoff_ms(attempt);
+    let msg = e.to_string().to_lowercase();
+    if msg.contains("concurrently modified") && !msg.contains("requirement failed") {
+        backoff.max(PACED_COMMIT_BACKOFF_MS)
+    } else {
+        backoff
+    }
 }
 
 /// Whether a failed commit attempt may run again: the catalog never applied
@@ -300,6 +398,33 @@ mod tests {
         .with_context("status", "403");
         assert!(!commit_attempt_is_retryable(&forbidden));
         assert!(!is_transient_load_error(&forbidden));
+    }
+
+    /// Horizon's pacing 409 names no requirement and gets the 500 ms floor; a
+    /// real conflict keeps the short backoff.
+    #[test]
+    fn only_a_refusal_without_a_failed_requirement_waits_longer() {
+        let paced = "Catalog commit conflict: {\"error\":{\"message\":\"Failed to commit Table or \
+                     View S.T because it was concurrently modified\",\"code\":409}}";
+        let real = "Catalog commit conflict: Requirement failed: branch main has changed";
+        for attempt in 1..=3 {
+            assert!(commit_backoff_ms(attempt, &paced) >= PACED_COMMIT_BACKOFF_MS);
+            assert!(commit_backoff_ms(attempt, &real) < PACED_COMMIT_BACKOFF_MS);
+        }
+    }
+
+    #[test]
+    fn the_unknown_outcome_text_is_recognised() {
+        let unknown = iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            "An unknown server-side problem occurred; the commit state is unknown.",
+        );
+        assert!(is_unknown_outcome(&unknown));
+        let conflict = iceberg::Error::new(
+            iceberg::ErrorKind::CatalogCommitConflicts,
+            "Commit conflict",
+        );
+        assert!(!is_unknown_outcome(&conflict));
     }
 
     #[tokio::test]

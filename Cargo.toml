@@ -39,6 +39,7 @@ exclude = [
     "vendor/sqlite-rs",
     "vendor/object_store",
     "vendor/zstd",
+    "vendor/datafusion-physical-plan",
     "playground",
 ]
 
@@ -295,9 +296,19 @@ flate2 = { version = "1" }
 # (fixed in 0.14.3). 0.14 only adds API over 0.13, so the 0.13 callers build
 # unchanged against it. Drop this patch and vendor/zstd when DataFusion moves
 # to arrow 60 (zstd 0.14, DataFusion 56).
+#
+# datafusion-physical-plan 55.2.0 as published plus apache/datafusion#24422
+# (src/aggregates/mod.rs only): a grouping-set aggregate (ROLLUP, CUBE,
+# GROUPING SETS) no longer inherits its input's equivalence properties.
+# Without it, `WHERE s_state = 'TN' GROUP BY ROLLUP (i_item_id, s_state)`
+# kept s_state constant through the ROLLUP, which NULLs it: the final
+# aggregate ran PartiallySorted on it and emitted duplicate groups, and
+# ORDER BY dropped it as a sort key (TPC-DS q27). Drop this patch and
+# vendor/datafusion-physical-plan when DataFusion ships #24422 (DF 56).
 [patch.crates-io]
 object_store = { path = "vendor/object_store" }
 zstd = { path = "vendor/zstd" }
+datafusion-physical-plan = { path = "vendor/datafusion-physical-plan" }
 
 # ── Dev profile: fast rebuilds, minimal artifacts ──────────────
 [profile.dev]

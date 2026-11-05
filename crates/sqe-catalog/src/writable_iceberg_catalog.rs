@@ -360,8 +360,11 @@ impl ViewSource {
     ) -> futures::future::BoxFuture<'a, DFResult<Option<Arc<dyn TableProvider>>>> {
         let plan = async move {
             let ns = NamespaceIdent::new(namespace.to_string());
-            let sql = match self.session_catalog.load_view_sql(&ns, name).await {
-                Ok(Some(sql)) => sql,
+            let crate::rest_catalog::ViewBody {
+                sql,
+                default_schema,
+            } = match self.session_catalog.load_view_body(&ns, name).await {
+                Ok(Some(body)) => body,
                 Ok(None) => return Ok(None),
                 Err(e) if e.is_not_found() || server_has_no_views(&e) => return Ok(None),
                 // A 403, a 5xx or an unsupported view dialect reaches the
@@ -371,7 +374,7 @@ impl ViewSource {
             let Some(schemas) = self.schemas.upgrade() else {
                 return Ok(None);
             };
-            let ctx = crate::schema_provider::view_planning_context(&self.name);
+            let ctx = crate::schema_provider::view_planning_context(&self.name, &default_schema)?;
             let planning: Arc<dyn CatalogProvider> = Arc::new(ViewPlanningCatalog(schemas));
             ctx.register_catalog(&self.name, Arc::clone(&planning));
             if self.warehouse != self.name {
@@ -384,8 +387,15 @@ impl ViewSource {
                         format!("Failed to plan view '{name}' SQL: {e}").into(),
                     )
                 })?;
-            crate::schema_provider::view_table(df, name, sql, &self.name, &[&self.warehouse])
-                .map(Some)
+            crate::schema_provider::view_table(
+                df,
+                name,
+                sql,
+                &self.name,
+                &default_schema,
+                &[&self.warehouse],
+            )
+            .map(Some)
         };
         Box::pin(crate::schema_provider::plan_view_guarded(
             &self.warehouse,

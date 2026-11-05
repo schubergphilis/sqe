@@ -2080,7 +2080,7 @@ impl HiveSchemaProvider {
         // JSON arrow operator, so `filter(tags, (tag) -> ...)` planned `tag`
         // as a column and the view was hidden with "No field named tag"
         // while the same expression ran fine as a user statement.
-        let ctx = crate::session_tuning::engine_context(
+        let mut ctx = crate::session_tuning::engine_context(
             crate::session_tuning::engine_session_config()
                 .with_default_catalog_and_schema(&self.catalog_name, &default_schema),
             Arc::clone(&self.runtime),
@@ -2090,8 +2090,7 @@ impl HiveSchemaProvider {
         // and the rest of Trino's library failed as "unknown function" in a
         // bare DataFusion context, which is how the first live Glue catalog
         // hid two of its three views.
-        sqe_trino_functions::register_trino_functions(&ctx);
-        sqe_trino_functions::register_extended_trino_functions(&ctx);
+        crate::session_tuning::register_engine_functions(&mut ctx)?;
         ctx.register_catalog(&self.catalog_name, Arc::clone(&planning_catalog));
         for alias in ["awsdatacatalog"]
             .into_iter()

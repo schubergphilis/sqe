@@ -43,7 +43,7 @@ datafusion-expr = { version = "55", features = ["proto", "recursive_protection"]
 datafusion-functions = { version = "55", features = ["crypto_expressions"] }
 datafusion-physical-expr = { version = "55", default-features = false, features = ["proto", "recursive_protection"] }
 datafusion-physical-expr-common = { version = "55", default-features = false, features = ["proto"] }
-datafusion-physical-plan = { version = "55", default-features = false, features = ["proto"] }
+datafusion-physical-plan = { path = "../../vendor/datafusion-physical-plan", default-features = false, features = ["proto"] }
 digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["mac", "std"] }
 digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid"] }
 either = { version = "1", features = ["use_std"] }

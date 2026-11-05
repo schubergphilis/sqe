@@ -122,7 +122,7 @@ fn build_memory_pool(
 /// - The memory pool comes from [`build_memory_pool`]: greedy behind the
 ///   unspillable headroom by default, `fair` on request.
 /// - When `spill_to_disk` is `true`, the spill directory is set via
-///   `RuntimeEnvBuilder::with_temp_file_path`.
+///   `RuntimeEnvBuilder::with_temp_file_path`, capped at `spill_max_bytes`.
 /// - When `spill_to_disk` is `false`, the disk manager is disabled via
 ///   `DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled)`.
 ///
@@ -149,6 +149,7 @@ pub fn build_coordinator_runtime(
         spill_to_disk = config.spill_to_disk,
         spill_dir = %config.spill_dir,
         spill_compression = %config.spill_compression,
+        spill_max_bytes = %config.spill_max_bytes,
         "Configuring coordinator DataFusion runtime"
     );
 
@@ -188,7 +189,15 @@ pub fn build_coordinator_runtime(
                 config.spill_dir
             )
         })?;
-        builder = builder.with_temp_file_path(&config.spill_dir);
+        let spill_max_bytes = parse_memory_limit(&config.spill_max_bytes).map_err(|e| {
+            anyhow::anyhow!(
+                "Invalid coordinator spill_max_bytes '{}': {e}",
+                config.spill_max_bytes
+            )
+        })?;
+        builder = builder
+            .with_temp_file_path(&config.spill_dir)
+            .with_max_temp_directory_size(spill_max_bytes as u64);
     } else {
         // Disable disk manager — any attempt to spill will return an error.
         let disk_builder = DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled);

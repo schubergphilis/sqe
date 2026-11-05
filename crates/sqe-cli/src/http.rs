@@ -47,33 +47,37 @@ impl HttpClient {
 #[async_trait::async_trait]
 impl SqlClient for HttpClient {
     async fn execute(&mut self, sql: &str) -> Result<QueryResult, Box<dyn std::error::Error>> {
-        let mut columns: Vec<String> = Vec::new();
-        let mut rows: Vec<Vec<String>> = Vec::new();
+        let mut result = QueryResult::empty();
 
         self.inner
             .execute(sql, |page| {
-                if columns.is_empty() {
+                if result.columns.is_empty() {
                     if let Some(cols) = &page.columns {
-                        columns = cols.iter().map(|c| c.name.clone()).collect();
+                        result.columns = cols.iter().map(|c| c.name.clone()).collect();
                     }
                 }
-                if let Some(data) = &page.data {
-                    rows.extend(
-                        data.iter()
-                            .map(|row| row.iter().map(json_to_display).collect::<Vec<String>>()),
-                    );
+                for row in page.data.iter().flatten() {
+                    let index = result.rows.len();
+                    for (column, value) in row.iter().enumerate() {
+                        if value.is_null() {
+                            result.nulls.insert((index, column));
+                        }
+                    }
+                    result.rows.push(row.iter().map(json_to_display).collect());
                 }
                 Ok(())
             })
             .await?;
 
-        Ok(QueryResult { columns, rows })
+        Ok(result)
     }
 }
 
+/// Display text of one Trino JSON cell. NULL is `""`, like the Arrow
+/// backends; the result's NULL set marks it.
 fn json_to_display(v: &serde_json::Value) -> String {
     match v {
-        serde_json::Value::Null => "NULL".to_string(),
+        serde_json::Value::Null => String::new(),
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Bool(b) => b.to_string(),
         serde_json::Value::Number(n) => n.to_string(),
