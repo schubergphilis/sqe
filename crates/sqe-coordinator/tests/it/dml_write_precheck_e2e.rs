@@ -1,12 +1,15 @@
-//! A caller who may read a table but not write it is refused DELETE, UPDATE
-//! and MERGE before any file is written (#880).
+//! A caller who may read a table but not write it is refused INSERT, DELETE,
+//! UPDATE, MERGE and TRUNCATE before any file is written (#880).
 //!
 //! With vended credentials Polaris answers a reader's delegated `loadTable`
 //! with read-only keys instead of a refusal, so the statement used to plan,
 //! write data files and fail on the first `PutObject`. The engine now asks
-//! Polaris first with a commit that changes nothing. This test runs the
-//! engine vended-only, as `vended_credentials_e2e` does, with a fresh Polaris
-//! principal that holds `TABLE_READ_DATA` and nothing that writes.
+//! Polaris first with a commit that cannot apply, then writes and deletes an
+//! empty object with the vended keys. This test runs the engine vended-only,
+//! as `vended_credentials_e2e` does, with two fresh Polaris principals: one
+//! holds `TABLE_READ_DATA` and nothing that writes (the catalog refuses),
+//! one also holds `TABLE_WRITE_PROPERTIES` (the catalog lets it commit, the
+//! vended keys are read-only, the storage probe refuses).
 
 use std::sync::Arc;
 
@@ -20,8 +23,7 @@ use sqe_core::{SecretString, Session, SqeConfig, SqeErrorCode};
 const POLARIS: &str = "http://localhost:18181/api";
 const CATALOG: &str = "test_warehouse";
 const READER: &str = "dml_precheck_reader";
-const READER_ROLE: &str = "dml_precheck_reader_role";
-const READER_CATALOG_ROLE: &str = "dml_precheck_reader_cr";
+const PROPS_WRITER: &str = "dml_precheck_props";
 const TABLE: &str = "test_ns.dml_precheck_t";
 
 fn vended_only_config() -> SqeConfig {
@@ -78,21 +80,23 @@ async fn polaris_token(client_id: &str, client_secret: &str) -> String {
         .to_string()
 }
 
-/// A fresh principal that may read every table in the catalog and write
-/// none; returns its token. Role creation answers 409 on a rerun, which is
-/// fine: the grants are idempotent.
-async fn reader_token(root: &str) -> String {
+/// A fresh principal `name` that may read every table in the catalog, plus
+/// `extra` privileges; returns its token. Role creation answers 409 on a
+/// rerun, which is fine: the grants are idempotent.
+async fn principal_token(root: &str, name: &str, extra: &[&str]) -> String {
+    let principal_role = format!("{name}_role");
+    let catalog_role = format!("{name}_cr");
     let http = reqwest::Client::new();
     let mgmt = format!("{POLARIS}/management/v1");
     let _ = http
-        .delete(format!("{mgmt}/principals/{READER}"))
+        .delete(format!("{mgmt}/principals/{name}"))
         .bearer_auth(root)
         .send()
         .await;
     let created: serde_json::Value = http
         .post(format!("{mgmt}/principals"))
         .bearer_auth(root)
-        .json(&serde_json::json!({ "principal": { "name": READER } }))
+        .json(&serde_json::json!({ "principal": { "name": name } }))
         .send()
         .await
         .expect("create principal")
@@ -105,24 +109,25 @@ async fn reader_token(root: &str) -> String {
     let _ = http
         .post(format!("{mgmt}/principal-roles"))
         .bearer_auth(root)
-        .json(&serde_json::json!({ "principalRole": { "name": READER_ROLE } }))
+        .json(&serde_json::json!({ "principalRole": { "name": principal_role } }))
         .send()
         .await;
     let _ = http
         .post(format!("{mgmt}/catalogs/{CATALOG}/catalog-roles"))
         .bearer_auth(root)
-        .json(&serde_json::json!({ "catalogRole": { "name": READER_CATALOG_ROLE } }))
+        .json(&serde_json::json!({ "catalogRole": { "name": catalog_role } }))
         .send()
         .await;
-    for privilege in [
+    let read = [
         "CATALOG_READ_PROPERTIES",
         "NAMESPACE_LIST",
         "NAMESPACE_READ_PROPERTIES",
         "TABLE_LIST",
         "TABLE_READ_DATA",
-    ] {
+    ];
+    for privilege in read.iter().chain(extra) {
         http.put(format!(
-            "{mgmt}/catalogs/{CATALOG}/catalog-roles/{READER_CATALOG_ROLE}/grants"
+            "{mgmt}/catalogs/{CATALOG}/catalog-roles/{catalog_role}/grants"
         ))
         .bearer_auth(root)
         .json(&serde_json::json!({ "grant": { "type": "catalog", "privilege": privilege } }))
@@ -133,18 +138,18 @@ async fn reader_token(root: &str) -> String {
         .unwrap_or_else(|e| panic!("grant {privilege}: {e}"));
     }
     http.put(format!(
-        "{mgmt}/principal-roles/{READER_ROLE}/catalog-roles/{CATALOG}"
+        "{mgmt}/principal-roles/{principal_role}/catalog-roles/{CATALOG}"
     ))
     .bearer_auth(root)
-    .json(&serde_json::json!({ "catalogRole": { "name": READER_CATALOG_ROLE } }))
+    .json(&serde_json::json!({ "catalogRole": { "name": catalog_role } }))
     .send()
     .await
     .expect("assign catalog role")
     .error_for_status()
     .expect("catalog role assigned");
-    http.put(format!("{mgmt}/principals/{READER}/principal-roles"))
+    http.put(format!("{mgmt}/principals/{name}/principal-roles"))
         .bearer_auth(root)
-        .json(&serde_json::json!({ "principalRole": { "name": READER_ROLE } }))
+        .json(&serde_json::json!({ "principalRole": { "name": principal_role } }))
         .send()
         .await
         .expect("assign principal role")
@@ -159,9 +164,9 @@ async fn reader_token(root: &str) -> String {
     .await
 }
 
-fn reader_session(token: String) -> Session {
+fn session_for(name: &str, token: String) -> Session {
     Session::new(
-        READER.to_string(),
+        name.to_string(),
         SecretString::new(token),
         None,
         Utc::now() + Duration::hours(1),
@@ -255,34 +260,56 @@ async fn a_reader_is_refused_dml_before_any_file_is_written() {
         .location()
         .to_string();
 
-    let reader = reader_session(reader_token(root.access_token().expose()).await);
-    assert_eq!(
-        ids(&handler, &reader).await,
-        vec!["1", "2"],
-        "the reader reads"
+    let reader = session_for(
+        READER,
+        principal_token(root.access_token().expose(), READER, &[]).await,
+    );
+    let props_writer = session_for(
+        PROPS_WRITER,
+        principal_token(
+            root.access_token().expose(),
+            PROPS_WRITER,
+            &["TABLE_WRITE_PROPERTIES"],
+        )
+        .await,
     );
 
     let before = objects_under(&location).await;
-    for sql in [
-        format!("DELETE FROM {TABLE} WHERE id = 1"),
-        format!("UPDATE {TABLE} SET name = 'z' WHERE id = 2"),
-        format!(
-            "MERGE INTO {TABLE} AS t USING {TABLE} AS s ON t.id = s.id \
-             WHEN MATCHED THEN UPDATE SET name = 'm'"
-        ),
-        format!("TRUNCATE TABLE {TABLE}"),
-    ] {
-        let err = handler
-            .execute(&reader, &sql, None)
-            .await
-            .expect_err(&format!("the reader is refused: {sql}"));
-        assert_eq!(err.error_code(), SqeErrorCode::AccessDenied, "{sql}: {err}");
-        assert!(err.to_string().contains("no write access"), "{sql}: {err}");
+    for (who, session) in [("reader", &reader), ("properties writer", &props_writer)] {
+        assert_eq!(
+            ids(&handler, session).await,
+            vec!["1", "2"],
+            "the {who} reads"
+        );
+        for sql in [
+            format!("INSERT INTO {TABLE} VALUES (3, 'c')"),
+            format!("DELETE FROM {TABLE} WHERE id = 1"),
+            format!("UPDATE {TABLE} SET name = 'z' WHERE id = 2"),
+            format!(
+                "MERGE INTO {TABLE} AS t USING {TABLE} AS s ON t.id = s.id \
+                 WHEN MATCHED THEN UPDATE SET name = 'm'"
+            ),
+            format!("TRUNCATE TABLE {TABLE}"),
+        ] {
+            let err = handler
+                .execute(session, &sql, None)
+                .await
+                .expect_err(&format!("the {who} is refused: {sql}"));
+            assert_eq!(
+                err.error_code(),
+                SqeErrorCode::AccessDenied,
+                "{who}: {sql}: {err}"
+            );
+            assert!(
+                err.to_string().contains("no write access"),
+                "{who}: {sql}: {err}"
+            );
+        }
     }
     assert_eq!(
         objects_under(&location).await,
         before,
-        "a refused statement writes no object"
+        "a refused statement writes no object, the probe leaves none"
     );
 
     // The owner's DELETE goes through as before.
