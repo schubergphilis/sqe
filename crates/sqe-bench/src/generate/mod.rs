@@ -262,7 +262,10 @@ mod batch_source_tests {
     #[test]
     fn generation_golden() {
         use std::hash::{Hash, Hasher};
-        // Captured from the eager generators before their streaming migration.
+        // Hashes the values, not an encoding of them: arrow-ipc 59.3.2 stopped
+        // writing all-valid bitmaps, which changed the IPC bytes but no value.
+        // Recorded on arrow 59.3.1, where the earlier IPC-byte golden (captured
+        // from the eager generators before their streaming migration) passed.
         // `SQE_BENCH_RECORD_GOLDEN=1` prints the current hashes instead of
         // checking them, for a deliberate change to generated values.
         let record = std::env::var_os("SQE_BENCH_RECORD_GOLDEN").is_some();
@@ -279,14 +282,20 @@ mod batch_source_tests {
                 let mut rows = 0;
                 for shard in source.shards {
                     for batch in (shard.make)() {
-                        let mut bytes = Vec::new();
-                        let mut writer =
-                            arrow::ipc::writer::StreamWriter::try_new(&mut bytes, &batch.schema())
-                                .unwrap();
-                        writer.write(&batch).unwrap();
-                        writer.finish().unwrap();
-                        drop(writer);
-                        bytes.hash(&mut hash);
+                        let schema = batch.schema();
+                        for (field, column) in schema.fields().iter().zip(batch.columns()) {
+                            field.name().hash(&mut hash);
+                            field.data_type().to_string().hash(&mut hash);
+                            let formatter = arrow::util::display::ArrayFormatter::try_new(
+                                column.as_ref(),
+                                &arrow::util::display::FormatOptions::default(),
+                            )
+                            .unwrap();
+                            for row in 0..column.len() {
+                                column.is_null(row).hash(&mut hash);
+                                formatter.value(row).to_string().hash(&mut hash);
+                            }
+                        }
                         rows += batch.num_rows();
                     }
                 }
