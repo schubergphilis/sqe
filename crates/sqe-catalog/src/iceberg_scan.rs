@@ -899,14 +899,20 @@ impl IcebergScanExec {
     pub fn projection(&self) -> Option<&[String]> {
         self.projection.as_deref()
     }
-    /// The projection fill a distributed worker needs (#831), or `None` when
-    /// no projected column ever changed, so every file carries every column
-    /// as the current schema declares it.
+    /// The projection fill a distributed worker conforms every batch to
+    /// (#831), or `None` for an unprojected or `COUNT(*)` scan.
+    ///
+    /// Sent even when no projected column ever changed. A parquet projection
+    /// emits columns in the file's order, and that order is the writer's
+    /// choice: Snowflake stores `ts, id, region` for a table declared
+    /// `id, region, ts`. Without a fill the worker labelled every batch with
+    /// its first file's layout, so a task mixing writers bound the second
+    /// file's columns by position.
     pub fn projection_fill(&self) -> DFResult<Option<Vec<u8>>> {
         let Some(cols) = self.projection.as_deref() else {
             return Ok(None);
         };
-        if cols.is_empty() || !projection_evolved(&self.table, self.snapshot_id, cols) {
+        if cols.is_empty() {
             return Ok(None);
         }
         let defaults =
@@ -2921,47 +2927,6 @@ fn conform_batch_to_projection(
     .map_err(|e| DataFusionError::Internal(format!("failed to conform scan batch: {e}")))
 }
 
-/// Whether some data file may store a projected column differently from the
-/// scanned snapshot's schema: absent (added later), under another name
-/// (renamed) or as another type (promoted). Answered from the table's historic
-/// schemas, so a table whose projected columns never changed reports `false`.
-///
-/// A column that is or holds a V3 `unknown` field also counts: that field is
-/// never in a data file, so every file stores the column narrower (#859).
-fn projection_evolved(table: &Table, snapshot_id: Option<i64>, cols: &[String]) -> bool {
-    let metadata = table.metadata();
-    let scanned = snapshot_schema(table, snapshot_id);
-    cols.iter().any(|name| {
-        let Some(field) = scanned.field_by_name(name) else {
-            return false;
-        };
-        if type_holds_unknown(&field.field_type) {
-            return true;
-        }
-        metadata
-            .schemas_iter()
-            .any(|schema| match schema.field_by_id(field.id) {
-                None => true,
-                Some(old) => old.name != field.name || old.field_type != field.field_type,
-            })
-    })
-}
-
-/// True when `ty` is V3 `unknown` or holds an `unknown` field at any depth.
-fn type_holds_unknown(ty: &iceberg::spec::Type) -> bool {
-    use iceberg::spec::{PrimitiveType, Type};
-    match ty {
-        Type::Primitive(p) => *p == PrimitiveType::Unknown,
-        Type::Struct(s) => s.fields().iter().any(|f| type_holds_unknown(&f.field_type)),
-        Type::List(l) => type_holds_unknown(&l.element_field.field_type),
-        Type::Map(m) => {
-            type_holds_unknown(&m.key_field.field_type)
-                || type_holds_unknown(&m.value_field.field_type)
-        }
-        _ => false,
-    }
-}
-
 /// Encode a projection fill (#831) as an Arrow IPC stream: one row, in
 /// `schema` with every field nullable, holding each column's default from
 /// `defaults` (parallel to `schema`; empty or `None` means NULL).
@@ -4320,6 +4285,74 @@ mod projection_evolution_tests {
             .map(|c| Arc::new(arrow::array::StringArray::from(c)) as arrow::array::ArrayRef)
             .collect();
         RecordBatch::try_new(Arc::new(schema.clone()), arrays).expect("test batch")
+    }
+
+    /// A table whose one schema never changed: `id long, region string`.
+    fn unevolved_table() -> Table {
+        let metadata: iceberg::spec::TableMetadata = serde_json::from_str(
+            r#"{
+            "format-version": 2,
+            "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+            "location": "/tmp/unevolved",
+            "last-sequence-number": 0,
+            "last-updated-ms": 1602638573590,
+            "last-column-id": 2,
+            "current-schema-id": 0,
+            "schemas": [{"type": "struct", "schema-id": 0, "fields": [
+                {"id": 1, "name": "id", "required": true, "type": "long"},
+                {"id": 2, "name": "region", "required": false, "type": "string"}]}],
+            "default-spec-id": 0,
+            "partition-specs": [{"spec-id": 0, "fields": []}],
+            "last-partition-id": 999,
+            "default-sort-order-id": 0,
+            "sort-orders": [{"order-id": 0, "fields": []}],
+            "properties": {},
+            "current-snapshot-id": -1,
+            "snapshots": []
+        }"#,
+        )
+        .expect("table metadata");
+        Table::builder()
+            .runtime(iceberg::Runtime::current())
+            .metadata(metadata)
+            .identifier(iceberg::TableIdent::new(
+                iceberg::NamespaceIdent::new("ns".to_string()),
+                "t".to_string(),
+            ))
+            .file_io(iceberg::io::FileIO::new_with_fs())
+            .build()
+            .expect("table")
+    }
+
+    /// A worker binds columns by position unless it gets a fill, and a
+    /// parquet projection emits them in the file's order. Snowflake writes
+    /// `region` before `id` into a table declared `id, region`, so a table that
+    /// never evolved still needs one: the distributed scan read `id` as NULL
+    /// and `region` as the id.
+    #[tokio::test]
+    async fn an_unevolved_projection_still_gets_a_fill() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, true),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let scan = IcebergScanExec::new(
+            unevolved_table(),
+            Arc::clone(&schema),
+            Some(names(&["region", "id"])),
+            None,
+        );
+        let fill = scan.projection_fill().unwrap().expect("a fill");
+        let decoded = decode_projection_fill(&fill).unwrap();
+        let fields: Vec<String> = decoded
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(fields, ["region", "id"]);
+
+        let count_star = IcebergScanExec::new(unevolved_table(), schema, Some(vec![]), None);
+        assert!(count_star.projection_fill().unwrap().is_none());
     }
 
     /// THE ONE THAT MATTERS. Every projected column is absent from the file.
