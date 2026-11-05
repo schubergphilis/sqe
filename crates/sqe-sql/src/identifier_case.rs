@@ -40,9 +40,8 @@ use std::ops::ControlFlow;
 
 use sqlparser::ast::{
     AssignmentTarget, Expr, Ident, JoinConstraint, JoinOperator, MergeAction, MergeClause,
-    ObjectName, ObjectNamePart, Query, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, Statement, TableAlias, TableFactor, TableObject, VisitMut,
-    VisitorMut,
+    ObjectName, ObjectNamePart, Query, Select, SelectItem, SelectItemQualifiedWildcardKind,
+    Statement, TableAlias, TableFactor, TableObject, Use, VisitMut, VisitorMut,
 };
 
 /// The catalogs whose unquoted identifiers fold to upper case, by the name
@@ -102,6 +101,10 @@ pub fn fold_upper_case_identifiers(
     let session_catalog = session_catalog.or(catalogs.default_catalog.as_deref());
     let mut changed = false;
     for stmt in statements.iter_mut() {
+        if let Statement::Use(target) = stmt {
+            changed |= fold_use_target(target, catalogs, session_catalog);
+            continue;
+        }
         if !matches!(
             stmt,
             Statement::Query(_)
@@ -127,6 +130,43 @@ pub fn fold_upper_case_identifiers(
         changed |= folder.changed;
     }
     changed
+}
+
+/// `USE sf.sales` / `USE sales` (session catalog `sf`) sets the schema that
+/// one-part names resolve in, so its schema part folds like a table name's:
+/// `USE sf."SALES"`. Without it the session would hold `sales`, and every
+/// later `SELECT .. FROM orders` would look for `sf.sales.ORDERS`.
+/// `USE CATALOG` names a catalog, which never folds.
+fn fold_use_target(
+    target: &mut Use,
+    catalogs: &UpperCaseCatalogs,
+    session_catalog: Option<&str>,
+) -> bool {
+    let name = match target {
+        Use::Object(name) | Use::Schema(name) | Use::Database(name) => name,
+        _ => return false,
+    };
+    let Some(parts) = identifiers(name) else {
+        return false;
+    };
+    let catalog = match parts.len() {
+        2 => Some(resolve(&parts[0])),
+        1 => session_catalog.map(str::to_string),
+        _ => None,
+    };
+    if !catalog.is_some_and(|c| catalogs.contains(&c)) {
+        return false;
+    }
+    if parts[parts.len() - 1]
+        .value
+        .eq_ignore_ascii_case("information_schema")
+    {
+        return false;
+    }
+    match name.0.last_mut() {
+        Some(ObjectNamePart::Identifier(schema)) => fold_ident(schema),
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,7 +358,11 @@ impl<'a> Folder<'a> {
             }
             let value = match ident.value.split_once('$') {
                 Some((table, suffix)) => {
-                    format!("{}${}", table.to_ascii_uppercase(), suffix.to_ascii_lowercase())
+                    format!(
+                        "{}${}",
+                        table.to_ascii_uppercase(),
+                        suffix.to_ascii_lowercase()
+                    )
                 }
                 None => ident.value.to_ascii_uppercase(),
             };
@@ -397,15 +441,17 @@ impl VisitorMut for Folder<'_> {
         for item in &mut select.projection {
             match item {
                 SelectItem::ExprWithAlias { alias, .. } => self.fold_name(alias),
-                SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(name), _) => {
-                    self.fold_wildcard_qualifier(name)
-                }
+                SelectItem::QualifiedWildcard(
+                    SelectItemQualifiedWildcardKind::ObjectName(name),
+                    _,
+                ) => self.fold_wildcard_qualifier(name),
                 _ => {}
             }
         }
         for from in &mut select.from {
             for join in &mut from.joins {
-                if let Some(JoinConstraint::Using(columns)) = join_constraint(&mut join.join_operator)
+                if let Some(JoinConstraint::Using(columns)) =
+                    join_constraint(&mut join.join_operator)
                 {
                     for column in columns {
                         self.fold_column_path(column);
@@ -579,24 +625,51 @@ mod tests {
             fold("SELECT id FROM s.t", Some("sf")),
             r#"SELECT "ID" FROM "S"."T""#
         );
-        assert_eq!(fold("SELECT id FROM s.t", Some("iceberg")), "SELECT id FROM s.t");
+        assert_eq!(
+            fold("SELECT id FROM s.t", Some("iceberg")),
+            "SELECT id FROM s.t"
+        );
+    }
+
+    #[test]
+    fn use_folds_the_schema_of_an_upper_case_catalog() {
+        assert_eq!(fold("USE sf.sqe_probe", None), r#"USE sf."SQE_PROBE""#);
+        assert_eq!(fold("USE sqe_probe", Some("sf")), r#"USE "SQE_PROBE""#);
+        assert_eq!(fold(r#"USE sf."lower""#, None), r#"USE sf."lower""#);
+        assert_eq!(
+            fold("USE sf.information_schema", None),
+            "USE sf.information_schema"
+        );
+        assert_eq!(fold("USE iceberg.s", None), "USE iceberg.s");
+        assert_eq!(fold("USE sqe_probe", Some("iceberg")), "USE sqe_probe");
     }
 
     #[test]
     fn engine_default_catalog_resolves_short_names_without_a_session_catalog() {
         let catalogs = UpperCaseCatalogs::new(["sf"]).with_default_catalog(Some("sf".into()));
         let mut statements = Parser::parse_sql(&GenericDialect {}, "SELECT id FROM s.t").unwrap();
-        assert!(fold_upper_case_identifiers(&mut statements, &catalogs, None));
+        assert!(fold_upper_case_identifiers(
+            &mut statements,
+            &catalogs,
+            None
+        ));
         assert_eq!(statements[0].to_string(), r#"SELECT "ID" FROM "S"."T""#);
         // The session's own catalog wins.
         let mut statements = Parser::parse_sql(&GenericDialect {}, "SELECT id FROM s.t").unwrap();
-        assert!(!fold_upper_case_identifiers(&mut statements, &catalogs, Some("iceberg")));
+        assert!(!fold_upper_case_identifiers(
+            &mut statements,
+            &catalogs,
+            Some("iceberg")
+        ));
     }
 
     #[test]
     fn functions_and_types_never_fold() {
         assert_eq!(
-            fold("SELECT count(*), sum(CAST(amount AS BIGINT)) FROM sf.s.t", None),
+            fold(
+                "SELECT count(*), sum(CAST(amount AS BIGINT)) FROM sf.s.t",
+                None
+            ),
             r#"SELECT count(*), sum(CAST("AMOUNT" AS BIGINT)) FROM sf."S"."T""#
         );
     }
@@ -604,7 +677,10 @@ mod tests {
     #[test]
     fn mixed_catalogs_fold_table_names_only() {
         assert_eq!(
-            fold("SELECT a.id, b.id FROM sf.s.t a JOIN iceberg.s.u b ON a.id = b.id", None),
+            fold(
+                "SELECT a.id, b.id FROM sf.s.t a JOIN iceberg.s.u b ON a.id = b.id",
+                None
+            ),
             r#"SELECT a.id, b.id FROM sf."S"."T" a JOIN iceberg.s.u b ON a.id = b.id"#
         );
     }
@@ -612,7 +688,10 @@ mod tests {
     #[test]
     fn ctes_and_aliases_fold_consistently() {
         assert_eq!(
-            fold("WITH c AS (SELECT id FROM sf.s.t) SELECT c.id FROM c JOIN sf.s.u x USING (id)", None),
+            fold(
+                "WITH c AS (SELECT id FROM sf.s.t) SELECT c.id FROM c JOIN sf.s.u x USING (id)",
+                None
+            ),
             r#"WITH "C" AS (SELECT "ID" FROM sf."S"."T") SELECT "C"."ID" FROM "C" JOIN sf."S"."U" "X" USING("ID")"#
         );
     }
@@ -670,7 +749,8 @@ mod tests {
 
     #[test]
     fn no_upper_case_catalog_is_a_no_op() {
-        let mut statements = Parser::parse_sql(&GenericDialect {}, "SELECT id FROM sf.s.t").unwrap();
+        let mut statements =
+            Parser::parse_sql(&GenericDialect {}, "SELECT id FROM sf.s.t").unwrap();
         assert!(!fold_upper_case_identifiers(
             &mut statements,
             &UpperCaseCatalogs::default(),

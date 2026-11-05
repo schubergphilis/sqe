@@ -187,7 +187,9 @@ table names, so quote the Snowflake columns there. Quoted names keep
 their case, function and type names never fold, and the columns of
 metadata tables (`$snapshots`, `$files`) stay lower case. One- and
 two-part names fold when the session catalog, or else the default
-catalog, is an upper-case catalog.
+catalog, is an upper-case catalog. `USE sf.sales` folds its schema the
+same way, so a later `SELECT * FROM orders` reads `sf."SALES"."ORDERS"`.
+The embedded CLI has no `USE`, so name the schema there.
 
 The fold mirrors Snowflake, including its cost. A table that SQE wrote
 with lower-case names into an upper-case catalog needs quotes in SQE,
@@ -206,6 +208,7 @@ A configured catalog sets the same with `identifier_case = "upper"`:
 [catalogs.sf]
 catalog_url = "https://<account>.snowflakecomputing.com/polaris/api/catalog"
 warehouse = "ANALYTICS"
+access_delegation = "vended-credentials"
 identifier_case = "upper"
 ```
 
