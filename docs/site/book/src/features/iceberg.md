@@ -111,11 +111,14 @@ user = "<label for the audit log>"
 catalog_url = "https://<orgname>-<accountname>.snowflakecomputing.com/polaris/api/catalog"
 warehouse = "<Snowflake database>"
 access_delegation = "vended-credentials"
+identifier_case = "upper"     # unquoted names fold to upper case, as in Snowflake
 ```
 
-`bearer_passthrough` belongs on a test rig. Horizon publishes no JWKS for its access tokens, so SQE cannot validate them itself and leaves that to Horizon. The embedded CLI attaches the same endpoint with `ACCESS_DELEGATION 'vended-credentials'` ([example](../operations/catalogs.md#example-snowflake-horizon)).
+`bearer_passthrough` belongs on a test rig. Horizon publishes no JWKS for its access tokens, so SQE cannot validate them itself and leaves that to Horizon. The embedded CLI attaches the same endpoint with `ACCESS_DELEGATION 'vended-credentials'` and `IDENTIFIER_CASE 'upper'` ([example](../operations/catalogs.md#example-snowflake-horizon)).
 
-The interop run in `scripts/interop/snowflake-horizon/` follows the Databricks run: each engine writes, the other reads, both run DML on the other's tables, and 33 reads are compared value by value.
+Snowflake folds unquoted names to upper case and SQE folds them to lower case. With `identifier_case = "upper"`, SQE folds unquoted names for that catalog the Snowflake way, so `SELECT id FROM sf.sales.orders` finds `SALES.ORDERS` and its `ID` column. Without it, quote Snowflake's names: `sf."SALES"."ORDERS"`. The [identifier case](../operations/catalogs.md#identifier-case) section lists what folds and how policies bind.
+
+The interop run in `scripts/interop/snowflake-horizon/` follows the Databricks run: each engine writes, the other reads, both run DML on the other's tables, and 40 reads are compared value by value.
 
 | Direction | What it covers |
 |---|---|
@@ -124,16 +127,19 @@ The interop run in `scripts/interop/snowflake-horizon/` follows the Databricks r
 | Snowflake DML on SQE tables | DELETE, UPDATE and INSERT, including a DELETE over SQE's deletion vector |
 | SQE DML on Snowflake tables | DELETE, UPDATE and MERGE, on V2 and V3 tables |
 
-All 40 reads match in embedded mode, against a single coordinator, and against a coordinator with a worker. The run found four things SQE now handles:
+All 40 reads match in embedded mode, against a single coordinator, and against a coordinator with a worker. The run found five things SQE now handles:
 
 - **Table placement.** Horizon refuses a `CREATE TABLE` that names a location. SQE resends the create without one, and Horizon places the table.
 - **Commit pacing.** A commit that follows the previous one within about half a second is refused, with a 409 that names no failed requirement or a 500 "Indeterminate result". Neither was applied. SQE resends schema commits, backs data commits off at least 500 ms, and retries an unknown outcome only after a reload shows the table did not move.
 - **File layout.** Snowflake writes parquet columns in an order of its own and adds row-lineage columns. A worker matched columns by position and returned values under the wrong names. Every worker scan that reads columns now carries a projection fill, `SELECT *` included, and the worker matches by field id.
 - **Delete files.** Snowflake encodes integer columns with 512-value `DELTA_BINARY_PACKED` miniblocks, and parquet before 59.3.2 could not skip rows inside one. Applying a Snowflake position delete or deletion vector failed with "cannot skip miniblock of size 512". SQE now builds against parquet 59.3.2.
+- **Name case.** Every Snowflake name needed quotes in SQE. A catalog with `identifier_case = "upper"` folds unquoted names the Snowflake way, `USE` targets included.
 
 Known gaps from the same run:
 
-- Snowflake upper-cases unquoted names and SQE folds them to lower case, so quote Snowflake's names: `sf."SALES"."ORDERS"`.
+- A table SQE writes with lower-case names needs quotes in Snowflake (`"sqe_orders"`, `"id"`), and in SQE too when the catalog sets `identifier_case = "upper"`. Snowflake has the same cost the other way round.
+- A row filter on a Snowflake column quotes it (`"REGION" = 'EU'`). Policy expressions are not folded, and an unquoted name fails the query.
+- The interop harness runs without `identifier_case` and quotes every Snowflake name, so the option is checked by a separate probe, not by the 40-read compare.
 - Snowflake rewrites small tables copy-on-write whatever the table's merge-on-read setting. Its delete files appear only on large tables with `ICEBERG_MERGE_ON_READ_BEHAVIOR = 'enabled'`; the harness uses 1M rows.
 - `ST_AREA` on an Iceberg `GEOMETRY` comes back negative in Snowflake, whichever engine wrote the table.
 - An external volume encrypted with a customer KMS key fails: the credentials Horizon vends lack `kms:Decrypt`. Use Snowflake-managed storage.

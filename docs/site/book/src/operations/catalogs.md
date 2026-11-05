@@ -41,7 +41,7 @@ takes a bare identifier so it can be looked up in the secret store.
 
 | `TYPE` value     | `<location>` shape                            | Required options          | Optional options                |
 |------------------|-----------------------------------------------|---------------------------|---------------------------------|
-| `iceberg_rest`   | URL of the Iceberg REST endpoint              | `WAREHOUSE`               | `SECRET` (bearer or oauth2), `PREFIX`, `ACCESS_DELEGATION`, `S3_*` |
+| `iceberg_rest`   | URL of the Iceberg REST endpoint              | `WAREHOUSE`               | `SECRET` (bearer or oauth2), `PREFIX`, `ACCESS_DELEGATION`, `IDENTIFIER_CASE`, `S3_*` |
 | `glue`           | empty string (region drives discovery)        | `WAREHOUSE`               | `SECRET` (aws), `REGION`        |
 | `s3tables`       | empty string                                  | `TABLE_BUCKET_ARN`        | `SECRET` (aws), `ENDPOINT_URL`  |
 | `hms`            | Thrift URI (`thrift://host:9083`)             | `WAREHOUSE`               |                                 |
@@ -163,15 +163,54 @@ CREATE SECRET horizon (TYPE bearer, TOKEN 'eyJhbGciOiJ...');
 
 ATTACH 'https://<account>.snowflakecomputing.com/polaris/api/catalog' AS sf
   (TYPE iceberg_rest, WAREHOUSE 'ANALYTICS', SECRET horizon,
-   ACCESS_DELEGATION 'vended-credentials');
+   ACCESS_DELEGATION 'vended-credentials', IDENTIFIER_CASE 'upper');
 
-SELECT * FROM sf."SALES"."ORDERS" LIMIT 10;
+SELECT order_id, region FROM sf.sales.orders WHERE region = 'EU';
 ```
 
-Snowflake stores unquoted names in upper case, and SQE folds unquoted
-names to lower case, so quote Snowflake's names. A burst of catalog calls
-can draw 429 Too Many Requests from Horizon. The REST client waits and
-retries a throttled call up to six times.
+A burst of catalog calls can draw 429 Too Many Requests from Horizon.
+The REST client waits and retries a throttled call up to six times.
+
+### Identifier case
+
+SQE folds unquoted names to lower case, as PostgreSQL and Trino do.
+Snowflake folds them to upper case. Both then match names exactly, so
+without help a Snowflake table needs quotes in SQE:
+`sf."SALES"."ORDERS"` and `"ORDER_ID"`.
+
+`IDENTIFIER_CASE 'upper'` folds unquoted names for that catalog to upper
+case instead, the way Snowflake does. The schema and table parts of a
+name in the catalog fold. Columns, aliases and CTE names fold too when
+every table in the statement lives in upper-case catalogs. A statement
+that joins an upper-case catalog with a lower-case one folds only the
+table names, so quote the Snowflake columns there. Quoted names keep
+their case, function and type names never fold, and the columns of
+metadata tables (`$snapshots`, `$files`) stay lower case. One- and
+two-part names fold when the session catalog, or else the default
+catalog, is an upper-case catalog. `USE sf.sales` folds its schema the
+same way, so a later `SELECT * FROM orders` reads `sf."SALES"."ORDERS"`.
+The embedded CLI has no `USE`, so name the schema there.
+
+The fold mirrors Snowflake, including its cost. A table that SQE wrote
+with lower-case names into an upper-case catalog needs quotes in SQE,
+just as it does in Snowflake: `sf.sales."daily_totals"`.
+
+The fold runs before policy rewriting, so a folded statement is
+governed exactly like the same statement quoted by hand. Policies bind
+to the stored name. Row-filter expressions are parsed without the fold,
+so a filter on a Snowflake column quotes it: `"REGION" = 'EU'`. An
+unquoted `region` there names a column that does not exist, and the
+query fails instead of returning rows.
+
+A configured catalog sets the same with `identifier_case = "upper"`:
+
+```toml
+[catalogs.sf]
+catalog_url = "https://<account>.snowflakecomputing.com/polaris/api/catalog"
+warehouse = "ANALYTICS"
+access_delegation = "vended-credentials"
+identifier_case = "upper"
+```
 
 ## Example: AWS Glue with explicit credentials
 
