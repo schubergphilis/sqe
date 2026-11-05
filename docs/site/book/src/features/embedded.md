@@ -26,7 +26,9 @@ Catalog choices:
 - **Glue and S3 Tables** (`--catalog-backend glue|s3tables`): attached
   read-only, with the standard AWS credential chain.
 - **Any other catalog at the prompt**: `ATTACH ... (TYPE iceberg_rest)` mounts
-  a REST catalog such as Polaris, Nessie or Unity Catalog. See
+  a REST catalog such as Polaris, Nessie or Unity Catalog. Its data files
+  are read from the store the CLI is configured for, unless the ATTACH names
+  its own `S3_*` options. See
   [Using the CLI](../getting-started/cli.md#catalog-backends).
 
 See the quickstarts:
@@ -275,7 +277,9 @@ Beyond that:
   process runs as the Unix user. An attached REST catalog uses the secret you
   give it, and a bearer token in a secret is not refreshed.
 - **Single-node execution.** No workers. The query memory pool is capped by
-  `--memory-limit` (default 1GB).
+  `--memory-limit` (default 1GB) and shared like the coordinator's default
+  pool: first come, first served, with the top 20% kept for consumers that
+  cannot spill, such as the scan's decodes.
 - **Single writer.** The SQLite catalog is a single-process catalog.
 - **No observability endpoints.** Prometheus metrics, OpenTelemetry, and
   the audit log live in the server.

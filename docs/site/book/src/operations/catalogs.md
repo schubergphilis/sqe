@@ -41,7 +41,7 @@ takes a bare identifier so it can be looked up in the secret store.
 
 | `TYPE` value     | `<location>` shape                            | Required options          | Optional options                |
 |------------------|-----------------------------------------------|---------------------------|---------------------------------|
-| `iceberg_rest`   | URL of the Iceberg REST endpoint              | `WAREHOUSE`               | `SECRET` (bearer or oauth2)     |
+| `iceberg_rest`   | URL of the Iceberg REST endpoint              | `WAREHOUSE`               | `SECRET` (bearer or oauth2), `PREFIX`, `ACCESS_DELEGATION`, `S3_*` |
 | `glue`           | empty string (region drives discovery)        | `WAREHOUSE`               | `SECRET` (aws), `REGION`        |
 | `s3tables`       | empty string                                  | `TABLE_BUCKET_ARN`        | `SECRET` (aws), `ENDPOINT_URL`  |
 | `hms`            | Thrift URI (`thrift://host:9083`)             | `WAREHOUSE`               |                                 |
@@ -65,6 +65,41 @@ a token itself. A basic secret stores a username
 and password. An AWS secret can hold any combination of credential
 fields; missing fields fall through to the standard AWS credential
 chain (env vars, profile, IMDS).
+
+## Object store of an `iceberg_rest` catalog
+
+The REST catalog hands back table locations; reading the files under them
+needs S3 settings. These options set them:
+
+| Option             | Sets                                   |
+|--------------------|----------------------------------------|
+| `S3_ENDPOINT`      | endpoint URL, for RustFS, MinIO, StorageGRID and other S3-compatible stores |
+| `S3_REGION`        | signing region                         |
+| `S3_ACCESS_KEY`    | access key id                          |
+| `S3_SECRET_KEY`    | secret access key                      |
+| `S3_SESSION_TOKEN` | STS session token, with temporary keys |
+| `S3_PATH_STYLE`    | `'true'` for path-style requests       |
+
+Credentials the catalog vends replace these keys for the tables it vends
+them for. Some catalogs, Unity Catalog among them, vend on every
+`loadTable`. Others, Snowflake Horizon and Polaris among them, vend only
+when the request asks with the `X-Iceberg-Access-Delegation` header. Add
+`ACCESS_DELEGATION 'vended-credentials'` to the ATTACH to send it. The
+option is off by default, as in Trino and Spark, because a catalog that
+cannot vend may answer the header with an error. `'none'` is the default;
+remote signing is not supported.
+
+On a cluster, an ATTACH with no `S3_*` option falls back to the standard
+AWS credential chain. It never borrows the coordinator's `[storage]` keys,
+because every query runs as its user.
+
+In embedded mode (`sqe-cli --embedded`), an ATTACH with no `S3_*` option
+reads the store the CLI is configured for: `--s3-endpoint` and the other
+`--s3-*` flags, `SQE_STORAGE__S3_*`, then `AWS_*`. Name any `S3_*` option
+and the ATTACH uses only its own options, nothing from the CLI's settings.
+So a catalog whose data sits on another store than the CLI's (a remote AWS
+catalog while the CLI points at a local MinIO, say) is attached with its
+own `S3_ENDPOINT`, `S3_REGION` and keys.
 
 ## Example: REST catalog with bearer token
 
@@ -113,6 +148,30 @@ The client secret works like a service account: every session that
 reads through the attached catalog uses the principal's grants, not
 the querying user's. Give the principal only the grants the catalog
 needs.
+
+## Example: Snowflake Horizon
+
+Snowflake serves its Iceberg tables over the REST protocol at
+`/polaris/api/catalog`, with a database as the warehouse. Get a token
+by posting a key-pair JWT as `client_secret` to the catalog's
+`/v1/oauth/tokens` endpoint, with the scope `session:role:<ROLE>`.
+Horizon vends storage credentials only on request, so the ATTACH needs
+`ACCESS_DELEGATION`:
+
+```sql
+CREATE SECRET horizon (TYPE bearer, TOKEN 'eyJhbGciOiJ...');
+
+ATTACH 'https://<account>.snowflakecomputing.com/polaris/api/catalog' AS sf
+  (TYPE iceberg_rest, WAREHOUSE 'ANALYTICS', SECRET horizon,
+   ACCESS_DELEGATION 'vended-credentials');
+
+SELECT * FROM sf."SALES"."ORDERS" LIMIT 10;
+```
+
+Snowflake stores unquoted names in upper case, and SQE folds unquoted
+names to lower case, so quote Snowflake's names. A burst of catalog calls
+can draw 429 Too Many Requests from Horizon. The REST client waits and
+retries a throttled call up to six times.
 
 ## Example: AWS Glue with explicit credentials
 

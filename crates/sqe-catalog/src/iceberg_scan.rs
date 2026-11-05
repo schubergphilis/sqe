@@ -270,6 +270,14 @@ pub struct IcebergScanExec {
     /// These are `PhysicalExpr`s (not logical `Expr`s) because they come from the
     /// physical optimizer, after logical-to-physical conversion has already occurred.
     pushed_down_filters: Vec<Arc<dyn PhysicalExpr>>,
+    /// `expression_id`s of the pushed filters that tighten progressively
+    /// while this scan streams (a TopK bound, an aggregate's bound) rather
+    /// than sealing once (a hash join's build side). They depend on this
+    /// scan's own output, so the stream-open wait skips them and readers
+    /// re-sample them instead of freezing the first snapshot. Set by
+    /// [`crate::dynamic_filter_wiring::settle_dynamic_filters`]; empty means
+    /// every filter is treated as join-sealed (#787).
+    progressive_filter_ids: Arc<[u64]>,
     /// Concurrency for direct manifest walks (column-stats pruning path).
     ///
     /// The primary scan planner goes through `Table::scan().plan_files()` which
@@ -592,6 +600,7 @@ impl IcebergScanExec {
             trust_sort_order: false,
             small_file_threshold_bytes: tuning.small_file_threshold_bytes,
             pushed_down_filters: vec![],
+            progressive_filter_ids: Arc::from(Vec::new()),
             manifest_concurrency: tuning.manifest_concurrency,
             direct_read_concurrency: tuning.prefetch_concurrency,
             target_partitions: DEFAULT_TARGET_PARTITIONS,
@@ -890,19 +899,43 @@ impl IcebergScanExec {
     pub fn projection(&self) -> Option<&[String]> {
         self.projection.as_deref()
     }
-    /// The projection fill a distributed worker needs (#831), or `None` when
-    /// no projected column ever changed, so every file carries every column
-    /// as the current schema declares it.
+    /// The projection fill a distributed worker conforms every batch to
+    /// (#831), or `None` for a `COUNT(*)` scan. An unprojected scan gets a
+    /// fill over every declared column ([`Self::output_columns`]).
+    ///
+    /// Sent even when no projected column ever changed. A parquet projection
+    /// emits columns in the file's order, and that order is the writer's
+    /// choice: Snowflake stores `ts, id, region` for a table declared
+    /// `id, region, ts`. Without a fill the worker labelled every batch with
+    /// its first file's layout, so a task mixing writers bound the second
+    /// file's columns by position.
     pub fn projection_fill(&self) -> DFResult<Option<Vec<u8>>> {
-        let Some(cols) = self.projection.as_deref() else {
-            return Ok(None);
-        };
-        if cols.is_empty() || !projection_evolved(&self.table, self.snapshot_id, cols) {
+        let cols = self.output_columns();
+        if cols.is_empty() {
             return Ok(None);
         }
         let defaults =
-            initial_default_scalars(&self.table, self.snapshot_id, cols, &self.projected_schema)?;
+            initial_default_scalars(&self.table, self.snapshot_id, &cols, &self.projected_schema)?;
         encode_projection_fill(&self.projected_schema, &defaults).map(Some)
+    }
+    /// The columns this scan emits, in output order: the projection, or every
+    /// column of the declared schema when the scan is unprojected. Empty only
+    /// for a `COUNT(*)` scan (`Some([])`).
+    ///
+    /// An unprojected scan needs the full list as much as a projected one: a
+    /// worker reading it without names or a fill emits each file's own column
+    /// order, so a file Snowflake rewrote (`ts, id, region`, plus its
+    /// row-lineage columns) bound by position against `id, region, ts`.
+    pub fn output_columns(&self) -> Vec<String> {
+        match self.projection.as_deref() {
+            Some(cols) => cols.to_vec(),
+            None => self
+                .projected_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect(),
+        }
     }
     /// The shredded variant prunes (sqe#870) as scan-ticket bytes, with each
     /// field id resolved against the scanned snapshot, or `None` when the
@@ -932,6 +965,32 @@ impl IcebergScanExec {
         self.clone_with_pushed_filters(Vec::new())
     }
 
+    /// Ids of the pushed filters that tighten while this scan streams; see
+    /// the `progressive_filter_ids` field.
+    pub fn progressive_filter_ids(&self) -> &[u64] {
+        &self.progressive_filter_ids
+    }
+
+    /// Clone this scan keeping only the pushed filters `keep` accepts and
+    /// marking the ids in `progressive` as progressive. Used by
+    /// [`crate::dynamic_filter_wiring::settle_dynamic_filters`] to drop filters
+    /// whose producer a later rule replaced (#787).
+    pub fn clone_with_settled_filters(
+        &self,
+        keep: impl Fn(&Arc<dyn PhysicalExpr>) -> bool,
+        progressive: Vec<u64>,
+    ) -> Self {
+        let filters = self
+            .pushed_down_filters
+            .iter()
+            .filter(|f| keep(f))
+            .cloned()
+            .collect();
+        let mut scan = self.clone_with_pushed_filters(filters);
+        scan.progressive_filter_ids = Arc::from(progressive);
+        scan
+    }
+
     /// Create a copy of this scan with additional dynamic filters pushed down
     /// from parent operators (e.g., `HashJoinExec` build-side bounds).
     ///
@@ -951,6 +1010,7 @@ impl IcebergScanExec {
             trust_sort_order: self.trust_sort_order,
             small_file_threshold_bytes: self.small_file_threshold_bytes,
             pushed_down_filters: filters,
+            progressive_filter_ids: self.progressive_filter_ids.clone(),
             manifest_concurrency: self.manifest_concurrency,
             direct_read_concurrency: self.direct_read_concurrency,
             target_partitions: self.target_partitions,
@@ -1505,8 +1565,20 @@ impl ExecutionPlan for IcebergScanExec {
                 .downcast_ref::<DynamicFilterPhysicalExpr>()
                 .is_some()
             {
-                // Dynamic filter from hash join — accept it
-                dynamic_filters.push(Arc::clone(&pf.filter));
+                // Dynamic filter (join, TopK or aggregate bound) — accept it.
+                // A post-phase re-run re-pushes filters this scan already
+                // holds (a SortExec pushes its TopK filter on every pass), so
+                // skip one whose shared state is already stored (#787).
+                let id = pf.filter.expression_id();
+                let held = id.is_some()
+                    && self
+                        .pushed_down_filters
+                        .iter()
+                        .chain(dynamic_filters.iter())
+                        .any(|f| f.expression_id() == id);
+                if !held {
+                    dynamic_filters.push(Arc::clone(&pf.filter));
+                }
                 filter_results.push(PushedDown::Yes);
             } else {
                 // Static filter — leave it for FilterExec to handle
@@ -1575,6 +1647,15 @@ impl ExecutionPlan for IcebergScanExec {
         let direct_read_concurrency = self.direct_read_concurrency;
         let pushed_down_filters = self.pushed_down_filters.clone();
         let sealed_filters = self.sealed_filters.clone();
+        // Per pushed filter: true when it tightens while this scan streams
+        // (TopK / aggregate bound) instead of sealing once (#787).
+        let progressive: Arc<[bool]> = pushed_down_filters
+            .iter()
+            .map(|f| {
+                f.expression_id()
+                    .is_some_and(|id| self.progressive_filter_ids.contains(&id))
+            })
+            .collect();
         let runtime_filter_clustering_skip = self.runtime_filter_clustering_skip;
         let runtime_filter_uniform_threshold = self.runtime_filter_uniform_threshold;
         let runtime_filter_wait_ms = self.runtime_filter_wait_ms;
@@ -1821,9 +1902,18 @@ impl ExecutionPlan for IcebergScanExec {
             // Waited AFTER manifest planning so that I/O overlaps the join
             // build sides, and BEFORE either reader path samples the dynamic
             // filters. Bounded; see wait_for_dynamic_filters.
-            if !pushed_down_filters.is_empty() && runtime_filter_wait_ms > 0 {
+            // Only join filters are awaited: a progressive filter can only
+            // tighten once this scan emits rows, so waiting on it burns the
+            // whole deadline (#787: 100 ms per partition on every TopK).
+            let awaited: Vec<Arc<dyn PhysicalExpr>> = pushed_down_filters
+                .iter()
+                .zip(progressive.iter())
+                .filter(|(_, p)| !**p)
+                .map(|(f, _)| Arc::clone(f))
+                .collect();
+            if !awaited.is_empty() && runtime_filter_wait_ms > 0 {
                 let _t = filter_wait_time.timer();
-                let waited = wait_for_dynamic_filters(&pushed_down_filters, runtime_filter_wait_ms).await;
+                let waited = wait_for_dynamic_filters(&awaited, runtime_filter_wait_ms).await;
                 if waited > 0 {
                     debug!(waited_ms = waited, "Waited for dynamic filters to seal");
                 }
@@ -1852,7 +1942,17 @@ impl ExecutionPlan for IcebergScanExec {
                 // hasn't finished yet). Early batches pass unfiltered; later
                 // batches get the actual bounds once the build side completes.
                 let mut resolved_filters: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
+                // Progressive filters (TopK / aggregate bounds) are still open
+                // at stream open, since they tighten on this scan's own rows.
+                // The reader gets the live filter instead, which re-reads the
+                // current bound on every evaluation (#787). They take no
+                // part in the file pruning below, which runs before any row.
+                let mut live_filters: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
                 for (idx, filter) in pushed_down_filters.iter().enumerate() {
+                    if progressive[idx] {
+                        live_filters.push(Arc::clone(filter));
+                        continue;
+                    }
                     if let Some(dynamic) = filter.downcast_ref::<DynamicFilterPhysicalExpr>() {
                         match dynamic.current() {
                             Ok(expr) => {
@@ -1974,6 +2074,7 @@ impl ExecutionPlan for IcebergScanExec {
                 });
 
                 let concurrency = direct_read_concurrency.max(1);
+                resolved_filters.extend(live_filters);
                 let resolved_filters = Arc::new(resolved_filters);
                 let bytes_scanned = bytes_scanned.clone();
                 let rows_prefilter = rows_prefilter.clone();
@@ -2013,7 +2114,9 @@ impl ExecutionPlan for IcebergScanExec {
 
                             // Parse Parquet from the in-memory bytes.
                             // `bytes::Bytes` implements `ChunkReader` so this works directly.
-                            let reader_opts = ArrowReaderOptions::new().with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required);
+                            // Optional, not Required: Snowflake writes files with no offset index
+                            // on VARIANT and nested columns, and Required fails the whole file.
+                            let reader_opts = ArrowReaderOptions::new().with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Optional);
                             let reader_md = ArrowReaderMetadata::load(&bytes, reader_opts.clone())
                                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
                             // String view: decode strings straight into the
@@ -2436,7 +2539,13 @@ impl ExecutionPlan for IcebergScanExec {
                 // re-checks, so a cached (slightly stale) snapshot can only pass
                 // extra rows, never drop a match. The cache is scan-wide
                 // (`sealed_filters`), so all partitions share one snapshot.
+                // DataFusion 55.2 now caches `current()` per generation, but
+                // the collapse below is ours and still costs a set build.
+                // Progressive filters (TopK / aggregate bounds) never seal:
+                // they skip the cache and re-read `current()` per batch, or
+                // the first, loosest bound would stick (#787).
                 let resolved_cache = sealed_filters.clone();
+                let progressive = progressive.clone();
                 let filter_concurrency = std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(8);
@@ -2449,6 +2558,7 @@ impl ExecutionPlan for IcebergScanExec {
                         let rows_passed_filter_pending = rows_passed_filter_pending.clone();
                         let dynamic_filters_skipped = dynamic_filters_skipped.clone();
                         let resolved_cache = resolved_cache.clone();
+                        let progressive = progressive.clone();
                         async move {
                             let batch = batch_res?;
                             // The Tier-2 membership-filter evaluation is pure CPU and
@@ -2473,6 +2583,15 @@ impl ExecutionPlan for IcebergScanExec {
                                     // once present we never call `current()` again
                                     // (that call is the whole cost).
                                     let resolved = match slot.snapshot.get() {
+                                        // A TopK / aggregate bound tightens
+                                        // as rows arrive: read the live one.
+                                        // DataFusion caches `current()` per
+                                        // generation, so between updates this
+                                        // is a lock read (#787).
+                                        _ if progressive[idx] => match dynamic.current() {
+                                            Ok(e) if !is_trivial_true(&e) => Some((e, false)),
+                                            _ => None,
+                                        },
                                         Some(e) => Some(e.clone()),
                                         None => match dynamic.current() {
                                             // Build side not sealed yet: the
@@ -2824,47 +2943,6 @@ fn conform_batch_to_projection(
         &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(rows)),
     )
     .map_err(|e| DataFusionError::Internal(format!("failed to conform scan batch: {e}")))
-}
-
-/// Whether some data file may store a projected column differently from the
-/// scanned snapshot's schema: absent (added later), under another name
-/// (renamed) or as another type (promoted). Answered from the table's historic
-/// schemas, so a table whose projected columns never changed reports `false`.
-///
-/// A column that is or holds a V3 `unknown` field also counts: that field is
-/// never in a data file, so every file stores the column narrower (#859).
-fn projection_evolved(table: &Table, snapshot_id: Option<i64>, cols: &[String]) -> bool {
-    let metadata = table.metadata();
-    let scanned = snapshot_schema(table, snapshot_id);
-    cols.iter().any(|name| {
-        let Some(field) = scanned.field_by_name(name) else {
-            return false;
-        };
-        if type_holds_unknown(&field.field_type) {
-            return true;
-        }
-        metadata
-            .schemas_iter()
-            .any(|schema| match schema.field_by_id(field.id) {
-                None => true,
-                Some(old) => old.name != field.name || old.field_type != field.field_type,
-            })
-    })
-}
-
-/// True when `ty` is V3 `unknown` or holds an `unknown` field at any depth.
-fn type_holds_unknown(ty: &iceberg::spec::Type) -> bool {
-    use iceberg::spec::{PrimitiveType, Type};
-    match ty {
-        Type::Primitive(p) => *p == PrimitiveType::Unknown,
-        Type::Struct(s) => s.fields().iter().any(|f| type_holds_unknown(&f.field_type)),
-        Type::List(l) => type_holds_unknown(&l.element_field.field_type),
-        Type::Map(m) => {
-            type_holds_unknown(&m.key_field.field_type)
-                || type_holds_unknown(&m.value_field.field_type)
-        }
-        _ => false,
-    }
 }
 
 /// Encode a projection fill (#831) as an Arrow IPC stream: one row, in
@@ -4225,6 +4303,98 @@ mod projection_evolution_tests {
             .map(|c| Arc::new(arrow::array::StringArray::from(c)) as arrow::array::ArrayRef)
             .collect();
         RecordBatch::try_new(Arc::new(schema.clone()), arrays).expect("test batch")
+    }
+
+    /// A table whose one schema never changed: `id long, region string`.
+    fn unevolved_table() -> Table {
+        let metadata: iceberg::spec::TableMetadata = serde_json::from_str(
+            r#"{
+            "format-version": 2,
+            "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+            "location": "/tmp/unevolved",
+            "last-sequence-number": 0,
+            "last-updated-ms": 1602638573590,
+            "last-column-id": 2,
+            "current-schema-id": 0,
+            "schemas": [{"type": "struct", "schema-id": 0, "fields": [
+                {"id": 1, "name": "id", "required": true, "type": "long"},
+                {"id": 2, "name": "region", "required": false, "type": "string"}]}],
+            "default-spec-id": 0,
+            "partition-specs": [{"spec-id": 0, "fields": []}],
+            "last-partition-id": 999,
+            "default-sort-order-id": 0,
+            "sort-orders": [{"order-id": 0, "fields": []}],
+            "properties": {},
+            "current-snapshot-id": -1,
+            "snapshots": []
+        }"#,
+        )
+        .expect("table metadata");
+        Table::builder()
+            .runtime(iceberg::Runtime::current())
+            .metadata(metadata)
+            .identifier(iceberg::TableIdent::new(
+                iceberg::NamespaceIdent::new("ns".to_string()),
+                "t".to_string(),
+            ))
+            .file_io(iceberg::io::FileIO::new_with_fs())
+            .build()
+            .expect("table")
+    }
+
+    /// A worker binds columns by position unless it gets a fill, and a
+    /// parquet projection emits them in the file's order. Snowflake writes
+    /// `region` before `id` into a table declared `id, region`, so a table that
+    /// never evolved still needs one: the distributed scan read `id` as NULL
+    /// and `region` as the id.
+    #[tokio::test]
+    async fn an_unevolved_projection_still_gets_a_fill() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, true),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let scan = IcebergScanExec::new(
+            unevolved_table(),
+            Arc::clone(&schema),
+            Some(names(&["region", "id"])),
+            None,
+        );
+        let fill = scan.projection_fill().unwrap().expect("a fill");
+        let decoded = decode_projection_fill(&fill).unwrap();
+        let fields: Vec<String> = decoded
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(fields, ["region", "id"]);
+
+        let count_star =
+            IcebergScanExec::new(unevolved_table(), Arc::clone(&schema), Some(vec![]), None);
+        assert!(count_star.output_columns().is_empty());
+        assert!(count_star.projection_fill().unwrap().is_none());
+    }
+
+    /// An unprojected scan (`projection == None`) reads every declared
+    /// column, and its worker binds them by position just the same: it gets
+    /// the full column list and a fill in the declared order.
+    #[tokio::test]
+    async fn an_unprojected_scan_gets_the_declared_columns_and_a_fill() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, true),
+        ]));
+        let scan = IcebergScanExec::new(unevolved_table(), schema, None, None);
+        assert_eq!(scan.output_columns(), ["id", "region"]);
+        let fill = scan.projection_fill().unwrap().expect("a fill");
+        let decoded = decode_projection_fill(&fill).unwrap();
+        let fields: Vec<String> = decoded
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(fields, ["id", "region"]);
     }
 
     /// THE ONE THAT MATTERS. Every projected column is absent from the file.

@@ -162,10 +162,14 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
             println!("Compare report written to: {cpath}");
             let summary = &cmp.summary;
             println!(
-                "compare {suite}: {}/{} matched (row_diff {}, sqe_failed {}, trino_failed {}, both_failed {}, vacuous_bug {}); see compare JSON for full breakdown",
+                "compare {suite}: {}/{} matched (row_diff {}, value_diff {}, sqe_failed {}, trino_failed {}, both_failed {}, vacuous_bug {}); see compare JSON for full breakdown",
                 summary.matched, summary.total,
-                summary.row_diff, summary.sqe_failed, summary.trino_failed, summary.both_failed, summary.vacuous_bug,
+                summary.row_diff, summary.value_diff, summary.sqe_failed, summary.trino_failed, summary.both_failed, summary.vacuous_bug,
             );
+            for q in cmp.queries.iter().filter(|q| q.value_diff.is_some()) {
+                let diff = q.value_diff.as_deref().unwrap_or_default();
+                println!("  {} value diff: {diff}", q.query_name);
+            }
         }
     }
 

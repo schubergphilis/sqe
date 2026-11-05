@@ -71,14 +71,21 @@ async fn mock_polaris() -> wiremock::MockServer {
     server
 }
 
-struct Fixture {
+pub(crate) struct Fixture {
     _mock: wiremock::MockServer,
     _dirs: Vec<tempfile::TempDir>,
-    handler: QueryHandler,
-    session: Session,
+    pub(crate) handler: QueryHandler,
+    pub(crate) session: Session,
 }
 
 async fn fixture(join_fallback: bool) -> Fixture {
+    fixture_with(|config| config.query.join_fallback = join_fallback).await
+}
+
+/// Tables `lake.t.a(k, x)` and `lake.t.b(k, y)` of [`ROWS`] rows each, on a
+/// handler capped at [`CAP`] per query and spilling to a temp dir, with
+/// `tune` applied to the config last.
+pub(crate) async fn fixture_with(tune: impl FnOnce(&mut SqeConfig)) -> Fixture {
     crate::common::init_tracing();
     let root = tempfile::tempdir().expect("tempdir");
     let data_a = tempfile::tempdir().expect("tempdir");
@@ -96,8 +103,8 @@ async fn fixture(join_fallback: bool) -> Fixture {
     config.storage.tvf.allow_local_paths = true;
     config.query.max_query_memory = CAP.to_string();
     config.query.per_user_memory_budget = "0".to_string();
-    config.query.join_fallback = join_fallback;
     config.coordinator.spill_dir = spill.path().display().to_string();
+    tune(&mut config);
     let tracker = Arc::new(QueryTracker::new(&config.query_history));
     let handler = QueryHandler::new(
         Arc::new(PassthroughEnforcer),
@@ -201,4 +208,61 @@ async fn the_fallback_completes_the_join_on_the_streaming_path() {
         .await
         .expect("the sort-merge retry completes the join");
     assert_eq!(answer(&batches), expected());
+}
+
+/// The `operation` column (physical operator names) of an EXPLAIN ANALYZE /
+/// FULL result.
+fn operations(batches: &[RecordBatch]) -> Vec<String> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            let ops = b.column(1).as_string::<i32>();
+            (0..b.num_rows())
+                .map(|i| ops.value(i).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// #788: EXPLAIN ANALYZE and EXPLAIN FULL run the query, and ran it on the
+/// session's shared pool, outside `max_query_memory`: the join the query
+/// cannot run under the cap completed when explained.
+#[tokio::test(flavor = "multi_thread")]
+async fn explain_analyze_runs_under_the_query_cap() {
+    let f = fixture(false).await;
+    for explain in ["EXPLAIN ANALYZE", "EXPLAIN FULL"] {
+        let err = f
+            .handler
+            .execute(&f.session, &format!("{explain} {SQL}"), None)
+            .await
+            .expect_err("the explained hash build must hit the query cap");
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("resources exhausted"),
+            "{explain}: expected a memory error, got: {msg}"
+        );
+    }
+}
+
+/// #788: under the cap, EXPLAIN ANALYZE takes the query's sort-merge retry
+/// and reports the plan that produced the rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn explain_analyze_reports_the_fallback_plan() {
+    let f = fixture(true).await;
+    for explain in ["EXPLAIN ANALYZE", "EXPLAIN FULL"] {
+        let batches = f
+            .handler
+            .execute(&f.session, &format!("{explain} {SQL}"), None)
+            .await
+            .unwrap_or_else(|e| panic!("{explain}: the sort-merge retry completes: {e}"));
+        let ops = operations(&batches);
+        assert!(
+            ops.iter().any(|op| op == "SortMergeJoinExec"),
+            "{explain}: expected the retry's sort-merge join, got: {ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| op == "HashJoinExec"),
+            "{explain}: reported the failed hash plan: {ops:?}"
+        );
+    }
 }

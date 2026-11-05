@@ -39,9 +39,8 @@ use std::sync::Arc;
 
 use sqe_core::SecretStore;
 
-use arrow_array::RecordBatch;
 use async_trait::async_trait;
-use datafusion::execution::memory_pool::FairSpillPool;
+use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool, TrackConsumersPool};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::SessionContext;
 use sqe_core::config::StorageConfig;
@@ -267,6 +266,36 @@ pub fn build_embedded_context(
 const TT_CATALOG: &str = "default";
 const TT_SCHEMA: &str = "default";
 
+/// The embedded engine's memory pool: the coordinator's default, greedy with
+/// an unspillable headroom ([`sqe_core::memory_headroom`]).
+///
+/// It used to be a `FairSpillPool`, which splits the pool minus every
+/// unspillable byte evenly across the registered spillable consumers. The
+/// Iceberg scan's decode admissions are unspillable, so each aggregate
+/// partition's cap shrank with them: q3 of the engine bench (150M rows,
+/// 3 GB) spilled its final aggregate 88-96 times where the coordinator, on
+/// the same data and limit, did not spill at all.
+///
+/// The coordinator also caps each sort at a share of the spillable bytes,
+/// in the per-query pool it builds for every statement. This engine has no
+/// per-query pool, so the share sits on this one: a greedy pool without it
+/// lets the first sort partitions take every spillable byte and fails the
+/// query on a sibling that cannot start.
+fn embedded_memory_pool(memory_limit_bytes: usize) -> Arc<dyn MemoryPool> {
+    const TOP_CONSUMERS_IN_ERROR: usize = 5;
+    let pool_size = memory_limit_bytes.max(64 * 1024 * 1024);
+    let tracked = Arc::new(TrackConsumersPool::new(
+        GreedyMemoryPool::new(pool_size),
+        std::num::NonZeroUsize::new(TOP_CONSUMERS_IN_ERROR).expect("non-zero const"),
+    ));
+    sqe_core::memory_headroom::HeadroomPool::wrap_single_query(
+        tracked,
+        pool_size,
+        sqe_core::memory_headroom::DEFAULT_UNSPILLABLE_HEADROOM_PERCENT,
+        "sqe-cli --memory-limit",
+    )
+}
+
 /// Like [`build_embedded_context`], with an explicit HMAC mask key (from
 /// `[policy] mask_key` in a loaded `sqe.toml`).
 pub fn build_embedded_context_with_mask(
@@ -278,8 +307,7 @@ pub fn build_embedded_context_with_mask(
         .with_information_schema(true)
         .with_default_catalog_and_schema(TT_CATALOG, TT_SCHEMA);
 
-    let pool_size = memory_limit_bytes.max(64 * 1024 * 1024);
-    let pool = Arc::new(FairSpillPool::new(pool_size));
+    let pool = embedded_memory_pool(memory_limit_bytes);
     // V10: wrap DataFusion's default ObjectStoreRegistry so
     // `read_csv('https://...')`, `read_parquet('https://...')`, etc. lazily
     // build an HttpStore for the URL's scheme://host on first request. Keeps
@@ -314,6 +342,10 @@ pub fn build_embedded_context_with_mask(
             ))
             .with_physical_optimizer_rule(Arc::new(
                 sqe_catalog::parallel_scan::ParallelScanRule::new(0),
+            ))
+            // Re-attach the scan filters those two orphaned (#787).
+            .with_physical_optimizer_rule(Arc::new(
+                sqe_catalog::dynamic_filter_wiring::SettleDynamicFiltersRule::new(),
             ))
             .build(),
     );
@@ -1113,7 +1145,7 @@ impl EmbeddedClient {
         // optimizer collapse like `WHERE FALSE` yields an EmptyExec).
         let schema = df.schema().as_arrow().clone();
         let batches = df.collect().await?;
-        Ok(record_batches_to_query_result(&schema, &batches))
+        Ok(QueryResult::from_batches(&schema, &batches)?)
     }
 
     /// Plan one statement the way [`Self::run_datafusion`] runs it, without
@@ -1154,6 +1186,52 @@ impl EmbeddedClient {
     }
 }
 
+/// The ATTACH an `iceberg_rest` catalog opens with in embedded mode. An
+/// ATTACH that names no `S3_*` option reads the engine's own object store,
+/// the one `--s3-endpoint` / `SQE_STORAGE__S3_*` / `AWS_*` configured, so
+/// those settings fill the `S3_*` options; without them the catalog's FileIO
+/// fell back to the ambient AWS chain and failed with "region is missing"
+/// against a custom endpoint. Any `S3_*` option means the ATTACH describes
+/// its own store and nothing is mixed in. Credentials the catalog vends
+/// still replace these keys.
+///
+/// The server does not do this: there the configured keys are the
+/// coordinator's, and a user's ATTACH must not borrow them.
+fn with_storage_fallback<'a>(
+    stmt: &'a sqe_sql::AttachStatement,
+    storage: &StorageConfig,
+) -> std::borrow::Cow<'a, sqe_sql::AttachStatement> {
+    use sqe_sql::OptionValue;
+    use std::borrow::Cow;
+
+    if stmt.kind != sqe_sql::CatalogKind::IcebergRest
+        || stmt.options.keys().any(|k| k.starts_with("S3_"))
+    {
+        return Cow::Borrowed(stmt);
+    }
+    let path_style = if storage.s3_path_style { "true" } else { "" };
+    let fill = [
+        ("S3_ENDPOINT", storage.s3_endpoint.as_str()),
+        ("S3_REGION", storage.s3_region.as_str()),
+        ("S3_ACCESS_KEY", storage.s3_access_key.as_str()),
+        ("S3_SECRET_KEY", storage.s3_secret_key.expose()),
+        ("S3_SESSION_TOKEN", storage.s3_session_token.expose()),
+        ("S3_PATH_STYLE", path_style),
+    ];
+    if fill.iter().all(|(_, v)| v.is_empty()) {
+        return Cow::Borrowed(stmt);
+    }
+    let mut filled = stmt.clone();
+    for (key, value) in fill {
+        if !value.is_empty() {
+            filled
+                .options
+                .insert(key.to_string(), OptionValue::String(value.to_string()));
+        }
+    }
+    Cow::Owned(filled)
+}
+
 impl EmbeddedClient {
     async fn embedded_handle_attach(
         &mut self,
@@ -1167,6 +1245,8 @@ impl EmbeddedClient {
             .into());
         }
 
+        let filled = with_storage_fallback(stmt, &self.storage);
+        let stmt: &sqe_sql::AttachStatement = &filled;
         let catalog = sqe_catalog::mount::build_catalog(
             &stmt.location,
             stmt.kind,
@@ -1211,10 +1291,7 @@ impl EmbeddedClient {
             .map(|s| s.to_string());
         self.attached_catalogs.insert(stmt.name.clone(), secret_ref);
 
-        Ok(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        })
+        Ok(QueryResult::empty())
     }
 
     /// The REST `SessionCatalog` view DDL and view reads of an
@@ -1267,10 +1344,7 @@ impl EmbeddedClient {
         // but our tracking no longer considers it attached — queries that
         // try to resolve it will fail at plan time once the provider is
         // removed from our accounting.
-        Ok(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        })
+        Ok(QueryResult::empty())
     }
 
     fn embedded_handle_create_secret(
@@ -1286,10 +1360,7 @@ impl EmbeddedClient {
         self.secrets
             .create(&stmt.name, secret)
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        Ok(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        })
+        Ok(QueryResult::empty())
     }
 
     fn embedded_handle_drop_secret(
@@ -1306,10 +1377,7 @@ impl EmbeddedClient {
         self.secrets
             .drop_secret(&stmt.name, &in_use)
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        Ok(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        })
+        Ok(QueryResult::empty())
     }
 
     fn embedded_handle_show_secrets(&self) -> Result<QueryResult, Box<dyn std::error::Error>> {
@@ -1317,13 +1385,13 @@ impl EmbeddedClient {
             .secrets
             .list()
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        Ok(QueryResult {
-            columns: vec!["name".to_string(), "type".to_string()],
-            rows: listed
+        Ok(QueryResult::text(
+            vec!["name".to_string(), "type".to_string()],
+            listed
                 .into_iter()
                 .map(|(name, type_name)| vec![name, type_name.to_string()])
                 .collect(),
-        })
+        ))
     }
 
     /// `CREATE EXTERNAL TABLE` in embedded mode: write `spec`'s sidecar
@@ -1385,10 +1453,7 @@ impl EmbeddedClient {
         // for up to `cache_ttl` (60s in `attach_hive_root`).
         provider.invalidate_table_names(&database);
 
-        Ok(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        })
+        Ok(QueryResult::empty())
     }
 
     /// `CREATE SCHEMA <cat>.<ns>` / `DROP SCHEMA <cat>.<ns>` where `<cat>` is
@@ -1468,10 +1533,7 @@ impl EmbeddedClient {
                     .await?
             }
         }
-        Ok(Some(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        }))
+        Ok(Some(QueryResult::empty()))
     }
 
     /// The session's default catalog, which a one- or two-part name resolves in.
@@ -1542,10 +1604,7 @@ impl EmbeddedClient {
             )
             .into());
         }
-        let empty = QueryResult {
-            columns: vec![],
-            rows: vec![],
-        };
+        let empty = QueryResult::empty();
         if self.ctx.table_exist(name.to_string().as_str())? {
             if ct.if_not_exists {
                 return Ok(Some(empty));
@@ -1627,6 +1686,19 @@ impl EmbeddedClient {
     /// the table schema, whose list fields carry `PARQUET:field_id`
     /// metadata, and an `ARRAY[...]` literal then fails to build its batch.
     /// `Ok(None)`: not a writable Iceberg target, DataFusion answers.
+    /// The config the write and DDL handlers run under: the embedded
+    /// defaults with `query.max_query_memory` set to this engine's pool
+    /// (`--memory-limit`), so a sort-on-write is admitted against the memory
+    /// the engine has, not the server's 256 MB default.
+    fn handler_config(&self) -> sqe_core::SqeConfig {
+        use datafusion::execution::memory_pool::MemoryLimit;
+        let mut config = sqe_core::SqeConfig::embedded_defaults();
+        if let MemoryLimit::Finite(bytes) = self.ctx.runtime_env().memory_pool.memory_limit() {
+            config.query.max_query_memory = bytes.to_string();
+        }
+        config
+    }
+
     async fn embedded_handle_iceberg_insert(
         &self,
         stmt: &sqlparser::ast::Statement,
@@ -1649,8 +1721,7 @@ impl EmbeddedClient {
 
         let select_sql = sqe_sql::rewrite_named_tvf_args(&source.to_string());
         let session = self.write_session(catalog_name);
-        let handler =
-            sqe_write::write_handler::WriteHandler::new(sqe_core::SqeConfig::embedded_defaults());
+        let handler = sqe_write::write_handler::WriteHandler::new(self.handler_config());
         let mut plan_out = None;
         let mut policy_summary = None;
         let batches = handler
@@ -1668,7 +1739,7 @@ impl EmbeddedClient {
             .first()
             .map(|b| b.schema())
             .unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()));
-        Ok(Some(record_batches_to_query_result(&schema, &batches)))
+        Ok(Some(QueryResult::from_batches(&schema, &batches)?))
     }
 
     /// DELETE / UPDATE / MERGE on a table in a `WritableIcebergCatalog`,
@@ -1701,7 +1772,7 @@ impl EmbeddedClient {
         self.ensure_write_scratch_catalog()?;
 
         let session = self.write_session(catalog_name);
-        let handler = WriteHandler::new(sqe_core::SqeConfig::embedded_defaults());
+        let handler = WriteHandler::new(self.handler_config());
         let mut plan_out = None;
         let mut policy_summary = None;
         let batches = match stmt {
@@ -1760,7 +1831,7 @@ impl EmbeddedClient {
             .first()
             .map(|b| b.schema())
             .unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()));
-        Ok(Some(record_batches_to_query_result(&schema, &batches)))
+        Ok(Some(QueryResult::from_batches(&schema, &batches)?))
     }
 
     /// `CREATE TABLE` with a column list in a `WritableIcebergCatalog`,
@@ -1784,8 +1855,7 @@ impl EmbeddedClient {
         };
         let rest_catalog = self.rest_catalogs.contains_key(&catalog_name);
         let session = self.write_session(catalog_name.clone());
-        let handler =
-            sqe_write::write_handler::WriteHandler::new(sqe_core::SqeConfig::embedded_defaults());
+        let handler = sqe_write::write_handler::WriteHandler::new(self.handler_config());
         handler
             .handle_create_table_on(&session, stmt, catalog, rest_catalog)
             .await?;
@@ -1797,10 +1867,7 @@ impl EmbeddedClient {
         if let Some(writable) = self.iceberg_catalogs.get(&catalog_name) {
             writable.refresh_namespace(&namespace).await?;
         }
-        Ok(Some(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        }))
+        Ok(Some(QueryResult::empty()))
     }
 
     /// `CREATE [OR REPLACE] VIEW` / `DROP VIEW [IF EXISTS]` naming a
@@ -1853,10 +1920,7 @@ impl EmbeddedClient {
                 return match stmt {
                     Statement::Drop {
                         if_exists: true, ..
-                    } => Ok(Some(QueryResult {
-                        columns: vec![],
-                        rows: vec![],
-                    })),
+                    } => Ok(Some(QueryResult::empty())),
                     Statement::Drop { .. } => Err(format!(
                         "view {name} does not exist: catalog `{catalog_name}` stores no views"
                     )
@@ -1898,10 +1962,7 @@ impl EmbeddedClient {
                 .refresh_views(&ident.namespace().as_ref().join("."))
                 .await;
         }
-        Ok(Some(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        }))
+        Ok(Some(QueryResult::empty()))
     }
 
     /// The schema a view body produces, planned as a query would be: the
@@ -2025,10 +2086,7 @@ impl EmbeddedClient {
                 writable.refresh_namespace(namespace).await?;
             }
         }
-        Ok(Some(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        }))
+        Ok(Some(QueryResult::empty()))
     }
 
     /// The catalog a one- to three-part table name lands in, when that is a
@@ -2347,10 +2405,7 @@ impl EmbeddedClient {
         }
         provider.invalidate_table_names(database);
 
-        Ok(Some(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        }))
+        Ok(Some(QueryResult::empty()))
     }
 
     /// `SHOW CREATE TABLE` against a Hive root: render Athena/Glue-style DDL
@@ -2379,10 +2434,10 @@ impl EmbeddedClient {
         let spec = sqe_catalog::hive::hive_spec_from_manifest(catalog, &manifest);
         let ddl = sqe_catalog::hive::render_hive_create_table_ddl(&spec);
 
-        Ok(Some(QueryResult {
-            columns: vec!["Create Table".to_string()],
-            rows: vec![vec![ddl]],
-        }))
+        Ok(Some(QueryResult::text(
+            vec!["Create Table".to_string()],
+            vec![vec![ddl]],
+        )))
     }
 
     /// `SHOW CREATE TABLE` for a table in an Iceberg catalog, rendered as
@@ -2471,10 +2526,10 @@ impl EmbeddedClient {
             Some(metadata_table.metadata()),
         );
 
-        Ok(Some(QueryResult {
-            columns: vec!["Create Table".to_string()],
-            rows: vec![vec![ddl]],
-        }))
+        Ok(Some(QueryResult::text(
+            vec!["Create Table".to_string()],
+            vec![vec![ddl]],
+        )))
     }
 
     /// `SHOW CREATE VIEW` on an Iceberg view: its stored SQL, with the
@@ -2504,10 +2559,10 @@ impl EmbeddedClient {
             }
             _ => body,
         };
-        Ok(QueryResult {
-            columns: vec!["Create View".to_string()],
-            rows: vec![vec![format!("CREATE VIEW {} AS\n{body}", parts.join("."))]],
-        })
+        Ok(QueryResult::text(
+            vec!["Create View".to_string()],
+            vec![vec![format!("CREATE VIEW {} AS\n{body}", parts.join("."))]],
+        ))
     }
 }
 
@@ -2543,36 +2598,6 @@ fn widen_coarse_timestamps(schema: &arrow_schema::Schema) -> Option<arrow_schema
         fields,
         schema.metadata().clone(),
     ))
-}
-
-/// Render a sequence of [`RecordBatch`]es into the CLI's column-name +
-/// stringified-row shape. Column names come from the input `schema`
-/// even when `batches` is empty, matching what the network clients do.
-fn record_batches_to_query_result(
-    schema: &arrow_schema::Schema,
-    batches: &[RecordBatch],
-) -> QueryResult {
-    let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-
-    let mut rows = Vec::new();
-    for batch in batches {
-        let formatters: Vec<_> = batch
-            .columns()
-            .iter()
-            .map(|col| {
-                arrow::util::display::ArrayFormatter::try_new(col.as_ref(), &Default::default())
-            })
-            .collect::<Result<_, _>>()
-            .unwrap_or_default();
-        for row_idx in 0..batch.num_rows() {
-            let row: Vec<String> = formatters
-                .iter()
-                .map(|f| f.value(row_idx).to_string())
-                .collect();
-            rows.push(row);
-        }
-    }
-    QueryResult { columns, rows }
 }
 
 /// True when `sql`, after skipping leading whitespace and SQL comments,
@@ -2642,6 +2667,71 @@ fn writable_store(
 mod tests {
     use super::*;
 
+    fn rest_attach(options: &[(&str, &str)]) -> sqe_sql::AttachStatement {
+        sqe_sql::AttachStatement {
+            name: "polaris".to_string(),
+            location: "http://localhost:8181/api/catalog".to_string(),
+            kind: sqe_sql::CatalogKind::IcebergRest,
+            options: options
+                .iter()
+                .map(|(k, v)| (k.to_string(), sqe_sql::OptionValue::String(v.to_string())))
+                .collect(),
+        }
+    }
+
+    fn minio_storage() -> StorageConfig {
+        StorageConfig {
+            s3_endpoint: "http://127.0.0.1:9000".to_string(),
+            s3_region: "us-east-1".to_string(),
+            s3_access_key: "ak".to_string(),
+            s3_secret_key: sqe_core::SecretString::new("sk".to_string()),
+            s3_path_style: true,
+            ..Default::default()
+        }
+    }
+
+    fn opt<'a>(stmt: &'a sqe_sql::AttachStatement, key: &str) -> Option<&'a str> {
+        stmt.options.get(key).and_then(sqe_sql::OptionValue::as_str)
+    }
+
+    #[test]
+    fn rest_attach_without_s3_options_reads_the_engine_store() {
+        let stmt = rest_attach(&[("WAREHOUSE", "bench")]);
+        let filled = with_storage_fallback(&stmt, &minio_storage());
+        assert_eq!(opt(&filled, "S3_ENDPOINT"), Some("http://127.0.0.1:9000"));
+        assert_eq!(opt(&filled, "S3_REGION"), Some("us-east-1"));
+        assert_eq!(opt(&filled, "S3_ACCESS_KEY"), Some("ak"));
+        assert_eq!(opt(&filled, "S3_SECRET_KEY"), Some("sk"));
+        assert_eq!(opt(&filled, "S3_PATH_STYLE"), Some("true"));
+        // Unset settings stay absent rather than becoming empty props.
+        assert_eq!(opt(&filled, "S3_SESSION_TOKEN"), None);
+        assert_eq!(opt(&filled, "WAREHOUSE"), Some("bench"));
+    }
+
+    #[test]
+    fn rest_attach_with_any_s3_option_is_left_alone() {
+        let stmt = rest_attach(&[
+            ("WAREHOUSE", "bench"),
+            ("S3_ENDPOINT", "https://s3.eu-west-1.amazonaws.com"),
+        ]);
+        let filled = with_storage_fallback(&stmt, &minio_storage());
+        assert!(matches!(filled, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(opt(&filled, "S3_ACCESS_KEY"), None);
+        assert_eq!(opt(&filled, "S3_REGION"), None);
+    }
+
+    #[test]
+    fn unconfigured_store_and_other_kinds_are_left_alone() {
+        let stmt = rest_attach(&[("WAREHOUSE", "bench")]);
+        let filled = with_storage_fallback(&stmt, &StorageConfig::default());
+        assert!(matches!(filled, std::borrow::Cow::Borrowed(_)));
+
+        let mut glue = rest_attach(&[]);
+        glue.kind = sqe_sql::CatalogKind::Glue;
+        let filled = with_storage_fallback(&glue, &minio_storage());
+        assert!(matches!(filled, std::borrow::Cow::Borrowed(_)));
+    }
+
     /// A stub environment, so these tests never touch process-global
     /// `std::env` and cannot race the rest of the binary.
     fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
@@ -2651,6 +2741,91 @@ mod tests {
                 .find(|(k, _)| *k == name)
                 .map(|(_, v)| v.to_string())
         }
+    }
+
+    /// The embedded pool is the coordinator's: a busy aggregate is not capped
+    /// at a share by idle spillable siblings or by the scan's unspillable
+    /// bytes, stops at the headroom line, and the scan keeps the headroom.
+    #[test]
+    fn embedded_pool_is_greedy_with_unspillable_headroom() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+        const MIB: usize = 1024 * 1024;
+        let pool = embedded_memory_pool(100 * MIB);
+        let _idle: Vec<_> = (0..8)
+            .map(|i| {
+                MemoryConsumer::new(format!("idle-agg-{i}"))
+                    .with_can_spill(true)
+                    .register(&pool)
+            })
+            .collect();
+        let scan = MemoryConsumer::new("iceberg-scan-decode:t").register(&pool);
+        scan.try_grow(15 * MIB).expect("the scan admits");
+        let agg = MemoryConsumer::new("agg")
+            .with_can_spill(true)
+            .register(&pool);
+        // A FairSpillPool would cap this at (100 - 15) / 9 MiB.
+        agg.try_grow(75 * MIB)
+            .expect("one aggregate may take the spillable bytes");
+        let err = agg.try_grow(6 * MIB).expect_err("spillable stops at 80%");
+        assert!(
+            matches!(
+                err,
+                datafusion::error::DataFusionError::ResourcesExhausted(_)
+            ),
+            "the refusal is the one operators spill on: {err}"
+        );
+        scan.try_grow(10 * MIB)
+            .expect("the scan still has the unspillable headroom");
+    }
+
+    /// The coordinator's per-query sort share: each partition's sort buffer
+    /// stops at its share of the spillable bytes, so the last partition to
+    /// start still finds room instead of failing the query.
+    #[test]
+    fn embedded_pool_keeps_a_sort_share_for_every_partition() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+        const MIB: usize = 1024 * 1024;
+        let pool = embedded_memory_pool(100 * MIB);
+        let sorters: Vec<_> = (0..4)
+            .map(|i| {
+                MemoryConsumer::new(format!("ExternalSorter[{i}]"))
+                    .with_can_spill(true)
+                    .register(&pool)
+            })
+            .collect();
+        // 80 MiB spillable over 4 sorts.
+        for sorter in &sorters[..3] {
+            sorter.try_grow(MIB).expect("first reservation");
+            let err = sorter
+                .try_grow(60 * MIB)
+                .expect_err("a sort stops at its 20 MiB share");
+            let refusal = err.to_string();
+            assert!(
+                refusal.contains("sqe-cli --memory-limit sort share"),
+                "the refusal names the embedded limit: {refusal}"
+            );
+            sorter.try_grow(19 * MIB).expect("up to the share");
+        }
+        sorters[3]
+            .try_grow(20 * MIB)
+            .expect("the last partition still gets its share");
+        let agg = MemoryConsumer::new("agg")
+            .with_can_spill(true)
+            .register(&pool);
+        agg.try_grow(1)
+            .expect_err("the shares filled the spillable bytes");
+    }
+
+    /// Writes plan their sort-on-write gate against `--memory-limit`, not
+    /// the server's 256 MB `query.max_query_memory` default.
+    #[tokio::test]
+    async fn handler_config_takes_the_memory_limit() {
+        let client = EmbeddedClient::new(3 * 1024 * 1024 * 1024).unwrap();
+        let config = client.handler_config();
+        assert_eq!(
+            sqe_core::parse_memory_limit(&config.query.max_query_memory).unwrap(),
+            3 * 1024 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -2844,6 +3019,25 @@ mod tests {
         // embedded included (finding 700); DataFusion's `Int64(1)` is gone.
         assert_eq!(result.columns, vec!["_col0".to_string()]);
         assert!(result.rows.is_empty());
+    }
+
+    /// A NULL cell is marked, so `-f json` prints `null` and an empty string
+    /// stays `""`. Both used to render as `""`.
+    #[tokio::test]
+    async fn embedded_client_marks_null_cells() {
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
+        let sql = "SELECT CAST(NULL AS DECIMAL(7,2)) AS n, '' AS e, 1 AS one \
+                   UNION ALL SELECT 2.50, NULL, 2 ORDER BY one";
+        let result = client.execute(sql).await.expect("query");
+        assert_eq!(result.rows.len(), 2);
+        let marked: Vec<Vec<bool>> = (0..2)
+            .map(|r| (0..3).map(|c| result.is_null(r, c)).collect())
+            .collect();
+        assert_eq!(
+            marked,
+            vec![vec![true, false, false], vec![false, true, false]]
+        );
+        assert_eq!(result.rows[0][1], "");
     }
 
     /// Finding 700: Trino shapes that only the Trino HTTP door used to accept
@@ -3665,7 +3859,10 @@ mod tests {
         assert_eq!(body["schema"]["fields"][0]["type"], "long");
         let version = &body["view-version"];
         assert_eq!(version["default-catalog"], "wh");
-        assert_eq!(version["default-namespace"], serde_json::json!(["ns"]));
+        // The schema the body's unqualified names resolve in: the creating
+        // session's (no USE here, so `default`), not the view's own
+        // namespace (ai-portal-data#357).
+        assert_eq!(version["default-namespace"], serde_json::json!(["default"]));
         assert_eq!(version["representations"][0]["dialect"], "sqe");
         assert_eq!(
             version["representations"][0]["sql"],
@@ -4492,7 +4689,7 @@ mod tests {
             arrow_schema::DataType::Int64,
             false,
         )]));
-        let batch = RecordBatch::try_new(
+        let batch = arrow_array::RecordBatch::try_new(
             Arc::clone(&schema),
             vec![Arc::new(arrow_array::Int64Array::from(vec![1]))],
         )

@@ -1963,10 +1963,17 @@ impl QueryHandler {
                         let inner = statement.to_string();
                         let (ctx, _) = self.create_session_context(session).await?;
                         if *analyze {
-                            self.explain_handler.analyze(session, &inner, &ctx).await
+                            // It runs the query: same quota, sort share and
+                            // join fallback as the query itself (#788).
+                            let (ctx, fallback) = self.explain_execution(ctx, &query_id, quota);
+                            self.explain_handler
+                                .analyze(session, &inner, &ctx, fallback)
+                                .await
                         } else {
                             let is_admin = self.config.auth.has_admin_role(&session.user.roles);
-                            self.explain_handler.plan(session, &inner, &ctx, is_admin).await
+                            self.explain_handler
+                                .plan(session, &inner, &ctx, is_admin)
+                                .await
                         }
                     } else if let sqlparser::ast::Statement::ShowColumns { show_options, .. } =
                         stmt.as_ref()
@@ -2701,7 +2708,10 @@ impl QueryHandler {
 
                 StatementKind::ExplainFull(inner) => {
                     let (ctx, _) = self.create_session_context(session).await?;
-                    self.explain_handler.full(session, inner, &ctx).await
+                    let (ctx, fallback) = self.explain_execution(ctx, &query_id, quota);
+                    self.explain_handler
+                        .full(session, inner, &ctx, fallback)
+                        .await
                 }
 
                 StatementKind::Delete(stmt) => {
@@ -3742,11 +3752,15 @@ impl QueryHandler {
     /// carries its `$n` placeholders (no values are bound yet). Returns
     /// `None` for statement kinds the streaming path does not run (DML, DDL,
     /// metadata); those keep executing through the buffered text path.
+    ///
+    /// The schema is the analyzed one, the types the stream will carry (the
+    /// analyzer types decimal arithmetic, #785); a plan whose placeholders
+    /// the analyzer cannot type yet keeps the planned schema.
     pub async fn plan_prepared_statement(
         &self,
         session: &Session,
         numbered_sql: &str,
-    ) -> sqe_core::Result<Option<LogicalPlan>> {
+    ) -> sqe_core::Result<Option<(LogicalPlan, SchemaRef)>> {
         reject_oversized_sql(&self.config.query, numbered_sql)?;
         let kind = classify_user_sql(session, numbered_sql)?;
         // Inside a transaction a stored plan would pin the tables it loaded
@@ -3761,7 +3775,9 @@ impl QueryHandler {
         let (plan, _tt_cleanup) = self
             .plan_sql_for_stream(&ctx, &session_catalog, session, numbered_sql, None)
             .await?;
-        Ok(Some(plan))
+        let schema = sqe_catalog::file_tvf_prepare::analyzed_schema(&ctx, &plan)
+            .unwrap_or_else(|_| Arc::clone(plan.schema()));
+        Ok(Some((plan, Arc::new(schema.as_arrow().clone()))))
     }
 
     #[tracing::instrument(
@@ -4280,6 +4296,42 @@ impl QueryHandler {
         }
     }
 
+    /// The parameter types a Flight SQL client is told for a prepared
+    /// statement that has no stored plan. INSERT, UPDATE and DELETE are
+    /// planned once to read them: DataFusion types an INSERT's `VALUES`
+    /// placeholders from the target columns. Any other statement, or one
+    /// that does not plan here (a MERGE, a Hive target), stays untyped:
+    /// preparing it must not start failing. The types are advisory; the
+    /// values are coerced when the statement runs.
+    pub async fn dml_parameter_types(
+        &self,
+        session: &Session,
+        numbered_sql: &str,
+        param_count: usize,
+    ) -> Vec<Option<DataType>> {
+        let untyped = vec![None; param_count];
+        if param_count == 0 {
+            return untyped;
+        }
+        let is_dml = matches!(
+            classify_user_sql(session, numbered_sql),
+            Ok(StatementKind::Insert(_) | StatementKind::Update(_) | StatementKind::Delete(_))
+        );
+        if !is_dml {
+            return untyped;
+        }
+        match self
+            .prepared_parameter_types(session, numbered_sql, param_count)
+            .await
+        {
+            Ok(types) => types,
+            Err(e) => {
+                debug!(error = %e, "prepared DML parameters left untyped");
+                untyped
+            }
+        }
+    }
+
     /// Plan a (placeholder-numbered) statement and return the inferred type of
     /// each bind parameter in positional order. `None` for a parameter whose
     /// type DataFusion could not infer.
@@ -4679,6 +4731,31 @@ impl QueryHandler {
     /// under the query's own quota, so a retry gets a fresh quota. `None`
     /// too for a query admitted under pressure: retrying a query that did
     /// not fit the pressure cap only spends more of a red pool.
+    /// The context and join fallback an EXPLAIN ANALYZE / FULL runs its plan
+    /// with: the query pool `execute_query` builds (`max_query_memory`, the
+    /// sort share) and, once the enforced plan is known, the same fallback.
+    /// They ran on the session's shared pool, outside the query's cap, so a
+    /// full sort that completes as a query failed when explained (#788).
+    fn explain_execution(
+        &self,
+        ctx: SessionContext,
+        query_id: &uuid::Uuid,
+        quota: crate::query_memory::QueryQuota,
+    ) -> (
+        SessionContext,
+        impl FnOnce(LogicalPlan) -> Option<crate::join_fallback::JoinFallback> + '_,
+    ) {
+        let shared_pool = Arc::clone(&ctx.runtime_env().memory_pool);
+        let ctx =
+            crate::query_memory::with_query_quota(ctx, quota, self.unspillable_headroom_percent);
+        let query_id = *query_id;
+        let fallback_ctx = ctx.clone();
+        let fallback = move |logical| {
+            self.join_fallback(&fallback_ctx, shared_pool, logical, &query_id, quota)
+        };
+        (ctx, fallback)
+    }
+
     fn join_fallback(
         &self,
         ctx: &SessionContext,
@@ -5069,8 +5146,11 @@ impl QueryHandler {
             iceberg_scan.table(),
             iceberg_scan.snapshot_id(),
         );
+        // An unprojected scan sends its full column list too: without names
+        // the worker emits each file's own column order (#831 follow-up).
+        let output_columns = iceberg_scan.output_columns();
         let (projected_cols, projected_field_ids) =
-            scan_task_projection(iceberg_scan.projection(), &scanned_schema);
+            scan_task_projection(&output_columns, &scanned_schema);
 
         // 6a. The declared projection plus each column's initial default, for
         // workers whose files predate a projected column (#831). `None` unless
@@ -9173,12 +9253,12 @@ pub fn replace_scan_in_plan(
 }
 
 /// Derive the worker-side projection for a `ScanTask` from the scan's
-/// projection and the table's Iceberg schema.
+/// output columns (`IcebergScanExec::output_columns`: the projection, or the
+/// full declared schema when unprojected) and the table's Iceberg schema.
 ///
 /// Returns `(projected_columns, projected_field_ids)`:
-/// - both empty when the scan is unprojected (`SELECT *`) or the projection
-///   is empty (`COUNT(*)` -- workers return full columns, the reassembly
-///   path drops them),
+/// - both empty for a `COUNT(*)` scan (no columns -- workers return full
+///   columns, the reassembly path drops them),
 /// - field IDs only when EVERY projected column resolves to an Iceberg field
 ///   ID; a partial mapping would silently project the wrong columns on
 ///   post-evolution files, so incomplete IDs degrade to name-only projection.
@@ -9189,10 +9269,10 @@ pub fn replace_scan_in_plan(
 /// these columns and ships batches that match that schema (modulo column
 /// order, which reassembly normalizes by name).
 fn scan_task_projection(
-    projection: Option<&[String]>,
+    columns: &[String],
     iceberg_schema: &iceberg::spec::Schema,
 ) -> (Vec<String>, Vec<i32>) {
-    let projected_cols: Vec<String> = projection.map(<[String]>::to_vec).unwrap_or_default();
+    let projected_cols: Vec<String> = columns.to_vec();
     if projected_cols.is_empty() {
         return (projected_cols, Vec::new());
     }
@@ -11540,24 +11620,17 @@ mod tests {
         // so the ScanTask projection derived here agrees with the schema
         // DistributedScanExec advertises: no 16-vs-2 width mismatch.
         let proj = vec!["c".to_string(), "a".to_string()];
-        let (cols, ids) = scan_task_projection(Some(&proj), &iceberg_schema_abc());
+        let (cols, ids) = scan_task_projection(&proj, &iceberg_schema_abc());
         assert_eq!(cols, vec!["c".to_string(), "a".to_string()]);
         assert_eq!(ids, vec![3, 1], "field IDs parallel the projected columns");
     }
 
     #[test]
-    fn scan_task_projection_unprojected_scan_sends_nothing() {
-        let (cols, ids) = scan_task_projection(None, &iceberg_schema_abc());
-        assert!(cols.is_empty());
-        assert!(ids.is_empty());
-    }
-
-    #[test]
     fn scan_task_projection_count_star_sends_nothing() {
-        // COUNT(*) scans carry Some([]) — workers return full columns and the
+        // COUNT(*) scans carry no columns: workers return full columns and the
         // reassembly path drops them (expected schema has 0 fields).
         let proj: Vec<String> = vec![];
-        let (cols, ids) = scan_task_projection(Some(&proj), &iceberg_schema_abc());
+        let (cols, ids) = scan_task_projection(&proj, &iceberg_schema_abc());
         assert!(cols.is_empty());
         assert!(ids.is_empty());
     }
@@ -11568,7 +11641,7 @@ mod tests {
         // happen, but fail safe): partial IDs would project the wrong parquet
         // columns, so the IDs are dropped and the name fallback is used.
         let proj = vec!["a".to_string(), "ghost".to_string()];
-        let (cols, ids) = scan_task_projection(Some(&proj), &iceberg_schema_abc());
+        let (cols, ids) = scan_task_projection(&proj, &iceberg_schema_abc());
         assert_eq!(cols, vec!["a".to_string(), "ghost".to_string()]);
         assert!(ids.is_empty(), "incomplete ID mapping must send no IDs");
     }

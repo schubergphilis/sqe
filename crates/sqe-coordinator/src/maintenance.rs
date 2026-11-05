@@ -1453,6 +1453,7 @@ impl MaintenanceHandler {
         let committed = tx_applied
             .commit(catalog.as_ref())
             .await
+            .inspect_err(|e| cleanup_guard.keep_if_outcome_unknown(e))
             .map_err(|e| classify_commit_error(e, "rewrite_data_files"))?;
         cleanup_guard.mark_committed();
         let new_snapshot_id = committed.metadata().current_snapshot_id();
@@ -1460,15 +1461,8 @@ impl MaintenanceHandler {
         // Compaction rewrites files, not rows: the previous snapshot's Puffin
         // NDV statistics stay exact for the new one, so re-register them
         // (architecture review 512). Best effort; the data commit is done.
-        crate::puffin_carry::carry_forward_statistics(
-            catalog.as_ref(),
-            &ident,
-            &committed,
-            crate::puffin_carry::CarryOp::Rewrite,
-            None,
-            self.metrics.as_deref(),
-        )
-        .await;
+        carry_rewrite_statistics(catalog, &ident, &table, &committed, self.metrics.as_deref())
+            .await;
 
         // After the commit, invalidate the shared TableMetadataCache entry so
         // subsequent load_table calls (including the table_files TVF used by
@@ -2470,15 +2464,7 @@ impl MaintenanceHandler {
 
         // Same as the local path: carry the previous snapshot's Puffin NDV
         // statistics onto the compacted snapshot (architecture review 512).
-        crate::puffin_carry::carry_forward_statistics(
-            catalog.as_ref(),
-            ident,
-            &committed,
-            crate::puffin_carry::CarryOp::Rewrite,
-            None,
-            metrics,
-        )
-        .await;
+        carry_rewrite_statistics(catalog, ident, table, &committed, metrics).await;
 
         let cache_key = format!("{}.{}", ident.namespace(), ident.name());
         if let Some(tc) = table_cache {
@@ -2598,6 +2584,9 @@ impl MaintenanceHandler {
         // manifests / data files as part of the action; apache does it as a
         // separate post-commit step. A cleanup failure does not undo the
         // committed expiry, so it is surfaced as an error for the operator.
+        // The cleanup deletes through a reload of the committed table: the
+        // table a commit returns has no vended credential.
+        let committed = reload_committed(&catalog, &ident, &committed).await?;
         committed
             .cleanup_expired_files(&before_metadata)
             .await
@@ -2677,11 +2666,12 @@ impl MaintenanceHandler {
                         format!("remove_orphan_files apply failed: {e}"),
                     )
                 })?;
-            table = tx
+            let committed = tx
                 .commit(catalog.as_ref())
                 .await
                 .map_err(|e| classify_commit_error(e, "remove_orphan_files"))?;
             self.invalidate_table_cache(&ident).await;
+            table = reload_committed(&catalog, &ident, &committed).await?;
         }
 
         let action = iceberg::actions::RemoveOrphanFilesAction::new(table)
@@ -2759,12 +2749,11 @@ impl MaintenanceHandler {
 
         // Manifest rewrite touches no data: the previous snapshot's Puffin
         // NDV statistics remain exact for the new one (architecture review 512).
-        crate::puffin_carry::carry_forward_statistics(
-            catalog.as_ref(),
+        carry_rewrite_statistics(
+            &catalog,
             &ident,
+            &table,
             &committed,
-            crate::puffin_carry::CarryOp::Rewrite,
-            None,
             self.metrics.as_deref(),
         )
         .await;
@@ -3516,6 +3505,64 @@ pub(crate) async fn load_table(
         .map_err(|e| SqeError::Catalog(format!("Failed to load table '{ident}': {e}")))
 }
 
+/// The table a commit returned, reloaded before anything reads or deletes
+/// its files.
+///
+/// A REST commit's response carries metadata but no storage `config`, so
+/// the table the catalog builds from it has a `FileIO` with the catalog's
+/// own properties only: on a credential-vending catalog with no static
+/// warehouse key, its first file access fails with "failed to load signing
+/// credential" (portal request §2). Only `loadTable` vends the caller's
+/// credential. The reload must show the metadata this commit wrote; if
+/// another writer committed in between, the caller's file step is refused
+/// rather than run against metadata it did not produce.
+async fn reload_committed(
+    catalog: &Arc<dyn Catalog>,
+    ident: &TableIdent,
+    committed: &IcebergTable,
+) -> sqe_core::Result<IcebergTable> {
+    let reloaded = load_table(catalog, ident).await?;
+    if reloaded.metadata_location() != committed.metadata_location() {
+        return Err(SqeError::with_code(
+            SqeErrorCode::CommitConflict,
+            format!(
+                "table '{ident}' changed after this call's commit; the commit stands but no \
+                 file was deleted; system.remove_orphan_files removes what it left"
+            ),
+        ));
+    }
+    Ok(reloaded)
+}
+
+/// Carry the previous snapshot's Puffin statistics onto the snapshot
+/// `committed` made (a rewrite: the NDVs stay exact). Best effort, like the
+/// carry itself.
+///
+/// The sidecars are read and written through a fresh `loadTable`'s
+/// `FileIO`: the table a REST commit returns has no vended credential, and
+/// `loaded`'s may have expired during a long rewrite. `loaded` is the
+/// fallback when the reload fails.
+async fn carry_rewrite_statistics(
+    catalog: &Arc<dyn Catalog>,
+    ident: &TableIdent,
+    loaded: &IcebergTable,
+    committed: &IcebergTable,
+    metrics: Option<&sqe_metrics::MetricsRegistry>,
+) {
+    let reloaded = load_table(catalog, ident).await.ok();
+    let io = reloaded.as_ref().unwrap_or(loaded).file_io();
+    crate::puffin_carry::carry_forward_statistics(
+        catalog.as_ref(),
+        ident,
+        committed,
+        io,
+        crate::puffin_carry::CarryOp::Rewrite,
+        None,
+        metrics,
+    )
+    .await;
+}
+
 /// Collect the three inputs [`crate::table_health::analyze_table_health`]
 /// needs for one table, in the exact sequence `table_health()` (the `CALL
 /// system.table_health` handler, above) uses: live data files, live delete
@@ -3995,6 +4042,75 @@ mod purge_prefix_tests {
             .unwrap_err();
         assert!(err.to_string().contains("ns.twin"), "{err}");
         assert!(err.to_string().contains("uses the same location"), "{err}");
+    }
+
+    /// The file step of `expire_snapshots` / `remove_orphan_files` runs on a
+    /// reload of the committed table (a REST commit's table has no vended
+    /// credential), and only when that reload is the metadata this commit
+    /// wrote. The in-memory catalog cannot show the missing credential; the
+    /// guard against another writer's commit is checked here.
+    #[tokio::test]
+    async fn reload_committed_returns_this_commit_or_refuses() {
+        use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+        use iceberg::transaction::{ApplyTransactionAction, Transaction};
+        use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            iceberg::memory::MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    [("warehouse".to_string(), "memory:///wh".to_string())].into(),
+                )
+                .await
+                .unwrap(),
+        );
+        let ns = NamespaceIdent::new("ns".into());
+        catalog
+            .create_namespace(&ns, Default::default())
+            .await
+            .unwrap();
+        let schema = Schema::builder()
+            .with_fields(vec![NestedField::required(
+                1,
+                "x",
+                Type::Primitive(PrimitiveType::Long),
+            )
+            .into()])
+            .build()
+            .unwrap();
+        let table = catalog
+            .create_table(
+                &ns,
+                TableCreation::builder()
+                    .name("t".to_string())
+                    .location("memory:///wh/ns/t".to_string())
+                    .schema(schema)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let ident = TableIdent::new(ns, "t".into());
+        let set = |table: &iceberg::table::Table, v: &str| {
+            let tx = Transaction::new(table);
+            tx.update_table_properties()
+                .set("k".to_string(), v.to_string())
+                .apply(tx)
+                .unwrap()
+        };
+
+        let committed = set(&table, "1").commit(catalog.as_ref()).await.unwrap();
+        let reloaded = super::reload_committed(&catalog, &ident, &committed)
+            .await
+            .expect("nothing committed in between");
+        assert_eq!(reloaded.metadata_location(), committed.metadata_location());
+
+        // Another writer commits before the file step.
+        set(&committed, "2").commit(catalog.as_ref()).await.unwrap();
+        let err = super::reload_committed(&catalog, &ident, &committed)
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::CommitConflict);
+        assert!(err.to_string().contains("no file was deleted"), "{err}");
     }
 
     /// `CALL ...(table => 'cat.a.b.t')` loads `t` from the nested namespace

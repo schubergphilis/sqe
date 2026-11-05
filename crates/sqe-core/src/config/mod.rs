@@ -882,9 +882,19 @@ pub struct CoordinatorConfig {
     /// Default: "/tmp/sqe-coordinator-spill".
     #[serde(default = "default_coordinator_spill_dir")]
     pub spill_dir: String,
-    /// Compression for spill files. Default: lz4.
+    /// Compression for spill files: `lz4`, `zstd` or `none`. Default: lz4.
+    /// Sets DataFusion's `datafusion.execution.spill_compression` on every
+    /// coordinator session (#788); before, the setting was logged but
+    /// spills were written uncompressed.
     #[serde(default = "default_spill_compression")]
     pub spill_compression: FlightCompression,
+    /// Most bytes all spill files in `spill_dir` may hold at once, across
+    /// every query. A spill past it fails its query with a
+    /// `ResourceExhausted` error naming this setting, instead of filling the
+    /// disk. Default `100GB` (DataFusion's own default, which applied before
+    /// the setting existed).
+    #[serde(default = "default_coordinator_spill_max_bytes")]
+    pub spill_max_bytes: String,
     /// Arrow Flight IPC compression for client-facing DoGet responses.
     /// Default: lz4.
     #[serde(default = "default_flight_compression")]
@@ -1402,6 +1412,7 @@ impl std::fmt::Debug for CoordinatorConfig {
             .field("spill_to_disk", &self.spill_to_disk)
             .field("spill_dir", &self.spill_dir)
             .field("spill_compression", &self.spill_compression)
+            .field("spill_max_bytes", &self.spill_max_bytes)
             .field("flight_compression", &self.flight_compression)
             .field("worker_flight_compression", &self.worker_flight_compression)
             .field("max_workers", &self.max_workers)
@@ -1471,6 +1482,18 @@ impl FromStr for FlightCompression {
             other => Err(format!(
                 "unknown Flight compression codec {other:?}; expected lz4, zstd, or none"
             )),
+        }
+    }
+}
+
+impl FlightCompression {
+    /// The value of DataFusion's `datafusion.execution.spill_compression`
+    /// for this codec.
+    pub fn spill_codec(self) -> &'static str {
+        match self {
+            Self::None => "uncompressed",
+            Self::Lz4 => "lz4_frame",
+            Self::Zstd => "zstd",
         }
     }
 }
@@ -5827,10 +5850,13 @@ fn default_memory_limit_auto_fraction() -> f64 {
     0.7
 }
 fn default_unspillable_headroom_percent() -> u8 {
-    20
+    crate::memory_headroom::DEFAULT_UNSPILLABLE_HEADROOM_PERCENT
 }
 fn default_spill_compression() -> FlightCompression {
     FlightCompression::Lz4
+}
+fn default_coordinator_spill_max_bytes() -> String {
+    "100GB".to_string()
 }
 fn default_flight_compression() -> FlightCompression {
     FlightCompression::Lz4
@@ -7000,6 +7026,10 @@ fn validate_byte_sizes(config: &SqeConfig, errors: &mut Vec<String>) {
         "coordinator.process_headroom",
         &config.coordinator.process_headroom,
     );
+    check(
+        "coordinator.spill_max_bytes",
+        &config.coordinator.spill_max_bytes,
+    );
     check("worker.memory_limit", &config.worker.memory_limit);
     check(
         "worker.memory.process_headroom",
@@ -7932,6 +7962,7 @@ partial_progress_batch = 5
                 spill_to_disk: true,
                 spill_dir: default_coordinator_spill_dir(),
                 spill_compression: default_spill_compression(),
+                spill_max_bytes: default_coordinator_spill_max_bytes(),
                 flight_compression: default_flight_compression(),
                 worker_flight_compression: default_worker_flight_compression(),
                 runtime_stack_mib: default_runtime_stack_mib(),

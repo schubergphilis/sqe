@@ -24,9 +24,9 @@ use crate::ident::{
     schema_catalog_qualifier,
 };
 use crate::write_handler::{
-    arrow_column_to_iceberg_type, default_to_iceberg_literal as alter_default_to_iceberg_literal,
-    geospatial_iceberg_type, parse_partition_transform_sql, sql_type_to_arrow,
-    sql_type_to_arrow_for, CatalogDiscovery,
+    arrow_column_to_iceberg_type, configured_write_target,
+    default_to_iceberg_literal as alter_default_to_iceberg_literal, geospatial_iceberg_type,
+    parse_partition_transform_sql, sql_type_to_arrow, sql_type_to_arrow_for, CatalogDiscovery,
 };
 
 /// Per-table async lock used to serialize read-merge-commit sequences (see
@@ -551,6 +551,18 @@ impl CatalogOps {
         let namespace = view_ident.namespace();
         let name = view_ident.name();
         let select_sql = format!("{query}");
+        // The schema the body was planned in (the session's, as for any
+        // statement), recorded as the version's `default-namespace` so a
+        // reader resolves its unqualified names to the same tables
+        // (ai-portal-data#357).
+        let default_namespace = NamespaceIdent::new(
+            session
+                .default_schema
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("default")
+                .to_string(),
+        );
 
         info!(
             username = %session.user.username,
@@ -566,11 +578,25 @@ impl CatalogOps {
 
         if or_replace {
             session_catalog
-                .create_or_replace_view(namespace, name, &select_sql, schema_json, &properties)
+                .create_or_replace_view(
+                    namespace,
+                    name,
+                    &select_sql,
+                    &default_namespace,
+                    schema_json,
+                    &properties,
+                )
                 .await
         } else {
             session_catalog
-                .create_view(namespace, name, &select_sql, schema_json, &properties)
+                .create_view(
+                    namespace,
+                    name,
+                    &select_sql,
+                    &default_namespace,
+                    schema_json,
+                    &properties,
+                )
                 .await
         }
     }
@@ -2112,6 +2138,18 @@ impl CatalogOps {
     ) -> sqe_core::Result<Arc<SessionCatalog>> {
         if let Some(catalog) = &self.fixed_catalog {
             return Ok(catalog.clone());
+        }
+        // A `[catalogs.<name>]` entry: its own endpoint, warehouse and auth.
+        if let (Some(name), Some(discovery)) = (
+            configured_write_target(&self.config, target_warehouse),
+            &self.catalog_discovery,
+        ) {
+            return discovery
+                .configured_session_catalog(&name, &self.config, session, self.table_cache.as_ref())
+                .await
+                .ok_or_else(|| {
+                    SqeError::Catalog(format!("Catalog '{name}' did not build for this session"))
+                });
         }
         match target_warehouse {
             Some(warehouse)

@@ -25,8 +25,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::error::Result;
 use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionContext;
-use futures::TryStreamExt;
-use futures::future::join_all;
+use futures::{StreamExt, TryStreamExt};
 use iceberg::arrow::arrow_schema_to_schema_auto_assign_ids;
 use iceberg::inspect::MetadataTableType;
 use iceberg::spec::FormatVersion;
@@ -34,6 +33,9 @@ use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 
 use crate::table::IcebergTableProvider;
 use crate::to_datafusion_error;
+
+/// SQE patch (catalog-429): concurrent table loads when a namespace attaches.
+const LOAD_CONCURRENCY: usize = 16;
 
 /// Represents a [`SchemaProvider`] for the Iceberg [`Catalog`], managing
 /// access to table providers within a specific namespace.
@@ -78,15 +80,25 @@ impl IcebergSchemaProvider {
         // Unity Catalog namespace lists its Delta tables too, and loading one
         // answers 400 "not an Iceberg compatible table"; one such table must
         // not fail the whole catalog.
-        let providers = join_all(
-            table_names
-                .iter()
-                .map(|name| {
-                    IcebergTableProvider::try_new(client.clone(), namespace.clone(), name)
-                })
-                .collect::<Vec<_>>(),
-        )
-        .await;
+        //
+        // SQE patch (catalog-429): at most `LOAD_CONCURRENCY` loads in flight.
+        // An unbounded fan-out over a large namespace drew 429 Too Many
+        // Requests from Snowflake Horizon; `buffered` keeps the name order.
+        // Owned names and a boxed future: a stream of futures borrowing `&str`
+        // trips rustc's higher-ranked `Send` check in every async caller.
+        let loads: Vec<futures::future::BoxFuture<'static, _>> = table_names
+            .iter()
+            .map(|name| {
+                let (client, namespace, name) = (client.clone(), namespace.clone(), name.clone());
+                Box::pin(
+                    async move { IcebergTableProvider::try_new(client, namespace, &name).await },
+                ) as futures::future::BoxFuture<'static, _>
+            })
+            .collect();
+        let providers: Vec<_> = futures::stream::iter(loads)
+            .buffered(LOAD_CONCURRENCY)
+            .collect()
+            .await;
 
         let tables = Arc::new(DashMap::new());
         for (name, provider) in table_names.into_iter().zip(providers) {

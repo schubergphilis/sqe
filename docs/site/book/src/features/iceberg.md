@@ -11,7 +11,7 @@ SQE is built on the [iceberg-rust](https://github.com/apache/iceberg-rust) libra
 - **Parquet**: 59
 - **Iceberg table format**: V2 and V3. V3 is the default for new tables. V3 features verified end-to-end: TIMESTAMP_NS, column defaults, equality-delete UPDATE on identifier-fields, partition evolution, deletion vectors, row lineage, `VARIANT`, and top-level unknown columns.
 
-The matrix score against [icebergmatrix.org](https://icebergmatrix.org) is 156/162 (96.3%), rescored in October 2026 against the current rubric, which scores only the cells that apply to each format version. Scores from the older rubric (167/189) are not comparable. See [getsqe.com/compare/iceberg](https://getsqe.com/compare/iceberg) for the per-cell breakdown and the side-by-side V2/V3 comparison against every other engine on the public scoreboard.
+The matrix score against [icebergmatrix.org](https://icebergmatrix.org) is 158/162 (97.5%), rescored in October 2026 against the current rubric, which scores only the cells that apply to each format version. Scores from the older rubric (167/189) are not comparable. See [getsqe.com/compare/iceberg](https://getsqe.com/compare/iceberg) for the per-cell breakdown and the side-by-side V2/V3 comparison against every other engine on the public scoreboard.
 
 ## Architecture
 
@@ -44,6 +44,7 @@ SQE keeps the catalog choice as a runtime configuration concern. Every catalog b
 | AWS Glue (Iceberg REST) | `rest` | Iceberg REST + AWS SigV4 | AWS provider chain | live verified |
 | AWS S3 Tables (REST) | `rest` | Iceberg REST + AWS SigV4 (`s3tables` signing) | AWS provider chain | live verified |
 | Databricks Unity Catalog | `rest` | Iceberg REST | Databricks user token, passed through | live verified: read, write and DML both ways ([interop run](#databricks-unity-catalog-interop)) |
+| Snowflake Horizon | `rest` | Iceberg REST | Snowflake access token, passed through | live verified: read, write and DML both ways ([interop run](#snowflake-horizon-interop)) |
 | Unity Catalog OSS | `rest` | Iceberg REST | anonymous | live verified, read-only |
 | AWS Glue (native SDK) | `glue` | aws-sdk-glue | AWS provider chain | live verified eu-central-1 |
 | AWS S3 Tables (native SDK) | `s3tables` | aws-sdk-s3tables | AWS provider chain | live verified eu-west-1 |
@@ -87,7 +88,7 @@ The interop run in `scripts/interop/databricks-uc/` checks both directions again
 | Databricks DML on SQE tables | DELETE, UPDATE and INSERT, including a deletion vector on an SQE-written V3 table |
 | SQE DML on Databricks tables | DELETE, UPDATE, MERGE and INSERT, on V2 and V3 tables |
 
-All 25 compared reads match in embedded mode (`ATTACH` in `sqe-cli`), against a single coordinator, and against a coordinator with a worker. The distributed run found a real bug: a worker read its data files without the table's delete files, so rows that Databricks had deleted with a deletion vector came back. A scan ticket now carries each data file's position deletes and deletion vector, and the worker skips those rows. A snapshot with equality deletes is still scanned on the coordinator.
+All 27 compared reads match in embedded mode (`ATTACH` in `sqe-cli`), against a single coordinator, and against a coordinator with a worker. The distributed run found a real bug: a worker read its data files without the table's delete files, so rows that Databricks had deleted with a deletion vector came back. A scan ticket now carries each data file's position deletes and deletion vector, and the worker skips those rows. A snapshot with equality deletes is still scanned on the coordinator.
 
 Known gaps from the same run:
 
@@ -96,6 +97,48 @@ Known gaps from the same run:
 - `SHOW CREATE TABLE` prints Unity's internal table properties (`databricks.*`, `io.unitycatalog.tableId`, the storage paths) and no clustering clause.
 - A Databricks user token lives about an hour. A longer session needs a fresh login, or an `ATTACH` with an [oauth2 secret](../operations/catalogs.md#example-rest-catalog-with-an-oauth2-client-credential) that refreshes a service principal's token. That trades the user's grants for the principal's.
 - A Delta table listed in the same Unity schema is refused with "not an Iceberg table". SQE reads Iceberg only.
+
+## Snowflake Horizon interop
+
+Snowflake serves its Iceberg tables over the Iceberg REST protocol at `/polaris/api/catalog`, with a Snowflake database as the warehouse. SQE reaches it with the `rest` backend and no service account. The user's key pair signs a JWT, Horizon trades it for an access token scoped to one role, and SQE passes that token through. Horizon vends storage credentials only when asked, so the catalog sets `access_delegation`.
+
+```toml
+[[auth.providers]]
+type = "bearer_passthrough"   # the Horizon token is opaque; Horizon validates it
+user = "<label for the audit log>"
+
+[catalogs.sf]
+catalog_url = "https://<orgname>-<accountname>.snowflakecomputing.com/polaris/api/catalog"
+warehouse = "<Snowflake database>"
+access_delegation = "vended-credentials"
+```
+
+`bearer_passthrough` belongs on a test rig. Horizon publishes no JWKS for its access tokens, so SQE cannot validate them itself and leaves that to Horizon. The embedded CLI attaches the same endpoint with `ACCESS_DELEGATION 'vended-credentials'` ([example](../operations/catalogs.md#example-snowflake-horizon)).
+
+The interop run in `scripts/interop/snowflake-horizon/` follows the Databricks run: each engine writes, the other reads, both run DML on the other's tables, and 33 reads are compared value by value.
+
+| Direction | What it covers |
+|---|---|
+| Snowflake writes, SQE reads | scalar types including `TIMESTAMP_LTZ`, `TIMESTAMP_NTZ`, nanosecond timestamps, `BINARY` and `TIME`, `OBJECT`, `ARRAY` and `MAP`, identity and month partitions, schema evolution, V3 `VARIANT`, `GEOMETRY(4326)` and `GEOGRAPHY`, position deletes (V2) and deletion vectors (V3) from merge-on-read DML |
+| SQE writes, Snowflake reads | CREATE, CTAS, INSERT, UPDATE, DELETE, MERGE, ALTER, V2 and V3 tables, `VARIANT`, `GEOMETRY`, a deletion vector from a merge-on-read DELETE |
+| Snowflake DML on SQE tables | DELETE, UPDATE and INSERT, including a DELETE over SQE's deletion vector |
+| SQE DML on Snowflake tables | DELETE, UPDATE and MERGE, on V2 and V3 tables |
+
+All 40 reads match in embedded mode, against a single coordinator, and against a coordinator with a worker. The run found four things SQE now handles:
+
+- **Table placement.** Horizon refuses a `CREATE TABLE` that names a location. SQE resends the create without one, and Horizon places the table.
+- **Commit pacing.** A commit that follows the previous one within about half a second is refused, with a 409 that names no failed requirement or a 500 "Indeterminate result". Neither was applied. SQE resends schema commits, backs data commits off at least 500 ms, and retries an unknown outcome only after a reload shows the table did not move.
+- **File layout.** Snowflake writes parquet columns in an order of its own and adds row-lineage columns. A worker matched columns by position and returned values under the wrong names. Every worker scan that reads columns now carries a projection fill, `SELECT *` included, and the worker matches by field id.
+- **Delete files.** Snowflake encodes integer columns with 512-value `DELTA_BINARY_PACKED` miniblocks, and parquet before 59.3.2 could not skip rows inside one. Applying a Snowflake position delete or deletion vector failed with "cannot skip miniblock of size 512". SQE now builds against parquet 59.3.2.
+
+Known gaps from the same run:
+
+- Snowflake upper-cases unquoted names and SQE folds them to lower case, so quote Snowflake's names: `sf."SALES"."ORDERS"`.
+- Snowflake rewrites small tables copy-on-write whatever the table's merge-on-read setting. Its delete files appear only on large tables with `ICEBERG_MERGE_ON_READ_BEHAVIOR = 'enabled'`; the harness uses 1M rows.
+- `$files` lists data files only. Delete files and deletion vectors show in the `$snapshots` summary.
+- `ST_AREA` on an Iceberg `GEOMETRY` comes back negative in Snowflake, whichever engine wrote the table.
+- An external volume encrypted with a customer KMS key fails: the credentials Horizon vends lack `kms:Decrypt`. Use Snowflake-managed storage.
+- A Horizon access token lives about an hour.
 
 ## Catalog REST surface
 

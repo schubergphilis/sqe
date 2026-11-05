@@ -1087,11 +1087,49 @@ impl WriteHandler {
         Fut: std::future::Future<Output = sqe_core::Result<Option<RewriteAttempt<T>>>>,
     {
         let target_branch = crate::commit::txn_target_branch(catalog, table_ident).await?;
+        let failed = |e: &dyn std::fmt::Display| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("Failed to commit {stmt_label}: {e}"),
+            )
+        };
         let mut attempt = 1u32;
+        // An attempt whose commit outcome is unknown: the metadata location
+        // it was built on, its error, and its cleanup guard, held until a
+        // reload shows whether the commit landed (see
+        // `crate::commit::is_unknown_outcome`). Unmoved table: it did not, the
+        // guard drops and deletes that attempt's files. Moved table: it may
+        // have, the files stay and the write stops with that error.
+        let mut unknown: Option<(Option<String>, iceberg::Error, Option<WriteCleanupGuard>)> = None;
         loop {
-            let table = catalog.load_table(table_ident).await.map_err(|e| {
+            let loaded = catalog.load_table(table_ident).await;
+            if let Some((base, error, held)) = unknown.take() {
+                let unmoved = matches!(&loaded, Ok(t) if base.is_some() && t.metadata_location() == base.as_deref());
+                if !unmoved {
+                    if let Some(guard) = &held {
+                        guard.mark_committed();
+                    }
+                    warn!(
+                        table = %table_ident,
+                        op,
+                        "the table moved after a rewrite commit with an unknown outcome; not retrying"
+                    );
+                    return Err(failed(&error));
+                }
+                info!(
+                    table = %table_ident,
+                    op,
+                    "the table did not move after a rewrite commit with an unknown outcome; retrying it"
+                );
+                drop(held);
+                // Stays set: a later conflict must not rebuild on a moved
+                // table either. Its files are gone, so no guard.
+                unknown = Some((base, error, None));
+            }
+            let table = loaded.map_err(|e| {
                 SqeError::Catalog(format!("Failed to load table {table_ident}: {e}"))
             })?;
+            let base = table.metadata_location().map(str::to_string);
             let Some(RewriteAttempt {
                 add,
                 remove,
@@ -1139,6 +1177,26 @@ impl WriteHandler {
                     }
                     return Ok(Some(value));
                 }
+                Err(e) if crate::commit::is_unknown_outcome(&e) && attempt < COW_MAX_ATTEMPTS => {
+                    warn!(
+                        table = %table_ident,
+                        op,
+                        attempt,
+                        error = %e,
+                        "rewrite commit outcome unknown; reloading the table to see whether it applied"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        crate::commit::UNKNOWN_OUTCOME_SETTLE_MS,
+                    ))
+                    .await;
+                    // A second unknown outcome keeps the first one's base and
+                    // error: the retry was built on the same location.
+                    unknown = Some(match unknown {
+                        Some((first_base, first_error, _)) => (first_base, first_error, cleanup),
+                        None => (base, e, cleanup),
+                    });
+                    attempt += 1;
+                }
                 Err(e)
                     if (e.retryable() || is_conflict_message(&e.to_string()))
                         && attempt < COW_MAX_ATTEMPTS =>
@@ -1153,7 +1211,7 @@ impl WriteHandler {
                             .with_label_values(&[op])
                             .inc();
                     }
-                    let sleep_ms = crate::commit::conflict_backoff_ms(attempt);
+                    let sleep_ms = crate::commit::commit_backoff_ms(attempt, &e);
                     warn!(
                         table = %table_ident,
                         op,
@@ -1166,9 +1224,15 @@ impl WriteHandler {
                     attempt += 1;
                 }
                 Err(e) => {
-                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                        "Failed to commit {stmt_label}: {e}"
-                    )));
+                    if crate::commit::is_unknown_outcome(&e) {
+                        // The commit may have landed: its files stay.
+                        if let Some(guard) = &cleanup {
+                            guard.mark_committed();
+                        }
+                    }
+                    // An earlier unknown outcome is the error to report.
+                    let error = unknown.map_or(e, |(_, first, _)| first);
+                    return Err(failed(&error));
                 }
             }
         }
@@ -1293,9 +1357,44 @@ pub trait CatalogDiscovery: Send + Sync {
         table_cache: Option<&TableMetadataCache>,
     ) -> Option<Arc<SessionCatalog>>;
 
+    /// Build the session catalog of the `[catalogs.<name>]` entry, from that
+    /// entry's own endpoint, warehouse, auth and storage, as SELECT does.
+    /// `None` when it does not build for this session.
+    async fn configured_session_catalog(
+        &self,
+        name: &str,
+        config: &SqeConfig,
+        session: &Session,
+        table_cache: Option<&TableMetadataCache>,
+    ) -> Option<Arc<SessionCatalog>> {
+        let _ = (name, config, session, table_cache);
+        None
+    }
+
     /// Drop every cached session context of `username` after a commit so the
     /// next query sees the new schema state.
     async fn invalidate_session_cache(&self, username: &str);
+}
+
+/// The `[catalogs.<name>]` entry a write target resolves to, when that entry is
+/// not the legacy `[catalog]` block. `target` is the statement's catalog
+/// qualifier (or the session default, see [`resolve_target_catalog`]); `None`
+/// in a config made only of `[catalogs.*]` blocks means the default catalog,
+/// because the legacy block is then a dropped placeholder. `None` back means
+/// "the legacy block or Polaris discovery", the behaviour before named
+/// catalogs took writes.
+pub(crate) fn configured_write_target(config: &SqeConfig, target: Option<&str>) -> Option<String> {
+    let flattened = config.flattened_catalogs();
+    let is_legacy = |c: &sqe_core::config::CatalogConfig| std::ptr::eq(c, &config.catalog);
+    let name = match target {
+        Some(t) => t.to_string(),
+        None if flattened.iter().any(|(_, c)| is_legacy(c)) => return None,
+        None => config.resolve_default_catalog(),
+    };
+    flattened
+        .iter()
+        .find(|(n, c)| *n == name && !is_legacy(c))
+        .map(|(n, _)| n.clone())
 }
 
 /// The one thing `after_commit` needs from a catalog, extracted as a trait so
@@ -1434,6 +1533,49 @@ async fn unique_table_location(
     let ns = catalog.get_namespace(namespace).await.ok()?;
     let base = ns.properties().get("location")?.trim_end_matches('/');
     Some(format!("{base}/{table_name}-{}", Uuid::new_v4()))
+}
+
+/// Create a table at the location [`unique_table_location`] chose, or at the
+/// catalog's own location when the catalog refuses explicit ones.
+///
+/// Snowflake Horizon answers a create that carries a `location` with HTTP 400
+/// "Creating a table with an explicit location is not allowed": it places
+/// every table itself. The refused request created nothing, so the same
+/// creation is sent again without the location.
+async fn create_table_at_location(
+    catalog: &dyn Catalog,
+    namespace: &NamespaceIdent,
+    creation: TableCreation,
+) -> iceberg::Result<iceberg::table::Table> {
+    if creation.location.is_none() {
+        return catalog.create_table(namespace, creation).await;
+    }
+    let without_location = TableCreation {
+        name: creation.name.clone(),
+        location: None,
+        schema: creation.schema.clone(),
+        partition_spec: creation.partition_spec.clone(),
+        sort_order: creation.sort_order.clone(),
+        properties: creation.properties.clone(),
+        format_version: creation.format_version,
+    };
+    match catalog.create_table(namespace, creation).await {
+        Err(e) if refuses_explicit_location(&e) => {
+            info!(
+                namespace = %namespace,
+                table = %without_location.name,
+                "catalog places tables itself; creating without a location"
+            );
+            catalog.create_table(namespace, without_location).await
+        }
+        other => other,
+    }
+}
+
+/// True for a catalog's refusal of a client-chosen table location.
+fn refuses_explicit_location(e: &iceberg::Error) -> bool {
+    let msg = e.to_string().to_ascii_lowercase();
+    msg.contains("explicit location") && msg.contains("not allowed")
 }
 
 /// Handles write operations: CTAS (CREATE TABLE AS SELECT) and INSERT INTO SELECT.
@@ -1922,6 +2064,7 @@ impl WriteHandler {
             catalog,
             table_ident,
             &committed,
+            committed.file_io(),
             op,
             sketches,
             self.metrics.as_deref(),
@@ -2170,8 +2313,7 @@ impl WriteHandler {
             .properties(props)
             .build();
 
-        let _created_table = catalog
-            .create_table(&namespace, table_creation)
+        let _created_table = create_table_at_location(catalog.as_ref(), &namespace, table_creation)
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to create table: {e}")))?;
 
@@ -2227,8 +2369,12 @@ impl WriteHandler {
                     },
                 )
                 .await
+                .inspect_err(|e| cleanup_guard.keep_if_outcome_unknown(e))
                 .map_err(|e| {
-                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to commit CTAS transaction: {e}"))
+                    SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!("Failed to commit CTAS transaction: {e}"),
+                    )
                 })?;
                 snapshot_id = committed.metadata().current_snapshot_id();
                 cleanup_guard.mark_committed();
@@ -2402,8 +2548,9 @@ impl WriteHandler {
             .await;
 
         // On failure the guard's Drop deletes the parquet files this statement
-        // wrote; the table keeps the contents it had.
-        committed?;
+        // wrote; the table keeps the contents it had. Unless the outcome is
+        // unknown: the swap may have landed, so the files stay.
+        committed.inspect_err(|e| cleanup_guard.keep_if_outcome_unknown(e))?;
         cleanup_guard.mark_committed();
 
         if let Some(sketches) = finish_puffin_sketches(sketch_acc) {
@@ -2495,6 +2642,10 @@ impl WriteHandler {
             .load_table(&table_ident)
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
+        // A caller who may not write is refused here, before any file (#880).
+        session_catalog
+            .check_write_access(&table_ident, &table)
+            .await?;
         if overwrite {
             self.refuse_replace_under_policy(
                 session,
@@ -2516,9 +2667,22 @@ impl WriteHandler {
             )?
         };
 
-        let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, &effective_sql)
-            .await
-            .map_err(SqeError::planning)?;
+        // The source is planned on its own, so a bound placeholder written
+        // straight into a column (`VALUES (?, ?)`) has no type until it
+        // meets the table; give it the column's, so a wrong value is refused
+        // at binding instead of failing in the write's cast, whose error
+        // quotes it. `effective_sql` yields the table's columns in order.
+        let target_types: Vec<_> = build_arrow_schema_for_table(&table)?
+            .fields()
+            .iter()
+            .map(|f| f.data_type().clone())
+            .collect();
+        let df = sqe_catalog::txn::with_insert_target(
+            target_types,
+            sqe_catalog::file_tvf_prepare::plan_sql(ctx, &effective_sql),
+        )
+        .await
+        .map_err(SqeError::planning)?;
 
         // 505: fail a mis-shaped INSERT here, at planning time, before the
         // stream starts and before the writer opens its first parquet part.
@@ -2619,7 +2783,8 @@ impl WriteHandler {
                 data_files,
                 overwrite,
             )
-            .await?;
+            .await
+            .inspect_err(|e| cleanup_guard.keep_if_outcome_unknown(e))?;
         cleanup_guard.mark_committed();
         record_lineage_snapshot(plan_out, snapshot_id);
 
@@ -2795,8 +2960,7 @@ impl WriteHandler {
             .partition_spec_opt(partition_spec)
             .build();
 
-        catalog
-            .create_table(&namespace, table_creation)
+        create_table_at_location(catalog.as_ref(), &namespace, table_creation)
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to create table: {e}")))?;
 
@@ -2900,8 +3064,7 @@ impl WriteHandler {
             .properties(props)
             .build();
 
-        catalog
-            .create_table(&namespace, table_creation)
+        create_table_at_location(catalog.as_ref(), &namespace, table_creation)
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to create table: {e}")))?;
 
@@ -2967,6 +3130,10 @@ impl WriteHandler {
             .load_table(&table_ident)
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
+        // A caller who may not write is refused here, before any file (#880).
+        session_catalog
+            .check_write_access(&table_ident, &table)
+            .await?;
 
         // The streaming sink re-stamps every batch onto the table schema, so the
         // adapter's declared schema is only the stream contract, not the write
@@ -3043,8 +3210,12 @@ impl WriteHandler {
                 },
             )
             .await
+            .inspect_err(|e| cleanup_guard.keep_if_outcome_unknown(e))
             .map_err(|e| {
-                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to commit ingest transaction: {e}"))
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Failed to commit ingest transaction: {e}"),
+                )
             })?;
             cleanup_guard.mark_committed();
 
@@ -3097,6 +3268,8 @@ impl WriteHandler {
         };
 
         let table = catalog.load_table(&table_ident).await?;
+        // A caller who may not write is refused here, before any file (#880).
+        catalog.check_write_access(&table_ident, &table).await?;
 
         let where_clause = &delete.selection;
         // Snapshot-independent setup (schema + policy predicates) runs once;
@@ -3313,6 +3486,8 @@ impl WriteHandler {
         };
 
         let table = catalog.load_table(&table_ident).await?;
+        // A caller who may not write is refused here, before any file (#880).
+        catalog.check_write_access(&table_ident, &table).await?;
 
         let old_data_files = self.collect_data_files(&table).await?;
 
@@ -3686,6 +3861,8 @@ impl WriteHandler {
             }
         };
         let table = catalog.load_table(&table_ident).await?;
+        // A caller who may not write is refused here, before any file (#880).
+        catalog.check_write_access(&table_ident, &table).await?;
 
         // Equality deletes require declared identifier-field-ids (primary key).
         let identifier_field_ids: Vec<i32> = table
@@ -4011,6 +4188,8 @@ impl WriteHandler {
         };
 
         let table = catalog.load_table(&table_ident).await?;
+        // A caller who may not write is refused here, before any file (#880).
+        catalog.check_write_access(&table_ident, &table).await?;
 
         // Snapshot-independent setup runs once. Schema, policy predicates, and
         // lifted IN-subqueries do not depend on the data snapshot, so they are
@@ -4337,6 +4516,8 @@ impl WriteHandler {
             }
         };
         let table = catalog.load_table(&table_ident).await?;
+        // A caller who may not write is refused here, before any file (#880).
+        catalog.check_write_access(&table_ident, &table).await?;
 
         // MoR UPDATE requires declared identifier-field-ids (primary key)
         // so we can emit an equality delete for the old row. Without a PK
@@ -4552,6 +4733,7 @@ impl WriteHandler {
             },
         )
         .await
+        .inspect_err(|e| cleanup_guard.keep_if_outcome_unknown(e))
         .map_err(|e| {
             let msg = e.to_string().to_lowercase();
             if msg.contains("stale snapshot") || msg.contains("rowdelta conflict") {
@@ -4660,6 +4842,8 @@ impl WriteHandler {
         // commit conflict the whole merge re-runs against the reloaded
         // snapshot, because rewritten files are snapshot-specific (506).
         let table = catalog.load_table(&table_ident).await?;
+        // A caller who may not write is refused here, before any file (#880).
+        catalog.check_write_access(&table_ident, &table).await?;
 
         // Column names for the merge SQL come from the table's current schema.
         // The per-attempt target relation derives its own Arrow schema from the
@@ -5529,6 +5713,8 @@ impl WriteHandler {
         let on_sql = format!("{on_expr}");
 
         let table = catalog.load_table(&table_ident).await?;
+        // A caller who may not write is refused here, before any file (#880).
+        catalog.check_write_access(&table_ident, &table).await?;
         let identifier_field_ids: Vec<i32> = table
             .metadata()
             .current_schema()
@@ -6070,6 +6256,7 @@ impl WriteHandler {
             },
         )
         .await
+        .inspect_err(|e| cleanup_guard.keep_if_outcome_unknown(e))
         .map_err(|e| {
             let msg = e.to_string().to_lowercase();
             if msg.contains("stale snapshot") || msg.contains("rowdelta conflict") {
@@ -7438,8 +7625,30 @@ impl WriteHandler {
         session: &Session,
         target_warehouse: Option<&str>,
     ) -> sqe_core::Result<Arc<SessionCatalog>> {
-        let session_catalog = match target_warehouse {
-            Some(warehouse)
+        let configured = match (
+            configured_write_target(&self.config, target_warehouse),
+            &self.catalog_discovery,
+        ) {
+            (Some(name), Some(discovery)) => Some(
+                discovery
+                    .configured_session_catalog(
+                        &name,
+                        &self.config,
+                        session,
+                        self.table_cache.as_ref(),
+                    )
+                    .await
+                    .ok_or_else(|| {
+                        SqeError::Catalog(format!(
+                            "Catalog '{name}' did not build for this session"
+                        ))
+                    })?,
+            ),
+            _ => None,
+        };
+        let session_catalog = match (configured, target_warehouse) {
+            (Some(session_catalog), _) => session_catalog,
+            (None, Some(warehouse))
                 if warehouse != self.config.catalog.warehouse
                     && self.config.query.catalog_discovery
                         == sqe_core::config::CatalogDiscovery::PolarisAuto =>
@@ -9638,6 +9847,70 @@ mod tests {
         assert_eq!(
             resolve_target_catalog(Some("other_wh".to_string()), &session),
             Some("other_wh".to_string())
+        );
+    }
+
+    /// Horizon's refusal of a client-chosen location triggers the retry
+    /// without one; every other create failure is returned as it came.
+    #[test]
+    fn only_a_refused_location_retries_the_create() {
+        let refused = iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            "Creating a table with an explicit location is not allowed  \
+             [BadRequestException, HTTP 400]",
+        );
+        assert!(refuses_explicit_location(&refused));
+        for other in [
+            "Table already exists",
+            "location overlaps with another table",
+            "Forbidden: not allowed",
+        ] {
+            let e = iceberg::Error::new(iceberg::ErrorKind::Unexpected, other);
+            assert!(!refuses_explicit_location(&e), "{other}");
+        }
+    }
+
+    /// A write to a `[catalogs.<name>]` entry is built from that entry, not
+    /// from the legacy `[catalog]` block: before, CREATE / INSERT / DML on
+    /// `sf.schema.t` in a config of only `[catalogs.sf]` went to the legacy
+    /// block's placeholder URL while SELECT read the right catalog.
+    #[test]
+    fn a_write_to_a_named_catalog_uses_that_catalog() {
+        let legacy_only = write_test_config();
+        assert_eq!(configured_write_target(&legacy_only, None), None);
+        assert_eq!(configured_write_target(&legacy_only, Some("iceberg")), None);
+        assert_eq!(configured_write_target(&legacy_only, Some("test_wh")), None);
+
+        let mut named = write_test_config();
+        let mut sf = named.catalog.clone();
+        sf.catalog_url = "https://horizon.example/polaris/api/catalog".to_string();
+        sf.warehouse = "SQE_INTEROP".to_string();
+        named.catalogs.insert("sf".to_string(), sf.clone());
+        named.catalogs.insert("other".to_string(), sf);
+        assert_eq!(
+            configured_write_target(&named, Some("sf")).as_deref(),
+            Some("sf")
+        );
+        assert_eq!(
+            configured_write_target(&named, Some("other")).as_deref(),
+            Some("other")
+        );
+        // Unqualified: the legacy block is a dropped placeholder, so the
+        // default catalog (first by name) takes the write.
+        assert_eq!(
+            configured_write_target(&named, None).as_deref(),
+            Some("other")
+        );
+        // A name no block declares keeps the old path (Polaris discovery).
+        assert_eq!(configured_write_target(&named, Some("ws_team_a")), None);
+
+        // The legacy block named as the default stays on the legacy path.
+        named.query.default_catalog = Some("iceberg".to_string());
+        assert_eq!(configured_write_target(&named, None), None);
+        assert_eq!(configured_write_target(&named, Some("iceberg")), None);
+        assert_eq!(
+            configured_write_target(&named, Some("sf")).as_deref(),
+            Some("sf")
         );
     }
 
@@ -13132,6 +13405,12 @@ s3_path_style = true
         commits: std::sync::Mutex<usize>,
         unauthorized_load: Option<usize>,
         loads: std::sync::Mutex<usize>,
+        /// The first `unknown_commits` commits fail with an unknown outcome.
+        unknown_commits: usize,
+        /// Served by `load_table` once `moved_after` commits were sent: the
+        /// table as it would look if one of them had landed.
+        moved: Option<IcebergTable>,
+        moved_after: usize,
     }
 
     impl FlakyCatalog {
@@ -13142,6 +13421,9 @@ s3_path_style = true
                 commits: std::sync::Mutex::new(0),
                 unauthorized_load: None,
                 loads: std::sync::Mutex::new(0),
+                unknown_commits: 0,
+                moved: None,
+                moved_after: 1,
             }
         }
 
@@ -13165,6 +13447,12 @@ s3_path_style = true
                 )
                 .with_context("status", "401"));
             }
+            drop(n);
+            if self.commit_count() >= self.moved_after {
+                if let Some(moved) = &self.moved {
+                    return Ok(moved.clone());
+                }
+            }
             Ok(self.table.clone())
         }
 
@@ -13174,6 +13462,13 @@ s3_path_style = true
         ) -> iceberg::Result<IcebergTable> {
             let mut n = self.commits.lock().expect("commit counter");
             *n += 1;
+            if *n <= self.unknown_commits {
+                // iceberg-rust's REST catalog text for a 5xx on the commit.
+                return Err(iceberg::Error::new(
+                    iceberg::ErrorKind::Unexpected,
+                    "An unknown server-side problem occurred; the commit state is unknown.",
+                ));
+            }
             if *n <= self.fail_first {
                 Err(iceberg::Error::new(
                     iceberg::ErrorKind::DataInvalid,
@@ -13393,6 +13688,111 @@ s3_path_style = true
             4,
             "two loads per attempt, two attempts"
         );
+    }
+
+    fn table_at(table: &IcebergTable, metadata_location: &str) -> IcebergTable {
+        IcebergTable::builder()
+            .runtime(iceberg::Runtime::current())
+            .metadata(table.metadata_ref())
+            .metadata_location(metadata_location)
+            .identifier(table.identifier().clone())
+            .file_io(table.file_io().clone())
+            .build()
+            .expect("test table")
+    }
+
+    async fn append_once(catalog: &FlakyCatalog) -> iceberg::Result<IcebergTable> {
+        let ident = TableIdent::from_strs(["ns", "tbl"]).unwrap();
+        let files = vec![test_data_file(
+            "s3://bucket/insert.parquet",
+            0,
+            iceberg::spec::Struct::empty(),
+        )];
+        commit_with_retry(catalog, &ident, "unit-test", |fresh| {
+            let files = files.clone();
+            async move {
+                let tx = Transaction::new(&fresh);
+                let tx = tx.fast_append().add_data_files(files).apply(tx)?;
+                tx.commit(catalog).await
+            }
+        })
+        .await
+    }
+
+    /// Snowflake Horizon answers a commit sent right after the previous one
+    /// with a 500 that applied nothing. The table still sits at the location
+    /// the attempt was built on, so the commit is sent again.
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_outcome_on_an_unmoved_table_is_retried() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table = table_at(
+            &local_table(&dir, UNPARTITIONED_META),
+            "mem://t/v1.metadata.json",
+        );
+        let catalog = FlakyCatalog {
+            unknown_commits: 1,
+            ..FlakyCatalog::new(table, 0)
+        };
+
+        append_once(&catalog)
+            .await
+            .expect("the unknown outcome is retried");
+        assert_eq!(catalog.commit_count(), 2);
+    }
+
+    /// The table moved after the unknown outcome: the commit may have landed,
+    /// so it is not sent again and the caller gets the unknown-state error
+    /// (and keeps its data files).
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_outcome_on_a_moved_table_is_returned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = local_table(&dir, UNPARTITIONED_META);
+        let catalog = FlakyCatalog {
+            unknown_commits: 1,
+            moved: Some(table_at(&base, "mem://t/v2.metadata.json")),
+            ..FlakyCatalog::new(table_at(&base, "mem://t/v1.metadata.json"), 0)
+        };
+
+        let err = append_once(&catalog).await.expect_err("not retried");
+        assert!(crate::commit::is_unknown_outcome(&err), "err: {err}");
+        assert_eq!(catalog.commit_count(), 1, "sent once");
+    }
+
+    /// Once an attempt's outcome was unknown, a later conflict must not
+    /// rebuild on a moved table either: the move may be that first commit.
+    #[tokio::test(start_paused = true)]
+    async fn after_an_unknown_outcome_a_conflict_on_a_moved_table_stops() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = local_table(&dir, UNPARTITIONED_META);
+        // Commit 1: unknown, table unmoved on reload (moved only serves after
+        // commit 2). Commit 2: conflict. Reload: moved -> stop.
+        let catalog = FlakyCatalog {
+            unknown_commits: 1,
+            moved: Some(table_at(&base, "mem://t/v2.metadata.json")),
+            moved_after: 2,
+            ..FlakyCatalog::new(table_at(&base, "mem://t/v1.metadata.json"), 2)
+        };
+
+        let err = append_once(&catalog)
+            .await
+            .expect_err("stops on the moved table");
+        assert!(crate::commit::is_unknown_outcome(&err), "err: {err}");
+        assert_eq!(catalog.commit_count(), 2);
+    }
+
+    /// A table without a metadata location cannot be checked, so an unknown
+    /// outcome on it is never retried.
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_outcome_without_a_location_is_returned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let catalog = FlakyCatalog {
+            unknown_commits: 1,
+            ..FlakyCatalog::new(local_table(&dir, UNPARTITIONED_META), 0)
+        };
+
+        let err = append_once(&catalog).await.expect_err("not retried");
+        assert!(crate::commit::is_unknown_outcome(&err), "err: {err}");
+        assert_eq!(catalog.commit_count(), 1);
     }
 
     /// 502: an old-spec file is partitioned by `country`, not by `region`, so

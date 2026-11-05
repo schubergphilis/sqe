@@ -31,6 +31,13 @@
 //     emitted by `shared_bounds.rs`.
 //   - `InListExpr(col, [literals])`: membership filter for join keys.
 //   - `BinaryExpr` of the above ANDed together.
+//   - `col IS [NOT] NULL`, so a TopK bound with nulls first
+//     (`col IS NULL OR col > t`, the default for DESC) converts (#787).
+//
+// Float range comparisons never convert: Parquet leaves NaN out of
+// min/max, while DataFusion's total order puts NaN above (and -NaN
+// below) every number. A row group whose max is below a TopK or join
+// bound can still hold rows the bound keeps.
 //
 // Anything outside this vocabulary returns `None`, and the reader
 // falls back to its static predicate.
@@ -39,7 +46,8 @@ use std::sync::Arc;
 
 use datafusion::arrow::datatypes::DataType;
 use datafusion::physical_expr::expressions::{
-    BinaryExpr, CaseExpr, Column, DynamicFilterPhysicalExpr, InListExpr, Literal,
+    BinaryExpr, CaseExpr, Column, DynamicFilterPhysicalExpr, InListExpr, IsNotNullExpr, IsNullExpr,
+    Literal,
 };
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::scalar::ScalarValue;
@@ -167,6 +175,15 @@ fn convert_physical(expr: &Arc<dyn PhysicalExpr>, max_set_values: usize) -> Opti
     //    sets into one `Predicate::Set` per column (sqe#369).
     if let Some(case) = any.downcast_ref::<CaseExpr>() {
         return convert_case(case, max_set_values);
+    }
+
+    // 5. Null tests: the nulls-first arm of a TopK bound. Parquet null
+    //    counts are exact, so row-group pruning on them is sound (#787).
+    if let Some(is_null) = any.downcast_ref::<IsNullExpr>() {
+        return Some(Reference::new(extract_column(is_null.arg())?).is_null());
+    }
+    if let Some(not_null) = any.downcast_ref::<IsNotNullExpr>() {
+        return Some(Reference::new(extract_column(not_null.arg())?).is_not_null());
     }
 
     None
@@ -428,6 +445,18 @@ fn convert_comparison(
         },
     };
 
+    // Parquet min/max skip NaN, and DataFusion orders NaN above every
+    // number (-NaN below), so stats pruning on a float range bound could
+    // drop NaN rows the bound keeps. Equality never matches NaN; it stays.
+    let float = matches!(literal, ScalarValue::Float32(_) | ScalarValue::Float64(_));
+    let range = matches!(
+        op,
+        Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+    );
+    if float && range {
+        return None;
+    }
+
     let datum = scalar_to_datum(&literal)?;
     let reference = Reference::new(col_name);
     Some(match op {
@@ -679,3 +708,52 @@ fn scalar_to_datum(scalar: &ScalarValue) -> Option<Datum> {
 /// coverage of `scalar_to_datum`'s match arms.
 #[allow(dead_code)]
 fn _ensure_data_type_import_used(_dt: DataType) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::expressions::{lit, IsNullExpr};
+
+    fn x() -> Arc<dyn PhysicalExpr> {
+        Arc::new(Column::new("x", 0))
+    }
+
+    fn cmp(op: Operator, value: ScalarValue) -> Arc<dyn PhysicalExpr> {
+        Arc::new(BinaryExpr::new(x(), op, lit(value)))
+    }
+
+    /// The default DESC TopK bound: `x IS NULL OR x > t`.
+    fn nulls_first_bound(value: ScalarValue) -> Arc<dyn PhysicalExpr> {
+        let is_null: Arc<dyn PhysicalExpr> = Arc::new(IsNullExpr::new(x()));
+        let above = cmp(Operator::Gt, value);
+        Arc::new(BinaryExpr::new(is_null, Operator::Or, above))
+    }
+
+    fn convert(expr: Arc<dyn PhysicalExpr>) -> Option<Predicate> {
+        convert_physical_filters_to_predicate(&[expr])
+    }
+
+    /// #787: the nulls-first arm used to make the whole OR unconvertible,
+    /// so a DESC TopK pruned nothing.
+    #[test]
+    fn nulls_first_topk_bound_converts_on_an_integer_key() {
+        let p = convert(nulls_first_bound(ScalarValue::Int64(Some(5)))).unwrap();
+        assert_eq!(p.to_string(), "(x IS NULL) OR (x > 5)");
+        assert!(convert(cmp(Operator::Lt, ScalarValue::Int64(Some(1)))).is_some());
+    }
+
+    /// Parquet min/max leave NaN out, and DataFusion sorts NaN above every
+    /// number: a float range bound could prune a row group holding NaN rows
+    /// the bound keeps.
+    #[test]
+    fn float_range_bounds_never_convert() {
+        assert!(convert(nulls_first_bound(ScalarValue::Float64(Some(5.0)))).is_none());
+        for op in [Operator::Lt, Operator::LtEq, Operator::Gt, Operator::GtEq] {
+            let double = convert(cmp(op, ScalarValue::Float64(Some(1.0))));
+            let float = convert(cmp(op, ScalarValue::Float32(Some(1.0))));
+            assert!(double.is_none() && float.is_none(), "{op}");
+        }
+        assert!(convert(cmp(Operator::Eq, ScalarValue::Float64(Some(1.0)))).is_some());
+    }
+}

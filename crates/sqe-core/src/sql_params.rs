@@ -251,6 +251,138 @@ fn type_case_branches(e: Expr, schema: &DFSchema) -> datafusion::common::Result<
     })
 }
 
+/// Give the bare placeholders an INSERT source writes straight into the
+/// target's columns those columns' types.
+///
+/// DataFusion types a placeholder from the expression around it, and in
+/// `VALUES (?, ?)` or `SELECT ?, ?` there is none: the INSERT source is
+/// planned on its own, before it meets the table. An untyped placeholder
+/// takes the bound value's type, and a string bound to an INTEGER column
+/// then failed in the write's cast, whose error quotes the value. Typing it
+/// from the column makes [`bind_params`] check the value before the plan
+/// runs, as it does for `UPDATE ... SET c = ?`.
+///
+/// `target` holds the column types of the source's output, position by
+/// position. The walk goes down through projections and aliases that pass
+/// a column through unchanged (the reorder an explicit column list adds),
+/// following each column to its input position, and types placeholders in
+/// the `VALUES` or the input-less `SELECT` it reaches. Placeholders inside
+/// expressions, and sources of any other shape, are left to DataFusion's
+/// own inference.
+pub fn type_insert_placeholders(
+    plan: LogicalPlan,
+    target: &[DataType],
+) -> datafusion::common::Result<LogicalPlan> {
+    let want: Vec<Option<DataType>> = target.iter().cloned().map(Some).collect();
+    type_feeding(plan, &want).map(|t| t.data)
+}
+
+fn type_feeding(
+    plan: LogicalPlan,
+    want: &[Option<DataType>],
+) -> datafusion::common::Result<Transformed<LogicalPlan>> {
+    use datafusion::logical_expr::{LogicalPlanBuilder, Projection, SubqueryAlias};
+
+    if plan.schema().fields().len() != want.len() {
+        return Ok(Transformed::no(plan));
+    }
+    match plan {
+        LogicalPlan::Values(mut values) => {
+            let mut typed = false;
+            for row in values.values.iter_mut() {
+                for (e, w) in row.iter_mut().zip(want) {
+                    if let Some(t) = w {
+                        typed |= type_placeholder(e, t);
+                    }
+                }
+            }
+            if !typed {
+                return Ok(Transformed::no(LogicalPlan::Values(values)));
+            }
+            LogicalPlanBuilder::values(values.values)?
+                .build()
+                .map(Transformed::yes)
+        }
+        LogicalPlan::Projection(mut p)
+            if matches!(p.input.as_ref(), LogicalPlan::EmptyRelation(_)) =>
+        {
+            let mut typed = false;
+            for (e, w) in p.expr.iter_mut().zip(want) {
+                if let Some(t) = w {
+                    typed |= type_placeholder(e, t);
+                }
+            }
+            if !typed {
+                return Ok(Transformed::no(LogicalPlan::Projection(p)));
+            }
+            Projection::try_new(p.expr, p.input)
+                .map(|p| Transformed::yes(LogicalPlan::Projection(p)))
+        }
+        LogicalPlan::Projection(p) => {
+            let input_schema = p.input.schema();
+            let mut want_in: Vec<Option<DataType>> = vec![None; input_schema.fields().len()];
+            let mut fed = vec![false; want_in.len()];
+            for (e, w) in p.expr.iter().zip(want) {
+                let Expr::Column(c) = unalias(e) else {
+                    continue;
+                };
+                let Some(j) = input_schema.maybe_index_of_column(c) else {
+                    continue;
+                };
+                // A column feeding two targets of different types has no
+                // one type to give.
+                if fed[j] && want_in[j] != *w {
+                    want_in[j] = None;
+                } else if !fed[j] {
+                    want_in[j] = w.clone();
+                }
+                fed[j] = true;
+            }
+            // Rebuilt either way (the input was moved out); the new schema
+            // carries the placeholder types up.
+            let input = type_feeding(Arc::unwrap_or_clone(p.input), &want_in)?;
+            let plan = Projection::try_new(p.expr, Arc::new(input.data))?;
+            Ok(Transformed::new_transformed(
+                LogicalPlan::Projection(plan),
+                input.transformed,
+            ))
+        }
+        LogicalPlan::SubqueryAlias(s) => {
+            let input = type_feeding(Arc::unwrap_or_clone(s.input), want)?;
+            let plan = SubqueryAlias::try_new(Arc::new(input.data), s.alias)?;
+            Ok(Transformed::new_transformed(
+                LogicalPlan::SubqueryAlias(plan),
+                input.transformed,
+            ))
+        }
+        other => Ok(Transformed::no(other)),
+    }
+}
+
+fn unalias(e: &Expr) -> &Expr {
+    match e {
+        Expr::Alias(a) => unalias(&a.expr),
+        e => e,
+    }
+}
+
+/// Type `e` as `t` when it is an untyped placeholder, under any aliases or
+/// the cast `VALUES` adds to line a NULL-typed row up with the others.
+fn type_placeholder(e: &mut Expr, t: &DataType) -> bool {
+    match e {
+        Expr::Placeholder(Placeholder {
+            field: field @ None,
+            ..
+        }) => {
+            *field = Some(Arc::new(Field::new("", t.clone(), true)));
+            true
+        }
+        Expr::Alias(a) => type_placeholder(&mut a.expr, t),
+        Expr::Cast(c) => type_placeholder(&mut c.expr, t),
+        _ => false,
+    }
+}
+
 /// Check one bound value against the placeholder type DataFusion inferred.
 ///
 /// Exact matches pass. Nulls become a typed null. Values in the same type
@@ -505,6 +637,58 @@ mod tests {
         let err = bind_params(p, &[ScalarValue::Utf8(Some("secret-value".into()))]).unwrap_err();
         assert!(err.contains("parameter $1"), "{err}");
         assert!(!err.contains("secret"), "{err}");
+    }
+
+    /// The INSERT source shapes: `VALUES`, an input-less `SELECT`, and the
+    /// alias-and-reorder wrapper an explicit column list adds. Each
+    /// placeholder takes its target column's type, so a string is parsed or
+    /// refused before execution, never quoted by a failing cast.
+    #[tokio::test]
+    async fn insert_source_placeholders_take_the_target_types() {
+        use DataType::{Int32, Utf8};
+        let wrapped = "SELECT b, a FROM (VALUES ($1, $2)) AS __sqe_insert_src(a, b)";
+        let cases: [(&str, &[DataType]); 4] = [
+            ("VALUES ($1, $2)", &[Int32, Utf8]),
+            ("VALUES ($1, $2), (7, $3)", &[Int32, Utf8]),
+            ("SELECT $1, $2", &[Int32, Utf8]),
+            // The wrapper writes the second VALUES column first.
+            (wrapped, &[Utf8, Int32]),
+        ];
+        for (sql, target) in cases {
+            let typed = type_insert_placeholders(plan(sql).await, target).unwrap();
+            let params = [
+                ScalarValue::Utf8(Some("5".into())),
+                ScalarValue::Utf8(Some("x".into())),
+                ScalarValue::Utf8(Some("y".into())),
+            ];
+            let bound = bind_params(typed, &params).unwrap();
+            let shown = bound.display_indent().to_string();
+            assert!(shown.contains("Int32(5)"), "{sql}: {shown}");
+
+            let typed = type_insert_placeholders(plan(sql).await, target).unwrap();
+            let params = [
+                ScalarValue::Utf8(Some("secret-value".into())),
+                ScalarValue::Utf8(Some("x".into())),
+                ScalarValue::Utf8(Some("y".into())),
+            ];
+            let err = bind_params(typed, &params).unwrap_err();
+            assert_eq!(err, "parameter $1: cannot convert Utf8 to Int32", "{sql}");
+        }
+    }
+
+    /// A placeholder inside an expression keeps DataFusion's own inference,
+    /// and a source of another shape is left alone.
+    #[tokio::test]
+    async fn insert_placeholders_leave_expressions_and_other_shapes() {
+        let p = plan("VALUES ($1 + 1)").await;
+        let before = p.get_parameter_types().unwrap();
+        let typed = type_insert_placeholders(p, &[DataType::Int32]).unwrap();
+        assert_eq!(typed.get_parameter_types().unwrap(), before);
+
+        let p = plan("SELECT id FROM t WHERE name = $1").await;
+        let shown = p.display_indent().to_string();
+        let typed = type_insert_placeholders(p, &[DataType::Int32]).unwrap();
+        assert_eq!(typed.display_indent().to_string(), shown);
     }
 
     #[tokio::test]

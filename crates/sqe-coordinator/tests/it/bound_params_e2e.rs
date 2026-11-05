@@ -202,8 +202,90 @@ async fn bound_param_of_the_wrong_type_is_refused_without_echoing_it() {
         assert!(!record.sql.contains(secret), "query log echoes the value");
     }
 
+    // INSERT plans its source on its own, so these placeholders are typed
+    // from the target columns: in table order, and through the reorder an
+    // explicit column list adds (portal request §1).
+    for sql in [
+        format!("INSERT INTO {t} VALUES ($2, 'EU', $1)"),
+        format!("INSERT INTO {t} (value, id) VALUES ($1, $2)"),
+        format!("INSERT INTO {t} SELECT $2, 'EU', $1"),
+    ] {
+        let id = uuid::Uuid::new_v4();
+        let err = handler
+            .execute_bound_with_id(&session, &sql, vec![utf8(secret), int(2)], None, Some(id))
+            .await
+            .expect_err("a string that is not a number does not bind to BIGINT");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("parameter $1"),
+            "{sql}: error names the position: {msg}"
+        );
+        assert!(
+            !msg.contains(secret),
+            "{sql}: error echoes the value: {msg}"
+        );
+        if let Some(record) = handler.query_tracker().get(&id) {
+            let logged = record.error_message.clone().unwrap_or_default();
+            assert!(
+                !logged.contains(secret),
+                "{sql}: query log echoes the value: {logged}"
+            );
+        }
+    }
+
+    // A string that is a number is parsed into the column's type.
+    let sql = format!("INSERT INTO {t} (value, id) VALUES ($1, $2)");
+    bound(&handler, &session, &sql, vec![utf8("42"), int(3)]).await;
+
     assert_eq!(
         rows(&handler, &session, t).await,
-        vec!["1|EU|10".to_string()]
+        vec!["1|EU|10".to_string(), "3|NULL|42".to_string()]
     );
+}
+
+/// A Flight SQL prepared INSERT advertises the target columns' types, so a
+/// driver binds BIGINT as Int64 rather than Utf8 (portal request §1). A
+/// MERGE does not plan through DataFusion and stays untyped. A STRING
+/// column plans as `Utf8View`; `parameter_schema` advertises it as `Utf8`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn prepared_dml_advertises_target_column_types() {
+    use arrow_schema::DataType;
+    let (session, handler) = crate::common::setup_handler().await;
+    let t = "default.bound_param_types";
+    exec(&handler, &session, &format!("DROP TABLE IF EXISTS {t}")).await;
+    let create = format!("CREATE TABLE {t} (id BIGINT, region STRING, value BIGINT)");
+    exec(&handler, &session, &create).await;
+
+    let cases: [(String, Vec<Option<DataType>>); 4] = [
+        (
+            format!("INSERT INTO {t} VALUES ($1, $2, $3)"),
+            vec![
+                Some(DataType::Int64),
+                Some(DataType::Utf8View),
+                Some(DataType::Int64),
+            ],
+        ),
+        (
+            format!("INSERT INTO {t} (value, id) VALUES ($1, $2)"),
+            vec![Some(DataType::Int64), Some(DataType::Int64)],
+        ),
+        (
+            format!("DELETE FROM {t} WHERE region = $1"),
+            vec![Some(DataType::Utf8View)],
+        ),
+        (
+            format!(
+                "MERGE INTO {t} AS t USING {t} AS s ON t.id = s.id \
+                 WHEN MATCHED THEN UPDATE SET value = $1"
+            ),
+            vec![None],
+        ),
+    ];
+    for (sql, want) in cases {
+        let got = handler
+            .dml_parameter_types(&session, &sql, want.len())
+            .await;
+        assert_eq!(got, want, "{sql}");
+    }
 }
