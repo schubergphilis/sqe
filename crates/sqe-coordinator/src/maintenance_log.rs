@@ -602,7 +602,13 @@ pub async fn append_row(
         },
     )
     .await
-    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("maintenance_log: failed to commit append: {e}")))?;
+    .inspect_err(|e| cleanup_guard.keep_if_outcome_unknown(e))
+    .map_err(|e| {
+        SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!("maintenance_log: failed to commit append: {e}"),
+        )
+    })?;
     cleanup_guard.mark_committed();
 
     Ok(())
@@ -1247,9 +1253,12 @@ pub async fn compact_history(
             );
             Ok(HistoryRetentionOutcome::default())
         }
-        Err(e) => Err(SqeError::Execution(format!(
-            "maintenance_log retention: failed to commit rewrite: {e}"
-        ))),
+        Err(e) => {
+            cleanup_guard.keep_if_outcome_unknown(&e);
+            Err(SqeError::Execution(format!(
+                "maintenance_log retention: failed to commit rewrite: {e}"
+            )))
+        }
     }
 }
 
