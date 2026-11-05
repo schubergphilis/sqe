@@ -55,6 +55,25 @@ The harness is in `scripts/interop/snowflake-horizon/`, a Python driver and five
 
 Phase 5 runs once per SQE mode: the embedded CLI, a single coordinator, and a coordinator with one worker. In the last mode every scan goes to the worker.
 
+## What the 40 reads cover
+
+Each read is one line in `compare.tsv`: a name, the SQE query, and the Snowflake query when the two differ. Twenty-seven read tables Snowflake wrote, thirteen read tables SQE wrote.
+
+| Area | Snowflake wrote | SQE wrote | What a match proves |
+|---|---|---|---|
+| Scalar types | 4 | 1 | `TIMESTAMP_LTZ` and `TIMESTAMP_NTZ` filters, `DECIMAL`, `BINARY`, `TIME`, aggregates |
+| Nanosecond timestamps | 1 | | all nine digits survive, compared as epoch nanos |
+| Objects, arrays, maps | 1 | | nested fields by path, Snowflake's 0-based arrays against SQE's 1-based |
+| Partitions | 2 | 2 | partitioned tables, grouped and filtered |
+| V2 and V3 after DML | 5 | 3 | rows after DELETE, UPDATE and MERGE rewrote files written by the other engine |
+| Merge-on-read deletes | 7 | 2 | Snowflake's position deletes and deletion vectors on a million rows, SQE's deletion vector |
+| `VARIANT` | 1 | 1 | the same path into the same document on both sides |
+| `GEOMETRY`, `GEOGRAPHY` | 3 | 2 | WKT, SRID and area |
+| Schema evolution | 3 | 1 | added, renamed, widened and dropped columns, old files read by field id |
+| CTAS | | 1 | a table SQE created from a query |
+
+A match means the same rows with the same values, not the same row count. Timestamps compare as epoch micros, so a time zone slip of one hour fails the read. Snowflake widened a decimal and inserted 4000000000.00 after it; SQE widened an `INT` and inserted five billion. Both values have to survive the other engine's reader. The million-row tables compare a checksum over every id, a range across the deleted ones, and point lookups at the deleted ids and their neighbours. A reader that drops one row too many, or keeps one deleted row, fails all three.
+
 ## Writes
 
 SQE's writes failed before the first row landed, three times over.
@@ -85,9 +104,17 @@ The first run found no delete file in any Snowflake snapshot. Snowflake had run 
 
 It was wrong. The tables were a hundred rows each, and on a table that size Snowflake rewrites the file whatever the setting. With the table property `ICEBERG_MERGE_ON_READ_BEHAVIOR = 'enabled'` and a million rows, the same DELETE writes a position delete file on V2 and a deletion vector on V3. The snapshot summaries say so: `added-position-delete-files` on one, `added-dvs` on the other. A later UPDATE adds a position delete on V2 and replaces the vector on V3.
 
-SQE could not read either table. Every read that crossed a deleted row failed with "cannot skip miniblock of size 512". Snowflake encodes integer columns as `DELTA_BINARY_PACKED` with 512-value miniblocks. Applying a delete means skipping rows, and the parquet crate could not skip into the middle of a miniblock that wide. The small tables never showed it, because a rewritten file has no deletes to skip.
+SQE could not read either table. Every read that crossed a deleted row failed with "cannot skip miniblock of size 512".
 
-The bug was not ours, and it was already fixed. Databricks Photon writes 256-value miniblocks, the same rejection was reported there ([apache/arrow-rs#11018](https://github.com/apache/arrow-rs/issues/11018)), and the fix ([#11021](https://github.com/apache/arrow-rs/pull/11021), backported in [#11754](https://github.com/apache/arrow-rs/pull/11754)) shipped in parquet 59.3.2. SQE was on 59.3.1. It is on 59.3.2 now, with a test that hand-encodes a 512-value page and skips inside it, so a downgrade fails the tests.
+The error came from below SQE. DataFusion reads parquet through the `parquet` crate from Apache Arrow's Rust implementation, and so does SQE. A deletion vector is a bitmap of row positions. SQE turns it into a row selection, and the parquet reader decodes the rows it keeps and skips the rest. Skipping is the fast path: the reader steps over values without materialising them.
+
+Snowflake writes integer columns as `DELTA_BINARY_PACKED`. That encoding packs values in blocks, and each block in miniblocks that share one bit width. The parquet spec lets a writer pick the miniblock size. Parquet-java uses 32 values, and the Rust reader's skip path was tuned for that: it decoded into a small buffer sized for 32 or 64 values, and refused anything else. The source said so in a comment: "no current writers use anything else". Snowflake uses 512.
+
+The small tables never showed it. A rewritten file has no deleted rows, so the reader never skips. Only merge-on-read creates a row selection with holes, and only a million rows made Snowflake write merge-on-read.
+
+The bug was not ours, and it was already fixed. Databricks Photon writes 256-value miniblocks, and the same rejection was reported for those ([apache/arrow-rs#11018](https://github.com/apache/arrow-rs/issues/11018)). The fix ([#11021](https://github.com/apache/arrow-rs/pull/11021), backported in [#11754](https://github.com/apache/arrow-rs/pull/11754)) keeps the small stack buffer and skips a wide miniblock in 64-value chunks. It shipped in parquet 59.3.2. SQE was on 59.3.1. It is on 59.3.2 now, with a test that hand-encodes a page of 512-value miniblocks and skips inside one and across two, so a downgrade fails the tests.
+
+Two commercial engines picked the same corner of the spec, and the open-source reader caught up within one patch release. That is how a shared format is supposed to work. Nobody had to wait for Snowflake or ask Databricks to change a writer.
 
 The harness keeps both tables. Seven reads check them: an aggregate over all million rows, a range across the deleted ids, point lookups at the deleted multiples of 100000 and their neighbours, and a `SELECT *` on V3. All seven match in every mode.
 
@@ -109,3 +136,9 @@ None of these change a value.
 ## Why run it by hand
 
 The run needs a Snowflake account, a user with a key pair, and a role that may create Iceberg tables in one scratch database. None of that belongs in CI. The harness reads the account from environment variables, writes its output with the token, account and storage names redacted, and exits non-zero on any mismatch. Point it at your own account and run it before you trust either engine with the other's tables.
+
+## One copy, three engines
+
+The run ended with 120 compared reads against Snowflake and 81 against Databricks on one build, every one of them a value match. Two commercial data platforms and an open-source engine now write the same tables, change each other's rows, and agree on every value. What they share is the Iceberg spec, a REST catalog protocol and the parquet format. When those three are enough, your data is not in Snowflake or in Databricks or in SQE. It sits in your bucket, and each engine is a reader you can swap.
+
+We are proud of that result. Most of the fixes it took were small, and every one of them makes SQE a better Iceberg citizen, not a better Snowflake client. The writes cope with a catalog that refuses quick commits. The worker reads files by field id whatever their column order. The parquet reader skips any miniblock width the spec allows. Each of those helps the next engine we point SQE at.
