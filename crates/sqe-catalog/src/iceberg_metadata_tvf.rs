@@ -71,7 +71,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use arrow_array::builder::{Int64Builder, StringBuilder};
+use arrow_array::builder::{Int32Builder, Int64Builder, StringBuilder};
 use arrow_array::{ArrayRef, RecordBatch, TimestampMillisecondArray};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
@@ -816,13 +816,33 @@ fn files_schema() -> Arc<Schema> {
         // numbers are bare and strings are quoted (both valid JSON values).
         Field::new("lower_bounds", DataType::Utf8, true),
         Field::new("upper_bounds", DataType::Utf8, true),
+        // Iceberg's content type (data_file field 134), as in Spark's `files`
+        // and Trino's `$files`: 0 data, 1 position deletes (a V3 deletion
+        // vector is a position delete stored in Puffin), 2 equality deletes.
+        // The names below follow those tables. Appended, not first as there,
+        // so positional readers of the older ten columns keep working.
+        Field::new("content", DataType::Int32, false),
+        // Delete files only: the data file a position delete or deletion
+        // vector applies to, where the writer recorded one.
+        Field::new("referenced_data_file", DataType::Utf8, true),
+        // Deletion vectors only: the blob's offset and length in the Puffin file.
+        Field::new("content_offset", DataType::Int64, true),
+        Field::new("content_size_in_bytes", DataType::Int64, true),
+        // Equality deletes only: the field ids the delete matches on, as a
+        // JSON array.
+        Field::new("equality_ids", DataType::Utf8, true),
+        // The partition spec `partition` was written under.
+        Field::new("spec_id", DataType::Int32, false),
     ]))
 }
 
 /// DataFusion TVF: `table_files('namespace', 'table_name')`
 ///
-/// Returns one row per data file in the current snapshot. Column-level
-/// statistics (sizes, value counts) are serialised as JSON strings.
+/// Returns one row per live content file in the current snapshot: data
+/// files, position delete files, deletion vectors and equality delete
+/// files, told apart by `content` (0, 1, 2). `WHERE content = 0` gives the
+/// data files alone. Column-level statistics (sizes, value counts) are
+/// serialised as JSON strings.
 #[derive(Debug)]
 pub struct TableFilesFunction {
     catalogs: CatalogSource,
@@ -975,7 +995,7 @@ async fn build_files_batch(
     schema: &SchemaRef,
     gov: &StatsGovernance,
 ) -> DFResult<RecordBatch> {
-    use iceberg::spec::{DataContentType, ManifestStatus};
+    use iceberg::spec::ManifestStatus;
 
     let metadata = table.metadata();
     let table_schema = metadata.current_schema();
@@ -991,6 +1011,12 @@ async fn build_files_batch(
     let mut partition_b = StringBuilder::new();
     let mut lower_bounds_b = StringBuilder::new();
     let mut upper_bounds_b = StringBuilder::new();
+    let mut content_b = Int32Builder::new();
+    let mut referenced_data_file_b = StringBuilder::new();
+    let mut content_offset_b = Int64Builder::new();
+    let mut content_size_b = Int64Builder::new();
+    let mut equality_ids_b = StringBuilder::new();
+    let mut spec_id_b = Int32Builder::new();
 
     if let Some(snapshot) = metadata.current_snapshot() {
         match table.manifest_list_reader(snapshot).load().await {
@@ -1003,9 +1029,16 @@ async fn build_files_batch(
                                     continue;
                                 }
                                 let df = entry.data_file();
-                                if df.content_type() != DataContentType::Data {
-                                    continue;
-                                }
+
+                                content_b.append_value(df.content_type() as i32);
+                                referenced_data_file_b.append_option(df.referenced_data_file());
+                                content_offset_b.append_option(df.content_offset());
+                                content_size_b.append_option(df.content_size_in_bytes());
+                                equality_ids_b.append_option(df.equality_ids().map(|ids| {
+                                    let ids: Vec<String> = ids.iter().map(i32::to_string).collect();
+                                    format!("[{}]", ids.join(","))
+                                }));
+                                spec_id_b.append_value(df.partition_spec_id());
 
                                 file_path_b.append_value(df.file_path());
                                 file_format_b.append_value(format!("{:?}", df.file_format()));
@@ -1066,6 +1099,12 @@ async fn build_files_batch(
             Arc::new(partition_b.finish()) as ArrayRef,
             Arc::new(lower_bounds_b.finish()) as ArrayRef,
             Arc::new(upper_bounds_b.finish()) as ArrayRef,
+            Arc::new(content_b.finish()) as ArrayRef,
+            Arc::new(referenced_data_file_b.finish()) as ArrayRef,
+            Arc::new(content_offset_b.finish()) as ArrayRef,
+            Arc::new(content_size_b.finish()) as ArrayRef,
+            Arc::new(equality_ids_b.finish()) as ArrayRef,
+            Arc::new(spec_id_b.finish()) as ArrayRef,
         ],
     )?;
 
@@ -1692,8 +1731,50 @@ mod tests {
 
     #[test]
     fn test_record_count_nullable_for_row_filtered_callers() {
-        assert!(files_schema().field_with_name("record_count").unwrap().is_nullable());
-        assert!(partitions_schema().field_with_name("record_count").unwrap().is_nullable());
+        assert!(files_schema()
+            .field_with_name("record_count")
+            .unwrap()
+            .is_nullable());
+        assert!(partitions_schema()
+            .field_with_name("record_count")
+            .unwrap()
+            .is_nullable());
+    }
+
+    #[test]
+    fn test_files_schema_keeps_old_columns_first_and_appends_content() {
+        let schema = files_schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "file_path",
+                "file_format",
+                "record_count",
+                "file_size_in_bytes",
+                "column_sizes",
+                "value_counts",
+                "null_value_counts",
+                "partition",
+                "lower_bounds",
+                "upper_bounds",
+                "content",
+                "referenced_data_file",
+                "content_offset",
+                "content_size_in_bytes",
+                "equality_ids",
+                "spec_id",
+            ]
+        );
+        assert!(!schema.field_with_name("content").unwrap().is_nullable());
+    }
+
+    #[test]
+    fn test_content_values_match_the_iceberg_spec() {
+        use iceberg::spec::DataContentType;
+        assert_eq!(DataContentType::Data as i32, 0);
+        assert_eq!(DataContentType::PositionDeletes as i32, 1);
+        assert_eq!(DataContentType::EqualityDeletes as i32, 2);
     }
 
     // ── summary JSON serialisation ────────────────────────────────────────────

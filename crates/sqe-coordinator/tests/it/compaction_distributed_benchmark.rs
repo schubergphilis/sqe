@@ -109,7 +109,9 @@ async fn max_file_size_bytes(
     let b = exec(
         handler,
         session,
-        &format!("SELECT MAX(file_size_in_bytes) FROM table_files('{ns}', '{name}')"),
+        &format!(
+            "SELECT MAX(file_size_in_bytes) FROM table_files('{ns}', '{name}') WHERE content = 0"
+        ),
     )
     .await;
     b[0].column(0)

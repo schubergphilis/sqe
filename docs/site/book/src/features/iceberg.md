@@ -135,7 +135,6 @@ Known gaps from the same run:
 
 - Snowflake upper-cases unquoted names and SQE folds them to lower case, so quote Snowflake's names: `sf."SALES"."ORDERS"`.
 - Snowflake rewrites small tables copy-on-write whatever the table's merge-on-read setting. Its delete files appear only on large tables with `ICEBERG_MERGE_ON_READ_BEHAVIOR = 'enabled'`; the harness uses 1M rows.
-- `$files` lists data files only. Delete files and deletion vectors show in the `$snapshots` summary.
 - `ST_AREA` on an Iceberg `GEOMETRY` comes back negative in Snowflake, whichever engine wrote the table.
 - An external volume encrypted with a customer KMS key fails: the credentials Horizon vends lack `kms:Decrypt`. Use Snowflake-managed storage.
 - A Horizon access token lives about an hour.
