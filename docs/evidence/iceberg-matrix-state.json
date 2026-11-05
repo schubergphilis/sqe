@@ -322,7 +322,7 @@
     },
     "sqe:snowflake-horizon-catalog:v3": {
       "level": "full",
-      "notes": "Same live run, on V3 tables. SQE reads Snowflake's VARIANT (paths and NULLs), GEOMETRY(4326), GEOGRAPHY and nanosecond timestamps, and the copy-on-write snapshots Snowflake's DELETE and UPDATE produce; Snowflake reads SQE-written V3 tables including VARIANT and GEOMETRY, SQE's deletes and MERGE on them, and a deletion vector from SQE's merge-on-read DELETE, which a later Snowflake DELETE folds into a rewritten file that SQE reads back. Snowflake-written files carry row-lineage columns and a column order of their own; SQE matches by field id on every path, the distributed worker included.",
+      "notes": "Same live run, on V3 tables. SQE reads Snowflake's VARIANT (paths and NULLs), GEOMETRY(4326), GEOGRAPHY and nanosecond timestamps, and the copy-on-write snapshots Snowflake's DELETE and UPDATE produce; Snowflake reads SQE-written V3 tables including VARIANT and GEOMETRY, SQE's deletes and MERGE on them, and a deletion vector from SQE's merge-on-read DELETE (compared value by value in every mode); in a separate probe a Snowflake DELETE on that table also succeeded and SQE read the result. Snowflake-written files carry row-lineage columns and a column order of their own; SQE matches by field id on every path, the distributed worker included.",
       "evidence": "scripts/interop/snowflake-horizon/run.py, scripts/interop/snowflake-horizon/compare.tsv, crates/sqe-catalog/src/iceberg_scan.rs#projection_fill, crates/sqe-worker/src/projection_fill.rs",
       "caveats": [
         "The live run needs a Snowflake account and a key pair; it runs by hand, not in CI.",

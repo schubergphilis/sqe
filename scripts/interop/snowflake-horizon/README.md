@@ -105,7 +105,7 @@ and its own `[metrics] prometheus_port`. Start the worker first.
   reading a Snowflake deletion vector. The other direction is covered:
   `sqe_v3_mor` is merge-on-read, SQE's DELETE on it writes a deletion
   vector (the phase F `$snapshots` probe must show `added-dvs` 1), and
-  Snowflake reads it and later folds it with its own DELETE.
+  phase E checks that Snowflake applies it.
 
 ## Snowflake behaviour SQE handles
 

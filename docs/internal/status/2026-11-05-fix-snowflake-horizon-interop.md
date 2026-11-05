@@ -71,14 +71,15 @@ whichever engine wrote it; Snowflake parquet carries row-lineage columns
 
 Snowflake's DELETE / UPDATE / MERGE were copy-on-write on the harness's small
 tables (no delete files in any snapshot). That is a size effect, not a rule:
-with `ICEBERG_MERGE_ON_READ_BEHAVIOR = 'enabled'` a 4M-row table gets V2
+with `ICEBERG_MERGE_ON_READ_BEHAVIOR = 'enabled'` a 1M-row table gets V2
 position deletes and V3 deletion vectors. Reading those failed in SQE with
 "cannot skip miniblock of size 512", a parquet decoder limit fixed by
 parquet 59.3.2 (!1662). A merge-on-read SQE table (`write.delete.mode`)
 covers the other direction: SQE's DELETE writes a deletion vector, Snowflake
-reads the table correctly, and a later Snowflake DELETE folds the vector into
-a rewritten file that SQE reads back. The harness keeps one such table
-(`sqe_v3_mor`), so the compare is 33/33 in all three modes.
+reads the table correctly. In a separate probe a Snowflake DELETE on that
+table also succeeded and SQE read the result; the harness does not repeat
+that step. The harness keeps one such table (`sqe_v3_mor`), so the compare
+is 33/33 in all three modes.
 
 Regression check on the same build: the Databricks UC harness
 (`scripts/interop/databricks-uc/`, catalog `pg3-bronze`) ran phases A-D with
