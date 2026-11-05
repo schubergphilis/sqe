@@ -37,6 +37,53 @@ case (#337), so Snowflake tables need quoted names. Trino's
 tracing subscriber, so a table skipped at ATTACH (Delta in Unity Catalog, an
 unreadable volume) still disappears without a message.
 
-**NEXT:** live interop harness `scripts/interop/snowflake-horizon/` (both
-directions, DML, value compare in embedded, coordinator and distributed), then
-the matrix `snowflake-horizon-catalog` cells.
+**Update, same day: the full matrix run.** The harness
+(`scripts/interop/snowflake-horizon/`, own MR) ran Snowflake writes + SQE
+reads, SQE writes + Snowflake reads, and DML from both engines on both sides'
+tables. Phases A-D: 0 errors. Value compare: 31/31 in embedded,
+coordinator-only and distributed (one worker, `distribution_threshold = 0`).
+Fixes it took, all in this MR:
+
+- Writes to a `[catalogs.<name>]` target used the legacy `[catalog]`
+  warehouse (`configured_write_target`, `CatalogOps` and the write handler).
+- Horizon refuses an explicit table `location` (400): `create_table_at_location`
+  resends without it.
+- Horizon paces commits: a commit within ~0.5 s of the last gets a 409
+  "concurrently modified" with no failed requirement, or a 500
+  "Indeterminate result during conflict resolution check", neither applied.
+  Schema commits resend unchanged (`rest_catalog.rs`, 4 x 500 ms); data
+  commits back off >= 500 ms on that 409 (`commit_backoff_ms`). An unknown
+  outcome retries only after a 1 s settle + reload shows the metadata
+  location unchanged (`commit_with_retry`, `commit_rewrite_with_retry`);
+  `WriteCleanupGuard::keep_if_outcome_unknown` keeps files on every write
+  and maintenance path.
+- Distributed: a worker without a projection fill labelled batches with the
+  first file's column order. A Snowflake-written file (`ts, id,
+  METADATA$RL_ROW_ID, region, ...`) bound by position. The fill is now sent
+  on every projected scan (`IcebergScanExec::projection_fill`), closing the
+  worker-path gap left by !784.
+
+Snowflake quirks, not SQE bugs: `ST_AREA` on an Iceberg GEOMETRY is negative
+whichever engine wrote it; Snowflake parquet carries row-lineage columns
+(`METADATA$RL_*`, field ids 2147483539/40) in a non-schema order.
+
+Snowflake's DELETE / UPDATE / MERGE are copy-on-write on V2 and V3 (no delete
+files in any snapshot). A merge-on-read SQE table (`write.delete.mode`) covers
+the other direction: SQE's DELETE writes a deletion vector, Snowflake reads
+the table correctly, and a later Snowflake DELETE folds the vector into a
+rewritten file that SQE reads back. The harness keeps one such table
+(`sqe_v3_mor`), so the compare is 33/33 in all three modes.
+
+Regression check on the same build: the Databricks UC harness
+(`scripts/interop/databricks-uc/`, catalog `pg3-bronze`) ran phases A-D with
+0 errors and 27/27 in embedded, coordinator-local and distributed mode.
+Its V3 tables carry Databricks deletion vectors, so the always-sent fill
+works alongside worker-applied deletes. The fill has one cost: a worker older
+than scan ticket V4 now refuses every projected scan, so upgrade workers
+before or together with the coordinator.
+
+Still open: `$files` has no `content` column, so delete files and deletion
+vectors are not listed; the case-folding gap above.
+
+**NEXT:** merge this MR, then the harness MR (matrix cells
+`sqe:snowflake-horizon-catalog:v2/v3` to measured) and the blog post.
