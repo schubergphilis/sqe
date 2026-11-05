@@ -11,6 +11,7 @@ pub mod front_door;
 pub mod grant_policy;
 pub mod hive_ddl;
 pub mod hive_partitions;
+pub mod identifier_case;
 pub mod identifier_fields;
 pub mod merge_star;
 pub mod metadata;

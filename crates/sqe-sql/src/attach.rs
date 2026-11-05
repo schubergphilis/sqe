@@ -155,6 +155,21 @@ impl OptionValue {
     }
 }
 
+/// Read the `IDENTIFIER_CASE` ATTACH option: `'upper'` makes unquoted
+/// identifiers for the attached catalog fold to upper case (Snowflake
+/// Horizon), `'lower'` (the default) keeps SQE's lower-case folding.
+/// Any other value is an error, so a typo never silently picks a fold.
+pub fn identifier_case_is_upper(
+    options: &BTreeMap<String, OptionValue>,
+) -> Result<bool, SqeError> {
+    match options.get("IDENTIFIER_CASE") {
+        None => Ok(false),
+        Some(OptionValue::String(v)) if v.eq_ignore_ascii_case("upper") => Ok(true),
+        Some(OptionValue::String(v)) if v.eq_ignore_ascii_case("lower") => Ok(false),
+        Some(_) => Err(err("IDENTIFIER_CASE must be 'upper' or 'lower'")),
+    }
+}
+
 /// Build a `Secret` payload from a parsed `CREATE SECRET` statement.
 ///
 /// Both the coordinator and the embedded CLI need the same validation rules.
@@ -560,6 +575,21 @@ impl OptionValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identifier_case_option() {
+        let opts = |v: &str| {
+            let sql = format!(
+                "ATTACH 'https://x/api/catalog' AS sf (TYPE iceberg_rest, IDENTIFIER_CASE '{v}')"
+            );
+            try_parse_attach(&sql).unwrap().unwrap().options
+        };
+        assert!(identifier_case_is_upper(&opts("upper")).unwrap());
+        assert!(identifier_case_is_upper(&opts("UPPER")).unwrap());
+        assert!(!identifier_case_is_upper(&opts("lower")).unwrap());
+        assert!(identifier_case_is_upper(&opts("mixed")).is_err());
+        assert!(!identifier_case_is_upper(&BTreeMap::new()).unwrap());
+    }
 
     #[test]
     fn catalog_kind_parses_all_variants() {
