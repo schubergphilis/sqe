@@ -1,5 +1,19 @@
-# No image advisory exceptions. The runtime base contains glibc-2.44 2.44-r8,
-# which fixes the Medium/Low advisories tracked in #800; unfiltered amd64 and
-# arm64 scans of the base report nothing. Keep the High/Critical image gate
-# active.
-ignore: []
+# Ignore rules for the aikido-image-vuln gate (.gitlab-ci.yml runs
+# `grype registry:<image> --fail-on high` from the repo root, and grype reads
+# this file from the working directory). Every entry names the CVE, the exact
+# package and why it is accepted, and carries a `# review-by YYYY-MM-DD
+# owner=<name>` tag that scripts/check-advisory-ignores.py enforces (also in
+# deny.toml and .cargo/audit.toml). Delete the entry when the runtime base
+# ships the fix (Renovate bumps the cgr.dev/chainguard/glibc-dynamic digest).
+ignore:
+  # CVE-2026-84243, glibc 2.44-r13, High. The latest glibc-dynamic digest
+  # (2026-11-06) carries 2.44-r13 and grype reports no fixed version, so no
+  # base can clear it yet; it blocked the v0.53.0 release image together with
+  # the Critical CVE-2026-91403 in ca-certificates-bundle, which this base
+  # fixes. sqe-server is the only process in the image and does not expose the
+  # affected glibc surface to untrusted input beyond what the TLS/HTTP stacks
+  # already parse. See docs/evidence/security/runtime-base-review-2026-11-06.md.
+  - vulnerability: CVE-2026-84243  # review-by 2026-11-20 owner=sqe-maintainers
+    package:
+      name: glibc-2.44
+      version: 2.44-r13
