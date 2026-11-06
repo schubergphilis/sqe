@@ -1,15 +1,19 @@
-# Keep the High/Critical image gate active. Each exception below is scoped to
-# one advisory on one package, only while grype knows no fixed version
-# (fix-state: unknown, which is what Wolfi/Chainguard apk matches report), so
-# it lapses by itself once a fix ships and the state turns `fixed`.
-#
-# CVE-2026-84243 (glibc 2.44, published 2026-10-30): no fixed glibc in
-# Chainguard, Debian, RHEL, SUSE or Ubuntu as of 2026-11-06; the runtime base
-# carries glibc-2.44 2.44-r13. It blocked the v0.53.0 release scan. Review
-# when Chainguard ships a fix: bump the glibc-dynamic digest and delete this.
+# Ignore rules for the aikido-image-vuln gate (.gitlab-ci.yml runs
+# `grype registry:<image> --fail-on high` from the repo root, and grype reads
+# this file from the working directory). Every entry names the CVE, the exact
+# package and why it is accepted, and carries a `# review-by YYYY-MM-DD
+# owner=<name>` tag that scripts/check-advisory-ignores.py enforces (also in
+# deny.toml and .cargo/audit.toml). Delete the entry when the runtime base
+# ships the fix (Renovate bumps the cgr.dev/chainguard/glibc-dynamic digest).
 ignore:
-  - vulnerability: CVE-2026-84243
-    fix-state: unknown
+  # CVE-2026-84243, glibc 2.44-r13, High. The latest glibc-dynamic digest
+  # (2026-11-06) carries 2.44-r13 and grype reports no fixed version, so no
+  # base can clear it yet; it blocked the v0.53.0 release image together with
+  # the Critical CVE-2026-91403 in ca-certificates-bundle, which this base
+  # fixes. sqe-server is the only process in the image and does not expose the
+  # affected glibc surface to untrusted input beyond what the TLS/HTTP stacks
+  # already parse. See docs/evidence/security/runtime-base-review-2026-11-06.md.
+  - vulnerability: CVE-2026-84243  # review-by 2026-11-20 owner=sqe-maintainers
     package:
       name: glibc-2.44
-      type: apk
+      version: 2.44-r13

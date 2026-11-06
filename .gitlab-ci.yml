@@ -237,7 +237,7 @@ aikido-clippy-rust:
 catalog-live-tests:
   extends: aikido-rust-extra
   services:
-    - name: "postgres:17-alpine@sha256:266d3c257594e195b309ae9d1805e54c788f1d7b375f56bf6c367aac6c917e7b"
+    - name: "postgres:17-alpine@sha256:3540c0362c809df084ffac0ae69fe794515f9de92692f02178bcdce0ef0302ac"
       alias: postgres
       variables:
         POSTGRES_USER: iceberg
@@ -293,7 +293,7 @@ catalog-live-tests:
 
 vendored-profile-drift:
   stage: test
-  image: alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+  image: alpine:3.24@sha256:3f4d6b32e26703c6082839234f43769d5046b3ac7c910033911d1e71d8cd630a
   variables:
     GIT_DEPTH: "1"
     DATA_PLATFORM_DIR: "$CI_BUILDS_DIR/data-platform"
