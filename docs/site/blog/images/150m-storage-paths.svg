@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" font-family="Helvetica Neue, Helvetica, Arial, sans-serif">
+<rect width="1200" height="620" fill="#fcfcfb"/>
+<text x="40" y="52" font-size="26" font-weight="600" fill="#0b0b0b">Three ways the same 150M rows reach an engine</text>
+<text x="40" y="82" font-size="16" fill="#52514e">The engines and queries stay the same. The storage path is what the two runs change.</text>
+<text x="40" y="150" font-size="18" font-weight="600" fill="#0b0b0b">Local run</text>
+<text x="40" y="172" font-size="13" fill="#52514e">duckdb, polars, spark,</text>
+<text x="40" y="190" font-size="13" fill="#52514e">sqe-parquet, sqe-iceberg</text>
+<text x="40" y="310" font-size="18" font-weight="600" fill="#0b0b0b">S3 run</text>
+<text x="40" y="332" font-size="13" fill="#52514e">duckdb, polars, spark, sqe-parquet</text>
+<text x="40" y="470" font-size="18" font-weight="600" fill="#0b0b0b">Both runs</text>
+<text x="40" y="492" font-size="13" fill="#52514e">sqe-polaris</text>
+<rect x="300" y="160" width="220" height="70" rx="10" fill="#ffffff" stroke="#c3c2b7" stroke-width="1.5"/>
+<text x="410.0" y="192.0" font-size="16" font-weight="600" fill="#0b0b0b" text-anchor="middle">Parquet on SSD</text>
+<text x="410.0" y="213.0" font-size="13" fill="#52514e" text-anchor="middle">3.1 GB, Snappy, 30 files</text>
+<line x1="520" y1="195" x2="811" y2="195" stroke="#2a78d6" stroke-width="4"/>
+<path d="M820,195 l-11,-6 v12 z" fill="#2a78d6"/>
+<text x="670.0" y="185" font-size="13" fill="#52514e" text-anchor="middle">page cache, GB/s</text>
+<rect x="820" y="160" width="220" height="70" rx="10" fill="#ffffff" stroke="#2a78d6" stroke-width="1.5"/>
+<text x="930.0" y="192.0" font-size="16" font-weight="600" fill="#0b0b0b" text-anchor="middle">Engine process</text>
+<text x="930.0" y="213.0" font-size="13" fill="#52514e" text-anchor="middle">reads, computes, writes</text>
+<rect x="300" y="320" width="220" height="70" rx="10" fill="#ffffff" stroke="#c3c2b7" stroke-width="1.5"/>
+<text x="410.0" y="352.0" font-size="16" font-weight="600" fill="#0b0b0b" text-anchor="middle">RustFS container</text>
+<text x="410.0" y="373.0" font-size="13" fill="#52514e" text-anchor="middle">same Parquet in a bucket</text>
+<rect x="575" y="332" width="190" height="46" rx="8" fill="#fbe9e9" stroke="#d03b3b" stroke-width="1.5"/>
+<text x="670" y="352" font-size="14" font-weight="600" fill="#d03b3b" text-anchor="middle">port forward</text>
+<text x="670" y="370" font-size="12" fill="#d03b3b" text-anchor="middle">about 220 MB/s</text>
+<line x1="520" y1="355" x2="566" y2="355" stroke="#52514e" stroke-width="2"/>
+<path d="M575,355 l-11,-6 v12 z" fill="#52514e"/>
+<line x1="765" y1="355" x2="811" y2="355" stroke="#52514e" stroke-width="2"/>
+<path d="M820,355 l-11,-6 v12 z" fill="#52514e"/>
+<rect x="820" y="320" width="220" height="70" rx="10" fill="#ffffff" stroke="#2a78d6" stroke-width="1.5"/>
+<text x="930.0" y="352.0" font-size="16" font-weight="600" fill="#0b0b0b" text-anchor="middle">Engine process</text>
+<text x="930.0" y="373.0" font-size="13" fill="#52514e" text-anchor="middle">S3 GETs over HTTP</text>
+<rect x="300" y="430" width="220" height="52" rx="10" fill="#f4f3ef" stroke="#c3c2b7" stroke-width="1.5"/>
+<text x="410.0" y="462.0" font-size="16" font-weight="600" fill="#0b0b0b" text-anchor="middle">Polaris catalog</text>
+<rect x="300" y="492" width="220" height="70" rx="10" fill="#ffffff" stroke="#c3c2b7" stroke-width="1.5"/>
+<text x="410.0" y="524.0" font-size="16" font-weight="600" fill="#0b0b0b" text-anchor="middle">RustFS container</text>
+<text x="410.0" y="545.0" font-size="13" fill="#52514e" text-anchor="middle">Iceberg copy, 2.5 GB, ZSTD</text>
+<rect x="575" y="504" width="190" height="46" rx="8" fill="#fbe9e9" stroke="#d03b3b" stroke-width="1.5"/>
+<text x="670" y="524" font-size="14" font-weight="600" fill="#d03b3b" text-anchor="middle">port forward</text>
+<text x="670" y="542" font-size="12" fill="#d03b3b" text-anchor="middle">about 220 MB/s</text>
+<line x1="520" y1="527" x2="566" y2="527" stroke="#52514e" stroke-width="2"/>
+<path d="M575,527 l-11,-6 v12 z" fill="#52514e"/>
+<line x1="765" y1="527" x2="811" y2="527" stroke="#52514e" stroke-width="2"/>
+<path d="M820,527 l-11,-6 v12 z" fill="#52514e"/>
+<line x1="520" y1="456" x2="900" y2="456" stroke="#52514e" stroke-width="1.5" stroke-dasharray="5 4"/>
+<line x1="900" y1="456" x2="900" y2="483" stroke="#52514e" stroke-width="1.5" stroke-dasharray="5 4"/>
+<text x="700" y="448" font-size="13" fill="#52514e" text-anchor="middle">table metadata, credentials</text>
+<rect x="820" y="492" width="170" height="70" rx="10" fill="#ffffff" stroke="#2a78d6" stroke-width="1.5"/>
+<text x="905.0" y="524.0" font-size="16" font-weight="600" fill="#0b0b0b" text-anchor="middle">sqe-server</text>
+<text x="905.0" y="545.0" font-size="13" fill="#52514e" text-anchor="middle">coordinator</text>
+<line x1="990" y1="527" x2="1051" y2="527" stroke="#52514e" stroke-width="2"/>
+<path d="M1060,527 l-11,-6 v12 z" fill="#52514e"/>
+<text x="1025.0" y="515" font-size="13" fill="#52514e" text-anchor="middle">Flight SQL</text>
+<rect x="1060" y="492" width="110" height="70" rx="10" fill="#ffffff" stroke="#c3c2b7" stroke-width="1.5"/>
+<text x="1115.0" y="524.0" font-size="16" font-weight="600" fill="#0b0b0b" text-anchor="middle">client</text>
+<text x="1115.0" y="545.0" font-size="13" fill="#52514e" text-anchor="middle">writes</text>
+</svg>
