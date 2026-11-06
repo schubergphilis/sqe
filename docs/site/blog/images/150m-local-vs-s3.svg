@@ -1,0 +1,169 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1040" viewBox="0 0 1200 1040" font-family="Helvetica Neue, Helvetica, Arial, sans-serif">
+<rect width="1200" height="1040" fill="#fcfcfb"/>
+<text x="40" y="52" font-size="26" font-weight="600" fill="#0b0b0b">Query time on local disk and on S3, 150M rows</text>
+<text x="40" y="82" font-size="16" fill="#52514e">Median seconds, log scale. Same engines, same files, same 4.5 GiB cap; only the storage path changes.</text>
+<circle cx="47" cy="107" r="6" fill="#fcfcfb" stroke="#6f6d68" stroke-width="2.5"/>
+<text x="60" y="112" font-size="15" fill="#52514e">local disk</text>
+<circle cx="152" cy="107" r="6.5" fill="#6f6d68"/>
+<text x="165" y="112" font-size="15" fill="#52514e">S3 (RustFS in Docker)</text>
+<rect x="340" y="100" width="14" height="14" rx="3" fill="#2a78d6"/>
+<text x="362" y="112" font-size="15" fill="#52514e">SQE</text>
+<rect x="410" y="100" width="14" height="14" rx="3" fill="#6f6d68"/>
+<text x="432" y="112" font-size="15" fill="#52514e">DuckDB, Polars, Spark</text>
+<text x="40" y="160" font-size="18" font-weight="600" fill="#0b0b0b">q1_filter_agg</text>
+<line x1="208.3" y1="174" x2="208.3" y2="324" stroke="#c3c2b7" stroke-width="1"/>
+<line x1="327.4" y1="174" x2="327.4" y2="324" stroke="#e1e0d9" stroke-width="1"/>
+<line x1="446.4" y1="174" x2="446.4" y2="324" stroke="#e1e0d9" stroke-width="1"/>
+<line x1="603.8" y1="174" x2="603.8" y2="324" stroke="#e1e0d9" stroke-width="1"/>
+<line x1="722.9" y1="174" x2="722.9" y2="324" stroke="#e1e0d9" stroke-width="1"/>
+<line x1="841.9" y1="174" x2="841.9" y2="324" stroke="#e1e0d9" stroke-width="1"/>
+<line x1="999.3" y1="174" x2="999.3" y2="324" stroke="#e1e0d9" stroke-width="1"/>
+<text x="160" y="194" font-size="14" fill="#52514e" text-anchor="end">sqe-parquet</text>
+<line x1="250.7" y1="189" x2="716.9" y2="189" stroke="#a9c9ef" stroke-width="4" stroke-linecap="round"/>
+<circle cx="250.7" cy="189" r="6" fill="#fcfcfb" stroke="#2a78d6" stroke-width="2.5"/>
+<circle cx="716.9" cy="189" r="6.5" fill="#2a78d6"/>
+<text x="238.7" y="194" font-size="13" fill="#52514e" text-anchor="end">0.64</text>
+<text x="728.9" y="194" font-size="13" fill="#0b0b0b">9.66</text>
+<text x="160" y="224" font-size="14" fill="#52514e" text-anchor="end">sqe-polaris</text>
+<line x1="682.8" y1="219" x2="701.7" y2="219" stroke="#a9c9ef" stroke-width="4" stroke-linecap="round"/>
+<circle cx="682.8" cy="219" r="6" fill="#fcfcfb" stroke="#2a78d6" stroke-width="2.5"/>
+<circle cx="701.7" cy="219" r="6.5" fill="#2a78d6"/>
+<text x="670.8" y="224" font-size="13" fill="#52514e" text-anchor="end">7.92</text>
+<text x="713.7" y="224" font-size="13" fill="#0b0b0b">8.84</text>
+<text x="160" y="254" font-size="14" fill="#52514e" text-anchor="end">duckdb</text>
+<line x1="278.0" y1="249" x2="715.3" y2="249" stroke="#c9c7c0" stroke-width="4" stroke-linecap="round"/>
+<circle cx="278.0" cy="249" r="6" fill="#fcfcfb" stroke="#6f6d68" stroke-width="2.5"/>
+<circle cx="715.3" cy="249" r="6.5" fill="#6f6d68"/>
+<text x="266.0" y="254" font-size="13" fill="#52514e" text-anchor="end">0.75</text>
+<text x="727.3" y="254" font-size="13" fill="#0b0b0b">9.57</text>
+<text x="160" y="284" font-size="14" fill="#52514e" text-anchor="end">polars</text>
+<line x1="224.7" y1="279" x2="683.7" y2="279" stroke="#c9c7c0" stroke-width="4" stroke-linecap="round"/>
+<circle cx="224.7" cy="279" r="6" fill="#fcfcfb" stroke="#6f6d68" stroke-width="2.5"/>
+<circle cx="683.7" cy="279" r="6.5" fill="#6f6d68"/>
+<text x="212.7" y="284" font-size="13" fill="#52514e" text-anchor="end">0.55</text>
+<text x="695.7" y="284" font-size="13" fill="#0b0b0b">7.96</text>
+<text x="160" y="314" font-size="14" fill="#52514e" text-anchor="end">spark</text>
+<line x1="625.7" y1="309" x2="824.9" y2="309" stroke="#c9c7c0" stroke-width="4" stroke-linecap="round"/>
+<circle cx="625.7" cy="309" r="6" fill="#fcfcfb" stroke="#6f6d68" stroke-width="2.5"/>
+<circle cx="824.9" cy="309" r="6.5" fill="#6f6d68"/>
+<text x="613.7" y="314" font-size="13" fill="#52514e" text-anchor="end">5.68</text>
+<text x="836.9" y="314" font-size="13" fill="#0b0b0b">18.12</text>
+<text x="40" y="370" font-size="18" font-weight="600" fill="#0b0b0b">q2_join_agg</text>
+<line x1="208.3" y1="384" x2="208.3" y2="534" stroke="#c3c2b7" stroke-width="1"/>
+<line x1="327.4" y1="384" x2="327.4" y2="534" stroke="#e1e0d9" stroke-width="1"/>
+<line x1="446.4" y1="384" x2="446.4" y2="534" stroke="#e1e0d9" stroke-width="1"/>
+<line x1="603.8" y1="384" x2="603.8" y2="534" stroke="#e1e0d9" stroke-width="1"/>
+<line x1="722.9" y1="384" x2="722.9" y2="534" stroke="#e1e0d9" stroke-width="1"/>
+<line x1="841.9" y1="384" x2="841.9" y2="534" stroke="#e1e0d9" stroke-width="1"/>
+<line x1="999.3" y1="384" x2="999.3" y2="534" stroke="#e1e0d9" stroke-width="1"/>
+<text x="160" y="404" font-size="14" fill="#52514e" text-anchor="end">sqe-parquet</text>
+<line x1="348.4" y1="399" x2="611.5" y2="399" stroke="#a9c9ef" stroke-width="4" stroke-linecap="round"/>
+<circle cx="348.4" cy="399" r="6" fill="#fcfcfb" stroke="#2a78d6" stroke-width="2.5"/>
+<circle cx="611.5" cy="399" r="6.5" fill="#2a78d6"/>
+<text x="336.4" y="404" font-size="13" fill="#52514e" text-anchor="end">1.13</text>
+<text x="623.5" y="404" font-size="13" fill="#0b0b0b">5.23</text>
+<text x="160" y="434" font-size="14" fill="#52514e" text-anchor="end">sqe-polaris</text>
+<line x1="616.7" y1="429" x2="646.7" y2="429" stroke="#a9c9ef" stroke-width="4" stroke-linecap="round"/>
+<circle cx="616.7" cy="429" r="6" fill="#fcfcfb" stroke="#2a78d6" stroke-width="2.5"/>
+<circle cx="646.7" cy="429" r="6.5" fill="#2a78d6"/>
+<text x="604.7" y="434" font-size="13" fill="#52514e" text-anchor="end">5.39</text>
+<text x="658.7" y="434" font-size="13" fill="#0b0b0b">6.42</text>
+<text x="160" y="464" font-size="14" fill="#52514e" text-anchor="end">duckdb</text>
+<line x1="382.7" y1="459" x2="659.1" y2="459" stroke="#c9c7c0" stroke-width="4" stroke-linecap="round"/>
+<circle cx="382.7" cy="459" r="6" fill="#fcfcfb" stroke="#6f6d68" stroke-width="2.5"/>
+<circle cx="659.1" cy="459" r="6.5" fill="#6f6d68"/>
+<text x="370.7" y="464" font-size="13" fill="#52514e" text-anchor="end">1.38</text>
+<text x="671.1" y="464" font-size="13" fill="#0b0b0b">6.90</text>
+<text x="160" y="494" font-size="14" fill="#52514e" text-anchor="end">polars</text>
+<line x1="388.8" y1="489" x2="615.7" y2="489" stroke="#c9c7c0" stroke-width="4" stroke-linecap="round"/>
+<circle cx="388.8" cy="489" r="6" fill="#fcfcfb" stroke="#6f6d68" stroke-width="2.5"/>
+<circle cx="615.7" cy="489" r="6.5" fill="#6f6d68"/>
+<text x="376.8" y="494" font-size="13" fill="#52514e" text-anchor="end">1.43</text>
+<text x="627.7" y="494" font-size="13" fill="#0b0b0b">5.36</text>
+<text x="160" y="524" font-size="14" fill="#52514e" text-anchor="end">spark</text>
+<line x1="739.1" y1="519" x2="864.4" y2="519" stroke="#c9c7c0" stroke-width="4" stroke-linecap="round"/>
+<circle cx="739.1" cy="519" r="6" fill="#fcfcfb" stroke="#6f6d68" stroke-width="2.5"/>
+<circle cx="864.4" cy="519" r="6.5" fill="#6f6d68"/>
+<text x="727.1" y="524" font-size="13" fill="#52514e" text-anchor="end">10.99</text>
+<text x="876.4" y="524" font-size="13" fill="#0b0b0b">22.80</text>
+<text x="40" y="580" font-size="18" font-weight="600" fill="#0b0b0b">q3_window_latest</text>
+<line x1="208.3" y1="594" x2="208.3" y2="744" stroke="#c3c2b7" stroke-width="1"/>
+<line x1="327.4" y1="594" x2="327.4" y2="744" stroke="#e1e0d9" stroke-width="1"/>
+<line x1="446.4" y1="594" x2="446.4" y2="744" stroke="#e1e0d9" stroke-width="1"/>
+<line x1="603.8" y1="594" x2="603.8" y2="744" stroke="#e1e0d9" stroke-width="1"/>
+<line x1="722.9" y1="594" x2="722.9" y2="744" stroke="#e1e0d9" stroke-width="1"/>
+<line x1="841.9" y1="594" x2="841.9" y2="744" stroke="#e1e0d9" stroke-width="1"/>
+<line x1="999.3" y1="594" x2="999.3" y2="744" stroke="#e1e0d9" stroke-width="1"/>
+<text x="160" y="614" font-size="14" fill="#52514e" text-anchor="end">sqe-parquet</text>
+<line x1="562.9" y1="609" x2="824.6" y2="609" stroke="#a9c9ef" stroke-width="4" stroke-linecap="round"/>
+<circle cx="562.9" cy="609" r="6" fill="#fcfcfb" stroke="#2a78d6" stroke-width="2.5"/>
+<circle cx="824.6" cy="609" r="6.5" fill="#2a78d6"/>
+<text x="550.9" y="614" font-size="13" fill="#52514e" text-anchor="end">3.94</text>
+<text x="836.6" y="614" font-size="13" fill="#0b0b0b">18.08</text>
+<text x="160" y="644" font-size="14" fill="#52514e" text-anchor="end">sqe-polaris</text>
+<line x1="794.7" y1="639" x2="824.5" y2="639" stroke="#a9c9ef" stroke-width="4" stroke-linecap="round"/>
+<circle cx="794.7" cy="639" r="6" fill="#fcfcfb" stroke="#2a78d6" stroke-width="2.5"/>
+<circle cx="824.5" cy="639" r="6.5" fill="#2a78d6"/>
+<text x="782.7" y="644" font-size="13" fill="#52514e" text-anchor="end">15.19</text>
+<text x="836.5" y="644" font-size="13" fill="#0b0b0b">18.07</text>
+<text x="160" y="674" font-size="14" fill="#52514e" text-anchor="end">duckdb</text>
+<line x1="700.3" y1="669" x2="893.2" y2="669" stroke="#c9c7c0" stroke-width="4" stroke-linecap="round"/>
+<circle cx="700.3" cy="669" r="6" fill="#fcfcfb" stroke="#6f6d68" stroke-width="2.5"/>
+<circle cx="893.2" cy="669" r="6.5" fill="#6f6d68"/>
+<text x="688.3" y="674" font-size="13" fill="#52514e" text-anchor="end">8.77</text>
+<text x="905.2" y="674" font-size="13" fill="#0b0b0b">26.96</text>
+<text x="160" y="704" font-size="14" fill="#52514e" text-anchor="end">polars</text>
+<text x="178" y="704" font-size="13" fill="#d03b3b">killed by the 4.5 GiB watchdog in every run, local and S3</text>
+<text x="160" y="734" font-size="14" fill="#52514e" text-anchor="end">spark</text>
+<line x1="943.9" y1="729" x2="1032.3" y2="729" stroke="#c9c7c0" stroke-width="4" stroke-linecap="round"/>
+<circle cx="943.9" cy="729" r="6" fill="#fcfcfb" stroke="#6f6d68" stroke-width="2.5"/>
+<circle cx="1032.3" cy="729" r="6.5" fill="#6f6d68"/>
+<text x="931.9" y="734" font-size="13" fill="#52514e" text-anchor="end">36.22</text>
+<text x="1044.3" y="734" font-size="13" fill="#0b0b0b">60.59</text>
+<text x="40" y="790" font-size="18" font-weight="600" fill="#0b0b0b">q4_highcard_agg</text>
+<line x1="208.3" y1="804" x2="208.3" y2="954" stroke="#c3c2b7" stroke-width="1"/>
+<text x="208.3" y="974" font-size="13" fill="#898781" text-anchor="middle">0.5 s</text>
+<line x1="327.4" y1="804" x2="327.4" y2="954" stroke="#e1e0d9" stroke-width="1"/>
+<text x="327.4" y="974" font-size="13" fill="#898781" text-anchor="middle">1 s</text>
+<line x1="446.4" y1="804" x2="446.4" y2="954" stroke="#e1e0d9" stroke-width="1"/>
+<text x="446.4" y="974" font-size="13" fill="#898781" text-anchor="middle">2 s</text>
+<line x1="603.8" y1="804" x2="603.8" y2="954" stroke="#e1e0d9" stroke-width="1"/>
+<text x="603.8" y="974" font-size="13" fill="#898781" text-anchor="middle">5 s</text>
+<line x1="722.9" y1="804" x2="722.9" y2="954" stroke="#e1e0d9" stroke-width="1"/>
+<text x="722.9" y="974" font-size="13" fill="#898781" text-anchor="middle">10 s</text>
+<line x1="841.9" y1="804" x2="841.9" y2="954" stroke="#e1e0d9" stroke-width="1"/>
+<text x="841.9" y="974" font-size="13" fill="#898781" text-anchor="middle">20 s</text>
+<line x1="999.3" y1="804" x2="999.3" y2="954" stroke="#e1e0d9" stroke-width="1"/>
+<text x="999.3" y="974" font-size="13" fill="#898781" text-anchor="middle">50 s</text>
+<text x="160" y="824" font-size="14" fill="#52514e" text-anchor="end">sqe-parquet</text>
+<line x1="534.5" y1="819" x2="801.3" y2="819" stroke="#a9c9ef" stroke-width="4" stroke-linecap="round"/>
+<circle cx="534.5" cy="819" r="6" fill="#fcfcfb" stroke="#2a78d6" stroke-width="2.5"/>
+<circle cx="801.3" cy="819" r="6.5" fill="#2a78d6"/>
+<text x="522.5" y="824" font-size="13" fill="#52514e" text-anchor="end">3.34</text>
+<text x="813.3" y="824" font-size="13" fill="#0b0b0b">15.79</text>
+<text x="160" y="854" font-size="14" fill="#52514e" text-anchor="end">sqe-polaris</text>
+<line x1="785.0" y1="849" x2="821.2" y2="849" stroke="#a9c9ef" stroke-width="4" stroke-linecap="round"/>
+<circle cx="785.0" cy="849" r="6" fill="#fcfcfb" stroke="#2a78d6" stroke-width="2.5"/>
+<circle cx="821.2" cy="849" r="6.5" fill="#2a78d6"/>
+<text x="773.0" y="854" font-size="13" fill="#52514e" text-anchor="end">14.36</text>
+<text x="833.2" y="854" font-size="13" fill="#0b0b0b">17.73</text>
+<text x="160" y="884" font-size="14" fill="#52514e" text-anchor="end">duckdb</text>
+<line x1="714.8" y1="879" x2="852.2" y2="879" stroke="#c9c7c0" stroke-width="4" stroke-linecap="round"/>
+<circle cx="714.8" cy="879" r="6" fill="#fcfcfb" stroke="#6f6d68" stroke-width="2.5"/>
+<circle cx="852.2" cy="879" r="6.5" fill="#6f6d68"/>
+<text x="702.8" y="884" font-size="13" fill="#52514e" text-anchor="end">9.54</text>
+<text x="864.2" y="884" font-size="13" fill="#0b0b0b">21.23</text>
+<text x="160" y="914" font-size="14" fill="#52514e" text-anchor="end">polars</text>
+<line x1="565.0" y1="909" x2="819.5" y2="909" stroke="#c9c7c0" stroke-width="4" stroke-linecap="round"/>
+<circle cx="565.0" cy="909" r="6" fill="#fcfcfb" stroke="#6f6d68" stroke-width="2.5"/>
+<circle cx="819.5" cy="909" r="6.5" fill="#6f6d68"/>
+<text x="553.0" y="914" font-size="13" fill="#52514e" text-anchor="end">3.99</text>
+<text x="831.5" y="914" font-size="13" fill="#0b0b0b">17.55</text>
+<text x="160" y="944" font-size="14" fill="#52514e" text-anchor="end">spark</text>
+<line x1="923.9" y1="939" x2="1009.6" y2="939" stroke="#c9c7c0" stroke-width="4" stroke-linecap="round"/>
+<circle cx="923.9" cy="939" r="6" fill="#fcfcfb" stroke="#6f6d68" stroke-width="2.5"/>
+<circle cx="1009.6" cy="939" r="6.5" fill="#6f6d68"/>
+<text x="911.9" y="944" font-size="13" fill="#52514e" text-anchor="end">32.23</text>
+<text x="1021.6" y="944" font-size="13" fill="#0b0b0b">53.10</text>
+<text x="40" y="1018" font-size="13" fill="#898781">Apple M3 Pro, 8 threads, 3 GB memory setting, 3 reps. Local run 2026-11-05, S3 run 2026-11-06. sqe-polaris reads RustFS in both runs.</text>
+</svg>
