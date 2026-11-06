@@ -2,7 +2,8 @@
 #
 # GitLab is the canonical remote; github.com/schubergphilis/sqe is a read-only
 # push mirror that receives every branch and `v*` tag. A mirrored tag push is a
-# normal push event here, so this workflow builds the four binaries for macOS
+# normal push event here, so this workflow builds the three binaries (sqe-server,
+# sqe-cli, sqe-bench; a worker is `sqe-server --mode worker`) for macOS
 # (Apple Silicon and Intel) and Linux x86_64, and attaches them to a GitHub
 # Release named after the tag. Nothing here talks back to GitLab.
 #
@@ -116,7 +117,7 @@ jobs:
           set -euo pipefail
           cargo build --locked --profile "$PROFILE" \
             --no-default-features \
-            --bin sqe-server --bin sqe-worker --bin sqe-cli --bin sqe-bench
+            --bin sqe-server --bin sqe-cli --bin sqe-bench
 
       - name: Package
         id: pkg
@@ -130,7 +131,7 @@ jobs:
           profile="$PROFILE"
           name="sqe-${VERSION}-${TARGET}"
           mkdir -p "dist/$name"
-          for b in sqe-server sqe-worker sqe-cli sqe-bench; do
+          for b in sqe-server sqe-cli sqe-bench; do
             cp "target/$profile/$b" "dist/$name/"
           done
           cp LICENSE "dist/$name/" 2>/dev/null || true
