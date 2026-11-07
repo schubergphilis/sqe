@@ -43,7 +43,7 @@ use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use tracing::warn;
 
 use crate::query_handler::{
-    aggregate_spill_metrics, extract_iceberg_scan_metrics, extract_plan_metrics,
+    aggregate_spill_metrics, extract_iceberg_scan_metrics, extract_plan_metrics, PlanMetrics,
 };
 use crate::query_tracker::QueryTracker;
 use sqe_core::SqeErrorCode;
@@ -281,13 +281,24 @@ impl StreamFinalizer {
     /// The one `AuditKind::Query` event a streaming query emits, whichever
     /// way it ended; success, error and cancel differ only in `outcome` and
     /// in which duration they report (review 409).
+    ///
+    /// Stats come from the plan's metrics whichever way the query ended: a
+    /// failed or cancelled query still scanned, spilled and held memory, and
+    /// the audit log is the durable query history (#812). The planning time
+    /// comes from the tracker record; execution is the rest of the duration.
     fn emit_audit(
         &self,
         audit: &sqe_metrics::audit::AuditLogger,
         outcome: sqe_metrics::audit::Outcome,
         duration_ms: u64,
         rows: usize,
+        pm: &PlanMetrics,
     ) {
+        let (queued_ms, planning_ms) = self
+            .tracker
+            .get(&self.query_id)
+            .map(|r| (r.queued_ms, r.planning_ms))
+            .unwrap_or_default();
         audit.log_event(sqe_metrics::audit::AuditEvent {
             time: chrono::Utc::now(),
             kind: sqe_metrics::audit::AuditKind::Query,
@@ -297,13 +308,22 @@ impl StreamFinalizer {
             policy: Some(crate::audit_emitter::policy_audit(&self.policy_summary)),
             timing: Some(sqe_metrics::audit::Timing {
                 duration_ms,
-                ..Default::default()
+                queued_ms,
+                planning_ms,
+                execution_ms: duration_ms.saturating_sub(queued_ms + planning_ms),
             }),
             stats: Some(sqe_metrics::audit::QueryStats {
                 rows_returned: rows,
-                ..Default::default()
+                rows_written: None,
+                bytes_scanned: pm.bytes_scanned,
+                rows_scanned: pm.rows_scanned,
+                spill_bytes: pm.spill_bytes,
+                peak_memory_bytes: pm.peak_memory_bytes,
             }),
-            query: Some(crate::audit_emitter::query_info(&self.sql, "query".to_string())),
+            query: Some(crate::audit_emitter::query_info(
+                &self.sql,
+                "query".to_string(),
+            )),
             session_id: Some(crate::session_manager::session_log_id(&self.session_id)),
             client_ip: self.client_ip.clone(),
             trace_id: self.trace_id.clone(),
@@ -311,6 +331,14 @@ impl StreamFinalizer {
             transaction: None,
             integrity: Default::default(),
         });
+    }
+
+    /// The plan's scan/spill counters plus the memory the query holds in the
+    /// pool right now; call before `observe_query_end` releases it.
+    fn audit_plan_metrics(&self) -> PlanMetrics {
+        let mut pm = extract_plan_metrics(&self.plan);
+        pm.peak_memory_bytes = crate::memory::used_bytes(&self.runtime.memory_pool) as u64;
+        pm
     }
 
     /// Render, log, and store the per-operator profile for this query.
@@ -362,8 +390,7 @@ impl StreamFinalizer {
         let duration = self.start.elapsed();
         let execution_ms = duration.as_millis() as u64;
 
-        let mut pm = extract_plan_metrics(&self.plan);
-        pm.peak_memory_bytes = crate::memory::used_bytes(&self.runtime.memory_pool) as u64;
+        let pm = self.audit_plan_metrics();
 
         self.tracker.complete(
             &self.query_id,
@@ -411,6 +438,7 @@ impl StreamFinalizer {
                 sqe_metrics::audit::Outcome::Success,
                 execution_ms,
                 rows,
+                &pm,
             );
         }
 
@@ -440,6 +468,8 @@ impl StreamFinalizer {
 
     fn on_error(self, rows: usize, err: &sqe_core::SqeError) {
         let duration = self.start.elapsed();
+        // Read before `observe_query_end` releases the query's pool usage.
+        let pm = self.audit_plan_metrics();
         self.tracker.failed(&self.query_id, err);
         if let Some(ref metrics) = self.metrics {
             metrics
@@ -468,6 +498,7 @@ impl StreamFinalizer {
                 crate::audit_emitter::outcome_of(Some(err)),
                 duration.as_millis() as u64,
                 rows,
+                &pm,
             );
         }
 
@@ -480,6 +511,8 @@ impl StreamFinalizer {
 
     fn on_cancel(self, rows: usize) {
         let duration = self.start.elapsed();
+        // Read before `observe_query_end` releases the query's pool usage.
+        let pm = self.audit_plan_metrics();
         self.tracker.canceled(&self.query_id);
         if let Some(ref metrics) = self.metrics {
             metrics
@@ -513,6 +546,7 @@ impl StreamFinalizer {
                 },
                 duration.as_millis() as u64,
                 rows,
+                &pm,
             );
         }
         self.record_scan_metrics();
@@ -1605,6 +1639,65 @@ mod tests {
         );
     }
 
+    /// #812: the audit log is the durable query history, so a streaming
+    /// query's event carries what it scanned and how long it planned
+    /// whichever way it ended, not only `rows_returned`.
+    #[tokio::test]
+    async fn streaming_audit_event_carries_stats_and_timing_on_every_outcome() {
+        use datafusion::error::DataFusionError;
+
+        for ending in ["success", "error", "cancel"] {
+            let (plan, rows) = MetricsStubExec::create();
+            rows.add(7);
+            let schema = plan.schema();
+            let runtime = SessionContext::new().runtime_env();
+            let tracker = test_tracker();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("audit.jsonl");
+            let audit =
+                Arc::new(sqe_metrics::audit::AuditLogger::new(path.to_str().unwrap()).unwrap());
+
+            let mut fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
+            fin.audit = Some(Arc::clone(&audit));
+            fin.sql = "SELECT x FROM t WHERE x = 42".to_string();
+            let qid = fin.query_id;
+            tracker.start(qid, "test-user", None, &fin.sql, "s", None, vec![], None);
+            tracker.running(&qid, 3);
+
+            let items: Vec<Result<RecordBatch, DataFusionError>> = match ending {
+                "success" => vec![Ok(sample_batch(2))],
+                "error" => vec![Err(DataFusionError::Execution("boom".to_string()))],
+                _ => vec![Ok(sample_batch(2)), Ok(sample_batch(2))],
+            };
+            let inner: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::iter(items),
+            ));
+            let mut stream = TrackedRecordBatchStream::new(inner, fin, None);
+            if ending == "success" {
+                while stream.next().await.is_some() {}
+            } else {
+                let _first = stream.next().await.unwrap();
+            }
+            drop(stream);
+            audit.flush();
+
+            let content = std::fs::read_to_string(&path).unwrap();
+            let v: serde_json::Value =
+                serde_json::from_str(content.lines().next().unwrap()).unwrap();
+            assert_eq!(v["stats"]["rows_scanned"], 7, "{ending}: {v}");
+            assert_eq!(v["timing"]["planning_ms"], 3, "{ending}: {v}");
+            let duration = v["timing"]["duration_ms"].as_u64().unwrap();
+            let execution = v["timing"]["execution_ms"].as_u64().unwrap();
+            assert_eq!(execution, duration.saturating_sub(3), "{ending}: {v}");
+            assert_eq!(
+                v["query"]["query_fingerprint"].as_str(),
+                Some(sqe_metrics::audit::query_fingerprint("SELECT x FROM t WHERE x = 7").as_str()),
+                "{ending}: the fingerprint ignores the literal; {v}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn idle_timeout_surfaces_error_not_empty_success() {
         let (plan, schema, runtime) = trivial_plan().await;
@@ -1694,8 +1787,10 @@ mod tests {
     }
 
     impl ExecutionPlan for MetricsStubExec {
+        /// "Scan" in the name makes `extract_plan_metrics` count its output
+        /// rows as scanned rows, which the audit stats test reads.
         fn name(&self) -> &str {
-            "MetricsStubExec"
+            "MetricsStubScanExec"
         }
 
         /// SQE PATCH (DataFusion 55): metrics-only test stub, no expressions.

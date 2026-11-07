@@ -3937,6 +3937,11 @@ impl QueryHandler {
                 audit_resources,
                 replanned,
             )) => {
+                // Planning is done; the stream starts executing. Records the
+                // planning time on the tracker (system.runtime and the audit
+                // event read it from there).
+                self.query_tracker
+                    .running(&query_id, start.elapsed().as_millis() as u64);
                 let actor = crate::audit_emitter::actor_for(session);
                 let finalizer = crate::streaming::StreamFinalizer {
                     tracker: Arc::clone(&self.query_tracker),

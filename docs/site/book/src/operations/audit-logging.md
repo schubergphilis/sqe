@@ -43,8 +43,8 @@ whatever their patterns and tags miss. A deployment that ships the chain to a SI
 keep the text out of the log altogether.
 
 With `omit_query_text = true`, no record holds statement text. The native `query.text` and
-the OCSF `unmapped.query_text` are absent. `query_hash` and `statement_type` stay, so
-repeated statements still correlate, and the text's byte length is written as
+the OCSF `unmapped.query_text` are absent. `query_hash`, `query_fingerprint` and
+`statement_type` stay, so repeated statements still correlate, and the text's byte length is written as
 `query.text_len` (OCSF `unmapped.query_text_len`). The legacy path for secret-bearing
 statements honours the setting too, with `query_text_len` in its flat record.
 
@@ -211,9 +211,24 @@ Standard OCSF fields used:
 - `src_endpoint.ip`: client IP, when present.
 - `metadata.product.name`: `"SQE"`.
 - `metadata.uid`: integrity hash of the record.
+- `duration`: the statement's total time in milliseconds, when timed.
+- `status_code`: the SQE error code of a failed statement (`QUERY_CANCELLED` for
+  a client cancel).
 
-SQE-specific fields that have no OCSF home (query hash, statement type, scan stats,
-policy decisions) travel under `unmapped` as a flat object.
+SQE-specific fields that have no OCSF home travel under `unmapped` as a flat
+object: query hash and fingerprint, statement type, query id, trace id, the phase
+split (`queued_ms`, `planning_ms`, `execution_ms`), scan stats, the error type of a
+failure, and policy decisions.
+
+`query_hash` hashes the whitespace- and case-normalised text, so it differs per
+literal. `query_fingerprint` hashes the same text with every string and numeric
+literal replaced by a placeholder, so `WHERE id = 1` and `WHERE id = 2` share one
+fingerprint. It holds no value from the statement.
+
+A streaming SELECT (Flight SQL, Trino HTTP) records its scan stats, peak memory
+and planning time whether it succeeded, failed or was cancelled. The buffered path
+plans and executes in one call, so its `queued_ms` and `planning_ms` are 0 and
+`execution_ms` covers both.
 
 ## Tamper-evident hash chain
 

@@ -68,19 +68,21 @@ pub(crate) fn policy_audit(summary: &PolicySummary) -> PolicyAudit {
     }
 }
 
-/// The query block: raw text (see the module doc on redaction), its hash and
-/// the statement kind label.
+/// The query block: raw text (see the module doc on redaction), its hash,
+/// its literal-free fingerprint and the statement kind label.
 pub(crate) fn query_info(sql: &str, statement_type: String) -> QueryInfo {
     QueryInfo {
         text: Some(sql.to_string()),
         query_hash: sqe_metrics::audit::query_hash(sql),
         statement_type,
         text_len: None,
+        query_fingerprint: Some(sqe_metrics::audit::query_fingerprint(sql)),
     }
 }
 
-/// Timing with the two fields this call site knows. `queued_ms` and
-/// `planning_ms` are tracked by `QueryTracker` but not exposed per id here.
+/// Timing with the two fields the buffered path knows. It plans and runs in
+/// one call, so `queued_ms` and `planning_ms` stay 0; the streaming path
+/// fills them from its `QueryTracker` record.
 pub(crate) fn timing(duration: Duration, execution_ms: u64) -> Timing {
     Timing {
         duration_ms: duration.as_millis() as u64,

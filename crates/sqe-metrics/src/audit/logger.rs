@@ -103,6 +103,14 @@ pub fn query_hash(sql: &str) -> String {
     hex::encode(hash)
 }
 
+/// [`query_hash`] of the statement with its string and numeric literals
+/// replaced by placeholders ([`super::strip_sql_literals`]), so
+/// `WHERE id = 1` and `WHERE id = 2` share one fingerprint. Groups the
+/// history of one query shape without keeping any of its values.
+pub fn query_fingerprint(sql: &str) -> String {
+    query_hash(&super::strip_sql_literals(sql))
+}
+
 /// Compute a chain hash over raw bytes: `sha256(prev_hash || body_bytes)`.
 ///
 /// Used to chain legacy `AuditEntry` records without converting them to `AuditEvent`.
@@ -198,6 +206,7 @@ impl From<AuditEntry> for AuditEvent {
                 query_hash: e.query_hash,
                 statement_type: e.statement_type,
                 text_len: e.query_text_len,
+                query_fingerprint: None,
             }),
             session_id: e.session_id,
             client_ip: e.client_ip,
@@ -1744,6 +1753,19 @@ mod tests {
         assert_ne!(h1, h2);
     }
 
+    /// #812: one query shape, one fingerprint, whatever its values.
+    #[test]
+    fn test_query_fingerprint_ignores_literals() {
+        let a = query_fingerprint("SELECT * FROM t WHERE id = 1 AND name = 'bob'");
+        let b = query_fingerprint("select *  from t where id = 22 and name = 'it''s'");
+        assert_eq!(a, b);
+        assert_ne!(a, query_fingerprint("SELECT * FROM t WHERE id2 = 1"));
+        assert_ne!(
+            a,
+            query_hash("SELECT * FROM t WHERE id = 1 AND name = 'bob'")
+        );
+    }
+
     #[test]
     fn test_file_logger_writes() {
         let (_dir, path) = fresh_audit_path("sqe-audit-test.jsonl");
@@ -2018,6 +2040,7 @@ mod tests {
             query_hash: query_hash(sql),
             statement_type: "query".into(),
             text_len: None,
+            query_fingerprint: None,
         });
         logger.log_event(ev);
         logger.flush();
@@ -2150,6 +2173,7 @@ mod tests {
             query_hash: "h".into(),
             statement_type: "query".into(),
             text_len: None,
+            query_fingerprint: None,
         });
         logger.log_event(ev);
         logger.flush();
@@ -2198,6 +2222,7 @@ mod tests {
             query_hash: "h".into(),
             statement_type: "query".into(),
             text_len: None,
+            query_fingerprint: None,
         });
         logger.log_event(ev);
         logger.flush();
@@ -2257,6 +2282,7 @@ mod tests {
             query_hash: "h".into(),
             statement_type: "query".into(),
             text_len: None,
+            query_fingerprint: None,
         });
         logger.log_event(ev);
         logger.flush();
@@ -2337,6 +2363,7 @@ mod tests {
             query_hash: "h".into(),
             statement_type: "query".into(),
             text_len: None,
+            query_fingerprint: None,
         });
         logger.log_event(ev);
         logger.flush();
