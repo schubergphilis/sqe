@@ -39,6 +39,8 @@ Choose Spark for very large batch transformation, when you are already invested 
 
 Choose SQE for interactive and analytical SQL on Iceberg where per-user identity and a small operational footprint matter, and where a single Rust binary beats standing up a Spark cluster. SQE distributes (coordinator plus stateless workers) but is positioned for query serving, not as a general batch framework.
 
+Moving Spark or Databricks SQL over: a bare `ORDER BY x DESC` puts NULLs first in SQE (the Trino order) and last in Spark. Write `NULLS LAST` on those sorts to keep Spark's result. See [NULL order in ORDER BY](../sql-reference/dml.md#null-order-in-order-by).
+
 ## The through-line
 
 SQE's distinguishing property is sovereignty: every query runs with the identity and permissions of the user who submitted it, no service-account intermediary, on hardware you control. Trino, DuckDB, and Spark each beat SQE on some axis (breadth, single-machine simplicity, batch scale). None of them pass a per-user bearer token through to both the catalog and storage. That is the trade SQE is built around. See [Why SQE](../story/why-sqe.md).

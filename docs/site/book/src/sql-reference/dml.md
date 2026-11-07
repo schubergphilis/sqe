@@ -19,6 +19,17 @@ Source: `crates/sqe-sql/src/time_travel.rs`, `crates/sqe-coordinator/src/{query_
 | `SELECT cols FROM t1, LATERAL (SELECT ... FROM t2 WHERE ...)` | `datafusion-builtin` | Correlated subquery in FROM. | yes | yes | partial | yes |
 | `SELECT cols FROM t TABLESAMPLE BERNOULLI (5)` | `datafusion-builtin` | Random sampling. | yes | yes | yes | yes |
 
+### NULL order in ORDER BY
+
+Without `NULLS FIRST` or `NULLS LAST`, SQE sorts NULL as the largest value, as Trino and PostgreSQL do:
+
+| Clause | NULLs go | Trino | Spark SQL / Databricks |
+|---|---|---|---|
+| `ORDER BY x` / `ORDER BY x ASC` | last | last | first |
+| `ORDER BY x DESC` | first | first | last |
+
+The same rule applies to the `ORDER BY` inside `OVER (...)`, so `ROW_NUMBER`, `RANK`, `QUALIFY` and every top-N pick their rows by it. SQE has no switch to change the default. SQL that moves over from Spark or Databricks keeps Spark's order by spelling it out: `ORDER BY x DESC NULLS LAST`, `ORDER BY x ASC NULLS FIRST`. Both clauses work on every protocol.
+
 ### Time travel (Iceberg-specific)
 
 | Form | Origin | Notes |
@@ -191,7 +202,9 @@ SET WRITE_BRANCH = DEFAULT;
 |---|---|---|
 | `USE catalog.schema` | `sqe-sql/classifier.rs` | Switch active catalog and schema. Subsequent unqualified table references use this scope. Over the Trino protocol the scope travels back as `X-Trino-Set-Catalog` / `X-Trino-Set-Schema` and the client echoes it; over Flight SQL it is stored on the session behind the bearer token, so every later request on that token, on any connection, resolves in the new scope. `current_schema()` reports it. |
 | `USE schema` | `sqe-sql/classifier.rs` | Switch schema only; the catalog stays as it was. |
-| `SET <variable> = <value>` | `sqlparser-rs` (DataFusion) | DataFusion session config. See `EXPLAIN ANALYZE` documentation for valid keys. |
+| `SET TIME ZONE '<zone>'` | `sqe-coordinator` | Accepted so client connection setup succeeds, but not applied: timestamps are evaluated in UTC. See [Date and time](datetime.md). |
+| `SET SESSION <name> = <value>` / `RESET SESSION <name>` | `sqe-trino-compat` | Trino protocol only. The allowed names are listed by `SHOW SESSION`. |
+| `SET <variable> = <value>` | - | Refused. SQE does not expose DataFusion session settings to clients. `SET WRITE_BRANCH` (above) is the exception. |
 | `BEGIN` / `START TRANSACTION` / `COMMIT` / `ROLLBACK` / `SET TRANSACTION` | `sqe-sql/classifier.rs` | Explicit transactions. See [Transactions](#transactions). |
 
 ## Transactions
