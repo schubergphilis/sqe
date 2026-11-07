@@ -12,12 +12,12 @@ over rotated logs) and the web UI view are still open.
   them. Error and cancel read the metrics before `observe_query_end`.
   Timing carries `planning_ms` / `queued_ms` from the tracker record and
   `execution_ms` as the rest of the duration.
-- `query_handler.rs`: `execute_stream_inner` calls `tracker.running()` once
-  planning returns. Nothing in production called `running()` before, so
-  every streaming SELECT showed as Queued in `system.runtime` and the web UI
-  until it ended, and `planning_ms` was always 0.
 - `query_tracker.rs`: `running()` no longer counts the planning time as
-  queue time too, and it is a no-op on a record a cancel already ended.
+  queue time too, and it is a no-op on a record a cancel already ended (a
+  cancel during planning used to be set back to Running).
+- Correction: the first commit also added a `running()` call to
+  `execute_stream_inner`, claiming nothing called it. `open_stream` already
+  does, after planning; the duplicate is removed.
 - `QueryInfo.query_fingerprint` (new, optional): `query_hash` of the
   literal-stripped text (`strip_sql_literals`). Set by `audit_emitter::query_info`,
   so every buffered and streaming statement record has it; synthetic events
@@ -48,8 +48,9 @@ over rotated logs) and the web UI view are still open.
 - #812 (b): read history back from the audit JSONL, time-bounded, unioned
   with the in-memory tracker, as `system.runtime.query_history`.
 - #812 (c): web UI history view.
-- The buffered path still plans and executes in one call, so its
-  `planning_ms` stays 0.
+- The buffered path calls `running()` before `execute_query` plans, so its
+  `planning_ms` is only the setup before that (cache lookup, session
+  context), not the planning.
 - Finding (pre-existing, both paths): `peak_memory_bytes` is the
   coordinator-wide pool's reservation when the query ends, not this query's
   peak (`query_handler.rs` says so in a comment). Fixed on the next branch:

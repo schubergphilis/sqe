@@ -13,8 +13,8 @@
 
 ### Fixed
 
-- Streaming queries show as Running and report their planning time (#812)
+- `queued_ms` no longer counts planning time, and a cancel during planning stays a cancel (#812)
 
-    The streaming path never marked a query running, so `system.runtime`
-    and the web UI listed a streaming SELECT as Queued until it ended, with
-    `planning_ms` 0. `queued_ms` no longer counts planning time.
+    `system.runtime` reported a query's planning time twice, once as
+    `planning_ms` and again as `queued_ms`. A query cancelled while it
+    planned was set back to Running once planning returned.
