@@ -1862,6 +1862,12 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
         sqe_metrics::MetricsRegistry::new()
             .map_err(|e| anyhow::anyhow!("failed to initialize metrics registry: {e}"))?,
     );
+    // Object-store request metrics (#815). Before any catalog is built:
+    // OpenDAL caches operators, and one created earlier never carries them.
+    sqe_catalog::store_metrics::install_storage_metrics(
+        sqe_metrics::HasRegistry::prometheus_registry(metrics.as_ref()),
+    )
+    .map_err(|e| anyhow::anyhow!("failed to install object-store metrics: {e}"))?;
 
     let _metrics_server = sqe_metrics::server::start_metrics_server(
         metrics.clone(),
@@ -2776,6 +2782,11 @@ async fn run_worker(config: SqeConfig, config_path: String) -> anyhow::Result<()
         sqe_metrics::WorkerMetricsRegistry::new()
             .map_err(|e| anyhow::anyhow!("failed to initialize worker metrics registry: {e}"))?,
     );
+    // Data-file reads go through object_store; see store_metrics (#815).
+    sqe_catalog::store_metrics::install_storage_metrics(
+        sqe_metrics::HasRegistry::prometheus_registry(worker_metrics.as_ref()),
+    )
+    .map_err(|e| anyhow::anyhow!("failed to install object-store metrics: {e}"))?;
     let _metrics_server = sqe_metrics::server::start_metrics_server(
         worker_metrics.clone(),
         worker_bind,

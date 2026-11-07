@@ -106,7 +106,7 @@ object_store = { version = "0.13", features = ["aws", "http", "azure", "gcp"] }
 iceberg = { path = "vendor/iceberg-rust/crates/iceberg" }
 # Object storage moved out of iceberg core into this crate (OpenDAL-backed
 # StorageFactory). S3 / GCS / Azure are features of this crate now.
-iceberg-storage-opendal = { path = "vendor/iceberg-rust/crates/storage/opendal", default-features = false, features = ["opendal-memory", "opendal-fs", "opendal-s3"] }
+iceberg-storage-opendal = { path = "vendor/iceberg-rust/crates/storage/opendal", default-features = false, features = ["opendal-memory", "opendal-fs", "opendal-s3", "prometheus"] }
 # No default `aws-sigv4` on this path dep: sqe-catalog's `rest-sigv4`
 # feature enables it for coordinator/worker builds. Slim Polaris-only
 # builds pass `--no-default-features --features rest` on sqe-catalog.

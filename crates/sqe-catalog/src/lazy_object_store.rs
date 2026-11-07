@@ -134,6 +134,9 @@ impl<R: ObjectStoreRegistry> ObjectStoreRegistry for LazyHttpObjectStoreRegistry
         url: &Url,
         store: Arc<dyn ObjectStore>,
     ) -> Option<Arc<dyn ObjectStore>> {
+        // Every store a runtime holds passes here (Hive roots, file TVFs,
+        // pre-registered buckets), so this is where request metrics attach.
+        let store = crate::store_metrics::metered_for_url(store, url);
         self.inner.register_store(url, store)
     }
 
@@ -193,11 +196,11 @@ fn build_and_register_http_store(
         .with_url(&base)
         .build()
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let store: Arc<dyn ObjectStore> = Arc::new(store);
 
     let key = Url::parse(&base).map_err(|e| {
         DataFusionError::Plan(format!("failed to build object-store URL '{base}': {e}"))
     })?;
+    let store = crate::store_metrics::metered_for_url(Arc::new(store), &key);
 
     inner.register_store(&key, Arc::clone(&store));
     Ok(store)
@@ -213,7 +216,7 @@ fn build_and_register_s3_store(
     })?;
 
     let store = crate::file_tvf_common::build_s3_store_for_bucket(bucket, storage)?;
-    let store: Arc<dyn ObjectStore> = Arc::new(store);
+    let store = crate::store_metrics::metered(Arc::new(store), url.scheme(), bucket);
 
     // DataFusion keys the registry by `scheme://host`; register under the
     // bucket-scoped URL so the constructed store is reused for every object in

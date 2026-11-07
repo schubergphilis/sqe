@@ -142,7 +142,14 @@ pub fn s3_object_store_factory() -> ObjectStoreFactory {
                     &creds.session_token,
                 )?),
             };
-            Ok(store)
+            // Same bucket the builder took; the store cannot be built
+            // without one, so the lookup cannot fail here.
+            let bucket = task
+                .data_file_paths
+                .first()
+                .and_then(|path| s3_url_to_bucket(path).ok())
+                .unwrap_or_default();
+            Ok(sqe_catalog::store_metrics::metered(store, "s3", &bucket))
         },
     )
 }
