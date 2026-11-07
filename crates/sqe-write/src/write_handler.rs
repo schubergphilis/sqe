@@ -2095,6 +2095,51 @@ impl WriteHandler {
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
         policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let target_catalog = match stmt {
+            Statement::CreateTable(ct) => {
+                resolve_target_catalog(catalog_qualifier(&ct.name), session)
+            }
+            _ => None,
+        };
+        // Keep the `SessionCatalog`: `after_commit` (507) and the OR REPLACE
+        // path (500) both need more than the erased `Catalog` trait object.
+        let session_catalog = self
+            .resolve_session_catalog(session, target_catalog.as_deref())
+            .await?;
+        let rest_catalog = matches!(
+            self.config.catalog.backend,
+            sqe_core::config::CatalogBackend::Rest
+        );
+        self.handle_ctas_streaming_on(
+            session,
+            stmt,
+            session_catalog,
+            rest_catalog,
+            ctx,
+            select_sql,
+            plan_out,
+            policy_summary_out,
+        )
+        .await
+    }
+
+    /// [`Self::handle_ctas_streaming`] against a catalog the caller already
+    /// resolved. The embedded CLI holds its catalogs itself and has no
+    /// coordinator session layer to resolve them through. `rest_catalog`:
+    /// the format version may be sent as the reserved `format-version`
+    /// property, which a local (SQLite) catalog refuses.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn handle_ctas_streaming_on(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        session_catalog: Arc<SessionCatalog>,
+        rest_catalog: bool,
+        ctx: &DFSessionContext,
+        select_sql: &str,
+        plan_out: &mut Option<sqe_lineage::PlanOrHint>,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
         let (table_name, or_replace, partition_by, user_options) = match stmt {
             Statement::CreateTable(ct) => {
                 if ct.query.is_none() {
@@ -2178,11 +2223,6 @@ impl WriteHandler {
         );
 
         let target_catalog = resolve_target_catalog(catalog_qualifier(table_name), session);
-        // Keep the `SessionCatalog`: `after_commit` (507) and the OR REPLACE
-        // path (500) both need more than the erased `Catalog` trait object.
-        let session_catalog = self
-            .resolve_session_catalog(session, target_catalog.as_deref())
-            .await?;
         let catalog: Arc<dyn Catalog> = session_catalog.as_catalog();
 
         // Defense-in-depth: ensure the target namespace exists in this catalog
@@ -2296,14 +2336,7 @@ impl WriteHandler {
         // Merge user TBLPROPERTIES / WITH options (see handle_ctas for why):
         // a CTAS must keep properties like write.parquet.bloom-filter-* that
         // drive the data write, matching the plain CREATE TABLE path.
-        let props = create_table_properties(
-            matches!(
-                self.config.catalog.backend,
-                sqe_core::config::CatalogBackend::Rest
-            ),
-            create_format_version,
-            user_options,
-        );
+        let props = create_table_properties(rest_catalog, create_format_version, user_options);
         let table_creation = TableCreation::builder()
             .name(create_name.clone())
             .schema(iceberg_schema)
