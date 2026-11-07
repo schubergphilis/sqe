@@ -58,7 +58,7 @@ pub(crate) fn reject_multi_statement(tokens: &[TokenWithSpan]) -> sqe_core::Resu
     Ok(())
 }
 
-/// Reject text that [`crate::front_door::EXECUTION_DIALECT`] tokenizes
+/// Reject text that [`crate::front_door::ExecutionDialect`] tokenizes
 /// differently from `GenericDialect` (#683). Every classifier parses with
 /// Generic, but DataFusion plans the text under the execution dialect, and
 /// the two disagree on nested block comments, `q'[...]'`, `E'...'` and
@@ -70,14 +70,7 @@ pub(crate) fn reject_dialect_divergence(
     sql: &str,
     tokens: &[TokenWithSpan],
 ) -> sqe_core::Result<()> {
-    let Some(dialect) = sqlparser::dialect::dialect_from_str(crate::front_door::EXECUTION_DIALECT)
-    else {
-        return Err(syntax_error(format!(
-            "unknown execution dialect {}",
-            crate::front_door::EXECUTION_DIALECT
-        )));
-    };
-    let execution = tokenize(dialect.as_ref(), sql).unwrap_or_default();
+    let execution = tokenize(&crate::front_door::ExecutionDialect, sql).unwrap_or_default();
     let Some(at) = tokens
         .iter()
         .zip(&execution)
