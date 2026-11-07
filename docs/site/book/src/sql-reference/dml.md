@@ -30,6 +30,24 @@ Without `NULLS FIRST` or `NULLS LAST`, SQE sorts NULL as the largest value, as T
 
 The same rule applies to the `ORDER BY` inside `OVER (...)`, so `ROW_NUMBER`, `RANK`, `QUALIFY` and every top-N pick their rows by it. SQE has no switch to change the default. SQL that moves over from Spark or Databricks keeps Spark's order by spelling it out: `ORDER BY x DESC NULLS LAST`, `ORDER BY x ASC NULLS FIRST`. Both clauses work on every protocol.
 
+### Lateral column aliases
+
+A select-list item can use an alias defined earlier in the same select list, as in Databricks, Snowflake and Spark 3.4+:
+
+```sql
+SELECT a + 1 AS b, b * 2 AS c FROM t;   -- c = (a + 1) * 2
+SELECT g, SUM(amt) AS s, s * 2 AS u FROM t GROUP BY g;
+```
+
+The rules follow Databricks:
+
+- A column of the `FROM` relation wins over an alias of the same name. In `SELECT price * 2 AS price, price + 1 AS q FROM t`, `q` reads the column, not the doubled value.
+- The alias must come first. A name used before its alias is defined is an unknown column.
+- Only bare names in the select list resolve to an alias. `t.b` is always the column. `WHERE` cannot see a select-list alias. `GROUP BY`, `HAVING` and `ORDER BY` already accept output aliases.
+- A subquery in the select list has its own scope and does not see the outer select list's aliases.
+
+SQE resolves a name against the `FROM` relation first and falls back to an earlier alias only for a name the relation does not have. That fallback applies to the whole statement, so one edge case differs from Databricks. Suppose `b` is a `FROM` column and also an earlier alias in one `SELECT`, and another `SELECT` in the same statement (a CTE or union arm) uses the alias `b` without having a column `b`. Then the first `SELECT` reads the alias as well. Give the alias another name to avoid this.
+
 ### Time travel (Iceberg-specific)
 
 | Form | Origin | Notes |

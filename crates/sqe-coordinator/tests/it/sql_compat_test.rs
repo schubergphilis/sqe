@@ -279,3 +279,11 @@ async fn test_sql_compat_05_aggregations() {
 async fn test_sql_compat_06_qualify() {
     run_sql_file("06_qualify.sql").await;
 }
+
+// Lateral column aliases (#878): a select-list item may name an earlier
+// item's alias, and a FROM column of the same name wins (Databricks' rule).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn test_sql_compat_08_lateral_alias() {
+    run_sql_file("08_lateral_alias.sql").await;
+}

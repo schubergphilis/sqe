@@ -154,6 +154,51 @@ fn planning_options() -> datafusion::execution::context::SQLOptions {
     datafusion::execution::context::SQLOptions::new().with_allow_ddl(false)
 }
 
+/// Bounds [`plan_with_lateral_aliases`]: one round per alias a chain uses.
+const LATERAL_ALIAS_ROUNDS: usize = 16;
+
+/// Plan `sql` with `plan`; when planning fails on a bare name that an
+/// earlier select-list item aliases (`SELECT a + 1 AS b, b * 2 AS c`,
+/// #878), inline that alias ([`sqe_sql::inline_lateral_alias`]) and plan
+/// again. A name the `FROM` relation has never fails, so the column wins
+/// over the alias, as in Databricks. Returns the last planning error when no
+/// alias explains it.
+async fn plan_with_lateral_aliases<T, F, Fut>(sql: &str, mut plan: F) -> DFResult<T>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = DFResult<T>>,
+{
+    let mut text = sql.to_string();
+    for _ in 0..LATERAL_ALIAS_ROUNDS {
+        let error = match plan(text.clone()).await {
+            Ok(planned) => return Ok(planned),
+            Err(error) => error,
+        };
+        let inlined = unresolved_bare_name(&error)
+            .and_then(|name| sqe_sql::inline_lateral_alias(&text, name));
+        match inlined {
+            Some(next) => text = next,
+            None => return Err(error),
+        }
+    }
+    plan(text).await
+}
+
+/// The unqualified column name a planning error could not resolve.
+fn unresolved_bare_name(error: &DataFusionError) -> Option<&str> {
+    let DataFusionError::SchemaError(schema_error, _) = error.find_root() else {
+        return None;
+    };
+    match schema_error.as_ref() {
+        datafusion::common::SchemaError::FieldNotFound { field, .. }
+            if field.relation.is_none() =>
+        {
+            Some(field.name.as_str())
+        }
+        _ => None,
+    }
+}
+
 /// Prepare the file table functions `sql` calls, then plan it: the one way
 /// a planner entry point should reach `ctx.sql`. Refuses DDL
 /// ([`planning_options`]).
@@ -163,10 +208,11 @@ pub async fn plan_sql(
 ) -> DFResult<datafusion::dataframe::DataFrame> {
     in_statement(async {
         prepare_statement(ctx, sql).await?;
-        let df = ctx
-            .sql_with_options(sql, planning_options())
-            .await
-            .map_err(explain_not_iceberg)?;
+        let df = plan_with_lateral_aliases(sql, |sql| async move {
+            ctx.sql_with_options(&sql, planning_options()).await
+        })
+        .await
+        .map_err(explain_not_iceberg)?;
         name_unknown_types(bind_statement_params(df)?)
     })
     .await
@@ -237,7 +283,9 @@ pub async fn plan_sql_without_policy(
 ) -> DFResult<datafusion::dataframe::DataFrame> {
     in_statement(async {
         prepare_statement(ctx, sql).await?;
-        let df = ctx.sql(sql).await.map_err(explain_not_iceberg)?;
+        let df = plan_with_lateral_aliases(sql, |sql| async move { ctx.sql(&sql).await })
+            .await
+            .map_err(explain_not_iceberg)?;
         name_unknown_types(bind_statement_params(df)?)
     })
     .await
@@ -252,10 +300,11 @@ pub async fn plan_parsed(
 ) -> DFResult<datafusion::dataframe::DataFrame> {
     in_statement(async {
         prepare_parsed_statement(ctx, statement).await?;
-        let df = ctx
-            .sql_with_options(sql, planning_options())
-            .await
-            .map_err(explain_not_iceberg)?;
+        let df = plan_with_lateral_aliases(sql, |sql| async move {
+            ctx.sql_with_options(&sql, planning_options()).await
+        })
+        .await
+        .map_err(explain_not_iceberg)?;
         name_unknown_types(bind_statement_params(df)?)
     })
     .await
@@ -291,8 +340,11 @@ pub async fn create_logical_plan(
                 registry.prepare_statement(sql).await?;
             }
         }
-        let plan = state
-            .create_logical_plan(sql)
+        let plan =
+            plan_with_lateral_aliases(
+                sql,
+                |sql| async move { state.create_logical_plan(&sql).await },
+            )
             .await
             .map_err(explain_not_iceberg)?;
         match crate::txn::params() {
@@ -850,6 +902,58 @@ mod tests {
         )
         .await;
         assert!(nested.contains("| 1 |"), "{nested}");
+    }
+
+    /// #878: a select-list item may name an earlier item's alias, the
+    /// inlined expression keeps its parentheses, and a column of the `FROM`
+    /// relation wins over an alias of the same name (Databricks' rule).
+    #[tokio::test]
+    async fn lateral_column_alias_resolves_after_the_from_columns() {
+        use datafusion::arrow::util::pretty::pretty_format_batches;
+        let ctx = SessionContext::new();
+        let rows = |sql: &'static str| {
+            let ctx = ctx.clone();
+            async move {
+                let df: DataFrame = plan_sql(&ctx, sql).await?;
+                let batches = df.collect().await?;
+                let text = pretty_format_batches(&batches)?.to_string();
+                Ok::<_, DataFusionError>(text)
+            }
+        };
+
+        let sql = "SELECT a + 1 AS b, b * 2 AS c FROM (VALUES (1, 10, 'x'), (2, 20, 'y')) \
+                   AS t(a, price, g) ORDER BY a";
+        let out = rows(sql).await.unwrap();
+        // (a + 1) * 2, not a + 1 * 2.
+        assert!(
+            out.contains("| 2 | 4 |") && out.contains("| 3 | 6 |"),
+            "{out}"
+        );
+
+        let sql = "SELECT price * 2 AS price, price + 1 AS q FROM (VALUES (1, 10, 'x'), \
+                   (2, 20, 'y')) AS t(a, price, g) ORDER BY q";
+        let out = rows(sql).await.unwrap();
+        assert!(out.contains("| 20    | 11 |"), "the column wins: {out}");
+
+        let sql = "SELECT a + 1 AS b, b * 2 AS c, c + b AS d FROM (VALUES (1, 10, 'x'), \
+                   (2, 20, 'y')) AS t(a, price, g) ORDER BY a";
+        let out = rows(sql).await.unwrap();
+        assert!(
+            out.contains("| 2 | 4 | 6 |") && out.contains("| 3 | 6 | 9 |"),
+            "{out}"
+        );
+
+        let sql = "SELECT g, sum(price) AS s, s * 2 AS u FROM (VALUES (1, 10, 'x'), \
+                   (2, 20, 'y'), (3, 5, 'x')) AS t(a, price, g) GROUP BY g ORDER BY g";
+        let out = rows(sql).await.unwrap();
+        assert!(
+            out.contains("| x | 15 | 30 |") && out.contains("| y | 20 | 40 |"),
+            "{out}"
+        );
+
+        let sql = "SELECT a AS b, z AS c FROM (VALUES (1, 10, 'x')) AS t(a, price, g)";
+        let err = rows(sql).await.unwrap_err().to_string();
+        assert!(err.contains("No field named z"), "{err}");
     }
 
     fn session_with(name: &str) -> (SessionContext, Arc<Recording>) {
