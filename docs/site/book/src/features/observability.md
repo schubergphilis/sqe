@@ -89,6 +89,36 @@ open http://localhost:13000    # Grafana, admin / admin
 
 The overlay auto-scrapes the single-node coordinator (`localhost:19090`), the distributed coordinator (`localhost:29090`), and workers (`localhost:29091-29094`). A pre-built dashboard lives at `deploy/observability/sqe-benchmark-dashboard.json` and is auto-provisioned by the overlay. To import it manually, copy the JSON into your Grafana instance and point it at a Prometheus or VictoriaMetrics data source.
 
+### Table health and alert rules
+
+The maintenance scheduler sets these per-table gauges on every tick, for the
+tables opted in with `sqe.maintenance.enabled = 'true'`. They exist only when
+`[maintenance] mode` is `"advisory"` or `"active"` and
+`[maintenance.scheduler] enabled = true`. The `table` label is `namespace.table`.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `sqe_table_data_files` | Gauge | `table` | Live data files |
+| `sqe_table_delete_files` | Gauge | `table` | Live delete files (position and equality) |
+| `sqe_table_small_files` | Gauge | `table` | Live data files below the target compaction file size |
+| `sqe_table_manifests` | Gauge | `table` | Manifests in the current snapshot, data and delete |
+| `sqe_maintenance_est_rewrite_bytes` | Gauge | `table` | Bytes in the bin-pack groups compaction would rewrite |
+
+`deploy/observability/alerts.yml` holds SQE's alert rules. Two of them
+watch these gauges, and both mean compaction is due:
+
+| Alert | Fires when (for 1h) | Fix |
+|---|---|---|
+| `SqeTableDeleteFileAmplification` | more than one delete file per two data files, on a table with at least 50 delete files | `CALL system.rewrite_data_files` |
+| `SqeTableManifestCountHigh` | more than 500 manifests in the current snapshot | `CALL system.rewrite_manifests` |
+
+The thresholds are starting points; edit them in `alerts.yml`. Load the file
+with Prometheus `rule_files`, or set `prometheusRule.enabled: true` in the
+Helm chart to install the same rules as a `PrometheusRule` (add the labels
+your Prometheus `ruleSelector` matches under `prometheusRule.labels`).
+`make alerts-test` checks the rules and runs their promtool unit tests in
+`deploy/observability/alerts.test.yml`.
+
 ## Health Endpoints
 
 Available on port 9091 (metrics port + 1) for both coordinator and workers.

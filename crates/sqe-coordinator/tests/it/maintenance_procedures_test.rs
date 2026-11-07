@@ -550,14 +550,11 @@ async fn rewrite_manifests_commits_and_returns_summary() {
         .execute(&session, &format!("CREATE TABLE {table} (id BIGINT)"), None)
         .await
         .expect("CREATE");
-    handler
-        .execute(
-            &session,
-            &format!("INSERT INTO {table} VALUES (1), (2), (3)"),
-            None,
-        )
-        .await
-        .expect("INSERT");
+    // Three INSERTs, three fast-append commits: three manifests.
+    for v in 1..=3 {
+        let sql = format!("INSERT INTO {table} VALUES ({v})");
+        handler.execute(&session, &sql, None).await.expect("INSERT");
+    }
 
     let batches = handler
         .execute(
@@ -568,6 +565,21 @@ async fn rewrite_manifests_commits_and_returns_summary() {
         .await
         .expect("rewrite_manifests");
     assert!(!batches.is_empty());
+
+    // input_count / output_count are the manifests before and after the
+    // rewrite, read from the manifest lists (#815; they used to count
+    // snapshot summary properties).
+    let count = |name: &str| {
+        batches[0]
+            .column_by_name(name)
+            .unwrap_or_else(|| panic!("summary has {name}"))
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("Int64 count")
+            .value(0)
+    };
+    assert_eq!(count("input_count"), 3, "three appends, three manifests");
+    assert_eq!(count("output_count"), 1, "rewritten into one manifest");
 
     // Data readability must be preserved after the rewrite.
     let post = handler

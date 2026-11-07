@@ -107,7 +107,7 @@ BENCH_STORAGE  ?= local
         ebook-pdf ebook-epub ebook-html bench bench-smoke \
         benchmark-charts test test-access-control test-access-control-spark \
         test-integration test-distributed test-integration-down \
-        audit audit-advisories deps-check lock-maintenance dbt-sqe-lock metrics-layering-check \
+        audit audit-advisories deps-check lock-maintenance dbt-sqe-lock metrics-layering-check alerts-test \
         audit-deny audit-licenses \
         benchmark_all benchmark_all_trino \
         clippy lint fmt fmt-check pre-commit pre-commit-all clean clean-rust clean-rustbook \
@@ -396,6 +396,13 @@ metrics-layering-check:  ## Only runtime crates may link the full sqe-metrics cr
 	@bad=$$(grep -l 'path = "../sqe-metrics" }' crates/*/Cargo.toml | grep -vE 'sqe-(coordinator|server|worker|lineage)/'); \
 	if [ -n "$$bad" ]; then echo "full sqe-metrics linked by a library crate (use sqe-metrics-core):"; echo "$$bad"; exit 1; fi
 	@echo "==> metrics layering ok"
+
+# promtool from the Prometheus image, so no local install is needed. Bump the
+# tag with the Prometheus version you run.
+PROMTOOL_IMAGE ?= prom/prometheus:v3.5.0
+alerts-test:  ## Check deploy/observability/alerts.yml and run its promtool unit tests (needs Docker)
+	@docker run --rm -v "$(CURDIR)/deploy/observability:/w:ro" -w /w --entrypoint promtool $(PROMTOOL_IMAGE) check rules alerts.yml
+	@docker run --rm -v "$(CURDIR)/deploy/observability:/w:ro" -w /w --entrypoint promtool $(PROMTOOL_IMAGE) test rules alerts.test.yml
 
 check-advisory-ignores:  ## Every ignored advisory (deny.toml, .cargo/audit.toml, .grype.yaml) has an owner and an unexpired review date
 	@test -n "$(AIKIDO_SHARED_HOME)" || { echo "Set AIKIDO_SHARED_HOME to an Aikido checkout"; exit 1; }

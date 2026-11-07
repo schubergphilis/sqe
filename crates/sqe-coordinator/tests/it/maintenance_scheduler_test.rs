@@ -405,6 +405,17 @@ async fn advisory_tick_reports_opted_table_and_mutates_nothing() {
         Some(0.0),
         "opted table has no delete files"
     );
+    assert_eq!(
+        gauge_sample(&metrics, "sqe_table_data_files", "ns.opted"),
+        Some(3.0),
+        "opted table has 3 live data files"
+    );
+    // One fast_append commit writes one manifest (#815).
+    assert_eq!(
+        gauge_sample(&metrics, "sqe_table_manifests", "ns.opted"),
+        Some(1.0),
+        "opted table's current snapshot has one manifest"
+    );
     assert!(
         gauge_sample(&metrics, "sqe_maintenance_est_rewrite_bytes", "ns.opted").unwrap_or(0.0)
             > 0.0,

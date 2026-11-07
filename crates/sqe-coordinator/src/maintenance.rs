@@ -2735,12 +2735,23 @@ impl MaintenanceHandler {
             .await?;
         let ident = to_table_ident(table_ref);
         let table = load_table(&catalog, &ident).await?;
+        let manifests_before = current_manifest_count(&table).await?;
 
         let tx = Transaction::new(&table);
-        let action = tx.rewrite_manifests();
-        let tx_applied = action
-            .apply(tx)
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("rewrite_manifests apply failed: {e}")))?;
+        // Without a cluster function the action only applies manual
+        // add/delete calls, so the rewrite committed an unchanged manifest
+        // list (#815). One key merges every data manifest of a partition
+        // spec; the action still seals a manifest at
+        // `commit.manifest.target-size-bytes`. Delete manifests are kept.
+        let action = tx
+            .rewrite_manifests()
+            .cluster_by(Box::new(|_| String::new()));
+        let tx_applied = action.apply(tx).map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("rewrite_manifests apply failed: {e}"),
+            )
+        })?;
 
         let committed = tx_applied
             .commit(catalog.as_ref())
@@ -2758,23 +2769,20 @@ impl MaintenanceHandler {
         )
         .await;
 
-        let manifest_count = committed
-            .metadata()
-            .current_snapshot()
-            .map(|s| s.summary().additional_properties.len() as i64)
-            .unwrap_or(0);
+        let manifests_after = current_manifest_count(&committed).await?;
 
         info!(
             table = %ident,
-            manifest_count,
+            manifests_before,
+            manifests_after,
             "rewrite_manifests: committed"
         );
 
         Ok(vec![summary_batch(
             "rewrite_manifests",
             &ident,
-            0,
-            manifest_count,
+            manifests_before,
+            manifests_after,
             0,
             0,
             "committed".to_string(),
@@ -3581,6 +3589,23 @@ pub(crate) async fn collect_health_inputs(
     let delete_files = collect_live_delete_files(table).await?;
     let read_plan = plan_delete_aware_read(table).await?;
     Ok((data_files, delete_files, read_plan.tasks_by_path))
+}
+
+/// Manifests in `table`'s current snapshot, data and delete manifests
+/// together; 0 for a table with no snapshot. Reads the manifest list
+/// (through the table's object cache), not the snapshot summary, which
+/// carries no manifest count.
+pub(crate) async fn current_manifest_count(table: &IcebergTable) -> sqe_core::Result<i64> {
+    let metadata_ref = table.metadata_ref();
+    let Some(snapshot) = metadata_ref.current_snapshot() else {
+        return Ok(0);
+    };
+    let manifest_list = table
+        .object_cache()
+        .get_manifest_list(snapshot, &metadata_ref)
+        .await
+        .map_err(|e| SqeError::Execution(format!("failed to load manifest list: {e}")))?;
+    Ok(manifest_list.entries().len() as i64)
 }
 
 /// Table property prefix a compaction job stamps onto the snapshot it

@@ -388,3 +388,10 @@ serviceMonitor:
   enabled: false
   interval: 30s
   labels: {}
+
+# Alert rules from deploy/observability/alerts.yml as a PrometheusRule
+# (prometheus-operator). Add the labels your Prometheus `ruleSelector`
+# matches, e.g. `release: kube-prometheus-stack`.
+prometheusRule:
+  enabled: false
+  labels: {}
