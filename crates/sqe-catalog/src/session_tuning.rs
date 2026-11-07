@@ -457,3 +457,70 @@ mod recursive_aggregate_dynamic_filter {
         assert_eq!(non_null_iterations(&ctx, dir.path()).await, 1);
     }
 }
+
+/// The default null order, which a Databricks migration must not rely on
+/// (#876). SQE keeps DataFusion's `nulls_max`, as Trino and PostgreSQL do:
+/// nulls sort as the largest value, so they come last in `ASC` and first in
+/// `DESC`. Spark and Databricks put them last in `DESC`; migrated SQL keeps
+/// that order by writing `NULLS LAST`, which these tests also pin, together
+/// with the window `ORDER BY` that `ROW_NUMBER` / `QUALIFY` top-N depend on.
+#[cfg(test)]
+mod null_ordering_default {
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::{Int64Array, RecordBatch};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+
+    fn ctx() -> SessionContext {
+        let ctx = SessionContext::new_with_config(super::engine_session_config());
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(1), None, Some(2)]))],
+        )
+        .unwrap();
+        let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        ctx.register_table("t", Arc::new(table)).unwrap();
+        ctx
+    }
+
+    /// Column 0 of the result, top to bottom, with NULL as `None`.
+    async fn column(sql: &str) -> Vec<Option<i64>> {
+        let batches = ctx().sql(sql).await.unwrap().collect().await.unwrap();
+        let mut out = Vec::new();
+        for b in &batches {
+            let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            out.extend(col.iter());
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn null_ordering_default_is_nulls_largest() {
+        let asc = column("SELECT a FROM t ORDER BY a").await;
+        assert_eq!(asc, vec![Some(1), Some(2), None]);
+        let desc = column("SELECT a FROM t ORDER BY a DESC").await;
+        assert_eq!(desc, vec![None, Some(2), Some(1)], "DESC puts nulls first");
+    }
+
+    #[tokio::test]
+    async fn null_ordering_explicit_nulls_last_gives_spark_desc_order() {
+        let desc = column("SELECT a FROM t ORDER BY a DESC NULLS LAST").await;
+        assert_eq!(desc, vec![Some(2), Some(1), None]);
+        let asc = column("SELECT a FROM t ORDER BY a ASC NULLS FIRST").await;
+        assert_eq!(asc, vec![None, Some(1), Some(2)]);
+    }
+
+    #[tokio::test]
+    async fn null_ordering_window_top_n_follows_the_same_rule() {
+        let top = "SELECT a FROM (SELECT a, ROW_NUMBER() OVER (ORDER BY a DESC) AS rn FROM t) \
+                   WHERE rn = 1";
+        // Bare DESC: the NULL row ranks first.
+        assert_eq!(column(top).await, vec![None]);
+        let spark = "SELECT a FROM (SELECT a, ROW_NUMBER() OVER (ORDER BY a DESC NULLS LAST) \
+                     AS rn FROM t) WHERE rn = 1";
+        assert_eq!(column(spark).await, vec![Some(2)]);
+    }
+}
