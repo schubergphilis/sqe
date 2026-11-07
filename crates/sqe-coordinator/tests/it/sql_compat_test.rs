@@ -280,6 +280,14 @@ async fn test_sql_compat_06_qualify() {
     run_sql_file("06_qualify.sql").await;
 }
 
+// SQL pipe syntax (`|>`, #851): FROM-first queries with pipe steps run through
+// the coordinator's front door and planner, and `|` stays bitwise OR.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn test_sql_compat_07_pipe_syntax() {
+    run_sql_file("07_pipe_syntax.sql").await;
+}
+
 // Lateral column aliases (#878): a select-list item may name an earlier
 // item's alias, and a FROM column of the same name wins (Databricks' rule).
 #[tokio::test(flavor = "multi_thread")]

@@ -74,6 +74,42 @@ SELECT * FROM events
 FOR INCREMENTAL BETWEEN SNAPSHOT 1234 AND SNAPSHOT 5678;
 ```
 
+### Pipe syntax
+
+A query can be written as a chain of steps joined by `|>`, in the order they run. Each step takes the result of the one before it. The query starts with a bare `FROM t` or a full `SELECT`. This is the pipe syntax from BigQuery and Databricks, planned by DataFusion.
+
+```sql
+FROM orders
+|> WHERE order_date >= DATE '2026-01-01'
+|> AGGREGATE SUM(amount) AS total_spent GROUP BY customer_id
+|> WHERE total_spent > 1000
+|> ORDER BY total_spent DESC;
+```
+
+That query returns the same rows as:
+
+```sql
+SELECT customer_id, SUM(amount) AS total_spent
+FROM orders
+WHERE order_date >= DATE '2026-01-01'
+GROUP BY customer_id
+HAVING SUM(amount) > 1000
+ORDER BY total_spent DESC;
+```
+
+| Operator | Meaning |
+|---|---|
+| `\|> WHERE pred` | Filter. After `AGGREGATE` it acts like `HAVING`. |
+| `\|> SELECT exprs` | Replace the columns. |
+| `\|> EXTEND expr AS name, ...` | Add columns and keep the existing ones. |
+| `\|> AGGREGATE aggs [GROUP BY keys]` | Aggregate. The output has the group keys, then the aggregates. |
+| `\|> ORDER BY ...` / `\|> LIMIT n [OFFSET m]` | Sort, limit. |
+| `\|> AS alias` | Name the result so later steps can qualify its columns. |
+| `\|> [LEFT\|...] JOIN t ON ...` | Join another table to the result. |
+| `\|> UNION / INTERSECT / EXCEPT [ALL\|DISTINCT] (query)` | Set operation with another query. |
+
+`SET`, `DROP`, `RENAME`, `TABLESAMPLE`, `CALL`, `PIVOT` and `UNPIVOT` steps parse but are not planned: the query fails with "`...` pipe operator is not supported yet". Policies apply to a pipe query the same way as to its standard form, because they rewrite the plan, not the text.
+
 ## INSERT
 
 | Form | Origin | Notes |

@@ -25,8 +25,9 @@
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{Expr, Ident, Query, Select, SelectItem, SetExpr, VisitMut, VisitorMut};
-use sqlparser::dialect::DuckDbDialect;
 use sqlparser::parser::Parser;
+
+use crate::front_door::ExecutionDialect;
 
 /// `sql` with every bare reference to `name` in a select list replaced by
 /// the expression an earlier item of that select list aliases as `name`.
@@ -36,7 +37,9 @@ use sqlparser::parser::Parser;
 /// `name` is the planner's normalized name: unquoted identifiers compare
 /// ASCII-case-insensitively, quoted ones exactly.
 pub fn inline_lateral_alias(sql: &str, name: &str) -> Option<String> {
-    let mut statements = Parser::parse_sql(&DuckDbDialect {}, sql).ok()?;
+    // The planner's dialect (DuckDB plus `|>`, #851), so a pipe query
+    // parses here too.
+    let mut statements = Parser::parse_sql(&ExecutionDialect, sql).ok()?;
     let [statement] = statements.as_mut_slice() else {
         return None;
     };
