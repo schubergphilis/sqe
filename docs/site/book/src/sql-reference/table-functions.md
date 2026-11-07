@@ -108,7 +108,7 @@ The `summary` column is a `MAP<VARCHAR, VARCHAR>`; cast values numerically when 
 | `generate_series(start, stop)` | `datafusion-builtin` | Integer sequence, inclusive both ends. | `sequence` | `sequence` | `sequence` | `generate_series` |
 | `generate_series(start, stop, step)` | `datafusion-builtin` | With step. Negative step counts down. | `sequence` | - | - | `generate_series` |
 | `range(start, stop)` / `range(start, stop, step)` | `datafusion-builtin` | Half-open: includes `start`, excludes `stop`. | - | - | - | `range` |
-| `unnest(array)` | `datafusion-builtin` | Lateral expansion: one input row -> N output rows. | `unnest` | `flatten` | `explode` | `unnest` |
+| `unnest(array)` | `datafusion-builtin` | Lateral expansion: one input row -> N output rows. Spark's `explode` and `posexplode` are accepted in the SELECT list (see [Array, map, struct](array-map.md)). | `unnest` | `flatten` | `explode` | `unnest` |
 
 Examples:
 
