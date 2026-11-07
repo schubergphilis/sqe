@@ -235,7 +235,11 @@ pub fn apply_trino_compat(statements: &mut Vec<Statement>, source: &str) -> bool
     // `].` / `).` -> rewrite_dot_after_subscript: `l[1].b` and `(s).a`,
     // which DataFusion cannot plan.
     let has_late_dot = lower.contains("].") || lower.contains(").");
+    // `explode` -> rewrite_spark_explode: Spark's `explode(a)` and
+    // `posexplode(a)` select-list generators become `unnest`. See #877.
+    let has_explode = lower.contains("explode");
     if !has_json_cast
+        && !has_explode
         && !has_late_dot
         && !has_exponent
         && !has_unicode_literal
@@ -458,6 +462,10 @@ impl VisitorMut for TrinoCompatVisitor {
     fn post_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
         // Translate a FETCH clause DataFusion can't plan. See #319.
         if rewrite_fetch_clause(query) {
+            self.rewrites += 1;
+        }
+        // Spark select-list generators. See #877.
+        if rewrite_spark_explode(query.body.as_mut()) {
             self.rewrites += 1;
         }
         ControlFlow::Continue(())
@@ -1273,6 +1281,134 @@ fn rewrite_metadata_dollar_table(factor: &mut TableFactor) -> bool {
     true
 }
 
+/// Rewrite Spark's `explode(a)` and `posexplode(a)` select items into
+/// DataFusion `unnest`, in every SELECT of `body` (set-operation branches
+/// included; nested queries are reached by their own `post_visit_query`).
+/// Returns true if any item was rewritten. See #877.
+///
+/// - `explode(a)` becomes `unnest(a) AS col`.
+/// - `posexplode(a)` becomes two items, `unnest(range(0, n)) AS pos` and
+///   `unnest(a) AS col` with `n = CAST(array_length(a) AS BIGINT)`.
+///   DataFusion zips select-list unnests, so row `i` pairs position `i`
+///   (0-based, BIGINT) with element `i`. A NULL or empty array gives no
+///   rows, as in Spark; a NULL element is kept.
+/// - A user alias is kept: `explode(a) AS x`, `posexplode(a) AS (p, x)`.
+///   A single alias on `posexplode` names nothing Spark accepts, so it is
+///   left for the planner to refuse.
+/// - Only a whole select item is rewritten; a generator inside another
+///   expression is not valid Spark and is left alone. The argument is
+///   evaluated twice for `posexplode`, so it should be deterministic.
+/// - `explode` of a MAP and the `_outer` variants are not handled.
+fn rewrite_spark_explode(body: &mut SetExpr) -> bool {
+    let select = match body {
+        SetExpr::Select(s) => s.as_mut(),
+        SetExpr::SetOperation { left, right, .. } => {
+            let l = rewrite_spark_explode(left.as_mut());
+            let r = rewrite_spark_explode(right.as_mut());
+            return l || r;
+        }
+        _ => return false,
+    };
+    let generator_arg = |expr: &Expr, name: &str| -> Option<Expr> {
+        let Expr::Function(func) = expr else {
+            return None;
+        };
+        if !function_name_is(func, name) || func.over.is_some() || func.filter.is_some() {
+            return None;
+        }
+        let FunctionArguments::List(list) = &func.args else {
+            return None;
+        };
+        match list.args.as_slice() {
+            [FunctionArg::Unnamed(FunctionArgExpr::Expr(arg))] if list.clauses.is_empty() => {
+                Some(arg.clone())
+            }
+            _ => None,
+        }
+    };
+    let positions = |arg: Expr| -> Expr {
+        let len = Expr::Cast {
+            kind: CastKind::Cast,
+            expr: Box::new(call("array_length", arg)),
+            data_type: SqlDataType::BigInt(None),
+            format: None,
+            array: false,
+        };
+        let range = Expr::Function(Function {
+            name: ObjectName::from(vec![Ident::new("range")]),
+            uses_odbc_syntax: false,
+            parameters: FunctionArguments::None,
+            args: FunctionArguments::List(FunctionArgumentList {
+                duplicate_treatment: None,
+                args: vec![
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::value(Value::Number(
+                        "0".to_string(),
+                        false,
+                    )))),
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(len)),
+                ],
+                clauses: vec![],
+            }),
+            filter: None,
+            null_treatment: None,
+            over: None,
+            within_group: vec![],
+        });
+        call("unnest", range)
+    };
+
+    let mut changed = false;
+    let mut out = Vec::with_capacity(select.projection.len() + 1);
+    for item in std::mem::take(&mut select.projection) {
+        let (expr, aliases) = match &item {
+            SelectItem::UnnamedExpr(e) => (e, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(vec![alias.clone()])),
+            SelectItem::ExprWithAliases { expr, aliases } => (expr, Some(aliases.clone())),
+            _ => {
+                out.push(item);
+                continue;
+            }
+        };
+        if let Some(arg) = generator_arg(expr, "explode") {
+            let alias = match aliases.as_deref() {
+                None => Ident::new("col"),
+                Some([a]) => a.clone(),
+                Some(_) => {
+                    out.push(item);
+                    continue;
+                }
+            };
+            out.push(SelectItem::ExprWithAlias {
+                expr: call("unnest", arg),
+                alias,
+            });
+            changed = true;
+        } else if let Some(arg) = generator_arg(expr, "posexplode") {
+            let (pos, col) = match aliases.as_deref() {
+                None => (Ident::new("pos"), Ident::new("col")),
+                Some([p, c]) => (p.clone(), c.clone()),
+                Some(_) => {
+                    out.push(item);
+                    continue;
+                }
+            };
+            out.push(SelectItem::ExprWithAlias {
+                expr: positions(arg.clone()),
+                alias: pos,
+            });
+            out.push(SelectItem::ExprWithAlias {
+                expr: call("unnest", arg),
+                alias: col,
+            });
+            changed = true;
+        } else {
+            out.push(item);
+        }
+    }
+    select.projection = out;
+    changed
+}
+
 /// Translate a `FETCH FIRST n ROW[S] {ONLY|WITH TIES}` clause that DataFusion
 /// rejects (it plans only `LIMIT`, returning `not_impl_err!("FETCH clause is
 /// not supported yet")` for any `query.fetch`). Returns true when the query was
@@ -1715,6 +1851,55 @@ mod tests {
     fn unnest_without_ordinality_untouched() {
         let sql = "SELECT * FROM UNNEST(ARRAY[1,2]) AS t(x)";
         assert_eq!(rewrite_trino_compat(sql), sql);
+    }
+
+    #[test]
+    fn posexplode_becomes_pos_and_col_unnests() {
+        let out = rewrite_trino_compat("SELECT id, posexplode(a) FROM t");
+        assert_eq!(
+            out,
+            "SELECT id, unnest(range(0, CAST(array_length(a) AS BIGINT))) AS pos, \
+             unnest(a) AS col FROM t"
+        );
+    }
+
+    #[test]
+    fn posexplode_keeps_a_two_name_alias() {
+        let out = rewrite_trino_compat("SELECT posexplode(a) AS (p, v) FROM t");
+        assert!(out.contains(") AS p, unnest(a) AS v FROM t"), "{out}");
+    }
+
+    #[test]
+    fn explode_becomes_unnest_named_col() {
+        assert_eq!(
+            rewrite_trino_compat("SELECT explode(a) FROM t"),
+            "SELECT unnest(a) AS col FROM t"
+        );
+        assert_eq!(
+            rewrite_trino_compat("SELECT explode(a) AS x FROM t"),
+            "SELECT unnest(a) AS x FROM t"
+        );
+    }
+
+    #[test]
+    fn explode_in_subquery_and_union_branch_rewritten() {
+        let out = rewrite_trino_compat(
+            "SELECT * FROM (SELECT explode(a) FROM t) UNION ALL SELECT explode(b) FROM u",
+        );
+        assert!(!out.contains("explode"), "{out}");
+        assert_eq!(out.matches("unnest(").count(), 2, "{out}");
+    }
+
+    #[test]
+    fn explode_inside_an_expression_or_quoted_untouched() {
+        for sql in [
+            "SELECT explode(a) + 1 FROM t",
+            "SELECT \"explode\"(a) FROM t",
+            "SELECT posexplode(a) AS p FROM t",
+            "SELECT explode_count FROM t",
+        ] {
+            assert_eq!(rewrite_trino_compat(sql), sql);
+        }
     }
 
     #[test]

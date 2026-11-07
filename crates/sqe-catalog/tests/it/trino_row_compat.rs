@@ -375,3 +375,75 @@ async fn cast_row_to_named_row_executes_as_named_struct() {
         "field y missing from struct type: {dt}"
     );
 }
+
+/// Rewrite + run `input` and return the result as a pretty table, so the
+/// column names, types and row order are all asserted at once.
+async fn rewrite_and_render(input: &str) -> String {
+    let rewritten = rewrite_trino_compat(input);
+    let ctx = SessionContext::new();
+    let df = ctx
+        .sql(&rewritten)
+        .await
+        .unwrap_or_else(|e| panic!("planning failed for `{rewritten}` (from `{input}`): {e}"));
+    let schema = df.schema().clone();
+    let batches = df
+        .collect()
+        .await
+        .unwrap_or_else(|e| panic!("execution failed for `{rewritten}` (from `{input}`): {e}"));
+    let types: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|f| format!("{}:{}", f.name(), f.data_type()))
+        .collect();
+    let table = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+        .unwrap()
+        .to_string();
+    format!("{}\n{table}", types.join(","))
+}
+
+#[tokio::test]
+async fn posexplode_returns_zero_based_pos_and_col() {
+    // #877: Spark `posexplode` names its columns `pos` (BIGINT, from 0) and
+    // `col`.
+    let out = rewrite_and_render("SELECT posexplode(ARRAY[10, 20])").await;
+    let want = "pos:Int64,col:Int64\n\
+                +-----+-----+\n\
+                | pos | col |\n\
+                +-----+-----+\n\
+                | 0   | 10  |\n\
+                | 1   | 20  |\n\
+                +-----+-----+";
+    assert_eq!(out, want);
+}
+
+#[tokio::test]
+async fn posexplode_empty_and_null_arrays_return_no_rows() {
+    // Spark: an empty or NULL array generates no rows; a NULL element is kept.
+    for sql in [
+        "SELECT posexplode(CAST(ARRAY[] AS BIGINT[]))",
+        "SELECT posexplode(CAST(NULL AS BIGINT[]))",
+    ] {
+        let out = rewrite_and_render(sql).await;
+        assert!(!out.contains("| 0"), "`{sql}` should give no rows: {out}");
+    }
+    let out = rewrite_and_render("SELECT posexplode(ARRAY[7, NULL])").await;
+    assert!(out.contains("| 0   | 7   |"), "{out}");
+    assert!(out.contains("| 1   |     |"), "NULL element kept: {out}");
+}
+
+#[tokio::test]
+async fn posexplode_keeps_user_aliases_and_other_columns() {
+    let out =
+        rewrite_and_render("SELECT 'k' AS id, posexplode(ARRAY['a', 'b']) AS (p, v) ORDER BY p")
+            .await;
+    assert!(out.starts_with("id:Utf8,p:Int64,v:Utf8\n"), "{out}");
+    assert!(out.contains("| k  | 0 | a |"), "{out}");
+    assert!(out.contains("| k  | 1 | b |"), "{out}");
+}
+
+#[tokio::test]
+async fn explode_returns_only_the_element_column() {
+    let out = rewrite_and_render("SELECT explode(ARRAY[10, 20])").await;
+    assert!(out.starts_with("col:Int64\n"), "{out}");
+    assert!(out.contains("| 10  |") && out.contains("| 20  |"), "{out}");
+}

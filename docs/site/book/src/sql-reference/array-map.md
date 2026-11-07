@@ -69,6 +69,16 @@ DataFusion's `datafusion-functions-nested` crate ships ~40 array and map helpers
 |---|---|---|---|---|---|---|
 | `unnest(a)` | `datafusion-builtin` | One row per element. Used in FROM. | yes | yes | yes (`explode`) | yes |
 | `unnest(a) WITH ORDINALITY` | `datafusion-builtin` | Adds 1-based offset column. | yes | - | - | - |
+| `explode(a)` | `sqe-sql` | Spark spelling, in the SELECT list. Rewritten to `unnest(a) AS col`. | - | - | yes | - |
+| `posexplode(a)` | `sqe-sql` | Spark spelling, in the SELECT list. Two columns: `pos` (BIGINT, starts at 0) and `col`. | - | - | yes | - |
+
+`explode` and `posexplode` follow Spark:
+
+- Write them as a whole SELECT item. They cannot sit inside another expression.
+- An empty or NULL array gives no rows. A NULL element gives a row.
+- `posexplode(a) AS (p, v)` renames both columns, and `explode(a) AS v` renames the one column.
+- They take arrays only. `explode` of a MAP and the `_outer` variants (`explode_outer`, `posexplode_outer`) are not supported.
+- `pos` starts at 0. The `WITH ORDINALITY` column starts at 1.
 
 ```sql
 -- One row per (order, item) pair
@@ -78,6 +88,10 @@ FROM orders, UNNEST(items) AS t(item);
 -- Numbered
 SELECT order_id, item, idx
 FROM orders, UNNEST(items) WITH ORDINALITY AS t(item, idx);
+
+-- Spark spelling: SELECT posexplode(ARRAY[10, 20]) returns (0, 10), (1, 20)
+SELECT order_id, posexplode(items) AS (pos, item)
+FROM orders;
 ```
 
 ## Map functions
