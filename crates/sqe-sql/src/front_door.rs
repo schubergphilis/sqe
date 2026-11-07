@@ -50,6 +50,72 @@ use crate::token_scan::parse_error;
 /// One constant so the check and the session cannot name different dialects.
 pub const EXECUTION_DIALECT: &str = "DuckDB";
 
+/// The parser the engine plans with: [`EXECUTION_DIALECT`] plus the `|>` pipe
+/// syntax (#851). sqlparser only tokenizes `|>` for dialects that opt in
+/// (Generic, BigQuery), and DataFusion's dialect setting is a name, so a
+/// DuckDB session could not read pipe queries. This wraps DuckDB, reports
+/// itself as DuckDB to sqlparser's `dialect_of!` checks, and turns the pipe
+/// operator on. The planner entry points in `sqe_catalog::file_tvf_prepare`
+/// parse with it, and the front door's tokenization check (#683) compares
+/// against it.
+///
+/// The delegation list mirrors every `DuckDbDialect` override in sqlparser
+/// 0.62 (`src/dialect/duckdb.rs`); recheck it on a sqlparser bump.
+/// `execution_dialect_parses_like_duckdb` holds the DuckDB syntax SQE
+/// relies on to the same AST under both.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ExecutionDialect;
+
+macro_rules! delegate_to_duckdb {
+    ($($name:ident),* $(,)?) => {
+        $(fn $name(&self) -> bool {
+            sqlparser::dialect::DuckDbDialect.$name()
+        })*
+    };
+}
+
+impl sqlparser::dialect::Dialect for ExecutionDialect {
+    fn dialect(&self) -> std::any::TypeId {
+        std::any::TypeId::of::<sqlparser::dialect::DuckDbDialect>()
+    }
+
+    fn is_identifier_start(&self, ch: char) -> bool {
+        sqlparser::dialect::DuckDbDialect.is_identifier_start(ch)
+    }
+
+    fn is_identifier_part(&self, ch: char) -> bool {
+        sqlparser::dialect::DuckDbDialect.is_identifier_part(ch)
+    }
+
+    fn supports_pipe_operator(&self) -> bool {
+        true
+    }
+
+    delegate_to_duckdb!(
+        supports_trailing_commas,
+        supports_filter_during_aggregation,
+        supports_group_by_expr,
+        supports_bitwise_shift_operators,
+        supports_named_fn_args_with_eq_operator,
+        supports_named_fn_args_with_assignment_operator,
+        supports_dictionary_syntax,
+        support_map_literal_syntax,
+        supports_lambda_functions,
+        allow_extract_single_quotes,
+        supports_explain_with_utility_options,
+        supports_load_extension,
+        supports_array_typedef_with_brackets,
+        supports_from_first_select,
+        supports_order_by_all,
+        supports_select_wildcard_exclude,
+        supports_notnull_operator,
+        supports_install,
+        supports_detach,
+        supports_select_wildcard_replace,
+        supports_comma_separated_trim,
+    );
+}
+
 /// The protocol a statement arrived on.
 ///
 /// Today no rewrite is protocol-specific: Trino HTTP, Flight SQL (dbt-sqe,
@@ -352,6 +418,63 @@ mod tests {
         "CREATE TABLE t (id INT)",
         "SELECT 'information_schema.tables'",
     ];
+
+    /// #851: pipe queries pass the front door (they used to fail the #683
+    /// tokenization check, DuckDB reading `|>` as `|` then `>`) and come out
+    /// as text the execution dialect parses to the same statement.
+    #[test]
+    fn pipe_syntax_passes_the_front_door() {
+        let door = SqlFrontDoor::new(WireDialect::Flight);
+        for sql in [
+            "FROM orders |> WHERE order_date >= DATE '2026-01-01' \
+             |> AGGREGATE SUM(amount) AS total_spent GROUP BY customer_id \
+             |> WHERE total_spent > 1000 |> ORDER BY total_spent DESC",
+            "SELECT * FROM orders |> WHERE amount > 1 |> SELECT customer_id |> LIMIT 5",
+            "SELECT a FROM t |> EXTEND a * 2 AS b |> AS x |> WHERE x.b > 2",
+        ] {
+            let normalized = door.normalize(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let text = normalized.sql();
+            assert!(text.contains("|>"), "{sql} lost its pipes: {text}");
+            assert!(text.starts_with("SELECT "), "FROM not expanded: {text}");
+            let reparsed = Parser::parse_sql(&ExecutionDialect, text)
+                .unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(reparsed.len(), 1, "{text}");
+        }
+        // Relation walkers reach tables named only inside a pipe step.
+        let sql = "SELECT a FROM t |> JOIN information_schema.tables ON true";
+        let stmt = &Parser::parse_sql(&GenericDialect {}, sql).unwrap()[0];
+        assert!(metadata::reads_information_schema(stmt), "{sql}");
+    }
+
+    /// The DuckDB syntax SQE relies on parses to the same AST under
+    /// [`ExecutionDialect`] as under sqlparser's DuckDB dialect, and `|`
+    /// stays bitwise OR (#851).
+    #[test]
+    fn execution_dialect_parses_like_duckdb() {
+        let duckdb = sqlparser::dialect::DuckDbDialect;
+        for sql in [
+            "SELECT filter([1, 2, 3], x -> x > 1)",
+            "SELECT {'a': 1, 'b': 2}",
+            "SELECT MAP {'a': 1}",
+            "SELECT * EXCLUDE (a) FROM t",
+            "SELECT * REPLACE (a + 1 AS a) FROM t",
+            "SELECT a, b, FROM t",
+            "SELECT a FROM t ORDER BY ALL",
+            "FROM t SELECT a",
+            "SELECT a FROM t WHERE a NOTNULL",
+            "SELECT 1 << 2, 6 | 1, a$b FROM t",
+            "SELECT f(a := 1), g(b => 2)",
+            "SELECT count(*) FILTER (WHERE a > 1) FROM t",
+            "SELECT EXTRACT('year' FROM d) FROM t",
+            "SELECT TRIM(a, 'x') FROM t",
+            "CREATE TABLE t (a INT[])",
+        ] {
+            let expected = Parser::parse_sql(&duckdb, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let actual =
+                Parser::parse_sql(&ExecutionDialect, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(actual, expected, "{sql}");
+        }
+    }
 
     #[test]
     fn every_dialect_normalizes_trino_shapes_identically() {

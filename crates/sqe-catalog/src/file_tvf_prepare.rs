@@ -154,6 +154,44 @@ fn planning_options() -> datafusion::execution::context::SQLOptions {
     datafusion::execution::context::SQLOptions::new().with_allow_ddl(false)
 }
 
+/// `SessionState::create_logical_plan`, parsing with
+/// [`sqe_sql::ExecutionDialect`] instead of the session's named dialect.
+/// DataFusion's dialect setting is a name, and the DuckDB dialect it names
+/// does not tokenize the `|>` pipe operator (#851); the planner does plan
+/// pipe queries. Same recursion limit and single-statement rule as
+/// DataFusion's own `sql_to_statement`.
+async fn parse_and_plan(
+    state: &datafusion::execution::SessionState,
+    sql: &str,
+) -> DFResult<LogicalPlan> {
+    let recursion_limit = state.config().options().sql_parser.recursion_limit.get();
+    let mut statements = datafusion::sql::parser::DFParserBuilder::new(sql)
+        .with_dialect(&sqe_sql::ExecutionDialect)
+        .with_recursion_limit(recursion_limit)
+        .build()?
+        .parse_statements()?;
+    if statements.len() > 1 {
+        return datafusion::common::not_impl_err!(
+            "The context currently only supports a single SQL statement"
+        );
+    }
+    let statement = statements.pop_front().ok_or_else(|| {
+        DataFusionError::Plan("No SQL statements were provided in the query string".into())
+    })?;
+    state.statement_to_plan(statement).await
+}
+
+/// `SessionContext::sql_with_options` over [`parse_and_plan`].
+async fn sql_with_options(
+    ctx: &SessionContext,
+    sql: &str,
+    options: datafusion::execution::context::SQLOptions,
+) -> DFResult<DataFrame> {
+    let plan = parse_and_plan(&ctx.state(), sql).await?;
+    options.verify_plan(&plan)?;
+    ctx.execute_logical_plan(plan).await
+}
+
 /// Prepare the file table functions `sql` calls, then plan it: the one way
 /// a planner entry point should reach `ctx.sql`. Refuses DDL
 /// ([`planning_options`]).
@@ -163,8 +201,7 @@ pub async fn plan_sql(
 ) -> DFResult<datafusion::dataframe::DataFrame> {
     in_statement(async {
         prepare_statement(ctx, sql).await?;
-        let df = ctx
-            .sql_with_options(sql, planning_options())
+        let df = sql_with_options(ctx, sql, planning_options())
             .await
             .map_err(explain_not_iceberg)?;
         name_unknown_types(bind_statement_params(df)?)
@@ -237,7 +274,9 @@ pub async fn plan_sql_without_policy(
 ) -> DFResult<datafusion::dataframe::DataFrame> {
     in_statement(async {
         prepare_statement(ctx, sql).await?;
-        let df = ctx.sql(sql).await.map_err(explain_not_iceberg)?;
+        let df = sql_with_options(ctx, sql, datafusion::execution::context::SQLOptions::new())
+            .await
+            .map_err(explain_not_iceberg)?;
         name_unknown_types(bind_statement_params(df)?)
     })
     .await
@@ -252,8 +291,7 @@ pub async fn plan_parsed(
 ) -> DFResult<datafusion::dataframe::DataFrame> {
     in_statement(async {
         prepare_parsed_statement(ctx, statement).await?;
-        let df = ctx
-            .sql_with_options(sql, planning_options())
+        let df = sql_with_options(ctx, sql, planning_options())
             .await
             .map_err(explain_not_iceberg)?;
         name_unknown_types(bind_statement_params(df)?)
@@ -291,8 +329,7 @@ pub async fn create_logical_plan(
                 registry.prepare_statement(sql).await?;
             }
         }
-        let plan = state
-            .create_logical_plan(sql)
+        let plan = parse_and_plan(state, sql)
             .await
             .map_err(explain_not_iceberg)?;
         match crate::txn::params() {
@@ -780,6 +817,55 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    /// #851: a pipe query plans through every entry point under the engine
+    /// session config (DuckDB dialect) and returns what its standard-SQL
+    /// form returns. DataFusion plans pipes; DuckDB did not tokenize `|>`.
+    #[tokio::test]
+    async fn pipe_query_matches_its_standard_sql_form() {
+        use datafusion::arrow::util::pretty::pretty_format_batches;
+        let ctx = SessionContext::new_with_config(crate::session_tuning::engine_session_config());
+        let orders = "CREATE TABLE orders AS SELECT * FROM (VALUES \
+            (1, DATE '2026-02-01', 800), (1, DATE '2026-03-01', 400), \
+            (2, DATE '2025-12-01', 5000), (2, DATE '2026-01-05', 900), \
+            (3, DATE '2026-04-01', 3000)) AS v(customer_id, order_date, amount)";
+        ctx.sql(orders).await.unwrap();
+        let pipe = "FROM orders \
+            |> WHERE order_date >= DATE '2026-01-01' \
+            |> AGGREGATE SUM(amount) AS total_spent GROUP BY customer_id \
+            |> WHERE total_spent > 1000 \
+            |> ORDER BY total_spent DESC";
+        let standard = "SELECT customer_id, SUM(amount) AS total_spent FROM orders \
+            WHERE order_date >= DATE '2026-01-01' GROUP BY customer_id \
+            HAVING SUM(amount) > 1000 ORDER BY total_spent DESC";
+        let expected = "+-------------+-------------+\n\
+                        | customer_id | total_spent |\n\
+                        +-------------+-------------+\n\
+                        | 3           | 3000        |\n\
+                        | 1           | 1200        |\n\
+                        +-------------+-------------+";
+        // Every protocol hands the planner front-door text (bare `FROM t`
+        // becomes `SELECT * FROM t` there).
+        let door = sqe_sql::SqlFrontDoor::new(sqe_sql::WireDialect::Flight);
+        for sql in [pipe, standard] {
+            let normalized = door.normalize(sql).unwrap();
+            let sql = normalized.sql();
+            let df = plan_sql(&ctx, sql).await.unwrap();
+            let rows = df.collect().await.unwrap();
+            assert_eq!(pretty_format_batches(&rows).unwrap().to_string(), expected);
+            let plan = create_logical_plan(&ctx.state(), sql).await.unwrap();
+            let df = ctx.execute_logical_plan(plan).await.unwrap();
+            let rows = df.collect().await.unwrap();
+            assert_eq!(pretty_format_batches(&rows).unwrap().to_string(), expected);
+        }
+        // Pipe operators DataFusion does not plan say so.
+        let drop = "FROM orders |> DROP amount";
+        let err = plan_sql(&ctx, drop).await.unwrap_err();
+        assert!(err.to_string().contains("not supported"), "{err}");
+        // Two statements stay refused, as in DataFusion's own parser.
+        let err = plan_sql(&ctx, "SELECT 1; SELECT 2").await.unwrap_err();
+        assert!(err.to_string().contains("single SQL statement"), "{err}");
     }
 
     /// #839: the planned schema types the UNION by its first branch; the
