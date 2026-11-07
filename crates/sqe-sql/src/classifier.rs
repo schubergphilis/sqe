@@ -878,6 +878,13 @@ fn try_classify_custom(parser: &mut Parser, sql: &str) -> sqe_core::Result<Optio
             expect_end(parser)?;
             Some(StatementKind::SetWriteBranch(branch))
         }
+        // RESET WRITE_BRANCH: back to main, the same as `SET WRITE_BRANCH =
+        // DEFAULT`. The refusals that a write branch causes name this form.
+        ["RESET", "WRITE_BRANCH", ..] => {
+            consume_words(parser, &["RESET", "WRITE_BRANCH"]);
+            expect_end(parser)?;
+            Some(StatementKind::SetWriteBranch(None))
+        }
         // SET SESSION <name> = <value> (Trino session property). (#628)
         ["SET", "SESSION", ..] => {
             consume_words(parser, &["SET", "SESSION"]);
@@ -3176,6 +3183,23 @@ mod tests {
     fn test_set_write_branch_null_clears() {
         let kind = parse_and_classify("SET WRITE_BRANCH = NULL").unwrap();
         assert!(matches!(kind, StatementKind::SetWriteBranch(None)));
+    }
+
+    #[test]
+    fn test_reset_write_branch_clears() {
+        // The write-branch refusals tell the user to run this form.
+        for sql in [
+            "RESET WRITE_BRANCH",
+            "reset write_branch",
+            "RESET WRITE_BRANCH;",
+        ] {
+            let kind = parse_and_classify(sql).unwrap();
+            assert!(
+                matches!(kind, StatementKind::SetWriteBranch(None)),
+                "{sql}: {kind:?}"
+            );
+        }
+        assert!(parse_and_classify("RESET WRITE_BRANCH dev").is_err());
     }
 
     #[test]
