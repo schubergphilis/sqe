@@ -77,6 +77,7 @@ pub fn register_extended_trino_functions(ctx: &datafusion::prelude::SessionConte
     // Format / JSON
     ctx.register_udf(ScalarUDF::from(Format));
     ctx.register_udf(ScalarUDF::from(crate::json_cast::ToJson));
+    ctx.register_udf(ScalarUDF::from(crate::json_cast::JsonArrayOfJson));
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1597,6 +1598,9 @@ impl ScalarUDFImpl for JsonArrayGet {
     }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Utf8)
+    }
+    fn return_field_from_args(&self, _: ReturnFieldArgs) -> DFResult<FieldRef> {
+        Ok(crate::json_cast::json_text_field(self.name()))
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         const EXPECTED: &str = "json, bigint";

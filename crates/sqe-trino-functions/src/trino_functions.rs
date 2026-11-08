@@ -13,6 +13,7 @@ use arrow::array::{
 };
 use arrow::compute::kernels::zip::zip;
 use arrow::datatypes::DataType;
+use arrow::datatypes::FieldRef;
 use arrow::temporal_conversions;
 use chrono::{Datelike, Duration, Months, NaiveDate, NaiveDateTime, Timelike};
 use datafusion::common::Result as DFResult;
@@ -20,8 +21,8 @@ use datafusion::common::ScalarValue;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
 use datafusion::logical_expr::{
-    ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
-    Volatility,
+    ColumnarValue, Expr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+    TypeSignature, Volatility,
 };
 use sqe_trino_protocol::encode;
 
@@ -1175,7 +1176,16 @@ impl ScalarUDFImpl for TypeOf {
             ColumnarValue::Array(arr) => arr.data_type().clone(),
             ColumnarValue::Scalar(sv) => sv.data_type(),
         };
-        let type_name = encode::arrow_to_declared_trino_type(&data_type);
+        // JSON text from json_parse and friends is Utf8 with a marker (#848).
+        let type_name = if args
+            .arg_fields
+            .first()
+            .is_some_and(|f| crate::json_cast::is_json_text(f))
+        {
+            "json".to_string()
+        } else {
+            encode::arrow_to_declared_trino_type(&data_type)
+        };
 
         // Return a scalar string — same value for every row.
         Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(type_name))))
@@ -2499,6 +2509,9 @@ impl ScalarUDFImpl for JsonExtract {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Utf8)
     }
+    fn return_field_from_args(&self, _: ReturnFieldArgs) -> DFResult<FieldRef> {
+        Ok(crate::json_cast::json_text_field(self.name()))
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         str_transform_2("json_extract", &args.args, |json, path| {
             let key = path.trim_start_matches("$.");
@@ -2601,6 +2614,9 @@ impl ScalarUDFImpl for JsonParse {
     }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Utf8)
+    }
+    fn return_field_from_args(&self, _: ReturnFieldArgs) -> DFResult<FieldRef> {
+        Ok(crate::json_cast::json_text_field(self.name()))
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         // json_parse validates and normalises the JSON string to Trino's

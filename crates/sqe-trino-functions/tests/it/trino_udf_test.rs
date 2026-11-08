@@ -842,6 +842,94 @@ async fn test_to_json_null_is_sql_null() {
     );
 }
 
+/// A JSON value reaches `to_json` with its marker through an alias, a CTE
+/// and a subquery, so the cast stays the identity as in Trino (#848). A
+/// plain string is still encoded as a JSON string.
+#[tokio::test]
+async fn test_to_json_of_json_value_is_the_identity() {
+    let cases = [
+        (
+            r#"SELECT to_json(json_parse('{"b":1,"a":[1,2]}'))"#,
+            r#"{"a":[1,2],"b":1}"#,
+        ),
+        (
+            r#"SELECT to_json(json_extract('{"a":{"b":"x"}}', '$.a'))"#,
+            r#"{"b":"x"}"#,
+        ),
+        (
+            r#"SELECT to_json(json_extract('{"a":"x"}', '$.a'))"#,
+            r#""x""#,
+        ),
+        ("SELECT to_json(json_array_get('[1,[2]]', 1))", "[2]"),
+        ("SELECT to_json(to_json(make_array(1, 2)))", "[1,2]"),
+        (
+            r#"WITH j AS (SELECT json_parse('{"a":1}') AS p) SELECT to_json(p) FROM j"#,
+            r#"{"a":1}"#,
+        ),
+        (
+            r#"SELECT to_json(p) FROM (SELECT json_parse('[1]') AS p) s"#,
+            "[1]",
+        ),
+        (r#"SELECT to_json('{"a":1}')"#, r#""{\"a\":1}""#),
+        // CASE and coalesce return a field without the marker: still quoted.
+        (
+            r#"SELECT to_json(CASE WHEN s <> '' THEN json_parse(s) END) FROM (VALUES ('{"a":1}')) t(s)"#,
+            r#""{\"a\":1}""#,
+        ),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(eval_str(sql).await.as_deref(), Some(want), "{sql}");
+    }
+    assert_eq!(eval_str("SELECT to_json(json_parse(NULL))").await, None);
+}
+
+#[tokio::test]
+async fn test_typeof_json_value_is_json() {
+    let cases = [
+        ("SELECT typeof(json_parse('1'))", "json"),
+        (
+            "SELECT typeof(p) FROM (SELECT json_extract('{}', '$') AS p) s",
+            "json",
+        ),
+        ("SELECT typeof(to_json(1))", "json"),
+        ("SELECT typeof('1')", "varchar"),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(eval_str(sql).await.as_deref(), Some(want), "{sql}");
+    }
+}
+
+/// `CAST(ARRAY[<json>, ...] AS JSON)` is rewritten to this function; Trino
+/// embeds each element and writes a NULL element as `null` (#848).
+#[tokio::test]
+async fn test_json_array_of_json_embeds_elements() {
+    let cases = [
+        (
+            r#"make_array(json_parse('{"a":1}'), NULL, json_parse('[2]'))"#,
+            r#"[{"a":1},null,[2]]"#,
+        ),
+        (r#"make_array(json_parse('"s"'))"#, r#"["s"]"#),
+        (
+            "make_array(__sqe_json_array_of_json(make_array(json_parse('1'))))",
+            "[[1]]",
+        ),
+    ];
+    for (expr, want) in cases {
+        let got = eval_str(&format!("SELECT __sqe_json_array_of_json({expr})")).await;
+        assert_eq!(got.as_deref(), Some(want), "{expr}");
+    }
+    assert_eq!(
+        eval_str("SELECT __sqe_json_array_of_json(CAST(NULL AS VARCHAR[]))").await,
+        None
+    );
+    assert_eq!(
+        eval_str("SELECT typeof(__sqe_json_array_of_json(make_array(json_parse('1'))))")
+            .await
+            .as_deref(),
+        Some("json")
+    );
+}
+
 #[tokio::test]
 async fn test_to_json_column_input() {
     let ctx = ctx().await;
