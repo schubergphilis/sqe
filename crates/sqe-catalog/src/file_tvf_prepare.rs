@@ -154,6 +154,51 @@ fn planning_options() -> datafusion::execution::context::SQLOptions {
     datafusion::execution::context::SQLOptions::new().with_allow_ddl(false)
 }
 
+/// Bounds [`plan_with_lateral_aliases`]: one round per alias a chain uses.
+const LATERAL_ALIAS_ROUNDS: usize = 16;
+
+/// Plan `sql` with `plan`; when planning fails on a bare name that an
+/// earlier select-list item aliases (`SELECT a + 1 AS b, b * 2 AS c`,
+/// #878), inline that alias ([`sqe_sql::inline_lateral_alias`]) and plan
+/// again. A name the `FROM` relation has never fails, so the column wins
+/// over the alias, as in Databricks. Returns the last planning error when no
+/// alias explains it.
+async fn plan_with_lateral_aliases<T, F, Fut>(sql: &str, mut plan: F) -> DFResult<T>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = DFResult<T>>,
+{
+    let mut text = sql.to_string();
+    for _ in 0..LATERAL_ALIAS_ROUNDS {
+        let error = match plan(text.clone()).await {
+            Ok(planned) => return Ok(planned),
+            Err(error) => error,
+        };
+        let inlined = unresolved_bare_name(&error)
+            .and_then(|name| sqe_sql::inline_lateral_alias(&text, name));
+        match inlined {
+            Some(next) => text = next,
+            None => return Err(error),
+        }
+    }
+    plan(text).await
+}
+
+/// The unqualified column name a planning error could not resolve.
+fn unresolved_bare_name(error: &DataFusionError) -> Option<&str> {
+    let DataFusionError::SchemaError(schema_error, _) = error.find_root() else {
+        return None;
+    };
+    match schema_error.as_ref() {
+        datafusion::common::SchemaError::FieldNotFound { field, .. }
+            if field.relation.is_none() =>
+        {
+            Some(field.name.as_str())
+        }
+        _ => None,
+    }
+}
+
 /// `SessionState::create_logical_plan`, parsing with
 /// [`sqe_sql::ExecutionDialect`] instead of the session's named dialect.
 /// DataFusion's dialect setting is a name, and the DuckDB dialect it names
@@ -201,9 +246,11 @@ pub async fn plan_sql(
 ) -> DFResult<datafusion::dataframe::DataFrame> {
     in_statement(async {
         prepare_statement(ctx, sql).await?;
-        let df = sql_with_options(ctx, sql, planning_options())
-            .await
-            .map_err(explain_not_iceberg)?;
+        let df = plan_with_lateral_aliases(sql, |sql| async move {
+            sql_with_options(ctx, &sql, planning_options()).await
+        })
+        .await
+        .map_err(explain_not_iceberg)?;
         name_unknown_types(bind_statement_params(df)?)
     })
     .await
@@ -274,9 +321,11 @@ pub async fn plan_sql_without_policy(
 ) -> DFResult<datafusion::dataframe::DataFrame> {
     in_statement(async {
         prepare_statement(ctx, sql).await?;
-        let df = sql_with_options(ctx, sql, datafusion::execution::context::SQLOptions::new())
-            .await
-            .map_err(explain_not_iceberg)?;
+        let df = plan_with_lateral_aliases(sql, |sql| async move {
+            sql_with_options(ctx, &sql, datafusion::execution::context::SQLOptions::new()).await
+        })
+        .await
+        .map_err(explain_not_iceberg)?;
         name_unknown_types(bind_statement_params(df)?)
     })
     .await
@@ -291,9 +340,11 @@ pub async fn plan_parsed(
 ) -> DFResult<datafusion::dataframe::DataFrame> {
     in_statement(async {
         prepare_parsed_statement(ctx, statement).await?;
-        let df = sql_with_options(ctx, sql, planning_options())
-            .await
-            .map_err(explain_not_iceberg)?;
+        let df = plan_with_lateral_aliases(sql, |sql| async move {
+            sql_with_options(ctx, &sql, planning_options()).await
+        })
+        .await
+        .map_err(explain_not_iceberg)?;
         name_unknown_types(bind_statement_params(df)?)
     })
     .await
@@ -329,9 +380,10 @@ pub async fn create_logical_plan(
                 registry.prepare_statement(sql).await?;
             }
         }
-        let plan = parse_and_plan(state, sql)
-            .await
-            .map_err(explain_not_iceberg)?;
+        let plan =
+            plan_with_lateral_aliases(sql, |sql| async move { parse_and_plan(state, &sql).await })
+                .await
+                .map_err(explain_not_iceberg)?;
         match crate::txn::params() {
             Some(params) => sqe_core::bind_params(plan, &params).map_err(DataFusionError::Plan),
             None => Ok(plan),

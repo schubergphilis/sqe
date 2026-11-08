@@ -13,6 +13,7 @@ pub mod hive_ddl;
 pub mod hive_partitions;
 pub mod identifier_case;
 pub mod identifier_fields;
+pub mod lateral_alias;
 pub mod merge_star;
 pub mod metadata;
 pub mod nested_row_cast;
@@ -54,6 +55,7 @@ pub use front_door::{
     EXECUTION_DIALECT,
 };
 pub use identifier_fields::{try_parse_identifier_fields, IdentifierFieldsDdl};
+pub use lateral_alias::inline_lateral_alias;
 pub use merge_star::{rewrite_merge_star, MERGE_STAR_MARKER};
 pub use metadata::{
     is_metadata_query, qualify_information_schema, reads_information_schema, update_type,
