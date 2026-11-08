@@ -1612,14 +1612,15 @@ impl EmbeddedClient {
             .clone()
     }
 
-    /// `CREATE TABLE <cat>.<ns>.<t> AS <query>` where `<cat>` is a
-    /// `WritableIcebergCatalog`. DataFusion's CTAS registers a filled
-    /// `MemTable`, which the Iceberg schema provider refuses ("register_table
-    /// does not support tables with data"). It accepts an empty one, so the
-    /// table is created from the query's schema with `LIMIT 0` and filled by
-    /// an `INSERT`, the path a plain INSERT already takes. The two steps are
-    /// not one commit: a failing INSERT drops the empty table again.
-    /// `Ok(None)` means "not ours" and falls through to `ctx.sql`.
+    /// `CREATE [OR REPLACE] TABLE <cat>.<ns>.<t> AS <query>` where `<cat>` is
+    /// a `WritableIcebergCatalog`, through `sqe-write`'s streaming CTAS as on
+    /// a coordinator: the table is created from the query's analyzed schema
+    /// (second and millisecond timestamps widened to microseconds), the rows
+    /// land in one append commit, and a failure after the create drops the
+    /// table again. `PARTITIONED BY`, `TBLPROPERTIES` / `WITH` and
+    /// `OR REPLACE` (in place when the schema fits, staged and swapped when
+    /// it does not) behave as on the cluster. `Ok(None)` means "not ours"
+    /// and falls through to `ctx.sql`.
     async fn embedded_handle_iceberg_ctas(
         &self,
         stmt: &sqlparser::ast::Statement,
@@ -1630,103 +1631,52 @@ impl EmbeddedClient {
         let Some(query) = ct.query.as_ref() else {
             return Ok(None);
         };
-        let parts: Vec<&str> = ct
-            .name
-            .0
-            .iter()
-            .filter_map(|p| p.as_ident().map(|i| i.value.as_str()))
-            .collect();
-        let catalog = match parts.as_slice() {
-            [catalog, _, _] => catalog.to_string(),
-            [_] | [_, _] => self.default_catalog(),
-            _ => return Ok(None),
-        };
-        if ct.temporary || !ct.columns.is_empty() || !self.iceberg_catalogs.contains_key(&catalog) {
+        if ct.temporary || !ct.columns.is_empty() {
             return Ok(None);
         }
+        let Some((catalog_name, catalog)) = self.writable_target(&ct.name) else {
+            return Ok(None);
+        };
         let name = &ct.name;
-        if ct.or_replace {
-            return Err(format!(
-                "CREATE OR REPLACE TABLE ... AS is not supported for Iceberg catalog \
-                 `{catalog}` in embedded mode; DROP TABLE {name} first"
-            )
-            .into());
-        }
-        // The CTAS below runs through DataFusion's CREATE TABLE, which would
-        // drop both silently.
-        if ct.partition_by.is_some()
-            || ct.cluster_by.is_some()
-            || !matches!(
-                ct.hive_distribution,
-                sqlparser::ast::HiveDistributionStyle::NONE
-            )
-            || !matches!(ct.table_options, sqlparser::ast::CreateTableOptions::None)
-        {
-            return Err(format!(
-                "CREATE TABLE ... AS with PARTITIONED BY, WITH or TBLPROPERTIES is not \
-                 supported for Iceberg catalog `{catalog}` in embedded mode; CREATE TABLE \
-                 {name} with a column list first, then INSERT INTO {name} SELECT ..."
-            )
-            .into());
-        }
-        let empty = QueryResult::empty();
-        if self.ctx.table_exist(name.to_string().as_str())? {
+        if !ct.or_replace && self.ctx.table_exist(name.to_string().as_str())? {
             if ct.if_not_exists {
-                return Ok(Some(empty));
+                return Ok(Some(QueryResult::empty()));
             }
             return Err(format!("table {name} already exists").into());
         }
-        // Iceberg stores no second or millisecond timestamps, and a Parquet
-        // `timestamp(s)` column reads as Timestamp(ms), so `CREATE TABLE AS
-        // SELECT * FROM read_parquet(...)` was refused with "Unsupported
-        // Arrow data type: Timestamp(ms)". Create the empty table with those
-        // columns widened to microseconds instead; the INSERT below casts the
-        // rows onto the table schema, which loses nothing.
-        let probe = self
-            .plan_datafusion(&format!("SELECT * FROM ({query}) AS __sqe_ctas LIMIT 0"))
+        self.ensure_write_scratch_catalog()?;
+
+        let select_sql = sqe_sql::rewrite_named_tvf_args(&query.to_string());
+        let rest_catalog = self.rest_catalogs.contains_key(&catalog_name);
+        let session = self.write_session(catalog_name.clone());
+        let handler = sqe_write::write_handler::WriteHandler::new(self.handler_config());
+        let mut plan_out = None;
+        let mut policy_summary = None;
+        let batches = handler
+            .handle_ctas_streaming_on(
+                &session,
+                stmt,
+                catalog,
+                rest_catalog,
+                &self.ctx,
+                &select_sql,
+                &mut plan_out,
+                &mut policy_summary,
+            )
             .await?;
-        match widen_coarse_timestamps(probe.schema().as_arrow()) {
-            Some(widened) => {
-                self.ctx.register_table(
-                    name.to_string().as_str(),
-                    Arc::new(datafusion::datasource::empty::EmptyTable::new(Arc::new(
-                        widened,
-                    ))),
-                )?;
-            }
-            None => {
-                self.run_datafusion(&format!(
-                    "CREATE TABLE {name} AS SELECT * FROM ({query}) AS __sqe_ctas LIMIT 0"
-                ))
-                .await?;
-            }
+
+        // The new table (and a namespace the handler created) is not in the
+        // catalog's cached listing yet.
+        let ident = sqe_write::ident::resolve_table_ident(name, &session)?;
+        let namespace = ident.namespace().as_ref().join(".");
+        if let Some(writable) = self.iceberg_catalogs.get(&catalog_name) {
+            writable.refresh_namespace(&namespace).await?;
         }
-        // The rows go through the same writer as a plain INSERT. The error
-        // is not `Send`, so only its text crosses the cleanup await.
-        let insert_sql = format!("INSERT INTO {name} {query}");
-        let inserted = match sqlparser::parser::Parser::parse_sql(
-            &sqlparser::dialect::GenericDialect {},
-            &insert_sql,
-        ) {
-            Ok(stmts) if stmts.len() == 1 => self
-                .embedded_handle_iceberg_insert(&stmts[0])
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string()),
-            _ => self
-                .run_datafusion(&insert_sql)
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string()),
-        };
-        let failure = match inserted {
-            Ok(()) => return Ok(Some(empty)),
-            Err(e) => e,
-        };
-        let _ = self
-            .run_datafusion(&format!("DROP TABLE IF EXISTS {name}"))
-            .await;
-        Err(failure.into())
+        let schema = batches
+            .first()
+            .map(|b| b.schema())
+            .unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()));
+        Ok(Some(QueryResult::from_batches(&schema, &batches)?))
     }
 
     /// The write handlers register their scratch tables under DataFusion's
@@ -2629,40 +2579,6 @@ impl EmbeddedClient {
             vec![vec![format!("CREATE VIEW {} AS\n{body}", parts.join("."))]],
         ))
     }
-}
-
-/// `schema` with its second and millisecond timestamp columns widened to
-/// microseconds, the coarsest precision Iceberg stores, or `None` when it has
-/// none. Nanosecond columns stay: the Iceberg schema provider upgrades the
-/// table to v3 for them.
-// ponytail: top-level columns only, like the coordinator's
-// `timestamps_for_format_version`.
-fn widen_coarse_timestamps(schema: &arrow_schema::Schema) -> Option<arrow_schema::Schema> {
-    use arrow_schema::{DataType, TimeUnit};
-    let coarse = |f: &arrow_schema::Field| {
-        matches!(
-            f.data_type(),
-            DataType::Timestamp(TimeUnit::Second | TimeUnit::Millisecond, _)
-        )
-    };
-    if !schema.fields().iter().any(|f| coarse(f)) {
-        return None;
-    }
-    let fields: Vec<arrow_schema::Field> = schema
-        .fields()
-        .iter()
-        .map(|f| match f.data_type() {
-            DataType::Timestamp(_, tz) if coarse(f) => f
-                .as_ref()
-                .clone()
-                .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, tz.clone())),
-            _ => f.as_ref().clone(),
-        })
-        .collect();
-    Some(arrow_schema::Schema::new_with_metadata(
-        fields,
-        schema.metadata().clone(),
-    ))
 }
 
 /// True when `sql`, after skipping leading whitespace and SQL comments,
@@ -4256,6 +4172,73 @@ mod tests {
             "{:?}",
             r.rows
         );
+    }
+
+    /// CTAS runs the coordinator's streaming CTAS (#875), not DataFusion's
+    /// empty CREATE plus a separate INSERT: the rows land in one snapshot,
+    /// `PARTITIONED BY` and `TBLPROPERTIES` are kept instead of refused, and
+    /// `CREATE OR REPLACE` replaces in place when the schema fits and swaps
+    /// in a new table when it does not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ctas_is_one_commit_and_keeps_partitioning_and_replace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().to_str().unwrap();
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
+        let rows = |r: QueryResult| r.rows;
+        for sql in [
+            format!("ATTACH '{path}' AS ice (TYPE sqlite)"),
+            "CREATE SCHEMA ice.s1".to_string(),
+        ] {
+            client
+                .execute(&sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        let created = client
+            .execute(
+                "CREATE TABLE ice.s1.t PARTITIONED BY (region) \
+                 TBLPROPERTIES ('sqe.test.prop' = 'kept') \
+                 AS SELECT * FROM (VALUES (1, 'eu'), (2, 'us'), (3, 'eu')) AS v(id, region)",
+            )
+            .await
+            .expect("ctas");
+        assert_eq!(rows(created), vec![vec!["3".to_string()]]);
+
+        let snapshots = "SELECT count(*) FROM ice.s1.\"t$snapshots\"";
+        let r = client.execute(snapshots).await.expect("snapshots");
+        assert_eq!(rows(r), vec![vec!["1".to_string()]], "one commit");
+        let ddl = client
+            .execute("SHOW CREATE TABLE ice.s1.t")
+            .await
+            .expect("show create");
+        let ddl = ddl.rows[0][0].clone();
+        assert!(ddl.contains("PARTITIONED BY"), "{ddl}");
+        assert!(ddl.contains("region"), "{ddl}");
+        assert!(ddl.contains("sqe.test.prop"), "{ddl}");
+
+        // Same schema: replaced in place, so the history carries over.
+        let replace = "CREATE OR REPLACE TABLE ice.s1.t PARTITIONED BY (region) \
+                       AS SELECT * FROM (VALUES (7, 'eu')) AS v(id, region)";
+        client.execute(replace).await.expect("replace in place");
+        let r = client.execute(snapshots).await.expect("snapshots");
+        assert_eq!(rows(r), vec![vec!["2".to_string()]], "history kept");
+        let r = client
+            .execute("SELECT id, region FROM ice.s1.t")
+            .await
+            .expect("select");
+        assert_eq!(rows(r), vec![vec!["7".to_string(), "eu".to_string()]]);
+
+        // Different schema: a new table swapped in under the same name.
+        let replace = "CREATE OR REPLACE TABLE ice.s1.t AS SELECT 'x' AS label";
+        client
+            .execute(replace)
+            .await
+            .expect("replace with a new schema");
+        let r = client
+            .execute("SELECT label FROM ice.s1.t")
+            .await
+            .expect("select");
+        assert_eq!(rows(r), vec![vec!["x".to_string()]]);
     }
 
     /// `SHOW TABLES IN|FROM [catalog.]schema [LIKE ...]` was "SHOW TABLES IN

@@ -118,11 +118,13 @@ WHERE total > 0;
 source is planned as a plain query and written the same way a coordinator
 writes it, so `VALUES` rows with `ARRAY` columns need no casts.
 
-CTAS into an Iceberg catalog runs as two commits. The first creates the empty
-table from the query's schema, the second inserts the rows. When the insert
-fails, the empty table is dropped again. `CREATE TABLE IF NOT EXISTS ... AS`
-skips an existing table. `CREATE OR REPLACE TABLE ... AS` is refused: drop the
-table first.
+CTAS into an Iceberg catalog runs on the cluster's CTAS handler. The table is
+created from the query's schema and the rows land in one append commit. When
+the write fails, the new table is dropped again. `PARTITIONED BY` and
+`TBLPROPERTIES` / `WITH (...)` options are kept. `CREATE TABLE IF NOT EXISTS
+... AS` skips an existing table. `CREATE OR REPLACE TABLE ... AS` swaps the
+rows in with one commit when the query's schema and partitioning match the
+table, which keeps its snapshot history. Otherwise a new table replaces it.
 
 `UPDATE`, `DELETE` and `MERGE INTO` run on the cluster's own write handlers.
 A table's `write.delete.mode` picks copy-on-write or merge-on-read, the same as
@@ -133,9 +135,7 @@ masks the rows these statements read.
 `PARTITIONED BY` transforms (`day(ts)`, `bucket(16, id)`), `TBLPROPERTIES` or
 `WITH (...)` options and nested `STRUCT`, `ARRAY` and `MAP` columns all reach
 the table metadata. New tables are format version 3 unless an option picks
-`'format-version' = '2'`. A CTAS with `PARTITIONED BY` or options is refused,
-because the CTAS path would drop them: create the table first, then
-`INSERT INTO ... SELECT`. `CREATE TABLE ... LIKE` runs on a coordinator only.
+`'format-version' = '2'`. `CREATE TABLE ... LIKE` runs on a coordinator only.
 
 `ALTER TABLE` runs on the cluster's DDL handler as well. Columns can be added,
 dropped, renamed and retyped, nested `STRUCT` fields included. `SET
@@ -180,7 +180,7 @@ Exporting results to plain files goes through `COPY ... TO`; see
 | `CREATE SCHEMA` / `DROP SCHEMA` | yes | yes |
 | `CREATE TABLE` with a column list | yes | yes |
 | `CREATE TABLE` with `PARTITIONED BY` or `TBLPROPERTIES` | yes | yes |
-| `CREATE TABLE ... AS` (CTAS) | yes, two commits | yes |
+| `CREATE [OR REPLACE] TABLE ... AS` (CTAS) | yes | yes |
 | `INSERT INTO` | yes | yes |
 | `UPDATE`, `DELETE`, `MERGE INTO` | yes | yes |
 | `ALTER TABLE` (columns, properties, partitions, rename) | yes | yes |
