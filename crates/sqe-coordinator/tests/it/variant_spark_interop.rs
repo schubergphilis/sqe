@@ -396,6 +396,83 @@ async fn sqe_prunes_its_own_files_on_variant_bounds() {
     assert_eq!(spark, vec!["2|3", "1|4"], "Spark's rows with SQE's bounds");
 }
 
+/// A string longer than 16 characters gets a truncated variant bound, as
+/// Iceberg Java writes it (#870): the lower bound is the 16-character prefix
+/// and the upper is cut and rounded up. Both still bound every value, so a
+/// file is pruned only when no row can match, and Spark 4.1 reads the same
+/// rows with these bounds in the manifest.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn sqe_prunes_on_truncated_string_variant_bounds() {
+    if let Some(reason) = spark_stack_skip_reason() {
+        eprintln!("skipping sqe_prunes_on_truncated_string_variant_bounds: {reason}");
+        return;
+    }
+    let (session, handler) = crate::common::setup_handler().await;
+    let fq = "default.variant_truncated_bounds";
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+    for sql in [
+        format!(
+            "CREATE TABLE {fq} (id INT, v JSON) \
+             WITH ('write.parquet.shred-variants' = 'true')"
+        ),
+        // Bounds [customer-0000000, customer-0000001].
+        format!(
+            r#"INSERT INTO {fq} VALUES (1, '{{"s": "customer-0000000000-alpha"}}'), (2, '{{"s": "customer-0000000000-beta"}}')"#
+        ),
+        // Bounds [supplier-0000000, supplier-0000001].
+        format!(
+            r#"INSERT INTO {fq} VALUES (3, '{{"s": "supplier-0000000000-gamma"}}'), (4, '{{"s": "supplier-0000000000-delta"}}')"#
+        ),
+    ] {
+        handler.execute(&session, &sql, None).await.expect(&sql);
+    }
+
+    let filters = [
+        "variant_get(v, '$.s', 'string') = 'customer-0000000000-beta'",
+        "variant_get(v, '$.s', 'string') = 'supplier-0000000000-delta'",
+        // Inside the first file's truncated range, but no row has it.
+        "variant_get(v, '$.s', 'string') = 'customer-0000000000-zeta'",
+        "variant_get(v, '$.s', 'string') > 'customer-0000001'",
+        "variant_get(v, '$.s', 'string') = 'vendor-0000000000-x'",
+    ];
+    let mut got = Vec::new();
+    for filter in filters {
+        let sql = format!("SELECT count(*), min(id) FROM {fq} WHERE {filter}");
+        let rows = sqe_rows(&handler, &session, &sql).await.join(",");
+        let (scanned, total) = scan_files(&handler, &session, &sql).await;
+        got.push(format!("{rows} files {scanned}/{total}"));
+    }
+    let spark_count =
+        |filter: &str| format!("SELECT count(*), min(id) FROM rest.{fq} WHERE {filter};");
+    let spark = spark_rows(&format!(
+        "{} {}",
+        spark_count(filters[0]),
+        spark_count(filters[1])
+    ));
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+
+    assert_eq!(
+        got,
+        vec![
+            "1|2 files 1/2",
+            "1|4 files 1/2",
+            "0|NULL files 1/2",
+            "2|3 files 1/2",
+            "0|NULL files 0/2",
+        ]
+    );
+    assert_eq!(
+        spark,
+        vec!["1|2", "1|4"],
+        "Spark's rows with truncated bounds"
+    );
+}
+
 /// SQE writes shredded variants when the table sets
 /// `write.parquet.shred-variants` (#858). Each data file infers its own
 /// shredding from its first batch, so the second INSERT shreds `a` as a
