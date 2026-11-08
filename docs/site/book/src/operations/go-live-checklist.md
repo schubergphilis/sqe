@@ -22,7 +22,7 @@ What SQE ships and what your platform owns is split in [Shared Responsibility](.
 **Health and monitoring**
 
 - [ ] `/healthz` and `/readyz` answer `200`, and the probes are green.
-- [ ] Prometheus scrapes the coordinator. The rules in `deploy/observability/alerts.yml` are loaded and route to your on-call.
+- [ ] Prometheus scrapes the coordinator. The rules in `deploy/observability/alerts.yml` are loaded (`rule_files`, or `prometheusRule.enabled: true` in the Helm chart) and route to your on-call.
 
 **Audit logging**
 

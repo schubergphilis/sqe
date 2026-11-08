@@ -316,6 +316,10 @@ pub struct MetricsRegistry {
     pub table_small_files: GaugeVec,
     /// Live delete files (position + equality), by table.
     pub table_delete_files: GaugeVec,
+    /// Live data files, by table.
+    pub table_data_files: GaugeVec,
+    /// Manifests in the current snapshot (data and delete), by table.
+    pub table_manifests: GaugeVec,
     /// Bytes covered by the pure bin-pack eligible groups, by table.
     pub maintenance_est_rewrite_bytes: GaugeVec,
     /// Advisory tick loop failures (a whole tick erroring out, not a
@@ -934,6 +938,20 @@ impl MetricsRegistry {
             &["table"],
         )?;
 
+        let table_data_files = register_gauge_vec(
+            &registry,
+            "sqe_table_data_files",
+            "Live data files, by table",
+            &["table"],
+        )?;
+
+        let table_manifests = register_gauge_vec(
+            &registry,
+            "sqe_table_manifests",
+            "Manifests in the current snapshot (data and delete), by table",
+            &["table"],
+        )?;
+
         let maintenance_est_rewrite_bytes = register_gauge_vec(
             &registry,
             "sqe_maintenance_est_rewrite_bytes",
@@ -1090,6 +1108,8 @@ impl MetricsRegistry {
             dashboard_auth_success_total,
             table_small_files,
             table_delete_files,
+            table_data_files,
+            table_manifests,
             maintenance_est_rewrite_bytes,
             maintenance_tick_errors,
             maintenance_job_total,

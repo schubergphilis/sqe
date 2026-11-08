@@ -1,0 +1,23 @@
+{{- if .Values.prometheusRule.enabled }}
+{{- /*
+  The rules are deploy/observability/alerts.yml; files/alerts.yml is a
+  symlink to it, so a plain Prometheus `rule_files` setup and this chart
+  load the same rules.
+*/}}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "sqe.fullname" . }}
+  labels:
+    {{- include "sqe.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- $rules := .Files.Get "files/alerts.yml" | fromYaml }}
+  {{- if not $rules.groups }}
+  {{- fail "files/alerts.yml has no rule groups" }}
+  {{- end }}
+  groups:
+    {{- toYaml $rules.groups | nindent 4 }}
+{{- end }}

@@ -152,3 +152,40 @@ groups:
         annotations:
           summary: An SQE worker scrape target is down
           description: "{{ $labels.instance }} is not being scraped. Relabel job if your scrape config uses a different name."
+
+  # Table health (#815). The maintenance scheduler sets these gauges on each
+  # tick for the tables opted in with `sqe.maintenance.enabled = 'true'`.
+  # The series exist only when `[maintenance] mode` is "advisory" or "active"
+  # and `[maintenance.scheduler] enabled = true`; otherwise these rules stay
+  # silent. Both mean compaction is due.
+  - name: sqe.table_health
+    rules:
+      - alert: SqeTableDeleteFileAmplification
+        # More than one delete file for every two data files, on a table
+        # with at least 50 delete files (small tables are cheap to read).
+        expr: |
+          sqe_table_delete_files / clamp_min(sqe_table_data_files, 1) > 0.5
+            and
+          sqe_table_delete_files >= 50
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.table }} has too many delete files"
+          description: >
+            {{ $labels.table }} reads {{ $value | humanize }} delete files per
+            data file. Every scan merges them. Run
+            CALL system.rewrite_data_files on it, or opt it in to active
+            compaction.
+
+      - alert: SqeTableManifestCountHigh
+        expr: sqe_table_manifests > 500
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.table }} has more than 500 manifests"
+          description: >
+            The current snapshot of {{ $labels.table }} lists
+            {{ $value | humanize }} manifests, and query planning reads each
+            one. Run CALL system.rewrite_manifests on it.

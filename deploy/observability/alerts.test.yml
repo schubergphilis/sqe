@@ -1,0 +1,59 @@
+# promtool unit tests for alerts.yml. Run with `make alerts-test`.
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # #815: a table with more than N position-delete files fires the
+  # amplification alert; a small table and a healthy large one do not.
+  - interval: 1m
+    input_series:
+      - series: 'sqe_table_delete_files{table="ns.amplified"}'
+        values: '120x90'
+      - series: 'sqe_table_data_files{table="ns.amplified"}'
+        values: '100x90'
+      - series: 'sqe_table_delete_files{table="ns.small"}'
+        values: '10x90'
+      - series: 'sqe_table_data_files{table="ns.small"}'
+        values: '2x90'
+      - series: 'sqe_table_delete_files{table="ns.healthy"}'
+        values: '60x90'
+      - series: 'sqe_table_data_files{table="ns.healthy"}'
+        values: '1000x90'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SqeTableDeleteFileAmplification
+        exp_alerts: []
+      - eval_time: 61m
+        alertname: SqeTableDeleteFileAmplification
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              table: ns.amplified
+            exp_annotations:
+              summary: "ns.amplified has too many delete files"
+              description: >
+                ns.amplified reads 1.2 delete files per data file. Every scan
+                merges them. Run CALL system.rewrite_data_files on it, or opt
+                it in to active compaction.
+
+  - interval: 1m
+    input_series:
+      - series: 'sqe_table_manifests{table="ns.fragmented"}'
+        values: '800x90'
+      - series: 'sqe_table_manifests{table="ns.compact"}'
+        values: '3x90'
+    alert_rule_test:
+      - eval_time: 61m
+        alertname: SqeTableManifestCountHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              table: ns.fragmented
+            exp_annotations:
+              summary: "ns.fragmented has more than 500 manifests"
+              description: >
+                The current snapshot of ns.fragmented lists 800 manifests, and
+                query planning reads each one. Run CALL system.rewrite_manifests
+                on it.

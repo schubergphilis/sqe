@@ -880,6 +880,36 @@ impl MaintenanceScheduler {
         });
     }
 
+    /// Set the per-table health gauges. Advisory and active mode both call
+    /// this, so a dashboard sees the same series whichever mode runs.
+    fn record_health_gauges(
+        &self,
+        name: &str,
+        health: &crate::table_health::TableHealth,
+        manifests: Option<i64>,
+    ) {
+        let m = &self.metrics;
+        let gauges = [
+            (&m.table_small_files, health.small_files as f64),
+            (&m.table_delete_files, health.delete_files as f64),
+            (&m.table_data_files, health.live_data_files as f64),
+            (
+                &m.maintenance_est_rewrite_bytes,
+                health.est_rewrite_bytes as f64,
+            ),
+        ];
+        for (gauge, value) in gauges {
+            gauge.with_label_values(&[name]).set(value);
+        }
+        // A manifest list that failed to load leaves the last value in place
+        // rather than reporting a table with no manifests.
+        if let Some(manifests) = manifests {
+            m.table_manifests
+                .with_label_values(&[name])
+                .set(manifests as f64);
+        }
+    }
+
     /// Analyze one table's compaction debt and report it. Read-only: the
     /// only write is the best-effort `maintenance_log` append, and even
     /// that failure is swallowed (logged, not propagated) so it never
@@ -906,18 +936,8 @@ impl MaintenanceScheduler {
         );
 
         let name = ident.to_string();
-        self.metrics
-            .table_small_files
-            .with_label_values(&[&name])
-            .set(health.small_files as f64);
-        self.metrics
-            .table_delete_files
-            .with_label_values(&[&name])
-            .set(health.delete_files as f64);
-        self.metrics
-            .maintenance_est_rewrite_bytes
-            .with_label_values(&[&name])
-            .set(health.est_rewrite_bytes as f64);
+        let manifests = crate::maintenance::current_manifest_count(&table).await?;
+        self.record_health_gauges(&name, &health, Some(manifests));
 
         if let Some(audit) = &self.audit {
             audit.log_event(build_maintenance_audit_event(
@@ -1041,18 +1061,14 @@ impl MaintenanceScheduler {
         // (per-table-resolved) knobs too, so they agree with the gate and
         // the rewrite below, not with a global config a table has opted
         // out of via its own override.
-        self.metrics
-            .table_small_files
-            .with_label_values(&[&name])
-            .set(health.small_files as f64);
-        self.metrics
-            .table_delete_files
-            .with_label_values(&[&name])
-            .set(health.delete_files as f64);
-        self.metrics
-            .maintenance_est_rewrite_bytes
-            .with_label_values(&[&name])
-            .set(health.est_rewrite_bytes as f64);
+        let manifests = match crate::maintenance::current_manifest_count(&table).await {
+            Ok(n) => Some(n),
+            Err(e) => {
+                warn!(table = %name, error = %e, "active_tick: manifest count failed");
+                None
+            }
+        };
+        self.record_health_gauges(&name, &health, manifests);
 
         let job_id = uuid::Uuid::now_v7().to_string();
         let started_at_ms = now_ms;
