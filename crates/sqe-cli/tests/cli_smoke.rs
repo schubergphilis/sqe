@@ -417,7 +417,9 @@ fn embedded_warehouse_alter_table() {
 }
 
 #[test]
-fn embedded_warehouse_ctas_refuses_partitioning_it_would_drop() {
+fn embedded_warehouse_ctas_keeps_partitioning() {
+    // Embedded CTAS runs the cluster's CTAS handler (#875), so PARTITIONED BY
+    // lands in the table's spec instead of being refused.
     let wh = tempfile::tempdir().expect("tempdir");
     let wh_path = wh.path().to_str().expect("utf-8 path");
     bin()
@@ -441,10 +443,9 @@ fn embedded_warehouse_ctas_refuses_partitioning_it_would_drop() {
         ])
         .timeout(std::time::Duration::from_secs(60))
         .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "CREATE TABLE ... AS with PARTITIONED BY",
-        ));
+        .success();
+    let ddl = show_create(wh_path, "iceberg.s.t");
+    assert!(ddl.contains("PARTITIONED BY (id)"), "{ddl}");
 }
 
 #[test]
