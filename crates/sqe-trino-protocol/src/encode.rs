@@ -5,8 +5,21 @@
 //! tool results). It lived in the Trino *server* crate, so `sqe-mcp` linked
 //! the whole HTTP server for this one function (review 803, item 3).
 
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field};
 use base64::Engine;
+
+/// Field metadata key that marks a Utf8 value as JSON text rather than a
+/// string (#848): set on the result of `json_parse`, `json_extract`,
+/// `json_array_get` and `CAST(.. AS JSON)`. Private on purpose: the
+/// canonical `ARROW:extension:name = arrow.json` would make Flight clients
+/// (pyarrow, ADBC) read the column as a JSON extension array.
+pub const JSON_TEXT_MARKER: &str = "sqe.json";
+
+/// True when `field` is Utf8 JSON text carrying [`JSON_TEXT_MARKER`].
+pub fn is_json_text(field: &Field) -> bool {
+    field.data_type() == &DataType::Utf8
+        && field.metadata().get(JSON_TEXT_MARKER).map(String::as_str) == Some("true")
+}
 
 /// Normalize a rendered timestamp string to exactly 6 fractional-second digits
 /// (truncating extra precision, padding shorter), preserving any trailing

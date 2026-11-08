@@ -192,7 +192,13 @@ pub fn columns_for_schema(schema: &arrow_schema::Schema) -> Vec<TrinoColumn> {
         .fields()
         .iter()
         .map(|f| {
-            let trino_type = arrow_to_trino_type(f.data_type());
+            // JSON text from json_parse and friends is `json`, as in Trino;
+            // the value is the same text either way (#848).
+            let trino_type = if sqe_trino_protocol::encode::is_json_text(f) {
+                "json".to_string()
+            } else {
+                arrow_to_trino_type(f.data_type())
+            };
             let type_signature = type_signature_for(&trino_type);
             TrinoColumn {
                 name: f.name().clone(),
@@ -272,6 +278,25 @@ mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
+
+    /// A marked Utf8 column (a JSON value) is `json`; a plain one stays
+    /// `varchar` (#848).
+    #[test]
+    fn json_text_column_is_reported_as_json() {
+        let marked = Field::new("j", DataType::Utf8, true).with_metadata(
+            [(
+                sqe_trino_protocol::encode::JSON_TEXT_MARKER.to_string(),
+                "true".to_string(),
+            )]
+            .into(),
+        );
+        let schema = Schema::new(vec![marked, Field::new("s", DataType::Utf8, true)]);
+        let types: Vec<String> = columns_for_schema(&schema)
+            .into_iter()
+            .map(|c| c.r#type)
+            .collect();
+        assert_eq!(types, ["json", "varchar"]);
+    }
 
     #[test]
     fn test_batches_to_trino_empty() {

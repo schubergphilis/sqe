@@ -14,26 +14,46 @@
 //!   `"2024-01-02 03:04:05.123"`
 //!
 //! A variant (an Iceberg V3 `JSON` or `VARIANT` column) is embedded as its
-//! JSON value, at any depth (#848). Other JSON values travel as Utf8, so a
-//! string input is always encoded as a JSON string. The rewrite leaves `CAST` of a JSON-returning function
-//! (`json_parse`, `json_extract`, ...) alone so that case stays the identity,
-//! as it is in Trino. Types Trino refuses to cast (varbinary, time,
-//! intervals) are written as their quoted display text instead of failing.
+//! JSON value, at any depth (#848). Other JSON values travel as Utf8: the
+//! result of `json_parse`, `json_extract`, `json_array_get` and `to_json`
+//! carries the [`JSON_TEXT_MARKER`] field marker, so `to_json` returns that
+//! text as it is, also through an alias, a CTE, a subquery or a view
+//! (Trino's cast of a JSON value is the identity). `CASE` and `coalesce`
+//! return a field without the marker, and any other string, a stored V2
+//! `JSON` column included, has none: those are encoded as a JSON string.
+//! `sqe-sql::trino_compat` rewrites `CAST(ARRAY[<json>, ...] AS JSON)` to
+//! [`JsonArrayOfJson`], since an array literal drops the element marker.
+//! Types Trino refuses to cast (varbinary, time, intervals) are written as
+//! their quoted display text instead of failing.
 
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use arrow::array::{Array, ArrayRef, AsArray, StringBuilder};
 use arrow::datatypes::{
-    DataType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
-    UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    DataType, Field, FieldRef, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type,
+    Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
 use arrow::util::display::{ArrayFormatter, FormatOptions};
-use datafusion::common::Result as DFResult;
+use datafusion::common::{exec_err, Result as DFResult};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
+    Volatility,
 };
 use datafusion::scalar::ScalarValue;
 use sqe_trino_protocol::encode;
+
+pub(crate) use encode::{is_json_text, JSON_TEXT_MARKER};
+
+/// The return field of a function whose Utf8 result is JSON text.
+pub(crate) fn json_text_field(name: &str) -> FieldRef {
+    Arc::new(
+        Field::new(name, DataType::Utf8, true).with_metadata(HashMap::from([(
+            JSON_TEXT_MARKER.to_string(),
+            "true".to_string(),
+        )])),
+    )
+}
 
 /// to_json(x) — serialize any value to compact JSON text, as Trino's
 /// `CAST(x AS JSON)` does. NULL in, NULL out.
@@ -55,8 +75,16 @@ impl ScalarUDFImpl for ToJson {
         Ok(DataType::Utf8)
     }
 
+    fn return_field_from_args(&self, _: ReturnFieldArgs) -> DFResult<FieldRef> {
+        Ok(json_text_field(self.name()))
+    }
+
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let input = &args.args[0];
+        // Already JSON (#848): the cast is the identity.
+        if args.arg_fields.first().is_some_and(|f| is_json_text(f)) {
+            return Ok(input.clone());
+        }
         let scalar = matches!(input, ColumnarValue::Scalar(_));
         let mut array = input.to_array(if scalar { 1 } else { args.number_rows })?;
         if let DataType::Dictionary(_, value_type) = array.data_type() {
@@ -84,6 +112,78 @@ fn to_json_array(array: &ArrayRef) -> DFResult<ArrayRef> {
         }
     }
     Ok(Arc::new(builder.finish()))
+}
+
+/// `CAST(ARRAY[<json>, ...] AS JSON)` (#848). An array literal drops the
+/// [`JSON_TEXT_MARKER`] of its elements, so `sqe-sql::trino_compat` sends a
+/// cast of an array whose elements are all JSON-returning calls (or NULL)
+/// here: each element is written as the JSON text it is, a NULL element as
+/// `null`, as Trino does for `array(json)`.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(crate) struct JsonArrayOfJson;
+
+impl ScalarUDFImpl for JsonArrayOfJson {
+    fn name(&self) -> &str {
+        "__sqe_json_array_of_json"
+    }
+
+    fn signature(&self) -> &Signature {
+        static SIG: LazyLock<Signature> =
+            LazyLock::new(|| Signature::new(TypeSignature::Any(1), Volatility::Immutable));
+        &SIG
+    }
+
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    fn return_field_from_args(&self, _: ReturnFieldArgs) -> DFResult<FieldRef> {
+        Ok(json_text_field(self.name()))
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let input = &args.args[0];
+        let scalar = matches!(input, ColumnarValue::Scalar(_));
+        let array = input.to_array(if scalar { 1 } else { args.number_rows })?;
+        let text_list = DataType::new_list(DataType::Utf8, true);
+        let lists = match array.data_type() {
+            DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..) => {
+                arrow::compute::cast(&array, &text_list)?
+            }
+            other => return exec_err!("__sqe_json_array_of_json expects an array, got {other}"),
+        };
+        let lists = lists.as_list::<i32>();
+        let mut builder = StringBuilder::with_capacity(lists.len(), lists.len() * 16);
+        let mut text = String::new();
+        for row in 0..lists.len() {
+            if lists.is_null(row) {
+                builder.append_null();
+                continue;
+            }
+            let values = lists.value(row);
+            let values = values.as_string::<i32>();
+            text.clear();
+            text.push('[');
+            for i in 0..values.len() {
+                if i > 0 {
+                    text.push(',');
+                }
+                text.push_str(if values.is_null(i) {
+                    "null"
+                } else {
+                    values.value(i)
+                });
+            }
+            text.push(']');
+            builder.append_value(&text);
+        }
+        let out: ArrayRef = Arc::new(builder.finish());
+        if scalar {
+            Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(&out, 0)?))
+        } else {
+            Ok(ColumnarValue::Array(out))
+        }
+    }
 }
 
 /// A NullArray reports no null buffer, so `is_null` alone says false for it.

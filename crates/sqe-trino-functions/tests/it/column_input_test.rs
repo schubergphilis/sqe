@@ -761,6 +761,8 @@ fn arg_specs(name: &str) -> Option<Vec<ArgSpec>> {
         "json_size" => vec![Col(Json), LitStr("$")],
         "json_array_get" => vec![Col(Json), Col(Int32)],
         "format" => vec![LitStr("%s-%d"), Col(Str), Col(Int)],
+        // Integer elements are JSON text too.
+        "__sqe_json_array_of_json" => vec![Col(ListInt)],
         // ── base ──
         "year" | "month" | "day" | "hour" | "minute" | "second" | "day_of_week" | "dow"
         | "day_of_year" | "doy" | "quarter" | "week" | "week_of_year" | "to_unixtime" | "date" => {

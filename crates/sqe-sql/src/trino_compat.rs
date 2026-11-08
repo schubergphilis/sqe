@@ -1053,8 +1053,13 @@ fn function_name_is(func: &Function, want: &str) -> bool {
 /// Functions whose result Trino types as JSON. `to_json` is here because an
 /// inner `CAST(.. AS JSON)` has already been rewritten by the time the outer
 /// one is visited.
-const JSON_RETURNING_FUNCTIONS: &[&str] =
-    &["json_parse", "json_extract", "json_array_get", "to_json"];
+const JSON_RETURNING_FUNCTIONS: &[&str] = &[
+    "json_parse",
+    "json_extract",
+    "json_array_get",
+    "to_json",
+    "__sqe_json_array_of_json",
+];
 
 fn rewrite_cast_as_json(expr: &mut Expr) -> bool {
     let Expr::Cast {
@@ -1084,12 +1089,33 @@ fn rewrite_cast_as_json(expr: &mut Expr) -> bool {
             return true;
         }
     }
+    // An array literal drops the JSON marker of its elements, so `to_json`
+    // would quote each one; Trino embeds them (#848).
+    let target = if is_array_of_json(inner) {
+        "__sqe_json_array_of_json"
+    } else {
+        "to_json"
+    };
     let inner_expr = std::mem::replace(
         inner.as_mut(),
         Expr::Identifier(Ident::new("__cast_as_json_placeholder__")),
     );
-    *expr = call("to_json", inner_expr);
+    *expr = call(target, inner_expr);
     true
+}
+
+/// `ARRAY[e, ...]` whose elements are JSON-returning calls or NULL, with at
+/// least one call.
+fn is_array_of_json(expr: &Expr) -> bool {
+    let Expr::Array(array) = expr else {
+        return false;
+    };
+    let is_json_call = |e: &Expr| {
+        matches!(e, Expr::Function(func)
+            if JSON_RETURNING_FUNCTIONS.iter().any(|name| function_name_is(func, name)))
+    };
+    let is_null = |e: &Expr| matches!(e, Expr::Value(v) if v.value == sqlparser::ast::Value::Null);
+    array.elem.iter().any(is_json_call) && array.elem.iter().all(|e| is_json_call(e) || is_null(e))
 }
 
 /// `name(arg)`, a plain one-argument function call.
@@ -1670,6 +1696,29 @@ mod tests {
         assert_eq!(out, "SELECT json_extract(s, '$.a') FROM t");
         let out = rewrite_trino_compat("SELECT CAST(CAST(x AS JSON) AS JSON) FROM t");
         assert_eq!(out, "SELECT to_json(x) FROM t");
+    }
+
+    /// An array literal of JSON values goes to the function that embeds the
+    /// elements (#848); any other element keeps `to_json`.
+    #[test]
+    fn cast_of_array_of_json_embeds_the_elements() {
+        let out =
+            rewrite_trino_compat(r#"SELECT CAST(ARRAY[json_parse('{"a":1}'), NULL] AS JSON)"#);
+        assert_eq!(
+            out,
+            r#"SELECT __sqe_json_array_of_json(ARRAY[json_parse('{"a":1}'), NULL])"#
+        );
+        let out = rewrite_trino_compat(
+            "SELECT CAST(ARRAY[CAST(ARRAY[json_parse(s)] AS JSON)] AS JSON) FROM t",
+        );
+        assert_eq!(
+            out,
+            "SELECT __sqe_json_array_of_json(ARRAY[__sqe_json_array_of_json(ARRAY[json_parse(s)])]) FROM t"
+        );
+        let out = rewrite_trino_compat("SELECT CAST(ARRAY[json_parse(s), s] AS JSON) FROM t");
+        assert_eq!(out, "SELECT to_json(ARRAY[json_parse(s), s]) FROM t");
+        let out = rewrite_trino_compat("SELECT CAST(ARRAY[NULL] AS JSON)");
+        assert_eq!(out, "SELECT to_json(ARRAY[NULL])");
     }
 
     #[test]

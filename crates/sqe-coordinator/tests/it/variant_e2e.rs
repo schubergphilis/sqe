@@ -384,6 +384,60 @@ async fn cast_as_json_embeds_a_v3_json_column() {
     drop(&handler, &session, fq).await;
 }
 
+/// A JSON value from `json_parse` / `json_extract` keeps its JSON marker
+/// through a subquery, so `CAST(.. AS JSON)` of it is the identity, and an
+/// array of JSON values embeds them (#848). The marked field writes like
+/// any string (CTAS, INSERT, UNION with a plain column). A stored V2 text
+/// column has no marker, so its cast stays a JSON string.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn cast_as_json_of_a_json_value_is_the_identity() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let src = "default.json_value_cast_src";
+    let dst = "default.json_value_cast_dst";
+    drop(&handler, &session, src).await;
+    drop(&handler, &session, dst).await;
+    for sql in [
+        format!("CREATE TABLE {src} (id INT, doc VARCHAR)"),
+        format!(r#"INSERT INTO {src} VALUES (1, '{{"n": 1.5}}'), (2, NULL)"#),
+        format!("CREATE TABLE {dst} AS SELECT id, json_parse(doc) AS p FROM {src}"),
+        format!("INSERT INTO {dst} SELECT id + 10, json_extract(doc, '$') FROM {src}"),
+    ] {
+        handler.execute(&session, &sql, None).await.expect(&sql);
+    }
+    let cases = [
+        (
+            format!("SELECT id, CAST(p AS JSON), typeof(p) FROM (SELECT id, json_parse(doc) AS p FROM {src}) s ORDER BY id"),
+            vec![r#"1|{"n":1.5}|json"#, "2|NULL|json"],
+        ),
+        (
+            format!("SELECT CAST(ARRAY[json_parse(doc), NULL] AS JSON) FROM {src} ORDER BY id"),
+            vec![r#"[{"n":1.5},null]"#, "[null,null]"],
+        ),
+        (
+            format!("SELECT id, p, CAST(p AS JSON) FROM {dst} ORDER BY id"),
+            vec![
+                r#"1|{"n":1.5}|"{\"n\":1.5}""#,
+                "2|NULL|NULL",
+                r#"11|{"n":1.5}|"{\"n\":1.5}""#,
+                "12|NULL|NULL",
+            ],
+        ),
+        (
+            format!(
+                "SELECT v FROM (SELECT json_parse(doc) AS v FROM {src} WHERE id = 1 \
+                 UNION ALL SELECT doc FROM {src} WHERE id = 1) u ORDER BY v"
+            ),
+            vec![r#"{"n": 1.5}"#, r#"{"n":1.5}"#],
+        ),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(rows(&handler, &session, &sql).await, want, "{sql}");
+    }
+    drop(&handler, &session, src).await;
+    drop(&handler, &session, dst).await;
+}
+
 /// `variant_get` reads typed fields of a stored variant column, a missing
 /// path is NULL, and without a type the result is a variant (#857).
 #[tokio::test(flavor = "multi_thread")]
