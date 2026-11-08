@@ -428,6 +428,7 @@ mod tests {
         QueryTracker::new(&QueryHistoryConfig {
             max_entries: 100,
             ttl_secs: 60,
+            ..QueryHistoryConfig::default()
         })
     }
 

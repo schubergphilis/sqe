@@ -716,6 +716,10 @@ pub struct QueryHistoryConfig {
     pub max_entries: u64,
     #[serde(default = "default_history_ttl_secs")]
     pub ttl_secs: u64,
+    /// How far back `system.runtime.query_history` reads the audit log when
+    /// the query has no time bound on `end` or `created` (#812).
+    #[serde(default = "default_history_lookback_secs")]
+    pub lookback_secs: u64,
 }
 
 impl Default for QueryHistoryConfig {
@@ -723,8 +727,13 @@ impl Default for QueryHistoryConfig {
         Self {
             max_entries: default_history_max_entries(),
             ttl_secs: default_history_ttl_secs(),
+            lookback_secs: default_history_lookback_secs(),
         }
     }
+}
+
+fn default_history_lookback_secs() -> u64 {
+    86_400
 }
 
 fn default_history_max_entries() -> u64 {

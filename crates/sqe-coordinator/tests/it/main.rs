@@ -81,6 +81,7 @@ mod order_by_hidden_sort_key_e2e;
 mod partition_e2e;
 mod partition_evolution_e2e;
 mod quack_e2e;
+mod query_history_restart_e2e;
 mod rewrite_data_files_deletes;
 mod rewrite_data_files_distributed_parity;
 mod rewrite_data_files_real;

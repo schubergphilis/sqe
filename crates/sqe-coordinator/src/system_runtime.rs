@@ -1,6 +1,7 @@
-//! The virtual `system.runtime` schema (`queries`, `nodes`, `tasks`), rendered
-//! from the coordinator's own [`QueryTracker`](crate::query_tracker::QueryTracker)
-//! records.
+//! The virtual `system.runtime` schema (`queries`, `query_history`, `nodes`,
+//! `tasks`), rendered from the coordinator's own
+//! [`QueryTracker`](crate::query_tracker::QueryTracker) records and, for
+//! `query_history`, the native audit log.
 //!
 //! This used to live in `sqe-catalog` behind mirrored copies of
 //! `QueryRecord`, `QueryState` and `FragmentInfo` "to avoid a circular crate
@@ -17,9 +18,11 @@ use arrow_array::builder::{
 };
 use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
-use datafusion::catalog::SchemaProvider;
+use datafusion::catalog::{SchemaProvider, Session};
 use datafusion::datasource::{MemTable, TableProvider};
-use datafusion::error::Result as DFResult;
+use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::physical_plan::ExecutionPlan;
 
 use crate::query_tracker::{QueryRecord, QueryState};
 
@@ -32,9 +35,10 @@ pub type QueryRecordsFn = Arc<dyn Fn() -> Vec<Arc<QueryRecord>> + Send + Sync>;
 
 /// DataFusion `SchemaProvider` for the virtual `system.runtime` schema.
 ///
-/// Exposes three tables compatible with Trino's `system.runtime` contract:
+/// Exposes Trino's `system.runtime` tables plus a history view:
 ///
 /// - `queries` — one row per tracked query
+/// - `query_history` — `queries` plus the finished queries in the audit log
 /// - `nodes`   — one row per cluster node
 /// - `tasks`   — one row per finished-query task (single-node: one task per query)
 pub struct RuntimeSchemaProvider {
@@ -45,6 +49,8 @@ pub struct RuntimeSchemaProvider {
     /// When set, `queries` / `tasks` only show records owned by this user.
     /// `None` (admin sessions) shows every user's queries.
     owner_filter: Option<String>,
+    /// The audit log `query_history` reads; `None` shows tracker records only.
+    history: Option<AuditHistorySource>,
 }
 
 impl RuntimeSchemaProvider {
@@ -66,7 +72,14 @@ impl RuntimeSchemaProvider {
             coordinator_uri,
             worker_urls,
             owner_filter: None,
+            history: None,
         }
+    }
+
+    /// Read finished queries for `query_history` from this audit log.
+    pub fn with_audit_history(mut self, source: Option<AuditHistorySource>) -> Self {
+        self.history = source;
+        self
     }
 
     /// Restrict `queries` / `tasks` to records owned by `owner` (a non-admin
@@ -98,16 +111,27 @@ impl std::fmt::Debug for RuntimeSchemaProvider {
 #[async_trait]
 impl SchemaProvider for RuntimeSchemaProvider {
     fn table_names(&self) -> Vec<String> {
-        vec!["queries".into(), "nodes".into(), "tasks".into()]
+        vec![
+            "queries".into(),
+            "query_history".into(),
+            "nodes".into(),
+            "tasks".into(),
+        ]
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        matches!(name, "queries" | "nodes" | "tasks")
+        matches!(name, "queries" | "query_history" | "nodes" | "tasks")
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
         match name {
             "queries" => Ok(Some(build_queries_table(&self.records())?)),
+            "query_history" => Ok(Some(Arc::new(QueryHistoryTable {
+                live: self.records(),
+                source: self.history.clone(),
+                owner_filter: self.owner_filter.clone(),
+                schema: Arc::new(queries_schema()),
+            }))),
             "nodes" => Ok(Some(build_nodes_table(
                 &self.warehouse,
                 &self.coordinator_uri,
@@ -168,6 +192,318 @@ fn build_queries_table(records: &[Arc<QueryRecord>]) -> DFResult<Arc<dyn TablePr
         batch.schema(),
         vec![vec![batch]],
     )?))
+}
+
+// ---------------------------------------------------------------------------
+// query_history table — `queries` plus the audit log (#812)
+// ---------------------------------------------------------------------------
+
+/// Most audit events one `query_history` scan reads; the newest are kept.
+const HISTORY_ROW_CAP: usize = 100_000;
+
+/// Where `query_history` reads finished queries the tracker has dropped.
+#[derive(Debug, Clone)]
+pub struct AuditHistorySource {
+    /// `metrics.audit_log_path`: the active native audit file.
+    pub path: std::path::PathBuf,
+    /// Read window when the query bounds neither `end` nor `created`
+    /// (`[query_history] lookback_secs`).
+    pub lookback: chrono::Duration,
+}
+
+/// The audit log `query_history` reads under `config`: the native file when
+/// `metrics.audit_log_path` is set and `metrics.audit.format` writes native
+/// events there ("native" or "both"). With "ocsf" the file holds OCSF, whose
+/// query class is shared with other event kinds, so the history shows the
+/// tracker's records only.
+pub fn audit_history_source(config: &sqe_core::SqeConfig) -> Option<AuditHistorySource> {
+    if config.metrics.audit_log_path.is_empty() {
+        return None;
+    }
+    if matches!(
+        crate::parse_audit_format(&config.metrics.audit.format),
+        sqe_metrics::audit::AuditFormat::Ocsf
+    ) {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "metrics.audit.format = \"ocsf\": system.runtime.query_history reads the \
+                 native audit log, so it shows only the queries still in memory; use \
+                 \"both\" to keep the history"
+            );
+        });
+        return None;
+    }
+    Some(AuditHistorySource {
+        path: std::path::PathBuf::from(&config.metrics.audit_log_path),
+        lookback: i64::try_from(config.query_history.lookback_secs)
+            .ok()
+            .and_then(chrono::Duration::try_seconds)
+            .unwrap_or(chrono::Duration::MAX),
+    })
+}
+
+/// `system.runtime.query_history`: the tracker's records (running queries
+/// and the recently finished ones) plus the finished queries in the native
+/// audit log, so a query stays visible after the tracker's TTL and after a
+/// coordinator restart. Same columns as `queries`.
+///
+/// The audit log is read at scan time, for the window the query's filters on
+/// `end` / `created` give (the filters stay applied above the scan), or the
+/// last `lookback` when they give none.
+#[derive(Debug)]
+struct QueryHistoryTable {
+    live: Vec<Arc<QueryRecord>>,
+    source: Option<AuditHistorySource>,
+    owner_filter: Option<String>,
+    schema: arrow::datatypes::SchemaRef,
+}
+
+#[async_trait]
+impl TableProvider for QueryHistoryTable {
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> datafusion::datasource::TableType {
+        datafusion::datasource::TableType::View
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
+        // Inexact: the bounds only pick which audit lines to read; DataFusion
+        // still applies every filter to the rows.
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let mut records = self.live.clone();
+        if let Some(source) = &self.source {
+            let bounds = EndBounds::from_filters(filters);
+            // A lookback past chrono's range reads the whole log.
+            let from = bounds.from.unwrap_or_else(|| {
+                chrono::Utc::now()
+                    .checked_sub_signed(source.lookback)
+                    .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+            });
+            let path = source.path.clone();
+            let events = tokio::task::spawn_blocking(move || {
+                sqe_metrics::audit::read_query_events(&path, from, bounds.to, HISTORY_ROW_CAP)
+            })
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let mut seen: std::collections::HashSet<uuid::Uuid> =
+                records.iter().map(|r| r.query_id).collect();
+            // Newest first, so a query logged twice shows its last event.
+            for event in events.into_iter().rev() {
+                if let Some(owner) = &self.owner_filter {
+                    if &event.actor.username != owner {
+                        continue;
+                    }
+                }
+                if let Some(record) = record_from_event(event) {
+                    if seen.insert(record.query_id) {
+                        records.push(Arc::new(record));
+                    }
+                }
+            }
+        }
+        let batch = queries_batch(&records)?;
+        MemTable::try_new(batch.schema(), vec![vec![batch]])?
+            .scan(state, projection, &[], limit)
+            .await
+    }
+}
+
+/// The audit window a scan's filters give, in terms of `end` (the audit
+/// event's `time`). `created <= end`, so a lower bound on `created` is one
+/// on `end` too; an upper bound on `created` is not.
+#[derive(Debug, Default, Clone, Copy)]
+struct EndBounds {
+    from: Option<chrono::DateTime<chrono::Utc>>,
+    to: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl EndBounds {
+    /// One second of slack each way: the log keeps sub-millisecond times
+    /// and `created` is derived from `end` minus the duration.
+    const SLACK: chrono::Duration = chrono::Duration::seconds(1);
+
+    fn from_filters(filters: &[Expr]) -> Self {
+        let mut bounds = Self::default();
+        for filter in filters {
+            bounds.add(filter);
+        }
+        bounds
+    }
+
+    fn add(&mut self, expr: &Expr) {
+        use datafusion::logical_expr::{Between, BinaryExpr, Operator};
+        match expr {
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+                if *op == Operator::And {
+                    self.add(left);
+                    self.add(right);
+                    return;
+                }
+                let (column, op, millis) = match (time_column(left), ts_millis(right)) {
+                    (Some(c), Some(v)) => (c, *op, v),
+                    _ => match (ts_millis(left), time_column(right), op.swap()) {
+                        (Some(v), Some(c), Some(op)) => (c, op, v),
+                        _ => return,
+                    },
+                };
+                match op {
+                    Operator::Gt | Operator::GtEq => self.lower(column, millis),
+                    Operator::Lt | Operator::LtEq => self.upper(column, millis),
+                    Operator::Eq => {
+                        self.lower(column, millis);
+                        self.upper(column, millis);
+                    }
+                    _ => {}
+                }
+            }
+            Expr::Between(Between {
+                expr,
+                negated: false,
+                low,
+                high,
+            }) => {
+                if let Some(column) = time_column(expr) {
+                    if let Some(v) = ts_millis(low) {
+                        self.lower(column, v);
+                    }
+                    if let Some(v) = ts_millis(high) {
+                        self.upper(column, v);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn lower(&mut self, _column: TimeColumn, millis: i64) {
+        let Some(t) = chrono::DateTime::from_timestamp_millis(millis) else {
+            return;
+        };
+        let t = t.checked_sub_signed(Self::SLACK).unwrap_or(t);
+        self.from = Some(self.from.map_or(t, |f| f.max(t)));
+    }
+
+    fn upper(&mut self, column: TimeColumn, millis: i64) {
+        if column != TimeColumn::End {
+            return;
+        }
+        let Some(t) = chrono::DateTime::from_timestamp_millis(millis) else {
+            return;
+        };
+        let t = t.checked_add_signed(Self::SLACK).unwrap_or(t);
+        self.to = Some(self.to.map_or(t, |u| u.min(t)));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeColumn {
+    End,
+    Created,
+}
+
+/// `end` or `created`, under any casts the planner put on it.
+fn time_column(expr: &Expr) -> Option<TimeColumn> {
+    match expr {
+        Expr::Column(c) if c.name == "end" => Some(TimeColumn::End),
+        Expr::Column(c) if c.name == "created" => Some(TimeColumn::Created),
+        Expr::Cast(c) => time_column(&c.expr),
+        Expr::TryCast(c) => time_column(&c.expr),
+        _ => None,
+    }
+}
+
+/// A timestamp literal as epoch milliseconds.
+fn ts_millis(expr: &Expr) -> Option<i64> {
+    use datafusion::common::ScalarValue;
+    match expr {
+        Expr::Literal(ScalarValue::TimestampSecond(Some(v), _), _) => v.checked_mul(1000),
+        Expr::Literal(ScalarValue::TimestampMillisecond(Some(v), _), _) => Some(*v),
+        Expr::Literal(ScalarValue::TimestampMicrosecond(Some(v), _), _) => Some(v / 1000),
+        Expr::Literal(ScalarValue::TimestampNanosecond(Some(v), _), _) => Some(v / 1_000_000),
+        _ => None,
+    }
+}
+
+/// A finished query as the `queries` table shows it, from its audit event.
+/// `None` for an event without a parseable query id.
+fn record_from_event(event: sqe_metrics::audit::AuditEvent) -> Option<QueryRecord> {
+    use sqe_metrics::audit::Outcome;
+    let query_id = uuid::Uuid::parse_str(event.query_id.as_deref()?).ok()?;
+    let timing = event.timing.unwrap_or(sqe_metrics::audit::Timing {
+        duration_ms: 0,
+        queued_ms: 0,
+        planning_ms: 0,
+        execution_ms: 0,
+    });
+    let stats = event.stats;
+    let ended = event.time;
+    let created = ended - chrono::Duration::milliseconds(u64_to_i64_saturating(timing.duration_ms));
+    let started = created + chrono::Duration::milliseconds(u64_to_i64_saturating(timing.queued_ms));
+    let (state, error_type, error_code, error_message) = match event.outcome {
+        Outcome::Success => (QueryState::Finished, None, None, None),
+        Outcome::Failure {
+            error_type,
+            error_code,
+            message,
+        } => {
+            let state = if error_code.as_deref() == Some("QUERY_CANCELLED") {
+                QueryState::Canceled
+            } else {
+                QueryState::Failed
+            };
+            (state, error_type, error_code, message)
+        }
+    };
+    Some(QueryRecord {
+        query_id,
+        state,
+        principal: event
+            .actor
+            .subject
+            .clone()
+            .unwrap_or_else(|| event.actor.username.clone()),
+        user: event.actor.username,
+        source: event.actor.app_name,
+        sql: event.query.and_then(|q| q.text).unwrap_or_default(),
+        session_id: event.session_id.unwrap_or_default(),
+        client_ip: event.client_ip,
+        roles: event.actor.roles,
+        created,
+        started: Some(started),
+        ended: Some(ended),
+        queued_ms: timing.queued_ms,
+        planning_ms: timing.planning_ms,
+        execution_ms: timing.execution_ms,
+        output_rows: stats.as_ref().map_or(0, |s| s.rows_returned),
+        rows_written: stats.as_ref().and_then(|s| s.rows_written),
+        error_type,
+        error_code,
+        error_message,
+        tables_touched: Vec::new(),
+        bytes_scanned: stats.as_ref().map_or(0, |s| s.bytes_scanned),
+        physical_input_bytes: 0,
+        rows_scanned: stats.as_ref().map_or(0, |s| s.rows_scanned),
+        spill_bytes: stats.as_ref().map_or(0, |s| s.spill_bytes),
+        peak_memory_bytes: stats.as_ref().map_or(0, |s| s.peak_memory_bytes),
+        profile: None,
+        trace_id: event.trace_id,
+        fragments: Arc::default(),
+    })
 }
 
 fn queries_batch(records: &[Arc<QueryRecord>]) -> DFResult<RecordBatch> {
@@ -841,7 +1177,153 @@ mod tests {
         );
         let mut names = provider.table_names();
         names.sort();
-        assert_eq!(names, vec!["nodes", "queries", "tasks"]);
+        assert_eq!(names, vec!["nodes", "queries", "query_history", "tasks"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // query_history (#812)
+    // -----------------------------------------------------------------------
+
+    /// One native audit line for a finished query, as the logger writes it.
+    fn audit_line(id: u128, user: &str, ended: chrono::DateTime<Utc>, status: &str) -> String {
+        let outcome = match status {
+            "success" => r#""status":"success""#.to_string(),
+            code => format!(r#""status":"failure","error_code":"{code}","message":"boom""#),
+        };
+        format!(
+            r#"{{"time":"{time}","kind":"query","actor":{{"username":"{user}"}},{outcome},"timing":{{"duration_ms":1500,"queued_ms":100,"planning_ms":400,"execution_ms":1000}},"stats":{{"rows_returned":7,"bytes_scanned":64}},"query":{{"text":"SELECT {id}","query_hash":"h","statement_type":"Query"}},"query_id":"{qid}"}}"#,
+            time = ended.to_rfc3339(),
+            qid = Uuid::from_u128(id),
+        )
+    }
+
+    /// A provider over `live` and an audit log of `lines`, run through SQL.
+    async fn history_rows(
+        live: Vec<Arc<QueryRecord>>,
+        lines: &[String],
+        owner: Option<&str>,
+        sql: &str,
+    ) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        // A legacy `AuditEntry` line and a torn tail are skipped.
+        let body = format!(
+            "{{\"timestamp\":\"2026-01-01T00:00:00Z\",\"user\":\"alice\"}}\n{}\n{{\"time\":\"20",
+            lines.join("\n")
+        );
+        std::fs::write(&path, body).unwrap();
+        let provider = RuntimeSchemaProvider::new(
+            Arc::new(move || live.clone()),
+            "wh".into(),
+            "http://localhost:8080".into(),
+            vec![],
+        )
+        .with_owner_filter(owner.map(str::to_string))
+        .with_audit_history(Some(AuditHistorySource {
+            path,
+            lookback: chrono::Duration::hours(1),
+        }));
+        let ctx = datafusion::prelude::SessionContext::new();
+        let table = provider.table("query_history").await.unwrap().unwrap();
+        ctx.register_table("query_history", table).unwrap();
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let mut out = Vec::new();
+        for batch in &batches {
+            let column = arrow::compute::cast(batch.column(0), &DataType::Utf8).unwrap();
+            let column = column
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
+            out.extend(column.iter().map(|v| v.unwrap_or_default().to_string()));
+        }
+        out.sort();
+        out
+    }
+
+    #[tokio::test]
+    async fn query_history_adds_audited_queries_the_tracker_dropped() {
+        let now = Utc::now();
+        let running = record(1, QueryState::Running, "alice", None, "SELECT 1");
+        let live = vec![Arc::new(running)];
+        // In the order the logger appends them: oldest first.
+        let lines = [
+            // Older than the one-hour lookback.
+            audit_line(5, "alice", now - chrono::Duration::days(3), "success"),
+            audit_line(
+                4,
+                "alice",
+                now - chrono::Duration::minutes(7),
+                "QUERY_CANCELLED",
+            ),
+            audit_line(3, "bob", now - chrono::Duration::minutes(6), "SQE-1"),
+            audit_line(2, "alice", now - chrono::Duration::minutes(5), "success"),
+            // Still in the tracker too: shown once, from the tracker.
+            audit_line(1, "alice", now, "success"),
+        ];
+        let rows = history_rows(
+            live.clone(),
+            &lines,
+            None,
+            "SELECT concat(query, ':', state) FROM query_history",
+        )
+        .await;
+        assert_eq!(
+            rows,
+            [
+                "SELECT 1:RUNNING",
+                "SELECT 2:FINISHED",
+                "SELECT 3:FAILED",
+                "SELECT 4:CANCELED"
+            ]
+        );
+
+        // A non-admin session sees its own queries only.
+        let sql = "SELECT query FROM query_history";
+        let rows = history_rows(live.clone(), &lines, Some("bob"), sql).await;
+        assert_eq!(rows, ["SELECT 3"]);
+
+        // A bound on `end` older than the lookback reads further back.
+        let since = (now - chrono::Duration::days(4)).to_rfc3339();
+        let sql = format!(
+            "SELECT query FROM query_history WHERE \"end\" >= TIMESTAMP '{since}' \
+             AND \"end\" < now() - INTERVAL '2' DAY"
+        );
+        let rows = history_rows(live.clone(), &lines, None, &sql).await;
+        assert_eq!(rows, ["SELECT 5"]);
+
+        // The audit row carries the event's timing and stats.
+        let sql = "SELECT concat(CAST(output_rows AS VARCHAR), '/', CAST(bytes_scanned AS VARCHAR), '/', \
+                   CAST(queued_time_ms AS VARCHAR), '/', CAST(\"end\" - created AS VARCHAR)) \
+                   FROM query_history WHERE query = 'SELECT 2'";
+        let rows = history_rows(live, &lines, None, sql).await;
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].starts_with("7/64/100/"), "{rows:?}");
+    }
+
+    #[test]
+    fn end_bounds_come_from_end_and_created_filters() {
+        use datafusion::common::ScalarValue;
+        use datafusion::prelude::{col, lit};
+        let utc = Some("UTC".into());
+        let ts = |ms: i64| lit(ScalarValue::TimestampMillisecond(Some(ms), utc.clone()));
+        let bounds = EndBounds::from_filters(&[
+            col("created").gt_eq(ts(10_000)),
+            ts(60_000).gt(col("end")),
+            // An upper bound on `created` does not bound `end`.
+            col("created").lt(ts(30_000)),
+            col("query").eq(lit("x")),
+        ]);
+        assert_eq!(bounds.from.unwrap().timestamp_millis(), 9_000);
+        assert_eq!(bounds.to.unwrap().timestamp_millis(), 61_000);
+        let none = EndBounds::from_filters(&[col("created").lt(ts(30_000))]);
+        assert!(none.from.is_none() && none.to.is_none());
+
+        // Bounds at chrono's range ends do not overflow the slack.
+        let min = chrono::DateTime::<chrono::Utc>::MIN_UTC.timestamp_millis();
+        let max = chrono::DateTime::<chrono::Utc>::MAX_UTC.timestamp_millis();
+        let edge = EndBounds::from_filters(&[col("end").gt_eq(ts(min)), col("end").lt_eq(ts(max))]);
+        assert_eq!(edge.from.unwrap().timestamp_millis(), min);
+        assert_eq!(edge.to.unwrap().timestamp_millis(), max);
     }
 
     #[test]
@@ -853,6 +1335,7 @@ mod tests {
             vec![],
         );
         assert!(provider.table_exist("queries"));
+        assert!(provider.table_exist("query_history"));
         assert!(provider.table_exist("nodes"));
         assert!(provider.table_exist("tasks"));
         assert!(!provider.table_exist("unknown"));

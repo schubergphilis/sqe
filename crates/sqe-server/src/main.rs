@@ -3656,6 +3656,7 @@ token_endpoint = "http://127.0.0.1:1/token"
             &sqe_core::QueryHistoryConfig {
                 max_entries: 100,
                 ttl_secs: 60,
+                ..sqe_core::QueryHistoryConfig::default()
             },
         ));
         let id = uuid::Uuid::now_v7();

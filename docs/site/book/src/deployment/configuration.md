@@ -307,6 +307,7 @@ ttl_secs = 300                  # Cache entry TTL
 [query_history]
 max_entries = 10000             # Max queries retained in history
 ttl_secs = 1800                 # History entry TTL (30 min)
+lookback_secs = 86400           # system.runtime.query_history: audit log window read when the query has no bound on "end"/"created"
 
 [rate_limit]
 enabled = false                 # Enable every limiter below
