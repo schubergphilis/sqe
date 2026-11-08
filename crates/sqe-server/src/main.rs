@@ -205,6 +205,9 @@ struct HealthState {
     /// when MCP is off or mounted on this listener (`mcp.port = 0`), where
     /// answering `/healthz` at all already proves the MCP routes are up.
     mcp_listener_alive: Option<Arc<AtomicBool>>,
+    /// The native audit log the dashboard's History tab reads (#812).
+    /// `None` without a native audit log, in `run_worker` and in tests.
+    query_history: Option<sqe_coordinator::AuditHistorySource>,
 }
 
 impl sqe_coordinator::web_auth::BearerAdminState for HealthState {
@@ -581,6 +584,60 @@ async fn api_queries(
     Json(items)
 }
 
+#[derive(serde::Deserialize)]
+struct QueryHistoryParams {
+    state: Option<String>,
+    limit: Option<usize>,
+    /// RFC 3339: only queries that ended at or after it.
+    since: Option<String>,
+    /// The `nextBefore` of the previous page.
+    before: Option<String>,
+}
+
+/// One page of finished queries from the tracker and the audit log (#812).
+async fn api_query_history(
+    state: axum::extract::State<Arc<HealthState>>,
+    params: axum::extract::Query<QueryHistoryParams>,
+) -> Response {
+    let since = match params.since.as_deref() {
+        None | Some("") => None,
+        Some(s) => match sqe_coordinator::web_ui::parse_rfc3339(s) {
+            Some(t) => Some(t),
+            None => return (axum::http::StatusCode::BAD_REQUEST, "invalid since").into_response(),
+        },
+    };
+    let before = match params.before.as_deref() {
+        None | Some("") => None,
+        Some(s) => match sqe_coordinator::web_ui::HistoryCursor::parse(s) {
+            Some(c) => Some(c),
+            None => return (axum::http::StatusCode::BAD_REQUEST, "invalid before").into_response(),
+        },
+    };
+    let limit = params.limit.unwrap_or(50).clamp(1, 1000);
+    let live = state
+        .query_tracker
+        .as_ref()
+        .map(|t| t.records())
+        .unwrap_or_default();
+    let source = state.query_history.clone();
+    let filter = params.state.clone();
+    let page = tokio::task::spawn_blocking(move || {
+        sqe_coordinator::web_ui::query_history_page(
+            live,
+            source.as_ref(),
+            since,
+            before,
+            filter.as_deref(),
+            limit,
+        )
+    })
+    .await;
+    match page {
+        Ok(page) => Json(page).into_response(),
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 async fn api_query_detail(
     state: axum::extract::State<Arc<HealthState>>,
     id: axum::extract::Path<String>,
@@ -827,6 +884,7 @@ fn build_health_router(state: Arc<HealthState>) -> Router {
             .route("/", get(dashboard))
             .route("/api/v1/overview", get(api_overview))
             .route("/api/v1/queries", get(api_queries))
+            .route("/api/v1/queries/history", get(api_query_history))
             .route("/api/v1/queries/{id}", get(api_query_detail))
             .route("/api/v1/workers", get(api_workers))
             .route("/api/v1/metrics/history", get(api_metrics_history))
@@ -2251,6 +2309,7 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
         hive_manifest_cache: Some(Arc::clone(&hive_manifest_cache)),
         serving: Some(serving),
         mcp_listener_alive: mcp_listener_alive.clone(),
+        query_history: sqe_coordinator::audit_history_source(&config),
         success_audit_dedup: {
             let window = config.metrics.audit.dashboard_access_audit_window_secs;
             if window == 0 {
@@ -2771,6 +2830,7 @@ async fn run_worker(config: SqeConfig, config_path: String) -> anyhow::Result<()
         hive_manifest_cache: None,
         serving: None,
         mcp_listener_alive: None,
+        query_history: None,
     });
     let worker_bind: std::net::IpAddr = std::net::Ipv4Addr::UNSPECIFIED.into();
     start_health_server_with_extra(worker_bind, health_port, health_state, None);
@@ -3401,8 +3461,9 @@ token_endpoint = "http://127.0.0.1:1/token"
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
-        serving: None,
-        mcp_listener_alive: None,
+            serving: None,
+            mcp_listener_alive: None,
+            query_history: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -3432,8 +3493,9 @@ token_endpoint = "http://127.0.0.1:1/token"
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
-        serving: None,
-        mcp_listener_alive: None,
+            serving: None,
+            mcp_listener_alive: None,
+            query_history: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -3469,8 +3531,9 @@ token_endpoint = "http://127.0.0.1:1/token"
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
-        serving: None,
-        mcp_listener_alive: None,
+            serving: None,
+            mcp_listener_alive: None,
+            query_history: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -3503,8 +3566,9 @@ token_endpoint = "http://127.0.0.1:1/token"
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
-        serving: None,
-        mcp_listener_alive: None,
+            serving: None,
+            mcp_listener_alive: None,
+            query_history: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -3536,8 +3600,9 @@ token_endpoint = "http://127.0.0.1:1/token"
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
-        serving: None,
-        mcp_listener_alive: None,
+            serving: None,
+            mcp_listener_alive: None,
+            query_history: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -3639,8 +3704,9 @@ token_endpoint = "http://127.0.0.1:1/token"
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
-        serving: None,
-        mcp_listener_alive: None,
+            serving: None,
+            mcp_listener_alive: None,
+            query_history: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -3690,8 +3756,9 @@ token_endpoint = "http://127.0.0.1:1/token"
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
-        serving: None,
-        mcp_listener_alive: None,
+            serving: None,
+            mcp_listener_alive: None,
+            query_history: None,
         });
 
         let Json(items) = api_queries(
@@ -3706,6 +3773,70 @@ token_endpoint = "http://127.0.0.1:1/token"
         // WEB-02: the unauth list no longer exposes the username or raw SQL;
         // it carries the SQL digest instead. Assert the item is populated.
         assert!(!items[0].sql_hash.is_empty());
+    }
+
+    /// `/api/v1/queries/history` (#812): finished queries only, and a bad
+    /// `since` or `before` is a 400, not an empty page.
+    #[tokio::test]
+    async fn api_query_history_pages_finished_queries() {
+        let config = sqe_core::QueryHistoryConfig::default();
+        let tracker = Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(&config));
+        let done = uuid::Uuid::now_v7();
+        let running = uuid::Uuid::now_v7();
+        for id in [done, running] {
+            tracker.start(id, "alice", None, "SELECT 1", "s1", None, vec![], None);
+        }
+        tracker.complete(&done, 1, 5, vec![], 0, 0, 0, 0);
+
+        let state = Arc::new(HealthState {
+            ready: Arc::new(AtomicBool::new(true)),
+            started_at: Instant::now(),
+            role: "coordinator",
+            worker_registry: None,
+            query_tracker: Some(tracker),
+            web_ui: true,
+            catalog_url: String::new(),
+            node_info: None,
+            metrics_history: None,
+            bearer_provider: None,
+            auth_cfg: None,
+            security_cfg: None,
+            audit: None,
+            anonymous_denied: None,
+            dashboard_success: None,
+            success_audit_dedup: None,
+            table_cache: None,
+            hive_manifest_cache: None,
+            serving: None,
+            mcp_listener_alive: None,
+            query_history: None,
+        });
+        let call = |since: Option<&str>, before: Option<&str>| {
+            api_query_history(
+                axum::extract::State(Arc::clone(&state)),
+                axum::extract::Query(QueryHistoryParams {
+                    state: None,
+                    limit: None,
+                    since: since.map(str::to_string),
+                    before: before.map(str::to_string),
+                }),
+            )
+        };
+
+        let response = call(None, None).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        assert_eq!(page["items"][0]["queryId"], done.to_string());
+        assert!(page["nextBefore"].is_null());
+
+        let since = call(Some("yesterday"), None).await;
+        assert_eq!(since.status(), axum::http::StatusCode::BAD_REQUEST);
+        let before = call(None, Some("not-a-cursor")).await;
+        assert_eq!(before.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -3729,8 +3860,9 @@ token_endpoint = "http://127.0.0.1:1/token"
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
-        serving: None,
-        mcp_listener_alive: None,
+            serving: None,
+            mcp_listener_alive: None,
+            query_history: None,
         });
         let Json(resp) = api_metrics_history(axum::extract::State(state)).await;
         assert_eq!(
@@ -3776,8 +3908,9 @@ token_endpoint = "http://127.0.0.1:1/token"
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
-        serving: None,
-        mcp_listener_alive: None,
+            serving: None,
+            mcp_listener_alive: None,
+            query_history: None,
         });
         let Json(resp) = api_metrics_history(axum::extract::State(state)).await;
         assert_eq!(
@@ -3856,8 +3989,9 @@ token_endpoint = "http://127.0.0.1:1/token"
             success_audit_dedup: None,
             table_cache: Some(cache.clone()),
             hive_manifest_cache: None,
-        serving: None,
-        mcp_listener_alive: None,
+            serving: None,
+            mcp_listener_alive: None,
+            query_history: None,
         });
 
         let Json(resp) = api_catalogs_refresh(axum::extract::State(state), None).await;
@@ -3925,6 +4059,7 @@ token_endpoint = "http://127.0.0.1:1/token"
             hive_manifest_cache: Some(Arc::clone(&hive)),
             serving: None,
             mcp_listener_alive: None,
+            query_history: None,
         });
 
         let Json(resp) = api_catalogs_refresh(axum::extract::State(state), None).await;
@@ -3956,8 +4091,9 @@ token_endpoint = "http://127.0.0.1:1/token"
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
-        serving: None,
-        mcp_listener_alive: None,
+            serving: None,
+            mcp_listener_alive: None,
+            query_history: None,
         });
         let Json(resp) = api_catalogs_refresh(axum::extract::State(state), None).await;
         assert_eq!(resp.invalidated, "all");
@@ -4047,8 +4183,9 @@ token_endpoint = "http://127.0.0.1:1/token"
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
-        serving: None,
-        mcp_listener_alive: None,
+            serving: None,
+            mcp_listener_alive: None,
+            query_history: None,
         })
     }
 
@@ -4416,8 +4553,9 @@ token_endpoint = "http://127.0.0.1:1/token"
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
-        serving: None,
-        mcp_listener_alive: None,
+            serving: None,
+            mcp_listener_alive: None,
+            query_history: None,
         });
         let app = build_health_router(state);
         let req = axum::http::Request::builder()
@@ -4458,8 +4596,9 @@ token_endpoint = "http://127.0.0.1:1/token"
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
-        serving: None,
-        mcp_listener_alive: None,
+            serving: None,
+            mcp_listener_alive: None,
+            query_history: None,
         });
         let app = build_health_router(state);
         let req = axum::http::Request::builder()
@@ -4528,8 +4667,9 @@ token_endpoint = "http://127.0.0.1:1/token"
             success_audit_dedup: cache,
             table_cache: None,
             hive_manifest_cache: None,
-        serving: None,
-        mcp_listener_alive: None,
+            serving: None,
+            mcp_listener_alive: None,
+            query_history: None,
         })
     }
 

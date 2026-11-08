@@ -199,7 +199,7 @@ fn build_queries_table(records: &[Arc<QueryRecord>]) -> DFResult<Arc<dyn TablePr
 // ---------------------------------------------------------------------------
 
 /// Most audit events one `query_history` scan reads; the newest are kept.
-const HISTORY_ROW_CAP: usize = 100_000;
+pub(crate) const HISTORY_ROW_CAP: usize = 100_000;
 
 /// Where `query_history` reads finished queries the tracker has dropped.
 #[derive(Debug, Clone)]
@@ -241,6 +241,56 @@ pub fn audit_history_source(config: &sqe_core::SqeConfig) -> Option<AuditHistory
             .and_then(chrono::Duration::try_seconds)
             .unwrap_or(chrono::Duration::MAX),
     })
+}
+
+impl AuditHistorySource {
+    /// The finished queries the log holds with an end time in `[from, to]`
+    /// (`from` defaults to `lookback` ago), newest first, one record per
+    /// query id (its last event). Reads at most `cap` events, the newest; the
+    /// flag is `true` when it read `cap`, so older matching events may be left
+    /// out. Blocking: it reads the log files.
+    pub fn read(
+        &self,
+        from: Option<chrono::DateTime<chrono::Utc>>,
+        to: Option<chrono::DateTime<chrono::Utc>>,
+        cap: usize,
+    ) -> (Vec<QueryRecord>, bool) {
+        // A lookback past chrono's range reads the whole log.
+        let from = from.unwrap_or_else(|| {
+            chrono::Utc::now()
+                .checked_sub_signed(self.lookback)
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+        });
+        let events = sqe_metrics::audit::read_query_events(&self.path, from, to, cap);
+        let full = events.len() >= cap;
+        let mut seen = std::collections::HashSet::new();
+        let records = events
+            .into_iter()
+            .rev()
+            .filter_map(record_from_event)
+            .filter(|r| seen.insert(r.query_id))
+            .collect();
+        (records, full)
+    }
+}
+
+/// Append the `logged` records (newest first) to `records`, skipping a query
+/// id `records` already holds (the tracker's record is the fuller one) and,
+/// with `owner`, the queries another user ran.
+pub(crate) fn merge_logged(
+    records: &mut Vec<Arc<QueryRecord>>,
+    logged: Vec<QueryRecord>,
+    owner: Option<&str>,
+) {
+    let mut seen: std::collections::HashSet<uuid::Uuid> =
+        records.iter().map(|r| r.query_id).collect();
+    records.extend(
+        logged
+            .into_iter()
+            .filter(|r| owner.is_none_or(|o| r.user == o))
+            .filter(|r| seen.insert(r.query_id))
+            .map(Arc::new),
+    );
 }
 
 /// `system.runtime.query_history`: the tracker's records (running queries
@@ -286,35 +336,14 @@ impl TableProvider for QueryHistoryTable {
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let mut records = self.live.clone();
-        if let Some(source) = &self.source {
+        if let Some(source) = self.source.clone() {
             let bounds = EndBounds::from_filters(filters);
-            // A lookback past chrono's range reads the whole log.
-            let from = bounds.from.unwrap_or_else(|| {
-                chrono::Utc::now()
-                    .checked_sub_signed(source.lookback)
-                    .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
-            });
-            let path = source.path.clone();
-            let events = tokio::task::spawn_blocking(move || {
-                sqe_metrics::audit::read_query_events(&path, from, bounds.to, HISTORY_ROW_CAP)
+            let (logged, _) = tokio::task::spawn_blocking(move || {
+                source.read(bounds.from, bounds.to, HISTORY_ROW_CAP)
             })
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let mut seen: std::collections::HashSet<uuid::Uuid> =
-                records.iter().map(|r| r.query_id).collect();
-            // Newest first, so a query logged twice shows its last event.
-            for event in events.into_iter().rev() {
-                if let Some(owner) = &self.owner_filter {
-                    if &event.actor.username != owner {
-                        continue;
-                    }
-                }
-                if let Some(record) = record_from_event(event) {
-                    if seen.insert(record.query_id) {
-                        records.push(Arc::new(record));
-                    }
-                }
-            }
+            merge_logged(&mut records, logged, self.owner_filter.as_deref());
         }
         let batch = queries_batch(&records)?;
         MemTable::try_new(batch.schema(), vec![vec![batch]])?
@@ -1238,6 +1267,104 @@ mod tests {
         }
         out.sort();
         out
+    }
+
+    /// Every `limit`-row page of the dashboard's History tab, walked through
+    /// `nextBefore` until the last one; the query ids in order.
+    fn walk_history_pages(
+        live: &[Arc<QueryRecord>],
+        source: &AuditHistorySource,
+        since: Option<chrono::DateTime<Utc>>,
+        state: Option<&str>,
+        limit: usize,
+    ) -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut before = None;
+        loop {
+            let page = crate::web_ui::query_history_page(
+                live.to_vec(),
+                Some(source),
+                since,
+                before,
+                state,
+                limit,
+            );
+            assert!(page.items.len() <= limit);
+            ids.extend(page.items.into_iter().map(|q| q.query_id));
+            match page.next_before {
+                Some(cursor) => before = crate::web_ui::HistoryCursor::parse(&cursor),
+                None => return ids,
+            }
+            assert!(before.is_some(), "the cursor parses back");
+        }
+    }
+
+    /// The dashboard's History pages (#812) walk the tracker and the log
+    /// newest end first, each finished query exactly once, and a sparse
+    /// state filter widens the log read until a page fills.
+    #[test]
+    fn history_pages_walk_tracker_and_log_once() {
+        let now = Utc::now();
+        let at = |i: u128| now - chrono::Duration::seconds(i64::try_from(i).unwrap());
+        // Query i ended i seconds ago; every 40th failed.
+        let lines: Vec<String> = (1..=120u128)
+            .rev()
+            .map(|i| {
+                let status = if i % 40 == 0 { "SQE-1" } else { "success" };
+                audit_line(i, "alice", at(i), status)
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let source = AuditHistorySource {
+            path,
+            lookback: chrono::Duration::hours(1),
+        };
+        let finished = |n: u128, ended, sql: &str| {
+            Arc::new(QueryRecord {
+                ended: Some(ended),
+                ..record(n, QueryState::Finished, "alice", None, sql)
+            })
+        };
+        let half = chrono::Duration::milliseconds(500);
+        let running = record(600, QueryState::Running, "alice", None, "SELECT 600");
+        let live = vec![
+            // Also logged: listed once, from the tracker.
+            finished(5, at(5), "SELECT tracker"),
+            // Only in the tracker, ended between queries 2 and 3.
+            finished(500, now - chrono::Duration::seconds(2) - half, "SELECT 500"),
+            // Still running: the Queries tab's, not History's.
+            Arc::new(running),
+        ];
+        let id = |n: u128| Uuid::from_u128(n).to_string();
+
+        let mut expected = vec![id(1), id(2), id(500)];
+        expected.extend((3..=120).map(id));
+        assert_eq!(walk_history_pages(&live, &source, None, None, 7), expected);
+
+        let all =
+            crate::web_ui::query_history_page(live.clone(), Some(&source), None, None, None, 200);
+        let five = all.items.iter().find(|q| q.query_id == id(5)).unwrap();
+        assert_eq!(five.sql, "SELECT tracker");
+        assert!(all.next_before.is_none());
+
+        let failed = walk_history_pages(&live, &source, None, Some("failed"), 1);
+        assert_eq!(failed, [id(40), id(80), id(120)]);
+
+        let recent = walk_history_pages(&live, &source, Some(at(10)), None, 100);
+        let mut expected = vec![id(1), id(2), id(500)];
+        expected.extend((3..=10).map(id));
+        assert_eq!(recent, expected);
+
+        // A cursor round-trips; anything else is refused.
+        let cursor = crate::web_ui::HistoryCursor {
+            ended: now,
+            query_id: Uuid::from_u128(7),
+        };
+        let parsed = crate::web_ui::HistoryCursor::parse(&cursor.encode());
+        assert_eq!(parsed, Some(cursor));
+        assert_eq!(crate::web_ui::HistoryCursor::parse("2026-11-08"), None);
     }
 
     #[tokio::test]

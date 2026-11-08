@@ -254,6 +254,15 @@ WHERE "end" >= now() - INTERVAL '7' DAY AND state = 'FAILED';
   generations included. Without one, the last `[query_history] lookback_secs`
   (default 86400, one day) is read. One scan returns at most the newest
   100000 audited queries.
+- The log is read newest first. A binary search on the line timestamps finds
+  where the window ends, and the read stops at the window start or once it
+  has the rows it needs, so a short window costs about the same however much
+  log lies behind it. On a week of log (about a million queries in six
+  256 MiB generations) a one-hour window reads in about 25 ms and the whole
+  week, capped at 100000 rows, in about 270 ms. A 50-row page of the web UI
+  takes under 1 ms for the newest queries and about 3 ms five days back.
+- The web UI's History tab pages through the same rows; see
+  [Web UI](web-ui.md).
 - A query still in the tracker is shown once, from the tracker; a running query
   appears only there.
 - Rows from the log carry the audit event's timing, state (`FINISHED`, `FAILED`

@@ -118,6 +118,15 @@
   .spark-wrap { height:40px; }
   svg.spark   { width:100%; height:40px; overflow:visible; }
 
+  /* ── History controls ── */
+  .hist-bar { display:flex; flex-wrap:wrap; gap:.75rem; align-items:center;
+              margin-bottom:.75rem; font-size:13px; }
+  .hist-bar select, .hist-bar button, button.more {
+              font:inherit; padding:.3rem .6rem; border-radius:5px;
+              border:1px solid var(--soft-blue); background:var(--white); cursor:pointer; }
+  button.more { display:block; margin:.75rem auto 0; }
+  .hist-count { margin-left:auto; color:var(--gray-medium); }
+
   /* ── Tooltip ── */
   #tip { position:fixed; pointer-events:none; display:none; z-index:9999;
          background:#1a2535; color:#fff; font:600 12px var(--mono);
@@ -134,6 +143,7 @@
   <nav>
     <button data-tab="overview" class="active">Overview</button>
     <button data-tab="queries">Queries</button>
+    <button data-tab="history">History</button>
     <button data-tab="cluster">Cluster</button>
   </nav>
   <span id="meta"></span>
@@ -141,6 +151,7 @@
 <div id="err"></div>
 <div id="overview"></div>
 <div id="queries" style="display:none"></div>
+<div id="history" style="display:none"></div>
 <div id="cluster" style="display:none"></div>
 <div id="detail" class="hidden"></div>
 
@@ -462,11 +473,72 @@ async function renderQueries(){
   } catch(e){ showErr(e); }
 }
 
-async function openDetail(id){
+// History tab (#812): finished queries from the tracker and the audit log,
+// newest first, 50 per page. It does not refresh on the 2 s tick, so loaded
+// pages stay put; Refresh or a filter change starts again from the newest.
+const hist = { rows:[], next:null, loaded:false, since:null, range:"86400", state:"all" };
+const histById = new Map();
+async function renderHistory(reset){
+  if(reset){
+    hist.rows=[]; hist.next=null; histById.clear();
+    hist.since = hist.range==="all" ? null : new Date(Date.now()-Number(hist.range)*1000).toISOString();
+  }
+  hist.loaded = true;
+  const p = new URLSearchParams({limit:"50"});
+  if(hist.since) p.set("since", hist.since);
+  if(hist.state!=="all") p.set("state", hist.state);
+  if(!reset && hist.next) p.set("before", hist.next);
+  try {
+    const page = await getJSON("/api/v1/queries/history?"+p.toString()); clearErr();
+    (page.items||[]).forEach(q=>{ hist.rows.push(q); histById.set(q.queryId, q); });
+    hist.next = page.nextBefore || null;
+    drawHistory();
+  } catch(e){ hist.loaded=false; showErr(e); }
+}
+function histOpt(v, label, cur){ return `<option value="${esc(v)}"${v===cur?" selected":""}>${esc(label)}</option>`; }
+function drawHistory(){
+  if(current!==null) return; // detail open
+  const ranges=[["3600","last hour"],["86400","last 24 hours"],["604800","last 7 days"],["2592000","last 30 days"],["all","whole log"]];
+  const states=[["all","any state"],["finished","finished"],["failed","failed"],["canceled","canceled"]];
+  // nosemgrep: opt.aikido.semgrep-rules.html.security.audit.insecure-document-method -- all interpolations pass through esc()
+  $("#history").innerHTML =
+    `<div class=hist-bar><select id=hist-range>${ranges.map(([v,l])=>histOpt(v,l,hist.range)).join("")}</select>`+
+    `<select id=hist-state>${states.map(([v,l])=>histOpt(v,l,hist.state)).join("")}</select>`+
+    `<button id=hist-refresh>Refresh</button>`+
+    `<span class=hist-count>${hist.rows.length} ${hist.next?"shown, more available":"queries"}</span></div>`+
+    "<table><thead><tr><th>ended</th><th>id</th><th>state</th><th>user</th><th>sql (redacted)</th>"+
+    "<th class=num>elapsed</th><th class=num>rows</th><th class=num>scanned</th></tr></thead><tbody>"+
+    hist.rows.map(q=>{
+      const el = (q.executionMs||0)+(q.planningMs||0)+(q.queuedMs||0);
+      return `<tr class=h data-id="${esc(q.queryId)}"><td>${esc(q.ended?new Date(q.ended).toLocaleString():"")}</td>`+
+        `<td>${esc(String(q.queryId).slice(0,8))}</td>`+
+        `<td class="${stClass(q.state)}">${esc(q.state)}</td>`+
+        `<td>${esc(q.username||"")}</td>`+
+        `<td title="${esc(q.sql||"")}">${esc(String(q.sql||"").slice(0,60))}</td>`+
+        `<td class=num>${ms(el)}</td><td class=num>${q.outputRows|0}</td>`+
+        `<td class=num>${fmtBytes(q.bytesScanned)}</td></tr>`;
+    }).join("")+"</tbody></table>"+
+    (hist.next?`<button class=more id=hist-more>Load more</button>`:"");
+  $("#hist-range").onchange=e=>{ hist.range=e.target.value; renderHistory(true); };
+  $("#hist-state").onchange=e=>{ hist.state=e.target.value; renderHistory(true); };
+  $("#hist-refresh").onclick=()=>renderHistory(true);
+  if(hist.next) $("#hist-more").onclick=()=>renderHistory(false);
+  document.querySelectorAll("tr.h").forEach(tr=>
+    tr.onclick=()=>openDetail(tr.dataset.id, histById.get(tr.dataset.id)));
+}
+
+// `fallback`: the History row, shown when the tracker no longer holds the
+// query (it aged out or the coordinator restarted); the audit log keeps no
+// fragments, tables or profile.
+async function openDetail(id, fallback){
   current = id;
   try {
-    const d = await getJSON("/api/v1/queries/"+encodeURIComponent(id)); clearErr();
-    $("#queries").style.display="none"; $("#cluster").style.display="none"; $("#overview").style.display="none";
+    let d;
+    try { d = await getJSON("/api/v1/queries/"+encodeURIComponent(id)); }
+    catch(e){ if(!fallback || !/ 404$/.test(e.message)) throw e; d = fallback; }
+    clearErr();
+    $("#queries").style.display="none"; $("#history").style.display="none";
+    $("#cluster").style.display="none"; $("#overview").style.display="none";
     const det = $("#detail"); det.classList.remove("hidden");
     const fr = (d.fragments||[]).map(f=>
       `<tr><td>${esc(f.taskId)}</td><td>${esc(f.workerUrl)}</td>`+
@@ -495,7 +567,7 @@ async function openDetail(id){
   } catch(e){ showErr(e); }
 }
 function closeDetail(){ current=null; $("#detail").classList.add("hidden");
-  $("#queries").style.display=""; switchTab(tab); }
+  switchTab(tab); if(tab==="history") drawHistory(); }
 
 async function renderCluster(){
   try {
@@ -518,6 +590,7 @@ function switchTab(t){
     b.classList.toggle("active", b.dataset.tab===t));
   $("#overview").style.display = t==="overview" ? "" : "none";
   $("#queries").style.display  = t==="queries"  ? "" : "none";
+  $("#history").style.display  = t==="history"  ? "" : "none";
   $("#cluster").style.display  = t==="cluster"  ? "" : "none";
   tick();
 }
@@ -527,6 +600,7 @@ document.querySelectorAll("nav button").forEach(b=>
 function tick(){ if(current!==null) return;
   if(tab==="overview") renderOverview();
   else if(tab==="queries") renderQueries();
+  else if(tab==="history") { if(!hist.loaded) renderHistory(true); }
   else renderCluster(); }
 tick(); setInterval(tick, 2000);
 </script>

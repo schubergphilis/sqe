@@ -4,6 +4,7 @@
 //! thin wrappers over these functions. Ops-only, network-gated; see
 //! `docs/superpowers/specs/2026-06-01-sqe-web-ui-design.md`.
 
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -289,6 +290,132 @@ pub fn query_list(
         .take(limit)
         .map(|r| to_list_item(&r))
         .collect()
+}
+
+/// An RFC 3339 time (the `since` of the history API) in UTC.
+pub fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
+    Some(DateTime::parse_from_rfc3339(s).ok()?.with_timezone(&Utc))
+}
+
+/// Keyset position in the history: the end time and id of the last row a
+/// page showed. The next page holds the rows strictly after it in
+/// newest-first order. Rendered as `<rfc3339 end>_<query id>`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HistoryCursor {
+    pub ended: DateTime<Utc>,
+    pub query_id: Uuid,
+}
+
+impl HistoryCursor {
+    /// `None` for a string [`HistoryCursor::encode`] did not produce.
+    pub fn parse(s: &str) -> Option<Self> {
+        let (ended, id) = s.rsplit_once('_')?;
+        Some(Self {
+            ended: parse_rfc3339(ended)?,
+            query_id: Uuid::parse_str(id).ok()?,
+        })
+    }
+
+    pub fn encode(&self) -> String {
+        let ended = self
+            .ended
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        format!("{ended}_{}", self.query_id)
+    }
+
+    fn of(r: &QueryRecord) -> Option<Self> {
+        Some(Self {
+            ended: r.ended?,
+            query_id: r.query_id,
+        })
+    }
+
+    /// Newest-first order: a later end sorts first, ties by id descending.
+    fn key(&self) -> (std::cmp::Reverse<DateTime<Utc>>, std::cmp::Reverse<Uuid>) {
+        (
+            std::cmp::Reverse(self.ended),
+            std::cmp::Reverse(self.query_id),
+        )
+    }
+}
+
+#[derive(Serialize, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryPage {
+    pub items: Vec<QueryListItem>,
+    /// Pass as `before` for the next, older page; `None` on the last page.
+    pub next_before: Option<String>,
+}
+
+/// One page of the query history: finished queries (any end state) from the
+/// tracker and from the native audit log, newest end time first, one row per
+/// query id (the tracker's record wins). `since` bounds the end time from
+/// below (`None` reads the whole log), `before` continues after a page's
+/// last row, `state_filter` works as in [`query_list`].
+///
+/// The log is read newest first and stops after `limit` + 1 matches, so a
+/// page costs about the same however much log lies behind it. When the
+/// state filter or a query logged twice leaves the read short, the read
+/// grows (up to 100 000 events) until the page is full or the window is
+/// exhausted. Blocking: run it off the async runtime.
+pub fn query_history_page(
+    live: Vec<std::sync::Arc<QueryRecord>>,
+    source: Option<&crate::AuditHistorySource>,
+    since: Option<DateTime<Utc>>,
+    before: Option<HistoryCursor>,
+    state_filter: Option<&str>,
+    limit: usize,
+) -> HistoryPage {
+    let want = state_filter
+        .map(|s| s.to_ascii_lowercase())
+        .filter(|s| s != "all" && !s.is_empty());
+    let keep = |r: &QueryRecord| -> bool {
+        let Some(at) = HistoryCursor::of(r) else {
+            return false; // still running: the Queries tab shows it
+        };
+        since.is_none_or(|s| at.ended >= s)
+            && before.is_none_or(|b| at.key() > b.key())
+            && want
+                .as_deref()
+                .is_none_or(|w| r.state.to_string().eq_ignore_ascii_case(w))
+    };
+    let mut records: Vec<_> = live.into_iter().filter(|r| keep(r)).collect();
+    if let Some(source) = source {
+        let from = since.unwrap_or(DateTime::<Utc>::MIN_UTC);
+        let to = before.map(|b| b.ended);
+        let mut cap = limit.saturating_add(1).max(64);
+        loop {
+            let (logged, full) = source.read(Some(from), to, cap);
+            let logged: Vec<_> = logged.into_iter().filter(|r| keep(r)).collect();
+            // Every event the read left out is older than every one it
+            // kept, so the page is exact once `limit` + 1 logged rows
+            // match: counting the tracker's rows here could let an older
+            // tracker row take the place of an unread, newer log row.
+            let enough = logged.len() > limit;
+            let cap_reached = cap >= crate::system_runtime::HISTORY_ROW_CAP;
+            if !full || enough || cap_reached {
+                crate::system_runtime::merge_logged(&mut records, logged, None);
+                break;
+            }
+            cap = cap
+                .saturating_mul(4)
+                .min(crate::system_runtime::HISTORY_ROW_CAP);
+        }
+    }
+    records.sort_by_key(|r| HistoryCursor::of(r).map(|c| c.key()));
+    let next_before = if records.len() > limit {
+        records.truncate(limit);
+        records
+            .last()
+            .and_then(|r| HistoryCursor::of(r))
+            .map(|c| c.encode())
+    } else {
+        None
+    };
+    HistoryPage {
+        items: records.iter().map(|r| to_list_item(r)).collect(),
+        next_before,
+    }
 }
 
 #[derive(Serialize, PartialEq, Debug)]
