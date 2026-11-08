@@ -45,6 +45,29 @@ pub fn to_ocsf(event: &AuditEvent) -> Value {
         if let Some(len) = q.text_len {
             unmapped.insert("query_text_len".into(), json!(len));
         }
+        if let Some(fp) = &q.query_fingerprint {
+            unmapped.insert("query_fingerprint".into(), json!(fp));
+        }
+    }
+    if let Some(id) = &event.query_id {
+        unmapped.insert("query_id".into(), json!(id));
+    }
+    if let Some(id) = &event.trace_id {
+        unmapped.insert("trace_id".into(), json!(id));
+    }
+    // The total lands on OCSF's own `duration` below; the phase split has no
+    // OCSF home.
+    if let Some(t) = &event.timing {
+        unmapped.insert("queued_ms".into(), json!(t.queued_ms));
+        unmapped.insert("planning_ms".into(), json!(t.planning_ms));
+        unmapped.insert("execution_ms".into(), json!(t.execution_ms));
+    }
+    if let Outcome::Failure {
+        error_type: Some(t),
+        ..
+    } = &event.outcome
+    {
+        unmapped.insert("error_type".into(), json!(t));
     }
     if let Some(s) = &event.stats {
         unmapped.insert("bytes_scanned".into(), json!(s.bytes_scanned));
@@ -90,6 +113,16 @@ pub fn to_ocsf(event: &AuditEvent) -> Value {
     } = &event.outcome
     {
         out["message"] = json!(m);
+    }
+    if let Outcome::Failure {
+        error_code: Some(c),
+        ..
+    } = &event.outcome
+    {
+        out["status_code"] = json!(c);
+    }
+    if let Some(t) = &event.timing {
+        out["duration"] = json!(t.duration_ms);
     }
     if let Some(ip) = &event.client_ip {
         out["src_endpoint"] = json!({ "ip": ip });
@@ -165,6 +198,7 @@ mod tests {
                 query_hash: "abc".into(),
                 statement_type: "query".into(),
                 text_len: None,
+                query_fingerprint: None,
             }),
             session_id: Some("sess-1".into()),
             client_ip: Some("10.0.0.1".into()),
@@ -203,6 +237,30 @@ mod tests {
         };
         let v = to_ocsf(&ev);
         assert_eq!(v["status_id"], 2);
+        assert_eq!(v["status_code"], "E1");
+        assert_eq!(v["unmapped"]["error_type"], "PlanError");
+    }
+
+    /// #812: the fields a query history needs reach the OCSF twin too:
+    /// ids, the literal-free fingerprint, the total on OCSF's `duration` and
+    /// the phase split under `unmapped`.
+    #[test]
+    fn query_history_fields_reach_ocsf() {
+        let mut ev = query_event();
+        ev.query_id = Some("q-1".into());
+        ev.trace_id = Some("t-1".into());
+        if let Some(q) = ev.query.as_mut() {
+            q.query_fingerprint = Some("fp".into());
+        }
+        let v = to_ocsf(&ev);
+        assert_eq!(v["duration"], 42);
+        assert_eq!(v["unmapped"]["planning_ms"], 5);
+        assert_eq!(v["unmapped"]["execution_ms"], 37);
+        assert_eq!(v["unmapped"]["query_id"], "q-1");
+        assert_eq!(v["unmapped"]["trace_id"], "t-1");
+        assert_eq!(v["unmapped"]["query_fingerprint"], "fp");
+        assert!(v.get("status_code").is_none(), "success has no status_code");
+        assert!(v["unmapped"].get("error_type").is_none());
     }
 
     #[test]

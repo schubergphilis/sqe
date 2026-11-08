@@ -300,11 +300,18 @@ impl QueryTracker {
 
     pub fn running(&self, query_id: &Uuid, planning_ms: u64) {
         self.update(query_id, |record| {
+            // A cancel that landed while the query planned already made the
+            // record terminal; running must not bring it back.
+            if record.state != QueryState::Queued {
+                return;
+            }
             let now = Utc::now();
             record.state = QueryState::Running;
             record.started = Some(now);
-            let elapsed = (now - record.created).num_milliseconds();
-            record.queued_ms = elapsed.max(0) as u64;
+            // Time from registration to running, less the planning inside
+            // it: what is left is waiting, not working.
+            let elapsed = (now - record.created).num_milliseconds().max(0) as u64;
+            record.queued_ms = elapsed.saturating_sub(planning_ms);
             record.planning_ms = planning_ms;
         });
     }
@@ -563,6 +570,29 @@ mod tests {
         assert_eq!(rec.planning_ms, 10);
         assert!(rec.tables_touched.contains(&"ns.table1".to_string()));
         assert_eq!(tracker.active_count(), 0);
+    }
+
+    /// `running` reports the planning it is given, and the queue time is
+    /// what is left of the wait, not the planning counted twice. A cancel
+    /// that landed during planning stays a cancel.
+    #[tokio::test]
+    async fn running_splits_queue_from_planning_and_keeps_a_cancel() {
+        let tracker = QueryTracker::new(&test_config());
+        let id = Uuid::now_v7();
+        tracker.start(id, "bob", None, "SELECT 1", "s", None, vec![], None);
+        tracker.running(&id, 60_000);
+        let rec = tracker.get(&id).unwrap();
+        assert_eq!(rec.state, QueryState::Running);
+        assert_eq!(rec.planning_ms, 60_000);
+        assert_eq!(rec.queued_ms, 0, "planning is not queue time");
+
+        let id = Uuid::now_v7();
+        tracker.start(id, "bob", None, "SELECT 1", "s", None, vec![], None);
+        tracker.canceled(&id);
+        tracker.running(&id, 5);
+        let rec = tracker.get(&id).unwrap();
+        assert_eq!(rec.state, QueryState::Canceled);
+        assert_eq!(rec.planning_ms, 0);
     }
 
     #[tokio::test]

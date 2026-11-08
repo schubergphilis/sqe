@@ -984,6 +984,13 @@ async fn streaming_select_emits_canonical_query_event() {
         v["integrity"]["seq"].is_u64(),
         "integrity.seq must be a u64; got: {v}"
     );
+    // 6. the literal-free fingerprint (#812); the stats values are asserted
+    // in streaming::tests, where the plan has scan metrics to report
+    assert_eq!(
+        v["query"]["query_fingerprint"].as_str(),
+        Some(sqe_metrics::audit::query_fingerprint("SELECT 1 AS x").as_str()),
+        "got: {v}"
+    );
 }
 
 // ---------------------------------------------------------------------------

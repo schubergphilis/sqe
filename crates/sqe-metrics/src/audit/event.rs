@@ -108,6 +108,12 @@ pub struct QueryInfo {
     /// the text out of the log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_len: Option<usize>,
+    /// Hash of the statement with every literal replaced by a placeholder
+    /// ([`super::query_fingerprint`]): the same query shape with different
+    /// values shares one fingerprint, where `query_hash` differs per value.
+    /// Holds no literal, so it stays when `omit_query_text` drops the text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -293,6 +299,7 @@ pub(crate) fn sample_query_event() -> AuditEvent {
             query_hash: "abc".into(),
             statement_type: "query".into(),
             text_len: None,
+            query_fingerprint: None,
         }),
         session_id: Some("sess-1".into()),
         client_ip: Some("10.0.0.1".into()),
@@ -347,6 +354,7 @@ mod tests {
                 query_hash: "abc".into(),
                 statement_type: "query".into(),
                 text_len: None,
+                query_fingerprint: None,
             }),
             session_id: Some("sess-1".into()),
             client_ip: Some("10.0.0.1".into()),

@@ -203,6 +203,7 @@ pub fn dashboard_audit_event(
             query_hash: sqe_metrics::audit::query_hash("dashboard_access"),
             statement_type: "dashboard_access".into(),
             text_len: None,
+            query_fingerprint: None,
         }),
         session_id: None,
         client_ip,
