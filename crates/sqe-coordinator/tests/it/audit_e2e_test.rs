@@ -899,6 +899,7 @@ async fn streaming_select_emits_canonical_query_event() {
         kind_name: "Query".to_string(),
         plan,
         runtime,
+        query_peak: None,
         start: std::time::Instant::now(),
         slow_query_threshold_secs: 0,
         sql_length: 14,

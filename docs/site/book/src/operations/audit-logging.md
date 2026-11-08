@@ -230,6 +230,12 @@ and planning time whether it succeeded, failed or was cancelled. The buffered pa
 plans and executes in one call, so its `queued_ms` and `planning_ms` are 0 and
 `execution_ms` covers both.
 
+`stats.peak_memory_bytes` is the most memory the query itself held at once under
+its `query.max_query_memory` quota, a memory retry included. Other queries on the
+coordinator do not count towards it. With `max_query_memory = 0` the query has
+no quota and the field is 0. The same value is the `peak_memory_bytes` column of
+`system.runtime.queries`.
+
 ## Tamper-evident hash chain
 
 Every record carries an `integrity` block:

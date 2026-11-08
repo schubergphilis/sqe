@@ -85,6 +85,7 @@ type OpenStreamResult = (
     sqe_policy::PolicySummary,
     Vec<sqe_metrics::audit::Resource>,
     crate::join_fallback::ReplannedPlan,
+    Option<crate::query_memory::QueryPeak>,
 );
 
 /// Marks a tracked query abandoned if the future running it is dropped
@@ -3936,6 +3937,7 @@ impl QueryHandler {
                 policy_summary,
                 audit_resources,
                 replanned,
+                query_peak,
             )) => {
                 let actor = crate::audit_emitter::actor_for(session);
                 let finalizer = crate::streaming::StreamFinalizer {
@@ -3949,6 +3951,7 @@ impl QueryHandler {
                     kind_name,
                     plan: final_plan,
                     runtime: Arc::clone(&self.runtime),
+                    query_peak,
                     start,
                     slow_query_threshold_secs: self.config.query.slow_query_threshold_secs,
                     sql_length: sql.len(),
@@ -4157,6 +4160,7 @@ impl QueryHandler {
             policy_summary,
             audit_resources,
             replanned,
+            crate::query_memory::query_peak(&ctx),
         ))
     }
 
@@ -4721,12 +4725,10 @@ impl QueryHandler {
         // QueryTracker when the query completes.
         {
             let mut extracted = extract_plan_metrics(&final_plan);
-            // Snapshot the memory pool usage as a best-effort proxy for peak
-            // memory. This is the pool-wide value (shared across concurrent
-            // queries), so it overestimates per-query usage, but it's the best
-            // signal available without per-query reservation tracking.
+            // This query's own peak under its quota, retries included; 0
+            // when `query.max_query_memory = 0` leaves it without one.
             extracted.peak_memory_bytes =
-                crate::memory::used_bytes(&self.runtime.memory_pool) as u64;
+                crate::query_memory::query_peak(&ctx).map_or(0, |peak| peak.bytes());
             if let Ok(mut pm) = plan_metrics.lock() {
                 *pm = extracted;
             }
@@ -10803,6 +10805,45 @@ mod show_stats_policy_tests {
             chrono::Utc::now() + chrono::Duration::hours(1),
             Vec::new(),
         )
+    }
+
+    /// `peak_memory_bytes` is the query's own peak, on the buffered and the
+    /// streaming path: a sort reserves memory, so it is above 0, and the
+    /// 32 MiB another consumer holds on the same coordinator pool is not in
+    /// it. Before, both paths recorded the pool's total at query end.
+    #[tokio::test]
+    async fn peak_memory_is_the_querys_own_on_both_paths() {
+        use futures::StreamExt;
+        let handler = pressure_handler("64MB");
+        let held = datafusion::execution::memory_pool::MemoryConsumer::new("other-query")
+            .register(&handler.runtime.memory_pool);
+        held.try_grow(32 << 20).expect("hold 32 MiB");
+        let session = pressure_session();
+
+        let buffered = "SELECT value FROM generate_series(1, 200000) ORDER BY value DESC";
+        handler
+            .execute(&session, buffered, None)
+            .await
+            .expect(buffered);
+        let streamed = "SELECT value FROM generate_series(1, 200001) ORDER BY value DESC";
+        let (_, mut stream) = handler
+            .execute_stream(&session, streamed, None)
+            .await
+            .expect(streamed);
+        while let Some(batch) = stream.next().await {
+            batch.expect("batch");
+        }
+        drop(stream);
+
+        for sql in [buffered, streamed] {
+            let records = handler.query_tracker.records();
+            let record = records.iter().find(|r| r.sql == sql).expect(sql);
+            assert!(
+                record.peak_memory_bytes > 0 && record.peak_memory_bytes < 32 << 20,
+                "{sql}: peak {} is not this query's own",
+                record.peak_memory_bytes
+            );
+        }
     }
 
     /// A light read runs while the pool is red, under the pressure cap,

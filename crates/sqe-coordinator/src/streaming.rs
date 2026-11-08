@@ -155,6 +155,9 @@ pub struct StreamFinalizer {
     pub kind_name: String,
     pub plan: Arc<dyn ExecutionPlan>,
     pub runtime: Arc<RuntimeEnv>,
+    /// The query's own memory peak under its quota
+    /// ([`crate::query_memory::query_peak`]); `None` without a quota.
+    pub query_peak: Option<crate::query_memory::QueryPeak>,
     pub start: Instant,
     pub slow_query_threshold_secs: u64,
     pub sql_length: usize,
@@ -337,7 +340,7 @@ impl StreamFinalizer {
     /// pool right now; call before `observe_query_end` releases it.
     fn audit_plan_metrics(&self) -> PlanMetrics {
         let mut pm = extract_plan_metrics(&self.plan);
-        pm.peak_memory_bytes = crate::memory::used_bytes(&self.runtime.memory_pool) as u64;
+        pm.peak_memory_bytes = self.query_peak.as_ref().map_or(0, |peak| peak.bytes());
         pm
     }
 
@@ -1070,6 +1073,7 @@ mod tests {
             kind_name: "Query".to_string(),
             plan,
             runtime,
+            query_peak: None,
             start: Instant::now(),
             slow_query_threshold_secs: 0,
             sql_length: 8,
@@ -1645,12 +1649,22 @@ mod tests {
     #[tokio::test]
     async fn streaming_audit_event_carries_stats_and_timing_on_every_outcome() {
         use datafusion::error::DataFusionError;
+        use datafusion::execution::memory_pool::MemoryConsumer;
 
         for ending in ["success", "error", "cancel"] {
             let (plan, rows) = MetricsStubExec::create();
             rows.add(7);
             let schema = plan.schema();
-            let runtime = SessionContext::new().runtime_env();
+            // This query peaked at 300 bytes under its quota while another
+            // held 5000 of the same coordinator pool: the record shows 300.
+            let ctx = SessionContext::new();
+            let runtime = ctx.runtime_env();
+            let query = crate::query_memory::with_query_limit(ctx.clone(), 1 << 20, 0);
+            let other = MemoryConsumer::new("other").register(&runtime.memory_pool);
+            other.grow(5000);
+            let mine = MemoryConsumer::new("mine").register(&query.runtime_env().memory_pool);
+            mine.grow(300);
+            mine.shrink(200);
             let tracker = test_tracker();
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("audit.jsonl");
@@ -1658,6 +1672,7 @@ mod tests {
                 Arc::new(sqe_metrics::audit::AuditLogger::new(path.to_str().unwrap()).unwrap());
 
             let mut fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
+            fin.query_peak = crate::query_memory::query_peak(&query);
             fin.audit = Some(Arc::clone(&audit));
             fin.sql = "SELECT x FROM t WHERE x = 42".to_string();
             let qid = fin.query_id;
@@ -1686,6 +1701,10 @@ mod tests {
             let v: serde_json::Value =
                 serde_json::from_str(content.lines().next().unwrap()).unwrap();
             assert_eq!(v["stats"]["rows_scanned"], 7, "{ending}: {v}");
+            assert_eq!(v["stats"]["peak_memory_bytes"], 300, "{ending}: {v}");
+            if ending == "success" {
+                assert_eq!(tracker.get(&qid).unwrap().peak_memory_bytes, 300);
+            }
             assert_eq!(v["timing"]["planning_ms"], 3, "{ending}: {v}");
             let duration = v["timing"]["duration_ms"].as_u64().unwrap();
             let execution = v["timing"]["execution_ms"].as_u64().unwrap();

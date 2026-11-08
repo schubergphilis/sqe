@@ -5,6 +5,7 @@
 //! MemoryPool contract's infallible `grow` are not a process RSS limit.
 
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::memory_headroom::HeadroomBudget;
@@ -53,6 +54,35 @@ impl QueryQuota {
     }
 }
 
+/// The most bytes one execution held under its quota at any moment: its
+/// own peak, where the coordinator pool's `reserved()` sums every running
+/// query. A join-fallback retry shares the first attempt's counter, so the
+/// peak covers every attempt. `pub` because [`crate::streaming::StreamFinalizer`]
+/// carries one in a public field.
+#[derive(Debug, Clone, Default)]
+pub struct QueryPeak(Arc<AtomicUsize>);
+
+impl QueryPeak {
+    fn observe(&self, charged: usize) {
+        self.0.fetch_max(charged, Ordering::Relaxed);
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.0.load(Ordering::Relaxed) as u64
+    }
+}
+
+/// The peak of the query whose quota `ctx` runs under, or `None` when it
+/// has none (`query.max_query_memory = 0`).
+pub(crate) fn query_peak(ctx: &SessionContext) -> Option<QueryPeak> {
+    peak_of(&ctx.runtime_env().memory_pool)
+}
+
+fn peak_of(pool: &Arc<dyn MemoryPool>) -> Option<QueryPeak> {
+    pool.downcast_ref::<QueryMemoryPool>()
+        .map(|query| query.peak.clone())
+}
+
 #[derive(Debug)]
 struct QueryMemoryPool {
     shared: Arc<dyn MemoryPool>,
@@ -62,6 +92,7 @@ struct QueryMemoryPool {
     /// `limit`, with the share only non-spillable consumers may use
     /// (`coordinator.unspillable_headroom_percent`).
     budget: HeadroomBudget,
+    peak: QueryPeak,
 }
 
 impl fmt::Display for QueryMemoryPool {
@@ -90,6 +121,7 @@ impl MemoryPool for QueryMemoryPool {
         // admission must use try_grow. Still account these bytes in both pools.
         self.budget.charge(reservation.consumer(), additional);
         self.shared.grow(reservation, additional);
+        self.peak.observe(self.budget.charged());
     }
 
     fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
@@ -108,6 +140,7 @@ impl MemoryPool for QueryMemoryPool {
             self.budget.release(reservation.consumer(), additional);
             return Err(error);
         }
+        self.peak.observe(self.budget.charged());
         Ok(())
     }
 
@@ -252,6 +285,8 @@ fn with_quota_over(
     // fair share caps the other spilling consumers as well.
     let budget = HeadroomBudget::new(limit, headroom_percent, true).with_sort_share();
     let mut runtime = (*ctx.runtime_env()).clone();
+    // A retry built from the first attempt's context keeps its peak.
+    let peak = peak_of(&runtime.memory_pool).unwrap_or_default();
     runtime.memory_pool = Arc::new(QueryMemoryPool {
         shared,
         limit,
@@ -261,6 +296,7 @@ fn with_quota_over(
         } else {
             budget
         },
+        peak,
     });
     let state = SessionStateBuilder::from(ctx.state())
         .with_runtime_env(Arc::new(runtime))
@@ -280,6 +316,7 @@ mod tests {
             limit,
             limit_name: QueryQuota::normal(limit).name(),
             budget: HeadroomBudget::new(limit, 0, true),
+            peak: QueryPeak::default(),
         })
     }
 
@@ -512,5 +549,37 @@ mod tests {
         drop(a);
         drop(b);
         assert_eq!(ctx.runtime_env().memory_pool.reserved(), 0);
+    }
+
+    /// The peak is this query's high watermark: another query on the same
+    /// coordinator pool does not count, a shrink does not lower it, and a
+    /// retry built from the query's context (join fallback, #784) raises
+    /// the same peak. A context without a quota has none.
+    #[test]
+    fn query_peak_is_this_querys_high_watermark_across_retries() {
+        let ctx = SessionContext::new();
+        let shared = Arc::clone(&ctx.runtime_env().memory_pool);
+        let query = with_query_limit(ctx.clone(), 1024, 0);
+        let other = with_query_limit(ctx.clone(), 1024, 0);
+        assert!(query_peak(&ctx).is_none());
+        let peak = query_peak(&query).expect("a query with a quota has a peak");
+
+        let theirs = MemoryConsumer::new("theirs").register(&other.runtime_env().memory_pool);
+        theirs.try_grow(600).unwrap();
+        let mine = MemoryConsumer::new("mine").register(&query.runtime_env().memory_pool);
+        mine.try_grow(100).unwrap();
+        mine.grow(50);
+        mine.shrink(120);
+        assert_eq!(peak.bytes(), 150, "own bytes only, highest point kept");
+        drop(mine);
+
+        let retry = with_query_limit_over(query.clone(), shared, 1024, 0, true);
+        let again = MemoryConsumer::new("again").register(&retry.runtime_env().memory_pool);
+        again.try_grow(100).unwrap();
+        assert_eq!(peak.bytes(), 150, "a smaller retry keeps the first peak");
+        again.try_grow(100).unwrap();
+        assert_eq!(peak.bytes(), 200, "the retry raises the same peak");
+        assert_eq!(query_peak(&retry).unwrap().bytes(), 200);
+        assert_eq!(query_peak(&other).unwrap().bytes(), 600);
     }
 }
