@@ -49,6 +49,7 @@ pub mod schema_provider;
 pub mod show_create;
 pub mod snapshot_stats;
 pub mod sort_order;
+pub mod store_metrics;
 #[cfg(feature = "rest")]
 pub mod system_catalog;
 #[cfg(feature = "rest")]

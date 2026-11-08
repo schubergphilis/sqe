@@ -629,3 +629,69 @@ async fn hive_load_denied_when_location_fails_the_storage_allowlist() {
         "error should name the allowlist gate that denied it: {msg}"
     );
 }
+
+/// #815: a Hive scan on real RustFS shows up in the object-store request
+/// metrics, labelled with the bucket, once `install_storage_metrics` ran.
+///
+/// The install is process-wide and first-wins, so this is the only test in
+/// the `it` binary that calls it. Every store built after the install is
+/// metered; the handler below is created after it, so its lazily built S3
+/// store is wrapped. A broken wiring (the registry not wrapping, or the
+/// wrapper not counting) leaves the counter at zero and fails this test.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn hive_scan_counts_object_store_requests_815() {
+    let metrics = sqe_metrics::MetricsRegistry::new().expect("metrics registry");
+    let registry = sqe_metrics::HasRegistry::prometheus_registry(&metrics);
+    sqe_catalog::store_metrics::install_storage_metrics(registry).expect("install storage metrics");
+
+    let store = s3_store();
+    reset_prefix(store.as_ref(), "hive-t11-wh/sales/metered").await;
+    reset_prefix(store.as_ref(), "hive-t11-raw/metered").await;
+    put_object(
+        store.as_ref(),
+        "hive-t11-raw/metered/data.parquet",
+        write_parquet_bytes(&[1, 2, 3], &[1.0, 2.0, 3.0]),
+    )
+    .await;
+
+    let prefixes = vec![
+        "s3://warehouse/hive-t11-wh/".to_string(),
+        "s3://warehouse/hive-t11-raw/".to_string(),
+    ];
+    let (session, handler, _mock) = attached_handler(&prefixes).await;
+    handler
+        .execute(
+            &session,
+            "CREATE EXTERNAL TABLE lake.sales.metered (id BIGINT, amount DOUBLE) \
+             STORED AS PARQUET LOCATION 's3://warehouse/hive-t11-raw/metered/'",
+            None,
+        )
+        .await
+        .expect("create parquet external table over real RustFS");
+    let sql = "SELECT count(*) FROM lake.sales.metered";
+    assert_eq!(count_of(&handler, &session, sql).await, 3);
+
+    // Sum the request counter over every (scheme="s3", bucket="warehouse")
+    // series, whatever the operation.
+    let requests: f64 = registry
+        .gather()
+        .iter()
+        .filter(|f| f.name() == "sqe_object_store_requests_total")
+        .flat_map(|f| f.get_metric().iter())
+        .filter(|m| {
+            let label = |k: &str| {
+                m.get_label()
+                    .iter()
+                    .find(|l| l.name() == k)
+                    .map(|l| l.value().to_string())
+            };
+            label("scheme").as_deref() == Some("s3") && label("bucket").as_deref() == Some(BUCKET)
+        })
+        .map(|m| m.get_counter().value())
+        .sum();
+    assert!(
+        requests > 0.0,
+        "a Hive scan on s3://{BUCKET} must count object-store requests, got {requests}"
+    );
+}

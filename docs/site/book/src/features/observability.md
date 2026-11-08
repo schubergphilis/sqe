@@ -78,6 +78,55 @@ increase(sqe_scan_ticket_encode_seconds_count[1h])
 / increase(sqe_scheduler_task_count_sum[1h])
 ```
 
+### Object-store requests
+
+`sqe_s3_requests_total` above counts the requests SQE's own scan and write
+code makes. The families below sit one level lower, around the storage
+clients, so they also see metadata reads, listings, footers and failures
+that never reach a scan counter. Coordinators and workers both export them.
+
+SQE talks to object storage through two clients. **object_store** reads the
+data files on workers, and serves Hive external tables and file functions such
+as `read_parquet` on the coordinator:
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `sqe_object_store_requests_total` | Counter | `scheme`, `bucket`, `operation` | Requests started: `get`, `head`, `get_ranges`, `put`, `put_multipart`, `list`, `list_with_delimiter`, `copy`, `rename`, `delete` |
+| `sqe_object_store_errors_total` | Counter | `scheme`, `bucket`, `operation`, `error` | Failed requests. `error` is `not_found`, `permission_denied`, `unauthenticated`, `precondition`, `not_modified`, `already_exists`, `not_supported`, `invalid_path`, `generic` or `other` |
+| `sqe_object_store_request_duration_seconds` | Histogram | `scheme`, `bucket`, `operation` | Time to the response. For `get` that is the headers, not the whole body |
+| `sqe_object_store_ttfb_seconds` | Histogram | `scheme`, `bucket` | `get` only: time from the request to the first body chunk |
+
+**OpenDAL** carries Iceberg's own file I/O: metadata, manifests, and the
+data files the coordinator reads or writes itself. Its families come from
+OpenDAL's Prometheus layer, among them `opendal_operation_duration_seconds`,
+`opendal_operation_errors_total`, `opendal_operation_ttfb_seconds`,
+`opendal_http_request_duration_seconds` and `opendal_http_status_errors_total`.
+Their labels are `scheme`, `namespace` (the bucket), `root` and `operation`.
+
+The labels name buckets, not catalogs: several catalogs on one bucket share a
+series.
+
+Retries are only visible on the OpenDAL side. `opendal_operation_*` counts one
+sample per operation and `opendal_http_*` one per HTTP attempt, so the gap
+between them is the retry count. The object_store client retries inside one
+request, so `sqe_object_store_*` counts the request once, with its final
+outcome and total time.
+
+Spill files written to S3 are not counted here.
+
+```promql
+# Object-store error ratio per bucket and operation
+sum by (bucket, operation) (rate(sqe_object_store_errors_total[5m]))
+/ sum by (bucket, operation) (rate(sqe_object_store_requests_total[5m]))
+
+# p99 time to first byte of data-file reads
+histogram_quantile(0.99, sum by (le, bucket) (rate(sqe_object_store_ttfb_seconds_bucket[5m])))
+
+# Iceberg metadata retries (HTTP attempts per operation, above 1 means retries)
+sum(rate(opendal_http_request_duration_seconds_count[5m]))
+/ sum(rate(opendal_operation_duration_seconds_count[5m]))
+```
+
 ### Local observability stack
 
 For a self-contained metrics view alongside the test stack, SQE ships a Docker Compose overlay using VictoriaMetrics (Prometheus-compatible, around 30 MB RAM) and Grafana:
