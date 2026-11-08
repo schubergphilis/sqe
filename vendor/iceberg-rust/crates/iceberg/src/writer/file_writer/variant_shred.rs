@@ -338,10 +338,40 @@ fn infer_variant(array: &ArrayRef) -> Result<Option<Node>> {
     )
 }
 
-/// Longest string bound written, in bytes. A path whose smallest or largest
-/// string is longer gets no bound, so a long text value does not bloat every
-/// manifest entry.
-const MAX_STRING_BOUND: usize = 64;
+/// Longest string bound written, in characters: Iceberg Java's default
+/// `truncate(16)` metrics mode. A longer lower bound is cut to its prefix
+/// and a longer upper bound is cut and rounded up, so both still bound every
+/// value and a long text value does not bloat every manifest entry.
+const STRING_BOUND_LENGTH: usize = 16;
+
+/// `s` cut to [`STRING_BOUND_LENGTH`] characters: a prefix is never larger.
+fn truncate_lower(s: &str) -> String {
+    s.chars().take(STRING_BOUND_LENGTH).collect()
+}
+
+/// `s` cut to [`STRING_BOUND_LENGTH`] characters with its last character
+/// incremented, so it is larger than every string it stands for; `None` when
+/// every kept character is already the largest code point. Iceberg Java's
+/// `UnicodeUtil.truncateStringMax`.
+fn truncate_upper(s: &str) -> Option<String> {
+    if s.chars().nth(STRING_BOUND_LENGTH).is_none() {
+        return Some(s.to_string());
+    }
+    let mut kept: Vec<char> = s.chars().take(STRING_BOUND_LENGTH).collect();
+    while let Some(last) = kept.pop() {
+        // `char::from_u32` refuses the surrogates; the next valid one is
+        // U+E000.
+        let next = match u32::from(last) + 1 {
+            0xD800 => Some('\u{E000}'),
+            code => char::from_u32(code),
+        };
+        if let Some(next) = next {
+            kept.push(next);
+            return Some(kept.into_iter().collect());
+        }
+    }
+    None
+}
 
 /// One value of a variant manifest bound.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -371,8 +401,21 @@ impl Scalar {
         })
     }
 
-    fn fits_a_bound(&self) -> bool {
-        !matches!(self, Scalar::Str(s) if s.len() > MAX_STRING_BOUND)
+    /// This value as written for a lower bound.
+    fn as_lower(&self) -> Scalar {
+        match self {
+            Scalar::Str(s) => Scalar::Str(truncate_lower(s)),
+            other => other.clone(),
+        }
+    }
+
+    /// This value as written for an upper bound, or `None` when a string
+    /// cannot be cut and rounded up.
+    fn as_upper(&self) -> Option<Scalar> {
+        match self {
+            Scalar::Str(s) => truncate_upper(s).map(Scalar::Str),
+            other => Some(other.clone()),
+        }
     }
 }
 
@@ -568,21 +611,21 @@ impl VariantShredder {
     pub(crate) fn variant_bounds(&self) -> (HashMap<i32, Vec<u8>>, HashMap<i32, Vec<u8>>) {
         let (mut lower, mut upper) = (HashMap::new(), HashMap::new());
         for column in &self.bounds {
-            let kept: Vec<(String, &Scalar, &Scalar)> = column
+            let kept: Vec<(String, Scalar, Scalar)> = column
                 .paths
                 .iter()
                 .filter_map(|(path, bounds)| {
                     let (min, max) = bounds.as_ref()?;
                     let key = bound_key(path)?;
-                    (min.fits_a_bound() && max.fits_a_bound()).then_some((key, min, max))
+                    Some((key, min.as_lower(), max.as_upper()?))
                 })
                 .collect();
             if kept.is_empty() {
                 continue;
             }
-            let min = kept.iter().map(|(key, min, _)| (key.as_str(), *min));
+            let min = kept.iter().map(|(key, min, _)| (key.as_str(), min));
             lower.insert(column.field_id, encode_bound(min));
-            let max = kept.iter().map(|(key, _, max)| (key.as_str(), *max));
+            let max = kept.iter().map(|(key, _, max)| (key.as_str(), max));
             upper.insert(column.field_id, encode_bound(max));
         }
         (lower, upper)
@@ -900,11 +943,59 @@ mod tests {
     }
 
     #[test]
-    fn doubles_long_strings_and_quoted_keys_get_no_bound() {
-        let long = "x".repeat(MAX_STRING_BOUND + 1);
-        let row = format!(r#"{{"f": 1.5, "l": "{long}", "it's": 1, "n": 2}}"#);
+    fn long_strings_are_truncated_like_iceberg_java() {
+        let (lo, hi) = (
+            "a".repeat(20),
+            format!("{}b{}", "m".repeat(15), "z".repeat(10)),
+        );
+        let rows = [
+            format!(r#"{{"s": "{lo}", "x": "short"}}"#),
+            format!(r#"{{"s": "{hi}", "x": "shorter"}}"#),
+        ];
+        let rows: Vec<Option<&str>> = rows.iter().map(|r| Some(r.as_str())).collect();
+        let (lower, upper) = file_bounds(&[variant_batch_with_id(&rows)]);
+        let s = |v: &str| Some(Scalar::Str(v.to_string()));
+        // The lower bound is the prefix; the upper is cut and rounded up.
+        assert_eq!(bound_at(&lower, "$['s']"), s(&"a".repeat(16)));
+        assert_eq!(
+            bound_at(&upper, "$['s']"),
+            s(&format!("{}c", "m".repeat(15)))
+        );
+        assert_eq!(bound_at(&lower, "$['x']"), s("short"));
+        assert_eq!(bound_at(&upper, "$['x']"), s("shorter"));
+
+        // Characters, not bytes: 16 multi-byte characters stay whole.
+        let accents = "é".repeat(16);
+        assert_eq!(truncate_lower(&format!("{accents}é")), accents);
+        assert_eq!(truncate_upper(&accents), Some(accents.clone()));
+        assert_eq!(
+            truncate_upper(&format!("{}ê", "é".repeat(16))),
+            Some(format!("{}ê", "é".repeat(15)))
+        );
+        // The largest code point carries into the character before it, the
+        // surrogates are skipped, and a string of only U+10FFFF has no upper.
+        let top = '\u{10FFFF}';
+        let carry = format!("{}{top}{top}", "a".repeat(15));
+        assert_eq!(truncate_upper(&carry), Some(format!("{}b", "a".repeat(14))));
+        let below = format!("{}\u{D7FF}x", "a".repeat(15));
+        assert_eq!(
+            truncate_upper(&below),
+            Some(format!("{}\u{E000}", "a".repeat(15)))
+        );
+        assert_eq!(truncate_upper(&top.to_string().repeat(17)), None);
+        // No upper bound: the path gets neither bound.
+        let row = format!(r#"{{"t": "{}", "n": 2}}"#, top.to_string().repeat(17));
         let (lower, upper) = file_bounds(&[variant_batch_with_id(&[Some(&row)])]);
-        for key in ["$['f']", "$['l']", "$['it's']"] {
+        assert_eq!(bound_at(&lower, "$['t']"), None);
+        assert_eq!(bound_at(&upper, "$['t']"), None);
+        assert_eq!(bound_at(&upper, "$['n']"), Some(Scalar::Int(2)));
+    }
+
+    #[test]
+    fn doubles_and_quoted_keys_get_no_bound() {
+        let row = r#"{"f": 1.5, "it's": 1, "n": 2}"#;
+        let (lower, upper) = file_bounds(&[variant_batch_with_id(&[Some(row)])]);
+        for key in ["$['f']", "$['it's']"] {
             assert_eq!(bound_at(&lower, key), None, "{key}");
         }
         assert_eq!(bound_at(&lower, "$['n']"), Some(Scalar::Int(2)));
