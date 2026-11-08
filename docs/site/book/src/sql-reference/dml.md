@@ -230,6 +230,7 @@ Iceberg branches let you isolate writes from the production snapshot. SQE expose
 | `SET WRITE_BRANCH = 'name'` | Subsequent INSERT / UPDATE / DELETE / MERGE / TRUNCATE writes, and Flight SQL bulk ingest, go to the named branch. |
 | `SET WRITE_BRANCH = DEFAULT` | Reset to the default (main) branch. |
 | `SET WRITE_BRANCH = NULL` | Same as `DEFAULT`. |
+| `RESET WRITE_BRANCH` | Same as `DEFAULT`. |
 
 While a branch is set:
 

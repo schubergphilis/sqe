@@ -728,6 +728,9 @@ pub struct EmbeddedClient {
     /// after start-up reads with the same endpoint and credentials the file
     /// TVFs were registered with; see [`EmbeddedS3Options`].
     storage: StorageConfig,
+    /// `SET WRITE_BRANCH`: the branch INSERT / DELETE / UPDATE / MERGE read
+    /// and commit to, as on the cluster (#829, #875). `None` is `main`.
+    write_branch: Option<String>,
 }
 
 impl EmbeddedClient {
@@ -749,6 +752,7 @@ impl EmbeddedClient {
             rest_catalogs: HashMap::new(),
             read_only_catalog: None,
             storage,
+            write_branch: None,
         })
     }
 
@@ -788,6 +792,7 @@ impl EmbeddedClient {
             rest_catalogs: HashMap::new(),
             read_only_catalog: None,
             storage,
+            write_branch: None,
         };
         client.register_metadata_tvfs();
         Ok(client)
@@ -892,6 +897,7 @@ impl EmbeddedClient {
             rest_catalogs: HashMap::new(),
             read_only_catalog: Some(catalog_name.to_string()),
             storage,
+            write_branch: None,
         })
     }
 
@@ -958,6 +964,43 @@ impl EmbeddedClient {
 #[async_trait]
 impl SqlClient for EmbeddedClient {
     async fn execute(&mut self, sql: &str) -> Result<QueryResult, Box<dyn std::error::Error>> {
+        let Some(branch) = self.write_branch.clone() else {
+            return self.execute_statement(sql).await;
+        };
+        // With `SET WRITE_BRANCH`, a data write reads and commits at the
+        // branch, the way the coordinator runs it (#829): the write path's
+        // `SessionCatalog` pins the target to the branch, commits there, and
+        // refuses a commit that would move `main`. Reads and DDL stay on
+        // `main`, so only a data write runs in the scope.
+        let kind = sqe_sql::SqlFrontDoor::new(sqe_sql::WireDialect::Embedded)
+            .with_upper_case_catalogs(self.upper_case_catalogs.clone())
+            .normalize(sql)
+            .and_then(sqe_sql::classify_normalized)
+            .ok();
+        // CTAS creates the table before its first append, and a new table
+        // has no branch: the append would be refused after the create
+        // landed, leaving an empty table behind.
+        if matches!(kind, Some(sqe_sql::StatementKind::Ctas(_))) {
+            return Err(sqe_core::SqeError::with_code(
+                sqe_core::SqeErrorCode::NotSupported,
+                "CREATE TABLE AS SELECT creates a new table, which has no branch to \
+                 write to; RESET WRITE_BRANCH first"
+                    .to_string(),
+            )
+            .into());
+        }
+        let branch = kind.filter(|k| k.is_data_write()).map(|_| branch);
+        sqe_catalog::txn::write_scope(None, branch, self.execute_statement(sql)).await
+    }
+}
+
+impl EmbeddedClient {
+    /// One statement, on `main` unless [`SqlClient::execute`] wrapped it in
+    /// the session's write branch.
+    async fn execute_statement(
+        &mut self,
+        sql: &str,
+    ) -> Result<QueryResult, Box<dyn std::error::Error>> {
         // The SQL front door (finding 700): the same normalization the
         // coordinator applies over Flight SQL and the Trino server applies
         // over HTTP, so `INSERT INTO t VALUES 1`, `TABLE t` and `SELECT 1+1`
@@ -1000,6 +1043,15 @@ impl SqlClient for EmbeddedClient {
                 }
                 sqe_sql::StatementKind::ShowSecrets => {
                     return self.embedded_handle_show_secrets();
+                }
+                // Checked when a write runs, not here: the branch must exist
+                // on the table the write targets (`txn::target_branch`).
+                sqe_sql::StatementKind::SetWriteBranch(branch) => {
+                    if let Some(name) = branch.as_deref() {
+                        sqe_catalog::txn::reject_txn_ref(name)?;
+                    }
+                    self.write_branch = branch;
+                    return Ok(QueryResult::empty());
                 }
                 sqe_sql::StatementKind::CreateExternalTable(spec) => {
                     return self.embedded_handle_create_external_table(&spec).await;

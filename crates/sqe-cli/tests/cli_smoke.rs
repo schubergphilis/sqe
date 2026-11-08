@@ -684,6 +684,97 @@ fn embedded_warehouse_time_travel() {
 }
 
 #[test]
+fn embedded_warehouse_write_branch() {
+    // SET WRITE_BRANCH was cluster-only (#875). `main` and `dev` diverge
+    // first, so a write that read or committed `main` shows in the rows.
+    let wh = tempfile::tempdir().expect("tempdir");
+    let wh_path = wh.path().to_str().expect("utf-8 path");
+    let script = wh.path().join("wb.sql");
+    std::fs::write(
+        &script,
+        "CREATE SCHEMA iceberg.s;\n\
+         CREATE TABLE iceberg.s.t (id INT, v VARCHAR);\n\
+         INSERT INTO iceberg.s.t VALUES (1, 'a'), (2, 'b'), (3, 'c');\n\
+         ALTER TABLE iceberg.s.t CREATE BRANCH dev;\n\
+         INSERT INTO iceberg.s.t VALUES (99, 'late');\n\
+         SET WRITE_BRANCH = 'dev';\n\
+         INSERT INTO iceberg.s.t VALUES (4, 'd');\n\
+         DELETE FROM iceberg.s.t WHERE id = 2;\n\
+         UPDATE iceberg.s.t SET v = 'z' WHERE id = 1;\n\
+         MERGE INTO iceberg.s.t t USING (SELECT * FROM (VALUES (3, 'm'), (99, 'new')) AS s(id, v)) s \
+         ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v \
+         WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v);\n\
+         RESET WRITE_BRANCH;\n\
+         INSERT INTO iceberg.s.t VALUES (5, 'main');\n",
+    )
+    .expect("write script");
+    bin()
+        .args(["--embedded", "--warehouse", wh_path, "--file"])
+        .arg(&script)
+        .arg("--stop-on-error")
+        .timeout(std::time::Duration::from_secs(120))
+        .assert()
+        .success();
+
+    let rows = |from: &str| {
+        let out = bin()
+            .args([
+                "--embedded",
+                "--warehouse",
+                wh_path,
+                "-e",
+                &format!(
+                    "SELECT 'rows=' || string_agg(CAST(id AS VARCHAR) || v, ',' ORDER BY id) \
+                     AS r FROM {from}"
+                ),
+            ])
+            .timeout(std::time::Duration::from_secs(60))
+            .assert()
+            .success();
+        String::from_utf8_lossy(&out.get_output().stdout).to_string()
+    };
+    // id 99 was on main only, so the MERGE inserts it on dev.
+    let dev = rows("iceberg.s.t FOR VERSION AS OF 'dev'");
+    assert!(dev.contains("rows=1z,3m,4d,99new"), "dev: {dev}");
+    let main = rows("iceberg.s.t");
+    assert!(main.contains("rows=1a,2b,3c,5main,99late"), "main: {main}");
+
+    // CTAS on a branch is refused before the table is created, and a
+    // branch the table lacks is refused instead of created.
+    let refused = |sql: &str, needle: &str| {
+        let script = wh.path().join("refused.sql");
+        std::fs::write(&script, format!("SET WRITE_BRANCH = 'dev';\n{sql};\n")).expect("write");
+        bin()
+            .args(["--embedded", "--warehouse", wh_path, "--file"])
+            .arg(&script)
+            .arg("--stop-on-error")
+            .timeout(std::time::Duration::from_secs(60))
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(needle));
+    };
+    refused(
+        "CREATE TABLE iceberg.s.c AS SELECT 1 AS id",
+        "has no branch to write to",
+    );
+    refused(
+        "CREATE TABLE iceberg.s.u (id INT);\nINSERT INTO iceberg.s.u VALUES (1)",
+        "CREATE BRANCH dev",
+    );
+    bin()
+        .args([
+            "--embedded",
+            "--warehouse",
+            wh_path,
+            "-e",
+            "SELECT * FROM iceberg.s.c",
+        ])
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .failure();
+}
+
+#[test]
 fn embedded_warehouse_refuses_create_view() {
     // The SQLite catalog stores no views. CREATE VIEW used to "succeed" by
     // registering an empty Iceberg table under the view's name.

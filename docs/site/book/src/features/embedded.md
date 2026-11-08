@@ -193,9 +193,15 @@ Exporting results to plain files goes through `COPY ... TO`; see
 | `FOR VERSION AS OF` / `FOR SYSTEM_TIME AS OF` | Iceberg tables | yes |
 | Metadata tables (`orders$snapshots`) | yes | yes |
 | `CREATE BRANCH` / `CREATE TAG` | yes | yes |
-| `SET WRITE_BRANCH` | no | yes |
+| `SET WRITE_BRANCH` / `RESET WRITE_BRANCH` | Iceberg tables | yes |
 | `CALL system.*` procedures | no | yes |
 | `ATTACH` / `DETACH`, `CREATE SECRET` | yes | yes |
+
+`SET WRITE_BRANCH` holds for the CLI process, as it does for a cluster
+session: INSERT, UPDATE, DELETE and MERGE on an Iceberg table read and commit
+at the branch, and CTAS is refused while it is set. The rules are those of
+[branch routing](../sql-reference/dml.md#branch-routing-sqe-specific). A
+write to a table outside an Iceberg catalog ignores it.
 
 Metadata tables (`$snapshots`, `$history`, `$manifests`, `$files`,
 `$partitions`, `$refs`) read the catalog named in front of the table:
