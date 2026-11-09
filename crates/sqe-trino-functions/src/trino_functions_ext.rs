@@ -78,6 +78,18 @@ pub fn register_extended_trino_functions(ctx: &datafusion::prelude::SessionConte
     ctx.register_udf(ScalarUDF::from(Format));
     ctx.register_udf(ScalarUDF::from(crate::json_cast::ToJson));
     ctx.register_udf(ScalarUDF::from(crate::json_cast::JsonArrayOfJson));
+    ctx.register_udf(ScalarUDF::from(crate::json_cast::JsonText));
+    // Appended, so it runs after type coercion (#848). Once per context.
+    let rule = crate::json_cast::JsonMarkerRule;
+    let present = ctx
+        .state()
+        .analyzer()
+        .rules
+        .iter()
+        .any(|r| r.name() == datafusion::optimizer::AnalyzerRule::name(&rule));
+    if !present {
+        ctx.add_analyzer_rule(Arc::new(rule));
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
