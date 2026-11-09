@@ -60,7 +60,8 @@ pub struct DecimalArithmeticRule;
 
 impl AnalyzerRule for DecimalArithmeticRule {
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
-        plan.transform_up_with_subqueries(type_plan).data()
+        plan.transform_up_with_subqueries(|plan| rewrite_plan_exprs(plan, type_node))
+            .data()
     }
 
     fn name(&self) -> &str {
@@ -68,8 +69,12 @@ impl AnalyzerRule for DecimalArithmeticRule {
     }
 }
 
-/// Rewrite one node's expressions against the schema its expressions read.
-fn type_plan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+/// Rewrite one node's expressions, bottom up with `node`, against the
+/// schema its expressions read. Keeps each expression's name.
+pub(super) fn rewrite_plan_exprs(
+    plan: LogicalPlan,
+    node: fn(Expr, &DFSchema) -> Result<Transformed<Expr>>,
+) -> Result<Transformed<LogicalPlan>> {
     let mut schema = merge_schema(&plan.inputs());
     if let LogicalPlan::TableScan(scan) = &plan {
         let source =
@@ -90,7 +95,7 @@ fn type_plan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let names = NamePreserver::new(&plan);
     let out = plan.map_expressions(|expr| {
         let name = names.save(&expr);
-        let typed = expr.transform_up(|e| type_node(e, &schema))?;
+        let typed = expr.transform_up(|e| node(e, &schema))?;
         Ok(typed.update_data(|e| name.restore(e)))
     })?;
     if out.transformed {
@@ -141,7 +146,7 @@ fn type_node(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
 /// The type `expr` has once DataFusion coerces it: before coercion a
 /// `CASE` or `coalesce` over an integer and a decimal reports its first
 /// branch's type.
-fn coerced_type(expr: &Expr, schema: &DFSchema) -> Option<DataType> {
+pub(super) fn coerced_type(expr: &Expr, schema: &DFSchema) -> Option<DataType> {
     let coerced = expr
         .clone()
         .rewrite(&mut TypeCoercionRewriter::new(schema))

@@ -450,10 +450,10 @@ async fn sqe_prunes_on_double_variant_bounds() {
     ))
     .expect("spark writes the double variant table");
 
-    // `9.0` is a decimal literal here, as in Trino, and the comparison runs
-    // in decimal: not a shape the scan prunes on. An integer literal or a
-    // cast to double is a double. `-0.0 < 0` is false in SQE and in Spark,
-    // so `< 0` finds no row but must still keep the file holding -0.0.
+    // `9.0` is a decimal literal, as in Trino, and a double compared with a
+    // decimal compares as a double, so it prunes like `9`. `-0.0 < 0` is
+    // false in SQE and in Spark, so `< 0` finds no row but must still keep
+    // the file holding -0.0.
     let d = "variant_get(v, '$.d', 'double')";
     let mut got = Vec::new();
     for (fq, filter) in [
@@ -464,6 +464,8 @@ async fn sqe_prunes_on_double_variant_bounds() {
         (ours, format!("{d} + 0 > 9")),
         (ours, format!("{d} > 9.0")),
         (theirs, format!("{d} > 5")),
+        // A decimal literal against the NaN row: NaN is above every number.
+        (theirs, format!("{d} > 5.0")),
         (theirs, format!("{d} < 0")),
         // Spark's lower bound is +0.0 over a -0.0 row: only the widening
         // keeps that file for a -0.0 literal.
@@ -493,9 +495,10 @@ async fn sqe_prunes_on_double_variant_bounds() {
             "1|5 files 1/3",
             "1|6 files 1/3",
             "2|3 files 3/3",
-            "2|3 files 3/3",
+            "2|3 files 1/3",
             // Spark's files: [1.5, 2.5], [+0.0, 3.0], and the NaN file with
             // no bound, which every filter keeps.
+            "1|7 files 1/3",
             "1|7 files 1/3",
             "0|NULL files 2/3",
             "1|4 files 2/3",

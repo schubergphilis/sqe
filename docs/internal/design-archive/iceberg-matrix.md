@@ -5,7 +5,7 @@ SQE rated against the [icebergmatrix.org](https://icebergmatrix.org) rubric ([Ne
 **Score: 158/162 (97.5%)** on 54 cells.
 
 - SQE cells: `docs/evidence/iceberg-matrix-state.json`, last changed 2026-11-05.
-- Rubric and peer scores: `docs/evidence/iceberg-matrix-rubric.json`, upstream `027f151356` fetched 2026-10-27.
+- Rubric and peer scores: `docs/evidence/iceberg-matrix-rubric.json`, upstream `027f151356` fetched 2026-11-09.
 - Regenerate: `python3 scripts/render-iceberg-matrix-compare.py` (refreshes the rubric snapshot and [the engine comparison](./iceberg-matrix-compare.md)), then `python3 scripts/render-iceberg-matrix.py`.
 
 ---
@@ -159,7 +159,7 @@ Every cell below full, with its caveats. Each has a `[MATRIX]` issue.
 - **snowflake-horizon-catalog (v3)**: Snowflake's ST_AREA on an Iceberg GEOMETRY is negative whichever engine wrote it; SQE's is positive.
 - **snowflake-horizon-catalog (v3)**: Snowflake rewrites small tables copy-on-write whatever the merge-on-read setting; its deletion vectors only appear on large tables with ICEBERG_MERGE_ON_READ_BEHAVIOR = 'enabled'. Reading them needs parquet >= 59.3.2.
 - **snowflake-horizon-catalog (v3)**: The $files metadata table lists data files only; delete files and deletion vectors show in the $snapshots summary.
-- **shredded-variant (v3)**: Shredded columns are unshredded on read, so typed_value gives no typed field access. Its statistics prune row groups, on the coordinator and on a worker, only for a variant_get / try_variant_get comparison with a literal, and never on a double field (Parquet leaves NaN out of the statistics). A double field prunes files only against a double literal: 9.0 is a decimal literal and its comparison runs in decimal. Nested variants get no manifest bounds, as in Iceberg Java.
+- **shredded-variant (v3)**: Shredded columns are unshredded on read, so typed_value gives no typed field access. Its statistics prune row groups, on the coordinator and on a worker, only for a variant_get / try_variant_get comparison with a literal, and never on a double field (Parquet leaves NaN out of the statistics). A double field prunes files only. Nested variants get no manifest bounds, as in Iceberg Java.
 - **lineage (v3)**: MoR DELETE is not a lineage case (deleted rows have no successor).
 
 ---
