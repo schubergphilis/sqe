@@ -53,11 +53,21 @@ session id is never exposed.
 
 ## Tabs
 
-- **Overview** carries the node identity and capabilities (enabled protocols and
-  ports, catalog backend and URL, storage, memory limit), live resource gauges
-  (memory pool used, concurrency against the configured cap), and the engine
-  metrics (queries by state, rows out, average latency) as stat cards. Each card
-  has a one-hour sparkline, and a query-activity histogram sits below them.
+The tabs sit in two groups: **Engine** (Overview, Cluster) and **Workload**
+(Queries, History). Every tab opens with a one-sentence summary of what its
+numbers say, and a banner when something wants attention, with a button that
+goes to the place to look. The page follows the operating system's light or
+dark setting.
+
+- **Overview** opens with the last hour in one sentence (queries, failures,
+  running against the slot count, memory pool use). Banners fire when the
+  memory pool is above 80%, when 90% of the query slots are in use, and when a
+  query failed in the last hour; the failure banner opens History filtered to
+  failed queries. Below that a metric strip shows the engine metrics (queries
+  by state, rows out, average latency), each with a one-hour sparkline, then
+  the query-activity histogram, the memory and concurrency gauges, and the
+  node configuration (enabled protocols and ports, catalog backend and URL,
+  storage, memory limit).
 - **Queries** lists recent queries with id, user, state, SQL, elapsed time, rows,
   and bytes scanned. Click a row for the detail: the queue, planning, and
   execution timing, the rows/bytes/spill/peak-memory totals, and the
@@ -73,11 +83,16 @@ session id is never exposed.
   query only the log still holds opens with its row data: the log keeps no
   fragments. Without a native audit log (`metrics.audit_log_path` unset, or
   `format = "ocsf"`) the tab shows the tracker's finished queries only.
-- **Cluster** shows the worker nodes with health and in-flight load. In
-  single-node mode the coordinator lists itself as one node doing both roles.
+- **Cluster** shows the worker nodes with health and in-flight load, with a
+  banner when a worker is unhealthy. In single-node mode the coordinator lists
+  itself as one node doing both roles.
 
 Every chart is hoverable. Pointing at a bar or a sparkline point shows the time
-and value.
+and value. Table headers sort: a click sorts by that column (numbers largest
+first), a second click reverses, a third returns to the server's order. The
+order holds across the Queries tab's two-second refresh. Elapsed time and bytes
+scanned carry a bar scaled to the largest value on the page, and the query
+detail splits its time into queued, planning and execution.
 
 ## JSON API
 

@@ -3,134 +3,210 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="light dark" />
 <title>SQE</title>
 <style>
-  /* Visual language adapted from the Schuberg Philis design system
-     (colours + layout: SBP Blue, Soft Blue panels, Space Gray header, the
-     marker bar, signal colours, no shadows/borders). Self-contained: system
-     fonts (no brand webfonts), no logos. */
+  /* Self-contained on purpose: the page is compiled into the coordinator and
+     may run air-gapped, so no webfonts, CDNs, icon sets or build step. Every
+     colour is a token below; the dark set follows the OS preference. */
   :root {
-    --sbp-blue:#1E80ED; --soft-blue:#E8F2FD; --turquoise:#1EE8ED;
-    --midnight:#020C17; --space-gray:#082646; --white:#fff;
-    --yellow:#FFDB4E; --pale-blue:#F3F6FB;
-    --gray-medium:#5A6782; --gray-light:#AACBEF;
-    --green:#0E9F6E; --red:#D6336C;          /* readable-on-light state colours */
-    --mut:var(--gray-medium);                 /* secondary text (used by page JS) */
+    --bg:#F3F6FB; --surface:#FFFFFF; --panel:#E8F2FD; --line:#DCE6F2;
+    --text:#020C17; --text-2:#5A6782; --text-3:#8391A8;
+    --accent:#1E80ED; --accent-soft:#E1EEFD; --marker:#FFDB4E;
+    --ok:#0E8A61; --ok-soft:#DCF4EA; --bad:#C92A62; --bad-soft:#FDE6EE;
+    --warn:#A65A00; --warn-soft:#FFF1D6; --warn-line:#F5A524;
+    --head-bg:#082646; --head-text:#FFFFFF; --head-mut:#AACBEF; --head-line:#082646;
+    --tip-bg:#0B1B2E; --tip-text:#FFFFFF;
+    --mut:var(--text-2);          /* kept for older inline styles */
     --font:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-    --mono:ui-monospace,"SF Mono",Monaco,Consolas,"Liberation Mono",monospace;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#030B16; --surface:#071628; --panel:#0A2038; --line:#15304D;
+      --text:#E6EEF8; --text-2:#93A6C0; --text-3:#64799A;
+      --accent:#4EA1F5; --accent-soft:#0E2C50; --marker:#FFDB4E;
+      --ok:#4AD6A0; --ok-soft:#0C3529; --bad:#FF6F9C; --bad-soft:#3A1428;
+      --warn:#FFBE5C; --warn-soft:#2E2210; --warn-line:#E39B2A;
+      --head-bg:#030B16; --head-text:#E6EEF8; --head-mut:#93A6C0; --head-line:#15304D;
+      --tip-bg:#E6EEF8; --tip-text:#030B16;
+    }
   }
   * { box-sizing:border-box; }
-  body { margin:0; background:var(--pale-blue); color:var(--midnight);
+  body { margin:0; background:var(--bg); color:var(--text);
          font:14px/1.5 var(--font); -webkit-font-smoothing:antialiased; }
+  button { font:inherit; color:inherit; }
+  :focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:4px; }
 
-  /* dark header (SBP Space Gray), brand wordmark + eyebrow + marker bar */
-  header { background:var(--space-gray); color:var(--white);
-           display:flex; align-items:center; gap:1.5rem; padding:.7rem 1.5rem; }
-  .brand { display:flex; flex-direction:column; gap:.2rem; }
-  .brand .eyebrow { font-family:var(--mono); font-size:11px; font-weight:700;
-                    letter-spacing:.04em; color:var(--turquoise); }
-  .brand .wordmark { font-size:20px; font-weight:900; letter-spacing:.01em; line-height:1; }
-  .brand .marker { width:56px; height:4px; background:var(--yellow); margin-top:.3rem; }
-  nav { display:flex; gap:.2rem; margin-left:1rem; }
-  nav button { background:none; border:none; color:var(--gray-light); cursor:pointer;
-               padding:.5rem .75rem; font:600 14px var(--font);
-               border-bottom:3px solid transparent; }
-  nav button:hover { color:var(--white); }
-  nav button.active { color:var(--white); border-bottom-color:var(--sbp-blue); }
-  #meta { margin-left:auto; font-family:var(--mono); font-size:12px; color:var(--gray-light); }
+  /* ── header: brand, grouped tabs (eyebrow per group), node meta ── */
+  header { background:var(--head-bg); color:var(--head-text);
+           border-bottom:1px solid var(--head-line);
+           display:flex; align-items:flex-end; flex-wrap:wrap; gap:.5rem 2rem;
+           padding:.75rem 1.5rem 0; }
+  .brand { display:flex; flex-direction:column; gap:.2rem; padding-bottom:.8rem; }
+  .brand .eyebrow { font-family:var(--mono); font-size:10.5px; font-weight:700;
+                    letter-spacing:.06em; text-transform:uppercase; color:var(--head-mut); }
+  .brand .wordmark { font-size:20px; font-weight:900; line-height:1; }
+  .brand .marker { width:40px; height:3px; background:var(--marker); margin-top:.25rem; }
+  nav { display:flex; gap:1.75rem; }
+  .navgrp { display:flex; flex-direction:column; }
+  .navgrp > span { font-size:11px; color:var(--head-mut); padding-left:.6rem; }
+  .navgrp > div { display:flex; }
+  nav button { background:none; border:none; color:var(--head-mut); cursor:pointer;
+               padding:.35rem .6rem .7rem; font-weight:600;
+               border-bottom:2px solid transparent; }
+  nav button:hover { color:var(--head-text); }
+  nav button.active { color:var(--head-text); border-bottom-color:var(--accent); }
+  #meta { margin-left:auto; padding-bottom:.9rem; font-family:var(--mono);
+          font-size:12px; color:var(--head-mut); }
 
-  #err { color:var(--red); background:#ffe1ea; padding:.5rem 1.5rem;
-         display:none; font-weight:600; }
+  main { max-width:1320px; margin:0 auto; padding:1.5rem; }
+  #overview, #queries, #history, #cluster, #detail { min-height:40vh; }
+  #detail.hidden { display:none; }
 
-  /* content */
-  #overview, #queries, #cluster, #detail { padding:1.5rem; }
-  h2 { margin:.25rem 0 1rem; font-size:20px; font-weight:900; color:var(--midnight); }
-  h3 { margin:1.4rem 0 .6rem; font-size:13px; font-weight:700; color:var(--sbp-blue);
-       display:flex; align-items:center; gap:.5rem; letter-spacing:.01em; }
-  h3::before { content:""; width:28px; height:3px; background:var(--sbp-blue); }
-  h4 { margin:1.2rem 0 .5rem; font-size:13px; font-weight:700; color:var(--midnight); }
+  /* ── page head: eyebrow, title, marker, one-sentence summary ── */
+  .crumb { font-size:12.5px; color:var(--text-2); margin-bottom:.15rem; }
+  .crumb .mono { font-family:var(--mono); }
+  h1 { margin:0; font-size:24px; font-weight:800; letter-spacing:-.01em;
+       display:flex; align-items:center; gap:.6rem; flex-wrap:wrap; }
+  h1 .mono { font-family:var(--mono); font-size:19px; }
+  .marker { width:56px; height:4px; background:var(--marker); margin:.45rem 0 .6rem; }
+  .summary { margin:0 0 1.1rem; color:var(--text-2); max-width:90ch; }
+  .summary b { color:var(--text); font-weight:700; font-variant-numeric:tabular-nums; }
+  h2 { margin:1.6rem 0 .6rem; font-size:12px; font-weight:700; letter-spacing:.06em;
+       text-transform:uppercase; color:var(--text-2); }
+  h2 .aside { float:right; text-transform:none; letter-spacing:0; font-weight:500; }
 
-  /* pale-panel cards: Soft Blue fill, rounded, no border/shadow */
-  .kv { display:grid; grid-template-columns:max-content 1fr; gap:.4rem 1.5rem;
-        background:var(--soft-blue); border-radius:8px; padding:1rem 1.25rem;
-        margin-bottom:1rem; max-width:780px; font-variant-numeric:tabular-nums; }
-  .kv div:nth-child(odd) { color:var(--gray-medium); }
+  /* ── banners: a condition plus the action that addresses it ── */
+  .banner { display:flex; align-items:center; gap:.75rem; margin:0 0 .6rem;
+            padding:.65rem 1rem; border-radius:8px; border-left:3px solid;
+            background:var(--warn-soft); border-color:var(--warn-line); }
+  .banner svg { flex:none; color:var(--warn); }
+  .banner .msg { flex:1; }
+  .banner.bad { background:var(--bad-soft); border-color:var(--bad); }
+  .banner.bad svg { color:var(--bad); }
+  .banner button { background:none; border:none; cursor:pointer; font-weight:600;
+                   color:var(--text); white-space:nowrap; padding:.2rem .3rem; }
+  .banner button:hover { color:var(--accent); }
+  #err { display:none; margin:1rem 1.5rem 0; }
 
-  /* tables: Soft Blue header, white rows, fill-only separation, no shadow */
-  table { width:100%; border-collapse:collapse; background:var(--white);
-          border-radius:8px; overflow:hidden; }
-  thead th { background:var(--soft-blue); color:var(--gray-medium); font-weight:700;
-             text-align:left; padding:.55rem .75rem; font-size:12.5px; }
-  tbody td { padding:.5rem .75rem; border-bottom:1px solid var(--soft-blue);
+  /* ── pills (state, role, health) ── */
+  .pill { display:inline-flex; align-items:center; gap:.35rem; padding:.05rem .55rem;
+          border-radius:999px; font-size:12px; font-weight:600; line-height:1.6;
+          background:var(--panel); color:var(--text-2); white-space:nowrap; }
+  .pill::before { content:""; width:6px; height:6px; border-radius:50%; background:currentColor; }
+  .pill.plain::before { display:none; }
+  .s-RUNNING, .s-QUEUED, .s-PLANNING { background:var(--accent-soft); color:var(--accent); }
+  .s-FINISHED, .s-HEALTHY { background:var(--ok-soft); color:var(--ok); }
+  .s-FAILED, .s-CANCELED, .s-DOWN { background:var(--bad-soft); color:var(--bad); }
+  .s-RUNNING::before { animation:pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity:.25; } }
+  @media (prefers-reduced-motion: reduce) { .s-RUNNING::before { animation:none; } }
+
+  /* ── metric strip: one panel, a column per figure ── */
+  .strip { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+           background:var(--panel); border-radius:10px; overflow:hidden; }
+  .strip > div { padding:.9rem 1.1rem .7rem; display:flex; flex-direction:column; gap:.15rem;
+                 border-right:1px solid var(--line); }
+  .strip > div:last-child { border-right:none; }
+  .strip .lbl { font-size:12px; color:var(--text-2); }
+  .strip .val { font-size:22px; font-weight:800; font-variant-numeric:tabular-nums;
+                line-height:1.25; }
+  .strip .val.bad { color:var(--bad); }
+  .strip .sub { font-size:12px; color:var(--text-3); }
+  .stat-spark { width:100%; height:30px; overflow:visible; display:block; margin-top:.2rem; }
+
+  /* ── panels ── */
+  .grid2 { display:grid; grid-template-columns:minmax(0,2fr) minmax(260px,1fr); gap:1rem; }
+  @media (max-width:880px) { .grid2 { grid-template-columns:1fr; } }
+  .card { background:var(--surface); border:1px solid var(--line); border-radius:10px;
+          padding:1rem 1.15rem; }
+  .card + .card { margin-top:1rem; }
+  .gauge-head { display:flex; align-items:baseline; justify-content:space-between; gap:1rem; }
+  .gauge-title { font-size:12.5px; color:var(--text-2); }
+  .gauge-pct { font-size:22px; font-weight:800; font-variant-numeric:tabular-nums; }
+  .gauge-pct.warn { color:var(--warn); }
+  .bar-track { background:var(--panel); border-radius:4px; height:6px; overflow:hidden;
+               margin:.45rem 0 .4rem; }
+  .bar-fill { height:100%; border-radius:4px; background:var(--accent); }
+  .bar-fill.warn { background:var(--warn-line); }
+  svg.spark { width:100%; height:34px; overflow:visible; display:block; }
+  .hist-muted { color:var(--text-3); font-style:italic; margin:.5rem 0; }
+  .hist-legend { display:flex; align-items:center; flex-wrap:wrap; gap:.4rem 1rem;
+                 margin-top:.6rem; font-size:12px; color:var(--text-2); }
+  .sw { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:.35rem;
+        vertical-align:-1px; }
+  .hist-caption { margin-left:auto; color:var(--text-3); }
+  .hist-axis { display:flex; justify-content:space-between; font-family:var(--mono);
+               font-size:11px; color:var(--text-3); margin-top:.3rem; }
+
+  /* key/value grid */
+  .kv { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:.9rem 1.5rem;
+        background:var(--panel); border-radius:10px; padding:1rem 1.15rem;
+        font-variant-numeric:tabular-nums; }
+  .kv > div { display:flex; flex-direction:column; min-width:0; }
+  .kv .k { font-size:12px; color:var(--text-2); }
+  .kv .v { font-weight:600; overflow-wrap:anywhere; }
+  .kv .v.mono { font-family:var(--mono); font-weight:500; font-size:13px; }
+
+  /* ── tables: sortable headers, inline bars, quiet rules ── */
+  .tablewrap { overflow-x:auto; border:1px solid var(--line); border-radius:10px;
+               background:var(--surface); }
+  table { width:100%; border-collapse:collapse; }
+  thead th { text-align:left; font-size:12.5px; font-weight:600; color:var(--text-2);
+             padding:.55rem .75rem; border-bottom:1px solid var(--line); white-space:nowrap; }
+  thead th.num { text-align:right; font-family:var(--font); font-size:12.5px; }
+  button.sort { background:none; border:none; padding:0; cursor:pointer; font-weight:600;
+                color:inherit; display:inline-flex; align-items:center; gap:.3rem; }
+  button.sort:hover { color:var(--text); }
+  button.sort svg { opacity:.45; }
+  th[aria-sort="ascending"] button.sort, th[aria-sort="descending"] button.sort { color:var(--text); }
+  th[aria-sort="ascending"] button.sort svg, th[aria-sort="descending"] button.sort svg { opacity:1; color:var(--accent); }
+  tbody td { padding:.55rem .75rem; border-bottom:1px solid var(--line);
              white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:46ch; }
   tbody tr:last-child td { border-bottom:none; }
-  tr.q { cursor:pointer; } tr.q:hover { background:var(--pale-blue); }
-  .num { text-align:right; font-variant-numeric:tabular-nums; font-family:var(--mono); }
-  th.num { font-family:var(--mono); }
+  tr[data-id] { cursor:pointer; }
+  tr[data-id]:hover, tr[data-id]:focus-visible { background:var(--panel); outline:none; }
+  .num { text-align:right; font-variant-numeric:tabular-nums; font-family:var(--mono); font-size:13px; }
+  .id { font-family:var(--mono); font-size:13px; font-weight:600; }
+  .sqlc { font-family:var(--mono); font-size:12.5px; color:var(--text-2); }
+  .cellbar { display:inline-flex; align-items:center; justify-content:flex-end; gap:.55rem; }
+  .cellbar .track { width:52px; height:5px; border-radius:3px; background:var(--panel); overflow:hidden; }
+  .cellbar .track i { display:block; height:100%; background:var(--accent); border-radius:3px; }
+  .empty { padding:2rem; text-align:center; color:var(--text-3); }
 
-  /* state signal colours */
-  .s-RUNNING { color:var(--sbp-blue); font-weight:700; }
-  .s-FINISHED { color:var(--green); font-weight:700; }
-  .s-FAILED, .s-CANCELED { color:var(--red); font-weight:700; }
+  /* ── history toolbar ── */
+  .toolbar { display:flex; flex-wrap:wrap; gap:.6rem; align-items:center; margin-bottom:.75rem; }
+  .toolbar select, .toolbar button, button.more {
+      font:inherit; font-size:13px; padding:.35rem .7rem; border-radius:6px; cursor:pointer;
+      border:1px solid var(--line); background:var(--surface); color:var(--text); }
+  .toolbar button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+  .toolbar .count { margin-left:auto; color:var(--text-2); font-size:13px; }
+  button.more { display:block; margin:.9rem auto 0; }
 
-  a.back { color:var(--sbp-blue); cursor:pointer; font-weight:600;
-           display:inline-block; margin-bottom:.6rem; }
-  #detail.hidden { display:none; }
-  #detail pre { background:var(--soft-blue); border-radius:8px; padding:1rem;
-                font-family:var(--mono); font-size:12.5px; overflow:auto; max-width:920px; }
+  /* ── query detail ── */
+  a.back { color:var(--accent); cursor:pointer; font-weight:600; font-size:13px;
+           display:inline-block; margin-bottom:.6rem; text-decoration:none; }
+  a.back:hover { text-decoration:underline; }
+  .timing { display:flex; height:10px; border-radius:5px; overflow:hidden; background:var(--panel);
+            margin:.2rem 0 .5rem; }
+  .timing i { display:block; height:100%; min-width:2px; }
+  .t-q { background:var(--text-3); } .t-p { background:var(--warn-line); } .t-e { background:var(--accent); }
+  pre.sql { background:var(--panel); border-radius:10px; padding:1rem 1.15rem; margin:0;
+            font-family:var(--mono); font-size:12.5px; white-space:pre-wrap; overflow:auto; }
+  pre.sql .hash { color:var(--text-3); }
+  .errbox { color:var(--bad); font-weight:600; }
 
-  /* ── Dashboard stat cards ── */
-  .stat-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
-               gap:.75rem; margin-bottom:1.25rem; }
-  .stat-card { background:var(--white); border-radius:8px; padding:1rem 1.25rem;
-               display:flex; flex-direction:column; gap:.25rem; }
-  .stat-num  { font-size:40px; font-weight:900; color:var(--sbp-blue);
-               font-variant-numeric:tabular-nums; line-height:1; }
-  .stat-num.fail { color:var(--red); }
-  .stat-label{ font-size:12px; color:var(--gray-medium); font-weight:600;
-               letter-spacing:.01em; }
-  .stat-spark { width:100%; height:36px; overflow:visible; display:block; }
-
-  /* ── Histogram ── */
-  .hist-wrap { background:var(--white); border-radius:8px; padding:1rem 1.25rem;
-               margin-bottom:1.25rem; }
-  .hist-muted { font-size:12px; color:var(--gray-medium); font-style:italic; }
-  /* Histogram legend */
-  .hist-legend { display:flex; align-items:center; gap:1rem; margin-top:.5rem;
-                 font-size:12px; color:var(--gray-medium); }
-  .hist-legend-swatch { display:inline-block; width:12px; height:10px;
-                        border-radius:2px; flex-shrink:0; }
-  .hist-caption { margin-left:auto; font-style:italic; }
-
-  /* ── Gauge cards ── */
-  .gauge-row  { display:grid; grid-template-columns:1fr 1fr; gap:.75rem;
-                margin-bottom:1.25rem; }
-  .gauge-card { background:var(--white); border-radius:8px; padding:1rem 1.25rem;
-                display:flex; flex-direction:column; gap:.5rem; }
-  .gauge-title{ font-size:12px; font-weight:700; color:var(--gray-medium);
-                letter-spacing:.01em; text-transform:uppercase; }
-  .gauge-pct  { font-size:36px; font-weight:900; color:var(--sbp-blue);
-                font-variant-numeric:tabular-nums; line-height:1; }
-  .bar-track  { background:var(--soft-blue); border-radius:4px; height:8px;
-                overflow:hidden; }
-  .bar-fill   { height:100%; border-radius:4px; background:var(--sbp-blue);
-                transition:width .4s; }
-  .spark-wrap { height:40px; }
-  svg.spark   { width:100%; height:40px; overflow:visible; }
-
-  /* ── History controls ── */
-  .hist-bar { display:flex; flex-wrap:wrap; gap:.75rem; align-items:center;
-              margin-bottom:.75rem; font-size:13px; }
-  .hist-bar select, .hist-bar button, button.more {
-              font:inherit; padding:.3rem .6rem; border-radius:5px;
-              border:1px solid var(--soft-blue); background:var(--white); cursor:pointer; }
-  button.more { display:block; margin:.75rem auto 0; }
-  .hist-count { margin-left:auto; color:var(--gray-medium); }
-
-  /* ── Tooltip ── */
-  #tip { position:fixed; pointer-events:none; display:none; z-index:9999;
-         background:#1a2535; color:#fff; font:600 12px var(--mono);
+  /* tooltip */
+  #tip { position:absolute; pointer-events:none; display:none; z-index:9999;
+         background:var(--tip-bg); color:var(--tip-text); font:600 12px var(--mono);
          padding:.3rem .55rem; border-radius:5px; white-space:nowrap; }
+
+  @media (max-width:640px) {
+    header, main { padding-left:1rem; padding-right:1rem; }
+    #meta { display:none; }
+    nav { gap:.75rem; }
+  }
 </style>
 </head>
 <body>
@@ -140,22 +216,28 @@
     <div class="wordmark">SQE</div>
     <div class="marker"></div>
   </div>
-  <nav>
-    <button data-tab="overview" class="active">Overview</button>
-    <button data-tab="queries">Queries</button>
-    <button data-tab="history">History</button>
-    <button data-tab="cluster">Cluster</button>
+  <nav aria-label="Sections">
+    <div class="navgrp"><span>Engine</span><div>
+      <button data-tab="overview" class="active">Overview</button>
+      <button data-tab="cluster">Cluster</button>
+    </div></div>
+    <div class="navgrp"><span>Workload</span><div>
+      <button data-tab="queries">Queries</button>
+      <button data-tab="history">History</button>
+    </div></div>
   </nav>
   <span id="meta"></span>
 </header>
-<div id="err"></div>
+<div id="err" class="banner bad" role="alert"></div>
+<main>
 <div id="overview"></div>
 <div id="queries" style="display:none"></div>
 <div id="history" style="display:none"></div>
 <div id="cluster" style="display:none"></div>
 <div id="detail" class="hidden"></div>
+</main>
 
-<!-- Shared tooltip: lives outside #overview so it survives innerHTML rewrites -->
+<!-- Shared tooltip: lives outside the tab containers so it survives innerHTML rewrites -->
 <div id="tip"></div>
 
 <!-- nosemgrep: opt.aikido.semgrep-rules.html.security.audit.insecure-document-method -- every innerHTML write below passes engine values through esc() first -->
@@ -171,19 +253,42 @@ function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g, c=>(
   {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
 // State strings come from our own enum; strip to A-Z before using as a CSS class.
 function stClass(s){ return "s-"+String(s).replace(/[^A-Z]/g,""); }
+function pill(s){ return `<span class="pill ${stClass(s)}">${esc(String(s||"").toLowerCase())}</span>`; }
 function fmtBytes(n){ if(!n) return "0"; const u=["B","KB","MB","GB","TB"];
   let i=0,v=n; while(v>=1024&&i<u.length-1){v/=1024;i++;} return v.toFixed(1)+u[i]; }
 function ms(n){ return (n|0)>=1000 ? ((n|0)/1000).toFixed(2)+"s" : (n|0)+"ms"; }
-function dash(v){ return (v==null||v===0||v==="")?"--":esc(v); }
+function num(n){ return (Number(n)||0).toLocaleString(); }
+function pct(v, max){ return max>0 ? Math.max(0, Math.min(100, v/max*100)).toFixed(1) : "0"; }
+function dash(v){ return (v==null||v===0||v==="")?"&mdash;":esc(v); }
+function fmtDur(s){ s=s|0; const d=Math.floor(s/86400), h=Math.floor(s%86400/3600), m=Math.floor(s%3600/60);
+  return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : m ? `${m}m ${s%60}s` : `${s}s`; }
+function elapsed(q){ return (q.executionMs||0)+(q.planningMs||0)+(q.queuedMs||0); }
 // Format a Unix-epoch-ms timestamp as local HH:MM for chart tooltips.
 function hhmm(unixMs){ return new Date(unixMs).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}); }
+
+const ICON_WARN = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>`;
+const ICON_SORT = `<svg width="9" height="12" viewBox="0 0 9 12" aria-hidden="true"><path d="M4.5 0 9 5H0zM4.5 12 0 7h9z" fill="currentColor"/></svg>`;
 
 async function getJSON(u){ const r=await fetch(u); if(!r.ok) throw new Error(u+" "+r.status);
   return r.json(); }
 
-function showErr(e){ const el=$("#err"); el.textContent="lost connection: "+e.message;
-  el.style.display="block"; }
+function showErr(e){ const el=$("#err");
+  // nosemgrep: opt.aikido.semgrep-rules.html.security.audit.insecure-document-method -- the message passes through esc()
+  el.innerHTML = ICON_WARN+`<span class=msg>Lost connection to the coordinator: ${esc(e.message)}</span>`;
+  el.style.display="flex"; }
 function clearErr(){ $("#err").style.display="none"; }
+
+// A banner names a condition and the action that addresses it. `act` is the
+// key of a fixed entry in ACTIONS, never engine data.
+const ACTIONS = {
+  queries:   () => switchTab("queries"),
+  cluster:   () => switchTab("cluster"),
+  failedHr:  () => { hist.range="3600"; hist.state="failed"; hist.loaded=false; switchTab("history"); },
+};
+function banner(kind, msgHtml, act, label){
+  return `<div class="banner ${kind}" role="status">${ICON_WARN}<span class=msg>${msgHtml}</span>`+
+    (act?`<button data-act="${esc(act)}">${esc(label)} &rarr;</button>`:"")+`</div>`;
+}
 
 // ── Shared tooltip (event-delegated) ──────────────────────────────────────────
 // The #tip div is static in <body> and never overwritten. Listeners are
@@ -191,40 +296,88 @@ function clearErr(){ $("#err").style.display="none"; }
 // elements. Using pageX/pageY keeps positioning correct regardless of any
 // positioned ancestors.
 const tip = $("#tip");
-
 document.addEventListener("mouseover", e => {
   const t = e.target.closest("[data-tip]");
   if (!t) return;
   tip.textContent = t.getAttribute("data-tip");
   tip.style.display = "block";
 });
-
 document.addEventListener("mousemove", e => {
   if (!e.target.closest("[data-tip]")) return;
   tip.style.left = (e.pageX + 14) + "px";
-  tip.style.top  = (e.pageY - 28) + "px";
+  tip.style.top  = (e.pageY - 30) + "px";
 });
-
 document.addEventListener("mouseout", e => {
   if (!e.target.closest("[data-tip]")) return;
   tip.style.display = "none";
 });
-
 document.addEventListener("touchstart", e => {
   const t = e.target.closest("[data-tip]");
   if (!t) { tip.style.display = "none"; return; }
   const touch = e.touches[0];
   tip.textContent = t.getAttribute("data-tip");
   tip.style.left  = (touch.pageX + 14) + "px";
-  tip.style.top   = (touch.pageY - 28) + "px";
+  tip.style.top   = (touch.pageY - 30) + "px";
   tip.style.display = "block";
 }, { passive: true });
 
+// ── Sortable tables ──────────────────────────────────────────────────────────
+// Sort state lives here, outside the 2 s re-render, so a chosen order survives
+// the refresh. Clicking a header cycles: natural direction, reversed, off
+// (server order). Numbers start descending, text ascending.
+const sorts = { q:{k:null,d:1}, h:{k:null,d:1}, w:{k:null,d:1} };
+const redraw = { q:()=>drawQueries(), h:()=>drawHistory(), w:()=>drawCluster() };
+function colGet(c){ return c.get || (r => r[c.k]); }
+function sortRows(t, rows, cols){
+  const s = sorts[t]; if(!s.k) return rows;
+  const c = cols.find(c=>c.k===s.k); if(!c) return rows;
+  const g = colGet(c);
+  return rows.slice().sort((a,b)=>{
+    const x=g(a), y=g(b);
+    return (c.n ? (Number(x)||0)-(Number(y)||0) : String(x??"").localeCompare(String(y??""))) * s.d;
+  });
+}
+function thead(t, cols){
+  const s = sorts[t];
+  return "<thead><tr>"+cols.map(c=>{
+    const aria = s.k===c.k ? (s.d>0?"ascending":"descending") : "none";
+    return `<th${c.n?" class=num":""} aria-sort="${aria}"><button class=sort data-t="${esc(t)}" data-k="${esc(c.k)}">`+
+      `${esc(c.l)}${ICON_SORT}</button></th>`;
+  }).join("")+"</tr></thead>";
+}
+document.addEventListener("click", e => {
+  const b = e.target.closest("button.sort");
+  if (b) {
+    const s = sorts[b.dataset.t]; if(!s) return;
+    const cols = { q:QCOLS, h:HCOLS, w:WCOLS }[b.dataset.t];
+    const c = cols.find(c=>c.k===b.dataset.k); if(!c) return;
+    const first = c.n ? -1 : 1;
+    if (s.k!==c.k) { s.k=c.k; s.d=first; } else if (s.d===first) s.d=-first; else s.k=null;
+    redraw[b.dataset.t]();
+    return;
+  }
+  const a = e.target.closest("button[data-act]");
+  if (a && ACTIONS[a.dataset.act]) { ACTIONS[a.dataset.act](); return; }
+  const r = e.target.closest("tr[data-id]");
+  if (r) openRow(r);
+});
+document.addEventListener("keydown", e => {
+  if (e.key!=="Enter") return;
+  const r = e.target.closest && e.target.closest("tr[data-id]");
+  if (r) openRow(r);
+});
+function openRow(r){
+  if (r.closest("#history")) openDetail(r.dataset.id, histById.get(r.dataset.id));
+  else if (r.closest("#queries")) openDetail(r.dataset.id);
+}
+// Value with a bar scaled to the largest value on the page.
+function barCell(text, v, max){
+  return `<td class=num><span class=cellbar><span class=track><i style="width:${pct(v,max)}%"></i></span>${text}</span></td>`;
+}
+
 // ── SVG histogram ──────────────────────────────────────────────────────────
-// Builds a stacked-bar histogram from bucket data.
-// "Completed" bars = b.finished (successfully finished, not double-counting failed).
-// "Failed" bars    = b.failed   (failed, stacked on top).
-// Each bar gets a transparent hit-target rect carrying the data-tip label.
+// Stacked bars per bucket: finished (b.finished) below, failed (b.failed) on
+// top. Each bar gets a transparent hit-target rect carrying the data-tip label.
 function buildHistSvg(buckets, W, H) {
   if (!buckets || buckets.length === 0) return "";
   const maxVal = Math.max(...buckets.map(b => (b.finished||0)+(b.failed||0)), 1);
@@ -234,72 +387,43 @@ function buildHistSvg(buckets, W, H) {
   let bars = "";
   for (let i = 0; i < n; i++) {
     const x = i * (barW + gap);
-    const finished  = b => (b.finished||0);
-    const failed    = b => (b.failed||0);
-    const fin  = finished(buckets[i]);
-    const fail = failed(buckets[i]);
+    const fin  = buckets[i].finished||0;
+    const fail = buckets[i].failed||0;
     const totalQ = fin + fail;
     const totalH = Math.round((totalQ / maxVal) * H);
     const failH  = Math.round((fail / maxVal) * H);
-    if (fin > 0) {
-      bars += `<rect x="${x}" y="${H - totalH + failH}" width="${barW}" height="${totalH - failH}" fill="var(--sbp-blue)" />`;
-    }
-    if (fail > 0) {
-      bars += `<rect x="${x}" y="${H - failH}" width="${barW}" height="${failH}" fill="var(--red)" />`;
-    }
-    if (totalQ === 0) {
-      bars += `<rect x="${x}" y="${H - 2}" width="${barW}" height="2" fill="var(--soft-blue)" />`;
-    }
-    // Transparent hit-target covering the full bar height for tooltip
+    if (fin > 0) bars += `<rect x="${x}" y="${H - totalH + failH}" width="${barW}" height="${totalH - failH}" rx="1" fill="var(--accent)" />`;
+    if (fail > 0) bars += `<rect x="${x}" y="${H - failH}" width="${barW}" height="${failH}" rx="1" fill="var(--bad)" />`;
+    if (totalQ === 0) bars += `<rect x="${x}" y="${H - 2}" width="${barW}" height="2" fill="var(--line)" />`;
     const label = `${hhmm(buckets[i].tUnixMs)} · ${fin} completed, ${fail} failed`;
     bars += `<rect x="${x}" y="0" width="${barW}" height="${H}" fill="transparent" data-tip="${esc(label)}" style="cursor:crosshair" />`;
   }
-  return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" preserveAspectRatio="none">${bars}</svg>`;
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" preserveAspectRatio="none" role="img" aria-label="Queries per minute, last hour">${bars}</svg>`;
 }
 
 // ── SVG sparkline (polyline + per-point hover rects) ─────────────────────────
-// Returns inline SVG for a small sparkline. The `series` array is
-// [{val, label}] objects; `color` is a CSS color string.
+// `series` is [{val, label}]; `color` is a CSS color string.
 function sparklineSvg(series, color, W, H, cssClass) {
   if (!series || series.length < 2) return `<svg class="${cssClass||"stat-spark"}" viewBox="0 0 ${W} ${H}"></svg>`;
   const vals = series.map(p => p.val);
   const maxV = Math.max(...vals, 0.001);
-  const pts = vals.map((v, i) => {
-    const x = (i / (vals.length - 1)) * W;
-    const y = H - (v / maxV) * (H - 4) - 2;
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  }).join(" ");
-
-  // Faint area fill under the line
-  const firstX = 0, lastX = W;
-  const firstY = H - (vals[0] / maxV) * (H - 4) - 2;
-  const areaPath = `M${firstX},${firstY} ` + pts.split(" ").slice(1).map(p => `L${p}`).join(" ") + ` L${lastX},${H} L${firstX},${H} Z`;
-
-  // Per-point transparent hit-target columns
+  const xy = vals.map((v, i) => [(i / (vals.length - 1)) * W, H - (v / maxV) * (H - 4) - 2]);
+  const pts = xy.map(([x,y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
+  const areaPath = `M0,${xy[0][1].toFixed(1)} ` + xy.slice(1).map(([x,y]) => `L${x.toFixed(1)},${y.toFixed(1)}`).join(" ") + ` L${W},${H} L0,${H} Z`;
+  const [lx, ly] = xy[xy.length-1];
   const colW = W / vals.length;
   let targets = "";
   for (let i = 0; i < series.length; i++) {
-    const x = i * colW;
-    const label = series[i].label;
-    targets += `<rect x="${x.toFixed(1)}" y="0" width="${colW.toFixed(1)}" height="${H}" fill="transparent" data-tip="${esc(label)}" style="cursor:crosshair" />`;
+    targets += `<rect x="${(i*colW).toFixed(1)}" y="0" width="${colW.toFixed(1)}" height="${H}" fill="transparent" data-tip="${esc(series[i].label)}" style="cursor:crosshair" />`;
   }
-
   return `<svg class="${cssClass||"stat-spark"}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">` +
-    `<path d="${areaPath}" fill="${color}" opacity="0.10" />` +
-    `<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" />` +
-    targets +
-    `</svg>`;
+    `<path d="${areaPath}" fill="${color}" opacity="0.12" />` +
+    `<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke" />` +
+    `<circle cx="${lx.toFixed(1)}" cy="${ly.toFixed(1)}" r="2.5" fill="${color}" vector-effect="non-scaling-stroke" />` +
+    targets + `</svg>`;
 }
-
-// Build a sparkline series array from buckets given a value extractor and label template.
 function bucketSeries(buckets, valFn, labelFn) {
   return buckets.map(b => ({ val: valFn(b), label: labelFn(b) }));
-}
-
-// ── SVG sparkline (gauge variant, polyline) ────────────────────────────────
-// Used for the two gauge-card sparklines (same shape, different CSS class).
-function buildSparkSvg(series, W, H) {
-  return sparklineSvg(series, "var(--sbp-blue)", W, H, "spark");
 }
 
 async function renderOverview(){
@@ -309,168 +433,151 @@ async function renderOverview(){
       getJSON("/api/v1/metrics/history").catch(() => ({ buckets: [] }))
     ]);
     clearErr();
-    $("#meta").textContent = `${esc(o.node.role)} v${esc(o.node.version)} · up ${o.node.uptimeSeconds|0}s`;
+    $("#meta").textContent = `${o.node.role} v${o.node.version} · up ${fmtDur(o.node.uptimeSeconds)}`;
     const cap = o.capabilities||{}, res = o.resources||{}, met = o.metrics||{};
     const buckets = (hist && hist.buckets) ? hist.buckets : [];
 
-    // ── Stat cards with per-metric sparklines ───────────────────────────────
-    const W = 200, H = 36;
-    const statDefs = [
-      {
-        label:"Total queries",
-        num: met.totalQueries|0,
-        cls:"",
-        series: bucketSeries(buckets, b=>b.total||0,    b=>`${hhmm(b.tUnixMs)} · ${b.total||0} total`),
-        color:"var(--sbp-blue)"
-      },
-      {
-        label:"Finished",
-        num: met.finished|0,
-        cls:"",
-        series: bucketSeries(buckets, b=>b.finished||0, b=>`${hhmm(b.tUnixMs)} · ${b.finished||0} finished`),
-        color:"var(--sbp-blue)"
-      },
-      {
-        label:"Failed",
-        num: met.failed|0,
-        cls:"fail",
-        series: bucketSeries(buckets, b=>b.failed||0,   b=>`${hhmm(b.tUnixMs)} · ${b.failed||0} failed`),
-        color:"var(--red)"
-      },
-      {
-        label:"Running",
-        num: met.running|0,
-        cls:"",
-        series: bucketSeries(buckets, b=>b.avgActive||0, b=>`${hhmm(b.tUnixMs)} · ${(b.avgActive||0).toFixed(1)} avg active`),
-        color:"var(--sbp-blue)"
-      },
-      {
-        label:"Avg latency",
-        num: ms(met.avgExecutionMs),
-        cls:"",
-        raw:true,
-        series: bucketSeries(buckets, b=>b.avgLatencyMs||0, b=>`${hhmm(b.tUnixMs)} · ${ms(b.avgLatencyMs||0)} avg latency`),
-        color:"var(--sbp-blue)"
-      },
-      {
-        label:"Rows out",
-        num: met.totalOutputRows|0,
-        cls:"",
-        series: bucketSeries(buckets, b=>b.rowsOut||0,  b=>`${hhmm(b.tUnixMs)} · ${(b.rowsOut||0).toLocaleString()} rows`),
-        color:"var(--sbp-blue)"
-      },
-    ];
-    const statCards = statDefs.map(s => {
-      const spark = s.series.length >= 2
-        ? sparklineSvg(s.series, s.color, W, H, "stat-spark")
-        : `<svg class="stat-spark" viewBox="0 0 ${W} ${H}"></svg>`;
-      return `<div class="stat-card">` +
-        `<div class="stat-num ${s.cls}">${s.raw ? esc(s.num) : (s.num|0)}</div>` +
-        `<div class="stat-label">${esc(s.label)}</div>` +
-        spark +
-        `</div>`;
-    }).join("");
-
-    // ── Memory gauge ────────────────────────────────────────────────────────
-    // Use latest maxMemPct from history; fall back to 0 when no history yet.
+    // Last hour, from the history buckets.
+    const hrTotal = buckets.reduce((a,b)=>a+(b.total||0),0);
+    const hrFailed = buckets.reduce((a,b)=>a+(b.failed||0),0);
     const lastBucket = buckets.length > 0 ? buckets[buckets.length - 1] : null;
     const memPct = lastBucket ? (lastBucket.maxMemPct||0) : 0;
-    const memPctDisp = memPct.toFixed(1);
-    const memFill = memPct > 80 ? "#FF7000" : "var(--sbp-blue)";
-    const memSparkSeries = bucketSeries(buckets, b=>b.avgMemPct||0, b=>`${hhmm(b.tUnixMs)} · ${(b.avgMemPct||0).toFixed(1)}% mem`);
-    const memSpark = buildSparkSvg(memSparkSeries, 200, 40);
-
-    // ── Concurrency gauge ───────────────────────────────────────────────────
     const maxConc = cap.maxConcurrentQueries || 0;
     const activeQ = res.activeQueries || 0;
     const concPct = maxConc > 0 ? Math.min((activeQ / maxConc) * 100, 100) : 0;
-    const concPctDisp = concPct.toFixed(1);
-    const concSparkSeries = bucketSeries(buckets, b=>b.avgActive||0, b=>`${hhmm(b.tUnixMs)} · ${(b.avgActive||0).toFixed(1)} avg active`);
-    const concSpark = buildSparkSvg(concSparkSeries, 200, 40);
 
-    // ── Histogram ───────────────────────────────────────────────────────────
-    const histSvg = buckets.length > 0
-      ? buildHistSvg(buckets, 900, 100)
-      : `<p class="hist-muted">collecting&hellip;</p>`;
+    // 1. One sentence that says what the numbers below mean.
+    const summary = buckets.length
+      ? `<b>${num(hrTotal)}</b> ${hrTotal===1?"query":"queries"} in the last hour`+
+        (hrFailed ? `, <b>${num(hrFailed)}</b> failed` : ", none failed")+
+        `; <b>${num(activeQ)}</b> running${maxConc>0?` of ${num(maxConc)} slots`:""}, memory pool at <b>${memPct.toFixed(1)}%</b>`+
+        (res.memoryLimitBytes ? ` of ${fmtBytes(res.memoryLimitBytes)}` : "")+"."
+      : `<b>${num(met.totalQueries)}</b> queries tracked, <b>${num(activeQ)}</b> running. Activity history is still collecting.`;
 
-    // Histogram legend (only shown when there is data)
-    const histLegend = buckets.length > 0
-      ? `<div class="hist-legend">` +
-        `<span class="hist-legend-swatch" style="background:var(--sbp-blue)"></span> Completed` +
-        `<span class="hist-legend-swatch" style="background:var(--red)"></span> Failed` +
-        `<span class="hist-caption">1-min buckets &middot; last 1h</span>` +
-        `</div>`
-      : "";
+    // 4. Conditions that want attention, each with its action.
+    let banners = "";
+    if (memPct > 80) banners += banner("", `Memory pool at <b>${memPct.toFixed(1)}%</b>: new queries will spill or fail to reserve memory.`, "queries", "Running queries");
+    if (maxConc > 0 && concPct >= 90) banners += banner("", `<b>${num(activeQ)} of ${num(maxConc)}</b> query slots in use; new queries will queue.`, "queries", "Running queries");
+    if (hrFailed > 0) banners += banner("bad", `<b>${num(hrFailed)}</b> ${hrFailed===1?"query":"queries"} failed in the last hour.`, "failedHr", "Show failures");
+
+    // 2. Metric strip with per-figure sparklines.
+    const W = 200, H = 30;
+    const statDefs = [
+      { label:"Total queries", val:num(met.totalQueries), sub:`${num(hrTotal)} last hour`,
+        series: bucketSeries(buckets, b=>b.total||0,    b=>`${hhmm(b.tUnixMs)} · ${b.total||0} total`), color:"var(--accent)" },
+      { label:"Finished", val:num(met.finished),
+        series: bucketSeries(buckets, b=>b.finished||0, b=>`${hhmm(b.tUnixMs)} · ${b.finished||0} finished`), color:"var(--ok)" },
+      { label:"Failed", val:num(met.failed), cls:(met.failed|0)>0?"bad":"", sub:`${num(hrFailed)} last hour`,
+        series: bucketSeries(buckets, b=>b.failed||0,   b=>`${hhmm(b.tUnixMs)} · ${b.failed||0} failed`), color:"var(--bad)" },
+      { label:"Running", val:num(met.running),
+        series: bucketSeries(buckets, b=>b.avgActive||0, b=>`${hhmm(b.tUnixMs)} · ${(b.avgActive||0).toFixed(1)} avg active`), color:"var(--accent)" },
+      { label:"Avg latency", val:ms(met.avgExecutionMs),
+        series: bucketSeries(buckets, b=>b.avgLatencyMs||0, b=>`${hhmm(b.tUnixMs)} · ${ms(b.avgLatencyMs||0)} avg latency`), color:"var(--accent)" },
+      { label:"Rows out", val:num(met.totalOutputRows),
+        series: bucketSeries(buckets, b=>b.rowsOut||0,  b=>`${hhmm(b.tUnixMs)} · ${(b.rowsOut||0).toLocaleString()} rows`), color:"var(--accent)" },
+    ];
+    const strip = statDefs.map(s =>
+      `<div><span class=lbl>${esc(s.label)}</span>`+
+      `<span class="val ${s.cls||""}">${esc(s.val)}</span>`+
+      (s.sub?`<span class=sub>${esc(s.sub)}</span>`:"")+
+      sparklineSvg(s.series, s.color, W, H, "stat-spark")+`</div>`).join("");
+
+    // Histogram.
+    const peak = Math.max(0, ...buckets.map(b => (b.finished||0)+(b.failed||0)));
+    const histBody = buckets.length > 0
+      ? buildHistSvg(buckets, 900, 120) +
+        `<div class=hist-axis><span>${esc(hhmm(buckets[0].tUnixMs))}</span><span>${esc(hhmm(buckets[buckets.length-1].tUnixMs))}</span></div>`+
+        `<div class="hist-legend"><span><i class=sw style="background:var(--accent)"></i>Completed</span>`+
+        `<span><i class=sw style="background:var(--bad)"></i>Failed</span>`+
+        `<span class="hist-caption">1-min buckets · peak ${num(peak)}/min</span></div>`
+      : `<p class="hist-muted">Collecting&hellip; the first bucket lands within a minute.</p>`;
+
+    // Gauges.
+    const memSpark = sparklineSvg(bucketSeries(buckets, b=>b.avgMemPct||0, b=>`${hhmm(b.tUnixMs)} · ${(b.avgMemPct||0).toFixed(1)}% mem`), memPct>80?"var(--warn-line)":"var(--accent)", 200, 34, "spark");
+    const concSpark = sparklineSvg(bucketSeries(buckets, b=>b.avgActive||0, b=>`${hhmm(b.tUnixMs)} · ${(b.avgActive||0).toFixed(1)} avg active`), "var(--accent)", 200, 34, "spark");
+    const gauge = (title, p, warn, spark) =>
+      `<div class=card><div class=gauge-head><span class=gauge-title>${title}</span>`+
+      `<span class="gauge-pct${warn?" warn":""}">${p.toFixed(1)}%</span></div>`+
+      `<div class=bar-track><div class="bar-fill${warn?" warn":""}" style="width:${Math.min(p,100).toFixed(1)}%"></div></div>`+
+      spark+`</div>`;
+
+    const kv = (k, v, mono) => `<div><span class=k>${k}</span><span class="v${mono?" mono":""}">${v}</span></div>`;
 
     // nosemgrep: opt.aikido.semgrep-rules.html.security.audit.insecure-document-method -- all interpolations pass through esc()
     $("#overview").innerHTML =
-      `<h2>${esc(o.node.name)} <span style="color:var(--mut)">v${esc(o.node.version)}</span>`+
-      ` &mdash; <span class="s-FINISHED">${esc(o.node.role)}</span>`+
-      ` &mdash; DataFusion ${esc(o.node.datafusionVersion)}</h2>`+
-
-      // a. Stat cards
-      `<h3>Activity</h3>`+
-      `<div class="stat-grid">${statCards}</div>`+
-
-      // b. Histogram
-      `<h3>Query activity (last 1h)</h3>`+
-      `<div class="hist-wrap">${histSvg}${histLegend}</div>`+
-
-      // c. Resource gauges
-      `<h3>Resource usage</h3>`+
-      `<div class="gauge-row">`+
-        `<div class="gauge-card">`+
-          `<div class="gauge-title">Memory</div>`+
-          `<div class="gauge-pct">${memPctDisp}%</div>`+
-          `<div class="bar-track"><div class="bar-fill" style="width:${Math.min(memPct,100).toFixed(1)}%;background:${memFill}"></div></div>`+
-          `<div class="spark-wrap">${memSpark}</div>`+
-        `</div>`+
-        `<div class="gauge-card">`+
-          `<div class="gauge-title">Concurrency ${activeQ|0} / ${maxConc|0}</div>`+
-          `<div class="gauge-pct">${concPctDisp}%</div>`+
-          `<div class="bar-track"><div class="bar-fill" style="width:${Math.min(concPct,100).toFixed(1)}%"></div></div>`+
-          `<div class="spark-wrap">${concSpark}</div>`+
+      `<div class=crumb>Engine · <span class=mono>DataFusion ${esc(o.node.datafusionVersion)}</span></div>`+
+      `<h1>${esc(o.node.name)} <span class="pill plain">v${esc(o.node.version)}</span>`+
+      ` <span class="pill s-HEALTHY">${esc(o.node.role)}</span></h1>`+
+      `<div class=marker></div>`+
+      `<p class=summary>${summary}</p>`+
+      banners+
+      `<div class=strip>${strip}</div>`+
+      `<div class=grid2>`+
+        `<div><h2>Query activity <span class=aside>last hour</span></h2><div class=card>${histBody}</div></div>`+
+        `<div><h2>Resources</h2>`+
+          gauge("Memory pool", memPct, memPct>80, memSpark)+
+          gauge(maxConc>0 ? `Concurrency · ${num(activeQ)} / ${num(maxConc)}` : `Concurrency · ${num(activeQ)} running, no cap`,concPct, concPct>=90, concSpark)+
         `</div>`+
       `</div>`+
-
-      // d. Capabilities (config reference)
-      `<h3>Requirements</h3>`+
+      `<h2>Configuration</h2>`+
       `<div class=kv>`+
-      `<div>Flight SQL port</div><div>${dash(cap.flightSqlPort)}</div>`+
-      `<div>Trino HTTP port</div><div>${dash(cap.trinoHttpPort)}</div>`+
-      `<div>Quack port</div><div>${dash(cap.quackPort)}</div>`+
-      `<div>Catalog backend</div><div>${dash(cap.catalogBackend)}</div>`+
-      `<div>Catalog URL</div><div>${dash(cap.catalogUrl)}</div>`+
-      `<div>Storage</div><div>${dash(cap.storage)}</div>`+
-      `<div>Max query memory</div><div>${dash(cap.memoryLimit)}</div>`+
-      `<div>Max concurrent queries</div><div>${dash(cap.maxConcurrentQueries)}</div>`+
-      `<div>CPU cores</div><div>${res.cpuCores|0}</div>`+
-      `<div>Memory limit</div><div>${fmtBytes(res.memoryLimitBytes)}</div>`+
+        kv("Flight SQL port", dash(cap.flightSqlPort), true)+
+        kv("Trino HTTP port", dash(cap.trinoHttpPort), true)+
+        kv("Quack port", dash(cap.quackPort), true)+
+        kv("Catalog backend", dash(cap.catalogBackend))+
+        kv("Catalog URL", dash(cap.catalogUrl), true)+
+        kv("Storage", dash(cap.storage), true)+
+        kv("Max query memory", dash(cap.memoryLimit))+
+        kv("Max concurrent queries", dash(cap.maxConcurrentQueries))+
+        kv("CPU cores", String(res.cpuCores|0))+
+        kv("Memory limit", esc(fmtBytes(res.memoryLimitBytes)))+
       `</div>`;
   } catch(e){ showErr(e); }
 }
 
+// ── Queries (tracker, refreshed every 2 s) ──────────────────────────────────
+const QCOLS = [
+  {k:"queryId", l:"Query"}, {k:"state", l:"State"}, {k:"username", l:"User"},
+  {k:"sql", l:"SQL (redacted)"}, {k:"sqlHash", l:"SQL hash"},
+  {k:"elapsed", l:"Elapsed", n:true, get:elapsed},
+  {k:"outputRows", l:"Rows", n:true}, {k:"bytesScanned", l:"Scanned", n:true},
+];
+let lastQ = null;
 async function renderQueries(){
   try {
-    const rows = await getJSON("/api/v1/queries?limit=200"); clearErr();
-    if(current!==null) return; // detail open
-    // nosemgrep: opt.aikido.semgrep-rules.html.security.audit.insecure-document-method -- all interpolations pass through esc()
-    $("#queries").innerHTML =
-      "<table><thead><tr><th>id</th><th>state</th><th>user</th><th>sql (redacted)</th><th>sql hash</th>"+
-      "<th class=num>elapsed</th><th class=num>rows</th><th class=num>scanned</th></tr></thead><tbody>"+
-      rows.map(q=>{
-        const el = (q.executionMs||0)+(q.planningMs||0)+(q.queuedMs||0);
-        return `<tr class=q data-id="${esc(q.queryId)}"><td>${esc(String(q.queryId).slice(0,8))}</td>`+
-          `<td class="${stClass(q.state)}">${esc(q.state)}</td>`+
-          `<td>${esc(q.username||"")}</td>`+
-          `<td title="${esc(q.sql||"")}">${esc(String(q.sql||"").slice(0,60))}</td>`+
-          `<td title="${esc(q.sqlHash||"")}">${esc(String(q.sqlHash||"").slice(0,12))}</td>`+
-          `<td class=num>${ms(el)}</td><td class=num>${q.outputRows|0}</td>`+
-          `<td class=num>${fmtBytes(q.bytesScanned)}</td></tr>`;
-      }).join("")+"</tbody></table>";
-    document.querySelectorAll("tr.q").forEach(tr=>
-      tr.onclick=()=>openDetail(tr.dataset.id));
+    lastQ = await getJSON("/api/v1/queries?limit=200"); clearErr();
+    drawQueries();
   } catch(e){ showErr(e); }
+}
+function queryRow(q, maxEl, maxScan, withEnded){
+  const el = elapsed(q);
+  return `<tr data-id="${esc(q.queryId)}" tabindex=0>`+
+    (withEnded?`<td>${esc(q.ended?new Date(q.ended).toLocaleString():"")}</td>`:"")+
+    `<td class=id>${esc(String(q.queryId).slice(0,8))}</td>`+
+    `<td>${pill(q.state)}</td>`+
+    `<td>${esc(q.username||"")}</td>`+
+    `<td class=sqlc title="${esc(q.sql||"")}">${esc(String(q.sql||"").slice(0,60))}</td>`+
+    (withEnded?"":`<td class=sqlc title="${esc(q.sqlHash||"")}">${esc(String(q.sqlHash||"").slice(0,12))}</td>`)+
+    barCell(ms(el), el, maxEl)+
+    `<td class=num>${num(q.outputRows)}</td>`+
+    barCell(fmtBytes(q.bytesScanned), q.bytesScanned||0, maxScan)+`</tr>`;
+}
+function drawQueries(){
+  if(current!==null || !lastQ) return; // detail open
+  const rows = sortRows("q", lastQ, QCOLS);
+  const running = rows.filter(q=>q.state==="RUNNING").length;
+  const failed = rows.filter(q=>q.state==="FAILED").length;
+  const maxEl = Math.max(0, ...rows.map(elapsed));
+  const maxScan = Math.max(0, ...rows.map(q=>q.bytesScanned||0));
+  // nosemgrep: opt.aikido.semgrep-rules.html.security.audit.insecure-document-method -- all interpolations pass through esc()
+  $("#queries").innerHTML =
+    `<div class=crumb>Workload</div><h1>Queries</h1><div class=marker></div>`+
+    `<p class=summary><b>${num(rows.length)}</b> recent ${rows.length===1?"query":"queries"} in the tracker, `+
+    `<b>${num(running)}</b> running, <b>${num(failed)}</b> failed. Bars compare against the slowest and largest on this page; click a row for timing and fragments.</p>`+
+    `<div class=tablewrap><table>${thead("q", QCOLS)}<tbody>`+
+    (rows.length ? rows.map(q=>queryRow(q, maxEl, maxScan, false)).join("")
+                 : `<tr><td colspan=8 class=empty>No queries yet.</td></tr>`)+
+    "</tbody></table></div>";
 }
 
 // History tab (#812): finished queries from the tracker and the audit log,
@@ -478,6 +585,12 @@ async function renderQueries(){
 // pages stay put; Refresh or a filter change starts again from the newest.
 const hist = { rows:[], next:null, loaded:false, since:null, range:"86400", state:"all" };
 const histById = new Map();
+const HCOLS = [
+  {k:"ended", l:"Ended", get:q=>q.ended||""}, {k:"queryId", l:"Query"}, {k:"state", l:"State"},
+  {k:"username", l:"User"}, {k:"sql", l:"SQL (redacted)"},
+  {k:"elapsed", l:"Elapsed", n:true, get:elapsed},
+  {k:"outputRows", l:"Rows", n:true}, {k:"bytesScanned", l:"Scanned", n:true},
+];
 async function renderHistory(reset){
   if(reset){
     hist.rows=[]; hist.next=null; histById.clear();
@@ -498,33 +611,33 @@ async function renderHistory(reset){
 function histOpt(v, label, cur){ return `<option value="${esc(v)}"${v===cur?" selected":""}>${esc(label)}</option>`; }
 function drawHistory(){
   if(current!==null) return; // detail open
-  const ranges=[["3600","last hour"],["86400","last 24 hours"],["604800","last 7 days"],["2592000","last 30 days"],["all","whole log"]];
-  const states=[["all","any state"],["finished","finished"],["failed","failed"],["canceled","canceled"]];
+  const ranges=[["3600","Last hour"],["86400","Last 24 hours"],["604800","Last 7 days"],["2592000","Last 30 days"],["all","Whole log"]];
+  const states=[["all","Any state"],["finished","Finished"],["failed","Failed"],["canceled","Canceled"]];
+  const rows = sortRows("h", hist.rows, HCOLS);
+  const failed = rows.filter(q=>q.state==="FAILED").length;
+  const maxEl = Math.max(0, ...rows.map(elapsed));
+  const maxScan = Math.max(0, ...rows.map(q=>q.bytesScanned||0));
+  const win = (ranges.find(r=>r[0]===hist.range)||ranges[1])[1].toLowerCase();
   // nosemgrep: opt.aikido.semgrep-rules.html.security.audit.insecure-document-method -- all interpolations pass through esc()
   $("#history").innerHTML =
-    `<div class=hist-bar><select id=hist-range>${ranges.map(([v,l])=>histOpt(v,l,hist.range)).join("")}</select>`+
-    `<select id=hist-state>${states.map(([v,l])=>histOpt(v,l,hist.state)).join("")}</select>`+
-    `<button id=hist-refresh>Refresh</button>`+
-    `<span class=hist-count>${hist.rows.length} ${hist.next?"shown, more available":"queries"}</span></div>`+
-    "<table><thead><tr><th>ended</th><th>id</th><th>state</th><th>user</th><th>sql (redacted)</th>"+
-    "<th class=num>elapsed</th><th class=num>rows</th><th class=num>scanned</th></tr></thead><tbody>"+
-    hist.rows.map(q=>{
-      const el = (q.executionMs||0)+(q.planningMs||0)+(q.queuedMs||0);
-      return `<tr class=h data-id="${esc(q.queryId)}"><td>${esc(q.ended?new Date(q.ended).toLocaleString():"")}</td>`+
-        `<td>${esc(String(q.queryId).slice(0,8))}</td>`+
-        `<td class="${stClass(q.state)}">${esc(q.state)}</td>`+
-        `<td>${esc(q.username||"")}</td>`+
-        `<td title="${esc(q.sql||"")}">${esc(String(q.sql||"").slice(0,60))}</td>`+
-        `<td class=num>${ms(el)}</td><td class=num>${q.outputRows|0}</td>`+
-        `<td class=num>${fmtBytes(q.bytesScanned)}</td></tr>`;
-    }).join("")+"</tbody></table>"+
-    (hist.next?`<button class=more id=hist-more>Load more</button>`:"");
+    `<div class=crumb>Workload</div><h1>History</h1><div class=marker></div>`+
+    `<p class=summary><b>${num(rows.length)}</b> finished ${rows.length===1?"query":"queries"} loaded from the ${esc(win)}`+
+    (hist.state!=="all" ? ` (${esc(hist.state)} only)` : `, <b>${num(failed)}</b> failed`)+
+    (hist.next ? "; older ones are a page away." : ".")+
+    ` Newest end time first, from the tracker and the audit log. This tab does not auto-refresh.</p>`+
+    `<div class=toolbar><select id=hist-range aria-label="Window">${ranges.map(([v,l])=>histOpt(v,l,hist.range)).join("")}</select>`+
+    `<select id=hist-state aria-label="State">${states.map(([v,l])=>histOpt(v,l,hist.state)).join("")}</select>`+
+    `<button id=hist-refresh class=primary>Refresh</button>`+
+    `<span class=count>${num(hist.rows.length)} ${hist.next?"shown, more available":"queries"}</span></div>`+
+    `<div class=tablewrap><table>${thead("h", HCOLS)}<tbody>`+
+    (rows.length ? rows.map(q=>queryRow(q, maxEl, maxScan, true)).join("")
+                 : `<tr><td colspan=8 class=empty>${hist.loaded?"No finished queries in this window.":"Loading&hellip;"}</td></tr>`)+
+    "</tbody></table></div>"+
+    (hist.next?`<button class=more id=hist-more>Load 50 more</button>`:"");
   $("#hist-range").onchange=e=>{ hist.range=e.target.value; renderHistory(true); };
   $("#hist-state").onchange=e=>{ hist.state=e.target.value; renderHistory(true); };
   $("#hist-refresh").onclick=()=>renderHistory(true);
   if(hist.next) $("#hist-more").onclick=()=>renderHistory(false);
-  document.querySelectorAll("tr.h").forEach(tr=>
-    tr.onclick=()=>openDetail(tr.dataset.id, histById.get(tr.dataset.id)));
 }
 
 // `fallback`: the History row, shown when the tracker no longer holds the
@@ -540,48 +653,81 @@ async function openDetail(id, fallback){
     $("#queries").style.display="none"; $("#history").style.display="none";
     $("#cluster").style.display="none"; $("#overview").style.display="none";
     const det = $("#detail"); det.classList.remove("hidden");
+    const q = d.queuedMs||0, p = d.planningMs||0, x = d.executionMs||0, tot = q+p+x;
     const fr = (d.fragments||[]).map(f=>
-      `<tr><td>${esc(f.taskId)}</td><td>${esc(f.workerUrl)}</td>`+
-      `<td class="${stClass(f.state)}">${esc(f.state)}</td>`+
-      `<td class=num>${ms(f.elapsedMs)}</td><td class=num>${f.outputRows|0}</td></tr>`).join("");
+      `<tr><td class=id>${esc(f.taskId)}</td><td class=sqlc>${esc(f.workerUrl)}</td>`+
+      `<td>${pill(f.state)}</td>`+
+      `<td class=num>${ms(f.elapsedMs)}</td><td class=num>${num(f.outputRows)}</td></tr>`).join("");
+    const kv = (k, v) => `<div><span class=k>${k}</span><span class=v>${v}</span></div>`;
     // nosemgrep: opt.aikido.semgrep-rules.html.security.audit.insecure-document-method -- all interpolations pass through esc()
-    det.innerHTML = `<a class=back onclick="closeDetail()">&larr; back</a>`+
-      `<h3>${esc(d.queryId)}</h3>`+
-      `<div class=kv>`+
-      `<div>state</div><div class="${stClass(d.state)}">${esc(d.state)}</div>`+
-      `<div>user</div><div>${esc(d.username||"")}</div>`+
-      `<div>roles</div><div>${esc((d.roles||[]).join(", "))}</div>`+
-      (d.clientIp?`<div>client ip</div><div>${esc(d.clientIp)}</div>`:"")+
-      `<div>queued</div><div>${ms(d.queuedMs)}</div>`+
-      `<div>planning</div><div>${ms(d.planningMs)}</div>`+
-      `<div>execution</div><div>${ms(d.executionMs)}</div>`+
-      `<div>rows out</div><div>${d.outputRows|0}</div>`+
-      `<div>bytes scanned</div><div>${fmtBytes(d.bytesScanned)}</div>`+
-      `<div>spill</div><div>${fmtBytes(d.spillBytes)}</div>`+
-      `<div>peak mem</div><div>${fmtBytes(d.peakMemoryBytes)}</div>`+
-      (d.errorMessage?`<div>error</div><div class=s-FAILED>${esc(d.errorMessage)}</div>`:"")+
+    det.innerHTML = `<a class=back href="#" onclick="closeDetail();return false">&larr; Back to ${tab==="history"?"history":"queries"}</a>`+
+      `<div class=crumb>Query${fallback && !d.fragments ? " · from the audit log" : ""}</div>`+
+      `<h1><span class=mono>${esc(d.queryId)}</span> ${pill(d.state)}</h1><div class=marker></div>`+
+      `<p class=summary>Run by <b>${esc(d.username||"unknown")}</b>`+
+      ((d.roles||[]).length?` as ${esc(d.roles.join(", "))}`:"")+
+      `; <b>${ms(tot)}</b> end to end, <b>${num(d.outputRows)}</b> rows out, <b>${esc(fmtBytes(d.bytesScanned))}</b> scanned.</p>`+
+      (d.errorMessage?banner("bad", `<span class=errbox>${esc(d.errorMessage)}</span>`):"")+
+      `<h2>Timing</h2>`+
+      `<div class=timing>`+
+        (q?`<i class=t-q style="width:${pct(q,tot)}%" data-tip="queued ${esc(ms(q))}"></i>`:"")+
+        (p?`<i class=t-p style="width:${pct(p,tot)}%" data-tip="planning ${esc(ms(p))}"></i>`:"")+
+        (x?`<i class=t-e style="width:${pct(x,tot)}%" data-tip="execution ${esc(ms(x))}"></i>`:"")+
       `</div>`+
-      `<pre style="white-space:pre-wrap;color:var(--mut)">sql (redacted): ${esc(d.sql||"")}\n\nsql hash: ${esc(d.sqlHash)}</pre>`+
-      (fr?`<h4>fragments</h4><table><thead><tr><th>task</th><th>worker</th><th>state</th>`+
-        `<th class=num>elapsed</th><th class=num>rows</th></tr></thead><tbody>${fr}</tbody></table>`:"");
+      `<div class=hist-legend><span><i class="sw t-q"></i>Queued ${ms(q)}</span>`+
+      `<span><i class="sw t-p"></i>Planning ${ms(p)}</span><span><i class="sw t-e"></i>Execution ${ms(x)}</span></div>`+
+      `<h2>Resources</h2>`+
+      `<div class=kv>`+
+        kv("User", esc(d.username||"")) + kv("Roles", esc((d.roles||[]).join(", "))||"&mdash;")+
+        (d.clientIp?kv("Client IP", esc(d.clientIp)):"")+
+        kv("Rows out", num(d.outputRows)) + kv("Bytes scanned", esc(fmtBytes(d.bytesScanned)))+
+        kv("Spill", esc(fmtBytes(d.spillBytes))) + kv("Peak memory", esc(fmtBytes(d.peakMemoryBytes)))+
+      `</div>`+
+      `<h2>SQL (redacted)</h2>`+
+      `<pre class=sql>${esc(d.sql||"")}\n\n<span class=hash>sql hash ${esc(d.sqlHash)}</span></pre>`+
+      (fr?`<h2>Fragments</h2><div class=tablewrap><table><thead><tr><th>Task</th><th>Worker</th><th>State</th>`+
+        `<th class=num>Elapsed</th><th class=num>Rows</th></tr></thead><tbody>${fr}</tbody></table></div>`:"");
   } catch(e){ showErr(e); }
 }
 function closeDetail(){ current=null; $("#detail").classList.add("hidden");
   switchTab(tab); if(tab==="history") drawHistory(); }
 
+// ── Cluster ──────────────────────────────────────────────────────────────────
+const WCOLS = [
+  {k:"url", l:"Worker"}, {k:"healthy", l:"Health", get:w=>w.healthy?1:0},
+  {k:"inFlight", l:"In-flight fragments", n:true},
+];
+let lastW = null;
 async function renderCluster(){
   try {
     const [w,st] = await Promise.all([getJSON("/api/v1/workers"), getJSON("/api/v1/status/detail")]);
     clearErr();
-    $("#meta").textContent = `${st.node.role} v${st.node.version} · up ${st.node.uptimeSeconds}s`;
-    // nosemgrep: opt.aikido.semgrep-rules.html.security.audit.insecure-document-method -- all interpolations pass through esc()
-    $("#cluster").innerHTML =
-      `<div class=kv><div>workers</div><div>${w.healthyCount|0}/${w.total|0} healthy</div>`+
-      `<div>active queries</div><div>${w.activeQueries|0}</div></div>`+
-      "<table><thead><tr><th>worker</th><th>healthy</th><th class=num>in-flight</th></tr></thead><tbody>"+
-      (w.workers||[]).map(x=>`<tr><td>${esc(x.url)}</td><td>${x.healthy?"yes":"no"}</td>`+
-        `<td class=num>${x.inFlight|0}</td></tr>`).join("")+"</tbody></table>";
+    $("#meta").textContent = `${st.node.role} v${st.node.version} · up ${fmtDur(st.node.uptimeSeconds)}`;
+    lastW = w; drawCluster();
   } catch(e){ showErr(e); }
+}
+function drawCluster(){
+  if(current!==null || !lastW) return;
+  const w = lastW, list = sortRows("w", w.workers||[], WCOLS);
+  const down = (w.total|0) - (w.healthyCount|0);
+  const maxIn = Math.max(0, ...list.map(x=>x.inFlight|0));
+  // nosemgrep: opt.aikido.semgrep-rules.html.security.audit.insecure-document-method -- all interpolations pass through esc()
+  $("#cluster").innerHTML =
+    `<div class=crumb>Engine</div><h1>Cluster</h1><div class=marker></div>`+
+    `<p class=summary><b>${num(w.healthyCount)}</b> of <b>${num(w.total)}</b> workers healthy, `+
+    `<b>${num(w.activeQueries)}</b> ${(w.activeQueries|0)===1?"query":"queries"} active. Workers scan and stream Arrow back; joins, aggregates and sorts run on the coordinator.</p>`+
+    (down>0?banner("bad", `<b>${num(down)}</b> ${down===1?"worker is":"workers are"} unhealthy.`):"")+
+    `<div class=strip style="margin-bottom:1rem">`+
+      `<div><span class=lbl>Workers</span><span class=val>${num(w.total)}</span></div>`+
+      `<div><span class=lbl>Healthy</span><span class="val">${num(w.healthyCount)}</span></div>`+
+      `<div><span class=lbl>Unhealthy</span><span class="val ${down>0?"bad":""}">${num(down)}</span></div>`+
+      `<div><span class=lbl>Active queries</span><span class=val>${num(w.activeQueries)}</span></div>`+
+    `</div>`+
+    `<div class=tablewrap><table>${thead("w", WCOLS)}<tbody>`+
+    (list.length ? list.map(x=>`<tr><td class=sqlc>${esc(x.url)}</td>`+
+      `<td>${x.healthy?'<span class="pill s-HEALTHY">healthy</span>':'<span class="pill s-DOWN">unhealthy</span>'}</td>`+
+      barCell(num(x.inFlight), x.inFlight|0, maxIn)+`</tr>`).join("")
+      : `<tr><td colspan=3 class=empty>No workers registered.</td></tr>`)+
+    "</tbody></table></div>";
 }
 
 function switchTab(t){
