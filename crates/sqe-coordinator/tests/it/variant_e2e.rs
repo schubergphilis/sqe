@@ -578,7 +578,7 @@ async fn rewrite_data_files_preserves_variant_values() {
 
 /// The row groups of every data file of `table` (in `default`), and the
 /// largest file's size.
-async fn row_groups(
+pub(crate) async fn row_groups(
     handler: &sqe_coordinator::QueryHandler,
     session: &sqe_core::Session,
     table: &str,
@@ -606,7 +606,7 @@ async fn row_groups(
 }
 
 /// The scan's output rows in `EXPLAIN ANALYZE sql`.
-async fn scan_output_rows(
+pub(crate) async fn scan_output_rows(
     handler: &sqe_coordinator::QueryHandler,
     session: &sqe_core::Session,
     sql: &str,

@@ -239,7 +239,7 @@ ALTER TABLE places ADD COLUMN footprint GEOMETRY(3857);
 - **The table becomes format-version 3.** `ALTER TABLE ... ADD COLUMN` with a geospatial type is refused on a V2 table. CTAS from a geospatial table keeps the types.
 - **Top-level columns only.** A geospatial type inside a `STRUCT`, `ARRAY` or `MAP` is refused.
 - **Functions.** The `ST_*` functions read and build these values; see [Geospatial](./geospatial.md).
-- **Not yet:** pruning on the bounding box.
+- **Pruning.** An `ST_*` predicate on a `GEOMETRY` column prunes files and row groups on the bounding box; see [Geospatial](./geospatial.md).
 
 ## What CREATE / ALTER does NOT cover
 
