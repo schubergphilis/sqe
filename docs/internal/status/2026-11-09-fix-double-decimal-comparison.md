@@ -18,7 +18,16 @@ Fixes the decimal-vs-double coercion found during #870 (stacked on
   - `CASE` results and `coalesce`, `nvl`, `ifnull`, `nullif`, `greatest`,
     `least`, `make_array` (also `[a, b]`), `nvl2` (not its first argument);
   - `UNION` columns: a decimal input is read through a projection that casts
-    the column, then `Union::try_new_with_loose_types`.
+    the column, then `Union::try_new_with_loose_types`;
+  - `VALUES` columns. The planner (`LogicalPlanBuilder::values` ->
+    `type_union_resolution`) fixes the column type and casts each row
+    before any analyzer rule runs. The rule strips a row's cast to the
+    column type, replays that inference on the rows as written, and
+    retypes the column to the float only when the replay lands on the
+    column type again, so an `INSERT` target type is never touched. The
+    planner's cast and a user's `CAST` are the same expression: a row cast
+    by hand to exactly the inferred decimal (`DECIMAL(30,15)` for a double)
+    is read as the double it came from.
   Decimal vs decimal and decimal vs integer are untouched. Arithmetic
   already gives Float64 in DataFusion.
 - `decimal_arithmetic.rs`: `type_plan` generalised to
@@ -31,7 +40,9 @@ Fixes the decimal-vs-double coercion found during #870 (stacked on
 
 ## Tests
 
-- `cargo test -p sqe-catalog --lib` -> 797 passed; new
+- `cargo test -p sqe-catalog --lib` -> 798 passed; new
+  `values_keep_decimals_that_were_not_inferred` (decimal-only rows, a cast
+  to another decimal, `INSERT` into a decimal column),
   `doubles_compare_with_decimals_in_floating_point`,
   `doubles_meet_decimals_as_doubles` (checks the executed type is Float64;
   `df.schema()` is the pre-coercion type) and
@@ -43,16 +54,4 @@ Fixes the decimal-vs-double coercion found during #870 (stacked on
   overflows its stack with this rule disabled too, so the overflow was
   already there.
 
-## Found, not fixed here
-
-- `VALUES` rows mixing a double and a decimal:
-  `SELECT * FROM (VALUES (CAST('NaN' AS DOUBLE)), (1.5)) v(c)` fails with
-  `Cannot cast to Decimal128(30, 15). Overflowing on NaN`. The planner
-  (`LogicalPlanBuilder::values` -> `type_union_resolution`, `builder.rs:333`)
-  fixes the column type and casts each row before any analyzer rule runs,
-  so the rule cannot see it. In the analyzer, the planner's cast cannot be
-  told apart from a user's `CAST(x AS DECIMAL(30,15))`; the fix belongs in
-  the planner (DataFusion upstream, or a `TypePlanner`-level hook).
-
-**NEXT:** file the `VALUES` double/decimal issue, then typed read of
-shredded variants (#870).
+**NEXT:** typed read of shredded variants (#870).

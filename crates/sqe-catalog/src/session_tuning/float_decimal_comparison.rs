@@ -13,7 +13,7 @@
 //!   `IN (..)`, `IN (SELECT ..)` and the `CASE x WHEN ..` operand,
 //! - the results of `CASE` and of `coalesce`, `nvl`, `ifnull`, `nullif`,
 //!   `nvl2`, `greatest`, `least` and `make_array` (`[a, b]`),
-//! - the columns of a `UNION`.
+//! - the columns of a `UNION` and of a `VALUES` list.
 //!
 //! Arithmetic already takes the float type in DataFusion.
 
@@ -22,12 +22,13 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TransformedResult};
-use datafusion::common::{Column, DFSchema};
+use datafusion::common::{Column, DFSchema, DFSchemaRef};
 use datafusion::error::Result;
 use datafusion::logical_expr::expr::{Case, InList, InSubquery, ScalarFunction};
 use datafusion::logical_expr::expr_schema::cast_subquery;
+use datafusion::logical_expr::type_coercion::binary::type_union_resolution;
 use datafusion::logical_expr::{
-    cast, Between, BinaryExpr, Expr, LogicalPlan, Operator, Projection, Union,
+    cast, Between, BinaryExpr, Expr, LogicalPlan, Operator, Projection, Union, Values,
 };
 use datafusion::optimizer::AnalyzerRule;
 
@@ -41,7 +42,9 @@ pub struct FloatOverDecimalRule;
 impl AnalyzerRule for FloatOverDecimalRule {
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
         plan.transform_up_with_subqueries(|plan| {
-            rewrite_plan_exprs(plan, float_node)?.transform_data(union_as_float)
+            rewrite_plan_exprs(plan, float_node)?
+                .transform_data(union_as_float)?
+                .transform_data(values_as_float)
         })
         .data()
     }
@@ -251,6 +254,98 @@ fn union_as_float(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     )))
 }
 
+/// A `VALUES` column whose rows mix a float and a decimal. The SQL planner
+/// fixes the column type and casts every row to it before any analyzer
+/// rule runs, so this undoes that: a row's cast to the column type is
+/// stripped, the planner's inference is replayed on the rows as written,
+/// and only when it lands on the column's type again (the type was
+/// inferred, not taken from an `INSERT` target) is the column retyped to
+/// the float.
+///
+/// The planner's cast and a user's `CAST` build the same expression, so a
+/// row the user cast to exactly the inferred decimal (`CAST(d AS
+/// DECIMAL(30,15))` next to `1.5` for a double `d`) is read as the double
+/// it was cast from. A cast to any other decimal type is kept.
+fn values_as_float(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+    let LogicalPlan::Values(Values { schema, mut values }) = plan else {
+        return Ok(Transformed::no(plan));
+    };
+    let empty = DFSchema::empty();
+    let mut fields: Vec<_> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+    let mut transformed = false;
+    for (j, field) in fields.iter_mut().enumerate() {
+        let column = field.data_type().clone();
+        if !is_decimal(&column) {
+            continue;
+        }
+        let written: Vec<&Expr> = values
+            .iter()
+            .map(|row| as_written(&row[j], &column))
+            .collect();
+        let Some(types) = written
+            .iter()
+            .map(|e| coerced_type(e, &empty))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        let Some(float) = widest_float(types.iter()) else {
+            continue;
+        };
+        // `LogicalPlanBuilder::infer_data`: a pairwise fold that skips NULL.
+        let inferred = types
+            .iter()
+            .filter(|t| **t != DataType::Null)
+            .try_fold(None::<DataType>, |common, t| match common {
+                None => Some(Some(t.clone())),
+                Some(c) => type_union_resolution(&[c, t.clone()]).map(Some),
+            })
+            .flatten();
+        if inferred.as_ref() != Some(&column) {
+            continue;
+        }
+        for (row, t) in values.iter_mut().zip(&types) {
+            let e = as_written(&row[j], &column).clone();
+            row[j] = if *t == float {
+                e
+            } else {
+                cast(e, float.clone())
+            };
+        }
+        *field = field.clone().with_data_type(float);
+        transformed = true;
+    }
+    if !transformed {
+        return Ok(Transformed::no(LogicalPlan::Values(Values {
+            schema,
+            values,
+        })));
+    }
+    let qualified = schema
+        .iter()
+        .zip(fields)
+        .map(|((q, _), f)| (q.cloned(), Arc::new(f)))
+        .collect();
+    let schema = DFSchemaRef::new(DFSchema::new_with_metadata(
+        qualified,
+        schema.metadata().clone(),
+    )?);
+    Ok(Transformed::yes(LogicalPlan::Values(Values {
+        schema,
+        values,
+    })))
+}
+
+/// A `VALUES` row as written: without the planner's cast to the column
+/// type. A typed NULL literal the planner put in place of `NULL` is kept;
+/// its decimal type does not count against the float.
+fn as_written<'a>(e: &'a Expr, column: &DataType) -> &'a Expr {
+    match e {
+        Expr::Cast(c) if c.field.data_type() == column => &c.expr,
+        e => e,
+    }
+}
+
 fn is_comparison(op: Operator) -> bool {
     matches!(
         op,
@@ -430,9 +525,58 @@ mod tests {
             let (got, ty) = rows(&ctx, sql).await;
             assert_eq!((got.as_str(), ty.as_str()), (want, "Float64"), "{sql}");
         }
+        for (sql, want) in [
+            (
+                "SELECT c FROM (VALUES (CAST('NaN' AS DOUBLE)), (1.5)) v(c) ORDER BY 1",
+                "1.5,NaN",
+            ),
+            (
+                "SELECT c FROM (VALUES (1.5), (NULL), (CAST('NaN' AS DOUBLE))) v(c) \
+                 WHERE c IS NOT NULL ORDER BY 1",
+                "1.5,NaN",
+            ),
+            ("VALUES (1.5), (CAST('NaN' AS DOUBLE))", "1.5,NaN"),
+            (
+                "SELECT d FROM t WHERE id = 2 UNION ALL VALUES (0.5) ORDER BY 1",
+                "0.5,NaN",
+            ),
+        ] {
+            let (got, ty) = rows(&ctx, sql).await;
+            assert_eq!((got.as_str(), ty.as_str()), (want, "Float64"), "{sql}");
+        }
         let (got, ty) = rows(&ctx, "SELECT [d, 0.5] FROM t WHERE id = 2").await;
         assert_eq!(got, "[NaN, 0.5]");
         assert!(ty.contains("Float64"), "{ty}");
+    }
+
+    /// A `VALUES` column keeps the type the rows or an `INSERT` target give
+    /// it when no float meets a decimal by inference.
+    #[tokio::test]
+    async fn values_keep_decimals_that_were_not_inferred() {
+        let ctx = ctx();
+        for (sql, want, ty) in [
+            ("VALUES (1.5), (2.25)", "1.50,2.25", "Decimal128(3, 2)"),
+            (
+                "SELECT c FROM (VALUES (CAST(CAST(1.5 AS DOUBLE) AS DECIMAL(38,10))), (2.5)) v(c)",
+                "1.5000000000,2.5000000000",
+                "Decimal128(38, 10)",
+            ),
+        ] {
+            let (got, got_ty) = rows(&ctx, sql).await;
+            assert_eq!((got.as_str(), got_ty.as_str()), (want, ty), "{sql}");
+        }
+        ctx.sql("CREATE TABLE x (c DECIMAL(10,2))").await.unwrap();
+        ctx.sql("INSERT INTO x VALUES (CAST(1.5 AS DOUBLE)), (2.5)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let (got, ty) = rows(&ctx, "SELECT c FROM x ORDER BY c").await;
+        assert_eq!(
+            (got.as_str(), ty.as_str()),
+            ("1.50,2.50", "Decimal128(10, 2)")
+        );
     }
 
     /// The decimal side is cast, so the column stays bare and the filter
