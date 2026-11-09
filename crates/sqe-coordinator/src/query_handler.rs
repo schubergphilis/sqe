@@ -2584,7 +2584,7 @@ impl QueryHandler {
                             // Without this a Hive CTAS from read_parquet
                             // failed with "the table function was not
                             // prepared before planning".
-                            let (load_ctx, _) = self.create_session_context(session).await?;
+                            let (load_ctx, _) = self.write_session_context(session, quota).await?;
                             let written = crate::hive_write::handle_insert(
                                 &load_ctx,
                                 &load_stmt,
@@ -2622,7 +2622,7 @@ impl QueryHandler {
                             // The post-commit cache invalidation moved with it
                             // (`WriteHandler::after_commit`, 507).
                             let select_sql = sqe_sql::rewrite_named_tvf_args(&format!("{query}"));
-                            let (ctx, _) = self.create_session_context(session).await?;
+                            let (ctx, _) = self.write_session_context(session, quota).await?;
                             self.write_handler
                                 .handle_ctas_streaming(
                                     session,
@@ -2669,7 +2669,7 @@ impl QueryHandler {
                                 self.hive_ddl_handler
                                     .refuse_write_if_denied(session, &hive_ref, "INSERT")
                                     .await?;
-                                let (ctx, _) = self.create_session_context(session).await?;
+                                let (ctx, _) = self.write_session_context(session, quota).await?;
                                 let written = crate::hive_write::handle_insert(
                                     &ctx,
                                     stmt,
@@ -2720,7 +2720,7 @@ impl QueryHandler {
                             .ok_or_else(|| {
                                 SqeError::with_code(SqeErrorCode::ExecutionFailed, "INSERT without SELECT source")
                             })?;
-                        let (ctx, _) = self.create_session_context(session).await?;
+                        let (ctx, _) = self.write_session_context(session, quota).await?;
                         self.write_handler
                             .handle_insert_streaming(
                                 session,
@@ -2748,7 +2748,7 @@ impl QueryHandler {
                     if let Ok(name) = crate::write_handler::delete_target_object_name(stmt) {
                         self.reject_if_hive_table(session, &table_reference_of(name), "DELETE", 0)?;
                     }
-                    let (ctx, session_catalog) = self.create_session_context(session).await?;
+                    let (ctx, session_catalog) = self.write_session_context(session, quota).await?;
                     // Dispatch on `write.delete.mode` table property. Default CoW
                     // matches prior behaviour; `merge-on-read` routes to position
                     // or equality deletes depending on declared primary key.
@@ -2768,7 +2768,7 @@ impl QueryHandler {
                     if let Ok(name) = crate::write_handler::update_target_object_name(stmt) {
                         self.reject_if_hive_table(session, &table_reference_of(name), "UPDATE", 0)?;
                     }
-                    let (ctx, session_catalog) = self.create_session_context(session).await?;
+                    let (ctx, session_catalog) = self.write_session_context(session, quota).await?;
                     // Dispatch on `write.update.mode` table property. Default CoW
                     // matches prior behaviour; `merge-on-read` routes to the
                     // equality-delete path when the table has a declared PK.
@@ -2899,7 +2899,7 @@ impl QueryHandler {
                     let delete_sql = format!("DELETE FROM {table_name}");
                     let delete_kind = sqe_sql::parse_and_classify(&delete_sql)?;
                     if let StatementKind::Delete(delete_stmt) = delete_kind {
-                        let (ctx, session_catalog) = self.create_session_context(session).await?;
+                        let (ctx, session_catalog) = self.write_session_context(session, quota).await?;
                         // Route through dispatch so OL lineage capture covers
                         // TRUNCATE the same way it covers a normal DELETE.
                         self.write_handler
@@ -3113,7 +3113,7 @@ impl QueryHandler {
                     } else {
                         return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, "Expected MERGE statement"));
                     };
-                    let (ctx, session_catalog) = self.create_session_context(session).await?;
+                    let (ctx, session_catalog) = self.write_session_context(session, quota).await?;
                     // Capture the MERGE source plan from `execute_query`. The
                     // lineage for a MERGE event should describe the source's
                     // TableScans as inputs and the target as the output, so
@@ -5773,6 +5773,24 @@ impl QueryHandler {
             &self.secrets,
         )
         .await
+    }
+
+    /// [`Self::create_session_context`] under the statement's quota, for the
+    /// write paths (#788). Every write buffer (`TrackedBatchBuffer`,
+    /// `WriteReservation`, the fan-out writer) and the SELECT feeding a
+    /// CTAS/INSERT reserve from the context's pool, so without the wrap a
+    /// write could take the whole coordinator pool where a read is held to
+    /// `query.max_query_memory`.
+    async fn write_session_context(
+        &self,
+        session: &Session,
+        quota: crate::query_memory::QueryQuota,
+    ) -> sqe_core::Result<(SessionContext, Arc<SessionCatalog>)> {
+        let (ctx, catalog) = self.create_session_context(session).await?;
+        Ok((
+            crate::query_memory::with_query_quota(ctx, quota, self.unspillable_headroom_percent),
+            catalog,
+        ))
     }
 
     /// Revalidate every physical Iceberg table behind a cached query result.

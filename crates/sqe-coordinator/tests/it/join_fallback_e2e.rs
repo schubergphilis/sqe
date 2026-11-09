@@ -266,3 +266,72 @@ async fn explain_analyze_reports_the_fallback_plan() {
         );
     }
 }
+
+/// A Parquet Hive table `lake.t.out(k, s)` in a fresh directory, for the
+/// write tests. The directory lives as long as the returned guard.
+async fn output_table(f: &Fixture) -> tempfile::TempDir {
+    let out = tempfile::tempdir().expect("tempdir");
+    f.handler
+        .execute(
+            &f.session,
+            &format!(
+                "CREATE EXTERNAL TABLE lake.t.out (k BIGINT, s BIGINT) \
+                 STORED AS PARQUET LOCATION 'file://{}'",
+                out.path().display()
+            ),
+            None,
+        )
+        .await
+        .expect("create the output table");
+    out
+}
+
+const INSERT_SQL: &str =
+    "INSERT INTO lake.t.out SELECT a.k, a.x + b.y FROM lake.t.a a JOIN lake.t.b b ON a.k = b.k";
+
+/// #788: a write ran on the shared coordinator pool, outside
+/// `max_query_memory`: the join a SELECT cannot run under the cap completed
+/// when it fed an INSERT.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_runs_under_the_query_cap() {
+    let f = fixture(false).await;
+    let _out = output_table(&f).await;
+    let err = f
+        .handler
+        .execute(&f.session, INSERT_SQL, None)
+        .await
+        .expect_err("the INSERT's hash build must hit the query cap");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("query.max_query_memory"),
+        "expected a refusal naming the query cap, got: {msg}"
+    );
+    // The same code a read over the cap returns.
+    assert_eq!(
+        err.error_code(),
+        sqe_core::SqeErrorCode::ResourceExhausted,
+        "{msg}"
+    );
+}
+
+/// The control for [`a_write_runs_under_the_query_cap`]: without the cap
+/// the same INSERT writes every row, so the refusal above is the cap's.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_same_write_completes_without_the_cap() {
+    let f = fixture_with(|config| {
+        config.query.join_fallback = false;
+        config.query.max_query_memory = "0".to_string();
+    })
+    .await;
+    let _out = output_table(&f).await;
+    f.handler
+        .execute(&f.session, INSERT_SQL, None)
+        .await
+        .expect("the uncapped INSERT completes");
+    let batches = f
+        .handler
+        .execute(&f.session, "SELECT COUNT(*), SUM(s) FROM lake.t.out", None)
+        .await
+        .expect("read back the output");
+    assert_eq!(answer(&batches), expected());
+}

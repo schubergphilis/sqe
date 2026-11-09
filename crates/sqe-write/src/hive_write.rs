@@ -41,11 +41,17 @@ use sqe_core::{SqeError, SqeErrorCode};
 
 use crate::write_handler::check_batch_within_policy;
 
-fn exec_err(what: &str, e: impl std::fmt::Display) -> SqeError {
-    SqeError::with_code(
-        SqeErrorCode::ExecutionFailed,
-        format!("hive insert: {what}: {e}"),
-    )
+/// A memory refusal stays `ResourceExhausted`, as on the Iceberg write path,
+/// so a client can tell "over `query.max_query_memory`" from a failed
+/// statement (#788).
+fn exec_err(what: &str, e: datafusion::error::DataFusionError) -> SqeError {
+    let code = match e.find_root() {
+        datafusion::error::DataFusionError::ResourcesExhausted(_) => {
+            SqeErrorCode::ResourceExhausted
+        }
+        _ => SqeErrorCode::ExecutionFailed,
+    };
+    SqeError::with_code(code, format!("hive insert: {what}: {e}"))
 }
 
 /// One-row `count` result, matching what the Iceberg insert path returns so a
