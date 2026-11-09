@@ -4,8 +4,8 @@ SQE serves a read-only web dashboard on the coordinator's health port
 (`metrics_port + 1`, default `9091`). It shows the queries the engine is running
 and has run, per-query timing and fragments, the cluster nodes, and live engine
 metrics. The data comes from the coordinator's in-memory query tracker and
-worker registry. The page adds no new instrumentation and never touches the
-query path.
+worker registry, and for the History tab also from the native audit log. The
+page adds no new instrumentation and never touches the query path.
 
 ![SQE web UI: the Overview dashboard](../images/sqe-web-ui-overview.png)
 
@@ -47,8 +47,9 @@ on the metrics port is also ungated. Keep the metrics and health ports on an
 internal network.
 
 The UI is strictly read-only. It cannot submit queries, cancel them, or change
-configuration. The query-detail endpoint omits session id, client IP, and roles
-so a leaked admin token still exposes less session metadata.
+configuration. The query endpoints carry the user, roles and client IP, and SQL
+text and error messages pass through the audit log's PII redaction first; the
+session id is never exposed.
 
 ## Tabs
 
@@ -61,6 +62,17 @@ so a leaked admin token still exposes less session metadata.
   and bytes scanned. Click a row for the detail: the queue, planning, and
   execution timing, the rows/bytes/spill/peak-memory totals, and the
   per-fragment breakdown showing which worker ran each fragment.
+- **History** lists finished queries (finished, failed or canceled), newest end
+  time first, 50 per page with a **Load more** button. It reads the tracker and
+  the native audit log, rotated generations included, so it reaches past the
+  tracker's TTL and across coordinator restarts, the same rows
+  `system.runtime.query_history` returns (see
+  [Query history from the log](audit-logging.md#query-history-from-the-log)).
+  Pick the window (last hour up to the whole log) and a state filter at the
+  top; the tab does not auto-refresh, so press **Refresh** for new queries. A
+  query only the log still holds opens with its row data: the log keeps no
+  fragments. Without a native audit log (`metrics.audit_log_path` unset, or
+  `format = "ocsf"`) the tab shows the tracker's finished queries only.
 - **Cluster** shows the worker nodes with health and in-flight load. In
   single-node mode the coordinator lists itself as one node doing both roles.
 
@@ -76,6 +88,7 @@ are stable and safe to scrape directly:
 |---|---|
 | `GET /api/v1/overview` | node, capabilities, resources, metrics |
 | `GET /api/v1/queries?state=<running\|finished\|failed\|all>&limit=<n>` | recent queries, newest first |
+| `GET /api/v1/queries/history?since=<rfc3339>&state=<finished\|failed\|canceled\|all>&limit=<n>&before=<cursor>` | `{items, nextBefore}`: one page of finished queries from the tracker and the audit log, newest end first; `limit` defaults to 50 (max 1000); pass `nextBefore` as `before` for the next page |
 | `GET /api/v1/queries/{id}` | one query plus its fragments (404 if unknown) |
 | `GET /api/v1/workers` | worker nodes with health and in-flight load |
 | `GET /api/v1/metrics/history` | time-bucketed series for the charts |

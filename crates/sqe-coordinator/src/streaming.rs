@@ -1054,6 +1054,7 @@ mod tests {
         Arc::new(QueryTracker::new(&QueryHistoryConfig {
             max_entries: 128,
             ttl_secs: 60,
+            ..QueryHistoryConfig::default()
         }))
     }
 

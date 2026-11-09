@@ -532,6 +532,7 @@ mod tests {
         QueryHistoryConfig {
             max_entries: 100,
             ttl_secs: 60,
+            ..QueryHistoryConfig::default()
         }
     }
 
@@ -991,6 +992,7 @@ mod tests {
         let config = QueryHistoryConfig {
             max_entries: 100,
             ttl_secs: 1,
+            ..QueryHistoryConfig::default()
         };
         let tracker = QueryTracker::new(&config);
         let id = Uuid::now_v7();
@@ -1041,6 +1043,7 @@ mod tests {
         let config = QueryHistoryConfig {
             max_entries: 5,
             ttl_secs: 60,
+            ..QueryHistoryConfig::default()
         };
         let tracker = QueryTracker::new(&config);
 

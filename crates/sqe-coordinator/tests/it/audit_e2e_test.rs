@@ -880,6 +880,7 @@ async fn streaming_select_emits_canonical_query_event() {
     let tracker = Arc::new(QueryTracker::new(&QueryHistoryConfig {
         max_entries: 128,
         ttl_secs: 60,
+        ..QueryHistoryConfig::default()
     }));
 
     let dir = tempfile::tempdir().unwrap();

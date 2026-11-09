@@ -627,7 +627,8 @@ pub async fn create_session_context(
             .with_owner_filter(
                 (!config.auth.has_admin_role(&session.user.roles))
                     .then(|| session.user.username.clone()),
-            ));
+            )
+            .with_audit_history(crate::system_runtime::audit_history_source(config)));
             // Enumerate every reachable catalog (config catalogs + the session's
             // own discovered catalog) so `system.jdbc.*` / `system.metadata.*`
             // see all of them, not just the default. (#5)

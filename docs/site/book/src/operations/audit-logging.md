@@ -236,6 +236,43 @@ coordinator do not count towards it. With `max_query_memory = 0` the query has
 no quota and the field is 0. The same value is the `peak_memory_bytes` column of
 `system.runtime.queries`.
 
+### Query history from the log
+
+`system.runtime.queries` reads the coordinator's in-memory tracker, so a query
+drops out of it after `[query_history] ttl_secs` or `max_entries`, and a restart
+empties it. `system.runtime.query_history` has the same columns and adds the
+finished queries in the native audit log, so they stay visible after the TTL and
+after a restart:
+
+```sql
+SELECT query_id, state, "end", query
+FROM system.runtime.query_history
+WHERE "end" >= now() - INTERVAL '7' DAY AND state = 'FAILED';
+```
+
+- A filter on `end` or `created` picks which part of the log is read, rotated
+  generations included. Without one, the last `[query_history] lookback_secs`
+  (default 86400, one day) is read. One scan returns at most the newest
+  100000 audited queries.
+- The log is read newest first. A binary search on the line timestamps finds
+  where the window ends, and the read stops at the window start or once it
+  has the rows it needs, so a short window costs about the same however much
+  log lies behind it. On a week of log (about a million queries in six
+  256 MiB generations) a one-hour window reads in about 25 ms and the whole
+  week, capped at 100000 rows, in about 270 ms. A 50-row page of the web UI
+  takes under 1 ms for the newest queries and about 3 ms five days back.
+- The web UI's History tab pages through the same rows; see
+  [Web UI](web-ui.md).
+- A query still in the tracker is shown once, from the tracker; a running query
+  appears only there.
+- Rows from the log carry the audit event's timing, state (`FINISHED`, `FAILED`
+  or `CANCELED`), error class and message, client label and scan stats.
+  `fragments` is empty. With `omit_query_text` the `query` column is empty.
+- Non-admin users see only their own queries, as in `system.runtime.queries`.
+- The table reads the native format. With `format = "ocsf"` it shows the
+  tracker's queries only and logs a warning once; use `"both"` to keep the
+  history. Deleted generations (`max_files`, `min_free_bytes`) are gone from it.
+
 ## Tamper-evident hash chain
 
 Every record carries an `integrity` block:

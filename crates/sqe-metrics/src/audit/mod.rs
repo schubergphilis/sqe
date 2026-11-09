@@ -5,6 +5,7 @@
 mod chain;
 mod event;
 pub mod export;
+mod history;
 mod logger;
 mod ocsf;
 mod redact;
@@ -18,6 +19,7 @@ pub use event::{
     QueryInfo, QueryStats, Resource, Timing, TransactionAudit,
 };
 pub use export::SeqCursor;
+pub use history::read_query_events;
 pub use logger::{
     default_audit_queue_capacity, query_fingerprint, query_hash, rotated_audit_files, AuditEntry,
     AuditFailMode, AuditLogger, AuditLoggerOptions, AuditPrivacy, AuditRotation, AuditWriteError,
