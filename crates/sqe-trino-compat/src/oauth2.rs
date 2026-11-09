@@ -193,24 +193,95 @@ pub async fn delete_token_handler(
     StatusCode::NO_CONTENT
 }
 
-const SUCCESS_HTML: &str = r#"<!DOCTYPE html>
-<html><head><title>SQE — Authentication Complete</title></head>
-<body style="font-family:system-ui;text-align:center;padding:60px">
-<h2>Authentication successful</h2>
-<p>You can close this tab and return to your application.</p>
-</body></html>"#;
+/// Shared head for the two callback pages, in the coordinator web UI's design
+/// (navy band, yellow marker, state pill; light or dark from the OS). Static:
+/// no engine value is interpolated, and there are no external requests.
+macro_rules! callback_page {
+    ($title:literal, $state:literal, $pill:literal, $heading:literal, $body:literal) => {
+        concat!(
+            r#"<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>SQE · "#,
+            $title,
+            r#"</title>
+<style>
+:root{--bg:#F3F6FB;--surface:#FFFFFF;--line:#DCE6F2;--text:#020C17;--text-2:#5A6782;
+--marker:#FFDB4E;--head-bg:#082646;--head-mut:#AACBEF;
+--ok:#0E8A61;--ok-soft:#DCF4EA;--bad:#C92A62;--bad-soft:#FDE6EE;
+--font:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+@media (prefers-color-scheme:dark){:root{--bg:#030B16;--surface:#071628;--line:#15304D;
+--text:#E6EEF8;--text-2:#93A6C0;--head-bg:#030B16;--head-mut:#93A6C0;
+--ok:#4AD6A0;--ok-soft:#0C3529;--bad:#FF6F9C;--bad-soft:#3A1428}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 var(--font)}
+header{background:var(--head-bg);color:#fff;padding:.75rem 1.5rem .8rem;border-bottom:1px solid var(--line)}
+.eyebrow{font-family:var(--mono);font-size:10.5px;font-weight:700;letter-spacing:.06em;
+text-transform:uppercase;color:var(--head-mut)}
+.wordmark{font-size:20px;font-weight:900;line-height:1;margin-top:.2rem}
+.wm-marker{width:40px;height:3px;background:var(--marker);margin-top:.45rem}
+main{max-width:560px;margin:3rem auto;padding:0 1rem}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:1.5rem 1.6rem}
+.pill{display:inline-flex;align-items:center;gap:.35rem;padding:.05rem .6rem;border-radius:999px;
+font-size:12px;font-weight:600;line-height:1.6}
+.pill::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+.ok{background:var(--ok-soft);color:var(--ok)}.bad{background:var(--bad-soft);color:var(--bad)}
+h1{margin:.6rem 0 0;font-size:22px;font-weight:800}
+.marker{width:56px;height:4px;background:var(--marker);margin:.5rem 0 .8rem}
+p{margin:0;color:var(--text-2)}
+</style></head>
+<body><header><div class="eyebrow">Sovereign Query Engine</div>
+<div class="wordmark">SQE</div><div class="wm-marker"></div></header>
+<main><div class="card"><span class="pill "#,
+            $state,
+            r#"">"#,
+            $pill,
+            r#"</span><h1>"#,
+            $heading,
+            r#"</h1><div class="marker"></div><p>"#,
+            $body,
+            r#"</p></div></main></body></html>"#
+        )
+    };
+}
 
-const FAILURE_HTML: &str = r#"<!DOCTYPE html>
-<html><head><title>SQE — Authentication Failed</title></head>
-<body style="font-family:system-ui;text-align:center;padding:60px">
-<h2>Authentication failed</h2>
-<p>Please close this tab and try again.</p>
-</body></html>"#;
+const SUCCESS_HTML: &str = callback_page!(
+    "Authentication complete",
+    "ok",
+    "Signed in",
+    "Authentication successful",
+    "You can close this tab and return to your application."
+);
+
+const FAILURE_HTML: &str = callback_page!(
+    "Authentication failed",
+    "bad",
+    "Not signed in",
+    "Authentication failed",
+    "Close this tab and try again from your application."
+);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn callback_pages_are_self_contained_html() {
+        for (page, heading, state) in [
+            (SUCCESS_HTML, "Authentication successful", "pill ok"),
+            (FAILURE_HTML, "Authentication failed", "pill bad"),
+        ] {
+            assert!(page.starts_with("<!DOCTYPE html>"));
+            assert!(page.ends_with("</html>"));
+            assert!(page.contains(heading));
+            assert!(page.contains(state));
+            // No external requests: the page may be served air-gapped.
+            assert!(!page.contains("http://") && !page.contains("https://"));
+        }
+    }
 
     #[test]
     fn token_poll_response_pending_serializes() {
