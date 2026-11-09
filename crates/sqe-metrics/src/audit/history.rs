@@ -526,7 +526,7 @@ mod tests {
     /// Prints the read time per window; run in release:
     /// `cargo test -p sqe-metrics --release --lib history_seven_day_read_time -- --ignored --nocapture`.
     #[test]
-    #[ignore = "perf: writes ~1.3 GB of audit log"]
+    #[ignore = "bench; writes ~1.3 GB of audit log"]
     fn history_seven_day_read_time() {
         use std::io::Write;
         const EVENTS: i64 = 1_008_000;
