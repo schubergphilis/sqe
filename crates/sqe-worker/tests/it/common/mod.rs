@@ -87,6 +87,7 @@ pub fn local_scan_task(object_keys: Vec<String>, file_sizes: Vec<u64>) -> ScanTa
         projection_fill: None,
         variant_prunes: None,
         delete_tasks: None,
+        geo_prunes: None,
         version: 1,
         morsel_id: None,
         row_group_start: None,

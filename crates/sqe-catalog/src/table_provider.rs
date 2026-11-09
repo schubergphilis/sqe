@@ -248,6 +248,10 @@ impl SqeTableProvider {
                 } else if crate::variant_prune::is_variant_prune_filter(f, &self.schema) {
                     // A shredded variant comparison prunes row groups (sqe#870).
                     TableProviderFilterPushDown::Inexact
+                } else if crate::geo_prune::is_geo_prune_filter(f, &self.schema) {
+                    // An ST_* predicate on a geometry column prunes files and
+                    // row groups by bounding box (sqe#863).
+                    TableProviderFilterPushDown::Inexact
                 } else {
                     TableProviderFilterPushDown::Unsupported
                 }
@@ -305,16 +309,23 @@ impl SqeTableProvider {
         // Shredded variant comparisons (sqe#870) prune row groups and stay out
         // of `df_filters`: those go to workers, which decode them without the
         // variant functions and would lose every other filter with them.
+        // Geometry ST_* predicates (sqe#863) likewise.
         let mut variant_prunes = Vec::new();
+        let mut geo_prunes = Vec::new();
         let filters: Vec<Expr> = filters
             .iter()
             .filter(|f| {
                 if expr_to_predicate::is_filter_pushdown_supported(f, Some(&self.schema)) {
                     return true;
                 }
-                match crate::variant_prune::VariantPrune::from_expr(f, &self.schema) {
+                if let Some(prune) = crate::variant_prune::VariantPrune::from_expr(f, &self.schema)
+                {
+                    variant_prunes.push(prune);
+                    return false;
+                }
+                match crate::geo_prune::GeoPrune::from_expr(f, &self.schema) {
                     Some(prune) => {
-                        variant_prunes.push(prune);
+                        geo_prunes.push(prune);
                         false
                     }
                     None => true,
@@ -338,7 +349,8 @@ impl SqeTableProvider {
             predicates,
             filters.to_vec(),
         )
-        .with_variant_prunes(variant_prunes);
+        .with_variant_prunes(variant_prunes)
+        .with_geo_prunes(geo_prunes);
         if let Some(sid) = self.snapshot_id {
             exec = exec.with_snapshot_id(sid);
         }

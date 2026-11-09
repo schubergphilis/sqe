@@ -297,9 +297,10 @@ fn assert_spark_types(described: &str, expected: &[(&str, &str)]) {
 }
 
 /// A Spark-written geospatial table scanned on a worker: the worker streams
-/// the WKB back over Flight with its GeoArrow tag, and a predicate on a
-/// geometry column reaches the worker without pruning a file on the
-/// geometry's bounding box. Runs against an in-process worker.
+/// the WKB back over Flight with its GeoArrow tag, an equality predicate on a
+/// geometry column reaches the worker, and an `ST_Intersects` predicate prunes
+/// the file whose Spark-written bounds miss it (#863). Runs against an
+/// in-process worker.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:polaris"]
 async fn spark_geospatial_table_scans_on_a_worker() {
@@ -352,6 +353,16 @@ async fn spark_geospatial_table_scans_on_a_worker() {
         &format!("SELECT id FROM {fq} WHERE g = X'{POINT_5_6}' ORDER BY id"),
     )
     .await;
+    // An ST_* predicate prunes on Spark's geometry bounds (#863): the
+    // coordinator drops the first INSERT's file, so the worker ships one row.
+    let shipped = worker.rows_sent();
+    let intersects = sqe_rows(
+        handler,
+        session,
+        &format!("SELECT id FROM {fq} WHERE ST_Intersects(g, ST_Point(5, 6))"),
+    )
+    .await;
+    let intersects_sent = worker.rows_sent() - shipped;
     let after = worker.do_gets();
     let _ = spark_sql(&format!("DROP TABLE IF EXISTS rest.{fq}"));
 
@@ -375,6 +386,15 @@ async fn spark_geospatial_table_scans_on_a_worker() {
         "the worker's rows of the geospatial table"
     );
     assert_eq!(filtered, vec!["3".to_string()], "filter on geometry");
+    assert_eq!(
+        intersects,
+        vec!["3".to_string()],
+        "ST_Intersects on geometry"
+    );
+    assert_eq!(
+        intersects_sent, 1,
+        "ST_Intersects did not prune the file outside Spark's geometry bounds"
+    );
     assert!(
         after > before,
         "the scan ran on the coordinator, not a worker: \

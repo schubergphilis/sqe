@@ -634,6 +634,16 @@ fn from_wkt(name: &str, text: &str) -> Result<Geometry> {
     Geometry::try_from(wkt).map_err(|e| invalid(&e))
 }
 
+/// The planar bounding box of a WKB value as `[xmin, ymin, xmax, ymax]`, or
+/// `None` for invalid WKB, an empty geometry or a non-finite coordinate.
+/// Scan pruning compares it with the bounding boxes in manifests and
+/// Parquet statistics (#863).
+pub fn wkb_bounding_box(bytes: &[u8]) -> Option<[f64; 4]> {
+    let rect = decode("wkb_bounding_box", bytes).ok()?.bounding_rect()?;
+    let corners = [rect.min().x, rect.min().y, rect.max().x, rect.max().y];
+    corners.iter().all(|c| c.is_finite()).then_some(corners)
+}
+
 /// Decode WKB into a `geo` geometry.
 fn decode(name: &str, bytes: &[u8]) -> Result<Geometry> {
     let wkb = wkb::reader::read_wkb(bytes)

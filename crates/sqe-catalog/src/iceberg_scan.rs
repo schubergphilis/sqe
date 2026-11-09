@@ -232,6 +232,26 @@ struct StaticScanPlan {
     /// Files dropped because their manifest variant bounds exclude a
     /// shredded variant comparison (sqe#870).
     variant_files_pruned: usize,
+    /// Files dropped because their manifest bounding box misses a geometry
+    /// `ST_*` predicate (sqe#863).
+    geo_files_pruned: usize,
+}
+
+/// Runs each pruner on what the previous one kept: the vendored scan builder
+/// takes one [`RowGroupPruner`].
+#[derive(Debug)]
+struct ChainedRowGroupPruner(Vec<Arc<dyn RowGroupPruner>>);
+
+impl RowGroupPruner for ChainedRowGroupPruner {
+    fn select(
+        &self,
+        metadata: &parquet::file::metadata::ParquetMetaData,
+        candidates: Vec<usize>,
+    ) -> Vec<usize> {
+        self.0
+            .iter()
+            .fold(candidates, |kept, pruner| pruner.select(metadata, kept))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -369,6 +389,10 @@ pub struct IcebergScanExec {
     /// each row group's statistics. Kept apart from `df_filters`: those are
     /// sent to workers, which decode them without the variant functions.
     variant_prunes: Arc<[crate::variant_prune::VariantPrune]>,
+    /// `ST_*` predicates on geometry columns (sqe#863), checked against the
+    /// manifest and row-group bounding boxes. Kept apart from `df_filters`
+    /// for the same reason as `variant_prunes`.
+    geo_prunes: Arc<[crate::geo_prune::GeoPrune]>,
 }
 
 /// Per-filter slot holding a dynamic filter's first sealed snapshot after
@@ -621,6 +645,7 @@ impl IcebergScanExec {
             split_assignments: Arc::new(tokio::sync::OnceCell::new()),
             sealed_filters: new_sealed_filter_cache(0),
             variant_prunes: Arc::from(Vec::new()),
+            geo_prunes: Arc::from(Vec::new()),
         }
     }
 
@@ -693,6 +718,16 @@ impl IcebergScanExec {
     pub fn with_variant_prunes(mut self, prunes: Vec<crate::variant_prune::VariantPrune>) -> Self {
         self.variant_prunes = Arc::from(prunes);
         // The prunes also drop files from the static plan.
+        self.static_plan = Arc::new(tokio::sync::OnceCell::new());
+        self.split_assignments = Arc::new(tokio::sync::OnceCell::new());
+        self
+    }
+
+    /// Prune files and row groups on `ST_*` predicates over geometry columns
+    /// by bounding box (sqe#863).
+    #[must_use = "with_geo_prunes consumes self; bind the returned scan"]
+    pub fn with_geo_prunes(mut self, prunes: Vec<crate::geo_prune::GeoPrune>) -> Self {
+        self.geo_prunes = Arc::from(prunes);
         self.static_plan = Arc::new(tokio::sync::OnceCell::new());
         self.split_assignments = Arc::new(tokio::sync::OnceCell::new());
         self
@@ -949,6 +984,16 @@ impl IcebergScanExec {
         crate::variant_prune::encode_prunes(&prunes)
             .map_err(|e| DataFusionError::External(Box::new(e)))
     }
+    /// The geometry bounding-box prunes (sqe#863) as scan-ticket bytes, field
+    /// ids resolved against the scanned snapshot, or `None` when there are
+    /// none. Workers have no `ST_*` functions to decode them as filters.
+    pub fn geo_prunes_wire(&self) -> DFResult<Option<Vec<u8>>> {
+        if self.geo_prunes.is_empty() {
+            return Ok(None);
+        }
+        let prunes = resolve_geo_prunes(&self.geo_prunes, &self.table, self.snapshot_id);
+        crate::geo_prune::encode_prunes(&prunes).map_err(|e| DataFusionError::External(Box::new(e)))
+    }
     pub fn pushed_down_filters(&self) -> &[Arc<dyn PhysicalExpr>] {
         &self.pushed_down_filters
     }
@@ -1033,6 +1078,7 @@ impl IcebergScanExec {
             split_assignments: self.split_assignments.clone(),
             sealed_filters,
             variant_prunes: self.variant_prunes.clone(),
+            geo_prunes: self.geo_prunes.clone(),
         }
     }
 
@@ -1107,9 +1153,10 @@ impl IcebergScanExec {
             }
         }
         let mut pruned_count = 0usize;
-        if !self.variant_prunes.is_empty() {
+        if !self.variant_prunes.is_empty() || !self.geo_prunes.is_empty() {
             let prunes =
                 resolve_variant_prunes(&self.variant_prunes, &self.table, self.snapshot_id);
+            let geo = resolve_geo_prunes(&self.geo_prunes, &self.table, self.snapshot_id);
             let paths = result.iter().map(|(p, _)| p.clone()).collect();
             if let Ok(files) = collect_data_files_for_pruning(
                 &self.table,
@@ -1119,10 +1166,14 @@ impl IcebergScanExec {
             )
             .await
             {
-                let excluded = crate::variant_prune::files_excluded_by(
+                let mut excluded = crate::variant_prune::files_excluded_by(
                     files.iter().map(|f| f.as_ref()),
                     &prunes,
                 );
+                excluded.extend(crate::geo_prune::files_excluded_by(
+                    files.iter().map(|f| f.as_ref()),
+                    &geo,
+                ));
                 pruned_count += excluded.len();
                 result.retain(|(path, _)| !excluded.contains(path));
             }
@@ -1440,6 +1491,7 @@ impl ExecutionPlan for IcebergScanExec {
             let scan_reduces_rows = self.predicates.is_some()
                 || !self.df_filters.is_empty()
                 || !self.variant_prunes.is_empty()
+                || !self.geo_prunes.is_empty()
                 || !self.pushed_down_filters.is_empty();
             return Ok(Arc::new(degrade_row_count_for_filtered_scan(
                 cached.clone(),
@@ -1632,6 +1684,7 @@ impl ExecutionPlan for IcebergScanExec {
         let total_partitions = self.target_partitions;
         let static_plan_cache = self.static_plan.clone();
         let variant_prunes = self.variant_prunes.clone();
+        let geo_prunes = self.geo_prunes.clone();
         let split_assignments = self.split_assignments.clone();
         let table = self.table.clone();
         let schema = self.projected_schema.clone();
@@ -1738,15 +1791,32 @@ impl ExecutionPlan for IcebergScanExec {
             MetricBuilder::new(&self.metrics).counter("row_groups_pruned_variant", partition);
         let files_pruned_variant =
             MetricBuilder::new(&self.metrics).counter("files_pruned_variant", partition);
-        // Shredded variant comparisons (sqe#870), checked on both read paths.
-        let variant_pruner: Option<Arc<crate::variant_prune::VariantRowGroupPruner>> =
-            (!self.variant_prunes.is_empty()).then(|| {
-                let prunes = resolve_variant_prunes(&self.variant_prunes, &table, snapshot_id);
-                Arc::new(crate::variant_prune::VariantRowGroupPruner::new(
-                    Arc::from(prunes),
-                    row_groups_pruned_variant.clone(),
-                ))
-            });
+        let row_groups_pruned_geo =
+            MetricBuilder::new(&self.metrics).counter("row_groups_pruned_geo", partition);
+        let files_pruned_geo =
+            MetricBuilder::new(&self.metrics).counter("files_pruned_geo", partition);
+        // Shredded variant comparisons (sqe#870) and geometry bounding boxes
+        // (sqe#863), checked on both read paths.
+        let mut pruners: Vec<Arc<dyn RowGroupPruner>> = Vec::new();
+        if !self.variant_prunes.is_empty() {
+            let prunes = resolve_variant_prunes(&self.variant_prunes, &table, snapshot_id);
+            pruners.push(Arc::new(crate::variant_prune::VariantRowGroupPruner::new(
+                Arc::from(prunes),
+                row_groups_pruned_variant.clone(),
+            )));
+        }
+        if !self.geo_prunes.is_empty() {
+            let prunes = resolve_geo_prunes(&self.geo_prunes, &table, snapshot_id);
+            pruners.push(Arc::new(crate::geo_prune::GeoRowGroupPruner::new(
+                Arc::from(prunes),
+                row_groups_pruned_geo.clone(),
+            )));
+        }
+        let row_group_pruner: Option<Arc<dyn RowGroupPruner>> = match pruners.len() {
+            0 => None,
+            1 => pruners.pop(),
+            _ => Some(Arc::new(ChainedRowGroupPruner(pruners))),
+        };
         let filter_wait_time =
             MetricBuilder::new(&self.metrics).subset_time("filter_wait_time", partition);
         debug!(table=%table.identifier(), predicates=?predicates, snapshot_id=?snapshot_id, pushed_filters=pushed_down_filters.len(), "Executing IcebergScanExec");
@@ -1794,12 +1864,13 @@ impl ExecutionPlan for IcebergScanExec {
             let static_plan = {
                 let _t = planning_time.timer();
                 shared_static_scan_plan(&static_plan_cache, &table, snapshot_id,
-                    projection.as_deref(), predicates.as_ref(), &variant_prunes,
+                    projection.as_deref(), predicates.as_ref(), &variant_prunes, &geo_prunes,
                     Some(&static_planning_runs)).await?
             };
             // The plan is shared by every partition; count it once.
             if partition == 0 {
                 files_pruned_variant.add(static_plan.variant_files_pruned);
+                files_pruned_geo.add(static_plan.geo_files_pruned);
             }
             decode_gate.set_projected_share(static_plan.projected_share);
             // Borrow the sorted table-wide list. Whole-file readers allocate
@@ -2080,7 +2151,7 @@ impl ExecutionPlan for IcebergScanExec {
                 let rows_prefilter = rows_prefilter.clone();
                 let rows_decoded = rows_decoded.clone();
                 let direct_decode_gate = Arc::clone(&decode_gate);
-                let direct_variant_pruner = variant_pruner.clone();
+                let direct_row_group_pruner = row_group_pruner.clone();
                 let per_file_stream = futures::stream::iter(
                     file_entries.into_owned().into_iter().map(move |(path, size)| {
                         let file_io = file_io.clone();
@@ -2093,7 +2164,7 @@ impl ExecutionPlan for IcebergScanExec {
                         let rows_prefilter = rows_prefilter.clone();
                         let rows_decoded = rows_decoded.clone();
                         let decode_gate = Arc::clone(&direct_decode_gate);
-                        let variant_pruner = direct_variant_pruner.clone();
+                        let row_group_pruner = direct_row_group_pruner.clone();
                         async move {
                             debug!(path = %path, size = size, "Direct-read: reading file");
 
@@ -2134,7 +2205,7 @@ impl ExecutionPlan for IcebergScanExec {
                                 None => reader_md,
                             };
                             let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(bytes, reader_md);
-                            let builder = match &variant_pruner {
+                            let builder = match &row_group_pruner {
                                 Some(pruner) => {
                                     let groups = builder.metadata().num_row_groups();
                                     let kept = pruner.select(builder.metadata(), (0..groups).collect());
@@ -2356,8 +2427,8 @@ impl ExecutionPlan for IcebergScanExec {
             // decodes share the scan-wide permit budget and reserve their
             // estimated working set against the query pool.
             sb = sb.with_decode_gate(Arc::clone(&decode_gate) as Arc<dyn DecodeGate>);
-            if let Some(pruner) = &variant_pruner {
-                sb = sb.with_row_group_pruner(Arc::clone(pruner) as Arc<dyn RowGroupPruner>);
+            if let Some(pruner) = &row_group_pruner {
+                sb = sb.with_row_group_pruner(Arc::clone(pruner));
             }
             // Fetch/decode pipelining (sqe#scan-fetch-pipeline): stage subtask fetch and
             // decode under separate bounds so I/O depth is not capped by
@@ -3162,6 +3233,7 @@ async fn shared_static_scan_plan(
     projection: Option<&[String]>,
     predicates: Option<&Predicate>,
     variant_prunes: &[crate::variant_prune::VariantPrune],
+    geo_prunes: &[crate::geo_prune::GeoPrune],
     planning_runs: Option<&datafusion::physical_plan::metrics::Count>,
 ) -> DFResult<Arc<StaticScanPlan>> {
     cache
@@ -3169,9 +3241,16 @@ async fn shared_static_scan_plan(
             if let Some(runs) = planning_runs {
                 runs.add(1);
             }
-            plan_static_scan(table, snapshot_id, projection, predicates, variant_prunes)
-                .await
-                .map(Arc::new)
+            plan_static_scan(
+                table,
+                snapshot_id,
+                projection,
+                predicates,
+                variant_prunes,
+                geo_prunes,
+            )
+            .await
+            .map(Arc::new)
         })
         .await
         .cloned()
@@ -3191,12 +3270,30 @@ fn resolve_variant_prunes(
         .collect()
 }
 
+/// The scan's geometry prunes with their columns' field ids in the scanned
+/// snapshot's schema.
+fn resolve_geo_prunes(
+    prunes: &[crate::geo_prune::GeoPrune],
+    table: &Table,
+    snapshot_id: Option<i64>,
+) -> Vec<crate::geo_prune::GeoPrune> {
+    if prunes.is_empty() {
+        return Vec::new();
+    }
+    let schema = snapshot_schema(table, snapshot_id);
+    prunes
+        .iter()
+        .map(|p| p.clone().with_field_id(&schema))
+        .collect()
+}
+
 async fn plan_static_scan(
     table: &Table,
     snapshot_id: Option<i64>,
     projection: Option<&[String]>,
     predicates: Option<&Predicate>,
     variant_prunes: &[crate::variant_prune::VariantPrune],
+    geo_prunes: &[crate::geo_prune::GeoPrune],
 ) -> DFResult<StaticScanPlan> {
     let mut sb = table.scan().with_task_split_target_size(None);
     if let Some(sid) = snapshot_id {
@@ -3222,9 +3319,13 @@ async fn plan_static_scan(
     // Files whose manifest variant bounds exclude a shredded variant
     // comparison (sqe#870). Only files a writer gave variant bounds to
     // (Spark/Iceberg 1.12) can go; on a manifest read failure all stay.
+    // Geometry bounding boxes (sqe#863) likewise: only files a writer gave
+    // geometry bounds to can go.
     let mut variant_files_pruned = 0;
-    if !variant_prunes.is_empty() && !tasks.is_empty() {
+    let mut geo_files_pruned = 0;
+    if (!variant_prunes.is_empty() || !geo_prunes.is_empty()) && !tasks.is_empty() {
         let prunes = resolve_variant_prunes(variant_prunes, table, snapshot_id);
+        let geo = resolve_geo_prunes(geo_prunes, table, snapshot_id);
         let paths = tasks
             .iter()
             .map(|t| t.data_file_path().to_string())
@@ -3233,9 +3334,13 @@ async fn plan_static_scan(
             collect_data_files_for_pruning(table, snapshot_id, &paths, DEFAULT_MANIFEST_CONCURRENCY)
                 .await
         {
-            let excluded =
+            let mut excluded =
                 crate::variant_prune::files_excluded_by(files.iter().map(|f| f.as_ref()), &prunes);
             variant_files_pruned = excluded.len();
+            let geo_excluded =
+                crate::geo_prune::files_excluded_by(files.iter().map(|f| f.as_ref()), &geo);
+            geo_files_pruned = geo_excluded.difference(&excluded).count();
+            excluded.extend(geo_excluded);
             tasks.retain(|t| !excluded.contains(t.data_file_path()));
         }
     }
@@ -3255,6 +3360,7 @@ async fn plan_static_scan(
         has_deletes,
         projected_share,
         variant_files_pruned,
+        geo_files_pruned,
     })
 }
 
@@ -5020,7 +5126,7 @@ mod manifest_statistics_tests {
         let scan = IcebergScanExec::new(table.clone(), Arc::new(arrow_schema(&table)), None, None)
             .with_target_partitions(8);
         let requests = (0..8).map(|_| {
-            shared_static_scan_plan(&scan.static_plan, &table, None, None, None, &[], None)
+            shared_static_scan_plan(&scan.static_plan, &table, None, None, None, &[], &[], None)
         });
         let plans = futures::future::join_all(requests).await;
         let first = plans[0].as_ref().unwrap();
@@ -5072,6 +5178,7 @@ mod manifest_statistics_tests {
             Some(&projection),
             Some(&predicate),
             &[],
+            &[],
         )
         .await
         .unwrap();
@@ -5084,7 +5191,7 @@ mod manifest_statistics_tests {
 
         let delete_dir = tempfile::tempdir().unwrap();
         let deletes = fake_iceberg_table(delete_dir.path(), true).await;
-        let delete_plan = plan_static_scan(&deletes, None, None, None, &[])
+        let delete_plan = plan_static_scan(&deletes, None, None, None, &[], &[])
             .await
             .unwrap();
         assert!(delete_plan.has_deletes);
@@ -5098,13 +5205,20 @@ mod manifest_statistics_tests {
         let table = fake_iceberg_table(dir.path(), false).await;
         let cache = tokio::sync::OnceCell::new();
         let invalid = vec!["missing_column".to_string()];
-        assert!(
-            shared_static_scan_plan(&cache, &table, None, Some(&invalid), None, &[], None)
-                .await
-                .is_err()
-        );
+        assert!(shared_static_scan_plan(
+            &cache,
+            &table,
+            None,
+            Some(&invalid),
+            None,
+            &[],
+            &[],
+            None
+        )
+        .await
+        .is_err());
         assert!(cache.get().is_none());
-        let valid = shared_static_scan_plan(&cache, &table, None, None, None, &[], None)
+        let valid = shared_static_scan_plan(&cache, &table, None, None, None, &[], &[], None)
             .await
             .unwrap();
         assert_eq!(valid.tasks.len(), FAKE_FILES.len());
@@ -5204,6 +5318,7 @@ mod manifest_statistics_tests {
             None,
             None,
             &[],
+            &[],
             None,
         ));
         assert!(futures::poll!(waiter.as_mut()).is_pending());
@@ -5211,7 +5326,7 @@ mod manifest_statistics_tests {
         drop(initializer);
         let plan = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            shared_static_scan_plan(&cache, &table, None, None, None, &[], None),
+            shared_static_scan_plan(&cache, &table, None, None, None, &[], &[], None),
         )
         .await
         .unwrap()
