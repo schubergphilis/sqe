@@ -3226,6 +3226,8 @@ async fn snapshot_has_delete_files(table: &Table, snapshot_id: Option<i64>) -> D
         .any(|mf| mf.content == ManifestContentType::Deletes))
 }
 
+// Forwards plan_static_scan's arguments through the per-scan cache.
+#[allow(clippy::too_many_arguments)]
 async fn shared_static_scan_plan(
     cache: &tokio::sync::OnceCell<Arc<StaticScanPlan>>,
     table: &Table,
