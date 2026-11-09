@@ -180,7 +180,7 @@ Detailed Mermaid diagrams (query pipeline, crate dependencies, caching layers, d
 
 ## Web UI
 
-A read-only ops dashboard ships in the binary, on the coordinator's health port (`metrics_port + 1`). Queries with per-fragment timing, cluster nodes, and live engine metrics (stat cards, a query-activity histogram, memory and concurrency gauges), all from the coordinator's in-memory state. The dashboard and its JSON API require an admin bearer token (`require_admin_bearer`); only `/healthz` and `/readyz` stay unauthenticated. No build step, no external assets. Off by default; toggle with `[metrics] web_ui`. Full reference: [`docs/site/book/src/operations/web-ui.md`](docs/site/book/src/operations/web-ui.md).
+A read-only ops dashboard ships in the binary, on the coordinator's health port (`metrics_port + 1`). Queries with per-fragment timing, query history from the audit log, cluster nodes, and live engine metrics (a metric strip with sparklines, a query-activity histogram, memory and concurrency gauges), with a one-line summary and action banners per tab, sortable tables, and light and dark themes. The dashboard and its JSON API require an admin bearer token (`require_admin_bearer`); only `/healthz` and `/readyz` stay unauthenticated. No build step, no external assets. Off by default; toggle with `[metrics] web_ui`. Full reference: [`docs/site/book/src/operations/web-ui.md`](docs/site/book/src/operations/web-ui.md).
 
 ![SQE web UI: the Overview dashboard](docs/site/book/src/images/sqe-web-ui-overview.png)
 
