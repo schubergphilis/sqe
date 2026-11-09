@@ -2,7 +2,7 @@
   "source": "https://github.com/Neuw84/iceberg-matrix",
   "sourceCommit": "027f1513563f1453ee4d04f3b7b36ff2464a4a6a",
   "sourceLicense": "MIT",
-  "fetchedAt": "2026-10-27",
+  "fetchedAt": "2026-11-09",
   "generatedBy": "python3 scripts/render-iceberg-matrix-compare.py",
   "scoring": "One cell per feature and applicable format version (introducedIn up to, not including, removedIn). full=3, partial=2, unknown=1, none=0; a cell an engine does not list counts as none.",
   "cells": 54,

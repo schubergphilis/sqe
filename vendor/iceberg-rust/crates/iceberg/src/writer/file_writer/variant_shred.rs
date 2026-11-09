@@ -377,21 +377,49 @@ fn truncate_upper(s: &str) -> Option<String> {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Scalar {
     Int(i64),
+    Double(TotalF64),
     Str(String),
     Bool(bool),
     Date(NaiveDate),
 }
 
+/// A double ordered as SQL compares it: `f64::total_cmp`, where -0.0 sorts
+/// before +0.0. It never holds a NaN; `Scalar::of` refuses one.
+#[derive(Clone, Copy, Debug)]
+struct TotalF64(f64);
+
+impl PartialEq for TotalF64 {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.total_cmp(&other.0).is_eq()
+    }
+}
+
+impl Eq for TotalF64 {}
+
+impl PartialOrd for TotalF64 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TotalF64 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
 impl Scalar {
     /// `value` as a bound of a path shredded as `shape`, or `None` when it
-    /// has another type. A double never bounds: NaN and -0.0 have no safe
-    /// order, and no reader prunes on one.
+    /// has another type or is a NaN. A NaN drops the path's bound, as in
+    /// Iceberg Java: SQL orders NaN above every number, so a bound that left
+    /// it out would let a reader skip a file whose NaN row matches `> c`.
     fn of(shape: &Shape, value: &Variant<'_, '_>) -> Option<Scalar> {
         Some(match (shape, value) {
             (Shape::Int, Variant::Int8(v)) => Scalar::Int(i64::from(*v)),
             (Shape::Int, Variant::Int16(v)) => Scalar::Int(i64::from(*v)),
             (Shape::Int, Variant::Int32(v)) => Scalar::Int(i64::from(*v)),
             (Shape::Int, Variant::Int64(v)) => Scalar::Int(*v),
+            (Shape::Double, Variant::Double(v)) if !v.is_nan() => Scalar::Double(TotalF64(*v)),
             (Shape::Str, Variant::String(s)) => Scalar::Str(s.to_string()),
             (Shape::Str, Variant::ShortString(s)) => Scalar::Str(s.as_str().to_string()),
             (Shape::Bool, Variant::BooleanTrue) => Scalar::Bool(true),
@@ -401,19 +429,22 @@ impl Scalar {
         })
     }
 
-    /// This value as written for a lower bound.
+    /// This value as written for a lower bound. A zero is written as -0.0,
+    /// which sorts first, so the bound covers either zero.
     fn as_lower(&self) -> Scalar {
         match self {
             Scalar::Str(s) => Scalar::Str(truncate_lower(s)),
+            Scalar::Double(TotalF64(v)) if *v == 0.0 => Scalar::Double(TotalF64(-0.0)),
             other => other.clone(),
         }
     }
 
     /// This value as written for an upper bound, or `None` when a string
-    /// cannot be cut and rounded up.
+    /// cannot be cut and rounded up. A zero is written as +0.0.
     fn as_upper(&self) -> Option<Scalar> {
         match self {
             Scalar::Str(s) => truncate_upper(s).map(Scalar::Str),
+            Scalar::Double(TotalF64(v)) if *v == 0.0 => Some(Scalar::Double(TotalF64(0.0))),
             other => Some(other.clone()),
         }
     }
@@ -485,6 +516,7 @@ fn encode_bound<'a>(entries: impl Iterator<Item = (&'a str, &'a Scalar)>) -> Vec
     for (key, scalar) in entries {
         match scalar {
             Scalar::Int(v) => object.insert(key, *v),
+            Scalar::Double(TotalF64(v)) => object.insert(key, *v),
             Scalar::Str(s) => object.insert(key, s.as_str()),
             Scalar::Bool(b) => object.insert(key, *b),
             Scalar::Date(d) => object.insert(key, *d),
@@ -889,9 +921,15 @@ mod tests {
         let value = &bytes[metadata.size()..];
         let object = Variant::try_new_with_metadata(metadata, value).unwrap();
         let field = object.get_object_field(key)?;
-        [Shape::Int, Shape::Str, Shape::Bool, Shape::Date]
-            .iter()
-            .find_map(|shape| Scalar::of(shape, &field))
+        [
+            Shape::Int,
+            Shape::Double,
+            Shape::Str,
+            Shape::Bool,
+            Shape::Date,
+        ]
+        .iter()
+        .find_map(|shape| Scalar::of(shape, &field))
     }
 
     /// Writes `batches` through one shredder, as one data file.
@@ -991,18 +1029,88 @@ mod tests {
         assert_eq!(bound_at(&upper, "$['n']"), Some(Scalar::Int(2)));
     }
 
-    #[test]
-    fn doubles_and_quoted_keys_get_no_bound() {
-        let row = r#"{"f": 1.5, "it's": 1, "n": 2}"#;
-        let (lower, upper) = file_bounds(&[variant_batch_with_id(&[Some(row)])]);
-        for key in ["$['f']", "$['it's']"] {
-            assert_eq!(bound_at(&lower, key), None, "{key}");
+    /// One file of `{"f": <value>}` rows, field id 2, built directly: JSON
+    /// has no NaN or -0.0.
+    fn double_batch(values: &[f64]) -> RecordBatch {
+        use parquet::variant::{VariantArrayBuilder, VariantBuilderExt};
+        let mut builder = VariantArrayBuilder::new(values.len());
+        for v in values {
+            builder.new_object().with_field("f", *v).finish();
         }
+        let variants = builder.build();
+        let mut field = variants.field("v");
+        let mut metadata = field.metadata().clone();
+        metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string());
+        field = field.with_metadata(metadata);
+        let column: ArrayRef = Arc::new(variants.into_inner());
+        RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![column]).unwrap()
+    }
+
+    fn double_bound(bounds: &HashMap<i32, Vec<u8>>) -> Option<f64> {
+        match bound_at(bounds, "$['f']")? {
+            Scalar::Double(TotalF64(v)) => Some(v),
+            other => panic!("not a double bound: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn doubles_bound_with_zeros_widened_and_nan_dropping_the_path() {
+        let (lower, upper) = file_bounds(&[variant_batch_with_id(&[
+            Some(r#"{"f": 1.5}"#),
+            Some(r#"{"f": -2.25}"#),
+        ])]);
+        assert_eq!(
+            (double_bound(&lower), double_bound(&upper)),
+            (Some(-2.25), Some(1.5))
+        );
+
+        // Either zero at an end is written as the zero that covers both.
+        for zeros in [[0.0, 0.0], [-0.0, -0.0], [0.0, -0.0]] {
+            let (lower, upper) = file_bounds(&[double_batch(&zeros)]);
+            let (lower, upper) = (double_bound(&lower).unwrap(), double_bound(&upper).unwrap());
+            assert!(
+                lower == 0.0 && lower.is_sign_negative(),
+                "{zeros:?}: {lower}"
+            );
+            assert!(
+                upper == 0.0 && upper.is_sign_positive(),
+                "{zeros:?}: {upper}"
+            );
+        }
+        let (lower, upper) = file_bounds(&[double_batch(&[-0.0, 4.0])]);
+        assert!(double_bound(&lower).unwrap().is_sign_negative());
+        assert_eq!(double_bound(&upper), Some(4.0));
+        let (lower, upper) = file_bounds(&[double_batch(&[-3.0, 0.0])]);
+        assert_eq!(double_bound(&lower), Some(-3.0));
+        assert!(double_bound(&upper).unwrap().is_sign_positive());
+
+        // A NaN anywhere in the file, first or later, drops the path's bound.
+        for values in [[f64::NAN, 1.0], [1.0, f64::NAN], [1.0, -f64::NAN]] {
+            let (lower, upper) = file_bounds(&[double_batch(&values)]);
+            assert_eq!(
+                (double_bound(&lower), double_bound(&upper)),
+                (None, None),
+                "{values:?}"
+            );
+        }
+        let (lower, _) = file_bounds(&[
+            double_batch(&[1.0]),
+            double_batch(&[f64::NAN]),
+            double_batch(&[2.0]),
+        ]);
+        assert_eq!(double_bound(&lower), None);
+    }
+
+    #[test]
+    fn quoted_keys_get_no_bound() {
+        let row = r#"{"it's": 1, "n": 2}"#;
+        let (lower, upper) = file_bounds(&[variant_batch_with_id(&[Some(row)])]);
+        assert_eq!(bound_at(&lower, "$['it's']"), None);
         assert_eq!(bound_at(&lower, "$['n']"), Some(Scalar::Int(2)));
         assert_eq!(bound_at(&upper, "$['n']"), Some(Scalar::Int(2)));
 
         // Nothing boundable: no entry for the column at all.
-        let (lower, upper) = file_bounds(&[variant_batch_with_id(&[Some(r#"{"f": 1.5}"#)])]);
+        let (lower, upper) = file_bounds(&[variant_batch_with_id(&[Some(r#"{"it's": 1}"#)])]);
         assert!(lower.is_empty() && upper.is_empty());
         // No field id: no bounds.
         let (lower, _) = file_bounds(&[variant_batch(&[Some(r#"{"a": 1}"#)])]);

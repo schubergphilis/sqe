@@ -1,6 +1,6 @@
 # Public Iceberg Matrix Comparison
 
-Side-by-side comparison of SQE with every engine on [icebergmatrix.org](https://icebergmatrix.org). Upstream data: [Neuw84/iceberg-matrix@027f151356](https://github.com/Neuw84/iceberg-matrix/tree/027f1513563f1453ee4d04f3b7b36ff2464a4a6a) (MIT), fetched 2026-10-27. SQE data: [`docs/evidence/iceberg-matrix-state.json`](../../evidence/iceberg-matrix-state.json), rendered per cell in [`iceberg-matrix.md`](./iceberg-matrix.md).
+Side-by-side comparison of SQE with every engine on [icebergmatrix.org](https://icebergmatrix.org). Upstream data: [Neuw84/iceberg-matrix@027f151356](https://github.com/Neuw84/iceberg-matrix/tree/027f1513563f1453ee4d04f3b7b36ff2464a4a6a) (MIT), fetched 2026-11-09. SQE data: [`docs/evidence/iceberg-matrix-state.json`](../../evidence/iceberg-matrix-state.json), rendered per cell in [`iceberg-matrix.md`](./iceberg-matrix.md).
 
 Every engine is scored on the same 54 cells: one per feature and format version the rubric applies to. full=3, partial=2, unknown=1, none=0; max 162. SQE rates itself; the other engines are rated by the upstream maintainers and contributors.
 
