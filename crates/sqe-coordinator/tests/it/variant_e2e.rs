@@ -414,6 +414,14 @@ async fn cast_as_json_of_a_json_value_is_the_identity() {
             format!("SELECT CAST(ARRAY[json_parse(doc), NULL] AS JSON) FROM {src} ORDER BY id"),
             vec![r#"[{"n":1.5},null]"#, "[null,null]"],
         ),
+        // CASE and coalesce over JSON values stay JSON.
+        (
+            format!(
+                "SELECT id, CAST(CASE WHEN id = 1 THEN json_parse(doc) END AS JSON), \
+                 CAST(coalesce(json_parse(doc), json_parse('[]')) AS JSON) FROM {src} ORDER BY id"
+            ),
+            vec![r#"1|{"n":1.5}|{"n":1.5}"#, "2|NULL|[]"],
+        ),
         (
             format!("SELECT id, p, CAST(p AS JSON) FROM {dst} ORDER BY id"),
             vec![
