@@ -1,0 +1,136 @@
+{
+  "issue": 785,
+  "date": "2026-11-09",
+  "base_commit": "3641dc4c9",
+  "host": "Apple M3 Pro, 36 GB, one embedded process over local Parquet; not the SF100 box",
+  "command": "python3 benchmarks/experiments/tpcbb-q01-scale.py <root> <sf> --memory-limit <limit> --repetitions 3",
+  "data": "sqe-bench generate tpcds + tpcbb at the same scale (item domain fix bbc0325ff)",
+  "results": [
+    {
+      "engine": "SQE embedded over read_parquet; process startup included",
+      "scale": "sf1",
+      "memory_limit": "8GB",
+      "cardinality": {
+        "wcs_rows": "4000000",
+        "wcs_sale_rows": "2399946",
+        "ss_rows": "2880000",
+        "item_rows": "18000",
+        "joined_items": "18000",
+        "original_join_rows": "383991441",
+        "candidate_click_groups": "18000",
+        "candidate_sales_groups": "18000"
+      },
+      "runs": {
+        "original": [
+          {
+            "ms": 7534,
+            "peak_rss_bytes": 186908672,
+            "error": null
+          },
+          {
+            "ms": 8623,
+            "peak_rss_bytes": 187908096,
+            "error": null
+          },
+          {
+            "ms": 7260,
+            "peak_rss_bytes": 187514880,
+            "error": null
+          }
+        ],
+        "preaggregated": [
+          {
+            "ms": 65,
+            "peak_rss_bytes": 116490240,
+            "error": null
+          },
+          {
+            "ms": 52,
+            "peak_rss_bytes": 113557504,
+            "error": null
+          },
+          {
+            "ms": 54,
+            "peak_rss_bytes": 113033216,
+            "error": null
+          }
+        ]
+      },
+      "original": {
+        "ok_runs": 3,
+        "median_ms": 7534,
+        "max_peak_rss_bytes": 187908096
+      },
+      "preaggregated": {
+        "ok_runs": 3,
+        "median_ms": 54,
+        "max_peak_rss_bytes": 116490240
+      },
+      "top20_equal": true,
+      "speedup": 139.5
+    },
+    {
+      "scale": "sf10",
+      "memory_limit": "12GB",
+      "cardinality": {
+        "wcs_rows": "40000000",
+        "wcs_sale_rows": "23998829",
+        "ss_rows": "28800000",
+        "item_rows": "102000",
+        "joined_items": "102000",
+        "original_join_rows": "6775960722",
+        "candidate_click_groups": "102000",
+        "candidate_sales_groups": "102000"
+      },
+      "runs": {
+        "original": [
+          {
+            "ms": 127448,
+            "peak_rss_bytes": 835960832,
+            "error": null
+          },
+          {
+            "ms": 126531,
+            "peak_rss_bytes": 885161984,
+            "error": null
+          },
+          {
+            "ms": 128728,
+            "peak_rss_bytes": 847560704,
+            "error": null
+          }
+        ],
+        "preaggregated": [
+          {
+            "ms": 538,
+            "peak_rss_bytes": 299892736,
+            "error": null
+          },
+          {
+            "ms": 445,
+            "peak_rss_bytes": 309510144,
+            "error": null
+          },
+          {
+            "ms": 562,
+            "peak_rss_bytes": 297582592,
+            "error": null
+          }
+        ]
+      },
+      "original": {
+        "ok_runs": 3,
+        "median_ms": 127448,
+        "max_peak_rss_bytes": 885161984
+      },
+      "preaggregated": {
+        "ok_runs": 3,
+        "median_ms": 538,
+        "max_peak_rss_bytes": 309510144
+      },
+      "top20_equal": true,
+      "speedup": 236.9,
+      "engine": "SQE embedded over read_parquet; process startup included"
+    }
+  ]
+}

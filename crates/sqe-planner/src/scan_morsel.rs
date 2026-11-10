@@ -31,7 +31,11 @@ pub const SCAN_TASK_VERSION_V5: u32 = 5;
 /// worker would read those files without their deletes, so it must refuse.
 /// Bumped only when present.
 pub const SCAN_TASK_VERSION_V6: u32 = 6;
-pub const SCAN_TASK_VERSION_CURRENT: u32 = SCAN_TASK_VERSION_V6;
+/// `7` = optional geometry bounding-box prunes (sqe#863): the files and row
+/// groups a worker drops when their bounding box misses an `ST_*` predicate.
+/// Bumped only when present.
+pub const SCAN_TASK_VERSION_V7: u32 = 7;
+pub const SCAN_TASK_VERSION_CURRENT: u32 = SCAN_TASK_VERSION_V7;
 
 /// Default target compressed size for a morsel (128 MiB).
 pub const DEFAULT_MORSEL_TARGET_BYTES: u64 = 128 * 1024 * 1024;

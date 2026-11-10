@@ -95,6 +95,7 @@ pub fn storage_factory() -> std::sync::Arc<dyn iceberg::io::StorageFactory> {
 }
 
 pub mod delete_tasks;
+pub mod geo_prune;
 
 #[cfg(test)]
 mod parquet_delta_skip_tests;

@@ -280,7 +280,7 @@ Iceberg V3 table format support landed end-to-end. V3 is the default format-vers
 |---|---|
 | Typed access on shredded variant fields | Shredded fields are unshredded on read. File pruning on variant bounds and row-group pruning ship |
 | DATE to TIMESTAMP promotion | Refused: Iceberg Java refuses it too |
-| Geometry / geography type | Created with DDL, read and written as WKB, geometry bounds in the manifest, 30 `ST_*` functions plus `ST_SRID`. DESCRIBE and SHOW CREATE TABLE print `geometry(4326)` / `geography(4326, karney)`. Bounding-box file pruning not started |
+| Geometry / geography type | Created with DDL, read and written as WKB, geometry bounds in the manifest, 30 `ST_*` functions plus `ST_SRID`. DESCRIBE and SHOW CREATE TABLE print `geometry(4326)` / `geography(4326, karney)`. `ST_*` predicates prune files and row groups on the bounding box |
 | Multi-arg partition transforms | Not started |
 
 ### Other Hardening

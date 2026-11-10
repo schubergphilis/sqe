@@ -43,11 +43,19 @@ def main():
         #   sales), and keys past the click range (sales without clicks).
         # - ss_net_paid is DECIMAL(7,2) like TPC-DS, with NULLs, negative
         #   values (every fifth key only has refunds, so its average is
-        #   negative and truncates toward zero), and an item (key 2) whose
-        #   every value is NULL.
+        #   negative and rounds half away from zero), and an item (key 2)
+        #   whose every value is NULL.
+        # - One item (ROUNDING_KEY) has a single click and 2,000,001 sales,
+        #   1,000,000 of them 0.01: its average is 0.0049999975, so AVG
+        #   returns 0.00. A candidate that divides at scale 6 and then casts
+        #   to two decimals rounds twice and returns 0.01.
         conn.execute("CREATE TABLE item AS SELECT n::INTEGER i_item_sk, 'item-'||(n//2) i_item_id, CASE WHEN n%3=0 THEN 'description-alt-'||n ELSE 'description-'||(n//2) END i_item_desc, 'category-'||(n%5) i_category, 'class' i_class FROM range(1, ?) t(n)", [args.keys + 1])
         conn.execute("CREATE TABLE web_clickstreams AS SELECT CASE WHEN n%11=0 THEN NULL ELSE n%?+1 END::INTEGER wcs_item_sk, CASE WHEN n%4=0 THEN NULL ELSE n END::BIGINT wcs_sales_sk FROM range(?) t(n)", [args.keys + 10, args.rows])
         conn.execute("CREATE TABLE store_sales AS SELECT CASE WHEN n%13=0 THEN NULL ELSE n%?+1 END::INTEGER ss_item_sk, CASE WHEN n%?+1=2 OR n%7=0 THEN NULL WHEN (n%?+1)%5=0 THEN -(n%997)/100 ELSE ((n%1000)-100)/100 END::DECIMAL(7,2) ss_net_paid FROM range(?) t(n) WHERE (n%?+1)%17<>0", [args.keys + 20, args.keys + 20, args.keys + 20, args.rows, args.keys + 20])
+        rounding_key = args.keys + 1000
+        conn.execute("INSERT INTO item VALUES (?, 'item-rounding', 'description-rounding', 'category-rounding', 'class')", [rounding_key])
+        conn.execute("INSERT INTO web_clickstreams VALUES (?, 1)", [rounding_key])
+        conn.execute("INSERT INTO store_sales SELECT ?, CASE WHEN n < 1000000 THEN 0.01 ELSE 0 END::DECIMAL(7,2) FROM range(2000001) t(n)", [rounding_key])
         exports = {
             'item': "COPY item TO ? (FORMAT PARQUET)",
             'web_clickstreams': "COPY web_clickstreams TO ? (FORMAT PARQUET)",
@@ -76,7 +84,8 @@ def main():
         # Compare every group, exactly: ORDER BY ties may choose different
         # groups at the LIMIT boundary, so the comparison drops the ORDER BY
         # and LIMIT. Decimal sums are exact, so there is no tolerance.
-        # sqe-cli's JSON prints NULL as "", so the NULL flags are explicit.
+        # The explicit NULL flags date from when sqe-cli's JSON printed NULL
+        # as ""; it prints null now, and the flags still do no harm.
         group = ('i_item_id', 'i_item_desc', 'i_category', 'i_class')
         results = []
         for sql in queries.values():
@@ -106,10 +115,13 @@ def main():
         coverage = {
             'groups': len(rows),
             'null_revenue_groups': sum(r['revenue_is_null'] == 'true' for r in rows),
-            'negative_revenue_groups': sum(r['total_net_revenue'].startswith('-') for r in rows),
+            'negative_revenue_groups': sum((r['total_net_revenue'] or '').startswith('-') for r in rows),
         }
         if not (coverage['null_revenue_groups'] and coverage['negative_revenue_groups']):
             raise AssertionError(('the fixture lost an edge case', coverage))
+        rounding = [r['avg_sale_amount'] for r in rows if r['i_item_id'] == 'item-rounding']
+        if rounding != ['0.00']:
+            raise AssertionError(('the rounding group lost its single rounding', rounding))
         timings = {key: [] for key in queries}
         for repetition in range(args.repetitions):
             order = list(queries) if repetition % 2 == 0 else list(reversed(queries))

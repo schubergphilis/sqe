@@ -66,6 +66,18 @@ rustflags = ["-C", "linker=clang", "-C", "link-arg=-fuse-ld=mold"]
 # Do not run bare `cargo build` / `cargo test` in a tree you also build with
 # `make` — it forks a second variant of every crate.
 
+# ── Test thread stacks ────────────────────────────────────────────────────
+# 32 MiB test-thread stacks for a bare `cargo test`, as `make test` and CI
+# (AIKIDO_RUST_MIN_STACK) already run them. Debug builds of the coordinator
+# tests (flight_sql DDL and prepared-statement paths) overflow Rust's 2 MiB
+# default, and an overflow aborts the whole test binary. `#[tokio::test]`
+# bodies run on the test thread, so `on_planning_stack` cannot help there.
+# Deployed binaries are unaffected: cargo sets this only for the processes it
+# starts, and the server runtime sizes its own threads (sqe-core runtime.rs).
+# A RUST_MIN_STACK already in the environment wins.
+[env]
+RUST_MIN_STACK = "33554432"
+
 # ── xtask alias ───────────────────────────────────────────────────────────
 # `cargo xtask <subcommand>` is the convention for repo-local dev tooling.
 # See `xtask/` crate for available subcommands (e.g., `cargo xtask matrix-report`).

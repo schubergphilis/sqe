@@ -18,9 +18,10 @@
 //! result of `json_parse`, `json_extract`, `json_array_get` and `to_json`
 //! carries the [`JSON_TEXT_MARKER`] field marker, so `to_json` returns that
 //! text as it is, also through an alias, a CTE, a subquery or a view
-//! (Trino's cast of a JSON value is the identity). `CASE` and `coalesce`
-//! return a field without the marker, and any other string, a stored V2
-//! `JSON` column included, has none: those are encoded as a JSON string.
+//! (Trino's cast of a JSON value is the identity). [`JsonMarkerRule`] keeps
+//! the marker on a `CASE` or `coalesce` whose results are all JSON. Any
+//! other string, a stored V2 `JSON` column included, has none: those are
+//! encoded as a JSON string.
 //! `sqe-sql::trino_compat` rewrites `CAST(ARRAY[<json>, ...] AS JSON)` to
 //! [`JsonArrayOfJson`], since an array literal drops the element marker.
 //! Types Trino refuses to cast (varbinary, time, intervals) are written as
@@ -35,11 +36,17 @@ use arrow::datatypes::{
     Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
 use arrow::util::display::{ArrayFormatter, FormatOptions};
-use datafusion::common::{exec_err, Result as DFResult};
+use datafusion::common::config::ConfigOptions;
+use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion::common::{exec_err, DFSchema, Result as DFResult};
+use datafusion::logical_expr::expr::ScalarFunction;
+use datafusion::logical_expr::expr_rewriter::NamePreserver;
+use datafusion::logical_expr::utils::merge_schema;
 use datafusion::logical_expr::{
-    ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
-    Volatility,
+    ColumnarValue, Expr, ExprSchemable, LogicalPlan, ReturnFieldArgs, ScalarFunctionArgs,
+    ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
+use datafusion::optimizer::AnalyzerRule;
 use datafusion::scalar::ScalarValue;
 use sqe_trino_protocol::encode;
 
@@ -183,6 +190,122 @@ impl ScalarUDFImpl for JsonArrayOfJson {
         } else {
             Ok(ColumnarValue::Array(out))
         }
+    }
+}
+
+/// `__sqe_json_text(x)`: `x` unchanged, with the [`JSON_TEXT_MARKER`] on its
+/// field. [`JsonMarkerRule`] wraps a `CASE` or `coalesce` whose results are
+/// all JSON in it, since DataFusion builds their field without metadata.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(crate) struct JsonText;
+
+/// Name of [`JsonText`].
+const JSON_TEXT: &str = "__sqe_json_text";
+
+impl ScalarUDFImpl for JsonText {
+    fn name(&self) -> &str {
+        JSON_TEXT
+    }
+
+    fn signature(&self) -> &Signature {
+        static SIG: LazyLock<Signature> =
+            LazyLock::new(|| Signature::new(TypeSignature::Any(1), Volatility::Immutable));
+        &SIG
+    }
+
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    fn return_field_from_args(&self, _: ReturnFieldArgs) -> DFResult<FieldRef> {
+        Ok(json_text_field(self.name()))
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        Ok(args.args[0].clone())
+    }
+}
+
+/// Keeps the JSON marker through `CASE`, `coalesce`, `nvl`, `ifnull`,
+/// `nullif` and `nvl2` (#848). DataFusion gives those a field without
+/// metadata, so `CAST(CASE .. THEN json_parse(s) END AS JSON)` quoted the
+/// JSON text. When every result that is not a NULL literal is JSON text,
+/// the expression is wrapped in [`JsonText`]. Runs after type coercion, so
+/// a NULL branch is already `CAST(NULL AS Utf8)` and every result is Utf8.
+#[derive(Debug, Default)]
+pub struct JsonMarkerRule;
+
+impl AnalyzerRule for JsonMarkerRule {
+    fn analyze(&self, plan: LogicalPlan, _: &ConfigOptions) -> DFResult<LogicalPlan> {
+        plan.transform_up_with_subqueries(mark_plan).data()
+    }
+
+    fn name(&self) -> &str {
+        "sqe_json_marker"
+    }
+}
+
+fn mark_plan(plan: LogicalPlan) -> DFResult<Transformed<LogicalPlan>> {
+    let schema = merge_schema(&plan.inputs());
+    let names = NamePreserver::new(&plan);
+    let out = plan.map_expressions(|expr| {
+        let name = names.save(&expr);
+        let marked = expr.transform_up(|e| mark_expr(e, &schema))?;
+        Ok(marked.update_data(|e| name.restore(e)))
+    })?;
+    if out.transformed {
+        out.map_data(|plan| plan.recompute_schema())
+    } else {
+        Ok(out)
+    }
+}
+
+fn mark_expr(expr: Expr, schema: &DFSchema) -> DFResult<Transformed<Expr>> {
+    let results: Vec<&Expr> = match &expr {
+        Expr::Case(case) => case
+            .when_then_expr
+            .iter()
+            .map(|(_, then)| then.as_ref())
+            .chain(case.else_expr.as_deref())
+            .collect(),
+        Expr::ScalarFunction(f) => match f.name() {
+            "coalesce" | "nvl" | "ifnull" => f.args.iter().collect(),
+            "nullif" => f.args.iter().take(1).collect(),
+            "nvl2" => f.args.iter().skip(1).collect(),
+            _ => return Ok(Transformed::no(expr)),
+        },
+        _ => return Ok(Transformed::no(expr)),
+    };
+    let is_json = |e: &Expr| e.to_field(schema).is_ok_and(|(_, f)| is_json_text(&f));
+    let mut any_json = false;
+    for e in results {
+        if is_null_literal(e) {
+            continue;
+        }
+        if !is_json(e) {
+            return Ok(Transformed::no(expr));
+        }
+        any_json = true;
+    }
+    let plain_utf8 = expr
+        .to_field(schema)
+        .is_ok_and(|(_, f)| f.data_type() == &DataType::Utf8 && !is_json_text(&f));
+    if !any_json || !plain_utf8 {
+        return Ok(Transformed::no(expr));
+    }
+    static UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| Arc::new(ScalarUDF::from(JsonText)));
+    Ok(Transformed::yes(Expr::ScalarFunction(
+        ScalarFunction::new_udf(Arc::clone(&UDF), vec![expr]),
+    )))
+}
+
+/// `NULL`, or `NULL` cast by type coercion.
+fn is_null_literal(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(v, _) => v.is_null(),
+        Expr::Cast(c) => is_null_literal(&c.expr),
+        Expr::TryCast(c) => is_null_literal(&c.expr),
+        _ => false,
     }
 }
 

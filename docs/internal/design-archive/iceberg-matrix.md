@@ -2,10 +2,10 @@
 
 SQE rated against the [icebergmatrix.org](https://icebergmatrix.org) rubric ([Neuw84/iceberg-matrix](https://github.com/Neuw84/iceberg-matrix)).
 
-**Score: 158/162 (97.5%)** on 54 cells.
+**Score: 159/162 (98.1%)** on 54 cells.
 
 - SQE cells: `docs/evidence/iceberg-matrix-state.json`, last changed 2026-11-05.
-- Rubric and peer scores: `docs/evidence/iceberg-matrix-rubric.json`, upstream `027f151356` fetched 2026-10-27.
+- Rubric and peer scores: `docs/evidence/iceberg-matrix-rubric.json`, upstream `027f151356` fetched 2026-11-09.
 - Regenerate: `python3 scripts/render-iceberg-matrix-compare.py` (refreshes the rubric snapshot and [the engine comparison](./iceberg-matrix-compare.md)), then `python3 scripts/render-iceberg-matrix.py`.
 
 ---
@@ -30,7 +30,7 @@ Every engine scored on the same 54 cells. SQE rates itself; the other engines ar
 
 | Engine | Score | % |
 |---|---:|---:|
-| **SQE (self-rated)** | **158/162** | **97.5** |
+| **SQE (self-rated)** | **159/162** | **98.1** |
 | AWS EMR (8.1 Spark) | 147/162 | 90.7 |
 | Starburst (482-e) | 147/162 | 90.7 |
 | Dremio / SAP (26.x) | 146/162 | 90.1 |
@@ -106,7 +106,7 @@ Every engine scored on the same 54 cells. SQE rates itself; the other engines ar
 |---|:---:|:---:|---|---|
 | Variant Type | n/a | F | V3-only feature | VARIANT columns (and JSON columns on V3 tables) store Iceberg variant, unshredded. JSON text is parsed on write (invalid JSON fails the write), values read ... |
 | Shredded Variant | n/a | F | V3-only feature | SQE reads and writes shredded variant files. Read: Spark 4.1 + Iceberg 1.12 writes a table with write.parquet.shred-variants=true (the test asserts typed_value ... |
-| Geometry / Geo Types | n/a | P | V3-only feature | SQE reads GEOMETRY and GEOGRAPHY columns. The vendored iceberg-rust carries the upstream geospatial types and the read support from apache/iceberg-rust #3341; ... |
+| Geometry / Geo Types | n/a | F | V3-only feature | SQE reads GEOMETRY and GEOGRAPHY columns. The vendored iceberg-rust carries the upstream geospatial types and the read support from apache/iceberg-rust #3341; ... |
 | Nanosecond Timestamps | n/a | F | V3-only feature | TIMESTAMP_NS(N) / TIMESTAMPTZ_NS(N) map to Iceberg timestamp_ns / timestamptz_ns and to Arrow nanosecond timestamps; CREATE, INSERT and SELECT round-trip ... |
 | Unknown Type | n/a | F | V3-only feature | Top-level unknown columns work across engines. SQE declares one as UNKNOWN or VOID, reads a Spark-written VOID column as NULLs, inserts around it and promotes ... |
 
@@ -125,11 +125,6 @@ Every cell below full, with its caveats. Each has a `[MATRIX]` issue.
 - **google-lakehouse (v3)**, partial: Google Lakehouse runtime catalog exposes the Iceberg REST API, which SQE's REST client speaks. Rated partial because the pairing has not been measured.
   - Inferred from generic Iceberg REST catalog support; not measured against Google Lakehouse.
   - Iceberg data on GCS (gs://) through the table FileIO and Google OAuth for the REST endpoint are not verified.
-- **geometry-type (v3)**, partial: SQE reads GEOMETRY and GEOGRAPHY columns. The vendored iceberg-rust carries the upstream geospatial types and the read support from apache/iceberg-rust #3341; a column reads as WKB bytes (LargeBinary tagged geoarrow.wkb), filters and joins on it run in DataFusion, and information_schema reports it as LargeBinary (DataFusion's built-in provider answers it). Verified against a table written by Spark 4.1 + Iceberg 1.12 (spark.sql.geospatial.enabled). SQE also writes into such a table (INSERT, UPDATE and rewrite_data_files tested): values must be valid WKB, parquet tags the column as GEOMETRY / GEOGRAPHY, and a geometry column's manifest bounds are its bounding box (the vendored parquet writer carries the bounds from apache/iceberg-rust #3342). Spark 4.1 reads the rows SQE wrote and the compacted file. SQE creates such columns too: CREATE TABLE and ALTER TABLE ADD COLUMN take GEOMETRY[(crs)] and GEOGRAPHY[(crs[, algorithm])], with SRIDs mapped as Spark maps them (4326 is OGC:CRS84, n is EPSG:n); the table becomes format v3, and CTAS keeps the types. Spark 4.1 describes and reads an SQE-created table. A worker scans a Spark-written geospatial table too: the coordinator conforms the worker's Binary batches to the planned LargeBinary and keeps the GeoArrow tag, and a filter on the geometry column does not prune on its bounds. Thirty planar ST_* functions (sqe-geo) read and build WKB values: constructors, accessors, area / length / distance / centroid and the DE-9IM predicates; a geometry result writes into a GEOMETRY column, and the measures and predicates refuse a GEOGRAPHY value at planning time.
-  - A GEOGRAPHY column gets no manifest bounds: parquet computes no bounding box for it, and its byte-wise min/max would be wrong. Iceberg Java leaves the bounds out too when it has none.
-  - A geospatial column is top-level only: SQE refuses one inside STRUCT, ARRAY or MAP.
-  - No bounding-box pruning: a predicate on a geospatial column, ST_* included, is never pushed into the scan.
-  - The ST_* functions are planar only; there are no spherical GEOGRAPHY functions.
 
 ## Caveats on full cells
 
@@ -160,6 +155,10 @@ Every cell below full, with its caveats. Each has a `[MATRIX]` issue.
 - **snowflake-horizon-catalog (v3)**: Snowflake rewrites small tables copy-on-write whatever the merge-on-read setting; its deletion vectors only appear on large tables with ICEBERG_MERGE_ON_READ_BEHAVIOR = 'enabled'. Reading them needs parquet >= 59.3.2.
 - **snowflake-horizon-catalog (v3)**: The $files metadata table lists data files only; delete files and deletion vectors show in the $snapshots summary.
 - **shredded-variant (v3)**: Shredded columns are unshredded on read, so typed_value gives no typed field access. Its statistics prune row groups, on the coordinator and on a worker, only for a variant_get / try_variant_get comparison with a literal, and never on a double field (Parquet leaves NaN out of the statistics). A double field prunes files only against a double literal: 9.0 is a decimal literal and its comparison runs in decimal. Nested variants get no manifest bounds, as in Iceberg Java.
+- **geometry-type (v3)**: A GEOGRAPHY column gets no manifest bounds: parquet computes no bounding box for it, and its byte-wise min/max would be wrong. Iceberg Java leaves the bounds out too when it has none.
+- **geometry-type (v3)**: A geospatial column is top-level only: SQE refuses one inside STRUCT, ARRAY or MAP.
+- **geometry-type (v3)**: Bounding-box pruning covers GEOMETRY only: GEOGRAPHY has no planar bounds, and ST_Disjoint or a negated predicate is never pruned on.
+- **geometry-type (v3)**: GEOGRAPHY has the four measures (area, length, point distance, DWithin) in meters; the DE-9IM predicates, centroid and envelope are planar only and refuse it.
 - **lineage (v3)**: MoR DELETE is not a lineage case (deleted rows have no successor).
 
 ---

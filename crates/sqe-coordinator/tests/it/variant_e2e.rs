@@ -414,6 +414,14 @@ async fn cast_as_json_of_a_json_value_is_the_identity() {
             format!("SELECT CAST(ARRAY[json_parse(doc), NULL] AS JSON) FROM {src} ORDER BY id"),
             vec![r#"[{"n":1.5},null]"#, "[null,null]"],
         ),
+        // CASE and coalesce over JSON values stay JSON.
+        (
+            format!(
+                "SELECT id, CAST(CASE WHEN id = 1 THEN json_parse(doc) END AS JSON), \
+                 CAST(coalesce(json_parse(doc), json_parse('[]')) AS JSON) FROM {src} ORDER BY id"
+            ),
+            vec![r#"1|{"n":1.5}|{"n":1.5}"#, "2|NULL|[]"],
+        ),
         (
             format!("SELECT id, p, CAST(p AS JSON) FROM {dst} ORDER BY id"),
             vec![
@@ -578,7 +586,7 @@ async fn rewrite_data_files_preserves_variant_values() {
 
 /// The row groups of every data file of `table` (in `default`), and the
 /// largest file's size.
-async fn row_groups(
+pub(crate) async fn row_groups(
     handler: &sqe_coordinator::QueryHandler,
     session: &sqe_core::Session,
     table: &str,
@@ -606,7 +614,7 @@ async fn row_groups(
 }
 
 /// The scan's output rows in `EXPLAIN ANALYZE sql`.
-async fn scan_output_rows(
+pub(crate) async fn scan_output_rows(
     handler: &sqe_coordinator::QueryHandler,
     session: &sqe_core::Session,
     sql: &str,

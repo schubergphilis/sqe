@@ -51,7 +51,7 @@ V3 is the default format-version for new tables and landed end to end: default v
 
 | Feature | Status |
 |---|---|
-| Geometry / geography types | Created with DDL, read and written as WKB bytes. The `ST_*` functions are planar only and refuse `GEOGRAPHY` unless wrapped ([Geospatial](../sql-reference/geospatial.md)). A geospatial predicate does not prune files, and a geospatial type cannot be nested in a `STRUCT`, `ARRAY` or `MAP`. |
+| Geometry / geography types | Created with DDL, read and written as WKB bytes. The `ST_*` functions are planar only and refuse `GEOGRAPHY` unless wrapped ([Geospatial](../sql-reference/geospatial.md)). Only `GEOMETRY` predicates prune files and row groups (on the bounding box), and a geospatial type cannot be nested in a `STRUCT`, `ARRAY` or `MAP`. |
 | Multi-arg partition transforms | Not supported. `PARTITIONED BY` accepts single-source transforms only. |
 | Shredded variant reads | SQE writes and reads shredded variants, but unshreds on read, so a shredded field gives no typed access. A `variant_get` comparison with a literal prunes files on the variant bounds, and row groups on a shredded integer, string, date or boolean field. A double field prunes files only, and only against a double literal: `9.0` is a decimal, so write `9` or `CAST(9.5 AS DOUBLE)`. Variants inside a `STRUCT`, `ARRAY` or `MAP` are shredded but get no bounds, as in Iceberg Java. |
 | Unknown list elements and map keys/values | `ARRAY<VOID>`, a map with a `VOID` key or value, and a struct whose members are all unknown can be declared and read, but a row cannot be written: Parquet has no column for them, and Iceberg Java refuses the same writes. Unknown struct members (`STRUCT<a INT, u VOID>`) work. |

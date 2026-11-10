@@ -1920,6 +1920,15 @@ async fn test_explain_full() {
         "IcebergScanExec row should have non-NULL files_total"
     );
 
+    // The inner query takes the front door's rewrites, as it does on its
+    // own: DataFusion plans no `FETCH FIRST`, and `5e-1` is a double.
+    let sql = "EXPLAIN FULL SELECT * FROM test_ns.employees \
+               WHERE salary > 5e-1 FETCH FIRST 1 ROWS ONLY";
+    handler
+        .execute(&session, sql, None)
+        .await
+        .expect("EXPLAIN FULL plans a Trino-shaped query");
+
     teardown_join_fixture(&session, &handler).await;
 }
 
