@@ -11,11 +11,17 @@
 //! with the PostGIS / Spark spellings as aliases. Every function is
 //! strict: a NULL argument gives NULL.
 //!
-//! All the math is planar: lengths, areas and distances are in the units of
-//! the coordinates, as in PostGIS `geometry`. A function whose answer depends
-//! on the edge model refuses a `geography` argument (the field carries an
-//! `edges` key) at planning time, rather than answer a spherical question
-//! with planar math. Formatting and accessors (`ST_AsText`, `ST_X`,
+//! Over `geometry` the math is planar: lengths, areas and distances are in
+//! the units of the coordinates, as in PostGIS `geometry`.
+//!
+//! Over `geography` (the field carries a non-planar `edges` key) the four
+//! measures work on the earth, in meters and square meters, with longitude /
+//! latitude coordinates in degrees (see [`Earth`]): `ST_Area`, `ST_Length`,
+//! and `ST_Distance` / `ST_DWithin` between two points, as Trino's
+//! `SphericalGeography`. Every other function whose answer depends on the
+//! edge model (predicates, centroid, envelope, bounds) refuses a `geography`
+//! argument at planning time, rather than answer a spherical question with
+//! planar math. Formatting and accessors (`ST_AsText`, `ST_X`,
 //! `ST_GeometryType`, ...) accept both. To force planar math over geography
 //! values, rebuild them: `ST_GeomFromBinary(ST_AsBinary(g))`.
 
@@ -34,9 +40,10 @@ use datafusion::logical_expr::{
     Volatility,
 };
 use datafusion::prelude::SessionContext;
+use geo::orient::Direction;
 use geo::{
-    Area, BoundingRect, Centroid, CoordsIter, Distance, Euclidean, HasDimensions, Length, Relate,
-    Validation,
+    Area, BoundingRect, Centroid, CoordsIter, Distance, Euclidean, Geodesic, GeodesicArea,
+    HasDimensions, Haversine, Length, Orient, Relate, Validation,
 };
 use geo_traits::to_geo::ToGeoGeometry;
 use geo_types::{Geometry, LineString, Point, Rect};
@@ -90,6 +97,62 @@ pub fn is_geography(field: &Field) -> bool {
                 .map(|e| e != "planar")
         })
         .unwrap_or(false)
+}
+
+/// The earth model a GEOGRAPHY measure uses, picked by the column's edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Earth {
+    /// `spherical` edges (the Iceberg and Spark default): great circles on
+    /// a sphere of the GRS80 mean radius (6,371,008.8 m). Distance and
+    /// length are haversine, area the spherical excess ([`sphere_area`]).
+    Sphere,
+    /// `vincenty`, `thomas`, `andoyer` or `karney` edges: geodesics on the
+    /// WGS84 ellipsoid, computed with Karney's algorithm, the most accurate
+    /// of the four.
+    Ellipsoid,
+}
+
+/// The earth model a GEOGRAPHY measure runs on: `None` when no argument is
+/// a GEOGRAPHY value. A GEOGRAPHY next to a tagged planar geometry column,
+/// or two GEOGRAPHY columns with different edges, is refused. An untagged
+/// argument (a computed geometry such as `ST_Point(4.9, 52.4)`) is read as
+/// longitude / latitude.
+fn earth_model(name: &str, fields: &[FieldRef]) -> Result<Option<Earth>> {
+    let mut edges: Option<&str> = None;
+    let mut planar = None;
+    let tagged: Vec<(&FieldRef, Option<String>)> = fields
+        .iter()
+        .filter_map(|f| wkb_crs_and_edges(f).map(|(_, e)| (f, e)))
+        .collect();
+    for (f, e) in &tagged {
+        match e.as_deref() {
+            None => planar = Some(f.name()),
+            Some(e) => match edges {
+                None => edges = Some(e),
+                Some(seen) if seen != e => {
+                    return plan_err!(
+                        "{name}: GEOGRAPHY arguments with '{seen}' and '{e}' edges; \
+                         both sides must use the same edge model"
+                    )
+                }
+                Some(_) => {}
+            },
+        }
+    }
+    let Some(edges) = edges else {
+        return Ok(None);
+    };
+    if let Some(col) = planar {
+        return plan_err!(
+            "{name}: '{col}' is a GEOMETRY value and the other argument a GEOGRAPHY; \
+             measure both as one or the other"
+        );
+    }
+    Ok(Some(if edges == "spherical" {
+        Earth::Sphere
+    } else {
+        Earth::Ellipsoid
+    }))
 }
 
 /// The CRS and edge model a `geoarrow.wkb` field carries; `None` for any
@@ -357,6 +420,12 @@ impl Op {
                 | Op::IsEmpty
         )
     }
+
+    /// Whether the function measures a `geography` argument on the earth
+    /// (see [`Earth`]) rather than refusing it.
+    fn on_earth(self) -> bool {
+        matches!(self, Op::Area | Op::Length | Op::Distance | Op::DWithin)
+    }
 }
 
 /// `ST_SRID(g)`: the SRID of the column's CRS (see [`field_srid`]), NULL
@@ -490,11 +559,15 @@ impl ScalarUDFImpl for StFunction {
     }
 
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
-        if self.op.planar() {
+        if self.op.on_earth() {
+            earth_model(self.name(), args.arg_fields)?;
+        } else if self.op.planar() {
             if let Some(f) = args.arg_fields.iter().find(|f| is_geography(f)) {
                 return plan_err!(
                     "{} uses planar math and '{}' is a GEOGRAPHY value; \
-                     ST_GeomFromBinary(ST_AsBinary({})) reads it as planar geometry",
+                     ST_GeomFromBinary(ST_AsBinary({})) reads it as planar geometry \
+                     (on GEOGRAPHY, ST_Area, ST_Length, ST_Distance and ST_DWithin \
+                     measure in meters)",
                     self.name(),
                     f.name(),
                     f.name()
@@ -519,6 +592,11 @@ impl ScalarUDFImpl for StFunction {
             .iter()
             .all(|a| matches!(a, ColumnarValue::Scalar(_)));
         let rows = if all_scalar { 1 } else { args.number_rows };
+        let earth = if self.op.on_earth() {
+            earth_model(self.name(), &args.arg_fields)?
+        } else {
+            None
+        };
         let cols = args
             .args
             .iter()
@@ -538,7 +616,7 @@ impl ScalarUDFImpl for StFunction {
             if vals.len() < cols.len() {
                 out.push(Value::Null)?;
             } else {
-                out.push(eval(self.op, &vals)?)?;
+                out.push(eval(self.op, &vals, earth)?)?;
             }
         }
         let array = out.finish();
@@ -773,7 +851,7 @@ fn envelope(r: Rect) -> Geometry {
     }
 }
 
-fn eval(op: Op, a: &[Val<'_>]) -> Result<Value> {
+fn eval(op: Op, a: &[Val<'_>], earth: Option<Earth>) -> Result<Value> {
     let name = op.name();
     let bbox = |f: fn(Rect) -> f64| {
         Ok(geom(&a[0])
@@ -811,17 +889,33 @@ fn eval(op: Op, a: &[Val<'_>]) -> Result<Value> {
         Op::Envelope => Ok(geom(&a[0])
             .bounding_rect()
             .map_or(Value::Null, |r| Value::Geom(envelope(r)))),
-        Op::Area => Ok(Value::Num(geom(&a[0]).unsigned_area())),
-        Op::Length => match geom(&a[0]) {
-            Geometry::Line(l) => Ok(Value::Num(Euclidean.length(l))),
-            Geometry::LineString(l) => Ok(Value::Num(Euclidean.length(l))),
-            Geometry::MultiLineString(l) => Ok(Value::Num(Euclidean.length(l))),
-            g => exec_err!(
+        Op::Area => Ok(Value::Num(match earth {
+            None => geom(&a[0]).unsigned_area(),
+            Some(Earth::Sphere) => sphere_area(geom(&a[0])),
+            Some(Earth::Ellipsoid) => ellipsoid_area(geom(&a[0])),
+        })),
+        Op::Length => match (geom(&a[0]), earth) {
+            (Geometry::Line(l), None) => Ok(Value::Num(Euclidean.length(l))),
+            (Geometry::LineString(l), None) => Ok(Value::Num(Euclidean.length(l))),
+            (Geometry::MultiLineString(l), None) => Ok(Value::Num(Euclidean.length(l))),
+            (Geometry::Line(l), Some(Earth::Sphere)) => Ok(Value::Num(Haversine.length(l))),
+            (Geometry::LineString(l), Some(Earth::Sphere)) => Ok(Value::Num(Haversine.length(l))),
+            (Geometry::MultiLineString(l), Some(Earth::Sphere)) => {
+                Ok(Value::Num(Haversine.length(l)))
+            }
+            (Geometry::Line(l), Some(Earth::Ellipsoid)) => Ok(Value::Num(Geodesic.length(l))),
+            (Geometry::LineString(l), Some(Earth::Ellipsoid)) => Ok(Value::Num(Geodesic.length(l))),
+            (Geometry::MultiLineString(l), Some(Earth::Ellipsoid)) => {
+                Ok(Value::Num(Geodesic.length(l)))
+            }
+            (g, _) => exec_err!(
                 "{name} only applies to a LINESTRING or MULTILINESTRING, got {}",
                 type_name(g)
             ),
         },
-        Op::Distance => Ok(distance(geom(&a[0]), geom(&a[1])).map_or(Value::Null, Value::Num)),
+        Op::Distance => {
+            Ok(distance(name, geom(&a[0]), geom(&a[1]), earth)?.map_or(Value::Null, Value::Num))
+        }
         Op::Centroid => Ok(geom(&a[0])
             .centroid()
             .map_or(Value::Null, |p| Value::Geom(Geometry::Point(p)))),
@@ -833,14 +927,115 @@ fn eval(op: Op, a: &[Val<'_>]) -> Result<Value> {
         Op::Touches => relate(|m| m.is_touches()),
         Op::Crosses => relate(|m| m.is_crosses()),
         Op::Overlaps => relate(|m| m.is_overlaps()),
-        Op::DWithin => Ok(distance(geom(&a[0]), geom(&a[1]))
+        Op::DWithin => Ok(distance(name, geom(&a[0]), geom(&a[1]), earth)?
             .map_or(Value::Null, |d| Value::Bool(d <= num(&a[2])))),
     }
 }
 
-/// Planar distance, NULL when either side is empty.
-fn distance(a: &Geometry, b: &Geometry) -> Option<f64> {
-    (!a.is_empty() && !b.is_empty()).then(|| Euclidean.distance(a, b))
+/// Distance, NULL when either side is empty. On the earth it is the
+/// distance between two points in meters, as Trino's `SphericalGeography`;
+/// any other shape is refused.
+fn distance(name: &str, a: &Geometry, b: &Geometry, earth: Option<Earth>) -> Result<Option<f64>> {
+    if a.is_empty() || b.is_empty() {
+        return Ok(None);
+    }
+    let Some(earth) = earth else {
+        return Ok(Some(Euclidean.distance(a, b)));
+    };
+    match (a, b) {
+        (Geometry::Point(p), Geometry::Point(q)) => Ok(Some(match earth {
+            Earth::Sphere => Haversine.distance(*p, *q),
+            Earth::Ellipsoid => Geodesic.distance(*p, *q),
+        })),
+        (Geometry::Point(_), g) | (g, _) => exec_err!(
+            "{name} on GEOGRAPHY measures between two POINTs, got {}",
+            type_name(g)
+        ),
+    }
+}
+
+/// The GRS80 mean earth radius in meters, the sphere `Haversine` uses.
+const EARTH_RADIUS: f64 = 6_371_008.8;
+
+/// Area on the sphere with great-circle edges, exact: the spherical excess
+/// of each ring, summed edge by edge as the signed triangle the edge makes
+/// with the north pole. A ring encloses the smaller side of the sphere, so a
+/// polygon never covers more than a hemisphere and the winding does not
+/// matter, as on the ellipsoid. (`geo`'s Chamberlain-Duquette area is an
+/// approximation, 0.2% off on a one-degree square.)
+fn sphere_area(g: &Geometry) -> f64 {
+    fn ring(r: &LineString) -> f64 {
+        // The distinct vertices of the closed ring.
+        let mut pts: Vec<(f64, f64)> = r.coords().map(|c| (c.x, c.y)).collect();
+        if pts.len() > 1 && pts.first() == pts.last() {
+            pts.pop();
+        }
+        let n = pts.len();
+        let polar = |lat: f64| lat.abs() >= 90.0;
+        // A vertex on a pole has no longitude of its own; it takes the one
+        // before it, so the two edges through the pole add up to the step
+        // between their other ends rather than two separately wrapped steps.
+        if let Some(start) = pts.iter().position(|p| !polar(p.1)) {
+            for j in 1..n {
+                let (prev, i) = ((start + j - 1) % n, (start + j) % n);
+                if polar(pts[i].1) {
+                    pts[i].0 = pts[prev].0;
+                }
+            }
+        }
+        let excess: f64 = (0..n)
+            .map(|i| {
+                let ((x1, y1), (x2, y2)) = (pts[i], pts[(i + 1) % n]);
+                let (t1, t2) = ((y1.to_radians() / 2.0).tan(), (y2.to_radians() / 2.0).tan());
+                // The longitude step, across the antimeridian the short way.
+                let mut dl = (x2 - x1).to_radians();
+                if dl > std::f64::consts::PI {
+                    dl -= std::f64::consts::TAU;
+                } else if dl < -std::f64::consts::PI {
+                    dl += std::f64::consts::TAU;
+                }
+                2.0 * ((dl / 2.0).tan() * (t1 + t2)).atan2(1.0 + t1 * t2)
+            })
+            .sum::<f64>()
+            .abs();
+        excess.min(2.0 * std::f64::consts::TAU - excess)
+    }
+    fn polygon(p: &geo_types::Polygon) -> f64 {
+        (ring(p.exterior()) - p.interiors().iter().map(ring).sum::<f64>()).max(0.0)
+    }
+    let excess = match g {
+        Geometry::Polygon(p) => polygon(p),
+        Geometry::MultiPolygon(m) => m.iter().map(polygon).sum(),
+        Geometry::Rect(r) => polygon(&r.to_polygon()),
+        Geometry::Triangle(t) => polygon(&t.to_polygon()),
+        Geometry::GeometryCollection(c) => {
+            return c.iter().map(sphere_area).sum();
+        }
+        _ => 0.0,
+    };
+    excess * EARTH_RADIUS * EARTH_RADIUS
+}
+
+/// Area on the WGS84 ellipsoid. Karney's method reads the ring order, so
+/// polygons are first wound as Simple Features wants them (exterior
+/// counter-clockwise, holes clockwise): Spark and other writers do not
+/// promise a winding. A polygon therefore never covers more than a
+/// hemisphere, as in PostGIS.
+fn ellipsoid_area(g: &Geometry) -> f64 {
+    match g {
+        Geometry::Polygon(p) => p.orient(Direction::Default).geodesic_area_unsigned(),
+        Geometry::MultiPolygon(m) => m.orient(Direction::Default).geodesic_area_unsigned(),
+        Geometry::Rect(r) => r
+            .to_polygon()
+            .orient(Direction::Default)
+            .geodesic_area_unsigned(),
+        Geometry::Triangle(t) => t
+            .to_polygon()
+            .orient(Direction::Default)
+            .geodesic_area_unsigned(),
+        Geometry::GeometryCollection(c) => c.iter().map(ellipsoid_area).sum(),
+        _ => 0.0,
+    }
 }
 
 #[cfg(test)]
@@ -1063,13 +1258,175 @@ mod tests {
             .unwrap();
         assert_eq!(text[0].column(0).as_string::<i32>().value(0), "POINT(1 2)");
         let refused = ctx
-            .sql("SELECT ST_Area(geo) FROM t")
+            .sql("SELECT ST_Centroid(geo) FROM t")
             .await
             .expect_err("planar on geography");
         assert!(refused.to_string().contains("GEOGRAPHY"), "{refused}");
-        ctx.sql("SELECT ST_Area(ST_GeomFromBinary(ST_AsBinary(geo))) FROM t")
+        ctx.sql("SELECT ST_Centroid(ST_GeomFromBinary(ST_AsBinary(geo))) FROM t")
             .await
             .unwrap();
+    }
+
+    /// A one-row table `t(g geometry, sph geography, ell geography(karney))`
+    /// holding the WKT `wkt` in all three columns.
+    fn earth_ctx(wkt: &str) -> SessionContext {
+        let field = |name: &str, meta: Option<&str>| wkb_field(meta).with_name(name);
+        let wkb = encode(&from_wkt("test", wkt).unwrap()).unwrap();
+        let col: ArrayRef = Arc::new(LargeBinaryArray::from_iter([Some(wkb.as_slice())]));
+        let schema = Arc::new(Schema::new(vec![
+            field("g", Some(r#"{"crs":"OGC:CRS84"}"#)),
+            field("sph", Some(r#"{"crs":"OGC:CRS84","edges":"spherical"}"#)),
+            field("ell", Some(r#"{"crs":"OGC:CRS84","edges":"karney"}"#)),
+        ]));
+        let ctx = ctx();
+        ctx.register_batch(
+            "t",
+            RecordBatch::try_new(schema, vec![col.clone(), col.clone(), col]).unwrap(),
+        )
+        .unwrap();
+        ctx
+    }
+
+    async fn nums(ctx: &SessionContext, sql: &str) -> Vec<Option<f64>> {
+        let out = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        (0..out[0].num_columns())
+            .map(|i| {
+                let c = out[0]
+                    .column(i)
+                    .as_primitive::<arrow::datatypes::Float64Type>();
+                c.is_valid(0).then(|| c.value(0))
+            })
+            .collect()
+    }
+
+    fn near(got: Option<f64>, want: f64, tol: f64) {
+        let got = got.expect("a value");
+        assert!((got - want).abs() <= tol, "got {got}, want {want} +- {tol}");
+    }
+
+    /// GEOGRAPHY measures run on the earth in meters: one degree of the
+    /// equator is 111,195 m on the sphere and 111,319 m on WGS84.
+    #[tokio::test]
+    async fn geography_distance_and_length_in_meters() {
+        let ctx = earth_ctx("POINT(0 0)");
+        let d = nums(
+            &ctx,
+            "SELECT ST_Distance(sph, ST_Point(1, 0)), ST_Distance(ST_Point(1, 0), ell), \
+             ST_Distance(g, ST_Point(1, 0)) FROM t",
+        )
+        .await;
+        near(d[0], 111_195.08, 0.01);
+        near(d[1], 111_319.49, 0.01);
+        near(d[2], 1.0, 0.0);
+
+        // Amsterdam to Paris on the sphere, as Trino's
+        // ST_Distance(to_spherical_geography(..), ..) gives it.
+        let ctx = earth_ctx("POINT(4.9041 52.3676)");
+        let d = nums(
+            &ctx,
+            "SELECT ST_Distance(sph, ST_Point(2.3522, 48.8566)) FROM t",
+        )
+        .await;
+        near(d[0], 430_000.0, 2_000.0);
+        let within = ctx
+            .sql(
+                "SELECT ST_DWithin(sph, ST_Point(2.3522, 48.8566), 440000), \
+                 ST_DWithin(sph, ST_Point(2.3522, 48.8566), 420000) FROM t",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert!(within[0].column(0).as_boolean().value(0));
+        assert!(!within[0].column(1).as_boolean().value(0));
+
+        let ctx = earth_ctx("LINESTRING(0 0, 1 0, 2 0)");
+        let l = nums(
+            &ctx,
+            "SELECT ST_Length(sph), ST_Length(ell), ST_Length(g) FROM t",
+        )
+        .await;
+        near(l[0], 2.0 * 111_195.08, 0.02);
+        near(l[1], 2.0 * 111_319.49, 0.02);
+        near(l[2], 2.0, 0.0);
+
+        // Points only between GEOGRAPHY values, as Trino.
+        let err = ctx
+            .sql("SELECT ST_Distance(sph, ST_Point(0, 0)) FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .expect_err("a line on geography");
+        assert!(err.to_string().contains("two POINTs"), "{err}");
+    }
+
+    /// A one-degree square on the equator: 12,308,778,361 m2 on WGS84,
+    /// whichever way the ring is wound. On the sphere a great-circle octant
+    /// is exactly an eighth of the surface, pi R^2 / 2.
+    #[tokio::test]
+    async fn geography_area_in_square_meters() {
+        for ring in [
+            "POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))",
+            "POLYGON((0 0, 0 1, 1 1, 1 0, 0 0))",
+        ] {
+            let ctx = earth_ctx(ring);
+            let a = nums(&ctx, "SELECT ST_Area(sph), ST_Area(ell), ST_Area(g) FROM t").await;
+            // The square bounded by the parallel at 1 degree has area
+            // R^2 * d_lon * sin(1 deg). The great-circle top edge bows toward
+            // the pole by a sagitta of R * d_lon^2 / 8 * sin(1) cos(1)
+            // (4.23 m), adding about 2/3 * chord * sagitta (313,800 m2).
+            let r2 = EARTH_RADIUS * EARTH_RADIUS;
+            let (dl, lat) = (1f64.to_radians(), 1f64.to_radians());
+            let parallel = r2 * dl * lat.sin();
+            let sagitta = EARTH_RADIUS * dl * dl / 8.0 * lat.sin() * lat.cos();
+            let bow = 2.0 / 3.0 * EARTH_RADIUS * dl * lat.cos() * sagitta;
+            near(a[0], parallel + bow, 1_000.0);
+            near(a[1], 12_308_778_361.0, 1e3);
+            near(a[2], 1.0, 0.0);
+        }
+        let octant = std::f64::consts::PI * EARTH_RADIUS * EARTH_RADIUS / 2.0;
+        for ring in [
+            "POLYGON((0 0, 90 0, 0 90, 0 0))",
+            "POLYGON((0 0, 0 90, 90 0, 0 0))",
+            "POLYGON((170 0, -100 0, 0 90, 170 0))",
+        ] {
+            let ctx = earth_ctx(ring);
+            near(
+                nums(&ctx, "SELECT ST_Area(sph) FROM t").await[0],
+                octant,
+                1.0,
+            );
+        }
+        // A hole is taken out.
+        let ctx = earth_ctx("POLYGON((0 0, 90 0, 0 90, 0 0), (10 10, 10 20, 20 10, 10 10))");
+        let holed = nums(&ctx, "SELECT ST_Area(sph) FROM t").await[0].unwrap();
+        assert!(holed < octant - 1e11, "{holed}");
+
+        let ctx = earth_ctx("POINT(1 2)");
+        let a = nums(&ctx, "SELECT ST_Area(sph), ST_Area(ell) FROM t").await;
+        assert_eq!(a, vec![Some(0.0), Some(0.0)]);
+    }
+
+    /// The earth model comes from the GEOGRAPHY side; a tagged GEOMETRY
+    /// column next to it, or two edge models, do not plan.
+    #[tokio::test]
+    async fn geography_refuses_mixed_arguments() {
+        let ctx = earth_ctx("POINT(0 0)");
+        for (sql, want) in [
+            ("SELECT ST_Distance(g, sph) FROM t", "GEOMETRY value"),
+            ("SELECT ST_DWithin(sph, g, 1) FROM t", "GEOMETRY value"),
+            ("SELECT ST_Distance(sph, ell) FROM t", "same edge model"),
+            (
+                "SELECT ST_Intersects(sph, ST_Point(0, 0)) FROM t",
+                "planar math",
+            ),
+            ("SELECT ST_XMin(ell) FROM t", "planar math"),
+        ] {
+            let err = ctx.sql(sql).await.expect_err(sql);
+            assert!(err.to_string().contains(want), "{sql}: {err}");
+        }
     }
 
     /// A `geoarrow.wkb` field as the scan tags it; `meta` is the extension

@@ -5,7 +5,8 @@
 use crate::variant_spark_interop::sqe_rows;
 
 /// Three rows across two INSERTs (two data files): a point, a NULL, and a
-/// 4 x 3 rectangle. `h` is GEOGRAPHY, so the planar functions refuse it.
+/// 4 x 3 rectangle. `h` is GEOGRAPHY: the measures work in meters on the
+/// sphere, the other planar functions refuse it.
 async fn create_table(
     handler: &sqe_coordinator::QueryHandler,
     session: &sqe_core::Session,
@@ -78,10 +79,22 @@ async fn st_functions_over_an_sqe_geometry_table() {
         &format!("SELECT ST_AsText(h), ST_GeometryType(h) FROM {fq} WHERE id = 1"),
     )
     .await;
+    let meters = sqe_rows(
+        &handler,
+        &session,
+        &format!(
+            "SELECT id, CAST(ROUND(ST_Distance(h, ST_Point(0, 0))) AS BIGINT) \
+             FROM {fq} WHERE h IS NOT NULL"
+        ),
+    )
+    .await;
     let planar_on_geography = handler
+        .execute(&session, &format!("SELECT ST_Centroid(h) FROM {fq}"), None)
+        .await;
+    let mixed = handler
         .execute(
             &session,
-            &format!("SELECT ST_Distance(h, ST_Point(0, 0)) FROM {fq}"),
+            &format!("SELECT ST_Distance(g, h) FROM {fq}"),
             None,
         )
         .await;
@@ -109,10 +122,16 @@ async fn st_functions_over_an_sqe_geometry_table() {
         "ST_Centroid written back"
     );
     assert_eq!(geography, vec!["POINT(1 2)|ST_Point".to_string()]);
+    // Haversine on the GRS80 mean radius, POINT(1 2) to POINT(0 0).
+    assert_eq!(meters, vec!["1|248630".to_string()], "meters on the sphere");
     let err = planar_on_geography
         .expect_err("planar math on GEOGRAPHY is refused")
         .to_string();
     assert!(err.contains("GEOGRAPHY"), "{err}");
+    let err = mixed
+        .expect_err("GEOMETRY next to GEOGRAPHY is refused")
+        .to_string();
+    assert!(err.contains("GEOMETRY value"), "{err}");
 }
 
 /// DESCRIBE and SHOW CREATE TABLE print a geospatial column's type with its
