@@ -54,6 +54,62 @@ COMPOSE_FILE="$ROOT_DIR/docker-compose.test.yml"
 
 # ── Configuration ─────────────────────────────────────────────
 BENCH_SCALE="${BENCH_SCALE:-1}"
+
+# ── Host-sized defaults ───────────────────────────────────────
+# tests/sqe-test.toml is written for a large workstation. On a smaller or
+# Linux box, four of its assumptions break an SF100 sweep. Each default below
+# only applies when the operator has not set the variable.
+#
+# 1. Open files. A spilling sort keeps every run file open; TPC-H SF100 q07
+#    wrote 834 of them, past the 1024 soft limit most Linux logins start
+#    with (EMFILE, "Too many open files"). Raise the soft limit to the hard
+#    limit, capped at 65536.
+NOFILE_HARD=$(ulimit -Hn 2>/dev/null || echo 1024)
+[ "$NOFILE_HARD" = "unlimited" ] && NOFILE_HARD=65536
+[ "$NOFILE_HARD" -gt 65536 ] 2>/dev/null && NOFILE_HARD=65536
+if [ "$(ulimit -Sn)" != "unlimited" ] && [ "$(ulimit -Sn)" -lt "$NOFILE_HARD" ] 2>/dev/null; then
+    ulimit -Sn "$NOFILE_HARD" 2>/dev/null || true
+fi
+# 2. Query timeout. TPC-H files carry `-- timeout: 60s`, sized for SF1-SF10;
+#    at SF100 q18 and q21 need 60-110s. BENCH_QUERY_TIMEOUT_SECS overrides
+#    every per-file header (crates/sqe-bench/src/execute.rs).
+if [ -z "${BENCH_QUERY_TIMEOUT_SECS:-}" ] && [ "${BENCH_SCALE%%.*}" -ge 100 ] 2>/dev/null; then
+    export BENCH_QUERY_TIMEOUT_SECS=600
+fi
+# 3. Memory ceiling. The config's 64GB is a ceiling the pool trusts; on a
+#    31 GB box a query can grow past physical RAM before the pool refuses
+#    it, and the kernel OOM-kills the coordinator instead of letting spill
+#    or the sort-merge fallback kick in. Use
+#    75% of physical RAM when that is smaller.
+if [ -z "${SQE_MEMORY_LIMIT:-}" ] && [ -z "${SQE_COORDINATOR__MEMORY_LIMIT:-}" ]; then
+    MEM_BYTES=""
+    if [ -r /proc/meminfo ]; then
+        MEM_BYTES=$(awk '/^MemTotal:/ {print $2 * 1024}' /proc/meminfo)
+    elif command -v sysctl >/dev/null 2>&1; then
+        MEM_BYTES=$(sysctl -n hw.memsize 2>/dev/null || true)
+    fi
+    if [ -n "$MEM_BYTES" ]; then
+        MEM_LIMIT_GB=$(awk -v b="$MEM_BYTES" 'BEGIN { printf "%d", b * 0.75 / 1073741824 }')
+        if [ "$MEM_LIMIT_GB" -ge 1 ] && [ "$MEM_LIMIT_GB" -lt 64 ]; then
+            export SQE_MEMORY_LIMIT="${MEM_LIMIT_GB}GB"
+        fi
+    fi
+fi
+# 4. Spill directory. The config spills to /tmp, which is a RAM-backed tmpfs
+#    on many Linux hosts: spilling there competes with the memory it is
+#    meant to relieve (q09 alone spills ~49 GB at SF100). Spill under TMPDIR
+#    when it points outside /tmp, else under the repo's target/.
+if [ -z "${SQE_COORDINATOR__SPILL_DIR:-}" ]; then
+    TMP_FS=$(findmnt -n -o FSTYPE /tmp 2>/dev/null || stat -f -c %T /tmp 2>/dev/null || true)
+    if [ "$TMP_FS" = "tmpfs" ]; then
+        case "${TMPDIR:-/tmp}" in
+            /tmp|/tmp/*) SPILL_BASE="$ROOT_DIR/target" ;;
+            *) SPILL_BASE="${TMPDIR%/}" ;;
+        esac
+        export SQE_COORDINATOR__SPILL_DIR="$SPILL_BASE/sqe-bench-spill"
+    fi
+fi
+echo "Host defaults: nofile=$(ulimit -Sn) timeout=${BENCH_QUERY_TIMEOUT_SECS:-per-file} memory_limit=${SQE_MEMORY_LIMIT:-${SQE_COORDINATOR__MEMORY_LIMIT:-config}} spill_dir=${SQE_COORDINATOR__SPILL_DIR:-config}"
 BENCH_PROTOCOL="${BENCH_PROTOCOL:-flight}"
 BENCH_DATA_DIR="${BENCH_DATA_DIR:-/tmp/sqe-bench-data}"
 BENCH_HOST="localhost"
@@ -644,7 +700,12 @@ if [ -n "$COMPARE_TRINO" ]; then
     # Create Trino catalog config (may carry external credentials)
     mkdir -p /tmp/trino-bench/catalog
     touch /tmp/trino-bench/catalog/iceberg.properties
-    chmod 600 /tmp/trino-bench/catalog/iceberg.properties
+    # 640, not 600: the Trino image runs as uid 1000, and on Linux the bind
+    # mount keeps host ownership, so a 600 file owned by any other host user
+    # is unreadable and Trino exits at startup. The container joins our group
+    # (`--group-add` below) to read it. Docker Desktop's file sharing hides
+    # the problem on macOS.
+    chmod 640 /tmp/trino-bench/catalog/iceberg.properties
     cat > /tmp/trino-bench/catalog/iceberg.properties << TRINOEOF
 connector.name=iceberg
 iceberg.catalog.type=rest
@@ -718,6 +779,7 @@ TRINOEOF
     fi
     TRINO_CONTAINER=$(docker run -d --rm \
         --name trino-bench \
+        --group-add "$(id -g)" \
         -p "${TRINO_PORT}:8080" \
         ${TRINO_NETWORK_ARGS[@]+"${TRINO_NETWORK_ARGS[@]}"} \
         ${TRINO_MEMORY_ARGS[@]+"${TRINO_MEMORY_ARGS[@]}"} \
@@ -729,6 +791,17 @@ TRINOEOF
     for i in $(seq 1 180); do
         if curl -sf "http://localhost:${TRINO_PORT}/v1/info" >/dev/null 2>&1; then
             echo " ready"
+            break
+        fi
+        # `--rm` deletes a container that exits, so a Trino that dies at
+        # startup (bad config, unreadable catalog file) is gone, logs and
+        # all. Stop waiting the moment it disappears instead of six minutes on.
+        if ! docker inspect trino-bench >/dev/null 2>&1; then
+            echo " EXITED"
+            echo "  WARNING: TRINO DID NOT COME UP: the container exited during startup;"
+            echo "  rerun it in the foreground to see why:"
+            echo "    docker run --rm -v /tmp/trino-bench/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro $TRINO_IMAGE"
+            COMPARE_TRINO=""
             break
         fi
         if [ "$i" -eq 180 ]; then

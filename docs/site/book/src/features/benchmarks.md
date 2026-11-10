@@ -397,6 +397,34 @@ Reports are written to `benchmarks/results/<benchmark>-sf<N>-<protocol>-<timesta
 
 JSON reports are machine-readable and suitable for tracking regressions over time in CI.
 
+## Large scale factors
+
+`scripts/benchmark-test.sh` sizes four settings to the host when you leave them unset. The test config is written for a large workstation, and an SF100 sweep on a smaller Linux box trips over each of them.
+
+| Setting | Default on a small host | Why |
+|---|---|---|
+| Open files | soft limit raised to the hard limit (max 65536) | a spilling sort keeps every run file open; TPC-H SF100 q07 wrote 834 of them, past the usual 1024 |
+| `BENCH_QUERY_TIMEOUT_SECS` | 600 at SF100 and above | the per-file `-- timeout: 60s` headers fit SF1-SF10; SF100 q18 and q21 take 60-110s |
+| `SQE_MEMORY_LIMIT` | 75% of physical RAM, when below the config's 64GB | a ceiling above RAM lets the kernel kill the coordinator before the pool can spill |
+| `SQE_COORDINATOR__SPILL_DIR` | `$TMPDIR/sqe-bench-spill`, when `/tmp` is tmpfs | spilling to RAM defeats the point; q09 spills ~49 GB at SF100 under a 4GB cap |
+
+The script prints the values it used on a `Host defaults:` line. Set any of them yourself to override.
+
+## Profiling slow queries
+
+The test config logs a `query_profile` record for every query: the executed plan with per-operator metrics. `scripts/bench-profile.py` turns the coordinator log into a per-query list of the hottest operators, with scan bytes, pruning and spill:
+
+```bash
+# All queries of a run, labelled with the bench query ids
+scripts/bench-profile.py /tmp/sqe-bench-coord-<pid>.log \
+    --results benchmarks/results/tpch-sf100-flight-<timestamp>.json
+
+# Only the slow ones, ten operators each
+scripts/bench-profile.py LOG --results REPORT --min-ms 30000 --top 10
+```
+
+Operator time is CPU time summed over partitions, so it can exceed the query's wall time. Queries that time out leave no profile; the script lists them at the end.
+
 ## Historical Performance Tracking
 
 Benchmark JSON results are committed to `benchmarks/results/` for historical comparison. This enables tracking performance regressions and improvements across releases. The committed JSONs feed the per-suite, per-scale, per-query timeline on [getsqe.com/performance](https://getsqe.com/performance); refer there for the longitudinal view of how each suite moved across the optimization work.
