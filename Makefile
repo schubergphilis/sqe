@@ -113,7 +113,7 @@ BENCH_STORAGE  ?= local
         clippy lint fmt fmt-check pre-commit pre-commit-all clean clean-rust clean-rustbook \
         clean-ebook clean-benchmark-charts clean-images check-tools maintain \
         build build-sqe sbom sbom-sqe sqe-config images \
-        login buildx-builder push push-sqe leak-scan leaks
+        login buildx-builder push push-sqe leak-scan leaks mirror-github
 
 # ── Default target ────────────────────────────────────────────────────────
 help:
@@ -198,6 +198,7 @@ help:
 	@echo "    make check-tools  Verify cargo / mdbook / pandoc / d2 / mmdc are present"
 	@echo "    make leak-scan    Scan docs/site for account ids, internal hosts and user names (gitleaks covers secrets)"
 	@echo "    make leaks        Scan the whole tree: internal hosts/paths/names, home paths, AWS accounts, credentials"
+	@echo "    make mirror-github  Dry-run the GitHub mirror (PUSH=1 pushes main + tags, messages scrubbed)"
 
 # `all` is the full gate: supply chain, unit tests, the deployable image, then
 # the benchmark sweep. `all_trino` is the same with SQE-vs-Trino comparison on.
@@ -641,3 +642,10 @@ leak-scan:
 leaks: leak-scan
 	@echo "==> Scanning the repository for internal identifiers and credentials"
 	@bash scripts/leak-scan-repo.sh
+
+# GitHub mirror: main + tags with the internal host and group path rewritten
+# out of commit messages (deterministic, so pushes stay fast-forwards).
+# `make mirror-github` is a dry run; PUSH=1 pushes after `make leaks` passes.
+mirror-github:
+	@if [ "$(PUSH)" = "1" ]; then $(MAKE) --no-print-directory leaks && bash scripts/mirror-github.sh --push; \
+	else bash scripts/mirror-github.sh; fi
