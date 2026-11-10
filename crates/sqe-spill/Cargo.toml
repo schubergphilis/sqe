@@ -5,28 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0"
 repository.workspace = true
-description = "Byte budgets, accounted buffers, and (later) spill segment storage for SQE"
+description = "Byte budgets, accounted buffers and memory pools for the SQE worker"
 
 [lib]
 name = "sqe_spill"
 path = "src/lib.rs"
 
 [dependencies]
-arrow-array = { workspace = true }
-arrow-ipc = { workspace = true }
-arrow-schema = { workspace = true }
-async-trait = { workspace = true }
-bytes = { workspace = true }
-crc32fast = "1.4"
 datafusion = { workspace = true }
-futures = { workspace = true }
-object_store = { workspace = true }
-serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }

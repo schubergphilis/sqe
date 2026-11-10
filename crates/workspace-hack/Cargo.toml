@@ -62,7 +62,6 @@ geo-types = { version = "0.7", features = ["rstar_0_12"] }
 getrandom = { version = "0.3", default-features = false, features = ["std", "wasm_js"] }
 hashbrown-582f2526e08bb6a0 = { package = "hashbrown", version = "0.14", default-features = false, features = ["raw"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
-httparse = { version = "1" }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "server-auto", "service"] }
 iceberg-catalog-rest = { path = "../../vendor/iceberg-rust/crates/catalog/rest", default-features = false, features = ["aws-sigv4"] }
@@ -99,7 +98,6 @@ reqwest-594e8ee84c453af0 = { package = "reqwest", version = "0.13", default-feat
 reqwest-5ef9efb8ec2df382 = { package = "reqwest", version = "0.12", default-features = false, features = ["http2", "json", "rustls-tls-native-roots", "stream"] }
 ring = { version = "0.17", features = ["std"] }
 rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
-rustls-pki-types = { version = "1", features = ["std"] }
 scopeguard = { version = "1" }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }

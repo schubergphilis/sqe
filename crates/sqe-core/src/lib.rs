@@ -26,15 +26,14 @@ pub use process_memory::{
     DEFAULT_RUNTIME_MEMORY_WATCH_INTERVAL,
 };
 
-pub use config::{
-    parse_memory_limit, AuthProviderConfig, ExternalAuthConfig,
-    FlightCompression, MemoryPoolKind, ProfileMode, QueryCacheConfig, QueryConfig,
-    QueryHistoryConfig, ResolvedWorkerMemory, ServerMode, SortMode, SqeConfig,
-    WorkerMemoryConfig, WorkerSpillConfig,
-};
-pub use runtime::{build_server_runtime, DEFAULT_RUNTIME_STACK_MIB};
 pub use circuit_breaker::CircuitBreaker;
+pub use config::{
+    parse_memory_limit, AuthProviderConfig, ExternalAuthConfig, FlightCompression, MemoryPoolKind,
+    ProfileMode, QueryCacheConfig, QueryConfig, QueryHistoryConfig, ResolvedWorkerMemory,
+    ServerMode, SortMode, SqeConfig, WorkerMemoryConfig,
+};
 pub use error::{classified_by_text_total, CatalogOp, Result, SqeError, SqeErrorCode};
+pub use runtime::{build_server_runtime, DEFAULT_RUNTIME_STACK_MIB};
 pub use secret::{Secret, SecretStore, SecretStoreError};
 pub use secret_string::SecretString;
 pub use session::{Credentials, Session, SessionUser};

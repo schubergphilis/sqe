@@ -1,30 +1,25 @@
-//! Shared execution primitives for bounded-memory and spill.
+//! Byte accounting and memory pools for the SQE worker.
 //!
-//! Phase 1 delivers ownership-based byte accounting:
 //! - [`ByteBudget`] / [`BytePermit`]: fixed-unit admission against a capacity
 //!   and (optionally) the DataFusion [`MemoryPool`].
 //! - [`Accounted`]: a value that carries its permit so moves do not double-charge.
+//! - [`MemoryGovernor`] and [`ResizableFairSpillPool`]: the worker-wide pool,
+//!   resizable on hot config reload.
+//! - [`MemoryGrant`]: the operator memory grant the planner sizes sorts from.
 //!
-//! Phase 3 adds the spill substrate:
-//! - [`SpillManager`] / [`SpillScope`] / [`SpillSegment`]
-//! - [`SegmentStore`] with a local filesystem implementation
+//! The crate once also held a spill segment store (local, S3 and tiered
+//! backends behind a `SpillManager`). No query path ever wrote to it, since
+//! workers only scan; it was removed and DataFusion's own disk manager does
+//! all spilling.
 //!
-//! See `docs/superpowers/plans/2026-07-25-bounded-memory-spill-execution.md`.
+//! [`MemoryPool`]: datafusion::execution::memory_pool::MemoryPool
 
 pub mod accounted;
 pub mod budget;
 pub mod error;
-pub mod fault;
 pub mod governor;
-pub mod manager;
 pub mod reclaim;
 pub mod resizable_pool;
-pub mod scope;
-pub mod segment;
-pub mod store;
-pub mod store_local;
-pub mod store_s3;
-pub mod store_tiered;
 
 pub use accounted::Accounted;
 pub use budget::{
@@ -32,17 +27,6 @@ pub use budget::{
     DEFAULT_BUDGET_GRANULARITY, DEFAULT_READ_HEADROOM_DEN, DEFAULT_READ_HEADROOM_NUM,
 };
 pub use error::{BudgetError, Result};
-pub use fault::{
-    clear_faults, faults_injected, install_faults, serial_test_guard, take_fault, FaultSession,
-    SpillFault,
-};
 pub use governor::MemoryGovernor;
-pub use manager::{SpillManager, SpillScopeGuard};
 pub use reclaim::{MemoryGrant, ReclaimableConsumer};
 pub use resizable_pool::ResizableFairSpillPool;
-pub use scope::SpillScope;
-pub use segment::{SpillSegment, SEGMENT_FORMAT_VERSION, SEGMENT_MAGIC};
-pub use store::{SegmentReader, SegmentStore, SegmentWriter};
-pub use store_local::LocalSegmentStore;
-pub use store_s3::{S3SegmentStore, S3SpillConfig};
-pub use store_tiered::TieredSegmentStore;

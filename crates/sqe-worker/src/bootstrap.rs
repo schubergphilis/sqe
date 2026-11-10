@@ -21,10 +21,7 @@ use prometheus::Counter;
 use sqe_catalog::FooterCache;
 use sqe_core::{parse_memory_limit, SqeConfig};
 use sqe_metrics::WorkerMetricsRegistry;
-use sqe_spill::{
-    ByteBudget, LocalSegmentStore, MemoryGovernor, ResizableFairSpillPool, S3SegmentStore,
-    S3SpillConfig, SpillManager, TieredSegmentStore,
-};
+use sqe_spill::{ByteBudget, MemoryGovernor, ResizableFairSpillPool};
 
 use crate::advertise::derive_advertise_url;
 use crate::config_reload::{
@@ -69,7 +66,13 @@ pub fn build_worker_service_with_hot_reload(
         Arc::clone(&hot.configured_need_bytes),
     )?;
 
-    let spill_manager = build_spill_manager(config)?;
+    if config.worker.spill.is_some() {
+        tracing::warn!(
+            "[worker.spill] is retired and ignored: the worker spill segment store \
+             it configured was never written to. DataFusion spill uses \
+             worker.spill_to_disk and worker.spill_dir; remove the table"
+        );
+    }
     let memory_governor = Arc::new(MemoryGovernor::new(budgets.governor_pool_bytes));
     tracing::info!(
         pool_bytes = memory_governor.pool_bytes(),
@@ -117,9 +120,6 @@ pub fn build_worker_service_with_hot_reload(
             budgets.budget_granularity_bytes,
             None,
         ));
-    if let Some(sm) = spill_manager {
-        service = service.with_spill_manager(sm);
-    }
 
     if let (Some(pool), Some(path)) = (memory_pool, config_path) {
         let handles = HotReloadHandles {
@@ -290,130 +290,6 @@ fn validate_process_headroom(
     );
 
     Ok(())
-}
-
-/// Open a local [`SpillManager`] when spill is enabled, or `None` when disabled.
-///
-/// Runs orphan cleanup on start when configured. Fails loudly on unsupported
-/// backends or unusable spill directories so misconfig cannot silently disable
-/// spill in production.
-fn build_spill_manager(config: &SqeConfig) -> anyhow::Result<Option<Arc<SpillManager>>> {
-    let spill = &config.worker.spill;
-    // Respect both the legacy spill_to_disk flag and the new spill.enabled.
-    if !spill.enabled || !config.worker.spill_to_disk {
-        tracing::info!("Worker spill substrate disabled");
-        return Ok(None);
-    }
-    let max_bytes = parse_memory_limit(&spill.max_bytes)
-        .map_err(|e| anyhow::anyhow!("worker.spill.max_bytes: {e}"))? as u64;
-    let orphan_age = spill
-        .orphan_age_duration()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let store: Arc<dyn sqe_spill::SegmentStore> = match spill.backend.as_str() {
-        "local" => {
-            let dir = spill
-                .resolved_directory(&config.worker.spill_dir)
-                .to_string();
-            if dir.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "spill enabled but no directory configured \
-                     (set worker.spill.directory or worker.spill_dir)"
-                ));
-            }
-            let min_free = parse_memory_limit(&spill.min_free_bytes)
-                .map_err(|e| anyhow::anyhow!("worker.spill.min_free_bytes: {e}"))?
-                as u64;
-            Arc::new(LocalSegmentStore::open(
-                &dir,
-                max_bytes,
-                min_free,
-                spill.max_concurrent_writes,
-                spill.max_concurrent_reads,
-            )?)
-        }
-        "s3" => {
-            let s3 = &spill.s3;
-            let s3_cfg = S3SpillConfig {
-                bucket: s3.bucket.clone(),
-                prefix: s3.prefix.clone(),
-                region: s3.region.clone(),
-                endpoint: s3.endpoint.clone(),
-                access_key_id: s3.access_key_id.clone(),
-                secret_access_key: s3.secret_access_key.expose().to_string(),
-                allow_http: s3.allow_http,
-                path_style: s3.path_style || !s3.endpoint.is_empty(),
-                max_bytes,
-                max_objects: s3.max_objects,
-                max_concurrent_writes: spill.max_concurrent_writes,
-                max_concurrent_reads: spill.max_concurrent_reads,
-            };
-            Arc::new(S3SegmentStore::from_config(&s3_cfg)?)
-        }
-        "tiered" => {
-            let dir = spill
-                .resolved_directory(&config.worker.spill_dir)
-                .to_string();
-            if dir.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "tiered spill requires worker.spill.directory (or spill_dir)"
-                ));
-            }
-            let min_free = parse_memory_limit(&spill.min_free_bytes)
-                .map_err(|e| anyhow::anyhow!("worker.spill.min_free_bytes: {e}"))?
-                as u64;
-            let local = Arc::new(LocalSegmentStore::open(
-                &dir,
-                max_bytes,
-                min_free,
-                spill.max_concurrent_writes,
-                spill.max_concurrent_reads,
-            )?);
-            let s3c = &spill.s3;
-            let s3_cfg = S3SpillConfig {
-                bucket: s3c.bucket.clone(),
-                prefix: s3c.prefix.clone(),
-                region: s3c.region.clone(),
-                endpoint: s3c.endpoint.clone(),
-                access_key_id: s3c.access_key_id.clone(),
-                secret_access_key: s3c.secret_access_key.expose().to_string(),
-                allow_http: s3c.allow_http,
-                path_style: s3c.path_style || !s3c.endpoint.is_empty(),
-                max_bytes,
-                max_objects: s3c.max_objects,
-                max_concurrent_writes: spill.max_concurrent_writes,
-                max_concurrent_reads: spill.max_concurrent_reads,
-            };
-            let s3 = Arc::new(S3SegmentStore::from_config(&s3_cfg)?);
-            Arc::new(TieredSegmentStore::new(local, s3))
-        }
-        other => {
-            return Err(anyhow::anyhow!(
-                "worker.spill.backend = {other:?} is unknown \
-                 (supported: local, s3, tiered)"
-            ));
-        }
-    };
-
-    let manager = Arc::new(SpillManager::new(store, orphan_age));
-    // Orphan cleanup runs async on first use of the manager; avoid
-    // block_on during bootstrap (the runtime may already be running).
-    if spill.cleanup_on_start {
-        let mgr = manager.clone();
-        tokio::spawn(async move {
-            match mgr.cleanup_orphans_on_start().await {
-                Ok(n) => tracing::info!(orphans_cleaned = n, "Spill orphan cleanup complete"),
-                Err(e) => tracing::warn!(error = %e, "Spill orphan cleanup failed"),
-            }
-        });
-    }
-    tracing::info!(
-        backend = %spill.backend,
-        max_bytes,
-        cleanup_on_start = spill.cleanup_on_start,
-        "Worker spill manager ready"
-    );
-    Ok(Some(manager))
 }
 
 /// Build the Parquet footer cache and register its hit/miss counters on the
