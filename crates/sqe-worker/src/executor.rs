@@ -1846,6 +1846,41 @@ async fn open_parquet_stream(
             }
         }
 
+        // Geometry bounding-box prunes (sqe#863): row groups whose
+        // geospatial statistics miss an ST_* predicate. Narrows like above.
+        if let (Some(bytes), true) = (
+            task.geo_prunes.as_deref(),
+            row_group_prune::pruning_enabled(),
+        ) {
+            match sqe_catalog::geo_prune::decode_prunes(bytes) {
+                Ok(prunes) => {
+                    let candidates: Vec<usize> = match selected {
+                        Some(ref groups) => groups.clone(),
+                        None => (0..n_groups).collect(),
+                    };
+                    let before = candidates.len();
+                    let pruner = sqe_catalog::geo_prune::GeoRowGroupPruner::new(
+                        Arc::from(prunes),
+                        Count::new(),
+                    );
+                    let kept = pruner.select(meta, candidates);
+                    debug!(
+                        fragment_id = %task.fragment_id,
+                        file = %file_path,
+                        candidates = before,
+                        kept = kept.len(),
+                        "Geometry bounding-box row-group pruning applied"
+                    );
+                    selected = Some(kept);
+                }
+                Err(e) => warn!(
+                    fragment_id = %task.fragment_id,
+                    error = %e,
+                    "Ignoring undecodable geometry prunes"
+                ),
+            }
+        }
+
         // `Some(groups)` is an explicit selection and is applied verbatim, even
         // when empty: an empty selection means "this morsel owns no row groups"
         // and must read nothing. `None` means no morsel restriction was given,
@@ -2378,6 +2413,7 @@ mod tests {
             projection_fill: None,
             variant_prunes: None,
             delete_tasks: None,
+            geo_prunes: None,
             version: 1,
             morsel_id: None,
             row_group_start: None,
@@ -2857,6 +2893,7 @@ mod tests {
             projection_fill: None,
             variant_prunes: None,
             delete_tasks: None,
+            geo_prunes: None,
             version: 1,
             morsel_id: None,
             row_group_start: None,

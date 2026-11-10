@@ -871,10 +871,35 @@ async fn test_to_json_of_json_value_is_the_identity() {
             "[1]",
         ),
         (r#"SELECT to_json('{"a":1}')"#, r#""{\"a\":1}""#),
-        // CASE and coalesce return a field without the marker: still quoted.
+        // CASE and coalesce whose results are all JSON stay JSON.
         (
             r#"SELECT to_json(CASE WHEN s <> '' THEN json_parse(s) END) FROM (VALUES ('{"a":1}')) t(s)"#,
+            r#"{"a":1}"#,
+        ),
+        (
+            r#"SELECT to_json(CASE WHEN s = '' THEN json_parse('[]') ELSE json_parse(s) END) FROM (VALUES ('{"a":1}')) t(s)"#,
+            r#"{"a":1}"#,
+        ),
+        (
+            r#"SELECT to_json(coalesce(json_extract(s, '$.x'), json_parse(s))) FROM (VALUES ('{"a":1}')) t(s)"#,
+            r#"{"a":1}"#,
+        ),
+        (
+            r#"SELECT to_json(nullif(json_parse(s), 'x')) FROM (VALUES ('[1]')) t(s)"#,
+            "[1]",
+        ),
+        (
+            r#"SELECT to_json(c) FROM (SELECT coalesce(json_parse(s), NULL) AS c FROM (VALUES ('[1]')) t(s)) q"#,
+            "[1]",
+        ),
+        // A branch that is a plain string makes the result a string.
+        (
+            r#"SELECT to_json(CASE WHEN s <> '' THEN json_parse(s) ELSE s END) FROM (VALUES ('{"a":1}')) t(s)"#,
             r#""{\"a\":1}""#,
+        ),
+        (
+            r#"SELECT to_json(coalesce(s, json_parse(s))) FROM (VALUES ('[1]')) t(s)"#,
+            r#""[1]""#,
         ),
     ];
     for (sql, want) in cases {
@@ -892,6 +917,10 @@ async fn test_typeof_json_value_is_json() {
             "json",
         ),
         ("SELECT typeof(to_json(1))", "json"),
+        (
+            "SELECT typeof(CASE WHEN s = '' THEN NULL ELSE json_parse(s) END) FROM (VALUES ('1')) t(s)",
+            "json",
+        ),
         ("SELECT typeof('1')", "varchar"),
     ];
     for (sql, want) in cases {

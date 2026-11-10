@@ -5,7 +5,8 @@
 use crate::variant_spark_interop::sqe_rows;
 
 /// Three rows across two INSERTs (two data files): a point, a NULL, and a
-/// 4 x 3 rectangle. `h` is GEOGRAPHY, so the planar functions refuse it.
+/// 4 x 3 rectangle. `h` is GEOGRAPHY: the measures work in meters on the
+/// sphere, the other planar functions refuse it.
 async fn create_table(
     handler: &sqe_coordinator::QueryHandler,
     session: &sqe_core::Session,
@@ -78,10 +79,22 @@ async fn st_functions_over_an_sqe_geometry_table() {
         &format!("SELECT ST_AsText(h), ST_GeometryType(h) FROM {fq} WHERE id = 1"),
     )
     .await;
+    let meters = sqe_rows(
+        &handler,
+        &session,
+        &format!(
+            "SELECT id, CAST(ROUND(ST_Distance(h, ST_Point(0, 0))) AS BIGINT) \
+             FROM {fq} WHERE h IS NOT NULL"
+        ),
+    )
+    .await;
     let planar_on_geography = handler
+        .execute(&session, &format!("SELECT ST_Centroid(h) FROM {fq}"), None)
+        .await;
+    let mixed = handler
         .execute(
             &session,
-            &format!("SELECT ST_Distance(h, ST_Point(0, 0)) FROM {fq}"),
+            &format!("SELECT ST_Distance(g, h) FROM {fq}"),
             None,
         )
         .await;
@@ -109,10 +122,16 @@ async fn st_functions_over_an_sqe_geometry_table() {
         "ST_Centroid written back"
     );
     assert_eq!(geography, vec!["POINT(1 2)|ST_Point".to_string()]);
+    // Haversine on the GRS80 mean radius, POINT(1 2) to POINT(0 0).
+    assert_eq!(meters, vec!["1|248630".to_string()], "meters on the sphere");
     let err = planar_on_geography
         .expect_err("planar math on GEOGRAPHY is refused")
         .to_string();
     assert!(err.contains("GEOGRAPHY"), "{err}");
+    let err = mixed
+        .expect_err("GEOMETRY next to GEOGRAPHY is refused")
+        .to_string();
+    assert!(err.contains("GEOMETRY value"), "{err}");
 }
 
 /// DESCRIBE and SHOW CREATE TABLE print a geospatial column's type with its
@@ -220,10 +239,145 @@ async fn geospatial_types_round_trip_through_describe_and_show_create() {
     );
 }
 
+/// An `ST_*` predicate on a geometry column drops the data files whose
+/// manifest bounding box misses it (#863), and returns what the unpruned
+/// scan returns. Three INSERTs make three files of ten points each, around
+/// (0, 0), (100, 100) and (200, 200).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn st_predicates_prune_files_by_bounding_box() {
+    use crate::variant_e2e::scan_output_rows;
+    let (session, handler) = crate::common::setup_handler().await;
+    let fq = "default.geo_prune_files";
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+    let create = format!("CREATE TABLE {fq} (id BIGINT, g GEOMETRY)");
+    handler
+        .execute(&session, &create, None)
+        .await
+        .expect(&create);
+    for base in [0, 100, 200] {
+        let insert = format!(
+            "INSERT INTO {fq} SELECT {base} + value, \
+             ST_Point(CAST({base} + value AS DOUBLE), CAST({base} + value AS DOUBLE)) \
+             FROM range(0, 10)"
+        );
+        handler
+            .execute(&session, &insert, None)
+            .await
+            .expect(&insert);
+    }
+
+    let cases = [
+        // Every shape the scan prunes on, both argument orders.
+        "ST_Intersects(g, ST_MakeEnvelope(102.5, 102.5, 105.5, 105.5))",
+        "ST_Within(g, ST_GeomFromText('POLYGON ((102.5 102.5, 105.5 102.5, 105.5 105.5, 102.5 105.5, 102.5 102.5))'))",
+        "ST_Contains(ST_MakeEnvelope(102.5, 102.5, 105.5, 105.5), g)",
+        "ST_DWithin(g, ST_Point(104, 104), 1.5)",
+    ];
+    let mut got = Vec::new();
+    let mut read = Vec::new();
+    for predicate in &cases {
+        let sql = format!("SELECT id FROM {fq} WHERE {predicate} ORDER BY id");
+        got.push(sqe_rows(&handler, &session, &sql).await);
+        read.push(scan_output_rows(&handler, &session, &sql).await);
+    }
+    // `NOT ST_Disjoint` means ST_Intersects but is not a shape the scan
+    // prunes on: the full-scan baseline. (`ST_Intersects(..) = true` is no
+    // baseline: the optimizer simplifies it to the bare call, which prunes.)
+    let baseline = format!(
+        "SELECT id FROM {fq} WHERE NOT ST_Disjoint(g, ST_MakeEnvelope(102.5, 102.5, 105.5, 105.5)) ORDER BY id"
+    );
+    let baseline_rows = sqe_rows(&handler, &session, &baseline).await;
+    let baseline_read = scan_output_rows(&handler, &session, &baseline).await;
+    // ST_Disjoint holds on the boxes a prune would drop: nothing may go.
+    let disjoint = sqe_rows(
+        &handler,
+        &session,
+        &format!(
+            "SELECT count(*) FROM {fq} WHERE ST_Disjoint(g, ST_MakeEnvelope(102.5, 102.5, 105.5, 105.5))"
+        ),
+    )
+    .await;
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+
+    let want: Vec<String> = ["103", "104", "105"].map(String::from).to_vec();
+    assert_eq!(baseline_rows, want, "baseline");
+    assert_eq!(baseline_read, 30, "the baseline reads all three files");
+    for ((predicate, rows), read) in cases.iter().zip(&got).zip(&read) {
+        assert_eq!(rows, &want, "{predicate}");
+        assert_eq!(*read, 10, "{predicate}: reads only the middle file");
+    }
+    assert_eq!(disjoint, vec!["27".to_string()], "ST_Disjoint");
+}
+
+/// Row groups whose geospatial statistics miss an `ST_*` predicate are
+/// skipped (#863), on the small-file direct read and on the vendored reader.
+/// One file of points along the diagonal, written in id order, so each row
+/// group covers its own stretch of it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn st_predicates_prune_row_groups_by_bounding_box() {
+    use crate::variant_e2e::{row_groups, scan_output_rows};
+    let (session, handler) = crate::common::setup_handler().await;
+    for (table, n) in [
+        ("geo_prune_rg_small", 20_000_i64),
+        ("geo_prune_rg_large", 300_000),
+    ] {
+        let fq = format!("default.{table}");
+        let _ = handler
+            .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+            .await;
+        let create = format!(
+            "CREATE TABLE {fq} (id BIGINT, g GEOMETRY, pad VARCHAR) \
+             WITH ('write.parquet.row-group-size-bytes' = '262144')"
+        );
+        handler
+            .execute(&session, &create, None)
+            .await
+            .expect(&create);
+        // The padding is incompressible so the large file really is large.
+        let insert = format!(
+            "INSERT INTO {fq} SELECT value, \
+             ST_Point(CAST(value AS DOUBLE), CAST(value AS DOUBLE)), md5(CAST(value AS VARCHAR)) \
+             FROM range(0, {n})"
+        );
+        handler
+            .execute(&session, &insert, None)
+            .await
+            .expect(&insert);
+
+        let (groups, largest) = row_groups(&handler, &session, table).await;
+        assert!(
+            groups > 2,
+            "{table}: several row groups to prune, got {groups}"
+        );
+        let direct = largest < 3 * 1024 * 1024;
+        assert_eq!(direct, n == 20_000, "{table}: largest file {largest} bytes");
+
+        let lo = n - 100;
+        let pruned = format!(
+            "SELECT count(*), min(id) FROM {fq} \
+             WHERE ST_Intersects(g, ST_MakeEnvelope({lo}, {lo}, {n}, {n}))"
+        );
+        let got = sqe_rows(&handler, &session, &pruned).await;
+        let read = scan_output_rows(&handler, &session, &pruned).await;
+        let _ = handler
+            .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+            .await;
+
+        assert_eq!(got, vec![format!("100|{lo}")], "{table}");
+        assert!(read < n / 2, "{table}: pruned scan read {read} of {n} rows");
+    }
+}
+
 /// An `ST_*` query over a worker scan: the worker ships the geometry column
-/// as WKB and the coordinator evaluates the functions. The table provider
-/// does not push an `ST_*` filter down yet, so the worker ships every row;
-/// spatial file pruning will push it.
+/// as WKB and the coordinator evaluates the functions. The coordinator drops
+/// the file of the first INSERT, whose bounding box misses the predicate
+/// (#863), so the worker reads only the rectangle's file.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:polaris"]
 async fn st_functions_over_a_worker_scan() {
@@ -261,7 +415,7 @@ async fn st_functions_over_a_worker_scan() {
          the worker got no do_get ({before} -> {after})"
     );
     assert_eq!(
-        sent, 3,
-        "the worker read the geometry column of all three rows"
+        sent, 1,
+        "the worker read only the file whose bounding box meets the predicate"
     );
 }

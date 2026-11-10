@@ -195,6 +195,15 @@ impl SqlFrontDoor {
     pub fn normalize(&self, sql: &str) -> sqe_core::Result<NormalizedSql> {
         let parsed = match dispatch(sql)? {
             Dispatch::Custom(kind) => {
+                // EXPLAIN FULL runs its inner query, so the query takes the
+                // same rewrites it gets on its own: without them `1e0`
+                // stayed a decimal and Trino shapes did not plan.
+                let kind = match kind {
+                    StatementKind::ExplainFull(inner) => {
+                        StatementKind::ExplainFull(self.normalize(&inner)?.sql)
+                    }
+                    kind => kind,
+                };
                 return Ok(NormalizedSql {
                     sql: sql.to_string(),
                     statements: Vec::new(),
@@ -418,6 +427,31 @@ mod tests {
         "CREATE TABLE t (id INT)",
         "SELECT 'information_schema.tables'",
     ];
+
+    /// EXPLAIN FULL runs its inner query, so the query gets the rewrites it
+    /// gets on its own: `25e-1` becomes a double, as in a plain SELECT, and
+    /// a Trino `FETCH FIRST` becomes `LIMIT`.
+    #[test]
+    fn explain_full_normalizes_its_query() {
+        let inner = "SELECT a FROM t WHERE d = 25e-1 FETCH FIRST 5 ROWS ONLY";
+        for dialect in DIALECTS {
+            let door = SqlFrontDoor::new(dialect);
+            let alone = door.normalize(inner).unwrap().sql().to_string();
+            assert_ne!(alone, inner, "the plain query is rewritten");
+            let kind =
+                classify_normalized(door.normalize(&format!("EXPLAIN FULL {inner}")).unwrap())
+                    .unwrap();
+            match kind {
+                StatementKind::ExplainFull(sql) => assert_eq!(sql, alone, "{dialect:?}"),
+                other => panic!("{dialect:?}: {other:?}"),
+            }
+        }
+        // A query no rewrite touches keeps the user's text.
+        let door = SqlFrontDoor::new(WireDialect::Flight);
+        let kind =
+            classify_normalized(door.normalize("EXPLAIN FULL SELECT  a FROM t").unwrap()).unwrap();
+        assert!(matches!(kind, StatementKind::ExplainFull(sql) if sql == "SELECT  a FROM t"));
+    }
 
     /// #851: pipe queries pass the front door (they used to fail the #683
     /// tokenization check, DuckDB reading `|>` as `|` then `>`) and come out

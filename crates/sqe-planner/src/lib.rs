@@ -40,7 +40,9 @@ pub use scan_morsel::{
     DEFAULT_MORSEL_TARGET_BYTES, SCAN_TASK_VERSION_CURRENT, SCAN_TASK_VERSION_V1,
     SCAN_TASK_VERSION_V2, SCAN_TASK_VERSION_V5,
 };
-pub use scan_morsel::{SCAN_TASK_VERSION_V3, SCAN_TASK_VERSION_V4, SCAN_TASK_VERSION_V6};
+pub use scan_morsel::{
+    SCAN_TASK_VERSION_V3, SCAN_TASK_VERSION_V4, SCAN_TASK_VERSION_V6, SCAN_TASK_VERSION_V7,
+};
 pub use scan_task::{
     HiveScanDescriptor, HiveScanFormat, ScanCredentials, ScanStorage, ScanTask, ScanTaskBuilder,
     TicketSecret,

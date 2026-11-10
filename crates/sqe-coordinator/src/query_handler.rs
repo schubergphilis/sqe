@@ -5206,6 +5206,19 @@ impl QueryHandler {
         } else {
             None
         };
+        // 6a''. Geometry bounding-box prunes (sqe#863), for the same reason:
+        // workers have no ST_* functions. Files were already dropped when the
+        // coordinator planned the file list; workers prune row groups.
+        let geo_prunes = if self.config.query.distributed_scan_pushdown {
+            iceberg_scan.geo_prunes_wire().map_err(|e| {
+                SqeError::with_code(
+                    SqeErrorCode::InternalError,
+                    format!("encoding the scan's geometry prunes: {e}"),
+                )
+            })?
+        } else {
+            None
+        };
 
         // 6b. Push the scan predicate and (when safe) the query LIMIT into each
         // ScanTask (#233). Both are pure optimizations: the authoritative
@@ -5341,6 +5354,7 @@ impl QueryHandler {
                     .with_predicate_proto(predicate_proto.clone())
                     .with_projection_fill(projection_fill.clone())
                     .with_variant_prunes(variant_prunes.clone())
+                    .with_geo_prunes(geo_prunes.clone())
                     .with_delete_tasks(deletes)
                     .with_limit(scan_limit)
                     .build())]
@@ -5363,6 +5377,7 @@ impl QueryHandler {
                             .with_predicate_proto(predicate_proto.clone())
                             .with_projection_fill(projection_fill.clone())
                             .with_variant_prunes(variant_prunes.clone())
+                            .with_geo_prunes(geo_prunes.clone())
                             .with_delete_tasks(deletes)
                             .with_limit(scan_limit);
                             if let (Some(start), Some(end)) = (m.start_byte, m.end_byte) {
