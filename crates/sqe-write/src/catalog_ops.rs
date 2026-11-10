@@ -13,6 +13,7 @@ use sqlparser::ast::{
 use tracing::{error, info};
 
 use sqe_catalog::{SessionCatalog, TableMetadataCache};
+use sqe_core::json_columns::JsonColumnChange;
 use sqe_core::{Session, SqeConfig, SqeError, SqeErrorCode};
 use sqe_sql::{
     BranchRetention, IdentifierFieldsDdl, PartitionEvolution, RefDdl, ReprojectScope, TableRef,
@@ -718,6 +719,8 @@ impl CatalogOps {
         // rename leaves a tag naming a column that is gone: nothing matches, no
         // mask fires, and a governed column comes back RAW in both engines.
         let mut tag_key_changes: Vec<crate::tag_source_impl::TagKeyChange> = Vec::new();
+        // The `sqe.json-columns` property is keyed by name too (#848).
+        let mut json_changes: Vec<JsonColumnChange> = Vec::new();
 
         for op in operations {
             match op {
@@ -824,6 +827,15 @@ impl CatalogOps {
                         }
                     }
 
+                    // Below v3 a JSON column is stored as a string; the
+                    // property keeps it JSON. Any other type clears a stale
+                    // entry under the same name.
+                    json_changes.push(if !is_variant && is_json_type(&column_def.data_type) {
+                        JsonColumnChange::Add(col_name.clone())
+                    } else {
+                        JsonColumnChange::Remove(col_name.clone())
+                    });
+
                     fields.push(StdArc::new(new_field));
                 }
 
@@ -845,6 +857,7 @@ impl CatalogOps {
                                 tag_key_changes.push(crate::tag_source_impl::TagKeyChange::Drop {
                                     column: col.to_string(),
                                 });
+                                json_changes.push(JsonColumnChange::Remove(col.to_string()));
                             }
                             None if *if_exists => {}
                             None => {
@@ -882,6 +895,10 @@ impl CatalogOps {
                     );
                     fields[pos] = StdArc::new(renamed);
                     tag_key_changes.push(crate::tag_source_impl::TagKeyChange::Rename {
+                        old: old_name.to_string(),
+                        new: fold_unquoted_ident(new_column_name),
+                    });
+                    json_changes.push(JsonColumnChange::Rename {
                         old: old_name.to_string(),
                         new: fold_unquoted_ident(new_column_name),
                     });
@@ -931,6 +948,13 @@ impl CatalogOps {
                                     )
                                 })?;
                             check_type_promotion(col, &old_field.field_type, &iceberg_type)?;
+                            // `SET DATA TYPE JSON` on a string column is how a
+                            // table written before the property opts in.
+                            json_changes.push(if is_json_type(data_type) {
+                                JsonColumnChange::Add(col.to_string())
+                            } else {
+                                JsonColumnChange::Remove(col.to_string())
+                            });
                             NestedField::new(
                                 old_field.id,
                                 old_field.name.clone(),
@@ -978,10 +1002,30 @@ impl CatalogOps {
         // Commit via SessionCatalog::commit_schema_update which makes a direct REST
         // POST call. We use this rather than TableCommit::builder().build() because
         // the TypedBuilder `build()` is pub(crate) in the upstream iceberg crate.
-        let mut updates = vec![
-            TableUpdate::AddSchema { schema: new_schema },
-            TableUpdate::SetCurrentSchema { schema_id: -1 },
-        ];
+        //
+        // The catalog reuses a structurally equal schema rather than adding
+        // one, and then rejects `SetCurrentSchema { -1 }` ("no schema has been
+        // added"). A change that leaves the stored schema as it is (on a V2
+        // table `SET DATA TYPE JSON` keeps the column a string, #848) selects
+        // the existing schema by id, or skips the schema update when it is
+        // already current.
+        let new_ids: std::collections::BTreeSet<i32> = new_schema.identifier_field_ids().collect();
+        let same = metadata.schemas_iter().find(|s| {
+            s.as_struct() == new_schema.as_struct()
+                && s.identifier_field_ids()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    == new_ids
+        });
+        let mut updates = match same {
+            Some(s) if s.schema_id() == current_schema_id => Vec::new(),
+            Some(s) => vec![TableUpdate::SetCurrentSchema {
+                schema_id: s.schema_id(),
+            }],
+            None => vec![
+                TableUpdate::AddSchema { schema: new_schema },
+                TableUpdate::SetCurrentSchema { schema_id: -1 },
+            ],
+        };
 
         // Carry the column tags across the rename/drop in the SAME commit.
         //
@@ -1020,6 +1064,14 @@ impl CatalogOps {
                 changes = tag_key_changes.len(),
                 "Carrying column tags across a schema change"
             );
+        }
+        // The JSON column list follows in the same commit, for the same reason.
+        if let Some(update) = json_columns_update(metadata.properties(), &json_changes) {
+            updates.push(update);
+        }
+        if updates.is_empty() {
+            info!(table = %table_ident, "Schema change leaves the table unchanged");
+            return Ok(());
         }
         let requirements = vec![
             TableRequirement::LastAssignedFieldIdMatch {
@@ -2453,6 +2505,31 @@ fn set_nested_type(
     }
 }
 
+/// True for a SQL `JSON` column type.
+fn is_json_type(data_type: &sqlparser::ast::DataType) -> bool {
+    matches!(data_type, sqlparser::ast::DataType::JSON)
+}
+
+/// The property update that carries an ALTER's JSON column changes (#848):
+/// `SetProperties` with the new list, `RemoveProperties` when the list
+/// becomes empty, `None` when it did not change.
+fn json_columns_update(
+    properties: &HashMap<String, String>,
+    changes: &[JsonColumnChange],
+) -> Option<TableUpdate> {
+    use sqe_core::json_columns::{apply_changes, encode, json_columns, JSON_COLUMNS_PROP};
+    let next = apply_changes(&json_columns(properties), changes)?;
+    Some(if next.is_empty() {
+        TableUpdate::RemoveProperties {
+            removals: vec![JSON_COLUMNS_PROP.to_string()],
+        }
+    } else {
+        TableUpdate::SetProperties {
+            updates: HashMap::from([(JSON_COLUMNS_PROP.to_string(), encode(&next))]),
+        }
+    })
+}
+
 /// Refuse a column type change the Iceberg spec does not allow as a
 /// promotion. Existing data files keep their old type, so any other change
 /// leaves every scan of the table failing. Allowed: the same type, int to
@@ -2726,6 +2803,59 @@ mod tests {
 
     fn empty_locks() -> TableLockMap {
         StdArc::new(std::sync::Mutex::new(HashMap::new()))
+    }
+
+    /// An ALTER rewrites `sqe.json-columns` only when the JSON set moves:
+    /// a rename carries the name, a drop or retype removes it, and the last
+    /// one removes the property (#848).
+    #[test]
+    fn json_columns_update_follows_the_alter() {
+        use sqe_core::json_columns::JSON_COLUMNS_PROP;
+        let props = HashMap::from([(JSON_COLUMNS_PROP.to_string(), r#"["j"]"#.to_string())]);
+
+        assert!(json_columns_update(&props, &[]).is_none());
+        assert!(
+            json_columns_update(&props, &[JsonColumnChange::Remove("other".into())]).is_none()
+        );
+        assert!(
+            json_columns_update(&HashMap::new(), &[JsonColumnChange::Remove("x".into())])
+                .is_none(),
+            "a plain ALTER on a table without JSON columns writes no property"
+        );
+
+        match json_columns_update(
+            &props,
+            &[JsonColumnChange::Rename {
+                old: "j".into(),
+                new: "doc".into(),
+            }],
+        ) {
+            Some(TableUpdate::SetProperties { updates }) => {
+                assert_eq!(updates[JSON_COLUMNS_PROP], r#"["doc"]"#)
+            }
+            other => panic!("expected SetProperties, got {other:?}"),
+        }
+
+        match json_columns_update(&props, &[JsonColumnChange::Remove("j".into())]) {
+            Some(TableUpdate::RemoveProperties { removals }) => {
+                assert_eq!(removals, vec![JSON_COLUMNS_PROP.to_string()])
+            }
+            other => panic!("expected RemoveProperties, got {other:?}"),
+        }
+
+        match json_columns_update(&HashMap::new(), &[JsonColumnChange::Add("k".into())]) {
+            Some(TableUpdate::SetProperties { updates }) => {
+                assert_eq!(updates[JSON_COLUMNS_PROP], r#"["k"]"#)
+            }
+            other => panic!("expected SetProperties, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_json_type_matches_only_json() {
+        assert!(is_json_type(&sqlparser::ast::DataType::JSON));
+        assert!(!is_json_type(&sqlparser::ast::DataType::Varchar(None)));
+        assert!(!is_json_type(&sqlparser::ast::DataType::JSONB));
     }
 
     #[test]

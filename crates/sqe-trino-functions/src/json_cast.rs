@@ -18,10 +18,13 @@
 //! result of `json_parse`, `json_extract`, `json_array_get` and `to_json`
 //! carries the [`JSON_TEXT_MARKER`] field marker, so `to_json` returns that
 //! text as it is, also through an alias, a CTE, a subquery or a view
-//! (Trino's cast of a JSON value is the identity). [`JsonMarkerRule`] keeps
-//! the marker on a `CASE` or `coalesce` whose results are all JSON. Any
-//! other string, a stored V2 `JSON` column included, has none: those are
-//! encoded as a JSON string.
+//! (Trino's cast of a JSON value is the identity). A stored `JSON` column of
+//! a format v2 table is a string the `sqe.json-columns` table property
+//! names, and the scan puts the marker on it too. Its text was never
+//! validated, so a value that does not parse is encoded as a JSON string.
+//! [`JsonMarkerRule`] keeps the marker on a `CASE` or `coalesce` whose
+//! results are all JSON. Any other string has none: those are encoded as a
+//! JSON string.
 //! `sqe-sql::trino_compat` rewrites `CAST(ARRAY[<json>, ...] AS JSON)` to
 //! [`JsonArrayOfJson`], since an array literal drops the element marker.
 //! Types Trino refuses to cast (varbinary, time, intervals) are written as
@@ -88,22 +91,48 @@ impl ScalarUDFImpl for ToJson {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let input = &args.args[0];
-        // Already JSON (#848): the cast is the identity.
-        if args.arg_fields.first().is_some_and(|f| is_json_text(f)) {
-            return Ok(input.clone());
-        }
+        let json_input = args.arg_fields.first().is_some_and(|f| is_json_text(f));
         let scalar = matches!(input, ColumnarValue::Scalar(_));
         let mut array = input.to_array(if scalar { 1 } else { args.number_rows })?;
         if let DataType::Dictionary(_, value_type) = array.data_type() {
             array = arrow::compute::cast(&array, value_type)?;
         }
-        let out = to_json_array(&array)?;
+        // Already JSON (#848): the cast is the identity.
+        let out = if json_input {
+            json_text_identity(&array)?
+        } else {
+            to_json_array(&array)?
+        };
         if scalar {
             Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(&out, 0)?))
         } else {
             Ok(ColumnarValue::Array(out))
         }
     }
+}
+
+/// `CAST(x AS JSON)` of JSON text: the value, as compact JSON with sorted
+/// object keys (what `json_parse` returns). A stored V2 `JSON` column
+/// (#848) holds whatever text was written into it, so a value that does not
+/// parse is encoded as a JSON string rather than passed off as JSON.
+fn json_text_identity(array: &ArrayRef) -> DFResult<ArrayRef> {
+    let text = arrow::compute::cast(array, &DataType::Utf8)?;
+    let text = text.as_string::<i32>();
+    let mut builder = StringBuilder::with_capacity(text.len(), text.value_data().len());
+    for value in text.iter() {
+        let Some(value) = value else {
+            builder.append_null();
+            continue;
+        };
+        match serde_json::from_str::<serde_json::Value>(value) {
+            Ok(mut parsed) => {
+                parsed.sort_all_objects();
+                builder.append_value(parsed.to_string());
+            }
+            Err(_) => builder.append_value(serde_json::Value::from(value).to_string()),
+        }
+    }
+    Ok(Arc::new(builder.finish()))
 }
 
 fn to_json_array(array: &ArrayRef) -> DFResult<ArrayRef> {
@@ -196,6 +225,9 @@ impl ScalarUDFImpl for JsonArrayOfJson {
 /// `__sqe_json_text(x)`: `x` unchanged, with the [`JSON_TEXT_MARKER`] on its
 /// field. [`JsonMarkerRule`] wraps a `CASE` or `coalesce` whose results are
 /// all JSON in it, since DataFusion builds their field without metadata.
+/// The result keeps `x`'s string type: the rule runs after type coercion,
+/// so turning a `Utf8View` (a stored V2 `JSON` column, #848) into `Utf8`
+/// would leave the expressions around it planned for the wrong type.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub(crate) struct JsonText;
 
@@ -213,12 +245,22 @@ impl ScalarUDFImpl for JsonText {
         &SIG
     }
 
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Utf8)
+    fn return_type(&self, args: &[DataType]) -> DFResult<DataType> {
+        Ok(args.first().cloned().unwrap_or(DataType::Utf8))
     }
 
-    fn return_field_from_args(&self, _: ReturnFieldArgs) -> DFResult<FieldRef> {
-        Ok(json_text_field(self.name()))
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> DFResult<FieldRef> {
+        let data_type = args
+            .arg_fields
+            .first()
+            .map(|f| f.data_type().clone())
+            .unwrap_or(DataType::Utf8);
+        Ok(Arc::new(
+            json_text_field(self.name())
+                .as_ref()
+                .clone()
+                .with_data_type(data_type),
+        ))
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -287,10 +329,13 @@ fn mark_expr(expr: Expr, schema: &DFSchema) -> DFResult<Transformed<Expr>> {
         }
         any_json = true;
     }
-    let plain_utf8 = expr
-        .to_field(schema)
-        .is_ok_and(|(_, f)| f.data_type() == &DataType::Utf8 && !is_json_text(&f));
-    if !any_json || !plain_utf8 {
+    let plain_string = expr.to_field(schema).is_ok_and(|(_, f)| {
+        matches!(
+            f.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        ) && !is_json_text(&f)
+    });
+    if !any_json || !plain_string {
         return Ok(Transformed::no(expr));
     }
     static UDF: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| Arc::new(ScalarUDF::from(JsonText)));

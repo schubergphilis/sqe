@@ -908,6 +908,93 @@ async fn test_to_json_of_json_value_is_the_identity() {
     assert_eq!(eval_str("SELECT to_json(json_parse(NULL))").await, None);
 }
 
+/// A stored V2 `JSON` column (#848): a string field the scan marks from the
+/// `sqe.json-columns` property, read as `Utf8View` or `Utf8`. The cast is
+/// the identity for JSON text, normalized like `json_parse`; text that does
+/// not parse is encoded as a JSON string. The marker survives `CASE` and
+/// `coalesce` without changing the string layout the plan was coerced to.
+#[tokio::test]
+async fn test_stored_json_column_casts_as_json() {
+    use datafusion::arrow::array::{ArrayRef, StringArray, StringViewArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    assert_eq!(
+        sqe_core::json_columns::JSON_FIELD_MARKER,
+        sqe_trino_protocol::encode::JSON_TEXT_MARKER,
+        "the scan marks fields with the key the functions read"
+    );
+
+    let values = [Some(r#"{"b":1, "a":[2]}"#), Some("not json"), None];
+    for data_type in [DataType::Utf8View, DataType::Utf8] {
+        let field = Field::new("j", data_type.clone(), true).with_metadata(HashMap::from([(
+            sqe_core::json_columns::JSON_FIELD_MARKER.to_string(),
+            "true".to_string(),
+        )]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            field,
+        ]));
+        let column: ArrayRef = match data_type {
+            DataType::Utf8View => Arc::new(StringViewArray::from(values.to_vec())),
+            _ => Arc::new(StringArray::from(values.to_vec())),
+        };
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3])), column],
+        )
+        .unwrap();
+        let ctx = ctx().await;
+        ctx.register_table("t", Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()))
+            .unwrap();
+        let rows = |sql: &'static str| {
+            let ctx = ctx.clone();
+            async move {
+                let batches = ctx.sql(sql).await.expect(sql).collect().await.expect(sql);
+                let mut out = Vec::new();
+                for b in &batches {
+                    for i in 0..b.num_rows() {
+                        out.push(
+                            (!b.column(0).is_null(i))
+                                .then(|| array_value_to_string(b.column(0), i).unwrap()),
+                        );
+                    }
+                }
+                out
+            }
+        };
+        let want = vec![
+            Some(r#"{"a":[2],"b":1}"#.to_string()),
+            Some(r#""not json""#.to_string()),
+            None,
+        ];
+        for sql in [
+            "SELECT to_json(j) FROM t ORDER BY id",
+            "SELECT to_json(CASE WHEN id > 0 THEN j END) FROM t ORDER BY id",
+            "SELECT to_json(coalesce(j, NULL)) FROM t ORDER BY id",
+            "SELECT to_json(x) FROM (SELECT j AS x, id FROM t) s ORDER BY id",
+        ] {
+            assert_eq!(rows(sql).await, want, "{data_type}: {sql}");
+        }
+        assert_eq!(
+            rows("SELECT typeof(CASE WHEN id > 0 THEN j END) FROM t ORDER BY id").await[0]
+                .as_deref(),
+            Some("json"),
+            "{data_type}"
+        );
+        // The wrapped CASE keeps its layout, so a comparison planned for it runs.
+        assert_eq!(
+            rows("SELECT CAST(id AS VARCHAR) FROM t WHERE CASE WHEN id > 0 THEN j END = 'not json'")
+                .await,
+            vec![Some("2".to_string())],
+            "{data_type}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_typeof_json_value_is_json() {
     let cases = [
