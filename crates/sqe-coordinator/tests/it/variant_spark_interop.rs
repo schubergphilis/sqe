@@ -396,6 +396,119 @@ async fn sqe_prunes_its_own_files_on_variant_bounds() {
     assert_eq!(spark, vec!["2|3", "1|4"], "Spark's rows with SQE's bounds");
 }
 
+/// A shredded double path gets variant bounds (#870). SQE writes -0.0 as
+/// the lower bound of a file holding a zero, and Spark 4.1 writes +0.0 over
+/// a -0.0 row; SQE widens a zero bound on read either way, so `< 0.0` keeps
+/// the file holding -0.0. A path holding a NaN gets no bound from either
+/// writer, so `> c` keeps that file and finds the NaN row, which SQL orders
+/// above every number.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn sqe_prunes_on_double_variant_bounds() {
+    if let Some(reason) = spark_stack_skip_reason() {
+        eprintln!("skipping sqe_prunes_on_double_variant_bounds: {reason}");
+        return;
+    }
+    let (session, handler) = crate::common::setup_handler().await;
+    let ours = "default.variant_double_bounds_sqe";
+    let theirs = "default.variant_double_bounds_spark";
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {ours}"), None)
+        .await;
+    for sql in [
+        format!(
+            "CREATE TABLE {ours} (id INT, v JSON) \
+             WITH ('write.parquet.shred-variants' = 'true')"
+        ),
+        format!(r#"INSERT INTO {ours} VALUES (1, '{{"d": 1.5}}'), (2, '{{"d": 2.5}}')"#),
+        format!(r#"INSERT INTO {ours} VALUES (3, '{{"d": 10.5}}'), (4, '{{"d": 12.5}}')"#),
+        format!(r#"INSERT INTO {ours} VALUES (5, '{{"d": -0.0}}'), (6, '{{"d": 0.5}}')"#),
+    ] {
+        handler.execute(&session, &sql, None).await.expect(&sql);
+    }
+    // `to_variant_object` of a DOUBLE shreds as double; `parse_json('1.5')`
+    // would shred as a decimal. `COALESCE(1)`: one data file per INSERT.
+    let insert = |rows: &str| {
+        format!(
+            "INSERT INTO rest.{theirs} SELECT /*+ COALESCE(1) */ id, \
+             to_variant_object(named_struct('d', CAST(d AS DOUBLE))) \
+             FROM VALUES {rows} AS t(id, d);"
+        )
+    };
+    spark_sql(&format!(
+        r#"DROP TABLE IF EXISTS rest.{theirs};
+           CREATE TABLE rest.{theirs} (id INT, v VARIANT) USING iceberg
+             TBLPROPERTIES ('format-version' = '3',
+                            'write.parquet.shred-variants' = 'true');
+           {}
+           {}
+           {}"#,
+        insert("(1, '1.5'), (2, '2.5')"),
+        insert("(3, '1.5'), (4, '-0.0'), (5, '3.0')"),
+        // A NaN: Spark writes no bound for `$.d`.
+        insert("(6, '1.5'), (7, 'NaN')"),
+    ))
+    .expect("spark writes the double variant table");
+
+    // `9.0` is a decimal literal here, as in Trino, and the comparison runs
+    // in decimal: not a shape the scan prunes on. An integer literal or a
+    // cast to double is a double. `-0.0 < 0` is false in SQE and in Spark,
+    // so `< 0` finds no row but must still keep the file holding -0.0.
+    let d = "variant_get(v, '$.d', 'double')";
+    let mut got = Vec::new();
+    for (fq, filter) in [
+        (ours, format!("{d} > 9")),
+        (ours, format!("{d} < 0")),
+        (ours, format!("{d} <= 0")),
+        (ours, format!("{d} = CAST(0.5 AS DOUBLE)")),
+        (ours, format!("{d} + 0 > 9")),
+        (ours, format!("{d} > 9.0")),
+        (theirs, format!("{d} > 5")),
+        (theirs, format!("{d} < 0")),
+        // Spark's lower bound is +0.0 over a -0.0 row: only the widening
+        // keeps that file for a -0.0 literal.
+        (theirs, format!("{d} = CAST('-0.0' AS DOUBLE)")),
+        (theirs, format!("{d} = CAST(3.0 AS DOUBLE)")),
+    ] {
+        let sql = format!("SELECT count(*), min(id) FROM {fq} WHERE {filter}");
+        let rows = sqe_rows(&handler, &session, &sql).await.join(",");
+        let (scanned, total) = scan_files(&handler, &session, &sql).await;
+        got.push(format!("{rows} files {scanned}/{total}"));
+    }
+    let spark = spark_rows(&format!(
+        "SELECT count(*), min(id) FROM rest.{ours} WHERE {d} > 9; \
+         SELECT count(*), min(id) FROM rest.{ours} WHERE {d} <= 0;"
+    ));
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {ours}"), None)
+        .await;
+    let _ = spark_sql(&format!("DROP TABLE IF EXISTS rest.{theirs}"));
+
+    assert_eq!(
+        got,
+        vec![
+            // SQE's files: bounds [1.5, 2.5], [10.5, 12.5], [-0.0, 0.5].
+            "2|3 files 1/3",
+            "0|NULL files 1/3",
+            "1|5 files 1/3",
+            "1|6 files 1/3",
+            "2|3 files 3/3",
+            "2|3 files 3/3",
+            // Spark's files: [1.5, 2.5], [+0.0, 3.0], and the NaN file with
+            // no bound, which every filter keeps.
+            "1|7 files 1/3",
+            "0|NULL files 2/3",
+            "1|4 files 2/3",
+            "1|5 files 2/3",
+        ]
+    );
+    assert_eq!(
+        spark,
+        vec!["2|3", "1|5"],
+        "Spark's rows with SQE's double bounds"
+    );
+}
+
 /// A string longer than 16 characters gets a truncated variant bound, as
 /// Iceberg Java writes it (#870): the lower bound is the 16-character prefix
 /// and the upper is cut and rounded up. Both still bound every value, so a

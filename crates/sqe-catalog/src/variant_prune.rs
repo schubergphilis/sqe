@@ -44,6 +44,11 @@ enum Target {
     Utf8,
     Date32,
     Boolean,
+    /// Manifest bounds only. Parquet leaves NaN out of a float leaf's
+    /// statistics, and SQL orders NaN above every number, so a row group
+    /// holding a NaN would be skipped by `> c`. A manifest bound is safe:
+    /// Iceberg Java and SQE write none for a path that holds a NaN.
+    Float64,
 }
 
 impl Target {
@@ -54,6 +59,7 @@ impl Target {
             "string" | "varchar" | "text" | "utf8" => Some(Self::Utf8),
             "date" | "date32" => Some(Self::Date32),
             "boolean" | "bool" => Some(Self::Boolean),
+            "double" | "float64" => Some(Self::Float64),
             _ => None,
         }
     }
@@ -70,6 +76,33 @@ enum Bound {
     Int(i64),
     Bytes(Vec<u8>),
     Bool(bool),
+    Double(TotalF64),
+}
+
+/// A double ordered by `f64::total_cmp`, as DataFusion compares floats:
+/// -0.0 sorts before +0.0. Never a NaN; `bound_of` and `manifest_bound`
+/// refuse one.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct TotalF64(f64);
+
+impl PartialEq for TotalF64 {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.total_cmp(&other.0).is_eq()
+    }
+}
+
+impl Eq for TotalF64 {}
+
+impl PartialOrd for TotalF64 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TotalF64 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
 }
 
 /// The comparison, with the field on the left.
@@ -260,10 +293,30 @@ impl VariantPrune {
             manifest_bound(lower, &key, self.target),
             manifest_bound(upper, &key, self.target),
         ) {
-            (Some(min), Some(max)) => self.cmp.excludes(&min, &max, &self.value),
+            (Some(min), Some(max)) => {
+                let (min, max) = widen_zeros(min, max);
+                self.cmp.excludes(&min, &max, &self.value)
+            }
             _ => false,
         }
     }
+}
+
+/// A double bound at zero widened to cover both zeros: Iceberg Java writes
+/// +0.0 as the lower bound of a path holding -0.0, which sorts below it.
+fn widen_zeros(min: Bound, max: Bound) -> (Bound, Bound) {
+    let zero = |b: &Bound| matches!(b, Bound::Double(TotalF64(v)) if *v == 0.0);
+    let min = if zero(&min) {
+        Bound::Double(TotalF64(-0.0))
+    } else {
+        min
+    };
+    let max = if zero(&max) {
+        Bound::Double(TotalF64(0.0))
+    } else {
+        max
+    };
+    (min, max)
 }
 
 /// The data files, by path, whose manifest bounds exclude any of `prunes`.
@@ -459,6 +512,9 @@ fn bound_of(literal: &ScalarValue, target: Target) -> Option<Bound> {
         (Target::Int32 | Target::Int64, ScalarValue::UInt32(v)) => int(v.map(i64::from)),
         (Target::Date32, ScalarValue::Date32(v)) => int(v.map(i64::from)),
         (Target::Boolean, ScalarValue::Boolean(v)) => v.map(Bound::Bool),
+        (Target::Float64, ScalarValue::Float64(Some(v))) if !v.is_nan() => {
+            Some(Bound::Double(TotalF64(*v)))
+        }
         (
             Target::Utf8,
             ScalarValue::Utf8(v) | ScalarValue::LargeUtf8(v) | ScalarValue::Utf8View(v),
@@ -477,7 +533,8 @@ fn normalized_path(path: &[String]) -> String {
 /// The bound at `key` in a manifest variant bound (variant metadata followed
 /// by an object keyed by path), when its type reads as the target without
 /// conversion: any integer width for an integer target, a string, a date, a
-/// boolean. Anything else (a decimal, a float, another type) gives `None`.
+/// boolean, a float or double for a double target. Anything else (a
+/// decimal, a NaN, an integer read as a double) gives `None`.
 fn manifest_bound(bytes: &[u8], key: &str, target: Target) -> Option<Bound> {
     let metadata = VariantMetadata::try_new(bytes).ok()?;
     let value = bytes.get(metadata.size()..)?;
@@ -499,6 +556,13 @@ fn manifest_bound(bytes: &[u8], key: &str, target: Target) -> Option<Bound> {
         }
         Variant::BooleanTrue if target == Target::Boolean => return Some(Bound::Bool(true)),
         Variant::BooleanFalse if target == Target::Boolean => return Some(Bound::Bool(false)),
+        Variant::Double(v) if target == Target::Float64 && !v.is_nan() => {
+            return Some(Bound::Double(TotalF64(v)))
+        }
+        // Widening a float to a double is exact and keeps its order.
+        Variant::Float(v) if target == Target::Float64 && !v.is_nan() => {
+            return Some(Bound::Double(TotalF64(f64::from(v))))
+        }
         _ => return None,
     };
     match target {
@@ -675,11 +739,16 @@ mod tests {
                 Operator::Eq,
                 int(5),
             ),
-            // Float statistics order differs from SQL order (NaN, -0.0).
+            // A NaN literal, and a `float` target.
             cmp(
                 get("variant_get", "v", "$.a", "double"),
                 Operator::Eq,
-                Expr::Literal(ScalarValue::Float64(Some(1.0)), None),
+                Expr::Literal(ScalarValue::Float64(Some(f64::NAN)), None),
+            ),
+            cmp(
+                get("variant_get", "v", "$.a", "float"),
+                Operator::Eq,
+                Expr::Literal(ScalarValue::Float32(Some(1.0)), None),
             ),
             // Literal of another type.
             cmp(
@@ -1089,6 +1158,89 @@ mod tests {
         };
         assert!(file_prune(flag(true)).excludes_file(&file));
         assert!(!file_prune(flag(false)).excludes_file(&file));
+    }
+
+    /// The double bounds Spark 4.1 / Iceberg 1.12 wrote for a file of
+    /// `$.d` values {1.5, -0.0, 3.0}: the lower bound is +0.0, above the
+    /// -0.0 row.
+    const SPARK_DOUBLE_LOWER: &str = "11010006245B2764275D02010000091C0000000000000000";
+    const SPARK_DOUBLE_UPPER: &str = "11010006245B2764275D02010000091C0000000000000840";
+
+    fn unhex(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    fn d(op: Operator, v: f64) -> Expr {
+        cmp(
+            get("variant_get", "v", "$.d", "double"),
+            op,
+            Expr::Literal(ScalarValue::Float64(Some(v)), None),
+        )
+    }
+
+    fn double_bound(v: f64) -> Vec<u8> {
+        use parquet::variant::VariantBuilder;
+        let mut builder = VariantBuilder::new();
+        let mut object = builder.new_object();
+        object.insert("$['d']", v);
+        object.finish();
+        let (metadata, value) = builder.finish();
+        [metadata, value].concat()
+    }
+
+    #[test]
+    fn manifest_bounds_read_doubles() {
+        let file = file_with_bounds(2, unhex(SPARK_DOUBLE_LOWER), unhex(SPARK_DOUBLE_UPPER));
+        assert!(file_prune(d(Operator::Gt, 3.0)).excludes_file(&file));
+        assert!(file_prune(d(Operator::Eq, 3.5)).excludes_file(&file));
+        assert!(!file_prune(d(Operator::GtEq, 3.0)).excludes_file(&file));
+        assert!(!file_prune(d(Operator::Eq, 1.5)).excludes_file(&file));
+        // The -0.0 row sorts below the +0.0 bound, and matches both of
+        // these: the bound is widened, so the file stays.
+        assert!(!file_prune(d(Operator::Lt, 0.0)).excludes_file(&file));
+        assert!(!file_prune(d(Operator::LtEq, -0.0)).excludes_file(&file));
+        assert!(!file_prune(d(Operator::Eq, -0.0)).excludes_file(&file));
+        assert!(file_prune(d(Operator::Lt, -0.0)).excludes_file(&file));
+        assert!(file_prune(d(Operator::Lt, -1.0)).excludes_file(&file));
+
+        // A -0.0 upper bound is widened to +0.0.
+        let zeros = file_with_bounds(2, double_bound(-5.0), double_bound(-0.0));
+        assert!(!file_prune(d(Operator::GtEq, 0.0)).excludes_file(&zeros));
+        assert!(file_prune(d(Operator::Gt, 0.0)).excludes_file(&zeros));
+
+        // A NaN bound, an integer or decimal bound read as a double, and a
+        // double read as an integer are not judged.
+        let nan = file_with_bounds(2, double_bound(1.0), double_bound(f64::NAN));
+        assert!(!file_prune(d(Operator::Gt, 5.0)).excludes_file(&nan));
+        for path in ["$.a", "$.o.b"] {
+            let wider = cmp(
+                get("variant_get", "v", path, "double"),
+                Operator::Gt,
+                Expr::Literal(ScalarValue::Float64(Some(100.0)), None),
+            );
+            assert!(!file_prune(wider).excludes_file(&spark_file(2)), "{path}");
+        }
+        let as_int = cmp(
+            get("variant_get", "v", "$.d", "bigint"),
+            Operator::Gt,
+            int(5),
+        );
+        assert!(!file_prune(as_int).excludes_file(&file));
+    }
+
+    #[test]
+    fn double_filters_never_prune_a_row_group() {
+        let file = shredded_file(
+            &[Some(r#"{"d": 1.5}"#), Some(r#"{"d": 2.5}"#)],
+            Fields::from(vec![Field::new("d", DataType::Float64, true)]),
+            2,
+            &[],
+        );
+        let prune = VariantPrune::from_expr(&d(Operator::Gt, 10.0), &schema()).expect("prune");
+        assert!(!prune.excludes(&file, file.row_group(0)));
     }
 
     #[test]
