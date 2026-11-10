@@ -1333,6 +1333,45 @@ impl QueryHandlerAdapter {
     }
 }
 
+/// Raise the soft open-file limit to the hard limit; returns `(before, after)`.
+///
+/// A spilling sort holds every spill run open while it merges them. At TPC-H
+/// SF100 one `ORDER BY l_comment` wrote 818 runs and failed with EMFILE under
+/// the 1024 soft limit that systemd units and login shells start with (the
+/// hard limit was 1048576). Container runtimes usually start at the hard
+/// limit, so this only changes bare-metal and VM installs.
+#[cfg(unix)]
+fn raise_nofile_limit() -> Option<(libc::rlim_t, libc::rlim_t)> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes only to the rlimit struct we pass it.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return None;
+    }
+    let before = lim.rlim_cur;
+    if lim.rlim_max <= before {
+        return Some((before, before));
+    }
+    // macOS reports an unlimited hard limit but rejects a soft limit above
+    // kern.maxfilesperproc; 10240 (OPEN_MAX) is always accepted there.
+    for target in [lim.rlim_max, lim.rlim_max.min(10240)] {
+        if target <= before {
+            continue;
+        }
+        let want = libc::rlimit {
+            rlim_cur: target,
+            rlim_max: lim.rlim_max,
+        };
+        // SAFETY: setrlimit reads only the rlimit struct we pass it.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &want) } == 0 {
+            return Some((before, target));
+        }
+    }
+    Some((before, before))
+}
+
 // ── Main ───────────────────────────────────────────────────────
 //
 // We build the tokio runtime manually instead of using `#[tokio::main]` so we
@@ -1726,6 +1765,20 @@ async fn async_main() -> anyhow::Result<()> {
             "debug build: performance is not representative, build with \
              `cargo build --release --bin sqe-server` for anything but tests"
         );
+    }
+    #[cfg(unix)]
+    match raise_nofile_limit() {
+        Some((before, after)) if after > before => {
+            tracing::info!(before, after, "raised the open-file soft limit");
+        }
+        Some((limit, _)) if limit < 8192 => tracing::warn!(
+            limit,
+            "open-file limit is low: a large spilling sort keeps one file open per \
+             spill run and fails with 'Too many open files'; raise the hard limit \
+             (LimitNOFILE, ulimit -Hn)"
+        ),
+        Some(_) => {}
+        None => tracing::warn!("could not read or raise the open-file limit"),
     }
 
     match mode {

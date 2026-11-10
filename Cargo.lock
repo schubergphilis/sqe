@@ -7432,6 +7432,7 @@ dependencies = [
  "datafusion",
  "futures",
  "iceberg",
+ "libc",
  "moka",
  "prometheus",
  "reqwest 0.13.5",
