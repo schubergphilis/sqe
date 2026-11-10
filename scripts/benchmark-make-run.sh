@@ -6,8 +6,9 @@
 #   * tee the whole sweep to a log under $BENCH_LOG_DIR
 #   * cap Trino's container memory in comparison mode (unbounded means 80%
 #     of the HOST's RAM, which starves the SQE coordinator on a shared box)
-#   * fail when a Trino crash mid-sweep silently skipped comparisons -- the
-#     underlying script prints a warning and still exits 0
+#   * fail when Trino never started or crashed mid-sweep and comparisons were
+#     silently skipped -- the underlying script prints a warning and still
+#     exits 0
 #
 # Usage:
 #   scripts/benchmark-make-run.sh <scale> [--compare-trino] [suite...]
@@ -65,6 +66,15 @@ fi
 # shellcheck disable=SC2086
 BENCH_SCALE="$SCALE" ./scripts/benchmark-test.sh $COMPARE "$@" 2>&1 | tee "$LOG"
 STATUS=$?
+
+# A Trino that never starts disables the comparison for the whole sweep and
+# still exits 0, with SQE-only numbers that look like a finished run.
+if [ -n "$COMPARE" ] && grep -q "TRINO DID NOT COME UP" "$LOG"; then
+    echo ""
+    echo "ERROR: Trino did not start, so no suite was compared. The warning in"
+    echo "       the log says how to see why. Log: $LOG"
+    exit 1
+fi
 
 # A Trino crash mid-sweep skips the comparison for every suite that follows
 # and still exits 0. Turn that into a real failure so a green run means the
