@@ -63,7 +63,7 @@ Functions used in `GROUP BY` queries and `OVER` clauses. SQE inherits ~40 aggreg
 | `nth_value(expr, n [order by ...])` | `datafusion-builtin` | Nth row's value. | `nth_value` | `nth_value` | `nth_value` | `nth_value` |
 | `max_by(value, key)` | `sqe-trino-functions` | `value` from the row with the max `key`. `trino_functions.rs:177` | `max_by` | `max_by` | - | `arg_max` |
 | `min_by(value, key)` | `sqe-trino-functions` | `value` from the row with the min `key`. `trino_functions.rs:178` | `min_by` | `min_by` | - | `arg_min` |
-| `arbitrary(expr)` | `sqe-trino-functions (ext)` | Any one non-NULL value. Trino-named alias of `any_value`. `trino_functions_ext.rs:68` | `arbitrary` | `any_value` | `any_value` | `any_value` |
+| `arbitrary(expr)` | `sqe-trino-functions` | Any one non-NULL value. Trino-named alias of `any_value`. `trino_functions.rs:191` | `arbitrary` | `any_value` | `any_value` | `any_value` |
 
 ## Collection-building
 

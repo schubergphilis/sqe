@@ -815,9 +815,6 @@ fn skip_reason(name: &str) -> Option<&'static str> {
         "infinity" | "nan" | "e" | "current_timezone" | "now" | "localtime" | "localtimestamp" => {
             "zero-arity: no array input exists"
         }
-        "arbitrary" => {
-            "aggregate-alias stub: collapses a column to its first non-null value by design"
-        }
         "typeof" => "returns the static type name; a broadcast scalar is the correct shape",
         "all_match" | "none_match" | "reduce" | "array_all_match" | "array_none_match"
         | "array_reduce" | "filter" | "transform" | "any_match" | "array_any_match"
