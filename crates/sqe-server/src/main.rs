@@ -19,6 +19,8 @@ use sqe_trino_compat::server::{
     NodeContext, TrinoAuthenticator, TrinoQueryExecutor, TrinoResultStream,
 };
 
+mod malloc_arena;
+
 /// Build identity stamped in by `build.rs` (issue #669): shown in the
 /// startup log and `/api/v1/status` so a debug binary or a stale checkout
 /// is visible before anyone reads a benchmark off it.
@@ -1386,6 +1388,8 @@ fn raise_nofile_limit() -> Option<(libc::rlim_t, libc::rlim_t)> {
 // stream, and absorb large plans instead. An 8 MiB worker stack gives us ~4x
 // the headroom at zero runtime cost.
 fn main() -> anyhow::Result<()> {
+    // #788: cap glibc malloc arenas before any thread exists.
+    malloc_arena::apply();
     // ring is the process TLS provider (installed pre-main by sqe-core; this
     // makes it explicit and logs which case happened). The later call on the
     // TLS listener path stays as the finding-210 check.
@@ -1758,6 +1762,7 @@ async fn async_main() -> anyhow::Result<()> {
         build_profile = build_info::PROFILE,
         "Starting sqe-server"
     );
+    malloc_arena::log();
     // Issue #669: a debug binary is 5-10x slower on scans and decoding and
     // was once mistaken for an engine regression. Say so once, loudly.
     if build_info::IS_DEBUG {
