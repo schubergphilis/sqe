@@ -21,8 +21,8 @@ config, the right credentials, and a `SELECT` you can copy.
   Polaris stack from the repo's `docker-compose.test.yml`)
 
 ```bash
-git clone https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine.git
-cd sqlengine
+git clone https://github.com/schubergphilis/sqe.git
+cd sqe
 cargo build --release -p sqe-coordinator -p sqe-cli
 ```
 

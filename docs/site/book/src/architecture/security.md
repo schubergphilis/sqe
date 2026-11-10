@@ -2,7 +2,7 @@
 
 SQE enforces fine-grained security through **LogicalPlan rewriting**, injecting row filters and column masks into the query plan before DataFusion's optimizer runs.
 
-> **Status:** The plan-rewriting policy enforcer is implemented and pluggable, and it is **off by default**. The default policy engine is `passthrough` (`PassthroughEnforcer`), which returns plans unmodified, so enforcement is opt-in. The one enforcement backend is Apache Ranger, with an in-memory store for dev and tests. A default open-source deployment runs without any of this. See [GRANT and REVOKE](../sql-reference/grant-revoke.md) for the SQL surface and the Chameleon / SBP note.
+> **Status:** The plan-rewriting policy enforcer is implemented and pluggable, and it is **off by default**. The default policy engine is `passthrough` (`PassthroughEnforcer`), which returns plans unmodified, so enforcement is opt-in. The one enforcement backend is Apache Ranger, with an in-memory store for dev and tests. A default open-source deployment runs without any of this. See [GRANT and REVOKE](../sql-reference/grant-revoke.md) for the SQL surface and the platform note.
 
 ## Design Principle
 

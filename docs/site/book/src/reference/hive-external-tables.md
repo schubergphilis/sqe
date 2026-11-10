@@ -180,11 +180,11 @@ A Glue root can be scoped to named databases, in config or on the command line:
 [[hive.roots]]
 name      = "glue"
 kind      = "glue"
-databases = ["afas_raw", "claude"]   # empty = the whole catalog
+databases = ["billing_raw", "claude"]   # empty = the whole catalog
 ```
 
 ```bash
-sqe-server --glue-catalog glue --glue-database afas_raw,claude
+sqe-server --glue-catalog glue --glue-database billing_raw,claude
 ```
 
 Only those databases are listed, and a table anywhere else is not found rather than denied. Names are folded to lower case, which is how Glue stores them, and each is checked with `GetDatabase` at the first listing: a name that does not exist is a WARN in the log and is not listed, so a typo does not become an empty schema. This is a visibility scope shared by every caller of the server, not per-user authorization; that stays with the identity provider and the policy engine.

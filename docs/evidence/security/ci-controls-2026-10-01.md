@@ -4,11 +4,11 @@
 
 The two test-job overrides used the mutable `$CI_REGISTRY_IMAGE/ci-deps:main` image. They now use the registry-reported image reference with an immutable manifest digest:
 
-`registry-sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/ci-deps:main@sha256:ca76cfbb51768ed5ba75482893d159fa0773da5f9c97f5e9344dc1a4fb4a1c66`
+`$CI_REGISTRY_IMAGE/ci-deps:main@sha256:ca76cfbb51768ed5ba75482893d159fa0773da5f9c97f5e9344dc1a4fb4a1c66`
 
 The project registry API reports this digest for repository 411, tag main, image created 2026-09-27T16:55:20.649Z. Both test jobs use the same reviewed manifest. Digest pinning prevents a moved tag from changing an existing CI definition; it does not prove the contents are vulnerability-free. Refresh the checked-in digest when a new dependency image is reviewed. The main tag is retained for update discovery but the digest determines the pulled contents.
 
-GitLab CI lint (including the five pinned Aikido includes) returned valid=true, no errors and no warnings. The merged YAML contains the pinned image in both `aikido-test-rust` and `aikido-rust-extra`. `git diff --check` passed. Actual runner image pull and jobs are verified by MR CI.
+GitLab CI lint (including the five pinned shared-template includes) returned valid=true, no errors and no warnings. The merged YAML contains the pinned image in both `aikido-test-rust` and `aikido-rust-extra`. `git diff --check` passed. Actual runner image pull and jobs are verified by MR CI.
 
 ## #777 and #778 — project controls applied
 

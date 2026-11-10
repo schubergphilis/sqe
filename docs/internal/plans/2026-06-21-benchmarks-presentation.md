@@ -1,6 +1,6 @@
 # Benchmarks Presentation Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development. Implement on branch `docs/benchmarks-presentation` in worktree `/Users/jjverhoeks/sqe-d-wt` (NOT the primary checkout). Steps use checkbox (`- [ ]`) tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development. Implement on branch `docs/benchmarks-presentation` in worktree `~/sqe-d-wt` (NOT the primary checkout). Steps use checkbox (`- [ ]`) tracking.
 
 **Goal:** Make the published benchmark story coherent and honest across all surfaces, citing the committed numbers consistently and stating where SQE trails.
 
@@ -10,7 +10,7 @@
 
 **Spec:** `docs/internal/specs/2026-06-21-benchmarks-presentation-design.md`
 
-**Worktree note:** all work in `/Users/jjverhoeks/sqe-d-wt`; confirm `git branch --show-current` = `docs/benchmarks-presentation` at the start of each task.
+**Worktree note:** all work in `~/sqe-d-wt`; confirm `git branch --show-current` = `docs/benchmarks-presentation` at the start of each task.
 
 ## The canonical numbers (cite these; do not invent)
 
@@ -68,7 +68,7 @@ Replace the stale "~3.1x speedup on TPC-H SF1" framing with the current Results 
 
 Style: no emdash/endash/unicode-arrows; no "comprehensive/leverage/utilize"; short sentences; honest. Then:
 ```bash
-cd /Users/jjverhoeks/sqe-d-wt
+cd ~/sqe-d-wt
 ( cd docs/site/book && mdbook build -d /tmp/d1 2>&1 | grep -iE 'error|incomplete|broken' || echo "book builds clean" )
 grep -n '—\|–' docs/site/book/src/features/benchmarks.md || echo "no emdash"
 git add docs/site/book/src/features/benchmarks.md
@@ -91,7 +91,7 @@ Confirm `index.md` clearly frames itself as the longitudinal per-run record (it 
 
 - [ ] **Step 3: Build (evidence is not in the book, but check links) + commit**
 ```bash
-cd /Users/jjverhoeks/sqe-d-wt
+cd ~/sqe-d-wt
 grep -rn '—\|–' docs/evidence/benchmark/*.md || echo "no emdash"
 git add docs/evidence/benchmark/
 git commit -m "docs(benchmarks): tighten evidence narrative; reconcile numbers with performance.json"
@@ -115,7 +115,7 @@ Read it. Where it cites benchmark figures or "within 2x of Trino"-type claims, m
 
 Run:
 ```bash
-cd /Users/jjverhoeks/sqe-d-wt
+cd ~/sqe-d-wt
 grep -rnoE '[0-9]+(\.[0-9]+)?x|[0-9]+/[0-9]+|6/7|0\.70x' \
   docs/site/book/src/features/benchmarks.md \
   docs/site/web/performance.md \
@@ -137,7 +137,7 @@ git commit -m "docs(benchmarks): align performance.md + vs-other-engines with th
 
 - [ ] **Step 1: Full build + leak-scan**
 ```bash
-cd /Users/jjverhoeks/sqe-d-wt
+cd ~/sqe-d-wt
 make rustbook
 make leak-scan
 ```

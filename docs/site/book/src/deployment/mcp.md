@@ -649,7 +649,7 @@ root to named databases with `--glue-database` (repeatable or
 comma-separated) or `databases = [...]` on the `[[hive.roots]]` entry:
 
 ```bash
-sqe-server --glue-catalog glue --glue-database afas_raw,claude \
+sqe-server --glue-catalog glue --glue-database billing_raw,claude \
   --allow-s3-prefix s3://lake/ --mcp-anonymous --mcp-port 8098
 ```
 

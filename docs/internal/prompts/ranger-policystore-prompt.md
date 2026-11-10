@@ -13,7 +13,7 @@ adapting the existing OPA implementation. SQE already enforces row filters and
 column masks by rewriting the LogicalPlan; today the policy SOURCE can be OPA,
 Cedar, in-memory, or passthrough. Add Ranger as a source.
 
-Working dir: /Users/jjverhoeks/git/schuberg/vpf-data-ai/chameleon/Applications/sqlengine
+Working dir: the repository root
 Branch from `main`: `feat/ranger-policy-store`. Never push to main; open an MR.
 
 ## Context: how enforcement works today

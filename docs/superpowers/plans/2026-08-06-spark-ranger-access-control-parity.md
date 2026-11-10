@@ -289,7 +289,7 @@ mod tests {
 - [x] **Step 2: Run them to verify they fail**
 
 ```bash
-cd /Users/jjverhoeks/git/schuberg/vpf-data-ai/chameleon/Applications/sqlengine
+cd "$SQE_REPO"
 RUST_MIN_STACK=33554432 cargo test -p sqe-coordinator --test it spark_runner 2>&1 | tail -20
 ```
 

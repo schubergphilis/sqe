@@ -103,8 +103,8 @@ Top-level `docs/` holds zero loose files. Every file lands in exactly one zone:
 The current sync sanitizer does two unlike jobs. Split them:
 
 - **Security redaction (fix at source).** Real account IDs -> `123456789012`, no
-  personal IAM names (`jacobadmin`), no internal hostnames (`sbp.gitlab…`), no
-  monorepo paths (`vpf-data-ai/chameleon`). These are secrets/PII and must be
+  personal IAM names, no internal hostnames, no
+  internal monorepo paths. These are secrets/PII and must be
   placeholders even internally. `docs/site/` must never contain them. A repo-local
   leak-scan (`scripts/leak-scan-site.sh`) enforces exactly this set as a guard, and
   the corresponding rules are retired from both getsqe sync scripts.

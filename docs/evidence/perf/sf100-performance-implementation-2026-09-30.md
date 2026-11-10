@@ -8,10 +8,10 @@ experiments, not SF100 qualification.
 
 | Merge request | Issue scope |
 |---|---|
-| [!1220](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/merge_requests/1220) | Closes #780 on merge: retained buffered-result memory. |
-| [!1221](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/merge_requests/1221) | Closes #782 on merge: bounded JSON blocking work and cancellation. |
-| [!1222](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/merge_requests/1222) | Implements streaming for #783; full-scale RSS and live Iceberg checks remain open. |
-| [!1223](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/merge_requests/1223) | Advances #785; larger-scale and numeric qualification remain open. |
+| !1220 | Closes #780 on merge: retained buffered-result memory. |
+| !1221 | Closes #782 on merge: bounded JSON blocking work and cancellation. |
+| !1222 | Implements streaming for #783; full-scale RSS and live Iceberg checks remain open. |
+| !1223 | Advances #785; larger-scale and numeric qualification remain open. |
 
 The experiment script and raw JSON measurement file are supplied by !1223.
 Merge that MR before, or together with, this evidence document. Issues #779 and

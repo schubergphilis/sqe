@@ -54,19 +54,19 @@ default:
   interruptible: true
 
 include:
-  - project: 'vpf-data-ai/aikido'
+  - project: '$CI_PROJECT_ROOT_NAMESPACE/aikido'
     ref: '3911cfb92ece401e9dcaf329c95a0a8363e1f23f'
     file: '/ci/templates/guardrails.yml'
-  - project: 'vpf-data-ai/aikido'
+  - project: '$CI_PROJECT_ROOT_NAMESPACE/aikido'
     ref: '3911cfb92ece401e9dcaf329c95a0a8363e1f23f'
     file: '/ci/templates/test-rust.yml'
-  - project: 'vpf-data-ai/aikido'
+  - project: '$CI_PROJECT_ROOT_NAMESPACE/aikido'
     ref: '3911cfb92ece401e9dcaf329c95a0a8363e1f23f'
     file: '/ci/templates/deploy.yml'
-  - project: 'vpf-data-ai/aikido'
+  - project: '$CI_PROJECT_ROOT_NAMESPACE/aikido'
     ref: '3911cfb92ece401e9dcaf329c95a0a8363e1f23f'
     file: '/ci/templates/release.yml'
-  - project: 'vpf-data-ai/aikido'
+  - project: '$CI_PROJECT_ROOT_NAMESPACE/aikido'
     ref: '3911cfb92ece401e9dcaf329c95a0a8363e1f23f'
     file: '/ci/templates/consumer-controls.yml'
 
@@ -201,7 +201,7 @@ aikido-sbom:
 # Refresh these reviewed digests when the dependency image is rebuilt. The
 # moving main tag is build output, not a trusted immutable test environment.
 aikido-test-rust:
-  image: "registry-sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/ci-deps:main@sha256:ca76cfbb51768ed5ba75482893d159fa0773da5f9c97f5e9344dc1a4fb4a1c66"
+  image: "$CI_REGISTRY_IMAGE/ci-deps:main@sha256:ca76cfbb51768ed5ba75482893d159fa0773da5f9c97f5e9344dc1a4fb4a1c66"
   variables:
     AIKIDO_SHARED_SCRIPTS: "reuse-deps-image.sh"
     CARGO_TARGET_DIR: "/opt/sqe-deps/target"
@@ -212,7 +212,7 @@ aikido-test-rust:
     - !reference [.aikido_rust_build_env, before_script]
 
 aikido-rust-extra:
-  image: "registry-sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/ci-deps:main@sha256:ca76cfbb51768ed5ba75482893d159fa0773da5f9c97f5e9344dc1a4fb4a1c66"
+  image: "$CI_REGISTRY_IMAGE/ci-deps:main@sha256:ca76cfbb51768ed5ba75482893d159fa0773da5f9c97f5e9344dc1a4fb4a1c66"
   variables:
     AIKIDO_SHARED_SCRIPTS: "reuse-deps-image.sh"
     CARGO_TARGET_DIR: "/opt/sqe-deps/target"
@@ -302,7 +302,7 @@ vendored-profile-drift:
   script:
     - |
       set -euo pipefail
-      if ! git clone --depth 1           "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}:${CI_SERVER_PORT}/vpf-data-ai/chameleon/applications/data-platform.git"           "$DATA_PLATFORM_DIR" 2>/dev/null; then
+      if ! git clone --depth 1           "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}:${CI_SERVER_PORT}/${CI_PROJECT_NAMESPACE}/data-platform.git"           "$DATA_PLATFORM_DIR" 2>/dev/null; then
         echo "could not clone data-platform with CI_JOB_TOKEN." >&2
         echo "Add this project to data-platform's CI/CD job token allowlist" >&2
         echo "(Settings > CI/CD > Job token permissions), or run" >&2

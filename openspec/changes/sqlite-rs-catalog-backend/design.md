@@ -2,7 +2,7 @@
 
 ## The five gaps, measured
 
-Read from the `sqlite-rs` working tree at `/Users/jjverhoeks/git/schuberg/sqlite-rs`, version 0.18.5, on 2026-08-28.
+Read from a local `sqlite-rs` working tree, version 0.18.5, on 2026-08-28.
 
 ### 1. No `sqlx` driver, and SQE only speaks `sqlx`
 

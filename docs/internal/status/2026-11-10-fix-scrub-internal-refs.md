@@ -1,0 +1,7 @@
+**STATUS 2026-11-10: Internal infrastructure references scrubbed from the tree; `make leaks` added (`fix/scrub-internal-refs`).**
+
+The public GitHub mirror exposed the internal GitLab host and registry, the internal group path, home paths, personal AWS profile names, an AWS account id, internal dataset names and the company abbreviation. CI now takes its registry and include project from GitLab predefined variables (`glab ci lint` valid). Docs, tests, benchmark output, `.asset.license` and the playground Iceberg metadata are rewritten; the playground avro manifests were re-encoded with fastavro and `manifest_length` updated, then read back. `scripts/leak-scan-site.sh` patterns are generic now, so it does not spell out the strings it looks for. `scripts/leak-scan-repo.sh` (`make leaks`) checks the whole tree including untracked files; a canary file tripped every category.
+
+Limits: git history, tags and the other mirrored branches still contain the old values; cleaning them needs a history rewrite and force-push on both remotes. `docs/internal/` is still mirrored. `.asset` keeps its contact address (platform tooling reads it), and the `Chameleon` config name stays (renaming breaks configs). CI does not run `make leaks` yet (`ci-config-sanity` lacks git; credentials are covered by the secret-scan job).
+
+**NEXT:** decide on a history rewrite and on excluding `docs/internal/` from the mirror; recheck GitHub code search after the next mirror push; optionally add a masked `LEAK_SCAN_EXTRA` CI variable and run `make leaks` in CI.

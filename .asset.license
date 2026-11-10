@@ -6,7 +6,7 @@ id = "OSS-LGPL-R-EFI-UEFI-ONLY-2026"
 component = "pkg:cargo/r-efi@*"
 licenses = ["LGPL-2.1-or-later", "LGPL-*"]
 scope = "platform-optional-not-linked"
-owner = "vpf-data-ai/chameleon sqlengine maintainers"
+owner = "sqlengine maintainers"
 reason = "r-efi is UEFI firmware ABI bindings pulled only as a target-specific dependency of getrandom (0.3+/0.4) for target_os=uefi. SQE does not build or ship UEFI binaries; Linux/macOS/Windows server artifacts do not link r-efi. No drop-in replacement exists for getrandom's UEFI backend. Prefer removing if getrandom drops the dep; until then treat as platform-optional not-linked."
 expires = "2027-07-27"
 
@@ -21,7 +21,7 @@ id = "OSS-GHA-ACTIONS-CHECKOUT-EVIDENCE-2026"
 component = "actions/checkout@*"
 licenses = ["MIT"]
 scope = "evidence-vouched"
-owner = "vpf-data-ai/chameleon sqlengine maintainers"
+owner = "sqlengine maintainers"
 reason = "actions/checkout is MIT: https://github.com/actions/checkout/blob/v4/LICENSE . CI-only step on the GitHub mirror; nothing from it is shipped."
 expires = "2027-09-14"
 
@@ -30,7 +30,7 @@ id = "OSS-GHA-ACTIONS-UPLOAD-ARTIFACT-EVIDENCE-2026"
 component = "actions/upload-artifact@*"
 licenses = ["MIT"]
 scope = "evidence-vouched"
-owner = "vpf-data-ai/chameleon sqlengine maintainers"
+owner = "sqlengine maintainers"
 reason = "actions/upload-artifact is MIT: https://github.com/actions/upload-artifact/blob/v4/LICENSE . CI-only step on the GitHub mirror; nothing from it is shipped."
 expires = "2027-09-14"
 
@@ -39,7 +39,7 @@ id = "OSS-GHA-ACTIONS-DOWNLOAD-ARTIFACT-EVIDENCE-2026"
 component = "actions/download-artifact@*"
 licenses = ["MIT"]
 scope = "evidence-vouched"
-owner = "vpf-data-ai/chameleon sqlengine maintainers"
+owner = "sqlengine maintainers"
 reason = "actions/download-artifact is MIT: https://github.com/actions/download-artifact/blob/v4/LICENSE . CI-only step on the GitHub mirror; nothing from it is shipped."
 expires = "2027-09-14"
 
@@ -48,6 +48,6 @@ id = "OSS-GHA-SWATINEM-RUST-CACHE-EVIDENCE-2026"
 component = "Swatinem/rust-cache@*"
 licenses = ["MIT"]
 scope = "evidence-vouched"
-owner = "vpf-data-ai/chameleon sqlengine maintainers"
+owner = "sqlengine maintainers"
 reason = "Swatinem/rust-cache is MIT: https://github.com/Swatinem/rust-cache/blob/v2/LICENSE . CI-only cache step on the GitHub mirror; nothing from it is shipped."
 expires = "2027-09-14"

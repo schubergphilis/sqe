@@ -45,7 +45,7 @@ The flags:
   read lazily, so one unreadable table does not take the catalog down. Athena
   views are expanded from their Glue definition and queried like tables.
 - `--glue-database <db>` restricts the catalog to specific databases. Repeatable,
-  and each value may be comma-separated (`--glue-database claude,afas`). Empty
+  and each value may be comma-separated (`--glue-database claude,billing`). Empty
   exposes every database. A table in any other database is not found, so a shared
   Glue catalog can be scoped to what one deployment should see. Names are folded
   to lower case (Glue stores them that way) and checked against the catalog at

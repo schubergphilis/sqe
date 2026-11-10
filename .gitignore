@@ -62,3 +62,6 @@ benchmarks/profiles/*.secret.toml
 
 # Downloaded immutable Aikido control scripts
 .aikido-shared/
+
+# Private leak-scan patterns for `make leaks` (one ERE per line); never commit.
+.leak-scan-extra

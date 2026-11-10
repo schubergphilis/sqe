@@ -1,6 +1,6 @@
 # Website Content Unification Implementation Plan
 
-> **For agentic workers:** implement on branch `docs/website-content-unify` in the worktree `/Users/jjverhoeks/sqe-content-wt` (NOT the primary checkout). Steps use checkbox (`- [ ]`) tracking.
+> **For agentic workers:** implement on branch `docs/website-content-unify` in the worktree `~/sqe-content-wt` (NOT the primary checkout). Steps use checkbox (`- [ ]`) tracking.
 
 **Goal:** Make the SQE repo the single home for ALL website content (markdown + structured copy), so authors edit "from here"; the getsqe repo keeps only Astro code/templates that render it.
 
@@ -10,7 +10,7 @@
 
 ## Source -> target mapping (B1)
 
-Authored content currently ONLY in `/Users/jjverhoeks/git/getsqe/website`, to transcribe verbatim (preserving wording, fixing only emdash/endash/arrows per repo style) into `docs/site/web/`:
+Authored content currently ONLY in `~/git/getsqe/website`, to transcribe verbatim (preserving wording, fixing only emdash/endash/arrows per repo style) into `docs/site/web/`:
 
 | getsqe source | authored content | -> SQE target | format |
 |---|---|---|---|

@@ -28,7 +28,7 @@ a validation pass.
    filesystem catalog "without a catalog service"
 7. Quack protocol: server (sqe-quack-server) and client (sqe-quack-client)
 8. File-format TVFs: read_csv / read_parquet / read_json (read_delta if present)
-9. Chameleon/SBP-specific SQL: GRANT / REVOKE (+ SHOW GRANTS / SHOW EFFECTIVE POLICY)
+9. platform-specific SQL: GRANT / REVOKE (+ SHOW GRANTS / SHOW EFFECTIVE POLICY)
 10. Benchmarks: TPC-H, TPC-DS, SSB (and the others sqe-bench supports)
 
 ## Decisions (locked with the user)
@@ -36,12 +36,12 @@ a validation pass.
 - Deliverable: improve the existing tests where thin, document usage + config
   per use-case, and produce a results table. (Not a from-scratch test suite.)
 - Live backends: run live where credentials exist. Local `.env` provides
-  `AWS_PROFILE=jacobbuilder` (never committed; `.env` is gitignored at
+  `AWS_PROFILE=<builder>` (never committed; `.env` is gitignored at
   `.gitignore:14`). All gated backends run live this round: Glue, S3 Tables,
   Unity OSS, HMS, Nessie.
 - Structure: one combined branch + one MR.
 - Chameleon split: GRANT/REVOKE stays in the public book but under a clearly
-  marked "Chameleon / SBP-specific" callout, not removed.
+  marked "Platform-specific" callout, not removed.
 - Book section name: "Use Cases" (grouped, ~7 pages).
 - Validation matrix: curated markdown, evidence-backed (no new generator tooling).
 - Live scope: all gated backends live.
@@ -103,7 +103,7 @@ before or after "Deployment". Pages, each following one runbook template:
    (links to `features/benchmarks.md`).
 
 GRANT/REVOKE is documented in the existing `sql-reference/grant-revoke.md`
-under a clearly marked "Chameleon / SBP-specific" callout, and linked from
+under a clearly marked "Platform-specific" callout, and linked from
 the Use Cases index (not its own use-case page, to keep the split clean).
 
 Runbook page template (every page):
@@ -157,7 +157,7 @@ Include a runnable server + client example.
 
 ### E. Live validation runs (capture evidence)
 
-Create local `.env` (gitignored) with `AWS_PROFILE=jacobbuilder`, `AWS_REGION`,
+Create local `.env` (gitignored) with `AWS_PROFILE=<builder>`, `AWS_REGION`,
 and the glue + s3tables warehouse vars. Then, capturing output for the matrix:
 - Polaris single + distributed: compose up -> bootstrap -> Flight + Trino runs.
 - Backends live: run the `#[ignore]` Glue + S3 Tables tests with creds; bring
@@ -192,12 +192,12 @@ and the glue + s3tables warehouse vars. Then, capturing output for the matrix:
 - New tests for the thin spots (TVF csv/json, embedded sqlite/hadoop,
   GRANT/REVOKE e2e); in-process ones green in the workspace test lanes.
 - Quack discoverable in the book.
-- GRANT/REVOKE clearly marked Chameleon/SBP-specific.
+- GRANT/REVOKE clearly marked platform-specific.
 - mdBook builds; new prose passes the voice-rule grep; one MR.
 
 ## Risks
 
-- Live AWS (Glue/S3 Tables) depends on the `jacobbuilder` profile being valid
+- Live AWS (Glue/S3 Tables) depends on the `<builder>` profile being valid
   in this environment; if a call fails, that row is documented as creds-gated
   with the prior evidence rather than blocking the MR.
 - The local docker stack state is unknown; bootstrap may need a clean restart.

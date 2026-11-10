@@ -487,15 +487,15 @@ mod scope_tests {
     }
 
     /// Glue lower-cases database names; the scope is folded to match, so
-    /// `--glue-database Claude,afas_raw` scopes to `claude` and `afas_raw`
+    /// `--glue-database Claude,billing_raw` scopes to `claude` and `billing_raw`
     /// and a lookup in either case is answered.
     #[test]
     fn the_scope_is_lower_cased_trimmed_and_deduplicated() {
-        let s = source(&["Claude", " afas_raw ", "claude", ""]);
-        assert_eq!(s.scope(), ["afas_raw", "claude"]);
+        let s = source(&["Claude", " billing_raw ", "claude", ""]);
+        assert_eq!(s.scope(), ["billing_raw", "claude"]);
         assert!(!s.database_blocked("claude"));
         assert!(!s.database_blocked("CLAUDE"));
-        assert!(!s.database_blocked("afas_raw"));
+        assert!(!s.database_blocked("billing_raw"));
         assert!(s.database_blocked("usage_data_raw"));
     }
 

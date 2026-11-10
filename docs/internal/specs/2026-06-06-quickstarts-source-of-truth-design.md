@@ -44,7 +44,7 @@ particular the Keycloak auth tests it implied already exist at
   but mounts bootstrap configs from `quickstart/_shared/` by relative path.
   `cd quickstart/<name> && ./run.sh` works standalone; bootstrap stays DRY.
 - **AWS validation**: the user authorized `cdk deploy` + `cdk destroy` in the
-  `jacobbuilder` account this session for the AWS batch. Teardown is confirmed
+  builder account this session for the AWS batch. Teardown is confirmed
   after each run. (Not part of the reference build below; Batch B.)
 - **Website**: produce repo-side READMEs with Astro frontmatter
   (`slug`, `title`, `description`) and sanitizable placeholder values. Do NOT
@@ -169,7 +169,7 @@ output lands in `OUTPUT.md`.
 | Batch | Quickstarts | Shared assets |
 |---|---|---|
 | **A. Catalog + Auth (local stack)** | polaris+keycloak (client_id) [REF], polaris+keycloak (user token), nessie, other REST catalogs (Unity OSS / generic REST) | keycloak realm, polaris bootstrap, rustfs |
-| **B. AWS managed (CDK)** | s3tables, glue, glue + lake formation | one CDK app (deploy + destroy), jacobbuilder profile |
+| **B. AWS managed (CDK)** | s3tables, glue, glue + lake formation | one CDK app (deploy + destroy), builder profile |
 | **C. Embedded** | local + remote files, quack server, quack client, attach options, local sqlite catalog | file fixtures |
 | **D. Ops** | monitor / logs / metrics | observability compose (VictoriaMetrics + Grafana) |
 | **E. Benchmark** | TPC-H / TPC-DS / SSB | sqe-bench |
@@ -195,7 +195,7 @@ The two keycloak quickstarts differ only in auth flow:
    Work."
 7. Voice-rule grep clean on new prose. One MR for the reference + scaffold.
 8. (Subsequent plans/PRs) the remaining batches, each following the template.
-   Batch B runs `cdk deploy`/`destroy` against jacobbuilder.
+   Batch B runs `cdk deploy`/`destroy` against the builder account.
 
 ## Out of scope
 

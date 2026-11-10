@@ -1,6 +1,6 @@
 # Querying an AWS Glue Hive catalog from SQE
 
-Survey of a live Glue Data Catalog (account 088044431914, eu-central-1)
+Survey of a live Glue Data Catalog (account 123456789012, eu-central-1)
 against what SQE can read today, plus what the gap costs to close.
 
 Two passes, hours apart. The first read a field subset and saw 618 tables;
@@ -125,8 +125,8 @@ reported as an unsupported table rather than a parse failure.
 three-object sample per table. Re-listing them in full split that number in
 two, and both halves say something.
 
-13 were a sampling race. They live in `-transient-datazone` (`afas_tmp`,
-`afas_sensitive_tmp`) and were genuinely empty at 14:05, then held a fresh
+13 were a sampling race. They live in `-transient-datazone` (`billing_tmp`,
+`billing_sensitive_tmp`) and were genuinely empty at 14:05, then held a fresh
 Athena CTAS file 40 minutes later. The transient zone is rewritten on every
 ETL pass, so "this table is empty" is a statement with a shelf life of
 minutes. Any cache over Glue metadata or file listings needs a TTL short

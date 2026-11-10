@@ -130,7 +130,7 @@ name = "storagegrid"
 manage_stack = true            # bring up docker (postgres/polaris/rustfs); false = connect only
 
 [s3]
-endpoint    = "https://s3.storage.acc.schubergphilis.com"
+endpoint    = "https://s3.storagegrid.example.com"
 region      = "us-east-1"
 path_style  = true
 profile     = "storagegrid"    # aws credentials profile, OR access_key/secret_key below

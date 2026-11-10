@@ -26,7 +26,7 @@ Established empirically against the current `.gitlab-ci.yml`:
 
 ## Constraints discovered (load-bearing)
 
-- **The shared `.kaniko-build` template** (`vpf-data-ai/libraries/ci-cd-pipelines/build-publish-docker-images`):
+- **The shared `.kaniko-build` template** (shared CI library, `build-publish-docker-images`):
   - auth: `REGISTRY_USERNAME:-$CI_REGISTRY_USER` / `REGISTRY_PASSWORD:-$CI_REGISTRY_PASSWORD`;
   - image path: `${REGISTRY_PROJECT}/${IMAGE_NAME}` when `REGISTRY_PROJECT` is set, else
     `${CI_PROJECT_PATH}/${IMAGE_NAME}`; registry host = `${REGISTRY_URL:-$CI_REGISTRY}`;
