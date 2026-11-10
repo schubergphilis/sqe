@@ -15,10 +15,14 @@ use base64::Engine;
 /// (pyarrow, ADBC) read the column as a JSON extension array.
 pub const JSON_TEXT_MARKER: &str = "sqe.json";
 
-/// True when `field` is Utf8 JSON text carrying [`JSON_TEXT_MARKER`].
+/// True when `field` is string JSON text carrying [`JSON_TEXT_MARKER`]. A
+/// stored V2 `JSON` column is read as `Utf8View` (the scan's string layout)
+/// and carries the marker too (#848).
 pub fn is_json_text(field: &Field) -> bool {
-    field.data_type() == &DataType::Utf8
-        && field.metadata().get(JSON_TEXT_MARKER).map(String::as_str) == Some("true")
+    matches!(
+        field.data_type(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    ) && field.metadata().get(JSON_TEXT_MARKER).map(String::as_str) == Some("true")
 }
 
 /// Normalize a rendered timestamp string to exactly 6 fractional-second digits

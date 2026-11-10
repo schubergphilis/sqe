@@ -186,7 +186,24 @@ impl SqeTableProvider {
     /// Arrow schema for `snapshot_id` (the snapshot's own schema; the table's
     /// current schema when `None` or when the snapshot has no schema id),
     /// with top-level strings as `Utf8View` when `string_view` is set.
+    /// The string columns the `sqe.json-columns` property lists (a `JSON`
+    /// column below format v3, #848) carry the JSON text marker.
     fn arrow_schema_for(
+        table: &Table,
+        snapshot_id: Option<i64>,
+        string_view: bool,
+    ) -> sqe_core::Result<ArrowSchemaRef> {
+        let schema = Self::stored_arrow_schema(table, snapshot_id, string_view)?;
+        let json_columns = sqe_core::json_columns::json_columns(table.metadata().properties());
+        Ok(
+            match sqe_core::json_columns::mark_schema(&schema, &json_columns) {
+                Some(marked) => Arc::new(marked),
+                None => schema,
+            },
+        )
+    }
+
+    fn stored_arrow_schema(
         table: &Table,
         snapshot_id: Option<i64>,
         string_view: bool,
@@ -591,6 +608,12 @@ mod snapshot_schema_tests {
     /// Three schemas and three snapshots: `x` -> `x, y` (ADD COLUMN y) ->
     /// `y` (DROP COLUMN x). The current snapshot is the last one.
     fn evolved_table() -> iceberg::table::Table {
+        evolved_table_with_properties("{}")
+    }
+
+    /// [`evolved_table`] with `properties` (a JSON object) as its table
+    /// properties.
+    fn evolved_table_with_properties(properties: &str) -> iceberg::table::Table {
         const META_V2: &str = r#"{
             "format-version": 2,
             "table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
@@ -634,7 +657,8 @@ mod snapshot_schema_tests {
             "snapshot-log": [],
             "metadata-log": []
         }"#;
-        let metadata: iceberg::spec::TableMetadata = serde_json::from_str(META_V2).unwrap();
+        let meta = META_V2.replace(r#""properties": {}"#, &format!(r#""properties": {properties}"#));
+        let metadata: iceberg::spec::TableMetadata = serde_json::from_str(&meta).unwrap();
         let file_io = iceberg::io::FileIO::new_with_fs();
         iceberg::table::Table::builder()
             .runtime(iceberg::Runtime::current())
@@ -647,6 +671,41 @@ mod snapshot_schema_tests {
             .disable_cache()
             .build()
             .unwrap()
+    }
+
+    /// A string column the `sqe.json-columns` property lists is JSON text
+    /// (#848), with either string layout; an unlisted one is not.
+    #[tokio::test]
+    async fn listed_json_columns_carry_the_json_marker() {
+        use sqe_core::json_columns::is_marked;
+
+        let table = evolved_table_with_properties(r#"{"sqe.json-columns": "[\"y\"]"}"#);
+        let provider = SqeTableProvider::try_new(table).await.unwrap();
+        let y = provider.schema.field_with_name("y").unwrap();
+        assert!(is_marked(y));
+        assert_eq!(y.data_type(), &arrow::datatypes::DataType::Utf8View);
+        assert!(y.metadata().contains_key("PARQUET:field_id"));
+
+        let utf8 = provider.with_tuning(crate::iceberg_scan::ScanTuning {
+            string_view: false,
+            ..Default::default()
+        });
+        let y = utf8.schema.field_with_name("y").unwrap();
+        assert!(is_marked(y));
+        assert_eq!(y.data_type(), &arrow::datatypes::DataType::Utf8);
+
+        // Time travel to a snapshot with `y` keeps the marker.
+        let old = SqeTableProvider::try_new_at_snapshot(
+            evolved_table_with_properties(r#"{"sqe.json-columns": "[\"y\"]"}"#),
+            SNAP_X_AND_Y,
+        )
+        .await
+        .unwrap();
+        assert!(is_marked(old.schema.field_with_name("y").unwrap()));
+        assert!(!is_marked(old.schema.field_with_name("x").unwrap()));
+
+        let plain = SqeTableProvider::try_new(evolved_table()).await.unwrap();
+        assert!(!is_marked(plain.schema.field_with_name("y").unwrap()));
     }
 
     fn column_names(provider: &SqeTableProvider) -> Vec<String> {

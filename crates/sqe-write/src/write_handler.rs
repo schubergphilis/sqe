@@ -1470,6 +1470,13 @@ fn ctas_replace_is_in_place(
             return false;
         }
     }
+    // An in-place replace keeps the live properties, so a SELECT that
+    // changes which columns hold JSON text takes the staged path (#848).
+    if sqe_core::json_columns::json_columns(live.metadata().properties())
+        != sqe_core::json_columns::marked_columns(new_arrow_schema)
+    {
+        return false;
+    }
 
     let Some(unbound) = new_partition_spec else {
         return true;
@@ -2336,7 +2343,12 @@ impl WriteHandler {
         // Merge user TBLPROPERTIES / WITH options (see handle_ctas for why):
         // a CTAS must keep properties like write.parquet.bloom-filter-* that
         // drive the data write, matching the plain CREATE TABLE path.
-        let props = create_table_properties(rest_catalog, create_format_version, user_options);
+        let mut props = create_table_properties(rest_catalog, create_format_version, user_options);
+        // A string column the SELECT marks as JSON text stays JSON (#848).
+        record_json_columns(
+            &mut props,
+            sqe_core::json_columns::marked_columns(&arrow_schema),
+        );
         let table_creation = TableCreation::builder()
             .name(create_name.clone())
             .schema(iceberg_schema)
@@ -2971,11 +2983,15 @@ impl WriteHandler {
         // `with_options` (WITH (...)) fields into a single `table_options`
         // enum. Extract the user options regardless of which syntax produced
         // them so CREATE TABLE keeps every property the user typed.
-        let props = create_table_properties(
+        let mut props = create_table_properties(
             rest_catalog,
             format_version,
             create_table_options_as_slice(&ct.table_options),
         );
+        // Below v3 a JSON column is a string; the property keeps it JSON (#848).
+        if format_version != FormatVersion::V3 {
+            record_json_columns(&mut props, declared_json_columns(&ct.columns));
+        }
 
         // Translate any PARTITIONED BY (...) clause into an Iceberg
         // UnboundPartitionSpec. Identity transforms cover bare column
@@ -3087,7 +3103,12 @@ impl WriteHandler {
         } else {
             self.format_version()
         };
-        let props = self.format_version_props(format_version);
+        let mut props = self.format_version_props(format_version);
+        // The source's JSON columns are strings here too; keep them JSON (#848).
+        record_json_columns(
+            &mut props,
+            sqe_core::json_columns::json_columns(src_table.metadata().properties()),
+        );
         let location = unique_table_location(catalog.as_ref(), &namespace, &name).await;
         let table_creation = TableCreation::builder()
             .name(name.clone())
@@ -9408,6 +9429,31 @@ pub(crate) fn create_table_properties(
     props
 }
 
+/// Record `columns` in the `sqe.json-columns` property (#848). Nothing is
+/// written for an empty set, so a table without JSON columns keeps the
+/// properties it had.
+pub(crate) fn record_json_columns(
+    props: &mut std::collections::HashMap<String, String>,
+    columns: std::collections::BTreeSet<String>,
+) {
+    use sqe_core::json_columns::{encode, JSON_COLUMNS_PROP};
+    if columns.is_empty() {
+        return;
+    }
+    props.insert(JSON_COLUMNS_PROP.to_string(), encode(&columns));
+}
+
+/// The folded names of the columns a CREATE TABLE declares `JSON`.
+pub(crate) fn declared_json_columns(
+    columns: &[sqlparser::ast::ColumnDef],
+) -> std::collections::BTreeSet<String> {
+    columns
+        .iter()
+        .filter(|col| matches!(col.data_type, sqlparser::ast::DataType::JSON))
+        .map(|col| fold_unquoted_ident(&col.name))
+        .collect()
+}
+
 pub(crate) fn merge_user_table_properties(
     props: &mut std::collections::HashMap<String, String>,
     options: &[sqlparser::ast::SqlOption],
@@ -14074,6 +14120,65 @@ s3_path_style = true
             None,
             &nullable_ice
         ));
+    }
+
+    /// An in-place replace keeps the live properties, so a SELECT that adds
+    /// or drops a JSON text column has to stage the table instead (#848).
+    #[tokio::test]
+    async fn ctas_replace_is_not_in_place_when_the_json_columns_differ() {
+        use sqe_core::json_columns::JSON_FIELD_MARKER;
+        use std::collections::HashMap;
+        let meta = |props: &str| {
+            UNPARTITIONED_META
+                .replace(
+                    r#"{"id": 1, "name": "id", "required": true, "type": "int"}"#,
+                    r#"{"id": 1, "name": "j", "required": false, "type": "string"}"#,
+                )
+                .replace(r#""properties": {}"#, &format!(r#""properties": {props}"#))
+        };
+        let plain = Field::new("j", DataType::Utf8, true);
+        let marked = plain.clone().with_metadata(HashMap::from([(
+            JSON_FIELD_MARKER.to_string(),
+            "true".to_string(),
+        )]));
+        let (plain_arrow, plain_ice) = select_schemas(vec![plain]);
+        let (json_arrow, json_ice) = select_schemas(vec![marked]);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live_plain = local_table(&dir, &meta("{}"));
+        assert!(ctas_replace_is_in_place(&live_plain, &plain_arrow, None, &plain_ice));
+        assert!(!ctas_replace_is_in_place(&live_plain, &json_arrow, None, &json_ice));
+
+        let live_json = local_table(&dir, &meta(r#"{"sqe.json-columns": "[\"j\"]"}"#));
+        assert!(ctas_replace_is_in_place(&live_json, &json_arrow, None, &json_ice));
+        assert!(!ctas_replace_is_in_place(&live_json, &plain_arrow, None, &plain_ice));
+    }
+
+    /// CREATE TABLE records the folded names of its `JSON` columns; a quoted
+    /// name keeps its case (#848).
+    #[test]
+    fn declared_json_columns_folds_the_json_column_names() {
+        let sql = r#"CREATE TABLE t (id INT, Doc JSON, "Raw" JSON, note VARCHAR)"#;
+        let stmt = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::GenericDialect {},
+            sql,
+        )
+        .expect("parse")
+        .remove(0);
+        let sqlparser::ast::Statement::CreateTable(ct) = stmt else {
+            panic!("expected CREATE TABLE");
+        };
+        let columns = declared_json_columns(&ct.columns);
+        assert_eq!(
+            columns.into_iter().collect::<Vec<_>>(),
+            vec!["Raw".to_string(), "doc".to_string()]
+        );
+
+        let mut props = std::collections::HashMap::new();
+        record_json_columns(&mut props, Default::default());
+        assert!(props.is_empty(), "no JSON columns, no property");
+        record_json_columns(&mut props, declared_json_columns(&ct.columns));
+        assert_eq!(props["sqe.json-columns"], r#"["Raw","doc"]"#);
     }
 
     /// An explicit `PARTITIONED BY` has to name the same source columns and

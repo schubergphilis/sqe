@@ -384,11 +384,130 @@ async fn cast_as_json_embeds_a_v3_json_column() {
     drop(&handler, &session, fq).await;
 }
 
+/// A `JSON` column on a V2 table is a stored string listed in
+/// `sqe.json-columns`: `CAST(.. AS JSON)` returns it unchanged through every
+/// write path, and ALTER keeps the list current (#848).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn cast_as_json_returns_a_v2_json_column() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let fq = "default.cast_as_json_v2";
+    let src = "default.cast_as_json_v2_src";
+    let copy = "default.cast_as_json_v2_ctas";
+    let like = "default.cast_as_json_v2_like";
+    let legacy = "default.cast_as_json_v2_legacy";
+    for t in [fq, src, copy, like, legacy] {
+        drop(&handler, &session, t).await;
+    }
+    let cast = |table: &str, col: &str| {
+        format!("SELECT id, CAST({col} AS JSON), to_json({col}) FROM {table} ORDER BY id")
+    };
+    for sql in [
+        format!("CREATE TABLE {fq} (id INT, j JSON) WITH ('format-version' = '2')"),
+        format!(r#"INSERT INTO {fq} VALUES (1, '{{"b": 1, "a": 2}}'), (2, 'not json'), (3, NULL)"#),
+        format!("CREATE TABLE {src} (id INT, doc VARCHAR) WITH ('format-version' = '2')"),
+        format!(r#"INSERT INTO {src} VALUES (4, '[1, 2]'), (5, '{{"m": true}}')"#),
+        // Every write path into the column: INSERT .. SELECT, UPDATE, MERGE.
+        format!("INSERT INTO {fq} SELECT id, doc FROM {src} WHERE id = 4"),
+        format!(r#"UPDATE {fq} SET j = '{{"u": 1}}' WHERE id = 3"#),
+        format!(
+            "MERGE INTO {fq} t USING {src} s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET j = s.doc \
+             WHEN NOT MATCHED THEN INSERT (id, j) VALUES (s.id, s.doc)"
+        ),
+    ] {
+        handler.execute(&session, &sql, None).await.expect(&sql);
+    }
+    let want = vec![
+        r#"1|{"a":2,"b":1}|{"a":2,"b":1}"#.to_string(),
+        r#"2|"not json"|"not json""#.to_string(),
+        r#"3|{"u":1}|{"u":1}"#.to_string(),
+        "4|[1,2]|[1,2]".to_string(),
+        r#"5|{"m":true}|{"m":true}"#.to_string(),
+    ];
+    assert_eq!(rows(&handler, &session, &cast(fq, "j")).await, want);
+
+    // A UNION with a plain VARCHAR column and a filter keep the values.
+    let union = format!(
+        "SELECT v FROM (SELECT j AS v FROM {fq} WHERE id = 4 \
+         UNION ALL SELECT doc FROM {src} WHERE id = 4) u"
+    );
+    assert_eq!(
+        rows(&handler, &session, &union).await,
+        vec!["[1, 2]", "[1, 2]"]
+    );
+
+    // CTAS and CREATE TABLE LIKE carry the column list.
+    for sql in [
+        format!(
+            "CREATE TABLE {copy} TBLPROPERTIES ('format-version' = '2') AS SELECT id, j FROM {fq}"
+        ),
+        format!("CREATE TABLE {like} (LIKE {fq})"),
+        format!("INSERT INTO {like} SELECT id, j FROM {fq}"),
+    ] {
+        handler.execute(&session, &sql, None).await.expect(&sql);
+    }
+    assert_eq!(rows(&handler, &session, &cast(copy, "j")).await, want);
+    assert_eq!(rows(&handler, &session, &cast(like, "j")).await, want);
+
+    // RENAME follows the column; DROP and re-ADD as VARCHAR clears it.
+    handler
+        .execute(&session, &format!("ALTER TABLE {fq} RENAME COLUMN j TO doc"), None)
+        .await
+        .expect("rename");
+    assert_eq!(rows(&handler, &session, &cast(fq, "doc")).await, want);
+    for sql in [
+        format!("ALTER TABLE {fq} DROP COLUMN doc"),
+        format!("ALTER TABLE {fq} ADD COLUMN doc VARCHAR"),
+        format!(r#"UPDATE {fq} SET doc = '{{"x": 1}}' WHERE id = 1"#),
+    ] {
+        handler.execute(&session, &sql, None).await.expect(&sql);
+    }
+    assert_eq!(
+        rows(
+            &handler,
+            &session,
+            &format!("SELECT CAST(doc AS JSON) FROM {fq} WHERE id = 1")
+        )
+        .await,
+        vec![r#""{\"x\": 1}""#]
+    );
+
+    // A table written before the property opts in with SET DATA TYPE JSON.
+    for sql in [
+        format!("CREATE TABLE {legacy} (id INT, doc VARCHAR) WITH ('format-version' = '2')"),
+        format!(r#"INSERT INTO {legacy} VALUES (1, '{{"k": [1]}}')"#),
+    ] {
+        handler.execute(&session, &sql, None).await.expect(&sql);
+    }
+    let legacy_cast = format!("SELECT CAST(doc AS JSON) FROM {legacy}");
+    assert_eq!(
+        rows(&handler, &session, &legacy_cast).await,
+        vec![r#""{\"k\": [1]}""#]
+    );
+    handler
+        .execute(
+            &session,
+            &format!("ALTER TABLE {legacy} ALTER COLUMN doc SET DATA TYPE JSON"),
+            None,
+        )
+        .await
+        .expect("SET DATA TYPE JSON");
+    assert_eq!(
+        rows(&handler, &session, &legacy_cast).await,
+        vec![r#"{"k":[1]}"#]
+    );
+
+    for t in [fq, src, copy, like, legacy] {
+        drop(&handler, &session, t).await;
+    }
+}
+
 /// A JSON value from `json_parse` / `json_extract` keeps its JSON marker
 /// through a subquery, so `CAST(.. AS JSON)` of it is the identity, and an
 /// array of JSON values embeds them (#848). The marked field writes like
-/// any string (CTAS, INSERT, UNION with a plain column). A stored V2 text
-/// column has no marker, so its cast stays a JSON string.
+/// any string (CTAS, INSERT, UNION with a plain column). The CTAS records
+/// the column in `sqe.json-columns`, so the stored column casts unchanged.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:polaris"]
 async fn cast_as_json_of_a_json_value_is_the_identity() {
@@ -425,9 +544,9 @@ async fn cast_as_json_of_a_json_value_is_the_identity() {
         (
             format!("SELECT id, p, CAST(p AS JSON) FROM {dst} ORDER BY id"),
             vec![
-                r#"1|{"n":1.5}|"{\"n\":1.5}""#,
+                r#"1|{"n":1.5}|{"n":1.5}"#,
                 "2|NULL|NULL",
-                r#"11|{"n":1.5}|"{\"n\":1.5}""#,
+                r#"11|{"n":1.5}|{"n":1.5}"#,
                 "12|NULL|NULL",
             ],
         ),
