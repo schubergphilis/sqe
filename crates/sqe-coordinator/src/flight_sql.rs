@@ -2567,12 +2567,21 @@ impl FlightSqlService for SqeFlightSqlService {
         // ingest going through a `WriteHandler` entry point for that reason.
         // Outside a transaction the ingest writes to the session's
         // WRITE_BRANCH like an INSERT does (#829).
+        //
+        // The ingest passes the same admission as an INSERT and its buffers
+        // count against `query.max_query_memory` (#788). `admission` holds
+        // the permits and the per-user reservation until the commit.
+        let admission = self
+            .query_handler
+            .admit_ingest(&session, &qualified)
+            .map_err(|e| sqe_error_to_status(&e, None))?;
         let rows = sqe_catalog::txn::write_scope(
             txn,
             session.write_branch.clone(),
             self.query_handler.write_handler().handle_ingest_streaming(
                 &session,
                 &qualified,
+                Some(admission.memory.pool()),
                 Box::pin(flight_stream),
             ),
         )
