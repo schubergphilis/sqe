@@ -1,0 +1,7 @@
+**STATUS 2026-11-10: GitHub mirror rewritten without internal host / group path in messages; `make mirror-github` (`fix/github-mirror-rewrite`).**
+
+GitHub commit search found the internal GitLab host and group path in ~1,590 commit messages (GitLab "See merge request" trailers, two merge-from-URL lines, renovate titles) and the company abbreviation in four. GitLab history is untouched; `scripts/mirror-github.sh` rewrites a scratch copy of origin's main and tags with git filter-repo (messages only), verifies no match remains and that the tip tree equals origin's, and force-pushes. Two runs produced the same tip id, so later mirror pushes are fast-forwards. On 2026-11-10 GitHub main was force-pushed (b5bd42c4 -> 1f56a8b8) with all 77 tags, including the GitHub-only `v0.22.0-cdc`, re-pointed; the 15 stale GitHub branches were deleted first. The tag push started no `release-binaries` runs (GitHub skips workflows for pushes of more than three tags).
+
+Limits: author/committer emails are unchanged by decision, including GitLab bot addresses under the internal host (262 commits). Old commits stay readable on GitHub by id until GitHub Support purges them, and seven closed-PR refs (`refs/pull/{1,2,3,5,6,9,10}/head`) still point at pre-rewrite commits. Never `git push github main` or tags directly: that pushes the unrewritten history and is not a fast-forward.
+
+**NEXT:** ask GitHub Support to remove the closed-PR refs and purge unreferenced objects; consider a GitLab merge-commit template without the group path.

@@ -13,7 +13,7 @@ Values never go in this file or in `.gitlab-ci.yml`. They live as masked, protec
 | `AIKIDO_SBOM_DEPLOY_TOKEN` (+ `AIKIDO_SBOM_PROJECT_ID`) | Group CI/CD variables, protected; token masked | SBOM publication | Deploy token on the SBOM project | Set on the token | Group maintainers |
 | `CI_JOB_TOKEN`, `CI_REGISTRY_PASSWORD` | Issued by GitLab per job | Registry pushes, API calls inside a job | That job only | End of the job | GitLab (nothing to rotate) |
 | Sigstore OIDC token (`SIGSTORE_ID_TOKEN`) | Issued by GitLab per job | aikido-sign-image (keyless cosign) | Signing identity bound to the pipeline | Minutes | GitLab / Sigstore (nothing to rotate) |
-| GitHub mirror push | Maintainer's own SSH key or `gh` login | Manual `git push github main` and tags | Push to schubergphilis/sqe | Per personal policy | The pushing maintainer |
+| GitHub mirror push | Maintainer's own SSH key or `gh` login | `make mirror-github PUSH=1` (rewrites internal host and group path out of messages; never push `main` or tags to `github` directly) | Push to schubergphilis/sqe | Per personal policy | The pushing maintainer |
 | sccache bucket keys | Not configured (removed 2026-09-07) | none | none | none | none |
 
 Project-level CI/CD variables: none. Project access tokens and deploy tokens: none (checked 2026-09-26).
