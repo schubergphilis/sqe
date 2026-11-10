@@ -1729,7 +1729,7 @@ mod hive_factory_debug_tests {
     fn store_key_is_the_bucket_for_s3_and_the_scheme_for_local_paths() {
         assert_eq!(
             EngineHiveDataStoreFactory::store_key(
-                "s3://lake/afas/snapshots/t/snapshot_date=2026-09-16/"
+                "s3://lake/billing/snapshots/t/snapshot_date=2026-09-16/"
             ),
             "s3://lake"
         );

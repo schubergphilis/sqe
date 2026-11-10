@@ -19,9 +19,9 @@ build without verification.
 | Scan parallelism | `ParallelProbeScanRule` and `ParallelScanRule` exist; Iceberg scan has fetch-ahead and decode admission | Measure throughput and byte budgets; do not treat single output as a universal current bottleneck |
 | Large joins | `JoinStrategyRule` rewrites only exact over-threshold build estimates; absent/inexact estimates keep hash joins | Bound uncertain large builds without repeating the historical coalesce regression |
 | Sort memory | `SortMemoryRule` provides fail-closed merge-headroom admission; adaptive sort and spill protections exist | Qualify concurrent sort/join/aggregate completion and fairness under constrained memory |
-| Worker transport | Worker service has finite Flight-frame budgets and scan budget wiring | Prove end-to-end decode/transport accounting under slow consumers; track [#407](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/407) |
-| Result collection | Local implementation uses actual retained Arrow byte reservations and the configured row cap | Lifetime and shared-budget tests pass; qualify concurrent workloads for [#780](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/780) |
-| Distributed execution | Worker scan/distribution paths exist | Verify which operators execute on each node and qualify 1/2/4 workers on separate hosts; track [#416](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/416) |
+| Worker transport | Worker service has finite Flight-frame budgets and scan budget wiring | Prove end-to-end decode/transport accounting under slow consumers; track #407 |
+| Result collection | Local implementation uses actual retained Arrow byte reservations and the configured row cap | Lifetime and shared-budget tests pass; qualify concurrent workloads for #780 |
+| Distributed execution | Worker scan/distribution paths exist | Verify which operators execute on each node and qualify 1/2/4 workers on separate hosts; track #416 |
 
 This inspection does not establish that every operator or shuffle path spills.
 Successful plan admission is not proof of bounded process RSS or completion under
@@ -115,21 +115,21 @@ readiness. No universal SF100 speedup or linear-scaling target is implied here.
 
 ## Tracking
 
-Existing work: [#416](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/416) (separate-host qualification), [#407](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/407) (worker backpressure),
-[#380](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/380) (memory governor), [#382](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/382) (spill-store safety), [#755](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/755) (cardinality admission),
-and [#780](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/780) (buffered result byte accounting). New experiment issues:
+Existing work: #416 (separate-host qualification), #407 (worker backpressure),
+#380 (memory governor), #382 (spill-store safety), #755 (cardinality admission),
+and #780 (buffered result byte accounting). New experiment issues:
 
-- [#783 — [PERF][SF100] Stream SSB, TPC-DS and TPCBB fact generation](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/783)
+- #783 — [PERF][SF100] Stream SSB, TPC-DS and TPCBB fact generation
 
-- [#784 — [PERF][SF100] Bound large hash builds when statistics are inexact or absent](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/784)
+- #784 — [PERF][SF100] Bound large hash builds when statistics are inexact or absent
 
-- [#785 — [PERF][SF100] Prototype semantics-preserving pre-aggregation for TPCBB q01](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/785)
+- #785 — [PERF][SF100] Prototype semantics-preserving pre-aggregation for TPCBB q01
 
-- [#786 — [PERF][SF100] Qualify scan fetch-ahead and output parallelism under byte budgets](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/786)
+- #786 — [PERF][SF100] Qualify scan fetch-ahead and output parallelism under byte budgets
 
-- [#787 — [PERF][SF100] Verify TopK pushdown and clustered layouts for ClickBench q23-q26](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/787)
+- #787 — [PERF][SF100] Verify TopK pushdown and clustered layouts for ClickBench q23-q26
 
-- [#788 — [PERF][SF100] Qualify concurrent sort, join and aggregate spill with bounded memory](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/788)
+- #788 — [PERF][SF100] Qualify concurrent sort, join and aggregate spill with bounded memory
 
 ## Local implementation follow-up (2026-09-30)
 

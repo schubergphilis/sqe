@@ -48,8 +48,8 @@ version = "0.53.1"
 edition = "2021"
 rust-version = "1.99"
 license = "Apache-2.0"
-repository = "https://gitlab.schubergphilis.com/data-ai/chameleon/sqlengine"
-homepage = "https://gitlab.schubergphilis.com/data-ai/chameleon/sqlengine"
+repository = "https://github.com/schubergphilis/sqe"
+homepage = "https://getsqe.com"
 authors = ["Schuberg Philis"]
 
 # Inherited by crates that declare `[lints] workspace = true`. Issue #643: a

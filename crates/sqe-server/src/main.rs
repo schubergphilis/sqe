@@ -93,8 +93,12 @@ struct Cli {
 
     /// Restrict `--glue-catalog` to these databases. Repeatable, and each
     /// value may be a comma-separated list. Empty (the default) exposes every
-    /// database in the catalog. For example: `--glue-database claude,afas`.
-    #[arg(long = "glue-database", requires = "glue_catalog", value_delimiter = ',')]
+    /// database in the catalog. For example: `--glue-database claude,billing`.
+    #[arg(
+        long = "glue-database",
+        requires = "glue_catalog",
+        value_delimiter = ','
+    )]
     glue_database: Vec<String>,
 
     /// Allow reads from every object-store bucket with the engine's storage

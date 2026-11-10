@@ -11,7 +11,7 @@ inconsistency** a single read-through would miss, plus per-chapter voice quality
 ## Read these first
 1. Your assigned chapter (path given in your task).
 2. The voice guide: `docs/ebook/voice.md` (absolute:
-   `/Users/jjverhoeks/git/schuberg/vpf-data-ai/chameleon/Applications/sqlengine/docs/ebook/voice.md`)
+   `$SQE_REPO/docs/ebook/voice.md`)
 
 ## Then write a findings file
 Write to the exact path given in your task (e.g. `docs/ebook/review/findings-03-the-engine-you-already-have.md`).

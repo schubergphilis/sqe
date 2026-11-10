@@ -9,8 +9,8 @@
 **Tech Stack:** git, mdBook, Pandoc (ebook), Python+matplotlib (benchmark charts), bash (getsqe sync + leak-scan), Astro (getsqe website).
 
 **Repos:**
-- SQE source: `/Users/jjverhoeks/git/schuberg/vpf-data-ai/chameleon/Applications/sqlengine` (branch `docs/three-zone-restructure`, already created)
-- getsqe: `/Users/jjverhoeks/git/getsqe` (sub-repos `website/`, `docs-website/`)
+- SQE source: `$SQE_REPO` (branch `docs/three-zone-restructure`, already created)
+- getsqe: `$GETSQE_REPO` (sub-repos `website/`, `docs-website/`)
 
 **Spec:** `docs/superpowers/specs/2026-06-20-docs-coherence-three-zone-design.md`
 
@@ -33,7 +33,7 @@
 
 Run:
 ```bash
-cd /Users/jjverhoeks/git/schuberg/vpf-data-ai/chameleon/Applications/sqlengine
+cd $SQE_REPO
 git branch --show-current   # expect: docs/three-zone-restructure
 git status --short          # in-flight redaction edits may be present; that is expected
 ```
@@ -74,7 +74,7 @@ Expected: the 35 loose files (33 `.md` + `iceberg-matrix-state.json` + `performa
 
 Run:
 ```bash
-cd /Users/jjverhoeks/git/schuberg/vpf-data-ai/chameleon/Applications/sqlengine
+cd $SQE_REPO
 mkdir -p docs/site/compare docs/internal/process docs/internal/audit docs/internal/design-archive docs/evidence
 ```
 Expected: directories created (empty dirs are not tracked by git yet; content moves populate them).
@@ -94,7 +94,7 @@ Expected: directories created (empty dirs are not tracked by git yet; content mo
 
 Run:
 ```bash
-cd /Users/jjverhoeks/git/schuberg/vpf-data-ai/chameleon/Applications/sqlengine
+cd $SQE_REPO
 git mv docs/book docs/site/book
 git mv docs/ebook docs/site/ebook
 git mv docs/blog docs/site/blog
@@ -270,7 +270,7 @@ the technical companions, kept close to current state.
 
 Run:
 ```bash
-cd /Users/jjverhoeks/git/schuberg/vpf-data-ai/chameleon/Applications/sqlengine
+cd $SQE_REPO
 for f in datafusion-architecture ballista-evaluation-learnings dbt-sqe \
          fine-grained-policy s3vending polaris-principal-provisioning \
          row-level-writes quack-protocol trino-client-compatibility \
@@ -350,7 +350,7 @@ git commit -m "docs(restructure): publish design history as book Design Notes se
 
 Run:
 ```bash
-cd /Users/jjverhoeks/git/schuberg/vpf-data-ai/chameleon/Applications/sqlengine
+cd $SQE_REPO
 git mv docs/superpowers/specs docs/internal/specs
 git mv docs/superpowers/plans docs/internal/plans
 git mv docs/specs/performance-roadmap.md docs/internal/plans/performance-roadmap.md
@@ -415,7 +415,7 @@ git commit -m "docs(restructure): sweep working history into docs/internal/"
 
 Run:
 ```bash
-cd /Users/jjverhoeks/git/schuberg/vpf-data-ai/chameleon/Applications/sqlengine
+cd $SQE_REPO
 git mv docs/benchmark docs/evidence/benchmark
 git mv docs/perf docs/evidence/perf
 git mv docs/iceberg-matrix-state.json docs/evidence/iceberg-matrix-state.json
@@ -520,14 +520,14 @@ Per the spec's split invariant, this scanner enforces only secrets/PII at source
 must NOT match cosmetic patterns (MR/branch refs, regions, `amazonaws`, crate paths) —
 those stay in source and are rewritten presentation-only by the getsqe sync.
 Create `scripts/leak-scan-site.sh` covering only: 12-digit account IDs, personal IAM
-names (`jacobadmin`/`jacobbuilder`), internal GitLab host, and monorepo path.
+names, internal GitLab host, and monorepo path.
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="${1:-docs/site}"
 # SECURITY-ONLY. Cosmetic patterns (MR !/feat/chore/region/amazonaws/crate paths) are
 # intentionally NOT here — they are kept in source and rewritten by the getsqe sync.
-PATTERN='([0-9]{12})|sbp\.gitlab\.schubergphilis\.com|vpf-data-ai/chameleon|jacobadmin|jacobbuilder'
+PATTERN='([0-9]{12})|<internal host, monorepo path and IAM-name rules; see scripts/leak-scan-site.sh>'
 if grep -rnaIE "$PATTERN" "$ROOT" \
      --include='*.md' --include='*.toml' --include='*.json' --include='*.svg' \
    | grep -vE '123456789012|000000000000'; then
@@ -582,8 +582,8 @@ These tasks run in the getsqe repo. They only take effect when run/merged there;
 ### Task 11: Re-point website/scripts/sync-from-sqe.sh and retire its sanitizer
 
 **Files:**
-- Modify: `/Users/jjverhoeks/git/getsqe/website/scripts/sync-from-sqe.sh`
-- Modify: `/Users/jjverhoeks/git/getsqe/CLAUDE.md`
+- Modify: `$GETSQE_REPO/website/scripts/sync-from-sqe.sh`
+- Modify: `$GETSQE_REPO/CLAUDE.md`
 
 - [ ] **Step 1: Re-point every source path**
 
@@ -605,7 +605,7 @@ Edit `website/scripts/sync-from-sqe.sh`:
 
 `docs/site` is now secret-clean at source, so delete the *security* sed rules from the
 sanitizer block: the 12-digit account-id rule, the 13+-digit snapshot guard, the
-`sbp.gitlab…`/monorepo-path rules, and the `jacobadmin`/`jacobbuilder` rules. KEEP the
+internal-host/monorepo-path rules, and the personal IAM-name rules. KEEP the
 cosmetic rewrites that carry traceability or normalization: `MR !` -> "an earlier
 change", `feat/`/`chore/` -> branch phrasing, `eu-central`/`eu-west` -> `eu-example-*`,
 `amazonaws` -> `aws-endpoint`/`aws`, `crates/sqe-*` -> bare crate name. Keep the final
@@ -615,7 +615,7 @@ leak-scan gate as a guard so the build still fails if a secret ever reappears.
 
 Run:
 ```bash
-cd /Users/jjverhoeks/git/getsqe
+cd $GETSQE_REPO
 grep -nE 'docs/(book|ebook|blog|trino|duckdb|features|benchmark|performance|iceberg)' CLAUDE.md
 ```
 Edit each hit to the new `docs/site/...` or `docs/evidence/...` path.
@@ -624,8 +624,8 @@ Edit each hit to the new `docs/site/...` or `docs/evidence/...` path.
 
 Run:
 ```bash
-cd /Users/jjverhoeks/git/getsqe/website
-SQE_DIR=/Users/jjverhoeks/git/schuberg/vpf-data-ai/chameleon/Applications/sqlengine npm run sync
+cd $GETSQE_REPO/website
+SQE_DIR=$SQE_REPO npm run sync
 npm run build
 ```
 Expected: every copy resolves (no "warn: not found"); leak-scan passes; Astro build succeeds.
@@ -633,7 +633,7 @@ Expected: every copy resolves (no "warn: not found"); leak-scan passes; Astro bu
 - [ ] **Step 5: Commit (in website sub-repo)**
 
 ```bash
-cd /Users/jjverhoeks/git/getsqe/website
+cd $GETSQE_REPO/website
 git add -A
 git commit -m "sync: re-point to docs/site + docs/evidence, retire sanitizer (source is clean)"
 ```
@@ -641,7 +641,7 @@ git commit -m "sync: re-point to docs/site + docs/evidence, retire sanitizer (so
 ### Task 12: Re-point docs-website/scripts/sync-from-sqe.sh
 
 **Files:**
-- Modify: `/Users/jjverhoeks/git/getsqe/docs-website/scripts/sync-from-sqe.sh`
+- Modify: `$GETSQE_REPO/docs-website/scripts/sync-from-sqe.sh`
 
 - [ ] **Step 1: Re-point the book source path**
 
@@ -651,8 +651,8 @@ Leave the quickstart OVERVIEW overlay (line 42, reads `$SQE_DIR/quickstart/*/OVE
 - [ ] **Step 2: Retire only the SECURITY rules; keep cosmetics and the book.toml de-brand**
 
 From the `sed -E -i ''` block (lines 80-98), delete the *security* rules only: the
-12-digit account-id rule (85), the 13+-digit snapshot guard (84), the `sbp.gitlab…`
-host + URL rules (93-94), the monorepo-path rule (95), and `jacobadmin`/`jacobbuilder`
+12-digit account-id rule (85), the 13+-digit snapshot guard (84), the internal
+host + URL rules (93-94), the monorepo-path rule (95), and the personal IAM names
 (96-97). KEEP the cosmetic rules: crate-path strip with the `@@KEEP@@` sentinel (81-83),
 region rewrites (86-87), `amazonaws` (88-89), `MR !` (90), `feat/`/`chore/` (91-92).
 KEEP the `book.toml` de-brand `sed` (lines 52-56) — repo URL/authors/build-dir, not
@@ -662,8 +662,8 @@ secrets. Keep the leak-scan gate (lines 101-105) as a guard.
 
 Run:
 ```bash
-cd /Users/jjverhoeks/git/getsqe/docs-website
-SQE_DIR=/Users/jjverhoeks/git/schuberg/vpf-data-ai/chameleon/Applications/sqlengine bash scripts/sync-from-sqe.sh
+cd $GETSQE_REPO/docs-website
+SQE_DIR=$SQE_REPO bash scripts/sync-from-sqe.sh
 mdbook build
 ```
 Expected: `sync OK`; mdBook builds.
@@ -671,7 +671,7 @@ Expected: `sync OK`; mdBook builds.
 - [ ] **Step 4: Commit (in docs-website sub-repo)**
 
 ```bash
-cd /Users/jjverhoeks/git/getsqe/docs-website
+cd $GETSQE_REPO/docs-website
 git add -A
 git commit -m "sync: re-point book source to docs/site/book, retire sanitizer"
 ```
@@ -686,7 +686,7 @@ git commit -m "sync: re-point book source to docs/site/book, retire sanitizer"
 
 Run:
 ```bash
-cd /Users/jjverhoeks/git/schuberg/vpf-data-ai/chameleon/Applications/sqlengine
+cd $SQE_REPO
 test -z "$(find docs -maxdepth 1 -type f)" && echo "docs/ top is clean"
 make rustbook && make leak-scan
 ```
@@ -696,8 +696,8 @@ Expected: "docs/ top is clean", book builds, `docs/site` clean.
 
 Run:
 ```bash
-cd /Users/jjverhoeks/git/getsqe/website && SQE_DIR=/Users/jjverhoeks/git/schuberg/vpf-data-ai/chameleon/Applications/sqlengine npm run sync && npm run build
-cd /Users/jjverhoeks/git/getsqe/docs-website && SQE_DIR=/Users/jjverhoeks/git/schuberg/vpf-data-ai/chameleon/Applications/sqlengine bash scripts/sync-from-sqe.sh && mdbook build
+cd $GETSQE_REPO/website && SQE_DIR=$SQE_REPO npm run sync && npm run build
+cd $GETSQE_REPO/docs-website && SQE_DIR=$SQE_REPO bash scripts/sync-from-sqe.sh && mdbook build
 ```
 Expected: both succeed, no missing-file warnings, leak-scans pass.
 
@@ -705,7 +705,7 @@ Expected: both succeed, no missing-file warnings, leak-scans pass.
 
 Run:
 ```bash
-cd /Users/jjverhoeks/git/schuberg/vpf-data-ai/chameleon/Applications/sqlengine
+cd $SQE_REPO
 git push -u origin docs/three-zone-restructure
 ```
 Then open a PR (the getsqe sub-repo changes go as their own PRs in their respective repos).

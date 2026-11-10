@@ -6,7 +6,9 @@ ROOT="${1:-docs/site}"
 # 12-digit branch is boundary-anchored so a 12-digit *substring* of a longer
 # run (IEEE-754 fractions, 19-digit Iceberg snapshot ids) is NOT flagged --
 # only a standalone 12-digit token (a genuine AWS account id) trips it.
-PATTERN='(^|[^0-9])[0-9]{12}([^0-9]|$)|sbp\.gitlab\.schubergphilis\.com|vpf-data-ai/chameleon|jacobadmin|jacobbuilder'
+# Host and path rules are generic ([.] keeps the literal hosts out of this
+# file); scripts/leak-scan-repo.sh (`make leaks`) covers the whole tree.
+PATTERN='(^|[^0-9])[0-9]{12}([^0-9]|$)|[a-z0-9-]+[.]gitlab[.][a-z0-9-]+[.][a-z]{2,}|vpf-data-[a]i|jacob(admin|builder)|/Users/[A-Za-z0-9._-]+/'
 if grep -rnaIE "$PATTERN" "$ROOT" \
      --include='*.md' --include='*.toml' --include='*.json' --include='*.svg' \
    | grep -vE '123456789012|000000000000'; then

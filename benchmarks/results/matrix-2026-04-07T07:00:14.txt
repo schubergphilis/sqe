@@ -17,7 +17,7 @@
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   Matrix complete. Results in benchmarks/results/
   Metrics deltas in benchmarks/metrics/
-  Summary:  /Users/jjverhoeks/git/schuberg/vpf-data-ai/chameleon/Applications/sqlengine/benchmarks/results/matrix-2026-04-07T07:00:14.txt
+  Summary:  benchmarks/results/matrix-2026-04-07T07:00:14.txt
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Total time per config:

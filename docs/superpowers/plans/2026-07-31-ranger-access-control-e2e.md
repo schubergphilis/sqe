@@ -43,7 +43,7 @@
 - [ ] **Step 1: Confirm the two copies are identical before touching them**
 
 ```bash
-cd /Users/jjverhoeks/git/schuberg/vpf-data-ai/chameleon/Applications/sqlengine
+cd "$SQE_REPO"
 awk '/^fn build_grant_backend/,/^}/' crates/sqe-coordinator/src/main.rs > /tmp/gb-main.txt
 awk '/^fn build_grant_backend/,/^}/' crates/sqe-coordinator/src/bin/sqe_server.rs > /tmp/gb-server.txt
 diff /tmp/gb-main.txt /tmp/gb-server.txt && echo IDENTICAL

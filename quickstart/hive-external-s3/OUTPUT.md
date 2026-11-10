@@ -171,7 +171,7 @@ No Polaris, no Nessie, no Hive Metastore. `s3://lake/wh/demo/events_parquet/_sqe
   "table_type": "EXTERNAL_TABLE",
   "database_name": "demo",
   "name": "events_parquet",
-  "owner": "jjverhoeks",
+  "owner": "demo-user",
   "created_at": "2026-08-27T13:37:30.461839+00:00",
   "description": null,
   "partition_keys": [

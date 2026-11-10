@@ -1,6 +1,6 @@
 # Quickstarts Scenario Harness + Docs Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development. Implement on branch `docs/quickstart-scenario-harness` in worktree `/Users/jjverhoeks/sqe-c-wt` (NOT the primary checkout). Steps use checkbox (`- [ ]`) tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development. Implement on branch `docs/quickstart-scenario-harness` in worktree `~/sqe-c-wt` (NOT the primary checkout). Steps use checkbox (`- [ ]`) tracking.
 
 **Goal:** Make every quickstart both an asserted test scenario and a good documented starting point, unified under a two-tier harness with one entry point, wired into CI.
 
@@ -10,7 +10,7 @@
 
 **Spec:** `docs/internal/specs/2026-06-21-quickstarts-scenario-harness-design.md`
 
-**Worktree note:** All work in `/Users/jjverhoeks/sqe-c-wt`. Confirm `git branch --show-current` = `docs/quickstart-scenario-harness` at the start of every task.
+**Worktree note:** All work in `~/sqe-c-wt`. Confirm `git branch --show-current` = `docs/quickstart-scenario-harness` at the start of every task.
 
 ---
 

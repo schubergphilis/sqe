@@ -113,7 +113,7 @@ BENCH_STORAGE  ?= local
         clippy lint fmt fmt-check pre-commit pre-commit-all clean clean-rust clean-rustbook \
         clean-ebook clean-benchmark-charts clean-images check-tools maintain \
         build build-sqe sbom sbom-sqe sqe-config images \
-        login buildx-builder push push-sqe leak-scan
+        login buildx-builder push push-sqe leak-scan leaks
 
 # ── Default target ────────────────────────────────────────────────────────
 help:
@@ -197,6 +197,7 @@ help:
 	@echo "  Diagnostics:"
 	@echo "    make check-tools  Verify cargo / mdbook / pandoc / d2 / mmdc are present"
 	@echo "    make leak-scan    Scan docs/site for account ids, internal hosts and user names (gitleaks covers secrets)"
+	@echo "    make leaks        Scan the whole tree: internal hosts/paths/names, home paths, AWS accounts, credentials"
 
 # `all` is the full gate: supply chain, unit tests, the deployable image, then
 # the benchmark sweep. `all_trino` is the same with SQE-vs-Trino comparison on.
@@ -633,3 +634,10 @@ check-tools:
 leak-scan:
 	@echo "==> Scanning docs/site for leaks"
 	@bash scripts/leak-scan-site.sh docs/site
+
+# Whole tree, tracked + untracked (not ignored): the repo is mirrored to a
+# public GitHub repository, docs/internal included. Private extra patterns go
+# in the gitignored .leak-scan-extra (one ERE per line) or $LEAK_SCAN_EXTRA.
+leaks: leak-scan
+	@echo "==> Scanning the repository for internal identifiers and credentials"
+	@bash scripts/leak-scan-repo.sh

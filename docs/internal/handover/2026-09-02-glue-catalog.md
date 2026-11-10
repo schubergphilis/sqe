@@ -2,7 +2,7 @@
 
 Branch `feat/glue-sidecar-bridge`, merge request !908, 10 commits ahead of
 `main` and clean. Everything below was verified against the live catalog in
-account 088044431914, eu-central-1.
+account 123456789012, eu-central-1.
 
 ## What you can do now
 
@@ -23,7 +23,7 @@ heavyweight dependency the slim build exists to avoid.
 `[[hive.roots]] kind = "glue"` is the config equivalent.
 
 Measured working: `SHOW TABLES FROM glue.claude` lists 6 tables,
-`claude.user_usage` returns 72,946 rows, gzipped JSON (`afas_raw.absence`)
+`claude.user_usage` returns 72,946 rows, gzipped JSON (`billing_raw.events`)
 returns 5,370, a nested `struct` column (`claude_raw.user_usage`) reads
 `actor.email` as real values, and a projected table resolves a `NOW` range
 across date x hour axes.

@@ -81,7 +81,7 @@ Two surprises killed this option. First, our `vendor/iceberg-rust/crates/iceberg
 
 Second, `iceberg-datafusion`'s LIMIT and pushdown improvements don't help SQE because SQE bypasses `iceberg-datafusion::IcebergTableProvider` entirely. We have our own `SqeTableProvider` and `IcebergScanExec` so we can keep per-user vended S3 credentials. The 0.9.x story for `iceberg-datafusion` is for people who use it directly. We don't.
 
-A full vendor swap to 0.9.1 would mean re-porting 18 SBP patches (REST auth hardening, SigV4 for S3 Tables, runtime filter pushdown via DF 53's `filter_pushdown` API, dynamic-predicate sampling on the reader, plus cherry-picks from open upstream PRs we depend on). Days of work. For roughly no q72 gain.
+A full vendor swap to 0.9.1 would mean re-porting 18 local patches (REST auth hardening, SigV4 for S3 Tables, runtime filter pushdown via DF 53's `filter_pushdown` API, dynamic-predicate sampling on the reader, plus cherry-picks from open upstream PRs we depend on). Days of work. For roughly no q72 gain.
 
 ### Wrong answer 4: the RisingWave fork
 

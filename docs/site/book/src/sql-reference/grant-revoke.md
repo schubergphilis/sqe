@@ -1,6 +1,6 @@
 # GRANT and REVOKE
 
-> **Chameleon / SBP-specific.** The access-control SQL surface on this page
+> **Platform-specific.** The access-control SQL surface on this page
 > (column masks, row filters, effective-grant inspection, `CHECK ACCESS`) is an
 > SQE security extension built for the Chameleon platform. It is not part of
 > the core open-source Iceberg SQL surface, and the grant backend is pluggable:
