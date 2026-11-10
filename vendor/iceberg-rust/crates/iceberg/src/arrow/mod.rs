@@ -36,6 +36,8 @@ pub(crate) mod record_batch_transformer;
 pub(crate) use record_batch_transformer::build_partition_constant;
 mod scan_metrics;
 mod value;
+/// SQE PATCH (sqe#870): narrow a shredded variant's projection.
+pub mod variant_projection;
 
 pub use reader::*;
 pub use scan_metrics::{ScanMetrics, ScanResult};

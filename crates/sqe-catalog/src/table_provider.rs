@@ -354,6 +354,14 @@ impl SqeTableProvider {
         if let Some(sid) = self.snapshot_id {
             exec = exec.with_snapshot_id(sid);
         }
+        // The shredded variant fields the plan reads (sqe#870), found by
+        // `EngineQueryPlanner`. Resolved after the snapshot is set.
+        if let Some(hints) = state
+            .config()
+            .get_extension::<crate::variant_read::VariantReadHints>()
+        {
+            exec = exec.with_variant_fields(&hints);
+        }
         if let Some(reloader) = &self.reloader {
             exec = exec.with_table_reloader(reloader.clone());
         }

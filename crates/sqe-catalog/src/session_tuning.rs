@@ -17,6 +17,7 @@ use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::eliminate_cross_join::EliminateCrossJoin;
+use crate::variant_read::VariantReadHints;
 
 mod decimal_arithmetic;
 mod decimal_rounding;
@@ -104,21 +105,31 @@ impl QueryPlanner for EngineQueryPlanner {
         session: &dyn Session,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let planner = DefaultPhysicalPlanner::default();
-        let state = match session.as_any().downcast_ref::<SessionState>() {
-            Some(state)
-                if state.config_options().optimizer.enable_aggregate_dynamic_filter_pushdown
-                    && has_recursive_query(plan) =>
-            {
-                state
-            }
-            _ => return planner.create_physical_plan(plan, session).await,
+        let Some(state) = session.as_any().downcast_ref::<SessionState>() else {
+            return planner.create_physical_plan(plan, session).await;
         };
-        let mut state = state.clone();
-        state
-            .config_mut()
-            .options_mut()
+        let no_aggregate_filters = state
+            .config_options()
             .optimizer
-            .enable_aggregate_dynamic_filter_pushdown = false;
+            .enable_aggregate_dynamic_filter_pushdown
+            && has_recursive_query(plan);
+        // The table scans read only the shredded variant fields the plan
+        // reads (sqe#870); they find the hints in the session config.
+        let variant_hints = VariantReadHints::of(plan);
+        if !no_aggregate_filters && variant_hints.is_empty() {
+            return planner.create_physical_plan(plan, session).await;
+        }
+        let mut state = state.clone();
+        if no_aggregate_filters {
+            state
+                .config_mut()
+                .options_mut()
+                .optimizer
+                .enable_aggregate_dynamic_filter_pushdown = false;
+        }
+        if !variant_hints.is_empty() {
+            state.config_mut().set_extension(Arc::new(variant_hints));
+        }
         planner.create_physical_plan(plan, &state).await
     }
 }

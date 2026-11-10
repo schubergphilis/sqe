@@ -103,3 +103,4 @@ mod scoped_table;
 #[cfg(test)]
 pub(crate) mod test_fixtures;
 pub mod variant_prune;
+pub mod variant_read;

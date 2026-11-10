@@ -35,7 +35,11 @@ pub const SCAN_TASK_VERSION_V6: u32 = 6;
 /// groups a worker drops when their bounding box misses an `ST_*` predicate.
 /// Bumped only when present.
 pub const SCAN_TASK_VERSION_V7: u32 = 7;
-pub const SCAN_TASK_VERSION_CURRENT: u32 = SCAN_TASK_VERSION_V7;
+/// `8` = optional shredded variant fields (sqe#870): the object fields of
+/// each shredded variant column the query reads, so a worker reads those
+/// instead of the whole column. Bumped only when present.
+pub const SCAN_TASK_VERSION_V8: u32 = 8;
+pub const SCAN_TASK_VERSION_CURRENT: u32 = SCAN_TASK_VERSION_V8;
 
 /// Default target compressed size for a morsel (128 MiB).
 pub const DEFAULT_MORSEL_TARGET_BYTES: u64 = 128 * 1024 * 1024;

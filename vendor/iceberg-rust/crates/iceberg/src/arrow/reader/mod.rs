@@ -112,6 +112,8 @@ pub(crate) struct SqeReadOptions {
     /// SQE PATCH (static row filter): evaluate the scan's own predicate as
     /// a per-row parquet `RowFilter`.
     pub(crate) static_row_filter: bool,
+    /// SQE PATCH (sqe#870): the shredded variant fields the query reads.
+    pub(crate) variant_fields: Option<Arc<crate::arrow::variant_projection::VariantFieldHints>>,
 }
 
 impl Default for SqeReadOptions {
@@ -127,6 +129,7 @@ impl Default for SqeReadOptions {
             row_group_pruner: None,
             string_view: false,
             static_row_filter: true,
+            variant_fields: None,
         }
     }
 }
@@ -260,6 +263,18 @@ impl ArrowReaderBuilder {
     /// rely on it for correctness.
     pub fn with_static_row_filter(mut self, enabled: bool) -> Self {
         self.sqe.static_row_filter = enabled;
+        self
+    }
+
+    /// SQE PATCH (sqe#870): read only these object fields of each shredded
+    /// variant column, keyed by its field id (see
+    /// [`crate::arrow::variant_projection::narrow_variant_projection`]). A
+    /// column whose file does not shred every hinted field is read whole.
+    pub fn with_variant_fields(
+        mut self,
+        fields: Option<Arc<crate::arrow::variant_projection::VariantFieldHints>>,
+    ) -> Self {
+        self.sqe.variant_fields = fields;
         self
     }
 
