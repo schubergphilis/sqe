@@ -32,9 +32,10 @@ pub(crate) struct Admission {
     pub permits: Vec<tokio::sync::OwnedSemaphorePermit>,
     /// The per-user memory reservation, when the budget is on.
     pub memory_reservation: Option<crate::memory::PerUserReservation>,
-    /// The cap the statement executes under: `max_query_memory`, or the
-    /// smaller pressure-admission cap when the pool was red.
-    pub quota: crate::query_memory::QueryQuota,
+    /// The cap the statement executes under (`max_query_memory`, or the
+    /// smaller pressure-admission cap when the pool was red) and the one
+    /// pool every context the statement builds reserves from (#788).
+    pub memory: crate::query_memory::StatementMemory,
 }
 
 impl QueryHandler {
@@ -169,8 +170,24 @@ impl QueryHandler {
         Ok(Admission {
             permits,
             memory_reservation,
-            quota,
+            memory: crate::query_memory::StatementMemory::new(
+                Arc::clone(&self.runtime.memory_pool),
+                quota,
+                self.unspillable_headroom_percent,
+            ),
         })
+    }
+
+    /// Admission for a Flight `DoPut` ingest into `table`, which never passes
+    /// through `execute`: the gates a write statement passes (refused on a
+    /// red pool, concurrency permits, per-user reservation). Its fan-out
+    /// buffers reserve from `admission.memory.pool()` (#788). Hold the
+    /// `Admission` until the ingest commits.
+    pub(crate) fn admit_ingest(&self, session: &Session, table: &str) -> sqe_core::Result<Admission> {
+        let sql = format!("INSERT INTO {table}");
+        let admission = self.admit(session, &sql, "ingest")?;
+        self.refuse_under_pressure(&admission, false, &sql)?;
+        Ok(admission)
     }
 
     /// Refuse a classified statement that is not a read when it was admitted
@@ -182,7 +199,7 @@ impl QueryHandler {
         is_read: bool,
         sql: &str,
     ) -> sqe_core::Result<()> {
-        if !admission.quota.under_pressure || is_read {
+        if !admission.memory.quota().under_pressure || is_read {
             return Ok(());
         }
         // Red as of admission: the statement was admitted only as a possible

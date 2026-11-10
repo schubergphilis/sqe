@@ -1607,7 +1607,7 @@ impl QueryHandler {
         // reservation): one sequence shared with the streaming path, see
         // `query_handler::admission`. Held for the whole buffered call.
         let admission = self.admit(session, sql, "query")?;
-        let quota = admission.quota;
+        let memory = &admission.memory;
 
         let start = std::time::Instant::now();
         // Pre-parse pipeline (strip FOR INCREMENTAL / FOR VERSION AS OF,
@@ -1967,7 +1967,7 @@ impl QueryHandler {
                         session,
                         sql,
                         &query_id,
-                        quota,
+                        memory,
                         &plan_metrics,
                         &mut captured_plan,
                         &mut policy_summary,
@@ -1995,7 +1995,7 @@ impl QueryHandler {
                         if *analyze {
                             // It runs the query: same quota, sort share and
                             // join fallback as the query itself (#788).
-                            let (ctx, fallback) = self.explain_execution(ctx, &query_id, quota);
+                            let (ctx, fallback) = self.explain_execution(ctx, &query_id, memory);
                             self.explain_handler
                                 .analyze(session, &inner, &ctx, fallback)
                                 .await
@@ -2584,7 +2584,7 @@ impl QueryHandler {
                             // Without this a Hive CTAS from read_parquet
                             // failed with "the table function was not
                             // prepared before planning".
-                            let (load_ctx, _) = self.create_session_context(session).await?;
+                            let (load_ctx, _) = self.write_session_context(session, memory).await?;
                             let written = crate::hive_write::handle_insert(
                                 &load_ctx,
                                 &load_stmt,
@@ -2622,7 +2622,7 @@ impl QueryHandler {
                             // The post-commit cache invalidation moved with it
                             // (`WriteHandler::after_commit`, 507).
                             let select_sql = sqe_sql::rewrite_named_tvf_args(&format!("{query}"));
-                            let (ctx, _) = self.create_session_context(session).await?;
+                            let (ctx, _) = self.write_session_context(session, memory).await?;
                             self.write_handler
                                 .handle_ctas_streaming(
                                     session,
@@ -2669,7 +2669,7 @@ impl QueryHandler {
                                 self.hive_ddl_handler
                                     .refuse_write_if_denied(session, &hive_ref, "INSERT")
                                     .await?;
-                                let (ctx, _) = self.create_session_context(session).await?;
+                                let (ctx, _) = self.write_session_context(session, memory).await?;
                                 let written = crate::hive_write::handle_insert(
                                     &ctx,
                                     stmt,
@@ -2720,7 +2720,7 @@ impl QueryHandler {
                             .ok_or_else(|| {
                                 SqeError::with_code(SqeErrorCode::ExecutionFailed, "INSERT without SELECT source")
                             })?;
-                        let (ctx, _) = self.create_session_context(session).await?;
+                        let (ctx, _) = self.write_session_context(session, memory).await?;
                         self.write_handler
                             .handle_insert_streaming(
                                 session,
@@ -2738,7 +2738,7 @@ impl QueryHandler {
 
                 StatementKind::ExplainFull(inner) => {
                     let (ctx, _) = self.create_session_context(session).await?;
-                    let (ctx, fallback) = self.explain_execution(ctx, &query_id, quota);
+                    let (ctx, fallback) = self.explain_execution(ctx, &query_id, memory);
                     self.explain_handler
                         .full(session, inner, &ctx, fallback)
                         .await
@@ -2748,7 +2748,7 @@ impl QueryHandler {
                     if let Ok(name) = crate::write_handler::delete_target_object_name(stmt) {
                         self.reject_if_hive_table(session, &table_reference_of(name), "DELETE", 0)?;
                     }
-                    let (ctx, session_catalog) = self.create_session_context(session).await?;
+                    let (ctx, session_catalog) = self.write_session_context(session, memory).await?;
                     // Dispatch on `write.delete.mode` table property. Default CoW
                     // matches prior behaviour; `merge-on-read` routes to position
                     // or equality deletes depending on declared primary key.
@@ -2768,7 +2768,7 @@ impl QueryHandler {
                     if let Ok(name) = crate::write_handler::update_target_object_name(stmt) {
                         self.reject_if_hive_table(session, &table_reference_of(name), "UPDATE", 0)?;
                     }
-                    let (ctx, session_catalog) = self.create_session_context(session).await?;
+                    let (ctx, session_catalog) = self.write_session_context(session, memory).await?;
                     // Dispatch on `write.update.mode` table property. Default CoW
                     // matches prior behaviour; `merge-on-read` routes to the
                     // equality-delete path when the table has a declared PK.
@@ -2899,7 +2899,7 @@ impl QueryHandler {
                     let delete_sql = format!("DELETE FROM {table_name}");
                     let delete_kind = sqe_sql::parse_and_classify(&delete_sql)?;
                     if let StatementKind::Delete(delete_stmt) = delete_kind {
-                        let (ctx, session_catalog) = self.create_session_context(session).await?;
+                        let (ctx, session_catalog) = self.write_session_context(session, memory).await?;
                         // Route through dispatch so OL lineage capture covers
                         // TRUNCATE the same way it covers a normal DELETE.
                         self.write_handler
@@ -3113,7 +3113,6 @@ impl QueryHandler {
                     } else {
                         return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, "Expected MERGE statement"));
                     };
-                    let (ctx, session_catalog) = self.create_session_context(session).await?;
                     // Capture the MERGE source plan from `execute_query`. The
                     // lineage for a MERGE event should describe the source's
                     // TableScans as inputs and the target as the output, so
@@ -3127,12 +3126,16 @@ impl QueryHandler {
                             session,
                             &source_sql,
                             &query_id,
-                            quota,
+                            memory,
                             &plan_metrics,
                             &mut merge_source_plan,
                             &mut policy_summary,
                         )
                         .await?;
+                    // The collected source keeps its reservation in the
+                    // statement's pool, and the target rewrite reserves from
+                    // the same pool: one MERGE, one quota (#788).
+                    let (ctx, session_catalog) = self.write_session_context(session, memory).await?;
                     let merge_source_logical = match merge_source_plan {
                         Some(sqe_lineage::PlanOrHint::Plan(p)) => Some(*p),
                         _ => None,
@@ -3839,7 +3842,7 @@ impl QueryHandler {
         let Admission {
             permits,
             memory_reservation: per_user_mem_reservation,
-            quota,
+            memory,
         } = self.admit(session, sql, "streaming query")?;
 
         // --- Classify ---------------------------------------------------------
@@ -3925,7 +3928,7 @@ impl QueryHandler {
         }
 
         match self
-            .open_stream(session, sql, prebuilt, &query_id, quota, start)
+            .open_stream(session, sql, prebuilt, &query_id, &memory, start)
             .await
         {
             Ok((
@@ -4036,16 +4039,13 @@ impl QueryHandler {
         sql: &str,
         prebuilt: Option<LogicalPlan>,
         query_id: &uuid::Uuid,
-        quota: crate::query_memory::QueryQuota,
+        memory: &crate::query_memory::StatementMemory,
         start: std::time::Instant,
     ) -> sqe_core::Result<OpenStreamResult> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
         let shared_pool = Arc::clone(&ctx.runtime_env().memory_pool);
-        let ctx = crate::query_memory::with_query_quota(
-            ctx,
-            quota,
-            self.unspillable_headroom_percent,
-        );
+        let ctx = memory.bind(ctx);
+        let quota = memory.quota();
 
         // Every recursive phase (SQL planning, the policy rewrite, the
         // optimizer, physical planning, the post-planning rules) runs on the
@@ -4551,18 +4551,15 @@ impl QueryHandler {
         session: &Session,
         sql: &str,
         query_id: &uuid::Uuid,
-        quota: crate::query_memory::QueryQuota,
+        memory: &crate::query_memory::StatementMemory,
         plan_metrics: &Arc<Mutex<PlanMetrics>>,
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
         summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
         let shared_pool = Arc::clone(&ctx.runtime_env().memory_pool);
-        let ctx = crate::query_memory::with_query_quota(
-            ctx,
-            quota,
-            self.unspillable_headroom_percent,
-        );
+        let ctx = memory.bind(ctx);
+        let quota = memory.quota();
 
         self.refresh_listing_snapshots(&ctx, &session_catalog, session, sql)
             .await;
@@ -4771,14 +4768,14 @@ impl QueryHandler {
         &self,
         ctx: SessionContext,
         query_id: &uuid::Uuid,
-        quota: crate::query_memory::QueryQuota,
+        memory: &crate::query_memory::StatementMemory,
     ) -> (
         SessionContext,
         impl FnOnce(LogicalPlan) -> Option<crate::join_fallback::JoinFallback> + '_,
     ) {
         let shared_pool = Arc::clone(&ctx.runtime_env().memory_pool);
-        let ctx =
-            crate::query_memory::with_query_quota(ctx, quota, self.unspillable_headroom_percent);
+        let ctx = memory.bind(ctx);
+        let quota = memory.quota();
         let query_id = *query_id;
         let fallback_ctx = ctx.clone();
         let fallback = move |logical| {
@@ -5773,6 +5770,21 @@ impl QueryHandler {
             &self.secrets,
         )
         .await
+    }
+
+    /// [`Self::create_session_context`] on the statement's pool, for the
+    /// write paths (#788). Every write buffer (`TrackedBatchBuffer`,
+    /// `WriteReservation`, the fan-out writer) and the SELECT feeding a
+    /// CTAS/INSERT reserve from the context's pool, so without the bind a
+    /// write could take the whole coordinator pool where a read is held to
+    /// `query.max_query_memory`.
+    async fn write_session_context(
+        &self,
+        session: &Session,
+        memory: &crate::query_memory::StatementMemory,
+    ) -> sqe_core::Result<(SessionContext, Arc<SessionCatalog>)> {
+        let (ctx, catalog) = self.create_session_context(session).await?;
+        Ok((memory.bind(ctx), catalog))
     }
 
     /// Revalidate every physical Iceberg table behind a cached query result.
@@ -10871,8 +10883,8 @@ mod show_stats_policy_tests {
         let session = pressure_session();
 
         let admission = handler.admit(&session, "SELECT 1", "query").expect("admitted");
-        assert!(admission.quota.under_pressure);
-        assert_eq!(admission.quota.bytes, 64 * 1024 * 1024);
+        assert!(admission.memory.quota().under_pressure);
+        assert_eq!(admission.memory.quota().bytes, 64 * 1024 * 1024);
         assert!(admission.memory_reservation.is_some(), "per-user budget is on by default");
         assert_eq!(
             handler.per_user_memory.used_bytes("analyst"),
@@ -10934,7 +10946,38 @@ mod show_stats_policy_tests {
             .expect_err("cap 0 refuses at red");
         assert!(err.to_string().contains("memory is"), "{err}");
         let metadata = handler.admit(&session, "EXPLAIN SELECT 1", "query").expect("metadata");
-        assert!(!metadata.quota.under_pressure);
+        assert!(!metadata.memory.quota().under_pressure);
+    }
+
+    /// A Flight `DoPut` ingest passes the gates of a write: refused on a red
+    /// pool, and otherwise holding the per-user reservation while its
+    /// buffers charge the coordinator pool under the query quota (#788).
+    #[tokio::test]
+    async fn an_ingest_is_admitted_like_a_write() {
+        let handler = pressure_handler("64MB");
+        let session = pressure_session();
+        let admission = handler
+            .admit_ingest(&session, "sales.t")
+            .expect("green pool admits");
+        assert!(!admission.memory.quota().under_pressure);
+        assert!(admission.memory_reservation.is_some());
+        let buffer = datafusion::execution::memory_pool::MemoryConsumer::new("ingest")
+            .register(&admission.memory.pool());
+        buffer.try_grow(1 << 20).expect("under the quota");
+        assert!(
+            handler.runtime.memory_pool.reserved() >= 1 << 20,
+            "the ingest pool charges the coordinator pool"
+        );
+        drop(buffer);
+        drop(admission);
+        assert_eq!(handler.per_user_memory.used_bytes("analyst"), 0);
+
+        let _held = hold_red(&handler);
+        let err = match handler.admit_ingest(&session, "sales.t") {
+            Ok(_) => panic!("an ingest at red must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("memory is"), "{err}");
     }
 }
 

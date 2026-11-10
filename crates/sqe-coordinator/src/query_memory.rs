@@ -234,18 +234,63 @@ pub(crate) fn with_query_limit(
     limit: usize,
     headroom_percent: u8,
 ) -> SessionContext {
-    with_query_quota(ctx, QueryQuota::normal(limit), headroom_percent)
+    let shared = Arc::clone(&ctx.runtime_env().memory_pool);
+    StatementMemory::new(shared, QueryQuota::normal(limit), headroom_percent).bind(ctx)
 }
 
-/// [`with_query_limit`] for a quota that may be the pressure-admission cap,
-/// so a refusal names the setting that applied.
-pub(crate) fn with_query_quota(
-    ctx: SessionContext,
+/// One statement's memory (#788): the quota admission granted and the one
+/// query pool every context the statement builds reserves from. A statement
+/// that builds several contexts (a MERGE's source and target, a CTAS's
+/// SELECT and its load, an EXPLAIN ANALYZE) or none at all (a Flight
+/// `DoPut` ingest) holds one quota between them, and its peak covers all of
+/// them. Admission creates it; cloning shares the pool.
+#[derive(Clone)]
+pub(crate) struct StatementMemory {
     quota: QueryQuota,
-    headroom_percent: u8,
-) -> SessionContext {
-    let shared = Arc::clone(&ctx.runtime_env().memory_pool);
-    with_quota_over(ctx, shared, quota, headroom_percent, false)
+    /// The coordinator pool itself when the quota is 0 (no cap).
+    pool: Arc<dyn MemoryPool>,
+}
+
+/// The quota only: tracing spans record it, and the pool tree is noise.
+impl fmt::Debug for StatementMemory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.quota.fmt(f)
+    }
+}
+
+impl StatementMemory {
+    /// `quota` over `shared`, with `headroom_percent` of it kept for
+    /// non-spillable consumers and the sorts sharing the spillable rest.
+    pub(crate) fn new(shared: Arc<dyn MemoryPool>, quota: QueryQuota, headroom_percent: u8) -> Self {
+        Self {
+            quota,
+            pool: query_pool(shared, quota, headroom_percent),
+        }
+    }
+
+    pub(crate) fn quota(&self) -> QueryQuota {
+        self.quota
+    }
+
+    /// The pool a buffer with no `SessionContext` reserves from.
+    pub(crate) fn pool(&self) -> Arc<dyn MemoryPool> {
+        Arc::clone(&self.pool)
+    }
+
+    /// A copy of `ctx` (catalogs, object stores, caches and disk manager
+    /// kept) whose operators reserve from this statement's pool. Cached
+    /// sessions never share a quota: each statement brings its own.
+    pub(crate) fn bind(&self, ctx: SessionContext) -> SessionContext {
+        if self.quota.bytes == 0 {
+            return ctx;
+        }
+        let mut runtime = (*ctx.runtime_env()).clone();
+        runtime.memory_pool = Arc::clone(&self.pool);
+        let state = SessionStateBuilder::from(ctx.state())
+            .with_runtime_env(Arc::new(runtime))
+            .build();
+        SessionContext::new_with_state(state)
+    }
 }
 
 /// [`with_query_limit`] with the shared pool given explicitly, for a context
@@ -268,6 +313,25 @@ pub(crate) fn with_query_limit_over(
         headroom_percent,
         fair_share,
     )
+}
+
+/// The query pool for `quota` over `shared`; no quota returns `shared`
+/// itself. [`StatementMemory`] holds one per statement.
+fn query_pool(
+    shared: Arc<dyn MemoryPool>,
+    quota: QueryQuota,
+    headroom_percent: u8,
+) -> Arc<dyn MemoryPool> {
+    if quota.bytes == 0 {
+        return shared;
+    }
+    Arc::new(QueryMemoryPool {
+        shared,
+        limit: quota.bytes,
+        limit_name: quota.name(),
+        budget: HeadroomBudget::new(quota.bytes, headroom_percent, true).with_sort_share(),
+        peak: QueryPeak::default(),
+    })
 }
 
 fn with_quota_over(
@@ -369,6 +433,46 @@ mod tests {
         assert_eq!(admitted.load(Ordering::Relaxed), 2);
         assert_eq!(query.reserved(), 0);
         assert_eq!(shared.reserved(), 0);
+    }
+
+    /// Every context a statement binds, and a buffer on its bare pool,
+    /// reserve from one quota: what the first holds, the second cannot take.
+    /// A second statement has its own. No quota leaves the shared pool.
+    #[test]
+    fn a_statement_holds_one_quota_across_its_contexts() {
+        let shared: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024));
+        let base = SessionContext::new_with_state(
+            SessionStateBuilder::new()
+                .with_runtime_env(Arc::new(
+                    datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+                        .with_memory_pool(shared.clone())
+                        .build()
+                        .unwrap(),
+                ))
+                .build(),
+        );
+        let statement = StatementMemory::new(shared.clone(), QueryQuota::normal(64), 0);
+        let source = statement.bind(base.clone());
+        let target = statement.bind(base.clone());
+        let held = MemoryConsumer::new("source").register(&source.runtime_env().memory_pool);
+        held.try_grow(40).unwrap();
+        let rewrite = MemoryConsumer::new("target").register(&target.runtime_env().memory_pool);
+        let err = rewrite.try_grow(40).expect_err("one quota for both contexts");
+        assert!(err.to_string().contains("query.max_query_memory"), "{err}");
+        let ingest = MemoryConsumer::new("ingest").register(&statement.pool());
+        ingest.try_grow(24).unwrap();
+        assert_eq!(shared.reserved(), 64);
+        assert_eq!(query_peak(&target).unwrap().bytes(), 64, "one peak too");
+
+        let other = StatementMemory::new(shared.clone(), QueryQuota::normal(64), 0);
+        let own = MemoryConsumer::new("other").register(&other.pool());
+        own.try_grow(40).expect("another statement has its own quota");
+        drop((held, ingest, own));
+        assert_eq!(shared.reserved(), 0);
+
+        let uncapped = StatementMemory::new(shared.clone(), QueryQuota::normal(0), 0);
+        assert!(Arc::ptr_eq(&uncapped.pool(), &shared));
+        assert!(Arc::ptr_eq(&uncapped.bind(base).runtime_env().memory_pool, &shared));
     }
 
     #[tokio::test]

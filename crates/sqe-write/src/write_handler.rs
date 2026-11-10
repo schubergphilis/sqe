@@ -3123,10 +3123,14 @@ impl WriteHandler {
     ///
     /// `handle_ingest` (the batched signature) is retained for internal callers
     /// and the name-parsing tests.
+    ///
+    /// `pool` is the pool the fan-out writer's buffers reserve from: the
+    /// caller's per-query quota pool (#788). `None` leaves them uncharged.
     pub async fn handle_ingest_streaming<S, E>(
         &self,
         session: &Session,
         table_name: &str,
+        pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
         batch_stream: S,
     ) -> sqe_core::Result<usize>
     where
@@ -3212,9 +3216,9 @@ impl WriteHandler {
             self.metrics.as_ref(),
             self.compression(session),
             tracker,
-            // Flight DoPut has no session context; the auto-derived caps still bound
-            // the writer set, only the pool charge is unavailable here.
-            self.fanout_limits(None),
+            // Flight DoPut has no session context; the caller hands in the
+            // quota pool instead.
+            self.fanout_limits(pool),
         )
         .await?;
 
