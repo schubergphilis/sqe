@@ -42,6 +42,7 @@ pub use scan_morsel::{
 };
 pub use scan_morsel::{
     SCAN_TASK_VERSION_V3, SCAN_TASK_VERSION_V4, SCAN_TASK_VERSION_V6, SCAN_TASK_VERSION_V7,
+    SCAN_TASK_VERSION_V8,
 };
 pub use scan_task::{
     HiveScanDescriptor, HiveScanFormat, ScanCredentials, ScanStorage, ScanTask, ScanTaskBuilder,

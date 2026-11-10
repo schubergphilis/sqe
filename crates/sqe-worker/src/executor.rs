@@ -1614,7 +1614,33 @@ async fn open_parquet_stream(
             &task.projected_columns,
         );
         if !indices.is_empty() {
-            let mask = parquet::arrow::ProjectionMask::roots(builder.parquet_schema(), indices);
+            let mut mask = parquet::arrow::ProjectionMask::roots(builder.parquet_schema(), indices);
+            // Shredded variant fields (sqe#870): read `metadata` plus the
+            // named `typed_value` fields instead of the whole variant. The
+            // helper reads the column whole in any file that does not shred
+            // every named field, so a missing or unreadable hint only costs I/O.
+            if let Some(bytes) = task.variant_fields.as_deref() {
+                match serde_json::from_slice::<iceberg::arrow::variant_projection::VariantFieldHints>(
+                    bytes,
+                ) {
+                    Ok(hints) => {
+                        if let Some(narrowed) =
+                            iceberg::arrow::variant_projection::narrow_variant_projection(
+                                &mask,
+                                builder.parquet_schema(),
+                                &hints,
+                            )
+                        {
+                            mask = narrowed;
+                        }
+                    }
+                    Err(e) => warn!(
+                        fragment_id = %task.fragment_id,
+                        error = %e,
+                        "Ignoring undecodable variant fields"
+                    ),
+                }
+            }
             builder = builder.with_projection(mask);
         }
     }
@@ -2414,6 +2440,7 @@ mod tests {
             variant_prunes: None,
             delete_tasks: None,
             geo_prunes: None,
+            variant_fields: None,
             version: 1,
             morsel_id: None,
             row_group_start: None,
@@ -2894,6 +2921,7 @@ mod tests {
             variant_prunes: None,
             delete_tasks: None,
             geo_prunes: None,
+            variant_fields: None,
             version: 1,
             morsel_id: None,
             row_group_start: None,

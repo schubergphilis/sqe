@@ -393,6 +393,10 @@ pub struct IcebergScanExec {
     /// manifest and row-group bounding boxes. Kept apart from `df_filters`
     /// for the same reason as `variant_prunes`.
     geo_prunes: Arc<[crate::geo_prune::GeoPrune]>,
+    /// The object fields of each shredded variant column the query reads,
+    /// by field id (sqe#870): a file that shreds them all reads `metadata`
+    /// and those fields instead of the whole column.
+    variant_fields: Option<Arc<iceberg::arrow::variant_projection::VariantFieldHints>>,
 }
 
 /// Per-filter slot holding a dynamic filter's first sealed snapshot after
@@ -646,6 +650,7 @@ impl IcebergScanExec {
             sealed_filters: new_sealed_filter_cache(0),
             variant_prunes: Arc::from(Vec::new()),
             geo_prunes: Arc::from(Vec::new()),
+            variant_fields: None,
         }
     }
 
@@ -721,6 +726,36 @@ impl IcebergScanExec {
         self.static_plan = Arc::new(tokio::sync::OnceCell::new());
         self.split_assignments = Arc::new(tokio::sync::OnceCell::new());
         self
+    }
+
+    /// Read only the shredded variant fields `hints` names (sqe#870). The
+    /// names resolve to field ids in the scanned snapshot's schema, so set
+    /// the snapshot first; a name that is not a top-level variant column is
+    /// ignored.
+    #[must_use = "with_variant_fields consumes self; bind the returned scan"]
+    pub fn with_variant_fields(mut self, hints: &crate::variant_read::VariantReadHints) -> Self {
+        let schema = snapshot_schema(&self.table, self.snapshot_id);
+        let by_id: iceberg::arrow::variant_projection::VariantFieldHints = hints
+            .0
+            .iter()
+            .filter_map(|(name, fields)| {
+                let field = schema.as_struct().field_by_name(name)?;
+                matches!(field.field_type.as_ref(), iceberg::spec::Type::Variant(_))
+                    .then(|| (field.id, fields.clone()))
+            })
+            .collect();
+        self.variant_fields = (!by_id.is_empty()).then(|| Arc::new(by_id));
+        self
+    }
+
+    /// The variant fields the scan reads, by field id (sqe#870), as
+    /// scan-ticket bytes, or `None` when every column is read whole.
+    pub fn variant_fields_wire(&self) -> DFResult<Option<Vec<u8>>> {
+        self.variant_fields
+            .as_deref()
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|e| DataFusionError::External(Box::new(e)))
     }
 
     /// Prune files and row groups on `ST_*` predicates over geometry columns
@@ -1079,6 +1114,7 @@ impl IcebergScanExec {
             sealed_filters,
             variant_prunes: self.variant_prunes.clone(),
             geo_prunes: self.geo_prunes.clone(),
+            variant_fields: self.variant_fields.clone(),
         }
     }
 
@@ -1404,7 +1440,21 @@ impl DisplayAs for IcebergScanExec {
             self.df_filters.len(),
             self.pushed_down_filters.len(),
             self.snapshot_id,
-        )
+        )?;
+        // Shredded variant fields read (sqe#870), by field id, sorted.
+        if let Some(hints) = self.variant_fields.as_deref() {
+            let mut ids: Vec<_> = hints.iter().collect();
+            ids.sort_by_key(|(id, _)| **id);
+            let shown: Vec<String> = ids
+                .into_iter()
+                .map(|(id, names)| {
+                    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+                    format!("{id}:[{}]", names.join(","))
+                })
+                .collect();
+            write!(f, ", variant_fields={{{}}}", shown.join(", "))?;
+        }
+        Ok(())
     }
 }
 
@@ -1685,6 +1735,7 @@ impl ExecutionPlan for IcebergScanExec {
         let static_plan_cache = self.static_plan.clone();
         let variant_prunes = self.variant_prunes.clone();
         let geo_prunes = self.geo_prunes.clone();
+        let variant_fields = self.variant_fields.clone();
         let split_assignments = self.split_assignments.clone();
         let table = self.table.clone();
         let schema = self.projected_schema.clone();
@@ -2165,6 +2216,7 @@ impl ExecutionPlan for IcebergScanExec {
                         let rows_decoded = rows_decoded.clone();
                         let decode_gate = Arc::clone(&direct_decode_gate);
                         let row_group_pruner = direct_row_group_pruner.clone();
+                        let variant_fields = variant_fields.clone();
                         async move {
                             debug!(path = %path, size = size, "Direct-read: reading file");
 
@@ -2280,7 +2332,20 @@ impl ExecutionPlan for IcebergScanExec {
                                     let mask = if indices.is_empty() {
                                         ProjectionMask::roots(&parquet_schema, vec![0])
                                     } else {
-                                        ProjectionMask::roots(&parquet_schema, indices)
+                                        let roots = ProjectionMask::roots(&parquet_schema, indices);
+                                        // A shredded variant read only through
+                                        // object paths keeps `metadata` and the
+                                        // fields read (sqe#870).
+                                        variant_fields
+                                            .as_deref()
+                                            .and_then(|hints| {
+                                                iceberg::arrow::variant_projection::narrow_variant_projection(
+                                                    &roots,
+                                                    &parquet_schema,
+                                                    hints,
+                                                )
+                                            })
+                                            .unwrap_or(roots)
                                     };
                                     (builder.with_projection(mask.clone()), mask)
                                 }
@@ -2435,6 +2500,7 @@ impl ExecutionPlan for IcebergScanExec {
             // the decode permits. 0 keeps single-stage admission.
             sb = sb.with_fetch_ahead(scan_fetch_ahead);
             sb = sb.with_string_view(string_view);
+            sb = sb.with_variant_fields(variant_fields.clone());
             // The static predicate prunes; the FilterExec above filters rows.
             sb = sb.with_static_row_filter(static_row_filter);
             // Bloom-filter row-group probing (issue #369): the vendored

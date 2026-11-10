@@ -5216,6 +5216,15 @@ impl QueryHandler {
         } else {
             None
         };
+        // 6a'''. Shredded variant fields read (sqe#870): a projection, not a
+        // filter, so it is not gated on predicate pushdown. A worker reads
+        // `metadata` plus these fields instead of the whole variant.
+        let variant_fields = iceberg_scan.variant_fields_wire().map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::InternalError,
+                format!("encoding the scan's variant fields: {e}"),
+            )
+        })?;
 
         // 6b. Push the scan predicate and (when safe) the query LIMIT into each
         // ScanTask (#233). Both are pure optimizations: the authoritative
@@ -5352,6 +5361,7 @@ impl QueryHandler {
                     .with_projection_fill(projection_fill.clone())
                     .with_variant_prunes(variant_prunes.clone())
                     .with_geo_prunes(geo_prunes.clone())
+                    .with_variant_fields(variant_fields.clone())
                     .with_delete_tasks(deletes)
                     .with_limit(scan_limit)
                     .build())]
@@ -5375,6 +5385,7 @@ impl QueryHandler {
                             .with_projection_fill(projection_fill.clone())
                             .with_variant_prunes(variant_prunes.clone())
                             .with_geo_prunes(geo_prunes.clone())
+                            .with_variant_fields(variant_fields.clone())
                             .with_delete_tasks(deletes)
                             .with_limit(scan_limit);
                             if let (Some(start), Some(end)) = (m.start_byte, m.end_byte) {

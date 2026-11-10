@@ -33,6 +33,7 @@ use futures::{SinkExt, StreamExt, TryStreamExt};
 pub use task::*;
 
 pub use crate::arrow::{ScanMetrics, ScanResult};
+use crate::arrow::variant_projection::VariantFieldHints;
 use crate::arrow::{ArrowReaderBuilder, DEFAULT_TASK_SPLIT_TARGET_SIZE, DecodeGate, RowGroupPruner};
 use crate::delete_file_index::DeleteFileIndex;
 use crate::error::invalid_data;
@@ -176,6 +177,9 @@ pub struct TableScanBuilder<'a> {
     /// SQE PATCH (static row filter): the scan predicate as a per-row
     /// `RowFilter`, forwarded to the arrow reader.
     static_row_filter: bool,
+    /// SQE PATCH (sqe#870): the shredded variant fields the query reads,
+    /// forwarded to the arrow reader.
+    variant_fields: Option<Arc<VariantFieldHints>>,
 }
 
 impl<'a> TableScanBuilder<'a> {
@@ -207,7 +211,16 @@ impl<'a> TableScanBuilder<'a> {
             row_group_pruner: None,
             string_view: false,
             static_row_filter: true,
+            variant_fields: None,
         }
+    }
+
+    /// SQE PATCH (sqe#870): read only these object fields of each shredded
+    /// variant column. See
+    /// [`crate::arrow::ArrowReaderBuilder::with_variant_fields`].
+    pub fn with_variant_fields(mut self, fields: Option<Arc<VariantFieldHints>>) -> Self {
+        self.variant_fields = fields;
+        self
     }
 
     /// SQE PATCH (string view): decode top-level string columns as
@@ -486,6 +499,7 @@ impl<'a> TableScanBuilder<'a> {
                         row_group_pruner: self.row_group_pruner.clone(),
                         string_view: self.string_view,
                         static_row_filter: self.static_row_filter,
+                        variant_fields: self.variant_fields.clone(),
                     });
                 };
                 current_snapshot_id.clone()
@@ -580,6 +594,7 @@ impl<'a> TableScanBuilder<'a> {
             row_group_pruner: self.row_group_pruner,
             string_view: self.string_view,
             static_row_filter: self.static_row_filter,
+            variant_fields: self.variant_fields,
         })
     }
 }
@@ -644,6 +659,8 @@ pub struct TableScan {
     /// SQE PATCH (static row filter): see
     /// [`TableScanBuilder::with_static_row_filter`].
     static_row_filter: bool,
+    /// SQE PATCH (sqe#870): see [`TableScanBuilder::with_variant_fields`].
+    variant_fields: Option<Arc<VariantFieldHints>>,
 }
 
 impl TableScan {
@@ -816,7 +833,9 @@ impl TableScan {
                 // SQE PATCH (string view)
                 .with_string_view(self.string_view)
                 // SQE PATCH (static row filter)
-                .with_static_row_filter(self.static_row_filter);
+                .with_static_row_filter(self.static_row_filter)
+                // SQE PATCH (sqe#870)
+                .with_variant_fields(self.variant_fields.clone());
 
         if let Some(batch_size) = self.batch_size {
             arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);

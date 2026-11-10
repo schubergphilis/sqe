@@ -726,3 +726,112 @@ async fn prunes_shredded_row_groups() {
         drop(&handler, &session, &fq).await;
     }
 }
+
+/// Write `fq` (in `default`, dropped first) with `n` shredded rows plus a
+/// second file that does not shred `b`, then check that reading fields
+/// through `variant_get` (#870), which skips the other shredded fields,
+/// returns what a whole-column read returns.
+///
+/// The last three rows of the first file come after its first batch, which
+/// fixed the shredding schema: one holds `a` as a string, so the writer
+/// puts that whole object in the residual `value`; one is an array; one is
+/// NULL.
+pub(crate) async fn check_field_reads(
+    handler: &sqe_coordinator::QueryHandler,
+    session: &sqe_core::Session,
+    fq: &str,
+    n: i64,
+) {
+    let _ = handler
+        .execute(session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+    let (odd, array, null) = (n - 3, n - 2, n - 1);
+    for sql in [
+        format!(
+            "CREATE TABLE {fq} (id BIGINT, v VARIANT) \
+             WITH ('write.parquet.shred-variants' = 'true')"
+        ),
+        format!(
+            r#"INSERT INTO {fq} SELECT value, CASE
+                 WHEN value = {odd} THEN '{{"a": "s", "b": "odd", "pad": "p"}}'
+                 WHEN value = {array} THEN '[1, 2]'
+                 WHEN value = {null} THEN NULL
+                 ELSE '{{"a": ' || value || ', "b": "x' || value || '", "pad": "' || md5(CAST(value AS VARCHAR)) || '"}}'
+               END FROM range(0, {n})"#
+        ),
+        format!(
+            r#"INSERT INTO {fq} SELECT value, '{{"a": ' || value || ', "c": true}}' FROM range({n}, {n} + 10)"#
+        ),
+    ] {
+        handler.execute(session, &sql, None).await.expect(&sql);
+    }
+
+    let ids = format!("0, 1, {odd}, {array}, {null}, {n}");
+    let fields = "variant_get(v, '$.b', 'string'), try_variant_get(v, '$.a', 'bigint'), \
+                  try_variant_get(v, '$.c', 'boolean')";
+    let narrowed = format!("SELECT id, {fields} FROM {fq} WHERE id IN ({ids}) ORDER BY id");
+    // `$[0]` reads the column whole: the baseline. Its cell is dropped.
+    let whole = format!(
+        "SELECT id, {fields}, try_variant_get(v, '$[0]', 'bigint') FROM {fq} \
+         WHERE id IN ({ids}) ORDER BY id"
+    );
+    let got = rows(handler, session, &narrowed).await;
+    let want: Vec<String> = rows(handler, session, &whole)
+        .await
+        .into_iter()
+        .map(|r| r.rsplit_once('|').expect("baseline cell").0.to_string())
+        .collect();
+    assert_eq!(got, want, "{fq}: narrowed read vs whole read");
+    assert_eq!(
+        got,
+        vec![
+            "0|x0|0|NULL".to_string(),
+            "1|x1|1|NULL".to_string(),
+            format!("{odd}|odd|NULL|NULL"),
+            format!("{array}|NULL|NULL|NULL"),
+            format!("{null}|NULL|NULL|NULL"),
+            format!("{n}|NULL|{n}|true"),
+        ],
+        "{fq}"
+    );
+
+    let count = format!("SELECT count(variant_get(v, '$.b', 'string')) FROM {fq}");
+    assert_eq!(
+        rows(handler, session, &count).await,
+        vec![(n - 2).to_string()],
+        "{fq}: every row but the array and NULL has b"
+    );
+}
+
+/// The plan text of `EXPLAIN sql`.
+async fn explain(
+    handler: &sqe_coordinator::QueryHandler,
+    session: &sqe_core::Session,
+    sql: &str,
+) -> String {
+    rows(handler, session, &format!("EXPLAIN {sql}")).await.join("\n")
+}
+
+/// Reading shredded variant fields through `variant_get` reads only those
+/// fields (#870), on the small-file direct read and on the vendored reader,
+/// and returns what a whole-column read returns.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn reads_only_the_shredded_fields_a_query_uses() {
+    let (session, handler) = crate::common::setup_handler().await;
+    // The large table's file is over the 3 MiB direct-read threshold.
+    for (table, n) in [("variant_fields_small", 20_000_i64), ("variant_fields_large", 300_000)] {
+        let fq = format!("default.{table}");
+        check_field_reads(&handler, &session, &fq, n).await;
+        let (_, largest) = row_groups(&handler, &session, table).await;
+        assert_eq!(largest < 3 * 1024 * 1024, n == 20_000, "{table}: largest file {largest} bytes");
+
+        let narrowed = format!("SELECT variant_get(v, '$.b', 'string') FROM {fq}");
+        let plan = explain(&handler, &session, &narrowed).await;
+        assert!(plan.contains("variant_fields={2:[b]}"), "{table}: {plan}");
+        let whole = format!("SELECT variant_get(v, '$.b', 'string'), v FROM {fq}");
+        let plan = explain(&handler, &session, &whole).await;
+        assert!(!plan.contains("variant_fields="), "{table}: {plan}");
+        drop(&handler, &session, &fq).await;
+    }
+}

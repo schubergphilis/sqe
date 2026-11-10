@@ -251,6 +251,30 @@ async fn prunes_shredded_row_groups_on_a_worker() {
     );
 }
 
+/// Reading shredded variant fields through `variant_get` on a worker (#870):
+/// the ticket names the fields, the worker skips the other shredded fields,
+/// and the rows match a whole-column read. Runs against an in-process worker.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn reads_only_the_shredded_fields_a_query_uses_on_a_worker() {
+    use crate::common::chaos_worker::{spawn_chaos_worker, ChaosMode};
+    let worker = spawn_chaos_worker(ChaosMode::PassThrough).await;
+    let rig = crate::distributed_failure_e2e::rig(std::slice::from_ref(&worker.url), |_| {}).await;
+    let (session, handler) = (&rig.session, rig.handler.as_ref());
+    let fq = "default.variant_fields_on_worker";
+    let before = worker.do_gets();
+    crate::variant_e2e::check_field_reads(handler, session, fq, 20_000).await;
+    let after = worker.do_gets();
+    let _ = handler
+        .execute(session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+    assert!(
+        after > before,
+        "the scan ran on the coordinator, not a worker: \
+         the worker got no do_get ({before} -> {after})"
+    );
+}
+
 /// Variants SQE shredded inside a struct, a list and a map, scanned on a
 /// worker (#870): the worker folds each nested `typed_value` back into
 /// `value` before Flight. Runs against an in-process worker.

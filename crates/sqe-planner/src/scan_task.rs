@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use crate::scan_morsel::{
     SCAN_TASK_VERSION_CURRENT, SCAN_TASK_VERSION_V1, SCAN_TASK_VERSION_V2, SCAN_TASK_VERSION_V3,
     SCAN_TASK_VERSION_V4, SCAN_TASK_VERSION_V5, SCAN_TASK_VERSION_V6, SCAN_TASK_VERSION_V7,
+    SCAN_TASK_VERSION_V8,
 };
 
 /// File format of a Hive external table's data files.
@@ -397,6 +398,18 @@ pub struct ScanTask {
         with = "predicate_wire"
     )]
     pub geo_prunes: Option<Vec<u8>>,
+    /// Shredded variant fields (sqe#870): JSON written by
+    /// `IcebergScanExec::variant_fields_wire`, the object fields of each
+    /// shredded variant column the query reads, by field id. The worker
+    /// reads `metadata` and those fields instead of the whole column; one
+    /// that ignored it would read the whole column, so it only costs reads.
+    #[serde(
+        rename = "variant_fields_b64",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "predicate_wire"
+    )]
+    pub variant_fields: Option<Vec<u8>>,
 }
 
 /// Wire codec for [`ScanTask::predicate_proto`]: writes base64, reads either
@@ -551,6 +564,12 @@ impl ScanTaskBuilder {
         self
     }
 
+    /// Shredded variant fields read (sqe#870); see [`ScanTask::variant_fields`].
+    pub fn with_variant_fields(mut self, fields: Option<Vec<u8>>) -> Self {
+        self.task.variant_fields = fields;
+        self
+    }
+
     /// Per-fragment row LIMIT hint (#233).
     pub fn with_limit(mut self, limit: Option<usize>) -> Self {
         self.task.limit = limit;
@@ -599,6 +618,7 @@ impl std::fmt::Debug for ScanTask {
             .field("has_variant_prunes", &self.variant_prunes.is_some())
             .field("has_delete_tasks", &self.delete_tasks.is_some())
             .field("has_geo_prunes", &self.geo_prunes.is_some())
+            .field("has_variant_fields", &self.variant_fields.is_some())
             .finish()
     }
 }
@@ -642,6 +662,7 @@ impl ScanTask {
                 variant_prunes: None,
                 delete_tasks: None,
                 geo_prunes: None,
+                variant_fields: None,
             },
         }
     }
@@ -656,7 +677,8 @@ impl ScanTask {
     /// - v4: `projection_fill`;
     /// - v5: `variant_prunes`;
     /// - v6: `delete_tasks`;
-    /// - v7: `geo_prunes`.
+    /// - v7: `geo_prunes`;
+    /// - v8: `variant_fields`.
     ///
     /// `predicate_proto`, `limit`, `projected_field_ids`, `credentials`,
     /// `audience` and `expires_at` do not raise the version: an old worker
@@ -682,6 +704,9 @@ impl ScanTask {
         }
         if self.geo_prunes.is_some() {
             required = required.max(SCAN_TASK_VERSION_V7);
+        }
+        if self.variant_fields.is_some() {
+            required = required.max(SCAN_TASK_VERSION_V8);
         }
         required
     }
@@ -738,6 +763,9 @@ impl ScanTask {
         }
         if required >= SCAN_TASK_VERSION_V7 && self.geo_prunes.is_some() {
             fields.push("geo_prunes");
+        }
+        if required >= SCAN_TASK_VERSION_V8 && self.variant_fields.is_some() {
+            fields.push("variant_fields");
         }
         fields
     }
@@ -833,7 +861,7 @@ impl ScanTask {
         match self.version {
             SCAN_TASK_VERSION_V1 | SCAN_TASK_VERSION_V2 | SCAN_TASK_VERSION_V3
             | SCAN_TASK_VERSION_V4 | SCAN_TASK_VERSION_V5 | SCAN_TASK_VERSION_V6
-            | SCAN_TASK_VERSION_V7 => Ok(()),
+            | SCAN_TASK_VERSION_V7 | SCAN_TASK_VERSION_V8 => Ok(()),
             other => Err(format!(
                 "unsupported ScanTask version {other}; this worker supports \
                  {SCAN_TASK_VERSION_V1}..={SCAN_TASK_VERSION_CURRENT}"
@@ -887,6 +915,7 @@ mod tests {
             variant_prunes: None,
             delete_tasks: None,
             geo_prunes: None,
+            variant_fields: None,
         }
     }
 
@@ -945,7 +974,7 @@ mod tests {
     }
 
     #[test]
-    fn version_seven_is_accepted_and_eight_is_not() {
+    fn version_eight_is_accepted_and_nine_is_not() {
         let mut task = task_with_predicate(None);
         for v in [
             SCAN_TASK_VERSION_V1,
@@ -955,11 +984,12 @@ mod tests {
             SCAN_TASK_VERSION_V5,
             SCAN_TASK_VERSION_V6,
             SCAN_TASK_VERSION_V7,
+            SCAN_TASK_VERSION_V8,
         ] {
             task.version = v;
             assert!(task.validate_version().is_ok(), "v{v} must be accepted");
         }
-        task.version = 8;
+        task.version = 9;
         assert!(
             task.validate_version().is_err(),
             "an unknown version must be refused, not read as the newest known one"
@@ -1027,6 +1057,28 @@ mod tests {
         ));
         let text = String::from_utf8(plain.to_bytes().unwrap()).unwrap();
         assert!(!text.contains("geo_prunes"), "{text}");
+    }
+
+    #[test]
+    fn variant_fields_make_the_task_v8_and_round_trip() {
+        let task = built(
+            ScanTask::builder("f", vec!["s3://b/f.parquet".to_string()], storage())
+                .with_variant_fields(Some(vec![1, 2, 3])),
+        );
+        assert_eq!(task.version, SCAN_TASK_VERSION_V8);
+        let bytes = task.to_bytes().unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(text.contains("\"variant_fields_b64\":\"AQID\""), "{text}");
+        let back = ScanTask::decode_for_worker(&bytes, SCAN_TASK_VERSION_CURRENT).unwrap();
+        assert_eq!(back.variant_fields, Some(vec![1, 2, 3]));
+        assert!(ScanTask::decode_for_worker(&bytes, SCAN_TASK_VERSION_V7).is_err());
+        let plain = built(ScanTask::builder(
+            "f",
+            vec!["s3://b/f.parquet".to_string()],
+            storage(),
+        ));
+        let text = String::from_utf8(plain.to_bytes().unwrap()).unwrap();
+        assert!(!text.contains("variant_fields"), "{text}");
     }
 
     #[test]
@@ -1379,6 +1431,7 @@ mod tests {
             variant_prunes: None,
             delete_tasks: None,
             geo_prunes: None,
+            variant_fields: None,
         };
 
         let bytes = task.to_bytes().unwrap();
@@ -1420,6 +1473,7 @@ mod tests {
             variant_prunes: None,
             delete_tasks: None,
             geo_prunes: None,
+            variant_fields: None,
         };
 
         let bytes = task.to_bytes().unwrap();
@@ -1485,6 +1539,7 @@ mod tests {
             variant_prunes: None,
             delete_tasks: None,
             geo_prunes: None,
+            variant_fields: None,
         };
         let debug_output = format!("{task:?}");
         // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS's documented example key, asserting it is redacted
@@ -1526,6 +1581,7 @@ mod tests {
             variant_prunes: None,
             delete_tasks: None,
             geo_prunes: None,
+            variant_fields: None,
         };
 
         let bytes = task.to_bytes().unwrap();

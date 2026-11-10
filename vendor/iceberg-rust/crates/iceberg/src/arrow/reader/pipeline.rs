@@ -90,6 +90,7 @@ impl ArrowReader {
             row_group_pruner: sqe.row_group_pruner.clone(),
             string_view: sqe.string_view,
             static_row_filter: sqe.static_row_filter,
+            variant_fields: sqe.variant_fields.clone(),
         };
 
         // Fast-path for single concurrency to avoid overhead of try_flatten_unordered.
@@ -411,6 +412,9 @@ struct FileScanTaskReader {
     /// SQE PATCH (static row filter): see
     /// [`crate::arrow::ArrowReaderBuilder::with_static_row_filter`].
     static_row_filter: bool,
+    /// SQE PATCH (sqe#870): see
+    /// [`crate::arrow::ArrowReaderBuilder::with_variant_fields`].
+    variant_fields: Option<Arc<crate::arrow::variant_projection::VariantFieldHints>>,
 }
 
 impl FileScanTaskReader {
@@ -700,6 +704,19 @@ impl FileScanTaskReader {
             let phys_mask =
                 ProjectionMask::leaves(record_batch_stream_builder.parquet_schema(), vec![leaf]);
             projection_mask.union(&phys_mask);
+        }
+
+        // SQE PATCH (sqe#870): a shredded variant the query reads only
+        // through object paths keeps `metadata` and the shredded fields it
+        // reads; the transformer unshreds just those.
+        if let Some(hints) = self.variant_fields.as_deref()
+            && let Some(narrowed) = crate::arrow::variant_projection::narrow_variant_projection(
+                &projection_mask,
+                record_batch_stream_builder.parquet_schema(),
+                hints,
+            )
+        {
+            projection_mask = narrowed;
         }
 
         record_batch_stream_builder =

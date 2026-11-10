@@ -1879,6 +1879,7 @@ mod tests {
             variant_prunes: None,
             delete_tasks: None,
             geo_prunes: None,
+            variant_fields: None,
             version: 1,
             morsel_id: None,
             row_group_start: None,
