@@ -1393,9 +1393,10 @@ impl SqeFlightSqlService {
         qualified: &'a str,
         txn: Option<Arc<sqe_catalog::txn::TxnScope>>,
         pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
-        flight_stream: arrow_flight::decode::FlightRecordBatchStream,
+        mode: sqe_write::write_handler::IngestMode,
+        upload: crate::flight_ingest::PeekedUpload,
     ) -> futures::future::BoxFuture<'a, sqe_core::Result<usize>> {
-        Box::pin(self.ingest_flight_stream_inner(session, qualified, txn, pool, flight_stream))
+        Box::pin(self.ingest_flight_stream_inner(session, qualified, txn, pool, mode, upload))
     }
 
     async fn ingest_flight_stream_inner(
@@ -1404,7 +1405,8 @@ impl SqeFlightSqlService {
         qualified: &str,
         txn: Option<Arc<sqe_catalog::txn::TxnScope>>,
         pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
-        flight_stream: arrow_flight::decode::FlightRecordBatchStream,
+        mode: sqe_write::write_handler::IngestMode,
+        upload: crate::flight_ingest::PeekedUpload,
     ) -> sqe_core::Result<usize> {
         sqe_catalog::txn::write_scope(
             txn,
@@ -1413,7 +1415,9 @@ impl SqeFlightSqlService {
                 session,
                 qualified,
                 pool,
-                Box::pin(flight_stream),
+                mode,
+                upload.schema,
+                upload.batches,
             ),
         )
         .await
@@ -2733,13 +2737,22 @@ impl FlightSqlService for SqeFlightSqlService {
             .query_handler
             .admit_ingest(&session, &qualified)
             .map_err(|e| sqe_error_to_status(&e, None))?;
+        // What to do with a missing or an existing table (#881). The stream's
+        // schema is read only when a missing table would be created from it.
+        let mode = crate::flight_ingest::ingest_mode(ticket.table_definition_options.as_ref())?;
+        let upload = crate::flight_ingest::peek_upload_schema(
+            flight_stream,
+            mode.on_missing == sqe_write::write_handler::OnMissing::Create,
+        )
+        .await?;
         let rows = self
             .ingest_flight_stream(
                 &session,
                 &qualified,
                 txn,
                 Some(admission.memory.pool()),
-                flight_stream,
+                mode,
+                upload,
             )
             .await
             .map_err(|e| sqe_error_to_status(&e, None))?;
