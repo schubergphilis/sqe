@@ -2092,143 +2092,8 @@ impl QueryHandler {
                 StatementKind::ShowViews(filter) => self.handle_show_views(session, filter).await,
 
                 StatementKind::Utility(stmt) => {
-                    if let sqlparser::ast::Statement::Explain {
-                        analyze, statement, ..
-                    } = stmt.as_ref()
-                    {
-                        let inner = statement.to_string();
-                        let (ctx, _) = self.create_session_context(session).await?;
-                        if *analyze {
-                            // It runs the query: same quota, sort share and
-                            // join fallback as the query itself (#788).
-                            let (ctx, fallback) = self.explain_execution(ctx, &query_id, memory);
-                            self.explain_handler
-                                .analyze(session, &inner, &ctx, fallback)
-                                .await
-                        } else {
-                            let is_admin = self.config.auth.has_admin_role(&session.user.roles);
-                            self.explain_handler
-                                .plan(session, &inner, &ctx, is_admin)
-                                .await
-                        }
-                    } else if let sqlparser::ast::Statement::ShowColumns { show_options, .. } =
-                        stmt.as_ref()
-                    {
-                        // Trino: SHOW COLUMNS FROM ns.table -> rewrite as a
-                        // query against information_schema.columns. Same pattern
-                        // as handle_show_create_table; the Trino output has
-                        // four columns (Column, Type, Extra, Comment), but we
-                        // emit (column_name, data_type, is_nullable) for now.
-                        // dbt and most BI clients use this query for schema
-                        // inspection and only need the first two columns.
-                        self.handle_show_columns(session, show_options).await
-                    } else if let sqlparser::ast::Statement::ExplainTable {
-                        describe_alias,
-                        table_name,
-                        ..
-                    } = stmt.as_ref()
-                    {
-                        // DESCRIBE / DESC <table> -> same column metadata as
-                        // SHOW COLUMNS. EXPLAIN TABLE (a different alias) is not
-                        // a column-listing request, so it is not redirected.
-                        use sqlparser::ast::DescribeAlias;
-                        if matches!(
-                            describe_alias,
-                            DescribeAlias::Describe | DescribeAlias::Desc
-                        ) {
-                            self.columns_for_table(session, &table_name.to_string())
-                                .await
-                        } else {
-                            Err(SqeError::NotImplemented(format!(
-                                "Utility statement not supported: {stmt}"
-                            )))
-                        }
-                    } else if matches!(
-                        stmt.as_ref(),
-                        sqlparser::ast::Statement::Set(sqlparser::ast::Set::SetTimeZone { .. })
-                    ) {
-                        // Trino/JDBC clients emit `SET TIME ZONE '<tz>'` on
-                        // connect (e.g. DBeaver, dbt). SQE has no per-session
-                        // time-zone state, so the zone is accepted and recorded
-                        // in the log but not applied: query timestamps are
-                        // evaluated in UTC (`session_tuning::ENGINE_TIME_ZONE`)
-                        // regardless. This
-                        // matches Trino's "statement succeeds" contract (it
-                        // returns FINISHED with no rows) so the client's
-                        // connection setup does not fail. Accepting only the
-                        // SetTimeZone variant keeps every other unsupported SET
-                        // shape surfacing its clear error below. (#351b)
-                        if let sqlparser::ast::Statement::Set(sqlparser::ast::Set::SetTimeZone {
-                            value,
-                            ..
-                        }) = stmt.as_ref()
-                        {
-                            tracing::info!(
-                                requested_time_zone = %value,
-                                "SET TIME ZONE accepted as a no-op (SQE has no per-session zone; \
-                                 timestamps use UTC)"
-                            );
-                        }
-                        Ok(Vec::new())
-                    } else if matches!(
-                        stmt.as_ref(),
-                        sqlparser::ast::Statement::ShowFunctions { .. }
-                    ) {
-                        // SHOW FUNCTIONS -> list the registered functions with
-                        // Trino's column shape (#344).
-                        self.handle_show_functions(session).await
-                    } else if is_show_roles(stmt.as_ref()) {
-                        // SHOW ROLES / SHOW CURRENT ROLES / SHOW ROLE GRANTS ->
-                        // the caller's roles from the OIDC token. SQE has no
-                        // global role registry, so "available roles" is the
-                        // caller's own set (#350).
-                        self.handle_show_roles(session)
-                    } else if let Some(mv) = classify_materialized_view(stmt.as_ref()) {
-                        // SQE does not support materialized views (#324).
-                        // DROP MATERIALIZED VIEW IF EXISTS is a client-compat
-                        // no-op; anything else is a clear unsupported error.
-                        match mv {
-                            MaterializedViewStmt::DropIfExistsNoop => {
-                                debug!("DROP MATERIALIZED VIEW IF EXISTS: materialized views unsupported, treating as no-op");
-                                Ok(Vec::new())
-                            }
-                            MaterializedViewStmt::Unsupported => Err(SqeError::NotImplemented(
-                                "materialized views are not supported".to_string(),
-                            )),
-                        }
-                    } else if let sqlparser::ast::Statement::AlterTable(ref alter) = stmt.as_ref() {
-                        // The only ALTER TABLE shape that reaches this
-                        // catch-all: every other variant already has a
-                        // dedicated StatementKind (AlterSchema, AlterTableProps,
-                        // SetTags, RefDdl, PartitionEvolution, IdentifierFields,
-                        // DropNestedColumn,
-                        // and Rename above), so an AlterTable statement here is
-                        // ADD PARTITION (or another op this release has no
-                        // dedicated arm for). Only ADD PARTITION gets the
-                        // Hive-specific naming; anything else falls to the
-                        // generic error below unchanged, same as before this
-                        // branch existed.
-                        if alter.operations.iter().any(|op| {
-                            matches!(
-                                op,
-                                sqlparser::ast::AlterTableOperation::AddPartitions { .. }
-                            )
-                        }) {
-                            self.reject_if_hive_table(
-                                session,
-                                &table_reference_of(&alter.name),
-                                "ALTER TABLE ... ADD PARTITION",
-                                2,
-                            )?;
-                        }
-                        Err(SqeError::NotImplemented(format!(
-                            "Utility statement not supported: {stmt}"
-                        )))
-                    } else {
-                        Err(SqeError::NotImplemented(format!(
-                            "Utility statement not supported: {stmt}"
-                        )))
-                    }
+                    self.handle_utility_statement(session, stmt, query_id, memory)
+                        .await
                 }
 
                 StatementKind::Grant(ref stmt) => self.handle_grant(session, stmt, None).await,
@@ -3883,6 +3748,155 @@ impl QueryHandler {
                 SqeErrorCode::ExecutionFailed,
                 "Expected Insert statement",
             ))
+        }
+    }
+
+    /// Runs a catch-all utility statement: EXPLAIN / EXPLAIN ANALYZE, SHOW
+    /// COLUMNS, DESCRIBE, SET TIME ZONE (accepted as a no-op), SHOW FUNCTIONS,
+    /// SHOW ROLES and the materialized-view no-op. An ALTER TABLE ... ADD
+    /// PARTITION on a Hive table is rejected with a Hive-specific error; every
+    /// other shape gets a "not supported" error.
+    #[allow(clippy::borrowed_box)]
+    async fn handle_utility_statement(
+        &self,
+        session: &Session,
+        stmt: &Box<Statement>,
+        query_id: uuid::Uuid,
+        memory: &crate::query_memory::StatementMemory,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        if let sqlparser::ast::Statement::Explain {
+            analyze, statement, ..
+        } = stmt.as_ref()
+        {
+            let inner = statement.to_string();
+            let (ctx, _) = self.create_session_context(session).await?;
+            if *analyze {
+                // It runs the query: same quota, sort share and
+                // join fallback as the query itself (#788).
+                let (ctx, fallback) = self.explain_execution(ctx, &query_id, memory);
+                self.explain_handler
+                    .analyze(session, &inner, &ctx, fallback)
+                    .await
+            } else {
+                let is_admin = self.config.auth.has_admin_role(&session.user.roles);
+                self.explain_handler
+                    .plan(session, &inner, &ctx, is_admin)
+                    .await
+            }
+        } else if let sqlparser::ast::Statement::ShowColumns { show_options, .. } = stmt.as_ref() {
+            // Trino: SHOW COLUMNS FROM ns.table -> rewrite as a
+            // query against information_schema.columns. Same pattern
+            // as handle_show_create_table; the Trino output has
+            // four columns (Column, Type, Extra, Comment), but we
+            // emit (column_name, data_type, is_nullable) for now.
+            // dbt and most BI clients use this query for schema
+            // inspection and only need the first two columns.
+            self.handle_show_columns(session, show_options).await
+        } else if let sqlparser::ast::Statement::ExplainTable {
+            describe_alias,
+            table_name,
+            ..
+        } = stmt.as_ref()
+        {
+            // DESCRIBE / DESC <table> -> same column metadata as
+            // SHOW COLUMNS. EXPLAIN TABLE (a different alias) is not
+            // a column-listing request, so it is not redirected.
+            use sqlparser::ast::DescribeAlias;
+            if matches!(
+                describe_alias,
+                DescribeAlias::Describe | DescribeAlias::Desc
+            ) {
+                self.columns_for_table(session, &table_name.to_string())
+                    .await
+            } else {
+                Err(SqeError::NotImplemented(format!(
+                    "Utility statement not supported: {stmt}"
+                )))
+            }
+        } else if matches!(
+            stmt.as_ref(),
+            sqlparser::ast::Statement::Set(sqlparser::ast::Set::SetTimeZone { .. })
+        ) {
+            // Trino/JDBC clients emit `SET TIME ZONE '<tz>'` on
+            // connect (e.g. DBeaver, dbt). SQE has no per-session
+            // time-zone state, so the zone is accepted and recorded
+            // in the log but not applied: query timestamps are
+            // evaluated in UTC (`session_tuning::ENGINE_TIME_ZONE`)
+            // regardless. This
+            // matches Trino's "statement succeeds" contract (it
+            // returns FINISHED with no rows) so the client's
+            // connection setup does not fail. Accepting only the
+            // SetTimeZone variant keeps every other unsupported SET
+            // shape surfacing its clear error below. (#351b)
+            if let sqlparser::ast::Statement::Set(sqlparser::ast::Set::SetTimeZone {
+                value, ..
+            }) = stmt.as_ref()
+            {
+                tracing::info!(
+                    requested_time_zone = %value,
+                    "SET TIME ZONE accepted as a no-op (SQE has no per-session zone; \
+                     timestamps use UTC)"
+                );
+            }
+            Ok(Vec::new())
+        } else if matches!(
+            stmt.as_ref(),
+            sqlparser::ast::Statement::ShowFunctions { .. }
+        ) {
+            // SHOW FUNCTIONS -> list the registered functions with
+            // Trino's column shape (#344).
+            self.handle_show_functions(session).await
+        } else if is_show_roles(stmt.as_ref()) {
+            // SHOW ROLES / SHOW CURRENT ROLES / SHOW ROLE GRANTS ->
+            // the caller's roles from the OIDC token. SQE has no
+            // global role registry, so "available roles" is the
+            // caller's own set (#350).
+            self.handle_show_roles(session)
+        } else if let Some(mv) = classify_materialized_view(stmt.as_ref()) {
+            // SQE does not support materialized views (#324).
+            // DROP MATERIALIZED VIEW IF EXISTS is a client-compat
+            // no-op; anything else is a clear unsupported error.
+            match mv {
+                MaterializedViewStmt::DropIfExistsNoop => {
+                    debug!("DROP MATERIALIZED VIEW IF EXISTS: materialized views unsupported, treating as no-op");
+                    Ok(Vec::new())
+                }
+                MaterializedViewStmt::Unsupported => Err(SqeError::NotImplemented(
+                    "materialized views are not supported".to_string(),
+                )),
+            }
+        } else if let sqlparser::ast::Statement::AlterTable(ref alter) = stmt.as_ref() {
+            // The only ALTER TABLE shape that reaches this
+            // catch-all: every other variant already has a
+            // dedicated StatementKind (AlterSchema, AlterTableProps,
+            // SetTags, RefDdl, PartitionEvolution, IdentifierFields,
+            // DropNestedColumn,
+            // and Rename above), so an AlterTable statement here is
+            // ADD PARTITION (or another op this release has no
+            // dedicated arm for). Only ADD PARTITION gets the
+            // Hive-specific naming; anything else falls to the
+            // generic error below unchanged, same as before this
+            // branch existed.
+            if alter.operations.iter().any(|op| {
+                matches!(
+                    op,
+                    sqlparser::ast::AlterTableOperation::AddPartitions { .. }
+                )
+            }) {
+                self.reject_if_hive_table(
+                    session,
+                    &table_reference_of(&alter.name),
+                    "ALTER TABLE ... ADD PARTITION",
+                    2,
+                )?;
+            }
+            Err(SqeError::NotImplemented(format!(
+                "Utility statement not supported: {stmt}"
+            )))
+        } else {
+            Err(SqeError::NotImplemented(format!(
+                "Utility statement not supported: {stmt}"
+            )))
         }
     }
 
