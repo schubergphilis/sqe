@@ -13,15 +13,26 @@ Many design notes under `docs/site/book/src/design-notes/` are history, not the 
 - **Parser**: wrap sqlparser-rs, don't fork; SQE statements are pre-parsed in `sqe-sql`. Policies are authored with `CREATE [OR REPLACE] POLICY` / `DROP POLICY`, or `GRANT SELECT ... MASKED WITH (...) / ROWS WHERE` (one item per grantee in Ranger's single mask/filter policy per resource; `sqe-sql/src/grant_policy.rs`), and stored in Ranger
 - **dbt**: native dbt-sqe adapter over ADBC Flight SQL, not the Trino compat layer
 
+## Way of working
+
+- **Design in the main session, long command work in cheaper agents.** Architecture, specs, reviewing a diff and deciding what to merge stay with the strongest model. Multi-step build and measure work (a profile series, a full test suite, a bisect, a mechanical move with its gate) goes to a lower-tier agent with a written brief: goal, files, what is already ruled out, the gate to run, and the report to return (raw exit codes, `git status`, `git diff --stat`). A single command is not worth a brief; run it.
+- **If you were started with a brief, you are that agent.** Do the work yourself and start no further agents. Leave the tree uncommitted unless the brief says to commit, and say what you did not run.
+- **One build agent per tree, one at a time.** While an agent owns a checkout, nobody else switches branch, edits or runs cargo there (see "One builder per tree" below). Read-only investigation can fan out.
+- **The main session commits.** It reads the agent's diff and the raw gate output first. A summary that says "green" is not evidence; a piped gate hides its exit code.
+- **Larger changes start as an OpenSpec change** (`openspec/changes/<name>/`: proposal, design, specs, tasks). The specs hold the invariants the work must keep.
+- **Long functions are split by moving, not rewriting.** Split phase-shaped functions at their existing seams; lift a `match` arm into a `handle_*` function as a pure move, checked with `git diff --color-moved=zebra --color-moved-ws=allow-indentation-change`. Cleanups go in a later MR. Keep a dispatch `match` flat and exhaustive: no wildcard arm, so a new variant without a handler fails to compile.
+- **Compile-time claims need a profile.** `scripts/compile-profile.sh <crate>`, before and after, alternating runs back to back. Compare self time with `typeck` as the control; call counts and wall clock under load are noise. The cost is `Send` proofs over large futures, so the fix is a non-generic inherent function returning a boxed future, not a crate split.
+- **Upstream first.** Before adding a SQL function or patching `vendor/`, check whether DataFusion or iceberg-rust already has it. A function that shadows a built-in needs a stated reason (for example Trino semantics).
+
 ## Docs
 
 - `docs/site/` -- published (book -> docs.getsqe.com, ebook, blog). Must stay publish-clean (no secrets or PII); run `make leak-scan` before publishing
-- `docs/internal/` -- working history (specs, plans, reviews, status). Never published
+- `docs/internal/` -- working history (specs, plans, reviews, status). Not on the docs site, but the public GitHub mirror carries it: no secrets, PII, customer or internal host names there either
 - `docs/evidence/` -- generated artifacts (benchmark charts, perf JSON)
 
 ## Build loop
 
-Rebuild time here is dominated by the 24-crate workspace chain, not by rustc: an edit in `sqe-core` recompiles ~15 crates (~1.5–3 min). Keep one feature set and one target dir.
+Rebuild time here is dominated by the 28-crate workspace chain, not by rustc: an edit in `sqe-core` recompiles ~15 crates (~1.5–3 min). Keep one feature set and one target dir.
 
 ```bash
 cargo check-server   # type-check sqe-server only; fastest feedback
@@ -45,15 +56,20 @@ cargo sweep -t 2     # reclaim old artifacts when target/ grows past ~50 GB
 make test-integration                             # full suite
 make test-integration FILTER=test_ctas_roundtrip  # one test
 make test-distributed                             # coordinator + 2 workers
+make test-access-control                          # Ranger access-control e2e
 make test-integration-down                        # tear the stack down
 ```
+
+Read the log for the result, not the task status, and compare a failure against `main` before blaming the branch.
 
 ## Git workflow
 
 - **Never push directly to main** -- feature branch + merge request. `origin` is GitLab; use `glab`, not `gh`. The GitHub remote is a read-only mirror
 - Branch prefixes: `feat/`, `fix/`, `refactor/`, `docs/`, `test/`. One logical change per MR
-- No git worktrees -- use simple branches
+- Feature work uses simple branches in the main checkout, not worktrees. A second checkout is for work that must not disturb a running build (docs, a measurement, a control run); seed its `target/` first (see Build loop) and remove it afterwards
 - Edit source files with the Edit tool, not sed or Python scripts
+- Commit named paths only (no `commit -a`, no stash): the checkout usually holds someone's uncommitted work. Check the commit landed before pushing
+- The author of an MR does not merge it; merging is the maintainer's call
 
 ## After completing work
 
