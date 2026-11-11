@@ -2388,153 +2388,14 @@ impl QueryHandler {
                 )),
 
                 StatementKind::Ctas(stmt) => {
-                    if let Statement::CreateTable(ref ct) = **stmt {
-                        // A Hive external table takes its own path. CTAS is
-                        // TWO operations, and the order is the opposite of the
-                        // INSERT path's:
-                        //
-                        // - manifest first, then data. A failure leaves an
-                        //   empty table: SELECT returns no rows, SHOW CREATE
-                        //   TABLE works, DROP TABLE cleans up, re-running fixes
-                        //   it.
-                        // - data first would leave orphaned files under a path
-                        //   no table names. Nothing could find them, and
-                        //   MSCK REPAIR does not apply because repair needs a
-                        //   manifest to repair.
-                        //
-                        // The INSERT path reasons the other way ("data first,
-                        // the index can only be behind") and that is correct
-                        // THERE, because the table already exists. When it does
-                        // not, the failure modes swap.
-                        if self.is_hive_table(session, &table_reference_of(&ct.name)) {
-                            let (ctx, _) = self.create_session_context(session).await?;
-                            let select_sql =
-                                crate::hive_write::ctas_select_sql(ct).ok_or_else(|| {
-                                    SqeError::with_code(
-                                        SqeErrorCode::ExecutionFailed,
-                                        "CTAS without SELECT query",
-                                    )
-                                })?;
-
-                            // Plan the SELECT for its schema only. The column
-                            // list and the partition-key types both come from
-                            // the query, because a CTAS need not declare them.
-                            // Analyzed, so the columns carry the types the
-                            // load will write (#839).
-                            let schema = sqe_catalog::file_tvf_prepare::plan_sql(&ctx, &select_sql)
-                                .await
-                                .and_then(|df| {
-                                    sqe_catalog::file_tvf_prepare::analyzed_schema(&ctx, df.logical_plan())
-                                })
-                                .map_err(|e| {
-                                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                                        "hive_external: CTAS query does not plan: {e}"
-                                    ))
-                                })?
-                                .as_arrow()
-                                .clone();
-                            let spec = crate::hive_write::ctas_spec(ct, &schema)?;
-
-                            // 1. Manifest.
-                            self.hive_ddl_handler
-                                .create_external_table(session, &spec)
-                                .await?;
-                            crate::session_context::invalidate_session_cache(
-                                &session.user.username,
-                            )
-                            .await;
-
-                            // 2. Data, through the INSERT path, so the fan-out,
-                            // the index refresh and the cache invalidation are
-                            // the same code the plain INSERT uses rather than a
-                            // second copy that could drift.
-                            let load = crate::hive_write::ctas_load_sql(&ct.name, &select_sql);
-                            // Parsed with the same dialect the session uses, so
-                            // the synthesized INSERT cannot parse differently
-                            // from one a client sent.
-                            let load_stmt = sqlparser::parser::Parser::parse_sql(
-                                &sqlparser::dialect::DuckDbDialect {},
-                                &load,
-                            )
-                            .map_err(|e| {
-                                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                                    "hive_external: CTAS load statement does not parse: {e}"
-                                ))
-                            })?
-                            .into_iter()
-                            .next()
-                            .ok_or_else(|| {
-                                SqeError::with_code(SqeErrorCode::ExecutionFailed, "hive_external: CTAS load produced no statement".to_string())
-                            })?;
-                            // Gate the target before any object lands (503).
-                            self.hive_ddl_handler
-                                .refuse_write_if_denied(
-                                    session,
-                                    &table_reference_of(&ct.name),
-                                    "CREATE TABLE AS SELECT",
-                                )
-                                .await?;
-                            // A fresh context: the manifest step above
-                            // invalidated the session cache, so the file
-                            // functions prepared on the old one are gone.
-                            // Without this a Hive CTAS from read_parquet
-                            // failed with "the table function was not
-                            // prepared before planning".
-                            let (load_ctx, _) = self.write_session_context(session, memory).await?;
-                            let written = crate::hive_write::handle_insert(
-                                &load_ctx,
-                                &load_stmt,
-                                &load,
-                                self.policy_enforcer.as_ref(),
-                                &session.user,
-                                &mut policy_summary,
-                            )
-                            .await?;
-                            if let Err(e) = self
-                                .hive_ddl_handler
-                                .refresh_index_after_write(session, &table_reference_of(&ct.name))
-                                .await
-                            {
-                                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                                    "hive_external: the table was created and its rows WERE                                      written, but they are not yet visible: refreshing the                                      partition index failed ({e}). Run `MSCK REPAIR TABLE {}`                                      to make them visible.",
-                                    ct.name
-                                )));
-                            }
-                            crate::session_context::invalidate_session_cache(
-                                &session.user.username,
-                            )
-                            .await;
-                            return Ok(written);
-                        }
-                        if let Some(ref query) = ct.query {
-                            // CREATE OR REPLACE TABLE AS SELECT is handled
-                            // inside the write handler (architecture review
-                            // 500). It used to drop the target here first —
-                            // against the DEFAULT warehouse, whatever catalog
-                            // the name qualified, and before the SELECT had
-                            // even been planned. The handler resolves the
-                            // target catalog, keeps the existing table until
-                            // the new data is written, and only then swaps.
-                            // The post-commit cache invalidation moved with it
-                            // (`WriteHandler::after_commit`, 507).
-                            let select_sql = sqe_sql::rewrite_named_tvf_args(&format!("{query}"));
-                            let (ctx, _) = self.write_session_context(session, memory).await?;
-                            self.write_handler
-                                .handle_ctas_streaming(
-                                    session,
-                                    stmt,
-                                    &ctx,
-                                    &select_sql,
-                                    &mut captured_plan,
-                                    &mut policy_summary,
-                                )
-                                .await
-                        } else {
-                            Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, "CTAS without SELECT query"))
-                        }
-                    } else {
-                        Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, "Expected CreateTable statement"))
-                    }
+                    self.handle_ctas_statement(
+                        session,
+                        stmt,
+                        memory,
+                        &mut captured_plan,
+                        &mut policy_summary,
+                    )
+                    .await
                 }
 
                 StatementKind::Insert(stmt) => {
@@ -3911,6 +3772,172 @@ impl QueryHandler {
                 qcache.invalidate_all();
             }
             result
+        }
+    }
+
+    /// Runs a `CREATE [OR REPLACE] TABLE ... AS SELECT` statement. A target
+    /// that is a Hive external table takes its own path: the manifest is
+    /// created first, then the rows are loaded through the Hive INSERT path,
+    /// and the partition index and session cache are refreshed. Any other
+    /// target goes to the write handler's streaming CTAS, which also owns
+    /// `OR REPLACE`. A statement without a SELECT, or one that is not a
+    /// `CREATE TABLE`, is an error.
+    #[allow(clippy::borrowed_box)]
+    async fn handle_ctas_statement(
+        &self,
+        session: &Session,
+        stmt: &Box<Statement>,
+        memory: &crate::query_memory::StatementMemory,
+        captured_plan: &mut Option<sqe_lineage::PlanOrHint>,
+        policy_summary: &mut Option<sqe_policy::PolicySummary>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        if let Statement::CreateTable(ref ct) = **stmt {
+            // A Hive external table takes its own path. CTAS is
+            // TWO operations, and the order is the opposite of the
+            // INSERT path's:
+            //
+            // - manifest first, then data. A failure leaves an
+            //   empty table: SELECT returns no rows, SHOW CREATE
+            //   TABLE works, DROP TABLE cleans up, re-running fixes
+            //   it.
+            // - data first would leave orphaned files under a path
+            //   no table names. Nothing could find them, and
+            //   MSCK REPAIR does not apply because repair needs a
+            //   manifest to repair.
+            //
+            // The INSERT path reasons the other way ("data first,
+            // the index can only be behind") and that is correct
+            // THERE, because the table already exists. When it does
+            // not, the failure modes swap.
+            if self.is_hive_table(session, &table_reference_of(&ct.name)) {
+                let (ctx, _) = self.create_session_context(session).await?;
+                let select_sql = crate::hive_write::ctas_select_sql(ct).ok_or_else(|| {
+                    SqeError::with_code(SqeErrorCode::ExecutionFailed, "CTAS without SELECT query")
+                })?;
+
+                // Plan the SELECT for its schema only. The column
+                // list and the partition-key types both come from
+                // the query, because a CTAS need not declare them.
+                // Analyzed, so the columns carry the types the
+                // load will write (#839).
+                let schema = sqe_catalog::file_tvf_prepare::plan_sql(&ctx, &select_sql)
+                    .await
+                    .and_then(|df| {
+                        sqe_catalog::file_tvf_prepare::analyzed_schema(&ctx, df.logical_plan())
+                    })
+                    .map_err(|e| {
+                        SqeError::with_code(
+                            SqeErrorCode::ExecutionFailed,
+                            format!("hive_external: CTAS query does not plan: {e}"),
+                        )
+                    })?
+                    .as_arrow()
+                    .clone();
+                let spec = crate::hive_write::ctas_spec(ct, &schema)?;
+
+                // 1. Manifest.
+                self.hive_ddl_handler
+                    .create_external_table(session, &spec)
+                    .await?;
+                crate::session_context::invalidate_session_cache(&session.user.username).await;
+
+                // 2. Data, through the INSERT path, so the fan-out,
+                // the index refresh and the cache invalidation are
+                // the same code the plain INSERT uses rather than a
+                // second copy that could drift.
+                let load = crate::hive_write::ctas_load_sql(&ct.name, &select_sql);
+                // Parsed with the same dialect the session uses, so
+                // the synthesized INSERT cannot parse differently
+                // from one a client sent.
+                let load_stmt = sqlparser::parser::Parser::parse_sql(
+                    &sqlparser::dialect::DuckDbDialect {},
+                    &load,
+                )
+                .map_err(|e| {
+                    SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!("hive_external: CTAS load statement does not parse: {e}"),
+                    )
+                })?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        "hive_external: CTAS load produced no statement".to_string(),
+                    )
+                })?;
+                // Gate the target before any object lands (503).
+                self.hive_ddl_handler
+                    .refuse_write_if_denied(
+                        session,
+                        &table_reference_of(&ct.name),
+                        "CREATE TABLE AS SELECT",
+                    )
+                    .await?;
+                // A fresh context: the manifest step above
+                // invalidated the session cache, so the file
+                // functions prepared on the old one are gone.
+                // Without this a Hive CTAS from read_parquet
+                // failed with "the table function was not
+                // prepared before planning".
+                let (load_ctx, _) = self.write_session_context(session, memory).await?;
+                let written = crate::hive_write::handle_insert(
+                    &load_ctx,
+                    &load_stmt,
+                    &load,
+                    self.policy_enforcer.as_ref(),
+                    &session.user,
+                    &mut *policy_summary,
+                )
+                .await?;
+                if let Err(e) = self
+                    .hive_ddl_handler
+                    .refresh_index_after_write(session, &table_reference_of(&ct.name))
+                    .await
+                {
+                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
+                        "hive_external: the table was created and its rows WERE                                      written, but they are not yet visible: refreshing the                                      partition index failed ({e}). Run `MSCK REPAIR TABLE {}`                                      to make them visible.",
+                        ct.name
+                    )));
+                }
+                crate::session_context::invalidate_session_cache(&session.user.username).await;
+                return Ok(written);
+            }
+            if let Some(ref query) = ct.query {
+                // CREATE OR REPLACE TABLE AS SELECT is handled
+                // inside the write handler (architecture review
+                // 500). It used to drop the target here first —
+                // against the DEFAULT warehouse, whatever catalog
+                // the name qualified, and before the SELECT had
+                // even been planned. The handler resolves the
+                // target catalog, keeps the existing table until
+                // the new data is written, and only then swaps.
+                // The post-commit cache invalidation moved with it
+                // (`WriteHandler::after_commit`, 507).
+                let select_sql = sqe_sql::rewrite_named_tvf_args(&format!("{query}"));
+                let (ctx, _) = self.write_session_context(session, memory).await?;
+                self.write_handler
+                    .handle_ctas_streaming(
+                        session,
+                        stmt,
+                        &ctx,
+                        &select_sql,
+                        &mut *captured_plan,
+                        &mut *policy_summary,
+                    )
+                    .await
+            } else {
+                Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    "CTAS without SELECT query",
+                ))
+            }
+        } else {
+            Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                "Expected CreateTable statement",
+            ))
         }
     }
 
