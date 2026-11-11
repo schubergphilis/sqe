@@ -183,6 +183,14 @@ fn register_trino_aggregate_aliases(ctx: &datafusion::prelude::SessionContext) {
     let variance = (*var_samp_udaf()).clone().with_aliases(["variance"]);
     ctx.register_udaf(variance);
 
+    // arbitrary(x) -> any_value(x). Trino returns an arbitrary non-null
+    // value per group; DataFusion's any_value has the same contract. The
+    // old scalar stub of the same name collapsed a whole batch to its
+    // first non-null value and broke under GROUP BY.
+    use datafusion::functions_aggregate::any_value::any_value_udaf;
+    let arbitrary = (*any_value_udaf()).clone().with_aliases(["arbitrary"]);
+    ctx.register_udaf(arbitrary);
+
     // skewness(x) / kurtosis(x) — Trino higher-moment aggregates. Not
     // DataFusion built-ins; real UDAFs over shared online central moments
     // (count, m1, m2, m3, m4) in crate::central_moments, matching Trino's

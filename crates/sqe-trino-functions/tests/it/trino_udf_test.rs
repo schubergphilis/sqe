@@ -650,6 +650,37 @@ async fn test_arbitrary() {
     assert_eq!(v, Some(42));
 }
 
+/// `arbitrary` is an aggregate: one value per group, skipping NULLs.
+/// The old scalar stub returned one value for the whole batch, so the
+/// GROUP BY below did not even plan.
+#[tokio::test]
+async fn test_arbitrary_group_by() {
+    let ctx = ctx().await;
+    let sql = "SELECT k, arbitrary(v) AS a FROM (VALUES \
+               (1, CAST(NULL AS BIGINT)), (1, 10), (2, 20), (2, 20), (3, CAST(NULL AS BIGINT))) \
+               AS t(k, v) GROUP BY k ORDER BY k";
+    let batches = ctx
+        .sql(sql)
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("run");
+    let got: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            (0..b.num_rows()).map(move |i| {
+                format!(
+                    "{}={}",
+                    array_value_to_string(b.column(0), i).unwrap(),
+                    array_value_to_string(b.column(1), i).unwrap()
+                )
+            })
+        })
+        .collect();
+    assert_eq!(got, vec!["1=10", "2=20", "3="]);
+}
+
 // ═══════════════════════════════════════════════════════════════
 // DataFusion built-in verifications
 // These verify that DataFusion's built-ins work as expected and

@@ -63,8 +63,8 @@ pub fn register_extended_trino_functions(ctx: &datafusion::prelude::SessionConte
     // `MaxBy` and `MinBy` used to live here as scalar stubs that
     // returned the first argument. They now ship as real UDAFs in
     // `aggregates::ArgExtremum` registered alongside the other
-    // Trino aggregate aliases in trino_functions.rs.
-    ctx.register_udf(ScalarUDF::from(Arbitrary));
+    // Trino aggregate aliases in trino_functions.rs. `arbitrary` went
+    // the same way: it is an alias of DataFusion's any_value UDAF.
     ctx.register_udf(ScalarUDF::from(Checksum));
     ctx.register_udf(ScalarUDF::from(TimezoneHour));
     ctx.register_udf(ScalarUDF::from(TimezoneMinute));
@@ -1391,40 +1391,6 @@ impl ScalarUDFImpl for WordStem {
 // ═══════════════════════════════════════════════════════════════════
 // AGGREGATE-LIKE SCALAR ALIASES
 // ═══════════════════════════════════════════════════════════════════
-
-/// arbitrary(x) — Returns the first non-null value (scalar passthrough; aggregate form is first_value).
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct Arbitrary;
-
-impl ScalarUDFImpl for Arbitrary {
-    fn name(&self) -> &str {
-        "arbitrary"
-    }
-    fn signature(&self) -> &Signature {
-        static SIG: LazyLock<Signature> =
-            LazyLock::new(|| Signature::new(TypeSignature::Any(1), Volatility::Immutable));
-        &SIG
-    }
-    fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(arg_types[0].clone())
-    }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        // For scalar: pass through. For array: return first non-null.
-        match &args.args[0] {
-            ColumnarValue::Array(arr) => {
-                for i in 0..arr.len() {
-                    if !arr.is_null(i) {
-                        return Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(arr, i)?));
-                    }
-                }
-                Ok(ColumnarValue::Scalar(ScalarValue::try_from(
-                    arr.data_type(),
-                )?))
-            }
-            other => Ok(other.clone()),
-        }
-    }
-}
 
 // `MaxBy` and `MinBy` used to live here as scalar stubs that returned
 // the first argument. They produced wrong results in any aggregation
