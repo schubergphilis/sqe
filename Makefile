@@ -416,6 +416,9 @@ dast:  ## DAST baseline: OWASP ZAP against a local sqe-server's HTTP listener (n
 check-test-layout:  ## One integration-test binary per crate (tests/it/main.rs); each extra tests/*.rs relinks DataFusion
 	@scripts/check-test-layout.sh
 
+check-budgets:  ## Size and structure budgets (.config/budgets.json): lines per file and crate, first-party edges, Cargo.lock size
+	@$(CARGO) xtask budgets --check
+
 audit-deny:
 	@command -v cargo-deny >/dev/null 2>&1 || \
 		{ echo "cargo-deny not found. Install with: cargo install cargo-deny"; exit 1; }

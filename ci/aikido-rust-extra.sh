@@ -17,6 +17,7 @@ if [ "$profile" = "minimal" ]; then
   echo "(label the MR ci::full and run a new pipeline to get them)"
   cargo xtask matrix-report --min-percent 50
   cargo xtask test-groups --check
+  cargo xtask budgets --check
   exit 0
 fi
 
@@ -42,6 +43,11 @@ cargo xtask matrix-report --min-percent 50
 # Every #[ignore] must name the stack it needs (finding 807): a bare #[ignore]
 # or a reason outside the vocabulary in xtask/src/test_groups.rs fails here.
 cargo xtask test-groups --check
+
+# Size and structure budgets (.config/budgets.json): lines per file and crate,
+# the first-party dependency edges and the Cargo.lock size. Reads the tree and
+# `cargo metadata --no-deps`; compiles nothing beyond xtask itself.
+cargo xtask budgets --check
 
 # The workspace-hack crate must match the dependency graph, or per-crate builds
 # silently fall back to their own feature resolution and the 38-copies problem

@@ -1,0 +1,245 @@
+{
+  "file_lines_default": 3000,
+  "files": {
+    "crates/sqe-bench/src/generate/tpcds.rs": 5250,
+    "crates/sqe-catalog/src/hive/provider.rs": 3500,
+    "crates/sqe-catalog/src/iceberg_scan.rs": 5750,
+    "crates/sqe-catalog/src/rest_catalog.rs": 8000,
+    "crates/sqe-cli/src/embedded.rs": 5250,
+    "crates/sqe-coordinator/src/distributed_scan.rs": 4000,
+    "crates/sqe-coordinator/src/flight_sql.rs": 5000,
+    "crates/sqe-coordinator/src/maintenance.rs": 6250,
+    "crates/sqe-coordinator/src/maintenance_scheduler.rs": 4000,
+    "crates/sqe-coordinator/src/query_handler.rs": 13500,
+    "crates/sqe-core/src/config/mod.rs": 12500,
+    "crates/sqe-mcp/src/lib.rs": 5750,
+    "crates/sqe-policy/src/grants/ranger.rs": 4250,
+    "crates/sqe-policy/src/ranger_store.rs": 4750,
+    "crates/sqe-server/src/main.rs": 5250,
+    "crates/sqe-sql/src/classifier.rs": 4250,
+    "crates/sqe-trino-compat/src/server.rs": 7000,
+    "crates/sqe-trino-functions/src/trino_functions.rs": 3750,
+    "crates/sqe-worker/src/executor.rs": 3750,
+    "crates/sqe-worker/src/flight_service.rs": 3500,
+    "crates/sqe-write/src/catalog_ops.rs": 3750,
+    "crates/sqe-write/src/write_handler.rs": 16000
+  },
+  "crates": {
+    "sqe-auth": {
+      "lines": 12000,
+      "deps": [
+        "sqe-core"
+      ]
+    },
+    "sqe-bench": {
+      "lines": 25000,
+      "deps": [
+        "sqe-trino-protocol"
+      ]
+    },
+    "sqe-catalog": {
+      "lines": 64000,
+      "deps": [
+        "sqe-core",
+        "sqe-geo",
+        "sqe-metrics-core",
+        "sqe-policy-api",
+        "sqe-sql",
+        "sqe-trino-functions"
+      ]
+    },
+    "sqe-cli": {
+      "lines": 9000,
+      "deps": [
+        "sqe-catalog",
+        "sqe-core",
+        "sqe-geo",
+        "sqe-policy",
+        "sqe-sql",
+        "sqe-trino-functions",
+        "sqe-trino-protocol",
+        "sqe-write"
+      ]
+    },
+    "sqe-compaction": {
+      "lines": 8000,
+      "deps": [
+        "sqe-core",
+        "sqe-metrics-core"
+      ]
+    },
+    "sqe-coordinator": {
+      "lines": 68000,
+      "deps": [
+        "sqe-auth",
+        "sqe-catalog",
+        "sqe-compaction",
+        "sqe-core",
+        "sqe-geo",
+        "sqe-lineage",
+        "sqe-mcp",
+        "sqe-metrics",
+        "sqe-planner",
+        "sqe-policy",
+        "sqe-quack-client",
+        "sqe-quack-server",
+        "sqe-sql",
+        "sqe-trino-compat",
+        "sqe-trino-functions",
+        "sqe-write"
+      ]
+    },
+    "sqe-core": {
+      "lines": 25000,
+      "deps": []
+    },
+    "sqe-geo": {
+      "lines": 3000,
+      "deps": []
+    },
+    "sqe-lineage": {
+      "lines": 4000,
+      "deps": [
+        "sqe-core",
+        "sqe-metrics"
+      ]
+    },
+    "sqe-mcp": {
+      "lines": 7000,
+      "deps": [
+        "sqe-auth",
+        "sqe-core",
+        "sqe-metrics-core",
+        "sqe-sql",
+        "sqe-trino-protocol"
+      ]
+    },
+    "sqe-metrics": {
+      "lines": 9000,
+      "deps": [
+        "sqe-metrics-core"
+      ]
+    },
+    "sqe-metrics-core": {
+      "lines": 4000,
+      "deps": []
+    },
+    "sqe-planner": {
+      "lines": 9000,
+      "deps": [
+        "sqe-core",
+        "sqe-spill"
+      ]
+    },
+    "sqe-policy": {
+      "lines": 18000,
+      "deps": [
+        "sqe-core",
+        "sqe-metrics-core",
+        "sqe-policy-api",
+        "sqe-sql"
+      ]
+    },
+    "sqe-policy-api": {
+      "lines": 2000,
+      "deps": [
+        "sqe-core",
+        "sqe-sql"
+      ]
+    },
+    "sqe-quack-client": {
+      "lines": 2000,
+      "deps": [
+        "sqe-quack-wire"
+      ]
+    },
+    "sqe-quack-server": {
+      "lines": 3000,
+      "deps": [
+        "sqe-auth",
+        "sqe-core",
+        "sqe-metrics-core",
+        "sqe-quack-wire"
+      ]
+    },
+    "sqe-quack-wire": {
+      "lines": 8000,
+      "deps": []
+    },
+    "sqe-server": {
+      "lines": 6000,
+      "deps": [
+        "sqe-auth",
+        "sqe-catalog",
+        "sqe-coordinator",
+        "sqe-core",
+        "sqe-lineage",
+        "sqe-metrics",
+        "sqe-policy",
+        "sqe-quack-server",
+        "sqe-sql",
+        "sqe-trino-compat",
+        "sqe-worker"
+      ]
+    },
+    "sqe-spill": {
+      "lines": 3000,
+      "deps": []
+    },
+    "sqe-sql": {
+      "lines": 23000,
+      "deps": [
+        "sqe-core"
+      ]
+    },
+    "sqe-trino-compat": {
+      "lines": 11000,
+      "deps": [
+        "sqe-auth",
+        "sqe-core",
+        "sqe-metrics-core",
+        "sqe-sql",
+        "sqe-trino-protocol"
+      ]
+    },
+    "sqe-trino-functions": {
+      "lines": 13000,
+      "deps": [
+        "sqe-trino-protocol"
+      ]
+    },
+    "sqe-trino-protocol": {
+      "lines": 5000,
+      "deps": []
+    },
+    "sqe-worker": {
+      "lines": 12000,
+      "deps": [
+        "sqe-catalog",
+        "sqe-compaction",
+        "sqe-core",
+        "sqe-geo",
+        "sqe-metrics",
+        "sqe-planner",
+        "sqe-spill"
+      ]
+    },
+    "sqe-write": {
+      "lines": 28000,
+      "deps": [
+        "sqe-catalog",
+        "sqe-compaction",
+        "sqe-core",
+        "sqe-lineage",
+        "sqe-metrics-core",
+        "sqe-planner",
+        "sqe-policy",
+        "sqe-sql"
+      ]
+    }
+  },
+  "lock": {
+    "packages": 825,
+    "duplicate_names": 50
+  }
+}
