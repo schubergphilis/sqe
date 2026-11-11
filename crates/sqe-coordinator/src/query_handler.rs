@@ -2262,83 +2262,8 @@ impl QueryHandler {
                 // below: snapshots are shared state, so INSERT/DELETE/UPDATE/MERGE
                 // must invalidate every user's snapshot-bound TableProvider.
                 StatementKind::Drop(stmt) => {
-                    // DROP TABLE supports multiple names, but (like
-                    // `catalog_ops.drop_table` below) only the first is
-                    // acted on; a mixed Hive/Iceberg multi-name drop is not
-                    // a new problem this branch introduces.
-                    // Lineage: the dropped table is the output dataset, with
-                    // the `lifecycleStateChange: DROP` facet. Recorded before
-                    // the drop so a failed DROP's FAIL event names it too.
-                    // `DROP TABLE IF EXISTS` of a missing table still emits
-                    // it: `drop_table` does not say whether anything existed.
-                    if let Statement::Drop { names, .. } = stmt.as_ref() {
-                        if let Some(name) = names.first() {
-                            captured_plan = Some(lineage_lifecycle_hint(
-                                &self.config,
-                                session,
-                                name,
-                                sqe_lineage::event::lifecycle::DROP,
-                            ));
-                        }
-                    }
-                    let hive_drop = if let Statement::Drop {
-                        names,
-                        if_exists,
-                        purge,
-                        ..
-                    } = stmt.as_ref()
-                    {
-                        names
-                            .first()
-                            .map(|name| (table_reference_of(name), *if_exists, *purge))
-                    } else {
-                        None
-                    };
-                    let routed_to_hive =
-                        match &hive_drop {
-                            Some((table_ref, if_exists, purge))
-                                if matches!(
-                                    self.hive_ddl_handler.resolve_table_kind(table_ref),
-                                    crate::hive_ddl_handler::TableKind::Hive { .. }
-                                ) =>
-                            {
-                                match self
-                                .hive_ddl_handler
-                                .drop_table(session, table_ref, *purge)
-                                .await
-                            {
-                                Ok(()) => true,
-                                Err(e)
-                                    if *if_exists
-                                        && crate::hive_ddl_handler::hive_drop_target_missing(&e) =>
-                                {
-                                    true
-                                }
-                                Err(e) => return Err(e),
-                            }
-                            }
-                            _ => false,
-                        };
-                    let purge = matches!(stmt.as_ref(), Statement::Drop { purge: true, .. });
-                    if !routed_to_hive && purge {
-                        // `PURGE` runs `system.drop_table(purge => true)`
-                        // through the procedure entry (#841), so it takes the
-                        // same admin gate, shared-location refusal and purge
-                        // audit as the CALL. A catalog DROP grant alone drops
-                        // without PURGE.
-                        if let Some(table) = self.catalog_ops.purge_target(session, stmt).await? {
-                            let call = sqe_sql::ProcedureCall::DropTable { table, purge: true };
-                            let purged = self.maintenance_handler.handle(session, &call).await;
-                            purged.map_err(sql_purge_denial)?;
-                            if let Some(ref qcache) = self.query_cache {
-                                qcache.invalidate_all();
-                            }
-                        }
-                    } else if !routed_to_hive {
-                        self.catalog_ops.drop_table(session, stmt).await?;
-                    }
-                    crate::session_context::invalidate_session_cache(&session.user.username).await;
-                    Ok(vec![])
+                    self.handle_drop_statement(session, stmt, &mut captured_plan)
+                        .await
                 }
                 StatementKind::Rename(stmt) => {
                     if let Statement::AlterTable(ref alter) = **stmt {
@@ -3820,6 +3745,92 @@ impl QueryHandler {
         }
 
         result
+    }
+
+    /// Runs `DROP TABLE`: records the lineage hint, routes to the Hive or
+    /// Iceberg catalog (or the PURGE procedure) and invalidates the session cache.
+    #[allow(clippy::borrowed_box)]
+    async fn handle_drop_statement(
+        &self,
+        session: &Session,
+        stmt: &Box<Statement>,
+        captured_plan: &mut Option<sqe_lineage::PlanOrHint>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // DROP TABLE supports multiple names, but (like
+        // `catalog_ops.drop_table` below) only the first is
+        // acted on; a mixed Hive/Iceberg multi-name drop is not
+        // a new problem this branch introduces.
+        // Lineage: the dropped table is the output dataset, with
+        // the `lifecycleStateChange: DROP` facet. Recorded before
+        // the drop so a failed DROP's FAIL event names it too.
+        // `DROP TABLE IF EXISTS` of a missing table still emits
+        // it: `drop_table` does not say whether anything existed.
+        if let Statement::Drop { names, .. } = stmt.as_ref() {
+            if let Some(name) = names.first() {
+                *captured_plan = Some(lineage_lifecycle_hint(
+                    &self.config,
+                    session,
+                    name,
+                    sqe_lineage::event::lifecycle::DROP,
+                ));
+            }
+        }
+        let hive_drop = if let Statement::Drop {
+            names,
+            if_exists,
+            purge,
+            ..
+        } = stmt.as_ref()
+        {
+            names
+                .first()
+                .map(|name| (table_reference_of(name), *if_exists, *purge))
+        } else {
+            None
+        };
+        let routed_to_hive = match &hive_drop {
+            Some((table_ref, if_exists, purge))
+                if matches!(
+                    self.hive_ddl_handler.resolve_table_kind(table_ref),
+                    crate::hive_ddl_handler::TableKind::Hive { .. }
+                ) =>
+            {
+                match self
+                    .hive_ddl_handler
+                    .drop_table(session, table_ref, *purge)
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(e)
+                        if *if_exists && crate::hive_ddl_handler::hive_drop_target_missing(&e) =>
+                    {
+                        true
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            _ => false,
+        };
+        let purge = matches!(stmt.as_ref(), Statement::Drop { purge: true, .. });
+        if !routed_to_hive && purge {
+            // `PURGE` runs `system.drop_table(purge => true)`
+            // through the procedure entry (#841), so it takes the
+            // same admin gate, shared-location refusal and purge
+            // audit as the CALL. A catalog DROP grant alone drops
+            // without PURGE.
+            if let Some(table) = self.catalog_ops.purge_target(session, stmt).await? {
+                let call = sqe_sql::ProcedureCall::DropTable { table, purge: true };
+                let purged = self.maintenance_handler.handle(session, &call).await;
+                purged.map_err(sql_purge_denial)?;
+                if let Some(ref qcache) = self.query_cache {
+                    qcache.invalidate_all();
+                }
+            }
+        } else if !routed_to_hive {
+            self.catalog_ops.drop_table(session, stmt).await?;
+        }
+        crate::session_context::invalidate_session_cache(&session.user.username).await;
+        Ok(vec![])
     }
 
     /// Plan and open a streaming SELECT without buffering the result.
