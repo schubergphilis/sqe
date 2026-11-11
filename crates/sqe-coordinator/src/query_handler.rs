@@ -2746,146 +2746,8 @@ impl QueryHandler {
                 // the call completes so the next query rebuilds the context
                 // against the fresh Polaris metadata.
                 StatementKind::Procedure(ref call) => {
-                    // O5: emit the maintenance target as a lineage dataset. The
-                    // procedure reads and rewrites its own table, so the target
-                    // is recorded as both input and output (extract_from_hint).
-                    if let Some(table) = call.table() {
-                        let catalog = table
-                            .catalog
-                            .clone()
-                            .or_else(|| session.default_catalog.clone())
-                            .unwrap_or_else(|| self.config.resolve_default_catalog());
-                        captured_plan = Some(sqe_lineage::PlanOrHint::Hint(
-                            sqe_lineage::LineageHint::MaintenanceTable {
-                                catalog,
-                                schema: table.namespace.clone(),
-                                table: table.name.clone(),
-                            },
-                        ));
-                    }
-                    if let sqe_sql::ProcedureCall::ReprojectColumnTags { ref scope } = **call {
-                        // Admin-only Ranger write. Iceberg is not mutated, so
-                        // the maintenance write-privilege + snapshot-cache
-                        // invalidation path is the wrong gate and the wrong
-                        // follow-up. require_admin uses [auth] admin_roles.
-                        self.require_admin(session, "CALL system.reproject_column_tags")?;
-                        self.catalog_ops.reproject_column_tags(session, scope).await
-                    } else if let sqe_sql::ProcedureCall::RefreshCatalogCache { table, schema } =
-                        &**call
-                    {
-                        // Self-scoped catalog refresh. NOT a table maintenance
-                        // op: it skips the table-scoped maintenance
-                        // authorization + lineage path, and it must NOT touch
-                        // any process-global cache, or an unprivileged SQL user
-                        // could force a cross-tenant flush. So it drops ONLY the
-                        // caller's own SessionContext -- no REST-catalog drop, no
-                        // result-cache wipe (both of those are global). The
-                        // caller's next query rebuilds its SessionContext and
-                        // re-enumerates catalogs; a newly created catalog is a
-                        // fresh REST-catalog key, so the rebuild discovers it
-                        // without a global REST drop. The global rebind case is
-                        // the admin-gated `POST /api/v1/catalogs/refresh`.
-                        //
-                        // The shared TableMetadataCache is deliberately NOT
-                        // dropped here: `invalidate_all` is process-global and
-                        // would let any authenticated user flush every tenant's
-                        // entries. It caches present tables only (no negative
-                        // caching), so a freshly created table has nothing to
-                        // evict, and the session-cache drop above already
-                        // rebuilds this caller's namespace snapshot. The global
-                        // table-cache drop lives in `api_catalogs_refresh`.
-                        //
-                        // The Hive manifest cache is the exception (issue
-                        // #666): a `table =>` / `schema =>` argument drops
-                        // that scope's manifests. Those entries are shared
-                        // across sessions but hold no per-user data (the
-                        // policy layer decides per user on top of them), and
-                        // the cost is bounded by the scope named, the same
-                        // invalidation every DDL on the table performs. A
-                        // scope in a catalog that is not a Hive root drops
-                        // nothing here; the session drop below still
-                        // rebuilds the caller's view of it.
-                        let mut scope_label = format!("session:{}", session.user.username);
-                        if let Some(t) = table {
-                            let is_hive = t
-                                .catalog
-                                .as_deref()
-                                .map(|c| self.runtime_catalogs.is_hive_root(c).unwrap_or(false))
-                                .unwrap_or(false);
-                            if is_hive {
-                                self.hive_manifest_cache.invalidate(&t.namespace, &t.name);
-                            }
-                            scope_label = format!("{scope_label},table:{}", t.as_string());
-                        }
-                        if let Some(ns) = schema {
-                            let is_hive = ns
-                                .catalog
-                                .as_deref()
-                                .map(|c| self.runtime_catalogs.is_hive_root(c).unwrap_or(false))
-                                .unwrap_or(false);
-                            if is_hive {
-                                self.hive_manifest_cache.invalidate_database(&ns.namespace);
-                            }
-                            scope_label = format!("{scope_label},schema:{}", ns.as_string());
-                        }
-                        crate::session_context::invalidate_session_cache(&session.user.username)
-                            .await;
-                        let schema = Arc::new(Schema::new(vec![
-                            Field::new("scope", DataType::Utf8, false),
-                            Field::new("status", DataType::Utf8, false),
-                        ]));
-                        RecordBatch::try_new(
-                            schema,
-                            vec![
-                                Arc::new(arrow_array::StringArray::from(vec![scope_label])),
-                                Arc::new(arrow_array::StringArray::from(vec!["refreshed"])),
-                            ],
-                        )
-                        .map(|b| vec![b])
-                        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))
-                    } else {
-                        // `table_health` is a read-only report the maintenance
-                        // tier lets through without a privilege check; a
-                        // table the caller is fully denied stays "not found".
-                        if let sqe_sql::ProcedureCall::TableHealth { table } = &**call {
-                            let catalog = table
-                                .catalog
-                                .clone()
-                                .unwrap_or_else(|| self.session_catalog_name(session));
-                            deny_hidden_metadata_tvf_targets(
-                                self.policy_store.as_deref(),
-                                &session.user,
-                                self.config.policy.mask_precedence,
-                                &catalog,
-                                &[(table.namespace.clone(), table.name.clone())],
-                            )
-                            .await?;
-                        }
-                        let result = self.maintenance_handler.handle(session, call).await;
-
-                        // Maintenance procedures rewrite the table's snapshot
-                        // history. Two caches must drop their entries before the
-                        // next read or the user sees stale results:
-                        //
-                        // 1. SESSION_CONTEXT_CACHE keeps a per-user DataFusion
-                        //    SessionContext. Its registered table_files /
-                        //    table_snapshots TVFs return MemTables built from the
-                        //    pre-rewrite metadata. moka's remove + flush of
-                        //    pending tasks drops the entry immediately.
-                        // 2. ResultCache (query_cache) keys by SQL text. The
-                        //    per-table invalidation does NOT cover queries that
-                        //    referenced the table through a TVF: the TableScan
-                        //    carries the function name (`table_files`) rather
-                        //    than the Iceberg identifier. Nuke the whole result
-                        //    cache after a procedure: maintenance procedures are
-                        //    rare and the cache rebuilds cheaply on next read.
-                        crate::session_context::invalidate_session_cache(&session.user.username)
-                            .await;
-                        if let Some(ref qcache) = self.query_cache {
-                            qcache.invalidate_all();
-                        }
-                        result
-                    }
+                    self.handle_procedure_statement(session, call, &mut captured_plan)
+                        .await
                 }
 
                 // COMMENT ON TABLE/COLUMN — store as Iceberg table property
@@ -3897,6 +3759,158 @@ impl QueryHandler {
             Err(SqeError::NotImplemented(format!(
                 "Utility statement not supported: {stmt}"
             )))
+        }
+    }
+
+    /// Runs a `CALL system.<procedure>(...)` statement. It records the
+    /// maintenance target as a lineage hint, then takes one of three paths:
+    /// `reproject_column_tags` is an admin-only Ranger write,
+    /// `refresh_catalog_cache` drops only the caller's own session context
+    /// (and the Hive manifest cache for a named scope), and every other
+    /// procedure goes to the maintenance handler, after which the caller's
+    /// session cache and the whole result cache are invalidated.
+    #[allow(clippy::borrowed_box)]
+    async fn handle_procedure_statement(
+        &self,
+        session: &Session,
+        call: &Box<sqe_sql::ProcedureCall>,
+        captured_plan: &mut Option<sqe_lineage::PlanOrHint>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // O5: emit the maintenance target as a lineage dataset. The
+        // procedure reads and rewrites its own table, so the target
+        // is recorded as both input and output (extract_from_hint).
+        if let Some(table) = call.table() {
+            let catalog = table
+                .catalog
+                .clone()
+                .or_else(|| session.default_catalog.clone())
+                .unwrap_or_else(|| self.config.resolve_default_catalog());
+            *captured_plan = Some(sqe_lineage::PlanOrHint::Hint(
+                sqe_lineage::LineageHint::MaintenanceTable {
+                    catalog,
+                    schema: table.namespace.clone(),
+                    table: table.name.clone(),
+                },
+            ));
+        }
+        if let sqe_sql::ProcedureCall::ReprojectColumnTags { ref scope } = **call {
+            // Admin-only Ranger write. Iceberg is not mutated, so
+            // the maintenance write-privilege + snapshot-cache
+            // invalidation path is the wrong gate and the wrong
+            // follow-up. require_admin uses [auth] admin_roles.
+            self.require_admin(session, "CALL system.reproject_column_tags")?;
+            self.catalog_ops.reproject_column_tags(session, scope).await
+        } else if let sqe_sql::ProcedureCall::RefreshCatalogCache { table, schema } = &**call {
+            // Self-scoped catalog refresh. NOT a table maintenance
+            // op: it skips the table-scoped maintenance
+            // authorization + lineage path, and it must NOT touch
+            // any process-global cache, or an unprivileged SQL user
+            // could force a cross-tenant flush. So it drops ONLY the
+            // caller's own SessionContext -- no REST-catalog drop, no
+            // result-cache wipe (both of those are global). The
+            // caller's next query rebuilds its SessionContext and
+            // re-enumerates catalogs; a newly created catalog is a
+            // fresh REST-catalog key, so the rebuild discovers it
+            // without a global REST drop. The global rebind case is
+            // the admin-gated `POST /api/v1/catalogs/refresh`.
+            //
+            // The shared TableMetadataCache is deliberately NOT
+            // dropped here: `invalidate_all` is process-global and
+            // would let any authenticated user flush every tenant's
+            // entries. It caches present tables only (no negative
+            // caching), so a freshly created table has nothing to
+            // evict, and the session-cache drop above already
+            // rebuilds this caller's namespace snapshot. The global
+            // table-cache drop lives in `api_catalogs_refresh`.
+            //
+            // The Hive manifest cache is the exception (issue
+            // #666): a `table =>` / `schema =>` argument drops
+            // that scope's manifests. Those entries are shared
+            // across sessions but hold no per-user data (the
+            // policy layer decides per user on top of them), and
+            // the cost is bounded by the scope named, the same
+            // invalidation every DDL on the table performs. A
+            // scope in a catalog that is not a Hive root drops
+            // nothing here; the session drop below still
+            // rebuilds the caller's view of it.
+            let mut scope_label = format!("session:{}", session.user.username);
+            if let Some(t) = table {
+                let is_hive = t
+                    .catalog
+                    .as_deref()
+                    .map(|c| self.runtime_catalogs.is_hive_root(c).unwrap_or(false))
+                    .unwrap_or(false);
+                if is_hive {
+                    self.hive_manifest_cache.invalidate(&t.namespace, &t.name);
+                }
+                scope_label = format!("{scope_label},table:{}", t.as_string());
+            }
+            if let Some(ns) = schema {
+                let is_hive = ns
+                    .catalog
+                    .as_deref()
+                    .map(|c| self.runtime_catalogs.is_hive_root(c).unwrap_or(false))
+                    .unwrap_or(false);
+                if is_hive {
+                    self.hive_manifest_cache.invalidate_database(&ns.namespace);
+                }
+                scope_label = format!("{scope_label},schema:{}", ns.as_string());
+            }
+            crate::session_context::invalidate_session_cache(&session.user.username).await;
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("scope", DataType::Utf8, false),
+                Field::new("status", DataType::Utf8, false),
+            ]));
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(arrow_array::StringArray::from(vec![scope_label])),
+                    Arc::new(arrow_array::StringArray::from(vec!["refreshed"])),
+                ],
+            )
+            .map(|b| vec![b])
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))
+        } else {
+            // `table_health` is a read-only report the maintenance
+            // tier lets through without a privilege check; a
+            // table the caller is fully denied stays "not found".
+            if let sqe_sql::ProcedureCall::TableHealth { table } = &**call {
+                let catalog = table
+                    .catalog
+                    .clone()
+                    .unwrap_or_else(|| self.session_catalog_name(session));
+                deny_hidden_metadata_tvf_targets(
+                    self.policy_store.as_deref(),
+                    &session.user,
+                    self.config.policy.mask_precedence,
+                    &catalog,
+                    &[(table.namespace.clone(), table.name.clone())],
+                )
+                .await?;
+            }
+            let result = self.maintenance_handler.handle(session, call).await;
+
+            // Maintenance procedures rewrite the table's snapshot
+            // history. Two caches must drop their entries before the
+            // next read or the user sees stale results:
+            //
+            // 1. SESSION_CONTEXT_CACHE keeps a per-user DataFusion
+            //    SessionContext. Its registered table_files /
+            //    table_snapshots TVFs return MemTables built from the
+            //    pre-rewrite metadata. moka's remove + flush of
+            //    pending tasks drops the entry immediately.
+            // 2. ResultCache (query_cache) keys by SQL text. The
+            //    per-table invalidation does NOT cover queries that
+            //    referenced the table through a TVF: the TableScan
+            //    carries the function name (`table_files`) rather
+            //    than the Iceberg identifier. Nuke the whole result
+            //    cache after a procedure: maintenance procedures are
+            //    rare and the cache rebuilds cheaply on next read.
+            crate::session_context::invalidate_session_cache(&session.user.username).await;
+            if let Some(ref qcache) = self.query_cache {
+                qcache.invalidate_all();
+            }
+            result
         }
     }
 
