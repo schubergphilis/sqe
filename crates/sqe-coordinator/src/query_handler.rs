@@ -3137,75 +3137,16 @@ impl QueryHandler {
                 }
 
                 StatementKind::Merge(stmt) => {
-                    // Extract source SQL from the MERGE statement and execute it
-                    // to get the source batches, then pass them to the write handler.
-                    let source_sql = if let Statement::Merge(merge) = stmt.as_ref() {
-                        merge_source_sql(&merge.source)?
-                    } else {
-                        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, "Expected MERGE statement"));
-                    };
-                    // Capture the MERGE source plan from `execute_query`. The
-                    // lineage for a MERGE event should describe the source's
-                    // TableScans as inputs and the target as the output, so
-                    // the write handler re-wraps this source plan as a
-                    // synthetic INSERT against the target.
-                    let mut merge_source_plan: Option<sqe_lineage::PlanOrHint> = None;
-                    // The MERGE source's policy summary is recorded against the
-                    // outer MERGE statement's audit entry via `policy_summary`.
-                    let source_batches = self
-                        .execute_query(
-                            session,
-                            &source_sql,
-                            &query_id,
-                            memory,
-                            &plan_metrics,
-                            &mut merge_source_plan,
-                            &mut policy_summary,
-                        )
-                        .await?;
-                    // The collected source keeps its reservation in the
-                    // statement's pool, and the target rewrite reserves from
-                    // the same pool: one MERGE, one quota (#788).
-                    let (ctx, session_catalog) = self.write_session_context(session, memory).await?;
-                    let merge_source_logical = match merge_source_plan {
-                        Some(sqe_lineage::PlanOrHint::Plan(p)) => Some(*p),
-                        _ => None,
-                    };
-                    // A source that returned zero batches carries no schema, but
-                    // WHEN NOT MATCHED BY SOURCE still has to run against the
-                    // whole target (architecture review 501). Hand the write
-                    // handler the source plan's Arrow schema so it can register
-                    // an empty but typed source relation.
-                    let merge_source_schema = merge_source_logical
-                        .as_ref()
-                        .map(|p| Arc::new(p.schema().as_arrow().clone()));
-                    // Dispatch on `write.merge.mode` table property. Default CoW
-                    // matches prior behaviour; `merge-on-read` routes to the
-                    // equality-delete path when the target has a declared PK.
-                    // The target's own policy (row filter / masks, 202) is
-                    // audited together with the source summary above.
-                    let mut target_summary: Option<sqe_policy::PolicySummary> = None;
-                    let merged = self
-                        .write_handler
-                        .handle_merge_dispatch(
-                            session,
-                            stmt,
-                            source_batches,
-                            merge_source_schema,
-                            session_catalog,
-                            &ctx,
-                            merge_source_logical,
-                            &mut captured_plan,
-                            &mut target_summary,
-                        )
-                        .await;
-                    if let Some(target) = target_summary {
-                        match policy_summary.as_mut() {
-                            Some(source) => source.merge(&target),
-                            None => policy_summary = Some(target),
-                        }
-                    }
-                    merged
+                    self.handle_merge_statement(
+                        session,
+                        stmt,
+                        query_id,
+                        memory,
+                        &plan_metrics,
+                        &mut captured_plan,
+                        &mut policy_summary,
+                    )
+                    .await
                 }
 
                 // Coordinator-wide DDL — ATTACH / DETACH mount and unmount
@@ -3831,6 +3772,93 @@ impl QueryHandler {
         }
         crate::session_context::invalidate_session_cache(&session.user.username).await;
         Ok(vec![])
+    }
+
+    /// Runs `MERGE INTO`: executes the source query, then hands its batches
+    /// to the write handler's merge dispatch and merges the policy summaries.
+    #[allow(clippy::borrowed_box, clippy::too_many_arguments)]
+    async fn handle_merge_statement(
+        &self,
+        session: &Session,
+        stmt: &Box<Statement>,
+        query_id: uuid::Uuid,
+        memory: &crate::query_memory::StatementMemory,
+        plan_metrics: &Arc<Mutex<PlanMetrics>>,
+        captured_plan: &mut Option<sqe_lineage::PlanOrHint>,
+        policy_summary: &mut Option<sqe_policy::PolicySummary>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // Extract source SQL from the MERGE statement and execute it
+        // to get the source batches, then pass them to the write handler.
+        let source_sql = if let Statement::Merge(merge) = stmt.as_ref() {
+            merge_source_sql(&merge.source)?
+        } else {
+            return Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                "Expected MERGE statement",
+            ));
+        };
+        // Capture the MERGE source plan from `execute_query`. The
+        // lineage for a MERGE event should describe the source's
+        // TableScans as inputs and the target as the output, so
+        // the write handler re-wraps this source plan as a
+        // synthetic INSERT against the target.
+        let mut merge_source_plan: Option<sqe_lineage::PlanOrHint> = None;
+        // The MERGE source's policy summary is recorded against the
+        // outer MERGE statement's audit entry via `policy_summary`.
+        let source_batches = self
+            .execute_query(
+                session,
+                &source_sql,
+                &query_id,
+                memory,
+                plan_metrics,
+                &mut merge_source_plan,
+                &mut *policy_summary,
+            )
+            .await?;
+        // The collected source keeps its reservation in the
+        // statement's pool, and the target rewrite reserves from
+        // the same pool: one MERGE, one quota (#788).
+        let (ctx, session_catalog) = self.write_session_context(session, memory).await?;
+        let merge_source_logical = match merge_source_plan {
+            Some(sqe_lineage::PlanOrHint::Plan(p)) => Some(*p),
+            _ => None,
+        };
+        // A source that returned zero batches carries no schema, but
+        // WHEN NOT MATCHED BY SOURCE still has to run against the
+        // whole target (architecture review 501). Hand the write
+        // handler the source plan's Arrow schema so it can register
+        // an empty but typed source relation.
+        let merge_source_schema = merge_source_logical
+            .as_ref()
+            .map(|p| Arc::new(p.schema().as_arrow().clone()));
+        // Dispatch on `write.merge.mode` table property. Default CoW
+        // matches prior behaviour; `merge-on-read` routes to the
+        // equality-delete path when the target has a declared PK.
+        // The target's own policy (row filter / masks, 202) is
+        // audited together with the source summary above.
+        let mut target_summary: Option<sqe_policy::PolicySummary> = None;
+        let merged = self
+            .write_handler
+            .handle_merge_dispatch(
+                session,
+                stmt,
+                source_batches,
+                merge_source_schema,
+                session_catalog,
+                &ctx,
+                merge_source_logical,
+                &mut *captured_plan,
+                &mut target_summary,
+            )
+            .await;
+        if let Some(target) = target_summary {
+            match policy_summary.as_mut() {
+                Some(source) => source.merge(&target),
+                None => *policy_summary = Some(target),
+            }
+        }
+        merged
     }
 
     /// Plan and open a streaming SELECT without buffering the result.
