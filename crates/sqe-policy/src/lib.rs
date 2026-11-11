@@ -176,15 +176,40 @@ impl PolicyEnforcer for PassthroughEnforcer {
         Some("passthrough".to_string())
     }
 
-    async fn evaluate(
-        &self,
-        _user: &SessionUser,
-        _scope: &TableScope,
+    // Written out the way `#[async_trait]` expands it. As an `async fn` the
+    // method is a coroutine that owns `plan`, and proving that coroutine
+    // `Send` walks the whole `LogicalPlan` type graph in this method's own
+    // parameter environment (2.2 s of this crate's compile). The free
+    // function has no generics, so its proof is shared with every other
+    // non-generic future in the crate.
+    fn evaluate<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        _user: &'life1 SessionUser,
+        _scope: &'life2 TableScope,
         plan: LogicalPlan,
-    ) -> sqe_core::Result<(LogicalPlan, PolicySummary)> {
-        Ok((plan, PolicySummary::default()))
+    ) -> BoxedFuture<'async_trait, sqe_core::Result<(LogicalPlan, PolicySummary)>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        passthrough(plan)
     }
 }
+
+fn passthrough(
+    plan: LogicalPlan,
+) -> BoxedFuture<'static, sqe_core::Result<(LogicalPlan, PolicySummary)>> {
+    Box::pin(std::future::ready(Ok((plan, PolicySummary::default()))))
+}
+
+/// A boxed `Send` future, the type `#[async_trait]` methods return. Methods
+/// whose future holds an `Expr` or a `LogicalPlan` return it from a
+/// non-generic inherent function instead of being `async fn` in the trait
+/// impl, see `PassthroughEnforcer::evaluate`.
+pub(crate) type BoxedFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 /// The policy-store contract and its result types live in `sqe-policy-api`
 /// (build-time item C1) so `sqe-catalog` can depend on them without waiting
