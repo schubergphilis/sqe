@@ -2833,6 +2833,36 @@ async fn polaris_access_types_for_role(
     polaris_access_types_inner(ctx, "roles", role, catalog, namespace, table).await
 }
 
+/// Delete the `polaris` policies whose resource is exactly
+/// `{catalog}.{namespace}.{table}`. Idempotent: no policy is a no-op. Ranger
+/// merges grants into one policy per resource and `REVOKE` only removes the
+/// access types it names, so a fixture that wants a clean slate deletes it.
+async fn delete_polaris_policies_on(ctx: &AcCtx, catalog: &str, namespace: &str, table: &str) {
+    let policies = ctx
+        .ranger
+        .get_policies("polaris")
+        .await
+        .expect("list polaris policies");
+    for p in policies {
+        let val = |k: &str| -> Option<&str> {
+            p.get("resources")?
+                .get(k)?
+                .get("values")?
+                .as_array()?
+                .first()?
+                .as_str()
+        };
+        if val("catalog") == Some(catalog)
+            && val("namespace") == Some(namespace)
+            && val("table") == Some(table)
+        {
+            if let Some(name) = p["name"].as_str() {
+                let _ = ctx.ranger.delete_policy("polaris", name).await;
+            }
+        }
+    }
+}
+
 /// Whether any `polaris` policy item on exactly `{catalog}.{namespace}.{table}`
 /// names `user` with `delegateAdmin: true`.
 async fn user_holds_delegate_admin(
@@ -3392,6 +3422,8 @@ async fn insert_does_not_confer_storage_relocation() {
         .handler
         .execute(&ctx.carol, &format!("DROP TABLE IF EXISTS {fresh}"), None)
         .await;
+    // A previous run's policy outlives its table and a REVOKE only narrows it.
+    delete_polaris_policies_on(&ctx, "sales_wh", "ac", "orders_fresh_grant").await;
     exec_ok(
         &ctx,
         &ctx.carol,
@@ -3470,6 +3502,7 @@ async fn insert_does_not_confer_storage_relocation() {
         .handler
         .execute(&ctx.carol, &format!("DROP TABLE IF EXISTS {fresh}"), None)
         .await;
+    delete_polaris_policies_on(&ctx, "sales_wh", "ac", "orders_fresh_grant").await;
 }
 
 /// `expire_snapshots` runs as the table's writer, not only as an admin, and
