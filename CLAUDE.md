@@ -33,6 +33,7 @@ cargo sweep -t 2     # reclaim old artifacts when target/ grows past ~50 GB
 - **`incremental = false`** in `[profile.dev]`/`[profile.test]`: measured 2× faster (`sqe-core` edit 2m50 → 1m21) and it frees ~21 GB. Use `CARGO_INCREMENTAL=1` for a one-crate loop if you want it back.
 - **sccache stays off locally** (`.cargo/config.toml`): it misses on the crates that actually change. It only pays off in CI.
 - **`make dev-fast`** (opt-in, needs nightly): parallel frontend + cranelift, `sqe-core` edit 31-36s instead of 1m18 and cold build 2m41 instead of 4m11. Writes to `target/fast`, so it does not invalidate the stable cache. Never ship or benchmark its binaries — `cargo dev` stays the reference build.
+- **Second checkout: seed its `target/`, don't share it.** `scripts/seed-target.sh <built-checkout>`, run from the new checkout, clones `target/debug` copy-on-write (20 s, no extra disk). Cargo then rebuilds only the ~75 crates downstream of `vendor/` and the workspace instead of all ~720; a first `cargo check-server` took 2m00. Each checkout keeps its own build lock, which a shared `target-dir` or `build-dir` would not.
 - **One builder per tree.** Concurrent cargo runs (another session, `cargo audit`, a dep bump landing) serialise on the build lock and invalidate fingerprints; a dependency refresh costs one full rebuild per session.
 
 ## Integration tests
