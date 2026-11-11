@@ -2071,6 +2071,48 @@ fn ranger_policy_body(
     Ok(body)
 }
 
+impl RangerStore {
+    /// `PolicyStore::resolve`, boxed in a non-generic function. The future
+    /// holds a `ResolvedPolicy` (masks and row filters, so `Expr`) across its
+    /// awaits; inside the `#[async_trait]` method the `Send` proof over
+    /// `Expr` ran in that method's own parameter environment (2.6 s).
+    fn resolve_boxed<'a>(
+        &'a self,
+        user: &'a SessionUser,
+        table_name: &'a str,
+        namespace: &'a str,
+    ) -> crate::BoxedFuture<'a, sqe_core::Result<ResolvedPolicy>> {
+        Box::pin(self.resolve_policy(user, table_name, namespace))
+    }
+
+    async fn resolve_policy(
+        &self,
+        user: &SessionUser,
+        table_name: &str,
+        namespace: &str,
+    ) -> sqe_core::Result<ResolvedPolicy> {
+        let key = cache_key(user, table_name, namespace);
+        if let Some(cached) = self.cache.get(&key).await {
+            self.record_cache_hit();
+            return Ok(cached.0.policy().clone());
+        }
+        self.record_cache_miss();
+        let bundle = self.cached_bundle().await?;
+        let policy = resolve_from_bundle_with(
+            &bundle,
+            user,
+            table_name,
+            namespace,
+            self.requires_access_grant(namespace),
+            self.catalog_scoped,
+        );
+        self.cache
+            .insert(key, CachedPolicy(Arc::new(policy.clone())))
+            .await;
+        Ok(policy)
+    }
+}
+
 #[async_trait]
 impl PolicyStore for RangerStore {
     /// `[policy.ranger] catalog_scoped`: callers key Iceberg tables as
@@ -2128,25 +2170,7 @@ impl PolicyStore for RangerStore {
         table_name: &str,
         namespace: &str,
     ) -> sqe_core::Result<ResolvedPolicy> {
-        let key = cache_key(user, table_name, namespace);
-        if let Some(cached) = self.cache.get(&key).await {
-            self.record_cache_hit();
-            return Ok(cached.0.policy().clone());
-        }
-        self.record_cache_miss();
-        let bundle = self.cached_bundle().await?;
-        let policy = resolve_from_bundle_with(
-            &bundle,
-            user,
-            table_name,
-            namespace,
-            self.requires_access_grant(namespace),
-            self.catalog_scoped,
-        );
-        self.cache
-            .insert(key, CachedPolicy(Arc::new(policy.clone())))
-            .await;
-        Ok(policy)
+        self.resolve_boxed(user, table_name, namespace).await
     }
 
     /// The same access-policy evaluation that gates a Hive-root SELECT

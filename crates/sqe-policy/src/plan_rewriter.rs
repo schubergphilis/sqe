@@ -252,7 +252,35 @@ impl PolicyEnforcer for PolicyPlanRewriter {
         })
     }
 
-    async fn evaluate(
+    // Written out the way `#[async_trait]` expands it, and delegating to a
+    // non-generic inherent method: see `PassthroughEnforcer::evaluate`.
+    fn evaluate<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        user: &'life1 SessionUser,
+        scope: &'life2 crate::TableScope,
+        plan: LogicalPlan,
+    ) -> crate::BoxedFuture<'async_trait, sqe_core::Result<(LogicalPlan, PolicySummary)>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.evaluate_boxed(user, scope, plan)
+    }
+}
+
+impl PolicyPlanRewriter {
+    fn evaluate_boxed<'a>(
+        &'a self,
+        user: &'a SessionUser,
+        scope: &'a crate::TableScope,
+        plan: LogicalPlan,
+    ) -> crate::BoxedFuture<'a, sqe_core::Result<(LogicalPlan, PolicySummary)>> {
+        Box::pin(self.evaluate_plan(user, scope, plan))
+    }
+
+    async fn evaluate_plan(
         &self,
         user: &SessionUser,
         scope: &crate::TableScope,
