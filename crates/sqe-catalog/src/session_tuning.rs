@@ -3,7 +3,6 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::Result;
@@ -15,8 +14,10 @@ use datafusion::optimizer::{Analyzer, AnalyzerRule, Optimizer, OptimizerRule};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use datafusion::prelude::{SessionConfig, SessionContext};
+use futures::future::BoxFuture;
 
 use crate::eliminate_cross_join::EliminateCrossJoin;
+use crate::send_erased::SendErased;
 use crate::variant_read::VariantReadHints;
 
 mod decimal_arithmetic;
@@ -97,17 +98,42 @@ fn engine_optimizer_rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
 #[derive(Debug)]
 pub struct EngineQueryPlanner;
 
-#[async_trait]
 impl QueryPlanner for EngineQueryPlanner {
-    async fn create_physical_plan(
-        &self,
-        plan: &LogicalPlan,
-        session: &dyn Session,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
+    // Written in `async_trait`'s desugared form on purpose (compile time, see
+    // docs/internal/plans/2026-09-07-compile-time-async-hubs.md). As an
+    // `async fn` the coroutine owned `plan: &LogicalPlan` and a cloned
+    // `SessionState`, and proving it `Send` walked DataFusion's whole `Expr` /
+    // `LogicalPlan` graph (3 s). The decision and the state clone are made
+    // synchronously before the block; the block holds both as `SendErased`.
+    fn create_physical_plan<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        plan: &'life1 LogicalPlan,
+        session: &'life2 dyn Session,
+    ) -> BoxFuture<'async_trait, Result<Arc<dyn ExecutionPlan>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
         let planner = DefaultPhysicalPlanner::default();
-        let Some(state) = session.as_any().downcast_ref::<SessionState>() else {
-            return planner.create_physical_plan(plan, session).await;
-        };
+        let tuned = Self::tuned_state(plan, session).map(SendErased::new);
+        let plan = SendErased::new(plan);
+        Box::pin(async move {
+            match &tuned {
+                Some(state) => planner.create_physical_plan(plan.get(), state.get()).await,
+                None => planner.create_physical_plan(plan.get(), session).await,
+            }
+        })
+    }
+}
+
+impl EngineQueryPlanner {
+    /// The session to plan with when it differs from the caller's, `None`
+    /// when `session` is planned as it is (not a `SessionState`, or neither
+    /// tuning applies).
+    fn tuned_state(plan: &LogicalPlan, session: &dyn Session) -> Option<SessionState> {
+        let state = session.as_any().downcast_ref::<SessionState>()?;
         let no_aggregate_filters = state
             .config_options()
             .optimizer
@@ -117,7 +143,7 @@ impl QueryPlanner for EngineQueryPlanner {
         // reads (sqe#870); they find the hints in the session config.
         let variant_hints = VariantReadHints::of(plan);
         if !no_aggregate_filters && variant_hints.is_empty() {
-            return planner.create_physical_plan(plan, session).await;
+            return None;
         }
         let mut state = state.clone();
         if no_aggregate_filters {
@@ -130,7 +156,7 @@ impl QueryPlanner for EngineQueryPlanner {
         if !variant_hints.is_empty() {
             state.config_mut().set_extension(Arc::new(variant_hints));
         }
-        planner.create_physical_plan(plan, &state).await
+        Some(state)
     }
 }
 

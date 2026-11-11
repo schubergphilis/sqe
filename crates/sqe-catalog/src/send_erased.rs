@@ -20,7 +20,7 @@
 //! `SessionState` built for a scoped scan).
 
 use datafusion::execution::session_state::SessionState;
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{Expr, LogicalPlan};
 
 /// Types whose `Send + Sync`-ness this crate asserts by hand for
 /// [`SendErased`].
@@ -34,6 +34,7 @@ pub(crate) unsafe trait KnownSend {}
 
 unsafe impl KnownSend for Vec<Expr> {}
 unsafe impl KnownSend for &[Expr] {}
+unsafe impl KnownSend for &LogicalPlan {}
 unsafe impl KnownSend for SessionState {}
 
 /// A value the coroutine may hold across an await without paying the
@@ -68,6 +69,7 @@ mod tests {
     fn known_types_are_send_and_sync() {
         assert_send_sync::<Vec<Expr>>();
         assert_send_sync::<&[Expr]>();
+        assert_send_sync::<&LogicalPlan>();
         assert_send_sync::<SessionState>();
     }
 }
