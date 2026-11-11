@@ -1,0 +1,5 @@
+**STATUS 2026-11-11: `QuackTableProvider::scan` no longer holds `Expr` across an await (`refactor/quack-client-scan-hub`).**
+
+`scan` is written in `async_trait`'s desugared form and builds the plan with `MemorySourceConfig::try_new` + `DataSourceExec::from_data_source` (what `MemTable::scan` does; `filters` and `limit` ignored, no sort order), returning `Box::pin(std::future::ready(plan))`. Measured with `scripts/compile-profile.sh sqe-quack-client`, alternating before/after, two runs each: `evaluate_obligation` self time 3.27 s and 3.20 s before, 15.5 ms and 15.0 ms after (3753 -> 1927 obligations); `typeck_root` self time was 10.4 / 9.6 ms before and dropped out of the top table after; crate total 3.66 s / 3.54 s before, about 0.36 s after. The 3.3 s was attributed to this one function, so the hypothesis (`Expr: Sync` proof over the coroutine) held. One small difference: schema/batch validation errors are no longer wrapped in `DataFusionError::External` (the `MemTable::try_new` wrapper is gone).
+
+**NEXT:** unchanged; profile the next crate whose `evaluate_obligation` is rooted in one `async_trait` method.
