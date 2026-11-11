@@ -1,8 +1,8 @@
 ## 1. Safety net
 
 - [ ] 1.1 Bisect `access_control_e2e::insert_does_not_confer_storage_relocation` (red on `main` since before 5d1f41e62) and fix it
-- [ ] 1.2 Add tests that count audit records: refusal after classification, result-cache hit, execution failure, timeout, cancellation (one record each); and pin what the size check, audit-closed check and admission refusal write today
-- [ ] 1.3 Add a test that a cancelled write still audits the tables of its plan
+- [x] 1.2 Add tests that count audit records: refusal after classification, result-cache hit, execution failure, timeout, cancellation (one record each); and pin what the size check, audit-closed check and admission refusal write today
+- [x] 1.3 Add a test that a cancelled write still audits the tables of its plan (CTAS; the INSERT path is not covered)
 - [ ] 1.4 Record a baseline `scripts/compile-profile.sh sqe-coordinator` profile
 
 ## 2. Stage split (pilot)
