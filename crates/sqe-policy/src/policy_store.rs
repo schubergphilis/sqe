@@ -107,6 +107,50 @@ impl PolicyStore for InMemoryPolicyStore {
         table_name: &str,
         namespace: &str,
     ) -> sqe_core::Result<ResolvedPolicy> {
+        self.resolve_boxed(user, table_name, namespace).await
+    }
+
+    /// Only what `grant_table_privilege` registered: unlike `resolve`, an
+    /// absent entry grants nothing, because DDL authority is opt-in.
+    async fn grants_table_privilege(
+        &self,
+        user: &SessionUser,
+        table_name: &str,
+        namespace: &str,
+        privilege: TablePrivilege,
+    ) -> sqe_core::Result<bool> {
+        let key = format!("{}.{}", namespace, table_name);
+        Ok(self
+            .privileges
+            .read()
+            .await
+            .get(&key)
+            .is_some_and(|grants| {
+                grants.iter().any(|(grantee, p)| {
+                    *p == privilege && (*grantee == user.username || user.roles.contains(grantee))
+                })
+            }))
+    }
+}
+
+impl InMemoryPolicyStore {
+    /// `PolicyStore::resolve`, boxed in a non-generic function: see
+    /// `RangerStore::resolve_boxed`.
+    fn resolve_boxed<'a>(
+        &'a self,
+        user: &'a SessionUser,
+        table_name: &'a str,
+        namespace: &'a str,
+    ) -> crate::BoxedFuture<'a, sqe_core::Result<ResolvedPolicy>> {
+        Box::pin(self.resolve_policy(user, table_name, namespace))
+    }
+
+    async fn resolve_policy(
+        &self,
+        user: &SessionUser,
+        table_name: &str,
+        namespace: &str,
+    ) -> sqe_core::Result<ResolvedPolicy> {
         let key = format!("{}.{}", namespace, table_name);
 
         // Check table-specific policies first
@@ -156,28 +200,6 @@ impl PolicyStore for InMemoryPolicyStore {
 
         // No policy found — allow all (passthrough)
         Ok(ResolvedPolicy::default())
-    }
-
-    /// Only what `grant_table_privilege` registered: unlike `resolve`, an
-    /// absent entry grants nothing, because DDL authority is opt-in.
-    async fn grants_table_privilege(
-        &self,
-        user: &SessionUser,
-        table_name: &str,
-        namespace: &str,
-        privilege: TablePrivilege,
-    ) -> sqe_core::Result<bool> {
-        let key = format!("{}.{}", namespace, table_name);
-        Ok(self
-            .privileges
-            .read()
-            .await
-            .get(&key)
-            .is_some_and(|grants| {
-                grants.iter().any(|(grantee, p)| {
-                    *p == privilege && (*grantee == user.username || user.roles.contains(grantee))
-                })
-            }))
     }
 }
 
