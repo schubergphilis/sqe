@@ -24,7 +24,7 @@ use sqe_core::FlightCompression;
 use sqe_metrics::propagation::extract_trace_context;
 use sqe_metrics::WorkerMetricsRegistry;
 use sqe_planner::{ScanTask, WorkerCapacity, WorkerFault, SCAN_TASK_VERSION_CURRENT};
-use sqe_spill::{ByteBudget, BytePermit, MemoryGovernor, SpillManager};
+use sqe_spill::{ByteBudget, BytePermit, MemoryGovernor};
 use tokio_util::sync::CancellationToken;
 
 use crate::compaction::{
@@ -363,8 +363,6 @@ pub struct WorkerFlightService {
     advertise_url: String,
     /// Finding 601: accept legacy HMAC ticket tags (migration only).
     accept_hmac_tickets: bool,
-    /// Shared spill manager for operator spill.
-    spill_manager: Option<Arc<SpillManager>>,
     /// Scan timeout seconds (0 = none). Atomic for hot config reload.
     scan_timeout_secs: Arc<std::sync::atomic::AtomicU64>,
     /// Worker memory pool sizing (`worker.memory.operator_budget`), resized
@@ -688,7 +686,6 @@ impl WorkerFlightService {
             ticket_pin: None,
             advertise_url: String::new(),
             accept_hmac_tickets: false,
-            spill_manager: None,
             flight_budget: None,
             scan_timeout_secs: Arc::new(std::sync::atomic::AtomicU64::new(600)),
             memory_governor: None,
@@ -865,13 +862,6 @@ impl WorkerFlightService {
         self
     }
 
-    /// Attach the worker-wide spill manager (Phase 3).
-    #[must_use = "with_spill_manager consumes self; bind the returned service"]
-    pub fn with_spill_manager(mut self, manager: Arc<SpillManager>) -> Self {
-        self.spill_manager = Some(manager);
-        self
-    }
-
     /// Set the byte budget for encoded Flight frames awaiting shipment
     /// (`worker.memory.flight_budget`, issue #407).
     ///
@@ -950,11 +940,6 @@ impl WorkerFlightService {
                 inflight_scans: 0,
             }
         })
-    }
-
-    /// Spill manager when local spill is enabled at bootstrap.
-    pub fn spill_manager(&self) -> Option<&Arc<SpillManager>> {
-        self.spill_manager.as_ref()
     }
 
     /// Memory governor when wired at bootstrap.

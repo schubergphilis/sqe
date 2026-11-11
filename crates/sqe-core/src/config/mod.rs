@@ -1708,163 +1708,6 @@ fn default_budget_granularity() -> String {
     "64KB".to_string()
 }
 
-/// Worker spill substrate configuration (`[worker.spill]`).
-///
-/// `directory` is the single spill root for the local backend. Legacy
-/// `worker.spill_dir` maps onto it when `directory` is empty. Setting both to
-/// different paths is a config error.
-#[derive(Debug, Deserialize, Clone)]
-pub struct WorkerSpillConfig {
-    /// Master switch. When false, no SpillManager is opened at worker start.
-    /// Defaults to following `worker.spill_to_disk` at resolve time when left
-    /// at the serde default (true); call sites that need explicit off set
-    /// `enabled = false`.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Spill backend: `local` (default), `s3`, or `tiered`.
-    #[serde(default = "default_spill_backend")]
-    pub backend: String,
-    /// Spill root directory for local/tiered backends. Empty means use
-    /// `worker.spill_dir` (deprecated alias).
-    #[serde(default)]
-    pub directory: String,
-    /// Hard disk/object budget for spill segments.
-    #[serde(default = "default_spill_max_bytes")]
-    pub max_bytes: String,
-    /// Minimum free disk bytes that must remain after spill writes (local).
-    #[serde(default = "default_spill_min_free")]
-    pub min_free_bytes: String,
-    /// Target size for a single spill segment before rotation.
-    #[serde(default = "default_spill_segment_target")]
-    pub segment_target_size: String,
-    #[serde(default = "default_spill_max_concurrent_io")]
-    pub max_concurrent_writes: usize,
-    #[serde(default = "default_spill_max_concurrent_io")]
-    pub max_concurrent_reads: usize,
-    /// Delete orphaned scopes older than this age at worker start.
-    #[serde(default = "default_true")]
-    pub cleanup_on_start: bool,
-    /// Orphan age threshold (e.g. `"24h"`). Parsed as hours when suffixed with
-    /// `h`, otherwise as seconds.
-    #[serde(default = "default_spill_orphan_age")]
-    pub orphan_age: String,
-    /// Dedicated S3 location and credentials for the `s3` / `tiered` backends.
-    /// Never use table-vended STS here.
-    #[serde(default)]
-    pub s3: WorkerSpillS3Config,
-}
-
-/// S3 spill backend config (`[worker.spill.s3]`).
-///
-/// Must use a **dedicated** bucket/prefix and long-lived credential. Objects
-/// are tagged `sqe-spill=true` for lifecycle expiry rules.
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct WorkerSpillS3Config {
-    #[serde(default)]
-    pub bucket: String,
-    /// Key prefix (e.g. `sqe-spill/`). Must not overlap warehouse/table data.
-    #[serde(default = "default_spill_s3_prefix")]
-    pub prefix: String,
-    #[serde(default)]
-    pub region: String,
-    /// Optional endpoint for MinIO / RustFS / path-style gateways.
-    #[serde(default)]
-    pub endpoint: String,
-    #[serde(default)]
-    pub access_key_id: String,
-    /// Dedicated spill secret. `SecretString` so it never renders through
-    /// `WorkerConfig`'s Debug (CORE-01): the hand-written redacting Debug on
-    /// `WorkerConfig` prints `spill`, and a plain `String` here would leak the
-    /// key through any `{:?}`, panic, or anyhow chain.
-    #[serde(default)]
-    pub secret_access_key: SecretString,
-    #[serde(default)]
-    pub allow_http: bool,
-    /// Force path-style addressing (MinIO-friendly). Default true when
-    /// endpoint is set at resolve time in bootstrap.
-    #[serde(default = "default_true")]
-    pub path_style: bool,
-    /// Object-count budget (in addition to `max_bytes`).
-    #[serde(default = "default_spill_s3_max_objects")]
-    pub max_objects: u64,
-}
-
-fn default_spill_s3_prefix() -> String {
-    "sqe-spill/".to_string()
-}
-fn default_spill_s3_max_objects() -> u64 {
-    1_000_000
-}
-
-fn default_spill_backend() -> String {
-    "local".to_string()
-}
-fn default_spill_max_bytes() -> String {
-    "1TB".to_string()
-}
-fn default_spill_min_free() -> String {
-    "1GB".to_string()
-}
-fn default_spill_segment_target() -> String {
-    "256MB".to_string()
-}
-fn default_spill_max_concurrent_io() -> usize {
-    4
-}
-fn default_spill_orphan_age() -> String {
-    "24h".to_string()
-}
-
-impl Default for WorkerSpillConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            backend: default_spill_backend(),
-            directory: String::new(),
-            max_bytes: default_spill_max_bytes(),
-            min_free_bytes: default_spill_min_free(),
-            segment_target_size: default_spill_segment_target(),
-            max_concurrent_writes: default_spill_max_concurrent_io(),
-            max_concurrent_reads: default_spill_max_concurrent_io(),
-            cleanup_on_start: true,
-            orphan_age: default_spill_orphan_age(),
-            s3: WorkerSpillS3Config::default(),
-        }
-    }
-}
-
-impl WorkerSpillConfig {
-    /// Effective spill directory: explicit `directory`, else legacy `spill_dir`.
-    pub fn resolved_directory<'a>(&'a self, spill_dir_alias: &'a str) -> &'a str {
-        if !self.directory.is_empty() {
-            &self.directory
-        } else {
-            spill_dir_alias
-        }
-    }
-
-    /// Parse orphan age into a [`std::time::Duration`].
-    pub fn orphan_age_duration(&self) -> crate::error::Result<std::time::Duration> {
-        let s = self.orphan_age.trim();
-        if let Some(h) = s.strip_suffix('h').or_else(|| s.strip_suffix('H')) {
-            let hours: u64 = h.parse().map_err(|e| {
-                crate::error::SqeError::Config(format!("invalid spill.orphan_age '{s}': {e}"))
-            })?;
-            return Ok(std::time::Duration::from_secs(hours.saturating_mul(3600)));
-        }
-        if let Some(d) = s.strip_suffix('d').or_else(|| s.strip_suffix('D')) {
-            let days: u64 = d.parse().map_err(|e| {
-                crate::error::SqeError::Config(format!("invalid spill.orphan_age '{s}': {e}"))
-            })?;
-            return Ok(std::time::Duration::from_secs(days.saturating_mul(86400)));
-        }
-        let secs: u64 = s.parse().map_err(|e| {
-            crate::error::SqeError::Config(format!("invalid spill.orphan_age '{s}': {e}"))
-        })?;
-        Ok(std::time::Duration::from_secs(secs))
-    }
-}
-
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerConfig {
@@ -1892,14 +1735,15 @@ pub struct WorkerConfig {
     pub memory: WorkerMemoryConfig,
     #[serde(default = "default_true")]
     pub spill_to_disk: bool,
-    /// Deprecated alias for `[worker.spill].directory`. If both are set to
-    /// different paths, config validation fails. Prefer `worker.spill.directory`.
+    /// Directory for DataFusion spill files (sort, hash join, aggregate).
     #[serde(default = "default_spill_dir")]
     pub spill_dir: String,
-    /// Spill substrate configuration (Phase 3). When `enabled` and backend is
-    /// local, the worker opens a [`sqe_spill::SpillManager`] at bootstrap.
+    /// Retired `[worker.spill]` table. It configured a spill segment store
+    /// that no query path ever wrote to; it is still accepted, so existing
+    /// configs keep loading, and ignored. The worker logs a warning when it
+    /// is present. DataFusion spill uses `spill_to_disk` and `spill_dir`.
     #[serde(default)]
-    pub spill: WorkerSpillConfig,
+    pub spill: Option<serde::de::IgnoredAny>,
     /// Maximum duration in seconds for a single scan task. Default: 600 (10 minutes).
     /// Set to 0 to disable the timeout.
     #[serde(default = "default_scan_timeout")]
@@ -2025,7 +1869,7 @@ impl Default for WorkerConfig {
             memory: WorkerMemoryConfig::default(),
             spill_to_disk: true,
             spill_dir: default_spill_dir(),
-            spill: WorkerSpillConfig::default(),
+            spill: None,
             scan_timeout_secs: default_scan_timeout(),
             compaction_timeout_secs: default_compaction_timeout(),
             worker_secret: String::new(),
@@ -6560,39 +6404,6 @@ impl SqeConfig {
             }
         }
 
-        // #382: the S3 spill bucket must be dedicated. Spill segments are
-        // reaped by a bucket lifecycle rule keyed on an object tag, and a
-        // worker's spill prefix is a deny-list check away from table data, so
-        // a spill bucket that is also a warehouse bucket puts table files
-        // one misconfigured rule from expiry. The prefix denylist lives in
-        // `sqe-spill`; this is the cross-check against the buckets this
-        // config names for table data (Hive roots, S3 warehouses).
-        if matches!(self.worker.spill.backend.as_str(), "s3" | "tiered")
-            && !self.worker.spill.s3.bucket.trim().is_empty()
-        {
-            let spill_bucket = self.worker.spill.s3.bucket.trim();
-            let mut data_locations: Vec<(String, &str)> = self
-                .hive
-                .roots
-                .iter()
-                .map(|r| (format!("hive.roots[{}].location", r.name), r.location.as_str()))
-                .collect();
-            data_locations.push(("catalog.warehouse".to_string(), self.catalog.warehouse.as_str()));
-            for (name, c) in &self.catalogs {
-                data_locations.push((format!("catalogs.{name}.warehouse"), c.warehouse.as_str()));
-            }
-            for (field, location) in data_locations {
-                if s3_bucket_of(location) == Some(spill_bucket) {
-                    errors.push(format!(
-                        "worker.spill.s3.bucket = {spill_bucket:?} is also the bucket of \
-                         {field} = {location:?}; the spill bucket must be dedicated to spill \
-                         (its lifecycle rule expires tagged objects and its prefix check is \
-                         a denylist, neither protects table data in the same bucket)"
-                    ));
-                }
-            }
-        }
-
         // Finding 603: TLS on plus `https://` workers used to be a
         // configuration that compiled, booted, and then failed every single
         // dispatch because the coordinator had no client trust root. Refuse it
@@ -7095,15 +6906,6 @@ fn validate_byte_sizes(config: &SqeConfig, errors: &mut Vec<String>) {
         "worker.memory.budget_granularity",
         &config.worker.memory.budget_granularity,
     );
-    check("worker.spill.max_bytes", &config.worker.spill.max_bytes);
-    check(
-        "worker.spill.min_free_bytes",
-        &config.worker.spill.min_free_bytes,
-    );
-    check(
-        "worker.spill.segment_target_size",
-        &config.worker.spill.segment_target_size,
-    );
     check(
         "storage.coalesce_threshold",
         &config.storage.coalesce_threshold,
@@ -7152,79 +6954,6 @@ fn validate_byte_sizes(config: &SqeConfig, errors: &mut Vec<String>) {
             }
         }
     }
-
-    // Spill directory: single root. Fail if both spill_dir and spill.directory
-    // are set to different non-empty paths.
-    let spill = &config.worker.spill;
-    // `spill_dir` carries a serde default (`default_spill_dir()`), so it is
-    // never empty. Treat that default as "unset" so a user who sets only the
-    // preferred `spill.directory` does not trip a false conflict against the
-    // legacy alias's default and fail startup. Only a genuine, explicit dual
-    // set to different non-default paths is a real conflict.
-    if !spill.directory.is_empty()
-        && !config.worker.spill_dir.is_empty()
-        && config.worker.spill_dir != default_spill_dir()
-        && spill.directory != config.worker.spill_dir
-    {
-        errors.push(format!(
-            "worker.spill.directory ({:?}) and worker.spill_dir ({:?}) both set \
-             to different paths; set only one (prefer worker.spill.directory)",
-            spill.directory, config.worker.spill_dir
-        ));
-    }
-    if spill.enabled && config.worker.spill_to_disk {
-        let dir = spill.resolved_directory(&config.worker.spill_dir);
-        match spill.backend.as_str() {
-            "local" | "tiered" => {
-                if dir.is_empty() {
-                    errors.push(
-                        "worker.spill.enabled with backend local/tiered requires \
-                         worker.spill.directory (or legacy worker.spill_dir)"
-                            .into(),
-                    );
-                }
-                if spill.backend == "tiered" && spill.s3.bucket.trim().is_empty() {
-                    errors.push(
-                        "worker.spill.backend = \"tiered\" requires worker.spill.s3.bucket \
-                         for its S3 tier (a bucket dedicated to spill)"
-                            .into(),
-                    );
-                }
-            }
-            "s3" => {
-                // The S3 segment store has been wired in the worker bootstrap
-                // since !710 and `tiered` already reaches it; the "not
-                // implemented yet" refusal this arm used to carry was stale
-                // (#382). What the backend does need is a bucket.
-                if spill.s3.bucket.trim().is_empty() {
-                    errors.push(
-                        "worker.spill.backend = \"s3\" requires worker.spill.s3.bucket \
-                         (a bucket dedicated to spill; see the configuration reference)"
-                            .into(),
-                    );
-                }
-            }
-            other => {
-                errors.push(format!(
-                    "worker.spill.backend = {other:?} is not supported \
-                     (expected local | s3 | tiered)"
-                ));
-            }
-        }
-        if let Ok(max_b) = parse_memory_limit(&spill.max_bytes) {
-            if let Ok(seg) = parse_memory_limit(&spill.segment_target_size) {
-                if max_b < seg.saturating_mul(2) {
-                    errors.push(format!(
-                        "worker.spill.max_bytes ({max_b}) must be at least two \
-                         segment_target_size ({seg}) budgets"
-                    ));
-                }
-            }
-        }
-        if let Err(e) = spill.orphan_age_duration() {
-            errors.push(format!("worker.spill.orphan_age: {e}"));
-        }
-    }
 }
 
 /// Extract the OAuth2 `client_id` from an `AuthProviderConfig` variant that
@@ -7238,17 +6967,6 @@ fn maintenance_provider_client_id(provider: &AuthProviderConfig) -> Option<&str>
         | AuthProviderConfig::TokenExchange { client_id, .. } => Some(client_id.as_str()),
         _ => None,
     }
-}
-
-/// The bucket of an `s3://` or `s3a://` location, `None` for anything else
-/// (a Polaris warehouse name, a local path, an empty string).
-fn s3_bucket_of(location: &str) -> Option<&str> {
-    let rest = location
-        .trim()
-        .strip_prefix("s3://")
-        .or_else(|| location.trim().strip_prefix("s3a://"))?;
-    let bucket = rest.split('/').next().unwrap_or("");
-    (!bucket.is_empty()).then_some(bucket)
 }
 
 /// Validate every URL-shaped string in the config. Empty values are
@@ -7528,23 +7246,6 @@ mod tests {
     }
 
     #[test]
-    fn worker_config_debug_redacts_spill_s3_secret() {
-        // CORE-01: the dedicated S3 spill secret must not leak through
-        // WorkerConfig's Debug, which prints `spill` -> WorkerSpillS3Config.
-        let mut cfg = WorkerConfig::default();
-        cfg.spill.s3.secret_access_key = SecretString::new("spill-s3-secret-xyz".to_string());
-        let dbg = format!("{cfg:?}");
-        assert!(
-            !dbg.contains("spill-s3-secret-xyz"),
-            "spill S3 secret leaked through WorkerConfig Debug: {dbg}"
-        );
-        assert!(
-            dbg.contains("<set>"),
-            "expected SecretString redaction marker: {dbg}"
-        );
-    }
-
-    #[test]
     fn openlineage_config_debug_redacts_api_key() {
         let cfg = OpenLineageConfig {
             api_key: "ol-api-key-secret".to_string(),
@@ -7603,7 +7304,45 @@ shuffle_memory_budget = "900MB"
         let limit = 1024 * 1024 * 1024;
         let r = cfg.worker.memory.resolve_bytes(limit).unwrap();
         assert!(r.chargeable_sum() <= limit, "ignored budget must not count");
-        assert_eq!(r.spill_io_budget, limit - r.scan_budget - r.flight_budget - r.operator_budget);
+        assert_eq!(
+            r.spill_io_budget,
+            limit - r.scan_budget - r.flight_budget - r.operator_budget
+        );
+    }
+
+    /// The retired `[worker.spill]` table, S3 tier included, still loads and
+    /// is only recorded as present; nothing validates or reads its fields.
+    #[test]
+    fn retired_worker_spill_table_still_parses() {
+        let toml = r#"
+[coordinator]
+[auth]
+[catalog]
+catalog_url = ""
+[worker]
+spill_dir = "/tmp/sqe-spill"
+[worker.spill]
+enabled = true
+backend = "tiered"
+directory = "/mnt/other"
+max_bytes = "not-a-size"
+orphan_age = "24h"
+[worker.spill.s3]
+bucket = "lake"
+secret_access_key = "x"
+"#;
+        let cfg: SqeConfig = toml::from_str(toml).expect("retired [worker.spill] parses");
+        assert!(cfg.worker.spill.is_some());
+        assert_eq!(cfg.worker.spill_dir, "/tmp/sqe-spill");
+
+        let absent = r#"
+[coordinator]
+[auth]
+[catalog]
+catalog_url = ""
+"#;
+        let cfg: SqeConfig = toml::from_str(absent).unwrap();
+        assert!(cfg.worker.spill.is_none());
     }
 
     #[test]
@@ -7784,65 +7523,6 @@ partial_progress_batch = 5
         config.metrics.openlineage.enabled = false;
         config.metrics.openlineage.auth_mode = "bearer".to_string();
         assert!(config.validate().is_ok());
-    }
-
-    /// #382: the S3 spill bucket may not be a bucket this config names for
-    /// table data; a dedicated bucket passes, and the local backend does not
-    /// consult the field at all.
-    #[test]
-    fn spill_bucket_may_not_be_a_table_data_bucket() {
-        let mut config = valid_config();
-        config.worker.spill.backend = "s3".to_string();
-        config.worker.spill.s3.bucket = "lake".to_string();
-        config.hive.roots.push(HiveRootConfig {
-            name: "lake".to_string(),
-            kind: HiveRootKind::Sidecar,
-            location: "s3://lake/wh/".to_string(),
-            region: None,
-            catalog_id: None,
-            databases: Vec::new(),
-            secret: None,
-        });
-        let err = config.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("worker.spill.s3.bucket = \"lake\"")
-                && err.contains("hive.roots[lake].location"),
-            "{err}"
-        );
-
-        config.worker.spill.s3.bucket = "sqe-spill".to_string();
-        let dedicated = config.validate();
-        assert!(dedicated.is_ok(), "a dedicated bucket passes: {dedicated:?}");
-
-        // The S3 backends need a bucket at all; the stale "not implemented
-        // yet" refusal of `s3` (while `tiered` reached the same store) is gone.
-        for backend in ["s3", "tiered"] {
-            config.worker.spill.backend = backend.to_string();
-            config.worker.spill.s3.bucket = String::new();
-            let err = config.validate().unwrap_err().to_string();
-            assert!(
-                err.contains(&format!("worker.spill.backend = \"{backend}\" requires worker.spill.s3.bucket")),
-                "{backend}: {err}"
-            );
-        }
-        config.worker.spill.backend = "s3".to_string();
-
-        config.worker.spill.s3.bucket = "lake".to_string();
-        config.worker.spill.backend = "local".to_string();
-        let local = config.validate();
-        assert!(
-            local.is_ok(),
-            "the local backend never reads the S3 block: {local:?}"
-        );
-    }
-
-    #[test]
-    fn s3_bucket_of_parses_s3_and_s3a_only() {
-        assert_eq!(s3_bucket_of("s3://lake/wh/"), Some("lake"));
-        assert_eq!(s3_bucket_of(" s3a://lake "), Some("lake"));
-        assert_eq!(s3_bucket_of("main_warehouse"), None);
-        assert_eq!(s3_bucket_of("s3://"), None);
-        assert_eq!(s3_bucket_of("/tmp/wh"), None);
     }
 
     #[test]
@@ -11842,36 +11522,6 @@ audience = "polaris"
         config.query.per_user_memory_budget = "0".to_string();
         // "0" disables the gate, so the size relationship is irrelevant.
         assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn validate_accepts_spill_directory_without_touching_legacy_alias() {
-        // The recommended single-field config: set only worker.spill.directory
-        // and leave the legacy worker.spill_dir at its serde default. Because
-        // the default is non-empty, an earlier version of the conflict check
-        // failed startup here. It must pass.
-        let mut config = valid_config();
-        config.worker.spill.directory = "/mnt/nvme/sqe-spill".to_string();
-        // spill_dir left at default_spill_dir() ("/tmp/sqe-spill").
-        assert_eq!(config.worker.spill_dir, default_spill_dir());
-        assert!(
-            config.validate().is_ok(),
-            "single-field spill.directory must not conflict with the default alias: {:?}",
-            config.validate()
-        );
-    }
-
-    #[test]
-    fn validate_rejects_conflicting_explicit_spill_dirs() {
-        // Both explicitly set to different non-default paths is a real conflict.
-        let mut config = valid_config();
-        config.worker.spill.directory = "/mnt/a/sqe-spill".to_string();
-        config.worker.spill_dir = "/mnt/b/sqe-spill".to_string();
-        let err = config.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("worker.spill.directory") && err.contains("worker.spill_dir"),
-            "expected dual-set spill-dir conflict, got: {err}"
-        );
     }
 
     #[test]

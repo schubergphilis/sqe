@@ -7462,17 +7462,7 @@ dependencies = [
 name = "sqe-spill"
 version = "0.53.1"
 dependencies = [
- "arrow-array",
- "arrow-ipc",
- "arrow-schema",
- "async-trait",
- "bytes",
- "crc32fast",
  "datafusion",
- "futures",
- "object_store",
- "serde",
- "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -9148,7 +9138,6 @@ dependencies = [
  "getrandom 0.3.4",
  "hashbrown 0.14.5",
  "hashbrown 0.17.1",
- "httparse",
  "hyper",
  "hyper-util",
  "iceberg-catalog-loader",
@@ -9188,7 +9177,6 @@ dependencies = [
  "reqwest 0.13.5",
  "ring",
  "rustls",
- "rustls-pki-types",
  "scopeguard",
  "serde",
  "serde_core",

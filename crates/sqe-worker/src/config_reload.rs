@@ -71,8 +71,6 @@ pub struct BootConfigIdentity {
     pub coordinator_url: String,
     pub worker_secret_set: bool,
     pub allow_unauthenticated: bool,
-    pub spill_enabled: bool,
-    pub spill_backend: String,
     pub spill_dir: String,
     pub spill_to_disk: bool,
 }
@@ -85,13 +83,7 @@ impl BootConfigIdentity {
             coordinator_url: config.worker.coordinator_url.clone(),
             worker_secret_set: !config.worker.worker_secret.is_empty(),
             allow_unauthenticated: config.worker.allow_unauthenticated,
-            spill_enabled: config.worker.spill.enabled,
-            spill_backend: config.worker.spill.backend.clone(),
-            spill_dir: config
-                .worker
-                .spill
-                .resolved_directory(&config.worker.spill_dir)
-                .to_string(),
+            spill_dir: config.worker.spill_dir.clone(),
             spill_to_disk: config.worker.spill_to_disk,
         }
     }
@@ -316,15 +308,11 @@ pub fn warn_restart_required(boot: &BootConfigIdentity, next: &SqeConfig) -> boo
         any = true;
         warn!("worker auth settings changed; restart required (not hot-reloaded)");
     }
-    if boot.spill_enabled != now.spill_enabled
-        || boot.spill_backend != now.spill_backend
-        || boot.spill_dir != now.spill_dir
-        || boot.spill_to_disk != now.spill_to_disk
-    {
+    if boot.spill_dir != now.spill_dir || boot.spill_to_disk != now.spill_to_disk {
         any = true;
         warn!(
-            "worker spill backend/directory/enable changed; restart required \
-             (open stores are not re-created)"
+            "worker spill_dir/spill_to_disk changed; restart required \
+             (the DataFusion disk manager is built at start)"
         );
     }
     any
@@ -448,8 +436,6 @@ mod tests {
                 coordinator_url: String::new(),
                 worker_secret_set: false,
                 allow_unauthenticated: true,
-                spill_enabled: false,
-                spill_backend: "local".into(),
                 spill_dir: String::new(),
                 spill_to_disk: false,
             },
