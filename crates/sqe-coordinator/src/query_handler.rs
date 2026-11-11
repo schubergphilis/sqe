@@ -109,6 +109,45 @@ impl Drop for AbandonedQueryGuard<'_> {
     }
 }
 
+/// What `preflight` produces and dispatch and completion read.
+///
+/// **Field order is drop order.** Fields drop in declaration order, and these
+/// guards used to be locals of `execute_inner`, which drop in reverse of
+/// declaration. So they are declared in reverse of that old order: the
+/// abandoned-query guard first, then the cancel token, then the sorted-write
+/// permit, and admission last, after the audit record and metrics are written
+/// (spec `statement-pipeline`, "Guards span the whole statement"). Do not
+/// reorder them. `query_span` sits with them for the same reason: as a local
+/// it closed after the cancel token and before the permit and admission.
+struct StatementRun<'a> {
+    _abandon_guard: AbandonedQueryGuard<'a>,
+    cancel_token: tokio_util::sync::CancellationToken,
+    query_span: Span,
+    _sorted_write_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    admission: admission::Admission,
+    kind: StatementKind,
+    kind_name: String,
+    start: std::time::Instant,
+    query_id: uuid::Uuid,
+    ol_started_at: chrono::DateTime<chrono::Utc>,
+    ol_emit: bool,
+    trace_id: Option<String>,
+    cacheable: bool,
+    client_ip: Option<String>,
+}
+
+/// How `preflight` ended for a statement that did not fail.
+// `Run` is large and moves once per statement; boxing it would add an
+// allocation to every statement to shrink a value that is never in a
+// collection.
+#[allow(clippy::large_enum_variant)]
+enum Preflight<'a> {
+    /// Go on to dispatch.
+    Run(StatementRun<'a>),
+    /// Answered from the result cache; already audited, nothing left to run.
+    Done(Vec<RecordBatch>),
+}
+
 /// Determine the effective query timeout for a session.
 ///
 /// If any of the user's roles appear in `config.role_overrides`, the highest
@@ -1595,25 +1634,24 @@ impl QueryHandler {
         error
     }
 
-    #[tracing::instrument(
-        skip(self, session, sql),
-        fields(
-            db.system.name = "sqe",
-            db.operation.name = tracing::field::Empty,
-            db.namespace = tracing::field::Empty,
-            db.collection.name = tracing::field::Empty,
-            username = %session.user.username,
-            statement_type,
-        ),
-        name = "execute",
-    )]
-    async fn execute_inner(
+    /// The statement's head: everything up to and including the result-cache
+    /// lookup. Returns the run context for dispatch, or the batches of a
+    /// result-cache hit (already audited).
+    ///
+    /// The caller must not audit an `Err` from here. Every failure between
+    /// classification and the query tracker is audited by the `failed`
+    /// closure; the size check, the audit-closed check and admission return
+    /// before it exists and are deliberately unaudited (#882).
+    ///
+    /// No span of its own: it records on [`Span::current`] (the `execute`
+    /// span) and creates `query_span`, which the run carries.
+    async fn preflight(
         &self,
         session: &Session,
         sql: &str,
         client_ip: Option<String>,
         caller_query_id: Option<uuid::Uuid>,
-    ) -> sqe_core::Result<Vec<RecordBatch>> {
+    ) -> sqe_core::Result<Preflight<'_>> {
         // Issue #403: reject oversized SQL before parse so a client cannot
         // burn coordinator memory/CPU on an arbitrarily large statement.
         reject_oversized_sql(&self.config.query, sql)?;
@@ -1623,7 +1661,6 @@ impl QueryHandler {
         // reservation): one sequence shared with the streaming path, see
         // `query_handler::admission`. Held for the whole buffered call.
         let admission = self.admit(session, sql, "query")?;
-        let memory = &admission.memory;
 
         let start = std::time::Instant::now();
         // Pre-parse pipeline (strip FOR INCREMENTAL / FOR VERSION AS OF,
@@ -1954,10 +1991,63 @@ impl QueryHandler {
                             },
                         );
                     }
-                    return Ok(cached.batches.clone());
+                    return Ok(Preflight::Done(cached.batches.clone()));
                 }
             }
         }
+
+        Ok(Preflight::Run(StatementRun {
+            _abandon_guard,
+            cancel_token,
+            _sorted_write_permit,
+            admission,
+            kind,
+            kind_name,
+            start,
+            query_id,
+            ol_started_at,
+            ol_emit,
+            trace_id,
+            query_span,
+            cacheable,
+            client_ip,
+        }))
+    }
+
+    #[tracing::instrument(
+        skip(self, session, sql),
+        fields(
+            db.system.name = "sqe",
+            db.operation.name = tracing::field::Empty,
+            db.namespace = tracing::field::Empty,
+            db.collection.name = tracing::field::Empty,
+            username = %session.user.username,
+            statement_type,
+        ),
+        name = "execute",
+    )]
+    async fn execute_inner(
+        &self,
+        session: &Session,
+        sql: &str,
+        client_ip: Option<String>,
+        caller_query_id: Option<uuid::Uuid>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let run = match self
+            .preflight(session, sql, client_ip, caller_query_id)
+            .await?
+        {
+            Preflight::Done(batches) => return Ok(batches),
+            Preflight::Run(run) => run,
+        };
+        // Shared borrows of what dispatch and the race below read, so the
+        // async block does not capture `run` whole and the `select!` can still
+        // read `run.cancel_token`.
+        let kind = &run.kind;
+        let query_id = run.query_id;
+        let start = run.start;
+        let memory = &run.admission.memory;
+        let cancel_token = &run.cancel_token;
 
         // Mark query as running (planning phase complete)
         self.query_tracker
@@ -3228,7 +3318,7 @@ impl QueryHandler {
         //   - the per-query cancellation token (admin CancelQuery action)
         // The first one to fire wins. Cancellation skips the failed() write
         // because the tracker's cancel() already transitioned to Canceled.
-        let mut result = tokio::select! {
+        let result = tokio::select! {
             biased;
             _ = cancel_token.cancelled() => {
                 warn!(
@@ -3256,6 +3346,48 @@ impl QueryHandler {
                 }
             }
         };
+
+        self.complete(
+            session,
+            sql,
+            run,
+            result,
+            captured_plan,
+            policy_summary,
+            plan_metrics,
+        )
+        .await
+    }
+
+    /// The statement's tail: auth-failure recovery, row counts, tracker,
+    /// result cache, span fields, metrics, OpenLineage, the audit record and
+    /// the slow-query log.
+    ///
+    /// Takes `run` by value so the guards it holds (abandoned-query guard,
+    /// sorted-write permit, admission) drop when this function returns, after
+    /// the audit record and metrics are written, as they did when they were
+    /// locals of `execute_inner`.
+    #[allow(clippy::too_many_arguments)]
+    async fn complete(
+        &self,
+        session: &Session,
+        sql: &str,
+        run: StatementRun<'_>,
+        mut result: sqe_core::Result<Vec<RecordBatch>>,
+        mut captured_plan: Option<sqe_lineage::PlanOrHint>,
+        policy_summary: Option<sqe_policy::PolicySummary>,
+        plan_metrics: Arc<Mutex<PlanMetrics>>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let kind = run.kind;
+        let kind_name = run.kind_name;
+        let trace_id = run.trace_id;
+        let query_id = run.query_id;
+        let start = run.start;
+        let ol_started_at = run.ol_started_at;
+        let ol_emit = run.ol_emit;
+        let cacheable = run.cacheable;
+        let query_span = &run.query_span;
+        let client_ip = &run.client_ip;
 
         // Auth-failure recovery (issue #20). When the catalog rejected our
         // bearer mid-query — typically Polaris-side expiry crossing the
