@@ -1,11 +1,19 @@
 ## ADDED Requirements
 
 ### Requirement: One audit record per statement
-The coordinator SHALL write exactly one audit record for every statement it accepts for execution, whether the statement succeeds, fails, times out or is cancelled.
+The coordinator SHALL write exactly one audit record for every statement that reaches classification, whether the statement succeeds, is answered from the result cache, fails, times out or is cancelled.
 
-#### Scenario: Failure before the query tracker starts
-- **WHEN** a statement is refused during preflight (oversized SQL, classification error, pressure refusal, transaction guard)
+#### Scenario: Refusal before classification
+- **WHEN** a statement is refused by the size check, the audit-closed check or admission, which all return before the failure-audit path exists
+- **THEN** it writes whatever it writes today, pinned by a test added before the restructure, and the restructure does not change it
+
+#### Scenario: Failure between classification and the query tracker
+- **WHEN** a statement is refused during preflight after it was classified (classification error, pressure refusal, transaction guard, reserved property, file-function preparation)
 - **THEN** one failure record is written and the completion stage writes none
+
+#### Scenario: Result-cache hit
+- **WHEN** a query is answered from the result cache
+- **THEN** preflight writes one success record, with the resources and policy summary of the run that filled the entry, and the dispatch and completion stages do not run
 
 #### Scenario: Failure during execution
 - **WHEN** a statement fails after the query tracker has started
@@ -30,11 +38,15 @@ Every statement kind SHALL be routed by a match without a wildcard arm, so that 
 - **THEN** `sqe-coordinator` does not compile
 
 ### Requirement: Guards span the whole statement
-The admission slot, the sorted-write permit, the abandoned-query guard and the cancellation token SHALL be held from preflight until the completion stage has finished.
+The admission slot, the sorted-write permit, the abandoned-query guard and the cancellation token SHALL be held until the statement call returns, as they are today, and SHALL be released in today's order.
 
 #### Scenario: Admission is released after completion
 - **WHEN** a statement finishes
 - **THEN** its admission slot is released after the audit record and metrics are written, not before
+
+#### Scenario: Span fields
+- **WHEN** a stage records a field on the request span or on the query span
+- **THEN** the field lands on the same span as before the restructure, because the query span is created once in preflight and carried in the run context
 
 #### Scenario: Abandoned request
 - **WHEN** the client drops the request while the statement runs

@@ -45,7 +45,12 @@ Completion reads `captured_plan` after the `select!`. A statement that times out
 `admission`, the sorted-write permit, `AbandonedQueryGuard` and the cancel token are fields of `StatementRun` or locals of `execute_inner`, declared in today's order. None moves into a stage function's local scope, where it would drop when that stage returns.
 
 **5. One audit record per statement.**
-Before the tracker starts, failures are audited by the `failed` closure. After it starts, completion audits. `preflight` returns either a run context (tracker started) or an error that has already been audited. The type makes the second case explicit so the caller cannot audit it again.
+From classification until the tracker starts, failures are audited by the `failed` closure. After it starts, completion audits. A result-cache hit is the third exit: preflight writes the success record itself and returns the cached batches. `preflight` therefore returns one of three things: a run context, a finished result (cache hit, already audited), or an error that has already been audited. The type names all three so the caller cannot audit twice.
+
+The size check, the audit-closed check and admission return with `?` before `failed` exists. Whether they should be audited is a behaviour question, outside this change. A test pins what they do today.
+
+**5a. Spans are created once.**
+Preflight records fields on the caller's span (`Span::current()`) and creates `query_span`. The run context owns `query_span`; dispatch runs inside it as today, and completion records on it by name. No stage opens a span of its own, so trace shape does not change.
 
 **6. Move first, improve never (in the same merge request).**
 Each lift is a pure move: cut the arm body, paste it as a function, replace captured locals with parameters. `git diff --color-moved=zebra --color-moved-ws=allow-indentation-change` must show the body as moved. Cleanups go in a later merge request.
@@ -54,7 +59,7 @@ Each lift is a pure move: cut the arm body, paste it as a function, replace capt
 Preflight ends where the result-cache lookup ends; completion starts at the `select!`. Splitting there closes one function and opens the next without moving text, so the first merge request is small.
 
 **8. Function length is ratcheted by `xtask budgets`.**
-`budgets.json` gains a `functions` section: a default limit and a list of grandfathered functions with their current length. A grandfathered function may shrink (the tool asks for the entry to be lowered) and may not grow. Measured with `syn` on the parsed item, which `xtask` already depends on or can take cheaply. `clippy::too_many_lines` was considered: it cannot express a per-function ceiling that only moves down.
+`budgets.json` gains a `functions` section: a default limit and a list of grandfathered functions with their current length. A grandfathered function may shrink (the tool asks for the entry to be lowered) and may not grow. How it is measured is open (see Open Questions): `syn` in `xtask`, or `clippy::too_many_lines` with `#[expect]` on the recorded functions.
 
 **9. The shadow list is a test, not a document.**
 A test builds a default DataFusion `SessionContext` and SQE's, and lists the scalar, aggregate and window names SQE registers over a built-in. Each must appear in an allowlist with a one-line reason (for example Trino date semantics). An unlisted shadow fails the test, so a DataFusion upgrade that adds a built-in SQE already defines is noticed.
@@ -76,5 +81,6 @@ No deployment step. Each merge request is behaviour-neutral and can be reverted 
 
 ## Open Questions
 
+- Ratchet mechanism: `clippy::too_many_lines` with `#[expect(clippy::too_many_lines)]` catches new long functions and tells us when an exception is no longer needed, with no parser to maintain, but it has one threshold and cannot stop a recorded function from growing. A `syn` pass in `xtask` can. Try clippy first; task 6.1 decides.
 - Where the registry test lives: `sqe-coordinator` sees the final registry, `sqe-trino-functions` owns most shadows.
 - Whether `iceberg_scan.rs` `execute` (1,123 lines) is stage-shaped or needs its own design note.

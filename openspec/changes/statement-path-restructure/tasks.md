@@ -1,7 +1,7 @@
 ## 1. Safety net
 
 - [ ] 1.1 Bisect `access_control_e2e::insert_does_not_confer_storage_relocation` (red on `main` since before 5d1f41e62) and fix it
-- [ ] 1.2 Add tests that count audit records: preflight refusal, execution failure, timeout, cancellation (one record each)
+- [ ] 1.2 Add tests that count audit records: refusal after classification, result-cache hit, execution failure, timeout, cancellation (one record each); and pin what the size check, audit-closed check and admission refusal write today
 - [ ] 1.3 Add a test that a cancelled write still audits the tables of its plan
 - [ ] 1.4 Record a baseline `scripts/compile-profile.sh sqe-coordinator` profile
 
@@ -40,7 +40,7 @@
 
 ## 6. Function-length ratchet
 
-- [ ] 6.1 `functions` section in `.config/budgets.json`; measurement in `xtask/src/budgets.rs`
+- [ ] 6.1 Try `clippy::too_many_lines` with `#[expect]`; if it cannot hold a recorded function to its length, add a `functions` section to `.config/budgets.json` measured in `xtask/src/budgets.rs`
 - [ ] 6.2 Record the functions still over the limit after sections 2 to 5
 - [ ] 6.3 Document in `docs/site/book/src/development/crates.md`
 
