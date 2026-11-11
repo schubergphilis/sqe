@@ -244,6 +244,25 @@ Model Context Protocol endpoint. An OAuth resource server, not an authorization 
 
 Reference: [Model Context Protocol](../deployment/mcp.md).
 
+## Size and Structure Budgets
+
+The workspace carries budgets for its own size. They live in `.config/budgets.json` and `cargo xtask budgets --check` enforces them on every merge request and before every push. The check counts lines and reads `cargo metadata`, so it compiles nothing.
+
+| Budget | Rule |
+|---|---|
+| Lines per source file | 3,000 by default. A file already over it has its own recorded ceiling |
+| Lines per crate | One ceiling per crate, counted over `src/` |
+| First-party dependencies | The exact list per crate. A new edge fails the check |
+| `Cargo.lock` | A ceiling on packages, and on crate names locked at more than one version |
+
+The tool only lowers a budget. `cargo xtask budgets --update` tightens ceilings and drops edges that are gone. Raising a ceiling, adding an edge or adding a crate is a hand edit of the budget file, so the growth is one visible line in review and the merge request says why it is worth it.
+
+Ceilings are not exact. A file ceiling is recorded 250 to 500 lines above the file and a crate ceiling 1,000 to 2,000 lines above the crate, so a bug fix does not trip the check. A line ceiling with much more room than that fails as well: a file that shrinks cannot grow back unnoticed. The `Cargo.lock` ceilings are upper bounds only, because a dependency update removes packages as often as it adds them.
+
+The edge list matters most. An edit to a crate rebuilds every crate that reaches it, and `sqe-core` is reached by sixteen. Run `cargo xtask budgets` without flags for the table: lines, ceiling and rebuild fan-out per crate, and every file over the default.
+
+The budgets bound size and coupling. Compile time is a separate measurement, because most of it is trait solving and not line count. `scripts/compile-profile.sh <crate>` profiles one crate and names the functions that cost the most.
+
 ## Key External Dependencies
 
 | Crate | Version | Purpose |

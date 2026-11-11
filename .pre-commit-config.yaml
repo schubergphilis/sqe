@@ -17,6 +17,8 @@
 #   warnings denied; a Cargo.toml/Cargo.lock/toolchain change lints the
 #   whole workspace. MR pipelines skip clippy (minimal profile), so this is
 #   the only lint before merge. `make lint` lints the whole workspace.
+# - Pre-push: the size and structure budgets in .config/budgets.json
+#   (`cargo xtask budgets --check`, also `make check-budgets`).
 #
 # Semgrep, grype, trivy, and syft stay in CI: they need the aikido-tools
 # image and are too heavy for a commit hook.
@@ -141,5 +143,15 @@ repos:
         entry: scripts/pre-commit-hook.sh clippy
         language: system
         files: (\.rs|Cargo\.toml|Cargo\.lock|clippy\.toml|rust-toolchain\.toml)$
+        pass_filenames: false
+        stages: [pre-push]
+
+      # Same check as CI's `cargo xtask budgets --check`. Counts lines and
+      # reads `cargo metadata --no-deps`; the only compile is xtask itself.
+      - id: budgets
+        name: size and structure budgets (.config/budgets.json)
+        entry: cargo xtask budgets --check
+        language: system
+        files: (\.rs|Cargo\.toml|Cargo\.lock)$|^\.config/budgets\.json$
         pass_filenames: false
         stages: [pre-push]
