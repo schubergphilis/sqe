@@ -1,0 +1,5 @@
+**STATUS 2026-11-12: write statement family moved into `query_handler/write.rs` (`refactor/move-write-family`, stacked on `refactor/lift-ctas-arm`, openspec statement-path-restructure 3.7, first family).**
+
+`handle_merge_statement`, `handle_insert_statement` and `handle_ctas_statement` moved verbatim into a child module of `query_handler` with `use super::*;`, like `admission.rs`. They became `pub(super)`; no item in `query_handler.rs` needed wider visibility. The new file is rustfmt-clean: rustfmt re-wrapped two `SqeError::with_code(.., format!(..))` calls, with the message strings unchanged. Gates: check-server, clippy -D warnings, budgets, `cargo test --lib query_handler` (109 passed), `make test-integration FILTER=merge` (12), `insert` (23), `ctas` (16). The `query_handler.rs` budget ceiling stays at 13,500 (13,062 lines, same 500-line bucket).
+
+**NEXT:** next family (DDL: `handle_drop_statement`, views, comments), then show, time travel, catalog attach/secrets; access control last, after !1729.
