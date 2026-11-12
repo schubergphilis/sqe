@@ -570,6 +570,7 @@ Each entry requires a `type`:
 | `client_credentials` | `token_endpoint`, `client_id`, `client_secret` | OAuth2 client credentials |
 | `oidc_m2m` | `token_endpoint`, `client_id`, `client_secret` | OIDC machine-to-machine client-credentials (Unity Catalog and generic IdPs) |
 | `bearer_token` | `jwks_url` | Pre-obtained JWT validated via JWKS |
+| `bearer_passthrough` | none | Any bearer, forwarded to the catalog unvalidated, under one configured `user` and `roles`. Only behind a proxy that validates the token, or when the catalog is the sole check |
 | `token_exchange` | `token_url`, `client_id` | RFC 8693 token exchange |
 | `aws_iam` | none | AWS IAM via STS `GetCallerIdentity` |
 | `api_key` | `keys_file` | API key from a TOML keys file |
