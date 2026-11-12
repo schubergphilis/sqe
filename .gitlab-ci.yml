@@ -1,13 +1,22 @@
 # SQE owns product inputs and checks; reusable controls live in Aikido.
 # Routine MRs never build release binaries/images. Opt in with SQE_FORCE_IMAGE_BUILD=1.
-# Tests, dependency gates and SAST remain blocking; publishing waits on test stage.
+# Tests, dependency gates and SAST remain blocking on the MR.
+#
+# Main runs no test or lint jobs: the MR pipeline already ran them on the same
+# tree, and repeating them after every merge (test suite, clippy matrix, catalog
+# live tests: ~1 h of runner CPU, every merge cancelling the last) starved the
+# shared runner. Main keeps the security/supply-chain guardrails (.pre), the
+# advisory feed (deps-check) and a MANUAL release build: press play on
+# release-binaries, or run a main pipeline with SQE_BUILD_IMAGE=1, to build
+# and publish the :main image. Release tags build their own image
+# (aikido-release-image), so a release never waits on main's build.
 #
 # SQE_CI_PROFILE sizes the Rust work. "minimal" = the test gate plus the cheap
 # xtask guards; "full" adds clippy, the sqe-catalog feature matrix and the
 # hakari drift check (ci/aikido-rust-extra.sh). MRs default to minimal so the
 # shared runners carry one workspace compile per pipeline, not two. Opt in per
 # MR with the `ci::full` label (then run a new pipeline) or the pipeline
-# variable SQE_CI_PROFILE=full. Main and tags always run full.
+# variable SQE_CI_PROFILE=full. Tags run full.
 workflow:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && ($SQE_CI_PROFILE == "full" || $CI_MERGE_REQUEST_LABELS =~ /(^|,)ci::full(,|$)/)'
@@ -39,7 +48,6 @@ ci-config-sanity:
     - make leak-scan
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     - if: '$CI_COMMIT_TAG'
 
 supply-chain-watch:
@@ -94,7 +102,15 @@ release-binaries:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $SQE_FORCE_IMAGE_BUILD == "1"'
       variables:
         CARGO_PROFILE: "dev-release"
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $SQE_BUILD_IMAGE == "1"'
+      variables:
+        CARGO_PROFILE: "release"
+    # On demand: ~30-50 min of release-profile compile per merge was the
+    # largest single cost on the runner. allow_failure keeps the pipeline
+    # green (not "blocked") while nobody presses play.
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: true
       variables:
         CARGO_PROFILE: "release"
   variables:
@@ -106,9 +122,15 @@ ci-deps-image:
   variables:
     AIKIDO_DEPS_TARGET: "/opt/sqe-deps/target"
 
+# Runs whenever release-binaries ran (its `needs:` holds it until then); not
+# manual itself, so one press builds, scans and publishes.
 malware-scan:
   extends: .aikido-malware-scan
-  rules: !reference [release-binaries, rules]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $SQE_FORCE_IMAGE_BUILD == "1"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
   needs:
     - job: release-binaries
       artifacts: true
@@ -135,11 +157,15 @@ helm-chart-check:
       when: never
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes: ["deploy/helm/**/*", .gitlab-ci.yml]
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
+# `needs:` instead of the template's stage ordering: with no test job on main
+# there is no gate to wait for, and the build must wait for the manual
+# release-binaries rather than start in .post without its artifacts.
 aikido-build:
   timeout: 30m
-  dependencies: [release-binaries]
+  needs:
+    - job: release-binaries
+      artifacts: true
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
       when: never
@@ -208,7 +234,20 @@ aikido-sbom:
 # 1.99.1 and vendor/ tree 4b5d3bb0. Refresh it after any merge that changes
 # rust-toolchain.toml, Cargo.lock or vendor/: the `ci-deps-image` job on main
 # prints the new digest on its last lines.
+# Rules copied from the aikido test-rust template minus the default-branch
+# arms: the MR pipeline is the test gate (see the header).
+.sqe_rust_changes: &sqe_rust_changes
+  - "**/*.rs"
+  - "**/Cargo.toml"
+  - "**/Cargo.lock"
+  - "rust-toolchain.toml"
+
 aikido-test-rust:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      exists: ["**/Cargo.toml"]
+      changes: *sqe_rust_changes
+      allow_failure: false
   image: "$CI_REGISTRY_IMAGE/ci-deps:main@sha256:d1c0bbc1a235870c423be4f5c66875cb378e1c7389537b0e01f941ca92a99421"
   variables:
     AIKIDO_SHARED_SCRIPTS: "reuse-deps-image.sh"
@@ -220,6 +259,11 @@ aikido-test-rust:
     - !reference [.aikido_rust_build_env, before_script]
 
 aikido-rust-extra:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      exists: ["ci/aikido-rust-extra.sh"]
+      changes: *sqe_rust_changes
+      allow_failure: false
   image: "$CI_REGISTRY_IMAGE/ci-deps:main@sha256:d1c0bbc1a235870c423be4f5c66875cb378e1c7389537b0e01f941ca92a99421"
   variables:
     AIKIDO_SHARED_SCRIPTS: "reuse-deps-image.sh"
@@ -233,6 +277,12 @@ aikido-rust-extra:
 aikido-clippy-rust:
   rules:
     - when: never
+
+aikido-cargo-lock:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      exists: ["**/Cargo.toml"]
+      changes: *sqe_rust_changes
 
 # Live round trips against the catalogs outside the Iceberg matrix rubric that
 # SQE still advertises (#866): Nessie (Iceberg REST), Hive Metastore (Thrift)
@@ -290,7 +340,7 @@ catalog-live-tests:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
       when: never
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes:
         - "crates/sqe-catalog/**/*"
         - "vendor/iceberg-rust/**/*"
@@ -327,9 +377,6 @@ vendored-profile-drift:
         - "crates/sqe-policy/assets/*.json"
         - "crates/sqe-policy/src/grants/profile.rs"
         - "scripts/check-vendored-profile.sh"
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      changes:
-        - "crates/sqe-policy/assets/*.json"
 
 aikido-sast:
   allow_failure: false
