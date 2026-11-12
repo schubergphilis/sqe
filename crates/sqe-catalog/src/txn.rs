@@ -270,6 +270,10 @@ struct StatementScope {
     /// The column types an INSERT source writes, position by position, while
     /// that source is planned ([`with_insert_target`]).
     insert_target: Option<Arc<[datafusion::arrow::datatypes::DataType]>>,
+    /// The snapshot properties every snapshot this statement commits carries,
+    /// resolved by the caller of [`write_scope`]: the transaction's inside
+    /// one, the session's outside. Never both.
+    snapshot_properties: Option<Arc<SnapshotProperties>>,
 }
 
 tokio::task_local! {
@@ -282,6 +286,21 @@ fn inherited_params() -> Option<Arc<[datafusion::scalar::ScalarValue]>> {
     CURRENT.try_with(|s| s.params.clone()).ok().flatten()
 }
 
+/// The snapshot properties of the enclosing [`write_scope`], kept when a
+/// nested scope sets the transaction or branch, like [`inherited_params`].
+///
+/// Inheriting is safe at COMMIT and ROLLBACK, which run in `scope(None, ..)`:
+/// `publish` and `discard` move refs (`PublishBranchAction`, `drop_branch`,
+/// `create_branch`) and never build a snapshot, so they do not read it.
+/// Maintenance commits never read it either: they build their own actions
+/// and set their own `sqe.maintenance.*` keys.
+fn inherited_snapshot_properties() -> Option<Arc<SnapshotProperties>> {
+    CURRENT
+        .try_with(|s| s.snapshot_properties.clone())
+        .ok()
+        .flatten()
+}
+
 /// Run `f` inside `txn`'s scope. `None` runs it outside any transaction,
 /// even when the caller is inside one: COMMIT publishes the branch to
 /// `main`, which the bridge refuses from inside a scope.
@@ -291,6 +310,7 @@ pub async fn scope<F: Future>(txn: Option<Arc<TxnScope>>, f: F) -> F::Output {
         write_branch: None,
         params: inherited_params(),
         insert_target: None,
+        snapshot_properties: inherited_snapshot_properties(),
     };
     CURRENT.scope(scope, f).await
 }
@@ -342,9 +362,16 @@ pub fn insert_target() -> Option<Arc<[datafusion::arrow::datatypes::DataType]>> 
 /// runs, every table that holds the branch is read at it
 /// ([`pin`]), every write commits to it ([`target_branch`]), and the
 /// session catalog refuses a commit that would move `main`.
+///
+/// `snapshot_properties` are the properties every snapshot the statement
+/// commits carries ([`snapshot_properties`]). The caller resolves them:
+/// `txn`'s own inside a transaction, the session's outside one. They are
+/// kept as given, so the caller decides; a session's properties never reach
+/// a write inside a transaction.
 pub async fn write_scope<F: Future>(
     txn: Option<Arc<TxnScope>>,
     write_branch: Option<String>,
+    snapshot_properties: Option<Arc<SnapshotProperties>>,
     f: F,
 ) -> F::Output {
     let write_branch = match txn {
@@ -356,8 +383,18 @@ pub async fn write_scope<F: Future>(
         write_branch,
         params: inherited_params(),
         insert_target: None,
+        snapshot_properties,
     };
     CURRENT.scope(scope, f).await
+}
+
+/// The snapshot properties the current statement's commits carry
+/// ([`write_scope`]), or `None` outside one.
+///
+/// A task-local: it does not cross `tokio::spawn`. A commit reads it once,
+/// before its retry loop, and moves the value into the loop's closure.
+pub fn snapshot_properties() -> Option<Arc<SnapshotProperties>> {
+    inherited_snapshot_properties()
 }
 
 /// The transaction the current task runs in, if any.
@@ -909,6 +946,64 @@ mod tests {
         assert_eq!(txn.snapshot_properties(), Some(props(&[("a", "3")])));
         txn.set_snapshot_properties(None);
         assert!(txn.snapshot_properties().is_none());
+    }
+
+    /// The properties ride the statement's scope: a nested `with_params`,
+    /// `with_insert_target`, `scope` or `carried` keeps them, as `params`
+    /// are kept, and they end with the statement.
+    #[tokio::test]
+    async fn snapshot_properties_survive_nested_scopes() {
+        let set = props(&[("copy.run", "42")]);
+        assert!(snapshot_properties().is_none());
+
+        write_scope(None, None, Some(set.clone()), async {
+            assert_eq!(snapshot_properties(), Some(set.clone()));
+
+            with_params(vec![], async {
+                assert_eq!(snapshot_properties(), Some(set.clone()));
+                with_insert_target(vec![], async {
+                    assert_eq!(snapshot_properties(), Some(set.clone()));
+                })
+                .await;
+            })
+            .await;
+
+            // COMMIT and the planning paths enter `scope`; they keep it.
+            scope(None, async {
+                assert_eq!(snapshot_properties(), Some(set.clone()));
+            })
+            .await;
+            scope(Some(TxnScope::new("tx-1")), async {
+                assert_eq!(snapshot_properties(), Some(set.clone()));
+            })
+            .await;
+
+            carried(async {
+                assert_eq!(snapshot_properties(), Some(set.clone()));
+            })
+            .await;
+        })
+        .await;
+
+        assert!(snapshot_properties().is_none(), "the scope ended");
+    }
+
+    /// The caller resolves the value: a write outside a scope carries none,
+    /// and `write_scope(.., None, ..)` clears an enclosing scope's value.
+    #[tokio::test]
+    async fn a_write_scope_without_properties_carries_none() {
+        let outer = props(&[("a", "1")]);
+        write_scope(None, None, Some(outer), async {
+            write_scope(None, None, None, async {
+                assert!(snapshot_properties().is_none());
+            })
+            .await;
+        })
+        .await;
+        scope(None, async {
+            assert!(snapshot_properties().is_none());
+        })
+        .await;
     }
 
     #[test]

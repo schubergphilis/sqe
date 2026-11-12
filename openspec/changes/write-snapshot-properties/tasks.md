@@ -14,10 +14,10 @@
 
 ## 3. Carry to the commit
 
-- [ ] 3.1 `StatementScope` field, `write_scope` argument, inherited by `scope()` and `with_params()`; `sqe_catalog::txn::snapshot_properties()` accessor
-- [ ] 3.2 Resolve the value at the three `write_scope` callers (query handler execute, Flight ingest, embedded): transaction properties inside a transaction, session properties outside
-- [ ] 3.3 `apply_snapshot_properties` helpers for `fast_append`, `overwrite_files` and `row_delta`; call them at every action site in `write_handler.rs` and `write_handler/ingest.rs`, reading the task-local once before the retry loop
-- [ ] 3.4 Empty writes: when properties are set and nothing is added or removed, commit an empty `fast_append` with the properties
+- [x] 3.1 `StatementScope` field, `write_scope` argument, inherited by `scope()` and `with_params()`; `sqe_catalog::txn::snapshot_properties()` accessor
+- [x] 3.2 Resolve the value at the three `write_scope` callers (query handler execute, Flight ingest, embedded): transaction properties inside a transaction, session properties outside
+- [x] 3.3 `apply_snapshot_properties` helpers for `fast_append`, `overwrite_files` and `row_delta`; call them at every action site in `write_handler.rs` and `write_handler/ingest.rs`, reading the task-local once before the retry loop
+- [x] 3.4 Empty writes: when properties are set and nothing is added or removed, commit an empty `fast_append` with the properties
 - [ ] 3.5 Audit: the write's audit record lists the property keys (not values)
 
 ## 4. Flight SQL ingest options

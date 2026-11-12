@@ -35,6 +35,7 @@ Trino HTTP (task 1.2): `sqe-trino-compat/src/server.rs` builds a new `Session` f
 
 **3. Carried in `StatementScope`, read once, passed by value.**
 `write_scope` gains a `snapshot_properties: Option<Arc<SnapshotProperties>>` argument. The caller (`query_handler.rs` execute, `flight_sql.rs` ingest, `embedded.rs`) resolves the transaction or session value. `scope()` and `with_params()` inherit the field the way `params` is inherited. Each commit closure reads `sqe_catalog::txn::snapshot_properties()` once, before `commit_with_retry`. Task-locals do not cross `tokio::spawn`, so the value is cloned into the closure and never read from a spawned task.
+A statement that a transaction refuses and runs autocommit instead (CTAS, DDL; #824) takes the properties of the client's transaction, not the session's, so session properties never apply while a transaction is open.
 *Why:* the action is built inside each caller's closure, so there is no single hook. A small helper `apply_snapshot_properties` per action type keeps each site to one line.
 *Alternative:* patch the vendored `Transaction` to read a task-local. Rejected: a vendor patch for an SQE concern, and it would also stamp maintenance commits.
 

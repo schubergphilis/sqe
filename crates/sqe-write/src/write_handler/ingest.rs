@@ -295,6 +295,9 @@ impl WriteHandler {
             let catalog_for_commit = catalog.clone();
             let target_branch =
                 crate::commit::txn_target_branch(catalog.as_ref(), &table_ident).await?;
+            // The one resolved value this ingest stamps. Held in a local so
+            // the `snapshot-property.<key>` options (task 4.1) merge over it.
+            let snapshot_props = super::snapshot_props::current();
             commit_with_retry(
                 catalog.as_ref(),
                 &table_ident,
@@ -303,9 +306,13 @@ impl WriteHandler {
                     let files = files_for_retry.clone();
                     let cat = catalog_for_commit.clone();
                     let target_branch = target_branch.clone();
+                    let snapshot_props = snapshot_props.clone();
                     async move {
                         let tx = Transaction::new(&fresh_table);
-                        let mut action = tx.fast_append().add_data_files(files);
+                        let mut action = super::snapshot_props::stamp_append(
+                            tx.fast_append().add_data_files(files),
+                            &snapshot_props,
+                        );
                         if let Some(branch) = target_branch {
                             action = action.set_target_branch(branch);
                         }
@@ -338,6 +345,10 @@ impl WriteHandler {
             );
         } else {
             cleanup_guard.mark_committed();
+            // An empty upload adds nothing; with snapshot properties it still
+            // commits the marker snapshot.
+            self.commit_empty_snapshot(session, &session_catalog, &table_ident)
+                .await?;
         }
 
         Ok(total_rows)

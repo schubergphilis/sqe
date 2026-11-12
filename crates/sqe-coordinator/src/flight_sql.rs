@@ -1408,9 +1408,16 @@ impl SqeFlightSqlService {
         mode: sqe_write::write_handler::IngestMode,
         upload: crate::flight_ingest::PeekedUpload,
     ) -> sqe_core::Result<usize> {
+        // The transaction's snapshot properties inside one, the session's
+        // outside; the session's never apply inside a transaction.
+        let snapshot_properties = match &txn {
+            Some(txn) => txn.snapshot_properties(),
+            None => session.snapshot_properties.clone(),
+        };
         sqe_catalog::txn::write_scope(
             txn,
             session.write_branch.clone(),
+            snapshot_properties,
             self.query_handler.write_handler().handle_ingest_streaming(
                 session,
                 qualified,
