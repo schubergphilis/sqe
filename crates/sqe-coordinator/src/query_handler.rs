@@ -7258,15 +7258,6 @@ impl QueryHandler {
     }
 }
 
-/// Replace whole-token occurrences of `needle` (case insensitive) in `sql` with `replacement`.
-///
-/// Used to rewrite a table reference like `ns.t` to `datafusion.public.alias` after the incremental pre-parser has run.
-///
-/// The match is strict: `needle` must be preceded and followed by a character that cannot appear in a SQL identifier (whitespace, punctuation, or start / end of string). This prevents spurious matches when `needle` appears as a substring of a longer identifier.
-/// The explicit catalog component of a dotted table reference, if present.
-/// SQE models references as `[catalog.]schema.table` (single-level namespace),
-/// so only a three-part name carries an explicit catalog; one- and two-part
-/// names do not. Used to route time-travel reads to the right catalog (#317).
 /// Append the underlying Iceberg tables of any metadata TVF scans
 /// (`table_files('ns','t')`, `table_snapshots(...)`, ...) to `tables`.
 ///
@@ -7352,6 +7343,10 @@ async fn deny_hidden_metadata_tvf_targets(
     Ok(())
 }
 
+/// The explicit catalog component of a dotted table reference, if present.
+/// SQE models references as `[catalog.]schema.table` (single-level namespace),
+/// so only a three-part name carries an explicit catalog; one- and two-part
+/// names do not. Used to route time-travel reads to the right catalog (#317).
 fn explicit_catalog_component(table: &str) -> Option<&str> {
     let parts: Vec<&str> = table.split('.').collect();
     match parts.as_slice() {
