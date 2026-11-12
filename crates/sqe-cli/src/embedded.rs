@@ -731,6 +731,13 @@ pub struct EmbeddedClient {
     /// `SET WRITE_BRANCH`: the branch INSERT / DELETE / UPDATE / MERGE read
     /// and commit to, as on the cluster (#829, #875). `None` is `main`.
     write_branch: Option<String>,
+    /// `SET SNAPSHOT_PROPERTIES`: the snapshot summary properties later
+    /// writes stamp into their commit. Embedded has no transactions, so this
+    /// field is the whole state. `None` is no properties. Nothing reads it
+    /// until the commit path carries it (change `write-snapshot-properties`,
+    /// section 3), hence the `allow`.
+    #[allow(dead_code)]
+    snapshot_properties: Option<Arc<sqe_core::snapshot_properties::SnapshotProperties>>,
 }
 
 impl EmbeddedClient {
@@ -753,6 +760,7 @@ impl EmbeddedClient {
             read_only_catalog: None,
             storage,
             write_branch: None,
+            snapshot_properties: None,
         })
     }
 
@@ -793,6 +801,7 @@ impl EmbeddedClient {
             read_only_catalog: None,
             storage,
             write_branch: None,
+            snapshot_properties: None,
         };
         client.register_metadata_tvfs();
         Ok(client)
@@ -898,6 +907,7 @@ impl EmbeddedClient {
             read_only_catalog: Some(catalog_name.to_string()),
             storage,
             write_branch: None,
+            snapshot_properties: None,
         })
     }
 
@@ -1051,6 +1061,15 @@ impl EmbeddedClient {
                         sqe_catalog::txn::reject_txn_ref(name)?;
                     }
                     self.write_branch = branch;
+                    return Ok(QueryResult::empty());
+                }
+                // Validated here, so a reserved key fails at SET time, not at
+                // the write. An empty list clears.
+                sqe_sql::StatementKind::SetSnapshotProperties(pairs) => {
+                    let clears = pairs.is_empty();
+                    let properties =
+                        sqe_core::snapshot_properties::SnapshotProperties::try_new(pairs)?;
+                    self.snapshot_properties = (!clears).then(|| Arc::new(properties));
                     return Ok(QueryResult::empty());
                 }
                 sqe_sql::StatementKind::CreateExternalTable(spec) => {

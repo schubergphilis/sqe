@@ -1,6 +1,9 @@
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use crate::snapshot_properties::SnapshotProperties;
 use crate::SecretString;
 
 /// Atomic credential bundle. The three fields rotate together: the access
@@ -61,6 +64,11 @@ pub struct Session {
     /// `SET WRITE_BRANCH = '<name>'`, INSERT/UPDATE/DELETE/MERGE statements
     /// route their snapshot ref updates to this branch instead of `main`.
     pub write_branch: Option<String>,
+    /// Iceberg snapshot summary properties that this session's autocommit
+    /// writes stamp into their commit, set by `SET SNAPSHOT_PROPERTIES`
+    /// outside a transaction. Inside a transaction the properties live on the
+    /// transaction's scope instead; these do not apply there.
+    pub snapshot_properties: Option<Arc<SnapshotProperties>>,
     /// Per-session Parquet compression codec, carried by the client in the
     /// `iceberg.compression_codec` Trino session property (`X-Trino-Session`).
     /// When set, write paths use it instead of `config.catalog.parquet_compression`.
@@ -142,6 +150,7 @@ impl Session {
             source: None,
             peer_ip: None,
             write_branch: None,
+            snapshot_properties: None,
             compression_codec: None,
             transaction_id: None,
             client_transaction: false,
@@ -180,6 +189,12 @@ impl Session {
     /// and sends subsequent writes to `main`.
     pub fn set_write_branch(&mut self, branch: Option<String>) {
         self.write_branch = branch;
+    }
+
+    /// Set the snapshot properties for this session's autocommit writes.
+    /// Passing `None` clears them.
+    pub fn set_snapshot_properties(&mut self, properties: Option<Arc<SnapshotProperties>>) {
+        self.snapshot_properties = properties;
     }
 
     /// `USE [catalog.]schema`: set the scope unqualified table references
@@ -479,6 +494,21 @@ mod tests {
         assert_eq!(s.user.subject.as_deref(), Some("u-1"));
         assert_eq!(s.user.email.as_deref(), Some("alice@x.io"));
         assert_eq!(s.user.groups, vec!["hr".to_string()]);
+    }
+
+    #[test]
+    fn snapshot_properties_default_to_none_and_can_be_set_and_cleared() {
+        let mut session = make_session();
+        assert!(session.snapshot_properties.is_none());
+
+        let props = Arc::new(
+            SnapshotProperties::try_new([("copy.run".to_string(), "42".to_string())]).unwrap(),
+        );
+        session.set_snapshot_properties(Some(props.clone()));
+        assert_eq!(session.snapshot_properties, Some(props));
+
+        session.set_snapshot_properties(None);
+        assert!(session.snapshot_properties.is_none());
     }
 
     #[test]

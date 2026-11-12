@@ -83,8 +83,18 @@ const RESERVED_KEYS: &[&str] = &[
 const RESERVED_PREFIXES: &[&str] = &["partitions.", "sqe.", "commit.", "write."];
 
 /// A validated set of snapshot summary properties, ordered by key.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct SnapshotProperties(BTreeMap<String, String>);
+
+/// Keys only: a `Session` or `TxnScope` that holds the set is logged with
+/// `{:?}`, and values are client data that stay out of logs.
+impl std::fmt::Debug for SnapshotProperties {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SnapshotProperties")
+            .field(&self.0.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
 
 fn invalid(message: String) -> SqeError {
     SqeError::with_code(SqeErrorCode::InvalidArguments, message)
@@ -243,6 +253,15 @@ impl SnapshotProperties {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_shows_keys_not_values() {
+        let p =
+            SnapshotProperties::try_new([("copy.run".to_string(), "s3cret".to_string())]).unwrap();
+        let shown = format!("{p:?}");
+        assert!(shown.contains("copy.run"), "{shown}");
+        assert!(!shown.contains("s3cret"), "{shown}");
+    }
 
     fn kv(k: &str, v: &str) -> (String, String) {
         (k.to_string(), v.to_string())

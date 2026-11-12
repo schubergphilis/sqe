@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex};
 
 use iceberg::table::Table;
 use iceberg::{Catalog, TableIdent};
+use sqe_core::snapshot_properties::SnapshotProperties;
 use uuid::Uuid;
 
 /// Prefix of every transaction branch. A sweep may remove refs with this
@@ -128,6 +129,10 @@ pub struct TxnScope {
     /// What a successful [`publish`] moved `main` to, per table, for the
     /// audit and lineage records of the COMMIT.
     published: Mutex<Vec<(TableIdent, i64)>>,
+    /// The snapshot summary properties `SET SNAPSHOT_PROPERTIES` set inside
+    /// this transaction. They live and die with the scope: a write inside the
+    /// transaction uses these only, never the session's.
+    snapshot_properties: Mutex<Option<Arc<SnapshotProperties>>>,
 }
 
 impl std::fmt::Debug for TxnScope {
@@ -148,7 +153,25 @@ impl TxnScope {
             catalog_key: Mutex::new(None),
             catalog: Mutex::new(None),
             published: Mutex::new(Vec::new()),
+            snapshot_properties: Mutex::new(None),
         })
+    }
+
+    /// Replace the snapshot properties of this transaction's writes; `None`
+    /// clears them.
+    pub fn set_snapshot_properties(&self, properties: Option<Arc<SnapshotProperties>>) {
+        *self
+            .snapshot_properties
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = properties;
+    }
+
+    /// The snapshot properties this transaction's writes carry, if any.
+    pub fn snapshot_properties(&self) -> Option<Arc<SnapshotProperties>> {
+        self.snapshot_properties
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Remember the catalog a branch commit went through. Called by the
@@ -856,6 +879,36 @@ mod tests {
             branch: txn.branch_name(),
         });
         txn
+    }
+
+    fn props(pairs: &[(&str, &str)]) -> Arc<SnapshotProperties> {
+        Arc::new(
+            SnapshotProperties::try_new(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_transaction_holds_its_own_snapshot_properties() {
+        let txn = TxnScope::new("tx-1");
+        let other = TxnScope::new("tx-2");
+        assert!(txn.snapshot_properties().is_none());
+
+        txn.set_snapshot_properties(Some(props(&[("copy.run", "42")])));
+        assert_eq!(
+            txn.snapshot_properties(),
+            Some(props(&[("copy.run", "42")]))
+        );
+        assert!(
+            other.snapshot_properties().is_none(),
+            "a second transaction does not see the first one's properties"
+        );
+
+        // A new set replaces the whole set; `None` clears it.
+        txn.set_snapshot_properties(Some(props(&[("a", "3")])));
+        assert_eq!(txn.snapshot_properties(), Some(props(&[("a", "3")])));
+        txn.set_snapshot_properties(None);
+        assert!(txn.snapshot_properties().is_none());
     }
 
     #[test]

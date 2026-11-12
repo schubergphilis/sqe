@@ -183,6 +183,11 @@ pub enum StatementKind {
     /// SET WRITE_BRANCH = 'name' — route writes in this session to a named branch.
     /// SET WRITE_BRANCH = DEFAULT (or unquoted) resets to main.
     SetWriteBranch(Option<String>),
+    /// `SET SNAPSHOT_PROPERTIES [=] ('k' = 'v', ...)` — the Iceberg snapshot
+    /// summary properties later writes stamp into their commit. An empty vec
+    /// (`()` or `RESET SNAPSHOT_PROPERTIES`) clears them. The keys are not
+    /// validated here; dispatch builds a `SnapshotProperties` from the pairs.
+    SetSnapshotProperties(Vec<(String, String)>),
     /// ALTER TABLE ... ADD/DROP/REPLACE PARTITION FIELD — partition spec evolution.
     /// sqlparser-rs has no AST for transform-based partition fields, so this
     /// variant carries the pre-parsed `PartitionEvolution` and routes through
@@ -318,6 +323,7 @@ impl StatementKind {
             StatementKind::ShowStats(_) => "showstats",
             StatementKind::RefDdl(_) => "refddl",
             StatementKind::SetWriteBranch(_) => "setwritebranch",
+            StatementKind::SetSnapshotProperties(_) => "setsnapshotproperties",
             StatementKind::PartitionEvolution(_) => "partitionevolution",
             StatementKind::IdentifierFields(_) => "identifierfields",
             StatementKind::SetTags(_) => "settags",
@@ -409,6 +415,7 @@ impl StatementKind {
             | StatementKind::ResetSession(_)
             | StatementKind::ShowSession { .. }
             | StatementKind::SetWriteBranch(_)
+            | StatementKind::SetSnapshotProperties(_)
             | StatementKind::Prepare { .. }
             | StatementKind::Deallocate(_)
             | StatementKind::DescribeOutput(_)
@@ -465,7 +472,9 @@ impl StatementKind {
             StatementKind::Truncate(_) => U::Truncate,
             StatementKind::Analyze(_) => U::Analyze,
             StatementKind::Procedure(_) => U::Call,
-            StatementKind::SetWriteBranch(_) | StatementKind::SetSession { .. } => U::SetSession,
+            StatementKind::SetWriteBranch(_)
+            | StatementKind::SetSnapshotProperties(_)
+            | StatementKind::SetSession { .. } => U::SetSession,
             StatementKind::ResetSession(_) => U::ResetSession,
             StatementKind::Prepare { .. } => U::Prepare,
             StatementKind::Deallocate(_) => U::Deallocate,
@@ -477,7 +486,8 @@ impl StatementKind {
     /// this kind wraps one. Returns `None` for variants that are
     /// pre-parsed into custom shapes (RefDdl, PartitionEvolution,
     /// IdentifierFields, Procedure, ExplainFull, ShowSchemas, ShowTables, ShowStats,
-    /// ShowGrants, SetWriteBranch, Use, Truncate, Begin/Commit/Rollback).
+    /// ShowGrants, SetWriteBranch, SetSnapshotProperties, Use, Truncate,
+    /// Begin/Commit/Rollback).
     ///
     /// Used by the coordinator to walk the AST for cross-cutting
     /// validations (e.g. unknown catalog qualifier in 3-part names)
@@ -885,6 +895,22 @@ fn try_classify_custom(parser: &mut Parser, sql: &str) -> sqe_core::Result<Optio
             expect_end(parser)?;
             Some(StatementKind::SetWriteBranch(None))
         }
+        // SET SNAPSHOT_PROPERTIES [=] ('k' = 'v', ...) | (): the snapshot
+        // summary properties that later writes stamp into their commit.
+        ["SET", "SNAPSHOT_PROPERTIES", ..] => {
+            consume_words(parser, &["SET", "SNAPSHOT_PROPERTIES"]);
+            // The `=` is optional, as it is for `SET WRITE_BRANCH`.
+            let _ = parser.consume_token(&Token::Eq);
+            let pairs = parse_snapshot_property_list(parser)?;
+            expect_end(parser)?;
+            Some(StatementKind::SetSnapshotProperties(pairs))
+        }
+        // RESET SNAPSHOT_PROPERTIES: the same as `SET SNAPSHOT_PROPERTIES ()`.
+        ["RESET", "SNAPSHOT_PROPERTIES", ..] => {
+            consume_words(parser, &["RESET", "SNAPSHOT_PROPERTIES"]);
+            expect_end(parser)?;
+            Some(StatementKind::SetSnapshotProperties(Vec::new()))
+        }
         // SET SESSION <name> = <value> (Trino session property). (#628)
         ["SET", "SESSION", ..] => {
             consume_words(parser, &["SET", "SESSION"]);
@@ -1050,6 +1076,39 @@ fn parse_write_branch_value(parser: &mut Parser) -> sqe_core::Result<Option<Stri
     };
     parser.next_token();
     Ok(Some(value))
+}
+
+/// `SET SNAPSHOT_PROPERTIES` value: `( 'k' = 'v' [, ...] )` or `()`. Keys and
+/// values must be single-quoted string literals; anything else is a syntax
+/// error. The pairs are returned in source order and are not validated.
+fn parse_snapshot_property_list(parser: &mut Parser) -> sqe_core::Result<Vec<(String, String)>> {
+    parser.expect_token(&Token::LParen).map_err(parse_error)?;
+    let mut pairs = Vec::new();
+    if parser.consume_token(&Token::RParen) {
+        return Ok(pairs);
+    }
+    loop {
+        let key = parse_snapshot_property_string(parser, "key")?;
+        parser.expect_token(&Token::Eq).map_err(parse_error)?;
+        let value = parse_snapshot_property_string(parser, "value")?;
+        pairs.push((key, value));
+        if parser.consume_token(&Token::Comma) {
+            continue;
+        }
+        parser.expect_token(&Token::RParen).map_err(parse_error)?;
+        return Ok(pairs);
+    }
+}
+
+/// One single-quoted string literal of a snapshot-property pair.
+fn parse_snapshot_property_string(parser: &mut Parser, what: &str) -> sqe_core::Result<String> {
+    let tok = parser.next_token();
+    match tok.token {
+        Token::SingleQuotedString(s) => Ok(s),
+        other => Err(syntax_error(format!(
+            "SET SNAPSHOT_PROPERTIES expects a single-quoted string for the {what}, found: {other}"
+        ))),
+    }
 }
 
 /// The user-facing text of a literal expression: the unquoted string for
@@ -3206,6 +3265,137 @@ mod tests {
     fn test_set_write_branch_name() {
         let kind = parse_and_classify("SET WRITE_BRANCH = 'x'").unwrap();
         assert_eq!(kind.name(), "setwritebranch");
+    }
+
+    // ── SET SNAPSHOT_PROPERTIES tests ─────────────────────────────────────
+
+    fn snapshot_pairs(sql: &str) -> Vec<(String, String)> {
+        match parse_and_classify(sql) {
+            Ok(StatementKind::SetSnapshotProperties(pairs)) => pairs,
+            other => panic!("{sql}: expected SetSnapshotProperties, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_set_snapshot_properties_pairs() {
+        assert_eq!(
+            snapshot_pairs("SET SNAPSHOT_PROPERTIES = ('copy.run' = '42', 'owner' = 'it''s me')"),
+            vec![
+                ("copy.run".to_string(), "42".to_string()),
+                ("owner".to_string(), "it's me".to_string()),
+            ]
+        );
+        assert_eq!(
+            snapshot_pairs("SET SNAPSHOT_PROPERTIES ('a' = '1');"),
+            vec![("a".to_string(), "1".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_set_snapshot_properties_equals_is_optional() {
+        let with = snapshot_pairs("SET SNAPSHOT_PROPERTIES = ('a' = '1')");
+        let without = snapshot_pairs("SET SNAPSHOT_PROPERTIES ('a' = '1')");
+        assert_eq!(with, without);
+    }
+
+    #[test]
+    fn test_set_snapshot_properties_empty_list_clears() {
+        assert!(snapshot_pairs("SET SNAPSHOT_PROPERTIES ()").is_empty());
+        assert!(snapshot_pairs("SET SNAPSHOT_PROPERTIES = ( )").is_empty());
+    }
+
+    #[test]
+    fn test_reset_snapshot_properties_clears() {
+        for sql in [
+            "RESET SNAPSHOT_PROPERTIES",
+            "reset snapshot_properties",
+            "RESET SNAPSHOT_PROPERTIES;",
+        ] {
+            assert!(snapshot_pairs(sql).is_empty(), "{sql}");
+        }
+        assert!(parse_and_classify("RESET SNAPSHOT_PROPERTIES ('a' = '1')").is_err());
+    }
+
+    #[test]
+    fn test_set_snapshot_properties_keywords_are_case_insensitive() {
+        assert_eq!(
+            snapshot_pairs("set snapshot_properties = ('Key' = 'Value')"),
+            vec![("Key".to_string(), "Value".to_string())]
+        );
+        assert_eq!(
+            snapshot_pairs("Set Snapshot_Properties ('a' = '1')"),
+            vec![("a".to_string(), "1".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_set_snapshot_properties_refuses_non_string_literals() {
+        for sql in [
+            "SET SNAPSHOT_PROPERTIES (copy.run = '42')",
+            "SET SNAPSHOT_PROPERTIES (copy = '42')",
+            "SET SNAPSHOT_PROPERTIES (\"copy.run\" = '42')",
+            "SET SNAPSHOT_PROPERTIES ('a' = 42)",
+            "SET SNAPSHOT_PROPERTIES ('a' = value)",
+            "SET SNAPSHOT_PROPERTIES ('a' = \"v\")",
+            "SET SNAPSHOT_PROPERTIES ('a' = NULL)",
+        ] {
+            assert!(parse_and_classify(sql).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_set_snapshot_properties_refuses_malformed_lists() {
+        for sql in [
+            "SET SNAPSHOT_PROPERTIES",
+            "SET SNAPSHOT_PROPERTIES =",
+            "SET SNAPSHOT_PROPERTIES 'a'",
+            "SET SNAPSHOT_PROPERTIES ('a')",
+            "SET SNAPSHOT_PROPERTIES ('a' = '1'",
+            "SET SNAPSHOT_PROPERTIES ('a' = '1',)",
+            "SET SNAPSHOT_PROPERTIES ('a' '1')",
+            "SET SNAPSHOT_PROPERTIES (,)",
+        ] {
+            assert!(parse_and_classify(sql).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_set_snapshot_properties_refuses_trailing_garbage() {
+        for sql in [
+            "SET SNAPSHOT_PROPERTIES ('a' = '1') extra",
+            "SET SNAPSHOT_PROPERTIES () extra",
+            "SET SNAPSHOT_PROPERTIES ('a' = '1') ('b' = '2')",
+            "SET SNAPSHOT_PROPERTIES ('a' = '1'), ('b' = '2')",
+        ] {
+            assert!(parse_and_classify(sql).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_set_snapshot_properties_does_not_validate_keys() {
+        // Validation belongs to dispatch (`SnapshotProperties::try_new`).
+        assert_eq!(
+            snapshot_pairs("SET SNAPSHOT_PROPERTIES ('operation' = 'x')"),
+            vec![("operation".to_string(), "x".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_set_snapshot_properties_kind_traits() {
+        let kind = parse_and_classify("SET SNAPSHOT_PROPERTIES ('a' = '1')").unwrap();
+        assert_eq!(kind.name(), "setsnapshotproperties");
+        assert!(kind.allowed_in_transaction());
+        assert!(matches!(kind.update_type(), Some(UpdateType::SetSession)));
+        assert!(kind.statement().is_none());
+        assert!(!kind.is_data_write());
+    }
+
+    #[test]
+    fn test_set_snapshot_properties_after_leading_comment() {
+        assert_eq!(
+            snapshot_pairs("-- c\nSET SNAPSHOT_PROPERTIES ('a' = '1')"),
+            vec![("a".to_string(), "1".to_string())]
+        );
     }
 
     // ── PARTITION FIELD evolution tests ───────────────────────────────────
