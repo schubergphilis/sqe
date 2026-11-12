@@ -25,6 +25,7 @@
   - Files are `query_handler/<family>.rs` child modules (`use super::*;`), following `query_handler/admission.rs`, instead of a `statement/` directory. Moved methods called from `execute_inner` become `pub(super)`.
   - [x] `write` (MERGE, INSERT, CTAS): `query_handler/write.rs`, 370 lines
   - [x] `show` (SHOW CREATE, CATALOGS, SCHEMAS, COLUMNS, TABLES, VIEWS, FUNCTIONS, ROLES; `deny_hidden_table`): `query_handler/show.rs`, 897 lines
+  - [x] `time_travel` (FOR SYSTEM_TIME / VERSION AS OF, FOR INCREMENTAL; `TimeTravelCleanup`): `query_handler/time_travel.rs`, 580 lines
 
 ## 4. Completion stage
 
