@@ -18,7 +18,7 @@
 - [x] 3.1 `Drop` (79 lines), move-only, `FILTER=drop` (`handle_drop_statement`; 16 passed)
 - [x] 3.2 `Merge` (79 lines), `FILTER=merge` (`handle_merge_statement`; 12 passed)
 - [x] 3.3 `Insert` (95 lines), `FILTER=insert` (`handle_insert_statement`; 23 passed)
-- [ ] 3.4 `Utility` (140 lines)
+- [x] 3.4 `Utility` (140 lines) (`handle_utility_statement`; explain 4, show 11, describe 5, time_zone 1 passed)
 - [ ] 3.5 `Procedure` (144 lines), `FILTER=procedure`
 - [ ] 3.6 `Ctas` (150 lines), `FILTER=ctas`
 - [ ] 3.7 Move the `handle_*` families into `statement/*.rs` files of `impl QueryHandler` blocks, one family per merge request; access-control family last and only after 1.1
