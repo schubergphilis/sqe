@@ -1,0 +1,5 @@
+**STATUS 2026-11-12: `execute_inner` split into preflight / dispatch / complete (`refactor/statement-stage-split`, openspec statement-path-restructure 1.4, 2.1-2.4).**
+
+The change is a move: `git diff --color-moved=zebra --color-moved-ws=allow-indentation-change` shows the bodies as moved, and only the seams are new. `StatementRun` carries what the stages share. Its guard fields are declared in reverse of their old local order, because struct fields drop in declaration order. The `select!` stays in `execute_inner`, and `complete` starts after it, so `complete` is not generic over the dispatch future (a deviation from task 2.3's wording). Baseline profile, 3 runs on main 1e80cd220: sqe-coordinator `evaluate_obligation` 14.97 s, typeck 1.05 s, `execute_inner` 4 ms. After the split, one run: 14.71 s, and no stage over 50 ms, so nothing is boxed (2.4). The heaviest roots are `flight_sql` `do_get_tables` and `system_runtime` `scan` at 3.4 s each, and they are the next compile levers. `execute_inner` is still about 1,340 lines, almost all of it the dispatch match, which section 3 shrinks.
+
+**NEXT:** section 3, lifting the six fat dispatch arms, starting with `Drop`.

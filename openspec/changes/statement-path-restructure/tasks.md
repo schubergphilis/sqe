@@ -3,15 +3,15 @@
 - [x] 1.1 Bisect `access_control_e2e::insert_does_not_confer_storage_relocation` (red on `main` since before 5d1f41e62) and fix it (first bad 55b259a87: empty no-op probe is `UPDATE_TABLE` in Polaris; probe now drops the absent `main`)
 - [x] 1.2 Add tests that count audit records: refusal after classification, result-cache hit, execution failure, timeout, cancellation (one record each); and pin what the size check, audit-closed check and admission refusal write today
 - [x] 1.3 Add a test that a cancelled write still audits the tables of its plan (CTAS; the INSERT path is not covered)
-- [ ] 1.4 Record a baseline `scripts/compile-profile.sh sqe-coordinator` profile
+- [x] 1.4 Record a baseline `scripts/compile-profile.sh sqe-coordinator` profile (3 runs on 1e80cd220: `evaluate_obligation` 14.97 s, typeck 1.05 s, `execute_inner` 4 ms)
 
 ## 2. Stage split (pilot)
 
-- [ ] 2.1 Introduce `StatementRun` with the fields the three parts share; no behaviour change
-- [ ] 2.2 Split `execute_inner` at the end of the result-cache lookup into `preflight`
-- [ ] 2.3 Split at the `select!` into `complete`
-- [ ] 2.4 Re-profile back to back; box a stage only if the profile bills it
-- [ ] 2.5 `make test-integration` green; one merge request
+- [x] 2.1 Introduce `StatementRun` with the fields the three parts share; no behaviour change
+- [x] 2.2 Split `execute_inner` at the end of the result-cache lookup into `preflight`
+- [x] 2.3 Split at the `select!` into `complete` (the `select!` stays in `execute_inner`; `complete` starts after it, so it is not generic over the dispatch future)
+- [x] 2.4 Re-profile back to back; box a stage only if the profile bills it (14.71 s after; no stage over 50 ms; nothing boxed)
+- [x] 2.5 `make test-integration` green; one merge request (356 passed, 0 failed, on b2f364dad)
 
 ## 3. Lift the inline dispatch arms
 
