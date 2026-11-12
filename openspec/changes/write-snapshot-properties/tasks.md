@@ -6,11 +6,11 @@
 
 ## 2. Statement and session state
 
-- [ ] 2.1 Classifier: `SET SNAPSHOT_PROPERTIES [=] ('k' = 'v', ...)`, `SET SNAPSHOT_PROPERTIES ()`, `RESET SNAPSHOT_PROPERTIES` -> `StatementKind::SetSnapshotProperties`, `allowed_in_transaction`; parser tests
-- [ ] 2.2 `Session::snapshot_properties` and `SessionManager::set_snapshot_properties`
-- [ ] 2.3 `TxnScope` holds the transaction's properties; dropped when the transaction ends
-- [ ] 2.4 Coordinator dispatch: inside a transaction set them on its `TxnScope`, outside it on the session; refuse when the session is not held (no silent ignore)
-- [ ] 2.5 Embedded CLI dispatch (`sqe-cli/src/embedded.rs`)
+- [x] 2.1 Classifier: `SET SNAPSHOT_PROPERTIES [=] ('k' = 'v', ...)`, `SET SNAPSHOT_PROPERTIES ()`, `RESET SNAPSHOT_PROPERTIES` -> `StatementKind::SetSnapshotProperties`, `allowed_in_transaction`; parser tests
+- [x] 2.2 `Session::snapshot_properties` and `SessionManager::set_snapshot_properties`
+- [x] 2.3 `TxnScope` holds the transaction's properties; dropped when the transaction ends
+- [x] 2.4 Coordinator dispatch: inside a transaction set them on its `TxnScope`, outside it on the session; refuse when the session is not held (no silent ignore)
+- [x] 2.5 Embedded CLI dispatch (`sqe-cli/src/embedded.rs`)
 
 ## 3. Carry to the commit
 

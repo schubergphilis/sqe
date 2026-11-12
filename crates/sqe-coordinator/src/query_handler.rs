@@ -1594,6 +1594,52 @@ impl QueryHandler {
             .transpose()
     }
 
+    /// `SET SNAPSHOT_PROPERTIES` / `RESET SNAPSHOT_PROPERTIES`: validate the
+    /// pairs, then store them where the write that follows will look. Inside a
+    /// transaction that is the transaction's scope only (the session's own
+    /// properties never apply there); outside one it is the stored session.
+    /// A session the coordinator does not hold (Trino HTTP builds a new one
+    /// per request) cannot keep them, so the statement is refused instead of
+    /// ignored. An empty set clears. The log line names keys, never values.
+    fn handle_set_snapshot_properties(
+        &self,
+        session: &Session,
+        pairs: &[(String, String)],
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let properties =
+            sqe_core::snapshot_properties::SnapshotProperties::try_new(pairs.iter().cloned())?;
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        let properties = (!pairs.is_empty()).then(|| Arc::new(properties));
+        if let Some(scope) = self.txn_scope(session)? {
+            scope.set_snapshot_properties(properties);
+            tracing::info!(
+                username = %session.user.username,
+                transaction = %scope.id(),
+                keys = ?keys,
+                "SET SNAPSHOT_PROPERTIES applied to the transaction"
+            );
+            return Ok(vec![]);
+        }
+        let stored = self
+            .session_manager
+            .as_ref()
+            .is_some_and(|m| m.set_snapshot_properties(&session.id, properties));
+        if !stored {
+            return Err(SqeError::with_code(
+                SqeErrorCode::NotSupported,
+                "SET SNAPSHOT_PROPERTIES outside a transaction needs a session the server \
+                 keeps (Flight SQL); on this connection run it inside a transaction"
+                    .to_string(),
+            ));
+        }
+        tracing::info!(
+            username = %session.user.username,
+            keys = ?keys,
+            "SET SNAPSHOT_PROPERTIES applied to the session"
+        );
+        Ok(vec![])
+    }
+
     /// Write the audit record for a statement that failed before its normal
     /// audit point (parse, catalog preflight, planning, access denied at
     /// planning). Every admitted statement leaves exactly one audit line,
@@ -2259,6 +2305,9 @@ impl QueryHandler {
                         );
                     }
                     Ok(vec![])
+                }
+                StatementKind::SetSnapshotProperties(pairs) => {
+                    self.handle_set_snapshot_properties(session, pairs)
                 }
                 StatementKind::CreateView(stmt) => {
                     self.handle_create_view(session, stmt).await?;
@@ -7938,6 +7987,147 @@ mod show_stats_policy_tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("memory is"), "{err}");
+    }
+
+    fn snapshot_props_session(transaction: bool) -> sqe_core::Session {
+        let session = sqe_core::Session::new(
+            "loader".to_string(),
+            sqe_core::SecretString::new("tok".to_string()),
+            None,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            Vec::new(),
+        );
+        if transaction {
+            session.with_transaction_id(Some(sqe_core::txn_id::new_txn_id()))
+        } else {
+            session
+        }
+    }
+
+    fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// Inside a transaction the properties live on its scope and only there;
+    /// an empty list clears them.
+    #[tokio::test]
+    async fn set_snapshot_properties_inside_a_transaction_sets_the_scope() {
+        let handler = pressure_handler("64MB");
+        let session = snapshot_props_session(true);
+        let scope = handler
+            .txn_scope(&session)
+            .expect("scope")
+            .expect("in a transaction");
+        assert!(scope.snapshot_properties().is_none());
+
+        let out = handler
+            .handle_set_snapshot_properties(&session, &pairs(&[("copy.run", "42")]))
+            .expect("set inside a transaction needs no session manager");
+        assert!(out.is_empty());
+        let held = scope.snapshot_properties().expect("set on the scope");
+        assert_eq!(
+            *held,
+            sqe_core::snapshot_properties::SnapshotProperties::try_new(pairs(&[(
+                "copy.run", "42"
+            )]))
+            .unwrap()
+        );
+        assert!(
+            session.snapshot_properties.is_none(),
+            "the session's own properties are untouched"
+        );
+
+        handler
+            .handle_set_snapshot_properties(&session, &[])
+            .expect("clear");
+        assert!(scope.snapshot_properties().is_none());
+    }
+
+    /// A rejected key leaves the transaction's properties as they were, and
+    /// the error names the key.
+    #[tokio::test]
+    async fn set_snapshot_properties_refuses_a_reserved_key_and_keeps_the_old_set() {
+        let handler = pressure_handler("64MB");
+        let session = snapshot_props_session(true);
+        handler
+            .handle_set_snapshot_properties(&session, &pairs(&[("copy.run", "42")]))
+            .expect("set");
+
+        let err = handler
+            .handle_set_snapshot_properties(&session, &pairs(&[("sqe.maintenance.kind", "x")]))
+            .expect_err("reserved prefix");
+        assert_eq!(
+            err.error_code(),
+            sqe_core::SqeErrorCode::InvalidArguments,
+            "{err}"
+        );
+        assert!(err.to_string().contains("sqe.maintenance.kind"), "{err}");
+
+        let scope = handler.txn_scope(&session).unwrap().unwrap();
+        assert!(scope.snapshot_properties().is_some(), "old set kept");
+    }
+
+    /// Outside a transaction with no stored session the statement is refused,
+    /// never ignored (Trino HTTP builds a session per request).
+    #[tokio::test]
+    async fn set_snapshot_properties_outside_a_transaction_needs_a_held_session() {
+        let handler = pressure_handler("64MB");
+        let session = snapshot_props_session(false);
+
+        let err = handler
+            .handle_set_snapshot_properties(&session, &pairs(&[("copy.run", "42")]))
+            .expect_err("no session manager");
+        assert_eq!(
+            err.error_code(),
+            sqe_core::SqeErrorCode::NotSupported,
+            "{err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("Flight SQL"), "{msg}");
+        assert!(msg.contains("inside a transaction"), "{msg}");
+
+        // RESET is the same statement with an empty set and is refused too.
+        let err = handler
+            .handle_set_snapshot_properties(&session, &[])
+            .expect_err("RESET without a held session");
+        assert_eq!(
+            err.error_code(),
+            sqe_core::SqeErrorCode::NotSupported,
+            "{err}"
+        );
+
+        // The same refusal through the statement path.
+        let err = handler
+            .execute(
+                &session,
+                "SET SNAPSHOT_PROPERTIES ('copy.run' = '42')",
+                None,
+            )
+            .await
+            .expect_err("dispatch refuses");
+        assert_eq!(
+            err.error_code(),
+            sqe_core::SqeErrorCode::NotSupported,
+            "{err}"
+        );
+
+        // Validation comes first: a bad key is InvalidArguments, not NotSupported.
+        let err = handler
+            .execute(
+                &session,
+                "SET SNAPSHOT_PROPERTIES ('operation' = 'x')",
+                None,
+            )
+            .await
+            .expect_err("reserved key");
+        assert_eq!(
+            err.error_code(),
+            sqe_core::SqeErrorCode::InvalidArguments,
+            "{err}"
+        );
     }
 }
 

@@ -7,6 +7,7 @@ use tracing::{debug, info, warn};
 
 use sqe_auth::Authenticator;
 use sqe_auth::{AuthProvider, FlightCredentials, Identity};
+use sqe_core::snapshot_properties::SnapshotProperties;
 use sqe_core::Session;
 
 fn now_micros() -> i64 {
@@ -439,6 +440,18 @@ impl SessionManager {
         self.update_session(session_id, |s| s.set_write_branch(branch))
     }
 
+    /// Update the session's snapshot properties, which its later autocommit
+    /// writes stamp into their commit. Passing `None` clears them. Returns
+    /// `false` for a session the manager does not hold, so the caller can
+    /// refuse the statement instead of dropping it.
+    pub fn set_snapshot_properties(
+        &self,
+        session_id: &str,
+        properties: Option<Arc<SnapshotProperties>>,
+    ) -> bool {
+        self.update_session(session_id, |s| s.set_snapshot_properties(properties))
+    }
+
     /// Copy the stored session, apply `mutate`, re-insert. The read guard is
     /// dropped BEFORE the insert: `DashMap::insert` on a shard whose read
     /// guard the same thread still holds deadlocks (the first test of
@@ -788,6 +801,41 @@ mod tests {
             with_branch.default_schema.as_deref(),
             Some("hr"),
             "one setter does not clobber the other"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: SET SNAPSHOT_PROPERTIES mutates the stored session
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn set_snapshot_properties_updates_the_stored_session() {
+        let auth = make_authenticator().await;
+        let manager = SessionManager::new(auth);
+        let session = Arc::new(make_session("dave"));
+        let id = session.id.clone();
+        manager.sessions.insert(id.clone(), session);
+
+        let props = Arc::new(
+            SnapshotProperties::try_new([("copy.run".to_string(), "42".to_string())]).unwrap(),
+        );
+        assert!(manager.set_snapshot_properties(&id, Some(props.clone())));
+        let with_props = manager.get_session(&id).expect("session");
+        assert_eq!(with_props.snapshot_properties, Some(props));
+
+        // The other copy-and-reinsert setters must not clobber it, nor it them.
+        assert!(manager.set_write_branch(&id, Some("audit".into())));
+        let with_both = manager.get_session(&id).expect("session");
+        assert_eq!(with_both.write_branch.as_deref(), Some("audit"));
+        assert!(with_both.snapshot_properties.is_some());
+
+        assert!(manager.set_snapshot_properties(&id, None));
+        let cleared = manager.get_session(&id).expect("session");
+        assert!(cleared.snapshot_properties.is_none());
+        assert_eq!(cleared.write_branch.as_deref(), Some("audit"));
+
+        assert!(
+            !manager.set_snapshot_properties("no-such-session", None),
+            "an unknown session reports false so the caller can refuse the statement"
         );
     }
 
