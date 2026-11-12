@@ -1404,9 +1404,9 @@ impl TableProvider for HiveTableProvider {
             return self.scan_from_entries(state, projection.map(Vec::as_slice), rewritten, limit);
         }
         let held = SendErased::new(rewritten);
+        let quiet = without_footer_statistics(state).map(SendErased::new);
         Box::pin(async move {
-            let quiet = without_footer_statistics(state);
-            let state: &dyn Session = quiet.as_ref().map_or(state, |s| s as &dyn Session);
+            let state: &dyn Session = quiet.as_ref().map_or(state, |s| s.get() as &dyn Session);
             let plan = self
                 .inner
                 .scan(state, projection, held.get(), limit)
@@ -1444,9 +1444,9 @@ impl TableProvider for HiveTableProvider {
         }
         let held = SendErased::new(rewritten.unwrap_or_default());
         let has_filters = args.filters().is_some();
+        let quiet = without_footer_statistics(state).map(SendErased::new);
         Box::pin(async move {
-            let quiet = without_footer_statistics(state);
-            let state: &dyn Session = quiet.as_ref().map_or(state, |s| s as &dyn Session);
+            let state: &dyn Session = quiet.as_ref().map_or(state, |s| s.get() as &dyn Session);
             let mut new_args = ScanArgs::default()
                 .with_projection(projection)
                 .with_limit(limit);
@@ -2272,7 +2272,27 @@ impl SchemaProvider for HiveSchemaProvider {
         }))
     }
 
-    async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+    // Written in `async_trait`'s desugared form, with the body in an
+    // inherent function below (compile time, see
+    // docs/internal/plans/2026-09-07-compile-time-async-hubs.md): the
+    // coroutine's `Send` proof is paid once in `load_table`'s own parameter
+    // environment instead of in this method's.
+    fn table<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        name: &'life1 str,
+    ) -> BoxFuture<'async_trait, DFResult<Option<Arc<dyn TableProvider>>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(self.load_table(name))
+    }
+}
+
+impl HiveSchemaProvider {
+    /// The body of [`SchemaProvider::table`].
+    async fn load_table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
         // A denied table is absent, not an error (#716), same as SHOW TABLES.
         if !self.visible(name) {
             return Ok(None);

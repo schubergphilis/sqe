@@ -157,7 +157,13 @@ impl BufferBudget {
 
 /// A `MemTable` that keeps its decoded batches charged to the pool.
 struct ReservedMemTable {
-    inner: MemTable,
+    /// Held as a trait object on purpose (compile time, see
+    /// docs/internal/plans/2026-09-07-compile-time-async-hubs.md): with a
+    /// concrete `MemTable` here, type-checking `scan` proved
+    /// `ReservedMemTable: Send + Sync` over `MemTable`'s `Expr` column
+    /// defaults and sort order, about 1.7 s. `dyn TableProvider` is `Send +
+    /// Sync` by declaration, so the walk stops here.
+    inner: Arc<dyn TableProvider>,
     _budget: BufferBudget,
 }
 
@@ -577,7 +583,7 @@ pub(crate) fn decode_ndjson_to_memtable(
     // the reservation now tracks only the decoded batches.
     budget.release(ndjson.len());
 
-    let inner = MemTable::try_new(schema, vec![batches])?;
+    let inner: Arc<dyn TableProvider> = Arc::new(MemTable::try_new(schema, vec![batches])?);
     Ok(Arc::new(ReservedMemTable {
         inner,
         _budget: budget,
