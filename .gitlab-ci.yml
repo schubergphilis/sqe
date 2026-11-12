@@ -210,6 +210,24 @@ sqe-publish-latest:
       exists:
         - Dockerfile
 
+# A merged `release/vX.Y.Z` MR tags its merge commit `vX.Y.Z`; the tag
+# pipeline then builds and publishes the release. The branch carries the
+# version bump (scripts/release.sh on that branch), and the script refuses a
+# tag whose version does not match [workspace.package]. Hotfix branches such
+# as `release/0.35.x` do not match and still tag by hand. Not interruptible:
+# a later merge to main must not cancel the tag.
+sqe-tag-release:
+  interruptible: false
+  stage: .pre
+  needs: []
+  image: python:3.12-alpine@sha256:b64631e04e4920160c50fbe8d8df828f7f35f06f425cb44aa09bca53e708a35a
+  script:
+    - python3 scripts/ci-tag-release.py
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_MESSAGE =~ /^Merge branch .release\/v\d+\.\d+\.\d+. into/'
+
 # Scheduled rescan of the deployed release; main uses the digest gate.
 aikido-image-scan:
   variables:

@@ -6,9 +6,11 @@ the root `Cargo.toml`; all 17 crates inherit it with `version.workspace = true`.
 A release is one annotated git tag `vX.Y.Z` pointing at a commit where that
 version (and `Cargo.lock`) has been bumped to match.
 
-There are two ways to cut a release. The **branch-name** flow is the default and
-runs entirely in CI (aikido owns it). The **local script** is a fallback for
-hotfixes, pre-releases, or when you want full local control.
+Releases are cut by hand, never on an ordinary merge. The default is a
+**release branch**: `scripts/release.sh` prepares `release/vX.Y.Z`, the merge
+request is reviewed and merged, and CI tags the merge commit. The **local
+script** with a pushed tag stays for hotfixes on an older minor and for
+pre-releases.
 
 ## Where images go
 
@@ -42,35 +44,41 @@ between releases **reports the previous release version** — a `<short-sha>` im
 from today still identifies itself as v0.37.0. That is expected, and it is why
 `:<short-sha>` is a poor thing to pin in a deployment.
 
-## Cutting a release: the branch-name flow (default)
+## Cutting a release: the release branch (default)
 
-Owned by aikido's `aikido-release` job (`semver_release.py`), not by this repo.
-On every merge to `main` it bumps the version, commits it back, and tags it.
+```bash
+git switch -c release/v0.54.0 origin/main
+scripts/release.sh 0.54.0 --push
+glab mr create --source-branch release/v0.54.0 --target-branch main \
+  --title "chore(release): 0.54.0"
+```
 
-The **bump level comes from the merged MR's source branch name**, not from the
-MR title:
+On a `release/vX.Y.Z` branch `release.sh` bumps `[workspace.package] version`,
+refreshes `Cargo.lock`, updates the Helm chart, folds `changelog.d/` into
+`CHANGELOG.md` and commits `chore(release): X.Y.Z`. It does **not** tag: with
+`--push` it pushes only the branch. The version is yours to choose (see
+"Choosing the version by hand" below); the branch name must carry the same
+version.
 
-| Source branch | Bump  | Example: from `v0.37.0` |
-|---------------|-------|-------------------------|
-| `release/*`   | major | `v1.0.0`                |
-| `feat/*`      | minor | `v0.38.0`               |
-| anything else | patch | `v0.37.1`               |
+The merge request runs the normal MR pipeline. Review the changelog section in
+it: that text becomes the GitLab Release notes.
 
-Note that `release/*` means **major** here. Under this repo's pre-aikido flow it
-merely marked a branch as releasable and the level came from the MR title; a
-`release/*` MR merged today cuts a major version.
+Merge it. The `main` pipeline for the merge commit runs `sqe-tag-release`
+(`scripts/ci-tag-release.py`, stage `.pre`, not interruptible). The job runs
+only when the merge commit message is `Merge branch 'release/vX.Y.Z' into ...`,
+so keep GitLab's default merge commit message. It:
 
-The job is a dry-run — it prints the plan and stops — unless the project CI/CD
-variable `AIKIDO_RELEASE=1` is set. If releases are not happening on merge, check
-that variable first.
+1. Reads `X.Y.Z` from the merge commit message.
+2. Refuses (job fails, no tag) when `[workspace.package] version` on `main` is
+   not `X.Y.Z`. Rerun `release.sh` on the branch and merge again.
+3. Passes without change when `vX.Y.Z` already points at this commit (a retry),
+   and fails when it points anywhere else.
+4. Creates the annotated tag `vX.Y.Z` on the merge commit through the GitLab
+   API, with `AIKIDO_GROUP_TOKEN`.
 
-Merge it. CI then, on the `main` push:
-
-1. Finds the merged MR for the commit and reads its source branch.
-2. Computes the next version from the highest existing `vX.Y.Z` tag.
-3. Writes the new version into `Cargo.toml`, syncs `Cargo.lock`, and commits
-   `chore(release): vX.Y.Z [skip ci]` to `main`.
-4. Creates the tag `vX.Y.Z`.
+If the job fails on the token (HTTP 401/403), create the tag by hand on the
+merge commit: `git tag -a vX.Y.Z -m "Release vX.Y.Z" <merge-sha> && git push
+origin vX.Y.Z`. Then fix the token's rights on protected `v*` tags.
 
 The tag pipeline then builds and pushes to the GitLab registry
 (`aikido-release-image`) and mirrors to Harbor (`aikido-publish-release-image`):
@@ -95,15 +103,21 @@ containing it — renovate does this automatically — **a tag pipeline mirrors
 nothing**. That is why Harbor served `:stable` = `v0.37.0` from 2026-06-24 onward
 while `main` moved 1110 commits.
 
-There is no "non-release" MR any more: every merge to `main` goes through
-`aikido-release`, and a branch that matches nothing still cuts a patch. Use the
-branch name to say what you mean.
+### aikido's automatic release stays off
+
+The aikido template also ships `aikido-release` (`semver_release.py`), which on
+every merge to `main` would bump the version from the source branch name
+(`release/*` major, `feat/*` minor, anything else patch), commit it back and
+tag. It runs as a dry-run, printing its plan, unless the CI/CD variable
+`AIKIDO_RELEASE=1` is set. Keep that variable unset: with it, every merge cuts a
+release, and a merged `release/vX.Y.Z` branch would get a major bump on top of
+the version `release.sh` already set.
 
 ## Cutting a release: the local script (fallback / hotfix)
 
-`scripts/release.sh` does the same version bump locally and pushes the tag
-directly. Use it for emergency hotfixes on an older minor, or when you cannot go
-through an MR.
+Off a `release/vX.Y.Z` branch, `scripts/release.sh` does the same version bump,
+tags locally and pushes the tag directly. Use it for hotfixes on an older minor,
+for pre-releases, or when you cannot go through an MR.
 
 ```bash
 # Bump, commit, tag locally (does not push)
@@ -203,10 +217,11 @@ Harbor images stay the GitLab tag pipeline's job; GitHub only gets binaries.
 
 All of this is aikido-owned now; the pre-aikido `RELEASE_TOKEN` is no longer read.
 
-- `AIKIDO_RELEASE=1` — without it `aikido-release` only prints its plan and no
-  tag is ever created.
-- `AIKIDO_GROUP_TOKEN` — used by `semver_release.py` to commit the version bump
-  and create the tag through the GitLab API on the protected `main` branch.
+- `AIKIDO_RELEASE` stays **unset**, so `aikido-release` only prints its plan
+  (see "aikido's automatic release stays off").
+- `AIKIDO_GROUP_TOKEN`: `sqe-tag-release` creates the `vX.Y.Z` tag with it
+  through the GitLab API. It needs `api` scope and the right to create protected
+  `v*` tags (Maintainer).
 - `REGISTRY_USERNAME` / `REGISTRY_PASSWORD` — the Harbor credentials, named (not
   stored) by the `[[registry]]` block in `.asset` and inherited from the group.
 

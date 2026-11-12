@@ -29,6 +29,11 @@ What it does:
 5. Creates an annotated tag `v<version>`.
 6. Optionally pushes both to `origin`.
 
+On a `release/v<version>` branch it stops after step 4 and pushes only the
+branch. Merging that merge request makes the `sqe-tag-release` job on `main`
+tag the merge commit (`scripts/ci-tag-release.py`). That is the default flow
+since 2026-11; `release.md` at the repo root has the steps.
+
 The script refuses to run if the working tree is dirty or the tag already
 exists.
 
