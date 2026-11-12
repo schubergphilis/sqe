@@ -1,0 +1,5 @@
+**STATUS 2026-11-12: catalog statement family moved into `query_handler/catalog.rs` (`refactor/move-catalog-family`, stacked on `refactor/move-time-travel-family`, openspec statement-path-restructure 3.7, fourth family).**
+
+Eight methods moved verbatim (line-range cut): `handle_show_stats`, `handle_analyze_dispatch`, `handle_attach`, `handle_detach`, `handle_create_secret`, `handle_drop_secret`, `handle_show_secrets` are `pub(super)`; `handle_analyze` stays private. rustfmt on the new file only re-wrapped two calls (one closure gained braces and a trailing comma); the normalised hash is identical before and after. Gates: check-server, clippy -D warnings, budgets (ceiling 12,000 -> 11,750), `cargo test --lib query_handler` (109), `--lib secret` (6), `make test-integration FILTER=show_stats` (1), `analyze` (3), `attach` (1), `secret` (0 matched). Distributed and access-control suites not run for this move.
+
+**NEXT:** DDL family (`handle_drop_statement`, `handle_create_view`, `handle_comment_on`); access control last, after !1729.
