@@ -78,6 +78,12 @@ pub fn to_ocsf(event: &AuditEvent) -> Value {
         if let Some(rw) = s.rows_written {
             unmapped.insert("rows_written".into(), json!(rw));
         }
+        if !s.snapshot_property_keys.is_empty() {
+            unmapped.insert(
+                "snapshot_property_keys".into(),
+                json!(s.snapshot_property_keys),
+            );
+        }
     }
     if let Some(p) = &event.policy {
         unmapped.insert(
@@ -192,6 +198,7 @@ mod tests {
                 rows_scanned: 100,
                 spill_bytes: 0,
                 peak_memory_bytes: 0,
+                snapshot_property_keys: Vec::new(),
             }),
             query: Some(QueryInfo {
                 text: Some("SELECT 1".into()),
@@ -225,6 +232,26 @@ mod tests {
         // SQE-specific stats live under enrichments/unmapped, not core fields.
         assert_eq!(v["unmapped"]["bytes_scanned"], 2048);
         assert_eq!(v["unmapped"]["query_hash"], "abc");
+    }
+
+    /// A data write's snapshot property keys land under `unmapped`, in the
+    /// order given; a record without them has no such member at all.
+    #[test]
+    fn snapshot_property_keys_map_only_when_present() {
+        let none = to_ocsf(&query_event());
+        assert!(
+            none["unmapped"].get("snapshot_property_keys").is_none(),
+            "{none}"
+        );
+
+        let mut ev = query_event();
+        ev.stats.as_mut().unwrap().snapshot_property_keys =
+            vec!["copy.run".into(), "etl.job".into()];
+        let v = to_ocsf(&ev);
+        assert_eq!(
+            v["unmapped"]["snapshot_property_keys"],
+            json!(["copy.run", "etl.job"])
+        );
     }
 
     #[test]

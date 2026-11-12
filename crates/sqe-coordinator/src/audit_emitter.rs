@@ -18,6 +18,7 @@
 
 use std::time::Duration;
 
+use sqe_core::snapshot_properties::SnapshotProperties;
 use sqe_core::{Session, SqeError};
 use sqe_metrics::audit::{
     Actor, AuditEntry, AuditEvent, AuditKind, AuditLogger, Integrity, Outcome, PolicyAudit,
@@ -103,6 +104,27 @@ fn is_secret_bearing(kind: &StatementKind) -> bool {
     )
 }
 
+/// The snapshot property keys `kind`'s commit carries, sorted, for the
+/// audit record: the keys only, never the values. Empty unless `kind` is a
+/// data write (INSERT, CTAS, UPDATE, DELETE, MERGE, TRUNCATE) and `props`
+/// holds something, so a read in a scope that has properties lists none.
+pub(crate) fn property_keys(
+    kind: &StatementKind,
+    props: Option<&SnapshotProperties>,
+) -> Vec<String> {
+    match props {
+        Some(props) if kind.is_data_write() => props.iter().map(|(k, _)| k.to_string()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// [`property_keys`] for the properties of the current statement scope
+/// (`sqe_catalog::txn::write_scope`). Call it inside that scope: the value
+/// is a task-local and is gone outside the statement's task.
+pub(crate) fn snapshot_property_keys_for(kind: &StatementKind) -> Vec<String> {
+    property_keys(kind, sqe_catalog::txn::snapshot_properties().as_deref())
+}
+
 /// Everything `execute_inner` knows about a finished statement that the
 /// audit record needs.
 pub(crate) struct StatementAudit<'a> {
@@ -119,6 +141,10 @@ pub(crate) struct StatementAudit<'a> {
     pub rows: usize,
     /// Rows a DML statement reported as affected; `None` for reads.
     pub rows_written: Option<u64>,
+    /// Keys of the snapshot properties the write carried into its commit,
+    /// from [`snapshot_property_keys_for`]; empty for everything else. Only
+    /// a data write's stats block lists them.
+    pub snapshot_property_keys: Vec<String>,
     pub plan_metrics: &'a PlanMetrics,
     pub policy_summary: Option<PolicySummary>,
     /// Structured resources from the plan; the legacy entry lists their FQNs.
@@ -188,6 +214,8 @@ pub(crate) fn emit_failed_statement(
             execution_ms: 0,
             rows: 0,
             rows_written: None,
+            // Failed before the write started: nothing was carried.
+            snapshot_property_keys: Vec::new(),
             plan_metrics: &PlanMetrics::default(),
             policy_summary: None,
             resources: Vec::new(),
@@ -238,13 +266,14 @@ pub(crate) fn emit_statement_audit(audit: &AuditLogger, a: StatementAudit<'_>) {
     }
 
     let pm = a.plan_metrics;
-    let stats = |rows_written: Option<u64>| QueryStats {
+    let stats = |rows_written: Option<u64>, snapshot_property_keys: Vec<String>| QueryStats {
         rows_returned: a.rows,
         rows_written,
         bytes_scanned: pm.bytes_scanned,
         rows_scanned: pm.rows_scanned,
         spill_bytes: pm.spill_bytes,
         peak_memory_bytes: pm.peak_memory_bytes,
+        snapshot_property_keys,
     };
 
     let (kind, resources, policy, timing, stats) = match a.kind {
@@ -253,7 +282,7 @@ pub(crate) fn emit_statement_audit(audit: &AuditLogger, a: StatementAudit<'_>) {
             a.resources,
             Some(policy_audit(&ps)),
             timing(a.duration, a.execution_ms),
-            Some(stats(None)),
+            Some(stats(None, Vec::new())),
         ),
         StatementKind::Grant(_)
         | StatementKind::GrantWithPolicy(_)
@@ -270,7 +299,7 @@ pub(crate) fn emit_statement_audit(audit: &AuditLogger, a: StatementAudit<'_>) {
             a.resources,
             Some(policy_audit(&ps)),
             timing(a.duration, a.execution_ms),
-            Some(stats(a.rows_written)),
+            Some(stats(a.rows_written, a.snapshot_property_keys)),
         ),
         _ => (
             AuditKind::AdminDdl,
@@ -303,6 +332,117 @@ pub(crate) fn emit_statement_audit(audit: &AuditLogger, a: StatementAudit<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    fn props(pairs: &[(&str, &str)]) -> Arc<SnapshotProperties> {
+        Arc::new(
+            SnapshotProperties::try_new(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn property_keys_are_sorted_keys_for_data_writes_only() {
+        let set = props(&[("etl.job", "secret-value"), ("copy.run", "42")]);
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "CREATE TABLE t2 AS SELECT 1 AS a",
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+            "TRUNCATE TABLE t",
+        ] {
+            let kind = sqe_sql::parse_and_classify(sql).expect(sql);
+            assert!(kind.is_data_write(), "{sql}");
+            assert_eq!(
+                property_keys(&kind, Some(&set)),
+                vec!["copy.run".to_string(), "etl.job".to_string()],
+                "{sql}"
+            );
+            assert!(property_keys(&kind, None).is_empty(), "{sql}");
+        }
+        for sql in ["SELECT 1", "SHOW TABLES", "CREATE SCHEMA s"] {
+            let kind = sqe_sql::parse_and_classify(sql).expect(sql);
+            assert!(property_keys(&kind, Some(&set)).is_empty(), "{sql}");
+        }
+    }
+
+    /// The audit record of a data write that ran in a scope with snapshot
+    /// properties lists the keys and never a value; a read in the same scope
+    /// lists none.
+    #[tokio::test]
+    async fn audit_lists_snapshot_properties_keys_not_values_for_a_write_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+        let audit = AuditLogger::new(path.to_str().unwrap()).expect("audit logger");
+        let session = Session::new(
+            "alice".to_string(),
+            sqe_core::SecretString::new("access_tok".to_string()),
+            None,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            vec![],
+        );
+        let set = props(&[("etl.job", "never-in-the-log"), ("copy.run", "42")]);
+
+        sqe_catalog::txn::write_scope(None, None, Some(set), async {
+            for sql in ["INSERT INTO t VALUES (1)", "SELECT 1"] {
+                let kind = sqe_sql::parse_and_classify(sql).expect(sql);
+                emit_statement_audit(
+                    &audit,
+                    StatementAudit {
+                        session: &session,
+                        sql,
+                        kind: &kind,
+                        kind_name: kind.name().to_string(),
+                        error: None,
+                        status: "success",
+                        duration: Duration::from_millis(1),
+                        execution_ms: 1,
+                        rows: 1,
+                        rows_written: Some(1),
+                        snapshot_property_keys: snapshot_property_keys_for(&kind),
+                        plan_metrics: &PlanMetrics::default(),
+                        policy_summary: None,
+                        resources: Vec::new(),
+                        tables_touched: Vec::new(),
+                        grant_resources: Vec::new(),
+                        client_ip: None,
+                        trace_id: None,
+                        query_id: uuid::Uuid::now_v7(),
+                    },
+                );
+            }
+        })
+        .await;
+        audit.flush();
+
+        let content = std::fs::read_to_string(&path).expect("audit file");
+        assert!(
+            !content.contains("never-in-the-log") && !content.contains("\"42\""),
+            "a snapshot property value reached the audit log: {content}"
+        );
+        let events: Vec<serde_json::Value> = content
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .filter(|v: &serde_json::Value| v.get("stats").is_some())
+            .collect();
+        assert_eq!(events.len(), 2, "{content}");
+        let insert = events
+            .iter()
+            .find(|v| v["query"]["statement_type"] == "insert")
+            .expect("insert record");
+        assert_eq!(
+            insert["stats"]["snapshot_property_keys"],
+            serde_json::json!(["copy.run", "etl.job"])
+        );
+        let select = events
+            .iter()
+            .find(|v| v["query"]["statement_type"] != "insert")
+            .expect("select record");
+        assert!(
+            select["stats"].get("snapshot_property_keys").is_none(),
+            "{select}"
+        );
+    }
 
     /// A Flight session id is a bearer credential: the audit record carries
     /// its hash, never the raw value.

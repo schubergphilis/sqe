@@ -1585,6 +1585,7 @@ impl QueryHandler {
                 execution_ms: 0,
                 rows: 0,
                 rows_written: None,
+                snapshot_property_keys: Vec::new(),
                 plan_metrics: &Default::default(),
                 policy_summary: None,
                 resources: Vec::new(),
@@ -2050,6 +2051,8 @@ impl QueryHandler {
                                 execution_ms: 0,
                                 rows,
                                 rows_written: None,
+                                // A cache hit is a read.
+                                snapshot_property_keys: Vec::new(),
                                 plan_metrics: &PlanMetrics::default(),
                                 policy_summary: cached.audit.policy_summary.clone(),
                                 resources: cached.audit.resources.clone(),
@@ -3236,6 +3239,9 @@ impl QueryHandler {
                     execution_ms,
                     rows,
                     rows_written,
+                    // Read inside the statement's `write_scope`, where the
+                    // properties its commits carried are still set.
+                    snapshot_property_keys: crate::audit_emitter::snapshot_property_keys_for(&kind),
                     plan_metrics: &pm,
                     policy_summary,
                     resources: audit_resources,

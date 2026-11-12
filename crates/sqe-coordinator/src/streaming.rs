@@ -322,6 +322,8 @@ impl StreamFinalizer {
                 rows_scanned: pm.rows_scanned,
                 spill_bytes: pm.spill_bytes,
                 peak_memory_bytes: pm.peak_memory_bytes,
+                // A streamed statement is a read.
+                snapshot_property_keys: Vec::new(),
             }),
             query: Some(crate::audit_emitter::query_info(
                 &self.sql,
