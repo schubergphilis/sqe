@@ -4,6 +4,734 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+## [0.54.0] — 2026-11-12
+
+### Added
+
+- `scripts/seed-target.sh` seeds a second checkout's `target/` from a built one
+
+    A new git worktree or clone starts with an empty `target/` and pays the full cold
+    build. The script clones `target/<profile>` from an existing checkout copy-on-write
+    (APFS clonefile, reflink on Linux), which took 20 s for 45 GB and used no extra
+    disk. A first `cargo check-server` in the seeded checkout then rebuilt 75 crates
+    (the workspace and what sits downstream of `vendor/`) instead of about 720, in
+    2m00. Each checkout keeps its own build lock, so two checkouts can build at once.
+
+- Size and structure budgets, checked on every merge request (`cargo xtask budgets`)
+
+    `.config/budgets.json` records a line ceiling per crate, a 3,000-line default per source
+    file with a recorded ceiling for the 22 files already over it, the exact first-party
+    dependencies of every crate, and ceilings on the `Cargo.lock` package count and on crate
+    names locked at more than one version. `cargo xtask budgets --check` runs in the
+    `aikido-rust-extra` job in both CI profiles and as a pre-push hook; it counts lines and
+    reads `cargo metadata --no-deps`, so it compiles nothing. `--update` only lowers budgets;
+    raising one, adding an edge or adding a crate is a hand edit of the file. Ceilings leave
+    one to two steps of room (250 lines per file, 1,000 per crate) and the `Cargo.lock`
+    ceilings are upper bounds only. Compile time itself is not budgeted here.
+
+- OpenSpec `tvf-prefix-table-overlap`: guard file TVF prefixes against Iceberg table locations
+
+    Refuses Iceberg tables created inside an allowed prefix, refuses TVF reads under a loaded table that overlaps one, and probes for Iceberg metadata above a TVF path. It documents `s3://<bucket>/{catalog}/{user}/` as the per-catalog staging area. Hive roots are out of scope (#886). Spec only, no code.
+
+- Audit records carry what a query history needs (#812)
+
+    A streaming SELECT's audit record now holds its scan stats (bytes and rows
+    scanned, spill, peak memory) and its planning time on success, failure and
+    cancel; before, it held only the row count and the total duration. Every
+    statement record gains `query.query_fingerprint`, a hash of the text with
+    its literals replaced, so one query shape groups across values and stays
+    when `omit_query_text` drops the text. The OCSF record adds `duration`,
+    `status_code`, and under `unmapped` the query id, trace id, fingerprint,
+    phase timings and error type.
+
+- `SET WRITE_BRANCH` in embedded mode (#875)
+
+    `sqe-cli --embedded` now keeps a session write branch, as a cluster session does:
+    INSERT, UPDATE, DELETE and MERGE on an Iceberg table read and commit at the branch,
+    `main` does not move, a table without the branch is refused, and CTAS is refused while
+    a branch is set.
+
+- `RESET WRITE_BRANCH` (#875)
+
+    Same as `SET WRITE_BRANCH = DEFAULT`. The refusals a write branch causes already told
+    users to run it, but it did not parse.
+
+- Bounding-box pruning for `ST_*` predicates on GEOMETRY columns (#863)
+
+    `ST_Intersects`, `ST_Contains`, `ST_Within`, `ST_Equals`, `ST_Touches`,
+    `ST_Crosses` and `ST_Overlaps` between a geometry column and a constant
+    geometry, and `ST_DWithin(column, constant, d)`, skip the data files whose
+    manifest bounding box misses the constant's (grown by `d`), and the row
+    groups whose Parquet geospatial statistics miss it, on the coordinator and
+    on a worker. The predicate still runs on every row read, so a missing or
+    unreadable bound only costs reads. `ST_Disjoint`, a negated predicate and
+    GEOGRAPHY columns (no planar bounds) are never pruned on. Scan tickets
+    carrying the prunes are version 7.
+
+- `ST_Area`, `ST_Length`, `ST_Distance` and `ST_DWithin` measure `GEOGRAPHY` values in meters (#863)
+
+    The column's edge algorithm picks the earth model: `spherical` (the
+    default) uses a sphere of the GRS80 mean radius, with haversine distance
+    and length and the exact spherical excess for area; `vincenty`,
+    `thomas`, `andoyer` and `karney` use Karney's geodesics on WGS84.
+    Distance takes two points, as Trino's `SphericalGeography`. A computed
+    geometry next to a `GEOGRAPHY` value is read as longitude / latitude; a
+    `GEOMETRY` column next to one is refused. The predicates, `ST_Centroid`
+    and `ST_Envelope` still refuse `GEOGRAPHY`.
+
+- Lateral column aliases: `SELECT a + 1 AS b, b * 2 AS c FROM t` (#878)
+
+    A select-list item can use an alias defined earlier in the same select list, with
+    Databricks' rule that a column of the `FROM` relation wins over an alias of the same name.
+    When planning fails on a bare name that an earlier item aliases, the planner inlines that
+    item's expression in parentheses and plans again, so `b * 2` becomes `(a + 1) * 2`.
+    Qualified names, subqueries and lambda parameters keep their own scope.
+
+- Object-store request metrics on coordinators and workers (#815)
+
+    `sqe_object_store_requests_total`, `sqe_object_store_errors_total`,
+    `sqe_object_store_request_duration_seconds` and `sqe_object_store_ttfb_seconds`
+    cover the object_store client (worker data-file reads, Hive external tables, file
+    functions), labelled by `scheme`, `bucket` and `operation`; errors also carry an
+    `error` class. OpenDAL's Prometheus layer now exports the `opendal_operation_*` and
+    `opendal_http_*` families for Iceberg metadata and manifest I/O; the gap between
+    them is the retry count. Spill to S3 is not counted.
+
+- `system.runtime.query_history` and a web UI History tab: finished queries read back from the audit log, across the tracker TTL and coordinator restarts (#812)
+
+    `system.runtime.query_history` has the same columns as
+    `system.runtime.queries`. It adds the finished queries in the native
+    audit log (rotated generations included) to the tracker's records,
+    deduplicated by query id. A filter on `end` or `created` picks the part
+    of the log that is read; without one, the last
+    `[query_history] lookback_secs` (new, default 86400) is read. One scan
+    returns at most the newest 100000 audited queries. Non-admin users see
+    only their own queries. With `metrics.audit.format = "ocsf"` the table
+    shows the tracker only and warns once. The dashboard's new History tab
+    (`GET /api/v1/queries/history`, admin-gated) pages through the same
+    rows, 50 at a time, with a window and state filter. The log is read
+    newest first with a binary search to the window end: on a week of log
+    (about a million queries) a one-hour window reads in about 25 ms and a
+    50-row page in under 3 ms.
+
+- Releases: merging a `release/vX.Y.Z` merge request tags its merge commit `vX.Y.Z`
+
+    `scripts/release.sh X.Y.Z` on a `release/vX.Y.Z` branch prepares the version bump, Helm chart and changelog, and no longer tags locally. When the merge request merges, the `sqe-tag-release` job on `main` checks that the workspace version matches the branch name and creates the tag through the GitLab API; the tag pipeline then builds and publishes the release. Hotfix and pre-release tags are still pushed by hand.
+
+- Writes stamp `SET SNAPSHOT_PROPERTIES` into the snapshot they commit
+
+    INSERT, CTAS, INSERT OVERWRITE, DELETE, UPDATE, MERGE, TRUNCATE and Flight SQL bulk ingest carry the transaction's properties inside a transaction and the session's outside one, in the same commit as their data. A write that changes nothing commits an empty snapshot with the properties, so a loader that copies an empty table still finds its marker. Without properties nothing changes. Maintenance commits never carry them.
+
+- Audit: a data write's record lists the snapshot property keys it carried (OCSF `unmapped.snapshot_property_keys`), never the values
+
+    Records without properties serialize exactly as before, so existing audit hash chains still verify.
+
+- `SnapshotProperties` validation type in `sqe-core` (groundwork for `SET SNAPSHOT_PROPERTIES`)
+
+    It enforces the `write-snapshot-properties` rules: key charset and length, reserved Iceberg and engine keys and prefixes (case-insensitive), value length and control characters, 32 pairs and 8 KiB per set. Nothing calls it yet.
+
+- Flight SQL bulk ingest takes per-request snapshot properties as `snapshot-property.<key>` options
+
+    The prefix is Spark's. They are entries in the request's `CommandStatementIngest.options` and apply to that request's commit only, laid over the transaction's or session's properties, with the request winning for a repeated key. A refused key or value fails the request with `InvalidArgument` before any data file is written.
+
+- `SET SNAPSHOT_PROPERTIES ('k' = 'v', ...)` and `RESET SNAPSHOT_PROPERTIES` (statement and state only)
+
+    Inside a transaction the properties belong to that transaction and end with it. Outside one they stay on the session until reset. A session the server does not keep (Trino HTTP outside a transaction) refuses the statement instead of ignoring it. Writes do not stamp the properties into their commits yet.
+
+- Spark `explode` and `posexplode` in the SELECT list (#877)
+
+    `posexplode(a)` returns `pos` (BIGINT, starting at 0) and `col`; `explode(a)`
+    returns `col`. Both are rewritten to DataFusion `unnest`, so an empty or NULL
+    array gives no rows, as in Spark. `posexplode(a) AS (p, v)` and `explode(a) AS v`
+    keep the user's names. Arrays only: `explode` of a MAP and the `_outer`
+    variants are not supported.
+
+- SQL pipe syntax: `FROM t |> WHERE ... |> AGGREGATE ... GROUP BY ... |> ORDER BY ...` (#851)
+
+    The engine parses with `sqe_sql::ExecutionDialect`, DuckDB plus the `|>` operator, at every
+    planner entry point and in the front door's tokenization check. DuckDB, the dialect the
+    session names, read `|>` as `|` then `>`, so the front door refused every pipe query.
+    DataFusion plans `WHERE`, `SELECT`, `EXTEND`, `AGGREGATE`, `ORDER BY`, `LIMIT`, `AS`,
+    `JOIN` and `UNION` / `INTERSECT` / `EXCEPT` steps; `SET`, `DROP`, `RENAME`, `TABLESAMPLE`,
+    `CALL`, `PIVOT` and `UNPIVOT` fail with "pipe operator is not supported yet".
+
+- Table-health gauges and alert rules for delete-file and manifest build-up (#815)
+
+    The maintenance scheduler now also sets `sqe_table_data_files` and
+    `sqe_table_manifests` per opted-in table. `deploy/observability/alerts.yml` gains
+    `SqeTableDeleteFileAmplification` (more than one delete file per two data files, at
+    least 50 delete files) and `SqeTableManifestCountHigh` (more than 500 manifests), with
+    promtool unit tests (`make alerts-test`). The Helm chart installs the same rules as a
+    `PrometheusRule` when `prometheusRule.enabled` is true.
+
+- Shredded double fields in a variant get manifest bounds and prune files (#870)
+
+    SQE writes variant manifest bounds for shredded double paths, as Iceberg
+    Java does: a path that holds a NaN gets no bound, the lower bound of a
+    zero is -0.0 and the upper +0.0. A `variant_get(v, '$.d', 'double')`
+    comparison with a number now skips the files whose bounds exclude it,
+    for SQE-written and Spark-written tables alike. The
+    reader widens a zero bound to cover both zeros, because Iceberg Java
+    writes +0.0 over a -0.0 row. Row groups are not pruned on a double
+    field: Parquet leaves NaN out of the statistics.
+
+- Reading shredded variant fields skips the other shredded fields (#870)
+
+    A query that reads a shredded variant column only through
+    `variant_get` / `try_variant_get` object paths (`$.a`, `$.b.c`,
+    `$['d']`) reads `metadata`, the residual `value` and just the
+    `typed_value` fields those paths start with, instead of every shredded
+    field. This holds on the coordinator's direct read, on the iceberg-rust
+    reader and on a worker; the scan ticket goes to version 8 when it names
+    fields, so an older worker refuses it rather than reading wrong. Any
+    other use of the column (selecting it, `$`, an array path, a `UNION`,
+    `DISTINCT` on it) reads it whole. `EXPLAIN` shows the fields as
+    `variant_fields={<field id>:[names]}` on the scan.
+
+- `scripts/bench-profile.py` prints the hot operators per benchmark query from coordinator logs
+
+    It reads the `query_profile` records, labels them with bench query ids from the report
+    JSON, and lists per query the operators with the most CPU time, scan bytes, pruning and
+    spill, plus operator totals and the queries that left no profile.
+
+- End-to-end tests for Flight SQL bulk ingest (`DoPut` with `CommandStatementIngest`)
+
+    `tests/it/flight_ingest_e2e.rs` drives the ingest path (the one ADBC `adbc_ingest`
+    uses) through a real gRPC socket against the Polaris + RustFS stack: append into an
+    existing table with exact row contents, two appends, a four-batch stream, and an
+    ingest inside `BeginTransaction` that stays invisible to another session until
+    `EndTransaction(COMMIT)` and disappears on `ROLLBACK`. Two further tests pin what the
+    protocol asks for and the server does not do yet: `TableNotExistOption::Create` on a
+    missing table and `TableExistsOption::Fail` on an existing one. Both fail today
+    because `do_put_statement_ingest` ignores `table_definition_options` (#881) and
+    are ignored as `bug:#881` until the fix lands. Test-only change, no server code
+    touched.
+
+- Tests pin how many audit records one statement leaves, per outcome
+
+    `statement_audit_records_test` counts the records in the native and the OCSF file for a refusal after classification, a result-cache hit, an execution failure, a timeout and a cancellation (one record each), and for a cancelled CTAS (the record still names the plan's target and source tables). It also pins the statements that write nothing today: the SQL size check, admission refusal and the `fail_mode = closed` refusal. A safety net for the `execute_inner` restructure; no server code changes.
+
+### Changed
+
+- Connecting: Flight SQL clients can send an existing token as `Authorization: Bearer` (ADBC `authorization_header`) without a handshake. The page explains what a `bearer_token` provider and a `bearer_passthrough` provider each do with that token, and that clients sharing a token share one session. The provider table in Configuration gains `bearer_passthrough`.
+
+- OpenSpec change `ingest-by-column-name`: the plan for Flight SQL bulk ingest to match uploaded columns to the table by name, fill omitted columns with their `write-default` or NULL, keep positional mapping for uploads with generic names, and refuse partly matching uploads. No code change yet.
+
+- SQL reference states the default NULL order and the Spark migration path (#876)
+
+    A bare `ORDER BY x DESC` puts NULLs first, as in Trino; Spark and Databricks
+    put them last. Migrated SQL keeps Spark's order with an explicit `NULLS LAST`.
+    Unit tests pin the default, the explicit clauses and the window `ORDER BY`
+    behind `ROW_NUMBER` top-N. The session-control table no longer claims that
+    `SET <variable>` changes DataFusion settings; SQE refuses it.
+
+- `write-snapshot-properties` spec: only Flight SQL `BeginTransaction` transactions keep parallel loaders on one bearer token apart
+
+    A SQL `BEGIN` is stored on the session, and clients on one bearer token share that session, so they share its transaction and its snapshot properties. The design, the parallel-loader scenario and the docs task now say so.
+
+- `write-snapshot-properties` spec: Trino HTTP takes snapshot properties inside a transaction only
+
+    A Trino HTTP session is built per request and never held, so `SET SNAPSHOT_PROPERTIES` outside a transaction is refused there. Inside one the properties live on the transaction, which the client replays in `X-Trino-Transaction-Id`.
+
+- OpenSpec change `statement-path-restructure`: the plan to split the coordinator's 2,082-line `execute_inner` into three stages, lift its six inline dispatch arms, ratchet function length, and check SQE's function registry and `vendor/` patches against upstream. No code change yet.
+- `CLAUDE.md` gains a "Way of working" section (design in the main session, builds and tests in a lower-tier agent, one build agent per tree, move-only splits, profile before a compile-time claim). New `AGENTS.md` points other agents at it.
+
+- OpenSpec change `write-snapshot-properties`: the plan for user keys in the snapshot summary of every write (`SET` / `RESET SNAPSHOT_PROPERTIES`, scoped to the transaction or the session, plus the `snapshot-property.` Flight SQL ingest option), so a copy job can write its completion marker in the same commit as the data. No code change yet.
+
+- Embedded CTAS runs the cluster's CTAS handler (#875)
+
+    `CREATE TABLE ... AS` into an Iceberg catalog in `sqe-cli --embedded` now runs the same
+    streaming CTAS a coordinator runs, instead of an empty DataFusion CREATE followed by a
+    separate INSERT. `PARTITIONED BY` and `TBLPROPERTIES` / `WITH (...)` are kept instead of
+    refused, and `CREATE OR REPLACE TABLE ... AS` works: in place with one commit when the
+    query's schema and partitioning match the table, otherwise a new table replaces it.
+    The statement reports the written row count.
+
+- Long strings in shredded variants get truncated manifest bounds (#870)
+
+    A shredded variant path whose strings are longer than 16 characters
+    used to get no manifest bound above 64 bytes. SQE now writes the bounds
+    the way Iceberg Java does: the lower bound is the 16-character prefix and
+    the upper bound is cut and rounded up. A filter such as
+    `variant_get(v, '$.s', 'string') = '...'` on long text values now skips
+    the files whose range excludes it.
+
+- Playground and OAuth2 sign-in pages follow the web UI design
+
+    The browser playground and the Trino OAuth2 callback pages use the
+    dashboard's colours, navy header band, yellow marker, state pills and
+    red error banner, light or dark from the system setting. Behaviour is
+    unchanged.
+
+- Web UI design refresh: summaries, action banners, sortable tables, dark theme
+
+    Each tab opens with a one-sentence summary and shows a banner with an
+    action when the memory pool is above 80 %, query slots are nearly full,
+    queries failed in the last hour, or a worker is unhealthy. The six stat
+    cards became one metric strip, tabs are grouped (Engine, Workload), table
+    headers sort and keep their order across the refresh, elapsed and scanned
+    columns carry inline bars, states show as pills, the query detail splits
+    queued, planning and execution time, and the page follows the system's
+    light or dark setting. Still one self-contained file with no external
+    assets.
+
+- CI: the main-branch pipeline no longer re-runs the test suite, clippy matrix, catalog live tests or config checks after a merge
+
+    The merge request pipeline already ran them on the same tree. Main keeps the security and supply-chain scans and the dependency advisory check. The release build and the `:main` image are on demand: press play on `release-binaries`, or run a main pipeline with `SQE_BUILD_IMAGE=1`. Release tags still build their own image.
+
+- `sqe-catalog` trait-proof compile time cut from about 16-27 s to about 7 s
+
+    Four entry points made rustc prove `Send` over DataFusion's `SessionState` /
+    `LogicalPlan` / `Expr` type graph in their own parameter environment:
+    `HiveSchemaProvider::table`, `HiveTableProvider::scan` and `scan_with_args`,
+    and `EngineQueryPlanner::create_physical_plan`, plus the `MemTable` held by
+    `ReservedMemTable`. `HiveSchemaProvider::table` is written in `async_trait`'s
+    expanded form and its body moved, unchanged, into an inherent `load_table`;
+    the Hive scans and the query planner build their scoped `SessionState` before
+    the boxed future and hold it as a `SendErased` value, with the planner's
+    decision logic lifted into `EngineQueryPlanner::tuned_state`;
+    `ReservedMemTable` keeps its inner table as `Arc<dyn TableProvider>`.
+    Measured with `scripts/compile-profile.sh sqe-catalog`, before and after
+    alternating over three pairs: `evaluate_obligation` self time 16.5-27.3 s to
+    6.9-7.7 s, `typeck` control 1.1-2.0 s before and 1.0-1.7 s after (1.07 s and 0.98 s in the
+    matched third pair, 16.5 s to 7.2 s). No behaviour change.
+
+- `sqe-coordinator` trait-proof compile time cut from about 20.5 s to about 8.5 s
+
+    Five Flight SQL and table-provider entry points each made rustc prove `Send`
+    over DataFusion's `SessionContext` / `LogicalPlan` / `Expr` type graph in their
+    own parameter environment. `create_session_context` and `plan_prepared_statement`
+    now return a boxed future; the `CreatePreparedStatement` body and the
+    `DoPut` ingest call moved, unchanged, into boxed inherent functions;
+    `do_get_prepared_statement` goes through the existing boxed
+    `run_resolved_into_flight_response`; `QueryHistoryTable::scan` is written in
+    `async_trait`'s expanded form. Measured with `scripts/compile-profile.sh
+    sqe-coordinator`, before and after alternating: `evaluate_obligation` self time
+    20.2-20.8 s to 8.1-8.8 s, `typeck` control flat at 1.4-1.5 s, profiled crate
+    compile 47-49 s to 35-38 s. No behaviour change.
+
+- `[worker.spill]` is retired; the unused worker spill segment store is removed
+  The worker built a spill segment store at start (local, S3 or tiered,
+  configured under `[worker.spill]`), but no query path ever wrote to it:
+  workers only scan, and every sort, join and aggregate spills through
+  DataFusion's disk manager on the coordinator. About 2,900 lines go, with
+  the S3 tier's credentials and bucket checks. Old configs still load: a
+  `[worker.spill]` table is accepted, ignored, and logged as a warning at
+  worker start. `worker.spill_to_disk` and `worker.spill_dir` are unchanged.
+
+- `CREATE TABLE ... AS SELECT` dispatch moved out of `execute_inner` into `handle_ctas_statement` (no behaviour change)
+
+    A move of the inline arm into its own method, the last of the six inline dispatch
+    arms the statement-path restructure lifts. The Hive external and Iceberg paths move
+    together; the lineage hint and policy summary are written through `&mut` parameters.
+    `execute_inner` goes from 841 to 702 lines, down from 2,100 before the restructure.
+
+- `DROP TABLE` dispatch moved out of `execute_inner` into `handle_drop_statement` (no behaviour change)
+
+    A move of the 77-line inline arm into its own method, the first of the six inline
+    dispatch arms the statement-path restructure lifts. It writes the lineage hint through
+    `&mut captured_plan`, so a failed or cancelled DROP still names its table.
+    `execute_inner` goes from 1,332 to 1,257 lines.
+
+- `INSERT INTO` dispatch moved out of `execute_inner` into `handle_insert_statement` (no behaviour change)
+
+    A move of the inline arm into its own method, the third of the six inline dispatch
+    arms the statement-path restructure lifts. The Hive external and Iceberg paths move
+    together; the lineage hint and policy summary are written through `&mut` parameters.
+    `execute_inner` goes from 1,198 to 1,114 lines.
+
+- `MERGE INTO` dispatch moved out of `execute_inner` into `handle_merge_statement` (no behaviour change)
+
+    A move of the inline arm into its own method, the second of the six inline dispatch
+    arms the statement-path restructure lifts. It writes the lineage hint and the policy
+    summary through `&mut` parameters, so completion still sees both after a failure or
+    cancellation. `execute_inner` goes from 1,257 to 1,198 lines.
+
+- `CALL system.<procedure>` dispatch moved out of `execute_inner` into `handle_procedure_statement` (no behaviour change)
+
+    A move of the inline arm into its own method, the fifth of the six inline dispatch
+    arms the statement-path restructure lifts. The maintenance lineage hint is written
+    through `&mut captured_plan`. `execute_inner` goes from 979 to 841 lines.
+
+- Utility statement dispatch (EXPLAIN, SHOW COLUMNS, DESCRIBE, SET TIME ZONE, SHOW FUNCTIONS, SHOW ROLES) moved out of `execute_inner` into `handle_utility_statement` (no behaviour change)
+
+    A move of the inline arm into its own method, the fourth of the six inline dispatch
+    arms the statement-path restructure lifts. `execute_inner` goes from 1,114 to 979 lines.
+
+- The GRANT, REVOKE, DENY, SHOW GRANTS, policy DDL and masking-policy handlers moved from `query_handler.rs` into `query_handler/access_control.rs` (no behaviour change)
+
+    The last statement family moved into its own child module. `query_handler.rs` goes from
+    11,121 to 9,927 lines and its size ceiling drops from 11,500 to 10,250.
+
+- The SHOW STATS, ANALYZE, ATTACH / DETACH and secret handlers moved from `query_handler.rs` into `query_handler/catalog.rs` (no behaviour change)
+
+    The fourth statement family moved into its own child module. `query_handler.rs` goes from
+    11,672 to 11,286 lines and its size ceiling drops from 12,000 to 11,750.
+
+- The DROP, CREATE VIEW and COMMENT ON handlers moved from `query_handler.rs` into `query_handler/ddl.rs` (no behaviour change)
+
+    The fifth statement family moved into its own child module. `query_handler.rs` goes from
+    11,287 to 11,088 lines and its size ceiling drops from 11,750 to 11,500.
+
+- The SHOW / DESCRIBE statement handlers moved from `query_handler.rs` into `query_handler/show.rs` (no behaviour change)
+
+    The second statement family moved into its own child module: SHOW CREATE TABLE/VIEW/SCHEMA,
+    SHOW CATALOGS, SCHEMAS, COLUMNS, TABLES, VIEWS, FUNCTIONS and ROLES, with the hidden-table
+    check they share. `query_handler.rs` goes from 13,062 to 12,236 lines and its size ceiling
+    drops from 13,500 to 12,500.
+
+- The time-travel and incremental-read handlers moved from `query_handler.rs` into `query_handler/time_travel.rs` (no behaviour change)
+
+    The third statement family moved into its own child module: `FOR SYSTEM_TIME AS OF`,
+    `FOR VERSION AS OF` and `FOR INCREMENTAL BETWEEN SNAPSHOT` handling, with the
+    `TimeTravelCleanup` guard that deregisters the pinned providers. `query_handler.rs` goes
+    from 12,236 to 11,675 lines and its size ceiling drops from 12,500 to 12,000.
+
+- The MERGE, INSERT and CTAS statement handlers moved from `query_handler.rs` into `query_handler/write.rs` (no behaviour change)
+
+    The first statement family moved into its own child module of `query_handler`,
+    following `query_handler/admission.rs`. `query_handler.rs` goes from 13,423 to
+    13,062 lines.
+
+- `sqe-policy` compiles in about half the time
+
+    Four `#[async_trait]` methods (`PolicyPlanRewriter::evaluate`,
+    `PassthroughEnforcer::evaluate`, `RangerStore::resolve`,
+    `InMemoryPolicyStore::resolve`) each made rustc prove `Send` over DataFusion's
+    `Expr` / `LogicalPlan` type graph in the method's own parameter environment. Their
+    bodies now live in non-generic inherent functions that return a boxed future, so
+    the proof is made once for the crate. Measured with `scripts/compile-profile.sh
+    sqe-policy`, before and after back to back: trait-proof time 20.5 s to 4.3-6.7 s,
+    profiled crate compile 33-37 s to 12-19 s. No behaviour change.
+
+- `QuackTableProvider::scan` builds its plan synchronously (compile time only)
+
+    `scan` was an `#[async_trait]` method that held `&dyn Session` and `&[Expr]` across an
+    await, so rustc proved `Expr: Sync` for the whole crate. It is now written in
+    `async_trait`'s desugared form and returns a ready future built from
+    `MemorySourceConfig` + `DataSourceExec`, the same plan `MemTable::scan` produced.
+    `scripts/compile-profile.sh sqe-quack-client`, two alternating runs each: `evaluate_obligation`
+    self time 3.27 s / 3.20 s before, 15 ms / 15 ms after; crate pass time 3.6 s / 3.5 s before,
+    about 0.36 s after. No runtime behaviour change.
+
+- The buffered statement path runs in three stages (no behaviour change)
+
+    `QueryHandler::execute_inner` was one 2,100-line function. Its head, everything up to
+    and including the result-cache lookup, is now `preflight`, which returns a
+    `StatementRun` or a cache hit. Its tail after the timeout and cancellation race is now
+    `complete`. The dispatch match and the race stay in `execute_inner`. The guards (the
+    abandoned-query guard, cancel token, sorted-write permit and admission) and the query
+    span move into `StatementRun`, declared so that they drop in the same order as before.
+    Compile time is unchanged: the baseline profile bills `execute_inner` 4 ms of trait
+    solving, and the split adds nothing measurable (evaluate_obligation 14.97 s median
+    before, 14.71 s after).
+
+### Fixed
+
+- ADBC bulk ingest commits at once, also without autocommit
+
+    The README and the book said an ADBC connection without autocommit keeps
+    bulk ingest on the transaction branch until `commit()`. It does not: the
+    ADBC Flight SQL driver never sends the transaction id with an ingest, so
+    `adbc_ingest` commits to `main` at once. The server joins an ingest to a
+    transaction only when the id is on the command. The docs now say so and
+    show the staging-table workaround.
+
+- The Iceberg matrix's V3 read cell no longer says geometry is unsupported or that shredded variants are read unshredded (#870)
+
+    Both were true when the caveat was written. Geometry is full since #863, and a query reads only the shredded `typed_value` fields it names (#870).
+
+- `queued_ms` no longer counts planning time, and a cancel during planning stays a cancel (#812)
+
+    `system.runtime` reported a query's planning time twice, once as
+    `planning_ms` and again as `queued_ms`. A query cancelled while it
+    planned was set back to Running once planning returned.
+
+- `t$snapshots`: the `summary` column is valid JSON for any key and value
+
+    The column was built by hand and escaped only double quotes, so a backslash or control character in a summary value produced JSON that parsers rejected. It is now serialized with `serde_json`, with keys sorted.
+
+- `CALL system.rewrite_manifests` merges manifests and reports the counts (#815)
+
+    The procedure committed a new snapshot with the same manifests: without a
+    cluster function the iceberg-rust action rewrote nothing. It now merges the data
+    manifests of each partition spec, up to `commit.manifest.target-size-bytes`.
+    `input_count` and `output_count` are the manifests before and after; `input_count`
+    was always 0, and `output_count` counted the snapshot summary's properties.
+
+- The TPCBB q01 pre-aggregation candidate matches the original again, and SF1/SF10 measurements of it are recorded (#785)
+
+    Since `avg(decimal(p,s))` returns `decimal(p,s)` and `sum` returns
+    `decimal(38,s)`, the candidate's casts to the old types made it differ
+    from the original. It now returns the same types and computes the
+    average in whole cents with one half-up rounding. Dividing at scale 6
+    and then casting would round twice, which is a cent off once a group
+    joins about 10^6 rows. The exactness fixture has such a group.
+    `benchmarks/experiments/tpcbb-q01-scale.py` measures join cardinality,
+    time and peak RSS at any scale. At SF10 the original joins 6.78 billion
+    rows in 127 s; the candidate takes 0.54 s with the same top 20.
+
+- Benchmark harness runs SF100 on a small Linux host, and Trino starts there (#784, #787)
+
+    `benchmark-test.sh` wrote the Trino catalog file as mode 600, which the Trino container
+    (uid 1000) cannot read on Linux; Trino exited at startup and the comparison was skipped.
+    The file is now 640 and the container joins the caller's group. A container that exits
+    during startup ends the wait at once, and `benchmark-make-run.sh` fails a compare run when
+    Trino never came up. When unset, the script now raises the open-file limit, uses a 600s
+    query timeout at SF100 and above, caps `SQE_MEMORY_LIMIT` at 75% of physical RAM, and
+    spills under `$TMPDIR` when `/tmp` is tmpfs. TPC-H SF100 on an 8-core 31 GB box had hit
+    EMFILE on q07/q09 and the 60s timeout on q18/q21.
+
+- CI test jobs reuse the prebuilt dependency image again
+
+    `aikido-test-rust` and `aikido-rust-extra` pinned a `ci-deps` image built with rustc
+    1.98.1. The toolchain moved to 1.99.1 on 2026-10-18, so cargo rejected every baked
+    artifact and both jobs compiled all 679 crates from `proc-macro2` on every merge
+    request, 12 to 24 minutes depending on the runner. The pin now points at the image
+    built from the current `Cargo.lock`, toolchain and `vendor/` tree.
+
+- `make test-distributed` on a fresh stack no longer fails eleven catalog-discovery tests with "Unable to find warehouse discovery_test_wh"
+
+    `scripts/bootstrap-distributed.sh` kept its own copy of the catalog setup and created only
+    `test_warehouse`. It now runs `scripts/bootstrap-test.sh` for the buckets, warehouses and
+    namespaces, so both suites start from the same catalog state, and then waits for the
+    coordinator and the workers as before.
+
+- A double meets a decimal as a double, as in Trino
+
+    `double_col > 9.0` compared in `decimal(30,15)`: `9.0` is a decimal
+    literal, and DataFusion cast the double to it. A NaN row failed the
+    query (`Cannot cast to Decimal128(30, 15). Overflowing on NaN`), and so
+    did a value above 1e15. Comparisons, `BETWEEN`, `IN`, `IN (SELECT ..)`,
+    `CASE`, `COALESCE`, `nvl`, `ifnull`, `nullif`, `nvl2`, `greatest`,
+    `least`, array literals, `UNION` and `VALUES` lists now cast the
+    decimal side to the float type instead. The double column stays bare, so a `variant_get(v, '$.d', 'double') > 9.0` filter
+    now prunes files like `> 9`.
+
+- `EXPLAIN FULL` plans its query with the same rewrites the query gets on its own
+
+    The inner statement of `EXPLAIN FULL` skipped the front door's AST
+    rewrites, so a query that ran on its own could fail to explain: Trino's
+    `FETCH FIRST n ROWS ONLY` did not plan, an exponent literal such as
+    `25e-1` stayed a decimal (and a comparison with a NaN double failed),
+    and identifier folding and `information_schema` qualification did not
+    apply.
+
+- GitHub release binaries build again: the workflow no longer asks for the removed `sqe-worker` binary
+
+    `.github/workflows/release-binaries.yml` still built and packaged `--bin sqe-worker`, which was
+    deleted on 2026-09-18 (a worker is `sqe-server --mode worker`). Cargo stopped with "no bin target
+    named `sqe-worker`" on all three targets, so v0.50.0 through v0.53.1 got no GitHub Release. The
+    archives now hold `sqe-server`, `sqe-cli` and `sqe-bench`.
+
+- Concurrent spilling queries no longer push the server into the OOM killer on glibc (#788)
+  `sqe-server` now caps glibc malloc arenas at two (`mallopt(M_ARENA_MAX)`)
+  before any thread starts. With the glibc default (8 x cores), heap freed
+  by spilling sorts, joins and aggregates stayed fragmented across dozens of
+  arenas, invisible to the memory pool: an SF100 run of two sorts, two
+  aggregates and two joins reached 25 GB RSS with 4.6-10 GB in the pool and
+  was killed. With two arenas the same run completes. Setting
+  `MALLOC_ARENA_MAX` in the environment still wins.
+
+- Each statement runs under one memory quota, across every execution context it builds, and Flight `DoPut` ingest is admitted and capped like an INSERT (#788)
+
+    Admission now creates one query pool per statement, and every context
+    the statement builds reserves from it: the SELECT and the load of a
+    CTAS, the source and the target rewrite of a MERGE, an EXPLAIN ANALYZE.
+    A MERGE used to collect its source under one quota and rewrite the
+    target under a second, full one. An ADBC bulk ingest went straight to
+    the writer: no concurrency permit, no per-user reservation, no refusal
+    on a red coordinator pool, and its fan-out buffers charged no pool. It
+    now passes the same gates as an INSERT and its buffers reserve from the
+    statement's pool.
+
+- Flight SQL bulk ingest honours `table_definition_options` (#881)
+
+    ADBC `adbc_ingest` modes now work: `create` and `create_append` create a
+    missing table from the stream's Arrow schema, `create` refuses an existing
+    table with `ALREADY_EXISTS` before any file is written, and `replace` swaps
+    the rows in one overwrite snapshot that keeps the table's schema and
+    history. Before, the options were ignored: a missing table answered
+    `TABLE_NOT_FOUND` and every ingest into an existing table appended. Absent
+    or `UNSPECIFIED` options behave as before (fail if missing, append if
+    present). A create refuses inside a SQL `BEGIN` transaction and on a
+    session with `WRITE_BRANCH`; inside a client-held Flight transaction the
+    table is created at once and the rows follow the transaction. A replace
+    is refused under row-level policy, as `INSERT OVERWRITE` is. A create
+    needs the stream to announce its schema; one that does not fails with
+    `INVALID_ARGUMENT`.
+
+- `CAST(CASE .. END AS JSON)` and `CAST(coalesce(..) AS JSON)` of JSON values no longer quote them (#848)
+
+    DataFusion types a `CASE`, `coalesce`, `nvl`, `ifnull`, `nullif` and
+    `nvl2` result without field metadata, so the JSON marker of
+    `json_parse` and `json_extract` was lost and the cast encoded the JSON
+    text as a string: `"{\"a\":1}"` where Trino returns `{"a":1}`. When
+    every result is JSON (NULL aside), the result now stays JSON, and
+    `typeof` says `json`. A mix of JSON and plain strings is still a
+    string. A stored V2 `JSON` column still has no marker.
+
+- A catalog-qualified Iceberg metadata table reads the catalog it names (#317)
+
+    `cat.ns."t$refs"` (and `$snapshots`, `$manifests`, `$history`, `$files`,
+    `$partitions`) rewrites to `table_refs('ns', 't', 'cat')`, but the
+    coordinator ignored the catalog argument and loaded `ns.t` from the
+    session's default catalog. Over Flight SQL, where no `X-Trino-Catalog`
+    sets that default, a table in a second catalog failed with TableNotFound
+    (or read a same-named table elsewhere). The coordinator now picks the
+    named catalog from the ones the session built with the caller's
+    credentials; an unknown name is a planning error.
+
+- `peak_memory_bytes` is the query's own peak (#812)
+
+    `system.runtime.queries`, the web UI and the audit record reported the
+    coordinator pool's total use when the query ended, so every query
+    running at the same time showed the sum of all of them. The query
+    memory pool now keeps a high watermark of the query's own reservations,
+    a join or memory retry included.
+
+- `sqe-server` raises its open-file soft limit at startup (#788)
+
+    A full-table `ORDER BY` at SF100 kept more than 800 spill files open and
+    failed with "Too many open files" under the common 1024 soft limit, while
+    the hard limit allowed far more. The server now raises the soft limit to
+    the hard limit (10240 on macOS when the hard limit is unlimited), logs the
+    change, and warns when the result stays below 8192 so operators know to
+    raise `LimitNOFILE` or `ulimit -Hn`. Containers that already run at the
+    hard limit see no change.
+
+- A bare `cargo test` no longer aborts on a stack overflow
+
+    `.cargo/config.toml` sets `RUST_MIN_STACK` to 32 MiB for the processes
+    cargo starts, as `make test` and CI already did. Debug builds of the
+    coordinator Flight SQL tests overflowed Rust's 2 MiB test-thread default
+    and took the whole test binary down. Deployed binaries are unaffected:
+    the server runtime sizes its own threads.
+
+- `CAST(.. AS JSON)` of a JSON value is the identity through aliases and arrays (#848)
+
+    `json_parse`, `json_extract`, `json_array_get` and `CAST(.. AS JSON)`
+    mark their result as JSON, so a cast of such a value returns it
+    unchanged also through a CTE, a subquery or a view, where it used to
+    be quoted as a JSON string. `CAST(ARRAY[json_parse(..), ..] AS JSON)`
+    embeds the elements (`[{"a":1},null]`), and `typeof` of a JSON value
+    is `json`, as in Trino. The Trino protocol reports such a column as
+    `json` instead of `varchar`. A stored V2 `JSON` column has no marker and is
+    still cast to a JSON string.
+
+- COMMIT and ROLLBACK over the Trino HTTP endpoint no longer fail after they took effect (#820)
+
+    With a session manager wired (hybrid mode: Flight SQL and Trino HTTP on one
+    coordinator), COMMIT published the transaction's branch, or ROLLBACK
+    dropped it, and then returned "transaction control: session not found in
+    manager": the HTTP session is built per request and the manager never
+    held it. A client saw a failed COMMIT that had published. Ending a
+    transaction now succeeds when the manager holds no session to clear;
+    BEGIN on a session the manager does not hold still fails.
+
+- `arbitrary()` is now a real aggregate
+  `arbitrary(x)` was a scalar function that returned the first non-NULL
+  value of the whole batch, so `SELECT k, arbitrary(v) FROM t GROUP BY k`
+  failed to plan and other uses gave one value for every group. It is now
+  an alias of DataFusion's `any_value` aggregate, which matches Trino: one
+  non-NULL value per group, NULL when the group has none.
+
+- A `JSON` column on a V2 table casts to JSON unchanged (#848)
+
+    Before format v3 a `JSON` column is stored as an Iceberg string, so
+    `CAST(payload AS JSON)` quoted the text, `"{\"a\":1}"`, where Trino returns
+    `{"a":1}`. SQE now lists a V2 table's JSON columns in the `sqe.json-columns`
+    table property, and a scan marks those fields as JSON text: the cast returns
+    the value canonical, and the Trino protocol types the column `json`.
+    CREATE, CTAS, CREATE LIKE and ALTER ADD / RENAME / DROP COLUMN keep the
+    property current in the same commit as the schema. A table written before
+    the property opts in with `ALTER COLUMN .. SET DATA TYPE JSON`. DESCRIBE and
+    `information_schema` still show `varchar`.
+
+- An INSERT-only grantee can write the first rows into a table that has no snapshot yet
+
+    The pre-write check sends the catalog a commit whose requirement cannot match. For
+    a table without a `main` ref it sent an empty update list, which Polaris authorizes
+    as `UPDATE_TABLE` and so demands `table-properties-write`, a privilege an INSERT
+    grant does not carry. The first INSERT into a fresh table was refused with "no write
+    access". The check now drops the absent `main` ref instead, a no-op that the
+    data-write privilege covers. Regression since the write check covered every write.
+
+- CTAS, INSERT, DELETE, UPDATE, MERGE and TRUNCATE run under `query.max_query_memory`, like a SELECT (#788)
+
+    The write statements built their execution context on the shared
+    coordinator pool. Their write buffers and the SELECT feeding a CTAS or
+    INSERT reserve from that context, so one large write could take the
+    whole pool while a read was held to its quota. They now get the same
+    per-query quota, unspillable headroom and sort share as a read. A Hive
+    write refused by the quota returns `RESOURCE_EXHAUSTED` naming the
+    setting, as the Iceberg write path already did, not `EXECUTION_FAILED`.
+
+- CLI smoke test expects embedded CTAS to keep `PARTITIONED BY` (#875)
+
+    `embedded_warehouse_ctas_refuses_partitioning_it_would_drop` still asserted the refusal
+    that embedded CTAS on the cluster's CTAS handler removed, which failed `aikido-test-rust`
+    on main and on every MR pipeline. It is now `embedded_warehouse_ctas_keeps_partitioning`
+    and checks `SHOW CREATE TABLE` prints `PARTITIONED BY (id)`.
+
+### Security
+
+- Production guide no longer recommends the warehouse bucket as a file TVF prefix
+
+    File TVFs read with the engine's storage credentials, so `allowed_object_store_prefixes = ["s3://your-warehouse/"]` let any caller read every table's files raw, without row filters or masks. The examples now use a per-user landing prefix, and the guide says a TVF prefix never covers a warehouse. Deployments that copied the old example should replace that entry.
+
+- The GitHub mirror no longer carries the internal GitLab host or group path in commit messages
+
+    `make mirror-github` (dry run) and `make mirror-github PUSH=1` replace the
+    manual `git push github main`. `scripts/mirror-github.sh` fetches main and
+    the tags from origin into a scratch repository and rewrites only the
+    commit and tag messages with git filter-repo: merge-from-URL lines, "See
+    merge request <group path>!N" trailers, other internal URLs, the group path
+    and the company abbreviation. Files and authors are unchanged, and the
+    script checks that the rewritten tip tree equals origin's. The rewrite is
+    deterministic, so later pushes are fast-forwards. Signatures are dropped on
+    the mirror. The host and group path come from the origin URL, so the script
+    does not name them.
+
+- Runtime base with ca-certificates-bundle 20260909-r3 (CVE-2026-91403)
+
+    The v0.53.0 release image was held back by the image scan: its Chainguard
+    glibc-dynamic base carried ca-certificates-bundle 20260909-r2 (Critical
+    CVE-2026-91403). The base moves to the 2026-11-06 digest. CVE-2026-84243
+    (glibc 2.44, High, no fix yet) is accepted in `.grype.yaml` until 2026-11-20.
+
+- Runtime base with glibc 2.44-r16 (CVE-2026-84243)
+
+    The Chainguard glibc-dynamic base moves to the 2026-11-12 digest, which
+    ships glibc 2.44-r16 and ca-certificates-bundle 20261020. That fixes the
+    High CVE-2026-84243 the 2026-11-06 base still carried, and the `.grype.yaml`
+    exception for it is gone: the image scan passes with no accepted findings.
+
+- RUSTSEC-2026-0459 (C SQLite in libsqlite3-sys) recorded as an ignored advisory
+
+    libsqlite3-sys 0.37.0 is only reachable through sqlx 0.9.0, which caps it
+    below the fixed 0.39 and has no newer release. No shipped binary links it:
+    released builds use the pure-Rust SQLite engine, and the sqlx SQLite
+    driver stays behind the opt-in `sqlite-c` / `sql-sqlite` features. The
+    ignore has a review date and goes once sqlx accepts libsqlite3-sys 0.39.
+
+- Removed internal infrastructure references from the tree; `make leaks` scans for them
+
+    The repository is mirrored to a public GitHub repository, `docs/internal`
+    included. CI includes and images now use GitLab predefined variables
+    (`$CI_REGISTRY_IMAGE`, `$CI_PROJECT_ROOT_NAMESPACE`) instead of the
+    internal registry host and group path; `Cargo.toml` and `QUICKSTART.md`
+    point at the public repository. Local home paths, personal AWS profile
+    names, a real AWS account id and internal dataset names are gone from
+    docs, tests, benchmark output and the playground Iceberg metadata (the
+    avro manifests are re-encoded, not byte-patched). `make leaks` runs
+    `make leak-scan` and then `scripts/leak-scan-repo.sh` over every tracked
+    and untracked non-ignored file: internal hosts and group paths, the
+    company abbreviation, company mail hosts, home paths in text and binary
+    files, AWS profile names and account ids, private patterns from a
+    gitignored `.leak-scan-extra` file or `$LEAK_SCAN_EXTRA`, and gitleaks.
+    Git history still holds the old values.
+
 ## [0.53.1] — 2026-11-06
 
 ### Security
