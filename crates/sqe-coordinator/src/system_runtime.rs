@@ -328,27 +328,43 @@ impl TableProvider for QueryHistoryTable {
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
+    // `async_trait`'s desugared form (compile time, see
+    // docs/internal/plans/2026-09-07-compile-time-async-hubs.md). As an
+    // `async fn` the future captured `filters: &[Expr]` and held a `MemTable`
+    // (which carries `Expr` column defaults) across the last await, so proving
+    // it `Send` walked DataFusion's expression graph: 3.7 s for this method.
+    // The filters are read synchronously, before the block, and the table is
+    // held as `Arc<dyn TableProvider>`.
+    fn scan<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+        &'life0 self,
+        state: &'life1 dyn Session,
+        projection: Option<&'life2 Vec<usize>>,
+        filters: &'life3 [Expr],
         limit: Option<usize>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let mut records = self.live.clone();
-        if let Some(source) = self.source.clone() {
-            let bounds = EndBounds::from_filters(filters);
-            let (logged, _) = tokio::task::spawn_blocking(move || {
-                source.read(bounds.from, bounds.to, HISTORY_ROW_CAP)
-            })
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            merge_logged(&mut records, logged, self.owner_filter.as_deref());
-        }
-        let batch = queries_batch(&records)?;
-        MemTable::try_new(batch.schema(), vec![vec![batch]])?
-            .scan(state, projection, &[], limit)
-            .await
+    ) -> futures::future::BoxFuture<'async_trait, DFResult<Arc<dyn ExecutionPlan>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        Self: 'async_trait,
+    {
+        let bounds = EndBounds::from_filters(filters);
+        Box::pin(async move {
+            let mut records = self.live.clone();
+            if let Some(source) = self.source.clone() {
+                let (logged, _) = tokio::task::spawn_blocking(move || {
+                    source.read(bounds.from, bounds.to, HISTORY_ROW_CAP)
+                })
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                merge_logged(&mut records, logged, self.owner_filter.as_deref());
+            }
+            let batch = queries_batch(&records)?;
+            let table: Arc<dyn TableProvider> =
+                Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]])?);
+            table.scan(state, projection, &[], limit).await
+        })
     }
 }
 

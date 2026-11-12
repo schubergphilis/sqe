@@ -3789,7 +3789,19 @@ impl QueryHandler {
     /// The schema is the analyzed one, the types the stream will carry (the
     /// analyzer types decimal arithmetic, #785); a plan whose placeholders
     /// the analyzer cannot type yet keeps the planned schema.
-    pub async fn plan_prepared_statement(
+    ///
+    /// Boxed at the definition: the future holds a `SessionContext` and a
+    /// `LogicalPlan` across its awaits, and a caller that awaits it unboxed
+    /// re-proves `Send` over both.
+    pub fn plan_prepared_statement<'a>(
+        &'a self,
+        session: &'a Session,
+        numbered_sql: &'a str,
+    ) -> futures::future::BoxFuture<'a, sqe_core::Result<Option<(LogicalPlan, SchemaRef)>>> {
+        Box::pin(self.plan_prepared_statement_inner(session, numbered_sql))
+    }
+
+    async fn plan_prepared_statement_inner(
         &self,
         session: &Session,
         numbered_sql: &str,
@@ -5764,11 +5776,17 @@ impl QueryHandler {
     ///
     /// Delegates to [`crate::session_context::create_session_context`] which
     /// owns the full setup logic, keeping this file focused on query routing.
-    async fn create_session_context(
-        &self,
-        session: &Session,
-    ) -> sqe_core::Result<(SessionContext, Arc<SessionCatalog>)> {
-        crate::session_context::create_session_context(
+    ///
+    /// Boxed at the definition: the setup future is a 750-line state machine
+    /// and this method has about twenty callers. Unboxed, every `async_trait`
+    /// method that reaches it (Flight `do_get_tables` through
+    /// [`Self::session_catalog`]) proved `Send` over it again.
+    fn create_session_context<'a>(
+        &'a self,
+        session: &'a Session,
+    ) -> futures::future::BoxFuture<'a, sqe_core::Result<(SessionContext, Arc<SessionCatalog>)>>
+    {
+        Box::pin(crate::session_context::create_session_context(
             &self.config,
             session,
             self.policy_store.as_ref(),
@@ -5779,8 +5797,7 @@ impl QueryHandler {
             &self.runtime_catalogs,
             &self.hive_manifest_cache,
             &self.secrets,
-        )
-        .await
+        ))
     }
 
     /// [`Self::create_session_context`] on the statement's pool, for the

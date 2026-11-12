@@ -1379,6 +1379,156 @@ impl SqeFlightSqlService {
         }
     }
 
+    /// Stream a `DoPut` upload into the write handler (`CommandStatementIngest`).
+    ///
+    /// Boxed at the definition, for compile time and not behaviour:
+    /// `handle_ingest_streaming` is generic over the stream, and its future
+    /// holds a `SessionContext` across awaits, so awaiting it inside the
+    /// `async_trait` method made that method prove `Send` over it (3.5 s,
+    /// `-Zself-profile`). Here the proof is made once, for one concrete
+    /// stream type.
+    fn ingest_flight_stream<'a>(
+        &'a self,
+        session: &'a sqe_core::Session,
+        qualified: &'a str,
+        txn: Option<Arc<sqe_catalog::txn::TxnScope>>,
+        pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
+        flight_stream: arrow_flight::decode::FlightRecordBatchStream,
+    ) -> futures::future::BoxFuture<'a, sqe_core::Result<usize>> {
+        Box::pin(self.ingest_flight_stream_inner(session, qualified, txn, pool, flight_stream))
+    }
+
+    async fn ingest_flight_stream_inner(
+        &self,
+        session: &sqe_core::Session,
+        qualified: &str,
+        txn: Option<Arc<sqe_catalog::txn::TxnScope>>,
+        pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
+        flight_stream: arrow_flight::decode::FlightRecordBatchStream,
+    ) -> sqe_core::Result<usize> {
+        sqe_catalog::txn::write_scope(
+            txn,
+            session.write_branch.clone(),
+            self.query_handler.write_handler().handle_ingest_streaming(
+                session,
+                qualified,
+                pool,
+                Box::pin(flight_stream),
+            ),
+        )
+        .await
+    }
+
+    /// Plan and store a prepared statement (`CreatePreparedStatement`).
+    ///
+    /// Boxed at the definition, for compile time and not behaviour: the body
+    /// holds a `LogicalPlan` and a `PreparedStatement` across its awaits, and
+    /// as part of the `async_trait` method every await of it re-proved `Send`
+    /// over that type graph. The trait method resolves the session and the
+    /// client address, then hands over.
+    fn create_prepared_statement<'a>(
+        &'a self,
+        session: Arc<sqe_core::Session>,
+        query: ActionCreatePreparedStatementRequest,
+        client_ip: Option<String>,
+    ) -> futures::future::BoxFuture<'a, Result<ActionCreatePreparedStatementResult, Status>> {
+        Box::pin(self.create_prepared_statement_inner(session, query, client_ip))
+    }
+
+    async fn create_prepared_statement_inner(
+        &self,
+        session: Arc<sqe_core::Session>,
+        query: ActionCreatePreparedStatementRequest,
+        client_ip: Option<String>,
+    ) -> Result<ActionCreatePreparedStatementResult, Status> {
+        let sql = &query.query;
+
+        debug!(username = %session.user.username, sql_len = sql.len(), "Creating prepared statement");
+
+        // Finding 406: plan once. `?` placeholders become `$1..$N` so
+        // DataFusion can plan the statement without values, inferring each
+        // placeholder's type and the output schema. The plan is stored and
+        // reused by every GetFlightInfo/DoGet for this statement; policy
+        // enforcement is applied per execution, not here.
+        let (numbered_sql, numbered_count) = sqe_core::number_placeholders(sql);
+        // A statement that fails to plan here is never executed, so it is
+        // audited here (like `get_flight_info_statement`).
+        let start = std::time::Instant::now();
+        let failed = |e| {
+            let e =
+                self.query_handler
+                    .audit_failure(&session, sql, start, client_ip.clone(), None, e);
+            sqe_error_to_status(&e, None)
+        };
+        let plan = self
+            .query_handler
+            .plan_prepared_statement(&session, &numbered_sql)
+            .await
+            .map_err(failed)?;
+        let (param_types, dataset_schema): (
+            Vec<Option<arrow_schema::DataType>>,
+            arrow_schema::SchemaRef,
+        ) = match &plan {
+            Some((plan, schema)) => (
+                PreparedStatement::param_types_from_plan(plan, numbered_count)
+                    .map_err(Status::internal)?,
+                Arc::clone(schema),
+            ),
+            // DML, DDL and metadata statements have no streaming plan;
+            // their result schema is the one `get_schema` advertises. An
+            // INSERT / UPDATE / DELETE advertises the parameter types
+            // DataFusion infers (an INSERT's from its target columns), so a
+            // driver binds a BIGINT column as Int64, not Utf8; anything
+            // else is untyped. The bind is not checked against these
+            // types: the values are coerced when the statement runs.
+            None => (
+                self.query_handler
+                    .dml_parameter_types(&session, &numbered_sql, numbered_count)
+                    .await,
+                self.query_handler
+                    .get_schema(&session, sql)
+                    .await
+                    .map_err(failed)?,
+            ),
+        };
+        let statement = PreparedStatement::new(
+            sql.clone(),
+            numbered_sql,
+            plan.map(|(plan, _)| plan),
+            param_types,
+            Arc::clone(&dataset_schema),
+        )
+        .with_transaction_id(client_transaction_of(&session));
+        let parameter_schema = statement.parameter_schema();
+        let statement_id = self
+            .prepared_statements
+            .insert(&session.id, statement)
+            .await;
+        debug!(
+            statement_id = %statement_id,
+            parameters = parameter_schema.fields().len(),
+            "Prepared statement stored"
+        );
+
+        // Encode both schemas as IPC for the result; an empty one is sent
+        // as no schema (see `advertised_schema_bytes`).
+        let dataset_schema = advertised_schema_bytes(&dataset_schema)?;
+        let parameter_schema = if parameter_schema.fields().is_empty() {
+            Default::default()
+        } else {
+            FlightInfo::new()
+                .try_with_schema(&parameter_schema)
+                .map_err(|e| Status::internal(format!("Failed to encode parameter schema: {e}")))?
+                .schema
+        };
+
+        Ok(ActionCreatePreparedStatementResult {
+            prepared_statement_handle: PreparedStatementStore::handle_bytes(statement_id).into(),
+            dataset_schema,
+            parameter_schema,
+        })
+    }
+
     /// Execute a prepared statement (finding 406).
     ///
     /// Queries reuse the plan built at `CreatePreparedStatement`: the current
@@ -2240,8 +2390,16 @@ impl FlightSqlService for SqeFlightSqlService {
         );
 
         let client_ip = Some(self.extract_client_ip(&request));
-        self.run_prepared_into_flight_response(&session, &statement, client_ip, None)
-            .await
+        // Through the boxed hub, not `run_prepared_into_flight_response`
+        // directly: awaiting that unboxed future here made this method
+        // re-prove `Send` over the whole streaming path (compile time).
+        self.run_resolved_into_flight_response(
+            &session,
+            ResolvedStatement::Prepared(statement),
+            client_ip,
+            None,
+        )
+        .await
     }
 
     async fn do_get_table_types(
@@ -2575,18 +2733,16 @@ impl FlightSqlService for SqeFlightSqlService {
             .query_handler
             .admit_ingest(&session, &qualified)
             .map_err(|e| sqe_error_to_status(&e, None))?;
-        let rows = sqe_catalog::txn::write_scope(
-            txn,
-            session.write_branch.clone(),
-            self.query_handler.write_handler().handle_ingest_streaming(
+        let rows = self
+            .ingest_flight_stream(
                 &session,
                 &qualified,
+                txn,
                 Some(admission.memory.pool()),
-                Box::pin(flight_stream),
-            ),
-        )
-        .await
-        .map_err(|e| sqe_error_to_status(&e, None))?;
+                flight_stream,
+            )
+            .await
+            .map_err(|e| sqe_error_to_status(&e, None))?;
         // `after_commit` drops the session and table-metadata caches; the
         // result cache lives on the QueryHandler, so a SELECT of the same
         // text kept serving pre-ingest rows until its TTL (#746). Same call
@@ -2685,93 +2841,9 @@ impl FlightSqlService for SqeFlightSqlService {
                 .map_err(|e| Status::resource_exhausted(e.to_string()))?;
         }
         let session = in_request_transaction(session, query.transaction_id.as_deref())?;
-        let sql = &query.query;
-
-        debug!(username = %session.user.username, sql_len = sql.len(), "Creating prepared statement");
-
-        // Finding 406: plan once. `?` placeholders become `$1..$N` so
-        // DataFusion can plan the statement without values, inferring each
-        // placeholder's type and the output schema. The plan is stored and
-        // reused by every GetFlightInfo/DoGet for this statement; policy
-        // enforcement is applied per execution, not here.
-        let (numbered_sql, numbered_count) = sqe_core::number_placeholders(sql);
-        // A statement that fails to plan here is never executed, so it is
-        // audited here (like `get_flight_info_statement`).
-        let start = std::time::Instant::now();
-        let failed = |e| {
-            let client_ip = Some(self.extract_client_ip(&request));
-            let e = self
-                .query_handler
-                .audit_failure(&session, sql, start, client_ip, None, e);
-            sqe_error_to_status(&e, None)
-        };
-        let plan = self
-            .query_handler
-            .plan_prepared_statement(&session, &numbered_sql)
+        let client_ip = Some(self.extract_client_ip(&request));
+        self.create_prepared_statement(session, query, client_ip)
             .await
-            .map_err(failed)?;
-        let (param_types, dataset_schema): (
-            Vec<Option<arrow_schema::DataType>>,
-            arrow_schema::SchemaRef,
-        ) = match &plan {
-            Some((plan, schema)) => (
-                PreparedStatement::param_types_from_plan(plan, numbered_count)
-                    .map_err(Status::internal)?,
-                Arc::clone(schema),
-            ),
-            // DML, DDL and metadata statements have no streaming plan;
-            // their result schema is the one `get_schema` advertises. An
-            // INSERT / UPDATE / DELETE advertises the parameter types
-            // DataFusion infers (an INSERT's from its target columns), so a
-            // driver binds a BIGINT column as Int64, not Utf8; anything
-            // else is untyped. The bind is not checked against these
-            // types: the values are coerced when the statement runs.
-            None => (
-                self.query_handler
-                    .dml_parameter_types(&session, &numbered_sql, numbered_count)
-                    .await,
-                self.query_handler
-                    .get_schema(&session, sql)
-                    .await
-                    .map_err(failed)?,
-            ),
-        };
-        let statement = PreparedStatement::new(
-            sql.clone(),
-            numbered_sql,
-            plan.map(|(plan, _)| plan),
-            param_types,
-            Arc::clone(&dataset_schema),
-        )
-        .with_transaction_id(client_transaction_of(&session));
-        let parameter_schema = statement.parameter_schema();
-        let statement_id = self
-            .prepared_statements
-            .insert(&session.id, statement)
-            .await;
-        debug!(
-            statement_id = %statement_id,
-            parameters = parameter_schema.fields().len(),
-            "Prepared statement stored"
-        );
-
-        // Encode both schemas as IPC for the result; an empty one is sent
-        // as no schema (see `advertised_schema_bytes`).
-        let dataset_schema = advertised_schema_bytes(&dataset_schema)?;
-        let parameter_schema = if parameter_schema.fields().is_empty() {
-            Default::default()
-        } else {
-            FlightInfo::new()
-                .try_with_schema(&parameter_schema)
-                .map_err(|e| Status::internal(format!("Failed to encode parameter schema: {e}")))?
-                .schema
-        };
-
-        Ok(ActionCreatePreparedStatementResult {
-            prepared_statement_handle: PreparedStatementStore::handle_bytes(statement_id).into(),
-            dataset_schema,
-            parameter_schema,
-        })
     }
 
     async fn do_action_close_prepared_statement(
