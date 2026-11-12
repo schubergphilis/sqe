@@ -604,6 +604,17 @@ pub async fn create_session_context(
                 .find(|e| e.name == default_catalog)
                 .map(|e| Arc::clone(&e.catalog))
                 .unwrap_or_else(|| session_catalog_for_return.clone());
+            // A catalog-qualified `cat.ns."t$refs"` names its catalog in the
+            // TVF's third argument; the resolver picks it from the catalogs
+            // this session built with the caller's own credentials.
+            let metadata_catalogs = metadata_catalog_resolver(
+                system_catalog_entries
+                    .iter()
+                    .map(|e| (e.name.clone(), Arc::clone(&e.catalog)))
+                    .collect(),
+                default_catalog.clone(),
+                Arc::clone(&effective_session_catalog),
+            );
 
             // Register the system catalog for Trino JDBC metadata browsing
             // (system.jdbc.types, system.jdbc.catalogs, system.jdbc.schemas, etc.)
@@ -846,22 +857,24 @@ pub async fn create_session_context(
             //   SELECT * FROM table_files('schema', 'table')
             //   SELECT * FROM table_partitions('schema', 'table')
             //   SELECT * FROM table_refs('schema', 'table')
+            //   (each takes an optional third argument: the catalog)
+            use sqe_catalog::iceberg_metadata_tvf as meta;
             ctx.register_udtf(
                 "table_snapshots",
-                Arc::new(sqe_catalog::iceberg_metadata_tvf::TableSnapshotsFunction::new(
-                    Arc::clone(&effective_session_catalog),
+                Arc::new(meta::TableSnapshotsFunction::with_catalog_resolver(
+                    metadata_catalogs.clone(),
                 )),
             );
             ctx.register_udtf(
                 "table_manifests",
-                Arc::new(sqe_catalog::iceberg_metadata_tvf::TableManifestsFunction::new(
-                    Arc::clone(&effective_session_catalog),
+                Arc::new(meta::TableManifestsFunction::with_catalog_resolver(
+                    metadata_catalogs.clone(),
                 )),
             );
             ctx.register_udtf(
                 "table_history",
-                Arc::new(sqe_catalog::iceberg_metadata_tvf::TableHistoryFunction::new(
-                    Arc::clone(&effective_session_catalog),
+                Arc::new(meta::TableHistoryFunction::with_catalog_resolver(
+                    metadata_catalogs.clone(),
                 )),
             );
             // table_files / table_partitions expose per-column bounds, counts
@@ -897,25 +910,23 @@ pub async fn create_session_context(
             ctx.register_udtf(
                 "table_files",
                 Arc::new(
-                    sqe_catalog::iceberg_metadata_tvf::TableFilesFunction::new(Arc::clone(
-                        &effective_session_catalog,
-                    ))
-                    .with_policy(metadata_policy.clone()),
+                    meta::TableFilesFunction::with_catalog_resolver(metadata_catalogs.clone())
+                        .with_policy(metadata_policy.clone()),
                 ),
             );
             ctx.register_udtf(
                 "table_partitions",
                 Arc::new(
-                    sqe_catalog::iceberg_metadata_tvf::TablePartitionsFunction::new(Arc::clone(
-                        &effective_session_catalog,
-                    ))
+                    meta::TablePartitionsFunction::with_catalog_resolver(
+                        metadata_catalogs.clone(),
+                    )
                     .with_policy(metadata_policy),
                 ),
             );
             ctx.register_udtf(
                 "table_refs",
-                Arc::new(sqe_catalog::iceberg_metadata_tvf::TableRefsFunction::new(
-                    Arc::clone(&effective_session_catalog),
+                Arc::new(meta::TableRefsFunction::with_catalog_resolver(
+                    metadata_catalogs,
                 )),
             );
 
@@ -1039,6 +1050,37 @@ fn tvf_caller_for(
     } else {
         caller
     }
+}
+
+/// The catalog a metadata TVF (`table_refs`, `table_snapshots`, ...) loads
+/// from. No catalog argument, or the session's default by name, is the
+/// effective catalog. Any other name must be one this session built (config
+/// catalogs and the discovered warehouse, each with the caller's own
+/// credentials); an exact match wins over a case-insensitive one, as an
+/// unquoted SQL identifier arrives folded. An unknown name is an error: the
+/// effective catalog used to answer for every name, so
+/// `probe.s."t$refs"` over Flight SQL read `s.t` from whichever catalog
+/// was the default and failed with TableNotFound.
+fn metadata_catalog_resolver(
+    catalogs: Vec<(String, Arc<SessionCatalog>)>,
+    default_catalog: String,
+    effective: Arc<SessionCatalog>,
+) -> sqe_catalog::iceberg_metadata_tvf::MetadataCatalogResolver {
+    Arc::new(move |name: Option<&str>| {
+        let Some(name) = name.filter(|n| *n != default_catalog) else {
+            return Ok(Arc::clone(&effective));
+        };
+        catalogs
+            .iter()
+            .find(|(n, _)| n == name)
+            .or_else(|| catalogs.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)))
+            .map(|(_, c)| Arc::clone(c))
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Plan(format!(
+                    "metadata table: catalog '{name}' not found"
+                ))
+            })
+    })
 }
 
 /// Attempt to resolve `warehouse` as a Polaris catalog and build its
@@ -1772,5 +1814,41 @@ allowed_object_store_prefixes = ["s3://shared-landing/"]
                 plan.err()
             );
         }
+    }
+
+    fn bare_catalog() -> Arc<SessionCatalog> {
+        Arc::new(SessionCatalog::unconfigured(
+            &sqe_core::config::StorageConfig::default(),
+            None,
+        ))
+    }
+
+    #[test]
+    fn metadata_tvf_reads_the_catalog_its_argument_names() {
+        let (main, probe, effective) = (bare_catalog(), bare_catalog(), bare_catalog());
+        let resolve = metadata_catalog_resolver(
+            vec![
+                ("main".to_string(), Arc::clone(&main)),
+                ("Probe".to_string(), Arc::clone(&probe)),
+            ],
+            "main".to_string(),
+            Arc::clone(&effective),
+        );
+        let pick = |name| resolve(name).expect("resolves");
+        assert!(Arc::ptr_eq(&pick(None), &effective), "no argument");
+        assert!(
+            Arc::ptr_eq(&pick(Some("main")), &effective),
+            "the default by name"
+        );
+        assert!(Arc::ptr_eq(&pick(Some("Probe")), &probe), "exact name");
+        assert!(
+            Arc::ptr_eq(&pick(Some("probe")), &probe),
+            "folded identifier"
+        );
+        let err = resolve(Some("elsewhere")).expect_err("unknown catalog");
+        assert!(
+            err.to_string().contains("catalog 'elsewhere' not found"),
+            "{err}"
+        );
     }
 }

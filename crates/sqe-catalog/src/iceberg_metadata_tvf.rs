@@ -15,10 +15,10 @@
 //! as [`crate::read_parquet::ReadParquetFunction`].
 //!
 //! An optional third argument names the catalog: the `"t$snapshots"` rewrite
-//! turns `cat.ns."t$snapshots"` into `table_snapshots('ns', 't', 'cat')`. The
-//! coordinator builds the functions with `new` over the session's effective
-//! catalog and ignores the argument; embedded mode builds them with
-//! `with_catalog_resolver` and reads the named catalog.
+//! turns `cat.ns."t$snapshots"` into `table_snapshots('ns', 't', 'cat')`.
+//! Both the coordinator and embedded mode build the functions with
+//! `with_catalog_resolver` and read the named catalog; `new` binds one
+//! catalog and ignores the argument.
 //!
 //! ## Authorization (#750)
 //!
@@ -362,10 +362,9 @@ pub type MetadataCatalogResolver =
 
 #[derive(Clone)]
 enum CatalogSource {
-    /// One catalog for every call; a catalog argument is ignored. The
-    /// coordinator binds the session's effective catalog (#317).
+    /// One catalog for every call; a catalog argument is ignored.
     Fixed(Arc<SessionCatalog>),
-    /// The catalog argument picks one (embedded mode, several catalogs).
+    /// The catalog argument picks one (coordinator and embedded mode).
     Resolver(MetadataCatalogResolver),
 }
 

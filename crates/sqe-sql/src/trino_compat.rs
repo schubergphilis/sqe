@@ -1272,8 +1272,7 @@ fn rewrite_metadata_dollar_table(factor: &mut TableFactor) -> bool {
     // immediately before the table. Passing the catalog-qualified
     // `catalog.schema` as the namespace made Polaris fail to load the table
     // (#317), so the catalog travels as a third argument instead: the
-    // coordinator ignores it (its TVFs are bound to the session's effective
-    // catalog), embedded mode picks the named catalog with it.
+    // coordinator and embedded mode both pick the named catalog with it.
     let n = segments.len();
     if n < 2 {
         // Single-segment `"tbl$snapshots"` with no namespace. The TVFs require
