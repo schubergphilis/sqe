@@ -22,6 +22,8 @@
 - [x] 3.5 `Procedure` (144 lines), `FILTER=procedure` (`handle_procedure_statement`; 14 passed)
 - [x] 3.6 `Ctas` (150 lines), `FILTER=ctas` (`handle_ctas_statement`; 16 passed; execute_inner now 702 lines)
 - [ ] 3.7 Move the `handle_*` families into `statement/*.rs` files of `impl QueryHandler` blocks, one family per merge request; access-control family last and only after 1.1
+  - Files are `query_handler/<family>.rs` child modules (`use super::*;`), following `query_handler/admission.rs`, instead of a `statement/` directory. Moved methods called from `execute_inner` become `pub(super)`.
+  - [x] `write` (MERGE, INSERT, CTAS): `query_handler/write.rs`, 370 lines
 
 ## 4. Completion stage
 
