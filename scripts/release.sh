@@ -12,6 +12,10 @@
 #   3. Creates a chore(release) commit and an annotated tag `v<version>`.
 #   4. Optionally pushes both to `origin`.
 #
+#   Run on a `release/v<version>` branch, it skips the tag and pushes only the
+#   branch: merging that merge request makes CI tag the merge commit on main
+#   (sqe-tag-release, scripts/ci-tag-release.py). This is the default flow.
+#
 # Why this script:
 #   Tags and Cargo.toml drifted across the v0.16..v0.31 history (all 14 crates
 #   stayed at 0.15.0 while tags moved to 0.31.x). This script makes the bump
@@ -125,11 +129,27 @@ git commit -m "chore(release): ${VERSION}
 Bump all workspace crate versions to ${VERSION} ahead of the v${VERSION}
 tag so \`cargo --version\` matches the git tag. Tooling: scripts/release.sh."
 
+BRANCH="$(git symbolic-ref --short HEAD)"
+
+# On `release/vX.Y.Z` the tag comes from CI: when the merge request merges,
+# sqe-tag-release (scripts/ci-tag-release.py) tags the merge commit on main.
+# A local tag here would point at the branch commit, not at main.
+if [[ "$BRANCH" == "release/v${VERSION}" && "$VERSION" != *-* ]]; then
+    if $PUSH; then
+        echo "==> Pushing ${BRANCH} (CI tags v${VERSION} when the merge request merges)"
+        git push origin "$BRANCH"
+    else
+        echo ""
+        echo "Done. Push and open the merge request:  git push origin ${BRANCH}"
+        echo "CI tags v${VERSION} on main when it merges."
+    fi
+    exit 0
+fi
+
 echo "==> Tagging v${VERSION}"
 git tag -a "v${VERSION}" -m "Release v${VERSION}"
 
 if $PUSH; then
-    BRANCH="$(git symbolic-ref --short HEAD)"
     echo "==> Pushing ${BRANCH} + v${VERSION}"
     git push origin "$BRANCH"
     git push origin "v${VERSION}"
