@@ -143,6 +143,13 @@ pub struct QueryStats {
     pub spill_bytes: u64,
     #[serde(default)]
     pub peak_memory_bytes: u64,
+    /// Keys of the snapshot properties a data write carried into its commit
+    /// (`SET SNAPSHOT_PROPERTIES`), sorted. Never the values: they are free
+    /// text an operator may treat as sensitive. Omitted when empty, so reads,
+    /// writes without properties and every record written before this field
+    /// serialise, and hash into the audit chain, byte for byte as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub snapshot_property_keys: Vec<String>,
 }
 
 /// Policy decision summary carried in the audit event. A plain copy of the
@@ -293,6 +300,7 @@ pub(crate) fn sample_query_event() -> AuditEvent {
             rows_scanned: 100,
             spill_bytes: 0,
             peak_memory_bytes: 0,
+            snapshot_property_keys: Vec::new(),
         }),
         query: Some(QueryInfo {
             text: Some("SELECT 1".into()),
@@ -348,6 +356,7 @@ mod tests {
                 rows_scanned: 100,
                 spill_bytes: 0,
                 peak_memory_bytes: 0,
+                snapshot_property_keys: Vec::new(),
             }),
             query: Some(QueryInfo {
                 text: Some("SELECT 1".into()),
@@ -389,6 +398,40 @@ mod tests {
         assert!(json.contains("\"username\":\"alice\""));
         assert!(json.contains("\"groups\":[\"hr\"]"));
         assert!(json.contains("\"object_type\":\"table\""));
+    }
+
+    /// Empty keys leave the serialised stats exactly as they were before the
+    /// field existed: the literal below is the pre-field output, and the chain
+    /// hash is taken over these bytes, so existing logs keep verifying.
+    #[test]
+    fn stats_without_snapshot_property_keys_serialise_as_before() {
+        let ev = sample_query_event();
+        let stats = serde_json::to_string(ev.stats.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            stats,
+            r#"{"rows_returned":10,"bytes_scanned":1024,"rows_scanned":100,"spill_bytes":0,"peak_memory_bytes":0}"#
+        );
+        assert!(!serde_json::to_string(&ev)
+            .unwrap()
+            .contains("snapshot_property_keys"));
+    }
+
+    #[test]
+    fn stats_with_snapshot_property_keys_round_trip() {
+        let mut ev = sample_query_event();
+        ev.stats.as_mut().unwrap().snapshot_property_keys =
+            vec!["copy.run".into(), "etl.job".into()];
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""snapshot_property_keys":["copy.run","etl.job"]"#));
+        let back: AuditEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.stats.unwrap().snapshot_property_keys,
+            vec!["copy.run".to_string(), "etl.job".to_string()]
+        );
+        // A record written before the field existed still parses.
+        let old = r#"{"rows_returned":1}"#;
+        let stats: QueryStats = serde_json::from_str(old).unwrap();
+        assert!(stats.snapshot_property_keys.is_empty());
     }
 
     #[test]

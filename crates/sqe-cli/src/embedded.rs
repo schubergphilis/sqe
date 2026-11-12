@@ -733,10 +733,8 @@ pub struct EmbeddedClient {
     write_branch: Option<String>,
     /// `SET SNAPSHOT_PROPERTIES`: the snapshot summary properties later
     /// writes stamp into their commit. Embedded has no transactions, so this
-    /// field is the whole state. `None` is no properties. Nothing reads it
-    /// until the commit path carries it (change `write-snapshot-properties`,
-    /// section 3), hence the `allow`.
-    #[allow(dead_code)]
+    /// field is the whole state. `None` is no properties. `execute` runs a
+    /// data write in a `write_scope` that carries it to the commit path.
     snapshot_properties: Option<Arc<sqe_core::snapshot_properties::SnapshotProperties>>,
 }
 
@@ -974,14 +972,16 @@ impl EmbeddedClient {
 #[async_trait]
 impl SqlClient for EmbeddedClient {
     async fn execute(&mut self, sql: &str) -> Result<QueryResult, Box<dyn std::error::Error>> {
-        let Some(branch) = self.write_branch.clone() else {
+        if self.write_branch.is_none() && self.snapshot_properties.is_none() {
             return self.execute_statement(sql).await;
-        };
+        }
         // With `SET WRITE_BRANCH`, a data write reads and commits at the
         // branch, the way the coordinator runs it (#829): the write path's
         // `SessionCatalog` pins the target to the branch, commits there, and
         // refuses a commit that would move `main`. Reads and DDL stay on
-        // `main`, so only a data write runs in the scope.
+        // `main`, so only a data write runs in the scope. With
+        // `SET SNAPSHOT_PROPERTIES`, the same scope carries the properties
+        // the write's commit stamps into its snapshot summary.
         let kind = sqe_sql::SqlFrontDoor::new(sqe_sql::WireDialect::Embedded)
             .with_upper_case_catalogs(self.upper_case_catalogs.clone())
             .normalize(sql)
@@ -990,7 +990,7 @@ impl SqlClient for EmbeddedClient {
         // CTAS creates the table before its first append, and a new table
         // has no branch: the append would be refused after the create
         // landed, leaving an empty table behind.
-        if matches!(kind, Some(sqe_sql::StatementKind::Ctas(_))) {
+        if self.write_branch.is_some() && matches!(kind, Some(sqe_sql::StatementKind::Ctas(_))) {
             return Err(sqe_core::SqeError::with_code(
                 sqe_core::SqeErrorCode::NotSupported,
                 "CREATE TABLE AS SELECT creates a new table, which has no branch to \
@@ -999,8 +999,10 @@ impl SqlClient for EmbeddedClient {
             )
             .into());
         }
-        let branch = kind.filter(|k| k.is_data_write()).map(|_| branch);
-        sqe_catalog::txn::write_scope(None, branch, self.execute_statement(sql)).await
+        let is_data_write = kind.is_some_and(|k| k.is_data_write());
+        let branch = self.write_branch.clone().filter(|_| is_data_write);
+        let properties = self.snapshot_properties.clone().filter(|_| is_data_write);
+        sqe_catalog::txn::write_scope(None, branch, properties, self.execute_statement(sql)).await
     }
 }
 

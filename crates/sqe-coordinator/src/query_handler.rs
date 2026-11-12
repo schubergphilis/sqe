@@ -1430,8 +1430,24 @@ impl QueryHandler {
                 .flatten()
                 .filter(|kind| !kind.allowed_in_transaction())
                 .map(|_| session.clone().with_transaction_id(None));
+            let client_session = session;
             let session = autocommit.as_ref().unwrap_or(session);
             let txn = self.txn_scope(session).ok().flatten();
+            // The snapshot properties the statement's commits carry: the
+            // transaction's inside one, the session's outside. The session's
+            // never apply inside a transaction. A statement that runs
+            // autocommit inside a client-held transaction (DDL, above) has
+            // no `txn` here but still belongs to that transaction's client,
+            // so it takes that transaction's properties, not the session's.
+            let snapshot_properties = match &txn {
+                Some(txn) => txn.snapshot_properties(),
+                None if autocommit.is_some() => self
+                    .txn_scope(client_session)
+                    .ok()
+                    .flatten()
+                    .and_then(|txn| txn.snapshot_properties()),
+                None => session.snapshot_properties.clone(),
+            };
             // A data write outside a transaction reads and commits at the
             // session's WRITE_BRANCH (#829). Reads and other statements stay
             // on `main`, so this classifies only when a branch is set.
@@ -1443,6 +1459,7 @@ impl QueryHandler {
             sqe_catalog::txn::write_scope(
                 txn,
                 write_branch,
+                snapshot_properties,
                 sqe_catalog::file_tvf_prepare::in_statement(
                     self.execute_inner(session, sql, client_ip, query_id),
                 ),
@@ -1568,6 +1585,7 @@ impl QueryHandler {
                 execution_ms: 0,
                 rows: 0,
                 rows_written: None,
+                snapshot_property_keys: Vec::new(),
                 plan_metrics: &Default::default(),
                 policy_summary: None,
                 resources: Vec::new(),
@@ -2033,6 +2051,8 @@ impl QueryHandler {
                                 execution_ms: 0,
                                 rows,
                                 rows_written: None,
+                                // A cache hit is a read.
+                                snapshot_property_keys: Vec::new(),
                                 plan_metrics: &PlanMetrics::default(),
                                 policy_summary: cached.audit.policy_summary.clone(),
                                 resources: cached.audit.resources.clone(),
@@ -3219,6 +3239,9 @@ impl QueryHandler {
                     execution_ms,
                     rows,
                     rows_written,
+                    // Read inside the statement's `write_scope`, where the
+                    // properties its commits carried are still set.
+                    snapshot_property_keys: crate::audit_emitter::snapshot_property_keys_for(&kind),
                     plan_metrics: &pm,
                     policy_summary,
                     resources: audit_resources,

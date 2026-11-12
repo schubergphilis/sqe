@@ -39,6 +39,7 @@ use crate::writer::{
 use sqe_compaction::write_memory::{TrackedBatchBuffer, WriteReservation};
 
 mod ingest;
+mod snapshot_props;
 pub use ingest::{IngestMode, OnExisting, OnMissing};
 
 /// Target table, explicit column list and OVERWRITE flag of an INSERT.
@@ -1090,6 +1091,7 @@ impl WriteHandler {
         Fut: std::future::Future<Output = sqe_core::Result<Option<RewriteAttempt<T>>>>,
     {
         let target_branch = crate::commit::txn_target_branch(catalog, table_ident).await?;
+        let snapshot_props = snapshot_props::current();
         let failed = |e: &dyn std::fmt::Display| {
             SqeError::with_code(
                 SqeErrorCode::ExecutionFailed,
@@ -1148,6 +1150,7 @@ impl WriteHandler {
             // `overwrite`. A `replace` tells incremental readers (Spark
             // streaming, Databricks) the data did not change, and they skip it.
             let mut action = tx.overwrite_files();
+            snapshot_props::stamp_overwrite(&mut action, &snapshot_props);
             if let Some(branch) = &target_branch {
                 action = action.set_target_branch(branch.clone());
             }
@@ -1302,7 +1305,11 @@ impl WriteHandler {
                     .await;
                 Ok(truncated_rows)
             }
-            None => Ok(0),
+            None => {
+                self.commit_empty_snapshot(session, catalog, table_ident)
+                    .await?;
+                Ok(0)
+            }
         }
     }
 
@@ -2397,10 +2404,11 @@ impl WriteHandler {
             )
             .await?;
 
-            let mut snapshot_id = None;
+            let snapshot_id;
             if !data_files.is_empty() {
                 let files_for_retry = data_files.clone();
                 let catalog_for_commit = catalog.clone();
+                let props = snapshot_props::current();
                 let committed = commit_with_retry(
                     catalog.as_ref(),
                     &create_ident,
@@ -2408,9 +2416,11 @@ impl WriteHandler {
                     move |fresh_table| {
                         let files = files_for_retry.clone();
                         let cat = catalog_for_commit.clone();
+                        let props = props.clone();
                         async move {
                             let tx = Transaction::new(&fresh_table);
                             let action = tx.fast_append().add_data_files(files);
+                            let action = snapshot_props::stamp_append(action, &props);
                             let tx = action.apply(tx)?;
                             tx.commit(cat.as_ref()).await
                         }
@@ -2441,6 +2451,11 @@ impl WriteHandler {
                     .await;
                 }
             } else {
+                // The empty table is created; with snapshot properties it
+                // also gets the marker snapshot.
+                snapshot_id = self
+                    .commit_empty_snapshot(session, &session_catalog, &create_ident)
+                    .await?;
                 cleanup_guard.mark_committed();
                 info!(
                     table = %create_ident,
@@ -2598,8 +2613,12 @@ impl WriteHandler {
         // On failure the guard's Drop deletes the parquet files this statement
         // wrote; the table keeps the contents it had. Unless the outcome is
         // unknown: the swap may have landed, so the files stay.
-        committed.inspect_err(|e| cleanup_guard.keep_if_outcome_unknown(e))?;
+        let committed = committed.inspect_err(|e| cleanup_guard.keep_if_outcome_unknown(e))?;
         cleanup_guard.mark_committed();
+        if committed.is_none() {
+            self.commit_empty_snapshot(session, catalog, table_ident)
+                .await?;
+        }
 
         if let Some(sketches) = finish_puffin_sketches(sketch_acc) {
             // The replaced contents are gone, so the previous snapshot's
@@ -2820,6 +2839,11 @@ impl WriteHandler {
         if total_rows == 0 && !overwrite {
             info!(table = %table_ident, "INSERT SELECT returned no rows — nothing to write");
             cleanup_guard.mark_committed();
+            // With snapshot properties the empty INSERT still commits a marker.
+            let marker = self
+                .commit_empty_snapshot(session, &session_catalog, &table_ident)
+                .await?;
+            record_lineage_snapshot(plan_out, marker);
             return affected_rows_batch(0);
         }
 
@@ -3328,6 +3352,8 @@ impl WriteHandler {
             .await?;
 
         let Some(total_deleted) = total_deleted else {
+            self.commit_empty_snapshot(session, &catalog, &table_ident)
+                .await?;
             return affected_rows_batch(0);
         };
         // Row delta: carry the previous snapshot's Puffin NDV statistics as an
@@ -3386,6 +3412,8 @@ impl WriteHandler {
 
         if old_data_files.is_empty() {
             info!(table = %table_ident, "MoR DELETE: table has no data files, nothing to delete");
+            self.commit_empty_snapshot(session, &catalog, &table_ident)
+                .await?;
             return affected_rows_batch(0);
         }
 
@@ -3598,6 +3626,8 @@ impl WriteHandler {
                 table = %table_ident,
                 "MoR DELETE: no live matching rows, nothing to commit"
             );
+            self.commit_empty_snapshot(session, &catalog, &table_ident)
+                .await?;
             return affected_rows_batch(0);
         }
 
@@ -3629,6 +3659,7 @@ impl WriteHandler {
         let catalog_for_commit = catalog.clone();
         let target_branch =
             crate::commit::txn_target_branch(catalog.as_catalog().as_ref(), &table_ident).await?;
+        let props = snapshot_props::current();
         commit_with_retry(
             catalog.as_catalog().as_ref(),
             &table_ident,
@@ -3640,6 +3671,7 @@ impl WriteHandler {
                 let referenced = Arc::clone(&referenced_for_retry);
                 let cat = catalog_for_commit.clone();
                 let target_branch = target_branch.clone();
+                let props = props.clone();
                 async move {
                     if !v3 && fresh_table.metadata().current_snapshot_id() != base_snapshot_id {
                         let live: std::collections::HashSet<String> =
@@ -3670,6 +3702,7 @@ impl WriteHandler {
                             .row_delta()
                             .add_delete_files(vectors)
                             .remove_delete_files(retired);
+                        action = snapshot_props::stamp_row_delta(action, &props);
                         if let Some(base) = base_snapshot_id {
                             action = action.validate_from_snapshot(base);
                         }
@@ -3686,6 +3719,7 @@ impl WriteHandler {
                         // that into a retryable "RowDelta conflict", and the
                         // next attempt re-runs the check on the new snapshot.
                         let mut action = tx.row_delta().add_delete_files(files);
+                        action = snapshot_props::stamp_row_delta(action, &props);
                         if let Some(snap) = fresh_table.metadata().current_snapshot_id() {
                             action = action.validate_from_snapshot(snap);
                         }
@@ -3772,6 +3806,8 @@ impl WriteHandler {
         let old_data_files = self.collect_data_files(&table).await?;
         if old_data_files.is_empty() {
             info!(table = %table_ident, "equality DELETE: table has no data files");
+            self.commit_empty_snapshot(session, &catalog, &table_ident)
+                .await?;
             return affected_rows_batch(0);
         }
 
@@ -3874,6 +3910,8 @@ impl WriteHandler {
 
         if total_matched == 0 {
             info!(table = %table_ident, "equality DELETE: no matching rows, nothing to commit");
+            self.commit_empty_snapshot(session, &catalog, &table_ident)
+                .await?;
             return affected_rows_batch(0);
         }
 
@@ -3893,6 +3931,7 @@ impl WriteHandler {
         let catalog_for_commit = catalog.clone();
         let target_branch =
             crate::commit::txn_target_branch(catalog.as_catalog().as_ref(), &table_ident).await?;
+        let props = snapshot_props::current();
         commit_with_retry(
             catalog.as_catalog().as_ref(),
             &table_ident,
@@ -3901,10 +3940,12 @@ impl WriteHandler {
                 let files = files_for_retry.clone();
                 let cat = catalog_for_commit.clone();
                 let target_branch = target_branch.clone();
+                let props = props.clone();
                 async move {
                     let snapshot_id = fresh_table.metadata().current_snapshot_id();
                     let tx = Transaction::new(&fresh_table);
                     let mut action = tx.row_delta().add_delete_files(files);
+                    action = snapshot_props::stamp_row_delta(action, &props);
                     if let Some(snap) = snapshot_id {
                         action = action.validate_from_snapshot(snap);
                     }
@@ -4259,6 +4300,8 @@ impl WriteHandler {
             .await?;
 
         let Some(total_updated) = total_updated else {
+            self.commit_empty_snapshot(session, &catalog, &table_ident)
+                .await?;
             return affected_rows_batch(0);
         };
         // Row delta: carry the previous snapshot's Puffin NDV statistics as an
@@ -4430,6 +4473,8 @@ impl WriteHandler {
         let old_data_files = self.collect_data_files(&table).await?;
         if old_data_files.is_empty() {
             info!(table = %table_ident, "MoR UPDATE: table has no data files");
+            self.commit_empty_snapshot(session, &catalog, &table_ident)
+                .await?;
             return affected_rows_batch(0);
         }
 
@@ -4561,6 +4606,8 @@ impl WriteHandler {
 
         if total_updated == 0 {
             info!(table = %table_ident, "MoR UPDATE: no matching rows, nothing to commit");
+            self.commit_empty_snapshot(session, &catalog, &table_ident)
+                .await?;
             return affected_rows_batch(0);
         }
 
@@ -4601,6 +4648,7 @@ impl WriteHandler {
         let catalog_for_commit = catalog.clone();
         let target_branch =
             crate::commit::txn_target_branch(catalog.as_catalog().as_ref(), &table_ident).await?;
+        let props = snapshot_props::current();
         commit_with_retry(
             catalog.as_catalog().as_ref(),
             &table_ident,
@@ -4610,10 +4658,12 @@ impl WriteHandler {
                 let dels = delete_files_for_retry.clone();
                 let cat = catalog_for_commit.clone();
                 let target_branch = target_branch.clone();
+                let props = props.clone();
                 async move {
                     let snapshot_id = fresh_table.metadata().current_snapshot_id();
                     let tx = Transaction::new(&fresh_table);
                     let mut action = tx.row_delta().add_data_files(dfs).add_delete_files(dels);
+                    action = snapshot_props::stamp_row_delta(action, &props);
                     if let Some(snap) = snapshot_id {
                         action = action.validate_from_snapshot(snap);
                     }
@@ -4823,6 +4873,8 @@ impl WriteHandler {
                         "MERGE: source returned no data and no source schema was \
                          supplied, nothing to merge"
                     );
+                    self.commit_empty_snapshot(session, &catalog, &table_ident)
+                        .await?;
                     return affected_rows_batch(0);
                 }
             },
@@ -4907,6 +4959,8 @@ impl WriteHandler {
                     "MERGE: source returned no data and no WHEN NOT MATCHED BY \
                      SOURCE clause, nothing to merge"
                 );
+                self.commit_empty_snapshot(session, &catalog, &table_ident)
+                    .await?;
                 return affected_rows_batch(0);
             }
             empty_source_count_sql = crate::merge_sql::empty_source_claim_count_sql(
@@ -5130,6 +5184,8 @@ impl WriteHandler {
             .await?;
 
         let Some((total_rows, affected)) = outcome else {
+            self.commit_empty_snapshot(session, &catalog, &table_ident)
+                .await?;
             return affected_rows_batch(0);
         };
         // Row delta: carry the previous snapshot's Puffin NDV statistics as an
@@ -5698,6 +5754,8 @@ impl WriteHandler {
                         "MoR MERGE: source returned no data and no source schema \
                          was supplied, nothing to merge"
                     );
+                    self.commit_empty_snapshot(session, &catalog, &table_ident)
+                        .await?;
                     return affected_rows_batch(0);
                 }
             },
@@ -5782,6 +5840,8 @@ impl WriteHandler {
                 "MoR MERGE: source returned no data and no WHEN NOT MATCHED BY \
                  SOURCE clause, nothing to merge"
             );
+            self.commit_empty_snapshot(session, &catalog, &table_ident)
+                .await?;
             return affected_rows_batch(0);
         }
 
@@ -6088,6 +6148,8 @@ impl WriteHandler {
         let total_touched = updated_rows + deleted_rows + inserted_rows;
         if total_touched == 0 {
             info!(table = %table_ident, "MoR MERGE: no matched or not-matched rows");
+            self.commit_empty_snapshot(session, &catalog, &table_ident)
+                .await?;
             return affected_rows_batch(0);
         }
 
@@ -6118,6 +6180,7 @@ impl WriteHandler {
         let catalog_for_commit = catalog.clone();
         let target_branch =
             crate::commit::txn_target_branch(catalog.as_catalog().as_ref(), &table_ident).await?;
+        let props = snapshot_props::current();
         commit_with_retry(
             catalog.as_catalog().as_ref(),
             &table_ident,
@@ -6127,10 +6190,11 @@ impl WriteHandler {
                 let dels = delete_files_for_retry.clone();
                 let cat = catalog_for_commit.clone();
                 let target_branch = target_branch.clone();
+                let props = props.clone();
                 async move {
                     let snapshot_id = fresh_table.metadata().current_snapshot_id();
                     let tx = Transaction::new(&fresh_table);
-                    let mut action = tx.row_delta();
+                    let mut action = snapshot_props::stamp_row_delta(tx.row_delta(), &props);
                     if !dfs.is_empty() {
                         action = action.add_data_files(dfs);
                     }
@@ -6222,26 +6286,39 @@ impl WriteHandler {
         let bridge = catalog.as_catalog();
         if !overwrite {
             if new_data_files.is_empty() {
-                return Ok(None);
+                return self
+                    .commit_empty_snapshot(session, catalog, table_ident)
+                    .await;
             }
             let bridge_ref = bridge.as_ref();
             let target_branch = crate::commit::txn_target_branch(bridge_ref, table_ident).await?;
             let written_ref = target_branch.clone();
-            let committed = commit_with_retry(bridge_ref, table_ident, "insert", move |fresh_table| {
-                let files = new_data_files.clone();
-                let target_branch = target_branch.clone();
-                async move {
-                    let tx = Transaction::new(&fresh_table);
-                    let mut action = tx.fast_append().add_data_files(files);
-                    if let Some(branch) = target_branch {
-                        action = action.set_target_branch(branch);
+            let props = snapshot_props::current();
+            let committed =
+                commit_with_retry(bridge_ref, table_ident, "insert", move |fresh_table| {
+                    let files = new_data_files.clone();
+                    let target_branch = target_branch.clone();
+                    let props = props.clone();
+                    async move {
+                        let tx = Transaction::new(&fresh_table);
+                        let mut action = snapshot_props::stamp_append(
+                            tx.fast_append().add_data_files(files),
+                            &props,
+                        );
+                        if let Some(branch) = target_branch {
+                            action = action.set_target_branch(branch);
+                        }
+                        let tx = action.apply(tx)?;
+                        tx.commit(bridge_ref).await
                     }
-                    let tx = action.apply(tx)?;
-                    tx.commit(bridge_ref).await
-                }
-            })
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to commit INSERT: {e}")))?;
+                })
+                .await
+                .map_err(|e| {
+                    SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!("Failed to commit INSERT: {e}"),
+                    )
+                })?;
             self.after_commit(session, catalog.as_ref(), table_ident)
                 .await;
             // The append's snapshot, for lineage (the OL `version` facet).
@@ -6360,6 +6437,9 @@ impl WriteHandler {
             info!(table = %table_ident, "INSERT OVERWRITE committed successfully");
             self.after_commit(session, catalog.as_ref(), table_ident)
                 .await;
+        } else {
+            self.commit_empty_snapshot(session, catalog, table_ident)
+                .await?;
         }
         // The rewrite helper does not hand back the committed table; lineage
         // records no snapshot for an INSERT OVERWRITE.
@@ -14261,6 +14341,347 @@ s3_path_style = true
             Some(v.to_string())
         }
 
+        // --- Snapshot properties (write-snapshot-properties, 3.3 / 3.4) ----
+        //
+        // The coordinator runs a statement inside `write_scope(.., Some(props), ..)`
+        // after `SET SNAPSHOT_PROPERTIES`; these drive the real write paths the
+        // same way and read the properties back from the snapshot summary.
+
+        const RUN: &[(&str, &str)] = &[("run-id", "r1"), ("ticket", "T-9")];
+
+        async fn with_props<F: std::future::Future>(pairs: &[(&str, &str)], f: F) -> F::Output {
+            let props = sqe_core::snapshot_properties::SnapshotProperties::try_new(
+                pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())),
+            )
+            .expect("valid snapshot properties");
+            sqe_catalog::txn::write_scope(None, None, Some(Arc::new(props)), f).await
+        }
+
+        /// The summary of `ident`'s current snapshot.
+        async fn head_summary(rig: &SqliteRig, ident: &TableIdent) -> iceberg::spec::Summary {
+            rig.load(ident)
+                .await
+                .metadata()
+                .current_snapshot()
+                .expect("a snapshot")
+                .summary()
+                .clone()
+        }
+
+        fn assert_stamped(summary: &iceberg::spec::Summary) {
+            assert_eq!(
+                summary
+                    .additional_properties
+                    .get("run-id")
+                    .map(String::as_str),
+                Some("r1")
+            );
+            assert_eq!(
+                summary
+                    .additional_properties
+                    .get("ticket")
+                    .map(String::as_str),
+                Some("T-9")
+            );
+        }
+
+        fn mor_props() -> std::collections::HashMap<String, String> {
+            std::collections::HashMap::from([(
+                sqe_core::table_properties::WRITE_DELETE_MODE.to_string(),
+                "merge-on-read".to_string(),
+            )])
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn insert_stamps_the_snapshot_and_keeps_the_computed_summary() {
+            let rig = SqliteRig::new().await;
+            let h = handler(&rig);
+            let ident = seeded_id_v(&rig, "sp_insert").await;
+
+            with_props(
+                RUN,
+                run_insert(&h, &rig, "INSERT INTO default.sp_insert VALUES (4, 'd')"),
+            )
+            .await
+            .expect("INSERT");
+            let summary = head_summary(&rig, &ident).await;
+            assert_stamped(&summary);
+            assert_eq!(summary.operation, iceberg::spec::Operation::Append);
+            assert_eq!(
+                summary
+                    .additional_properties
+                    .get("added-data-files")
+                    .map(String::as_str),
+                Some("1"),
+                "the computed metrics stay"
+            );
+
+            // The next write, without properties, carries none of them.
+            run_insert(&h, &rig, "INSERT INTO default.sp_insert VALUES (5, 'e')")
+                .await
+                .expect("INSERT");
+            let summary = head_summary(&rig, &ident).await;
+            assert!(
+                !summary.additional_properties.contains_key("run-id"),
+                "{summary:?}"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn cow_delete_update_and_merge_stamp_the_snapshot() {
+            let rig = SqliteRig::new().await;
+            let h = handler(&rig);
+            let ident = seeded_id_v(&rig, "sp_cow").await;
+
+            with_props(
+                RUN,
+                run_delete(&h, &rig, "DELETE FROM default.sp_cow WHERE id = 2"),
+            )
+            .await
+            .expect("DELETE");
+            let summary = head_summary(&rig, &ident).await;
+            assert_stamped(&summary);
+            assert_eq!(summary.operation, iceberg::spec::Operation::Overwrite);
+
+            let ident_u = seeded_id_v(&rig, "sp_cow_update").await;
+            with_props(
+                RUN,
+                run_update(
+                    &h,
+                    &rig,
+                    "UPDATE default.sp_cow_update SET v = 'z' WHERE id = 1",
+                ),
+            )
+            .await
+            .expect("UPDATE");
+            assert_stamped(&head_summary(&rig, &ident_u).await);
+
+            let ident_m = seeded_id_v(&rig, "sp_cow_merge").await;
+            with_props(
+                RUN,
+                run_merge(
+                    &h,
+                    &rig,
+                    "MERGE INTO default.sp_cow_merge AS t USING src AS s ON t.id = s.id \
+                     WHEN MATCHED THEN UPDATE SET v = s.v \
+                     WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
+                    vec![id_v_batch(&[(2, "B"), (9, "new")])],
+                    None,
+                ),
+            )
+            .await
+            .expect("MERGE");
+            assert_stamped(&head_summary(&rig, &ident_m).await);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn mor_delete_update_and_merge_stamp_the_snapshot() {
+            let rig = SqliteRig::new().await;
+            let h = handler(&rig);
+            let ident = seeded_id_v_with(&rig, "sp_mor", mor_props()).await;
+
+            with_props(
+                RUN,
+                run_delete(&h, &rig, "DELETE FROM default.sp_mor WHERE id = 2"),
+            )
+            .await
+            .expect("DELETE");
+            let summary = head_summary(&rig, &ident).await;
+            assert_stamped(&summary);
+            assert!(
+                summary
+                    .additional_properties
+                    .contains_key("added-delete-files"),
+                "a position-delete commit: {summary:?}"
+            );
+
+            let ident_u = seeded_id_v_with(&rig, "sp_mor_update", mor_props()).await;
+            with_props(
+                RUN,
+                run_update(
+                    &h,
+                    &rig,
+                    "UPDATE default.sp_mor_update SET v = 'z' WHERE id = 1",
+                ),
+            )
+            .await
+            .expect("UPDATE");
+            assert_stamped(&head_summary(&rig, &ident_u).await);
+
+            let ident_m = seeded_id_v_with(&rig, "sp_mor_merge", mor_props()).await;
+            with_props(
+                RUN,
+                run_merge(
+                    &h,
+                    &rig,
+                    "MERGE INTO default.sp_mor_merge AS t USING src AS s ON t.id = s.id \
+                     WHEN MATCHED THEN UPDATE SET v = s.v \
+                     WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
+                    vec![id_v_batch(&[(2, "B"), (9, "new")])],
+                    None,
+                ),
+            )
+            .await
+            .expect("MERGE");
+            assert_stamped(&head_summary(&rig, &ident_m).await);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn insert_overwrite_and_ctas_stamp_the_snapshot() {
+            let rig = SqliteRig::new().await;
+            let h = handler(&rig);
+            let ident = seeded_id_v(&rig, "sp_ow").await;
+            with_props(
+                RUN,
+                run_insert(
+                    &h,
+                    &rig,
+                    "INSERT OVERWRITE default.sp_ow SELECT * FROM (VALUES (7, 'z')) AS s(id, v)",
+                ),
+            )
+            .await
+            .expect("INSERT OVERWRITE");
+            assert_stamped(&head_summary(&rig, &ident).await);
+
+            with_props(
+                RUN,
+                run_ctas(
+                    &h,
+                    &rig,
+                    "CREATE TABLE default.sp_ctas AS SELECT * FROM (VALUES (1, 'a')) AS s(id, v)",
+                ),
+            )
+            .await;
+            assert_stamped(&head_summary(&rig, &rig.ident("sp_ctas")).await);
+        }
+
+        /// 3.4: a write that changes nothing commits an empty `fast_append`
+        /// that carries the properties; without properties it commits
+        /// nothing, as before.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_empty_write_commits_a_marker_snapshot_only_with_properties() {
+            let rig = SqliteRig::new().await;
+            let h = handler(&rig);
+
+            // DELETE on a table that has no snapshot at all.
+            run_create(
+                &h,
+                &rig,
+                "CREATE TABLE default.sp_empty (id BIGINT, v VARCHAR)",
+            )
+            .await;
+            let ident = rig.ident("sp_empty");
+            let n = run_delete(&h, &rig, "DELETE FROM default.sp_empty WHERE id = 1")
+                .await
+                .expect("DELETE");
+            assert_eq!(n, 0);
+            assert_eq!(
+                snapshot_count(&rig.load(&ident).await),
+                0,
+                "no properties: no commit"
+            );
+
+            let n = with_props(
+                RUN,
+                run_delete(&h, &rig, "DELETE FROM default.sp_empty WHERE id = 1"),
+            )
+            .await
+            .expect("DELETE");
+            assert_eq!(n, 0, "still reports zero rows");
+            assert_eq!(
+                snapshot_count(&rig.load(&ident).await),
+                1,
+                "the marker snapshot"
+            );
+            let summary = head_summary(&rig, &ident).await;
+            assert_stamped(&summary);
+            assert_eq!(summary.operation, iceberg::spec::Operation::Append);
+            assert!(
+                summary
+                    .additional_properties
+                    .get("added-data-files")
+                    .is_none_or(|n| n == "0"),
+                "no data file added: {summary:?}"
+            );
+            assert!(
+                rows_of(rig.load(&ident).await).await.is_empty(),
+                "no data change"
+            );
+
+            // A DELETE that matches nothing in a MoR table with rows.
+            let mor = seeded_id_v_with(&rig, "sp_empty_mor", mor_props()).await;
+            let before = snapshot_count(&rig.load(&mor).await);
+            run_delete(&h, &rig, "DELETE FROM default.sp_empty_mor WHERE id = 999")
+                .await
+                .expect("DELETE");
+            assert_eq!(
+                snapshot_count(&rig.load(&mor).await),
+                before,
+                "no properties: no commit"
+            );
+            with_props(
+                RUN,
+                run_delete(&h, &rig, "DELETE FROM default.sp_empty_mor WHERE id = 999"),
+            )
+            .await
+            .expect("DELETE");
+            let table = rig.load(&mor).await;
+            assert_eq!(snapshot_count(&table), before + 1);
+            assert_stamped(&head_summary(&rig, &mor).await);
+            assert_eq!(rows_of(table).await.len(), 3, "rows untouched");
+
+            // An empty INSERT ... SELECT.
+            let ins = seeded_id_v(&rig, "sp_empty_ins").await;
+            let before = snapshot_count(&rig.load(&ins).await);
+            let none = "INSERT INTO default.sp_empty_ins SELECT * FROM (VALUES (1, 'a')) AS s(id, v) WHERE id < 0";
+            run_insert(&h, &rig, none).await.expect("INSERT");
+            assert_eq!(snapshot_count(&rig.load(&ins).await), before);
+            with_props(RUN, run_insert(&h, &rig, none))
+                .await
+                .expect("INSERT");
+            assert_eq!(snapshot_count(&rig.load(&ins).await), before + 1);
+            assert_stamped(&head_summary(&rig, &ins).await);
+
+            // An empty CTAS: the table is created, and with properties it has
+            // the marker snapshot.
+            let empty_ctas = |name: &str| {
+                format!(
+                    "CREATE TABLE default.{name} AS SELECT * FROM (VALUES (1, 'a')) AS s(id, v) WHERE id < 0"
+                )
+            };
+            run_ctas(&h, &rig, &empty_ctas("sp_ctas_plain")).await;
+            assert_eq!(
+                snapshot_count(&rig.load(&rig.ident("sp_ctas_plain")).await),
+                0
+            );
+            with_props(RUN, run_ctas(&h, &rig, &empty_ctas("sp_ctas_marked"))).await;
+            let marked = rig.ident("sp_ctas_marked");
+            assert_eq!(snapshot_count(&rig.load(&marked).await), 1);
+            assert_stamped(&head_summary(&rig, &marked).await);
+        }
+
+        /// The marker commit goes through `commit_with_retry`, so a concurrent
+        /// append between its load and its commit is retried, not an error,
+        /// and the marker still carries the properties.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_marker_commit_survives_a_concurrent_append() {
+            let rig = SqliteRig::new().await;
+            let ident = seeded_id_v_with(&rig, "sp_empty_race", mor_props()).await;
+            let before = snapshot_count(&rig.load(&ident).await);
+            let (hook, fired) = late_append_hook(&rig, &ident);
+            let h = handler(&rig).with_test_commit_race_hook(hook);
+            with_props(
+                RUN,
+                run_delete(&h, &rig, "DELETE FROM default.sp_empty_race WHERE id = 999"),
+            )
+            .await
+            .expect("DELETE");
+            assert!(fired.load(AtomicOrdering::SeqCst), "the race was exercised");
+            // Seed + the late append + the marker.
+            assert_eq!(snapshot_count(&rig.load(&ident).await), before + 2);
+            assert_stamped(&head_summary(&rig, &ident).await);
+        }
+
         // --- Explicit transactions (#821) ---------------------------------
         //
         // The coordinator runs every statement of a transaction inside
@@ -14626,7 +15047,7 @@ s3_path_style = true
         }
 
         async fn on_dev<F: std::future::Future>(f: F) -> F::Output {
-            sqe_catalog::txn::write_scope(None, s("dev"), f).await
+            sqe_catalog::txn::write_scope(None, s("dev"), None, f).await
         }
 
         async fn dev_rows(rig: &SqliteRig, ident: &TableIdent) -> Vec<(i64, Option<String>)> {
