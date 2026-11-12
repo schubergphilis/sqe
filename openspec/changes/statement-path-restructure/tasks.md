@@ -24,6 +24,7 @@
 - [ ] 3.7 Move the `handle_*` families into `statement/*.rs` files of `impl QueryHandler` blocks, one family per merge request; access-control family last and only after 1.1
   - Files are `query_handler/<family>.rs` child modules (`use super::*;`), following `query_handler/admission.rs`, instead of a `statement/` directory. Moved methods called from `execute_inner` become `pub(super)`.
   - [x] `write` (MERGE, INSERT, CTAS): `query_handler/write.rs`, 370 lines
+  - [x] `show` (SHOW CREATE, CATALOGS, SCHEMAS, COLUMNS, TABLES, VIEWS, FUNCTIONS, ROLES; `deny_hidden_table`): `query_handler/show.rs`, 897 lines
 
 ## 4. Completion stage
 
