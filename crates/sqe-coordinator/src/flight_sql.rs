@@ -2677,10 +2677,12 @@ impl FlightSqlService for SqeFlightSqlService {
     ) -> Result<i64, Status> {
         let session = self.get_session_from_request(&request).await?;
         // Inside a transaction (BEGIN, or the request's id) the ingest writes
-        // to the transaction's branch like an INSERT does (#824). A DB-API
-        // driver attaches its transaction to every ingest once the server
-        // advertises transactions, so refusing it here would break
-        // `adbc_ingest` on a default connection.
+        // to the transaction's branch like an INSERT does (#824). The ADBC
+        // Flight SQL driver (1.13, upstream main 2026-11-12) never sets
+        // `transaction_id` on an ingest, so `adbc_ingest` on a connection
+        // without autocommit arrives with none and commits to main at once.
+        // Refusing an id-less ingest would break it on every default DB-API
+        // connection, so the server cannot do better than join an id it gets.
         let session = in_request_transaction(session, ticket.transaction_id.as_deref())?;
         if session.transaction_id.is_some() && session.write_branch.is_some() {
             return Err(Status::failed_precondition(
