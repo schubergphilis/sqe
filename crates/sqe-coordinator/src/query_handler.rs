@@ -1058,6 +1058,14 @@ impl QueryHandler {
     /// Start (`Some`) or end (`None`) the explicit transaction on the stored
     /// session (#820). Without a session manager (the Trino HTTP layer, MCP)
     /// the protocol carries the transaction, so there is nothing to store.
+    ///
+    /// Ending is idempotent: a session the manager does not hold has no
+    /// stored transaction to clear. That is every Trino HTTP request in
+    /// hybrid mode (the manager is wired for Flight SQL, the HTTP session is
+    /// built per request and the client drops its id on
+    /// `X-Trino-Clear-Transaction-Id`), and a Flight session that expired
+    /// after BEGIN. The caller has already published or dropped the branch,
+    /// so failing here reported a COMMIT that had succeeded as an error.
     fn set_session_transaction(
         &self,
         session: &Session,
@@ -1070,7 +1078,15 @@ impl QueryHandler {
             );
             return Ok(());
         };
+        let starting = transaction_id.is_some();
         if !manager.set_transaction_id(&session.id, transaction_id) {
+            if !starting {
+                tracing::debug!(
+                    "transaction end for a session the manager does not hold; \
+                     nothing stored to clear"
+                );
+                return Ok(());
+            }
             return Err(SqeError::with_code(
                 SqeErrorCode::ExecutionFailed,
                 "transaction control: session not found in manager".to_string(),

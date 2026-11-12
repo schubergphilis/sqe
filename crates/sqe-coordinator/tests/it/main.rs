@@ -98,6 +98,7 @@ mod subscript_dot_access_e2e;
 mod table_files_json_e2e;
 mod table_health_test;
 mod timestamp_spark_interop;
+mod transaction_end_unmanaged_session_test;
 mod trino_cli_test;
 mod trino_describe_test;
 mod trino_metadata_test;
