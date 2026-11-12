@@ -52,25 +52,48 @@ impl PolicyEnforcer for DenyEnforcer {
     }
 }
 
-struct Fixture {
-    handler: Arc<QueryHandler>,
-    audit: Arc<AuditLogger>,
+pub(crate) struct Fixture {
+    pub(crate) handler: Arc<QueryHandler>,
+    pub(crate) audit: Arc<AuditLogger>,
     native: PathBuf,
     ocsf: PathBuf,
-    config: SqeConfig,
-    _server: MockServer,
+    pub(crate) config: SqeConfig,
+    pub(crate) server: MockServer,
     _dir: TempDir,
+}
+
+/// Builds the audit logger on the path the fixture hands it.
+pub(crate) type AuditBuilder = Box<dyn FnOnce(&str) -> AuditLogger>;
+
+/// What a test varies beyond the enforcer: the result cache, extra `[query]`
+/// settings, and the audit logger (built on the path the fixture hands it).
+#[derive(Default)]
+pub(crate) struct FixtureOpts {
+    pub(crate) cache: bool,
+    /// Lines appended under `[query]`, e.g. `timeout_secs = 1`.
+    pub(crate) query_toml: String,
+    /// Builds the logger for the native audit path; the default is
+    /// `AuditFormat::Both` with the default options.
+    pub(crate) audit: Option<AuditBuilder>,
+    /// How long the mock catalog takes to answer `GET /v1/namespaces`, the
+    /// request a statement's session context makes inside execution. A long
+    /// delay holds a statement in execution without a sleep in the engine.
+    pub(crate) namespaces_delay: std::time::Duration,
 }
 
 impl Fixture {
     /// Flushes, then returns the native and OCSF records, after checking the
     /// native hash chain.
-    fn records(&self) -> (Vec<Value>, Vec<Value>) {
+    pub(crate) fn records(&self) -> (Vec<Value>, Vec<Value>) {
         self.audit.flush();
-        let bytes = std::fs::read(&self.native).expect("native audit file");
-        let report = verify_audit_bytes(&bytes).expect("audit hash chain verifies");
+        let bytes = std::fs::read(&self.native).unwrap_or_default();
         let native = parse_lines(&bytes);
-        assert_eq!(report.records, native.len() as u64);
+        // An empty file has no chain to verify (the verifier rejects it);
+        // a test that expects no record reads it that way.
+        if !bytes.is_empty() {
+            let report = verify_audit_bytes(&bytes).expect("audit hash chain verifies");
+            assert_eq!(report.records, native.len() as u64);
+        }
         let ocsf = parse_lines(&std::fs::read(&self.ocsf).unwrap_or_default());
         (native, ocsf)
     }
@@ -93,6 +116,24 @@ async fn fixture(enforcer: Arc<dyn PolicyEnforcer>) -> Fixture {
 
 /// [`fixture`] with the result cache on when `cache` is true.
 async fn fixture_with(enforcer: Arc<dyn PolicyEnforcer>, cache: bool) -> Fixture {
+    fixture_opts(
+        enforcer,
+        FixtureOpts {
+            cache,
+            ..FixtureOpts::default()
+        },
+    )
+    .await
+}
+
+/// [`fixture`] with [`FixtureOpts`].
+pub(crate) async fn fixture_opts(enforcer: Arc<dyn PolicyEnforcer>, opts: FixtureOpts) -> Fixture {
+    let FixtureOpts {
+        cache,
+        query_toml,
+        audit: build_audit,
+        namespaces_delay,
+    } = opts;
     let server = crate::common::mock_server().await;
     Mock::given(method("GET"))
         .and(path("/v1/config"))
@@ -103,18 +144,23 @@ async fn fixture_with(enforcer: Arc<dyn PolicyEnforcer>, cache: bool) -> Fixture
         .await;
     Mock::given(method("GET"))
         .and(path("/v1/namespaces"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"namespaces":[]}"#))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"namespaces":[]}"#)
+                .set_delay(namespaces_delay),
+        )
         .mount(&server)
         .await;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let native = dir.path().join("audit.jsonl");
-    let audit = Arc::new(
-        AuditLogger::with_config(native.to_str().unwrap(), AuditFormat::Both)
+    let audit = Arc::new(match build_audit {
+        Some(build) => build(native.to_str().unwrap()),
+        None => AuditLogger::with_config(native.to_str().unwrap(), AuditFormat::Both)
             .expect("audit logger opens"),
-    );
+    });
     let toml = format!(
-        "[coordinator]\n\n[auth]\n\n[catalog]\ncatalog_url = \"{}\"\n",
+        "[coordinator]\n\n[auth]\n\n[catalog]\ncatalog_url = \"{}\"\n\n[query]\n{query_toml}\n",
         server.uri()
     );
     let config: SqeConfig = toml::from_str(&toml).expect("config");
@@ -146,14 +192,20 @@ async fn fixture_with(enforcer: Arc<dyn PolicyEnforcer>, cache: bool) -> Fixture
         ocsf: dir.path().join("audit.ocsf.jsonl"),
         native,
         config,
-        _server: server,
+        server,
         _dir: dir,
     }
 }
 
-fn session() -> Session {
+pub(crate) fn session() -> Session {
+    session_for("auditor")
+}
+
+/// A session for `user`, with a token of its own. The session-context cache
+/// is keyed by user name, so tests that run side by side use distinct names.
+pub(crate) fn session_for(user: &str) -> Session {
     Session::new(
-        "auditor".to_string(),
+        user.to_string(),
         sqe_core::SecretString::new(format!("tok-{}", uuid::Uuid::new_v4())),
         None,
         chrono::Utc::now() + chrono::Duration::hours(1),

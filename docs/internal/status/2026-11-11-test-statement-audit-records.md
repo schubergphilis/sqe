@@ -1,0 +1,5 @@
+**STATUS 2026-11-11: audit-record counts per statement outcome are pinned before the `execute_inner` restructure (`test/statement-audit-records`, openspec 1.2/1.3).**
+
+`crates/sqe-coordinator/tests/it/statement_audit_records_test.rs` drives nine statements through `QueryHandler::execute` against a wiremock catalog and counts the records in the native and OCSF files. Refusal after classification, result-cache hit, execution failure, timeout and cancellation leave one record each. A cancelled CTAS still audits its target and source tables. The SQL size check, admission refusal and the `fail_mode = closed` refusal write no record and no tracker entry; those three assertions are marked `// pins current behaviour:`. Timeout and cancellation are held by a delayed catalog response, not by a sleep in the engine. The existing audit harness gained `FixtureOpts` and a public `Fixture`. The cancelled-write test covers CTAS only; INSERT needs a mocked table load and is not covered.
+
+**NEXT:** restructure `execute_inner` (tasks 2.x), then decide whether the three unaudited refusals should write a record.
