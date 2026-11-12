@@ -20,7 +20,7 @@
 - [x] 3.3 `Insert` (95 lines), `FILTER=insert` (`handle_insert_statement`; 23 passed)
 - [x] 3.4 `Utility` (140 lines) (`handle_utility_statement`; explain 4, show 11, describe 5, time_zone 1 passed)
 - [x] 3.5 `Procedure` (144 lines), `FILTER=procedure` (`handle_procedure_statement`; 14 passed)
-- [ ] 3.6 `Ctas` (150 lines), `FILTER=ctas`
+- [x] 3.6 `Ctas` (150 lines), `FILTER=ctas` (`handle_ctas_statement`; 16 passed; execute_inner now 702 lines)
 - [ ] 3.7 Move the `handle_*` families into `statement/*.rs` files of `impl QueryHandler` blocks, one family per merge request; access-control family last and only after 1.1
 
 ## 4. Completion stage
