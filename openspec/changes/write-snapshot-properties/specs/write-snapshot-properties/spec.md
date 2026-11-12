@@ -33,9 +33,13 @@ When snapshot properties are set and a write has no files to add or remove, SQE 
 - **WHEN** a client begins a transaction, sets `('copy.run' = '42')`, inserts into `t`, and commits
 - **THEN** the snapshot `main` points to after COMMIT carries `copy.run = 42`
 
-#### Scenario: Parallel transactions under one bearer session
-- **WHEN** two transactions on the same session set different `copy.table` values and each writes its own table
+#### Scenario: Parallel Flight SQL transactions under one bearer session
+- **WHEN** two clients on the same bearer session each open a Flight SQL `BeginTransaction` transaction, set different `copy.table` values and each write their own table
 - **THEN** each table's snapshot carries its own transaction's value
+
+#### Scenario: SQL BEGIN is shared by the session
+- **WHEN** a client on a bearer session runs SQL `BEGIN` and sets `('copy.table' = 'a')`, and a second client on the same session writes
+- **THEN** the second client's write joins that transaction and carries `copy.table = a`, as every session-stored transaction state does
 
 #### Scenario: Cleared at the end of the transaction
 - **WHEN** a transaction that set properties commits, and the session then runs an autocommit INSERT with no session properties set

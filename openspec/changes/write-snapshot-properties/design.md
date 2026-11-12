@@ -6,13 +6,13 @@ SQE writes through `commit_with_retry` (`sqe-write/src/commit.rs`) and `WriteHan
 
 Session state that shapes writes already exists. `SET WRITE_BRANCH` is classified in `sqe-sql/src/classifier.rs`, stored by `SessionManager::set_write_branch`, and reaches the commit through the task-local `StatementScope` in `sqe-catalog/src/txn.rs`, set by `write_scope`. A transaction stages its writes on a branch and publishes it to `main` as a fast-forward, so each staged snapshot's summary survives publication.
 
-Bearer-token clients share one session per token (`SessionManager::session_for_bearer` maps a token fingerprint to one session id). Parallel loads under one token therefore share session state.
+Bearer-token clients share one session per token (`SessionManager::session_for_bearer` maps a token fingerprint to one session id). Parallel loads under one token therefore share session state. Two kinds of transaction exist. A Flight SQL `BeginTransaction` returns an id that the client sends with each request (`in_request_transaction` in `flight_sql.rs`), so each holder has its own transaction. A SQL `BEGIN` is stored on the session (`set_session_transaction` in `query_handler.rs`), so every connection on that session joins it.
 
 ## Goals / Non-Goals
 
 **Goals:**
 - A marker written in the same commit as the data, for every kind of user write.
-- No race between parallel loads that share a session, when they use transactions or per-request ingest options.
+- No race between parallel loads that share a session, when they use Flight SQL `BeginTransaction` transactions or per-request ingest options.
 - A property that SQE cannot apply is refused with an error, never dropped.
 - Keys that would change engine behaviour, or that Iceberg computes, cannot be set.
 
@@ -26,7 +26,7 @@ Bearer-token clients share one session per token (`SessionManager::session_for_b
 
 **1. Session statement modelled on `WRITE_BRANCH`, with a transaction scope.**
 `SET SNAPSHOT_PROPERTIES ('k' = 'v', ...)` replaces the whole set. `SET SNAPSHOT_PROPERTIES ()` and `RESET SNAPSHOT_PROPERTIES` clear it. The statement is allowed inside a transaction. Run inside one, it sets the properties on that transaction's `TxnScope`, and they are dropped when the transaction ends. Run outside one, it stores them on the session through a new `SessionManager::set_snapshot_properties`. A write inside a transaction uses only the transaction's properties. Session properties do not leak into it.
-*Why:* the per-transaction form is race-free under a shared bearer session, because each transaction has its own id. The session form covers single autocommit writes.
+*Why:* the per-transaction form is race-free under a shared bearer session when each loader holds its own Flight SQL `BeginTransaction` id, which the ADBC driver uses for a connection with autocommit off. A SQL `BEGIN` lives on the session, so loaders sharing a token and using SQL `BEGIN` share one transaction and its properties. The session form covers single autocommit writes from one client per session; parallel loaders under one token race on it, and the docs say so.
 *Alternatives:* a `SET SESSION` property is refused on Flight and is a flat string. A table-function or comment hint is invisible to the classifier and to audit.
 
 **2. Refuse where the session is not held.**

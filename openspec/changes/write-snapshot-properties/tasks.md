@@ -34,6 +34,6 @@
 
 ## 6. Docs and close-out
 
-- [ ] 6.1 SQL reference: `SET` / `RESET SNAPSHOT_PROPERTIES`, the reserved keys, the transaction form as the recommended one, compaction and expiry limits
+- [ ] 6.1 SQL reference: `SET` / `RESET SNAPSHOT_PROPERTIES`, the reserved keys, the transaction form as the recommended one, compaction and expiry limits, and that clients sharing one bearer token share session properties and a SQL `BEGIN` (parallel loaders use Flight SQL `BeginTransaction` or ingest options)
 - [ ] 6.2 Flight SQL connecting page: the `snapshot-property.` ingest option
 - [ ] 6.3 README roadmap, status fragment, changelog fragment
