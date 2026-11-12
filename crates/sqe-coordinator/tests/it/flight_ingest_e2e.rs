@@ -19,15 +19,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_server::FlightServiceServer;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_flight::sql::{
-    CommandStatementIngest, EndTransaction, TableDefinitionOptions, TableExistsOption,
-    TableNotExistOption,
+    CommandStatementIngest, DoPutUpdateResult, EndTransaction, ProstMessageExt,
+    TableDefinitionOptions, TableExistsOption, TableNotExistOption,
 };
+use arrow_flight::FlightDescriptor;
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use sqe_coordinator::flight_sql::SqeFlightSqlService;
 use sqe_coordinator::session_manager::SessionManager;
 use tokio::net::TcpListener;
@@ -161,6 +163,62 @@ async fn ingest(
     client.execute_ingest(command, stream).await
 }
 
+/// Like [`ingest`], but the stream announces `schema` even with no batches.
+/// `execute_ingest` encodes without a schema, so an empty upload carries none;
+/// ADBC drivers send the schema first.
+async fn ingest_announcing_schema(
+    client: &mut FlightSqlServiceClient<Channel>,
+    command: CommandStatementIngest,
+    batches: Vec<RecordBatch>,
+    schema: Arc<Schema>,
+) -> Result<i64, arrow_flight::error::FlightError> {
+    let descriptor = FlightDescriptor::new_cmd(prost::Message::encode_to_vec(&command.as_any()));
+    let data = FlightDataEncoderBuilder::new()
+        .with_flight_descriptor(Some(descriptor))
+        .with_schema(schema)
+        .build(futures::stream::iter(batches.into_iter().map(Ok)))
+        .map(|frame| frame.expect("the batches encode"));
+    let mut responses = client.do_put(data).await?;
+    let result = responses
+        .message()
+        .await
+        .map_err(arrow_flight::error::FlightError::from)?
+        .expect("a PutResult");
+    let update: DoPutUpdateResult = prost::Message::decode(&*result.app_metadata)
+        .map_err(|e| arrow_flight::error::FlightError::DecodeError(e.to_string()))?;
+    Ok(update.record_count)
+}
+
+/// The gRPC code of a failed ingest, if the error carries one.
+fn status_code<T>(result: &Result<T, arrow_flight::error::FlightError>) -> Option<tonic::Code> {
+    match result {
+        Err(arrow_flight::error::FlightError::Tonic(status)) => Some(status.code()),
+        _ => None,
+    }
+}
+
+/// `snapshot_id|operation` of every snapshot of `table`, oldest first.
+async fn snapshots(client: &mut FlightSqlServiceClient<Channel>, table: &str) -> Vec<String> {
+    let sql = format!(
+        "SELECT snapshot_id, operation FROM table_snapshots('{SCHEMA}', '{table}') \
+         ORDER BY committed_at, snapshot_id"
+    );
+    let batches = query(client, &sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let mut out = Vec::new();
+    for b in &batches {
+        for r in 0..b.num_rows() {
+            out.push(format!(
+                "{}|{}",
+                crate::common::fmt_val(b.column(0).as_ref(), r),
+                crate::common::fmt_val(b.column(1).as_ref(), r)
+            ));
+        }
+    }
+    out
+}
+
 /// Run `sql` through `GetFlightInfo` + `DoGet`.
 async fn query(
     client: &mut FlightSqlServiceClient<Channel>,
@@ -246,14 +304,9 @@ async fn ingest_append_into_existing_table_returns_count_and_rows() {
 
 /// The create-if-not-exists mode ADBC's `mode="create"` / `"create_append"`
 /// sends: the table does not exist, the ingest creates it from the stream
-/// schema and loads the rows.
-///
-/// Known bug #881: `do_put_statement_ingest` never reads
-/// `table_definition_options`, and `handle_ingest_streaming` starts with
-/// `load_table`, so a missing table answers `NOT_FOUND` / `TABLE_NOT_FOUND`
-/// instead of being created.
+/// schema and loads the rows (#881).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "bug:#881; needs:polaris; ingest ignores TableNotExistOption::Create"]
+#[ignore = "needs:polaris"]
 async fn ingest_create_if_not_exists_creates_the_table() {
     let server = IngestServer::start().await;
     let mut client = server.client().await;
@@ -320,14 +373,11 @@ async fn ingest_append_twice_keeps_both_batches() {
     drop_table(&mut client, table).await;
 }
 
-/// `TABLE_EXISTS_OPTION_FAIL` on an existing table is an error, and the table
-/// keeps the rows it had: a refused ingest writes nothing.
-///
-/// Known bug #881: `TableExistsOption` is ignored, so every ingest into an
-/// existing table appends. The call returns `Ok(1)` and the row is written.
-/// (`Replace` is ignored the same way.)
+/// `TABLE_EXISTS_OPTION_FAIL` on an existing table is an error (gRPC
+/// `AlreadyExists`), and the table keeps the rows it had: a refused ingest
+/// writes nothing (#881).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "bug:#881; needs:polaris; ingest ignores TableExistsOption::Fail"]
+#[ignore = "needs:polaris"]
 async fn ingest_fail_if_exists_refuses_an_existing_table() {
     let server = IngestServer::start().await;
     let mut client = server.client().await;
@@ -349,9 +399,10 @@ async fn ingest_fail_if_exists_refuses_an_existing_table() {
     );
     let result = ingest(&mut client, cmd, vec![batch(&[(2, "refused")])]).await;
 
-    assert!(
-        result.is_err(),
-        "fail-if-exists on an existing table must error, got {result:?}"
+    assert_eq!(
+        status_code(&result),
+        Some(tonic::Code::AlreadyExists),
+        "fail-if-exists on an existing table must refuse, got {result:?}"
     );
     assert_eq!(
         rows(&mut client, table).await,
@@ -359,6 +410,296 @@ async fn ingest_fail_if_exists_refuses_an_existing_table() {
         "a refused ingest must not write"
     );
     drop_table(&mut client, table).await;
+}
+
+/// `create_append` (CREATE, APPEND) twice: the first call creates the table,
+/// the second appends to it. Exact contents after each.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ingest_create_append_twice_creates_then_appends() {
+    let server = IngestServer::start().await;
+    let mut client = server.client().await;
+    let table = "flight_ingest_create_append";
+    drop_table(&mut client, table).await;
+
+    let create_append = || {
+        ingest_command(
+            table,
+            TableNotExistOption::Create,
+            TableExistsOption::Append,
+            None,
+        )
+    };
+    let first = ingest(
+        &mut client,
+        create_append(),
+        vec![batch(&[(1, "one"), (2, "two")])],
+    )
+    .await
+    .expect("first create_append creates the table");
+    assert_eq!(first, 2);
+    assert_eq!(rows(&mut client, table).await, strings(&["1|one", "2|two"]));
+
+    let second = ingest(&mut client, create_append(), vec![batch(&[(3, "three")])])
+        .await
+        .expect("second create_append appends");
+    assert_eq!(second, 1, "the count is this ingest's rows");
+    assert_eq!(
+        rows(&mut client, table).await,
+        strings(&["1|one", "2|two", "3|three"])
+    );
+    drop_table(&mut client, table).await;
+}
+
+/// `replace` (CREATE, REPLACE) on an existing table: the rows are exactly the
+/// new ones, and the old snapshot is still in the table's history (one new
+/// overwrite snapshot, not a drop and recreate).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ingest_replace_swaps_the_rows_and_keeps_history() {
+    let server = IngestServer::start().await;
+    let mut client = server.client().await;
+    let table = "flight_ingest_replace";
+    fresh_table(&mut client, table).await;
+    let seed = ingest_command(
+        table,
+        TableNotExistOption::Fail,
+        TableExistsOption::Append,
+        None,
+    );
+    ingest(&mut client, seed, vec![batch(&[(1, "old"), (2, "old")])])
+        .await
+        .expect("seed");
+    assert_eq!(rows(&mut client, table).await, strings(&["1|old", "2|old"]));
+    let before = snapshots(&mut client, table).await;
+    assert_eq!(before.len(), 1, "the seed is one snapshot: {before:?}");
+
+    let replace = ingest_command(
+        table,
+        TableNotExistOption::Create,
+        TableExistsOption::Replace,
+        None,
+    );
+    let count = ingest(
+        &mut client,
+        replace,
+        vec![batch(&[(5, "new"), (6, "new"), (7, "new")])],
+    )
+    .await
+    .expect("replace");
+    assert_eq!(count, 3);
+    assert_eq!(
+        rows(&mut client, table).await,
+        strings(&["5|new", "6|new", "7|new"]),
+        "the old rows are gone, the new ones are all there"
+    );
+
+    let after = snapshots(&mut client, table).await;
+    assert_eq!(after.len(), 2, "one new snapshot: {after:?}");
+    assert_eq!(
+        after[0], before[0],
+        "the previous snapshot is still in the history"
+    );
+    assert!(
+        after[1].ends_with("|overwrite") || after[1].ends_with("|replace"),
+        "the replace is one overwrite snapshot, got {}",
+        after[1]
+    );
+    drop_table(&mut client, table).await;
+}
+
+/// A replace whose stream does not fit the table fails and leaves the table
+/// as it was: same rows, same snapshots.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ingest_replace_with_a_mismatched_stream_leaves_the_table_unchanged() {
+    let server = IngestServer::start().await;
+    let mut client = server.client().await;
+    let table = "flight_ingest_replace_mismatch";
+    fresh_table(&mut client, table).await;
+    client
+        .execute_update(
+            format!("INSERT INTO {} VALUES (1, 'kept')", fq(table)),
+            None,
+        )
+        .await
+        .expect("seed row");
+    let before = snapshots(&mut client, table).await;
+
+    // Three columns into a two-column table.
+    let wide_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("extra", DataType::Utf8, true),
+    ]));
+    let wide = RecordBatch::try_new(
+        wide_schema,
+        vec![
+            Arc::new(Int64Array::from_iter_values([9])) as ArrayRef,
+            Arc::new(StringArray::from_iter_values(["x"])) as ArrayRef,
+            Arc::new(StringArray::from_iter_values(["y"])) as ArrayRef,
+        ],
+    )
+    .expect("wide batch");
+    let replace = ingest_command(
+        table,
+        TableNotExistOption::Create,
+        TableExistsOption::Replace,
+        None,
+    );
+    let result = ingest(&mut client, replace, vec![wide]).await;
+
+    assert!(
+        result.is_err(),
+        "a mismatched replace must fail, got {result:?}"
+    );
+    assert_eq!(
+        rows(&mut client, table).await,
+        strings(&["1|kept"]),
+        "the table keeps its rows"
+    );
+    assert_eq!(
+        snapshots(&mut client, table).await,
+        before,
+        "and its snapshots: a failed replace commits nothing"
+    );
+    drop_table(&mut client, table).await;
+}
+
+/// A create from a stream that announces its schema but carries no rows: the
+/// table exists with that schema and has no rows. (The Flight encoder sends
+/// the schema of an empty stream only when told to, so this sends it
+/// explicitly, as ADBC drivers do.)
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ingest_empty_stream_creates_an_empty_table() {
+    let server = IngestServer::start().await;
+    let mut client = server.client().await;
+    let table = "flight_ingest_empty_create";
+    drop_table(&mut client, table).await;
+
+    let cmd = ingest_command(
+        table,
+        TableNotExistOption::Create,
+        TableExistsOption::Fail,
+        None,
+    );
+    let count = ingest_announcing_schema(&mut client, cmd, vec![], ingest_schema())
+        .await
+        .expect("create from an empty stream");
+    assert_eq!(count, 0);
+
+    assert!(
+        rows(&mut client, table).await.is_empty(),
+        "the table exists and has no rows"
+    );
+    let columns = query(
+        &mut client,
+        &format!(
+            "SELECT column_name, data_type FROM information_schema.columns \
+             WHERE table_schema = '{SCHEMA}' AND table_name = '{table}' \
+             ORDER BY ordinal_position"
+        ),
+    )
+    .await
+    .expect("columns");
+    let mut described = Vec::new();
+    for b in &columns {
+        for r in 0..b.num_rows() {
+            described.push(format!(
+                "{}|{}",
+                crate::common::fmt_val(b.column(0).as_ref(), r),
+                crate::common::fmt_val(b.column(1).as_ref(), r)
+            ));
+        }
+    }
+    assert_eq!(
+        described,
+        strings(&["id|Int64", "name|Utf8View"]),
+        "the table has the stream's schema"
+    );
+    drop_table(&mut client, table).await;
+}
+
+/// A create with a stream that announces no schema fails with
+/// `InvalidArgument` and creates no table.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ingest_create_from_a_stream_without_a_schema_is_refused() {
+    let server = IngestServer::start().await;
+    let mut client = server.client().await;
+    let table = "flight_ingest_no_schema";
+    drop_table(&mut client, table).await;
+
+    let cmd = ingest_command(
+        table,
+        TableNotExistOption::Create,
+        TableExistsOption::Fail,
+        None,
+    );
+    // One message carrying the command descriptor and no schema or batches:
+    // nothing to create the table from. (A client with no descriptor message
+    // at all never reaches the ingest handler, so the descriptor is sent by
+    // hand.)
+    let descriptor = FlightDescriptor::new_cmd(prost::Message::encode_to_vec(&cmd.as_any()));
+    let frame = arrow_flight::FlightData {
+        flight_descriptor: Some(descriptor),
+        ..Default::default()
+    };
+    let result: Result<(), arrow_flight::error::FlightError> =
+        match client.do_put(futures::stream::iter([frame])).await {
+            Err(e) => Err(e),
+            Ok(mut responses) => responses
+                .message()
+                .await
+                .map(|_| ())
+                .map_err(arrow_flight::error::FlightError::from),
+        };
+    assert_eq!(
+        status_code(&result),
+        Some(tonic::Code::InvalidArgument),
+        "got {result:?}"
+    );
+    let probe = query(&mut client, &format!("SELECT id FROM {}", fq(table))).await;
+    assert!(probe.is_err(), "no table was created");
+}
+
+/// An ingest that creates a table inside a Flight transaction creates it
+/// autocommit (as SQL DDL does there) and writes the rows to the transaction:
+/// a rollback leaves the table, empty.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris; two concurrent sessions"]
+async fn ingest_create_in_a_transaction_then_rollback_leaves_an_empty_table() {
+    let server = IngestServer::start().await;
+    let mut writer = server.client().await;
+    let mut reader = server.client().await;
+    let table = "flight_ingest_txn_create_rollback";
+    drop_table(&mut writer, table).await;
+
+    let txn = writer.begin_transaction().await.expect("begin transaction");
+    let cmd = ingest_command(
+        table,
+        TableNotExistOption::Create,
+        TableExistsOption::Append,
+        Some(txn.clone()),
+    );
+    let count = ingest(&mut writer, cmd, vec![batch(&[(1, "discarded")])])
+        .await
+        .expect("create-and-ingest inside the transaction");
+    assert_eq!(count, 1);
+
+    writer
+        .end_transaction(txn, EndTransaction::Rollback)
+        .await
+        .expect("rollback");
+
+    for (who, client) in [("writer", &mut writer), ("reader", &mut reader)] {
+        assert!(
+            rows(client, table).await.is_empty(),
+            "{who}: the table exists and the rolled-back rows are gone"
+        );
+    }
+    drop_table(&mut writer, table).await;
 }
 
 /// A stream of several batches arrives complete and in value.

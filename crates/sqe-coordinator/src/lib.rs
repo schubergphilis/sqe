@@ -19,6 +19,7 @@ pub mod credential_refresh;
 pub(crate) mod dim_build_swap;
 pub(crate) mod distributed_scan;
 pub(crate) mod explain;
+pub(crate) mod flight_ingest;
 pub mod flight_sql;
 pub(crate) mod flight_sql_helpers;
 pub mod hive_ddl_handler;
