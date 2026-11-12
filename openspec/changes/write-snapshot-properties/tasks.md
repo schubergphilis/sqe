@@ -1,8 +1,8 @@
 ## 1. Groundwork
 
-- [ ] 1.1 `t$snapshots`: build the `summary` JSON with `serde_json` (`sqe-catalog/src/iceberg_metadata_tvf.rs`); unit test with quotes, backslash, control characters and non-ASCII
+- [x] 1.1 `t$snapshots`: build the `summary` JSON with `serde_json` (`sqe-catalog/src/iceberg_metadata_tvf.rs`); unit test with quotes, backslash, control characters and non-ASCII
 - [x] 1.2 Read the Trino HTTP session path: record in the design whether `SET` statements reach a session held by the session manager, and fix the spec's refusal scenario to match
-- [ ] 1.3 `SnapshotProperties` type with the validation rules (keys, values, reserved keys and prefixes, pair and byte caps) in `sqe-core`; unit tests for every rule
+- [x] 1.3 `SnapshotProperties` type with the validation rules (keys, values, reserved keys and prefixes, pair and byte caps) in `sqe-core`; unit tests for every rule
 
 ## 2. Statement and session state
 

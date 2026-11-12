@@ -484,6 +484,21 @@ impl TableFunctionImpl for TableSnapshotsFunction {
     }
 }
 
+/// Render a snapshot summary's additional properties as a JSON object.
+///
+/// Keys are sorted so the output is deterministic (the source is a
+/// `HashMap`). `serde_json` escapes quotes, backslashes and control
+/// characters, so the result parses for any key and value another writer
+/// stored.
+fn summary_json(props: &HashMap<String, String>) -> String {
+    let sorted: std::collections::BTreeMap<&str, &str> = props
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    // A map of strings always serializes; fall back to `{}` rather than panic.
+    serde_json::to_string(&sorted).unwrap_or_else(|_| "{}".to_string())
+}
+
 fn build_snapshots_batch(table: &Table, schema: &SchemaRef) -> DFResult<RecordBatch> {
     let metadata = table.metadata();
 
@@ -514,24 +529,7 @@ fn build_snapshots_batch(table: &Table, schema: &SchemaRef) -> DFResult<RecordBa
         manifest_list_b.append_value(snap.manifest_list());
 
         // Serialize additional_properties as a compact JSON object
-        let extra = &snap.summary().additional_properties;
-        if extra.is_empty() {
-            summary_b.append_value("{}");
-        } else {
-            // Build a simple JSON string without pulling in serde_json as a new dep —
-            // the serde_json crate is already transitively available via iceberg-rust.
-            let pairs: Vec<String> = extra
-                .iter()
-                .map(|(k, v)| {
-                    format!(
-                        "\"{}\":\"{}\"",
-                        k.replace('"', "\\\""),
-                        v.replace('"', "\\\"")
-                    )
-                })
-                .collect();
-            summary_b.append_value(format!("{{{}}}", pairs.join(",")));
-        }
+        summary_b.append_value(summary_json(&snap.summary().additional_properties));
     }
 
     let committed_at = TimestampMillisecondArray::from(committed_at_ms).with_timezone("UTC");
@@ -1376,6 +1374,65 @@ mod tests {
         Expr::Literal(ScalarValue::Utf8(Some(s.to_string())), None)
     }
 
+    // ── summary_json ─────────────────────────────────────────────────────────
+
+    fn summary_roundtrip(pairs: &[(&str, &str)]) -> (String, HashMap<String, String>) {
+        let props: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let out = summary_json(&props);
+        let parsed: HashMap<String, String> =
+            serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid JSON {out}: {e}"));
+        (out, parsed)
+    }
+
+    #[test]
+    fn summary_json_empty_is_empty_object() {
+        assert_eq!(summary_json(&HashMap::new()), "{}");
+    }
+
+    #[test]
+    fn summary_json_quotes_and_backslashes_roundtrip() {
+        let pairs = [("copy.run", r#"C:\load\"x""#), (r#"k"ey\"#, r#"a\"b\\"#)];
+        let (_, parsed) = summary_roundtrip(&pairs);
+        for (k, v) in pairs {
+            assert_eq!(parsed.get(k).map(String::as_str), Some(v));
+        }
+        assert_eq!(parsed.len(), pairs.len());
+    }
+
+    #[test]
+    fn summary_json_control_characters_roundtrip() {
+        let pairs = [("a", "line1\nline2\ttab\r"), ("b", "\u{1}\u{1f}x\u{0}")];
+        let (out, parsed) = summary_roundtrip(&pairs);
+        assert!(!out.contains('\n'), "raw newline leaked into JSON: {out:?}");
+        assert!(!out.contains('\u{1}'), "raw control char leaked: {out:?}");
+        for (k, v) in pairs {
+            assert_eq!(parsed.get(k).map(String::as_str), Some(v));
+        }
+    }
+
+    #[test]
+    fn summary_json_non_ascii_roundtrip() {
+        let pairs = [("café", "é"), ("lang", "日本語"), ("emoji", "🦀")];
+        let (_, parsed) = summary_roundtrip(&pairs);
+        for (k, v) in pairs {
+            assert_eq!(parsed.get(k).map(String::as_str), Some(v));
+        }
+    }
+
+    #[test]
+    fn summary_json_keys_are_sorted() {
+        let pairs = [("zeta", "1"), ("alpha", "2"), ("mid", "3"), ("Beta", "4")];
+        let (out, parsed) = summary_roundtrip(&pairs);
+        assert_eq!(parsed.len(), 4);
+        assert_eq!(
+            out, r#"{"Beta":"4","alpha":"2","mid":"3","zeta":"1"}"#,
+            "keys must be in byte order"
+        );
+    }
+
     // ── parse_two_string_args ────────────────────────────────────────────────
 
     #[test]
@@ -1774,50 +1831,5 @@ mod tests {
         assert_eq!(DataContentType::Data as i32, 0);
         assert_eq!(DataContentType::PositionDeletes as i32, 1);
         assert_eq!(DataContentType::EqualityDeletes as i32, 2);
-    }
-
-    // ── summary JSON serialisation ────────────────────────────────────────────
-
-    #[test]
-    fn test_summary_empty_map_produces_empty_object() {
-        let extra: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let result = if extra.is_empty() {
-            "{}".to_string()
-        } else {
-            let pairs: Vec<String> = extra
-                .iter()
-                .map(|(k, v)| {
-                    format!(
-                        "\"{}\":\"{}\"",
-                        k.replace('"', "\\\""),
-                        v.replace('"', "\\\"")
-                    )
-                })
-                .collect();
-            format!("{{{}}}", pairs.join(","))
-        };
-        assert_eq!(result, "{}");
-    }
-
-    #[test]
-    fn test_summary_escapes_double_quotes_in_key_and_value() {
-        let mut extra: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        extra.insert("ke\"y".to_string(), "va\"lue".to_string());
-        let pairs: Vec<String> = extra
-            .iter()
-            .map(|(k, v)| {
-                format!(
-                    "\"{}\":\"{}\"",
-                    k.replace('"', "\\\""),
-                    v.replace('"', "\\\"")
-                )
-            })
-            .collect();
-        let result = format!("{{{}}}", pairs.join(","));
-        assert!(result.contains("ke\\\"y"), "key should have escaped quotes");
-        assert!(
-            result.contains("va\\\"lue"),
-            "value should have escaped quotes"
-        );
     }
 }
