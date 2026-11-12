@@ -8,6 +8,7 @@ pub mod runtime;
 pub mod secret;
 pub mod secret_string;
 pub mod session;
+pub mod snapshot_properties;
 pub mod sql_params;
 pub mod supervised_task;
 pub mod table_properties;
