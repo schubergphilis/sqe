@@ -3937,7 +3937,17 @@ impl SessionCatalog {
                 reference: reference.clone(),
             }])
             .unwrap_or_else(|_| serde_json::json!([])),
-            None => serde_json::json!([]),
+            // No `main` yet. An empty update list is authorized by Polaris as the
+            // generic `UPDATE_TABLE`, which needs `TABLE_WRITE_PROPERTIES`
+            // (`table-properties-write`) -- a privilege an INSERT grant
+            // deliberately does not confer, so the first INSERT into a fresh
+            // table was refused. Dropping the absent `main` is a no-op, and
+            // Polaris authorizes it as `REMOVE_TABLE_SNAPSHOT_REF`, which the
+            // `table-data-write` closure includes.
+            None => serde_json::to_value(vec![TableUpdate::RemoveSnapshotRef {
+                ref_name: iceberg::spec::MAIN_BRANCH.to_string(),
+            }])
+            .unwrap_or_else(|_| serde_json::json!([])),
         };
         match self
             .post_noop_commit(table_ident, requirements, updates)
@@ -7352,6 +7362,71 @@ mod vended_credentials_rest_tests {
             serde_json::json!([
                 {"action": "set-snapshot-ref", "ref-name": "main", "snapshot-id": snapshot, "type": "branch"},
             ])
+        );
+    }
+
+    /// A table with no `main` yet (nothing written): the check must not send an
+    /// empty update list, which Polaris authorizes as `UPDATE_TABLE`
+    /// (`table-properties-write`) and an INSERT-only grantee lacks. It drops the
+    /// absent `main` instead, a no-op Polaris authorizes as
+    /// `REMOVE_TABLE_SNAPSHOT_REF`, inside the `table-data-write` closure.
+    #[tokio::test]
+    async fn write_check_without_main_probes_with_remove_snapshot_ref() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "defaults": {}, "overrides": {"prefix": "wh"}
+            })))
+            .mount(&server)
+            .await;
+        // The fixture table with its snapshot and `main` ref taken out.
+        let mut body: serde_json::Value = serde_json::from_str(LOAD_TABLE_RESPONSE).unwrap();
+        body["config"] = serde_json::json!({});
+        let meta = body["metadata"].as_object_mut().unwrap();
+        meta.insert("current-snapshot-id".into(), serde_json::json!(-1));
+        meta.insert("snapshots".into(), serde_json::json!([]));
+        meta.insert("snapshot-log".into(), serde_json::json!([]));
+        meta.remove("refs");
+        Mock::given(method("GET"))
+            .and(path(ORDERS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        Mock::given(path(ORDERS_PATH))
+            .and(is_commit)
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": {"message": "Requirement failed: UUID does not match",
+                          "type": "CommitFailedException", "code": 409}
+            })))
+            .mount(&server)
+            .await;
+        let cfg = catalog_config(&server, "");
+        let session = SessionCatalog::for_session_with(&cfg, &static_storage(), None, "tok-fresh")
+            .await
+            .unwrap();
+        let table = session.load_table(&orders()).await.unwrap();
+        assert!(
+            table.metadata().refs_iter().next().is_none(),
+            "fixture must have no refs"
+        );
+        session
+            .check_write_access(&orders(), &table)
+            .await
+            .expect("a 409 is a writer's answer");
+
+        let sent = commits(&server.received_requests().await.unwrap());
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let wrong = uuid::Uuid::from_u128(
+            uuid::Uuid::parse_str(ORDERS_UUID).unwrap().as_u128() ^ u128::MAX,
+        );
+        assert_eq!(
+            sent[0]["requirements"],
+            serde_json::json!([{"type": "assert-table-uuid", "uuid": wrong.to_string()}])
+        );
+        assert_eq!(
+            sent[0]["updates"],
+            serde_json::json!([{"action": "remove-snapshot-ref", "ref-name": "main"}])
         );
     }
 

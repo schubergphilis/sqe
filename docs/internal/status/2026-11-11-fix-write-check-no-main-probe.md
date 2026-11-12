@@ -1,0 +1,5 @@
+**STATUS 2026-11-11: pre-write check no longer needs table-properties-write on a table without `main` (`fix/write-check-no-main-probe`, openspec statement-path-restructure 1.1).**
+
+Bisect of `access_control_e2e::insert_does_not_confer_storage_relocation`: first bad commit 55b259a87 (merge of `fix/write-check-all-writes`). `catalog_write_check` sent `updates = []` when the table had no `main` ref; Polaris authorizes that as `UPDATE_TABLE` (`TABLE_WRITE_PROPERTIES`), which the INSERT grant excludes, so the first INSERT into a snapshotless table got 403. The probe now sends `remove-snapshot-ref main`. The Polaris op mapping is inferred from behaviour (the AC test turns green), not read from Polaris source. A wiremock unit test pins the sent update list. The AC test now deletes the residual Ranger policy on `orders_fresh_grant` before and after it runs, because REVOKE narrows a policy but never deletes it.
+
+**NEXT:** statement-path-restructure 1.4 (baseline compile profile), then the stage-split pilot.
