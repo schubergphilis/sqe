@@ -30,7 +30,8 @@ Bearer-token clients share one session per token (`SessionManager::session_for_b
 *Alternatives:* a `SET SESSION` property is refused on Flight and is a flat string. A table-function or comment hint is invisible to the classifier and to audit.
 
 **2. Refuse where the session is not held.**
-The existing `SetWriteBranch` arm logs and ignores the value when no session manager is wired. The new arm returns an error in that case, naming Flight SQL as the supported route. Before implementation, read the Trino HTTP session path and record in the spec whether it reaches a held session.
+The existing `SetWriteBranch` arm logs and ignores the value when no session manager is wired. The new arm returns an error in that case, naming Flight SQL as the supported route.
+Trino HTTP (task 1.2): `sqe-trino-compat/src/server.rs` builds a new `Session` for every request and the session manager never holds it. The client replays its transaction in `X-Trino-Transaction-Id`, which `txn_scope` resolves in the transaction registry. So over Trino HTTP the statement works inside a transaction, where the properties live on the `TxnScope`, and is refused outside one. A Trino-native session form (replayed in `X-Trino-Session`, as `SET SESSION` is) is out of scope.
 
 **3. Carried in `StatementScope`, read once, passed by value.**
 `write_scope` gains a `snapshot_properties: Option<Arc<SnapshotProperties>>` argument. The caller (`query_handler.rs` execute, `flight_sql.rs` ingest, `embedded.rs`) resolves the transaction or session value. `scope()` and `with_params()` inherit the field the way `params` is inherited. Each commit closure reads `sqe_catalog::txn::snapshot_properties()` once, before `commit_with_retry`. Task-locals do not cross `tokio::spawn`, so the value is cloned into the closure and never read from a spawned task.
