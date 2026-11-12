@@ -15,7 +15,7 @@
 
 ## 3. Lift the inline dispatch arms
 
-- [ ] 3.1 `Drop` (79 lines), move-only, `FILTER=drop`
+- [x] 3.1 `Drop` (79 lines), move-only, `FILTER=drop` (`handle_drop_statement`; 16 passed)
 - [ ] 3.2 `Merge` (79 lines), `FILTER=merge`
 - [ ] 3.3 `Insert` (95 lines), `FILTER=insert`
 - [ ] 3.4 `Utility` (140 lines)
