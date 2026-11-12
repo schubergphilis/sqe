@@ -11,13 +11,16 @@
 //! always exists for non-empty queries (every PrepareResponse carries
 //! `result_names` plus the first DataChunk).
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::datasource::{MemTable, TableProvider, TableType};
-use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::datasource::memory::{DataSourceExec, MemorySourceConfig};
+use datafusion::datasource::{TableProvider, TableType};
+use datafusion::error::Result as DFResult;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_expr::Expr;
 
@@ -55,7 +58,6 @@ impl QuackTableProvider {
             batches: result.batches,
         })
     }
-
 }
 
 #[async_trait]
@@ -67,15 +69,36 @@ impl TableProvider for QuackTableProvider {
         TableType::Base
     }
 
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let mem = MemTable::try_new(Arc::clone(&self.schema), vec![self.batches.clone()])
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        mem.scan(state, projection, filters, limit).await
+    // `async_trait`'s desugared form (compile time, see
+    // docs/internal/plans/2026-09-07-compile-time-async-hubs.md): the plan is
+    // built synchronously, the same way `MemTable::scan` builds it, and handed
+    // back as a ready future. No coroutine holds `&dyn Session` or `&[Expr]`,
+    // so rustc never proves `Expr: Sync` for this crate. `filters` and `limit`
+    // are unused, as in `MemTable::scan`; a fresh `MemTable` has no sort order.
+    fn scan<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+        &'life0 self,
+        state: &'life1 dyn Session,
+        projection: Option<&'life2 Vec<usize>>,
+        _filters: &'life3 [Expr],
+        _limit: Option<usize>,
+    ) -> Pin<Box<dyn Future<Output = DFResult<Arc<dyn ExecutionPlan>>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        Self: 'async_trait,
+    {
+        let plan = MemorySourceConfig::try_new(
+            std::slice::from_ref(&self.batches),
+            Arc::clone(&self.schema),
+            projection.cloned(),
+        )
+        .map(|source| {
+            let show_sizes = state.config_options().explain.show_sizes;
+            DataSourceExec::from_data_source(source.with_show_sizes(show_sizes))
+                as Arc<dyn ExecutionPlan>
+        });
+        Box::pin(std::future::ready(plan))
     }
 }
