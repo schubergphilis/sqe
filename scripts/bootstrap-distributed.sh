@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Bootstrap the distributed test stack.
-# Same as bootstrap-test.sh but uses the distributed compose ports.
+# Bootstrap the distributed test stack: the single-node catalog setup
+# (bootstrap-test.sh), then wait for the coordinator and the workers.
 
-POLARIS_URL="${POLARIS_URL:-http://localhost:18181}"
-S3_URL="${S3_URL:-http://localhost:19000}"
-S3_ACCESS_KEY="${S3_ACCESS_KEY:-s3admin}"
-S3_SECRET_KEY="${S3_SECRET_KEY:-s3admin}"
-CLIENT_ID="${CLIENT_ID:-root}"
-CLIENT_SECRET="${CLIENT_SECRET:-s3cr3t}"
-WAREHOUSE="${WAREHOUSE:-test_warehouse}"
+export POLARIS_URL="${POLARIS_URL:-http://localhost:18181}"
+export S3_URL="${S3_URL:-http://localhost:19000}"
+export S3_ACCESS_KEY="${S3_ACCESS_KEY:-s3admin}"
+export S3_SECRET_KEY="${S3_SECRET_KEY:-s3admin}"
+export CLIENT_ID="${CLIENT_ID:-root}"
+export CLIENT_SECRET="${CLIENT_SECRET:-s3cr3t}"
+export WAREHOUSE="${WAREHOUSE:-test_warehouse}"
 
 echo "=== SQE Distributed Stack Bootstrap ==="
 echo "Polaris:      $POLARIS_URL"
@@ -19,77 +19,15 @@ echo "Coordinator:  localhost:60051 (Flight SQL) / localhost:28080 (Trino HTTP)"
 echo "Workers:      localhost:60061, localhost:60062"
 echo ""
 
-# ── Wait for Polaris ───────────────────────────────────────────
-echo -n "Waiting for Polaris..."
-for i in $(seq 1 60); do
-    HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$POLARIS_URL/api/catalog/v1/oauth/tokens" \
-        -d "grant_type=client_credentials&client_id=$CLIENT_ID&client_secret=$CLIENT_SECRET&scope=PRINCIPAL_ROLE:ALL" 2>/dev/null || echo "000")
-    if [ "$HTTP" = "200" ]; then echo " ready"; break; fi
-    if [ "$i" -eq 60 ]; then echo " TIMEOUT"; exit 1; fi
-    echo -n "."
-    sleep 1
-done
-
-# ── Wait for RustFS ────────────────────────────────────────────
-echo -n "Waiting for RustFS..."
-for i in $(seq 1 30); do
-    if curl -so /dev/null "http://localhost:19000/minio/health/live" 2>/dev/null; then
-        echo " ready"; break
-    fi
-    if [ "$i" -eq 30 ]; then echo " TIMEOUT"; exit 1; fi
-    echo -n "."
-    sleep 1
-done
-
-# ── Create S3 bucket ───────────────────────────────────────────
-echo -n "Creating S3 bucket 'warehouse'... "
-mc alias set sqe "$S3_URL" "$S3_ACCESS_KEY" "$S3_SECRET_KEY" --api S3v4 >/dev/null 2>&1 || true
-mc mb sqe/warehouse 2>/dev/null && echo "done" || echo "already exists"
-
-# ── Get Polaris token ──────────────────────────────────────────
-echo -n "Getting Polaris token... "
-TOKEN=$(curl -s -X POST "$POLARIS_URL/api/catalog/v1/oauth/tokens" \
-    -d "grant_type=client_credentials&client_id=$CLIENT_ID&client_secret=$CLIENT_SECRET&scope=PRINCIPAL_ROLE:ALL" \
-    | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
-echo "done"
-
-# ── Create warehouse ──────────────────────────────────────────
-echo -n "Creating warehouse '$WAREHOUSE'... "
-HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$POLARIS_URL/api/management/v1/catalogs" \
-    -H "Authorization: Bearer $TOKEN" \
-    -H "Content-Type: application/json" \
-    -d "{
-        \"catalog\": {
-            \"name\": \"$WAREHOUSE\",
-            \"type\": \"INTERNAL\",
-            \"storageConfigInfo\": {
-                \"storageType\": \"S3\",
-                \"allowedLocations\": [\"s3://warehouse/\"],
-                \"endpoint\": \"$S3_URL\",
-                \"endpointInternal\": \"http://rustfs:9000\",
-                \"pathStyleAccess\": true
-            },
-            \"properties\": {
-                \"default-base-location\": \"s3://warehouse/\",
-                \"polaris.config.drop-with-purge.enabled\": \"true\"
-            }
-        }
-    }")
-if [ "$HTTP" = "201" ]; then echo "done"; elif [ "$HTTP" = "409" ]; then echo "already exists"; else echo "HTTP $HTTP"; fi
-
-# ── Grant catalog admin ───────────────────────────────────────
-echo -n "Granting catalog admin... "
-curl -s -o /dev/null -X PUT "$POLARIS_URL/api/management/v1/catalogs/$WAREHOUSE/catalog-roles/catalog_admin/grants" \
-    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-    -d '{"type":"catalog","privilege":"CATALOG_MANAGE_CONTENT"}' 2>/dev/null
-echo "done"
-
-# ── Create default namespace ──────────────────────────────────
-echo -n "Creating namespace 'default'... "
-HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$POLARIS_URL/api/catalog/v1/$WAREHOUSE/namespaces" \
-    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-    -d '{"namespace":["default"]}')
-if [ "$HTTP" = "200" ]; then echo "done"; elif [ "$HTTP" = "409" ]; then echo "already exists"; else echo "HTTP $HTTP"; fi
+# ── Catalog setup ─────────────────────────────────────────────
+# The distributed overlay shares Polaris and RustFS (same ports) with the
+# single-node test stack, and the suite runs the same tests, so it needs the
+# same catalog state: both buckets, test_warehouse with `default` and
+# `test_ns`, and discovery_test_wh with `disc_ns`. Reuse the single-node
+# bootstrap (idempotent) instead of keeping a second copy that drifts; the
+# old copy created only test_warehouse, so every catalog-discovery test
+# failed on a fresh distributed stack.
+"$(dirname "$0")/bootstrap-test.sh"
 
 # ── Wait for coordinator ──────────────────────────────────────
 echo ""
