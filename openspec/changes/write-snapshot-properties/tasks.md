@@ -22,7 +22,7 @@
 
 ## 4. Flight SQL ingest options
 
-- [ ] 4.1 `do_put_statement_ingest`: parse `snapshot-property.<key>` options, validate, merge over the scope's properties for that request; InvalidArgument before any file is written
+- [x] 4.1 `do_put_statement_ingest`: parse `snapshot-property.<key>` options, validate, merge over the scope's properties for that request; InvalidArgument before any file is written
 
 ## 5. Tests
 

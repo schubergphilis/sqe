@@ -4,6 +4,9 @@
 //!
 //! The mapping lives here so `sqe-write` needs no `arrow-flight` dependency.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use arrow_array::RecordBatch;
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::error::FlightError;
@@ -11,6 +14,7 @@ use arrow_flight::sql::{TableDefinitionOptions, TableExistsOption, TableNotExist
 use arrow_schema::SchemaRef;
 use futures::stream::BoxStream;
 use futures::StreamExt;
+use sqe_core::snapshot_properties::SnapshotProperties;
 use sqe_write::write_handler::{IngestMode, OnExisting, OnMissing};
 use tonic::Status;
 
@@ -87,6 +91,50 @@ pub(crate) async fn peek_upload_schema(
     }
     let batches = futures::stream::iter(first).chain(stream).boxed();
     Ok(PeekedUpload { schema, batches })
+}
+
+/// What an ingest commits under: the client's transaction, if any, and the
+/// snapshot properties resolved for this request.
+pub(crate) struct IngestScope {
+    pub(crate) txn: Option<Arc<sqe_catalog::txn::TxnScope>>,
+    pub(crate) snapshot_properties: Option<Arc<SnapshotProperties>>,
+}
+
+/// The option prefix Spark uses for per-write snapshot properties.
+const SNAPSHOT_PROPERTY_PREFIX: &str = "snapshot-property.";
+
+/// The snapshot properties of one ingest request: `base` (the transaction's or
+/// the session's) with the request's `snapshot-property.<key>` options laid
+/// over it, the request winning per key.
+///
+/// The prefix matches without regard to ASCII case, so a mistyped
+/// `Snapshot-Property.x` is applied or refused, never dropped. Every other
+/// option stays ignored, as before. A refused key or value is an
+/// `InvalidArgument` raised before the upload is read, so no data file is
+/// written for it.
+pub(crate) fn ingest_snapshot_properties(
+    options: &HashMap<String, String>,
+    base: Option<Arc<SnapshotProperties>>,
+) -> Result<Option<Arc<SnapshotProperties>>, Status> {
+    let prefix_len = SNAPSHOT_PROPERTY_PREFIX.len();
+    let pairs: Vec<(String, String)> = options
+        .iter()
+        .filter(|(name, _)| {
+            name.get(..prefix_len)
+                .is_some_and(|p| p.eq_ignore_ascii_case(SNAPSHOT_PROPERTY_PREFIX))
+        })
+        .map(|(name, value)| (name[prefix_len..].to_string(), value.clone()))
+        .collect();
+    if pairs.is_empty() {
+        return Ok(base);
+    }
+    let invalid = |e: sqe_core::SqeError| Status::invalid_argument(e.to_string());
+    let overrides = SnapshotProperties::try_new(pairs).map_err(invalid)?;
+    let merged = match base {
+        Some(base) => base.merged_with(&overrides).map_err(invalid)?,
+        None => overrides,
+    };
+    Ok(Some(Arc::new(merged)))
 }
 
 #[cfg(test)]
@@ -182,6 +230,79 @@ mod tests {
             if_exists: 99,
         };
         let err = ingest_mode(Some(&bad_existing)).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    fn props(pairs: &[(&str, &str)]) -> Arc<SnapshotProperties> {
+        Arc::new(
+            SnapshotProperties::try_new(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+                .unwrap(),
+        )
+    }
+
+    fn opts(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn no_snapshot_property_option_keeps_the_base() {
+        let base = props(&[("copy.run", "1")]);
+        let got = ingest_snapshot_properties(&opts(&[("other", "x")]), Some(base.clone())).unwrap();
+        assert!(Arc::ptr_eq(&got.unwrap(), &base));
+        assert!(ingest_snapshot_properties(&opts(&[]), None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn options_lay_over_the_base_and_win_per_key() {
+        let base = props(&[("copy.run", "1"), ("copy.table", "t")]);
+        let got = ingest_snapshot_properties(
+            &opts(&[
+                ("snapshot-property.copy.run", "42"),
+                ("Snapshot-Property.loader", "adbc"),
+                ("unrelated", "ignored"),
+            ]),
+            Some(base),
+        )
+        .unwrap()
+        .unwrap();
+        let map = got.as_map();
+        assert_eq!(map.len(), 3);
+        assert_eq!(map["copy.run"], "42");
+        assert_eq!(map["copy.table"], "t");
+        assert_eq!(map["loader"], "adbc");
+    }
+
+    #[test]
+    fn a_refused_option_is_an_invalid_argument() {
+        for (name, value) in [
+            ("snapshot-property.operation", "append"),
+            ("snapshot-property.", "empty key"),
+            ("snapshot-property.wap.id", "x"),
+            ("snapshot-property.ok", "bad\u{7}value"),
+        ] {
+            let err = ingest_snapshot_properties(&opts(&[(name, value)]), None).unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_merged_set_is_held_to_the_caps() {
+        let base = props(
+            &(0..32)
+                .map(|i| (format!("b{i}"), "v".to_string()))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect::<Vec<_>>(),
+        );
+        let err =
+            ingest_snapshot_properties(&opts(&[("snapshot-property.extra", "v")]), Some(base))
+                .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
