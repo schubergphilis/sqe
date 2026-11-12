@@ -56,8 +56,12 @@ When snapshot properties are set and a write has no files to add or remove, SQE 
 SQE SHALL return an error, and SHALL NOT ignore the statement, when the coordinator does not hold the session the statement runs in.
 
 #### Scenario: Unheld session
-- **WHEN** `SET SNAPSHOT_PROPERTIES` runs on a protocol path whose session the session manager does not hold
-- **THEN** the statement fails with an error that names Flight SQL as the supported route, and no later write carries the properties
+- **WHEN** `SET SNAPSHOT_PROPERTIES` runs outside a transaction on a protocol path whose session the session manager does not hold, such as Trino HTTP
+- **THEN** the statement fails with an error that names Flight SQL and transactions as the supported routes, and no later write carries the properties
+
+#### Scenario: Trino HTTP inside a transaction
+- **WHEN** a Trino HTTP client starts a transaction, runs `SET SNAPSHOT_PROPERTIES ('copy.run' = '42')`, inserts and commits, replaying `X-Trino-Transaction-Id` on each request
+- **THEN** the published snapshot carries `copy.run = 42`
 
 ### Requirement: Bulk ingest accepts per-request properties
 Flight SQL bulk ingest SHALL read `CommandStatementIngest.options` entries named `snapshot-property.<key>`. It SHALL validate them like `SET SNAPSHOT_PROPERTIES` and apply them to that request's commit only, on top of the transaction or session properties, with the request's value winning for a repeated key.
