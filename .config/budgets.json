@@ -10,7 +10,7 @@
     "crates/sqe-coordinator/src/flight_sql.rs": 5000,
     "crates/sqe-coordinator/src/maintenance.rs": 6250,
     "crates/sqe-coordinator/src/maintenance_scheduler.rs": 4000,
-    "crates/sqe-coordinator/src/query_handler.rs": 12000,
+    "crates/sqe-coordinator/src/query_handler.rs": 11750,
     "crates/sqe-core/src/config/mod.rs": 12500,
     "crates/sqe-mcp/src/lib.rs": 5750,
     "crates/sqe-policy/src/grants/ranger.rs": 4250,
