@@ -42,6 +42,7 @@ mod dml_exists_subquery_e2e;
 mod dml_in_subquery_row_alignment_e2e;
 mod dml_write_precheck_e2e;
 mod equality_delete_integration;
+mod flight_ingest_e2e;
 mod flight_sql_smoke;
 mod full_outer_window_join_test;
 mod geo_functions;
