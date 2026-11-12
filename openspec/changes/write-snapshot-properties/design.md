@@ -44,7 +44,7 @@ Today a write with nothing to add or delete skips the commit. With properties se
 *Why:* a client that copies an empty table must find its marker, or it redoes the table on every resume.
 
 **5. Ingest options use Spark's prefix.**
-`do_put_statement_ingest` reads `CommandStatementIngest.options` entries named `snapshot-property.<key>`, validates them with the same rules, and merges them over the transaction or session set for that request only. Other option names stay ignored, as today.
+`do_put_statement_ingest` reads `CommandStatementIngest.options` entries named `snapshot-property.<key>`, validates them with the same rules, and merges them over the transaction or session set for that request only. Other option names stay ignored, as today. The prefix matches without regard to ASCII case, so a mistyped `Snapshot-Property.` is applied or refused rather than silently ignored. The options are resolved before the upload is read, so a refused one writes no file.
 
 **6. Validation.**
 - Key: 1 to 128 bytes from `[A-Za-z0-9._-]`. Value: at most 1024 bytes, no control characters. At most 32 pairs and 8 KiB in total, because the summary lives in `metadata.json` and every snapshot repeats it.

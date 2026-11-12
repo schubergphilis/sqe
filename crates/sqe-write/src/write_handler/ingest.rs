@@ -295,8 +295,9 @@ impl WriteHandler {
             let catalog_for_commit = catalog.clone();
             let target_branch =
                 crate::commit::txn_target_branch(catalog.as_ref(), &table_ident).await?;
-            // The one resolved value this ingest stamps. Held in a local so
-            // the `snapshot-property.<key>` options (task 4.1) merge over it.
+            // The one resolved value this ingest stamps, read once. The
+            // Flight handler already laid the request's
+            // `snapshot-property.<key>` options over it in the scope.
             let snapshot_props = super::snapshot_props::current();
             commit_with_retry(
                 catalog.as_ref(),

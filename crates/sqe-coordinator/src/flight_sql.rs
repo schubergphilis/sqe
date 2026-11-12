@@ -1391,33 +1391,27 @@ impl SqeFlightSqlService {
         &'a self,
         session: &'a sqe_core::Session,
         qualified: &'a str,
-        txn: Option<Arc<sqe_catalog::txn::TxnScope>>,
+        scope: crate::flight_ingest::IngestScope,
         pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
         mode: sqe_write::write_handler::IngestMode,
         upload: crate::flight_ingest::PeekedUpload,
     ) -> futures::future::BoxFuture<'a, sqe_core::Result<usize>> {
-        Box::pin(self.ingest_flight_stream_inner(session, qualified, txn, pool, mode, upload))
+        Box::pin(self.ingest_flight_stream_inner(session, qualified, scope, pool, mode, upload))
     }
 
     async fn ingest_flight_stream_inner(
         &self,
         session: &sqe_core::Session,
         qualified: &str,
-        txn: Option<Arc<sqe_catalog::txn::TxnScope>>,
+        scope: crate::flight_ingest::IngestScope,
         pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
         mode: sqe_write::write_handler::IngestMode,
         upload: crate::flight_ingest::PeekedUpload,
     ) -> sqe_core::Result<usize> {
-        // The transaction's snapshot properties inside one, the session's
-        // outside; the session's never apply inside a transaction.
-        let snapshot_properties = match &txn {
-            Some(txn) => txn.snapshot_properties(),
-            None => session.snapshot_properties.clone(),
-        };
         sqe_catalog::txn::write_scope(
-            txn,
+            scope.txn,
             session.write_branch.clone(),
-            snapshot_properties,
+            scope.snapshot_properties,
             self.query_handler.write_handler().handle_ingest_streaming(
                 session,
                 qualified,
@@ -2701,6 +2695,16 @@ impl FlightSqlService for SqeFlightSqlService {
             .query_handler
             .transaction_scope(&session)
             .map_err(|e| sqe_error_to_status(&e, None))?;
+        // The transaction's snapshot properties inside one, the session's
+        // outside (the session's never apply inside a transaction), with the
+        // request's `snapshot-property.<key>` options over them. Resolved
+        // before the upload is read, so a refused option writes no file.
+        let base_properties = match &txn {
+            Some(txn) => txn.snapshot_properties(),
+            None => session.snapshot_properties.clone(),
+        };
+        let snapshot_properties =
+            crate::flight_ingest::ingest_snapshot_properties(&ticket.options, base_properties)?;
 
         // Build qualified table name from catalog + schema + table
         let mut qualified = String::new();
@@ -2758,7 +2762,10 @@ impl FlightSqlService for SqeFlightSqlService {
             .ingest_flight_stream(
                 &session,
                 &qualified,
-                txn,
+                crate::flight_ingest::IngestScope {
+                    txn,
+                    snapshot_properties,
+                },
                 Some(admission.memory.pool()),
                 mode,
                 upload,
