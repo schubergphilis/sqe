@@ -1,4 +1,4 @@
-### Documentation
+### Fixed
 
 - ADBC bulk ingest commits at once, also without autocommit
 
