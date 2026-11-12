@@ -31,7 +31,24 @@ conn.close()
 
 Use `grpc://` for plaintext and `grpc+tls://` when the coordinator runs with TLS (`[coordinator.tls]` cert and key set). The username and password are exchanged by the server for an OIDC token; what credentials are valid depends on the server's auth config.
 
-A DB-API connection starts in a transaction, as the DB-API spec requires. `INSERT`, `UPDATE`, `DELETE` and `MERGE` stay invisible to everyone else until `conn.commit()`, and closing the connection without it discards them. DDL, CTAS and bulk ingest (`cursor.adbc_ingest`) commit at once; the ADBC driver does not send the transaction with an ingest. Pass `autocommit=True` to `connect` when every statement should commit on its own, as a loader that opens a connection per statement needs. See [Transactions](../sql-reference/dml.md#transactions).
+A DB-API connection starts in a transaction, as the DB-API spec requires. `INSERT`, `UPDATE`, `DELETE` and `MERGE` stay invisible to everyone else until `conn.commit()`, and closing the connection without it discards them. DDL, CTAS and bulk ingest (`cursor.adbc_ingest`) commit at once. The ADBC driver does not send the transaction with an ingest (arrow-adbc issue 5027), so a client that needs the ingest inside the transaction sets `CommandStatementIngest.transaction_id` with its own Flight client. Pass `autocommit=True` to `connect` when every statement should commit on its own, as a loader that opens a connection per statement needs. See [Transactions](../sql-reference/dml.md#transactions).
+
+### With a bearer token
+
+A client that already holds a token sends it instead of a password. SQE reads `Authorization: Bearer <token>` on every request, so no handshake is needed:
+
+```python
+conn = connect(
+    "grpc+tls://sqe.example.com:50051",
+    db_kwargs={
+        DatabaseOptions.AUTHORIZATION_HEADER.value: f"Bearer {token}",
+    },
+)
+```
+
+The server decides what a token means. A `bearer_token` provider in `[[auth.providers]]` validates the JWT against the IdP's JWKS and takes the user and roles from its claims, so every person keeps their own identity. A token without a published JWKS, such as a Polaris `client_credentials` token signed with Polaris's internal key, is accepted only by a `bearer_passthrough` provider. That provider does not validate the token and gives every caller the one configured user, so SQE's own row filters and masks see that user, not the person. See [Provider chain](../deployment/configuration.md#provider-chain).
+
+SQE keeps one session per token. Clients that share a token share its session state, such as `USE` and `SET WRITE_BRANCH`.
 
 ## dbt with the dbt-sqe adapter
 
