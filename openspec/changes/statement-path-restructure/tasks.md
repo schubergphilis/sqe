@@ -17,7 +17,7 @@
 
 - [x] 3.1 `Drop` (79 lines), move-only, `FILTER=drop` (`handle_drop_statement`; 16 passed)
 - [x] 3.2 `Merge` (79 lines), `FILTER=merge` (`handle_merge_statement`; 12 passed)
-- [ ] 3.3 `Insert` (95 lines), `FILTER=insert`
+- [x] 3.3 `Insert` (95 lines), `FILTER=insert` (`handle_insert_statement`; 23 passed)
 - [ ] 3.4 `Utility` (140 lines)
 - [ ] 3.5 `Procedure` (144 lines), `FILTER=procedure`
 - [ ] 3.6 `Ctas` (150 lines), `FILTER=ctas`

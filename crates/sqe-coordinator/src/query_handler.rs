@@ -2673,98 +2673,14 @@ impl QueryHandler {
                 }
 
                 StatementKind::Insert(stmt) => {
-                    if let Statement::Insert(ref ins) = **stmt {
-                        // A Hive external table takes a different path entirely.
-                        // The Iceberg one below ends in `commit_written_files`,
-                        // an atomic metadata swap, and a Hive table has no
-                        // metadata pointer for that to touch. Routing through
-                        // the session context is what makes DataFusion call
-                        // `HiveTableProvider::insert_into`.
-                        if let sqlparser::ast::TableObject::TableName(ref name) = ins.table {
-                            let hive_ref = table_reference_of(name);
-                            if self.is_hive_table(session, &hive_ref) {
-                                // A Hive table has no branches: its files are
-                                // visible once written, so it cannot hold a
-                                // transaction's writes back (#821).
-                                if session.transaction_id.is_some() {
-                                    return Err(autocommit_write_conflict(session));
-                                }
-                                // Syntax first: an OVERWRITE is refused on the
-                                // statement alone, before any table lookup, so
-                                // the refusal cannot be masked by a lookup
-                                // error on a table that does not exist.
-                                crate::hive_write::reject_overwrite(stmt)?;
-                                // Gate the target before any object lands (503):
-                                // the post-write index refresh repeats the check,
-                                // but by then the files are in the bucket.
-                                self.hive_ddl_handler
-                                    .refuse_write_if_denied(session, &hive_ref, "INSERT")
-                                    .await?;
-                                let (ctx, _) = self.write_session_context(session, memory).await?;
-                                let written = crate::hive_write::handle_insert(
-                                    &ctx,
-                                    stmt,
-                                    &format!("{stmt}"),
-                                    self.policy_enforcer.as_ref(),
-                                    &session.user,
-                                    &mut policy_summary,
-                                )
-                                .await?;
-
-                                // Data first, then the index. The reverse order
-                                // makes the index promise files that do not
-                                // exist yet; this order can only leave data
-                                // that is intact and not yet visible, which
-                                // MSCK REPAIR TABLE recovers exactly.
-                                if let Err(e) = self
-                                    .hive_ddl_handler
-                                    .refresh_index_after_write(session, &hive_ref)
-                                    .await
-                                {
-                                    // Naming the recovery is the whole point. A
-                                    // generic error here sends the user looking
-                                    // for data that is sitting in the bucket.
-                                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                                        "hive_external: the rows were WRITTEN but are not yet                                          visible: refreshing the partition index failed ({e}).                                          The data files are on storage and intact. Run                                          `MSCK REPAIR TABLE {hive_ref}` to make them visible."
-                                    )));
-                                }
-                                // Drop the cached session context, the way
-                                // the Iceberg CTAS and INSERT arms do. Measured:
-                                // a SELECT before the write caches the table
-                                // provider, and the next SELECT on that same
-                                // context returns the PRE-write rows while a
-                                // fresh context returns the correct ones. The
-                                // index was already refreshed above; without
-                                // this the refresh is invisible, which is
-                                // indistinguishable from the refresh failing.
-                                crate::session_context::invalidate_session_cache(
-                                    &session.user.username,
-                                )
-                                .await;
-                                return Ok(written);
-                            }
-                        }
-                        let select_sql = ins
-                            .source
-                            .as_ref()
-                            .map(|q| sqe_sql::rewrite_named_tvf_args(&format!("{q}")))
-                            .ok_or_else(|| {
-                                SqeError::with_code(SqeErrorCode::ExecutionFailed, "INSERT without SELECT source")
-                            })?;
-                        let (ctx, _) = self.write_session_context(session, memory).await?;
-                        self.write_handler
-                            .handle_insert_streaming(
-                                session,
-                                stmt,
-                                &ctx,
-                                &select_sql,
-                                &mut captured_plan,
-                                &mut policy_summary,
-                            )
-                            .await
-                    } else {
-                        Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, "Expected Insert statement"))
-                    }
+                    self.handle_insert_statement(
+                        session,
+                        stmt,
+                        memory,
+                        &mut captured_plan,
+                        &mut policy_summary,
+                    )
+                    .await
                 }
 
                 StatementKind::ExplainFull(inner) => {
@@ -3859,6 +3775,115 @@ impl QueryHandler {
             }
         }
         merged
+    }
+
+    /// Runs `INSERT INTO ... SELECT`: a Hive external table goes through
+    /// `hive_write::handle_insert`, an Iceberg one through the write handler's
+    /// streaming insert.
+    #[allow(clippy::borrowed_box)]
+    async fn handle_insert_statement(
+        &self,
+        session: &Session,
+        stmt: &Box<Statement>,
+        memory: &crate::query_memory::StatementMemory,
+        captured_plan: &mut Option<sqe_lineage::PlanOrHint>,
+        policy_summary: &mut Option<sqe_policy::PolicySummary>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        if let Statement::Insert(ref ins) = **stmt {
+            // A Hive external table takes a different path entirely.
+            // The Iceberg one below ends in `commit_written_files`,
+            // an atomic metadata swap, and a Hive table has no
+            // metadata pointer for that to touch. Routing through
+            // the session context is what makes DataFusion call
+            // `HiveTableProvider::insert_into`.
+            if let sqlparser::ast::TableObject::TableName(ref name) = ins.table {
+                let hive_ref = table_reference_of(name);
+                if self.is_hive_table(session, &hive_ref) {
+                    // A Hive table has no branches: its files are
+                    // visible once written, so it cannot hold a
+                    // transaction's writes back (#821).
+                    if session.transaction_id.is_some() {
+                        return Err(autocommit_write_conflict(session));
+                    }
+                    // Syntax first: an OVERWRITE is refused on the
+                    // statement alone, before any table lookup, so
+                    // the refusal cannot be masked by a lookup
+                    // error on a table that does not exist.
+                    crate::hive_write::reject_overwrite(stmt)?;
+                    // Gate the target before any object lands (503):
+                    // the post-write index refresh repeats the check,
+                    // but by then the files are in the bucket.
+                    self.hive_ddl_handler
+                        .refuse_write_if_denied(session, &hive_ref, "INSERT")
+                        .await?;
+                    let (ctx, _) = self.write_session_context(session, memory).await?;
+                    let written = crate::hive_write::handle_insert(
+                        &ctx,
+                        stmt,
+                        &format!("{stmt}"),
+                        self.policy_enforcer.as_ref(),
+                        &session.user,
+                        &mut *policy_summary,
+                    )
+                    .await?;
+
+                    // Data first, then the index. The reverse order
+                    // makes the index promise files that do not
+                    // exist yet; this order can only leave data
+                    // that is intact and not yet visible, which
+                    // MSCK REPAIR TABLE recovers exactly.
+                    if let Err(e) = self
+                        .hive_ddl_handler
+                        .refresh_index_after_write(session, &hive_ref)
+                        .await
+                    {
+                        // Naming the recovery is the whole point. A
+                        // generic error here sends the user looking
+                        // for data that is sitting in the bucket.
+                        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
+                            "hive_external: the rows were WRITTEN but are not yet                                          visible: refreshing the partition index failed ({e}).                                          The data files are on storage and intact. Run                                          `MSCK REPAIR TABLE {hive_ref}` to make them visible."
+                        )));
+                    }
+                    // Drop the cached session context, the way
+                    // the Iceberg CTAS and INSERT arms do. Measured:
+                    // a SELECT before the write caches the table
+                    // provider, and the next SELECT on that same
+                    // context returns the PRE-write rows while a
+                    // fresh context returns the correct ones. The
+                    // index was already refreshed above; without
+                    // this the refresh is invisible, which is
+                    // indistinguishable from the refresh failing.
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
+                    return Ok(written);
+                }
+            }
+            let select_sql = ins
+                .source
+                .as_ref()
+                .map(|q| sqe_sql::rewrite_named_tvf_args(&format!("{q}")))
+                .ok_or_else(|| {
+                    SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        "INSERT without SELECT source",
+                    )
+                })?;
+            let (ctx, _) = self.write_session_context(session, memory).await?;
+            self.write_handler
+                .handle_insert_streaming(
+                    session,
+                    stmt,
+                    &ctx,
+                    &select_sql,
+                    &mut *captured_plan,
+                    &mut *policy_summary,
+                )
+                .await
+        } else {
+            Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                "Expected Insert statement",
+            ))
+        }
     }
 
     /// Plan and open a streaming SELECT without buffering the result.
