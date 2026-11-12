@@ -1,0 +1,5 @@
+**STATUS 2026-11-12: show statement family moved into `query_handler/show.rs` (`refactor/move-show-family`, stacked on `refactor/move-write-family`, openspec statement-path-restructure 3.7, second family).**
+
+Thirteen methods moved verbatim (line-range cut), eleven of them `pub(super)`; `show_create_view_body` and `iceberg_column_comments` stay private because only `show.rs` calls them. rustfmt on the new file re-wrapped lines and added braces/a `;`/dropped a `,`; with whitespace, `;`, `{}` and `,` stripped, the moved code hashes identical before and after. Gates: check-server, clippy -D warnings, budgets (ceiling 13,500 -> 12,500), `cargo test --lib query_handler` (109), `make test-integration FILTER=show` (11), `describe` (5), `information_schema` (4), `make test-access-control` 53 passed / 2 failed: the known `insert_does_not_confer_storage_relocation` (fixed by !1729) and its knock-on `show_schemas_describes_the_catalog_it_names`, which passes alone on a fresh stack.
+
+**NEXT:** time-travel family (`handle_time_travel` .. `apply_incremental_spec`, `TimeTravelCleanup`), then DDL and catalog attach/secrets; access control last, after !1729.
