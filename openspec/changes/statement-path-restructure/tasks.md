@@ -27,6 +27,7 @@
   - [x] `show` (SHOW CREATE, CATALOGS, SCHEMAS, COLUMNS, TABLES, VIEWS, FUNCTIONS, ROLES; `deny_hidden_table`): `query_handler/show.rs`, 897 lines
   - [x] `time_travel` (FOR SYSTEM_TIME / VERSION AS OF, FOR INCREMENTAL; `TimeTravelCleanup`): `query_handler/time_travel.rs`, 580 lines
   - [x] `catalog` (SHOW STATS, ANALYZE, ATTACH / DETACH, CREATE / DROP / SHOW SECRET): `query_handler/catalog.rs`, 402 lines
+  - [x] `ddl` (DROP, CREATE VIEW, COMMENT ON): `query_handler/ddl.rs`, 214 lines
 
 ## 4. Completion stage
 
