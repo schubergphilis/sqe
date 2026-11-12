@@ -103,7 +103,7 @@ RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},sharing=locked,target
 
 # Digest-pinned; Renovate bumps the runtime independently of builder tooling.
 # Keep this digest in lockstep with Dockerfile.bench.
-FROM cgr.dev/chainguard/glibc-dynamic@sha256:671a621016fb33812136dea6182b1db957996d3c8c618187aaf86abd9b14af53 AS runtime-base
+FROM cgr.dev/chainguard/glibc-dynamic@sha256:cb7aa4681bef604e99ad3fb6fb365330a3ca24fcee56df0b60b27ac4983409eb AS runtime-base
 
 USER 65532
 

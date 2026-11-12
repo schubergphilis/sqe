@@ -5,15 +5,8 @@
 # owner=<name>` tag that scripts/check-advisory-ignores.py enforces (also in
 # deny.toml and .cargo/audit.toml). Delete the entry when the runtime base
 # ships the fix (Renovate bumps the cgr.dev/chainguard/glibc-dynamic digest).
-ignore:
-  # CVE-2026-84243, glibc 2.44-r13, High. The latest glibc-dynamic digest
-  # (2026-11-06) carries 2.44-r13 and grype reports no fixed version, so no
-  # base can clear it yet; it blocked the v0.53.0 release image together with
-  # the Critical CVE-2026-91403 in ca-certificates-bundle, which this base
-  # fixes. sqe-server is the only process in the image and does not expose the
-  # affected glibc surface to untrusted input beyond what the TLS/HTTP stacks
-  # already parse. See docs/evidence/security/runtime-base-review-2026-11-06.md.
-  - vulnerability: CVE-2026-84243  # review-by 2026-11-20 owner=sqe-maintainers
-    package:
-      name: glibc-2.44
-      version: 2.44-r13
+#
+# No entries: CVE-2026-84243 (glibc 2.44) was accepted here until the
+# 2026-11-12 base shipped 2.44-r16. See
+# docs/evidence/security/runtime-base-review-2026-11-12.md.
+ignore: []
