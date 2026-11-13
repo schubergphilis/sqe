@@ -29,9 +29,14 @@ image:
 repo.sovereign-data.org/chameleon/sqlengine/sqe:<short-sha>
 ```
 
-There is **no `:latest`**. The old in-repo pipeline published one; the aikido
-mirror tags dev builds by short SHA only. Pin a `:<short-sha>` when you need an
-exact dev build, or `:stable` for the newest release.
+`:latest` is multi-arch (linux/amd64 and linux/arm64) and comes from `make
+latest` (`scripts/push-latest.sh`), not from CI. It cross-compiles HEAD of
+`main` for both architectures with cargo-zigbuild, packages each with
+`Dockerfile.ci`, and tags the manifest list `:latest` and `:<short-sha>` in
+both `chameleon/sqlengine/sqe` and `chameleon/sqe`. Release tags write
+`:vX.Y.Z` and `:stable` only, so a release no longer replaces the multi-arch
+`:latest` with an amd64 image. Pin a `:<short-sha>` when you need an exact dev
+build, or `:stable` for the newest release.
 
 The mirror job on the merge path is `allow_failure: true`, so a merge can land
 with no Harbor tag and a green pipeline. If a short SHA you expect is missing,
@@ -208,10 +213,14 @@ with that change, not before.
 
 ## Images are amd64 only
 
-The CI images (`:vX.Y.Z`, `:stable`, `:latest`, `:<short-sha>`) are built by
-kaniko for linux/amd64. `make push` builds amd64 and arm64 with `docker
-buildx` from a workstation. A CI multi-arch build (cross-compiling aarch64
-binaries and packaging `Dockerfile.ci` per platform) is being evaluated.
+The CI images (`:vX.Y.Z`, `:stable`, `:<short-sha>`) are built by kaniko for
+linux/amd64. `:latest` is the exception: `make latest` cross-compiles both
+architectures with cargo-zigbuild on a workstation (about 20 minutes per
+architecture cold) and pushes a manifest list. `make push` still builds both
+inside `docker buildx`, which compiles amd64 under QEMU on Apple silicon, and
+tags only the commit, never `:latest`. A CI
+multi-arch release build (the same cross-compile, then `Dockerfile.ci` per
+platform) is the next step.
 
 ## Binaries on the GitHub mirror
 

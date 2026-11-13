@@ -181,12 +181,12 @@ aikido-build-validate:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $SQE_FORCE_IMAGE_BUILD == "1"'
 
-# `:latest` on Harbor = the newest release. aikido-publish-release-image
-# mirrors only `:vX.Y.Z` + `:stable`, and only to chameleon/sqlengine/sqe
-# (deploy_mirror.py applies one AIKIDO_IMAGE_NAME to every registry), so this
-# adds `:latest` there and keeps chameleon/sqe (the `make push` repo) on the
-# same release. Fail-closed like the release mirror. amd64 only: the CI
-# image is single-arch; multi-arch still needs a local `make push`.
+# The release on Harbor's other names. aikido-publish-release-image mirrors only
+# `:vX.Y.Z` + `:stable`, and only to chameleon/sqlengine/sqe (deploy_mirror.py
+# applies one AIKIDO_IMAGE_NAME to every registry), so this keeps chameleon/sqe
+# (the `make push` repo) on the same release. Fail-closed like the release
+# mirror. `:latest` is not written here: the release image is amd64 only and
+# `:latest` is multi-arch, from `make latest` (scripts/push-latest.sh).
 sqe-publish-latest:
   interruptible: false
   stage: .post
@@ -199,7 +199,7 @@ sqe-publish-latest:
     - |
       set -eu
       SRC="docker://$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG"
-      for DEST in sqlengine/sqe:latest sqe:$CI_COMMIT_TAG sqe:stable sqe:latest; do
+      for DEST in sqe:$CI_COMMIT_TAG sqe:stable; do
         skopeo copy --src-creds "$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD" \
           --dest-creds "$REGISTRY_USERNAME:$REGISTRY_PASSWORD" \
           "$SRC" "docker://$HARBOR/$DEST"
