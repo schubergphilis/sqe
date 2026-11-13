@@ -51,7 +51,7 @@ PUSH_REGISTRY ?= repo.sovereign-data.org/chameleon
 REGISTRY_HOST := $(firstword $(subst /, ,$(PUSH_REGISTRY)))
 PUSH_SQE      := $(PUSH_REGISTRY)/sqe
 
-# Multi-arch push platforms, the mutable tag published alongside the SHA, and
+# Multi-arch push platforms, the mutable tag `make latest` writes, and
 # the dedicated buildx builder (the default `docker` driver can't emit manifest
 # lists, so `push` bootstraps this builder on demand).
 PLATFORMS      ?= linux/amd64,linux/arm64
@@ -103,7 +103,7 @@ BENCH_SPARK    ?= 1
 BENCH_ENGINES  ?=
 BENCH_STORAGE  ?= local
 
-.PHONY: help all all_trino docs-and-image check check-server dev dev-fast release rustbook ebook \
+.PHONY: help all all_trino docs-and-image check check-server dev dev-fast release rustbook ebook latest \
         ebook-pdf ebook-epub ebook-html bench bench-smoke \
         benchmark-charts test test-access-control test-access-control-spark \
         test-integration test-distributed test-integration-down \
@@ -177,7 +177,8 @@ help:
 	@echo "    make sqe-config   Stage $(CONFIG_SRC_DIR)/*/sqe.toml -> $(CONFIG_OUT_DIR)/"
 	@echo "    make images       build + sbom + sqe-config"
 	@echo "    make login        docker login to $(REGISTRY_HOST) (creds from ./.env or env)"
-	@echo "    make push         Multi-arch buildx build + push ($(PUSH_SQE):$(IMAGE_TAG) and :$(LATEST_TAG))"
+	@echo "    make push         Multi-arch buildx build + push ($(PUSH_SQE):$(IMAGE_TAG); :latest comes from make latest)"
+	@echo "    make latest       Cross-compile amd64 + arm64, push multi-arch :latest (DRY_RUN=1 to only build)"
 	@echo ""
 	@echo "  Combined:"
 	@echo "    make all          audit + test + image build + benchmark_all (hours, not minutes:"
@@ -538,10 +539,17 @@ buildx-builder:
 # NOT depend on the local build-sqe; depending on it would compile twice).
 push: push-sqe  ## Multi-arch build + push (run `make login` first)
 
+# Multi-arch `:latest` from HEAD on main, to chameleon/sqlengine/sqe and
+# chameleon/sqe. Cross-compiles both architectures natively with
+# cargo-zigbuild and packages them with Dockerfile.ci, so neither runs under
+# QEMU. Release tags no longer write `:latest`; this target does.
+latest:  ## Cross-build amd64 + arm64 and push a multi-arch :latest (make login first)
+	scripts/push-latest.sh
+
 push-sqe: buildx-builder
-	@echo "==> buildx push $(PUSH_SQE):$(IMAGE_TAG) + :$(LATEST_TAG) [$(PLATFORMS)]"
+	@echo "==> buildx push $(PUSH_SQE):$(IMAGE_TAG) [$(PLATFORMS)]"
 	$(DOCKER) buildx build $(SQE_BUILD_ARGS) --builder $(BUILDX_BUILDER) --platform $(PLATFORMS) \
-		-t $(PUSH_SQE):$(IMAGE_TAG) -t $(PUSH_SQE):$(LATEST_TAG) \
+		-t $(PUSH_SQE):$(IMAGE_TAG) \
 		-f $(SQE_DOCKERFILE) --push .
 
 # ── Docs: rust book (mdbook) ──────────────────────────────────────────────
