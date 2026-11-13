@@ -920,6 +920,47 @@ mod tests {
         assert!(err.to_string().contains("single SQL statement"), "{err}");
     }
 
+    /// #878 over #851: a lateral alias in a pipe `SELECT` or `EXTEND` step
+    /// plans through every entry point, as it does in a plain `SELECT`.
+    #[tokio::test]
+    async fn lateral_alias_in_a_pipe_step_plans() {
+        use datafusion::arrow::util::pretty::pretty_format_batches;
+        let ctx = SessionContext::new_with_config(crate::session_tuning::engine_session_config());
+        ctx.sql("CREATE TABLE t AS SELECT * FROM (VALUES (1), (2)) AS v(a)")
+            .await
+            .unwrap();
+        let expected = "+---+---+\n\
+                        | b | c |\n\
+                        +---+---+\n\
+                        | 2 | 4 |\n\
+                        | 3 | 6 |\n\
+                        +---+---+";
+        for sql in [
+            "SELECT * FROM t |> SELECT a + 1 AS b, b * 2 AS c |> ORDER BY b",
+            "SELECT * FROM t |> EXTEND a + 1 AS b, b * 2 AS c |> SELECT b, c |> ORDER BY b",
+        ] {
+            let rows = plan_sql(&ctx, sql).await.unwrap().collect().await.unwrap();
+            assert_eq!(
+                pretty_format_batches(&rows).unwrap().to_string(),
+                expected,
+                "{sql}"
+            );
+            let plan = create_logical_plan(&ctx.state(), sql).await.unwrap();
+            let rows = ctx
+                .execute_logical_plan(plan)
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                pretty_format_batches(&rows).unwrap().to_string(),
+                expected,
+                "{sql}"
+            );
+        }
+    }
+
     /// #839: the planned schema types the UNION by its first branch; the
     /// analyzed one matches what execution yields.
     #[tokio::test]

@@ -24,7 +24,7 @@
 //! resolves.
 use std::ops::ControlFlow;
 
-use sqlparser::ast::{Expr, Ident, Query, Select, SelectItem, SetExpr, VisitMut, VisitorMut};
+use sqlparser::ast::{Expr, Ident, PipeOperator, Query, SelectItem, SetExpr, VisitMut, VisitorMut};
 use sqlparser::parser::Parser;
 
 use crate::front_door::ExecutionDialect;
@@ -72,6 +72,13 @@ impl VisitorMut for SelectInliner<'_> {
 
     fn post_visit_query(&mut self, query: &mut Query) -> ControlFlow<()> {
         self.changed |= inline_in_set_expr(&mut query.body, self.name);
+        // Pipe steps (`|> SELECT`, `|> EXTEND`, #851) carry their own item
+        // lists; a later step reads an earlier step's alias without help.
+        for step in &mut query.pipe_operators {
+            if let PipeOperator::Select { exprs } | PipeOperator::Extend { exprs } = step {
+                self.changed |= inline_in_items(exprs, self.name);
+            }
+        }
         ControlFlow::Continue(())
     }
 }
@@ -79,7 +86,7 @@ impl VisitorMut for SelectInliner<'_> {
 /// A nested `SetExpr::Query` is its own query, visited on its own.
 fn inline_in_set_expr(body: &mut SetExpr, name: &str) -> bool {
     match body {
-        SetExpr::Select(select) => inline_in_select(select, name),
+        SetExpr::Select(select) => inline_in_items(&mut select.projection, name),
         SetExpr::SetOperation { left, right, .. } => {
             let left = inline_in_set_expr(left, name);
             inline_in_set_expr(right, name) | left
@@ -88,10 +95,11 @@ fn inline_in_set_expr(body: &mut SetExpr, name: &str) -> bool {
     }
 }
 
-fn inline_in_select(select: &mut Select, name: &str) -> bool {
+/// Rewrites one select list (a `SELECT`'s projection or a pipe step's items).
+fn inline_in_items(items: &mut [SelectItem], name: &str) -> bool {
     let mut definition: Option<Expr> = None;
     let mut changed = false;
-    for item in &mut select.projection {
+    for item in items {
         let (expr, alias) = match item {
             SelectItem::UnnamedExpr(expr) => (expr, None),
             SelectItem::ExprWithAlias { expr, alias } => (expr, Some(&*alias)),
@@ -242,6 +250,23 @@ mod tests {
         );
         // A quoted alias only matches its exact spelling.
         assert_eq!(inline("SELECT 1 AS \"S\", s AS u FROM t", "s"), None);
+    }
+
+    #[test]
+    fn pipe_select_and_extend_steps_are_rewritten() {
+        let sql = "FROM t |> SELECT a + 1 AS b, b * 2 AS c";
+        let out = inline(sql, "b").unwrap();
+        assert_eq!(out, "FROM t |> SELECT a + 1 AS b, (a + 1) * 2 AS c");
+
+        let sql = "FROM t |> EXTEND a + 1 AS b, b * 2 AS c";
+        let out = inline(sql, "b").unwrap();
+        assert_eq!(out, "FROM t |> EXTEND a + 1 AS b, (a + 1) * 2 AS c");
+
+        // A later step reads an earlier step's alias as a column already.
+        assert_eq!(
+            inline("FROM t |> SELECT a AS b |> SELECT b * 2 AS c", "b"),
+            None
+        );
     }
 
     #[test]
