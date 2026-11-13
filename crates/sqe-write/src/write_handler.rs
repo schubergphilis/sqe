@@ -2226,7 +2226,7 @@ impl WriteHandler {
         } else {
             self.format_version()
         };
-        let arrow_schema = Arc::new(timestamps_for_format_version(
+        let arrow_schema = Arc::new(write_schema_for_format_version(
             output_schema.as_arrow(),
             create_format_version,
         ));
@@ -8821,9 +8821,14 @@ pub fn schema_has_variant(schema: &IcebergSchema) -> bool {
 /// fail with "Unsupported Arrow data type: Timestamp(ms)". Nanosecond
 /// timestamps narrow to microseconds below v3: `timestamp_ns` /
 /// `timestamptz_ns` exist only from v3 (#773).
+///
+/// Iceberg has no unsigned integers either: `UInt64` (what `row_number`,
+/// `rank`, `dense_rank` and `ntile` return) maps to `long`. The sink casts
+/// with a checked cast (`apply_stamped_schema`), so a value above
+/// `i64::MAX` fails the write instead of wrapping (#888).
 // ponytail: top-level columns only; recurse into struct/list/map if a nested
-// non-µs timestamp ever reaches a CTAS.
-pub(crate) fn timestamps_for_format_version(
+// non-µs timestamp or unsigned integer ever reaches a CTAS.
+pub(crate) fn write_schema_for_format_version(
     arrow_schema: &ArrowSchema,
     format_version: FormatVersion,
 ) -> ArrowSchema {
@@ -8843,6 +8848,7 @@ pub(crate) fn timestamps_for_format_version(
                     .clone()
                     .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, tz.clone()))
             }
+            DataType::UInt64 => f.as_ref().clone().with_data_type(DataType::Int64),
             _ => f.as_ref().clone(),
         })
         .collect();
@@ -10798,7 +10804,7 @@ mod tests {
             Field::new("id", DataType::Int64, false),
         ]);
 
-        let v2 = timestamps_for_format_version(&ns, FormatVersion::V2);
+        let v2 = write_schema_for_format_version(&ns, FormatVersion::V2);
         assert_eq!(
             v2.field(0).data_type(),
             &DataType::Timestamp(TimeUnit::Microsecond, None)
@@ -10836,8 +10842,11 @@ mod tests {
         assert_eq!(us.value(0), 1_700_000_000_123_456);
 
         // V3 keeps nanoseconds.
-        let v3 = timestamps_for_format_version(&ns, FormatVersion::V3);
-        assert_eq!(v3.field(0).data_type(), &DataType::Timestamp(TimeUnit::Nanosecond, None));
+        let v3 = write_schema_for_format_version(&ns, FormatVersion::V3);
+        assert_eq!(
+            v3.field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
     }
 
     #[test]
@@ -10859,7 +10868,7 @@ mod tests {
         assert!(arrow_schema_to_iceberg(&coarse).is_err());
 
         for version in [FormatVersion::V2, FormatVersion::V3] {
-            let widened = timestamps_for_format_version(&coarse, version);
+            let widened = write_schema_for_format_version(&coarse, version);
             assert_eq!(
                 widened.field(0).data_type(),
                 &DataType::Timestamp(TimeUnit::Microsecond, None)
@@ -10904,6 +10913,41 @@ mod tests {
             assert_eq!(col(0), 1_700_000_000_000_000);
             assert_eq!(col(1), 1_700_000_000_123_000);
         }
+    }
+
+    #[test]
+    fn test_write_schema_maps_uint64_to_long_and_checks_overflow() {
+        // #888: row_number/rank/dense_rank/ntile are UInt64; Iceberg has none.
+        use arrow_array::{Int64Array, UInt64Array};
+        use arrow_schema::Field;
+        use iceberg::spec::{PrimitiveType, Type};
+
+        let unsigned = ArrowSchema::new(vec![Field::new("rn", DataType::UInt64, false)]);
+        assert!(arrow_schema_to_iceberg(&unsigned).is_err());
+        let mapped = write_schema_for_format_version(&unsigned, FormatVersion::V2);
+        assert_eq!(mapped.field(0).data_type(), &DataType::Int64);
+        let iceberg = arrow_schema_to_iceberg(&mapped).unwrap();
+        let fields = iceberg.as_struct().fields();
+        assert!(matches!(
+            *fields[0].field_type,
+            Type::Primitive(PrimitiveType::Long)
+        ));
+
+        let stamped = sqe_compaction::writer::build_stamped_schema(&iceberg).unwrap();
+        let batch = |v: u64| {
+            let col = Arc::new(UInt64Array::from(vec![v]));
+            RecordBatch::try_new(Arc::new(unsigned.clone()), vec![col]).unwrap()
+        };
+        let cast = sqe_compaction::writer::apply_stamped_schema(batch(42), &stamped).unwrap();
+        let col = cast
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(col.value(0), 42);
+        // Above i64::MAX the write fails; it never wraps or turns NULL.
+        let overflow = sqe_compaction::writer::apply_stamped_schema(batch(u64::MAX), &stamped);
+        assert!(overflow.is_err(), "u64::MAX must not fit a long column");
     }
 
     #[test]

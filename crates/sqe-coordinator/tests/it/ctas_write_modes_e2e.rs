@@ -911,3 +911,47 @@ async fn ctas_cast_filter_keeps_rows_a_lossy_cast_matches() {
 
     let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {t}")).await;
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// #888: ranking window functions return UInt64, which Iceberg has no type
+// for. CTAS failed with "UInt64 is not supported"; it now makes a bigint
+// column, and a value above i64::MAX fails the write instead of wrapping.
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ctas_ranking_functions_make_bigint_columns_888() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let t = "default.ctas_ranking_uint64";
+    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {t}")).await;
+    let ranked = "SELECT g, \
+         row_number() OVER (ORDER BY g) AS rn, rank() OVER (ORDER BY g) AS rk, \
+         dense_rank() OVER (ORDER BY g) AS dr, ntile(2) OVER (ORDER BY g) AS nt \
+         FROM (VALUES (1), (1), (2)) AS v(g)";
+    // CREATE, then CREATE OR REPLACE over the same schema (the in-place path).
+    for verb in ["CREATE TABLE", "CREATE OR REPLACE TABLE"] {
+        exec(&handler, &session, &format!("{verb} {t} AS {ranked}")).await;
+        let types = describe(&handler, &session, t).await;
+        for col in ["rn", "rk", "dr", "nt"] {
+            let want = format!("{col}|bigint");
+            assert!(types.contains(&want), "{verb}: {types:?}");
+        }
+        let sql = format!("SELECT SUM(rn * 1000 + rk * 100 + dr * 10 + nt) FROM {t}");
+        // rn 1,2,3; rk 1,1,3; dr 1,1,2; nt 1,1,2.
+        let want = 6000 + 500 + 40 + 4;
+        assert_eq!(scalar_i64(&handler, &session, &sql).await, want);
+    }
+
+    let too_big = format!(
+        "CREATE OR REPLACE TABLE {t} AS SELECT arrow_cast(18446744073709551615, 'UInt64') AS u"
+    );
+    let err = match handler.execute(&session, &too_big, None).await {
+        Ok(_) => panic!("u64::MAX must not fit a bigint column"),
+        Err(e) => e.to_string(),
+    };
+    let want = "Can't cast value 18446744073709551615";
+    assert!(err.contains(want), "{err}");
+    // The failed replace leaves the previous table in place.
+    let count = format!("SELECT COUNT(*) FROM {t}");
+    assert_eq!(scalar_i64(&handler, &session, &count).await, 3);
+    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {t}")).await;
+}

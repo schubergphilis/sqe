@@ -1167,3 +1167,42 @@ async fn ingest_and_insert_record_the_same_resource() {
 // `root`, which owns everything. A second principal with narrower grants needs
 // the Ranger stack (`make test-access-control`, `SQE_AC_E2E=1`), which is a
 // different docker stack and not part of this suite's group.
+
+/// #888: a create from a stream with an unsigned 64-bit column makes a
+/// `long` column instead of failing; Iceberg has no unsigned integers. A
+/// value above `i64::MAX` fails the ingest rather than wrapping.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ingest_create_maps_uint64_to_long() {
+    use arrow_array::UInt64Array;
+    let server = IngestServer::start().await;
+    let mut client = server.client().await;
+    let table = "flight_ingest_uint64_create";
+    drop_table(&mut client, table).await;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt64, true),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let unsigned = |id: u64, name: &str| {
+        let ids: ArrayRef = Arc::new(UInt64Array::from(vec![id]));
+        let names: ArrayRef = Arc::new(StringArray::from(vec![name]));
+        RecordBatch::try_new(schema.clone(), vec![ids, names]).expect("batch")
+    };
+    let cmd = ingest_command(
+        table,
+        TableNotExistOption::Create,
+        TableExistsOption::Append,
+        None,
+    );
+    let count = ingest(&mut client, cmd.clone(), vec![unsigned(7, "seven")])
+        .await
+        .expect("create from a UInt64 stream");
+    assert_eq!(count, 1);
+    assert_eq!(rows(&mut client, table).await, strings(&["7|seven"]));
+
+    let too_big = ingest(&mut client, cmd, vec![unsigned(u64::MAX, "max")]).await;
+    assert!(too_big.is_err(), "u64::MAX must not fit a long column");
+    assert_eq!(rows(&mut client, table).await, strings(&["7|seven"]));
+    drop_table(&mut client, table).await;
+}
