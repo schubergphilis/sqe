@@ -16,8 +16,8 @@
 //! 2. Parse with sqlparser. Only when that fails, run the source-level
 //!    fallbacks (`rewrite_paren_less_values`, `rewrite_bare_table`,
 //!    `rewrite_nested_row_cast`, `PARTITIONED BY` and the Spark CREATE TABLE
-//!    clause order, Spark `MERGE ... UPDATE SET *` / `INSERT *`) and parse
-//!    once more.
+//!    clause order, Spark `MERGE ... UPDATE SET *` / `INSERT *`, the
+//!    parentheses around an `INSERT` source query) and parse once more.
 //! 3. Run the AST rewriters on the single AST: `information_schema` catalog
 //!    qualification (when a session catalog is known), bare `FROM t` to
 //!    `SELECT * FROM t` ([`crate::from_first`]), the Trino-compat
@@ -272,6 +272,9 @@ impl SqlFrontDoor {
                 // Spark `MERGE ... UPDATE SET *` / `INSERT *`: the MERGE
                 // handler expands the marker against the target schema.
                 let rewritten = crate::rewrite_merge_star(&rewritten);
+                // `INSERT INTO t (WITH ... SELECT ...)`, as dbt's append
+                // strategy emits it (#889).
+                let rewritten = crate::rewrite_insert_paren_query(&rewritten);
                 if rewritten == sql {
                     return Err(parse_error(first_err));
                 }

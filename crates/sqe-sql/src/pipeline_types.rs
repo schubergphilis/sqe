@@ -89,5 +89,7 @@ pub fn pre_parse_pipeline(sql: &UserSql) -> sqe_core::Result<ClassifiableSql> {
     // mode is dropped here and read again from the AST by the CREATE VIEW
     // handler, which is the only caller that has somewhere to put it.
     let normalized = crate::view_compat::rewrite_view_compat(&normalized).sql;
+    // `INSERT INTO t (WITH ... SELECT ...)` (dbt append, #889). Parse-gated.
+    let normalized = crate::insert_paren_query::rewrite_insert_paren_query(&normalized);
     Ok(ClassifiableSql::from_normalized(normalized))
 }
