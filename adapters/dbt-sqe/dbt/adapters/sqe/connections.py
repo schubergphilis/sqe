@@ -37,6 +37,51 @@ def _agate_type(arrow_type: pyarrow.DataType) -> agate.DataType:
     return agate.Text()
 
 
+_INT_NAMES = {8: "TINYINT", 16: "SMALLINT", 32: "INTEGER", 64: "BIGINT"}
+
+
+def _sql_type_name(arrow_type: pyarrow.DataType) -> str:
+    """The SQE DDL type for an Arrow type, as `cursor.description` gives it.
+
+    dbt casts to and adds columns of these types (snapshots, model
+    contracts), so each name must be one SQE accepts back in DDL.
+    """
+    t = pyarrow.types
+    if t.is_boolean(arrow_type):
+        return "BOOLEAN"
+    if t.is_signed_integer(arrow_type):
+        return _INT_NAMES[arrow_type.bit_width]
+    if t.is_unsigned_integer(arrow_type):
+        # Iceberg has no unsigned types; SQE writes them as BIGINT (#888).
+        return "BIGINT"
+    if t.is_float16(arrow_type) or t.is_float32(arrow_type):
+        return "REAL"
+    if t.is_float64(arrow_type):
+        return "DOUBLE"
+    if t.is_decimal(arrow_type):
+        return f"DECIMAL({arrow_type.precision},{arrow_type.scale})"
+    if t.is_string(arrow_type) or t.is_large_string(arrow_type) or t.is_string_view(arrow_type):
+        return "VARCHAR"
+    if t.is_binary(arrow_type) or t.is_large_binary(arrow_type) or t.is_fixed_size_binary(arrow_type):
+        return "VARBINARY"
+    if t.is_date(arrow_type):
+        return "DATE"
+    if t.is_timestamp(arrow_type):
+        return "TIMESTAMP WITH TIME ZONE" if arrow_type.tz else "TIMESTAMP"
+    if t.is_time(arrow_type):
+        return "TIME"
+    # A snapshot reads the type of every source column, so nested and other
+    # types get a readable name instead of an error.
+    if t.is_list(arrow_type) or t.is_large_list(arrow_type) or t.is_fixed_size_list(arrow_type):
+        return f"ARRAY<{_sql_type_name(arrow_type.value_type)}>"
+    if t.is_map(arrow_type):
+        return f"MAP<{_sql_type_name(arrow_type.key_type)}, {_sql_type_name(arrow_type.item_type)}>"
+    if t.is_struct(arrow_type):
+        fields = ", ".join(f"{f.name}: {_sql_type_name(f.type)}" for f in arrow_type)
+        return f"STRUCT<{fields}>"
+    return str(arrow_type).upper()
+
+
 @dataclass
 class SQECredentials(Credentials):
     """Connection credentials for SQE.
@@ -92,8 +137,10 @@ _NO_RESULT_SQL = re.compile(
 # ExecuteQuery reports a failing statement only when its stream is read, and
 # closing an unread DML cursor cancels the write. dbt never fetches DML
 # (statement('main') has fetch_result=False), so these are read on execute.
+# TRUNCATE is one of them: dbt's seed re-run truncates through an unread
+# statement, and the truncate never landed, so every re-seed appended (#891).
 _DML_SQL = re.compile(
-    r"^(?:\s*(?:/\*.*?\*/|--[^\n]*))*\s*\(?\s*(?:insert|delete|update|merge)\b",
+    r"^(?:\s*(?:/\*.*?\*/|--[^\n]*))*\s*\(?\s*(?:insert|delete|update|merge|truncate)\b",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -269,6 +316,15 @@ class SQEConnectionManager(SQLConnectionManager):
         except Exception as e:
             msg = str(e)
             raise DbtDatabaseError(msg) from e
+
+    @classmethod
+    def data_type_code_to_name(cls, type_code) -> str:
+        """ADBC puts the column's Arrow type in `cursor.description`.
+
+        dbt-core's snapshot and contract macros read column types through it
+        (`get_column_schema_from_query`); without it every snapshot failed.
+        """
+        return _sql_type_name(type_code)
 
     @classmethod
     def get_response(cls, cursor) -> AdapterResponse:

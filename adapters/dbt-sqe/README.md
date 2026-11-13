@@ -87,6 +87,18 @@ Precedence when several are set: `token` > OAuth (`method: oauth` or `client_id`
 | `schema` | `default` | target schema |
 | `threads` | 1 | dbt parallelism |
 
+## Materializations and model configs
+
+- `table`, `view`, `incremental` (`append`, `delete+insert`, `merge`; `unique_key`
+  may be a list), `seed` and `snapshot` (`timestamp` and `check` strategies).
+- `table_properties` (alias `tblproperties`): Iceberg table properties, set on the
+  table's CREATE OR REPLACE. An incremental model takes new values on `--full-refresh`.
+
+```sql
+{{ config(materialized='table',
+          table_properties={'write.merge.mode': 'merge-on-read'}) }}
+```
+
 ## See also
 
 - Service-principal quickstart: `quickstart/polaris-ranger-service-principal/`

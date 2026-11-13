@@ -5,8 +5,15 @@
   {#- dbt takes one column name or a list of them. -#}
   {%- set unique_keys = [unique_key] if unique_key is string else unique_key -%}
 
-  {% if existing_relation is none %}
-    {# First run — create the table #}
+  {% if existing_relation is not none and existing_relation.type != 'table' %}
+    {# A view in the way is dropped, as in the table materialization. #}
+    {{ adapter.drop_relation(existing_relation) }}
+    {% set existing_relation = none %}
+  {% endif %}
+
+  {% if existing_relation is none or should_full_refresh() %}
+    {# First run, or --full-refresh / full_refresh: true: build the table
+       from the whole model. CREATE OR REPLACE swaps it in one commit. #}
     {% call statement('main') %}
       {{ sqe__create_table_as(False, this, compiled_code) }}
     {% endcall %}
@@ -27,7 +34,7 @@
       {% endif %}
       {% set tmp_relation = make_temp_relation(this) %}
       {% call statement('create_tmp') %}
-        {{ sqe__create_table_as(False, tmp_relation, compiled_code) }}
+        {{ sqe__create_table_as(True, tmp_relation, compiled_code) }}
       {% endcall %}
       {# DELETE and INSERT commit together: readers never see the deleted
          keys missing, and a failed INSERT rolls the DELETE back. The temp

@@ -60,11 +60,35 @@
 
 {# ── DDL generation ──────────────────────────────────────────────────── #}
 
+{# `temporary` marks a scratch table (the delete+insert staging table): it
+   takes no model properties, so a write mode meant for the target never
+   applies to it. #}
 {% macro sqe__create_table_as(temporary, relation, compiled_code) %}
   CREATE OR REPLACE TABLE {{ relation }}
+  {%- if not temporary %}{{ sqe__tblproperties_clause() }}{% endif %}
   AS (
     {{ compiled_code }}
   )
+{% endmacro %}
+
+{# The model's `table_properties` config (alias `tblproperties`, the
+   dbt-spark name) as Iceberg table properties, for example
+   {'write.merge.mode': 'merge-on-read'}. Applied when the table is created
+   or replaced: an incremental table takes new values on --full-refresh. #}
+{% macro sqe__tblproperties_clause() %}
+  {%- set props = config.get('table_properties') or config.get('tblproperties') -%}
+  {%- if props -%}
+    {%- if props is not mapping -%}
+      {{ exceptions.raise_compiler_error("table_properties must be a mapping of property name to value, got: " ~ props) }}
+    {%- endif %}
+  TBLPROPERTIES (
+    {%- for key, value in props.items() %}
+    {#- YAML `true` is a Python bool; Iceberg reads 'true', not 'True'. #}
+    {%- set value = (value | string | lower) if value is boolean else (value | string) %}
+    '{{ key | replace("'", "''") }}' = '{{ value | replace("'", "''") }}'{% if not loop.last %},{% endif %}
+    {%- endfor %}
+  )
+  {%- endif -%}
 {% endmacro %}
 
 {% macro sqe__create_view_as(relation, sql) %}
@@ -84,6 +108,12 @@
       DROP TABLE IF EXISTS {{ relation }}
     {% endif %}
   {% endcall %}
+{% endmacro %}
+
+{# A snapshot stages its changes in `<name>__dbt_tmp`, a real table here:
+   SQE has no temporary tables, so it is dropped after the MERGE (#891). #}
+{% macro sqe__post_snapshot(staging_relation) %}
+  {{ adapter.drop_relation(staging_relation) }}
 {% endmacro %}
 
 {% macro sqe__rename_relation(from_relation, to_relation) %}
