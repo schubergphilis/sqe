@@ -28,7 +28,7 @@ use std::borrow::Cow;
 use sqe_core::SqeError;
 use sqe_policy::write_predicates::WritePolicyPredicates;
 use sqlparser::ast::{
-    Assignment, MergeAction, MergeClause, MergeClauseKind, MergeInsertKind, ObjectName,
+    Assignment, Expr, Ident, MergeAction, MergeClause, MergeClauseKind, MergeInsertKind, ObjectName,
 };
 
 /// Name of the synthetic boolean column that marks rows surviving the MERGE.
@@ -257,9 +257,29 @@ fn star_columns<'n>(names: &'n MergeNames<'_>, form: &str) -> sqe_core::Result<V
     Ok(cols)
 }
 
+/// A NOT MATCHED clause has no target row, so a bare column in its
+/// predicate or INSERT VALUES is a source column (SQL:2016 MERGE, as in
+/// PostgreSQL and Spark). The rewrite joins target and source, where a bare
+/// name both sides carry is ambiguous, so it is qualified with the source
+/// scratch table first (#893). dbt's snapshot MERGE writes
+/// `insert (cols) values (cols)`.
+fn qualify_bare_source_columns(expr: &Expr, source_columns: &[String], source_ref: &str) -> Expr {
+    use std::ops::ControlFlow;
+    let mut expr = expr.clone();
+    let _ = sqlparser::ast::visit_expressions_mut(&mut expr, |e| {
+        if let Expr::Identifier(id) = e {
+            if source_columns.contains(&id.value) {
+                *e = Expr::CompoundIdentifier(vec![Ident::new(source_ref), id.clone()]);
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    expr
+}
+
 /// `UPDATE SET *` as explicit `col = <source alias>."col"` assignments.
 fn expand_update_star(names: &MergeNames<'_>) -> sqe_core::Result<Vec<Assignment>> {
-    use sqlparser::ast::{AssignmentTarget, Expr, Ident};
+    use sqlparser::ast::AssignmentTarget;
     Ok(star_columns(names, "UPDATE SET *")?
         .into_iter()
         .map(|col| Assignment {
@@ -400,10 +420,19 @@ pub(crate) fn classify_merge_clauses<'a>(
             }
             _ => {}
         }
-        let predicate = clause
-            .predicate
-            .as_ref()
-            .map(|p| rewrite_aliases(format!("{p}"), names));
+        let not_matched = matches!(
+            clause.clause_kind,
+            MergeClauseKind::NotMatched | MergeClauseKind::NotMatchedByTarget
+        );
+        let predicate = clause.predicate.as_ref().map(|p| {
+            let p = if not_matched {
+                let (cols, source) = (names.source_columns, names.source_ref);
+                Cow::Owned(qualify_bare_source_columns(p, cols, source))
+            } else {
+                Cow::Borrowed(p)
+            };
+            rewrite_aliases(format!("{p}"), names)
+        });
         // `UPDATE SET *` / `INSERT *`, left as a marker by the front door.
         let update_star = matches!(
             &clause.action,
@@ -970,7 +999,8 @@ pub(crate) fn resolve_insert_expr(
     target_table_ref: &str,
     omitted: &str,
 ) -> String {
-    let rewrite = |expr: String| -> String {
+    let rewrite = |expr: &Expr| -> String {
+        let expr = qualify_bare_source_columns(expr, source_columns, source_table_ref).to_string();
         let out = replace_alias_qualifier(&expr, s_alias, source_table_ref);
         replace_alias_qualifier(&out, t_alias, target_table_ref)
     };
@@ -982,7 +1012,7 @@ pub(crate) fn resolve_insert_expr(
                 if let Some(row) = values.rows.first() {
                     if let Some(idx) = source_columns.iter().position(|sc| sc == col) {
                         if idx < row.len() {
-                            return rewrite(format!("{}", row[idx]));
+                            return rewrite(&row[idx]);
                         }
                     }
                     return omitted.to_string();
@@ -1000,7 +1030,7 @@ pub(crate) fn resolve_insert_expr(
                 }) {
                     if let Some(row) = values.rows.first() {
                         if pos < row.len() {
-                            return rewrite(format!("{}", row[pos]));
+                            return rewrite(&row[pos]);
                         }
                     }
                 }
@@ -2466,6 +2496,38 @@ mod tests {
                 (Some(3), Some("keep".to_string())),
             ],
             "{select}"
+        );
+    }
+
+    /// #893: a NOT MATCHED clause has no target row, so bare names in its
+    /// predicate and VALUES are source columns, not ambiguous ones. dbt's
+    /// snapshot MERGE writes `insert (cols) values (cols)`.
+    #[tokio::test]
+    async fn not_matched_bare_columns_resolve_to_the_source() {
+        let ctx = SessionContext::new();
+        let target = id_v_batch(vec![Some(1)], vec![Some("a")]);
+        ctx.register_batch("__merge_target_x", target).unwrap();
+        ctx.register_batch(
+            "__merge_source_x",
+            id_v_batch(
+                vec![Some(1), Some(2), Some(3)],
+                vec![Some("x"), Some("ins"), Some("skip")],
+            ),
+        )
+        .unwrap();
+
+        let sql = "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+                   WHEN MATCHED THEN UPDATE SET v = s.v \
+                   WHEN NOT MATCHED AND v = 'ins' THEN INSERT (id, v) VALUES (id, upper(v))";
+        let out = build(sql, &["id", "v"], &["id", "v"]);
+        let rows = id_v_rows(&run_sql(&ctx, &out).await);
+        assert_eq!(
+            rows,
+            vec![
+                (Some(1), Some("x".to_string())),
+                (Some(2), Some("INS".to_string())),
+            ],
+            "{out}"
         );
     }
 
