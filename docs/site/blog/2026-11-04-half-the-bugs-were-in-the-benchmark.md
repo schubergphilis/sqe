@@ -112,3 +112,30 @@ A single run on an Apple M3 Pro laptop, with Trino 481 in Docker on the same mac
 Every result recorded on data generated before these changes measures a different dataset, and we do not compare against it. The next SF10 TPCx-BB run will be slower on q01. That is the data catching up with the spec, not the engine slowing down.
 
 Speed claims rest on correct answers, and correct answers rest on correct data. We now check the generated data against the spec DDL and the official row counts, every empty result against a canonical answer, and, with the next change, every value. The SSB and TPC-E generators still write money as `Float64`. They are next, followed by the SF10 rerun.
+
+## Update: the SF10 rerun
+
+Later the same day we ran four suites at SF10 against Trino, on data from the fixed generator. Same laptop, one run per suite. SQE runs as a native process. Trino 481 runs in Docker with a 10 GB container cap, because without a cap the Docker VM killed it earlier that day. Both read the same Iceberg tables in RustFS.
+
+| Suite | Matches Trino | SQE total | Trino total | Ratio |
+|---|---:|---:|---:|---:|
+| TPC-H, 22 queries | 22/22 | 53.1 s | 69.0 s | 1.3x |
+| SSB, 13 queries | 13/13 | 27.9 s | 11.8 s | 0.4x |
+| TPC-DS, 99 queries | 91/99 | 74.9 s | 131.6 s | 1.8x |
+| TPCx-BB, 10 queries | 9/10 | 147.5 s | 627.9 s | 4.3x |
+
+The ratio is Trino's total over SQE's. SQE is ahead on three suites and behind on SSB.
+
+SSB lost ground, and that is SQE's. In July, on a dedicated 8-core host, SSB at SF10 took 20.4 s on SQE and 21.4 s on Trino. On the laptop TPC-H got faster, from 66.5 s to 53.1 s, but SSB went from 20.4 s to 27.9 s. Nine of the ten queries in flights 2 to 4 take 1.7 to 4.8 s each, where Trino needs 0.6 to 2.2 s. The cause is not traced yet. SSB is the next trace.
+
+The value comparison found eight TPC-DS queries that do not match. Six are about decimal digits, not wrong rows:
+
+- q06, q35 and q44 use `avg` over a decimal. Trino keeps the input's scale and rounds. SQE returns more digits. In q06 and q44 that decides which rows sit on the boundary of a comparison or a rank, so one count differs by one and q44 returns 10 rows where Trino returns 14.
+- In q58 and q78 Trino's quotient carries fewer digits than SQE's: 10.512600 against 10.5126333.
+- In q61 it is the other way round. SQE stops at six digits, Trino carries more.
+
+Whether SQE should follow Trino's scale for `avg` is still open. The digits SQE returns are not wrong. They are not the digits Trino returns.
+
+The other two, q27 and q75, are new at SF10 and not explained yet. Both end in `ORDER BY ... LIMIT 100`. Before we call them ties at the limit, we check that each `ORDER BY` is a total order. TPCx-BB q02 returns no rows on both engines. At SF10 no item class has a return rate above the query's 10% threshold, the same kind of data problem as q64, and it goes to the generator next.
+
+Every number in this table comes from data that matches the spec, and every answer is compared value by value. The published SF10 numbers from July were measured on the old generator, and we do not compare against them except where the data did not change.

@@ -6,11 +6,11 @@
     },
     {
       "num": "8/8",
-      "label": "benchmark suites faster than Trino 481 at SF1 (Oct 2026)"
+      "label": "benchmark suites faster than Trino 481 at SF1 (Nov 2026)"
     },
     {
-      "num": "6/7",
-      "label": "suites faster at SF10 (Jul 2026)"
+      "num": "3/4",
+      "label": "suites faster at SF10 (Nov 2026)"
     },
     {
       "num": "43/43",

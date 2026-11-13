@@ -202,9 +202,11 @@ sources `.env` after the shell environment, so a value there wins.
 ## Output
 
 From a clean `MAX_BUSY_PCT=50 ./run.sh --check` at 10M rows on an Apple M3 Pro
-laptop (11 cores, 36 GB), captured in [`OUTPUT.md`](./OUTPUT.md) with the memory
-and wall-time tables. Each run starts only when the machine is under 50% busy.
-Every answer matches DuckDB's:
+laptop (11 cores, 36 GB). Each run starts only when the machine is under 50% busy.
+Every answer matches DuckDB's. [`OUTPUT.md`](./OUTPUT.md) and
+[`OUTPUT-s3.md`](./OUTPUT-s3.md) hold the latest full 150M-row runs (2026-11-04,
+with Spark), on local disk and on S3; the blog post
+`docs/site/blog/2026-11-02-150m-rows-under-a-4-5-gib-cap.md` discusses them. At 10M:
 
 | query | `sqe-parquet` | `sqe-iceberg` | `sqe-polaris` | `duckdb` | `polars` |
 |---|---:|---:|---:|---:|---:|

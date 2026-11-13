@@ -24,18 +24,18 @@ For the longitudinal view (every benchmark JSON in `benchmarks/results/` plotted
 
 ## Results (vs Trino 481)
 
-The numbers below compare SQE with Trino 481 on identical Iceberg tables and S3 storage. The SF1 columns are from the 2026-10-10 sweep. The SF10 columns are from the 2026-07-09 run, with both engines capped at 12 GB on a dedicated 8-core host; SF10 has not been re-run against Trino since. SQE is faster on all eight suites at SF1 and on six of seven at SF10, where SSB is at parity.
+The numbers below compare SQE with Trino 481 on identical Iceberg tables and S3 storage. The SF1 columns are from the 2026-11-02 sweep, with TPC-DS and TPC-BB rerun on 2026-11-04 on the fixed data generator. The November SF10 columns are from one run on 2026-11-04 on an Apple M3 Pro laptop, with SQE native and Trino in Docker capped at 10 GB. Suites marked "Jul" were last run at SF10 on 2026-07-09, with both engines capped at 12 GB on a dedicated 8-core host; TPC-BB's July data came from the old generator and is not comparable. SQE is faster on all eight suites at SF1 and on three of the four suites rerun at SF10. SSB trails.
 
-| Suite | SF1 SQE (Oct) | SF1 Trino (Oct) | SF1 speedup | SF10 SQE (Jul) | SF10 Trino (Jul) | SF10 speedup |
+| Suite | SF1 SQE | SF1 Trino | SF1 speedup | SF10 SQE | SF10 Trino | SF10 speedup |
 |---|---|---|---|---|---|---|
-| TPC-H (22) | 12.6s | 32.6s | 2.6x | 66.5s | 111.9s | 1.7x |
-| TPC-DS (99) | 34.2s | 95.9s | 2.8x | 216.6s | 320.5s | 1.5x |
-| SSB (13) | 3.2s | 5.5s | 1.7x | 20.4s | 21.4s | 1.0x |
-| ClickBench (43) | 1.7s | 4.8s | 2.8x | 10.0s | 31.6s | 3.2x |
-| TPC-E (11) | 0.7s | 4.8s | 7.2x | test-only | test-only | - |
-| TPC-BB (10) | 25.4s | 96.5s | 3.8x | 405.5s | 1429.7s | 3.5x |
-| Bank (8) | 12.0s | 37.7s | 3.1x | 370.5s | 85.5s | 0.23x |
-| TPC-C (8 read) | 1.1s | 5.3s | 4.9x | 5.0s | 18.0s | 3.6x |
+| TPC-H (22) | 8.8s | 19.9s | 2.3x | 53.1s (Nov) | 69.0s (Nov) | 1.3x |
+| TPC-DS (99) | 17.2s | 61.1s | 3.6x | 74.9s (Nov) | 131.6s (Nov) | 1.8x |
+| SSB (13) | 2.5s | 3.5s | 1.4x | 27.9s (Nov) | 11.8s (Nov) | 0.42x |
+| ClickBench (43) | 1.6s | 3.0s | 1.9x | 10.0s (Jul) | 31.6s (Jul) | 3.2x |
+| TPC-E (11) | 1.1s | 4.1s | 3.9x | test-only | test-only | - |
+| TPC-BB (10) | 12.8s | 60.2s | 4.7x | 147.5s (Nov) | 627.9s (Nov) | 4.3x |
+| Bank (8) | 2.7s | 4.5s | 1.7x | 370.5s (Jul) | 85.5s (Jul) | 0.23x |
+| TPC-C (8 read) | 0.8s | 2.3s | 3.0x | 5.0s (Jul) | 18.0s (Jul) | 3.6x |
 
 Run-to-run variance is real, so treat each figure as approximate. The full per-query timeline is on [getsqe.com/performance](https://getsqe.com/performance).
 
@@ -45,7 +45,9 @@ TPC-BB is lopsided. On the 2026-08-15 Flight SF1 run the suite is 63.1s and q01 
 
 - **Bank at SF10 (0.23x, 7/8, July run)**: spill stalled under an 8 GB memory pool. The October memory-pool and spill fixes have not been measured at SF10 yet.
 - **ClickBench at SF1 (41/43)**: the other two queries return no rows on either engine, so they count as vacuous, not as passes.
-- **TPC-DS at SF1 (98/99)**: q64 returns no rows on either engine since a data-generator change; it was 2 rows before.
+- **SSB at SF10 (0.42x, Nov run)**: at parity in July, now behind. Nine of the ten queries in flights 2 to 4 take 1.7 to 4.8 s on SQE against 0.6 to 2.2 s on Trino. Not traced yet.
+- **TPC-DS value differences (90/99 at SF1, 91/99 at SF10)**: since 2026-11-04 the comparison checks every value, not only row counts. Most differences are decimal digits: Trino keeps the input scale for `avg` over a decimal and carries fewer digits in some quotients (q06, q35, q44, q58, q78), and q61 goes the other way. q12, q20 and q98 at SF1 differed in the last digit because the comparator rounded twice; it no longer does, and they match at SF10. q27 and q75 at SF10 are not explained yet.
+- **TPC-BB q02 at SF10**: returns no rows on either engine, a data-generator problem (no item class reaches the query's return-rate threshold).
 - **TPC-E at SF10**: the differential check needs about 14 GB for a 10M-row result, so SF10 is validated test-only.
 
 ### How it is validated
