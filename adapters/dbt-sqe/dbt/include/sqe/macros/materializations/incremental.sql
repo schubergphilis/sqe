@@ -13,9 +13,12 @@
   {% else %}
     {# Incremental run #}
     {% if strategy == 'append' %}
+      {# No parentheses around the model: a model that starts with WITH
+         failed to parse as `INSERT INTO t (WITH ...)` before SQE #889,
+         and a model ending in a `--` comment would swallow a closing `)`. #}
       {% call statement('main') %}
         INSERT INTO {{ this }}
-        ({{ compiled_code }})
+        {{ compiled_code }}
       {% endcall %}
 
     {% elif strategy == 'delete+insert' %}

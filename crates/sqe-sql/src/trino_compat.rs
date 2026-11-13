@@ -333,11 +333,21 @@ pub fn alias_anonymous_select_columns(sql: &str) -> String {
 pub fn apply_anonymous_column_aliases(statements: &mut [Statement]) -> bool {
     let mut changed = false;
     for stmt in statements.iter_mut() {
-        if let Statement::Query(query) = stmt {
-            if let Some(select) = leftmost_select_mut(query.body.as_mut()) {
-                if alias_select_projection(select) {
-                    changed = true;
-                }
+        // An INSERT source is matched to the target by position, so naming
+        // its columns changes nothing but lets `SELECT 15, 15` plan: two
+        // unnamed `15`s collide ("Projections require unique expression
+        // names").
+        let query = match stmt {
+            Statement::Query(query) => query,
+            Statement::Insert(insert) => match insert.source.as_mut() {
+                Some(query) => query,
+                None => continue,
+            },
+            _ => continue,
+        };
+        if let Some(select) = leftmost_select_mut(query.body.as_mut()) {
+            if alias_select_projection(select) {
+                changed = true;
             }
         }
     }
@@ -2368,6 +2378,14 @@ mod tests {
     fn anonymous_expression_gets_col0() {
         let out = alias_anonymous_select_columns("SELECT 1 + 1");
         assert!(out.contains("AS _col0"), "expected _col0 alias: {out}");
+    }
+
+    #[test]
+    fn insert_source_columns_get_names_so_equal_literals_plan() {
+        let out = alias_anonymous_select_columns("INSERT INTO t (a, b) SELECT 15, 15");
+        assert!(out.contains("15 AS _col0, 15 AS _col1"), "{out}");
+        let values = "INSERT INTO t VALUES (1, 1)";
+        assert_eq!(alias_anonymous_select_columns(values), values);
     }
 
     #[test]
