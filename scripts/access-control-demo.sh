@@ -77,7 +77,7 @@ bootstrap() {
   # Build before inspecting the image. The local tag may legitimately still
   # point at the pre-Chainguard image, which is exactly what this bootstrap is
   # responsible for replacing.
-  dim "Building SQE; the first dependency build takes time, later source rebuilds reuse cargo-chef/sccache caches."
+  dim "Building SQE; the first dependency build takes time, later source rebuilds reuse the cargo-chef and BuildKit caches."
   docker compose build sqe || {
     red "sqe image build failed"
     exit 1

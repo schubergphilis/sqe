@@ -1,11 +1,25 @@
+# Only what the image builds read stays in the context: Cargo.toml, Cargo.lock,
+# crates/, vendor/, xtask/ (./Dockerfile) and out/ (Dockerfile.ci). BuildKit
+# sends just the COPYed paths anyway; kaniko and classic `docker build` walk
+# the whole context, so everything else is listed here.
 target/
+dist/
+sbom/
 .git/
+.claude/
 *.swp
 *.swo
 .DS_Store
+*.md
 docs/
 openspec/
+changelog.d/
 tests/
+testing/
 scripts/
-*.md
-.claude/
+benchmarks/
+quickstart/
+deploy/
+playground/
+adapters/
+docker-compose*.yml
