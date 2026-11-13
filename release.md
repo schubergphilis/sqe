@@ -192,6 +192,27 @@ never moved. `v*` is a protected tag now (create: Maintainers). If the Harbor
 mirror ever logs that skip line again, check Settings > Repository >
 Protected tags first, then retry the job; no rebuild is needed.
 
+## Release images are not signed yet
+
+`AIKIDO_SIGN` is `"0"`. With `"1"`, the aikido job `aikido-sign-image` runs
+`cosign sign` keyless: it asks the public Sigstore Fulcio for a certificate with
+the job's GitLab ID token. Fulcio does not trust this self-hosted GitLab as an
+identity issuer and answers HTTP 400 ("error processing the identity token").
+v0.54.0 was the first tag where the job ran, and it failed after the image and
+the Release were already published. No SQE image has a signature.
+
+Keyless signing against public Sigstore would also write the image reference
+to the public Rekor transparency log. The planned fix signs with a cosign key
+held in CI (or a KMS) and skips the public log; turn `AIKIDO_SIGN` back on
+with that change, not before.
+
+## Images are amd64 only
+
+The CI images (`:vX.Y.Z`, `:stable`, `:latest`, `:<short-sha>`) are built by
+kaniko for linux/amd64. `make push` builds amd64 and arm64 with `docker
+buildx` from a workstation. A CI multi-arch build (cross-compiling aarch64
+binaries and packaging `Dockerfile.ci` per platform) is being evaluated.
+
 ## Binaries on the GitHub mirror
 
 `github.com/schubergphilis/sqe` is a read-only push mirror of this repo and

@@ -90,7 +90,9 @@ variables:
   AIKIDO_RUST_MIN_STACK: "33554432"
   AIKIDO_CARGO_CLIPPY_JOB: "1"
   AIKIDO_DOCKER_TARGET: "runtime"
-  AIKIDO_SIGN: "1"
+  # Off until signing uses a key (release.md, "Release images are not signed
+  # yet"): keyless cosign against public Sigstore rejects this GitLab's ID token.
+  AIKIDO_SIGN: "0"
   AIKIDO_REPUTATION_MAX_AGE_DAYS: "7"
   AIKIDO_REPUTATION_MAX: "800"
 
