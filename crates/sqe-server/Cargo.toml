@@ -43,7 +43,7 @@ async-trait = { workspace = true }
 arrow-array = { workspace = true }
 arrow-flight = { workspace = true }
 axum = { workspace = true }
-axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
+axum-server = { version = "0.9", default-features = false, features = ["tls-rustls-no-provider"] }
 clap = { workspace = true }
 datafusion = { workspace = true }
 futures = { workspace = true }
