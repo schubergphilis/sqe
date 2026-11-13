@@ -4262,6 +4262,62 @@ mod tests {
         assert_eq!(rows(r), vec![vec!["x".to_string()]]);
     }
 
+    /// `DROP SCHEMA ... CASCADE` on an Iceberg catalog drops the schema's
+    /// tables and then the schema, as on a coordinator (#895); without
+    /// CASCADE a non-empty schema is refused and keeps its tables.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_schema_cascade_drops_the_tables() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().to_str().unwrap();
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
+        for sql in [
+            format!("ATTACH '{path}' AS ice (TYPE sqlite)"),
+            "CREATE SCHEMA ice.s1".to_string(),
+            "CREATE TABLE ice.s1.a (id BIGINT)".to_string(),
+            "CREATE TABLE ice.s1.b AS SELECT 1 AS id".to_string(),
+        ] {
+            client
+                .execute(&sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        let err = client
+            .execute("DROP SCHEMA ice.s1")
+            .await
+            .expect_err("a non-empty schema without CASCADE");
+        let r = client
+            .execute("SELECT b.id FROM ice.s1.b")
+            .await
+            .unwrap_or_else(|e| panic!("the table survives `{err}`: {e}"));
+        assert_eq!(r.rows, vec![vec!["1".to_string()]]);
+
+        client
+            .execute("DROP SCHEMA ice.s1 CASCADE")
+            .await
+            .expect("DROP SCHEMA CASCADE");
+        let r = client
+            .execute(
+                "SELECT count(*) FROM information_schema.schemata \
+                 WHERE catalog_name = 'ice' AND schema_name = 's1'",
+            )
+            .await
+            .expect("schemata");
+        assert_eq!(r.rows, vec![vec!["0".to_string()]], "the schema is gone");
+        client
+            .execute("SELECT 1 FROM ice.s1.a")
+            .await
+            .expect_err("the table is gone");
+        // The name is free again, and IF EXISTS on the missing schema is a no-op.
+        client
+            .execute("DROP SCHEMA IF EXISTS ice.s1 CASCADE")
+            .await
+            .expect("IF EXISTS");
+        client
+            .execute("CREATE SCHEMA ice.s1")
+            .await
+            .expect("re-create");
+    }
+
     /// `SHOW TABLES IN|FROM [catalog.]schema [LIKE ...]` was "SHOW TABLES IN
     /// not supported" in embedded mode.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

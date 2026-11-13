@@ -266,20 +266,15 @@ impl WritableIcebergCatalog {
         first_err.map_or(Ok(()), Err)
     }
 
-    /// `DROP SCHEMA [IF EXISTS] <name>` on this catalog, on the async path.
-    /// `CASCADE` is not implemented: the iceberg catalog refuses to drop a
-    /// non-empty namespace and SQE does not delete tables on its behalf.
+    /// `DROP SCHEMA [IF EXISTS] <name> [CASCADE]` on this catalog, on the
+    /// async path. `CASCADE` first drops the schema's views and tables, as
+    /// on a coordinator (#895); see [`Self::drop_namespace_contents`].
     pub async fn drop_namespace(
         &self,
         name: &str,
         if_exists: bool,
         cascade: bool,
     ) -> anyhow::Result<()> {
-        if cascade {
-            anyhow::bail!(
-                "DROP SCHEMA ... CASCADE is not implemented for embedded iceberg catalogs"
-            );
-        }
         if !self.schemas.contains_key(name) {
             if if_exists {
                 return Ok(());
@@ -287,6 +282,9 @@ impl WritableIcebergCatalog {
             anyhow::bail!("schema {name} does not exist");
         }
         let ns = NamespaceIdent::new(name.to_string());
+        if cascade {
+            self.drop_namespace_contents(&ns).await?;
+        }
         self.catalog
             .drop_namespace(&ns)
             .await
@@ -294,6 +292,77 @@ impl WritableIcebergCatalog {
         self.schemas.remove(name);
         if let Some(views) = self.views.get() {
             views.listed.remove(name);
+        }
+        Ok(())
+    }
+
+    /// The `CASCADE` part of `DROP SCHEMA`: every view (when the catalog has
+    /// views), then every table of `ns`. Everything is listed first, so a
+    /// schema with child schemas is refused untouched. A table drop never
+    /// purges data files. Not atomic: a failure part-way names what was
+    /// dropped and what is still there. An object already gone is skipped.
+    async fn drop_namespace_contents(&self, ns: &NamespaceIdent) -> anyhow::Result<()> {
+        let schema = ns.join(".");
+        let tables = self
+            .catalog
+            .list_tables(ns)
+            .await
+            .map_err(|e| anyhow::anyhow!("list tables of {schema}: {e}"))?;
+        let views = match self.views.get() {
+            Some(source) => match source.session_catalog.list_views(ns).await {
+                Ok(views) => views,
+                Err(e) if e.is_not_found() || server_has_no_views(&e) => Vec::new(),
+                Err(e) => anyhow::bail!("list views of {schema}: {e}"),
+            },
+            None => Vec::new(),
+        };
+        let children = self
+            .catalog
+            .list_namespaces(Some(ns))
+            .await
+            .map_err(|e| anyhow::anyhow!("list schemas in {schema}: {e}"))?;
+        if !children.is_empty() {
+            let names: Vec<String> = children.iter().map(|c| c.join(".")).collect();
+            anyhow::bail!(
+                "Cannot drop schema {schema} with CASCADE: it contains the schemas {}. \
+                 Drop them first. Nothing was dropped.",
+                names.join(", ")
+            );
+        }
+
+        // Views first: they hold no data, and a view over a table goes before it.
+        let objects: Vec<String> = views
+            .iter()
+            .map(|v| format!("view {schema}.{v}"))
+            .chain(tables.iter().map(|t| format!("table {schema}.{}", t.name)))
+            .collect();
+        let failed = |at: usize, e: String| {
+            let dropped = match &objects[..at] {
+                [] => "nothing".to_string(),
+                done => done.join(", "),
+            };
+            anyhow::anyhow!(
+                "DROP SCHEMA {schema} CASCADE failed on {}: {e}. A cascade is not atomic. \
+                 Dropped: {dropped}. Still there: {} and the schema itself.",
+                objects[at],
+                objects[at..].join(", ")
+            )
+        };
+        if let Some(source) = self.views.get() {
+            for (at, view) in views.iter().enumerate() {
+                match source.session_catalog.drop_view(ns, view).await {
+                    Ok(()) => {}
+                    Err(e) if e.is_not_found() => {}
+                    Err(e) => return Err(failed(at, e.to_string())),
+                }
+            }
+        }
+        for (i, table) in tables.iter().enumerate() {
+            match self.catalog.drop_table(table).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == iceberg::ErrorKind::TableNotFound => {}
+                Err(e) => return Err(failed(views.len() + i, e.to_string())),
+            }
         }
         Ok(())
     }
