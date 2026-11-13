@@ -2380,8 +2380,15 @@ impl QueryHandler {
                 }
                 StatementKind::DropSchema(stmt) => {
                     // Cross-user: the namespace disappears for everyone.
-                    self.catalog_ops.drop_schema(session, stmt).await?;
+                    // CASCADE drops tables and views too (#895), so cached
+                    // results over any of them go as well.
+                    let dropped = self.catalog_ops.drop_schema(session, stmt).await;
                     crate::session_context::invalidate_all_session_caches().await;
+                    if let Some(ref qcache) = self.query_cache {
+                        qcache.invalidate_all();
+                    }
+                    self.invalidate_results_read_through_views();
+                    dropped?;
                     Ok(vec![])
                 }
 
