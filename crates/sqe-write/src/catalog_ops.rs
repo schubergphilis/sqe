@@ -373,18 +373,21 @@ impl CatalogOps {
         }
     }
 
-    /// Drop a schema (namespace) via the Iceberg REST catalog.
+    /// Drop schemas (namespaces) via the Iceberg REST catalog.
     ///
-    /// Maps SQL `DROP SCHEMA` to Iceberg `drop_namespace`.
+    /// Maps SQL `DROP SCHEMA` to Iceberg `drop_namespace`, one per name, in
+    /// order (#895). With `CASCADE`, each schema's views and tables are
+    /// dropped first; see [`Self::drop_schema_contents`].
     #[instrument(skip(self, session, stmt), fields(username = %session.user.username))]
     pub async fn drop_schema(&self, session: &Session, stmt: &Statement) -> sqe_core::Result<()> {
-        let (names, if_exists) = match stmt {
+        let (names, if_exists, cascade) = match stmt {
             Statement::Drop {
                 names,
                 if_exists,
+                cascade,
                 object_type: ObjectType::Schema,
                 ..
-            } => (names, *if_exists),
+            } => (names, *if_exists, *cascade),
             other => {
                 return Err(SqeError::with_code(
                     SqeErrorCode::ExecutionFailed,
@@ -393,13 +396,26 @@ impl CatalogOps {
             }
         };
 
-        let schema_name_obj = names.first().ok_or_else(|| {
-            SqeError::with_code(
+        if names.is_empty() {
+            return Err(SqeError::with_code(
                 SqeErrorCode::ExecutionFailed,
                 "DROP SCHEMA requires at least one schema name".to_string(),
-            )
-        })?;
+            ));
+        }
+        for schema_name_obj in names {
+            self.drop_one_schema(session, schema_name_obj, if_exists, cascade)
+                .await?;
+        }
+        Ok(())
+    }
 
+    async fn drop_one_schema(
+        &self,
+        session: &Session,
+        schema_name_obj: &ObjectName,
+        if_exists: bool,
+        cascade: bool,
+    ) -> sqe_core::Result<()> {
         let target_catalog =
             schema_catalog_qualifier(schema_name_obj).or_else(|| session.default_catalog.clone());
         let namespace = namespace_without_catalog(schema_name_obj)?;
@@ -409,14 +425,34 @@ impl CatalogOps {
             namespace = ?namespace,
             target_catalog = ?target_catalog,
             if_exists = if_exists,
+            cascade = cascade,
             "Dropping schema"
         );
 
-        let catalog = self
-            .create_catalog_bridge(session, target_catalog.as_deref())
+        let session_catalog = self
+            .session_catalog_for(session, target_catalog.as_deref())
             .await?;
+        // Warm up the REST catalog, as `create_catalog_bridge` does.
+        let _ = session_catalog.list_namespaces().await;
 
-        match catalog.drop_namespace(&namespace).await {
+        if cascade {
+            let found = self
+                .drop_schema_contents(&session_catalog, &namespace)
+                .await?;
+            if !found {
+                if if_exists {
+                    info!(namespace = ?namespace, "Schema not found, IF EXISTS specified — ignoring");
+                    return Ok(());
+                }
+                return Err(SqeError::Catalog(format!(
+                    "Failed to drop schema: schema {} does not exist",
+                    namespace.join(".")
+                )));
+            }
+        }
+
+        let bridge = session_catalog.as_catalog();
+        match bridge.drop_namespace(&namespace).await {
             Ok(()) => Ok(()),
             Err(e) if if_exists && is_namespace_not_found(&e) => {
                 info!(
@@ -425,8 +461,102 @@ impl CatalogOps {
                 );
                 Ok(())
             }
+            Err(e) if !cascade && is_namespace_not_empty(&e) => Err(SqeError::Catalog(format!(
+                "Cannot drop schema {}: it is not empty. DROP SCHEMA ... CASCADE drops \
+                 its tables and views too. Underlying error: {e}",
+                namespace.join(".")
+            ))),
             Err(e) => Err(SqeError::Catalog(format!("Failed to drop schema: {e}"))),
         }
+    }
+
+    /// The `CASCADE` part of `DROP SCHEMA` (#895): drops every view, then
+    /// every table, in `namespace`. Returns `false` when the namespace does
+    /// not exist, with nothing dropped.
+    ///
+    /// Everything is listed before anything is dropped, so a schema that
+    /// holds child schemas is refused untouched. Each object is dropped with
+    /// the caller's own catalog session, so the catalog checks the drop
+    /// privilege per object, as for `DROP TABLE` / `DROP VIEW`. A table drop
+    /// never purges data files. The catalog has no multi-object drop, so the
+    /// cascade is not atomic: a failure part-way names what was dropped and
+    /// what remains. An object that is already gone (a concurrent drop) is
+    /// skipped.
+    async fn drop_schema_contents(
+        &self,
+        session_catalog: &Arc<SessionCatalog>,
+        namespace: &NamespaceIdent,
+    ) -> sqe_core::Result<bool> {
+        let schema = namespace.join(".");
+        let tables = match session_catalog.list_tables(namespace).await {
+            Ok(tables) => tables,
+            Err(e)
+                if e.is_not_found()
+                    || is_namespace_not_found_msg(&e.to_string().to_lowercase()) =>
+            {
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        };
+        // Views are a REST-catalog feature; other backends have none to drop.
+        let views = if session_catalog.is_rest_backend() {
+            session_catalog.list_views(namespace).await?
+        } else {
+            Vec::new()
+        };
+        let bridge = session_catalog.as_catalog();
+        let children = bridge
+            .list_namespaces(Some(namespace))
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to list schemas in {schema}: {e}")))?;
+        if !children.is_empty() {
+            let names: Vec<String> = children.iter().map(|ns| ns.join(".")).collect();
+            return Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!(
+                    "Cannot drop schema {schema} with CASCADE: it contains the schemas {}. \
+                     Drop them first. Nothing was dropped.",
+                    names.join(", ")
+                ),
+            ));
+        }
+
+        // Views first: they hold no data, and a view over a table goes before it.
+        let objects: Vec<String> = views
+            .iter()
+            .map(|v| format!("view {schema}.{v}"))
+            .chain(tables.iter().map(|t| format!("table {schema}.{}", t.name)))
+            .collect();
+        let failed = |at: usize, e: String| {
+            let dropped = match &objects[..at] {
+                [] => "nothing".to_string(),
+                done => done.join(", "),
+            };
+            SqeError::Catalog(format!(
+                "DROP SCHEMA {schema} CASCADE failed on {}: {e}. A cascade is not atomic. \
+                 Dropped: {dropped}. Still there: {} and the schema itself.",
+                objects[at],
+                objects[at..].join(", ")
+            ))
+        };
+
+        for (at, view) in views.iter().enumerate() {
+            match session_catalog.drop_view(namespace, view).await {
+                Ok(()) => {}
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(failed(at, e.to_string())),
+            }
+            info!(schema = %schema, view = %view, "DROP SCHEMA CASCADE: dropped view");
+        }
+        for (i, table) in tables.iter().enumerate() {
+            match bridge.drop_table(table).await {
+                Ok(()) => {}
+                Err(e) if is_table_not_found(&e) => {}
+                Err(e) => return Err(failed(views.len() + i, e.to_string())),
+            }
+            info!(schema = %schema, table = %table.name(), "DROP SCHEMA CASCADE: dropped table");
+        }
+        Ok(true)
     }
 
     /// Rename a table via the Iceberg REST catalog.
@@ -2728,6 +2858,13 @@ fn is_namespace_not_found_msg(msg: &str) -> bool {
         || msg.contains("under a namespace that does not exist")
         || msg.contains("schema not found")
         || msg.contains("schema does not exist")
+}
+
+/// Check if an iceberg error says a namespace still holds tables or views
+/// (Polaris answers 409 "Namespace ... is not empty"; SQLite "is not empty").
+fn is_namespace_not_empty(err: &iceberg::Error) -> bool {
+    let msg = err.to_string().to_lowercase();
+    msg.contains("not empty")
 }
 
 /// Check if an iceberg error indicates a namespace already exists.

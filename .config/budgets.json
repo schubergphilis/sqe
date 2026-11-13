@@ -225,7 +225,7 @@
       ]
     },
     "sqe-write": {
-      "lines": 28000,
+      "lines": 28100,
       "deps": [
         "sqe-catalog",
         "sqe-compaction",

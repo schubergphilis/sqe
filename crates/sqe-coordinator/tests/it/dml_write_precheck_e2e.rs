@@ -83,7 +83,7 @@ async fn polaris_token(client_id: &str, client_secret: &str) -> String {
 /// A fresh principal `name` that may read every table in the catalog, plus
 /// `extra` privileges; returns its token. Role creation answers 409 on a
 /// rerun, which is fine: the grants are idempotent.
-async fn principal_token(root: &str, name: &str, extra: &[&str]) -> String {
+pub(crate) async fn principal_token(root: &str, name: &str, extra: &[&str]) -> String {
     let principal_role = format!("{name}_role");
     let catalog_role = format!("{name}_cr");
     let http = reqwest::Client::new();
@@ -164,7 +164,7 @@ async fn principal_token(root: &str, name: &str, extra: &[&str]) -> String {
     .await
 }
 
-fn session_for(name: &str, token: String) -> Session {
+pub(crate) fn session_for(name: &str, token: String) -> Session {
     Session::new(
         name.to_string(),
         SecretString::new(token),
