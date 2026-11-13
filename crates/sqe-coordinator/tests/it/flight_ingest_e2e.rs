@@ -30,8 +30,10 @@ use arrow_flight::FlightDescriptor;
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
+use serde_json::Value;
 use sqe_coordinator::flight_sql::SqeFlightSqlService;
 use sqe_coordinator::session_manager::SessionManager;
+use sqe_metrics::audit::{verify_audit_bytes, AuditFormat, AuditLogger};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Channel, Server};
@@ -40,15 +42,46 @@ use tonic::transport::{Channel, Server};
 struct IngestServer {
     addr: std::net::SocketAddr,
     sessions: Arc<SessionManager>,
+    audit: Option<AuditFiles>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// The audit log an audited server writes, in `format = "both"`.
+struct AuditFiles {
+    logger: Arc<AuditLogger>,
+    native: std::path::PathBuf,
+    ocsf: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+}
+
 impl IngestServer {
     async fn start() -> Self {
+        Self::start_with(None).await
+    }
+
+    /// A server whose handler writes audit records to a fresh directory.
+    async fn start_audited() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let native = dir.path().join("audit.jsonl");
+        let logger = Arc::new(
+            AuditLogger::with_config(native.to_str().unwrap(), AuditFormat::Both)
+                .expect("audit logger opens"),
+        );
+        Self::start_with(Some(AuditFiles {
+            logger,
+            ocsf: dir.path().join("audit.ocsf.jsonl"),
+            native,
+            _dir: dir,
+        }))
+        .await
+    }
+
+    async fn start_with(audit: Option<AuditFiles>) -> Self {
         // `setup_handler` builds the handler the other tests use; the session
         // manager is attached afterwards, as `sqe-server` does.
-        let (_root, handler) = crate::common::setup_handler().await;
+        let logger = audit.as_ref().map(|a| Arc::clone(&a.logger));
+        let (_root, handler) = crate::common::setup_handler_with_audit(logger).await;
         let config =
             sqe_core::SqeConfig::load(&crate::common::test_config_path()).expect("test config");
         let authenticator = Arc::new(
@@ -77,9 +110,52 @@ impl IngestServer {
         Self {
             addr,
             sessions,
+            audit,
             shutdown: Some(tx),
             task: Some(task),
         }
+    }
+
+    /// Every record in the audit log (native, OCSF), the native chain
+    /// verified over the whole file.
+    fn audit_records(&self) -> (Vec<Value>, Vec<Value>) {
+        let files = self.audit.as_ref().expect("an audited server");
+        files.logger.flush();
+        let bytes = std::fs::read(&files.native).unwrap_or_default();
+        let native = json_lines(&bytes);
+        if !bytes.is_empty() {
+            let report = verify_audit_bytes(&bytes).expect("audit hash chain verifies");
+            assert_eq!(report.records, native.len() as u64);
+        }
+        let ocsf = json_lines(&std::fs::read(&files.ocsf).unwrap_or_default());
+        (native, ocsf)
+    }
+
+    /// How many records each file holds now; pass it to [`Self::one_record_since`].
+    fn audit_mark(&self) -> (usize, usize) {
+        let (native, ocsf) = self.audit_records();
+        (native.len(), ocsf.len())
+    }
+
+    /// Exactly one record in each file since `mark`, an ingest record whose
+    /// OCSF line is the chained native record; returns the native one. The
+    /// count is over the whole file, so a second record of any kind written
+    /// by the ingest is caught.
+    fn one_ingest_record_since(&self, mark: (usize, usize)) -> Value {
+        let (native, ocsf) = self.audit_records();
+        let new = &native[mark.0..];
+        let dump = serde_json::to_string_pretty(new).unwrap_or_default();
+        assert_eq!(new.len(), 1, "one native record for the ingest:\n{dump}");
+        assert_eq!(ocsf.len() - mark.1, 1, "one OCSF record for the ingest");
+        let r = new[0].clone();
+        assert_eq!(r["kind"], "query", "{r}");
+        assert_eq!(r["query"]["statement_type"], "ingest", "{r}");
+        assert!(r["integrity"]["seq"].is_u64(), "chained: {r}");
+        assert_eq!(
+            ocsf[mark.1]["metadata"]["uid"], r["integrity"]["hash"],
+            "the OCSF line is the chained native record"
+        );
+        r
     }
 
     /// A client on its own session (own token), authenticated as the test
@@ -99,6 +175,15 @@ impl IngestServer {
         client.set_token(session.id.clone());
         client
     }
+}
+
+fn json_lines(bytes: &[u8]) -> Vec<Value> {
+    std::str::from_utf8(bytes)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).expect("each line is JSON"))
+        .collect()
 }
 
 impl Drop for IngestServer {
@@ -822,6 +907,259 @@ async fn ingest_in_transaction_is_gone_after_rollback() {
         );
     }
     drop_table(&mut writer, table).await;
+}
+
+// -- Audit (#887) -------------------------------------------------------------
+//
+// A bulk ingest is a write and leaves one audit record, success or failure,
+// like the INSERT it stands for. The record names the target table, the
+// ingest mode and the row count, never the rows.
+
+/// A successful append writes one success record with the rows written.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ingest_append_writes_one_audit_record() {
+    let server = IngestServer::start_audited().await;
+    let mut client = server.client().await;
+    let table = "flight_ingest_audit_append";
+    fresh_table(&mut client, table).await;
+
+    let cmd = ingest_command(
+        table,
+        TableNotExistOption::Fail,
+        TableExistsOption::Append,
+        None,
+    );
+    let sent = batch(&[(1, "alpha"), (2, "beta"), (3, "gamma")]);
+    let mark = server.audit_mark();
+    ingest(&mut client, cmd, vec![sent]).await.expect("ingest");
+
+    let r = server.one_ingest_record_since(mark);
+    assert_eq!(r["status"], "success", "{r}");
+    assert_eq!(r["stats"]["rows_written"], 3, "{r}");
+    assert_eq!(r["resources"][0]["name"], table, "{r}");
+    assert_eq!(r["resources"][0]["namespace"][0], SCHEMA, "{r}");
+    let catalog = r["resources"][0]["catalog"].as_str().expect("a catalog");
+    assert_eq!(
+        r["query"]["text"],
+        format!(
+            "INSERT INTO {catalog}.{} /* flight sql ingest: if_not_exist=fail, if_exists=append */",
+            fq(table)
+        ),
+        "{r}"
+    );
+    assert!(
+        !r.to_string().contains("alpha"),
+        "the record never carries row values: {r}"
+    );
+    drop_table(&mut client, table).await;
+}
+
+/// Snapshot properties sent as ingest options are named in the record by
+/// key; their values stay out of the audit log.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ingest_with_snapshot_properties_writes_one_audit_record() {
+    let server = IngestServer::start_audited().await;
+    let mut client = server.client().await;
+    let table = "flight_ingest_audit_props";
+    fresh_table(&mut client, table).await;
+
+    let mut cmd = ingest_command(
+        table,
+        TableNotExistOption::Fail,
+        TableExistsOption::Append,
+        None,
+    );
+    cmd.options.insert(
+        "snapshot-property.pipeline-run".to_string(),
+        "run-value-887".to_string(),
+    );
+    let mark = server.audit_mark();
+    ingest(&mut client, cmd, vec![batch(&[(1, "alpha")])])
+        .await
+        .expect("ingest");
+
+    let r = server.one_ingest_record_since(mark);
+    assert_eq!(r["status"], "success", "{r}");
+    assert_eq!(r["stats"]["rows_written"], 1, "{r}");
+    assert_eq!(
+        r["stats"]["snapshot_property_keys"],
+        serde_json::json!(["pipeline-run"]),
+        "{r}"
+    );
+    assert!(
+        !r.to_string().contains("run-value-887"),
+        "property values stay out of the record: {r}"
+    );
+    drop_table(&mut client, table).await;
+}
+
+/// An ingest the server refuses (fail-if-exists on an existing table) writes
+/// one failure record and no row count.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ingest_fail_if_exists_writes_one_audit_record() {
+    let server = IngestServer::start_audited().await;
+    let mut client = server.client().await;
+    let table = "flight_ingest_audit_fail_exists";
+    fresh_table(&mut client, table).await;
+
+    let cmd = ingest_command(
+        table,
+        TableNotExistOption::Create,
+        TableExistsOption::Fail,
+        None,
+    );
+    let mark = server.audit_mark();
+    let result = ingest(&mut client, cmd, vec![batch(&[(1, "refused")])]).await;
+    assert_eq!(status_code(&result), Some(tonic::Code::AlreadyExists));
+
+    let r = server.one_ingest_record_since(mark);
+    assert_eq!(r["status"], "failure", "{r}");
+    assert_eq!(r["error_code"], "DUPLICATE_TABLE", "{r}");
+    assert!(r["stats"].get("rows_written").is_none(), "{r}");
+    assert_eq!(r["resources"][0]["name"], table, "{r}");
+    drop_table(&mut client, table).await;
+}
+
+/// A malformed snapshot property is refused before any write and still
+/// leaves one failure record.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ingest_bad_snapshot_property_writes_one_audit_record() {
+    let server = IngestServer::start_audited().await;
+    let mut client = server.client().await;
+    let table = "flight_ingest_audit_bad_prop";
+    fresh_table(&mut client, table).await;
+
+    let mut cmd = ingest_command(
+        table,
+        TableNotExistOption::Fail,
+        TableExistsOption::Append,
+        None,
+    );
+    cmd.options
+        .insert("snapshot-property.bad key".to_string(), "value".to_string());
+    let mark = server.audit_mark();
+    let result = ingest(&mut client, cmd, vec![batch(&[(1, "refused")])]).await;
+    assert_eq!(status_code(&result), Some(tonic::Code::InvalidArgument));
+
+    let r = server.one_ingest_record_since(mark);
+    assert_eq!(r["status"], "failure", "{r}");
+    assert_eq!(r["error_code"], "INVALID_ARGUMENTS", "{r}");
+    assert!(r["stats"].get("snapshot_property_keys").is_none(), "{r}");
+    assert_eq!(rows(&mut client, table).await, Vec::<String>::new());
+    drop_table(&mut client, table).await;
+}
+
+/// An ingest that creates its table writes one record (no separate DDL
+/// record) naming the new table and the rows written.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ingest_create_writes_one_audit_record() {
+    let server = IngestServer::start_audited().await;
+    let mut client = server.client().await;
+    let table = "flight_ingest_audit_create";
+    drop_table(&mut client, table).await;
+
+    let cmd = ingest_command(
+        table,
+        TableNotExistOption::Create,
+        TableExistsOption::Fail,
+        None,
+    );
+    let mark = server.audit_mark();
+    ingest(&mut client, cmd, vec![batch(&[(1, "alpha"), (2, "beta")])])
+        .await
+        .expect("ingest");
+
+    let r = server.one_ingest_record_since(mark);
+    assert_eq!(r["status"], "success", "{r}");
+    assert_eq!(r["stats"]["rows_written"], 2, "{r}");
+    assert_eq!(r["resources"][0]["name"], table, "{r}");
+    let text = r["query"]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("if_not_exist=create"), "{r}");
+    drop_table(&mut client, table).await;
+}
+
+/// A replace writes one record with the rows of the new snapshot.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ingest_replace_writes_one_audit_record() {
+    let server = IngestServer::start_audited().await;
+    let mut client = server.client().await;
+    let table = "flight_ingest_audit_replace";
+    fresh_table(&mut client, table).await;
+    let first = ingest_command(
+        table,
+        TableNotExistOption::Fail,
+        TableExistsOption::Append,
+        None,
+    );
+    ingest(&mut client, first, vec![batch(&[(1, "old"), (2, "old")])])
+        .await
+        .expect("seed");
+
+    let cmd = ingest_command(
+        table,
+        TableNotExistOption::Create,
+        TableExistsOption::Replace,
+        None,
+    );
+    let mark = server.audit_mark();
+    ingest(&mut client, cmd, vec![batch(&[(9, "new")])])
+        .await
+        .expect("replace");
+
+    let r = server.one_ingest_record_since(mark);
+    assert_eq!(r["status"], "success", "{r}");
+    assert_eq!(r["stats"]["rows_written"], 1, "{r}");
+    let text = r["query"]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("if_exists=replace"), "{r}");
+    drop_table(&mut client, table).await;
+}
+
+/// An ingest and an INSERT into the same table name the same resource,
+/// catalog included, so a search by table finds both.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ingest_and_insert_record_the_same_resource() {
+    let server = IngestServer::start_audited().await;
+    let mut client = server.client().await;
+    let table = "flight_ingest_audit_parity";
+    fresh_table(&mut client, table).await;
+
+    let mark = server.audit_mark();
+    let insert = format!("INSERT INTO {} VALUES (1, 'alpha')", fq(table));
+    client.execute_update(insert, None).await.expect("insert");
+    let (native, _) = server.audit_records();
+    let inserts: Vec<&Value> = native[mark.0..]
+        .iter()
+        .filter(|r| r["kind"] == "query")
+        .collect();
+    assert_eq!(inserts.len(), 1, "one INSERT record: {inserts:?}");
+    let insert_resource = inserts[0]["resources"][0].clone();
+
+    let cmd = ingest_command(
+        table,
+        TableNotExistOption::Fail,
+        TableExistsOption::Append,
+        None,
+    );
+    let mark = server.audit_mark();
+    ingest(&mut client, cmd, vec![batch(&[(2, "beta")])])
+        .await
+        .expect("ingest");
+    let r = server.one_ingest_record_since(mark);
+    for field in ["catalog", "namespace", "name", "object_type"] {
+        assert_eq!(
+            r["resources"][0][field], insert_resource[field],
+            "{field}: ingest {r} vs INSERT {insert_resource}"
+        );
+    }
+    assert!(r["resources"][0]["catalog"].is_string(), "{r}");
+    drop_table(&mut client, table).await;
 }
 
 // Policy case (ingest refused for a principal without write privilege on the

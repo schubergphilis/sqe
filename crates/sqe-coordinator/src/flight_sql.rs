@@ -62,6 +62,7 @@ use crate::worker_registry::WorkerRegistry;
 
 // Re-export helpers so callers that imported directly from this module
 // keep working without changes.
+use crate::flight_ingest::{request_refusal_error, IngestAuditGuard, IngestFailure};
 pub use crate::flight_sql_helpers::FetchResults;
 use crate::flight_sql_helpers::{sqe_error_to_status, FlightStream};
 
@@ -880,6 +881,24 @@ impl SqeFlightSqlService {
         Ok((statement_id, statement))
     }
 
+    /// Record a refusal of `sql` that happened before the query handler ran
+    /// it (a bad parameter bind, a missing bind, an unusable transaction
+    /// handle) as one failed statement, and hand the status back unchanged.
+    fn audit_request_refusal(
+        &self,
+        session: &sqe_core::Session,
+        sql: &str,
+        start: std::time::Instant,
+        client_ip: Option<String>,
+        query_id: Option<uuid::Uuid>,
+        status: Status,
+    ) -> Status {
+        let error = request_refusal_error(&status);
+        self.query_handler
+            .audit_failure(session, sql, start, client_ip, query_id, error);
+        status
+    }
+
     /// Decode an inbound parameter stream and bind it to `statement`.
     ///
     /// Finding 406: values are bound as typed Arrow scalars and checked
@@ -1274,10 +1293,18 @@ impl SqeFlightSqlService {
         // Issue #403: Flight SQL classifies (parses) before query_handler,
         // so the size cap must fire here or a huge statement still burns
         // the parser. execute/execute_stream re-check for the other paths.
-        self.config
-            .query
-            .check_sql_bytes(sql)
-            .map_err(|e| sqe_error_to_status(&e, None))?;
+        // Rejected before the query handler: audited unparsed (#882).
+        self.config.query.check_sql_bytes(sql).map_err(|e| {
+            let e = self.query_handler.audit_failure(
+                session,
+                sql,
+                std::time::Instant::now(),
+                client_ip.clone(),
+                query_id,
+                e,
+            );
+            sqe_error_to_status(&e, None)
+        })?;
 
         // Classify through the pre-parse pipeline (strips FOR INCREMENTAL /
         // VERSION AS OF, rewrites Hive `PARTITIONED BY` -> sqlparser `PARTITION
@@ -1556,10 +1583,23 @@ impl SqeFlightSqlService {
     ) -> Result<Response<FlightStream>, Status> {
         // A stored plan whose tables' vended keys are due for refresh is not
         // run: the path below re-plans, which reloads the tables.
+        // A refusal here is the statement's only record (#882).
+        let start = std::time::Instant::now();
+        let refusal_ip = client_ip.clone();
+        let refused = move |status: Status| {
+            self.audit_request_refusal(
+                session,
+                &statement.sql,
+                start,
+                refusal_ip.clone(),
+                query_id,
+                status,
+            )
+        };
         if statement.plan.is_some() && !statement.stored_plan_credentials_expired() {
             let plan = statement
                 .bound_plan()
-                .map_err(Status::failed_precondition)?;
+                .map_err(|e| refused(Status::failed_precondition(e)))?;
             let (schema, stream) = self
                 .query_handler
                 .execute_plan_stream_with_id(
@@ -1573,7 +1613,7 @@ impl SqeFlightSqlService {
                 .map_err(|e| sqe_error_to_status(&e, None))?;
             return self.stream_to_flight_response(schema, stream);
         }
-        match required_bind(statement)? {
+        match required_bind(statement).map_err(&refused)? {
             Some(params) => {
                 let run = self.run_sql_into_flight_response(
                     session,
@@ -1614,6 +1654,135 @@ impl SqeFlightSqlService {
                     .with_total_records(-1)
                     .with_ordered(false)
             })
+    }
+
+    /// The body of `do_put_statement_ingest` after authentication. Fills
+    /// `audit` as the request is read; the caller writes the one audit
+    /// record from it and the result (#887).
+    ///
+    /// A non-generic method returning a boxed future, like
+    /// [`Self::ingest_flight_stream`], so the `Send` proof over the ingest
+    /// is made once here and not inside the `async_trait` method.
+    fn statement_ingest<'a>(
+        &'a self,
+        session: Arc<sqe_core::Session>,
+        ticket: CommandStatementIngest,
+        request: Request<PeekableFlightDataStream>,
+        audit: &'a mut crate::audit_emitter::IngestAudit,
+    ) -> futures::future::BoxFuture<'a, Result<usize, IngestFailure>> {
+        Box::pin(self.statement_ingest_inner(session, ticket, request, audit))
+    }
+
+    async fn statement_ingest_inner(
+        &self,
+        session: Arc<sqe_core::Session>,
+        ticket: CommandStatementIngest,
+        request: Request<PeekableFlightDataStream>,
+        audit: &mut crate::audit_emitter::IngestAudit,
+    ) -> Result<usize, IngestFailure> {
+        // Inside a transaction (BEGIN, or the request's id) the ingest writes
+        // to the transaction's branch like an INSERT does (#824). The ADBC
+        // Flight SQL driver (1.13, upstream main 2026-11-12) never sets
+        // `transaction_id` on an ingest, so `adbc_ingest` on a connection
+        // without autocommit arrives with none and commits to main at once.
+        // Refusing an id-less ingest would break it on every default DB-API
+        // connection, so the server cannot do better than join an id it gets.
+        let session = in_request_transaction(session, ticket.transaction_id.as_deref())?;
+        if session.transaction_id.is_some() && session.write_branch.is_some() {
+            return Err(Status::failed_precondition(
+                "Transactions publish to main; RESET WRITE_BRANCH before \
+                 writing inside a transaction",
+            )
+            .into());
+        }
+        let txn = self.query_handler.transaction_scope(&session)?;
+        // The transaction's snapshot properties inside one, the session's
+        // outside (the session's never apply inside a transaction), with the
+        // request's `snapshot-property.<key>` options over them. Resolved
+        // before the upload is read, so a refused option writes no file.
+        let base_properties = match &txn {
+            Some(txn) => txn.snapshot_properties(),
+            None => session.snapshot_properties.clone(),
+        };
+        let snapshot_properties =
+            crate::flight_ingest::ingest_snapshot_properties(&ticket.options, base_properties)?;
+        audit.snapshot_property_keys = snapshot_properties
+            .as_deref()
+            .map(|p| p.iter().map(|(k, _)| k.to_string()).collect())
+            .unwrap_or_default();
+
+        // Build qualified table name from catalog + schema + table
+        let mut qualified = String::new();
+        if let Some(ref cat) = ticket.catalog {
+            qualified.push_str(cat);
+            qualified.push('.');
+        }
+        if let Some(ref schema) = ticket.schema {
+            qualified.push_str(schema);
+            qualified.push('.');
+        }
+        qualified.push_str(&ticket.table);
+
+        debug!(
+            username = %session.user.username,
+            table = %qualified,
+            "DoPut statement ingest"
+        );
+
+        // Decode the Arrow stream into RecordBatches. Feed the decoded stream
+        // straight into the streaming write sink instead of `try_collect`-ing
+        // the whole upload into a Vec: an arbitrarily large client upload no
+        // longer buffers unbounded on the coordinator (write-path memory safety).
+        let stream = request.into_inner();
+        let flight_stream = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
+            stream.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))),
+        );
+
+        // The post-commit cache invalidation is the handler's, not this arm's
+        // (`WriteHandler::after_commit`, architecture review 507). This path
+        // never passes through `QueryHandler::execute`, which is where the
+        // invalidation used to live for every other write, so an ADBC client
+        // that bulk-loaded here and then counted rows on the same connection
+        // read the pre-ingest snapshot until the cache TTL expired. Keep the
+        // ingest going through a `WriteHandler` entry point for that reason.
+        // Outside a transaction the ingest writes to the session's
+        // WRITE_BRANCH like an INSERT does (#829).
+        //
+        // The ingest passes the same admission as an INSERT and its buffers
+        // count against `query.max_query_memory` (#788). `admission` holds
+        // the permits and the per-user reservation until the commit.
+        let admission = self.query_handler.admit_ingest(&session, &qualified)?;
+        // What to do with a missing or an existing table (#881). The stream's
+        // schema is read only when a missing table would be created from it.
+        let mode = crate::flight_ingest::ingest_mode(ticket.table_definition_options.as_ref())?;
+        audit.mode = Some(crate::flight_ingest::ingest_mode_label(mode));
+        let upload = crate::flight_ingest::peek_upload_schema(
+            flight_stream,
+            mode.on_missing == sqe_write::write_handler::OnMissing::Create,
+        )
+        .await?;
+        let rows = self
+            .ingest_flight_stream(
+                &session,
+                &qualified,
+                crate::flight_ingest::IngestScope {
+                    txn,
+                    snapshot_properties,
+                },
+                Some(admission.memory.pool()),
+                mode,
+                upload,
+            )
+            .await?;
+        // `after_commit` drops the session and table-metadata caches; the
+        // result cache lives on the QueryHandler, so a SELECT of the same
+        // text kept serving pre-ingest rows until its TTL (#746). Same call
+        // the SQL INSERT arm makes.
+        if let Some(cache) = self.query_handler.query_cache() {
+            cache.invalidate(&qualified);
+        }
+
+        Ok(rows)
     }
 }
 
@@ -2677,110 +2846,39 @@ impl FlightSqlService for SqeFlightSqlService {
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
         let session = self.get_session_from_request(&request).await?;
-        // Inside a transaction (BEGIN, or the request's id) the ingest writes
-        // to the transaction's branch like an INSERT does (#824). The ADBC
-        // Flight SQL driver (1.13, upstream main 2026-11-12) never sets
-        // `transaction_id` on an ingest, so `adbc_ingest` on a connection
-        // without autocommit arrives with none and commits to main at once.
-        // Refusing an id-less ingest would break it on every default DB-API
-        // connection, so the server cannot do better than join an id it gets.
-        let session = in_request_transaction(session, ticket.transaction_id.as_deref())?;
-        if session.transaction_id.is_some() && session.write_branch.is_some() {
-            return Err(Status::failed_precondition(
-                "Transactions publish to main; RESET WRITE_BRANCH before \
-                 writing inside a transaction",
-            ));
-        }
-        let txn = self
-            .query_handler
-            .transaction_scope(&session)
-            .map_err(|e| sqe_error_to_status(&e, None))?;
-        // The transaction's snapshot properties inside one, the session's
-        // outside (the session's never apply inside a transaction), with the
-        // request's `snapshot-property.<key>` options over them. Resolved
-        // before the upload is read, so a refused option writes no file.
-        let base_properties = match &txn {
-            Some(txn) => txn.snapshot_properties(),
-            None => session.snapshot_properties.clone(),
-        };
-        let snapshot_properties =
-            crate::flight_ingest::ingest_snapshot_properties(&ticket.options, base_properties)?;
-
-        // Build qualified table name from catalog + schema + table
-        let mut qualified = String::new();
-        if let Some(ref cat) = ticket.catalog {
-            qualified.push_str(cat);
-            qualified.push('.');
-        }
-        if let Some(ref schema) = ticket.schema {
-            qualified.push_str(schema);
-            qualified.push('.');
-        }
-        qualified.push_str(&ticket.table);
-
-        debug!(
-            username = %session.user.username,
-            table = %qualified,
-            "DoPut statement ingest"
-        );
-
-        // Decode the Arrow stream into RecordBatches. Feed the decoded stream
-        // straight into the streaming write sink instead of `try_collect`-ing
-        // the whole upload into a Vec: an arbitrarily large client upload no
-        // longer buffers unbounded on the coordinator (write-path memory safety).
-        let stream = request.into_inner();
-        let flight_stream = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
-            stream.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))),
-        );
-
-        // The post-commit cache invalidation is the handler's, not this arm's
-        // (`WriteHandler::after_commit`, architecture review 507). This path
-        // never passes through `QueryHandler::execute`, which is where the
-        // invalidation used to live for every other write, so an ADBC client
-        // that bulk-loaded here and then counted rows on the same connection
-        // read the pre-ingest snapshot until the cache TTL expired. Keep the
-        // ingest going through a `WriteHandler` entry point for that reason.
-        // Outside a transaction the ingest writes to the session's
-        // WRITE_BRANCH like an INSERT does (#829).
-        //
-        // The ingest passes the same admission as an INSERT and its buffers
-        // count against `query.max_query_memory` (#788). `admission` holds
-        // the permits and the per-user reservation until the commit.
-        let admission = self
-            .query_handler
-            .admit_ingest(&session, &qualified)
-            .map_err(|e| sqe_error_to_status(&e, None))?;
-        // What to do with a missing or an existing table (#881). The stream's
-        // schema is read only when a missing table would be created from it.
-        let mode = crate::flight_ingest::ingest_mode(ticket.table_definition_options.as_ref())?;
-        let upload = crate::flight_ingest::peek_upload_schema(
-            flight_stream,
-            mode.on_missing == sqe_write::write_handler::OnMissing::Create,
-        )
-        .await?;
-        let rows = self
-            .ingest_flight_stream(
-                &session,
-                &qualified,
-                crate::flight_ingest::IngestScope {
-                    txn,
-                    snapshot_properties,
+        // Every authenticated ingest leaves one audit record, success or
+        // failure, like an INSERT (#887). The authentication refusal above
+        // has its own record.
+        // The catalog defaults the way a statement's does, so an ingest and
+        // an INSERT into the same table name the same resource.
+        let catalog = ticket
+            .catalog
+            .clone()
+            .or_else(|| session.default_catalog.clone())
+            .unwrap_or_else(|| self.config.resolve_default_catalog());
+        let mut guard = IngestAuditGuard {
+            logger: self.audit.clone(),
+            session: Arc::clone(&session),
+            audit: crate::audit_emitter::IngestAudit {
+                table: sqe_metrics::audit::Resource {
+                    catalog: Some(catalog),
+                    namespace: ticket.schema.iter().cloned().collect(),
+                    name: ticket.table.clone(),
+                    object_type: sqe_metrics::audit::ObjectType::Table,
                 },
-                Some(admission.memory.pool()),
-                mode,
-                upload,
-            )
-            .await
-            .map_err(|e| sqe_error_to_status(&e, None))?;
-        // `after_commit` drops the session and table-metadata caches; the
-        // result cache lives on the QueryHandler, so a SELECT of the same
-        // text kept serving pre-ingest rows until its TTL (#746). Same call
-        // the SQL INSERT arm makes.
-        if let Some(cache) = self.query_handler.query_cache() {
-            cache.invalidate(&qualified);
-        }
-
-        Ok(rows as i64)
+                mode: None,
+                snapshot_property_keys: Vec::new(),
+            },
+            start: std::time::Instant::now(),
+            client_ip: Some(self.extract_client_ip(&request)),
+        };
+        let result = self
+            .statement_ingest(session, ticket, request, &mut guard.audit)
+            .await;
+        guard.finish(&result);
+        result
+            .map(|rows| rows as i64)
+            .map_err(IngestFailure::into_status)
     }
 
     async fn do_put_substrait_plan(
@@ -2831,10 +2929,28 @@ impl FlightSqlService for SqeFlightSqlService {
         let (_, statement) = self
             .prepared_from_handle(&session, &query.prepared_statement_handle)
             .await?;
+        // Past the handle lookup the statement is known: a refusal before the
+        // query handler runs it is its only record (#882).
+        let start = std::time::Instant::now();
+        let refused = |status: Status| {
+            self.audit_request_refusal(
+                &session,
+                &statement.sql,
+                start,
+                client_ip.clone(),
+                None,
+                status,
+            )
+        };
         self.bind_prepared_from_stream(&statement, request.into_inner())
-            .await?;
-        let session = in_request_transaction(session, statement.transaction_handle())?;
-        let batches = match required_bind(&statement)? {
+            .await
+            .map_err(refused)?;
+        let txn_session =
+            in_request_transaction(Arc::clone(&session), statement.transaction_handle())
+                .map_err(refused)?;
+        let params = required_bind(&statement).map_err(refused)?;
+        let session = txn_session;
+        let batches = match params {
             Some(params) => {
                 self.query_handler
                     .execute_bound_with_id(

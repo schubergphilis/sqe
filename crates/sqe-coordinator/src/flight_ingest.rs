@@ -18,6 +18,123 @@ use sqe_core::snapshot_properties::SnapshotProperties;
 use sqe_write::write_handler::{IngestMode, OnExisting, OnMissing};
 use tonic::Status;
 
+/// The mode as the ingest's audit record names it, in the wire option names:
+/// `if_not_exist=create, if_exists=append` (#887).
+pub(crate) fn ingest_mode_label(mode: IngestMode) -> String {
+    let on_missing = match mode.on_missing {
+        OnMissing::Fail => "fail",
+        OnMissing::Create => "create",
+    };
+    let on_existing = match mode.on_existing {
+        OnExisting::Append => "append",
+        OnExisting::Fail => "fail",
+        OnExisting::Replace => "replace",
+    };
+    format!("if_not_exist={on_missing}, if_exists={on_existing}")
+}
+
+/// Holds an ingest's audit record until it is written (#887). `finish`
+/// writes it with the verdict; dropped without one, it writes a cancelled
+/// record instead: tonic drops the handler future when the client goes
+/// away, and by then the rows may already be committed.
+pub(crate) struct IngestAuditGuard {
+    pub(crate) logger: Option<Arc<sqe_metrics::audit::AuditLogger>>,
+    pub(crate) session: Arc<sqe_core::Session>,
+    pub(crate) audit: crate::audit_emitter::IngestAudit,
+    pub(crate) start: std::time::Instant,
+    pub(crate) client_ip: Option<String>,
+}
+
+impl IngestAuditGuard {
+    pub(crate) fn finish(mut self, result: &Result<usize, IngestFailure>) {
+        let refusal;
+        let outcome = match result {
+            Ok(rows) => Ok(*rows as u64),
+            Err(IngestFailure::Engine(e)) => Err(e),
+            Err(IngestFailure::Request(status)) => {
+                refusal = request_refusal_error(status);
+                Err(&refusal)
+            }
+        };
+        self.emit(outcome);
+    }
+
+    fn emit(&mut self, outcome: Result<u64, &sqe_core::SqeError>) {
+        if let Some(logger) = self.logger.take() {
+            crate::audit_emitter::emit_ingest_audit(
+                &logger,
+                &self.session,
+                &self.audit,
+                outcome,
+                self.start.elapsed(),
+                self.client_ip.take(),
+                uuid::Uuid::now_v7(),
+            );
+        }
+    }
+}
+
+impl Drop for IngestAuditGuard {
+    fn drop(&mut self) {
+        let gone = sqe_core::SqeError::with_code(
+            sqe_core::SqeErrorCode::QueryCancelled,
+            "the client went away before the ingest returned; its rows may be committed",
+        );
+        self.emit(Err(&gone));
+    }
+}
+
+/// Why a Flight SQL ingest failed: an engine error, which the audit record
+/// carries as is, or a refusal of the request itself, which the client gets
+/// as the `Status` it always got.
+pub(crate) enum IngestFailure {
+    Engine(sqe_core::SqeError),
+    Request(Status),
+}
+
+impl From<sqe_core::SqeError> for IngestFailure {
+    fn from(e: sqe_core::SqeError) -> Self {
+        Self::Engine(e)
+    }
+}
+
+impl From<Status> for IngestFailure {
+    fn from(s: Status) -> Self {
+        Self::Request(s)
+    }
+}
+
+/// The error an ingest's audit record carries for a refusal of the request
+/// itself: its gRPC code mapped onto the nearest engine code, with the
+/// message the client got. The ingest's own refusals are invalid options
+/// (`InvalidArgument`) and transaction conflicts (`FailedPrecondition`).
+pub(crate) fn request_refusal_error(status: &Status) -> sqe_core::SqeError {
+    use sqe_core::SqeErrorCode as C;
+    let code = match status.code() {
+        tonic::Code::InvalidArgument | tonic::Code::OutOfRange => C::InvalidArguments,
+        tonic::Code::FailedPrecondition | tonic::Code::Aborted => C::TransactionConflict,
+        tonic::Code::PermissionDenied => C::AccessDenied,
+        tonic::Code::Unauthenticated => C::AuthenticationFailed,
+        tonic::Code::NotFound => C::TableNotFound,
+        tonic::Code::AlreadyExists => C::DuplicateTable,
+        tonic::Code::ResourceExhausted => C::ResourceExhausted,
+        tonic::Code::Unimplemented => C::NotSupported,
+        tonic::Code::Cancelled => C::QueryCancelled,
+        tonic::Code::DeadlineExceeded => C::QueryTimeout,
+        _ => C::ExecutionFailed,
+    };
+    sqe_core::SqeError::with_code(code, status.message())
+}
+
+impl IngestFailure {
+    pub(crate) fn into_status(self) -> Status {
+        match self {
+            Self::Engine(e) => crate::flight_sql_helpers::sqe_error_to_status(&e, None),
+            Self::Request(s) => s,
+        }
+    }
+}
+
 /// Map the request's `TableDefinitionOptions` onto an [`IngestMode`].
 ///
 /// ADBC's four ingest modes arrive as: `append` = (FAIL, APPEND),
@@ -379,5 +496,54 @@ mod tests {
             .unwrap();
         assert!(peeked.schema.is_none());
         assert_eq!(peeked.batches.count().await, 1);
+    }
+
+    /// #887: an ingest whose future is dropped (the client went away) still
+    /// writes one record, marked cancelled; a finished one writes exactly
+    /// one, with no second record from the drop.
+    #[test]
+    fn ingest_audit_guard_writes_one_record_finished_or_dropped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+        let logger = Arc::new(
+            sqe_metrics::audit::AuditLogger::new(path.to_str().unwrap()).expect("audit logger"),
+        );
+        let guard = || IngestAuditGuard {
+            logger: Some(Arc::clone(&logger)),
+            session: Arc::new(sqe_core::Session::new(
+                "alice".to_string(),
+                sqe_core::SecretString::new("tok".to_string()),
+                None,
+                chrono::Utc::now() + chrono::Duration::hours(1),
+                vec![],
+            )),
+            audit: crate::audit_emitter::IngestAudit {
+                table: sqe_metrics::audit::Resource {
+                    catalog: Some("lake".to_string()),
+                    namespace: vec!["s".to_string()],
+                    name: "t".to_string(),
+                    object_type: sqe_metrics::audit::ObjectType::Table,
+                },
+                mode: None,
+                snapshot_property_keys: Vec::new(),
+            },
+            start: std::time::Instant::now(),
+            client_ip: None,
+        };
+
+        guard().finish(&Ok(4));
+        drop(guard());
+        logger.flush();
+
+        let content = std::fs::read_to_string(&path).expect("audit file");
+        let records: Vec<serde_json::Value> = content
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("json"))
+            .collect();
+        assert_eq!(records.len(), 2, "{content}");
+        assert_eq!(records[0]["status"], "success", "{content}");
+        assert_eq!(records[0]["stats"]["rows_written"], 4, "{content}");
+        assert_eq!(records[1]["status"], "failure", "{content}");
+        assert_eq!(records[1]["error_code"], "QUERY_CANCELLED", "{content}");
     }
 }

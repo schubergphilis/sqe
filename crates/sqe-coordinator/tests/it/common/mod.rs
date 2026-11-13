@@ -121,6 +121,13 @@ pub async fn setup_handler_with_store(
 
 /// Authenticate as root and return (session, handler).
 pub async fn setup_handler() -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
+    setup_handler_with_audit(None).await
+}
+
+/// [`setup_handler`] writing its audit records to `audit`.
+pub async fn setup_handler_with_audit(
+    audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
+) -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
     init_tracing();
     let config =
         sqe_core::SqeConfig::load(&test_config_path()).expect("Failed to load test config");
@@ -150,7 +157,7 @@ pub async fn setup_handler() -> (sqe_core::Session, sqe_coordinator::QueryHandle
         None,
         None,
         None,
-        None,
+        audit,
         query_tracker,
         query_cache,
         None, // grant_backend
