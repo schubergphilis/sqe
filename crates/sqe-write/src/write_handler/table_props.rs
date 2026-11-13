@@ -138,6 +138,58 @@ pub(crate) fn replace_in_place_properties(
     props
 }
 
+/// Live keys a staged replace does not carry: they name the old table's
+/// storage paths, and the staged table has a location of its own.
+const LOCATION_BOUND_PROPERTIES: &[&str] = &[
+    "write.data.path",
+    "write.metadata.path",
+    "write.object-storage.path",
+    "write.folder-storage.path",
+];
+
+/// Carry the live table's properties onto a staged `CREATE OR REPLACE`
+/// (#896), as the in-place replace keeps them (#894): every live key the
+/// statement does not set, except the reserved keys, the location-bound
+/// paths and `sqe.json-columns` (recomputed from the SELECT).
+/// `sqe.column-tags` keeps only the entries for `columns` the new schema
+/// still has, matched by top-level name. A tag value that does not parse is
+/// carried as it is: the policy rewriter fails closed on it, and dropping it
+/// would silently clear the tags.
+pub(crate) fn carry_live_properties(
+    props: &mut HashMap<String, String>,
+    live: &HashMap<String, String>,
+    columns: &[&str],
+) {
+    use crate::tag_source_impl::PROP_KEY as TAGS;
+    use sqe_core::json_columns::JSON_COLUMNS_PROP;
+    let is = |k: &str, set: &[&str]| set.iter().any(|r| k.eq_ignore_ascii_case(r));
+    for (k, v) in live {
+        if props.keys().any(|p| p.eq_ignore_ascii_case(k))
+            || is(k, &iceberg::spec::TableProperties::RESERVED_PROPERTIES)
+            || is(k, LOCATION_BOUND_PROPERTIES)
+            || k.eq_ignore_ascii_case(JSON_COLUMNS_PROP)
+        {
+            continue;
+        }
+        let value = if k == TAGS {
+            match serde_json::from_str::<std::collections::BTreeMap<String, Vec<String>>>(v) {
+                Ok(mut tags) => {
+                    let kept = |c: &str| columns.iter().any(|n| c.eq_ignore_ascii_case(n));
+                    tags.retain(|c, _| kept(c) || kept(c.split('.').next().unwrap_or(c)));
+                    if tags.is_empty() {
+                        continue;
+                    }
+                    serde_json::to_string(&tags).unwrap_or_else(|_| v.clone())
+                }
+                Err(_) => v.clone(),
+            }
+        } else {
+            v.clone()
+        };
+        props.insert(k.clone(), value);
+    }
+}
+
 /// `tx` with `properties` set as one more action of the same commit. No
 /// properties: `tx` unchanged.
 pub(super) fn with_properties(
@@ -202,5 +254,55 @@ mod tests {
         let want = [("a.b", "2"), ("write.merge.mode", "copy-on-write")]
             .map(|(k, v)| (k.to_string(), v.to_string()));
         assert_eq!(got, want);
+    }
+
+    fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn carry_live_properties_keeps_unset_keys_and_skips_bound_ones() {
+        let mut props = map(&[("a", "2"), ("format-version", "2")]);
+        let live = map(&[
+            ("A", "1"),
+            ("keep", "x"),
+            ("format-version", "3"),
+            ("write.data.path", "s3://old/data"),
+            ("sqe.json-columns", "[\"j\"]"),
+        ]);
+        carry_live_properties(&mut props, &live, &["id"]);
+        let mut got: Vec<_> = props.into_iter().collect();
+        got.sort();
+        let want = [("a", "2"), ("format-version", "2"), ("keep", "x")]
+            .map(|(k, v)| (k.to_string(), v.to_string()));
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn carry_live_properties_keeps_tags_of_columns_still_there() {
+        let tags = r#"{"email":["PII"],"gone":["PII"],"addr.zip":["PII"],"ADDR2":["X"]}"#;
+        let live = map(&[("sqe.column-tags", tags)]);
+        let mut props = HashMap::new();
+        carry_live_properties(&mut props, &live, &["id", "Email", "addr", "addr2"]);
+        assert_eq!(
+            props["sqe.column-tags"],
+            r#"{"ADDR2":["X"],"addr.zip":["PII"],"email":["PII"]}"#
+        );
+
+        // No tagged column left: the key goes.
+        let mut props = HashMap::new();
+        carry_live_properties(&mut props, &live, &["id"]);
+        assert!(props.is_empty(), "{props:?}");
+    }
+
+    #[test]
+    fn carry_live_properties_carries_malformed_tags_verbatim() {
+        let live = map(&[("sqe.column-tags", "not json")]);
+        let mut props = HashMap::new();
+        carry_live_properties(&mut props, &live, &["id"]);
+        assert_eq!(props["sqe.column-tags"], "not json");
     }
 }
