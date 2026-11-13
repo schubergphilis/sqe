@@ -1667,6 +1667,10 @@ impl QueryHandler {
     /// of that kind (`crate::audit_emitter::emit_failed_statement`); this
     /// runs on the failure path only. Public for front ends that reject a
     /// statement before calling the handler (the Trino HTTP front door).
+    ///
+    /// A statement over `query.max_sql_bytes` is never classified (#403):
+    /// it is recorded unparsed with a truncated text
+    /// (`crate::audit_emitter::emit_oversized_statement`, #882).
     pub fn record_failed_statement(
         &self,
         session: &Session,
@@ -1677,6 +1681,18 @@ impl QueryHandler {
         error: &SqeError,
     ) {
         if let Some(ref audit) = self.audit {
+            if reject_oversized_sql(&self.config.query, sql).is_err() {
+                crate::audit_emitter::emit_oversized_statement(
+                    audit,
+                    session,
+                    sql,
+                    error,
+                    start.elapsed(),
+                    client_ip,
+                    query_id.unwrap_or_else(uuid::Uuid::now_v7),
+                );
+                return;
+            }
             let kind = classify_user_sql(session, sql, &self.upper_case_catalogs()).ok();
             crate::audit_emitter::emit_failed_statement(
                 audit,
@@ -1709,10 +1725,11 @@ impl QueryHandler {
     /// lookup. Returns the run context for dispatch, or the batches of a
     /// result-cache hit (already audited).
     ///
-    /// The caller must not audit an `Err` from here. Every failure between
-    /// classification and the query tracker is audited by the `failed`
-    /// closure; the size check, the audit-closed check and admission return
-    /// before it exists and are deliberately unaudited (#882).
+    /// The caller must not audit an `Err` from here. Every failure before
+    /// the query tracker is audited on its way out: the size check and
+    /// admission each write one failure record (#882), everything after
+    /// them through the `failed` closure. Only the audit-closed refusal
+    /// writes none, since the log it would write to is unavailable.
     ///
     /// No span of its own: it records on [`Span::current`] (the `execute`
     /// span) and creates `query_span`, which the run carries.
@@ -1723,17 +1740,21 @@ impl QueryHandler {
         client_ip: Option<String>,
         caller_query_id: Option<uuid::Uuid>,
     ) -> sqe_core::Result<Preflight<'_>> {
+        let start = std::time::Instant::now();
         // Issue #403: reject oversized SQL before parse so a client cannot
         // burn coordinator memory/CPU on an arbitrarily large statement.
-        reject_oversized_sql(&self.config.query, sql)?;
+        // The refusal is audited unparsed (#882).
+        let refused = |e: SqeError| {
+            self.audit_failure(session, sql, start, client_ip.clone(), caller_query_id, e)
+        };
+        reject_oversized_sql(&self.config.query, sql).map_err(refused)?;
         refuse_if_audit_closed(self.audit.as_ref())?;
 
         // Admission (pressure, per-user and global permits, per-user memory
         // reservation): one sequence shared with the streaming path, see
         // `query_handler::admission`. Held for the whole buffered call.
-        let admission = self.admit(session, sql, "query")?;
+        let admission = self.admit(session, sql, "query").map_err(refused)?;
 
-        let start = std::time::Instant::now();
         // Pre-parse pipeline (strip FOR INCREMENTAL / FOR VERSION AS OF,
         // Hive PARTITIONED BY -> PARTITION BY; issue #117) then the SQL front
         // door: one parse, Trino-shape fallbacks, AST rewrites, classify
@@ -3740,8 +3761,12 @@ impl QueryHandler {
         client_ip: Option<String>,
         query_id: Option<uuid::Uuid>,
     ) -> sqe_core::Result<(SchemaRef, SendableRecordBatchStream)> {
-        // Issue #403: same pre-parse size cap as execute().
-        reject_oversized_sql(&self.config.query, sql)?;
+        // Issue #403: same pre-parse size cap as execute(). The size and
+        // admission refusals are audited like execute()'s (#882).
+        let start = std::time::Instant::now();
+        let refused =
+            |e: SqeError| self.audit_failure(session, sql, start, client_ip.clone(), query_id, e);
+        reject_oversized_sql(&self.config.query, sql).map_err(refused)?;
         refuse_if_audit_closed(self.audit.as_ref())?;
 
         // --- Admission control -------------------------------------------------
@@ -3753,7 +3778,9 @@ impl QueryHandler {
             permits,
             memory_reservation: per_user_mem_reservation,
             memory,
-        } = self.admit(session, sql, "streaming query")?;
+        } = self
+            .admit(session, sql, "streaming query")
+            .map_err(refused)?;
 
         // --- Classify ---------------------------------------------------------
         // See execute() for the pipeline rationale: pre-parse pipeline, then
@@ -3761,9 +3788,7 @@ impl QueryHandler {
         // Failures before `open_stream` return before any audit point, so
         // each is audited on its way out. `NotImplemented` below is not a
         // failure: the caller retries through `execute()`, which audits.
-        let start = std::time::Instant::now();
-        let failed =
-            |e: SqeError| self.audit_failure(session, sql, start, client_ip.clone(), query_id, e);
+        let failed = refused;
         let kind = classify_user_sql(session, sql, &self.upper_case_catalogs()).map_err(failed)?;
         let kind_name = kind.name().to_string();
         if !matches!(kind, StatementKind::Query(_)) {

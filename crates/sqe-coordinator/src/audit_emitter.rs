@@ -228,6 +228,141 @@ pub(crate) fn emit_failed_statement(
     );
 }
 
+/// Bytes of an oversized statement's text kept in its audit record.
+pub(crate) const OVERSIZED_TEXT_BYTES: usize = 1024;
+
+/// The first [`OVERSIZED_TEXT_BYTES`] of `sql`, cut on a char boundary and
+/// never inside a string literal. The audit worker redacts secrets and PII
+/// by matching whole quoted literals (`redact_pii`); a literal cut open
+/// would no longer match and its value would be written in the clear. An
+/// odd number of quotes means the cut is inside one (an escaped `''` adds
+/// two), so the prefix stops before the last opening quote.
+pub(crate) fn oversized_text_prefix(sql: &str) -> &str {
+    let mut cut = sql.len().min(OVERSIZED_TEXT_BYTES);
+    while !sql.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let prefix = &sql[..cut];
+    if prefix.bytes().filter(|b| *b == b'\'').count() % 2 == 1 {
+        let open = prefix.rfind('\'').unwrap_or(0);
+        return &prefix[..open];
+    }
+    prefix
+}
+
+/// Emit the one audit record for a statement refused for its size
+/// (`query.max_sql_bytes`, #403 / #882).
+///
+/// The statement is never classified: parsing it is exactly what the size
+/// cap prevents. It is recorded like an unparsed statement (`statement_type`
+/// `"unknown"`), with its text cut to [`OVERSIZED_TEXT_BYTES`] on a char
+/// boundary and its full byte length in `text_len`. `query_hash` covers the
+/// full text, so repeated refusals of one statement still correlate; the
+/// literal-free fingerprint is left out.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_oversized_statement(
+    audit: &AuditLogger,
+    session: &Session,
+    sql: &str,
+    error: &SqeError,
+    duration: Duration,
+    client_ip: Option<String>,
+    query_id: uuid::Uuid,
+) {
+    let text = oversized_text_prefix(sql);
+    audit.log_event(AuditEvent {
+        time: chrono::Utc::now(),
+        kind: AuditKind::Query,
+        actor: actor_for(session),
+        outcome: outcome_of(Some(error)),
+        resources: Vec::new(),
+        policy: None,
+        timing: Some(timing(duration, 0)),
+        stats: None,
+        query: Some(QueryInfo {
+            text: Some(text.to_string()),
+            query_hash: sqe_metrics::audit::query_hash(sql),
+            statement_type: "unknown".to_string(),
+            text_len: Some(sql.len()),
+            query_fingerprint: None,
+        }),
+        session_id: Some(session_log_id(&session.id)),
+        client_ip,
+        trace_id: sqe_metrics::propagation::current_trace_id(),
+        query_id: Some(query_id.to_string()),
+        transaction: None,
+        integrity: Integrity::default(),
+    });
+}
+
+/// What a Flight SQL bulk ingest (`CommandStatementIngest`) leaves for its
+/// audit record. Filled as the request is read, so a refusal records what
+/// was known when it failed.
+pub(crate) struct IngestAudit {
+    /// The target table as named in the request.
+    pub table: Resource,
+    /// `if_not_exist=..., if_exists=...`, once the options were read.
+    pub mode: Option<String>,
+    /// Keys of the snapshot properties the commit carries, sorted. Set once
+    /// the options were resolved; recorded on success only, like an INSERT.
+    pub snapshot_property_keys: Vec<String>,
+}
+
+impl IngestAudit {
+    /// The statement text of the record: the INSERT the ingest stands for
+    /// (the same text admission uses), the mode in a comment.
+    fn text(&self) -> String {
+        match &self.mode {
+            Some(mode) => format!(
+                "INSERT INTO {} /* flight sql ingest: {mode} */",
+                self.table.fqn()
+            ),
+            None => format!("INSERT INTO {} /* flight sql ingest */", self.table.fqn()),
+        }
+    }
+}
+
+/// Emit the one audit record for a Flight SQL bulk ingest (#887): a data
+/// write recorded like an INSERT (`AuditKind::Query`, the target table as
+/// its resource, `rows_written`, the snapshot property keys), with
+/// `statement_type` `"ingest"`. Every ingest request that passed
+/// authentication leaves exactly one, whatever it ended with.
+pub(crate) fn emit_ingest_audit(
+    audit: &AuditLogger,
+    session: &Session,
+    ingest: &IngestAudit,
+    result: Result<u64, &SqeError>,
+    duration: Duration,
+    client_ip: Option<String>,
+    query_id: uuid::Uuid,
+) {
+    let (error, rows_written, keys) = match result {
+        Ok(rows) => (None, Some(rows), ingest.snapshot_property_keys.clone()),
+        Err(e) => (Some(e), None, Vec::new()),
+    };
+    audit.log_event(AuditEvent {
+        time: chrono::Utc::now(),
+        kind: AuditKind::Query,
+        actor: actor_for(session),
+        outcome: outcome_of(error),
+        resources: vec![ingest.table.clone()],
+        policy: None,
+        timing: Some(timing(duration, duration.as_millis() as u64)),
+        stats: Some(QueryStats {
+            rows_written,
+            snapshot_property_keys: keys,
+            ..QueryStats::default()
+        }),
+        query: Some(query_info(&ingest.text(), "ingest".to_string())),
+        session_id: Some(session_log_id(&session.id)),
+        client_ip,
+        trace_id: sqe_metrics::propagation::current_trace_id(),
+        query_id: Some(query_id.to_string()),
+        transaction: None,
+        integrity: Integrity::default(),
+    });
+}
+
 /// Emit the one audit record for a buffered statement.
 ///
 /// - `Query` (SELECT and friends): `AuditKind::Query` with policy, timing,
@@ -339,6 +474,31 @@ mod tests {
             SnapshotProperties::try_new(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())))
                 .unwrap(),
         )
+    }
+
+    #[test]
+    fn oversized_text_prefix_is_bounded_and_never_cuts_a_literal_open() {
+        let short = "SELECT 1";
+        assert_eq!(oversized_text_prefix(short), short);
+
+        let long = format!("SELECT {}", "x".repeat(4 * OVERSIZED_TEXT_BYTES));
+        assert_eq!(oversized_text_prefix(&long).len(), OVERSIZED_TEXT_BYTES);
+
+        // The cut lands inside the secret literal: the prefix stops before it.
+        let head = "CREATE SECRET s (TYPE s3, SECRET '";
+        let secret = format!("{head}{}')", "k".repeat(2 * OVERSIZED_TEXT_BYTES));
+        let prefix = oversized_text_prefix(&secret);
+        assert_eq!(prefix, &head[..head.len() - 1]);
+        assert!(!prefix.contains('k'));
+
+        // A closed literal with an escaped quote stays.
+        let closed = format!("SELECT 'it''s' {}", "y".repeat(2 * OVERSIZED_TEXT_BYTES));
+        assert!(oversized_text_prefix(&closed).starts_with("SELECT 'it''s' y"));
+
+        // Multibyte text is cut on a char boundary.
+        let wide = "é".repeat(OVERSIZED_TEXT_BYTES);
+        let prefix = oversized_text_prefix(&wide);
+        assert!(prefix.len() <= OVERSIZED_TEXT_BYTES && prefix.chars().all(|c| c == 'é'));
     }
 
     #[test]

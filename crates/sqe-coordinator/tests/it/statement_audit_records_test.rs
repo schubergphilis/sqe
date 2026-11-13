@@ -83,16 +83,6 @@ impl Written {
         );
         s.clone()
     }
-
-    fn none(&self) {
-        assert_eq!(
-            self.native.len(),
-            0,
-            "no native record: {}",
-            serde_json::to_string_pretty(&self.native).unwrap_or_default()
-        );
-        assert_eq!(self.ocsf.len(), 0, "no OCSF record");
-    }
 }
 
 async fn catalog_namespace_requests(fx: &Fixture) -> usize {
@@ -118,31 +108,36 @@ async fn wait_until_held(fx: &Fixture) {
     }
 }
 
-// -- Refused before the failure-audit path exists ---------------------------
+// -- Refused before classification (#882) ----------------------------------
 
-/// The size check returns before admission and before `failed` exists.
+/// The size check runs before admission and never classifies the statement
+/// (#403): its record is unparsed (`statement_type` `"unknown"`) and carries
+/// the text cut to its first KiB, with the full length in `text_len`.
 #[tokio::test]
-async fn an_oversized_statement_is_refused_and_writes_no_record() {
-    let fx = fixture_opts(Arc::new(PassthroughEnforcer), opts("max_sql_bytes = 16")).await;
-    let sql = "SELECT 1 AS a, 2 AS b, 3 AS c";
+async fn an_oversized_statement_writes_one_audit_record() {
+    let fx = fixture_opts(Arc::new(PassthroughEnforcer), opts("max_sql_bytes = 1100")).await;
+    let sql = format!("SELECT '{}' AS a", "x".repeat(2048));
     let err = fx
         .handler
-        .execute(&session_for("size-user"), sql, None)
+        .execute(&session_for("size-user"), &sql, None)
         .await
         .expect_err("oversized");
     assert_eq!(err.error_code(), SqeErrorCode::InvalidArguments, "{err}");
     assert!(err.to_string().contains("max_sql_bytes"), "{err}");
 
-    // pins current behaviour: a refused statement leaves no audit record and
-    // no tracker entry, so the refusal is visible only to the client
-    Written::of(&fx).none();
+    let written = Written::of(&fx);
+    // The cut lands inside the literal, so the kept text stops before it.
+    let s = written.one_failure("SELECT ", "INVALID_ARGUMENTS");
+    assert_eq!(s["query"]["statement_type"], "unknown", "{s}");
+    assert_eq!(s["query"]["text_len"], sql.len(), "{s}");
+    // No tracker entry: the statement never started.
     assert!(fx.handler.query_tracker().records().is_empty());
 }
 
-/// Admission refuses before `failed` exists: here the per-user memory budget
+/// Admission refuses before classification: here the per-user memory budget
 /// is smaller than one statement's quota.
 #[tokio::test]
-async fn an_admission_refusal_writes_no_record() {
+async fn an_admission_refusal_writes_one_audit_record() {
     let fx = fixture_opts(
         Arc::new(PassthroughEnforcer),
         opts("per_user_memory_budget = \"1MB\"\nmax_query_memory = \"64MB\""),
@@ -160,8 +155,7 @@ async fn an_admission_refusal_writes_no_record() {
         "{err}"
     );
 
-    // pins current behaviour: no audit record and no tracker entry
-    Written::of(&fx).none();
+    Written::of(&fx).one_failure(sql, "EXECUTION_FAILED");
     assert!(fx.handler.query_tracker().records().is_empty());
 }
 

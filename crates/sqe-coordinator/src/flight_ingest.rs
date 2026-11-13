@@ -18,6 +18,21 @@ use sqe_core::snapshot_properties::SnapshotProperties;
 use sqe_write::write_handler::{IngestMode, OnExisting, OnMissing};
 use tonic::Status;
 
+/// The mode as the ingest's audit record names it, in the wire option names:
+/// `if_not_exist=create, if_exists=append` (#887).
+pub(crate) fn ingest_mode_label(mode: IngestMode) -> String {
+    let on_missing = match mode.on_missing {
+        OnMissing::Fail => "fail",
+        OnMissing::Create => "create",
+    };
+    let on_existing = match mode.on_existing {
+        OnExisting::Append => "append",
+        OnExisting::Fail => "fail",
+        OnExisting::Replace => "replace",
+    };
+    format!("if_not_exist={on_missing}, if_exists={on_existing}")
+}
+
 /// Map the request's `TableDefinitionOptions` onto an [`IngestMode`].
 ///
 /// ADBC's four ingest modes arrive as: `append` = (FAIL, APPEND),
