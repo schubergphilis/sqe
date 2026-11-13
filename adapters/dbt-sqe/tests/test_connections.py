@@ -58,6 +58,8 @@ def test_dml_is_read_on_execute_so_a_failure_raises():
         "delete from t where id in (select id from u)",
         "UPDATE t SET a = 1",
         "merge into t using u on t.id = u.id when matched then delete",
+        # dbt's truncate_relation, which a seed re-run calls (#891).
+        '/* {"app": "dbt"} */\n  truncate table c.s.seed',
     ):
         inner = FakeCursor(error=RuntimeError("cast failed"))
         with pytest.raises(RuntimeError, match="cast failed"):
@@ -276,3 +278,29 @@ def test_nested_begin_is_refused():
     handle.begin_transaction()
     with pytest.raises(Exception, match="already open"):
         handle.begin_transaction()
+
+
+# ── #891: column types for dbt's snapshot / contract macros ───────────────
+
+
+def test_data_type_code_to_name_renders_sqe_ddl_types():
+    # ADBC's cursor.description carries the Arrow type as the type code.
+    cases = [
+        (pa.bool_(), "BOOLEAN"),
+        (pa.int32(), "INTEGER"),
+        (pa.int64(), "BIGINT"),
+        (pa.uint64(), "BIGINT"),
+        (pa.float64(), "DOUBLE"),
+        (pa.decimal128(12, 2), "DECIMAL(12,2)"),
+        (pa.string(), "VARCHAR"),
+        (pa.large_string(), "VARCHAR"),
+        (pa.binary(), "VARBINARY"),
+        (pa.date32(), "DATE"),
+        (pa.timestamp("us"), "TIMESTAMP"),
+        (pa.timestamp("us", tz="UTC"), "TIMESTAMP WITH TIME ZONE"),
+        (pa.list_(pa.int64()), "ARRAY<BIGINT>"),
+        (pa.map_(pa.string(), pa.int32()), "MAP<VARCHAR, INTEGER>"),
+        (pa.struct([("a", pa.string()), ("b", pa.int64())]), "STRUCT<a: VARCHAR, b: BIGINT>"),
+    ]
+    for arrow_type, name in cases:
+        assert SQEConnectionManager.data_type_code_to_name(arrow_type) == name, arrow_type
