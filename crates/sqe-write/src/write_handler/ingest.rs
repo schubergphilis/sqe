@@ -432,7 +432,7 @@ impl WriteHandler {
         } else {
             self.format_version()
         };
-        let arrow_schema = timestamps_for_format_version(stream_schema, format_version);
+        let arrow_schema = write_schema_for_format_version(stream_schema, format_version);
         let iceberg_schema = arrow_schema_to_iceberg(&arrow_schema)?;
         let rest_catalog = matches!(
             self.config.catalog.backend,
