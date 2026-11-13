@@ -214,3 +214,50 @@ async fn merge_update_set_star_and_insert_star() {
         }
     }
 }
+
+/// #893: a NOT MATCHED clause has no target row, so bare names in its
+/// predicate and VALUES are source columns. This is dbt's snapshot MERGE
+/// shape; it failed as "Ambiguous reference to unqualified field id".
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn merge_not_matched_bare_columns_are_source_columns() {
+    let (session, handler) = crate::common::setup_handler().await;
+    for (name, props) in [("merge_bare_cow", COW), ("merge_bare_mor", MOR)] {
+        let t = format!("default.{name}");
+        let src = format!("default.{name}_src");
+        for fq in [&t, &src] {
+            exec(&handler, &session, &format!("DROP TABLE IF EXISTS {fq}")).await;
+        }
+        let create = format!("CREATE TABLE {t} (id BIGINT NOT NULL, val STRING){props}");
+        exec(&handler, &session, &create).await;
+        if props == MOR {
+            let alter = format!("ALTER TABLE {t} SET IDENTIFIER FIELDS id");
+            exec(&handler, &session, &alter).await;
+        }
+        let insert = format!("INSERT INTO {t} VALUES (1, 'a')");
+        exec(&handler, &session, &insert).await;
+        let create_src = format!("CREATE TABLE {src} (id BIGINT, val STRING, kind STRING)");
+        exec(&handler, &session, &create_src).await;
+        let rows_in = "(1, 'A', 'update'), (2, 'b', 'insert'), (3, 'c', 'skip')";
+        let fill = format!("INSERT INTO {src} VALUES {rows_in}");
+        exec(&handler, &session, &fill).await;
+
+        let sql = format!(
+            "MERGE INTO {t} AS DBT_INTERNAL_DEST USING {src} AS DBT_INTERNAL_SOURCE \
+             ON DBT_INTERNAL_SOURCE.id = DBT_INTERNAL_DEST.id \
+             WHEN MATCHED AND DBT_INTERNAL_SOURCE.kind = 'update' \
+               THEN UPDATE SET val = DBT_INTERNAL_SOURCE.val \
+             WHEN NOT MATCHED AND kind = 'insert' \
+               THEN INSERT (\"id\", \"val\") VALUES (\"id\", val)"
+        );
+        assert_eq!(affected(&handler, &session, &sql).await, 2, "{name}");
+        let got = rows(&handler, &session, &t).await;
+        assert_eq!(got, vec!["1:A", "2:b"], "{name}");
+
+        for fq in [&t, &src] {
+            let _ = handler
+                .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+                .await;
+        }
+    }
+}
