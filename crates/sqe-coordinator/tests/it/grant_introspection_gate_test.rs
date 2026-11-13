@@ -395,6 +395,36 @@ async fn set_reserved_tblproperties_requires_admin() {
 }
 
 #[tokio::test]
+async fn create_or_replace_with_reserved_tblproperties_requires_admin() {
+    // #894: an in-place CREATE OR REPLACE sets the statement's properties on
+    // the live table, whose older snapshots still hold the data its tags
+    // mask, so naming `sqe.column-tags` there is gated like SET TBLPROPERTIES.
+    let backend = Arc::new(RecordingBackend::default());
+    let store = Arc::new(RecordingStore::default());
+    let handler = make_handler(backend, store);
+    let session = session_for("alice", vec!["analyst"]);
+
+    let sql = "CREATE OR REPLACE TABLE cat.ns.tbl \
+               TBLPROPERTIES ('sqe.column-tags' = '{}') AS SELECT 1 AS id";
+    let err = handler
+        .execute(&session, sql, None)
+        .await
+        .expect_err("non-admin must not replace column tags");
+    assert!(err.to_string().contains("403"), "expected 403: {err}");
+
+    let sql = "CREATE OR REPLACE TABLE cat.ns.tbl \
+               TBLPROPERTIES ('write.merge.mode' = 'copy-on-write') AS SELECT 1 AS id";
+    let err = handler
+        .execute(&session, sql, None)
+        .await
+        .expect_err("no catalog is wired");
+    assert!(
+        !err.to_string().contains("403"),
+        "unexpected admin gate: {err}"
+    );
+}
+
+#[tokio::test]
 async fn set_maintenance_tblproperties_stays_owner_settable() {
     // Table owners opt into autonomous compaction with `sqe.maintenance.*`
     // keys; only policy properties are admin-gated, not every `sqe.` key.

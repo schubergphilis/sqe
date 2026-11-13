@@ -955,3 +955,58 @@ async fn ctas_ranking_functions_make_bigint_columns_888() {
     assert_eq!(scalar_i64(&handler, &session, &count).await, 3);
     let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {t}")).await;
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// An in-place CREATE OR REPLACE sets the statement's TBLPROPERTIES (#894).
+// It kept the live ones, while a schema-changing (staged) replace applied
+// them, so a dbt model re-run with new properties depended on its schema.
+// Keys the statement does not name stay, as in an Iceberg replace.
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ctas_replace_in_place_sets_tblproperties_894() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let fq = "default.ctas_replace_props_894";
+    let prop = |k: &str, v: &str| format!("'{k}' = '{v}'");
+
+    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {fq}")).await;
+    let create = format!(
+        "CREATE TABLE {fq} TBLPROPERTIES ('write.merge.mode' = 'merge-on-read', \
+         'sqe_test.a' = '1', 'sqe_test.keep' = 'x') AS SELECT 1 AS id"
+    );
+    exec(&handler, &session, &create).await;
+    let snapshots = "SELECT COUNT(*) FROM table_snapshots('default', 'ctas_replace_props_894')";
+    let before = scalar_i64(&handler, &session, snapshots).await;
+
+    // Same schema: replaced in place, in one commit with the properties.
+    let replace = format!(
+        "CREATE OR REPLACE TABLE {fq} TBLPROPERTIES ('write.merge.mode' = 'copy-on-write', \
+         'sqe_test.a' = '2') AS SELECT 2 AS id"
+    );
+    exec(&handler, &session, &replace).await;
+    let ddl = show_create(&handler, &session, fq).await;
+    for want in [
+        prop("write.merge.mode", "copy-on-write"),
+        prop("sqe_test.a", "2"),
+        prop("sqe_test.keep", "x"),
+    ] {
+        assert!(ddl.contains(&want), "missing {want}: {ddl}");
+    }
+    let after = scalar_i64(&handler, &session, snapshots).await;
+    assert_eq!(after, before + 1, "one snapshot for swap and properties");
+    let ids = format!("SELECT CAST(SUM(id) AS BIGINT) FROM {fq}");
+    assert_eq!(scalar_i64(&handler, &session, &ids).await, 2);
+
+    // Empty table replaced by an empty SELECT: no rewrite to ride on.
+    exec(&handler, &session, &format!("DELETE FROM {fq}")).await;
+    let empty = format!(
+        "CREATE OR REPLACE TABLE {fq} TBLPROPERTIES ('sqe_test.a' = '3') \
+         AS SELECT 1 AS id WHERE false"
+    );
+    exec(&handler, &session, &empty).await;
+    let ddl = show_create(&handler, &session, fq).await;
+    let want = prop("sqe_test.a", "3");
+    assert!(ddl.contains(&want), "empty replace: {ddl}");
+
+    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {fq}")).await;
+}
