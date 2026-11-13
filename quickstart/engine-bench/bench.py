@@ -2,12 +2,13 @@
 
     python bench.py load  --size 10m --engines sqe-iceberg,sqe-polaris
     python bench.py run   --sizes 10m --reps 3 --engines sqe-parquet,sqe-iceberg,sqe-polaris,duckdb,polars
+    python bench.py run   --sizes 10m --engines sqe-polaris,sqe-embedded-polaris,duckdb-polaris,polars-polaris
     python bench.py validate --size 10m
     python bench.py summary  > summary.md
 
 The workload is https://github.com/firfircelik/engine-bench (data generator,
 the four queries, and the DuckDB / Polars / Spark runners), cloned at a pinned
-commit by run.sh. This file adds three SQE engines next to those and measures
+commit by run.sh. This file adds SQE engines next to those and measures
 all of them the same way the upstream bench.py does: one fresh process per
 run, peak RSS of the whole process tree sampled every 50 ms, and a kill above
 --budget-gib. Every engine reads the same data and writes its answer to
@@ -22,6 +23,16 @@ SQE engines:
   sqe-polaris  a native sqe-server (fresh process per run) reading Iceberg
                tables from the Polaris REST catalog, data on RustFS (S3) in
                Docker. The client is sqe-cli over Arrow Flight SQL.
+  sqe-embedded-polaris
+               sqe-cli --embedded, ATTACHed to the same Polaris catalog
+               (TYPE iceberg_rest): the sqe-polaris tables without a server.
+
+Polaris readers (run_engine_polaris.py): the same Iceberg tables in Polaris,
+read by other engines over the Iceberg REST catalog API.
+  duckdb-polaris   DuckDB's iceberg extension, ATTACHed to Polaris.
+  polars-polaris   Polars scan_iceberg on tables pyiceberg loads from Polaris.
+All four *-polaris engines read polaris.bench_<size>, which `load --engines
+sqe-polaris` writes, and are recorded as storage=s3 whatever EB_STORAGE says.
 
 Storage (EB_STORAGE, set by run.sh from STORAGE=):
   local  every engine but sqe-polaris reads <work>/engine-bench/data from local
@@ -71,8 +82,9 @@ STORAGE = os.environ.get("EB_STORAGE", "local")
 S3_PREFIX = os.environ.get("EB_S3_PREFIX", "s3://warehouse/engine-bench/data").rstrip("/")
 
 QUERIES = ["q1_filter_agg", "q2_join_agg", "q3_window_latest", "q4_highcard_agg"]
-SQE_ENGINES = ["sqe-parquet", "sqe-iceberg", "sqe-polaris"]
-ORDER_E = SQE_ENGINES + ["duckdb", "polars", "spark"]
+SQE_ENGINES = ["sqe-parquet", "sqe-iceberg", "sqe-polaris", "sqe-embedded-polaris"]
+POLARIS_READERS = ["duckdb-polaris", "polars-polaris"]  # run_engine_polaris.py
+ORDER_E = SQE_ENGINES + ["duckdb", "polars", "spark"] + POLARIS_READERS
 
 # Same row count + rounded checksums as upstream validate.py.
 CHECK = {
@@ -206,16 +218,16 @@ def failure_reason(tail):
 
 
 def stderr_tail(res):
-    """The last stderr lines, with the S3 keys masked: an engine error can echo
-    the statement that carried them (DuckDB's CREATE SECRET), and the tail ends
-    up in the results file and OUTPUT.md."""
+    """The last stderr lines, with the S3 keys and the Polaris secret masked:
+    an engine error can echo the statement that carried them (a CREATE SECRET),
+    and the tail ends up in the results file and OUTPUT.md."""
     all_lines = [l for l in res["stderr"].splitlines() if l.strip()]
     # A JVM failure ends in stack frames; the line that names the error is
     # further up. Keep the first few such lines next to the tail.
     named = [l for l in all_lines
              if re.search(r"(Exception|Error)\b", l) and not l.lstrip().startswith("at ")][:4]
     lines = named + [l for l in all_lines[-6:] if l not in named]
-    for k in ("S3_SECRET_KEY", "S3_ACCESS_KEY"):
+    for k in ("S3_SECRET_KEY", "S3_ACCESS_KEY", "POLARIS_ROOT_SECRET"):
         v = os.environ.get(k)
         if v:
             lines = [l.replace(v, "***") for l in lines]
@@ -290,9 +302,13 @@ def flight_env():
 # ── engines ──────────────────────────────────────────────────────────────────
 
 def sqe_script(engine, size, query):
-    """The sqe-cli script for the two embedded engines."""
+    """The sqe-cli script for the embedded engines."""
     out = os.path.join(OUT, engine, f"{size}_{query}.parquet")
-    if engine == "sqe-parquet":
+    if engine == "sqe-embedded-polaris":
+        src = polaris_attach() + "".join(
+            f"CREATE VIEW {t} AS SELECT * FROM {POLARIS_CATALOG}.{namespace(size)}.{t};\n"
+            for t in ("sales", "products"))
+    elif engine == "sqe-parquet":
         data = S3_PREFIX if STORAGE == "s3" else DATA
         src = (f"CREATE VIEW sales AS SELECT * FROM read_parquet('{data}/sales_{size}/');\n"
                f"CREATE VIEW products AS SELECT * FROM read_parquet('{data}/products.parquet');\n")
@@ -301,6 +317,24 @@ def sqe_script(engine, size, query):
                "CREATE VIEW products AS SELECT * FROM iceberg.bench.products;\n")
     return out, (f"SET datafusion.execution.target_partitions = {THREADS};\n{src}"
                  f".timer on\nCOPY ({sql_text(query)}) TO '{out}';\n")
+
+
+def polaris_attach():
+    """CREATE SECRET + ATTACH of the bench's Polaris catalog for sqe-cli
+    --embedded. An ATTACHed catalog's FileIO takes its S3 settings from the
+    ATTACH options, not from SQE_STORAGE__*, so they are spelled out here."""
+    uri = f"http://localhost:{os.environ['POLARIS_PORT']}/api/catalog"
+    return (f"CREATE SECRET bench_polaris (TYPE oauth2, CLIENT_ID 'root', "
+            f"CLIENT_SECRET '{os.environ['POLARIS_ROOT_SECRET']}', TOKEN_URL '{uri}/v1/oauth/tokens', "
+            f"SCOPE 'PRINCIPAL_ROLE:ALL');\n"
+            f"ATTACH '{uri}' AS {POLARIS_CATALOG} (TYPE iceberg_rest, WAREHOUSE 'bench', "
+            f"SECRET bench_polaris, S3_ENDPOINT '{os.environ['EB_S3_ENDPOINT']}', S3_REGION 'us-east-1', "
+            f"S3_PATH_STYLE 'true', S3_ACCESS_KEY '{os.environ['S3_ACCESS_KEY']}', "
+            f"S3_SECRET_KEY '{os.environ['S3_SECRET_KEY']}');\n")
+
+
+def is_polaris(engine):
+    return engine.endswith("-polaris")
 
 
 def polaris_sql(size, query):
@@ -366,7 +400,8 @@ def run_sqe(engine, size, query, mem, budget, floor, timeout):
         _, script = sqe_script(engine, size, query)
         cmd = [SQE_CLI, "--embedded", "--memory-limit", mem_arg(mem), "-f", "table"]
         cmd[2:2] = ["--warehouse", warehouse(size)] if engine == "sqe-iceberg" else ["--memory"]
-        res = watch(cmd, script, [], budget, floor, timeout, env=sqe_s3_env())
+        env = None if engine == "sqe-embedded-polaris" else sqe_s3_env()  # it has its ATTACH options
+        res = watch(cmd, script, [], budget, floor, timeout, env=env)
         t = copy_time(res["stderr"]) if not sqe_failed(res) else None
         q = {"query_s": t} if t is not None else None
     rec.update({k: res[k] for k in ("wall_s", "peak_rss_gib", "min_sys_avail_gib", "exit")})
@@ -383,8 +418,10 @@ def run_sqe(engine, size, query, mem, budget, floor, timeout):
 
 def run_upstream(engine, size, query, mem, budget, floor, timeout):
     """DuckDB / Polars / Spark through upstream's own run_engine.py, or through
-    run_engine_s3.py (the same runner reading from S3) for STORAGE=s3."""
-    runner = (os.path.join(HERE, "run_engine_s3.py") if STORAGE == "s3"
+    run_engine_s3.py (the same runner reading from S3) for STORAGE=s3; the
+    Polaris readers through run_engine_polaris.py."""
+    runner = (os.path.join(HERE, "run_engine_polaris.py") if engine in POLARIS_READERS
+              else os.path.join(HERE, "run_engine_s3.py") if STORAGE == "s3"
               else os.path.join(UPSTREAM, "run_engine.py"))
     res = watch([sys.executable, runner, engine, size, query, mem],
                 None, [], budget, floor, timeout)
@@ -502,7 +539,7 @@ def run(a):
                         avail, busy = wait_for_room(a.min_avail_gib, a.max_busy_pct)
                         runner = run_sqe if engine in SQE_ENGINES else run_upstream
                         rec = {"engine": engine, "size": size, "query": query, "mem": a.mem,
-                               "storage": "s3" if STORAGE == "s3" or engine == "sqe-polaris" else "local"}
+                               "storage": "s3" if STORAGE == "s3" or is_polaris(engine) else "local"}
                         tx0 = rustfs_tx_bytes() if rec["storage"] == "s3" else None
                         budget = budgets.get(engine, a.budget_gib)
                         if budget != a.budget_gib:
@@ -516,7 +553,7 @@ def run(a):
                                     "started": datetime.now().isoformat(timespec="seconds")})
                         f.write(json.dumps(rec) + "\n")
                         f.flush()
-                        print(f"{size} r{rep} {query:17s} {engine:12s} {rec['status'][:40]:>6s} "
+                        print(f"{size} r{rep} {query:17s} {engine:20s} {rec['status'][:40]:>6s} "
                               f"wall={rec['wall_s']:7.2f}s q={rec.get('query_s', '-')} "
                               f"rss={rec['peak_rss_gib']:.2f}GiB rows={rec.get('rows_out', '-')}"
                               + (f" s3={rec['s3_read_gb']}GB" if "s3_read_gb" in rec else ""),
