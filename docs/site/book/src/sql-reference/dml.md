@@ -45,6 +45,7 @@ The rules follow Databricks:
 - The alias must come first. A name used before its alias is defined is an unknown column.
 - Only bare names in the select list resolve to an alias. `t.b` is always the column. `WHERE` cannot see a select-list alias. `GROUP BY`, `HAVING` and `ORDER BY` already accept output aliases.
 - A subquery in the select list has its own scope and does not see the outer select list's aliases.
+- A [pipe](#pipe-syntax) `SELECT` or `EXTEND` step follows the same rules within its own list: `FROM t |> SELECT a + 1 AS b, b * 2 AS c`. A later step sees an earlier step's aliases as columns.
 
 SQE resolves a name against the `FROM` relation first and falls back to an earlier alias only for a name the relation does not have. That fallback applies to the whole statement, so one edge case differs from Databricks. Suppose `b` is a `FROM` column and also an earlier alias in one `SELECT`, and another `SELECT` in the same statement (a CTE or union arm) uses the alias `b` without having a column `b`. Then the first `SELECT` reads the alias as well. Give the alias another name to avoid this.
 
