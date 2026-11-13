@@ -40,7 +40,13 @@ use sqe_compaction::write_memory::{TrackedBatchBuffer, WriteReservation};
 
 mod ingest;
 mod snapshot_props;
+mod table_props;
 pub use ingest::{IngestMode, OnExisting, OnMissing};
+use table_props::{commit_properties, sql_expr_to_property_string, with_properties};
+pub(crate) use table_props::{
+    create_table_options_as_slice, create_table_properties, declared_json_columns,
+    record_json_columns, replace_in_place_properties,
+};
 
 /// Target table, explicit column list and OVERWRITE flag of an INSERT.
 fn insert_target(stmt: &Statement) -> sqe_core::Result<(&ObjectName, &[ObjectName], bool)> {
@@ -1084,6 +1090,34 @@ impl WriteHandler {
         table_ident: &TableIdent,
         op: &'static str,
         stmt_label: &str,
+        build_attempt: F,
+    ) -> sqe_core::Result<Option<T>>
+    where
+        F: FnMut(IcebergTable) -> Fut,
+        Fut: std::future::Future<Output = sqe_core::Result<Option<RewriteAttempt<T>>>>,
+    {
+        let none = std::collections::HashMap::new();
+        self.commit_rewrite_and_properties_with_retry(
+            catalog,
+            table_ident,
+            op,
+            stmt_label,
+            &none,
+            build_attempt,
+        )
+        .await
+    }
+
+    /// [`Self::commit_rewrite_with_retry`] that also sets `properties` on the
+    /// table in the same commit, so the rewrite and the properties land
+    /// together or not at all (#894, in-place `CREATE OR REPLACE`).
+    async fn commit_rewrite_and_properties_with_retry<T, F, Fut>(
+        &self,
+        catalog: &dyn Catalog,
+        table_ident: &TableIdent,
+        op: &'static str,
+        stmt_label: &str,
+        properties: &std::collections::HashMap<String, String>,
         mut build_attempt: F,
     ) -> sqe_core::Result<Option<T>>
     where
@@ -1160,7 +1194,10 @@ impl WriteHandler {
             if !remove.is_empty() {
                 action = action.delete_files(remove);
             }
-            let commit_result = match action.apply(tx) {
+            let commit_result = match action
+                .apply(tx)
+                .and_then(|tx| with_properties(tx, properties))
+            {
                 Ok(tx) => {
                     self.before_commit_seam().await;
                     tx.commit(catalog).await
@@ -2314,6 +2351,7 @@ impl WriteHandler {
                     &iceberg_schema,
                 ) =>
             {
+                let properties = replace_in_place_properties(user_options);
                 let total_rows = self
                     .ctas_replace_in_place(
                         session,
@@ -2322,6 +2360,7 @@ impl WriteHandler {
                         &session_catalog,
                         live.clone(),
                         &table_ident,
+                        &properties,
                     )
                     .await?;
                 return affected_rows_batch(total_rows as u64);
@@ -2532,9 +2571,10 @@ impl WriteHandler {
     ///   removes the parquet files this attempt wrote;
     /// - grants survive, because nothing is dropped.
     ///
-    /// Table properties from the statement's `WITH` / `TBLPROPERTIES` clause
-    /// are NOT re-applied: an in-place replace keeps the live table's
-    /// properties. `ALTER TABLE ... SET TBLPROPERTIES` changes them.
+    /// `properties` (the statement's `WITH` / `TBLPROPERTIES`, see
+    /// [`replace_in_place_properties`]) are set in the same commit as the
+    /// swap; the live table's other properties stay (#894).
+    #[allow(clippy::too_many_arguments)]
     async fn ctas_replace_in_place(
         &self,
         session: &Session,
@@ -2543,6 +2583,7 @@ impl WriteHandler {
         catalog: &Arc<SessionCatalog>,
         table: IcebergTable,
         table_ident: &TableIdent,
+        properties: &std::collections::HashMap<String, String>,
     ) -> sqe_core::Result<usize> {
         info!(
             table = %table_ident,
@@ -2572,11 +2613,12 @@ impl WriteHandler {
 
         let borrowed = (&data_files, table_ident);
         let committed = self
-            .commit_rewrite_with_retry(
+            .commit_rewrite_and_properties_with_retry(
                 catalog.as_catalog().as_ref(),
                 table_ident,
                 "ctas-replace",
                 "CREATE OR REPLACE TABLE",
+                properties,
                 move |fresh_table| {
                     let (data_files, table_ident) = borrowed;
                     async move {
@@ -2618,6 +2660,8 @@ impl WriteHandler {
         if committed.is_none() {
             self.commit_empty_snapshot(session, catalog, table_ident)
                 .await?;
+            let bridge = catalog.as_catalog();
+            commit_properties(bridge.as_ref(), table_ident, properties).await?;
         }
 
         if let Some(sketches) = finish_puffin_sketches(sketch_acc) {
@@ -9295,113 +9339,6 @@ pub(crate) async fn ensure_namespace(
         Err(e) => Err(SqeError::Catalog(format!(
             "Failed to ensure namespace: {e}"
         ))),
-    }
-}
-
-/// Fold a `Vec<SqlOption>` (from sqlparser-rs `TBLPROPERTIES (...)` or
-/// `WITH (...)` clauses) into a property HashMap.
-///
-/// Only `KeyValue` options are materialised. Existing entries in `props`
-/// (typically `format-version` set by the SQE auto-upgrade path) are
-/// preserved when the user did not explicitly set them; an explicit
-/// user-supplied value wins so callers can pin a different format version.
-/// Extract the user-specified option list from a sqlparser 0.62
-/// `CreateTableOptions`. The 0.62 AST collapses the old separate
-/// `table_properties` (TBLPROPERTIES) and `with_options` (WITH (...)) fields
-/// into this single enum; every property-bearing variant carries a
-/// `Vec<SqlOption>`, so we return that slice regardless of the syntax the user
-/// wrote. `None` (no options) yields an empty slice.
-pub(crate) fn create_table_options_as_slice(
-    options: &sqlparser::ast::CreateTableOptions,
-) -> &[sqlparser::ast::SqlOption] {
-    use sqlparser::ast::CreateTableOptions;
-    match options {
-        CreateTableOptions::With(opts)
-        | CreateTableOptions::Options(opts)
-        | CreateTableOptions::Plain(opts)
-        | CreateTableOptions::TableProperties(opts) => opts.as_slice(),
-        CreateTableOptions::None => &[],
-    }
-}
-
-/// The properties a CREATE TABLE / CTAS hands to `create_table`: the
-/// format-version directive for the backend plus every user TBLPROPERTIES /
-/// WITH option. A non-REST catalog rejects any reserved property, including a
-/// user's own `'format-version' = '3'`; the version it asked for is already in
-/// `TableCreation.format_version` (`plan_create_table_schema` reads the
-/// option), so the reserved keys are dropped there (#854). `rest_catalog`:
-/// the catalog speaks the Iceberg REST protocol.
-pub(crate) fn create_table_properties(
-    rest_catalog: bool,
-    format_version: FormatVersion,
-    options: &[sqlparser::ast::SqlOption],
-) -> std::collections::HashMap<String, String> {
-    let mut props = if rest_catalog {
-        format_version_properties(format_version)
-    } else {
-        std::collections::HashMap::new()
-    };
-    merge_user_table_properties(&mut props, options);
-    if !rest_catalog {
-        props.retain(|k, _| {
-            !iceberg::spec::TableProperties::RESERVED_PROPERTIES.contains(&k.as_str())
-        });
-    }
-    props
-}
-
-/// Record `columns` in the `sqe.json-columns` property (#848). Nothing is
-/// written for an empty set, so a table without JSON columns keeps the
-/// properties it had.
-pub(crate) fn record_json_columns(
-    props: &mut std::collections::HashMap<String, String>,
-    columns: std::collections::BTreeSet<String>,
-) {
-    use sqe_core::json_columns::{encode, JSON_COLUMNS_PROP};
-    if columns.is_empty() {
-        return;
-    }
-    props.insert(JSON_COLUMNS_PROP.to_string(), encode(&columns));
-}
-
-/// The folded names of the columns a CREATE TABLE declares `JSON`.
-pub(crate) fn declared_json_columns(
-    columns: &[sqlparser::ast::ColumnDef],
-) -> std::collections::BTreeSet<String> {
-    columns
-        .iter()
-        .filter(|col| matches!(col.data_type, sqlparser::ast::DataType::JSON))
-        .map(|col| fold_unquoted_ident(&col.name))
-        .collect()
-}
-
-pub(crate) fn merge_user_table_properties(
-    props: &mut std::collections::HashMap<String, String>,
-    options: &[sqlparser::ast::SqlOption],
-) {
-    use sqlparser::ast::SqlOption;
-    for opt in options {
-        if let SqlOption::KeyValue { key, value } = opt {
-            let k = key.value.clone();
-            let v = sql_expr_to_property_string(value);
-            props.insert(k, v);
-        }
-    }
-}
-
-/// Turn a sqlparser `Expr` value used in TBLPROPERTIES / WITH into the
-/// raw string Iceberg expects. We trim surrounding string-literal quotes
-/// so `'merge-on-read'` becomes `merge-on-read` rather than `'merge-on-read'`.
-fn sql_expr_to_property_string(expr: &sqlparser::ast::Expr) -> String {
-    use sqlparser::ast::{Expr, Value};
-    match expr {
-        Expr::Value(v) => match &v.value {
-            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => s.clone(),
-            Value::Number(n, _) => n.clone(),
-            Value::Boolean(b) => b.to_string(),
-            other => other.to_string(),
-        },
-        other => other.to_string(),
     }
 }
 

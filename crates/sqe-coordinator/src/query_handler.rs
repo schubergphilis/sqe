@@ -284,22 +284,34 @@ const POLICY_TABLE_PROPERTIES: &[&str] = &[crate::tag_source_impl::PROP_KEY];
 
 /// True when an `ALTER TABLE ... SET TBLPROPERTIES` writes a policy property
 /// (matched case-insensitively), which needs the same admin gate as SET/UNSET
-/// TAGS.
+/// TAGS. So does a `CREATE OR REPLACE TABLE` naming one: an in-place replace
+/// sets the statement's properties on the live table, whose older snapshots
+/// still hold the data those tags mask (#894).
 fn sets_reserved_table_property(stmt: &Statement) -> bool {
-    let Statement::AlterTable(at) = stmt else {
-        return false;
+    let names_policy_property = |options: &[sqlparser::ast::SqlOption]| {
+        options.iter().any(|p| match p {
+            sqlparser::ast::SqlOption::KeyValue { key, .. } => POLICY_TABLE_PROPERTIES
+                .iter()
+                .any(|reserved| key.value.eq_ignore_ascii_case(reserved)),
+            _ => false,
+        })
     };
-    at.operations.iter().any(|op| match op {
-        sqlparser::ast::AlterTableOperation::SetTblProperties { table_properties } => {
-            table_properties.iter().any(|p| match p {
-                sqlparser::ast::SqlOption::KeyValue { key, .. } => POLICY_TABLE_PROPERTIES
-                    .iter()
-                    .any(|reserved| key.value.eq_ignore_ascii_case(reserved)),
-                _ => false,
-            })
-        }
+    match stmt {
+        Statement::AlterTable(at) => at.operations.iter().any(|op| match op {
+            sqlparser::ast::AlterTableOperation::SetTblProperties { table_properties } => {
+                names_policy_property(table_properties)
+            }
+            _ => false,
+        }),
+        Statement::CreateTable(ct) if ct.or_replace => match &ct.table_options {
+            sqlparser::ast::CreateTableOptions::With(o)
+            | sqlparser::ast::CreateTableOptions::Options(o)
+            | sqlparser::ast::CreateTableOptions::Plain(o)
+            | sqlparser::ast::CreateTableOptions::TableProperties(o) => names_policy_property(o),
+            sqlparser::ast::CreateTableOptions::None => false,
+        },
         _ => false,
-    })
+    }
 }
 
 /// A compile-time firewall, not an extension point: keep it even with one impl.
@@ -1813,11 +1825,8 @@ impl QueryHandler {
         // preflight so a non-admin is refused on the privilege, whatever the
         // catalog qualifier, and learns nothing about which catalogs exist.
         if kind.statement().is_some_and(sets_reserved_table_property) {
-            self.require_admin(
-                session,
-                "ALTER TABLE ... SET TBLPROPERTIES on a policy property",
-            )
-            .map_err(failed)?;
+            self.require_admin(session, "setting a policy table property")
+                .map_err(failed)?;
         }
 
         // Pre-flight: when a 3-part identifier names a catalog that the
