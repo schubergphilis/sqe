@@ -116,40 +116,45 @@ impl IngestServer {
         }
     }
 
-    /// The ingest records in the audit log (native, OCSF). The other
-    /// statements a test runs (CREATE, SELECT) write records of their own;
-    /// only the ingest ones are returned, and the native chain is verified
-    /// over the whole file.
-    fn ingest_records(&self) -> (Vec<Value>, Vec<Value>) {
+    /// Every record in the audit log (native, OCSF), the native chain
+    /// verified over the whole file.
+    fn audit_records(&self) -> (Vec<Value>, Vec<Value>) {
         let files = self.audit.as_ref().expect("an audited server");
         files.logger.flush();
         let bytes = std::fs::read(&files.native).unwrap_or_default();
         let native = json_lines(&bytes);
-        let report = verify_audit_bytes(&bytes).expect("audit hash chain verifies");
-        assert_eq!(report.records, native.len() as u64);
+        if !bytes.is_empty() {
+            let report = verify_audit_bytes(&bytes).expect("audit hash chain verifies");
+            assert_eq!(report.records, native.len() as u64);
+        }
         let ocsf = json_lines(&std::fs::read(&files.ocsf).unwrap_or_default());
-        let native: Vec<Value> = native
-            .into_iter()
-            .filter(|r| r["query"]["statement_type"] == "ingest")
-            .collect();
-        let uids: Vec<&Value> = native.iter().map(|r| &r["integrity"]["hash"]).collect();
-        let ocsf = ocsf
-            .into_iter()
-            .filter(|r| uids.contains(&&r["metadata"]["uid"]))
-            .collect();
         (native, ocsf)
     }
 
-    /// Exactly one ingest record in each file, its OCSF line the chained
-    /// native record; returns the native one.
-    fn one_ingest_record(&self) -> Value {
-        let (native, ocsf) = self.ingest_records();
-        let dump = serde_json::to_string_pretty(&native).unwrap_or_default();
-        assert_eq!(native.len(), 1, "one native ingest record:\n{dump}");
-        assert_eq!(ocsf.len(), 1, "one OCSF ingest record");
-        let r = native[0].clone();
+    /// How many records each file holds now; pass it to [`Self::one_record_since`].
+    fn audit_mark(&self) -> (usize, usize) {
+        let (native, ocsf) = self.audit_records();
+        (native.len(), ocsf.len())
+    }
+
+    /// Exactly one record in each file since `mark`, an ingest record whose
+    /// OCSF line is the chained native record; returns the native one. The
+    /// count is over the whole file, so a second record of any kind written
+    /// by the ingest is caught.
+    fn one_ingest_record_since(&self, mark: (usize, usize)) -> Value {
+        let (native, ocsf) = self.audit_records();
+        let new = &native[mark.0..];
+        let dump = serde_json::to_string_pretty(new).unwrap_or_default();
+        assert_eq!(new.len(), 1, "one native record for the ingest:\n{dump}");
+        assert_eq!(ocsf.len() - mark.1, 1, "one OCSF record for the ingest");
+        let r = new[0].clone();
         assert_eq!(r["kind"], "query", "{r}");
+        assert_eq!(r["query"]["statement_type"], "ingest", "{r}");
         assert!(r["integrity"]["seq"].is_u64(), "chained: {r}");
+        assert_eq!(
+            ocsf[mark.1]["metadata"]["uid"], r["integrity"]["hash"],
+            "the OCSF line is the chained native record"
+        );
         r
     }
 
@@ -926,17 +931,19 @@ async fn ingest_append_writes_one_audit_record() {
         None,
     );
     let sent = batch(&[(1, "alpha"), (2, "beta"), (3, "gamma")]);
+    let mark = server.audit_mark();
     ingest(&mut client, cmd, vec![sent]).await.expect("ingest");
 
-    let r = server.one_ingest_record();
+    let r = server.one_ingest_record_since(mark);
     assert_eq!(r["status"], "success", "{r}");
     assert_eq!(r["stats"]["rows_written"], 3, "{r}");
     assert_eq!(r["resources"][0]["name"], table, "{r}");
     assert_eq!(r["resources"][0]["namespace"][0], SCHEMA, "{r}");
+    let catalog = r["resources"][0]["catalog"].as_str().expect("a catalog");
     assert_eq!(
         r["query"]["text"],
         format!(
-            "INSERT INTO {} /* flight sql ingest: if_not_exist=fail, if_exists=append */",
+            "INSERT INTO {catalog}.{} /* flight sql ingest: if_not_exist=fail, if_exists=append */",
             fq(table)
         ),
         "{r}"
@@ -968,11 +975,12 @@ async fn ingest_with_snapshot_properties_writes_one_audit_record() {
         "snapshot-property.pipeline-run".to_string(),
         "run-value-887".to_string(),
     );
+    let mark = server.audit_mark();
     ingest(&mut client, cmd, vec![batch(&[(1, "alpha")])])
         .await
         .expect("ingest");
 
-    let r = server.one_ingest_record();
+    let r = server.one_ingest_record_since(mark);
     assert_eq!(r["status"], "success", "{r}");
     assert_eq!(r["stats"]["rows_written"], 1, "{r}");
     assert_eq!(
@@ -1003,10 +1011,11 @@ async fn ingest_fail_if_exists_writes_one_audit_record() {
         TableExistsOption::Fail,
         None,
     );
+    let mark = server.audit_mark();
     let result = ingest(&mut client, cmd, vec![batch(&[(1, "refused")])]).await;
     assert_eq!(status_code(&result), Some(tonic::Code::AlreadyExists));
 
-    let r = server.one_ingest_record();
+    let r = server.one_ingest_record_since(mark);
     assert_eq!(r["status"], "failure", "{r}");
     assert_eq!(r["error_code"], "DUPLICATE_TABLE", "{r}");
     assert!(r["stats"].get("rows_written").is_none(), "{r}");
@@ -1032,14 +1041,124 @@ async fn ingest_bad_snapshot_property_writes_one_audit_record() {
     );
     cmd.options
         .insert("snapshot-property.bad key".to_string(), "value".to_string());
+    let mark = server.audit_mark();
     let result = ingest(&mut client, cmd, vec![batch(&[(1, "refused")])]).await;
     assert_eq!(status_code(&result), Some(tonic::Code::InvalidArgument));
 
-    let r = server.one_ingest_record();
+    let r = server.one_ingest_record_since(mark);
     assert_eq!(r["status"], "failure", "{r}");
     assert_eq!(r["error_code"], "INVALID_ARGUMENTS", "{r}");
     assert!(r["stats"].get("snapshot_property_keys").is_none(), "{r}");
     assert_eq!(rows(&mut client, table).await, Vec::<String>::new());
+    drop_table(&mut client, table).await;
+}
+
+/// An ingest that creates its table writes one record (no separate DDL
+/// record) naming the new table and the rows written.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ingest_create_writes_one_audit_record() {
+    let server = IngestServer::start_audited().await;
+    let mut client = server.client().await;
+    let table = "flight_ingest_audit_create";
+    drop_table(&mut client, table).await;
+
+    let cmd = ingest_command(
+        table,
+        TableNotExistOption::Create,
+        TableExistsOption::Fail,
+        None,
+    );
+    let mark = server.audit_mark();
+    ingest(&mut client, cmd, vec![batch(&[(1, "alpha"), (2, "beta")])])
+        .await
+        .expect("ingest");
+
+    let r = server.one_ingest_record_since(mark);
+    assert_eq!(r["status"], "success", "{r}");
+    assert_eq!(r["stats"]["rows_written"], 2, "{r}");
+    assert_eq!(r["resources"][0]["name"], table, "{r}");
+    let text = r["query"]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("if_not_exist=create"), "{r}");
+    drop_table(&mut client, table).await;
+}
+
+/// A replace writes one record with the rows of the new snapshot.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ingest_replace_writes_one_audit_record() {
+    let server = IngestServer::start_audited().await;
+    let mut client = server.client().await;
+    let table = "flight_ingest_audit_replace";
+    fresh_table(&mut client, table).await;
+    let first = ingest_command(
+        table,
+        TableNotExistOption::Fail,
+        TableExistsOption::Append,
+        None,
+    );
+    ingest(&mut client, first, vec![batch(&[(1, "old"), (2, "old")])])
+        .await
+        .expect("seed");
+
+    let cmd = ingest_command(
+        table,
+        TableNotExistOption::Create,
+        TableExistsOption::Replace,
+        None,
+    );
+    let mark = server.audit_mark();
+    ingest(&mut client, cmd, vec![batch(&[(9, "new")])])
+        .await
+        .expect("replace");
+
+    let r = server.one_ingest_record_since(mark);
+    assert_eq!(r["status"], "success", "{r}");
+    assert_eq!(r["stats"]["rows_written"], 1, "{r}");
+    let text = r["query"]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("if_exists=replace"), "{r}");
+    drop_table(&mut client, table).await;
+}
+
+/// An ingest and an INSERT into the same table name the same resource,
+/// catalog included, so a search by table finds both.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ingest_and_insert_record_the_same_resource() {
+    let server = IngestServer::start_audited().await;
+    let mut client = server.client().await;
+    let table = "flight_ingest_audit_parity";
+    fresh_table(&mut client, table).await;
+
+    let mark = server.audit_mark();
+    let insert = format!("INSERT INTO {} VALUES (1, 'alpha')", fq(table));
+    client.execute_update(insert, None).await.expect("insert");
+    let (native, _) = server.audit_records();
+    let inserts: Vec<&Value> = native[mark.0..]
+        .iter()
+        .filter(|r| r["kind"] == "query")
+        .collect();
+    assert_eq!(inserts.len(), 1, "one INSERT record: {inserts:?}");
+    let insert_resource = inserts[0]["resources"][0].clone();
+
+    let cmd = ingest_command(
+        table,
+        TableNotExistOption::Fail,
+        TableExistsOption::Append,
+        None,
+    );
+    let mark = server.audit_mark();
+    ingest(&mut client, cmd, vec![batch(&[(2, "beta")])])
+        .await
+        .expect("ingest");
+    let r = server.one_ingest_record_since(mark);
+    for field in ["catalog", "namespace", "name", "object_type"] {
+        assert_eq!(
+            r["resources"][0][field], insert_resource[field],
+            "{field}: ingest {r} vs INSERT {insert_resource}"
+        );
+    }
+    assert!(r["resources"][0]["catalog"].is_string(), "{r}");
     drop_table(&mut client, table).await;
 }
 

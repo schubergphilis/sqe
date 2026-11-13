@@ -134,6 +134,73 @@ async fn an_oversized_statement_writes_one_audit_record() {
     assert!(fx.handler.query_tracker().records().is_empty());
 }
 
+/// The streaming entry point (Flight DoGet, Trino HTTP) refuses an oversized
+/// statement the same way, with one record.
+#[tokio::test]
+async fn an_oversized_streaming_statement_writes_one_audit_record() {
+    let fx = fixture_opts(Arc::new(PassthroughEnforcer), opts("max_sql_bytes = 1100")).await;
+    let sql = format!("SELECT '{}' AS a", "x".repeat(2048));
+    let err = fx
+        .handler
+        .execute_stream(&session_for("size-stream-user"), &sql, None)
+        .await
+        .err()
+        .expect("oversized");
+    assert_eq!(err.error_code(), SqeErrorCode::InvalidArguments, "{err}");
+
+    let s = Written::of(&fx).one_failure("SELECT ", "INVALID_ARGUMENTS");
+    assert_eq!(s["query"]["text_len"], sql.len(), "{s}");
+}
+
+/// Flight SQL `GetFlightInfo` refuses an oversized statement before it plans;
+/// that refusal writes one statement record (next to the request's `auth`
+/// record).
+#[tokio::test]
+async fn an_oversized_flight_statement_writes_one_audit_record() {
+    use arrow_flight::sql::server::FlightSqlService;
+
+    let fx = fixture_opts(Arc::new(PassthroughEnforcer), opts("max_sql_bytes = 1100")).await;
+    let provider = Arc::new(sqe_auth::AnonymousProvider::new(
+        sqe_auth::AnonymousProviderConfig::default(),
+    ));
+    let service = sqe_coordinator::flight_sql::SqeFlightSqlService::new(
+        Arc::new(sqe_coordinator::SessionManager::with_provider(provider)),
+        Arc::clone(&fx.handler),
+        fx.config.clone(),
+    );
+    let sql = format!("SELECT '{}' AS a", "x".repeat(2048));
+    let mut req = tonic::Request::new(arrow_flight::FlightDescriptor::new_cmd(vec![]));
+    req.metadata_mut().insert(
+        "authorization",
+        "Bearer header.payload.sig".parse().unwrap(),
+    );
+    let cmd = arrow_flight::sql::CommandStatementQuery {
+        query: sql.clone(),
+        transaction_id: None,
+    };
+    let status = service
+        .get_flight_info_statement(cmd, req)
+        .await
+        .expect_err("oversized");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status}");
+
+    let (native, ocsf) = fx.records();
+    let statements: Vec<&Value> = native.iter().filter(|r| r["kind"] == "query").collect();
+    let dump = serde_json::to_string_pretty(&native).unwrap_or_default();
+    assert_eq!(statements.len(), 1, "one statement record:\n{dump}");
+    assert_eq!(
+        native.len(),
+        2,
+        "the statement and the auth record:\n{dump}"
+    );
+    assert_eq!(ocsf.len(), 2, "both in OCSF too");
+    let s = statements[0];
+    assert_eq!(s["status"], "failure", "{s}");
+    assert_eq!(s["error_code"], "INVALID_ARGUMENTS", "{s}");
+    assert_eq!(s["query"]["text"], "SELECT ", "{s}");
+    assert_eq!(s["query"]["text_len"], sql.len(), "{s}");
+}
+
 /// Admission refuses before classification: here the per-user memory budget
 /// is smaller than one statement's quota.
 #[tokio::test]

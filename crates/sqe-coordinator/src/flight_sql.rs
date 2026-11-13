@@ -62,6 +62,7 @@ use crate::worker_registry::WorkerRegistry;
 
 // Re-export helpers so callers that imported directly from this module
 // keep working without changes.
+use crate::flight_ingest::{request_refusal_error, IngestAuditGuard, IngestFailure};
 pub use crate::flight_sql_helpers::FetchResults;
 use crate::flight_sql_helpers::{sqe_error_to_status, FlightStream};
 
@@ -880,6 +881,24 @@ impl SqeFlightSqlService {
         Ok((statement_id, statement))
     }
 
+    /// Record a refusal of `sql` that happened before the query handler ran
+    /// it (a bad parameter bind, a missing bind, an unusable transaction
+    /// handle) as one failed statement, and hand the status back unchanged.
+    fn audit_request_refusal(
+        &self,
+        session: &sqe_core::Session,
+        sql: &str,
+        start: std::time::Instant,
+        client_ip: Option<String>,
+        query_id: Option<uuid::Uuid>,
+        status: Status,
+    ) -> Status {
+        let error = request_refusal_error(&status);
+        self.query_handler
+            .audit_failure(session, sql, start, client_ip, query_id, error);
+        status
+    }
+
     /// Decode an inbound parameter stream and bind it to `statement`.
     ///
     /// Finding 406: values are bound as typed Arrow scalars and checked
@@ -1564,10 +1583,23 @@ impl SqeFlightSqlService {
     ) -> Result<Response<FlightStream>, Status> {
         // A stored plan whose tables' vended keys are due for refresh is not
         // run: the path below re-plans, which reloads the tables.
+        // A refusal here is the statement's only record (#882).
+        let start = std::time::Instant::now();
+        let refusal_ip = client_ip.clone();
+        let refused = move |status: Status| {
+            self.audit_request_refusal(
+                session,
+                &statement.sql,
+                start,
+                refusal_ip.clone(),
+                query_id,
+                status,
+            )
+        };
         if statement.plan.is_some() && !statement.stored_plan_credentials_expired() {
             let plan = statement
                 .bound_plan()
-                .map_err(Status::failed_precondition)?;
+                .map_err(|e| refused(Status::failed_precondition(e)))?;
             let (schema, stream) = self
                 .query_handler
                 .execute_plan_stream_with_id(
@@ -1581,7 +1613,7 @@ impl SqeFlightSqlService {
                 .map_err(|e| sqe_error_to_status(&e, None))?;
             return self.stream_to_flight_response(schema, stream);
         }
-        match required_bind(statement)? {
+        match required_bind(statement).map_err(&refused)? {
             Some(params) => {
                 let run = self.run_sql_into_flight_response(
                     session,
@@ -1751,57 +1783,6 @@ impl SqeFlightSqlService {
         }
 
         Ok(rows)
-    }
-}
-
-/// Why a Flight SQL ingest failed: an engine error, which the audit record
-/// carries as is, or a refusal of the request itself, which the client gets
-/// as the `Status` it always got.
-pub(crate) enum IngestFailure {
-    Engine(sqe_core::SqeError),
-    Request(Status),
-}
-
-impl From<sqe_core::SqeError> for IngestFailure {
-    fn from(e: sqe_core::SqeError) -> Self {
-        Self::Engine(e)
-    }
-}
-
-impl From<Status> for IngestFailure {
-    fn from(s: Status) -> Self {
-        Self::Request(s)
-    }
-}
-
-/// The error an ingest's audit record carries for a refusal of the request
-/// itself: its gRPC code mapped onto the nearest engine code, with the
-/// message the client got. The ingest's own refusals are invalid options
-/// (`InvalidArgument`) and transaction conflicts (`FailedPrecondition`).
-fn request_refusal_error(status: &Status) -> sqe_core::SqeError {
-    use sqe_core::SqeErrorCode as C;
-    let code = match status.code() {
-        tonic::Code::InvalidArgument | tonic::Code::OutOfRange => C::InvalidArguments,
-        tonic::Code::FailedPrecondition | tonic::Code::Aborted => C::TransactionConflict,
-        tonic::Code::PermissionDenied => C::AccessDenied,
-        tonic::Code::Unauthenticated => C::AuthenticationFailed,
-        tonic::Code::NotFound => C::TableNotFound,
-        tonic::Code::AlreadyExists => C::DuplicateTable,
-        tonic::Code::ResourceExhausted => C::ResourceExhausted,
-        tonic::Code::Unimplemented => C::NotSupported,
-        tonic::Code::Cancelled => C::QueryCancelled,
-        tonic::Code::DeadlineExceeded => C::QueryTimeout,
-        _ => C::ExecutionFailed,
-    };
-    sqe_core::SqeError::with_code(code, status.message())
-}
-
-impl IngestFailure {
-    fn into_status(self) -> Status {
-        match self {
-            Self::Engine(e) => sqe_error_to_status(&e, None),
-            Self::Request(s) => s,
-        }
     }
 }
 
@@ -2868,41 +2849,33 @@ impl FlightSqlService for SqeFlightSqlService {
         // Every authenticated ingest leaves one audit record, success or
         // failure, like an INSERT (#887). The authentication refusal above
         // has its own record.
-        let start = std::time::Instant::now();
-        let client_ip = Some(self.extract_client_ip(&request));
-        let mut audit = crate::audit_emitter::IngestAudit {
-            table: sqe_metrics::audit::Resource {
-                catalog: ticket.catalog.clone(),
-                namespace: ticket.schema.iter().cloned().collect(),
-                name: ticket.table.clone(),
-                object_type: sqe_metrics::audit::ObjectType::Table,
+        // The catalog defaults the way a statement's does, so an ingest and
+        // an INSERT into the same table name the same resource.
+        let catalog = ticket
+            .catalog
+            .clone()
+            .or_else(|| session.default_catalog.clone())
+            .unwrap_or_else(|| self.config.resolve_default_catalog());
+        let mut guard = IngestAuditGuard {
+            logger: self.audit.clone(),
+            session: Arc::clone(&session),
+            audit: crate::audit_emitter::IngestAudit {
+                table: sqe_metrics::audit::Resource {
+                    catalog: Some(catalog),
+                    namespace: ticket.schema.iter().cloned().collect(),
+                    name: ticket.table.clone(),
+                    object_type: sqe_metrics::audit::ObjectType::Table,
+                },
+                mode: None,
+                snapshot_property_keys: Vec::new(),
             },
-            mode: None,
-            snapshot_property_keys: Vec::new(),
+            start: std::time::Instant::now(),
+            client_ip: Some(self.extract_client_ip(&request)),
         };
         let result = self
-            .statement_ingest(Arc::clone(&session), ticket, request, &mut audit)
+            .statement_ingest(session, ticket, request, &mut guard.audit)
             .await;
-        if let Some(logger) = self.audit.as_deref() {
-            let refusal;
-            let outcome = match &result {
-                Ok(rows) => Ok(*rows as u64),
-                Err(IngestFailure::Engine(e)) => Err(e),
-                Err(IngestFailure::Request(status)) => {
-                    refusal = request_refusal_error(status);
-                    Err(&refusal)
-                }
-            };
-            crate::audit_emitter::emit_ingest_audit(
-                logger,
-                &session,
-                &audit,
-                outcome,
-                start.elapsed(),
-                client_ip,
-                uuid::Uuid::now_v7(),
-            );
-        }
+        guard.finish(&result);
         result
             .map(|rows| rows as i64)
             .map_err(IngestFailure::into_status)
@@ -2956,10 +2929,28 @@ impl FlightSqlService for SqeFlightSqlService {
         let (_, statement) = self
             .prepared_from_handle(&session, &query.prepared_statement_handle)
             .await?;
+        // Past the handle lookup the statement is known: a refusal before the
+        // query handler runs it is its only record (#882).
+        let start = std::time::Instant::now();
+        let refused = |status: Status| {
+            self.audit_request_refusal(
+                &session,
+                &statement.sql,
+                start,
+                client_ip.clone(),
+                None,
+                status,
+            )
+        };
         self.bind_prepared_from_stream(&statement, request.into_inner())
-            .await?;
-        let session = in_request_transaction(session, statement.transaction_handle())?;
-        let batches = match required_bind(&statement)? {
+            .await
+            .map_err(refused)?;
+        let txn_session =
+            in_request_transaction(Arc::clone(&session), statement.transaction_handle())
+                .map_err(refused)?;
+        let params = required_bind(&statement).map_err(refused)?;
+        let session = txn_session;
+        let batches = match params {
             Some(params) => {
                 self.query_handler
                     .execute_bound_with_id(
