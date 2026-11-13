@@ -1010,3 +1010,82 @@ async fn ctas_replace_in_place_sets_tblproperties_894() {
 
     let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {fq}")).await;
 }
+
+/// `(column, tag)` rows of `SHOW TAGS ON table`.
+async fn show_tags(
+    handler: &sqe_coordinator::QueryHandler,
+    session: &sqe_core::Session,
+    table: &str,
+) -> Vec<(String, String)> {
+    let batches = exec(handler, session, &format!("SHOW TAGS ON {table}")).await;
+    let mut rows = Vec::new();
+    for b in &batches {
+        let col = |i: usize| {
+            b.column(i)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("utf8")
+        };
+        for r in 0..b.num_rows() {
+            rows.push((col(0).value(r).to_string(), col(1).value(r).to_string()));
+        }
+    }
+    rows
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// A schema-changing CREATE OR REPLACE keeps the table's properties (#896).
+// It is staged under a temporary name and renamed into place; the staged
+// table took only the statement's options, so the live properties went,
+// `sqe.column-tags` among them, while a same-schema replace kept them.
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ctas_replace_with_a_new_schema_keeps_properties_and_tags_896() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let fq = "default.ctas_replace_tags_896";
+    let prop = |k: &str, v: &str| format!("'{k}' = '{v}'");
+
+    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {fq}")).await;
+    let create = format!(
+        "CREATE TABLE {fq} TBLPROPERTIES ('sqe_test.keep' = 'x', 'sqe_test.a' = '1') \
+         AS SELECT 1 AS id, 'a@b' AS email, 'x' AS gone"
+    );
+    exec(&handler, &session, &create).await;
+    // SET TAG is admin-only; same token, with an admin role.
+    let admin = sqe_core::Session::new(
+        "root".to_string(),
+        session.access_token().clone(),
+        None,
+        chrono::Utc::now() + chrono::Duration::hours(1),
+        vec!["service_admin".to_string()],
+    );
+    for column in ["email", "gone"] {
+        let tag = format!("ALTER TABLE {fq} MODIFY COLUMN {column} SET TAG pii_896 = 'true'");
+        exec(&handler, &admin, &tag).await;
+    }
+    let tagged: Vec<String> = show_tags(&handler, &session, fq)
+        .await
+        .into_iter()
+        .map(|(c, _)| c)
+        .collect();
+    assert_eq!(tagged, ["email", "gone"], "tags set");
+
+    // `gone` dropped and `extra` added: the staged path.
+    let replace = format!(
+        "CREATE OR REPLACE TABLE {fq} TBLPROPERTIES ('sqe_test.a' = '2') \
+         AS SELECT 2 AS id, 'c@d' AS email, 3 AS extra"
+    );
+    exec(&handler, &session, &replace).await;
+
+    let tags = show_tags(&handler, &session, fq).await;
+    assert_eq!(tags.len(), 1, "only email keeps a tag: {tags:?}");
+    assert_eq!(tags[0].0, "email", "{tags:?}");
+    let ddl = show_create(&handler, &session, fq).await;
+    for want in [prop("sqe_test.keep", "x"), prop("sqe_test.a", "2")] {
+        assert!(ddl.contains(&want), "missing {want}: {ddl}");
+    }
+    assert!(ddl.contains("extra"), "the new schema: {ddl}");
+
+    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {fq}")).await;
+}

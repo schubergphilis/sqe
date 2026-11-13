@@ -42,11 +42,11 @@ mod ingest;
 mod snapshot_props;
 mod table_props;
 pub use ingest::{IngestMode, OnExisting, OnMissing};
-use table_props::{commit_properties, sql_expr_to_property_string, with_properties};
 pub(crate) use table_props::{
-    create_table_options_as_slice, create_table_properties, declared_json_columns,
-    record_json_columns, replace_in_place_properties,
+    carry_live_properties, create_table_options_as_slice, create_table_properties,
+    declared_json_columns, record_json_columns, replace_in_place_properties,
 };
+use table_props::{commit_properties, sql_expr_to_property_string, with_properties};
 
 /// Target table, explicit column list and OVERWRITE flag of an INSERT.
 fn insert_target(stmt: &Statement) -> sqe_core::Result<(&ObjectName, &[ObjectName], bool)> {
@@ -2393,6 +2393,16 @@ impl WriteHandler {
         // a CTAS must keep properties like write.parquet.bloom-filter-* that
         // drive the data write, matching the plain CREATE TABLE path.
         let mut props = create_table_properties(rest_catalog, create_format_version, user_options);
+        // A staged replace keeps the live table's properties and the tags of
+        // the columns it still has, as the in-place replace does (#896).
+        if let Some(live) = &existing {
+            let columns: Vec<&str> = arrow_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect();
+            carry_live_properties(&mut props, live.metadata().properties(), &columns);
+        }
         // A string column the SELECT marks as JSON text stays JSON (#848).
         record_json_columns(
             &mut props,
