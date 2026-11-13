@@ -58,6 +58,11 @@
       {% endif %}
       {% set dest_columns = adapter.get_columns_in_relation(this) %}
       {% set merge_update_columns = dest_columns | map(attribute='name') | list %}
+      {% if merge_update_columns | length == 0 %}
+        {{ exceptions.raise_compiler_error(
+            "merge strategy: no columns found for " ~ this
+            ~ "; refusing to render a MERGE with empty UPDATE SET and INSERT lists") }}
+      {% endif %}
       {% call statement('main') %}
         MERGE INTO {{ this }} AS target
         USING ({{ compiled_code }}) AS source

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -54,12 +54,17 @@ pub struct NamespaceListing {
     /// than an outage. Denied is a legitimate (empty) answer; unavailable
     /// is not.
     pub denied: bool,
+    /// Set when a commit touched the namespace after (or while) these names
+    /// were listed (#890). The names are still served, because they are the
+    /// best answer there is, but the next pre-plan refresh re-lists, and
+    /// `table_exist` treats them as unknown rather than as fact.
+    pub invalidated: bool,
 }
 
 impl NamespaceListing {
     /// True when a refresh should run before the next planning pass.
     pub fn needs_refresh(&self) -> bool {
-        self.checked_at.elapsed() >= Duration::from_secs(TABLE_NAMES_TTL_SECS)
+        self.invalidated || self.checked_at.elapsed() >= Duration::from_secs(TABLE_NAMES_TTL_SECS)
     }
 
     /// True when the snapshot is stale because the catalog could not be
@@ -97,16 +102,43 @@ pub fn cached_namespace_listing(
     TABLE_NAMES_SNAPSHOTS.get(&listing_key(catalog, warehouse, namespace))
 }
 
-/// Drop every principal's snapshot of `namespace` (in any warehouse) so the
-/// next pre-plan refresh of each session re-lists it.
+/// Bumped by every invalidation, before it marks any snapshot (#890). A
+/// refresh reads it before listing and again after storing: if it moved, a
+/// commit may have landed after the listing was taken, so the stored
+/// snapshot is marked invalidated instead of passing as fresh for a TTL.
+/// Process-wide rather than per key, because a refresh in flight for a
+/// principal with no snapshot yet has no entry to carry a flag; the cost is
+/// an occasional extra re-list of an untouched namespace.
+static LISTING_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Mark one snapshot invalidated, keeping its names.
+fn mark_invalidated(key: &str) {
+    if let Some(listing) = TABLE_NAMES_SNAPSHOTS.get(key) {
+        if !listing.invalidated {
+            let marked = NamespaceListing {
+                invalidated: true,
+                ..(*listing).clone()
+            };
+            TABLE_NAMES_SNAPSHOTS.insert(key.to_string(), Arc::new(marked));
+        }
+    }
+}
+
+/// Mark every principal's snapshot of `namespace` (in any warehouse)
+/// invalidated so the next pre-plan refresh of each session re-lists it.
 ///
 /// A table created, dropped or renamed by one session is visible to all of
-/// them, but snapshots are keyed per token: dropping only the writer's left
+/// them, but snapshots are keyed per token: marking only the writer's left
 /// every other session (a parallel dbt model with its own connection, another
 /// user) answering `table_exist` and `information_schema.tables` from the
-/// pre-DDL list until the TTL. Matching on the namespace alone over-evicts a
+/// pre-DDL list until the TTL. Matching on the namespace alone over-marks a
 /// same-named namespace in another warehouse, which only costs it a re-list.
+///
+/// The snapshot is marked, not deleted (#890): a reader that planned between
+/// the refresh and this call would otherwise find no names at all and answer
+/// `information_schema.columns` with zero rows for tables nobody touched.
 pub fn invalidate_namespace_listing_all_tokens(namespace: &str) {
+    LISTING_EPOCH.fetch_add(1, Ordering::SeqCst);
     let suffix = format!("|{namespace}");
     let keys: Vec<Arc<String>> = TABLE_NAMES_SNAPSHOTS
         .iter()
@@ -114,14 +146,15 @@ pub fn invalidate_namespace_listing_all_tokens(namespace: &str) {
         .map(|(key, _)| key)
         .collect();
     for key in keys {
-        TABLE_NAMES_SNAPSHOTS.invalidate(key.as_str());
+        mark_invalidated(key.as_str());
     }
 }
 
-/// Drop the snapshot for one namespace so the next pre-plan refresh
-/// re-lists it. Call after DDL that creates or drops a table/view.
+/// Mark the snapshot for one namespace invalidated so the next pre-plan
+/// refresh re-lists it. Call after DDL that creates or drops a table/view.
 pub fn invalidate_namespace_listing(catalog: &SessionCatalog, warehouse: &str, namespace: &str) {
-    TABLE_NAMES_SNAPSHOTS.invalidate(&listing_key(catalog, warehouse, namespace));
+    LISTING_EPOCH.fetch_add(1, Ordering::SeqCst);
+    mark_invalidated(&listing_key(catalog, warehouse, namespace));
 }
 
 /// Fold one refresh outcome into the previous snapshot: success replaces the
@@ -139,6 +172,7 @@ pub(crate) fn merge_listing(
             checked_at: Instant::now(),
             stale_error: None,
             denied: false,
+            invalidated: false,
         },
         Err((error, denied)) => NamespaceListing {
             names: previous.map(|p| p.names.clone()).unwrap_or_default(),
@@ -146,6 +180,7 @@ pub(crate) fn merge_listing(
             checked_at: Instant::now(),
             stale_error: Some(error),
             denied,
+            invalidated: previous.is_some_and(|p| p.invalidated),
         },
     }
 }
@@ -164,6 +199,7 @@ pub async fn refresh_namespace_listing(
     namespace: &str,
 ) -> sqe_core::Result<Arc<NamespaceListing>> {
     let key = listing_key(catalog, warehouse, namespace);
+    let epoch = LISTING_EPOCH.load(Ordering::SeqCst);
     let previous = TABLE_NAMES_SNAPSHOTS.get(&key);
     let ns_ident = NamespaceIdent::new(namespace.to_string());
 
@@ -204,8 +240,19 @@ pub async fn refresh_namespace_listing(
             Some(e),
         ),
     };
+    // A commit that landed while we listed may be missing from `names`.
+    // Store the listing either way (it is the newest there is), marked so
+    // the next statement re-lists. Checked again after the insert: an
+    // invalidation that bumped the epoch after the first check marks the
+    // entry itself, because its mark runs after its bump, which is after
+    // this insert.
+    let mut merged = merged;
+    merged.invalidated |= LISTING_EPOCH.load(Ordering::SeqCst) != epoch;
     let merged = Arc::new(merged);
-    TABLE_NAMES_SNAPSHOTS.insert(key, Arc::clone(&merged));
+    TABLE_NAMES_SNAPSHOTS.insert(key.clone(), Arc::clone(&merged));
+    if LISTING_EPOCH.load(Ordering::SeqCst) != epoch {
+        mark_invalidated(&key);
+    }
     match err {
         Some(e) => {
             error!(namespace = %namespace, error = %e, kept = merged.names.len(), "Failed to list tables; keeping previous snapshot");
@@ -415,8 +462,10 @@ impl SchemaProvider for SqeSchemaProvider {
                         "Serving last known table list; catalog listing is stale"
                     );
                 }
-                self.listing_failed
-                    .store(listing.stale_error.is_some(), Ordering::Relaxed);
+                // An invalidated snapshot is served (#890) but is not proof
+                // of absence, as a deleted one was not before it.
+                let unknown = listing.stale_error.is_some() || listing.invalidated;
+                self.listing_failed.store(unknown, Ordering::Relaxed);
                 listing.names.clone()
             }
             None => {
@@ -466,7 +515,60 @@ impl SchemaProvider for SqeSchemaProvider {
         name_exists_in(&names, name)
     }
 
+    /// A name the namespace's snapshot lists but the catalog does not find
+    /// is retried a few times before it is left out (#890): `CREATE OR
+    /// REPLACE` that changes the schema stages, drops and renames, so a
+    /// reader can catch the table missing for a moment, and
+    /// `information_schema.columns` then answered zero rows for it. A name
+    /// that is not listed, or that stays missing (dropped elsewhere; the
+    /// next refresh drops it from the list), costs nothing extra or at most
+    /// the backoff below.
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        let mut delay = LISTED_NAME_RETRY_DELAY;
+        for attempt in 0..=LISTED_NAME_RETRIES {
+            match self.load_table_or_view(name).await? {
+                Lookup::Found(provider) => return Ok(Some(provider)),
+                Lookup::NotIceberg => return Ok(None),
+                Lookup::Absent => {
+                    let listed = self
+                        .cached_listing()
+                        .is_some_and(|l| name_exists_in(&l.names, name));
+                    if !listed || attempt == LISTED_NAME_RETRIES {
+                        return Ok(None);
+                    }
+                    debug!(
+                        namespace = %self.namespace,
+                        table = name,
+                        attempt,
+                        "Listed name not found; retrying (a concurrent replace may be swapping it)"
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Retries for a listed name the catalog does not find, and the first
+/// backoff (doubled each time: 25 + 50 + 100 ms at most). See
+/// [`SqeSchemaProvider::table`].
+const LISTED_NAME_RETRIES: u32 = 3;
+const LISTED_NAME_RETRY_DELAY: Duration = Duration::from_millis(25);
+
+/// What one catalog lookup of a name found.
+enum Lookup {
+    Found(Arc<dyn TableProvider>),
+    /// The catalog lists the name but it is not an Iceberg table (a Delta
+    /// table in Unity Catalog); resolves to no table without a retry.
+    NotIceberg,
+    Absent,
+}
+
+impl SqeSchemaProvider {
+    /// Load `name` as an Iceberg table, else as an Iceberg view.
+    async fn load_table_or_view(&self, name: &str) -> DFResult<Lookup> {
         debug!(
             namespace = %self.namespace,
             table = name,
@@ -487,10 +589,15 @@ impl SchemaProvider for SqeSchemaProvider {
                     let provider = provider
                         .with_tuning(self.tuning.clone())
                         .with_reloader(self.session_catalog.table_reloader(table_ident.clone()));
-                    return Ok(Some(Arc::new(provider)));
+                    return Ok(Lookup::Found(Arc::new(provider)));
                 }
                 Err(e) => {
+                    // The table exists; SQE cannot read its schema. Falling
+                    // through to the view lookup answered "table not found"
+                    // to a SELECT and left the table out of
+                    // `information_schema` without a word (#890).
                     error!(table = name, error = %e, "Failed to create table provider");
+                    return Err(DataFusionError::External(Box::new(e)));
                 }
             },
             Err(e) if should_try_view_after_table_error(&e) => {
@@ -499,7 +606,7 @@ impl SchemaProvider for SqeSchemaProvider {
             Err(e) if table_error_is_not_iceberg(&e) => {
                 debug!(table = name, error = %e, "Listed name is not an Iceberg table");
                 crate::file_tvf_prepare::note_not_iceberg(&self.namespace, name);
-                return Ok(None);
+                return Ok(Lookup::NotIceberg);
             }
             Err(e) => {
                 // Swallowing a Polaris 403 here turns AccessDenied into
@@ -511,7 +618,7 @@ impl SchemaProvider for SqeSchemaProvider {
         // Second: try loading as an Iceberg view. Views are a REST-only
         // surface; other backends have no view endpoint to consult.
         if !self.session_catalog.is_rest_backend() {
-            return Ok(None);
+            return Ok(Lookup::Absent);
         }
         match self.session_catalog.load_view_body(&ns_ident, name).await {
             Ok(Some(body)) => {
@@ -521,7 +628,8 @@ impl SchemaProvider for SqeSchemaProvider {
                     default_schema = %body.default_schema,
                     "Loaded view SQL, planning..."
                 );
-                return self.plan_view(name, body).await;
+                let view = self.plan_view(name, body).await?;
+                return Ok(view.map_or(Lookup::Absent, Lookup::Found));
             }
             Ok(None) => {}
             Err(e) if e.is_not_found() => {
@@ -536,7 +644,7 @@ impl SchemaProvider for SqeSchemaProvider {
             }
         }
 
-        Ok(None)
+        Ok(Lookup::Absent)
     }
 }
 
@@ -869,10 +977,11 @@ mod tests {
         assert!(err.contains("more than 32 views deep"), "{err}");
     }
 
-    /// DDL is visible to every session, so it drops every principal's
-    /// snapshot of the namespace, and only that namespace's.
+    /// DDL is visible to every session, so it marks every principal's
+    /// snapshot of the namespace for a re-list, and only that namespace's.
+    /// The names stay served until then (#890).
     #[test]
-    fn ddl_invalidation_drops_every_tokens_listing_of_the_namespace() {
+    fn ddl_invalidation_marks_every_tokens_listing_of_the_namespace() {
         let tag = uuid::Uuid::new_v4().to_string();
         let ns = format!("cbs_silver_{}", &tag[..8]);
         let other = format!("x.{ns}");
@@ -890,9 +999,28 @@ mod tests {
         }
         invalidate_namespace_listing_all_tokens(&ns);
         for key in &keys[..3] {
-            assert!(TABLE_NAMES_SNAPSHOTS.get(key).is_none(), "{key} survived");
+            let listing = TABLE_NAMES_SNAPSHOTS.get(key).expect("names are kept");
+            let marked = listing.invalidated && listing.needs_refresh();
+            assert!(marked, "{key} not marked");
+            assert_eq!(listing.names, ["t"], "{key}");
         }
-        assert!(TABLE_NAMES_SNAPSHOTS.get(&keys[3]).is_some(), "`x.{ns}` is a different namespace");
+        let other = TABLE_NAMES_SNAPSHOTS.get(&keys[3]);
+        let other = other.expect("other namespace");
+        assert!(!other.invalidated, "`x.{ns}` is a different namespace");
+    }
+
+    /// A successful refresh clears the mark; a failed one keeps it, so the
+    /// next statement tries again.
+    #[test]
+    fn refresh_outcome_decides_whether_the_mark_stays() {
+        let marked = NamespaceListing {
+            invalidated: true,
+            ..merge_listing(None, Ok(vec!["t".to_string()]))
+        };
+        assert!(!merge_listing(Some(&marked), Ok(vec![])).invalidated);
+        let failed = merge_listing(Some(&marked), Err(("503".to_string(), false)));
+        assert!(failed.invalidated && failed.needs_refresh());
+        assert_eq!(failed.names, ["t"]);
     }
 
     /// A view body's scans carry the table they resolved to, so the policy

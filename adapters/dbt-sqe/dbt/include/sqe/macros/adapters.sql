@@ -36,6 +36,26 @@
     ORDER BY ordinal_position
   {% endcall %}
   {% set table = load_result('get_columns').table %}
+  {#- dbt-core asks for the columns of relations that may not exist yet and
+      expects []. A relation that exists has at least one column, so no
+      columns for a listed relation is a wrong answer (SQE #890 returned one
+      while other sessions ran DDL): fail instead of rendering a MERGE or
+      INSERT with an empty column list. -#}
+  {% if table.rows | length == 0 %}
+    {% call statement('get_columns_exists', fetch_result=True) %}
+      SELECT COUNT(*) AS n
+      FROM information_schema.tables
+      WHERE table_name = '{{ relation.identifier }}'
+        AND table_schema = '{{ relation.schema }}'
+        AND table_catalog = '{{ relation.database }}'
+    {% endcall %}
+    {% if load_result('get_columns_exists').table.rows[0][0] | int > 0 %}
+      {{ exceptions.raise_database_error(
+          "information_schema.columns returned no columns for " ~ relation
+          ~ ", which information_schema.tables lists. Refusing to continue with an"
+          ~ " empty column list; rerun the model, and upgrade SQE if this repeats (#890).") }}
+    {% endif %}
+  {% endif %}
   {{ return(sql_convert_columns_in_relation(table)) }}
 {% endmacro %}
 
