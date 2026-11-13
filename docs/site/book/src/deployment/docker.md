@@ -16,7 +16,7 @@ graph TB
     end
 ```
 
-- **Build:** one multi-stage Dockerfile. Stage 1 is `rust:<toolchain>-bookworm` and a plain `cargo build --release --locked`. No cargo-chef, no sccache. Same file for local compose, data-platform quickstart/sqe, and aikido/kaniko.
+- **Build:** one multi-stage Dockerfile on `rust:<toolchain>-bookworm`. cargo-chef compiles the dependencies in their own layer, and BuildKit cache mounts keep the cargo registry and `target/` between builds. No sccache: the target cache already holds every compiled crate. Same file for local compose and the data-platform quickstart. CI compiles outside the image build and packages the binaries with `Dockerfile.ci`.
 - **Base (runtime):** `cgr.dev/chainguard/glibc-dynamic` (digest-pinned). glibc, libgcc, and CA certificates only. No shell, no package manager, no OpenSSL.
 - **Why not Debian slim / distroless:** the binaries link only `libc` / `libm` / `libgcc` (TLS is rustls). Bookworm-slim carried hundreds of unused OS CVEs. Distroless cut most of that but still fails the Aikido image gate on unfixed debian `libc` criticals. Chainguard is clean under `grype --fail-on high`.
 - **User:** Non-root UID/GID **65532**. Helm `securityContext` matches this UID.
