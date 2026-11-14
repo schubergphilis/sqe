@@ -156,6 +156,21 @@ impl ResultCache {
         non_deterministic.iter().any(|f| upper.contains(f))
     }
 
+    /// Whether a result read catalog metadata: `information_schema` or the
+    /// `system` catalog. Such a result changes with DDL on any table, which
+    /// the per-table eviction cannot reach (a CTAS evicts its own table, not
+    /// `information_schema.columns`), so it is never stored.
+    pub fn reads_catalog_metadata(resources: &[sqe_metrics::audit::Resource]) -> bool {
+        resources.iter().any(|r| {
+            r.catalog
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case("system"))
+                || r.namespace
+                    .iter()
+                    .any(|ns| ns.eq_ignore_ascii_case("information_schema"))
+        })
+    }
+
     /// Look up a cached result by user + SQL.
     pub fn lookup(&self, user: &str, sql: &str) -> Option<Arc<CachedResult>> {
         if Self::should_bypass(sql) {
@@ -634,6 +649,27 @@ mod tests {
 
         reader.join().expect("reader should not panic");
         writer.join().expect("writer should not panic");
+    }
+
+    #[test]
+    fn catalog_metadata_reads_are_not_cacheable() {
+        use sqe_metrics::audit::{ObjectType, Resource};
+        let resource = |catalog: Option<&str>, ns: &str, name: &str| Resource {
+            catalog: catalog.map(str::to_string),
+            namespace: vec![ns.to_string()],
+            name: name.to_string(),
+            object_type: ObjectType::Table,
+        };
+        let columns = resource(Some("iceberg"), "information_schema", "columns");
+        let nodes = resource(Some("system"), "runtime", "nodes");
+        let orders = resource(Some("iceberg"), "sales", "orders");
+        assert!(ResultCache::reads_catalog_metadata(&[
+            orders.clone(),
+            columns
+        ]));
+        assert!(ResultCache::reads_catalog_metadata(&[nodes]));
+        assert!(!ResultCache::reads_catalog_metadata(&[orders]));
+        assert!(!ResultCache::reads_catalog_metadata(&[]));
     }
 
     #[test]

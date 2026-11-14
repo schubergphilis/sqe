@@ -1639,8 +1639,8 @@ impl EmbeddedClient {
     /// (second and millisecond timestamps widened to microseconds), the rows
     /// land in one append commit, and a failure after the create drops the
     /// table again. `PARTITIONED BY`, `TBLPROPERTIES` / `WITH` and
-    /// `OR REPLACE` (in place when the schema fits, staged and swapped when
-    /// it does not) behave as on the cluster. `Ok(None)` means "not ours"
+    /// `OR REPLACE` (one commit on the existing table, which takes the new
+    /// columns and partitioning when they differ) behave as on the cluster. `Ok(None)` means "not ours"
     /// and falls through to `ctx.sql`.
     async fn embedded_handle_iceberg_ctas(
         &self,
@@ -4198,8 +4198,8 @@ mod tests {
     /// CTAS runs the coordinator's streaming CTAS (#875), not DataFusion's
     /// empty CREATE plus a separate INSERT: the rows land in one snapshot,
     /// `PARTITIONED BY` and `TBLPROPERTIES` are kept instead of refused, and
-    /// `CREATE OR REPLACE` replaces in place when the schema fits and swaps
-    /// in a new table when it does not.
+    /// `CREATE OR REPLACE` is one commit on the existing table, keeping its
+    /// history, whether or not the schema changes (#892).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ctas_is_one_commit_and_keeps_partitioning_and_replace() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -4249,7 +4249,8 @@ mod tests {
             .expect("select");
         assert_eq!(rows(r), vec![vec!["7".to_string(), "eu".to_string()]]);
 
-        // Different schema: a new table swapped in under the same name.
+        // Different schema: one more commit on the same table (#892), which
+        // takes the new columns and, without PARTITIONED BY, no partitioning.
         let replace = "CREATE OR REPLACE TABLE ice.s1.t AS SELECT 'x' AS label";
         client
             .execute(replace)
@@ -4260,6 +4261,15 @@ mod tests {
             .await
             .expect("select");
         assert_eq!(rows(r), vec![vec!["x".to_string()]]);
+        let r = client.execute(snapshots).await.expect("snapshots");
+        assert_eq!(rows(r), vec![vec!["3".to_string()]], "history kept");
+        let ddl = client
+            .execute("SHOW CREATE TABLE ice.s1.t")
+            .await
+            .expect("show create");
+        let ddl = ddl.rows[0][0].clone();
+        assert!(!ddl.contains("PARTITIONED BY"), "{ddl}");
+        assert!(ddl.contains("sqe.test.prop"), "properties kept: {ddl}");
     }
 
     /// `DROP SCHEMA ... CASCADE` on an Iceberg catalog drops the schema's

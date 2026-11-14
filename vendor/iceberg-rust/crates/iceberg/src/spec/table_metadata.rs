@@ -270,6 +270,29 @@ impl TableMetadata {
         &self.default_partition_type
     }
 
+    /// SQE PATCH (sqe#892): the schema to bind `spec`'s partition type against.
+    ///
+    /// The current schema when it holds every source column of the spec; otherwise the newest
+    /// schema that does. An older spec may name a source column that a later schema dropped
+    /// (a replace that drops the partition column), and binding it to the current schema
+    /// would type an identity field as `unknown`, so files written under it could no longer
+    /// be listed in a manifest.
+    pub fn schema_for_partition_spec(&self, spec: &super::PartitionSpec) -> &SchemaRef {
+        let holds_sources = |schema: &SchemaRef| {
+            spec.fields()
+                .iter()
+                .all(|field| schema.field_by_id(field.source_id).is_some())
+        };
+        let current = self.current_schema();
+        if holds_sources(current) {
+            return current;
+        }
+        self.schemas_iter()
+            .filter(|schema| holds_sources(schema))
+            .max_by_key(|schema| schema.schema_id())
+            .unwrap_or(current)
+    }
+
     /// Returns the unified partition type across every partition spec in the table, resolved
     /// against `schema`.
     ///

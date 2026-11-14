@@ -13,9 +13,10 @@ use futures::{StreamExt, TryStreamExt};
 use iceberg::arrow::arrow_schema_to_schema_auto_assign_ids;
 use iceberg::spec::{
     DataContentType, DataFile, FormatVersion, ManifestStatus, NestedField, Schema as IcebergSchema,
+    MAIN_BRANCH,
 };
 use iceberg::table::Table as IcebergTable;
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::transaction::{ApplyTransactionAction, ReplaceTableShapeAction, Transaction};
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 use sqlparser::ast::{ObjectName, Statement};
 use tracing::{info, warn};
@@ -38,15 +39,16 @@ use crate::writer::{
 };
 use sqe_compaction::write_memory::{TrackedBatchBuffer, WriteReservation};
 
+mod ctas_replace;
 mod ingest;
 mod snapshot_props;
 mod table_props;
 pub use ingest::{IngestMode, OnExisting, OnMissing};
-pub(crate) use table_props::{
-    carry_live_properties, create_table_options_as_slice, create_table_properties,
-    declared_json_columns, record_json_columns, replace_in_place_properties,
-};
 use table_props::{commit_properties, sql_expr_to_property_string, with_properties};
+pub(crate) use table_props::{
+    create_table_options_as_slice, create_table_properties, declared_json_columns,
+    record_json_columns, replace_in_place_properties, replace_shape_properties, PropertyChanges,
+};
 
 /// Target table, explicit column list and OVERWRITE flag of an INSERT.
 fn insert_target(stmt: &Statement) -> sqe_core::Result<(&ObjectName, &[ObjectName], bool)> {
@@ -1096,28 +1098,38 @@ impl WriteHandler {
         F: FnMut(IcebergTable) -> Fut,
         Fut: std::future::Future<Output = sqe_core::Result<Option<RewriteAttempt<T>>>>,
     {
-        let none = std::collections::HashMap::new();
         self.commit_rewrite_and_properties_with_retry(
             catalog,
             table_ident,
             op,
             stmt_label,
-            &none,
+            &PropertyChanges::default(),
+            None,
             build_attempt,
         )
         .await
     }
 
-    /// [`Self::commit_rewrite_with_retry`] that also sets `properties` on the
-    /// table in the same commit, so the rewrite and the properties land
+    /// [`Self::commit_rewrite_with_retry`] that also applies `properties` to
+    /// the table in the same commit, so the rewrite and the properties land
     /// together or not at all (#894, in-place `CREATE OR REPLACE`).
+    ///
+    /// `shape`: the schema and partition change of a `CREATE OR REPLACE`
+    /// whose columns or partitioning differ (#892), committed ahead of the
+    /// rewrite in the same commit. Each attempt pins `main` to the head it
+    /// collected the remove set from, so a concurrent append makes the
+    /// attempt rerun instead of being rebased into the commit; a concurrent
+    /// schema change fails it. An attempt with no files to add or remove
+    /// then commits the shape and the properties only.
+    #[allow(clippy::too_many_arguments)]
     async fn commit_rewrite_and_properties_with_retry<T, F, Fut>(
         &self,
         catalog: &dyn Catalog,
         table_ident: &TableIdent,
         op: &'static str,
         stmt_label: &str,
-        properties: &std::collections::HashMap<String, String>,
+        properties: &PropertyChanges,
+        shape: Option<&ReplaceTableShapeAction>,
         mut build_attempt: F,
     ) -> sqe_core::Result<Option<T>>
     where
@@ -1169,6 +1181,12 @@ impl WriteHandler {
                 SqeError::Catalog(format!("Failed to load table {table_ident}: {e}"))
             })?;
             let base = table.metadata_location().map(str::to_string);
+            if let Some(shape) = shape {
+                shape
+                    .pins()
+                    .check(table.metadata())
+                    .map_err(|e| failed(&e))?;
+            }
             let Some(RewriteAttempt {
                 add,
                 remove,
@@ -1179,25 +1197,34 @@ impl WriteHandler {
                 return Ok(None);
             };
 
-            let tx = Transaction::new(&table);
+            let mut tx = Transaction::new(&table);
+            if let Some(shape) = shape {
+                let main = table.metadata().snapshot_for_ref(MAIN_BRANCH);
+                let shape = shape
+                    .clone()
+                    .with_expected_main(main.map(|s| s.snapshot_id()));
+                tx = shape.apply(tx).map_err(|e| failed(&e))?;
+            }
             // Every caller changes table data, so the snapshot is an
             // `overwrite`. A `replace` tells incremental readers (Spark
             // streaming, Databricks) the data did not change, and they skip it.
-            let mut action = tx.overwrite_files();
-            snapshot_props::stamp_overwrite(&mut action, &snapshot_props);
-            if let Some(branch) = &target_branch {
-                action = action.set_target_branch(branch.clone());
-            }
-            if !add.is_empty() {
-                action = action.add_data_files(add);
-            }
-            if !remove.is_empty() {
-                action = action.delete_files(remove);
-            }
-            let commit_result = match action
-                .apply(tx)
-                .and_then(|tx| with_properties(tx, properties))
-            {
+            let rewritten = if add.is_empty() && remove.is_empty() {
+                Ok(tx)
+            } else {
+                let mut action = tx.overwrite_files();
+                snapshot_props::stamp_overwrite(&mut action, &snapshot_props);
+                if let Some(branch) = &target_branch {
+                    action = action.set_target_branch(branch.clone());
+                }
+                if !add.is_empty() {
+                    action = action.add_data_files(add);
+                }
+                if !remove.is_empty() {
+                    action = action.delete_files(remove);
+                }
+                action.apply(tx)
+            };
+            let commit_result = match rewritten.and_then(|tx| with_properties(tx, properties)) {
                 Ok(tx) => {
                     self.before_commit_seam().await;
                     tx.commit(catalog).await
@@ -1477,8 +1504,9 @@ impl TableCacheInvalidator for SessionCatalog {
     }
 }
 
-/// Can `CREATE OR REPLACE TABLE ... AS SELECT` swap this table's contents in
-/// place, or does the replacement have to be staged and renamed (500)?
+/// Can `CREATE OR REPLACE TABLE ... AS SELECT` swap this table's contents
+/// under its current schema and spec, or does the commit have to change them
+/// too (#892)?
 ///
 /// In place requires that what the streaming writer would produce fits the live
 /// table exactly, because the writer stamps every batch onto the live table's
@@ -1491,7 +1519,8 @@ impl TableCacheInvalidator for SessionCatalog {
 /// - an explicit `PARTITIONED BY` must name the same source columns with the
 ///   same transforms as the live default spec (source columns are compared by
 ///   name: field ids differ between a freshly assigned schema and an evolved
-///   one). No `PARTITIONED BY` keeps the live table's partitioning.
+///   one). No `PARTITIONED BY` means unpartitioned, as in Iceberg's replace
+///   transaction, so it fits only an unpartitioned live table.
 fn ctas_replace_is_in_place(
     live: &IcebergTable,
     new_arrow_schema: &ArrowSchema,
@@ -1518,17 +1547,17 @@ fn ctas_replace_is_in_place(
         }
     }
     // An in-place replace keeps the live properties, so a SELECT that
-    // changes which columns hold JSON text takes the staged path (#848).
+    // changes which columns hold JSON text takes the shape path (#848).
     if sqe_core::json_columns::json_columns(live.metadata().properties())
         != sqe_core::json_columns::marked_columns(new_arrow_schema)
     {
         return false;
     }
 
-    let Some(unbound) = new_partition_spec else {
-        return true;
-    };
     let live_spec = live.metadata().default_partition_spec();
+    let Some(unbound) = new_partition_spec else {
+        return live_spec.is_unpartitioned();
+    };
     if unbound.fields().len() != live_spec.fields().len() {
         return false;
     }
@@ -2342,67 +2371,91 @@ impl WriteHandler {
             .await?;
         }
 
-        let staged_ident = match &existing {
-            Some(live)
-                if ctas_replace_is_in_place(
+        if let Some(live) = &existing {
+            // A replace keeps the live table's format version unless the
+            // statement or the SELECT needs a higher one (#892).
+            let live_version = live.metadata().format_version();
+            let version = ctas_replace::replace_format_version(
+                &table_ident,
+                live_version,
+                requested_format_version(user_options)?,
+                arrow_schema_has_variant(output_schema.as_arrow()),
+            )?;
+            let (arrow_schema, iceberg_schema, partition_spec) = if version == create_format_version
+            {
+                (arrow_schema, iceberg_schema, partition_spec)
+            } else {
+                let arrow = Arc::new(write_schema_for_format_version(
+                    output_schema.as_arrow(),
+                    version,
+                ));
+                let iceberg = arrow_schema_to_iceberg(&arrow)?;
+                let spec = build_partition_spec(partition_by, &iceberg)?;
+                (arrow, iceberg, spec)
+            };
+            let in_place = version == live_version
+                && ctas_replace_is_in_place(
                     live,
                     &arrow_schema,
                     partition_spec.as_ref(),
                     &iceberg_schema,
-                ) =>
-            {
-                let properties = replace_in_place_properties(user_options);
-                let total_rows = self
-                    .ctas_replace_in_place(
-                        session,
-                        ctx,
-                        df,
-                        &session_catalog,
-                        live.clone(),
-                        &table_ident,
-                        &properties,
-                    )
-                    .await?;
-                return affected_rows_batch(total_rows as u64);
-            }
-            Some(_) => Some(TableIdent::new(
-                namespace.clone(),
-                format!("{name}__sqe_replace_{}", Uuid::new_v4().simple()),
-            )),
-            None => None,
-        };
-
-        // The name the table is CREATEd under: the target itself, or the
-        // staging name when an incompatible replacement has to be swapped in.
-        let create_ident = staged_ident.clone().unwrap_or_else(|| table_ident.clone());
-        let create_name = create_ident.name().to_string();
-        if let Some(staged) = &staged_ident {
-            warn!(
-                table = %table_ident,
-                staged = %staged,
-                "CREATE OR REPLACE: the SELECT's schema or partitioning differs from \
-                 the live table, so the replacement is staged under a temporary name \
-                 and swapped in with DROP + RENAME. The existing table survives a \
-                 failing SELECT; only the swap itself is two catalog calls, and the \
-                 replaced table's snapshot history does not carry over."
+                );
+            let (write_table, shape, properties) = if in_place {
+                let properties = PropertyChanges {
+                    set: replace_in_place_properties(user_options),
+                    remove: Vec::new(),
+                };
+                (live.clone(), None, properties)
+            } else {
+                // Other columns, partitioning or format version: the new
+                // shape becomes current in the same commit as the data (#892).
+                ctas_replace::refuse_shape_change_off_main(&table_ident)?;
+                let columns: Vec<&str> = arrow_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect();
+                let properties = replace_shape_properties(
+                    user_options,
+                    live.metadata().properties(),
+                    &columns,
+                    sqe_core::json_columns::marked_columns(&arrow_schema),
+                );
+                let (shape, evolved) = ctas_replace::plan_replace_shape(
+                    live,
+                    iceberg_schema,
+                    partition_spec,
+                    version,
+                )?;
+                (evolved, Some(shape), properties)
+            };
+            let total_rows = self
+                .ctas_replace_in_place(
+                    session,
+                    ctx,
+                    df,
+                    &session_catalog,
+                    write_table,
+                    &table_ident,
+                    &properties,
+                    shape.as_ref(),
+                )
+                .await?;
+            let replaced = catalog.load_table(&table_ident).await.ok();
+            record_lineage_snapshot(
+                plan_out,
+                replaced.and_then(|t| t.metadata().current_snapshot_id()),
             );
+            return affected_rows_batch(total_rows as u64);
         }
 
+        let create_ident = table_ident.clone();
+        let create_name = name.clone();
         let location = unique_table_location(catalog.as_ref(), &namespace, &create_name).await;
         // Merge user TBLPROPERTIES / WITH options (see handle_ctas for why):
         // a CTAS must keep properties like write.parquet.bloom-filter-* that
         // drive the data write, matching the plain CREATE TABLE path.
         let mut props = create_table_properties(rest_catalog, create_format_version, user_options);
-        // A staged replace keeps the live table's properties and the tags of
-        // the columns it still has, as the in-place replace does (#896).
-        if let Some(live) = &existing {
-            let columns: Vec<&str> = arrow_schema
-                .fields()
-                .iter()
-                .map(|f| f.name().as_str())
-                .collect();
-            carry_live_properties(&mut props, live.metadata().properties(), &columns);
-        }
         // A string column the SELECT marks as JSON text stays JSON (#848).
         record_json_columns(
             &mut props,
@@ -2524,34 +2577,7 @@ impl WriteHandler {
             rollback_ctas_partial_create(&catalog, &table, &create_ident).await;
         }
         let (total_rows, snapshot_id) = post_create?;
-        // A staged replacement is renamed into place below and keeps its
-        // snapshot, so the id names the target's data either way.
         record_lineage_snapshot(plan_out, snapshot_id);
-
-        // Swap a staged replacement into place (500). Both calls are metadata
-        // only. The failure message names the staged table so the swap can be
-        // finished by hand rather than leaving the data unreachable.
-        if let Some(staged) = &staged_ident {
-            catalog.drop_table(&table_ident).await.map_err(|e| {
-                SqeError::Catalog(format!(
-                    "CREATE OR REPLACE: failed to drop the existing table \
-                     '{table_ident}': {e}. The replacement is committed as '{staged}'; \
-                     no data was lost."
-                ))
-            })?;
-            catalog
-                .rename_table(staged, &table_ident)
-                .await
-                .map_err(|e| {
-                    SqeError::Catalog(format!(
-                        "CREATE OR REPLACE: '{table_ident}' was dropped and the replacement \
-                     is committed as '{staged}', but renaming it into place failed: {e}. \
-                     Run ALTER TABLE {staged} RENAME TO {table_ident} to finish the swap."
-                    ))
-                })?;
-            self.after_commit(session, session_catalog.as_ref(), staged)
-                .await;
-        }
 
         // The table exists and holds its data now: drop the caller's cached
         // session context and every token's metadata entry for it (507).
@@ -2584,6 +2610,11 @@ impl WriteHandler {
     /// `properties` (the statement's `WITH` / `TBLPROPERTIES`, see
     /// [`replace_in_place_properties`]) are set in the same commit as the
     /// swap; the live table's other properties stay (#894).
+    ///
+    /// `shape`: the new columns, partitioning or format version when they
+    /// differ from the live table's (#892). `table` is then the live table as
+    /// it reads after that change, so the data files are written in the new
+    /// shape, and the change commits together with the data swap.
     #[allow(clippy::too_many_arguments)]
     async fn ctas_replace_in_place(
         &self,
@@ -2593,12 +2624,13 @@ impl WriteHandler {
         catalog: &Arc<SessionCatalog>,
         table: IcebergTable,
         table_ident: &TableIdent,
-        properties: &std::collections::HashMap<String, String>,
+        properties: &PropertyChanges,
+        shape: Option<&ReplaceTableShapeAction>,
     ) -> sqe_core::Result<usize> {
         info!(
             table = %table_ident,
-            "CREATE OR REPLACE TABLE: replacing contents in place (schema and \
-             partitioning unchanged)"
+            shape_change = shape.is_some(),
+            "CREATE OR REPLACE TABLE: replacing contents in place"
         );
 
         let tracker = new_upload_tracker();
@@ -2629,11 +2661,13 @@ impl WriteHandler {
                 "ctas-replace",
                 "CREATE OR REPLACE TABLE",
                 properties,
+                shape,
                 move |fresh_table| {
                     let (data_files, table_ident) = borrowed;
+                    let has_shape = shape.is_some();
                     async move {
                         let live = self.collect_data_files(&fresh_table).await?;
-                        if live.is_empty() && data_files.is_empty() {
+                        if live.is_empty() && data_files.is_empty() && !has_shape {
                             info!(
                                 table = %table_ident,
                                 "CREATE OR REPLACE: empty table replaced by an empty \
@@ -2641,6 +2675,7 @@ impl WriteHandler {
                             );
                             return Ok(None);
                         }
+                        let live_was_empty = live.is_empty();
                         let removed_files = live.len();
                         let files_to_remove = self
                             .extend_with_superseded_deletes(&fresh_table, live)
@@ -2655,7 +2690,7 @@ impl WriteHandler {
                             add: data_files.clone(),
                             remove: files_to_remove,
                             cleanup: None,
-                            value: (),
+                            value: !(live_was_empty && data_files.is_empty()),
                         }))
                     }
                 },
@@ -2667,11 +2702,21 @@ impl WriteHandler {
         // unknown: the swap may have landed, so the files stay.
         let committed = committed.inspect_err(|e| cleanup_guard.keep_if_outcome_unknown(e))?;
         cleanup_guard.mark_committed();
-        if committed.is_none() {
-            self.commit_empty_snapshot(session, catalog, table_ident)
-                .await?;
-            let bridge = catalog.as_catalog();
-            commit_properties(bridge.as_ref(), table_ident, properties).await?;
+        // No data moved (an empty table replaced by an empty SELECT): record
+        // the statement as an empty snapshot, as a plain CTAS does. The
+        // properties are already in a shape commit; otherwise they go now.
+        match committed {
+            Some(true) => {}
+            Some(false) => {
+                self.commit_empty_snapshot(session, catalog, table_ident)
+                    .await?;
+            }
+            None => {
+                self.commit_empty_snapshot(session, catalog, table_ident)
+                    .await?;
+                let bridge = catalog.as_catalog();
+                commit_properties(bridge.as_ref(), table_ident, properties).await?;
+            }
         }
 
         if let Some(sketches) = finish_puffin_sketches(sketch_acc) {
@@ -14142,6 +14187,10 @@ s3_path_style = true
             Some(&different),
             &iceberg
         ));
+
+        // No PARTITIONED BY means unpartitioned (#892), so it does not fit a
+        // partitioned live table.
+        assert!(!ctas_replace_is_in_place(&live, &arrow, None, &iceberg));
     }
 
     // -------------------------------------------------------------------------
@@ -14164,6 +14213,8 @@ s3_path_style = true
     // -------------------------------------------------------------------------
     #[cfg(feature = "test-sqlite")]
     mod committing {
+        mod shape_replace;
+
         use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
         use super::*;
@@ -15667,55 +15718,6 @@ s3_path_style = true
             )
             .await;
             assert_eq!(rig.scan_id_v(&rig.ident("mk")).await, vec![(3, s("d"))]);
-        }
-
-        /// 500: a different column set cannot be written into the live table,
-        /// so the replacement is staged under a temporary name and swapped in
-        /// with DROP + RENAME, leaving no staging table behind.
-        #[tokio::test(flavor = "multi_thread")]
-        async fn create_or_replace_with_new_schema_swaps_tables() {
-            let rig = SqliteRig::new().await;
-            let h = handler(&rig);
-            run_ctas(
-                &h,
-                &rig,
-                "CREATE TABLE default.cs AS SELECT * FROM (VALUES (1, 'a')) AS s(id, v)",
-            )
-            .await;
-            let ident = rig.ident("cs");
-            let uuid_before = rig.load(&ident).await.metadata().uuid();
-
-            run_ctas(
-                &h,
-                &rig,
-                "CREATE OR REPLACE TABLE default.cs AS SELECT * FROM (VALUES (5, 'q', 2.5)) AS s(id, v, w)",
-            )
-            .await;
-
-            let after = rig.load(&ident).await;
-            assert_ne!(
-                after.metadata().uuid(),
-                uuid_before,
-                "a new table took the name"
-            );
-            assert_eq!(
-                after.metadata().current_schema().as_struct().fields().len(),
-                3
-            );
-            assert_eq!(rig.scan_i64(&ident, "id").await, vec![5]);
-            let tables = rig
-                .catalog
-                .list_tables(&NamespaceIdent::new("default".to_string()))
-                .await
-                .expect("list tables");
-            assert_eq!(
-                tables
-                    .iter()
-                    .map(|t| t.name().to_string())
-                    .collect::<Vec<_>>(),
-                vec!["cs".to_string()],
-                "no staging table left behind"
-            );
         }
 
         /// 502: files written under an older partition spec are still
