@@ -550,6 +550,10 @@ impl QueryHandler {
         runtime_catalogs: RuntimeCatalogRegistry,
         secrets: SecretStore,
     ) -> sqe_core::Result<Self> {
+        // #886: file TVFs may not read under a configured Hive data prefix.
+        // Registered here, not only in `main`, so every coordinator built
+        // in tests enforces it too. Idempotent.
+        sqe_core::config::protect_hive_data_prefixes(&config.hive, &config.storage.tvf);
         // Finding 601: one signing key per coordinator process (or the shared
         // key file), created before `config` is moved into the handler.
         let ticket_signer = Arc::new(crate::ticket_credentials::load_ticket_signer(

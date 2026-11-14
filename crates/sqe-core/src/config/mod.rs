@@ -6,7 +6,13 @@ use serde::{Deserialize, Serialize};
 use crate::SecretString;
 
 mod env_overlay;
+mod hive_data;
 pub mod production;
+
+pub use hive_data::{
+    configured_hive_prefixes, hive_tvf_overlaps, prefixes_overlap, protect_hive_data_prefixes,
+    HiveDataPolicy, ProtectedLocations,
+};
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -3073,6 +3079,12 @@ pub struct HiveRootConfig {
     /// secret from the manifest itself; reserved for a root-level default.
     #[serde(default)]
     pub secret: Option<String>,
+    /// Where this root's table and partition data may live, added to
+    /// `[hive] allowed_data_prefixes` for this root only (#886). Same
+    /// grammar as `[storage.tvf] allowed_object_store_prefixes`, `{user}`
+    /// and `{catalog}` included.
+    #[serde(default)]
+    pub data_prefixes: Vec<String>,
 }
 
 /// Where a `[[hive.roots]]` entry reads its table metadata.
@@ -3125,6 +3137,13 @@ fn default_hive_metadata_timeout_secs() -> u64 {
 pub struct HiveConfig {
     #[serde(default)]
     pub roots: Vec<HiveRootConfig>,
+    /// Where Hive table and partition data may live, for every root
+    /// (#886). File TVFs refuse paths under these prefixes, whoever asks.
+    /// With neither this nor any root's `data_prefixes` set, Hive locations
+    /// fall back to `[storage.tvf] allowed_object_store_prefixes`
+    /// (deprecated; removed in the next release).
+    #[serde(default)]
+    pub allowed_data_prefixes: Vec<String>,
     #[serde(default = "default_hive_manifest_max_bytes")]
     pub manifest_max_bytes: usize,
     #[serde(default = "default_hive_manifest_max_columns")]
@@ -3166,6 +3185,7 @@ impl Default for HiveConfig {
     fn default() -> Self {
         Self {
             roots: Vec::new(),
+            allowed_data_prefixes: Vec::new(),
             manifest_max_bytes: default_hive_manifest_max_bytes(),
             manifest_max_columns: default_hive_manifest_max_columns(),
             manifest_max_partition_keys: default_hive_manifest_max_partition_keys(),
@@ -3279,6 +3299,11 @@ pub struct TvfPolicy {
     /// startup log warns when it is on.
     #[serde(default)]
     pub allow_all_object_stores: bool,
+    /// Locations no file TVF reads with the engine's credentials, whatever
+    /// the settings above say: Hive table data (#886). Not configurable
+    /// here; it is the process-wide registry unless a test injects one.
+    #[serde(skip, default = "ProtectedLocations::global")]
+    pub protected: std::sync::Arc<ProtectedLocations>,
 }
 
 impl Default for TvfPolicy {
@@ -3296,6 +3321,7 @@ impl Default for TvfPolicy {
             object_store_admin_roles: Vec::new(),
             allow_inline_credentials: true,
             allow_all_object_stores: false,
+            protected: ProtectedLocations::global(),
         }
     }
 }
@@ -3477,6 +3503,16 @@ fn canonicalize_object_url(path: &str) -> Result<String, String> {
     Ok(out)
 }
 
+/// `true` for the object-store schemes the TVF gate reads with the
+/// engine's credentials (aliases included).
+fn is_object_store_url(path: &str) -> bool {
+    const SCHEMES: &[&str] = &[
+        "s3://", "s3a://", "abfss://", "abfs://", "azure://", "az://", "gs://", "gcs://",
+    ];
+    let lower = path.to_ascii_lowercase();
+    SCHEMES.iter().any(|s| lower.starts_with(s))
+}
+
 /// A `tvf_prefixes` entry must be an object-store URL with a bucket that
 /// survives [`canonicalize_object_url`]; anything else would never match.
 fn validate_tvf_prefix(prefix: &str) -> Result<(), String> {
@@ -3562,15 +3598,7 @@ impl TvfPolicy {
         inline_credentials: bool,
     ) -> Result<(), String> {
         let lower = path.to_lowercase();
-        if lower.starts_with("s3://")
-            || lower.starts_with("s3a://")
-            || lower.starts_with("abfss://")
-            || lower.starts_with("abfs://")
-            || lower.starts_with("azure://")
-            || lower.starts_with("az://")
-            || lower.starts_with("gs://")
-            || lower.starts_with("gcs://")
-        {
+        if is_object_store_url(path) {
             return self.check_object_store(path, caller, inline_credentials);
         }
         if lower.starts_with("hf://") {
@@ -3608,19 +3636,32 @@ impl TvfPolicy {
         if caller.trusted || (inline_credentials && self.allow_inline_credentials) {
             return Ok(());
         }
-        // Explicit allow-all: the operator has taken responsibility for the
-        // boundary (single tenant, or the engine's credentials already scope
-        // what is reachable). Startup logs a warning when this is set.
-        if self.allow_all_object_stores {
-            return Ok(());
-        }
-        if !self.object_store_admin_roles.is_empty()
+        // Hive table data is refused before any setting below can open it.
+        self.refuse_protected(path, caller)?;
+        self.check_object_store_allowlist(path, caller)
+    }
+
+    /// `true` when `caller` holds a role in `object_store_admin_roles`.
+    fn is_object_store_admin(&self, caller: &TvfCaller) -> bool {
+        !self.object_store_admin_roles.is_empty()
             && caller.roles.iter().any(|r| {
                 self.object_store_admin_roles
                     .iter()
                     .any(|a| a.eq_ignore_ascii_case(r))
             })
-        {
+    }
+
+    /// The allow-list half of [`Self::check_object_store`], without the
+    /// Hive refusal: the Hive gate's fallback uses it, so a table SQE has
+    /// loaded is not refused by its own registry entry.
+    fn check_object_store_allowlist(&self, path: &str, caller: &TvfCaller) -> Result<(), String> {
+        if caller.trusted {
+            return Ok(());
+        }
+        // Explicit allow-all: the operator has taken responsibility for the
+        // boundary (single tenant, or the engine's credentials already scope
+        // what is reachable). Startup logs a warning when this is set.
+        if self.allow_all_object_stores || self.is_object_store_admin(caller) {
             return Ok(());
         }
 
@@ -5979,6 +6020,19 @@ impl SqeConfig {
             for prefix in &catalog.tvf_prefixes {
                 if let Err(e) = validate_tvf_prefix(prefix) {
                     errors.push(format!("{section} tvf_prefixes: {e}"));
+                }
+            }
+        }
+        // The Hive data prefixes (#886) share the grammar.
+        for prefix in &self.hive.allowed_data_prefixes {
+            if let Err(e) = validate_tvf_prefix(prefix) {
+                errors.push(format!("[hive] allowed_data_prefixes: {e}"));
+            }
+        }
+        for root in &self.hive.roots {
+            for prefix in &root.data_prefixes {
+                if let Err(e) = validate_tvf_prefix(prefix) {
+                    errors.push(format!("[[hive.roots]] {} data_prefixes: {e}", root.name));
                 }
             }
         }

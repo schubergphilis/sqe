@@ -52,7 +52,7 @@ A runnable end-to-end example, including the data generator and the assertions, 
 
 A root name cannot collide with a registered catalog name; `ATTACH` rejects the collision. `TYPE hive` still means Hive Metastore for Iceberg tables. `TYPE hive_external` is a different thing: a warehouse root for tables that are not Iceberg at all.
 
-Attaching a root does not list or read anything. The check is a path-reachability check against the storage allowlist described below, not a network call against the root's contents.
+Attaching a root does not list or read anything. The check is a path check against the Hive data prefixes described below, not a network call against the root's contents.
 
 ## Creating a table
 
@@ -145,12 +145,34 @@ The credential model is a real difference from how SQE treats Iceberg tables. An
 
 Authorization still runs per user, in two places that do not depend on the credential:
 
-- The `[storage.tvf]` prefix allowlist. `allowed_object_store_prefixes` supports `{user}` substitution, and it is evaluated with the calling session's identity on every manifest load, not only at `CREATE EXTERNAL TABLE` time.
+- The Hive data prefixes (next section). They support `{user}` substitution, and they are evaluated with the calling session's identity on every manifest load, not only at `CREATE EXTERNAL TABLE` time.
 - The policy layer. Row filters and column masks apply to a Hive table the same way they apply to an Iceberg one (see the resource-naming rule below). Table-level access is decided here too, and differently from Iceberg: with `[policy] engine = "ranger"` a Hive table is readable only when a Ranger access policy grants `select` on it to the user, a role or a group, and a table with no grant reads as not found. Grant first, deny by default, because no catalog stands in front of the root to say no. `[policy.ranger] hive_access_policies = false` turns the gate off. Details in [Fine-grained access control](../features/fine-grained-access-control.md).
 
 With no static key under `[storage]`, the engine's credentials come from the AWS SDK default chain (profile, SSO, `credential_process`, IRSA, IMDS), resolved once and kept until five minutes before they expire, or for fifteen minutes when they carry no expiry; concurrent requests wait for the one resolution in flight. The SDK chain itself does not cache when called outside an SDK client, so before this every S3 request asked the SSO portal for role credentials, and a wide partition listing was answered with `TooManyRequestsException: HTTP 429`, reported as "storage credentials expired". If that message appears with a 429 inside it while another SQE build is running against the same profile, the older build is the one flooding the portal.
 
-Put plainly: for Iceberg tables SQE has no service account. For Hive external tables it effectively has one, bounded by a per-user prefix allowlist and per-user policy. If that distinction matters to your deployment, keep Hive roots out of buckets that are not uniformly readable by the engine's own identity. A secret named in a manifest does not widen this: the allowlist and the policy layer still apply on top of it, so a secret cannot reach a location the deployment has not already allowed.
+Put plainly: for Iceberg tables SQE has no service account. For Hive external tables it effectively has one, bounded by per-user data prefixes and per-user policy. If that distinction matters to your deployment, keep Hive roots out of buckets that are not uniformly readable by the engine's own identity. A secret named in a manifest does not widen this: the data prefixes and the policy layer still apply on top of it, so a secret cannot reach a location the deployment has not already allowed.
+
+## Where table data may live
+
+Table and partition locations are checked against their own list, separate from the file TVF list:
+
+```toml
+[hive]
+allowed_data_prefixes = ["s3://lake/hive/", "s3://lake/users/{user}/"]
+
+[[hive.roots]]
+name = "lake"
+location = "s3://lake/hive/"
+data_prefixes = ["s3://partner-drop/orders/"]   # only for this root's tables
+```
+
+`allowed_data_prefixes` applies to every root, `ATTACH`ed ones included; a root's `data_prefixes` adds to it for that root. A location is accepted on `CREATE EXTERNAL TABLE`, `ADD PARTITION` and every load only when it lies under one of them, expanded for the session user. Admin roles and `allow_all_object_stores` pass this check, as they pass the file TVF list.
+
+The two lists are kept apart on purpose. A file TVF (`read_parquet`, `read_csv`, `read_json`) reads with the same engine credentials but without the table's row filters and masks, so a file TVF is refused under every Hive data prefix and under the location of every Hive table the coordinator has loaded, for every caller, admins included. Only a TVF call that brings its own credentials is exempt. The refusal names a configured prefix; it does not name a table. A TVF prefix that overlaps a Hive data prefix is logged as an error at startup, and the overlap stays unreadable to file TVFs.
+
+The locations of loaded tables are kept in the coordinator's memory: after a restart, a table is covered again from its first query. The configured prefixes cover it from startup, which is one reason to set them.
+
+**Migration.** While neither `allowed_data_prefixes` nor any root's `data_prefixes` is set, table locations are still checked against `[storage.tvf] allowed_object_store_prefixes`, as before, and startup logs a deprecation warning. This fallback goes in the next release. In it, the location of a table anyone creates under a TVF prefix becomes unreadable to file TVFs for the life of the process. Setting `allowed_data_prefixes` ends the fallback for every root at once.
 
 ## Resource naming, and why it matters
 
@@ -191,7 +213,7 @@ Only those databases are listed, and a table anywhere else is not found rather t
 
 Verified through a real `sqe-server` process over Flight SQL, not only in-process: the quickstart's `./run.sh --server` boots a coordinator that attaches its root from `[[hive.roots]]`, runs the same DDL and the same queries as the embedded path, restarts the coordinator, and reads the tables back from the manifests. Same row counts, same rendered DDL.
 
-Two things a server-mode deployment needs that embedded mode does not. `[storage.tvf] allowed_object_store_prefixes` is mandatory: server mode fails closed on object-store paths, so with no allowlist every `s3://` read is denied, including the manifest load behind a Hive table. And nothing else has to be reachable. A coordinator whose `[catalog]` points at an Iceberg endpoint nobody is listening on still boots, attaches its Hive roots, and answers every Hive query, which is what a Hive-only deployment looks like.
+Two things a server-mode deployment needs that embedded mode does not. `[hive] allowed_data_prefixes` (or, until the fallback goes, `[storage.tvf] allowed_object_store_prefixes`) is mandatory: server mode fails closed on object-store paths, so with neither list every `s3://` location is denied, including the root and the manifest load behind a Hive table. And nothing else has to be reachable. A coordinator whose `[catalog]` points at an Iceberg endpoint nobody is listening on still boots, attaches its Hive roots, and answers every Hive query, which is what a Hive-only deployment looks like.
 
 The exception is metadata statements that enumerate catalogs. `information_schema.tables` and `DESCRIBE` walk **every** registered catalog before any `WHERE` clause narrows them, so an unreachable Iceberg catalog fails those statements even for a query that only named a Hive root. `SHOW TABLES FROM <root>.<database>` does not, and is the reliable listing in server mode. In embedded mode it is the reverse: `SHOW TABLES` is not parsed and `information_schema` is what works.
 
@@ -445,7 +467,7 @@ An overwrite would have to delete the partition's objects and then write new one
 
 **A CSV or JSON file is one task, however many cores you have.** Not only compressed files: neither format has row groups, so there is no boundary to split on, and a worker reads each text file whole. Split large text files at write time rather than relying on in-engine parallelism to compensate. Parquet splits within a file.
 
-**Reads use engine credentials or a named secret, never the caller's own.** Do not point a Hive root at a bucket your users should not uniformly be able to read through the engine's identity. Use the `[storage.tvf]` allowlist and grants to bound exposure per user; do not rely on the credential itself to do that job.
+**Reads use engine credentials or a named secret, never the caller's own.** Do not point a Hive root at a bucket your users should not uniformly be able to read through the engine's identity. Use the Hive data prefixes and grants to bound exposure per user; do not rely on the credential itself to do that job.
 
 **`array`, `struct`, and `map` columns are not supported.** A table with a nested column needs those columns projected out at the source or flattened before SQE reads it. There is no workaround inside SQE for cycle 1.
 

@@ -272,6 +272,12 @@ impl QueryHandler {
                 &stmt.location,
                 &stmt.options,
                 &self.config.storage,
+                // An ATTACHed root has no `data_prefixes` of its own: the
+                // global `[hive] allowed_data_prefixes` applies (#886).
+                sqe_core::config::HiveDataPolicy::from_config(
+                    &self.config.hive,
+                    &self.config.storage.tvf,
+                ),
                 limits,
                 caller,
             )

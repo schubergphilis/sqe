@@ -701,6 +701,7 @@ async fn create_external_table_refused_when_hive_registries_are_not_wired() {
         &format!("file://{}/wh", root_dir.path().display()),
         &std::collections::BTreeMap::new(),
         &storage,
+        storage.tvf.clone().into(),
         ManifestLimits::default(),
         TvfCaller::trusted_local(),
     )

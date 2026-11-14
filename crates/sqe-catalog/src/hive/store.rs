@@ -3,7 +3,7 @@
 //!
 //! The manifest is untrusted input: anyone who can write to the warehouse
 //! prefix can plant one. That is why [`HiveManifestStore::get`] re-checks
-//! `storage_descriptor.location` against the `[storage.tvf]` allowlist on
+//! `storage_descriptor.location` against the Hive data prefixes on
 //! every load, not only when the manifest is created. See the comment on
 //! that check for why the guard cannot be moved to create time.
 
@@ -15,7 +15,7 @@ use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use tracing::warn;
 
-use sqe_core::config::{TvfCaller, TvfPolicy};
+use sqe_core::config::{HiveDataPolicy, TvfCaller};
 
 use super::manifest::{HiveManifest, ManifestLimits};
 use super::HiveError;
@@ -31,25 +31,56 @@ pub struct HiveManifestStore {
     root: ListingTableUrl,
     store: Arc<dyn ObjectStore>,
     limits: ManifestLimits,
-    tvf: TvfPolicy,
+    data: HiveDataPolicy,
     caller: TvfCaller,
 }
 
 impl HiveManifestStore {
+    /// `data` gates every table and partition location (#886). A bare
+    /// `TvfPolicy` converts to the deprecated fallback, which checks against
+    /// the TVF list as before.
     pub fn new(
         root: ListingTableUrl,
         store: Arc<dyn ObjectStore>,
         limits: ManifestLimits,
-        tvf: TvfPolicy,
+        data: impl Into<HiveDataPolicy>,
         caller: TvfCaller,
     ) -> Self {
         Self {
             root,
             store,
             limits,
-            tvf,
+            data: data.into(),
             caller,
         }
+    }
+
+    /// The location gate this root was built with, for the per-session data
+    /// store factory.
+    pub fn data_policy(&self) -> &HiveDataPolicy {
+        &self.data
+    }
+
+    /// Check a location against the Hive data prefixes for this store's
+    /// caller, then record it so file TVFs refuse it from here on.
+    fn admit(&self, location: &str) -> Result<(), HiveError> {
+        self.data
+            .check_location(location, &self.caller)
+            .map_err(HiveError::Forbidden)?;
+        self.data.protect_location(location);
+        Ok(())
+    }
+
+    /// [`Self::admit`] for a manifest's table location and every
+    /// partition-index location.
+    fn admit_manifest(&self, m: &HiveManifest) -> Result<(), HiveError> {
+        self.admit(&m.storage_descriptor.location)?;
+        if let Some(index) = &m.sqe.partition_index {
+            for entry in &index.entries {
+                self.admit(&entry.location)?;
+            }
+        }
+        Ok(())
     }
 
     /// The same store, with every `check_path` gate evaluated for `caller`
@@ -61,7 +92,7 @@ impl HiveManifestStore {
             root: self.root.clone(),
             store: Arc::clone(&self.store),
             limits: self.limits,
-            tvf: self.tvf.clone(),
+            data: self.data.clone(),
             caller,
         }
     }
@@ -94,14 +125,12 @@ impl HiveManifestStore {
         &self.limits
     }
 
-    /// Run `[storage.tvf] check_path` on a data location. `ADD PARTITION`
+    /// Check a data location against the Hive data prefixes. `ADD PARTITION`
     /// must call this *before* LISTing the new entry: `put` also checks
     /// index locations, but that is too late if the LIST already walked a
     /// forbidden prefix.
     pub fn check_location(&self, location: &str) -> Result<(), HiveError> {
-        self.tvf
-            .check_path(location, &self.caller, false)
-            .map_err(HiveError::Forbidden)
+        self.admit(location)
     }
 
     /// The database-level prefix, `<root_path>/<database>`.
@@ -120,19 +149,12 @@ impl HiveManifestStore {
     /// manifest can reach the store by any other path (a direct write to the
     /// warehouse prefix), and the create-time check has no way to see that.
     pub async fn put(&self, m: &HiveManifest, if_not_exists: bool) -> Result<(), HiveError> {
-        self.tvf
-            .check_path(&m.storage_descriptor.location, &self.caller, false)
-            .map_err(HiveError::Forbidden)?;
-        // Same guard for index entry locations: ADD PARTITION can point an
-        // entry anywhere, and the create-time check is the only one that can
-        // refuse before a bad location is persisted at all.
-        if let Some(index) = &m.sqe.partition_index {
-            for entry in &index.entries {
-                self.tvf
-                    .check_path(&entry.location, &self.caller, false)
-                    .map_err(HiveError::Forbidden)?;
-            }
-        }
+        // Index entry locations get the same guard: ADD PARTITION can point
+        // an entry anywhere, and the create-time check is the only one that
+        // can refuse before a bad location is persisted at all. Admitted
+        // locations are protected from file TVFs before the manifest lands,
+        // so a new table is never raw-readable until its first SELECT.
+        self.admit_manifest(m)?;
 
         let path = self.manifest_path(&m.database_name, &m.name);
         let bytes = Bytes::from(m.to_bytes()?);
@@ -236,23 +258,14 @@ impl HiveManifestStore {
         // object store, a different engine version, a hand-edited file)
         // never goes through create-time validation at all, so a guard that
         // only runs at create protects nothing against the actual attack.
-        self.tvf
-            .check_path(&manifest.storage_descriptor.location, &self.caller, false)
-            .map_err(HiveError::Forbidden)?;
-
+        //
         // SECURITY: index entry locations get exactly the same treatment as
         // `storage_descriptor.location`, for exactly the same reason. A
         // planted manifest's index entries are attacker-chosen URLs; letting
         // read planning trust them without the allowlist would reintroduce
         // through the index door the bypass this check closed on the table
         // door.
-        if let Some(index) = &manifest.sqe.partition_index {
-            for entry in &index.entries {
-                self.tvf
-                    .check_path(&entry.location, &self.caller, false)
-                    .map_err(HiveError::Forbidden)?;
-            }
-        }
+        self.admit_manifest(&manifest)?;
 
         Ok(manifest)
     }

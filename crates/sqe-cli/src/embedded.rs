@@ -944,6 +944,9 @@ impl EmbeddedClient {
             location,
             &std::collections::BTreeMap::new(),
             &storage,
+            // Embedded mode has no `[hive]` section: the TVF list is the
+            // data gate, as before #886.
+            storage.tvf.clone().into(),
             sqe_catalog::hive::manifest::ManifestLimits::default(),
             caller.clone(),
         )

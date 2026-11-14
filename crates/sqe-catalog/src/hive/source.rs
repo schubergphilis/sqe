@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use sqe_core::config::HiveDataPolicy;
 
 use super::manifest::{HiveManifest, ManifestLimits};
 use super::store::HiveManifestStore;
@@ -119,27 +120,38 @@ impl HiveMetadataSource for HiveManifestStore {
 pub struct HiveRoot {
     source: Arc<dyn HiveMetadataSource>,
     sidecar: Option<Arc<HiveManifestStore>>,
+    /// Which locations this root's tables may reach (#886).
+    data: HiveDataPolicy,
 }
 
 impl HiveRoot {
-    /// A root over a sidecar warehouse SQE owns: readable and writable.
+    /// A root over a sidecar warehouse SQE owns: readable and writable. The
+    /// data policy is the store's own.
     pub fn from_store(store: Arc<HiveManifestStore>) -> Self {
         Self {
             source: Arc::clone(&store) as Arc<dyn HiveMetadataSource>,
+            data: store.data_policy().clone(),
             sidecar: Some(store),
         }
     }
 
-    /// A root over a metastore SQE does not own: readable only.
-    pub fn from_source(source: Arc<dyn HiveMetadataSource>) -> Self {
+    /// A root over a metastore SQE does not own: readable only. Its table
+    /// locations are checked against `data` on every load.
+    pub fn from_source(source: Arc<dyn HiveMetadataSource>, data: HiveDataPolicy) -> Self {
         Self {
             source,
             sidecar: None,
+            data,
         }
     }
 
     pub fn source(&self) -> Arc<dyn HiveMetadataSource> {
         Arc::clone(&self.source)
+    }
+
+    /// The data-location policy for this root's tables.
+    pub fn data_policy(&self) -> &HiveDataPolicy {
+        &self.data
     }
 
     /// The writable sidecar store, or `None` when this root reads an
