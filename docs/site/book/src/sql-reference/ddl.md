@@ -26,7 +26,7 @@ DROP SCHEMA staging CASCADE;
 | `CREATE TABLE t (col TYPE [DEFAULT expr], ...)` | `sqlparser-rs` + `sqe-sql` + `sqe-coordinator` | Iceberg V3 column defaults supported. Nested types in the Trino form (`array(integer)`, `map(varchar, bigint)`, `row(x decimal(10,2), y varchar)`) and the Spark form (`ARRAY<INT>`, `MAP<VARCHAR, BIGINT>`, `STRUCT<x INT>`) both work, at any depth (`sqe-sql/ddl_types.rs`). | yes | yes | yes | yes |
 | `CREATE TABLE t (...) PARTITIONED BY (transform(col), ...)` | `sqe-sql/partition.rs` | Partition transforms: `bucket(N, col)`, `truncate(N, col)`, `year(col)`, `month(col)`, `day(col)`, `hour(col)`, identity (just `col`). | partial | - | yes | - |
 | `CREATE TABLE t AS SELECT ...` (CTAS) | `sqlparser-rs` + `sqe-coordinator` | Inferred schema; partitioning via `PARTITIONED BY (...)` before `AS`, or Trino's `WITH (partitioning = ARRAY[...])`. Trino's table properties are honoured or refused; see [Trino table properties](#trino-table-properties). | yes | yes | yes | yes |
-| `CREATE OR REPLACE TABLE t AS SELECT ...` | `sqlparser-rs` + `sqe-coordinator` | Atomic replace. In-place snapshot replace when schema and partitioning match (table keeps UUID, grants, history; properties not re-applied). Staged table + swap otherwise. Self-referencing replace safe (reads old snapshot before swap). | yes | yes | partial | yes |
+| `CREATE OR REPLACE TABLE t AS SELECT ...` | `sqlparser-rs` + `sqe-coordinator` | Atomic replace: one snapshot on the existing table, which keeps its UUID, grants, history, refs and properties (the statement's options are set on top). A changed schema, partitioning or Trino `sorted_by` becomes current in the same commit (field ids kept by name). Refuses a format downgrade, and a shape change under `WRITE_BRANCH` or in a transaction. Self-referencing replace safe (reads old snapshot before swap). | yes | yes | partial | yes |
 | `CREATE TABLE [IF NOT EXISTS] t LIKE other_table` | `sqlparser-rs` + `sqe-coordinator` | Copy schema only, no data. | yes | yes | yes | yes |
 
 ```sql
@@ -76,7 +76,7 @@ An unquoted key in a `WITH (...)` list is a property of the Trino Iceberg connec
 
 `sorted_by` records a sort order; SQE's writer does not sort the rows, and the data files it writes claim no sort order. Leave `trust_sort_order` off for tables whose files SQE writes: it tells the planner that every file is sorted.
 
-`CREATE OR REPLACE` keeps the live table when the schema, the partitioning and the sort order match, so a `location` must then be the table's own. When any of them changes, the replacement is a new table and a `location` is refused.
+`CREATE OR REPLACE` always keeps the live table, so a `location` must be the table's own; a different one is refused. A `sorted_by` that differs from the live sort order becomes the default sort order in the same commit as the data, like a changed schema or partitioning.
 
 ```sql
 create table analytics.events_mart

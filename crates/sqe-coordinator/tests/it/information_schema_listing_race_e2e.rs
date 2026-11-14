@@ -28,13 +28,12 @@ async fn column_count(
 }
 
 /// Four sessions replace tables and views of the namespace in a loop (one of
-/// them with schema-changing replaces, which drop and rename) while a fifth
-/// reads the columns of a table nobody touches: every read must return the
-/// full column list, never a short one and never an error.
+/// them with schema-changing replaces) while a fifth reads the columns of a
+/// table nobody touches and of the table being replaced: every read must
+/// return the full column list, never a short one and never an error.
 ///
-/// The table being replaced is not read: a schema-changing replace is a DROP
-/// and a RENAME, and between the two the table is absent from the catalog
-/// itself, so a listing taken then cannot hold it (#892).
+/// A schema-changing replace is one commit on the existing table (#892), so
+/// the replaced table never leaves the catalog and always has two columns.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:polaris"]
 async fn information_schema_columns_survive_concurrent_replace_890() {
@@ -93,9 +92,11 @@ async fn information_schema_columns_survive_concurrent_replace_890() {
     let mut bad = Vec::new();
     let mut reads = 0;
     while reads < 300 || (committed.load(Ordering::Relaxed) < MIN_DDL && reads < 20_000) {
-        match column_count(&handler, &session, "stable").await {
-            Ok(2) => {}
-            other => bad.push(format!("read {reads}: {other:?}")),
+        for table in ["stable", "moving"] {
+            match column_count(&handler, &session, table).await {
+                Ok(2) => {}
+                other => bad.push(format!("read {reads} of {table}: {other:?}")),
+            }
         }
         reads += 1;
     }

@@ -248,11 +248,13 @@ impl<'a> SnapshotProducer<'a> {
                 let partition_type = if spec_id == metadata.default_partition_spec_id() {
                     metadata.default_partition_type().clone()
                 } else {
-                    spec.partition_type(metadata.current_schema())
+                    // SQE PATCH (sqe#892): bind against a schema that still holds the
+                    // spec's source columns.
+                    spec.partition_type(metadata.schema_for_partition_spec(spec))
                         .map_err(|err| {
                             Error::new(
                                 ErrorKind::DataInvalid,
-                                "Cannot bind data file partition spec to the current schema",
+                                "Cannot bind data file partition spec to the table schema",
                             )
                             .with_context("partition spec id", spec_id.to_string())
                             .with_context("file path", data_file.file_path())
@@ -478,7 +480,14 @@ impl<'a> SnapshotProducer<'a> {
             })?
             .as_ref()
             .clone();
-        let schema = self.table.metadata().current_schema().clone();
+        // SQE PATCH (sqe#892): a manifest of files under an older spec (the removed files
+        // of a replace that dropped the partition column) binds its partition type to a
+        // schema that still holds the spec's source columns.
+        let schema = self
+            .table
+            .metadata()
+            .schema_for_partition_spec(&partition_spec)
+            .clone();
 
         let builder = if let Some(em) = self.table.encryption_manager() {
             ManifestWriterBuilder::new_from_encrypted(
@@ -914,18 +923,10 @@ impl<'a> SnapshotProducer<'a> {
         } else {
             // A removed file may be written under an older spec whose source
             // column has since been dropped. Its type, such as a decimal's
-            // scale, then lives only in an older schema: take the newest
-            // schema that still holds every source column of the spec.
+            // scale, then lives only in an older schema: take a schema that
+            // still holds every source column of the spec.
             let schema = table_metadata
-                .schemas_iter()
-                .filter(|schema| {
-                    partition_spec
-                        .fields()
-                        .iter()
-                        .all(|f| schema.field_by_id(f.source_id).is_some())
-                })
-                .max_by_key(|schema| schema.schema_id())
-                .unwrap_or(table_metadata.current_schema())
+                .schema_for_partition_spec(&partition_spec)
                 .clone();
             summary_collector.remove_file(file, schema, partition_spec);
         }

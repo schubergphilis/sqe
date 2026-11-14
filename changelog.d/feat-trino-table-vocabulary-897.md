@@ -9,7 +9,9 @@
     location or properties; Trino keys SQE cannot honour (`compression_codec`,
     `max_commit_retry`, `data_location` and others) are refused with the reason,
     and an unknown key is an error. Quoted keys and `TBLPROPERTIES` stay plain
-    Iceberg properties. CREATE OR REPLACE with a different `location` is refused.
+    Iceberg properties. CREATE OR REPLACE keeps the live table: a different
+    `location` is refused, and a changed `sorted_by` (an empty one unsorts)
+    becomes the default sort order in the same commit as the data.
 
 ### Changed
 

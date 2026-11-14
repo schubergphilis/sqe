@@ -63,6 +63,7 @@ Upstream `testdata/` is vendored in full, so `cargo test -p iceberg --lib` runs 
 | — | Ring-only TLS: no `default-https-client`, opendal no-provider transport installed on first use | root `Cargo.toml`, `storage/opendal` |
 | — | New-delete conflict guard on `ReplaceFilesAction` (`set_validate_from_snapshot_id`) | `transaction/replace_files.rs` |
 | — | `RowDeltaAction` (apache PR #2203; no upstream equivalent) | `transaction/row_delta.rs` |
+| — | `ReplaceTableShapeAction`: a schema- and spec-changing replace as one commit on the live table (field ids kept by name, explicit `spec-id` on `add-spec`, shape pins), and `with_sort_order` to make a requested sort order default in the same commit (`sqe#897`); `TableMetadata::schema_for_partition_spec` binds an old spec whose source column was dropped to a schema that still holds it, for manifests and validation (`SQE PATCH (sqe#892)`) | `transaction/replace_shape.rs`, `transaction/snapshot.rs`, `spec/table_metadata.rs` |
 | — | Puffin blob range check | `puffin/reader.rs` |
 | — | `ManifestFile::load_manifest` shim over apache's `ManifestReader` | `spec/manifest_list/manifest_file.rs` |
 | — | V3 `unknown` columns are never written to a data file (top-level projected out, nested refused) (`SQE PATCH (v3-unknown)`) | `writer/file_writer/parquet_writer.rs` |

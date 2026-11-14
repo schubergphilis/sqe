@@ -34,6 +34,7 @@ mod bound_params_e2e;
 mod catalog_discovery_test;
 mod compaction_benchmark;
 mod compaction_distributed_benchmark;
+mod ctas_replace_shape_e2e;
 mod ctas_write_modes_e2e;
 mod distributed_delete_files;
 mod distributed_failure_e2e;

@@ -123,8 +123,9 @@ created from the query's schema and the rows land in one append commit. When
 the write fails, the new table is dropped again. `PARTITIONED BY` and
 `TBLPROPERTIES` / `WITH (...)` options are kept. `CREATE TABLE IF NOT EXISTS
 ... AS` skips an existing table. `CREATE OR REPLACE TABLE ... AS` swaps the
-rows in with one commit when the query's schema and partitioning match the
-table, which keeps its snapshot history. Otherwise a new table replaces it.
+rows in with one commit on the existing table, which keeps its snapshot
+history. When the query's columns or partitioning differ, the same commit
+makes the new schema and spec current.
 
 `UPDATE`, `DELETE` and `MERGE INTO` run on the cluster's own write handlers.
 A table's `write.delete.mode` picks copy-on-write or merge-on-read, the same as

@@ -514,15 +514,19 @@ impl TrinoTableOptions {
         }
     }
 
-    /// A schema-changing `CREATE OR REPLACE` stages a new table, which cannot
-    /// take the live table's location.
-    pub(crate) fn refuse_staged_location(&self) -> sqe_core::Result<()> {
-        if self.location.is_none() {
-            return Ok(());
+    /// The sort order a shape-changing `CREATE OR REPLACE` makes default:
+    /// `None` when `sorted_by` is not given (the live order stays where it
+    /// still binds), the unsorted order for an empty `sorted_by`.
+    pub(crate) fn replace_sort_order(
+        &self,
+        schema: &IcebergSchema,
+    ) -> sqe_core::Result<Option<SortOrder>> {
+        if self.sorted_by.is_none() {
+            return Ok(None);
         }
-        Err(invalid(
-            "this CREATE OR REPLACE changes the schema, partitioning or sort order, so the \
-             replacement is a new table and cannot keep the `location`; drop the property",
+        Ok(Some(
+            self.sort_order(schema)?
+                .unwrap_or_else(SortOrder::unsorted_order),
         ))
     }
 

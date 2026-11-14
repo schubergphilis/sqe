@@ -301,9 +301,10 @@ async fn trino_table_vocabulary_897() {
     )
     .await;
 
-    // CREATE OR REPLACE with a new sort order stages a new table and keeps
-    // the partitioning it asks for; the table's own location is accepted
-    // only in place, another one never.
+    // CREATE OR REPLACE with a new sort order keeps the live table and makes
+    // the order default in the same commit as the data (#892); the table's
+    // own location is accepted, another one never.
+    let uuid = load(&session, ctas).await.metadata().uuid();
     let replace = format!(
         "create or replace table {NS}.{ctas} WITH (partitioning = ARRAY['region', \
          'bucket(id, 4)'], sorted_by = ARRAY['region']) as select 1 as id, 'eu' as region"
@@ -315,6 +316,7 @@ async fn trino_table_vocabulary_897() {
         ["region ascending nulls first"],
         "{replace}"
     );
+    assert_eq!(table.metadata().uuid(), uuid, "the replace keeps the table");
     let live_location = table.metadata().location().to_string();
     let same = format!(
         "create or replace table {NS}.{ctas} WITH (location = '{live_location}', \
@@ -334,6 +336,32 @@ async fn trino_table_vocabulary_897() {
     .await
     .expect_err("a moved location is refused");
     assert!(err.contains("cannot move the table"), "{err}");
+
+    // An empty sorted_by unsorts; leaving it out keeps the live order.
+    let unsorted = format!(
+        "create or replace table {NS}.{ctas} WITH (partitioning = ARRAY['region', \
+         'bucket(id, 4)'], sorted_by = ARRAY[]) as select 4 as id, 'eu' as region"
+    );
+    ok(&base_url, &unsorted).await;
+    let table = load(&session, ctas).await;
+    assert!(sort_of(&table).is_empty(), "{unsorted}");
+    assert_eq!(table.metadata().uuid(), uuid);
+    ok(
+        &base_url,
+        &format!(
+            "create or replace table {NS}.{ctas} WITH (sorted_by = ARRAY['id DESC']) \
+             as select 5 as id, 'us' as region"
+        ),
+    )
+    .await;
+    ok(
+        &base_url,
+        &format!("create or replace table {NS}.{ctas} as select 6 as id, 'eu' as region"),
+    )
+    .await;
+    let table = load(&session, ctas).await;
+    assert_eq!(sort_of(&table), ["id descending nulls last"]);
+    assert_eq!(table.metadata().uuid(), uuid);
 
     // CREATE TABLE: month() of a timestamp, NULLS spelled out, and a
     // location the statement chooses.

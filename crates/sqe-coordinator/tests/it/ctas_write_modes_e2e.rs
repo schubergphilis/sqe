@@ -958,8 +958,7 @@ async fn ctas_ranking_functions_make_bigint_columns_888() {
 
 // ─────────────────────────────────────────────────────────────────────────
 // An in-place CREATE OR REPLACE sets the statement's TBLPROPERTIES (#894).
-// It kept the live ones, while a schema-changing (staged) replace applied
-// them, so a dbt model re-run with new properties depended on its schema.
+// It kept the live ones, while a schema-changing replace applied them, so a dbt model re-run with new properties depended on its schema.
 // Keys the statement does not name stay, as in an Iceberg replace.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
@@ -1035,9 +1034,10 @@ async fn show_tags(
 
 // ─────────────────────────────────────────────────────────────────────────
 // A schema-changing CREATE OR REPLACE keeps the table's properties (#896).
-// It is staged under a temporary name and renamed into place; the staged
-// table took only the statement's options, so the live properties went,
-// `sqe.column-tags` among them, while a same-schema replace kept them.
+// It was staged under a temporary name and renamed into place, and the
+// staged table took only the statement's options, so the live properties
+// went, `sqe.column-tags` among them. Since #892 it is one commit on the
+// table itself; the tags of dropped columns still go.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:polaris"]
@@ -1071,7 +1071,7 @@ async fn ctas_replace_with_a_new_schema_keeps_properties_and_tags_896() {
         .collect();
     assert_eq!(tagged, ["email", "gone"], "tags set");
 
-    // `gone` dropped and `extra` added: the staged path.
+    // `gone` dropped and `extra` added: a schema change.
     let replace = format!(
         "CREATE OR REPLACE TABLE {fq} TBLPROPERTIES ('sqe_test.a' = '2') \
          AS SELECT 2 AS id, 'c@d' AS email, 3 AS extra"
