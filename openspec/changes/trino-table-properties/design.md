@@ -21,6 +21,7 @@ The query handler does not know which wire a statement came from, and threading 
 - Iceberg property names hold dots and must be quoted (`'write.delete.mode'`).
 - An unquoted single-word key in `WITH (...)` is the Trino vocabulary. An unknown one is an error that lists the supported names.
 - Quoted keys and every `TBLPROPERTIES` key pass through as Iceberg properties, as today.
+- `WITH (...) TBLPROPERTIES (...)` reaches the handler as one `WITH` list: the front door appends the `TBLPROPERTIES` items with their keys quoted, so an unquoted `TBLPROPERTIES` key stays an Iceberg property (`sqe-sql/src/partition.rs`, `quote_option_keys`).
 
 *Alternative:* refuse unknown keys on the Trino door only. Rejected: the same `CREATE TABLE ... WITH (partitioning = ...)` would mean different things on Flight SQL and Trino.
 
@@ -37,8 +38,13 @@ The query handler does not know which wire a statement came from, and threading 
 | `format = 'PARQUET'` | accepted | `ORC` and `AVRO` refused |
 | `format_version`-like Iceberg keys inside `extra_properties` | refused | use `format_version` |
 | `parquet_bloom_filter_columns = ARRAY['c']` | `write.parquet.bloom-filter-enabled.column.c = true` | SQE writes bloom filters from these properties |
-| `max_commit_retry = n` | `commit.retry.num-retries` | check that SQE's commit retry reads it; else refuse |
-| `data_location = '...'` | `write.data.path` | only if the writer honours it; else refuse |
+| `max_commit_retry = n` | refused | SQE's commit retry is a fixed number of attempts (`commit::commit_with_retry`); it does not read `commit.retry.num-retries` |
+| `data_location = '...'` | refused | the writer writes under the table location; `write.data.path` is read only by the purge safety check |
+| `gc_enabled` | `gc.enabled` | read by maintenance (expire, purge) |
+| `parquet_writer_row_group_size = '128MB'` | `write.parquet.row-group-size-bytes` | a Trino data size, binary units; read by `parquet_writer_config` |
+| `compression_codec` | refused | the codec comes from the session (`iceberg.compression_codec`) or the configuration (`resolve_write_compression`) |
+| `target_max_file_size` | refused | the writer does not read a per-table target file size |
+| `delete_after_commit_enabled`, `max_previous_versions` | refused | SQE does not manage metadata files; the error names the quoted Iceberg keys for the catalog |
 | `object_store_layout_enabled` | refused | SQE's writer has no object-store layout |
 | `orc_bloom_filter_columns`, `orc_bloom_filter_fpp` | refused | no ORC |
 
@@ -64,4 +70,4 @@ Trino resets a property with `SET PROPERTIES p = DEFAULT`. That form is refused 
 
 ## Open Questions
 
-- Does `sqe-write`'s commit retry read `commit.retry.num-retries`, and does the writer read `write.data.path`? Each answer decides honour or refuse in D2.
+- ~~Does `sqe-write`'s commit retry read `commit.retry.num-retries`, and does the writer read `write.data.path`?~~ No to both, so `max_commit_retry` and `data_location` are refused (D2).

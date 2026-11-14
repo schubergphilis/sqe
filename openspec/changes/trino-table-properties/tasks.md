@@ -9,15 +9,15 @@
 
 ## 2. Vocabulary
 
-- [ ] 2.1 Answer the open questions: `commit.retry.num-retries` and `write.data.path` honoured or not
-- [ ] 2.2 A `trino_props` module in `sqe-write`: classify each option (D1), map or refuse (D2); unknown unquoted key -> error listing the supported names
-- [ ] 2.3 `partitioning` in Trino argument order through `build_partition_spec`; error with `PARTITIONED BY`
-- [ ] 2.4 `sorted_by` as the default sort order; data files keep `sort_order_id` unset (D3)
-- [ ] 2.5 `location` passed to `TableCreation`; no fallback (D4)
-- [ ] 2.6 `extra_properties` MAP; reserved keys refused
-- [ ] 2.7 `format`, `parquet_bloom_filter_columns`, `max_commit_retry`, `data_location`, `object_store_layout_enabled`, ORC keys per D2
-- [ ] 2.8 A unit test per property, each with a print/re-parse round trip of the statement
-- [ ] 2.9 CREATE OR REPLACE uses the same mapping, in place and schema-changing
+- [x] 2.1 Answer the open questions: `commit.retry.num-retries` and `write.data.path` honoured or not
+- [x] 2.2 A `trino_props` module in `sqe-write`: classify each option (D1), map or refuse (D2); unknown unquoted key -> error listing the supported names
+- [x] 2.3 `partitioning` in Trino argument order through `build_partition_spec`; error with `PARTITIONED BY`
+- [x] 2.4 `sorted_by` as the default sort order; data files keep `sort_order_id` unset (D3)
+- [x] 2.5 `location` passed to `TableCreation`; no fallback (D4)
+- [x] 2.6 `extra_properties` MAP; reserved keys refused
+- [x] 2.7 `format`, `parquet_bloom_filter_columns`, `max_commit_retry`, `data_location`, `object_store_layout_enabled`, ORC keys per D2
+- [x] 2.8 A unit test per property, each with a print/re-parse round trip of the statement
+- [x] 2.9 CREATE OR REPLACE uses the same mapping, in place and schema-changing
 
 ## 3. ALTER TABLE SET PROPERTIES
 
@@ -26,6 +26,6 @@
 
 ## 4. Wire and dbt
 
-- [ ] 4.1 Extend `trino_table_properties_e2e` to assert spec, sort order and properties per property
+- [x] 4.1 Extend `trino_table_properties_e2e` to assert spec, sort order and properties per property
 - [ ] 4.2 dbt-trino run with `on_table_exists` = `rename`, `drop`, `replace` and `skip`, and with `views_enabled = false`
-- [ ] 4.3 Docs: the Trino compatibility section of the DDL reference lists every property and its mapping; fix the CTAS row that claims `WITH (partitioning = ...)` works
+- [x] 4.3 Docs: the Trino compatibility section of the DDL reference lists every property and its mapping; fix the CTAS row that claims `WITH (partitioning = ...)` works

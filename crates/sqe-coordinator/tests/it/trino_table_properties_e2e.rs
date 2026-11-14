@@ -199,3 +199,179 @@ async fn trino_format_version_property_897() {
         ok(&base_url, &format!("DROP TABLE IF EXISTS {NS}.{t}")).await;
     }
 }
+
+async fn exists(session: &sqe_core::Session, name: &str) -> bool {
+    let config = sqe_core::SqeConfig::load(&crate::common::test_config_path()).expect("config");
+    let catalog = sqe_catalog::rest_catalog::SessionCatalog::for_session(
+        &config,
+        None,
+        session.access_token().expose(),
+    )
+    .await
+    .expect("session catalog");
+    let ident = iceberg::TableIdent::from_strs([NS, name]).expect("ident");
+    catalog.table_exists(&ident).await.expect("table_exists")
+}
+
+/// The partition fields as `(source column, transform)`.
+fn spec_of(table: &iceberg::table::Table) -> Vec<(String, String)> {
+    let meta = table.metadata();
+    let schema = meta.current_schema();
+    meta.default_partition_spec()
+        .fields()
+        .iter()
+        .map(|f| {
+            let column = schema.name_by_field_id(f.source_id).unwrap_or("?");
+            (column.to_string(), f.transform.to_string())
+        })
+        .collect()
+}
+
+/// The default sort order as `(column, direction, null order)`.
+fn sort_of(table: &iceberg::table::Table) -> Vec<String> {
+    let meta = table.metadata();
+    let schema = meta.current_schema();
+    meta.default_sort_order()
+        .fields
+        .iter()
+        .map(|f| {
+            let column = schema.name_by_field_id(f.source_id).unwrap_or("?");
+            format!("{column} {} nulls {}", f.direction, f.null_order)
+        })
+        .collect()
+}
+
+/// The rest of the Trino vocabulary on CTAS, CREATE TABLE and CREATE OR
+/// REPLACE: partitioning in Trino's argument order, sorted_by, location,
+/// extra_properties and the mapped Parquet keys; an unknown key fails the
+/// statement before a table exists.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn trino_table_vocabulary_897() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let handler = Arc::new(handler);
+    let base_url = start_server(&session, &handler).await;
+    let (ctas, plain, unknown) = (
+        "trino_vocab_ctas_897",
+        "trino_vocab_plain_897",
+        "trino_vocab_unknown_897",
+    );
+    for t in [ctas, plain, unknown] {
+        ok(&base_url, &format!("DROP TABLE IF EXISTS {NS}.{t}")).await;
+    }
+
+    let sql = format!(
+        "create table {NS}.{ctas}\n  WITH (\n    format = 'PARQUET',\n    \
+         partitioning = ARRAY['region', 'bucket(id, 4)'],\n    \
+         sorted_by = ARRAY['id DESC'],\n    gc_enabled = false,\n    \
+         parquet_bloom_filter_columns = ARRAY['region'],\n    \
+         parquet_writer_row_group_size = '64MB',\n    \
+         extra_properties = MAP(ARRAY['owner.team'], ARRAY['marts'])\n  )\nas (\n  \
+         select 1 as id, 'eu' as region union all select 2, 'us'\n);"
+    );
+    ok(&base_url, &sql).await;
+    let table = load(&session, ctas).await;
+    assert_eq!(
+        spec_of(&table),
+        [("region", "identity"), ("id", "bucket[4]")].map(|(c, t)| (c.to_string(), t.to_string())),
+        "{sql}"
+    );
+    assert_eq!(sort_of(&table), ["id descending nulls last"], "{sql}");
+    let props = table.metadata().properties();
+    let get = |k: &str| props.get(k).map(String::as_str);
+    assert_eq!(get("gc.enabled"), Some("false"));
+    assert_eq!(
+        get("write.parquet.bloom-filter-enabled.column.region"),
+        Some("true")
+    );
+    assert_eq!(get("write.parquet.row-group-size-bytes"), Some("67108864"));
+    assert_eq!(get("owner.team"), Some("marts"));
+    for gone in [
+        "format",
+        "partitioning",
+        "sorted_by",
+        "extra_properties",
+        "gc_enabled",
+    ] {
+        assert_eq!(get(gone), None, "{gone}: {props:?}");
+    }
+    ok(
+        &base_url,
+        &format!("INSERT INTO {NS}.{ctas} VALUES (3, 'eu')"),
+    )
+    .await;
+
+    // CREATE OR REPLACE with a new sort order stages a new table and keeps
+    // the partitioning it asks for; the table's own location is accepted
+    // only in place, another one never.
+    let replace = format!(
+        "create or replace table {NS}.{ctas} WITH (partitioning = ARRAY['region', \
+         'bucket(id, 4)'], sorted_by = ARRAY['region']) as select 1 as id, 'eu' as region"
+    );
+    ok(&base_url, &replace).await;
+    let table = load(&session, ctas).await;
+    assert_eq!(
+        sort_of(&table),
+        ["region ascending nulls first"],
+        "{replace}"
+    );
+    let live_location = table.metadata().location().to_string();
+    let same = format!(
+        "create or replace table {NS}.{ctas} WITH (location = '{live_location}', \
+         partitioning = ARRAY['region', 'bucket(id, 4)'], sorted_by = ARRAY['region']) \
+         as select 2 as id, 'us' as region"
+    );
+    ok(&base_url, &same).await;
+    let elsewhere = format!("{live_location}_elsewhere");
+    let err = run(
+        &base_url,
+        &format!(
+            "create or replace table {NS}.{ctas} WITH (location = '{elsewhere}', \
+             partitioning = ARRAY['region', 'bucket(id, 4)'], sorted_by = ARRAY['region']) \
+             as select 3 as id, 'eu' as region"
+        ),
+    )
+    .await
+    .expect_err("a moved location is refused");
+    assert!(err.contains("cannot move the table"), "{err}");
+
+    // CREATE TABLE: month() of a timestamp, NULLS spelled out, and a
+    // location the statement chooses.
+    let plain_location = format!(
+        "{}/{plain}_custom",
+        live_location.rsplit_once('/').expect("a parent").0
+    );
+    let sql = format!(
+        "create table {NS}.{plain} (id integer, ts timestamp(6), name varchar)\n\
+         WITH (partitioning = ARRAY['month(ts)'], \
+         sorted_by = ARRAY['name ASC NULLS LAST'], location = '{plain_location}')"
+    );
+    ok(&base_url, &sql).await;
+    let table = load(&session, plain).await;
+    assert_eq!(spec_of(&table), [("ts".to_string(), "month".to_string())]);
+    assert_eq!(sort_of(&table), ["name ascending nulls last"]);
+    assert_eq!(table.metadata().location(), plain_location);
+    ok(
+        &base_url,
+        &format!("INSERT INTO {NS}.{plain} VALUES (1, TIMESTAMP '2026-11-14 10:00:00', 'a')"),
+    )
+    .await;
+
+    // Refused and unknown keys fail before any table exists.
+    for (with, want) in [
+        ("foo = 'bar'", "unknown table property `foo`"),
+        ("compression_codec = 'ZSTD'", "iceberg.compression_codec"),
+        ("format = 'ORC'", "Parquet only"),
+        ("partitioning = ARRAY['nope']", "nope"),
+        ("sorted_by = ARRAY['nope']", "nope"),
+    ] {
+        let sql = format!("create table {NS}.{unknown} WITH ({with}) as select 1 as id");
+        let err = run(&base_url, &sql).await.expect_err(&sql);
+        assert!(err.contains(want), "{sql}: {err}");
+        assert!(!exists(&session, unknown).await, "{sql} left a table");
+    }
+
+    for t in [ctas, plain, unknown] {
+        ok(&base_url, &format!("DROP TABLE IF EXISTS {NS}.{t}")).await;
+    }
+}
