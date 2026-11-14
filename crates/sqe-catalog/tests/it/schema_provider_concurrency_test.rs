@@ -125,7 +125,30 @@ async fn eight_concurrent_table_names_refreshes_complete_on_two_workers() {
         started.elapsed()
     );
     assert!(provider.table_exist("orders"));
-    assert!(!provider.table_exist("missing"));
+
+    // Absence is only proven by a clean snapshot. The invalidation epoch is
+    // process-wide (#890), so a listing invalidation in any other test of
+    // this binary, landing while a refresh above was in flight, marks the snapshot
+    // invalidated and `table_exist` then answers "unknown" (true) by design.
+    // Retry only when the snapshot it answered from was invalidated; a clean
+    // snapshot that still reports "missing" fails.
+    let mut absent = false;
+    for _ in 0..20 {
+        if !provider.table_exist("missing") {
+            absent = true;
+            break;
+        }
+        let listing = provider.cached_listing().expect("a snapshot exists");
+        assert!(
+            listing.invalidated || listing.stale_error.is_some(),
+            "a clean snapshot must not report a table it does not list"
+        );
+        provider
+            .refresh_table_names()
+            .await
+            .expect("refresh against the mock");
+    }
+    assert!(absent, "no clean snapshot in 20 refreshes");
 }
 
 /// The real sync bridge: `CatalogProvider::schema` on a name outside the
