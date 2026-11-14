@@ -88,6 +88,20 @@ create table analytics.events_mart
 as (select * from analytics.events);
 ```
 
+`ALTER TABLE t SET PROPERTIES` takes the same properties, in one commit:
+
+- `partitioning` evolves the partition spec. Existing data files keep the spec they were written with; new writes use the new one. A field the table had before keeps its field id, so going back to an earlier layout reuses that spec. A new bucket count on the same column is a new field, named with the count (`id_bucket_8`).
+- `sorted_by` replaces the default sort order; `sorted_by = ARRAY[]` makes the table unsorted.
+- `extra_properties` sets the keys it lists. `format_version` upgrades the table.
+- `location` cannot be changed, and `p = DEFAULT` is refused: set the value explicitly.
+- Any other key is stored as an Iceberg property. As in `CREATE`, a quoted key is always an Iceberg property, so `SET TBLPROPERTIES ('k' = ...)` stores every key as written. Setting a layout the table already has commits nothing.
+
+```sql
+ALTER TABLE analytics.events_mart SET PROPERTIES
+  partitioning = ARRAY['month(occurred_at)', 'region'],
+  sorted_by = ARRAY[];
+```
+
 A column `DEFAULT` takes a literal and makes the table format-version 3. An `INSERT` with a column list and a `MERGE ... WHEN NOT MATCHED THEN INSERT` write the default into every column they omit; an explicit `NULL` is written as NULL. Defaults on `BINARY`, `FIXED` and `UUID` columns are refused on INSERT; name the column and give its value.
 
 ## Schema evolution
@@ -103,7 +117,7 @@ A column `DEFAULT` takes a literal and makes the table format-version 3. An `INS
 | `ALTER TABLE t ALTER COLUMN c TYPE new_type` | `sqlparser-rs` + `sqe-coordinator` | Iceberg type promotion only: INT -> BIGINT, REAL -> DOUBLE, a wider DECIMAL precision with the same scale, and (V3) UNKNOWN -> any primitive type. Any other change is rejected before it is committed. A nested field is named with a dotted path: a struct member as `s.a`, a list element as `l.element`, a map value as `m.value` (`ALTER COLUMN l.element TYPE BIGINT`). A map key cannot change type. | partial | partial | partial | partial |
 | `ALTER TABLE t RENAME TO new_t` | `sqlparser-rs` + `sqe-coordinator` | Catalog rename. Different catalog support varies. | yes | yes | yes | yes |
 | `ALTER TABLE t SET TBLPROPERTIES (...)` | `sqlparser-rs` + `sqe-coordinator` | Set Iceberg properties (e.g. `write.delete.mode`). `'format-version'` (or Trino's `format_version`) upgrades the table in the same commit; a lower version is refused. | yes | yes | yes | - |
-| `ALTER TABLE t SET PROPERTIES k = v, ...` | `sqe-sql` + `sqe-coordinator` | Trino's spelling of the above. `SET PROPERTIES format_version = 3` upgrades a V2 table. | yes | - | - | - |
+| `ALTER TABLE t SET PROPERTIES k = v, ...` | `sqe-sql` + `sqe-coordinator` | Trino's spelling of the above. `SET PROPERTIES format_version = 3` upgrades a V2 table; `partitioning`, `sorted_by` and `extra_properties` evolve the layout (see [Trino table properties](#trino-table-properties)). | yes | - | - | - |
 | `COMMENT ON TABLE t IS 'description'` | `sqlparser-rs` + `sqe-coordinator` | Stored in Iceberg properties. | yes | yes | yes | yes |
 | `COMMENT ON COLUMN t.c IS 'description'` | `sqlparser-rs` + `sqe-coordinator` | Stored on the column metadata. | yes | yes | yes | yes |
 

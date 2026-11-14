@@ -24,6 +24,7 @@ use crate::ident::{
     catalog_qualifier, fold_unquoted_ident, parse_table_ref, resolve_table_ident,
     schema_catalog_qualifier,
 };
+use crate::write_handler::trino_props::TrinoTableOptions;
 use crate::write_handler::{
     arrow_column_to_iceberg_type, configured_write_target,
     default_to_iceberg_literal as alter_default_to_iceberg_literal, geospatial_iceberg_type,
@@ -1514,11 +1515,16 @@ impl CatalogOps {
 
         // Extract SET TBLPROPERTIES key-value pairs. The format version
         // (`format-version` or Trino's `format_version`) is not a property:
-        // it upgrades the table (#897).
+        // it upgrades the table (#897). Trino's `partitioning` and
+        // `sorted_by` evolve the layout; its other keys map to Iceberg
+        // properties (`TrinoTableOptions::parse_alter`).
         let mut updates: HashMap<String, String> = HashMap::new();
         let mut requested_version = None;
+        let mut layout = Vec::new();
         for op in operations {
             if let AlterTableOperation::SetTblProperties { table_properties } = op {
+                let trino = TrinoTableOptions::parse_alter(table_properties)?;
+                let table_properties = trino.options();
                 if let Some(v) = requested_format_version(table_properties)? {
                     requested_version = Some(v);
                 }
@@ -1532,10 +1538,13 @@ impl CatalogOps {
                         updates.insert(k, v);
                     }
                 }
+                if trino.changes_layout() {
+                    layout.push(trino);
+                }
             }
         }
 
-        if updates.is_empty() && requested_version.is_none() {
+        if updates.is_empty() && requested_version.is_none() && layout.is_empty() {
             return Err(SqeError::Execution(
                 "ALTER TABLE SET TBLPROPERTIES: no valid key-value properties found".to_string(),
             ));
@@ -1577,11 +1586,23 @@ impl CatalogOps {
                 });
             }
         }
+        if !layout.is_empty() {
+            let table = session_catalog.load_table(&table_ident).await?;
+            for trino in &layout {
+                let (layout_updates, layout_requirements) = trino.alter_updates(&table)?;
+                table_updates.extend(layout_updates);
+                for requirement in layout_requirements {
+                    if !requirements.contains(&requirement) {
+                        requirements.push(requirement);
+                    }
+                }
+            }
+        }
         if !updates.is_empty() {
             table_updates.push(TableUpdate::SetProperties { updates });
         }
         if table_updates.is_empty() {
-            info!(table = %table_ident, "Format version already current; nothing to commit");
+            info!(table = %table_ident, "Table already as requested; nothing to commit");
             return Ok(());
         }
 

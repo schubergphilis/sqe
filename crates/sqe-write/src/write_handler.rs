@@ -41,7 +41,7 @@ use sqe_compaction::write_memory::{TrackedBatchBuffer, WriteReservation};
 mod ingest;
 mod snapshot_props;
 mod table_props;
-mod trino_props;
+pub(crate) mod trino_props;
 pub use ingest::{IngestMode, OnExisting, OnMissing};
 pub(crate) use table_props::{
     carry_live_properties, create_table_options_as_slice, create_table_properties,

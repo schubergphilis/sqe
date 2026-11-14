@@ -14,7 +14,7 @@ use iceberg::spec::{
     UnboundPartitionSpec,
 };
 use iceberg::table::Table;
-use iceberg::{Catalog, NamespaceIdent, TableCreation};
+use iceberg::{Catalog, NamespaceIdent, TableCreation, TableRequirement, TableUpdate};
 use sqe_core::{SqeError, SqeErrorCode};
 use sqlparser::ast::{
     CreateTableOptions, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, SqlOption,
@@ -130,6 +130,197 @@ impl TrinoTableOptions {
             ));
         }
         Ok(out)
+    }
+
+    /// Resolve the options of `ALTER TABLE ... SET PROPERTIES` (or `SET
+    /// TBLPROPERTIES`). The front door quotes every `SET PROPERTIES` key
+    /// (#338), so a Trino property is known here by its name; none of them
+    /// is an Iceberg property name, which are dotted. Every other key stays
+    /// an Iceberg property, as before. `location` cannot change, and Trino's
+    /// `p = DEFAULT` reset is refused.
+    pub(crate) fn parse_alter(items: &[SqlOption]) -> sqe_core::Result<Self> {
+        let mut out = Self::default();
+        for opt in items {
+            let SqlOption::KeyValue { key, value } = opt else {
+                out.options.push(opt.clone());
+                continue;
+            };
+            if matches!(value, Expr::Identifier(id)
+                if id.quote_style.is_none() && id.value.eq_ignore_ascii_case("default"))
+            {
+                return Err(invalid(format!(
+                    "SET PROPERTIES {} = DEFAULT is not supported; set the value explicitly",
+                    key.value
+                )));
+            }
+            // As in CREATE, a quoted key (every `SET TBLPROPERTIES` key) is an
+            // Iceberg property. An unquoted one is Trino vocabulary when SQE
+            // knows the name; any other stays a property, as `SET PROPERTIES`
+            // always stored it.
+            let name = key.value.to_ascii_lowercase();
+            let trino = key.quote_style.is_none()
+                && (SUPPORTED.contains(&name.as_str()) || REFUSED.iter().any(|(k, _)| *k == name));
+            if trino && name == "location" {
+                return Err(invalid(
+                    "ALTER TABLE cannot change the table property `location`",
+                ));
+            }
+            if trino {
+                out.trino_option(&name, opt, value)?;
+            } else {
+                out.options.push(opt.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    /// True when `partitioning` or `sorted_by` was given.
+    pub(crate) fn changes_layout(&self) -> bool {
+        self.partitioning.is_some() || self.sorted_by.is_some()
+    }
+
+    /// The table updates `partitioning` (partition evolution) and `sorted_by`
+    /// (a new default sort order) ask of `table`, with the requirements that
+    /// pin what they were derived from. Nothing for a property not given or
+    /// already in place.
+    pub(crate) fn alter_updates(
+        &self,
+        table: &Table,
+    ) -> sqe_core::Result<(Vec<TableUpdate>, Vec<TableRequirement>)> {
+        let meta = table.metadata();
+        let schema = meta.current_schema();
+        let mut updates = Vec::new();
+        let mut requirements = Vec::new();
+        if self.partitioning.is_some() {
+            let wanted = self
+                .partition_spec(None, schema)?
+                .map_or_else(Vec::new, |s| s.fields().to_vec());
+            let key = |source_id: i32, transform: Transform| (source_id, transform);
+            let live: Vec<_> = meta
+                .default_partition_spec()
+                .fields()
+                .iter()
+                .map(|f| key(f.source_id, f.transform))
+                .collect();
+            if live
+                != wanted
+                    .iter()
+                    .map(|f| key(f.source_id, f.transform))
+                    .collect::<Vec<_>>()
+            {
+                // A field some spec already had keeps its id and name, as
+                // Iceberg's own spec evolution does; a new one takes the next
+                // id after the last assigned (1000 on a table never partitioned).
+                let mut next_id = (meta.last_partition_id() + 1).max(1000);
+                let mut fields = Vec::with_capacity(wanted.len());
+                for mut field in wanted {
+                    let earlier = meta
+                        .partition_specs_iter()
+                        .flat_map(|s| s.fields())
+                        .find(|f| f.source_id == field.source_id && f.transform == field.transform);
+                    match earlier {
+                        Some(f) => {
+                            field.field_id = Some(f.field_id);
+                            field.name = f.name.clone();
+                        }
+                        None => {
+                            // `bucket(id, 8)` after `bucket(id, 4)` would reuse
+                            // the name `id_bucket` for another field; Iceberg
+                            // names it `id_bucket_8`.
+                            let taken = meta
+                                .partition_specs_iter()
+                                .flat_map(|s| s.fields())
+                                .any(|f| f.name == field.name);
+                            if taken {
+                                field.name = match field.transform {
+                                    Transform::Bucket(n) | Transform::Truncate(n) => {
+                                        format!("{}_{n}", field.name)
+                                    }
+                                    _ => format!("{}_{next_id}", field.name),
+                                };
+                            }
+                            field.field_id = Some(next_id);
+                            next_id += 1;
+                        }
+                    }
+                    fields.push(field);
+                }
+                requirements.push(TableRequirement::DefaultSpecIdMatch {
+                    default_spec_id: meta.default_partition_spec_id(),
+                });
+                // The catalog reuses a spec equal to one the table has and
+                // then has no "last added" spec, so an earlier layout is made
+                // the default by its id.
+                let same = |s: &iceberg::spec::PartitionSpec| {
+                    s.fields().len() == fields.len()
+                        && s.fields().iter().zip(&fields).all(|(a, b)| {
+                            Some(a.field_id) == b.field_id
+                                && a.source_id == b.source_id
+                                && a.transform == b.transform
+                                && a.name == b.name
+                        })
+                };
+                if let Some(spec) = meta.partition_specs_iter().find(|s| same(s)) {
+                    updates.push(TableUpdate::SetDefaultSpec {
+                        spec_id: spec.spec_id(),
+                    });
+                } else {
+                    let spec_id = meta
+                        .partition_specs_iter()
+                        .map(|s| s.spec_id())
+                        .max()
+                        .unwrap_or(0)
+                        + 1;
+                    let spec = UnboundPartitionSpec::builder()
+                        .with_spec_id(spec_id)
+                        .add_partition_fields(fields)
+                        .map_err(|e| invalid(format!("partitioning: {e}")))?
+                        .build();
+                    updates.push(TableUpdate::AddSpec { spec });
+                    updates.push(TableUpdate::SetDefaultSpec { spec_id: -1 });
+                    requirements.push(TableRequirement::LastAssignedPartitionIdMatch {
+                        last_assigned_partition_id: meta.last_partition_id(),
+                    });
+                }
+            }
+        }
+        if !self.keeps_sort_order(table, schema) {
+            let order_id = meta
+                .sort_orders_iter()
+                .map(|o| o.order_id)
+                .max()
+                .unwrap_or(0)
+                + 1;
+            let order = self
+                .sort_order_with_id(schema, order_id)?
+                .unwrap_or_else(SortOrder::unsorted_order);
+            // As for specs: an order the table has is made the default by id.
+            let key = |o: &SortOrder| -> Vec<_> {
+                o.fields
+                    .iter()
+                    .map(|f| (f.source_id, f.transform, f.direction, f.null_order))
+                    .collect()
+            };
+            requirements.push(TableRequirement::DefaultSortOrderIdMatch {
+                default_sort_order_id: meta.default_sort_order_id(),
+            });
+            match meta.sort_orders_iter().find(|o| key(o) == key(&order)) {
+                Some(existing) => updates.push(TableUpdate::SetDefaultSortOrder {
+                    sort_order_id: existing.order_id,
+                }),
+                None => {
+                    updates.push(TableUpdate::AddSortOrder { sort_order: order });
+                    updates.push(TableUpdate::SetDefaultSortOrder { sort_order_id: -1 });
+                }
+            }
+        }
+        if !updates.is_empty() {
+            requirements.push(TableRequirement::UuidMatch { uuid: meta.uuid() });
+            requirements.push(TableRequirement::CurrentSchemaIdMatch {
+                current_schema_id: meta.current_schema_id(),
+            });
+        }
+        Ok((updates, requirements))
     }
 
     fn trino_option(&mut self, key: &str, opt: &SqlOption, value: &Expr) -> sqe_core::Result<()> {
@@ -253,11 +444,19 @@ impl TrinoTableOptions {
     /// The default sort order `sorted_by` asks for, order id 1. Metadata
     /// only: SQE's writer does not sort, and its data files claim no order.
     pub(crate) fn sort_order(&self, schema: &IcebergSchema) -> sqe_core::Result<Option<SortOrder>> {
+        self.sort_order_with_id(schema, 1)
+    }
+
+    fn sort_order_with_id(
+        &self,
+        schema: &IcebergSchema,
+        order_id: i64,
+    ) -> sqe_core::Result<Option<SortOrder>> {
         let Some(items) = self.sorted_by.as_ref().filter(|i| !i.is_empty()) else {
             return Ok(None);
         };
         let mut order = SortOrder::builder();
-        order.with_order_id(1);
+        order.with_order_id(order_id);
         for item in items {
             let (column, direction, null_order) = sort_item(item)?;
             let field = schema.field_by_name(&column).ok_or_else(|| {
@@ -766,5 +965,80 @@ mod tests {
             opts.options(),
             create_table_options_as_slice(&ct.table_options)
         );
+    }
+
+    /// The SET TBLPROPERTIES list the front door makes of `SET PROPERTIES`.
+    fn alter(set: &str) -> sqe_core::Result<TrinoTableOptions> {
+        let sql = format!("ALTER TABLE t SET TBLPROPERTIES ({set})");
+        let stmt = Parser::parse_sql(&GenericDialect {}, &sql)
+            .expect("parse")
+            .remove(0);
+        let Statement::AlterTable(at) = stmt else {
+            panic!("not an ALTER TABLE");
+        };
+        let Some(sqlparser::ast::AlterTableOperation::SetTblProperties { table_properties }) =
+            at.operations.first()
+        else {
+            panic!("not SET TBLPROPERTIES");
+        };
+        TrinoTableOptions::parse_alter(table_properties)
+    }
+
+    #[test]
+    fn alter_knows_unquoted_trino_keys() {
+        let opts = alter(
+            r#"partitioning = ARRAY['bucket(id, 4)'], sorted_by = ARRAY['ts DESC'],
+               extra_properties = MAP(ARRAY['owner'], ARRAY['etl']),
+               gc_enabled = false, "write.delete.mode" = 'merge-on-read', custom = 'x'"#,
+        )
+        .unwrap();
+        assert!(opts.changes_layout());
+        let props = create_table_properties(false, FormatVersion::V2, opts.options());
+        assert_eq!(props.get("owner").map(String::as_str), Some("etl"));
+        assert_eq!(props.get("gc.enabled").map(String::as_str), Some("false"));
+        assert_eq!(
+            props.get("write.delete.mode").map(String::as_str),
+            Some("merge-on-read")
+        );
+        // An unknown unquoted key stays a property, as SET PROPERTIES stored it.
+        assert_eq!(props.get("custom").map(String::as_str), Some("x"));
+        assert!(!props.contains_key("partitioning"));
+        assert!(!alter("comment = 'c'").unwrap().changes_layout());
+    }
+
+    #[test]
+    fn alter_quoted_keys_stay_iceberg_properties() {
+        // SET TBLPROPERTIES quotes every key; those keep their old meaning.
+        let opts = alter(
+            r#"'location' = 's3://b/t', 'sorted_by' = 'x', "max_commit_retry" = '4',
+               'gc_enabled' = 'true'"#,
+        )
+        .unwrap();
+        assert!(!opts.changes_layout());
+        let props = create_table_properties(false, FormatVersion::V2, opts.options());
+        for key in ["location", "sorted_by", "max_commit_retry", "gc_enabled"] {
+            assert!(props.contains_key(key), "{key}: {props:?}");
+        }
+        assert!(!props.contains_key("gc.enabled"));
+    }
+
+    #[test]
+    fn alter_refuses_default_location_and_refused_keys() {
+        for (set, want) in [
+            ("sorted_by = DEFAULT", "DEFAULT is not supported"),
+            (
+                r#""write.delete.mode" = DEFAULT"#,
+                "DEFAULT is not supported",
+            ),
+            (
+                "location = 's3://b/t'",
+                "cannot change the table property `location`",
+            ),
+            ("max_commit_retry = 4", "not supported"),
+            ("partitioning = 'id'", "must be an ARRAY of strings"),
+        ] {
+            let e = alter(set).expect_err(set).to_string();
+            assert!(e.contains(want), "{set}: {e}");
+        }
     }
 }

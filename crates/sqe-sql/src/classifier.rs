@@ -1590,12 +1590,14 @@ fn rewrite_set_properties(trimmed: &str) -> Option<String> {
     if body.is_empty() {
         return None;
     }
-    // Split into `key = value` pairs on top-level commas and double-quote each
-    // key. Iceberg property names are dotted/hyphenated (e.g.
-    // `commit.retry.num-retries`) and do not parse as bare identifiers; quoting
-    // them as delimited identifiers makes sqlparser accept the list. Values are
-    // kept verbatim (they may themselves contain commas inside `ARRAY[...]`,
-    // which the top-level split preserves).
+    // Split into `key = value` pairs on top-level commas. Iceberg property
+    // names are dotted/hyphenated (e.g. `commit.retry.num-retries`) and do not
+    // parse as bare identifiers, so such a key is double-quoted. A plain
+    // identifier key stays unquoted: an unquoted key is Trino vocabulary
+    // (`partitioning`, `sorted_by`, ...) as in `CREATE TABLE ... WITH`, while
+    // a quoted one is an Iceberg property (#897). Values are kept verbatim
+    // (they may themselves contain commas inside `ARRAY[...]`, which the
+    // top-level split preserves).
     let mut pairs: Vec<String> = Vec::new();
     for segment in split_top_level(body, ',') {
         let seg = segment.trim();
@@ -1606,14 +1608,23 @@ fn rewrite_set_properties(trimmed: &str) -> Option<String> {
         if eq_parts.len() < 2 {
             return None;
         }
-        let key = eq_parts[0].trim().trim_matches('"').trim_matches('\'');
+        let raw_key = eq_parts[0].trim();
+        let key = raw_key.trim_matches('"').trim_matches('\'');
         let value = eq_parts[1..].join("=");
         let value = value.trim();
         if key.is_empty() || value.is_empty() {
             return None;
         }
-        let key_esc = key.replace('"', "\"\"");
-        pairs.push(format!("\"{key_esc}\" = {value}"));
+        let bare = raw_key.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && raw_key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if bare {
+            pairs.push(format!("{key} = {value}"));
+        } else {
+            let key_esc = key.replace('"', "\"\"");
+            pairs.push(format!("\"{key_esc}\" = {value}"));
+        }
     }
     if pairs.is_empty() {
         return None;
@@ -2705,6 +2716,47 @@ mod tests {
         assert!(
             matches!(result, StatementKind::AlterTableProps(_)),
             "Expected AlterTableProps, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_set_properties_keeps_identifier_keys_unquoted() {
+        // An identifier key stays unquoted so the write path reads it as Trino
+        // vocabulary; a dotted key or one the user quoted is an Iceberg
+        // property and is quoted (#897).
+        let result = parse_and_classify(
+            "ALTER TABLE t SET PROPERTIES partitioning = ARRAY['region', 'bucket(id, 4)'], \
+             commit.retry.num-retries = 4, \"location\" = 's3://b/t', sorted_by = ARRAY[]",
+        )
+        .unwrap();
+        let StatementKind::AlterTableProps(stmt) = result else {
+            panic!("Expected AlterTableProps, got: {result:?}");
+        };
+        let Statement::AlterTable(alter) = *stmt else {
+            panic!("expected AlterTable");
+        };
+        let Some(AlterTableOperation::SetTblProperties { table_properties }) =
+            alter.operations.first()
+        else {
+            panic!("expected SetTblProperties: {:?}", alter.operations);
+        };
+        let keys: Vec<_> = table_properties
+            .iter()
+            .map(|o| match o {
+                sqlparser::ast::SqlOption::KeyValue { key, .. } => {
+                    (key.value.clone(), key.quote_style.is_some())
+                }
+                other => panic!("unexpected option {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                ("partitioning".to_string(), false),
+                ("commit.retry.num-retries".to_string(), true),
+                ("location".to_string(), true),
+                ("sorted_by".to_string(), false),
+            ]
         );
     }
 

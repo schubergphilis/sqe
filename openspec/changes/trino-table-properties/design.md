@@ -63,6 +63,10 @@ The same vocabulary, in one commit where possible:
 
 Trino resets a property with `SET PROPERTIES p = DEFAULT`. That form is refused until it is needed.
 
+The quoting rule is the one CREATE uses. The front door's `SET PROPERTIES` rewrite keeps an identifier key unquoted and quotes a dotted one, and every `SET TBLPROPERTIES` key is quoted, so `SET TBLPROPERTIES` keeps its old meaning. An unquoted key is Trino vocabulary when its name is a supported or refused Trino property; any other unquoted key stays an Iceberg property, as `SET PROPERTIES` always stored it, so an unknown key is not an error in ALTER (existing `SET PROPERTIES owner = '...'` statements keep working). `location` is refused: moving a table is not a property change.
+
+A partition field the table had in any earlier spec, matched on source column and transform, keeps its field id and name; a new field takes the next id after the last assigned. A new field whose name an earlier field used (`bucket(id, 8)` after `bucket(id, 4)`) gets the parameter as a suffix (`id_bucket_8`), as Iceberg's own spec evolution names it. The commit asserts the default spec and sort order ids it read, beside the table uuid, schema id and last partition id. The catalog reuses a spec or sort order equal to one the table already has, and then has no "last added" one, so going back to an earlier layout sets the default by its id instead of adding it again.
+
 ## Risks / Trade-offs
 
 - **The unknown-key error is a behaviour change.** Existing SQL with an unquoted custom key fails. The error message tells the user to quote the key.
