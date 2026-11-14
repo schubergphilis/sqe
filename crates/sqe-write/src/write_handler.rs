@@ -2257,12 +2257,12 @@ impl WriteHandler {
         // the precision the format version can hold; the streaming sink casts
         // every batch onto the table schema (`apply_stamped_schema`), so the
         // ns values are narrowed to µs on write (#773).
-        // A variant column exists only from v3 (#849), so it upgrades the table.
-        let create_format_version = if arrow_schema_has_variant(output_schema.as_arrow()) {
-            FormatVersion::V3
-        } else {
-            self.format_version()
-        };
+        // A variant column exists only from v3 (#849), so it upgrades the
+        // table; otherwise the statement's format_version option, then the
+        // server default (#897).
+        let needs_v3 = arrow_schema_has_variant(output_schema.as_arrow()).then_some("variant");
+        let create_format_version =
+            new_table_format_version(user_options, needs_v3, self.format_version())?;
         let arrow_schema = Arc::new(write_schema_for_format_version(
             output_schema.as_arrow(),
             create_format_version,
@@ -8971,6 +8971,28 @@ pub(crate) fn requested_format_version(
     Ok(requested)
 }
 
+/// The format version a new table is created at (CREATE TABLE and CTAS,
+/// #897): V3 when a column needs it (`needs_v3` names the kinds), else the
+/// version the options ask for, else `default_version`. Asking for less than
+/// a column needs is an error.
+pub(crate) fn new_table_format_version(
+    options: &[sqlparser::ast::SqlOption],
+    needs_v3: Option<&str>,
+    default_version: FormatVersion,
+) -> sqe_core::Result<FormatVersion> {
+    match (requested_format_version(options)?, needs_v3) {
+        (Some(v), Some(kinds)) if v < FormatVersion::V3 => Err(SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!(
+                "format-version {v} was requested, but the table has a column \
+                 ({kinds}) that needs format v3"
+            ),
+        )),
+        (_, Some(_)) => Ok(FormatVersion::V3),
+        (requested, None) => Ok(requested.unwrap_or(default_version)),
+    }
+}
+
 /// Build the Arrow and Iceberg schemas of a `CREATE TABLE (cols)` and decide
 /// its format version.
 ///
@@ -8983,27 +9005,11 @@ pub(crate) fn plan_create_table_schema(
     options: &[sqlparser::ast::SqlOption],
     default_version: FormatVersion,
 ) -> sqe_core::Result<(ArrowSchema, IcebergSchema, FormatVersion)> {
-    let requested = requested_format_version(options)?;
-
     let arrow_schema = ArrowSchema::new(create_table_arrow_fields(column_defs, false)?);
     let iceberg_schema = arrow_schema_to_iceberg_with_defaults(&arrow_schema, column_defs)?;
-    let needs_v3 = requires_v3_features(column_defs, &iceberg_schema);
-
-    let format_version = match requested {
-        Some(v) if needs_v3 && v < FormatVersion::V3 => {
-            return Err(SqeError::with_code(
-                SqeErrorCode::ExecutionFailed,
-                format!(
-                    "format-version {v} was requested, but the table has a column \
-                     (variant, geometry, geography, nanosecond timestamp or DEFAULT) \
-                     that needs format v3"
-                ),
-            ))
-        }
-        _ if needs_v3 => FormatVersion::V3,
-        Some(v) => v,
-        None => default_version,
-    };
+    let needs_v3 = requires_v3_features(column_defs, &iceberg_schema)
+        .then_some("variant, geometry, geography, nanosecond timestamp or DEFAULT");
+    let format_version = new_table_format_version(options, needs_v3, default_version)?;
 
     if format_version < FormatVersion::V3 {
         return Ok((arrow_schema, iceberg_schema, format_version));
@@ -14164,6 +14170,7 @@ s3_path_style = true
     // -------------------------------------------------------------------------
     #[cfg(feature = "test-sqlite")]
     mod committing {
+        mod format_version;
         use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
         use super::*;

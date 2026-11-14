@@ -25,7 +25,7 @@ DROP SCHEMA staging CASCADE;
 |---|---|---|---|---|---|---|
 | `CREATE TABLE t (col TYPE [DEFAULT expr], ...)` | `sqlparser-rs` + `sqe-sql` + `sqe-coordinator` | Iceberg V3 column defaults supported. Nested types in the Trino form (`array(integer)`, `map(varchar, bigint)`, `row(x decimal(10,2), y varchar)`) and the Spark form (`ARRAY<INT>`, `MAP<VARCHAR, BIGINT>`, `STRUCT<x INT>`) both work, at any depth (`sqe-sql/ddl_types.rs`). | yes | yes | yes | yes |
 | `CREATE TABLE t (...) PARTITIONED BY (transform(col), ...)` | `sqe-sql/partition.rs` | Partition transforms: `bucket(N, col)`, `truncate(N, col)`, `year(col)`, `month(col)`, `day(col)`, `hour(col)`, identity (just `col`). | partial | - | yes | - |
-| `CREATE TABLE t AS SELECT ...` (CTAS) | `sqlparser-rs` + `sqe-coordinator` | Inferred schema; partitioning via `WITH (partitioning = ARRAY['day(ts)'])`. | yes | yes | yes | yes |
+| `CREATE TABLE t AS SELECT ...` (CTAS) | `sqlparser-rs` + `sqe-coordinator` | Inferred schema; partitioning via `PARTITIONED BY (...)` before `AS`. Of Trino's `WITH (...)` table properties only `format_version` takes effect so far; the others (`partitioning`, `sorted_by`, `location`, ...) are stored as plain properties and do nothing (#897). | yes | yes | yes | yes |
 | `CREATE OR REPLACE TABLE t AS SELECT ...` | `sqlparser-rs` + `sqe-coordinator` | Atomic replace. In-place snapshot replace when schema and partitioning match (table keeps UUID, grants, history; properties not re-applied). Staged table + swap otherwise. Self-referencing replace safe (reads old snapshot before swap). | yes | yes | partial | yes |
 | `CREATE TABLE [IF NOT EXISTS] t LIKE other_table` | `sqlparser-rs` + `sqe-coordinator` | Copy schema only, no data. | yes | yes | yes | yes |
 
@@ -45,6 +45,15 @@ SELECT day(occurred_at) AS d, count(*) AS n
 FROM analytics.events GROUP BY 1;
 ```
 
+The format version of a new table comes from the statement when it names one: `WITH (format_version = 3)` (Trino; a number or a string), `WITH ('format-version' = '3')` or `TBLPROPERTIES ('format-version' = '3')`. This holds for `CREATE TABLE` and CTAS. Otherwise the table gets `catalog.default_table_format_version`. A table comment written `COMMENT 'text'` is stored as the `comment` property, the same place `COMMENT ON TABLE` writes it. It may stand before or after a `WITH (...)` list, which is the order dbt-trino writes with `persist_docs`.
+
+```sql
+create table analytics.orders_mart
+  comment 'one row per order'
+  WITH (format_version = 3)
+as (select * from analytics.orders);
+```
+
 A column `DEFAULT` takes a literal and makes the table format-version 3. An `INSERT` with a column list and a `MERGE ... WHEN NOT MATCHED THEN INSERT` write the default into every column they omit; an explicit `NULL` is written as NULL. Defaults on `BINARY`, `FIXED` and `UUID` columns are refused on INSERT; name the column and give its value.
 
 ## Schema evolution
@@ -59,7 +68,8 @@ A column `DEFAULT` takes a literal and makes the table format-version 3. An `INS
 | `ALTER TABLE t ALTER COLUMN c SET DEFAULT expr` | `sqlparser-rs` + `sqe-coordinator` | Iceberg V3 column default. | partial | yes | yes | yes |
 | `ALTER TABLE t ALTER COLUMN c TYPE new_type` | `sqlparser-rs` + `sqe-coordinator` | Iceberg type promotion only: INT -> BIGINT, REAL -> DOUBLE, a wider DECIMAL precision with the same scale, and (V3) UNKNOWN -> any primitive type. Any other change is rejected before it is committed. A nested field is named with a dotted path: a struct member as `s.a`, a list element as `l.element`, a map value as `m.value` (`ALTER COLUMN l.element TYPE BIGINT`). A map key cannot change type. | partial | partial | partial | partial |
 | `ALTER TABLE t RENAME TO new_t` | `sqlparser-rs` + `sqe-coordinator` | Catalog rename. Different catalog support varies. | yes | yes | yes | yes |
-| `ALTER TABLE t SET TBLPROPERTIES (...)` | `sqlparser-rs` + `sqe-coordinator` | Set Iceberg properties (e.g. `write.delete.mode`). | yes | yes | yes | - |
+| `ALTER TABLE t SET TBLPROPERTIES (...)` | `sqlparser-rs` + `sqe-coordinator` | Set Iceberg properties (e.g. `write.delete.mode`). `'format-version'` (or Trino's `format_version`) upgrades the table in the same commit; a lower version is refused. | yes | yes | yes | - |
+| `ALTER TABLE t SET PROPERTIES k = v, ...` | `sqe-sql` + `sqe-coordinator` | Trino's spelling of the above. `SET PROPERTIES format_version = 3` upgrades a V2 table. | yes | - | - | - |
 | `COMMENT ON TABLE t IS 'description'` | `sqlparser-rs` + `sqe-coordinator` | Stored in Iceberg properties. | yes | yes | yes | yes |
 | `COMMENT ON COLUMN t.c IS 'description'` | `sqlparser-rs` + `sqe-coordinator` | Stored on the column metadata. | yes | yes | yes | yes |
 

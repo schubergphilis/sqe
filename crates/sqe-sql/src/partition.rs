@@ -159,20 +159,30 @@ pub fn is_create_external_table(sql: &str) -> bool {
 /// so `USING iceberg` says nothing; any other provider is left in place and
 /// keeps its parse error.
 ///
+/// sqlparser also keeps `COMMENT`, `WITH (...)` and `TBLPROPERTIES` in one
+/// options slot. A comment beside an options list becomes its `comment`
+/// property, and a `WITH` list beside `TBLPROPERTIES` joins it, where
+/// sqlparser would keep only the last list (#897).
+///
 /// Runs after [`normalize_partitioned_by`]. Parse-gated: SQL that already
-/// parses is returned untouched, and the reordered text is only adopted when
-/// it parses. A clause list holding anything else (`STORED AS`, `CLUSTER BY`)
-/// is left as written.
+/// parses is returned untouched unless it holds both lists, and the
+/// reordered text is only adopted when it parses. A clause list holding
+/// anything else (`STORED AS`, `CLUSTER BY`) is left as written.
 pub fn reorder_create_table_clauses(sql: &str) -> String {
     if !sql.to_ascii_lowercase().contains("create") || is_create_external_table(sql) {
         return sql.to_string();
     }
     let dialect = GenericDialect {};
-    if Parser::parse_sql(&dialect, sql).is_ok() {
+    let parses = Parser::parse_sql(&dialect, sql).is_ok();
+    if parses && !sql.to_ascii_uppercase().contains("TBLPROPERTIES") {
         return sql.to_string();
     }
     match reorder_clauses(sql) {
-        Some(candidate) if Parser::parse_sql(&dialect, &candidate).is_ok() => candidate,
+        Some((candidate, joined))
+            if (joined || !parses) && Parser::parse_sql(&dialect, &candidate).is_ok() =>
+        {
+            candidate
+        }
         _ => sql.to_string(),
     }
 }
@@ -188,7 +198,8 @@ enum TableClause {
     UsingIceberg,
 }
 
-fn reorder_clauses(sql: &str) -> Option<String> {
+/// The reordered statement, and whether a `WITH` list joined `TBLPROPERTIES`.
+fn reorder_clauses(sql: &str) -> Option<(String, bool)> {
     let tokens = Tokenizer::new(&GenericDialect {}, sql)
         .tokenize_with_location()
         .ok()?;
@@ -303,33 +314,79 @@ fn reorder_clauses(sql: &str) -> Option<String> {
         sig.get(p)
             .map_or(sql.len(), |&i| byte_offset(sql, tokens[i].span.start))
     };
-    // A clause ends where the token after its last one begins.
+    // Token `p` runs to where the token after it begins.
+    let end_of = |p: usize| {
+        tokens
+            .get(sig[p] + 1)
+            .map_or(sql.len(), |t| byte_offset(sql, t.span.start))
+    };
     let text = |(_, start, end): (TableClause, usize, usize)| {
-        let from = offset(start);
-        let to = tokens
-            .get(sig[end - 1] + 1)
-            .map_or(sql.len(), |t| byte_offset(sql, t.span.start));
-        &sql[from..to]
+        sql[offset(start)..end_of(end - 1)].to_string()
     };
     let mut sorted = clauses.clone();
     sorted.sort_by_key(|c| c.0);
-    let reordered: Vec<&str> = sorted
-        .into_iter()
-        .filter(|c| c.0 != TableClause::UsingIceberg)
-        .map(text)
+    let find = |kind: TableClause| sorted.iter().position(|c| c.0 == kind);
+    let mut texts: Vec<String> = sorted.iter().map(|&c| text(c)).collect();
+    // sqlparser keeps `COMMENT`, `WITH (...)` and `TBLPROPERTIES` in one
+    // options slot (#897). `WITH (...) TBLPROPERTIES (...)` parses, but the
+    // second list replaces the first: `WITH (format_version = 3)` was
+    // dropped without a word. Both are table properties, so the WITH items
+    // join the TBLPROPERTIES list.
+    let joined = match (find(TableClause::With), find(TableClause::TblProperties)) {
+        (Some(w), Some(t)) => {
+            let (_, start, end) = sorted[w];
+            let items = sql[offset(start + 2)..offset(end - 1)].trim();
+            texts[t] = append_option(&texts[t], items);
+            texts[w].clear();
+            true
+        }
+        _ => false,
+    };
+    // No order of `COMMENT` and an options list parses; dbt-trino writes
+    // `comment '...' WITH (...)`. The comment joins the options as the
+    // `comment` property, where Trino's Iceberg connector and `COMMENT ON
+    // TABLE` keep a table comment.
+    let options = find(TableClause::With)
+        .filter(|&w| !texts[w].is_empty())
+        .or(find(TableClause::TblProperties));
+    if let (Some(o), Some(c)) = (options, find(TableClause::Comment)) {
+        let literal = &sql[offset(sorted[c].2 - 1)..end_of(sorted[c].2 - 1)];
+        let key = match sorted[o].0 {
+            TableClause::With => "comment",
+            _ => "'comment'",
+        };
+        texts[o] = append_option(&texts[o], &format!("{key} = {literal}"));
+        texts[c].clear();
+    }
+    let reordered: Vec<String> = sorted
+        .iter()
+        .zip(texts)
+        .filter(|(c, t)| c.0 != TableClause::UsingIceberg && !t.is_empty())
+        .map(|(_, t)| t)
         .collect();
     let head = sql[..offset(clauses[0].1)].trim_end();
     let tail = &sql[offset(p)..];
     let mut out = head.to_string();
     for clause in reordered {
         out.push(' ');
-        out.push_str(clause);
+        out.push_str(&clause);
     }
     if !tail.is_empty() {
         out.push(' ');
         out.push_str(tail);
     }
-    Some(out)
+    Some((out, joined))
+}
+
+/// `clause` (`WITH (...)` or `TBLPROPERTIES (...)`) with `item` added as its
+/// last option.
+fn append_option(clause: &str, item: &str) -> String {
+    match clause.rfind(')') {
+        Some(close) if !item.is_empty() => {
+            format!("{}, {item}{}", clause[..close].trim_end(), &clause[close..])
+        }
+        _ => clause.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -469,13 +526,70 @@ mod tests {
     }
 
     /// sqlparser keeps `COMMENT`, `WITH (...)` and `TBLPROPERTIES` in one
-    /// options slot, so no order of two of them parses; the statement keeps
-    /// its own parse error.
+    /// options slot, so no order of two of them parses: the comment joins
+    /// the options as the `comment` property (#897).
     #[test]
-    fn clauses_sharing_the_options_slot_are_left_as_written() {
-        let sql = "CREATE TABLE t (id BIGINT) PARTITION BY (id) COMMENT 'c' \
+    fn a_comment_beside_options_becomes_the_comment_property() {
+        let sql = "CREATE TABLE t (id BIGINT) PARTITION BY (id) COMMENT 'it''s' \
                    TBLPROPERTIES ('a' = 'b')";
-        assert_eq!(reorder_create_table_clauses(sql), sql);
+        assert_eq!(
+            reorder_create_table_clauses(sql),
+            "CREATE TABLE t (id BIGINT) TBLPROPERTIES ('a' = 'b', 'comment' = 'it''s') \
+             PARTITION BY (id)"
+        );
+        // dbt-trino's table materialization with `persist_docs`.
+        let sql = "create table s.t\n  comment 'a mart'\n  WITH (\n    format_version = 2\n  )\n\
+                   as (\n  select 1 as id\n);";
+        let out = reorder_create_table_clauses(sql);
+        assert_eq!(
+            out,
+            "create table s.t WITH (\n    format_version = 2, comment = 'a mart') as (\n  \
+             select 1 as id\n);"
+        );
+        // The Trino door executes the re-printed statement: it parses again.
+        let stmt = Parser::parse_sql(&GenericDialect {}, &out)
+            .expect("parse")
+            .remove(0);
+        Parser::parse_sql(&GenericDialect {}, &stmt.to_string()).expect("re-parse");
+    }
+
+    /// `WITH (...) TBLPROPERTIES (...)` parses, but sqlparser keeps only the
+    /// last list: the WITH items join TBLPROPERTIES instead (#897).
+    #[test]
+    fn a_with_list_beside_tblproperties_joins_it() {
+        let sql = "CREATE TABLE t WITH (format_version = 3) TBLPROPERTIES ('b' = '2') AS SELECT 1";
+        assert_eq!(
+            reorder_create_table_clauses(sql),
+            "CREATE TABLE t TBLPROPERTIES ('b' = '2', format_version = 3) AS SELECT 1"
+        );
+        let sql = "CREATE TABLE t (id BIGINT) COMMENT 'c' WITH (a = 1) TBLPROPERTIES ('b' = '2')";
+        let out = reorder_create_table_clauses(sql);
+        assert_eq!(
+            out,
+            "CREATE TABLE t (id BIGINT) TBLPROPERTIES ('b' = '2', a = 1, 'comment' = 'c')"
+        );
+        let sqlparser::ast::Statement::CreateTable(ct) =
+            Parser::parse_sql(&GenericDialect {}, &out)
+                .expect("parse")
+                .remove(0)
+        else {
+            panic!("not a CREATE TABLE");
+        };
+        let keys = option_keys(&ct.table_options);
+        assert_eq!(keys, ["b", "a", "comment"]);
+    }
+
+    fn option_keys(options: &sqlparser::ast::CreateTableOptions) -> Vec<String> {
+        use sqlparser::ast::{CreateTableOptions, SqlOption};
+        let CreateTableOptions::TableProperties(opts) = options else {
+            panic!("not TBLPROPERTIES: {options:?}");
+        };
+        opts.iter()
+            .filter_map(|o| match o {
+                SqlOption::KeyValue { key, .. } => Some(key.value.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
