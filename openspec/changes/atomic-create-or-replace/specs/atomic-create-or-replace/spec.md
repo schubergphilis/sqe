@@ -28,7 +28,7 @@ A replace SHALL keep the table's UUID, location, earlier snapshots, branches oth
 
 #### Scenario: Rollback across the replace
 - **WHEN** after that replace `rollback_to_snapshot(t, S1)` runs
-- **THEN** `t` reads as before the replace, with its old schema
+- **THEN** `main` points at S1 and `t` returns S1's rows. The current schema stays the replace's schema, as in Iceberg Java (a rollback moves `main`, not the schema): columns the replace dropped are gone, columns kept by name keep S1's values, and columns the replace added read as NULL
 
 #### Scenario: Branches and tags kept
 - **WHEN** `t` has a branch `dev` and a tag `v1` before the replace
@@ -48,6 +48,10 @@ Columns of the new schema whose name exists in the current schema SHALL keep tha
 #### Scenario: Old files read correctly after the type change
 - **WHEN** after that replace a reader time-travels to the old snapshot
 - **THEN** `b` reads as the old INT values, not as strings decoded from INT data
+
+#### Scenario: Only kept required columns stay NOT NULL
+- **WHEN** a column of the new schema is new, gets a new id, or was optional in the current schema
+- **THEN** it is optional after the replace, even when the SELECT cannot produce NULL, because files written before the replace lack it or may hold nulls in it; a column that keeps the id of a required column, a map key and an identifier field stay required
 
 #### Scenario: Shape seen before
 - **WHEN** `t` is replaced with shape A, then shape B, then shape A again
@@ -69,7 +73,7 @@ The replace commit SHALL set the merged properties: the statement's keys overrid
 - **THEN** the replace snapshot's summary holds `run = 7`
 
 ### Requirement: Failures leave the table untouched
-When the SELECT, the write or the commit fails, the table SHALL be exactly as it was before the statement. SQE SHALL delete the data files, manifests and manifest list the attempt wrote.
+When the SELECT, the write or the commit fails, the table SHALL be exactly as it was before the statement. SQE SHALL delete the data files the attempt wrote. The manifests and manifest list of a refused commit are left on storage, unreferenced, as on every other SQE write path; removing them is a follow-up for all write paths.
 
 #### Scenario: Failing SELECT
 - **WHEN** the SELECT of a schema-changing replace fails part-way

@@ -71,6 +71,9 @@ mod update_statistics;
 mod upgrade_format_version;
 
 pub use branch::{CreateBranchAction, CreateTagAction, PublishBranchAction, RemoveRefAction};
+// SQE PATCH (sqe#892): the shape half of an atomic CREATE OR REPLACE.
+mod replace_shape;
+pub use replace_shape::{ReplaceTableShapeAction, ShapePins};
 pub use row_delta::RowDeltaAction;
 
 use std::sync::Arc;

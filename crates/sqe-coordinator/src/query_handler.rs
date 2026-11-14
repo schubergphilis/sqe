@@ -3010,7 +3010,9 @@ impl QueryHandler {
             }
 
             if let Some(ref cache) = self.query_cache {
-                if cacheable {
+                // Catalog metadata changes with DDL on any table, which the
+                // per-table eviction below cannot reach (#892).
+                if cacheable && !ResultCache::reads_catalog_metadata(&audit_resources) {
                     if let Ok(ref batches) = result {
                         cache.store_bound(
                             &ResultCache::session_scope(session),

@@ -35,7 +35,23 @@ CREATE OR REPLACE TABLE analytics.monthly_sales AS
 SELECT ... ;
 ```
 
-Drops the existing table (if it exists) and creates a new one. Useful for dbt `table` materializations.
+Replaces the rows of an existing table in one commit, or creates the table when it does not exist. Useful for dbt `table` materializations.
+
+The replace is a new snapshot on the same table, so the table keeps its UUID, snapshot history, branches, tags, grants and table properties. When the query's columns or the `PARTITIONED BY` clause differ from the table's, the same commit makes the new schema and partition spec current, as an Iceberg replace transaction does:
+
+- A column whose name the table already has keeps its field id when its type is the same or a promotion (`INT` to `BIGINT`, `FLOAT` to `DOUBLE`, a wider decimal). Any other column gets a new field id.
+- A column stays `NOT NULL` only when it keeps the field id of a `NOT NULL` column. New columns, columns with a new field id and formerly nullable columns are nullable after the replace, because files written before it lack them or may hold nulls.
+- No `PARTITIONED BY` means unpartitioned.
+- Column tags follow the columns that keep their name. A tag on a dropped column goes with it.
+- Time travel to an earlier snapshot reads it with the schema it was written with.
+- Readers see the old table or the new one, never neither: `information_schema.columns` always lists the table.
+
+The format version stays the table's unless the statement asks for a higher one (`WITH (format_version = 3)`) or the query needs V3. Two replaces are refused before any data is written:
+
+- one that asks for a lower format version; drop the table first;
+- one that changes the columns or partitioning while `WRITE_BRANCH` is set or inside a transaction, because the schema and spec apply to every branch.
+
+A replace that lands while another session changes the table's schema or partitioning fails and names the concurrent change; one that lands over a concurrent append is retried.
 
 ### INSERT INTO
 

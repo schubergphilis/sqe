@@ -56,6 +56,7 @@ It wraps that metadata in a `Table` with the live identifier and `FileIO`. The e
 **2. Field and spec ids follow Iceberg Java.**
 - **Column ids:** reused by exact column name from the live current schema; other columns get `last-column-id + 1, ...`. When a column keeps its name but changes type, the id is reused only when the change is an allowed Iceberg promotion (int to long, float to double, decimal precision widening). Otherwise it gets a fresh id.
 - **Nested fields:** ids are reused by full path.
+- **Required-ness:** a field stays required only when it keeps the id of a required field (map keys and identifier fields always stay required). Iceberg's evolution rule forbids adding a required column, and the replace keeps history: without this, rollback or time travel across the replace failed on an old file that lacks a NOT NULL column. Found by the rollback integration test.
 - **Partition fields:** ids are reused by (source id, transform).
 - **Equal shapes:** a schema or spec equal to an existing one reuses that one's id.
 
@@ -113,7 +114,15 @@ The `__sqe_replace_` branch, its warning and its swap block are deleted for Iceb
 
 ## Risks / Trade-offs
 
-These assumptions are open until the probes in task group 1 confirm them:
+Probe results (the integration tests in `ctas_replace_shape_e2e.rs` served as the probes, against Polaris 1.7.0; the embedded SQLite catalog is covered by the CLI test `ctas_is_one_commit_and_keeps_partitioning_and_replace`):
+
+- **A1 holds**, with one condition: an `add-spec` update must carry `spec-id`. Iceberg Java's parser requires the field; without it Polaris answers a bare `400 WebApplicationException` and logs nothing. The shape action now sets the next free spec id, as SQE's partition evolution already did.
+- **A2 / A3:** the shape action pins the ids it planned against (`ShapePins`: UUID, current schema id, last column id, default spec id, last partition id) and sends explicit ids for a reused schema or spec, so the catalog's id assignment is never relied on. A table that moved to other ids before the commit is refused with an error naming the concurrent schema change; a concurrent append only moves `main` and is retried.
+- **A4:** the replace is one table update commit (Polaris checks its update privilege), in place of create + drop + rename (U5 as designed). Not separately tested with a principal that holds only one of the two privilege sets.
+- **Rollback:** a rollback moves `main`, not the current schema (Iceberg Java semantics). After rolling back across a replace, S1's files read through the replace's schema: kept columns keep their values, added columns read as NULL, dropped columns are gone. The spec scenario was corrected to say so.
+- **Dropped partition column:** a replace that drops the column the old spec partitions on failed with "value is not compatible with type". The files it removes are listed in a manifest under their own (old) spec, and iceberg-rust bound that spec to the current schema, where an identity field on a missing column types as `unknown`. The vendor now binds an old spec to the newest schema that still holds its source columns (`TableMetadata::schema_for_partition_spec`), for the manifest writer and for added-file validation; the snapshot summary already did this. Found by the embedded CLI test; the Polaris test `ctas_replace_shape_changes_partitioning_892` now covers it too.
+
+The assumptions as they stood before the probes:
 
 - **A1:** Polaris accepts one commit holding `AddSchema`, `SetCurrentSchema`, `AddPartitionSpec`, `SetDefaultSpec`, `SetProperties`, `AddSnapshot` and `SetSnapshotRef`, with the requirements of Decision 4.
 - **A2:** Polaris assigns exactly the schema and spec ids the planner predicts, for a new shape and for a previously seen shape. The #890 race test alternates two shapes, so the reuse case is hit constantly.
