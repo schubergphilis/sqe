@@ -3944,7 +3944,9 @@ impl QueryHandler {
                 .with_query_deadline(std::time::Duration::from_secs(
                     timeout_for_session(&self.config.query, session),
                 ));
-                let boxed: SendableRecordBatchStream = Box::pin(tracked);
+                // A task pulls the result so a client that stops reading is
+                // dropped after the idle timeout (#884).
+                let boxed: SendableRecordBatchStream = tracked.into_client_stream();
                 Ok((schema, boxed))
             }
             Err(e) => {

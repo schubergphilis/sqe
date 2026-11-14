@@ -597,11 +597,11 @@ pub struct TrackedRecordBatchStream {
     /// Set once the cancel token has fired so subsequent polls short-circuit
     /// without re-running the finalizer.
     cancelled: bool,
-    /// Maximum time the stream may sit without producing a batch before it
-    /// is aborted and its concurrency permit is released. None disables the
-    /// guard. Without this an idle gRPC client can pin every slot in
-    /// `max_concurrent_queries` by holding open Flight streams without
-    /// draining them. Issue #75.
+    /// Maximum time the plan may run without producing a batch or moving
+    /// its operator metrics before the stream is aborted and its permit
+    /// released, when no query deadline is installed. With a deadline it is
+    /// not consulted: the client is waiting for the plan and the deadline
+    /// bounds it (#884). None disables the guard. Issue #75.
     idle_timeout: Option<Duration>,
     /// Pending idle deadline. Pinned so it can be polled in place each call.
     idle_sleep: Option<Pin<Box<Sleep>>>,
@@ -611,11 +611,9 @@ pub struct TrackedRecordBatchStream {
     /// merge completes) and the deadline is extended instead of aborting.
     /// Issue #365.
     idle_progress: Option<u64>,
-    /// Hard ceiling on progress-based idle extensions, mirroring
     /// `query.timeout_secs` for the streaming path (which has no outer
-    /// `tokio::time::timeout` wrapping consumption). Past this instant an
-    /// idle stream aborts even when operators still advance. None leaves
-    /// extensions unbounded.
+    /// `tokio::time::timeout` wrapping consumption). When set it alone
+    /// bounds a running plan; the idle guard applies only without it (#884).
     query_deadline: Option<tokio::time::Instant>,
     /// Absolute wall-clock deadline timer (`query.timeout_secs`), polled on
     /// every `Pending` independently of the idle timer. Before this existed
@@ -759,10 +757,12 @@ impl TrackedRecordBatchStream {
         }
     }
 
-    /// Enable the idle-timeout guard. The stream aborts (releasing its
-    /// concurrency permit) when no batch is produced for `timeout` AND the
-    /// plan's operator metrics stopped advancing (issue #365). Skips
-    /// installation when `timeout` is zero. Issue #75.
+    /// Enable the idle-timeout guard. Without a query deadline the stream
+    /// aborts (releasing its concurrency permit) when no batch is produced
+    /// for `timeout` AND the plan's operator metrics stopped advancing
+    /// (issue #365). With a deadline the guard never aborts a plan the
+    /// client is waiting for (#884). Skips installation when `timeout` is
+    /// zero. Issue #75.
     pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
         if !timeout.is_zero() {
             self.idle_timeout = Some(timeout);
@@ -783,8 +783,8 @@ impl TrackedRecordBatchStream {
     /// with a "timed out" error once it passes, whether or not batches are
     /// still flowing, so `query.timeout_secs` bounds the streaming path the
     /// same way the buffered path's `tokio::time::timeout` does (finding
-    /// 403). The same instant also caps progress-based idle extensions
-    /// (issue #365). Skips installation when `total` is zero.
+    /// 403). While it is installed the idle guard does not abort a running
+    /// plan (#884). Skips installation when `total` is zero.
     pub fn with_query_deadline(mut self, total: Duration) -> Self {
         if !total.is_zero() {
             let deadline = tokio::time::Instant::now() + total;
@@ -868,6 +868,87 @@ impl TrackedRecordBatchStream {
             sleep.as_mut().reset(tokio::time::Instant::now() + timeout);
         }
     }
+
+    /// The stream to hand to a client. With an idle timeout installed, a
+    /// task pulls this stream into a one-slot channel, so a client that
+    /// stops reading is noticed even though nothing polls the stream it
+    /// holds: when a batch is ready and the client has not taken the one
+    /// before it within the idle timeout, the query is finalized as failed
+    /// and dropped, releasing its permits, memory reservation and spill
+    /// files. The client then reads an error, never a clean end of stream.
+    /// A client that disconnects closes the channel, which drops the query
+    /// at once, as dropping the stream did before. Issue #884.
+    pub fn into_client_stream(self) -> SendableRecordBatchStream {
+        let Some(idle) = self.idle_timeout else {
+            return Box::pin(self);
+        };
+        let schema = Arc::clone(&self.schema);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch, DataFusionError>>(1);
+        let stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&stalled);
+        let mut source = self;
+        tokio::spawn(async move {
+            loop {
+                let item = tokio::select! {
+                    item = futures::StreamExt::next(&mut source) => item,
+                    () = tx.closed() => return,
+                };
+                let Some(item) = item else { return };
+                match tx.send_timeout(item, idle).await {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::SendTimeoutError::Closed(_)) => return,
+                    Err(tokio::sync::mpsc::error::SendTimeoutError::Timeout(_)) => {
+                        source.abort_client_idle(idle);
+                        flag.store(true, std::sync::atomic::Ordering::Release);
+                        return;
+                    }
+                }
+            }
+        });
+        let msg = client_idle_message(idle);
+        let batches = futures::stream::unfold(Some(rx), move |rx| {
+            let stalled = Arc::clone(&stalled);
+            let msg = msg.clone();
+            async move {
+                let mut rx = rx?;
+                match rx.recv().await {
+                    Some(item) => Some((item, Some(rx))),
+                    None if stalled.load(std::sync::atomic::Ordering::Acquire) => {
+                        Some((Err(DataFusionError::Execution(msg)), None))
+                    }
+                    None => None,
+                }
+            }
+        });
+        Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, batches))
+    }
+
+    /// Finalize as failed because the client stopped reading (#884). The
+    /// caller drops the stream next, which releases what it holds.
+    fn abort_client_idle(&mut self, idle: Duration) {
+        warn!(
+            rows_so_far = self.rows_so_far,
+            idle_secs = idle.as_secs(),
+            "Client did not read the result stream within the idle timeout, \
+             aborting query and releasing permits"
+        );
+        self.cancelled = true;
+        if let Some(f) = self.finalizer.take() {
+            f.on_error(
+                self.rows_so_far,
+                &sqe_core::SqeError::Execution(client_idle_message(idle)),
+            );
+        }
+    }
+}
+
+/// Error text for a client that stopped reading its result (#884).
+fn client_idle_message(idle: Duration) -> String {
+    format!(
+        "Query aborted: the client did not read the next result batch for {}s \
+         (idle timeout, query.stream_idle_timeout_secs).",
+        idle.as_secs()
+    )
 }
 
 impl Stream for TrackedRecordBatchStream {
@@ -948,6 +1029,17 @@ impl Stream for TrackedRecordBatchStream {
                 if deadline_fired {
                     return self.abort_deadline();
                 }
+                // `Pending` here means the client is waiting for the plan,
+                // not idle. With a query deadline the deadline bounds the
+                // plan; the idle guard below only bounds a plan that has no
+                // deadline (`query.timeout_secs = 0`). Operator metrics are
+                // not a reliable progress signal: a multi-level sort merge
+                // reports its intermediate passes to a detached metric set,
+                // and a single-row SF100 sort was cut at 600 s under load
+                // while still executing. Issue #884.
+                if self.query_deadline.is_some() {
+                    return Poll::Pending;
+                }
                 let idle_fired = match self.idle_sleep {
                     Some(ref mut sleep) => sleep.as_mut().poll(cx).is_ready(),
                     None => false,
@@ -967,10 +1059,7 @@ impl Stream for TrackedRecordBatchStream {
                         .as_ref()
                         .map(|f| plan_progress_fingerprint(&f.plan));
                     let progressed = sampled.is_some() && sampled != self.idle_progress;
-                    let within_deadline = self
-                        .query_deadline
-                        .is_none_or(|d| tokio::time::Instant::now() < d);
-                    if progressed && within_deadline {
+                    if progressed {
                         self.idle_progress = sampled;
                         self.reset_idle_timer();
                         // Poll the reset timer so its waker is registered;
@@ -982,25 +1071,15 @@ impl Stream for TrackedRecordBatchStream {
                     }
                     warn!(
                         rows_so_far = self.rows_so_far,
-                        operators_active = progressed,
                         "Stream idle-timeout reached, aborting query and releasing permits"
                     );
                     self.cancelled = true;
-                    let msg = if progressed {
-                        format!(
-                            "Query timed out after {}s: operators were still \
-                             executing but no results were produced within the \
-                             total query timeout.",
-                            self.query_timeout.unwrap_or_default().as_secs()
-                        )
-                    } else {
-                        format!(
-                            "Query aborted: produced no results for {}s (idle timeout). \
-                             The execution pipeline stalled or the client stopped \
-                             consuming the result stream.",
-                            self.idle_timeout.unwrap_or_default().as_secs()
-                        )
-                    };
+                    let msg = format!(
+                        "Query aborted: produced no results for {}s (idle timeout) \
+                         and its operators showed no progress. Set \
+                         query.timeout_secs to bound queries by wall clock instead.",
+                        self.idle_timeout.unwrap_or_default().as_secs()
+                    );
                     if let Some(f) = self.finalizer.take() {
                         f.on_error(
                             self.rows_so_far,
@@ -1964,8 +2043,148 @@ mod tests {
         assert_eq!(record.state, QueryState::Failed);
     }
 
-    /// Progress-based extensions must not be unbounded: past the query
-    /// deadline the stream aborts even though operators still advance.
+    /// Issue #884: a single-row query whose plan runs longer than the idle
+    /// window, with operator metrics that do not move (a merge phase that
+    /// reports to a detached metric set), must not be cut while the client
+    /// is waiting for it. The query deadline bounds it instead.
+    #[tokio::test(start_paused = true)]
+    async fn single_row_query_outlives_idle_timeout_while_client_waits() {
+        let (plan, _rows) = MetricsStubExec::create();
+        let schema = plan.schema();
+        let runtime = SessionContext::new().runtime_env();
+        let tracker = test_tracker();
+        let finalizer = test_finalizer(Arc::clone(&tracker), plan, runtime);
+        let qid = finalizer.query_id;
+        tracker.start(
+            qid,
+            "test-user",
+            None,
+            "SELECT 1",
+            "test-session",
+            None,
+            vec![],
+            None,
+        );
+
+        let idle = Duration::from_millis(100);
+        let slow = futures::stream::once(async move {
+            tokio::time::sleep(idle * 6).await;
+            Ok::<RecordBatch, DataFusionError>(sample_batch(1))
+        });
+        let inner: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, slow));
+        let mut stream = TrackedRecordBatchStream::new(inner, finalizer, None)
+            .with_idle_timeout(idle)
+            .with_query_deadline(Duration::from_secs(10));
+
+        let batch = stream
+            .next()
+            .await
+            .expect("stream must yield the row")
+            .expect("a query still executing must not hit the idle timeout");
+        assert_eq!(batch.num_rows(), 1);
+        assert!(stream.next().await.is_none());
+        assert_eq!(find_record(&tracker, qid).state, QueryState::Finished);
+    }
+
+    /// Tracked stream over `inner` holding the one permit of a fresh
+    /// semaphore, for the client-stream tests (#884).
+    fn permit_test_stream(
+        inner: SendableRecordBatchStream,
+        plan: Arc<dyn ExecutionPlan>,
+        runtime: Arc<RuntimeEnv>,
+    ) -> (
+        TrackedRecordBatchStream,
+        Arc<tokio::sync::Semaphore>,
+        Arc<QueryTracker>,
+        uuid::Uuid,
+    ) {
+        let tracker = test_tracker();
+        let finalizer = test_finalizer(Arc::clone(&tracker), plan, runtime);
+        let qid = finalizer.query_id;
+        tracker.start(
+            qid,
+            "test-user",
+            None,
+            "SELECT 1",
+            "test-session",
+            None,
+            vec![],
+            None,
+        );
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::clone(&sem).try_acquire_owned().unwrap();
+        let stream = TrackedRecordBatchStream::new(inner, finalizer, Some(permit));
+        (stream, sem, tracker, qid)
+    }
+
+    /// Issue #884: a client that takes one batch and then stops reading,
+    /// while more batches are ready, is dropped after the idle timeout: the
+    /// permit comes back without the client polling again, and when it does
+    /// read it gets the buffered batch and then an error, not a clean EOF.
+    #[tokio::test(start_paused = true)]
+    async fn client_stream_drops_a_client_that_stops_reading() {
+        let (plan, schema, runtime) = trivial_plan().await;
+        let ready = futures::stream::iter((0..10).map(|i| Ok(sample_batch(i))));
+        let inner: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, ready));
+        let (stream, sem, tracker, qid) = permit_test_stream(inner, plan, runtime);
+        let mut client = stream
+            .with_idle_timeout(Duration::from_millis(100))
+            .with_query_deadline(Duration::from_secs(60))
+            .into_client_stream();
+
+        assert!(client.next().await.expect("first batch").is_ok());
+        assert_eq!(sem.available_permits(), 0, "query holds its permit");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "a client that stopped reading must release the permit"
+        );
+        assert_eq!(find_record(&tracker, qid).state, QueryState::Failed);
+
+        let mut tail = Vec::new();
+        while let Some(item) = client.next().await {
+            tail.push(item);
+        }
+        let err = tail
+            .pop()
+            .expect("an item after the buffered batch")
+            .expect_err("the stream must end with an error");
+        assert!(
+            err.to_string().contains("idle timeout"),
+            "unexpected: {err}"
+        );
+        assert!(tail.iter().all(Result::is_ok));
+    }
+
+    /// A client that disconnects while the plan is still running drops the
+    /// query at once, as dropping the stream did before the pump (#884).
+    #[tokio::test]
+    async fn client_stream_disconnect_cancels_running_query() {
+        let (plan, schema, runtime) = trivial_plan().await;
+        let pending = futures::stream::pending::<Result<RecordBatch, DataFusionError>>();
+        let inner: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, pending));
+        let (stream, sem, tracker, qid) = permit_test_stream(inner, plan, runtime);
+        let client = stream
+            .with_idle_timeout(Duration::from_secs(60))
+            .with_query_deadline(Duration::from_secs(60))
+            .into_client_stream();
+
+        drop(client);
+        let released = tokio::time::timeout(Duration::from_secs(2), sem.acquire())
+            .await
+            .expect("permit must come back once the client is gone");
+        drop(released);
+        assert_eq!(find_record(&tracker, qid).state, QueryState::Canceled);
+    }
+
+    /// With a query deadline, the deadline (not the idle timer) ends a
+    /// plan that keeps running: the stream aborts with "timed out" even
+    /// though operators still advance.
     /// Paused clock for the same reason as the test above: on the wall
     /// clock a starved runner can abort at the idle deadline before the
     /// query deadline, with the wrong error.

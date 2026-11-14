@@ -1,0 +1,13 @@
+**STATUS 2026-11-14: result idle timeout no longer cuts a running query; a client that stops reading is dropped (`fix/result-idle-timeout-884`, #884).**
+
+- `TrackedRecordBatchStream` (`crates/sqe-coordinator/src/streaming.rs`): the idle check only ran in the `Pending` arm, i.e. while the client was waiting on the plan. It extended on operator-metric progress (#365), but a multi-level sort merge reports its intermediate passes to `metrics.intermediate()`, a detached set (vendored DataFusion `sorts/multi_level_merge.rs`), so a single-row SF100 sort was cut at ~600 s (one extension, then a frozen fingerprint). With a query deadline installed the `Pending` arm now leaves the plan to the deadline; the progress-aware idle abort stays only for `query.timeout_secs = 0`. The unreachable "operators still executing" message branch is gone.
+- Read-only finding, fixed here: the idle timeout never covered a client that stopped reading. Nothing polls the stream then (hyper does not poll an HTTP/2 body without send capacity), so the timer could not fire. `into_client_stream()` pulls the tracked stream from a task into a one-slot channel with `send_timeout(idle)`; on timeout the query is finalized as failed and dropped (permits, per-user reservation, plan and spill files), and the client reads the buffered batch and then an error. The task also selects on `tx.closed()`, so a disconnect cancels at once as before. Wired at the one place `execute_stream_with_id` boxes the tracked stream, so Flight, the Trino HTTP door and the other wires all get it. On the Trino door a client that waits longer than the idle timeout between `nextUri` pages now fails, like Trino's own `query.client.timeout` (5 min).
+- Tests: `single_row_query_outlives_idle_timeout_while_client_waits` (failed before the fix), `client_stream_drops_a_client_that_stops_reading`, `client_stream_disconnect_cancels_running_query`; the #365 / #75 / finding-403 tests are unchanged and pass.
+
+Gate: `cargo test -p sqe-coordinator --lib streaming::tests` -> 23 passed; `cargo clippy -p sqe-coordinator -p sqe-core --all-targets -- -D warnings` clean. Full `make test-integration` -> 389 passed; `make test-distributed` -> 397 passed (includes `distributed_failure_e2e`).
+
+Budget: `.config/budgets.json` sqe-coordinator line ceiling 68300 -> 68600 (the client-stream pump and its three tests; +221 net lines, crate at 68507 on top of #892).
+
+Not verified here: the SF100 six-way repro itself (needs the SF100 rig).
+
+**NEXT:** rerun the #788 six-way SF100 mix with `query.timeout_secs` raised to confirm sort86m completes; #885 (retained RSS) stays parked.

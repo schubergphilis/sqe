@@ -499,11 +499,12 @@ pub struct QueryConfig {
     /// wrong swap collects at most broadcast-threshold bytes).
     #[serde(default = "default_true")]
     pub dim_build_swap: bool,
-    /// Idle-timeout (seconds) for an active result stream. When the gRPC
-    /// client has not pulled a batch within this window the coordinator
-    /// aborts the stream and releases its concurrency permit. Bounds the
-    /// damage from slow or malicious clients holding open Flight streams
-    /// to pin every slot in `max_concurrent_queries`. Set to 0 to disable.
+    /// Idle-timeout (seconds) for an active result stream whose query has
+    /// no `timeout_secs` deadline: the coordinator aborts the stream and
+    /// releases its concurrency permit when the plan produces no batch and
+    /// its operator metrics stop advancing for this long. With a deadline
+    /// the deadline alone bounds a query the client is waiting for, so a
+    /// long single-row query is not cut here (#884). Set to 0 to disable.
     /// Default: 300 (5 minutes). Issue #75.
     #[serde(default = "default_stream_idle_timeout")]
     pub stream_idle_timeout_secs: u64,
