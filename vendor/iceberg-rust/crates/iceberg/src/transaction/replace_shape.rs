@@ -127,7 +127,10 @@ impl ShapePins {
 ///   one the catalog stores. A spec compatible with an existing one selects
 ///   that spec's id.
 /// - The default sort order stays when it still binds to the new schema;
-///   otherwise the table becomes unsorted.
+///   otherwise the table becomes unsorted. [`Self::with_sort_order`]
+///   replaces it instead (sqe#897): an equal existing order is selected by
+///   its id, a new one is added with the next free id, and the commit then
+///   also asserts the default sort order id it was planned on.
 ///
 /// The requirements pin the [`ShapePins`] the replace was planned on and,
 /// with [`Self::with_expected_main`], the `main` head the overwrite removes
@@ -144,6 +147,12 @@ pub struct ReplaceTableShapeAction {
     format_version: Option<FormatVersion>,
     pins: ShapePins,
     expected_main: Option<Option<i64>>,
+    /// Field id of the caller's schema -> assigned id, for `with_sort_order`.
+    ids: HashMap<i32, i32>,
+    /// The sort order to make default, its source ids already assigned.
+    sort_order: Option<SortOrder>,
+    /// The default sort order id when the replace was planned.
+    default_sort_order_id: i64,
 }
 
 impl ReplaceTableShapeAction {
@@ -196,7 +205,31 @@ impl ReplaceTableShapeAction {
             format_version: None,
             pins: ShapePins::of(metadata),
             expected_main: None,
+            ids,
+            sort_order: None,
+            default_sort_order_id: metadata.default_sort_order_id(),
         })
+    }
+
+    /// Make `order` the default sort order in the same commit (sqe#897).
+    /// Its source ids name fields of the schema given to [`Self::new`]; they
+    /// follow that schema's reassigned ids. An unsorted order makes the table
+    /// unsorted.
+    pub fn with_sort_order(mut self, order: SortOrder) -> Result<Self> {
+        let mut order = order;
+        for field in &mut order.fields {
+            field.source_id = *self.ids.get(&field.source_id).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "sort field names source id {}, which is not in the schema",
+                        field.source_id
+                    ),
+                )
+            })?;
+        }
+        self.sort_order = Some(order);
+        Ok(self)
     }
 
     /// The schema this replace makes current, with its assigned field ids.
@@ -312,25 +345,25 @@ impl ReplaceTableShapeAction {
             }
         }
 
-        let sort_order = metadata.default_sort_order();
-        let sort_order_binds = SortOrder::builder()
-            .with_order_id(sort_order.order_id)
-            .with_fields(sort_order.fields.clone())
-            .build(&schema)
-            .is_ok();
-        if !sort_order_binds {
-            if metadata
-                .sort_order_by_id(SortOrder::UNSORTED_ORDER_ID)
-                .is_some_and(|order| order.is_unsorted())
-            {
-                updates.push(TableUpdate::SetDefaultSortOrder {
-                    sort_order_id: SortOrder::UNSORTED_ORDER_ID,
-                });
-            } else {
-                updates.push(TableUpdate::AddSortOrder {
-                    sort_order: SortOrder::unsorted_order(),
-                });
-                updates.push(TableUpdate::SetDefaultSortOrder { sort_order_id: -1 });
+        match &self.sort_order {
+            Some(wanted) if !wanted.is_unsorted() => {
+                Self::select_sort_order(metadata, &schema, wanted, &mut updates)?;
+            }
+            Some(_) => {
+                if !metadata.default_sort_order().is_unsorted() {
+                    Self::make_unsorted(metadata, &mut updates);
+                }
+            }
+            None => {
+                let sort_order = metadata.default_sort_order();
+                let sort_order_binds = SortOrder::builder()
+                    .with_order_id(sort_order.order_id)
+                    .with_fields(sort_order.fields.clone())
+                    .build(&schema)
+                    .is_ok();
+                if !sort_order_binds {
+                    Self::make_unsorted(metadata, &mut updates);
+                }
             }
         }
 
@@ -351,6 +384,11 @@ impl ReplaceTableShapeAction {
                 last_assigned_partition_id: self.pins.last_partition_id,
             },
         ];
+        if self.sort_order.is_some() {
+            requirements.push(TableRequirement::DefaultSortOrderIdMatch {
+                default_sort_order_id: self.default_sort_order_id,
+            });
+        }
         if let Some(expected) = self.expected_main {
             requirements.push(TableRequirement::RefSnapshotIdMatch {
                 r#ref: MAIN_BRANCH.to_string(),
@@ -358,6 +396,62 @@ impl ReplaceTableShapeAction {
             });
         }
         Ok((updates, requirements))
+    }
+
+    /// Make the unsorted order the default: order 0 when the table has it,
+    /// else added.
+    fn make_unsorted(metadata: &TableMetadata, updates: &mut Vec<TableUpdate>) {
+        if metadata
+            .sort_order_by_id(SortOrder::UNSORTED_ORDER_ID)
+            .is_some_and(|order| order.is_unsorted())
+        {
+            updates.push(TableUpdate::SetDefaultSortOrder {
+                sort_order_id: SortOrder::UNSORTED_ORDER_ID,
+            });
+        } else {
+            updates.push(TableUpdate::AddSortOrder {
+                sort_order: SortOrder::unsorted_order(),
+            });
+            updates.push(TableUpdate::SetDefaultSortOrder { sort_order_id: -1 });
+        }
+    }
+
+    /// Make the sorted order `wanted` the default. An order with the same
+    /// fields is selected by its id: a catalog that reuses an equal order
+    /// (Polaris does) would otherwise leave `SetDefaultSortOrder(-1)` with no
+    /// order added in this commit. A new one gets the next free id, which
+    /// Iceberg Java's parser requires in `add-sort-order`.
+    fn select_sort_order(
+        metadata: &TableMetadata,
+        schema: &Schema,
+        wanted: &SortOrder,
+        updates: &mut Vec<TableUpdate>,
+    ) -> Result<()> {
+        SortOrder::builder()
+            .with_order_id(1)
+            .with_fields(wanted.fields.clone())
+            .build(schema)?;
+        if let Some(existing) = metadata
+            .sort_orders_iter()
+            .find(|order| order.fields == wanted.fields)
+        {
+            if existing.order_id != metadata.default_sort_order_id() {
+                updates.push(TableUpdate::SetDefaultSortOrder {
+                    sort_order_id: existing.order_id,
+                });
+            }
+            return Ok(());
+        }
+        let next_id = metadata
+            .sort_orders_iter()
+            .map(|order| order.order_id)
+            .max()
+            .map_or(1, |max| max.max(0) + 1);
+        updates.push(TableUpdate::AddSortOrder {
+            sort_order: wanted.clone().with_order_id(next_id),
+        });
+        updates.push(TableUpdate::SetDefaultSortOrder { sort_order_id: -1 });
+        Ok(())
     }
 
     /// `self.spec` with every unset field id taken from an equivalent field
@@ -571,8 +665,8 @@ mod tests {
 
     use super::assign_ids_by_name;
     use crate::spec::{
-        FormatVersion, ListType, NestedField, PrimitiveType, Schema, StructType, Transform, Type,
-        UnboundPartitionSpec,
+        FormatVersion, ListType, NestedField, NullOrder, PrimitiveType, Schema, SortDirection,
+        SortField, SortOrder, StructType, Transform, Type, UnboundPartitionSpec,
     };
     use crate::table::Table;
     use crate::transaction::action::ApplyTransactionAction;
@@ -845,6 +939,82 @@ mod tests {
             requirements.contains(&TableRequirement::LastAssignedFieldIdMatch {
                 last_assigned_field_id: 3
             })
+        );
+    }
+
+    fn desc_on(source_id: i32) -> SortOrder {
+        SortOrder::new(1, vec![SortField {
+            source_id,
+            transform: Transform::Identity,
+            direction: SortDirection::Descending,
+            null_order: NullOrder::Last,
+        }])
+    }
+
+    /// sqe#897: a requested sort order names the caller's field ids. `w` is
+    /// id 9 to the caller and gets id 4, so the order follows it; it is new,
+    /// so it is added as order 4 (after the fixture's order 3), made default
+    /// in the same commit, and the commit asserts the planned default order.
+    #[tokio::test]
+    async fn a_requested_sort_order_follows_the_assigned_ids_and_is_added() {
+        let table = make_v2_table();
+        let action = shape(
+            &table,
+            schema(vec![long(1, "x"), long(9, "w")]),
+            unpartitioned(),
+        )
+        .with_sort_order(desc_on(9))
+        .unwrap();
+        let evolved = action.evolved_table(&table).unwrap();
+        let (updates, requirements) = commit_of(&table, action).await;
+
+        let default = evolved.metadata().default_sort_order();
+        assert_eq!(default.order_id, 4);
+        assert_eq!(default.fields, desc_on(4).fields);
+        assert!(updates.contains(&TableUpdate::SetDefaultSortOrder { sort_order_id: -1 }));
+        assert!(
+            requirements.contains(&TableRequirement::DefaultSortOrderIdMatch {
+                default_sort_order_id: 3
+            })
+        );
+        assert!(
+            shape(&table, schema(vec![long(1, "x")]), unpartitioned())
+                .with_sort_order(desc_on(9))
+                .is_err(),
+            "a sort on a column the schema lacks is refused"
+        );
+    }
+
+    /// An order equal to an existing one is selected by id, never added again
+    /// (Polaris reuses it and `-1` would then name nothing); an unsorted
+    /// request makes a sorted table unsorted even though its order binds.
+    #[tokio::test]
+    async fn a_requested_sort_order_reuses_an_equal_one_and_unsorted_unsorts() {
+        let table = make_v2_table();
+        let current = table.metadata().current_schema().as_ref().clone();
+        let live = table.metadata().default_sort_order().as_ref().clone();
+        let (updates, _) = commit_of(
+            &table,
+            shape(&table, current.clone(), unpartitioned())
+                .with_sort_order(live)
+                .unwrap(),
+        )
+        .await;
+        assert!(!updates.iter().any(|u| matches!(
+            u,
+            TableUpdate::AddSortOrder { .. } | TableUpdate::SetDefaultSortOrder { .. }
+        )));
+
+        let action = shape(&table, current, unpartitioned())
+            .with_sort_order(SortOrder::unsorted_order())
+            .unwrap();
+        assert!(
+            action
+                .evolved_table(&table)
+                .unwrap()
+                .metadata()
+                .default_sort_order()
+                .is_unsorted()
         );
     }
 

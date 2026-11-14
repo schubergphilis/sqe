@@ -25,8 +25,8 @@ DROP SCHEMA staging CASCADE;
 |---|---|---|---|---|---|---|
 | `CREATE TABLE t (col TYPE [DEFAULT expr], ...)` | `sqlparser-rs` + `sqe-sql` + `sqe-coordinator` | Iceberg V3 column defaults supported. Nested types in the Trino form (`array(integer)`, `map(varchar, bigint)`, `row(x decimal(10,2), y varchar)`) and the Spark form (`ARRAY<INT>`, `MAP<VARCHAR, BIGINT>`, `STRUCT<x INT>`) both work, at any depth (`sqe-sql/ddl_types.rs`). | yes | yes | yes | yes |
 | `CREATE TABLE t (...) PARTITIONED BY (transform(col), ...)` | `sqe-sql/partition.rs` | Partition transforms: `bucket(N, col)`, `truncate(N, col)`, `year(col)`, `month(col)`, `day(col)`, `hour(col)`, identity (just `col`). | partial | - | yes | - |
-| `CREATE TABLE t AS SELECT ...` (CTAS) | `sqlparser-rs` + `sqe-coordinator` | Inferred schema; partitioning via `WITH (partitioning = ARRAY['day(ts)'])`. | yes | yes | yes | yes |
-| `CREATE OR REPLACE TABLE t AS SELECT ...` | `sqlparser-rs` + `sqe-coordinator` | Atomic replace: one snapshot on the existing table, which keeps its UUID, grants, history, refs and properties (the statement's options are set on top). A changed schema or partitioning becomes current in the same commit (field ids kept by name). Refuses a format downgrade, and a shape change under `WRITE_BRANCH` or in a transaction. Self-referencing replace safe (reads old snapshot before swap). | yes | yes | partial | yes |
+| `CREATE TABLE t AS SELECT ...` (CTAS) | `sqlparser-rs` + `sqe-coordinator` | Inferred schema; partitioning via `PARTITIONED BY (...)` before `AS`, or Trino's `WITH (partitioning = ARRAY[...])`. Trino's table properties are honoured or refused; see [Trino table properties](#trino-table-properties). | yes | yes | yes | yes |
+| `CREATE OR REPLACE TABLE t AS SELECT ...` | `sqlparser-rs` + `sqe-coordinator` | Atomic replace: one snapshot on the existing table, which keeps its UUID, grants, history, refs and properties (the statement's options are set on top). A changed schema, partitioning or Trino `sorted_by` becomes current in the same commit (field ids kept by name). Refuses a format downgrade, and a shape change under `WRITE_BRANCH` or in a transaction. Self-referencing replace safe (reads old snapshot before swap). | yes | yes | partial | yes |
 | `CREATE TABLE [IF NOT EXISTS] t LIKE other_table` | `sqlparser-rs` + `sqe-coordinator` | Copy schema only, no data. | yes | yes | yes | yes |
 
 ```sql
@@ -45,6 +45,63 @@ SELECT day(occurred_at) AS d, count(*) AS n
 FROM analytics.events GROUP BY 1;
 ```
 
+The format version of a new table comes from the statement when it names one: `WITH (format_version = 3)` (Trino; a number or a string), `WITH ('format-version' = '3')` or `TBLPROPERTIES ('format-version' = '3')`. This holds for `CREATE TABLE` and CTAS. Otherwise the table gets `catalog.default_table_format_version`. A table comment written `COMMENT 'text'` is stored as the `comment` property, the same place `COMMENT ON TABLE` writes it. It may stand before or after a `WITH (...)` list, which is the order dbt-trino writes with `persist_docs`.
+
+```sql
+create table analytics.orders_mart
+  comment 'one row per order'
+  WITH (format_version = 3)
+as (select * from analytics.orders);
+```
+
+### Trino table properties
+
+An unquoted key in a `WITH (...)` list is a property of the Trino Iceberg connector, as dbt-trino and other Trino clients write them. SQE honours each one below or refuses it. An unknown unquoted key is an error, so a property is never stored and then ignored. A quoted key (`'write.delete.mode'`) and every `TBLPROPERTIES` key is an Iceberg property and is stored as written. The properties apply to `CREATE TABLE`, CTAS and `CREATE OR REPLACE`.
+
+| Property | Effect |
+|---|---|
+| `format_version = 2` | The format version of the new table. |
+| `partitioning = ARRAY['region', 'bucket(id, 16)', 'month(ts)']` | The partition spec. Trino puts the column first: `bucket(col, n)` and `truncate(col, n)`, where `PARTITIONED BY` takes Spark's `bucket(n, col)`. Also `year`, `day`, `hour` and `void`. Giving both `partitioning` and `PARTITIONED BY` is an error. |
+| `sorted_by = ARRAY['id', 'ts DESC', 'name ASC NULLS LAST']` | The table's default sort order. Without `NULLS`, ascending puts nulls first and descending last. |
+| `location = 's3://...'` | The table location. When the catalog refuses it, the statement fails; SQE does not create the table somewhere else. |
+| `extra_properties = MAP(ARRAY['k'], ARRAY['v'])` | Stored as Iceberg properties. Reserved keys such as `format-version` are refused. |
+| `format = 'PARQUET'` | Accepted. `ORC` and `AVRO` are refused: SQE writes Parquet. |
+| `parquet_bloom_filter_columns = ARRAY['c']` | `write.parquet.bloom-filter-enabled.column.c = true`. |
+| `parquet_writer_row_group_size = '128MB'` | `write.parquet.row-group-size-bytes`. Units are binary, as in Trino. |
+| `gc_enabled = false` | `gc.enabled`. |
+| `compression_codec` | Refused. The codec comes from the session property `iceberg.compression_codec` or the server configuration. |
+| `target_max_file_size`, `max_commit_retry`, `data_location`, `object_store_layout_enabled` | Refused: SQE's writer has no per-table setting for them. |
+| `delete_after_commit_enabled`, `max_previous_versions` | Refused. Set the quoted Iceberg keys `'write.metadata.delete-after-commit.enabled'` and `'write.metadata.previous-versions-max'` for the catalog to act on. |
+| `orc_bloom_filter_columns`, `orc_bloom_filter_fpp` | Refused: no ORC. |
+
+`sorted_by` records a sort order; SQE's writer does not sort the rows, and the data files it writes claim no sort order. Leave `trust_sort_order` off for tables whose files SQE writes: it tells the planner that every file is sorted.
+
+`CREATE OR REPLACE` always keeps the live table, so a `location` must be the table's own; a different one is refused. A `sorted_by` that differs from the live sort order becomes the default sort order in the same commit as the data, like a changed schema or partitioning.
+
+```sql
+create table analytics.events_mart
+  WITH (
+    partitioning = ARRAY['month(occurred_at)', 'bucket(user_id, 16)'],
+    sorted_by = ARRAY['occurred_at DESC'],
+    extra_properties = MAP(ARRAY['owner'], ARRAY['analytics'])
+  )
+as (select * from analytics.events);
+```
+
+`ALTER TABLE t SET PROPERTIES` takes the same properties, in one commit:
+
+- `partitioning` evolves the partition spec. Existing data files keep the spec they were written with; new writes use the new one. A field the table had before keeps its field id, so going back to an earlier layout reuses that spec. A new bucket count on the same column is a new field, named with the count (`id_bucket_8`).
+- `sorted_by` replaces the default sort order; `sorted_by = ARRAY[]` makes the table unsorted.
+- `extra_properties` sets the keys it lists. `format_version` upgrades the table.
+- `location` cannot be changed, and `p = DEFAULT` is refused: set the value explicitly.
+- Any other key is stored as an Iceberg property. As in `CREATE`, a quoted key is always an Iceberg property, so `SET TBLPROPERTIES ('k' = ...)` stores every key as written. Setting a layout the table already has commits nothing.
+
+```sql
+ALTER TABLE analytics.events_mart SET PROPERTIES
+  partitioning = ARRAY['month(occurred_at)', 'region'],
+  sorted_by = ARRAY[];
+```
+
 A column `DEFAULT` takes a literal and makes the table format-version 3. An `INSERT` with a column list and a `MERGE ... WHEN NOT MATCHED THEN INSERT` write the default into every column they omit; an explicit `NULL` is written as NULL. Defaults on `BINARY`, `FIXED` and `UUID` columns are refused on INSERT; name the column and give its value.
 
 ## Schema evolution
@@ -59,7 +116,8 @@ A column `DEFAULT` takes a literal and makes the table format-version 3. An `INS
 | `ALTER TABLE t ALTER COLUMN c SET DEFAULT expr` | `sqlparser-rs` + `sqe-coordinator` | Iceberg V3 column default. | partial | yes | yes | yes |
 | `ALTER TABLE t ALTER COLUMN c TYPE new_type` | `sqlparser-rs` + `sqe-coordinator` | Iceberg type promotion only: INT -> BIGINT, REAL -> DOUBLE, a wider DECIMAL precision with the same scale, and (V3) UNKNOWN -> any primitive type. Any other change is rejected before it is committed. A nested field is named with a dotted path: a struct member as `s.a`, a list element as `l.element`, a map value as `m.value` (`ALTER COLUMN l.element TYPE BIGINT`). A map key cannot change type. | partial | partial | partial | partial |
 | `ALTER TABLE t RENAME TO new_t` | `sqlparser-rs` + `sqe-coordinator` | Catalog rename. Different catalog support varies. | yes | yes | yes | yes |
-| `ALTER TABLE t SET TBLPROPERTIES (...)` | `sqlparser-rs` + `sqe-coordinator` | Set Iceberg properties (e.g. `write.delete.mode`). | yes | yes | yes | - |
+| `ALTER TABLE t SET TBLPROPERTIES (...)` | `sqlparser-rs` + `sqe-coordinator` | Set Iceberg properties (e.g. `write.delete.mode`). `'format-version'` (or Trino's `format_version`) upgrades the table in the same commit; a lower version is refused. | yes | yes | yes | - |
+| `ALTER TABLE t SET PROPERTIES k = v, ...` | `sqe-sql` + `sqe-coordinator` | Trino's spelling of the above. `SET PROPERTIES format_version = 3` upgrades a V2 table; `partitioning`, `sorted_by` and `extra_properties` evolve the layout (see [Trino table properties](#trino-table-properties)). | yes | - | - | - |
 | `COMMENT ON TABLE t IS 'description'` | `sqlparser-rs` + `sqe-coordinator` | Stored in Iceberg properties. | yes | yes | yes | yes |
 | `COMMENT ON COLUMN t.c IS 'description'` | `sqlparser-rs` + `sqe-coordinator` | Stored on the column metadata. | yes | yes | yes | yes |
 

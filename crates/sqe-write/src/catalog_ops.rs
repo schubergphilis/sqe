@@ -24,11 +24,18 @@ use crate::ident::{
     catalog_qualifier, fold_unquoted_ident, parse_table_ref, resolve_table_ident,
     schema_catalog_qualifier,
 };
+use crate::write_handler::trino_props::TrinoTableOptions;
 use crate::write_handler::{
     arrow_column_to_iceberg_type, configured_write_target,
     default_to_iceberg_literal as alter_default_to_iceberg_literal, geospatial_iceberg_type,
-    parse_partition_transform_sql, sql_type_to_arrow, sql_type_to_arrow_for, CatalogDiscovery,
+    parse_partition_transform_sql, requested_format_version, sql_type_to_arrow,
+    sql_type_to_arrow_for, CatalogDiscovery,
 };
+
+/// `format-version` (Iceberg) or `format_version` (Trino).
+fn is_format_version_key(key: &str) -> bool {
+    key.eq_ignore_ascii_case("format-version") || key.eq_ignore_ascii_case("format_version")
+}
 
 /// Per-table async lock used to serialize read-merge-commit sequences (see
 /// `keyed_lock`). The outer `std::Mutex` guards only the map; the inner
@@ -1506,21 +1513,38 @@ impl CatalogOps {
 
         let table_ident = resolve_table_ident(table_name, session)?;
 
-        // Extract SET TBLPROPERTIES key-value pairs
+        // Extract SET TBLPROPERTIES key-value pairs. The format version
+        // (`format-version` or Trino's `format_version`) is not a property:
+        // it upgrades the table (#897). Trino's `partitioning` and
+        // `sorted_by` evolve the layout; its other keys map to Iceberg
+        // properties (`TrinoTableOptions::parse_alter`).
         let mut updates: HashMap<String, String> = HashMap::new();
+        let mut requested_version = None;
+        let mut layout = Vec::new();
         for op in operations {
             if let AlterTableOperation::SetTblProperties { table_properties } = op {
+                let trino = TrinoTableOptions::parse_alter(table_properties)?;
+                let table_properties = trino.options();
+                if let Some(v) = requested_format_version(table_properties)? {
+                    requested_version = Some(v);
+                }
                 for prop in table_properties {
                     if let SqlOption::KeyValue { key, value } = prop {
+                        if is_format_version_key(&key.value) {
+                            continue;
+                        }
                         let k = key.value.clone();
                         let v = sql_expr_to_string(value);
                         updates.insert(k, v);
                     }
                 }
+                if trino.changes_layout() {
+                    layout.push(trino);
+                }
             }
         }
 
-        if updates.is_empty() {
+        if updates.is_empty() && requested_version.is_none() && layout.is_empty() {
             return Err(SqeError::Execution(
                 "ALTER TABLE SET TBLPROPERTIES: no valid key-value properties found".to_string(),
             ));
@@ -1537,8 +1561,50 @@ impl CatalogOps {
             .session_catalog_for(session, catalog_qualifier(table_name).as_deref())
             .await?;
 
-        let table_updates = vec![TableUpdate::SetProperties { updates }];
-        let requirements = vec![];
+        let mut table_updates = Vec::new();
+        let mut requirements = vec![];
+        if let Some(version) = requested_version {
+            let table = session_catalog.load_table(&table_ident).await?;
+            let live = table.metadata().format_version();
+            if version < live {
+                return Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!(
+                        "ALTER TABLE cannot lower the format version of '{table_ident}' \
+                         from {live} to {version}"
+                    ),
+                ));
+            }
+            if version > live {
+                // Pin the table the version was read from, so a concurrent
+                // replace by another table under this name fails the commit.
+                requirements.push(TableRequirement::UuidMatch {
+                    uuid: table.metadata().uuid(),
+                });
+                table_updates.push(TableUpdate::UpgradeFormatVersion {
+                    format_version: version,
+                });
+            }
+        }
+        if !layout.is_empty() {
+            let table = session_catalog.load_table(&table_ident).await?;
+            for trino in &layout {
+                let (layout_updates, layout_requirements) = trino.alter_updates(&table)?;
+                table_updates.extend(layout_updates);
+                for requirement in layout_requirements {
+                    if !requirements.contains(&requirement) {
+                        requirements.push(requirement);
+                    }
+                }
+            }
+        }
+        if !updates.is_empty() {
+            table_updates.push(TableUpdate::SetProperties { updates });
+        }
+        if table_updates.is_empty() {
+            info!(table = %table_ident, "Table already as requested; nothing to commit");
+            return Ok(());
+        }
 
         session_catalog
             .commit_schema_update(&table_ident, table_updates, requirements)

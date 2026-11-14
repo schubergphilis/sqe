@@ -43,6 +43,7 @@ mod ctas_replace;
 mod ingest;
 mod snapshot_props;
 mod table_props;
+pub(crate) mod trino_props;
 pub use ingest::{IngestMode, OnExisting, OnMissing};
 use table_props::{commit_properties, sql_expr_to_property_string, with_properties};
 pub(crate) use table_props::{
@@ -2223,10 +2224,11 @@ impl WriteHandler {
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
         policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let (table_name, or_replace, partition_by, user_options) = match stmt {
+        let (table_name, or_replace, partition_by, trino) = match stmt {
             Statement::CreateTable(ct) => {
                 if ct.query.is_none() {
-                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed,
+                    return Err(SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
                         "CTAS statement has no SELECT query",
                     ));
                 }
@@ -2234,16 +2236,22 @@ impl WriteHandler {
                     &ct.name,
                     ct.or_replace,
                     ct.partition_by.as_deref(),
-                    create_table_options_as_slice(&ct.table_options),
+                    // Trino table properties, refused before anything runs (#897).
+                    trino_props::TrinoTableOptions::parse(
+                        &ct.table_options,
+                        ct.partition_by.is_some(),
+                    )?,
                 )
             }
             other => {
-                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "Expected CreateTable statement, got: {other}"
-                )));
+                return Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Expected CreateTable statement, got: {other}"),
+                ));
             }
         };
 
+        let user_options = trino.options();
         let table_ident = resolve_table_ident(table_name, session)?;
         let namespace = table_ident.namespace().clone();
         let name = table_ident.name().to_string();
@@ -2286,17 +2294,23 @@ impl WriteHandler {
         // the precision the format version can hold; the streaming sink casts
         // every batch onto the table schema (`apply_stamped_schema`), so the
         // ns values are narrowed to µs on write (#773).
-        // A variant column exists only from v3 (#849), so it upgrades the table.
-        let create_format_version = if arrow_schema_has_variant(output_schema.as_arrow()) {
-            FormatVersion::V3
-        } else {
-            self.format_version()
-        };
+        // A variant column exists only from v3 (#849), so it upgrades the
+        // table; otherwise the statement's format_version option, then the
+        // server default (#897).
+        let needs_v3 = arrow_schema_has_variant(output_schema.as_arrow()).then_some("variant");
+        let create_format_version =
+            new_table_format_version(user_options, needs_v3, self.format_version())?;
         let arrow_schema = Arc::new(write_schema_for_format_version(
             output_schema.as_arrow(),
             create_format_version,
         ));
         let iceberg_schema = arrow_schema_to_iceberg(&arrow_schema)?;
+        // Honor PARTITIONED BY / `partitioning` on CTAS. Without it, `CREATE
+        // TABLE ... PARTITIONED BY (month(d)) AS SELECT ...` silently produced
+        // an unpartitioned table. Built before the namespace is touched, so a
+        // bad column leaves nothing behind.
+        let partition_spec = trino.partition_spec(partition_by, &iceberg_schema)?;
+        let sort_order = trino.sort_order(&iceberg_schema)?;
 
         info!(
             username = %session.user.username,
@@ -2311,11 +2325,6 @@ impl WriteHandler {
         // Defense-in-depth: ensure the target namespace exists in this catalog
         // (dbt's CREATE SCHEMA may not have landed here); idempotent.
         ensure_namespace(catalog.as_ref(), &namespace).await?;
-
-        // Honor PARTITIONED BY on CTAS (the plain CREATE TABLE path already
-        // does this). Without it, `CREATE TABLE ... PARTITIONED BY (month(d))
-        // AS SELECT ...` silently produced an unpartitioned table.
-        let partition_spec = build_partition_spec(partition_by, &iceberg_schema)?;
 
         // Capture the SELECT plan as a synthetic INSERT-into-target wrapper for
         // OpenLineage extraction. The wrapper is never executed; it lets the
@@ -2337,16 +2346,13 @@ impl WriteHandler {
         // `CREATE OR REPLACE TABLE t AS SELECT ... FROM t` dropped `t` and then
         // failed to plan, any later failure left the user with no table at all,
         // and a 3-part name dropped the same-named table in the wrong catalog.
-        // Two replacement shapes now, both of which keep the original table
-        // until the new data is on storage:
+        // Both replacement shapes are one commit on the live table, which
+        // keeps its UUID, snapshot history and grants:
         //
-        //  - the SELECT's schema and partitioning match the live table: swap
-        //    the contents in with one `rewrite_files` commit. The table keeps
-        //    its UUID, its snapshot history and its grants.
-        //  - they differ (the streaming writer stamps every batch onto the
-        //    live table's schema, so a different column set, order or type
-        //    cannot be written into it): stage the replacement under a
-        //    temporary name in the same namespace and swap with DROP + RENAME.
+        //  - the SELECT's schema, partitioning and sort order match the live
+        //    table: swap the contents in.
+        //  - they differ: the new schema, spec and sort order become current
+        //    in the same commit as the data (#892, #897).
         let existing = if or_replace {
             if session_catalog.table_exists(&table_ident).await? {
                 Some(catalog.load_table(&table_ident).await.map_err(|e| {
@@ -2390,16 +2396,20 @@ impl WriteHandler {
                     version,
                 ));
                 let iceberg = arrow_schema_to_iceberg(&arrow)?;
-                let spec = build_partition_spec(partition_by, &iceberg)?;
+                let spec = trino.partition_spec(partition_by, &iceberg)?;
                 (arrow, iceberg, spec)
             };
+            // The replace keeps the live table, so a Trino `location` must
+            // be its own (#897).
+            trino.check_replace_location(live)?;
             let in_place = version == live_version
                 && ctas_replace_is_in_place(
                     live,
                     &arrow_schema,
                     partition_spec.as_ref(),
                     &iceberg_schema,
-                );
+                )
+                && trino.keeps_sort_order(live, &iceberg_schema);
             let (write_table, shape, properties) = if in_place {
                 let properties = PropertyChanges {
                     set: replace_in_place_properties(user_options),
@@ -2407,8 +2417,9 @@ impl WriteHandler {
                 };
                 (live.clone(), None, properties)
             } else {
-                // Other columns, partitioning or format version: the new
-                // shape becomes current in the same commit as the data (#892).
+                // Other columns, partitioning, format version or Trino
+                // `sorted_by`: the new shape becomes current in the same
+                // commit as the data (#892, #897).
                 ctas_replace::refuse_shape_change_off_main(&table_ident)?;
                 let columns: Vec<&str> = arrow_schema
                     .fields()
@@ -2421,10 +2432,12 @@ impl WriteHandler {
                     &columns,
                     sqe_core::json_columns::marked_columns(&arrow_schema),
                 );
+                let sort_order = trino.replace_sort_order(&iceberg_schema)?;
                 let (shape, evolved) = ctas_replace::plan_replace_shape(
                     live,
                     iceberg_schema,
                     partition_spec,
+                    sort_order,
                     version,
                 )?;
                 (evolved, Some(shape), properties)
@@ -2451,7 +2464,10 @@ impl WriteHandler {
 
         let create_ident = table_ident.clone();
         let create_name = name.clone();
-        let location = unique_table_location(catalog.as_ref(), &namespace, &create_name).await;
+        let location = match trino.location() {
+            Some(location) => Some(location),
+            None => unique_table_location(catalog.as_ref(), &namespace, &create_name).await,
+        };
         // Merge user TBLPROPERTIES / WITH options (see handle_ctas for why):
         // a CTAS must keep properties like write.parquet.bloom-filter-* that
         // drive the data write, matching the plain CREATE TABLE path.
@@ -2467,10 +2483,12 @@ impl WriteHandler {
             .location_opt(location)
             .format_version(create_format_version)
             .partition_spec_opt(partition_spec)
+            .sort_order_opt(sort_order)
             .properties(props)
             .build();
 
-        let _created_table = create_table_at_location(catalog.as_ref(), &namespace, table_creation)
+        let _created_table = trino
+            .create_table(catalog.as_ref(), &namespace, table_creation)
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to create table: {e}")))?;
 
@@ -3060,12 +3078,16 @@ impl WriteHandler {
             ));
         }
 
+        // Trino table properties, refused before anything runs (#897).
+        let trino =
+            trino_props::TrinoTableOptions::parse(&ct.table_options, ct.partition_by.is_some())?;
         let table_ident = resolve_table_ident(&ct.name, session)?;
         let namespace = table_ident.namespace().clone();
         let name = table_ident.name().to_string();
 
         if ct.columns.is_empty() {
-            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed,
+            return Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
                 "CREATE TABLE requires at least one column definition",
             ));
         }
@@ -3074,11 +3096,14 @@ impl WriteHandler {
         // unquoted names, #337) and decide the format version: V3 features
         // upgrade the table, else a `format-version` option, else the
         // configured default (V3 unless set to 2). JSON is a variant on V3 (#849).
-        let (arrow_schema, iceberg_schema, format_version) = plan_create_table_schema(
-            &ct.columns,
-            create_table_options_as_slice(&ct.table_options),
-            self.format_version(),
-        )?;
+        let (arrow_schema, iceberg_schema, format_version) =
+            plan_create_table_schema(&ct.columns, trino.options(), self.format_version())?;
+        // PARTITIONED BY / `partitioning` as an Iceberg partition spec
+        // (identity for bare columns, else year/month/day/hour/bucket/
+        // truncate/void), and `sorted_by`: built before the namespace is
+        // touched, so a bad column leaves nothing behind.
+        let partition_spec = trino.partition_spec(ct.partition_by.as_deref(), &iceberg_schema)?;
+        let sort_order = trino.sort_order(&iceberg_schema)?;
 
         info!(
             username = %session.user.username,
@@ -3109,23 +3134,16 @@ impl WriteHandler {
         // `with_options` (WITH (...)) fields into a single `table_options`
         // enum. Extract the user options regardless of which syntax produced
         // them so CREATE TABLE keeps every property the user typed.
-        let mut props = create_table_properties(
-            rest_catalog,
-            format_version,
-            create_table_options_as_slice(&ct.table_options),
-        );
+        let mut props = create_table_properties(rest_catalog, format_version, trino.options());
         // Below v3 a JSON column is a string; the property keeps it JSON (#848).
         if format_version != FormatVersion::V3 {
             record_json_columns(&mut props, declared_json_columns(&ct.columns));
         }
 
-        // Translate any PARTITIONED BY (...) clause into an Iceberg
-        // UnboundPartitionSpec. Identity transforms cover bare column
-        // refs; year/month/day/hour/bucket/truncate/void cover the
-        // standard hidden-partitioning transforms.
-        let partition_spec = build_partition_spec(ct.partition_by.as_deref(), &iceberg_schema)?;
-
-        let location = unique_table_location(catalog.as_ref(), &namespace, &name).await;
+        let location = match trino.location() {
+            Some(location) => Some(location),
+            None => unique_table_location(catalog.as_ref(), &namespace, &name).await,
+        };
         let table_creation = TableCreation::builder()
             .name(name.clone())
             .schema(iceberg_schema)
@@ -3133,9 +3151,11 @@ impl WriteHandler {
             .format_version(format_version)
             .properties(props)
             .partition_spec_opt(partition_spec)
+            .sort_order_opt(sort_order)
             .build();
 
-        create_table_at_location(catalog.as_ref(), &namespace, table_creation)
+        trino
+            .create_table(catalog.as_ref(), &namespace, table_creation)
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to create table: {e}")))?;
 
@@ -9016,6 +9036,28 @@ pub(crate) fn requested_format_version(
     Ok(requested)
 }
 
+/// The format version a new table is created at (CREATE TABLE and CTAS,
+/// #897): V3 when a column needs it (`needs_v3` names the kinds), else the
+/// version the options ask for, else `default_version`. Asking for less than
+/// a column needs is an error.
+pub(crate) fn new_table_format_version(
+    options: &[sqlparser::ast::SqlOption],
+    needs_v3: Option<&str>,
+    default_version: FormatVersion,
+) -> sqe_core::Result<FormatVersion> {
+    match (requested_format_version(options)?, needs_v3) {
+        (Some(v), Some(kinds)) if v < FormatVersion::V3 => Err(SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!(
+                "format-version {v} was requested, but the table has a column \
+                 ({kinds}) that needs format v3"
+            ),
+        )),
+        (_, Some(_)) => Ok(FormatVersion::V3),
+        (requested, None) => Ok(requested.unwrap_or(default_version)),
+    }
+}
+
 /// Build the Arrow and Iceberg schemas of a `CREATE TABLE (cols)` and decide
 /// its format version.
 ///
@@ -9028,27 +9070,11 @@ pub(crate) fn plan_create_table_schema(
     options: &[sqlparser::ast::SqlOption],
     default_version: FormatVersion,
 ) -> sqe_core::Result<(ArrowSchema, IcebergSchema, FormatVersion)> {
-    let requested = requested_format_version(options)?;
-
     let arrow_schema = ArrowSchema::new(create_table_arrow_fields(column_defs, false)?);
     let iceberg_schema = arrow_schema_to_iceberg_with_defaults(&arrow_schema, column_defs)?;
-    let needs_v3 = requires_v3_features(column_defs, &iceberg_schema);
-
-    let format_version = match requested {
-        Some(v) if needs_v3 && v < FormatVersion::V3 => {
-            return Err(SqeError::with_code(
-                SqeErrorCode::ExecutionFailed,
-                format!(
-                    "format-version {v} was requested, but the table has a column \
-                     (variant, geometry, geography, nanosecond timestamp or DEFAULT) \
-                     that needs format v3"
-                ),
-            ))
-        }
-        _ if needs_v3 => FormatVersion::V3,
-        Some(v) => v,
-        None => default_version,
-    };
+    let needs_v3 = requires_v3_features(column_defs, &iceberg_schema)
+        .then_some("variant, geometry, geography, nanosecond timestamp or DEFAULT");
+    let format_version = new_table_format_version(options, needs_v3, default_version)?;
 
     if format_version < FormatVersion::V3 {
         return Ok((arrow_schema, iceberg_schema, format_version));
@@ -14213,6 +14239,7 @@ s3_path_style = true
     // -------------------------------------------------------------------------
     #[cfg(feature = "test-sqlite")]
     mod committing {
+        mod format_version;
         mod shape_replace;
 
         use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};

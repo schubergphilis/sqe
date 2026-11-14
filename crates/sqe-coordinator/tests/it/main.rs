@@ -109,6 +109,7 @@ mod trino_describe_test;
 mod trino_metadata_test;
 mod trino_session_catalog_test;
 mod trino_stats_bytes_e2e;
+mod trino_table_properties_e2e;
 mod tvf_catalog_placeholder_e2e;
 mod tvf_join_broadcast_e2e;
 mod unknown_type_spark_interop;

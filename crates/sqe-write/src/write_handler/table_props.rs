@@ -93,9 +93,19 @@ pub(crate) fn merge_user_table_properties(
     props: &mut std::collections::HashMap<String, String>,
     options: &[sqlparser::ast::SqlOption],
 ) {
-    use sqlparser::ast::SqlOption;
+    use sqlparser::ast::{CommentDef, SqlOption};
     for opt in options {
+        // `CREATE TABLE t COMMENT '...'`: the `comment` property, where
+        // `COMMENT ON TABLE` and Trino's Iceberg connector keep it (#897).
+        if let SqlOption::Comment(CommentDef::WithEq(c) | CommentDef::WithoutEq(c)) = opt {
+            props.insert("comment".to_string(), c.clone());
+        }
         if let SqlOption::KeyValue { key, value } = opt {
+            // Trino's spelling of the format version is an option, not a
+            // property: `TableCreation.format_version` carries it (#897).
+            if key.value.eq_ignore_ascii_case("format_version") {
+                continue;
+            }
             let k = key.value.clone();
             let v = sql_expr_to_property_string(value);
             props.insert(k, v);
@@ -261,6 +271,83 @@ mod tests {
         let want = [("a.b", "2"), ("write.merge.mode", "copy-on-write")]
             .map(|(k, v)| (k.to_string(), v.to_string()));
         assert_eq!(got, want);
+    }
+
+    fn create_options(sql: &str) -> Vec<sqlparser::ast::SqlOption> {
+        let dialect = sqlparser::dialect::GenericDialect {};
+        let stmt = sqlparser::parser::Parser::parse_sql(&dialect, sql)
+            .expect("parse")
+            .remove(0);
+        let sqlparser::ast::Statement::CreateTable(ct) = stmt else {
+            panic!("not a CREATE TABLE");
+        };
+        create_table_options_as_slice(&ct.table_options).to_vec()
+    }
+
+    /// #897: Trino's `format_version` sets the version and is not stored as
+    /// a property, on a REST catalog and on the others.
+    #[test]
+    fn create_table_properties_do_not_store_trino_format_version() {
+        let opts = create_options("CREATE TABLE t WITH (format_version = 3, a = 'x') AS SELECT 1");
+        let rest = create_table_properties(true, FormatVersion::V3, &opts);
+        assert_eq!(rest.get("format-version").map(String::as_str), Some("3"));
+        assert!(!rest.contains_key("format_version"), "{rest:?}");
+        assert_eq!(rest.get("a").map(String::as_str), Some("x"));
+        let local = create_table_properties(false, FormatVersion::V3, &opts);
+        assert_eq!(local, map(&[("a", "x")]));
+    }
+
+    /// #897: a table comment, written inline or folded into the options by
+    /// the front door, is the `comment` property.
+    #[test]
+    fn create_table_comment_is_the_comment_property() {
+        for sql in [
+            "CREATE TABLE t COMMENT 'a mart' AS SELECT 1",
+            "CREATE TABLE t COMMENT = 'a mart' AS SELECT 1",
+            "CREATE TABLE t WITH (format_version = 2, comment = 'a mart') AS SELECT 1",
+        ] {
+            let props = create_table_properties(false, FormatVersion::V2, &create_options(sql));
+            assert_eq!(props, map(&[("comment", "a mart")]), "{sql}");
+        }
+    }
+
+    /// #897: the version a new table (CREATE TABLE or CTAS) is created at.
+    #[test]
+    fn new_table_format_version_follows_the_option() {
+        use crate::write_handler::new_table_format_version as version;
+        let v2 = FormatVersion::V2;
+        for (sql, want) in [
+            ("CREATE TABLE t AS SELECT 1", FormatVersion::V2),
+            (
+                "CREATE TABLE t WITH (format_version = 3) AS SELECT 1",
+                FormatVersion::V3,
+            ),
+            (
+                "CREATE TABLE t WITH (format_version = '3') AS SELECT 1",
+                FormatVersion::V3,
+            ),
+            (
+                "CREATE TABLE t WITH (FORMAT_VERSION = 1) AS SELECT 1",
+                FormatVersion::V1,
+            ),
+            (
+                "CREATE TABLE t TBLPROPERTIES ('format-version' = '3') AS SELECT 1",
+                FormatVersion::V3,
+            ),
+        ] {
+            let got = version(&create_options(sql), None, v2).unwrap();
+            assert_eq!(got, want, "{sql}");
+        }
+        // A variant column needs V3: it upgrades a default, and contradicts
+        // an explicit lower version.
+        let none = create_options("CREATE TABLE t AS SELECT 1");
+        let got = version(&none, Some("variant"), v2).unwrap();
+        assert_eq!(got, FormatVersion::V3);
+        let low = create_options("CREATE TABLE t WITH (format_version = 2) AS SELECT 1");
+        let err = version(&low, Some("variant"), v2).unwrap_err().to_string();
+        assert!(err.contains("needs format v3"), "{err}");
+        let bad = create_options("CREATE TABLE t WITH (format_version = 4) AS SELECT 1");
+        assert!(version(&bad, None, v2).is_err());
     }
 
     fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {

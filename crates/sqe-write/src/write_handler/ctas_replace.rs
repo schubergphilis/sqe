@@ -1,9 +1,10 @@
 //! The planning half of a `CREATE OR REPLACE TABLE ... AS SELECT` whose
-//! columns or partitioning differ from the live table's (#892): one commit on
-//! the existing table that makes the new schema and spec current and swaps
-//! the data, instead of a staged table swapped in with DROP + RENAME.
+//! columns, partitioning or Trino sort order differ from the live table's
+//! (#892, #897): one commit on the existing table that makes the new schema,
+//! spec and sort order current and swaps the data, instead of a staged table
+//! swapped in with DROP + RENAME.
 
-use iceberg::spec::{FormatVersion, Schema as IcebergSchema, UnboundPartitionSpec};
+use iceberg::spec::{FormatVersion, Schema as IcebergSchema, SortOrder, UnboundPartitionSpec};
 use iceberg::table::Table as IcebergTable;
 use iceberg::transaction::ReplaceTableShapeAction;
 use iceberg::TableIdent;
@@ -69,6 +70,7 @@ pub(super) fn plan_replace_shape(
     live: &IcebergTable,
     schema: IcebergSchema,
     spec: Option<UnboundPartitionSpec>,
+    sort_order: Option<SortOrder>,
     format_version: FormatVersion,
 ) -> sqe_core::Result<(ReplaceTableShapeAction, IcebergTable)> {
     let failed = |e: iceberg::Error| {
@@ -78,9 +80,14 @@ pub(super) fn plan_replace_shape(
         )
     };
     let spec = spec.unwrap_or_else(|| UnboundPartitionSpec::builder().build());
-    let action = ReplaceTableShapeAction::new(live, schema, spec)
+    let mut action = ReplaceTableShapeAction::new(live, schema, spec)
         .map_err(failed)?
         .with_format_version(format_version);
+    // A Trino `sorted_by` replaces the default sort order in the same commit
+    // (#897); without one the live order stays where it still binds.
+    if let Some(order) = sort_order {
+        action = action.with_sort_order(order).map_err(failed)?;
+    }
     let evolved = action.evolved_table(live).map_err(failed)?;
     Ok((action, evolved))
 }
