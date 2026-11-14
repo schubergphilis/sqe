@@ -386,7 +386,7 @@ Each section lists Trino functions with their SQE status:
 | `ALTER TABLE ... DROP COLUMN` | Same | ✅ | Top-level and nested struct-subfield drops. `DROP COLUMN a.b` is a pre-parse intercept (sqlparser cannot parse the dotted path) routed to `drop_nested_column`, which rebuilds the struct without the leaf via `remove_struct_subfield` and commits an Iceberg schema update. Missing leaf errors unless `IF EXISTS`. Schema surgery is unit-verified; the end-to-end Iceberg commit is best confirmed against a live stack |
 | `ALTER TABLE ... RENAME COLUMN` | Same | ✅ | |
 | `ALTER TABLE ... SET/DROP NOT NULL` | Same | ✅ | |
-| `ALTER TABLE ... SET PROPERTIES` | `ALTER TABLE ... SET TBLPROPERTIES` | ✅ | Iceberg TableUpdate::SetProperties |
+| `ALTER TABLE ... SET PROPERTIES` | `ALTER TABLE ... SET PROPERTIES` or `SET TBLPROPERTIES` | ✅ | `partitioning` evolves the partition spec, `sorted_by` replaces the sort order, `extra_properties` and other keys become Iceberg properties, `format_version` upgrades. `location` and `p = DEFAULT` are refused |
 | `CREATE VIEW` | Same | ✅ | Iceberg views |
 | `CREATE VIEW ... COMMENT '<text>'` | Same | ✅ | Stored as the view's `comment` property |
 | `CREATE VIEW ... SECURITY DEFINER \| INVOKER` | Accepted, recorded | ⚠️ | SQE always evaluates views as INVOKER (no service account to run as the definer). Recorded in `sqe.view-security`; stricter than DEFINER, so it fails closed |

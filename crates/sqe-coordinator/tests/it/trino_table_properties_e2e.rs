@@ -375,3 +375,161 @@ async fn trino_table_vocabulary_897() {
         ok(&base_url, &format!("DROP TABLE IF EXISTS {NS}.{t}")).await;
     }
 }
+
+/// The partition field ids of the default spec.
+/// The spec ids of the manifests the current snapshot added.
+async fn new_manifest_specs(table: &iceberg::table::Table) -> Vec<i32> {
+    let meta = table.metadata();
+    let snapshot = meta.current_snapshot().expect("snapshot");
+    let list = table
+        .manifest_list_reader(snapshot)
+        .load()
+        .await
+        .expect("manifest list");
+    list.entries()
+        .iter()
+        .filter(|m| m.added_snapshot_id == snapshot.snapshot_id())
+        .map(|m| m.partition_spec_id)
+        .collect()
+}
+
+/// The single BIGINT a `SELECT count(*)` returns.
+async fn count_rows(
+    handler: &sqe_coordinator::QueryHandler,
+    session: &sqe_core::Session,
+    sql: &str,
+) -> i64 {
+    let batches = handler
+        .execute(session, sql, None)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::Int64Array>()
+        .expect("count is BIGINT")
+        .value(0)
+}
+
+fn field_ids(table: &iceberg::table::Table) -> Vec<i32> {
+    let spec = table.metadata().default_partition_spec();
+    spec.fields().iter().map(|f| f.field_id).collect()
+}
+
+/// `ALTER TABLE ... SET PROPERTIES` with the Trino layout keys:
+/// `partitioning` evolves the spec (a field the table had keeps its id),
+/// `sorted_by` replaces the sort order, `extra_properties` sets properties.
+/// `= DEFAULT`, `location` and refused keys fail and change nothing.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn trino_alter_properties_897() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let handler = Arc::new(handler);
+    let base_url = start_server(&session, &handler).await;
+    let t = "trino_alter_props_897";
+    ok(&base_url, &format!("DROP TABLE IF EXISTS {NS}.{t}")).await;
+    ok(
+        &base_url,
+        &format!(
+            "create table {NS}.{t} WITH (partitioning = ARRAY['region']) \
+             as select 1 as id, 'eu' as region"
+        ),
+    )
+    .await;
+    let region_id = field_ids(&load(&session, t).await)[0];
+
+    let alter = format!(
+        "ALTER TABLE {NS}.{t} SET PROPERTIES partitioning = ARRAY['region', 'bucket(id, 4)'], \
+         sorted_by = ARRAY['id DESC'], extra_properties = MAP(ARRAY['owner.team'], ARRAY['marts'])"
+    );
+    ok(&base_url, &alter).await;
+    let table = load(&session, t).await;
+    assert_eq!(
+        spec_of(&table),
+        [("region", "identity"), ("id", "bucket[4]")].map(|(c, t)| (c.to_string(), t.to_string())),
+        "{alter}"
+    );
+    assert_eq!(field_ids(&table), [region_id, region_id + 1], "{alter}");
+    assert_eq!(sort_of(&table), ["id descending nulls last"], "{alter}");
+    let props = table.metadata().properties();
+    assert_eq!(props.get("owner.team").map(String::as_str), Some("marts"));
+    for gone in ["partitioning", "sorted_by", "extra_properties"] {
+        assert!(!props.contains_key(gone), "{gone}: {props:?}");
+    }
+    let bucket4_spec = table.metadata().default_partition_spec_id();
+    assert_ne!(bucket4_spec, 0, "{alter}");
+    ok(&base_url, &format!("INSERT INTO {NS}.{t} VALUES (2, 'us')")).await;
+    // The write after the ALTER uses the new spec.
+    assert_eq!(
+        new_manifest_specs(&load(&session, t).await).await,
+        [bucket4_spec]
+    );
+
+    // Another bucket count on the same column is a new field, and a new name.
+    let bucket8 = format!(
+        "ALTER TABLE {NS}.{t} SET PROPERTIES partitioning = ARRAY['region', 'bucket(id, 8)']"
+    );
+    ok(&base_url, &bucket8).await;
+    let table = load(&session, t).await;
+    let names: Vec<_> = table
+        .metadata()
+        .default_partition_spec()
+        .fields()
+        .iter()
+        .map(|f| (f.name.clone(), f.field_id))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("region".to_string(), region_id),
+            ("id_bucket_8".to_string(), region_id + 2)
+        ],
+        "{bucket8}"
+    );
+    ok(&base_url, &format!("INSERT INTO {NS}.{t} VALUES (4, 'us')")).await;
+
+    // Back to the first layout: the field keeps its id, the order empties,
+    // and the table's first spec is the default again.
+    let back = format!(
+        "ALTER TABLE {NS}.{t} SET PROPERTIES partitioning = ARRAY['region'], sorted_by = ARRAY[]"
+    );
+    ok(&base_url, &back).await;
+    let table = load(&session, t).await;
+    assert_eq!(field_ids(&table), [region_id], "{back}");
+    assert_eq!(table.metadata().default_partition_spec_id(), 0, "{back}");
+    assert!(sort_of(&table).is_empty(), "{back}");
+    ok(&base_url, &format!("INSERT INTO {NS}.{t} VALUES (3, 'eu')")).await;
+    assert_eq!(new_manifest_specs(&load(&session, t).await).await, [0]);
+    // Rows written under the three specs all read back.
+    let count = |filter: &str| format!("SELECT count(*) FROM {NS}.{t} {filter}");
+    assert_eq!(count_rows(&handler, &session, &count("")).await, 4);
+    assert_eq!(
+        count_rows(&handler, &session, &count("WHERE region = 'eu'")).await,
+        2
+    );
+    // The same layout again is no commit at all.
+    let commits = load(&session, t).await.metadata().metadata_log().len();
+    ok(&base_url, &back).await;
+    assert_eq!(
+        load(&session, t).await.metadata().metadata_log().len(),
+        commits,
+        "an unchanged layout commits nothing"
+    );
+
+    for (set, want) in [
+        ("sorted_by = DEFAULT", "DEFAULT is not supported"),
+        (
+            "location = 's3://elsewhere/t'",
+            "cannot change the table property `location`",
+        ),
+        ("max_commit_retry = 8", "not supported"),
+        ("partitioning = ARRAY['nope']", "nope"),
+    ] {
+        let sql = format!("ALTER TABLE {NS}.{t} SET PROPERTIES {set}");
+        let err = run(&base_url, &sql).await.expect_err(&sql);
+        assert!(err.contains(want), "{sql}: {err}");
+    }
+    assert_eq!(field_ids(&load(&session, t).await), [region_id]);
+
+    ok(&base_url, &format!("DROP TABLE IF EXISTS {NS}.{t}")).await;
+}

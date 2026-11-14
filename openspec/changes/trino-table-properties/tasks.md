@@ -21,8 +21,8 @@
 
 ## 3. ALTER TABLE SET PROPERTIES
 
-- [ ] 3.1 `partitioning` as partition evolution, `sorted_by` replaces the sort order, `extra_properties`
-- [ ] 3.2 `SET PROPERTIES p = DEFAULT` refused with a clear error
+- [x] 3.1 `partitioning` as partition evolution, `sorted_by` replaces the sort order, `extra_properties`
+- [x] 3.2 `SET PROPERTIES p = DEFAULT` refused with a clear error
 
 ## 4. Wire and dbt
 
