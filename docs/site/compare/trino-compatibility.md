@@ -377,7 +377,7 @@ Each section lists Trino functions with their SQE status:
 
 | Trino Statement | SQE Support | Status | Notes |
 |---|---|---|---|
-| `CREATE TABLE (cols) WITH (...)` | `CREATE TABLE (cols) WITH (...)` | ✅ | Trino's `WITH (foo = 'bar')` syntax merges into table properties via `merge_user_table_properties` in `write_handler.rs:589-590`, alongside `TBLPROPERTIES (...)`. Both spellings produce identical Iceberg metadata |
+| `CREATE TABLE (cols) WITH (...)` | `CREATE TABLE (cols) WITH (...)` | ✅ | Trino's table properties (`format_version`, `partitioning`, `sorted_by`, `location`, `extra_properties`, the Parquet keys) are honoured or refused; an unknown unquoted key is an error. Quoted keys and `TBLPROPERTIES (...)` are Iceberg properties. See the DDL reference, "Trino table properties" |
 | `CREATE TABLE AS SELECT` | Same | ✅ | |
 | `CREATE TABLE ... LIKE` | `CREATE TABLE new (LIKE src)` | ✅ | Classifier rewrites the parenthesized form (unsupported by GenericDialect) to plain LIKE; `handle_create_table_like` copies the source schema. Unqualified source names resolve against the session schema (X-Trino-Schema) |
 | `DROP TABLE` | Same | ✅ | |
@@ -553,7 +553,7 @@ Two real fixes plus three stale-doc flips:
 | `SHOW COLUMNS FROM ns.t` | new handler | ✅ | New `handle_show_columns` in query_handler.rs translates the Trino-style query into a SELECT against `information_schema.columns`, returning `(column_name, data_type, is_nullable)` ordered by ordinal_position. Same pattern as `handle_show_create_table`'s column lookup |
 | `CAST(json AS T)` | doc fix | ✅ | Already worked: JSON columns stored as `Utf8` (V2 tables today), DataFusion's built-in `Utf8 → T` coercion parses numeric / boolean strings into the target type. The doc had been misframing this as a syntax difference |
 | `EXPLAIN ANALYZE` | stale doc | ✅ | Already routed since Phase 2: `parse_and_classify` produces `StatementKind::Utility` with `Statement::Explain { analyze: true, .. }`, dispatched to `explain_handler.analyze()` which returns the per-operator timing breakdown. The "different keyword" caveat was a stale doc claim |
-| `CREATE TABLE (cols) WITH (foo = 'bar')` | stale doc | ✅ | Already handled: `merge_user_table_properties` in write_handler.rs merges both `TBLPROPERTIES (...)` and `WITH (...)` into the same table-property map (lines 589-590). Both spellings produce identical Iceberg metadata |
+| `CREATE TABLE (cols) WITH (foo = 'bar')` | stale doc | ✅ | Superseded (#897): an unquoted key is now a Trino table property, honoured or refused, and `foo` is an unknown key. `WITH ('foo' = 'bar')` stores the Iceberg property |
 
 Net coverage delta this MR:
 

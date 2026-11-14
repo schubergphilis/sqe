@@ -161,8 +161,8 @@ pub fn is_create_external_table(sql: &str) -> bool {
 ///
 /// sqlparser also keeps `COMMENT`, `WITH (...)` and `TBLPROPERTIES` in one
 /// options slot. A comment beside an options list becomes its `comment`
-/// property, and a `WITH` list beside `TBLPROPERTIES` joins it, where
-/// sqlparser would keep only the last list (#897).
+/// property, and `TBLPROPERTIES` beside a `WITH` list joins it with its keys
+/// quoted, where sqlparser would keep only the last list (#897).
 ///
 /// Runs after [`normalize_partitioned_by`]. Parse-gated: SQL that already
 /// parses is returned untouched unless it holds both lists, and the
@@ -330,14 +330,15 @@ fn reorder_clauses(sql: &str) -> Option<(String, bool)> {
     // sqlparser keeps `COMMENT`, `WITH (...)` and `TBLPROPERTIES` in one
     // options slot (#897). `WITH (...) TBLPROPERTIES (...)` parses, but the
     // second list replaces the first: `WITH (format_version = 3)` was
-    // dropped without a word. Both are table properties, so the WITH items
-    // join the TBLPROPERTIES list.
+    // dropped without a word. The TBLPROPERTIES items join the WITH list
+    // with their keys quoted: an unquoted WITH key is a Trino table property
+    // and a quoted one an Iceberg property, so each keeps its meaning.
     let joined = match (find(TableClause::With), find(TableClause::TblProperties)) {
         (Some(w), Some(t)) => {
-            let (_, start, end) = sorted[w];
-            let items = sql[offset(start + 2)..offset(end - 1)].trim();
-            texts[t] = append_option(&texts[t], items);
-            texts[w].clear();
+            let (_, start, end) = sorted[t];
+            let items = quote_option_keys(&sql[offset(start + 2)..offset(end - 1)])?;
+            texts[w] = append_option(&texts[w], items.trim());
+            texts[t].clear();
             true
         }
         _ => false,
@@ -376,6 +377,35 @@ fn reorder_clauses(sql: &str) -> Option<(String, bool)> {
         out.push_str(tail);
     }
     Some((out, joined))
+}
+
+/// An option list (`k = v, 'k2' = v2`) with every unquoted key quoted. The
+/// rest of the text is copied as written.
+fn quote_option_keys(items: &str) -> Option<String> {
+    let tokens = Tokenizer::new(&GenericDialect {}, items)
+        .tokenize_with_location()
+        .ok()?;
+    let (mut out, mut copied, mut depth, mut at_key) = (String::new(), 0, 0usize, true);
+    for (i, t) in tokens.iter().enumerate() {
+        match &t.token {
+            Token::Whitespace(_) | Token::EOF => continue,
+            Token::Word(w) if at_key && depth == 0 && w.quote_style.is_none() => {
+                let start = byte_offset(items, t.span.start);
+                let end = tokens
+                    .get(i + 1)
+                    .map_or(items.len(), |n| byte_offset(items, n.span.start));
+                out.push_str(&items[copied..start]);
+                out.push_str(&format!("'{}'", w.value));
+                copied = end;
+            }
+            Token::LParen | Token::LBracket => depth += 1,
+            Token::RParen | Token::RBracket => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        at_key = depth == 0 && t.token == Token::Comma;
+    }
+    out.push_str(&items[copied..]);
+    Some(out)
 }
 
 /// `clause` (`WITH (...)` or `TBLPROPERTIES (...)`) with `item` added as its
@@ -554,39 +584,62 @@ mod tests {
     }
 
     /// `WITH (...) TBLPROPERTIES (...)` parses, but sqlparser keeps only the
-    /// last list: the WITH items join TBLPROPERTIES instead (#897).
+    /// last list: the TBLPROPERTIES items join the WITH list instead, keys
+    /// quoted, so an unquoted key still marks a Trino property (#897).
     #[test]
     fn a_with_list_beside_tblproperties_joins_it() {
         let sql = "CREATE TABLE t WITH (format_version = 3) TBLPROPERTIES ('b' = '2') AS SELECT 1";
         assert_eq!(
             reorder_create_table_clauses(sql),
-            "CREATE TABLE t TBLPROPERTIES ('b' = '2', format_version = 3) AS SELECT 1"
+            "CREATE TABLE t WITH (format_version = 3, 'b' = '2') AS SELECT 1"
         );
-        let sql = "CREATE TABLE t (id BIGINT) COMMENT 'c' WITH (a = 1) TBLPROPERTIES ('b' = '2')";
+        let sql = "CREATE TABLE t (id BIGINT) COMMENT 'c' WITH (a = 1) TBLPROPERTIES (b = '2')";
         let out = reorder_create_table_clauses(sql);
         assert_eq!(
             out,
-            "CREATE TABLE t (id BIGINT) TBLPROPERTIES ('b' = '2', a = 1, 'comment' = 'c')"
+            "CREATE TABLE t (id BIGINT) WITH (a = 1, 'b' = '2', comment = 'c')"
         );
-        let sqlparser::ast::Statement::CreateTable(ct) =
-            Parser::parse_sql(&GenericDialect {}, &out)
+        let sql = "CREATE TABLE t WITH (partitioning = ARRAY['a', 'bucket(b, 4)']) \
+                   TBLPROPERTIES (k = MAP(ARRAY['x'], ARRAY['y']), 'w.q' = 'it''s')";
+        let out = reorder_create_table_clauses(sql);
+        assert_eq!(
+            out,
+            "CREATE TABLE t WITH (partitioning = ARRAY['a', 'bucket(b, 4)'], \
+             'k' = MAP(ARRAY['x'], ARRAY['y']), 'w.q' = 'it''s')"
+        );
+        for (sql, want) in [
+            (out.as_str(), ["partitioning", "'k'", "'w.q'"]),
+            (
+                "CREATE TABLE t (id BIGINT) WITH (a = 1, 'b' = '2', comment = 'c')",
+                ["a", "'b'", "comment"],
+            ),
+        ] {
+            let stmt = Parser::parse_sql(&GenericDialect {}, sql)
                 .expect("parse")
-                .remove(0)
-        else {
-            panic!("not a CREATE TABLE");
-        };
-        let keys = option_keys(&ct.table_options);
-        assert_eq!(keys, ["b", "a", "comment"]);
+                .remove(0);
+            let printed = stmt.to_string();
+            for text in [sql, printed.as_str()] {
+                let sqlparser::ast::Statement::CreateTable(ct) =
+                    Parser::parse_sql(&GenericDialect {}, text)
+                        .expect("parse")
+                        .remove(0)
+                else {
+                    panic!("not a CREATE TABLE");
+                };
+                assert_eq!(with_keys(&ct.table_options), want, "{text}");
+            }
+        }
     }
 
-    fn option_keys(options: &sqlparser::ast::CreateTableOptions) -> Vec<String> {
+    /// The keys of a `WITH (...)` list as written, quotes included.
+    fn with_keys(options: &sqlparser::ast::CreateTableOptions) -> Vec<String> {
         use sqlparser::ast::{CreateTableOptions, SqlOption};
-        let CreateTableOptions::TableProperties(opts) = options else {
-            panic!("not TBLPROPERTIES: {options:?}");
+        let CreateTableOptions::With(opts) = options else {
+            panic!("not WITH: {options:?}");
         };
         opts.iter()
             .filter_map(|o| match o {
-                SqlOption::KeyValue { key, .. } => Some(key.value.clone()),
+                SqlOption::KeyValue { key, .. } => Some(key.to_string()),
                 _ => None,
             })
             .collect()
