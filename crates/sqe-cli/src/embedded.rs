@@ -49,6 +49,8 @@ use sqe_catalog::writable_iceberg_catalog::WritableIcebergCatalog;
 
 use crate::client::{QueryResult, SqlClient};
 
+mod procedures;
+
 /// One persistent Iceberg catalog the embedded engine attaches.
 ///
 /// Every entry produces an independent SQLite catalog at
@@ -1188,6 +1190,9 @@ impl EmbeddedClient {
                         return Ok(result);
                     }
                 }
+                sqe_sql::StatementKind::Procedure(ref call) => {
+                    return self.embedded_handle_procedure(call).await;
+                }
                 _ => {}
             },
             // Our own classifier rejected this statement with a specific,
@@ -2135,13 +2140,22 @@ impl EmbeddedClient {
         name: &sqlparser::ast::ObjectName,
     ) -> Option<(String, Arc<sqe_catalog::SessionCatalog>)> {
         let catalog_name = self.iceberg_target(name)?;
-        let writable = self.iceberg_catalogs.get(&catalog_name)?;
-        let catalog = Arc::new(sqe_catalog::SessionCatalog::local(
-            writable.client(),
-            &catalog_name,
-            &self.storage,
-        ));
+        let catalog = self.local_session_catalog(&catalog_name)?;
         Some((catalog_name, catalog))
+    }
+
+    /// A `SessionCatalog` over the writable Iceberg catalog `catalog_name`;
+    /// `None` when that name is not one.
+    fn local_session_catalog(
+        &self,
+        catalog_name: &str,
+    ) -> Option<Arc<sqe_catalog::SessionCatalog>> {
+        let writable = self.iceberg_catalogs.get(catalog_name)?;
+        Some(Arc::new(sqe_catalog::SessionCatalog::local(
+            writable.client(),
+            catalog_name,
+            &self.storage,
+        )))
     }
 
     /// Refuse `DROP TABLE` / `DROP VIEW` / `DROP SCHEMA` on a read-only

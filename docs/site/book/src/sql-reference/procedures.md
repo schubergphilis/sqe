@@ -298,6 +298,10 @@ The admin tier exists because these procedures delete data files or history with
 
 A denied call fails with `403 Forbidden` and is recorded in the audit log as `AdminGateDenied`.
 
+### Embedded mode
+
+`sqe-cli --embedded` runs `expire_snapshots`, `rewrite_manifests`, `set_current_snapshot`, `rollback_to_snapshot`, `register_table` and `table_health`, and refuses the others by name. It has no tiers: there is no policy engine and no role set, and the CLI user calls the catalog with the credentials they attached. Every procedure it runs is a catalog commit or a metadata read, so the catalog's own authorization decides, as it does for `DROP TABLE` and `ALTER TABLE` in embedded mode. The admin tier above protects a shared coordinator from its other users; a single-user process has no counterpart to that, so running `set_current_snapshot` without an admin role in embedded mode is not a bypass of the cluster's tiers.
+
 ## Safety notes
 
 - **`remove_orphan_files` with no `older_than`** uses the 3-day default, which is conservative against compaction or COPY jobs in flight. Override with `older_than` only after confirming no concurrent writers. The server refuses any deleting call whose cutoff is inside `[maintenance] orphan_min_age_secs`, whatever the client sends. Run it with `dry_run => true` first to review the list.
