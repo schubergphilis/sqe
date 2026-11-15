@@ -58,7 +58,7 @@ pub mod session_manager;
 pub mod streaming;
 pub(crate) mod suggest_bloom;
 pub(crate) mod system_runtime;
-pub mod table_health;
+pub use sqe_write::table_health;
 pub(crate) mod ticket_credentials;
 pub mod tls;
 pub mod transport;

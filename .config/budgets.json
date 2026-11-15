@@ -8,7 +8,7 @@
     "crates/sqe-cli/src/embedded.rs": 5250,
     "crates/sqe-coordinator/src/distributed_scan.rs": 4000,
     "crates/sqe-coordinator/src/flight_sql.rs": 5000,
-    "crates/sqe-coordinator/src/maintenance.rs": 6250,
+    "crates/sqe-coordinator/src/maintenance.rs": 5750,
     "crates/sqe-coordinator/src/maintenance_scheduler.rs": 4000,
     "crates/sqe-coordinator/src/query_handler.rs": 10250,
     "crates/sqe-core/src/config/mod.rs": 12500,
@@ -69,7 +69,7 @@
       ]
     },
     "sqe-coordinator": {
-      "lines": 68600,
+      "lines": 67500,
       "deps": [
         "sqe-auth",
         "sqe-catalog",
@@ -225,7 +225,7 @@
       ]
     },
     "sqe-write": {
-      "lines": 30100,
+      "lines": 31250,
       "deps": [
         "sqe-catalog",
         "sqe-compaction",

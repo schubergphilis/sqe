@@ -6,7 +6,7 @@
 //! `rewrite_data_files` uses to plan a real rewrite
 //! (`collect_live_data_files`, `collect_live_delete_files`,
 //! `plan_delete_aware_read`, `delete_heavy_files`,
-//! `pack_file_groups_partition_aware`, all in `crate::maintenance`). The
+//! `pack_file_groups_partition_aware`, all in `sqe_compaction` or `crate::writer`). The
 //! later advisory scheduler task reuses [`analyze_table_health`] directly to
 //! emit per-table metrics without going through the `CALL` surface.
 //!
@@ -39,7 +39,7 @@ use sqe_core::config::MaintenanceCompactionConfig;
 /// Table property that opts a table into the (later) advisory scheduler.
 /// `table_health` reports whether the scheduler would even consider this
 /// table; the scheduler itself does not exist yet in Phase 4a.
-pub(crate) const MAINTENANCE_ENABLED_PROPERTY: &str = "sqe.maintenance.enabled";
+pub const MAINTENANCE_ENABLED_PROPERTY: &str = "sqe.maintenance.enabled";
 
 /// Compaction-debt snapshot for one table.
 ///
@@ -76,7 +76,7 @@ pub struct TableHealth {
     /// compaction job, or `None` if none has run. Echoes `analyze_table_health`'s
     /// `last_compaction_ms` parameter, which the caller computes from the
     /// already-loaded `IcebergTable`'s snapshot log via
-    /// `crate::maintenance::last_compaction_snapshot_ms` (the newest
+    /// `crate::procedures::last_compaction_snapshot_ms` (the newest
     /// snapshot whose summary carries any `sqe.maintenance.*` property).
     pub last_compaction_snapshot_ms: Option<i64>,
     /// Whether `sqe.maintenance.enabled == "true"` is set on the table, i.e.
@@ -88,7 +88,7 @@ pub struct TableHealth {
 /// delete files, and delete-aware read plan task map.
 ///
 /// Pure and unit-testable: takes data the caller already collected (via
-/// `crate::maintenance::collect_live_data_files`,
+/// `crate::writer::collect_live_data_files`,
 /// `collect_live_delete_files`, and `plan_delete_aware_read`) and never loads
 /// or scans anything itself.
 ///
@@ -100,7 +100,7 @@ pub struct TableHealth {
 /// them with synthetic `FileScanTask`s instead of a docker-backed table.
 ///
 /// `last_compaction_ms` is likewise collected by the caller (via
-/// `crate::maintenance::last_compaction_snapshot_ms`, which walks the
+/// `crate::procedures::last_compaction_snapshot_ms`, which walks the
 /// already-loaded `IcebergTable`'s snapshot log) rather than computed here:
 /// this function stays pure and never touches a live table, snapshot log,
 /// or catalog.
@@ -126,14 +126,14 @@ pub fn analyze_table_health(
 
     // The same helper `rewrite_data_files_once` uses, so a threshold of 0 means
     // that trigger is off, not "every file qualifies".
-    let delete_heavy: HashSet<String> = crate::maintenance::delete_triggered_files(
+    let delete_heavy: HashSet<String> = sqe_compaction::delete_triggered_files(
         tasks_by_path,
         Some(cfg.delete_file_threshold),
         Some(cfg.delete_ratio_threshold),
     );
 
     let no_force: HashSet<String> = HashSet::new();
-    let groups = crate::maintenance::pack_file_groups_partition_aware(data, target, &no_force);
+    let groups = sqe_compaction::pack_file_groups_partition_aware(data, target, &no_force);
     let eligible_groups: Vec<&Vec<DataFile>> = groups
         .iter()
         .filter(|g| g.len() >= cfg.min_input_files)
@@ -309,7 +309,9 @@ mod tests {
     fn tasks_by_path(tasks: Vec<FileScanTask>) -> HashMap<String, Vec<FileScanTask>> {
         let mut map: HashMap<String, Vec<FileScanTask>> = HashMap::new();
         for t in tasks {
-            map.entry(t.data_file_path().to_string()).or_default().push(t);
+            map.entry(t.data_file_path().to_string())
+                .or_default()
+                .push(t);
         }
         map
     }
@@ -467,7 +469,7 @@ mod tests {
         );
 
         let expected_groups =
-            crate::maintenance::pack_file_groups_partition_aware(&files, target, &HashSet::new());
+            sqe_compaction::pack_file_groups_partition_aware(&files, target, &HashSet::new());
         let expected_eligible = expected_groups
             .iter()
             .filter(|g| g.len() >= min_input)
@@ -582,7 +584,7 @@ mod tests {
     fn last_compaction_snapshot_ms_echoes_caller_supplied_value() {
         // `analyze_table_health` is pure: it never computes this itself, it
         // only echoes whatever the caller (which walked the loaded table's
-        // snapshot log via `crate::maintenance::last_compaction_snapshot_ms`)
+        // snapshot log via `crate::procedures::last_compaction_snapshot_ms`)
         // passed in.
         let files = vec![data_file_of_size("a", 100)];
         let health = analyze_table_health(
