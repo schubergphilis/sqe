@@ -250,8 +250,8 @@ aikido-sbom:
 # A stale pin fails silently: cargo reuses a baked crate only when rustc, the
 # package id and the features all match, so an image built before a toolchain
 # bump is rebuilt from `proc-macro2` in every job and nothing turns red. The
-# digest below is `ci-deps:lock-a73c967e88a4`, built from 74575db1 with rustc
-# 1.99.1 and vendor/ tree 61e1f3d7. Refresh it after any merge that changes
+# digest below is `ci-deps:lock-a73c967e88a4`, built from de95a8ed with rustc
+# 1.99.1 and vendor/ tree 2dc7f629 (digest sha256:306ae4af). Refresh it after any merge that changes
 # rust-toolchain.toml, Cargo.lock or vendor/: the `ci-deps-image` job on main
 # prints the new digest on its last lines.
 # Rules copied from the aikido test-rust template minus the default-branch
@@ -268,7 +268,7 @@ aikido-test-rust:
       exists: ["**/Cargo.toml"]
       changes: *sqe_rust_changes
       allow_failure: false
-  image: "$CI_REGISTRY_IMAGE/ci-deps:main@sha256:e2965567fa6dfae7f9d50da8f2cab4c55304bf9ec3490852ac6b9059bb8e78be"
+  image: "$CI_REGISTRY_IMAGE/ci-deps:main@sha256:306ae4afc927432fc5c81564981249c44e074f1904e850a845862a42ca5b1e99"
   variables:
     AIKIDO_SHARED_SCRIPTS: "reuse-deps-image.sh"
     CARGO_TARGET_DIR: "/opt/sqe-deps/target"
@@ -284,7 +284,7 @@ aikido-rust-extra:
       exists: ["ci/aikido-rust-extra.sh"]
       changes: *sqe_rust_changes
       allow_failure: false
-  image: "$CI_REGISTRY_IMAGE/ci-deps:main@sha256:e2965567fa6dfae7f9d50da8f2cab4c55304bf9ec3490852ac6b9059bb8e78be"
+  image: "$CI_REGISTRY_IMAGE/ci-deps:main@sha256:306ae4afc927432fc5c81564981249c44e074f1904e850a845862a42ca5b1e99"
   variables:
     AIKIDO_SHARED_SCRIPTS: "reuse-deps-image.sh"
     CARGO_TARGET_DIR: "/opt/sqe-deps/target"
@@ -315,7 +315,7 @@ aikido-cargo-lock:
 catalog-live-tests:
   extends: aikido-rust-extra
   services:
-    - name: "postgres:17-alpine@sha256:d3244e8ce3f165ee3c93d9c4a4b1d0fe48b3a89e2287b717fdcbbde92d405065"
+    - name: "postgres:17-alpine@sha256:a77aa70e641402a21411b92b721c58d10f23b50ae5fdd2333efd22d166e1e5f7"
       alias: postgres
       variables:
         POSTGRES_USER: iceberg
