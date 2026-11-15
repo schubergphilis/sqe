@@ -63,23 +63,23 @@ default:
 
 include:
   - project: '$CI_PROJECT_ROOT_NAMESPACE/aikido'
-    ref: '3911cfb92ece401e9dcaf329c95a0a8363e1f23f'
+    ref: 'af7e72c4424b52618c091e47d438bfea8e772e55'
     file: '/ci/templates/guardrails.yml'
   - project: '$CI_PROJECT_ROOT_NAMESPACE/aikido'
-    ref: '3911cfb92ece401e9dcaf329c95a0a8363e1f23f'
+    ref: 'af7e72c4424b52618c091e47d438bfea8e772e55'
     file: '/ci/templates/test-rust.yml'
   - project: '$CI_PROJECT_ROOT_NAMESPACE/aikido'
-    ref: '3911cfb92ece401e9dcaf329c95a0a8363e1f23f'
+    ref: 'af7e72c4424b52618c091e47d438bfea8e772e55'
     file: '/ci/templates/deploy.yml'
   - project: '$CI_PROJECT_ROOT_NAMESPACE/aikido'
-    ref: '3911cfb92ece401e9dcaf329c95a0a8363e1f23f'
+    ref: 'af7e72c4424b52618c091e47d438bfea8e772e55'
     file: '/ci/templates/release.yml'
   - project: '$CI_PROJECT_ROOT_NAMESPACE/aikido'
-    ref: '3911cfb92ece401e9dcaf329c95a0a8363e1f23f'
+    ref: 'af7e72c4424b52618c091e47d438bfea8e772e55'
     file: '/ci/templates/consumer-controls.yml'
 
 variables:
-  AIKIDO_SHARED_REF: "3911cfb92ece401e9dcaf329c95a0a8363e1f23f"
+  AIKIDO_SHARED_REF: "af7e72c4424b52618c091e47d438bfea8e772e55"
   AIKIDO_CARGO_SUPPLY_CHAIN_IN_TEST: "0"
   AIKIDO_DOCKERFILE: "Dockerfile.ci"
   AIKIDO_SCAN_BUILT_IMAGE_ONLY: "1"
