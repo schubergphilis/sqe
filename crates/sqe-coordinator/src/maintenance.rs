@@ -16,7 +16,9 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Int64Array, RecordBatch, StringArray};
+#[cfg(all(test, feature = "test-sqlite"))]
+use arrow_array::Int64Array;
+use arrow_array::{RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use iceberg::spec::{DataContentType, DataFile};
@@ -36,8 +38,8 @@ use crate::writer::{new_upload_tracker, parse_parquet_compression, WriteCleanupG
 /// procedures keep calling `collect_live_data_files` unqualified.
 pub(crate) use crate::writer::collect_live_data_files;
 pub(crate) use sqe_compaction::{
-    collect_live_delete_files, covered_position_deletes, delete_heavy_files,
-    delete_ratio_heavy_files, pack_file_groups_partition_aware,
+    collect_live_delete_files, covered_position_deletes, delete_triggered_files,
+    pack_file_groups_partition_aware,
 };
 /// Delete-aware bin-pack/sort rewrite primitives moved to `sqe-compaction`
 /// (Phase 4c Task 1) so the worker-side `compact_file_group` action can reuse
@@ -58,34 +60,22 @@ use sqe_compaction::{
     group_files_by_partition, plan_delete_aware_read, rewrite_group, SortCtx, SortSpec,
 };
 
+/// The catalog-only procedure cores and the helpers they share moved to
+/// `sqe-write` so the embedded CLI runs the same code; re-imported here so
+/// the rewrite paths, the scheduler and the tests keep calling them as
+/// `crate::maintenance::*`.
+pub(crate) use sqe_write::procedures::{
+    carry_rewrite_statistics, classify_commit_error, collect_health_inputs, current_manifest_count,
+    last_compaction_snapshot_ms, load_table, nested_namespace, reload_committed, summary_batch,
+    to_table_ident,
+};
+
 /// Callback that returns a snapshot of recent SQL query texts.
 ///
 /// Used by `suggest_bloom_filter_columns` to read the query log without
 /// pulling `QueryTracker` into the procedure AST. Returning owned `String`s
 /// keeps the closure simple and avoids lifetime gymnastics.
 pub type QueryHistoryFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
-
-/// Data files that either delete trigger marks for rewrite: at least
-/// `count` distinct delete files ([`delete_heavy_files`]), or a deleted-row
-/// share of at least `ratio` ([`delete_ratio_heavy_files`]). A count of 0
-/// and a ratio of 0 (or `None`) each mean that trigger is off, not "every
-/// file qualifies". Shared by both rewrite paths and by `table_health`, so
-/// the report and the rewrite can never disagree about which files are
-/// delete-heavy.
-pub(crate) fn delete_triggered_files(
-    tasks_by_path: &std::collections::HashMap<String, Vec<iceberg::scan::FileScanTask>>,
-    count: Option<usize>,
-    ratio: Option<f64>,
-) -> std::collections::HashSet<String> {
-    let mut out = match count {
-        Some(threshold) if threshold > 0 => delete_heavy_files(tasks_by_path, threshold),
-        _ => std::collections::HashSet::new(),
-    };
-    if let Some(ratio) = ratio.filter(|r| *r > 0.0) {
-        out.extend(delete_ratio_heavy_files(tasks_by_path, ratio));
-    }
-    out
-}
 
 /// Dispatcher for `CALL system.*` maintenance procedures.
 ///
@@ -478,20 +468,8 @@ impl MaintenanceHandler {
         }
     }
 
-    /// Move the `main` branch ref to an existing snapshot, repointing the
-    /// table's current snapshot. Both `set_current_snapshot` and
-    /// `rollback_to_snapshot` are this one metadata-only commit; the only
-    /// difference is `require_ancestor`:
-    ///
-    /// - `set_current_snapshot` (false): repoint to ANY snapshot in the table.
-    /// - `rollback_to_snapshot` (true): the target must be an ancestor of the
-    ///   current snapshot (you can only roll backward along the current
-    ///   history), matching Spark/Iceberg semantics and preventing an
-    ///   accidental forward jump onto a divergent line.
-    ///
-    /// No snapshots are removed — the snapshot log (audit trail) is preserved;
-    /// only the `main` pointer moves. SELECTs read the target state once the
-    /// table cache is invalidated below.
+    /// Move the `main` branch ref to an existing snapshot; the commit is
+    /// [`sqe_write::procedures::move_main_ref`].
     async fn move_main_ref(
         &self,
         session: &Session,
@@ -500,96 +478,28 @@ impl MaintenanceHandler {
         require_ancestor: bool,
         op_name: &'static str,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        use iceberg::spec::MAIN_BRANCH;
-
         let catalog = self
             .create_catalog_bridge(session, table_ref.catalog.as_deref())
             .await?;
         let ident = to_table_ident(table_ref);
-        let table = load_table(&catalog, &ident).await?;
-
-        let before = table.metadata().current_snapshot_id().unwrap_or(-1);
-
-        // Target must exist in the table's snapshot history.
-        if table.metadata().snapshot_by_id(snapshot_id).is_none() {
-            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                "CALL system.{op_name}: snapshot id {snapshot_id} not found in table '{ident}' history"
-            )));
-        }
-
-        // Rollback safety: target must be an ancestor of the current snapshot.
-        // Walk the parent chain from current; set_current_snapshot skips this.
-        if require_ancestor {
-            let mut cursor = table.metadata().current_snapshot_id();
-            let mut is_ancestor = false;
-            while let Some(id) = cursor {
-                if id == snapshot_id {
-                    is_ancestor = true;
-                    break;
-                }
-                cursor = table
-                    .metadata()
-                    .snapshot_by_id(id)
-                    .and_then(|s| s.parent_snapshot_id());
-            }
-            if !is_ancestor {
-                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "CALL system.rollback_to_snapshot: snapshot id {snapshot_id} is not an ancestor \
-                     of the current snapshot of '{ident}'; use set_current_snapshot to move to an \
-                     arbitrary snapshot"
-                )));
-            }
-        }
-
-        // Repoint `main` at the target. create_branch with the default
-        // if_not_exists=false updates the existing ref (if_not_exists=true
-        // would silently no-op on an existing branch). This resets main's
-        // retention to Branch{None,None,None}, which is the intended default
-        // for these operations.
-        let tx = Transaction::new(&table);
-        let action = tx.create_branch(MAIN_BRANCH).with_snapshot_id(snapshot_id);
-        let tx = action
-            .apply(tx)
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("{op_name} apply failed: {e}")))?;
-        let committed = tx
-            .commit(catalog.as_ref())
-            .await
-            .map_err(|e| classify_commit_error(e, op_name))?;
-
-        // Invalidate the table cache so subsequent SELECTs see the moved
-        // pointer immediately instead of a stale pre-move snapshot.
-        sqe_catalog::invalidate_rest_catalog_cache_all().await;
-
-        let after = committed.metadata().current_snapshot_id().unwrap_or(-1);
-
+        let rows = sqe_write::procedures::move_main_ref(
+            &catalog,
+            &ident,
+            snapshot_id,
+            require_ancestor,
+            op_name,
+        )
+        .await?;
         info!(
             user = %session.user.username,
             table = %ident,
-            before_snapshot = before,
-            after_snapshot = after,
-            "{op_name}: committed main ref move"
+            "{op_name}: main ref move committed"
         );
-
-        Ok(vec![summary_batch(
-            op_name,
-            &ident,
-            before,
-            after,
-            0,
-            0,
-            format!("snapshot {before} -> {after}"),
-        )?])
+        Ok(rows)
     }
 
-    /// Register an existing Iceberg table by pointing the catalog at its
-    /// `metadata.json`. No data movement; the catalog backend validates the
-    /// metadata file is readable and commits a pointer to it.
-    ///
-    /// Mirrors Spark's `CALL <catalog>.system.register_table(...)`. Useful
-    /// for the golden-dataset workflow (generate once, register into each
-    /// test catalog), catalog migration (drop on source + register on
-    /// destination = data-free move), and disaster recovery (rebuild the
-    /// catalog from intact S3 by re-registering every `metadata.json`).
+    /// Register an existing Iceberg table by its `metadata.json`; the
+    /// registration is [`sqe_write::procedures::register_table`].
     async fn register_table(
         &self,
         session: &Session,
@@ -608,44 +518,7 @@ impl MaintenanceHandler {
             "register_table: requesting catalog registration"
         );
 
-        let table = catalog
-            .register_table(&ident, metadata_location.to_string())
-            .await
-            .map_err(|e| classify_commit_error(e, "register_table"))?;
-
-        // Invalidate the table cache so subsequent SELECTs see the
-        // registration immediately. The cache key is the bearer token
-        // fingerprint plus the table identifier, so a stale "table not
-        // found" entry from an earlier load would otherwise mask the
-        // registered table for up to the cache TTL.
-        // Force every session to re-resolve the table on next access so the
-        // register / drop is visible without waiting for the soft TTL to
-        // expire. Cheap (one moka clear) and bounded to one catalog
-        // operation per CALL.
-        sqe_catalog::invalidate_rest_catalog_cache_all().await;
-
-        let snapshot_id = table
-            .metadata()
-            .current_snapshot()
-            .map(|s| s.snapshot_id())
-            .unwrap_or(0);
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("table_identifier", DataType::Utf8, false),
-            Field::new("snapshot_id", DataType::Int64, false),
-            Field::new("metadata_location", DataType::Utf8, false),
-            Field::new("status", DataType::Utf8, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec![ident.to_string()])),
-                Arc::new(Int64Array::from(vec![snapshot_id])),
-                Arc::new(StringArray::from(vec![metadata_location.to_string()])),
-                Arc::new(StringArray::from(vec!["registered"])),
-            ],
-        )
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("register_table summary: {e}")))?;
-        Ok(vec![batch])
+        sqe_write::procedures::register_table(&catalog, &ident, metadata_location).await
     }
 
     /// Drop a table from the catalog. `purge => false` removes the catalog
@@ -815,15 +688,8 @@ impl MaintenanceHandler {
         crate::suggest_bloom::suggest_bloom_filter_columns(table_ref, &queries, history_limit)
     }
 
-    /// Read-only compaction-debt report: `CALL system.table_health`.
-    ///
-    /// Collects the same file/delete/read-plan data `rewrite_data_files`
-    /// would use (`collect_live_data_files`, `collect_live_delete_files`,
-    /// `plan_delete_aware_read`), hands it to the pure
-    /// [`crate::table_health::analyze_table_health`], and returns the
-    /// resulting summary. Never mutates the table and never requires write
-    /// privilege (bypassed in [`authorize_or_deny`] like
-    /// `suggest_bloom_filter_columns`).
+    /// `CALL system.table_health`: the report is
+    /// [`sqe_write::procedures::table_health`].
     async fn table_health(
         &self,
         session: &Session,
@@ -833,31 +699,8 @@ impl MaintenanceHandler {
             .create_catalog_bridge(session, table_ref.catalog.as_deref())
             .await?;
         let ident = to_table_ident(table_ref);
-        let table = load_table(&catalog, &ident).await?;
-
-        let (data_files, delete_files, tasks_by_path) = collect_health_inputs(&table).await?;
-        let last_compaction_ms = last_compaction_snapshot_ms(&table);
-
-        let health = crate::table_health::analyze_table_health(
-            &data_files,
-            &delete_files,
-            &tasks_by_path,
-            &self.config.maintenance.compaction,
-            table.metadata().properties(),
-            last_compaction_ms,
-        );
-
-        info!(
-            table = %ident,
-            live_data_files = health.live_data_files,
-            small_files = health.small_files,
-            delete_files = health.delete_files,
-            delete_heavy_files = health.delete_heavy_files,
-            eligible_groups = health.eligible_groups,
-            "table_health: computed compaction-debt report"
-        );
-
-        Ok(vec![crate::table_health::table_health_batch(&health)])
+        sqe_write::procedures::table_health(&catalog, &ident, &self.config.maintenance.compaction)
+            .await
     }
 
     /// Authorization gate for `CALL system.*` (architecture review 510).
@@ -2528,6 +2371,8 @@ impl MaintenanceHandler {
         })
     }
 
+    /// `CALL system.expire_snapshots`: the expiry is
+    /// [`sqe_write::procedures::expire_snapshots`].
     async fn expire_snapshots(
         &self,
         session: &Session,
@@ -2539,84 +2384,14 @@ impl MaintenanceHandler {
             .create_catalog_bridge(session, table_ref.catalog.as_deref())
             .await?;
         let ident = to_table_ident(table_ref);
-        // Branches a crashed coordinator left behind go first, so their
-        // snapshots expire in this same call. Best-effort: a lost commit
-        // race leaves them for the next call, not this expiry undone.
-        let txn_branches = sqe_catalog::txn::drop_stale_branches(
-            catalog.as_ref(),
+        sqe_write::procedures::expire_snapshots(
+            &catalog,
             &ident,
-            chrono::Utc::now().timestamp_millis(),
+            older_than_ms,
+            retain_last,
+            self.table_cache.as_ref(),
         )
         .await
-        .unwrap_or_else(|e| {
-            warn!(
-                table = %ident,
-                error = %e,
-                "expire_snapshots: stale transaction branches not dropped"
-            );
-            Vec::new()
-        });
-        let table = load_table(&catalog, &ident).await?;
-
-        let before_count = table.metadata().snapshots().count() as i64;
-
-        let before_metadata = table.metadata_ref();
-        let tx = Transaction::new(&table);
-        let mut action = tx.expire_snapshots();
-        if let Some(ts) = older_than_ms {
-            action = action.expire_older_than_ms(ts);
-        }
-        if let Some(keep) = retain_last {
-            action = action.retain_last(keep);
-        }
-
-        let tx_applied = action
-            .apply(tx)
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("expire_snapshots apply failed: {e}")))?;
-
-        let committed = tx_applied
-            .commit(catalog.as_ref())
-            .await
-            .map_err(|e| classify_commit_error(e, "expire_snapshots"))?;
-        // Before the cleanup: a cached handle would still list the snapshots
-        // whose files are about to go.
-        self.invalidate_table_cache(&ident).await;
-
-        // The old fork's `clear_expire_files(true)` deleted the now-unreachable
-        // manifests / data files as part of the action; apache does it as a
-        // separate post-commit step. A cleanup failure does not undo the
-        // committed expiry, so it is surfaced as an error for the operator.
-        // The cleanup deletes through a reload of the committed table: the
-        // table a commit returns has no vended credential.
-        let committed = reload_committed(&catalog, &ident, &committed).await?;
-        committed
-            .cleanup_expired_files(&before_metadata)
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("expire_snapshots file cleanup failed after commit: {e}")))?;
-
-        let after_count = committed.metadata().snapshots().count() as i64;
-        let removed = before_count - after_count;
-
-        info!(
-            table = %ident,
-            before_count,
-            after_count,
-            removed,
-            "expire_snapshots: committed"
-        );
-
-        Ok(vec![summary_batch(
-            "expire_snapshots",
-            &ident,
-            before_count,
-            after_count,
-            0,
-            0,
-            format!(
-                "snapshots_removed={removed} txn_branches_dropped={}",
-                txn_branches.len()
-            ),
-        )?])
     }
 
     /// Drop the shared metadata cache entry for a table this handler just
@@ -2727,6 +2502,8 @@ impl MaintenanceHandler {
         )?])
     }
 
+    /// `CALL system.rewrite_manifests`: the rewrite is
+    /// [`sqe_write::procedures::rewrite_manifests`].
     async fn rewrite_manifests(
         &self,
         session: &Session,
@@ -2736,59 +2513,7 @@ impl MaintenanceHandler {
             .create_catalog_bridge(session, table_ref.catalog.as_deref())
             .await?;
         let ident = to_table_ident(table_ref);
-        let table = load_table(&catalog, &ident).await?;
-        let manifests_before = current_manifest_count(&table).await?;
-
-        let tx = Transaction::new(&table);
-        // Without a cluster function the action only applies manual
-        // add/delete calls, so the rewrite committed an unchanged manifest
-        // list (#815). One key merges every data manifest of a partition
-        // spec; the action still seals a manifest at
-        // `commit.manifest.target-size-bytes`. Delete manifests are kept.
-        let action = tx
-            .rewrite_manifests()
-            .cluster_by(Box::new(|_| String::new()));
-        let tx_applied = action.apply(tx).map_err(|e| {
-            SqeError::with_code(
-                SqeErrorCode::ExecutionFailed,
-                format!("rewrite_manifests apply failed: {e}"),
-            )
-        })?;
-
-        let committed = tx_applied
-            .commit(catalog.as_ref())
-            .await
-            .map_err(|e| classify_commit_error(e, "rewrite_manifests"))?;
-
-        // Manifest rewrite touches no data: the previous snapshot's Puffin
-        // NDV statistics remain exact for the new one (architecture review 512).
-        carry_rewrite_statistics(
-            &catalog,
-            &ident,
-            &table,
-            &committed,
-            self.metrics.as_deref(),
-        )
-        .await;
-
-        let manifests_after = current_manifest_count(&committed).await?;
-
-        info!(
-            table = %ident,
-            manifests_before,
-            manifests_after,
-            "rewrite_manifests: committed"
-        );
-
-        Ok(vec![summary_batch(
-            "rewrite_manifests",
-            &ident,
-            manifests_before,
-            manifests_after,
-            0,
-            0,
-            "committed".to_string(),
-        )?])
+        sqe_write::procedures::rewrite_manifests(&catalog, &ident, self.metrics.as_deref()).await
     }
 
     /// Sweep a namespace's warehouse prefix for S3 subdirectories that are
@@ -3481,175 +3206,10 @@ fn commit_backoff(attempt: usize) -> std::time::Duration {
     std::time::Duration::from_millis(50 * (1u64 << (attempt - 1)))
 }
 
-/// Translate an iceberg commit error into an SQE error, preserving retryable
-/// conflict signalling so callers can distinguish transient from permanent
-/// failures.
-fn classify_commit_error(err: iceberg::Error, proc: &str) -> SqeError {
-    let msg = err.to_string();
-    if msg.to_lowercase().contains("conflict") || msg.to_lowercase().contains("retry") {
-        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-            "{proc}: concurrent writer conflict (retryable): {msg}"
-        ))
-    } else {
-        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("{proc}: commit failed: {msg}"))
-    }
-}
-
-fn to_table_ident(table_ref: &TableRef) -> TableIdent {
-    let ns = nested_namespace(table_ref.namespace_parts());
-    TableIdent::new(ns, table_ref.name.clone())
-}
-
-/// `NamespaceIdent` from a CALL reference's levels (`a.b` -> `["a", "b"]`).
-pub(crate) fn nested_namespace(parts: Vec<String>) -> NamespaceIdent {
-    NamespaceIdent::from_vec(parts).expect("a dotted name splits into at least one part")
-}
-
-pub(crate) async fn load_table(
-    catalog: &Arc<dyn Catalog>,
-    ident: &TableIdent,
-) -> sqe_core::Result<IcebergTable> {
-    catalog
-        .load_table(ident)
-        .await
-        .map_err(|e| SqeError::Catalog(format!("Failed to load table '{ident}': {e}")))
-}
-
-/// The table a commit returned, reloaded before anything reads or deletes
-/// its files.
-///
-/// A REST commit's response carries metadata but no storage `config`, so
-/// the table the catalog builds from it has a `FileIO` with the catalog's
-/// own properties only: on a credential-vending catalog with no static
-/// warehouse key, its first file access fails with "failed to load signing
-/// credential" (portal request §2). Only `loadTable` vends the caller's
-/// credential. The reload must show the metadata this commit wrote; if
-/// another writer committed in between, the caller's file step is refused
-/// rather than run against metadata it did not produce.
-async fn reload_committed(
-    catalog: &Arc<dyn Catalog>,
-    ident: &TableIdent,
-    committed: &IcebergTable,
-) -> sqe_core::Result<IcebergTable> {
-    let reloaded = load_table(catalog, ident).await?;
-    if reloaded.metadata_location() != committed.metadata_location() {
-        return Err(SqeError::with_code(
-            SqeErrorCode::CommitConflict,
-            format!(
-                "table '{ident}' changed after this call's commit; the commit stands but no \
-                 file was deleted; system.remove_orphan_files removes what it left"
-            ),
-        ));
-    }
-    Ok(reloaded)
-}
-
-/// Carry the previous snapshot's Puffin statistics onto the snapshot
-/// `committed` made (a rewrite: the NDVs stay exact). Best effort, like the
-/// carry itself.
-///
-/// The sidecars are read and written through a fresh `loadTable`'s
-/// `FileIO`: the table a REST commit returns has no vended credential, and
-/// `loaded`'s may have expired during a long rewrite. `loaded` is the
-/// fallback when the reload fails.
-async fn carry_rewrite_statistics(
-    catalog: &Arc<dyn Catalog>,
-    ident: &TableIdent,
-    loaded: &IcebergTable,
-    committed: &IcebergTable,
-    metrics: Option<&sqe_metrics::MetricsRegistry>,
-) {
-    let reloaded = load_table(catalog, ident).await.ok();
-    let io = reloaded.as_ref().unwrap_or(loaded).file_io();
-    crate::puffin_carry::carry_forward_statistics(
-        catalog.as_ref(),
-        ident,
-        committed,
-        io,
-        crate::puffin_carry::CarryOp::Rewrite,
-        None,
-        metrics,
-    )
-    .await;
-}
-
-/// Collect the three inputs [`crate::table_health::analyze_table_health`]
-/// needs for one table, in the exact sequence `table_health()` (the `CALL
-/// system.table_health` handler, above) uses: live data files, live delete
-/// files, and the delete-aware read plan's per-path task map. Consolidated
-/// into one seam so the advisory scheduler (`maintenance_scheduler.rs`)
-/// promotes a single `pub(crate)` function instead of reaching into three
-/// private collectors plus the private `DeleteAwareReadPlan` struct.
-pub(crate) async fn collect_health_inputs(
-    table: &IcebergTable,
-) -> sqe_core::Result<(
-    Vec<DataFile>,
-    Vec<DataFile>,
-    std::collections::HashMap<String, Vec<iceberg::scan::FileScanTask>>,
-)> {
-    let data_files = collect_live_data_files(table).await?;
-    let delete_files = collect_live_delete_files(table).await?;
-    let read_plan = plan_delete_aware_read(table).await?;
-    Ok((data_files, delete_files, read_plan.tasks_by_path))
-}
-
-/// Manifests in `table`'s current snapshot, data and delete manifests
-/// together; 0 for a table with no snapshot. Reads the manifest list
-/// (through the table's object cache), not the snapshot summary, which
-/// carries no manifest count.
-pub(crate) async fn current_manifest_count(table: &IcebergTable) -> sqe_core::Result<i64> {
-    let metadata_ref = table.metadata_ref();
-    let Some(snapshot) = metadata_ref.current_snapshot() else {
-        return Ok(0);
-    };
-    let manifest_list = table
-        .object_cache()
-        .get_manifest_list(snapshot, &metadata_ref)
-        .await
-        .map_err(|e| SqeError::Execution(format!("failed to load manifest list: {e}")))?;
-    Ok(manifest_list.entries().len() as i64)
-}
-
-/// Table property prefix a compaction job stamps onto the snapshot it
-/// commits (`sqe.maintenance.job-id`, `sqe.maintenance.principal`,
-/// `sqe.maintenance.trigger`; see `active_one_table`'s `snapshot_properties`
-/// in `maintenance_scheduler.rs`). Shared here so
-/// [`last_compaction_snapshot_ms`] and the stamping call site can never
-/// disagree about which prefix marks a "this snapshot was a compaction job"
-/// snapshot.
-pub(crate) const MAINTENANCE_SNAPSHOT_PROPERTY_PREFIX: &str = "sqe.maintenance.";
-
 /// Table property a deleting `remove_orphan_files` commits (epoch ms of the
 /// run) before it deletes: the commit is the caller's write check.
 pub(crate) const ORPHAN_FILES_LAST_RUN_PROPERTY: &str =
     "sqe.maintenance.remove-orphan-files.last-run-ms";
-
-/// Timestamp (epoch ms) of the most recent snapshot in `table`'s snapshot
-/// log whose summary carries any `sqe.maintenance.*` property, or `None` if
-/// no snapshot ever did. Feeds
-/// [`crate::table_health::TableHealth::last_compaction_snapshot_ms`] (via
-/// its `analyze_table_health` parameter): `analyze_table_health` itself
-/// stays pure and never touches a live `IcebergTable`, so this is the one
-/// place that walks `table.metadata().snapshots()` to answer "when did a
-/// compaction job last touch this table."
-///
-/// Synchronous and I/O-free: `TableMetadata::snapshots()` only reads the
-/// already-loaded metadata, not the object store, so callers that already
-/// have a loaded `IcebergTable` (the `table_health` handler and the
-/// scheduler) can call this directly without an extra catalog round trip.
-pub(crate) fn last_compaction_snapshot_ms(table: &IcebergTable) -> Option<i64> {
-    table
-        .metadata()
-        .snapshots()
-        .filter(|s| {
-            s.summary()
-                .additional_properties
-                .keys()
-                .any(|k| k.starts_with(MAINTENANCE_SNAPSHOT_PROPERTY_PREFIX))
-        })
-        .map(|s| s.timestamp_ms())
-        .max()
-}
 
 /// Resolve the `strategy` / `sort_order` procedure args into a `SortSpec`,
 /// validated against the table schema. Returns `None` for the default bin-pack
@@ -3732,46 +3292,6 @@ fn parse_sort_spec(
         }
     }
     Ok(Some(spec))
-}
-
-/// Build a single-row `RecordBatch` describing the procedure's effect.
-/// Columns: procedure, table, input_count, output_count, input_bytes,
-/// output_bytes, status.
-fn summary_batch(
-    procedure: &str,
-    ident: &TableIdent,
-    input_count: i64,
-    output_count: i64,
-    input_bytes: i64,
-    output_bytes: i64,
-    status: String,
-) -> sqe_core::Result<RecordBatch> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("procedure", DataType::Utf8, false),
-        Field::new("table", DataType::Utf8, false),
-        Field::new("input_count", DataType::Int64, false),
-        Field::new("output_count", DataType::Int64, false),
-        Field::new("input_bytes", DataType::Int64, false),
-        Field::new("output_bytes", DataType::Int64, false),
-        Field::new("status", DataType::Utf8, false),
-    ]));
-
-    let table_str = format!("{}.{}", ident.namespace(), ident.name());
-
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(StringArray::from(vec![procedure])),
-            Arc::new(StringArray::from(vec![table_str.as_str()])),
-            Arc::new(Int64Array::from(vec![input_count])),
-            Arc::new(Int64Array::from(vec![output_count])),
-            Arc::new(Int64Array::from(vec![input_bytes])),
-            Arc::new(Int64Array::from(vec![output_bytes])),
-            Arc::new(StringArray::from(vec![status.as_str()])),
-        ],
-    )
-    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build summary batch: {e}")))?;
-    Ok(batch)
 }
 
 /// Blast-radius tier of a maintenance procedure; decides which gate

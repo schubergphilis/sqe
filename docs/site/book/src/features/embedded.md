@@ -195,7 +195,7 @@ Exporting results to plain files goes through `COPY ... TO`; see
 | Metadata tables (`orders$snapshots`) | yes | yes |
 | `CREATE BRANCH` / `CREATE TAG` | yes | yes |
 | `SET WRITE_BRANCH` / `RESET WRITE_BRANCH` | Iceberg tables | yes |
-| `CALL system.*` procedures | no | yes |
+| `CALL system.*` procedures | partly: `expire_snapshots`, `rewrite_manifests`, `set_current_snapshot`, `rollback_to_snapshot`, `register_table`, `table_health` | yes |
 | `ATTACH` / `DETACH`, `CREATE SECRET` | yes | yes |
 
 `SET WRITE_BRANCH` holds for the CLI process, as it does for a cluster
@@ -208,6 +208,17 @@ Metadata tables (`$snapshots`, `$history`, `$manifests`, `$files`,
 `$partitions`, `$refs`) read the catalog named in front of the table:
 `SELECT * FROM iceberg.sales."orders$snapshots"`. Without a catalog the
 table resolves only when exactly one Iceberg catalog is mounted.
+
+`CALL system.*` runs the six procedures above against an attached Iceberg
+catalog: the one named in the `table` argument, or the default catalog. They
+return the same columns as on a cluster, and a table they change is re-read
+by the next query. The other procedures (`rewrite_data_files`,
+`remove_orphan_files`, `purge_orphan_locations`, `drop_table`,
+`refresh_catalog_cache`, `reproject_column_tags`,
+`suggest_bloom_filter_columns`) answer that they are not available in
+embedded mode; use `DROP TABLE` instead of `system.drop_table`. See
+[CALL procedures](../sql-reference/procedures.md#embedded-mode) for how they
+are authorized.
 
 ## Cookbook
 

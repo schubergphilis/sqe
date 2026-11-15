@@ -392,6 +392,28 @@ pub fn delete_ratio_heavy_files(
     out
 }
 
+/// Data files that either delete trigger marks for rewrite: at least
+/// `count` distinct delete files ([`delete_heavy_files`]), or a deleted-row
+/// share of at least `ratio` ([`delete_ratio_heavy_files`]). A count of 0
+/// and a ratio of 0 (or `None`) each mean that trigger is off, not "every
+/// file qualifies". Shared by both rewrite paths and by `table_health`, so
+/// the report and the rewrite can never disagree about which files are
+/// delete-heavy.
+pub fn delete_triggered_files(
+    tasks_by_path: &HashMap<String, Vec<iceberg::scan::FileScanTask>>,
+    count: Option<usize>,
+    ratio: Option<f64>,
+) -> HashSet<String> {
+    let mut out = match count {
+        Some(threshold) if threshold > 0 => delete_heavy_files(tasks_by_path, threshold),
+        _ => HashSet::new(),
+    };
+    if let Some(ratio) = ratio.filter(|r| *r > 0.0) {
+        out.extend(delete_ratio_heavy_files(tasks_by_path, ratio));
+    }
+    out
+}
+
 /// Group every file of a partition into a single group, one group per
 /// partition, ignoring file size. Used by the sort/z-order strategy: the whole
 /// partition must be sorted as one stream so the rolling writer can cut it into
