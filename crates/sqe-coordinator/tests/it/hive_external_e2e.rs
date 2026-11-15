@@ -55,9 +55,13 @@
 //! Per Task 8's spec correction, Hive reads use the ENGINE's storage
 //! credentials (`[storage]` in config), never the caller's -- there is no
 //! mechanism to vend object-store credentials for a raw prefix. Per-user
-//! authorization survives entirely through `[storage.tvf]
-//! allowed_object_store_prefixes`, checked on every manifest load
+//! authorization survives through `[hive] allowed_data_prefixes` (#886;
+//! the deprecated fallback while it is unset is `[storage.tvf]
+//! allowed_object_store_prefixes`), checked on every manifest load
 //! (`HiveManifestStore::get`/`put`, `hive/store.rs`), not only at CREATE.
+//! File TVFs are refused under those prefixes and under every loaded
+//! table's location, so the engine's credentials are not a way around a
+//! Hive table's policy.
 //! `hive_load_denied_when_location_fails_the_storage_allowlist` below is
 //! the first test anywhere in this feature that exercises that gate
 //! against a real store rather than a local temp directory.
@@ -243,7 +247,18 @@ fn fresh_session() -> Session {
 /// (`s3://warehouse/hive-t11-wh/`) under the name `lake`. Returns the
 /// handler, a session, and the `MockServer` (kept alive: dropping it would
 /// close the port a later `flattened_catalogs()` call might still reach).
-async fn attached_handler(extra_prefixes: &[String]) -> (Session, QueryHandler, wiremock::MockServer) {
+async fn attached_handler(
+    extra_prefixes: &[String],
+) -> (Session, QueryHandler, wiremock::MockServer) {
+    attached_handler_with_hive_prefixes(extra_prefixes, &[]).await
+}
+
+/// [`attached_handler`] with `[hive] allowed_data_prefixes` set (#886).
+/// An empty `hive_prefixes` is the deprecated fallback to the TVF list.
+async fn attached_handler_with_hive_prefixes(
+    extra_prefixes: &[String],
+    hive_prefixes: &[String],
+) -> (Session, QueryHandler, wiremock::MockServer) {
     let mock = mock_polaris().await;
     let toml_text = format!(
         "[coordinator]\n\n[auth]\n\n[catalog]\ncatalog_url = \"{}\"\nwarehouse = \"test_warehouse\"\n\n\
@@ -255,6 +270,7 @@ async fn attached_handler(extra_prefixes: &[String]) -> (Session, QueryHandler, 
     let mut config: SqeConfig = toml::from_str(&toml_text).expect("test config parses");
     config.storage.tvf.allow_local_paths = false;
     config.storage.tvf.allowed_object_store_prefixes = extra_prefixes.to_vec();
+    config.hive.allowed_data_prefixes = hive_prefixes.to_vec();
 
     let tracker = Arc::new(QueryTracker::new(&config.query_history));
     let handler = QueryHandler::new(
@@ -628,6 +644,217 @@ async fn hive_load_denied_when_location_fails_the_storage_allowlist() {
         msg.contains("allowed_object_store_prefixes"),
         "error should name the allowlist gate that denied it: {msg}"
     );
+}
+
+/// `CREATE EXTERNAL TABLE lake.sales.<table>` over the partitioned CSV
+/// fixture at `s3://warehouse/<prefix>/`.
+fn create_csv_table_sql(table: &str, prefix: &str) -> String {
+    format!(
+        "CREATE EXTERNAL TABLE lake.sales.{table} (id BIGINT, amount DOUBLE) \
+         PARTITIONED BY (dt string) \
+         ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE \
+         LOCATION 's3://warehouse/{prefix}/' \
+         TBLPROPERTIES ('skip.header.line.count' = '1')"
+    )
+}
+
+/// #886 5.1: with `[hive] allowed_data_prefixes` set, Hive tables are gated
+/// by that list alone. No TVF prefix covers the data, yet create, SELECT
+/// and ADD PARTITION work; a location outside the Hive list is refused and
+/// the error names the Hive setting, not the TVF one.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn hive_data_prefixes_gate_tables_without_a_tvf_prefix_886() {
+    let store = s3_store();
+    reset_prefix(store.as_ref(), "hive-t11-wh/sales/dp886_orders").await;
+    reset_prefix(store.as_ref(), "hive-t11-wh/sales/dp886_outside").await;
+    reset_prefix(store.as_ref(), "hive-t11-raw/dp886/orders").await;
+    upload_partitioned_csv(store.as_ref(), "hive-t11-raw/dp886/orders").await;
+
+    let hive = vec![
+        "s3://warehouse/hive-t11-wh/".to_string(),
+        "s3://warehouse/hive-t11-raw/dp886/".to_string(),
+    ];
+    let (session, handler, _mock) = attached_handler_with_hive_prefixes(&[], &hive).await;
+
+    let create = create_csv_table_sql("dp886_orders", "hive-t11-raw/dp886/orders");
+    handler
+        .execute(&session, &create, None)
+        .await
+        .expect("create under a Hive data prefix needs no TVF prefix");
+    handler
+        .execute(&session, "MSCK REPAIR TABLE lake.sales.dp886_orders", None)
+        .await
+        .expect("msck repair under a Hive data prefix");
+    for (sql, expected, what) in [
+        (
+            "ALTER TABLE lake.sales.dp886_orders DROP PARTITION (dt='2026-01-02')",
+            2,
+            "drop",
+        ),
+        (
+            "ALTER TABLE lake.sales.dp886_orders ADD PARTITION (dt='2026-01-02') \
+             LOCATION 's3://warehouse/hive-t11-raw/dp886/orders/dt=2026-01-02/'",
+            3,
+            "add",
+        ),
+    ] {
+        handler
+            .execute(&session, sql, None)
+            .await
+            .unwrap_or_else(|e| panic!("{what} partition: {e}"));
+        assert_eq!(
+            count_of(
+                &handler,
+                &session,
+                "SELECT count(*) FROM lake.sales.dp886_orders"
+            )
+            .await,
+            expected,
+            "rows after {what} partition"
+        );
+    }
+
+    let outside = create_csv_table_sql("dp886_outside", "hive-t11-raw/orders");
+    let msg = handler
+        .execute(&session, &outside, None)
+        .await
+        .expect_err("a location outside the Hive data prefixes must be refused")
+        .to_string();
+    assert!(
+        msg.contains("allowed_data_prefixes"),
+        "error should name the Hive setting: {msg}"
+    );
+    assert!(
+        !object_exists(
+            store.as_ref(),
+            "hive-t11-wh/sales/dp886_outside/_sqe/table.json"
+        )
+        .await,
+        "a refused create must not write a manifest"
+    );
+}
+
+/// #886 5.2: a TVF prefix that overlaps a Hive data prefix does not let a
+/// file TVF read the table's files with the engine's credentials, even for
+/// an admin session. A file under the TVF prefix but outside the Hive one
+/// (a staging area) still reads, and the table itself still reads.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn file_tvf_refused_under_an_overlapping_hive_data_prefix_886() {
+    let store = s3_store();
+    reset_prefix(store.as_ref(), "hive-t11-wh/sales/dp886_overlap").await;
+    reset_prefix(store.as_ref(), "hive-t11-raw/dp886_overlap").await;
+    reset_prefix(store.as_ref(), "hive-t11-raw/dp886_staging").await;
+    upload_partitioned_csv(store.as_ref(), "hive-t11-raw/dp886_overlap/orders").await;
+    upload_partitioned_csv(store.as_ref(), "hive-t11-raw/dp886_staging").await;
+
+    let tvf = vec!["s3://warehouse/hive-t11-raw/".to_string()];
+    let hive = vec![
+        "s3://warehouse/hive-t11-wh/".to_string(),
+        "s3://warehouse/hive-t11-raw/dp886_overlap/".to_string(),
+    ];
+    let (session, handler, _mock) = attached_handler_with_hive_prefixes(&tvf, &hive).await;
+
+    let create = create_csv_table_sql("dp886_overlap", "hive-t11-raw/dp886_overlap/orders");
+    handler
+        .execute(&session, &create, None)
+        .await
+        .expect("create");
+    assert_eq!(
+        count_of(
+            &handler,
+            &session,
+            "SELECT count(*) FROM lake.sales.dp886_overlap"
+        )
+        .await,
+        3,
+        "the Hive table itself still reads"
+    );
+
+    // The registry is process-wide, so the directory above the data may
+    // also overlap a table another test in this binary loaded; it is
+    // refused either way, only the reason named differs.
+    for (path, reason) in [
+        (
+            "s3://warehouse/hive-t11-raw/dp886_overlap/orders/dt=2026-01-01/a.csv",
+            "overlaps the Hive data prefix",
+        ),
+        (
+            "s3://warehouse/hive-t11-raw/dp886_overlap/orders/*/a.csv",
+            "overlaps the Hive data prefix",
+        ),
+        (
+            "s3://warehouse/hive-t11-raw/",
+            "File TVFs do not read Hive table data",
+        ),
+    ] {
+        let sql = format!("SELECT count(*) FROM read_csv('{path}')");
+        let msg = handler
+            .execute(&session, &sql, None)
+            .await
+            .expect_err("a file TVF over Hive table data must be refused")
+            .to_string();
+        assert!(msg.contains(reason), "{path}: expected '{reason}': {msg}");
+    }
+
+    let staging = "SELECT count(*) FROM read_csv('s3://warehouse/hive-t11-raw/dp886_staging/dt=2026-01-01/a.csv')";
+    handler
+        .execute(&session, staging, None)
+        .await
+        .expect("a TVF prefix path outside the Hive data prefixes still reads");
+}
+
+/// #886 5.3: in the deprecated fallback (no Hive prefix configured), a
+/// Hive table's location is protected from file TVFs once it is created
+/// or loaded, though the TVF list covers it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn file_tvf_refused_over_a_loaded_hive_table_in_fallback_886() {
+    let store = s3_store();
+    reset_prefix(store.as_ref(), "hive-t11-wh/sales/dp886_fallback").await;
+    reset_prefix(store.as_ref(), "hive-t11-raw/dp886_fallback").await;
+    upload_partitioned_csv(store.as_ref(), "hive-t11-raw/dp886_fallback/orders").await;
+    upload_partitioned_csv(store.as_ref(), "hive-t11-raw/dp886_fallback/loose").await;
+
+    let tvf = vec![
+        "s3://warehouse/hive-t11-wh/".to_string(),
+        "s3://warehouse/hive-t11-raw/".to_string(),
+    ];
+    let (session, handler, _mock) = attached_handler(&tvf).await;
+
+    let create = create_csv_table_sql("dp886_fallback", "hive-t11-raw/dp886_fallback/orders");
+    handler
+        .execute(&session, &create, None)
+        .await
+        .expect("create");
+    assert_eq!(
+        count_of(
+            &handler,
+            &session,
+            "SELECT count(*) FROM lake.sales.dp886_fallback"
+        )
+        .await,
+        3,
+        "the Hive table itself still reads"
+    );
+
+    let table_file = "SELECT count(*) FROM read_csv('s3://warehouse/hive-t11-raw/dp886_fallback/orders/dt=2026-01-01/a.csv')";
+    let msg = handler
+        .execute(&session, table_file, None)
+        .await
+        .expect_err("a file TVF over a Hive table's files must be refused")
+        .to_string();
+    assert!(
+        msg.contains("overlaps the location of a Hive table"),
+        "error should say why without naming the table: {msg}"
+    );
+
+    let loose = "SELECT count(*) FROM read_csv('s3://warehouse/hive-t11-raw/dp886_fallback/loose/dt=2026-01-01/a.csv')";
+    handler
+        .execute(&session, loose, None)
+        .await
+        .expect("a sibling of the table location still reads");
 }
 
 /// #815: a Hive scan on real RustFS shows up in the object-store request

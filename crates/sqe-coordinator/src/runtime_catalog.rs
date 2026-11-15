@@ -410,7 +410,9 @@ pub async fn attach_configured_hive_roots(
     };
     let metadata_timeout = (hive_config.metadata_timeout_secs > 0)
         .then(|| std::time::Duration::from_secs(hive_config.metadata_timeout_secs));
+    let data_policy = sqe_core::config::HiveDataPolicy::from_config(hive_config, &storage.tvf);
     for root in &hive_config.roots {
+        let data = data_policy.for_root(root);
         if root.name == default_catalog {
             return Err(format!(
                 "[[hive.roots]] '{}' collides with the session default catalog '{default_catalog}': \
@@ -427,6 +429,7 @@ pub async fn attach_configured_hive_roots(
                     &root.location,
                     &std::collections::BTreeMap::new(),
                     storage,
+                    data,
                     limits,
                     sqe_core::config::TvfCaller::trusted_startup_config(),
                 )
@@ -435,7 +438,7 @@ pub async fn attach_configured_hive_roots(
                 sqe_catalog::hive::source::HiveRoot::from_store(store)
             }
             sqe_core::config::HiveRootKind::Glue => {
-                build_glue_hive_root(root, limits, metadata_timeout).await?
+                build_glue_hive_root(root, data, limits, metadata_timeout).await?
             }
         };
         // Every metadata read on the root is cut at `metadata_timeout`
@@ -457,6 +460,7 @@ pub async fn attach_configured_hive_roots(
 #[cfg(feature = "glue")]
 async fn build_glue_hive_root(
     root: &sqe_core::config::HiveRootConfig,
+    data: sqe_core::config::HiveDataPolicy,
     limits: sqe_catalog::hive::manifest::ManifestLimits,
     timeout: Option<std::time::Duration>,
 ) -> Result<sqe_catalog::hive::source::HiveRoot, String> {
@@ -468,12 +472,15 @@ async fn build_glue_hive_root(
         timeout,
     )
     .await;
-    Ok(sqe_catalog::hive::source::HiveRoot::from_source(source))
+    Ok(sqe_catalog::hive::source::HiveRoot::from_source(
+        source, data,
+    ))
 }
 
 #[cfg(not(feature = "glue"))]
 async fn build_glue_hive_root(
     root: &sqe_core::config::HiveRootConfig,
+    _data: sqe_core::config::HiveDataPolicy,
     _limits: sqe_catalog::hive::manifest::ManifestLimits,
     _timeout: Option<std::time::Duration>,
 ) -> Result<sqe_catalog::hive::source::HiveRoot, String> {
@@ -497,6 +504,7 @@ mod hive_lane_tests {
             &format!("file://{}", dir.display()),
             &std::collections::BTreeMap::new(),
             &storage,
+            storage.tvf.clone().into(),
             sqe_catalog::hive::manifest::ManifestLimits::default(),
             sqe_core::config::TvfCaller::trusted_local(),
         )
@@ -733,6 +741,7 @@ mod hive_lane_tests {
                 name: "lake".to_string(),
                 location: format!("file://{}", dir.path().display()),
                 secret: None,
+                data_prefixes: Vec::new(),
             }],
             ..sqe_core::config::HiveConfig::default()
         };
@@ -766,6 +775,7 @@ mod hive_lane_tests {
                 name: "lake".to_string(),
                 location: format!("file://{}", dir.path().display()),
                 secret: None,
+                data_prefixes: Vec::new(),
             }],
             ..sqe_core::config::HiveConfig::default()
         };
@@ -794,6 +804,7 @@ mod hive_lane_tests {
                 name: "lake".to_string(),
                 location: "/no/such/warehouse".to_string(),
                 secret: None,
+                data_prefixes: Vec::new(),
             }],
             ..sqe_core::config::HiveConfig::default()
         };

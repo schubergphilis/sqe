@@ -145,7 +145,7 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 #[cfg(feature = "hive-external")]
 use object_store::ObjectStore;
 #[cfg(feature = "hive-external")]
-use sqe_core::config::{StorageConfig, TvfCaller};
+use sqe_core::config::{HiveDataPolicy, StorageConfig, TvfCaller};
 
 /// Validate a Hive warehouse root and build the shared, session-independent
 /// manifest store every session's provider borrows.
@@ -153,8 +153,9 @@ use sqe_core::config::{StorageConfig, TvfCaller};
 /// Never lists or HEADs the root: a root is registered lazily (there is no
 /// notion of "creating" a Hive warehouse root the way `CREATE SCHEMA` creates
 /// an Iceberg namespace), so attaching a prefix that does not exist yet, or
-/// is still empty, must succeed. The only check performed is the
-/// `[storage.tvf]` allowlist via `storage.tvf.check_path`, and that a root
+/// is still empty, must succeed. The only check performed is the Hive data
+/// prefixes via `data.check_location` (#886: `[hive] allowed_data_prefixes`,
+/// or the `[storage.tvf]` list while no Hive prefix is set), and that a root
 /// name does not collide with an already-registered catalog is the caller's
 /// responsibility (this function has no registry to check against; see the
 /// module doc comment on `sqe_policy_api::HiveCatalogs` for why that check
@@ -177,6 +178,7 @@ pub async fn build_hive_root(
     location: &str,
     _options: &BTreeMap<String, OptionValue>,
     storage: &StorageConfig,
+    data: HiveDataPolicy,
     limits: crate::hive::manifest::ManifestLimits,
     caller: TvfCaller,
 ) -> Result<Arc<crate::hive::store::HiveManifestStore>, String> {
@@ -185,9 +187,9 @@ pub async fn build_hive_root(
         return Err("location must not be empty for TYPE hive_external".to_string());
     }
 
-    storage
-        .tvf
-        .check_path(trimmed, &caller, false)
+    // The root itself is not recorded as protected: only table and
+    // partition locations are Hive data.
+    data.check_location(trimmed, &caller)
         .map_err(|e| format!("ATTACH (TYPE hive_external) failed: {e}"))?;
 
     let root = datafusion::datasource::listing::ListingTableUrl::parse(trimmed).map_err(|e| {
@@ -197,11 +199,7 @@ pub async fn build_hive_root(
         .map_err(|e| format!("ATTACH (TYPE hive_external) failed: {e}"))?;
 
     Ok(Arc::new(crate::hive::store::HiveManifestStore::new(
-        root,
-        store,
-        limits,
-        storage.tvf.clone(),
-        caller,
+        root, store, limits, data, caller,
     )))
 }
 
@@ -244,6 +242,7 @@ pub async fn build_glue_root(
 pub fn session_hive_catalog_from_source(
     name: &str,
     source: Arc<dyn crate::hive::source::HiveMetadataSource>,
+    data: HiveDataPolicy,
     storage: &StorageConfig,
     secrets: &SecretStore,
     caller: TvfCaller,
@@ -251,12 +250,9 @@ pub fn session_hive_catalog_from_source(
     manifest_cache: Arc<crate::hive::provider::HiveMetadataCache>,
     cache_ttl: std::time::Duration,
 ) -> Arc<crate::hive::provider::HiveCatalogProvider> {
-    let factory: Arc<dyn crate::hive::provider::HiveDataStoreFactory> =
-        Arc::new(EngineHiveDataStoreFactory::new(
-            storage.clone(),
-            secrets.clone(),
-            caller,
-        ));
+    let factory: Arc<dyn crate::hive::provider::HiveDataStoreFactory> = Arc::new(
+        EngineHiveDataStoreFactory::new(storage.clone(), data, secrets.clone(), caller),
+    );
     Arc::new(crate::hive::provider::HiveCatalogProvider::with_source(
         name.to_string(),
         source,
@@ -300,6 +296,7 @@ pub fn session_hive_catalog(
     let factory: Arc<dyn crate::hive::provider::HiveDataStoreFactory> =
         Arc::new(EngineHiveDataStoreFactory::new(
             storage.clone(),
+            root.data_policy().clone(),
             secrets.clone(),
             caller,
         ));
@@ -324,6 +321,9 @@ pub fn session_hive_catalog(
 #[cfg(feature = "hive-external")]
 struct EngineHiveDataStoreFactory {
     storage: StorageConfig,
+    /// Which locations this root's tables may reach (#886), and the
+    /// registry that keeps file TVFs off them once they are loaded.
+    data: HiveDataPolicy,
     secrets: SecretStore,
     caller: TvfCaller,
     /// Built stores by `(bucket or scheme root, secret name)`. A scan over a
@@ -346,9 +346,15 @@ const STORE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300)
 
 #[cfg(feature = "hive-external")]
 impl EngineHiveDataStoreFactory {
-    fn new(storage: StorageConfig, secrets: SecretStore, caller: TvfCaller) -> Self {
+    fn new(
+        storage: StorageConfig,
+        data: HiveDataPolicy,
+        secrets: SecretStore,
+        caller: TvfCaller,
+    ) -> Self {
         Self {
             storage,
+            data,
             secrets,
             caller,
             stores: moka::sync::Cache::builder()
@@ -394,10 +400,14 @@ impl crate::hive::provider::HiveDataStoreFactory for EngineHiveDataStoreFactory 
         location: &str,
         secret: Option<&str>,
     ) -> Result<Arc<dyn ObjectStore>, crate::hive::HiveError> {
-        self.storage
-            .tvf
-            .check_path(location, &self.caller, false)
+        // The table location comes through here before any partition's
+        // (`provider.rs` asks for the table's store first), so recording it
+        // protects the whole table and later partitions under it are
+        // already covered. For a Glue root this is the only gate.
+        self.data
+            .check_location(location, &self.caller)
             .map_err(crate::hive::HiveError::Forbidden)?;
+        self.data.protect_location(location);
 
         let key = (Self::store_key(location), secret.map(str::to_string));
         if let Some(store) = self.stores.get(&key) {
@@ -1715,6 +1725,7 @@ mod hive_factory_debug_tests {
     fn debug_impl_does_not_panic_and_omits_credential_fields() {
         let factory = EngineHiveDataStoreFactory::new(
             StorageConfig::default(),
+            StorageConfig::default().tvf.into(),
             SecretStore::new(),
             TvfCaller::for_user("alice".to_string(), Vec::new()),
         );
@@ -1749,7 +1760,8 @@ mod hive_factory_debug_tests {
         let mut storage = StorageConfig::default();
         storage.tvf.allow_local_paths = true;
         let factory = EngineHiveDataStoreFactory::new(
-            storage,
+            storage.clone(),
+            storage.tvf.into(),
             SecretStore::new(),
             TvfCaller::trusted_local(),
         );

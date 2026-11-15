@@ -704,6 +704,7 @@ pub async fn create_session_context(
                 let hive_provider = sqe_catalog::mount::session_hive_catalog_from_source(
                     name,
                     root.source(),
+                    root.data_policy().clone(),
                     &global_storage,
                     secrets,
                     hive_caller,

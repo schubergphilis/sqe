@@ -213,6 +213,22 @@ prefetch_buffer = "32MB"        # Prefetch buffer for overlapping footer reads
 # coalesce_threshold and footer_cache_size are documented in
 # architecture/streaming-execution.md alongside the S3 I/O pipeline.
 
+[storage.tvf]
+# Paths file TVFs (read_parquet, read_csv, read_json) may read with the
+# engine's credentials. Server mode denies every object-store path not
+# listed. Never list table data: see features/read-parquet.md.
+allowed_object_store_prefixes = []   # e.g. ["s3://landing/{user}/"]
+allow_local_paths = false
+allow_http = false
+
+[hive]
+# Where Hive external table data may live, checked for the session
+# user on CREATE, ADD PARTITION and every load. File TVFs are refused under
+# these prefixes. A [[hive.roots]] entry adds `data_prefixes` of its own.
+# While neither is set, the [storage.tvf] list is used instead (deprecated;
+# see reference/hive-external-tables.md).
+allowed_data_prefixes = []           # e.g. ["s3://lake/hive/"]
+
 # Access control and policy are two independent axes. See
 # [GRANT and REVOKE](../sql-reference/grant-revoke.md) for the full model.
 

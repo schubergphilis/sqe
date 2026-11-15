@@ -38,6 +38,7 @@ async fn attach_rejects_a_root_location_that_fails_the_allowlist() {
         "file:///etc",
         &BTreeMap::new(),
         &StorageConfig::default(),
+        StorageConfig::default().tvf.into(),
         sqe_catalog::hive::manifest::ManifestLimits::default(),
         sqe_core::config::TvfCaller::default(),
     )
@@ -76,6 +77,7 @@ async fn attach_accepts_an_s3_root_without_touching_the_network() {
         "s3://bucket/wh/",
         &BTreeMap::new(),
         &storage,
+        storage.tvf.clone().into(),
         sqe_catalog::hive::manifest::ManifestLimits::default(),
         sqe_core::config::TvfCaller::default(),
     )
@@ -115,6 +117,7 @@ async fn attach_accepts_an_empty_local_root() {
         &location,
         &BTreeMap::new(),
         &storage,
+        storage.tvf.clone().into(),
         sqe_catalog::hive::manifest::ManifestLimits::default(),
         sqe_core::config::TvfCaller::trusted_local(),
     )
@@ -144,6 +147,7 @@ async fn session_hive_catalog_resolves_a_table_written_through_the_shared_root()
         &format!("file://{}", dir.path().display()),
         &BTreeMap::new(),
         &storage,
+        storage.tvf.clone().into(),
         sqe_catalog::hive::manifest::ManifestLimits::default(),
         caller.clone(),
     )
@@ -225,6 +229,7 @@ async fn build_hive_root_wires_max_bytes_into_the_store_it_returns() {
         &format!("file://{}", dir.path().display()),
         &BTreeMap::new(),
         &storage,
+        storage.tvf.clone().into(),
         tiny_limits,
         sqe_core::config::TvfCaller::trusted_local(),
     )
@@ -388,6 +393,7 @@ async fn a_missing_manifest_secret_errors_naming_the_secret() {
         &format!("file://{}", dir.path().display()),
         &BTreeMap::new(),
         &storage,
+        storage.tvf.clone().into(),
         sqe_catalog::hive::manifest::ManifestLimits::default(),
         caller.clone(),
     )

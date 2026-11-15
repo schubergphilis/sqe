@@ -72,6 +72,13 @@ path falls under an allowed prefix. The same rule covers `read_csv` and
 allowed_object_store_prefixes = ["s3://shared-landing/", "s3://scratch/{user}/"]
 ```
 
+A path under a Hive external table's data is refused even when a prefix
+covers it, for every caller: under `[hive] allowed_data_prefixes`, and
+under the location of any Hive table the coordinator has loaded. Query
+the Hive table instead, so its row filters and masks apply. A call that
+passes its own credentials is not refused. See
+[Hive external tables](../reference/hive-external-tables.md#where-table-data-may-live).
+
 A catalog can add prefixes of its own. They apply only to sessions scoped to
 that catalog, so one coordinator can serve several workspaces that each read
 only their own landing buckets:

@@ -1518,6 +1518,34 @@ fn load_config_or_default(path: &str) -> anyhow::Result<SqeConfig> {
     }
 }
 
+/// Startup notes for the Hive data prefixes (#886). An overlap between a
+/// TVF prefix and a Hive data prefix is logged as an error, not refused:
+/// the TVF refusal already keeps file TVFs out of the overlap, and the
+/// operator should drop it from the TVF list. Hive roots still gated by the
+/// TVF list get the deprecation warning: the fallback goes in the next
+/// release.
+fn log_hive_data_prefix_config(config: &SqeConfig) {
+    for (section, tvf_prefix, hive_prefix) in sqe_core::config::hive_tvf_overlaps(config) {
+        tracing::error!(
+            %section, %tvf_prefix, %hive_prefix,
+            "TVF prefix overlaps a Hive data prefix: file TVFs are refused there; \
+             remove it from the TVF list"
+        );
+    }
+    if !config.hive.roots.is_empty()
+        && sqe_core::config::configured_hive_prefixes(&config.hive)
+            .next()
+            .is_none()
+    {
+        tracing::warn!(
+            "Hive table locations are checked against [storage.tvf] \
+             allowed_object_store_prefixes because no [hive] allowed_data_prefixes or \
+             root data_prefixes is set. This fallback is deprecated and goes in the next \
+             release; set [hive] allowed_data_prefixes"
+        );
+    }
+}
+
 async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -1675,6 +1703,7 @@ async fn async_main() -> anyhow::Result<()> {
             catalog_id: None,
             databases: cli.glue_database.clone(),
             secret: None,
+            data_prefixes: Vec::new(),
         });
     }
 
@@ -1693,6 +1722,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     let config = config;
     config.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
+    log_hive_data_prefix_config(&config);
     sqe_catalog::rest_catalog::configure_breaker_failure_classes(
         &config.catalog.circuit_breaker_failure_classes,
     )
@@ -3376,6 +3406,7 @@ token_endpoint = "http://127.0.0.1:1/token"
             catalog_id: None,
             databases: Vec::new(),
             secret: None,
+            data_prefixes: Vec::new(),
         });
         let serving = serving_status(&config);
         assert_eq!(serving.mode, "mcp-only");

@@ -42,7 +42,7 @@ allow_http = false
 allowed_object_store_prefixes = ["s3://your-landing/{user}/"]
 ```
 
-Never list a warehouse or any other location that holds table files. File TVFs read with the engine's credentials, so a prefix over a table's files lets a caller read them raw, without the table's row filters and masks. Keep staging and landing data in a bucket or root outside every catalog's `allowedLocations`.
+Never list a warehouse or any other location that holds table files. File TVFs read with the engine's credentials, so a prefix over a table's files lets a caller read them raw, without the table's row filters and masks. Hive external table data goes in `[hive] allowed_data_prefixes`, not here: file TVFs are refused under that list, and startup logs an error for every TVF prefix that overlaps it. Keep staging and landing data in a bucket or root outside every catalog's `allowedLocations`.
 
 Keep the global list to what every user may read. A bucket that belongs to
 one workspace goes in that catalog's `tvf_prefixes` instead, so only sessions
