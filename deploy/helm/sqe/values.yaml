@@ -188,6 +188,16 @@ config:
     # client_secret: set via secret or env override
     token_refresh_buffer_secs: 60
     ssl_verification: true
+    # [[auth.providers]] chain (#899). When non-empty it replaces the legacy
+    # keycloak_url/realm endpoint above, which reads no groups. Each entry is
+    # one provider table, keys as in sqe.toml.example. Ranger grants by group,
+    # so production_mode with policy.engine=ranger needs groups_claim on every
+    # oidc_password / bearer_token provider. client_secret: env override.
+    providers: []
+    # - type: oidc_password
+    #   token_url: "https://keycloak.example.com/realms/iceberg/protocol/openid-connect/token"
+    #   client_id: "sqe-client"
+    #   groups_claim: "groups"
 
   catalog:
     catalog_url: "http://polaris:8181/api/catalog"
@@ -233,6 +243,10 @@ config:
     # production_mode refuses the plaintext Trino HTTP listener unless a
     # TLS-terminating ingress/proxy fronts it and this says so.
     allow_plaintext_behind_tls_proxy: false
+    # production_mode with policy.engine=ranger refuses providers without a
+    # groups_claim (group grants would match nobody) unless this says every
+    # Ranger item names users (#899).
+    allow_tokens_without_groups: false
 
   metrics:
     prometheus_port: 9090

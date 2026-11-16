@@ -310,6 +310,15 @@ allow_insecure_transport = true  # dev only -- enable TLS for production
 # production_mode refuses Ranger with project-tags off unless this is set
 # true (SQE-only Ranger deploys that never talk to Spark).
 # allow_unprojected_tags = false
+#
+# allow_tokens_without_groups (issue #899): Ranger grants, masks and row
+# filters by group. A token read without a groups_claim leaves the session
+# with no groups, so every group item matches nobody. production_mode
+# refuses engine = ranger when an oidc_password / bearer_token provider has
+# an empty groups_claim, or when [[auth.providers]] is empty (the legacy
+# [auth] block reads no groups), unless this is set true (every Ranger item
+# names users).
+# allow_tokens_without_groups = false
 
 [policy]
 engine = "passthrough"

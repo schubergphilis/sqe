@@ -301,6 +301,26 @@ pub const PRODUCTION_RULES: &[ProductionRule] = &[
                 })
         },
     },
+    ProductionRule {
+        name: "ranger-groups-claim",
+        summary: "With `policy.engine = ranger`, every `oidc_password` / `bearer_token` provider must set `groups_claim`, and the legacy `[auth]` block (no `auth.providers`) is refused, unless `security.allow_tokens_without_groups = true` (group grants and masks would match nobody).",
+        check: |c| {
+            if c.policy.engine != PolicyEngine::Ranger || c.security.allow_tokens_without_groups {
+                return None;
+            }
+            let offenders = groupless_providers(c);
+            (!offenders.is_empty()).then(|| {
+                format!(
+                    "production_mode: policy.engine is ranger but {} read no groups from the \
+                     token, so every Ranger group grant, mask and row filter matches nobody. \
+                     Set groups_claim (for example \"groups\") on each oidc_password / \
+                     bearer_token provider, or set security.allow_tokens_without_groups = true \
+                     when every Ranger item names users.",
+                    offenders.join(", ")
+                )
+            })
+        },
+    },
     // Finding 751: three more dev-only switches that used to start silently.
     ProductionRule {
         name: "no-hmac-tickets",
@@ -436,6 +456,31 @@ pub const PRODUCTION_RULES: &[ProductionRule] = &[
         },
     },
 ];
+
+/// The auth sources that leave a session with no groups (issue #899): each
+/// `oidc_password` / `bearer_token` provider with an empty `groups_claim`, as
+/// `auth.providers[i] (<type>)`, or the legacy `[auth]` block when
+/// `auth.providers` is empty (it never reads groups). Providers without a
+/// `groups_claim` field are not counted; they cannot be fixed by setting one.
+fn groupless_providers(c: &SqeConfig) -> Vec<String> {
+    if c.auth.providers.is_empty() {
+        return vec!["the legacy [auth] block (no auth.providers)".to_string()];
+    }
+    c.auth
+        .providers
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| match p {
+            AuthProviderConfig::OidcPassword { groups_claim, .. } if groups_claim.is_empty() => {
+                Some(format!("auth.providers[{i}] (oidc_password)"))
+            }
+            AuthProviderConfig::BearerToken { groups_claim, .. } if groups_claim.is_empty() => {
+                Some(format!("auth.providers[{i}] (bearer_token)"))
+            }
+            _ => None,
+        })
+        .collect()
+}
 
 /// Every rule `config` violates, in table order. Empty means production mode
 /// is satisfied.
