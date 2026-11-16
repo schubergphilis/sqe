@@ -35,7 +35,13 @@ A DB-API connection starts in a transaction, as the DB-API spec requires. `INSER
 
 #### Bulk ingest
 
-`cursor.adbc_ingest` sends a Flight SQL `CommandStatementIngest` over `DoPut`. The reply carries the number of rows written. It does not carry the new snapshot id: arrow-flight fixes that reply to a row count. To find the snapshot, read `table_snapshots('<schema>', '<table>')` after the ingest. A snapshot property you set on the ingest is the most reliable way to pick it out.
+`cursor.adbc_ingest` sends a Flight SQL `CommandStatementIngest` over `DoPut`. The reply message carries the number of rows written; arrow-flight fixes that message to a row count. The id of the snapshot the ingest committed travels in the gRPC trailing metadata instead, as `x-sqe-snapshot-id` (a decimal `i64`). The trailer is sent after a create or append commits to the table. It is absent when:
+
+- the ingest runs inside a transaction (the snapshot only lands on the table at COMMIT);
+- the ingest replaces the table (`TableExistsOption::Replace`);
+- the ingest failed.
+
+The ADBC drivers do not expose trailing metadata. A client on a gRPC library that does (tonic's `Streaming::trailers`, a grpc-java `ClientInterceptor`, Go's `grpc.Trailer`) reads the id directly. Otherwise read `table_snapshots('<schema>', '<table>')` after the ingest; a snapshot property you set on the ingest is the most reliable way to pick the snapshot out.
 
 To stamp the ingest's snapshot summary, send ingest options named `snapshot-property.<key>` in `CommandStatementIngest.options`. For example, `snapshot-property.run_id = 2026-11-16-a` puts the key `run_id` in that snapshot's summary. The options apply to that one request only and are merged over any `SET SNAPSHOT_PROPERTIES` in force for the session or transaction. The keys follow the same rules as `SET SNAPSHOT_PROPERTIES`:
 

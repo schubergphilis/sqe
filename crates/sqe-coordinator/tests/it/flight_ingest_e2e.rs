@@ -126,6 +126,7 @@ impl IngestServer {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             Server::builder()
+                .layer(sqe_coordinator::flight_trailers::SnapshotTrailerLayer)
                 .add_service(FlightServiceServer::new(service))
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                     let _ = rx.await;
@@ -307,6 +308,34 @@ async fn ingest_announcing_schema(
     let update: DoPutUpdateResult = prost::Message::decode(&*result.app_metadata)
         .map_err(|e| arrow_flight::error::FlightError::DecodeError(e.to_string()))?;
     Ok(update.record_count)
+}
+
+/// Send `batches` as one `DoPut` ingest; returns the server's count and the
+/// `x-sqe-snapshot-id` trailer, read after the response stream ends (#904).
+async fn ingest_reading_snapshot_trailer(
+    client: &mut FlightSqlServiceClient<Channel>,
+    command: CommandStatementIngest,
+    batches: Vec<RecordBatch>,
+) -> (i64, Option<i64>) {
+    let descriptor = FlightDescriptor::new_cmd(prost::Message::encode_to_vec(&command.as_any()));
+    let data = FlightDataEncoderBuilder::new()
+        .with_flight_descriptor(Some(descriptor))
+        .with_schema(ingest_schema())
+        .build(futures::stream::iter(batches.into_iter().map(Ok)))
+        .map(|frame| frame.expect("the batches encode"));
+    let mut responses = client.do_put(data).await.expect("ingest");
+    let mut count = None;
+    while let Some(result) = responses.message().await.expect("a PutResult") {
+        let update: DoPutUpdateResult =
+            prost::Message::decode(&*result.app_metadata).expect("DoPutUpdateResult");
+        count = Some(update.record_count);
+    }
+    let trailers = responses.trailers().await.expect("trailers");
+    let snapshot_id = trailers
+        .as_ref()
+        .and_then(|t| t.get(sqe_coordinator::flight_trailers::SNAPSHOT_ID_TRAILER))
+        .map(|v| v.to_str().expect("ascii").parse().expect("an i64"));
+    (count.expect("a record count"), snapshot_id)
 }
 
 /// The gRPC code of a failed ingest, if the error carries one.
@@ -1453,5 +1482,57 @@ async fn ingest_create_maps_uint64_to_long() {
     let too_big = ingest(&mut client, cmd, vec![unsigned(u64::MAX, "max")]).await;
     assert!(too_big.is_err(), "u64::MAX must not fit a long column");
     assert_eq!(rows(&mut client, table).await, strings(&["7|seven"]));
+    drop_table(&mut client, table).await;
+}
+
+/// The id of `table`'s newest snapshot, from `table_snapshots`.
+async fn newest_snapshot_id(client: &mut FlightSqlServiceClient<Channel>, table: &str) -> i64 {
+    let all = snapshots(client, table).await;
+    let newest = all.last().expect("a snapshot");
+    let id = newest.split('|').next().expect("snapshot_id|operation");
+    id.parse()
+        .unwrap_or_else(|e| panic!("snapshot id {id}: {e}"))
+}
+
+/// #904 acceptance 3: an ingest that commits to `main` returns the snapshot
+/// id it committed in the `x-sqe-snapshot-id` trailer, and it is the table's
+/// newest snapshot. A replace and an ingest inside a transaction send no
+/// trailer (documented on the Flight SQL page).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ingest_returns_the_committed_snapshot_id_as_a_trailer() {
+    let server = IngestServer::start().await;
+    let mut client = server.client().await;
+    let table = "flight_ingest_snapshot_trailer";
+    drop_table(&mut client, table).await;
+    use TableExistsOption as Exists;
+    use TableNotExistOption as Missing;
+
+    for (label, missing, exists) in [
+        ("create", Missing::Create, Exists::Fail),
+        ("append", Missing::Fail, Exists::Append),
+    ] {
+        let cmd = ingest_command(table, missing, exists, None);
+        let (count, id) =
+            ingest_reading_snapshot_trailer(&mut client, cmd, vec![batch(&[(1, label)])]).await;
+        assert_eq!(count, 1, "{label}");
+        let newest = newest_snapshot_id(&mut client, table).await;
+        assert_eq!(id, Some(newest), "{label}: the trailer is the new snapshot");
+    }
+
+    let cmd = ingest_command(table, Missing::Fail, Exists::Replace, None);
+    let (count, id) =
+        ingest_reading_snapshot_trailer(&mut client, cmd, vec![batch(&[(2, "replace")])]).await;
+    assert_eq!((count, id), (1, None), "a replace reports no id");
+
+    let txn = client.begin_transaction().await.expect("begin");
+    let cmd = ingest_command(table, Missing::Fail, Exists::Append, Some(txn.clone()));
+    let (count, id) =
+        ingest_reading_snapshot_trailer(&mut client, cmd, vec![batch(&[(3, "txn")])]).await;
+    assert_eq!((count, id), (1, None), "no id inside a transaction");
+    client
+        .end_transaction(txn, EndTransaction::Commit)
+        .await
+        .expect("commit");
     drop_table(&mut client, table).await;
 }

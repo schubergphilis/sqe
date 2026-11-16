@@ -1422,7 +1422,8 @@ impl SqeFlightSqlService {
         pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
         mode: sqe_write::write_handler::IngestMode,
         upload: crate::flight_ingest::PeekedUpload,
-    ) -> futures::future::BoxFuture<'a, sqe_core::Result<usize>> {
+    ) -> futures::future::BoxFuture<'a, sqe_core::Result<sqe_write::write_handler::IngestOutcome>>
+    {
         Box::pin(self.ingest_flight_stream_inner(session, qualified, scope, pool, mode, upload))
     }
 
@@ -1434,7 +1435,7 @@ impl SqeFlightSqlService {
         pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
         mode: sqe_write::write_handler::IngestMode,
         upload: crate::flight_ingest::PeekedUpload,
-    ) -> sqe_core::Result<usize> {
+    ) -> sqe_core::Result<sqe_write::write_handler::IngestOutcome> {
         sqe_catalog::txn::write_scope(
             scope.txn,
             session.write_branch.clone(),
@@ -1669,7 +1670,10 @@ impl SqeFlightSqlService {
         ticket: CommandStatementIngest,
         request: Request<PeekableFlightDataStream>,
         audit: &'a mut crate::audit_emitter::IngestAudit,
-    ) -> futures::future::BoxFuture<'a, Result<usize, IngestFailure>> {
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<sqe_write::write_handler::IngestOutcome, IngestFailure>,
+    > {
         Box::pin(self.statement_ingest_inner(session, ticket, request, audit))
     }
 
@@ -1679,7 +1683,7 @@ impl SqeFlightSqlService {
         ticket: CommandStatementIngest,
         request: Request<PeekableFlightDataStream>,
         audit: &mut crate::audit_emitter::IngestAudit,
-    ) -> Result<usize, IngestFailure> {
+    ) -> Result<sqe_write::write_handler::IngestOutcome, IngestFailure> {
         // Inside a transaction (BEGIN, or the request's id) the ingest writes
         // to the transaction's branch like an INSERT does (#824). The ADBC
         // Flight SQL driver (1.13, upstream main 2026-11-12) never sets
@@ -1696,6 +1700,7 @@ impl SqeFlightSqlService {
             .into());
         }
         let txn = self.query_handler.transaction_scope(&session)?;
+        let in_txn = txn.is_some();
         // The transaction's snapshot properties inside one, the session's
         // outside (the session's never apply inside a transaction), with the
         // request's `snapshot-property.<key>` options over them. Resolved
@@ -1765,7 +1770,7 @@ impl SqeFlightSqlService {
             mode.on_missing == sqe_write::write_handler::OnMissing::Create,
         )
         .await?;
-        let rows = self
+        let mut outcome = self
             .ingest_flight_stream(
                 &session,
                 &qualified,
@@ -1786,8 +1791,14 @@ impl SqeFlightSqlService {
         if let Some(cache) = self.query_handler.query_cache() {
             cache.invalidate(&qualified);
         }
+        // Inside a transaction the snapshot is on the transaction's branch
+        // and COMMIT publishes it to `main` later, so no id is reported for
+        // it (#904): the client could not find it on the table yet.
+        if in_txn {
+            outcome.snapshot_id = None;
+        }
 
-        Ok(rows)
+        Ok(outcome)
     }
 }
 
@@ -2877,9 +2888,22 @@ impl FlightSqlService for SqeFlightSqlService {
             start: std::time::Instant::now(),
             client_ip: Some(self.extract_client_ip(&request)),
         };
+        // Filled after the commit; `SnapshotTrailerLayer` sends it as the
+        // `x-sqe-snapshot-id` trailer (#904). Absent when the server runs
+        // without that layer.
+        let snapshot_slot = request
+            .extensions()
+            .get::<crate::flight_trailers::SnapshotIdSlot>()
+            .cloned();
         let result = self
             .statement_ingest(session, ticket, request, &mut guard.audit)
             .await;
+        let result = result.map(|outcome| {
+            if let (Some(slot), Some(id)) = (&snapshot_slot, outcome.snapshot_id) {
+                slot.set(id);
+            }
+            outcome.rows
+        });
         guard.finish(&result);
         result
             .map(|rows| rows as i64)

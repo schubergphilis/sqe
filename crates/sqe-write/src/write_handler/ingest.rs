@@ -41,6 +41,16 @@ pub struct IngestMode {
     pub on_existing: OnExisting,
 }
 
+/// What a streaming ingest did: the rows it wrote and the snapshot it
+/// committed (#904). `snapshot_id` is the head of the ref the ingest wrote
+/// (`main`, the session's WRITE_BRANCH or the transaction branch), and `None`
+/// when nothing was committed (an empty append without snapshot properties).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IngestOutcome {
+    pub rows: usize,
+    pub snapshot_id: Option<i64>,
+}
+
 impl IngestMode {
     /// Whether the plan depends on the table's existence. `(Fail, Append)`
     /// and `(Fail, Replace)` do not: a missing table is the load's own error.
@@ -155,7 +165,7 @@ impl WriteHandler {
         mode: IngestMode,
         stream_schema: Option<arrow_schema::SchemaRef>,
         batch_stream: S,
-    ) -> sqe_core::Result<usize>
+    ) -> sqe_core::Result<IngestOutcome>
     where
         S: futures::Stream<Item = std::result::Result<RecordBatch, E>> + Send + 'static,
         E: std::error::Error + Send + Sync + 'static,
@@ -276,12 +286,17 @@ impl WriteHandler {
         )
         .await?;
 
-        if replace {
+        let snapshot_id = if replace {
             // One overwrite snapshot that removes the old files and adds the
             // new ones. An empty upload still commits: it truncates, as an
             // INSERT OVERWRITE of no rows does. A failure leaves the table as
             // it was; the guard deletes the files this ingest wrote.
-            self.commit_written_files(session, &session_catalog, &table_ident, data_files, true)
+            //
+            // The rewrite helper does not hand back the committed table, so
+            // the id is `None` here; reading the table again could report a
+            // concurrent writer's snapshot instead.
+            let snapshot_id = self
+                .commit_written_files(session, &session_catalog, &table_ident, data_files, true)
                 .await
                 .inspect_err(|e| cleanup_guard.keep_if_outcome_unknown(e))?;
             cleanup_guard.mark_committed();
@@ -290,16 +305,18 @@ impl WriteHandler {
                 total_rows,
                 "Streaming DoPut ingest replaced the table's rows"
             );
+            snapshot_id
         } else if !data_files.is_empty() {
             let files_for_retry = data_files.clone();
             let catalog_for_commit = catalog.clone();
             let target_branch =
                 crate::commit::txn_target_branch(catalog.as_ref(), &table_ident).await?;
+            let written_ref = target_branch.clone();
             // The one resolved value this ingest stamps, read once. The
             // Flight handler already laid the request's
             // `snapshot-property.<key>` options over it in the scope.
             let snapshot_props = super::snapshot_props::current();
-            commit_with_retry(
+            let committed = commit_with_retry(
                 catalog.as_ref(),
                 &table_ident,
                 "ingest",
@@ -344,15 +361,26 @@ impl WriteHandler {
                 total_rows,
                 "Streaming DoPut ingest committed successfully"
             );
+            // The append's snapshot, read from the table the commit returned
+            // (not a reload, which could see a later writer): the head of the
+            // ref it wrote, as `commit_written_files` reports it for INSERT.
+            let metadata = committed.metadata();
+            match written_ref {
+                Some(branch) => metadata.snapshot_for_ref(&branch).map(|s| s.snapshot_id()),
+                None => metadata.current_snapshot_id(),
+            }
         } else {
             cleanup_guard.mark_committed();
             // An empty upload adds nothing; with snapshot properties it still
             // commits the marker snapshot.
             self.commit_empty_snapshot(session, &session_catalog, &table_ident)
-                .await?;
-        }
+                .await?
+        };
 
-        Ok(total_rows)
+        Ok(IngestOutcome {
+            rows: total_rows,
+            snapshot_id,
+        })
     }
 
     /// Settle what the ingest does to `table_ident` before the stream is read:

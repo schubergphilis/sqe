@@ -2900,6 +2900,8 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
     let drain_tracker = Arc::clone(txn_handler.query_tracker());
     let serve_result = server_builder
         .layer(sqe_coordinator::flight_sql::FlightTraceLayer)
+        // The committed snapshot id of an ingest as a trailer (#904).
+        .layer(sqe_coordinator::flight_trailers::SnapshotTrailerLayer)
         .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(flight_service))
         .serve_with_shutdown(
             addr,

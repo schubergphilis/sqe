@@ -80,6 +80,9 @@ governor = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
+# The ingest snapshot-id trailer wraps tonic's response body (#904); tonic
+# already depends on http-body 1, so this adds no crate to the build.
+http-body = "1"
 uuid = { workspace = true }
 prost = { workspace = true }
 anyhow = { workspace = true }
