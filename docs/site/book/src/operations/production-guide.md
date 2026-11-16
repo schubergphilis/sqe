@@ -316,6 +316,73 @@ Route audit logs and traces through an OpenTelemetry Collector when possible. Au
 
 ---
 
+## Minimal production config with Ranger
+
+The smallest `sqe.toml` that starts with `production_mode = true` and Ranger enforcing row filters, masks and column restrictions. A unit test in `crates/sqe-core/src/config/production.rs` parses this block and fails if it breaks any rule, so it stays current. Use a release that has `catalog-scoped` together with its view-body fix (v0.51.0 or later).
+
+```toml
+[coordinator]
+production_mode = true
+# Trino clients over TLS only. Behind a TLS-terminating proxy, keep
+# trino_http_port and set [security] allow_plaintext_behind_tls_proxy = true.
+trino_http_port = 0
+trino_https_port = 8443
+
+[coordinator.tls]
+cert_file = "/etc/sqe/tls/tls.crt"
+key_file = "/etc/sqe/tls/tls.key"
+
+[coordinator.trino_tls]
+cert_file = "/etc/sqe/tls/tls.crt"
+key_file = "/etc/sqe/tls/tls.key"
+
+[rate_limit]
+enabled = true
+
+# Every provider reads groups: Ranger grants, masks and row filters by group.
+[[auth.providers]]
+type = "oidc_password"
+token_url = "https://idp.example.com/realms/data/protocol/openid-connect/token"
+client_id = "sqe"
+groups_claim = "groups"
+
+[[auth.providers]]
+type = "bearer_token"
+jwks_url = "https://idp.example.com/realms/data/protocol/openid-connect/certs"
+issuer = "https://idp.example.com/realms/data"
+audience = "sqe"
+groups_claim = "groups"
+
+[catalog]
+polaris_url = "https://polaris.example.com/api/catalog"
+warehouse = "lakehouse"
+require_vended_credentials = true
+
+[storage.tvf]
+allow_inline_credentials = false
+
+[policy]
+engine = "ranger"
+# Set SQE_POLICY__MASK_KEY from your secret store instead of writing it here.
+mask_key = "replace-me"
+
+[policy.ranger]
+url = "https://ranger.example.com"
+service_name = "lakehouse"
+project-tags = true
+# Key policies on <catalog>.<namespace>: needed when several catalogs hold
+# the same namespace.table names.
+catalog-scoped = true
+
+[access_control]
+backend = "ranger"
+url = "https://ranger.example.com"
+```
+
+The Ranger admin credentials (`policy.ranger.admin_user`, `admin_password`) come from the environment as well (`SQE_POLICY__RANGER__ADMIN_PASSWORD`). The same file with `engine = "passthrough"` fails at startup with `[policy-engine-configured] production_mode: policy.engine is passthrough ...`.
+
+---
+
 ## What production mode enforces
 
 `coordinator.production_mode = true` (or `SQE_PRODUCTION_MODE=1`) turns the following into startup errors. The table is the one in `crates/sqe-core/src/config/production.rs`; a unit test fails when the two drift. Each `security.allow_*` waiver is an explicit acknowledgement, logged at startup.
