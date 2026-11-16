@@ -3120,6 +3120,60 @@ fn namespace_path_segment(namespace: &NamespaceIdent) -> String {
 /// the query path already applies to client SQL.
 const SUPPORTED_VIEW_DIALECTS: [&str; 3] = ["sqe", "trino", "spark"];
 
+/// The Iceberg view property that lets a replace drop a dialect. The Java
+/// reference catalog (and so Polaris) refuses a commit that loses one
+/// without it.
+const REPLACE_DROP_DIALECT_ALLOWED: &str = "replace.drop-dialect.allowed";
+
+/// Refuses a replace that would drop another engine's text (#900).
+///
+/// SQE writes every new version with one `sqe` representation, so replacing a
+/// view whose current version also carries, say, a `spark` text leaves Spark
+/// unable to read it. Each such dialect must be named in `drop_dialects`
+/// (the `WITH (drop_dialects = '...')` option); dialects compare
+/// case-insensitively, as [`select_view_sql`] does.
+///
+/// Returns whether the replace drops an opted-in dialect: the commit must
+/// then carry [`REPLACE_DROP_DIALECT_ALLOWED`], or the catalog refuses it.
+fn refuse_dropping_dialects(
+    existing: &iceberg::spec::ViewMetadata,
+    view_name: &str,
+    drop_dialects: &[String],
+) -> sqe_core::Result<bool> {
+    let version = existing.current_version();
+    let mut dropped: Vec<String> = Vec::new();
+    let mut opted_in = false;
+    for rep in version.representations().iter() {
+        let iceberg::spec::ViewRepresentation::Sql(sql) = rep;
+        let dialect = sql.dialect.to_ascii_lowercase();
+        if dialect == "sqe" {
+            continue;
+        }
+        if drop_dialects
+            .iter()
+            .any(|d| d.eq_ignore_ascii_case(&dialect))
+        {
+            opted_in = true;
+        } else if !dropped.contains(&dialect) {
+            dropped.push(dialect);
+        }
+    }
+    if dropped.is_empty() {
+        return Ok(opted_in);
+    }
+    Err(SqeError::with_code(
+        SqeErrorCode::NotSupported,
+        format!(
+            "CREATE OR REPLACE VIEW would drop the {} representation of view '{view_name}' \
+             (version {}): SQE writes only `sqe` SQL, so those engines could no longer read \
+             the view. Add WITH (drop_dialects = '{}') to replace it anyway",
+            dropped.join(", "),
+            version.version_id(),
+            dropped.join(",")
+        ),
+    ))
+}
+
 /// Select the SQL of the view's *current* version (`current-version-id`,
 /// not `versions.last()`), preferring representation dialects in
 /// [`SUPPORTED_VIEW_DIALECTS`] order.
@@ -3563,6 +3617,7 @@ impl SessionCatalog {
     /// in which the view is missing and the version history is kept. When it
     /// does not exist, this is [`Self::create_view`].
     #[instrument(skip(self, sql, schema), fields(namespace = ?namespace, view = %name, warehouse = %self.warehouse))]
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_or_replace_view(
         &self,
         namespace: &NamespaceIdent,
@@ -3571,6 +3626,7 @@ impl SessionCatalog {
         default_namespace: &NamespaceIdent,
         schema: &serde_json::Value,
         properties: &std::collections::HashMap<String, String>,
+        drop_dialects: &[String],
     ) -> sqe_core::Result<()> {
         self.require_rest_backend("create_or_replace_view")?;
         let Some(existing) = self.load_view_metadata(namespace, name).await? else {
@@ -3578,6 +3634,17 @@ impl SessionCatalog {
                 .create_view(namespace, name, sql, default_namespace, schema, properties)
                 .await;
         };
+        // Waive the catalog's own dialect-loss check for this commit only,
+        // unless the view already allows it.
+        let waive_dialect_check = refuse_dropping_dialects(&existing, name, drop_dialects)?
+            && !existing
+                .properties()
+                .get(REPLACE_DROP_DIALECT_ALLOWED)
+                .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        let mut properties = properties.clone();
+        if waive_dialect_check {
+            properties.insert(REPLACE_DROP_DIALECT_ALLOWED.to_string(), "true".to_string());
+        }
 
         let next_schema_id = existing
             .schemas_iter()
@@ -3601,31 +3668,63 @@ impl SessionCatalog {
         })?;
         if !properties.is_empty() {
             updates.push(iceberg::ViewUpdate::SetProperties {
-                updates: properties.clone(),
+                updates: properties,
             });
         }
+        let url = self.view_url(namespace, name).await;
+        debug!(url = %url, view = name, version = next_version_id, "Replacing view via Iceberg REST");
+        self.commit_view_updates(namespace, name, &existing, &url, &updates)
+            .await?;
+        info!(view = name, namespace = ?namespace, version = next_version_id, "View replaced");
+
+        if waive_dialect_check {
+            // A second commit: the waiver must not outlive this statement, or
+            // another engine's replace could drop SQE's text unasked. Best
+            // effort; the replace itself has already landed.
+            let restore = [iceberg::ViewUpdate::RemoveProperties {
+                removals: vec![REPLACE_DROP_DIALECT_ALLOWED.to_string()],
+            }];
+            if let Err(e) = self
+                .commit_view_updates(namespace, name, &existing, &url, &restore)
+                .await
+            {
+                warn!(
+                    view = name,
+                    error = %e,
+                    "View replaced, but removing {REPLACE_DROP_DIALECT_ALLOWED} failed; \
+                     remove the property by hand"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// POST one view commit guarded by `assert-view-uuid`.
+    async fn commit_view_updates(
+        &self,
+        namespace: &NamespaceIdent,
+        name: &str,
+        existing: &iceberg::spec::ViewMetadata,
+        url: &str,
+        updates: &[iceberg::ViewUpdate],
+    ) -> sqe_core::Result<()> {
         let body = serde_json::to_value(CommitViewRequest {
             identifier: TableIdent::new(namespace.clone(), name.to_string()),
             requirements: vec![serde_json::json!({
                 "type": "assert-view-uuid",
                 "uuid": existing.uuid(),
             })],
-            updates: &updates,
+            updates,
         })
         .map_err(|e| SqeError::execution_src(format!("Failed to serialize view commit: {e}"), e))?;
-
-        let url = self.view_url(namespace, name).await;
-        debug!(url = %url, view = name, version = next_version_id, "Replacing view via Iceberg REST");
         self.rest_request(
             sqe_core::CatalogOp::Commit,
             reqwest::Method::POST,
-            &url,
+            url,
             Some(body),
             &[],
         )
         .await?;
-
-        info!(view = name, namespace = ?namespace, version = next_version_id, "View replaced");
         Ok(())
     }
 
@@ -6263,7 +6362,7 @@ mod other_backend_tests {
                 .await
                 .err(),
             session
-                .create_or_replace_view(&sales(), "v", "SELECT 1", &sales(), &schema, &props)
+                .create_or_replace_view(&sales(), "v", "SELECT 1", &sales(), &schema, &props, &[])
                 .await
                 .err(),
             session.list_views(&sales()).await.err(),
@@ -6845,7 +6944,9 @@ mod view_rest_tests {
         let server = MockServer::start().await;
         let doc = serde_json::json!({
             "metadata-location": "s3://bucket/sales/v/metadata/v2.json",
-            "metadata": view_metadata_json(2, &[("sqe", "SELECT 1 AS x")]),
+            // Current version 1 holds only `sqe`; version 2 (`spark`) is not
+            // current, so the dialect check (#900) does not apply.
+            "metadata": view_metadata_json(1, &[("sqe", "SELECT 1 AS x")]),
         });
         Mock::given(method("GET"))
             .and(path("/v1/test-warehouse/namespaces/sales/views/v"))
@@ -6867,6 +6968,7 @@ mod view_rest_tests {
                 &sales(),
                 &view_schema_json(),
                 &HashMap::new(),
+                &[],
             )
             .await
             .expect("mocked replace succeeds");
@@ -6908,6 +7010,154 @@ mod view_rest_tests {
                 .any(|r| r.method == wiremock::http::Method::DELETE),
             "replace must not drop the view"
         );
+    }
+
+    /// A session over a view whose current version (1) holds `reps`.
+    async fn replace_session(server: &MockServer, reps: &[(&str, &str)]) -> SessionCatalog {
+        let doc = serde_json::json!({
+            "metadata-location": "s3://bucket/sales/v/metadata/v2.json",
+            "metadata": view_metadata_json(1, reps),
+        });
+        Mock::given(method("GET"))
+            .and(path("/v1/test-warehouse/namespaces/sales/views/v"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(doc))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/test-warehouse/namespaces/sales/views/v"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(server)
+            .await;
+        session_with(server, TableMetadataCache::new(300), None).await
+    }
+
+    async fn replace_v(session: &SessionCatalog, drop_dialects: &[String]) -> sqe_core::Result<()> {
+        let props = HashMap::new();
+        let schema = view_schema_json();
+        let sql = "SELECT 3 AS x";
+        session
+            .create_or_replace_view(&sales(), "v", sql, &sales(), &schema, &props, drop_dialects)
+            .await
+    }
+
+    async fn posts(server: &MockServer) -> Vec<serde_json::Value> {
+        let requests = server.received_requests().await.unwrap();
+        requests
+            .iter()
+            .filter(|r| r.method == wiremock::http::Method::POST)
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect()
+    }
+
+    /// #900: a replace that would drop another engine's text is refused,
+    /// names the dialect and the opt-in, and commits nothing.
+    #[tokio::test]
+    async fn replace_refuses_to_drop_spark_representation() {
+        let server = MockServer::start().await;
+        let reps = [("sqe", "SELECT 1 AS x"), ("Spark", "SELECT 1 AS x")];
+        let session = replace_session(&server, &reps).await;
+
+        let err = replace_v(&session, &[])
+            .await
+            .expect_err("spark text would be dropped");
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::NotSupported);
+        let text = err.to_string();
+        assert!(text.contains("spark"), "{text}");
+        assert!(text.contains("drop_dialects = 'spark'"), "{text}");
+        assert!(
+            posts(&server).await.is_empty(),
+            "a refused replace commits nothing"
+        );
+    }
+
+    /// #900: with the opt-in, the replace commits a version with `sqe` only.
+    #[tokio::test]
+    async fn replace_with_drop_dialects_writes_sqe_only() {
+        let server = MockServer::start().await;
+        let reps = [("sqe", "SELECT 1 AS x"), ("spark", "SELECT 1 AS x")];
+        let session = replace_session(&server, &reps).await;
+
+        replace_v(&session, &["spark".to_string()])
+            .await
+            .expect("opt-in replace");
+        let posts = posts(&server).await;
+        assert_eq!(posts.len(), 2, "the replace, then the waiver removed");
+        let reps = posts[0]["updates"][0]["view-version"]["representations"]
+            .as_array()
+            .expect("representations");
+        assert_eq!(reps.len(), 1, "{reps:?}");
+        assert_eq!(reps[0]["dialect"], "sqe");
+        assert_eq!(reps[0]["sql"], "SELECT 3 AS x");
+        // The catalog refuses a dialect loss unless the commit allows it.
+        let set = posts[0]["updates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["action"] == "set-properties")
+            .expect("set-properties in the replace commit");
+        assert_eq!(set["updates"]["replace.drop-dialect.allowed"], "true");
+        assert_eq!(posts[1]["updates"][0]["action"], "remove-properties");
+        assert_eq!(
+            posts[1]["updates"][0]["removals"],
+            serde_json::json!(["replace.drop-dialect.allowed"])
+        );
+    }
+
+    /// #900: a view that already allows dropping dialects keeps its property:
+    /// one commit, and no removal afterwards.
+    #[tokio::test]
+    async fn replace_keeps_an_existing_drop_dialect_property() {
+        let server = MockServer::start().await;
+        let mut md = view_metadata_json(1, &[("sqe", "SELECT 1"), ("spark", "SELECT 1")]);
+        md["properties"] = serde_json::json!({"replace.drop-dialect.allowed": "true"});
+        let doc = serde_json::json!({
+            "metadata-location": "s3://bucket/sales/v/metadata/v2.json",
+            "metadata": md,
+        });
+        Mock::given(method("GET"))
+            .and(path("/v1/test-warehouse/namespaces/sales/views/v"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(doc))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/test-warehouse/namespaces/sales/views/v"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        let session = session_with(&server, TableMetadataCache::new(300), None).await;
+
+        replace_v(&session, &["spark".to_string()])
+            .await
+            .expect("opt-in replace");
+        let posts = posts(&server).await;
+        assert_eq!(posts.len(), 1, "{posts:?}");
+        let actions: Vec<&str> = posts[0]["updates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["action"].as_str().unwrap())
+            .collect();
+        assert!(!actions.contains(&"set-properties"), "{actions:?}");
+    }
+
+    /// #900: the opt-in covers only the dialects it names.
+    #[tokio::test]
+    async fn replace_names_only_the_uncovered_dialects() {
+        let server = MockServer::start().await;
+        let reps = [
+            ("sqe", "SELECT 1 AS x"),
+            ("spark", "SELECT 1 AS x"),
+            ("trino", "SELECT 1 AS x"),
+        ];
+        let session = replace_session(&server, &reps).await;
+
+        let err = replace_v(&session, &["SPARK".to_string()])
+            .await
+            .expect_err("trino text is not covered");
+        let text = err.to_string();
+        assert!(text.contains("drop the trino representation"), "{text}");
+        assert!(text.contains("drop_dialects = 'trino'"), "{text}");
+        assert!(posts(&server).await.is_empty());
     }
 
     fn update_actions(updates: &[iceberg::ViewUpdate]) -> Vec<String> {

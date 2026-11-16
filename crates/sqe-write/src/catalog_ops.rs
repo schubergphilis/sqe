@@ -670,12 +670,13 @@ impl CatalogOps {
         stmt: &Statement,
         schema_json: &serde_json::Value,
     ) -> sqe_core::Result<()> {
-        let (view_name, query, or_replace, properties) = match stmt {
+        let (view_name, query, or_replace, properties, drop_dialects) = match stmt {
             Statement::CreateView(cv) => (
                 &cv.name,
                 &cv.query,
                 cv.or_replace,
                 view_properties(cv, &session.user.username),
+                view_drop_dialects(cv),
             ),
             other => {
                 return Err(SqeError::with_code(
@@ -723,6 +724,7 @@ impl CatalogOps {
                     &default_namespace,
                     schema_json,
                     &properties,
+                    &drop_dialects,
                 )
                 .await
         } else {
@@ -2960,12 +2962,7 @@ fn view_properties(cv: &sqlparser::ast::CreateView, username: &str) -> HashMap<S
         props.insert("comment".to_string(), comment.clone());
     }
 
-    let options: &[SqlOption] = match &cv.options {
-        sqlparser::ast::CreateTableOptions::With(opts) => opts,
-        sqlparser::ast::CreateTableOptions::Options(opts) => opts,
-        _ => &[],
-    };
-    for opt in options {
+    for opt in view_options(cv) {
         let SqlOption::KeyValue { key, value } = opt else {
             continue;
         };
@@ -2999,10 +2996,75 @@ fn view_properties(cv: &sqlparser::ast::CreateView, username: &str) -> HashMap<S
     props
 }
 
+/// The `WITH (...)` / `OPTIONS (...)` list of a `CREATE VIEW`.
+fn view_options(cv: &sqlparser::ast::CreateView) -> &[SqlOption] {
+    match &cv.options {
+        sqlparser::ast::CreateTableOptions::With(opts) => opts,
+        sqlparser::ast::CreateTableOptions::Options(opts) => opts,
+        _ => &[],
+    }
+}
+
+/// The `WITH` option that lets `CREATE OR REPLACE VIEW` drop other engines'
+/// representations (#900). A statement option, never a view property:
+/// [`view_properties`] skips it.
+const VIEW_DROP_DIALECTS_OPTION: &str = "drop_dialects";
+
+/// The dialects named in `WITH (drop_dialects = 'spark, trino')`, lowercased.
+fn view_drop_dialects(cv: &sqlparser::ast::CreateView) -> Vec<String> {
+    let mut out = Vec::new();
+    for opt in view_options(cv) {
+        let SqlOption::KeyValue { key, value } = opt else {
+            continue;
+        };
+        if !key.value.eq_ignore_ascii_case(VIEW_DROP_DIALECTS_OPTION) {
+            continue;
+        }
+        let list = match value {
+            Expr::Value(v) => match &v.value {
+                Value::SingleQuotedString(s) => s.clone(),
+                other => other.to_string(),
+            },
+            other => other.to_string(),
+        };
+        out.extend(
+            list.split(',')
+                .map(|d| d.trim().to_ascii_lowercase())
+                .filter(|d| !d.is_empty()),
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sqlparser::ast::Ident;
+
+    fn create_view_stmt(sql: &str) -> sqlparser::ast::CreateView {
+        let dialect = sqlparser::dialect::GenericDialect {};
+        match sqlparser::parser::Parser::parse_sql(&dialect, sql)
+            .unwrap()
+            .pop()
+        {
+            Some(Statement::CreateView(cv)) => cv,
+            other => panic!("expected CREATE VIEW, got {other:?}"),
+        }
+    }
+
+    /// #900: the opt-in is read case-insensitively, split on commas and
+    /// lowercased, and never persisted as a view property.
+    #[test]
+    fn view_drop_dialects_is_parsed_and_not_a_property() {
+        let cv = create_view_stmt(
+            "CREATE OR REPLACE VIEW v WITH (DROP_DIALECTS = 'Spark, trino,') AS SELECT 1 AS x",
+        );
+        assert_eq!(view_drop_dialects(&cv), ["spark", "trino"]);
+        assert!(view_properties(&cv, "alice").is_empty());
+
+        let cv = create_view_stmt("CREATE OR REPLACE VIEW v AS SELECT 1 AS x");
+        assert!(view_drop_dialects(&cv).is_empty());
+    }
 
     fn empty_locks() -> TableLockMap {
         StdArc::new(std::sync::Mutex::new(HashMap::new()))
