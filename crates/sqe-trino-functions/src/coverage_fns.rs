@@ -9,6 +9,8 @@
 //!   This overrides it to dispatch: array membership (three-valued, NULL when
 //!   the element is absent but the array holds a NULL) and the original string
 //!   `contains` behaviour is preserved.
+//! - `cosine_similarity(array, array)`: Trino's vector similarity (#907),
+//!   `dot(a, b) / (|a| * |b|)`. DataFusion has only `cosine_distance`.
 
 use std::sync::Arc;
 
@@ -28,6 +30,7 @@ pub fn register_coverage_fns(ctx: &SessionContext) {
     ctx.register_udaf(AggregateUDF::from(CountIf::new()));
     ctx.register_udf(ScalarUDF::from(ElementAt));
     ctx.register_udf(ScalarUDF::from(Contains));
+    ctx.register_udf(ScalarUDF::from(CosineSimilarity::default()));
 }
 
 // ─── count_if(pred) ──────────────────────────────────────────────────────────
@@ -323,6 +326,102 @@ impl ScalarUDFImpl for Contains {
     }
 }
 
+// ─── cosine_similarity(a, b) ─────────────────────────────────────────────────
+
+/// Trino `cosine_similarity(array(double), array(double))`: 1 for the same
+/// direction, 0 for orthogonal, -1 for opposite. Arguments are coerced the
+/// way DataFusion's `cosine_distance` coerces them (any numeric list, fixed
+/// size lists, `LargeList`), so both functions accept the same columns. The
+/// value is computed directly rather than as `1 - cosine_distance`, which
+/// would lose precision near 0.
+///
+/// NULL when either array is NULL, holds a NULL element, or is all zeros
+/// (Trino raises on NULL elements). Arrays of different length are an error,
+/// as in Trino. Trino's `map(varchar, double)` form is not supported.
+#[derive(Debug, Default, PartialEq, Eq, Hash)]
+struct CosineSimilarity {
+    distance: datafusion::functions_nested::cosine_distance::CosineDistance,
+}
+
+impl ScalarUDFImpl for CosineSimilarity {
+    fn name(&self) -> &str {
+        "cosine_similarity"
+    }
+    fn signature(&self) -> &Signature {
+        self.distance.signature()
+    }
+    fn coerce_types(&self, arg_types: &[DataType]) -> DFResult<Vec<DataType>> {
+        self.distance.coerce_types(arg_types)
+    }
+    fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Float64)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let rows = args.number_rows;
+        let [a, b] = &args.args[..] else {
+            return Err(DataFusionError::Plan(
+                "cosine_similarity takes two arguments".into(),
+            ));
+        };
+        let (a, b) = (a.to_array(rows)?, b.to_array(rows)?);
+        let out = match (a.data_type(), b.data_type()) {
+            (DataType::List(_), DataType::List(_)) => cosine_similarity_of::<i32>(&a, &b)?,
+            (DataType::LargeList(_), DataType::LargeList(_)) => {
+                cosine_similarity_of::<i64>(&a, &b)?
+            }
+            (l, r) => {
+                return Err(DataFusionError::Internal(format!(
+                    "cosine_similarity: unexpected types after coercion: {l} and {r}"
+                )));
+            }
+        };
+        Ok(ColumnarValue::Array(Arc::new(out) as ArrayRef))
+    }
+}
+
+/// Row-wise cosine similarity of two `Float64` lists (after coercion).
+fn cosine_similarity_of<O: arrow::array::OffsetSizeTrait>(
+    a: &ArrayRef,
+    b: &ArrayRef,
+) -> DFResult<arrow::array::Float64Array> {
+    use arrow::array::{AsArray, Float64Array};
+    use arrow::datatypes::Float64Type;
+    let (a, b) = (a.as_list::<O>(), b.as_list::<O>());
+    let mut out = Float64Array::builder(a.len());
+    for row in 0..a.len() {
+        if a.is_null(row) || b.is_null(row) {
+            out.append_null();
+            continue;
+        }
+        let (x, y) = (a.value(row), b.value(row));
+        if x.len() != y.len() {
+            return Err(DataFusionError::Execution(format!(
+                "cosine_similarity: arrays must have the same length, got {} and {}",
+                x.len(),
+                y.len()
+            )));
+        }
+        if x.null_count() != 0 || y.null_count() != 0 {
+            out.append_null();
+            continue;
+        }
+        let x = x.as_primitive::<Float64Type>();
+        let y = y.as_primitive::<Float64Type>();
+        let (mut dot, mut xx, mut yy) = (0.0, 0.0, 0.0);
+        for (p, q) in x.values().iter().zip(y.values()) {
+            dot += p * q;
+            xx += p * p;
+            yy += q * q;
+        }
+        if xx == 0.0 || yy == 0.0 {
+            out.append_null();
+        } else {
+            out.append_value(dot / (xx.sqrt() * yy.sqrt()));
+        }
+    }
+    Ok(out.finish())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,6 +519,69 @@ mod tests {
             one_bool("SELECT contains(make_array(1, CAST(NULL AS int), 3), 2)").await,
             None
         );
+    }
+
+    async fn one_f64(sql: &str) -> Option<f64> {
+        let ctx = crate::duckdb_test_ctx();
+        register_coverage_fns(&ctx);
+        let b = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let a = b[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        (!a.is_null(0)).then(|| a.value(0))
+    }
+
+    #[tokio::test]
+    async fn cosine_similarity_matches_trino() {
+        let cases = [
+            ("[1.0, 2.0], [2.0, 4.0]", 1.0),
+            ("[1.0, 0.0], [0.0, 1.0]", 0.0),
+            ("[1.0, 2.0], [-1.0, -2.0]", -1.0),
+            ("[1.0, 2.0], [2.0, 3.0]", 8.0 / (5f64.sqrt() * 13f64.sqrt())),
+            // integer and real lists coerce like cosine_distance
+            ("[1, 2], [2, 4]", 1.0),
+            (
+                "arrow_cast([3.0, 4.0], 'FixedSizeList(2, Float32)'), [4.0, 3.0]",
+                24.0 / 25.0,
+            ),
+        ];
+        for (args, want) in cases {
+            let got = one_f64(&format!("SELECT cosine_similarity({args})"))
+                .await
+                .unwrap_or_else(|| panic!("{args}: NULL"));
+            assert!((got - want).abs() < 1e-12, "{args}: {got} != {want}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cosine_similarity_null_cases_and_length_mismatch() {
+        for args in [
+            "[0.0, 0.0], [1.0, 2.0]",
+            "CAST(NULL AS double[]), [1.0]",
+            "[1.0, CAST(NULL AS double)], [1.0, 2.0]",
+        ] {
+            let got = one_f64(&format!("SELECT cosine_similarity({args})")).await;
+            assert_eq!(got, None, "{args}");
+        }
+        let ctx = crate::duckdb_test_ctx();
+        register_coverage_fns(&ctx);
+        let err = match ctx.sql("SELECT cosine_similarity([1.0], [1.0, 2.0])").await {
+            Ok(df) => df.collect().await.unwrap_err(),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("same length"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn cosine_similarity_is_one_minus_cosine_distance() {
+        let got = one_f64(
+            "SELECT cosine_similarity(v, w) + cosine_distance(v, w) \
+             FROM (VALUES ([0.3, -1.2, 5.0], [2.0, 0.5, 1.5])) t(v, w)",
+        )
+        .await;
+        assert!((got.unwrap() - 1.0).abs() < 1e-12);
     }
 
     #[tokio::test]

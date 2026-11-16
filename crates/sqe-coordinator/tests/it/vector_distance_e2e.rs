@@ -91,7 +91,8 @@ async fn distance_functions_rank_an_iceberg_list_column() {
     let sql = format!(
         "SELECT id, cosine_distance(emb, make_array(1.0, 0.0)), \
          inner_product(emb, make_array(1.0, 0.0)), \
-         array_distance(emb, make_array(1.0, 0.0)) \
+         array_distance(emb, make_array(1.0, 0.0)), \
+         cosine_similarity(emb, make_array(1.0, 0.0)) \
          FROM {t} ORDER BY 2, id"
     );
     let batches = handler.execute(&session, &sql, None).await.expect(&sql);
@@ -102,6 +103,12 @@ async fn distance_functions_rank_an_iceberg_list_column() {
     assert_eq!(last(1), Some(2.0), "cosine_distance");
     assert_eq!(last(2), Some(-1.0), "inner_product");
     assert_eq!(last(3), Some(2.0), "array_distance");
+    assert_eq!(last(4), Some(-1.0), "cosine_similarity (#907)");
+    // Similarity is 1 - distance on every row.
+    for (d, s) in floats(&batches, 1).into_iter().zip(floats(&batches, 4)) {
+        let (d, s) = (d.expect("distance"), s.expect("similarity"));
+        assert!((d + s - 1.0).abs() < 1e-9, "{d} + {s}");
+    }
 
     exec(&handler, &session, &format!("DROP TABLE IF EXISTS {t}")).await;
 }
