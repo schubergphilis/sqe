@@ -63,6 +63,23 @@ DataFusion's `datafusion-functions-nested` crate ships ~40 array and map helpers
 | `array_mean(a)` | `datafusion-builtin` | Average. | - | - | - | - |
 | `array_any_value(a)` | `datafusion-builtin` | First non-NULL element. | - | - | - | - |
 
+## Vector distance
+
+An embedding can live in an ordinary Iceberg `list<float>` column (`array(real)` in DDL) and be ranked in SQL, with no separate vector store. Both arguments are numeric arrays of the same length; the result is a `DOUBLE`, and NULL when either argument is NULL.
+
+| Function | Origin | Notes |
+|---|---|---|
+| `cosine_distance(a, b)` | `datafusion-builtin` | `1 - cos(angle)`: 0 for the same direction, 2 for opposite. |
+| `inner_product(a, b)` | `datafusion-builtin` | Dot product. |
+| `array_distance(a, b)` | `datafusion-builtin` | Euclidean distance. |
+
+```sql
+-- The five rows nearest the bound query vector, from a prepared statement.
+SELECT id FROM docs ORDER BY cosine_distance(embedding, ?) LIMIT 5;
+```
+
+The query vector can be bound as a parameter on either side, as a list of `DOUBLE` against a `list<float>` column. Policies apply as on any other column: a row filter limits the ranking to rows the caller may see, and a masked or restricted vector column gives a NULL distance for every row. Vector indexes are not supported; every ranking is a full scan of the rows that survive the filters.
+
 ## Array unnesting (lateral)
 
 | Function | Origin | Notes | Trino | Snowflake | Spark SQL | DuckDB |
@@ -198,5 +215,6 @@ SELECT reduce(ARRAY[1, 2, 3, 4], 0, (s, x) -> s + x, s -> s);     -- 10
 
 ## What is NOT registered
 
+- **`cosine_similarity(a, b)`** (Trino). Use `1 - cosine_distance(a, b)`.
 - **`zip(a, b)`** (parallel-iterate two arrays). Use `unnest` against an indexed pair instead.
 - **Snowflake `flatten` table function** (with PATH and OUTER options). Use `UNNEST` directly.
