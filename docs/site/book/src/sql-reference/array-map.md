@@ -70,6 +70,7 @@ An embedding can live in an ordinary Iceberg `list<float>` column (`array(real)`
 | Function | Origin | Notes |
 |---|---|---|
 | `cosine_distance(a, b)` | `datafusion-builtin` | `1 - cos(angle)`: 0 for the same direction, 2 for opposite. |
+| `cosine_similarity(a, b)` | `sqe-trino-functions` | Trino's `cos(angle)`: 1 for the same direction, 0 for orthogonal, -1 for opposite. Also NULL when an array holds a NULL element (Trino raises an error) or is all zeros. Arrays only; Trino's `map(varchar, double)` form is not supported. |
 | `inner_product(a, b)` | `datafusion-builtin` | Dot product. |
 | `array_distance(a, b)` | `datafusion-builtin` | Euclidean distance. |
 
@@ -215,6 +216,5 @@ SELECT reduce(ARRAY[1, 2, 3, 4], 0, (s, x) -> s + x, s -> s);     -- 10
 
 ## What is NOT registered
 
-- **`cosine_similarity(a, b)`** (Trino). Use `1 - cosine_distance(a, b)`.
 - **`zip(a, b)`** (parallel-iterate two arrays). Use `unnest` against an indexed pair instead.
 - **Snowflake `flatten` table function** (with PATH and OUTER options). Use `UNNEST` directly.
