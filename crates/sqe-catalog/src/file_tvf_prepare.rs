@@ -77,6 +77,23 @@ struct StatementProviders {
     /// `(namespace, table)` names the catalog listed but would not load as
     /// Iceberg during this statement; see [`note_not_iceberg`].
     not_iceberg: Mutex<Vec<(String, String)>>,
+    /// Metadata-cache keys this statement already checked against the
+    /// catalog; see [`first_check_in_statement`].
+    checked: Mutex<std::collections::HashSet<String>>,
+}
+
+/// Whether this is the statement's first catalog check of the metadata-cache
+/// entry `key`, and record it (#903). Outside a statement scope every call is
+/// a first check: nothing bounds the answer, so nothing may be skipped.
+// Its only caller is the REST session catalog.
+#[cfg_attr(not(feature = "rest"), allow(dead_code))]
+pub(crate) fn first_check_in_statement(key: &str) -> bool {
+    STATEMENT_PROVIDERS
+        .try_with(|scope| {
+            let mut checked = scope.checked.lock().unwrap_or_else(PoisonError::into_inner);
+            checked.insert(key.to_string())
+        })
+        .unwrap_or(true)
 }
 
 /// Record that the catalog listed `namespace.table` but refused to load it
@@ -1207,6 +1224,29 @@ mod tests {
         for t in ["into_t", "ctas_t", "view_t"] {
             assert!(ctx.table(t).await.is_err(), "{t} was registered");
         }
-        plan_sql(&ctx, "SELECT 1").await.expect("queries still plan");
+        plan_sql(&ctx, "SELECT 1")
+            .await
+            .expect("queries still plan");
+    }
+
+    /// #903: one catalog currency check per table per statement. Outside a
+    /// statement every load checks (the safe direction).
+    #[tokio::test]
+    async fn a_table_is_checked_once_per_statement() {
+        assert!(first_check_in_statement("k"), "no scope: always check");
+        assert!(first_check_in_statement("k"), "no scope: always check");
+        for _ in 0..2 {
+            in_statement(async {
+                assert!(first_check_in_statement("k"), "first load in the statement");
+                assert!(!first_check_in_statement("k"), "second load reuses it");
+                assert!(first_check_in_statement("other"), "another table checks");
+                in_statement(async {
+                    let again = first_check_in_statement("k");
+                    assert!(!again, "nested plan shares the scope");
+                })
+                .await;
+            })
+            .await;
+        }
     }
 }

@@ -1302,6 +1302,78 @@ async fn tag_column_mask_applies_from_iceberg_property() {
     );
 }
 
+/// A tag another engine commits straight to the catalog masks the very next
+/// query, even with a 300 s metadata cache (#903). Under a policy engine each
+/// statement revalidates every table it loads once (a conditional GET), so the
+/// TTL bounds staleness only where nothing enforces tags.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn tag_from_out_of_band_commit_masks_the_next_query() {
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+    use iceberg::{Catalog, NamespaceIdent, TableIdent};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+    let (handler, _cache) =
+        crate::common::setup_ranger_handler_with(|c| c.catalog.metadata_cache_ttl_secs = 300).await;
+
+    // Prove the tag policy is live through the SQL path first, on another
+    // column, so the step under test cannot be waiting on Ranger.
+    set_column_tag(&ctx, "email", "PII").await;
+    let policy = tag_mask_policy(
+        &format!("{PREFIX}tag-oob-null"),
+        "PII",
+        serde_json::json!({"dataMaskType": "hive:MASK_NULL"}),
+    );
+    ctx.ranger
+        .create_policy(policy)
+        .await
+        .expect("create tag mask");
+    let sql = format!("SELECT email, ssn FROM {ORDERS} ORDER BY id");
+    crate::common::eventually("the PII mask on email", || async {
+        match handler.execute(&ctx.bob, &sql, None).await {
+            Ok(b) if col_strings(&b, "email") == vec!["NULL"; 3] => Ok(b),
+            Ok(b) => Err(format!("got {:?}", col_strings(&b, "email"))),
+            Err(e) => Err(format!("query failed: {e}")),
+        }
+    })
+    .await;
+
+    // The out-of-band commit: carol's own catalog client with no cache of its
+    // own, so nothing in `handler` hears about it.
+    let config = sqe_core::SqeConfig::load(&crate::common::ranger_config_path()).unwrap();
+    let token = ctx.carol.access_token().expose();
+    let none = Some(sqe_catalog::TableMetadataCache::new(0));
+    let session = sqe_catalog::SessionCatalog::for_session(&config, none, token);
+    let catalog = Arc::new(session.await.expect("carol's catalog")).as_catalog();
+    let ns = NamespaceIdent::new("ac".to_string());
+    let ident = TableIdent::new(ns, "orders".to_string());
+    let table = catalog.load_table(&ident).await.expect("load orders");
+    let raw = table.metadata().properties().get("sqe.column-tags");
+    let mut tags: HashMap<String, Vec<String>> =
+        serde_json::from_str(raw.expect("email is tagged")).unwrap();
+    tags.insert("ssn".to_string(), vec!["PII".to_string()]);
+    let tx = Transaction::new(&table);
+    let action = tx.update_table_properties().set(
+        "sqe.column-tags".to_string(),
+        serde_json::to_string(&tags).unwrap(),
+    );
+    let tx = action.apply(tx).unwrap();
+    tx.commit(catalog.as_ref()).await.expect("raw tag commit");
+
+    // The next statement, not eventually.
+    let bob = handler.execute(&ctx.bob, &sql, None).await.unwrap();
+    assert_eq!(
+        col_strings(&bob, "ssn"),
+        vec!["NULL"; 3],
+        "a tag committed outside SQE must mask the next query"
+    );
+}
+
 /// The Iceberg metadata TVFs answer under Ranger, and `table_files` still
 /// withholds a tag-masked column's bounds. Until #846 every one of them was
 /// refused with "tag state unknown": the rewriter looked up tags for the scan

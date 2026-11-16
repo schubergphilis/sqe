@@ -2153,10 +2153,12 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
     // same regardless of who queries. The cache is invalidated on DDL/DML operations.
     let table_cache = sqe_catalog::TableMetadataCache::new(config.catalog.metadata_cache_ttl_secs)
         .with_authorization_recheck(config.catalog.authorization_recheck_secs)
+        .with_statement_revalidation(config.revalidate_each_statement())
         .with_metrics(Arc::clone(&metrics));
     tracing::info!(
         metadata_cache_ttl_secs = config.catalog.metadata_cache_ttl_secs,
         authorization_recheck_secs = config.catalog.authorization_recheck_secs,
+        revalidate_each_statement = config.revalidate_each_statement(),
         "Initialized global table metadata cache (shared across all sessions)"
     );
 

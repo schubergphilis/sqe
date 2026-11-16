@@ -140,6 +140,11 @@ warehouse = "iceberg"           # warehouse identifier the catalog expects
 metadata_cache_ttl_secs = 30    # Table metadata cache TTL; each table is revalidated
                                 # after 80-100% of it, so tables cached together
                                 # do not all revalidate at once
+# revalidate_each_statement = true  # Default: on unless policy.engine = "passthrough".
+                                # The first read of a table in each statement sends a
+                                # conditional GET (304 when unchanged), so a column tag
+                                # another engine commits masks the next query. Costs
+                                # one catalog round trip per table per statement
 default_table_format_version = 3 # Iceberg table format version (2 or 3); 2 for
                                 # Trino < 481 / Spark < 4.0 / Iceberg < 1.10 readers
 trust_sort_order = false        # Trust Iceberg sort order for all columns, not just partition keys
@@ -457,6 +462,7 @@ Every config field can be overridden via environment variable. Convention: `SQE_
 | `SQE_CATALOG__ACCESS_DELEGATION` | `catalog.access_delegation` | `none` / `vended-credentials` |
 | `SQE_CATALOG__REQUIRE_VENDED_CREDENTIALS` | `catalog.require_vended_credentials` | bool |
 | `SQE_CATALOG__METADATA_CACHE_TTL_SECS` | `catalog.metadata_cache_ttl_secs` | u64 |
+| `SQE_CATALOG__REVALIDATE_EACH_STATEMENT` | `catalog.revalidate_each_statement` | bool |
 | `SQE_CATALOG__DEFAULT_TABLE_FORMAT_VERSION` | `catalog.default_table_format_version` | u8 |
 | **Storage** | | |
 | `SQE_STORAGE__S3_ENDPOINT` | `storage.s3_endpoint` | string |

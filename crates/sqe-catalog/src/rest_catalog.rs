@@ -799,6 +799,9 @@ pub struct TableMetadataCache {
     /// How long a successful authorization check is reused. `ZERO` re-checks
     /// on every lookup. Sourced from `catalog.authorization_recheck_secs`.
     authorization_recheck: std::time::Duration,
+    /// Check a fresh entry against the catalog the first time each statement
+    /// loads it (#903). Sourced from `catalog.revalidate_each_statement`.
+    statement_revalidation: bool,
     /// Optional Prometheus metrics for catalog roundtrip + circuit
     /// breaker state. Threaded through the cache so every
     /// `SessionCatalog` clone shares the same handle without changing
@@ -853,6 +856,7 @@ impl TableMetadataCache {
                 .time_to_live(std::time::Duration::from_secs(3600))
                 .build(),
             authorization_recheck: std::time::Duration::ZERO,
+            statement_revalidation: false,
             metrics: None,
             generation_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             global_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -884,6 +888,18 @@ impl TableMetadataCache {
     #[must_use = "with_authorization_recheck consumes self; bind the returned cache"]
     pub fn with_authorization_recheck(mut self, secs: u64) -> Self {
         self.authorization_recheck = std::time::Duration::from_secs(secs);
+        self
+    }
+
+    /// Revalidate a fresh REST entry once per statement: the first load of a
+    /// table in a statement sends a conditional `GET loadTable` instead of
+    /// trusting the soft TTL, so a property another engine committed (a
+    /// column tag) is seen by the next statement (#903). Later loads in the
+    /// same statement hit the cache. Outside a statement scope every load
+    /// checks. See `CatalogConfig::revalidate_each_statement`.
+    #[must_use = "with_statement_revalidation consumes self; bind the returned cache"]
+    pub fn with_statement_revalidation(mut self, on: bool) -> Self {
+        self.statement_revalidation = on;
         self
     }
 
@@ -1267,15 +1283,22 @@ impl TableMetadataCache {
         // mean a tag added by another engine is ignored until the 1h hard
         // TTL (architecture review 303). No fresh entry => `None`, which the
         // tag source treats as UNKNOWN and the rewriter fails closed on.
+        //
+        // Several principals can each hold a fresh entry for the table; the
+        // most recently validated one carries the newest tags (#903), so it
+        // wins rather than whichever the iterator yields first.
         if let Some(exact_suffix) = exact_suffix {
-            for (key, entry) in self.inner.iter() {
-                if key.ends_with(&exact_suffix) && self.is_fresh(&key, &entry) {
-                    return Some(entry.table.metadata().properties().clone());
-                }
+            let newest = self
+                .inner
+                .iter()
+                .filter(|(key, entry)| key.ends_with(&exact_suffix) && self.is_fresh(key, entry))
+                .max_by_key(|(_, entry)| entry.validated_at);
+            if let Some((_, entry)) = newest {
+                return Some(entry.table.metadata().properties().clone());
             }
         }
 
-        let mut fallback = None;
+        let mut fallback: Option<CachedTableEntry> = None;
         let mut fallback_warehouse = None;
         for (key, entry) in self.inner.iter() {
             if key.ends_with(&table_suffix) {
@@ -1298,10 +1321,15 @@ impl TableMetadataCache {
                     return None;
                 }
                 fallback_warehouse = Some(warehouse.to_string());
-                fallback = Some(entry.table.metadata().properties().clone());
+                if fallback
+                    .as_ref()
+                    .is_none_or(|kept| kept.validated_at < entry.validated_at)
+                {
+                    fallback = Some(entry);
+                }
             }
         }
-        fallback
+        fallback.map(|entry| entry.table.metadata().properties().clone())
     }
 }
 
@@ -2631,8 +2659,21 @@ impl SessionCatalog {
         // instead of firing a second fire-and-forget HEAD request to Polaris.
         let mut etag_from_revalidation: Option<String> = None;
 
+        // #903: the first load of a table in each statement asks the catalog
+        // whether it changed (the conditional GET below), so a tag another
+        // engine committed masks the next query rather than one after the
+        // soft TTL. Later loads in the statement serve the cache.
+        let check_now = self.table_cache.statement_revalidation
+            && matches!(self.inner, CatalogHandle::Rest(_))
+            && crate::file_tvf_prepare::first_check_in_statement(&cache_key);
+
         // Fast path: return cached table that is still within the soft TTL.
-        if let Some(cached) = self.table_cache.get_fresh(&cache_key).await {
+        if let Some(cached) = self
+            .table_cache
+            .get_fresh(&cache_key)
+            .await
+            .filter(|_| !check_now)
+        {
             // A metadata cache hit must not be an authorization cache hit.
             // Polaris/Ranger grants can change out-of-band while the user's
             // bearer token and this cache key stay unchanged. Re-check the
@@ -2686,6 +2727,9 @@ impl SessionCatalog {
                             "ETag revalidation: 304 Not Modified, reusing cached metadata"
                         );
                         self.table_cache.revalidate(&cache_key, &generation).await;
+                        // The GET is `loadTable` itself, authorized like the
+                        // HEAD, so the 304 also renews the access check.
+                        self.table_cache.mark_authorized(&cache_key).await;
                         return Ok(stale_table);
                     }
                     // Non-304: fall through to the full load path below.
@@ -4853,6 +4897,30 @@ type = "aws"
             .is_some());
     }
 
+    /// #903: two principals hold fresh entries; the one validated last
+    /// carries the tag another engine just committed, so it decides.
+    #[tokio::test]
+    async fn table_metadata_cache_properties_prefer_the_newest_entry() {
+        let ident = iceberg::TableIdent::new(
+            iceberg::NamespaceIdent::new("sales".to_string()),
+            "orders".to_string(),
+        );
+        let key_old = super::table_metadata_cache_key("tok_a", "warehouse_a", &ident);
+        let key_new = super::table_metadata_cache_key("tok_b", "warehouse_a", &ident);
+        let cache = super::TableMetadataCache::new(30);
+        let fs = iceberg::io::FileIO::new_with_fs;
+        let old = test_table_with_metadata_props(fs(), &[("tag", "old")]);
+        let new = test_table_with_metadata_props(fs(), &[("tag", "new")]);
+        let age = std::time::Duration::from_secs(10);
+        cache.insert_aged(key_old, old, age).await;
+        cache.insert(key_new, new).await;
+        for warehouse in [Some("warehouse_a"), None] {
+            let props = cache.properties_for(warehouse, "sales", "orders").unwrap();
+            let tag = props.get("tag").map(String::as_str);
+            assert_eq!(tag, Some("new"), "{warehouse:?}");
+        }
+    }
+
     /// Issue #240: the REST catalog cache must hold well beyond the old cap of
     /// 100 so concurrent user-token-warehouse triples stop evicting each other
     /// and re-paying the ~250 ms `/v1/config` + `list_namespaces` rebuild. We
@@ -5071,6 +5139,14 @@ type = "aws"
     }
 
     fn test_table_with_file_io(file_io: iceberg::io::FileIO) -> iceberg::table::Table {
+        test_table_with_metadata_props(file_io, &[])
+    }
+
+    /// [`test_table`] whose metadata carries `props` (e.g. column tags).
+    fn test_table_with_metadata_props(
+        file_io: iceberg::io::FileIO,
+        props: &[(&str, &str)],
+    ) -> iceberg::table::Table {
         const META_V1: &str = r#"{
             "format-version": 1,
             "table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
@@ -5086,7 +5162,11 @@ type = "aws"
             "current-snapshot-id": -1,
             "snapshots": []
         }"#;
-        let metadata: iceberg::spec::TableMetadata = serde_json::from_str(META_V1).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(META_V1).unwrap();
+        for (k, v) in props {
+            json["properties"][*k] = serde_json::Value::from(*v);
+        }
+        let metadata: iceberg::spec::TableMetadata = serde_json::from_value(json).unwrap();
         iceberg::table::Table::builder()
             .runtime(iceberg::Runtime::current())
             .metadata(metadata)
