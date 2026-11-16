@@ -16,10 +16,10 @@
 #      `:<short sha>` in every repository of LATEST_REPOS.
 #   4. Fails unless every pushed tag lists both linux/amd64 and linux/arm64.
 #
-# Why: the release images from CI are amd64 only, so Apple silicon and arm64
-# nodes either emulate or build from source. Release tags no longer write
-# `:latest` (sqe-publish-latest in .gitlab-ci.yml); this script owns it until CI
-# builds both architectures.
+# Why: the dev images CI builds on merges to main are amd64 only. Release tags
+# are multi-arch (#898) but write `:vX.Y.Z` and `:stable`, never `:latest`
+# (sqe-publish-latest in .gitlab-ci.yml), so this script owns `:latest`.
+# scripts/ci-release-binaries.sh is the CI copy of step 1; keep them alike.
 #
 # Needs: cargo-zigbuild (`cargo install cargo-zigbuild`), zig on PATH (`brew
 # install zig` or `pip install ziglang`), the two rustup targets, docker buildx,

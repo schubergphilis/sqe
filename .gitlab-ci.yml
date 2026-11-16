@@ -181,30 +181,204 @@ aikido-build-validate:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $SQE_FORCE_IMAGE_BUILD == "1"'
 
-# The release on Harbor's other names. aikido-publish-release-image mirrors only
-# `:vX.Y.Z` + `:stable`, and only to chameleon/sqlengine/sqe (deploy_mirror.py
-# applies one AIKIDO_IMAGE_NAME to every registry), so this keeps chameleon/sqe
-# (the `make push` repo) on the same release. Fail-closed like the release
-# mirror. `:latest` is not written here: the release image is amd64 only and
-# `:latest` is multi-arch, from `make latest` (scripts/push-latest.sh).
+# ── Multi-arch release image (#898) ─────────────────────────────────────────
+# A `vX.Y.Z` tag publishes ONE manifest list for linux/amd64 and linux/arm64:
+#
+#   sqe-release-binaries     cargo zigbuild per arch on the amd64 runner
+#                            (glibc 2.28 floor, no QEMU), as `make latest` does
+#   sqe-release-image-arch   kaniko packages Dockerfile.ci per arch
+#                            (--custom-platform; the file is COPY-only)
+#   aikido-release-image     joins both into the index, tags :vX.Y.Z + :stable,
+#                            fails unless both platforms are listed, and writes
+#                            the index digest to image-digest.txt
+#   aikido-release-image-scan + sqe-release-image-scan-arm64
+#                            grype each platform of that digest
+#   aikido-publish-release-image + sqe-publish-latest
+#                            skopeo copy --all --preserve-digests to Harbor,
+#                            then read back: both platforms, same digest
+#   gitlab-release           release notes name the index digest
+#
+# The job names aikido-release-image and aikido-publish-release-image stay, so
+# the template's scan and signing jobs keep their `needs:`. No Docker daemon on
+# the runners, so no buildx: crane builds the index (scripts/ci-release-index.sh).
+#
+# Dry run on an MR: the `ci::multiarch` label (then run a new MR pipeline)
+# builds both architectures with dev-release and pushes them to this project's
+# registry as :mr-<iid> only. It never writes a release tag, :stable or Harbor:
+# the scan, mirror and release jobs are tag-only.
+.sqe_multiarch_rules:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+      exists:
+        - Dockerfile
+      variables:
+        CARGO_PROFILE: "release"
+        SQE_IMAGE_REF: "$CI_COMMIT_TAG"
+        SQE_IMAGE_TAGS: "$CI_COMMIT_TAG stable"
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)ci::multiarch(,|$)/'
+      variables:
+        CARGO_PROFILE: "dev-release"
+        SQE_IMAGE_REF: "mr-$CI_MERGE_REQUEST_IID"
+        SQE_IMAGE_TAGS: "mr-$CI_MERGE_REQUEST_IID"
+
+sqe-release-binaries:
+  rules: !reference [.sqe_multiarch_rules, rules]
+  interruptible: false
+  stage: test
+  needs: []
+  image: "$AIKIDO_RUST_IMAGE"
+  timeout: 90m
+  parallel:
+    matrix:
+      - SQE_ARCH: [amd64, arm64]
+  variables:
+    CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
+    CARGO_INCREMENTAL: "0"
+    CARGO_TERM_COLOR: "always"
+  cache:
+    key: "release-binaries-registry"
+    paths:
+      - .cargo-home/registry/
+  before_script:
+    - !reference [.aikido_rust_build_env, before_script]
+  script:
+    - bash scripts/ci-release-binaries.sh "$SQE_ARCH"
+  artifacts:
+    paths:
+      - dist/$SQE_ARCH/
+    expire_in: 7 days
+
+sqe-release-image-arch:
+  rules: !reference [.sqe_multiarch_rules, rules]
+  interruptible: false
+  stage: test
+  image:
+    name: "gcr.io/kaniko-project/executor:v1.23.2-debug@sha256:c3109d5926a997b100c4343944e06c6b30a6804b2f9abe0994d3de6ef92b028e"
+    entrypoint: [""]
+  parallel:
+    matrix:
+      - SQE_ARCH: [amd64, arm64]
+  needs:
+    - job: sqe-release-binaries
+      artifacts: true
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - |
+      AUTH=$(printf "%s:%s" "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')
+      printf '{"auths":{"%s":{"auth":"%s"}}}' "$CI_REGISTRY" "$AUTH" > /kaniko/.docker/config.json
+  script:
+    # One platform per run; the index job checks that the config says it.
+    - |
+      set -eu
+      CTX="$CI_PROJECT_DIR/dist/$SQE_ARCH"
+      cp "$CI_PROJECT_DIR/Dockerfile.ci" "$CTX/Dockerfile"
+      /kaniko/executor --context "$CTX" --dockerfile "$CTX/Dockerfile" --target runtime \
+        --custom-platform "linux/$SQE_ARCH" \
+        --build-arg "VERSION=$SQE_IMAGE_REF" --build-arg "BUILD_DATE=$CI_PIPELINE_CREATED_AT" \
+        --build-arg "GIT_REVISION=$CI_COMMIT_SHA" \
+        --destination "$CI_REGISTRY_IMAGE:$SQE_IMAGE_REF-$SQE_ARCH" \
+        --digest-file "image-digest-$SQE_ARCH.txt"
+      echo "linux/$SQE_ARCH $(cat "image-digest-$SQE_ARCH.txt")"
+  artifacts:
+    paths:
+      - image-digest-$SQE_ARCH.txt
+    expire_in: 7 days
+
+# Replaces the template's single-arch kaniko build of ./Dockerfile. Every key
+# the template sets is set here on purpose: GitLab merges a local job into the
+# included one key by key, so a key left out would keep the kaniko version.
+# `rules` by !reference, not `extends`: the included job's own rules would win
+# over an extended parent's.
+aikido-release-image:
+  rules: !reference [.sqe_multiarch_rules, rules]
+  interruptible: false
+  stage: test
+  image:
+    name: "$AIKIDO_TOOLS_IMAGE"
+    entrypoint: [""]
+  needs:
+    - job: sqe-release-image-arch
+      artifacts: true
+  before_script:
+    - mkdir -p "$HOME/.docker"
+    - |
+      AUTH=$(printf "%s:%s" "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')
+      printf '{"auths":{"%s":{"auth":"%s"}}}' "$CI_REGISTRY" "$AUTH" > "$HOME/.docker/config.json"
+  script:
+    - |
+      set -eu
+      # Belt and braces for the dry run: off a release tag, only :mr-<iid>.
+      if [ -z "${CI_COMMIT_TAG:-}" ]; then
+        for t in $SQE_IMAGE_TAGS; do
+          case "$t" in
+            mr-[0-9]*) ;;
+            *) echo "refusing to write :$t outside a release tag pipeline"; exit 1 ;;
+          esac
+        done
+      fi
+      # shellcheck disable=SC2086 # SQE_IMAGE_TAGS is a word list
+      bash scripts/ci-release-index.sh "$CI_REGISTRY_IMAGE" \
+        "$(cat image-digest-amd64.txt)" "$(cat image-digest-arm64.txt)" $SQE_IMAGE_TAGS
+  artifacts:
+    paths:
+      - image-digest.txt
+    expire_in: 7 days
+
+# grype resolves an index to one platform. The template scan job takes amd64
+# (pinned here, not left to the runner's arch); this one scans arm64 of the
+# same digest, and the mirror jobs need both.
+aikido-release-image-scan:
+  variables:
+    GRYPE_PLATFORM: "linux/amd64"
+
+sqe-release-image-scan-arm64:
+  extends: aikido-release-image-scan
+  variables:
+    GRYPE_PLATFORM: "linux/arm64"
+
+# The template mirrors with deploy_mirror.py, whose `skopeo copy` has no
+# --all: it would put only the runner's platform on Harbor, under another
+# digest. Same destination (chameleon/sqlengine/sqe) and tags, copied by digest.
+aikido-publish-release-image:
+  needs:
+    - job: aikido-release-image
+      artifacts: true
+    - job: aikido-release-image-scan
+    - job: sqe-release-image-scan-arm64
+  variables:
+    HARBOR: "repo.sovereign-data.org/chameleon"
+  script:
+    - |
+      set -eu
+      D="$(cat image-digest.txt)"
+      SRC_CREDS="$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD" \
+      DEST_CREDS="$REGISTRY_USERNAME:$REGISTRY_PASSWORD" \
+        bash scripts/ci-mirror-release.sh "$CI_REGISTRY_IMAGE@$D" "$D" \
+          "$HARBOR/$AIKIDO_IMAGE_NAME" "$CI_COMMIT_TAG" stable
+
+# The release on Harbor's other name, chameleon/sqe (the `make push` repo),
+# from the same digest. Fail-closed like the release mirror. `:latest` is not
+# written here: it follows main, from `make latest` (scripts/push-latest.sh).
 sqe-publish-latest:
   interruptible: false
   stage: .post
   image: "$AIKIDO_TOOLS_IMAGE"
   needs:
+    - job: aikido-release-image
+      artifacts: true
     - job: aikido-publish-release-image
   variables:
     HARBOR: "repo.sovereign-data.org/chameleon"
   script:
     - |
       set -eu
-      SRC="docker://$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG"
-      for DEST in sqe:$CI_COMMIT_TAG sqe:stable; do
-        skopeo copy --src-creds "$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD" \
-          --dest-creds "$REGISTRY_USERNAME:$REGISTRY_PASSWORD" \
-          "$SRC" "docker://$HARBOR/$DEST"
-        echo "mirrored -> $HARBOR/$DEST"
-      done
+      D="$(cat image-digest.txt)"
+      SRC_CREDS="$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD" \
+      DEST_CREDS="$REGISTRY_USERNAME:$REGISTRY_PASSWORD" \
+        bash scripts/ci-mirror-release.sh "$CI_REGISTRY_IMAGE@$D" "$D" \
+          "$HARBOR/sqe" "$CI_COMMIT_TAG" stable
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
       when: never
@@ -401,5 +575,32 @@ vendored-profile-drift:
 aikido-sast:
   allow_failure: false
 
+# The template's notes (the CHANGELOG section) plus the image digest. Created
+# only after both Harbor names hold the release.
 gitlab-release:
   extends: .aikido-gitlab-release
+  needs:
+    - job: aikido-release-image
+      artifacts: true
+    - job: aikido-publish-release-image
+    - job: sqe-publish-latest
+  script:
+    - V="${CI_COMMIT_TAG#v}"
+    - awk -v v="$V" 'index($0, "## [" v "]") == 1 {p=1; next} p && /^## \[/ {exit} p' CHANGELOG.md > release-notes.md
+    - '[ -s release-notes.md ] || echo "No CHANGELOG.md section for ${V}." > release-notes.md'
+    - |
+      set -eu
+      D="$(cat image-digest.txt)"
+      case "$D" in sha256:*) ;; *) echo "no index digest in image-digest.txt: '$D'"; exit 1 ;; esac
+      {
+        echo ""
+        echo "## Container image"
+        echo ""
+        echo "One manifest list for linux/amd64 and linux/arm64, digest \`$D\`:"
+        echo ""
+        echo "- \`repo.sovereign-data.org/chameleon/sqlengine/sqe:$CI_COMMIT_TAG\`"
+        echo "- \`repo.sovereign-data.org/chameleon/sqe:$CI_COMMIT_TAG\`"
+        echo ""
+        echo "Pin it as \`repo.sovereign-data.org/chameleon/sqlengine/sqe@$D\`."
+      } >> release-notes.md
+    - wc -l release-notes.md
