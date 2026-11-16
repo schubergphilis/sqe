@@ -12,6 +12,9 @@ Available at `http://coordinator:9090/metrics` in Prometheus text format.
 | `sqe_query_duration_seconds` | Histogram | `statement_type` | Query duration distribution |
 | `sqe_rows_returned_total` | Counter | — | Cumulative rows returned |
 | `sqe_active_queries` | Gauge | none | Queries that have not reached a terminal state |
+| `sqe_idle_seconds` | Gauge | none | 0 while a statement runs, else seconds since the last one finished (or since start); a scale-to-zero signal |
+| `sqe_admission_queue_length` | Gauge | none | Statements waiting in the admission queue for a global slot |
+| `sqe_admission_queue_wait_seconds` | Histogram | `outcome` | Time in the admission queue: `admitted`, `timeout`, `draining`, `cancelled` |
 | `sqe_active_sessions` | Gauge | — | Current active sessions |
 | `sqe_transactions_open` | Gauge | none | Explicit transactions open on this coordinator |
 | `sqe_transactions_ended_total` | Counter | `outcome` | Ended transactions: `committed`, `rolled_back`, `conflict`, `idle_timeout`, `lifetime`, `session_ended`, `shutdown` |

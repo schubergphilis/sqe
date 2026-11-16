@@ -908,6 +908,17 @@ impl WorkerFlightService {
         &self.status
     }
 
+    /// `Unavailable` once the worker drains for shutdown, so no new
+    /// fragment starts here (#902).
+    fn refuse_while_draining(&self) -> Result<(), Status> {
+        if self.status.is_draining() {
+            return Err(Status::unavailable(
+                "worker is shutting down; retry the fragment on another worker",
+            ));
+        }
+        Ok(())
+    }
+
     /// Current load vector for the heartbeat hello.
     ///
     /// `memory_limit_bytes` is the session pool limit (0 when unbounded).
@@ -1175,6 +1186,8 @@ impl FlightService for WorkerFlightService {
         // scan task or even validate its shape until the coordinator has
         // proven itself.
         self.verify_worker_secret(request.metadata())?;
+        // Shutting down: the coordinator retries the fragment elsewhere (#902).
+        self.refuse_while_draining()?;
 
         // Verify the HMAC over the exact ticket bytes (#206) before decoding or
         // executing. This proves the coordinator authored this precise task; a
@@ -1987,6 +2000,21 @@ mod tests {
             sign("expected-secret", &ticket).parse().unwrap(),
         );
         unwrap_err(svc.do_get(request).await)
+    }
+
+    /// Drain (#902): a draining worker refuses a new fragment `Unavailable`,
+    /// which the coordinator retries on another worker, before it decodes
+    /// the ticket.
+    #[tokio::test]
+    async fn a_draining_worker_refuses_new_fragments_unavailable() {
+        let svc = make_service("expected-secret");
+        let before = do_get_hmac_signed(&svc, b"junk".to_vec()).await;
+        assert_eq!(before.code(), tonic::Code::InvalidArgument);
+
+        svc.status().start_drain();
+        let err = do_get_hmac_signed(&svc, b"junk".to_vec()).await;
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert_eq!(svc.status().inflight_scans(), 0);
     }
 
     fn assert_task_invalid(err: &Status, needle: &str) {

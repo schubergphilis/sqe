@@ -998,13 +998,15 @@ pub struct CoordinatorConfig {
     /// Per-request timeout used when pushing refreshed credentials to a worker. Default: 10 s.
     #[serde(default = "default_credential_push_request_timeout_secs")]
     pub credential_push_request_timeout_secs: u64,
-    /// Grace period (seconds) to keep the process alive after SIGTERM before
-    /// shutting down the Flight server. On SIGTERM the readiness probe flips to
-    /// NOT-ready first so the Kubernetes Service stops routing new work, then
-    /// the process sleeps this long to let already-routed connections drain
-    /// before the tonic graceful boundary cuts remaining streams. Keep this
-    /// shorter than the pod's `terminationGracePeriodSeconds` so the process
-    /// exits cleanly before SIGKILL. Default: 25 s. Issue #250.
+    /// Upper bound (seconds) on the shutdown drain after SIGTERM. The readiness
+    /// probe flips to NOT-ready so the Kubernetes Service stops routing new
+    /// work, new and queued statements are refused with reason `draining`
+    /// (a worker refuses new fragments with `Unavailable`), and the process
+    /// waits until no statement (worker: no scan) runs or this bound passes,
+    /// whichever comes first, before the tonic graceful boundary cuts
+    /// remaining streams. `0` skips the wait. Keep this shorter than the pod's
+    /// `terminationGracePeriodSeconds` so the process exits cleanly before
+    /// SIGKILL. Default: 25 s. Issues #250, #902.
     #[serde(default = "default_shutdown_drain_secs")]
     pub shutdown_drain_secs: u64,
     /// When `true`, refuse to start if dev-only auth providers, disabled rate

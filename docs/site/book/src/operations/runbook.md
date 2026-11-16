@@ -277,11 +277,20 @@ it still OOMKilled, the engine `memory_limit` sits too close to the pod limit.
   | `memory_budget` | the user's memory budget is spent | `[rate_limit]` |
   | `memory_pressure` | the pool is red | `pressure_admission_memory` |
   | `rate_limited` | the per-user request rate | `[rate_limit]` |
+  | `draining` | the coordinator is shutting down; retry on another one | `shutdown_drain_secs` |
 
   With `queue_max > 0`, a statement that finds every slot taken waits in a
   queue served round robin per user, so one user's burst does not starve the
   others. `sqe_admission_queue_length` and
   `sqe_admission_queue_wait_seconds{outcome}` show the queue.
+- On SIGTERM the coordinator flips `/readyz` to 503, refuses new and queued
+  statements with `draining`, and waits until no statement runs or
+  `coordinator.shutdown_drain_secs` (25 s) passes, then exits. A statement
+  still running at the bound is cut off. A worker refuses new fragments with
+  `Unavailable` (the coordinator retries them on another worker) and waits
+  for its running scans within the same bound. Keep the bound below the
+  pod's `terminationGracePeriodSeconds`. A second signal exits at once.
+  `sqe_idle_seconds` reads how long the coordinator has run nothing.
 
 **Escalation.** Repeated OOMKills after lowering the engine limit, with spill
 active, means a single query is too large for the node. Capture the query from

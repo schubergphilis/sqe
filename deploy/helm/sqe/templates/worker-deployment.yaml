@@ -27,8 +27,8 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      # On SIGTERM the worker flips readiness to NOT-ready, drains for
-      # coordinator.shutdown_drain_secs, then stops. Keep this above that
+      # On SIGTERM the worker flips readiness to NOT-ready, drains until no
+      # scan runs or coordinator.shutdown_drain_secs passes, then stops. Keep this above that
       # drain so in-flight scans finish before SIGKILL (issue #250).
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:

@@ -1341,10 +1341,13 @@ mod tests {
         let mut stream = TrackedRecordBatchStream::new(inner, fin, None);
 
         let _first = stream.next().await.unwrap().unwrap();
+        assert_eq!(tracker.active_count(), 1);
         drop(stream);
 
         let record = find_record(&tracker, qid);
         assert_eq!(record.state, QueryState::Canceled);
+        // The drain and `sqe_idle_seconds` read `active_count()` (#902).
+        assert_eq!(tracker.active_count(), 0);
     }
 
     #[tokio::test]

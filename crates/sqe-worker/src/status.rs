@@ -44,6 +44,8 @@ pub struct WorkerStatus {
     /// serving tickets so a coordinator that flaps does not take every worker
     /// with it.
     coordinator_accepted: AtomicBool,
+    /// Set on shutdown: new fragments are refused `Unavailable` (#902).
+    draining: AtomicBool,
     capacity_probe: OnceLock<CapacityProbe>,
 }
 
@@ -54,6 +56,7 @@ impl std::fmt::Debug for WorkerStatus {
             .field("inflight_scans", &self.inflight_scans())
             .field("failures_since_last", &self.failures_since_last())
             .field("coordinator_accepted", &self.coordinator_accepted())
+            .field("draining", &self.is_draining())
             .field("capacity_probe", &self.capacity_probe.get().is_some())
             .finish()
     }
@@ -67,8 +70,19 @@ impl WorkerStatus {
             inflight_scans: AtomicU32::new(0),
             failures_since_last: AtomicU32::new(0),
             coordinator_accepted: AtomicBool::new(true),
+            draining: AtomicBool::new(false),
             capacity_probe: OnceLock::new(),
         })
+    }
+
+    /// Stop taking fragments for shutdown; running scans finish.
+    pub fn start_drain(&self) {
+        self.draining.store(true, Ordering::Release);
+    }
+
+    /// True once [`WorkerStatus::start_drain`] ran.
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
     }
 
     /// Stable for the life of the process; changes on restart.

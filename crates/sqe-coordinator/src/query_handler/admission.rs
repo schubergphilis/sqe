@@ -52,6 +52,10 @@ impl QueryHandler {
         sql: &str,
         what: &str,
     ) -> sqe_core::Result<Admission> {
+        // Shutting down: nothing new starts, so the drain can end (#902).
+        if self.draining.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(super::admission_queue::draining_refusal());
+        }
         // Metadata statements (SHOW, DESCRIBE, EXPLAIN without ANALYZE) read
         // catalog state and plan; they never execute a scan. See below.
         let metadata = is_metadata_statement(sql);
@@ -404,6 +408,30 @@ mod queue_tests {
         let queue = h.admission_queue.as_ref().unwrap();
         assert_eq!(queue.waiting(), 0, "not queued");
         run(&h, "b").await.expect("another user runs");
+    }
+
+    /// Drain (D4): a queued statement and any later one are refused
+    /// `draining`; the running one keeps its slot. Without a global cap
+    /// the flag alone refuses.
+    #[tokio::test]
+    async fn after_start_drain_queued_and_new_statements_are_refused_draining() {
+        let h = handler("max_concurrent_queries = 1\nqueue_max = 4\nqueue_timeout_secs = 30");
+        let running = hold(&h, "a").await;
+        let h2 = Arc::clone(&h);
+        let queued = tokio::spawn(async move { run(&h2, "b").await });
+        wait_for_waiters(&h, 1).await;
+
+        h.start_drain();
+        let queued = queued.await.expect("join");
+        assert_eq!(reason(queued), Some(RefusalReason::Draining));
+        assert_eq!(reason(run(&h, "c").await), Some(RefusalReason::Draining));
+        drop(running);
+        assert_eq!(reason(run(&h, "c").await), Some(RefusalReason::Draining));
+
+        let h = handler("max_concurrent_queries = 0");
+        run(&h, "a").await.expect("runs before the drain");
+        h.start_drain();
+        assert_eq!(reason(run(&h, "a").await), Some(RefusalReason::Draining));
     }
 }
 
