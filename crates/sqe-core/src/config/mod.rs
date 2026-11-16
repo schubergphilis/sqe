@@ -1935,6 +1935,16 @@ pub struct CatalogConfig {
     /// re-checked. Set to `0` to re-check on every lookup. Default: 10.
     #[serde(default = "default_authorization_recheck_secs")]
     pub authorization_recheck_secs: u64,
+    /// Check each table a statement loads against the catalog once per
+    /// statement (a conditional `GET loadTable`, 304 when unchanged), even
+    /// inside `metadata_cache_ttl_secs`. Tags (`sqe.column-tags`) another
+    /// engine commits then mask the next query instead of after the TTL
+    /// (#903). Unset: on whenever `policy.engine` is not `passthrough`.
+    /// Cost: one round trip per table per statement, which also stands in
+    /// for the `authorization_recheck_secs` HEAD. Read from `[catalog]`
+    /// only, like the TTL: the metadata cache is process-wide.
+    #[serde(default)]
+    pub revalidate_each_statement: Option<bool>,
     /// Default Iceberg table format version for new tables (2 or 3).
     /// Default: 3.
     #[serde(default = "default_table_format_version")]
@@ -4193,6 +4203,14 @@ impl SqeConfig {
     /// see the same SQL identifier.
     pub const LEGACY_CATALOG_NAME: &'static str = "iceberg";
 
+    /// `catalog.revalidate_each_statement`, defaulted: on whenever a policy
+    /// engine enforces tags, because a tag committed by another engine must
+    /// mask the next query, not the one after the metadata TTL (#903).
+    pub fn revalidate_each_statement(&self) -> bool {
+        let enforcing = self.policy.engine != PolicyEngine::Passthrough;
+        self.catalog.revalidate_each_statement.unwrap_or(enforcing)
+    }
+
     /// Flatten the legacy `[catalog]` block plus the `[catalogs.*]`
     /// map into a single ordered list of named catalogs. Order is
     /// stable: legacy block first if it's the only one, otherwise
@@ -6082,6 +6100,7 @@ partial_progress_batch = 5
                 request_timeout_secs: 30,
                 connect_timeout_secs: 5,
                 authorization_recheck_secs: 10,
+                revalidate_each_statement: None,
                 default_table_format_version: 3,
                 trust_sort_order: false,
                 namespace_visibility_filter: true,
@@ -7613,6 +7632,7 @@ s3_secret_key = "configured-secret"
                 request_timeout_secs: 30,
                 connect_timeout_secs: 5,
                 authorization_recheck_secs: 10,
+                revalidate_each_statement: None,
                 default_table_format_version: 3,
                 trust_sort_order: false,
                 namespace_visibility_filter: true,
@@ -7655,6 +7675,7 @@ s3_secret_key = "configured-secret"
                     request_timeout_secs: 30,
                     connect_timeout_secs: 5,
                     authorization_recheck_secs: 10,
+                    revalidate_each_statement: None,
                     default_table_format_version: 3,
                     trust_sort_order: false,
                     namespace_visibility_filter: true,
@@ -7704,6 +7725,7 @@ s3_secret_key = "configured-secret"
                 request_timeout_secs: 30,
                 connect_timeout_secs: 5,
                 authorization_recheck_secs: 10,
+                revalidate_each_statement: None,
                 default_table_format_version: 3,
                 trust_sort_order: false,
                 namespace_visibility_filter: true,
@@ -9308,6 +9330,22 @@ audience = "polaris"
         config.policy.engine = PolicyEngine::Passthrough;
         config.catalog.metadata_cache_ttl_secs = 0;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn statement_revalidation_defaults_on_when_a_policy_engine_enforces() {
+        // #903: a tag committed by another engine must mask the next query.
+        let mut config = valid_config();
+        config.policy.engine = PolicyEngine::InMemory;
+        assert!(config.revalidate_each_statement());
+        config.policy.engine = PolicyEngine::Passthrough;
+        let passthrough = config.revalidate_each_statement();
+        assert!(!passthrough, "no policy, no tags to see");
+        config.catalog.revalidate_each_statement = Some(true);
+        assert!(config.revalidate_each_statement(), "explicit setting wins");
+        config.policy.engine = PolicyEngine::InMemory;
+        config.catalog.revalidate_each_statement = Some(false);
+        assert!(!config.revalidate_each_statement(), "explicit opt-out wins");
     }
 
     #[test]

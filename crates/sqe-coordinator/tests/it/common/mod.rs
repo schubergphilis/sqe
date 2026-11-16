@@ -405,7 +405,12 @@ pub async fn setup_ranger_handler_sharing(
         sqe_core::SqeConfig::load(&ranger_config_path()).expect("load tests/sqe-ranger-test.toml");
     mutate(&mut config);
     let config = config;
-    let table_cache = existing_cache.unwrap_or_else(|| sqe_catalog::TableMetadataCache::new(30));
+    // Sized from the config like the server's cache (default 30 s).
+    let ttl = config.catalog.metadata_cache_ttl_secs;
+    let revalidate = config.revalidate_each_statement();
+    let table_cache = existing_cache.unwrap_or_else(|| {
+        sqe_catalog::TableMetadataCache::new(ttl).with_statement_revalidation(revalidate)
+    });
     let (enforcer, store) = sqe_coordinator::policy_wiring::build_policy_enforcer(
         &config.policy,
         Some(table_cache.clone()),
