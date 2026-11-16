@@ -260,6 +260,9 @@ snapshot_interval_secs = 60     # How often file persistence snapshots sessions 
 timeout_secs = 300              # 5 min, max execution time per query
 max_result_rows = 1000000       # Max rows per query (0 = unlimited)
 max_concurrent_queries = 100    # Concurrency limit (0 = unlimited)
+queue_max = 0                   # Statements that may wait for a slot when all are taken,
+                                # served round robin per user. 0 refuses at once.
+queue_timeout_secs = 30         # How long a queued statement waits before it is refused
 max_query_memory = "256MB"      # Per-query memory limit
 pressure_admission_memory = "64MB" # Per-query cap for a read admitted while the coordinator
                                 # pool is red (>95% used). SHOW/DESCRIBE/EXPLAIN pass at red;

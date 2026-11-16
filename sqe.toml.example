@@ -425,6 +425,12 @@ hash_join_memory_threshold = "2GB"
 # Default: 1048576 (1 MiB). Set to 0 for unlimited; production_mode refuses
 # 0 so a production coordinator cannot accept arbitrarily large statements.
 # max_sql_bytes = 1048576
+# Admission queue (#902). With every max_concurrent_queries slot taken, up to
+# queue_max statements wait (round robin per user) for queue_timeout_secs.
+# Default 0 refuses at once. Refusals are RESOURCE_EXHAUSTED with a reason:
+# Flight metadata x-sqe-refusal-reason, Trino errorName SQE_<REASON>.
+# queue_max = 0
+# queue_timeout_secs = 30
 # Cap concurrent CTAS/INSERT with a top-level ORDER BY (issue #408). Extra
 # sorted writes are rejected with ResourceExhausted, not queued. Default 2.
 # A dbt or bench run that used to fire 4 parallel sorted loads will fail 2

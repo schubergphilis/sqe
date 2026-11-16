@@ -1142,11 +1142,29 @@ async fn call_tool(
                 state.config.max_response_bytes,
             )))
         }
-        Err(error) => Ok(tool_failure(with_decimal_hint(with_refresh_hint(
-            name,
-            client_error_text(&error),
-        )))),
+        Err(error) => {
+            let text = with_decimal_hint(with_refresh_hint(name, client_error_text(&error)));
+            Ok(match error.refusal_reason() {
+                Some(reason) => refusal_failure(reason, text),
+                None => tool_failure(text),
+            })
+        }
     }
+}
+
+/// A statement refused before it ran (busy, over a budget, draining):
+/// `structuredContent.error` names the reason so an agent can tell "retry
+/// later" from a failure of its SQL (#902). A rate-limit denial keeps its
+/// `retry_after_seconds` shape.
+fn refusal_failure(reason: sqe_core::RefusalReason, message: String) -> Value {
+    if retry_after_in(&message).is_some() {
+        return tool_failure(message);
+    }
+    json!({
+        "content":[{"type":"text","text":message}],
+        "isError":true,
+        "structuredContent":{"error":reason.as_str(),"detail":message},
+    })
 }
 
 /// What the model is told when the engine fails (#675). A user error (bad
@@ -3821,7 +3839,16 @@ mod tests {
         assert_eq!(failure["isError"], true);
         assert_eq!(failure["structuredContent"]["error"], "rate_limited");
         assert_eq!(failure["structuredContent"]["retry_after_seconds"], 3);
-        assert!(tool_failure("table not found".to_string()).get("structuredContent").is_none());
+        let plain = tool_failure("table not found".to_string());
+        assert!(plain.get("structuredContent").is_none());
+
+        // An admission refusal names its reason (#902).
+        let busy = refusal_failure(
+            sqe_core::RefusalReason::QueueFull,
+            "Too many concurrent queries (2 active, 0 queued). Please retry later.".to_string(),
+        );
+        assert_eq!(busy["isError"], true);
+        assert_eq!(busy["structuredContent"]["error"], "queue_full");
 
         let seen = auth.seen.lock().unwrap();
         assert_eq!(seen.len(), 2);

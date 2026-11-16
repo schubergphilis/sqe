@@ -263,6 +263,25 @@ it still OOMKilled, the engine `memory_limit` sits too close to the pod limit.
   every other statement except `SHOW`/`DESCRIBE`/`EXPLAIN` is refused,
   including `SET` and transaction control. Set it to `"0"` to refuse reads
   at red too.
+- A statement refused before it ran is `RESOURCE_EXHAUSTED` with a reason:
+  the Flight metadata key `x-sqe-refusal-reason`, the Trino `errorName`
+  `SQE_<REASON>` (errorType `INSUFFICIENT_RESOURCES`), and the MCP
+  `structuredContent.error`. A memory failure of a running statement has the
+  same code and no reason.
+
+  | Reason | Cause | Knob |
+  |---|---|---|
+  | `queue_full` | every slot taken and the queue full (or no queue) | `max_concurrent_queries`, `queue_max` |
+  | `queue_timeout` | waited `queue_timeout_secs` for a slot | `queue_timeout_secs` |
+  | `user_limit` | the user is at their own concurrency limit; never queued | `max_concurrent_per_user` |
+  | `memory_budget` | the user's memory budget is spent | `[rate_limit]` |
+  | `memory_pressure` | the pool is red | `pressure_admission_memory` |
+  | `rate_limited` | the per-user request rate | `[rate_limit]` |
+
+  With `queue_max > 0`, a statement that finds every slot taken waits in a
+  queue served round robin per user, so one user's burst does not starve the
+  others. `sqe_admission_queue_length` and
+  `sqe_admission_queue_wait_seconds{outcome}` show the queue.
 
 **Escalation.** Repeated OOMKills after lowering the engine limit, with spill
 active, means a single query is too large for the node. Capture the query from

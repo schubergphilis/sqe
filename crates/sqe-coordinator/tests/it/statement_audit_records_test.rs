@@ -216,13 +216,18 @@ async fn an_admission_refusal_writes_one_audit_record() {
         .execute(&session_for("admission-user"), sql, None)
         .await
         .expect_err("over the per-user memory budget");
-    assert_eq!(err.error_code(), SqeErrorCode::ExecutionFailed, "{err}");
+    assert_eq!(err.error_code(), SqeErrorCode::ResourceExhausted, "{err}");
+    assert_eq!(
+        err.refusal_reason(),
+        Some(sqe_core::RefusalReason::MemoryBudget),
+        "{err}"
+    );
     assert!(
         err.to_string().contains("Per-user memory budget exceeded"),
         "{err}"
     );
 
-    Written::of(&fx).one_failure(sql, "EXECUTION_FAILED");
+    Written::of(&fx).one_failure(sql, "RESOURCE_EXHAUSTED");
     assert!(fx.handler.query_tracker().records().is_empty());
 }
 

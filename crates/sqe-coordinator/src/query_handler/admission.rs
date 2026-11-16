@@ -16,7 +16,8 @@
 //!    once it is classified ([`QueryHandler::refuse_under_pressure`]);
 //! 2. the per-user concurrency permit, so one tenant cannot hold every
 //!    global permit while under their own submission rate limit;
-//! 3. the global concurrency permit;
+//! 3. the global concurrency slot, waiting in the fair queue of
+//!    `admission_queue` when `query.queue_max` allows (#902);
 //! 4. the per-user memory reservation.
 //!
 //! Permits and the reservation are owned values. The buffered path drops
@@ -25,11 +26,15 @@
 //! draining, not when planning returns.
 
 use super::*;
+use sqe_core::RefusalReason;
 
 /// What admission granted. Dropping it releases everything.
 pub(crate) struct Admission {
-    /// Per-user permit first, then the global one, when either cap is on.
+    /// The per-user permit, when that cap is on.
     pub permits: Vec<tokio::sync::OwnedSemaphorePermit>,
+    /// The global slot, when `max_concurrent_queries` is on. Its drop admits
+    /// the next queued statement (#902).
+    pub global: Option<super::GlobalPermit>,
     /// The per-user memory reservation, when the budget is on.
     pub memory_reservation: Option<crate::memory::PerUserReservation>,
     /// The cap the statement executes under (`max_query_memory`, or the
@@ -41,7 +46,7 @@ pub(crate) struct Admission {
 impl QueryHandler {
     /// Run the admission gates for one statement. `what` names the entry
     /// point in the pressure-rejection log line ("query", "streaming query").
-    pub(crate) fn admit(
+    pub(crate) async fn admit(
         &self,
         session: &Session,
         sql: &str,
@@ -87,6 +92,9 @@ impl QueryHandler {
             quota = crate::query_memory::QueryQuota::under_pressure(bytes);
         }
 
+        // Refusals from here on are RESOURCE_EXHAUSTED with a reason, so a
+        // client can tell "busy, retry" from a failure of its statement
+        // (#902).
         let mut permits = Vec::new();
         if self.config.query.max_concurrent_per_user > 0 {
             let username = session.user.username.clone();
@@ -102,8 +110,10 @@ impl QueryHandler {
             match sem.try_acquire_owned() {
                 Ok(p) => permits.push(p),
                 Err(_) => {
-                    return Err(SqeError::with_code(
-                        SqeErrorCode::ExecutionFailed,
+                    // Not queued: the user's own statements would free the
+                    // slot, and a queue would hide a client that floods.
+                    return Err(SqeError::refused(
+                        RefusalReason::UserLimit,
                         format!(
                             "Too many concurrent queries for user '{}' ({} active). Please retry later.",
                             username, self.config.query.max_concurrent_per_user
@@ -112,20 +122,12 @@ impl QueryHandler {
                 }
             }
         }
-        if let Some(ref sem) = self.query_semaphore {
-            match Arc::clone(sem).try_acquire_owned() {
-                Ok(p) => permits.push(p),
-                Err(_) => {
-                    return Err(SqeError::with_code(
-                        SqeErrorCode::ExecutionFailed,
-                        format!(
-                            "Too many concurrent queries ({} active). Please retry later.",
-                            self.config.query.max_concurrent_queries
-                        ),
-                    ));
-                }
-            }
-        }
+        // The global slot, waiting in the fair queue when all are taken.
+        // A refusal or a timeout drops the per-user permit above.
+        let global = match &self.admission_queue {
+            Some(queue) => Some(queue.acquire(&session.user.username).await?),
+            None => None,
+        };
 
         // Per-user memory reservation. Reject when this user's in-flight
         // queries would push past their share of the global pool, before
@@ -153,8 +155,8 @@ impl QueryHandler {
                 Some(r) => Some(r),
                 None => {
                     let used = self.per_user_memory.used_bytes(&username);
-                    return Err(SqeError::with_code(
-                        SqeErrorCode::ExecutionFailed,
+                    return Err(SqeError::refused(
+                        RefusalReason::MemoryBudget,
                         format!(
                             "Per-user memory budget exceeded for '{}': {} bytes reserved, \
                                  limit {} bytes. Wait for in-flight queries to complete.",
@@ -169,6 +171,7 @@ impl QueryHandler {
 
         Ok(Admission {
             permits,
+            global,
             memory_reservation,
             memory: crate::query_memory::StatementMemory::new(
                 Arc::clone(&self.runtime.memory_pool),
@@ -183,9 +186,13 @@ impl QueryHandler {
     /// red pool, concurrency permits, per-user reservation). Its fan-out
     /// buffers reserve from `admission.memory.pool()` (#788). Hold the
     /// `Admission` until the ingest commits.
-    pub(crate) fn admit_ingest(&self, session: &Session, table: &str) -> sqe_core::Result<Admission> {
+    pub(crate) async fn admit_ingest(
+        &self,
+        session: &Session,
+        table: &str,
+    ) -> sqe_core::Result<Admission> {
         let sql = format!("INSERT INTO {table}");
-        let admission = self.admit(session, &sql, "ingest")?;
+        let admission = self.admit(session, &sql, "ingest").await?;
         self.refuse_under_pressure(&admission, false, &sql)?;
         Ok(admission)
     }
@@ -211,9 +218,10 @@ impl QueryHandler {
 /// The refusal a statement gets at red without a pressure-admission cap.
 fn pressure_rejection(sql: &str, pressure: crate::memory::MemoryPressure) -> SqeError {
     let sort_cols = extract_order_by_columns(sql);
-    SqeError::Execution(adaptive_sort::format_pressure_rejection(
-        &sort_cols, pressure,
-    ))
+    SqeError::refused(
+        RefusalReason::MemoryPressure,
+        adaptive_sort::format_pressure_rejection(&sort_cols, pressure),
+    )
 }
 
 /// True when the statement only reads catalog metadata or plans: `SHOW ...`,
@@ -267,6 +275,136 @@ fn leading_keywords(sql: &str, n: usize) -> Vec<String> {
         rest = &rest[end..];
     }
     out
+}
+
+/// The queue end to end through `execute`, on a handler with no catalog: a
+/// held `Admission` is the statement that keeps the only slot busy (#902).
+#[cfg(test)]
+mod queue_tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use sqe_core::RefusalReason;
+
+    fn handler(query: &str) -> Arc<super::QueryHandler> {
+        let mut config: sqe_core::SqeConfig = toml::from_str(&format!(
+            "[coordinator]\n\n[auth]\n\n[catalog]\ncatalog_url = \"\"\n\n[query]\n{query}\n"
+        ))
+        .expect("config parses");
+        if !query.contains("max_concurrent_per_user") {
+            config.query.max_concurrent_per_user = 0;
+        }
+        Arc::new(
+            super::QueryHandler::new(
+                Arc::new(sqe_policy::PassthroughEnforcer),
+                None,
+                config.clone(),
+                None,
+                None,
+                None,
+                None,
+                Arc::new(crate::query_tracker::QueryTracker::new(
+                    &config.query_history,
+                )),
+                None,
+                None,
+                None,
+                crate::runtime_catalog::RuntimeCatalogRegistry::new(),
+                sqe_core::SecretStore::new(),
+            )
+            .expect("QueryHandler::new"),
+        )
+    }
+
+    fn session(user: &str) -> sqe_core::Session {
+        sqe_core::Session::new(
+            user.to_string(),
+            sqe_core::SecretString::new("tok".to_string()),
+            None,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            Vec::new(),
+        )
+    }
+
+    async fn wait_for_waiters(h: &super::QueryHandler, n: usize) {
+        let queue = h.admission_queue.as_ref().expect("queue on");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while queue.waiting() != n {
+            let waiting = queue.waiting();
+            assert!(Instant::now() < deadline, "{waiting} waiting, want {n}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn hold(h: &super::QueryHandler, user: &str) -> super::Admission {
+        let admitted = h.admit(&session(user), "SELECT 1", "query").await;
+        admitted.expect("slot")
+    }
+
+    async fn run(h: &super::QueryHandler, user: &str) -> Result<(), sqe_core::SqeError> {
+        h.execute(&session(user), "SELECT 1", None).await.map(drop)
+    }
+
+    fn reason(result: Result<(), sqe_core::SqeError>) -> Option<RefusalReason> {
+        let err = result.expect_err("refused");
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::ResourceExhausted);
+        err.refusal_reason()
+    }
+
+    /// Acceptance 1: with one slot and one queue place, the second statement
+    /// waits and runs after the first, the third is refused `queue_full`.
+    #[tokio::test]
+    async fn the_second_statement_waits_and_the_third_is_refused() {
+        let h = handler("max_concurrent_queries = 1\nqueue_max = 1\nqueue_timeout_secs = 30");
+        let first = hold(&h, "a").await;
+
+        let h2 = Arc::clone(&h);
+        let second =
+            tokio::spawn(async move { h2.execute(&session("b"), "SELECT 42 AS v", None).await });
+        wait_for_waiters(&h, 1).await;
+
+        assert_eq!(reason(run(&h, "c").await), Some(RefusalReason::QueueFull));
+
+        drop(first);
+        let result = second.await.expect("join").expect("ran after the first");
+        assert_eq!(result.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        // The slot went back: the next statement runs at once.
+        run(&h, "c").await.expect("free slot");
+    }
+
+    /// Acceptance 2: a queued statement whose slot stays busy is refused
+    /// with `queue_timeout` after `queue_timeout_secs`.
+    #[tokio::test]
+    async fn a_queued_statement_times_out() {
+        let h = handler("max_concurrent_queries = 1\nqueue_max = 4\nqueue_timeout_secs = 1");
+        let _busy = hold(&h, "a").await;
+        let started = Instant::now();
+        let refused = reason(run(&h, "b").await);
+        assert_eq!(refused, Some(RefusalReason::QueueTimeout));
+        let waited = started.elapsed();
+        let in_window = waited >= Duration::from_millis(900) && waited < Duration::from_secs(5);
+        assert!(in_window, "{waited:?}");
+        assert_eq!(h.admission_queue.as_ref().unwrap().waiting(), 0);
+    }
+
+    /// Acceptance 4 of the queue spec: `queue_max = 0` (the default) refuses
+    /// at once; a user at their own limit is refused `user_limit`, not queued.
+    #[tokio::test]
+    async fn without_a_queue_and_at_the_user_limit_statements_are_refused_at_once() {
+        let h = handler("max_concurrent_queries = 1");
+        let held = hold(&h, "a").await;
+        let started = Instant::now();
+        assert_eq!(reason(run(&h, "b").await), Some(RefusalReason::QueueFull));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(held);
+
+        let h = handler("max_concurrent_queries = 4\nqueue_max = 4\nmax_concurrent_per_user = 1");
+        let _mine = hold(&h, "a").await;
+        assert_eq!(reason(run(&h, "a").await), Some(RefusalReason::UserLimit));
+        let queue = h.admission_queue.as_ref().unwrap();
+        assert_eq!(queue.waiting(), 0, "not queued");
+        run(&h, "b").await.expect("another user runs");
+    }
 }
 
 #[cfg(test)]

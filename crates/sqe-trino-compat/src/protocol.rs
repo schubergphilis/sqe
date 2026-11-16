@@ -86,10 +86,16 @@ impl TrinoErrorExt for TrinoError {
         let code = e.error_code();
         let message = e.client_message();
         let error_type = code.trino_error_type().to_string();
+        // A refusal names its reason, `SQE_QUEUE_FULL` and so on, so a
+        // Trino client can tell "busy, retry" from a failure (#902).
+        let error_name = match e.refusal_reason() {
+            Some(reason) => format!("SQE_{}", reason.as_str().to_ascii_uppercase()),
+            None => code.name().to_string(),
+        };
         Self {
             message: message.clone(),
             error_code: code.trino_error_code(),
-            error_name: code.name().to_string(),
+            error_name,
             error_type: error_type.clone(),
             query_id: query_id.map(|s| s.to_string()),
             failure_info: Some(TrinoFailureInfo {
@@ -547,6 +553,29 @@ mod tests {
 
         let panic = TrinoError::internal_error("query task terminated unexpectedly", None);
         assert_eq!(panic.error_type, "INTERNAL_ERROR");
+    }
+
+    /// A refusal before the statement ran names its reason in `errorName`,
+    /// so a Trino client can tell "busy, retry" from a memory failure of
+    /// its statement, which keeps `RESOURCE_EXHAUSTED` (#902).
+    #[test]
+    fn a_refusal_names_its_reason() {
+        let refused = sqe_core::SqeError::refused(
+            sqe_core::RefusalReason::QueueFull,
+            "Too many concurrent queries (2 active, 0 queued). Please retry later.",
+        );
+        let err = TrinoError::from_sqe_error(&refused, Some("q1"));
+        assert_eq!(err.error_type, "INSUFFICIENT_RESOURCES");
+        assert_eq!(err.error_name, "SQE_QUEUE_FULL");
+        let busy = err.message.contains("Too many concurrent queries");
+        assert!(busy, "{}", err.message);
+
+        let failure = sqe_core::SqeError::with_code(
+            sqe_core::SqeErrorCode::ResourceExhausted,
+            "memory limit hit while sorting",
+        );
+        let err = TrinoError::from_sqe_error(&failure, None);
+        assert_eq!(err.error_name, "RESOURCE_EXHAUSTED");
     }
 
     #[test]

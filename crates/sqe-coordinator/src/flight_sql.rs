@@ -1752,7 +1752,10 @@ impl SqeFlightSqlService {
         // The ingest passes the same admission as an INSERT and its buffers
         // count against `query.max_query_memory` (#788). `admission` holds
         // the permits and the per-user reservation until the commit.
-        let admission = self.query_handler.admit_ingest(&session, &qualified)?;
+        let admission = self
+            .query_handler
+            .admit_ingest(&session, &qualified)
+            .await?;
         // What to do with a missing or an existing table (#881). The stream's
         // schema is read only when a missing table would be created from it.
         let mode = crate::flight_ingest::ingest_mode(ticket.table_definition_options.as_ref())?;

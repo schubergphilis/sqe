@@ -42,6 +42,7 @@ use crate::write_handler::WriteHandler;
 // share this module's private state. Admission is the first.
 mod access_control;
 mod admission;
+mod admission_queue;
 mod catalog;
 mod ddl;
 mod show;
@@ -49,6 +50,7 @@ mod time_travel;
 use time_travel::TimeTravelCleanup;
 mod write;
 pub(crate) use admission::Admission;
+pub(crate) use admission_queue::GlobalPermit;
 
 /// Per-query resource metrics extracted from the executed physical plan tree.
 ///
@@ -403,14 +405,15 @@ pub struct QueryHandler {
     lineage: Option<Arc<dyn LineageSink>>,
     query_tracker: Arc<QueryTracker>,
     query_cache: Option<Arc<ResultCache>>,
-    /// Semaphore limiting global concurrent query execution.
-    query_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    /// The global concurrency slots and the fair queue in front of them
+    /// (#902). `None` when `max_concurrent_queries` is 0 (unlimited).
+    admission_queue: Option<Arc<admission_queue::AdmissionQueue>>,
     /// Caps concurrent sorted CTAS / INSERT (issue #408). `None` means unlimited.
     sorted_write_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     /// Per-user concurrency semaphores. Lazily created on first query per
     /// username. Each entry caps how many simultaneous queries one user can
     /// hold against the global pool, preventing a single tenant from
-    /// monopolising `query_semaphore`.
+    /// monopolising the global slots.
     per_user_semaphores: Arc<dashmap::DashMap<String, Arc<tokio::sync::Semaphore>>>,
     /// Tracks per-user reserved memory bytes for admission. Reservations are
     /// recorded at admit time and released when the streaming result wrapper
@@ -612,10 +615,13 @@ impl QueryHandler {
             policy_enforcer.permits_result_cache() || policy_enforcer.policy_fingerprint().is_some()
         });
 
-        let query_semaphore = if config.query.max_concurrent_queries > 0 {
-            Some(Arc::new(tokio::sync::Semaphore::new(
+        let admission_queue = if config.query.max_concurrent_queries > 0 {
+            Some(admission_queue::AdmissionQueue::new(
                 config.query.max_concurrent_queries,
-            )))
+                config.query.queue_max,
+                std::time::Duration::from_secs(config.query.queue_timeout_secs),
+                metrics.clone(),
+            ))
         } else {
             None
         };
@@ -703,7 +709,7 @@ impl QueryHandler {
             lineage: lineage.map(|o| o as Arc<dyn LineageSink>),
             query_tracker,
             query_cache,
-            query_semaphore,
+            admission_queue,
             sorted_write_semaphore,
             per_user_semaphores: Arc::new(dashmap::DashMap::new()),
             per_user_memory: Arc::new(crate::memory::PerUserMemoryRegistry::new()),
@@ -1386,16 +1392,12 @@ impl QueryHandler {
         };
         match Arc::clone(sem).try_acquire_owned() {
             Ok(p) => Ok(Some(p)),
-            Err(_) => Err(SqeError::sourced(
-                SqeErrorCode::ResourceExhausted,
+            Err(_) => Err(SqeError::refused(
+                sqe_core::RefusalReason::QueueFull,
                 format!(
                     "Too many concurrent sorted writes ({} active). Retry or raise \
                      query.max_concurrent_sorted_writes.",
                     self.config.query.max_concurrent_sorted_writes
-                ),
-                std::io::Error::new(
-                    std::io::ErrorKind::ResourceBusy,
-                    "sorted write concurrency cap",
                 ),
             )),
         }
@@ -1773,7 +1775,7 @@ impl QueryHandler {
         // Admission (pressure, per-user and global permits, per-user memory
         // reservation): one sequence shared with the streaming path, see
         // `query_handler::admission`. Held for the whole buffered call.
-        let admission = self.admit(session, sql, "query").map_err(refused)?;
+        let admission = self.admit(session, sql, "query").await.map_err(refused)?;
 
         // Pre-parse pipeline (strip FOR INCREMENTAL / FOR VERSION AS OF,
         // Hive PARTITIONED BY -> PARTITION BY; issue #117) then the SQL front
@@ -3802,10 +3804,12 @@ impl QueryHandler {
         // planning returns.
         let Admission {
             permits,
+            global,
             memory_reservation: per_user_mem_reservation,
             memory,
         } = self
             .admit(session, sql, "streaming query")
+            .await
             .map_err(refused)?;
 
         // --- Classify ---------------------------------------------------------
@@ -3933,6 +3937,7 @@ impl QueryHandler {
                     inner_stream,
                     finalizer,
                     permits,
+                    global,
                     per_user_mem_reservation,
                     cancel_token,
                 )
@@ -7967,10 +7972,16 @@ mod show_stats_policy_tests {
         let _held = hold_red(&handler);
         let session = pressure_session();
 
-        let admission = handler.admit(&session, "SELECT 1", "query").expect("admitted");
+        let admission = handler
+            .admit(&session, "SELECT 1", "query")
+            .await
+            .expect("admitted");
         assert!(admission.memory.quota().under_pressure);
         assert_eq!(admission.memory.quota().bytes, 64 * 1024 * 1024);
-        assert!(admission.memory_reservation.is_some(), "per-user budget is on by default");
+        assert!(
+            admission.memory_reservation.is_some(),
+            "per-user budget is on by default"
+        );
         assert_eq!(
             handler.per_user_memory.used_bytes("analyst"),
             64 * 1024 * 1024,
@@ -8030,7 +8041,10 @@ mod show_stats_policy_tests {
             .await
             .expect_err("cap 0 refuses at red");
         assert!(err.to_string().contains("memory is"), "{err}");
-        let metadata = handler.admit(&session, "EXPLAIN SELECT 1", "query").expect("metadata");
+        let metadata = handler
+            .admit(&session, "EXPLAIN SELECT 1", "query")
+            .await
+            .expect("metadata");
         assert!(!metadata.memory.quota().under_pressure);
     }
 
@@ -8043,6 +8057,7 @@ mod show_stats_policy_tests {
         let session = pressure_session();
         let admission = handler
             .admit_ingest(&session, "sales.t")
+            .await
             .expect("green pool admits");
         assert!(!admission.memory.quota().under_pressure);
         assert!(admission.memory_reservation.is_some());
@@ -8058,11 +8073,13 @@ mod show_stats_policy_tests {
         assert_eq!(handler.per_user_memory.used_bytes("analyst"), 0);
 
         let _held = hold_red(&handler);
-        let err = match handler.admit_ingest(&session, "sales.t") {
+        let err = match handler.admit_ingest(&session, "sales.t").await {
             Ok(_) => panic!("an ingest at red must be refused"),
             Err(e) => e,
         };
         assert!(err.to_string().contains("memory is"), "{err}");
+        let pressure = Some(sqe_core::RefusalReason::MemoryPressure);
+        assert_eq!(err.refusal_reason(), pressure);
     }
 
     fn snapshot_props_session(transaction: bool) -> sqe_core::Session {

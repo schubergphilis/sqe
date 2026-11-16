@@ -13,7 +13,7 @@ use governor::clock::{Clock, DefaultClock, Reference};
 use governor::{Quota, RateLimiter};
 use sha2::{Digest, Sha256};
 use sqe_core::config::RateLimitConfig;
-use sqe_core::error::{SqeError, SqeErrorCode};
+use sqe_core::error::SqeError;
 
 /// Hard admission limit per keyed limiter. Keys are SHA-256 fingerprints,
 /// so retained identity width is bounded as well as cardinality. At capacity,
@@ -238,8 +238,8 @@ pub struct RateLimitDenial {
 
 impl RateLimitDenial {
     pub fn into_error(self) -> SqeError {
-        SqeError::with_code(
-            SqeErrorCode::ResourceExhausted,
+        SqeError::refused(
+            sqe_core::RefusalReason::RateLimited,
             format!(
                 "Rate limit exceeded: {} ({}, per minute); retry after {}s",
                 self.detail,
@@ -656,7 +656,9 @@ mod tests {
         });
         query.check("u").unwrap();
         let err = query.check("u").unwrap_err();
-        assert_eq!(err.error_code(), SqeErrorCode::ResourceExhausted);
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::ResourceExhausted);
+        let limited = Some(sqe_core::RefusalReason::RateLimited);
+        assert_eq!(err.refusal_reason(), limited);
         let text = err.to_string();
         assert!(
             text.contains("rate_limit.per_user_queries_per_minute"),
@@ -771,7 +773,7 @@ mod tests {
         // ResourceExhausted, not Auth, so the session is preserved and the
         // protocol adapters answer 429 / RESOURCE_EXHAUSTED.
         assert!(
-            err.error_code() == SqeErrorCode::ResourceExhausted,
+            err.error_code() == sqe_core::SqeErrorCode::ResourceExhausted,
             "Expected a ResourceExhausted denial, got: {err:?}"
         );
     }

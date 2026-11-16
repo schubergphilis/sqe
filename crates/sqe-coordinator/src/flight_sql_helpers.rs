@@ -120,6 +120,13 @@ pub(crate) fn sqe_error_to_status(
     if let Ok(val) = code.name().parse() {
         status.metadata_mut().insert("x-sqe-error-code", val);
     }
+    // A refusal before the statement ran says why, so a client can tell
+    // "busy, retry" from a memory error its statement hit (#902).
+    if let Some(reason) = e.refusal_reason() {
+        if let Ok(val) = reason.as_str().parse() {
+            status.metadata_mut().insert("x-sqe-refusal-reason", val);
+        }
+    }
     if let Some(qid) = query_id {
         if let Ok(val) = qid.to_string().parse() {
             status.metadata_mut().insert("x-sqe-query-id", val);
@@ -148,6 +155,29 @@ mod tests {
 
     use arrow_flight::sql::ProstMessageExt;
     use prost::Message;
+
+    /// A refusal is RESOURCE_EXHAUSTED with its reason in metadata; a
+    /// memory failure of the statement keeps the code without a reason
+    /// (#902).
+    #[test]
+    fn a_refusal_carries_its_reason_in_metadata() {
+        let refused = sqe_core::SqeError::refused(
+            sqe_core::RefusalReason::QueueTimeout,
+            "Waited 30s for a query slot (2 active). Please retry later.",
+        );
+        let status = sqe_error_to_status(&refused, None);
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        let reason = status.metadata().get("x-sqe-refusal-reason");
+        assert_eq!(reason.map(|v| v.to_str().unwrap()), Some("queue_timeout"));
+
+        let failure = sqe_core::SqeError::with_code(
+            sqe_core::SqeErrorCode::ResourceExhausted,
+            "memory limit hit while sorting",
+        );
+        let status = sqe_error_to_status(&failure, None);
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert!(status.metadata().get("x-sqe-refusal-reason").is_none());
+    }
 
     // -----------------------------------------------------------------------
     // FetchResults: encode / decode roundtrip
