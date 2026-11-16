@@ -74,7 +74,7 @@ impl AuditFiles {
 }
 
 impl IngestServer {
-    async fn start() -> Self {
+    pub(crate) async fn start() -> Self {
         Self::start_with(None).await
     }
 
@@ -186,7 +186,7 @@ impl IngestServer {
 
     /// A client on its own session (own token), authenticated as the test
     /// stack's root principal. Two clients are two sessions of the same user.
-    async fn client(&self) -> FlightSqlServiceClient<Channel> {
+    pub(crate) async fn client(&self) -> FlightSqlServiceClient<Channel> {
         self.client_as("root", "").await
     }
 

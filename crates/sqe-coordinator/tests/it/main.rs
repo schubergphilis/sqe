@@ -118,6 +118,7 @@ mod v3_types_integration;
 mod variant_distributed;
 mod variant_e2e;
 mod variant_spark_interop;
+mod vector_distance_e2e;
 mod vended_credentials_e2e;
 mod view_planner_parity_e2e;
 mod view_policy_session_catalog_e2e;
