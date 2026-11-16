@@ -7116,6 +7116,7 @@ dependencies = [
  "governor",
  "hex",
  "hmac",
+ "http-body",
  "iceberg",
  "moka",
  "object_store",

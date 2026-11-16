@@ -44,7 +44,7 @@ mod ingest;
 mod snapshot_props;
 mod table_props;
 pub(crate) mod trino_props;
-pub use ingest::{IngestMode, OnExisting, OnMissing};
+pub use ingest::{IngestMode, IngestOutcome, OnExisting, OnMissing};
 use table_props::{commit_properties, sql_expr_to_property_string, with_properties};
 pub(crate) use table_props::{
     create_table_options_as_slice, create_table_properties, declared_json_columns,
