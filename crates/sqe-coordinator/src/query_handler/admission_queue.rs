@@ -56,6 +56,18 @@ struct State {
     lanes: VecDeque<Lane>,
     waiting: usize,
     next_id: u64,
+    /// Set by [`AdmissionQueue::close`] on shutdown: nothing is admitted
+    /// any more.
+    closed: bool,
+}
+
+/// The refusal for a statement that arrives, or still waits, once the
+/// coordinator drains for shutdown.
+pub(crate) fn draining_refusal() -> SqeError {
+    SqeError::refused(
+        RefusalReason::Draining,
+        "The coordinator is shutting down. Retry on another coordinator.",
+    )
 }
 
 struct Lane {
@@ -135,6 +147,9 @@ impl AdmissionQueue {
     pub(crate) async fn acquire(self: &Arc<Self>, user: &str) -> Result<GlobalPermit, SqeError> {
         let (id, mut rx) = {
             let mut st = self.lock();
+            if st.closed {
+                return Err(draining_refusal());
+            }
             if let Ok(permit) = Arc::clone(&self.sem).try_acquire_owned() {
                 return Ok(GlobalPermit {
                     permit: Some(permit),
@@ -184,10 +199,7 @@ impl AdmissionQueue {
                 // The sender went without a permit: the queue was closed.
                 guard.armed = false;
                 self.observe("draining", guard.started);
-                Err(SqeError::refused(
-                    RefusalReason::Draining,
-                    "The coordinator is shutting down. Retry on another coordinator.",
-                ))
+                Err(draining_refusal())
             }
             Err(_) => {
                 guard.armed = false;
@@ -210,6 +222,22 @@ impl AdmissionQueue {
                 ))
             }
         }
+    }
+
+    /// Stop admitting for shutdown: every queued statement is refused with
+    /// `draining` now, not left to time out, and so is every later arrival.
+    /// Running statements keep their slots.
+    pub(crate) fn close(&self) {
+        let lanes = {
+            let mut st = self.lock();
+            st.closed = true;
+            st.waiting = 0;
+            self.set_gauge(&st);
+            std::mem::take(&mut st.lanes)
+        };
+        // Dropping the senders outside the lock wakes each waiter with
+        // `Err`, which `acquire` turns into the `draining` refusal.
+        drop(lanes);
     }
 
     /// Take waiter `id` out of its lane. False when it is no longer queued
@@ -288,6 +316,25 @@ mod tests {
         let err = q.acquire("b").await.expect_err("no slot, no queue");
         assert_eq!(err.refusal_reason(), Some(RefusalReason::QueueFull));
         assert_eq!(err.error_code(), sqe_core::SqeErrorCode::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn close_refuses_queued_and_later_statements_with_draining() {
+        let q = queue(1, 4, 60_000);
+        let held = q.acquire("a").await.expect("free slot");
+        let q2 = Arc::clone(&q);
+        let waiter = tokio::spawn(async move { q2.acquire("b").await });
+        settle().await;
+        assert_eq!(q.waiting(), 1);
+
+        q.close();
+        let queued = waiter.await.unwrap().expect_err("woken by close");
+        assert_eq!(queued.refusal_reason(), Some(RefusalReason::Draining));
+        assert_eq!(q.waiting(), 0);
+
+        drop(held);
+        let later = q.acquire("c").await.expect_err("closed, slot free or not");
+        assert_eq!(later.refusal_reason(), Some(RefusalReason::Draining));
     }
 
     #[tokio::test]

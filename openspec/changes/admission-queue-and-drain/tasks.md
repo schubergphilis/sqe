@@ -1,6 +1,6 @@
 ## 1. Groundwork
 
-- [ ] 1.1 Verify `QueryTracker::active_count()` and `sqe_active_queries` drop a streamed statement that ends by client drop; fix if not (D5)
+- [x] 1.1 Verify `QueryTracker::active_count()` and `sqe_active_queries` drop a streamed statement that ends by client drop; fix if not (D5)
 - [x] 1.2 `RefusalReason` enum + `SqeError::refused(reason, msg)` + accessor in `sqe-core/src/error.rs`; unit test wire names
 - [x] 1.3 Map the reason in Flight SQL (status metadata), Trino HTTP (`errorName`), HTTP 429 JSON; one test per protocol
 
@@ -20,16 +20,16 @@
 
 ## 4. Drain
 
-- [ ] 4.1 `draining` flag in the handler; admission refuses and queued waiters are woken with `draining`
-- [ ] 4.2 `shutdown_with_drain` waits on `active_count()`; keep `before_close` after it; fix the stale comment in `main.rs`
-- [ ] 4.3 Worker drain hook: refuse new fragments with `Unavailable`, wait for in-flight ones
+- [x] 4.1 `draining` flag in the handler; admission refuses and queued waiters are woken with `draining`
+- [x] 4.2 `shutdown_with_drain` waits on `active_count()`; keep `before_close` after it; fix the stale comment in `main.rs`
+- [x] 4.3 Worker drain hook: refuse new fragments with `Unavailable`, wait for in-flight ones
 - [ ] 4.4 Process-level test: acceptance 4 (SIGTERM during a 20 s query)
 
 ## 5. Idle gauge
 
-- [ ] 5.1 `last_finished` timestamp + `sqe_idle_seconds` in the sampler
-- [ ] 5.2 Test: acceptance 5
+- [x] 5.1 `last_finished` timestamp + `sqe_idle_seconds` in the sampler
+- [x] 5.2 Test: acceptance 5
 
 ## 6. Docs
 
-- [ ] 6.1 Operations guide: queueing, reasons table, drain semantics; changelog notes the `ExecutionFailed` -> `ResourceExhausted` change for clients
+- [x] 6.1 Operations guide: queueing, reasons table, drain semantics; changelog notes the `ExecutionFailed` -> `ResourceExhausted` change for clients

@@ -408,6 +408,9 @@ pub struct QueryHandler {
     /// The global concurrency slots and the fair queue in front of them
     /// (#902). `None` when `max_concurrent_queries` is 0 (unlimited).
     admission_queue: Option<Arc<admission_queue::AdmissionQueue>>,
+    /// Set on shutdown by [`QueryHandler::start_drain`]: admission refuses
+    /// every new statement with reason `draining` (#902).
+    draining: std::sync::atomic::AtomicBool,
     /// Caps concurrent sorted CTAS / INSERT (issue #408). `None` means unlimited.
     sorted_write_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     /// Per-user concurrency semaphores. Lazily created on first query per
@@ -710,6 +713,7 @@ impl QueryHandler {
             query_tracker,
             query_cache,
             admission_queue,
+            draining: std::sync::atomic::AtomicBool::new(false),
             sorted_write_semaphore,
             per_user_semaphores: Arc::new(dashmap::DashMap::new()),
             per_user_memory: Arc::new(crate::memory::PerUserMemoryRegistry::new()),
@@ -873,6 +877,18 @@ impl QueryHandler {
             .with_ticket_signer(Arc::clone(&signer));
         self.ticket_signer = signer;
         self
+    }
+
+    /// Stop admitting for shutdown (#902): every later statement, and every
+    /// one still queued, is refused with reason `draining`. Running
+    /// statements finish; the caller waits on
+    /// [`QueryTracker::active_count`].
+    pub fn start_drain(&self) {
+        self.draining
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(queue) = &self.admission_queue {
+            queue.close();
+        }
     }
 
     /// Returns a reference to the query tracker.

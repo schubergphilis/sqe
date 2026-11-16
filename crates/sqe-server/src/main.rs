@@ -1018,21 +1018,23 @@ async fn shutdown_signal() {
 /// On SIGTERM/SIGINT this:
 /// 1. flips `ready` to NOT-ready so `/readyz` returns 503 and the Kubernetes
 ///    Service / load balancer stops routing NEW work to this pod;
-/// 2. sleeps `drain_secs` so connections already routed before the readiness
-///    flip propagated can finish at the tonic graceful boundary;
-/// 3. runs `before_close` (the coordinator rolls back its open transactions,
+/// 2. stops admitting: the coordinator refuses new and queued statements
+///    with reason `draining`, a worker refuses new fragments with
+///    `Unavailable` (#902);
+/// 3. waits until no work is in flight (`in_flight` reads 0), polled every
+///    [`DRAIN_POLL`], or `drain_secs` passes, whichever comes first;
+/// 4. runs `before_close` (the coordinator rolls back its open transactions,
 ///    #824);
-/// 4. resolves, which tells tonic to stop accepting and shut down.
+/// 5. resolves, which tells tonic to stop accepting and shut down.
 ///
-/// The grace period is bounded by `coordinator.shutdown_drain_secs` and must
-/// stay below the pod's `terminationGracePeriodSeconds` so the process exits
-/// before SIGKILL. NOTE: this is a time-bounded connection-drain, not a true
-/// in-flight-query drain. SQE has no query-lifecycle registry to wait on yet;
-/// tracking in-flight queries and blocking shutdown until they complete is a
-/// follow-up (see MR).
+/// The bound is `coordinator.shutdown_drain_secs` and must stay below the
+/// pod's `terminationGracePeriodSeconds` so the process exits before SIGKILL.
+/// A statement still running at the bound is cut off with the connections.
 async fn shutdown_with_drain(
     ready: Arc<AtomicBool>,
     drain_secs: u64,
+    stop_admitting: impl FnOnce(),
+    in_flight: impl Fn() -> usize,
     before_close: impl std::future::Future<Output = ()>,
 ) {
     shutdown_signal().await;
@@ -1040,7 +1042,7 @@ async fn shutdown_with_drain(
     // A second SIGINT/SIGTERM during the drain means "now": exit the way a
     // shell expects (130) instead of making the operator wait it out.
     tokio::select! {
-        _ = flip_ready_and_drain(&ready, drain_secs) => {}
+        _ = flip_ready_and_drain(&ready, drain_secs, stop_admitting, in_flight) => {}
         _ = shutdown_signal() => {
             tracing::warn!("second shutdown signal during drain; exiting now");
             std::process::exit(130);
@@ -1076,25 +1078,50 @@ fn effective_drain_secs(configured: u64, interactive: bool) -> u64 {
     }
 }
 
-/// Flip readiness to NOT-ready, then sleep the bounded drain period. Split out
-/// of [`shutdown_with_drain`] so the readiness-flip is unit-testable without a
-/// real OS signal.
-async fn flip_ready_and_drain(ready: &AtomicBool, drain_secs: u64) {
+/// How often the drain re-reads the in-flight count.
+const DRAIN_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Flip readiness to NOT-ready, stop admitting, then wait for in-flight work
+/// to reach 0 or the bound. Split out of [`shutdown_with_drain`] so it is
+/// unit-testable without a real OS signal.
+async fn flip_ready_and_drain(
+    ready: &AtomicBool,
+    drain_secs: u64,
+    stop_admitting: impl FnOnce(),
+    in_flight: impl Fn() -> usize,
+) {
     // Stop advertising readiness BEFORE we start draining so the Service
     // routing table converges away from this pod while we wait.
     ready.store(false, Ordering::Relaxed);
+    stop_admitting();
 
     if drain_secs == 0 {
         tracing::info!("shutdown_drain_secs = 0, shutting down immediately");
         return;
     }
 
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(drain_secs);
     tracing::info!(
         drain_secs,
-        "readiness flipped to NOT-ready, draining connections before shutdown"
+        in_flight = in_flight(),
+        "readiness flipped to NOT-ready, draining in-flight work before shutdown"
     );
-    tokio::time::sleep(std::time::Duration::from_secs(drain_secs)).await;
-    tracing::info!("drain period elapsed, shutting down");
+    loop {
+        let running = in_flight();
+        if running == 0 {
+            tracing::info!("drain complete: nothing in flight, shutting down");
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                in_flight = running,
+                drain_secs,
+                "drain bound reached with work still in flight, shutting down"
+            );
+            return;
+        }
+        tokio::time::sleep(DRAIN_POLL).await;
+    }
 }
 
 // ── Trino adapters ─────────────────────────────────────────────
@@ -2552,6 +2579,11 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
         query_handler.runtime().clone(),
         metrics.clone(),
     );
+    // `sqe_active_queries` and `sqe_idle_seconds` from the tracker (#902).
+    sqe_coordinator::query_tracker::spawn_activity_reporter(
+        query_handler.query_tracker().clone(),
+        metrics.clone(),
+    );
 
     // Spawn dashboard time-series sampler when the web UI is enabled.
     if let Some(ref hist) = metrics_history {
@@ -2810,9 +2842,12 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
             "Flight SQL disabled (flight_sql_port = 0); serving MCP only. \
              Coordinator up."
         );
+        let tracker = Arc::clone(query_handler.query_tracker());
         shutdown_with_drain(
             ready.clone(),
             config.coordinator.shutdown_drain_secs,
+            || query_handler.start_drain(),
+            move || tracker.active_count(),
             query_handler.abort_open_transactions(),
         )
         .await;
@@ -2861,6 +2896,8 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
         tracing::info!("SQE coordinator listening on {addr} (plaintext)");
     }
 
+    let drain_handler = Arc::clone(&txn_handler);
+    let drain_tracker = Arc::clone(txn_handler.query_tracker());
     let serve_result = server_builder
         .layer(sqe_coordinator::flight_sql::FlightTraceLayer)
         .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(flight_service))
@@ -2869,6 +2906,8 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
             shutdown_with_drain(
                 ready.clone(),
                 config.coordinator.shutdown_drain_secs,
+                move || drain_handler.start_drain(),
+                move || drain_tracker.active_count(),
                 async move { txn_handler.abort_open_transactions().await },
             ),
         )
@@ -2990,6 +3029,10 @@ async fn run_worker(config: SqeConfig, config_path: String) -> anyhow::Result<()
         tracing::info!("SQE worker listening on {addr} (plaintext)");
     }
 
+    // New fragments are refused `Unavailable` (the coordinator retries them
+    // on another worker); running ones finish within the bound (#902).
+    let worker_status = Arc::clone(flight_service.status());
+    let drain_status = Arc::clone(&worker_status);
     server_builder
         .add_service(
             flight_service.into_server(config.coordinator.transport.max_decoding_message_bytes),
@@ -2999,6 +3042,8 @@ async fn run_worker(config: SqeConfig, config_path: String) -> anyhow::Result<()
             shutdown_with_drain(
                 ready.clone(),
                 config.coordinator.shutdown_drain_secs,
+                move || drain_status.start_drain(),
+                move || worker_status.inflight_scans() as usize,
                 std::future::ready(()),
             ),
         )
@@ -3288,7 +3333,7 @@ mod tests {
     async fn flip_ready_and_drain_flips_readiness_first() {
         // drain_secs = 0 so the test does not sleep; readiness must still flip.
         let ready = AtomicBool::new(true);
-        flip_ready_and_drain(&ready, 0).await;
+        flip_ready_and_drain(&ready, 0, || {}, || 0).await;
         assert!(
             !ready.load(Ordering::Relaxed),
             "readiness must be flipped to NOT-ready on shutdown"
@@ -3351,10 +3396,33 @@ token_endpoint = "http://127.0.0.1:1/token"
 
     #[tokio::test]
     async fn flip_ready_and_drain_flips_readiness_with_nonzero_drain() {
-        // A short non-zero drain still flips readiness immediately, then sleeps.
+        // A non-zero drain still flips readiness and stops admitting at once.
         let ready = AtomicBool::new(true);
-        flip_ready_and_drain(&ready, 1).await;
+        let stopped = AtomicBool::new(false);
+        let stop = || stopped.store(true, Ordering::Relaxed);
+        flip_ready_and_drain(&ready, 1, stop, || 0).await;
         assert!(!ready.load(Ordering::Relaxed));
+        assert!(stopped.load(Ordering::Relaxed));
+    }
+
+    /// Acceptance 4 (#902): the drain ends when the last statement does, not
+    /// at the bound, and gives up at the bound when one never ends.
+    #[tokio::test(start_paused = true)]
+    async fn the_drain_waits_for_in_flight_work_and_stops_at_the_bound() {
+        let ready = AtomicBool::new(true);
+        let started = tokio::time::Instant::now();
+        let done_at = started + std::time::Duration::from_secs(20);
+        let in_flight = || usize::from(tokio::time::Instant::now() < done_at);
+        flip_ready_and_drain(&ready, 60, || {}, in_flight).await;
+        let waited = started.elapsed();
+        let just_after = std::time::Duration::from_secs(20)..std::time::Duration::from_secs(21);
+        assert!(just_after.contains(&waited), "{waited:?}");
+
+        let started = tokio::time::Instant::now();
+        flip_ready_and_drain(&ready, 5, || {}, || 1).await;
+        let waited = started.elapsed();
+        let at_bound = std::time::Duration::from_secs(5)..std::time::Duration::from_secs(6);
+        assert!(at_bound.contains(&waited), "{waited:?}");
     }
 
     /// Finding 764: anonymous MCP pulls the health and metrics listeners onto

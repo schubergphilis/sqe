@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use moka::sync::Cache;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -128,6 +129,9 @@ struct ActiveQuery {
 pub struct QueryTracker {
     history: Cache<Uuid, Arc<QueryRecord>>,
     active: DashMap<Uuid, ActiveQuery>,
+    /// Unix ms when a statement last left `active`; process start before the
+    /// first one. Feeds `sqe_idle_seconds` (#902).
+    last_finished_ms: AtomicI64,
 }
 
 impl QueryTracker {
@@ -160,6 +164,7 @@ impl QueryTracker {
     /// an explicit cancel).
     fn finish(&self, query_id: &Uuid, f: impl FnOnce(&mut QueryRecord)) {
         if let Some((_, a)) = self.active.remove(query_id) {
+            self.mark_finished();
             let mut record = (*a.record).clone();
             f(&mut record);
             self.history.insert(*query_id, Arc::new(record));
@@ -185,6 +190,7 @@ impl QueryTracker {
     /// once the query is terminal.
     pub fn abandoned(&self, query_id: &Uuid, reason: &str) {
         if let Some((_, active)) = self.active.remove(query_id) {
+            self.mark_finished();
             active.token.cancel();
             let mut record = (*active.record).clone();
             let now = Utc::now();
@@ -221,7 +227,23 @@ impl QueryTracker {
         Self {
             history,
             active: DashMap::new(),
+            last_finished_ms: AtomicI64::new(Utc::now().timestamp_millis()),
         }
+    }
+
+    fn mark_finished(&self) {
+        self.last_finished_ms
+            .store(Utc::now().timestamp_millis(), Ordering::Release);
+    }
+
+    /// Seconds without a running statement at `now`: 0 while one runs, else
+    /// the time since the last one finished, or since start (#902).
+    pub fn idle_seconds(&self, now: DateTime<Utc>) -> i64 {
+        if !self.active.is_empty() {
+            return 0;
+        }
+        let since = now.timestamp_millis() - self.last_finished_ms.load(Ordering::Acquire);
+        since.max(0) / 1000
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -426,6 +448,7 @@ impl QueryTracker {
     /// (unknown, or already terminal).
     pub fn cancel(&self, query_id: &Uuid) -> bool {
         if let Some((_, active)) = self.active.remove(query_id) {
+            self.mark_finished();
             active.token.cancel();
             let mut record = (*active.record).clone();
             record.state = QueryState::Canceled;
@@ -524,6 +547,31 @@ impl QueryTracker {
     }
 }
 
+/// Set `sqe_active_queries` and `sqe_idle_seconds` from the tracker every
+/// second. The statement paths only set the active gauge when a streamed
+/// statement ends, so between those it read stale (#902).
+pub fn spawn_activity_reporter(
+    tracker: Arc<QueryTracker>,
+    metrics: Arc<sqe_metrics::MetricsRegistry>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            report_activity(&tracker, &metrics, Utc::now());
+        }
+    })
+}
+
+fn report_activity(
+    tracker: &QueryTracker,
+    metrics: &sqe_metrics::MetricsRegistry,
+    now: DateTime<Utc>,
+) {
+    metrics.active_queries.set(tracker.active_count() as i64);
+    metrics.idle_seconds.set(tracker.idle_seconds(now));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,6 +642,29 @@ mod tests {
         let rec = tracker.get(&id).unwrap();
         assert_eq!(rec.state, QueryState::Canceled);
         assert_eq!(rec.planning_ms, 0);
+    }
+
+    /// Acceptance 5 (#902): 0 while a statement runs, the seconds since the
+    /// last one finished otherwise, and the reporter copies both gauges.
+    #[tokio::test]
+    async fn idle_seconds_is_zero_while_running_and_counts_from_the_last_finish() {
+        let tracker = QueryTracker::new(&test_config());
+        let metrics = sqe_metrics::MetricsRegistry::new().unwrap();
+        let later = Utc::now() + chrono::Duration::seconds(31);
+        assert!(tracker.idle_seconds(later) >= 30, "idle since start");
+
+        let id = Uuid::now_v7();
+        tracker.start(id, "erin", None, "SELECT 1", "s9", None, vec![], None);
+        report_activity(&tracker, &metrics, later);
+        assert_eq!(metrics.idle_seconds.get(), 0);
+        assert_eq!(metrics.active_queries.get(), 1);
+
+        tracker.canceled(&id);
+        let finished = Utc::now();
+        assert_eq!(tracker.idle_seconds(finished), 0, "just finished");
+        report_activity(&tracker, &metrics, finished + chrono::Duration::seconds(30));
+        assert!(metrics.idle_seconds.get() >= 30);
+        assert_eq!(metrics.active_queries.get(), 0);
     }
 
     #[tokio::test]

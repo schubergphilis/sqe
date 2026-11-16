@@ -133,6 +133,9 @@ pub struct MetricsRegistry {
     pub query_duration: HistogramVec,
     pub rows_returned: Counter,
     pub active_queries: IntGauge,
+    /// 0 while a statement runs, else seconds since the last one finished
+    /// (or since start). A scale-to-zero signal (#902).
+    pub idle_seconds: IntGauge,
     /// Statements waiting in the admission queue for a global slot (#902).
     pub admission_queue_length: IntGauge,
     /// Seconds a statement spent in the admission queue, by how the wait
@@ -400,6 +403,11 @@ impl MetricsRegistry {
 
         let active_queries =
             register_int_gauge(&registry, "sqe_active_queries", "Number of active queries")?;
+        let idle_seconds = register_int_gauge(
+            &registry,
+            "sqe_idle_seconds",
+            "Seconds since the last statement finished; 0 while one runs",
+        )?;
         let admission_queue_length = register_int_gauge(
             &registry,
             "sqe_admission_queue_length",
@@ -1054,6 +1062,7 @@ impl MetricsRegistry {
             query_duration,
             rows_returned,
             active_queries,
+            idle_seconds,
             admission_queue_length,
             admission_queue_wait_seconds,
             active_sessions,
