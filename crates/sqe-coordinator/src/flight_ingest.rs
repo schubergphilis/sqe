@@ -104,6 +104,41 @@ impl From<Status> for IngestFailure {
     }
 }
 
+/// The first error the client's upload stream yielded, kept so a failed
+/// ingest answers with the transport's own status. Without it a message over
+/// the decoding limit reached the client as `Internal` "Stream error:
+/// External error: Tonic error: ..." instead of `OutOfRange` (#904).
+#[derive(Clone, Default)]
+pub(crate) struct UploadError(Arc<std::sync::Mutex<Option<Status>>>);
+
+impl UploadError {
+    /// `stream`, recording its first error here.
+    pub(crate) fn watch<S, T>(
+        &self,
+        stream: S,
+    ) -> impl futures::Stream<Item = Result<T, Status>> + Send + 'static
+    where
+        S: futures::Stream<Item = Result<T, Status>> + Send + 'static,
+    {
+        let slot = Arc::clone(&self.0);
+        stream.inspect(move |item| {
+            if let Err(status) = item {
+                let mut first = slot.lock().unwrap_or_else(|p| p.into_inner());
+                first.get_or_insert_with(|| status.clone());
+            }
+        })
+    }
+
+    /// The upload's own status when the stream failed, else `e`.
+    pub(crate) fn or(&self, e: sqe_core::SqeError) -> IngestFailure {
+        let first = self.0.lock().unwrap_or_else(|p| p.into_inner()).take();
+        match first {
+            Some(status) => IngestFailure::Request(status),
+            None => IngestFailure::Engine(e),
+        }
+    }
+}
+
 /// The error an ingest's audit record carries for a refusal of the request
 /// itself: its gRPC code mapped onto the nearest engine code, with the
 /// message the client got. The ingest's own refusals are invalid options
@@ -475,6 +510,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(peeked.schema, None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_upload_answers_with_the_transport_status() {
+        let watched = UploadError::default();
+        let items: Vec<Result<i32, Status>> = vec![
+            Ok(1),
+            Err(Status::out_of_range("message too large")),
+            Err(Status::internal("later")),
+        ];
+        let seen: Vec<_> = watched.watch(futures::stream::iter(items)).collect().await;
+        assert_eq!(seen.len(), 3, "the stream passes through unchanged");
+        let engine = sqe_core::SqeError::Execution("Stream error".to_string());
+        match watched.or(engine) {
+            IngestFailure::Request(s) => assert_eq!(s.code(), tonic::Code::OutOfRange),
+            IngestFailure::Engine(e) => panic!("the first transport status wins: {e}"),
+        }
+
+        let clean = UploadError::default();
+        let engine = sqe_core::SqeError::Execution("commit failed".to_string());
+        assert!(matches!(clean.or(engine), IngestFailure::Engine(_)));
     }
 
     #[tokio::test]

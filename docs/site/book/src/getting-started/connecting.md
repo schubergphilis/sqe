@@ -33,6 +33,25 @@ Use `grpc://` for plaintext and `grpc+tls://` when the coordinator runs with TLS
 
 A DB-API connection starts in a transaction, as the DB-API spec requires. `INSERT`, `UPDATE`, `DELETE` and `MERGE` stay invisible to everyone else until `conn.commit()`, and closing the connection without it discards them. DDL, CTAS and bulk ingest (`cursor.adbc_ingest`) commit at once. The ADBC driver does not send the transaction with an ingest (arrow-adbc issue 5027), so a client that needs the ingest inside the transaction sets `CommandStatementIngest.transaction_id` with its own Flight client. Pass `autocommit=True` to `connect` when every statement should commit on its own, as a loader that opens a connection per statement needs. See [Transactions](../sql-reference/dml.md#transactions).
 
+#### Bulk ingest
+
+`cursor.adbc_ingest` sends a Flight SQL `CommandStatementIngest` over `DoPut`. The reply carries the number of rows written. It does not carry the new snapshot id: arrow-flight fixes that reply to a row count. To find the snapshot, read `table_snapshots('<schema>', '<table>')` after the ingest. A snapshot property you set on the ingest is the most reliable way to pick it out.
+
+To stamp the ingest's snapshot summary, send ingest options named `snapshot-property.<key>` in `CommandStatementIngest.options`. For example, `snapshot-property.run_id = 2026-11-16-a` puts the key `run_id` in that snapshot's summary. The options apply to that one request only and are merged over any `SET SNAPSHOT_PROPERTIES` in force for the session or transaction. The keys follow the same rules as `SET SNAPSHOT_PROPERTIES`:
+
+- A key is 1 to 128 bytes of `A-Z a-z 0-9 . _ -`.
+- A value is at most 1 KiB.
+- An ingest takes at most 32 pairs and 8 KiB in all.
+- Keys Iceberg computes (`added-records`, `total-data-files`, ...) are reserved, and so are `operation`, `wap.id`, `published-wap-id` and `source-snapshot-id`, and keys starting with `partitions.`, `sqe.`, `commit.` or `write.`.
+
+A bad option fails with `InvalidArgument` before any data file is written.
+
+Limits on an ingest:
+
+- **4 MiB per gRPC message.** The coordinator sets no `max_decoding_message_size`, so tonic's 4 MiB default applies to every `FlightData` message of the upload. A client that sends one record batch per message must keep each encoded batch under 4 MiB. The Rust arrow-flight encoder splits batches into messages of about 2 MiB by rows. A single row larger than 4 MiB cannot be split and fails the whole ingest with `OutOfRange` ("decoded message length too large"); the table is left unchanged. The number of messages, and so the total size of the upload, is not capped.
+- **Admission.** An ingest is admitted like a write statement. It takes a concurrency permit and the per-user memory reservation, and it is refused while the coordinator memory pool is under red pressure. A refused ingest fails before it reads the stream.
+- **Policy.** The caller needs write access to the table in the configured policy engine. A refusal writes one failure audit record.
+
 ### With a bearer token
 
 A client that already holds a token sends it instead of a password. SQE reads `Authorization: Bearer <token>` on every request, so no handshake is needed:

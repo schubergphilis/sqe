@@ -701,6 +701,52 @@ async fn write_privileges_are_separate_from_read() {
     );
 }
 
+/// #904: a Flight SQL bulk ingest by a principal Ranger gives no write access
+/// is refused before any file is written, and leaves one failure audit
+/// record. The ingest asks the catalog the same write question an INSERT
+/// does (`check_write_access`), and Polaris answers it from Ranger.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn flight_ingest_without_write_access_is_refused_and_audited() {
+    use arrow_flight::sql::{
+        CommandStatementIngest, TableDefinitionOptions, TableExistsOption, TableNotExistOption,
+    };
+    ac_gate!();
+    let ctx = ac_setup().await;
+    let count = format!("SELECT id FROM {ORDERS}");
+    let before = total_rows(&exec_ok(&ctx, &ctx.carol, &count).await);
+
+    let server = crate::flight_ingest_e2e::IngestServer::start_ranger_audited().await;
+    let mut alice = server.client_as("alice", "alice123").await;
+    let cmd = CommandStatementIngest {
+        table_definition_options: Some(TableDefinitionOptions {
+            if_not_exist: TableNotExistOption::Fail as i32,
+            if_exists: TableExistsOption::Append as i32,
+        }),
+        table: "orders".to_string(),
+        schema: Some("ac".to_string()),
+        catalog: Some("sales_wh".to_string()),
+        temporary: false,
+        transaction_id: None,
+        options: std::collections::HashMap::new(),
+    };
+    let mark = server.audit_mark();
+    let rows = vec![crate::flight_ingest_e2e::batch(&[(9, "x")])];
+    let result = crate::flight_ingest_e2e::ingest(&mut alice, cmd, rows).await;
+    assert_eq!(
+        crate::flight_ingest_e2e::status_code(&result),
+        Some(tonic::Code::PermissionDenied),
+        "{result:?}"
+    );
+
+    let r = server.one_ingest_record_since(mark);
+    assert_eq!(r["status"], "failure", "{r}");
+    assert_eq!(r["error_code"], "ACCESS_DENIED", "{r}");
+    assert!(r["stats"].get("rows_written").is_none(), "{r}");
+    let after = total_rows(&exec_ok(&ctx, &ctx.carol, &count).await);
+    assert_eq!(after, before, "the refused ingest wrote nothing");
+}
+
 /// Add a `denyPolicyItems` entry for role `engineer` to the EXISTING Ranger
 /// policy that SQE's `GRANT SELECT ON ops_wh.ac.audit` created.
 ///

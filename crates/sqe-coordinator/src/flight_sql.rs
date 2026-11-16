@@ -1733,7 +1733,8 @@ impl SqeFlightSqlService {
         // straight into the streaming write sink instead of `try_collect`-ing
         // the whole upload into a Vec: an arbitrarily large client upload no
         // longer buffers unbounded on the coordinator (write-path memory safety).
-        let stream = request.into_inner();
+        let upload_error = crate::flight_ingest::UploadError::default();
+        let stream = upload_error.watch(request.into_inner());
         let flight_stream = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
             stream.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))),
         );
@@ -1773,7 +1774,8 @@ impl SqeFlightSqlService {
                 mode,
                 upload,
             )
-            .await?;
+            .await
+            .map_err(|e| upload_error.or(e))?;
         // `after_commit` drops the session and table-metadata caches; the
         // result cache lives on the QueryHandler, so a SELECT of the same
         // text kept serving pre-ingest rows until its TTL (#746). Same call

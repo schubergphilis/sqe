@@ -26,14 +26,14 @@
 
 ## 5. Tests
 
-- [ ] 5.1 Table-driven integration test: every write kind and ingest mode, in a transaction and outside, asserts the key in the committed summary
+- [x] 5.1 Table-driven integration test: every write kind and ingest mode, in a transaction and outside, asserts the key in the committed summary
 - [ ] 5.2 Transaction scope: published head carries the marker; cleared after COMMIT and ROLLBACK; two parallel transactions on one session keep their own values
 - [ ] 5.3 Empty write commits an empty snapshot with properties; no snapshot without them
 - [ ] 5.4 Compaction snapshot carries no user keys
-- [ ] 5.5 Ingest option applies to one request only; reserved ingest key fails before data files are written
+- [x] 5.5 Ingest option applies to one request only; reserved ingest key fails before data files are written
 
 ## 6. Docs and close-out
 
 - [ ] 6.1 SQL reference: `SET` / `RESET SNAPSHOT_PROPERTIES`, the reserved keys, the transaction form as the recommended one, compaction and expiry limits, and that clients sharing one bearer token share session properties and a SQL `BEGIN` (parallel loaders use Flight SQL `BeginTransaction` or ingest options)
-- [ ] 6.2 Flight SQL connecting page: the `snapshot-property.` ingest option
+- [x] 6.2 Flight SQL connecting page: the `snapshot-property.` ingest option
 - [ ] 6.3 README roadmap, status fragment, changelog fragment
