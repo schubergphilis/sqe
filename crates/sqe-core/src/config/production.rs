@@ -501,10 +501,13 @@ fn is_plaintext_remote(endpoint: &str) -> bool {
     }
 }
 
+/// Every rule `config` breaks, each message prefixed with its rule name in
+/// brackets, so a startup error names the rule an operator can look up in
+/// the production guide.
 pub fn violations(config: &SqeConfig) -> Vec<String> {
     PRODUCTION_RULES
         .iter()
-        .filter_map(|rule| (rule.check)(config))
+        .filter_map(|rule| (rule.check)(config).map(|msg| format!("[{}] {msg}", rule.name)))
         .collect()
 }
 
@@ -576,6 +579,50 @@ mod tests {
         assert!((rule.check)(&c)
             .unwrap()
             .contains("metrics.audit_export.otlp_endpoint"));
+    }
+
+    /// The guide's minimal Ranger config passes every rule, and the same file
+    /// with `passthrough` fails naming `policy-engine-configured` (#898).
+    #[test]
+    fn production_guide_minimal_ranger_config_validates() {
+        let _g = super::super::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let guide = include_str!("../../../../docs/site/book/src/operations/production-guide.md");
+        let toml = guide
+            .split("## Minimal production config with Ranger")
+            .nth(1)
+            .and_then(|s| s.split("```toml\n").nth(1))
+            .and_then(|s| s.split("```").next())
+            .expect("production-guide.md has the minimal Ranger config block");
+        // validate() checks the certificate files exist; point them at real ones.
+        let dir = std::env::temp_dir().join(format!("sqe-898-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["tls.crt", "tls.key"] {
+            std::fs::write(dir.join(f), "").unwrap();
+        }
+        let toml = toml.replace("/etc/sqe/tls", &dir.to_string_lossy());
+
+        let c = SqeConfig::load_from_str(&toml).expect("the documented config parses");
+        assert!(c.coordinator.production_mode);
+        assert!(c.policy.ranger.catalog_scoped);
+        if let Err(e) = c.validate() {
+            panic!("the documented config must start in production_mode: {e}");
+        }
+
+        let passthrough = toml.replace("engine = \"ranger\"", "engine = \"passthrough\"");
+        let c = SqeConfig::load_from_str(&passthrough).expect("passthrough variant parses");
+        let err = c
+            .validate()
+            .expect_err("passthrough is refused")
+            .to_string();
+        assert!(
+            err.contains(
+                "[policy-engine-configured] production_mode: policy.engine is passthrough"
+            ),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
