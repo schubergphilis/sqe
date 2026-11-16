@@ -134,6 +134,40 @@ impl CatalogOps {
         self
     }
 
+    /// Project `ident`'s tags (`previous` is the map before the change) under
+    /// the Ranger key a mask on it uses. `catalog` is the planner's name for
+    /// the table's catalog ([`Self::planner_catalog`]), which a
+    /// `catalog_scoped` key carries (#899).
+    async fn project_tags(
+        &self,
+        catalog: &str,
+        ident: &TableIdent,
+        previous: &HashMap<String, Vec<String>>,
+        tags: &HashMap<String, Vec<String>>,
+    ) -> sqe_core::Result<()> {
+        use sqe_policy::tag_projector::{project_table_tags, ColumnTags};
+        let to_map = |m: &HashMap<String, Vec<String>>| -> ColumnTags {
+            m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        let (ns, name) = (ident.namespace().as_ref(), ident.name());
+        let (scoped, prev, tags) = (self.catalog_scoped(), to_map(previous), to_map(tags));
+        let projector = self.tag_projector.as_ref();
+        project_table_tags(projector, catalog, ns, name, scoped, &prev, &tags).await
+    }
+
+    fn catalog_scoped(&self) -> bool {
+        self.config.policy.ranger.catalog_scoped
+    }
+
+    /// The catalog name the planner resolves `qualifier` to: the qualifier,
+    /// else the session's catalog, else the configured default. Not the
+    /// warehouse, which can differ.
+    fn planner_catalog(&self, session: &Session, qualifier: Option<String>) -> String {
+        qualifier
+            .or_else(|| session.default_catalog.clone())
+            .unwrap_or_else(|| self.config.resolve_default_catalog())
+    }
+
     /// Attach a global table metadata cache so DDL operations invalidate the right entry.
     #[must_use = "with_table_cache consumes self; bind the returned ops"]
     pub fn with_table_cache(mut self, cache: TableMetadataCache) -> Self {
@@ -1240,22 +1274,9 @@ impl CatalogOps {
             self.invalidate_table_all_tokens(&table_ident).await;
 
             if self.tag_projector.enabled() {
-                let key = sqe_policy::tag_projector::TagTableKey::from_namespace(
-                    &table_ident.namespace().to_url_string(),
-                    table_ident.name().to_string(),
-                );
-                let previous = current_tags;
-                let previous_projected: sqe_policy::tag_projector::ColumnTags = previous
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                let projected: sqe_policy::tag_projector::ColumnTags = new_tags
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
+                let catalog = self.planner_catalog(session, catalog_qualifier(table_name));
                 if let Err(project_err) = self
-                    .tag_projector
-                    .project(&key, &previous_projected, &projected)
+                    .project_tags(&catalog, &table_ident, &current_tags, &new_tags)
                     .await
                 {
                     // Deliberately NOT rolled back. `set_column_tags` reverts its
@@ -1843,21 +1864,9 @@ impl CatalogOps {
         // Still under `_guard`: the rollback below is part of the read-modify-write
         // sequence the lock protects.
         if self.tag_projector.enabled() {
-            let key = sqe_policy::tag_projector::TagTableKey::from_namespace(
-                &table_ident.namespace().to_url_string(),
-                table_ident.name().to_string(),
-            );
-            let projected: sqe_policy::tag_projector::ColumnTags = new_map
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            let previous_projected: sqe_policy::tag_projector::ColumnTags = current
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
+            let catalog = self.planner_catalog(session, catalog_qualifier(&object_name));
             if let Err(project_err) = self
-                .tag_projector
-                .project(&key, &previous_projected, &projected)
+                .project_tags(&catalog, &table_ident, &current, &new_map)
                 .await
             {
                 // ROLL BACK the property. Leaving it would mean SQE masks the column
@@ -1981,6 +1990,7 @@ impl CatalogOps {
         };
         let session_catalog = self.session_catalog_for(session, catalog_name).await?;
         let targets = collect_reproject_targets(&session_catalog, session, scope).await?;
+        let catalog = self.planner_catalog(session, catalog_name.map(str::to_string));
 
         let mut tables = Vec::with_capacity(targets.len());
         let mut statuses = Vec::with_capacity(targets.len());
@@ -1990,7 +2000,9 @@ impl CatalogOps {
         for ident in targets {
             let table_lock = self.table_lock_for(&ident);
             let _guard = table_lock.lock().await;
-            let row = self.reproject_one_table(&session_catalog, &ident).await;
+            let row = self
+                .reproject_one_table(&session_catalog, &catalog, &ident)
+                .await;
             tables.push(row.table);
             statuses.push(row.status);
             columns.push(row.columns_projected);
@@ -2024,6 +2036,7 @@ impl CatalogOps {
     async fn reproject_one_table(
         &self,
         session_catalog: &SessionCatalog,
+        catalog: &str,
         ident: &TableIdent,
     ) -> ReprojectRow {
         let table = match session_catalog.load_table(ident).await {
@@ -2041,7 +2054,8 @@ impl CatalogOps {
                 );
             }
         };
-        reproject_loaded_tags(self.tag_projector.as_ref(), ident, &tags).await
+        let scoped = self.catalog_scoped();
+        reproject_loaded_tags(self.tag_projector.as_ref(), catalog, scoped, ident, &tags).await
     }
 
     /// Execute a parsed `PartitionEvolution` (ALTER TABLE ... ADD/DROP/REPLACE
@@ -2476,32 +2490,29 @@ impl ReprojectRow {
 
 /// Project a already-loaded tag map. Isolated so tests can drive the
 /// projector without a live catalog.
+///
+/// `catalog` is the planner's name for the table's catalog; with
+/// `catalog_scoped` it leads the key, and the unscoped resource left from
+/// before the setting is deleted (#899).
 async fn reproject_loaded_tags(
     projector: &dyn sqe_policy::tag_projector::TagProjector,
+    catalog: &str,
+    catalog_scoped: bool,
     ident: &TableIdent,
     tags: &HashMap<String, Vec<String>>,
 ) -> ReprojectRow {
+    use sqe_policy::tag_projector::{project_table_tags, ColumnTags};
     let table = ident.to_string();
     if tags.is_empty() {
         return ReprojectRow::skipped(table);
     }
-    let key = sqe_policy::tag_projector::TagTableKey::from_namespace(
-        &ident.namespace().to_url_string(),
-        ident.name().to_string(),
-    );
-    let projected: sqe_policy::tag_projector::ColumnTags =
-        tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let projected: ColumnTags = tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let (ns, name, scoped) = (ident.namespace().as_ref(), ident.name(), catalog_scoped);
     // previous is empty: this is a first-time (or idempotent add_or_update)
     // projection of the Iceberg source of truth. Deleting-then-adding the
     // current map would briefly unmask Spark on a repair of a live table.
-    match projector
-        .project(
-            &key,
-            &sqe_policy::tag_projector::ColumnTags::new(),
-            &projected,
-        )
-        .await
-    {
+    let prev = ColumnTags::new();
+    match project_table_tags(projector, catalog, ns, name, scoped, &prev, &projected).await {
         Ok(()) => ReprojectRow::projected(table, tags.len() as i64),
         Err(e) => ReprojectRow::error(table, e.to_string()),
     }
@@ -3311,8 +3322,8 @@ mod tests {
             calls: std::sync::Mutex::new(Vec::new()),
             fail: false,
         };
-        let row =
-            reproject_loaded_tags(&projector, &ident("sales", "orders"), &HashMap::new()).await;
+        let (none, orders) = (HashMap::new(), ident("sales", "orders"));
+        let row = reproject_loaded_tags(&projector, "a", true, &orders, &none).await;
         assert_eq!(row.status, "skipped");
         assert_eq!(row.columns_projected, 0);
         assert!(projector.calls.lock().unwrap().is_empty());
@@ -3327,7 +3338,8 @@ mod tests {
         let mut tags = HashMap::new();
         tags.insert("ssn".into(), vec!["PII".into()]);
         tags.insert("email".into(), vec!["PII".into(), "GDPR".into()]);
-        let row = reproject_loaded_tags(&ok, &ident("sales", "orders"), &tags).await;
+        let orders = ident("sales", "orders");
+        let row = reproject_loaded_tags(&ok, "a", false, &orders, &tags).await;
         assert_eq!(row.status, "projected");
         assert_eq!(row.columns_projected, 2);
         assert_eq!(
@@ -3335,11 +3347,20 @@ mod tests {
             &[("sales".into(), "orders".into(), 2)]
         );
 
+        // #899: catalog-scoped, the catalog leads the key and the unscoped
+        // resource from before the setting is cleared (no tags added).
+        ok.calls.lock().unwrap().clear();
+        let row = reproject_loaded_tags(&ok, "a", true, &orders, &tags).await;
+        assert_eq!(row.status, "projected");
+        let scoped = ("a.sales".into(), "orders".into(), 2);
+        let cleared = ("sales".into(), "orders".into(), 0);
+        assert_eq!(ok.calls.lock().unwrap().as_slice(), &[scoped, cleared]);
+
         let fail = RecordingProjector {
             calls: std::sync::Mutex::new(Vec::new()),
             fail: true,
         };
-        let row = reproject_loaded_tags(&fail, &ident("sales", "orders"), &tags).await;
+        let row = reproject_loaded_tags(&fail, "a", false, &orders, &tags).await;
         assert_eq!(row.status, "error");
         assert!(row.message.contains("ranger down"), "got: {}", row.message);
         assert_eq!(row.columns_projected, 0);

@@ -3156,6 +3156,16 @@ pub struct SecurityConfig {
     /// this true only for SQE-only Ranger deploys that never talk to Spark.
     #[serde(default)]
     pub allow_unprojected_tags: bool,
+    /// Opt-in escape hatch for Ranger without a group claim (issue #899).
+    /// Ranger policies grant and mask by group; a session with no groups
+    /// matches no group item, so every group grant is silently dead and the
+    /// user sees only what user-level items give them. `production_mode`
+    /// therefore refuses `policy.engine = ranger` when an OIDC password or
+    /// bearer-token provider has an empty `groups_claim`, or when
+    /// `auth.providers` is empty (the legacy `[auth]` block never reads
+    /// groups). Set this true only when every Ranger item names users.
+    #[serde(default)]
+    pub allow_tokens_without_groups: bool,
 }
 
 impl SecurityConfig {
@@ -7092,7 +7102,12 @@ s3_secret_key = "configured-secret"
         config.coordinator.production_mode = true;
         config.rate_limit.enabled = true;
         config.security.allow_insecure_transport = false;
-        config.auth.providers = vec![oidc_provider_for_validate()];
+        // #899: Ranger grants by group, so the provider must read groups.
+        let mut provider = oidc_provider_for_validate();
+        if let AuthProviderConfig::OidcPassword { groups_claim, .. } = &mut provider {
+            *groups_claim = "groups".to_string();
+        }
+        config.auth.providers = vec![provider];
         config.catalog.require_vended_credentials = true;
         // Review 212: a real policy engine and a grant backend are part of a
         // hardened config; the tests below flip each back to its default.
@@ -7430,6 +7445,51 @@ s3_secret_key = "configured-secret"
         config.policy.ranger.project_tags = false;
         config.security.allow_unprojected_tags = true;
         assert!(config.validate_production().is_ok());
+    }
+
+    // #899: a Ranger deploy whose tokens carry no groups grants nobody.
+    #[test]
+    fn validate_production_rejects_ranger_without_groups_claim() {
+        let mut config = valid_production_config();
+        config.auth.providers = vec![oidc_provider_for_validate()];
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(
+            err.contains("auth.providers[0] (oidc_password)")
+                && err.contains("allow_tokens_without_groups"),
+            "got: {err}"
+        );
+
+        // The legacy [auth] block never reads groups.
+        config.auth.providers.clear();
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(err.contains("legacy [auth] block"), "got: {err}");
+
+        config.security.allow_tokens_without_groups = true;
+        let err = config.validate_production().err().map(|e| e.to_string());
+        assert!(
+            !err.as_deref().unwrap_or("").contains("ranger-groups-claim")
+                && !err.as_deref().unwrap_or("").contains("read no groups"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_production_accepts_ranger_groups_claim_or_opt_out() {
+        let mut config = valid_production_config();
+        assert!(config.validate_production().is_ok());
+
+        config.auth.providers = vec![oidc_provider_for_validate()];
+        config.security.allow_tokens_without_groups = true;
+        assert!(config.validate_production().is_ok());
+
+        // Without Ranger, groups are not required.
+        config.security.allow_tokens_without_groups = false;
+        config.policy.engine = PolicyEngine::InMemory;
+        let err = config.validate_production().err().map(|e| e.to_string());
+        assert!(
+            !err.as_deref().unwrap_or("").contains("read no groups"),
+            "got: {err:?}"
+        );
     }
 
     #[test]

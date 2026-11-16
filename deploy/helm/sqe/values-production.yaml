@@ -26,6 +26,17 @@ config:
   # REST catalog (issue #395).
   catalog:
     require_vended_credentials: true
+  # Ranger grants, masks and row filters by group, so the token must carry
+  # groups: production_mode with policy.engine=ranger refuses a provider
+  # without groups_claim, and the legacy keycloak_url block (which reads no
+  # groups) (#899). Point token_url at your IdP; the client secret arrives as
+  # the SQE_AUTH__CLIENT_SECRET env override from existingSecret.
+  auth:
+    providers:
+      - type: oidc_password
+        token_url: "https://keycloak.example.com/realms/iceberg/protocol/openid-connect/token"
+        client_id: "sqe-client"
+        groups_claim: "groups"
   # production_mode refuses caller-supplied object-store keys on the file
   # table functions (#751).
   storage:
