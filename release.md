@@ -34,9 +34,9 @@ latest` (`scripts/push-latest.sh`), not from CI. It cross-compiles HEAD of
 `main` for both architectures with cargo-zigbuild, packages each with
 `Dockerfile.ci`, and tags the manifest list `:latest` and `:<short-sha>` in
 both `chameleon/sqlengine/sqe` and `chameleon/sqe`. Release tags write
-`:vX.Y.Z` and `:stable` only, so a release no longer replaces the multi-arch
-`:latest` with an amd64 image. Pin a `:<short-sha>` when you need an exact dev
-build, or `:stable` for the newest release.
+`:vX.Y.Z` and `:stable` only (both multi-arch too, see "Release images are
+multi-arch"). Pin a `:<short-sha>` when you need an exact dev build (amd64
+only), or `:stable` for the newest release.
 
 The mirror job on the merge path is `allow_failure: true`, so a merge can land
 with no Harbor tag and a green pipeline. If a short SHA you expect is missing,
@@ -211,16 +211,37 @@ to the public Rekor transparency log. The planned fix signs with a cosign key
 held in CI (or a KMS) and skips the public log; turn `AIKIDO_SIGN` back on
 with that change, not before.
 
-## Images are amd64 only
+## Release images are multi-arch
 
-The CI images (`:vX.Y.Z`, `:stable`, `:<short-sha>`) are built by kaniko for
-linux/amd64. `:latest` is the exception: `make latest` cross-compiles both
-architectures with cargo-zigbuild on a workstation (about 20 minutes per
-architecture cold) and pushes a manifest list. `make push` still builds both
-inside `docker buildx`, which compiles amd64 under QEMU on Apple silicon, and
-tags only the commit, never `:latest`. A CI
-multi-arch release build (the same cross-compile, then `Dockerfile.ci` per
-platform) is the next step.
+A `vX.Y.Z` tag pipeline publishes one manifest list with linux/amd64 and
+linux/arm64 under `:vX.Y.Z` and `:stable`, in the GitLab registry and in Harbor:
+
+1. `sqe-release-binaries` (one job per architecture) cross-compiles
+   `sqe-server` and `sqe-cli` on the amd64 runner with cargo-zigbuild, glibc
+   2.28 floor (`scripts/ci-release-binaries.sh`, the same build as
+   `make latest`). No arm64 runner and no QEMU.
+2. `sqe-release-image-arch` packages each with `Dockerfile.ci` in kaniko
+   (`--custom-platform`).
+3. `aikido-release-image` joins both digests into one index with crane
+   (`scripts/ci-release-index.sh`); the runners have no Docker daemon, so no
+   buildx. Its digest goes to `image-digest.txt`.
+4. Grype scans both platforms (`aikido-release-image-scan` for amd64,
+   `sqe-release-image-scan-arm64`).
+5. The Harbor mirror and `sqe-publish-latest` copy with `skopeo copy --all
+   --preserve-digests` (`scripts/ci-mirror-release.sh`) and read every tag
+   back: it fails unless the tag lists both platforms under the same index
+   digest. A plain `skopeo copy` keeps only the runner's platform.
+6. The GitLab Release names the index digest to pin.
+
+Each check is `scripts/ci-image-platforms.py`. To try the path without a tag,
+put the `ci::multiarch` label on an MR and run a new MR pipeline: it builds
+both architectures with the `dev-release` profile and pushes `:mr-<iid>` to
+this project's registry only, never a release tag, `:stable` or Harbor.
+
+The dev images (`:<short-sha>`) from merges to `main` are still amd64 only.
+`:latest` stays with `make latest` (see "Dev versions"). `make push` builds
+both inside `docker buildx`, which compiles amd64 under QEMU on Apple silicon,
+and tags only the commit.
 
 ## Binaries on the GitHub mirror
 
