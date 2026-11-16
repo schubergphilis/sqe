@@ -496,6 +496,11 @@ mod tests {
 
     #[test]
     fn telemetry_endpoints_need_https_unless_loopback() {
+        // `load_from_str` reads the `SQE_*` env overlay; tests in
+        // `config::tests` set those variables under this lock.
+        let _g = super::super::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let rule = PRODUCTION_RULES
             .iter()
             .find(|r| r.name == "https-telemetry-endpoints")

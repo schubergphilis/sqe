@@ -8701,8 +8701,10 @@ otlp_endpoint = ""
     /// has process-wide effect. Every test in this module that calls
     /// std::env::set_var or std::env::remove_var MUST acquire this lock
     /// at its top with `let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());`
-    /// before touching the environment.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// before touching the environment. A test anywhere under `config/` that
+    /// loads a config (`load_from_str` applies the `SQE_*` env overlay) must
+    /// hold it too, or it reads another test's half-set variables.
+    pub(super) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     const MINIMAL_TOML: &str = r#"
 [coordinator]
