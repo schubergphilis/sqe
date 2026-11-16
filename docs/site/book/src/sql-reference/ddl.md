@@ -208,6 +208,7 @@ SELECT * FROM analytics.events FOR VERSION AS OF 'dev_2026_05';
 | `DROP VIEW [IF EXISTS] v` | `sqlparser-rs` + `sqe-coordinator` | Remove a view. | yes | yes | yes | yes |
 | `CREATE VIEW v COMMENT '<text>' AS ...` | `sqe-sql` `view_compat` + `sqe-coordinator` | Trino's comment spelling, without `=`. Stored as the view's `comment` property. | yes | no | no | no |
 | `CREATE VIEW v SECURITY {DEFINER \| INVOKER} AS ...` | `sqe-sql` `view_compat` + `sqe-coordinator` | Accepted and recorded. See below: `DEFINER` is not enforced. | yes | no | no | no |
+| `CREATE OR REPLACE VIEW v WITH (drop_dialects = 'spark') AS ...` | `sqe-coordinator` | Lets a replace drop the named dialects' texts. See below. | no | no | no | no |
 
 ```sql
 CREATE OR REPLACE VIEW analytics.recent_events AS
@@ -216,6 +217,27 @@ WHERE occurred_at >= now() - INTERVAL '7' DAY;
 
 DROP VIEW IF EXISTS analytics.recent_events;
 ```
+
+### Replacing a view another engine can read
+
+An Iceberg view version can hold the same query in several SQL dialects, one per
+engine. SQE writes only an `sqe` text. Replacing a view whose current version also
+holds, for example, a `spark` text would leave Spark unable to read it, so SQE
+refuses that replace and the error names each dialect it would drop.
+
+To replace the view anyway, name those dialects:
+
+```sql
+CREATE OR REPLACE VIEW analytics.recent_events
+WITH (drop_dialects = 'spark, trino') AS
+SELECT * FROM analytics.events;
+```
+
+The list is comma-separated and case-insensitive. It applies to that one statement
+and is not stored on the view. The Iceberg REST catalog has its own guard, the view
+property `replace.drop-dialect.allowed`. SQE sets it for the replace commit and
+removes it again afterwards, unless the view already had it. A view whose current version has only an `sqe`
+text is replaced without the option.
 
 ### `SECURITY DEFINER` is recorded, not enforced
 
