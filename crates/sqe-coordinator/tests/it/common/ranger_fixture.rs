@@ -441,7 +441,7 @@ impl RangerAdmin {
 
     /// Ranger's tag bundle for a resource service, the same document its plugins
     /// download.
-    async fn download_tag_bundle(&self, service: &str) -> anyhow::Result<Value> {
+    pub async fn download_tag_bundle(&self, service: &str) -> anyhow::Result<Value> {
         let resp = self
             .req(
                 reqwest::Method::GET,

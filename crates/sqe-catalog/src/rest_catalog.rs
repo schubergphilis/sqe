@@ -821,6 +821,8 @@ pub struct TableMetadataCache {
     /// absent map entry reads as this value, which is newer than anything a
     /// reader that snapshotted before the prune can hold.
     prune_floor: Arc<std::sync::atomic::AtomicU64>,
+    /// Told about every table a schema provider loads (#903).
+    load_observer: crate::load_observer::LoadObserverSlot,
 }
 
 impl TableMetadataCache {
@@ -863,7 +865,17 @@ impl TableMetadataCache {
             table_generations: Arc::new(DashMap::new()),
             key_generations: Arc::new(DashMap::new()),
             prune_floor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            load_observer: Default::default(),
         }
+    }
+
+    /// Install the observer every clone of this cache reports table loads
+    /// to; false when one is already installed.
+    pub fn set_load_observer(
+        &self,
+        observer: Arc<dyn crate::load_observer::TableLoadObserver>,
+    ) -> bool {
+        self.load_observer.set(observer)
     }
 
     /// Attach a metrics registry. Every `SessionCatalog` clone of this
@@ -2592,6 +2604,12 @@ impl SessionCatalog {
                 ),
             )),
         }
+    }
+
+    /// Report a table loaded for planning to the shared cache's observer
+    /// (#903). `catalog` is the planner's name for this catalog.
+    pub fn notify_table_loaded(&self, catalog: &str, ident: &TableIdent, table: &Table) {
+        self.table_cache.load_observer.notify(catalog, ident, table);
     }
 
     /// A [`crate::vended_credentials::TableReloader`] for `table_ident` that

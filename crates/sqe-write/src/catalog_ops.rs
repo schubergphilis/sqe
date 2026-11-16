@@ -40,7 +40,8 @@ fn is_format_version_key(key: &str) -> bool {
 /// Per-table async lock used to serialize read-merge-commit sequences (see
 /// `keyed_lock`). The outer `std::Mutex` guards only the map; the inner
 /// `tokio::Mutex` is the per-table critical-section lock.
-type TableLockMap = StdArc<std::sync::Mutex<HashMap<String, StdArc<tokio::sync::Mutex<()>>>>>;
+pub(crate) type TableLockMap =
+    StdArc<std::sync::Mutex<HashMap<String, StdArc<tokio::sync::Mutex<()>>>>>;
 
 /// Handles catalog DDL operations (DROP TABLE, ALTER TABLE RENAME, views).
 ///
@@ -157,6 +158,20 @@ impl CatalogOps {
 
     fn catalog_scoped(&self) -> bool {
         self.config.policy.ranger.catalog_scoped
+    }
+
+    /// The observer that projects a tag change found on table load (#903);
+    /// `None` when projection is off.
+    pub fn load_tag_observer(
+        &self,
+    ) -> Option<Arc<dyn sqe_catalog::load_observer::TableLoadObserver>> {
+        let projector = self.tag_projector.clone();
+        let locks = self.table_locks.clone();
+        let observer =
+            crate::tag_load_observer::TagLoadObserver::new(projector, self.catalog_scoped(), locks);
+        self.tag_projector
+            .enabled()
+            .then(|| Arc::new(observer) as Arc<_>)
     }
 
     /// The catalog name the planner resolves `qualifier` to: the qualifier,
@@ -2788,7 +2803,7 @@ fn check_type_promotion(
 /// are never removed (tag authoring is rare; the map stays small), so two calls
 /// with the same key always return the SAME `Arc<tokio::Mutex>` and therefore
 /// serialize.
-fn keyed_lock(locks: &TableLockMap, key: String) -> StdArc<tokio::sync::Mutex<()>> {
+pub(crate) fn keyed_lock(locks: &TableLockMap, key: String) -> StdArc<tokio::sync::Mutex<()>> {
     let mut map = locks.lock().expect("table_locks mutex poisoned");
     StdArc::clone(map.entry(key).or_default())
 }

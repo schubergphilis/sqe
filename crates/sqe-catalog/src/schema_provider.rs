@@ -579,7 +579,14 @@ impl SqeSchemaProvider {
         let table_ident = iceberg::TableIdent::new(ns_ident.clone(), name.to_string());
 
         // First: try loading as a regular Iceberg table
-        match self.session_catalog.load_table(&table_ident).await {
+        let loaded = self.session_catalog.load_table(&table_ident).await;
+        if let Ok(table) = &loaded {
+            // Projects a tag committed outside SQE into Ranger (#903).
+            let catalog = self.catalog_name.as_deref().unwrap_or(&self.warehouse);
+            self.session_catalog
+                .notify_table_loaded(catalog, &table_ident, table);
+        }
+        match loaded {
             Ok(table) => match SqeTableProvider::try_new(table).await {
                 Ok(provider) => {
                     let provider = match self.prom_metrics {

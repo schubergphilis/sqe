@@ -28,6 +28,7 @@ mod policy_view;
 pub mod procedures;
 pub mod puffin_carry;
 pub mod table_health;
+pub mod tag_load_observer;
 pub mod tag_source_impl;
 pub mod view_schema;
 pub mod write_handler;
