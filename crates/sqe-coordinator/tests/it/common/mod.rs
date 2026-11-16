@@ -400,6 +400,20 @@ pub async fn setup_ranger_handler_sharing(
     sqe_coordinator::QueryHandler,
     sqe_catalog::TableMetadataCache,
 ) {
+    setup_ranger_handler_audited(existing_cache, None, mutate).await
+}
+
+/// `setup_ranger_handler_sharing`, with the handler writing its audit
+/// records to `audit`.
+#[allow(dead_code)]
+pub async fn setup_ranger_handler_audited(
+    existing_cache: Option<sqe_catalog::TableMetadataCache>,
+    audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
+    mutate: impl FnOnce(&mut sqe_core::SqeConfig),
+) -> (
+    sqe_coordinator::QueryHandler,
+    sqe_catalog::TableMetadataCache,
+) {
     init_tracing();
     let mut config =
         sqe_core::SqeConfig::load(&ranger_config_path()).expect("load tests/sqe-ranger-test.toml");
@@ -431,7 +445,7 @@ pub async fn setup_ranger_handler_sharing(
         None, // worker_registry
         None, // credential_tracker
         None, // metrics
-        None, // audit
+        audit,
         query_tracker,
         None, // query_cache
         grant_backend,

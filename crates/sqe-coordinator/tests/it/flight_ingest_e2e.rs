@@ -39,7 +39,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Channel, Server};
 
 /// A running Flight SQL server over the real stack. Dropping it stops it.
-struct IngestServer {
+pub(crate) struct IngestServer {
     addr: std::net::SocketAddr,
     sessions: Arc<SessionManager>,
     audit: Option<AuditFiles>,
@@ -55,6 +55,24 @@ struct AuditFiles {
     _dir: tempfile::TempDir,
 }
 
+impl AuditFiles {
+    /// A fresh audit log in a temporary directory.
+    fn new() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let native = dir.path().join("audit.jsonl");
+        let logger = Arc::new(
+            AuditLogger::with_config(native.to_str().unwrap(), AuditFormat::Both)
+                .expect("audit logger opens"),
+        );
+        Self {
+            logger,
+            ocsf: dir.path().join("audit.ocsf.jsonl"),
+            native,
+            _dir: dir,
+        }
+    }
+}
+
 impl IngestServer {
     async fn start() -> Self {
         Self::start_with(None).await
@@ -62,19 +80,7 @@ impl IngestServer {
 
     /// A server whose handler writes audit records to a fresh directory.
     async fn start_audited() -> Self {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let native = dir.path().join("audit.jsonl");
-        let logger = Arc::new(
-            AuditLogger::with_config(native.to_str().unwrap(), AuditFormat::Both)
-                .expect("audit logger opens"),
-        );
-        Self::start_with(Some(AuditFiles {
-            logger,
-            ocsf: dir.path().join("audit.ocsf.jsonl"),
-            native,
-            _dir: dir,
-        }))
-        .await
+        Self::start_with(Some(AuditFiles::new())).await
     }
 
     async fn start_with(audit: Option<AuditFiles>) -> Self {
@@ -84,6 +90,26 @@ impl IngestServer {
         let (_root, handler) = crate::common::setup_handler_with_audit(logger).await;
         let config =
             sqe_core::SqeConfig::load(&crate::common::test_config_path()).expect("test config");
+        Self::serve(handler, config, audit).await
+    }
+
+    /// An audited server on the Ranger access-control stack, where Polaris
+    /// authorizes against Ranger. Clients sign in with [`Self::client_as`].
+    pub(crate) async fn start_ranger_audited() -> Self {
+        let audit = AuditFiles::new();
+        let logger = Some(Arc::clone(&audit.logger));
+        let (handler, _cache) =
+            crate::common::setup_ranger_handler_audited(None, logger, |_| {}).await;
+        let path = crate::common::ranger_config_path();
+        let config = sqe_core::SqeConfig::load(&path).expect("ranger test config");
+        Self::serve(handler, config, Some(audit)).await
+    }
+
+    async fn serve(
+        handler: sqe_coordinator::QueryHandler,
+        config: sqe_core::SqeConfig,
+        audit: Option<AuditFiles>,
+    ) -> Self {
         let authenticator = Arc::new(
             sqe_auth::Authenticator::new(&config.auth)
                 .await
@@ -132,7 +158,7 @@ impl IngestServer {
     }
 
     /// How many records each file holds now; pass it to [`Self::one_record_since`].
-    fn audit_mark(&self) -> (usize, usize) {
+    pub(crate) fn audit_mark(&self) -> (usize, usize) {
         let (native, ocsf) = self.audit_records();
         (native.len(), ocsf.len())
     }
@@ -141,7 +167,7 @@ impl IngestServer {
     /// OCSF line is the chained native record; returns the native one. The
     /// count is over the whole file, so a second record of any kind written
     /// by the ingest is caught.
-    fn one_ingest_record_since(&self, mark: (usize, usize)) -> Value {
+    pub(crate) fn one_ingest_record_since(&self, mark: (usize, usize)) -> Value {
         let (native, ocsf) = self.audit_records();
         let new = &native[mark.0..];
         let dump = serde_json::to_string_pretty(new).unwrap_or_default();
@@ -161,6 +187,15 @@ impl IngestServer {
     /// A client on its own session (own token), authenticated as the test
     /// stack's root principal. Two clients are two sessions of the same user.
     async fn client(&self) -> FlightSqlServiceClient<Channel> {
+        self.client_as("root", "").await
+    }
+
+    /// A client on a fresh session of `user`.
+    pub(crate) async fn client_as(
+        &self,
+        user: &str,
+        password: &str,
+    ) -> FlightSqlServiceClient<Channel> {
         let channel = Channel::from_shared(format!("http://{}", self.addr))
             .expect("valid endpoint")
             .connect()
@@ -168,9 +203,9 @@ impl IngestServer {
             .expect("connect to the flight sql server");
         let session = self
             .sessions
-            .authenticate("root", "")
+            .authenticate(user, password)
             .await
-            .expect("root session");
+            .unwrap_or_else(|e| panic!("{user} session: {e}"));
         let mut client = FlightSqlServiceClient::new(channel);
         client.set_token(session.id.clone());
         client
@@ -212,7 +247,7 @@ fn ingest_schema() -> Arc<Schema> {
 }
 
 /// One batch of `(id, name)` rows.
-fn batch(rows: &[(i64, &str)]) -> RecordBatch {
+pub(crate) fn batch(rows: &[(i64, &str)]) -> RecordBatch {
     let ids: ArrayRef = Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0)));
     let names: ArrayRef = Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.1)));
     RecordBatch::try_new(ingest_schema(), vec![ids, names]).expect("batch")
@@ -239,7 +274,7 @@ fn ingest_command(
 }
 
 /// Send `batches` as one `DoPut` ingest stream; returns the server's count.
-async fn ingest(
+pub(crate) async fn ingest(
     client: &mut FlightSqlServiceClient<Channel>,
     command: CommandStatementIngest,
     batches: Vec<RecordBatch>,
@@ -275,7 +310,9 @@ async fn ingest_announcing_schema(
 }
 
 /// The gRPC code of a failed ingest, if the error carries one.
-fn status_code<T>(result: &Result<T, arrow_flight::error::FlightError>) -> Option<tonic::Code> {
+pub(crate) fn status_code<T>(
+    result: &Result<T, arrow_flight::error::FlightError>,
+) -> Option<tonic::Code> {
     match result {
         Err(arrow_flight::error::FlightError::Tonic(status)) => Some(status.code()),
         _ => None,
@@ -302,6 +339,24 @@ async fn snapshots(client: &mut FlightSqlServiceClient<Channel>, table: &str) ->
         }
     }
     out
+}
+
+/// The summary of `table`'s newest snapshot, as the JSON object
+/// `table_snapshots` renders.
+async fn latest_summary(client: &mut FlightSqlServiceClient<Channel>, table: &str) -> Value {
+    let sql = format!(
+        "SELECT summary FROM table_snapshots('{SCHEMA}', '{table}') \
+         ORDER BY committed_at DESC, snapshot_id DESC LIMIT 1"
+    );
+    let batches = query(client, &sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let b = batches
+        .iter()
+        .find(|b| b.num_rows() > 0)
+        .expect("a snapshot");
+    let text = crate::common::fmt_val(b.column(0).as_ref(), 0);
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("summary {text}: {e}"))
 }
 
 /// Run `sql` through `GetFlightInfo` + `DoGet`.
@@ -952,6 +1007,200 @@ async fn ingest_append_writes_one_audit_record() {
         !r.to_string().contains("alpha"),
         "the record never carries row values: {r}"
     );
+    drop_table(&mut client, table).await;
+}
+
+/// #904 (write-snapshot-properties 5.1): a `snapshot-property.<key>` option
+/// lands in the summary of the snapshot each ingest mode commits, inside a
+/// transaction and outside one.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ingest_snapshot_property_lands_in_every_mode_summary() {
+    let server = IngestServer::start().await;
+    let mut client = server.client().await;
+    let table = "flight_ingest_summary_props";
+    drop_table(&mut client, table).await;
+    use TableExistsOption as Exists;
+    use TableNotExistOption as Missing;
+    let modes = [
+        ("create", Missing::Create, Exists::Fail),
+        ("append", Missing::Fail, Exists::Append),
+        ("replace", Missing::Fail, Exists::Replace),
+        ("txn-append", Missing::Fail, Exists::Append),
+        ("txn-replace", Missing::Fail, Exists::Replace),
+    ];
+    for (i, (label, missing, exists)) in modes.into_iter().enumerate() {
+        let txn = match label.starts_with("txn-") {
+            true => Some(client.begin_transaction().await.expect("begin")),
+            false => None,
+        };
+        let mut cmd = ingest_command(table, missing, exists, txn.clone());
+        let run = format!("42-{label}");
+        cmd.options
+            .insert("snapshot-property.run".to_string(), run.clone());
+        let rows = vec![batch(&[(i as i64, label)])];
+        let count = ingest(&mut client, cmd, rows).await;
+        assert_eq!(count.unwrap_or_else(|e| panic!("{label}: {e}")), 1);
+        if let Some(txn) = txn {
+            client
+                .end_transaction(txn, EndTransaction::Commit)
+                .await
+                .unwrap_or_else(|e| panic!("{label} commit: {e}"));
+        }
+        let summary = latest_summary(&mut client, table).await;
+        assert_eq!(summary["run"], run.as_str(), "{label}: {summary}");
+    }
+    drop_table(&mut client, table).await;
+}
+
+/// #904 (write-snapshot-properties 5.5): an ingest option applies to its
+/// own request only, and a reserved key is refused before any snapshot.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ingest_snapshot_property_is_per_request_and_reserved_keys_fail() {
+    let server = IngestServer::start().await;
+    let mut client = server.client().await;
+    let table = "flight_ingest_summary_scope";
+    fresh_table(&mut client, table).await;
+    let append = || {
+        ingest_command(
+            table,
+            TableNotExistOption::Fail,
+            TableExistsOption::Append,
+            None,
+        )
+    };
+
+    let mut cmd = append();
+    cmd.options
+        .insert("snapshot-property.run".to_string(), "42".to_string());
+    ingest(&mut client, cmd, vec![batch(&[(1, "a")])])
+        .await
+        .expect("ingest with the option");
+    assert_eq!(latest_summary(&mut client, table).await["run"], "42");
+
+    ingest(&mut client, append(), vec![batch(&[(2, "b")])])
+        .await
+        .expect("ingest without it");
+    let summary = latest_summary(&mut client, table).await;
+    assert!(summary.get("run").is_none(), "one request only: {summary}");
+
+    let before = snapshots(&mut client, table).await;
+    let mut cmd = append();
+    cmd.options.insert(
+        "snapshot-property.operation".to_string(),
+        "append".to_string(),
+    );
+    let refused = ingest(&mut client, cmd, vec![batch(&[(3, "c")])]).await;
+    assert_eq!(status_code(&refused), Some(tonic::Code::InvalidArgument));
+    assert_eq!(snapshots(&mut client, table).await, before, "no snapshot");
+    assert_eq!(rows(&mut client, table).await, strings(&["1|a", "2|b"]));
+    drop_table(&mut client, table).await;
+}
+
+/// #904: the coordinator decodes at most tonic's default 4 MiB per gRPC
+/// message. The Rust encoder splits a batch into ~2 MiB messages by rows, so
+/// many rows arrive, but one row over the limit cannot be split and the whole
+/// ingest is refused with the table unchanged. The Flight SQL page documents
+/// this limit.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn ingest_message_over_four_mib_is_refused() {
+    let server = IngestServer::start().await;
+    let mut client = server.client().await;
+    let table = "flight_ingest_message_limit";
+    fresh_table(&mut client, table).await;
+    let append = || {
+        ingest_command(
+            table,
+            TableNotExistOption::Fail,
+            TableExistsOption::Append,
+            None,
+        )
+    };
+
+    let mid = "m".repeat(1 << 20);
+    let many: Vec<(i64, &str)> = (0..6).map(|i| (i, mid.as_str())).collect();
+    let count = ingest(&mut client, append(), vec![batch(&many)]).await;
+    assert_eq!(count.expect("a 6 MiB batch of 1 MiB rows"), 6);
+
+    let before = snapshots(&mut client, table).await;
+    let big = "b".repeat(5 << 20);
+    let refused = ingest(&mut client, append(), vec![batch(&[(9, big.as_str())])]).await;
+    assert_eq!(
+        status_code(&refused),
+        Some(tonic::Code::OutOfRange),
+        "{refused:?}"
+    );
+    assert_eq!(snapshots(&mut client, table).await, before, "no snapshot");
+    drop_table(&mut client, table).await;
+}
+
+/// #904 (write-snapshot-properties 5.1, SQL half): `SET SNAPSHOT_PROPERTIES`
+/// reaches the committed summary of every SQL write kind, in a Flight SQL
+/// transaction and outside one.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn sql_snapshot_property_lands_in_every_write_kind_summary() {
+    let server = IngestServer::start().await;
+    let mut client = server.client().await;
+    let table = "flight_sql_summary_props";
+    let t = fq(table);
+    drop_table(&mut client, table).await;
+    let kinds = [
+        (
+            "ctas",
+            format!("CREATE TABLE {t} AS SELECT 1 AS id, 'a' AS name"),
+        ),
+        (
+            "insert",
+            format!("INSERT INTO {t} VALUES (2, 'b'), (3, 'c')"),
+        ),
+        ("update", format!("UPDATE {t} SET name = 'bb' WHERE id = 2")),
+        ("delete", format!("DELETE FROM {t} WHERE id = 3")),
+        (
+            "merge",
+            format!(
+                "MERGE INTO {t} AS t USING (SELECT 4 AS id, 'd' AS name) AS s \
+                 ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.id, s.name)"
+            ),
+        ),
+        ("overwrite", format!("INSERT OVERWRITE {t} VALUES (5, 'e')")),
+    ];
+    for in_txn in [false, true] {
+        if in_txn {
+            drop_table(&mut client, table).await;
+        }
+        for (kind, sql) in &kinds {
+            let label = format!("{kind} in_txn={in_txn}");
+            let run = format!("42-{kind}-{in_txn}");
+            let txn = match in_txn {
+                true => Some(client.begin_transaction().await.expect("begin")),
+                false => None,
+            };
+            let set = format!("SET SNAPSHOT_PROPERTIES ('run' = '{run}')");
+            client
+                .execute_update(set, txn.clone())
+                .await
+                .unwrap_or_else(|e| panic!("{label} set: {e}"));
+            client
+                .execute_update(sql.clone(), txn.clone())
+                .await
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            match txn {
+                Some(txn) => client
+                    .end_transaction(txn, EndTransaction::Commit)
+                    .await
+                    .unwrap_or_else(|e| panic!("{label} commit: {e}")),
+                None => {
+                    let reset = "RESET SNAPSHOT_PROPERTIES".to_string();
+                    client.execute_update(reset, None).await.expect("reset");
+                }
+            }
+            let summary = latest_summary(&mut client, table).await;
+            assert_eq!(summary["run"], run.as_str(), "{label}: {summary}");
+        }
+    }
     drop_table(&mut client, table).await;
 }
 
