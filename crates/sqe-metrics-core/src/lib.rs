@@ -133,6 +133,11 @@ pub struct MetricsRegistry {
     pub query_duration: HistogramVec,
     pub rows_returned: Counter,
     pub active_queries: IntGauge,
+    /// Statements waiting in the admission queue for a global slot (#902).
+    pub admission_queue_length: IntGauge,
+    /// Seconds a statement spent in the admission queue, by how the wait
+    /// ended: `admitted`, `timeout`, `draining`, `cancelled` (#902).
+    pub admission_queue_wait_seconds: HistogramVec,
     pub active_sessions: IntGauge,
     pub healthy_workers: IntGauge,
     pub cache_hits: Counter,
@@ -395,6 +400,22 @@ impl MetricsRegistry {
 
         let active_queries =
             register_int_gauge(&registry, "sqe_active_queries", "Number of active queries")?;
+        let admission_queue_length = register_int_gauge(
+            &registry,
+            "sqe_admission_queue_length",
+            "Statements waiting in the admission queue for a global slot",
+        )?;
+        let admission_queue_wait_seconds = register_histogram_vec(
+            &registry,
+            HistogramOpts::new(
+                "sqe_admission_queue_wait_seconds",
+                "Seconds a statement waited in the admission queue, by outcome",
+            )
+            .buckets(vec![
+                0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
+            ]),
+            &["outcome"],
+        )?;
 
         let active_sessions = register_int_gauge(
             &registry,
@@ -1033,6 +1054,8 @@ impl MetricsRegistry {
             query_duration,
             rows_returned,
             active_queries,
+            admission_queue_length,
+            admission_queue_wait_seconds,
             active_sessions,
             healthy_workers,
             cache_hits,

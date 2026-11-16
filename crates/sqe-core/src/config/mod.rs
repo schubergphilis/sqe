@@ -347,6 +347,18 @@ pub struct QueryConfig {
     /// every global permit; set to 0 to disable per-user accounting entirely.
     #[serde(default = "default_max_concurrent_per_user")]
     pub max_concurrent_per_user: usize,
+    /// Statements that may wait for a global slot when all
+    /// `max_concurrent_queries` are taken (#902). Waiters are served round
+    /// robin per user, so one user's backlog does not starve another's
+    /// single statement. Default 0: refuse at once with reason `queue_full`
+    /// (the pre-#902 behaviour). A user at `max_concurrent_per_user` is
+    /// refused, not queued.
+    #[serde(default)]
+    pub queue_max: usize,
+    /// Seconds a queued statement waits for a slot before it is refused
+    /// with reason `queue_timeout`. Default 30.
+    #[serde(default = "default_queue_timeout_secs")]
+    pub queue_timeout_secs: u64,
     /// Cap on concurrent CTAS / INSERT statements that include `ORDER BY`.
     /// Greedy pools let several sorted writes starve `ExternalSorterMerge`
     /// reservations and crash the process (issue #408). Default 2. Set to 0
@@ -639,6 +651,8 @@ impl Default for QueryConfig {
             max_sql_bytes: default_max_sql_bytes(),
             max_concurrent_queries: default_max_concurrent_queries(),
             max_concurrent_per_user: default_max_concurrent_per_user(),
+            queue_max: 0,
+            queue_timeout_secs: default_queue_timeout_secs(),
             max_concurrent_sorted_writes: default_max_concurrent_sorted_writes(),
             per_user_memory_budget: default_per_user_memory_budget(),
             slow_query_threshold_secs: default_slow_query_threshold(),
@@ -3910,6 +3924,9 @@ fn default_max_concurrent_per_user() -> usize {
 }
 fn default_max_concurrent_sorted_writes() -> usize {
     2
+}
+fn default_queue_timeout_secs() -> u64 {
+    30
 }
 fn default_per_user_memory_budget() -> String {
     "1GB".to_string()

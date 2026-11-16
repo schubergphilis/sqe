@@ -69,7 +69,7 @@
       ]
     },
     "sqe-coordinator": {
-      "lines": 67500,
+      "lines": 68200,
       "deps": [
         "sqe-auth",
         "sqe-catalog",

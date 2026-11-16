@@ -576,11 +576,11 @@ pub struct TrackedRecordBatchStream {
     schema: SchemaRef,
     finalizer: Option<StreamFinalizer>,
     rows_so_far: usize,
-    /// Concurrency permits held for the lifetime of the stream. Stored as a
-    /// vec so the streaming path can carry both a per-user permit and a
-    /// global permit without duplicating fields; both drop when the stream
-    /// drops, releasing the slots back to their respective semaphores.
+    /// Concurrency permits held for the lifetime of the stream (the
+    /// per-user one on the query path); they drop with the stream.
     _permits: Vec<OwnedSemaphorePermit>,
+    /// The global slot; its drop admits the next queued statement (#902).
+    _global: Option<crate::query_handler::GlobalPermit>,
     /// Opaque teardown handle whose Drop runs when the stream completes
     /// (clean EOF, error, or client cancel). Used by time-travel pinned
     /// providers (#44) to deregister the session-context alias once the
@@ -647,6 +647,7 @@ impl TrackedRecordBatchStream {
             finalizer: Some(finalizer),
             rows_so_far: 0,
             _permits: permit.into_iter().collect(),
+            _global: None,
             _teardown: None,
             _per_user_reservation: None,
             cancel_token: None,
@@ -679,6 +680,7 @@ impl TrackedRecordBatchStream {
             finalizer: Some(finalizer),
             rows_so_far: 0,
             _permits: permit.into_iter().collect(),
+            _global: None,
             _teardown: None,
             _per_user_reservation: None,
             cancel_wait: Some(Box::pin(cancel_token.clone().cancelled_owned())),
@@ -698,10 +700,11 @@ impl TrackedRecordBatchStream {
     /// Variant that also carries a per-user memory reservation. The
     /// reservation is released when the stream drops, freeing the user's
     /// share of the per-user memory budget.
-    pub fn with_permits_reservation_and_cancel_token(
+    pub(crate) fn with_permits_reservation_and_cancel_token(
         inner: SendableRecordBatchStream,
         finalizer: StreamFinalizer,
         permits: Vec<OwnedSemaphorePermit>,
+        global: Option<crate::query_handler::GlobalPermit>,
         reservation: Option<crate::memory::PerUserReservation>,
         cancel_token: CancellationToken,
     ) -> Self {
@@ -712,6 +715,7 @@ impl TrackedRecordBatchStream {
             finalizer: Some(finalizer),
             rows_so_far: 0,
             _permits: permits,
+            _global: global,
             _teardown: None,
             _per_user_reservation: reservation,
             cancel_wait: Some(Box::pin(cancel_token.clone().cancelled_owned())),

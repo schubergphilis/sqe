@@ -124,6 +124,53 @@ pub enum SqeError {
     Internal(#[from] anyhow::Error),
 }
 
+/// Why a statement was refused before it ran (#902). Carried as the source
+/// of a `ResourceExhausted` error so every protocol can send it on as a
+/// machine-readable field: a client retries `queue_full` but not a memory
+/// error raised while its statement ran, which carries no reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalReason {
+    /// The coordinator is at `max_concurrent_queries` and its queue is full
+    /// (or `query.queue_max` is 0).
+    QueueFull,
+    /// The statement waited `query.queue_timeout_secs` without a slot.
+    QueueTimeout,
+    /// The user is at `max_concurrent_per_user`.
+    UserLimit,
+    /// The user's in-flight statements hold their `per_user_memory_budget`.
+    MemoryBudget,
+    /// The coordinator memory pool is in the red band.
+    MemoryPressure,
+    /// A submission rate limit.
+    RateLimited,
+    /// The coordinator is shutting down and admits nothing new.
+    Draining,
+}
+
+impl RefusalReason {
+    /// The wire name: Flight metadata `x-sqe-refusal-reason`, the Trino
+    /// `errorName` suffix and the HTTP 429 JSON `reason`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RefusalReason::QueueFull => "queue_full",
+            RefusalReason::QueueTimeout => "queue_timeout",
+            RefusalReason::UserLimit => "user_limit",
+            RefusalReason::MemoryBudget => "memory_budget",
+            RefusalReason::MemoryPressure => "memory_pressure",
+            RefusalReason::RateLimited => "rate_limited",
+            RefusalReason::Draining => "draining",
+        }
+    }
+}
+
+impl std::fmt::Display for RefusalReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for RefusalReason {}
+
 fn body_for_display(body: &str) -> String {
     if body.is_empty() {
         String::new()
@@ -146,6 +193,21 @@ impl SqeError {
         }
         impl std::error::Error for TypedOrigin {}
         SqeError::sourced(code, message.to_string(), TypedOrigin)
+    }
+
+    /// An admission refusal: `ResourceExhausted` with `reason` as its
+    /// source, read back by [`SqeError::refusal_reason`] (#902).
+    pub fn refused(reason: RefusalReason, message: impl Into<String>) -> Self {
+        SqeError::sourced(SqeErrorCode::ResourceExhausted, message, reason)
+    }
+
+    /// The reason this error refused a statement before it ran, if it is
+    /// such a refusal.
+    pub fn refusal_reason(&self) -> Option<RefusalReason> {
+        match self {
+            SqeError::Sourced { source, .. } => source.downcast_ref::<RefusalReason>().copied(),
+            _ => None,
+        }
     }
 
     /// Build a source-preserving error with an explicit [`SqeErrorCode`]. The
@@ -632,6 +694,9 @@ impl SqeErrorCode {
                 | SqeErrorCode::CircuitBreakerOpen
                 | SqeErrorCode::StorageError
                 | SqeErrorCode::StorageCredentialsUnavailable => "EXTERNAL",
+                // Trino's type for its own resource limits
+                // (`EXCEEDED_*_LIMIT`, `QUERY_QUEUE_FULL`) (#902).
+                SqeErrorCode::ResourceExhausted => "INSUFFICIENT_RESOURCES",
                 _ => "INTERNAL_ERROR",
             }
         }
@@ -1840,6 +1905,41 @@ mod tests {
     fn iceberg_commit_conflict_variant_is_commit_conflict() {
         let err = SqeError::IcebergCommitConflict("snapshot N has already been added".to_string());
         assert_eq!(err.error_code(), SqeErrorCode::CommitConflict);
+    }
+
+    #[test]
+    fn refusal_carries_its_reason_and_resource_exhausted() {
+        let err = SqeError::refused(RefusalReason::QueueFull, "busy");
+        assert_eq!(err.error_code(), SqeErrorCode::ResourceExhausted);
+        assert_eq!(err.refusal_reason(), Some(RefusalReason::QueueFull));
+        assert_eq!(err.client_message(), "busy");
+        let wire: Vec<&str> = [
+            RefusalReason::QueueFull,
+            RefusalReason::QueueTimeout,
+            RefusalReason::UserLimit,
+            RefusalReason::MemoryBudget,
+            RefusalReason::MemoryPressure,
+            RefusalReason::RateLimited,
+            RefusalReason::Draining,
+        ]
+        .into_iter()
+        .map(RefusalReason::as_str)
+        .collect();
+        assert_eq!(
+            wire,
+            [
+                "queue_full",
+                "queue_timeout",
+                "user_limit",
+                "memory_budget",
+                "memory_pressure",
+                "rate_limited",
+                "draining"
+            ]
+        );
+        // A memory error raised while a statement ran is not a refusal.
+        let ran = SqeError::with_code(SqeErrorCode::ResourceExhausted, "pool full");
+        assert_eq!(ran.refusal_reason(), None);
     }
 
     #[test]
