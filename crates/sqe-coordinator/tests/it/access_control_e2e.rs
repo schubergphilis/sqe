@@ -1418,6 +1418,51 @@ async fn tag_from_out_of_band_commit_masks_the_next_query() {
         vec!["NULL"; 3],
         "a tag committed outside SQE must mask the next query"
     );
+
+    // That load also projected the tag into Ranger, so Spark masks it too.
+    ranger_column_tagged(&ctx, "ssn", true).await;
+
+    // An out-of-band removal is projected the same way.
+    let table = catalog.load_table(&ident).await.expect("reload orders");
+    tags.remove("ssn");
+    let tx = Transaction::new(&table);
+    let action = tx.update_table_properties().set(
+        "sqe.column-tags".to_string(),
+        serde_json::to_string(&tags).unwrap(),
+    );
+    let tx = action.apply(tx).unwrap();
+    tx.commit(catalog.as_ref()).await.expect("raw untag commit");
+    handler.execute(&ctx.bob, &sql, None).await.unwrap();
+    ranger_column_tagged(&ctx, "ssn", false).await;
+}
+
+/// Wait until Ranger's tag bundle does (or no longer does) associate a tag
+/// with `orders.<column>`.
+async fn ranger_column_tagged(ctx: &AcCtx, column: &str, want: bool) {
+    let has = |r: &serde_json::Value, key: &str, value: &str| {
+        let values = r["resourceElements"][key]["values"].as_array();
+        values.is_some_and(|a| a.iter().any(|v| v == value))
+    };
+    let what = format!("Ranger tag on orders.{column} present={want}");
+    crate::common::eventually(&what, || async {
+        let bundle = ctx.ranger.download_tag_bundle(HIVE_SERVICE).await;
+        let bundle = bundle.map_err(|e| e.to_string())?;
+        let empty = Vec::new();
+        let resources = bundle["serviceResources"].as_array().unwrap_or(&empty);
+        let tagged = resources
+            .iter()
+            .filter(|r| has(r, "table", "orders") && has(r, "column", column))
+            .any(|r| {
+                let ids = &bundle["resourceToTagIds"][r["id"].to_string()];
+                ids.as_array().is_some_and(|t| !t.is_empty())
+            });
+        if tagged == want {
+            Ok(())
+        } else {
+            Err(format!("tagged={tagged}"))
+        }
+    })
+    .await;
 }
 
 /// The Iceberg metadata TVFs answer under Ranger, and `table_files` still

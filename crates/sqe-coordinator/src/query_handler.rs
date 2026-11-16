@@ -832,6 +832,10 @@ impl QueryHandler {
         self.catalog_ops = self.catalog_ops.with_table_cache(cache.clone());
         self.write_handler = self.write_handler.with_table_cache(cache.clone());
         self.maintenance_handler = self.maintenance_handler.with_table_cache(cache.clone());
+        // A tag committed outside SQE reaches Ranger on the next load (#903).
+        if let Some(observer) = self.catalog_ops.load_tag_observer() {
+            cache.set_load_observer(observer);
+        }
         self.table_cache = Some(cache);
         self
     }

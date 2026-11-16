@@ -501,8 +501,13 @@ it. The rule in Ranger is what protects it.**
 
 Masks are shared with Spark through the same `query` service. Associations are
 projected: SQE reads Iceberg `sqe.column-tags`, Spark reads Ranger's tag store.
-With `project-tags = true`, `SET TAG` writes both. `CALL system.reproject_column_tags`
-covers tables tagged before the projector existed.
+With `project-tags = true`, `SET TAG` writes both. A tag another client commits
+straight to the catalog (Spark, a raw REST commit) reaches Ranger the next time
+SQE loads the table: SQE compares the tags with the ones it last projected and
+sends the difference. That memory is per coordinator process, so a tag removed
+while the coordinator was down stays in Ranger until
+`CALL system.reproject_column_tags` repairs it. The same CALL covers tables
+tagged before the projector existed.
 
 One enforcement detail does not carry over, and it is pinned by
 `scripts/access-control-parity-demo.sh`: Kyuubi places its masking projection

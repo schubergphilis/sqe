@@ -22,6 +22,8 @@ pub mod incremental_scan;
 pub mod info_schema;
 pub mod late_materialize;
 pub mod lazy_object_store;
+#[cfg(feature = "rest")]
+pub mod load_observer;
 pub mod mount;
 pub mod parallel_probe_scan;
 pub mod parallel_scan;
