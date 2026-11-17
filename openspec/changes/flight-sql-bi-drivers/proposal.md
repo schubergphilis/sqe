@@ -12,7 +12,7 @@ The Arrow Flight SQL JDBC driver 19.0.0, run against SQE's default configuration
 
 ## What Changes
 
-- **Compression per client.** A request from the Arrow Java Flight client (`user-agent` starting `grpc-java`) is answered uncompressed. A request header `x-sqe-flight-compression: none|lz4|zstd` picks the codec for that request and wins over both. Every other client keeps `[coordinator] flight_compression`.
+- **Compression per client.** A request from the Arrow Java Flight client (`user-agent` containing `grpc-java`; the JDBC driver sends `JDBC Flight SQL Driver 19.0.0 grpc-java-netty/...`) is answered uncompressed. A request header `x-sqe-flight-compression: none|lz4|zstd` picks the codec for that request and wins over both. Every other client keeps `[coordinator] flight_compression`.
 - **SQL catalog names.** The catalog metadata RPCs use the names SQL resolves: `GetCatalogs` returns what `SHOW CATALOGS` returns; `GetDbSchemas` and `GetTables` walk each catalog the request's filter selects.
 - **Session options.** `SetSessionOptions` accepts `catalog` and `schema` (string values) and sets the session's default scope, as `USE` does; an unknown catalog is `INVALID_VALUE`, an unknown option `INVALID_NAME`. `GetSessionOptions` returns them. `CloseSession` answers `NOT_CLOSEABLE`: a session lives as long as its token.
 - **Views.** `GetTables` types each row `TABLE` or `VIEW`; `GetTableTypes` returns both.

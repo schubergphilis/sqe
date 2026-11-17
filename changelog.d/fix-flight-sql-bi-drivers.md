@@ -2,7 +2,7 @@
 
 - Flight SQL works with the stock Arrow Flight SQL JDBC and ODBC drivers
 
-    The Arrow Java Flight client (`user-agent` `grpc-java...`) now gets uncompressed results, because it has no LZ4/ZSTD codec. The header `x-sqe-flight-compression: none|lz4|zstd` picks the codec for one request.
+    The Arrow Java Flight client (a `user-agent` containing `grpc-java`) now gets uncompressed results, because it has no LZ4/ZSTD codec. The header `x-sqe-flight-compression: none|lz4|zstd` picks the codec for one request.
 
     `GetCatalogs`, `GetDbSchemas` and `GetTables` report the catalog names SQL resolves, not the warehouse name. Views are typed `VIEW`, and `GetTableTypes` lists `TABLE` and `VIEW`.
 

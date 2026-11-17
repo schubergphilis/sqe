@@ -10,7 +10,9 @@
 //!
 //! 1. `x-sqe-flight-compression: none|lz4|zstd` wins (an unparsable value is
 //!    ignored);
-//! 2. a `user-agent` starting `grpc-java` gets no compression;
+//! 2. a `user-agent` containing `grpc-java` gets no compression. grpc-java
+//!    appends its own token after the application's, so the JDBC driver
+//!    sends `JDBC Flight SQL Driver 19.0.0 grpc-java-netty/1.x`;
 //! 3. otherwise there is no override and `[coordinator] flight_compression`
 //!    applies.
 //!
@@ -53,7 +55,7 @@ pub fn compression_for_headers(headers: &http::HeaderMap) -> Option<FlightCompre
     let java = headers
         .get(http::header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|ua| ua.starts_with("grpc-java"));
+        .is_some_and(|ua| ua.contains("grpc-java"));
     java.then_some(FlightCompression::None)
 }
 
@@ -216,6 +218,10 @@ mod tests {
     #[test]
     fn java_clients_get_no_compression() {
         let h = headers(&[("user-agent", "grpc-java-netty/1.73.0")]);
+        assert_eq!(compression_for_headers(&h), Some(FlightCompression::None));
+        // The JDBC driver's own agent comes first; grpc-java appends its token.
+        let jdbc = "JDBC Flight SQL Driver 19.0.0 grpc-java-netty/1.73.0";
+        let h = headers(&[("user-agent", jdbc)]);
         assert_eq!(compression_for_headers(&h), Some(FlightCompression::None));
     }
 

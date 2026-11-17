@@ -11,7 +11,7 @@ Measured with the Arrow Flight SQL JDBC driver 19.0.0 (JDK 21) against a local c
 `flight_ipc_options` reads a tokio `task_local` that a tower layer (`ClientCompressionLayer`, innermost on the Flight server) sets from the request headers before tonic dispatches. Order of precedence:
 
 1. `x-sqe-flight-compression: none|lz4|zstd` (the JDBC driver forwards unknown connection properties as headers, so `jdbc:arrow-flight-sql://host:port?x-sqe-flight-compression=lz4` re-enables a codec for a driver that has one). An unparsable value is ignored, not an error.
-2. `user-agent` starting `grpc-java`: `none`. The Java Flight client has no LZ4/ZSTD codec unless the application adds `arrow-compression`; uncompressed is always readable.
+2. `user-agent` containing `grpc-java` (grpc-java appends its token after the application agent, so the JDBC driver sends `JDBC Flight SQL Driver 19.0.0 grpc-java-netty/...`): `none`. The Java Flight client has no LZ4/ZSTD codec unless the application adds `arrow-compression`; uncompressed is always readable.
 3. `[coordinator] flight_compression`.
 
 A task-local keeps the 15 `flight_ipc_options` call sites unchanged. Every call site computes the options in the handler body, before the response stream is returned, so the value is read while the layer's scope is active.
