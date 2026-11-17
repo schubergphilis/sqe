@@ -39,7 +39,7 @@ Two more server-side gaps came out of the full driver matrix (`trino-jdbc` 480, 
 - `getUserName()` runs `SELECT current_user`, which failed with "No field named current_user". It failed in any SQL, not only from the driver: the front door re-serializes the bare keyword, the session's DuckDB dialect reads it as a column, and the unquoted call form `current_user()` is a parse error there. The front door now rewrites it to `"current_user"()` (`rewrite_bare_current_user`). Tests: `rewrites_bare_current_user_to_quoted_call`, plus `SELECT current_user` in `current_catalog_and_schema_return_session_values`.
 - `PreparedStatement.getMetaData()` before execute threw `NullPointerException: tableName is null`. `DESCRIBE OUTPUT` returned NULL for Catalog, Schema and Table; Trino returns `''` for a column it cannot trace, and the driver requires non-null. Now `''`. The test `describe_output_lists_columns_and_types` asserts no nulls.
 
-The other 9 failures are in the driver: `SQLFeatureNotSupportedException` for exported keys, cross reference, index info, best row identifier, version columns and both privilege calls; `getFunctions` and `getFunctionColumns` are not implemented. Expected after this change: 65 of 74.
+The other 9 failures are in the driver: `SQLFeatureNotSupportedException` for exported keys, cross reference, index info, best row identifier, version columns and both privilege calls; `getFunctions` and `getFunctionColumns` are not implemented. Measured after this change, password and token alike: 65 of 74 (`getUserName()` returns the user, prepared `getMetaData()` passes); the 9 left are the driver-side ones above.
 
 Left open:
 
