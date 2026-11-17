@@ -95,7 +95,7 @@ fn register_higher_order_aliases(ctx: &SessionContext) {
 pub const MAX_GENERATED_SIZE: u64 = 100_000_000;
 
 #[derive(Debug, PartialEq, Eq, Hash)]
-enum SizeKind {
+pub(crate) enum SizeKind {
     Range,
     Repeat,
     Pad,
@@ -109,7 +109,7 @@ struct SizeCapped {
     kind: SizeKind,
 }
 
-fn size_capped(udf: &ScalarUDF, kind: SizeKind) -> ScalarUDF {
+pub(crate) fn size_capped(udf: &ScalarUDF, kind: SizeKind) -> ScalarUDF {
     ScalarUDF::from(SizeCapped {
         inner: udf.clone(),
         kind,

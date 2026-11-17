@@ -75,7 +75,6 @@ log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
 moka = { version = "0.12", features = ["future", "sync"] }
 num-bigint = { version = "0.4", features = ["serde"] }
-num-integer = { version = "0.1", features = ["i128"] }
 num-traits = { version = "0.2", features = ["i128", "libm"] }
 object_store = { path = "../../vendor/object_store", features = ["aws", "azure", "gcp", "http"] }
 once_cell = { version = "1" }
