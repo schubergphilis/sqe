@@ -485,6 +485,24 @@ impl SessionManager {
         self.update_session(session_id, |s| s.set_default_scope(catalog, schema))
     }
 
+    /// Flight `SetSessionOptions {catalog, schema}`: either half alone, so a
+    /// client can switch catalog without naming a schema.
+    pub fn set_session_scope(
+        &self,
+        session_id: &str,
+        catalog: Option<String>,
+        schema: Option<String>,
+    ) -> bool {
+        self.update_session(session_id, |s| {
+            if catalog.is_some() {
+                s.default_catalog = catalog;
+            }
+            if schema.is_some() {
+                s.default_schema = schema;
+            }
+        })
+    }
+
     /// `BEGIN` / `COMMIT` / `ROLLBACK` for a stored session (#820). Flight
     /// SQL has no transaction header, so the explicit transaction lives on
     /// the session every later request on the same token resolves through.

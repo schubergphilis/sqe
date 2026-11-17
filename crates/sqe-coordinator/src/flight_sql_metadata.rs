@@ -41,11 +41,13 @@ pub fn build_sql_info_data() -> Result<arrow_flight::sql::metadata::SqlInfoData,
     b.append(I::SqlDdlSchema, true);
     b.append(I::SqlDdlTable, true);
 
-    // Identifier handling. Iceberg / SQE preserve identifier case when
-    // double-quoted; bare identifiers fold to lower-case (CaseSensitivityLowerCase = 2).
-    b.append(I::SqlIdentifierCase, 2i32);
+    // Identifier handling. Bare identifiers fold to lower case
+    // (SqlSupportedCaseSensitivity LOWERCASE = 3). Quoted ones keep their
+    // case, which the enum (unknown, insensitive, upper, lower) cannot say:
+    // UNKNOWN = 0.
+    b.append(I::SqlIdentifierCase, 3i32);
     b.append(I::SqlIdentifierQuoteChar, "\"");
-    b.append(I::SqlQuotedIdentifierCase, 3i32); // CaseSensitive = 3
+    b.append(I::SqlQuotedIdentifierCase, 0i32);
 
     // Catalog and schema semantics.
     b.append(I::SqlAllTablesAreSelectable, true);
@@ -185,10 +187,19 @@ pub fn build_sql_info_data() -> Result<arrow_flight::sql::metadata::SqlInfoData,
     b.append(I::SqlSearchStringEscape, "\\");
     b.append(I::SqlExtraNameCharacters, "");
 
-    // Grammar level. SqlSupportedGrammar.SQL_MINIMUM_GRAMMAR = 0.
-    b.append(I::SqlSupportedGrammar, 0i32);
-    // SqlAnsi92SupportedLevel.ANSI92_INTERMEDIATE_SQL = 1.
-    b.append(I::SqlAnsi92SupportedLevel, 1i32);
+    // Grammar levels are bitmasks over the enum ordinals: minimum | core
+    // (SupportedSqlGrammar 0, 1) and ANSI-92 entry | intermediate
+    // (SupportedAnsi92SqlGrammarLevel 0, 1).
+    b.append(I::SqlSupportedGrammar, 0b011i32);
+    b.append(I::SqlAnsi92SupportedLevel, 0b011i32);
+    // GROUP BY unrelated | beyond select (bits 0, 1).
+    b.append(I::SqlSupportedGroupBy, 0b11i32);
+    // UNION | UNION ALL (bits 0, 1).
+    b.append(I::SqlSupportedUnions, 0b11i32);
+    // SqlOuterJoinsSupportLevel.SQL_FULL_OUTER_JOINS = 2.
+    b.append(I::SqlOuterJoinsSupportLevel, 2i32);
+    // Subqueries in comparisons | EXISTS | IN | quantified (bits 0-3).
+    b.append(I::SqlSupportedSubqueries, 0b1111i32);
 
     // Common capability booleans.
     b.append(I::SqlSupportsColumnAliasing, true);
@@ -236,7 +247,9 @@ pub fn build_sql_info_data() -> Result<arrow_flight::sql::metadata::SqlInfoData,
     // (SqlTransactionIsolationLevel 2, bitmask 1 << 2). DDL inside a
     // client-held transaction runs autocommit and leaves the transaction
     // open: it neither commits the transaction nor is ignored.
-    b.append(I::SqlDefaultTransactionIsolation, 2i32);
+    // Sent as int64: the Flight SQL JDBC driver casts this value to `Long`
+    // and threw ClassCastException on an int32.
+    b.append(I::SqlDefaultTransactionIsolation, 2i64);
     b.append(I::SqlTransactionsSupported, true);
     b.append(I::SqlSupportedTransactionsIsolationLevels, 1i32 << 2);
     b.append(I::SqlDataDefinitionCausesTransactionCommit, false);

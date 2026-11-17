@@ -1059,8 +1059,24 @@ impl QueryHandler {
         }
     }
 
-    /// List `(namespace, table_name)` pairs reachable by `session` across the
-    /// default Iceberg catalog. Used by Flight SQL `do_get_tables` and the
+    /// The catalog names `SHOW CATALOGS` lists for `session`: the names SQL
+    /// resolves, which Flight SQL `GetCatalogs` reports.
+    pub async fn list_catalog_names(&self, session: &Session) -> sqe_core::Result<Vec<String>> {
+        let batches = self.handle_show_catalogs(session).await?;
+        Ok(batches
+            .iter()
+            .filter_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+            })
+            .flat_map(|col| col.iter().flatten().map(str::to_string))
+            .collect())
+    }
+
+    /// List `(namespace, name, kind)` reachable by `session` in `catalog`
+    /// (`None`: the session's catalog), `kind` being `TABLE` or `VIEW`. The
+    /// catalog resolves as in `SHOW TABLES FROM`. Used by Flight SQL `do_get_tables` and the
     /// JDBC `DatabaseMetaData.getTables` path; bypasses the SQL planner so
     /// 500-table warehouses no longer trigger 500 planner invocations
     /// (issue #7), removes the catalog-name → SQL-string concatenation that
@@ -1076,17 +1092,18 @@ impl QueryHandler {
     pub async fn list_metadata_tables(
         &self,
         session: &Session,
-    ) -> sqe_core::Result<Vec<(String, String)>> {
+        catalog: Option<&str>,
+    ) -> sqe_core::Result<Vec<(String, String, &'static str)>> {
         use futures::StreamExt;
 
-        let catalog = self.session_catalog(session).await?;
+        let catalog = self.show_catalog(session, catalog).await?;
         let namespaces = catalog.list_namespaces().await?;
 
         // Bounded concurrency keeps load on Polaris predictable while
         // shaving wall-clock for warehouses with many schemas.
         const MAX_INFLIGHT: usize = 16;
 
-        let entries: Vec<(String, Vec<String>)> = futures::stream::iter(namespaces)
+        let entries: Vec<(String, Vec<(String, &'static str)>)> = futures::stream::iter(namespaces)
             .map(|ns| {
                 let catalog = Arc::clone(&catalog);
                 async move {
@@ -1097,8 +1114,11 @@ impl QueryHandler {
                         .collect::<Vec<_>>()
                         .join(".");
 
-                    let mut names: Vec<String> = match catalog.list_tables(&ns).await {
-                        Ok(tables) => tables.into_iter().map(|t| t.name().to_string()).collect(),
+                    let mut names = match catalog.list_tables(&ns).await {
+                        Ok(tables) => tables
+                            .into_iter()
+                            .map(|t| (t.name().to_string(), "TABLE"))
+                            .collect::<Vec<_>>(),
                         Err(e) => {
                             warn!(
                                 namespace = %ns_label,
@@ -1112,7 +1132,7 @@ impl QueryHandler {
                     // Views: REST-only. Non-REST backends return an error
                     // which we swallow — same shape as schema_provider.
                     if let Ok(views) = catalog.list_views(&ns).await {
-                        names.extend(views);
+                        names.extend(views.into_iter().map(|v| (v, "VIEW")));
                     }
 
                     (ns_label, names)
@@ -1122,10 +1142,10 @@ impl QueryHandler {
             .collect()
             .await;
 
-        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut pairs: Vec<(String, String, &'static str)> = Vec::new();
         for (ns_label, names) in entries {
-            for name in names {
-                pairs.push((ns_label.clone(), name));
+            for (name, kind) in names {
+                pairs.push((ns_label.clone(), name, kind));
             }
         }
         // Sorted output for stable JDBC client display.

@@ -288,6 +288,18 @@ fn client_transaction_of(session: &sqe_core::Session) -> Option<String> {
         .flatten()
 }
 
+/// The `GetTableTypes` result: the kinds `list_metadata_tables` reports.
+fn table_types_batch() -> Result<RecordBatch, Status> {
+    let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+        "table_type",
+        arrow_schema::DataType::Utf8,
+        false,
+    )]));
+    let kinds = arrow_array::StringArray::from(vec!["TABLE", "VIEW"]);
+    RecordBatch::try_new(schema, vec![Arc::new(kinds)])
+        .map_err(|e| Status::internal(format!("Failed to build table types: {e}")))
+}
+
 /// The IPC bytes a statement's `FlightInfo` (or prepared-statement result)
 /// advertises for `schema`. A schema with no fields is what
 /// `QueryHandler::get_schema` returns for statements whose columns are only
@@ -322,15 +334,12 @@ fn client_schema(schema: &arrow_schema::Schema) -> arrow_schema::SchemaRef {
         .fields()
         .iter()
         .map(|f| {
-            if sqe_core::variant::is_variant_field(f) {
-                Arc::new(arrow_schema::Field::new(
-                    f.name(),
-                    arrow_schema::DataType::Utf8,
-                    true,
-                ))
+            let field = if sqe_core::variant::is_variant_field(f) {
+                arrow_schema::Field::new(f.name(), arrow_schema::DataType::Utf8, true)
             } else {
-                Arc::new(nullable_field(f))
-            }
+                nullable_field(f)
+            };
+            Arc::new(crate::flight_client_compat::with_column_metadata(field))
         })
         .collect();
     Arc::new(arrow_schema::Schema::new_with_metadata(
@@ -964,8 +973,46 @@ impl SqeFlightSqlService {
     }
 
     /// Parse the `[coordinator] flight_compression` config into IPC write options.
+    /// The catalogs a `GetDbSchemas` / `GetTables` request walks: the one its
+    /// filter names, else every `SHOW CATALOGS` name. A filter naming no
+    /// catalog SQL knows selects nothing.
+    async fn metadata_catalogs(
+        &self,
+        session: &sqe_core::Session,
+        filter: Option<&str>,
+    ) -> Result<Vec<String>, Status> {
+        let names = self
+            .query_handler
+            .list_catalog_names(session)
+            .await
+            .map_err(|e| sqe_error_to_status(&e, None))?;
+        Ok(match filter.filter(|f| !f.is_empty()) {
+            Some(f) => names.into_iter().filter(|n| n == f).collect(),
+            None => names,
+        })
+    }
+
+    /// `SetSessionOptions`: validate against `SHOW CATALOGS`, apply what
+    /// passed to the stored session, reply with the per-option errors.
+    async fn set_session_options(&self, request: &Request<Action>) -> Result<Vec<u8>, Status> {
+        let session = self.get_session_from_request(request).await?;
+        let known = self.metadata_catalogs(&session, None).await?;
+        let body = &request.get_ref().body;
+        let (change, result) = crate::flight_session_options::plan_set(body, &known)?;
+        if (change.catalog.is_some() || change.schema.is_some())
+            && !self
+                .session_manager
+                .set_session_scope(&session.id, change.catalog, change.schema)
+        {
+            return Err(Status::internal("SetSessionOptions: session not found"));
+        }
+        Ok(result.encode_to_vec())
+    }
+
+    /// A request's own codec choice (`flight_client_compat`) wins.
     fn flight_ipc_options(&self) -> Result<IpcWriteOptions, Status> {
-        let compression = self.config.coordinator.flight_compression;
+        let compression = crate::flight_client_compat::client_compression_override()
+            .unwrap_or(self.config.coordinator.flight_compression);
         ipc_options_for(compression)
     }
 
@@ -1883,14 +1930,10 @@ impl FlightSqlService for SqeFlightSqlService {
                 .map_err(|e| Status::resource_exhausted(e.to_string()))?;
         }
         info!("Flight SQL: do_get_catalogs called");
-        let catalog_name = if self.config.catalog.warehouse.is_empty() {
-            "default".to_string()
-        } else {
-            self.config.catalog.warehouse.clone()
-        };
-
         let mut builder = query.into_builder();
-        builder.append(&catalog_name);
+        for name in self.metadata_catalogs(&session, None).await? {
+            builder.append(name);
+        }
         let batch = builder
             .build()
             .map_err(|e| Status::internal(format!("Failed to build batch: {e}")))?;
@@ -1928,36 +1971,35 @@ impl FlightSqlService for SqeFlightSqlService {
                 .map_err(|e| Status::resource_exhausted(e.to_string()))?;
         }
 
-        let catalog_name = if self.config.catalog.warehouse.is_empty() {
-            "default".to_string()
-        } else {
-            self.config.catalog.warehouse.clone()
-        };
-
-        // Use query handler to list schemas via the session catalog
+        // Every catalog the filter selects, each listed as `SHOW SCHEMAS
+        // FROM` lists it. A catalog that cannot be listed adds no rows.
         let client_ip = Some(self.extract_client_ip(&request));
-        let batches = self
-            .query_handler
-            .execute(&session, "SHOW SCHEMAS", client_ip)
-            .await
-            .map_err(|e| sqe_error_to_status(&e, None))?;
-
-        // Build the Flight SQL GetDbSchemas response using the builder
+        let catalogs = self
+            .metadata_catalogs(&session, query.catalog.as_deref())
+            .await?;
         let mut builder = query.into_builder();
-        for batch in &batches {
-            let col = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow_array::StringArray>()
-                .ok_or_else(|| Status::internal("Expected string column for schema names"))?;
-            for i in 0..col.len() {
-                if !col.is_null(i) {
-                    builder.append(&catalog_name, col.value(i));
+        for catalog in &catalogs {
+            let sql = format!("SHOW SCHEMAS FROM \"{}\"", catalog.replace('"', "\"\""));
+            let ip = client_ip.clone();
+            let batches = match self.query_handler.execute(&session, &sql, ip).await {
+                Ok(batches) => batches,
+                Err(e) => {
+                    warn!(catalog = %catalog, error = %e, "GetDbSchemas: skipping catalog");
+                    continue;
+                }
+            };
+            for batch in &batches {
+                let col = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .ok_or_else(|| Status::internal("Expected string column for schema names"))?;
+                for name in col.iter().flatten() {
+                    builder.append(catalog, name);
                 }
             }
         }
 
-        let _schema = builder.schema();
         let batch = builder
             .build()
             .map_err(|e| Status::internal(format!("Failed to build batch: {e}")))?;
@@ -1995,12 +2037,6 @@ impl FlightSqlService for SqeFlightSqlService {
                 .map_err(|e| Status::resource_exhausted(e.to_string()))?;
         }
 
-        let catalog_name = if self.config.catalog.warehouse.is_empty() {
-            "default".to_string()
-        } else {
-            self.config.catalog.warehouse.clone()
-        };
-
         let schema_pattern = query.db_schema_filter_pattern.clone();
         let table_pattern = query.table_name_filter_pattern.clone();
         let include_schema = query.include_schema;
@@ -2016,48 +2052,39 @@ impl FlightSqlService for SqeFlightSqlService {
             )
         };
 
-        // Catalog filter: drop everything when the request asks for a
-        // different catalog than the one this coordinator hosts.
-        if let Some(ref c) = query.catalog {
-            if !c.is_empty() && !c.eq_ignore_ascii_case(&catalog_name) {
-                let builder = query.into_builder();
-                let batch = builder
-                    .build()
-                    .map_err(|e| Status::internal(format!("Failed to build batch: {e}")))?;
-                return self.batches_to_stream(vec![batch]);
-            }
-        }
+        let catalogs = self
+            .metadata_catalogs(&session, query.catalog.as_deref())
+            .await?;
 
-        // Table-type filter: short-circuit when the requested set excludes
-        // TABLE (the only kind `list_metadata_tables` returns today).
-        if let Some(ref types) = type_filter {
-            if !types.iter().any(|t| t == "TABLE") {
-                let builder = query.into_builder();
-                let batch = builder
-                    .build()
-                    .map_err(|e| Status::internal(format!("Failed to build batch: {e}")))?;
-                return self.batches_to_stream(vec![batch]);
-            }
-        }
-
-        // Walk the catalog directly. The previous path ran `SHOW SCHEMAS`
+        // Walk each catalog directly. The previous path ran `SHOW SCHEMAS`
         // followed by `SHOW TABLES IN "<ns>"` once per namespace through
         // the SQL planner -- N+1 planner invocations plus N Polaris round
         // trips per `DatabaseMetaData.getTables()`. It also concatenated
         // catalog-returned namespace names into SQL with only
         // backslash-quote escaping, so a federated catalog could pivot to
         // SQL execution as the browsing user. `list_metadata_tables`
-        // closes both holes (issues #7, #9, #15).
-        let pairs = self
-            .query_handler
-            .list_metadata_tables(&session)
-            .await
-            .map_err(|e| sqe_error_to_status(&e, None))?;
+        // closes both holes (issues #7, #9, #15). A catalog that cannot be
+        // listed (not authorized, a Hive root) adds no rows.
+        let mut rows = Vec::new();
+        for catalog in catalogs {
+            let listing = self
+                .query_handler
+                .list_metadata_tables(&session, Some(&catalog));
+            match listing.await {
+                Ok(tables) => rows.extend(tables.into_iter().map(|t| (catalog.clone(), t))),
+                Err(e) => warn!(catalog = %catalog, error = %e, "GetTables: skipping catalog"),
+            }
+        }
 
         let mut builder = query.into_builder();
         let empty_schema = arrow_schema::Schema::empty();
 
-        for (ns, table_name) in &pairs {
+        for (catalog_name, (ns, table_name, kind)) in &rows {
+            if let Some(ref types) = type_filter {
+                if !types.iter().any(|t| t == kind) {
+                    continue;
+                }
+            }
             if let Some(ref pat) = schema_pattern {
                 if !like_match(pat, ns) {
                     continue;
@@ -2079,11 +2106,15 @@ impl FlightSqlService for SqeFlightSqlService {
                 // Catalog-returned names are data, not SQL: quote every
                 // component so a namespace like `SELECT 1 --` cannot plan
                 // as a statement through `get_schema` (#712).
-                let sql = format!("SELECT * FROM {}", quote_qualified(ns, table_name));
+                let sql = format!(
+                    "SELECT * FROM \"{}\".{}",
+                    catalog_name.replace('"', "\"\""),
+                    quote_qualified(ns, table_name)
+                );
                 match self.query_handler.get_schema(&session, &sql).await {
                     Ok(schema) => {
                         builder
-                            .append(&catalog_name, ns, table_name, "TABLE", &schema)
+                            .append(catalog_name, ns, table_name, kind, &schema)
                             .map_err(|e| {
                                 Status::internal(format!("Failed to append table: {e}"))
                             })?;
@@ -2096,7 +2127,7 @@ impl FlightSqlService for SqeFlightSqlService {
             }
 
             builder
-                .append(&catalog_name, ns, table_name, "TABLE", &empty_schema)
+                .append(catalog_name, ns, table_name, kind, &empty_schema)
                 .map_err(|e| Status::internal(format!("Failed to append table: {e}")))?;
         }
 
@@ -2168,6 +2199,8 @@ impl FlightSqlService for SqeFlightSqlService {
         let ticket = Ticket::new(query.as_any().encode_to_vec());
         let endpoint = FlightEndpoint::new().with_ticket(ticket);
         let info = FlightInfo::new()
+            .try_with_schema(&table_types_batch()?.schema())
+            .map_err(|e| Status::internal(format!("Unable to encode schema: {e}")))?
             .with_endpoint(endpoint)
             .with_descriptor(flight_descriptor);
         Ok(Response::new(info))
@@ -2312,22 +2345,7 @@ impl FlightSqlService for SqeFlightSqlService {
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let _session = self.get_session_from_request(&request).await?;
-        // SQE backs every metadata row from `list_metadata_tables` as a
-        // physical Iceberg table; VIEW is not yet implemented. Returning
-        // both TABLE and VIEW caused JDBC tools to issue follow-up
-        // `getTables(types=["VIEW"])` calls that always came back empty
-        // and confused schema browsers.
-        let mut builder = arrow_array::builder::StringBuilder::new();
-        builder.append_value("TABLE");
-        let arr = builder.finish();
-        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-            "table_type",
-            arrow_schema::DataType::Utf8,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)])
-            .map_err(|e| Status::internal(format!("Failed to build table types: {e}")))?;
-        self.batches_to_stream(vec![batch])
+        self.batches_to_stream(vec![table_types_batch()?])
     }
 
     async fn do_get_sql_info(
@@ -2943,6 +2961,25 @@ impl FlightSqlService for SqeFlightSqlService {
         &self,
         request: Request<Action>,
     ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
+        use crate::flight_session_options as opts;
+        let reply = match request.get_ref().r#type.as_str() {
+            opts::SET_SESSION_OPTIONS => Some(self.set_session_options(&request).await?),
+            opts::GET_SESSION_OPTIONS => {
+                let s = self.get_session_from_request(&request).await?;
+                let (catalog, schema) = (s.default_catalog.as_deref(), s.default_schema.as_deref());
+                Some(opts::current(catalog, schema).encode_to_vec())
+            }
+            opts::CLOSE_SESSION => {
+                self.get_session_from_request(&request).await?;
+                Some(opts::close().encode_to_vec())
+            }
+            _ => None,
+        };
+        if let Some(body) = reply {
+            let result = arrow_flight::Result { body: body.into() };
+            return Ok(Response::new(Box::pin(stream::once(async { Ok(result) }))
+                as <Self as FlightService>::DoActionStream));
+        }
         let peer = request.remote_addr();
         let (metadata, _, action) = request.into_parts();
         match action.r#type.as_str() {
@@ -3467,25 +3504,44 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn table_types_batch_contains_only_table() {
-        // Replicate the exact logic from do_get_table_types so we can test it
-        // without gRPC overhead. SQE does not yet implement VIEW, so the
-        // table_type result set is `TABLE` only (issue #98).
-        let mut builder = StringBuilder::new();
-        builder.append_value("TABLE");
-        let arr = builder.finish();
-
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "table_type",
-            DataType::Utf8,
-            false,
-        )]));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(arr)]).expect("batch should be valid");
-
-        assert_eq!(batch.num_rows(), 1);
+    fn table_types_batch_lists_tables_and_views() {
+        let batch = super::table_types_batch().expect("table types");
         let col = batch.column(0).as_string::<i32>();
-        assert_eq!(col.value(0), "TABLE");
+        let kinds: Vec<&str> = col.iter().flatten().collect();
+        assert_eq!(kinds, ["TABLE", "VIEW"]);
+    }
+
+    /// The JDBC driver casts the default isolation to `Long` and reads the
+    /// grammar, GROUP BY, UNION, outer-join and subquery keys.
+    #[test]
+    fn sql_info_has_the_keys_jdbc_reads() {
+        let data = build_sql_info_data().expect("sql info");
+        let keys = [
+            SqlInfo::SqlIdentifierCase,
+            SqlInfo::SqlSupportedGrammar,
+            SqlInfo::SqlAnsi92SupportedLevel,
+            SqlInfo::SqlSupportedGroupBy,
+            SqlInfo::SqlSupportedUnions,
+            SqlInfo::SqlOuterJoinsSupportLevel,
+            SqlInfo::SqlSupportedSubqueries,
+        ];
+        let query = CommandGetSqlInfo {
+            info: keys.iter().map(|k| *k as u32).collect(),
+        };
+        let batch = query.into_builder(&data).build().expect("filtered batch");
+        assert_eq!(batch.num_rows(), keys.len());
+
+        let query = CommandGetSqlInfo {
+            info: vec![SqlInfo::SqlDefaultTransactionIsolation as u32],
+        };
+        let batch = query.into_builder(&data).build().expect("isolation");
+        let value = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::UnionArray>()
+            .expect("dense union");
+        // Union child 2 is `bigint_value` in the SqlInfo value union.
+        assert_eq!(value.type_id(0), 2, "the isolation level is an int64");
     }
 
     #[test]

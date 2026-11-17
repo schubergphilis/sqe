@@ -2902,6 +2902,8 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
         .layer(sqe_coordinator::flight_sql::FlightTraceLayer)
         // The committed snapshot id of an ingest as a trailer (#904).
         .layer(sqe_coordinator::flight_trailers::SnapshotTrailerLayer)
+        // A codec the client can decode: none for the Java Flight client.
+        .layer(sqe_coordinator::flight_client_compat::ClientCompressionLayer)
         .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(flight_service))
         .serve_with_shutdown(
             addr,
