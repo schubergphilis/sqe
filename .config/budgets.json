@@ -10,7 +10,7 @@
     "crates/sqe-coordinator/src/flight_sql.rs": 5000,
     "crates/sqe-coordinator/src/maintenance.rs": 5750,
     "crates/sqe-coordinator/src/maintenance_scheduler.rs": 4000,
-    "crates/sqe-coordinator/src/query_handler.rs": 10250,
+    "crates/sqe-coordinator/src/query_handler.rs": 10300,
     "crates/sqe-core/src/config/mod.rs": 10000,
     "crates/sqe-mcp/src/lib.rs": 5750,
     "crates/sqe-policy/src/grants/ranger.rs": 4250,
@@ -38,7 +38,7 @@
       ]
     },
     "sqe-catalog": {
-      "lines": 64100,
+      "lines": 64250,
       "deps": [
         "sqe-core",
         "sqe-geo",
@@ -69,7 +69,7 @@
       ]
     },
     "sqe-coordinator": {
-      "lines": 68700,
+      "lines": 68900,
       "deps": [
         "sqe-auth",
         "sqe-catalog",

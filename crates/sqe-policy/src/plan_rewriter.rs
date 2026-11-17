@@ -1123,21 +1123,31 @@ pub(crate) fn merge_tag_masks(
 /// True when `table_ref` names a reserved, virtual (non-Iceberg) relation that
 /// cannot carry Iceberg column tags and is never present in the table metadata
 /// cache: `information_schema.*` (DataFusion reserves this schema in every
-/// catalog), and anything under the reserved `system` / `datafusion` catalogs.
+/// catalog), SQE's virtual `system` schemas (`system.runtime.*`,
+/// `system.metadata.*`, `system.jdbc.*`), and anything under `datafusion`.
 ///
 /// These names cannot be used for a user Iceberg table (DataFusion reserves the
-/// schema; the coordinator reserves the catalog names), so skipping the tag
-/// lookup here introduces no governance bypass: a real Iceberg table can never
-/// match. The resource policy (`store.resolve`) still runs for these refs.
+/// schema; the `system` composite never serves a Polaris namespace of a
+/// reserved name; `datafusion` cannot be attached), so skipping the tag lookup
+/// here introduces no governance bypass: a real Iceberg table can never match.
+/// The resource policy (`store.resolve`) still runs for these refs.
+///
+/// Any other schema under `system` is a Polaris catalog `system` (#901) and is
+/// governed like every catalog. The match is the one the composite routes by
+/// (`sqe_core::system_catalog`), so the two cannot disagree.
 ///
 /// `pg_catalog` is intentionally NOT matched: SQE does not register it as a
 /// virtual provider, so a user namespace named `pg_catalog` must still be tag-
 /// governed.
 fn is_reserved_virtual_ref(table_ref: &datafusion::common::TableReference) -> bool {
-    // Reserved catalogs (cannot host a user Iceberg table).
     if let Some(cat) = table_ref.catalog() {
-        if cat.eq_ignore_ascii_case("system") || cat.eq_ignore_ascii_case("datafusion") {
+        if cat.eq_ignore_ascii_case(sqe_core::system_catalog::DATAFUSION_CATALOG) {
             return true;
+        }
+        if let Some(schema) = table_ref.schema() {
+            if sqe_core::system_catalog::is_virtual_system_ref(cat, schema) {
+                return true;
+            }
         }
     }
     // information_schema is reserved in every catalog. Match on the LAST schema
@@ -2475,6 +2485,21 @@ mod tests {
         assert!(is_reserved_virtual_ref(&sys));
         let df = datafusion::common::TableReference::full("datafusion", "info", "version");
         assert!(is_reserved_virtual_ref(&df));
+        for schema in ["metadata", "jdbc", "RUNTIME"] {
+            let r = datafusion::common::TableReference::full("system", schema, "t");
+            assert!(is_reserved_virtual_ref(&r), "system.{schema}.t");
+        }
+    }
+
+    #[test]
+    fn reserved_ref_does_not_match_polaris_system_schemas() {
+        // #901: a Polaris catalog named `system` serves every schema the
+        // virtual part does not reserve; those tables are tag-governed.
+        let r = datafusion::common::TableReference::full("system", "access", "audit");
+        assert!(!is_reserved_virtual_ref(&r));
+        // A quoted `"SYSTEM"` is a different catalog, never the virtual one.
+        let r = datafusion::common::TableReference::full("SYSTEM", "runtime", "queries");
+        assert!(!is_reserved_virtual_ref(&r));
     }
 
     #[test]

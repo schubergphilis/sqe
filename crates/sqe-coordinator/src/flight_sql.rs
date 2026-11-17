@@ -574,6 +574,24 @@ fn client_transaction_of(session: &sqe_core::Session) -> Option<String> {
         .flatten()
 }
 
+type HandshakeStream = Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send>>;
+
+/// The handshake reply: the session id as the payload and as a
+/// `Bearer <session id>` `authorization` header for the following calls.
+fn handshake_response(session_id: &str) -> Result<Response<HandshakeStream>, Status> {
+    let result = HandshakeResponse {
+        protocol_version: 0,
+        payload: session_id.as_bytes().to_vec().into(),
+    };
+    let output = futures::stream::iter(vec![Ok(result)]);
+    let token = MetadataValue::from_str(&format!("Bearer {session_id}"))
+        .map_err(|e| Status::internal(format!("Failed to create auth metadata: {e}")))?;
+    let mut response: Response<Pin<Box<dyn Stream<Item = _> + Send>>> =
+        Response::new(Box::pin(output));
+    response.metadata_mut().append("authorization", token);
+    Ok(response)
+}
+
 /// The IPC bytes a statement's `FlightInfo` (or prepared-statement result)
 /// advertises for `schema`. A schema with no fields is what
 /// `QueryHandler::get_schema` returns for statements whose columns are only
@@ -1806,10 +1824,12 @@ impl SqeFlightSqlService {
 impl FlightSqlService for SqeFlightSqlService {
     type FlightService = SqeFlightSqlService;
 
-    /// Handle client authentication via Basic auth.
+    /// Handle client authentication via Basic auth or a bearer token.
     ///
-    /// Extracts username:password from the Basic auth header, authenticates
-    /// via the configured OIDC provider, and returns the session ID as a bearer token.
+    /// Basic: extracts username:password, authenticates via the configured
+    /// OIDC provider. Bearer: an SQE session id or an IdP token, resolved
+    /// like any other call. Either way the reply carries the session ID as
+    /// a bearer token.
     #[tracing::instrument(skip_all, name = "flight_sql.handshake")]
     async fn do_handshake(
         &self,
@@ -1826,6 +1846,32 @@ impl FlightSqlService for SqeFlightSqlService {
             .to_str()
             .map_err(|e| Status::internal(format!("Authorization header not parsable: {e}")))?
             .to_string();
+
+        // A client configured with a token (the Arrow Flight SQL JDBC
+        // driver's `token` property) handshakes with `Bearer <token>`. The
+        // per-call path already takes an SQE session id or an IdP JWT; the
+        // handshake resolves the bearer the same way and hands back the
+        // session id.
+        if authorization.starts_with("Bearer ") {
+            let (metadata, extensions, _stream) = request.into_parts();
+            let probe = Request::from_parts(metadata, extensions, ());
+            let client_ip = self.extract_client_ip(&probe);
+            let session = self.get_session_from_request(&probe).await?;
+            info!(
+                username = %session.user.username,
+                session_id = %session_log_id(&session.id),
+                "Handshake authenticated via bearer token"
+            );
+            let actor = sqe_metrics::audit::Actor::from_parts(
+                session.user.username.clone(),
+                session.user.subject.clone(),
+                session.user.email.clone(),
+                session.user.roles.clone(),
+                session.user.groups.clone(),
+            );
+            self.emit_session_event(actor, Some(client_ip), Some(session.id.clone()));
+            return handshake_response(&session.id);
+        }
 
         if !authorization.starts_with(basic_prefix) {
             return Err(Status::invalid_argument(format!(
@@ -1988,23 +2034,7 @@ impl FlightSqlService for SqeFlightSqlService {
         );
         self.emit_session_event(handshake_actor, Some(client_ip), Some(session.id.clone()));
 
-        let result = HandshakeResponse {
-            protocol_version: 0,
-            payload: session.id.as_bytes().to_vec().into(),
-        };
-
-        let output = futures::stream::iter(vec![Ok(result)]);
-
-        let token = format!("Bearer {}", session.id);
-        let mut response: Response<Pin<Box<dyn Stream<Item = _> + Send>>> =
-            Response::new(Box::pin(output));
-        response.metadata_mut().append(
-            "authorization",
-            MetadataValue::from_str(&token)
-                .map_err(|e| Status::internal(format!("Failed to create auth metadata: {e}")))?,
-        );
-
-        Ok(response)
+        handshake_response(&session.id)
     }
 
     /// Handle SQL statement queries by creating a ticket for execution.
