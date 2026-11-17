@@ -11,8 +11,13 @@ set -euo pipefail
 #   scripts/parity-test.sh                 # up stack, load demo data, compare
 #   scripts/parity-test.sh --no-build      # skip the SQE image rebuild
 #   scripts/parity-test.sh --reload        # drop + reload the demo schema first
+#   scripts/parity-test.sh --protocol both # SQE over Trino HTTP and Flight SQL
+#   scripts/parity-test.sh --all           # also Iceberg scenarios + function coverage
 #
 # Requires: Docker, python3. The TPC-H scale is tiny (tpch.tiny ~= SF0.01).
+# --protocol flight|both needs `pip install -r tests/parity/requirements.txt`
+# (set PARITY_PYTHON to a venv's python). Reports land in $PARITY_OUT
+# (default target/parity).
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT_DIR"
@@ -22,12 +27,19 @@ SCHEMA="tpch_demo"
 TABLES=(nation region customer orders lineitem part supplier partsupp)
 BUILD_FLAG="--build"
 RELOAD=0
-for arg in "$@"; do
-  case "$arg" in
+ALL=0
+PROTOCOL=http
+PY="${PARITY_PYTHON:-python3}"
+OUT="${PARITY_OUT:-target/parity}"
+while [ $# -gt 0 ]; do
+  case "$1" in
     --no-build) BUILD_FLAG="" ;;
     --reload)   RELOAD=1 ;;
-    *) echo "unknown arg: $arg" >&2; exit 2 ;;
+    --all)      ALL=1 ;;
+    --protocol) PROTOCOL="${2:?--protocol needs http, flight or both}"; shift ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
+  shift
 done
 
 echo "=== SQE-vs-Trino parity: shared Polaris catalog ==="
@@ -61,4 +73,17 @@ fi
 
 # ── Compare ────────────────────────────────────────────────────────────
 echo ""
-python3 tests/parity/parity_compare.py --schema "$SCHEMA"
+mkdir -p "$OUT"
+if [ "$ALL" = "0" ]; then
+  "$PY" tests/parity/parity_compare.py --schema "$SCHEMA" --protocol "$PROTOCOL" \
+    --report "$OUT/queries.json"
+  exit $?
+fi
+# --all: run every suite, then fail if any failed.
+rc=0
+"$PY" tests/parity/parity_compare.py --schema "$SCHEMA" --protocol "$PROTOCOL" \
+  --report "$OUT/queries.json" || rc=1
+"$PY" tests/parity/iceberg_parity.py --protocol "$PROTOCOL" || rc=1
+"$PY" tests/parity/function_coverage.py --schema "$SCHEMA" --protocol "$PROTOCOL" \
+  --report "$OUT/functions.json" --markdown "$OUT/functions.md" || rc=1
+exit $rc
