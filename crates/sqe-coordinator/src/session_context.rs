@@ -646,7 +646,17 @@ pub async fn create_session_context(
             let system_catalog =
                 sqe_catalog::SystemCatalogProvider::new(system_catalog_entries)
                     .with_runtime(runtime_schema);
-            ctx.register_catalog("system", Arc::new(system_catalog));
+            // A config or discovered Polaris catalog named `system` registered
+            // above is wrapped, not replaced: SQE keeps its virtual schemas
+            // and every other schema reads the Polaris one (#901).
+            let polaris_system = ctx.catalog(sqe_core::system_catalog::SYSTEM_CATALOG);
+            ctx.register_catalog(
+                sqe_core::system_catalog::SYSTEM_CATALOG,
+                Arc::new(sqe_catalog::SystemCompositeProvider::new(
+                    Arc::new(system_catalog),
+                    polaris_system,
+                )),
+            );
 
             // Register any catalogs attached at runtime via ATTACH.
             // The providers snapshot was taken before the cache future was

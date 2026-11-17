@@ -398,6 +398,23 @@ impl CatalogOps {
         // session-relative CREATE SCHEMA must land there, not the default warehouse.
         let target_catalog = explicit_catalog.or_else(|| session.default_catalog.clone());
 
+        // A namespace of a reserved name in a Polaris catalog `system` would
+        // be shadowed by SQE's virtual schema: created, then never reachable
+        // (#901). Refuse it before Polaris sees it.
+        if let (Some(catalog), Some(first)) =
+            (target_catalog.as_deref(), namespace.as_ref().first())
+        {
+            if sqe_core::system_catalog::is_virtual_system_ref(catalog, first) {
+                return Err(SqeError::with_code(
+                    SqeErrorCode::InvalidArguments,
+                    format!(
+                        "schema name `{first}` is reserved in catalog `system` (reserved: {})",
+                        sqe_core::system_catalog::RESERVED_SYSTEM_SCHEMAS.join(", ")
+                    ),
+                ));
+            }
+        }
+
         info!(
             username = %session.user.username,
             namespace = ?namespace,

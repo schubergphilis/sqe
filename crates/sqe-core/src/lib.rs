@@ -11,6 +11,7 @@ pub mod session;
 pub mod snapshot_properties;
 pub mod sql_params;
 pub mod supervised_task;
+pub mod system_catalog;
 pub mod table_properties;
 pub mod ticket_signing;
 pub mod tls;
