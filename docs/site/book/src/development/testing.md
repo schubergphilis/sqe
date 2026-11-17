@@ -256,6 +256,50 @@ The `distributed` scenario replaces the retired standalone distributed test scri
 
 The AWS `run.sh` scripts do not yet support `--check`; the `scenario-test-aws` job invokes their default deploy, verify, and destroy flow directly. Adding a `--check` mode to the AWS scenarios is a follow-up.
 
+## Trino parity
+
+The integration tests check that SQE answers correctly. The parity harness checks that it answers the way Trino does. It runs the same SQL on SQE and on a real Trino 484, both pointed at one Polaris catalog, so both engines read the same Iceberg files. Any difference in the result is an engine difference, never a data difference.
+
+```bash
+scripts/parity-test.sh --all --protocol both   # queries + Iceberg scenarios + functions
+scripts/parity-test.sh --protocol flight       # queries only, SQE over Flight SQL
+scripts/parity-test.sh --no-build --reload     # reuse the image, reload the demo data
+```
+
+The script brings up RustFS, Polaris, SQE and Trino, loads TPC-H tiny into `iceberg.tpch_demo` through Trino's `tpch` connector, and runs three suites. Trino is always read over its own HTTP protocol. SQE is read over the Trino HTTP protocol, Flight SQL (through the ADBC driver), or both. Flight needs `pip install -r tests/parity/requirements.txt` in a virtualenv, with `PARITY_PYTHON` pointing at its `python`.
+
+| Suite | What it runs | Denominator |
+|---|---|---|
+| `parity_compare.py` | the read-only queries in `tests/parity/queries.json`: aggregates, joins, windows, arrays, maps, JSON, casts | 153 queries |
+| `iceberg_parity.py` | DDL and DML sequences on each engine's own table, then a diffed read; plus interop, where one engine writes and both read | 20 scenarios |
+| `function_coverage.py` | every scalar, aggregate and window signature in Trino's `SHOW FUNCTIONS`, called with sample arguments of its declared types | 296 functions |
+
+The comparison is strict. Two results MATCH only when the column types are the same, the values are the same after canonicalising both sides by Trino's type (decimals as decimals, doubles to 9 significant digits), and the row order is the same under a top-level `ORDER BY`. A result that differs only in type is `TYPE`; a different value or row count is `DIFF`. A statement both engines reject counts as parity, because error text is not part of the contract.
+
+The function list comes from Trino, not from us. Signatures whose types Iceberg cannot store (HyperLogLog, Geometry, IPADDRESS) are reported but not counted. A signature the generator cannot call on Trino counts as `UNTESTED`, against SQE, until the generator learns it. A function counts as covered only when every counted signature matches with real values; one that matched only on typed NULLs is reported apart.
+
+First strict baseline, 2026-11-17, against Trino 484:
+
+| Suite | Trino HTTP | Flight SQL |
+|---|---|---|
+| Queries | 137 of 153 | 129 of 153 |
+| Iceberg scenarios | 20 of 20 | 20 of 20 |
+| Functions | 121 of 296 | 115 of 296 |
+
+The same queries scored 153 of 153 under the old comparator, which rounded numbers to two places and ignored column types. The per-query and per-function tables are in [`docs/evidence/trino-parity/`](https://github.com/schubergphilis/sqe/tree/main/docs/evidence/trino-parity), and the work to close each gap is the OpenSpec change [`trino-sql-parity`](https://github.com/schubergphilis/sqe/tree/main/openspec/changes/trino-sql-parity). The suite passes when `scripts/parity-test.sh --all --protocol both` exits 0.
+
+### Driver probes
+
+SQL parity says nothing about the metadata calls a BI tool makes before it runs a query. Two probes under [`testing/drivers/`](https://github.com/schubergphilis/sqe/tree/main/testing/drivers) drive SQE through the real client drivers and print one line per check, so one run lists every gap:
+
+| Probe | Driver | Protocol | Last result (2026-11-17) |
+|---|---|---|---|
+| `jdbc/Matrix.java` | Trino JDBC 480 | Trino HTTPS | 65 of 74 |
+| `jdbc/Matrix.java` | Arrow Flight SQL JDBC 19.0.0 | Flight SQL | 71 of 72 |
+| `odbc/` | Arrow Flight SQL ODBC 26.0.1 | Flight SQL | 105 of 114 |
+
+The results are the same with a password and with a bearer token. Every remaining failure is a call the driver itself does not implement (`SQLFeatureNotSupportedException` in Trino JDBC, `IM001` in ODBC), except Flight SQL JDBC's `setSchema`, which the driver ignores.
+
 ## CI
 
 Every suite that needs a compose stack runs **locally**, not in CI. The jobs that
@@ -278,6 +322,8 @@ behind it.
 | Distributed scenario | `scripts/test.sh scenario distributed` |
 | Access control | `make test-access-control` |
 | Access control via Spark | `make test-access-control-spark` |
+| Trino parity | `scripts/parity-test.sh --all --protocol both` |
+| BI driver probes | see [`testing/drivers/README.md`](https://github.com/schubergphilis/sqe/tree/main/testing/drivers) |
 
 Run the ones your change touches before merging. `make test-integration` brings up
 its own Polaris and RustFS stack, preflights the fixed host ports, and names any

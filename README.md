@@ -62,7 +62,7 @@ sqe> SELECT snapshot_id, committed_at FROM s3tables.sales."orders$snapshots";
 
 Two longer comparison docs trace the lineage of these positions:
 
-- vs Trino: [`docs/site/compare/trino-compatibility.md`](docs/site/compare/trino-compatibility.md). SQL function and feature parity by category. ~96% coverage.
+- vs Trino: [`docs/site/compare/trino-compatibility.md`](docs/site/compare/trino-compatibility.md). SQL function and feature parity by category. Measured strictly against Trino 484 (same types, values and order): 137 of 153 parity queries, 20 of 20 Iceberg scenarios, 121 of 296 Trino functions (`scripts/parity-test.sh`).
 - vs DuckDB: [`docs/site/compare/duckdb-comparision.md`](docs/site/compare/duckdb-comparision.md). What SQE has that DuckDB does not, and vice versa, with the V8 to V12 work that closed the embedded-mode gap.
 
 ## Performance receipts (SF1, vs Trino 465)

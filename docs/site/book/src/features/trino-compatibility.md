@@ -2,6 +2,20 @@
 
 SQE includes a Trino-compatible HTTP endpoint that allows existing Trino clients (JDBC drivers, CLI tools, DBeaver) and Trino-speaking BI tools (Metabase, Superset) to connect without modification.
 
+## How close to Trino
+
+We measure compatibility against a running Trino 484 on the same Iceberg tables, with a strict comparison: same column types, same values, same order. The [parity harness](../development/testing.md#trino-parity) runs over both the Trino HTTP protocol and Flight SQL. The first strict baseline, from 2026-11-17:
+
+| Suite | Trino HTTP | Flight SQL |
+|---|---|---|
+| Parity queries | 137 of 153 | 129 of 153 |
+| Iceberg DDL, DML and interop scenarios | 20 of 20 | 20 of 20 |
+| Trino functions, all signatures matching | 121 of 296 | 115 of 296 |
+
+Most query gaps are types, not values. DataFusion types an integer literal as `bigint` where Trino says `integer`; `length`, `strpos` and `extract` return `integer` where Trino returns `bigint`; `mod`, `sign`, `ceil` and `floor` return `double` on an integer argument. The function gap is mostly functions SQE does not have yet, plus Trino's type syntax (`array(double)`, `time(3)`) in casts. Each gap has a task in the OpenSpec change [`trino-sql-parity`](https://github.com/schubergphilis/sqe/tree/main/openspec/changes/trino-sql-parity), and the goal is every suite at 100% on both protocols.
+
+The real client drivers are tested apart, by the [driver probes](../development/testing.md#driver-probes): Trino JDBC passes 65 of 74 metadata and type checks, and every failure is a call the driver does not implement.
+
 ## Enabling
 
 The Trino HTTP endpoint is enabled by default on port 8080. Set port to 0 to disable:

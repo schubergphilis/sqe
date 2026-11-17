@@ -7,6 +7,28 @@ SQE aims to be a drop-in replacement for Trino in Iceberg-only environments.
 This document maps every Trino SQL function and feature to its SQE equivalent,
 noting semantic differences and gaps.
 
+## Measured against Trino 484
+
+The matrix below is hand-kept: a ✅ means SQE has a function or feature of that
+name that does the same job. It does not mean SQE returns what Trino returns.
+Since 2026-11-17 a [parity harness](https://docs.getsqe.com/development/testing.html#trino-parity)
+measures that directly. It runs the same SQL on SQE and on Trino 484 over one
+Polaris catalog, and compares types, values and order strictly. Its function
+list is Trino's own `SHOW FUNCTIONS`, not this page.
+
+| Suite | Trino HTTP | Flight SQL |
+|---|---|---|
+| Parity queries | 137 of 153 | 129 of 153 |
+| Iceberg DDL, DML and interop scenarios | 20 of 20 | 20 of 20 |
+| Trino functions, every signature matching | 121 of 296 (41%) | 115 of 296 (39%) |
+
+Of the 175 functions not covered over HTTP, 92 do not resolve on SQE, 29 fail
+on a signature (often Trino type syntax such as `array(double)` in a cast), 31
+return a different value and 18 a different type; 5 the generator cannot call
+yet. Where this page and the harness disagree, the harness is right. The
+per-function table is in
+[`docs/evidence/trino-parity/`](https://github.com/schubergphilis/sqe/tree/main/docs/evidence/trino-parity).
+
 > **2026-05-04 update — three reds turn green.** The same MR that landed the
 > matrix refresh shipped the SQL-side wiring for two of the four "honest
 > technical debt" items called out in the previous sweep. The third (MoR
@@ -87,7 +109,10 @@ noting semantic differences and gaps.
 
 ### Overall Coverage
 
-**~96% Trino SQL compatibility** for Iceberg-only workloads. The remaining gaps are:
+**~96% of the matrix rows have an SQE equivalent** for Iceberg-only workloads.
+That counts names, not results: measured strictly against Trino 484, SQE
+matches 121 of 296 functions (see [Measured against Trino 484](#measured-against-trino-484)).
+The structural gaps in the matrix are:
 - **Trino-specific sketch types** (HyperLogLog, TDigest, SetDigest). Not used in typical Iceberg analytics.
 - **`approx_most_frequent(n, x, cap)`**: Trino's Count-Min Sketch UDAF, one of two ❌ remaining in the Aggregate category. The other is `merge(digest)` (HyperLogLog/TDigest sketch types — not planned). All four Map-producing UDAFs (`histogram`, `map_agg`, `multimap_agg`, `map_union`) shipped.
 - **CREATE MATERIALIZED VIEW**. Not in Iceberg spec; use CTAS + scheduled refresh.
