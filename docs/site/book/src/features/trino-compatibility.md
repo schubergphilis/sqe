@@ -136,7 +136,7 @@ BI tools that speak Trino connect through the same endpoint. Metabase uses the T
 - `SHOW CATALOGS` and the `system.jdbc.*` / `system.metadata.*` tables enumerate every reachable catalog and skip the ones the caller is not authorized to list, and `SHOW TABLES` / `SHOW SCHEMAS` honor the session catalog (`X-Trino-Catalog`).
 - `system.jdbc` serves every table the Trino JDBC driver reads: `catalogs`, `schemas`, `tables` (views included, as `VIEW`), `columns`, `types`, `table_types`, and the always-empty `procedures`, `procedure_columns`, `udts`, `super_types`, `super_tables`, `attributes` and `pseudo_columns`, so `DatabaseMetaData` calls such as `getTableTypes()` and `getProcedures()` answer instead of failing.
 - `DESCRIBE` and `SHOW COLUMNS` resolve double-quoted identifiers (`"catalog"."schema"."table"`), so field discovery works.
-- Types map to their Trino equivalents: `timestamp(6)` carries its precision in the type signature (so date bucketing over JDBC works), and computed unsigned-64 aggregates like `count(*)` map to `bigint` rather than `decimal`.
+- Types map to their Trino equivalents: `timestamp(6)` carries its precision in the type signature (so date bucketing over JDBC works), and computed unsigned-64 aggregates like `count(*)` map to `bigint` rather than `decimal`. Trino has no unsigned types, so an unsigned result (`row_number`, `rank`, `cardinality`) is `bigint` over both the Trino protocol and Flight SQL; a value above the `bigint` range fails the query instead of turning into NULL. `NaN`, `Infinity` and `-Infinity` travel as the strings Trino clients expect.
 
 ## Metadata statements
 

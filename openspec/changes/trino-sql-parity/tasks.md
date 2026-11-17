@@ -10,9 +10,9 @@
 
 ## 2. Result types at the protocol boundary
 
-- [ ] 2.1 Unsigned Arrow results become `Int64` on both protocols (`row_number`, `rank`, `dense_rank`, `ntile`, `cardinality`, `array_position`, `approx_distinct`)
-- [ ] 2.2 HTTP encoder sends NaN and infinities as Trino does
-- [ ] 2.3 HTTP type label of `cast(json AS varchar)` is `varchar`
+- [x] 2.1 Unsigned Arrow results become `Int64` on both protocols (`row_number`, `rank`, `dense_rank`, `ntile`, `cardinality`, `array_position`, `approx_distinct`)
+- [x] 2.2 HTTP encoder sends NaN and infinities as Trino does
+- [x] 2.3 HTTP type label of `cast(json AS varchar)` is `varchar`
 - [ ] 2.4 Timestamp precision follows Trino: a literal's precision is its fraction digits, `timestamp` without a precision is `timestamp(3)`, and Flight reports the same precision as HTTP (today HTTP always says 6, Flight 9 for nanosecond values)
 - [ ] 2.5 `TIMESTAMP '... UTC'` and `current_timestamp` keep their zone (today both come back as `timestamp(6)` without one)
 

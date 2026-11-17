@@ -49,7 +49,11 @@ Known differences from Trino:
 - **Anonymous rows**: `CAST(ROW(1, 'x') AS JSON)` gives `{"c0":1,"c1":"x"}`; Trino gives `{"":1,"":"x"}`. Name the fields with `CAST(ROW(..) AS ROW(a .., b ..))` to get the same output.
 - **JSON columns and JSON inside an array or map**: on a V3 table a `JSON` column is a variant, and a cast embeds it at any depth: `CAST(payload AS JSON)` returns `{"a":1}` and `CAST(ARRAY[payload] AS JSON)` returns `[{"a":1}]`, as in Trino. On a V2 table a `JSON` column is stored as an Iceberg string. SQE lists it in the `sqe.json-columns` table property, and a scan reads it back as JSON: `CAST(payload AS JSON)` returns `{"a":1}`, as in Trino, and the Trino protocol reports the column as `json`. The cast returns the text canonical (keys sorted, whitespace removed); a stored value that does not parse comes back as a JSON string. `CREATE TABLE`, CTAS of a JSON expression, `CREATE TABLE LIKE`, `ALTER TABLE ADD COLUMN`, `RENAME COLUMN` and `DROP COLUMN` keep the property current. A V2 table created before SQE wrote the property has none, so its `JSON` columns read as `VARCHAR`; `ALTER TABLE t ALTER COLUMN payload SET DATA TYPE JSON` lists one without rewriting data. `DESCRIBE`, `SHOW CREATE TABLE` and `information_schema.columns` still report the stored type, `varchar`. A `CASE` or `coalesce` keeps the JSON type when every result is JSON. It is lost through an array that is not an `ARRAY[...]` literal of JSON values, such as `ARRAY[payload]` or an array column.
 - **Timestamp precision**: fractional seconds print without trailing zeros; Trino pads to the declared precision. A zoned timestamp ends in an offset (`+00:00`), not a zone name (`UTC`).
-- **Types Trino refuses**: varbinary, time and interval values are written as their quoted text; Trino raises "Cannot cast ... to json". Likewise `CAST(json AS VARCHAR)` returns the JSON text, where Trino raises an error.
+- **Types Trino refuses**: varbinary, time and interval values are written as their quoted text; Trino raises "Cannot cast ... to json".
+
+## CAST(json AS VARCHAR)
+
+`CAST(<json> AS VARCHAR)` returns the value Trino returns. A JSON string comes back unquoted, a number or boolean as its text, and JSON `null` as SQL NULL. An array or object raises "Cannot cast ... to varchar", as in Trino; `TRY_CAST` returns NULL for it. A mask or other cast SQE builds itself keeps the JSON text.
 
 ## DataFusion JSON layer
 

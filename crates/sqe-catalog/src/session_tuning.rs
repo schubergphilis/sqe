@@ -61,7 +61,8 @@ pub fn engine_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> Sessio
 /// coercion, so coercion types every parent against Trino's decimal types,
 /// then [`FloatOverDecimalRule`], so a float that meets a decimal
 /// stays a float as in Trino, and [`DecimalRoundingRule`] after
-/// coercion.
+/// coercion. [`sqe_trino_functions::JsonCastRule`] runs first, while every
+/// cast in the plan is one the query wrote.
 fn engine_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     let mut rules = Analyzer::new().rules;
     let at = rules
@@ -70,6 +71,7 @@ fn engine_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
         .unwrap_or(rules.len());
     rules.insert(at, Arc::new(FloatOverDecimalRule));
     rules.insert(at, Arc::new(DecimalArithmeticRule));
+    rules.insert(at, Arc::new(sqe_trino_functions::JsonCastRule));
     rules.push(Arc::new(DecimalRoundingRule));
     rules
 }
@@ -564,5 +566,119 @@ mod null_ordering_default {
         let spark = "SELECT a FROM (SELECT a, ROW_NUMBER() OVER (ORDER BY a DESC NULLS LAST) \
                      AS rn FROM t) WHERE rn = 1";
         assert_eq!(column(spark).await, vec![Some(2)]);
+    }
+}
+
+/// `CAST(<json> AS VARCHAR)` is Trino's: a JSON string loses its quotes,
+/// JSON `null` is SQL NULL, an array fails and `TRY_CAST` of one is NULL,
+/// and the result is a plain string, not JSON text. A cast type coercion
+/// adds between string types keeps the marker.
+#[cfg(test)]
+mod json_cast_to_varchar {
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::{Array, AsArray};
+    use datafusion::arrow::datatypes::Field;
+    use datafusion::execution::runtime_env::RuntimeEnv;
+    use datafusion::prelude::SessionContext;
+    use sqe_core::json_columns::JSON_FIELD_MARKER;
+
+    fn is_json_text(field: &Field) -> bool {
+        field.metadata().get(JSON_FIELD_MARKER).map(String::as_str) == Some("true")
+    }
+
+    fn ctx() -> SessionContext {
+        let ctx = super::engine_context(
+            super::engine_session_config(),
+            Arc::new(RuntimeEnv::default()),
+        );
+        sqe_trino_functions::register_trino_functions(&ctx);
+        sqe_trino_functions::register_extended_trino_functions(&ctx);
+        ctx
+    }
+
+    /// The single value of `sql`, and whether its column is JSON text.
+    async fn value(sql: &str) -> (Option<String>, bool) {
+        let batches = ctx().sql(sql).await.unwrap().collect().await.unwrap();
+        let schema = batches[0].schema();
+        let col = datafusion::arrow::compute::cast(
+            batches[0].column(0),
+            &datafusion::arrow::datatypes::DataType::Utf8,
+        )
+        .unwrap();
+        let text = col.as_string::<i32>();
+        let v = (!text.is_null(0)).then(|| text.value(0).to_string());
+        (v, is_json_text(schema.field(0)))
+    }
+
+    #[tokio::test]
+    async fn json_cast_to_varchar_is_trino_text() {
+        let cases = [
+            (
+                r#"SELECT CAST(json_parse('"abc"') AS VARCHAR)"#,
+                Some("abc"),
+            ),
+            ("SELECT CAST(json_parse('12') AS VARCHAR)", Some("12")),
+            ("SELECT CAST(json_parse('true') AS VARCHAR)", Some("true")),
+            ("SELECT CAST(json_parse('null') AS VARCHAR)", None),
+            ("SELECT TRY_CAST(json_parse('[1]') AS VARCHAR)", None),
+            (
+                r#"SELECT CAST(j AS VARCHAR) FROM (SELECT json_parse('"x"') AS j) s"#,
+                Some("x"),
+            ),
+        ];
+        for (sql, expected) in cases {
+            let (v, json) = value(sql).await;
+            assert_eq!(v.as_deref(), expected, "{sql}");
+            assert!(!json, "{sql}: still labelled json");
+        }
+        let err = ctx()
+            .sql("SELECT CAST(json_parse('[1]') AS VARCHAR)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Cannot cast '[1]' to varchar"),
+            "{err}"
+        );
+    }
+
+    /// A cast with a named target field is engine-built (the partial mask of
+    /// a `Utf8View` column): it stays DataFusion's cast, so a stored JSON
+    /// object is cast as text instead of failing.
+    #[tokio::test]
+    async fn named_cast_of_stored_json_keeps_the_text() {
+        use datafusion::arrow::array::{RecordBatch, StringViewArray};
+        use datafusion::arrow::datatypes::{DataType, Schema};
+        use datafusion::datasource::MemTable;
+        use datafusion::logical_expr::{Cast, Expr};
+        use datafusion::prelude::col;
+        use std::collections::HashMap;
+
+        let marker = HashMap::from([(JSON_FIELD_MARKER.to_string(), "true".to_string())]);
+        let field = Field::new("j", DataType::Utf8View, true).with_metadata(marker);
+        let schema = Arc::new(Schema::new(vec![field]));
+        let values = StringViewArray::from(vec![r#"{"a":1}"#]);
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(values)]).unwrap();
+        let ctx = ctx();
+        let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        ctx.register_table("t", Arc::new(table)).unwrap();
+        let named = Arc::new(Field::new("j", DataType::Utf8, true));
+        let cast = Expr::Cast(Cast::new_from_field(Box::new(col("j")), named));
+        let df = ctx.table("t").await.unwrap().select(vec![cast]).unwrap();
+        let batches = df.collect().await.unwrap();
+        assert_eq!(
+            batches[0].column(0).as_string::<i32>().value(0),
+            r#"{"a":1}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn json_text_through_coercion_stays_json() {
+        let (v, json) = value(r#"SELECT coalesce(json_parse('{"a":1}'), NULL)"#).await;
+        assert_eq!(v.as_deref(), Some(r#"{"a":1}"#));
+        assert!(json, "coalesce of JSON keeps the marker");
     }
 }

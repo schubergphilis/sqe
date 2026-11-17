@@ -694,12 +694,20 @@ fn nullable_type(data_type: &arrow_schema::DataType) -> arrow_schema::DataType {
         // `Utf8` / `Binary`, so the wire carries the classic layout.
         DataType::Utf8View => DataType::Utf8,
         DataType::BinaryView => DataType::Binary,
+        // Trino has no unsigned integers: `row_number`, `rank`, `cardinality`
+        // and `approx_distinct` are `bigint` there, and the HTTP protocol
+        // already labels them so. The next wider signed type holds every
+        // value but a UInt64 above i64::MAX, which fails the cast.
+        DataType::UInt64 | DataType::UInt32 => DataType::Int64,
+        DataType::UInt16 => DataType::Int32,
+        DataType::UInt8 => DataType::Int16,
         other => other.clone(),
     }
 }
 
 /// Re-declare `batch` under `schema` (its [`client_schema`]). Columns whose
-/// nested nullability differs are cast; the values are unchanged.
+/// nested nullability, string layout or integer signedness differs are
+/// cast; the values are unchanged.
 fn conform_batch(
     batch: RecordBatch,
     schema: &arrow_schema::SchemaRef,
@@ -719,7 +727,13 @@ fn conform_batch(
             {
                 sqe_core::variant::to_json(column.as_ref())
             } else {
-                arrow::compute::cast(column, field.data_type())
+                // Not `safe`: a UInt64 above i64::MAX fails instead of
+                // arriving as NULL.
+                let options = arrow::compute::CastOptions {
+                    safe: false,
+                    ..Default::default()
+                };
+                arrow::compute::cast_with_options(column, field.data_type(), &options)
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -3713,6 +3727,54 @@ mod tests {
             batch.column(0).to_data().buffers()
         );
         assert_eq!(conformed.num_rows(), 1);
+    }
+
+    /// Unsigned integers (`row_number`, `cardinality`) go out as Trino's
+    /// signed types, nested ones too; a UInt64 above i64::MAX fails rather
+    /// than arriving as NULL.
+    #[test]
+    fn client_schema_sends_unsigned_as_signed() {
+        use arrow::array::{Int64Array, ListArray, UInt64Array, UInt8Array};
+        use arrow::datatypes::UInt32Type;
+        use arrow_schema::{DataType, Field, Schema};
+
+        let list = ListArray::from_iter_primitive::<UInt32Type, _, _>(vec![Some(vec![Some(7)])]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("rn", DataType::UInt64, false),
+            Field::new("b", DataType::UInt8, true),
+            Field::new("l", list.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(UInt64Array::from(vec![3])),
+                Arc::new(UInt8Array::from(vec![255])),
+                Arc::new(list),
+            ],
+        )
+        .unwrap();
+        let client = super::client_schema(&schema);
+        assert_eq!(client.field(0).data_type(), &DataType::Int64);
+        assert_eq!(client.field(1).data_type(), &DataType::Int16);
+        let DataType::List(item) = client.field(2).data_type() else {
+            panic!("list")
+        };
+        assert_eq!(item.data_type(), &DataType::Int64);
+        let conformed = super::conform_batch(batch, &client).unwrap();
+        let rn = conformed
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(rn.value(0), 3);
+
+        let huge = Arc::new(Schema::new(vec![Field::new("n", DataType::UInt64, true)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&huge),
+            vec![Arc::new(UInt64Array::from(vec![u64::MAX]))],
+        )
+        .unwrap();
+        assert!(super::conform_batch(batch, &super::client_schema(&huge)).is_err());
     }
 
     // -----------------------------------------------------------------------

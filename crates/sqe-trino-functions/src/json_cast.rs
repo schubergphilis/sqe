@@ -46,7 +46,7 @@ use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::expr_rewriter::NamePreserver;
 use datafusion::logical_expr::utils::merge_schema;
 use datafusion::logical_expr::{
-    ColumnarValue, Expr, ExprSchemable, LogicalPlan, ReturnFieldArgs, ScalarFunctionArgs,
+    Cast, ColumnarValue, Expr, ExprSchemable, LogicalPlan, ReturnFieldArgs, ScalarFunctionArgs,
     ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
 use datafusion::optimizer::AnalyzerRule;
@@ -279,7 +279,8 @@ pub struct JsonMarkerRule;
 
 impl AnalyzerRule for JsonMarkerRule {
     fn analyze(&self, plan: LogicalPlan, _: &ConfigOptions) -> DFResult<LogicalPlan> {
-        plan.transform_up_with_subqueries(mark_plan).data()
+        plan.transform_up_with_subqueries(|p| rewrite_plan(p, mark_expr))
+            .data()
     }
 
     fn name(&self) -> &str {
@@ -287,12 +288,38 @@ impl AnalyzerRule for JsonMarkerRule {
     }
 }
 
-fn mark_plan(plan: LogicalPlan) -> DFResult<Transformed<LogicalPlan>> {
+/// Plans Trino's `CAST(j AS VARCHAR)` of a JSON value as [`JsonToVarchar`].
+/// DataFusion plans a string-to-string cast as the identity and keeps the
+/// source field's metadata, so the result stayed JSON text: labelled `json`,
+/// quotes and all. Runs before type coercion, so every cast it sees is one
+/// the query wrote; after coercion a cast DataFusion adds between string
+/// types (a stored `Utf8View` JSON column meeting `Utf8`) looks the same and
+/// must keep the marker.
+#[derive(Debug, Default)]
+pub struct JsonCastRule;
+
+impl AnalyzerRule for JsonCastRule {
+    fn analyze(&self, plan: LogicalPlan, _: &ConfigOptions) -> DFResult<LogicalPlan> {
+        plan.transform_up_with_subqueries(|p| rewrite_plan(p, cast_expr))
+            .data()
+    }
+
+    fn name(&self) -> &str {
+        "sqe_json_cast"
+    }
+}
+
+/// Rewrites every expression of `plan` bottom-up with `rewrite`, against the
+/// merged schema of its inputs, keeping the output names.
+fn rewrite_plan(
+    plan: LogicalPlan,
+    rewrite: fn(Expr, &DFSchema) -> DFResult<Transformed<Expr>>,
+) -> DFResult<Transformed<LogicalPlan>> {
     let schema = merge_schema(&plan.inputs());
     let names = NamePreserver::new(&plan);
     let out = plan.map_expressions(|expr| {
         let name = names.save(&expr);
-        let marked = expr.transform_up(|e| mark_expr(e, &schema))?;
+        let marked = expr.transform_up(|e| rewrite(e, &schema))?;
         Ok(marked.update_data(|e| name.restore(e)))
     })?;
     if out.transformed {
@@ -342,6 +369,110 @@ fn mark_expr(expr: Expr, schema: &DFSchema) -> DFResult<Transformed<Expr>> {
     Ok(Transformed::yes(Expr::ScalarFunction(
         ScalarFunction::new_udf(Arc::clone(&UDF), vec![expr]),
     )))
+}
+
+/// Only a type-only cast, the kind the SQL planner builds for `CAST(x AS
+/// VARCHAR)`, is the query's. Engine code that casts a column it does not
+/// own (a policy mask) names the target field, and keeps DataFusion's cast.
+fn cast_expr(expr: Expr, schema: &DFSchema) -> DFResult<Transformed<Expr>> {
+    let (input, field, strict) = match &expr {
+        Expr::Cast(c) => (&c.expr, &c.field, true),
+        Expr::TryCast(c) => (&c.expr, &c.field, false),
+        _ => return Ok(Transformed::no(expr)),
+    };
+    if !field.name().is_empty() {
+        return Ok(Transformed::no(expr));
+    }
+    let target = field.data_type();
+    let to_string = matches!(
+        target,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    );
+    if !to_string || !input.to_field(schema).is_ok_and(|(_, f)| is_json_text(&f)) {
+        return Ok(Transformed::no(expr));
+    }
+    static STRICT: LazyLock<Arc<ScalarUDF>> =
+        LazyLock::new(|| Arc::new(ScalarUDF::from(JsonToVarchar { strict: true })));
+    static TRY: LazyLock<Arc<ScalarUDF>> =
+        LazyLock::new(|| Arc::new(ScalarUDF::from(JsonToVarchar { strict: false })));
+    let udf = if strict { &STRICT } else { &TRY };
+    let text = Expr::ScalarFunction(ScalarFunction::new_udf(
+        Arc::clone(udf),
+        vec![input.as_ref().clone()],
+    ));
+    Ok(Transformed::yes(match target {
+        DataType::Utf8 => text,
+        other => Expr::Cast(Cast::new(Box::new(text), other.clone())),
+    }))
+}
+
+/// `__sqe_json_to_varchar(j)`: Trino's `CAST(j AS VARCHAR)` of JSON text. A
+/// JSON string is its text without the quotes, a number or boolean its JSON
+/// text, JSON `null` is SQL NULL, and an array or object fails as in Trino
+/// (`Cannot cast '[1]' to varchar`); `__sqe_try_json_to_varchar` returns
+/// NULL there instead, for `TRY_CAST`. Text that does not parse (a stored
+/// V2 `JSON` column is never validated) is returned as it is. The result
+/// carries no JSON marker, so the column is `varchar`. [`JsonCastRule`]
+/// plans the casts as this function.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(crate) struct JsonToVarchar {
+    strict: bool,
+}
+
+impl ScalarUDFImpl for JsonToVarchar {
+    fn name(&self) -> &str {
+        if self.strict {
+            "__sqe_json_to_varchar"
+        } else {
+            "__sqe_try_json_to_varchar"
+        }
+    }
+
+    fn signature(&self) -> &Signature {
+        static SIG: LazyLock<Signature> = LazyLock::new(|| {
+            let strings = vec![DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View];
+            Signature::uniform(1, strings, Volatility::Immutable)
+        });
+        &SIG
+    }
+
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let input = &args.args[0];
+        let scalar = matches!(input, ColumnarValue::Scalar(_));
+        let array = input.to_array(if scalar { 1 } else { args.number_rows })?;
+        let array = arrow::compute::cast(&array, &DataType::Utf8)?;
+        let texts = array.as_string::<i32>();
+        let mut builder = StringBuilder::with_capacity(texts.len(), texts.value_data().len());
+        for row in 0..texts.len() {
+            if texts.is_null(row) {
+                builder.append_null();
+                continue;
+            }
+            let text = texts.value(row);
+            match serde_json::from_str::<serde_json::Value>(text) {
+                Ok(serde_json::Value::String(s)) => builder.append_value(s),
+                Ok(serde_json::Value::Null) => builder.append_null(),
+                Ok(serde_json::Value::Array(_) | serde_json::Value::Object(_)) => {
+                    if self.strict {
+                        return exec_err!("Cannot cast '{text}' to varchar");
+                    }
+                    builder.append_null();
+                }
+                Ok(_) => builder.append_value(text.trim()),
+                Err(_) => builder.append_value(text),
+            }
+        }
+        let out: ArrayRef = Arc::new(builder.finish());
+        if scalar {
+            Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(&out, 0)?))
+        } else {
+            Ok(ColumnarValue::Array(out))
+        }
+    }
 }
 
 /// `NULL`, or `NULL` cast by type coercion.

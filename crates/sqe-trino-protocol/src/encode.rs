@@ -86,6 +86,20 @@ fn display(array: &dyn arrow_array::Array, row: usize) -> String {
     arrow_cast::display::array_value_to_string(array, row).unwrap_or_default()
 }
 
+/// JSON has no NaN or infinity, so Trino sends `double` and `real` ones as
+/// the strings Java's `Double.toString` writes. JSON null would read as SQL
+/// NULL.
+fn non_finite_json(v: f64) -> serde_json::Value {
+    let text = if v.is_nan() {
+        "NaN"
+    } else if v > 0.0 {
+        "Infinity"
+    } else {
+        "-Infinity"
+    };
+    serde_json::Value::String(text.to_string())
+}
+
 /// Render one Arrow cell as the JSON value a Trino client expects in `data`.
 ///
 /// Numbers stay numbers (u64 included, Trino types them `bigint`), doubles
@@ -142,7 +156,12 @@ pub fn arrow_value_to_json(array: &dyn arrow_array::Array, row: usize) -> serde_
         }
         DataType::Float32 => {
             let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
-            serde_json::json!(arr.value(row))
+            let v = arr.value(row);
+            if v.is_finite() {
+                serde_json::json!(v)
+            } else {
+                non_finite_json(f64::from(v))
+            }
         }
         DataType::Float64 => {
             let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
@@ -153,7 +172,7 @@ pub fn arrow_value_to_json(array: &dyn arrow_array::Array, row: usize) -> serde_
             // serde_json uses decimal notation; we override for Trino compat.
             let abs_v = v.abs();
             if !v.is_finite() {
-                serde_json::json!(v)
+                non_finite_json(v)
             } else if v == 0.0 || (1e-3..1e7).contains(&abs_v) {
                 // Normal range: decimal notation (3.14, 1000.0)
                 serde_json::json!(v)
@@ -433,9 +452,11 @@ fn trino_type_name(dt: &DataType, spelling: Spelling) -> String {
     match dt {
         DataType::Null => "unknown".to_string(),
         DataType::Boolean => "boolean".to_string(),
-        DataType::Int8 | DataType::UInt8 => "tinyint".to_string(),
-        DataType::Int16 | DataType::UInt16 => "smallint".to_string(),
-        DataType::Int32 => "integer".to_string(),
+        // An unsigned type takes the next wider signed one, which holds all
+        // its values; Flight SQL sends the same (`client_schema`).
+        DataType::Int8 => "tinyint".to_string(),
+        DataType::Int16 | DataType::UInt8 => "smallint".to_string(),
+        DataType::Int32 | DataType::UInt16 => "integer".to_string(),
         // u64 nominally exceeds i64::MAX, but the only u64 columns SQE produces
         // are computed aggregates -- count(*), approx_distinct(), row_number()
         // OVER(...) -- whose values fit i64 in practice, and Trino itself types
@@ -794,5 +815,46 @@ mod tests {
             arrow_value_to_json(&list, 0),
             serde_json::json!([[1, "x"], [null, "y"]])
         );
+    }
+
+    /// NaN and infinities are the strings Trino sends, not JSON null, for
+    /// `double`, `real` and an array element; the decoder reads them back.
+    #[test]
+    fn non_finite_floats_are_trino_strings() {
+        use arrow_array::types::Float64Type;
+        use arrow_array::{Float32Array, Float64Array, ListArray};
+        let expected = serde_json::json!(["NaN", "Infinity", "-Infinity", 1.5]);
+        let doubles = Float64Array::from(vec![f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.5]);
+        let reals = Float32Array::from(vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1.5]);
+        for array in [&doubles as &dyn arrow_array::Array, &reals] {
+            let cells: Vec<_> = (0..4).map(|row| arrow_value_to_json(array, row)).collect();
+            assert_eq!(serde_json::Value::Array(cells), expected);
+        }
+        let list = ListArray::from_iter_primitive::<Float64Type, _, _>(vec![Some(vec![
+            Some(f64::NAN),
+            Some(f64::NEG_INFINITY),
+        ])]);
+        assert_eq!(
+            arrow_value_to_json(&list, 0),
+            serde_json::json!(["NaN", "-Infinity"])
+        );
+
+        let cols = [crate::types::TrinoColumn {
+            name: "d".to_string(),
+            r#type: "double".to_string(),
+            type_signature: crate::types::type_signature_for("double"),
+        }];
+        let rows: Vec<Vec<serde_json::Value>> = (0..4)
+            .map(|row| vec![arrow_value_to_json(&doubles, row)])
+            .collect();
+        let batch = crate::decode::rows_to_record_batch(&cols, &rows).unwrap();
+        let back = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(back.value(0).is_nan());
+        assert_eq!(back.value(1), f64::INFINITY);
+        assert_eq!(back.value(2), f64::NEG_INFINITY);
     }
 }

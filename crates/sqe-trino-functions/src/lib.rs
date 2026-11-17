@@ -29,6 +29,7 @@ pub mod scalar_fns;
 pub mod trino_functions;
 pub mod trino_functions_ext;
 
+pub use json_cast::JsonCastRule;
 pub use trino_functions::register_trino_functions;
 pub use trino_functions_ext::register_extended_trino_functions;
 

@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 use datafusion::common::tree_node::{Transformed, TreeNodeRecursion};
 use datafusion::logical_expr::utils::conjunction;
@@ -1454,11 +1454,14 @@ fn apply_mask(
                 DataType::Utf8 => mask_expr(col(column_name)),
                 // LargeUtf8 / Utf8View column (Iceberg scans read strings as
                 // Utf8View by default): the UDF only accepts Utf8, and the
-                // output must keep the column type. Cast in and back.
+                // output must keep the column type. Cast in and back. The
+                // named target field keeps the cast in, so a JSON column is
+                // masked as its text: `sqe_json_cast` plans only unnamed
+                // (query-written) casts as Trino's JSON-to-varchar.
                 DataType::LargeUtf8 | DataType::Utf8View => Expr::Cast(Cast::new(
-                    Box::new(mask_expr(Expr::Cast(Cast::new(
+                    Box::new(mask_expr(Expr::Cast(Cast::new_from_field(
                         Box::new(col(column_name)),
-                        DataType::Utf8,
+                        Arc::new(Field::new(column_name, DataType::Utf8, true)),
                     )))),
                     data_type.clone(),
                 )),
