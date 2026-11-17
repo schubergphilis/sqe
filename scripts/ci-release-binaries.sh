@@ -38,6 +38,7 @@ ZIGBUILD_SHA256="f09b180a517af0e4dd4bffc921bb88e5ab705452a9dd948c61e489b3020c68c
 
 TOOLS="${SQE_ZIG_TOOLS_DIR:-$REPO_ROOT/.zig-tools}"
 if [[ "$(uname -m)" != x86_64 ]]; then
+    # nosemgrep: opt.aikido.semgrep-rules.ai.ai-best-practices.hooks-dns-exfiltration.hooks-dns-exfiltration-generic -- prints the host architecture to stderr, no network
     echo "error: the pinned zig and cargo-zigbuild are x86_64 Linux builds; this host is $(uname -m)" >&2
     exit 1
 fi
