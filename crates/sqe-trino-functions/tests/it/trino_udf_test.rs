@@ -694,16 +694,10 @@ async fn test_arbitrary_group_by() {
 
 #[tokio::test]
 async fn test_width_bucket_builtin() {
-    // width_bucket is available in Trino but NOT in DataFusion 52.
-    // This test documents that the function is absent — any query using it
-    // will fail with an "Invalid function" error. When DataFusion adds it,
-    // this test should be updated to verify correctness.
-    let ctx = ctx().await;
-    let result = ctx.sql("SELECT width_bucket(5.0, 0.0, 10.0, 5)").await;
-    // Expect parse/plan error since width_bucket is not registered
-    assert!(
-        result.is_err(),
-        "Expected width_bucket to be unavailable in DataFusion 52, but query succeeded"
+    // DataFusion has no width_bucket; SQE registers Trino's (`math_fns`).
+    assert_eq!(
+        eval_i64("SELECT width_bucket(5.0, 0.0, 10.0, 5)").await,
+        Some(3)
     );
 }
 

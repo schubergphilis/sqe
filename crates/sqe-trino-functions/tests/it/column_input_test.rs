@@ -694,6 +694,8 @@ enum ArgSpec {
     LitStr(&'static str),
     /// A constant integer.
     LitInt(i64),
+    /// A constant double.
+    LitFloat(f64),
 }
 
 #[derive(Clone, Copy)]
@@ -722,6 +724,12 @@ enum Kind {
     Bin8,
     Real,
     B32,
+    /// `array(double)`, sorted ascending, no zero vector.
+    ListF64,
+    /// Valid latitudes and longitudes.
+    Degrees,
+    /// Probabilities strictly between 0 and 1.
+    Unit,
 }
 
 fn make_array(kind: Kind) -> ArrayRef {
@@ -780,6 +788,17 @@ fn make_array(kind: Kind) -> ArrayRef {
         ])),
         Kind::Real => Arc::new(Float32Array::from(vec![1.5f32, -2.0, 0.25])),
         Kind::B32 => Arc::new(StringArray::from(vec!["NBSWY3DP", "O5XXE3DE", "PA======"])),
+        Kind::ListF64 => Arc::new(ListArray::from_iter_primitive::<
+            datafusion::arrow::datatypes::Float64Type,
+            _,
+            _,
+        >(vec![
+            Some(vec![Some(1.0), Some(2.0), Some(3.0)]),
+            Some(vec![Some(4.0), Some(5.0), Some(6.5)]),
+            Some(vec![Some(0.5), Some(0.25), Some(8.0)]),
+        ])),
+        Kind::Degrees => Arc::new(Float64Array::from(vec![10.0, 45.5, -20.25])),
+        Kind::Unit => Arc::new(Float64Array::from(vec![0.1, 0.5, 0.9])),
     }
 }
 
@@ -854,9 +873,10 @@ fn arg_specs(name: &str) -> Option<Vec<ArgSpec>> {
         "from_ieee754_64" | "from_big_endian_64" => vec![Col(Bin8)],
         "cosine_similarity" => vec![Col(ListDbl), Col(ListDbl)],
         "json_extract" | "json_extract_scalar" => vec![Col(Json), LitStr("$.a")],
-        "mod" => vec![Col(Int), Col(Int32)],
+        // Integer `mod` by zero is an error, so the divisor has no zero.
+        "mod" => vec![Col(Int), Col(Int)],
         "truncate" => vec![Col(Float)],
-        "sign" => vec![Col(Int)],
+        "sign" | "ceiling" | "is_nan" | "is_finite" | "is_infinite" => vec![Col(Float)],
         "codepoint" => vec![Col(Char)],
         // The bitwise signature is uniform Int64; the SQL planner coerces
         // narrower integers before the UDF sees them.
@@ -864,7 +884,20 @@ fn arg_specs(name: &str) -> Option<Vec<ArgSpec>> {
         | "bitwise_or"
         | "bitwise_xor"
         | "bitwise_left_shift"
-        | "bitwise_right_shift" => vec![Col(Int), Col(Int)],
+        | "bitwise_right_shift"
+        | "bitwise_right_shift_arithmetic" => vec![Col(Int), Col(Int)],
+        "bit_count" => vec![Col(Int), LitInt(64)],
+        "width_bucket" => vec![Col(Float), LitFloat(0.0), LitFloat(4000.0), LitInt(10)],
+        "great_circle_distance" => vec![Col(Degrees), LitFloat(2.0), Col(Degrees), LitFloat(3.0)],
+        "wilson_interval_lower" | "wilson_interval_upper" => {
+            vec![Col(Int), LitInt(1000), LitFloat(1.96)]
+        }
+        "normal_cdf" => vec![LitFloat(0.0), LitFloat(1.0), Col(Float)],
+        "inverse_normal_cdf" => vec![LitFloat(0.0), LitFloat(1.0), Col(Unit)],
+        "beta_cdf" => vec![LitFloat(2.0), LitFloat(3.0), Col(Unit)],
+        "inverse_beta_cdf" => vec![LitFloat(2.0), LitFloat(3.0), Col(Unit)],
+        "t_cdf" | "t_pdf" => vec![LitFloat(5.0), Col(Float)],
+        "euclidean_distance" => vec![Col(ListF64), Col(ListF64)],
         "bitwise_not" => vec![Col(Int)],
         "slice" => vec![Col(ListInt), LitInt(1), LitInt(2)],
         "element_at" => vec![Col(ListInt), LitInt(1)],
@@ -895,6 +928,7 @@ fn scalar_arg(spec: ArgSpec) -> ColumnarValue {
         ArgSpec::Col(kind) => ColumnarValue::Array(make_array(kind)),
         ArgSpec::LitStr(s) => ColumnarValue::Scalar(ScalarValue::Utf8(Some(s.to_string()))),
         ArgSpec::LitInt(i) => ColumnarValue::Scalar(ScalarValue::Int64(Some(i))),
+        ArgSpec::LitFloat(f) => ColumnarValue::Scalar(ScalarValue::Float64(Some(f))),
     }
 }
 

@@ -188,7 +188,17 @@ pub fn apply_trino_compat(statements: &mut Vec<Statement>, source: &str) -> bool
     // `json '...'` / `uuid '...'` -> rewrite_utf8_typed_string: Trino typed-string
     // literals DataFusion rejects; rewritten to a plain string / json_parse
     // call (SQE stores both JSON and UUID as Utf8). See #326 for UUID.
-    let has_utf8_literal = lower.contains("json '") || lower.contains("uuid '");
+    // `decimal '...'` (also numeric / dec, with or without a precision) ->
+    // rewrite_decimal_typed_string: typed from the literal's digits.
+    let has_utf8_literal = lower.contains("json '")
+        || lower.contains("uuid '")
+        || ["decimal '", "numeric '", "dec '"]
+            .iter()
+            .any(|t| lower.contains(t))
+        || (["decimal(", "numeric(", "dec("]
+            .iter()
+            .any(|t| lower.contains(t))
+            && lower.contains(") '"));
     // `row(` -> the `CAST(ROW(...) AS ROW(...))` named-row cast, which becomes
     // `named_struct(...)`. A bare ROW(...) is DataFusion's own row(). A false
     // positive (e.g. a column literally named `arrow`) is harmless: it only
@@ -792,11 +802,69 @@ fn rewrite_utf8_typed_string(expr: &mut Expr) -> bool {
         match ts.data_type {
             SqlDataType::Uuid => *expr = Expr::Value(ts.value.clone()),
             SqlDataType::JSON => *expr = call("json_parse", Expr::Value(ts.value.clone())),
+            SqlDataType::Decimal(info) | SqlDataType::Numeric(info) | SqlDataType::Dec(info) => {
+                return rewrite_decimal_typed_string(expr, info)
+            }
             _ => return false,
         }
         return true;
     }
     false
+}
+
+/// `DECIMAL '12.34'` is `decimal(4,2)` in Trino: precision and scale come
+/// from the literal's digits. DataFusion plans the typed string as
+/// `decimal(38,10)`, which changes the type of every `abs`, `round`, `sum`
+/// over it. The literal becomes `CAST('<text>' AS DECIMAL(p, s))`. With an
+/// explicit precision (`DECIMAL(10,2) '1.5'`) the cast takes that type.
+/// Text that is not plain digits (an exponent, a stray character) or does
+/// not fit 38 digits is left for DataFusion.
+fn rewrite_decimal_typed_string(expr: &mut Expr, info: sqlparser::ast::ExactNumberInfo) -> bool {
+    use sqlparser::ast::ExactNumberInfo;
+    let Expr::TypedString(ts) = expr else {
+        return false;
+    };
+    let Value::SingleQuotedString(text) = &ts.value.value else {
+        return false;
+    };
+    let data_type = if matches!(info, ExactNumberInfo::None) {
+        let Some((precision, scale)) = decimal_literal_shape(text) else {
+            return false;
+        };
+        SqlDataType::Decimal(ExactNumberInfo::PrecisionAndScale(precision, scale))
+    } else {
+        ts.data_type.clone()
+    };
+    *expr = Expr::Cast {
+        kind: sqlparser::ast::CastKind::Cast,
+        expr: Box::new(Expr::Value(Value::SingleQuotedString(text.clone()).into())),
+        data_type,
+        array: false,
+        format: None,
+    };
+    true
+}
+
+/// Trino's `(precision, scale)` for a decimal literal's text: the digits
+/// after the point are the scale, the precision counts the digits without
+/// leading zeros and is at least the scale and 1.
+fn decimal_literal_shape(text: &str) -> Option<(u64, i64)> {
+    let digits = text.trim().trim_start_matches(['+', '-']);
+    let (int_part, frac_part) = digits.split_once('.').unwrap_or((digits, ""));
+    let plain = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    if digits.contains('.') && frac_part.is_empty()
+        || int_part.is_empty() && frac_part.is_empty()
+        || !plain(int_part)
+        || !plain(frac_part)
+        || text.trim().len() - digits.len() > 1
+    {
+        return None;
+    }
+    let scale = frac_part.len() as u64;
+    let precision = (int_part.trim_start_matches('0').len() as u64 + scale)
+        .max(scale)
+        .max(1);
+    (precision <= 38).then_some((precision, scale as i64))
 }
 
 /// Rewrite a SQL:2011 Unicode string literal (`U&'\2013'`) to the plain
@@ -2522,6 +2590,25 @@ mod tests {
         // A cast of the literal is then the identity.
         let out = rewrite_trino_compat(r#"SELECT CAST(JSON '[1]' AS JSON)"#);
         assert_eq!(out, "SELECT json_parse('[1]')");
+    }
+
+    #[test]
+    fn decimal_typed_literal_takes_precision_and_scale_from_its_digits() {
+        let out = rewrite_trino_compat(
+            "SELECT DECIMAL '12.34', DECIMAL '-5', DECIMAL '0.001', DECIMAL '007.50', DECIMAL '0'",
+        );
+        assert_eq!(
+            out,
+            "SELECT CAST('12.34' AS DECIMAL(4,2)), CAST('-5' AS DECIMAL(1,0)), \
+             CAST('0.001' AS DECIMAL(3,3)), CAST('007.50' AS DECIMAL(3,2)), \
+             CAST('0' AS DECIMAL(1,0))"
+        );
+        // An explicit precision wins.
+        let out = rewrite_trino_compat("SELECT DECIMAL(10,2) '1.5'");
+        assert_eq!(out, "SELECT CAST('1.5' AS DECIMAL(10,2))");
+        // An exponent or unparseable text is left for DataFusion.
+        let out = rewrite_trino_compat("SELECT DECIMAL '1e3', DECIMAL 'abc'");
+        assert_eq!(out, "SELECT DECIMAL '1e3', DECIMAL 'abc'");
     }
 
     #[test]

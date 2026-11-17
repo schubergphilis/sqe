@@ -1,7 +1,7 @@
 //! Trino-compatible scalar functions that DataFusion does not provide.
 //!
 //! - Bitwise scalar functions (#346): `bitwise_and`, `bitwise_or`,
-//!   `bitwise_xor`, `bitwise_not`, `bitwise_left_shift`, `bitwise_right_shift`.
+//!   `bitwise_xor`, `bitwise_not` (the shifts are in `math_fns`).
 //!   DataFusion only ships the `_agg` aggregate variants; Trino's scalar forms
 //!   are what BI/analytics SQL uses.
 //! - `sequence` (#349): Trino's name for DataFusion's inclusive `generate_series`.
@@ -28,8 +28,6 @@ pub fn register_scalar_fns(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(BitwiseOr));
     ctx.register_udf(ScalarUDF::from(BitwiseXor));
     ctx.register_udf(ScalarUDF::from(BitwiseNot));
-    ctx.register_udf(ScalarUDF::from(BitwiseLeftShift));
-    ctx.register_udf(ScalarUDF::from(BitwiseRightShift));
     ctx.register_udf(ScalarUDF::from(Slice));
 
     // `sequence` is Trino's spelling of DataFusion's inclusive `generate_series`.
@@ -210,32 +208,8 @@ impl ScalarUDFImpl for SizeCapped {
 // ─── bitwise scalar functions (#346) ─────────────────────────────────────────
 //
 // Trino's `bitwise_and/or/xor/not` are defined on `bigint` and return `bigint`,
-// so integer arguments are widened to Int64. The shifts are *logical* (zero
-// fill) and, in Trino, preserve the operand's integer width (`integer` -> 32-bit,
-// `bigint` -> 64-bit). SQE follows DataFusion, which types every integer literal
-// as Int64, so the shifts operate on 64 bits. This matches Trino for `bigint`
-// operands; Trino's narrower-than-bigint behaviour is not reachable here because
-// the literal never carries a 32-bit type into the function.
-
-/// Logical (zero-fill) left shift; `shift` outside `0..64` yields 0, matching
-/// Trino (`bitwise_left_shift(1, 64) = 0`).
-fn logical_shl(value: i64, shift: i64) -> i64 {
-    if (0..64).contains(&shift) {
-        ((value as u64) << (shift as u32)) as i64
-    } else {
-        0
-    }
-}
-
-/// Logical (zero-fill) right shift; `shift` outside `0..64` yields 0, matching
-/// Trino (`bitwise_right_shift(255, 68) = 0`).
-fn logical_shr(value: i64, shift: i64) -> i64 {
-    if (0..64).contains(&shift) {
-        ((value as u64) >> (shift as u32)) as i64
-    } else {
-        0
-    }
-}
+// so integer arguments are widened to Int64. The shifts live in `math_fns`:
+// they keep the first argument's width.
 
 fn eval_binary_i64(args: ScalarFunctionArgs, f: fn(i64, i64) -> i64) -> DFResult<ColumnarValue> {
     let rows = args.number_rows;
@@ -302,8 +276,6 @@ macro_rules! bitwise_binary {
 bitwise_binary!(BitwiseAnd, "bitwise_and", |a, b| a & b);
 bitwise_binary!(BitwiseOr, "bitwise_or", |a, b| a | b);
 bitwise_binary!(BitwiseXor, "bitwise_xor", |a, b| a ^ b);
-bitwise_binary!(BitwiseLeftShift, "bitwise_left_shift", logical_shl);
-bitwise_binary!(BitwiseRightShift, "bitwise_right_shift", logical_shr);
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct BitwiseNot;
@@ -470,32 +442,7 @@ mod tests {
         assert_eq!(scalar_i64("SELECT bitwise_not(5)").await, Some(-6));
     }
 
-    #[tokio::test]
-    async fn bitwise_shifts_are_logical_64bit() {
-        assert_eq!(scalar_i64("SELECT bitwise_left_shift(1, 3)").await, Some(8));
-        assert_eq!(
-            scalar_i64("SELECT bitwise_right_shift(16, 2)").await,
-            Some(4)
-        );
-        // bigint operand: logical (zero-fill) right shift, not arithmetic.
-        assert_eq!(
-            scalar_i64("SELECT bitwise_right_shift(CAST(-8 AS bigint), 1)").await,
-            Some(9223372036854775804)
-        );
-        assert_eq!(
-            scalar_i64("SELECT bitwise_left_shift(CAST(-1 AS bigint), 1)").await,
-            Some(-2)
-        );
-        // shift >= width -> 0, matching Trino.
-        assert_eq!(
-            scalar_i64("SELECT bitwise_right_shift(255, 68)").await,
-            Some(0)
-        );
-        assert_eq!(
-            scalar_i64("SELECT bitwise_left_shift(1, 64)").await,
-            Some(0)
-        );
-    }
+    // The shift tests moved to `math_fns`, which owns the shifts.
 
     #[tokio::test]
     async fn bitwise_null_propagates() {
