@@ -22,6 +22,7 @@ pub(crate) mod explain;
 pub(crate) mod flight_ingest;
 pub mod flight_sql;
 pub(crate) mod flight_sql_helpers;
+pub(crate) mod flight_sql_metadata;
 pub mod flight_trailers;
 pub mod hive_ddl_handler;
 pub mod hive_scan_tasks;
