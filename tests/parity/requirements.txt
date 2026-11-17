@@ -1,0 +1,4 @@
+# Flight SQL mode of the parity harnesses (--protocol flight|both).
+# The HTTP mode needs only the Python standard library.
+adbc-driver-flightsql>=1.13
+pyarrow>=20

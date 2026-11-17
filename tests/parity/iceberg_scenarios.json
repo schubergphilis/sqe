@@ -55,9 +55,9 @@
    "verify": "SELECT id, a FROM {t} ORDER BY id"},
 
   {"name": "alter_set_properties", "kind": "parity",
-   "setup": ["CREATE TABLE {t} (id int)",
+   "setup": ["CREATE TABLE {t} (id int) WITH (format_version = 2)",
              "INSERT INTO {t} VALUES (1),(2),(3)",
-             "ALTER TABLE {t} SET PROPERTIES format_version = 2"],
+             "ALTER TABLE {t} SET PROPERTIES format_version = 3"],
    "verify": "SELECT count(*) FROM {t}"},
 
   {"name": "meta_snapshots_readable", "kind": "parity",

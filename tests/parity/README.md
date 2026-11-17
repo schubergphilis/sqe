@@ -15,23 +15,60 @@ data is identical, any result difference is an engine behavior difference.
 ## Run
 
 ```bash
-scripts/parity-test.sh                 # up stack, load demo data, compare
-scripts/parity-test.sh --no-build      # skip SQE image rebuild
-scripts/parity-test.sh --reload        # drop + reload the demo schema
+scripts/parity-test.sh                   # up stack, load demo data, compare
+scripts/parity-test.sh --no-build        # skip SQE image rebuild
+scripts/parity-test.sh --reload          # drop + reload the demo schema
+scripts/parity-test.sh --protocol both   # SQE over Trino HTTP and Flight SQL
+scripts/parity-test.sh --all --protocol both   # + Iceberg scenarios + function coverage
 ```
 
 The script brings up `rustfs + polaris + sqe + trino` (from
 `docker-compose.test.yml` + `docker-compose.compare.yml`), bootstraps the
 warehouse, loads TPC-H tiny once via Trino's built-in `tpch` connector
 (`CREATE TABLE ... AS SELECT * FROM tpch.tiny.*`), then runs the comparator.
-Exit code is non-zero if any query diverges, so it works as a CI gate.
+Exit code is non-zero if any query diverges. Reports go to `$PARITY_OUT`
+(default `target/parity`).
+
+Flight SQL needs the ADBC driver: `pip install -r tests/parity/requirements.txt`
+in a venv and point `PARITY_PYTHON` at its python.
+
+## Verdicts
+
+The Trino baseline is always read over its HTTP protocol; SQE is read over
+each protocol asked for (`--protocol http|flight|both`). Every SQE result is
+compared with the baseline (`parity_client.compare`):
+
+| Verdict | Meaning |
+|---|---|
+| `MATCH` | same column types, same values, same order under a top-level `ORDER BY` |
+| `TYPE` | same values, different column type (`length()` integer vs bigint) |
+| `ORDER` | same rows, different order where the query fixes one |
+| `DIFF` | different values or row count |
+| `SQE-ERR` / `TRINO-ERR` | one side failed |
+| `BOTH-ERR` | both rejected the statement; counts as parity |
+| `MISSING` | (function coverage) the function name does not resolve on SQE |
+
+Values are compared after canonicalising both sides by Trino's column type:
+decimals as decimals, floating point to 9 significant digits, timestamps
+without trailing fraction zeros. Flight results are Arrow; `parity_client`
+maps the Arrow type to the Trino type name and encodes the values the way
+Trino's JSON does, so an unsigned Arrow type shows up as `arrow:uint64`.
+`parity_compare.py` also prints the older lenient count (rounded to 2 places,
+types ignored) so a run stays comparable with earlier reports.
 
 ## Files
 
-- `parity_compare.py` -- runs each query in `queries.json` against both engines
-  over the Trino HTTP wire protocol, follows pagination, normalizes numerics
-  (rounding) and row order, and reports `MATCH` / `DIFF` / one-sided `ERROR` /
-  `BOTH-ERR`. `BOTH-ERR` counts as parity (identical rejection).
+- `parity_client.py` -- the shared clients (Trino HTTP, Flight SQL over ADBC),
+  the Arrow-to-Trino type map and `compare`.
+- `parity_compare.py` -- runs each query in `queries.json` against both engines.
+- `function_coverage.py` -- every scalar, aggregate and window signature that
+  Trino's `SHOW FUNCTIONS` lists, called with sample arguments of its declared
+  types (typed NULLs when Trino rejects the samples). Signatures whose types
+  Iceberg cannot carry (HyperLogLog, Geometry, IPADDRESS, ...) or that take a
+  lambda the generator cannot build are listed but not counted. A function is
+  covered when every counted signature is `MATCH`; one that matched only on
+  typed NULLs is reported apart, and a signature for which no generated call
+  works on Trino counts as `UNTESTED`, against the function.
 - `queries.json` -- the query set. Uses the TPC-H column names from Trino's
   `tpch` connector, which are **bare** (`extendedprice`, not `l_extendedprice`).
   Add queries here to grow coverage; covers counts, aggregates, multi-way joins
@@ -62,8 +99,14 @@ query. Two scenario kinds (see `iceberg_scenarios.json`):
   position-delete files) is Trino-readable and vice versa.
 
 ```bash
-python3 tests/parity/iceberg_parity.py tests/parity/iceberg_scenarios.json
+python3 tests/parity/iceberg_parity.py tests/parity/iceberg_scenarios.json --protocol both
 ```
+
+## Baseline
+
+The current numbers and the work to close the gaps are in the OpenSpec change
+`openspec/changes/trino-sql-parity/`; each run's per-function table is in
+`docs/evidence/trino-parity/`.
 
 Table names are fully qualified (`tpch_demo.<t>`) on purpose: SQE's write path
 resolves an UNqualified name to the `default` namespace while reads use the
