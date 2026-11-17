@@ -7037,15 +7037,17 @@ fn build_show_stats_batch(
 /// Build the `DESCRIBE OUTPUT` result set for a prepared statement's output
 /// schema: one row per column, matching Trino's column layout
 /// (Column Name, Catalog, Schema, Table, Type, Type Size, Aliased). Catalog /
-/// Schema / Table are null (SQE does not track per-column source bindings);
-/// Type is the Trino type name; Type Size is the fixed byte width where known.
+/// Schema / Table are empty strings, as Trino reports for a column it cannot
+/// trace to a table (SQE does not track per-column source bindings); the
+/// Trino JDBC driver's `getMetaData()` requires them non-null. Type is the
+/// Trino type name; Type Size is the fixed byte width where known.
 fn build_describe_output(schema: &SchemaRef) -> sqe_core::Result<Vec<RecordBatch>> {
     use arrow_array::builder::{BooleanBuilder, Int64Builder};
     let out_schema = Arc::new(Schema::new(vec![
         Field::new("Column Name", DataType::Utf8, false),
-        Field::new("Catalog", DataType::Utf8, true),
-        Field::new("Schema", DataType::Utf8, true),
-        Field::new("Table", DataType::Utf8, true),
+        Field::new("Catalog", DataType::Utf8, false),
+        Field::new("Schema", DataType::Utf8, false),
+        Field::new("Table", DataType::Utf8, false),
         Field::new("Type", DataType::Utf8, false),
         Field::new("Type Size", DataType::Int64, true),
         Field::new("Aliased", DataType::Boolean, false),
@@ -7059,9 +7061,9 @@ fn build_describe_output(schema: &SchemaRef) -> sqe_core::Result<Vec<RecordBatch
     let mut aliased_b = BooleanBuilder::new();
     for field in schema.fields() {
         name_b.append_value(field.name());
-        cat_b.append_null();
-        sch_b.append_null();
-        tbl_b.append_null();
+        cat_b.append_value("");
+        sch_b.append_value("");
+        tbl_b.append_value("");
         type_b.append_value(sqe_trino_compat::types::arrow_to_trino_type(
             field.data_type(),
         ));

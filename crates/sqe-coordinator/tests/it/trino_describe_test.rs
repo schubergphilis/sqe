@@ -136,6 +136,11 @@ async fn describe_output_lists_columns_and_types() {
     // Trino type names: bigint (Int64 literal) and varchar.
     assert_eq!(cell(b, 4, 0), "bigint");
     assert_eq!(cell(b, 4, 1), "varchar");
+    // Catalog / Schema / Table are '' like Trino, never NULL: the Trino JDBC
+    // driver's PreparedStatement.getMetaData() requires a non-null table name.
+    for col in 1..=3 {
+        assert_eq!(b.column(col).null_count(), 0, "column {col} has nulls");
+    }
 }
 
 /// DESCRIBE INPUT: one row per bind parameter with its inferred type.

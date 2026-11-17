@@ -8,3 +8,11 @@
     - empty `procedures`, `procedure_columns`, `udts`, `super_types`, `super_tables`, `attributes` and `pseudo_columns` tables.
 
     Before, `getTableTypes()`, `getProcedures()` and similar metadata calls failed. `system.jdbc.tables` also lists views, as `VIEW`.
+
+- Bare `current_user` works in SQL
+
+    `SELECT current_user` failed with "No field named current_user", which also broke the Trino JDBC driver's `getUserName()`.
+
+- `PreparedStatement.getMetaData()` works with the Trino JDBC driver before the statement runs
+
+    `DESCRIBE OUTPUT` returns empty strings for Catalog, Schema and Table, as Trino does, instead of NULL. The driver threw a `NullPointerException` on NULL.

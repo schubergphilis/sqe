@@ -177,6 +177,9 @@ pub fn apply_trino_compat(statements: &mut Vec<Statement>, source: &str) -> bool
     // current_catalog". Rewrite it to the call form for the same reason as
     // `current_schema` above.
     let has_current_catalog = lower.contains("current_catalog");
+    // `current_user` (bare keyword) -> rewrite_bare_current_user. The Trino
+    // JDBC driver's `getUserName()` runs `SELECT current_user`.
+    let has_current_user = lower.contains("current_user");
     // `as uuid` / `as ipaddress` -> rewrite_cast_custom_to_varchar. Trino's
     // UUID and IPADDRESS types have no DataFusion equivalent (CAST -> a
     // NOT_SUPPORTED error); both are string-representable, so on the read path
@@ -247,6 +250,7 @@ pub fn apply_trino_compat(statements: &mut Vec<Statement>, source: &str) -> bool
         && !has_dollar
         && !has_current_schema
         && !has_current_catalog
+        && !has_current_user
         && !has_custom_cast
         && !has_utf8_literal
         && !has_row
@@ -424,6 +428,9 @@ impl VisitorMut for TrinoCompatVisitor {
             self.rewrites += 1;
         }
         if rewrite_bare_current_catalog(expr) {
+            self.rewrites += 1;
+        }
+        if rewrite_bare_current_user(expr) {
             self.rewrites += 1;
         }
         if rewrite_utf8_typed_string(expr) {
@@ -1199,6 +1206,29 @@ fn rewrite_bare_current_catalog(expr: &mut Expr) -> bool {
     if !function_name_is(func, "current_catalog") || func.args != FunctionArguments::None {
         return false;
     }
+    func.args = FunctionArguments::List(FunctionArgumentList {
+        duplicate_treatment: None,
+        args: vec![],
+        clauses: vec![],
+    });
+    true
+}
+
+/// Rewrite a bare `current_user` into `"current_user"()`. The Generic
+/// dialect parses bare `current_user` as a no-arg `Function` without
+/// parentheses, which re-serializes to the bare keyword; under the session's
+/// DuckDB dialect that is a column ("No field named current_user"), and the
+/// unquoted call form `current_user()` is a parse error there. The quoted
+/// name keeps the call form and still resolves to the session UDF. A quoted
+/// `"current_user"` column is not this `Function` shape and is left alone.
+fn rewrite_bare_current_user(expr: &mut Expr) -> bool {
+    let Expr::Function(func) = expr else {
+        return false;
+    };
+    if !function_name_is(func, "current_user") || func.args != FunctionArguments::None {
+        return false;
+    }
+    func.name = ObjectName::from(vec![Ident::with_quote('"', "current_user")]);
     func.args = FunctionArguments::List(FunctionArgumentList {
         duplicate_treatment: None,
         args: vec![],
@@ -2347,6 +2377,17 @@ mod tests {
             out.to_lowercase().contains("current_catalog()"),
             "bare current_catalog must become a call: {out}"
         );
+    }
+
+    #[test]
+    fn rewrites_bare_current_user_to_quoted_call() {
+        // The Trino JDBC driver's getUserName() runs exactly this.
+        for sql in ["SELECT current_user", "SELECT CURRENT_USER"] {
+            let out = rewrite_trino_compat(sql);
+            assert_eq!(out, r#"SELECT "current_user"()"#, "{sql}");
+        }
+        let out = rewrite_trino_compat(r#"SELECT "current_user" FROM t"#);
+        assert_eq!(out, r#"SELECT "current_user" FROM t"#);
     }
 
     #[test]
