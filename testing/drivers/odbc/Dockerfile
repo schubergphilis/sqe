@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Apache Arrow Flight SQL ODBC driver (apache-arrow-26.0.1) + pyodbc + probe script.
 # Mirrors the project's ubuntu-cpp-odbc compose service (compose.yaml): BUNDLED deps.
-FROM ubuntu:24.04 AS build
+FROM ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8 AS build
 ARG DEBIAN_FRONTEND=noninteractive
 ARG ARROW_TAG=apache-arrow-26.0.1
 RUN apt-get update -y -q && apt-get install -y -q --no-install-recommends \
@@ -31,7 +31,7 @@ RUN cmake --install /build \
     && ldd /opt/arrow/lib/libarrow_flight_sql_odbc.so \
     && ls /opt/arrow/share/*/flight/sql/odbc/
 
-FROM ubuntu:24.04
+FROM ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update -y -q && apt-get install -y -q --no-install-recommends \
       unixodbc odbcinst python3 python3-pyodbc ca-certificates \
@@ -44,6 +44,8 @@ RUN if ldd /opt/arrow/lib/libarrow_flight_sql_odbc.so | grep "not found"; then e
     bash /tmp/install_odbc.sh /opt/arrow/lib/libarrow_flight_sql_odbc.so && rm /tmp/install_odbc.sh \
     && cat /etc/odbcinst.ini
 COPY probe/odbc_probe.py /probe/odbc_probe.py
-RUN python3 -m py_compile /probe/odbc_probe.py
+RUN python3 -m py_compile /probe/odbc_probe.py \
+    && useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin probe
+USER 10001
 WORKDIR /probe
 CMD ["python3", "/probe/odbc_probe.py"]
