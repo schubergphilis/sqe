@@ -91,11 +91,12 @@ done
 # old implementation masked stderr and always printed "done", which hid
 # silent-creation failures until Polaris tried to write to the bucket
 # and got back a NoSuchBucket 404 hours later.
-# Two buckets: 'warehouse' for test_warehouse and 'warehouse-discovery'
-# for discovery_test_wh. Polaris 1.5.0 rejects catalogs whose allowed
+# Three buckets: 'warehouse' for test_warehouse, 'warehouse-discovery'
+# for discovery_test_wh and 'warehouse-system' for the Polaris catalog
+# 'system'. Polaris 1.5.0 rejects catalogs whose allowed
 # locations overlap an existing catalog, so the discovery warehouse can
 # no longer nest under s3://warehouse/.
-for BUCKET in warehouse warehouse-discovery; do
+for BUCKET in warehouse warehouse-discovery warehouse-system; do
 echo -n "Creating S3 bucket '$BUCKET'... "
 if command -v aws &> /dev/null; then
     if AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" \
@@ -283,6 +284,67 @@ HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
     -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
     -d '{"namespace": ["disc_ns"]}' 2>/dev/null)
+
+case "$HTTP_CODE" in
+    200) echo "done" ;;
+    409) echo "already exists" ;;
+    *) echo "FAILED (HTTP $HTTP_CODE)"; exit 1 ;;
+esac
+
+# ── 8. Create a Polaris catalog named 'system' (system_catalog_split_test.rs) ──
+# `system` is shared: SQE serves the reserved schemas (runtime, metadata,
+# jdbc, information_schema) and Polaris serves every other schema. The
+# test needs a real Polaris `system` catalog with a namespace `access`.
+echo -n "Creating warehouse 'system'... "
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+    "$POLARIS_URL/api/management/v1/catalogs" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "{
+        \"catalog\": {
+            \"name\": \"system\",
+            \"type\": \"INTERNAL\",
+            \"storageConfigInfo\": {
+                \"storageType\": \"S3\",
+                \"allowedLocations\": [\"s3://warehouse-system/\"],
+                \"endpoint\": \"$S3_URL\",
+                \"endpointInternal\": \"http://rustfs:9000\",
+                \"pathStyleAccess\": true
+            },
+            \"properties\": {
+                \"default-base-location\": \"s3://warehouse-system/\",
+                \"polaris.config.drop-with-purge.enabled\": \"true\"
+            }
+        }
+    }" 2>/dev/null)
+
+case "$HTTP_CODE" in
+    200|201) echo "done" ;;
+    409) echo "already exists" ;;
+    *) echo "FAILED (HTTP $HTTP_CODE)"; exit 1 ;;
+esac
+
+curl -s -o /dev/null -X POST "$POLARIS_URL/api/management/v1/catalogs/system/catalog-roles" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"catalogRole": {"name": "catalog_admin"}}' 2>/dev/null || true
+
+curl -s -o /dev/null -X PUT "$POLARIS_URL/api/management/v1/catalogs/system/catalog-roles/catalog_admin/grants" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"grant": {"type": "catalog", "privilege": "CATALOG_MANAGE_CONTENT"}}' 2>/dev/null || true
+
+curl -s -o /dev/null -X PUT "$POLARIS_URL/api/management/v1/principal-roles/service_admin/catalog-roles/system" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"catalogRole": {"name": "catalog_admin"}}' 2>/dev/null || true
+
+echo -n "Creating namespace 'access' in system... "
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+    "$POLARIS_URL/api/catalog/v1/system/namespaces" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"namespace": ["access"]}' 2>/dev/null)
 
 case "$HTTP_CODE" in
     200) echo "done" ;;

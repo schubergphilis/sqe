@@ -172,6 +172,41 @@ impl Visitor for CatalogQualifierCollector {
     }
 }
 
+/// True when `stmt` names a relation `system.<schema>.<t>` whose schema is
+/// not one of SQE's virtual `system` schemas (#901): only then can the
+/// statement need a Polaris catalog named `system`, so only then is it worth
+/// asking Polaris for one. `system.runtime.*` and friends never probe.
+pub fn names_polaris_system_schema(stmt: &Statement) -> bool {
+    struct Finder(bool);
+    impl Visitor for Finder {
+        type Break = ();
+        fn pre_visit_relation(&mut self, name: &ObjectName) -> ControlFlow<Self::Break> {
+            if let [cat, schema, _] = name.0.as_slice() {
+                let (Some(cat), Some(schema)) = (cat.as_ident(), schema.as_ident()) else {
+                    return ControlFlow::Continue(());
+                };
+                // An unquoted identifier folds to lowercase before DataFusion
+                // resolves it (#337); a quoted one is taken as written.
+                let is_system = match cat.quote_style {
+                    None => cat
+                        .value
+                        .eq_ignore_ascii_case(sqe_core::system_catalog::SYSTEM_CATALOG),
+                    Some(_) => cat.value == sqe_core::system_catalog::SYSTEM_CATALOG,
+                };
+                if is_system && !sqe_core::system_catalog::is_reserved_system_schema(&schema.value)
+                {
+                    self.0 = true;
+                    return ControlFlow::Break(());
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut finder = Finder(false);
+    let _ = stmt.visit(&mut finder);
+    finder.0
+}
+
 /// The namespace an `information_schema` read pins, when the statement is a
 /// single SELECT whose WHERE clause has a top-level conjunct of exactly
 /// `table_schema = '<literal>'` (either operand order, optionally qualified
@@ -301,6 +336,23 @@ mod tests {
     use super::*;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
+
+    #[test]
+    fn polaris_system_schema_only_for_non_virtual_schemas() {
+        for (sql, want) in [
+            ("SELECT * FROM system.access.audit", true),
+            ("SELECT * FROM SYSTEM.query.history", true),
+            ("SELECT * FROM t JOIN system.lakeflow.jobs ON true", true),
+            ("SELECT * FROM system.runtime.queries", false),
+            ("SELECT * FROM system.JDBC.tables", false),
+            ("SELECT * FROM system.metadata.catalogs", false),
+            ("SELECT * FROM \"SYSTEM\".access.audit", false),
+            ("SELECT * FROM iceberg.access.audit", false),
+            ("SELECT * FROM access.audit", false),
+        ] {
+            assert_eq!(names_polaris_system_schema(&parse(sql)), want, "{sql}");
+        }
+    }
 
     #[test]
     fn rename_catalog_rewrites_three_part_relations_and_four_part_columns() {

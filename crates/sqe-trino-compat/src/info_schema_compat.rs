@@ -207,6 +207,24 @@ fn scope_catalog(batch: RecordBatch, session_catalog: Option<&str>) -> RecordBat
         Some(c) => c,
         None => return batch,
     };
+    // `system` is SQE's virtual schemas plus, when one exists, a Polaris
+    // catalog of that name (#901): only the virtual rows are internal.
+    let schema_col = schema
+        .index_of("table_schema")
+        .or_else(|_| schema.index_of("schema_name"))
+        .ok()
+        .and_then(|i| batch.column(i).as_any().downcast_ref::<StringArray>());
+    let internal = |i: usize, catalog: &str| {
+        if catalog == sqe_core::system_catalog::SYSTEM_CATALOG {
+            return match schema_col {
+                Some(s) if !s.is_null(i) => {
+                    sqe_core::system_catalog::is_virtual_system_ref(catalog, s.value(i))
+                }
+                _ => true,
+            };
+        }
+        INTERNAL_CATALOGS.contains(&catalog)
+    };
     let mask: BooleanArray = (0..col.len())
         .map(|i| {
             if col.is_null(i) {
@@ -215,7 +233,7 @@ fn scope_catalog(batch: RecordBatch, session_catalog: Option<&str>) -> RecordBat
             let v = col.value(i);
             Some(match session_catalog {
                 Some(sc) => v == sc,
-                None => !INTERNAL_CATALOGS.contains(&v),
+                None => !internal(i, v),
             })
         })
         .collect();
@@ -514,6 +532,24 @@ mod tests {
         );
         let out = apply_info_schema_compat(vec![b], None);
         assert_eq!(catalog_values(&out[0]), vec!["iceberg"]);
+    }
+
+    #[test]
+    fn keeps_polaris_system_schemas_when_no_session_catalog() {
+        // #901: `system.access` is a Polaris catalog `system`; only SQE's
+        // virtual schemas under `system` are internal.
+        let b = tables_batch(
+            &["system", "system", "system", "datafusion"],
+            &["runtime", "access", "information_schema", "public"],
+        );
+        let out = apply_info_schema_compat(vec![b], None);
+        assert_eq!(catalog_values(&out[0]), vec!["system"]);
+        let schemas = out[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(schemas.value(0), "access");
     }
 
     #[test]

@@ -63,6 +63,20 @@ impl std::fmt::Debug for AttachedCatalog {
 /// Shorthand alias used internally.
 type ProviderList = Vec<(String, Arc<dyn CatalogProvider>)>;
 
+/// `system` and `datafusion` are not attachable (#901). Attached catalogs and
+/// Hive roots register after the `system` composite and would replace it; a
+/// quoted `"SYSTEM"` root would sit next to it, its `runtime` database named
+/// like a virtual schema. A Polaris catalog `system` comes from config or
+/// discovery, where it is wrapped instead.
+fn refuse_reserved_catalog_name(name: &str) -> Result<(), String> {
+    if sqe_core::system_catalog::is_reserved_catalog_name(name) {
+        return Err(format!(
+            "catalog name '{name}' is reserved; ATTACH it under another name"
+        ));
+    }
+    Ok(())
+}
+
 /// Process-local registry of catalogs added by `ATTACH` at runtime.
 ///
 /// Cloning shares the same backing map; safe to thread through
@@ -92,6 +106,7 @@ impl RuntimeCatalogRegistry {
         stmt: &AttachStatement,
         secrets: &SecretStore,
     ) -> Result<(), String> {
+        refuse_reserved_catalog_name(&stmt.name)?;
         // 1) Refuse duplicate name (case-sensitive). Checks BOTH lanes: the
         //    two share one SQL catalog-name namespace (see the "Hive lane"
         //    section below), and checking only `self.inner` here would let
@@ -285,6 +300,7 @@ impl RuntimeCatalogRegistry {
         name: &str,
         root: sqe_catalog::hive::source::HiveRoot,
     ) -> Result<(), String> {
+        refuse_reserved_catalog_name(name)?;
         {
             let iceberg = self
                 .inner
@@ -539,6 +555,23 @@ mod hive_lane_tests {
             .attach_hive_root("lake", sqe_catalog::hive::source::HiveRoot::from_store(store))
             .expect_err("duplicate attach must fail");
         assert!(err.contains("already attached"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn attach_hive_root_refuses_reserved_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = RuntimeCatalogRegistry::new();
+        let store = local_hive_store(dir.path()).await;
+        for name in ["system", "SYSTEM", "datafusion"] {
+            let err = registry
+                .attach_hive_root(
+                    name,
+                    sqe_catalog::hive::source::HiveRoot::from_store(Arc::clone(&store)),
+                )
+                .expect_err("reserved name must be refused");
+            assert!(err.contains("is reserved"), "{name}: {err}");
+        }
+        assert!(registry.hive_roots().expect("hive_roots").is_empty());
     }
 
     /// Minimal `iceberg::Catalog` stub so the cross-lane collision test below

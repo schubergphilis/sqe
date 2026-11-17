@@ -83,7 +83,7 @@ pub use rest_catalog::{
 pub use sqe_core::circuit_breaker;
 pub use sqe_core::CircuitBreaker;
 #[cfg(feature = "rest")]
-pub use system_catalog::{SystemCatalogEntry, SystemCatalogProvider};
+pub use system_catalog::{SystemCatalogEntry, SystemCatalogProvider, SystemCompositeProvider};
 
 /// Object storage for every Iceberg catalog and `FileIO` SQE builds.
 ///

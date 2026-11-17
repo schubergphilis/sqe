@@ -406,6 +406,32 @@ Properties:
   declaration or `ATTACH`. `SHOW CATALOGS` lists statically-configured and
   already-discovered catalogs, not warehouses never yet referenced.
 
+### A Polaris catalog named `system`
+
+SQE serves four schemas of the `system` catalog itself: `runtime`,
+`metadata`, `jdbc` and `information_schema`. These names are reserved.
+With `polaris-auto`, every other schema under `system` comes from a
+Polaris catalog named `system` when one exists:
+
+```sql
+SELECT * FROM system.runtime.queries;       -- served by SQE
+SELECT * FROM system.access.audit;          -- Polaris catalog `system`, namespace `access`
+SHOW SCHEMAS FROM system;                   -- jdbc, metadata, runtime, plus the Polaris namespaces
+```
+
+- **Governed like any catalog.** A table in the Polaris part is read and
+  written with the caller's token and goes through the same policies,
+  masks, row filters, tag policies, audit and result cache as a table in
+  any other catalog.
+- **Reserved names stay with SQE.** `CREATE SCHEMA system.runtime` (or
+  `metadata`, `jdbc`, `information_schema`) is refused. A Polaris
+  namespace with one of those names that already exists is ignored.
+- **Procedures keep their meaning.** `CALL system.rewrite_data_files(...)`
+  and the other procedures run as before, on the session catalog's table.
+- **`ATTACH ... AS system` is refused**, as is `AS datafusion`.
+- **Static mode is unchanged.** With `catalog_discovery = "static"`,
+  `system` holds only the four reserved schemas.
+
 ## Metadata freshness under concurrent writers
 
 Each session plans against a cached list of a catalog's schemas and a cached

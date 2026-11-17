@@ -48,7 +48,7 @@ pub(crate) struct IngestServer {
 }
 
 /// The audit log an audited server writes, in `format = "both"`.
-struct AuditFiles {
+pub(crate) struct AuditFiles {
     logger: Arc<AuditLogger>,
     native: std::path::PathBuf,
     ocsf: std::path::PathBuf,
@@ -105,7 +105,7 @@ impl IngestServer {
         Self::serve(handler, config, Some(audit)).await
     }
 
-    async fn serve(
+    pub(crate) async fn serve(
         handler: sqe_coordinator::QueryHandler,
         config: sqe_core::SqeConfig,
         audit: Option<AuditFiles>,

@@ -134,10 +134,14 @@ impl TableScope {
         }
     }
 
-    /// `table` with its missing catalog / schema filled from the scope. A
-    /// reserved catalog (`system`, `datafusion`) is never filled in: it would
-    /// make a user table look like a reserved virtual one and skip its tag
-    /// lookup, and neither Iceberg policy keys nor Hive routing need it.
+    /// `table` with its missing catalog / schema filled from the scope. The
+    /// `datafusion` catalog is never filled in: it would make a user table
+    /// look like a reserved virtual one and skip its tag lookup.
+    ///
+    /// `system` is filled in (#901): under `USE system`, `access.audit` names
+    /// a table of a Polaris catalog `system` and must be keyed on it, while
+    /// `runtime.queries` becomes `system.runtime.queries`, which the
+    /// schema-aware reserved check still treats as virtual.
     pub fn qualify(
         &self,
         table: &datafusion::common::TableReference,
@@ -146,7 +150,7 @@ impl TableScope {
         let catalog = self
             .catalog
             .as_deref()
-            .filter(|c| !c.eq_ignore_ascii_case("system") && !c.eq_ignore_ascii_case("datafusion"));
+            .filter(|c| !c.eq_ignore_ascii_case(sqe_core::system_catalog::DATAFUSION_CATALOG));
         match table {
             TableReference::Bare { table: t } => match (catalog, self.schema.as_deref()) {
                 (Some(c), Some(s)) => TableReference::full(c, s, t.as_ref()),
@@ -327,5 +331,26 @@ mod tests {
         let date_year = MaskType::DateShowYear;
         assert!(format!("{partial:?}").contains("PartialMask"));
         assert!(format!("{date_year:?}").contains("DateShowYear"));
+    }
+
+    #[test]
+    fn qualify_fills_system_but_not_datafusion() {
+        use datafusion::common::TableReference;
+        let scope = |c: &str| TableScope {
+            catalog: Some(c.to_string()),
+            schema: Some("runtime".to_string()),
+        };
+        // #901: under `USE system`, `access.audit` is a Polaris table of the
+        // catalog `system` and must be keyed on it.
+        let partial = TableReference::partial("access", "audit");
+        assert_eq!(
+            scope("system").qualify(&partial),
+            TableReference::full("system", "access", "audit")
+        );
+        assert_eq!(
+            scope("system").qualify(&TableReference::bare("queries")),
+            TableReference::full("system", "runtime", "queries")
+        );
+        assert_eq!(scope("datafusion").qualify(&partial), partial);
     }
 }
