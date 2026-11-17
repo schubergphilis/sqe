@@ -21,6 +21,9 @@ What the gaps have in common:
 | Built-in return types differ (`length` Int32, `extract` Int32, `mod`/`sign` Float64) | 5 query TYPE rows, 2 query DIFF rows |
 | Trino type syntax (`array(T)`, `time(p)`) does not parse | 17 function SQE-ERR signatures |
 | HTTP encoder: NaN sent as NULL; `json` label on a varchar | `asin`/`acos` HTTP-only DIFF; `json_cast` HTTP-only TYPE |
+| Timestamp precision is fixed at 6 (HTTP) or the Arrow unit (Flight); zone dropped from `TIMESTAMP '... UTC'` and `current_timestamp` | `at_timezone`, `with_timezone` and every timestamp-returning function's TYPE row |
+
+The harness sends `X-Trino-Client-Capabilities: PARAMETRIC_DATETIME`, as the JDBC driver does. Without it Trino reports `timestamp with time zone` with no precision, which hid the precision gap.
 
 ## Goals / Non-Goals
 

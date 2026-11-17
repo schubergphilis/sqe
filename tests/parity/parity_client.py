@@ -59,6 +59,9 @@ class TrinoHttp:
             "X-Trino-Catalog": catalog,
             "X-Trino-Schema": schema,
             "Content-Type": "text/plain",
+            # What the JDBC driver sends. Without it Trino reports the legacy
+            # `timestamp with time zone` (no precision) and rounds to millis.
+            "X-Trino-Client-Capabilities": "PARAMETRIC_DATETIME",
         }
         if password is not None:
             tok = base64.b64encode(f"{user}:{password}".encode()).decode()

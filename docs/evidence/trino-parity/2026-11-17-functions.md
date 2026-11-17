@@ -19,7 +19,7 @@ Signature scopes: iceberg 676, trino 230, untested 5.
 | `array_remove` | scalar | DIFF | DIFF | `SELECT array_remove(ARRAY[BIGINT '7', BIGINT '7'], BIGINT '7')` -> DIFF: SQE=1r Trino=1r \| SQE [[[7]]] vs Trino [[[]]] |
 | `array_sort` | scalar | SQE-ERR | SQE-ERR | `SELECT array_sort(CAST(NULL AS array(bigint)), (x, y) -> 7)` -> SQE-ERR: Parse error: sql parser error: Expected: <, found: ( at Line: 1, Column: 37 |
 | `asin` | scalar | DIFF | MATCH | `SELECT asin(DOUBLE '2.5')` -> DIFF: SQE=1r Trino=1r \| SQE [[None]] vs Trino [['NaN']] |
-| `at_timezone` | scalar | TYPE | TYPE | `SELECT at_timezone(TIMESTAMP '2024-03-15 12:34:56.789 UTC', 'UTC')` -> TYPE: _col0: timestamp(6) with time zone vs timestamp with time zone |
+| `at_timezone` | scalar | TYPE | TYPE | `SELECT at_timezone(TIMESTAMP '2024-03-15 12:34:56.789 UTC', 'UTC')` -> TYPE: _col0: timestamp(6) with time zone vs timestamp(3) with time zone |
 | `avg` | aggregate | SQE-ERR | SQE-ERR | `SELECT avg(DECIMAL '12.34')` -> TYPE: _col0: decimal(38,10) vs decimal(4,2) |
 | `bar` | scalar | MISSING | MISSING | `SELECT bar(DOUBLE '2.5', BIGINT '7')` -> MISSING: Invalid function 'bar'. |
 | `beta_cdf` | scalar | MISSING | MISSING | `SELECT beta_cdf(CAST(NULL AS double), CAST(NULL AS double), CAST(NULL AS double))` -> MISSING: Invalid function 'beta_cdf'. |
@@ -119,7 +119,7 @@ Signature scopes: iceberg 676, trino 230, untested 5.
 | `ngrams` | scalar | MISSING | MISSING | `SELECT ngrams(ARRAY[BIGINT '7', BIGINT '7'], 7)` -> MISSING: Invalid function 'ngrams'. |
 | `normal_cdf` | scalar | MISSING | MISSING | `SELECT normal_cdf(DOUBLE '2.5', DOUBLE '2.5', DOUBLE '2.5')` -> MISSING: Invalid function 'normal_cdf'. |
 | `normalize` | scalar | UNTESTED | UNTESTED | UNTESTED: no generated call Trino accepts (varchar(x), varchar(y)) |
-| `now` | scalar | DIFF | DIFF | `SELECT now()` -> DIFF: SQE=1r Trino=1r \| SQE [['2026-11-17 20:35:10.555320']] vs Trino [['2026-11-17 20:35:10.548 UTC']] |
+| `now` | scalar | DIFF | DIFF | `SELECT now()` -> DIFF: SQE=1r Trino=1r \| SQE [['2026-11-17 20:40:43.743440']] vs Trino [['2026-11-17 20:40:43.729 UTC']] |
 | `ntile` | window | MATCH | TYPE | `SELECT ntile(BIGINT '7') OVER (ORDER BY 1)` -> TYPE: _col0: arrow:uint64 vs bigint |
 | `numeric_histogram` | aggregate | MISSING | MISSING | `SELECT numeric_histogram(BIGINT '7', DOUBLE '2.5')` -> MISSING: Invalid function 'numeric_histogram'. |
 | `parse_data_size` | scalar | MISSING | MISSING | `SELECT parse_data_size(CAST(NULL AS varchar))` -> MISSING: Invalid function 'parse_data_size'. |
@@ -168,7 +168,7 @@ Signature scopes: iceberg 676, trino 230, untested 5.
 | `to_ieee754_64` | scalar | MISSING | MISSING | `SELECT to_ieee754_64(DOUBLE '2.5')` -> MISSING: Invalid function 'to_ieee754_64'. |
 | `to_iso8601` | scalar | DIFF | DIFF | `SELECT to_iso8601(TIMESTAMP '2024-03-15 12:34:56.789 UTC')` -> DIFF: SQE=1r Trino=1r \| SQE [['2024-03-15T12:34:56.789']] vs Trino [['2024-03-15T12:34:56.789Z']] |
 | `to_milliseconds` | scalar | MISSING | MISSING | `SELECT to_milliseconds(INTERVAL '2' DAY)` -> MISSING: Invalid function 'to_milliseconds'. |
-| `to_timestamp` | scalar | TYPE | TYPE | `SELECT to_timestamp(CAST(NULL AS varchar), CAST(NULL AS varchar))` -> TYPE: _col0: timestamp(6) with time zone vs timestamp |
+| `to_timestamp` | scalar | TYPE | TYPE | `SELECT to_timestamp(CAST(NULL AS varchar), CAST(NULL AS varchar))` -> TYPE: _col0: timestamp(6) with time zone vs timestamp(3) |
 | `to_utf8` | scalar | DIFF | DIFF | `SELECT to_utf8(CHAR 'abc')` -> DIFF: SQE=1r Trino=1r \| SQE [['616263']] vs Trino [['YWJj']] |
 | `trim_array` | scalar | SQE-ERR | SQE-ERR | `SELECT trim_array(CAST(NULL AS array(bigint)), CAST(NULL AS bigint))` -> SQE-ERR: Parse error: sql parser error: Expected: <, found: ( at Line: 1, Column: 37 |
 | `truncate` | scalar | SQE-ERR | SQE-ERR | `SELECT truncate(DECIMAL '12.34', 7)` -> SQE-ERR: Execution error: expected numeric scalar, got Scalar(Decimal128(12.3400000000,38,10)) |
@@ -184,7 +184,7 @@ Signature scopes: iceberg 676, trino 230, untested 5.
 | `width_bucket` | scalar | MISSING | MISSING | `SELECT width_bucket(DOUBLE '2.5', ARRAY[DOUBLE '2.5', DOUBLE '2.5'])` -> MISSING: Invalid function 'width_bucket'. |
 | `wilson_interval_lower` | scalar | MISSING | MISSING | `SELECT wilson_interval_lower(BIGINT '7', BIGINT '7', DOUBLE '2.5')` -> MISSING: Invalid function 'wilson_interval_lower'. |
 | `wilson_interval_upper` | scalar | MISSING | MISSING | `SELECT wilson_interval_upper(BIGINT '7', BIGINT '7', DOUBLE '2.5')` -> MISSING: Invalid function 'wilson_interval_upper'. |
-| `with_timezone` | scalar | TYPE | TYPE | `SELECT with_timezone(TIMESTAMP '2024-03-15 12:34:56.789', 'UTC')` -> TYPE: _col0: timestamp(6) with time zone vs timestamp with time zone |
+| `with_timezone` | scalar | TYPE | TYPE | `SELECT with_timezone(TIMESTAMP '2024-03-15 12:34:56.789', 'UTC')` -> TYPE: _col0: timestamp(6) with time zone vs timestamp(3) with time zone |
 | `xxhash64` | scalar | MISSING | MISSING | `SELECT xxhash64(X'616263')` -> MISSING: Invalid function 'xxhash64'. |
 | `year` | scalar | SQE-ERR | SQE-ERR | `SELECT year(INTERVAL '3' MONTH)` -> SQE-ERR: Expected date, timestamp, or time scalar, got IntervalMonthDayNano("IntervalMonthDayNano { months: 3, days: 0, nanosecon |
 | `year_of_week` | scalar | MISSING | MISSING | `SELECT year_of_week(DATE '2024-03-15')` -> MISSING: Invalid function 'year_of_week'. |
