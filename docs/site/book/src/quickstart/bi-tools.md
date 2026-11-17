@@ -44,6 +44,8 @@ Create a new **Trino** connection:
 
 The schema browser walks catalogs, then schemas, then tables, and column metadata renders from `DESCRIBE`.
 
+DBeaver reads the browser tree from the Trino driver's `DatabaseMetaData`, which queries the `system.jdbc` tables: catalogs, schemas, table types, tables (tables and views, as `TABLE` and `VIEW`) and columns. Set **Database/Schema** in the connection's main tab to the catalog you work in. `system.jdbc.catalogs` lists the configured catalogs plus the session catalog, so a catalog that is neither configured nor set on the connection is not in the tree, though queries that name it in full still run. A view's columns are not listed under it; open the view's DDL or query it.
+
 ## Trino CLI
 
 ```bash
