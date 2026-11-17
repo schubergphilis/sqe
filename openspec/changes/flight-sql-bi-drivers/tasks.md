@@ -26,4 +26,4 @@
 
 - [x] 5.1 SqlInfo values corrected; GROUP BY / UNION / outer join / subquery keys added
 - [x] 5.2 Column metadata in `client_schema`; unit test for decimal, integer, string
-- [ ] 5.3 Driver matrix rerun (JDBC and ODBC, password and token)
+- [x] 5.3 Driver matrix rerun (JDBC and ODBC, password and token)

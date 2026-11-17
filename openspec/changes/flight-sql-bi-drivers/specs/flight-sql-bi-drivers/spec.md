@@ -1,8 +1,8 @@
 ## ADDED Requirements
 
-### Requirement: Java Flight clients receive results they can decode
+### Requirement: Java and C++ Flight clients receive results they can decode
 
-The coordinator SHALL answer a Flight request whose `user-agent` contains `grpc-java` with uncompressed IPC bodies, whatever `[coordinator] flight_compression` says. A request header `x-sqe-flight-compression` with value `none`, `lz4` or `zstd` SHALL choose the codec for that request and take precedence over the user agent and the configuration. Any other client SHALL keep the configured codec.
+The coordinator SHALL answer a Flight request whose `user-agent` contains `grpc-java` or `grpc-c++` with uncompressed IPC bodies, whatever `[coordinator] flight_compression` says. A request header `x-sqe-flight-compression` with value `none`, `lz4` or `zstd` SHALL choose the codec for that request and take precedence over the user agent and the configuration. Any other client SHALL keep the configured codec.
 
 #### Scenario: The Flight SQL JDBC driver reads a result under the default configuration
 - **WHEN** a request with `user-agent: JDBC Flight SQL Driver 19.0.0 grpc-java-netty/1.73.0` runs `SELECT 1` and `flight_compression = "lz4"`
@@ -11,6 +11,10 @@ The coordinator SHALL answer a Flight request whose `user-agent` contains `grpc-
 #### Scenario: The header wins
 - **WHEN** a `grpc-java` request sends `x-sqe-flight-compression: zstd`
 - **THEN** its result is ZSTD-compressed
+
+#### Scenario: The Flight SQL ODBC driver reads a result under the default configuration
+- **WHEN** a request with `user-agent: grpc-c++/1.71.0 grpc-c/46.0.0 (linux; chttp2)` runs `SELECT 1` and `flight_compression = "lz4"`
+- **THEN** the IPC options for its result carry no compression
 
 #### Scenario: Other clients are unchanged
 - **WHEN** an ADBC Go client sends no header and `flight_compression = "lz4"`

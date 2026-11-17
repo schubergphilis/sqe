@@ -3,16 +3,21 @@
 //!
 //! **Compression.** The Arrow Java Flight client (under the Flight SQL JDBC
 //! driver) ships no LZ4/ZSTD codec unless the application adds
-//! `arrow-compression`, so an LZ4 body is unreadable to it.
+//! `arrow-compression`, and Arrow's Flight SQL ODBC installer is built with
+//! both codecs off, so an LZ4 body is unreadable to either.
 //! [`ClientCompressionLayer`] picks the codec per request and puts it in a
 //! task-local the handlers read through
 //! [`client_compression_override`]:
 //!
 //! 1. `x-sqe-flight-compression: none|lz4|zstd` wins (an unparsable value is
-//!    ignored);
-//! 2. a `user-agent` containing `grpc-java` gets no compression. grpc-java
-//!    appends its own token after the application's, so the JDBC driver
-//!    sends `JDBC Flight SQL Driver 19.0.0 grpc-java-netty/1.x`;
+//!    ignored). The ODBC driver sends any connection property it does not
+//!    know as a header, so `x-sqe-flight-compression=lz4` in the connection
+//!    string sets it;
+//! 2. a `user-agent` containing `grpc-java` or `grpc-c++` gets no
+//!    compression. gRPC appends its own token after the application's, so
+//!    the JDBC driver sends `JDBC Flight SQL Driver 19.0.0
+//!    grpc-java-netty/1.x`. pyarrow shares the C++ stack and has the codecs;
+//!    it can ask for one with the header;
 //! 3. otherwise there is no override and `[coordinator] flight_compression`
 //!    applies.
 //!
@@ -52,12 +57,17 @@ pub fn compression_for_headers(headers: &http::HeaderMap) -> Option<FlightCompre
     {
         return Some(choice);
     }
-    let java = headers
+    let no_codec = headers
         .get(http::header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|ua| ua.contains("grpc-java"));
-    java.then_some(FlightCompression::None)
+        .is_some_and(|ua| NO_CODEC_AGENTS.iter().any(|a| ua.contains(a)));
+    no_codec.then_some(FlightCompression::None)
 }
+
+/// gRPC stacks whose stock Flight SQL drivers ship without LZ4/ZSTD: the
+/// Java client under the JDBC driver, and the C++ client under the ODBC
+/// driver (Arrow's Windows installer builds with both codecs off).
+const NO_CODEC_AGENTS: [&str; 2] = ["grpc-java", "grpc-c++"];
 
 /// Sets the per-request codec override; see the module docs.
 #[derive(Clone, Copy, Debug, Default)]
@@ -223,6 +233,15 @@ mod tests {
         let jdbc = "JDBC Flight SQL Driver 19.0.0 grpc-java-netty/1.73.0";
         let h = headers(&[("user-agent", jdbc)]);
         assert_eq!(compression_for_headers(&h), Some(FlightCompression::None));
+    }
+
+    #[test]
+    fn cpp_clients_get_no_compression_unless_they_ask() {
+        let odbc = "grpc-c++/1.71.0 grpc-c/46.0.0 (linux; chttp2)";
+        let h = headers(&[("user-agent", odbc)]);
+        assert_eq!(compression_for_headers(&h), Some(FlightCompression::None));
+        let h = headers(&[("user-agent", odbc), (COMPRESSION_HEADER, "lz4")]);
+        assert_eq!(compression_for_headers(&h), Some(FlightCompression::Lz4));
     }
 
     #[test]
