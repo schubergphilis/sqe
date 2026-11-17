@@ -81,13 +81,16 @@ struct FlightServer {
 
 impl FlightServer {
     async fn start() -> Self {
-        let polaris = mount_empty_polaris().await;
-        let config = smoke_config(&polaris.uri());
-        let tracker = Arc::new(QueryTracker::new(&config.query_history));
-
         // Any credentials authenticate. The subject here is the transport, not
         // the identity provider, which has its own tests.
         let provider = Arc::new(AnonymousProvider::new(AnonymousProviderConfig::default()));
+        Self::start_with(provider).await
+    }
+
+    async fn start_with(provider: Arc<dyn sqe_auth::AuthProvider>) -> Self {
+        let polaris = mount_empty_polaris().await;
+        let config = smoke_config(&polaris.uri());
+        let tracker = Arc::new(QueryTracker::new(&config.query_history));
         let session_manager = Arc::new(SessionManager::with_provider(provider));
 
         // The handler holds the same manager the service authenticates with,
@@ -496,4 +499,160 @@ async fn streamed_schema(
         .schema()
         .expect("the stream carries a schema")
         .clone()
+}
+
+/// A JWT-shaped bearer (it contains dots, so the per-call path hands it to the
+/// provider chain instead of looking it up as a session id).
+// nosemgrep: opt.aikido.semgrep-rules.generic.secrets.security.detected-jwt-token -- unsigned test fixture (alg none, sub dbeaver); only the test provider accepts it
+const GOOD_BEARER: &str = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJkYmVhdmVyIn0.sig";
+const BEARER_USER: &str = "bearer-user";
+
+/// Accepts `GOOD_BEARER`, rejects every other bearer, and takes any
+/// username and password, so one server covers both handshake kinds.
+struct OneBearerProvider;
+
+#[async_trait::async_trait]
+impl sqe_auth::AuthProvider for OneBearerProvider {
+    async fn authenticate(
+        &self,
+        credentials: &sqe_auth::FlightCredentials,
+    ) -> Result<sqe_auth::Identity, sqe_auth::AuthError> {
+        let user = match (&credentials.bearer_token, &credentials.username) {
+            (Some(token), _) if token.expose() == GOOD_BEARER => BEARER_USER.to_string(),
+            (Some(_), _) => {
+                return Err(sqe_auth::AuthError::AuthFailed("unknown token".into()));
+            }
+            (None, Some(username)) => username.clone(),
+            (None, None) => return Err(sqe_auth::AuthError::NotMyCredentials),
+        };
+        Ok(sqe_auth::Identity {
+            user_id: user.clone(),
+            roles: if user == BEARER_USER {
+                vec!["bearer-role".to_string()]
+            } else {
+                Vec::new()
+            },
+            display_name: user,
+            subject: None,
+            email: None,
+            groups: Vec::new(),
+            catalog_token: credentials.bearer_token.clone(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: Vec::new(),
+        })
+    }
+}
+
+/// A raw `Handshake` call with `authorization` set as given, the way a Flight
+/// SQL JDBC driver configured with a `token` sends it. Returns the session id
+/// from the reply's `authorization` header and checks the payload agrees.
+async fn raw_handshake(
+    server: &FlightServer,
+    authorization: &str,
+) -> Result<String, tonic::Status> {
+    use arrow_flight::flight_service_client::FlightServiceClient;
+    let mut raw = FlightServiceClient::new(server.channel().await);
+    let messages = futures::stream::iter(vec![arrow_flight::HandshakeRequest::default()]);
+    let mut request = tonic::Request::new(messages);
+    let value = authorization.parse().expect("ascii authorization header");
+    request.metadata_mut().insert("authorization", value);
+    let response = raw.handshake(request).await?;
+    let header = response
+        .metadata()
+        .get("authorization")
+        .expect("the handshake reply carries an authorization header")
+        .to_str()
+        .expect("ascii header")
+        .to_string();
+    let session_id = header
+        .strip_prefix("Bearer ")
+        .expect("the reply header is a bearer")
+        .to_string();
+    let first = response
+        .into_inner()
+        .try_next()
+        .await?
+        .expect("one handshake message");
+    assert_eq!(
+        first.payload.as_ref(),
+        session_id.as_bytes(),
+        "payload is the session id"
+    );
+    Ok(session_id)
+}
+
+/// Request 23: a client configured with a token handshakes with
+/// `Bearer <token>`. The handshake used to refuse anything but Basic, so the
+/// client never got as far as a statement.
+#[tokio::test(flavor = "multi_thread")]
+async fn bearer_handshake_returns_a_session_that_runs_statements() {
+    let server = FlightServer::start_with(Arc::new(OneBearerProvider)).await;
+    let session_id = raw_handshake(&server, &format!("Bearer {GOOD_BEARER}"))
+        .await
+        .expect("a valid bearer handshakes");
+    assert!(
+        !session_id.contains('.'),
+        "the reply is an SQE session id, not the JWT"
+    );
+
+    let mut client = FlightSqlServiceClient::new(server.channel().await);
+    client.set_token(session_id.clone());
+    // `current_user` is a reserved word the planner does not resolve, so the
+    // token's identity is observed through the role it alone carries.
+    let sql = "SELECT is_role_in_session('bearer-role') AS r";
+    let batches = query(&mut client, sql).await.expect("statement runs");
+    let batch = batches.iter().find(|b| b.num_rows() > 0).expect("one row");
+    let has_role = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::BooleanArray>()
+        .expect("is_role_in_session is Boolean")
+        .value(0);
+    assert!(has_role, "the statement runs as the token's user");
+
+    // Handshaking again with the session id hands back the same session.
+    let again = raw_handshake(&server, &format!("Bearer {session_id}"))
+        .await
+        .expect("a session-id bearer handshakes");
+    assert_eq!(again, session_id);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bearer_handshake_refuses_an_unknown_token() {
+    let server = FlightServer::start_with(Arc::new(OneBearerProvider)).await;
+    let bad = raw_handshake(&server, "Bearer eyJ.not.valid")
+        .await
+        .expect_err("an unknown JWT is refused");
+    assert_eq!(bad.code(), tonic::Code::Unauthenticated, "{bad:?}");
+
+    let unknown_session = raw_handshake(&server, "Bearer no-such-session")
+        .await
+        .expect_err("an unknown session id is refused");
+    assert_eq!(
+        unknown_session.code(),
+        tonic::Code::Unauthenticated,
+        "{unknown_session:?}"
+    );
+
+    let other = raw_handshake(&server, "Digest abc")
+        .await
+        .expect_err("other schemes stay refused");
+    assert_eq!(other.code(), tonic::Code::InvalidArgument, "{other:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn basic_handshake_still_works_next_to_bearer() {
+    let server = FlightServer::start_with(Arc::new(OneBearerProvider)).await;
+    let mut client = FlightSqlServiceClient::new(server.channel().await);
+    let token = client
+        .handshake("basic-user", "pw")
+        .await
+        .expect("Basic handshakes");
+    client.set_token(String::from_utf8(token.to_vec()).expect("token is utf-8"));
+    let batches = query(&mut client, "SELECT 1 + 1 AS answer")
+        .await
+        .expect("statement runs");
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 1);
 }
