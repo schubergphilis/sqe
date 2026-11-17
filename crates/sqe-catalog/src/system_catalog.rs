@@ -92,3 +92,211 @@ impl CatalogProvider for SystemCatalogProvider {
         }
     }
 }
+
+/// The catalog registered as `system` (#901): SQE's virtual schemas, plus a
+/// Polaris catalog named `system` for every other schema when one exists.
+///
+/// Routing uses [`sqe_core::system_catalog::is_reserved_system_schema`], the
+/// same predicate the policy rewriter uses to skip tag lookups, so a schema
+/// the policy layer treats as virtual can never come from Polaris. A Polaris
+/// namespace with a reserved name is hidden.
+///
+/// The Polaris part is set at most once: at session build when the catalog is
+/// configured or is the session's discovered catalog, or later by lazy
+/// discovery on a cached session ([`Self::attach_polaris`]).
+#[derive(Debug)]
+pub struct SystemCompositeProvider {
+    virtual_: Arc<dyn CatalogProvider>,
+    polaris: std::sync::OnceLock<Arc<dyn CatalogProvider>>,
+}
+
+impl SystemCompositeProvider {
+    pub fn new(
+        virtual_: Arc<dyn CatalogProvider>,
+        polaris: Option<Arc<dyn CatalogProvider>>,
+    ) -> Self {
+        let cell = std::sync::OnceLock::new();
+        if let Some(p) = polaris {
+            let _ = cell.set(p);
+        }
+        Self {
+            virtual_,
+            polaris: cell,
+        }
+    }
+
+    /// Set the Polaris part. False when one was already set (the first wins).
+    pub fn attach_polaris(&self, polaris: Arc<dyn CatalogProvider>) -> bool {
+        self.polaris.set(polaris).is_ok()
+    }
+
+    pub fn has_polaris(&self) -> bool {
+        self.polaris.get().is_some()
+    }
+
+    /// The Polaris catalog `system`, when one is attached.
+    pub fn polaris(&self) -> Option<&Arc<dyn CatalogProvider>> {
+        self.polaris.get()
+    }
+}
+
+fn reserved_schema_error(name: &str) -> datafusion::error::DataFusionError {
+    datafusion::error::DataFusionError::Plan(format!(
+        "schema name `{name}` is reserved in catalog `system` (reserved: {})",
+        sqe_core::system_catalog::RESERVED_SYSTEM_SCHEMAS.join(", ")
+    ))
+}
+
+impl CatalogProvider for SystemCompositeProvider {
+    fn schema_names(&self) -> Vec<String> {
+        let mut names = self.virtual_.schema_names();
+        if let Some(p) = self.polaris.get() {
+            names.extend(
+                p.schema_names()
+                    .into_iter()
+                    .filter(|n| !sqe_core::system_catalog::is_reserved_system_schema(n)),
+            );
+        }
+        names
+    }
+
+    fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+        if sqe_core::system_catalog::is_reserved_system_schema(name) {
+            return self.virtual_.schema(name);
+        }
+        self.polaris.get().and_then(|p| p.schema(name))
+    }
+
+    fn register_schema(
+        &self,
+        name: &str,
+        schema: Arc<dyn SchemaProvider>,
+    ) -> datafusion::error::Result<Option<Arc<dyn SchemaProvider>>> {
+        if sqe_core::system_catalog::is_reserved_system_schema(name) {
+            return Err(reserved_schema_error(name));
+        }
+        match self.polaris.get() {
+            Some(p) => p.register_schema(name, schema),
+            None => datafusion::common::not_impl_err!(
+                "catalog `system` has no Polaris catalog to create schema `{name}` in"
+            ),
+        }
+    }
+
+    fn deregister_schema(
+        &self,
+        name: &str,
+        cascade: bool,
+    ) -> datafusion::error::Result<Option<Arc<dyn SchemaProvider>>> {
+        if sqe_core::system_catalog::is_reserved_system_schema(name) {
+            return Err(reserved_schema_error(name));
+        }
+        match self.polaris.get() {
+            Some(p) => p.deregister_schema(name, cascade),
+            None => Ok(None),
+        }
+    }
+}
+
+#[cfg(test)]
+mod composite_tests {
+    use super::*;
+    use datafusion::catalog::{MemoryCatalogProvider, MemorySchemaProvider};
+
+    fn polaris_with(names: &[&str]) -> Arc<dyn CatalogProvider> {
+        let p = MemoryCatalogProvider::new();
+        for n in names {
+            p.register_schema(n, Arc::new(MemorySchemaProvider::new()))
+                .unwrap();
+        }
+        Arc::new(p)
+    }
+
+    fn virtual_with_runtime() -> (Arc<dyn CatalogProvider>, Arc<dyn SchemaProvider>) {
+        let runtime: Arc<dyn SchemaProvider> = Arc::new(MemorySchemaProvider::new());
+        let v = SystemCatalogProvider::new(vec![]).with_runtime(Arc::clone(&runtime));
+        (Arc::new(v), runtime)
+    }
+
+    #[test]
+    fn reserved_names_go_to_the_virtual_part_only() {
+        let (v, runtime) = virtual_with_runtime();
+        // Polaris carries a namespace for every reserved name and its case
+        // variants: none may ever be returned.
+        let mut shadow: Vec<String> = Vec::new();
+        for r in sqe_core::system_catalog::RESERVED_SYSTEM_SCHEMAS {
+            shadow.push(r.to_string());
+            shadow.push(r.to_ascii_uppercase());
+        }
+        let shadow_refs: Vec<&str> = shadow.iter().map(String::as_str).collect();
+        let mut all = shadow_refs.clone();
+        all.push("access");
+        let polaris = polaris_with(&all);
+        let c = SystemCompositeProvider::new(v, Some(Arc::clone(&polaris)));
+
+        let got = c.schema("runtime").expect("runtime");
+        assert!(
+            Arc::ptr_eq(&got, &runtime),
+            "runtime must be the virtual one"
+        );
+        for name in &shadow_refs {
+            if let Some(s) = c.schema(name) {
+                let from_polaris = polaris.schema(name).expect("seeded");
+                assert!(!Arc::ptr_eq(&s, &from_polaris), "{name} came from Polaris");
+            }
+        }
+        assert!(c.schema("access").is_some());
+
+        let names = c.schema_names();
+        assert!(names.contains(&"access".to_string()), "{names:?}");
+        assert!(names.contains(&"runtime".to_string()), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n == "RUNTIME" || n == "JDBC"),
+            "{names:?}"
+        );
+        assert_eq!(
+            names.iter().filter(|n| *n == "runtime").count(),
+            1,
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn without_polaris_it_is_the_virtual_catalog() {
+        let (v, _) = virtual_with_runtime();
+        let expected = v.schema_names();
+        let c = SystemCompositeProvider::new(v, None);
+        assert_eq!(c.schema_names(), expected);
+        assert!(c.schema("access").is_none());
+        assert!(c.schema("jdbc").is_some());
+    }
+
+    #[test]
+    fn reserved_schemas_cannot_be_registered_or_dropped() {
+        let (v, _) = virtual_with_runtime();
+        let c = SystemCompositeProvider::new(v, Some(polaris_with(&[])));
+        let err = c
+            .register_schema("Runtime", Arc::new(MemorySchemaProvider::new()))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("reserved in catalog `system`"),
+            "{err}"
+        );
+        assert!(c.deregister_schema("jdbc", true).is_err());
+        assert!(c
+            .register_schema("access", Arc::new(MemorySchemaProvider::new()))
+            .is_ok());
+        assert!(c.schema("access").is_some());
+    }
+
+    #[test]
+    fn polaris_is_attached_once() {
+        let (v, _) = virtual_with_runtime();
+        let c = SystemCompositeProvider::new(v, None);
+        assert!(!c.has_polaris());
+        assert!(c.attach_polaris(polaris_with(&["access"])));
+        assert!(!c.attach_polaris(polaris_with(&["other"])));
+        assert!(c.schema("access").is_some());
+        assert!(c.schema("other").is_none());
+    }
+}

@@ -28,8 +28,10 @@ struct JdbcTypeRow {
 
 /// DataFusion `SchemaProvider` for the virtual `system.jdbc` schema.
 ///
-/// Exposes JDBC metadata tables (`types`, `catalogs`, `schemas`, `tables`, `columns`)
-/// required by Trino JDBC drivers (e.g. DBeaver) for metadata browsing.
+/// Exposes every table the Trino JDBC driver reads for metadata browsing
+/// (DBeaver and other JDBC tools): `types`, `catalogs`, `schemas`, `tables`
+/// (tables and views), `columns`, `table_types`, and the always-empty
+/// tables in [`EMPTY_TABLES`].
 pub struct JdbcSchemaProvider {
     /// Every catalog the session can reach (primary/default first, then the
     /// other configured catalogs and the session's own, deduplicated by name).
@@ -56,19 +58,22 @@ pub(crate) fn dedup_entries(entries: Vec<SystemCatalogEntry>) -> Vec<SystemCatal
         .collect()
 }
 
-/// List a single catalog's namespaces as dotted strings; `[]` on error
-/// (unauthorized / unreachable catalog), so enumeration skips it rather than
-/// aborting the whole metadata listing.
-async fn list_namespaces_for(catalog: &SessionCatalog) -> DFResult<Vec<String>> {
+/// List a single catalog's namespaces as (dotted name, ident) pairs; `[]` when
+/// the principal may not list the catalog, so enumeration skips it rather
+/// than aborting the whole metadata listing. The ident keeps the namespace
+/// parts, so a nested namespace is not looked up as one dotted level.
+async fn list_namespaces_for(catalog: &SessionCatalog) -> DFResult<Vec<(String, NamespaceIdent)>> {
     match catalog.list_namespaces().await {
         Ok(namespaces) => Ok(namespaces
-            .iter()
+            .into_iter()
             .map(|ns| {
-                ns.as_ref()
+                let dotted = ns
+                    .as_ref()
                     .iter()
                     .map(|s| s.as_str())
                     .collect::<Vec<_>>()
-                    .join(".")
+                    .join(".");
+                (dotted, ns)
             })
             .collect()),
         Err(e) if listing_error_is_forbidden(&e) => {
@@ -91,25 +96,35 @@ impl std::fmt::Debug for JdbcSchemaProvider {
 #[async_trait]
 impl SchemaProvider for JdbcSchemaProvider {
     fn table_names(&self) -> Vec<String> {
-        vec![
-            "types".into(),
-            "catalogs".into(),
-            "schemas".into(),
-            "tables".into(),
-            "columns".into(),
-        ]
+        let listed = [
+            "types",
+            "catalogs",
+            "schemas",
+            "tables",
+            "columns",
+            "table_types",
+        ];
+        listed
+            .into_iter()
+            .chain(EMPTY_TABLES.iter().map(|(name, _)| *name))
+            .map(String::from)
+            .collect()
     }
 
     fn table_exist(&self, name: &str) -> bool {
         matches!(
             name,
-            "types" | "catalogs" | "schemas" | "tables" | "columns"
-        )
+            "types" | "catalogs" | "schemas" | "tables" | "columns" | "table_types"
+        ) || EMPTY_TABLES.iter().any(|(n, _)| *n == name)
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        if let Some((_, columns)) = EMPTY_TABLES.iter().find(|(n, _)| *n == name) {
+            return Ok(Some(build_empty_table(columns)?));
+        }
         match name {
             "types" => Ok(Some(build_types_table()?)),
+            "table_types" => Ok(Some(build_table_types_table()?)),
             "catalogs" => {
                 let names: Vec<String> = self.catalogs.iter().map(|e| e.name.clone()).collect();
                 Ok(Some(build_catalogs_table(&names)?))
@@ -137,7 +152,7 @@ impl JdbcSchemaProvider {
             schem_builder.append_value("information_schema");
             catalog_builder.append_value(&entry.name);
 
-            for ns in list_namespaces_for(&entry.catalog).await? {
+            for (ns, _) in list_namespaces_for(&entry.catalog).await? {
                 schem_builder.append_value(&ns);
                 catalog_builder.append_value(&entry.name);
             }
@@ -180,29 +195,42 @@ impl JdbcSchemaProvider {
         let mut ref_gen_b = StringBuilder::new();
 
         for entry in &self.catalogs {
-            for ns in list_namespaces_for(&entry.catalog).await? {
-                let ns_ident = NamespaceIdent::new(ns.clone());
+            for (ns, ns_ident) in list_namespaces_for(&entry.catalog).await? {
+                let mut rows: Vec<(String, &'static str)> = Vec::new();
                 match entry.catalog.list_tables(&ns_ident).await {
                     Ok(tables) => {
-                        for table in &tables {
-                            cat_b.append_value(&entry.name);
-                            schem_b.append_value(&ns);
-                            name_b.append_value(table.name());
-                            type_b.append_value("TABLE");
-                            remarks_b.append_null();
-                            type_cat_b.append_null();
-                            type_schem_b.append_null();
-                            type_name_b.append_null();
-                            self_ref_b.append_null();
-                            ref_gen_b.append_null();
-                        }
+                        rows.extend(tables.iter().map(|t| (t.name().to_string(), "TABLE")))
                     }
                     Err(e) if listing_error_is_forbidden(&e) => {
                         debug!(catalog = %entry.name, namespace = %ns, "system.jdbc.tables: skipping namespace the principal is not authorized to list");
+                        continue;
                     }
                     Err(e) => {
                         return Err(DataFusionError::External(Box::new(e)));
                     }
+                }
+                // Views live only behind the REST catalog's view endpoints.
+                // A failed view listing drops the views, never the tables,
+                // as SHOW VIEWS and information_schema do.
+                if entry.catalog.is_rest_backend() {
+                    match entry.catalog.list_views(&ns_ident).await {
+                        Ok(views) => rows.extend(views.into_iter().map(|v| (v, "VIEW"))),
+                        Err(e) => {
+                            debug!(catalog = %entry.name, namespace = %ns, error = %e, "system.jdbc.tables: skipping views the principal cannot list");
+                        }
+                    }
+                }
+                for (name, kind) in &rows {
+                    cat_b.append_value(&entry.name);
+                    schem_b.append_value(&ns);
+                    name_b.append_value(name);
+                    type_b.append_value(kind);
+                    remarks_b.append_null();
+                    type_cat_b.append_null();
+                    type_schem_b.append_null();
+                    type_name_b.append_null();
+                    self_ref_b.append_null();
+                    ref_gen_b.append_null();
                 }
             }
         }
@@ -281,8 +309,7 @@ impl JdbcSchemaProvider {
         let mut is_gen_b = StringBuilder::new();
 
         for entry in &self.catalogs {
-            for ns in list_namespaces_for(&entry.catalog).await? {
-                let ns_ident = NamespaceIdent::new(ns.clone());
+            for (ns, ns_ident) in list_namespaces_for(&entry.catalog).await? {
                 let tables = match entry.catalog.list_tables(&ns_ident).await {
                     Ok(t) => t,
                     Err(e) if listing_error_is_forbidden(&e) => {
@@ -606,6 +633,50 @@ fn build_types_table() -> DFResult<Arc<dyn TableProvider>> {
     Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
 }
 
+/// Build `system.jdbc.table_types`: the table types `system.jdbc.tables`
+/// can report. The Trino driver's `getTableTypes()` reads it, and DBeaver
+/// asks for it before it lists a schema's tables.
+fn build_table_types_table() -> DFResult<Arc<dyn TableProvider>> {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "table_type",
+        DataType::Utf8,
+        false,
+    )]));
+    let mut type_b = StringBuilder::new();
+    type_b.append_value("TABLE");
+    type_b.append_value("VIEW");
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(type_b.finish()) as ArrayRef])?;
+    Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+}
+
+/// `system.jdbc` tables SQE has no rows for (no procedures, user-defined
+/// types or type hierarchies). The Trino driver still queries them (with
+/// `LIMIT 0`) for `getProcedures()`, `getUDTs()` and the rest, so a missing
+/// table fails the JDBC call. The columns are the ones the driver selects,
+/// in its order; a `#` marks a `bigint` column, the rest are `varchar`.
+const EMPTY_TABLES: &[(&str, &str)] = &[
+    ("procedures", "procedure_cat procedure_schem procedure_name remarks #procedure_type specific_name"),
+    ("procedure_columns", "procedure_cat procedure_schem procedure_name column_name #column_type #data_type type_name #precision #length #scale #radix #nullable remarks column_def #sql_data_type #sql_datetime_sub #char_octet_length #ordinal_position is_nullable specific_name"),
+    ("udts", "type_cat type_schem type_name class_name #data_type remarks #base_type"),
+    ("super_types", "type_cat type_schem type_name supertype_cat supertype_schem supertype_name"),
+    ("super_tables", "table_cat table_schem table_name supertable_name"),
+    ("attributes", "type_cat type_schem type_name attr_name #data_type attr_type_name #attr_size #decimal_digits #num_prec_radix #nullable remarks attr_def #sql_data_type #sql_datetime_sub #char_octet_length #ordinal_position is_nullable scope_catalog scope_schema scope_table #source_data_type"),
+    ("pseudo_columns", "table_cat table_schem table_name column_name #data_type #column_size #decimal_digits #num_prec_radix column_usage remarks #char_octet_length is_nullable"),
+];
+
+/// Build an empty table from an [`EMPTY_TABLES`] column spec.
+fn build_empty_table(columns: &str) -> DFResult<Arc<dyn TableProvider>> {
+    let fields: Vec<Field> = columns
+        .split_whitespace()
+        .map(|c| match c.strip_prefix('#') {
+            Some(name) => Field::new(name, DataType::Int64, true),
+            None => Field::new(c, DataType::Utf8, true),
+        })
+        .collect();
+    let schema = Arc::new(Schema::new(fields));
+    Ok(Arc::new(MemTable::try_new(schema, vec![vec![]])?))
+}
+
 /// Build the `system.jdbc.catalogs` table, one row per catalog the session
 /// can see (JDBC `getCatalogs()` shape: a single `table_cat` column).
 fn build_catalogs_table(catalogs: &[String]) -> DFResult<Arc<dyn TableProvider>> {
@@ -684,6 +755,36 @@ mod tests {
             build_catalogs_table(&["main_warehouse".to_string(), "ws_energy_co".to_string()])
                 .unwrap();
         assert_eq!(table.schema().field(0).name(), "table_cat");
+    }
+
+    #[tokio::test]
+    async fn every_table_the_trino_driver_reads_exists() {
+        // TrinoDatabaseMetaData reads these 13 tables; a missing one fails
+        // the JDBC call (getTableTypes, getProcedures, ...), and DBeaver
+        // then shows no tables.
+        let provider = JdbcSchemaProvider::new(Vec::new());
+        let read_by_driver = [
+            "catalogs",
+            "schemas",
+            "tables",
+            "columns",
+            "types",
+            "table_types",
+            "procedures",
+            "procedure_columns",
+            "udts",
+            "super_types",
+            "super_tables",
+            "attributes",
+            "pseudo_columns",
+        ];
+        let names = provider.table_names();
+        for name in read_by_driver {
+            assert!(provider.table_exist(name), "{name} missing");
+            assert!(names.iter().any(|n| n == name), "{name} not listed");
+            assert!(provider.table(name).await.unwrap().is_some(), "{name}");
+        }
+        assert_eq!(names.len(), read_by_driver.len());
     }
 
     #[test]

@@ -1133,6 +1133,13 @@ async fn call_tool(
         Ok(batches) => {
             let batches = if show_catalogs {
                 strip_phantom_catalogs(batches, &state.hive_roots)
+            } else if name == "list_schemas" {
+                // SQE's virtual schemas under `system` are not an MCP
+                // surface; a Polaris catalog `system`'s schemas are (#901).
+                let catalog = required(&args, "catalog")?;
+                retain_first_column(batches, |s| {
+                    !sqe_core::system_catalog::is_virtual_system_ref(catalog, s)
+                })
             } else {
                 batches
             };
@@ -1249,8 +1256,24 @@ async fn list_catalogs_with_diagnostics(
     state: &McpServerState,
     session: &Session,
 ) -> Result<Value, (i32, String)> {
-    let batches = match state.executor.execute_metadata(session, "SHOW CATALOGS").await {
-        Ok(batches) => strip_phantom_catalogs(batches, &state.hive_roots),
+    let batches = match state
+        .executor
+        .execute_metadata(session, "SHOW CATALOGS")
+        .await
+    {
+        Ok(batches) => {
+            // `system` is listed only when a Polaris catalog of that name
+            // gives it schemas an agent may read (#901); SQE's virtual
+            // schemas under it are not an MCP surface.
+            let mut real: Vec<String> = state.hive_roots.to_vec();
+            let lists_system = first_column_strings(&batches)
+                .iter()
+                .any(|n| n == sqe_core::system_catalog::SYSTEM_CATALOG);
+            if lists_system && !polaris_system_schemas(state, session).await.is_empty() {
+                real.push(sqe_core::system_catalog::SYSTEM_CATALOG.to_string());
+            }
+            strip_phantom_catalogs(batches, &real)
+        }
         Err(error) => return Ok(tool_failure(error.to_string())),
     };
     let visible = first_column_strings(&batches);
@@ -1353,26 +1376,54 @@ async fn list_catalogs_with_diagnostics(
 /// of these names is real and kept.
 // ponytail: a REST catalog literally named `default` is dropped too; pass
 // the configured names into the state if a deployment ever does that.
+// `system` is kept when a Polaris catalog of that name has schemas (#901).
 const PHANTOM_CATALOGS: [&str; 3] = ["default", "datafusion", "system"];
 
+/// The schemas of a Polaris catalog `system` the caller can list: `SHOW
+/// SCHEMAS FROM system` minus SQE's virtual schemas (#901). Empty when there
+/// is no such catalog, the caller may not list it, or it does not answer
+/// within [`CATALOG_PROBE_TIMEOUT`].
+async fn polaris_system_schemas(state: &McpServerState, session: &Session) -> Vec<String> {
+    let sql = format!(
+        "SHOW SCHEMAS FROM {}",
+        ident(sqe_core::system_catalog::SYSTEM_CATALOG)
+    );
+    let probe = tokio::time::timeout(
+        CATALOG_PROBE_TIMEOUT,
+        state.executor.execute_metadata(session, &sql),
+    );
+    match probe.await {
+        Ok(Ok(batches)) => first_column_strings(&batches)
+            .into_iter()
+            .filter(|s| !sqe_core::system_catalog::is_reserved_system_schema(s))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn strip_phantom_catalogs(batches: Vec<RecordBatch>, hive_roots: &[String]) -> Vec<RecordBatch> {
-    let is_phantom = |name: &str| {
-        PHANTOM_CATALOGS
+    retain_first_column(batches, |name| {
+        !PHANTOM_CATALOGS
             .iter()
             .any(|p| name.eq_ignore_ascii_case(p))
-            && !hive_roots.iter().any(|r| name.eq_ignore_ascii_case(r))
-    };
+            || hive_roots.iter().any(|r| name.eq_ignore_ascii_case(r))
+    })
+}
+
+/// Rows of single-string-column listings (`SHOW CATALOGS`, `SHOW SCHEMAS`)
+/// whose name `keep` accepts. A batch of another shape passes unchanged.
+fn retain_first_column(batches: Vec<RecordBatch>, keep: impl Fn(&str) -> bool) -> Vec<RecordBatch> {
     batches
         .into_iter()
         .filter_map(|batch| {
             let names = first_column_strings(std::slice::from_ref(&batch));
-            if names.len() != batch.num_rows() || !names.iter().any(|n| is_phantom(n)) {
+            if names.len() != batch.num_rows() || names.iter().all(|n| keep(n)) {
                 return Some(batch);
             }
             let kept: Vec<&str> = names
                 .iter()
                 .map(String::as_str)
-                .filter(|n| !is_phantom(n))
+                .filter(|n| keep(n))
                 .collect();
             let mut columns: Vec<arrow_array::ArrayRef> = batch.columns().to_vec();
             columns[0] = Arc::new(arrow_array::StringArray::from(kept));
@@ -1506,8 +1557,11 @@ async fn list_tables(
 ) -> Result<Value, (i32, String)> {
     let catalog = required(args, "catalog")?;
     let schema = required(args, "schema")?;
+    refuse_virtual_system(catalog, schema)?;
     let sql = format!("SHOW TABLES FROM {}.{}", ident(catalog), ident(schema));
-    let names = state.executor.execute_metadata(session, &sql)
+    let names = state
+        .executor
+        .execute_metadata(session, &sql)
         .await
         .map_err(|e| (-32000, e.to_string()))?;
     let kinds = table_kinds(state, session, catalog, schema).await;
@@ -1596,6 +1650,7 @@ async fn search_tables(
     let mut all_schemas: Vec<String> = first_column_strings(&schemas)
         .into_iter()
         .filter(|s| !s.eq_ignore_ascii_case("information_schema"))
+        .filter(|s| !sqe_core::system_catalog::is_virtual_system_ref(&catalog, s))
         .collect();
     all_schemas.sort();
     let mut skipped: Vec<Value> = all_schemas
@@ -1739,6 +1794,7 @@ async fn describe_schema(
 
     let catalog = required(args, "catalog")?.to_string();
     let schema = required(args, "schema")?.to_string();
+    refuse_virtual_system(&catalog, &schema)?;
     let include_stats = bool_arg(args, "include_stats")?;
     let include_queryability = bool_arg(args, "include_queryability")?;
     let page_size = page_size_arg(args)?;
@@ -2059,10 +2115,22 @@ fn required<'a>(args: &'a Value, name: &str) -> Result<&'a str, (i32, String)> {
 fn ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
-fn table_ref(args: &Value) -> Result<String, (i32, String)> {
-    if required(args, "catalog")?.eq_ignore_ascii_case("system") {
-        return Err((-32602, "the system catalog is not an MCP surface".to_string()));
+/// SQE's virtual `system` schemas are not an MCP surface; a Polaris catalog
+/// `system` is (#901). The catalog is folded first: a denylist may be wider
+/// than the engine's routing (which matches `system` exactly), never narrower.
+fn refuse_virtual_system(catalog: &str, schema: &str) -> Result<(), (i32, String)> {
+    let catalog = catalog.to_ascii_lowercase();
+    if sqe_core::system_catalog::is_virtual_system_ref(&catalog, schema) {
+        return Err((
+            -32602,
+            format!("{catalog}.{schema} is a system schema, not an MCP surface"),
+        ));
     }
+    Ok(())
+}
+
+fn table_ref(args: &Value) -> Result<String, (i32, String)> {
+    refuse_virtual_system(required(args, "catalog")?, required(args, "schema")?)?;
     Ok(format!(
         "{}.{}.{}",
         ident(required(args, "catalog")?),
@@ -2196,7 +2264,16 @@ fn denied_relation(name: &sqlparser::ast::ObjectName) -> Option<String> {
             first.value
         ));
     }
-    if name.0.len() > 1 && first.value.eq_ignore_ascii_case("system") {
+    // `system.<schema>.t` is refused only for SQE's virtual schemas; any other
+    // schema is a Polaris catalog `system`, governed like every catalog
+    // (#901). The catalog is matched without regard to case or quotes: a
+    // denylist may be wider than the engine's routing, never narrower.
+    let names_system = first.value.eq_ignore_ascii_case("system");
+    let virtual_schema = match name.0.get(1).and_then(|p| p.as_ident()) {
+        Some(schema) => sqe_core::system_catalog::is_reserved_system_schema(&schema.value),
+        None => false,
+    };
+    if names_system && (name.0.len() == 2 || virtual_schema) {
         return Some(format!(
             "system catalog table {name}; the runtime views are an operator surface"
         ));
@@ -2982,13 +3059,34 @@ mod tests {
             "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM system.runtime.queries)",
         ] {
             let err = ensure_read_only(sql, None).expect_err(sql);
-            assert!(err.contains("Read-only tool rejected system catalog"), "{sql}: {err}");
+            assert!(
+                err.contains("Read-only tool rejected system catalog"),
+                "{sql}: {err}"
+            );
         }
-        ensure_read_only("SELECT * FROM system", None).expect("a table named system is not the catalog");
-        ensure_read_only("SELECT * FROM iceberg.system.t", None).expect("a schema named system is fine");
-        let err = table_ref(&json!({"catalog": "System", "schema": "runtime", "table": "queries"}))
+        ensure_read_only("SELECT * FROM system", None)
+            .expect("a table named system is not the catalog");
+        ensure_read_only("SELECT * FROM iceberg.system.t", None)
+            .expect("a schema named system is fine");
+        let err = table_ref(&json!({"catalog": "System", "schema": "RUNTIME", "table": "queries"}))
             .expect_err("sample_rows shares the gate");
         assert_eq!(err.0, -32602);
+    }
+
+    #[test]
+    fn polaris_system_catalog_is_an_mcp_surface() {
+        // #901: only SQE's virtual schemas under `system` are refused; any
+        // other schema is a Polaris catalog `system`, governed as usual.
+        ensure_read_only("SELECT * FROM system.access.audit", None)
+            .expect("a Polaris system schema is a catalog table");
+        let err = ensure_read_only("SELECT * FROM system.metadata.table_properties", None)
+            .expect_err("virtual schema");
+        assert!(
+            err.contains("Read-only tool rejected system catalog"),
+            "{err}"
+        );
+        table_ref(&json!({"catalog": "system", "schema": "access", "table": "audit"}))
+            .expect("Polaris system table");
     }
 
     #[test]
@@ -4309,24 +4407,43 @@ mod tests {
     /// statement can name, unless one is a configured Hive root.
     #[tokio::test]
     async fn list_catalogs_drops_phantom_catalog_names_unless_they_are_hive_roots() {
+        // No Polaris catalog `system`: its schema listing fails.
         let executor = Arc::new(ProbeExecutor {
             catalogs: vec!["default", "glue", "datafusion", "system"],
-            schema_errors: HashMap::new(),
+            schema_errors: HashMap::from([(
+                "SHOW SCHEMAS FROM \"system\"",
+                SqeError::Execution("Catalog 'system' does not exist".into()),
+            )]),
         });
         let state = McpServerState::new(Arc::new(MockAuth), executor, static_config(false))
             .with_hive_roots(vec!["glue".into()]);
         let session = local_session("mcp-reader".into(), vec![]);
+        let names = |body: &Value| -> Vec<String> {
+            body["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["Catalog"].as_str().unwrap().to_string())
+                .collect()
+        };
         let body = list_catalogs_with_diagnostics(&state, &session)
             .await
             .unwrap()["structuredContent"]
             .clone();
-        let names: Vec<&str> = body["rows"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|r| r["Catalog"].as_str().unwrap())
-            .collect();
-        assert_eq!(names, vec!["glue"], "{body}");
+        assert_eq!(names(&body), vec!["glue"], "{body}");
+
+        // #901: a Polaris catalog `system` with a readable schema is listed.
+        let executor = Arc::new(ProbeExecutor {
+            catalogs: vec!["glue", "system"],
+            schema_errors: HashMap::new(),
+        });
+        let state = McpServerState::new(Arc::new(MockAuth), executor, static_config(false))
+            .with_hive_roots(vec!["glue".into()]);
+        let body = list_catalogs_with_diagnostics(&state, &session)
+            .await
+            .unwrap()["structuredContent"]
+            .clone();
+        assert_eq!(names(&body), vec!["glue", "system"], "{body}");
 
         // A Hive root that happens to be called `default` is real and stays.
         let executor = Arc::new(ProbeExecutor {

@@ -10,6 +10,8 @@
 
 `sqe-catalog` exports `RESERVED_SYSTEM_SCHEMAS = ["runtime", "metadata", "jdbc", "information_schema"]` and `fn is_virtual_system_ref(catalog, schema) -> bool` (ASCII case-insensitive, like DataFusion's identifier fold). Every place that today tests `catalog == "system"` calls it instead: the policy rewriter, `qualify`, the result cache, the Polaris load check, Trino compat and MCP. A grep gate in the tasks lists every `"system"` literal and each one is either moved to the helper or justified.
 
+As built: the helper lives in `sqe-core::system_catalog`, not `sqe-catalog`, because `sqe-policy`, `sqe-sql`, `sqe-mcp` and `sqe-trino-compat` need it and must not depend on `sqe-catalog`. The schema matches ASCII case-insensitively. The catalog matches exactly (`system`), like DataFusion's catalog lookup after the unquoted-identifier fold: a quoted `"SYSTEM"` is a different catalog. The MCP denylist folds the catalog too, because a denylist may be wider than routing but never narrower. `ATTACH ... AS system` (and `AS datafusion`) is refused, so the only Polaris part of `system` is the one discovery finds. The Polaris part is looked up only with `catalog_discovery = "polaris-auto"`; in static mode `system` stays virtual-only.
+
 `is_reserved_virtual_ref` keeps returning true for the `datafusion` catalog and for `information_schema` in any catalog; for `system` it returns true only for the reserved schemas. This is fail-closed in the direction that matters: a `system.access.audit` reference now goes through every policy step.
 
 ### D2. Composite provider, virtual first

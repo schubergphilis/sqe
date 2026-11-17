@@ -355,6 +355,25 @@ impl QueryHandler {
         )]));
         let mut builder = StringBuilder::new();
 
+        // `system` is SQE's virtual schemas plus, when one exists, a Polaris
+        // catalog of that name (#901). List both; a Polaris namespace with a
+        // reserved name is shadowed, so it is not listed.
+        if catalog.as_deref() == Some(sqe_core::system_catalog::SYSTEM_CATALOG) {
+            for name in self.system_schema_names(session).await? {
+                if keep(&name) {
+                    builder.append_value(name);
+                }
+            }
+            let array: ArrayRef = Arc::new(builder.finish());
+            let batch = RecordBatch::try_new(schema, vec![array]).map_err(|e| {
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Failed to create result batch: {e}"),
+                )
+            })?;
+            return Ok(vec![batch]);
+        }
+
         // A Hive root is not an Iceberg catalog: `show_catalog` knows
         // `[catalogs.*]` and Polaris discovery only, so a root's name would
         // fail as "Unknown catalog" while `SHOW TABLES FROM <root>.<db>`
@@ -440,6 +459,40 @@ impl QueryHandler {
         self.columns_for_table(session, &table_name).await
     }
 
+    /// The schemas of the `system` catalog: the virtual ones (`jdbc`,
+    /// `metadata`, `runtime`), then the namespaces of a Polaris catalog
+    /// `system` the caller may list (#901). No Polaris catalog `system`, or
+    /// one the caller may not list: the virtual schemas only.
+    async fn system_schema_names(&self, session: &Session) -> sqe_core::Result<Vec<String>> {
+        use sqe_core::system_catalog::{is_reserved_system_schema, SYSTEM_CATALOG};
+        let mut names: Vec<String> = vec!["jdbc".into(), "metadata".into(), "runtime".into()];
+        if self.config.query.catalog_discovery != sqe_core::config::CatalogDiscovery::PolarisAuto {
+            return Ok(names);
+        }
+        let polaris = crate::session_context::discover_session_catalog(
+            SYSTEM_CATALOG,
+            &self.config,
+            session,
+            self.table_cache.as_ref(),
+        )
+        .await;
+        let Some(polaris) = polaris else {
+            return Ok(names);
+        };
+        let namespaces = match polaris.list_namespaces().await {
+            Ok(ns) => ns,
+            Err(e) if e.is_not_found() => Vec::new(),
+            Err(e) => namespaces_or_empty_on_denial(Err(e))?,
+        };
+        names.extend(
+            namespaces
+                .iter()
+                .map(|ns| ns.as_ref().join("."))
+                .filter(|n| !is_reserved_system_schema(n)),
+        );
+        Ok(names)
+    }
+
     /// Column metadata for a table via `information_schema.columns`, shared by
     /// `SHOW COLUMNS` and `DESCRIBE <table>`.
     pub(super) async fn columns_for_table(
@@ -466,6 +519,15 @@ impl QueryHandler {
         self.deny_hidden_table(session, table_name).await?;
 
         let (ctx, session_catalog) = self.create_session_context(session).await?;
+        // `system.<schema>.t` outside the virtual schemas is a table of a
+        // Polaris catalog `system`, attached to the composite on demand (#901).
+        if let [catalog, schema, _] = parts.as_slice() {
+            if catalog == sqe_core::system_catalog::SYSTEM_CATALOG
+                && !sqe_core::system_catalog::is_reserved_system_schema(schema)
+            {
+                self.attach_polaris_system(&ctx, session).await;
+            }
+        }
         // The schema lookups serve snapshots (review 806); fill the ones
         // this name touches first.
         let probe = format!("SELECT * FROM {table_name}");
@@ -600,6 +662,40 @@ impl QueryHandler {
         let (filter, like) = ShowLike::split(filter);
         let keep = |name: &str| like.as_ref().is_none_or(|l| l.matches(name));
         let catalog = show_tables_catalog(filter);
+        // A virtual `system` schema is listed from SQE's own provider, never
+        // from a Polaris catalog `system`, whose namespace of the same name
+        // the composite shadows (#901).
+        if catalog.as_deref() == Some(sqe_core::system_catalog::SYSTEM_CATALOG) {
+            if let Some(ns) = parse_show_tables_namespace(filter)
+                .filter(|ns| sqe_core::system_catalog::is_reserved_system_schema(ns))
+            {
+                let (ctx, _) = self.create_session_context(session).await?;
+                let mut names: Vec<String> = ctx
+                    .catalog(sqe_core::system_catalog::SYSTEM_CATALOG)
+                    .and_then(|c| c.schema(&ns.to_ascii_lowercase()))
+                    .map(|s| s.table_names())
+                    .unwrap_or_default();
+                names.retain(|n| keep(n));
+                names.sort();
+                let schema = Arc::new(Schema::new(vec![Field::new(
+                    "Table",
+                    DataType::Utf8,
+                    false,
+                )]));
+                let mut table_builder = StringBuilder::new();
+                for name in &names {
+                    table_builder.append_value(name);
+                }
+                let array: ArrayRef = Arc::new(table_builder.finish());
+                let batch = RecordBatch::try_new(schema, vec![array]).map_err(|e| {
+                    SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!("Failed to create result batch: {e}"),
+                    )
+                })?;
+                return Ok(vec![batch]);
+            }
+        }
         // A Hive root is not an Iceberg catalog: `show_catalog` only knows
         // `[catalogs.*]` config and Polaris discovery, so a Hive root's name
         // would otherwise fail as "Unknown catalog". Answer directly from

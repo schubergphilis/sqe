@@ -156,18 +156,22 @@ impl ResultCache {
         non_deterministic.iter().any(|f| upper.contains(f))
     }
 
-    /// Whether a result read catalog metadata: `information_schema` or the
-    /// `system` catalog. Such a result changes with DDL on any table, which
-    /// the per-table eviction cannot reach (a CTAS evicts its own table, not
-    /// `information_schema.columns`), so it is never stored.
+    /// Whether a result read catalog metadata: `information_schema` or one of
+    /// SQE's virtual `system` schemas. Such a result changes with DDL on any
+    /// table (or with live coordinator state), which the per-table eviction
+    /// cannot reach (a CTAS evicts its own table, not
+    /// `information_schema.columns`), so it is never stored. A table in a
+    /// Polaris catalog `system` (`system.access.audit`, #901) is ordinary
+    /// data and caches like any table. With no catalog on the resource (a
+    /// partial name under `USE system`), a reserved schema name is enough.
     pub fn reads_catalog_metadata(resources: &[sqe_metrics::audit::Resource]) -> bool {
+        use sqe_core::system_catalog::{is_reserved_system_schema, SYSTEM_CATALOG};
         resources.iter().any(|r| {
-            r.catalog
-                .as_deref()
-                .is_some_and(|c| c.eq_ignore_ascii_case("system"))
-                || r.namespace
-                    .iter()
-                    .any(|ns| ns.eq_ignore_ascii_case("information_schema"))
+            let system_or_unknown = r.catalog.as_deref().is_none_or(|c| c == SYSTEM_CATALOG);
+            r.namespace.iter().any(|ns| {
+                ns.eq_ignore_ascii_case("information_schema")
+                    || (system_or_unknown && is_reserved_system_schema(ns))
+            })
         })
     }
 
@@ -670,6 +674,14 @@ mod tests {
         assert!(ResultCache::reads_catalog_metadata(&[nodes]));
         assert!(!ResultCache::reads_catalog_metadata(&[orders]));
         assert!(!ResultCache::reads_catalog_metadata(&[]));
+        // #901: a Polaris table under `system` is data, not metadata.
+        let audit = resource(Some("system"), "access", "audit");
+        assert!(!ResultCache::reads_catalog_metadata(&[audit]));
+        // A partial `runtime.queries` under `USE system` is still virtual.
+        let partial = resource(None, "runtime", "queries");
+        assert!(ResultCache::reads_catalog_metadata(&[partial]));
+        let iceberg_runtime = resource(Some("iceberg"), "runtime", "t");
+        assert!(!ResultCache::reads_catalog_metadata(&[iceberg_runtime]));
     }
 
     #[test]

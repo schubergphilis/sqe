@@ -220,3 +220,114 @@ async fn describe_with_quote_in_name_is_escaped_not_injected() {
         "escaped name must produce valid SQL (no injection/parse error), got: {r:?}"
     );
 }
+
+/// Every value of the first column as text.
+fn first_column(batches: &[arrow_array::RecordBatch]) -> Vec<String> {
+    let mut out = Vec::new();
+    for b in batches {
+        for row in 0..b.num_rows() {
+            out.push(arrow::util::display::array_value_to_string(b.column(0), row).unwrap());
+        }
+    }
+    out
+}
+
+// DBeaver over the Trino driver lists a schema's tables through
+// `TrinoDatabaseMetaData`, which reads 13 `system.jdbc` tables. SQE served 5:
+// `getTableTypes()` failed on the missing `table_types`, and views were never
+// listed. These are the driver's own statements (master), sent the way it
+// sends them: unquoted upper-case names, `LIKE ... ESCAPE '\'`, and
+// `LIMIT 0` on the tables it only needs the shape of.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn trino_jdbc_driver_metadata_lists_tables_and_views() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let ns = "jdbc_meta";
+    for sql in [
+        format!("DROP VIEW IF EXISTS {ns}.v"),
+        format!("DROP TABLE IF EXISTS {ns}.t"),
+    ] {
+        let _ = handler.execute(&session, &sql, None).await;
+    }
+    for sql in [
+        format!("CREATE SCHEMA IF NOT EXISTS {ns}"),
+        format!("CREATE TABLE {ns}.t (id BIGINT, name VARCHAR)"),
+        format!("CREATE VIEW {ns}.v AS SELECT id FROM {ns}.t"),
+    ] {
+        handler
+            .execute(&session, &sql, None)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    let types_sql = "SELECT TABLE_TYPE FROM system.jdbc.table_types ORDER BY TABLE_TYPE";
+    let types = handler.execute(&session, types_sql, None).await.unwrap();
+    assert_eq!(first_column(&types), ["TABLE", "VIEW"]);
+
+    let tables_sql = format!(
+        "SELECT TABLE_NAME, TABLE_TYPE, TABLE_CAT, TABLE_SCHEM, REMARKS, TYPE_CAT, \
+         TYPE_SCHEM, TYPE_NAME, SELF_REFERENCING_COL_NAME, REF_GENERATION \
+         FROM system.jdbc.tables WHERE TABLE_SCHEM LIKE '{ns}' ESCAPE '\\' \
+         AND TABLE_NAME LIKE '%' ESCAPE '\\' AND TABLE_TYPE IN ('TABLE', 'VIEW') \
+         ORDER BY TABLE_TYPE, TABLE_CAT, TABLE_SCHEM, TABLE_NAME"
+    );
+    let tables = handler.execute(&session, &tables_sql, None).await.unwrap();
+    let names = first_column(&tables);
+    let kinds: Vec<String> = tables
+        .iter()
+        .flat_map(|b| {
+            (0..b.num_rows())
+                .map(|r| arrow::util::display::array_value_to_string(b.column(1), r).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(names, ["t", "v"], "kinds: {kinds:?}");
+    assert_eq!(kinds, ["TABLE", "VIEW"]);
+
+    let shape_only = [
+        "SELECT PROCEDURE_CAT, PROCEDURE_SCHEM, PROCEDURE_NAME, null, null, null, REMARKS, \
+         PROCEDURE_TYPE, SPECIFIC_NAME FROM system.jdbc.procedures",
+        "SELECT PROCEDURE_CAT, PROCEDURE_SCHEM, PROCEDURE_NAME, COLUMN_NAME, COLUMN_TYPE, \
+         DATA_TYPE, TYPE_NAME, PRECISION, LENGTH, SCALE, RADIX, NULLABLE, REMARKS, COLUMN_DEF, \
+         SQL_DATA_TYPE, SQL_DATETIME_SUB, CHAR_OCTET_LENGTH, ORDINAL_POSITION, IS_NULLABLE, \
+         SPECIFIC_NAME FROM system.jdbc.procedure_columns",
+        "SELECT TYPE_CAT, TYPE_SCHEM, TYPE_NAME, CLASS_NAME, DATA_TYPE, REMARKS, BASE_TYPE \
+         FROM system.jdbc.udts",
+        "SELECT TYPE_CAT, TYPE_SCHEM, TYPE_NAME, SUPERTYPE_CAT, SUPERTYPE_SCHEM, SUPERTYPE_NAME \
+         FROM system.jdbc.super_types",
+        "SELECT TABLE_CAT, TABLE_SCHEM, TABLE_NAME, SUPERTABLE_NAME FROM system.jdbc.super_tables",
+        "SELECT TYPE_CAT, TYPE_SCHEM, TYPE_NAME, ATTR_NAME, DATA_TYPE, ATTR_TYPE_NAME, ATTR_SIZE, \
+         DECIMAL_DIGITS, NUM_PREC_RADIX, NULLABLE, REMARKS, ATTR_DEF, SQL_DATA_TYPE, \
+         SQL_DATETIME_SUB, CHAR_OCTET_LENGTH, ORDINAL_POSITION, IS_NULLABLE, SCOPE_CATALOG, \
+         SCOPE_SCHEMA, SCOPE_TABLE, SOURCE_DATA_TYPE FROM system.jdbc.attributes",
+        "SELECT TABLE_CAT, TABLE_SCHEM, TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_SIZE, \
+         DECIMAL_DIGITS, NUM_PREC_RADIX, COLUMN_USAGE, REMARKS, CHAR_OCTET_LENGTH, IS_NULLABLE \
+         FROM system.jdbc.pseudo_columns",
+        "SELECT CAST(NULL AS varchar) TABLE_CAT, CAST(NULL AS varchar) TABLE_SCHEM, \
+         CAST(NULL AS varchar) TABLE_NAME, CAST(NULL AS varchar) COLUMN_NAME, \
+         CAST(NULL AS smallint) KEY_SEQ, CAST(NULL AS varchar) PK_NAME WHERE false",
+    ];
+    for sql in shape_only {
+        let sql = format!("{sql} LIMIT 0");
+        handler
+            .execute(&session, &sql, None)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    let columns_sql = format!(
+        "SELECT COLUMN_NAME FROM system.jdbc.columns WHERE TABLE_SCHEM LIKE '{ns}' ESCAPE '\\' \
+         AND TABLE_NAME LIKE 't' ESCAPE '\\' ORDER BY TABLE_CAT, TABLE_SCHEM, TABLE_NAME, \
+         ORDINAL_POSITION"
+    );
+    let columns = handler.execute(&session, &columns_sql, None).await.unwrap();
+    assert_eq!(first_column(&columns), ["id", "name"]);
+
+    for sql in [
+        format!("DROP VIEW IF EXISTS {ns}.v"),
+        format!("DROP TABLE IF EXISTS {ns}.t"),
+        format!("DROP SCHEMA IF EXISTS {ns}"),
+    ] {
+        let _ = handler.execute(&session, &sql, None).await;
+    }
+}

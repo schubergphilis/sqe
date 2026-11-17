@@ -238,6 +238,8 @@ async fn current_catalog_and_schema_return_session_values() {
         ("SELECT current_catalog", "ws_energy_co"),
         ("SELECT current_schema", "gold"),
         ("SELECT current_schema()", "gold"),
+        // The Trino JDBC driver's getUserName() runs this.
+        ("SELECT current_user", "user_tok_curcat"),
     ] {
         let rewritten = sqe_sql::rewrite_trino_compat(sql);
         let batches = ctx

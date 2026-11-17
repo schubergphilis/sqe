@@ -1335,7 +1335,6 @@ impl QueryHandler {
             .into_iter()
             .map(|(n, _)| n)
             .collect();
-        known.insert("system".to_string());
         known.insert("datafusion".to_string());
         known.extend(self.runtime_catalogs.list().map_err(SqeError::Catalog)?);
         // `runtime_catalogs.list()` only sees the Iceberg lane (`ATTACH ...
@@ -1351,8 +1350,18 @@ impl QueryHandler {
                 .map(|(name, _)| name),
         );
 
+        // `system` is always known: its virtual schemas need nothing. A
+        // statement naming `system.<other schema>` may need a Polaris catalog
+        // `system` (#901); unless config declares one (session build wraps
+        // it), discovery below attaches it to the session's composite.
+        let probe_system = self.config.query.catalog_discovery
+            == sqe_core::config::CatalogDiscovery::PolarisAuto
+            && !known.contains(sqe_core::system_catalog::SYSTEM_CATALOG)
+            && sqe_sql::names_polaris_system_schema(stmt);
+        known.insert(sqe_core::system_catalog::SYSTEM_CATALOG.to_string());
+
         // Fast path: every qualifier is statically known — done, no Polaris.
-        if qualifiers.iter().all(|q| known.contains(q)) {
+        if !probe_system && qualifiers.iter().all(|q| known.contains(q)) {
             return Ok(());
         }
 
@@ -1381,6 +1390,10 @@ impl QueryHandler {
             ctx.catalog_names().into_iter().collect();
         known.insert("system".to_string());
         known.insert("datafusion".to_string());
+
+        if probe_system {
+            self.attach_polaris_system(&ctx, session).await;
+        }
 
         for q in &qualifiers {
             if known.contains(q) {
@@ -1413,6 +1426,42 @@ impl QueryHandler {
             )));
         }
         Ok(())
+    }
+
+    /// Discover a Polaris catalog named `system` with the caller's token and
+    /// attach it to the session's `system` composite (#901). Registering it
+    /// with `register_catalog` would replace the composite and drop SQE's
+    /// virtual schemas. No Polaris catalog `system`: nothing changes, and the
+    /// statement fails later on the missing schema as before.
+    async fn attach_polaris_system(
+        &self,
+        ctx: &datafusion::prelude::SessionContext,
+        session: &Session,
+    ) {
+        if self.config.query.catalog_discovery != sqe_core::config::CatalogDiscovery::PolarisAuto {
+            return;
+        }
+        let Some(catalog) = ctx.catalog(sqe_core::system_catalog::SYSTEM_CATALOG) else {
+            return;
+        };
+        let Some(composite) = catalog.downcast_ref::<sqe_catalog::SystemCompositeProvider>() else {
+            return;
+        };
+        if composite.has_polaris() {
+            return;
+        }
+        if let Some((provider, _)) = crate::session_context::discover_catalog_provider(
+            sqe_core::system_catalog::SYSTEM_CATALOG,
+            &self.config,
+            session,
+            self.table_cache.as_ref(),
+            self.metrics.as_ref(),
+        )
+        .await
+        {
+            composite.attach_polaris(Arc::new(provider));
+            tracing::info!("catalog discovery: attached Polaris catalog `system` to the session");
+        }
     }
 
     /// Execute a SQL statement for the given session and return collected RecordBatches.
@@ -5842,11 +5891,17 @@ impl QueryHandler {
             };
 
             // DataFusion scratch tables and SQE's virtual metadata schemas do
-            // not map to Polaris loadTable endpoints.
-            if matches!(catalog, Some("datafusion" | "system"))
+            // not map to Polaris loadTable endpoints. A Polaris table under
+            // `system` (`system.access.audit`, #901) does, and is checked;
+            // so is `iceberg.runtime.t`. A partial name keeps today's skip
+            // for a reserved schema: it is virtual under `USE system`.
+            let virtual_system = match catalog {
+                Some(c) => sqe_core::system_catalog::is_virtual_system_ref(c, namespace),
+                None => sqe_core::system_catalog::is_reserved_system_schema(namespace),
+            };
+            if matches!(catalog, Some("datafusion"))
                 || namespace.eq_ignore_ascii_case("information_schema")
-                || namespace.eq_ignore_ascii_case("runtime")
-                || namespace.eq_ignore_ascii_case("metadata")
+                || virtual_system
             {
                 continue;
             }
@@ -7057,15 +7112,17 @@ fn build_show_stats_batch(
 /// Build the `DESCRIBE OUTPUT` result set for a prepared statement's output
 /// schema: one row per column, matching Trino's column layout
 /// (Column Name, Catalog, Schema, Table, Type, Type Size, Aliased). Catalog /
-/// Schema / Table are null (SQE does not track per-column source bindings);
-/// Type is the Trino type name; Type Size is the fixed byte width where known.
+/// Schema / Table are empty strings, as Trino reports for a column it cannot
+/// trace to a table (SQE does not track per-column source bindings); the
+/// Trino JDBC driver's `getMetaData()` requires them non-null. Type is the
+/// Trino type name; Type Size is the fixed byte width where known.
 fn build_describe_output(schema: &SchemaRef) -> sqe_core::Result<Vec<RecordBatch>> {
     use arrow_array::builder::{BooleanBuilder, Int64Builder};
     let out_schema = Arc::new(Schema::new(vec![
         Field::new("Column Name", DataType::Utf8, false),
-        Field::new("Catalog", DataType::Utf8, true),
-        Field::new("Schema", DataType::Utf8, true),
-        Field::new("Table", DataType::Utf8, true),
+        Field::new("Catalog", DataType::Utf8, false),
+        Field::new("Schema", DataType::Utf8, false),
+        Field::new("Table", DataType::Utf8, false),
         Field::new("Type", DataType::Utf8, false),
         Field::new("Type Size", DataType::Int64, true),
         Field::new("Aliased", DataType::Boolean, false),
@@ -7079,9 +7136,9 @@ fn build_describe_output(schema: &SchemaRef) -> sqe_core::Result<Vec<RecordBatch
     let mut aliased_b = BooleanBuilder::new();
     for field in schema.fields() {
         name_b.append_value(field.name());
-        cat_b.append_null();
-        sch_b.append_null();
-        tbl_b.append_null();
+        cat_b.append_value("");
+        sch_b.append_value("");
+        tbl_b.append_value("");
         type_b.append_value(sqe_trino_compat::types::arrow_to_trino_type(
             field.data_type(),
         ));

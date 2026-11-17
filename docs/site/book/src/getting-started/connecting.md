@@ -60,7 +60,7 @@ Limits on an ingest:
 
 ### With a bearer token
 
-A client that already holds a token sends it instead of a password. SQE reads `Authorization: Bearer <token>` on every request, so no handshake is needed:
+A client that already holds a token sends it instead of a password. SQE reads `Authorization: Bearer <token>` on every request, so no handshake is needed. A client that does handshake with the bearer, as the Flight SQL JDBC driver does, gets back the session id for that token:
 
 ```python
 conn = connect(
@@ -107,7 +107,15 @@ jdbc:arrow-flight-sql://localhost:50051?user=jacob&password=your-password&useEnc
 
 Set `useEncryption=true` when the coordinator runs with TLS. JDBC tools (DBeaver, query consoles, BI connectors that take a JDBC URL) point at this string with the Flight SQL driver on the classpath.
 
-`token=<access token>` takes the place of `user` and `password` when you sign in with an OIDC token. `catalog=iceberg` sets the default catalog, the same as `USE iceberg`. The driver never sends `setSchema` to the server, so qualify table names or run `USE catalog.schema`.
+A client that holds a token sets the driver's `token` property instead of `user` and `password`:
+
+```
+jdbc:arrow-flight-sql://localhost:50051?token=<token>&useEncryption=false
+```
+
+The driver then opens with a handshake that carries `Authorization: Bearer <token>`. SQE resolves that bearer the same way as on any other call (see [With a bearer token](#with-a-bearer-token)) and replies with its session id, which the driver sends on every later call. An unknown or invalid token fails the handshake with `UNAUTHENTICATED`.
+
+`catalog=iceberg` sets the default catalog, the same as `USE iceberg`. The driver never sends `setSchema` to the server, so qualify table names or run `USE catalog.schema`.
 
 ## Flight SQL over ODBC
 
