@@ -503,6 +503,7 @@ async fn streamed_schema(
 
 /// A JWT-shaped bearer (it contains dots, so the per-call path hands it to the
 /// provider chain instead of looking it up as a session id).
+// nosemgrep: opt.aikido.semgrep-rules.generic.secrets.security.detected-jwt-token -- unsigned test fixture (alg none, sub dbeaver); only the test provider accepts it
 const GOOD_BEARER: &str = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJkYmVhdmVyIn0.sig";
 const BEARER_USER: &str = "bearer-user";
 
