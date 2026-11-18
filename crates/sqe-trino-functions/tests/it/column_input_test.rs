@@ -377,16 +377,12 @@ col_case!(
 col_case!(
     col_human_readable_seconds,
     "human_readable_seconds(dbl_a)",
-    [
-        s("1 hours, 1 minutes, 1.00 seconds"),
-        s("45.50 seconds"),
-        None
-    ]
+    [s("1 hour, 1 minute, 1 second"), s("46 seconds"), None]
 );
 col_case!(
     col_human_readable_seconds_int,
     "human_readable_seconds(int_a)",
-    [s("4 minutes, 15.00 seconds"), s("10.00 seconds"), None]
+    [s("4 minutes, 15 seconds"), s("10 seconds"), None]
 );
 col_case!(
     col_last_day_of_month,
@@ -730,6 +726,8 @@ enum Kind {
     Degrees,
     /// Probabilities strictly between 0 and 1.
     Unit,
+    Digits,
+    DataSize,
 }
 
 fn make_array(kind: Kind) -> ArrayRef {
@@ -765,6 +763,8 @@ fn make_array(kind: Kind) -> ArrayRef {
         ])),
         Kind::B64 => Arc::new(StringArray::from(vec!["aGVsbG8=", "d29ybGQ=", "eA=="])),
         Kind::Hex => Arc::new(StringArray::from(vec!["68656c6c6f", "776f726c64", "78"])),
+        Kind::Digits => Arc::new(StringArray::from(vec!["79927398713", "1234", "0"])),
+        Kind::DataSize => Arc::new(StringArray::from(vec!["1kB", "2.5MB", "7B"])),
         Kind::ListInt => Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
             Some(vec![Some(1), Some(2), Some(3)]),
             Some(vec![Some(4), Some(5)]),
@@ -856,7 +856,13 @@ fn arg_specs(name: &str) -> Option<Vec<ArgSpec>> {
         | "url_extract_path"
         | "url_extract_port"
         | "url_extract_protocol"
-        | "url_extract_query" => vec![Col(Url)],
+        | "url_extract_query"
+        | "url_extract_fragment" => vec![Col(Url)],
+        "index" => vec![Col(Str), LitStr("a")],
+        "levenshtein_distance" => vec![Col(Str), Col(Str)],
+        "luhn_check" => vec![Col(Digits)],
+        "format_number" => vec![Col(Int)],
+        "parse_data_size" => vec![Col(DataSize)],
         "url_extract_parameter" => vec![Col(Url), LitStr("q")],
         "url_encode" | "url_decode" | "to_base64" | "to_utf8" => vec![Col(Str)],
         "from_base64" | "from_base64url" => vec![Col(B64)],

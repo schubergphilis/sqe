@@ -403,7 +403,7 @@ async fn test_soundex() {
 #[tokio::test]
 async fn test_soundex_empty() {
     let v = eval_str("SELECT soundex('')").await;
-    assert_eq!(v, Some("0000".to_string()));
+    assert_eq!(v, Some(String::new()));
 }
 
 #[tokio::test]
@@ -610,8 +610,7 @@ async fn test_human_readable_seconds_hours() {
     let v = eval_str("SELECT human_readable_seconds(3661.0)").await;
     assert!(v.is_some(), "human_readable_seconds returned None");
     let s = v.unwrap();
-    assert!(s.contains("1 hours"), "Expected '1 hours' in: {s}");
-    assert!(s.contains("1 minutes"), "Expected '1 minutes' in: {s}");
+    assert_eq!(s, "1 hour, 1 minute, 1 second");
 }
 
 #[tokio::test]

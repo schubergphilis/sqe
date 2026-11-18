@@ -29,8 +29,10 @@ pub mod math_fns;
 pub mod overrides;
 pub mod scalar_fns;
 pub mod stats_fns;
+mod string_fns;
 pub mod trino_functions;
 pub mod trino_functions_ext;
+mod url_fns;
 
 pub use json_cast::JsonCastRule;
 pub use trino_functions::register_trino_functions;

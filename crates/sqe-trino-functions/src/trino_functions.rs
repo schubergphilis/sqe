@@ -70,13 +70,7 @@ pub fn register_trino_functions(ctx: &datafusion::prelude::SessionContext) {
     ctx.register_udf(ScalarUDF::from(LocalTime));
     ctx.register_udf(ScalarUDF::from(LocalTimestamp));
 
-    // URL extraction functions
-    ctx.register_udf(ScalarUDF::from(UrlExtractHost));
-    ctx.register_udf(ScalarUDF::from(UrlExtractPath));
-    ctx.register_udf(ScalarUDF::from(UrlExtractPort));
-    ctx.register_udf(ScalarUDF::from(UrlExtractProtocol));
-    ctx.register_udf(ScalarUDF::from(UrlExtractQuery));
-    ctx.register_udf(ScalarUDF::from(UrlExtractParameter));
+    // url_extract_* live in `url_fns`, registered below.
     ctx.register_udf(ScalarUDF::from(UrlEncode));
     ctx.register_udf(ScalarUDF::from(UrlDecode));
 
@@ -108,6 +102,11 @@ pub fn register_trino_functions(ctx: &datafusion::prelude::SessionContext) {
 
     // Bitwise scalar functions, `sequence`, and `slice` (#346, #349).
     crate::scalar_fns::register_scalar_fns(ctx);
+
+    // String functions (array-aware concat/reverse, bigint results, ...) and
+    // the url_extract_* family.
+    crate::string_fns::register_string_fns(ctx);
+    crate::url_fns::register_url_fns(ctx);
 
     // count_if, element_at (array/map), contains (array) (#356).
     crate::coverage_fns::register_coverage_fns(ctx);
@@ -1984,81 +1983,6 @@ impl ScalarUDFImpl for LocalTimestamp {
 // ---------------------------------------------------------------------------
 
 use crate::helpers::{str_transform, str_transform_2};
-
-// ---------------------------------------------------------------------------
-// URL extraction functions
-// ---------------------------------------------------------------------------
-
-use url::Url;
-
-fn extract_url_component(url_str: &str, component: &str, param: Option<&str>) -> Option<String> {
-    let parsed = Url::parse(url_str).ok()?;
-    match component {
-        "host" => parsed.host_str().map(|s| s.to_string()),
-        "path" => Some(parsed.path().to_string()),
-        "port" => parsed.port().map(|p| p.to_string()),
-        "protocol" => Some(parsed.scheme().to_string()),
-        "query" => parsed.query().map(|s| s.to_string()),
-        "parameter" => {
-            let param_name = param?;
-            parsed
-                .query_pairs()
-                .find(|(k, _)| k == param_name)
-                .map(|(_, v)| v.to_string())
-        }
-        _ => None,
-    }
-}
-
-fn parse_url_component(args: &[ColumnarValue], component: &str) -> DFResult<ColumnarValue> {
-    // Utf8 / LargeUtf8 / Utf8View, scalar or column, all go through the
-    // shared string lifters; non-string input is a Trino-style Plan error.
-    let fn_name = format!("url_extract_{component}");
-    if component == "parameter" {
-        crate::helpers::str_transform_2(&fn_name, args, |u, p| {
-            extract_url_component(u, component, Some(p))
-        })
-    } else {
-        crate::helpers::str_transform(&fn_name, &args[0], |u| {
-            extract_url_component(u, component, None)
-        })
-    }
-}
-
-macro_rules! url_extract_udf {
-    ($name:ident, $func_name:expr, $component:expr, $nargs:expr) => {
-        #[derive(Debug, PartialEq, Eq, Hash)]
-        struct $name;
-
-        impl ScalarUDFImpl for $name {
-            fn name(&self) -> &str {
-                $func_name
-            }
-            fn signature(&self) -> &Signature {
-                static SIG: std::sync::LazyLock<Signature> = std::sync::LazyLock::new(|| {
-                    Signature::new(
-                        TypeSignature::Exact(vec![DataType::Utf8; $nargs]),
-                        Volatility::Immutable,
-                    )
-                });
-                &SIG
-            }
-            fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-                Ok(DataType::Utf8)
-            }
-            fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-                parse_url_component(&args.args, $component)
-            }
-        }
-    };
-}
-
-url_extract_udf!(UrlExtractHost, "url_extract_host", "host", 1);
-url_extract_udf!(UrlExtractPath, "url_extract_path", "path", 1);
-url_extract_udf!(UrlExtractPort, "url_extract_port", "port", 1);
-url_extract_udf!(UrlExtractProtocol, "url_extract_protocol", "protocol", 1);
-url_extract_udf!(UrlExtractQuery, "url_extract_query", "query", 1);
-url_extract_udf!(UrlExtractParameter, "url_extract_parameter", "parameter", 2);
 
 // url_encode / url_decode
 
