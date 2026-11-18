@@ -47,7 +47,7 @@
 
 - [x] 7.1 Type integer literals as `integer` when they fit, as Trino does; ordinals, LIMIT/OFFSET and type parameters untouched
 - [x] 7.2 Overflow behaviour matches Trino (`2147483647 + 1`)
-- [ ] 7.3 Access-control suite and a TPC-H compare before and after
+- [x] 7.3 Access-control suite and a TPC-H compare before and after
 - [x] 7.4 `bigint` arithmetic and unary minus fail on overflow, as in Trino
 
 ## 8. Done
