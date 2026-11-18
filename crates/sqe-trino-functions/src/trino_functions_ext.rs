@@ -769,8 +769,17 @@ fn constant_zone(fn_name: &str, tz: Option<&ScalarValue>) -> DFResult<String> {
     }
 }
 
+/// The unit a zone function answers in: the input's own for a timestamp
+/// (Trino keeps the precision), microseconds for a date or null.
+fn zone_unit(input: &DataType) -> arrow::datatypes::TimeUnit {
+    match input {
+        DataType::Timestamp(unit, _) => *unit,
+        _ => arrow::datatypes::TimeUnit::Microsecond,
+    }
+}
+
 /// `return_field_from_args` shared by the two zone functions: the result is
-/// `Timestamp(Microsecond, Some(zone))` with the zone taken from the literal.
+/// `Timestamp(<input unit>, Some(zone))` with the zone taken from the literal.
 fn zoned_return_field(fn_name: &str, args: ReturnFieldArgs) -> DFResult<FieldRef> {
     if args.arg_fields.len() != 2 {
         return Err(DataFusionError::Plan(format!(
@@ -788,9 +797,10 @@ fn zoned_return_field(fn_name: &str, args: ReturnFieldArgs) -> DFResult<FieldRef
         }
     }
     let tz = constant_zone(fn_name, args.scalar_arguments[1])?;
+    let unit = zone_unit(args.arg_fields[0].data_type());
     Ok(Arc::new(Field::new(
         fn_name,
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some(tz.into())),
+        DataType::Timestamp(unit, Some(tz.into())),
         true,
     )))
 }
@@ -844,7 +854,15 @@ impl ScalarUDFImpl for WithTimezone {
             let local = micros_to_local_naive(us, in_tz.as_deref());
             Ok(local.and_then(|l| zone.utc_micros(l)).map(TsMicros))
         })?;
-        tag_timezone(out, &tz_name)
+        // Computed in microseconds, answered in the input's unit. A second or
+        // millisecond input comes back exact; a nanosecond input keeps its
+        // microseconds (the sub-microsecond digits are not carried).
+        let unit = zone_unit(&args.args[0].data_type());
+        let out = tag_timezone(out, &tz_name)?;
+        if unit == arrow::datatypes::TimeUnit::Microsecond {
+            return Ok(out);
+        }
+        out.cast_to(&DataType::Timestamp(unit, Some(tz_name.into())), None)
     }
 }
 
@@ -875,6 +893,18 @@ impl ScalarUDFImpl for AtTimezone {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let tz_name = runtime_zone("at_timezone", &args.args)?;
         let ts: TsArg = arg("at_timezone", "timestamp, varchar", &args.args, 0)?;
+        // Same instant, so a timestamp input is relabelled in its own unit
+        // with nothing recomputed.
+        // A naive input is a UTC instant here (Arrow would read it as local
+        // time in the target zone), so it is tagged UTC first.
+        if let DataType::Timestamp(unit, in_tz) = args.args[0].data_type() {
+            let base = if in_tz.is_none() {
+                args.args[0].cast_to(&DataType::Timestamp(unit, Some("UTC".into())), None)?
+            } else {
+                args.args[0].clone()
+            };
+            return base.cast_to(&DataType::Timestamp(unit, Some(tz_name.into())), None);
+        }
         let out = lift1(&ts, |us| Ok(Some(TsMicros(us))))?;
         tag_timezone(out, &tz_name)
     }

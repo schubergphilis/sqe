@@ -256,7 +256,11 @@ pub fn apply_trino_compat(statements: &mut Vec<Statement>, source: &str) -> bool
     // `explode` -> rewrite_spark_explode: Spark's `explode(a)` and
     // `posexplode(a)` select-list generators become `unnest`. See #877.
     let has_explode = lower.contains("explode");
+    // `timestamp` -> rewrite_timestamp_precision: the typed literal and the
+    // cast target take Trino's precision (see that function).
+    let has_timestamp = lower.contains("timestamp");
     if !has_json_cast
+        && !has_timestamp
         && !has_explode
         && !has_late_dot
         && !has_exponent
@@ -450,6 +454,9 @@ impl VisitorMut for TrinoCompatVisitor {
             self.rewrites += 1;
         }
         if rewrite_utf8_typed_string(expr) {
+            self.rewrites += 1;
+        }
+        if rewrite_timestamp_precision(expr) {
             self.rewrites += 1;
         }
         if rewrite_exponent_literal_to_double(expr) {
@@ -855,6 +862,194 @@ fn rewrite_utf8_typed_string(expr: &mut Expr) -> bool {
         return true;
     }
     false
+}
+
+/// Trino's precision for timestamp literals and casts. Arrow has four units
+/// (second, millisecond, microsecond, nanosecond), so a precision `p` maps to
+/// the next of 0, 3, 6, 9; the unit is the precision `typeof` reports.
+///
+/// - `TIMESTAMP '<text>'` becomes `CAST('<text>' AS TIMESTAMP(p))`, `p` the
+///   literal's fraction digits rounded up (DataFusion plans the typed string
+///   as nanoseconds whatever the text says). A literal with a zone, or written
+///   `TIMESTAMP WITH TIME ZONE '...'`, is `TIMESTAMP(p) WITH TIME ZONE`.
+/// - `CAST(x AS TIMESTAMP)` / `TRY_CAST` with no precision is
+///   `TIMESTAMP(3)`, Trino's default. DDL column types are not touched:
+///   `CREATE TABLE t (ts timestamp)` stays microseconds, which is what
+///   Iceberg stores.
+/// - `TIMESTAMP(p)` with `p` outside 0/3/6/9 takes the next of those;
+///   DataFusion refuses 1, 2, 4, 5, 7, 8 (known DIFF: the label then reads
+///   the rounded-up precision).
+fn rewrite_timestamp_precision(expr: &mut Expr) -> bool {
+    use sqlparser::ast::TimezoneInfo;
+    match expr {
+        Expr::TypedString(ts) => {
+            let SqlDataType::Timestamp(precision, tz_info) = &ts.data_type else {
+                return false;
+            };
+            let Value::SingleQuotedString(text) = &ts.value.value else {
+                return false;
+            };
+            let Some(shape) = timestamp_literal_shape(text) else {
+                return false;
+            };
+            let digits = precision.unwrap_or(shape.fraction_digits as u64);
+            let precision = round_timestamp_precision(digits);
+            let zoned = shape.zone.is_some()
+                || !matches!(tz_info, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone);
+            let data_type = SqlDataType::Timestamp(
+                Some(precision),
+                if zoned {
+                    TimezoneInfo::WithTimeZone
+                } else {
+                    TimezoneInfo::None
+                },
+            );
+            let cast = Expr::Cast {
+                kind: CastKind::Cast,
+                expr: Box::new(Expr::Value(Value::SingleQuotedString(text.clone()).into())),
+                data_type,
+                array: false,
+                format: None,
+            };
+            // DataFusion's WITH TIME ZONE takes the engine zone and drops the
+            // literal's; `arrow_cast` relabels the same instant and
+            // constant-folds, so the zone survives into the plan. A zone name
+            // that is not a plain identifier is never spliced into a type
+            // string: the cast stays on the engine zone.
+            let zone = zoned
+                .then(|| trino_zone_name(shape.zone.as_deref().unwrap_or("UTC")))
+                .flatten();
+            *expr = match zone {
+                Some(zone) => {
+                    let unit = match precision {
+                        0 => "Second",
+                        3 => "Millisecond",
+                        6 => "Microsecond",
+                        _ => "Nanosecond",
+                    };
+                    let target = format!("Timestamp({unit}, Some(\"{zone}\"))");
+                    call2(
+                        "arrow_cast",
+                        cast,
+                        Expr::Value(Value::SingleQuotedString(target).into()),
+                    )
+                }
+                None => cast,
+            };
+            true
+        }
+        Expr::Cast {
+            kind: CastKind::Cast | CastKind::TryCast,
+            data_type: SqlDataType::Timestamp(precision, _),
+            ..
+        } => {
+            let wanted = match precision {
+                None => 3,
+                Some(p) => round_timestamp_precision(*p),
+            };
+            if *precision == Some(wanted) {
+                return false;
+            }
+            *precision = Some(wanted);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The next of 0, 3, 6, 9 at or above `p` (9 for anything beyond).
+fn round_timestamp_precision(p: u64) -> u64 {
+    match p {
+        0 => 0,
+        1..=3 => 3,
+        4..=6 => 6,
+        _ => 9,
+    }
+}
+
+/// What a `TIMESTAMP '<text>'` literal says: its fraction digits and whether
+/// a zone follows the time (`Z`, `+02:00`, `UTC`, `Europe/Amsterdam`).
+struct TimestampLiteralShape {
+    fraction_digits: usize,
+    zone: Option<String>,
+}
+
+/// The zone string a literal carries: `Z`, `UTC` and a zero offset are `UTC`
+/// (the string the datetime functions use); a region or other offset is kept.
+/// None for text that is not a plain zone identifier.
+fn trino_zone_name(raw: &str) -> Option<String> {
+    let z = raw.trim();
+    if z.is_empty()
+        || z.len() > 64
+        || !z
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'+' | b'-' | b':'))
+    {
+        return None;
+    }
+    let utc = z.eq_ignore_ascii_case("z")
+        || z.eq_ignore_ascii_case("utc")
+        || matches!(z, "+00:00" | "-00:00" | "+0000" | "+00");
+    Some(if utc { "UTC".to_owned() } else { z.to_owned() })
+}
+
+/// `[+-]YYYY-MM-DD[ T]HH:MM[:SS[.fff]][ ][zone]`; None for text that is not
+/// that, which is left for DataFusion to accept or reject.
+fn timestamp_literal_shape(text: &str) -> Option<TimestampLiteralShape> {
+    let t = text.trim();
+    let bytes = t.as_bytes();
+    let mut i = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    let digits = |i: &mut usize, n: usize| -> bool {
+        let ok = bytes.len() >= *i + n && bytes[*i..*i + n].iter().all(u8::is_ascii_digit);
+        if ok {
+            *i += n;
+        }
+        ok
+    };
+    let sep = |i: &mut usize, allowed: &[u8]| -> bool {
+        let ok = bytes.get(*i).is_some_and(|b| allowed.contains(b));
+        if ok {
+            *i += 1;
+        }
+        ok
+    };
+    let year_start = i;
+    while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+        i += 1;
+    }
+    if i - year_start < 4
+        || !sep(&mut i, b"-")
+        || !digits(&mut i, 2)
+        || !sep(&mut i, b"-")
+        || !digits(&mut i, 2)
+    {
+        return None;
+    }
+    let mut fraction_digits = 0;
+    if sep(&mut i, b" T") {
+        if !digits(&mut i, 2) || !sep(&mut i, b":") || !digits(&mut i, 2) {
+            return None;
+        }
+        if sep(&mut i, b":") {
+            if !digits(&mut i, 2) {
+                return None;
+            }
+            if sep(&mut i, b".") {
+                let start = i;
+                while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+                    i += 1;
+                }
+                fraction_digits = i - start;
+                if fraction_digits == 0 {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(TimestampLiteralShape {
+        fraction_digits,
+        zone: Some(t[i..].trim().to_owned()).filter(|z| !z.is_empty()),
+    })
 }
 
 /// `DECIMAL '12.34'` is `decimal(4,2)` in Trino: precision and scale come
@@ -1264,6 +1459,17 @@ fn call(name: &str, arg: Expr) -> Expr {
         over: None,
         within_group: vec![],
     })
+}
+
+fn call2(name: &str, a: Expr, b: Expr) -> Expr {
+    let mut f = call(name, a);
+    if let Expr::Function(func) = &mut f {
+        if let FunctionArguments::List(list) = &mut func.args {
+            list.args
+                .push(FunctionArg::Unnamed(FunctionArgExpr::Expr(b)));
+        }
+    }
+    f
 }
 
 /// Rewrite a bare `current_schema` identifier into the `current_schema()`
@@ -2677,6 +2883,98 @@ mod tests {
         // An exponent or unparseable text is left for DataFusion.
         let out = rewrite_trino_compat("SELECT DECIMAL '1e3', DECIMAL 'abc'");
         assert_eq!(out, "SELECT DECIMAL '1e3', DECIMAL 'abc'");
+    }
+
+    #[test]
+    fn timestamp_literal_takes_its_precision_from_the_fraction_digits() {
+        let out = rewrite_trino_compat(
+            "SELECT TIMESTAMP '2024-01-01 10:00:00', TIMESTAMP '2024-01-01 10:00:00.1', \
+             TIMESTAMP '2024-01-01 10:00:00.123', TIMESTAMP '2024-01-01 10:00:00.1234', \
+             TIMESTAMP '2024-01-01 10:00:00.123456', TIMESTAMP '2024-01-01 10:00:00.1234567', \
+             TIMESTAMP '2024-01-01 10:00:00.123456789', TIMESTAMP '2024-01-01 10:00'",
+        );
+        assert_eq!(
+            out,
+            "SELECT CAST('2024-01-01 10:00:00' AS TIMESTAMP(0)), \
+             CAST('2024-01-01 10:00:00.1' AS TIMESTAMP(3)), \
+             CAST('2024-01-01 10:00:00.123' AS TIMESTAMP(3)), \
+             CAST('2024-01-01 10:00:00.1234' AS TIMESTAMP(6)), \
+             CAST('2024-01-01 10:00:00.123456' AS TIMESTAMP(6)), \
+             CAST('2024-01-01 10:00:00.1234567' AS TIMESTAMP(9)), \
+             CAST('2024-01-01 10:00:00.123456789' AS TIMESTAMP(9)), \
+             CAST('2024-01-01 10:00' AS TIMESTAMP(0))"
+        );
+    }
+
+    #[test]
+    fn timestamp_literal_with_a_zone_keeps_its_zone() {
+        // (suffix as written, zone in the plan)
+        for (zone, kept) in [
+            ("UTC", "UTC"),
+            ("Z", "UTC"),
+            ("+00:00", "UTC"),
+            ("+02:00", "+02:00"),
+            ("Europe/Amsterdam", "Europe/Amsterdam"),
+        ] {
+            let sep = if zone == "Z" { "" } else { " " };
+            let out = rewrite_trino_compat(&format!(
+                "SELECT TIMESTAMP '2024-01-01 10:00:00.123{sep}{zone}'"
+            ));
+            assert_eq!(
+                out,
+                format!(
+                    "SELECT arrow_cast(CAST('2024-01-01 10:00:00.123{sep}{zone}' AS \
+                     TIMESTAMP(3) WITH TIME ZONE), 'Timestamp(Millisecond, Some(\"{kept}\"))')"
+                ),
+                "{zone}"
+            );
+        }
+        let out = rewrite_trino_compat("SELECT TIMESTAMP WITH TIME ZONE '2024-01-01 10:00:00'");
+        assert_eq!(
+            out,
+            "SELECT arrow_cast(CAST('2024-01-01 10:00:00' AS TIMESTAMP(0) WITH TIME ZONE), \
+             'Timestamp(Second, Some(\"UTC\"))')"
+        );
+        // A zone that is not a plain identifier is never spliced into the
+        // type string; the cast stays on the engine zone.
+        let out = rewrite_trino_compat("SELECT TIMESTAMP '2024-01-01 10:00:00 a\"b)'");
+        assert_eq!(
+            out,
+            "SELECT CAST('2024-01-01 10:00:00 a\"b)' AS TIMESTAMP(0) WITH TIME ZONE)"
+        );
+    }
+
+    #[test]
+    fn timestamp_literal_that_is_not_a_timestamp_is_left_alone() {
+        let sql = "SELECT TIMESTAMP 'not a time', TIMESTAMP '2024-01-01 10:00:00.'";
+        assert_eq!(rewrite_trino_compat(sql), sql);
+    }
+
+    #[test]
+    fn bare_timestamp_cast_is_milliseconds_and_other_precisions_round_up() {
+        let out = rewrite_trino_compat(
+            "SELECT CAST(a AS TIMESTAMP), TRY_CAST(a AS TIMESTAMP WITH TIME ZONE), \
+             CAST(a AS TIMESTAMP(0)), CAST(a AS TIMESTAMP(3)), CAST(a AS TIMESTAMP(6)), \
+             CAST(a AS TIMESTAMP(9)), CAST(a AS TIMESTAMP(1)), CAST(a AS TIMESTAMP(2)), \
+             CAST(a AS TIMESTAMP(4)), CAST(a AS TIMESTAMP(5)), CAST(a AS TIMESTAMP(7)), \
+             CAST(a AS TIMESTAMP(8)), CAST(a AS TIMESTAMP(12))",
+        );
+        assert_eq!(
+            out,
+            "SELECT CAST(a AS TIMESTAMP(3)), TRY_CAST(a AS TIMESTAMP(3) WITH TIME ZONE), \
+             CAST(a AS TIMESTAMP(0)), CAST(a AS TIMESTAMP(3)), CAST(a AS TIMESTAMP(6)), \
+             CAST(a AS TIMESTAMP(9)), CAST(a AS TIMESTAMP(3)), CAST(a AS TIMESTAMP(3)), \
+             CAST(a AS TIMESTAMP(6)), CAST(a AS TIMESTAMP(6)), CAST(a AS TIMESTAMP(9)), \
+             CAST(a AS TIMESTAMP(9)), CAST(a AS TIMESTAMP(9))"
+        );
+    }
+
+    /// Column types in DDL are not rewritten: `timestamp` stays the
+    /// microsecond column Iceberg stores.
+    #[test]
+    fn ddl_timestamp_columns_are_not_rewritten() {
+        let sql = "CREATE TABLE t (ts timestamp, tz timestamp with time zone, p timestamp(3))";
+        assert_eq!(rewrite_trino_compat(sql), sql);
     }
 
     #[test]

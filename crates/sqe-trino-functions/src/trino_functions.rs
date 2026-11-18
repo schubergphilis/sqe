@@ -1070,16 +1070,17 @@ impl ScalarUDFImpl for TrinoNow {
         &SIG
     }
 
+    // Trino: `timestamp(3) with time zone` in the session zone, which is UTC.
     fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Microsecond,
-            None,
+            arrow::datatypes::TimeUnit::Millisecond,
+            Some("UTC".into()),
         ))
     }
 
     fn simplify(&self, args: Vec<Expr>, info: &SimplifyContext) -> DFResult<ExprSimplifyResult> {
         Ok(query_start_literal(args, info, |start| {
-            ScalarValue::TimestampMicrosecond(Some(start.timestamp_micros()), None)
+            ScalarValue::TimestampMillisecond(Some(start.timestamp_millis()), Some("UTC".into()))
         }))
     }
 
@@ -1544,16 +1545,17 @@ impl ScalarUDFImpl for LocalTimestamp {
         &SIG
     }
 
+    // Trino: `timestamp(3)` (no zone).
     fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Microsecond,
+            arrow::datatypes::TimeUnit::Millisecond,
             None,
         ))
     }
 
     fn simplify(&self, args: Vec<Expr>, info: &SimplifyContext) -> DFResult<ExprSimplifyResult> {
         Ok(query_start_literal(args, info, |start| {
-            ScalarValue::TimestampMicrosecond(Some(start.timestamp_micros()), None)
+            ScalarValue::TimestampMillisecond(Some(start.timestamp_millis()), None)
         }))
     }
 
@@ -2167,7 +2169,21 @@ mod tests {
             ("'hello'", "varchar"),
             ("true", "boolean"),
             ("DATE '2024-01-01'", "date"),
-            ("TIMESTAMP '2024-01-01 00:00:00'", "timestamp(6)"),
+            // No front-door rewrite runs in this test, so DataFusion's own
+            // nanosecond typing of the literal shows: the label is the unit's.
+            ("TIMESTAMP '2024-01-01 00:00:00'", "timestamp(9)"),
+            (
+                "CAST('2024-01-01 00:00:00' AS TIMESTAMP(0))",
+                "timestamp(0)",
+            ),
+            (
+                "CAST('2024-01-01 00:00:00' AS TIMESTAMP(3))",
+                "timestamp(3)",
+            ),
+            (
+                "CAST('2024-01-01 00:00:00' AS TIMESTAMP(6))",
+                "timestamp(6)",
+            ),
             ("make_array(1, 2)", "array(bigint)"),
             ("NULL", "unknown"),
         ] {

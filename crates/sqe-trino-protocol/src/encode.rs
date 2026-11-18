@@ -25,31 +25,52 @@ pub fn is_json_text(field: &Field) -> bool {
     ) && field.metadata().get(JSON_TEXT_MARKER).map(String::as_str) == Some("true")
 }
 
-/// Normalize a rendered timestamp string to exactly 6 fractional-second digits
-/// (truncating extra precision, padding shorter), preserving any trailing
-/// timezone offset (`+00:00`, `Z`). Trino reports these columns as
-/// `timestamp(6)`, so a nanosecond-backed value rendered with 9 digits (e.g.
-/// from `date_trunc`) and a microsecond CAST rendered with 6 must agree.
-fn normalize_timestamp_fraction(s: &str) -> String {
-    // Find where any timezone suffix begins: the first '+', '-', or 'Z' after
-    // the date (skip the first 11 chars: "YYYY-MM-DD " ) so the date's '-'
-    // separators are not mistaken for an offset.
-    let tz_start = s
-        .char_indices()
+/// The fractional-second digits Trino reports for an Arrow timestamp unit:
+/// `timestamp(0)` for seconds, 3 for milliseconds, 6 for microseconds and 9
+/// for nanoseconds. The type label and the rendered text both use this.
+fn timestamp_digits(unit: &arrow_schema::TimeUnit) -> usize {
+    match unit {
+        arrow_schema::TimeUnit::Second => 0,
+        arrow_schema::TimeUnit::Millisecond => 3,
+        arrow_schema::TimeUnit::Microsecond => 6,
+        arrow_schema::TimeUnit::Nanosecond => 9,
+    }
+}
+
+/// Where a rendered timestamp's zone suffix (`+00:00`, `-05:00`, `Z`) begins,
+/// or the string's length when it has none. The first 11 characters
+/// (`YYYY-MM-DD `) are skipped so the date's `-` separators are not mistaken
+/// for an offset.
+fn timestamp_zone_start(s: &str) -> usize {
+    s.char_indices()
         .skip(11)
         .find(|(_, c)| *c == '+' || *c == '-' || *c == 'Z')
         .map(|(i, _)| i)
-        .unwrap_or(s.len());
-    let (body, suffix) = s.split_at(tz_start);
+        .unwrap_or(s.len())
+}
+
+/// Normalize a rendered timestamp string to exactly `digits` fractional-second
+/// digits (truncating extra precision, padding shorter, none and no dot for
+/// 0), preserving any trailing timezone offset (`+00:00`, `Z`). The digits
+/// follow the column's unit, which is also its `timestamp(p)` label, so a
+/// value never shows more or fewer digits than its type claims.
+fn normalize_timestamp_fraction(s: &str, digits: usize) -> String {
+    let (body, suffix) = s.split_at(timestamp_zone_start(s));
 
     let normalized_body = if let Some(dot) = body.find('.') {
-        let mut frac: String = body[dot + 1..].chars().take(6).collect();
-        while frac.len() < 6 {
-            frac.push('0');
+        if digits == 0 {
+            body[..dot].to_string()
+        } else {
+            let mut frac: String = body[dot + 1..].chars().take(digits).collect();
+            while frac.len() < digits {
+                frac.push('0');
+            }
+            format!("{}.{}", &body[..dot], frac)
         }
-        format!("{}.{}", &body[..dot], frac)
+    } else if digits == 0 {
+        body.trim_end().to_string()
     } else {
-        format!("{}.000000", body.trim_end())
+        format!("{}.{}", body.trim_end(), "0".repeat(digits))
     };
     format!("{normalized_body}{suffix}")
 }
@@ -195,8 +216,9 @@ pub fn arrow_value_to_json(array: &dyn arrow_array::Array, row: usize) -> serde_
         }
         // Timestamps must use Trino format: "2024-03-20 08:00:00.000" (space separator, millis)
         // The JDBC driver rejects ISO 8601 "T" separator.
-        DataType::Timestamp(_, tz) => {
+        DataType::Timestamp(unit, tz) => {
             let s = display(array, row);
+            let digits = timestamp_digits(unit);
             // Replace 'T' with space (the JDBC driver rejects ISO 8601 'T').
             let s = s.replace('T', " ");
             // Strip timezone suffix for naive timestamps (Trino handles tz separately).
@@ -208,22 +230,23 @@ pub fn arrow_value_to_json(array: &dyn arrow_array::Array, row: usize) -> serde_
             } else {
                 s
             };
-            // Normalize to exactly 6 fractional digits so timestamp(6) renders
-            // consistently regardless of the backing unit -- date_trunc emits 9
-            // (nanosecond) while CAST emits 6, and the JDBC type is timestamp(6).
-            // (#5)
-            let s = normalize_timestamp_fraction(&s);
+            // Render exactly the digits of the column's `timestamp(p)` label
+            // (p follows the unit), so the text never disagrees with the type.
+            let s = normalize_timestamp_fraction(&s, digits);
             if tz.is_none() {
                 return serde_json::Value::String(s);
             }
             // Trino renders `timestamp with time zone` as `<local> <zone>`,
             // space separated; the Python client splits on that space. Arrow
             // writes the zone straight after the fraction (`Z`, `+02:00`).
-            let body_end = s.find('.').map_or(s.len(), |dot| dot + 7).min(s.len());
-            let (body, zone) = s.split_at(body_end);
-            let zone = match zone {
-                "" | "Z" | "+00:00" => "UTC",
-                z => z,
+            // The wall clock is already in the column's zone; the zone shown
+            // is that zone's name (`Europe/Amsterdam`), `UTC` for any UTC
+            // spelling, the offset text for an offset zone.
+            let (body, offset) = s.split_at(timestamp_zone_start(&s));
+            let zone = match tz.as_deref() {
+                Some("+00:00" | "Z" | "UTC" | "") => "UTC",
+                Some(name) => name,
+                None => offset,
             };
             serde_json::Value::String(format!("{body} {zone}"))
         }
@@ -434,9 +457,7 @@ pub fn arrow_to_declared_trino_type(dt: &DataType) -> String {
 }
 
 /// The column type `SHOW CREATE TABLE` writes: [`arrow_to_declared_trino_type`]
-/// with a timestamp's precision taken from its unit, so a nanosecond column
-/// is recreated as `timestamp(9)`, not as the `timestamp(6)` its values are
-/// served at.
+/// (a timestamp's precision comes from its unit in every spelling).
 pub fn arrow_to_ddl_trino_type(dt: &DataType) -> String {
     trino_type_name(dt, Spelling::Ddl)
 }
@@ -472,17 +493,10 @@ fn trino_type_name(dt: &DataType, spelling: Spelling) -> String {
         | DataType::FixedSizeBinary(_) => "varbinary".to_string(),
         DataType::Date32 | DataType::Date64 => "date".to_string(),
         DataType::Time32(_) | DataType::Time64(_) => "time".to_string(),
-        // Report an explicit precision. SQE timestamps are microsecond-backed
-        // and rendered to 6 fractional digits, so timestamp(6) / timestamp(6)
-        // with time zone is the consistent, Trino-accurate type. (#5) DDL
-        // keeps the stored unit, so the table is recreated as it was.
+        // The precision is the unit's: s 0, ms 3, us 6, ns 9, the same label
+        // on every spelling and the digits the values are rendered with.
         DataType::Timestamp(unit, tz) => {
-            let precision = match (spelling, unit) {
-                (Spelling::Ddl, arrow_schema::TimeUnit::Second) => 0,
-                (Spelling::Ddl, arrow_schema::TimeUnit::Millisecond) => 3,
-                (Spelling::Ddl, arrow_schema::TimeUnit::Nanosecond) => 9,
-                _ => 6,
-            };
+            let precision = timestamp_digits(unit);
             let zone = if tz.is_some() { " with time zone" } else { "" };
             format!("timestamp({precision}){zone}")
         }
@@ -559,23 +573,45 @@ mod tests {
     fn test_normalize_timestamp_fraction() {
         // Truncate 9 (nanosecond) -> 6.
         assert_eq!(
-            normalize_timestamp_fraction("2024-03-20 08:00:00.123456789"),
+            normalize_timestamp_fraction("2024-03-20 08:00:00.123456789", 6),
             "2024-03-20 08:00:00.123456"
         );
-        // Pad missing fractional -> .000000.
+        // Pad missing fractional.
         assert_eq!(
-            normalize_timestamp_fraction("2024-03-20 08:00:00"),
+            normalize_timestamp_fraction("2024-03-20 08:00:00", 6),
             "2024-03-20 08:00:00.000000"
+        );
+        assert_eq!(
+            normalize_timestamp_fraction("2024-03-20 08:00:00", 3),
+            "2024-03-20 08:00:00.000"
+        );
+        // Keep every nanosecond digit at 9.
+        assert_eq!(
+            normalize_timestamp_fraction("2024-03-20 08:00:00.5", 9),
+            "2024-03-20 08:00:00.500000000"
+        );
+        // Zero digits: no fraction and no dot.
+        assert_eq!(
+            normalize_timestamp_fraction("2024-03-20 08:00:00", 0),
+            "2024-03-20 08:00:00"
+        );
+        assert_eq!(
+            normalize_timestamp_fraction("2024-03-20 08:00:00.5", 0),
+            "2024-03-20 08:00:00"
         );
         // Already 6 -> unchanged.
         assert_eq!(
-            normalize_timestamp_fraction("2024-03-20 08:00:00.500000"),
+            normalize_timestamp_fraction("2024-03-20 08:00:00.500000", 6),
             "2024-03-20 08:00:00.500000"
         );
         // Preserve a timezone offset suffix while normalizing the fraction.
         assert_eq!(
-            normalize_timestamp_fraction("2024-03-20 08:00:00.123456789+00:00"),
+            normalize_timestamp_fraction("2024-03-20 08:00:00.123456789+00:00", 6),
             "2024-03-20 08:00:00.123456+00:00"
+        );
+        assert_eq!(
+            normalize_timestamp_fraction("2024-03-20 08:00:00+02:00", 0),
+            "2024-03-20 08:00:00+02:00"
         );
     }
 
@@ -691,16 +727,70 @@ mod tests {
         );
     }
 
+    /// The label and the digits both follow the unit: second 0, millisecond
+    /// 3, microsecond 6, nanosecond 9.
+    #[test]
+    fn timestamp_label_and_digits_follow_the_unit() {
+        use arrow_array::types::{
+            TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+            TimestampSecondType,
+        };
+        use arrow_schema::TimeUnit;
+        let sec = 1_710_921_600i64;
+        let render = |arr: &dyn arrow_array::Array| arrow_value_to_json(arr, 0);
+        let s = arrow_array::PrimitiveArray::<TimestampSecondType>::from(vec![sec]);
+        let ms =
+            arrow_array::PrimitiveArray::<TimestampMillisecondType>::from(vec![sec * 1000 + 5]);
+        let us = arrow_array::PrimitiveArray::<TimestampMicrosecondType>::from(vec![
+            sec * 1_000_000 + 5,
+        ]);
+        let ns = arrow_array::PrimitiveArray::<TimestampNanosecondType>::from(vec![
+            sec * 1_000_000_000 + 5,
+        ]);
+        assert_eq!(render(&s), serde_json::json!("2024-03-20 08:00:00"));
+        assert_eq!(render(&ms), serde_json::json!("2024-03-20 08:00:00.005"));
+        assert_eq!(render(&us), serde_json::json!("2024-03-20 08:00:00.000005"));
+        assert_eq!(
+            render(&ns),
+            serde_json::json!("2024-03-20 08:00:00.000000005")
+        );
+        for (unit, label) in [
+            (TimeUnit::Second, "timestamp(0)"),
+            (TimeUnit::Millisecond, "timestamp(3)"),
+            (TimeUnit::Microsecond, "timestamp(6)"),
+            (TimeUnit::Nanosecond, "timestamp(9)"),
+        ] {
+            let dt = DataType::Timestamp(unit, None);
+            assert_eq!(arrow_to_trino_type(&dt), label);
+            assert_eq!(arrow_to_declared_trino_type(&dt), label);
+            assert_eq!(arrow_to_ddl_trino_type(&dt), label);
+            let zoned = DataType::Timestamp(unit, Some("UTC".into()));
+            assert_eq!(
+                arrow_to_trino_type(&zoned),
+                format!("{label} with time zone")
+            );
+        }
+    }
+
     /// `timestamp with time zone` values are `<local> <zone>` like Trino's,
     /// not Arrow's `...Z` / `...+02:00`: the Python client splits on the space.
     #[test]
     fn zoned_timestamp_renders_the_zone_after_a_space() {
-        use arrow_array::types::TimestampMicrosecondType;
+        use arrow_array::types::{TimestampMicrosecondType, TimestampMillisecondType};
         let micros = 1_710_921_600_500_000i64;
         let cases = [
             ("+00:00", "2024-03-20 08:00:00.500000 UTC"),
             ("UTC", "2024-03-20 08:00:00.500000 UTC"),
             ("+02:00", "2024-03-20 10:00:00.500000 +02:00"),
+            // A region renders its name, not the offset in force.
+            (
+                "Europe/Amsterdam",
+                "2024-03-20 09:00:00.500000 Europe/Amsterdam",
+            ),
+            (
+                "America/New_York",
+                "2024-03-20 04:00:00.500000 America/New_York",
+            ),
         ];
         for (tz, expected) in cases {
             let arr = arrow_array::PrimitiveArray::<TimestampMicrosecondType>::from(vec![micros])
@@ -711,6 +801,14 @@ mod tests {
                 "{tz}"
             );
         }
+        let ms = arrow_array::PrimitiveArray::<TimestampMillisecondType>::from(vec![
+            1_710_921_600_500i64,
+        ])
+        .with_timezone("+02:00");
+        assert_eq!(
+            arrow_value_to_json(&ms, 0),
+            serde_json::json!("2024-03-20 10:00:00.500 +02:00")
+        );
     }
 
     #[test]

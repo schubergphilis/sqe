@@ -39,6 +39,13 @@ mod tests {
             )),
             "timestamp(6) with time zone"
         );
+        for (unit, label) in [
+            (arrow_schema::TimeUnit::Second, "timestamp(0)"),
+            (arrow_schema::TimeUnit::Millisecond, "timestamp(3)"),
+            (arrow_schema::TimeUnit::Nanosecond, "timestamp(9)"),
+        ] {
+            assert_eq!(arrow_to_trino_type(&DataType::Timestamp(unit, None)), label);
+        }
     }
 
     #[test]
@@ -189,10 +196,17 @@ mod tests {
                         TrinoType::Decimal { precision: p, scale: s }
                     );
                 }
-                DataType::Timestamp(_, tz) => {
+                DataType::Timestamp(unit, tz) => {
+                    // The precision is the unit's: s 0, ms 3, us 6, ns 9.
+                    let precision = match unit {
+                        arrow_schema::TimeUnit::Second => 0,
+                        arrow_schema::TimeUnit::Millisecond => 3,
+                        arrow_schema::TimeUnit::Microsecond => 6,
+                        arrow_schema::TimeUnit::Nanosecond => 9,
+                    };
                     proptest::prop_assert_eq!(
                         parsed,
-                        TrinoType::Timestamp { precision: 6, with_time_zone: tz.is_some() }
+                        TrinoType::Timestamp { precision, with_time_zone: tz.is_some() }
                     );
                 }
                 _ => {}

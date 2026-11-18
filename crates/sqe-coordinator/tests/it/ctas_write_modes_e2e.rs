@@ -571,7 +571,7 @@ async fn show_create_table_round_trips_its_column_types() {
         "   d decimal(10,2)",
         "   f double",
         "   t boolean",
-        "   ts timestamp(9)",
+        "   ts timestamp(6)",
         "   s varchar",
         "   dt date",
         "   r row(x bigint,y varchar)",
