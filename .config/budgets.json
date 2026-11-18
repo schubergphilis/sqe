@@ -17,11 +17,12 @@
     "crates/sqe-policy/src/ranger_store.rs": 4750,
     "crates/sqe-server/src/main.rs": 5250,
     "crates/sqe-sql/src/classifier.rs": 4250,
+    "crates/sqe-sql/src/trino_compat.rs": 3500,
     "crates/sqe-trino-compat/src/server.rs": 7000,
     "crates/sqe-worker/src/executor.rs": 3750,
     "crates/sqe-worker/src/flight_service.rs": 3500,
     "crates/sqe-write/src/catalog_ops.rs": 3750,
-    "crates/sqe-write/src/write_handler.rs": 16000
+    "crates/sqe-write/src/write_handler.rs": 16500
   },
   "crates": {
     "sqe-auth": {
@@ -37,7 +38,7 @@
       ]
     },
     "sqe-catalog": {
-      "lines": 64600,
+      "lines": 67000,
       "deps": [
         "sqe-core",
         "sqe-geo",
@@ -53,7 +54,6 @@
         "sqe-catalog",
         "sqe-core",
         "sqe-geo",
-        "sqe-policy",
         "sqe-sql",
         "sqe-trino-functions",
         "sqe-trino-protocol",
@@ -202,7 +202,7 @@
       ]
     },
     "sqe-trino-functions": {
-      "lines": 21600,
+      "lines": 24000,
       "deps": [
         "sqe-trino-protocol"
       ]

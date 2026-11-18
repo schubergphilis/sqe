@@ -7051,7 +7051,6 @@ dependencies = [
  "sqe-catalog",
  "sqe-core",
  "sqe-geo",
- "sqe-policy",
  "sqe-sql",
  "sqe-trino-functions",
  "sqe-trino-protocol",
