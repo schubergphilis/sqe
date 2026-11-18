@@ -175,6 +175,14 @@ impl ScalarUDFImpl for ElementAt {
         if let Some(list) = container.as_any().downcast_ref::<ListArray>() {
             let offsets = list.value_offsets();
             let values = list.values();
+            // Trino coerces an `integer` index to `bigint`; integer literals
+            // are `integer` since the literal-typing change.
+            if !keys.data_type().is_integer() {
+                return Err(DataFusionError::Plan(
+                    "element_at: array index must be an integer".into(),
+                ));
+            }
+            let keys = arrow::compute::cast(&keys, &DataType::Int64)?;
             let idx = keys.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                 DataFusionError::Plan("element_at: array index must be bigint".into())
             })?;
@@ -605,6 +613,15 @@ mod tests {
         assert_eq!(
             one_i64("SELECT element_at(make_array(10,20,30), 0)").await,
             None
+        );
+        // An `integer` index (integer literals are `integer`, as in Trino).
+        assert_eq!(
+            one_i64("SELECT element_at(make_array(10,20,30), CAST(2 AS INTEGER))").await,
+            Some(20)
+        );
+        assert_eq!(
+            one_i64("SELECT element_at(make_array(10,20,30), CAST(-1 AS SMALLINT))").await,
+            Some(30)
         );
     }
 

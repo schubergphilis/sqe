@@ -424,8 +424,8 @@ aikido-sbom:
 # A stale pin fails silently: cargo reuses a baked crate only when rustc, the
 # package id and the features all match, so an image built before a toolchain
 # bump is rebuilt from `proc-macro2` in every job and nothing turns red. The
-# digest below is `ci-deps:lock-a3137de30f85`, built from 552cccbe with rustc
-# 1.100.0 and vendor/ tree 2dc7f629 (digest sha256:1496ad27). Refresh it after any merge that changes
+# digest below is `ci-deps:lock-fa9b8dfe478d`, built from 2b9a287c with rustc
+# 1.100.0 and vendor/ tree 2dc7f629 (digest sha256:8909b622). Refresh it after any merge that changes
 # rust-toolchain.toml, Cargo.lock or vendor/: the `ci-deps-image` job on main
 # prints the new digest on its last lines.
 # Rules copied from the aikido test-rust template minus the default-branch
@@ -442,7 +442,7 @@ aikido-test-rust:
       exists: ["**/Cargo.toml"]
       changes: *sqe_rust_changes
       allow_failure: false
-  image: "$CI_REGISTRY_IMAGE/ci-deps:main@sha256:1496ad27dbb7103257ec18b58ad75ac4e987037439f49636088d164ab387844b"
+  image: "$CI_REGISTRY_IMAGE/ci-deps:main@sha256:8909b6227120397f85f1dc5539a5b768e646c4bbaf7f24360a97a469e7c1123e"
   variables:
     AIKIDO_SHARED_SCRIPTS: "reuse-deps-image.sh"
     CARGO_TARGET_DIR: "/opt/sqe-deps/target"
@@ -458,7 +458,7 @@ aikido-rust-extra:
       exists: ["ci/aikido-rust-extra.sh"]
       changes: *sqe_rust_changes
       allow_failure: false
-  image: "$CI_REGISTRY_IMAGE/ci-deps:main@sha256:1496ad27dbb7103257ec18b58ad75ac4e987037439f49636088d164ab387844b"
+  image: "$CI_REGISTRY_IMAGE/ci-deps:main@sha256:8909b6227120397f85f1dc5539a5b768e646c4bbaf7f24360a97a469e7c1123e"
   variables:
     AIKIDO_SHARED_SCRIPTS: "reuse-deps-image.sh"
     CARGO_TARGET_DIR: "/opt/sqe-deps/target"

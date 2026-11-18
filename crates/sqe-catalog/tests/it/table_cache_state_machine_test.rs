@@ -273,10 +273,9 @@ async fn stale_entry_revalidates_with_if_none_match_and_reuses_on_304() {
         "the stale lookup is exactly one conditional GET"
     );
 
-    // 304 refreshed the soft TTL: the next lookups are fresh hits. The first
-    // pays the authorization HEAD (neither the cold load nor the 304 marks
-    // the principal authorized); within the recheck window the second pays
-    // nothing.
+    // 304 refreshed the soft TTL and, since #903, the authorization window:
+    // the conditional GET is `loadTable` itself, authorized like the HEAD.
+    // The next lookups are fresh hits that pay nothing.
     catalog
         .load_table(&orders())
         .await
@@ -285,7 +284,7 @@ async fn stale_entry_revalidates_with_if_none_match_and_reuses_on_304() {
         .load_table(&orders())
         .await
         .expect("fresh after 304");
-    assert_eq!(table_request_counts(&server).await, (1, 1, 2));
+    assert_eq!(table_request_counts(&server).await, (1, 1, 1));
 }
 
 /// Stale entry whose ETag no longer matches: the conditional `GET` returns
