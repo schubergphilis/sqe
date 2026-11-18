@@ -233,6 +233,13 @@ ring = "0.17"
 # Crypto
 sha2 = "0.11"
 hmac = "0.13"
+# Trino hash functions (md5, sha1, crc32, xxhash64, murmur3); same digest 0.11
+# generation as sha2 / hmac, so they add no second digest copy.
+md-5 = "0.11"
+sha1 = "0.11"
+crc32fast = "1"
+murmur3 = "0.5"
+twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
 hex = "0.4"
 base64 = "0.23"
 subtle = "2"

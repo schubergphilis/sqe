@@ -357,14 +357,19 @@ async fn test_to_base64() {
 
 #[tokio::test]
 async fn test_from_base64() {
+    // varbinary result: Arrow renders the bytes as hex.
     let v = eval_str("SELECT from_base64('aGVsbG8=')").await;
+    assert_eq!(v, Some("68656c6c6f".to_string()));
+    let v = eval_str("SELECT from_utf8(from_base64('aGVsbG8='))").await;
     assert_eq!(v, Some("hello".to_string()));
 }
 
 #[tokio::test]
 async fn test_from_hex() {
-    // "hello" in hex (lowercase input should work too)
+    // "hello" in hex (lowercase input should work too); result is varbinary.
     let v = eval_str("SELECT from_hex('68656c6c6f')").await;
+    assert_eq!(v, Some("68656c6c6f".to_string()));
+    let v = eval_str("SELECT from_utf8(from_hex('68656c6c6f'))").await;
     assert_eq!(v, Some("hello".to_string()));
 }
 
@@ -1685,19 +1690,26 @@ async fn to_base_rejects_out_of_range_radix() {
 #[tokio::test]
 async fn from_hex_handles_non_ascii_without_panicking() {
     // SQL-03: a non-ASCII argument used to panic on a char-boundary slice.
-    // It must now complete (returning some string) without aborting.
-    assert!(!exec_errors("SELECT from_hex('café')").await);
+    // Trino rejects a non-hex digit, so it is a clean error, never a panic.
+    assert!(exec_errors("SELECT from_hex('café')").await);
     // The ASCII happy path is preserved: '41' hex -> 'A'.
     assert_eq!(
-        eval_str("SELECT from_hex('41')").await.as_deref(),
+        eval_str("SELECT from_utf8(from_hex('41'))")
+            .await
+            .as_deref(),
         Some("A")
     );
 }
 
 #[tokio::test]
 async fn from_utf8_handles_non_ascii_without_panicking() {
-    // SQL-03: same char-boundary hazard on from_utf8.
-    assert!(!exec_errors("SELECT from_utf8('café')").await);
+    // SQL-03: same char-boundary hazard on from_utf8, now over varbinary.
+    assert_eq!(
+        eval_str("SELECT from_utf8(to_utf8('café'))")
+            .await
+            .as_deref(),
+        Some("café")
+    );
 }
 
 #[tokio::test]

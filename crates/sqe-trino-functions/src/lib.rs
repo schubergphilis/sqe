@@ -17,6 +17,7 @@
 //! regex). See openspec change `split-trino-functions`.
 
 pub mod aggregates;
+pub mod binary_fns;
 pub mod central_moments;
 pub mod coverage_fns;
 pub(crate) mod helpers;

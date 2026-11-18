@@ -19,10 +19,11 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, ListArray,
-    RecordBatch, StringArray, StringViewArray, TimestampMicrosecondArray, TimestampNanosecondArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array,
+    Int32Array, Int64Array, ListArray, RecordBatch, StringArray, StringViewArray,
+    TimestampMicrosecondArray, TimestampNanosecondArray,
 };
-use datafusion::arrow::datatypes::{DataType, Field, Int32Type, Schema, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Field, Float64Type, Int32Type, Schema, TimeUnit};
 use datafusion::arrow::util::display::array_value_to_string;
 use datafusion::common::ScalarValue;
 use datafusion::datasource::MemTable;
@@ -505,10 +506,39 @@ col_case!(
     "url_encode(view_a)",
     [s("Robert"), s("Tymczak"), None]
 );
+// varbinary result; Arrow renders the bytes as hex.
 col_case!(
     col_from_base64,
     "from_base64(b64_a)",
+    [s("68656c6c6f"), s("776f726c64"), None]
+);
+col_case!(
+    col_from_utf8_from_base64,
+    "from_utf8(from_base64(b64_a))",
     [s("hello"), s("world"), None]
+);
+col_case!(
+    col_to_hex_varbinary,
+    "to_hex(from_base64(b64_a))",
+    [s("68656C6C6F"), s("776F726C64"), None]
+);
+col_case!(
+    col_sha1_varbinary,
+    "sha1(from_base64(b64_a))",
+    [
+        s("aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"),
+        s("7c211433f02071597741e6ff5a8ea34789abbf43"),
+        None
+    ]
+);
+col_case!(
+    col_md5_varbinary,
+    "md5(from_base64(b64_a))",
+    [
+        s("5d41402abc4b2a76b9719d911017c592"),
+        s("7d793037a0760186574b0282f2f435e7"),
+        None
+    ]
 );
 col_case!(
     col_json_extract_scalar,
@@ -684,6 +714,14 @@ enum Kind {
     Hex,
     Char,
     ListInt,
+    ListDbl,
+    /// varbinary of arbitrary length.
+    Bin,
+    /// varbinary of exactly 4 and 8 bytes (the fixed-width decoders).
+    Bin4,
+    Bin8,
+    Real,
+    B32,
 }
 
 fn make_array(kind: Kind) -> ArrayRef {
@@ -724,6 +762,24 @@ fn make_array(kind: Kind) -> ArrayRef {
             Some(vec![Some(4), Some(5)]),
             Some(vec![Some(6)]),
         ])),
+        Kind::ListDbl => Arc::new(ListArray::from_iter_primitive::<Float64Type, _, _>(vec![
+            Some(vec![Some(1.0), Some(2.0), Some(3.0)]),
+            Some(vec![Some(4.0), Some(5.0), Some(6.0)]),
+            Some(vec![Some(0.5), Some(0.25), Some(2.0)]),
+        ])),
+        Kind::Bin => Arc::new(BinaryArray::from_vec(vec![b"hello", b"world", b"x"])),
+        Kind::Bin4 => Arc::new(BinaryArray::from_vec(vec![
+            &[0, 0, 0, 1],
+            &[0x3f, 0x80, 0, 0],
+            &[0xff, 0xff, 0xff, 0xfe],
+        ])),
+        Kind::Bin8 => Arc::new(BinaryArray::from_vec(vec![
+            &[0, 0, 0, 0, 0, 0, 0, 1],
+            &[0x3f, 0xf0, 0, 0, 0, 0, 0, 0],
+            &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe],
+        ])),
+        Kind::Real => Arc::new(Float32Array::from(vec![1.5f32, -2.0, 0.25])),
+        Kind::B32 => Arc::new(StringArray::from(vec!["NBSWY3DP", "O5XXE3DE", "PA======"])),
     }
 }
 
@@ -784,8 +840,19 @@ fn arg_specs(name: &str) -> Option<Vec<ArgSpec>> {
         | "url_extract_query" => vec![Col(Url)],
         "url_extract_parameter" => vec![Col(Url), LitStr("q")],
         "url_encode" | "url_decode" | "to_base64" | "to_utf8" => vec![Col(Str)],
-        "from_base64" => vec![Col(B64)],
-        "from_hex" | "from_utf8" => vec![Col(Hex)],
+        "from_base64" | "from_base64url" => vec![Col(B64)],
+        "from_hex" => vec![Col(Hex)],
+        "from_base32" => vec![Col(B32)],
+        "to_base64url" | "to_base32" => vec![Col(Bin)],
+        "from_utf8" | "sha1" | "crc32" | "xxhash64" | "murmur3" => vec![Col(Bin)],
+        "hmac_md5" | "hmac_sha1" | "hmac_sha256" | "hmac_sha512" => vec![Col(Bin), Col(Bin)],
+        "to_ieee754_32" => vec![Col(Real)],
+        "to_ieee754_64" => vec![Col(Float)],
+        "to_big_endian_32" => vec![Col(Int32)],
+        "to_big_endian_64" => vec![Col(Int)],
+        "from_ieee754_32" | "from_big_endian_32" => vec![Col(Bin4)],
+        "from_ieee754_64" | "from_big_endian_64" => vec![Col(Bin8)],
+        "cosine_similarity" => vec![Col(ListDbl), Col(ListDbl)],
         "json_extract" | "json_extract_scalar" => vec![Col(Json), LitStr("$.a")],
         "mod" => vec![Col(Int), Col(Int32)],
         "truncate" => vec![Col(Float)],

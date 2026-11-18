@@ -28,6 +28,8 @@ use sqe_trino_protocol::encode;
 
 /// Register all Trino-compatible function aliases on a SessionContext.
 pub fn register_trino_functions(ctx: &datafusion::prelude::SessionContext) {
+    // Rebuilds the session state, so it goes before any function is registered.
+    crate::binary_fns::install_substring_planner(ctx);
     // Date/time extract functions
     ctx.register_udf(ScalarUDF::from(ExtractYear));
     ctx.register_udf(ScalarUDF::from(ExtractMonth));
@@ -78,17 +80,6 @@ pub fn register_trino_functions(ctx: &datafusion::prelude::SessionContext) {
     ctx.register_udf(ScalarUDF::from(UrlEncode));
     ctx.register_udf(ScalarUDF::from(UrlDecode));
 
-    // Encoding functions
-    ctx.register_udf(ScalarUDF::from(FromBase64));
-    ctx.register_udf(ScalarUDF::from(ToBase64));
-    ctx.register_udf(ScalarUDF::from(FromHex));
-    // Note: ToHex intentionally NOT registered — DataFusion 52 has a built-in
-    // to_hex(integer) that formats integers as hex strings. Registering our
-    // string-byte variant would shadow it and break integer callers. Users can
-    // use encode(s, 'hex') for binary→hex conversion.
-    ctx.register_udf(ScalarUDF::from(FromUtf8));
-    ctx.register_udf(ScalarUDF::from(ToUtf8));
-
     // Trino JSON aliases — map Trino names to lightweight serde_json-based impls
     ctx.register_udf(ScalarUDF::from(JsonExtract));
     ctx.register_udf(ScalarUDF::from(JsonExtractScalar));
@@ -123,6 +114,10 @@ pub fn register_trino_functions(ctx: &datafusion::prelude::SessionContext) {
 
     // count_if, element_at (array/map), contains (array) (#356).
     crate::coverage_fns::register_coverage_fns(ctx);
+
+    // varbinary hashes and encodings, plus binary-aware md5 / to_hex / lpad /
+    // rpad / substr. After the built-ins, whose names the overrides take over.
+    crate::binary_fns::register_binary_fns(ctx);
 
     // DataFusion's `to_char` and `map_extract` claim `date_format` and
     // `element_at` as aliases. Left claiming them, either could take the key
@@ -2367,93 +2362,8 @@ impl ScalarUDFImpl for UrlDecode {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Encoding functions: base64, hex, utf8
-// ---------------------------------------------------------------------------
-
-use base64::Engine as _;
-
-macro_rules! encoding_udf {
-    ($name:ident, $func_name:expr, $transform:expr) => {
-        #[derive(Debug, PartialEq, Eq, Hash)]
-        struct $name;
-
-        impl ScalarUDFImpl for $name {
-            fn name(&self) -> &str {
-                $func_name
-            }
-            fn signature(&self) -> &Signature {
-                static SIG: std::sync::LazyLock<Signature> = std::sync::LazyLock::new(|| {
-                    Signature::uniform(1, vec![DataType::Utf8], Volatility::Immutable)
-                });
-                &SIG
-            }
-            fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-                Ok(DataType::Utf8)
-            }
-            fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-                let transform = $transform;
-                str_transform($func_name, &args.args[0], |s| Some(transform(s)))
-            }
-        }
-    };
-}
-
-encoding_udf!(ToBase64, "to_base64", |s: &str| {
-    base64::engine::general_purpose::STANDARD.encode(s.as_bytes())
-});
-
-encoding_udf!(FromBase64, "from_base64", |s: &str| {
-    base64::engine::general_purpose::STANDARD
-        .decode(s.as_bytes())
-        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-        .unwrap_or_default()
-});
-
-// Note: ToHex removed — DataFusion 52 has a built-in to_hex(integer) and
-// shadowing it breaks integer hex formatting. Use encode(s, 'hex') instead.
-
-encoding_udf!(FromHex, "from_hex", |s: &str| {
-    // Slice the BYTE view, not the &str: stepping by 2 over a string with
-    // multi-byte UTF-8 characters and slicing `&s[i..i+2]` lands inside a
-    // character and panics ("not a char boundary"). Hex pairs are ASCII, so
-    // operating on the raw bytes is both correct and panic-free.
-    let raw = s.as_bytes();
-    let bytes: Vec<u8> = (0..raw.len())
-        .step_by(2)
-        .filter_map(|i| {
-            raw.get(i..i + 2)
-                .and_then(|pair| std::str::from_utf8(pair).ok())
-                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
-        })
-        .collect();
-    String::from_utf8_lossy(&bytes).to_string()
-});
-
-encoding_udf!(ToUtf8, "to_utf8", |s: &str| {
-    // Trino to_utf8 converts VARCHAR → VARBINARY; we return hex-encoded for string compat.
-    s.bytes().map(|b| format!("{:02X}", b)).collect::<String>()
-});
-
-encoding_udf!(FromUtf8, "from_utf8", |s: &str| {
-    // Trino from_utf8 converts VARBINARY → VARCHAR; we accept hex-encoded string.
-    // Slice the BYTE view, not the &str, so a non-ASCII input cannot panic on a
-    // char-boundary slice.
-    let raw = s.as_bytes();
-    let bytes: Vec<u8> = (0..raw.len())
-        .step_by(2)
-        .filter_map(|i| {
-            raw.get(i..i + 2)
-                .and_then(|pair| std::str::from_utf8(pair).ok())
-                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
-        })
-        .collect();
-    if bytes.is_empty() {
-        s.to_string()
-    } else {
-        String::from_utf8_lossy(&bytes).to_string()
-    }
-});
+// The base64 / hex / utf8 encoding functions live in `binary_fns` (Trino
+// `varbinary` in and out).
 
 // ---------------------------------------------------------------------------
 // Trino JSON aliases — thin wrappers backed by serde_json
