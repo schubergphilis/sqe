@@ -30,7 +30,6 @@ pub fn register_extended_trino_functions(ctx: &datafusion::prelude::SessionConte
     ctx.register_udf(ScalarUDF::from(JsonArrayContains));
 
     // Simple UDFs
-    ctx.register_udf(ScalarUDF::from(Soundex));
     ctx.register_udf(ScalarUDF::from(HammingDistance));
     ctx.register_udf(ScalarUDF::from(FromBase));
     ctx.register_udf(ScalarUDF::from(ToBase));
@@ -38,14 +37,12 @@ pub fn register_extended_trino_functions(ctx: &datafusion::prelude::SessionConte
     ctx.register_udf(ScalarUDF::from(FromIso8601Timestamp));
     ctx.register_udf(ScalarUDF::from(ToIso8601));
     ctx.register_udf(ScalarUDF::from(CurrentTimezone));
-    ctx.register_udf(ScalarUDF::from(HumanReadableSeconds));
     ctx.register_udf(ScalarUDF::from(LastDayOfMonth));
 
     // Medium UDFs
     ctx.register_udf(ScalarUDF::from(RegexpExtract));
     ctx.register_udf(ScalarUDF::from(RegexpExtractAll));
     ctx.register_udf(ScalarUDF::from(RegexpSplit));
-    ctx.register_udf(ScalarUDF::from(Normalize));
     ctx.register_udf(ScalarUDF::from(WithTimezone));
     ctx.register_udf(ScalarUDF::from(AtTimezone));
 
@@ -98,8 +95,8 @@ pub fn register_extended_trino_functions(ctx: &datafusion::prelude::SessionConte
 
 use crate::helpers::{
     arg, lift1, lift2, micros_to_local_naive, str_transform, str_transform_2, strftime_naive,
-    tag_timezone, unexpected_parameters, AnyArg, DateArg, DateDays, F64Arg, FromColumnar, I64Arg, RowArg, StrArg,
-    TsArg, TsMicros, Zone,
+    tag_timezone, unexpected_parameters, AnyArg, DateArg, DateDays, FromColumnar, I64Arg, RowArg,
+    StrArg, TsArg, TsMicros, Zone,
 };
 
 /// Epoch day zero, shared by the date helpers below.
@@ -271,66 +268,6 @@ fn check_json_array_contains(json: &str, search_val: &str) -> bool {
 // ═══════════════════════════════════════════════════════════════════
 // SIMPLE UDFs
 // ═══════════════════════════════════════════════════════════════════
-
-/// soundex(s) → 4-character Soundex phonetic code
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct Soundex;
-
-impl ScalarUDFImpl for Soundex {
-    fn name(&self) -> &str {
-        "soundex"
-    }
-    fn signature(&self) -> &Signature {
-        static SIG: LazyLock<Signature> =
-            LazyLock::new(|| Signature::any(1, Volatility::Immutable));
-        &SIG
-    }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Utf8)
-    }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        str_transform("soundex", &args.args[0], |s| Some(compute_soundex(s)))
-    }
-}
-
-fn compute_soundex(s: &str) -> String {
-    let s = s.to_uppercase();
-    let mut chars = s.chars().filter(|c| c.is_ascii_alphabetic());
-    let first = match chars.next() {
-        Some(c) => c,
-        None => return "0000".to_string(),
-    };
-    let code = |c: char| -> Option<char> {
-        match c {
-            'B' | 'F' | 'P' | 'V' => Some('1'),
-            'C' | 'G' | 'J' | 'K' | 'Q' | 'S' | 'X' | 'Z' => Some('2'),
-            'D' | 'T' => Some('3'),
-            'L' => Some('4'),
-            'M' | 'N' => Some('5'),
-            'R' => Some('6'),
-            _ => None,
-        }
-    };
-    let mut result = String::with_capacity(4);
-    result.push(first);
-    let mut last_code = code(first);
-    for c in chars {
-        let c_code = code(c);
-        if let Some(cc) = c_code {
-            if c_code != last_code {
-                result.push(cc);
-            }
-            if result.len() == 4 {
-                break;
-            }
-        }
-        last_code = c_code;
-    }
-    while result.len() < 4 {
-        result.push('0');
-    }
-    result
-}
 
 /// hamming_distance(s1, s2) → number of positions where characters differ
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -661,45 +598,6 @@ impl ScalarUDFImpl for CurrentTimezone {
     }
 }
 
-/// human_readable_seconds(n) → VARCHAR human-friendly duration string
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct HumanReadableSeconds;
-
-impl ScalarUDFImpl for HumanReadableSeconds {
-    fn name(&self) -> &str {
-        "human_readable_seconds"
-    }
-    fn signature(&self) -> &Signature {
-        static SIG: LazyLock<Signature> =
-            LazyLock::new(|| Signature::any(1, Volatility::Immutable));
-        &SIG
-    }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Utf8)
-    }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let secs: F64Arg = arg("human_readable_seconds", "double", &args.args, 0)?;
-        lift1(&secs, |s| Ok(Some(format_seconds(s))))
-    }
-}
-
-fn format_seconds(total: f64) -> String {
-    let total = total.abs();
-    let hours = (total / 3600.0) as u64;
-    let minutes = ((total % 3600.0) / 60.0) as u64;
-    let seconds = total % 60.0;
-    if hours > 0 {
-        format!(
-            "{} hours, {} minutes, {:.2} seconds",
-            hours, minutes, seconds
-        )
-    } else if minutes > 0 {
-        format!("{} minutes, {:.2} seconds", minutes, seconds)
-    } else {
-        format!("{:.2} seconds", seconds)
-    }
-}
-
 /// last_day_of_month(date) → DATE — the last calendar day of the month containing `date`
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct LastDayOfMonth;
@@ -1010,37 +908,6 @@ fn build_regex_list_array(
         builder.append(true);
     }
     Ok(ColumnarValue::Array(Arc::new(builder.finish()) as ArrayRef))
-}
-
-/// normalize(s, form) → Unicode-normalized string (NFC/NFD/NFKC/NFKD)
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct Normalize;
-
-impl ScalarUDFImpl for Normalize {
-    fn name(&self) -> &str {
-        "normalize"
-    }
-    fn signature(&self) -> &Signature {
-        static SIG: LazyLock<Signature> =
-            LazyLock::new(|| Signature::any(2, Volatility::Immutable));
-        &SIG
-    }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Utf8)
-    }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        use unicode_normalization::UnicodeNormalization;
-        str_transform_2("normalize", &args.args, |s, form| {
-            let result = match form.to_uppercase().as_str() {
-                "NFC" => s.nfc().collect::<String>(),
-                "NFD" => s.nfd().collect::<String>(),
-                "NFKC" => s.nfkc().collect::<String>(),
-                "NFKD" => s.nfkd().collect::<String>(),
-                _ => s.nfc().collect::<String>(),
-            };
-            Some(result)
-        })
-    }
 }
 
 /// Resolve the constant time-zone argument of `with_timezone` / `at_timezone`.

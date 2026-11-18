@@ -117,7 +117,7 @@ async fn trino_stats_report_the_bytes_a_select_read() {
     for sql in [
         format!("DROP TABLE IF EXISTS {t}"),
         format!("CREATE TABLE {t} (id BIGINT, s VARCHAR)"),
-        format!("INSERT INTO {t} SELECT value, repeat('x', 64) FROM generate_series(1, 5000)"),
+        format!("INSERT INTO {t} SELECT value, rpad('', 64, 'x') FROM generate_series(1, 5000)"),
     ] {
         handler
             .execute(&session, &sql, None)
@@ -211,8 +211,8 @@ async fn trino_stats_report_bytes_for_a_distributed_scan() {
     for sql in [
         format!("DROP TABLE IF EXISTS {t}"),
         format!("CREATE TABLE {t} (id BIGINT, s VARCHAR)"),
-        format!("INSERT INTO {t} SELECT value, repeat('x', 64) FROM generate_series(1, 5000)"),
-        format!("INSERT INTO {t} SELECT value, repeat('y', 64) FROM generate_series(5001, 9000)"),
+        format!("INSERT INTO {t} SELECT value, rpad('', 64, 'x') FROM generate_series(1, 5000)"),
+        format!("INSERT INTO {t} SELECT value, rpad('', 64, 'y') FROM generate_series(5001, 9000)"),
     ] {
         setup
             .execute(&setup_session, &sql, None)

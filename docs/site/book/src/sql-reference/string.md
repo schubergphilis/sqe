@@ -52,8 +52,8 @@ DataFusion contributes ~35 string functions plus a unicode submodule and a regex
 | `initcap(s)` | `datafusion-builtin` | Title-case each word. | yes | yes | yes | yes |
 | `lpad(s, n [, fill])` | `datafusion-builtin` | Pad on left to length `n`. | yes | yes | yes | yes |
 | `rpad(s, n [, fill])` | `datafusion-builtin` | Pad on right. | yes | yes | yes | yes |
-| `repeat(s, n)` | `datafusion-builtin` | Repeat `n` times. | yes | yes | yes | yes |
-| `reverse(s)` | `datafusion-builtin` | Reverse the string. | yes | yes | yes | yes |
+| `repeat(x, n)` | `sqe-trino-functions` | Array of `n` copies of `x`, as in Trino. For a repeated string use `rpad('', n, s)` or `array_join(repeat(s, n), '')`. | yes | - | - | - |
+| `reverse(s)` | `sqe-trino-functions` | Reverse the string; on an array, reverse the elements. | yes | yes | yes | yes |
 | `replace(s, from, to)` | `datafusion-builtin` | Replace all occurrences. | yes | yes | yes | yes |
 | `translate(s, from, to)` | `datafusion-builtin` | Per-character substitution. | yes | yes | yes | yes |
 | `overlay(s placing rep from start [for length])` | `datafusion-builtin` | Splice substring. | yes | yes | yes | yes |

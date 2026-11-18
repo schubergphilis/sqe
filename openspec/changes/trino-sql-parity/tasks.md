@@ -36,9 +36,9 @@
 ## 6. Missing functions
 
 - [x] 6.1 Math and statistics (`is_nan`, `is_finite`, `normal_cdf`, `width_bucket`, `beta_cdf`, ...) (`fix/trino-math-functions`; real-typed `corr`/`covar_*`/`regr_*` open)
-- [ ] 6.2 String, binary and hash (`levenshtein_distance`, `crc32`, `xxhash64`, `hmac_*`, `to_base32`, ...)
+- [x] 6.2 String, binary and hash (`levenshtein_distance`, `crc32`, `xxhash64`, `hmac_*`, `to_base32`, ...)
   - [x] 6.2a Binary and hash (`fix/trino-binary-functions`; `spooky_hash_v2_*` open)
-  - [ ] 6.2b String and URL
+  - [x] 6.2b String and URL (`fix/trino-string-functions`)
 - [ ] 6.3 Date and time (`dow`, `doy`, `day_of_month`, `week_of_year`, `year_of_week`, `from_unixtime`, `parse_duration`, ...)
 - [ ] 6.4 Array and map (`array_last`, `array_histogram`, `zip`, `zip_with`, `map_concat`, `map_filter`, `split_to_map`, ...)
 - [ ] 6.5 Aggregates and signatures (`max(x, n)`, `min_by(x, y, n)`, `approx_distinct(x, e)`, `approx_most_frequent`, `reduce_agg`, `numeric_histogram`, ...)

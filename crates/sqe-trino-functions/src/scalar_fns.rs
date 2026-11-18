@@ -46,11 +46,13 @@ pub fn register_scalar_fns(ctx: &SessionContext) {
         SizeKind::Range,
     ));
     ctx.register_udf(size_capped(
-        &datafusion::functions::string::repeat(),
-        SizeKind::Repeat,
+        &datafusion::functions::unicode::lpad(),
+        SizeKind::Pad,
     ));
-    ctx.register_udf(size_capped(&datafusion::functions::unicode::lpad(), SizeKind::Pad));
-    ctx.register_udf(size_capped(&datafusion::functions::unicode::rpad(), SizeKind::Pad));
+    ctx.register_udf(size_capped(
+        &datafusion::functions::unicode::rpad(),
+        SizeKind::Pad,
+    ));
 
     register_higher_order_aliases(ctx);
     crate::higher_order::register_match_predicates(ctx);
@@ -95,7 +97,6 @@ pub const MAX_GENERATED_SIZE: u64 = 100_000_000;
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub(crate) enum SizeKind {
     Range,
-    Repeat,
     Pad,
 }
 
@@ -128,18 +129,6 @@ impl SizeCapped {
             SizeKind::Pad => {
                 let len = i64_arg(args, 1)?;
                 Ok(len.iter().flatten().map(|n| n.max(0) as u64).max())
-            }
-            SizeKind::Repeat => {
-                let strings = args.args[0].to_array(args.number_rows)?;
-                let bytes = arrow::compute::kernels::length::length(&strings)?;
-                let bytes = arrow::compute::cast(&bytes, &DataType::Int64)?;
-                let bytes = bytes.as_primitive::<Int64Type>();
-                let counts = i64_arg(args, 1)?;
-                Ok(bytes
-                    .iter()
-                    .zip(counts.iter())
-                    .filter_map(|(b, c)| Some((b? as u64).saturating_mul(c?.max(0) as u64)))
-                    .max())
             }
             SizeKind::Range => {
                 // ponytail: only the integer form is checked; the date and
@@ -485,7 +474,6 @@ mod tests {
             format!("SELECT sequence(1, {over})"),
             format!("SELECT generate_series(1, {over})"),
             format!("SELECT range({})", over + 1),
-            format!("SELECT repeat('ab', {})", over / 2 + 1),
             format!("SELECT lpad('x', {over})"),
             format!("SELECT rpad('x', {over})"),
         ] {
@@ -499,7 +487,7 @@ mod tests {
         // At the cap and below still work.
         assert_eq!(array_i64("SELECT sequence(1, 3)").await, vec![1, 2, 3]);
         let batches = ctx
-            .sql("SELECT repeat('ab', 3), lpad('x', 3, '-')")
+            .sql("SELECT lpad('x', 3, '-')")
             .await
             .unwrap()
             .collect()
@@ -509,8 +497,7 @@ mod tests {
             let col = arrow::compute::cast(batches[0].column(i), &DataType::Utf8).unwrap();
             col.as_string::<i32>().value(0).to_string()
         };
-        assert_eq!(text(0), "ababab");
-        assert_eq!(text(1), "--x");
+        assert_eq!(text(0), "--x");
     }
 
     #[tokio::test]
