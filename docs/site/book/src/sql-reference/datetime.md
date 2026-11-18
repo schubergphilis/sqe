@@ -32,11 +32,14 @@ These return integer parts. SQE registers Trino names; DataFusion's `extract` an
 | `hour(d)` | `sqe-trino-functions` | `trino_functions.rs:31` | `hour` | `hour` | `hour` | `hour` |
 | `minute(d)` | `sqe-trino-functions` | `trino_functions.rs:32` | `minute` | `minute` | `minute` | `minute` |
 | `second(d)` | `sqe-trino-functions` | `trino_functions.rs:33` | `second` | `second` | `second` | `second` |
-| `millisecond(d)` | `sqe-trino-functions (ext)` | Sub-second component. `trino_functions_ext.rs:27` | `millisecond` | - | - | - |
-| `day_of_week(d)` | `sqe-trino-functions` | ISO: 1=Mon..7=Sun. `trino_functions.rs:34` | `day_of_week` / `dow` | `dayofweek` | `dayofweek` | `dayofweek` |
-| `day_of_year(d)` | `sqe-trino-functions` | 1..366. `trino_functions.rs:35` | `day_of_year` / `doy` | `dayofyear` | `dayofyear` | `dayofyear` |
+| `millisecond(d)` | `sqe-trino-functions` | Sub-second component in milliseconds, returns `BIGINT`. | `millisecond` | - | - | - |
+| `day_of_week(d)` | `sqe-trino-functions` | ISO: 1=Mon..7=Sun, returns `BIGINT`. Alias `dow`. `trino_functions.rs:34` | `day_of_week` / `dow` | `dayofweek` | `dayofweek` | `dayofweek` |
+| `day_of_year(d)` | `sqe-trino-functions` | 1..366, returns `BIGINT`. Alias `doy`. `trino_functions.rs:35` | `day_of_year` / `doy` | `dayofyear` | `dayofyear` | `dayofyear` |
 | `quarter(d)` | `sqe-trino-functions` | 1..4. `trino_functions.rs:36` | `quarter` | `quarter` | `quarter` | `quarter` |
-| `week(d)` | `sqe-trino-functions` | ISO week number. `trino_functions.rs:37` | `week` / `week_of_year` | `weekofyear` | `weekofyear` | `weekofyear` |
+| `week(d)` | `sqe-trino-functions` | ISO week number, returns `BIGINT`. Alias `week_of_year`. `trino_functions.rs:37` | `week` / `week_of_year` | `weekofyear` | `weekofyear` | `weekofyear` |
+| `year_of_week(d)` | `sqe-trino-functions` | ISO year of the week, returns `BIGINT`. Alias `yow`. | `year_of_week` / `yow` | `yearofweek` | - | `isoyear` |
+
+`day`, `hour`, `minute`, `second`, `year` and `month` also accept an interval, and `day_of_month` is an alias of `day`. `to_milliseconds(interval)` returns the interval as `BIGINT` milliseconds.
 | `extract(<part> from d)` | `datafusion-builtin` | SQL standard. Parts: `YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND`, `DOW`, `DOY`, `EPOCH`, `QUARTER`, `WEEK`. | `extract` | `extract` | `extract` | `extract` |
 | `date_part('year', d)` | `datafusion-builtin` | Function form of `extract`. | `date_part` | `date_part` | - | `date_part` |
 
@@ -44,7 +47,7 @@ These return integer parts. SQE registers Trino names; DataFusion's `extract` an
 
 | Function | Origin | Notes | Trino | Snowflake | Spark SQL | DuckDB |
 |---|---|---|---|---|---|---|
-| `date_trunc('month', d)` | `datafusion-builtin` | Round down to a calendar boundary. Parts: `year`, `quarter`, `month`, `week`, `day`, `hour`, `minute`, `second`, `millisecond`, `microsecond`. | `date_trunc` | `date_trunc` | `date_trunc` | `date_trunc` |
+| `date_trunc('month', d)` | `sqe-trino-functions` | Round down to a calendar boundary. A `DATE` input returns a `DATE`, a timestamp keeps its type and zone, and a varchar is read as a timestamp. Parts: `year`, `quarter`, `month`, `week`, `day`, `hour`, `minute`, `second`, `millisecond`, `microsecond`. Shadows the DataFusion built-in for Trino return types. | `date_trunc` | `date_trunc` | `date_trunc` | `date_trunc` |
 | `date_bin(stride, d)` | `datafusion-builtin` | Bin into fixed-width buckets, e.g. `INTERVAL '15' minutes`. SQE-relevant for time-series rollups. | - | `time_slice` | - | `time_bucket` |
 | `last_day_of_month(d)` | `sqe-trino-functions (ext)` | Last calendar day of `d`'s month. `trino_functions_ext.rs:43` | `last_day_of_month` | `last_day` | `last_day` | `last_day` |
 
@@ -82,13 +85,17 @@ Two parallel formatting families:
 
 | Function | Origin | Notes | Trino | Snowflake | Spark SQL | DuckDB |
 |---|---|---|---|---|---|---|
-| `date_format(d, fmt)` | `sqe-trino-functions` | Trino / MySQL specifiers (`%Y`, `%m`, `%d`, `%H`, `%i` for minutes, `%s` for seconds). `trino_functions.rs:51` | `date_format` | `to_char` | `date_format` | `strftime` |
-| `date_parse(str, fmt)` | `sqe-trino-functions` | Inverse of `date_format`. Returns `TIMESTAMP(6)`. `trino_functions.rs:52` | `date_parse` | `to_timestamp` | `to_timestamp` | `strptime` |
-| `format_datetime(d, fmt)` | `sqe-trino-functions (ext)` | Java / Joda specifiers (`yyyy-MM-dd HH:mm:ss`). `trino_functions_ext.rs:54` | `format_datetime` | - | `date_format` | - |
-| `parse_datetime(str, fmt)` | `sqe-trino-functions (ext)` | Inverse of `format_datetime`. `trino_functions_ext.rs:55` | `parse_datetime` | - | `to_timestamp` | - |
-| `to_iso8601(d)` | `sqe-trino-functions (ext)` | RFC 3339 / ISO 8601 string. A timestamp without a zone has no designator (`2024-01-02T03:04:05`, as in Trino); a zoned one ends in its offset. The fraction appears only when non-zero, in 3, 6 or 9 digits, where Trino pads to the declared precision. `trino_functions_ext.rs:40` | `to_iso8601` | - | - | - |
-| `from_iso8601_date(str)` | `sqe-trino-functions (ext)` | ISO 8601 -> `DATE`. `trino_functions_ext.rs:38` | `from_iso8601_date` | - | - | - |
-| `from_iso8601_timestamp(str)` | `sqe-trino-functions (ext)` | ISO 8601 -> `TIMESTAMP(6)`. Reads a `Z`, `+hh`, `+hhmm` or `+hh:mm` designator and returns that instant as UTC wall clock; no designator means UTC. Accepts `T` or a space, `hh:mm` without seconds and a bare date (midnight). `trino_functions_ext.rs:39` | `from_iso8601_timestamp` | - | - | - |
+| `date_format(d, fmt)` | `sqe-trino-functions` | Trino / MySQL specifiers (`%Y`, `%m`, `%d`, `%H`, `%i` for minutes, `%s` for seconds). Returns `VARCHAR`. An unknown specifier renders the letter itself; `%U`, `%u`, `%V`, `%X` and a trailing `%` raise an error. | `date_format` | `to_char` | `date_format` | `strftime` |
+| `date_parse(str, fmt)` | `sqe-trino-functions` | Inverse of `date_format`. Returns `TIMESTAMP(3)` without a zone. Text that does not match the format raises an error. | `date_parse` | `to_timestamp` | `to_timestamp` | `strptime` |
+| `format_datetime(d, fmt)` | `sqe-trino-functions` | Java / Joda specifiers (`yyyy-MM-dd HH:mm:ss`). Returns `VARCHAR`. | `format_datetime` | - | `date_format` | - |
+| `parse_datetime(str, fmt)` | `sqe-trino-functions` | Inverse of `format_datetime`. Returns `TIMESTAMP(3) WITH TIME ZONE`. Text that does not match raises an error. | `parse_datetime` | - | `to_timestamp` | - |
+| `to_iso8601(d)` | `sqe-trino-functions` | ISO 8601 string, returns `VARCHAR`. A `DATE` gives `YYYY-MM-DD`. A timestamp without a zone has no designator (`2024-01-02T03:04:05`, as in Trino); a zoned one ends in `Z` for UTC or an offset such as `+01:00`. The fraction has 3 digits, or 6 when the value has sub-millisecond digits. | `to_iso8601` | - | - | - |
+| `from_iso8601_date(str)` | `sqe-trino-functions` | ISO 8601 text to `DATE`. | `from_iso8601_date` | - | - | - |
+| `from_iso8601_timestamp(str)` | `sqe-trino-functions` | ISO 8601 text to `TIMESTAMP(3) WITH TIME ZONE`. Reads a `Z`, `+hh`, `+hhmm` or `+hh:mm` designator and returns that instant; no designator means UTC. Invalid text raises an error. | `from_iso8601_timestamp` | - | - | - |
+| `from_iso8601_timestamp_nanos(str)` | `sqe-trino-functions` | Same as `from_iso8601_timestamp` but returns `TIMESTAMP(9) WITH TIME ZONE`. | `from_iso8601_timestamp_nanos` | - | - | - |
+| `date(x)` | `sqe-trino-functions` | Cast a varchar, timestamp or `DATE` to `DATE`. | `date` | `date` | `date` | `date` |
+| `parse_duration(str)` | `sqe-trino-functions` | Text such as `'1.5h'` to an interval of days to seconds. | `parse_duration` | - | - | - |
+| `sequence(start, stop [, step])` | `sqe-trino-functions` | Array of dates or timestamps. Two `DATE` arguments use a one day step. Result size is capped. | `sequence` | - | `sequence` | `generate_series` |
 | `to_char(d, fmt)` | `datafusion-builtin` | Postgres-style. Specifiers differ from Trino's `date_format`. | - | `to_char` | `date_format` | `strftime` |
 | `to_date(str [, fmt])` | `datafusion-builtin` | Parse to `DATE`. | - | `to_date` | `to_date` | `strptime` |
 | `to_timestamp(str [, fmt])` | `datafusion-builtin` | Parse to `TIMESTAMP`. | `parse_datetime` | `to_timestamp` | `to_timestamp` | `strptime` |
@@ -104,7 +111,7 @@ SELECT date_format(TIMESTAMP '2026-05-08 14:30:00', '%Y-%m-%d %H:%i:%s');
 -- 2026-05-08 14:30:00
 
 SELECT date_parse('2026-05-08 14:30:00', '%Y-%m-%d %H:%i:%s');
--- 2026-05-08 14:30:00 (TIMESTAMP)
+-- 2026-05-08 14:30:00 (TIMESTAMP(3))
 ```
 
 Java-style example (preferred for new code):
@@ -118,8 +125,9 @@ SELECT format_datetime(TIMESTAMP '2026-05-08 14:30:00', 'yyyy-MM-dd HH:mm:ss');
 
 | Function | Origin | Notes | Trino | Snowflake | Spark SQL | DuckDB |
 |---|---|---|---|---|---|---|
-| `from_unixtime(epoch)` | `sqe-trino-functions` | Seconds since epoch -> `TIMESTAMP(6)`. `trino_functions.rs:42` | `from_unixtime` | - | `from_unixtime` | `to_timestamp` |
-| `to_unixtime(d)` | `sqe-trino-functions` | `TIMESTAMP` -> seconds since epoch (Double). `trino_functions.rs:43` | `to_unixtime` | - | `unix_timestamp` | `epoch` |
+| `from_unixtime(epoch [, zone] [, hours, minutes])` | `sqe-trino-functions` | Seconds since epoch (double) to `TIMESTAMP(3) WITH TIME ZONE`. | `from_unixtime` | - | `from_unixtime` | `to_timestamp` |
+| `from_unixtime_nanos(ns)` | `sqe-trino-functions` | Nanoseconds since epoch to `TIMESTAMP(9) WITH TIME ZONE`. | `from_unixtime_nanos` | - | - | - |
+| `to_unixtime(d)` | `sqe-trino-functions` | `TIMESTAMP` to seconds since epoch (`DOUBLE`). | `to_unixtime` | - | `unix_timestamp` | `epoch` |
 | `extract(epoch from d)` | `datafusion-builtin` | SQL-standard alternative for `to_unixtime`. | yes | - | yes | yes |
 
 ## Time zones
@@ -128,8 +136,9 @@ SELECT format_datetime(TIMESTAMP '2026-05-08 14:30:00', 'yyyy-MM-dd HH:mm:ss');
 |---|---|---|---|---|---|---|
 | `with_timezone(d, tz)` | `sqe-trino-functions (ext)` | Attach a timezone offset to a naive timestamp. `trino_functions_ext.rs:50` | `with_timezone` | `convert_timezone` | `from_utc_timestamp` | - |
 | `at_timezone(d, tz)` | `sqe-trino-functions (ext)` | Convert a `TIMESTAMP WITH TIME ZONE` to another zone. `trino_functions_ext.rs:51` | `at_timezone` | `convert_timezone` | - | - |
-| `timezone_hour(d)` | `sqe-trino-functions (ext)` | Hour component of the offset. `trino_functions_ext.rs:70` | `timezone_hour` | - | - | - |
-| `timezone_minute(d)` | `sqe-trino-functions (ext)` | Minute component of the offset. `trino_functions_ext.rs:71` | `timezone_minute` | - | - | - |
+| `timezone_hour(d)` | `sqe-trino-functions` | Hour component of the real offset of the value's zone, returns `BIGINT`. | `timezone_hour` | - | - | - |
+| `timezone_minute(d)` | `sqe-trino-functions` | Minute component of the real offset, returns `BIGINT`. | `timezone_minute` | - | - | - |
+| `timezone(d)` | `sqe-trino-functions` | Zone name of a `TIMESTAMP WITH TIME ZONE`, returns `VARCHAR`. | `timezone` | - | - | - |
 | `expr AT TIME ZONE 'Europe/Amsterdam'` | `datafusion-builtin` | SQL-standard syntax. | yes | yes | yes | yes |
 
 ## Misc

@@ -240,7 +240,12 @@ col_case!(
 col_case!(
     col_from_iso8601_timestamp,
     "from_iso8601_timestamp(iso_ts)",
-    [s("2024-03-15T14:30:45.123"), s("2020-01-02T03:04:05"), None]
+    // timestamp(3) with time zone: UTC when the text names no zone.
+    [
+        s("2024-03-15T14:30:45.123Z"),
+        s("2020-01-02T03:04:05Z"),
+        None
+    ]
 );
 col_case!(
     col_to_iso8601_ts,
@@ -303,13 +308,15 @@ col_case!(
 );
 col_case!(
     col_parse_datetime,
-    "parse_datetime(iso_date, 'yyyyMMdd')",
-    [None, s("2024-02-10T00:00:00"), None]
+    // A row that does not match the pattern is an error in Trino, so only
+    // the matching row is fed in.
+    "parse_datetime(CASE WHEN rid = 1 THEN iso_date END, 'yyyyMMdd')",
+    [None, s("2024-02-10T00:00:00Z"), None]
 );
 col_case!(
     col_parse_datetime_col_pattern,
     "parse_datetime(iso_date, CASE WHEN rid = 0 THEN 'yyyy-MM-dd' ELSE 'yyyyMMdd' END)",
-    [s("2024-03-15T00:00:00"), s("2024-02-10T00:00:00"), None]
+    [s("2024-03-15T00:00:00Z"), s("2024-02-10T00:00:00Z"), None]
 );
 col_case!(
     col_json_array_contains,
@@ -442,12 +449,13 @@ col_case!(
 col_case!(
     col_timezone_hour,
     "timezone_hour(ts_a)",
-    [s("0"), s("0"), s("0")]
+    // NULL in, NULL out.
+    [s("0"), s("0"), None]
 );
 col_case!(
     col_timezone_minute,
     "timezone_minute(ts_a)",
-    [s("0"), s("0"), s("0")]
+    [s("0"), s("0"), None]
 );
 col_case!(
     col_try_passthrough,
@@ -707,7 +715,13 @@ enum Kind {
     Date,
     Ts,
     TsNs,
+    /// A timestamp with a time zone, for `timezone()`.
+    TsTz,
     IsoTs,
+    /// ISO dates that parse with `yyyy-MM-dd` / `%Y-%m-%d`.
+    DateStr,
+    /// Durations as `parse_duration` reads them.
+    Duration,
     B64,
     Hex,
     Char,
@@ -756,11 +770,20 @@ fn make_array(kind: Kind) -> ArrayRef {
             TS1_US * 1000,
             0,
         ])),
+        Kind::TsTz => Arc::new(
+            TimestampMicrosecondArray::from(vec![TS0_US, TS1_US, 0]).with_timezone("+05:30"),
+        ),
         Kind::IsoTs => Arc::new(StringArray::from(vec![
             "2024-03-15T14:30:45.123",
             "2020-01-02 03:04:05",
             "1970-01-01T00:00:00",
         ])),
+        Kind::DateStr => Arc::new(StringArray::from(vec![
+            "2024-03-15",
+            "2020-01-02",
+            "1970-01-01",
+        ])),
+        Kind::Duration => Arc::new(StringArray::from(vec!["3.5m", "2d", "150ms"])),
         Kind::B64 => Arc::new(StringArray::from(vec!["aGVsbG8=", "d29ybGQ=", "eA=="])),
         Kind::Hex => Arc::new(StringArray::from(vec!["68656c6c6f", "776f726c64", "78"])),
         Kind::Digits => Arc::new(StringArray::from(vec!["79927398713", "1234", "0"])),
@@ -811,6 +834,11 @@ fn arg_specs(name: &str) -> Option<Vec<ArgSpec>> {
     let v = match name {
         // ── extended ──
         "millisecond" | "timezone_hour" | "timezone_minute" => vec![Col(Ts)],
+        "timezone" => vec![Col(TsTz)],
+        "yow" | "year_of_week" | "day_of_month" => vec![Col(Ts)],
+        "from_unixtime_nanos" => vec![Col(Int)],
+        "from_iso8601_timestamp_nanos" => vec![Col(IsoTs)],
+        "parse_duration" => vec![Col(Duration)],
         // Nanosecond input (what `CAST(x AS TIMESTAMP)` produces) must be
         // accepted and normalised to microseconds.
         "to_iso8601" => vec![Col(TsNs)],
@@ -832,7 +860,7 @@ fn arg_specs(name: &str) -> Option<Vec<ArgSpec>> {
         "normalize" => vec![Col(View), LitStr("NFC")],
         "with_timezone" | "at_timezone" => vec![Col(Ts), LitStr("Europe/Amsterdam")],
         "format_datetime" => vec![Col(Ts), LitStr("yyyy-MM-dd")],
-        "parse_datetime" => vec![Col(IsoTs), LitStr("yyyy-MM-dd'T'HH:mm:ss")],
+        "parse_datetime" => vec![Col(DateStr), LitStr("yyyy-MM-dd")],
         "json_size" => vec![Col(Json), LitStr("$")],
         "json_array_get" => vec![Col(Json), Col(Int32)],
         "format" => vec![LitStr("%s-%d"), Col(Str), Col(Int)],
@@ -849,7 +877,7 @@ fn arg_specs(name: &str) -> Option<Vec<ArgSpec>> {
         "from_unixtime" => vec![Col(Int)],
         "if" | "iff" => vec![Col(Bool), Col(Int), Col(Int)],
         "date_format" => vec![Col(Ts), LitStr("%Y-%m-%d")],
-        "date_parse" => vec![Col(IsoTs), LitStr("%Y-%m-%dT%H:%i:%s")],
+        "date_parse" => vec![Col(DateStr), LitStr("%Y-%m-%d")],
         "json_object" => vec![LitStr("k"), Col(Int)],
         "json_format" | "json_parse" | "json_array_length" => vec![Col(Json)],
         "url_extract_host"
@@ -921,6 +949,8 @@ fn skip_reason(name: &str) -> Option<&'static str> {
         "infinity" | "nan" | "e" | "current_timezone" | "now" | "localtime" | "localtimestamp" => {
             "zero-arity: no array input exists"
         }
+        "to_milliseconds" => "needs an interval column, which this harness does not synthesise \
+                              (covered with an interval literal and a VALUES column in datetime_fns)",
         "typeof" => "returns the static type name; a broadcast scalar is the correct shape",
         "all_match" | "none_match" | "reduce" | "array_all_match" | "array_none_match"
         | "array_reduce" | "filter" | "transform" | "any_match" | "array_any_match"

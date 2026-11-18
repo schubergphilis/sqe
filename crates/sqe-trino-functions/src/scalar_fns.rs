@@ -32,14 +32,13 @@ pub fn register_scalar_fns(ctx: &SessionContext) {
 
     // `sequence` is Trino's spelling of DataFusion's inclusive `generate_series`.
     // Matches Trino for the ascending integer form, the 3-arg step form, and the
-    // date/timestamp + INTERVAL form. The one divergence is 2-arg *descending*
-    // (`sequence(5, 1)`): Trino auto-descends to [5,4,3,2,1] while
-    // `generate_series` returns [] unless an explicit negative step is given.
-    let sequence = size_capped(
-        &datafusion::functions_nested::range::gen_series_udf(),
-        SizeKind::Range,
-    )
-    .with_aliases(["sequence"]);
+    // date/timestamp + INTERVAL form, plus `sequence(date, date)` with an
+    // implicit one-day step (in `datetime_fns`). The one divergence is 2-arg
+    // *descending* integers (`sequence(5, 1)`): Trino auto-descends to
+    // [5,4,3,2,1] while `generate_series` returns [] unless an explicit
+    // negative step is given.
+    let sequence = size_capped(&crate::datetime_fns::sequence_udf(), SizeKind::Range)
+        .with_aliases(["sequence"]);
     ctx.register_udf(sequence);
     ctx.register_udf(size_capped(
         &datafusion::functions_nested::range::range_udf(),
