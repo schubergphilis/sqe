@@ -232,6 +232,9 @@ impl SqlFrontDoor {
                 } else {
                     sql.to_string()
                 };
+                // `CAST(x AS map(..))` and `CAST(x AS time(3))` parse but do
+                // not plan; `array(..)` does not parse (the fallback below).
+                let rewritten = crate::rewrite_trino_cast_types(&rewritten);
                 // Bare `PARTITIONED BY (id)` parses too, as a Hive partition
                 // column list the DDL handler never reads, so the table came
                 // out unpartitioned. Rewrite it to `PARTITION BY` as the
@@ -258,6 +261,7 @@ impl SqlFrontDoor {
                 let rewritten = crate::rewrite_paren_less_values(sql);
                 let rewritten = crate::rewrite_bare_table(&rewritten);
                 let rewritten = crate::rewrite_nested_row_cast(&rewritten);
+                let rewritten = crate::rewrite_trino_cast_types(&rewritten);
                 let rewritten = crate::rewrite_trim_both_from(&rewritten);
                 let rewritten = crate::rewrite_trino_ddl_types(&rewritten);
                 // `PARTITIONED BY (day(ts))` and the Spark clause order. The
