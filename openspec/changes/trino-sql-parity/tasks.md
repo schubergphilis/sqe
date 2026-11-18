@@ -40,8 +40,8 @@
   - [x] 6.2a Binary and hash (`fix/trino-binary-functions`; `spooky_hash_v2_*` open)
   - [x] 6.2b String and URL (`fix/trino-string-functions`)
 - [x] 6.3 Date and time (`dow`, `doy`, `day_of_month`, `week_of_year`, `year_of_week`, `from_unixtime`, `parse_duration`, ...) (`fix/trino-datetime-functions`; zoned extraction and `now()` open)
-- [ ] 6.4 Array and map (`array_last`, `array_histogram`, `zip`, `zip_with`, `map_concat`, `map_filter`, `split_to_map`, ...)
-- [ ] 6.5 Aggregates and signatures (`max(x, n)`, `min_by(x, y, n)`, `approx_distinct(x, e)`, `approx_most_frequent`, `reduce_agg`, `numeric_histogram`, ...)
+- [x] 6.4 Array and map (`array_last`, `array_histogram`, `zip`, `zip_with`, `map_concat`, `map_filter`, `split_to_map`, ...)
+- [ ] 6.5 Aggregates and signatures (`max(x, n)`, `min_by(x, y, n)`, `approx_distinct(x, e)`, `approx_most_frequent`, `reduce_agg`, `numeric_histogram`, ...). Done except `reduce_agg`, `numeric_histogram`, `approx_distinct(x, e)`
 
 ## 7. Integer literals
 

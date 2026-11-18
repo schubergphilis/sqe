@@ -32,8 +32,10 @@ use datafusion::error::DataFusionError;
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion::logical_expr::utils::format_state_name;
 use datafusion::logical_expr::{
-    Accumulator, AggregateUDF, AggregateUDFImpl, Signature, Volatility,
+    Accumulator, AggregateUDF, AggregateUDFImpl, Signature, TypeSignature, Volatility,
 };
+
+use crate::agg_fns::TopN;
 
 /// Direction of the arg-extremum aggregate. `Max` keeps the largest y;
 /// `Min` keeps the smallest y. Both store (best_x, best_y) and return x.
@@ -95,11 +97,14 @@ impl ArgExtremum {
         Self {
             direction,
             aliases: direction.aliases(),
-            // Two arguments, any types. Trino's signature is also wide:
-            // x can be any column type, y must be Comparable. We catch
-            // unorderable y at runtime in the accumulator rather than
-            // restricting the signature.
-            signature: Signature::any(2, Volatility::Immutable),
+            // Two arguments, any types (Trino's signature is also wide:
+            // x can be any column type, y must be Comparable; we catch
+            // unorderable y at runtime in the accumulator), or three with a
+            // constant n, which returns the n best x as an array.
+            signature: Signature::one_of(
+                vec![TypeSignature::Any(2), TypeSignature::Any(3)],
+                Volatility::Immutable,
+            ),
         }
     }
 
@@ -126,18 +131,27 @@ impl AggregateUDFImpl for ArgExtremum {
     }
 
     fn return_type(&self, args: &[DataType]) -> DFResult<DataType> {
-        // Returns the type of x (the first argument).
-        if args.len() != 2 {
-            return Err(DataFusionError::Plan(format!(
-                "{}(x, y) takes exactly 2 arguments, got {}",
+        // The type of x (the first argument), or array(x) for the n form.
+        match args.len() {
+            2 => Ok(args[0].clone()),
+            3 => Ok(TopN::return_type(&args[0])),
+            n => Err(DataFusionError::Plan(format!(
+                "{}(x, y) takes 2 arguments, or 3 with a count, got {n}",
                 self.direction.primary_name(),
-                args.len()
-            )));
+            ))),
         }
-        Ok(args[0].clone())
     }
 
     fn accumulator(&self, acc_args: AccumulatorArgs) -> DFResult<Box<dyn Accumulator>> {
+        if acc_args.exprs.len() == 3 {
+            let descending = self.direction == Direction::Max;
+            return Ok(Box::new(TopN::from_args(
+                descending,
+                &acc_args,
+                2,
+                self.direction.primary_name(),
+            )?));
+        }
         let x_type = acc_args.expr_fields[0].data_type().clone();
         let y_type = acc_args.expr_fields[1].data_type().clone();
         Ok(Box::new(ArgExtremumAccumulator::try_new(
@@ -148,6 +162,9 @@ impl AggregateUDFImpl for ArgExtremum {
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> DFResult<Vec<FieldRef>> {
+        if args.input_fields.len() == 3 {
+            return Ok(TopN::state_fields(&args, true));
+        }
         let x_type = args.input_fields[0].data_type().clone();
         let y_type = args.input_fields[1].data_type().clone();
         Ok(vec![

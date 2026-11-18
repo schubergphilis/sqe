@@ -56,8 +56,8 @@ pub fn register_extended_trino_functions(ctx: &datafusion::prelude::SessionConte
     // returned the first argument. They now ship as real UDAFs in
     // `aggregates::ArgExtremum` registered alongside the other
     // Trino aggregate aliases in trino_functions.rs. `arbitrary` went
-    // the same way: it is an alias of DataFusion's any_value UDAF.
-    ctx.register_udf(ScalarUDF::from(Checksum));
+    // the same way: it is an alias of DataFusion's any_value UDAF. So did
+    // `checksum`, now an aggregate in `agg_fns`.
     ctx.register_udf(ScalarUDF::from(JsonSize));
     ctx.register_udf(ScalarUDF::from(JsonArrayGet));
 
@@ -971,54 +971,8 @@ impl ScalarUDFImpl for WordStem {
 // and `arg_min` are also registered as aliases on the same UDAF
 // (DuckDB / ClickHouse spelling).
 
-/// checksum(x) — Order-insensitive hash aggregate (XOR of hashes). Scalar impl for single values.
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct Checksum;
-
-impl ScalarUDFImpl for Checksum {
-    fn name(&self) -> &str {
-        "checksum"
-    }
-    fn signature(&self) -> &Signature {
-        static SIG: LazyLock<Signature> =
-            LazyLock::new(|| Signature::new(TypeSignature::Any(1), Volatility::Immutable));
-        &SIG
-    }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Utf8)
-    }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        use sha2::{Digest, Sha256};
-        match &args.args[0] {
-            ColumnarValue::Scalar(v) => {
-                let mut hasher = Sha256::new();
-                hasher.update(format!("{:?}", v).as_bytes());
-                let result = hasher.finalize();
-                let hex = hex::encode(result).chars().take(16).collect::<String>();
-                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(hex))))
-            }
-            ColumnarValue::Array(arr) => {
-                let str_arr = arrow::compute::cast(arr, &DataType::Utf8)?;
-                let str_arr = str_arr
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| DataFusionError::Plan("Expected StringArray".into()))?;
-                let result: StringArray = str_arr
-                    .iter()
-                    .map(|opt| {
-                        opt.map(|s| {
-                            let mut hasher = Sha256::new();
-                            hasher.update(format!("{:?}", s).as_bytes());
-                            let digest = hasher.finalize();
-                            hex::encode(digest).chars().take(16).collect::<String>()
-                        })
-                    })
-                    .collect();
-                Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
-            }
-        }
-    }
-}
+// `checksum(x)` is the real aggregate in `crate::agg_fns`; the scalar stub
+// that used to live here hashed one value and returned hex text.
 
 // ═══════════════════════════════════════════════════════════════════
 // JSON HELPERS

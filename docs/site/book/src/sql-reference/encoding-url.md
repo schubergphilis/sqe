@@ -30,12 +30,12 @@ SELECT decode('6869', 'hex');                     -- bytea -> 'hi'
 | `sha384(s)` | `datafusion-builtin` | SHA-384 hex. | yes | - | yes | - |
 | `sha512(s)` | `datafusion-builtin` | SHA-512 hex. | yes | yes | yes | yes |
 | `digest(s, algo)` | `datafusion-builtin` | Generic. Algos: `md5`, `sha224`, `sha256`, `sha384`, `sha512`, `blake2s`, `blake2b`, `blake3`. | - | - | - | - |
-| `checksum(b)` | `sqe-trino-functions (ext)` | xxHash of bytes; cheaper than crypto hashes. `trino_functions_ext.rs:69` | yes | - | - | - |
+| `checksum(x)` | `sqe-trino-functions` | Aggregate (not a per-row hash). Returns an 8-byte `varbinary`, order independent, NULL for an empty group. Built from xxHash64 per value; the exact bytes are not confirmed against Trino. `agg_fns.rs` | yes | - | - | - |
 
 ```sql
 SELECT sha256(email) AS email_hash FROM users;
 SELECT digest('hello', 'blake3');       -- 64-char blake3 hex
-SELECT to_hex(checksum(payload)) FROM events;
+SELECT to_hex(checksum(payload)) FROM events;  -- one value for the whole group
 ```
 
 ## URL parsing
@@ -80,7 +80,7 @@ For example, on `https://example.com:8443/api?utm_source=newsletter&page=2`:
 
 | Use case | Recommendation |
 |---|---|
-| Equality lookups, deduplication | `xxhash` via `checksum()`. ~10x faster than crypto hashes. |
+| Comparing two whole tables or partitions | `checksum(col)` per table; equal checksums mean equal contents, whatever the row order. It is an aggregate, so it is not a per-row hash for lookups. |
 | Cryptographic integrity, signatures | `sha256` or `sha512`. Avoid `md5` for new uses. |
 | Column masking via grants | `sha256` (used in `MASKED WITH` clauses). Deterministic, no collisions in practice. |
 | Hashing UTF-8 strings | All accept `VARCHAR` or `BINARY` arguments. The result type is `VARCHAR` (hex) for crypto hashes, `BINARY` for `digest()`. |

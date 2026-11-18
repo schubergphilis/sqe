@@ -116,6 +116,12 @@ pub fn register_trino_functions(ctx: &datafusion::prelude::SessionContext) {
     // Date/time conversion, formatting and parsing with Trino's value and type.
     crate::datetime_fns::register_datetime_fns(ctx);
 
+    // Trino array functions (array_last, zip, ngrams, ...). After the
+    // built-ins: some of them replace one (`array_remove`, `array_first`).
+    crate::array_fns::register_array_fns(ctx);
+    crate::map_fns::register_map_fns(ctx);
+    crate::agg_fns::register_agg_fns(ctx);
+
     // DataFusion's `to_char` and `map_extract` claim `date_format` and
     // `element_at` as aliases. Left claiming them, either could take the key
     // back whenever a query's session is rebuilt (see `overrides`).
