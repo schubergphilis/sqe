@@ -1472,6 +1472,15 @@ pub(crate) fn configured_write_target(config: &SqeConfig, target: Option<&str>) 
         .map(|(n, _)| n.clone())
 }
 
+/// The SQL name of the catalog a write falls back to when no configured or
+/// discovered catalog matched: the qualifier the statement named, else the
+/// configured default. A catalog scope (#908) is checked against this name.
+pub(crate) fn default_write_catalog(config: &SqeConfig, target: Option<&str>) -> String {
+    target
+        .map(str::to_string)
+        .unwrap_or_else(|| config.resolve_default_catalog())
+}
+
 /// The one thing `after_commit` needs from a catalog, extracted as a trait so
 /// the hook is unit-testable (architecture review 507).
 ///
@@ -7771,7 +7780,11 @@ impl WriteHandler {
                     self.table_cache.clone(),
                     session.access_token().expose(),
                 )
-                .await?,
+                .await?
+                .scoped_to(
+                    session,
+                    &default_write_catalog(&self.config, target_warehouse),
+                )?,
             ),
         };
 

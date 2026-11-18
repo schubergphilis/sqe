@@ -89,6 +89,7 @@ impl SessionAuth {
             refresh_token: session.refresh_token().cloned(),
             expires_at: Some(session.token_expiry()),
             scopes: vec![],
+            token_binding: None,
         })
     }
 }

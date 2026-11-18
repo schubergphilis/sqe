@@ -81,6 +81,12 @@ impl AuthProvider for BearerPassthroughProvider {
             refresh_token: None,
             expires_at: None,
             scopes: vec![],
+            // Unverified: this provider trusts the upstream that validated
+            // the bearer. The binding only classifies the token for a
+            // catalog scope (#908); the scope itself is still verified.
+            token_binding: crate::provider::unverified_jwt_claims(token.expose())
+                .as_ref()
+                .and_then(crate::provider::token_binding_from_claims),
         })
     }
 

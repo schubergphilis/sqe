@@ -238,6 +238,7 @@ impl OidcClientCredentialsProvider {
             refresh_token: None,
             expires_at,
             scopes: vec![],
+            token_binding: None,
         }
     }
 }
@@ -499,6 +500,7 @@ mod tests {
             refresh_token: None,
             expires_at: None,
             scopes: vec![],
+            token_binding: None,
         };
         assert!(p.refresh_catalog_token(&id).await.unwrap().is_none());
     }

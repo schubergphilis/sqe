@@ -1,3 +1,4 @@
+pub mod catalog_scope;
 pub mod circuit_breaker;
 pub mod config;
 pub mod error;

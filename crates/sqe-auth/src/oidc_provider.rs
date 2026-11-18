@@ -346,6 +346,7 @@ impl AuthProvider for OidcPasswordProvider {
                 .map(sqe_core::SecretString::new),
             expires_at,
             scopes: vec![],
+            token_binding: None,
         })
     }
 

@@ -115,6 +115,7 @@ static SESSION_CONTEXT_CACHE: LazyLock<Cache<String, CachedSession>> =
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_catalog_provider(
     cat_cfg: &sqe_core::config::CatalogConfig,
+    sql_name: &str,
     session: &Session,
     global_storage: &sqe_core::config::StorageConfig,
     prefetch_concurrency: usize,
@@ -123,7 +124,7 @@ pub(crate) async fn build_catalog_provider(
     degrade_unresolvable: bool,
 ) -> Result<(SqeCatalogProvider, Arc<SessionCatalog>), Arc<SqeError>> {
     let (session_catalog, storage) =
-        build_session_catalog(cat_cfg, session, global_storage, table_cache).await?;
+        build_session_catalog(cat_cfg, sql_name, session, global_storage, table_cache).await?;
 
     let mut catalog_provider = SqeCatalogProvider::try_new_with_options(
         session_catalog.clone(),
@@ -152,12 +153,18 @@ pub(crate) async fn build_catalog_provider(
 /// [`SessionCatalog`] for `cat_cfg`. Shared by [`build_catalog_provider`] (read
 /// path) and [`discover_session_catalog`] (write path) so both resolve auth and
 /// storage identically — keep them on one code path to avoid silent divergence.
+///
+/// `sql_name` is the name SQL uses for the catalog. A session limited to a
+/// catalog scope (#908) gets "catalog not found" for a name outside it, and
+/// the catalog it does get refuses writes the scope does not allow.
 pub(crate) async fn build_session_catalog(
     cat_cfg: &sqe_core::config::CatalogConfig,
+    sql_name: &str,
     session: &Session,
     global_storage: &sqe_core::config::StorageConfig,
     table_cache: Option<&TableMetadataCache>,
 ) -> Result<(Arc<SessionCatalog>, sqe_core::config::StorageConfig), Arc<SqeError>> {
+    session.check_catalog_read(sql_name).map_err(Arc::new)?;
     let auth = cat_cfg.auth.clone().unwrap_or_default();
     let bearer = sqe_auth::per_catalog::resolve_bearer(&auth, session.access_token().expose())
         .await
@@ -170,7 +177,8 @@ pub(crate) async fn build_session_catalog(
     let session_catalog = Arc::new(
         SessionCatalog::for_session_with(cat_cfg, &storage, table_cache.cloned(), &bearer)
             .await
-            .map_err(Arc::new)?,
+            .map_err(Arc::new)?
+            .with_catalog_scope(session.catalog_scope_arc(), sql_name),
     );
 
     Ok((session_catalog, storage))
@@ -210,6 +218,12 @@ pub async fn create_session_context(
     hive_manifest_cache: &Arc<sqe_catalog::hive::provider::HiveMetadataCache>,
     secrets: &sqe_core::SecretStore,
 ) -> sqe_core::Result<(SessionContext, Arc<SessionCatalog>)> {
+    // Catalog scope (#908): fail closed before anything is built or served
+    // from cache, and refuse a session catalog the scope hides.
+    session.effective_scope()?;
+    if let Some(c) = session.default_catalog.as_deref().filter(|c| !c.is_empty()) {
+        session.check_catalog_read(c)?;
+    }
     let cache_key = session_cache_key(session);
 
     // --- Atomic cache lookup / build via try_get_with ---
@@ -260,6 +274,9 @@ pub async fn create_session_context(
             } else {
                 config.resolve_default_catalog()
             };
+            // A scoped session whose config default is outside its scope
+            // defaults to its first scoped catalog instead.
+            let catalog_name = scoped_default_catalog(session, catalog_name, &flattened);
 
             // --- Session catalog/schema resolution (Trino X-Trino-Catalog /
             //     X-Trino-Schema) ---
@@ -286,10 +303,17 @@ pub async fn create_session_context(
                 SqeCatalogProvider,
                 Arc<SessionCatalog>,
             )> = None;
+            // A scoped default that is not configured is discovered like a
+            // session catalog, so unqualified names resolve against it.
+            let scoped_discovery = (session.catalog_scope().is_some()
+                && !config_catalog_names.contains(catalog_name.as_str())
+                && catalog_name != "datafusion")
+                .then_some(catalog_name.as_str());
             let default_catalog = match session
                 .default_catalog
                 .as_deref()
                 .filter(|c| !c.is_empty())
+                .or(scoped_discovery)
             {
                 // Already a static-config catalog, an ATTACHed catalog or a
                 // Hive root: registered below, so just point DataFusion's
@@ -524,8 +548,13 @@ pub async fn create_session_context(
                 std::collections::HashSet::new();
 
             for (cat_name, cat_cfg) in &flattened {
+                // A catalog scope (#908) hides the catalogs outside it.
+                if !session.catalog_visible(cat_name) {
+                    continue;
+                }
                 let (catalog_provider, session_catalog) = build_catalog_provider(
                     cat_cfg,
+                    cat_name,
                     session,
                     &global_storage,
                     config.storage.prefetch_concurrency,
@@ -663,6 +692,9 @@ pub async fn create_session_context(
             // entered, so it reflects the registry state at the moment of
             // the cache miss.
             for (name, provider) in &attached_providers {
+                if !session.catalog_visible(name) {
+                    continue;
+                }
                 ctx.register_catalog(name.clone(), Arc::clone(provider));
             }
 
@@ -710,6 +742,9 @@ pub async fn create_session_context(
             // `DROP TABLE`, which every session sees because the snapshots
             // are shared; another process's DDL is visible after the TTL.
             for (name, root) in &hive_roots {
+                if !session.catalog_visible(name) {
+                    continue;
+                }
                 let hive_caller = crate::hive_ddl_handler::hive_session_caller(&session.user);
                 let hive_provider = sqe_catalog::mount::session_hive_catalog_from_source(
                     name,
@@ -1113,6 +1148,7 @@ pub(crate) async fn discover_catalog_provider(
 
     match build_catalog_provider(
         &cfg,
+        warehouse,
         session,
         &config.storage,
         config.storage.prefetch_concurrency,
@@ -1168,7 +1204,7 @@ pub(crate) async fn configured_session_catalog(
         .find(|(n, _)| n == name)
         .or_else(|| flattened.iter().find(|(_, c)| c.warehouse == name))?;
     let cfg = (*cfg).clone();
-    match build_session_catalog(&cfg, session, &config.storage, table_cache).await {
+    match build_session_catalog(&cfg, name, session, &config.storage, table_cache).await {
         Ok((session_catalog, _storage)) => Some(session_catalog),
         Err(e) => {
             tracing::info!(
@@ -1227,7 +1263,7 @@ pub(crate) async fn discover_session_catalog(
     let mut cfg = discovery_template(config)?;
     cfg.warehouse = warehouse.to_string();
 
-    match build_session_catalog(&cfg, session, &config.storage, table_cache).await {
+    match build_session_catalog(&cfg, warehouse, session, &config.storage, table_cache).await {
         Ok((session_catalog, _storage)) => Some(session_catalog),
         Err(e) => {
             tracing::info!(
@@ -1311,6 +1347,30 @@ pub async fn invalidate_all_session_caches() {
 /// (X-Trino-Catalog / X-Trino-Schema) are part of the key: the same
 /// user+token opening two connections against different catalogs/schemas
 /// builds distinct DataFusion default-catalog contexts and must not collide.
+/// The default catalog for a session limited to a catalog scope (#908):
+/// `configured` when the scope allows it, else the first scoped catalog that
+/// is configured, else the first scoped catalog (resolved by discovery),
+/// else `datafusion`. Unscoped sessions keep `configured`.
+fn scoped_default_catalog(
+    session: &Session,
+    configured: String,
+    flattened: &[(String, sqe_core::config::CatalogConfig)],
+) -> String {
+    let Some(scope) = session.catalog_scope() else {
+        return configured;
+    };
+    if session.catalog_visible(&configured) {
+        return configured;
+    }
+    flattened
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .find(|n| scope.access(n).is_some())
+        .or_else(|| scope.catalog_names().next())
+        .unwrap_or("datafusion")
+        .to_string()
+}
+
 fn session_cache_key(session: &Session) -> String {
     let token_hash = hex::encode(Sha256::digest(session.access_token().expose_bytes()));
     let mut roles = session.user.roles.clone();
@@ -1329,14 +1389,20 @@ fn session_cache_key(session: &Session) -> String {
         identity.update(part.as_bytes());
     }
     let identity_hash = hex::encode(identity.finalize());
-    format!(
+    let key = format!(
         "{}:{}:{}:{}:{}",
         session.user.username,
         &token_hash[..16],
         &identity_hash[..16],
         session.default_catalog.as_deref().unwrap_or(""),
         session.default_schema.as_deref().unwrap_or(""),
-    )
+    );
+    // A scoped session (#908) sees fewer catalogs than the same bearer
+    // without one. Unscoped keys stay as they were.
+    match session.catalog_scope() {
+        Some(scope) => format!("{key}:scope={}", scope.digest()),
+        None => key,
+    }
 }
 
 #[cfg(test)]

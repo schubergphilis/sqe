@@ -225,7 +225,9 @@ fn classify_user_sql(
 ) -> sqe_core::Result<StatementKind> {
     let classifiable = sqe_sql::pre_parse_pipeline(&sqe_sql::UserSql::from(sql))?;
     let normalized = engine_front_door(session, upper).normalize(classifiable.as_str())?;
-    sqe_sql::classify_normalized(normalized)
+    let kind = sqe_sql::classify_normalized(normalized)?;
+    crate::catalog_scope_gate::check_statement(session, &kind)?;
+    Ok(kind)
 }
 
 /// Normalize SQL for the DataFusion planner, once, after the time-travel and
@@ -7640,7 +7642,7 @@ fn autocommit_write_conflict(session: &Session) -> SqeError {
     SqeError::with_code(SqeErrorCode::AutocommitWriteConflict, message)
 }
 
-fn parse_use_target(target: &str) -> sqe_core::Result<(Option<String>, String)> {
+pub(crate) fn parse_use_target(target: &str) -> sqe_core::Result<(Option<String>, String)> {
     let unquote = |part: &str| -> String {
         let p = part.trim();
         p.strip_prefix('"')

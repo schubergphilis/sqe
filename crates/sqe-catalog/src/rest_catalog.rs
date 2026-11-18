@@ -1471,6 +1471,18 @@ pub struct SessionCatalog {
     /// (issue #49). TTL and capacity are configured when the global cache is created
     /// (see `TableMetadataCache::new`).
     table_cache: TableMetadataCache,
+    /// The session's signed catalog scope and this catalog's SQL name
+    /// (#908). `None` outside a scoped session. With a scope, every mutation
+    /// refuses unless the scope marks the catalog `read_write`, and a sibling
+    /// warehouse outside the scope is not found: the backstop behind the
+    /// checks where writes resolve their target.
+    scope_guard: Option<ScopeGuard>,
+}
+
+#[derive(Clone)]
+struct ScopeGuard {
+    scope: Arc<sqe_core::catalog_scope::CatalogScope>,
+    catalog: String,
 }
 
 /// Local placeholder used when a deployment has no Iceberg catalog.
@@ -1784,6 +1796,7 @@ impl SessionCatalog {
             circuit_breaker: user_circuit_breaker("unconfigured", "unconfigured"),
             require_vended_credentials: false,
             table_cache: table_cache.unwrap_or_else(|| TableMetadataCache::new(0)),
+            scope_guard: None,
         }
     }
 
@@ -1809,6 +1822,7 @@ impl SessionCatalog {
             circuit_breaker: user_circuit_breaker("local", warehouse),
             require_vended_credentials: false,
             table_cache: TableMetadataCache::new(0),
+            scope_guard: None,
         }
     }
 
@@ -1978,6 +1992,7 @@ impl SessionCatalog {
             circuit_breaker,
             require_vended_credentials: catalog.require_vended_credentials,
             table_cache,
+            scope_guard: None,
         }
     }
 
@@ -2158,6 +2173,7 @@ impl SessionCatalog {
             circuit_breaker: user_circuit_breaker(token_fingerprint, "http://127.0.0.1:1"),
             require_vended_credentials: false,
             table_cache,
+            scope_guard: None,
         }
     }
 
@@ -2171,7 +2187,15 @@ impl SessionCatalog {
     /// `team_a_data.public.events`). Authorization is unchanged — the same
     /// user token is presented, so Polaris/OPA still decide access.
     pub async fn for_sibling_warehouse(&self, warehouse: &str) -> sqe_core::Result<Self> {
-        Self::new_with_props(
+        // A scoped session reaches only its catalogs, through a view body
+        // as much as directly (#908).
+        let scope = self.scope_guard.as_ref().map(|g| g.scope.clone());
+        if let Some(scope) = &scope {
+            if scope.access(warehouse).is_none() {
+                return Err(sqe_core::catalog_scope::catalog_not_found(warehouse));
+            }
+        }
+        let sibling = Self::new_with_props(
             &self.catalog_url,
             warehouse,
             &self.bearer_token,
@@ -2182,7 +2206,8 @@ impl SessionCatalog {
             self.require_vended_credentials,
             self.extra_props.clone(),
         )
-        .await
+        .await?;
+        Ok(sibling.with_catalog_scope(scope, warehouse))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2356,7 +2381,46 @@ impl SessionCatalog {
             circuit_breaker,
             require_vended_credentials,
             table_cache,
+            scope_guard: None,
         })
+    }
+
+    /// Bind this catalog to the session's signed catalog scope under its SQL
+    /// name `catalog` (#908). `None` leaves it unrestricted.
+    pub fn with_catalog_scope(
+        mut self,
+        scope: Option<Arc<sqe_core::catalog_scope::CatalogScope>>,
+        catalog: &str,
+    ) -> Self {
+        self.scope_guard = scope.map(|scope| ScopeGuard {
+            scope,
+            catalog: catalog.to_string(),
+        });
+        self
+    }
+
+    /// Bind this catalog to `session`'s catalog scope under the SQL name
+    /// `catalog`, refusing it as "not found" when the scope hides it. A
+    /// no-op for an unscoped session; an error when the session's scope
+    /// check fails (#908).
+    pub fn scoped_to(self, session: &sqe_core::Session, catalog: &str) -> sqe_core::Result<Self> {
+        session.check_catalog_read(catalog)?;
+        Ok(self.with_catalog_scope(session.catalog_scope_arc(), catalog))
+    }
+
+    /// Refuse a mutation unless the session's scope (if any) marks this
+    /// catalog `read_write`.
+    pub fn ensure_writable(&self) -> sqe_core::Result<()> {
+        let Some(guard) = &self.scope_guard else {
+            return Ok(());
+        };
+        match guard.scope.access(&guard.catalog) {
+            Some(sqe_core::catalog_scope::CatalogAccess::ReadWrite) => Ok(()),
+            Some(sqe_core::catalog_scope::CatalogAccess::ReadOnly) => {
+                Err(sqe_core::catalog_scope::catalog_read_only(&guard.catalog))
+            }
+            None => Err(sqe_core::catalog_scope::catalog_not_found(&guard.catalog)),
+        }
     }
 
     /// Returns the token fingerprint for this session (last 8 chars of the bearer token).
@@ -3524,6 +3588,7 @@ impl SessionCatalog {
     /// commit. Call it before the statement writes any data file; outside a
     /// transaction it does nothing.
     pub async fn admit_txn_write(&self, table_ident: &TableIdent) -> sqe_core::Result<()> {
+        self.ensure_writable()?;
         match crate::txn::current() {
             Some(txn) => self.admit_txn_write_in(&txn, table_ident).await,
             None => Ok(()),
@@ -3631,6 +3696,7 @@ impl SessionCatalog {
         schema: &serde_json::Value,
         properties: &std::collections::HashMap<String, String>,
     ) -> sqe_core::Result<()> {
+        self.ensure_writable()?;
         self.require_rest_backend("create_view")?;
         let url = self.views_url(namespace).await;
         let schema = view_schema_from_json(schema, 0)?;
@@ -3690,6 +3756,7 @@ impl SessionCatalog {
         properties: &std::collections::HashMap<String, String>,
         drop_dialects: &[String],
     ) -> sqe_core::Result<()> {
+        self.ensure_writable()?;
         self.require_rest_backend("create_or_replace_view")?;
         let Some(existing) = self.load_view_metadata(namespace, name).await? else {
             return self
@@ -3895,6 +3962,7 @@ impl SessionCatalog {
     /// Calls `DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}`.
     #[instrument(skip(self), fields(namespace = ?namespace, view = %name, warehouse = %self.warehouse))]
     pub async fn drop_view(&self, namespace: &NamespaceIdent, name: &str) -> sqe_core::Result<()> {
+        self.ensure_writable()?;
         self.require_rest_backend("drop_view")?;
         let url = self.view_url(namespace, name).await;
         debug!(url = %url, view = name, "Dropping view via Iceberg REST");
@@ -3933,6 +4001,7 @@ impl SessionCatalog {
         updates: Vec<TableUpdate>,
         requirements: Vec<TableRequirement>,
     ) -> sqe_core::Result<()> {
+        self.ensure_writable()?;
         // A non-REST backend (the embedded SQLite catalog) takes the same
         // update list through `Catalog::update_table`, whose `apply` checks
         // the requirements the REST server would check.
@@ -4042,6 +4111,7 @@ impl SessionCatalog {
         table_ident: &TableIdent,
         table: &Table,
     ) -> sqe_core::Result<()> {
+        self.ensure_writable()?;
         if !matches!(self.inner, CatalogHandle::Rest(_)) {
             return Ok(());
         }
@@ -4287,6 +4357,13 @@ pub struct SessionCatalogBridge {
     session: Arc<SessionCatalog>,
 }
 
+impl SessionCatalogBridge {
+    /// The scope backstop (#908) for every mutating `Catalog` method.
+    fn ensure_writable(&self) -> iceberg::Result<()> {
+        self.session.ensure_writable().map_err(bridge_error)
+    }
+}
+
 /// Hand an `SqeError` back to iceberg-rust callers. The message keeps the
 /// SQE text; a catalog HTTP status also rides along as the `status` context,
 /// so `iceberg::Error::http_status` sees it on the far side (the commit
@@ -4317,6 +4394,7 @@ impl Catalog for SessionCatalogBridge {
         namespace: &NamespaceIdent,
         properties: HashMap<String, String>,
     ) -> iceberg::Result<iceberg::Namespace> {
+        self.ensure_writable()?;
         dispatch_catalog!(self.session.inner, create_namespace(namespace, properties))
     }
 
@@ -4336,10 +4414,12 @@ impl Catalog for SessionCatalogBridge {
         namespace: &NamespaceIdent,
         properties: HashMap<String, String>,
     ) -> iceberg::Result<()> {
+        self.ensure_writable()?;
         dispatch_catalog!(self.session.inner, update_namespace(namespace, properties))
     }
 
     async fn drop_namespace(&self, namespace: &NamespaceIdent) -> iceberg::Result<()> {
+        self.ensure_writable()?;
         dispatch_catalog!(self.session.inner, drop_namespace(namespace))
     }
 
@@ -4352,6 +4432,7 @@ impl Catalog for SessionCatalogBridge {
         namespace: &NamespaceIdent,
         creation: iceberg::TableCreation,
     ) -> iceberg::Result<Table> {
+        self.ensure_writable()?;
         let table_name = creation.name.clone();
         let result = dispatch_catalog!(self.session.inner, create_table(namespace, creation))?;
         // Evict every token's entry for this name, not just the creator's: a
@@ -4369,6 +4450,7 @@ impl Catalog for SessionCatalogBridge {
     }
 
     async fn drop_table(&self, table: &TableIdent) -> iceberg::Result<()> {
+        self.ensure_writable()?;
         let result = dispatch_catalog!(self.session.inner, drop_table(table));
         // Invalidate on success or failure: stale data is worse than a miss.
         // All tokens, because a dropped table is dropped for everyone and a
@@ -4378,6 +4460,7 @@ impl Catalog for SessionCatalogBridge {
     }
 
     async fn purge_table(&self, table: &TableIdent) -> iceberg::Result<()> {
+        self.ensure_writable()?;
         let result = dispatch_catalog!(self.session.inner, purge_table(table));
         // Same invalidation as drop_table: the files are gone for everyone.
         self.session.invalidate_table_all_tokens(table).await;
@@ -4389,6 +4472,7 @@ impl Catalog for SessionCatalogBridge {
     }
 
     async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> iceberg::Result<()> {
+        self.ensure_writable()?;
         let result = dispatch_catalog!(self.session.inner, rename_table(src, dest));
         // BOTH names, and every token holding either. The source name no longer
         // resolves and the destination may have shadowed a cached entry, so a
@@ -4405,6 +4489,7 @@ impl Catalog for SessionCatalogBridge {
         table: &TableIdent,
         metadata_location: String,
     ) -> iceberg::Result<Table> {
+        self.ensure_writable()?;
         let result =
             dispatch_catalog!(self.session.inner, register_table(table, metadata_location));
         // Registering binds this name to a different metadata document; any
@@ -4421,6 +4506,7 @@ impl Catalog for SessionCatalogBridge {
     }
 
     async fn commit_transaction(&self, commits: Vec<iceberg::TableCommit>) -> iceberg::Result<()> {
+        self.ensure_writable()?;
         let idents: Vec<TableIdent> = commits.iter().map(|c| c.identifier().clone()).collect();
         let result = dispatch_catalog!(self.session.inner, commit_transaction(commits));
         // As in `update_table`: every principal's cached copy is stale, and
@@ -4432,6 +4518,7 @@ impl Catalog for SessionCatalogBridge {
     }
 
     async fn update_table(&self, commit: iceberg::TableCommit) -> iceberg::Result<Table> {
+        self.ensure_writable()?;
         let ident = commit.identifier().clone();
         // Inside a transaction every write goes to the transaction branch and
         // only COMMIT, which runs outside the scope, moves `main` (#821). A
@@ -8025,5 +8112,70 @@ mod rest_prefix_tests {
             .expect("probe admitted under the advertised prefix");
         server.verify().await;
         assert_eq!(breaker.state_label(), "closed");
+    }
+}
+
+#[cfg(test)]
+mod catalog_scope_backstop_tests {
+    use super::*;
+    use sqe_core::catalog_scope::{CatalogAccess, CatalogScope};
+
+    fn scope() -> Arc<CatalogScope> {
+        Arc::new(CatalogScope::new(
+            "user-1",
+            "jti-1",
+            chrono::Utc::now() + chrono::Duration::minutes(5),
+            [
+                ("rw".to_string(), CatalogAccess::ReadWrite),
+                ("ro".to_string(), CatalogAccess::ReadOnly),
+            ],
+        ))
+    }
+
+    fn catalog(name: &str, scoped: bool) -> Arc<SessionCatalog> {
+        Arc::new(
+            SessionCatalog::unconfigured(&StorageConfig::default(), None)
+                .with_catalog_scope(scoped.then(scope), name),
+        )
+    }
+
+    #[test]
+    fn unscoped_catalog_is_writable() {
+        assert!(catalog("anything", false).ensure_writable().is_ok());
+    }
+
+    #[test]
+    fn read_write_passes_read_only_and_unknown_refuse() {
+        assert!(catalog("rw", true).ensure_writable().is_ok());
+        assert!(catalog("RW", true).ensure_writable().is_ok());
+        let ro = catalog("ro", true).ensure_writable().unwrap_err();
+        assert_eq!(ro.error_code(), sqe_core::SqeErrorCode::AccessDenied);
+        let other = catalog("other", true).ensure_writable().unwrap_err();
+        assert_eq!(other.error_code(), sqe_core::SqeErrorCode::CatalogNotFound);
+    }
+
+    #[tokio::test]
+    async fn bridge_refuses_mutation_before_the_backend() {
+        let bridge = catalog("ro", true).as_catalog();
+        let ns = NamespaceIdent::new("n".to_string());
+        let err = bridge
+            .create_namespace(&ns, HashMap::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("read-only"), "{err}");
+        let err = bridge
+            .drop_table(&TableIdent::new(ns, "t".to_string()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("read-only"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn sibling_outside_scope_is_not_found() {
+        let err = catalog("rw", true)
+            .for_sibling_warehouse("elsewhere")
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::CatalogNotFound);
     }
 }

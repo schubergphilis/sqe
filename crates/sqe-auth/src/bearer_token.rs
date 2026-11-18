@@ -559,6 +559,16 @@ impl BearerTokenProvider {
         Ok(cached)
     }
 
+    /// Verify `token` against this provider's issuer and keys and return its
+    /// claims, without building an identity. Used for signed catalog scopes
+    /// (#908), which are not bearer tokens.
+    pub(crate) async fn verify_jwt_claims(
+        &self,
+        token: &str,
+    ) -> Result<serde_json::Value, AuthError> {
+        self.validate_jwt(token).await.map(|d| d.claims)
+    }
+
     /// Validate and decode a JWT token against the cached JWKS.
     ///
     /// On `kid` mismatch, refetches the JWKS once and retries (handles key rotation).
@@ -834,6 +844,7 @@ impl AuthProvider for BearerTokenProvider {
             refresh_token: None,
             expires_at,
             scopes: Self::extract_scopes(claims),
+            token_binding: crate::provider::token_binding_from_claims(claims),
         })
     }
 
@@ -2213,6 +2224,7 @@ Gsk+TB4BOZOZvvRKOPj1Dj5tcKc/tv2Hx8kiS4egVEC2qWmKaBDbv9kN
             refresh_token: None,
             expires_at: None,
             scopes: vec![],
+            token_binding: None,
         };
 
         let result = provider
@@ -2244,6 +2256,7 @@ Gsk+TB4BOZOZvvRKOPj1Dj5tcKc/tv2Hx8kiS4egVEC2qWmKaBDbv9kN
             refresh_token: None,
             expires_at: None,
             scopes: vec![],
+            token_binding: None,
         };
 
         let result = provider

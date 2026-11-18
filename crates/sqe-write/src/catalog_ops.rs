@@ -27,9 +27,9 @@ use crate::ident::{
 use crate::write_handler::trino_props::TrinoTableOptions;
 use crate::write_handler::{
     arrow_column_to_iceberg_type, configured_write_target,
-    default_to_iceberg_literal as alter_default_to_iceberg_literal, geospatial_iceberg_type,
-    parse_partition_transform_sql, requested_format_version, sql_type_to_arrow,
-    sql_type_to_arrow_for, CatalogDiscovery,
+    default_to_iceberg_literal as alter_default_to_iceberg_literal, default_write_catalog,
+    geospatial_iceberg_type, parse_partition_transform_sql, requested_format_version,
+    sql_type_to_arrow, sql_type_to_arrow_for, CatalogDiscovery,
 };
 
 /// `format-version` (Iceberg) or `format_version` (Trino).
@@ -2479,7 +2479,11 @@ impl CatalogOps {
                     self.table_cache.clone(),
                     session.access_token().expose(),
                 )
-                .await?,
+                .await?
+                .scoped_to(
+                    session,
+                    &default_write_catalog(&self.config, target_warehouse),
+                )?,
             )),
         }
     }
@@ -3122,12 +3126,9 @@ mod tests {
         let props = HashMap::from([(JSON_COLUMNS_PROP.to_string(), r#"["j"]"#.to_string())]);
 
         assert!(json_columns_update(&props, &[]).is_none());
+        assert!(json_columns_update(&props, &[JsonColumnChange::Remove("other".into())]).is_none());
         assert!(
-            json_columns_update(&props, &[JsonColumnChange::Remove("other".into())]).is_none()
-        );
-        assert!(
-            json_columns_update(&HashMap::new(), &[JsonColumnChange::Remove("x".into())])
-                .is_none(),
+            json_columns_update(&HashMap::new(), &[JsonColumnChange::Remove("x".into())]).is_none(),
             "a plain ALTER on a table without JSON columns writes no property"
         );
 

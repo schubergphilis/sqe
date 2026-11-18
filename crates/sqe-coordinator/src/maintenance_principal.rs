@@ -115,6 +115,7 @@ impl MaintenancePrincipal {
             refresh_token: None,
             expires_at: None,
             scopes: vec![],
+            token_binding: None,
         };
         let refreshed = self
             .provider
@@ -200,6 +201,7 @@ mod tests {
             refresh_token: None,
             expires_at: None,
             scopes: vec![],
+            token_binding: None,
         }
     }
 
