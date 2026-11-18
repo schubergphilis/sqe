@@ -25,6 +25,7 @@ mod decimal_rounding;
 mod float_decimal_comparison;
 mod sorted_row_number;
 mod top_row_number;
+mod trino_decimal_types;
 
 pub use decimal_arithmetic::{DecimalArithUdf, DecimalArithmeticRule, TrinoSum, DECIMAL_ARITH};
 pub use decimal_rounding::{
