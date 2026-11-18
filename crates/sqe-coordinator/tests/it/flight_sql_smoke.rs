@@ -211,8 +211,8 @@ async fn handshake_then_statement_returns_rows_over_grpc() {
         .expect("the projected alias survives the round trip");
     let values = col
         .as_any()
-        .downcast_ref::<arrow_array::Int64Array>()
-        .expect("1 + 1 is an Int64");
+        .downcast_ref::<arrow_array::Int32Array>()
+        .expect("1 + 1 is a Trino integer (Int32)");
     assert_eq!(values.value(0), 2);
 }
 

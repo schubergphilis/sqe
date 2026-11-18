@@ -38,7 +38,7 @@
 
 use chrono::{DateTime, Utc};
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Statement, Value,
+    DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Statement, Value,
     ValueWithSpan,
 };
 
@@ -834,6 +834,13 @@ fn expect_timestamp(expr: &Expr, field: &str) -> sqe_core::Result<DateTime<Utc>>
             value: Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
             ..
         }) => s.clone(),
+        // The Trino rewrite turns `TIMESTAMP '...'` into
+        // `CAST('...' AS TIMESTAMP(0))` before the CALL is parsed.
+        Expr::Cast {
+            expr: inner,
+            data_type: DataType::Timestamp(..),
+            ..
+        } if matches!(**inner, Expr::Value(_)) => return expect_timestamp(inner, field),
         Expr::TypedString(ts) => match ts.value.clone().into_string() {
             Some(s) => s,
             None => {
@@ -1229,6 +1236,28 @@ mod tests {
             }
             other => panic!("Expected ExpireSnapshots, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_older_than_as_a_rewritten_timestamp_cast() {
+        // What the Trino rewrite makes of `TIMESTAMP '2999-01-01 00:00:00'`.
+        let stmt = parse_first(
+            "CALL system.expire_snapshots(table => 'ns.t', \
+             older_than => CAST('2999-01-01 00:00:00' AS TIMESTAMP(0)))",
+        );
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        match call {
+            ProcedureCall::ExpireSnapshots { older_than, .. } => {
+                let want = DateTime::parse_from_rfc3339("2999-01-01T00:00:00Z").unwrap();
+                assert_eq!(older_than, Some(want.with_timezone(&Utc)));
+            }
+            other => panic!("Expected ExpireSnapshots, got {other:?}"),
+        }
+        let stmt = parse_first(
+            "CALL system.expire_snapshots(table => 'ns.t', \
+             older_than => CAST(now() AS TIMESTAMP(0)))",
+        );
+        assert!(try_parse_call(&stmt).is_err(), "only a literal is accepted");
     }
 
     #[test]

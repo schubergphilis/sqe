@@ -133,8 +133,8 @@ async fn describe_output_lists_columns_and_types() {
     // Column names in order.
     assert_eq!(cell(b, 0, 0), "id");
     assert_eq!(cell(b, 0, 1), "name");
-    // Trino type names: bigint (Int64 literal) and varchar.
-    assert_eq!(cell(b, 4, 0), "bigint");
+    // Trino type names: integer (a literal that fits is `integer`) and varchar.
+    assert_eq!(cell(b, 4, 0), "integer");
     assert_eq!(cell(b, 4, 1), "varchar");
     // Catalog / Schema / Table are '' like Trino, never NULL: the Trino JDBC
     // driver's PreparedStatement.getMetaData() requires a non-null table name.
