@@ -13,10 +13,9 @@
 //! The mask function is named [`MASK_HASH_UDF_NAME`] and is never registered
 //! in a session: HASH masks embed it into the plan directly, so users cannot
 //! call the keyed function and compare its output against masked values.
-//! Users get a plain, unkeyed `sha256` from [`user_sha256_udf`].
+//! Users call DataFusion's built-in `sha256` (varbinary, as in Trino).
 //!
 //! Usage:
-//!   ctx.register_udf(user_sha256_udf(None));       // user-callable sha256
 //!   sha256_udf(Some(key_bytes))                    // HASH mask (HMAC-SHA256)
 
 use std::sync::Arc;
@@ -188,16 +187,6 @@ pub fn sha256_udf(key: Option<Arc<Vec<u8>>>) -> ScalarUDF {
     ScalarUDF::from(Sha256Func::new(key))
 }
 
-/// The user-callable `sha256(text)`. Pass `None` wherever HASH masks apply
-/// (the coordinator): a user-callable keyed hash would reproduce masked
-/// output. Only embedded mode, which has no policy, passes a key.
-pub fn user_sha256_udf(key: Option<Arc<Vec<u8>>>) -> ScalarUDF {
-    ScalarUDF::from(Sha256Func {
-        name: "sha256",
-        ..Sha256Func::new(key)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,28 +208,15 @@ mod tests {
         }
     }
 
-    /// The keyed mask function must not be reachable as `sha256`: SQL users
-    /// get only the unkeyed function under that name.
+    /// The mask function must not be reachable as `sha256`: SQL users get
+    /// the built-in under that name.
     #[test]
-    fn test_keyed_mask_udf_is_not_user_sha256() {
-        let mask = sha256_udf(Some(Arc::new(b"k".to_vec())));
-        assert_ne!(mask.name(), "sha256");
-        assert_eq!(mask.name(), MASK_HASH_UDF_NAME);
-
-        let user = user_sha256_udf(None);
-        assert_eq!(user.name(), "sha256");
-        let input = ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(Some(
-            "hello".to_string(),
-        )));
-        let result = user.invoke_with_args(make_args(vec![input], 1)).unwrap();
-        let ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(Some(hash))) = result
-        else {
-            panic!("Expected Utf8 scalar");
-        };
-        assert_eq!(
-            hash, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
-            "user sha256 is plain SHA-256"
-        );
+    fn test_mask_udf_is_not_user_sha256() {
+        for key in [None, Some(Arc::new(b"k".to_vec()))] {
+            let mask = sha256_udf(key);
+            assert_ne!(mask.name(), "sha256");
+            assert_eq!(mask.name(), MASK_HASH_UDF_NAME);
+        }
     }
 
     #[test]

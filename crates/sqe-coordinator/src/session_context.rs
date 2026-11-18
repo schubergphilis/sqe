@@ -181,7 +181,7 @@ pub(crate) async fn build_session_catalog(
 /// The context is wired up with:
 /// - The user's Polaris catalog (via their bearer token)
 /// - The `system` catalog for Trino JDBC metadata + runtime query tables
-/// - The `sha256()` UDF for column masking
+/// - The internal keyed hash for column masking (embedded in plans, never registered)
 /// - Trino-compatible function aliases (`year()`, `month()`, ...)
 /// - The `read_parquet()` table-valued function
 ///
@@ -753,13 +753,11 @@ pub async fn create_session_context(
                 ctx.register_catalog(name.clone(), hive_provider);
             }
 
-            // Register the user-callable sha256() scalar function (plain,
-            // unkeyed). DataFusion does not ship a built-in sha256. HASH masks
+            // `sha256()` is DataFusion's built-in (Trino: varbinary). HASH masks
             // use a separate keyed function (`coordinator.policy.mask_key`,
             // issue #37) that the policy rewriter embeds in the plan and that
             // is deliberately NOT registered: if users could call it they
             // could hash candidate values and match masked output.
-            ctx.register_udf(sqe_policy::sha256_udf::user_sha256_udf(None));
 
             // Register session-context UDFs: current_user(), is_role_in_session(),
             // current_available_roles(), current_database(), current_schema().
@@ -1762,7 +1760,6 @@ allowed_object_store_prefixes = ["s3://shared-landing/"]
         let mut ctx = SessionContext::new_with_config(cfg);
 
         // Mirror the coordinator's registration set (see the builder above).
-        ctx.register_udf(sqe_policy::sha256_udf::user_sha256_udf(None));
         let identity = std::sync::Arc::new(sqe_policy::session_udf::SessionIdentity {
             username: "alice".into(),
             roles: vec!["analyst".into()],

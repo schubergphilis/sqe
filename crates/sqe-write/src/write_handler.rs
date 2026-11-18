@@ -12916,7 +12916,7 @@ s3_path_style = true
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dml_under_keyed_hash_mask_plans_without_exposing_mask_udf() {
         use arrow_array::StringArray;
-        use sqe_policy::sha256_udf::{sha256_udf, user_sha256_udf, MASK_HASH_UDF_NAME};
+        use sqe_policy::sha256_udf::{sha256_udf, MASK_HASH_UDF_NAME};
         use sqe_policy::MaskType;
         use sqlparser::dialect::GenericDialect;
         use sqlparser::parser::Parser;
@@ -12952,7 +12952,7 @@ s3_path_style = true
             }
         };
         let keyed = hash_of(sha256_udf(Some(key.clone())), "111-11").await;
-        let unkeyed = hash_of(user_sha256_udf(None), "111-11").await;
+        let unkeyed = hash_of(sha256_udf(None), "111-11").await;
         assert_ne!(keyed, unkeyed, "the mask must be the keyed hash");
 
         let assignments = |sql: &str| match Parser::parse_sql(&GenericDialect {}, sql)

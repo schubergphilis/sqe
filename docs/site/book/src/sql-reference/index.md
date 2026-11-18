@@ -28,7 +28,7 @@ Every function in SQE has exactly one origin. Eight values appear:
 | `datafusion-functions-json` | DataFusion JSON helper crate, registered explicitly. | `datafusion_functions_json::register_all()` in `session_context.rs:361`. |
 | `sqe-trino-functions` | Our Trino-compatibility crate. Adds Trino names for things DataFusion calls differently. | `crates/sqe-trino-functions/src/trino_functions.rs` and `trino_functions_ext.rs`. |
 | `sqe-trino-functions (ext)` | Extended Trino aliases. Same crate, separate registration call. | `register_extended_trino_functions()` in the same crate. |
-| `sqe-policy` | Security crate. Currently exposes one UDF (`sha256`) used by column masks. | `crates/sqe-policy/src/sha256_udf.rs`. |
+| `sqe-policy` | Security crate. Currently exposes the keyed hash UDF that HASH column masks use (internal, not callable from SQL). | `crates/sqe-policy/src/sha256_udf.rs`. |
 | `sqe-catalog` | Iceberg catalog and TVF crate. Provides `read_*` and `table_*` table functions. | `crates/sqe-catalog/src/`. |
 | `sqe-sql` | Parser extension. Statements pre-parsed before DataFusion sees them. | `crates/sqe-sql/src/`. |
 | `sqe-coordinator` | Statement router. Handles statements that need catalog calls or auth before execution. | `crates/sqe-coordinator/src/query_handler.rs`, `catalog_ops.rs`. |

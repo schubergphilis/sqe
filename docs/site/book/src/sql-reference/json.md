@@ -18,7 +18,7 @@ A `JSON` column is stored as Iceberg `VARIANT` on a V3 table (the default for ne
 | `json_extract(j, '$.path')` | `sqe-trino-functions` | JSONPath extraction. Returns JSON-encoded value. `trino_functions.rs:89` | yes | yes | yes | yes |
 | `json_extract_scalar(j, '$.path')` | `sqe-trino-functions` | Same path syntax; returns plain text scalar (or NULL). `trino_functions.rs:90` | yes | - | `get_json_object` | `json_extract_string` |
 | `is_json_scalar(j)` | `sqe-trino-functions (ext)` | True for JSON null / boolean / number / string. False for objects and arrays. `trino_functions_ext.rs:30` | yes | - | - | - |
-| `json_array_contains(j, v)` | `sqe-trino-functions (ext)` | True if JSON array contains the value. `trino_functions_ext.rs:31` | yes | - | - | - |
+| `json_array_contains(j, v)` | `sqe-trino-functions (ext)` | True if the JSON array contains the value; NULL when the JSON is not an array. `trino_functions_ext.rs:31` | yes | - | - | - |
 | `json_size(j, '$.path')` | `sqe-trino-functions (ext)` | Cardinality at the path. Object key count for objects; array length for arrays; `0` for primitives. `trino_functions_ext.rs:72` | yes | - | - | - |
 | `json_array_get(j, idx)` | `sqe-trino-functions (ext)` | 0-based element from a JSON array. `trino_functions_ext.rs:73` | yes | - | - | - |
 | `to_json(any)` | `sqe-trino-functions (ext)` | Serialize a SQL value (struct, array, map) as JSON; the target of `CAST(x AS JSON)`, see below. NULL in, NULL out. `json_cast.rs` | - | yes | yes | yes |

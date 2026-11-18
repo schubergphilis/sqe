@@ -322,3 +322,99 @@ fn data_size_arithmetic_has_no_float_error() {
     assert_eq!(parse_data_size_of("1.5GB").unwrap(), 1_610_612_736);
     assert!(parse_data_size_of("99999999999999999999999YB").is_err());
 }
+
+#[tokio::test]
+async fn concat_with_an_element_prepends_or_appends() {
+    let (dt, rows) = run("SELECT concat(7, make_array(1, 2))").await;
+    assert!(is_list_of(&dt, &DataType::Int64), "{dt:?}");
+    assert_eq!(rows, ["[7, 1, 2]"]);
+    assert_eq!(one("SELECT concat(make_array(1), 2)").await, "[1, 2]");
+    assert_eq!(
+        one("SELECT concat(make_array(1), 2, make_array(3, 4), 5)").await,
+        "[1, 2, 3, 4, 5]"
+    );
+    assert_eq!(one("SELECT concat(make_array('a'), 'b')").await, "[a, b]");
+    // A NULL array gives NULL; a typed NULL element is kept as an element.
+    assert_eq!(
+        one("SELECT concat(make_array(1), CAST(NULL AS BIGINT[]))").await,
+        "NULL"
+    );
+    assert_eq!(
+        one("SELECT cardinality(concat(make_array(1), CAST(NULL AS BIGINT)))").await,
+        "2"
+    );
+    let (_, rows) = run(
+        "SELECT concat(a, x) FROM (VALUES (make_array(1), 8), (make_array(2, 3), 9), (CAST(NULL AS BIGINT[]), 1)) t(a, x)",
+    )
+    .await;
+    assert_eq!(rows, ["[1, 8]", "[2, 3, 9]", "NULL"]);
+    assert!(err("SELECT concat(make_array(1), 'x')")
+        .await
+        .contains("concat"));
+}
+
+#[tokio::test]
+async fn title_case_capitalises_each_word() {
+    let (dt, rows) = run("SELECT title_case('hello wORLD-foo_bar 2nd')").await;
+    assert_eq!(dt, DataType::Utf8);
+    assert_eq!(rows, ["Hello World-Foo_Bar 2nd"]);
+    assert_eq!(one("SELECT title_case('')").await, "");
+    assert_eq!(one("SELECT title_case('élan vital')").await, "Élan Vital");
+    let (_, rows) = run("SELECT title_case(s) FROM (VALUES ('a b'), (NULL)) t(s)").await;
+    assert_eq!(rows, ["A B", "NULL"]);
+}
+
+#[tokio::test]
+async fn char2hexint_is_utf16be_hex() {
+    let (dt, rows) = run("SELECT char2hexint('abc')").await;
+    assert_eq!(dt, DataType::Utf8);
+    assert_eq!(rows, ["006100620063"]);
+    assert_eq!(one("SELECT char2hexint('ü')").await, "00FC");
+    // Outside the BMP: a surrogate pair.
+    assert_eq!(one("SELECT char2hexint('😀')").await, "D83DDE00");
+    assert_eq!(one("SELECT char2hexint('')").await, "");
+    let (_, rows) = run("SELECT char2hexint(s) FROM (VALUES ('a'), (NULL)) t(s)").await;
+    assert_eq!(rows, ["0061", "NULL"]);
+}
+
+#[tokio::test]
+async fn position_and_extract_return_bigint() {
+    let (dt, rows) = run("SELECT position('b' IN 'abc')").await;
+    assert_eq!(dt, DataType::Int64);
+    assert_eq!(rows, ["2"]);
+    assert_eq!(one("SELECT position('z' IN 'abc')").await, "0");
+    let (_, rows) = run("SELECT position('a' IN s) FROM (VALUES ('xa'), (NULL)) t(s)").await;
+    assert_eq!(rows, ["2", "NULL"]);
+    for field in [
+        "YEAR",
+        "QUARTER",
+        "MONTH",
+        "WEEK",
+        "DAY",
+        "DOW",
+        "DOY",
+        "HOUR",
+        "MINUTE",
+        "SECOND",
+        "MILLISECOND",
+    ] {
+        let (dt, _) = run(&format!(
+            "SELECT extract({field} FROM TIMESTAMP '2024-03-05 06:07:08.123')"
+        ))
+        .await;
+        assert_eq!(dt, DataType::Int64, "{field}");
+    }
+    assert_eq!(
+        one("SELECT extract(YEAR FROM DATE '2024-03-05')").await,
+        "2024"
+    );
+    assert_eq!(
+        one("SELECT extract(SECOND FROM TIMESTAMP '2024-03-05 06:07:08.123')").await,
+        "8"
+    );
+    let (_, rows) = run(
+        "SELECT extract(MONTH FROM d) FROM (VALUES (DATE '2024-03-05'), (CAST(NULL AS DATE))) t(d)",
+    )
+    .await;
+    assert_eq!(rows, ["3", "NULL"]);
+}

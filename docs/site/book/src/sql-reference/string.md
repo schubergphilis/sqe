@@ -88,7 +88,7 @@ DataFusion contributes ~35 string functions plus a unicode submodule and a regex
 |---|---|---|---|---|---|---|
 | `md5(s)` | `datafusion-builtin` | 128-bit hex. | yes | yes | yes | yes |
 | `sha224(s)` | `datafusion-builtin` | SHA-224 hex. | yes | - | yes | - |
-| `sha256(s)` | `datafusion-builtin` + `sqe-policy` | SHA-256 hex, unkeyed on the coordinator. HASH column masks use a separate internal keyed function that SQL cannot call. | yes | yes | yes | yes |
+| `sha256(x)` | `datafusion-builtin` | Trino: returns `varbinary` (32 bytes) for a `varbinary` argument; a `varchar` argument is hashed as its UTF-8 bytes. Wrap in `to_hex()` for text. HASH column masks use a separate internal keyed function that SQL cannot call. | yes | yes | yes | yes |
 | `sha384(s)` | `datafusion-builtin` | SHA-384 hex. | yes | - | yes | - |
 | `sha512(s)` | `datafusion-builtin` | SHA-512 hex. | yes | yes | yes | yes |
 | `digest(s, algorithm)` | `datafusion-builtin` | Generic digest. Algos: `md5`, `sha224`, `sha256`, `sha384`, `sha512`, `blake2s`, `blake2b`, `blake3`. | - | - | - | - |
@@ -151,7 +151,7 @@ WHERE length(token) > 3;
 ```sql
 SELECT
     user_id,
-    sha256(email) AS email_hash,
+    to_hex(sha256(email)) AS email_hash,
     concat('***', right(phone, 4)) AS phone_masked
 FROM users;
 ```
