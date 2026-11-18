@@ -120,12 +120,7 @@ async fn scalar_i64(
     sql: &str,
 ) -> i64 {
     let batches = exec(handler, session, sql).await;
-    batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("Int64Array")
-        .value(0)
+    crate::common::i64s(batches[0].column(0)).value(0)
 }
 
 /// CTAS seed + two single-row INSERTs -> three live data files, one row
@@ -574,7 +569,7 @@ async fn show_create_table_round_trips_its_column_types() {
         "   ts timestamp(9)",
         "   s varchar",
         "   dt date",
-        "   r row(x bigint,y varchar)",
+        "   r row(x integer,y varchar)",
     ] {
         assert!(ddl.contains(column), "missing `{column}` in: {ddl}");
     }

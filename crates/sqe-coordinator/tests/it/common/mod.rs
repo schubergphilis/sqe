@@ -543,6 +543,18 @@ pub fn utf8(col: &dyn arrow_array::Array) -> arrow_array::StringArray {
         .clone()
 }
 
+/// An integer result column widened to `Int64Array`. Integer literals are
+/// `integer` (Int32) when they fit, as in Trino, so widen before reading
+/// values instead of downcasting to `Int64Array` directly.
+#[allow(dead_code)]
+pub fn i64s(col: &arrow_array::ArrayRef) -> arrow_array::Int64Array {
+    use arrow_array::cast::AsArray as _;
+    arrow::compute::cast(col, &arrow_schema::DataType::Int64)
+        .expect("column should be an integer")
+        .as_primitive::<arrow_array::types::Int64Type>()
+        .clone()
+}
+
 /// Format a single cell value from an Arrow column for display / comparison.
 // Used by sql_compat_test.rs; integration_test.rs uses print_results instead.
 #[allow(dead_code)]

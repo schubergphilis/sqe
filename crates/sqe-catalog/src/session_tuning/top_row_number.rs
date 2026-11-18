@@ -101,8 +101,16 @@ fn rewrite_filter(filter: &Filter) -> Result<Option<LogicalPlan>> {
         }
         _ => return Ok(None),
     };
-    let [Expr::WindowFunction(function)] = window.window_expr.as_slice() else {
-        return Ok(None);
+    // An analyzer rule that retypes a literal inside the window (`PARTITION
+    // BY id % 7`) keeps the column name with an alias; the output names come
+    // from the window's schema either way.
+    let function = match window.window_expr.as_slice() {
+        [Expr::WindowFunction(function)] => function,
+        [Expr::Alias(alias)] => match alias.expr.as_ref() {
+            Expr::WindowFunction(function) => function,
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
     };
     let WindowFunction { fun, params } = function.as_ref();
     let WindowFunctionDefinition::WindowUDF(udwf) = fun else {

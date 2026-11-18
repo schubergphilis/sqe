@@ -658,12 +658,12 @@ mod tests {
             "SELECT CASE WHEN true THEN CAST(1 AS DECIMAL(7,2)) ELSE 2 END / CAST(3 AS DECIMAL(7,2))",
         )
         .await;
-        // DataFusion's CASE type over decimal(7,2) and a bigint literal is
-        // decimal(22,2) (Trino's is decimal(12,2)), so the precision is wider
-        // than Trino's (22,10); the scale and the value match.
+        // The literal `2` is an `integer`, so the CASE is decimal(12,2) as
+        // in Trino (a bigint literal made it decimal(22,2)), and the
+        // quotient is Trino's decimal(22,10).
         assert_eq!(
             (ty, v.as_str()),
-            (DataType::Decimal128(32, 10), "0.3333333333")
+            (DataType::Decimal128(22, 10), "0.3333333333")
         );
     }
 

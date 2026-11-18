@@ -23,6 +23,7 @@ use crate::variant_read::VariantReadHints;
 mod decimal_arithmetic;
 mod decimal_rounding;
 mod float_decimal_comparison;
+mod integer_literals;
 mod sorted_row_number;
 mod top_row_number;
 mod trino_decimal_types;
@@ -33,6 +34,7 @@ pub use decimal_rounding::{
     RESCALE,
 };
 pub use float_decimal_comparison::FloatOverDecimalRule;
+pub use integer_literals::{CheckedIntegerArithmeticRule, IntegerLiteralRule};
 pub use sorted_row_number::{SortedRowNumberExec, SortedRowNumberRule};
 pub use top_row_number::TopRowNumberRule;
 
@@ -58,12 +60,14 @@ pub fn engine_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> Sessio
     ctx
 }
 
-/// DataFusion's analyzer rules with [`DecimalArithmeticRule`] before type
-/// coercion, so coercion types every parent against Trino's decimal types,
-/// then [`FloatOverDecimalRule`], so a float that meets a decimal
-/// stays a float as in Trino, and [`DecimalRoundingRule`] after
-/// coercion. [`sqe_trino_functions::JsonCastRule`] runs first, while every
-/// cast in the plan is one the query wrote.
+/// DataFusion's analyzer rules with four of SQE's before type coercion:
+/// [`sqe_trino_functions::JsonCastRule`], while every cast in the plan is
+/// one the query wrote; [`IntegerLiteralRule`], so every later rule sees
+/// Trino's `integer` literals; [`DecimalArithmeticRule`], so coercion types
+/// every parent against Trino's decimal types; and [`FloatOverDecimalRule`],
+/// so a float that meets a decimal stays a float as in Trino.
+/// [`DecimalRoundingRule`] and [`CheckedIntegerArithmeticRule`] run after
+/// coercion.
 fn engine_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     let mut rules = Analyzer::new().rules;
     let at = rules
@@ -72,8 +76,10 @@ fn engine_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
         .unwrap_or(rules.len());
     rules.insert(at, Arc::new(FloatOverDecimalRule));
     rules.insert(at, Arc::new(DecimalArithmeticRule));
+    rules.insert(at, Arc::new(IntegerLiteralRule));
     rules.insert(at, Arc::new(sqe_trino_functions::JsonCastRule));
     rules.push(Arc::new(DecimalRoundingRule));
+    rules.push(Arc::new(CheckedIntegerArithmeticRule));
     rules
 }
 

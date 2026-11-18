@@ -539,9 +539,13 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion::execution::runtime_env::RuntimeEnv;
+    use datafusion::execution::session_state::SessionStateBuilder;
+    use datafusion::optimizer::Analyzer;
     use datafusion::prelude::SessionContext;
 
-    use crate::session_tuning::{engine_context, engine_session_config};
+    use crate::session_tuning::{
+        engine_context, engine_session_config, CheckedIntegerArithmeticRule, IntegerLiteralRule,
+    };
 
     const A: &str = "(SELECT 1 AS t, 17 AS x, 18 AS y, 0 AS id) a";
     const K: &str = "(SELECT 0 AS k, 0 AS id UNION ALL SELECT 1, 0) k";
@@ -582,8 +586,19 @@ mod tests {
         engine_context(engine_session_config(), Arc::new(RuntimeEnv::default()))
     }
 
+    /// Upstream's rules, with only SQE's integer typing added (literals in
+    /// front, checked arithmetic last), so both plans start from the same
+    /// expressions.
     fn plain() -> SessionContext {
-        SessionContext::new_with_config(engine_session_config())
+        let mut rules = Analyzer::new().rules;
+        rules.insert(0, Arc::new(IntegerLiteralRule));
+        rules.push(Arc::new(CheckedIntegerArithmeticRule));
+        let state = SessionStateBuilder::new()
+            .with_config(engine_session_config())
+            .with_default_features()
+            .with_analyzer_rules(rules)
+            .build();
+        SessionContext::new_with_state(state)
     }
 
     async fn optimized(ctx: &SessionContext, sql: &str) -> String {
