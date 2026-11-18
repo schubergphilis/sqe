@@ -166,3 +166,6 @@ winnow = { version = "1" }
 path = "../../vendor/iceberg-rust/crates/catalog/loader"
 default-features = false
 features = ["rest"]
+
+[lints]
+workspace = true
