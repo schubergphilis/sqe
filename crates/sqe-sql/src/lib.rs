@@ -1,6 +1,7 @@
 pub mod alter_execute;
 pub mod attach;
 pub mod bare_table;
+pub mod cast_types;
 pub mod catalog_qualifiers;
 pub mod classifier;
 pub mod ctas_compat;
@@ -40,6 +41,7 @@ pub use attach::{
     DropSecretStatement, OptionValue, SecretKind,
 };
 pub use bare_table::rewrite_bare_table;
+pub use cast_types::rewrite_trino_cast_types;
 pub use catalog_qualifiers::{
     extract_catalog_qualifiers, extract_catalog_qualifiers_from_sql,
     extract_schema_qualifiers_from_sql, names_polaris_system_schema, pinned_table_schema_from_sql,

@@ -26,8 +26,8 @@
 
 ## 4. Trino type syntax
 
-- [ ] 4.1 `array(T)`, `map(K, V)`, `row(name T, ...)` in CAST and DDL
-- [ ] 4.2 `time(p)` and `time(p) with time zone`
+- [x] 4.1 `array(T)`, `map(K, V)`, `row(name T, ...)` in CAST and DDL (CAST: `sqe-sql/src/cast_types.rs`; map via `arrow_cast`, no TRY_CAST to a map; no JSON-to-array cast)
+- [ ] 4.2 `time(p)` and `time(p) with time zone` (CAST done: both become `TIME`, Time64(ns), zone dropped; DDL: `time(p<=6)` works, `time with time zone` is still refused as NotImplemented)
 
 ## 5. Function semantics (baseline DIFFs)
 

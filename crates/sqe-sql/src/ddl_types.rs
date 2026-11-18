@@ -136,7 +136,7 @@ fn is_nested_kw(w: &str) -> bool {
 
 /// Rewrite one type into sqlparser's spelling, recursing into nested types.
 /// A type that is not nested is returned as written.
-fn rewrite_type(t: &str) -> Option<String> {
+pub(crate) fn rewrite_type(t: &str) -> Option<String> {
     let t = t.trim();
     let b = t.as_bytes();
     let Some(end) = nested_type_end(t, 0) else {
@@ -202,7 +202,7 @@ fn column_def_end(b: &[u8], pos: usize, close: usize) -> usize {
 }
 
 /// Split on commas outside any `(..)` / `<..>` and quotes.
-fn split_top_level(s: &str) -> Vec<&str> {
+pub(crate) fn split_top_level(s: &str) -> Vec<&str> {
     let b = s.as_bytes();
     let mut out = Vec::new();
     let mut depth = 0i32;
@@ -227,7 +227,7 @@ fn split_top_level(s: &str) -> Vec<&str> {
 
 /// Index of the bracket closing the `(` or `<` at `open`; `(`/`<` and
 /// `)`/`>` nest together, which holds inside a type.
-fn matching_bracket(b: &[u8], open: usize) -> Option<usize> {
+pub(crate) fn matching_bracket(b: &[u8], open: usize) -> Option<usize> {
     let mut depth = 0i32;
     let mut i = open;
     while i < b.len() {
@@ -248,7 +248,7 @@ fn matching_bracket(b: &[u8], open: usize) -> Option<usize> {
 }
 
 /// Index of the quote closing the one at `i` (a doubled quote escapes).
-fn skip_quoted(b: &[u8], i: usize) -> usize {
+pub(crate) fn skip_quoted(b: &[u8], i: usize) -> usize {
     let q = b[i];
     let mut k = i + 1;
     while k < b.len() {
@@ -265,7 +265,7 @@ fn skip_quoted(b: &[u8], i: usize) -> usize {
 }
 
 /// End of the identifier (bare or quoted) at `i`.
-fn skip_ident(b: &[u8], i: usize) -> Option<usize> {
+pub(crate) fn skip_ident(b: &[u8], i: usize) -> Option<usize> {
     match b.get(i)? {
         b'"' | b'`' => {
             let close = skip_quoted(b, i);
@@ -304,7 +304,7 @@ fn skip_if_exists(s: &str, i: usize, words: &[&str]) -> usize {
 }
 
 /// The bare word after whitespace at `i`, and its end.
-fn next_word(s: &str, i: usize) -> Option<(&str, usize)> {
+pub(crate) fn next_word(s: &str, i: usize) -> Option<(&str, usize)> {
     let b = s.as_bytes();
     let start = skip_ws(b, i);
     let mut k = start;
@@ -314,7 +314,7 @@ fn next_word(s: &str, i: usize) -> Option<(&str, usize)> {
     (k > start).then(|| (&s[start..k], k))
 }
 
-fn skip_ws(b: &[u8], mut i: usize) -> usize {
+pub(crate) fn skip_ws(b: &[u8], mut i: usize) -> usize {
     while i < b.len() && b[i].is_ascii_whitespace() {
         i += 1;
     }
