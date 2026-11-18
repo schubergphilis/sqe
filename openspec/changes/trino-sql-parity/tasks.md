@@ -20,8 +20,8 @@
 
 - [ ] 3.1 `length`, `strpos`, `position`, `extract` return `bigint`
 - [ ] 3.2 `mod`, `sign`, `ceil`, `floor` keep an integer argument's type
-- [ ] 3.3 `abs`, `avg` keep decimal precision and scale
-- [ ] 3.4 Aggregates over `real` return `real` (`avg`, `corr`, `covar_pop`, `covar_samp`, ...)
+- [x] 3.3 `abs`, `avg` keep decimal precision and scale (pinned in sqe-catalog; `round` decimal types added; `truncate` decimal types come with the math-functions change)
+- [ ] 3.4 Aggregates over `real` return `real` (`avg`, `corr`, `covar_pop`, `covar_samp`, ...) (done: `corr`, `covar_pop`, `covar_samp`, `regr_slope`, `regr_intercept`; open: `avg` and the rest)
 - [ ] 3.5 Bitwise shifts keep the argument's width
 
 ## 4. Trino type syntax

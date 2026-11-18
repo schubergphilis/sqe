@@ -217,6 +217,13 @@ fn register_trino_aggregate_aliases(ctx: &datafusion::prelude::SessionContext) {
     ctx.register_udaf(crate::map_aggregates::MapAgg::udaf());
     ctx.register_udaf(crate::map_aggregates::MultimapAgg::udaf());
     ctx.register_udaf(crate::map_aggregates::MapUnion::udaf());
+
+    // corr / covar_* / regr_slope / regr_intercept: `real` in, `real` out
+    // (Trino 484); DataFusion's are double only.
+    crate::real_aggregates::register_real_aggregates(ctx);
+
+    // round over DECIMAL with Trino's result types.
+    crate::decimal_math::register_decimal_math(ctx);
 }
 
 /// Extract a chrono component from a Date32, Timestamp, or Time64 array.
