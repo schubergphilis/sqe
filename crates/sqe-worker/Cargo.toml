@@ -66,3 +66,6 @@ tempfile = { workspace = true }
 # (finding 611): port 0 + `serve_with_incoming` so parallel test binaries
 # never collide on a fixed port.
 tokio-stream = { version = "0.1", features = ["net"] }
+
+[lints]
+workspace = true

@@ -156,3 +156,6 @@ datafusion = { workspace = true }
 # objects directly, the same client `sqe-catalog`'s hive/store.rs uses in
 # production (`AmazonS3Builder`). Not a production dependency of this crate.
 object_store = { workspace = true }
+
+[lints]
+workspace = true

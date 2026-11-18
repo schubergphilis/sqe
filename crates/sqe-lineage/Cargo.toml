@@ -27,3 +27,6 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 insta = { version = "1", features = ["json"] }
 tempfile = { workspace = true }
 wiremock = { workspace = true }
+
+[lints]
+workspace = true

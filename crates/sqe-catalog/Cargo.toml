@@ -240,3 +240,6 @@ toml = { workspace = true }
 # `sqlx` is a feature knob: `sql-postgres` / `sql-sqlite` forward driver
 # features to it; the vendored iceberg-catalog-sql does the importing.
 ignored = ["sqlx"]
+
+[lints]
+workspace = true
