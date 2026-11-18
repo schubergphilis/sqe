@@ -25,7 +25,9 @@ mode = "hybrid"                 # "coordinator", "worker", "hybrid", "local", "d
 worker_urls = []                # Worker Flight URLs for distributed mode
 worker_secret = ""              # Shared secret for worker heartbeat auth (empty disables the check)
 debug = false                   # When true, error messages include internal details (dev only)
-flight_compression = "lz4"      # IPC compression for client DoGet responses
+flight_compression = "lz4"      # IPC compression for client DoGet responses; the
+                                # JDBC and ODBC drivers (grpc-java, grpc-c++) get
+                                # "none" unless they send x-sqe-flight-compression
 shuffle_compression = "zstd"    # IPC compression for internal DoExchange shuffle
 spill_dir = "/tmp/sqe-coordinator-spill"  # Where sorts, aggregates and joins spill
 spill_compression = "lz4"       # Spill file codec: "lz4", "zstd" or "none"

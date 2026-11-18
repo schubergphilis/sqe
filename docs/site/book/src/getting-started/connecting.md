@@ -115,6 +115,20 @@ jdbc:arrow-flight-sql://localhost:50051?token=<token>&useEncryption=false
 
 The driver then opens with a handshake that carries `Authorization: Bearer <token>`. SQE resolves that bearer the same way as on any other call (see [With a bearer token](#with-a-bearer-token)) and replies with its session id, which the driver sends on every later call. An unknown or invalid token fails the handshake with `UNAUTHENTICATED`.
 
+`catalog=iceberg` sets the default catalog, the same as `USE iceberg`. The driver never sends `setSchema` to the server, so qualify table names or run `USE catalog.schema`.
+
+## Flight SQL over ODBC
+
+The Arrow Flight SQL ODBC driver takes the same settings as a connection string:
+
+```
+Driver={Apache Arrow Flight SQL ODBC Driver};host=localhost;port=50051;uid=jacob;pwd=your-password;useEncryption=false
+```
+
+Use `token=<access token>` in place of `uid` and `pwd` for token sign-in. The driver lists catalogs, schemas, tables and columns, and runs queries. It does not implement primary keys, foreign keys, statistics, special columns, procedures or parameter markers, so tools that call those get an "is not implemented" error from the driver.
+
+Arrow's ODBC installer is built without the LZ4 and ZSTD codecs, and the JDBC driver has neither unless the application adds them. SQE therefore sends uncompressed results to both, whatever `flight_compression` says. A client that can decode a codec asks for it with the `x-sqe-flight-compression: lz4` (or `zstd`, `none`) request header. The ODBC driver sends any connection-string key it does not know as a header, so `x-sqe-flight-compression=lz4` in the connection string works too.
+
 ## Trino HTTP
 
 The Trino HTTP endpoint is on by default (`[coordinator] trino_http_port = 8080`, set to `0` to disable). Trino clients, the Trino JDBC driver, and Trino-compatible BI tools (Metabase, Superset) point at it unchanged. Basic auth carries the user; the password is the OIDC secret (empty for a local root client).

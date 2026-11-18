@@ -847,6 +847,46 @@ async fn teardown_join_fixture(
 // View tests
 // ---------------------------------------------------------------------------
 
+// Test: the listing behind Flight SQL GetTables types a view VIEW, so BI
+// browsers that pass table_types=[TABLE, VIEW] show it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn test_metadata_listing_types_views() {
+    let (session, handler) = setup_join_fixture().await;
+    let sql = "CREATE OR REPLACE VIEW test_ns.kind_view AS SELECT id FROM test_ns.employees";
+    handler
+        .execute(&session, sql, None)
+        .await
+        .expect("CREATE VIEW");
+
+    let catalogs = handler
+        .list_catalog_names(&session)
+        .await
+        .expect("catalogs");
+    assert!(
+        !catalogs.is_empty(),
+        "SHOW CATALOGS names the session catalog"
+    );
+    let listed = handler
+        .list_metadata_tables(&session, None)
+        .await
+        .expect("listing");
+    let kind = |name: &str| {
+        let row = listed
+            .iter()
+            .find(|(ns, t, _)| ns == "test_ns" && t == name);
+        row.map(|(_, _, kind)| *kind)
+    };
+    assert_eq!(kind("employees"), Some("TABLE"), "{listed:?}");
+    assert_eq!(kind("kind_view"), Some("VIEW"), "{listed:?}");
+
+    let drop = "DROP VIEW IF EXISTS test_ns.kind_view";
+    handler
+        .execute(&session, drop, None)
+        .await
+        .expect("DROP VIEW");
+}
+
 // Test: CREATE VIEW registers the view in Polaris; DROP VIEW removes it
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:polaris"]

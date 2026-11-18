@@ -501,6 +501,209 @@ async fn streamed_schema(
         .clone()
 }
 
+/// Every batch behind a metadata `FlightInfo` (GetCatalogs, GetTableTypes, ...).
+async fn fetch(
+    client: &mut FlightSqlServiceClient<Channel>,
+    info: arrow_flight::FlightInfo,
+) -> Vec<arrow_array::RecordBatch> {
+    let mut batches = Vec::new();
+    for endpoint in info.endpoint {
+        let ticket = endpoint.ticket.expect("endpoint carries a ticket");
+        let stream = client.do_get(ticket).await.expect("DoGet");
+        batches.extend(stream.try_collect::<Vec<_>>().await.expect("stream"));
+    }
+    batches
+}
+
+/// The strings in column `idx` of every batch.
+fn strings(batches: &[arrow_array::RecordBatch], idx: usize) -> Vec<String> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            let col = b.column(idx).as_any();
+            let col = col
+                .downcast_ref::<arrow_array::StringArray>()
+                .expect("Utf8");
+            col.iter().flatten().map(str::to_string).collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// One `DoAction` with a bare-message body; returns the single result body.
+async fn action(
+    client: &mut FlightSqlServiceClient<Channel>,
+    kind: &str,
+    body: Vec<u8>,
+) -> Result<bytes::Bytes, arrow_flight::error::FlightError> {
+    let action = arrow_flight::Action {
+        r#type: kind.to_string(),
+        body: body.into(),
+    };
+    let mut results = client.do_action(action).await?;
+    let first = results.try_next().await?.expect("one result");
+    Ok(first.body)
+}
+
+/// The Flight SQL JDBC driver's `catalog=` property and `setCatalog` send
+/// `SetSessionOptions {catalog}` and fail the connection on an error reply;
+/// the catalogs SQL knows must be accepted, and `schema` must scope later
+/// statements the way `USE` does. `GetCatalogs` names the catalogs.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_options_set_the_scope_jdbc_asks_for() {
+    use prost::Message;
+    use sqe_coordinator::flight_session_options::{
+        CloseSessionResult, CloseSessionStatus, ErrorValue, GetSessionOptionsResult, OptionValue,
+        SessionOptionValue, SetSessionOptionsRequest, SetSessionOptionsResult,
+    };
+
+    let server = FlightServer::start().await;
+    let mut client = FlightSqlServiceClient::new(server.channel().await);
+    let token = client.handshake("opts", "opts").await.expect("handshake");
+    client.set_token(String::from_utf8(token.to_vec()).expect("token is utf-8"));
+
+    let info = client.get_catalogs().await.expect("GetCatalogs");
+    let catalogs = strings(&fetch(&mut client, info).await, 0);
+    let catalog = catalogs
+        .first()
+        .expect("GetCatalogs lists a catalog")
+        .clone();
+
+    let set = |pairs: &[(&str, &str)]| {
+        let string = |v: &str| SessionOptionValue {
+            option_value: Some(OptionValue::StringValue(v.to_string())),
+        };
+        let options = pairs.iter().map(|(k, v)| (k.to_string(), string(v)));
+        SetSessionOptionsRequest {
+            session_options: options.collect(),
+        }
+        .encode_to_vec()
+    };
+
+    let body = set(&[("catalog", &catalog), ("schema", "analytics")]);
+    let reply = action(&mut client, "SetSessionOptions", body)
+        .await
+        .expect("set");
+    let result = SetSessionOptionsResult::decode(reply).expect("SetSessionOptionsResult");
+    assert!(
+        result.errors.is_empty(),
+        "known catalog refused: {result:?}"
+    );
+
+    let rows = query(&mut client, "SELECT current_schema() AS s")
+        .await
+        .expect("query");
+    assert_eq!(
+        strings(&rows, 0),
+        ["analytics"],
+        "schema option scopes later statements"
+    );
+
+    let reply = action(&mut client, "GetSessionOptions", Vec::new())
+        .await
+        .expect("get");
+    let got = GetSessionOptionsResult::decode(reply).expect("GetSessionOptionsResult");
+    let value = |k: &str| {
+        got.session_options
+            .get(k)
+            .and_then(|v| v.option_value.clone())
+    };
+    assert_eq!(
+        value("catalog"),
+        Some(OptionValue::StringValue(catalog.clone()))
+    );
+    assert_eq!(
+        value("schema"),
+        Some(OptionValue::StringValue("analytics".into()))
+    );
+
+    let body = set(&[("catalog", "no_such_catalog"), ("timezone", "UTC")]);
+    let reply = action(&mut client, "SetSessionOptions", body)
+        .await
+        .expect("set");
+    let result = SetSessionOptionsResult::decode(reply).expect("SetSessionOptionsResult");
+    let invalid_value = ErrorValue::InvalidValue as i32;
+    assert_eq!(result.errors["catalog"].value, invalid_value);
+    assert_eq!(
+        result.errors["timezone"].value,
+        ErrorValue::InvalidName as i32
+    );
+
+    let reply = action(&mut client, "CloseSession", Vec::new())
+        .await
+        .expect("close");
+    let closed = CloseSessionResult::decode(reply).expect("CloseSessionResult");
+    assert_eq!(closed.status, CloseSessionStatus::NotCloseable as i32);
+    let still = query(&mut client, "SELECT 1").await;
+    still.expect("the token's session survives CloseSession");
+}
+
+/// `GetTableTypes` advertises its schema and lists both kinds `GetTables`
+/// reports; `GetTables` over a catalog without tables is empty, not an error.
+#[tokio::test(flavor = "multi_thread")]
+async fn table_types_and_tables_answer_bi_browsers() {
+    use arrow_flight::sql::CommandGetTables;
+
+    let server = FlightServer::start().await;
+    let mut client = FlightSqlServiceClient::new(server.channel().await);
+    let token = client.handshake("types", "types").await.expect("handshake");
+    client.set_token(String::from_utf8(token.to_vec()).expect("token is utf-8"));
+
+    let info = client.get_table_types().await.expect("GetTableTypes");
+    assert!(
+        !info.schema.is_empty(),
+        "GetTableTypes advertises its schema"
+    );
+    assert_eq!(
+        strings(&fetch(&mut client, info).await, 0),
+        ["TABLE", "VIEW"]
+    );
+
+    let request = CommandGetTables {
+        catalog: None,
+        db_schema_filter_pattern: None,
+        table_name_filter_pattern: None,
+        table_types: vec!["TABLE".into(), "VIEW".into()],
+        include_schema: false,
+    };
+    let info = client.get_tables(request).await.expect("GetTables");
+    let rows: usize = fetch(&mut client, info)
+        .await
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(rows, 0, "the mock catalog has no tables");
+}
+
+/// Result columns carry the Flight SQL column metadata JDBC and ODBC read for
+/// `getColumnTypeName`, `getPrecision` and `getScale`.
+#[tokio::test(flavor = "multi_thread")]
+async fn result_columns_carry_flight_sql_type_metadata() {
+    let server = FlightServer::start().await;
+    let mut client = FlightSqlServiceClient::new(server.channel().await);
+    let token = client.handshake("meta", "meta").await.expect("handshake");
+    client.set_token(String::from_utf8(token.to_vec()).expect("token is utf-8"));
+
+    let sql = "SELECT CAST(1.5 AS DECIMAL(10, 2)) AS d, CAST(1 AS INT) AS i, 'x' AS s";
+    let info = client
+        .execute(sql.to_string(), None)
+        .await
+        .expect("GetFlightInfo");
+    let schema = advertised_schema(sql, &info);
+    let meta = |name: &str, key: &str| {
+        let field = schema.field_with_name(name).expect("column");
+        field.metadata().get(key).cloned()
+    };
+    let type_name = "ARROW:FLIGHT:SQL:TYPE_NAME";
+    assert_eq!(meta("d", type_name).as_deref(), Some("decimal(10,2)"));
+    assert_eq!(
+        meta("d", "ARROW:FLIGHT:SQL:PRECISION").as_deref(),
+        Some("10")
+    );
+    assert_eq!(meta("d", "ARROW:FLIGHT:SQL:SCALE").as_deref(), Some("2"));
+    assert_eq!(meta("i", type_name).as_deref(), Some("integer"));
+    assert_eq!(meta("s", type_name).as_deref(), Some("varchar"));
+}
+
 /// A JWT-shaped bearer (it contains dots, so the per-call path hands it to the
 /// provider chain instead of looking it up as a session id).
 // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.security.detected-jwt-token -- unsigned test fixture (alg none, sub dbeaver); only the test provider accepts it
