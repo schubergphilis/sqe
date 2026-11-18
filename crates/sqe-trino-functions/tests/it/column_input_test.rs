@@ -325,7 +325,8 @@ col_case!(
 col_case!(
     col_json_array_contains,
     "json_array_contains(json_a, 2)",
-    [s("true"), s("false"), None]
+    // Row 1 is a JSON object: Trino gives NULL for a non-array.
+    [s("true"), None, None]
 );
 col_case!(
     col_json_array_contains_col_value,
@@ -890,7 +891,8 @@ fn arg_specs(name: &str) -> Option<Vec<ArgSpec>> {
         "to_iso8601" => vec![Col(TsNs)],
         "is_json_scalar" => vec![Col(Json)],
         "json_array_contains" => vec![Col(Json), Col(Int)],
-        "soundex" | "word_stem" | "word_stem_lang" | "to_json" | "try" => {
+        "soundex" | "word_stem" | "word_stem_lang" | "to_json" | "try" | "title_case"
+        | "char2hexint" | "json_scalar" => {
             vec![Col(Str)]
         }
         "hamming_distance" => vec![Col(Str), Col(Str)],
@@ -986,6 +988,8 @@ fn arg_specs(name: &str) -> Option<Vec<ArgSpec>> {
         "array_last" | "list_last" | "shuffle" | "array_histogram" => vec![Col(ListInt)],
         "contains_sequence" => vec![Col(ListInt), Col(ListInt)],
         "ngrams" => vec![Col(ListStr), LitInt(2)],
+        "combinations" => vec![Col(ListStr), LitInt(2)],
+        "trim_array" => vec![Col(ListStr), LitInt(0)],
         "zip" => vec![Col(ListInt), Col(ListStr)],
         "map_concat" => vec![Col(MapStrInt), Col(MapStrInt)],
         "map_from_entries" | "multimap_from_entries" => vec![Col(ListEntries)],

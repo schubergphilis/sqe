@@ -460,7 +460,7 @@ SELECT digest(email, 'sha256') AS h FROM glue.crm.customers LIMIT 1;
 SELECT sha256(lower(arrow_cast(email, 'Utf8View'))) FROM glue.crm.customers LIMIT 1;
 ```
 
-`sha256()` is SQE's own function and is plain, unkeyed SHA-256. It is not
+`sha256()` is plain, unkeyed SHA-256 and returns `varbinary` (Trino semantics; use `to_hex()` for text). It is not
 the function HASH column masks use: those run HMAC-SHA256 under
 `[policy] mask_key` and cannot be called from SQL, so a query cannot
 reproduce masked values by hashing candidates. Overlap between two hash

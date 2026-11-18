@@ -26,14 +26,14 @@ SELECT decode('6869', 'hex');                     -- bytea -> 'hi'
 |---|---|---|---|---|---|---|
 | `md5(s)` | `datafusion-builtin` | 128-bit hex string. | yes | yes | yes | yes |
 | `sha224(s)` | `datafusion-builtin` | SHA-224 hex. | yes | - | yes | - |
-| `sha256(s)` | `datafusion-builtin` + `sqe-policy` | SHA-256 hex, unkeyed on the coordinator. HASH column masks use a separate internal keyed function that SQL cannot call. | yes | yes | yes | yes |
+| `sha256(x)` | `datafusion-builtin` | Trino: returns `varbinary` (32 bytes) for a `varbinary` argument; a `varchar` argument is hashed as its UTF-8 bytes. Wrap in `to_hex()` for text. HASH column masks use a separate internal keyed function that SQL cannot call. | yes | yes | yes | yes |
 | `sha384(s)` | `datafusion-builtin` | SHA-384 hex. | yes | - | yes | - |
 | `sha512(s)` | `datafusion-builtin` | SHA-512 hex. | yes | yes | yes | yes |
 | `digest(s, algo)` | `datafusion-builtin` | Generic. Algos: `md5`, `sha224`, `sha256`, `sha384`, `sha512`, `blake2s`, `blake2b`, `blake3`. | - | - | - | - |
 | `checksum(x)` | `sqe-trino-functions` | Aggregate (not a per-row hash). Returns an 8-byte `varbinary`, order independent, NULL for an empty group. Built from xxHash64 per value; the exact bytes are not confirmed against Trino. `agg_fns.rs` | yes | - | - | - |
 
 ```sql
-SELECT sha256(email) AS email_hash FROM users;
+SELECT to_hex(sha256(email)) AS email_hash FROM users;
 SELECT digest('hello', 'blake3');       -- 64-char blake3 hex
 SELECT to_hex(checksum(payload)) FROM events;  -- one value for the whole group
 ```
@@ -82,8 +82,8 @@ For example, on `https://example.com:8443/api?utm_source=newsletter&page=2`:
 |---|---|
 | Comparing two whole tables or partitions | `checksum(col)` per table; equal checksums mean equal contents, whatever the row order. It is an aggregate, so it is not a per-row hash for lookups. |
 | Cryptographic integrity, signatures | `sha256` or `sha512`. Avoid `md5` for new uses. |
-| Column masking via grants | `sha256` (used in `MASKED WITH` clauses). Deterministic, no collisions in practice. |
-| Hashing UTF-8 strings | All accept `VARCHAR` or `BINARY` arguments. The result type is `VARCHAR` (hex) for crypto hashes, `BINARY` for `digest()`. |
+| Column masking via grants | `MASK_HASH` (keyed by `policy.mask_key`). In a `MASKED WITH` expression use `to_hex(sha256(col))`, so the column stays text. |
+| Hashing UTF-8 strings | All accept `VARCHAR` or `BINARY` arguments. `md5` returns `VARCHAR` (hex); `sha224`, `sha256`, `sha384`, `sha512` and `digest()` return `VARBINARY`. |
 | Salting | Concatenate the salt: `sha256(concat(salt, password))`. SQE has no `pbkdf2`-style helpers. |
 
 ## When to use which URL parser

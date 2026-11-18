@@ -111,6 +111,54 @@ impl ScalarUDFImpl for ToJson {
     }
 }
 
+/// json_scalar(x) -- wrap a SQL scalar as a JSON scalar. The same value as
+/// `CAST(x AS JSON)`; a NULL stays SQL NULL; arrays, rows and maps are
+/// refused, as Trino does.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(crate) struct JsonScalar;
+
+impl ScalarUDFImpl for JsonScalar {
+    fn name(&self) -> &str {
+        "json_scalar"
+    }
+
+    fn signature(&self) -> &Signature {
+        static SIG: LazyLock<Signature> =
+            LazyLock::new(|| Signature::new(TypeSignature::Any(1), Volatility::Immutable));
+        &SIG
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
+        match arg_types.first() {
+            Some(
+                DataType::List(_)
+                | DataType::LargeList(_)
+                | DataType::FixedSizeList(_, _)
+                | DataType::Struct(_)
+                | DataType::Map(_, _),
+            ) => exec_err!(
+                "json_scalar: unexpected parameters ({}); expected a scalar value",
+                arg_types[0]
+            ),
+            _ => Ok(DataType::Utf8),
+        }
+    }
+
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> DFResult<FieldRef> {
+        let types: Vec<DataType> = args
+            .arg_fields
+            .iter()
+            .map(|f| f.data_type().clone())
+            .collect();
+        self.return_type(&types)?;
+        Ok(json_text_field(self.name()))
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        ToJson.invoke_with_args(args)
+    }
+}
+
 /// `CAST(x AS JSON)` of JSON text: the value, as compact JSON with sorted
 /// object keys (what `json_parse` returns). A stored V2 `JSON` column
 /// (#848) holds whatever text was written into it, so a value that does not

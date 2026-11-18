@@ -35,9 +35,7 @@ pub fn register_string_fns(ctx: &SessionContext) {
     // the 2-argument form that the string built-ins lack.
     ctx.register_udf(Dispatch::new(
         &datafusion::functions::string::concat(),
-        datafusion::functions_nested::concat::array_concat_udf()
-            .as_ref()
-            .clone(),
+        ScalarUDF::from(ConcatArray),
         |t| t.iter().any(is_list),
     ));
     ctx.register_udf(Dispatch::new(
@@ -83,6 +81,8 @@ pub fn register_string_fns(ctx: &SessionContext) {
 
     ctx.register_udf(ScalarUDF::from(Normalize));
     ctx.register_udf(ScalarUDF::from(Soundex));
+    ctx.register_udf(ScalarUDF::from(TitleCase));
+    ctx.register_udf(ScalarUDF::from(Char2HexInt));
     ctx.register_udf(ScalarUDF::from(HumanReadableSeconds));
     ctx.register_udf(ScalarUDF::from(LuhnCheck));
     ctx.register_udf(ScalarUDF::from(FormatNumber));
@@ -182,6 +182,145 @@ impl ScalarUDFImpl for Dispatch {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let types: Vec<DataType> = args.args.iter().map(|a| a.data_type()).collect();
         self.pick(&types).invoke_with_args(args)
+    }
+}
+
+/// Trino's array `concat`: `concat(array, array, ...)`, plus the element
+/// forms `concat(x, array)` (prepend) and `concat(array, x)` (append). Every
+/// argument is cast to one element type. A NULL array argument gives a NULL
+/// result; a NULL element is kept as an element. A NULL literal (untyped) is
+/// taken as a NULL element, not as a NULL array.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct ConcatArray;
+
+fn list_elem(dt: &DataType) -> Option<&DataType> {
+    match dt {
+        DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => {
+            Some(f.data_type())
+        }
+        _ => None,
+    }
+}
+
+impl ScalarUDFImpl for ConcatArray {
+    fn name(&self) -> &str {
+        "concat"
+    }
+    fn signature(&self) -> &Signature {
+        static SIG: std::sync::LazyLock<Signature> =
+            std::sync::LazyLock::new(|| Signature::user_defined(Volatility::Immutable));
+        &SIG
+    }
+    fn coerce_types(&self, arg_types: &[DataType]) -> DFResult<Vec<DataType>> {
+        use datafusion::logical_expr::type_coercion::binary::comparison_coercion;
+        let is_text =
+            |t: &DataType| matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View);
+        let mut common = DataType::Null;
+        for t in arg_types {
+            let e = list_elem(t).unwrap_or(t);
+            // Trino has no implicit varchar <-> number coercion.
+            if common != DataType::Null && e != &DataType::Null && is_text(&common) != is_text(e) {
+                return Err(DataFusionError::Plan(format!(
+                    "concat: cannot combine {common} and {e} in one array"
+                )));
+            }
+            common = comparison_coercion(&common, e).ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "concat: cannot combine {common} and {e} in one array"
+                ))
+            })?;
+        }
+        let list = DataType::List(Arc::new(Field::new("item", common.clone(), true)));
+        Ok(arg_types
+            .iter()
+            .map(|t| {
+                if is_list(t) {
+                    list.clone()
+                } else {
+                    common.clone()
+                }
+            })
+            .collect())
+    }
+    fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
+        let elem = arg_types
+            .iter()
+            .find_map(list_elem)
+            .cloned()
+            .unwrap_or(DataType::Null);
+        Ok(DataType::List(Arc::new(Field::new("item", elem, true))))
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        use arrow::array::{make_array, Array, MutableArrayData};
+        use arrow::buffer::{NullBuffer, OffsetBuffer};
+        let rows = args.number_rows;
+        let arrays: Vec<ArrayRef> = args
+            .args
+            .iter()
+            .map(|a| a.to_array(rows))
+            .collect::<DFResult<_>>()?;
+        let elem = arrays
+            .iter()
+            .find_map(|a| list_elem(a.data_type()))
+            .cloned()
+            .ok_or_else(|| DataFusionError::Plan("concat: expected an array argument".into()))?;
+        // Child values to copy from: a list's values, or the element column.
+        let children: Vec<ArrayRef> = arrays
+            .iter()
+            .map(|a| {
+                if is_list(a.data_type()) {
+                    a.as_list::<i32>().values().clone()
+                } else {
+                    a.clone()
+                }
+            })
+            .collect();
+        let datas: Vec<_> = children.iter().map(|c| c.to_data()).collect();
+        let refs: Vec<_> = datas.iter().collect();
+        let mut out = MutableArrayData::new(refs, true, 0);
+        let mut offsets: Vec<i32> = Vec::with_capacity(rows + 1);
+        let mut valid: Vec<bool> = Vec::with_capacity(rows);
+        offsets.push(0);
+        let mut len: i32 = 0;
+        for row in 0..rows {
+            let null_array = arrays
+                .iter()
+                .any(|a| is_list(a.data_type()) && a.is_null(row));
+            if !null_array {
+                for (i, a) in arrays.iter().enumerate() {
+                    let (start, end) = if is_list(a.data_type()) {
+                        let offs = a.as_list::<i32>().value_offsets();
+                        (offs[row] as usize, offs[row + 1] as usize)
+                    } else {
+                        (row, row + 1)
+                    };
+                    out.try_extend(i, start, end)?;
+                    len = len.checked_add((end - start) as i32).ok_or_else(|| {
+                        DataFusionError::Execution("concat: array too large".into())
+                    })?;
+                }
+            }
+            valid.push(!null_array);
+            offsets.push(len);
+        }
+        let values = make_array(out.freeze());
+        let list = arrow::array::ListArray::try_new(
+            Arc::new(Field::new("item", elem, true)),
+            OffsetBuffer::new(offsets.into()),
+            values,
+            Some(NullBuffer::from(valid)),
+        )?;
+        let all_scalar = args
+            .args
+            .iter()
+            .all(|a| matches!(a, ColumnarValue::Scalar(_)));
+        let list: ArrayRef = Arc::new(list);
+        if all_scalar {
+            return Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(
+                &list, 0,
+            )?));
+        }
+        Ok(ColumnarValue::Array(list))
     }
 }
 
@@ -432,6 +571,11 @@ fn occurrences(s: &str, sub: &str, limit: Option<usize>) -> Vec<usize> {
     out
 }
 
+/// The Trino `strpos` (`bigint`), for the `POSITION(x IN y)` planner.
+pub(crate) fn strpos_udf() -> ScalarUDF {
+    ScalarUDF::from(Strpos)
+}
+
 fn strpos_of(s: &str, sub: &str, instance: i64) -> DFResult<i64> {
     if instance == 0 {
         return Err(DataFusionError::Execution(
@@ -635,6 +779,81 @@ impl ScalarUDFImpl for Soundex {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let s: StrArg = arg("soundex", "varchar", &args.args, 0)?;
         lift1(&s, |s| Ok(Some(soundex_of(s))))
+    }
+}
+
+// ─── title_case, char2hexint ─────────────────────────────────────────────────
+
+/// `title_case(string)`: the first letter of each word upper case, the rest
+/// lower case. Words are separated by non-alphanumeric characters.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct TitleCase;
+
+fn title_case_of(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut word_start = true;
+    for c in s.chars() {
+        if c.is_alphanumeric() {
+            if word_start {
+                out.extend(c.to_uppercase());
+            } else {
+                out.extend(c.to_lowercase());
+            }
+            word_start = false;
+        } else {
+            out.push(c);
+            word_start = true;
+        }
+    }
+    out
+}
+
+impl ScalarUDFImpl for TitleCase {
+    fn name(&self) -> &str {
+        "title_case"
+    }
+    fn signature(&self) -> &Signature {
+        static SIG: std::sync::LazyLock<Signature> =
+            std::sync::LazyLock::new(|| Signature::any(1, Volatility::Immutable));
+        &SIG
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let s: StrArg = arg("title_case", "varchar", &args.args, 0)?;
+        lift1(&s, |s| Ok(Some(title_case_of(s))))
+    }
+}
+
+/// `char2hexint(string)`: the UTF-16BE encoding as upper-case hex, four digits
+/// per code unit (`'a'` is `0061`, a character outside the BMP is a pair).
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Char2HexInt;
+
+fn char2hexint_of(s: &str) -> String {
+    use std::fmt::Write;
+    s.encode_utf16().fold(String::new(), |mut out, unit| {
+        let _ = write!(out, "{unit:04X}");
+        out
+    })
+}
+
+impl ScalarUDFImpl for Char2HexInt {
+    fn name(&self) -> &str {
+        "char2hexint"
+    }
+    fn signature(&self) -> &Signature {
+        static SIG: std::sync::LazyLock<Signature> =
+            std::sync::LazyLock::new(|| Signature::any(1, Volatility::Immutable));
+        &SIG
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let s: StrArg = arg("char2hexint", "varchar", &args.args, 0)?;
+        lift1(&s, |s| Ok(Some(char2hexint_of(s))))
     }
 }
 

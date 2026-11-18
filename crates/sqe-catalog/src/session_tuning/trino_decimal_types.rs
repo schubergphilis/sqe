@@ -58,6 +58,33 @@ mod tests {
         );
     }
 
+    /// `avg(real)` is `real` in the full engine context, next to the decimal
+    /// rule, and the decimal rule still applies.
+    #[tokio::test]
+    async fn avg_of_real_is_real_next_to_decimal_avg() {
+        let ctx = ctx();
+        let df = ctx
+            .sql("SELECT avg(CAST(x AS REAL)) FROM (VALUES (1), (2)) AS t(x)")
+            .await
+            .unwrap();
+        assert_eq!(df.schema().field(0).data_type(), &DataType::Float32);
+        let (t, _) = dec(&ctx, "SELECT avg(CAST('12.34' AS DECIMAL(4,2)))").await;
+        assert_eq!(t, DataType::Decimal128(4, 2));
+    }
+
+    /// `sum(real)` is `real` next to the `decimal(38,s)` sum rule.
+    #[tokio::test]
+    async fn sum_of_real_is_real_next_to_decimal_sum() {
+        let ctx = ctx();
+        let df = ctx
+            .sql("SELECT sum(CAST(x AS REAL)) FROM (VALUES (1), (2)) AS t(x)")
+            .await
+            .unwrap();
+        assert_eq!(df.schema().field(0).data_type(), &DataType::Float32);
+        let (t, _) = dec(&ctx, "SELECT sum(CAST('12.34' AS DECIMAL(4,2)))").await;
+        assert_eq!(t, DataType::Decimal128(38, 2));
+    }
+
     #[tokio::test]
     async fn avg_is_input_decimal() {
         let ctx = ctx();

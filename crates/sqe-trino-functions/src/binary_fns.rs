@@ -112,6 +112,33 @@ impl ExprPlanner for SubstringPlanner {
     }
 }
 
+/// `POSITION(x IN y)` and `EXTRACT(field FROM x)` are parsed to dedicated
+/// expressions that DataFusion's built-in planners turn straight into its own
+/// `strpos` (`Int32`) and `date_part` (`Int32`, or `Float64` for some fields),
+/// bypassing the registry. Trino returns `bigint` for both.
+#[derive(Debug)]
+struct BigintPlanner {
+    strpos: Arc<ScalarUDF>,
+}
+
+impl ExprPlanner for BigintPlanner {
+    fn plan_position(&self, args: Vec<Expr>) -> DFResult<PlannerResult<Vec<Expr>>> {
+        Ok(PlannerResult::Planned(Expr::ScalarFunction(
+            ScalarFunction::new_udf(self.strpos.clone(), args),
+        )))
+    }
+
+    fn plan_extract(&self, args: Vec<Expr>) -> DFResult<PlannerResult<Vec<Expr>>> {
+        let part = Expr::ScalarFunction(ScalarFunction::new_udf(
+            datafusion::functions::datetime::date_part(),
+            args,
+        ));
+        Ok(PlannerResult::Planned(Expr::Cast(
+            datafusion::logical_expr::Cast::new(Box::new(part), DataType::Int64),
+        )))
+    }
+}
+
 /// Put [`SubstringPlanner`] ahead of the built-in planners. DataFusion offers
 /// no way to prepend one, so the state is rebuilt, which re-registers every
 /// function in map order and can hand an alias (`date_format`, `element_at`)
@@ -122,7 +149,12 @@ pub(crate) fn install_substring_planner(ctx: &SessionContext) {
     let udf = Arc::new(substr_udf());
     let state_ref = ctx.state_ref();
     let mut guard = state_ref.write();
-    let mut planners: Vec<Arc<dyn ExprPlanner>> = vec![Arc::new(SubstringPlanner { udf })];
+    let mut planners: Vec<Arc<dyn ExprPlanner>> = vec![
+        Arc::new(SubstringPlanner { udf }),
+        Arc::new(BigintPlanner {
+            strpos: Arc::new(crate::string_fns::strpos_udf()),
+        }),
+    ];
     planners.extend(guard.expr_planners().iter().cloned());
     *guard = SessionStateBuilder::new_from_existing(guard.clone())
         .with_expr_planners(planners)
@@ -1049,6 +1081,25 @@ mod tests {
         let t = q("SELECT md5('hello')").await;
         assert!(is_string(t.data_type()), "{:?}", t.data_type());
         assert_eq!(hexval("SELECT md5(to_utf8(NULL))").await, None);
+    }
+
+    /// `sha256` is the built-in (varbinary), not a hex-text policy UDF; a
+    /// varchar argument hashes its UTF-8 bytes. HASH masks use a separate
+    /// internal function.
+    #[tokio::test]
+    async fn sha256_is_varbinary_for_binary_and_varchar() {
+        const HELLO_SHA: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        assert_eq!(
+            hexval(&format!("SELECT sha256({HELLO})")).await,
+            s(HELLO_SHA)
+        );
+        assert_eq!(hexval("SELECT sha256('hello')").await, s(HELLO_SHA));
+        assert_eq!(hexval("SELECT sha256(to_utf8(NULL))").await, None);
+        assert_eq!(hexval("SELECT sha256(CAST(NULL AS VARCHAR))").await, None);
+        assert_eq!(
+            hexval("SELECT sha256('')").await,
+            s("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        );
     }
 
     #[tokio::test]

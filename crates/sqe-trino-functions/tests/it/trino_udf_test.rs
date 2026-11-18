@@ -272,6 +272,60 @@ async fn test_json_array_contains_false() {
 }
 
 #[tokio::test]
+async fn test_json_array_contains_non_array_is_null() {
+    assert_eq!(
+        eval_bool(r#"SELECT json_array_contains('5', 5)"#).await,
+        None
+    );
+    assert_eq!(
+        eval_bool(r#"SELECT json_array_contains('{"a":1}', 1)"#).await,
+        None
+    );
+    assert_eq!(
+        eval_bool(r#"SELECT json_array_contains('not json', 1)"#).await,
+        None
+    );
+    assert_eq!(
+        eval_bool(r#"SELECT json_array_contains(CAST(NULL AS VARCHAR), 1)"#).await,
+        None
+    );
+}
+
+#[tokio::test]
+async fn test_json_scalar_wraps_a_sql_value() {
+    assert_eq!(
+        eval_str("SELECT json_scalar(1)").await.as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        eval_str("SELECT json_scalar('abc')").await.as_deref(),
+        Some("\"abc\"")
+    );
+    assert_eq!(
+        eval_str("SELECT json_scalar(true)").await.as_deref(),
+        Some("true")
+    );
+    assert_eq!(
+        eval_str("SELECT json_scalar(DATE '2024-01-02')")
+            .await
+            .as_deref(),
+        Some("\"2024-01-02\"")
+    );
+    // A SQL NULL stays SQL NULL, not the JSON null.
+    assert_eq!(
+        eval_str("SELECT json_scalar(CAST(NULL AS BIGINT))").await,
+        None
+    );
+    let ctx = ctx().await;
+    let err = ctx
+        .sql("SELECT json_scalar(make_array(1, 2))")
+        .await
+        .map(|_| ())
+        .err();
+    assert!(err.is_some(), "an array is not a scalar");
+}
+
+#[tokio::test]
 async fn test_json_size() {
     let v = eval_i64(r#"SELECT json_size('{"a":1,"b":2,"c":3}', '$')"#).await;
     assert_eq!(v, Some(3));

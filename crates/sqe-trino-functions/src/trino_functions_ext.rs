@@ -67,6 +67,7 @@ pub fn register_extended_trino_functions(ctx: &datafusion::prelude::SessionConte
     // Format / JSON
     ctx.register_udf(ScalarUDF::from(Format));
     ctx.register_udf(ScalarUDF::from(crate::json_cast::ToJson));
+    ctx.register_udf(ScalarUDF::from(crate::json_cast::JsonScalar));
     ctx.register_udf(ScalarUDF::from(crate::json_cast::JsonArrayOfJson));
     ctx.register_udf(ScalarUDF::from(crate::json_cast::JsonText));
     // Appended, so it runs after type coercion (#848). Once per context.
@@ -203,7 +204,7 @@ impl ScalarUDFImpl for JsonArrayContains {
             let needle = scalar_to_json_comparable(&v).ok_or_else(|| {
                 unexpected_parameters("json_array_contains", &args.args, EXPECTED)
             })?;
-            Ok(Some(check_json_array_contains(json, &needle)))
+            Ok(check_json_array_contains(json, &needle))
         })
     }
 }
@@ -226,14 +227,15 @@ fn scalar_to_json_comparable(val: &ScalarValue) -> Option<String> {
     }
 }
 
-fn check_json_array_contains(json: &str, search_val: &str) -> bool {
-    if let Ok(serde_json::Value::Array(arr)) = serde_json::from_str::<serde_json::Value>(json) {
-        let search: serde_json::Value =
-            serde_json::from_str(search_val).unwrap_or(serde_json::Value::Null);
-        arr.contains(&search)
-    } else {
-        false
-    }
+/// Trino: `NULL` when the JSON is not an array (a scalar, an object, or text
+/// that does not parse), otherwise whether an element equals the search value.
+fn check_json_array_contains(json: &str, search_val: &str) -> Option<bool> {
+    let Ok(serde_json::Value::Array(arr)) = serde_json::from_str::<serde_json::Value>(json) else {
+        return None;
+    };
+    let search: serde_json::Value =
+        serde_json::from_str(search_val).unwrap_or(serde_json::Value::Null);
+    Some(arr.contains(&search))
 }
 
 // ═══════════════════════════════════════════════════════════════════

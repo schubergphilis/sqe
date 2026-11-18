@@ -358,15 +358,16 @@ pub fn build_embedded_context_with_mask(
     let ctx = ctx.enable_url_table();
     let mut ctx = ctx;
 
-    // Scalar UDFs. SQE_POLICY__MASK_KEY enables HMAC-SHA256 in embedded
-    // mode (issue #37). Without it the UDF stays plain SHA-256 and prints
-    // a one-shot warning on registration.
-    let mask_key = mask_key
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| Arc::new(s.as_bytes().to_vec()));
-    // Embedded mode applies no masks, so a keyed user-callable sha256 is safe.
-    ctx.register_udf(sqe_policy::sha256_udf::user_sha256_udf(mask_key));
+    // `sha256()` is DataFusion's built-in (Trino: varbinary, plain SHA-256).
+    // Embedded mode applies no masks, so the mask key has no consumer here;
+    // the parameter stays so callers keep their signature. It used to key
+    // `sha256()` (issue #37), so say so when someone still sets it.
+    if mask_key.is_some_and(|k| !k.trim().is_empty()) {
+        eprintln!(
+            "warning: [policy] mask_key has no effect in embedded mode: sha256() is plain \
+             SHA-256 (Trino). Use hmac_sha256(x, key) for a keyed hash."
+        );
+    }
 
     // Trino dialect compatibility — year(), month(), day_of_week(),
     // url_extract_*, etc. plus the extended set (regexp_extract,

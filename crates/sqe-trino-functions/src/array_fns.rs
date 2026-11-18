@@ -7,7 +7,7 @@
 //! - `array_remove(array, x)` removes every occurrence (Trino), where
 //!   DataFusion's removes the first only.
 //! - `zip`, `zip_with`, `array_histogram`, `contains_sequence`, `ngrams`,
-//!   `shuffle`.
+//!   `combinations`, `trim_array`, `shuffle`.
 //!
 //! Most of these run row by row over the flattened list values, using
 //! `ScalarValue` for equality, so every element type works without a kernel per
@@ -686,6 +686,131 @@ fn ngrams(args: &[ArrayRef], _rows: usize) -> DFResult<ArrayRef> {
     )?))
 }
 
+// ─── combinations ────────────────────────────────────────────────────────────
+
+/// Trino: the largest `n`, and the most elements the result may hold.
+const COMBINATIONS_MAX_N: i64 = 5;
+const COMBINATIONS_MAX_ELEMENTS: u128 = 100_000;
+
+fn combinations_ret(args: &[DataType]) -> DFResult<DataType> {
+    arity("combinations", args, 2)?;
+    let element = element_field(&args[0], "combinations")?;
+    Ok(DataType::List(item_field(DataType::List(item_field(
+        element.data_type().clone(),
+    )))))
+}
+
+/// `combinations(array, n)`: every `n`-element sub-group, in index order
+/// (`[1,2,3], 2` gives `[1,2] [1,3] [2,3]`). Positions are distinct, so
+/// duplicate values give duplicate groups. `n = 0` gives one empty group; `n`
+/// above the array size gives none. `n` must be 0..=5 and the result under
+/// 100,000 elements, as in Trino.
+fn combinations(args: &[ArrayRef], _rows: usize) -> DFResult<ArrayRef> {
+    let rows = ListRows::new(&args[0], "combinations")?;
+    let widths = int_arg(&args[1], "combinations")?;
+    let mut groups: Vec<Option<Vec<usize>>> = Vec::new();
+    let mut offsets = Vec::with_capacity(rows.len() + 1);
+    offsets.push(0i32);
+    let mut valid = Vec::with_capacity(rows.len());
+    for row in 0..rows.len() {
+        match (
+            rows.range(row),
+            widths.is_valid(row).then(|| widths.value(row)),
+        ) {
+            (Some((s, e)), Some(n)) => {
+                if n < 0 {
+                    return Err(DataFusionError::Execution(format!(
+                        "combination size must not be negative: {n}"
+                    )));
+                }
+                if n > COMBINATIONS_MAX_N {
+                    return Err(DataFusionError::Execution(format!(
+                        "combination size must not exceed {COMBINATIONS_MAX_N}: {n}"
+                    )));
+                }
+                let (len, n) = (e - s, n as usize);
+                if n <= len {
+                    // C(len, n), without overflow: the running product stays exact.
+                    let mut count: u128 = 1;
+                    for i in 0..n as u128 {
+                        count = count * (len as u128 - i) / (i + 1);
+                        if count * (n as u128) >= COMBINATIONS_MAX_ELEMENTS {
+                            return Err(DataFusionError::Execution(
+                                "combinations exceed max size".into(),
+                            ));
+                        }
+                    }
+                    let mut idx: Vec<usize> = (0..n).collect();
+                    loop {
+                        groups.push(Some(idx.iter().map(|i| s + i).collect()));
+                        // Advance to the next index tuple in lexicographic order.
+                        let Some(at) = (0..n).rev().find(|&k| idx[k] < len - n + k) else {
+                            break;
+                        };
+                        idx[at] += 1;
+                        for k in at + 1..n {
+                            idx[k] = idx[k - 1] + 1;
+                        }
+                    }
+                }
+                valid.push(true);
+            }
+            _ => valid.push(false),
+        }
+        offsets.push(groups.len() as i32);
+    }
+    let element = item_field(rows.values.data_type().clone());
+    let inner = list_by_indices(element, &rows.values, &groups)?;
+    Ok(Arc::new(ListArray::try_new(
+        item_field(inner.data_type().clone()),
+        OffsetBuffer::new(offsets.into()),
+        inner,
+        Some(NullBuffer::from(valid)),
+    )?))
+}
+
+// ─── trim_array ──────────────────────────────────────────────────────────────
+
+fn trim_array_ret(args: &[DataType]) -> DFResult<DataType> {
+    arity("trim_array", args, 2)?;
+    Ok(DataType::List(item_field(
+        element_field(&args[0], "trim_array")?.data_type().clone(),
+    )))
+}
+
+/// `trim_array(x, n)`: drop the last `n` elements. A negative `n`, or one
+/// above the array size, is an error (Trino); NULL in, NULL out.
+fn trim_array(args: &[ArrayRef], _rows: usize) -> DFResult<ArrayRef> {
+    let rows = ListRows::new(&args[0], "trim_array")?;
+    let sizes = int_arg(&args[1], "trim_array")?;
+    let mut picks: Vec<Option<Vec<usize>>> = Vec::with_capacity(rows.len());
+    for row in 0..rows.len() {
+        let pick = match (
+            rows.range(row),
+            sizes.is_valid(row).then(|| sizes.value(row)),
+        ) {
+            (Some((s, e)), Some(n)) => {
+                if n < 0 {
+                    return Err(DataFusionError::Execution(format!(
+                        "size must not be negative: {n}"
+                    )));
+                }
+                if n as u64 > (e - s) as u64 {
+                    return Err(DataFusionError::Execution(format!(
+                        "size must not exceed array cardinality {}: {n}",
+                        e - s
+                    )));
+                }
+                Some((s..e - n as usize).collect())
+            }
+            _ => None,
+        };
+        picks.push(pick);
+    }
+    let field = item_field(rows.values.data_type().clone());
+    list_by_indices(field, &rows.values, &picks)
+}
+
 // ─── shuffle ─────────────────────────────────────────────────────────────────
 
 fn shuffle_ret(args: &[DataType]) -> DFResult<DataType> {
@@ -788,6 +913,20 @@ pub fn register_array_fns(ctx: &SessionContext) {
         Signature::any(2, imm),
         ngrams_ret,
         ngrams,
+    ));
+    ctx.register_udf(RowUdf::udf(
+        "combinations",
+        &[],
+        Signature::any(2, imm),
+        combinations_ret,
+        combinations,
+    ));
+    ctx.register_udf(RowUdf::udf(
+        "trim_array",
+        &[],
+        Signature::any(2, imm),
+        trim_array_ret,
+        trim_array,
     ));
     ctx.register_udf(RowUdf::udf(
         "shuffle",
@@ -994,6 +1133,88 @@ mod tests {
         assert!(err("SELECT ngrams(make_array(1), 0)")
             .await
             .contains("greater than zero"));
+    }
+
+    #[tokio::test]
+    async fn combinations_lists_index_ordered_subgroups() {
+        assert_eq!(
+            one("SELECT combinations(make_array('foo', 'bar', 'baz'), 2)").await,
+            (
+                "[[foo, bar], [foo, baz], [bar, baz]]".into(),
+                "array(array(varchar))".into()
+            )
+        );
+        // Duplicate values are distinct positions.
+        assert_eq!(
+            one("SELECT combinations(make_array(1, 2, 2), 2)").await.0,
+            "[[1, 2], [1, 2], [2, 2]]"
+        );
+        assert_eq!(
+            one("SELECT combinations(make_array(1, 2, 3), 1)").await.0,
+            "[[1], [2], [3]]"
+        );
+        assert_eq!(
+            one("SELECT combinations(make_array(1, 2, 3), 3)").await.0,
+            "[[1, 2, 3]]"
+        );
+        // n = 0 is one empty group; n above the size is no group.
+        assert_eq!(
+            one("SELECT combinations(make_array(1, 2), 0)").await.0,
+            "[[]]"
+        );
+        assert_eq!(
+            one("SELECT combinations(make_array(1, 2), 3)").await.0,
+            "[]"
+        );
+        let (rows, _) = query(
+            "SELECT combinations(a, n) FROM (VALUES (make_array(1, 2), 1), (CAST(NULL AS BIGINT[]), 1), (make_array(1), CAST(NULL AS BIGINT))) t(a, n)",
+        )
+        .await;
+        assert_eq!(rows, ["[[1], [2]]", "NULL", "NULL"]);
+        assert!(err("SELECT combinations(make_array(1, 2), -1)")
+            .await
+            .contains("must not be negative"));
+        assert!(err("SELECT combinations(make_array(1, 2), 6)")
+            .await
+            .contains("must not exceed 5"));
+        // C(40, 5) = 658008 groups: over the 100,000 element limit.
+        assert!(err("SELECT combinations(range(1, 41), 5)")
+            .await
+            .contains("exceed max size"));
+    }
+
+    #[tokio::test]
+    async fn trim_array_drops_trailing_elements() {
+        assert_eq!(
+            one("SELECT trim_array(make_array(1, 2, 3, 4), 1)").await,
+            ("[1, 2, 3]".into(), "array(bigint)".into())
+        );
+        assert_eq!(
+            one("SELECT trim_array(make_array(1, 2, 3, 4), 2)").await.0,
+            "[1, 2]"
+        );
+        assert_eq!(one("SELECT trim_array(make_array(1, 2), 2)").await.0, "[]");
+        assert_eq!(
+            one("SELECT trim_array(make_array(1, 2), 0)").await.0,
+            "[1, 2]"
+        );
+        let (rows, _) = query(
+            "SELECT trim_array(a, 1) FROM (VALUES (make_array(1, 2)), (CAST(NULL AS BIGINT[]))) t(a)",
+        )
+        .await;
+        assert_eq!(rows, ["[1]", "NULL"]);
+        assert_eq!(
+            one("SELECT trim_array(make_array(1), CAST(NULL AS BIGINT))")
+                .await
+                .0,
+            "NULL"
+        );
+        assert!(err("SELECT trim_array(make_array(1, 2), -1)")
+            .await
+            .contains("must not be negative"));
+        assert!(err("SELECT trim_array(make_array(1, 2), 3)")
+            .await
+            .contains("must not exceed array cardinality"));
     }
 
     #[tokio::test]
