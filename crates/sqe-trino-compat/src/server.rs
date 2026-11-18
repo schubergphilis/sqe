@@ -690,6 +690,24 @@ pub trait TrinoAuthenticator: Send + Sync + 'static {
     async fn admit_auth_challenge(&self, _peer_ip: &str) -> Result<(), sqe_core::SqeError> {
         Ok(())
     }
+
+    /// The request header that carries a signed catalog scope (#908),
+    /// lowercased; `None` when the feature is off (the default).
+    fn catalog_scope_header(&self) -> Option<String> {
+        None
+    }
+
+    /// Verify the catalog scope sent with a statement and attach it to the
+    /// session. Sessions of other clients pass through. An `Auth` error
+    /// refuses the statement with its reason. The default changes nothing.
+    async fn attach_catalog_scope(
+        &self,
+        session: Session,
+        _scope: Option<&str>,
+        _peer_ip: &str,
+    ) -> Result<Session, sqe_core::SqeError> {
+        Ok(session)
+    }
 }
 
 #[async_trait::async_trait]
@@ -2482,6 +2500,22 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 }
                 return error_response(StatusCode::UNAUTHORIZED, "Missing Authorization header");
             }
+        };
+
+        // Signed catalog scope (#908): verified per statement, before the
+        // client's catalog header is applied.
+        let scope_header = state.authenticator.catalog_scope_header();
+        let scope = scope_header
+            .as_deref()
+            .and_then(|name| headers.get(name))
+            .and_then(|v| v.to_str().ok());
+        let session = match state
+            .authenticator
+            .attach_catalog_scope(session, scope, &peer_host)
+            .await
+        {
+            Ok(session) => session,
+            Err(e) => return error_response(StatusCode::UNAUTHORIZED, e.to_string()),
         };
 
         // Apply Trino client headers (catalog, schema, source) to the session.

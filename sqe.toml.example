@@ -352,6 +352,19 @@ absolute_timeout_secs = 28800  # 8 hours — sessions older than this are expire
 # only (lost on restart). ATTACH mounts are still process-local. #409
 # secrets_path = "/var/lib/sqe/secrets.json"
 
+# Signed catalog scope for one OAuth client (#908). Off unless set. Tokens
+# whose `azp` equals client_id must carry an ES256 JWS from `issuer` in the
+# header below (Flight SQL: call metadata), whose `sub`/`jti` equal the
+# bearer's; the session then sees only the catalogs it lists, and writes only
+# into those marked read_write. The bearer still goes to Polaris and S3.
+# [session.catalog_scope]
+# client_id = "orchestrator-runs"
+# issuer = "https://orchestrator.example.com"
+# jwks_url = "https://orchestrator.example.com/.well-known/jwks.json"
+# header_name = "x-sqe-catalog-scope"
+# leeway_secs = 30
+# allow_insecure_jwks = false   # development only: plain-http JWKS
+
 [metrics]
 prometheus_port = 9090
 # OTLP gRPC endpoint for traces, metrics, and logs (e.g. "http://otel-collector:4317")

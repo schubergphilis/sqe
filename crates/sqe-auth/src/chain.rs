@@ -167,6 +167,7 @@ mod tests {
                 refresh_token: None,
                 expires_at: None,
                 scopes: vec![],
+                token_binding: None,
             })
         }
     }
@@ -323,6 +324,7 @@ mod tests {
             refresh_token: None,
             expires_at: None,
             scopes: vec![],
+            token_binding: None,
         };
 
         let result = chain.refresh_catalog_token(&identity).await;
@@ -348,6 +350,7 @@ mod tests {
             refresh_token: None,
             expires_at: None,
             scopes: vec![],
+            token_binding: None,
         };
 
         let result = chain.refresh_catalog_token(&identity).await;
@@ -404,6 +407,7 @@ mod tests {
                     refresh_token: None,
                     expires_at: None,
                     scopes: vec![],
+                    token_binding: None,
                 }),
                 _ => Err(AuthError::NotMyCredentials),
             }
@@ -433,6 +437,7 @@ mod tests {
                     refresh_token: None,
                     expires_at: None,
                     scopes: vec![],
+                    token_binding: None,
                 }),
                 _ => Err(AuthError::NotMyCredentials),
             }

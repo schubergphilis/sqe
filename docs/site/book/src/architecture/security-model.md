@@ -8,6 +8,39 @@ SQE has no service account. A client authenticates with a username and password 
 
 In client-credentials mode (the lightweight test stack, where the catalog itself issues tokens) the username from the handshake is informational, used for session labelling and audit. The catalog requests still carry the service token. In OIDC password-grant mode, the token is the user's own.
 
+## Signed catalog scope: narrowing one client's sessions
+
+An orchestrating service can bind a workspace to some catalogs, each read-write or read-only, and launch jobs (dbt, Python clients) that connect to SQE with the person's own token. The job's code owns that connection, so a plain header cannot narrow it: the code could drop the header. `[session.catalog_scope]` closes that gap for one OAuth client. It is off unless configured.
+
+The orchestrator mints the job a token issued to its runs client (`sub` is the person, `azp` is the runs client). It also signs a **catalog scope** for that token: a compact JWS (ES256) from a configured issuer, with these claims:
+
+| Claim | Meaning |
+|---|---|
+| `sub` | Must equal the bearer's `sub` |
+| `jti` | Must equal the bearer's `jti`, so the scope is bound to one token |
+| `catalogs` | Object of catalog name to `read_write` or `read_only` |
+| `exp` | Expiry; a leeway of `leeway_secs` (default 30) applies |
+
+The client sends it in the `x-sqe-catalog-scope` HTTP header on the Trino path, or as Flight SQL call metadata under the same key. The name is configurable with `header_name`. SQE verifies the signature against the issuer's JWKS and checks the binding and the expiry. A session of that client without a valid scope is refused with the reason, and the refusal is written to the audit log. The refusal also holds on protocols that cannot carry the header (MCP, Quack): such a session never gets a query context.
+
+A scoped session:
+
+- sees only the listed catalogs. Any other catalog answers "catalog not found", the same as one that does not exist;
+- lists only them in `SHOW CATALOGS`, and can only select them with `USE`, `SET CATALOG` or `X-Trino-Catalog`;
+- cannot run `ATTACH` / `DETACH`, `CREATE` / `DROP SECRET`, `SHOW SECRETS`, `GRANT` / `REVOKE` / `DENY`, policy DDL or tag and masking-policy statements;
+- cannot write into a `read_only` catalog. The catalog layer refuses every commit there, as a backstop under the statement checks.
+
+The person stays the identity end to end. The bearer goes to Polaris and S3 exactly as it would without a scope, so grants still decide access inside the scope. The scope only narrows what the user can reach in this session; it never widens it. Tokens of every other client are unchanged.
+
+```toml
+[session.catalog_scope]
+client_id = "orchestrator-runs"        # azp of the job tokens
+issuer = "https://orchestrator.example.com"  # iss of the scope JWS
+jwks_url = "https://orchestrator.example.com/.well-known/jwks.json"
+# header_name = "x-sqe-catalog-scope"
+# leeway_secs = 30
+```
+
 ## The metadata boundary: gated per user
 
 Catalog operations carry the user's bearer token. Listing namespaces, loading a table, committing a snapshot: all go to the catalog as `Authorization: Bearer <user token>`, and the catalog enforces what that user may see and do. `SHOW TABLES` returns only tables the user can access. A write commits as the user. The metadata path is gated per user.
@@ -56,4 +89,5 @@ Flight SQL connections can run with TLS, and optional mTLS adds client-certifica
 | Read data path (worker `ScanTask`) | Optional | `distributed_credentials = "vended"` ships only per-user vended credentials |
 | Row filters / column masks | Off by default; available | Ranger + in-memory enforcers shipped; enable with `[policy] engine`. Ranger shares the policy with Spark/Kyuubi |
 | TVF file access | Engine identity, not user | Scope storage creds and filesystem access minimally |
+| Catalogs of one client's sessions | Optional | `[session.catalog_scope]`: a signed scope narrows the session to listed catalogs, read-only where marked |
 | Worker reach | Limited by pushed creds | Bounded by the static read key unless `distributed_credentials = "vended"` |

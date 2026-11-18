@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::SecretString;
 
 mod auth;
+mod catalog_scope;
 mod env_overlay;
 mod hive;
 mod hive_data;
@@ -15,6 +16,7 @@ mod storage;
 mod tvf_policy;
 
 pub use auth::{AuthConfig, AuthProviderConfig, ExternalAuthConfig};
+pub use catalog_scope::{CatalogScopeConfig, DEFAULT_CATALOG_SCOPE_HEADER};
 pub use hive::{HiveConfig, HiveRootConfig, HiveRootKind};
 pub use hive_data::{
     configured_hive_prefixes, hive_tvf_overlaps, prefixes_overlap, protect_hive_data_prefixes,
@@ -3424,6 +3426,9 @@ pub struct SessionConfig {
     /// How often the session-expiry sweeper runs (seconds). Default: 60.
     #[serde(default = "default_session_expiry_sweep_interval")]
     pub expiry_sweep_interval_secs: u64,
+    /// Signed catalog scope for one OAuth client (#908). Off when absent.
+    #[serde(default)]
+    pub catalog_scope: Option<CatalogScopeConfig>,
 }
 
 impl Default for SessionConfig {
@@ -3436,6 +3441,7 @@ impl Default for SessionConfig {
             secrets_path: String::new(),
             snapshot_interval_secs: default_session_snapshot_interval(),
             expiry_sweep_interval_secs: default_session_expiry_sweep_interval(),
+            catalog_scope: None,
         }
     }
 }

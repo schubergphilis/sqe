@@ -743,6 +743,7 @@ impl sqe_auth::AuthProvider for OneBearerProvider {
             refresh_token: None,
             expires_at: None,
             scopes: Vec::new(),
+            token_binding: None,
         })
     }
 }

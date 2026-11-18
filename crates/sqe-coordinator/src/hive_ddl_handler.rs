@@ -347,6 +347,8 @@ impl HiveDdlHandler {
                     .to_string(),
             )
         })?;
+        // A catalog scope (#908) allows writes only into its read_write catalogs.
+        session.check_catalog_write(catalog_name)?;
         let store = self.store_for(catalog_name, &session.user)?;
 
         // "default", matching the same fallback `embedded_handle_create_external_table`
@@ -461,13 +463,18 @@ impl HiveDdlHandler {
         };
 
         if purge {
-            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                "hive_external: DROP TABLE ... PURGE is not supported for Hive external tables \
+            return Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!(
+                    "hive_external: DROP TABLE ... PURGE is not supported for Hive external tables \
                  ({schema}.{table}): PURGE deletes the underlying data, which an external \
                  table's DROP never does"
-            )));
+                ),
+            ));
         }
 
+        // A catalog scope (#908) allows writes only into its read_write catalogs.
+        session.check_catalog_write(catalog)?;
         let store = self.store_for(catalog, &session.user)?;
         // A missing table surfaces here with `HiveError::NotFound`'s "table
         // not found" wording, which `hive_drop_target_missing` still matches.
@@ -876,6 +883,8 @@ impl HiveDdlHandler {
         if_not_exists: bool,
     ) -> Result<(), SqeError> {
         let (root, database, table) = self.full_hive_name(table_ref)?;
+        // A catalog scope (#908) allows writes only into its read_write catalogs.
+        session.check_catalog_write(&root)?;
         let store = self.store_for(&root, &session.user)?;
         let mut manifest = store
             .get(&database, &table)
@@ -929,12 +938,17 @@ impl HiveDdlHandler {
     ) -> Result<(), SqeError> {
         let (root, database, table) = self.full_hive_name(table_ref)?;
         if purge {
-            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                "hive_external: ALTER TABLE ... DROP PARTITION ... PURGE is not supported for \
+            return Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!(
+                    "hive_external: ALTER TABLE ... DROP PARTITION ... PURGE is not supported for \
                  Hive external tables ({database}.{table}): PURGE deletes the underlying data, \
                  which cycle 4 does not implement yet"
-            )));
+                ),
+            ));
         }
+        // A catalog scope (#908) allows writes only into its read_write catalogs.
+        session.check_catalog_write(&root)?;
         let store = self.store_for(&root, &session.user)?;
         let mut manifest = store
             .get(&database, &table)
@@ -1019,6 +1033,8 @@ impl HiveDdlHandler {
         statement: &str,
     ) -> Result<(), SqeError> {
         let (root, database, table) = self.full_hive_name(table_ref)?;
+        // A catalog scope (#908) allows writes only into its read_write catalogs.
+        session.check_catalog_write(&root)?;
         let store = self.store_for(&root, &session.user)?;
         let manifest = match store.get(&database, &table).await {
             Ok(m) => m,
@@ -1041,6 +1057,8 @@ impl HiveDdlHandler {
         audit_label: &str,
     ) -> Result<usize, SqeError> {
         let (root, database, table) = self.full_hive_name(table_ref)?;
+        // A catalog scope (#908) allows writes only into its read_write catalogs.
+        session.check_catalog_write(&root)?;
         let store = self.store_for(&root, &session.user)?;
         let mut manifest = store
             .get(&database, &table)
@@ -1108,6 +1126,8 @@ impl HiveDdlHandler {
         table_ref: &TableReference,
     ) -> Result<sqe_catalog::hive::manifest::HiveTableStatistics, SqeError> {
         let (root, database, table) = self.full_hive_name(table_ref)?;
+        // A catalog scope (#908) allows writes only into its read_write catalogs.
+        session.check_catalog_write(&root)?;
         let store = self.store_for(&root, &session.user)?;
         let mut manifest = store
             .get(&database, &table)

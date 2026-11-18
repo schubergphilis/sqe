@@ -306,6 +306,16 @@ impl QueryHandler {
                 catalog_names.push(name);
             }
         }
+        // A catalog scope (#908) lists exactly its own catalogs: the hidden
+        // ones drop out, and a scoped Polaris catalog not in config joins.
+        if let Some(scope) = session.effective_scope()? {
+            catalog_names.retain(|n| scope.access(n).is_some());
+            for name in scope.catalog_names() {
+                if !catalog_names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+                    catalog_names.push(name.to_string());
+                }
+            }
+        }
 
         // Trino's `SHOW CATALOGS` column is named `Catalog`.
         let schema = Arc::new(Schema::new(vec![Field::new(

@@ -3,6 +3,10 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use crate::catalog_scope::{
+    catalog_not_found, catalog_read_only, scope_required, CatalogAccess, CatalogScope,
+    TokenBinding, SCOPE_EXEMPT_CATALOGS,
+};
 use crate::snapshot_properties::SnapshotProperties;
 use crate::SecretString;
 
@@ -96,6 +100,14 @@ pub struct Session {
     /// defaults to allow" heuristic. Polaris remains the real server-side
     /// enforcer; this field does not bypass it.
     maintenance_authority: bool,
+    /// The `azp` / `jti` / `sub` of the bearer this session authenticated
+    /// with, when the provider verified a JWT. A catalog scope (#908) binds
+    /// to it. `None` for sessions without a JWT (password grant without
+    /// claims, static users).
+    token_binding: Option<Arc<TokenBinding>>,
+    /// The verified catalog scope of this request (#908). Set on a
+    /// per-request clone by the front door, never on the stored session.
+    catalog_scope: Option<Arc<CatalogScope>>,
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +167,126 @@ impl Session {
             transaction_id: None,
             client_transaction: false,
             maintenance_authority: false,
+            token_binding: None,
+            catalog_scope: None,
+        }
+    }
+
+    /// Returns a new session bound to the bearer claims a catalog scope is
+    /// checked against (#908). An empty binding is stored as `None`.
+    #[must_use = "with_token_binding consumes self; bind the returned Session"]
+    pub fn with_token_binding(mut self, binding: Option<TokenBinding>) -> Self {
+        self.token_binding = binding.filter(|b| !b.is_empty()).map(Arc::new);
+        self
+    }
+
+    pub fn token_binding(&self) -> Option<&TokenBinding> {
+        self.token_binding.as_deref()
+    }
+
+    /// Returns a new session limited to `scope` (#908). The front door
+    /// calls this on a per-request clone after verifying the scope.
+    #[must_use = "with_catalog_scope consumes self; bind the returned Session"]
+    pub fn with_catalog_scope(mut self, scope: Option<Arc<CatalogScope>>) -> Self {
+        self.catalog_scope = scope;
+        self
+    }
+
+    pub fn catalog_scope(&self) -> Option<&CatalogScope> {
+        self.catalog_scope.as_deref()
+    }
+
+    /// The shared handle to this session's scope, for catalogs that carry
+    /// it as a backstop.
+    pub fn catalog_scope_arc(&self) -> Option<Arc<CatalogScope>> {
+        self.catalog_scope.clone()
+    }
+
+    /// The scope that governs this session, checked against its bearer
+    /// (#908). Fails closed:
+    /// - a scope whose `sub` / `jti` differ from the bearer's, or that has
+    ///   expired, is refused;
+    /// - a session of the scoped client without a scope is refused, on
+    ///   every protocol, whether or not its door could carry one.
+    ///
+    /// `Ok(None)` is an unscoped session of any other client.
+    pub fn effective_scope(&self) -> Result<Option<&CatalogScope>, crate::SqeError> {
+        self.effective_scope_for(crate::catalog_scope::scoped_client().as_deref(), Utc::now())
+    }
+
+    /// [`Session::effective_scope`] with the scoped client and the clock
+    /// passed in, for tests.
+    pub fn effective_scope_for(
+        &self,
+        scoped_client: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<Option<&CatalogScope>, crate::SqeError> {
+        let binding = self.token_binding.as_deref();
+        match self.catalog_scope.as_deref() {
+            Some(scope) => {
+                let bound = binding.is_some_and(|b| {
+                    b.subject.as_deref() == Some(scope.subject())
+                        && b.token_id.as_deref() == Some(scope.token_id())
+                });
+                if !bound {
+                    return Err(scope_required("the scope is for another token"));
+                }
+                if scope.is_expired(now) {
+                    return Err(scope_required("the scope has expired"));
+                }
+                Ok(Some(scope))
+            }
+            None => {
+                let is_scoped_client = scoped_client.is_some_and(|client| {
+                    binding.and_then(|b| b.client_id.as_deref()) == Some(client)
+                });
+                if is_scoped_client {
+                    Err(scope_required("this client must present a catalog scope"))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    /// Whether `catalog` is visible to this session. Always true without a
+    /// scope; with one, true for the scoped catalogs and SQE's own
+    /// [`SCOPE_EXEMPT_CATALOGS`]. False when the scope check fails.
+    pub fn catalog_visible(&self, catalog: &str) -> bool {
+        match self.effective_scope() {
+            Ok(None) => true,
+            Ok(Some(scope)) => {
+                scope.access(catalog).is_some()
+                    || SCOPE_EXEMPT_CATALOGS
+                        .iter()
+                        .any(|c| c.eq_ignore_ascii_case(catalog))
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// `Ok` when this session may read `catalog`; "catalog not found" when
+    /// a scope hides it. A no-op without a scope.
+    pub fn check_catalog_read(&self, catalog: &str) -> Result<(), crate::SqeError> {
+        self.effective_scope()?;
+        if self.catalog_visible(catalog) {
+            Ok(())
+        } else {
+            Err(catalog_not_found(catalog))
+        }
+    }
+
+    /// `Ok` when this session may write into `catalog`: "catalog not found"
+    /// outside the scope, refused for a `read_only` one. A no-op without a
+    /// scope.
+    pub fn check_catalog_write(&self, catalog: &str) -> Result<(), crate::SqeError> {
+        let Some(scope) = self.effective_scope()? else {
+            return Ok(());
+        };
+        match scope.access(catalog) {
+            Some(CatalogAccess::ReadWrite) => Ok(()),
+            Some(CatalogAccess::ReadOnly) => Err(catalog_read_only(catalog)),
+            None => Err(catalog_not_found(catalog)),
         }
     }
 
@@ -353,6 +485,82 @@ mod tests {
             Utc::now() + Duration::hours(1),
             vec!["analyst".to_string()],
         )
+    }
+
+    fn bound(client: &str, sub: &str, jti: &str) -> Session {
+        make_session().with_token_binding(Some(crate::catalog_scope::TokenBinding {
+            client_id: Some(client.to_string()),
+            token_id: Some(jti.to_string()),
+            subject: Some(sub.to_string()),
+        }))
+    }
+
+    fn scope_for(sub: &str, jti: &str, expires: DateTime<Utc>) -> Option<Arc<CatalogScope>> {
+        Some(Arc::new(CatalogScope::new(
+            sub,
+            jti,
+            expires,
+            [(
+                "sales".to_string(),
+                crate::catalog_scope::CatalogAccess::ReadOnly,
+            )],
+        )))
+    }
+
+    #[test]
+    fn effective_scope_accepts_a_bound_live_scope() {
+        let now = Utc::now();
+        let s = bound("portal", "alice", "j1").with_catalog_scope(scope_for(
+            "alice",
+            "j1",
+            now + Duration::minutes(5),
+        ));
+        let scope = s.effective_scope_for(Some("portal"), now).unwrap();
+        assert!(scope.is_some_and(|sc| sc.access("SALES").is_some()));
+    }
+
+    #[test]
+    fn effective_scope_refuses_another_tokens_scope() {
+        let now = Utc::now();
+        let exp = now + Duration::minutes(5);
+        let other_jti =
+            bound("portal", "alice", "j1").with_catalog_scope(scope_for("alice", "j2", exp));
+        assert!(other_jti.effective_scope_for(Some("portal"), now).is_err());
+        let other_sub =
+            bound("portal", "alice", "j1").with_catalog_scope(scope_for("bob", "j1", exp));
+        assert!(other_sub.effective_scope_for(Some("portal"), now).is_err());
+        let unbound = make_session().with_catalog_scope(scope_for("alice", "j1", exp));
+        assert!(unbound.effective_scope_for(None, now).is_err());
+    }
+
+    #[test]
+    fn effective_scope_refuses_an_expired_scope() {
+        let now = Utc::now();
+        let s = bound("portal", "alice", "j1").with_catalog_scope(scope_for("alice", "j1", now));
+        assert!(s.effective_scope_for(Some("portal"), now).is_err());
+    }
+
+    #[test]
+    fn effective_scope_refuses_the_scoped_client_without_a_scope() {
+        let s = bound("portal", "alice", "j1");
+        assert!(s.effective_scope_for(Some("portal"), Utc::now()).is_err());
+    }
+
+    #[test]
+    fn effective_scope_leaves_other_clients_alone() {
+        let now = Utc::now();
+        assert!(matches!(
+            bound("dbt", "alice", "j1").effective_scope_for(Some("portal"), now),
+            Ok(None)
+        ));
+        assert!(matches!(
+            make_session().effective_scope_for(Some("portal"), now),
+            Ok(None)
+        ));
+        assert!(matches!(
+            bound("portal", "alice", "j1").effective_scope_for(None, now),
+            Ok(None)
+        ));
     }
 
     #[test]

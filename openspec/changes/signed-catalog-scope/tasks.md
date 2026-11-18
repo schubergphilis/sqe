@@ -1,24 +1,25 @@
 ## 1. Prerequisites
 
-- [ ] 1.1 Read `azp` and `jti` from the verified bearer claims into `Session`
-- [ ] 1.2 Extract `JwksVerifier` from `bearer_token.rs` as a pure move (D2); bearer tests unchanged
-- [ ] 1.3 Config `[session.catalog_scope]` + `sqe.toml.example`; off when unset
+- [x] 1.1 `Identity.token_binding` (`azp`, `jti`, `sub`) from the presented token; carried into `Session` by `into_session`
+- [x] 1.2 Scope verifier: a `BearerTokenProvider` for the scope issuer (D2); bearer tests unchanged
+- [x] 1.3 Config `[session.catalog_scope]` (`client_id`, `issuer`, `jwks_url`, `header_name`) + `sqe.toml.example`; off when unset
 
 ## 2. Scope verification
 
-- [ ] 2.1 `CatalogScope` type + ES256 verification of `sub`, `jti`, `exp`, `catalogs`; unit tests for each refusal
-- [ ] 2.2 Read `x-sqe-catalog-scope` on HTTP/Trino and Flight SQL metadata; refuse with reason + audit
-- [ ] 2.3 Flight SQL: re-check per request and on `rotate_credentials` (D3)
-- [ ] 2.4 Session cache key includes the scope hash
+- [x] 2.1 `CatalogScope` type + ES256 verification of `sub`, `jti`, `exp`, `catalogs`; unit tests for each refusal
+- [x] 2.2 Read the scope header on HTTP/Trino and Flight SQL metadata per request; refuse with reason + audit
+- [x] 2.3 Fail closed at `create_session_context` / `build_session_catalog` for the scoped client without a valid scope (D3)
+- [x] 2.4 Both cache keys include the scope digest, only when a scope is present
 
 ## 3. Narrowing
 
-- [ ] 3.1 Filter static, discovered, Hive and runtime catalogs at registration; refuse `ATTACH`
-- [ ] 3.2 `SHOW CATALOGS`, `USE`, `X-Trino-Catalog`
-- [ ] 3.3 Plan-time walker: scans and write targets (D1)
-- [ ] 3.4 `check_write` in non-plan write paths (CALL, DDL, COPY, ingest, branches, transactions) + exhaustive-match test
+- [x] 3.1 Filter configured, discovered, Hive and attached catalogs at registration; lazy discovery; view sibling warehouses
+- [x] 3.2 `SHOW CATALOGS`, `USE`, `X-Trino-Catalog`
+- [x] 3.3 Refuse `ATTACH`/`DETACH`, `CREATE`/`DROP SECRET` and DCL in scoped sessions (buffered and streaming dispatch)
+- [x] 3.4 `check_catalog_write` where writes resolve their target (DML, CTAS, DDL, CALL, Hive, ingest)
+- [x] 3.5 `SessionCatalog` backstop: read-only warehouses refuse every mutation
 
 ## 4. Tests and docs
 
 - [ ] 4.1 Integration: acceptance 1-3 with a test issuer (local JWKS over https in the fixture)
-- [ ] 4.2 Book: security page documents the scope, the claims and the header
+- [x] 4.2 Book: security page documents the scope, the claims and the header

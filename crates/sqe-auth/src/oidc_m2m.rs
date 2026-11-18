@@ -221,6 +221,7 @@ impl AuthProvider for OidcM2mProvider {
             refresh_token: None,
             expires_at: None,
             scopes: vec![],
+            token_binding: None,
         })
     }
 

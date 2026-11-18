@@ -143,6 +143,7 @@ impl AuthProvider for MtlsProvider {
             refresh_token: None,
             expires_at: None,
             scopes: vec![],
+            token_binding: None,
         })
     }
 
@@ -312,6 +313,7 @@ mod tests {
             refresh_token: None,
             expires_at: None,
             scopes: vec![],
+            token_binding: None,
         };
 
         assert!(provider

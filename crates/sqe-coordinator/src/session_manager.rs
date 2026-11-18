@@ -1311,6 +1311,7 @@ mod tests {
                     refresh_token: None,
                     expires_at: None,
                     scopes: vec![],
+                    token_binding: None,
                 }),
                 _ => Err(sqe_auth::AuthError::NotMyCredentials),
             }
@@ -1343,6 +1344,7 @@ mod tests {
                     refresh_token: None,
                     expires_at: Some(Utc::now() + self.expires_in),
                     scopes: vec![],
+                    token_binding: None,
                 }),
                 _ => Err(sqe_auth::AuthError::NotMyCredentials),
             }

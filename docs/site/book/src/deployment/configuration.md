@@ -258,6 +258,15 @@ snapshot_interval_secs = 60     # How often file persistence snapshots sessions 
 # only. ATTACH mounts stay process-local even when this is set.
 # secrets_path = "/var/lib/sqe/secrets.json"
 
+# Optional: sessions of one OAuth client (matched on the token's azp) must
+# carry a signed catalog scope and see only the catalogs it lists.
+# See "Signed catalog scope" in the security model page.
+# [session.catalog_scope]
+# client_id = "orchestrator-runs"
+# issuer = "https://orchestrator.example.com"
+# jwks_url = "https://orchestrator.example.com/.well-known/jwks.json"
+# header_name = "x-sqe-catalog-scope"   # also the Flight SQL metadata key
+
 [query]
 timeout_secs = 300              # 5 min, max execution time per query
 max_result_rows = 1000000       # Max rows per query (0 = unlimited)

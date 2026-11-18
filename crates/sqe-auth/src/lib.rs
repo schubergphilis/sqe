@@ -5,6 +5,7 @@ pub mod authenticator;
 pub mod aws_iam;
 pub mod bearer_passthrough;
 pub mod bearer_token;
+pub mod catalog_scope_verifier;
 pub mod chain;
 pub mod factory;
 pub mod identity_session;

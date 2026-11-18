@@ -13,6 +13,7 @@ pub(crate) mod audit_emitter;
 pub(crate) mod audit_resources;
 pub mod audit_tag_adapter;
 pub(crate) mod buffered_result;
+pub mod catalog_scope_gate;
 pub mod channel_pool;
 pub(crate) mod compaction_dispatch;
 pub mod credential_refresh;

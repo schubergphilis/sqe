@@ -138,6 +138,12 @@ impl ResultCache {
                 &session.write_branch,
             )
         );
+        // A scoped session (#908) gets its own entries; unscoped keys are
+        // unchanged.
+        let context = match session.catalog_scope() {
+            Some(scope) => format!("{context}:scope={}", scope.digest()),
+            None => context,
+        };
         Self::cache_key(&context, session.access_token().expose())
     }
 

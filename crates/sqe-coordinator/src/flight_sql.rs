@@ -844,7 +844,35 @@ impl SqeFlightSqlService {
         &'a self,
         request: &'a Request<T>,
     ) -> futures::future::BoxFuture<'a, Result<Arc<sqe_core::Session>, Status>> {
-        Box::pin(self.get_session_from_request_inner(request))
+        Box::pin(async move {
+            let session = self.get_session_from_request_inner(request).await?;
+            self.attach_catalog_scope(request, session).await
+        })
+    }
+
+    /// Signed catalog scope (#908): verify the scope in the request metadata
+    /// and attach it to a per-request copy of the session. The stored
+    /// session never carries a scope, so each RPC proves its own.
+    async fn attach_catalog_scope<T: Send + Sync>(
+        &self,
+        request: &Request<T>,
+        session: Arc<sqe_core::Session>,
+    ) -> Result<Arc<sqe_core::Session>, Status> {
+        if !crate::catalog_scope_gate::applies(&session) {
+            return Ok(session);
+        }
+        let Some(header) = crate::catalog_scope_gate::header_name() else {
+            return Ok(session);
+        };
+        let scope = request
+            .metadata()
+            .get(header.as_str())
+            .and_then(|v| v.to_str().ok());
+        let client_ip = self.extract_client_ip(request);
+        match crate::catalog_scope_gate::attach((*session).clone(), scope, Some(&client_ip)).await {
+            Ok(scoped) => Ok(Arc::new(scoped)),
+            Err(e) => Err(Status::unauthenticated(e.to_string())),
+        }
     }
 
     async fn get_session_from_request_inner<T: Send + Sync>(

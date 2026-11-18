@@ -1213,6 +1213,19 @@ impl TrinoAuthenticator for AuthenticatorAdapter {
             .check(peer_ip, "oauth2-challenge")
             .map_err(|_| trino_auth_error(sqe_auth::AuthError::RateLimited, ""))
     }
+
+    fn catalog_scope_header(&self) -> Option<String> {
+        sqe_coordinator::catalog_scope_gate::header_name()
+    }
+
+    async fn attach_catalog_scope(
+        &self,
+        session: sqe_core::Session,
+        scope: Option<&str>,
+        peer_ip: &str,
+    ) -> Result<sqe_core::Session, sqe_core::SqeError> {
+        sqe_coordinator::catalog_scope_gate::attach(session, scope, Some(peer_ip)).await
+    }
 }
 
 struct QueryHandlerAdapter {
@@ -2279,6 +2292,12 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
     };
 
     let audit = Arc::new(audit_logger);
+
+    // Signed catalog scope (#908): off unless `[session.catalog_scope]` is set.
+    sqe_coordinator::catalog_scope_gate::install(
+        config.session.catalog_scope.as_ref(),
+        Some(audit.clone()),
+    )?;
 
     // Advisory/active auto-compaction scheduler (Phase 4a, Task 5). `Off`
     // mode (the default) constructs NOTHING here: neither the dedicated
@@ -4302,6 +4321,7 @@ token_endpoint = "http://127.0.0.1:1/token"
                     refresh_token: None,
                     expires_at: None,
                     scopes: vec![],
+                    token_binding: None,
                 }),
                 "user-tok" => Ok(sqe_auth::Identity {
                     user_id: "user".into(),
@@ -4314,6 +4334,7 @@ token_endpoint = "http://127.0.0.1:1/token"
                     refresh_token: None,
                     expires_at: None,
                     scopes: vec![],
+                    token_binding: None,
                 }),
                 _ => Err(sqe_auth::AuthError::AuthFailed("bad token".into())),
             }

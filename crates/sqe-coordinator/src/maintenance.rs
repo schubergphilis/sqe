@@ -2726,6 +2726,7 @@ impl MaintenanceHandler {
             (_, Some(cfg)) => {
                 crate::session_context::build_session_catalog(
                     cfg,
+                    target.unwrap_or_default(),
                     session,
                     &self.config.storage,
                     self.table_cache.as_ref(),
@@ -2759,7 +2760,13 @@ impl MaintenanceHandler {
                     self.table_cache.clone(),
                     session.access_token().expose(),
                 )
-                .await?,
+                .await?
+                .scoped_to(
+                    session,
+                    &target
+                        .map(str::to_string)
+                        .unwrap_or_else(|| self.config.resolve_default_catalog()),
+                )?,
             ),
         };
         let _ = session_catalog.list_namespaces().await;

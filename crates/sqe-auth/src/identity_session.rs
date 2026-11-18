@@ -46,6 +46,7 @@ impl Identity {
             self.roles,
         )
         .with_identity(self.subject, self.email, self.groups)
+        .with_token_binding(self.token_binding)
     }
 
     /// Borrowing form of [`Identity::into_session`].
@@ -70,6 +71,7 @@ mod tests {
             refresh_token: Some(SecretString::new("refresh-tok".to_string())),
             expires_at: Some(Utc::now() + Duration::minutes(7)),
             scopes: vec![],
+            token_binding: None,
         }
     }
 

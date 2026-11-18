@@ -77,6 +77,43 @@ pub struct Identity {
     /// `scp` array/string). Empty when the provider does not know them
     /// (anonymous, mTLS, API key, ...). Issue #676.
     pub scopes: Vec<String>,
+    /// `azp` / `jti` / `sub` of the JWT the caller presented, for binding a
+    /// signed catalog scope to it (#908). Read from the token SQE verified,
+    /// not from an exchanged catalog token. `None` when the credential was
+    /// not a JWT.
+    pub token_binding: Option<sqe_core::catalog_scope::TokenBinding>,
+}
+
+/// Read the claims a catalog scope binds to (`azp`, `jti`, `sub`) from a
+/// decoded JWT payload. `None` when the payload carries none of them.
+pub fn token_binding_from_claims(
+    claims: &serde_json::Value,
+) -> Option<sqe_core::catalog_scope::TokenBinding> {
+    let text = |key: &str| {
+        claims
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    let binding = sqe_core::catalog_scope::TokenBinding {
+        client_id: text("azp"),
+        token_id: text("jti"),
+        subject: text("sub"),
+    };
+    (!binding.is_empty()).then_some(binding)
+}
+
+/// Decode a JWT payload *without* verifying it. Only for classifying a
+/// token a trusted upstream already verified (the bearer passthrough
+/// provider); never for an authorization decision on its own.
+pub fn unverified_jwt_claims(token: &str) -> Option<serde_json::Value> {
+    use base64::Engine as _;
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Errors returned by `AuthProvider::authenticate`.
@@ -238,6 +275,7 @@ mod tests {
             refresh_token: Some(SecretString::new("very-secret-refresh-token".to_string())),
             expires_at: None,
             scopes: vec![],
+            token_binding: None,
         };
         let debug = format!("{:?}", identity);
 

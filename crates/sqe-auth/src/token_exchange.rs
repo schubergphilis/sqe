@@ -279,6 +279,12 @@ impl TokenExchangeProvider {
             refresh_token: Some(sqe_core::SecretString::new(subject_token.to_string())),
             expires_at,
             scopes: vec![],
+            // The catalog scope binds to the token the caller presented,
+            // which the IdP has just accepted as the exchange's subject
+            // token, not to the exchanged one (#908).
+            token_binding: crate::provider::unverified_jwt_claims(subject_token)
+                .as_ref()
+                .and_then(crate::provider::token_binding_from_claims),
         })
     }
 

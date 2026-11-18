@@ -108,6 +108,7 @@ async fn quack_select_one_round_trip() {
             refresh_token: None,
             expires_at: None,
             scopes: vec![],
+            token_binding: None,
         },
     });
     let executor: Arc<dyn sqe_quack_server::QueryExecutor> =

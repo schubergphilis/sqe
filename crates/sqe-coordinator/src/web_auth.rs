@@ -383,6 +383,7 @@ mod tests {
                     refresh_token: None,
                     expires_at: None,
                     scopes: vec![],
+                    token_binding: None,
                 })
             } else {
                 Err(sqe_auth::AuthError::AuthFailed("bad".into()))
@@ -472,6 +473,7 @@ mod tests {
             refresh_token: None,
             expires_at: None,
             scopes: vec![],
+            token_binding: None,
         }
     }
 
@@ -487,6 +489,7 @@ mod tests {
             refresh_token: None,
             expires_at: None,
             scopes: vec![],
+            token_binding: None,
         }
     }
 
@@ -756,6 +759,7 @@ mod tests {
             refresh_token: None,
             expires_at: None,
             scopes: vec![],
+            token_binding: None,
         };
 
         emit_success(&state, &alice);
@@ -905,6 +909,7 @@ mod tests {
                     refresh_token: None,
                     expires_at: None,
                     scopes: vec![],
+                    token_binding: None,
                 })
             }
         }
