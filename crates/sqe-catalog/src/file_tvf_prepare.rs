@@ -222,16 +222,34 @@ fn unresolved_bare_name(error: &DataFusionError) -> Option<&str> {
 /// does not tokenize the `|>` pipe operator (#851); the planner does plan
 /// pipe queries. Same recursion limit and single-statement rule as
 /// DataFusion's own `sql_to_statement`.
+///
+/// `->` is parsed as an operator first ([`sqe_sql::ArrowExecutionDialect`])
+/// and promoted to a lambda only inside higher-order calls, so a JSON arrow
+/// on a bare column is not read as a lambda (#913). Text that only parses
+/// with lambda syntax (`lambda x: ...`, a typed parameter) is parsed as
+/// before.
 async fn parse_and_plan(
     state: &datafusion::execution::SessionState,
     sql: &str,
 ) -> DFResult<LogicalPlan> {
     let recursion_limit = state.config().options().sql_parser.recursion_limit.get();
-    let mut statements = datafusion::sql::parser::DFParserBuilder::new(sql)
-        .with_dialect(&sqe_sql::ExecutionDialect)
-        .with_recursion_limit(recursion_limit)
-        .build()?
-        .parse_statements()?;
+    let parse = |dialect: &dyn datafusion::sql::sqlparser::dialect::Dialect| {
+        datafusion::sql::parser::DFParserBuilder::new(sql)
+            .with_dialect(dialect)
+            .with_recursion_limit(recursion_limit)
+            .build()?
+            .parse_statements()
+    };
+    let mut statements = match parse(&sqe_sql::ArrowExecutionDialect) {
+        Ok(mut statements) => {
+            let higher_order = |name: &str| state.higher_order_functions().contains_key(name);
+            for statement in &mut statements {
+                promote_lambdas(statement, &higher_order);
+            }
+            statements
+        }
+        Err(_) => parse(&sqe_sql::ExecutionDialect)?,
+    };
     if statements.len() > 1 {
         return datafusion::common::not_impl_err!(
             "The context currently only supports a single SQL statement"
@@ -241,6 +259,27 @@ async fn parse_and_plan(
         DataFusionError::Plan("No SQL statements were provided in the query string".into())
     })?;
     state.statement_to_plan(statement).await
+}
+
+/// [`sqe_sql::promote_lambda_arguments`] through DataFusion's statement
+/// wrappers (`EXPLAIN`, `COPY (query) TO`).
+fn promote_lambdas(
+    statement: &mut datafusion::sql::parser::Statement,
+    higher_order: &dyn Fn(&str) -> bool,
+) {
+    use datafusion::sql::parser::{CopyToSource, Statement as DFStatement};
+    match statement {
+        DFStatement::Statement(statement) => {
+            sqe_sql::promote_lambda_arguments(statement.as_mut(), higher_order);
+        }
+        DFStatement::Explain(explain) => promote_lambdas(&mut explain.statement, higher_order),
+        DFStatement::CopyTo(copy) => {
+            if let CopyToSource::Query(query) = &mut copy.source {
+                sqe_sql::promote_lambda_arguments(query.as_mut(), higher_order);
+            }
+        }
+        DFStatement::CreateExternalTable(_) | DFStatement::Reset(_) => {}
+    }
 }
 
 /// `SessionContext::sql_with_options` over [`parse_and_plan`].
@@ -935,6 +974,72 @@ mod tests {
         // Two statements stay refused, as in DataFusion's own parser.
         let err = plan_sql(&ctx, "SELECT 1; SELECT 2").await.unwrap_err();
         assert!(err.to_string().contains("single SQL statement"), "{err}");
+    }
+
+    /// #913: a JSON arrow on a bare column plans as a JSON arrow through
+    /// every entry point, `EXPLAIN` included, while lambdas in higher-order
+    /// calls keep planning.
+    #[tokio::test]
+    async fn json_arrow_on_a_bare_column_is_not_a_lambda() {
+        use datafusion::arrow::util::pretty::pretty_format_batches;
+        let mut ctx =
+            SessionContext::new_with_config(crate::session_tuning::engine_session_config());
+        crate::session_tuning::register_engine_functions(&mut ctx).unwrap();
+        ctx.sql(
+            "CREATE TABLE events AS SELECT * FROM (VALUES \
+             ('{\"session\": {\"device\": {\"type\": \"mobile\"}}}')) AS v(payload)",
+        )
+        .await
+        .unwrap();
+        let cases = [
+            (
+                "SELECT payload -> 'session' -> 'device' ->> 'type' AS device_type FROM events",
+                "+-------------+\n\
+                 | device_type |\n\
+                 +-------------+\n\
+                 | mobile      |\n\
+                 +-------------+",
+            ),
+            (
+                "SELECT count(*) AS n FROM events \
+                 WHERE (payload -> 'session' -> 'device' ->> 'type') = 'mobile'",
+                "+---+\n\
+                 | n |\n\
+                 +---+\n\
+                 | 1 |\n\
+                 +---+",
+            ),
+            (
+                "SELECT transform(filter([1, 2, 3], x -> x > 1), x -> x * 10) AS v",
+                "+----------+\n\
+                 | v        |\n\
+                 +----------+\n\
+                 | [20, 30] |\n\
+                 +----------+",
+            ),
+        ];
+        for (sql, expected) in cases {
+            let rows = plan_sql(&ctx, sql).await.unwrap().collect().await.unwrap();
+            assert_eq!(
+                pretty_format_batches(&rows).unwrap().to_string(),
+                expected,
+                "{sql}"
+            );
+            let plan = create_logical_plan(&ctx.state(), sql).await.unwrap();
+            let rows = ctx
+                .execute_logical_plan(plan)
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                pretty_format_batches(&rows).unwrap().to_string(),
+                expected,
+                "{sql}"
+            );
+            plan_sql(&ctx, &format!("EXPLAIN {sql}")).await.unwrap();
+        }
     }
 
     /// #878 over #851: a lateral alias in a pipe `SELECT` or `EXTEND` step
