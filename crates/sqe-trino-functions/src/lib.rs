@@ -20,6 +20,7 @@ pub mod aggregates;
 pub mod binary_fns;
 pub mod central_moments;
 pub mod coverage_fns;
+mod datetime_fns;
 pub(crate) mod helpers;
 pub mod higher_order;
 pub mod histogram;

@@ -7,9 +7,9 @@ use std::sync::{Arc, LazyLock};
 
 use serde_json;
 
-use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, FieldRef};
-use chrono::{Datelike, NaiveDate, NaiveDateTime};
+use chrono::{Datelike, NaiveDate};
 use datafusion::common::Result as DFResult;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{
@@ -23,7 +23,6 @@ pub fn register_extended_trino_functions(ctx: &datafusion::prelude::SessionConte
     // Trivial aliases. `every` used to live here as a scalar stub;
     // it now ships as a real aggregate alias on `bool_and` registered
     // in `register_trino_aggregate_aliases` (trino_functions.rs).
-    ctx.register_udf(ScalarUDF::from(Millisecond));
     ctx.register_udf(ScalarUDF::from(Infinity));
     ctx.register_udf(ScalarUDF::from(Nan));
     ctx.register_udf(ScalarUDF::from(IsJsonScalar));
@@ -34,8 +33,6 @@ pub fn register_extended_trino_functions(ctx: &datafusion::prelude::SessionConte
     ctx.register_udf(ScalarUDF::from(FromBase));
     ctx.register_udf(ScalarUDF::from(ToBase));
     ctx.register_udf(ScalarUDF::from(FromIso8601Date));
-    ctx.register_udf(ScalarUDF::from(FromIso8601Timestamp));
-    ctx.register_udf(ScalarUDF::from(ToIso8601));
     ctx.register_udf(ScalarUDF::from(CurrentTimezone));
     ctx.register_udf(ScalarUDF::from(LastDayOfMonth));
 
@@ -47,8 +44,6 @@ pub fn register_extended_trino_functions(ctx: &datafusion::prelude::SessionConte
     ctx.register_udf(ScalarUDF::from(AtTimezone));
 
     // Hard UDFs
-    ctx.register_udf(ScalarUDF::from(FormatDatetime));
-    ctx.register_udf(ScalarUDF::from(ParseDatetime));
     // word_stem(s) and word_stem(s, lang) live under the same name with a
     // OneOf signature; word_stem_lang is registered as an alias for
     // backward compatibility with callers that adopted the old separate
@@ -63,8 +58,6 @@ pub fn register_extended_trino_functions(ctx: &datafusion::prelude::SessionConte
     // Trino aggregate aliases in trino_functions.rs. `arbitrary` went
     // the same way: it is an alias of DataFusion's any_value UDAF.
     ctx.register_udf(ScalarUDF::from(Checksum));
-    ctx.register_udf(ScalarUDF::from(TimezoneHour));
-    ctx.register_udf(ScalarUDF::from(TimezoneMinute));
     ctx.register_udf(ScalarUDF::from(JsonSize));
     ctx.register_udf(ScalarUDF::from(JsonArrayGet));
 
@@ -94,9 +87,9 @@ pub fn register_extended_trino_functions(ctx: &datafusion::prelude::SessionConte
 // ═══════════════════════════════════════════════════════════════════
 
 use crate::helpers::{
-    arg, lift1, lift2, micros_to_local_naive, str_transform, str_transform_2, strftime_naive,
-    tag_timezone, unexpected_parameters, AnyArg, DateArg, DateDays, FromColumnar, I64Arg, RowArg,
-    StrArg, TsArg, TsMicros, Zone,
+    arg, lift1, lift2, micros_to_local_naive, str_transform, str_transform_2, tag_timezone,
+    unexpected_parameters, AnyArg, DateArg, DateDays, FromColumnar, I64Arg, RowArg, StrArg,
+    TsArg, TsMicros, Zone,
 };
 
 /// Epoch day zero, shared by the date helpers below.
@@ -113,28 +106,6 @@ fn epoch_date() -> NaiveDate {
 // single-row contexts but is wrong in any GROUP BY). It has been
 // replaced by the aggregate alias on `bool_and` registered in
 // trino_functions.rs::register_trino_aggregate_aliases.
-
-/// millisecond(ts) — extract millisecond component (0–999)
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct Millisecond;
-
-impl ScalarUDFImpl for Millisecond {
-    fn name(&self) -> &str {
-        "millisecond"
-    }
-    fn signature(&self) -> &Signature {
-        static SIG: LazyLock<Signature> =
-            LazyLock::new(|| Signature::any(1, Volatility::Immutable));
-        &SIG
-    }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Int64)
-    }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let ts: TsArg = arg("millisecond", "timestamp", &args.args, 0)?;
-        lift1(&ts, |us| Ok(Some(us.div_euclid(1000).rem_euclid(1000))))
-    }
-}
 
 /// infinity() → f64::INFINITY
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -434,145 +405,6 @@ fn parse_iso_date(s: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(s, "%Y-%m-%d")
         .or_else(|_| NaiveDate::parse_from_str(s, "%Y%m%d"))
         .ok()
-}
-
-/// from_iso8601_timestamp(s) → TIMESTAMP WITH MICROSECOND precision
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct FromIso8601Timestamp;
-
-impl ScalarUDFImpl for FromIso8601Timestamp {
-    fn name(&self) -> &str {
-        "from_iso8601_timestamp"
-    }
-    fn signature(&self) -> &Signature {
-        static SIG: LazyLock<Signature> =
-            LazyLock::new(|| Signature::any(1, Volatility::Immutable));
-        &SIG
-    }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Microsecond,
-            None,
-        ))
-    }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let s: StrArg = arg("from_iso8601_timestamp", "varchar", &args.args, 0)?;
-        lift1(&s, |s| Ok(parse_iso_timestamp(s).map(TsMicros)))
-    }
-}
-
-/// Parse an ISO 8601 timestamp to UTC microseconds. A `Z` or `±hh[:mm]`
-/// suffix names the instant (`03:04:05+02:00` is `01:04:05` UTC); without
-/// one the wall clock is read as UTC, the session zone SQE runs in. A bare
-/// date is midnight, and the minutes may stop at `hh:mm`, as in Trino.
-fn parse_iso_timestamp(s: &str) -> Option<i64> {
-    let s = s.trim();
-    let (local, offset_secs) = split_iso_offset(s)?;
-    let naive = [
-        "%Y-%m-%dT%H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%dT%H:%M",
-        "%Y-%m-%d %H:%M",
-    ]
-    .iter()
-    .find_map(|f| NaiveDateTime::parse_from_str(local, f).ok())
-    .or_else(|| parse_iso_date(local).and_then(|d| d.and_hms_opt(0, 0, 0)))?;
-    let utc = naive.checked_sub_signed(chrono::Duration::seconds(offset_secs))?;
-    Some(utc.and_utc().timestamp_micros())
-}
-
-/// Split a trailing `Z` / `±hh` / `±hhmm` / `±hh:mm` zone designator off an
-/// ISO 8601 timestamp. Returns the wall-clock part and the offset in seconds
-/// east of UTC (0 when there is no designator). Only looks past the time
-/// part, so the `-` separators of the date are never taken for an offset.
-fn split_iso_offset(s: &str) -> Option<(&str, i64)> {
-    if let Some(local) = s.strip_suffix('Z').or_else(|| s.strip_suffix('z')) {
-        return Some((local, 0));
-    }
-    // A date is 10 bytes; an offset can only start after `T`/` ` + time.
-    let Some(pos) = s
-        .get(10..)
-        .and_then(|t| t.rfind(['+', '-']))
-        .map(|p| p + 10)
-    else {
-        return Some((s, 0));
-    };
-    let (local, zone) = s.split_at(pos);
-    let sign = if zone.starts_with('-') { -1 } else { 1 };
-    let digits: String = zone[1..].chars().filter(|c| *c != ':').collect();
-    if !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let (hh, mm) = match digits.len() {
-        2 => (digits.parse::<i64>().ok()?, 0),
-        4 => (
-            digits[..2].parse::<i64>().ok()?,
-            digits[2..].parse::<i64>().ok()?,
-        ),
-        _ => return None,
-    };
-    if hh > 18 || mm > 59 {
-        return None;
-    }
-    Some((local, sign * (hh * 3600 + mm * 60)))
-}
-
-/// to_iso8601(ts_or_date) → VARCHAR ISO 8601 string
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct ToIso8601;
-
-impl ScalarUDFImpl for ToIso8601 {
-    fn name(&self) -> &str {
-        "to_iso8601"
-    }
-    fn signature(&self) -> &Signature {
-        static SIG: LazyLock<Signature> =
-            LazyLock::new(|| Signature::any(1, Volatility::Immutable));
-        &SIG
-    }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Utf8)
-    }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        const EXPECTED: &str = "timestamp | date";
-        match args.args[0].data_type() {
-            DataType::Date32 | DataType::Date64 => {
-                let epoch = epoch_date();
-                let d: DateArg = arg("to_iso8601", EXPECTED, &args.args, 0)?;
-                lift1(&d, |days| {
-                    Ok(epoch
-                        .checked_add_signed(chrono::Duration::days(days as i64))
-                        .map(|date| date.format("%Y-%m-%d").to_string()))
-                })
-            }
-            DataType::Timestamp(_, _) | DataType::Null => {
-                let ts: TsArg = arg("to_iso8601", EXPECTED, &args.args, 0)?;
-                // Zoned input renders the local wall clock with its offset
-                // (Trino: `2024-03-15T15:30:45.123+01:00`). Naive input has
-                // no zone, so it gets no designator either (Trino:
-                // `2024-01-02T03:04:05`); a `Z` would claim it is UTC. The
-                // fraction is shown only when it is non-zero, in 3, 6 or 9
-                // digits, since Arrow carries a unit rather than the declared
-                // precision Trino pads to.
-                let zone = ts.tz.as_deref().map(Zone::parse).transpose()?;
-                lift1(&ts, |us| {
-                    let utc = chrono::DateTime::from_timestamp_micros(us);
-                    Ok(utc.map(|utc| match &zone {
-                        None => utc.naive_utc().format("%Y-%m-%dT%H:%M:%S%.f").to_string(),
-                        Some(Zone::Named(tz)) => utc
-                            .with_timezone(tz)
-                            .format("%Y-%m-%dT%H:%M:%S%.3f%:z")
-                            .to_string(),
-                        Some(Zone::Fixed(off)) => utc
-                            .with_timezone(off)
-                            .format("%Y-%m-%dT%H:%M:%S%.3f%:z")
-                            .to_string(),
-                    }))
-                })
-            }
-            _ => Err(unexpected_parameters("to_iso8601", &args.args, EXPECTED)),
-        }
-    }
 }
 
 /// current_timezone() → VARCHAR — returns 'UTC' (SQE runs in UTC)
@@ -1052,134 +884,6 @@ impl ScalarUDFImpl for AtTimezone {
 // HARD UDFs
 // ═══════════════════════════════════════════════════════════════════
 
-/// format_datetime(ts, joda_format) → VARCHAR — format using Joda-style patterns
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct FormatDatetime;
-
-impl ScalarUDFImpl for FormatDatetime {
-    fn name(&self) -> &str {
-        "format_datetime"
-    }
-    fn signature(&self) -> &Signature {
-        static SIG: LazyLock<Signature> =
-            LazyLock::new(|| Signature::any(2, Volatility::Immutable));
-        &SIG
-    }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Utf8)
-    }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        const EXPECTED: &str = "timestamp, varchar";
-        let ts: TsArg = arg("format_datetime", EXPECTED, &args.args, 0)?;
-        let fmt: StrArg = arg("format_datetime", EXPECTED, &args.args, 1)?;
-        let tz = ts.tz.clone();
-        // Translate the Joda pattern once when it is constant; per row otherwise.
-        let const_fmt = const_str_scalar(&args.args[1]).map(joda_to_chrono);
-        lift2(&ts, &fmt, |us, joda_fmt| {
-            let chrono_fmt: std::borrow::Cow<str> = match &const_fmt {
-                Some(f) => std::borrow::Cow::Borrowed(f),
-                None => std::borrow::Cow::Owned(joda_to_chrono(joda_fmt)),
-            };
-            micros_to_local_naive(us, tz.as_deref())
-                .map(|dt| strftime_naive("format_datetime", &dt, &chrono_fmt))
-                .transpose()
-        })
-    }
-}
-
-/// parse_datetime(s, joda_format) → TIMESTAMP — parse using Joda-style patterns
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct ParseDatetime;
-
-impl ScalarUDFImpl for ParseDatetime {
-    fn name(&self) -> &str {
-        "parse_datetime"
-    }
-    fn signature(&self) -> &Signature {
-        static SIG: LazyLock<Signature> =
-            LazyLock::new(|| Signature::any(2, Volatility::Immutable));
-        &SIG
-    }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Microsecond,
-            None,
-        ))
-    }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        const EXPECTED: &str = "varchar, varchar";
-        let s: StrArg = arg("parse_datetime", EXPECTED, &args.args, 0)?;
-        let fmt: StrArg = arg("parse_datetime", EXPECTED, &args.args, 1)?;
-        let const_fmt = const_str_scalar(&args.args[1]).map(joda_to_chrono);
-        lift2(&s, &fmt, |s, joda_fmt| {
-            let chrono_fmt: std::borrow::Cow<str> = match &const_fmt {
-                Some(f) => std::borrow::Cow::Borrowed(f),
-                None => std::borrow::Cow::Owned(joda_to_chrono(joda_fmt)),
-            };
-            // Try full datetime first; fall back to a date-only pattern.
-            // chrono's NaiveDateTime parse requires a time component, but
-            // Trino's parse_datetime accepts date-only patterns and returns
-            // midnight (e.g. parse_datetime('2020-01-02','yyyy-MM-dd')).
-            let ts = NaiveDateTime::parse_from_str(s, &chrono_fmt)
-                .ok()
-                .or_else(|| {
-                    NaiveDate::parse_from_str(s, &chrono_fmt)
-                        .ok()
-                        .and_then(|d| d.and_hms_opt(0, 0, 0))
-                })
-                .map(|dt| TsMicros(dt.and_utc().timestamp_micros()));
-            Ok(ts)
-        })
-    }
-}
-
-/// Translate Joda datetime format patterns to chrono format patterns.
-///
-/// Single pass over the input, greedily matching the longest token at each
-/// position. A chained `str::replace` (the previous approach) re-scanned its
-/// own output: after `"dd" -> "%d"`, a later `"d" -> "%d"` re-hit the `d` inside
-/// the just-emitted `%d` and corrupted it to `%%d` (a literal `%d`), so almost
-/// every date format failed to parse. Emitting tokens in one pass avoids that.
-fn joda_to_chrono(joda: &str) -> String {
-    // Longest variant of each letter group first so the greedy match is correct.
-    const TOKENS: &[(&str, &str)] = &[
-        ("yyyy", "%Y"),
-        ("yy", "%y"),
-        ("MMMM", "%B"), // full month name
-        ("MMM", "%b"),  // abbreviated month
-        ("MM", "%m"),   // zero-padded month
-        ("M", "%m"),
-        ("dd", "%d"), // zero-padded day
-        ("d", "%d"),
-        ("HH", "%H"), // 24-hour
-        ("H", "%H"),
-        ("hh", "%I"), // 12-hour
-        ("h", "%I"),
-        ("mm", "%M"),    // minute
-        ("ss", "%S"),    // second
-        ("SSS", "%.3f"), // milliseconds
-        ("SS", "%.2f"),
-        ("EEEE", "%A"), // full day name (before EEE)
-        ("EEE", "%a"),  // abbreviated day name
-        ("ZZ", "%:z"),  // timezone offset with colon
-        ("Z", "%z"),    // timezone offset
-        ("a", "%p"),    // AM/PM
-    ];
-    let mut out = String::with_capacity(joda.len() * 2);
-    let mut rest = joda;
-    while !rest.is_empty() {
-        if let Some((pat, rep)) = TOKENS.iter().find(|(p, _)| rest.starts_with(p)) {
-            out.push_str(rep);
-            rest = &rest[pat.len()..];
-        } else {
-            let ch = rest.chars().next().unwrap();
-            out.push(ch);
-            rest = &rest[ch.len_utf8()..];
-        }
-    }
-    out
-}
-
 /// word_stem(s) or word_stem(s, lang) → stemmed word in the specified language.
 ///
 /// Trino's `word_stem` accepts both arities under the same name. DataFusion's
@@ -1310,69 +1014,6 @@ impl ScalarUDFImpl for Checksum {
                         })
                     })
                     .collect();
-                Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
-            }
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// DATE/TIME — TIMEZONE HELPERS
-// ═══════════════════════════════════════════════════════════════════
-
-/// timezone_hour(ts) — Returns the hour component of the timezone offset.
-///
-/// SQE operates in UTC, so the offset is always 0.
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct TimezoneHour;
-
-impl ScalarUDFImpl for TimezoneHour {
-    fn name(&self) -> &str {
-        "timezone_hour"
-    }
-    fn signature(&self) -> &Signature {
-        static SIG: LazyLock<Signature> =
-            LazyLock::new(|| Signature::new(TypeSignature::Any(1), Volatility::Immutable));
-        &SIG
-    }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Int64)
-    }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        // SQE operates in UTC, so timezone offset is always 0
-        match &args.args[0] {
-            ColumnarValue::Scalar(_) => Ok(ColumnarValue::Scalar(ScalarValue::Int64(Some(0)))),
-            ColumnarValue::Array(arr) => {
-                let result: Int64Array = (0..arr.len()).map(|_| Some(0i64)).collect();
-                Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
-            }
-        }
-    }
-}
-
-/// timezone_minute(ts) — Returns the minute component of the timezone offset.
-///
-/// SQE operates in UTC, so the offset is always 0.
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct TimezoneMinute;
-
-impl ScalarUDFImpl for TimezoneMinute {
-    fn name(&self) -> &str {
-        "timezone_minute"
-    }
-    fn signature(&self) -> &Signature {
-        static SIG: LazyLock<Signature> =
-            LazyLock::new(|| Signature::new(TypeSignature::Any(1), Volatility::Immutable));
-        &SIG
-    }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Int64)
-    }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        match &args.args[0] {
-            ColumnarValue::Scalar(_) => Ok(ColumnarValue::Scalar(ScalarValue::Int64(Some(0)))),
-            ColumnarValue::Array(arr) => {
-                let result: Int64Array = (0..arr.len()).map(|_| Some(0i64)).collect();
                 Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
             }
         }
@@ -1713,75 +1354,4 @@ fn apply_format(fmt: &str, args: &[String]) -> DFResult<String> {
     }
 
     Ok(result)
-}
-
-#[cfg(test)]
-mod parse_datetime_tests {
-    use super::*;
-    use arrow::array::{Array, TimestampMicrosecondArray};
-
-    #[test]
-    fn joda_to_chrono_does_not_corrupt_repeated_letters() {
-        // Regression for the chained-replace bug that produced `%%d` / `%%H`.
-        assert_eq!(joda_to_chrono("yyyy-MM-dd HH:mm:ss"), "%Y-%m-%d %H:%M:%S");
-        assert_eq!(joda_to_chrono("yyyy-MM-dd"), "%Y-%m-%d");
-        assert_eq!(joda_to_chrono("HH:mm"), "%H:%M");
-        assert_eq!(joda_to_chrono("yy/M/d"), "%y/%m/%d");
-    }
-
-    #[tokio::test]
-    async fn format_datetime_unrenderable_pattern_errors() {
-        // Joda 'Z' maps to %z, which a zoneless timestamp cannot render;
-        // a stray '%' is an invalid strftime item. Both used to panic.
-        let ctx = crate::duckdb_test_ctx();
-        register_extended_trino_functions(&ctx);
-        for pat in ["yyyy Z", "yyyy %"] {
-            let sql = format!("SELECT format_datetime(TIMESTAMP '2024-01-15 10:30:45', '{pat}')");
-            let res = match ctx.sql(&sql).await {
-                Ok(df) => df.collect().await.map(|_| ()),
-                Err(e) => Err(e),
-            };
-            assert!(res.is_err(), "{pat} should error");
-        }
-    }
-
-    async fn parse_dt(s: &str, fmt: &str) -> Option<i64> {
-        let ctx = crate::duckdb_test_ctx();
-        register_extended_trino_functions(&ctx);
-        let sql = format!("SELECT parse_datetime('{s}', '{fmt}')");
-        let b = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
-        let a = b[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .unwrap();
-        if a.is_null(0) {
-            None
-        } else {
-            Some(a.value(0))
-        }
-    }
-
-    #[tokio::test]
-    async fn parse_datetime_handles_date_only_and_datetime() {
-        // Date-only pattern -> midnight (matches Trino), previously returned NULL.
-        let midnight = NaiveDate::from_ymd_opt(2020, 1, 2)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc()
-            .timestamp_micros();
-        assert_eq!(parse_dt("2020-01-02", "yyyy-MM-dd").await, Some(midnight));
-        // Full datetime pattern (previously corrupted to %%d/%%H -> NULL).
-        let dt = NaiveDate::from_ymd_opt(2020, 1, 2)
-            .unwrap()
-            .and_hms_opt(3, 4, 5)
-            .unwrap()
-            .and_utc()
-            .timestamp_micros();
-        assert_eq!(
-            parse_dt("2020-01-02 03:04:05", "yyyy-MM-dd HH:mm:ss").await,
-            Some(dt)
-        );
-    }
 }

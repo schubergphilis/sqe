@@ -509,16 +509,18 @@ async fn test_to_iso8601_date() {
 #[tokio::test]
 async fn test_from_iso8601_timestamp_reads_the_zone() {
     for (input, want) in [
-        ("2024-01-02T03:04:05Z", "2024-01-02T03:04:05"),
-        ("2024-01-02T03:04:05.123Z", "2024-01-02T03:04:05.123"),
-        ("2024-01-02T05:04:05+02:00", "2024-01-02T03:04:05"),
-        ("2024-01-02T05:04:05+0200", "2024-01-02T03:04:05"),
-        ("2024-01-02T05:04:05+02", "2024-01-02T03:04:05"),
-        ("2024-01-01T22:04:05-05:00", "2024-01-02T03:04:05"),
-        ("2024-01-02T03:04:05", "2024-01-02T03:04:05"),
-        ("2024-01-02 03:04:05", "2024-01-02T03:04:05"),
-        ("2024-01-02T03:04Z", "2024-01-02T03:04:00"),
-        ("2024-01-02", "2024-01-02T00:00:00"),
+        // timestamp(3) with time zone: the instant is kept and the zone is
+        // the one the text names (the session zone, UTC, when it names none).
+        ("2024-01-02T03:04:05Z", "2024-01-02T03:04:05Z"),
+        ("2024-01-02T03:04:05.123Z", "2024-01-02T03:04:05.123Z"),
+        ("2024-01-02T05:04:05+02:00", "2024-01-02T05:04:05+02:00"),
+        ("2024-01-02T05:04:05+0200", "2024-01-02T05:04:05+02:00"),
+        ("2024-01-02T05:04:05+02", "2024-01-02T05:04:05+02:00"),
+        ("2024-01-01T22:04:05-05:00", "2024-01-01T22:04:05-05:00"),
+        ("2024-01-02T03:04:05", "2024-01-02T03:04:05Z"),
+        ("2024-01-02 03:04:05", "2024-01-02T03:04:05Z"),
+        ("2024-01-02T03:04Z", "2024-01-02T03:04:00Z"),
+        ("2024-01-02", "2024-01-02T00:00:00Z"),
     ] {
         let v = eval_str(&format!("SELECT from_iso8601_timestamp('{input}')")).await;
         assert_eq!(
@@ -532,8 +534,16 @@ async fn test_from_iso8601_timestamp_reads_the_zone() {
         "2024-01-02T03:04:05+0x:00",
         "nope",
     ] {
-        let v = eval_str(&format!("SELECT from_iso8601_timestamp('{bad}')")).await;
-        assert_eq!(v, None, "from_iso8601_timestamp('{bad}')");
+        // Trino raises on text it cannot parse; it does not return NULL.
+        let ctx = ctx().await;
+        let res = match ctx
+            .sql(&format!("SELECT from_iso8601_timestamp('{bad}')"))
+            .await
+        {
+            Ok(df) => df.collect().await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+        assert!(res.is_err(), "from_iso8601_timestamp('{bad}')");
     }
 }
 
@@ -547,12 +557,13 @@ async fn test_to_iso8601_naive_timestamp_has_no_zone() {
     assert_eq!(v.as_deref(), Some("2024-01-02T03:04:05.123"));
     let v = eval_str("SELECT to_iso8601(TIMESTAMP '2024-01-02 03:04:05.123456')").await;
     assert_eq!(v.as_deref(), Some("2024-01-02T03:04:05.123456"));
-    // Round trip through the parser.
+    // Round trip through the parser: the parsed value is zoned (UTC), so it
+    // renders with its designator.
     let v = eval_str(
         "SELECT to_iso8601(from_iso8601_timestamp(to_iso8601(TIMESTAMP '2024-01-02 03:04:05.5')))",
     )
     .await;
-    assert_eq!(v.as_deref(), Some("2024-01-02T03:04:05.500"));
+    assert_eq!(v.as_deref(), Some("2024-01-02T03:04:05.500Z"));
 }
 
 /// Trino evaluates every clock function at the query start, so two calls in
