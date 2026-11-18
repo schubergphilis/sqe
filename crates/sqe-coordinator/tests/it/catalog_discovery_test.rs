@@ -427,12 +427,7 @@ async fn polaris_auto_lazy_hit() {
     assert_eq!(total_rows, 1, "probe_t has exactly one row");
 
     let batch = &batches[0];
-    let id_arr = batch
-        .column_by_name("id")
-        .expect("'id' column must exist")
-        .as_any()
-        .downcast_ref::<arrow_array::Int64Array>()
-        .expect("'id' is Int64");
+    let id_arr = crate::common::i64s(batch.column_by_name("id").expect("'id' column must exist"));
     assert_eq!(id_arr.value(0), 42);
 
     let label_arr = crate::common::utf8(

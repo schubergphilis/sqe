@@ -4389,12 +4389,15 @@ catalog_url = ""
         .expect("decodes result batches")
     }
 
-    /// The single Int64 value of a one-row, one-column result.
+    /// The single integer value of a one-row, one-column result. Integer
+    /// literals are `integer` (Int32) and parameters `bigint`, so the
+    /// column is widened before it is read.
     fn single_i64(batches: &[RecordBatch]) -> i64 {
         let rows: Vec<i64> = batches
             .iter()
             .flat_map(|b| {
-                b.column(0)
+                datafusion::arrow::compute::cast(b.column(0), &DataType::Int64)
+                    .expect("integer column")
                     .as_primitive::<arrow_array::types::Int64Type>()
                     .values()
                     .iter()

@@ -130,10 +130,7 @@ async fn test_ctas_roundtrip() {
     // Verify column values
     let batch = &batches[0];
     let id_col = batch.column_by_name("id").expect("should have 'id' column");
-    let id_arr = id_col
-        .as_any()
-        .downcast_ref::<arrow_array::Int64Array>()
-        .expect("id column should be Int64");
+    let id_arr = crate::common::i64s(id_col);
     assert_eq!(id_arr.value(0), 1);
 
     let name_col = batch
@@ -3009,10 +3006,7 @@ async fn test_delete_with_where() {
     let mut ids: Vec<i64> = Vec::new();
     for batch in &batches {
         let id_col = batch.column_by_name("id").expect("should have 'id' column");
-        let id_arr = id_col
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("id should be Int64");
+        let id_arr = crate::common::i64s(id_col);
         for row in 0..batch.num_rows() {
             ids.push(id_arr.value(row));
         }
@@ -3146,18 +3140,13 @@ async fn test_update_with_where() {
     // Collect (id, val) pairs
     let mut rows: Vec<(i64, i64)> = Vec::new();
     for batch in &batches {
-        let id_col = batch
-            .column_by_name("id")
-            .expect("should have 'id' column")
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("id should be Int64");
-        let val_col = batch
-            .column_by_name("val")
-            .expect("should have 'val' column")
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("val should be Int64");
+        let id_col =
+            crate::common::i64s(batch.column_by_name("id").expect("should have 'id' column"));
+        let val_col = crate::common::i64s(
+            batch
+                .column_by_name("val")
+                .expect("should have 'val' column"),
+        );
         for row in 0..batch.num_rows() {
             rows.push((id_col.value(row), val_col.value(row)));
         }
@@ -3230,18 +3219,13 @@ async fn test_update_all_rows() {
     // Collect (id, val) pairs
     let mut rows: Vec<(i64, i64)> = Vec::new();
     for batch in &batches {
-        let id_col = batch
-            .column_by_name("id")
-            .expect("should have 'id' column")
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("id should be Int64");
-        let val_col = batch
-            .column_by_name("val")
-            .expect("should have 'val' column")
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("val should be Int64");
+        let id_col =
+            crate::common::i64s(batch.column_by_name("id").expect("should have 'id' column"));
+        let val_col = crate::common::i64s(
+            batch
+                .column_by_name("val")
+                .expect("should have 'val' column"),
+        );
         for row in 0..batch.num_rows() {
             rows.push((id_col.value(row), val_col.value(row)));
         }
@@ -3335,12 +3319,8 @@ async fn test_merge_insert_and_update() {
 
     let mut rows: Vec<(i64, String)> = Vec::new();
     for batch in &batches {
-        let id_col = batch
-            .column_by_name("id")
-            .expect("should have 'id' column")
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("id should be Int64");
+        let id_col =
+            crate::common::i64s(batch.column_by_name("id").expect("should have 'id' column"));
         let val_col = crate::common::utf8(
             batch
                 .column_by_name("val")
@@ -3450,12 +3430,8 @@ async fn test_merge_delete_matched() {
 
     let mut ids: Vec<i64> = Vec::new();
     for batch in &batches {
-        let id_col = batch
-            .column_by_name("id")
-            .expect("should have 'id' column")
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("id should be Int64");
+        let id_col =
+            crate::common::i64s(batch.column_by_name("id").expect("should have 'id' column"));
         for row in 0..batch.num_rows() {
             ids.push(id_col.value(row));
         }
@@ -3784,12 +3760,8 @@ async fn test_delete_multiple_data_files() {
 
     let mut ids: Vec<i64> = Vec::new();
     for batch in &batches {
-        let id_col = batch
-            .column_by_name("id")
-            .expect("should have 'id' column")
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("id should be Int64");
+        let id_col =
+            crate::common::i64s(batch.column_by_name("id").expect("should have 'id' column"));
         for row in 0..batch.num_rows() {
             ids.push(id_col.value(row));
         }
@@ -3902,18 +3874,13 @@ async fn test_update_multiple_data_files() {
 
     let mut rows: Vec<(i64, i64)> = Vec::new();
     for batch in &batches {
-        let id_col = batch
-            .column_by_name("id")
-            .expect("should have 'id' column")
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("id should be Int64");
-        let val_col = batch
-            .column_by_name("val")
-            .expect("should have 'val' column")
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("val should be Int64");
+        let id_col =
+            crate::common::i64s(batch.column_by_name("id").expect("should have 'id' column"));
+        let val_col = crate::common::i64s(
+            batch
+                .column_by_name("val")
+                .expect("should have 'val' column"),
+        );
         for row in 0..batch.num_rows() {
             rows.push((id_col.value(row), val_col.value(row)));
         }
@@ -3956,12 +3923,7 @@ async fn txn_ids(
         .unwrap_or_else(|e| panic!("SELECT from {table}: {e}"));
     let mut ids = Vec::new();
     for batch in &batches {
-        let col = batch
-            .column_by_name("id")
-            .expect("id column")
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("id should be Int64");
+        let col = crate::common::i64s(batch.column_by_name("id").expect("id column"));
         ids.extend((0..batch.num_rows()).map(|i| col.value(i)));
     }
     ids

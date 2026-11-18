@@ -13,7 +13,7 @@
 //! which aborts the whole test process with SIGABRT rather than failing one
 //! test. 32 MiB is comfortable.
 
-use arrow_array::{Array, Int64Array, StringArray};
+use arrow_array::{Array, StringArray};
 use std::collections::HashMap;
 
 async fn exec(
@@ -33,12 +33,7 @@ async fn scalar_i64(
     sql: &str,
 ) -> i64 {
     let batches = exec(handler, session, sql).await;
-    batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("Int64Array")
-        .value(0)
+    crate::common::i64s(batches[0].column(0)).value(0)
 }
 
 async fn snapshot_count(
