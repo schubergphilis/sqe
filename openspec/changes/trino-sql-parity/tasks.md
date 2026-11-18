@@ -35,7 +35,7 @@
 
 ## 6. Missing functions
 
-- [ ] 6.1 Math and statistics (`is_nan`, `is_finite`, `normal_cdf`, `width_bucket`, `beta_cdf`, ...)
+- [x] 6.1 Math and statistics (`is_nan`, `is_finite`, `normal_cdf`, `width_bucket`, `beta_cdf`, ...) (`fix/trino-math-functions`; real-typed `corr`/`covar_*`/`regr_*` open)
 - [ ] 6.2 String, binary and hash (`levenshtein_distance`, `crc32`, `xxhash64`, `hmac_*`, `to_base32`, ...)
   - [x] 6.2a Binary and hash (`fix/trino-binary-functions`; `spooky_hash_v2_*` open)
   - [ ] 6.2b String and URL

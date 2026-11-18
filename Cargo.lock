@@ -7543,6 +7543,7 @@ dependencies = [
  "datafusion-functions-json",
  "hex",
  "hmac",
+ "libm",
  "md-5 0.11.0",
  "murmur3",
  "regex",

@@ -272,6 +272,129 @@ impl Accumulator for ArgExtremumAccumulator {
     }
 }
 
+// ─── geometric_mean(x) ───────────────────────────────────────────────────────
+
+/// Trino `geometric_mean(double) -> double`: `exp(avg(ln(x)))`. NULL inputs
+/// are skipped and an empty group gives NULL. A negative input gives NaN and a
+/// zero input gives 0, as `ln` does in Trino. The real-input variant (which
+/// returns real) is not implemented: real input is widened to double.
+#[derive(Debug)]
+pub(crate) struct GeometricMean {
+    signature: Signature,
+}
+
+impl GeometricMean {
+    pub(crate) fn udaf() -> AggregateUDF {
+        AggregateUDF::from(Self {
+            signature: Signature::exact(vec![DataType::Float64], Volatility::Immutable),
+        })
+    }
+}
+
+impl PartialEq for GeometricMean {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for GeometricMean {}
+
+impl std::hash::Hash for GeometricMean {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        "geometric_mean".hash(state);
+    }
+}
+
+impl AggregateUDFImpl for GeometricMean {
+    fn name(&self) -> &str {
+        "geometric_mean"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Float64)
+    }
+
+    fn accumulator(&self, _acc_args: AccumulatorArgs) -> DFResult<Box<dyn Accumulator>> {
+        Ok(Box::new(GeometricMeanAccumulator::default()))
+    }
+
+    fn state_fields(&self, args: StateFieldsArgs) -> DFResult<Vec<FieldRef>> {
+        Ok(vec![
+            Arc::new(Field::new(
+                format_state_name(args.name, "log_sum"),
+                DataType::Float64,
+                true,
+            )),
+            Arc::new(Field::new(
+                format_state_name(args.name, "count"),
+                DataType::Int64,
+                true,
+            )),
+        ])
+    }
+}
+
+#[derive(Debug, Default)]
+struct GeometricMeanAccumulator {
+    log_sum: f64,
+    count: i64,
+}
+
+impl Accumulator for GeometricMeanAccumulator {
+    fn update_batch(&mut self, args: &[ArrayRef]) -> DFResult<()> {
+        use arrow::array::AsArray;
+        let arr = args[0]
+            .as_primitive_opt::<arrow::datatypes::Float64Type>()
+            .ok_or_else(|| {
+                DataFusionError::Plan("geometric_mean expected a Float64 input".to_string())
+            })?;
+        for value in arr.iter().flatten() {
+            self.log_sum += value.ln();
+            self.count += 1;
+        }
+        Ok(())
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> DFResult<()> {
+        use arrow::array::{Array, AsArray};
+        let sums = states[0].as_primitive_opt::<arrow::datatypes::Float64Type>();
+        let counts = states[1].as_primitive_opt::<arrow::datatypes::Int64Type>();
+        let (Some(sums), Some(counts)) = (sums, counts) else {
+            return Err(DataFusionError::Plan(
+                "geometric_mean state has the wrong types".to_string(),
+            ));
+        };
+        for i in 0..sums.len() {
+            if sums.is_valid(i) && counts.is_valid(i) {
+                self.log_sum += sums.value(i);
+                self.count += counts.value(i);
+            }
+        }
+        Ok(())
+    }
+
+    fn state(&mut self) -> DFResult<Vec<ScalarValue>> {
+        Ok(vec![
+            ScalarValue::Float64(Some(self.log_sum)),
+            ScalarValue::Int64(Some(self.count)),
+        ])
+    }
+
+    fn evaluate(&mut self) -> DFResult<ScalarValue> {
+        Ok(ScalarValue::Float64(
+            (self.count > 0).then(|| (self.log_sum / self.count as f64).exp()),
+        ))
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -229,6 +229,9 @@ csv = "1"
 # thread_rng -> rng, Rng -> RngExt.
 rand = "0.10"
 ring = "0.17"
+# erfc / lgamma for the Trino distribution functions (sqe-trino-functions).
+# Already in Cargo.lock through num-traits.
+libm = "0.2"
 
 # Crypto
 sha2 = "0.11"

@@ -25,8 +25,10 @@ pub mod higher_order;
 pub mod histogram;
 mod json_cast;
 pub mod map_aggregates;
+pub mod math_fns;
 pub mod overrides;
 pub mod scalar_fns;
+pub mod stats_fns;
 pub mod trino_functions;
 pub mod trino_functions_ext;
 

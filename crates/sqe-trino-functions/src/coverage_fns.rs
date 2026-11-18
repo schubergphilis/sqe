@@ -31,6 +31,17 @@ pub fn register_coverage_fns(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(ElementAt));
     ctx.register_udf(ScalarUDF::from(Contains));
     ctx.register_udf(ScalarUDF::from(CosineSimilarity::default()));
+    // Trino semantics: DataFusion's `cosine_distance` returns a small non-zero
+    // value for identical vectors; this one is exactly `1 - cosine_similarity`.
+    ctx.register_udf(ScalarUDF::from(CosineSimilarity {
+        distance: Default::default(),
+        as_distance: true,
+    }));
+    // Trino's `euclidean_distance` is DataFusion's `array_distance`.
+    ctx.register_udf(
+        ScalarUDF::from(datafusion::functions_nested::distance::ArrayDistance::new())
+            .with_aliases(["euclidean_distance"]),
+    );
 }
 
 // ─── count_if(pred) ──────────────────────────────────────────────────────────
@@ -341,11 +352,24 @@ impl ScalarUDFImpl for Contains {
 #[derive(Debug, Default, PartialEq, Eq, Hash)]
 struct CosineSimilarity {
     distance: datafusion::functions_nested::cosine_distance::CosineDistance,
+    /// Return `1 - similarity` (registered as `cosine_distance`).
+    as_distance: bool,
 }
 
 impl ScalarUDFImpl for CosineSimilarity {
     fn name(&self) -> &str {
-        "cosine_similarity"
+        if self.as_distance {
+            "cosine_distance"
+        } else {
+            "cosine_similarity"
+        }
+    }
+    fn aliases(&self) -> &[String] {
+        if self.as_distance {
+            self.distance.aliases()
+        } else {
+            &[]
+        }
     }
     fn signature(&self) -> &Signature {
         self.distance.signature()
@@ -364,7 +388,7 @@ impl ScalarUDFImpl for CosineSimilarity {
             ));
         };
         let (a, b) = (a.to_array(rows)?, b.to_array(rows)?);
-        let out = match (a.data_type(), b.data_type()) {
+        let mut out = match (a.data_type(), b.data_type()) {
             (DataType::List(_), DataType::List(_)) => cosine_similarity_of::<i32>(&a, &b)?,
             (DataType::LargeList(_), DataType::LargeList(_)) => {
                 cosine_similarity_of::<i64>(&a, &b)?
@@ -375,6 +399,9 @@ impl ScalarUDFImpl for CosineSimilarity {
                 )));
             }
         };
+        if self.as_distance {
+            out = out.unary(|s| 1.0 - s);
+        }
         Ok(ColumnarValue::Array(Arc::new(out) as ArrayRef))
     }
 }
@@ -416,7 +443,16 @@ fn cosine_similarity_of<O: arrow::array::OffsetSizeTrait>(
         if xx == 0.0 || yy == 0.0 {
             out.append_null();
         } else {
-            out.append_value(dot / (xx.sqrt() * yy.sqrt()));
+            // sqrt(xx*yy) first: for identical vectors it is exactly |x|, so
+            // the similarity is exactly 1 (and the distance exactly 0). The
+            // split form is the fallback when the product over/underflows.
+            let product = (xx * yy).sqrt();
+            let norm = if product.is_finite() && product > 0.0 {
+                product
+            } else {
+                xx.sqrt() * yy.sqrt()
+            };
+            out.append_value((dot / norm).clamp(-1.0, 1.0));
         }
     }
     Ok(out.finish())
