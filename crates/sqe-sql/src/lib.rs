@@ -15,6 +15,7 @@ pub mod hive_partitions;
 pub mod identifier_case;
 pub mod identifier_fields;
 pub mod insert_paren_query;
+pub mod json_arrow;
 pub mod lateral_alias;
 pub mod merge_star;
 pub mod metadata;
@@ -55,11 +56,12 @@ pub use ctas_compat::rewrite_ctas_compat;
 pub use ddl::{try_parse_ref_ddl, BranchRetention, RefDdl};
 pub use ddl_types::rewrite_trino_ddl_types;
 pub use front_door::{
-    classify_normalized, ExecutionDialect, NormalizedSql, SqlFrontDoor, WireDialect,
-    EXECUTION_DIALECT,
+    classify_normalized, ArrowExecutionDialect, ExecutionDialect, NormalizedSql, SqlFrontDoor,
+    WireDialect, EXECUTION_DIALECT,
 };
 pub use identifier_fields::{try_parse_identifier_fields, IdentifierFieldsDdl};
 pub use insert_paren_query::rewrite_insert_paren_query;
+pub use json_arrow::promote_lambda_arguments;
 pub use lateral_alias::inline_lateral_alias;
 pub use merge_star::{rewrite_merge_star, MERGE_STAR_MARKER};
 pub use metadata::{

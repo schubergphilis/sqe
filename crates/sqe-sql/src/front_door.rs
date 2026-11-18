@@ -66,6 +66,14 @@ pub const EXECUTION_DIALECT: &str = "DuckDB";
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ExecutionDialect;
 
+/// [`ExecutionDialect`] without lambda syntax, so `payload -> 'k'` on a bare
+/// column parses as the JSON arrow it is (#913). The planner parses with
+/// this one and promotes `x -> ...` to a lambda only where a higher-order
+/// function takes it ([`crate::json_arrow::promote_lambda_arguments`]).
+/// Everything else matches [`ExecutionDialect`]: both come from one macro.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ArrowExecutionDialect;
+
 macro_rules! delegate_to_duckdb {
     ($($name:ident),* $(,)?) => {
         $(fn $name(&self) -> bool {
@@ -74,47 +82,57 @@ macro_rules! delegate_to_duckdb {
     };
 }
 
-impl sqlparser::dialect::Dialect for ExecutionDialect {
-    fn dialect(&self) -> std::any::TypeId {
-        std::any::TypeId::of::<sqlparser::dialect::DuckDbDialect>()
-    }
+macro_rules! execution_dialect {
+    ($dialect:ty, lambdas: $lambdas:expr) => {
+        impl sqlparser::dialect::Dialect for $dialect {
+            fn dialect(&self) -> std::any::TypeId {
+                std::any::TypeId::of::<sqlparser::dialect::DuckDbDialect>()
+            }
 
-    fn is_identifier_start(&self, ch: char) -> bool {
-        sqlparser::dialect::DuckDbDialect.is_identifier_start(ch)
-    }
+            fn is_identifier_start(&self, ch: char) -> bool {
+                sqlparser::dialect::DuckDbDialect.is_identifier_start(ch)
+            }
 
-    fn is_identifier_part(&self, ch: char) -> bool {
-        sqlparser::dialect::DuckDbDialect.is_identifier_part(ch)
-    }
+            fn is_identifier_part(&self, ch: char) -> bool {
+                sqlparser::dialect::DuckDbDialect.is_identifier_part(ch)
+            }
 
-    fn supports_pipe_operator(&self) -> bool {
-        true
-    }
+            fn supports_pipe_operator(&self) -> bool {
+                true
+            }
 
-    delegate_to_duckdb!(
-        supports_trailing_commas,
-        supports_filter_during_aggregation,
-        supports_group_by_expr,
-        supports_bitwise_shift_operators,
-        supports_named_fn_args_with_eq_operator,
-        supports_named_fn_args_with_assignment_operator,
-        supports_dictionary_syntax,
-        support_map_literal_syntax,
-        supports_lambda_functions,
-        allow_extract_single_quotes,
-        supports_explain_with_utility_options,
-        supports_load_extension,
-        supports_array_typedef_with_brackets,
-        supports_from_first_select,
-        supports_order_by_all,
-        supports_select_wildcard_exclude,
-        supports_notnull_operator,
-        supports_install,
-        supports_detach,
-        supports_select_wildcard_replace,
-        supports_comma_separated_trim,
-    );
+            fn supports_lambda_functions(&self) -> bool {
+                $lambdas
+            }
+
+            delegate_to_duckdb!(
+                supports_trailing_commas,
+                supports_filter_during_aggregation,
+                supports_group_by_expr,
+                supports_bitwise_shift_operators,
+                supports_named_fn_args_with_eq_operator,
+                supports_named_fn_args_with_assignment_operator,
+                supports_dictionary_syntax,
+                support_map_literal_syntax,
+                allow_extract_single_quotes,
+                supports_explain_with_utility_options,
+                supports_load_extension,
+                supports_array_typedef_with_brackets,
+                supports_from_first_select,
+                supports_order_by_all,
+                supports_select_wildcard_exclude,
+                supports_notnull_operator,
+                supports_install,
+                supports_detach,
+                supports_select_wildcard_replace,
+                supports_comma_separated_trim,
+            );
+        }
+    };
 }
+
+execution_dialect!(ExecutionDialect, lambdas: sqlparser::dialect::DuckDbDialect.supports_lambda_functions());
+execution_dialect!(ArrowExecutionDialect, lambdas: false);
 
 /// The protocol a statement arrived on.
 ///
