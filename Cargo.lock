@@ -7556,7 +7556,6 @@ dependencies = [
  "tokio",
  "twox-hash",
  "unicode-normalization",
- "url",
  "workspace-hack",
 ]
 
