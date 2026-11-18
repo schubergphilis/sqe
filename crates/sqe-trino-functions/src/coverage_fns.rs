@@ -348,7 +348,8 @@ impl ScalarUDFImpl for Contains {
 ///
 /// NULL when either array is NULL, holds a NULL element, or is all zeros
 /// (Trino raises on NULL elements). Arrays of different length are an error,
-/// as in Trino. Trino's `map(varchar, double)` form is not supported.
+/// as in Trino. Also accepts Trino's `map(varchar, double)` form, where a key
+/// missing from one map counts as 0.
 #[derive(Debug, Default, PartialEq, Eq, Hash)]
 struct CosineSimilarity {
     distance: datafusion::functions_nested::cosine_distance::CosineDistance,
@@ -375,6 +376,11 @@ impl ScalarUDFImpl for CosineSimilarity {
         self.distance.signature()
     }
     fn coerce_types(&self, arg_types: &[DataType]) -> DFResult<Vec<DataType>> {
+        // The `map(varchar, double)` overload is read as-is and cast per
+        // batch; only the array form needs `cosine_distance`'s coercion.
+        if let [DataType::Map(..), DataType::Map(..)] = arg_types {
+            return Ok(arg_types.to_vec());
+        }
         self.distance.coerce_types(arg_types)
     }
     fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
@@ -389,6 +395,7 @@ impl ScalarUDFImpl for CosineSimilarity {
         };
         let (a, b) = (a.to_array(rows)?, b.to_array(rows)?);
         let mut out = match (a.data_type(), b.data_type()) {
+            (DataType::Map(..), DataType::Map(..)) => cosine_similarity_of_maps(&a, &b)?,
             (DataType::List(_), DataType::List(_)) => cosine_similarity_of::<i32>(&a, &b)?,
             (DataType::LargeList(_), DataType::LargeList(_)) => {
                 cosine_similarity_of::<i64>(&a, &b)?
@@ -404,6 +411,79 @@ impl ScalarUDFImpl for CosineSimilarity {
         }
         Ok(ColumnarValue::Array(Arc::new(out) as ArrayRef))
     }
+}
+
+/// Row-wise cosine similarity of two `map(varchar, double)` columns. A key
+/// absent from one map counts as 0 there. NULL when either map is NULL, a
+/// value is NULL, or a map has no non-zero value.
+fn cosine_similarity_of_maps(a: &ArrayRef, b: &ArrayRef) -> DFResult<arrow::array::Float64Array> {
+    use arrow::array::{AsArray, Float64Array};
+    use arrow::datatypes::Float64Type;
+    use std::collections::HashMap;
+
+    // Flat keys and values of one map column, cast to varchar and double.
+    let flat = |arr: &ArrayRef| -> DFResult<(ArrayRef, ArrayRef)> {
+        let map = arr
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .ok_or_else(|| DataFusionError::Plan("cosine_similarity: expected a map".into()))?;
+        let keys = arrow::compute::cast(map.keys(), &DataType::Utf8)?;
+        let values = arrow::compute::cast(map.values(), &DataType::Float64)?;
+        Ok((keys, values))
+    };
+    let (a_keys, a_vals) = flat(a)?;
+    let (b_keys, b_vals) = flat(b)?;
+    let (a_map, b_map) = (a.as_map(), b.as_map());
+    let (a_keys, b_keys) = (a_keys.as_string::<i32>(), b_keys.as_string::<i32>());
+    let (a_vals, b_vals) = (
+        a_vals.as_primitive::<Float64Type>(),
+        b_vals.as_primitive::<Float64Type>(),
+    );
+
+    let mut out = Float64Array::builder(a_map.len());
+    for row in 0..a_map.len() {
+        if a_map.is_null(row) || b_map.is_null(row) {
+            out.append_null();
+            continue;
+        }
+        let (a_off, b_off) = (a_map.value_offsets(), b_map.value_offsets());
+        let (a_range, b_range) = (
+            a_off[row] as usize..a_off[row + 1] as usize,
+            b_off[row] as usize..b_off[row + 1] as usize,
+        );
+        if a_range
+            .clone()
+            .any(|i| a_vals.is_null(i) || a_keys.is_null(i))
+            || b_range
+                .clone()
+                .any(|i| b_vals.is_null(i) || b_keys.is_null(i))
+        {
+            out.append_null();
+            continue;
+        }
+        let mut b_by_key: HashMap<&str, f64> = HashMap::new();
+        for i in b_range.clone() {
+            b_by_key.insert(b_keys.value(i), b_vals.value(i));
+        }
+        let (mut dot, mut xx, mut yy) = (0.0, 0.0, 0.0);
+        for i in a_range {
+            let x = a_vals.value(i);
+            xx += x * x;
+            if let Some(y) = b_by_key.get(a_keys.value(i)) {
+                dot += x * y;
+            }
+        }
+        for i in b_range {
+            let y = b_vals.value(i);
+            yy += y * y;
+        }
+        if xx == 0.0 || yy == 0.0 {
+            out.append_null();
+        } else {
+            out.append_value(dot / (xx.sqrt() * yy.sqrt()));
+        }
+    }
+    Ok(out.finish())
 }
 
 /// Row-wise cosine similarity of two `Float64` lists (after coercion).
@@ -608,6 +688,26 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("same length"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn cosine_similarity_of_maps_matches_trino() {
+        // One shared key of two: dot = 1, norms = sqrt(5) each.
+        let got = one_f64(
+            "SELECT cosine_similarity(map(['a', 'b'], [1.0, 2.0]), map(['a', 'c'], [1.0, 2.0]))",
+        )
+        .await;
+        assert!((got.unwrap() - 0.2).abs() < 1e-12);
+        // Identical maps, and a column-fed multi-row case.
+        let got = one_f64(
+            "SELECT sum(cosine_similarity(m, m)) FROM (VALUES (map(['x'], [3.0])), \
+             (map(['y', 'z'], [1.0, 1.0]))) t(m)",
+        )
+        .await;
+        assert!((got.unwrap() - 2.0).abs() < 1e-12);
+        // A map with no non-zero value gives NULL.
+        let got = one_f64("SELECT cosine_similarity(map(['a'], [0.0]), map(['a'], [1.0]))").await;
+        assert_eq!(got, None);
     }
 
     #[tokio::test]

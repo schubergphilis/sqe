@@ -203,7 +203,7 @@
       ]
     },
     "sqe-trino-functions": {
-      "lines": 13250,
+      "lines": 14250,
       "deps": [
         "sqe-trino-protocol"
       ]

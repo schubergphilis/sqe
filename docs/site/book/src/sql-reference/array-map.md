@@ -33,7 +33,7 @@ DataFusion's `datafusion-functions-nested` crate ships ~40 array and map helpers
 | `array_append(a, elem)` | `datafusion-builtin` | Add to end. | yes | yes | yes | yes |
 | `array_prepend(elem, a)` | `datafusion-builtin` | Add to start. | yes | - | yes | yes |
 | `array_concat(a1, a2, ...)` | `datafusion-builtin` | Variadic concat. | yes | yes | yes | yes |
-| `array_remove(a, elem)` | `datafusion-builtin` | Remove first occurrence. | - | - | - | yes |
+| `array_remove(a, elem)` | `sqe-trino-functions` | Remove every occurrence, as Trino does (DataFusion's built-in removes only the first). Alias `list_remove`. NULL element removes NULLs. | yes | - | - | - |
 | `array_remove_all(a, elem)` | `datafusion-builtin` | Remove all occurrences. | yes | - | - | yes |
 | `array_replace(a, from, to)` | `datafusion-builtin` | Replace first match. | yes | - | yes | yes |
 | `array_replace_all(a, from, to)` | `datafusion-builtin` | Replace all matches. | - | - | - | yes |
@@ -44,6 +44,13 @@ DataFusion's `datafusion-functions-nested` crate ships ~40 array and map helpers
 | `array_pop_front(a)` / `array_pop_back(a)` | `datafusion-builtin` | Remove first / last. | yes | - | - | yes |
 | `array_resize(a, n [, fill])` | `datafusion-builtin` | Truncate or pad to length n. | - | - | - | yes |
 | `array_flatten(a)` / `flatten(a)` | `datafusion-builtin` | One level of flattening. | yes | yes | yes | yes |
+| `array_first(a)` / `array_last(a)` | `sqe-trino-functions` | First / last element, NULL for an empty array. `array_first` also keeps DataFusion's lambda form. Aliases `list_first`, `list_last`. | yes | - | - | yes |
+| `zip(a1, a2 [, ...])` | `sqe-trino-functions` | `array(row(T1, T2, ...))` with anonymous row fields, up to 5 arrays. Shorter arrays are padded with NULL. | yes | - | - | - |
+| `zip_with(a1, a2, (x, y) -> expr)` | `sqe-trino-functions` | Lambda over two arrays, padded with NULL to the longer one. | yes | - | - | - |
+| `array_histogram(a)` | `sqe-trino-functions` | `map(T, bigint)` of element counts, NULL elements ignored. | yes | - | - | - |
+| `contains_sequence(a, sub)` | `sqe-trino-functions` | True if `sub` occurs as a contiguous run in `a`. | yes | - | - | - |
+| `ngrams(a, n)` | `sqe-trino-functions` | `array(array(T))` of n-element windows. An array shorter than n gives one window holding the whole array. | yes | - | - | - |
+| `shuffle(a)` | `sqe-trino-functions` | Random permutation (volatile). | yes | - | - | - |
 
 ## Array set operations
 
@@ -70,7 +77,7 @@ An embedding can live in an ordinary Iceberg `list<float>` column (`array(real)`
 | Function | Origin | Notes |
 |---|---|---|
 | `cosine_distance(a, b)` | `datafusion-builtin` | `1 - cos(angle)`: 0 for the same direction, 2 for opposite. |
-| `cosine_similarity(a, b)` | `sqe-trino-functions` | Trino's `cos(angle)`: 1 for the same direction, 0 for orthogonal, -1 for opposite. Also NULL when an array holds a NULL element (Trino raises an error) or is all zeros. Arrays only; Trino's `map(varchar, double)` form is not supported. |
+| `cosine_similarity(a, b)` | `sqe-trino-functions` | Trino's `cos(angle)`: 1 for the same direction, 0 for orthogonal, -1 for opposite. Also NULL when an array holds a NULL element (Trino raises an error) or is all zeros. Also takes two `map(varchar, double)` values (a key missing from one map counts as 0). |
 | `inner_product(a, b)` | `datafusion-builtin` | Dot product. |
 | `array_distance(a, b)` | `datafusion-builtin` | Euclidean distance. |
 
@@ -122,6 +129,15 @@ FROM orders;
 | `map_extract(m, key)` | `datafusion-builtin` | Lookup. NULL if missing. Also accessible via `m[key]`. | yes (`element_at`) | yes (`get`) | yes (`element_at`) | yes (`element_at`) |
 | `cardinality(m)` | `datafusion-builtin` | Number of keys. | yes | yes | yes | yes |
 | `m['key']` | `datafusion-builtin` | Subscript syntax for map lookup. | yes | yes | yes | yes |
+| `map_entries(m)` | `sqe-trino-functions` | `array(row(K, V))` with anonymous row fields, as Trino returns it (DataFusion's names them `key` / `value`). | yes | - | - | - |
+| `map_concat(m1, m2, ...)` | `sqe-trino-functions` | Merge maps; the later map wins on a duplicate key. NULL if any argument is NULL. | yes | - | - | - |
+| `map_filter(m, (k, v) -> bool)` | `sqe-trino-functions` | Lambda. Keeps entries where the lambda is true. | yes | - | - | - |
+| `transform_keys(m, (k, v) -> k2)` | `sqe-trino-functions` | Lambda. Errors on a NULL or duplicate new key. | yes | - | - | - |
+| `transform_values(m, (k, v) -> v2)` | `sqe-trino-functions` | Lambda. The value type follows the lambda. | yes | - | - | - |
+| `map_from_entries(a)` | `sqe-trino-functions` | `map(K, V)` from `array(row(K, V))`. Errors on a NULL key, NULL entry or duplicate key. | yes | - | - | - |
+| `multimap_from_entries(a)` | `sqe-trino-functions` | `map(K, array(V))`, grouping values per key in input order. | yes | - | - | - |
+| `split_to_map(s, entry_delim, kv_delim)` | `sqe-trino-functions` | `map(varchar, varchar)`. Errors on a duplicate key or an entry without exactly one `kv_delim`. | yes | - | - | - |
+| `split_to_multimap(s, entry_delim, kv_delim)` | `sqe-trino-functions` | `map(varchar, array(varchar))`. | yes | - | - | - |
 
 ## Aggregates that build maps / arrays
 
@@ -216,5 +232,6 @@ SELECT reduce(ARRAY[1, 2, 3, 4], 0, (s, x) -> s + x, s -> s);     -- 10
 
 ## What is NOT registered
 
-- **`zip(a, b)`** (parallel-iterate two arrays). Use `unnest` against an indexed pair instead.
+- **`array_sort(a, (x, y) -> ...)`** (comparator form) and **`reduce_agg`**. The one-argument `array_sort` wins the name.
+- **`numeric_histogram`**. Trino's streaming algorithm cannot be reproduced exactly.
 - **Snowflake `flatten` table function** (with PATH and OUTER options). Use `UNNEST` directly.

@@ -43,7 +43,7 @@ use datafusion::logical_expr::{
 // ─── Shared helpers ────────────────────────────────────────────────────────
 
 /// Build the `MAP<K, V>` DataType for the given key + value type pair.
-fn map_type_for(key_type: &DataType, value_type: &DataType) -> DataType {
+pub(crate) fn map_type_for(key_type: &DataType, value_type: &DataType) -> DataType {
     let entries_struct = DataType::Struct(Fields::from(vec![
         Field::new("key", key_type.clone(), false),
         Field::new("value", value_type.clone(), true),
@@ -58,7 +58,7 @@ fn map_type_for(key_type: &DataType, value_type: &DataType) -> DataType {
 /// Build the state-field shape `List<Struct{key, value}>` used by
 /// `map_agg` and `map_union`. `value_type` is the leaf value type for
 /// these flat aggregates.
-fn flat_state_field(name: String, key_type: DataType, value_type: DataType) -> FieldRef {
+pub(crate) fn flat_state_field(name: String, key_type: DataType, value_type: DataType) -> FieldRef {
     let entries_struct = DataType::Struct(Fields::from(vec![
         Field::new("key", key_type, false),
         Field::new("value", value_type, true),
@@ -72,7 +72,7 @@ fn flat_state_field(name: String, key_type: DataType, value_type: DataType) -> F
 
 /// Materialize a single-row `MapArray` from typed keys + values arrays.
 /// Caller is responsible for ensuring keys.len() == values.len().
-fn build_map_array(
+pub(crate) fn build_map_array(
     keys: ArrayRef,
     values: ArrayRef,
     key_type: &DataType,
@@ -111,7 +111,7 @@ fn build_map_array(
 
 /// Materialize keys / values arrays from a Vec<(ScalarValue, ScalarValue)>.
 /// Empty input produces zero-row arrays of the right types.
-fn materialize_kv_arrays(
+pub(crate) fn materialize_kv_arrays(
     entries: &[(ScalarValue, ScalarValue)],
     key_type: &DataType,
     value_type: &DataType,
@@ -684,7 +684,7 @@ fn decompose_map_type(map_type: &DataType) -> DFResult<(DataType, DataType)> {
 /// Walk the merge-state ListArray of `Struct{key, value}` and call `f`
 /// on every (key, value) pair. Used by `map_agg`, `multimap_agg`, and
 /// `map_union`'s `merge_batch` since their state shape is identical.
-fn merge_flat_state(
+pub(crate) fn merge_flat_state(
     states: &[ArrayRef],
     mut f: impl FnMut(ScalarValue, ScalarValue),
 ) -> DFResult<()> {

@@ -14,6 +14,7 @@ Functions used in `GROUP BY` queries and `OVER` clauses. SQE inherits ~40 aggreg
 | `avg(expr)` / `mean(expr)` | `datafusion-builtin` | Arithmetic mean. NULL-skipping. | `avg` | `avg` | `avg` / `mean` | `avg` / `mean` |
 | `min(expr)` | `datafusion-builtin` | Minimum. | `min` | `min` | `min` | `min` |
 | `max(expr)` | `datafusion-builtin` | Maximum. | `max` | `max` | `max` | `max` |
+| `min(expr, n)` / `max(expr, n)` | `sqe-trino-functions` | The n smallest / largest non-NULL values as `array(T)`, best first. Write `max(x, n)`; a call with two arguments, no `DISTINCT` and no `OVER` plans as the separate aggregate `max_n(x, n)` / `min_n(x, n)`, so one-argument `max` / `min` are untouched. `n` is a constant from 1 to 10000. NULL for a group with no values. Not available as a window function. `agg_fns.rs` | `min` / `max` | - | - | - |
 | `median(expr)` | `datafusion-builtin` | Exact median. Slower than `approx_median` on big inputs. | - | `median` | `median` | `median` |
 
 ## Statistical / regression
@@ -32,6 +33,8 @@ Functions used in `GROUP BY` queries and `OVER` clauses. SQE inherits ~40 aggreg
 | `regr_count`, `regr_sxx`, `regr_syy`, `regr_sxy`, `regr_avgx`, `regr_avgy` | `datafusion-builtin` | Regression sums and counts. | yes | yes | - | yes |
 
 ## Distinct and approximation
+
+`approx_most_frequent(buckets, value, capacity)` returns `map(T, bigint)`: the `buckets` most frequent values with their counts. SQE counts exactly and ignores `capacity`, so the result matches Trino whenever the group has at most `capacity` distinct values and is more accurate otherwise. `checksum(x)` is listed under [Encoding and URL](./encoding-url.md).
 
 | Function | Origin | Notes | Trino | Snowflake | Spark SQL | DuckDB |
 |---|---|---|---|---|---|---|
@@ -63,6 +66,8 @@ Functions used in `GROUP BY` queries and `OVER` clauses. SQE inherits ~40 aggreg
 | `nth_value(expr, n [order by ...])` | `datafusion-builtin` | Nth row's value. | `nth_value` | `nth_value` | `nth_value` | `nth_value` |
 | `max_by(value, key)` | `sqe-trino-functions` | `value` from the row with the max `key`. `trino_functions.rs:177` | `max_by` | `max_by` | - | `arg_max` |
 | `min_by(value, key)` | `sqe-trino-functions` | `value` from the row with the min `key`. `trino_functions.rs:178` | `min_by` | `min_by` | - | `arg_min` |
+| `max_by(value, key, n)` | `sqe-trino-functions` | The `value` of the n rows with the largest `key`, as `array(T)`, best first. Rows with a NULL `key` are skipped. `n` is a constant from 1 to 10000. | `max_by` | - | - | - |
+| `min_by(value, key, n)` | `sqe-trino-functions` | The `value` of the n rows with the smallest `key`, as `array(T)`. | `min_by` | - | - | - |
 | `arbitrary(expr)` | `sqe-trino-functions` | Any one non-NULL value. Trino-named alias of `any_value`. `trino_functions.rs:191` | `arbitrary` | `any_value` | `any_value` | `any_value` |
 
 ## Collection-building

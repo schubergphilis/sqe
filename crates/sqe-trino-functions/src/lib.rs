@@ -16,7 +16,9 @@
 //! its transitive deps (unicode-normalization, rust-stemmers, chrono-tz,
 //! regex). See openspec change `split-trino-functions`.
 
+pub mod agg_fns;
 pub mod aggregates;
+pub mod array_fns;
 pub mod binary_fns;
 pub mod central_moments;
 pub mod coverage_fns;
@@ -26,6 +28,7 @@ pub mod higher_order;
 pub mod histogram;
 mod json_cast;
 pub mod map_aggregates;
+pub mod map_fns;
 pub mod math_fns;
 pub mod overrides;
 pub mod scalar_fns;

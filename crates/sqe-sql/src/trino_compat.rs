@@ -221,6 +221,11 @@ pub fn apply_trino_compat(statements: &mut Vec<Statement>, source: &str) -> bool
     // `listagg` is touched; percentile_cont/percentile_disc keep WITHIN GROUP.
     // See #340.
     let has_within_group = lower.contains("within group");
+    // `max(` / `min(` -> rewrite_max_min_n: Trino's `max(x, n)` / `min(x, n)`
+    // (the n largest / smallest values as an array) are separate UDAFs named
+    // `max_n` / `min_n`, so DataFusion's one-argument max/min keep their
+    // planner rules. A query without either call skips the walk.
+    let has_max_min = lower.contains("max(") || lower.contains("min(");
     // `try(` -> rewrite_try_function: Trino's error-suppression wrapper is
     // lowered to TRY_CAST / NULLIF-guarded division. `try_cast(` does not
     // contain `try(`, so the control that already works skips the walk. See
@@ -267,6 +272,7 @@ pub fn apply_trino_compat(statements: &mut Vec<Statement>, source: &str) -> bool
         && !has_fetch
         && !has_binary_cast
         && !has_within_group
+        && !has_max_min
         && !has_try
         && !has_ordinality
     {
@@ -465,6 +471,9 @@ impl VisitorMut for TrinoCompatVisitor {
             self.rewrites += 1;
         }
         if rewrite_listagg_within_group(expr) {
+            self.rewrites += 1;
+        }
+        if rewrite_max_min_n(expr) {
             self.rewrites += 1;
         }
         if rewrite_try_function(expr) {
@@ -756,6 +765,42 @@ fn rewrite_listagg_within_group(expr: &mut Expr) -> bool {
         .clauses
         .push(FunctionArgumentClause::OrderBy(order_by));
     func.name = ObjectName::from(vec![Ident::new("string_agg")]);
+    true
+}
+
+/// Trino's `max(x, n)` / `min(x, n)` return the n largest / smallest values as
+/// an array. DataFusion's `max` / `min` take one argument, and planner rules
+/// (`single_distinct_to_groupby`, `is_reaggregatable`) re-aggregate anything
+/// named max/min by name, so the n-form lives in separate UDAFs `max_n` /
+/// `min_n`. This renames a call with exactly two unnamed arguments, no DISTINCT
+/// and no OVER clause. One-argument calls and window uses are left alone.
+/// Returns true if the rewrite fired.
+fn rewrite_max_min_n(expr: &mut Expr) -> bool {
+    let Expr::Function(func) = expr else {
+        return false;
+    };
+    let new_name = if function_name_is(func, "max") {
+        "max_n"
+    } else if function_name_is(func, "min") {
+        "min_n"
+    } else {
+        return false;
+    };
+    if func.over.is_some() {
+        return false;
+    }
+    let FunctionArguments::List(arg_list) = &func.args else {
+        return false;
+    };
+    let two_plain = arg_list.args.len() == 2
+        && arg_list
+            .args
+            .iter()
+            .all(|a| matches!(a, FunctionArg::Unnamed(FunctionArgExpr::Expr(_))));
+    if !two_plain || arg_list.duplicate_treatment.is_some() {
+        return false;
+    }
+    func.name = ObjectName::from(vec![Ident::new(new_name)]);
     true
 }
 
@@ -1862,6 +1907,29 @@ mod tests {
             out.to_ascii_lowercase().contains("to_json"),
             "WHERE-clause CAST should be rewritten: {out}"
         );
+    }
+
+    // ─── max(x, n) / min(x, n) -> max_n / min_n ────────────────────────────
+
+    #[test]
+    fn two_argument_max_min_become_max_n_min_n() {
+        let out = rewrite_trino_compat("SELECT max(x, 2), min(y, 3) FROM t");
+        assert!(out.contains("max_n(x, 2)"), "{out}");
+        assert!(out.contains("min_n(y, 3)"), "{out}");
+    }
+
+    #[test]
+    fn one_argument_max_min_are_untouched() {
+        let out = rewrite_trino_compat("SELECT max(x), min(y) FROM t");
+        assert!(out.contains("max(x)") && out.contains("min(y)"), "{out}");
+        assert!(!out.contains("max_n") && !out.contains("min_n"), "{out}");
+    }
+
+    #[test]
+    fn windowed_two_argument_max_is_untouched() {
+        let out = rewrite_trino_compat("SELECT max(x, 2) OVER (PARTITION BY g) FROM t");
+        assert!(!out.contains("max_n"), "{out}");
+        assert!(out.contains("max(x, 2) OVER"), "{out}");
     }
 
     // ─── CAST AS VARBINARY -> BYTEA (#339) ─────────────────────────────────

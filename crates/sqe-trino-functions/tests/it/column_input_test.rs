@@ -23,7 +23,11 @@ use datafusion::arrow::array::{
     Int32Array, Int64Array, ListArray, RecordBatch, StringArray, StringViewArray,
     TimestampMicrosecondArray, TimestampNanosecondArray,
 };
-use datafusion::arrow::datatypes::{DataType, Field, Float64Type, Int32Type, Schema, TimeUnit};
+use datafusion::arrow::array::{Int64Builder, ListBuilder, MapBuilder, StringBuilder, StructArray};
+use datafusion::arrow::buffer::OffsetBuffer;
+use datafusion::arrow::datatypes::{
+    DataType, Field, Fields, Float64Type, Int32Type, Schema, TimeUnit,
+};
 use datafusion::arrow::util::display::array_value_to_string;
 use datafusion::common::ScalarValue;
 use datafusion::datasource::MemTable;
@@ -442,11 +446,6 @@ col_case!(
     [s("karolin"), s("hello123world"), None]
 );
 col_case!(
-    col_checksum_is_per_row,
-    "length(checksum(str_a))",
-    [s("16"), s("16"), None]
-);
-col_case!(
     col_timezone_hour,
     "timezone_hour(ts_a)",
     // NULL in, NULL out.
@@ -742,6 +741,12 @@ enum Kind {
     Unit,
     Digits,
     DataSize,
+    /// `array(varchar)`.
+    ListStr,
+    /// `map(varchar, bigint)`.
+    MapStrInt,
+    /// `array(row(integer, varchar))`.
+    ListEntries,
 }
 
 fn make_array(kind: Kind) -> ArrayRef {
@@ -822,6 +827,47 @@ fn make_array(kind: Kind) -> ArrayRef {
         ])),
         Kind::Degrees => Arc::new(Float64Array::from(vec![10.0, 45.5, -20.25])),
         Kind::Unit => Arc::new(Float64Array::from(vec![0.1, 0.5, 0.9])),
+        Kind::ListStr => {
+            let mut b = ListBuilder::new(StringBuilder::new());
+            for row in [vec!["a", "b"], vec!["c"], vec!["d", "e", "f"]] {
+                for v in row {
+                    b.values().append_value(v);
+                }
+                b.append(true);
+            }
+            Arc::new(b.finish())
+        }
+        Kind::MapStrInt => {
+            let mut b = MapBuilder::new(None, StringBuilder::new(), Int64Builder::new());
+            for row in [vec![("a", 1), ("b", 2)], vec![("b", 3)], vec![("c", 4)]] {
+                for (k, v) in row {
+                    b.keys().append_value(k);
+                    b.values().append_value(v);
+                }
+                b.append(true).unwrap();
+            }
+            Arc::new(b.finish())
+        }
+        Kind::ListEntries => {
+            let fields = Fields::from(vec![
+                Field::new("a", DataType::Int32, true),
+                Field::new("b", DataType::Utf8, true),
+            ]);
+            let entries = StructArray::new(
+                fields.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+                    Arc::new(StringArray::from(vec!["x", "y", "z", "w"])),
+                ],
+                None,
+            );
+            Arc::new(ListArray::new(
+                Arc::new(Field::new("item", DataType::Struct(fields), true)),
+                OffsetBuffer::new(vec![0, 2, 3, 4].into()),
+                Arc::new(entries),
+                None,
+            ))
+        }
     }
 }
 
@@ -844,7 +890,7 @@ fn arg_specs(name: &str) -> Option<Vec<ArgSpec>> {
         "to_iso8601" => vec![Col(TsNs)],
         "is_json_scalar" => vec![Col(Json)],
         "json_array_contains" => vec![Col(Json), Col(Int)],
-        "soundex" | "word_stem" | "word_stem_lang" | "checksum" | "to_json" | "try" => {
+        "soundex" | "word_stem" | "word_stem_lang" | "to_json" | "try" => {
             vec![Col(Str)]
         }
         "hamming_distance" => vec![Col(Str), Col(Str)],
@@ -936,6 +982,13 @@ fn arg_specs(name: &str) -> Option<Vec<ArgSpec>> {
         "slice" => vec![Col(ListInt), LitInt(1), LitInt(2)],
         "element_at" => vec![Col(ListInt), LitInt(1)],
         "contains" => vec![Col(ListInt), Col(Int32)],
+        // ── arrays and maps (array_fns / map_fns) ──
+        "array_last" | "list_last" | "shuffle" | "array_histogram" => vec![Col(ListInt)],
+        "contains_sequence" => vec![Col(ListInt), Col(ListInt)],
+        "ngrams" => vec![Col(ListStr), LitInt(2)],
+        "zip" => vec![Col(ListInt), Col(ListStr)],
+        "map_concat" => vec![Col(MapStrInt), Col(MapStrInt)],
+        "map_from_entries" | "multimap_from_entries" => vec![Col(ListEntries)],
         "split" => vec![Col(Str), LitStr("r")],
         "sequence" => vec![Col(Int), LitInt(300)],
         _ => return None,
@@ -952,6 +1005,10 @@ fn skip_reason(name: &str) -> Option<&'static str> {
         "to_milliseconds" => "needs an interval column, which this harness does not synthesise \
                               (covered with an interval literal and a VALUES column in datetime_fns)",
         "typeof" => "returns the static type name; a broadcast scalar is the correct shape",
+        "split_to_map" | "split_to_multimap" => {
+            "errors by design (Trino) on any entry lacking the key-value delimiter, \
+             and the synthetic string column has none; covered by map_fns unit tests"
+        }
         "all_match" | "none_match" | "reduce" | "array_all_match" | "array_none_match"
         | "array_reduce" | "filter" | "transform" | "any_match" | "array_any_match"
         | "array_filter" | "array_transform" => "lambda argument cannot be synthesised as an array",

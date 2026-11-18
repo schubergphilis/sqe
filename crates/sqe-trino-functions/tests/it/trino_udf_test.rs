@@ -651,15 +651,6 @@ async fn test_millisecond() {
 // ═══════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn test_checksum() {
-    let v = eval_str("SELECT checksum('hello')").await;
-    assert!(v.is_some(), "checksum returned None");
-    let s = v.unwrap();
-    // checksum returns a hex string; length depends on implementation (SHA-based → 16 hex chars for 8 bytes)
-    assert!(!s.is_empty(), "checksum result was empty");
-}
-
-#[tokio::test]
 async fn test_arbitrary() {
     let v = eval_i64("SELECT arbitrary(42)").await;
     assert_eq!(v, Some(42));

@@ -513,6 +513,12 @@ fn trino_type_name(dt: &DataType, spelling: Spelling) -> String {
             let cols: Vec<String> = fields
                 .iter()
                 .map(|f| {
+                    // An unnamed Arrow field is an anonymous Trino row field
+                    // (`row(varchar, bigint)`), as `zip` and `map_entries`
+                    // produce.
+                    if f.name().is_empty() {
+                        return trino_type_name(f.data_type(), spelling);
+                    }
                     format!(
                         "{} {}",
                         row_field_name(f.name()),
@@ -759,6 +765,25 @@ mod tests {
             arrow_value_to_json(&b.finish(), 0),
             serde_json::json!({ "10": "x" })
         );
+    }
+
+    /// Unnamed struct fields are anonymous row fields, as in Trino's
+    /// `array(row(varchar, bigint))` for `map_entries`.
+    #[test]
+    fn unnamed_struct_fields_are_anonymous_row_fields() {
+        use std::sync::Arc;
+
+        use arrow_schema::Fields;
+
+        let anon = DataType::Struct(Fields::from(vec![
+            Field::new("", DataType::Utf8, true),
+            Field::new("", DataType::Int64, true),
+        ]));
+        assert_eq!(arrow_to_trino_type(&anon), "row(varchar,bigint)");
+        let list = DataType::List(Arc::new(Field::new("item", anon, true)));
+        assert_eq!(arrow_to_trino_type(&list), "array(row(varchar,bigint))");
+        let named = DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int64, true)]));
+        assert_eq!(arrow_to_trino_type(&named), "row(a bigint)");
     }
 
     /// #849: a variant cell is sent as its JSON text, not as a row of two
