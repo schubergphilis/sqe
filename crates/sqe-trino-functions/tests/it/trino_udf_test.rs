@@ -566,6 +566,26 @@ async fn test_to_iso8601_naive_timestamp_has_no_zone() {
     assert_eq!(v.as_deref(), Some("2024-01-02T03:04:05.500Z"));
 }
 
+/// Trino 484 prints a zero offset as `Z` (Java's ISO offset formatter) and
+/// any other offset as `+hh:mm`.
+#[tokio::test]
+async fn test_to_iso8601_zero_offset_is_z() {
+    // The Trino rewrite of a zoned literal lives in sqe-sql; build the
+    // zoned value the way that rewrite does.
+    for (zone, want) in [
+        ("UTC", "2024-03-15T12:34:56.789Z"),
+        ("+00:00", "2024-03-15T12:34:56.789Z"),
+        ("+01:00", "2024-03-15T12:34:56.789+01:00"),
+    ] {
+        let sql = format!(
+            "SELECT to_iso8601(arrow_cast(TIMESTAMP '2024-03-15 12:34:56.789', \
+             'Timestamp(Millisecond, Some(\"{zone}\"))'))"
+        );
+        let v = eval_str(&sql).await;
+        assert_eq!(v.as_deref(), Some(want), "{zone}");
+    }
+}
+
 /// Trino evaluates every clock function at the query start, so two calls in
 /// one statement are equal. They used to read the clock per call and differ
 /// by microseconds.

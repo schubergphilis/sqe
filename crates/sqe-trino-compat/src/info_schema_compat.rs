@@ -436,8 +436,9 @@ mod tests {
         );
     }
 
-    /// SHOW CREATE TABLE keeps a timestamp's stored unit, so the table is
-    /// recreated as it was; the information_schema name stays the wire's.
+    /// A timestamp's precision is its unit's in every spelling, so SHOW
+    /// CREATE TABLE recreates the table as it was and information_schema
+    /// agrees with the wire.
     #[test]
     fn ddl_type_keeps_the_timestamp_unit() {
         assert_eq!(arrow_display_to_ddl_type("Timestamp(ns)"), "timestamp(9)");
@@ -445,7 +446,8 @@ mod tests {
             arrow_display_to_ddl_type("Timestamp(µs, \"UTC\")"),
             "timestamp(6) with time zone"
         );
-        assert_eq!(arrow_display_to_trino_type("Timestamp(ns)"), "timestamp(6)");
+        assert_eq!(arrow_display_to_trino_type("Timestamp(ns)"), "timestamp(9)");
+        assert_eq!(arrow_display_to_trino_type("Timestamp(ms)"), "timestamp(3)");
         assert_eq!(
             arrow_display_to_ddl_type(r#"Struct("metadata": Binary, "value": Binary)"#),
             "variant"

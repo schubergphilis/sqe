@@ -14,17 +14,19 @@
 //! - [`DecimalRoundingRule`], an analyzer rule after type coercion: a decimal
 //!   division gets one guard digit on its dividend and is rounded back to
 //!   its planned type; a cast to a smaller decimal scale, or from a decimal
-//!   to an integer, rounds through [`RescaleUdf`].
+//!   to an integer, rounds through [`RescaleUdf`]; so does a cast to a
+//!   timestamp with a coarser unit, which Trino rounds half up and Arrow
+//!   truncates (`.7896` at precision 3 is `.790`).
 //! - [`RoundedAvg`]: DataFusion's `avg` with Trino's decimal result type,
 //!   whose final division rounds. Count, sum and state are DataFusion's own;
 //!   only the result type and the last step differ.
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, AsArray, Decimal256Array};
+use datafusion::arrow::array::{Array, ArrayRef, AsArray, Decimal256Array, Int64Array};
 use datafusion::arrow::compute::{cast_with_options, CastOptions};
 use datafusion::arrow::datatypes::{
-    i256, DataType, Field, FieldRef, UInt64Type, DECIMAL256_MAX_PRECISION,
+    i256, DataType, Field, FieldRef, Int64Type, TimeUnit, UInt64Type, DECIMAL256_MAX_PRECISION,
 };
 use datafusion::arrow::util::display::FormatOptions;
 use datafusion::common::config::ConfigOptions;
@@ -95,6 +97,43 @@ impl RescaleUdf {
     }
 }
 
+fn timestamp_unit_rank(unit: &TimeUnit) -> u8 {
+    match unit {
+        TimeUnit::Second => 0,
+        TimeUnit::Millisecond => 1,
+        TimeUnit::Microsecond => 2,
+        TimeUnit::Nanosecond => 3,
+    }
+}
+
+fn timestamp_units_per(unit: &TimeUnit) -> i64 {
+    match unit {
+        TimeUnit::Second => 1,
+        TimeUnit::Millisecond => 1_000,
+        TimeUnit::Microsecond => 1_000_000,
+        TimeUnit::Nanosecond => 1_000_000_000,
+    }
+}
+
+/// `array` (a timestamp) as the `Int64` of its raw values divided by `ratio`,
+/// rounding half up (a tie goes toward later instants). A value within half a
+/// step of `i64::MAX` truncates instead of overflowing.
+fn round_timestamp_half_up(array: &ArrayRef, ratio: i64) -> Result<ArrayRef> {
+    let raw = cast_with_options(array, &DataType::Int64, &CastOptions::default())?;
+    let half = ratio / 2;
+    let out: Int64Array = raw
+        .as_primitive::<Int64Type>()
+        .iter()
+        .map(|v| {
+            v.map(|v| match v.checked_add(half) {
+                Some(up) => up.div_euclid(ratio),
+                None => v.div_euclid(ratio),
+            })
+        })
+        .collect();
+    Ok(Arc::new(out))
+}
+
 impl Default for RescaleUdf {
     fn default() -> Self {
         Self::new()
@@ -136,7 +175,29 @@ impl ScalarUDFImpl for RescaleUdf {
             safe,
             format_options: FormatOptions::default(),
         };
-        args.args[0].cast_to(args.return_field.data_type(), Some(&options))
+        let target = args.return_field.data_type();
+        if let (DataType::Timestamp(to_unit, _), Some(DataType::Timestamp(from_unit, from_tz))) =
+            (target, args.arg_fields.first().map(|f| f.data_type()))
+        {
+            if timestamp_unit_rank(to_unit) < timestamp_unit_rank(from_unit) {
+                let ratio = timestamp_units_per(from_unit) / timestamp_units_per(to_unit);
+                let scalar = matches!(args.args[0], ColumnarValue::Scalar(_));
+                let array = args.args[0].to_array(args.number_rows)?;
+                let rounded = round_timestamp_half_up(&array, ratio)?;
+                let narrowed = cast_with_options(
+                    &rounded,
+                    &DataType::Timestamp(*to_unit, from_tz.clone()),
+                    &options,
+                )?;
+                let out = cast_with_options(&narrowed, target, &options)?;
+                return Ok(if scalar {
+                    ColumnarValue::Scalar(ScalarValue::try_from_array(&out, 0)?)
+                } else {
+                    ColumnarValue::Array(out)
+                });
+            }
+        }
+        args.args[0].cast_to(target, Some(&options))
     }
 }
 
@@ -272,6 +333,10 @@ fn round_division(div: &Expr, left: &Expr, right: &Expr, schema: &DFSchema) -> O
 /// through [`RescaleUdf`].
 fn round_cast(inner: &Expr, target: &DataType, safe: bool, schema: &DFSchema) -> Option<Expr> {
     let source = inner.get_type(schema).ok()?;
+    if let (DataType::Timestamp(from, _), DataType::Timestamp(to, _)) = (&source, target) {
+        return (timestamp_unit_rank(to) < timestamp_unit_rank(from))
+            .then(|| RescaleUdf::call(inner.clone(), target, safe));
+    }
     let (precision, scale) = decimal_parts(&source)?;
     if scale <= 0 {
         return None;
@@ -823,6 +888,65 @@ mod tests {
 
     /// Column names are DataFusion's, so a client sees the same columns with
     /// or without the rewrite; the types are Trino's.
+    /// Trino rounds half up when a cast drops fraction digits; Arrow's unit
+    /// cast truncates (`.7896` at precision 3 is `.790`, not `.789`).
+    #[tokio::test]
+    async fn narrowing_timestamp_cast_rounds_half_up() {
+        let ctx = ctx();
+        let cast = |text: &str, from: u8, to: u8| {
+            format!("SELECT CAST(CAST('{text}' AS TIMESTAMP({from})) AS TIMESTAMP({to}))")
+        };
+        let cases = [
+            ("2020-01-01 00:00:00.7896", 6, 3, "2020-01-01T00:00:00.790"),
+            ("2020-01-01 00:00:00.7894", 6, 3, "2020-01-01T00:00:00.789"),
+            ("2020-01-01 00:00:00.5", 6, 0, "2020-01-01T00:00:01"),
+            ("2020-01-01 00:00:00.4999", 6, 0, "2020-01-01T00:00:00"),
+            ("2020-01-01 23:59:59.9996", 6, 3, "2020-01-02T00:00:00"),
+            (
+                "2020-01-01 00:00:00.123456789",
+                9,
+                6,
+                "2020-01-01T00:00:00.123457",
+            ),
+            (
+                "2020-01-01 00:00:00.123456789",
+                9,
+                3,
+                "2020-01-01T00:00:00.123",
+            ),
+            // Before the epoch the tie still goes toward later instants.
+            ("1969-12-31 23:59:59.9996", 6, 3, "1970-01-01T00:00:00"),
+            ("1969-12-31 23:59:59.9994", 6, 3, "1969-12-31T23:59:59.999"),
+        ];
+        for (text, from, to, want) in cases {
+            assert_eq!(value(&ctx, &cast(text, from, to)).await, want, "{text}");
+        }
+        // Over a column, not folded at planning; widening is untouched.
+        let out = rows(
+            &ctx,
+            "SELECT CAST(ts AS TIMESTAMP(3)) AS ms, CAST(ts AS TIMESTAMP(9)) AS ns FROM \
+             (SELECT CAST(g || '' AS VARCHAR) AS g, CAST('2020-01-01 00:00:00.7896' AS TIMESTAMP(6)) AS ts FROM t LIMIT 1)",
+        )
+        .await;
+        assert!(out.contains("2020-01-01T00:00:00.790 "), "\n{out}");
+        assert!(out.contains("2020-01-01T00:00:00.789600"), "\n{out}");
+        // The zone survives.
+        let zoned = value(
+            &ctx,
+            "SELECT CAST(CAST('2020-01-01 00:00:00.7896' AS TIMESTAMP(6) WITH TIME ZONE) \
+             AS TIMESTAMP(3) WITH TIME ZONE)",
+        )
+        .await;
+        assert_eq!(zoned, "2020-01-01T00:00:00.790Z");
+        // TRY_CAST rounds too.
+        let tried = value(
+            &ctx,
+            "SELECT TRY_CAST(CAST('2020-01-01 00:00:00.7896' AS TIMESTAMP(6)) AS TIMESTAMP(3))",
+        )
+        .await;
+        assert_eq!(tried, "2020-01-01T00:00:00.790");
+    }
+
     #[tokio::test]
     async fn rewrite_keeps_column_names() {
         let ctx = ctx();

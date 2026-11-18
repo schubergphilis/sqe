@@ -47,6 +47,33 @@ The harness sends `X-Trino-Client-Capabilities: PARAMETRIC_DATETIME`, as the JDB
 
 **Integer literals last, on their own.** Typing literals as `integer` changes every plan that mentions a number. It goes in its own MR after the function work, so a regression there is not mixed with function fixes.
 
+### Timestamps (tasks 2.4 and 2.5)
+
+Trino types a timestamp by its precision `p` (0 to 12) and an optional zone. SQE holds timestamps in Arrow, which has four units: second, millisecond, microsecond, nanosecond. Iceberg stores `timestamp`/`timestamptz` as microseconds and, in v3, `timestamp_ns`/`timestamptz_ns` as nanoseconds, always as UTC instants. The engine runs with `datafusion.execution.time_zone = "+00:00"` and has no session zone.
+
+**Precision label comes from the Arrow unit.** Second is `timestamp(0)`, millisecond `timestamp(3)`, microsecond `timestamp(6)`, nanosecond `timestamp(9)`, on both protocols. HTTP renders that many fraction digits. The fixed 6 in `normalize_timestamp_fraction` and `trino_type_name` goes away; the reason for it (#5: a nanosecond `date_trunc` and a microsecond CAST rendered differently under one label) no longer holds once label and digits both follow the unit. Every remaining nanosecond producer flips from 6 to 9, so the MR lists them from a `typeof` probe before and after, and the parity TYPE count must not rise.
+
+**Literals and casts get Trino's precision in the front door.** `apply_trino_compat` rewrites:
+- `TIMESTAMP '<text>'` to `CAST('<text>' AS TIMESTAMP(p))`, with `p` the literal's fraction digits rounded up to 0, 3, 6 or 9. A literal with a zone becomes `TIMESTAMP(p) WITH TIME ZONE` and keeps its zone (below).
+- `TIMESTAMP` and `TIMESTAMP WITH TIME ZONE` without a precision, inside `CAST`/`TRY_CAST` only, to `TIMESTAMP(3)`. DDL column types are not touched: `CREATE TABLE t (ts timestamp)` stays microseconds, which is what Iceberg stores and what Trino's Iceberg connector reports (`timestamp(6)`).
+- `TIMESTAMP(p)` with `p` outside 0/3/6/9 to the next of those. DataFusion refuses those precisions today; after the rewrite they work, and the label differs from Trino (`timestamp(2)` reports `timestamp(3)`). Recorded as a known DIFF.
+
+**Precision reduction rounds.** Trino rounds half up when a cast drops fraction digits; Arrow's unit cast truncates. The MR confirms Trino's result for `CAST(TIMESTAMP '2020-01-01 00:00:00.7896' AS timestamp(3))` on the parity stack and, if it rounds, adds the rounding to the narrowing cast (an analyzer rule over `Cast` between timestamp units, not a per-call rewrite).
+
+**Zone.** A literal keeps its zone, as Trino does: `TIMESTAMP '2024-01-01 10:00 Europe/Amsterdam'` renders in that zone. A zone spelled `+00:00`, `Z` or empty becomes `UTC`, the string the datetime functions use. Two consequences are handled where they bite:
+- Iceberg only accepts UTC zones. CTAS (`write_schema_for_format_version`) normalises any zoned timestamp to `+00:00`; the stored instant is the same.
+- A cast between two zoned timestamps changes metadata only, never the stored value, so `cast_is_exact` accepts any zoned to zoned cast at one unit. A predicate with the literal on the left (`TIMESTAMP '... Europe/Amsterdam' < ts`) then still pushes down.
+
+**`now()` and friends.** `current_timestamp` and `now()` return `timestamp(3) with time zone` in the session zone (`UTC`); `localtimestamp` returns `timestamp(3)`. `at_timezone` and `with_timezone` keep the input's unit instead of forcing microseconds. The common filter `naive_ts > now() - INTERVAL '7' DAY` coerces the column to the zoned type; `cast_is_exact` already treats a no-zone to UTC cast as exact under the fixed `+00:00` engine zone, and the MR pins both operand orders on a `timestamp` and a `timestamptz` column.
+
+**Pushdown of coarse literals.** `scalar_value_to_datum` maps only microsecond and nanosecond scalars. Second and millisecond literals now reach paths that skip coercion (DELETE, UPDATE and MERGE predicates, distributed scan filters), so it scales them to microseconds. Narrowing casts are still not unwrapped: a filter on `CAST(ts_col AS TIMESTAMP)` now narrows the column to milliseconds and loses pruning, as in Trino's own Iceberg connector.
+
+**Write path.** CTAS of `CAST(x AS TIMESTAMP)` now writes a microsecond `timestamp` (milliseconds widened) on v2 and v3, where a v3 table previously got `timestamp_ns`. That matches Trino. DDL `timestamp(0..3)` columns, which fail today because DDL has no widening step, are widened to microseconds the way CTAS widens.
+
+**Out of scope.** The session zone stays unwired: `SET TIME ZONE` is logged only and `X-Trino-Time-Zone` is not read. `to_iso8601` belongs to the datetime-functions change.
+
+**Split.** 2.4 (precision) and 2.5 (zone) are separate commits; each runs the full integration suite, the distributed suite and a parity run, because every timestamp literal changes type.
+
 ## Risks / Trade-offs
 
 - **Policy guard.** A rewrite that adds a cast or arithmetic around a column can turn a leakproof predicate into a fallible one, which reads row-filtered scans through the `CASE WHEN` guard: slower, and a silent change. Each rewrite MR runs `make test-access-control`.

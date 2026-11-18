@@ -337,7 +337,12 @@ mod tests {
             .await;
             assert_eq!(
                 row,
-                ["Timestamp(µs)", "Timestamp(µs)", "2024-01-02", "Int64"]
+                [
+                    "Timestamp(ms, \"UTC\")",
+                    "Timestamp(ms, \"UTC\")",
+                    "2024-01-02",
+                    "Int64"
+                ]
             );
         }
     }

@@ -103,6 +103,7 @@ mod subscript_dot_access_e2e;
 mod system_catalog_split_test;
 mod table_files_json_e2e;
 mod table_health_test;
+mod timestamp_literals_e2e;
 mod timestamp_spark_interop;
 mod transaction_end_unmanaged_session_test;
 mod trino_cli_test;

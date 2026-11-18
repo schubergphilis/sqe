@@ -8441,9 +8441,10 @@ pub fn sql_type_to_arrow_for(
             } else {
                 None
             };
+            // Iceberg stores microseconds, so `timestamp(0..=3)` widens to
+            // them exactly as CTAS does (`write_schema_for_format_version`).
             match p {
-                0..=3 => Ok(DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, tz)),
-                4..=6 => Ok(DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, tz)),
+                0..=6 => Ok(DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, tz)),
                 _ => Ok(DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, tz)),
             }
         }
@@ -8956,16 +8957,21 @@ pub(crate) fn write_schema_for_format_version(
         .fields()
         .iter()
         .map(|f| match f.data_type() {
-            DataType::Timestamp(TimeUnit::Second | TimeUnit::Millisecond, tz) => f
-                .as_ref()
-                .clone()
-                .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, tz.clone())),
-            DataType::Timestamp(TimeUnit::Nanosecond, tz)
-                if format_version != FormatVersion::V3 =>
-            {
+            // Iceberg stores `timestamp`/`timestamptz` as UTC instants and
+            // reads only a UTC zone back, so any zone (`Europe/Amsterdam`,
+            // `+02:00`, `UTC`) is written as `+00:00`: same instants, and
+            // seconds and milliseconds widen to microseconds.
+            DataType::Timestamp(unit, tz) => {
+                let unit = match unit {
+                    TimeUnit::Nanosecond if format_version == FormatVersion::V3 => {
+                        TimeUnit::Nanosecond
+                    }
+                    _ => TimeUnit::Microsecond,
+                };
+                let tz = tz.as_ref().map(|_| Arc::<str>::from("+00:00"));
                 f.as_ref()
                     .clone()
-                    .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, tz.clone()))
+                    .with_data_type(DataType::Timestamp(unit, tz))
             }
             DataType::UInt64 => f.as_ref().clone().with_data_type(DataType::Int64),
             _ => f.as_ref().clone(),
@@ -10709,14 +10715,22 @@ mod tests {
 
     #[test]
     fn test_sql_type_to_arrow_timestamp_low_precision() {
-        // Precision 0-3 → Millisecond
+        // Precision 0-3 widens to Microsecond, the unit Iceberg stores (the
+        // way CTAS widens), so `timestamp(3)` columns can be created.
         for p in 0u64..=3 {
             let result =
                 sql_type_to_arrow(&SqlType::Timestamp(Some(p), TimezoneInfo::None)).unwrap();
             assert_eq!(
                 result,
-                DataType::Timestamp(TimeUnit::Millisecond, None),
-                "precision {p} should map to Millisecond"
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                "precision {p} should map to Microsecond"
+            );
+            let zoned = sql_type_to_arrow(&SqlType::Timestamp(Some(p), TimezoneInfo::WithTimeZone))
+                .unwrap();
+            assert_eq!(
+                zoned,
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                "precision {p} with time zone"
             );
         }
     }
@@ -10829,7 +10843,7 @@ mod tests {
         );
         assert_eq!(
             v2.field(1).data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into()))
         );
         assert_eq!(v2.field(2).data_type(), &DataType::Int64);
         let iceberg = arrow_schema_to_iceberg(&v2).unwrap();
@@ -10893,7 +10907,7 @@ mod tests {
             );
             assert_eq!(
                 widened.field(1).data_type(),
-                &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+                &DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into()))
             );
             let iceberg = arrow_schema_to_iceberg(&widened).unwrap();
             let fields = iceberg.as_struct().fields();
@@ -10992,6 +11006,54 @@ mod tests {
             *fields[1].field_type,
             Type::Primitive(PrimitiveType::TimestamptzNs)
         ));
+    }
+
+    #[test]
+    fn test_write_schema_normalises_every_zone_to_utc_offset() {
+        // A `TIMESTAMP '... Europe/Amsterdam'` literal carries its zone into
+        // CTAS; Iceberg only reads a UTC zone back, so the stored zone is
+        // `+00:00` and the instants are untouched. Naive stays naive.
+        use arrow_schema::Field;
+
+        let schema = ArrowSchema::new(vec![
+            Field::new(
+                "ams",
+                DataType::Timestamp(TimeUnit::Millisecond, Some("Europe/Amsterdam".into())),
+                true,
+            ),
+            Field::new(
+                "off",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+02:00".into())),
+                true,
+            ),
+            Field::new("naive", DataType::Timestamp(TimeUnit::Second, None), true),
+        ]);
+        for version in [FormatVersion::V2, FormatVersion::V3] {
+            let out = write_schema_for_format_version(&schema, version);
+            let us = TimeUnit::Microsecond;
+            assert_eq!(
+                out.field(0).data_type(),
+                &DataType::Timestamp(us, Some("+00:00".into()))
+            );
+            assert_eq!(
+                out.field(1).data_type(),
+                &DataType::Timestamp(us, Some("+00:00".into()))
+            );
+            assert_eq!(out.field(2).data_type(), &DataType::Timestamp(us, None));
+            assert!(arrow_schema_to_iceberg(&out).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_ddl_timestamp_without_precision_stays_microsecond() {
+        // The compat rewrite leaves DDL column types alone, so a plain
+        // `timestamp` column is the microsecond type Iceberg stores.
+        let ct = parse_create_table("CREATE TABLE t (ts timestamp)");
+        let fields = create_table_arrow_fields(&ct.columns, false).unwrap();
+        assert_eq!(
+            fields[0].data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
     }
 
     // ------------------------------------------------------------------

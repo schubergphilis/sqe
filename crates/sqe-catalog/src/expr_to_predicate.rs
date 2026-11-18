@@ -238,9 +238,10 @@ fn to_iceberg_operation(op: Operator) -> OpTransformedResult {
 /// Whether a cast from `from` to `to` maps every value to a distinct value
 /// in the same order, with a literal of `to` binding exactly to a `from`
 /// column. Float widening is left out: Iceberg rounds a double literal to
-/// f32 when it binds it to a float column. A zone change is safe only
-/// between UTC spellings, because Arrow reads a timestamp without a zone
-/// as local time in the target zone.
+/// f32 when it binds it to a float column. A zone change is safe between
+/// two zoned types (only the label changes, never the stored instant) and
+/// between UTC spellings, but not to or from no zone elsewhere: Arrow reads a
+/// timestamp without a zone as local time in the target zone.
 fn cast_is_exact(from: &DataType, to: &DataType) -> bool {
     use DataType::*;
     fn utc(tz: &Option<std::sync::Arc<str>>) -> bool {
@@ -252,7 +253,7 @@ fn cast_is_exact(from: &DataType, to: &DataType) -> bool {
         (Utf8 | LargeUtf8 | Utf8View, Utf8 | LargeUtf8 | Utf8View) => true,
         (Timestamp(fu, ftz), Timestamp(tu, ttz)) => {
             let unit_ok = fu == tu || (*fu == TimeUnit::Microsecond && *tu == TimeUnit::Nanosecond);
-            unit_ok && (ftz == ttz || (utc(ftz) && utc(ttz)))
+            unit_ok && (ftz == ttz || (utc(ftz) && utc(ttz)) || (ftz.is_some() && ttz.is_some()))
         }
         _ => false,
     }
@@ -343,12 +344,29 @@ fn scalar_value_to_datum(value: &ScalarValue) -> Option<Datum> {
         ScalarValue::BinaryView(Some(v)) => Some(Datum::binary(v.clone())),
         ScalarValue::Date32(Some(v)) => Some(Datum::date(*v)),
         ScalarValue::Date64(Some(v)) => Some(Datum::date((*v / MILLIS_PER_DAY) as i32)),
+        // Second and millisecond literals (`TIMESTAMP '2024-01-01 10:00:00'`
+        // is `timestamp(0)`) reach paths that skip type coercion, so they are
+        // scaled to the microseconds Iceberg stores. Overflow pushes nothing.
+        ScalarValue::TimestampSecond(Some(v), tz) => {
+            timestamp_datum(v.checked_mul(1_000_000)?, tz.is_some())
+        }
+        ScalarValue::TimestampMillisecond(Some(v), tz) => {
+            timestamp_datum(v.checked_mul(1_000)?, tz.is_some())
+        }
         ScalarValue::TimestampMicrosecond(Some(v), None) => Some(Datum::timestamp_micros(*v)),
         ScalarValue::TimestampMicrosecond(Some(v), Some(_)) => Some(Datum::timestamptz_micros(*v)),
         ScalarValue::TimestampNanosecond(Some(v), None) => Some(Datum::timestamp_nanos(*v)),
         ScalarValue::TimestampNanosecond(Some(v), Some(_)) => Some(Datum::timestamptz_nanos(*v)),
         _ => None,
     }
+}
+
+fn timestamp_datum(micros: i64, zoned: bool) -> Option<Datum> {
+    Some(if zoned {
+        Datum::timestamptz_micros(micros)
+    } else {
+        Datum::timestamp_micros(micros)
+    })
 }
 
 /// `datum` in the unit and zone of the column it is compared with, or
@@ -861,6 +879,155 @@ mod tests {
             Expr::Literal(ScalarValue::TimestampNanosecond(Some(7), None), None),
         );
         assert!(!is_filter_pushdown_supported(&expr, None));
+    }
+
+    /// Second and millisecond literals are scaled to microseconds, with or
+    /// without a column type; an overflow pushes nothing.
+    #[test]
+    fn coarse_timestamp_literals_scale_to_microseconds() {
+        let lit = |v: ScalarValue| {
+            let expr = binary(col("ts"), Operator::Gt, Expr::Literal(v, None));
+            convert_filters_to_predicate(&[expr])
+        };
+        assert_eq!(
+            lit(ScalarValue::TimestampSecond(Some(3), None)).unwrap(),
+            Reference::new("ts").greater_than(Datum::timestamp_micros(3_000_000))
+        );
+        assert_eq!(
+            lit(ScalarValue::TimestampMillisecond(Some(1_500), None)).unwrap(),
+            Reference::new("ts").greater_than(Datum::timestamp_micros(1_500_000))
+        );
+        assert_eq!(
+            lit(ScalarValue::TimestampMillisecond(
+                Some(2),
+                Some("+00:00".into())
+            ))
+            .unwrap(),
+            Reference::new("ts").greater_than(Datum::timestamptz_micros(2_000))
+        );
+        assert!(lit(ScalarValue::TimestampSecond(Some(i64::MAX), None)).is_none());
+        assert!(lit(ScalarValue::TimestampMillisecond(Some(i64::MIN), None)).is_none());
+    }
+
+    /// Plan `SELECT * FROM t WHERE <cond>` through the front door (Trino
+    /// rewrites, engine functions, optimizer) over a `timestamp` and a
+    /// `timestamptz` column and convert every filter that reaches the scan.
+    async fn pushed_filters(cond: &str) -> Vec<(String, Option<Predicate>)> {
+        use datafusion::arrow::datatypes::Field;
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+        use datafusion::datasource::MemTable;
+        use datafusion::execution::runtime_env::RuntimeEnv;
+        use datafusion::logical_expr::LogicalPlan;
+        use std::sync::Arc;
+
+        let mut ctx = crate::session_tuning::engine_context(
+            crate::engine_session_config(),
+            Arc::new(RuntimeEnv::default()),
+        );
+        crate::session_tuning::register_engine_functions(&mut ctx).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new(
+                "tz",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                true,
+            ),
+        ]));
+        let table = MemTable::try_new(schema.clone(), vec![vec![]]).unwrap();
+        ctx.register_table("t", Arc::new(table)).unwrap();
+        let mut out = vec![];
+        for column in ["ts", "tz"] {
+            let sql = sqe_sql::trino_compat::rewrite_trino_compat(&format!(
+                "SELECT * FROM t WHERE {}",
+                cond.replace("{c}", column)
+            ));
+            let state = ctx.state();
+            let plan = state.create_logical_plan(&sql).await.unwrap();
+            let plan = state.optimize(&plan).unwrap();
+            let mut filters = vec![];
+            plan.apply(|node| {
+                match node {
+                    LogicalPlan::Filter(f) => filters.push(f.predicate.clone()),
+                    LogicalPlan::TableScan(scan) => filters.extend(scan.filters.clone()),
+                    _ => {}
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+            assert!(!filters.is_empty(), "{sql}\n{plan}");
+            let pred = convert_filters_to_predicate_for(&filters, Some(&schema));
+            out.push((format!("{column}: {sql}\n{plan}"), pred));
+        }
+        out
+    }
+
+    /// The predicate reaches the scan, in both operand orders, on a
+    /// `timestamp` and a `timestamptz` column: a second-precision literal, a
+    /// literal with a zone (`Europe/Amsterdam` is 09:00 UTC) and `now()`.
+    #[tokio::test]
+    async fn timestamp_filters_reach_the_scan_in_both_operand_orders() {
+        let instant = 1_704_099_600_000_000i64; // 2024-01-01 09:00:00 UTC
+        let literal = "TIMESTAMP '2024-01-01 10:00:00 Europe/Amsterdam'";
+        let second = "TIMESTAMP '2024-01-01 09:00:00'";
+        for (cond, op) in [
+            (format!("{{c}} > {literal}"), "gt"),
+            (format!("{literal} < {{c}}"), "gt"),
+            (format!("{{c}} <= {literal}"), "le"),
+            (format!("{{c}} > {second}"), "gt"),
+            (format!("{second} < {{c}}"), "gt"),
+        ] {
+            for (i, (plan, pred)) in pushed_filters(&cond).await.into_iter().enumerate() {
+                let pred = pred.unwrap_or_else(|| panic!("not pushed: {plan}"));
+                let name = ["ts", "tz"][i];
+                let datum = if i == 0 {
+                    Datum::timestamp_micros(instant)
+                } else {
+                    Datum::timestamptz_micros(instant)
+                };
+                let reference = Reference::new(name);
+                let expected = if op == "gt" {
+                    reference.greater_than(datum)
+                } else {
+                    reference.less_than_or_equal_to(datum)
+                };
+                assert_eq!(pred, expected, "{plan}");
+            }
+        }
+        for cond in [
+            "{c} > now() - INTERVAL '7' DAY",
+            "now() - INTERVAL '7' DAY < {c}",
+            "{c} < current_timestamp",
+            "localtimestamp() > {c}",
+        ] {
+            for (plan, pred) in pushed_filters(cond).await {
+                assert!(pred.is_some(), "not pushed: {plan}");
+            }
+        }
+    }
+
+    /// A filter between two zoned types changes the label only.
+    #[test]
+    fn zoned_to_zoned_cast_is_exact_at_one_unit() {
+        use DataType::Timestamp;
+        let zoned = |u, z: &str| Timestamp(u, Some(z.into()));
+        let us = TimeUnit::Microsecond;
+        assert!(cast_is_exact(
+            &zoned(us, "UTC"),
+            &zoned(us, "Europe/Amsterdam")
+        ));
+        assert!(cast_is_exact(&zoned(us, "+02:00"), &zoned(us, "+00:00")));
+        assert!(!cast_is_exact(
+            &zoned(us, "Europe/Amsterdam"),
+            &Timestamp(us, None)
+        ));
+        assert!(!cast_is_exact(
+            &Timestamp(us, None),
+            &zoned(us, "Europe/Amsterdam")
+        ));
+        assert!(!cast_is_exact(
+            &zoned(TimeUnit::Millisecond, "UTC"),
+            &zoned(us, "Europe/Amsterdam")
+        ));
     }
 
     // ─── AND with partial pushdown ─────────────────────────────────
