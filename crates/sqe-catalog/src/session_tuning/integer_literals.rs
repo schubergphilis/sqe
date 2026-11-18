@@ -9,9 +9,10 @@
 //! `integer` operands stays `integer`. DataFusion's `+ - *` wrap on
 //! overflow, which a narrow literal would make reachable (`int_col + 1` was
 //! `bigint`), so [`CheckedIntegerArithmeticRule`] runs after coercion and
-//! sends `tinyint`, `smallint` and `integer` `+ - *` through arrow's checked
-//! kernels: `2147483647 + 1` fails with `integer addition overflow`, as in
-//! Trino. `bigint` arithmetic still wraps.
+//! sends integer `+ - *` and unary minus, `tinyint` to `bigint`, through
+//! arrow's checked kernels: `2147483647 + 1` fails with `integer addition
+//! overflow` and `-x` on the smallest `bigint` with `bigint negation
+//! overflow`, as in Trino.
 //!
 //! Untouched:
 //!
@@ -30,7 +31,7 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::compute::kernels::numeric::{add, mul, sub};
+use datafusion::arrow::compute::kernels::numeric::{add, mul, neg, sub};
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::arrow::error::ArrowError;
 use datafusion::common::config::ConfigOptions;
@@ -207,10 +208,10 @@ fn retype_union(union: Union) -> Result<Transformed<LogicalPlan>> {
     })))
 }
 
-/// Sends `+ - *` over two `tinyint`, `smallint` or `integer` operands
-/// through [`CheckedIntArith`], which errors on overflow where DataFusion's
-/// operators wrap. Runs after type coercion, where both operands have the
-/// result's type.
+/// Sends `+ - *` over two integer operands of one type, and unary minus on
+/// an integer, through [`CheckedIntArith`], which errors on overflow where
+/// DataFusion's operators wrap. Runs after type coercion, where both
+/// operands have the result's type.
 #[derive(Debug, Default)]
 pub struct CheckedIntegerArithmeticRule;
 
@@ -226,44 +227,75 @@ impl AnalyzerRule for CheckedIntegerArithmeticRule {
 }
 
 fn check_node(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
-    let Expr::BinaryExpr(BinaryExpr { left, op, right }) = &expr else {
-        return Ok(Transformed::no(expr));
+    let op = match &expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => match Checked::of(*op) {
+            Some(op) => {
+                let ty = left.get_type(schema)?;
+                (is_integer(&ty) && right.get_type(schema)? == ty).then_some(op)
+            }
+            None => None,
+        },
+        Expr::Negative(inner) => is_integer(&inner.get_type(schema)?).then_some(Checked::Negate),
+        _ => None,
     };
-    if !matches!(op, Operator::Plus | Operator::Minus | Operator::Multiply) {
-        return Ok(Transformed::no(expr));
-    }
-    let ty = left.get_type(schema)?;
-    if !matches!(ty, DataType::Int8 | DataType::Int16 | DataType::Int32)
-        || right.get_type(schema)? != ty
-    {
-        return Ok(Transformed::no(expr));
-    }
-    let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr else {
-        unreachable!("matched above");
+    let (op, args) = match (op, expr) {
+        (Some(op), Expr::BinaryExpr(BinaryExpr { left, right, .. })) => (op, vec![*left, *right]),
+        (Some(op), Expr::Negative(inner)) => (op, vec![*inner]),
+        (_, expr) => return Ok(Transformed::no(expr)),
     };
-    Ok(Transformed::yes(CheckedIntArith::call(*left, op, *right)))
+    Ok(Transformed::yes(CheckedIntArith::call(op, args)))
 }
 
-/// `__sqe_checked_add(a, b)` (and `_subtract`, `_multiply`): `a op b` in
-/// the operands' integer type, an error on overflow.
+fn is_integer(ty: &DataType) -> bool {
+    matches!(
+        ty,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+    )
+}
+
+/// The operation a [`CheckedIntArith`] performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Checked {
+    Add,
+    Subtract,
+    Multiply,
+    Negate,
+}
+
+impl Checked {
+    fn of(op: Operator) -> Option<Self> {
+        match op {
+            Operator::Plus => Some(Self::Add),
+            Operator::Minus => Some(Self::Subtract),
+            Operator::Multiply => Some(Self::Multiply),
+            _ => None,
+        }
+    }
+}
+
+/// `__sqe_checked_add(a, b)` (and `_subtract`, `_multiply`, and
+/// `__sqe_checked_negate(a)`): the operation in the operands' integer type,
+/// an error on overflow.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct CheckedIntArith {
-    op: Operator,
+    op: Checked,
     signature: Signature,
 }
 
 impl CheckedIntArith {
-    fn call(left: Expr, op: Operator, right: Expr) -> Expr {
+    fn call(op: Checked, args: Vec<Expr>) -> Expr {
         let udf = Self {
             op,
-            signature: Signature::any(2, Volatility::Immutable),
+            signature: Signature::any(args.len(), Volatility::Immutable),
         };
         Expr::ScalarFunction(ScalarFunction::new_udf(
             Arc::new(ScalarUDF::new_from_impl(udf)),
-            vec![left, right],
+            args,
         ))
     }
 
+    /// Trino's message: `integer addition overflow: 2147483647 + 1`,
+    /// `bigint negation overflow: -9223372036854775808`.
     fn overflow(&self, ty: &DataType, e: ArrowError) -> DataFusionError {
         let ArrowError::ArithmeticOverflow(detail) = e else {
             return e.into();
@@ -271,19 +303,22 @@ impl CheckedIntArith {
         let ty = match ty {
             DataType::Int8 => "tinyint",
             DataType::Int16 => "smallint",
-            _ => "integer",
+            DataType::Int32 => "integer",
+            _ => "bigint",
         };
         let detail = detail
             .strip_prefix("Overflow happened on: ")
             .unwrap_or(&detail);
+        let detail = detail.strip_prefix("- ").unwrap_or(detail);
         exec_datafusion_err!("{ty} {} overflow: {detail}", self.word())
     }
 
     fn word(&self) -> &'static str {
         match self.op {
-            Operator::Plus => "addition",
-            Operator::Minus => "subtraction",
-            _ => "multiplication",
+            Checked::Add => "addition",
+            Checked::Subtract => "subtraction",
+            Checked::Multiply => "multiplication",
+            Checked::Negate => "negation",
         }
     }
 }
@@ -291,9 +326,10 @@ impl CheckedIntArith {
 impl ScalarUDFImpl for CheckedIntArith {
     fn name(&self) -> &str {
         match self.op {
-            Operator::Plus => "__sqe_checked_add",
-            Operator::Minus => "__sqe_checked_subtract",
-            _ => "__sqe_checked_multiply",
+            Checked::Add => "__sqe_checked_add",
+            Checked::Subtract => "__sqe_checked_subtract",
+            Checked::Multiply => "__sqe_checked_multiply",
+            Checked::Negate => "__sqe_checked_negate",
         }
     }
 
@@ -317,11 +353,12 @@ impl ScalarUDFImpl for CheckedIntArith {
             .iter()
             .all(|a| matches!(a, ColumnarValue::Scalar(_)));
         let arrays = ColumnarValue::values_to_arrays(&args.args)?;
-        let (l, r) = (&arrays[0], &arrays[1]);
+        let l = &arrays[0];
         let out = match self.op {
-            Operator::Plus => add(l, r),
-            Operator::Minus => sub(l, r),
-            _ => mul(l, r),
+            Checked::Add => add(l, &arrays[1]),
+            Checked::Subtract => sub(l, &arrays[1]),
+            Checked::Multiply => mul(l, &arrays[1]),
+            Checked::Negate => neg(l),
         }
         .map_err(|e| self.overflow(l.data_type(), e))?;
         Ok(if scalar {
@@ -425,12 +462,47 @@ mod tests {
                 "SELECT CAST(32767 AS SMALLINT) + CAST(1 AS SMALLINT)",
                 "smallint addition overflow",
             ),
+            (
+                "SELECT 9223372036854775807 + 1",
+                "bigint addition overflow: 9223372036854775807 + 1",
+            ),
+            (
+                "SELECT CAST(-9223372036854775807 AS BIGINT) - 2",
+                "bigint subtraction overflow",
+            ),
+            (
+                "SELECT 4294967296 * 4294967296",
+                "bigint multiplication overflow",
+            ),
+            (
+                "SELECT -x FROM (VALUES (CAST(-2147483648 AS INTEGER))) AS t(x)",
+                "integer negation overflow: -2147483648",
+            ),
+            (
+                "SELECT -x FROM (VALUES (-9223372036854775807 - 1)) AS t(x)",
+                "bigint negation overflow: -9223372036854775808",
+            ),
         ] {
             let err = error(&ctx, sql).await;
             assert!(err.contains(msg), "{sql}: {err}");
         }
         for (sql, ty, v) in [
             ("SELECT 2147483646 + 1", DataType::Int32, "2147483647"),
+            (
+                "SELECT 9223372036854775806 + 1",
+                DataType::Int64,
+                "9223372036854775807",
+            ),
+            (
+                "SELECT -x FROM (VALUES (5), (NULL)) AS t(x)",
+                DataType::Int32,
+                "-5",
+            ),
+            (
+                "SELECT -x FROM (VALUES (5000000000)) AS t(x)",
+                DataType::Int64,
+                "-5000000000",
+            ),
             (
                 "SELECT x * 2 FROM (VALUES (3), (NULL)) AS t(x)",
                 DataType::Int32,
