@@ -1052,6 +1052,33 @@ async fn an_unqualified_reference_under_a_hive_default_catalog_is_still_rejected
 /// resolves to `TableKind::Hive` when `default_catalog` names an attached
 /// Hive root, and stays `TableKind::Iceberg` when it does not (no
 /// regression on the pre-existing, unqualified-reference behaviour).
+#[test]
+fn qualify_for_session_fills_catalog_and_schema_for_drop() {
+    use sqe_coordinator::hive_ddl_handler::HiveDdlHandler;
+    let q = |cat, sch, r: &str| HiveDdlHandler::qualify_for_session(cat, sch, r.into());
+
+    assert_eq!(
+        q(Some("lake"), Some("sales"), "orders"),
+        TableReference::full("lake", "sales", "orders")
+    );
+    assert_eq!(
+        q(Some("lake"), None, "orders"),
+        TableReference::full("lake", "default", "orders")
+    );
+    assert_eq!(
+        q(Some("lake"), Some("sales"), "hr.people"),
+        TableReference::full("lake", "hr", "people")
+    );
+    assert_eq!(
+        q(Some("lake"), Some("sales"), "other.hr.people"),
+        TableReference::full("other", "hr", "people")
+    );
+    assert_eq!(
+        q(None, Some("sales"), "orders"),
+        TableReference::bare("orders")
+    );
+}
+
 #[tokio::test]
 async fn resolve_table_kind_for_session_promotes_a_partial_reference_under_a_hive_default() {
     let h = handler_with_root("lake").await;

@@ -472,6 +472,60 @@ async fn maintenance_call_uses_the_session_catalog() {
     );
 }
 
+/// `DROP TABLE` with a one- or two-part name drops from the session catalog
+/// and schema, as INSERT and CTAS resolve them. Before, it went to the
+/// default warehouse, where `IF EXISTS` swallowed "not found" and nothing
+/// was dropped.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn drop_table_uses_the_session_catalog() {
+    let _live = LIVE_STACK_LOCK.lock().await;
+    crate::common::init_tracing();
+    seed_discovery_warehouse().await;
+
+    let handler = make_handler(polaris_auto_config());
+    let qualified = live_session().await;
+    let mut scoped = live_session().await;
+    scoped.default_catalog = Some("discovery_test_wh".to_string());
+    scoped.default_schema = Some("disc_ns".to_string());
+
+    for (table, drop) in [
+        ("drop_probe_one", "DROP TABLE IF EXISTS drop_probe_one"),
+        (
+            "drop_probe_two",
+            "DROP TABLE IF EXISTS disc_ns.drop_probe_two",
+        ),
+    ] {
+        let full = format!("discovery_test_wh.disc_ns.{table}");
+        handler
+            .execute(&qualified, &format!("DROP TABLE IF EXISTS {full}"), None)
+            .await
+            .unwrap_or_else(|e| panic!("pre-clean {full}: {e}"));
+        handler
+            .execute(
+                &qualified,
+                &format!("CREATE TABLE {full} AS SELECT 1 AS id"),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("create {full}: {e}"));
+
+        handler
+            .execute(&scoped, drop, None)
+            .await
+            .unwrap_or_else(|e| panic!("{drop}: {e}"));
+
+        let err = handler
+            .execute(&qualified, &format!("SELECT id FROM {full}"), None)
+            .await
+            .expect_err("the session-scoped DROP must have dropped the table");
+        assert!(
+            err.to_string().contains(table),
+            "{full} must be gone after `{drop}`, got: {err}"
+        );
+    }
+}
+
 /// `COMMENT ON COLUMN cat.ns.t.c` and `COMMENT ON TABLE cat.ns.t` commit to
 /// the catalog the name qualifies, not the session default. Before, both went
 /// to the default warehouse and failed with "does not exist" on a table a

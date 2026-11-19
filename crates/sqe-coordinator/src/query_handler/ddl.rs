@@ -41,9 +41,16 @@ impl QueryHandler {
             ..
         } = stmt.as_ref()
         {
-            names
-                .first()
-                .map(|name| (table_reference_of(name), *if_exists, *purge))
+            // A one- or two-part name drops from the session scope (`USE`),
+            // so a Hive root set as the session catalog is still routed here.
+            names.first().map(|name| {
+                let table_ref = crate::hive_ddl_handler::HiveDdlHandler::qualify_for_session(
+                    session.default_catalog.as_deref(),
+                    session.default_schema.as_deref(),
+                    table_reference_of(name),
+                );
+                (table_ref, *if_exists, *purge)
+            })
         } else {
             None
         };

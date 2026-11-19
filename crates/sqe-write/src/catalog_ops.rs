@@ -29,7 +29,7 @@ use crate::write_handler::{
     arrow_column_to_iceberg_type, configured_write_target,
     default_to_iceberg_literal as alter_default_to_iceberg_literal, default_write_catalog,
     geospatial_iceberg_type, parse_partition_transform_sql, requested_format_version,
-    sql_type_to_arrow, sql_type_to_arrow_for, CatalogDiscovery,
+    resolve_target_catalog, sql_type_to_arrow, sql_type_to_arrow_for, CatalogDiscovery,
 };
 
 /// `format-version` (Iceberg) or `format_version` (Trino).
@@ -270,8 +270,12 @@ impl CatalogOps {
             "Dropping table"
         );
 
+        // A one- or two-part name drops from the session catalog (`USE`),
+        // as INSERT/CTAS/DELETE resolve it, not from the default warehouse:
+        // with IF EXISTS the latter swallowed "not found" and dropped nothing.
+        let target = resolve_target_catalog(catalog_qualifier(table_name), session);
         let catalog = self
-            .create_catalog_bridge(session, catalog_qualifier(table_name).as_deref())
+            .create_catalog_bridge(session, target.as_deref())
             .await?;
 
         match catalog.drop_table(&table_ident).await {
@@ -324,7 +328,7 @@ impl CatalogOps {
             )
         })?;
         let table_ident = resolve_table_ident(table_name, session)?;
-        let catalog_name = catalog_qualifier(table_name);
+        let catalog_name = resolve_target_catalog(catalog_qualifier(table_name), session);
         let [namespace] = table_ident.namespace().as_ref().as_slice() else {
             return Err(SqeError::with_code(
                 SqeErrorCode::NotSupported,
