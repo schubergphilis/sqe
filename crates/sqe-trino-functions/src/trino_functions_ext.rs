@@ -1039,12 +1039,7 @@ impl ScalarUDFImpl for JsonSize {
 
 fn json_size_at_path(json: &str, path: &str) -> Option<i64> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    let key = path.trim_start_matches("$.");
-    let target = if key.is_empty() || key == "$" {
-        &v
-    } else {
-        crate::trino_functions::navigate_json(&v, key)?
-    };
+    let target = crate::trino_functions::navigate_json(&v, path)?;
     match target {
         serde_json::Value::Object(m) => Some(m.len() as i64),
         serde_json::Value::Array(a) => Some(a.len() as i64),

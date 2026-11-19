@@ -305,6 +305,33 @@ impl HiveDdlHandler {
         self.resolve_table_kind(&TableReference::full(catalog.to_string(), schema, table))
     }
 
+    /// `table_ref` made catalog-qualified from the session scope, for a
+    /// statement that needs the full name and not only its kind (`DROP
+    /// TABLE`): a `Partial` reference takes the session catalog, a `Bare` one
+    /// also the session schema (else `"default"`, as `ident::parse_table_ref`
+    /// falls back). Unchanged when it is already `Full` or the session has no
+    /// catalog.
+    pub fn qualify_for_session(
+        default_catalog: Option<&str>,
+        default_schema: Option<&str>,
+        table_ref: TableReference,
+    ) -> TableReference {
+        let Some(catalog) = default_catalog else {
+            return table_ref;
+        };
+        match table_ref {
+            TableReference::Partial { schema, table } => {
+                TableReference::full(catalog.to_string(), schema, table)
+            }
+            TableReference::Bare { table } => TableReference::full(
+                catalog.to_string(),
+                default_schema.unwrap_or("default").to_string(),
+                table,
+            ),
+            full @ TableReference::Full { .. } => full,
+        }
+    }
+
     /// Build the standard rejection for a statement this release does not
     /// support against a Hive external table. `cycle` is the release that
     /// adds support; `0` is the sentinel for "no planned cycle" and omits

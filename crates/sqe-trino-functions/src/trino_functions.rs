@@ -1653,36 +1653,24 @@ impl ScalarUDFImpl for UrlDecode {
 // Trino JSON aliases — thin wrappers backed by serde_json
 // ---------------------------------------------------------------------------
 
+/// The value a Trino JSON path names (`$.items[0].name`); see
+/// [`crate::json_path`].
 pub(crate) fn navigate_json<'a>(
     value: &'a serde_json::Value,
     path: &str,
 ) -> Option<&'a serde_json::Value> {
-    let mut current = value;
-    for key in path.split('.') {
-        let key = key.trim();
-        if key.is_empty() {
-            continue;
-        }
-        if let Some(obj) = current.as_object() {
-            current = obj.get(key)?;
-        } else {
-            let arr = current.as_array()?;
-            let idx: usize = key.parse().ok()?;
-            current = arr.get(idx)?;
-        }
-    }
-    Some(current)
+    crate::json_path::navigate(value, path)
 }
 
-fn extract_json_value(json: &str, key: &str) -> Option<String> {
+fn extract_json_value(json: &str, path: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    let result = navigate_json(&v, key)?;
+    let result = navigate_json(&v, path)?;
     Some(result.to_string())
 }
 
-fn extract_json_scalar(json: &str, key: &str) -> Option<String> {
+fn extract_json_scalar(json: &str, path: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    let result = navigate_json(&v, key)?;
+    let result = navigate_json(&v, path)?;
     match result {
         serde_json::Value::String(s) => Some(s.clone()),
         serde_json::Value::Number(n) => Some(n.to_string()),
@@ -1716,9 +1704,7 @@ impl ScalarUDFImpl for JsonExtract {
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         str_transform_2("json_extract", &args.args, |json, path| {
-            let key = path.trim_start_matches("$.");
-            let key = if key == "$" { "" } else { key };
-            extract_json_value(json, key)
+            extract_json_value(json, path)
         })
     }
 }
@@ -1744,9 +1730,7 @@ impl ScalarUDFImpl for JsonExtractScalar {
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         str_transform_2("json_extract_scalar", &args.args, |json, path| {
-            let key = path.trim_start_matches("$.");
-            let key = if key == "$" { "" } else { key };
-            extract_json_scalar(json, key)
+            extract_json_scalar(json, path)
         })
     }
 }

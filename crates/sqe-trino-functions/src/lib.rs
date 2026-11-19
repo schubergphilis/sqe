@@ -28,6 +28,7 @@ pub(crate) mod helpers;
 pub mod higher_order;
 pub mod histogram;
 mod json_cast;
+mod json_path;
 pub mod map_aggregates;
 pub mod map_fns;
 pub mod math_fns;

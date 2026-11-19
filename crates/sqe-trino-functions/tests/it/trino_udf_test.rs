@@ -223,6 +223,23 @@ async fn test_json_extract_scalar() {
     assert_eq!(v, Some("alice".to_string()));
 }
 
+/// Array indexes and quoted members in the JSON path, as in Trino.
+#[tokio::test]
+async fn test_json_extract_path_brackets() {
+    let doc = r#"'{"items":[{"name":"a"},{"name":"b"}],"k.x":{"n":[10,20]}}'"#;
+    let scalar = |path: &str| format!("SELECT json_extract_scalar({doc}, '{path}')");
+    assert_eq!(eval_str(&scalar("$.items[1].name")).await, Some("b".into()));
+    assert_eq!(
+        eval_str(&scalar(r#"$["k.x"].n[0]"#)).await,
+        Some("10".into())
+    );
+    assert_eq!(eval_str(&scalar("$.items[5].name")).await, None);
+    let v = eval_str(&format!("SELECT json_extract({doc}, '$.items[0]')")).await;
+    assert_eq!(v, Some(r#"{"name":"a"}"#.into()));
+    let n = eval_i64(&format!("SELECT json_size({doc}, '$.items[0]')")).await;
+    assert_eq!(n, Some(1));
+}
+
 #[tokio::test]
 async fn test_json_array_length() {
     let v = eval_i64(r#"SELECT json_array_length('[1,2,3,4,5]')"#).await;
