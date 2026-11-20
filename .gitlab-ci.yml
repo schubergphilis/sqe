@@ -217,6 +217,13 @@ aikido-build-validate:
         CARGO_PROFILE: "release"
         SQE_IMAGE_REF: "$CI_COMMIT_TAG"
         SQE_IMAGE_TAGS: "$CI_COMMIT_TAG stable"
+    # ci::multiarch-release: the same dry run with the release profile (thin
+    # LTO), to prove the tag build before tagging. About twice as long.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)ci::multiarch-release(,|$)/'
+      variables:
+        CARGO_PROFILE: "release"
+        SQE_IMAGE_REF: "mr-$CI_MERGE_REQUEST_IID"
+        SQE_IMAGE_TAGS: "mr-$CI_MERGE_REQUEST_IID"
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)ci::multiarch(,|$)/'
       variables:
         CARGO_PROFILE: "dev-release"
@@ -229,9 +236,12 @@ sqe-release-binaries:
   stage: test
   needs: []
   image: "$AIKIDO_RUST_IMAGE"
-  # The release profile links sqe-server with thin LTO; on a busy shared runner
-  # that link alone ran past 50 minutes (v0.55.1), and a cold compile adds 20-40.
+  # The release profile links with thin LTO: 30+ silent minutes per link, and a
+  # large memory peak. In v0.55.1 both arches landed on the same runner host
+  # twice and the host died mid-link both times, so the arches run one after
+  # the other. A job waiting for the group does not count toward its timeout.
   timeout: 180m
+  resource_group: sqe-release-binaries
   parallel:
     matrix:
       - SQE_ARCH: [amd64, arm64]
