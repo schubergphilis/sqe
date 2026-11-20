@@ -8,6 +8,12 @@
 services:
   polaris:
     image: apache/polaris:1.9.0
+    # The image sizes the heap at 80% of the memory it sees. Uncapped, that is
+    # 80% of the whole Docker VM: Polaris 1.9 lets its heap grow to over 6 GB
+    # of garbage during make test-integration, and the VM's OOM killer stops
+    # the JVM mid-suite (every later test fails to fetch a token). Capped, the
+    # JVM collects instead; the live set stays well under 1 GB.
+    mem_limit: 3g
     environment:
       POLARIS_PERSISTENCE_TYPE: in-memory
       POLARIS_BOOTSTRAP_CREDENTIALS: "POLARIS,root,s3cr3t"
