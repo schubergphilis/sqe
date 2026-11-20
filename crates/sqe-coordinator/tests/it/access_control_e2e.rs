@@ -1436,14 +1436,62 @@ async fn tag_from_out_of_band_commit_masks_the_next_query() {
     ranger_column_tagged(&ctx, "ssn", false).await;
 }
 
+/// `[policy.ranger] catalog_scoped = true` projects a column tag onto the
+/// `<catalog>.<namespace>` Ranger resource and clears the legacy unscoped
+/// `database=<namespace>` one (#899). Every other test here runs unscoped.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn catalog_scoped_tag_projection_keys_the_catalog() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    // Unscoped handler: the tag lands on the legacy `database=ac` resource.
+    set_column_tag(&ctx, "ssn", "PII").await;
+    ranger_column_tagged_in(&ctx, Some("ac"), "ssn", true).await;
+
+    // Same config and warm cache, scoped. Re-setting the tag re-projects it.
+    let (scoped, _) = crate::common::setup_ranger_handler_sharing(Some(ctx.cache.clone()), |cfg| {
+        cfg.policy.ranger.catalog_scoped = true;
+    })
+    .await;
+    let sql = format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn SET TAG PII = 'true'");
+    crate::common::eventually("scoped handler to re-set the tag", || async {
+        scoped
+            .execute(&ctx.carol, &sql, None)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await;
+
+    ranger_column_tagged_in(&ctx, Some("sales_wh.ac"), "ssn", true).await;
+    ranger_column_tagged_in(&ctx, Some("ac"), "ssn", false).await;
+
+    // Clean up through the scoped handler so no scoped resource is left behind.
+    let unset = format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn UNSET TAG PII");
+    scoped
+        .execute(&ctx.carol, &unset, None)
+        .await
+        .expect("unset tag through the scoped handler");
+    ranger_column_tagged_in(&ctx, None, "ssn", false).await;
+}
+
 /// Wait until Ranger's tag bundle does (or no longer does) associate a tag
-/// with `orders.<column>`.
+/// with `orders.<column>`, whatever `database` resource carries it.
 async fn ranger_column_tagged(ctx: &AcCtx, column: &str, want: bool) {
+    ranger_column_tagged_in(ctx, None, column, want).await;
+}
+
+/// `ranger_column_tagged`, optionally restricted to resources whose `database`
+/// element is exactly `database` (`ac` for the legacy unscoped form,
+/// `sales_wh.ac` for the catalog-scoped one).
+async fn ranger_column_tagged_in(ctx: &AcCtx, database: Option<&str>, column: &str, want: bool) {
     let has = |r: &serde_json::Value, key: &str, value: &str| {
         let values = r["resourceElements"][key]["values"].as_array();
         values.is_some_and(|a| a.iter().any(|v| v == value))
     };
-    let what = format!("Ranger tag on orders.{column} present={want}");
+    let what = format!("Ranger tag on {database:?} orders.{column} present={want}");
     crate::common::eventually(&what, || async {
         let bundle = ctx.ranger.download_tag_bundle(HIVE_SERVICE).await;
         let bundle = bundle.map_err(|e| e.to_string())?;
@@ -1452,6 +1500,7 @@ async fn ranger_column_tagged(ctx: &AcCtx, column: &str, want: bool) {
         let tagged = resources
             .iter()
             .filter(|r| has(r, "table", "orders") && has(r, "column", column))
+            .filter(|r| database.is_none_or(|d| has(r, "database", d)))
             .any(|r| {
                 let ids = &bundle["resourceToTagIds"][r["id"].to_string()];
                 ids.as_array().is_some_and(|t| !t.is_empty())
