@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0"
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 description = "The shipped SQE binary: `sqe-server --mode coordinator|worker`, wiring the coordinator and worker libraries"
 
 # Review 803 item 4 / 804 MR C: the binary used to live in `sqe-coordinator`,

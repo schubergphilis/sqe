@@ -88,6 +88,14 @@ impl FlightServer {
     }
 
     async fn start_with(provider: Arc<dyn sqe_auth::AuthProvider>) -> Self {
+        Self::start_audited(provider, None).await
+    }
+
+    /// [`Self::start_with`] with the handler writing audit records to `audit`.
+    async fn start_audited(
+        provider: Arc<dyn sqe_auth::AuthProvider>,
+        audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
+    ) -> Self {
         let polaris = mount_empty_polaris().await;
         let config = smoke_config(&polaris.uri());
         let tracker = Arc::new(QueryTracker::new(&config.query_history));
@@ -103,7 +111,7 @@ impl FlightServer {
             None, // worker_registry
             None, // credential_tracker
             None, // metrics
-            None, // audit
+            audit,
             Arc::clone(&tracker),
             None, // query_cache
             None, // grant_backend
@@ -271,6 +279,87 @@ async fn use_over_flight_scopes_later_statements_on_the_same_token() {
     other.set_token(String::from_utf8(other_token.to_vec()).expect("token is utf-8"));
     let other_schema = query(&mut other, "SELECT current_schema() AS s").await.expect("query");
     assert_eq!(schema_of(other_schema), "default", "USE is per session");
+}
+
+/// #910: the audit record names the session's catalog and namespace, in the
+/// native and the OCSF line, on the streaming path (a `SELECT` over Flight
+/// streams through `DoGet`). `USE CATALOG finance` was a syntax error, then a
+/// no-op: the next statement must record `finance`, the one before it the
+/// configured default.
+#[tokio::test(flavor = "multi_thread")]
+async fn use_catalog_over_flight_names_the_session_catalog_in_both_audit_records() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let native = dir.path().join("audit.jsonl");
+    let ocsf = dir.path().join("audit.ocsf.jsonl");
+    let audit = Arc::new(
+        sqe_metrics::audit::AuditLogger::with_config(
+            native.to_str().unwrap(),
+            sqe_metrics::audit::AuditFormat::Both,
+        )
+        .expect("audit logger opens"),
+    );
+    let provider = Arc::new(AnonymousProvider::new(AnonymousProviderConfig::default()));
+    let server = FlightServer::start_audited(provider, Some(Arc::clone(&audit))).await;
+    let mut client = FlightSqlServiceClient::new(server.channel().await);
+    let token = client
+        .handshake("catalog-audit", "catalog-audit")
+        .await
+        .expect("handshake");
+    client.set_token(String::from_utf8(token.to_vec()).expect("token is utf-8"));
+
+    query(&mut client, "SELECT 11 AS before_use")
+        .await
+        .expect("query before USE");
+    query(&mut client, "USE CATALOG finance")
+        .await
+        .expect("USE CATALOG executes");
+    query(&mut client, "SELECT 12 AS after_use")
+        .await
+        .expect("query after USE");
+    query(&mut client, "USE CATALOG finance.gold")
+        .await
+        .expect_err("a dotted catalog is refused");
+
+    audit.flush();
+    let lines = |path: &std::path::Path| -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .expect("audit file")
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).expect("each line is JSON"))
+            .collect()
+    };
+    let (native, ocsf) = (lines(&native), lines(&ocsf));
+    let record = |sql_part: &str| -> (serde_json::Value, serde_json::Value) {
+        let n = native
+            .iter()
+            .find(|r| {
+                r["query"]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains(sql_part))
+            })
+            .unwrap_or_else(|| panic!("native record for {sql_part}: {native:?}"));
+        let o = ocsf
+            .iter()
+            .find(|r| {
+                r["unmapped"]["query_text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains(sql_part))
+            })
+            .unwrap_or_else(|| panic!("OCSF record for {sql_part}: {ocsf:?}"));
+        (n.clone(), o.clone())
+    };
+
+    let (n, o) = record("after_use");
+    assert_eq!(n["session"]["catalog"], "finance", "{n}");
+    assert_eq!(n["session"]["namespace"], "default", "{n}");
+    assert_eq!(o["unmapped"]["session_catalog"], "finance", "{o}");
+    assert_eq!(o["unmapped"]["session_namespace"], "default", "{o}");
+
+    let (n, o) = record("before_use");
+    let default_catalog = n["session"]["catalog"].as_str().expect("catalog named");
+    assert_ne!(default_catalog, "finance", "{n}");
+    assert_eq!(o["unmapped"]["session_catalog"], default_catalog, "{o}");
 }
 
 /// Finding 403: the ADBC/JDBC cancel sequence over the wire. `GetFlightInfo`

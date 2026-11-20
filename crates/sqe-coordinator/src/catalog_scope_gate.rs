@@ -131,7 +131,12 @@ pub fn check_statement(session: &Session, kind: &StatementKind) -> Result<(), Sq
         StatementKind::PolicyDdl(_) => "CREATE / DROP POLICY",
         StatementKind::SetTags(_) => "Setting tags",
         StatementKind::SetMaskingPolicy(_) => "Setting a masking policy",
-        StatementKind::SetCatalog(catalog) => return session.check_catalog_read(catalog),
+        StatementKind::SetCatalog(target) => {
+            if let Ok(catalog) = crate::query_handler::parse_catalog_target(target) {
+                session.check_catalog_read(&catalog)?;
+            }
+            return Ok(());
+        }
         StatementKind::Use(target) => {
             if let Ok((Some(catalog), _)) = crate::query_handler::parse_use_target(target) {
                 session.check_catalog_read(&catalog)?;
@@ -172,6 +177,7 @@ fn refuse(gate: &Gate, session: &Session, client_ip: Option<&str>, reason: &str)
             trace_id: sqe_metrics::propagation::current_trace_id(),
             query_id: None,
             transaction: None,
+            session: None,
             integrity: Integrity::default(),
         });
     }

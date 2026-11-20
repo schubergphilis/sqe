@@ -22,7 +22,7 @@ use sqe_core::snapshot_properties::SnapshotProperties;
 use sqe_core::{Session, SqeError};
 use sqe_metrics::audit::{
     Actor, AuditEntry, AuditEvent, AuditKind, AuditLogger, Integrity, Outcome, PolicyAudit,
-    QueryInfo, QueryStats, Resource, Timing,
+    QueryInfo, QueryStats, Resource, SessionScope, Timing,
 };
 use sqe_policy::PolicySummary;
 use sqe_sql::StatementKind;
@@ -41,6 +41,18 @@ pub(crate) fn actor_for(session: &Session) -> Actor {
         session.user.groups.clone(),
     )
     .with_app_name(session.source.clone())
+}
+
+/// The catalog and namespace the session resolved to, for the audit record's
+/// `session` block (#910). The same scope the planner defaults unqualified
+/// names to (`lineage_scope`): the session's catalog or the configured
+/// default, the session's schema or `default`.
+pub(crate) fn session_scope(config: &sqe_core::SqeConfig, session: &Session) -> SessionScope {
+    let scope = crate::query_handler::lineage_scope(config, session);
+    SessionScope {
+        catalog: scope.catalog,
+        namespace: Some(scope.schema),
+    }
 }
 
 /// `Success`, or the failure block built from the error's classified code and
@@ -155,6 +167,8 @@ pub(crate) struct StatementAudit<'a> {
     pub client_ip: Option<String>,
     pub trace_id: Option<String>,
     pub query_id: uuid::Uuid,
+    /// The session's resolved catalog and namespace.
+    pub scope: SessionScope,
 }
 
 /// Emit the one audit record for a statement that failed before the
@@ -179,6 +193,7 @@ pub(crate) fn emit_failed_statement(
     duration: Duration,
     client_ip: Option<String>,
     query_id: uuid::Uuid,
+    scope: SessionScope,
 ) {
     let trace_id = sqe_metrics::propagation::current_trace_id();
     let Some(kind) = kind else {
@@ -197,6 +212,7 @@ pub(crate) fn emit_failed_statement(
             trace_id,
             query_id: Some(query_id.to_string()),
             transaction: None,
+            session: Some(scope),
             integrity: Integrity::default(),
         });
         return;
@@ -224,6 +240,7 @@ pub(crate) fn emit_failed_statement(
             client_ip,
             trace_id,
             query_id,
+            scope,
         },
     );
 }
@@ -268,6 +285,7 @@ pub(crate) fn emit_oversized_statement(
     duration: Duration,
     client_ip: Option<String>,
     query_id: uuid::Uuid,
+    scope: SessionScope,
 ) {
     let text = oversized_text_prefix(sql);
     audit.log_event(AuditEvent {
@@ -291,6 +309,7 @@ pub(crate) fn emit_oversized_statement(
         trace_id: sqe_metrics::propagation::current_trace_id(),
         query_id: Some(query_id.to_string()),
         transaction: None,
+        session: Some(scope),
         integrity: Integrity::default(),
     });
 }
@@ -306,6 +325,8 @@ pub(crate) struct IngestAudit {
     /// Keys of the snapshot properties the commit carries, sorted. Set once
     /// the options were resolved; recorded on success only, like an INSERT.
     pub snapshot_property_keys: Vec<String>,
+    /// The session's resolved catalog and namespace.
+    pub scope: SessionScope,
 }
 
 impl IngestAudit {
@@ -359,6 +380,7 @@ pub(crate) fn emit_ingest_audit(
         trace_id: sqe_metrics::propagation::current_trace_id(),
         query_id: Some(query_id.to_string()),
         transaction: None,
+        session: Some(ingest.scope.clone()),
         integrity: Integrity::default(),
     });
 }
@@ -460,6 +482,7 @@ pub(crate) fn emit_statement_audit(audit: &AuditLogger, a: StatementAudit<'_>) {
         trace_id: a.trace_id,
         query_id: Some(a.query_id.to_string()),
         transaction: None,
+        session: Some(a.scope),
         integrity: Integrity::default(),
     });
 }
@@ -568,6 +591,10 @@ mod tests {
                         client_ip: None,
                         trace_id: None,
                         query_id: uuid::Uuid::now_v7(),
+                        scope: SessionScope {
+                            catalog: "iceberg".to_string(),
+                            namespace: Some("default".to_string()),
+                        },
                     },
                 );
             }
@@ -604,6 +631,81 @@ mod tests {
         );
     }
 
+    /// #910: the record names the session's catalog and namespace, not the
+    /// catalogs of the tables the statement touched.
+    #[test]
+    fn audit_names_the_session_catalog_not_the_catalogs_of_its_tables() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+        let audit = AuditLogger::new(path.to_str().unwrap()).expect("audit logger");
+        let config: sqe_core::SqeConfig =
+            toml::from_str("[coordinator]\n[auth]\n[catalog]\ncatalog_url = \"http://polaris\"\n")
+                .expect("minimal config parses");
+        let mut session = Session::new(
+            "alice".to_string(),
+            sqe_core::SecretString::new("access_tok".to_string()),
+            None,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            vec![],
+        );
+        session.default_catalog = Some("c".to_string());
+        session.default_schema = Some("gold".to_string());
+        let table = |catalog: &str| Resource {
+            catalog: Some(catalog.to_string()),
+            namespace: vec!["s".to_string()],
+            name: "t".to_string(),
+            object_type: sqe_metrics::audit::ObjectType::Table,
+        };
+        let sql = "SELECT * FROM a.s.t JOIN b.s.t ON true";
+        let kind = sqe_sql::parse_and_classify(sql).expect(sql);
+        emit_statement_audit(
+            &audit,
+            StatementAudit {
+                session: &session,
+                sql,
+                kind: &kind,
+                kind_name: kind.name().to_string(),
+                error: None,
+                status: "success",
+                duration: Duration::from_millis(1),
+                execution_ms: 1,
+                rows: 1,
+                rows_written: None,
+                snapshot_property_keys: Vec::new(),
+                plan_metrics: &PlanMetrics::default(),
+                policy_summary: None,
+                resources: vec![table("a"), table("b")],
+                tables_touched: vec!["a.s.t".to_string(), "b.s.t".to_string()],
+                grant_resources: Vec::new(),
+                client_ip: None,
+                trace_id: None,
+                query_id: uuid::Uuid::now_v7(),
+                scope: session_scope(&config, &session),
+            },
+        );
+        audit.flush();
+
+        let content = std::fs::read_to_string(&path).expect("audit file");
+        let event: serde_json::Value = content
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .find(|v: &serde_json::Value| v.get("query").is_some())
+            .expect("query record");
+        assert_eq!(
+            event["session"],
+            serde_json::json!({"catalog": "c", "namespace": "gold"}),
+            "{content}"
+        );
+        assert_eq!(event["resources"].as_array().map(Vec::len), Some(2));
+
+        // No session scope: the configured default catalog, schema `default`.
+        session.default_catalog = None;
+        session.default_schema = None;
+        let scope = session_scope(&config, &session);
+        assert_eq!(scope.catalog, config.resolve_default_catalog());
+        assert_eq!(scope.namespace.as_deref(), Some("default"));
+    }
+
     /// A Flight session id is a bearer credential: the audit record carries
     /// its hash, never the raw value.
     #[test]
@@ -629,6 +731,10 @@ mod tests {
             Duration::from_millis(1),
             None,
             uuid::Uuid::now_v7(),
+            SessionScope {
+                catalog: "iceberg".to_string(),
+                namespace: Some("default".to_string()),
+            },
         );
         audit.flush();
 

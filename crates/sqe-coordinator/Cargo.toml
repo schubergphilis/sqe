@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0"
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 
 [features]
 # Opt-in for integration tests that spin up a SQLite-backed Iceberg
@@ -122,6 +124,8 @@ opentelemetry_sdk = { workspace = true }
 # OS-assigned port. Both production entry points hand tonic a SocketAddr and
 # let it bind, which cannot report the port back.
 tokio-stream = "0.1"
+# Test-only: the catalog scope e2e signs ES256 scopes as the test issuer.
+jsonwebtoken = { workspace = true }
 
 toml = { workspace = true }
 sqe-core = { path = "../sqe-core" }

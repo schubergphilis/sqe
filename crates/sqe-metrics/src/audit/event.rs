@@ -199,6 +199,17 @@ pub struct Integrity {
     pub hash: String,
 }
 
+/// The catalog and namespace a statement's session resolved to: the session's
+/// `USE` / `X-Trino-Catalog` / Flight default, else the configured default.
+/// Names where unqualified identifiers pointed, whatever tables the statement
+/// touched (a `SELECT 1` touches none, a join can span two catalogs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionScope {
+    pub catalog: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
     pub time: DateTime<Utc>,
@@ -229,6 +240,12 @@ pub struct AuditEvent {
     /// Set on [`AuditKind::Transaction`] events only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transaction: Option<TransactionAudit>,
+    /// The session's resolved catalog and namespace (#910). Omitted when
+    /// unset (authentication, maintenance, scheduler and system events, and
+    /// every record written before this field), so those records serialise,
+    /// and hash into the audit chain, byte for byte as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionScope>,
     #[serde(default)]
     pub integrity: Integrity,
 }
@@ -314,6 +331,7 @@ pub(crate) fn sample_query_event() -> AuditEvent {
         trace_id: Some("0af7651916cd43dd8448eb211c80319c".into()),
         query_id: Some("019f510a-a20f-74f1-81cd-d1d22ae2e18b".into()),
         transaction: None,
+        session: None,
         integrity: Integrity::default(),
     }
 }
@@ -370,6 +388,7 @@ mod tests {
             trace_id: None,
             query_id: None,
             transaction: None,
+            session: None,
             integrity: Integrity::default(),
         }
     }
@@ -388,6 +407,42 @@ mod tests {
         assert_eq!(a.email, Some("a@x.io".to_string()));
         assert_eq!(a.roles, vec!["r".to_string()]);
         assert_eq!(a.groups, vec!["g".to_string()]);
+    }
+
+    /// #910: a record without a session scope serialises without the key, so
+    /// it hashes into the audit chain as it always did; with one it carries
+    /// the object and round-trips.
+    #[test]
+    fn session_scope_is_omitted_when_unset_and_round_trips_when_set() {
+        let ev = sample_query_event();
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(!json.contains("\"session\""), "{json}");
+        // A line written before the field existed still reads.
+        let back: AuditEvent = serde_json::from_str(&json).unwrap();
+        assert!(back.session.is_none());
+
+        let mut ev = sample_query_event();
+        ev.session = Some(SessionScope {
+            catalog: "finance".into(),
+            namespace: Some("gold".into()),
+        });
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(
+            json.contains("\"session\":{\"catalog\":\"finance\",\"namespace\":\"gold\"}"),
+            "{json}"
+        );
+        let back: AuditEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.session, ev.session);
+
+        ev.session = Some(SessionScope {
+            catalog: "finance".into(),
+            namespace: None,
+        });
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(
+            json.contains("\"session\":{\"catalog\":\"finance\"}"),
+            "{json}"
+        );
     }
 
     #[test]

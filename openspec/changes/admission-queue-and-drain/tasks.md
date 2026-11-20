@@ -23,7 +23,7 @@
 - [x] 4.1 `draining` flag in the handler; admission refuses and queued waiters are woken with `draining`
 - [x] 4.2 `shutdown_with_drain` waits on `active_count()`; keep `before_close` after it; fix the stale comment in `main.rs`
 - [x] 4.3 Worker drain hook: refuse new fragments with `Unavailable`, wait for in-flight ones
-- [ ] 4.4 Process-level test: acceptance 4 (SIGTERM during a 20 s query)
+- [x] 4.4 Process-level test: acceptance 4 (SIGTERM during a 20 s query)
 
 ## 5. Idle gauge
 

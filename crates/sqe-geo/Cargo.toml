@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0"
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 description = "ST_* scalar functions over WKB geometry columns (Iceberg V3 GEOMETRY / GEOGRAPHY)"
 
 # Its own crate so the geometry algorithms (and `geo`'s dependency tree) do

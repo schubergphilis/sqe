@@ -55,6 +55,12 @@ pub fn to_ocsf(event: &AuditEvent) -> Value {
     if let Some(id) = &event.trace_id {
         unmapped.insert("trace_id".into(), json!(id));
     }
+    if let Some(scope) = &event.session {
+        unmapped.insert("session_catalog".into(), json!(scope.catalog));
+        if let Some(ns) = &scope.namespace {
+            unmapped.insert("session_namespace".into(), json!(ns));
+        }
+    }
     // The total lands on OCSF's own `duration` below; the phase split has no
     // OCSF home.
     if let Some(t) = &event.timing {
@@ -212,6 +218,7 @@ mod tests {
             trace_id: None,
             query_id: None,
             transaction: None,
+            session: None,
             integrity: Integrity::default(),
         }
     }
@@ -252,6 +259,33 @@ mod tests {
             v["unmapped"]["snapshot_property_keys"],
             json!(["copy.run", "etl.job"])
         );
+    }
+
+    #[test]
+    fn session_scope_maps_only_when_present() {
+        let none = to_ocsf(&query_event());
+        assert!(none["unmapped"].get("session_catalog").is_none(), "{none}");
+        assert!(
+            none["unmapped"].get("session_namespace").is_none(),
+            "{none}"
+        );
+
+        let mut ev = query_event();
+        ev.session = Some(crate::audit::SessionScope {
+            catalog: "finance".into(),
+            namespace: Some("gold".into()),
+        });
+        let v = to_ocsf(&ev);
+        assert_eq!(v["unmapped"]["session_catalog"], "finance");
+        assert_eq!(v["unmapped"]["session_namespace"], "gold");
+
+        ev.session = Some(crate::audit::SessionScope {
+            catalog: "finance".into(),
+            namespace: None,
+        });
+        let v = to_ocsf(&ev);
+        assert_eq!(v["unmapped"]["session_catalog"], "finance");
+        assert!(v["unmapped"].get("session_namespace").is_none(), "{v}");
     }
 
     #[test]
@@ -325,6 +359,7 @@ mod tests {
             trace_id: None,
             query_id: None,
             transaction: None,
+            session: None,
             integrity: Integrity::default(),
         };
         // No client label: the key is absent, not null.

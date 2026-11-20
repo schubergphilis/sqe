@@ -220,6 +220,15 @@ object: query hash and fingerprint, statement type, query id, trace id, the phas
 split (`queued_ms`, `planning_ms`, `execution_ms`), scan stats, the error type of a
 failure, and policy decisions.
 
+Every statement record also names the session's resolved catalog and namespace.
+Natively that is `"session": {"catalog": "...", "namespace": "..."}`; in OCSF it is
+`unmapped.session_catalog` and `unmapped.session_namespace`. The catalog is the one
+the session selected (`USE CATALOG`, the connection default), falling back to the
+configured default catalog, and the namespace falls back to `default`. It is the
+session scope, not the catalogs of the tables the statement touched. Authentication,
+maintenance and system records carry no session scope, and the fields are omitted
+there. Records written before this field existed hash unchanged.
+
 `query_hash` hashes the whitespace- and case-normalised text, so it differs per
 literal. `query_fingerprint` hashes the same text with every string and numeric
 literal replaced by a placeholder, so `WHERE id = 1` and `WHERE id = 2` share one

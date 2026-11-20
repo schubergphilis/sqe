@@ -1607,6 +1607,7 @@ impl HiveDdlHandler {
             trace_id: None,
             query_id: None,
             transaction: None,
+            session: None,
             integrity: sqe_metrics::audit::Integrity::default(),
         });
     }
