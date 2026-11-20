@@ -22,7 +22,7 @@
 
 services:
   spark-iceberg:
-    image: apache/spark:4.1.3
+    image: apache/spark:4.3.0
     container_name: sqe-spark-iceberg
     # The image runs as `spark` with HOME=/nonexistent, where Ivy cannot
     # write its resolution cache. Root, with the cache on the volume below.

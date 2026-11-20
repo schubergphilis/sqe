@@ -202,7 +202,7 @@ services:
 
   # ── ranger-setup — register service-def + service, seed admin grant ───
   ranger-setup:
-    image: curlimages/curl:8.22.0
+    image: curlimages/curl:8.23.0
     entrypoint: ["sh", "/bootstrap-ranger.sh"]
     environment:
       RANGER_URL: http://ranger-admin:6080
@@ -283,7 +283,7 @@ services:
 
   # ── polaris-setup — catalogs, namespaces, principals, principal-roles ─
   polaris-setup:
-    image: curlimages/curl:8.22.0
+    image: curlimages/curl:8.23.0
     entrypoint: ["sh", "/bootstrap-data.sh"]
     environment:
       POLARIS_URL: http://polaris:8181
@@ -341,7 +341,7 @@ services:
   # Uses curl + Trino HTTP, not the SQE image: the production SQE image is
   # Chainguard/distroless (no shell). Seeding must not require `sh` inside it.
   data-seed:
-    image: curlimages/curl:8.22.0
+    image: curlimages/curl:8.23.0
     entrypoint: ["sh", "-c"]
     command:
       - |
