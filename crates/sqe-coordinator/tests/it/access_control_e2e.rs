@@ -5171,3 +5171,201 @@ async fn grant_masked_with_per_role_items_survive_revoke() {
         .await;
     delete_grant_policies_on_orders(&ctx.ranger).await;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The `system` catalog split (#901): the Polaris part of `system` is governed
+// like any catalog. openspec/changes/system-catalog-split, task 6.2.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SYS_AUDIT: &str = "system.access.audit";
+
+/// Create the Polaris catalog `system` on the access-control stack when it is
+/// not there yet. Idempotent (409 is success). The quickstart bootstrap creates
+/// only `sales_wh` and `ops_wh`, and `system` is test-owned: nothing else in the
+/// demo reads it, so it is created here, with the same shape `mk_catalog` in
+/// `quickstart/polaris-ranger-keycloak/polaris/bootstrap-data.sh` gives the
+/// other two. Ranger's seed policies use `catalog: *`, so no policy is needed
+/// for it. Must run BEFORE `ac_setup()`: `catalog_discovery = "polaris-auto"`
+/// finds the catalog when the handler's sessions are built.
+async fn ensure_polaris_system_catalog() {
+    let config = sqe_core::SqeConfig::load(&crate::common::ranger_config_path())
+        .expect("load the access-control config");
+    let polaris = config
+        .catalog
+        .catalog_url
+        .trim_end_matches('/')
+        .trim_end_matches("/api/catalog")
+        .to_string();
+    let secret = std::env::var("POLARIS_BOOTSTRAP_SECRET")
+        .unwrap_or_else(|_| "polaris-root-secret".to_string());
+    let realm = "iceberg-ranger";
+    let http = reqwest::Client::new();
+
+    let token: serde_json::Value = http
+        .post(format!("{polaris}/api/catalog/v1/oauth/tokens"))
+        .header("Polaris-Realm", realm)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(format!(
+            "grant_type=client_credentials&client_id=root&client_secret={secret}\
+             &scope=PRINCIPAL_ROLE:ALL"
+        ))
+        .send()
+        .await
+        .expect("Polaris token request")
+        .json()
+        .await
+        .expect("Polaris token response");
+    let token = token["access_token"]
+        .as_str()
+        .expect("Polaris root token")
+        .to_string();
+
+    let resp = http
+        .post(format!("{polaris}/api/management/v1/catalogs"))
+        .header("Polaris-Realm", realm)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"catalog": {
+            "name": "system",
+            "type": "INTERNAL",
+            "storageConfigInfo": {
+                "storageType": "S3",
+                "allowedLocations": ["s3://warehouse/system/"],
+                "endpoint": config.storage.s3_endpoint,
+                "endpointInternal": "http://rustfs:9000",
+                "pathStyleAccess": true,
+                "stsUnavailable": true
+            },
+            "properties": {
+                "default-base-location": "s3://warehouse/system/",
+                "polaris.config.drop-with-purge.enabled": "true"
+            }
+        }}))
+        .send()
+        .await
+        .expect("Polaris create catalog request");
+    let status = resp.status();
+    assert!(
+        status.is_success() || status.as_u16() == 409,
+        "create Polaris catalog `system` -> HTTP {status}: {}",
+        resp.text().await.unwrap_or_default()
+    );
+}
+
+/// A tag mask on a column of `system.access.audit`, a table of the Polaris
+/// catalog `system`, applies; a user with no grant on it is refused.
+///
+/// This is the failure the change guards against: a Polaris table reachable
+/// under a name the policy rewriter still treats as virtual would skip tag
+/// policies and masks. Here the table is read through every policy step: the
+/// coarse gate (`polaris` service, written by SQL `GRANT`), the tag service
+/// (`PII` on `ssn`, set through SQL, mask from the test-owned tag service).
+/// bob (role `engineer`, the grantee) sees the masked value; alice (analyst
+/// only) holds no grant and is refused, with the same statement proven valid
+/// as carol first, so the refusal is authorization and not a typo.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn system_catalog_split_tag_mask_applies_and_ungranted_user_is_refused() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    ensure_polaris_system_catalog().await;
+    let ctx = ac_setup().await;
+
+    // A run that died halfway left its coarse-gate policy on this exact
+    // resource; `ac_setup` only cleans the suite's own catalogs.
+    delete_polaris_policies_on(&ctx, "system", "access", "audit").await;
+
+    crate::common::eventually("carol to (re)create system.access.audit", || async {
+        for stmt in [
+            "CREATE SCHEMA IF NOT EXISTS system.access".to_string(),
+            format!("DROP TABLE IF EXISTS {SYS_AUDIT}"),
+            format!("CREATE TABLE {SYS_AUDIT} (id BIGINT, ssn VARCHAR)"),
+            format!(
+                "INSERT INTO {SYS_AUDIT} VALUES \
+                 (1,'111-11-1111'),(2,'222-22-2222'),(3,'333-33-3333')"
+            ),
+        ] {
+            if let Err(e) = ctx.handler.execute(&ctx.carol, &stmt, None).await {
+                return Err(format!("`{stmt}` failed: {e}"));
+            }
+        }
+        Ok(())
+    })
+    .await;
+
+    let sql = format!("SELECT ssn FROM {SYS_AUDIT} ORDER BY id");
+
+    // Before any grant: refused for both (carol proves the SQL is valid).
+    assert_denied_but_valid(&ctx, &ctx.alice, &sql).await;
+    assert_denied_but_valid(&ctx, &ctx.bob, &sql).await;
+
+    // The grant lands in the coarse-gate service on the Polaris `system`
+    // catalog's resource, and nowhere else.
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT SELECT ON {SYS_AUDIT} TO ROLE \"engineer\""),
+    )
+    .await;
+    let access =
+        polaris_access_types_for_role(&ctx, "engineer", "system", Some("access"), Some("audit"))
+            .await;
+    assert!(
+        access.contains(&"table-data-read".to_string()),
+        "the grant is a policy on system.access.audit in the polaris service, got {access:?}"
+    );
+
+    // The tag is set through SQL and read back from the table property; the
+    // mask comes from the tag service, as for any catalog.
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("ALTER TABLE {SYS_AUDIT} MODIFY COLUMN ssn SET TAG PII = 'true'"),
+    )
+    .await;
+    let policy = format!("{PREFIX}system-tag-mask-pii");
+    ctx.ranger
+        .create_policy(tag_mask_policy(
+            &policy,
+            "PII",
+            serde_json::json!({"dataMaskType": "hive:MASK_SHOW_LAST_4"}),
+        ))
+        .await
+        .expect("create tag mask");
+
+    let bob = crate::common::eventually("bob's tag mask on system.access.audit", || async {
+        match ctx.handler.execute(&ctx.bob, &sql, None).await {
+            Ok(b)
+                if col_strings(&b, "ssn") == vec!["xxx-xx-1111", "xxx-xx-2222", "xxx-xx-3333"] =>
+            {
+                Ok(b)
+            }
+            Ok(b) => Err(format!("got {:?}", col_strings(&b, "ssn"))),
+            Err(e) => Err(format!("query failed: {e}")),
+        }
+    })
+    .await;
+    assert_eq!(total_rows(&bob), 3, "a tag mask must not drop rows");
+
+    // The grantee is masked; the user without a grant is still refused.
+    assert_denied_but_valid(&ctx, &ctx.alice, &sql).await;
+
+    // Cleanup: the tag policy, the coarse-gate policy, the table.
+    let _ = ctx.ranger.delete_policy(TAG_SERVICE, &policy).await;
+    let _ = ctx
+        .handler
+        .execute(
+            &ctx.carol,
+            &format!("REVOKE SELECT ON {SYS_AUDIT} FROM ROLE \"engineer\""),
+            None,
+        )
+        .await;
+    delete_polaris_policies_on(&ctx, "system", "access", "audit").await;
+    let _ = ctx
+        .handler
+        .execute(
+            &ctx.carol,
+            &format!("DROP TABLE IF EXISTS {SYS_AUDIT}"),
+            None,
+        )
+        .await;
+}

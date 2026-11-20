@@ -30,5 +30,5 @@
 ## 6. Tests and docs
 
 - [x] 6.1 Integration: acceptance 1-6 (Polaris catalog `system` created by `scripts/bootstrap-test.sh`)
-- [ ] 6.2 Ranger e2e: tag mask on `system.access.audit`, refused without grant
+- [x] 6.2 Ranger e2e: tag mask on `system.access.audit`, refused without grant
 - [x] 6.3 Book: catalogs page documents the split and the reserved names
