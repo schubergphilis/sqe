@@ -94,10 +94,31 @@ if [[ "$(ulimit -n)" != unlimited && "$(ulimit -n)" -lt 4096 ]]; then
     exit 1
 fi
 
-echo "==> cargo zigbuild $TRIPLE (glibc $GLIBC_FLOOR, profile $CARGO_PROFILE)"
-RUSTFLAGS="$REMAP" CFLAGS="$CFLAG_REMAP" CXXFLAGS="$CFLAG_REMAP" \
-    cargo zigbuild --locked --profile "$CARGO_PROFILE" --no-default-features \
-    --target "$TRIPLE.$GLIBC_FLOOR" -p sqe-server -p sqe-cli --bin sqe-server --bin sqe-cli
+# Memory every 60 s while cargo runs. The thin-LTO link prints nothing for 30+
+# minutes, and in v0.55.1 the runner host died in that window; this shows how
+# close the job came to its cgroup limit and whether the kernel OOM-killed it.
+mem_sample() {
+    local cg=/sys/fs/cgroup
+    while sleep 60; do
+        echo "[mem] $(date -u +%H:%M:%S) current=$(cat "$cg/memory.current" 2>/dev/null || echo ?)" \
+            "max=$(cat "$cg/memory.max" 2>/dev/null || echo ?)" \
+            "$(grep -E '^oom_kill ' "$cg/memory.events" 2>/dev/null || true)" \
+            "avail=$(awk '/MemAvailable/ {print $2 "kB"}' /proc/meminfo)"
+    done
+}
+mem_sample &
+MEM_SAMPLER=$!
+trap 'kill "$MEM_SAMPLER" 2>/dev/null || true' EXIT
+
+# One binary per cargo run, so two thin-LTO links never overlap. The second
+# run reuses every dependency the first one built and only compiles and links
+# its own crate.
+for bin in sqe-cli sqe-server; do
+    echo "==> cargo zigbuild $bin $TRIPLE (glibc $GLIBC_FLOOR, profile $CARGO_PROFILE)"
+    RUSTFLAGS="$REMAP" CFLAGS="$CFLAG_REMAP" CXXFLAGS="$CFLAG_REMAP" \
+        cargo zigbuild --locked --profile "$CARGO_PROFILE" --no-default-features \
+        --target "$TRIPLE.$GLIBC_FLOOR" -p "$bin" --bin "$bin"
+done
 
 profile_dir="$CARGO_PROFILE"
 [[ "$CARGO_PROFILE" == dev ]] && profile_dir=debug
