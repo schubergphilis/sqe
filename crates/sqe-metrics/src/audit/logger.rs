@@ -213,6 +213,7 @@ impl From<AuditEntry> for AuditEvent {
             trace_id: None,
             query_id: None,
             transaction: None,
+            session: None,
             integrity: Integrity::default(),
         }
     }
@@ -727,6 +728,7 @@ fn audit_resume_event(reason: &str) -> AuditEvent {
         trace_id: None,
         query_id: None,
         transaction: None,
+        session: None,
         integrity: Integrity::default(),
     }
 }

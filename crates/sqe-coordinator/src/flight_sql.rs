@@ -755,6 +755,7 @@ impl SqeFlightSqlService {
                 trace_id: sqe_metrics::propagation::current_trace_id(),
                 query_id: None,
                 transaction: None,
+                session: None,
                 integrity: sqe_metrics::audit::Integrity::default(),
             };
             audit.log_event(event);
@@ -796,6 +797,7 @@ impl SqeFlightSqlService {
                 trace_id: sqe_metrics::propagation::current_trace_id(),
                 query_id: None,
                 transaction: None,
+                session: None,
                 integrity: sqe_metrics::audit::Integrity::default(),
             };
             audit.log_event(event);
@@ -2688,6 +2690,7 @@ impl FlightSqlService for SqeFlightSqlService {
                 },
                 mode: None,
                 snapshot_property_keys: Vec::new(),
+                scope: crate::audit_emitter::session_scope(&self.config, &session),
             },
             start: std::time::Instant::now(),
             client_ip: Some(self.extract_client_ip(&request)),

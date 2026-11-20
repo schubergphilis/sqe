@@ -188,6 +188,8 @@ pub struct StreamFinalizer {
     pub client_ip: Option<String>,
     /// W3C trace ID captured at query start for audit <-> trace correlation (O4).
     pub trace_id: Option<String>,
+    /// The session's resolved catalog and namespace, for the audit record.
+    pub scope: sqe_metrics::audit::SessionScope,
     pub query_span: tracing::Span,
 }
 
@@ -334,6 +336,7 @@ impl StreamFinalizer {
             trace_id: self.trace_id.clone(),
             query_id: Some(self.query_id.to_string()),
             transaction: None,
+            session: Some(self.scope.clone()),
             integrity: Default::default(),
         });
     }
@@ -1170,6 +1173,10 @@ mod tests {
             resources: Vec::new(),
             client_ip: None,
             trace_id: None,
+            scope: sqe_metrics::audit::SessionScope {
+                catalog: "iceberg".to_string(),
+                namespace: Some("default".to_string()),
+            },
             query_span: tracing::Span::none(),
         }
     }

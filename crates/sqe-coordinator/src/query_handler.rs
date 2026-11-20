@@ -1703,6 +1703,7 @@ impl QueryHandler {
                 client_ip,
                 trace_id: sqe_metrics::propagation::current_trace_id(),
                 query_id: uuid::Uuid::now_v7(),
+                scope: crate::audit_emitter::session_scope(&self.config, session),
             },
         );
     }
@@ -1799,6 +1800,7 @@ impl QueryHandler {
                     start.elapsed(),
                     client_ip,
                     query_id.unwrap_or_else(uuid::Uuid::now_v7),
+                    crate::audit_emitter::session_scope(&self.config, session),
                 );
                 return;
             }
@@ -1812,6 +1814,7 @@ impl QueryHandler {
                 start.elapsed(),
                 client_ip,
                 query_id.unwrap_or_else(uuid::Uuid::now_v7),
+                crate::audit_emitter::session_scope(&self.config, session),
             );
         }
     }
@@ -2188,6 +2191,7 @@ impl QueryHandler {
                                 client_ip: client_ip.clone(),
                                 trace_id: trace_id.clone(),
                                 query_id,
+                                scope: crate::audit_emitter::session_scope(&self.config, session),
                             },
                         );
                     }
@@ -2546,14 +2550,33 @@ impl QueryHandler {
                     Box::pin(self.handle_hive_show_partitions(session, table_name)).await
                 }
 
-                // SET CATALOG is USE without a schema: the default catalog is
-                // client-protocol state (the Trino client replays it in
-                // X-Trino-Catalog; Flight clients pass it per connection), so
-                // the engine has nothing to change. Same no-op as USE above.
-                StatementKind::SetCatalog(ref catalog) => {
-                    tracing::info!(
-                        "SET CATALOG {catalog} — session catalog switch (no-op at engine level)"
-                    );
+                // SET CATALOG / USE CATALOG: switch the default catalog and
+                // keep the schema. The Trino HTTP layer answers it itself
+                // (X-Trino-Set-Catalog); the Flight path has no such channel,
+                // so the stored session is mutated here like USE above and
+                // every later request on the same token resolves in the new
+                // catalog (#910: it was a no-op, so the audit record and the
+                // planner kept the old one).
+                StatementKind::SetCatalog(ref target) => {
+                    let catalog = parse_catalog_target(target)?;
+                    if let Some(ref manager) = self.session_manager {
+                        if !manager.set_session_scope(&session.id, Some(catalog.clone()), None) {
+                            return Err(SqeError::with_code(
+                                SqeErrorCode::ExecutionFailed,
+                                "SET CATALOG: session not found in manager".to_string(),
+                            ));
+                        }
+                        tracing::info!(
+                            username = %session.user.username,
+                            catalog = %catalog,
+                            "SET CATALOG applied to the session"
+                        );
+                    } else {
+                        tracing::debug!(
+                            "SET CATALOG {target} requested but session manager is not wired; \
+                             the catalog is carried by the protocol layer in this mode"
+                        );
+                    }
                     Ok(vec![])
                 }
 
@@ -3386,6 +3409,7 @@ impl QueryHandler {
                     client_ip: client_ip.clone(),
                     trace_id,
                     query_id,
+                    scope: crate::audit_emitter::session_scope(&self.config, session),
                 },
             );
         }
@@ -4017,6 +4041,7 @@ impl QueryHandler {
                     resources: audit_resources,
                     client_ip: client_ip.clone(),
                     trace_id,
+                    scope: crate::audit_emitter::session_scope(&self.config, session),
                     query_span: query_span.clone(),
                 };
 
@@ -7200,7 +7225,7 @@ fn build_describe_input(param_types: &[Option<DataType>]) -> sqe_core::Result<Ve
 /// (`with_default_catalog_and_schema`): the session's catalog
 /// (`X-Trino-Catalog`, `USE`) or the configured default, and the session's
 /// schema or `default`. Lineage names a scan of `customers` after it.
-fn lineage_scope(config: &SqeConfig, session: &Session) -> sqe_lineage::LineageScope {
+pub(crate) fn lineage_scope(config: &SqeConfig, session: &Session) -> sqe_lineage::LineageScope {
     sqe_lineage::LineageScope {
         catalog: session
             .default_catalog
@@ -7659,6 +7684,18 @@ pub(crate) fn parse_use_target(target: &str) -> sqe_core::Result<(Option<String>
         _ => Err(SqeError::with_code(
             SqeErrorCode::SyntaxError,
             format!("Invalid USE target '{target}': expected [catalog.]schema"),
+        )),
+    }
+}
+
+/// The catalog named by `SET CATALOG <name>` / `USE CATALOG <name>`: one
+/// part, quotes removed. A dotted name is not a catalog.
+pub(crate) fn parse_catalog_target(target: &str) -> sqe_core::Result<String> {
+    match parse_use_target(target)? {
+        (None, catalog) => Ok(catalog),
+        (Some(_), _) => Err(SqeError::with_code(
+            SqeErrorCode::SyntaxError,
+            format!("Invalid catalog '{target}': expected a single name"),
         )),
     }
 }
@@ -9188,6 +9225,16 @@ mod tests {
         );
         for bad in ["", "a.b.c", "a.", ".b"] {
             let err = parse_use_target(bad).expect_err(bad);
+            assert_eq!(err.error_code(), SqeErrorCode::SyntaxError, "{bad}");
+        }
+    }
+
+    #[test]
+    fn parse_catalog_target_takes_one_unquoted_part() {
+        assert_eq!(parse_catalog_target("finance").unwrap(), "finance");
+        assert_eq!(parse_catalog_target("\"My Cat\"").unwrap(), "My Cat");
+        for bad in ["", "a.b"] {
+            let err = parse_catalog_target(bad).expect_err(bad);
             assert_eq!(err.error_code(), SqeErrorCode::SyntaxError, "{bad}");
         }
     }

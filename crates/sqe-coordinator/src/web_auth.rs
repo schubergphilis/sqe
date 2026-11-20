@@ -210,6 +210,7 @@ pub fn dashboard_audit_event(
         trace_id: None,
         query_id: None,
         transaction: None,
+        session: None,
         integrity: Integrity::default(),
     })
 }

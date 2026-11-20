@@ -617,6 +617,7 @@ async fn audit_logger_round_trips_session_event() {
         trace_id: None,
         query_id: None,
         transaction: None,
+        session: None,
         integrity: sqe_metrics::audit::Integrity::default(),
     };
     audit.log_event(event);
@@ -921,6 +922,10 @@ async fn streaming_select_emits_canonical_query_event() {
             object_type: ObjectType::Table,
         }],
         client_ip: None,
+        scope: sqe_metrics::audit::SessionScope {
+            catalog: "polaris".to_string(),
+            namespace: Some("public".to_string()),
+        },
         query_span: tracing::Span::none(),
     };
 
@@ -991,6 +996,13 @@ async fn streaming_select_emits_canonical_query_event() {
     assert_eq!(
         v["query"]["query_fingerprint"].as_str(),
         Some(sqe_metrics::audit::query_fingerprint("SELECT 1 AS x").as_str()),
+        "got: {v}"
+    );
+    // 7. the session's catalog and namespace (#910), threaded from the
+    // finalizer, next to (not derived from) the resources
+    assert_eq!(
+        v["session"],
+        serde_json::json!({"catalog": "polaris", "namespace": "public"}),
         "got: {v}"
     );
 }
