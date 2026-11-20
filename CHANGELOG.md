@@ -4,6 +4,43 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+## [0.55.2] — 2026-11-20
+
+### Added
+
+- Audit records carry the session's resolved catalog and namespace (#910)
+
+    The native event has an optional `session` object and the OCSF line has `unmapped.session_catalog` and `unmapped.session_namespace`. Statement records set them; authentication, maintenance and system records do not. Existing records hash unchanged.
+
+- CI: the `ci::multiarch-release` MR label runs the multi-arch image dry run with the release profile, so the tag build can be proven before tagging.
+
+### Fixed
+
+- Crates inherit the workspace `homepage` and `authors` fields
+
+    `[workspace.package]` declared `homepage` and `authors`, but no crate
+    inherited them, so every cargo run warned `unused field`. The 26 SQE
+    crates now take both, which also puts them in `cargo metadata` and SBOMs.
+
+- `USE CATALOG <name>` now takes effect over Flight SQL (#910)
+
+    The statement did not parse and the Flight handler ignored it, so later statements ran in the old catalog.
+
+- Release pipeline: the amd64 and arm64 `sqe-release-binaries` jobs run one after the other, and each builds `sqe-cli` and `sqe-server` in separate cargo runs. In the v0.55.1 tag pipeline both arches landed on the same runner host twice, and the host died during the thin-LTO link both times. The job now logs its memory use every minute.
+
+- Release pipeline: the `sqe-release-binaries` jobs get 180 minutes instead of 90. The thin-LTO link of `sqe-server` on a busy shared runner outlasted the old limit, so the v0.55.1 tag pipeline timed out before it built any binary.
+
+- End-to-end test for catalog-scoped tag projection (#899)
+
+    Under `[policy.ranger] catalog_scoped = true`, a column tag set through SQE lands on the `<catalog>.<namespace>` Ranger resource, and the unscoped `<namespace>` resource left from before is cleared. Until now this was unit-tested only; it is now asserted against a live Ranger.
+
+- Acceptance tests for the signed catalog scope, the `system` catalog split and the shutdown drain (#908, #901, #902)
+
+    These are tests only; behaviour is unchanged.
+    - The signed catalog scope is now tested against a test issuer serving a JWKS over https.
+    - A Ranger tag mask on the Polaris table `system.access.audit` is now tested end to end, together with the refusal for a user who has no grant.
+    - A process test SIGTERMs a running `sqe-server`. It checks that the running query finishes, that a later statement is refused with `draining`, and that the process exits right after.
+
 ## [0.55.1] — 2026-11-20
 
 ### Fixed
