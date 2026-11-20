@@ -358,6 +358,122 @@ async fn set_tags_requires_admin() {
     assert!(err.to_string().contains("403"), "expected 403: {err}");
 }
 
+// ---------------------------------------------------------------------------
+// #911 - tag_authority = "ranger-delegate"
+// ---------------------------------------------------------------------------
+
+/// A handler under `tag_authority = "ranger-delegate"` over `store`.
+fn make_delegate_handler(store: Arc<dyn PolicyStore>) -> QueryHandler {
+    let mut config = minimal_config();
+    config.access_control.tag_authority = sqe_core::config::TagAuthority::RangerDelegate;
+    let tracker = Arc::new(QueryTracker::new(&config.query_history));
+    QueryHandler::new(
+        Arc::new(PassthroughEnforcer),
+        Some(store),
+        config,
+        None,
+        None,
+        None,
+        None,
+        tracker,
+        None,
+        Some(Arc::new(RecordingBackend::default())),
+        None,
+        RuntimeCatalogRegistry::new(),
+        SecretStore::new(),
+    )
+    .expect("QueryHandler::new")
+}
+
+/// The statement got past the tag gate (it may fail later: no catalog is wired).
+fn assert_passed_tag_gate(res: sqe_core::Result<Vec<arrow_array::RecordBatch>>, sql: &str) {
+    let e = res.expect_err("no catalog is wired, so the write itself cannot succeed");
+    let msg = e.to_string();
+    assert!(
+        !msg.contains("403 Forbidden"),
+        "{sql}: the tag gate must pass: {msg}"
+    );
+    assert!(
+        !msg.contains("expected a"),
+        "{sql}: the statement must parse: {msg}"
+    );
+}
+
+fn assert_refused_by_tag_gate(res: sqe_core::Result<Vec<arrow_array::RecordBatch>>, sql: &str) {
+    let e = res.expect_err("must be refused");
+    assert!(
+        e.to_string().contains("403 Forbidden"),
+        "{sql}: expected 403: {e}"
+    );
+}
+
+const TAG_STMTS: [&str; 3] = [
+    "ALTER TABLE ns.tbl SET TAGS (ssn = ('PII'))",
+    "ALTER TABLE ns.tbl UNSET TAGS (ssn)",
+    "ALTER TABLE ns.tbl MODIFY COLUMN ssn UNSET MASKING POLICY",
+];
+
+#[tokio::test]
+async fn tag_authority_delegate_passes_with_a_grant() {
+    let store = Arc::new(sqe_policy::policy_store::InMemoryPolicyStore::new());
+    store
+        .grant_table_privilege("ns", "tbl", "alice", sqe_policy::TablePrivilege::Alter)
+        .await;
+    let handler = make_delegate_handler(store);
+    let session = session_for("alice", vec!["analyst"]);
+    for sql in TAG_STMTS {
+        assert_passed_tag_gate(handler.execute(&session, sql, None).await, sql);
+    }
+}
+
+#[tokio::test]
+async fn tag_authority_delegate_refuses_without_a_grant() {
+    let store = Arc::new(sqe_policy::policy_store::InMemoryPolicyStore::new());
+    // Alter on a different table, and Drop on this one: neither counts.
+    store
+        .grant_table_privilege("ns", "other", "alice", sqe_policy::TablePrivilege::Alter)
+        .await;
+    store
+        .grant_table_privilege("ns", "tbl", "alice", sqe_policy::TablePrivilege::Drop)
+        .await;
+    let handler = make_delegate_handler(store);
+    let session = session_for("alice", vec!["analyst"]);
+    for sql in TAG_STMTS {
+        assert_refused_by_tag_gate(handler.execute(&session, sql, None).await, sql);
+    }
+}
+
+#[tokio::test]
+async fn tag_authority_delegate_refuses_on_a_backend_without_the_model() {
+    // RecordingStore keeps the default `grants_column_privilege`: nothing.
+    let handler = make_delegate_handler(Arc::new(RecordingStore::default()));
+    let session = session_for("alice", vec!["analyst"]);
+    for sql in TAG_STMTS {
+        assert_refused_by_tag_gate(handler.execute(&session, sql, None).await, sql);
+    }
+}
+
+#[tokio::test]
+async fn tag_authority_delegate_admin_still_passes() {
+    let handler = make_delegate_handler(Arc::new(RecordingStore::default()));
+    let session = session_for("root", vec!["service_admin"]);
+    for sql in TAG_STMTS {
+        assert_passed_tag_gate(handler.execute(&session, sql, None).await, sql);
+    }
+}
+
+#[tokio::test]
+async fn tag_authority_default_mode_refuses_every_tag_spelling() {
+    let handler = make_handler(
+        Arc::new(RecordingBackend::default()),
+        Arc::new(RecordingStore::default()),
+    );
+    let session = session_for("alice", vec!["analyst"]);
+    for sql in TAG_STMTS {
+        assert_refused_by_tag_gate(handler.execute(&session, sql, None).await, sql);
+    }
+}
+
 #[tokio::test]
 async fn set_reserved_tblproperties_requires_admin() {
     // `sqe.column-tags` is the same property SET TAGS writes, so writing it

@@ -898,12 +898,67 @@ fn access_grants_table_type(
     access_type: &str,
     last_component_fallback: bool,
 ) -> bool {
+    access_grants_type_with(
+        bundle,
+        user,
+        database,
+        table,
+        access_type,
+        last_component_fallback,
+        column_resource_covers_table,
+    )
+}
+
+/// True when an access policy's `column` resource matches `column`: absent
+/// matches every column, otherwise `resource_matches` (wildcards, case
+/// folding, `isExcludes`).
+fn column_resource_matches(p: &RangerPolicy, column: &str) -> bool {
+    p.resources
+        .get("column")
+        .is_none_or(|res| resource_matches(res, column))
+}
+
+/// `access_grants_table_type` for one column: same evaluation order, but a
+/// policy counts when its `column` resource matches `column` instead of
+/// covering the whole table. A deny on this column or on `*` decides; a deny
+/// on another column does not.
+fn access_grants_column_type(
+    bundle: &ServicePolicies,
+    user: &SessionUser,
+    database: &str,
+    table: &str,
+    column: &str,
+    access_type: &str,
+    last_component_fallback: bool,
+) -> bool {
+    access_grants_type_with(
+        bundle,
+        user,
+        database,
+        table,
+        access_type,
+        last_component_fallback,
+        |p| column_resource_matches(p, column),
+    )
+}
+
+/// Shared body of the table and column access checks; `column_ok` is the only
+/// difference between them.
+fn access_grants_type_with(
+    bundle: &ServicePolicies,
+    user: &SessionUser,
+    database: &str,
+    table: &str,
+    access_type: &str,
+    last_component_fallback: bool,
+    column_ok: impl Fn(&RangerPolicy) -> bool,
+) -> bool {
     let matching = |fallback: bool| {
         bundle
             .policies
             .iter()
             .filter(|p| p.is_enabled && p.policy_type == POLICY_TYPE_ACCESS)
-            .filter(|p| policy_matches_table_with(p, database, table, fallback) && column_resource_covers_table(p))
+            .filter(|p| policy_matches_table_with(p, database, table, fallback) && column_ok(p))
             .collect::<Vec<_>>()
     };
 
@@ -2201,6 +2256,29 @@ impl PolicyStore for RangerStore {
         ))
     }
 
+    /// Column-level sibling of `grants_table_privilege`: a policy whose
+    /// `column` resource names (or wildcard-matches) `column` counts, so a
+    /// column-scoped steward is recognised. Deny-first, like the table check.
+    async fn grants_column_privilege(
+        &self,
+        user: &SessionUser,
+        table_name: &str,
+        namespace: &str,
+        column: &str,
+        privilege: crate::TablePrivilege,
+    ) -> sqe_core::Result<bool> {
+        let bundle = self.cached_bundle().await?;
+        Ok(access_grants_column_type(
+            &bundle,
+            user,
+            &hive_database(namespace),
+            table_name,
+            column,
+            privilege.access_type(),
+            !self.catalog_scoped,
+        ))
+    }
+
     /// Resolve tag-based policies from the Ranger bundle for a given user and
     /// set of tag names present on a table's columns.
     ///
@@ -3237,8 +3315,118 @@ mod tests {
 
     #[test]
     fn allow_exceptions_carve_a_user_out_of_a_role_grant() {
-        assert!(!crate::plan_rewriter::policy_denies_all(&gated(&user("dan", &["admin"]), "anything", "glue.bi")));
-        assert!(crate::plan_rewriter::policy_denies_all(&gated(&user("eve", &["admin"]), "anything", "glue.bi")));
+        assert!(!crate::plan_rewriter::policy_denies_all(&gated(
+            &user("dan", &["admin"]),
+            "anything",
+            "glue.bi"
+        )));
+        assert!(crate::plan_rewriter::policy_denies_all(&gated(
+            &user("eve", &["admin"]),
+            "anything",
+            "glue.bi"
+        )));
+    }
+
+    /// Column `alter` grants for the tag gate (#911). `policies` is a list of
+    /// `(column resource JSON or "" for none, items JSON)`; every policy sits
+    /// on database `lake.sales`, table `orders`.
+    fn column_bundle(policies: &[(&str, &str)]) -> ServicePolicies {
+        let body = policies
+            .iter()
+            .enumerate()
+            .map(|(i, (col, items))| {
+                let col = if col.is_empty() { String::new() } else { format!(r#","column":{col}"#) };
+                format!(
+                    r#"{{"id":{id},"name":"p{id}","policyType":0,"isEnabled":true,
+                      "resources":{{"database":{{"values":["lake.sales"]}},"table":{{"values":["orders"]}}{col}}},
+                      {items}}}"#,
+                    id = i + 1
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        serde_json::from_str(&format!(r#"{{"policies":[{body}]}}"#)).unwrap()
+    }
+
+    fn col_alter(b: &ServicePolicies, u: &SessionUser, column: &str) -> bool {
+        access_grants_column_type(b, u, "lake.sales", "orders", column, "alter", true)
+    }
+
+    const STEWARD_ALLOW: &str =
+        r#""policyItems":[{"users":["steward"],"accesses":[{"type":"alter","isAllowed":true}]}]"#;
+    const STEWARD_DENY: &str = r#""denyPolicyItems":[{"users":["steward"],"accesses":[{"type":"alter","isAllowed":true}]}]"#;
+
+    #[test]
+    fn column_alter_allow_covers_that_column_only() {
+        let b = column_bundle(&[(r#"{"values":["ssn"]}"#, STEWARD_ALLOW)]);
+        let u = user("steward", &[]);
+        assert!(col_alter(&b, &u, "ssn"));
+        assert!(col_alter(&b, &u, "SSN"), "case-insensitive");
+        assert!(
+            !col_alter(&b, &u, "email"),
+            "a grant on another column is not this column"
+        );
+        assert!(
+            !col_alter(&b, &user("other", &[]), "ssn"),
+            "nobody else is granted"
+        );
+        // The table-level check still refuses a column-scoped grant.
+        assert!(!access_grants_table_type(
+            &b,
+            &u,
+            "lake.sales",
+            "orders",
+            "alter",
+            true
+        ));
+    }
+
+    #[test]
+    fn column_alter_star_and_wildcard_and_excludes() {
+        let u = user("steward", &[]);
+        let star = column_bundle(&[(r#"{"values":["*"]}"#, STEWARD_ALLOW)]);
+        assert!(col_alter(&star, &u, "anything"));
+        let wild = column_bundle(&[(r#"{"values":["ss*"]}"#, STEWARD_ALLOW)]);
+        assert!(col_alter(&wild, &u, "ssn"));
+        assert!(!col_alter(&wild, &u, "email"));
+        let excl = column_bundle(&[(r#"{"values":["ssn"],"isExcludes":true}"#, STEWARD_ALLOW)]);
+        assert!(!col_alter(&excl, &u, "ssn"));
+        assert!(col_alter(&excl, &u, "email"));
+    }
+
+    #[test]
+    fn column_alter_deny_beats_allow_and_is_column_scoped() {
+        let u = user("steward", &[]);
+        let allow_all = (r#"{"values":["*"]}"#, STEWARD_ALLOW);
+        let deny_ssn = column_bundle(&[allow_all, (r#"{"values":["ssn"]}"#, STEWARD_DENY)]);
+        assert!(
+            !col_alter(&deny_ssn, &u, "ssn"),
+            "a column deny beats the allow"
+        );
+        assert!(
+            col_alter(&deny_ssn, &u, "email"),
+            "a deny on another column does not deny this one"
+        );
+        let deny_star = column_bundle(&[allow_all, (r#"{"values":["*"]}"#, STEWARD_DENY)]);
+        assert!(!col_alter(&deny_star, &u, "ssn"));
+        assert!(!col_alter(&deny_star, &u, "email"));
+    }
+
+    #[test]
+    fn column_alter_conditional_allow_is_ignored_and_no_column_resource_matches_all() {
+        let u = user("steward", &[]);
+        let cond = column_bundle(&[(
+            r#"{"values":["ssn"]}"#,
+            r#""policyItems":[{"users":["steward"],"accesses":[{"type":"alter","isAllowed":true}],
+               "conditions":[{"type":"ip-range","values":["10.0.0.0/8"]}]}]"#,
+        )]);
+        assert!(
+            !col_alter(&cond, &u, "ssn"),
+            "a condition SQE cannot evaluate grants nothing"
+        );
+        let none = column_bundle(&[("", STEWARD_ALLOW)]);
+        assert!(col_alter(&none, &u, "ssn"));
+        assert!(col_alter(&none, &u, "email"));
     }
 
     /// DDL authority comes from the same access policies as `select`, asked

@@ -322,6 +322,24 @@ pub trait PolicyStore: Send + Sync {
         Ok(false)
     }
 
+    /// Does the policy engine grant `user` the `privilege` on one column of
+    /// this table? Keyed like `grants_table_privilege`.
+    ///
+    /// Used to let a column steward write that column's tags
+    /// (`[access_control] tag_authority = "ranger-delegate"`). The default
+    /// answers `false`: a backend without a column privilege model grants
+    /// nothing, so only admins pass.
+    async fn grants_column_privilege(
+        &self,
+        _user: &SessionUser,
+        _table_name: &str,
+        _namespace: &str,
+        _column: &str,
+        _privilege: TablePrivilege,
+    ) -> sqe_core::Result<bool> {
+        Ok(false)
+    }
+
     /// Create or replace a fine-grained row-filter / column-mask policy.
     async fn create_policy(
         &self,
