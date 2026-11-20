@@ -687,8 +687,9 @@ impl CatalogOps {
 
         // Resolve against the SOURCE catalog. Iceberg REST cannot rename across
         // catalogs, so reject a destination that explicitly names a different
-        // one rather than silently renaming within the source.
-        let target_catalog = catalog_qualifier(source_name);
+        // one rather than silently renaming within the source. An unqualified
+        // source is in the session catalog (`USE`), as DROP TABLE resolves it.
+        let target_catalog = resolve_target_catalog(catalog_qualifier(source_name), session);
         let src_catalog = target_catalog
             .as_deref()
             .unwrap_or(self.config.catalog.warehouse.as_str());
@@ -782,7 +783,10 @@ impl CatalogOps {
         );
 
         let session_catalog = self
-            .session_catalog_for(session, catalog_qualifier(view_name).as_deref())
+            .session_catalog_for(
+                session,
+                resolve_target_catalog(catalog_qualifier(view_name), session).as_deref(),
+            )
             .await?;
 
         if or_replace {
@@ -853,7 +857,10 @@ impl CatalogOps {
         );
 
         let session_catalog = self
-            .session_catalog_for(session, catalog_qualifier(view_name).as_deref())
+            .session_catalog_for(
+                session,
+                resolve_target_catalog(catalog_qualifier(view_name), session).as_deref(),
+            )
             .await?;
 
         match session_catalog.drop_view(namespace, name).await {
@@ -901,7 +908,10 @@ impl CatalogOps {
         // Use SessionCatalog directly so we can call commit_schema_update, which
         // bypasses the crate-private TableCommit::build() method.
         let session_catalog = self
-            .session_catalog_for(session, catalog_qualifier(table_name).as_deref())
+            .session_catalog_for(
+                session,
+                resolve_target_catalog(catalog_qualifier(table_name), session).as_deref(),
+            )
             .await?;
 
         // Load the table via the catalog bridge (iceberg's load_table returns a Table)
@@ -1361,7 +1371,10 @@ impl CatalogOps {
         let table_ident = resolve_table_ident(&table_name, session)?;
 
         let session_catalog = self
-            .session_catalog_for(session, catalog_qualifier(&table_name).as_deref())
+            .session_catalog_for(
+                session,
+                resolve_target_catalog(catalog_qualifier(&table_name), session).as_deref(),
+            )
             .await?;
         let catalog = session_catalog.as_catalog();
         let iceberg_table = catalog
@@ -1465,7 +1478,10 @@ impl CatalogOps {
         let table_name = parse_object_name(table)?;
         let table_ident = resolve_table_ident(&table_name, session)?;
         let session_catalog = self
-            .session_catalog_for(session, catalog_qualifier(&table_name).as_deref())
+            .session_catalog_for(
+                session,
+                resolve_target_catalog(catalog_qualifier(&table_name), session).as_deref(),
+            )
             .await?;
         let iceberg_table = session_catalog
             .as_catalog()
@@ -1617,7 +1633,10 @@ impl CatalogOps {
         );
 
         let session_catalog = self
-            .session_catalog_for(session, catalog_qualifier(table_name).as_deref())
+            .session_catalog_for(
+                session,
+                resolve_target_catalog(catalog_qualifier(table_name), session).as_deref(),
+            )
             .await?;
 
         let mut table_updates = Vec::new();
@@ -1720,7 +1739,10 @@ impl CatalogOps {
         let table_ident = resolve_table_ident(&object_name, session)?;
 
         let session_catalog = self
-            .session_catalog_for(session, catalog_qualifier(&object_name).as_deref())
+            .session_catalog_for(
+                session,
+                resolve_target_catalog(catalog_qualifier(&object_name), session).as_deref(),
+            )
             .await?;
 
         let table = session_catalog.load_table(&table_ident).await?;
@@ -2126,7 +2148,10 @@ impl CatalogOps {
         let table_ident = resolve_table_ident(&object_name, session)?;
 
         let session_catalog = self
-            .session_catalog_for(session, catalog_qualifier(&object_name).as_deref())
+            .session_catalog_for(
+                session,
+                resolve_target_catalog(catalog_qualifier(&object_name), session).as_deref(),
+            )
             .await?;
 
         let table = session_catalog.load_table(&table_ident).await?;
@@ -2316,7 +2341,10 @@ impl CatalogOps {
         let object_name = parse_object_name(&ddl.table)?;
         let table_ident = resolve_table_ident(&object_name, session)?;
         let session_catalog = self
-            .session_catalog_for(session, catalog_qualifier(&object_name).as_deref())
+            .session_catalog_for(
+                session,
+                resolve_target_catalog(catalog_qualifier(&object_name), session).as_deref(),
+            )
             .await?;
         let table = session_catalog.load_table(&table_ident).await?;
         let metadata = table.metadata();

@@ -526,6 +526,122 @@ async fn drop_table_uses_the_session_catalog() {
     }
 }
 
+/// #916: ALTER TABLE, RENAME, CREATE VIEW and DROP VIEW with a one-part name
+/// act on the session catalog and schema, as DROP TABLE does. Before, these
+/// `catalog_ops` paths loaded the table from the default warehouse, so the
+/// statement failed with "does not exist" or changed a same-named table there.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn catalog_ops_ddl_uses_the_session_catalog() {
+    let _live = LIVE_STACK_LOCK.lock().await;
+    crate::common::init_tracing();
+    seed_discovery_warehouse().await;
+
+    let handler = make_handler(polaris_auto_config());
+    let qualified = live_session().await;
+    let mut scoped = live_session().await;
+    scoped.default_catalog = Some("discovery_test_wh".to_string());
+    scoped.default_schema = Some("disc_ns".to_string());
+
+    let run = |session: &Session, sql: String| {
+        let handler = &handler;
+        let session = session.clone();
+        async move {
+            handler
+                .execute(&session, &sql, None)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        }
+    };
+    let render = |batches: &[arrow::record_batch::RecordBatch]| {
+        arrow::util::pretty::pretty_format_batches(batches)
+            .expect("render")
+            .to_string()
+    };
+
+    let full = "discovery_test_wh.disc_ns.ops_probe";
+    let renamed = "discovery_test_wh.disc_ns.ops_probe_renamed";
+    for t in [full, renamed] {
+        run(&qualified, format!("DROP TABLE IF EXISTS {t}")).await;
+    }
+    run(
+        &qualified,
+        "DROP VIEW IF EXISTS discovery_test_wh.disc_ns.ops_probe_v".to_string(),
+    )
+    .await;
+    run(&qualified, format!("CREATE TABLE {full} AS SELECT 1 AS id")).await;
+
+    // alter_table_schema
+    run(
+        &scoped,
+        "ALTER TABLE ops_probe ADD COLUMN extra INT".to_string(),
+    )
+    .await;
+    let described = render(&run(&qualified, format!("DESCRIBE {full}")).await);
+    assert!(
+        described.contains("extra"),
+        "ADD COLUMN must land on {full}, got:\n{described}"
+    );
+
+    // set_table_properties
+    run(
+        &scoped,
+        "ALTER TABLE ops_probe SET TBLPROPERTIES ('probe.key' = 'probe-916')".to_string(),
+    )
+    .await;
+    // SHOW CREATE TABLE reads columns through the session context, which does
+    // not hold a discovered catalog, so read the table back through a handler
+    // whose default catalog IS `discovery_test_wh` (as the seeding does).
+    sqe_coordinator::session_context::invalidate_all_session_caches().await;
+    let seed_handler = make_handler(seed_config());
+    let ddl = render(
+        &seed_handler
+            .execute(&qualified, "SHOW CREATE TABLE disc_ns.ops_probe", None)
+            .await
+            .unwrap_or_else(|e| panic!("SHOW CREATE TABLE disc_ns.ops_probe: {e}")),
+    );
+    assert!(
+        ddl.contains("probe-916"),
+        "SET TBLPROPERTIES must land on {full}, got:\n{ddl}"
+    );
+
+    // create_view / drop_view
+    run(
+        &scoped,
+        "CREATE VIEW ops_probe_v AS SELECT id FROM ops_probe".to_string(),
+    )
+    .await;
+    let rows = render(
+        &run(
+            &qualified,
+            "SELECT id FROM discovery_test_wh.disc_ns.ops_probe_v".to_string(),
+        )
+        .await,
+    );
+    assert!(
+        rows.contains('1'),
+        "the view must exist in the session catalog, got:\n{rows}"
+    );
+    run(&scoped, "DROP VIEW ops_probe_v".to_string()).await;
+    handler
+        .execute(
+            &qualified,
+            "SELECT id FROM discovery_test_wh.disc_ns.ops_probe_v",
+            None,
+        )
+        .await
+        .expect_err("DROP VIEW must drop the view in the session catalog");
+
+    // rename_table
+    run(
+        &scoped,
+        "ALTER TABLE ops_probe RENAME TO ops_probe_renamed".to_string(),
+    )
+    .await;
+    run(&qualified, format!("SELECT id FROM {renamed}")).await;
+    run(&qualified, format!("DROP TABLE IF EXISTS {renamed}")).await;
+}
+
 /// `COMMENT ON COLUMN cat.ns.t.c` and `COMMENT ON TABLE cat.ns.t` commit to
 /// the catalog the name qualifies, not the session default. Before, both went
 /// to the default warehouse and failed with "does not exist" on a table a
