@@ -21,5 +21,5 @@
 
 ## 4. Tests and docs
 
-- [ ] 4.1 Integration: acceptance 1-3 with a test issuer (local JWKS over https in the fixture)
+- [x] 4.1 Integration: acceptance 1-3 with a test issuer (local JWKS over https in the fixture)
 - [x] 4.2 Book: security page documents the scope, the claims and the header

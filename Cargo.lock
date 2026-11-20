@@ -7116,6 +7116,7 @@ dependencies = [
  "hmac",
  "http-body",
  "iceberg",
+ "jsonwebtoken",
  "moka",
  "object_store",
  "opentelemetry",
