@@ -67,7 +67,7 @@ services:
   # stay in RustFS). `bench.py load` checks the row count and reloads when the
   # catalog comes back empty.
   polaris:
-    image: apache/polaris:1.7.0
+    image: apache/polaris:1.9.0
     environment:
       POLARIS_PERSISTENCE_TYPE: in-memory
       POLARIS_BOOTSTRAP_CREDENTIALS: iceberg,root,${POLARIS_ROOT_SECRET:-polaris-root-secret}

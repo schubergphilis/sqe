@@ -20,7 +20,7 @@ baselines. The numbers belong to the machine they ran on.
 | `bench.py` | Fresh process per run, 50 ms process-tree RSS sampling, 4.5 GiB kill, quiet-machine gate; `load`, `run`, `validate`, `summary`. |
 | `sqe-cli --embedded` | `sqe-parquet` (views over `read_parquet()`) and `sqe-iceberg` (local SQLite-catalog warehouse). |
 | `sqe-server` + ADBC Flight SQL | `sqe-polaris`: a native coordinator per run, the client fetches Arrow and writes Parquet. |
-| RustFS + Polaris 1.7.0 (Docker) | S3 store and Iceberg REST catalog for the `*-polaris` engines. |
+| RustFS + Polaris 1.9.0 (Docker) | S3 store and Iceberg REST catalog for the `*-polaris` engines. |
 | `run_engine_polaris.py` | `duckdb-polaris` (iceberg extension) and `polars-polaris` (pyiceberg + `scan_iceberg`) on the same Polaris tables; with `sqe-embedded-polaris` (an `ATTACH ... TYPE iceberg_rest`), opt-in through `POLARIS_READERS=1`. |
 
 ## Flow

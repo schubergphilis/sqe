@@ -31,7 +31,7 @@ runners. Every engine's answer is checked against DuckDB's.
 |---|---|
 | `run.sh` | Clones engine-bench at a pinned commit, generates the data, loads Iceberg, runs, validates, writes [`OUTPUT.md`](./OUTPUT.md). |
 | `bench.py` | The runner. One fresh process per run, peak RSS of the whole process tree sampled every 50 ms, a kill above 4.5 GiB, the same as upstream's `bench.py`. Subcommands `load`, `run`, `validate`, `summary`. |
-| `docker-compose.yml` + `bootstrap.sh` | RustFS (S3) and Polaris 1.7.0, and a one-shot that creates the `bench` catalog and grants the root principal `CATALOG_MANAGE_CONTENT`. |
+| `docker-compose.yml` + `bootstrap.sh` | RustFS (S3) and Polaris 1.9.0, and a one-shot that creates the `bench` catalog and grants the root principal `CATALOG_MANAGE_CONTENT`. |
 | `sqe.toml.tmpl` | The coordinator config for the Polaris leg, rendered to `.work/sqe.toml`. |
 | `run_engine_polaris.py` | DuckDB and Polars reading the Polaris tables over the Iceberg REST API (`POLARIS_READERS=1`). |
 

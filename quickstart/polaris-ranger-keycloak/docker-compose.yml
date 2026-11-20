@@ -1,8 +1,8 @@
-# SQE quickstart: Polaris 1.5 + Apache Ranger 2.8 + Keycloak.
+# SQE quickstart: Polaris 1.9 + Apache Ranger 2.8 + Keycloak.
 #
 # A second access-control option for Polaris. SQE translates GRANT/REVOKE into
 # Apache Ranger Admin REST calls (the new `ranger` access-control backend);
-# Polaris 1.5's embedded Ranger authorizer ENFORCES those policies when SQE
+# Polaris 1.9's embedded Ranger authorizer ENFORCES those policies when SQE
 # (carrying each user's Keycloak token) asks Polaris for table access.
 #
 # Identity flow: SQE authenticates the user against Keycloak (ROPC), passes the
@@ -219,7 +219,7 @@ services:
 
   # ── Polaris — Iceberg REST catalog, Ranger authorizer + Keycloak OIDC ─
   polaris:
-    image: apache/polaris:1.7.0
+    image: apache/polaris:1.9.0
     environment:
       POLARIS_PERSISTENCE_TYPE: in-memory
       POLARIS_BOOTSTRAP_CREDENTIALS: iceberg-ranger,root,${POLARIS_BOOTSTRAP_SECRET:-polaris-root-secret}
@@ -246,7 +246,7 @@ services:
       polaris.oidc.principal-roles-mapper.filter: ".*"
       polaris.oidc.principal-roles-mapper.mappings[0].regex: (.+)
       polaris.oidc.principal-roles-mapper.mappings[0].replacement: $1
-      # Apache Ranger authorizer (Beta, Polaris 1.5)
+      # Apache Ranger authorizer (Beta, Polaris 1.9)
       polaris.authorization.type: ranger
       polaris.authorization.ranger.service-name: polaris
       polaris.authorization.ranger.authz.default.policy.source.impl: org.apache.ranger.admin.client.RangerAdminRESTClient
