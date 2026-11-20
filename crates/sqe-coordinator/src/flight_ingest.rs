@@ -582,6 +582,10 @@ mod tests {
                 },
                 mode: None,
                 snapshot_property_keys: Vec::new(),
+                scope: sqe_metrics::audit::SessionScope {
+                    catalog: "lake".to_string(),
+                    namespace: Some("default".to_string()),
+                },
             },
             start: std::time::Instant::now(),
             client_ip: None,

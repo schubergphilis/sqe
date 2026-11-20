@@ -692,6 +692,16 @@ pub(crate) fn classify_single(statements: Vec<Statement>) -> sqe_core::Result<St
     classify(stmt)
 }
 
+/// True when the token after `USE CATALOG` is a name: not the end of the
+/// statement (`USE catalog`, a schema called `catalog`) and not a `.`
+/// (`USE catalog.sch`).
+fn use_catalog_names_a_catalog(parser: &Parser) -> bool {
+    !matches!(
+        parser.peek_nth_token(2).token,
+        Token::EOF | Token::SemiColon | Token::Period
+    )
+}
+
 /// Recognise SQE-only grammar from the leading tokens and parse it.
 ///
 /// Dispatch is on the leading unquoted words, so a quoted identifier such as
@@ -923,6 +933,17 @@ fn try_classify_custom(parser: &mut Parser, sql: &str) -> sqe_core::Result<Optio
         // SET CATALOG <name>. (#628)
         ["SET", "CATALOG", ..] => {
             consume_words(parser, &["SET", "CATALOG"]);
+            let catalog = parse_name_ref(parser)?;
+            expect_end(parser)?;
+            Some(StatementKind::SetCatalog(catalog))
+        }
+        // USE CATALOG <name>: the Generic dialect reads `USE <name>` only, so
+        // `USE CATALOG finance` was a syntax error. It is `SET CATALOG` under
+        // another spelling. `USE catalog`, `USE catalog.sch` and `USE catalog
+        // sch` keep their schema meaning: only a name after the keyword makes
+        // it the catalog form. (#910)
+        ["USE", "CATALOG", ..] if use_catalog_names_a_catalog(parser) => {
+            consume_words(parser, &["USE", "CATALOG"]);
             let catalog = parse_name_ref(parser)?;
             expect_end(parser)?;
             Some(StatementKind::SetCatalog(catalog))
@@ -2623,6 +2644,45 @@ mod tests {
             matches!(result, Ok(StatementKind::Use(_))),
             "Expected Use, got: {result:?}"
         );
+    }
+
+    /// #910: `USE CATALOG finance` names a catalog. It used to be a syntax
+    /// error (the Generic dialect has no such form), so a session could not
+    /// switch catalog with it. It classifies as `SET CATALOG`; the schema
+    /// forms keep their meaning, including a schema called `catalog`.
+    #[test]
+    fn test_use_catalog_names_a_catalog_not_a_schema() {
+        for (sql, catalog) in [
+            ("USE CATALOG finance", "finance"),
+            ("use catalog finance;", "finance"),
+            ("USE CATALOG \"My Cat\"", "\"My Cat\""),
+        ] {
+            let result = parse_and_classify(sql);
+            assert!(
+                matches!(result, Ok(StatementKind::SetCatalog(ref c)) if c == catalog),
+                "{sql}: got {result:?}"
+            );
+            let door = crate::front_door::SqlFrontDoor::new(crate::front_door::WireDialect::Flight)
+                .normalize(sql)
+                .and_then(crate::front_door::classify_normalized);
+            assert!(
+                matches!(door, Ok(StatementKind::SetCatalog(ref c)) if c == catalog),
+                "{sql} through the front door: got {door:?}"
+            );
+        }
+        for (sql, target) in [
+            ("USE catalog", "catalog"),
+            ("USE catalog.sales", "catalog.sales"),
+            ("USE finance.gold", "finance.gold"),
+            ("USE finance", "finance"),
+        ] {
+            let result = parse_and_classify(sql);
+            assert!(
+                matches!(result, Ok(StatementKind::Use(ref t)) if t == target),
+                "{sql}: got {result:?}"
+            );
+        }
+        assert!(parse_and_classify("USE CATALOG finance extra").is_err());
     }
 
     #[test]

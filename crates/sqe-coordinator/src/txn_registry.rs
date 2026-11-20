@@ -415,6 +415,7 @@ impl TxnRegistry {
             trace_id: sqe_metrics::propagation::current_trace_id(),
             query_id: None,
             transaction: Some(transaction),
+            session: None,
             integrity: Integrity::default(),
         });
     }
