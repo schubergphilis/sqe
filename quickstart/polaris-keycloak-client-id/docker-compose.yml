@@ -170,7 +170,7 @@ services:
 
   # ── polaris-setup — one-shot RBAC + catalog + namespace bootstrap ─────
   polaris-setup:
-    image: curlimages/curl:8.22.0
+    image: curlimages/curl:8.23.0
     entrypoint: ["sh", "/bootstrap.sh"]
     environment:
       POLARIS_URL: http://polaris:8181

@@ -20,7 +20,7 @@ services:
 
   # Hive-type service `query` + the two group policies SQE enforces.
   ranger-setup:
-    image: curlimages/curl:8.22.0
+    image: curlimages/curl:8.23.0
     entrypoint: ["sh", "/bootstrap-ranger.sh"]
     environment:
       RANGER_URL: http://ranger-admin:6080

@@ -96,7 +96,7 @@ services:
   # One-shot: catalog `bench` on s3://warehouse/, and CATALOG_MANAGE_CONTENT
   # for the root principal's service_admin role. Idempotent.
   polaris-setup:
-    image: curlimages/curl:8.22.0
+    image: curlimages/curl:8.23.0
     entrypoint: ["sh", "/bootstrap.sh"]
     environment:
       POLARIS_ROOT_SECRET: ${POLARIS_ROOT_SECRET:-polaris-root-secret}
