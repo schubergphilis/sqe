@@ -4,6 +4,734 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+## [0.55.0] — 2026-11-20
+
+### Added
+
+- Benchmark reports from 2026-11-05 and 2026-11-10 committed under `benchmarks/results/`
+
+    Eight run reports that had stayed uncommitted: TPC-DS SF0.1, SF1 and SF10 over Flight SQL (99/99 each) with the Trino comparisons at SF0.1 (90 matched, 9 expected empty) and SF1 (99/99), ClickBench SF100 (43/43), and two early TPC-H SF100 runs that have errors (q18 and q21 hit the 60 s timeout; the second run also lost q07 and q09 to "Too many open files"). The TPC-H SF100 runs from the same day that are already committed passed 22/22. No code change.
+
+- Production guide: a minimal `sqe.toml` that starts with `production_mode = true` and Ranger enforcing row filters, masks and column restrictions (TLS-only Trino listener, rate limiting, group claims, vended credentials, `project-tags`, `catalog-scoped`). A unit test runs the documented block through startup validation, so it fails when a new rule makes it stale
+
+- `sqe_idle_seconds`: how long the coordinator has run nothing (#902)
+
+    0 while a statement runs, otherwise the seconds since the last one
+    finished (or since start), for scale-to-zero. `sqe_active_queries` is
+    now set every second from the query tracker; it used to change only
+    when a streamed statement ended and could read stale.
+
+- Admission queue: statements wait for a slot instead of being refused (#902)
+
+    `[query] queue_max` (default 0, today's behaviour) lets a statement that
+    finds all `max_concurrent_queries` slots taken wait up to
+    `queue_timeout_secs` (default 30). Waiters are served round robin per
+    user, FIFO within a user. A user at `max_concurrent_per_user` is still
+    refused at once. New metrics `sqe_admission_queue_length` and
+    `sqe_admission_queue_wait_seconds{outcome}`.
+
+- Trino `cosine_similarity(array, array)` (#907)
+
+    Returns `dot(a, b) / (|a| * |b|)` as a `DOUBLE`, taking the same argument types as `cosine_distance`. Like `cosine_distance`, it returns NULL for a NULL array, an array with a NULL element (where Trino raises an error) or an all-zero array, and arrays of different length are an error. Trino's `map(varchar, double)` form is not supported.
+
+- `sqe-cli --embedded` runs six `CALL system.*` maintenance procedures (#875)
+
+    `expire_snapshots`, `rewrite_manifests`, `set_current_snapshot`,
+    `rollback_to_snapshot`, `register_table` and `table_health` run against
+    an attached Iceberg catalog and return the cluster's result columns. A
+    table they change is re-read by the next query. The other procedures say
+    they are not available in embedded mode before they touch the catalog.
+    Embedded mode has no role tiers: the catalog's commit authorization is
+    the gate. The six procedures now share one implementation in `sqe-write`
+    with the coordinator, whose behaviour, tiers and audit are unchanged.
+
+- engine-bench: DuckDB, Polars and embedded SQE read the Polaris tables over the Iceberg REST catalog API
+
+    `POLARIS_READERS=1 ./run.sh` adds `sqe-embedded-polaris` (`sqe-cli
+    --embedded` with `ATTACH ... (TYPE iceberg_rest)`), `duckdb-polaris`
+    (DuckDB's `iceberg` extension) and `polars-polaris` (pyiceberg plus
+    `pl.scan_iceberg`, planned by `polars-iceberg`). All three read
+    `polaris.bench_<size>`, the snapshot `sqe-polaris` reads, so every engine
+    reads one catalog and one store. The new `run_engine_polaris.py` holds the
+    DuckDB and Polars runners. `run.sh` also takes `BUDGET_FOR` (per-engine kill
+    thresholds) and `OUTPUT`. A Polaris run writes `OUTPUT-polaris.md`, so the
+    committed `OUTPUT.md` / `OUTPUT-s3.md` stay as they are. `stderr_tail`
+    now masks the Polaris root secret as well.
+
+- The Flight SQL handshake accepts a bearer token
+
+    A client configured with a token, such as the Arrow Flight SQL JDBC
+    driver's `token` property, handshakes with `Authorization: Bearer
+    <token>`. The handshake used to accept only Basic and refused the
+    bearer, so those clients could not connect. It now resolves the bearer
+    as every other call does (an SQE session id, or an IdP token through
+    the provider chain) and replies with the session id. An unknown token
+    fails with `UNAUTHENTICATED`; other schemes stay refused.
+
+- Flight SQL bulk ingest: documented limits and end-to-end proof for snapshot properties and refusals (#904)
+
+    The connecting page now documents the `snapshot-property.<key>` ingest option and its key rules. It also covers the 4 MiB per gRPC message limit (tonic's default; one row larger than that fails the whole ingest with `OutOfRange` and leaves the table unchanged), admission like a write statement, and the write-access refusal. New integration tests check that the option lands in the snapshot summary in every ingest mode, in a transaction and outside one, and applies to one request only. A reserved key is refused before any snapshot. `SET SNAPSHOT_PROPERTIES` reaches the summary of CTAS, INSERT, UPDATE, DELETE, MERGE and INSERT OVERWRITE. A new Ranger access-control test checks that an ingest by a principal without write access is refused with one failure audit record. The ingest reply still carries only the row count; see the merge request for the snapshot-id options.
+
+- Flight SQL bulk ingest returns the committed snapshot id as the `x-sqe-snapshot-id` gRPC trailer (#904)
+
+    `CommandStatementIngest` over `DoPut` can only answer with a row count, so the id of the snapshot a create or append committed now travels in the trailing metadata, next to `grpc-status`. No trailer is sent inside a transaction, for a replace, or when the ingest fails. ADBC drivers do not expose trailers; those clients still read `table_snapshots`.
+
+- Lateral column aliases in pipe `SELECT` and `EXTEND` steps (#878)
+
+    A pipe step can now refer to an alias defined earlier in the same step, the same way a plain `SELECT` list can: `FROM t |> SELECT a + 1 AS b, b * 2 AS c` and `FROM t |> EXTEND a + 1 AS b, b * 2 AS c` both plan. A real column with the same name still wins over the alias.
+
+- `make latest`: a multi-arch (linux/amd64 + linux/arm64) `:latest` image
+
+    `scripts/push-latest.sh` cross-compiles `sqe-server` and `sqe-cli` for both architectures with cargo-zigbuild (glibc 2.28 floor, no QEMU), packages each with `Dockerfile.ci`, and pushes one manifest list as `:latest` and `:<short-sha>` to `chameleon/sqlengine/sqe` and `chameleon/sqe`. It builds HEAD of `main` only (`ALLOW_BRANCH=1` overrides), refuses a modified tree, and fails unless every tag lists both platforms. `DRY_RUN=1` builds without pushing. Host paths are remapped out of the binaries, the image is stamped with the commit date and carries no attestations, so the same commit gives the same digest.
+
+- Signed catalog scope for one OAuth client's sessions (#908)
+
+    `[session.catalog_scope]` names one client (matched on the bearer's `azp`) whose sessions must carry an ES256 JWS from a configured issuer, sent as the `x-sqe-catalog-scope` header on the Trino path or as Flight SQL metadata (name configurable). The scope's `sub` and `jti` must equal the bearer's, and `catalogs` maps each catalog to `read_write` or `read_only`. A scoped session sees only those catalogs (others answer "catalog not found"; `SHOW CATALOGS`, `USE`, `SET CATALOG` and `X-Trino-Catalog` are limited to them), may not run `ATTACH` / `DETACH`, secret statements or access-control DDL, and cannot write into a `read_only` catalog, with the catalog layer refusing such commits as a backstop. A missing or invalid scope refuses the session with a reason and an audit record, also on MCP and Quack, which cannot carry the header. The bearer still goes to Polaris and S3, so the user stays the identity and grants still decide access inside the scope. Off unless configured; other clients and unscoped cache keys are unchanged.
+
+- A Polaris catalog named `system` is reachable next to SQE's virtual `system` schemas (#901)
+
+    With `catalog_discovery = "polaris-auto"`, `system.runtime`, `system.metadata`, `system.jdbc` and `system.information_schema` stay SQE's own schemas. Any other `system.<schema>` resolves to a Polaris catalog named `system`. Tables there can be created, written (including Flight SQL ingest), listed, described, read and dropped like tables in any other catalog. `SHOW SCHEMAS FROM system` lists both parts. `CREATE SCHEMA system.<reserved name>` and `ATTACH ... AS system` are refused, and `CALL system.<procedure>` still runs the built-in procedures. In static catalog mode nothing changes.
+
+- A column tag committed by another engine reaches Ranger's tag store (#903)
+
+    With `[policy.ranger] project-tags = true`, every table SQE loads for a
+    query is compared with the tags SQE last projected for it. When another
+    client changed `sqe.column-tags` (Spark, a raw REST commit), SQE projects
+    the difference in the background, so Spark masks what SQE masks. A data
+    commit that leaves the tags alone sends nothing to Ranger. The first load
+    of a tagged table after a restart projects its tags once; a tag removed
+    while the coordinator was down stays in Ranger until
+    `CALL system.reproject_column_tags` repairs it. The projection uses the
+    coordinator's Ranger credentials on behalf of whoever committed the tag.
+
+- `ALTER TABLE ... SET PROPERTIES` honours the Trino properties `partitioning` (partition evolution), `sorted_by` (replaces the default sort order) and `extra_properties` (#897)
+
+    dbt-trino changes a table's layout with `SET PROPERTIES`, and SQE stored
+    `partitioning` and `sorted_by` as plain table properties. They now evolve the
+    partition spec and the sort order in one commit; a partition field the table
+    had before keeps its field id, and going back to an earlier layout reuses its
+    spec. `location` and `p = DEFAULT` are refused. Other keys are stored as
+    Iceberg properties, as before, and `SET TBLPROPERTIES` (quoted keys) is
+    unchanged.
+
+- CREATE TABLE, CTAS and CREATE OR REPLACE honour the Trino table properties `partitioning`, `sorted_by`, `location`, `extra_properties`, `format`, `gc_enabled`, `parquet_bloom_filter_columns` and `parquet_writer_row_group_size` (#897)
+
+    dbt-trino sends a model's `properties` as a Trino `WITH (...)` list, and SQE
+    stored every item as a plain table property, so `partitioning` and
+    `sorted_by` had no effect. An unquoted key in `WITH (...)` is now Trino
+    vocabulary: supported keys map to the Iceberg partition spec, sort order,
+    location or properties; Trino keys SQE cannot honour (`compression_codec`,
+    `max_commit_retry`, `data_location` and others) are refused with the reason,
+    and an unknown key is an error. Quoted keys and `TBLPROPERTIES` stay plain
+    Iceberg properties. CREATE OR REPLACE keeps the live table: a different
+    `location` is refused, and a changed `sorted_by` (an empty one unsorts)
+    becomes the default sort order in the same commit as the data.
+
+- dbt-sqe 1.1.0: a `table_properties` model config (alias `tblproperties`) sets Iceberg table properties, and snapshots run (#891)
+
+    `{{ config(table_properties={'write.merge.mode': 'merge-on-read'}) }}` is
+    emitted as `TBLPROPERTIES (...)` on the CTAS of `table` and `incremental`
+    models (an incremental model takes new values on `--full-refresh`). The
+    delete+insert staging table takes none. dbt's snapshot materialization now
+    runs on SQE for the `timestamp` and `check` strategies: the adapter names
+    each column's SQL type from the Arrow schema, which dbt's snapshot and
+    contract macros need, and drops the `__dbt_tmp` staging table afterwards.
+
+- Trino array, map and aggregate functions
+
+    `array_last`, `zip`, `zip_with`, `array_histogram`, `contains_sequence`,
+    `ngrams`, `shuffle`, `map_concat`, `map_filter`, `transform_keys`,
+    `transform_values`, `split_to_map`, `split_to_multimap`,
+    `map_from_entries`, `multimap_from_entries`, the map overload of
+    `cosine_similarity`, `max(x, n)` / `min(x, n)` (planned as `max_n` /
+    `min_n`), `max_by(x, y, n)` / `min_by(x, y, n)` and
+    `approx_most_frequent` (exact counts).
+
+- Trino varbinary hash and encoding functions
+
+    `sha1`, `crc32`, `xxhash64`, `murmur3`, `hmac_md5`, `hmac_sha1`,
+    `hmac_sha256`, `hmac_sha512`, `to_base64url` / `from_base64url`,
+    `to_base32` / `from_base32`, `to_ieee754_32` / `_64`,
+    `from_ieee754_32` / `_64`, `to_big_endian_32` / `_64` and
+    `from_big_endian_32` / `_64`. Hashes return `varbinary`, `crc32` returns
+    `bigint`. `spooky_hash_v2_32` / `_64` are not implemented yet.
+
+- Trino date and time functions
+
+    `dow`, `doy`, `day_of_month`, `week_of_year`, `yow` / `year_of_week`,
+    `to_milliseconds`, `timezone`, `from_unixtime_nanos`,
+    `from_iso8601_timestamp_nanos`, `from_iso8601_date`, `parse_duration`,
+    interval forms of `day` / `hour` / `minute` / `second` / `millisecond` /
+    `year` / `month`, and `sequence(date, date)` with an implicit one-day step.
+
+- Trino math and statistics functions
+
+    `is_nan`, `is_finite`, `is_infinite`, `width_bucket` (bounds and bins
+    forms), `great_circle_distance`, `wilson_interval_lower` / `_upper`,
+    `euclidean_distance`, `normal_cdf`, `inverse_normal_cdf`, `beta_cdf`,
+    `inverse_beta_cdf`, `t_cdf`, `t_pdf`, `bit_count`,
+    `bitwise_right_shift_arithmetic`, `random(n)` / `random(m, n)` and the
+    `geometric_mean` aggregate.
+
+- Trino string and URL functions
+
+    `luhn_check`, `format_number`, `parse_data_size`, `hamming_distance`,
+    `normalize`, `url_extract_fragment`, the 2-argument `replace`, the
+    3-argument `strpos`, and `index` as an alias of `strpos`.
+
+- Trino parity harness compares strictly and over Flight SQL, and measures Trino function coverage
+
+    `tests/parity/` compares column types, values and order with Trino 484 over the Trino HTTP protocol and Flight SQL (`--protocol both`). `function_coverage.py` calls every function in Trino's `SHOW FUNCTIONS` whose types Iceberg can carry. `scripts/parity-test.sh --all` runs the query, Iceberg and function suites. Baseline: 137/129 of 153 queries (HTTP/Flight), 20 of 20 Iceberg scenarios, 121/115 of 296 functions. `testing/drivers/` adds the JDBC and ODBC driver probes.
+
+- Vector distance functions documented and covered end to end (#907)
+
+    The array reference has a new "Vector distance" section for `cosine_distance`, `inner_product` and `array_distance` over an Iceberg `list<float>` column. New integration tests check:
+
+    - the three functions rank a real Iceberg table;
+    - a query vector bound as a `List<Float64>` parameter over Flight SQL ranks correctly on either side of `cosine_distance`;
+    - a row filter limits the ranking to allowed rows;
+    - a masked or restricted vector column gives a NULL distance for every row.
+
+    Trino's `cosine_similarity` is not registered; the page gives `1 - cosine_distance(a, b)` instead.
+
+### Changed
+
+- Benchmark pages updated with the 2026-11-04 runs: engine-bench at 150M rows on local disk and on S3, and SF10 against Trino 481
+
+    The 150M post gets an update section (local and S3 tables, the q3 alone-check, Polars 2.1.0) and the "Half the bugs" post gets the SF10 rerun: TPC-H 1.3x, TPC-DS 1.8x (91/99 matched), TPCx-BB 4.3x, SSB 0.42x behind Trino. The performance page, landing table, roadmap counters and the book's benchmark page now show the November SF1 and SF10 numbers; the engine-bench `OUTPUT.md` / `OUTPUT-s3.md` and the SF10 result JSON are committed.
+
+- A `production_mode` startup error now names each rule it breaks, for example `[policy-engine-configured] production_mode: policy.engine is passthrough ...`, so an operator can look the rule up in the production guide
+
+- Docs: Trino compatibility is stated as measured parity, not matrix coverage
+
+    The book's testing page documents the Trino parity harness (queries,
+    Iceberg scenarios, Trino functions, both protocols) and the BI driver
+    probes. The Trino compatibility pages and the README quote the strict
+    2026-11-17 baseline against Trino 484 (HTTP: 137 of 153 queries, 20 of 20
+    Iceberg scenarios, 121 of 296 functions) instead of "~96% coverage". New
+    blog post "153 of 153 was a rounding error" on what the lenient check hid.
+
+- Shutdown drains running statements instead of sleeping (#902)
+
+    On SIGTERM the coordinator refuses new and queued statements with
+    `RESOURCE_EXHAUSTED` reason `draining`, then waits until no statement
+    runs or `coordinator.shutdown_drain_secs` passes, and exits as soon as
+    the last one ends. It used to sleep the whole period whatever was
+    running. A worker refuses new fragments with `Unavailable`, which the
+    coordinator retries on another worker, and waits for its running scans
+    within the same bound.
+
+- Busy refusals are `RESOURCE_EXHAUSTED` with a reason (#902)
+
+    A statement refused before it ran (concurrency, queue, per-user memory,
+    memory pressure, rate limit) now reports `ResourceExhausted` instead of
+    `ExecutionFailed`, so clients that retried on `INTERNAL` or matched the
+    message must match the code. The reason is `queue_full`,
+    `queue_timeout`, `user_limit`, `memory_budget`, `memory_pressure` or
+    `rate_limited`: Flight SQL metadata `x-sqe-refusal-reason`, Trino
+    `errorName` `SQE_<REASON>` with errorType `INSUFFICIENT_RESOURCES`, MCP
+    `structuredContent.error`.
+
+- A schema-changing `CREATE OR REPLACE TABLE ... AS SELECT` is one commit on the existing table (#892)
+
+    A replace whose SELECT changes the columns, the partitioning or the
+    format version used to build the new table under a staging name, drop
+    the old one and rename the staged one into place. Readers could see no
+    table in between, and the table lost its UUID, snapshot history, branches,
+    tags and grants. The replace now commits the new schema, partition spec
+    and data in one catalog update on the live table, as an Iceberg replace
+    transaction does. Columns keep their field id when their name and type
+    (or a type promotion) are kept; a column stays NOT NULL only when it keeps
+    the id of a NOT NULL column. Time travel and rollback cross the replace.
+    A replace that lowers the format version, or changes the shape while
+    `WRITE_BRANCH` is set or inside a transaction, is refused before any data
+    is written. A concurrent schema change fails the replace with a message
+    naming it; a concurrent append is retried.
+
+- Release tags no longer write `:latest`
+
+    `sqe-publish-latest` copied the amd64-only release image over `:latest`, which would replace a multi-arch `:latest` on every release. It now mirrors `:vX.Y.Z` and `:stable` only.
+
+- `make push` no longer tags `:latest`
+
+    It pushed `chameleon/sqe:latest` from any branch and feature set. It now pushes only `:<short-sha>`; `:latest` has one writer, `make latest`.
+
+- Release images are multi-arch: a `vX.Y.Z` tag now publishes one manifest list with linux/amd64 and linux/arm64 under `:vX.Y.Z` and `:stable`, in the GitLab registry and Harbor, so arm64 nodes and Apple silicon run the release image natively. The binaries are cross-compiled on the amd64 runners with cargo-zigbuild (glibc 2.28 floor), both platforms are scanned, and every published tag is read back and refused unless it lists both platforms under the release's index digest. The GitLab Release names that digest. Dev images from `main` (`:<short-sha>`) stay amd64 only
+
+- `ALTER TABLE ... SET PROPERTIES` keeps an identifier key unquoted, so `partitioning`, `sorted_by`, `extra_properties`, `gc_enabled`, the Parquet keys and the refused Trino keys there now mean the Trino property instead of a plain table property; `SET PROPERTIES k = DEFAULT` is refused (#897)
+
+- `WITH (...) TBLPROPERTIES (...)` joins the `TBLPROPERTIES` items into the `WITH` list with quoted keys, so they stay plain Iceberg properties (#897)
+
+- CI: release image signing is off until it signs with a key
+
+    Keyless `cosign sign` against public Sigstore cannot use this GitLab's ID token, so `aikido-sign-image` failed the v0.54.0 tag pipeline after the image and Release were published. No release image was ever signed. `release.md` records why and what turns it back on.
+
+- `array_remove` removes every occurrence, `map_entries` and `zip` return
+  anonymous row fields (`row(varchar, bigint)` over the Trino protocol), and
+  `checksum` is an order-independent aggregate returning `varbinary` instead
+  of a per-row hex string, as in Trino.
+
+- `to_utf8`, `from_utf8`, `from_hex`, `to_base64` and `from_base64` work on
+  `varbinary` like Trino
+
+    They used to return hex text in place of bytes. `to_utf8` and `from_hex`
+    now return `varbinary`; `from_utf8` takes `varbinary` and the replacement
+    overloads. `to_hex` takes `varbinary` as well as integers. `md5`, `lpad`,
+    `rpad` and `substr` / `substring` keep `varbinary` in and out; `md5` on
+    `varchar` keeps DataFusion's hex text.
+
+- Integer literals are `integer` when they fit, as in Trino
+
+    `SELECT 1`, `abs(-5)`, `CASE WHEN .. THEN 1 ..`, `VALUES (1), (2)` and
+    `SELECT 1 UNION ALL SELECT 2` return `integer`, not `bigint`, and
+    `CREATE TABLE AS SELECT 1` writes an `int` column. A literal past
+    2147483647 stays `bigint`. A literal inside `WITH RECURSIVE` stays
+    `bigint`.
+
+- `repeat(x, n)` returns an array, as in Trino
+
+    It used to repeat a string. Use `rpad('', n, s)` or
+    `array_join(repeat(s, n), '')` for a repeated string. `concat`, `reverse`
+    and `concat_ws` also take arrays.
+
+- Image build: `sqe-bench` links only for the `bench-runtime` target
+
+    The `builder` stage of `Dockerfile` compiled and linked `sqe-bench` for every server image. A `bench-builder` stage now does that, on the same target cache, so `docker build .` and the quickstart Compose builds skip it. `.dockerignore` lists the directories no image build reads (`benchmarks/`, `quickstart/`, `deploy/`, `playground/`, `adapters/`, `dist/`, `sbom/`, `testing/`, `changelog.d/`).
+
+- Image build: no sccache, no cmake
+
+    `Dockerfile` no longer downloads and wraps rustc with sccache. Beside the `target/` cache mount it had nothing to add: a rebuild after a `sqe-core` edit recompiled 15 workspace crates with 0 cache hits, and the build step took 495 s with it and 481 s without. The builder stage no longer installs `cmake`, which no crate needs (a cold build of all 603 crates passes without it), nor `libssl-dev`, `pkg-config` and `curl`, which the Rust base image already ships.
+
+### Removed
+
+- `Dockerfile.bench`
+
+    Nothing built it. The bench image is `docker build --target bench-runtime .`; the separate file had no dependency caching and an unpinned builder base.
+
+### Fixed
+
+- A commit that removes files written under an older partition spec whose source column was dropped no longer fails with "value is not compatible with type" (#892)
+
+    iceberg-rust bound an old spec to the current schema, where an identity
+    field on a dropped column types as `unknown`. The old spec now binds to
+    the newest schema that still holds its source columns.
+
+- `information_schema` and `system` catalog queries are no longer served from the result cache
+
+    A write evicts the cached results of the table it wrote, but a result
+    read from `information_schema.columns` is indexed under `columns`, so a
+    query repeated after a CTAS, CREATE OR REPLACE or DROP returned the old
+    column or table list until the cache entry expired. Results that read
+    catalog metadata are now never cached.
+
+- A Flight SQL ingest whose upload breaks in transport now fails with the transport's own gRPC status (#904)
+
+    A `FlightData` message over the coordinator's 4 MiB decoding limit failed the ingest as `Internal` / `EXECUTION_FAILED` with a nested "Stream error: External error: Tonic error: ..." message. The ingest now keeps the first error the upload stream yields and answers with that status: `OutOfRange` with tonic's "decoded message length too large" message. The audit record carries `INVALID_ARGUMENTS`.
+
+- A column tag committed by another engine masks the next query (#903)
+
+    With a policy engine on, the first read of a table in each statement now
+    sends a conditional GET to the catalog (304 when nothing changed) instead
+    of trusting a cache entry for up to `metadata_cache_ttl_secs`. Before, a
+    tag added by Spark or another SQE replica left the column readable until
+    the soft TTL lapsed. Later reads of the table in the same statement still
+    serve the cache. The cost is one catalog round trip per table per
+    statement; `[catalog] revalidate_each_statement = false` restores the old
+    behaviour. Tag lookups that fall back to the shared cache now take the
+    most recently validated entry. Projecting the new tag into Ranger on load
+    is not part of this change.
+
+- `CREATE TABLE ... WITH (format_version = 3)` and CTAS create the table at that version; `ALTER TABLE ... SET PROPERTIES format_version = 3` upgrades it (#897)
+
+    The Trino `format_version` option was stored as a table property, and
+    the table was created at the server default (`catalog.default_table_format_version`).
+    So dbt-trino marts with `+properties: {format_version: "3"}` came out V2 on a
+    V2-default server. CREATE TABLE and CTAS now take the version from
+    `format_version` (a number or a string), `'format-version'` or
+    `TBLPROPERTIES ('format-version' = ...)`. A version below what a column
+    needs (variant, geometry, nanosecond timestamps, DEFAULT) is an error.
+    `ALTER TABLE ... SET TBLPROPERTIES` / `SET PROPERTIES` with a higher version
+    upgrades the table in the same commit and refuses a lower one.
+
+- dbt-trino's `create table t comment '...' WITH (...) as (...)` parses (#897)
+
+    sqlparser keeps `COMMENT`, `WITH (...)` and `TBLPROPERTIES` in one options
+    slot, so any model with `persist_docs: {relation: true}` and `properties`
+    failed with "Expected: end of statement, found: WITH". The comment now joins
+    the options as the `comment` property. A plain `CREATE TABLE t COMMENT '...'`
+    used to drop its comment; it is now stored as the `comment` property too, where
+    `COMMENT ON TABLE` writes it. `WITH (...) TBLPROPERTIES (...)` parsed, but
+    sqlparser kept only the second list, so the `WITH` items were dropped without
+    an error. They now join the `TBLPROPERTIES` list.
+
+- `sqe-server` recompiled on every build in a git worktree
+
+    `crates/sqe-server/build.rs` asked cargo to watch `<git dir>/<branch ref>`. In a linked worktree, and after `git pack-refs`, that file does not exist, and cargo treats a missing watched path as changed: the crate was rebuilt and relinked on every `cargo build`. The script now resolves paths with `git rev-parse --git-path`, watches only paths that exist, and watches the reflog so a new commit is still picked up.
+
+- `CALL system.expire_snapshots` / `remove_orphan_files` accept
+  `older_than => TIMESTAMP '...'` again
+
+    The Trino rewrite turns the literal into `CAST('...' AS TIMESTAMP(0))`
+    before the CALL is parsed, and the procedure parser refused the cast
+    as `Unsupported SQL statement`. A timestamp cast of a literal is now
+    read like the literal.
+
+- `element_at(array, i)` accepts an `integer` index again
+
+    Integer literals became `integer`, and `element_at(arr, 1)` failed with
+    `array index must be bigint`. Any integer index is now widened to
+    `bigint`, as Trino does.
+
+- The CI dependency image builds again with Rust 1.100
+
+    Cargo 1.100 puts every build unit in `target/debug/build/<pkg>/<hash>/` and no longer
+    creates `target/debug/deps`, so the image build failed after a successful compile and
+    test jobs fell back to rebuilding every dependency. The shared CI templates now prune
+    both layouts; this pins the template commit with that fix.
+
+- MR pipelines pass again: the dependency image pin, the advisory review
+  dates and an unused `sqe-cli` dependency
+
+    The pinned `ci-deps` digest no longer existed in the registry, so
+    `aikido-test-rust`, `aikido-rust-extra` and `catalog-live-tests` failed
+    to pull their image. The pin now names the image built from the current
+    `Cargo.lock`, toolchain and `vendor/`. The three chrono, chrono-tz and
+    humantime advisory ignores in `deny.toml` carry their review date in the
+    form the advisory check reads. `sqe-cli` no longer depends on
+    `sqe-policy`, which it stopped using, so `deps-check` passes on main.
+
+- CI test jobs start again after the dependency image was rebuilt
+
+    `aikido-test-rust` and `aikido-rust-extra` failed on every merge request with
+    `manifest unknown`: the pinned `ci-deps` digest no longer existed in the registry
+    after the dependency refresh rebuilt the image. The pin now points at
+    `ci-deps:lock-a73c967e88a4`, built from the current `Cargo.lock`, toolchain and
+    `vendor/` tree.
+
+- CI test jobs reuse the dependency image built with Rust 1.100
+
+    The Rust jobs still pinned the `ci-deps` image built with rustc 1.99.1, so after
+    the toolchain bump every job rebuilt all dependencies. The pin now points at the
+    image built on main from 87a6f695 with rustc 1.100.0.
+
+- CI test jobs reuse the dependency image built for the current `vendor/` tree
+
+    The #897 merge changed the vendored iceberg-rust, so the `ci-deps` image pinned the
+    same day no longer matched it and every crate downstream of `vendor/` would rebuild
+    in each merge request. The pin now points at the image built from de95a8ed.
+
+- A schema-changing `CREATE OR REPLACE TABLE ... AS SELECT` keeps the table's properties and column tags (#896)
+
+    A replace whose SELECT changes the columns or the partitioning is staged
+    under a temporary name and renamed into place. The staged table was
+    created with the statement's own options only, so every property of the
+    live table was lost, `sqe.column-tags` among them, and tag-based masks
+    and row filters stopped applying to the replaced table. The staged table
+    now takes every live property the statement does not set, as the
+    same-schema replace already did (#894). Column tags are kept for the
+    columns the new schema still has; a dropped column's tags go. The
+    reserved keys, the old table's storage paths and `sqe.json-columns`
+    (recomputed from the SELECT) are not carried.
+
+- `CREATE OR REPLACE TABLE ... TBLPROPERTIES (...) AS SELECT` sets the statement's properties when it replaces the table in place (#894)
+
+    A replace with an unchanged schema swaps the contents of the live table and
+    kept its old properties; only a schema-changing replace applied the new
+    ones. The statement's properties now land in the same commit as the swap
+    (also when an empty table is replaced by an empty SELECT). Properties the
+    statement does not name stay, as in an Iceberg replace. A `CREATE OR
+    REPLACE` that names `sqe.column-tags` needs an admin role, like `ALTER
+    TABLE ... SET TBLPROPERTIES`: the replaced table keeps the snapshots those
+    tags mask.
+
+- CTAS and Flight SQL ingest create accept unsigned 64-bit columns (#888)
+
+    `row_number()`, `rank()`, `dense_rank()` and `ntile()` return `UInt64`, which
+    Iceberg has no type for, so `CREATE TABLE ... AS SELECT row_number() OVER (...)`
+    failed with "UInt64 is not supported". The column is now created as `bigint`.
+    The write casts with a checked cast, so a value above `9223372036854775807`
+    fails the statement instead of wrapping or turning NULL, and a failed
+    `CREATE OR REPLACE` leaves the previous table in place. `UInt8`, `UInt16` and
+    `UInt32` were already mapped to `int`/`bigint`. Unsigned fields nested in a
+    struct, list or map are not mapped yet.
+
+- dbt-sqe: a second `dbt seed` replaces the rows instead of appending them (#891)
+
+    The seed re-run truncates the table through a statement whose result is
+    never read, so the TRUNCATE never ran. It is now read on execute, like the
+    other DML. Also fixed: `dbt docs generate` (it selected `table_type` from
+    `information_schema.columns`, which has none), `--full-refresh` of an
+    incremental model (it appended), and an incremental model replacing a view
+    of the same name. The requirements lock matches `setup.cfg` again
+    (adbc-driver-flightsql 1.13.0).
+
+- `DROP SCHEMA ... CASCADE` drops the schema's views and tables; `DROP SCHEMA a, b` drops both (#895)
+
+    CASCADE was ignored, so a schema holding tables failed with the catalog's
+    409 "Namespace is not empty". It now drops each view, then each table
+    (a catalog drop, never a purge), with the caller's own token, so the
+    catalog checks the drop privilege per object, then the schema. Everything
+    is listed first: a schema with child schemas is refused before anything
+    is dropped. The cascade is not atomic; a failure part-way names what was
+    dropped and what is still there. Without CASCADE, a non-empty schema now
+    says so and points at CASCADE. A multi-name `DROP SCHEMA` used to drop
+    only the first name. The query result cache is cleared after a DROP
+    SCHEMA.
+
+- `DROP SCHEMA ... CASCADE` works on an Iceberg catalog attached to the embedded CLI
+
+    The embedded CLI refused CASCADE with "not implemented". It now drops
+    the schema's views (when the catalog has views) and tables, then the
+    schema, as a coordinator does since #895. Everything is listed first,
+    so a schema with child schemas is refused before anything is dropped.
+    Table drops never purge data files. The cascade is not atomic: a failure
+    part-way names what was dropped and what is still there.
+
+- Flight SQL works with the stock Arrow Flight SQL JDBC and ODBC drivers
+
+    The Arrow Java and C++ Flight clients (a `user-agent` containing `grpc-java` or `grpc-c++`) now get uncompressed results, because the JDBC driver and Arrow's ODBC installer have no LZ4/ZSTD codec. The header `x-sqe-flight-compression: none|lz4|zstd` picks the codec for one request; pyarrow, which has the codecs, can send `lz4` to get compression back.
+
+    `GetCatalogs`, `GetDbSchemas` and `GetTables` report the catalog names SQL resolves, not the warehouse name. Views are typed `VIEW`, and `GetTableTypes` lists `TABLE` and `VIEW`.
+
+    The `SetSessionOptions`, `GetSessionOptions` and `CloseSession` actions are answered. This makes the JDBC `catalog=` property and `setCatalog` work.
+
+    SqlInfo values are corrected: the identifier case, the grammar, GROUP BY, UNION, outer joins, subqueries, and an int64 default isolation level.
+
+    Result columns carry `ARROW:FLIGHT:SQL:TYPE_NAME`, `PRECISION` and `SCALE`.
+
+- `information_schema.columns` no longer answers zero rows while other sessions run DDL (#890)
+
+    Every commit deleted the namespace's table-name snapshot, so a reader that
+    planned between its pre-plan refresh and a concurrent commit found no names
+    and got zero rows for tables nobody touched (dbt then rendered a MERGE with
+    an empty column list). A commit now marks the snapshot for a re-list and
+    keeps serving its names; a refresh that raced a commit is stored marked.
+    A listed name the catalog briefly does not find (a `CREATE OR REPLACE` that
+    changes the schema swaps the table) is retried for up to 175 ms before it
+    is left out. The table being swapped can still be missed when the swap
+    takes longer than that; an atomic replace is tracked in #892. A table whose schema SQE cannot read is now an error with the
+    reason instead of "table not found" and a silent gap in `information_schema`.
+    dbt-sqe: `get_columns_in_relation` raises when it gets no columns for a
+    relation `information_schema.tables` lists, and the merge strategy refuses
+    an empty column list.
+
+- `INSERT INTO t (WITH ... SELECT ...)` and other parenthesised source queries parse (#889)
+
+    sqlparser only took `(SELECT` after the table name, so `(WITH`, `(VALUES` and
+    `((SELECT` were read as a column list and failed with "Expected: ), found: x".
+    A parse-gated rewrite drops the one pair of parentheses; a real column list is
+    never touched. dbt-sqe's `append` incremental strategy no longer wraps the model
+    in parentheses, so every model that starts with a CTE appends. `INSERT ...
+    SELECT 4, 4` no longer fails with "Projections require unique expression
+    names": unnamed INSERT source columns get `_colN` names as SELECT columns do.
+
+- A JSON arrow on a bare column (`payload -> 'session' ->> 'type'`) plans again instead of failing with "Unsupported ast node in sqltorel: Lambda" (#913)
+
+    Since lambdas were added, the parser read a bare column followed by `->` as a one-parameter lambda wherever it stood. The planner now parses `->` as an operator and makes it a lambda only in the second and later arguments of a higher-order function (`transform`, `filter`, `reduce`, `any_match`, ...), so both forms work in one statement. A qualified column (`e.payload -> 'k'`) and `->>` were never affected. Text that only parses with lambda syntax (`lambda x: ...`, a typed lambda parameter) is planned as before. Policy expressions (`ROWS WHERE`, masks) are parsed by DataFusion directly and still read `col -> ...` as a lambda.
+
+- `json_extract_scalar`, `json_extract` and `json_size` read array indexes and bracketed members in a JSON path
+
+    `$.items[1].name`, `$[0]` and `$["a.b"]` used to return NULL (#914), because the path was split on dots only. The path now follows Trino's subset: `$`, `.key`, `[n]`, `["key"]` and `['key']`. Paths that worked before, such as `$.items.0.name` or a path without `$`, give the same result. A malformed path is NULL rather than an error.
+
+- `DROP TABLE` with a one- or two-part name drops from the session catalog and schema
+
+    `DROP TABLE t` and `DROP TABLE s.t` went to the default warehouse instead of the catalog set by `USE` or the client. With `IF EXISTS` the table was not found there, so the statement succeeded and dropped nothing (#915). The name now resolves like INSERT and CTAS do. The same applies to `DROP TABLE ... PURGE` and to a Hive root that is the session catalog.
+
+- MERGE: a bare column in a `WHEN NOT MATCHED` clause is a source column (#893)
+
+    `WHEN NOT MATCHED THEN INSERT (id, name) VALUES (id, name)` failed with
+    "Ambiguous reference to unqualified field id" when target and source share the
+    column name. A NOT MATCHED clause has no target row, so its bare names now
+    resolve to the source, in the INSERT VALUES and in the clause's `AND`
+    predicate, on the copy-on-write and merge-on-read paths. dbt-core's snapshot
+    MERGE uses this form, so every dbt snapshot failed on its second run.
+
+- Every workspace crate now inherits the workspace lint table, so `await_holding_lock = "deny"` applies everywhere
+
+    22 crates (and `xtask`) had no `[lints] workspace = true`, so the deny on holding a lock across an `.await` only reached the crates that opted in, and cargo warned `missing_lints_inheritance` on every build. Workspace clippy stays clean with the lint now active. The size budgets in `.config/budgets.json` are raised to cover the Trino parity functions merged this week (`sqe-trino-functions` 14250 -> 21600 lines), the matching catalog and coordinator growth, and `query_handler.rs` (10300 -> 10350), so the pre-push hooks pass again without `SKIP=budgets`.
+
+- A long query is no longer cut by the result idle timeout while the client waits for it, and a client that stops reading is dropped (#884)
+
+    `query.stream_idle_timeout_secs` aborted a query whose plan produced no batch for 300 s unless its operator metrics moved. A multi-level sort merge reports its intermediate passes to a detached metric set, so a single-row SF100 sort under concurrent load was cut at about 600 s while still executing. With a `query.timeout_secs` deadline (the default) the deadline alone now bounds a running plan; the idle guard on the plan applies only when `timeout_secs = 0`.
+
+    The idle timeout also never saw a client that stopped reading: the check ran only when something polled the result, and an HTTP/2 client with a full window is not polled. A task now pulls each streaming result into a one-slot channel. When a batch is ready and the client has not taken the previous one within the idle timeout, the query fails with "the client did not read the next result batch" and its permits, memory reservation and spill files are released; the client reads that error after the buffered batch. A client that disconnects still cancels the query at once.
+
+- The SAST job no longer flags the release-binaries script's architecture check as DNS exfiltration; the line carries a `nosemgrep` marker with its reason.
+
+- DBeaver and other Trino JDBC clients can browse tables and views
+
+    `system.jdbc` now serves every table the Trino JDBC driver reads:
+
+    - `table_types` (`TABLE`, `VIEW`);
+    - empty `procedures`, `procedure_columns`, `udts`, `super_types`, `super_tables`, `attributes` and `pseudo_columns` tables.
+
+    Before, `getTableTypes()`, `getProcedures()` and similar metadata calls failed. `system.jdbc.tables` also lists views, as `VIEW`.
+
+- Bare `current_user` works in SQL
+
+    `SELECT current_user` failed with "No field named current_user", which also broke the Trino JDBC driver's `getUserName()`.
+
+- `PreparedStatement.getMetaData()` works with the Trino JDBC driver before the statement runs
+
+    `DESCRIBE OUTPUT` returns empty strings for Catalog, Schema and Table, as Trino does, instead of NULL. The driver threw a `NullPointerException` on NULL.
+
+- Trino result types for `corr`, `covar_pop`, `covar_samp`, `regr_slope`, `regr_intercept`, and DECIMAL `round`
+
+    `corr`, `covar_pop`, `covar_samp`, `regr_slope` and `regr_intercept` over two `REAL` arguments now return `real`, as in Trino; double and mixed inputs still return `double`. `round(decimal(p,s))` returns `decimal(p-s+min(1,s),0)`, `round(decimal(p,s), d)` returns `decimal(p+1,s)`. Rounding is half away from zero.
+
+- Trino type syntax in CAST
+
+    `CAST` and `TRY_CAST` accept Trino's `array(T)`, `row(name T, ...)`
+    (nested, and inside arrays) and `map(K, V)` targets, as DDL already did.
+    `time(p)` and `time(p) with time zone` cast to `TIME`; precision and zone
+    are dropped, since DataFusion has no zoned time.
+
+- `bigint` arithmetic and unary minus fail on overflow, as in Trino
+
+    `9223372036854775807 + 1` fails with `bigint addition overflow` instead
+    of wrapping to the smallest `bigint`; `-` and `*` do the same. `-x` on
+    the smallest `integer` or `bigint` fails with `integer negation
+    overflow` or `bigint negation overflow`. The literal `-2147483648` is
+    `bigint`, as in Trino.
+
+- Date and time functions return Trino's types and values
+
+    `from_unixtime`, `from_iso8601_timestamp` and `parse_datetime` return
+    `timestamp(3) with time zone`; `to_iso8601` writes UTC as `Z`;
+    `date(varchar)` parses instead of returning NULL; `date_trunc` on a date
+    returns a date; `timezone_hour` / `timezone_minute` return the zone's
+    offset. `format_datetime` walks the full Joda pattern and `date_parse` /
+    `date_format` the full MySQL specifier table; a value `date_parse` cannot
+    parse is an error instead of the epoch. `now()` is still `timestamp(6)`
+    without a zone.
+
+- Trino function leftovers (trino-sql-parity wave 3)
+
+    `sha256` now returns `varbinary` and accepts `varbinary` or `varchar` (the DataFusion built-in; use `to_hex` for text); HASH column masks are unaffected because they use the internal keyed function. `concat` with an array argument prepends, appends or concatenates like Trino. `json_array_contains` returns NULL for a non-array. `EXTRACT(... FROM ...)` and `POSITION(x IN y)` return `bigint`. `avg(real)` and `sum(real)` return `real`. New: `json_scalar`, `combinations`, `trim_array`, `title_case`, `char2hexint`. Breaking for callers that treated `sha256(x)` as hex text: wrap it in `to_hex`. In embedded mode (`sqe-cli`) `[policy] mask_key` no longer keys `sha256()`; the CLI warns when it is set, and `hmac_sha256(x, key)` gives a keyed hash.
+
+- Main's `deps-check` passes again
+
+    `sqe-trino-functions` still declared the `url` crate after the URL functions
+    moved to their own parser, and cargo-machete failed the job on main.
+
+- `integer`, `smallint` and `tinyint` arithmetic fails on overflow, as in Trino
+
+    `2147483647 + 1` fails with `integer addition overflow` instead of
+    wrapping to `-2147483648`. The same holds for `-` and `*` and for column
+    values. `bigint` arithmetic still wraps.
+
+- Math functions return Trino's types
+
+    `DECIMAL '12.34'` is `decimal(4,2)`, typed from its digits, instead of
+    `decimal(38,10)`. `ceil`, `floor`, `sign`, `truncate` and `mod` keep the
+    integer or decimal type of their input instead of returning double; integer
+    `mod` by zero is an error. The bit shifts return the first argument's
+    integer type. `cosine_distance` of identical vectors is exactly 0. The
+    real-typed results of `corr`, `covar_*` and `regr_*` are still double.
+
+- Trino result boundary: unsigned integers, non-finite doubles and `CAST(json AS varchar)` now match Trino over HTTP and Flight SQL
+
+    Flight SQL sends an unsigned column as the next wider signed type (`UInt64`/`UInt32` as `Int64`, `UInt16` as `Int32`, `UInt8` as `Int16`), as Trino has no unsigned types; a `UInt64` above `i64::MAX` is an error instead of a silent NULL. The Trino HTTP protocol labels unsigned columns the same way and encodes `NaN`, `Infinity` and `-Infinity` as the strings Trino clients expect, where they were `null` before. `CAST(<json> AS varchar)` returns Trino's text: a JSON string unquoted, a number or boolean as its text, JSON `null` as SQL NULL, and an error for an array or object (`TRY_CAST` gives NULL); it was the JSON text with its quotes. A cast the engine builds itself (named target field, such as a partial column mask) keeps the JSON text.
+
+- String functions return Trino's types and values
+
+    `strpos`, `length`, `levenshtein_distance` return bigint; `split_part`
+    past the last field gives NULL; `human_readable_seconds` rounds to whole
+    seconds; the `url_extract_*` functions return `''` for an absent component
+    and `url_extract_port` returns bigint. SQL `position(x IN y)` still
+    returns integer.
+
+- Timestamp precision and zone follow Trino
+
+    `TIMESTAMP '...'` is typed by its fraction digits (0, 3, 6 or 9, rounded up),
+    `CAST(x AS TIMESTAMP)` is `timestamp(3)`, and `TIMESTAMP(p)` with p of 1, 2,
+    4, 5, 7 or 8 works (it reports the next of 0/3/6/9). Result types report the
+    precision of the Arrow unit on HTTP and Flight, with that many fraction
+    digits; nanosecond values now say `timestamp(9)` instead of 6. A literal
+    with a zone keeps it (`TIMESTAMP '2024-01-01 10:00:00 Europe/Amsterdam'`
+    renders in that zone, UTC as ` UTC`). `now()` and `current_timestamp` return
+    `timestamp(3) with time zone` in UTC, `localtimestamp` returns
+    `timestamp(3)`, and `at_timezone` / `with_timezone` keep the input unit.
+    Narrowing casts round half up. Coarse literals in DELETE, UPDATE and MERGE
+    predicates are scaled to microseconds for Iceberg pushdown, a zoned to
+    zoned cast no longer blocks pushdown, DDL `timestamp(0..3)` columns can be
+    created, and CTAS writes any zoned timestamp as UTC `timestamptz`. Known
+    differences: `timestamp(2)` reports `timestamp(3)`, and `with_timezone` on
+    nanosecond input drops digits below the microsecond.
+
+- `CREATE OR REPLACE VIEW` no longer drops another engine's SQL text without asking (#900)
+
+    A replace writes a new view version with only the `sqe` representation. When
+    the current version also holds a text in another dialect (for example
+    `spark`, written by a migrator or by Spark itself), that engine could no
+    longer read the view, and nobody was told. The replace is now refused with
+    an error that names each dialect it would drop. Add
+    `WITH (drop_dialects = 'spark')` (a comma-separated list, case-insensitive)
+    to replace the view anyway. The option is a statement option and is not
+    stored as a view property. Views whose current version has only `sqe` text
+    are replaced as before.
+
+    Polaris already refused such a replace, but only as an HTTP 500 that did
+    not say how to proceed (`replace.drop-dialect.allowed=false`). With the
+    option, SQE sets `replace.drop-dialect.allowed = true` in the replace commit
+    and removes it again in a second commit, unless the view already had it.
+
+- `docker build --build-arg CARGO_PROFILE=dev` failed after compiling
+
+    The builder copied the binaries from `target/dev`, but cargo writes the `dev` profile to `target/debug`.
+
+### Security
+
+- File TVFs no longer read Hive external table data; Hive tables get their own location list (#886)
+
+    Hive table locations were gated by the file TVF allow-list
+    (`[storage.tvf] allowed_object_store_prefixes`), so every location a Hive
+    table could live at was also a path any user could `read_parquet` /
+    `read_csv` / `read_json` with the engine's credentials, bypassing the
+    table's row filters and masks. Hive locations now use
+    `[hive] allowed_data_prefixes` and a per-root `[[hive.roots]] data_prefixes`
+    (same grammar, `{user}` and `{catalog}` placeholders). A file TVF read under
+    a Hive data prefix, or under the location of any Hive table the coordinator
+    has loaded, is refused for every caller, admins and
+    `allow_all_object_stores` included; a call with complete inline credentials
+    is not. Directories and globs above the data are refused too. Startup logs
+    an error for each TVF prefix that overlaps a Hive prefix.
+
+    Migration: with neither key set, Hive locations keep using the TVF list
+    for one release and startup logs a deprecation warning; loaded tables are
+    still refused to file TVFs. Existing file TVF reads of Hive table data
+    stop working: query the Hive table instead. Loaded-table entries are per
+    process, so after a restart a table is protected again from its first
+    load; the configured prefixes have no such gap.
+
+- Projected Ranger tags carry the catalog under `catalog_scoped` (#899)
+
+    With `policy.ranger.catalog_scoped = true`, `SET TAG` / `UNSET TAG`,
+    schema changes and tag reprojection now write the Ranger tag-store
+    resource under the same key as the mask (`<catalog>.<namespace>`), so two
+    same-named tables in different catalogs no longer share one resource and
+    Spark no longer masks the wrong table. The unscoped resource left from
+    before the setting is cleared on the next projection. Without
+    `catalog_scoped`, a one-level namespace projects as before; a multi-level
+    namespace now projects as the dotted path the mask key uses.
+
+- `production_mode` refuses Ranger when tokens carry no groups (#899)
+
+    New rule `ranger-groups-claim`: with `policy.engine = ranger`, every
+    `oidc_password` / `bearer_token` provider must set `groups_claim`, and the
+    legacy `[auth]` block (no `[[auth.providers]]`, never reads groups) is
+    refused. The error names the provider. Opt out with
+    `security.allow_tokens_without_groups = true`. The Helm chart renders
+    `config.auth.providers` as `[[auth.providers]]`, `values-production.yaml`
+    sets an `oidc_password` provider with `groups_claim: groups`, and the
+    chart fails at template time on the same condition.
+
+- Flight SQL bulk ingest and early statement refusals now write an audit record (#887, #882)
+
+    A `DoPut` bulk ingest (`CommandStatementIngest`, what ADBC `adbc_ingest` and dbt seeds send) wrote rows to Iceberg with no audit record. It now writes one record per call, success or failure: actor, target table, ingest mode (`if_not_exist` / `if_exists`), rows written, outcome and the snapshot property keys (never their values). The table resource carries the same catalog an `INSERT` into it records. An ingest whose client disconnects before the reply still writes one record, marked cancelled, since its rows may already be committed. A prepared statement refused before it runs (bad or missing parameter binding, a transaction handle that does not resolve) now writes a failure record too. A statement refused by the size limit (`query.max_sql_bytes`) or by admission (per-user concurrency or memory budget) also wrote no record; each now writes one failure record. The oversized one is not parsed: it is recorded as `statement_type` `unknown` with its first KiB of text (never cut inside a string literal) and its full length in `text_len`. The same holds for oversized statements arriving through Flight SQL `GetFlightInfo` and prepared statements. Only the refusal for a closed audit log (`fail_mode = "closed"`) still writes none, since the log is unavailable.
+
+- The advisory gates (`cargo deny`, `cargo audit`) accept the 2026-11-17 unmaintained notices for chrono, chrono-tz and humantime with a review date of 2027-01-17. No version is fixed, no vulnerability is known, and arrow, DataFusion and object_store depend on them.
+
 ## [0.54.0] — 2026-11-12
 
 ### Added

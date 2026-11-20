@@ -1,5 +1,0 @@
-### Added
-
-- Signed catalog scope for one OAuth client's sessions (#908)
-
-    `[session.catalog_scope]` names one client (matched on the bearer's `azp`) whose sessions must carry an ES256 JWS from a configured issuer, sent as the `x-sqe-catalog-scope` header on the Trino path or as Flight SQL metadata (name configurable). The scope's `sub` and `jti` must equal the bearer's, and `catalogs` maps each catalog to `read_write` or `read_only`. A scoped session sees only those catalogs (others answer "catalog not found"; `SHOW CATALOGS`, `USE`, `SET CATALOG` and `X-Trino-Catalog` are limited to them), may not run `ATTACH` / `DETACH`, secret statements or access-control DDL, and cannot write into a `read_only` catalog, with the catalog layer refusing such commits as a backstop. A missing or invalid scope refuses the session with a reason and an audit record, also on MCP and Quack, which cannot carry the header. The bearer still goes to Polaris and S3, so the user stays the identity and grants still decide access inside the scope. Off unless configured; other clients and unscoped cache keys are unchanged.
