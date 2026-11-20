@@ -353,7 +353,15 @@ engine = "passthrough"
 # also lets a user tag a column they hold Ranger `alter` on. A broad `alter`
 # grant then becomes the right to remove that column's mask: read the Ranger
 # policies before switching.
+# Under "ranger-delegate" this covers every write of sqe.column-tags: the tag
+# statements, SET TBLPROPERTIES and CREATE [OR REPLACE] TABLE ... TBLPROPERTIES
+# (checked on the columns whose tags change).
 # tag_authority = "admin-role"
+# The Ranger access type a column tag write needs under "ranger-delegate":
+# "alter" (default) or "apply_tag", a grant of its own that alter, write and
+# `all` do not imply. "apply_tag" needs that access type on the hive
+# servicedef (the quickstart's bootstrap-ranger.sh adds it).
+# tag_privilege = "alter"
 
 [session]
 idle_timeout_secs = 900       # 15 minutes — sessions idle longer than this are expired

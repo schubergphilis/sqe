@@ -2312,6 +2312,10 @@ pub struct AccessControlConfig {
     /// Who may write column tags. See [`TagAuthority`].
     #[serde(default, alias = "tag-authority")]
     pub tag_authority: TagAuthority,
+    /// Which Ranger access type authorises a tag write under
+    /// `tag_authority = "ranger-delegate"`. See [`TagPrivilege`].
+    #[serde(default, alias = "tag-privilege")]
+    pub tag_privilege: TagPrivilege,
     /// Apache Ranger backend tuning. Used only when `backend = "ranger"`.
     #[serde(default)]
     pub ranger: RangerConfig,
@@ -2327,6 +2331,7 @@ impl Default for AccessControlConfig {
             client_secret: None,
             grant_authority: GrantAuthority::default(),
             tag_authority: TagAuthority::default(),
+            tag_privilege: TagPrivilege::default(),
             ranger: RangerConfig::default(),
         }
     }
@@ -2363,14 +2368,17 @@ pub enum GrantAuthority {
     RangerDelegate,
 }
 
-/// Where the authority to write column tags comes from (`ALTER TABLE ... SET /
-/// UNSET TAGS`, `SET / UNSET MASKING POLICY`).
+/// Where the authority to write column tags comes from: every statement that
+/// writes the `sqe.column-tags` table property (`ALTER TABLE ... SET / UNSET
+/// TAGS`, `SET / UNSET MASKING POLICY`, `SET TBLPROPERTIES`, `CREATE [OR
+/// REPLACE] TABLE ... TBLPROPERTIES`).
 ///
-/// - `admin-role` (default) requires an `[auth] admin_roles` role.
+/// - `admin-role` (default) requires an `[auth] admin_roles` role for the tag
+///   statements and for `TBLPROPERTIES` that change the reserved key.
 /// - `ranger-delegate` also lets a non-admin tag a column when the Ranger
-///   policies grant them `alter` on that column. A broad `alter` grant then
+///   policies grant them [`TagPrivilege`] on that column. A broad grant then
 ///   becomes the right to untag a column and so remove its mask; review the
-///   `alter` grants before turning it on.
+///   grants before turning it on.
 ///
 /// Admins pass in both modes. Backends without a column privilege model grant
 /// nothing, so only admins can tag there.
@@ -2380,6 +2388,27 @@ pub enum TagAuthority {
     #[default]
     AdminRole,
     RangerDelegate,
+}
+
+/// The Ranger `hive` access type a non-admin needs on a column to change its
+/// tags under `tag_authority = "ranger-delegate"`.
+///
+/// - `alter` (default) is the 0.55 behaviour: whoever may alter the table may
+///   tag its columns.
+/// - `apply_tag` asks for the custom access type `apply_tag` instead, the
+///   Databricks `APPLY TAG` model: tagging is its own grant, held apart from
+///   the right to change data or schema. It is not implied by `alter`, by any
+///   write type, or by an allow item's `all`; a deny item naming `apply_tag`
+///   or `all` still denies it. The access type has to exist in the `hive`
+///   servicedef (`{"name":"apply_tag","impliedGrants":[]}`) before Ranger
+///   accepts a policy that names it.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TagPrivilege {
+    #[default]
+    #[serde(rename = "alter")]
+    Alter,
+    #[serde(rename = "apply_tag", alias = "apply-tag")]
+    ApplyTag,
 }
 
 fn default_access_control_timeout() -> u64 {
@@ -9869,6 +9898,37 @@ mod ranger_config_tests {
             toml::from_str::<AccessControlConfig>(r#"tag_authority = "ranger_delegate""#).is_err(),
             "an unrecognised value must be refused, not defaulted"
         );
+    }
+
+    #[test]
+    fn tag_privilege_defaults_to_alter_and_spells_apply_tag() {
+        let c: AccessControlConfig = toml::from_str(r#"backend = "ranger""#).unwrap();
+        assert_eq!(
+            c.tag_privilege,
+            TagPrivilege::Alter,
+            "0.55 behaviour by default"
+        );
+        assert_eq!(
+            AccessControlConfig::default().tag_privilege,
+            TagPrivilege::Alter
+        );
+        for (line, want) in [
+            (r#"tag_privilege = "alter""#, TagPrivilege::Alter),
+            (r#"tag_privilege = "apply_tag""#, TagPrivilege::ApplyTag),
+            (r#"tag-privilege = "apply_tag""#, TagPrivilege::ApplyTag),
+            (r#"tag_privilege = "apply-tag""#, TagPrivilege::ApplyTag),
+        ] {
+            let c: AccessControlConfig =
+                toml::from_str(&format!("backend = \"ranger\"\n{line}\n")).unwrap();
+            assert_eq!(c.tag_privilege, want, "{line}");
+        }
+        for bad in ["APPLY_TAG", "applytag", "apply tag", "write", "all", ""] {
+            assert!(
+                toml::from_str::<AccessControlConfig>(&format!("tag_privilege = \"{bad}\""))
+                    .is_err(),
+                "{bad:?} must be refused, not defaulted"
+            );
+        }
     }
 
     #[test]

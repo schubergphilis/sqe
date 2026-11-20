@@ -656,3 +656,440 @@ async fn check_access_admin_can_check_anyone() {
         "admin access check must reach the backend"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #917 - tag_privilege, and every writer of `sqe.column-tags`
+// ---------------------------------------------------------------------------
+
+/// A store that grants a column privilege per (user, column, privilege),
+/// whatever the table: the gate asks per column, so per-column answers are
+/// what these tests need. Deny evaluation is the Ranger store's (its unit
+/// tests); to the gate a deny is a `false` here.
+#[derive(Default)]
+struct ColumnGrants(Vec<(&'static str, &'static str, sqe_policy::TablePrivilege)>);
+
+#[async_trait]
+impl PolicyStore for ColumnGrants {
+    async fn resolve(
+        &self,
+        _user: &SessionUser,
+        _table_name: &str,
+        _namespace: &str,
+    ) -> sqe_core::Result<ResolvedPolicy> {
+        Ok(ResolvedPolicy::default())
+    }
+
+    fn invalidate_all(&self) {}
+
+    async fn grants_column_privilege(
+        &self,
+        user: &SessionUser,
+        _table_name: &str,
+        _namespace: &str,
+        column: &str,
+        privilege: sqe_policy::TablePrivilege,
+    ) -> sqe_core::Result<bool> {
+        Ok(self
+            .0
+            .iter()
+            .any(|(u, c, p)| *u == user.username && *c == column && *p == privilege))
+    }
+}
+
+fn tag_handler(
+    config: SqeConfig,
+    store: Arc<dyn PolicyStore>,
+    authority: sqe_core::config::TagAuthority,
+    privilege: sqe_core::config::TagPrivilege,
+) -> QueryHandler {
+    let mut config = config;
+    config.access_control.tag_authority = authority;
+    config.access_control.tag_privilege = privilege;
+    let tracker = Arc::new(QueryTracker::new(&config.query_history));
+    QueryHandler::new(
+        Arc::new(PassthroughEnforcer),
+        Some(store),
+        config,
+        None,
+        None,
+        None,
+        None,
+        tracker,
+        None,
+        Some(Arc::new(RecordingBackend::default())),
+        None,
+        RuntimeCatalogRegistry::new(),
+        SecretStore::new(),
+    )
+    .expect("QueryHandler::new")
+}
+
+fn apply_tag_handler(grants: ColumnGrants) -> QueryHandler {
+    tag_handler(
+        minimal_config(),
+        Arc::new(grants),
+        sqe_core::config::TagAuthority::RangerDelegate,
+        sqe_core::config::TagPrivilege::ApplyTag,
+    )
+}
+
+#[tokio::test]
+async fn apply_tag_privilege_gates_the_tag_statements() {
+    use sqe_policy::TablePrivilege::{Alter, ApplyTag};
+    let handler = apply_tag_handler(ColumnGrants(vec![
+        ("steward", "ssn", ApplyTag),
+        ("owner", "ssn", Alter),
+    ]));
+    for sql in TAG_STMTS {
+        let steward = session_for("steward", vec!["analyst"]);
+        assert_passed_tag_gate(handler.execute(&steward, sql, None).await, sql);
+        // `alter` is not `apply_tag`.
+        let owner = session_for("owner", vec!["analyst"]);
+        let err = handler
+            .execute(&owner, sql, None)
+            .await
+            .expect_err("refused");
+        assert!(
+            err.to_string().contains("requires apply_tag on ns.tbl.ssn"),
+            "{sql}: {err}"
+        );
+        let root = session_for("root", vec!["service_admin"]);
+        assert_passed_tag_gate(handler.execute(&root, sql, None).await, sql);
+    }
+    // The default privilege stays `alter`.
+    let handler = tag_handler(
+        minimal_config(),
+        Arc::new(ColumnGrants(vec![("owner", "ssn", Alter)])),
+        sqe_core::config::TagAuthority::RangerDelegate,
+        sqe_core::config::TagPrivilege::default(),
+    );
+    let owner = session_for("owner", vec!["analyst"]);
+    for sql in TAG_STMTS {
+        assert_passed_tag_gate(handler.execute(&owner, sql, None).await, sql);
+    }
+}
+
+#[tokio::test]
+async fn plain_create_naming_tags_needs_the_privilege_on_every_named_column() {
+    use sqe_policy::TablePrivilege::ApplyTag;
+    let handler = apply_tag_handler(ColumnGrants(vec![
+        ("steward", "ssn", ApplyTag),
+        ("steward", "email", ApplyTag),
+    ]));
+    let steward = session_for("steward", vec!["analyst"]);
+    for sql in [
+        r#"CREATE TABLE ns.tbl (ssn INT, email INT) TBLPROPERTIES ('sqe.column-tags' = '{"ssn":["PII"],"email":["PII"]}')"#,
+        r#"CREATE TABLE ns.tbl TBLPROPERTIES ('sqe.column-tags' = '{"ssn":["PII"]}') AS SELECT 1 AS ssn"#,
+        r#"CREATE TABLE ns.tbl (ssn INT) WITH (extra_properties = MAP(ARRAY['sqe.column-tags'], ARRAY['{"ssn":["PII"]}']))"#,
+        // A new table with an empty map tags nothing.
+        "CREATE TABLE ns.tbl (ssn INT) TBLPROPERTIES ('sqe.column-tags' = '{}')",
+    ] {
+        assert_passed_tag_gate(handler.execute(&steward, sql, None).await, sql);
+    }
+    for sql in [
+        r#"CREATE TABLE ns.tbl (ssn INT, phone INT) TBLPROPERTIES ('sqe.column-tags' = '{"ssn":["PII"],"phone":["PII"]}')"#,
+        r#"CREATE TABLE ns.tbl TBLPROPERTIES ('sqe.column-tags' = '{"phone":["PII"]}') AS SELECT 1 AS phone"#,
+    ] {
+        let err = handler
+            .execute(&steward, sql, None)
+            .await
+            .expect_err("refused");
+        assert!(
+            err.to_string()
+                .contains("requires apply_tag on ns.tbl.phone"),
+            "{sql}: {err}"
+        );
+    }
+    let root = session_for("root", vec!["service_admin"]);
+    let sql = r#"CREATE TABLE ns.tbl (phone INT) TBLPROPERTIES ('sqe.column-tags' = '{"phone":["PII"]}')"#;
+    assert_passed_tag_gate(handler.execute(&root, sql, None).await, sql);
+}
+
+#[tokio::test]
+async fn raw_tag_writes_refuse_a_malformed_value_or_an_off_case_key_before_the_catalog() {
+    use sqe_policy::TablePrivilege::ApplyTag;
+    let handler = apply_tag_handler(ColumnGrants(vec![("steward", "ssn", ApplyTag)]));
+    let steward = session_for("steward", vec!["analyst"]);
+    // `cat` is no catalog: a 403 here was decided before catalog resolution.
+    for sql in [
+        "ALTER TABLE cat.ns.tbl SET TBLPROPERTIES ('sqe.column-tags' = 'not-json')",
+        r#"ALTER TABLE cat.ns.tbl SET TBLPROPERTIES ('sqe.column-tags' = '{"ssn":"PII"}')"#,
+        r#"ALTER TABLE cat.ns.tbl SET TBLPROPERTIES ('SQE.column-tags' = '{"ssn":["PII"]}')"#,
+        "CREATE OR REPLACE TABLE cat.ns.tbl TBLPROPERTIES ('sqe.column-tags' = '[]') AS SELECT 1 AS ssn",
+        r#"CREATE TABLE cat.ns.tbl (ssn INT) TBLPROPERTIES ('sqe.column-tags' = '{"ssn":')"#,
+    ] {
+        let err = handler.execute(&steward, sql, None).await.expect_err("refused");
+        assert!(err.to_string().contains("403 Forbidden"), "{sql}: {err}");
+        assert!(!err.to_string().contains("unknown catalog"), "{sql}: {err}");
+    }
+    // An admin is not gated on the value at all.
+    let root = session_for("root", vec!["service_admin"]);
+    let sql = "ALTER TABLE cat.ns.tbl SET TBLPROPERTIES ('sqe.column-tags' = 'not-json')";
+    let err = handler
+        .execute(&root, sql, None)
+        .await
+        .expect_err("no catalog");
+    assert!(!err.to_string().contains("403"), "{err}");
+}
+
+#[tokio::test]
+async fn admin_role_mode_is_unchanged_but_sees_extra_properties() {
+    // Under the default `admin-role` a non-admin may not write the key
+    // through ALTER or CREATE OR REPLACE, may through a plain CREATE (a new
+    // table), and a grant changes nothing.
+    use sqe_policy::TablePrivilege::{Alter, ApplyTag};
+    let handler = tag_handler(
+        minimal_config(),
+        Arc::new(ColumnGrants(vec![
+            ("alice", "ssn", ApplyTag),
+            ("alice", "ssn", Alter),
+        ])),
+        sqe_core::config::TagAuthority::AdminRole,
+        sqe_core::config::TagPrivilege::ApplyTag,
+    );
+    let alice = session_for("alice", vec!["analyst"]);
+    for sql in [
+        r#"ALTER TABLE cat.ns.tbl SET TBLPROPERTIES ('sqe.column-tags' = '{"ssn":["PII"]}')"#,
+        // The Trino spelling of the same write was not seen by the 0.55 gate.
+        "ALTER TABLE cat.ns.tbl SET TBLPROPERTIES (extra_properties = MAP(ARRAY['sqe.column-tags'], ARRAY['{}']))",
+        "CREATE OR REPLACE TABLE cat.ns.tbl WITH (extra_properties = MAP(ARRAY['sqe.column-tags'], ARRAY['{}'])) AS SELECT 1 AS ssn",
+    ] {
+        let err = handler.execute(&alice, sql, None).await.expect_err("refused");
+        assert!(err.to_string().contains("requires one of admin roles"), "{sql}: {err}");
+    }
+    for sql in TAG_STMTS {
+        assert_refused_by_tag_gate(handler.execute(&alice, sql, None).await, sql);
+    }
+    let sql =
+        r#"CREATE TABLE ns.tbl (ssn INT) TBLPROPERTIES ('sqe.column-tags' = '{"ssn":["PII"]}')"#;
+    assert_passed_tag_gate(handler.execute(&alice, sql, None).await, sql);
+}
+
+/// The routes that diff against a live table, on a sqlite catalog.
+#[cfg(feature = "test-sqlite")]
+mod live_tag_maps {
+    use super::*;
+    use sqe_core::config::{TagAuthority, TagPrivilege};
+    use sqe_policy::TablePrivilege::{Alter, ApplyTag};
+    use sqe_write::test_support::sqlite_rig::SqliteRig;
+    use std::collections::HashMap;
+
+    struct Rig {
+        rig: SqliteRig,
+        handler: QueryHandler,
+    }
+
+    impl Rig {
+        /// Table `t (ssn, email, phone)` with `ssn` and `email` tagged.
+        async fn new(authority: TagAuthority, grants: ColumnGrants) -> Self {
+            let rig = SqliteRig::new().await;
+            let handler = tag_handler(
+                rig.config.clone(),
+                Arc::new(grants),
+                authority,
+                TagPrivilege::ApplyTag,
+            );
+            let me = Self { rig, handler };
+            me.run("root", "CREATE TABLE t (ssn INT, email INT, phone INT)")
+                .await
+                .expect("create");
+            me.run(
+                "root",
+                r#"ALTER TABLE t SET TBLPROPERTIES ('sqe.column-tags' = '{"ssn":["PII"],"email":["PII"]}')"#,
+            )
+            .await
+            .expect("seed tags");
+            me
+        }
+
+        async fn run(
+            &self,
+            user: &str,
+            sql: &str,
+        ) -> sqe_core::Result<Vec<arrow_array::RecordBatch>> {
+            let roles = if user == "root" {
+                vec!["service_admin"]
+            } else {
+                vec!["analyst"]
+            };
+            let mut session = session_for(user, roles);
+            session.default_schema = Some(self.rig.session().default_schema.unwrap());
+            self.handler.execute(&session, sql, None).await
+        }
+
+        async fn tags(&self) -> HashMap<String, Vec<String>> {
+            let table = self.rig.load(&self.rig.ident("t")).await;
+            sqe_write::tag_source_impl::parse_column_tags(table.metadata().properties()).unwrap()
+        }
+    }
+
+    fn set(json: &str) -> String {
+        format!("ALTER TABLE t SET TBLPROPERTIES ('sqe.column-tags' = '{json}')")
+    }
+
+    fn refused_on(err: sqe_core::SqeError, column: &str) {
+        let msg = err.to_string();
+        assert!(msg.contains("403 Forbidden"), "{msg}");
+        let column = if column.contains('.') {
+            column.to_string()
+        } else {
+            format!("t.{column}")
+        };
+        assert!(
+            msg.contains(&format!("requires apply_tag on default.{column}")),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_tblproperties_checks_the_changed_columns_only() {
+        let r = Rig::new(
+            TagAuthority::RangerDelegate,
+            ColumnGrants(vec![
+                ("steward", "phone", ApplyTag),
+                ("owner", "ssn", Alter),
+            ]),
+        )
+        .await;
+        // Add `phone`, keep the rest as is (in another order): only `phone` changes.
+        r.run(
+            "steward",
+            &set(r#"{"email":["PII"],"phone":["PII"],"ssn":["PII"]}"#),
+        )
+        .await
+        .expect("phone is granted");
+        assert_eq!(r.tags().await.len(), 3);
+        // Dropping `email` from the map is an untag of `email`.
+        refused_on(
+            r.run("steward", &set(r#"{"ssn":["PII"],"phone":["PII"]}"#))
+                .await
+                .unwrap_err(),
+            "email",
+        );
+        // Changing `ssn`'s tags.
+        refused_on(
+            r.run(
+                "steward",
+                &set(r#"{"ssn":["SECRET"],"email":["PII"],"phone":["PII"]}"#),
+            )
+            .await
+            .unwrap_err(),
+            "ssn",
+        );
+        // Clearing the map, the stand-in for UNSET TBLPROPERTIES.
+        refused_on(r.run("steward", &set("{}")).await.unwrap_err(), "email");
+        // `alter` on the column is not `apply_tag`.
+        refused_on(
+            r.run("owner", &set(r#"{"email":["PII"],"phone":["PII"]}"#))
+                .await
+                .unwrap_err(),
+            "ssn",
+        );
+        assert_eq!(r.tags().await.len(), 3, "no refused write landed");
+        // The steward may untag what they may tag.
+        r.run("steward", &set(r#"{"ssn":["PII"],"email":["PII"]}"#))
+            .await
+            .expect("untag phone");
+        assert!(!r.tags().await.contains_key("phone"));
+        // An admin may do anything.
+        r.run("root", &set("{}")).await.expect("admin");
+        assert!(r.tags().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unset_tblproperties_does_not_reach_the_tags() {
+        let r = Rig::new(TagAuthority::RangerDelegate, ColumnGrants::default()).await;
+        for sql in [
+            "ALTER TABLE t UNSET TBLPROPERTIES ('sqe.column-tags')",
+            "ALTER TABLE t UNSET TBLPROPERTIES IF EXISTS ('sqe.column-tags')",
+        ] {
+            assert!(r.run("steward", sql).await.is_err(), "{sql}");
+        }
+        assert_eq!(r.tags().await.len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_or_replace_diffs_against_the_live_table() {
+        let r = Rig::new(
+            TagAuthority::RangerDelegate,
+            ColumnGrants(vec![("steward", "phone", ApplyTag)]),
+        )
+        .await;
+        let replace = |json: &str| {
+            format!(
+                "CREATE OR REPLACE TABLE t TBLPROPERTIES ('sqe.column-tags' = '{json}') \
+                 AS SELECT 1 AS ssn, 2 AS email, 3 AS phone"
+            )
+        };
+        refused_on(
+            r.run("steward", &replace(r#"{"phone":["PII"]}"#))
+                .await
+                .unwrap_err(),
+            "email",
+        );
+        assert_eq!(r.tags().await.len(), 2, "nothing replaced");
+        r.run(
+            "steward",
+            &replace(r#"{"ssn":["PII"],"email":["PII"],"phone":["PII"]}"#),
+        )
+        .await
+        .expect("only phone changes");
+        assert_eq!(r.tags().await.len(), 3);
+        // Replacing without naming the key keeps the tags and needs nothing.
+        r.run(
+            "steward",
+            "CREATE OR REPLACE TABLE t AS SELECT 1 AS ssn, 2 AS email, 3 AS phone",
+        )
+        .await
+        .expect("tags untouched");
+        assert_eq!(r.tags().await.len(), 3);
+        // A replace that creates the table checks every column named.
+        refused_on(
+            r.run(
+                "steward",
+                r#"CREATE OR REPLACE TABLE u TBLPROPERTIES ('sqe.column-tags' = '{"ssn":["PII"]}') AS SELECT 1 AS ssn"#,
+            )
+            .await
+            .unwrap_err(),
+            "u.ssn",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_malformed_live_map_is_an_admins_to_overwrite() {
+        let r = Rig::new(
+            TagAuthority::RangerDelegate,
+            ColumnGrants(vec![("steward", "phone", ApplyTag)]),
+        )
+        .await;
+        r.run("root", &set("not-json"))
+            .await
+            .expect("admin writes anything");
+        let err = r
+            .run("steward", &set(r#"{"phone":["PII"]}"#))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not a tag map"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_role_still_refuses_set_tblproperties() {
+        let r = Rig::new(
+            TagAuthority::AdminRole,
+            ColumnGrants(vec![("steward", "phone", ApplyTag)]),
+        )
+        .await;
+        let err = r
+            .run(
+                "steward",
+                &set(r#"{"ssn":["PII"],"email":["PII"],"phone":["PII"]}"#),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("requires one of admin roles"),
+            "{err}"
+        );
+        assert_eq!(r.tags().await.len(), 2);
+    }
+}

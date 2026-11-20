@@ -204,6 +204,97 @@ pub fn parse_column_tags(
     serde_json::from_str::<HashMap<String, Vec<String>>>(raw)
 }
 
+/// What a raw property write (`ALTER TABLE ... SET TBLPROPERTIES / SET
+/// PROPERTIES`, `CREATE [OR REPLACE] TABLE ... TBLPROPERTIES / WITH`) does to
+/// `sqe.column-tags`, read from the options after the Trino vocabulary is
+/// resolved, so `extra_properties = MAP(ARRAY['sqe.column-tags'], ...)` counts
+/// like the key written out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagPropertyWrite {
+    /// The value set under the exact key, the last one when given twice (as
+    /// the write keeps it). `None` when only an off-case spelling is given.
+    pub value: Option<String>,
+    /// A key equal to `sqe.column-tags` only ignoring case. Iceberg keys are
+    /// case-sensitive, so the tag source never reads it, but it is policy
+    /// shaped and stays an admin's to write.
+    pub off_case_key: bool,
+}
+
+/// The `sqe.column-tags` write `stmt` makes, `None` when it names no such key.
+/// An error is the one the write itself would raise on the same options.
+pub fn tag_property_write(
+    stmt: &sqlparser::ast::Statement,
+) -> sqe_core::Result<Option<TagPropertyWrite>> {
+    use crate::write_handler::trino_props::TrinoTableOptions;
+    use sqlparser::ast::{AlterTableOperation, Expr, SqlOption, Statement, Value};
+    let resolved: Vec<TrinoTableOptions> = match stmt {
+        Statement::AlterTable(at) => at
+            .operations
+            .iter()
+            .filter_map(|op| match op {
+                AlterTableOperation::SetTblProperties { table_properties } => {
+                    Some(TrinoTableOptions::parse_alter(table_properties))
+                }
+                _ => None,
+            })
+            .collect::<sqe_core::Result<_>>()?,
+        Statement::CreateTable(ct) => vec![TrinoTableOptions::parse(
+            &ct.table_options,
+            ct.partition_by.is_some(),
+        )?],
+        _ => return Ok(None),
+    };
+    let mut write = TagPropertyWrite {
+        value: None,
+        off_case_key: false,
+    };
+    let mut named = false;
+    for opt in resolved.iter().flat_map(|t| t.options()) {
+        let SqlOption::KeyValue { key, value } = opt else {
+            continue;
+        };
+        if key.value == PROP_KEY {
+            named = true;
+            write.value = Some(match value {
+                Expr::Value(v) => match &v.value {
+                    Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => s.clone(),
+                    _ => value.to_string(),
+                },
+                other => other.to_string(),
+            });
+        } else if key.value.eq_ignore_ascii_case(PROP_KEY) {
+            named = true;
+            write.off_case_key = true;
+        }
+    }
+    Ok(named.then_some(write))
+}
+
+/// The columns whose tags differ between two `sqe.column-tags` maps: added,
+/// changed and removed ones, never unchanged ones. This is the set a raw write
+/// of the property (`SET TBLPROPERTIES`, `CREATE OR REPLACE ... TBLPROPERTIES`)
+/// has to be authorised for, the same per-column check `SET TAGS` gets.
+///
+/// Tag lists compare as sets (order and duplicates do not matter), and an empty
+/// list is the same as no entry. Column names compare exactly, so a key whose
+/// case changes counts as two columns: one removed, one added.
+pub fn changed_tag_columns(
+    old: &HashMap<String, Vec<String>>,
+    new: &HashMap<String, Vec<String>>,
+) -> std::collections::BTreeSet<String> {
+    use std::collections::BTreeSet;
+    let tags = |m: &HashMap<String, Vec<String>>, c: &str| -> BTreeSet<String> {
+        m.get(c)
+            .map(|v| v.iter().cloned().collect())
+            .unwrap_or_default()
+    };
+    old.keys()
+        .chain(new.keys())
+        .filter(|c| tags(old, c) != tags(new, c))
+        .cloned()
+        .collect()
+}
+
 /// Apply column-tag operations to the current tag map (merge semantics).
 /// `Set` unions tags (dedup, stable order). `Unset` removes the listed tags, or
 /// ALL tags on the column when the list is empty. A column whose tag list becomes
@@ -258,6 +349,104 @@ mod tests {
             .iter()
             .map(|(c, ts)| (c.to_string(), ts.iter().map(|t| t.to_string()).collect()))
             .collect()
+    }
+
+    #[test]
+    fn tag_property_write_reads_every_spelling() {
+        let w = |sql: &str| {
+            let stmt =
+                sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, sql)
+                    .expect("parse")
+                    .remove(0);
+            tag_property_write(&stmt).expect("options")
+        };
+        let set = |v: &str| {
+            Some(TagPropertyWrite {
+                value: Some(v.to_string()),
+                off_case_key: false,
+            })
+        };
+        assert_eq!(
+            w(r#"ALTER TABLE t SET TBLPROPERTIES ('sqe.column-tags' = '{"a":["PII"]}')"#),
+            set(r#"{"a":["PII"]}"#)
+        );
+        // Twice: the last value is the one written.
+        assert_eq!(
+            w("ALTER TABLE t SET TBLPROPERTIES ('sqe.column-tags' = 'x', 'sqe.column-tags' = '{}')"),
+            set("{}")
+        );
+        // Trino's extra_properties puts the key in too.
+        assert_eq!(
+            w("ALTER TABLE t SET TBLPROPERTIES (extra_properties = MAP(ARRAY['sqe.column-tags'], ARRAY['{}']))"),
+            set("{}")
+        );
+        assert_eq!(
+            w("CREATE TABLE t (a INT) WITH (extra_properties = MAP(ARRAY['sqe.column-tags'], ARRAY['{}']))"),
+            set("{}")
+        );
+        assert_eq!(
+            w("CREATE OR REPLACE TABLE t (a INT) TBLPROPERTIES ('sqe.column-tags' = '{}')"),
+            set("{}")
+        );
+        assert_eq!(
+            w("CREATE TABLE t TBLPROPERTIES ('sqe.column-tags' = '{}') AS SELECT 1 AS a"),
+            set("{}")
+        );
+        assert_eq!(
+            w("ALTER TABLE t SET TBLPROPERTIES ('SQE.Column-Tags' = '{}')"),
+            Some(TagPropertyWrite {
+                value: None,
+                off_case_key: true
+            })
+        );
+        assert_eq!(
+            w("ALTER TABLE t SET TBLPROPERTIES ('sqe.maintenance.x' = '1')"),
+            None
+        );
+        assert_eq!(w("CREATE TABLE t (a INT)"), None);
+        assert_eq!(w("SELECT 1"), None);
+    }
+
+    #[test]
+    fn changed_tag_columns_is_added_changed_and_removed() {
+        let set = |cs: &[&str]| -> std::collections::BTreeSet<String> {
+            cs.iter().map(|c| c.to_string()).collect()
+        };
+        let old = map(&[
+            ("ssn", &["PII"]),
+            ("email", &["PII", "GDPR"]),
+            ("phone", &["PII"]),
+            ("note", &[]),
+        ]);
+        let new = map(&[
+            ("ssn", &["PII"]),                  // unchanged
+            ("email", &["GDPR", "PII", "PII"]), // same set, other order
+            ("phone", &["SECRET"]),             // changed
+            ("dob", &["PII"]),                  // added
+            ("blank", &[]),                     // empty is no entry
+        ]);
+        // `note` (empty -> absent) is no change either.
+        assert_eq!(changed_tag_columns(&old, &new), set(&["phone", "dob"]));
+        // Removing a column counts.
+        assert_eq!(
+            changed_tag_columns(&old, &map(&[("ssn", &["PII"])])),
+            set(&["email", "phone"])
+        );
+        // Clearing the map touches every tagged column; a new table every named one.
+        assert_eq!(
+            changed_tag_columns(&old, &HashMap::new()),
+            set(&["ssn", "email", "phone"])
+        );
+        assert_eq!(
+            changed_tag_columns(&HashMap::new(), &old),
+            set(&["ssn", "email", "phone"])
+        );
+        assert!(changed_tag_columns(&old, &old).is_empty());
+        // A key that changes case is two columns.
+        assert_eq!(
+            changed_tag_columns(&map(&[("ssn", &["PII"])]), &map(&[("SSN", &["PII"])])),
+            set(&["ssn", "SSN"])
+        );
     }
 
     #[test]

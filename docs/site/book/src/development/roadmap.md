@@ -240,6 +240,7 @@ Landed June 2026 across five sub-phases; the end-to-end demo is `quickstart/pola
 - **Session-context functions** (Phase 2B): `current_user()`, `is_role_in_session(role)`, `current_database()`, `current_schema()` usable in policy expressions and user SQL; they const-fold to literals before plan distribution, so no session state ships to workers
 - **Tag-based masking** (Phase 3a): column-to-tag associations in Iceberg `sqe.column-tags` table properties, mask-per-tag rules from Ranger `tagPolicies`, configurable contested-column precedence (`policy.mask-precedence`, default `tag`), unmappable tags fail closed
 - **Tag authoring DDL**: `ALTER TABLE ... SET TAGS (col = ('PII'))` / `UNSET TAGS`, plus the Snowflake-compatible `MODIFY COLUMN ... SET TAG` form
+- **Delegated tagging**: `[access_control] tag_authority = "ranger-delegate"` checks every write of `sqe.column-tags` (tag DDL, `SET TBLPROPERTIES`, `CREATE [OR REPLACE] ... TBLPROPERTIES`) per changed column against Ranger, on `alter` or, with `tag_privilege = "apply_tag"`, a separate `apply_tag` access type (#911, #917). Open: refusing a tag no tag policy defines
 - **FUTURE grants**: `GRANT ... ON FUTURE TABLES IN SCHEMA x` via Ranger table wildcards
 - **Conditional masks**: a CUSTOM mask expression can reference sibling columns of the same row; qualified references fail closed
 - **Spark parity**: the same Ranger policies produce byte-exact masked output in SQE and Spark/Kyuubi (`parity-test.sh` in the quickstart)

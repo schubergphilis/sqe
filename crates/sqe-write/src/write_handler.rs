@@ -14316,6 +14316,7 @@ s3_path_style = true
     mod committing {
         mod format_version;
         mod shape_replace;
+        mod tag_guard;
 
         use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
