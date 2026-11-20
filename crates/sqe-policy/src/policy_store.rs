@@ -131,6 +131,19 @@ impl PolicyStore for InMemoryPolicyStore {
                 })
             }))
     }
+
+    /// A table-level grant covers its columns.
+    async fn grants_column_privilege(
+        &self,
+        user: &SessionUser,
+        table_name: &str,
+        namespace: &str,
+        _column: &str,
+        privilege: TablePrivilege,
+    ) -> sqe_core::Result<bool> {
+        self.grants_table_privilege(user, table_name, namespace, privilege)
+            .await
+    }
 }
 
 impl InMemoryPolicyStore {

@@ -2309,6 +2309,9 @@ pub struct AccessControlConfig {
     /// Who may issue `GRANT` and `REVOKE`. See [`GrantAuthority`].
     #[serde(default, alias = "grant-authority")]
     pub grant_authority: GrantAuthority,
+    /// Who may write column tags. See [`TagAuthority`].
+    #[serde(default, alias = "tag-authority")]
+    pub tag_authority: TagAuthority,
     /// Apache Ranger backend tuning. Used only when `backend = "ranger"`.
     #[serde(default)]
     pub ranger: RangerConfig,
@@ -2323,6 +2326,7 @@ impl Default for AccessControlConfig {
             client_id: None,
             client_secret: None,
             grant_authority: GrantAuthority::default(),
+            tag_authority: TagAuthority::default(),
             ranger: RangerConfig::default(),
         }
     }
@@ -2354,6 +2358,25 @@ impl Default for AccessControlConfig {
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum GrantAuthority {
+    #[default]
+    AdminRole,
+    RangerDelegate,
+}
+
+/// Where the authority to write column tags comes from (`ALTER TABLE ... SET /
+/// UNSET TAGS`, `SET / UNSET MASKING POLICY`).
+///
+/// - `admin-role` (default) requires an `[auth] admin_roles` role.
+/// - `ranger-delegate` also lets a non-admin tag a column when the Ranger
+///   policies grant them `alter` on that column. A broad `alter` grant then
+///   becomes the right to untag a column and so remove its mask; review the
+///   `alter` grants before turning it on.
+///
+/// Admins pass in both modes. Backends without a column privilege model grant
+/// nothing, so only admins can tag there.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum TagAuthority {
     #[default]
     AdminRole,
     RangerDelegate,
@@ -9826,6 +9849,24 @@ mod ranger_config_tests {
         assert!(
             toml::from_str::<AccessControlConfig>(r#"grant_authority = "ranger_delegate""#)
                 .is_err(),
+            "an unrecognised value must be refused, not defaulted"
+        );
+    }
+
+    #[test]
+    fn tag_authority_parses_both_spellings_and_defaults_safe() {
+        let c: AccessControlConfig = toml::from_str(r#"backend = "ranger""#).unwrap();
+        assert_eq!(c.tag_authority, TagAuthority::AdminRole);
+        for line in [
+            r#"tag_authority = "ranger-delegate""#,
+            r#"tag-authority = "ranger-delegate""#,
+        ] {
+            let c: AccessControlConfig =
+                toml::from_str(&format!("backend = \"ranger\"\n{line}\n")).unwrap();
+            assert_eq!(c.tag_authority, TagAuthority::RangerDelegate, "{line}");
+        }
+        assert!(
+            toml::from_str::<AccessControlConfig>(r#"tag_authority = "ranger_delegate""#).is_err(),
             "an unrecognised value must be refused, not defaulted"
         );
     }

@@ -1834,9 +1834,10 @@ impl CatalogOps {
         let object_name = parse_object_name(&stmt.table)?;
         let table_ident = resolve_table_ident(&object_name, session)?;
 
-        let session_catalog = self
-            .session_catalog_for(session, catalog_qualifier(&object_name).as_deref())
-            .await?;
+        // A bare name lands in the session's catalog, the one the tag gate
+        // (`require_tag_authority`) keys its check with (#911).
+        let target = resolve_target_catalog(catalog_qualifier(&object_name), session);
+        let session_catalog = self.session_catalog_for(session, target.as_deref()).await?;
 
         // Serialize the read-merge-commit per table. `set_column_tags` does a
         // read-current -> apply_tag_ops -> SetProperties commit. Two concurrent
@@ -1984,9 +1985,8 @@ impl CatalogOps {
         let object_name = parse_object_name(table)?;
         let table_ident = resolve_table_ident(&object_name, session)?;
 
-        let session_catalog = self
-            .session_catalog_for(session, catalog_qualifier(&object_name).as_deref())
-            .await?;
+        let target = resolve_target_catalog(catalog_qualifier(&object_name), session);
+        let session_catalog = self.session_catalog_for(session, target.as_deref()).await?;
 
         let table = session_catalog.load_table(&table_ident).await?;
         let tags = crate::tag_source_impl::parse_column_tags(table.metadata().properties())

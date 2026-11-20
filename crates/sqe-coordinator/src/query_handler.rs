@@ -2391,9 +2391,10 @@ impl QueryHandler {
                 }
                 StatementKind::SetTags(stmt) => {
                     // Tags drive masking, so a tag write is policy DDL: an
-                    // UNSET TAGS drops the Ranger mask on that column. Same gate
-                    // as CREATE/DROP POLICY and CALL system.reproject_column_tags.
-                    self.require_admin(session, "ALTER TABLE ... SET/UNSET TAGS")?;
+                    // UNSET TAGS drops the Ranger mask on that column: admin, or
+                    // a column `alter` grant under `tag_authority = ranger-delegate`.
+                    self.require_tag_authority(session, stmt, "ALTER TABLE ... SET/UNSET TAGS")
+                        .await?;
                     self.reject_if_hive_table(
                         session,
                         &TableReference::from(stmt.table.as_str()),
@@ -2409,7 +2410,22 @@ impl QueryHandler {
                 }
                 StatementKind::SetMaskingPolicy(op) => {
                     // Same write as SET TAGS, spelled differently.
-                    self.require_admin(session, "ALTER TABLE ... SET/UNSET MASKING POLICY")?;
+                    // Gated before `masking_policy_to_tag_op` so an unauthorised
+                    // caller cannot probe the policy list through its errors.
+                    let gate = sqe_sql::tags::SetTagsStatement {
+                        table: op.table.clone(),
+                        ops: vec![sqe_sql::tags::ColumnTagOp {
+                            column: op.column.clone(),
+                            tags: vec![],
+                            action: sqe_sql::tags::TagAction::Unset,
+                        }],
+                    };
+                    self.require_tag_authority(
+                        session,
+                        &gate,
+                        "ALTER TABLE ... SET/UNSET MASKING POLICY",
+                    )
+                    .await?;
                     let stmt = self.masking_policy_to_tag_op(op).await?;
                     self.catalog_ops.set_column_tags(session, &stmt).await?;
                     crate::session_context::invalidate_session_cache(&session.user.username).await;

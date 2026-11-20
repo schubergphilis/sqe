@@ -5222,6 +5222,388 @@ async fn grant_masked_with_per_role_items_survive_revoke() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// #911: column tags by Ranger grant (`tag_authority = "ranger-delegate"`)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// dave is the steward: he holds no admin role. Polaris needs him to be allowed
+// to load the table and commit a table property (the ALTER and MONITOR
+// privileges, written to the coarse `polaris` service directly), and
+// SQE's own gate then asks the Ranger `hive` access policies for `alter` on the
+// COLUMN. The fixture's `public` item holds `alter` on `*/*/*`, so "alter on
+// ssn only" is expressed the way an operator would have to: a deny item for
+// dave on every other column. That also makes the refusal tests meaningful,
+// because a refusal can only come from a deny.
+
+/// A `hive` access policy with one deny item (`alter`) for user dave.
+fn tag_authority_deny_policy(
+    name: &str,
+    database: &str,
+    table: &str,
+    column: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "service": HIVE_SERVICE,
+        "name": name,
+        "policyType": 0,
+        "isEnabled": true,
+        "resources": {
+            "database": {"values": [database]},
+            "table": {"values": [table]},
+            "column": column
+        },
+        "denyPolicyItems": [{
+            "users": ["dave"],
+            "accesses": [{"type": "alter", "isAllowed": true}]
+        }]
+    })
+}
+
+/// Polaris-side rights for the steward and the engineer tag mask both tests
+/// observe the effect through. Returns the delegating handler, with the audit
+/// files it writes.
+struct TagAuthorityRig {
+    handler: QueryHandler,
+    audit: Option<(
+        std::sync::Arc<sqe_metrics::audit::AuditLogger>,
+        std::path::PathBuf,
+    )>,
+    _audit_dir: Option<tempfile::TempDir>,
+}
+
+/// Give dave what Polaris needs to load `ac.orders` and commit a property.
+/// `GRANT SELECT` writes the three discovery and read levels in the shape the
+/// grant planner uses. SQL `GRANT` has no ALTER keyword, so the commit rights
+/// (the ALTER privilege of the grant profile, table level) are merged into the
+/// table policy that grant produced, as an item for dave.
+async fn tag_authority_grant_dave_in_polaris(ctx: &AcCtx) {
+    exec_ok(
+        ctx,
+        &ctx.carol,
+        &format!("GRANT SELECT ON {ORDERS} TO USER \"dave\""),
+    )
+    .await;
+    let policies = ctx
+        .ranger
+        .get_policies(COARSE_SERVICE)
+        .await
+        .expect("list polaris policies");
+    let one = |p: &serde_json::Value, key: &str, want: &str| {
+        p["resources"][key]["values"] == serde_json::json!([want])
+    };
+    let mut table = policies
+        .into_iter()
+        .find(|p| {
+            one(p, "catalog", "sales_wh") && one(p, "namespace", "ac") && one(p, "table", "orders")
+        })
+        .expect("GRANT SELECT wrote the table-level polaris policy");
+    let id = table["id"].as_i64().expect("policy id");
+    let alter: Vec<serde_json::Value> = [
+        "table-properties-set",
+        "table-schema-add",
+        "table-structure-manage",
+    ]
+    .iter()
+    .map(|a| serde_json::json!({"type": a, "isAllowed": true}))
+    .collect();
+    let items = table["policyItems"].as_array_mut().expect("policyItems");
+    let has_dave = |i: &serde_json::Value| {
+        i["users"]
+            .as_array()
+            .is_some_and(|u| u.iter().any(|x| x == "dave"))
+    };
+    match items.iter_mut().find(|i| has_dave(i)) {
+        Some(item) => item["accesses"]
+            .as_array_mut()
+            .expect("accesses")
+            .extend(alter),
+        None => items.push(serde_json::json!({"users": ["dave"], "accesses": alter})),
+    }
+    ctx.ranger
+        .update_policy(id, table)
+        .await
+        .expect("add alter rights for dave");
+}
+
+async fn tag_authority_rig(ctx: &AcCtx, audited: bool) -> TagAuthorityRig {
+    tag_authority_grant_dave_in_polaris(ctx).await;
+    ctx.ranger
+        .create_policy(tag_mask_policy(
+            &format!("{PREFIX}tag-authority-mask"),
+            "PII",
+            serde_json::json!({"dataMaskType": "hive:MASK_SHOW_LAST_4"}),
+        ))
+        .await
+        .expect("create tag mask");
+    let (dir, audit) = if audited {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let native = dir.path().join("audit.jsonl");
+        let logger = std::sync::Arc::new(
+            sqe_metrics::audit::AuditLogger::with_config(
+                native.to_str().unwrap(),
+                sqe_metrics::audit::AuditFormat::Both,
+            )
+            .expect("audit logger opens"),
+        );
+        (Some(dir), Some((logger, native)))
+    } else {
+        (None, None)
+    };
+    let (handler, _cache) = crate::common::setup_ranger_handler_audited(
+        Some(ctx.cache.clone()),
+        audit.as_ref().map(|(l, _)| l.clone()),
+        |c| c.access_control.tag_authority = sqe_core::config::TagAuthority::RangerDelegate,
+    )
+    .await;
+    TagAuthorityRig {
+        handler,
+        audit,
+        _audit_dir: dir,
+    }
+}
+
+async fn tag_authority_cleanup(ctx: &AcCtx, rig: &TagAuthorityRig, deny_policies: &[&str]) {
+    // Unset first, so a failed assertion cannot leave the fixture tagged.
+    let _ = ctx
+        .handler
+        .execute(
+            &ctx.carol,
+            &format!("ALTER TABLE {ORDERS} UNSET TAGS (ssn, email)"),
+            None,
+        )
+        .await;
+    let _ = &rig.handler;
+    for name in deny_policies {
+        let _ = ctx.ranger.delete_policy(HIVE_SERVICE, name).await;
+    }
+    let _ = ctx
+        .ranger
+        .delete_policy(TAG_SERVICE, &format!("{PREFIX}tag-authority-mask"))
+        .await;
+    // Drops the coarse-gate policies this suite wrote, including the alter
+    // rights merged into dave's table policy (a REVOKE SELECT would leave them).
+    let _ = ctx.ranger.delete_suite_grants().await;
+    for stmt in [
+        format!("REVOKE SELECT ON {ORDERS} FROM USER \"dave\""),
+        format!("REVOKE SELECT ON {ORDERS} FROM ROLE \"analyst\""),
+        format!("REVOKE SELECT ON {ORDERS} FROM ROLE \"engineer\""),
+    ] {
+        let _ = ctx.handler.execute(&ctx.carol, &stmt, None).await;
+    }
+    delete_grant_policies_on_orders(&ctx.ranger).await;
+}
+
+/// bob (engineer) reads `column` and sees these values, waiting for the
+/// policy and metadata caches.
+async fn bob_sees(ctx: &AcCtx, column: &str, want: &[&str]) {
+    let sql = format!("SELECT {column} FROM {ORDERS} ORDER BY id");
+    crate::common::eventually(&format!("bob to see {column} = {want:?}"), || async {
+        match ctx.handler.execute(&ctx.bob, &sql, None).await {
+            Ok(b) if col_strings(&b, column) == want => Ok(()),
+            Ok(b) => Err(format!("got {:?}", col_strings(&b, column))),
+            Err(e) => Err(format!("query failed: {e}")),
+        }
+    })
+    .await;
+}
+
+const SSN_RAW: [&str; 3] = ["111-11-1111", "222-22-2222", "333-33-3333"];
+const SSN_MASKED: [&str; 3] = ["xxx-xx-1111", "xxx-xx-2222", "xxx-xx-3333"];
+const EMAIL_RAW: [&str; 3] = ["a@x", "b@x", "c@x"];
+
+/// A steward with `alter` on one column tags it, the mask applies on the next
+/// query, and untagging removes it. The control is the default
+/// `admin-role` handler, which refuses the same statement from the same user.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn tag_authority_steward_tags_and_untags_their_column() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+    let deny = format!("{PREFIX}tag-authority-deny-other-columns");
+    ctx.ranger
+        .create_policy(tag_authority_deny_policy(
+            &deny,
+            "ac",
+            "orders",
+            serde_json::json!({"values": ["ssn"], "isExcludes": true}),
+        ))
+        .await
+        .expect("create deny on every column but ssn");
+    let rig = tag_authority_rig(&ctx, false).await;
+
+    let set = format!("ALTER TABLE {ORDERS} SET TAGS (ssn = ('PII'))");
+    let unset = format!("ALTER TABLE {ORDERS} UNSET TAGS (ssn)");
+
+    // Control: the default gate refuses the same statement from the same user.
+    let err = ctx
+        .handler
+        .execute(&ctx.dave, &set, None)
+        .await
+        .expect_err("admin-role mode must refuse a non-admin")
+        .to_string();
+    assert!(err.contains("403 Forbidden"), "{err}");
+    bob_sees(&ctx, "ssn", &SSN_RAW).await;
+
+    crate::common::eventually("dave to tag ssn", || async {
+        rig.handler
+            .execute(&ctx.dave, &set, None)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    bob_sees(&ctx, "ssn", &SSN_MASKED).await;
+
+    crate::common::eventually("dave to untag ssn", || async {
+        rig.handler
+            .execute(&ctx.dave, &unset, None)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    bob_sees(&ctx, "ssn", &SSN_RAW).await;
+
+    tag_authority_cleanup(&ctx, &rig, &[&deny]).await;
+}
+
+/// A refused column refuses the whole statement, writes nothing and leaves a
+/// failed-statement audit record.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn tag_authority_refused_column_writes_nothing_and_is_audited() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+    let deny = format!("{PREFIX}tag-authority-deny-other-columns");
+    ctx.ranger
+        .create_policy(tag_authority_deny_policy(
+            &deny,
+            "ac",
+            "orders",
+            serde_json::json!({"values": ["ssn"], "isExcludes": true}),
+        ))
+        .await
+        .expect("create deny on every column but ssn");
+    let rig = tag_authority_rig(&ctx, true).await;
+    let (logger, native) = rig.audit.clone().expect("audited rig");
+
+    // ssn alone passes the gate, email does not: the statement as a whole is
+    // refused, so ssn must stay unmasked too.
+    let sql = format!("ALTER TABLE {ORDERS} SET TAGS (ssn = ('PII'), email = ('PII'))");
+    let err = rig
+        .handler
+        .execute(&ctx.dave, &sql, None)
+        .await
+        .expect_err("alter on email is denied")
+        .to_string();
+    assert!(err.contains("403 Forbidden"), "{err}");
+    assert!(err.contains("ac.orders.email"), "names the column: {err}");
+
+    // Nothing was written. The tag mask is live, so a tag that landed would
+    // show up as a mask for bob; give it a full cache cycle to do so.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    bob_sees(&ctx, "ssn", &SSN_RAW).await;
+    bob_sees(&ctx, "email", &EMAIL_RAW).await;
+
+    // The failed statement left an audit record carrying the refusal.
+    logger.flush();
+    let bytes = std::fs::read_to_string(&native).unwrap_or_default();
+    let records: Vec<serde_json::Value> = bytes
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).expect("audit line is JSON"))
+        .collect();
+    let rec = records
+        .iter()
+        .find(|r| r["query"]["text"] == sql.as_str())
+        .unwrap_or_else(|| panic!("no audit record for the refused statement: {records:#?}"));
+    assert_eq!(rec["status"], "failure", "{rec}");
+    assert_eq!(rec["error_code"], "ACCESS_DENIED", "{rec}");
+    assert_eq!(
+        rec["user"]["name"].as_str().unwrap_or("dave"),
+        "dave",
+        "{rec}"
+    );
+
+    tag_authority_cleanup(&ctx, &rig, &[&deny]).await;
+}
+
+/// A bare table name is checked against the session namespace (`USE`), the
+/// namespace the write resolves it in. dave is denied everywhere in
+/// `ac_other` and allowed in `ac`, so the same bare statement passes under
+/// `USE ac` and is refused under `USE ac_other`, with the refusal naming the
+/// resource that was checked.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn tag_authority_bare_name_is_checked_against_the_session_namespace() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+    let deny = format!("{PREFIX}tag-authority-deny-ac-other");
+    ctx.ranger
+        .create_policy(tag_authority_deny_policy(
+            &deny,
+            "ac_other",
+            "*",
+            serde_json::json!({"values": ["*"]}),
+        ))
+        .await
+        .expect("create deny in ac_other");
+    let rig = tag_authority_rig(&ctx, false).await;
+
+    // `USE <ns>` is carried on the session by the protocol layer; set it the
+    // same way the session manager does.
+    // A bare name also resolves in the session's default catalog, which sorts
+    // to ops_wh in this config, so point the session at the fixture's catalog.
+    let in_sales = ctx.dave.clone().with_catalog(Some("sales_wh".to_string()));
+    let in_ac = in_sales.clone().with_schema(Some("ac".to_string()));
+    let in_other = in_sales.with_schema(Some("ac_other".to_string()));
+    let set = "ALTER TABLE orders SET TAGS (ssn = ('PII'))";
+
+    let err = rig
+        .handler
+        .execute(&in_other, set, None)
+        .await
+        .expect_err("USE ac_other: denied there")
+        .to_string();
+    assert!(err.contains("403 Forbidden"), "{err}");
+    assert!(
+        err.contains("ac_other.orders.ssn"),
+        "the check is made against the session namespace: {err}"
+    );
+    bob_sees(&ctx, "ssn", &SSN_RAW).await;
+
+    // Same text under `USE ac` passes the gate AND writes into the session's
+    // catalog (sales_wh), the table the gate checked: the mask applies.
+    // `eventually`: Polaris picks up dave's table rights on its policy poll.
+    crate::common::eventually("USE ac: dave to tag ssn by bare name", || async {
+        rig.handler
+            .execute(&in_ac, set, None)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    bob_sees(&ctx, "ssn", &SSN_MASKED).await;
+    let unset = "ALTER TABLE orders UNSET TAGS (ssn)";
+    crate::common::eventually("USE ac: dave to untag ssn by bare name", || async {
+        rig.handler
+            .execute(&in_ac, unset, None)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    bob_sees(&ctx, "ssn", &SSN_RAW).await;
+
+    tag_authority_cleanup(&ctx, &rig, &[&deny]).await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // The `system` catalog split (#901): the Polaris part of `system` is governed
 // like any catalog. openspec/changes/system-catalog-split, task 6.2.
 // ─────────────────────────────────────────────────────────────────────────────

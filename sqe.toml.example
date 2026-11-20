@@ -345,6 +345,16 @@ engine = "passthrough"
 # Environment override: SQE_POLICY__RANGER__CATALOG_SCOPED=true
 # catalog-scoped = true
 
+# [access_control]
+# Who may issue GRANT / REVOKE: "admin-role" (default) or "ranger-delegate".
+# grant_authority = "admin-role"
+# Who may SET / UNSET column tags (and SET / UNSET MASKING POLICY):
+# "admin-role" (default) needs an [auth] admin_roles role. "ranger-delegate"
+# also lets a user tag a column they hold Ranger `alter` on. A broad `alter`
+# grant then becomes the right to remove that column's mask: read the Ranger
+# policies before switching.
+# tag_authority = "admin-role"
+
 [session]
 idle_timeout_secs = 900       # 15 minutes — sessions idle longer than this are expired
 absolute_timeout_secs = 28800  # 8 hours — sessions older than this are expired regardless of activity

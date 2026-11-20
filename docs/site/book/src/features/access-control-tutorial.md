@@ -310,6 +310,42 @@ Before switching, read the Ranger policies. `ranger-delegate` widens who may gra
 to everyone holding `delegateAdmin`, and the quickstart's wildcard discovery policy
 gives roles `analyst` and `engineer` exactly that for the discovery access types.
 
+### Who may tag a column
+
+Column tags drive tag-based masks, so by default `ALTER TABLE ... SET TAGS`,
+`UNSET TAGS` and `MODIFY COLUMN ... SET | UNSET MASKING POLICY` need a role from
+`[auth] admin_roles`. A data steward who owns one column cannot tag it. To let
+Ranger decide instead:
+
+```toml
+[access_control]
+tag_authority = "ranger-delegate"
+```
+
+SQE then allows the statement when the Ranger `hive` access policies give the user
+`alter` on every column it names. The check is made per column, so a statement
+that touches one column the user may not alter is refused as a whole and writes
+nothing. Deny items win over allow items, and wildcard and exclude resources work as
+they do for reads. A refusal starts with `403 Forbidden` and is recorded in the
+audit log like any other failed statement.
+
+```sql
+-- as dave, no admin role, holding alter on the ssn column only:
+ALTER TABLE sales_wh.acdemo.orders SET TAGS (ssn = ('PII'));
+ALTER TABLE sales_wh.acdemo.orders UNSET TAGS (ssn);
+```
+
+Before switching, read the Ranger policies. Whoever may alter a column may tag it,
+and a tag can switch a mask off as easily as on, so a broad `alter` grant is also
+the right to unmask. The quickstart's wildcard policy gives `public` `alter` on every
+column; with that policy in place every user passes this check. Add deny items for
+the columns a user must not touch, or narrow the policy first.
+
+Some paths stay admin-only under either setting: writing `sqe.column-tags` through
+`SET TBLPROPERTIES` and `CALL system.reproject_column_tags`. Backends with no
+column privilege model, such as Polaris grants and passthrough, also stay
+admin-only, because there is nothing to ask.
+
 ## 1.8 Introspection
 
 ```sql
