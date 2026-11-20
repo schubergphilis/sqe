@@ -83,6 +83,17 @@ CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
 REMAP="--remap-path-prefix=$CARGO_HOME_DIR=/cargo --remap-path-prefix=$REPO_ROOT=/build"
 CFLAG_REMAP="-ffile-prefix-map=$CARGO_HOME_DIR=/cargo -ffile-prefix-map=$REPO_ROOT=/build"
 
+# zig's lld keeps every input object open while it links: sqe-server passes
+# ~1650 objects, past the runner's default soft limit of 1024 descriptors, and
+# the link fails with ProcessFdQuotaExceeded (v0.55.0). Raise the soft limit to
+# the hard one; a container that caps the hard limit below this fails here, not
+# twenty minutes into the build.
+ulimit -n "$(ulimit -Hn)"
+if [[ "$(ulimit -n)" != unlimited && "$(ulimit -n)" -lt 4096 ]]; then
+    echo "error: open-file limit is $(ulimit -n); zig needs about 2000 to link sqe-server" >&2
+    exit 1
+fi
+
 echo "==> cargo zigbuild $TRIPLE (glibc $GLIBC_FLOOR, profile $CARGO_PROFILE)"
 RUSTFLAGS="$REMAP" CFLAGS="$CFLAG_REMAP" CXXFLAGS="$CFLAG_REMAP" \
     cargo zigbuild --locked --profile "$CARGO_PROFILE" --no-default-features \
