@@ -34,6 +34,7 @@ const SUBJECT: &str = "scope-user-1";
 
 // The issuer's ES256 test keypair, the same public test material as the
 // bearer provider's unit tests. NOT for production use.
+// nosemgrep: opt.aikido.semgrep-rules.generic.secrets.security.detected-private-key -- published test key, signs only test JWTs
 const SIGNING_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
 MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcb/PT1Xj+xW0FvVc
 0YZLwJCPra8OSopguEXNw3d3TbihRANCAASkMxNpk8e4ypVo60ZUB3Q4TIHOcXSJ
