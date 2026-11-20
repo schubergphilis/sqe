@@ -280,7 +280,7 @@ tag-to-column association is authored with `ALTER TABLE ... SET TAGS` and stored
 
 ## Versions
 
-- Apache Polaris 1.7.0 (embedded Ranger authorizer, Beta).
+- Apache Polaris 1.9.0 (embedded Ranger authorizer, Beta).
 - Apache Ranger 2.8.0 (required by the Polaris plugin; it uses the new embedded
   authorizer API).
 - Keycloak 26.5.

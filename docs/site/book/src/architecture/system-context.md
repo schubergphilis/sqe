@@ -81,7 +81,7 @@ Each dependency, the version SQE pins today, and how it is kept current. Renovat
 | Runtime image base | `cgr.dev/chainguard/glibc-dynamic`, digest-pinned | Rolling, rebuilt daily upstream | Renovate bumps the digest; the image scan blocks high findings |
 | Helm chart | apiVersion v2, chart version = SQE version | Released with SQE | Lint and hardening check in CI |
 | Kubernetes | Chart `kubeVersion: >=1.21` (policy/v1 PDB, pod `seccompProfile`) | The three newest minors are supported upstream | That is the technical floor; run an upstream-supported minor |
-| Apache Polaris (quickstarts) | 1.7.0 | Latest release | Renovate |
+| Apache Polaris (quickstarts) | 1.9.0 | Latest release | Renovate |
 | Apache Ranger (quickstarts) | 2.8.0 | Latest release | Renovate |
 | Keycloak (quickstarts) | 26.7.0 | Latest release | Renovate |
 | PostgreSQL (quickstarts, test stack) | 17 | Five years per major | Renovate keeps 17.x patched; a major move is a hand change, with the volume name carrying the major |
