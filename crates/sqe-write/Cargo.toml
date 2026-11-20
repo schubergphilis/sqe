@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0"
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 description = "SQE write path: CTAS/INSERT/UPDATE/DELETE/MERGE handling, Parquet data and delete file writers, Puffin statistics carry-forward, Hive external-table writes"
 
 [features]

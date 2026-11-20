@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0"
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 description = "Trino wire types and the shared Trino HTTP / Flight SQL clients used by sqe-cli, sqe-bench and sqe-trino-compat"
 
 [features]

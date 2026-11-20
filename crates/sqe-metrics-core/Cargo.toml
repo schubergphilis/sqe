@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0"
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 description = "Prometheus registry types and W3C trace-context propagation helpers, without exporters or servers"
 
 # Review 803 item 2: `sqe-policy`, `sqe-catalog`, `sqe-compaction` and
