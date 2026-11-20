@@ -229,7 +229,9 @@ sqe-release-binaries:
   stage: test
   needs: []
   image: "$AIKIDO_RUST_IMAGE"
-  timeout: 90m
+  # The release profile links sqe-server with thin LTO; on a busy shared runner
+  # that link alone ran past 50 minutes (v0.55.1), and a cold compile adds 20-40.
+  timeout: 180m
   parallel:
     matrix:
       - SQE_ARCH: [amd64, arm64]
