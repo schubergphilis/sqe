@@ -1149,7 +1149,9 @@ mod scan_column_tags_tests {
             "lake",
             &Default::default(),
         ));
-        let function = TagViewFunction::new(Arc::new(move |_| Ok(Arc::clone(&catalog))));
+        let function = TagViewFunction::new(Arc::new(move |_| {
+            Ok((Arc::clone(&catalog), "lake".to_string()))
+        }));
         let provider = function.call(&[lit("column_tags")]).unwrap();
         assert_eq!(
             scan_column_tags(provider.as_ref()),
