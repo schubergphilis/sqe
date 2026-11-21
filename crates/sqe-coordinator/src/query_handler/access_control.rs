@@ -914,20 +914,25 @@ impl QueryHandler {
     /// Build the `SHOW TAGS` result batch: one row per (column, tag) with the
     /// tag's value, sorted by (column, tag) for deterministic output. A
     /// key-only tag has `value = ''`, as in `information_schema.column_tags`.
+    /// `applied` is false for an entry whose column was dropped (#920): it is
+    /// listed under the name it was stored with so an admin can unset it.
     pub(super) fn tags_to_record_batch(
-        col_tags: &sqe_core::column_tags::ColumnTagMap,
+        col_tags: &sqe_core::column_tags::ids::Resolved,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("column", DataType::Utf8, false),
             Field::new("tag", DataType::Utf8, false),
             Field::new("value", DataType::Utf8, false),
+            Field::new("applied", DataType::Boolean, false),
         ]));
 
-        let mut rows: Vec<(&str, &str, &str)> = Vec::new();
-        for (col, tags) in col_tags {
+        let applied = col_tags.applied.iter().map(|(c, t)| (c, t, true));
+        let orphaned = col_tags.orphaned.iter().map(|(c, (_, t))| (c, t, false));
+        let mut rows: Vec<(&str, &str, &str, bool)> = Vec::new();
+        for (col, tags, applied) in applied.chain(orphaned) {
             for tag in tags {
                 let value = tag.value.as_deref().unwrap_or_default();
-                rows.push((col.as_str(), tag.key.as_str(), value));
+                rows.push((col.as_str(), tag.key.as_str(), value, applied));
             }
         }
         rows.sort_unstable();
@@ -935,10 +940,12 @@ impl QueryHandler {
         let mut col_b = StringBuilder::new();
         let mut tag_b = StringBuilder::new();
         let mut value_b = StringBuilder::new();
-        for (col, tag, value) in rows {
+        let mut applied_b = arrow::array::BooleanBuilder::new();
+        for (col, tag, value, applied) in rows {
             col_b.append_value(col);
             tag_b.append_value(tag);
             value_b.append_value(value);
+            applied_b.append_value(applied);
         }
 
         let batch = RecordBatch::try_new(
@@ -947,6 +954,7 @@ impl QueryHandler {
                 Arc::new(col_b.finish()) as ArrayRef,
                 Arc::new(tag_b.finish()) as ArrayRef,
                 Arc::new(value_b.finish()) as ArrayRef,
+                Arc::new(applied_b.finish()) as ArrayRef,
             ],
         )
         .map_err(|e| {

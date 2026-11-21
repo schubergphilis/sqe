@@ -22,6 +22,7 @@ pub mod catalog_ops;
 pub mod commit;
 pub mod hive_write;
 pub mod ident;
+mod live_tags;
 pub mod merge_sql;
 pub mod merge_target_provider;
 mod policy_view;

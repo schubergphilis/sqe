@@ -358,6 +358,21 @@ impl QueryHandler {
                 "is reserved for admins; use ALTER TABLE ... SET TAGS ('key' = 'value')",
             ));
         }
+        // The field ids that move a column's tags with a rename (#920): a
+        // forged one would point a tag at another column, so only an admin
+        // writes them raw. SET TAGS and ALTER keep them current.
+        if !self.config.auth.has_admin_role(&session.user.roles)
+            && crate::tag_source_impl::writes_table_property(
+                stmt,
+                sqe_core::column_tags::ids::IDS_PROP_KEY,
+            )?
+        {
+            return Err(self.refuse_tag_write(
+                session,
+                "setting the sqe.column-tag-ids table property",
+                "is reserved for admins; SET TAGS records the ids",
+            ));
+        }
         let Some(write) = tag_property_write(stmt)? else {
             return Ok(());
         };

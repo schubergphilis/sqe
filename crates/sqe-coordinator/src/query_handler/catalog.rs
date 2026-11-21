@@ -92,13 +92,16 @@ impl QueryHandler {
             Some(store) => {
                 // Malformed tags are UNKNOWN, not empty: the rewriter fails
                 // closed on them and so does this.
-                let col_tags = crate::tag_source_impl::parse_column_tags(metadata.properties())
-                    .map_err(|e| {
-                        SqeError::with_code(
-                            SqeErrorCode::ExecutionFailed,
-                            format!("SHOW STATS: malformed sqe.column-tags on {table_name}: {e}"),
-                        )
-                    })?;
+                let col_tags = crate::tag_source_impl::resolved_column_tags(
+                    metadata.properties(),
+                    metadata.current_schema(),
+                )
+                .map_err(|e| {
+                    SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!("SHOW STATS: malformed sqe.column-tags on {table_name}: {e}"),
+                    )
+                })?;
                 let default_hive = sqe_policy::plan_rewriter::HiveCatalogs::new();
                 let hive_catalogs = self.hive_catalogs.as_deref().unwrap_or(&default_hive);
                 // Keyed by the catalog NAME the planner uses (explicit

@@ -1287,6 +1287,18 @@ impl TableMetadataCache {
         namespace_display: &str,
         table_name: &str,
     ) -> Option<std::collections::HashMap<String, String>> {
+        self.metadata_for(warehouse, namespace_display, table_name)
+            .map(|metadata| metadata.properties().clone())
+    }
+
+    /// [`Self::properties_for`] returning the whole table metadata, so the
+    /// tag source can resolve column tags by field id against its schema.
+    pub fn metadata_for(
+        &self,
+        warehouse: Option<&str>,
+        namespace_display: &str,
+        table_name: &str,
+    ) -> Option<iceberg::spec::TableMetadataRef> {
         let table_suffix = format!("|{}.{}", namespace_display, table_name);
         let exact_suffix = warehouse.map(|warehouse| format!("|{warehouse}{table_suffix}"));
         // Only entries still inside the soft TTL may decide column masking.
@@ -1306,7 +1318,7 @@ impl TableMetadataCache {
                 .filter(|(key, entry)| key.ends_with(&exact_suffix) && self.is_fresh(key, entry))
                 .max_by_key(|(_, entry)| entry.validated_at);
             if let Some((_, entry)) = newest {
-                return Some(entry.table.metadata().properties().clone());
+                return Some(entry.table.metadata_ref());
             }
         }
 
@@ -1341,7 +1353,7 @@ impl TableMetadataCache {
                 }
             }
         }
-        fallback.map(|entry| entry.table.metadata().properties().clone())
+        fallback.map(|entry| entry.table.metadata_ref())
     }
 }
 

@@ -2444,6 +2444,7 @@ impl WriteHandler {
                 let properties = replace_shape_properties(
                     user_options,
                     live.metadata().properties(),
+                    live.metadata().current_schema(),
                     &columns,
                     sqe_core::json_columns::marked_columns(&arrow_schema),
                 );

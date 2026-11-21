@@ -91,6 +91,12 @@ impl SqeTableProvider {
         &self.table
     }
 
+    /// The Iceberg schema this provider scans: the pinned snapshot's, else
+    /// the current one. Column tags resolve their field ids against it.
+    pub fn scan_schema(&self) -> iceberg::spec::SchemaRef {
+        crate::iceberg_scan::snapshot_schema(&self.table, self.snapshot_id)
+    }
+
     /// Attach the reloader every scan of this table carries, so a
     /// distributed scan can renew vended credentials (see
     /// [`crate::vended_credentials::TableReloader`]).

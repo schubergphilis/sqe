@@ -152,7 +152,7 @@ impl TableLoadObserver for TagLoadObserver {
             return;
         }
         let metadata = table.metadata();
-        let tags = match crate::tag_source_impl::parse_column_tags(metadata.properties()) {
+        let tags = match crate::tag_source_impl::table_column_tags(table) {
             Ok(tags) => tags.into_iter().collect(),
             Err(e) => {
                 tracing::warn!(table = %ident, error = %e, "malformed sqe.column-tags; not projected");

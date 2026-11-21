@@ -96,7 +96,7 @@ impl CatalogOps {
             return None;
         }
         let table = session_catalog.load_table(ident).await.ok()?;
-        match crate::tag_source_impl::parse_column_tags(table.metadata().properties()) {
+        match crate::tag_source_impl::table_column_tags(&table) {
             Ok(tags) if !tags.is_empty() => Some(tags),
             Ok(_) => None,
             Err(e) => {
@@ -333,7 +333,7 @@ impl CatalogOps {
                 return ReprojectRow::error(ident.to_string(), format!("load_table failed: {e}"));
             }
         };
-        let tags = match crate::tag_source_impl::parse_column_tags(table.metadata().properties()) {
+        let tags = match crate::tag_source_impl::table_column_tags(&table) {
             Ok(t) => t,
             Err(e) => {
                 return ReprojectRow::error(

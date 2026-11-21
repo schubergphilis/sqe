@@ -164,14 +164,18 @@ pub(crate) struct PropertyChanges {
 ///   still has, matched by top-level name, and is removed when none is left
 ///   (#896). A tag value that does not parse stays as it is: the policy
 ///   rewriter fails closed on it, and dropping it would silently clear the
-///   tags.
+///   tags. The entries are read by field id against `live_schema` and kept
+///   under the columns' current names; `sqe.column-tag-ids` is removed, as
+///   the new shape may give a kept column a new field id (#920).
 pub(crate) fn replace_shape_properties(
     options: &[sqlparser::ast::SqlOption],
     live: &HashMap<String, String>,
+    live_schema: &iceberg::spec::Schema,
     columns: &[&str],
     json_columns: std::collections::BTreeSet<String>,
 ) -> PropertyChanges {
     use crate::tag_source_impl::PROP_KEY as TAGS;
+    use sqe_core::column_tags::ids::IDS_PROP_KEY as IDS;
     use sqe_core::json_columns::JSON_COLUMNS_PROP;
     let mut changes = PropertyChanges {
         set: replace_in_place_properties(options),
@@ -181,15 +185,25 @@ pub(crate) fn replace_shape_properties(
     if !changes.set.contains_key(JSON_COLUMNS_PROP) && live.contains_key(JSON_COLUMNS_PROP) {
         changes.remove.push(JSON_COLUMNS_PROP.to_string());
     }
+    let drop_ids = |changes: &mut PropertyChanges| {
+        if live.contains_key(IDS) && !changes.set.contains_key(IDS) {
+            changes.remove.push(IDS.to_string());
+        }
+    };
     let Some(live_tags) = live.get(TAGS) else {
+        drop_ids(&mut changes);
         return changes;
     };
     if changes.set.contains_key(TAGS) {
+        drop_ids(&mut changes);
         return changes;
     }
-    let Ok(mut tags) = sqe_core::column_tags::parse(live_tags) else {
+    let Ok(resolved) = sqe_catalog::column_tag_ids::resolve_table_tags(live, live_schema) else {
         return changes;
     };
+    drop_ids(&mut changes);
+    // Orphans go: their column is gone and the replace keeps no ids.
+    let mut tags = resolved.applied;
     let kept = |c: &str| columns.iter().any(|n| c.eq_ignore_ascii_case(n));
     tags.retain(|c, _| kept(c) || kept(c.split('.').next().unwrap_or(c)));
     if tags.is_empty() {
@@ -355,8 +369,20 @@ mod tests {
             .collect()
     }
 
+    fn live_schema(fields: &[(i32, &str)]) -> iceberg::spec::Schema {
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        let fields = fields.iter().map(|(id, name)| {
+            NestedField::optional(*id, *name, Type::Primitive(PrimitiveType::String)).into()
+        });
+        iceberg::spec::Schema::builder()
+            .with_fields(fields.collect::<Vec<_>>())
+            .build()
+            .unwrap()
+    }
+
     fn shape_changes(live: &HashMap<String, String>, columns: &[&str]) -> PropertyChanges {
-        replace_shape_properties(&[], live, columns, Default::default())
+        let schema = live_schema(&[]);
+        replace_shape_properties(&[], live, &schema, columns, Default::default())
     }
 
     #[test]
@@ -367,7 +393,8 @@ mod tests {
         assert_eq!(changes.remove, ["sqe.json-columns"]);
 
         let json = ["k".to_string()].into_iter().collect();
-        let changes = replace_shape_properties(&[], &live, &["k"], json);
+        let schema = live_schema(&[]);
+        let changes = replace_shape_properties(&[], &live, &schema, &["k"], json);
         assert_eq!(changes.set["sqe.json-columns"], "[\"k\"]");
         assert!(changes.remove.is_empty());
     }
@@ -397,6 +424,30 @@ mod tests {
             changes.set["sqe.column-tags"],
             r#"{"card":[{"pci":"card"},"pii"]}"#
         );
+    }
+
+    /// #920: an entry another engine's rename left under the old name is
+    /// read by field id and kept under the current name; the ids go, as the
+    /// new shape may number the column differently.
+    #[test]
+    fn replace_shape_properties_keep_tags_by_field_id() {
+        use sqe_core::column_tags::ids::{digest, IDS_PROP_KEY};
+        let tags = r#"{"email":["PII"],"gone":["PII"]}"#;
+        let ids = format!(
+            r#"{{"v":1,"tags_sha256":"{}","ids":{{"email":2,"gone":7}}}}"#,
+            digest(tags)
+        );
+        let live = map(&[("sqe.column-tags", tags), (IDS_PROP_KEY, &ids)]);
+        let schema = live_schema(&[(1, "id"), (2, "contact")]);
+        let columns = ["id", "contact"];
+        let changes = replace_shape_properties(&[], &live, &schema, &columns, Default::default());
+        assert_eq!(changes.set["sqe.column-tags"], r#"{"contact":["PII"]}"#);
+        assert_eq!(changes.remove, [IDS_PROP_KEY]);
+
+        // Ids without tags go too.
+        let live = map(&[(IDS_PROP_KEY, &ids)]);
+        let changes = shape_changes(&live, &["id"]);
+        assert_eq!(changes.remove, [IDS_PROP_KEY]);
     }
 
     #[test]

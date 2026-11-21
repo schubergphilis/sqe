@@ -33,6 +33,7 @@ mod bloom_spec_spark_interop;
 mod bound_params_e2e;
 mod catalog_discovery_test;
 mod catalog_scope_e2e;
+mod column_tag_ids_e2e;
 mod compaction_benchmark;
 mod compaction_distributed_benchmark;
 mod ctas_replace_shape_e2e;
