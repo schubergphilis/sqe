@@ -371,8 +371,10 @@ fn ident_for(namespace: &str, table_name: &str) -> TableIdent {
 /// Picks the catalog a metadata TVF loads its target from, given the
 /// optional catalog name the `$snapshots` rewrite passes as a third argument
 /// (`cat.ns."t$snapshots"` -> `table_snapshots('ns', 't', 'cat')`).
+/// Returns the catalog and the name it is registered under, which can differ
+/// from the argument (a case-insensitive match). Policy keys on that name.
 pub type MetadataCatalogResolver =
-    Arc<dyn Fn(Option<&str>) -> DFResult<Arc<SessionCatalog>> + Send + Sync>;
+    Arc<dyn Fn(Option<&str>) -> DFResult<(Arc<SessionCatalog>, String)> + Send + Sync>;
 
 #[derive(Clone)]
 enum CatalogSource {
@@ -393,8 +395,9 @@ impl std::fmt::Debug for CatalogSource {
 
 impl CatalogSource {
     /// The catalog and table a call names: `(namespace, table)` plus an
-    /// optional trailing catalog name. The name is returned only when it
-    /// picked the catalog (a `Fixed` source ignores it).
+    /// optional trailing catalog name. When the name picked the catalog (a
+    /// `Fixed` source ignores it), the name that catalog is registered under
+    /// is returned with it.
     fn target(&self, fn_name: &str, exprs: &[Expr]) -> DFResult<Target> {
         let (table_args, catalog) = match exprs {
             [ns, table, Expr::Literal(ScalarValue::Utf8(Some(c)) | ScalarValue::LargeUtf8(Some(c)), _)] => {
@@ -405,7 +408,10 @@ impl CatalogSource {
         let (namespace, table_name) = parse_two_string_args(fn_name, &table_args)?;
         let (catalog, catalog_name) = match self {
             Self::Fixed(fixed) => (Arc::clone(fixed), None),
-            Self::Resolver(resolve) => (resolve(catalog)?, catalog.map(str::to_string)),
+            Self::Resolver(resolve) => {
+                let (resolved, registered) = resolve(catalog)?;
+                (resolved, catalog.map(|_| registered))
+            }
         };
         Ok((catalog, catalog_name, ident_for(&namespace, &table_name)))
     }
@@ -1538,6 +1544,43 @@ mod tests {
         let exprs = vec![str_literal("ns"), str_literal("t")];
         source.target("table_snapshots", &exprs).unwrap_err();
         assert_eq!(*seen.lock().unwrap(), [None]);
+    }
+
+    /// The provider carries the name the catalog is registered under, which
+    /// the policy rewriter keys on: `'sales'` matching catalog `Sales`
+    /// case-insensitively records `Sales`. No argument, or a function bound
+    /// to one catalog, records none. `call` is DataFusion's deprecated entry
+    /// point; `call_with_args` delegates to it.
+    #[test]
+    #[allow(deprecated)]
+    fn provider_records_the_registered_catalog_name() {
+        let unconfigured = || {
+            Arc::new(SessionCatalog::unconfigured(
+                &sqe_core::config::StorageConfig::default(),
+                None,
+            ))
+        };
+        let resolver: MetadataCatalogResolver =
+            Arc::new(move |_name: Option<&str>| Ok((unconfigured(), "Sales".to_string())));
+        let f = TableFilesFunction::with_catalog_resolver(resolver);
+        let named = f
+            .call(&[str_literal("ns"), str_literal("t"), str_literal("sales")])
+            .unwrap();
+        assert_eq!(
+            metadata_tvf_target(named.as_ref()),
+            Some((Some("Sales".to_string()), "ns".to_string(), "t".to_string()))
+        );
+        let bare = f.call(&[str_literal("ns"), str_literal("t")]).unwrap();
+        assert_eq!(metadata_tvf_target(bare.as_ref()).unwrap().0, None);
+
+        let fixed = TableFilesFunction::new(Arc::new(SessionCatalog::unconfigured(
+            &sqe_core::config::StorageConfig::default(),
+            None,
+        )));
+        let ignored = fixed
+            .call(&[str_literal("ns"), str_literal("t"), str_literal("sales")])
+            .unwrap();
+        assert_eq!(metadata_tvf_target(ignored.as_ref()).unwrap().0, None);
     }
 
     #[test]

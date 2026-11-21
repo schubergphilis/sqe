@@ -1597,6 +1597,59 @@ async fn metadata_tvfs_answer_and_withhold_tag_masked_stats() {
     );
 }
 
+/// Under `catalog_scoped`, a metadata TVF that names a catalog is checked in
+/// that catalog, under the name the catalog is registered as. Bob's session is
+/// in `ops_wh`; a deny-all row filter on `sales_wh.ac.orders` refuses his
+/// `table_files('ac', 'orders', 'sales_wh')`, and the case variant
+/// `'SALES_WH'`, which reads the same catalog, is refused too (Ranger matches
+/// case-insensitively; the check also keys the registered name). Alice, with
+/// no deny, reads the same files.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn catalog_scoped_metadata_tvf_checks_the_catalog_it_names() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    let mut deny = hive_rowfilter_policy(&format!("{PREFIX}scoped-tvf-deny"), "false");
+    deny["resources"]["database"] = serde_json::json!({"values": ["sales_wh.ac"]});
+    ctx.ranger
+        .create_policy(deny)
+        .await
+        .expect("create the scoped deny-all row filter");
+
+    let (scoped, _) = crate::common::setup_ranger_handler_sharing(Some(ctx.cache.clone()), |cfg| {
+        cfg.policy.ranger.catalog_scoped = true;
+    })
+    .await;
+    let files =
+        |catalog: &str| format!("SELECT file_path FROM table_files('ac', 'orders', '{catalog}')");
+
+    crate::common::eventually("bob's scoped deny to refuse the TVF", || async {
+        match scoped.execute(&ctx.bob, &files("sales_wh"), None).await {
+            Err(e) if e.to_string().contains("not found") => Ok(()),
+            Err(e) => Err(format!("refused with another error: {e}")),
+            Ok(b) => Err(format!("still answered {} rows", total_rows(&b))),
+        }
+    })
+    .await;
+    let variant = scoped.execute(&ctx.bob, &files("SALES_WH"), None).await;
+    assert!(
+        variant
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("not found")),
+        "the case variant names the same catalog and is refused: {:?}",
+        variant.map(|b| total_rows(&b))
+    );
+
+    let alice = scoped
+        .execute(&ctx.alice, &files("sales_wh"), None)
+        .await
+        .expect("alice has no deny");
+    assert!(total_rows(&alice) >= 1, "alice reads sales_wh's files");
+}
+
 /// DataFusion's built-in generator TVFs answer under Ranger. Until #847 the
 /// tag gate did not recognise their provider and refused them with "tag state
 /// unknown"; they have no table and no column tags.

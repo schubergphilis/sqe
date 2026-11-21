@@ -842,11 +842,14 @@ impl EmbeddedClient {
                     ))
                 }
             };
-            Ok(Arc::new(sqe_catalog::SessionCatalog::local(
-                writable.client(),
-                name,
-                &storage,
-            )))
+            Ok((
+                Arc::new(sqe_catalog::SessionCatalog::local(
+                    writable.client(),
+                    name,
+                    &storage,
+                )),
+                name.clone(),
+            ))
         });
         let r = || resolve.clone();
         let functions: [(&str, Arc<dyn TableFunctionImpl>); 6] = [
