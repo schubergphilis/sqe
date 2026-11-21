@@ -1014,6 +1014,7 @@ pub async fn create_session_context(
                             let policy = sqe_policy::plan_rewriter::resolve_effective_policy(
                                 store.as_ref(),
                                 &user,
+                                Some(&catalog),
                                 &table,
                                 &namespace,
                                 &col_tags,

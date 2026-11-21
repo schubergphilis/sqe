@@ -202,10 +202,8 @@ impl TableFunctionImpl for TagViewFunction {
         let Some(view) = TagView::from_name(view) else {
             return plan_err!("{TAG_VIEW_FUNCTION}: unknown tag view '{view}'");
         };
-        let catalog = (self.catalogs)(catalog_name)?;
-        let catalog_name = catalog_name
-            .map(str::to_string)
-            .unwrap_or_else(|| catalog.warehouse().to_string());
+        // The name the catalog is registered under, which policy keys on.
+        let (catalog, catalog_name) = (self.catalogs)(catalog_name)?;
         Ok(Arc::new(TagViewProvider {
             view,
             schema: view.schema(),
@@ -556,7 +554,10 @@ mod tests {
     }
 
     fn function(catalog: Arc<SessionCatalog>) -> TagViewFunction {
-        TagViewFunction::new(Arc::new(move |_| Ok(Arc::clone(&catalog))))
+        TagViewFunction::new(Arc::new(move |name: Option<&str>| {
+            let registered = name.unwrap_or("lake").to_string();
+            Ok((Arc::clone(&catalog), registered))
+        }))
     }
 
     async fn rows(ctx: &SessionContext, sql: &str) -> Vec<Vec<String>> {
