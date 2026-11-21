@@ -438,6 +438,33 @@ async fn polaris_auto_lazy_hit() {
     assert_eq!(label_arr.value(0), "discovered");
 }
 
+/// `SHOW CREATE TABLE cat.ns.t` as the first statement on a catalog the
+/// session has not attached yet discovers it, as a SELECT does. Before, the
+/// pre-flight found no catalog in the statement and reported the table
+/// missing (#921).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn catalog_ops_show_create_table_on_a_fresh_context() {
+    let _live = LIVE_STACK_LOCK.lock().await;
+    crate::common::init_tracing();
+    seed_discovery_warehouse().await;
+
+    let handler = make_handler(polaris_auto_config());
+    let session = live_session().await;
+    let sql = "SHOW CREATE TABLE discovery_test_wh.disc_ns.probe_t";
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let ddl = arrow::util::pretty::pretty_format_batches(&batches)
+        .expect("render")
+        .to_string();
+    assert!(
+        ddl.contains("probe_t") && ddl.contains("label"),
+        "the DDL names the table and its columns, got:\n{ddl}"
+    );
+}
+
 /// A maintenance `CALL` on an unqualified `ns.t` resolves in the session
 /// catalog, as a SELECT of the same name does. Before, it always used the
 /// configured default warehouse, so a Trino client with `catalog=<sibling>`
@@ -589,17 +616,9 @@ async fn catalog_ops_ddl_uses_the_session_catalog() {
         "ALTER TABLE ops_probe SET TBLPROPERTIES ('probe.key' = 'probe-916')".to_string(),
     )
     .await;
-    // SHOW CREATE TABLE reads columns through the session context, which does
-    // not hold a discovered catalog, so read the table back through a handler
-    // whose default catalog IS `discovery_test_wh` (as the seeding does).
+    // SHOW CREATE TABLE on the discovered catalog, on a fresh context (#921).
     sqe_coordinator::session_context::invalidate_all_session_caches().await;
-    let seed_handler = make_handler(seed_config());
-    let ddl = render(
-        &seed_handler
-            .execute(&qualified, "SHOW CREATE TABLE disc_ns.ops_probe", None)
-            .await
-            .unwrap_or_else(|e| panic!("SHOW CREATE TABLE disc_ns.ops_probe: {e}")),
-    );
+    let ddl = render(&run(&qualified, format!("SHOW CREATE TABLE {full}")).await);
     assert!(
         ddl.contains("probe-916"),
         "SET TBLPROPERTIES must land on {full}, got:\n{ddl}"
