@@ -402,6 +402,7 @@ impl PolicyPlanRewriter {
                     &resolve_effective_policy(
                         store.as_ref(),
                         user,
+                        catalog.as_deref(),
                         table,
                         &key_ns,
                         &no_tags,
@@ -563,7 +564,13 @@ impl PolicyPlanRewriter {
 
                             if !all_tags.is_empty() {
                                 let (tag_masks_by_tag, tag_filters, unmappable_tags) =
-                                    store.resolve_tags(&user_clone, &all_tags).await;
+                                    crate::tag_scope::resolve_tags_in_catalog(
+                                        store.as_ref(),
+                                        &user_clone,
+                                        &all_tags,
+                                        table_ref.catalog(),
+                                    )
+                                    .await;
 
                                 debug!(
                                     user = %username,
@@ -953,10 +960,14 @@ fn summarise_policies(table_policies: &HashMap<String, ResolvedPolicy>) -> Polic
 ///
 /// `namespace`/`table` must be the SAME policy key the rewriter uses
 /// (`resolve_policy_key` -> the full dotted namespace), or the diagnostic would
-/// describe a different policy than enforcement applies.
+/// describe a different policy than enforcement applies. `catalog` is the
+/// planner's name for the table's catalog: under `catalog_scoped` it picks the
+/// catalog's tag policies (#919, [`crate::tag_scope`]). It is passed rather
+/// than read off `namespace`, which not every caller prefixes.
 pub async fn resolve_effective_policy(
     store: &dyn PolicyStore,
     user: &sqe_core::session::SessionUser,
+    catalog: Option<&str>,
     table: &str,
     namespace: &str,
     col_tags: &HashMap<String, Vec<String>>,
@@ -975,7 +986,7 @@ pub async fn resolve_effective_policy(
     let all_tags: HashSet<String> = col_tags.values().flatten().cloned().collect();
     if !all_tags.is_empty() {
         let (tag_masks_by_tag, tag_filters, unmappable_tags) =
-            store.resolve_tags(user, &all_tags).await;
+            crate::tag_scope::resolve_tags_in_catalog(store, user, &all_tags, catalog).await;
         let identity = SessionIdentity {
             username: user.username.clone(),
             roles: user.roles.clone(),
@@ -3179,6 +3190,7 @@ mod tests {
         let got = resolve_effective_policy(
             &store,
             &diag_user(&[]),
+            None,
             "employees",
             "hr",
             &HashMap::new(),
@@ -3197,6 +3209,7 @@ mod tests {
         let got = resolve_effective_policy(
             &store,
             &diag_user(&[]),
+            None,
             "orders",
             "sales",
             &HashMap::new(),
@@ -3222,6 +3235,7 @@ mod tests {
         let got = resolve_effective_policy(
             &store,
             &diag_user(&[]),
+            None,
             "t",
             "ns2",
             &HashMap::new(),

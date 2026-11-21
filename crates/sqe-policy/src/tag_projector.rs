@@ -103,7 +103,19 @@ pub async fn project_table_tags(
     tags: &ColumnTags,
 ) -> sqe_core::Result<()> {
     let key = TagTableKey::for_table(catalog, namespace, table, catalog_scoped)?;
-    projector.project(&key, previous, tags).await?;
+    if catalog_scoped {
+        // Both names, so Ranger's evaluator applies the catalog's tag policy
+        // and the bare one, as SQE does (#919, `crate::tag_scope`).
+        projector
+            .project(
+                &key,
+                &with_catalog_tags(catalog, previous),
+                &with_catalog_tags(catalog, tags),
+            )
+            .await?;
+    } else {
+        projector.project(&key, previous, tags).await?;
+    }
     if catalog_scoped {
         let legacy = TagTableKey::for_table(catalog, namespace, table, false)?;
         let mut stale = previous.clone();
@@ -119,6 +131,19 @@ pub async fn project_table_tags(
         }
     }
     Ok(())
+}
+
+/// `tags` with each column's tags followed by their catalog-qualified names
+/// (`pii` -> `pii`, `sales.pii`).
+fn with_catalog_tags(catalog: &str, tags: &ColumnTags) -> ColumnTags {
+    use crate::tag_scope::qualify_tag;
+    tags.iter()
+        .map(|(column, names)| {
+            let mut all = names.clone();
+            all.extend(names.iter().map(|t| qualify_tag(catalog, t)));
+            (column.clone(), all)
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -447,6 +472,43 @@ mod tests {
         let run = project_table_tags(&rec, "a", &ns, "orders", false, &prev, &now);
         run.await.unwrap();
         assert_eq!(*rec.0.lock().unwrap(), [("sales".into(), 1, 1)]);
+    }
+
+    /// Under `catalog_scoped` each column carries its bare tag and the
+    /// catalog-qualified one, so Ranger applies both tag policies (#919).
+    #[tokio::test]
+    async fn scoped_projection_adds_the_catalog_qualified_tag() {
+        #[derive(Default)]
+        struct Rec(std::sync::Mutex<Vec<(String, ColumnTags, ColumnTags)>>);
+        #[async_trait]
+        impl TagProjector for Rec {
+            async fn project(
+                &self,
+                t: &TagTableKey,
+                prev: &ColumnTags,
+                tags: &ColumnTags,
+            ) -> sqe_core::Result<()> {
+                let call = (t.database.clone(), prev.clone(), tags.clone());
+                self.0.lock().unwrap().push(call);
+                Ok(())
+            }
+        }
+        let ns = vec!["sales".to_string()];
+        let prev = tags(&[("ssn", &["pii"])]);
+        let now = tags(&[("email", &["pii"])]);
+
+        let rec = Rec::default();
+        let run = project_table_tags(&rec, "a", &ns, "orders", true, &prev, &now);
+        run.await.unwrap();
+        let calls = rec.0.lock().unwrap().clone();
+        assert_eq!(calls[0].0, "a.sales");
+        assert_eq!(calls[0].1, tags(&[("ssn", &["pii", "a.pii"])]));
+        assert_eq!(calls[0].2, tags(&[("email", &["pii", "a.pii"])]));
+
+        let rec = Rec::default();
+        let run = project_table_tags(&rec, "a", &ns, "orders", false, &prev, &now);
+        run.await.unwrap();
+        assert_eq!(rec.0.lock().unwrap()[0].2, now);
     }
 
     #[test]

@@ -581,6 +581,7 @@ impl QueryHandler {
         let policy = sqe_policy::plan_rewriter::resolve_effective_policy(
             store,
             &target,
+            Some(&catalog_name),
             &table_name,
             &namespace,
             &col_tags,

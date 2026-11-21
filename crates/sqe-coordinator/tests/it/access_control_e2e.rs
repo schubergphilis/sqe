@@ -1477,6 +1477,118 @@ async fn catalog_scoped_tag_projection_keys_the_catalog() {
     ranger_column_tagged_in(&ctx, None, "ssn", false).await;
 }
 
+/// #919 live: under `catalog_scoped` the projector writes `sales_wh.PII` next
+/// to `PII`, a tag policy on `ops_wh.PII` leaves `sales_wh` raw, and one on
+/// `sales_wh.PII` masks it. The unscoped handler matches neither.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn catalog_scoped_tag_policy_masks_its_catalog_only() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    let (scoped, _) = crate::common::setup_ranger_handler_sharing(Some(ctx.cache.clone()), |cfg| {
+        cfg.policy.ranger.catalog_scoped = true;
+    })
+    .await;
+    let tag = format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn SET TAG PII = 'true'");
+    crate::common::eventually("scoped handler to set the tag", || async {
+        let done = scoped.execute(&ctx.carol, &tag, None).await;
+        done.map(|_| ()).map_err(|e| e.to_string())
+    })
+    .await;
+    ranger_column_tag_named(&ctx, "sales_wh.ac", "ssn", "sales_wh.PII").await;
+
+    let raw = vec!["111-11-1111", "222-22-2222", "333-33-3333"];
+    let masked = vec!["xxx-xx-1111", "xxx-xx-2222", "xxx-xx-3333"];
+    let sql = format!("SELECT ssn FROM {ORDERS} ORDER BY id");
+    let mask = serde_json::json!({"dataMaskType": "hive:MASK_SHOW_LAST_4"});
+
+    // Another catalog's policy: sales_wh stays raw.
+    let ops = tag_mask_policy(&format!("{PREFIX}tag-mask-ops"), "ops_wh.PII", mask.clone());
+    ctx.ranger
+        .create_policy(ops)
+        .await
+        .expect("create ops_wh.PII mask");
+    let sales = tag_mask_policy(&format!("{PREFIX}tag-mask-sales"), "sales_wh.PII", mask);
+    let bob = exec_ok_on(&scoped, &ctx.bob, &sql).await;
+    assert_eq!(
+        col_strings(&bob, "ssn"),
+        raw,
+        "ops_wh.PII must not mask sales_wh"
+    );
+
+    // This catalog's policy masks through the scoped handler only.
+    ctx.ranger
+        .create_policy(sales)
+        .await
+        .expect("create sales_wh.PII mask");
+    crate::common::eventually("sales_wh.PII to mask bob", || async {
+        match scoped.execute(&ctx.bob, &sql, None).await {
+            Ok(b) if col_strings(&b, "ssn") == masked => Ok(()),
+            Ok(b) => Err(format!("got {:?}", col_strings(&b, "ssn"))),
+            Err(e) => Err(format!("query failed: {e}")),
+        }
+    })
+    .await;
+    let unscoped = exec_ok(&ctx, &ctx.bob, &sql).await;
+    assert_eq!(
+        col_strings(&unscoped, "ssn"),
+        raw,
+        "unscoped: a qualified tag matches nothing"
+    );
+
+    let unset = format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn UNSET TAG PII");
+    let done = scoped.execute(&ctx.carol, &unset, None).await;
+    done.expect("unset tag through the scoped handler");
+    ranger_column_tagged_in(&ctx, None, "ssn", false).await;
+}
+
+/// Run `sql` as `user` on `handler`; panic on error.
+async fn exec_ok_on(handler: &QueryHandler, user: &Session, sql: &str) -> Vec<RecordBatch> {
+    match handler.execute(user, sql, None).await {
+        Ok(b) => b,
+        Err(e) => panic!("{sql}: {e}"),
+    }
+}
+
+/// Wait until Ranger's tag bundle tags `orders.<column>` on the `database`
+/// resource with a tag named `tag`.
+async fn ranger_column_tag_named(ctx: &AcCtx, database: &str, column: &str, tag: &str) {
+    let has = |r: &serde_json::Value, key: &str, value: &str| {
+        let values = r["resourceElements"][key]["values"].as_array();
+        values.is_some_and(|a| a.iter().any(|v| v == value))
+    };
+    let what = format!("Ranger tag {tag} on {database} orders.{column}");
+    crate::common::eventually(&what, || async {
+        let bundle = ctx.ranger.download_tag_bundle(HIVE_SERVICE).await;
+        let bundle = bundle.map_err(|e| e.to_string())?;
+        let empty = Vec::new();
+        let resources = bundle["serviceResources"].as_array().unwrap_or(&empty);
+        let names: Vec<String> = resources
+            .iter()
+            .filter(|r| has(r, "table", "orders") && has(r, "column", column))
+            .filter(|r| has(r, "database", database))
+            .flat_map(|r| {
+                let ids = &bundle["resourceToTagIds"][r["id"].to_string()];
+                ids.as_array().cloned().unwrap_or_default()
+            })
+            .filter_map(|id| {
+                bundle["tags"][id.to_string()]["type"]
+                    .as_str()
+                    .map(String::from)
+            })
+            .collect();
+        if names.iter().any(|n| n == tag) {
+            Ok(())
+        } else {
+            Err(format!("tags {names:?}"))
+        }
+    })
+    .await;
+}
+
 /// Wait until Ranger's tag bundle does (or no longer does) associate a tag
 /// with `orders.<column>`, whatever `database` resource carries it.
 async fn ranger_column_tagged(ctx: &AcCtx, column: &str, want: bool) {

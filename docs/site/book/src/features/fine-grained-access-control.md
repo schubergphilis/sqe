@@ -48,7 +48,14 @@ The default drops the catalog, the convention Hive and Spark/Kyuubi use, so one 
 - Policies written for the default convention stop matching. Rewrite them before turning the setting on, or masks disappear.
 - The catalog is the name the session uses for it, not the warehouse behind it. A config catalog `[catalogs.iceberg]` over warehouse `test_warehouse` is keyed `iceberg.<namespace>`, whether the table is read directly or through a view. Before #835 a view's tables were keyed by the warehouse instead, so a mask written for `iceberg.<namespace>` did not apply through the view. A policy written for `test_warehouse.<namespace>` to cover views no longer matches anything: move it to the session's catalog name. A table no policy matches is read without masks or row filters, so check for such policies before upgrading.
 
-Tag-based policies are unaffected: a tag policy names a tag, not a table.
+A tag policy names a tag, not a table, so the setting scopes it through the tag's name. With `catalog-scoped` on, a column tagged `pii` in catalog `ws_sales` is governed by two tag policies: one on `pii` and one on `ws_sales.pii` (`CREATE POLICY ... ON TAG ws_sales.pii`). The column tag stays `pii`; only the policy carries the catalog.
+
+- A policy on `ws_sales.pii` applies to `ws_sales` only. The same tag in `ws_hr` is not affected by it.
+- A policy on bare `pii` keeps applying in every catalog, so turning the setting on never unmasks a column.
+- When both mask the same column, the catalog's mask wins. Row filters from both apply, ANDed. A tag policy SQE cannot map under either name restricts the column.
+- When SQE projects column tags into Ranger for Spark, it writes both names on the column, so Spark applies the same two policies.
+
+With the setting off, a policy on `ws_sales.pii` matches nothing.
 
 ### Which item and which policy wins
 
