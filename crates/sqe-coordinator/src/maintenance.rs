@@ -341,9 +341,16 @@ impl MaintenanceHandler {
                 // 4b scheduler can call them directly with the catalog it
                 // already built via its own `catalog_factory` seam, without
                 // going through `create_catalog_bridge` a second time.
-                let catalog = self
-                    .create_catalog_bridge(session, table.catalog.as_deref())
+                let session_catalog = self
+                    .create_session_catalog(session, table.catalog.as_deref())
                     .await?;
+                let catalog: Arc<dyn Catalog> = session_catalog.as_catalog();
+                // A caller who may not write is refused here, before any
+                // rewritten file is written (#880). The role check in
+                // `authorize_or_deny` lets a reader with no roles through.
+                let ident = to_table_ident(table);
+                let live = load_table(&catalog, &ident).await?;
+                session_catalog.check_write_access(&ident, &live).await?;
 
                 let rewrite_all = rewrite_all.unwrap_or(false);
 
@@ -2713,6 +2720,19 @@ impl MaintenanceHandler {
         session: &Session,
         target_warehouse: Option<&str>,
     ) -> sqe_core::Result<Arc<dyn Catalog>> {
+        Ok(self
+            .create_session_catalog(session, target_warehouse)
+            .await?
+            .as_catalog())
+    }
+
+    /// The [`SessionCatalog`] behind [`Self::create_catalog_bridge`], for the
+    /// callers that also need its write check.
+    async fn create_session_catalog(
+        &self,
+        session: &Session,
+        target_warehouse: Option<&str>,
+    ) -> sqe_core::Result<Arc<SessionCatalog>> {
         let target =
             maintenance_target_catalog(target_warehouse, session.default_catalog.as_deref());
         let configured = target.and_then(|name| {
@@ -2772,7 +2792,7 @@ impl MaintenanceHandler {
             ),
         };
         let _ = session_catalog.list_namespaces().await;
-        Ok(session_catalog.as_catalog())
+        Ok(session_catalog)
     }
 }
 
