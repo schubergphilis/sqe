@@ -1104,6 +1104,104 @@ pub fn merge_source_sql(source: &sqlparser::ast::TableFactor) -> Result<String, 
     }
 }
 
+/// Give an unaliased MERGE target or source table its table name as alias.
+///
+/// Without an alias, ON, the clause predicates and SET name the table by its
+/// name (`ON ns.t.id = s.id`, `ON t.id = s.id`). The compiled MERGE renames
+/// each side through its alias and defaulted to `t` / `s`, so those
+/// references did not resolve. The bare table name becomes the alias, and a
+/// qualified reference (`ns.t.id`, `cat.ns.t.id`) is shortened to it. A
+/// source table whose bare name equals the target's alias keeps no alias.
+/// `None` when the statement needs no change.
+pub(crate) fn alias_unaliased_tables(
+    stmt: &sqlparser::ast::Statement,
+) -> Option<sqlparser::ast::Statement> {
+    use sqlparser::ast::{Statement, TableAlias, TableFactor, VisitMut, VisitorMut};
+    use std::ops::ControlFlow;
+
+    let Statement::Merge(merge) = stmt else {
+        return None;
+    };
+    let mut merge = merge.clone();
+    let alias_of = |factor: &TableFactor| match factor {
+        TableFactor::Table { alias: Some(a), .. } | TableFactor::Derived { alias: Some(a), .. } => {
+            Some(a.name.value.clone())
+        }
+        _ => None,
+    };
+    let target_alias = alias_of(&merge.table);
+    let mut qualifiers: Vec<Vec<Ident>> = Vec::new();
+    for (factor, is_target) in [(&mut merge.table, true), (&mut merge.source, false)] {
+        let TableFactor::Table {
+            name,
+            alias: alias @ None,
+            ..
+        } = factor
+        else {
+            continue;
+        };
+        let Some(parts) = name
+            .0
+            .iter()
+            .map(|p| p.as_ident().cloned())
+            .collect::<Option<Vec<Ident>>>()
+        else {
+            continue;
+        };
+        let Some(bare) = parts.last().cloned() else {
+            continue;
+        };
+        let taken = qualifiers
+            .first()
+            .and_then(|q| q.last())
+            .map(|i| i.value.clone())
+            .or(target_alias.clone());
+        if !is_target && taken.is_some_and(|t| t.eq_ignore_ascii_case(&bare.value)) {
+            continue;
+        }
+        *alias = Some(TableAlias {
+            explicit: true,
+            name: bare,
+            columns: vec![],
+            at: None,
+        });
+        qualifiers.push(parts);
+    }
+    if qualifiers.is_empty() {
+        return None;
+    }
+
+    struct Shorten<'a>(&'a [Vec<Ident>]);
+    impl VisitorMut for Shorten<'_> {
+        type Break = ();
+        fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+            let Expr::CompoundIdentifier(ids) = expr else {
+                return ControlFlow::Continue(());
+            };
+            for parts in self.0 {
+                // Longest qualifier first; a one-part qualifier is the alias.
+                for k in (2..=parts.len()).rev() {
+                    let suffix = &parts[parts.len() - k..];
+                    let hit = ids.len() > k
+                        && ids[..k]
+                            .iter()
+                            .zip(suffix)
+                            .all(|(a, b)| a.value.eq_ignore_ascii_case(&b.value));
+                    if hit {
+                        ids.drain(..k - 1);
+                        return ControlFlow::Continue(());
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut shorten = Shorten(&qualifiers);
+    let _ = merge.on.visit(&mut shorten);
+    let _ = merge.clauses.visit(&mut shorten);
+    Some(Statement::Merge(merge))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2150,6 +2248,57 @@ mod tests {
             replace_alias_qualifier("'it''s.x' = s.y", "s", "R"),
             "'it''s.x' = R.y"
         );
+    }
+
+    fn aliased(sql: &str) -> Option<String> {
+        let stmt = Parser::parse_sql(&GenericDialect {}, sql)
+            .expect("parse")
+            .remove(0);
+        alias_unaliased_tables(&stmt).map(|s| s.to_string())
+    }
+
+    #[test]
+    fn an_unaliased_target_is_named_by_its_table() {
+        let out = aliased(
+            "MERGE INTO cat.ns.tgt USING src AS s ON cat.ns.tgt.id = s.id AND ns.tgt.k = 1 AND tgt.j = 2 \
+             WHEN MATCHED AND ns.tgt.v > 0 THEN UPDATE SET v = ns.tgt.v + s.v",
+        )
+        .expect("rewritten");
+        assert!(
+            out.starts_with("MERGE INTO cat.ns.tgt AS tgt USING src AS s"),
+            "{out}"
+        );
+        assert!(
+            out.contains("ON tgt.id = s.id AND tgt.k = 1 AND tgt.j = 2"),
+            "{out}"
+        );
+        assert!(
+            out.contains("WHEN MATCHED AND tgt.v > 0 THEN UPDATE SET v = tgt.v + s.v"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn an_unaliased_source_table_is_named_by_its_table() {
+        let out = aliased(
+            "MERGE INTO tgt AS t USING ns.src ON t.id = ns.src.id WHEN MATCHED THEN DELETE",
+        )
+        .expect("rewritten");
+        assert!(
+            out.contains("USING ns.src AS src ON t.id = src.id"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn aliased_tables_and_a_clashing_source_name_are_left_alone() {
+        assert_eq!(
+            aliased("MERGE INTO tgt AS t USING src AS s ON t.id = s.id WHEN MATCHED THEN DELETE"),
+            None
+        );
+        let out = aliased("MERGE INTO a.t USING b.t ON a.t.id = b.t.id WHEN MATCHED THEN DELETE")
+            .expect("rewritten");
+        assert!(out.starts_with("MERGE INTO a.t AS t USING b.t ON"), "{out}");
     }
 
     #[test]
