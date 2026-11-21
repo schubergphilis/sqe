@@ -26,9 +26,22 @@
 //! A table whose `sqe.column-tags` cannot be read is left out with a
 //! warning rather than failing the whole listing.
 //!
-//! `catalog_tags`, `schema_tags` and `table_tags` return no rows yet: SQE
-//! keeps tags on columns only. They have Databricks' columns, so a client
-//! that reads all four works today.
+//! `table_tags` walks the same tables and reads `sqe.table-tags`
+//! ([`sqe_core::object_tags`]). Its visibility rule is the same as for
+//! `column_tags`: the table must load with the caller's token, and the
+//! policy store must not deny the caller every row, judged with the
+//! table's column tags. A table whose `sqe.column-tags` cannot be read is
+//! left out of `table_tags` too, since its policy cannot be judged.
+//!
+//! `schema_tags` reads the namespace property `sqe.schema-tags` of every
+//! namespace the caller can list and load, the rule `SHOW SCHEMAS` uses:
+//! Polaris decides, and the policy store, which keys on tables, is not
+//! asked.
+//!
+//! `catalog_tags` reads the Polaris catalog property `sqe.catalog-tags`
+//! through the management API on the caller's token. A caller Polaris does
+//! not let read the catalog entity sees no rows, and neither does a catalog
+//! that is not Polaris REST.
 //!
 //! Equality filters on `schema_name` and `table_name` limit which
 //! namespaces are listed and which tables are loaded; DataFusion applies
@@ -294,14 +307,24 @@ fn hidden_from_caller(e: &sqe_core::SqeError) -> bool {
     e.is_not_found() || e.error_code() == sqe_core::SqeErrorCode::AccessDenied
 }
 
-/// One `column_tags` row.
+/// One row of a tag view: the object's name parts below the catalog
+/// (`[schema, table, column]` for `column_tags`, `[]` for `catalog_tags`),
+/// then the tag.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct ColumnTagRow {
-    schema: String,
-    table: String,
-    column: String,
+struct TagRow {
+    parts: Vec<String>,
     tag: String,
     value: String,
+}
+
+impl TagRow {
+    fn new(parts: Vec<String>, tag: sqe_core::column_tags::ColumnTag) -> Self {
+        Self {
+            parts,
+            tag: tag.key,
+            value: tag.value.unwrap_or_default(),
+        }
+    }
 }
 
 #[async_trait]
@@ -346,12 +369,14 @@ impl TableProvider for TagViewProvider {
     {
         let (schema_name, table_name) = pinned_names(filters);
         Box::pin(async move {
-            let rows = match self.view {
-                TagView::Column => self.column_tag_rows(schema_name, table_name).await?,
-                // SQE keeps tags on columns only (until catalog, schema and
-                // table tags land).
-                TagView::Catalog | TagView::Schema | TagView::Table => Vec::new(),
+            let mut rows = match self.view {
+                TagView::Catalog => self.catalog_tag_rows().await?,
+                TagView::Schema => self.schema_tag_rows(schema_name).await?,
+                TagView::Table | TagView::Column => {
+                    self.table_tag_rows(schema_name, table_name).await?
+                }
             };
+            rows.sort_unstable();
             let batch = self.batch(&rows)?;
             let mem: Arc<dyn TableProvider> =
                 Arc::new(MemTable::try_new(self.schema.clone(), vec![vec![batch]])?);
@@ -361,23 +386,101 @@ impl TableProvider for TagViewProvider {
 }
 
 impl TagViewProvider {
-    /// Every (column, tag) of every table the caller can load, sorted.
-    async fn column_tag_rows(
-        &self,
-        schema_name: Option<String>,
-        table_name: Option<String>,
-    ) -> DFResult<Vec<ColumnTagRow>> {
-        let fail = |what: &str, e: sqe_core::SqeError| {
-            DataFusionError::Execution(format!("information_schema.column_tags: {what}: {e}"))
-        };
-        let namespaces = match schema_name {
-            Some(name) => vec![NamespaceIdent::new(name)],
+    fn fail(&self, what: &str, e: sqe_core::SqeError) -> DataFusionError {
+        DataFusionError::Execution(format!(
+            "information_schema.{}: {what}: {e}",
+            self.view.name()
+        ))
+    }
+
+    /// The pinned namespace, or every namespace the caller can list.
+    async fn namespaces(&self, schema_name: Option<String>) -> DFResult<Vec<NamespaceIdent>> {
+        match schema_name {
+            Some(name) => Ok(vec![NamespaceIdent::new(name)]),
             None => self
                 .catalog
                 .list_namespaces()
                 .await
-                .map_err(|e| fail("failed to list schemas", e))?,
+                .map_err(|e| self.fail("failed to list schemas", e)),
+        }
+    }
+
+    /// The catalog's own tags, or none when the caller cannot read the
+    /// catalog entity or the catalog is not Polaris REST.
+    async fn catalog_tag_rows(&self) -> DFResult<Vec<TagRow>> {
+        let properties = match self.catalog.catalog_properties().await {
+            Ok(properties) => properties,
+            Err(e)
+                if hidden_from_caller(&e) || matches!(e, sqe_core::SqeError::NotImplemented(_)) =>
+            {
+                debug!(catalog = %self.catalog_name, error = %e, "catalog_tags: catalog not read");
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(self.fail("failed to read catalog properties", e)),
         };
+        let raw = properties.get(sqe_core::object_tags::CATALOG_PROP_KEY);
+        match sqe_core::object_tags::parse(raw.map(String::as_str)) {
+            Ok(tags) => Ok(tags
+                .into_iter()
+                .map(|t| TagRow::new(Vec::new(), t))
+                .collect()),
+            Err(e) => {
+                warn!(catalog = %self.catalog_name, error = %e, "catalog_tags: unreadable sqe.catalog-tags, left out");
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// The tags of every namespace the caller can load.
+    async fn schema_tag_rows(&self, schema_name: Option<String>) -> DFResult<Vec<TagRow>> {
+        let namespaces = self.namespaces(schema_name).await?;
+        let per_schema: Vec<Vec<TagRow>> = futures::stream::iter(namespaces)
+            .map(|namespace| self.namespace_rows(namespace))
+            .buffer_unordered(LOAD_CONCURRENCY)
+            .try_collect()
+            .await?;
+        Ok(per_schema.into_iter().flatten().collect())
+    }
+
+    /// The rows of one namespace, or none when the caller cannot load it.
+    fn namespace_rows(
+        &self,
+        namespace: NamespaceIdent,
+    ) -> futures::future::BoxFuture<'_, DFResult<Vec<TagRow>>> {
+        Box::pin(async move {
+            let schema = namespace.as_ref().join(".");
+            let loaded = match self.catalog.get_namespace(&namespace).await {
+                Ok(loaded) => loaded,
+                Err(e) if hidden_from_caller(&e) => {
+                    debug!(namespace = %schema, error = %e, "schema_tags: schema not loaded");
+                    return Ok(Vec::new());
+                }
+                Err(e) => return Err(self.fail(&format!("failed to load schema '{schema}'"), e)),
+            };
+            let raw = loaded
+                .properties()
+                .get(sqe_core::object_tags::SCHEMA_PROP_KEY);
+            match sqe_core::object_tags::parse(raw.map(String::as_str)) {
+                Ok(tags) => Ok(tags
+                    .into_iter()
+                    .map(|t| TagRow::new(vec![schema.clone()], t))
+                    .collect()),
+                Err(e) => {
+                    warn!(namespace = %schema, error = %e, "schema_tags: unreadable sqe.schema-tags, schema left out");
+                    Ok(Vec::new())
+                }
+            }
+        })
+    }
+
+    /// The column tags (`column_tags`) or the table's own tags
+    /// (`table_tags`) of every table the caller can see.
+    async fn table_tag_rows(
+        &self,
+        schema_name: Option<String>,
+        table_name: Option<String>,
+    ) -> DFResult<Vec<TagRow>> {
+        let namespaces = self.namespaces(schema_name).await?;
 
         let mut idents: Vec<TableIdent> = Vec::new();
         for namespace in &namespaces {
@@ -388,58 +491,77 @@ impl TagViewProvider {
                         .filter(|t| table_name.as_deref().is_none_or(|n| t.name() == n)),
                 ),
                 Err(e) if hidden_from_caller(&e) => {
-                    debug!(namespace = ?namespace, error = %e, "column_tags: schema not listed");
+                    debug!(namespace = ?namespace, error = %e, view = self.view.name(), "schema not listed");
                 }
-                Err(e) => return Err(fail("failed to list tables", e)),
+                Err(e) => return Err(self.fail("failed to list tables", e)),
             }
         }
 
-        let per_table: Vec<Vec<ColumnTagRow>> = futures::stream::iter(idents)
+        let per_table: Vec<Vec<TagRow>> = futures::stream::iter(idents)
             .map(|ident| self.table_rows(ident))
             .buffer_unordered(LOAD_CONCURRENCY)
             .try_collect()
             .await?;
-        let mut rows: Vec<ColumnTagRow> = per_table.into_iter().flatten().collect();
-        rows.sort_unstable();
-        Ok(rows)
+        Ok(per_table.into_iter().flatten().collect())
     }
 
     /// The rows of one table, or none when the caller cannot see it.
     fn table_rows(
         &self,
         ident: TableIdent,
-    ) -> futures::future::BoxFuture<'_, DFResult<Vec<ColumnTagRow>>> {
+    ) -> futures::future::BoxFuture<'_, DFResult<Vec<TagRow>>> {
         Box::pin(async move {
             let schema = ident.namespace().as_ref().join(".");
             let table_name = ident.name().to_string();
             let table = match self.catalog.load_table(&ident).await {
                 Ok(table) => table,
                 Err(e) if hidden_from_caller(&e) => {
-                    debug!(table = %ident, error = %e, "column_tags: table not loaded");
+                    debug!(table = %ident, error = %e, view = self.view.name(), "table not loaded");
                     return Ok(Vec::new());
                 }
-                Err(e) => {
-                    return Err(DataFusionError::Execution(format!(
-                        "information_schema.column_tags: failed to load table '{ident}': {e}"
-                    )))
+                Err(e) => return Err(self.fail(&format!("failed to load table '{ident}'"), e)),
+            };
+            let properties = table.metadata().properties();
+            // The column tags decide the policy verdict for either view, so
+            // a table whose column tags cannot be read is left out of both.
+            let column_tags = match properties.get(sqe_core::column_tags::PROP_KEY) {
+                None => sqe_core::column_tags::ColumnTagMap::new(),
+                Some(raw) => match sqe_core::column_tags::parse(raw) {
+                    Ok(tags) => tags,
+                    Err(e) => {
+                        warn!(table = %ident, error = %e, view = self.view.name(), "unreadable sqe.column-tags, table left out");
+                        return Ok(Vec::new());
+                    }
+                },
+            };
+            let keys = sqe_core::column_tags::keys(&column_tags);
+            let rows: Vec<TagRow> = match self.view {
+                TagView::Column => column_tags
+                    .into_iter()
+                    .flat_map(|(column, tags)| {
+                        let parts = vec![schema.clone(), table_name.clone(), column];
+                        tags.into_iter()
+                            .map(move |tag| TagRow::new(parts.clone(), tag))
+                    })
+                    .collect(),
+                TagView::Table | TagView::Catalog | TagView::Schema => {
+                    let raw = properties.get(sqe_core::object_tags::TABLE_PROP_KEY);
+                    match sqe_core::object_tags::parse(raw.map(String::as_str)) {
+                        Ok(tags) => tags
+                            .into_iter()
+                            .map(|tag| TagRow::new(vec![schema.clone(), table_name.clone()], tag))
+                            .collect(),
+                        Err(e) => {
+                            warn!(table = %ident, error = %e, "table_tags: unreadable sqe.table-tags, table left out");
+                            return Ok(Vec::new());
+                        }
+                    }
                 }
             };
-            let Some(raw) = table
-                .metadata()
-                .properties()
-                .get(sqe_core::column_tags::PROP_KEY)
-            else {
-                return Ok(Vec::new());
-            };
-            let tags = match sqe_core::column_tags::parse(raw) {
-                Ok(tags) => tags,
-                Err(e) => {
-                    warn!(table = %ident, error = %e, "column_tags: unreadable sqe.column-tags, table left out");
-                    return Ok(Vec::new());
-                }
-            };
+            if rows.is_empty() {
+                return Ok(rows);
+            }
             if let Some(access) = &self.access {
-                let keys = sqe_core::column_tags::keys(&tags);
                 if !(access.0)(
                     self.catalog_name.clone(),
                     schema.clone(),
@@ -451,35 +573,19 @@ impl TagViewProvider {
                     return Ok(Vec::new());
                 }
             }
-            Ok(tags
-                .into_iter()
-                .flat_map(|(column, tags)| {
-                    let (schema, table_name) = (schema.clone(), table_name.clone());
-                    tags.into_iter().map(move |tag| ColumnTagRow {
-                        schema: schema.clone(),
-                        table: table_name.clone(),
-                        column: column.clone(),
-                        tag: tag.key,
-                        value: tag.value.unwrap_or_default(),
-                    })
-                })
-                .collect())
+            Ok(rows)
         })
     }
 
-    fn batch(&self, rows: &[ColumnTagRow]) -> DFResult<RecordBatch> {
+    fn batch(&self, rows: &[TagRow]) -> DFResult<RecordBatch> {
         let mut builders: Vec<StringBuilder> = (0..self.schema.fields().len())
             .map(|_| StringBuilder::new())
             .collect();
         for row in rows {
-            let values = [
-                self.catalog_name.as_str(),
-                &row.schema,
-                &row.table,
-                &row.column,
-                &row.tag,
-                &row.value,
-            ];
+            let values = std::iter::once(self.catalog_name.as_str())
+                .chain(row.parts.iter().map(String::as_str))
+                .chain([row.tag.as_str(), row.value.as_str()]);
+            debug_assert_eq!(row.parts.len() + 3, builders.len());
             for (builder, value) in builders.iter_mut().zip(values) {
                 builder.append_value(value);
             }
@@ -505,7 +611,28 @@ mod tests {
 
     use super::*;
 
+    /// (namespace, table, table properties).
+    type TestTable<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str)>);
+
     async fn catalog_with(tables: &[(&str, &str, Option<&str>)]) -> Arc<SessionCatalog> {
+        let tables: Vec<TestTable> = tables
+            .iter()
+            .map(|(ns, table, tags)| {
+                let props = tags
+                    .map(|t| vec![(sqe_core::column_tags::PROP_KEY, t)])
+                    .unwrap_or_default();
+                (*ns, *table, props)
+            })
+            .collect();
+        catalog_with_props(&[], &tables).await
+    }
+
+    /// A memory catalog with `schemas` (namespace, properties) and `tables`
+    /// (namespace, table, table properties).
+    async fn catalog_with_props(
+        schemas: &[(&str, &[(&str, &str)])],
+        tables: &[TestTable<'_>],
+    ) -> Arc<SessionCatalog> {
         let catalog = iceberg::memory::MemoryCatalogBuilder::default()
             .load(
                 "memory",
@@ -513,7 +640,19 @@ mod tests {
             )
             .await
             .unwrap();
-        for (ns, table, tags) in tables {
+        let owned = |props: &[(&str, &str)]| -> HashMap<String, String> {
+            props
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        for (ns, props) in schemas {
+            catalog
+                .create_namespace(&NamespaceIdent::new(ns.to_string()), owned(props))
+                .await
+                .unwrap();
+        }
+        for (ns, table, props) in tables {
             let ns = NamespaceIdent::new(ns.to_string());
             if !catalog.namespace_exists(&ns).await.unwrap() {
                 catalog
@@ -529,11 +668,7 @@ mod tests {
                 ])
                 .build()
                 .unwrap();
-            let properties: HashMap<String, String> = tags
-                .map(|t| {
-                    HashMap::from([(sqe_core::column_tags::PROP_KEY.to_string(), t.to_string())])
-                })
-                .unwrap_or_default();
+            let properties = owned(props);
             catalog
                 .create_table(
                     &ns,
@@ -734,23 +869,162 @@ mod tests {
         assert_eq!(got, vec![vec!["good".to_string()]]);
     }
 
+    const TABLE_TAGS: &str = sqe_core::object_tags::TABLE_PROP_KEY;
+    const SCHEMA_TAGS: &str = sqe_core::object_tags::SCHEMA_PROP_KEY;
+    const COLUMN_TAGS: &str = sqe_core::column_tags::PROP_KEY;
+
     #[tokio::test]
-    async fn object_tag_views_are_empty_with_their_columns() {
+    async fn table_tags_lists_each_tables_own_tags() {
+        let catalog = catalog_with_props(
+            &[],
+            &[
+                (
+                    "sales",
+                    "cards",
+                    vec![
+                        (TABLE_TAGS, r#"["gold",{"owner":"finance"}]"#),
+                        (COLUMN_TAGS, r#"{"card":["pci"]}"#),
+                    ],
+                ),
+                ("sales", "plain", vec![]),
+            ],
+        )
+        .await;
+        let ctx = context(function(catalog));
+        let got = rows(
+            &ctx,
+            "SELECT * FROM sqe_information_schema_tags('table_tags')",
+        )
+        .await;
+        let row = |tag: &str, value: &str| {
+            ["lake", "sales", "cards", tag, value]
+                .map(str::to_string)
+                .to_vec()
+        };
+        assert_eq!(got, vec![row("gold", ""), row("owner", "finance")]);
+    }
+
+    #[tokio::test]
+    async fn table_tags_asks_the_policy_even_without_column_tags() {
+        let catalog = catalog_with_props(
+            &[],
+            &[
+                ("sales", "open", vec![(TABLE_TAGS, r#"["gold"]"#)]),
+                ("hr", "people", vec![(TABLE_TAGS, r#"["gold"]"#)]),
+            ],
+        )
+        .await;
+        let access = TagViewAccess::new(|_catalog, _ns, table, keys| {
+            assert!(keys.is_empty());
+            Box::pin(async move { table != "people" })
+        });
+        let ctx = context(function(catalog).with_access(Some(access)));
+        let got = rows(
+            &ctx,
+            "SELECT table_name FROM sqe_information_schema_tags('table_tags')",
+        )
+        .await;
+        assert_eq!(got, vec![vec!["open".to_string()]]);
+    }
+
+    #[tokio::test]
+    async fn table_tags_leaves_out_a_table_whose_column_tags_are_unreadable() {
+        let catalog = catalog_with_props(
+            &[],
+            &[
+                (
+                    "sales",
+                    "bad",
+                    vec![
+                        (TABLE_TAGS, r#"["gold"]"#),
+                        (COLUMN_TAGS, r#"{"card":[{"a":"1","b":"2"}]}"#),
+                    ],
+                ),
+                ("sales", "good", vec![(TABLE_TAGS, r#"["gold"]"#)]),
+            ],
+        )
+        .await;
+        let ctx = context(function(catalog));
+        let got = rows(
+            &ctx,
+            "SELECT table_name FROM sqe_information_schema_tags('table_tags')",
+        )
+        .await;
+        assert_eq!(got, vec![vec!["good".to_string()]]);
+    }
+
+    #[tokio::test]
+    async fn schema_tags_lists_namespace_tags_and_honours_the_schema_filter() {
+        let catalog = catalog_with_props(
+            &[
+                ("sales", &[(SCHEMA_TAGS, r#"[{"domain":"revenue"}]"#)]),
+                ("hr", &[(SCHEMA_TAGS, r#"["pii"]"#)]),
+                ("bad", &[(SCHEMA_TAGS, "not json")]),
+                ("plain", &[]),
+            ],
+            &[],
+        )
+        .await;
+        let ctx = context(function(catalog));
+        let got = rows(
+            &ctx,
+            "SELECT * FROM sqe_information_schema_tags('schema_tags')",
+        )
+        .await;
+        let row = |schema: &str, tag: &str, value: &str| {
+            ["lake", schema, tag, value].map(str::to_string).to_vec()
+        };
+        assert_eq!(
+            got,
+            vec![row("hr", "pii", ""), row("sales", "domain", "revenue")]
+        );
+
+        let pinned = rows(
+            &ctx,
+            "SELECT tag_name FROM sqe_information_schema_tags('schema_tags') \
+             WHERE schema_name = 'sales'",
+        )
+        .await;
+        assert_eq!(pinned, vec![vec!["domain".to_string()]]);
+
+        let missing = rows(
+            &ctx,
+            "SELECT tag_name FROM sqe_information_schema_tags('schema_tags') \
+             WHERE schema_name = 'nope'",
+        )
+        .await;
+        assert!(missing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn column_tags_ignores_table_tags() {
+        let catalog = catalog_with_props(
+            &[],
+            &[("sales", "cards", vec![(TABLE_TAGS, r#"["gold"]"#)])],
+        )
+        .await;
+        let ctx = context(function(catalog));
+        let got = rows(
+            &ctx,
+            "SELECT * FROM sqe_information_schema_tags('column_tags')",
+        )
+        .await;
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn catalog_tags_is_empty_for_a_catalog_that_is_not_polaris() {
         let catalog = catalog_with(&[("sales", "cards", Some(r#"{"card":["pci"]}"#))]).await;
         let ctx = context(function(catalog));
-        for view in ["catalog_tags", "schema_tags", "table_tags"] {
-            let df = ctx
-                .sql(&format!(
-                    "SELECT * FROM sqe_information_schema_tags('{view}', 'lake')"
-                ))
-                .await
-                .unwrap();
-            assert_eq!(
-                df.schema().fields().len(),
-                TagView::from_name(view).unwrap().schema().fields().len()
-            );
-            assert_eq!(df.count().await.unwrap(), 0, "{view}");
-        }
+        let df = ctx
+            .sql("SELECT * FROM sqe_information_schema_tags('catalog_tags', 'lake')")
+            .await
+            .unwrap();
+        assert_eq!(
+            df.schema().fields().len(),
+            TagView::Catalog.schema().fields().len()
+        );
+        assert_eq!(df.count().await.unwrap(), 0);
     }
 
     #[tokio::test]

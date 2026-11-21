@@ -292,21 +292,21 @@ fn from_sqlite_error(error: SqliteError) -> Error {
 
 fn no_such_namespace_err<T>(namespace: &NamespaceIdent) -> Result<T> {
     Err(Error::new(
-        ErrorKind::Unexpected,
+        ErrorKind::NamespaceNotFound,
         format!("No such namespace: {namespace:?}"),
     ))
 }
 
 fn no_such_table_err<T>(table: &TableIdent) -> Result<T> {
     Err(Error::new(
-        ErrorKind::Unexpected,
+        ErrorKind::TableNotFound,
         format!("No such table: {table:?}"),
     ))
 }
 
 fn table_already_exists_err<T>(table: &TableIdent) -> Result<T> {
     Err(Error::new(
-        ErrorKind::Unexpected,
+        ErrorKind::TableAlreadyExists,
         format!("Table {table:?} already exists"),
     ))
 }
@@ -511,7 +511,7 @@ impl Catalog for SqliteRsCatalog {
     ) -> Result<Namespace> {
         if self.namespace_exists(namespace).await? {
             return Err(Error::new(
-                ErrorKind::Unexpected,
+                ErrorKind::NamespaceAlreadyExists,
                 format!("Namespace {namespace:?} already exists"),
             ));
         }

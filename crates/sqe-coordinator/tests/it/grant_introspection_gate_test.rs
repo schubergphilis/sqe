@@ -1425,6 +1425,75 @@ mod live_tag_maps {
         );
         assert_eq!(r.tags().await.len(), 2);
     }
+
+    /// `(tag_name, tag_value)` rows of a tag view, as the caller sees them.
+    async fn view_tags(r: &Rig, view: &str) -> Vec<(String, String)> {
+        let batches = r
+            .run(
+                "root",
+                &format!(
+                    "SELECT tag_name, tag_value FROM information_schema.{view} \
+                     ORDER BY tag_name"
+                ),
+            )
+            .await
+            .expect("read tag view");
+        let mut out = Vec::new();
+        for batch in batches {
+            let names = arrow::array::as_string_array(batch.column(0));
+            let values = arrow::array::as_string_array(batch.column(1));
+            for i in 0..batch.num_rows() {
+                out.push((names.value(i).to_string(), values.value(i).to_string()));
+            }
+        }
+        out
+    }
+
+    /// #922: a tag written by `ALTER ... SET TAGS` shows in the matching
+    /// `information_schema` view in the next statement, and an `UNSET`
+    /// takes it out again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn object_tags_read_back_through_the_tag_views() {
+        let r = Rig::new(TagAuthority::AdminRole, ColumnGrants(vec![])).await;
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+
+        r.run(
+            "root",
+            "ALTER TABLE t SET TAGS ('gold', 'owner' = 'finance')",
+        )
+        .await
+        .expect("set table tags");
+        assert_eq!(
+            view_tags(&r, "table_tags").await,
+            vec![pair("gold", ""), pair("owner", "finance")]
+        );
+        r.run("root", "ALTER TABLE t UNSET TAGS ('gold')")
+            .await
+            .expect("unset table tag");
+        assert_eq!(
+            view_tags(&r, "table_tags").await,
+            vec![pair("owner", "finance")]
+        );
+
+        let schema = r.rig.session().default_schema.unwrap();
+        r.run(
+            "root",
+            &format!("ALTER SCHEMA \"{schema}\" SET TAGS ('domain' = 'hr')"),
+        )
+        .await
+        .expect("set schema tags");
+        assert_eq!(
+            view_tags(&r, "schema_tags").await,
+            vec![pair("domain", "hr")]
+        );
+        r.run(
+            "root",
+            &format!("ALTER SCHEMA \"{schema}\" UNSET TAGS ('domain')"),
+        )
+        .await
+        .expect("unset schema tag");
+        assert!(view_tags(&r, "schema_tags").await.is_empty());
+    }
 }
 
 // ---------------------------------------------------------------------------

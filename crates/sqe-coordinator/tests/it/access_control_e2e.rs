@@ -4071,13 +4071,25 @@ async fn show_schemas_describes_the_catalog_it_names() {
         "the error must name the catalog asked for, got: {err}"
     );
     // Trino's answer, for a catalog that is missing or not visible alike.
-    assert_eq!(err.error_code(), sqe_core::SqeErrorCode::CatalogNotFound, "{err}");
-    assert!(err.to_string().contains("Catalog 'no_such_wh' does not exist"), "{err}");
+    assert_eq!(
+        err.error_code(),
+        sqe_core::SqeErrorCode::CatalogNotFound,
+        "{err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("Catalog 'no_such_wh' does not exist"),
+        "{err}"
+    );
 
     // LIKE narrows the named catalog's schemas; dbt-trino checks existence
     // this way, and the pattern used to be dropped (every schema matched).
     let sales_like = schemas("SHOW SCHEMAS FROM sales_wh LIKE 'only_in%'").await;
-    assert_eq!(sales_like, vec!["only_in_sales".to_string()], "{sales_like:?}");
+    assert_eq!(
+        sales_like,
+        vec!["only_in_sales".to_string()],
+        "{sales_like:?}"
+    );
     let ops_in_sales = schemas("SHOW SCHEMAS FROM sales_wh LIKE 'only_in_ops'").await;
     assert!(ops_in_sales.is_empty(), "{ops_in_sales:?}");
     let ops_like = schemas("SHOW SCHEMAS IN ops_wh LIKE 'only_in_%'").await;
@@ -6476,10 +6488,30 @@ async fn ops_wh_catalog_tags(who: &Session) -> Option<String> {
         .remove(sqe_core::object_tags::CATALOG_PROP_KEY)
 }
 
+/// `ops_wh.information_schema.catalog_tags` as `who` reads it, one
+/// `name=value` per row.
+async fn ops_wh_catalog_tag_rows(
+    ctx: &AcCtx,
+    who: &Session,
+) -> Result<Vec<String>, sqe_core::SqeError> {
+    let sql = "SELECT tag_name, tag_value FROM ops_wh.information_schema.catalog_tags \
+               ORDER BY tag_name";
+    let batches = ctx.handler.execute(who, sql, None).await?;
+    let names = col_strings(&batches, "tag_name");
+    let values = col_strings(&batches, "tag_value");
+    Ok(names
+        .into_iter()
+        .zip(values)
+        .map(|(n, v)| format!("{n}={v}"))
+        .collect())
+}
+
 /// Catalog tags (#922) go to the Polaris management API on the caller's own
 /// token. carol (`sqe_admin`, catalog-properties write in Polaris) writes
-/// them; under `ranger-delegate` SQE lets alice through to Polaris, which
-/// refuses her because she can read the catalog but not change it.
+/// them and reads them back through `information_schema.catalog_tags`.
+/// alice can read the catalog but not change it: she sees the same rows,
+/// and under `ranger-delegate` SQE lets her write through to Polaris, which
+/// refuses her.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn catalog_tags_are_written_through_polaris_on_the_callers_token() {
@@ -6494,6 +6526,8 @@ async fn catalog_tags_are_written_through_polaris_on_the_callers_token() {
     )
     .await;
     let tagged = ops_wh_catalog_tags(&ctx.carol).await;
+    let carol_view = ops_wh_catalog_tag_rows(&ctx, &ctx.carol).await;
+    let alice_view = ops_wh_catalog_tag_rows(&ctx, &ctx.alice).await;
 
     let (delegate, _cache) =
         crate::common::setup_ranger_handler_audited(Some(ctx.cache.clone()), None, |c| {
@@ -6513,11 +6547,21 @@ async fn catalog_tags_are_written_through_polaris_on_the_callers_token() {
     )
     .await;
     let cleared = ops_wh_catalog_tags(&ctx.carol).await;
+    let cleared_view = ops_wh_catalog_tag_rows(&ctx, &ctx.carol).await;
 
     assert_eq!(
         tagged.as_deref(),
         Some(r#"["gold",{"region":"eu"}]"#),
         "before: {before:?}"
+    );
+    let expected = vec!["gold=".to_string(), "region=eu".to_string()];
+    assert_eq!(carol_view.expect("carol reads catalog_tags"), expected);
+    // Reading the tags takes only what Polaris needs to read the catalog
+    // entity, which alice has; she cannot change them.
+    assert_eq!(alice_view.expect("alice reads catalog_tags"), expected);
+    assert_eq!(
+        cleared_view.expect("carol reads catalog_tags"),
+        Vec::<String>::new()
     );
     let err = denied.expect_err("Polaris must refuse alice's catalog update");
     assert!(

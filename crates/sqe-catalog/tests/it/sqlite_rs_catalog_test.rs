@@ -155,7 +155,10 @@ async fn namespaces_and_tables_roundtrip_and_persist_across_reopen() {
         assert!(catalog.create_table(&ns, creation("orders")).await.is_err());
 
         let loaded = catalog.load_table(&ident).await.unwrap();
-        assert_eq!(loaded.metadata().current_schema().as_ref(), &simple_schema());
+        assert_eq!(
+            loaded.metadata().current_schema().as_ref(),
+            &simple_schema()
+        );
 
         let renamed = TableIdent::new(ns.clone(), "orders_v2".to_string());
         catalog.rename_table(&ident, &renamed).await.unwrap();
@@ -169,15 +172,25 @@ async fn namespaces_and_tables_roundtrip_and_persist_across_reopen() {
     // Fresh process-equivalent: the worker thread went away with the last
     // handle; a new open reads what was committed.
     let catalog = open(dir.path()).await;
-    assert_eq!(catalog.list_namespaces(None).await.unwrap(), vec![ns.clone()]);
+    assert_eq!(
+        catalog.list_namespaces(None).await.unwrap(),
+        vec![ns.clone()]
+    );
     let renamed = TableIdent::new(ns.clone(), "orders_v2".to_string());
-    assert_eq!(catalog.list_tables(&ns).await.unwrap(), vec![renamed.clone()]);
+    assert_eq!(
+        catalog.list_tables(&ns).await.unwrap(),
+        vec![renamed.clone()]
+    );
 
     catalog.drop_table(&renamed).await.unwrap();
-    assert!(matches!(
-        catalog.load_table(&renamed).await,
-        Err(e) if e.message().contains("No such table")
-    ));
+    // TableNotFound, as upstream's sql catalog says: the schema provider
+    // reads only that kind as "no such table", and DataFusion looks up a
+    // table function's name as a table before it calls the function.
+    let Err(e) = catalog.load_table(&renamed).await else {
+        panic!("a dropped table loaded");
+    };
+    assert!(e.message().contains("No such table"), "{e}");
+    assert_eq!(e.kind(), iceberg::ErrorKind::TableNotFound);
     catalog.drop_namespace(&ns).await.unwrap();
     assert!(!catalog.namespace_exists(&ns).await.unwrap());
     assert_oracle_ok(&db(dir.path()));
@@ -320,7 +333,10 @@ async fn a_file_written_by_the_sqlx_path_roundtrips_through_sqlite_rs() {
                 SQL_CATALOG_PROP_URI.to_string(),
                 format!("sqlite://{}?mode=rwc", db(dir.path()).display()),
             ),
-            (SQL_CATALOG_PROP_WAREHOUSE.to_string(), warehouse(dir.path())),
+            (
+                SQL_CATALOG_PROP_WAREHOUSE.to_string(),
+                warehouse(dir.path()),
+            ),
         ]);
         SqlCatalogBuilder::default()
             .with_storage_factory(sqe_catalog::storage_factory())
@@ -358,7 +374,10 @@ async fn a_file_written_by_the_sqlx_path_roundtrips_through_sqlite_rs() {
         let orders = TableIdent::new(ns.clone(), "orders".to_string());
         assert_eq!(rs.list_tables(&ns).await.unwrap(), vec![orders.clone()]);
         let loaded = rs.load_table(&orders).await.unwrap();
-        assert_eq!(loaded.metadata().current_schema().as_ref(), &simple_schema());
+        assert_eq!(
+            loaded.metadata().current_schema().as_ref(),
+            &simple_schema()
+        );
 
         rs.create_table(&ns, creation("customers")).await.unwrap();
         // Uniqueness is enforced through the recovered autoindex.
