@@ -573,7 +573,7 @@ impl PolicyPlanRewriter {
                                     database: None,
                                     schema: None,
                                 };
-                                merge_tag_masks(
+                                let conflicts = merge_tag_masks(
                                     &mut policy,
                                     &col_tags,
                                     &tag_masks_by_tag,
@@ -582,6 +582,18 @@ impl PolicyPlanRewriter {
                                     &identity,
                                     self.mask_precedence,
                                 );
+                                // `refuse` precedence: policies that disagree
+                                // fail the statement before any row is read
+                                // (#918).
+                                if let Some(conflict) = conflicts.first() {
+                                    warn!(
+                                        user = %username,
+                                        table = %table_name,
+                                        conflict = ?conflict,
+                                        "Conflicting policies; refusing the statement"
+                                    );
+                                    return Err(conflict.to_error(&table_ref.to_string()));
+                                }
                             }
                         }
                         // Known: no tags on this table. Proceed with the
@@ -963,7 +975,7 @@ pub async fn resolve_effective_policy(
             database: None,
             schema: None,
         };
-        merge_tag_masks(
+        let conflicts = merge_tag_masks(
             &mut policy,
             col_tags,
             &tag_masks_by_tag,
@@ -972,6 +984,13 @@ pub async fn resolve_effective_policy(
             &identity,
             precedence,
         );
+        // A statement on this table is refused (#918); the callers here only
+        // read the policy, so they see it denied, fail closed.
+        if !conflicts.is_empty() {
+            let mut deny = ResolvedPolicy::default();
+            deny.row_filters.push(lit(false));
+            return deny;
+        }
     }
 
     policy
@@ -1004,6 +1023,10 @@ pub async fn resolve_effective_policy(
 ///    parsed as a SQL expression via `parse_sql_predicate`. On success the column
 ///    receives `MaskType::Custom(expr)`. On any parse failure the column is
 ///    restricted (fail-closed).
+///
+/// Under [`MaskPrecedence::Refuse`](sqe_core::config::MaskPrecedence::Refuse)
+/// nothing wins: see [`merge_tag_masks_refusing`]. The returned conflicts are
+/// empty under every other precedence.
 pub(crate) fn merge_tag_masks(
     policy: &mut ResolvedPolicy,
     col_tags: &HashMap<String, Vec<String>>,
@@ -1012,7 +1035,17 @@ pub(crate) fn merge_tag_masks(
     unmappable_tags: &HashSet<String>,
     identity: &SessionIdentity,
     precedence: sqe_core::config::MaskPrecedence,
-) {
+) -> Vec<PolicyConflict> {
+    if precedence == sqe_core::config::MaskPrecedence::Refuse {
+        return merge_tag_masks_refusing(
+            policy,
+            col_tags,
+            tag_masks_by_tag,
+            tag_filters,
+            unmappable_tags,
+            identity,
+        );
+    }
     for (column, tags) in col_tags {
         // Restricted columns always win — tag cannot un-restrict. This is not
         // configurable: restriction means SQE could not establish a safe value
@@ -1102,6 +1135,127 @@ pub(crate) fn merge_tag_masks(
     }
     // Tag row filters AND with resource row filters (most restrictive).
     policy.row_filters.extend(tag_filters);
+    Vec::new()
+}
+
+/// A column or table for which policies resolve to different answers under
+/// [`MaskPrecedence::Refuse`](sqe_core::config::MaskPrecedence::Refuse).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PolicyConflict {
+    /// Two different masks resolve for this column.
+    Mask(String),
+    /// Tag row filters and a different filter resolve for the table.
+    RowFilter,
+}
+
+impl PolicyConflict {
+    /// The statement error for this conflict on `table` (the qualified name).
+    pub fn to_error(&self, table: &str) -> sqe_core::error::SqeError {
+        let message = match self {
+            Self::Mask(column) => format!(
+                "mask conflict on {table}.{column}: more than one distinct column mask \
+                 applies to this column for this user"
+            ),
+            Self::RowFilter => format!(
+                "row filter conflict on {table}: more than one distinct row filter \
+                 applies to this table for this user"
+            ),
+        };
+        sqe_core::error::SqeError::with_code(sqe_core::SqeErrorCode::AccessDenied, message)
+    }
+}
+
+/// `merge_tag_masks` under `Refuse` (#918): every mask that resolves for a
+/// column (its resource mask and each of its tags' masks) is collected, and
+/// so is every row filter once a tag contributes one. One distinct mask (or
+/// filter) applies as usual; the same mask from two sources is one mask.
+/// More than one is a conflict: the column is restricted as well, so a
+/// caller that only reads the policy (metadata, `SHOW STATS`) fails closed.
+///
+/// The fail-closed rules of the other modes hold: a restricted column stays
+/// restricted, an unmappable tag on a column with no resource mask restricts
+/// it, and a CUSTOM template that does not parse restricts the column when
+/// nothing else masks it (and is otherwise ignored, as under `Tag`).
+fn merge_tag_masks_refusing(
+    policy: &mut ResolvedPolicy,
+    col_tags: &HashMap<String, Vec<String>>,
+    tag_masks_by_tag: &HashMap<String, TagMaskSpec>,
+    tag_filters: Vec<datafusion::logical_expr::Expr>,
+    unmappable_tags: &HashSet<String>,
+    identity: &SessionIdentity,
+) -> Vec<PolicyConflict> {
+    let mut conflicts = Vec::new();
+    for (column, tags) in col_tags {
+        if policy.is_restricted(column) {
+            continue;
+        }
+        let resource_mask = policy.mask_for(column).cloned();
+        if resource_mask.is_none() && tags.iter().any(|t| unmappable_tags.contains(t)) {
+            policy.restricted_columns.push(column.clone());
+            continue;
+        }
+        let mut masks: Vec<MaskType> = resource_mask.into_iter().collect();
+        let mut broken = false;
+        for tag in tags {
+            let mask = match tag_masks_by_tag.get(tag) {
+                Some(TagMaskSpec::Ready(mask)) => mask.clone(),
+                Some(TagMaskSpec::Custom(template)) => {
+                    match parse_sql_predicate(&template.replace("{col}", column), identity) {
+                        Ok(expr) => MaskType::Custom(expr),
+                        Err(e) => {
+                            warn!(
+                                column = %column,
+                                tag = %tag,
+                                error = %e,
+                                "CUSTOM tag mask expression failed to parse"
+                            );
+                            broken = true;
+                            continue;
+                        }
+                    }
+                }
+                None => continue,
+            };
+            if !masks.contains(&mask) {
+                masks.push(mask);
+            }
+        }
+        match masks.as_slice() {
+            [] if broken => policy.restricted_columns.push(column.clone()),
+            [] => {}
+            [mask] => {
+                policy.column_masks.insert(column.clone(), mask.clone());
+            }
+            [_, _, ..] => {
+                policy.column_masks.remove(column);
+                policy.restricted_columns.push(column.clone());
+                conflicts.push(PolicyConflict::Mask(column.clone()));
+            }
+        }
+    }
+
+    // Row filters: the deny-all sentinel is not a filter a policy chose, so it
+    // is kept as is and never counted.
+    if !tag_filters.is_empty() {
+        let (mut sentinels, mut filters): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut policy.row_filters)
+                .into_iter()
+                .partition(is_deny_all_expr);
+        for f in tag_filters {
+            if is_deny_all_expr(&f) {
+                sentinels.push(f);
+            } else if !filters.contains(&f) {
+                filters.push(f);
+            }
+        }
+        if filters.len() > 1 {
+            conflicts.push(PolicyConflict::RowFilter);
+        }
+        policy.row_filters = sentinels;
+        policy.row_filters.extend(filters);
+    }
+    conflicts.sort();
+    conflicts
 }
 
 /// Derive the `(namespace, table)` policy key from a structured DataFusion
@@ -1932,6 +2086,61 @@ mod tests {
             !policy.restricted_columns.contains(&"email".to_string()),
             "column with a valid CUSTOM mask must NOT be restricted"
         );
+    }
+
+    #[test]
+    fn merge_tag_masks_refuse_same_custom_mask_from_two_tags_is_one_mask() {
+        let mut policy = ResolvedPolicy::default();
+        let col_tags = make_col_tags(&[("email", &["PII", "CONTACT"]), ("ssn", &["PII", "GOV"])]);
+        let mut tag_masks: HashMap<String, TagMaskSpec> = HashMap::new();
+        let template = TagMaskSpec::Custom("concat('***', {col})".to_string());
+        tag_masks.insert("PII".to_string(), template.clone());
+        tag_masks.insert("CONTACT".to_string(), template);
+        tag_masks.insert("GOV".to_string(), TagMaskSpec::Ready(MaskType::Nullify));
+        let conflicts = merge_tag_masks(
+            &mut policy,
+            &col_tags,
+            &tag_masks,
+            vec![],
+            &no_unmappable(),
+            &default_identity(),
+            MaskPrecedence::Refuse,
+        );
+        assert_eq!(conflicts, vec![PolicyConflict::Mask("ssn".to_string())]);
+        assert!(matches!(
+            policy.column_masks.get("email"),
+            Some(MaskType::Custom(_))
+        ));
+        assert!(
+            policy.is_restricted("ssn"),
+            "a contested column fails closed"
+        );
+        assert!(!policy.column_masks.contains_key("ssn"));
+    }
+
+    #[test]
+    fn merge_tag_masks_refuse_keeps_the_fail_closed_rules() {
+        let mut policy = ResolvedPolicy::default();
+        let col_tags = make_col_tags(&[("email", &["BROKEN"]), ("ssn", &["SECRET"])]);
+        let mut tag_masks: HashMap<String, TagMaskSpec> = HashMap::new();
+        tag_masks.insert(
+            "BROKEN".to_string(),
+            TagMaskSpec::Custom("concat('***', {col}".to_string()),
+        );
+        let unmappable: HashSet<String> = ["SECRET".to_string()].into();
+        let conflicts = merge_tag_masks(
+            &mut policy,
+            &col_tags,
+            &tag_masks,
+            vec![lit(false)],
+            &unmappable,
+            &default_identity(),
+            MaskPrecedence::Refuse,
+        );
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert!(policy.is_restricted("email"), "a broken template restricts");
+        assert!(policy.is_restricted("ssn"), "an unmappable tag restricts");
+        assert!(policy_denies_all(&policy), "the deny-all sentinel is kept");
     }
 
     #[test]

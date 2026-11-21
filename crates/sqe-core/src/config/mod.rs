@@ -2558,6 +2558,12 @@ pub enum MaskPrecedence {
     Tag,
     /// Resource mask wins. The most-specific-rule reading.
     Resource,
+    /// No winner: a column for which two different masks resolve, or a
+    /// table for which tag row filters and a different filter resolve, fails
+    /// the statement with a named conflict error before any row is read
+    /// (#918). The same mask or filter from two sources is not a conflict.
+    /// Matches Unity Catalog's one-mask-per-column, one-filter-per-table rule.
+    Refuse,
 }
 
 /// Fine-grained policy engine backed by a `hive`-type Apache Ranger service.

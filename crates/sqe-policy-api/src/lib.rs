@@ -117,7 +117,7 @@ pub fn wildcard_match(pattern: &str, target: &str) -> bool {
 }
 
 /// Types of column masking supported.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MaskType {
     /// Replace with NULL
     Nullify,
