@@ -1005,12 +1005,12 @@ async fn ctas_replace_in_place_sets_tblproperties_894() {
     let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {fq}")).await;
 }
 
-/// `(column, tag)` rows of `SHOW TAGS ON table`.
+/// `(column, tag, value)` rows of `SHOW TAGS ON table`.
 async fn show_tags(
     handler: &sqe_coordinator::QueryHandler,
     session: &sqe_core::Session,
     table: &str,
-) -> Vec<(String, String)> {
+) -> Vec<(String, String, String)> {
     let batches = exec(handler, session, &format!("SHOW TAGS ON {table}")).await;
     let mut rows = Vec::new();
     for b in &batches {
@@ -1021,7 +1021,8 @@ async fn show_tags(
                 .expect("utf8")
         };
         for r in 0..b.num_rows() {
-            rows.push((col(0).value(r).to_string(), col(1).value(r).to_string()));
+            let cell = |i: usize| col(i).value(r).to_string();
+            rows.push((cell(0), cell(1), cell(2)));
         }
     }
     rows
@@ -1062,7 +1063,7 @@ async fn ctas_replace_with_a_new_schema_keeps_properties_and_tags_896() {
     let tagged: Vec<String> = show_tags(&handler, &session, fq)
         .await
         .into_iter()
-        .map(|(c, _)| c)
+        .map(|(c, ..)| c)
         .collect();
     assert_eq!(tagged, ["email", "gone"], "tags set");
 
@@ -1081,6 +1082,37 @@ async fn ctas_replace_with_a_new_schema_keeps_properties_and_tags_896() {
         assert!(ddl.contains(&want), "missing {want}: {ddl}");
     }
     assert!(ddl.contains("extra"), "the new schema: {ddl}");
+
+    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {fq}")).await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SHOW TAGS lists each tag's value (#923). A key-only tag shows an empty
+// value, the form `information_schema.column_tags` uses.
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn show_tags_lists_tag_values_923() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let fq = "default.show_tags_values_923";
+
+    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {fq}")).await;
+    let create = format!("CREATE TABLE {fq} AS SELECT 1 AS id, '123-45-6789' AS ssn");
+    exec(&handler, &session, &create).await;
+    // SET TAGS is admin-only; same token, with an admin role.
+    let admin = sqe_core::Session::new(
+        "root".to_string(),
+        session.access_token().clone(),
+        None,
+        chrono::Utc::now() + chrono::Duration::hours(1),
+        vec!["service_admin".to_string()],
+    );
+    let set = format!("ALTER TABLE {fq} ALTER COLUMN ssn SET TAGS ('pii_923' = 'ssn', 'gdpr_923')");
+    exec(&handler, &admin, &set).await;
+
+    let row = |t: &str, v: &str| ("ssn".to_string(), t.to_string(), v.to_string());
+    let want = vec![row("gdpr_923", ""), row("pii_923", "ssn")];
+    assert_eq!(show_tags(&handler, &session, fq).await, want);
 
     let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {fq}")).await;
 }
