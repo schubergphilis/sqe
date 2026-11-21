@@ -346,6 +346,27 @@ pub trait PolicyStore: Send + Sync {
         Ok(false)
     }
 
+    /// The tag names the policy engine holds a definition for, used to refuse
+    /// a tag write naming an undefined tag (`[access_control] tag_names =
+    /// "ranger-tagdefs"`). With `fresh` the backend re-reads its source instead
+    /// of answering from a cache: the caller asks again that way before it
+    /// refuses a name, so a tag defined a moment ago is not refused for a TTL.
+    ///
+    /// The default is an error: a backend that cannot list tag definitions
+    /// defines nothing, and the caller refuses (fails closed). Only the Ranger
+    /// store overrides it.
+    async fn tag_definitions(
+        &self,
+        _fresh: bool,
+    ) -> sqe_core::Result<std::sync::Arc<HashSet<String>>> {
+        Err(sqe_core::SqeError::with_code(
+            sqe_core::SqeErrorCode::ExecutionFailed,
+            "the configured policy backend cannot list tag definitions; \
+             [access_control] tag_names = \"ranger-tagdefs\" needs [policy] engine = \"ranger\""
+                .to_string(),
+        ))
+    }
+
     /// Create or replace a fine-grained row-filter / column-mask policy.
     async fn create_policy(
         &self,

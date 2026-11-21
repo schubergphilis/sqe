@@ -865,6 +865,324 @@ async fn admin_role_mode_is_unchanged_but_sees_extra_properties() {
     assert_passed_tag_gate(handler.execute(&alice, sql, None).await, sql);
 }
 
+// ---------------------------------------------------------------------------
+// #926 - tag_names = "ranger-tagdefs": refuse undefined tag names
+// ---------------------------------------------------------------------------
+
+/// Column grants plus a tag-definition list. `defs: None` is a backend whose
+/// list cannot be read; `late` is defined only on a fresh read (a tag the
+/// portal defined after the list was cached).
+#[derive(Default)]
+struct Tagdefs {
+    grants: ColumnGrants,
+    defs: Option<Vec<&'static str>>,
+    late: Option<&'static str>,
+    scoped: bool,
+    reads: AtomicU32,
+    fresh_reads: AtomicU32,
+}
+
+#[async_trait]
+impl PolicyStore for Tagdefs {
+    async fn resolve(
+        &self,
+        _user: &SessionUser,
+        _table_name: &str,
+        _namespace: &str,
+    ) -> sqe_core::Result<ResolvedPolicy> {
+        Ok(ResolvedPolicy::default())
+    }
+
+    fn invalidate_all(&self) {}
+
+    fn catalog_scoped(&self) -> bool {
+        self.scoped
+    }
+
+    async fn grants_column_privilege(
+        &self,
+        user: &SessionUser,
+        table_name: &str,
+        namespace: &str,
+        column: &str,
+        privilege: sqe_policy::TablePrivilege,
+    ) -> sqe_core::Result<bool> {
+        self.grants
+            .grants_column_privilege(user, table_name, namespace, column, privilege)
+            .await
+    }
+
+    async fn tag_definitions(
+        &self,
+        fresh: bool,
+    ) -> sqe_core::Result<Arc<std::collections::HashSet<String>>> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        if fresh {
+            self.fresh_reads.fetch_add(1, Ordering::SeqCst);
+        }
+        let defs = self.defs.as_ref().ok_or_else(|| {
+            sqe_core::SqeError::Execution(
+                "could not read the Ranger tag definitions: HTTP 503".into(),
+            )
+        })?;
+        let mut out: std::collections::HashSet<String> =
+            defs.iter().map(|d| d.to_string()).collect();
+        if fresh {
+            out.extend(self.late.map(String::from));
+        }
+        Ok(Arc::new(out))
+    }
+}
+
+/// A handler with `tag_names = "ranger-tagdefs"` and `authority` over `store`.
+fn tagdef_handler(store: Arc<Tagdefs>, authority: sqe_core::config::TagAuthority) -> QueryHandler {
+    let mut config = minimal_config();
+    config.access_control.tag_names = sqe_core::config::TagNames::RangerTagdefs;
+    tag_handler(
+        config,
+        store,
+        authority,
+        sqe_core::config::TagPrivilege::Alter,
+    )
+}
+
+fn steward_tagdefs(defs: Option<Vec<&'static str>>) -> Tagdefs {
+    use sqe_policy::TablePrivilege::Alter;
+    Tagdefs {
+        grants: ColumnGrants(vec![("steward", "ssn", Alter)]),
+        defs,
+        ..Default::default()
+    }
+}
+
+/// Got past both the privilege and the name check.
+fn assert_passed_name_check(res: sqe_core::Result<Vec<arrow_array::RecordBatch>>, sql: &str) {
+    if let Err(e) = &res {
+        assert!(!e.to_string().contains("not defined"), "{sql}: {e}");
+        assert!(!e.to_string().contains("tag names"), "{sql}: {e}");
+    }
+    assert_passed_tag_gate(res, sql);
+}
+
+fn assert_undefined(res: sqe_core::Result<Vec<arrow_array::RecordBatch>>, sql: &str, tag: &str) {
+    let e = res.expect_err("an undefined tag must be refused");
+    assert!(
+        e.to_string()
+            .contains(&format!("tag '{tag}' is not defined in Ranger")),
+        "{sql}: {e}"
+    );
+    assert!(
+        !e.to_string().contains("403"),
+        "{sql}: a name error, not a denial: {e}"
+    );
+}
+
+#[tokio::test]
+async fn tag_names_refuses_an_undefined_tag_and_accepts_a_defined_one() {
+    use sqe_core::config::TagAuthority::RangerDelegate;
+    let store = Arc::new(steward_tagdefs(Some(vec!["live.pii", "PII"])));
+    let handler = tagdef_handler(store.clone(), RangerDelegate);
+    let steward = session_for("steward", vec!["analyst"]);
+
+    let sql = "ALTER TABLE ns.tbl SET TAGS (ssn = ('live.pi'))";
+    assert_undefined(handler.execute(&steward, sql, None).await, sql, "live.pi");
+    // A cached miss is re-read once before the refusal.
+    assert_eq!(store.fresh_reads.load(Ordering::SeqCst), 1);
+
+    for sql in [
+        "ALTER TABLE ns.tbl SET TAGS (ssn = ('live.pii'))",
+        "ALTER TABLE ns.tbl ALTER COLUMN ssn SET TAGS ('live.pii' = 'high', 'PII')",
+        "ALTER TABLE ns.tbl MODIFY COLUMN ssn SET TAG live.pii = 'x'",
+    ] {
+        assert_passed_name_check(handler.execute(&steward, sql, None).await, sql);
+    }
+    // The native list has no value syntax: refused by the parser, not stored
+    // (and name-checked) as the key `live.pii' = 'high`.
+    let sql = "ALTER TABLE ns.tbl SET TAGS (ssn = ('live.pii' = 'high', 'PII'))";
+    let err = handler.execute(&steward, sql, None).await.expect_err(sql);
+    assert!(
+        err.to_string().contains("takes tag names only"),
+        "{sql}: {err}"
+    );
+    // Exact match: tag names are case-sensitive, as tag policies match them.
+    let sql = "ALTER TABLE ns.tbl SET TAGS (ssn = ('pii'))";
+    assert_undefined(handler.execute(&steward, sql, None).await, sql, "pii");
+    // One undefined name in the list refuses the statement.
+    let sql = "ALTER TABLE ns.tbl SET TAGS (ssn = ('PII', 'live.pi'))";
+    assert_undefined(handler.execute(&steward, sql, None).await, sql, "live.pi");
+}
+
+#[tokio::test]
+async fn tag_names_accepts_a_tag_defined_since_the_list_was_cached() {
+    let store = Arc::new(Tagdefs {
+        late: Some("live.new"),
+        ..steward_tagdefs(Some(vec!["PII"]))
+    });
+    let handler = tagdef_handler(
+        store.clone(),
+        sqe_core::config::TagAuthority::RangerDelegate,
+    );
+    let steward = session_for("steward", vec!["analyst"]);
+    let sql = "ALTER TABLE ns.tbl SET TAGS (ssn = ('live.new'))";
+    assert_passed_name_check(handler.execute(&steward, sql, None).await, sql);
+    assert_eq!(store.fresh_reads.load(Ordering::SeqCst), 1);
+    // A defined name is answered from the cached list alone.
+    let sql = "ALTER TABLE ns.tbl SET TAGS (ssn = ('PII'))";
+    assert_passed_name_check(handler.execute(&steward, sql, None).await, sql);
+    assert_eq!(store.fresh_reads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn tag_names_fails_closed_but_never_blocks_an_untag() {
+    use sqe_core::config::TagAuthority::RangerDelegate;
+    // The list cannot be read.
+    let store = Arc::new(steward_tagdefs(None));
+    let handler = tagdef_handler(store.clone(), RangerDelegate);
+    let steward = session_for("steward", vec!["analyst"]);
+    let sql = "ALTER TABLE ns.tbl SET TAGS (ssn = ('PII'))";
+    let err = handler
+        .execute(&steward, sql, None)
+        .await
+        .expect_err("fail closed");
+    assert!(err.to_string().contains("403 Forbidden"), "{err}");
+    assert!(
+        err.to_string().contains("cannot check the tag names"),
+        "{err}"
+    );
+    // Removing a tag names nothing new, so it needs no list.
+    for sql in [
+        "ALTER TABLE ns.tbl UNSET TAGS (ssn)",
+        "ALTER TABLE ns.tbl UNSET TAGS (ssn = ('PII'))",
+        "ALTER TABLE ns.tbl MODIFY COLUMN ssn UNSET MASKING POLICY",
+    ] {
+        assert_passed_name_check(handler.execute(&steward, sql, None).await, sql);
+    }
+    assert_eq!(
+        store.reads.load(Ordering::SeqCst),
+        1,
+        "only the SET read the list"
+    );
+
+    // A backend without tag definitions (the trait default) refuses too.
+    use sqe_policy::TablePrivilege::Alter;
+    let handler = {
+        let mut config = minimal_config();
+        config.access_control.tag_names = sqe_core::config::TagNames::RangerTagdefs;
+        tag_handler(
+            config,
+            Arc::new(ColumnGrants(vec![("steward", "ssn", Alter)])),
+            RangerDelegate,
+            sqe_core::config::TagPrivilege::Alter,
+        )
+    };
+    let sql = "ALTER TABLE ns.tbl SET TAGS (ssn = ('PII'))";
+    let err = handler
+        .execute(&steward, sql, None)
+        .await
+        .expect_err("fail closed");
+    assert!(
+        err.to_string().contains("cannot list tag definitions"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn tag_names_exempts_admins_and_checks_only_after_the_privilege() {
+    use sqe_core::config::TagAuthority::RangerDelegate;
+    let store = Arc::new(steward_tagdefs(None));
+    let handler = tagdef_handler(store.clone(), RangerDelegate);
+    // An admin is not checked, even with an unreadable list.
+    let root = session_for("root", vec!["service_admin"]);
+    let sql = "ALTER TABLE ns.tbl SET TAGS (ssn = ('anything.at.all'))";
+    assert_passed_name_check(handler.execute(&root, sql, None).await, sql);
+    // A caller without the privilege is refused for that, before the list is
+    // read: the refusal tells them nothing about which tags exist.
+    let mallory = session_for("mallory", vec!["analyst"]);
+    let err = handler
+        .execute(&mallory, sql, None)
+        .await
+        .expect_err("refused");
+    assert!(
+        err.to_string().contains("requires alter on ns.tbl.ssn"),
+        "{err}"
+    );
+    assert_eq!(store.reads.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn tag_names_any_is_the_default_and_reads_nothing() {
+    let store = Arc::new(steward_tagdefs(None));
+    let handler = tag_handler(
+        minimal_config(),
+        store.clone(),
+        sqe_core::config::TagAuthority::RangerDelegate,
+        sqe_core::config::TagPrivilege::Alter,
+    );
+    let steward = session_for("steward", vec!["analyst"]);
+    let sql = "ALTER TABLE ns.tbl SET TAGS (ssn = ('live.pi'))";
+    assert_passed_name_check(handler.execute(&steward, sql, None).await, sql);
+    assert_eq!(store.reads.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn tag_names_under_catalog_scoped_accepts_the_catalog_qualified_definition() {
+    use sqe_core::config::TagAuthority::RangerDelegate;
+    let steward = session_for("steward", vec!["analyst"]);
+    let store = Arc::new(Tagdefs {
+        scoped: true,
+        ..steward_tagdefs(Some(vec!["sales.pii", "PII"]))
+    });
+    let handler = tagdef_handler(store, RangerDelegate);
+    // `sales.pii` defines `pii` in catalog `sales`...
+    let sql = "ALTER TABLE sales.ns.tbl SET TAGS (ssn = ('pii'))";
+    assert_passed_name_check(handler.execute(&steward, sql, None).await, sql);
+    // ...and not in another catalog.
+    let sql = "ALTER TABLE ops.ns.tbl SET TAGS (ssn = ('pii'))";
+    assert_undefined(handler.execute(&steward, sql, None).await, sql, "pii");
+    // A bare definition still defines the tag in every catalog.
+    for sql in [
+        "ALTER TABLE sales.ns.tbl SET TAGS (ssn = ('PII'))",
+        "ALTER TABLE ops.ns.tbl SET TAGS (ssn = ('PII'))",
+    ] {
+        assert_passed_name_check(handler.execute(&steward, sql, None).await, sql);
+    }
+    // The qualified name itself is a defined tag, as any name in the list is.
+    let sql = "ALTER TABLE ops.ns.tbl SET TAGS (ssn = ('sales.pii'))";
+    assert_passed_name_check(handler.execute(&steward, sql, None).await, sql);
+
+    // Without catalog_scoped a qualified definition defines only itself.
+    let store = Arc::new(steward_tagdefs(Some(vec!["sales.pii"])));
+    let handler = tagdef_handler(store, RangerDelegate);
+    let sql = "ALTER TABLE sales.ns.tbl SET TAGS (ssn = ('pii'))";
+    assert_undefined(handler.execute(&steward, sql, None).await, sql, "pii");
+}
+
+#[tokio::test]
+async fn tag_names_checks_the_tags_a_new_table_names() {
+    use sqe_core::config::TagAuthority::{AdminRole, RangerDelegate};
+    let ok =
+        r#"CREATE TABLE ns.tbl (ssn INT) TBLPROPERTIES ('sqe.column-tags' = '{"ssn":["PII"]}')"#;
+    let typo = r#"CREATE TABLE ns.tbl (ssn INT) TBLPROPERTIES ('sqe.column-tags' = '{"ssn":["PII",{"live.pi":"x"}]}')"#;
+    let alice = session_for("steward", vec!["analyst"]);
+    // `admin-role` lets a non-admin name tags on a new table; their names are
+    // still checked.
+    for authority in [AdminRole, RangerDelegate] {
+        let handler = tagdef_handler(Arc::new(steward_tagdefs(Some(vec!["PII"]))), authority);
+        assert_passed_name_check(handler.execute(&alice, ok, None).await, ok);
+        assert_undefined(handler.execute(&alice, typo, None).await, typo, "live.pi");
+        let root = session_for("root", vec!["service_admin"]);
+        assert_passed_name_check(handler.execute(&root, typo, None).await, typo);
+    }
+    // Off, the admin-role plain CREATE is ungated as before.
+    let handler = tag_handler(
+        minimal_config(),
+        Arc::new(steward_tagdefs(None)),
+        AdminRole,
+        sqe_core::config::TagPrivilege::Alter,
+    );
+    assert_passed_tag_gate(handler.execute(&alice, typo, None).await, typo);
+}
+
 /// The routes that diff against a live table, on a sqlite catalog.
 #[cfg(feature = "test-sqlite")]
 mod live_tag_maps {

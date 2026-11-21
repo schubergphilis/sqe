@@ -362,6 +362,11 @@ engine = "passthrough"
 # `all` do not imply. "apply_tag" needs that access type on the hive
 # servicedef (the quickstart's bootstrap-ranger.sh adds it).
 # tag_privilege = "alter"
+# "any" (default) or "ranger-tagdefs": refuse a non-admin SET TAGS naming a
+# tag Ranger has no tag definition for (GET /service/tags/tagdefs, cached for
+# [policy.ranger] cache_ttl_secs). Fails closed if the list cannot be read.
+# Needs [policy] engine = "ranger".
+# tag_names = "any"
 
 [session]
 idle_timeout_secs = 900       # 15 minutes — sessions idle longer than this are expired
