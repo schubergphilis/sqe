@@ -36,8 +36,20 @@ pub fn extract_catalog_qualifiers(stmt: &Statement) -> Vec<String> {
     let mut visitor = CatalogQualifierCollector {
         catalogs: BTreeSet::new(),
     };
-    let _ = stmt.visit(&mut visitor);
+    let _ = visit_named_relations(stmt, &mut visitor);
     visitor.catalogs.into_iter().collect()
+}
+
+/// `stmt.visit(visitor)`, plus the object a `SHOW CREATE` names: sqlparser
+/// does not visit that name as a relation, so a `SHOW CREATE TABLE
+/// cat.ns.t` on a catalog the session has not attached yet found no
+/// catalog to discover and reported the table missing (#921).
+fn visit_named_relations<V: Visitor>(stmt: &Statement, visitor: &mut V) -> ControlFlow<V::Break> {
+    stmt.visit(visitor)?;
+    if let Statement::ShowCreate { obj_name, .. } = stmt {
+        visitor.pre_visit_relation(obj_name)?;
+    }
+    ControlFlow::Continue(())
 }
 
 /// Like [`extract_catalog_qualifiers`] but takes raw SQL text — used by the
@@ -119,7 +131,7 @@ pub fn extract_schema_qualifiers_from_sql(sql: &str) -> Vec<(Option<String>, Str
         schemas: BTreeSet::new(),
     };
     for stmt in &statements {
-        let _ = stmt.visit(&mut visitor);
+        let _ = visit_named_relations(stmt, &mut visitor);
     }
     visitor.schemas.into_iter().collect()
 }
@@ -203,7 +215,7 @@ pub fn names_polaris_system_schema(stmt: &Statement) -> bool {
         }
     }
     let mut finder = Finder(false);
-    let _ = stmt.visit(&mut finder);
+    let _ = visit_named_relations(stmt, &mut finder);
     finder.0
 }
 
@@ -336,6 +348,20 @@ mod tests {
     use super::*;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
+
+    #[test]
+    fn show_create_table_three_part_extracts_catalog() {
+        let stmt = parse("SHOW CREATE TABLE disc_wh.ns.t");
+        assert_eq!(extract_catalog_qualifiers(&stmt), vec!["disc_wh"]);
+        assert!(extract_catalog_qualifiers(&parse("SHOW CREATE TABLE ns.t")).is_empty());
+        assert!(names_polaris_system_schema(&parse(
+            "SHOW CREATE TABLE system.access.audit"
+        )));
+        assert_eq!(
+            extract_schema_qualifiers_from_sql("SHOW CREATE VIEW disc_wh.ns.v"),
+            vec![(Some("disc_wh".to_string()), "ns".to_string())]
+        );
+    }
 
     #[test]
     fn polaris_system_schema_only_for_non_virtual_schemas() {
