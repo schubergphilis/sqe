@@ -280,7 +280,7 @@ mod tests {
         ctx.register_udtf(
             TAG_VIEW_FUNCTION,
             std::sync::Arc::new(TagViewFunction::new(std::sync::Arc::new(move |_| {
-                Ok(std::sync::Arc::clone(&catalog))
+                Ok((std::sync::Arc::clone(&catalog), "lake".to_string()))
             }))),
         );
         let plan = ctx
