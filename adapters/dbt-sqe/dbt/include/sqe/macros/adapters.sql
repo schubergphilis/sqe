@@ -1,5 +1,17 @@
 {# ── Metadata discovery ─────────────────────────────────────────────── #}
 
+{# Every metadata read names its catalog: `"<database>".information_schema.<view>`.
+   SQE qualifies a bare `information_schema` with the session catalog, which
+   the adapter never sets, so a profile whose catalog is not the server's
+   default read another catalog's listing. SQE also loads a namespace's tables
+   before an information_schema read only in the catalogs the statement names,
+   so a bare read listed none of the profile catalog's tables: the seed table
+   was never found and every `dbt seed` re-run appended its rows again. The
+   `table_catalog` / `catalog_name` filters stay: the listing itself is global. #}
+{% macro sqe__information_schema_view(database, view) -%}
+  "{{ database | replace('"', '') }}".information_schema.{{ view }}
+{%- endmacro %}
+
 {# SQLAdapter.list_relations_without_caching unpacks rows positionally as
    (database, name, schema, type); any other order swaps name and schema and
    no existing relation is ever found. #}
@@ -14,7 +26,7 @@
         WHEN 'VIEW' THEN 'view'
         ELSE 'table'
       END AS "type"
-    FROM information_schema.tables
+    FROM {{ sqe__information_schema_view(schema_relation.database, 'tables') }}
     WHERE table_schema = '{{ schema_relation.schema }}'
       AND table_catalog = '{{ schema_relation.database }}'
   {% endcall %}
@@ -29,7 +41,7 @@
       character_maximum_length,
       numeric_precision,
       numeric_scale
-    FROM information_schema.columns
+    FROM {{ sqe__information_schema_view(relation.database, 'columns') }}
     WHERE table_name = '{{ relation.identifier }}'
       AND table_schema = '{{ relation.schema }}'
       AND table_catalog = '{{ relation.database }}'
@@ -44,7 +56,7 @@
   {% if table.rows | length == 0 %}
     {% call statement('get_columns_exists', fetch_result=True) %}
       SELECT COUNT(*) AS n
-      FROM information_schema.tables
+      FROM {{ sqe__information_schema_view(relation.database, 'tables') }}
       WHERE table_name = '{{ relation.identifier }}'
         AND table_schema = '{{ relation.schema }}'
         AND table_catalog = '{{ relation.database }}'
@@ -62,7 +74,7 @@
 {% macro sqe__list_schemas(database) %}
   {% call statement('list_schemas', fetch_result=True) %}
     SELECT DISTINCT schema_name
-    FROM information_schema.schemata
+    FROM {{ sqe__information_schema_view(database, 'schemata') }}
     WHERE catalog_name = '{{ database | replace('"', '') }}'
   {% endcall %}
   {{ return(load_result('list_schemas').table) }}
@@ -71,7 +83,7 @@
 {% macro sqe__check_schema_exists(information_schema, schema) %}
   {% call statement('check_schema', fetch_result=True) %}
     SELECT COUNT(*) AS num_schemas
-    FROM information_schema.schemata
+    FROM {{ sqe__information_schema_view(information_schema.database, 'schemata') }}
     WHERE catalog_name = '{{ information_schema.database }}'
       AND schema_name = '{{ schema }}'
   {% endcall %}

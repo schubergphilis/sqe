@@ -83,7 +83,7 @@ Precedence when several are set: `token` > OAuth (`method: oauth` or `client_id`
 | `port` | `50051` | Flight SQL port |
 | `tls` | `true` | connect with `grpc+tls://`; set `false` only for a local plaintext coordinator |
 | `tls_root_certs` | unset | path to a PEM CA bundle to trust (private CA); requires `tls: true` |
-| `catalog` (alias `database`) | `warehouse` | target catalog |
+| `catalog` (alias `database`) | `warehouse` | target catalog; every relation and `information_schema` read names it, so it need not be the server's default catalog |
 | `schema` | `default` | target schema |
 | `threads` | 1 | dbt parallelism |
 

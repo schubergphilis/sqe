@@ -32,7 +32,15 @@
     {% endfor %}
   {% endset %}
 
+  {#- dbt creates the seed table only when its lookup found none, and then
+      loads every row. If the table is there after all (a lookup that missed
+      it), `CREATE TABLE IF NOT EXISTS` kept it and the rows were appended a
+      second time. Replace it instead, as dbt does on --full-refresh: a seed
+      run always leaves exactly the CSV's rows. -#}
+  {% call statement('drop_seed_table') %}
+    DROP TABLE IF EXISTS {{ this }}
+  {% endcall %}
   {% call statement('create_seed_table') %}
-    CREATE TABLE IF NOT EXISTS {{ this }} ({{ cols }})
+    CREATE TABLE {{ this }} ({{ cols }})
   {% endcall %}
 {% endmacro %}
