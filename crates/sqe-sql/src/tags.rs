@@ -63,6 +63,45 @@ pub fn try_parse_set_tags(sql: &str) -> Result<Option<SetTagsStatement>> {
         let (column, rest2) = split_identifier(after)?;
         let rest2 = rest2.trim_start();
         let rest2_upper = rest2.to_ascii_uppercase();
+        // Databricks: `ALTER COLUMN c SET TAGS ('k' = 'v', 'k2')` and
+        // `ALTER COLUMN c UNSET TAGS ('k')`. Checked before the singular
+        // Snowflake forms, which are prefixes of these.
+        if let Some(body) = strip_kw(rest2, &rest2_upper, "SET TAGS") {
+            let tags = parse_databricks_tag_list(body, "SET TAGS")?
+                .into_iter()
+                .map(|(key, _value)| key)
+                .collect();
+            return Ok(Some(SetTagsStatement {
+                table,
+                ops: vec![ColumnTagOp {
+                    column,
+                    tags,
+                    action: TagAction::Set,
+                }],
+            }));
+        }
+        if let Some(body) = strip_kw(rest2, &rest2_upper, "UNSET TAGS") {
+            let mut tags = Vec::new();
+            for (key, value) in parse_databricks_tag_list(body, "UNSET TAGS")? {
+                if value.is_some() {
+                    return Err(SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!(
+                            "UNSET TAGS: name the tag to remove without a value, got `{key} = ...`"
+                        ),
+                    ));
+                }
+                tags.push(key);
+            }
+            return Ok(Some(SetTagsStatement {
+                table,
+                ops: vec![ColumnTagOp {
+                    column,
+                    tags,
+                    action: TagAction::Unset,
+                }],
+            }));
+        }
         // SET TAG (singular) but not SET TAGS (plural, native form).
         if rest2_upper.starts_with("SET TAG") && !rest2_upper.starts_with("SET TAGS") {
             let body = rest2["SET TAG".len()..].trim_start();
@@ -287,11 +326,79 @@ fn unquote(s: &str) -> String {
     }
 }
 
+/// Byte offset of the first `=` outside single or double quotes.
+fn find_top_level_eq(s: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    for (i, c) in s.char_indices() {
+        match (quote, c) {
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), _) if c == q => quote = None,
+            (None, '=') => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Databricks' tag list `( 'key' = 'value', 'key2', ... )` as `(key, value)`
+/// pairs; a key-only tag has no value. Keys are string literals in Databricks;
+/// bare and double-quoted names are accepted as well. Keys are kept as
+/// written (no case folding, dots allowed), like the native form's tags.
+fn parse_databricks_tag_list(body: &str, context: &str) -> Result<Vec<(String, Option<String>)>> {
+    let inner = strip_parens(body, context)?;
+    let mut tags = Vec::new();
+    for item in split_top_level(inner) {
+        let (key, value) = match find_top_level_eq(&item) {
+            Some(eq) => (unquote(&item[..eq]), Some(unquote(&item[eq + 1..]))),
+            None => (unquote(&item), None),
+        };
+        if key.is_empty() {
+            return Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("{context}: expected a tag name, got `{item}`"),
+            ));
+        }
+        if value.as_deref().is_some_and(|v| v.trim().is_empty()) {
+            return Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("{context}: tag `{key}` has `=` but no value"),
+            ));
+        }
+        tags.push((key, value));
+    }
+    if tags.is_empty() {
+        return Err(SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!("{context}: empty tag list"),
+        ));
+    }
+    Ok(tags)
+}
+
+/// Databricks' table-level form (`SET TAGS ('k' = 'v')`, `UNSET TAGS ('k')`)
+/// starts its list with a string literal, where the native form names a
+/// column. Tags on tables, views, schemas and catalogs need storage SQE does
+/// not have yet, so this is refused with a pointer to the column form rather
+/// than a parse error about identifiers.
+fn refuse_table_level_tags(item: &str, context: &str) -> Result<()> {
+    if item.trim_start().starts_with('\'') {
+        return Err(SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!(
+                "{context}: tags on a table are not supported yet, only tags on its \
+                 columns. Use ALTER TABLE <table> ALTER COLUMN <column> {context} ('key' = 'value')"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// `( col = ( 'tag', ... ), col2 = (...) )`
 fn parse_native_set_list(body: &str) -> Result<Vec<ColumnTagOp>> {
     let inner = strip_parens(body, "tag list")?;
     let mut ops = Vec::new();
     for item in split_top_level(inner) {
+        refuse_table_level_tags(&item, "SET TAGS")?;
         let eq = item.find('=').ok_or_else(|| {
             SqeError::with_code(
                 SqeErrorCode::ExecutionFailed,
@@ -332,6 +439,7 @@ fn parse_native_unset_list(body: &str) -> Result<Vec<ColumnTagOp>> {
     let inner = strip_parens(body, "column list")?;
     let mut ops = Vec::new();
     for item in split_top_level(inner) {
+        refuse_table_level_tags(&item, "UNSET TAGS")?;
         let (col, _) = split_identifier(item.trim())?;
         ops.push(ColumnTagOp {
             column: col,
@@ -460,6 +568,84 @@ mod tests {
         let s = parse("ALTER TABLE t MODIFY COLUMN email UNSET TAG GDPR");
         assert_eq!(s.ops[0].column, "email");
         assert_eq!(s.ops[0].tags, vec!["GDPR"]);
+        assert_eq!(s.ops[0].action, TagAction::Unset);
+    }
+
+    #[test]
+    fn databricks_column_set_tags_key_value_and_key_only() {
+        let s = parse("ALTER TABLE c.s.t ALTER COLUMN email SET TAGS ('lt_uc' = 'v', 'pii')");
+        assert_eq!(s.table, "c.s.t");
+        assert_eq!(s.ops.len(), 1);
+        assert_eq!(s.ops[0].column, "email");
+        assert_eq!(s.ops[0].tags, vec!["lt_uc", "pii"]);
+        assert_eq!(s.ops[0].action, TagAction::Set);
+
+        let s = parse("alter table c.s.t alter column email set tags ('lt_uc');");
+        assert_eq!(s.ops[0].tags, vec!["lt_uc"]);
+        assert_eq!(s.ops[0].action, TagAction::Set);
+    }
+
+    #[test]
+    fn databricks_column_unset_tags_names_the_tags() {
+        let s = parse("ALTER TABLE c.s.t ALTER COLUMN email UNSET TAGS ('lt_uc', 'pii')");
+        assert_eq!(s.ops[0].column, "email");
+        assert_eq!(s.ops[0].tags, vec!["lt_uc", "pii"]);
+        assert_eq!(s.ops[0].action, TagAction::Unset);
+    }
+
+    #[test]
+    fn databricks_tag_keys_keep_dots_case_and_quoted_commas() {
+        // A tag key is a string literal: dots, case and commas inside the
+        // quotes are part of it, and an `=` inside a value does not split.
+        let s = parse(
+            "ALTER TABLE t ALTER COLUMN \"Email\" SET TAGS ('Live.PII' = 'a=b', 'x,y', \"dq\")",
+        );
+        assert_eq!(s.ops[0].column, "Email");
+        assert_eq!(s.ops[0].tags, vec!["Live.PII", "x,y", "dq"]);
+    }
+
+    #[test]
+    fn databricks_unset_tags_with_a_value_errors() {
+        let err = try_parse_set_tags("ALTER TABLE t ALTER COLUMN email UNSET TAGS ('k' = 'v')")
+            .expect_err("UNSET TAGS takes names only");
+        assert!(err.to_string().contains("without a value"), "{err}");
+    }
+
+    #[test]
+    fn databricks_malformed_column_tag_lists_error() {
+        for sql in [
+            "ALTER TABLE t ALTER COLUMN email SET TAGS ()",
+            "ALTER TABLE t ALTER COLUMN email SET TAGS ('k' = )",
+            "ALTER TABLE t ALTER COLUMN email SET TAGS 'k' = 'v'",
+            "ALTER TABLE t ALTER COLUMN email UNSET TAGS ()",
+            "ALTER TABLE t ALTER COLUMN email SET TAGS ('k' = 'v'",
+        ] {
+            assert!(try_parse_set_tags(sql).is_err(), "must error: {sql}");
+        }
+    }
+
+    #[test]
+    fn databricks_table_level_tags_are_refused_with_a_pointer() {
+        for sql in [
+            "ALTER TABLE c.s.t SET TAGS ('lt_uc' = 'v')",
+            "ALTER TABLE c.s.t SET TAGS ('lt_uc')",
+            "ALTER TABLE c.s.t UNSET TAGS ('lt_uc')",
+        ] {
+            let err = try_parse_set_tags(sql).expect_err(sql);
+            let msg = err.to_string();
+            assert!(msg.contains("not supported yet"), "{sql}: {msg}");
+            assert!(msg.contains("ALTER COLUMN"), "{sql}: {msg}");
+        }
+    }
+
+    #[test]
+    fn snowflake_singular_forms_still_parse_after_databricks_check() {
+        // `SET TAG` is a prefix of `SET TAGS`; the singular form must still
+        // reach the Snowflake parser.
+        let s = parse("ALTER TABLE t ALTER COLUMN email SET TAG tags_owner = 'x'");
+        assert_eq!(s.ops[0].tags, vec!["tags_owner"]);
+        let s = parse("ALTER TABLE t ALTER COLUMN email UNSET TAG tags_owner");
+        assert_eq!(s.ops[0].tags, vec!["tags_owner"]);
         assert_eq!(s.ops[0].action, TagAction::Unset);
     }
 
