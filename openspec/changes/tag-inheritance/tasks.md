@@ -16,5 +16,5 @@
 
 ## 3. Follow-ups
 
-- [ ] 3.1 Ranger tag projection of inherited tags, for Spark parity (D5)
+- [ ] 3.1 Ranger tag projection of inherited tags, for Spark parity (D5, #935); #924 is not done without it
 - [ ] 3.2 Ranger e2e in `access_control_e2e.rs` once the Ranger stack is free
