@@ -2089,8 +2089,8 @@ impl CatalogOps {
     }
 
     /// Read back the `sqe.column-tags` property of a table as a
-    /// `column -> [tags]` map. Powers `SHOW TAGS ON <table>` and the tag-merge
-    /// step of `SHOW EFFECTIVE POLICY`. Loads the table via the caller's token,
+    /// `column -> [tag keys]` map, for the tag-merge step of
+    /// `SHOW EFFECTIVE POLICY`. Loads the table via the caller's token,
     /// so the catalog's own read-access enforcement gates the call (no extra
     /// SQE gate needed). Returns an empty map for a table with no tags.
     ///
@@ -2102,6 +2102,17 @@ impl CatalogOps {
         session: &Session,
         table: &str,
     ) -> sqe_core::Result<(TableIdent, HashMap<String, Vec<String>>)> {
+        let (table_ident, tags) = self.load_column_tag_entries(session, table).await?;
+        Ok((table_ident, column_tags::keys(&tags)))
+    }
+
+    /// [`Self::load_column_tags`] keeping each tag's value, for `SHOW TAGS`.
+    #[instrument(skip(self, session), fields(username = %session.user.username))]
+    pub async fn load_column_tag_entries(
+        &self,
+        session: &Session,
+        table: &str,
+    ) -> sqe_core::Result<(TableIdent, ColumnTagMap)> {
         let object_name = parse_object_name(table)?;
         let table_ident = resolve_table_ident(&object_name, session)?;
 
@@ -2109,13 +2120,12 @@ impl CatalogOps {
         let session_catalog = self.session_catalog_for(session, target.as_deref()).await?;
 
         let table = session_catalog.load_table(&table_ident).await?;
-        let tags = crate::tag_source_impl::parse_column_tags(table.metadata().properties())
-            .map_err(|e| {
-                SqeError::with_code(
-                    SqeErrorCode::ExecutionFailed,
-                    format!("malformed sqe.column-tags JSON on table '{table_ident}': {e}"),
-                )
-            })?;
+        let tags = parse_column_tag_entries(table.metadata().properties()).map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("malformed sqe.column-tags JSON on table '{table_ident}': {e}"),
+            )
+        })?;
         Ok((table_ident, tags))
     }
 

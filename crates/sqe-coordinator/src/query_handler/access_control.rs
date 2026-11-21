@@ -699,10 +699,6 @@ impl QueryHandler {
         }
     }
 
-    /// Handle `SHOW TAGS ON <table>` — read back the `sqe.column-tags` property
-    /// as (column, tag) rows. No extra SQE gate: `load_column_tags` loads the
-    /// table with the caller's token, so the catalog enforces read access.
-    /// Empty result when the table carries no tags.
     /// `SHOW MASKING POLICIES` / `SHOW MASKING POLICY <name>`.
     ///
     /// ADMIN-GATED. The listing names the columns someone thought worth masking,
@@ -899,38 +895,50 @@ impl QueryHandler {
         Ok(vec![batch])
     }
 
+    /// Handle `SHOW TAGS ON <table>`: the `sqe.column-tags` property as
+    /// (column, tag, value) rows. No extra SQE gate: the table is loaded with
+    /// the caller's token, so the catalog enforces read access. Empty result
+    /// when the table carries no tags.
     pub(super) async fn handle_show_tags(
         &self,
         session: &Session,
         table: &str,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let (_table_ident, col_tags) = self.catalog_ops.load_column_tags(session, table).await?;
+        let (_, col_tags) = self
+            .catalog_ops
+            .load_column_tag_entries(session, table)
+            .await?;
         Self::tags_to_record_batch(&col_tags)
     }
 
-    /// Build the `SHOW TAGS` result batch: one row per (column, tag), sorted by
-    /// (column, tag) for deterministic output.
+    /// Build the `SHOW TAGS` result batch: one row per (column, tag) with the
+    /// tag's value, sorted by (column, tag) for deterministic output. A
+    /// key-only tag has `value = ''`, as in `information_schema.column_tags`.
     pub(super) fn tags_to_record_batch(
-        col_tags: &std::collections::HashMap<String, Vec<String>>,
+        col_tags: &sqe_core::column_tags::ColumnTagMap,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("column", DataType::Utf8, false),
             Field::new("tag", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, false),
         ]));
 
-        let mut rows: Vec<(&str, &str)> = Vec::new();
+        let mut rows: Vec<(&str, &str, &str)> = Vec::new();
         for (col, tags) in col_tags {
             for tag in tags {
-                rows.push((col.as_str(), tag.as_str()));
+                let value = tag.value.as_deref().unwrap_or_default();
+                rows.push((col.as_str(), tag.key.as_str(), value));
             }
         }
         rows.sort_unstable();
 
         let mut col_b = StringBuilder::new();
         let mut tag_b = StringBuilder::new();
-        for (col, tag) in rows {
+        let mut value_b = StringBuilder::new();
+        for (col, tag, value) in rows {
             col_b.append_value(col);
             tag_b.append_value(tag);
+            value_b.append_value(value);
         }
 
         let batch = RecordBatch::try_new(
@@ -938,6 +946,7 @@ impl QueryHandler {
             vec![
                 Arc::new(col_b.finish()) as ArrayRef,
                 Arc::new(tag_b.finish()) as ArrayRef,
+                Arc::new(value_b.finish()) as ArrayRef,
             ],
         )
         .map_err(|e| {

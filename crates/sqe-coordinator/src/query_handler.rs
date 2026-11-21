@@ -8931,18 +8931,22 @@ mod tests {
 
     #[test]
     fn tags_batch_sorted_one_row_per_pair() {
-        let mut map: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
+        use sqe_core::column_tags::{ColumnTag, ColumnTagMap};
+        let mut map = ColumnTagMap::new();
         map.insert(
             "email".to_string(),
-            vec!["PII".to_string(), "CONTACT".to_string()],
+            vec![
+                ColumnTag::with_value("PII", "email"),
+                ColumnTag::key("CONTACT"),
+            ],
         );
-        map.insert("id".to_string(), vec!["PK".to_string()]);
+        map.insert("id".to_string(), vec![ColumnTag::key("PK")]);
 
         let batches = QueryHandler::tags_to_record_batch(&map).unwrap();
         let b = &batches[0];
         let cols = string_col(b, 0);
         let tags = string_col(b, 1);
+        let values = string_col(b, 2);
         assert_eq!(b.num_rows(), 3);
         // Sorted by (column, tag): (email, CONTACT), (email, PII), (id, PK).
         assert_eq!(cols[0].as_deref(), Some("email"));
@@ -8951,11 +8955,15 @@ mod tests {
         assert_eq!(tags[1].as_deref(), Some("PII"));
         assert_eq!(cols[2].as_deref(), Some("id"));
         assert_eq!(tags[2].as_deref(), Some("PK"));
+        // A key-only tag shows an empty value, as `column_tags` does.
+        assert_eq!(values[0].as_deref(), Some(""));
+        assert_eq!(values[1].as_deref(), Some("email"));
+        assert_eq!(values[2].as_deref(), Some(""));
     }
 
     #[test]
     fn tags_batch_empty_when_no_tags() {
-        let map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        let map = sqe_core::column_tags::ColumnTagMap::new();
         let batches = QueryHandler::tags_to_record_batch(&map).unwrap();
         assert_eq!(batches[0].num_rows(), 0);
     }
