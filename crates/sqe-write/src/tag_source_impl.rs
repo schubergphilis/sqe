@@ -140,7 +140,9 @@ impl TagSource for CacheTagSource {
 /// metadata TVF's output carries no column tags (the target's are applied
 /// inside the provider), so it is known-untagged (#846), and so is
 /// DataFusion's `generate_series` / `range`, which computes its rows and
-/// reads no table (#847). Any other provider (Hive, views) is
+/// reads no table (#847). The information_schema tag views
+/// (`sqe_information_schema_tags`) list tag names and values, not tagged
+/// column data, so they are known-untagged too. Any other provider (Hive, views) is
 /// `NotRecognised` and goes to `CacheTagSource` / `HiveTagSource`.
 pub fn scan_column_tags(
     provider: &dyn datafusion::catalog::TableProvider,
@@ -149,6 +151,7 @@ pub fn scan_column_tags(
 
     if sqe_catalog::iceberg_metadata_tvf::is_metadata_table_provider(provider)
         || is_series_generator(provider)
+        || sqe_catalog::tag_views::is_tag_view_provider(provider)
     {
         return ScanTagState::Known(HashMap::new());
     }
@@ -1124,6 +1127,33 @@ mod scan_column_tags_tests {
                 "ssn".to_string(),
                 vec!["PII".to_string()]
             )]))
+        );
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn a_tag_view_is_known_untagged() {
+        use datafusion::catalog::TableFunctionImpl;
+        use datafusion::prelude::lit;
+        use sqe_catalog::tag_views::TagViewFunction;
+
+        let catalog = iceberg::memory::MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                [("warehouse".to_string(), "memory:///wh".to_string())].into(),
+            )
+            .await
+            .unwrap();
+        let catalog = Arc::new(sqe_catalog::SessionCatalog::local(
+            Arc::new(catalog),
+            "lake",
+            &Default::default(),
+        ));
+        let function = TagViewFunction::new(Arc::new(move |_| Ok(Arc::clone(&catalog))));
+        let provider = function.call(&[lit("column_tags")]).unwrap();
+        assert_eq!(
+            scan_column_tags(provider.as_ref()),
+            ScanTagState::Known(HashMap::new())
         );
     }
 
