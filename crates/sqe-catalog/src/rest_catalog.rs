@@ -2485,6 +2485,18 @@ impl SessionCatalog {
             .map_err(|e| classify_iceberg_catalog_error("Failed to get namespace", e))
     }
 
+    /// Set the given namespace properties, leaving every other key alone.
+    /// Refused for a catalog the session's scope marks read-only (#908).
+    pub async fn update_namespace(
+        &self,
+        namespace: &NamespaceIdent,
+        properties: HashMap<String, String>,
+    ) -> sqe_core::Result<()> {
+        self.ensure_writable()?;
+        dispatch_catalog!(self.inner, update_namespace(namespace, properties))
+            .map_err(|e| classify_iceberg_catalog_error("Failed to update namespace", e))
+    }
+
     /// True when the backend is the REST/Polaris variant — the only backend
     /// that forwards the caller's bearer per request and can therefore
     /// answer per-caller visibility probes. Single-identity backends

@@ -20,6 +20,7 @@ pub mod lateral_alias;
 pub mod merge_star;
 pub mod metadata;
 pub mod nested_row_cast;
+pub mod object_tags;
 pub mod paren_less_values;
 pub mod partition;
 pub mod partition_evolution;

@@ -2383,6 +2383,9 @@ impl QueryHandler {
                     self.invalidate_policy_cache();
                     Ok(vec![])
                 }
+                StatementKind::SetObjectTags(stmt) => {
+                    self.handle_set_object_tags(session, stmt).await
+                }
                 StatementKind::SetMaskingPolicy(op) => {
                     // Same write as SET TAGS, spelled differently.
                     // Gated before `masking_policy_to_tag_op` so an unauthorised

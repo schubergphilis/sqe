@@ -242,25 +242,8 @@ pub struct TagPropertyWrite {
 pub fn tag_property_write(
     stmt: &sqlparser::ast::Statement,
 ) -> sqe_core::Result<Option<TagPropertyWrite>> {
-    use crate::write_handler::trino_props::TrinoTableOptions;
-    use sqlparser::ast::{AlterTableOperation, Expr, SqlOption, Statement, Value};
-    let resolved: Vec<TrinoTableOptions> = match stmt {
-        Statement::AlterTable(at) => at
-            .operations
-            .iter()
-            .filter_map(|op| match op {
-                AlterTableOperation::SetTblProperties { table_properties } => {
-                    Some(TrinoTableOptions::parse_alter(table_properties))
-                }
-                _ => None,
-            })
-            .collect::<sqe_core::Result<_>>()?,
-        Statement::CreateTable(ct) => vec![TrinoTableOptions::parse(
-            &ct.table_options,
-            ct.partition_by.is_some(),
-        )?],
-        _ => return Ok(None),
-    };
+    use sqlparser::ast::{Expr, SqlOption, Value};
+    let resolved = written_table_options(stmt)?;
     let mut write = TagPropertyWrite {
         value: None,
         off_case_key: false,
@@ -285,6 +268,45 @@ pub fn tag_property_write(
         }
     }
     Ok(named.then_some(write))
+}
+
+/// True when `stmt` writes the table property `key` in any case, through
+/// any spelling (`extra_properties` included).
+pub fn writes_table_property(
+    stmt: &sqlparser::ast::Statement,
+    key: &str,
+) -> sqe_core::Result<bool> {
+    use sqlparser::ast::SqlOption;
+    Ok(written_table_options(stmt)?
+        .iter()
+        .flat_map(|t| t.options())
+        .any(|opt| matches!(opt, SqlOption::KeyValue { key: k, .. } if k.value.eq_ignore_ascii_case(key))))
+}
+
+/// The table options a raw property write sets, after the Trino vocabulary
+/// is resolved. Empty for a statement that sets none.
+fn written_table_options(
+    stmt: &sqlparser::ast::Statement,
+) -> sqe_core::Result<Vec<crate::write_handler::trino_props::TrinoTableOptions>> {
+    use crate::write_handler::trino_props::TrinoTableOptions;
+    use sqlparser::ast::{AlterTableOperation, Statement};
+    Ok(match stmt {
+        Statement::AlterTable(at) => at
+            .operations
+            .iter()
+            .filter_map(|op| match op {
+                AlterTableOperation::SetTblProperties { table_properties } => {
+                    Some(TrinoTableOptions::parse_alter(table_properties))
+                }
+                _ => None,
+            })
+            .collect::<sqe_core::Result<_>>()?,
+        Statement::CreateTable(ct) => vec![TrinoTableOptions::parse(
+            &ct.table_options,
+            ct.partition_by.is_some(),
+        )?],
+        _ => Vec::new(),
+    })
 }
 
 /// The columns whose tags differ between two `sqe.column-tags` maps: added,

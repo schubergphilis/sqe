@@ -49,11 +49,17 @@ pub fn try_parse_set_tags(sql: &str) -> Result<Option<SetTagsStatement>> {
 
     if rest_upper.starts_with("SET TAGS") {
         let body = rest["SET TAGS".len()..].trim_start();
+        if is_object_tag_list(body, "SET TAGS")? {
+            return Ok(None);
+        }
         let ops = parse_native_set_list(body)?;
         return Ok(Some(SetTagsStatement { table, ops }));
     }
     if rest_upper.starts_with("UNSET TAGS") {
         let body = rest["UNSET TAGS".len()..].trim_start();
+        if is_object_tag_list(body, "UNSET TAGS")? {
+            return Ok(None);
+        }
         let ops = parse_native_unset_list(body)?;
         return Ok(Some(SetTagsStatement { table, ops }));
     }
@@ -224,13 +230,13 @@ pub fn try_parse_masking_policy(sql: &str) -> Result<Option<MaskingPolicyOp>> {
 }
 
 /// Strip a case-insensitive keyword prefix, returning the remainder.
-fn strip_kw<'a>(s: &'a str, upper: &str, keyword: &str) -> Option<&'a str> {
+pub(crate) fn strip_kw<'a>(s: &'a str, upper: &str, keyword: &str) -> Option<&'a str> {
     upper.starts_with(keyword).then(|| &s[keyword.len()..])
 }
 
 /// Read a leading (possibly dotted/quoted) identifier; return (cleaned, rest).
 /// `"a"."b"` and `a.b` both yield `a.b`. Quotes are stripped, dots preserved.
-fn split_identifier(s: &str) -> Result<(String, &str)> {
+pub(crate) fn split_identifier(s: &str) -> Result<(String, &str)> {
     let s = s.trim_start();
     let mut out = String::new();
     let mut in_quote = false;
@@ -351,7 +357,10 @@ fn find_top_level_eq(s: &str) -> Option<usize> {
 /// pairs; a key-only tag has no value. Keys are string literals in Databricks;
 /// bare and double-quoted names are accepted as well. Keys are kept as
 /// written (no case folding, dots allowed), like the native form's tags.
-fn parse_databricks_tag_list(body: &str, context: &str) -> Result<Vec<(String, Option<String>)>> {
+pub(crate) fn parse_databricks_tag_list(
+    body: &str,
+    context: &str,
+) -> Result<Vec<(String, Option<String>)>> {
     let inner = strip_parens(body, context)?;
     let mut tags = Vec::new();
     for item in split_top_level(inner) {
@@ -391,22 +400,35 @@ fn parse_databricks_tag_list(body: &str, context: &str) -> Result<Vec<(String, O
     Ok(tags)
 }
 
-/// Databricks' table-level form (`SET TAGS ('k' = 'v')`, `UNSET TAGS ('k')`)
-/// starts its list with a string literal, where the native form names a
-/// column. Tags on tables, views, schemas and catalogs need storage SQE does
-/// not have yet, so this is refused with a pointer to the column form rather
-/// than a parse error about identifiers.
-fn refuse_table_level_tags(item: &str, context: &str) -> Result<()> {
-    if item.trim_start().starts_with('\'') {
+/// Whether a `SET TAGS` / `UNSET TAGS` list on a table tags the table
+/// itself (Databricks: `('k' = 'v', 'k2')`, every item a string literal)
+/// rather than its columns (the native `(col = ('tag'))` / `(col)`, every
+/// item an identifier). The object form belongs to
+/// [`crate::object_tags::try_parse_object_tags`]. A list mixing the two is
+/// refused rather than read either way.
+pub(crate) fn is_object_tag_list(body: &str, context: &str) -> Result<bool> {
+    let Ok(inner) = strip_parens(body, context) else {
+        // The caller's own parser reports the malformed list.
+        return Ok(false);
+    };
+    let items = split_top_level(inner);
+    let literal = items
+        .iter()
+        .filter(|i| i.trim_start().starts_with('\''))
+        .count();
+    if literal == 0 {
+        return Ok(false);
+    }
+    if literal < items.len() {
         return Err(SqeError::with_code(
             SqeErrorCode::ExecutionFailed,
             format!(
-                "{context}: tags on a table are not supported yet, only tags on its \
-                 columns. Use ALTER TABLE <table> ALTER COLUMN <column> {context} ('key' = 'value')"
+                "{context}: a list cannot mix tags on the table ('key' = 'value') and tags \
+                 on its columns (column = ('tag')). Use one statement for each"
             ),
         ));
     }
-    Ok(())
+    Ok(true)
 }
 
 /// `( col = ( 'tag', ... ), col2 = (...) )`
@@ -414,7 +436,6 @@ fn parse_native_set_list(body: &str) -> Result<Vec<ColumnTagOp>> {
     let inner = strip_parens(body, "tag list")?;
     let mut ops = Vec::new();
     for item in split_top_level(inner) {
-        refuse_table_level_tags(&item, "SET TAGS")?;
         let eq = item.find('=').ok_or_else(|| {
             SqeError::with_code(
                 SqeErrorCode::ExecutionFailed,
@@ -468,7 +489,6 @@ fn parse_native_unset_list(body: &str) -> Result<Vec<ColumnTagOp>> {
     let inner = strip_parens(body, "column list")?;
     let mut ops = Vec::new();
     for item in split_top_level(inner) {
-        refuse_table_level_tags(&item, "UNSET TAGS")?;
         let (col, _) = split_identifier(item.trim())?;
         ops.push(ColumnTagOp {
             column: col,
@@ -513,7 +533,7 @@ fn parse_snowflake_assignments(body: &str) -> Result<Vec<(String, Option<String>
 /// Keys keep their first position; a key given twice keeps its last value.
 /// An empty value (`'k' = ''`) is stored as a key-only tag, which is how
 /// Databricks reports a key-only tag.
-fn keys_and_values(
+pub(crate) fn keys_and_values(
     pairs: Vec<(String, Option<String>)>,
 ) -> (Vec<String>, BTreeMap<String, String>) {
     let mut tags: Vec<String> = Vec::new();
@@ -727,16 +747,25 @@ mod tests {
     }
 
     #[test]
-    fn databricks_table_level_tags_are_refused_with_a_pointer() {
+    fn databricks_table_level_tags_are_left_to_the_object_parser() {
         for sql in [
             "ALTER TABLE c.s.t SET TAGS ('lt_uc' = 'v')",
             "ALTER TABLE c.s.t SET TAGS ('lt_uc')",
             "ALTER TABLE c.s.t UNSET TAGS ('lt_uc')",
         ] {
-            let err = try_parse_set_tags(sql).expect_err(sql);
-            let msg = err.to_string();
-            assert!(msg.contains("not supported yet"), "{sql}: {msg}");
-            assert!(msg.contains("ALTER COLUMN"), "{sql}: {msg}");
+            assert_eq!(try_parse_set_tags(sql).expect(sql), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_list_mixing_table_and_column_tags_is_refused() {
+        for sql in [
+            "ALTER TABLE t SET TAGS ('k' = 'v', email = ('pii'))",
+            "ALTER TABLE t SET TAGS (email = ('pii'), 'k' = 'v')",
+            "ALTER TABLE t UNSET TAGS ('k', email)",
+        ] {
+            let msg = try_parse_set_tags(sql).expect_err(sql).to_string();
+            assert!(msg.contains("cannot mix"), "{sql}: {msg}");
         }
     }
 

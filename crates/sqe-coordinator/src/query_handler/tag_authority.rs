@@ -24,6 +24,8 @@ use sqe_core::column_tags::ColumnTagMap;
 use sqe_core::config::{TagAuthority, TagNames, TagPrivilege};
 use sqe_policy::TablePrivilege;
 
+mod object_tags;
+
 const RAW_TAG_WRITE: &str = "setting the sqe.column-tags table property";
 
 /// True when an `ALTER TABLE ... SET TBLPROPERTIES` (or a `CREATE OR REPLACE
@@ -125,6 +127,21 @@ impl QueryHandler {
         names: &BTreeSet<&str>,
         statement: &str,
     ) -> sqe_core::Result<()> {
+        let catalog = crate::ident::catalog_qualifier(table)
+            .unwrap_or_else(|| self.session_catalog_name(session));
+        self.require_defined_tags_in(session, catalog, names, statement)
+            .await
+    }
+
+    /// [`Self::require_defined_tags`] for an object in `catalog`: a table,
+    /// or a schema (#922).
+    pub(super) async fn require_defined_tags_in(
+        &self,
+        session: &Session,
+        catalog: String,
+        names: &BTreeSet<&str>,
+        statement: &str,
+    ) -> sqe_core::Result<()> {
         if self.config.access_control.tag_names == TagNames::Any || names.is_empty() {
             return Ok(());
         }
@@ -136,10 +153,7 @@ impl QueryHandler {
                  (tag_names = \"ranger-tagdefs\" needs [policy] engine = \"ranger\")",
             ));
         };
-        let catalog = store.catalog_scoped().then(|| {
-            crate::ident::catalog_qualifier(table)
-                .unwrap_or_else(|| self.session_catalog_name(session))
-        });
+        let catalog = store.catalog_scoped().then_some(catalog);
         let undefined = |defs: &HashSet<String>| -> Vec<&str> {
             names
                 .iter()
@@ -253,6 +267,20 @@ impl QueryHandler {
         session: &Session,
         stmt: &Statement,
     ) -> sqe_core::Result<()> {
+        // The table's own tags (#922) have no raw writer: in every mode only
+        // an admin may write `sqe.table-tags` as a property.
+        if !self.config.auth.has_admin_role(&session.user.roles)
+            && crate::tag_source_impl::writes_table_property(
+                stmt,
+                sqe_core::object_tags::TABLE_PROP_KEY,
+            )?
+        {
+            return Err(self.refuse_tag_write(
+                session,
+                "setting the sqe.table-tags table property",
+                "is reserved for admins; use ALTER TABLE ... SET TAGS ('key' = 'value')",
+            ));
+        }
         let Some(write) = tag_property_write(stmt)? else {
             return Ok(());
         };

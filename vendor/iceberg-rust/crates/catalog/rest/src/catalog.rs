@@ -52,6 +52,7 @@ use crate::types::{
     CreateNamespaceRequest,
     CreateTableRequest, ListNamespaceResponse, ListTablesResponse, LoadTableResult,
     NamespaceResponse, RegisterTableRequest, RenameTableRequest,
+    UpdateNamespacePropertiesRequest,
 };
 
 /// REST catalog URI
@@ -1299,16 +1300,47 @@ impl SessionCatalog for RestSessionCatalog {
             .await
     }
 
+    /// SQE PATCH (sqe#922): set namespace properties through
+    /// `POST .../namespaces/{namespace}/properties`. Only the given keys are
+    /// sent as `updates`; every other property is left alone and nothing is
+    /// removed, the merge the `Catalog` trait's map-only signature allows.
+    /// Upstream returns `FeatureUnsupported`.
     async fn update_namespace(
         &self,
         _context: &SessionContext,
-        _namespace: &NamespaceIdent,
-        _properties: HashMap<String, String>,
+        namespace: &NamespaceIdent,
+        properties: HashMap<String, String>,
     ) -> Result<()> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Updating namespace not supported yet!",
-        ))
+        let client = self.client().await?;
+
+        let request = HttpRequest::build(
+            client
+                .http_client
+                .request(
+                    Method::POST,
+                    format!("{}/properties", client.config.namespace_endpoint(namespace)),
+                )
+                // `removals: []`, not null: the spec types it as an array and
+                // a strict server may refuse null.
+                .json(&UpdateNamespacePropertiesRequest {
+                    removals: Some(Vec::new()),
+                    updates: properties,
+                }),
+        )?;
+
+        let http_response = client.query_catalog(request).await?;
+
+        match http_response.status() {
+            StatusCode::OK => Ok(()),
+            StatusCode::NOT_FOUND => Err(Error::new(
+                ErrorKind::NamespaceNotFound,
+                "Tried to update the properties of a namespace that does not exist",
+            )),
+            _ => Err(deserialize_unexpected_catalog_error(
+                http_response,
+                client.http_client.disable_header_redaction(),
+            )),
+        }
     }
 
     async fn drop_namespace(
@@ -3520,6 +3552,57 @@ mod tests {
 
         config_mock.assert_async().await;
         create_ns_mock.assert_async().await;
+    }
+
+    // SQE PATCH (sqe#922)
+    #[tokio::test]
+    async fn test_update_namespace_sends_only_the_given_keys() {
+        let mut server = Server::new_async().await;
+
+        let config_mock = create_config_mock(&mut server).await;
+
+        let update_mock = server
+            .mock("POST", "/v1/namespaces/ns1%1Fns11/properties")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "removals": [],
+                "updates": {"sqe.schema-tags": "[\"pii\"]"}
+            })))
+            .with_body(r#"{"updated": ["sqe.schema-tags"], "removed": []}"#)
+            .create_async()
+            .await;
+        let missing_mock = server
+            .mock("POST", "/v1/namespaces/gone/properties")
+            .with_status(404)
+            .with_body(
+                r#"{"error": {"message": "no such namespace", "type": "NoSuchNamespaceException", "code": 404}}"#,
+            )
+            .create_async()
+            .await;
+
+        let catalog = session_catalog(RestCatalogConfig::builder().uri(server.url()).build());
+        let updates = HashMap::from([("sqe.schema-tags".to_string(), "[\"pii\"]".to_string())]);
+
+        catalog
+            .update_namespace(
+                &SessionContext::empty(),
+                &NamespaceIdent::from_vec(vec!["ns1".to_string(), "ns11".to_string()]).unwrap(),
+                updates.clone(),
+            )
+            .await
+            .unwrap();
+        let err = catalog
+            .update_namespace(
+                &SessionContext::empty(),
+                &NamespaceIdent::new("gone".to_string()),
+                updates,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NamespaceNotFound);
+
+        config_mock.assert_async().await;
+        update_mock.assert_async().await;
+        missing_mock.assert_async().await;
     }
 
     #[tokio::test]
