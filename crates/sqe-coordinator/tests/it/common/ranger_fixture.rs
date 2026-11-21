@@ -588,6 +588,76 @@ impl RangerAdmin {
         bail!("delete policy {name} -> HTTP {}", resp.status());
     }
 
+    /// The id of the tag definition named `name`, or `None` when Ranger has
+    /// none (`GET /service/tags/tagdef/name/{name}` answers 404).
+    async fn tagdef_id(&self, name: &str) -> anyhow::Result<Option<i64>> {
+        let resp = self
+            .req(
+                reqwest::Method::GET,
+                &format!("/service/tags/tagdef/name/{name}"),
+            )
+            .send()
+            .await
+            .context("GET tagdef")?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            bail!("get tagdef {name} -> HTTP {}", resp.status());
+        }
+        let body: serde_json::Value = resp.json().await.context("tagdef json")?;
+        body["id"]
+            .as_i64()
+            .map(Some)
+            .with_context(|| format!("tagdef {name} has no id: {body}"))
+    }
+
+    /// Define a tag in Ranger's tag store (`POST /service/tags/tagdefs`).
+    /// An existing definition of the same name is not an error.
+    pub async fn create_tagdef(&self, name: &str) -> anyhow::Result<()> {
+        if self.tagdef_id(name).await?.is_some() {
+            return Ok(());
+        }
+        let resp = self
+            .req(reqwest::Method::POST, "/service/tags/tagdefs")
+            .json(&serde_json::json!({"name": name, "source": "sqe-ac-e2e"}))
+            .send()
+            .await
+            .context("POST tagdef")?;
+        if !resp.status().is_success() {
+            bail!(
+                "create tagdef {name} -> HTTP {}: {}",
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            );
+        }
+        Ok(())
+    }
+
+    /// Delete a tag definition by name. Missing is not an error. Ranger
+    /// deletes by id only (`DELETE /service/tags/tagdef/{id}`).
+    pub async fn delete_tagdef(&self, name: &str) -> anyhow::Result<()> {
+        let Some(id) = self.tagdef_id(name).await? else {
+            return Ok(());
+        };
+        let resp = self
+            .req(
+                reqwest::Method::DELETE,
+                &format!("/service/tags/tagdef/{id}"),
+            )
+            .send()
+            .await
+            .context("DELETE tagdef")?;
+        if resp.status().is_success() {
+            return Ok(());
+        }
+        bail!(
+            "delete tagdef {name} -> HTTP {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        );
+    }
+
     /// Delete every `sqe-ac-e2e-` policy from both test-owned services.
     /// Returns how many were removed.
     pub async fn delete_test_policies(&self) -> anyhow::Result<usize> {
