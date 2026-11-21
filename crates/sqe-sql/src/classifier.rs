@@ -13,6 +13,7 @@ use crate::ddl::{try_parse_ref_ddl, RefDdl};
 use crate::grant_policy::{try_parse_grant_policy, GrantWithPolicy};
 use crate::identifier_fields::{try_parse_identifier_fields, IdentifierFieldsDdl};
 use crate::metadata::UpdateType;
+use crate::object_tags::{try_parse_object_tags, ObjectTagsStatement, TagObject};
 use crate::partition_evolution::{try_parse_partition_evolution, PartitionEvolution};
 use crate::policy_ddl::{try_parse_policy_ddl, PolicyDdlStatement};
 use crate::procedures::{try_parse_call, ProcedureCall};
@@ -199,6 +200,9 @@ pub enum StatementKind {
     /// `ALTER TABLE ... SET TAGS / UNSET TAGS` and the Snowflake-compatible
     /// `MODIFY|ALTER COLUMN ... SET TAG / UNSET TAG` column-tag authoring DDL.
     SetTags(Box<SetTagsStatement>),
+    /// `ALTER TABLE|SCHEMA|DATABASE|CATALOG <name> SET|UNSET TAGS ('k' = 'v')`:
+    /// tags on the object itself, metadata only (#922).
+    SetObjectTags(Box<ObjectTagsStatement>),
     /// `ALTER TABLE ... MODIFY|ALTER COLUMN <col> SET|UNSET MASKING POLICY <name>`.
     /// Snowflake-compatible. Resolved against the policy store, not here: the
     /// named policy has to be looked up to find the tag it is keyed on.
@@ -327,6 +331,7 @@ impl StatementKind {
             StatementKind::PartitionEvolution(_) => "partitionevolution",
             StatementKind::IdentifierFields(_) => "identifierfields",
             StatementKind::SetTags(_) => "settags",
+            StatementKind::SetObjectTags(_) => "setobjecttags",
             StatementKind::SetMaskingPolicy(_) => "setmaskingpolicy",
             StatementKind::Attach(_) => "attach",
             StatementKind::Detach(_) => "detach",
@@ -469,6 +474,10 @@ impl StatementKind {
             | StatementKind::SetTags(_)
             | StatementKind::SetMaskingPolicy(_)
             | StatementKind::HivePartitionDdl(_) => U::AlterTable,
+            StatementKind::SetObjectTags(stmt) => match stmt.object {
+                TagObject::Table(_) => U::AlterTable,
+                TagObject::Schema(_) | TagObject::Catalog(_) => U::AlterSchema,
+            },
             StatementKind::Truncate(_) => U::Truncate,
             StatementKind::Analyze(_) => U::Analyze,
             StatementKind::Procedure(_) => U::Call,
@@ -991,6 +1000,11 @@ fn try_classify_custom(parser: &mut Parser, sql: &str) -> sqe_core::Result<Optio
         // (branch/tag DDL, partition evolution, Hive partitions, tags,
         // masking policies, nested DROP COLUMN, Trino SET PROPERTIES).
         ["ALTER", "TABLE", ..] => classify_alter_table_extension(body)?,
+        // Tags on a schema or catalog (#922); every other ALTER SCHEMA form
+        // returns None here and reaches sqlparser.
+        ["ALTER", "SCHEMA" | "DATABASE" | "CATALOG", ..] => {
+            try_parse_object_tags(body)?.map(|s| StatementKind::SetObjectTags(Box::new(s)))
+        }
         // ATTACH / DETACH / CREATE SECRET / DROP SECRET: SQE extensions with a
         // DuckDB-style option list. A legacy SQLite `ATTACH '<file>' AS
         // <name>` falls through to sqlparser and its NotImplemented error.
@@ -1051,6 +1065,12 @@ fn classify_alter_table_extension(body: &str) -> sqe_core::Result<Option<Stateme
     // cannot silently capture a masking-policy statement.
     if let Some(op) = try_parse_masking_policy(body)? {
         return Ok(Some(StatementKind::SetMaskingPolicy(Box::new(op))));
+    }
+    // Tags on the table itself: the list starts with a string literal. The
+    // column parser returns Ok(None) for that shape, so the order is not
+    // load-bearing either.
+    if let Some(stmt) = try_parse_object_tags(body)? {
+        return Ok(Some(StatementKind::SetObjectTags(Box::new(stmt))));
     }
     if let Some(set_tags) = try_parse_set_tags(body)? {
         return Ok(Some(StatementKind::SetTags(Box::new(set_tags))));
@@ -3020,6 +3040,37 @@ mod tests {
             matches!(result, Ok(StatementKind::SetTags(_))),
             "expected SetTags, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn object_tag_forms_classify_as_set_object_tags() {
+        use crate::metadata::UpdateType;
+        for (sql, update) in [
+            (
+                "ALTER TABLE c.s.t SET TAGS ('owner' = 'finance')",
+                UpdateType::AlterTable,
+            ),
+            ("ALTER TABLE t UNSET TAGS ('owner')", UpdateType::AlterTable),
+            (
+                "ALTER SCHEMA c.s SET TAGS ('domain' = 'sales')",
+                UpdateType::AlterSchema,
+            ),
+            ("ALTER DATABASE s UNSET TAGS ('k')", UpdateType::AlterSchema),
+            ("ALTER CATALOG c SET TAGS ('env')", UpdateType::AlterSchema),
+        ] {
+            let kind = parse_and_classify(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert!(
+                matches!(kind, StatementKind::SetObjectTags(_)),
+                "expected SetObjectTags for {sql}, got: {kind:?}"
+            );
+            assert_eq!(kind.update_type(), Some(update), "{sql}");
+        }
+        // Other ALTER SCHEMA forms still reach sqlparser.
+        assert!(!matches!(
+            parse_and_classify("ALTER SCHEMA s RENAME TO s2"),
+            Ok(StatementKind::SetObjectTags(_))
+        ));
+        assert!(parse_and_classify("ALTER TABLE t SET TAGS ('k' = 'v', email = ('pii'))").is_err());
     }
 
     #[test]

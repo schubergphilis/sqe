@@ -875,6 +875,8 @@ async fn admin_role_mode_is_unchanged_but_sees_extra_properties() {
 #[derive(Default)]
 struct Tagdefs {
     grants: ColumnGrants,
+    /// (user, table) pairs granted every privilege on the whole table.
+    tables: Vec<(&'static str, &'static str)>,
     defs: Option<Vec<&'static str>>,
     late: Option<&'static str>,
     scoped: bool,
@@ -897,6 +899,19 @@ impl PolicyStore for Tagdefs {
 
     fn catalog_scoped(&self) -> bool {
         self.scoped
+    }
+
+    async fn grants_table_privilege(
+        &self,
+        user: &SessionUser,
+        table_name: &str,
+        _namespace: &str,
+        _privilege: sqe_policy::TablePrivilege,
+    ) -> sqe_core::Result<bool> {
+        Ok(self
+            .tables
+            .iter()
+            .any(|(u, t)| *u == user.username && *t == table_name))
     }
 
     async fn grants_column_privilege(
@@ -1410,4 +1425,137 @@ mod live_tag_maps {
         );
         assert_eq!(r.tags().await.len(), 2);
     }
+}
+
+// ---------------------------------------------------------------------------
+// #922 - tags on a table or schema itself
+// ---------------------------------------------------------------------------
+
+const TABLE_TAG_STMTS: [&str; 2] = [
+    "ALTER TABLE ns.tbl SET TAGS ('gold', 'owner' = 'finance')",
+    "ALTER TABLE ns.tbl UNSET TAGS ('gold')",
+];
+
+const SCHEMA_TAG_STMTS: [&str; 2] = [
+    "ALTER SCHEMA ns SET TAGS ('gold', 'owner' = 'finance')",
+    "ALTER SCHEMA ns UNSET TAGS ('gold')",
+];
+
+#[tokio::test]
+async fn object_tags_admin_role_refuses_a_steward_and_passes_an_admin() {
+    let handler = make_handler(
+        Arc::new(RecordingBackend::default()),
+        Arc::new(RecordingStore::default()),
+    );
+    let steward = session_for("alice", vec!["analyst"]);
+    let admin = session_for("root", vec!["service_admin"]);
+    for sql in TABLE_TAG_STMTS.into_iter().chain(SCHEMA_TAG_STMTS) {
+        assert_refused_by_tag_gate(handler.execute(&steward, sql, None).await, sql);
+        assert_passed_tag_gate(handler.execute(&admin, sql, None).await, sql);
+    }
+}
+
+#[tokio::test]
+async fn object_tags_delegate_needs_the_table_grant() {
+    let store = Arc::new(sqe_policy::policy_store::InMemoryPolicyStore::new());
+    store
+        .grant_table_privilege("ns", "tbl", "alice", sqe_policy::TablePrivilege::Alter)
+        .await;
+    let handler = make_delegate_handler(store);
+    let alice = session_for("alice", vec!["analyst"]);
+    let bob = session_for("bob", vec!["analyst"]);
+    for sql in TABLE_TAG_STMTS {
+        assert_passed_tag_gate(handler.execute(&alice, sql, None).await, sql);
+        assert_refused_by_tag_gate(handler.execute(&bob, sql, None).await, sql);
+    }
+    // A table grant is not a schema grant.
+    for sql in SCHEMA_TAG_STMTS {
+        assert_refused_by_tag_gate(handler.execute(&alice, sql, None).await, sql);
+    }
+}
+
+#[tokio::test]
+async fn object_tags_column_grant_is_not_a_table_grant() {
+    use sqe_policy::TablePrivilege::Alter;
+    let handler = apply_tag_handler(ColumnGrants(vec![("steward", "ssn", Alter)]));
+    let steward = session_for("steward", vec!["analyst"]);
+    for sql in TABLE_TAG_STMTS {
+        assert_refused_by_tag_gate(handler.execute(&steward, sql, None).await, sql);
+    }
+}
+
+#[tokio::test]
+async fn object_tags_schema_needs_the_database_wildcard_grant() {
+    let store = Arc::new(sqe_policy::policy_store::InMemoryPolicyStore::new());
+    store
+        .grant_table_privilege("ns", "*", "alice", sqe_policy::TablePrivilege::Alter)
+        .await;
+    let handler = make_delegate_handler(store);
+    let alice = session_for("alice", vec!["analyst"]);
+    for sql in SCHEMA_TAG_STMTS {
+        assert_passed_tag_gate(handler.execute(&alice, sql, None).await, sql);
+    }
+}
+
+#[tokio::test]
+async fn object_tags_refuse_an_undefined_key() {
+    use sqe_core::config::TagAuthority::RangerDelegate;
+    let store = Arc::new(Tagdefs {
+        tables: vec![("steward", "tbl"), ("steward", "*")],
+        defs: Some(vec!["gold"]),
+        ..Default::default()
+    });
+    let handler = tagdef_handler(store, RangerDelegate);
+    let steward = session_for("steward", vec!["analyst"]);
+    for sql in [
+        "ALTER TABLE ns.tbl SET TAGS ('gold', 'silver')",
+        "ALTER SCHEMA ns SET TAGS ('silver' = 'x')",
+    ] {
+        assert_undefined(handler.execute(&steward, sql, None).await, sql, "silver");
+    }
+    // UNSET removes names; it does not need them defined.
+    for sql in [
+        "ALTER TABLE ns.tbl SET TAGS ('gold' = 'x')",
+        "ALTER SCHEMA ns UNSET TAGS ('silver')",
+    ] {
+        assert_passed_name_check(handler.execute(&steward, sql, None).await, sql);
+    }
+}
+
+#[tokio::test]
+async fn object_tags_raw_table_property_is_reserved_for_admins() {
+    let store = Arc::new(sqe_policy::policy_store::InMemoryPolicyStore::new());
+    store
+        .grant_table_privilege("ns", "tbl", "alice", sqe_policy::TablePrivilege::Alter)
+        .await;
+    let delegate = make_delegate_handler(store);
+    let default = make_handler(
+        Arc::new(RecordingBackend::default()),
+        Arc::new(RecordingStore::default()),
+    );
+    let alice = session_for("alice", vec!["analyst"]);
+    for sql in [
+        "ALTER TABLE ns.tbl SET TBLPROPERTIES ('sqe.table-tags' = '[\"gold\"]')",
+        "ALTER TABLE ns.tbl SET TBLPROPERTIES ('SQE.Table-Tags' = '[]')",
+    ] {
+        for handler in [&delegate, &default] {
+            let err = handler.execute(&alice, sql, None).await.expect_err(sql);
+            assert!(
+                err.to_string().contains("sqe.table-tags table property"),
+                "{sql}: {err}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn object_tags_on_a_catalog_are_refused() {
+    let handler = make_delegate_handler(Arc::new(RecordingStore::default()));
+    let admin = session_for("root", vec!["service_admin"]);
+    let sql = "ALTER CATALOG iceberg SET TAGS ('gold')";
+    let err = handler.execute(&admin, sql, None).await.expect_err(sql);
+    assert!(
+        err.to_string().contains("not supported yet"),
+        "{sql}: {err}"
+    );
 }

@@ -129,7 +129,7 @@ pub fn check_statement(session: &Session, kind: &StatementKind) -> Result<(), Sq
         StatementKind::Revoke(_) => "REVOKE",
         StatementKind::Deny(_) => "DENY",
         StatementKind::PolicyDdl(_) => "CREATE / DROP POLICY",
-        StatementKind::SetTags(_) => "Setting tags",
+        StatementKind::SetTags(_) | StatementKind::SetObjectTags(_) => "Setting tags",
         StatementKind::SetMaskingPolicy(_) => "Setting a masking policy",
         StatementKind::SetCatalog(target) => {
             if let Ok(catalog) = crate::query_handler::parse_catalog_target(target) {

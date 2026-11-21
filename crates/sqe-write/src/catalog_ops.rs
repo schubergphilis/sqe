@@ -36,6 +36,8 @@ use crate::write_handler::{
 };
 use sqe_core::column_tags::ColumnTagMap;
 
+pub mod object_tags;
+
 /// `format-version` (Iceberg) or `format_version` (Trino).
 fn is_format_version_key(key: &str) -> bool {
     key.eq_ignore_ascii_case("format-version") || key.eq_ignore_ascii_case("format_version")
