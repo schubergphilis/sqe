@@ -1,0 +1,13 @@
+**STATUS 2026-11-21: object tag readers (`feat/object-tag-views-922`, #922). On main after !1894 and !1898.**
+
+OpenSpec change: `openspec/changes/object-level-tags/` (section 9).
+
+- `information_schema.table_tags`, `schema_tags` and `catalog_tags` now list tags instead of no rows (`sqe-catalog/src/tag_views.rs`). One flat dispatch per view; rows are `TagRow { parts, tag, value }`.
+- `table_tags`: the same table walk as `column_tags`. The column-tag map is parsed first (an unreadable one leaves the table out of both views, with a warning), and the policy is asked even when the table has no column tags, so a table the policy denies entirely is left out of both.
+- `schema_tags`: `get_namespace` for every listed namespace (or the pinned one), read concurrently. Visibility is `SHOW SCHEMAS` visibility: what Polaris lists. A namespace that fails to load is left out.
+- `catalog_tags`: `SessionCatalog::catalog_properties` over the Polaris management API on the caller's token. Forbidden, missing, or a catalog that is not Polaris REST (or uses SigV4) gives no rows; an unreadable property gives no rows with a warning.
+- Fix found on the way: SQE's sqlite-rs catalog (`sqlite_rs_catalog.rs`) raised missing tables and namespaces, and existing ones, as `ErrorKind::Unexpected`. Upstream's sql catalog uses `TableNotFound`, `NamespaceNotFound`, `TableAlreadyExists` and `NamespaceAlreadyExists`. The schema provider treats only `TableNotFound` as "no such table", and DataFusion looks up a table function's name as a table first, so every table function query on that backend failed to plan. The kinds now match upstream.
+
+Gates: `cargo test -p sqe-catalog --lib tag_views` (14), `cargo test -p sqe-catalog --test it sqlite_rs` (6), `cargo test -p sqe-coordinator --features test-sqlite --test it -- live_tag_maps` (6, including the new read-after-write `object_tags_read_back_through_the_tag_views`), full test-sqlite coordinator `it` (366 passed; the 2 failures were the main-wide `rewrite_require_mode_test` pair, since fixed on main), `cargo test -p sqe-write --all-targets`, `cargo test -p sqe-catalog`, `cargo check-server`, clippy `-D warnings` on sqe-catalog. Live, on the Ranger compose stack: `catalog_tags_are_written_through_polaris_on_the_callers_token` now reads back through `ops_wh.information_schema.catalog_tags` (passed). The catalog admin and alice, who can read the catalog but not update it, see the same rows. The live `tag` subset: 7 passed, 1 failed, and the failure was `tag_from_out_of_band_commit_masks_the_next_query`, fixed on main by !1897.
+
+**NEXT:** values and object tags in `SHOW TAGS`.

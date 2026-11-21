@@ -41,3 +41,11 @@
 - [x] 8.3 Gate: admin, `admin-role` admins only, `ranger-delegate` leaves the privilege to Polaris; `tag_names` for SET
 - [x] 8.4 Book: catalog tags and the inheritance gap (#930)
 - [x] 8.5 Live e2e on the Ranger compose stack: catalog admin writes, reader refused by Polaris
+
+## 9. Readers
+
+- [x] 9.1 `table_tags`: same table walk and policy check as `column_tags` (asked even without column tags; unreadable column tags leave the table out)
+- [x] 9.2 `schema_tags`: `get_namespace` per listed or pinned namespace, `SHOW SCHEMAS` visibility
+- [x] 9.3 `catalog_tags`: management API on the caller's token; forbidden, missing or not Polaris gives no rows
+- [x] 9.4 Unit tests; sqlite `tests/it` read-after-write for table and schema tags
+- [x] 9.5 Live e2e: catalog tags read back for a catalog admin, and what a reader sees (a reader of the catalog sees the same rows)
