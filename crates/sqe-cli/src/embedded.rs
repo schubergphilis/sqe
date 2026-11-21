@@ -849,7 +849,7 @@ impl EmbeddedClient {
             )))
         });
         let r = || resolve.clone();
-        let functions: [(&str, Arc<dyn TableFunctionImpl>); 6] = [
+        let functions: [(&str, Arc<dyn TableFunctionImpl>); 7] = [
             (
                 "table_snapshots",
                 Arc::new(TableSnapshotsFunction::with_catalog_resolver(r())),
@@ -873,6 +873,13 @@ impl EmbeddedClient {
             (
                 "table_refs",
                 Arc::new(TableRefsFunction::with_catalog_resolver(r())),
+            ),
+            // `cat.information_schema.column_tags` and the other tag views,
+            // which the front door rewrites into this function. Embedded
+            // mode has no policy store, so every loadable table is listed.
+            (
+                sqe_catalog::tag_views::TAG_VIEW_FUNCTION,
+                Arc::new(sqe_catalog::tag_views::TagViewFunction::new(r())),
             ),
         ];
         for (name, function) in functions {

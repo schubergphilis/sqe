@@ -2215,16 +2215,20 @@ fn ensure_read_only(sql: &str, session_catalog: Option<&str>) -> Result<Statemen
 
 /// The table functions a tool statement may call: the catalog-scoped Iceberg
 /// metadata TVFs (`crates/sqe-catalog/src/iceberg_metadata_tvf.rs`), which
-/// resolve through the catalog. Everything else with `(...)` in FROM is
-/// refused (#766): `read_*`, `*_scan`, `quack_query` and whatever gets
-/// registered next read paths with the engine's credentials.
-const CATALOG_TABLE_FUNCTIONS: [&str; 6] = [
+/// resolve through the catalog, and the information_schema tag views
+/// (`cat.information_schema.column_tags`), which the front door rewrites into
+/// `sqe_information_schema_tags` and which list only tables the caller can
+/// load (`crates/sqe-catalog/src/tag_views.rs`). Everything else with
+/// `(...)` in FROM is refused (#766): `read_*`, `*_scan`, `quack_query` and
+/// whatever gets registered next read paths with the engine's credentials.
+const CATALOG_TABLE_FUNCTIONS: [&str; 7] = [
     "table_snapshots",
     "table_manifests",
     "table_history",
     "table_files",
     "table_partitions",
     "table_refs",
+    "sqe_information_schema_tags",
 ];
 
 /// Scalar-position names that are still file readers (`SELECT read_csv('x')`).
@@ -4234,6 +4238,19 @@ mod tests {
         ensure_read_only("SELECT * FROM t FOR VERSION AS OF 5", None)
             .expect("SQE time-travel clause survives the pre-parse pipeline");
         assert!(ensure_read_only("SELEC 1", None).is_err());
+    }
+
+    #[test]
+    fn information_schema_tag_views_are_readable() {
+        for view in ["catalog_tags", "schema_tags", "table_tags", "column_tags"] {
+            let sql = format!("SELECT * FROM lake.information_schema.{view} LIMIT 1");
+            ensure_read_only(&sql, Some("lake")).expect(view);
+        }
+        ensure_read_only(
+            "SELECT tag_name FROM information_schema.column_tags",
+            Some("lake"),
+        )
+        .expect("session catalog fills the catalog");
     }
 
     #[test]

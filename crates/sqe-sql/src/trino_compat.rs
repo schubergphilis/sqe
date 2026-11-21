@@ -41,7 +41,7 @@ use sqlparser::ast::{
     AccessExpr, BinaryOperator, CastKind, DataType as SqlDataType, Expr, Function, FunctionArg,
     FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments, Ident,
     LimitClause, ObjectName, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, Subscript,
-    TableFactor, TableFunctionArgs, Value, Visit, VisitMut, Visitor, VisitorMut,
+    TableAlias, TableFactor, TableFunctionArgs, Value, Visit, VisitMut, Visitor, VisitorMut,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -122,6 +122,14 @@ const METADATA_SUFFIXES: &[(&str, &str)] = &[
     ("files", "table_files"),
     ("refs", "table_refs"),
 ];
+
+/// Unity Catalog's `information_schema` tag views and the table function that
+/// answers them (`sqe_catalog::tag_views::TAG_VIEW_FUNCTION`). DataFusion
+/// answers every `information_schema.*` name itself, so the views are
+/// rewritten into the function call; see
+/// [`rewrite_information_schema_tag_view`].
+const TAG_VIEWS: &[&str] = &["catalog_tags", "schema_tags", "table_tags", "column_tags"];
+const TAG_VIEW_FUNCTION: &str = "sqe_information_schema_tags";
 
 /// Rewrite Trino-compat AST patterns in `sql` that DataFusion does not
 /// natively recognize. Returns the rewritten SQL as a new string. If the
@@ -259,7 +267,11 @@ pub fn apply_trino_compat(statements: &mut Vec<Statement>, source: &str) -> bool
     // `timestamp` -> rewrite_timestamp_precision: the typed literal and the
     // cast target take Trino's precision (see that function).
     let has_timestamp = lower.contains("timestamp");
+    // `_tags` -> rewrite_information_schema_tag_view:
+    // `information_schema.column_tags` and its siblings.
+    let has_tag_view = lower.contains("_tags");
     if !has_json_cast
+        && !has_tag_view
         && !has_timestamp
         && !has_explode
         && !has_late_dot
@@ -494,6 +506,9 @@ impl VisitorMut for TrinoCompatVisitor {
 
     fn post_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<Self::Break> {
         if rewrite_metadata_dollar_table(factor) {
+            self.rewrites += 1;
+        }
+        if rewrite_information_schema_tag_view(factor) {
             self.rewrites += 1;
         }
         if rewrite_unnest_with_ordinality(factor) {
@@ -1665,6 +1680,76 @@ fn rewrite_metadata_dollar_table(factor: &mut TableFactor) -> bool {
     true
 }
 
+/// Rewrite Unity Catalog's `information_schema` tag views into the table
+/// function that answers them:
+///
+/// - `cat.information_schema.column_tags` ->
+///   `sqe_information_schema_tags('column_tags', 'cat') AS column_tags`
+/// - `information_schema.table_tags` (no session catalog to qualify it) ->
+///   `sqe_information_schema_tags('table_tags') AS table_tags`
+///
+/// DataFusion answers any `information_schema.*` name with its own provider,
+/// so a table registered there would never be read. The front door
+/// qualifies a bare `information_schema.x` with the session catalog first
+/// ([`crate::metadata::qualify_information_schema`]), so the catalog argument
+/// is the one the query means. A user alias is kept; without one the view's
+/// name becomes the alias, so `column_tags.tag_name` still resolves. Names
+/// match ignoring ASCII case; any other `information_schema` table and a
+/// table called `column_tags` in an ordinary schema are left alone.
+fn rewrite_information_schema_tag_view(factor: &mut TableFactor) -> bool {
+    let TableFactor::Table {
+        name, alias, args, ..
+    } = factor
+    else {
+        return false;
+    };
+    if args.is_some() {
+        return false;
+    }
+    let parts: Vec<&Ident> = name.0.iter().filter_map(|p| p.as_ident()).collect();
+    if parts.len() != name.0.len() {
+        return false;
+    }
+    let (catalog, schema, view) = match parts.as_slice() {
+        [catalog, schema, view] => (Some(catalog.value.clone()), *schema, *view),
+        [schema, view] => (None, *schema, *view),
+        _ => return false,
+    };
+    if !schema.value.eq_ignore_ascii_case("information_schema") {
+        return false;
+    }
+    let Some(view_name) = TAG_VIEWS
+        .iter()
+        .find(|v| v.eq_ignore_ascii_case(&view.value))
+    else {
+        return false;
+    };
+
+    let literal = |value: String| {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
+            Value::SingleQuotedString(value).into(),
+        )))
+    };
+    let args_vec = std::iter::once(view_name.to_string())
+        .chain(catalog)
+        .map(literal)
+        .collect();
+    if alias.is_none() {
+        *alias = Some(TableAlias {
+            explicit: true,
+            name: Ident::new(*view_name),
+            columns: vec![],
+            at: None,
+        });
+    }
+    *name = ObjectName::from(vec![Ident::new(TAG_VIEW_FUNCTION)]);
+    *args = Some(TableFunctionArgs {
+        args: args_vec,
+        settings: None,
+    });
+    true
+}
+
 /// Rewrite Spark's `explode(a)` and `posexplode(a)` select items into
 /// DataFusion `unnest`, in every SELECT of `body` (set-operation branches
 /// included; nested queries are reached by their own `post_visit_query`).
@@ -2355,6 +2440,47 @@ mod tests {
             !lower.contains("string_agg"),
             "must not become string_agg: {out}"
         );
+    }
+
+    // ─── information_schema tag views ──────────────────────────────────────
+
+    #[test]
+    fn tag_views_rewrite_to_the_function() {
+        let cases = [
+            (
+                "SELECT * FROM cat.information_schema.column_tags",
+                "SELECT * FROM sqe_information_schema_tags('column_tags', 'cat') AS column_tags",
+            ),
+            (
+                "SELECT * FROM information_schema.schema_tags",
+                "SELECT * FROM sqe_information_schema_tags('schema_tags') AS schema_tags",
+            ),
+            (
+                "SELECT c.tag_value FROM \"Cat\".information_schema.CATALOG_TAGS AS c",
+                "SELECT c.tag_value FROM sqe_information_schema_tags('catalog_tags', 'Cat') AS c",
+            ),
+            (
+                "SELECT column_tags.tag_name FROM cat.information_schema.column_tags \
+                 WHERE column_tags.schema_name = 's'",
+                "SELECT column_tags.tag_name FROM sqe_information_schema_tags('column_tags', 'cat') \
+                 AS column_tags WHERE column_tags.schema_name = 's'",
+            ),
+        ];
+        for (sql, want) in cases {
+            assert_eq!(rewrite_trino_compat(sql), want, "{sql}");
+        }
+    }
+
+    #[test]
+    fn other_tables_are_not_tag_views() {
+        for sql in [
+            "SELECT * FROM cat.information_schema.columns",
+            "SELECT * FROM cat.sales.column_tags",
+            "SELECT * FROM column_tags",
+            "SELECT * FROM a.b.information_schema.column_tags",
+        ] {
+            assert_eq!(rewrite_trino_compat(sql), sql);
+        }
     }
 
     // ─── Metadata $-syntax rewriter ────────────────────────────────────────

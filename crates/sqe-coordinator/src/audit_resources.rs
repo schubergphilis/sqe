@@ -49,13 +49,27 @@ pub fn resources_from_plan(plan: &LogicalPlan, default_catalog: Option<&str>) ->
             LogicalPlan::TableScan(TableScan {
                 table_name, source, ..
             }) => {
-                // Check whether this scan's provider is an un-inlined ViewTable.
-                // After DF54 this is rare; governed views are inlined to their
-                // base scans. Un-inlined ViewTable scans are typically fail-closed
-                // denied by the policy rewriter, but we tag them View here for
-                // completeness.
-                let object_type =
-                    if let Ok(provider) = datafusion::datasource::source_as_provider(source) {
+                let provider = datafusion::datasource::source_as_provider(source).ok();
+                // The information_schema tag views plan as a table function;
+                // name them as the view the user queried, so the result
+                // cache sees a catalog-metadata read and never caches it.
+                let tag_view = provider
+                    .as_ref()
+                    .and_then(|p| sqe_catalog::tag_views::tag_view_resource(p.as_ref()));
+                if let Some((catalog, view)) = tag_view {
+                    let name = datafusion::common::TableReference::full(
+                        catalog,
+                        "information_schema",
+                        view,
+                    );
+                    Some((name, ObjectType::View))
+                } else {
+                    // Check whether this scan's provider is an un-inlined ViewTable.
+                    // After DF54 this is rare; governed views are inlined to their
+                    // base scans. Un-inlined ViewTable scans are typically fail-closed
+                    // denied by the policy rewriter, but we tag them View here for
+                    // completeness.
+                    let object_type = if let Some(provider) = provider {
                         let any_ref: &dyn std::any::Any = provider.as_ref();
                         if any_ref
                             .downcast_ref::<datafusion::datasource::ViewTable>()
@@ -68,7 +82,8 @@ pub fn resources_from_plan(plan: &LogicalPlan, default_catalog: Option<&str>) ->
                     } else {
                         ObjectType::Table
                     };
-                Some((table_name.clone(), object_type))
+                    Some((table_name.clone(), object_type))
+                }
             }
             LogicalPlan::Dml(DmlStatement { table_name, .. }) => {
                 // INSERT INTO / UPDATE / DELETE: the target is always a Table.
@@ -239,5 +254,46 @@ mod tests {
         let plan = plan_for_ref(TableReference::partial("ns", "tbl"));
         let resources = resources_from_plan(&plan, Some("cat"));
         assert_eq!(resources[0].fqn(), "cat.ns.tbl");
+    }
+
+    /// A tag view is named as the information_schema view the user queried,
+    /// not as the table function it plans to, so the result cache treats it
+    /// as a catalog-metadata read and never stores it.
+    #[tokio::test]
+    async fn a_tag_view_is_named_as_its_information_schema_view() {
+        use iceberg::CatalogBuilder;
+        use sqe_catalog::tag_views::{TagViewFunction, TAG_VIEW_FUNCTION};
+
+        let catalog = iceberg::memory::MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                [("warehouse".to_string(), "memory:///wh".to_string())].into(),
+            )
+            .await
+            .unwrap();
+        let catalog = std::sync::Arc::new(sqe_catalog::SessionCatalog::local(
+            std::sync::Arc::new(catalog),
+            "lake",
+            &Default::default(),
+        ));
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_udtf(
+            TAG_VIEW_FUNCTION,
+            std::sync::Arc::new(TagViewFunction::new(std::sync::Arc::new(move |_| {
+                Ok(std::sync::Arc::clone(&catalog))
+            }))),
+        );
+        let plan = ctx
+            .sql("SELECT * FROM sqe_information_schema_tags('column_tags', 'lake') AS column_tags")
+            .await
+            .unwrap()
+            .into_unoptimized_plan();
+        let resources = resources_from_plan(&plan, Some("other"));
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].fqn(), "lake.information_schema.column_tags");
+        assert_eq!(resources[0].object_type, ObjectType::View);
+        assert!(crate::query_cache::ResultCache::reads_catalog_metadata(
+            &resources
+        ));
     }
 }

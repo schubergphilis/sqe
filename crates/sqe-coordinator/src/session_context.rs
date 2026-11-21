@@ -970,8 +970,53 @@ pub async fn create_session_context(
             ctx.register_udtf(
                 "table_refs",
                 Arc::new(meta::TableRefsFunction::with_catalog_resolver(
-                    metadata_catalogs,
+                    metadata_catalogs.clone(),
                 )),
+            );
+
+            // Unity Catalog's information_schema tag views
+            // (`cat.information_schema.column_tags`, ...), which the front
+            // door rewrites into this function. A table the policy store
+            // denies the caller entirely is left out, as a query of it
+            // reports "table not found".
+            let tag_view_access = policy_store.map(|store| {
+                let store = Arc::clone(store);
+                let user = session.user.clone();
+                let precedence = config.policy.mask_precedence;
+                let catalog_scoped = store.catalog_scoped();
+                sqe_catalog::tag_views::TagViewAccess::new(
+                    move |catalog,
+                          namespace,
+                          table,
+                          col_tags|
+                          -> futures::future::BoxFuture<'static, bool> {
+                        let (store, user) = (Arc::clone(&store), user.clone());
+                        let namespace = if catalog_scoped {
+                            format!("{catalog}.{namespace}")
+                        } else {
+                            namespace
+                        };
+                        Box::pin(async move {
+                            let policy = sqe_policy::plan_rewriter::resolve_effective_policy(
+                                store.as_ref(),
+                                &user,
+                                &table,
+                                &namespace,
+                                &col_tags,
+                                precedence,
+                            )
+                            .await;
+                            !sqe_policy::plan_rewriter::policy_denies_all(&policy)
+                        })
+                    },
+                )
+            });
+            ctx.register_udtf(
+                sqe_catalog::tag_views::TAG_VIEW_FUNCTION,
+                Arc::new(
+                    sqe_catalog::tag_views::TagViewFunction::new(metadata_catalogs)
+                        .with_access(tag_view_access),
+                ),
             );
 
             // Symmetric to DuckDB's quack_query(): pull rows from a remote

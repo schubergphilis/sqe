@@ -556,6 +556,31 @@ mod tests {
         }
     }
 
+    /// A bare `information_schema.column_tags` is qualified with the session
+    /// catalog first, so the tag-view function gets that catalog.
+    #[test]
+    fn tag_views_become_the_tag_view_function() {
+        for d in DIALECTS {
+            let door = SqlFrontDoor::new(d).with_session_catalog(Some("lake"));
+            let bare = door
+                .normalize("SELECT tag_name FROM information_schema.column_tags")
+                .unwrap();
+            assert_eq!(
+                bare.sql(),
+                "SELECT tag_name FROM sqe_information_schema_tags('column_tags', 'lake') AS column_tags",
+                "{d:?}"
+            );
+            let qualified = door
+                .normalize("SELECT * FROM other.INFORMATION_SCHEMA.Table_Tags t LIMIT 1")
+                .unwrap();
+            assert_eq!(
+                qualified.sql(),
+                "SELECT * FROM sqe_information_schema_tags('table_tags', 'other') t LIMIT 1",
+                "{d:?}"
+            );
+        }
+    }
+
     #[test]
     fn source_fallbacks_run_only_when_the_first_parse_fails() {
         let door = SqlFrontDoor::new(WireDialect::Flight);
