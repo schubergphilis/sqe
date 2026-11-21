@@ -40,45 +40,43 @@ impl LiveTags {
 
     /// The property updates that store `applied` (current names) plus the
     /// orphans, with ids from `committed`, the schema current after the
-    /// commit. Ids no entry needs remove the ids property.
+    /// commit. When no entry needs an id, existing ids are overwritten with
+    /// an empty set bound to the new map. The updates never remove a
+    /// property: that is a catalog privilege a tag steward need not hold
+    /// (#936).
     pub fn record(
         &self,
         applied: &ColumnTagMap,
         committed: &Schema,
     ) -> Result<Vec<TableUpdate>, serde_json::Error> {
         let recorded = ids::record(applied, &self.resolved.orphaned, &SchemaFieldIds(committed))?;
+        let ids = match recorded.ids {
+            Some(value) => Some(value),
+            None if self.raw_ids.is_some() => Some(ids::empty_ids(&recorded.tags)?),
+            None => None,
+        };
         let mut set = std::collections::HashMap::from([(PROP_KEY.to_string(), recorded.tags)]);
-        let mut updates = Vec::new();
-        match recorded.ids {
-            Some(value) => {
-                set.insert(IDS_PROP_KEY.to_string(), value);
-            }
-            None if self.raw_ids.is_some() => updates.push(TableUpdate::RemoveProperties {
-                removals: vec![IDS_PROP_KEY.to_string()],
-            }),
-            None => {}
+        if let Some(value) = ids {
+            set.insert(IDS_PROP_KEY.to_string(), value);
         }
-        updates.insert(0, TableUpdate::SetProperties { updates: set });
-        Ok(updates)
+        Ok(vec![TableUpdate::SetProperties { updates: set }])
     }
 
-    /// The updates that put both properties back exactly as they were read.
+    /// The update that puts both properties back as they were read: the
+    /// exact values, so the digest still binds. A property that was absent
+    /// comes back as its empty form (`{}`, ids bound to the restored map),
+    /// never as a removal (#936).
     pub fn restore(&self) -> Vec<TableUpdate> {
-        let mut set = std::collections::HashMap::new();
-        let mut removals = Vec::new();
-        for (key, raw) in [(PROP_KEY, &self.raw_tags), (IDS_PROP_KEY, &self.raw_ids)] {
-            match raw {
-                Some(value) => {
-                    set.insert(key.to_string(), value.clone());
-                }
-                None => removals.push(key.to_string()),
-            }
-        }
-        let mut updates = vec![TableUpdate::SetProperties { updates: set }];
-        if !removals.is_empty() {
-            updates.push(TableUpdate::RemoveProperties { removals });
-        }
-        updates
+        let tags = self.raw_tags.clone().unwrap_or_else(|| "{}".to_string());
+        let ids = match &self.raw_ids {
+            Some(value) => value.clone(),
+            None => ids::empty_ids(&tags).expect("serialising a fixed struct"),
+        };
+        let set = std::collections::HashMap::from([
+            (PROP_KEY.to_string(), tags),
+            (IDS_PROP_KEY.to_string(), ids),
+        ]);
+        vec![TableUpdate::SetProperties { updates: set }]
     }
 }
 
@@ -158,9 +156,10 @@ mod tests {
         assert_eq!(again.applied, live.resolved.applied);
     }
 
-    /// Removing every tag removes the ids property too.
+    /// Removing every tag empties the ids, bound to the new map, with one
+    /// SetProperties and no removal (#936).
     #[test]
-    fn an_empty_map_drops_the_ids() {
+    fn an_empty_map_empties_the_ids() {
         let s = schema(&[(1, "ssn")]);
         let tags = r#"{"ssn":["PII"]}"#;
         let bound = format!(
@@ -169,23 +168,66 @@ mod tests {
         );
         let live = live(Some(tags), Some(&bound), &s);
         let updates = live.record(&ColumnTagMap::new(), &s).unwrap();
-        assert!(matches!(
-            &updates[1],
-            TableUpdate::RemoveProperties { removals } if removals == &[IDS_PROP_KEY.to_string()]
-        ));
+        assert_eq!(updates.len(), 1, "{updates:?}");
+        let set = set_of(&updates);
+        let ids = ids::parse_ids(&set[IDS_PROP_KEY]).unwrap();
+        assert!(ids.ids.is_empty());
+        assert_eq!(ids.tags_sha256, ids::digest(&set[PROP_KEY]));
     }
 
-    /// A rollback restores the exact bytes, so the digest still binds.
+    /// No tag write, in any start state, removes a property: removal is a
+    /// catalog privilege a tag steward need not hold (#936).
+    #[test]
+    fn no_tag_write_removes_a_property() {
+        let s = schema(&[(1, "ssn"), (2, "email")]);
+        let tags = r#"{"ssn":["PII"]}"#;
+        let bound = format!(
+            r#"{{"v":1,"tags_sha256":"{}","ids":{{"ssn":1}}}}"#,
+            ids::digest(tags)
+        );
+        let mut tagged = ColumnTagMap::new();
+        tagged.insert("email".into(), vec![ColumnTag::key("PII")]);
+        let starts = [
+            (None, None),
+            (Some(tags), None),
+            (Some(tags), Some(bound.as_str())),
+            (None, Some(bound.as_str())),
+        ];
+        for (raw_tags, raw_ids) in starts {
+            let state = live(raw_tags, raw_ids, &s);
+            let writes = [
+                state.record(&ColumnTagMap::new(), &s).unwrap(),
+                state.record(&tagged, &s).unwrap(),
+                state.record(state.applied(), &s).unwrap(),
+                state.restore(),
+            ];
+            for updates in writes {
+                assert!(
+                    updates
+                        .iter()
+                        .all(|u| matches!(u, TableUpdate::SetProperties { .. })),
+                    "{raw_tags:?} {raw_ids:?}: {updates:?}"
+                );
+            }
+        }
+    }
+
+    /// A rollback restores the exact bytes, so the digest still binds; an
+    /// absent property comes back empty, never as a removal (#936).
     #[test]
     fn restore_puts_back_the_exact_values() {
         let s = schema(&[(1, "ssn")]);
         let tags = r#"{ "ssn": ["PII"] }"#;
-        let live = live(Some(tags), None, &s);
-        let updates = live.restore();
-        assert_eq!(set_of(&updates)[PROP_KEY], tags);
-        assert!(matches!(
-            &updates[1],
-            TableUpdate::RemoveProperties { removals } if removals == &[IDS_PROP_KEY.to_string()]
-        ));
+        let updates = live(Some(tags), None, &s).restore();
+        assert_eq!(updates.len(), 1, "{updates:?}");
+        let set = set_of(&updates);
+        assert_eq!(set[PROP_KEY], tags);
+        let ids = ids::parse_ids(&set[IDS_PROP_KEY]).unwrap();
+        assert!(ids.ids.is_empty());
+        assert_eq!(ids.tags_sha256, ids::digest(tags));
+
+        let set = set_of(&live(None, None, &s).restore());
+        let resolved = resolve_table_tags(&set, &s).unwrap();
+        assert!(resolved.applied.is_empty() && resolved.orphaned.is_empty());
     }
 }
