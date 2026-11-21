@@ -1601,9 +1601,9 @@ impl CatalogOps {
     /// overwritten unauthorised. A live or new value that is not a tag map is
     /// refused too.
     ///
-    /// With `conflict_guard` (`mask_precedence = refuse`), a statement that
-    /// sets the key takes the same lock and refuses a new map that creates a
-    /// policy conflict (#918), whoever writes it. A live value that is not a
+    /// With `conflict_guard` (set whenever a policy store is configured), a
+    /// statement that sets the key takes the same lock and refuses a new map
+    /// that creates a policy conflict (#918, #931), whoever writes it. A live value that is not a
     /// tag map counts as empty there, so an admin can still repair it.
     #[instrument(skip_all, fields(username = %session.user.username))]
     pub async fn set_table_properties_guarded(
@@ -1693,14 +1693,21 @@ impl CatalogOps {
                         )))
                     }
                 };
-                let wanted = sqe_core::column_tags::parse(raw).map_err(|e| {
-                    SqeError::Catalog(format!(
-                        "403 Forbidden: {TAG_PROP_KEY} must be a JSON object of column to \
-                         tag list ({e})"
-                    ))
-                })?;
-                if let Some(authorised) = authorised_tag_columns {
-                    let unauthorised: Vec<String> = changed_tag_columns(&live, &wanted)
+                let wanted = match sqe_core::column_tags::parse(raw) {
+                    Ok(wanted) => Some(wanted),
+                    // An unrestricted writer may store a value that is not a
+                    // tag map; reads of it deny everything (#840), so it
+                    // creates no policy conflict to check.
+                    Err(_) if authorised_tag_columns.is_none() => None,
+                    Err(e) => {
+                        return Err(SqeError::Catalog(format!(
+                            "403 Forbidden: {TAG_PROP_KEY} must be a JSON object of column to \
+                             tag list ({e})"
+                        )))
+                    }
+                };
+                if let (Some(authorised), Some(wanted)) = (authorised_tag_columns, &wanted) {
+                    let unauthorised: Vec<String> = changed_tag_columns(&live, wanted)
                         .into_iter()
                         .filter(|c| !authorised.contains(c))
                         .collect();
@@ -1712,8 +1719,8 @@ impl CatalogOps {
                         )));
                     }
                 }
-                if let Some(guard) = conflict_guard {
-                    let (before, after) = (column_tags::keys(&live), column_tags::keys(&wanted));
+                if let (Some(guard), Some(wanted)) = (conflict_guard, &wanted) {
+                    let (before, after) = (column_tags::keys(&live), column_tags::keys(wanted));
                     guard.check(&before, &after).await?;
                 }
                 Some(held)
@@ -1931,9 +1938,9 @@ impl CatalogOps {
     /// applies merge semantics, and commits the new map as a single
     /// `TableUpdate::SetProperties`.
     ///
-    /// `conflict_guard` (set under `mask_precedence = refuse`) runs inside the
-    /// table lock on the live map and refuses a change that creates a policy
-    /// conflict (#918).
+    /// `conflict_guard` (set whenever a policy store is configured) runs inside
+    /// the table lock on the live map and refuses a change that creates a
+    /// policy conflict (#918, #931).
     #[instrument(skip(self, session, stmt, conflict_guard), fields(username = %session.user.username))]
     pub async fn set_column_tags(
         &self,

@@ -3209,7 +3209,9 @@ async fn refuse_at_write_disjoint_roles_allowed() {
 }
 
 /// 4.4: a tag row filter that differs from engineer's resource row filter is
-/// refused, and the table keeps its tags.
+/// refused, and the table keeps its tags. One row filter per table and user
+/// (TA-13, #931) holds in every precedence, so the default `tag` handler
+/// refuses the write too.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn refuse_at_write_row_filter_conflict() {
@@ -3233,13 +3235,20 @@ async fn refuse_at_write_row_filter_conflict() {
         .await
         .expect("create tag row filter");
     let refuse = refuse_handler(&ctx).await;
+    // A fresh default-precedence handler: `ctx.handler` loaded its policies
+    // before these were created, and a write that goes through once leaves
+    // nothing new for a retry to refuse.
+    let (tag, _) =
+        crate::common::setup_ranger_handler_sharing(Some(ctx.cache.clone()), |_| {}).await;
 
     let set = format!("ALTER TABLE {ORDERS} SET TAGS (region = ('GEO'))");
-    let err = refused_as_conflict(&refuse, &ctx.carol, &set).await;
-    assert!(
-        err.contains("row filter conflict on sales_wh.ac.orders"),
-        "{err}"
-    );
+    for handler in [&refuse, &tag] {
+        let err = refused_as_conflict(handler, &ctx.carol, &set).await;
+        assert!(
+            err.contains("row filter conflict on sales_wh.ac.orders"),
+            "{err}"
+        );
+    }
     // Nothing was written: bob's refuse read keeps only the resource filter.
     let read = format!("SELECT id FROM {ORDERS} ORDER BY id");
     crate::common::eventually("bob to read the EU rows only", || async {

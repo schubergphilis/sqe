@@ -14,4 +14,4 @@
 
 ## 4. Follow-up
 
-- [ ] 4.1 Refuse a `SET TAGS` that creates a row-filter conflict in every precedence (the #918 write guard runs under `refuse` only)
+- [x] 4.1 Refuse a `SET TAGS` that creates a row-filter conflict in every precedence (`tag_conflict_guard` runs in every mode; mask conflicts still only under `refuse`; `access_control_e2e::refuse_at_write_row_filter_conflict` checks the default `tag` handler too)

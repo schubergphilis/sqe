@@ -227,33 +227,39 @@ impl QueryHandler {
         Ok(key.map(|(namespace, table)| (namespace, table, display)))
     }
 
-    /// Under `mask_precedence = refuse`, the check a tag write of `table` runs
-    /// under its table lock: it refuses a change that creates a mask or row
-    /// filter conflict for a principal the policies name (#918). `None` in
-    /// the other modes and without a policy store.
+    /// The check a tag write of `table` runs under its table lock: it refuses
+    /// a change that creates a conflict for a principal the policies name
+    /// (#918). A row-filter conflict is refused under every `mask_precedence`
+    /// (TA-13, #931); a mask conflict only under `refuse`. `None` without a
+    /// policy store.
     pub(super) fn tag_conflict_guard(
         &self,
         session: &Session,
         table: &sqlparser::ast::ObjectName,
     ) -> sqe_core::Result<Option<TagConflictGuard>> {
-        if self.config.policy.mask_precedence != MaskPrecedence::Refuse {
-            return Ok(None);
-        }
         let Some(store) = self.policy_store.clone() else {
             return Ok(None);
         };
-        let (namespace, table_name, display) = self
-            .tag_policy_key(session, store.as_ref(), table)?
-            .ok_or_else(|| {
-                SqeError::with_code(
-                    SqeErrorCode::AccessDenied,
-                    format!("cannot key table '{table}' for a policy conflict check"),
-                )
-            })?;
+        let precedence = self.config.policy.mask_precedence;
+        let Some((namespace, table_name, display)) =
+            self.tag_policy_key(session, store.as_ref(), table)?
+        else {
+            // Outside `refuse` a table the policies cannot key was never
+            // checked; keep it that way rather than refuse its tag writes.
+            if precedence != MaskPrecedence::Refuse {
+                return Ok(None);
+            }
+            return Err(SqeError::with_code(
+                SqeErrorCode::AccessDenied,
+                format!("cannot key table '{table}' for a policy conflict check"),
+            ));
+        };
         let catalog = crate::ident::catalog_qualifier(table)
             .unwrap_or_else(|| self.session_catalog_name(session));
         Ok(Some(
-            TagConflictGuard::new(store, namespace, table_name, display).with_catalog(catalog),
+            TagConflictGuard::new(store, namespace, table_name, display)
+                .with_catalog(catalog)
+                .with_precedence(precedence),
         ))
     }
 
