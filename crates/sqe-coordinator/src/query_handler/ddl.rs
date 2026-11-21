@@ -86,7 +86,7 @@ impl QueryHandler {
             // without PURGE.
             if let Some(table) = self.catalog_ops.purge_target(session, stmt).await? {
                 let call = sqe_sql::ProcedureCall::DropTable { table, purge: true };
-                let purged = self.maintenance_handler.handle(session, &call).await;
+                let purged = self.run_maintenance_call(session, &call).await;
                 purged.map_err(sql_purge_denial)?;
                 if let Some(ref qcache) = self.query_cache {
                     qcache.invalidate_all();

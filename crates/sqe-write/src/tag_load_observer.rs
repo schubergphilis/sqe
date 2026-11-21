@@ -34,6 +34,28 @@ struct Projected {
     tags: ColumnTags,
 }
 
+/// What the observer last projected, per `{catalog}|{ns}.{table}`.
+///
+/// `CatalogOps` owns it and hands it to the observer, so a DDL statement that
+/// projects a table itself can [`forget`](Self::forget) it (#928). Without
+/// that, a dropped table's remembered tags would make the observer skip a
+/// table recreated under the same name with the same tags.
+#[derive(Clone, Default)]
+pub(crate) struct TagLoadMemory(Arc<Mutex<HashMap<String, Projected>>>);
+
+impl TagLoadMemory {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Projected>> {
+        self.0.lock().expect("projected tags mutex poisoned")
+    }
+
+    /// Drop what was projected for `ident` in every catalog, so its next
+    /// load projects its tags afresh.
+    pub(crate) fn forget(&self, ident: &TableIdent) {
+        let suffix = format!("|{ident}");
+        self.lock().retain(|key, _| !key.ends_with(&suffix));
+    }
+}
+
 /// One table load, reduced to what the projection needs.
 struct Observation {
     /// `{catalog}|{ns}.{table}`: the same table in two catalogs is two
@@ -53,7 +75,7 @@ pub struct TagLoadObserver {
     /// `CatalogOps`' per-table locks, so a projection from here never
     /// interleaves with `SET TAG`'s own.
     table_locks: TableLockMap,
-    projected: Arc<Mutex<HashMap<String, Projected>>>,
+    projected: TagLoadMemory,
 }
 
 impl TagLoadObserver {
@@ -61,20 +83,18 @@ impl TagLoadObserver {
         projector: Arc<dyn TagProjector>,
         catalog_scoped: bool,
         table_locks: TableLockMap,
+        projected: TagLoadMemory,
     ) -> Self {
         Self {
             projector,
             catalog_scoped,
             table_locks,
-            projected: Default::default(),
+            projected,
         }
     }
 
     fn is_current(&self, key: &str, location: &str) -> bool {
-        let projected = self
-            .projected
-            .lock()
-            .expect("projected tags mutex poisoned");
+        let projected = self.projected.lock();
         projected.get(key).is_some_and(|p| p.location == location)
     }
 
@@ -86,10 +106,7 @@ impl TagLoadObserver {
         let lock = keyed_lock(&self.table_locks, lock_key);
         let _guard = lock.lock().await;
         let previous = {
-            let projected = self
-                .projected
-                .lock()
-                .expect("projected tags mutex poisoned");
+            let projected = self.projected.lock();
             match projected.get(&obs.key) {
                 Some(p)
                     if p.location == obs.location || p.last_updated_ms > obs.last_updated_ms =>
@@ -121,11 +138,7 @@ impl TagLoadObserver {
             last_updated_ms: obs.last_updated_ms,
             tags: obs.tags,
         };
-        let mut projected = self
-            .projected
-            .lock()
-            .expect("projected tags mutex poisoned");
-        projected.insert(obs.key, state);
+        self.projected.lock().insert(obs.key, state);
     }
 }
 
@@ -202,7 +215,8 @@ mod tests {
     fn setup() -> (Arc<Recording>, TagLoadObserver) {
         let rec = Arc::new(Recording::default());
         let locks = Arc::new(Mutex::new(HashMap::new()));
-        (rec.clone(), TagLoadObserver::new(rec, false, locks))
+        let memory = TagLoadMemory::default();
+        (rec.clone(), TagLoadObserver::new(rec, false, locks, memory))
     }
 
     fn obs(location: &str, updated: i64, tags: &[(&str, &str)]) -> Observation {
@@ -279,5 +293,26 @@ mod tests {
         rec.fail.store(false, std::sync::atomic::Ordering::SeqCst);
         o.converge(obs("m1", 1, &[("ssn", "PII")])).await;
         assert_eq!(calls(&rec).len(), 1);
+    }
+
+    /// #928: a table dropped and recreated under its name with the same tags
+    /// is projected again once DDL has forgotten it.
+    #[tokio::test]
+    async fn a_forgotten_table_is_projected_again_with_the_same_tags() {
+        let (rec, o) = setup();
+        o.converge(obs("m1", 1, &[("ssn", "PII")])).await;
+        o.converge(obs("m2", 2, &[("ssn", "PII")])).await;
+        assert_eq!(calls(&rec).len(), 1, "same tags, nothing re-sent");
+
+        let other = TableIdent::new(NamespaceIdent::new("ns2".into()), "t".into());
+        o.projected.forget(&other);
+        assert!(o.is_current("cat|ns.t", "m2"), "another table is kept");
+
+        o.projected.forget(&obs("m3", 3, &[]).ident);
+        assert!(!o.is_current("cat|ns.t", "m2"));
+        o.converge(obs("m3", 3, &[("ssn", "PII")])).await;
+        let c = calls(&rec);
+        assert_eq!(c.len(), 2, "the recreated table is projected: {c:?}");
+        assert!(c[1].1.is_empty() && c[1].2.contains_key("ssn"));
     }
 }

@@ -183,6 +183,14 @@ fn reject_oversized_sql(query: &QueryConfig, sql: &str) -> sqe_core::Result<()> 
     query.check_sql_bytes(sql)
 }
 
+/// The table a CREATE TABLE or CTAS writes.
+fn created_table_name(stmt: &Statement) -> Option<&sqlparser::ast::ObjectName> {
+    match stmt {
+        Statement::CreateTable(ct) => Some(&ct.name),
+        _ => None,
+    }
+}
+
 /// The SQL front door at the engine boundary (finding 700).
 ///
 /// Every statement the coordinator classifies or plans goes through
@@ -955,6 +963,27 @@ impl QueryHandler {
             .default_catalog
             .clone()
             .unwrap_or_else(|| self.config.resolve_default_catalog())
+    }
+
+    /// Run a maintenance procedure. A `drop_table` also clears the table's
+    /// projected Ranger tags once it has dropped it (#928).
+    async fn run_maintenance_call(
+        &self,
+        session: &Session,
+        call: &sqe_sql::ProcedureCall,
+    ) -> sqe_core::Result<Vec<arrow_array::RecordBatch>> {
+        let sqe_sql::ProcedureCall::DropTable { table, .. } = call else {
+            return self.maintenance_handler.handle(session, call).await;
+        };
+        let tags = self
+            .catalog_ops
+            .tags_before_procedure_drop(session, table)
+            .await;
+        let dropped = self.maintenance_handler.handle(session, call).await?;
+        if let Some(tags) = tags {
+            self.catalog_ops.clear_tags_after_procedure_drop(tags).await;
+        }
+        Ok(dropped)
     }
 
     /// Resolve the catalog whose metadata a `SHOW SCHEMAS/TABLES FROM <catalog>`
@@ -2513,7 +2542,21 @@ impl QueryHandler {
                     // The session-cache drop lives in
                     // `WriteHandler::after_commit` with every other write path
                     // (architecture review 507).
-                    self.write_handler.handle_create_table(session, stmt).await
+                    let table = created_table_name(stmt);
+                    let tags = match table {
+                        Some(t) => self.catalog_ops.tags_before_create(session, t).await,
+                        None => None,
+                    };
+                    let created = self
+                        .write_handler
+                        .handle_create_table(session, stmt)
+                        .await?;
+                    if let Some(t) = table {
+                        self.catalog_ops
+                            .project_created_table_tags(session, t, tags)
+                            .await?;
+                    }
+                    Ok(created)
                 }
 
                 // `CREATE EXTERNAL TABLE` (Hive/Athena) is classified separately
@@ -2628,14 +2671,28 @@ impl QueryHandler {
                 )),
 
                 StatementKind::Ctas(stmt) => {
-                    self.handle_ctas_statement(
-                        session,
-                        stmt,
-                        memory,
-                        &mut captured_plan,
-                        &mut policy_summary,
-                    )
-                    .await
+                    // Tags in the properties, or a replaced table's trimmed
+                    // tags, reach Ranger too (#928).
+                    let table = created_table_name(stmt);
+                    let tags = match table {
+                        Some(t) => self.catalog_ops.tags_before_create(session, t).await,
+                        None => None,
+                    };
+                    let created = self
+                        .handle_ctas_statement(
+                            session,
+                            stmt,
+                            memory,
+                            &mut captured_plan,
+                            &mut policy_summary,
+                        )
+                        .await?;
+                    if let Some(t) = table {
+                        self.catalog_ops
+                            .project_created_table_tags(session, t, tags)
+                            .await?;
+                    }
+                    Ok(created)
                 }
 
                 StatementKind::Insert(stmt) => {
@@ -3713,7 +3770,7 @@ impl QueryHandler {
                 )
                 .await?;
             }
-            let result = self.maintenance_handler.handle(session, call).await;
+            let result = self.run_maintenance_call(session, call).await;
 
             // Maintenance procedures rewrite the table's snapshot
             // history. Two caches must drop their entries before the
