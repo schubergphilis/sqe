@@ -2405,6 +2405,22 @@ impl PolicyStore for RangerStore {
         (masks, filter_exprs, unmappable)
     }
 
+    async fn conflict_principals(
+        &self,
+        table_name: &str,
+        namespace: &str,
+        tags: &std::collections::HashSet<String>,
+    ) -> sqe_core::Result<Option<Vec<SessionUser>>> {
+        let bundle = self.cached_bundle().await?;
+        Ok(Some(conflict_principals::conflict_principals_from_bundle(
+            &bundle,
+            &hive_database(namespace),
+            table_name,
+            !self.catalog_scoped,
+            tags,
+        )))
+    }
+
     fn invalidate_all(&self) {
         self.cache.invalidate_all();
         // Also drop the shared bundle so a manual refresh does not serve a stale
@@ -2437,6 +2453,8 @@ impl PolicyStore for RangerStore {
         Ok(defs)
     }
 }
+
+mod conflict_principals;
 
 #[cfg(test)]
 mod tests {

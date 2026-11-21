@@ -291,6 +291,22 @@ pub trait PolicyStore: Send + Sync {
         (HashMap::new(), vec![], HashSet::new())
     }
 
+    /// One user per principal that a mask or row-filter policy on this table,
+    /// or on one of `tags`, names, plus a user with no name, roles or groups
+    /// (who still matches `{PUBLIC}` items). The tag write check under
+    /// `mask_precedence = refuse` resolves each of them (#918).
+    ///
+    /// `Ok(None)` (the default) means the store cannot say, and the check
+    /// allows the write. An error refuses it.
+    async fn conflict_principals(
+        &self,
+        _table_name: &str,
+        _namespace: &str,
+        _tags: &HashSet<String>,
+    ) -> sqe_core::Result<Option<Vec<SessionUser>>> {
+        Ok(None)
+    }
+
     /// List the data-mask policies as WRITTEN in the backing store.
     ///
     /// Powers `SHOW MASKING POLICIES`. The default REFUSES rather than returning an

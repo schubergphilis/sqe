@@ -15,7 +15,7 @@ async fn alter(rig: &SqliteRig, sql: &str, authorised: Option<&[&str]>) -> sqe_c
     let set: Option<BTreeSet<String>> =
         authorised.map(|cs| cs.iter().map(|c| c.to_string()).collect());
     CatalogOps::new(rig.config.clone())
-        .set_table_properties_guarded(&rig.session(), &stmt, set.as_ref())
+        .set_table_properties_guarded(&rig.session(), &stmt, set.as_ref(), None)
         .await
 }
 

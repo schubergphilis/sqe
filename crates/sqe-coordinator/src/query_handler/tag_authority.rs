@@ -21,7 +21,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use super::*;
 use crate::tag_source_impl::{changed_tag_columns, tag_property_write};
 use sqe_core::column_tags::ColumnTagMap;
-use sqe_core::config::{TagAuthority, TagNames, TagPrivilege};
+use sqe_core::config::{MaskPrecedence, TagAuthority, TagNames, TagPrivilege};
+use sqe_policy::tag_conflict_guard::TagConflictGuard;
 use sqe_policy::TablePrivilege;
 
 mod object_tags;
@@ -200,6 +201,88 @@ impl QueryHandler {
         ))
     }
 
+    /// The policy key `(namespace, table)` of the table a tag write of `table`
+    /// commits to, and its qualified name: the catalog the write resolves (the
+    /// session's for a bare name), keyed by the store's `catalog_scoped` rule
+    /// as enforcement keys it. `None` when the table cannot be keyed.
+    fn tag_policy_key(
+        &self,
+        session: &Session,
+        store: &dyn PolicyStore,
+        table: &sqlparser::ast::ObjectName,
+    ) -> sqe_core::Result<Option<(String, String, String)>> {
+        let table_ident = crate::ident::resolve_table_ident(table, session)?;
+        let catalog_name = crate::ident::catalog_qualifier(table)
+            .unwrap_or_else(|| self.session_catalog_name(session));
+        let default_hive = sqe_policy::plan_rewriter::HiveCatalogs::new();
+        let hive_catalogs = self.hive_catalogs.as_deref().unwrap_or(&default_hive);
+        let key = sqe_policy::plan_rewriter::resolve_policy_key_for_ident_scoped(
+            Some(&catalog_name),
+            table_ident.namespace().as_ref(),
+            table_ident.name(),
+            hive_catalogs,
+            store.catalog_scoped(),
+        );
+        let display = format!("{catalog_name}.{table_ident}");
+        Ok(key.map(|(namespace, table)| (namespace, table, display)))
+    }
+
+    /// Under `mask_precedence = refuse`, the check a tag write of `table` runs
+    /// under its table lock: it refuses a change that creates a mask or row
+    /// filter conflict for a principal the policies name (#918). `None` in
+    /// the other modes and without a policy store.
+    pub(super) fn tag_conflict_guard(
+        &self,
+        session: &Session,
+        table: &sqlparser::ast::ObjectName,
+    ) -> sqe_core::Result<Option<TagConflictGuard>> {
+        if self.config.policy.mask_precedence != MaskPrecedence::Refuse {
+            return Ok(None);
+        }
+        let Some(store) = self.policy_store.clone() else {
+            return Ok(None);
+        };
+        let (namespace, table_name, display) = self
+            .tag_policy_key(session, store.as_ref(), table)?
+            .ok_or_else(|| {
+                SqeError::with_code(
+                    SqeErrorCode::AccessDenied,
+                    format!("cannot key table '{table}' for a policy conflict check"),
+                )
+            })?;
+        let catalog = crate::ident::catalog_qualifier(table)
+            .unwrap_or_else(|| self.session_catalog_name(session));
+        Ok(Some(
+            TagConflictGuard::new(store, namespace, table_name, display).with_catalog(catalog),
+        ))
+    }
+
+    /// [`Self::tag_conflict_guard`] for SET/UNSET TAGS and the masking-policy
+    /// statements, which reach the same write.
+    pub(super) fn tag_statement_conflict_guard(
+        &self,
+        session: &Session,
+        stmt: &sqe_sql::tags::SetTagsStatement,
+    ) -> sqe_core::Result<Option<TagConflictGuard>> {
+        let table = crate::catalog_ops::parse_object_name(&stmt.table)?;
+        self.tag_conflict_guard(session, &table)
+    }
+
+    /// [`Self::tag_conflict_guard`] for a raw property statement: only one
+    /// that writes `sqe.column-tags` to an existing table gets the check.
+    pub(super) fn tag_property_conflict_guard(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+    ) -> sqe_core::Result<Option<TagConflictGuard>> {
+        match stmt {
+            Statement::AlterTable(at) if tag_property_write(stmt)?.is_some() => {
+                self.tag_conflict_guard(session, &at.name)
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Every column in `columns` of `table` must be granted the configured
     /// privilege by `store`. The policy key is derived with the same functions
     /// the tag writes resolve their table with, so the resource checked is the
@@ -214,20 +297,8 @@ impl QueryHandler {
         statement: &str,
     ) -> sqe_core::Result<()> {
         let privilege = self.tag_privilege();
-        let table_ident = crate::ident::resolve_table_ident(table, session)?;
-        let catalog_name = crate::ident::catalog_qualifier(table)
-            .unwrap_or_else(|| self.session_catalog_name(session));
-        let default_hive = sqe_policy::plan_rewriter::HiveCatalogs::new();
-        let hive_catalogs = self.hive_catalogs.as_deref().unwrap_or(&default_hive);
-        let (namespace, table_name) =
-            sqe_policy::plan_rewriter::resolve_policy_key_for_ident_scoped(
-                Some(&catalog_name),
-                table_ident.namespace().as_ref(),
-                table_ident.name(),
-                hive_catalogs,
-                store.catalog_scoped(),
-            )
-            .ok_or_else(|| {
+        let (namespace, table_name, _) =
+            self.tag_policy_key(session, store, table)?.ok_or_else(|| {
                 self.refuse_tag_write(
                     session,
                     statement,
