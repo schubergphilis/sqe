@@ -16,7 +16,7 @@ The default `[policy] engine = "passthrough"` returns plans unmodified. Turn enf
 ```toml
 [policy]
 engine = "ranger"
-mask-precedence = "tag"        # which mask wins on a column covered by both (default: "tag")
+mask-precedence = "tag"        # which mask wins on a column covered by both: "tag" (default), "resource" or "refuse"
 
 [policy.ranger]
 url = "http://ranger-admin:6080"
@@ -59,6 +59,8 @@ SQE evaluates mask and row-filter policies the way Ranger does:
 - **Across row-filter policies SQE applies every matching policy's filter**, ANDed. Ranger applies only the first. A user covered by two filter policies sees no more rows in SQE than in Ranger, and possibly fewer.
 
 `mask-precedence` settles the one case where a column is covered twice, by a resource policy naming it and by a tag policy matching its classification. `tag` is the default and matches the plugin order Hive and Spark/Kyuubi implement, so a rule authored once in Ranger renders the same value whichever engine reads it. `resource` restores the narrower most-specific-rule-wins reading. The column is masked either way; only which mask applies changes.
+
+`refuse` picks no winner, the rule Unity Catalog ABAC follows. When more than one distinct mask resolves for a column and user (its resource mask and a tag mask, or two tag masks), the statement fails with `mask conflict on <catalog>.<schema>.<table>.<column>` before any row is read. When a tag row filter and a different filter resolve for a table and user, it fails with `row filter conflict on <catalog>.<schema>.<table>`. The same mask or filter from two sources is one mask or filter, not a conflict, and a user for whom only one resolves gets that one. Statements that only read a policy (metadata functions, `SHOW STATS`, `SHOW EFFECTIVE POLICY`) see a contested table as denied. `SET TAGS` does not yet refuse a tag that would create a conflict; the conflict shows up when the table is read.
 
 `[policy.ranger]` is distinct from `[access_control.ranger]`. The `[policy]` block points at the frontend-query service for SQE-side fine-grained enforcement (row filters and masks that SQE applies). The `[access_control]` block points at the `polaris` service for the coarse GRANT-to-catalog path where Polaris enforces. They can target the same Ranger Admin host and read different services. See [GRANT and REVOKE](../sql-reference/grant-revoke.md) for the two-axis model.
 

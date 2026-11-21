@@ -26,7 +26,7 @@ use sqe_policy::policy_store::InMemoryPolicyStore;
 use sqe_policy::tag_source::TagSource;
 use sqe_policy::{
     plan_rewriter::{PolicyPlanRewriter, ScanTagState},
-    MaskType, PolicyEnforcer, PolicyStore, ResolvedPolicy, TagMaskSpec,
+    MaskType, PolicyEnforcer, PolicyStore, PolicySummary, ResolvedPolicy, TagMaskSpec,
 };
 
 fn user(name: &str, roles: &[&str]) -> SessionUser {
@@ -892,6 +892,11 @@ impl TagTestStore {
         self
     }
 
+    fn with_tag_filter(mut self, filter: Expr) -> Self {
+        self.tag_filters.push(filter);
+        self
+    }
+
     fn with_unmappable(mut self, tag: &str) -> Self {
         self.unmappable.insert(tag.to_string());
         self
@@ -1152,8 +1157,113 @@ async fn run_contested_column(precedence: MaskPrecedence) {
                 64,
                 "{precedence:?}: expected a 64-char tag Hash, got {got:?} (row {i})"
             ),
+            MaskPrecedence::Refuse => unreachable!("covered by contested_column_refuses_*"),
         }
     }
+}
+
+/// The `employees` scan of the shared fixture, selecting `customer_id, ssn`.
+fn contested_plan() -> LogicalPlan {
+    let (_mem, scan) = build_multilevel_scan_with_mem();
+    let tref = TableReference::full("cat", "ns1.ns2", "employees");
+    LogicalPlanBuilder::from(scan)
+        .project(vec![
+            Expr::Column(Column::new(Some(tref.clone()), "customer_id")),
+            Expr::Column(Column::new(Some(tref), "ssn")),
+        ])
+        .unwrap()
+        .build()
+        .unwrap()
+}
+
+/// `refuse` precedence (#918): `store` resolved for the `ssn` column tagged
+/// `PII`.
+async fn evaluate_refusing(store: TagTestStore) -> sqe_core::Result<(LogicalPlan, PolicySummary)> {
+    let mut col_tags = HashMap::new();
+    col_tags.insert("ssn".to_string(), vec!["PII".to_string()]);
+    let (fake_source, _calls) = FakeTagSource::new(col_tags);
+    PolicyPlanRewriter::new(Arc::new(store))
+        .with_tag_source(Arc::new(fake_source))
+        .with_mask_precedence(MaskPrecedence::Refuse)
+        .evaluate(
+            &user("bob", &[]),
+            &sqe_policy::TableScope::default(),
+            contested_plan(),
+        )
+        .await
+}
+
+/// A resource mask and a different tag mask on one column: the statement is
+/// refused with the column named, before any row is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn contested_column_refuses_under_refuse() {
+    let mut resource_policy = ResolvedPolicy::default();
+    resource_policy
+        .column_masks
+        .insert("ssn".to_string(), MaskType::Redact("***".to_string()));
+    let store = TagTestStore::new()
+        .with_resource_policy(resource_policy)
+        .with_tag_mask("PII", MaskType::Hash);
+    let err = evaluate_refusing(store)
+        .await
+        .expect_err("two masks conflict");
+    assert_eq!(
+        err.error_code(),
+        sqe_core::SqeErrorCode::AccessDenied,
+        "{err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("mask conflict on cat.ns1.ns2.employees.ssn"),
+        "{err}"
+    );
+}
+
+/// The same mask from the resource policy and the tag is one mask: no error,
+/// the column reads masked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn contested_column_refuses_nothing_when_the_masks_agree() {
+    let mut resource_policy = ResolvedPolicy::default();
+    resource_policy
+        .column_masks
+        .insert("ssn".to_string(), MaskType::Hash);
+    let store = TagTestStore::new()
+        .with_resource_policy(resource_policy)
+        .with_tag_mask("PII", MaskType::Hash);
+    let (_plan, summary) = evaluate_refusing(store).await.expect("one distinct mask");
+    assert_eq!(summary.columns_masked, vec!["ssn"], "{summary:?}");
+}
+
+/// A resource row filter and a different tag row filter conflict; the same
+/// filter twice is one filter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn contested_row_filter_refuses_under_refuse() {
+    let region_eu = col("region").eq(lit("EU"));
+    let mut resource_policy = ResolvedPolicy::default();
+    resource_policy.row_filters.push(region_eu.clone());
+
+    let store = TagTestStore::new()
+        .with_resource_policy(resource_policy.clone())
+        .with_tag_filter(col("region").eq(lit("US")));
+    let err = evaluate_refusing(store)
+        .await
+        .expect_err("two filters conflict");
+    assert_eq!(
+        err.error_code(),
+        sqe_core::SqeErrorCode::AccessDenied,
+        "{err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("row filter conflict on cat.ns1.ns2.employees"),
+        "{err}"
+    );
+
+    let store = TagTestStore::new()
+        .with_resource_policy(resource_policy)
+        .with_tag_filter(region_eu);
+    let (_plan, summary) = evaluate_refusing(store).await.expect("one distinct filter");
+    assert_eq!(summary.row_filters_applied, 1, "{summary:?}");
 }
 
 /// Test 4 -- unmappable tag fails closed: ssn is DROPPED from the output.
@@ -1754,6 +1864,7 @@ async fn effective_policy_reports_the_precedence_the_rewriter_applies() {
                 matches!(got_mask, MaskType::Redact(s) if s == "***"),
                 "{precedence:?}: expected the resource Redact, got {got_mask:?}"
             ),
+            MaskPrecedence::Refuse => unreachable!("not in this loop"),
         }
     }
 }
