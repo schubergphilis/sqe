@@ -341,6 +341,34 @@ impl MaintenanceHandler {
                 // 4b scheduler can call them directly with the catalog it
                 // already built via its own `catalog_factory` seam, without
                 // going through `create_catalog_bridge` a second time.
+                // Phase 4c Task 5: `distribution.mode` routing. `distributed`
+                // is the optional per-call override (`distributed =>
+                // 'auto'|'local'|'require'`); absent, the configured
+                // `[maintenance.distribution] mode` applies. `require` below
+                // the healthy-worker floor is an `Err` here -- the manual
+                // `CALL` surface is interactive, so a caller who explicitly
+                // asked to require the fleet gets a loud failure, never a
+                // silent coordinator-local rewrite. It is decided before the
+                // catalog is opened: the answer does not depend on the table
+                // and names nothing about it.
+                let mode = match distributed {
+                    Some(raw) => parse_distribution_mode_override(raw)?,
+                    None => self.config.maintenance.distribution.mode,
+                };
+                let dist = self.config.maintenance.distribution.clone();
+                let healthy = self.healthy_worker_count().await;
+                let plan = resolve_execution(mode, healthy, dist.min_workers);
+                if plan == ExecutionPlan::SkipInsufficientWorkers {
+                    return Err(SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!(
+                            "CALL system.rewrite_data_files: distribution mode 'require' \
+                         needs >= {} healthy workers, only {healthy} are healthy",
+                            dist.min_workers
+                        ),
+                    ));
+                }
+
                 let session_catalog = self
                     .create_session_catalog(session, table.catalog.as_deref())
                     .await?;
@@ -354,27 +382,9 @@ impl MaintenanceHandler {
 
                 let rewrite_all = rewrite_all.unwrap_or(false);
 
-                // Phase 4c Task 5: `distribution.mode` routing. `distributed`
-                // is the optional per-call override (`distributed =>
-                // 'auto'|'local'|'require'`); absent, the configured
-                // `[maintenance.distribution] mode` applies. `require` below
-                // the healthy-worker floor is an `Err` here -- the manual
-                // `CALL` surface is interactive, so a caller who explicitly
-                // asked to require the fleet gets a loud failure, never a
-                // silent coordinator-local rewrite.
-                let mode = match distributed {
-                    Some(raw) => parse_distribution_mode_override(raw)?,
-                    None => self.config.maintenance.distribution.mode,
-                };
-                let dist = self.config.maintenance.distribution.clone();
-                let healthy = self.healthy_worker_count().await;
-                let outcome = match resolve_execution(mode, healthy, dist.min_workers) {
+                let outcome = match plan {
                     ExecutionPlan::SkipInsufficientWorkers => {
-                        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                            "CALL system.rewrite_data_files: distribution mode 'require' \
-                             needs >= {} healthy workers, only {healthy} are healthy",
-                            dist.min_workers
-                        )));
+                        unreachable!("refused before the catalog was opened")
                     }
                     ExecutionPlan::Local => {
                         self.rewrite_data_files(
