@@ -1215,13 +1215,18 @@ mod live_tag_maps {
     impl Rig {
         /// Table `t (ssn, email, phone)` with `ssn` and `email` tagged.
         async fn new(authority: TagAuthority, grants: ColumnGrants) -> Self {
+            Self::with_removal(authority, grants, Default::default()).await
+        }
+
+        async fn with_removal(
+            authority: TagAuthority,
+            grants: ColumnGrants,
+            removal: sqe_core::config::TagRemoval,
+        ) -> Self {
             let rig = SqliteRig::new().await;
-            let handler = tag_handler(
-                rig.config.clone(),
-                Arc::new(grants),
-                authority,
-                TagPrivilege::ApplyTag,
-            );
+            let mut config = rig.config.clone();
+            config.access_control.tag_removal = removal;
+            let handler = tag_handler(config, Arc::new(grants), authority, TagPrivilege::ApplyTag);
             let me = Self { rig, handler };
             me.run("root", "CREATE TABLE t (ssn INT, email INT, phone INT)")
                 .await
@@ -1327,6 +1332,49 @@ mod live_tag_maps {
         // An admin may do anything.
         r.run("root", &set("{}")).await.expect("admin");
         assert!(r.tags().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_removal_gates_the_keys_a_raw_write_drops() {
+        use sqe_policy::TablePrivilege::RemoveTag;
+        let mut grants: Vec<_> = ["ssn", "email", "phone"]
+            .map(|c| ("steward", c, ApplyTag))
+            .into();
+        grants.push(("steward", "email", RemoveTag));
+        let removal = sqe_core::config::TagRemoval::RemoveTag;
+        let r =
+            Rig::with_removal(TagAuthority::RangerDelegate, ColumnGrants(grants), removal).await;
+        // Adding a column or a key removes nothing.
+        let sql = set(r#"{"ssn":["PII","GDPR"],"email":["PII"],"phone":["PII"]}"#);
+        r.run("steward", &sql).await.expect("adds only");
+        // Dropping a key from `ssn` needs `remove_tag` there.
+        let err = r
+            .run(
+                "steward",
+                &set(r#"{"ssn":["PII"],"email":["PII"],"phone":["PII"]}"#),
+            )
+            .await;
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("requires remove_tag on default.t.ssn"),
+            "{msg}"
+        );
+        assert_eq!(
+            r.tags().await["ssn"].len(),
+            2,
+            "the refused write did not land"
+        );
+        // CREATE OR REPLACE diffs against the live map the same way.
+        let sql = "CREATE OR REPLACE TABLE t TBLPROPERTIES ('sqe.column-tags' = \
+                   '{\"ssn\":[\"PII\"],\"email\":[\"PII\"],\"phone\":[\"PII\"]}') \
+                   AS SELECT 1 AS ssn, 2 AS email, 3 AS phone";
+        let msg = r.run("steward", sql).await.unwrap_err().to_string();
+        assert!(msg.contains("requires remove_tag on"), "{msg}");
+        assert_eq!(r.tags().await["ssn"].len(), 2, "nothing replaced");
+        // `email` is granted it.
+        let sql = set(r#"{"ssn":["PII","GDPR"],"phone":["PII"]}"#);
+        r.run("steward", &sql).await.expect("email may be untagged");
+        assert!(!r.tags().await.contains_key("email"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1666,4 +1714,130 @@ async fn catalog_tags_refuse_an_undefined_key_and_a_dotted_name() {
         err.to_string().contains("single catalog name"),
         "{sql}: {err}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #927 - tag_removal: removing a tag can need more than adding one
+// ---------------------------------------------------------------------------
+
+fn removal_handler(
+    store: Arc<dyn PolicyStore>,
+    removal: sqe_core::config::TagRemoval,
+    privilege: sqe_core::config::TagPrivilege,
+) -> QueryHandler {
+    let mut config = minimal_config();
+    config.access_control.tag_removal = removal;
+    let authority = sqe_core::config::TagAuthority::RangerDelegate;
+    tag_handler(config, store, authority, privilege)
+}
+
+const UNTAG_STMTS: [&str; 2] = [
+    "ALTER TABLE ns.tbl UNSET TAGS (ssn)",
+    "ALTER TABLE ns.tbl MODIFY COLUMN ssn UNSET MASKING POLICY",
+];
+
+#[tokio::test]
+async fn tag_removal_remove_tag_gates_the_untags_only() {
+    use sqe_core::config::{TagPrivilege, TagRemoval};
+    use sqe_policy::TablePrivilege::{ApplyTag, RemoveTag};
+    let grants = ColumnGrants(vec![
+        ("steward", "ssn", ApplyTag),
+        ("remover", "ssn", ApplyTag),
+        ("remover", "ssn", RemoveTag),
+        ("bare", "ssn", RemoveTag),
+    ]);
+    let handler = removal_handler(
+        Arc::new(grants),
+        TagRemoval::RemoveTag,
+        TagPrivilege::ApplyTag,
+    );
+    let session = |u: &str| session_for(u, vec!["analyst"]);
+    // Adding a tag needs the tag privilege only.
+    let sql = "ALTER TABLE ns.tbl SET TAGS (ssn = ('PII'))";
+    assert_passed_tag_gate(handler.execute(&session("steward"), sql, None).await, sql);
+    for sql in UNTAG_STMTS {
+        let err = handler
+            .execute(&session("steward"), sql, None)
+            .await
+            .expect_err(sql);
+        assert!(
+            err.to_string()
+                .contains("requires remove_tag on ns.tbl.ssn"),
+            "{sql}: {err}"
+        );
+        assert_passed_tag_gate(handler.execute(&session("remover"), sql, None).await, sql);
+        // `remove_tag` stacks on the tag privilege; it does not replace it.
+        let err = handler
+            .execute(&session("bare"), sql, None)
+            .await
+            .expect_err(sql);
+        assert!(
+            err.to_string().contains("requires apply_tag on ns.tbl.ssn"),
+            "{sql}: {err}"
+        );
+        let root = session_for("root", vec!["service_admin"]);
+        assert_passed_tag_gate(handler.execute(&root, sql, None).await, sql);
+    }
+}
+
+#[tokio::test]
+async fn tag_removal_admin_and_same() {
+    use sqe_core::config::{TagPrivilege, TagRemoval};
+    use sqe_policy::TablePrivilege::{Alter, RemoveTag};
+    let grants = || {
+        Arc::new(ColumnGrants(vec![
+            ("owner", "ssn", Alter),
+            ("owner", "ssn", RemoveTag),
+        ]))
+    };
+    let owner = session_for("owner", vec!["analyst"]);
+    let root = session_for("root", vec!["service_admin"]);
+    let admin = removal_handler(grants(), TagRemoval::Admin, TagPrivilege::Alter);
+    let sql = "ALTER TABLE ns.tbl SET TAGS (ssn = ('PII'))";
+    assert_passed_tag_gate(admin.execute(&owner, sql, None).await, sql);
+    for sql in UNTAG_STMTS {
+        let err = admin.execute(&owner, sql, None).await.expect_err(sql);
+        assert!(
+            err.to_string().contains("tag_removal = \"admin\""),
+            "{sql}: {err}"
+        );
+        assert_passed_tag_gate(admin.execute(&root, sql, None).await, sql);
+    }
+    // The default leaves an untag to the tag privilege, as before.
+    let same = removal_handler(grants(), TagRemoval::default(), TagPrivilege::Alter);
+    for sql in UNTAG_STMTS {
+        assert_passed_tag_gate(same.execute(&owner, sql, None).await, sql);
+    }
+}
+
+#[tokio::test]
+async fn tag_removal_gates_object_untags() {
+    use sqe_core::config::{TagPrivilege, TagRemoval};
+    use sqe_policy::TablePrivilege::{Alter, RemoveTag};
+    let store = Arc::new(sqe_policy::policy_store::InMemoryPolicyStore::new());
+    store
+        .grant_table_privilege("ns", "tbl", "alice", Alter)
+        .await;
+    store.grant_table_privilege("ns", "tbl", "bob", Alter).await;
+    store
+        .grant_table_privilege("ns", "tbl", "bob", RemoveTag)
+        .await;
+    let handler = removal_handler(store.clone(), TagRemoval::RemoveTag, TagPrivilege::Alter);
+    let [set, unset] = TABLE_TAG_STMTS;
+    let alice = session_for("alice", vec!["analyst"]);
+    let bob = session_for("bob", vec!["analyst"]);
+    assert_passed_tag_gate(handler.execute(&alice, set, None).await, set);
+    let err = handler.execute(&alice, unset, None).await.expect_err(unset);
+    assert!(
+        err.to_string().contains("requires remove_tag on ns.tbl"),
+        "{err}"
+    );
+    assert_passed_tag_gate(handler.execute(&bob, unset, None).await, unset);
+    // Polaris has no `remove_tag`: a catalog untag is an admin's.
+    let [set, unset] = CATALOG_TAG_STMTS;
+    assert_passed_tag_gate(handler.execute(&bob, set, None).await, set);
+    assert_refused_by_tag_gate(handler.execute(&bob, unset, None).await, unset);
+    let admin = removal_handler(store, TagRemoval::Admin, TagPrivilege::Alter);
+    let [_, unset] = TABLE_TAG_STMTS;
+    assert_refused_by_tag_gate(admin.execute(&bob, unset, None).await, unset);
 }

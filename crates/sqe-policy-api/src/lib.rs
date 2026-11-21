@@ -213,6 +213,10 @@ pub enum TablePrivilege {
     /// to the `hive` servicedef). Not implied by `alter`, by any write type,
     /// or by an allow item's `all`.
     ApplyTag,
+    /// Remove a tag from a column (Ranger `remove_tag`, custom like
+    /// `apply_tag`) under `tag_removal = "remove_tag"` (#927). Implied by
+    /// nothing, `apply_tag` included.
+    RemoveTag,
 }
 
 impl TablePrivilege {
@@ -222,6 +226,7 @@ impl TablePrivilege {
             Self::Alter => "alter",
             Self::Drop => "drop",
             Self::ApplyTag => "apply_tag",
+            Self::RemoveTag => "remove_tag",
         }
     }
 }

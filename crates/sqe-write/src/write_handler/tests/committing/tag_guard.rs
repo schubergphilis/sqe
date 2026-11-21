@@ -4,18 +4,31 @@
 
 use super::*;
 use crate::catalog_ops::CatalogOps;
-use crate::tag_source_impl::{parse_column_tags, PROP_KEY};
-use std::collections::{BTreeSet, HashMap};
+use crate::tag_source_impl::{parse_column_tags, TagWriteAuth, PROP_KEY};
+use std::collections::HashMap;
 
+/// Authorised to change `authorised` columns and to remove a tag key from none.
 async fn alter(rig: &SqliteRig, sql: &str, authorised: Option<&[&str]>) -> sqe_core::Result<()> {
+    let auth = authorised.map(|changed| (changed, &[][..]));
+    alter_auth(rig, sql, auth).await
+}
+
+async fn alter_auth(
+    rig: &SqliteRig,
+    sql: &str,
+    authorised: Option<(&[&str], &[&str])>,
+) -> sqe_core::Result<()> {
     let dialect = sqlparser::dialect::GenericDialect {};
     let stmt = sqlparser::parser::Parser::parse_sql(&dialect, sql)
         .expect("parse")
         .remove(0);
-    let set: Option<BTreeSet<String>> =
-        authorised.map(|cs| cs.iter().map(|c| c.to_string()).collect());
+    let names = |cs: &[&str]| cs.iter().map(|c| c.to_string()).collect();
+    let auth = authorised.map(|(changed, removed)| TagWriteAuth {
+        changed: names(changed),
+        removed: names(removed),
+    });
     CatalogOps::new(rig.config.clone())
-        .set_table_properties_guarded(&rig.session(), &stmt, set.as_ref(), None)
+        .set_table_properties_guarded(&rig.session(), &stmt, auth.as_ref(), None)
         .await
 }
 
@@ -51,6 +64,23 @@ async fn a_guarded_tag_write_changes_only_authorised_columns() {
         .expect_err("ssn not authorised");
     assert!(err.to_string().contains("ssn"), "{err}");
     assert_eq!(tags(&rig).await.len(), 2, "nothing written");
+
+    // #927: removing `phone`'s tag key needs removal authority on `phone`,
+    // not just the right to change it.
+    let drop_phone = set(r#"{"ssn":["PII"]}"#);
+    let err = alter(&rig, &drop_phone, Some(&["phone"]))
+        .await
+        .expect_err("phone removal not authorised");
+    assert!(err.to_string().contains("phone"), "{err}");
+    assert_eq!(tags(&rig).await.len(), 2, "nothing written");
+    alter_auth(&rig, &drop_phone, Some((&["phone"], &["phone"])))
+        .await
+        .expect("phone removal authorised");
+    assert_eq!(tags(&rig).await.len(), 1);
+    let restore = set(r#"{"ssn":["PII"],"phone":["PII"]}"#);
+    alter(&rig, &restore, Some(&["phone"]))
+        .await
+        .expect("phone re-added");
 
     // Other properties in the statement do not get through either.
     let err = alter(

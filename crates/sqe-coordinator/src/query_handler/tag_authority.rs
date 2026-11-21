@@ -19,9 +19,11 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::*;
-use crate::tag_source_impl::{changed_tag_columns, tag_property_write};
+use crate::tag_source_impl::{
+    changed_tag_columns, removed_tag_columns, tag_property_write, TagWriteAuth,
+};
 use sqe_core::column_tags::ColumnTagMap;
-use sqe_core::config::{MaskPrecedence, TagAuthority, TagNames, TagPrivilege};
+use sqe_core::config::{MaskPrecedence, TagAuthority, TagNames, TagPrivilege, TagRemoval};
 use sqe_policy::tag_conflict_guard::TagConflictGuard;
 use sqe_policy::TablePrivilege;
 
@@ -99,9 +101,18 @@ impl QueryHandler {
                 .iter()
                 .map(|op| op.column.as_str())
                 .collect::<Vec<_>>(),
+            self.tag_privilege(),
             statement,
         )
         .await?;
+        let unset: Vec<&str> = stmt
+            .ops
+            .iter()
+            .filter(|op| op.action == sqe_sql::tags::TagAction::Unset)
+            .map(|op| op.column.as_str())
+            .collect();
+        self.require_tag_removal(session, store, &object_name, &unset, statement)
+            .await?;
         let set: BTreeSet<&str> = stmt
             .ops
             .iter()
@@ -289,8 +300,49 @@ impl QueryHandler {
         }
     }
 
-    /// Every column in `columns` of `table` must be granted the configured
-    /// privilege by `store`. The policy key is derived with the same functions
+    /// `[access_control] tag_removal` for a non-admin under `ranger-delegate`
+    /// whose write removes a tag key from `columns` (#927), after the tag
+    /// privilege passed: `same` adds nothing, `remove_tag` needs that access
+    /// type on each column, `admin` refuses. A removal that passes is logged,
+    /// since it may lift a mask.
+    async fn require_tag_removal(
+        &self,
+        session: &Session,
+        store: &dyn PolicyStore,
+        table: &sqlparser::ast::ObjectName,
+        columns: &[&str],
+        statement: &str,
+    ) -> sqe_core::Result<()> {
+        if columns.is_empty() {
+            return Ok(());
+        }
+        match self.config.access_control.tag_removal {
+            TagRemoval::Same => {}
+            TagRemoval::RemoveTag => {
+                let privilege = TablePrivilege::RemoveTag;
+                self.require_tag_columns(session, store, table, columns, privilege, statement)
+                    .await?
+            }
+            TagRemoval::Admin => {
+                return Err(self.refuse_tag_write(
+                    session,
+                    statement,
+                    "removes a tag; tag_removal = \"admin\" reserves that for admins",
+                ))
+            }
+        }
+        info!(
+            username = %session.user.username,
+            statement,
+            table = %table,
+            columns = ?columns,
+            "tag removal authorised"
+        );
+        Ok(())
+    }
+
+    /// Every column in `columns` of `table` must be granted `privilege` by
+    /// `store`. The policy key is derived with the same functions
     /// the tag writes resolve their table with, so the resource checked is the
     /// resource written (a bare name resolves against the session schema). A
     /// store error grants nothing.
@@ -300,9 +352,9 @@ impl QueryHandler {
         store: &dyn PolicyStore,
         table: &sqlparser::ast::ObjectName,
         columns: &[&str],
+        privilege: TablePrivilege,
         statement: &str,
     ) -> sqe_core::Result<()> {
-        let privilege = self.tag_privilege();
         let (namespace, table_name, _) =
             self.tag_policy_key(session, store, table)?.ok_or_else(|| {
                 self.refuse_tag_write(
@@ -401,7 +453,8 @@ impl QueryHandler {
     /// The per-column part of the raw `sqe.column-tags` gate under
     /// `ranger-delegate`, after the catalog preflight. Diffs the live tag map
     /// against the one `stmt` writes and requires the configured privilege on
-    /// every added, changed or removed column. Returns those columns for a
+    /// every added, changed or removed column, and [`Self::require_tag_removal`]
+    /// on the columns that lose a key (#927). Returns those columns for a
     /// non-admin under `ranger-delegate` (the `ALTER` write re-checks them
     /// under its table lock), `None` when no per-column check applies.
     ///
@@ -413,7 +466,7 @@ impl QueryHandler {
         &self,
         session: &Session,
         stmt: &Statement,
-    ) -> sqe_core::Result<Option<BTreeSet<String>>> {
+    ) -> sqe_core::Result<Option<TagWriteAuth>> {
         if self.config.auth.has_admin_role(&session.user.roles) {
             return Ok(None);
         }
@@ -469,12 +522,45 @@ impl QueryHandler {
             store,
             table,
             &changed.iter().map(String::as_str).collect::<Vec<_>>(),
+            self.tag_privilege(),
             RAW_TAG_WRITE,
         )
         .await?;
+        let removed = removed_tag_columns(&old, &new);
+        let columns = removed.iter().map(String::as_str).collect::<Vec<_>>();
+        self.require_tag_removal(session, store, table, &columns, RAW_TAG_WRITE)
+            .await?;
         self.require_defined_tags(session, table, &added_tag_names(&old, &new), RAW_TAG_WRITE)
             .await?;
-        Ok(Some(changed))
+        // Under `same` a changed column may also lose a key by the time the
+        // write holds its lock: the tag privilege alone covered that.
+        let removed = match self.config.access_control.tag_removal {
+            TagRemoval::Same => changed.clone(),
+            TagRemoval::RemoveTag | TagRemoval::Admin => removed,
+        };
+        Ok(Some(TagWriteAuth { changed, removed }))
+    }
+}
+
+/// The statement `SET / UNSET MASKING POLICY` is gated as, before the policy
+/// is looked up: its column with no tag names, an add for `SET` and, for
+/// `UNSET`, a removal of every tag on the column (what the write does).
+pub(super) fn masking_policy_gate(
+    op: &sqe_sql::tags::MaskingPolicyOp,
+) -> sqe_sql::tags::SetTagsStatement {
+    use sqe_sql::tags::TagAction;
+    sqe_sql::tags::SetTagsStatement {
+        table: op.table.clone(),
+        ops: vec![sqe_sql::tags::ColumnTagOp {
+            column: op.column.clone(),
+            tags: vec![],
+            values: Default::default(),
+            action: if op.policy.is_some() {
+                TagAction::Set
+            } else {
+                TagAction::Unset
+            },
+        }],
     }
 }
 

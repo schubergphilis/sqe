@@ -13,6 +13,7 @@ mod hive_data;
 mod mcp;
 pub mod production;
 mod storage;
+mod tags;
 mod tvf_policy;
 
 pub use auth::{AuthConfig, AuthProviderConfig, ExternalAuthConfig};
@@ -24,6 +25,7 @@ pub use hive_data::{
 };
 pub use mcp::{McpAnonymousConfig, McpAuthConfig, McpAuthMode, McpConfig, McpPrincipalConfig};
 pub use storage::StorageConfig;
+pub use tags::{TagAuthority, TagNames, TagPrivilege, TagRemoval};
 pub use tvf_policy::{TvfCaller, TvfPolicy};
 
 #[cfg(test)]
@@ -2316,6 +2318,9 @@ pub struct AccessControlConfig {
     /// `tag_authority = "ranger-delegate"`. See [`TagPrivilege`].
     #[serde(default, alias = "tag-privilege")]
     pub tag_privilege: TagPrivilege,
+    /// What removing a tag needs under `ranger-delegate`. See [`TagRemoval`].
+    #[serde(default, alias = "tag-removal")]
+    pub tag_removal: TagRemoval,
     /// Which tag names a non-admin may write. See [`TagNames`].
     #[serde(default, alias = "tag-names")]
     pub tag_names: TagNames,
@@ -2335,6 +2340,7 @@ impl Default for AccessControlConfig {
             grant_authority: GrantAuthority::default(),
             tag_authority: TagAuthority::default(),
             tag_privilege: TagPrivilege::default(),
+            tag_removal: TagRemoval::default(),
             tag_names: TagNames::default(),
             ranger: RangerConfig::default(),
         }
@@ -2370,72 +2376,6 @@ pub enum GrantAuthority {
     #[default]
     AdminRole,
     RangerDelegate,
-}
-
-/// Where the authority to write column tags comes from: every statement that
-/// writes the `sqe.column-tags` table property (`ALTER TABLE ... SET / UNSET
-/// TAGS`, `SET / UNSET MASKING POLICY`, `SET TBLPROPERTIES`, `CREATE [OR
-/// REPLACE] TABLE ... TBLPROPERTIES`).
-///
-/// - `admin-role` (default) requires an `[auth] admin_roles` role for the tag
-///   statements and for `TBLPROPERTIES` that change the reserved key.
-/// - `ranger-delegate` also lets a non-admin tag a column when the Ranger
-///   policies grant them [`TagPrivilege`] on that column. A broad grant then
-///   becomes the right to untag a column and so remove its mask; review the
-///   grants before turning it on.
-///
-/// Admins pass in both modes. Backends without a column privilege model grant
-/// nothing, so only admins can tag there.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum TagAuthority {
-    #[default]
-    AdminRole,
-    RangerDelegate,
-}
-
-/// The Ranger `hive` access type a non-admin needs on a column to change its
-/// tags under `tag_authority = "ranger-delegate"`.
-///
-/// - `alter` (default) is the 0.55 behaviour: whoever may alter the table may
-///   tag its columns.
-/// - `apply_tag` asks for the custom access type `apply_tag` instead, the
-///   Databricks `APPLY TAG` model: tagging is its own grant, held apart from
-///   the right to change data or schema. It is not implied by `alter`, by any
-///   write type, or by an allow item's `all`; a deny item naming `apply_tag`
-///   or `all` still denies it. The access type has to exist in the `hive`
-///   servicedef (`{"name":"apply_tag","impliedGrants":[]}`) before Ranger
-///   accepts a policy that names it.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TagPrivilege {
-    #[default]
-    #[serde(rename = "alter")]
-    Alter,
-    #[serde(rename = "apply_tag", alias = "apply-tag")]
-    ApplyTag,
-}
-
-/// Which tag names a non-admin may write to `sqe.column-tags`.
-///
-/// - `any` (default) accepts every name, as before. A typo (`live.pi` for
-///   `live.pii`) then tags the column with a name no tag policy matches, and
-///   the column stays unmasked.
-/// - `ranger-tagdefs` accepts only a name Ranger holds a tag definition for
-///   (`GET /service/tags/tagdefs`). Under `[policy.ranger] catalog_scoped`, a
-///   definition named `<catalog>.<tag>` also defines `<tag>` in that catalog.
-///   The check fails closed: when the definitions cannot be read, or the
-///   policy backend is not Ranger, a non-admin tag write is refused.
-///
-/// Admins are exempt in both modes. Only names a write sets are checked:
-/// `ALTER TABLE ... SET TAGS` checks every name it sets, a raw `sqe.column-tags`
-/// write the tags it adds to a column, and `UNSET TAGS` is never refused, so a
-/// column can always be untagged.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum TagNames {
-    #[default]
-    Any,
-    RangerTagdefs,
 }
 
 fn default_access_control_timeout() -> u64 {

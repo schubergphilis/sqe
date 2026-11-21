@@ -13,6 +13,8 @@
 use std::collections::BTreeSet;
 
 use super::*;
+use sqe_core::config::TagRemoval;
+use sqe_policy::TablePrivilege;
 use sqe_sql::object_tags::{ObjectTagsStatement, TagObject};
 use sqe_sql::tags::TagAction;
 use sqe_write::catalog_ops::object_tags::{catalog_target, schema_target};
@@ -82,7 +84,14 @@ impl QueryHandler {
             self.require_admin(session, statement)?;
             return Ok(catalog);
         };
-        let privilege = self.tag_privilege();
+        let mut privileges = vec![self.tag_privilege()];
+        if stmt.action == TagAction::Unset {
+            match self.config.access_control.tag_removal {
+                TagRemoval::Same => {}
+                TagRemoval::RemoveTag => privileges.push(TablePrivilege::RemoveTag),
+                TagRemoval::Admin => self.require_admin(session, statement)?,
+            }
+        }
         let default_hive = sqe_policy::plan_rewriter::HiveCatalogs::new();
         let hive_catalogs = self.hive_catalogs.as_deref().unwrap_or(&default_hive);
         let (policy_ns, policy_table) =
@@ -100,22 +109,24 @@ impl QueryHandler {
                     &format!("cannot key '{}' for a policy check", stmt.object.name()),
                 )
             })?;
-        let granted = store
-            .grants_table_privilege(&session.user, &policy_table, &policy_ns, privilege)
-            .await
-            .unwrap_or_else(|e| {
-                warn!(error = %e, "tag authority check failed; treating as not granted");
-                false
-            });
-        if !granted {
-            return Err(self.refuse_tag_write(
-                session,
-                statement,
-                &format!(
-                    "requires {} on {policy_ns}.{policy_table}",
-                    privilege.access_type()
-                ),
-            ));
+        for privilege in privileges {
+            let granted = store
+                .grants_table_privilege(&session.user, &policy_table, &policy_ns, privilege)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(error = %e, "tag authority check failed; treating as not granted");
+                    false
+                });
+            if !granted {
+                return Err(self.refuse_tag_write(
+                    session,
+                    statement,
+                    &format!(
+                        "requires {} on {policy_ns}.{policy_table}",
+                        privilege.access_type()
+                    ),
+                ));
+            }
         }
         self.require_defined_object_tags(session, stmt, &catalog, statement)
             .await?;
@@ -124,7 +135,9 @@ impl QueryHandler {
 
     /// The catalog gate: admins pass, `admin-role` refuses everyone else,
     /// and under `ranger-delegate` the privilege is Polaris's to check when
-    /// the write reaches it. The name check still runs here.
+    /// the write reaches it. The name check still runs here. An UNSET needs an
+    /// admin there when `tag_removal` is not `same` (#927): Polaris has no
+    /// `remove_tag` to check.
     async fn require_catalog_tag_authority(
         &self,
         session: &Session,
@@ -135,7 +148,9 @@ impl QueryHandler {
         if self.config.auth.has_admin_role(&session.user.roles) {
             return Ok(catalog);
         }
-        if self.tag_delegate_store().is_none() {
+        let removal = stmt.action == TagAction::Unset
+            && self.config.access_control.tag_removal != TagRemoval::Same;
+        if self.tag_delegate_store().is_none() || removal {
             self.require_admin(session, statement)?;
             return Ok(catalog);
         }

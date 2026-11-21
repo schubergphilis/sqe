@@ -362,6 +362,12 @@ engine = "passthrough"
 # `all` do not imply. "apply_tag" needs that access type on the hive
 # servicedef (the quickstart's bootstrap-ranger.sh adds it).
 # tag_privilege = "alter"
+# What removing a tag key from a column needs under "ranger-delegate" (UNSET
+# TAGS, UNSET MASKING POLICY, a sqe.column-tags write that drops a key):
+# "same" (default) the tag_privilege alone; "remove_tag" also that custom
+# access type on the column (nothing implies it; bootstrap-ranger.sh adds it);
+# "admin" an [auth] admin_roles role. Removing a tag can lift a mask.
+# tag_removal = "same"
 # "any" (default) or "ranger-tagdefs": refuse a non-admin SET TAGS naming a
 # tag Ranger has no tag definition for (GET /service/tags/tagdefs, cached for
 # [policy.ranger] cache_ttl_secs). Fails closed if the list cannot be read.

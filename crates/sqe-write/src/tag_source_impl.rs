@@ -375,6 +375,29 @@ pub fn changed_tag_columns(
         .collect()
 }
 
+/// The columns that lose a tag key between two `sqe.column-tags` maps: the
+/// removals `[access_control] tag_removal` decides (#927). A kept key whose
+/// value changes is not one; masks resolve on keys.
+pub fn removed_tag_columns(
+    old: &ColumnTagMap,
+    new: &ColumnTagMap,
+) -> std::collections::BTreeSet<String> {
+    let keeps = |c: &str, key: &str| new.get(c).is_some_and(|t| t.iter().any(|t| t.key == key));
+    old.iter()
+        .filter(|(c, tags)| tags.iter().any(|t| !keeps(c, &t.key)))
+        .map(|(c, _)| c.clone())
+        .collect()
+}
+
+/// What a non-admin's raw `sqe.column-tags` write was authorised for: the
+/// columns it may change, and the subset it may remove a tag key from. The
+/// write re-diffs under the table lock and refuses anything outside them.
+#[derive(Debug, Clone, Default)]
+pub struct TagWriteAuth {
+    pub changed: std::collections::BTreeSet<String>,
+    pub removed: std::collections::BTreeSet<String>,
+}
+
 /// Apply column-tag operations to the current tag map (merge semantics).
 /// `Set` unions tags (dedup by key, stable order) and sets each named tag's
 /// value to the one the statement gave, or to none for a key-only tag, as
@@ -518,6 +541,27 @@ mod tests {
             ["card".to_string()].into_iter().collect()
         );
         assert!(super::changed_tag_columns(&old, &old).is_empty());
+        // ... but not a removal (#927).
+        assert!(removed_tag_columns(&old, &new).is_empty());
+    }
+
+    #[test]
+    fn removed_tag_columns_are_the_columns_that_lose_a_key() {
+        let m = |pairs: &[(&str, &[&str])]| column_tags::from_keys(&map(pairs));
+        let old = m(&[
+            ("ssn", &["PII", "GDPR"]),
+            ("email", &["PII"]),
+            ("phone", &["PII"]),
+        ]);
+        let new = m(&[
+            ("ssn", &["PII"]),
+            ("phone", &["PII", "NEW"]),
+            ("zip", &["GEO"]),
+        ]);
+        let got: Vec<String> = removed_tag_columns(&old, &new).into_iter().collect();
+        // `ssn` loses a key, `email` loses all; `phone` and `zip` only gain.
+        assert_eq!(got, ["email", "ssn"]);
+        assert!(removed_tag_columns(&ColumnTagMap::new(), &old).is_empty());
     }
 
     #[test]
