@@ -1171,13 +1171,13 @@ fn metadata_catalog_resolver(
 ) -> sqe_catalog::iceberg_metadata_tvf::MetadataCatalogResolver {
     Arc::new(move |name: Option<&str>| {
         let Some(name) = name.filter(|n| *n != default_catalog) else {
-            return Ok(Arc::clone(&effective));
+            return Ok((Arc::clone(&effective), default_catalog.clone()));
         };
         catalogs
             .iter()
             .find(|(n, _)| n == name)
             .or_else(|| catalogs.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)))
-            .map(|(_, c)| Arc::clone(c))
+            .map(|(n, c)| (Arc::clone(c), n.clone()))
             .ok_or_else(|| {
                 datafusion::error::DataFusionError::Plan(format!(
                     "metadata table: catalog '{name}' not found"
@@ -1967,7 +1967,7 @@ allowed_object_store_prefixes = ["s3://shared-landing/"]
             "main".to_string(),
             Arc::clone(&effective),
         );
-        let pick = |name| resolve(name).expect("resolves");
+        let pick = |name| resolve(name).expect("resolves").0;
         assert!(Arc::ptr_eq(&pick(None), &effective), "no argument");
         assert!(
             Arc::ptr_eq(&pick(Some("main")), &effective),
@@ -1978,6 +1978,11 @@ allowed_object_store_prefixes = ["s3://shared-landing/"]
             Arc::ptr_eq(&pick(Some("probe")), &probe),
             "folded identifier"
         );
+        // Policy keys on the registered name, not the argument's spelling.
+        let name = |arg| resolve(arg).expect("resolves").1;
+        assert_eq!(name(Some("probe")), "Probe");
+        assert_eq!(name(Some("main")), "main");
+        assert_eq!(name(None), "main");
         let err = resolve(Some("elsewhere")).expect_err("unknown catalog");
         assert!(
             err.to_string().contains("catalog 'elsewhere' not found"),
