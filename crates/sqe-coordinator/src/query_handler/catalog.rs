@@ -91,15 +91,16 @@ impl QueryHandler {
             None => (column_names, row_count),
             Some(store) => {
                 // Malformed tags are UNKNOWN, not empty: the rewriter fails
-                // closed on them and so does this.
-                let col_tags = crate::tag_source_impl::resolved_column_tags(
+                // closed on them and so does this. Table tags count, as
+                // the rewriter inherits them (#924).
+                let col_tags = crate::tag_source_impl::effective_column_tags(
                     metadata.properties(),
                     metadata.current_schema(),
                 )
                 .map_err(|e| {
                     SqeError::with_code(
                         SqeErrorCode::ExecutionFailed,
-                        format!("SHOW STATS: malformed sqe.column-tags on {table_name}: {e}"),
+                        format!("SHOW STATS: malformed column or table tags on {table_name}: {e}"),
                     )
                 })?;
                 let default_hive = sqe_policy::plan_rewriter::HiveCatalogs::new();

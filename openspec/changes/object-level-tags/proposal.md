@@ -10,7 +10,7 @@ SQE keeps tags on columns only. Databricks also tags tables, schemas and catalog
 - `ALTER SCHEMA|DATABASE <s> SET TAGS (...)` and `UNSET TAGS (...)` tag a schema. They are stored in the namespace property `sqe.schema-tags`, written with the caller's token.
 - Both properties hold a JSON list in the entry format `sqe.column-tags` uses for one column: a key is a string, a key with a value is a one-entry object.
 - `ALTER CATALOG <c> SET|UNSET TAGS` tags a catalog. The tags are stored in the Polaris catalog property `sqe.catalog-tags`, written through the management API with the caller's token and the entity version it read, so Polaris decides who may write (catalog admins, as Unity Catalog asks for ownership or `MANAGE`). A catalog that is not Polaris REST is refused.
-- Object tags are metadata. They do not drive masks, are not projected into Ranger, and do not change what a query returns.
+- Object tags are metadata. They do not drive masks, are not projected into Ranger, and do not change what a query returns. (Superseded for table tags by the change `tag-inheritance`: a table's tags are inherited by its columns.)
 - Authority follows `[access_control] tag_authority`:
   - Admins pass.
   - Under `admin-role`, only admins.
