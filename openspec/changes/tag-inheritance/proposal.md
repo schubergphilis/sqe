@@ -15,7 +15,7 @@ Object tags (#922) are metadata only: tagging a table `pii` masks nothing. In Un
 ## Out of scope
 
 - Schema and catalog inheritance (second MR).
-- The Ranger tag projection stays on own column tags, so engines that read Ranger's tag store (Spark) do not see table tags yet.
+- The Ranger tag projection stays on own column tags. Inherited tags are enforced by SQE only; the Ranger tag projection (and so Spark) still sees own tags. Projecting effective tags is #935.
 - View tags: views take no tags; a query of a view is policed on its base tables' tags.
 - Hive tables: object tags are refused there (#922).
 - A write-time conflict check for table tags; the read-time refusal is the backstop.

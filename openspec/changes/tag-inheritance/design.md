@@ -31,7 +31,9 @@ A table tag adds the table's masks to every column. Under `mask_precedence = "re
 
 ### D5. The Ranger tag projection stays on own tags
 
-`catalog_ops/tag_projection.rs` and the tag load observer project `sqe.column-tags` into Ranger's tag store, so Spark's Ranger plugin masks the same columns. They keep projecting own tags only. A table tag therefore masks in SQE and not in Spark until the projection learns inheritance; that is a follow-up, not part of this change.
+**Inherited tags are enforced by SQE only; the Ranger tag projection (and so Spark) still sees own tags.** This change gives no two-engine guarantee.
+
+`catalog_ops/tag_projection.rs` and the tag load observer project `sqe.column-tags` into Ranger's tag store, so Spark's Ranger plugin masks the same columns. They keep projecting own tags only. A table tag therefore masks in SQE and not in Spark until the projection learns inheritance, with the same override as D1 (#935, part of #924). This is no regression for Spark: table tags never masked columns before. It does keep #924 open.
 
 ### D6. Freshness follows the table metadata
 
@@ -46,4 +48,4 @@ For schema and catalog tags (second MR), the parent properties are read through 
 ## Risks
 
 - Tagging a table with a key that a row filter matches filters every query of it. That is the intent, but a broad key (`gold`) with a filter now has a wider effect than before. Release notes call it out.
-- Spark and SQE differ on table tags until D5's follow-up lands.
+- Spark and SQE differ on table tags until D5's follow-up (#935) lands.
