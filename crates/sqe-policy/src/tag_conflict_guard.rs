@@ -1,6 +1,8 @@
-//! Refuse a tag write that creates a policy conflict under `mask_precedence =
-//! refuse` (#918). A read already fails on a conflict; this refuses the write
-//! that would cause one, for every principal the table's policies name.
+//! Refuse a tag write that creates a policy conflict (#918). A read already
+//! fails on a conflict; this refuses the write that would cause one, for every
+//! principal the table's policies name. A row-filter conflict (TA-13, #931: one
+//! row filter per table and user) is refused under every `mask_precedence`; a
+//! mask conflict only under `refuse`, the one mode where masks conflict.
 //!
 //! Design: `openspec/changes/policy-conflict-refuse-at-write/design.md`.
 
@@ -24,6 +26,7 @@ pub struct TagConflictGuard {
     table: String,
     display: String,
     catalog: Option<String>,
+    precedence: MaskPrecedence,
 }
 
 impl TagConflictGuard {
@@ -42,7 +45,15 @@ impl TagConflictGuard {
             table,
             display,
             catalog: None,
+            precedence: MaskPrecedence::Refuse,
         }
+    }
+
+    /// The configured `mask_precedence`; `refuse` when unset. The guard finds
+    /// the conflicts a read under this precedence would refuse.
+    pub fn with_precedence(mut self, precedence: MaskPrecedence) -> Self {
+        self.precedence = precedence;
+        self
     }
 
     /// The table's catalog, for tag policies scoped to it (#919): tags then
@@ -106,7 +117,7 @@ impl TagConflictGuard {
     }
 
     /// The conflicts `col_tags` resolves for `user` on top of `base`, as the
-    /// read path's `refuse` merge finds them.
+    /// read path's merge under the configured precedence finds them.
     async fn conflicts(
         &self,
         user: &SessionUser,
@@ -138,7 +149,7 @@ impl TagConflictGuard {
             filters,
             &unmappable,
             &identity,
-            MaskPrecedence::Refuse,
+            self.precedence,
         )
         .into_iter()
         .collect()
@@ -148,12 +159,18 @@ impl TagConflictGuard {
     /// not entitled to learn whom a policy binds.
     fn refusal(&self, conflict: &PolicyConflict) -> SqeError {
         let what = match conflict {
-            PolicyConflict::Mask(column) => format!("a mask conflict on {}.{column}", self.display),
-            PolicyConflict::RowFilter => format!("a row filter conflict on {}", self.display),
+            PolicyConflict::Mask(column) => format!(
+                "a mask conflict on {}.{column} under mask_precedence = refuse",
+                self.display
+            ),
+            PolicyConflict::RowFilter => format!(
+                "a row filter conflict on {} (one row filter per table and user)",
+                self.display
+            ),
         };
         SqeError::with_code(
             SqeErrorCode::AccessDenied,
-            format!("tag change refused: it would create {what} under mask_precedence = refuse"),
+            format!("tag change refused: it would create {what}"),
         )
     }
 }
@@ -426,5 +443,44 @@ mod tests {
         run(stub(None), tags(&[]), tags(&[("amount", &["null"])]))
             .await
             .unwrap();
+    }
+
+    async fn run_under(precedence: MaskPrecedence, after: ColumnTagKeys) -> sqe_core::Result<()> {
+        guard(stub(Some(vec![eng()])))
+            .with_precedence(precedence)
+            .check(&tags(&[]), &after)
+            .await
+    }
+
+    /// TA-13 (#931): one row filter per table and user holds in every
+    /// precedence, so the write that would break it is refused in every one.
+    #[tokio::test]
+    async fn a_new_row_filter_conflict_is_refused_under_every_precedence() {
+        for precedence in [
+            MaskPrecedence::Tag,
+            MaskPrecedence::Resource,
+            MaskPrecedence::Refuse,
+        ] {
+            let err = run_under(precedence, tags(&[("region", &["f"])]))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("row filter conflict on c.ac.orders"),
+                "{precedence:?}: {err}"
+            );
+            assert!(!err.contains("mask_precedence"), "{precedence:?}: {err}");
+        }
+    }
+
+    /// Outside `refuse` the precedence decides which mask wins, so two masks
+    /// on a column are no conflict and the write goes through.
+    #[tokio::test]
+    async fn a_mask_conflict_is_allowed_outside_refuse() {
+        for precedence in [MaskPrecedence::Tag, MaskPrecedence::Resource] {
+            run_under(precedence, tags(&[("amount", &["null"])]))
+                .await
+                .unwrap_or_else(|e| panic!("{precedence:?}: {e}"));
+        }
     }
 }
