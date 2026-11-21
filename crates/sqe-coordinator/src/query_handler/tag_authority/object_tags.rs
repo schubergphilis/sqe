@@ -5,15 +5,17 @@
 //! pass. Under `admin-role` only admins may write them. Under
 //! `ranger-delegate` a table needs the configured privilege on the table
 //! (a column grant does not count) and a schema needs it on the database
-//! with table `*`. Catalog tags are refused. `tag_names` checks the keys a
-//! `SET` names, after the privilege, as for column tags.
+//! with table `*`. A catalog has no resource in the query service, so under
+//! `ranger-delegate` Polaris decides: the write goes to its management API
+//! on the caller's token and needs catalog-properties write there. `tag_names`
+//! checks the keys a `SET` names, after the privilege, as for column tags.
 
 use std::collections::BTreeSet;
 
 use super::*;
 use sqe_sql::object_tags::{ObjectTagsStatement, TagObject};
 use sqe_sql::tags::TagAction;
-use sqe_write::catalog_ops::object_tags::{catalog_tags_unsupported, schema_target};
+use sqe_write::catalog_ops::object_tags::{catalog_target, schema_target};
 
 impl QueryHandler {
     /// `ALTER TABLE|SCHEMA|CATALOG <name> SET|UNSET TAGS ('k' = 'v')`.
@@ -23,9 +25,6 @@ impl QueryHandler {
         stmt: &ObjectTagsStatement,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let label = format!("ALTER {} ... SET/UNSET TAGS", stmt.object.kind());
-        if matches!(stmt.object, TagObject::Catalog(_)) {
-            return Err(catalog_tags_unsupported());
-        }
         let catalog = self
             .require_object_tag_authority(session, stmt, &label)
             .await?;
@@ -70,7 +69,11 @@ impl QueryHandler {
                 let catalog = target.unwrap_or_else(|| self.session_catalog_name(session));
                 (catalog, namespace, "*".to_string())
             }
-            TagObject::Catalog(_) => return Err(catalog_tags_unsupported()),
+            TagObject::Catalog(_) => {
+                return self
+                    .require_catalog_tag_authority(session, stmt, catalog_target(&name)?, statement)
+                    .await;
+            }
         };
         if self.config.auth.has_admin_role(&session.user.roles) {
             return Ok(catalog);
@@ -114,11 +117,46 @@ impl QueryHandler {
                 ),
             ));
         }
-        if stmt.action == TagAction::Set {
-            let names: BTreeSet<&str> = stmt.tags.iter().map(String::as_str).collect();
-            self.require_defined_tags_in(session, catalog.clone(), &names, statement)
-                .await?;
-        }
+        self.require_defined_object_tags(session, stmt, &catalog, statement)
+            .await?;
         Ok(catalog)
+    }
+
+    /// The catalog gate: admins pass, `admin-role` refuses everyone else,
+    /// and under `ranger-delegate` the privilege is Polaris's to check when
+    /// the write reaches it. The name check still runs here.
+    async fn require_catalog_tag_authority(
+        &self,
+        session: &Session,
+        stmt: &ObjectTagsStatement,
+        catalog: String,
+        statement: &str,
+    ) -> sqe_core::Result<String> {
+        if self.config.auth.has_admin_role(&session.user.roles) {
+            return Ok(catalog);
+        }
+        if self.tag_delegate_store().is_none() {
+            self.require_admin(session, statement)?;
+            return Ok(catalog);
+        }
+        self.require_defined_object_tags(session, stmt, &catalog, statement)
+            .await?;
+        Ok(catalog)
+    }
+
+    /// `tag_names` for the keys a `SET` adds. UNSET only removes names.
+    async fn require_defined_object_tags(
+        &self,
+        session: &Session,
+        stmt: &ObjectTagsStatement,
+        catalog: &str,
+        statement: &str,
+    ) -> sqe_core::Result<()> {
+        if stmt.action != TagAction::Set {
+            return Ok(());
+        }
+        let names: BTreeSet<&str> = stmt.tags.iter().map(String::as_str).collect();
+        self.require_defined_tags_in(session, catalog.to_string(), &names, statement)
+            .await
     }
 }

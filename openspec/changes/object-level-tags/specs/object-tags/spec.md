@@ -27,8 +27,17 @@ A tag list that starts with an identifier SHALL be read as the native column for
 - **WHEN** a user runs `ALTER TABLE t SET TAGS ('k' = 'v', email = ('pii'))`
 - **THEN** the statement fails and no tag changes
 
-### Requirement: Catalog tags are refused for now
-`ALTER CATALOG <c> SET TAGS (...)` and `UNSET TAGS (...)` SHALL fail with an error saying catalog tags are not supported yet.
+### Requirement: Catalog tags are a Polaris catalog property
+`ALTER CATALOG <c> SET TAGS (...)` and `UNSET TAGS (...)` SHALL read and write the property `sqe.catalog-tags` of the Polaris catalog through the management API, with the caller's token and the entity version it read. Every other catalog property SHALL be written back unchanged. A version conflict SHALL re-read and retry; a Polaris denial SHALL be returned as the error. A catalog that is not Polaris REST, and a Hive catalog, SHALL be refused.
+
+#### Scenario: A catalog admin tags a catalog
+- **WHEN** a principal with catalog-properties write on `sales_wh` runs `ALTER CATALOG sales_wh SET TAGS ('region' = 'eu')`
+- **THEN** the catalog carries `sqe.catalog-tags` = `[{"region":"eu"}]`
+- **AND** its other properties are unchanged
+
+#### Scenario: A reader cannot tag a catalog
+- **WHEN** a principal without catalog-properties write runs the same statement under `ranger-delegate`
+- **THEN** Polaris refuses the update and the statement fails with its denial
 
 ### Requirement: Object tags are metadata only
 Object tags SHALL NOT drive masks or row filters, and SHALL NOT be projected into the Ranger tag store.

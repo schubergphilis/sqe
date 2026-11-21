@@ -33,3 +33,11 @@
 
 - [x] 7.1 Book: object tags, metadata only
 - [x] 7.2 README roadmap, changelog fragment, status file
+
+## 8. Catalog tags
+
+- [x] 8.1 `SessionCatalog::update_catalog_property` / `catalog_properties`: Polaris management GET/PUT on the caller's token, full map, entity version, retry on 409; mock-server tests
+- [x] 8.2 `CatalogOps::set_catalog_tags` writes `sqe.catalog-tags`; single-name target
+- [x] 8.3 Gate: admin, `admin-role` admins only, `ranger-delegate` leaves the privilege to Polaris; `tag_names` for SET
+- [x] 8.4 Book: catalog tags and the inheritance gap (#930)
+- [x] 8.5 Live e2e on the Ranger compose stack: catalog admin writes, reader refused by Polaris

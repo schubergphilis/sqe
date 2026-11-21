@@ -129,19 +129,22 @@ The Unity Catalog `information_schema` tag views list the associations with thei
 
 Author the mask type under the `hive:` prefix (`hive:MASK_SHOW_LAST_4`). Ranger's `tag` service definition never defines bare mask names: it aggregates the mask types of every component it can decorate, so the entries are `hive:MASK_SHOW_LAST_4`, `trino:MASK_NULL`, and so on. SQE accepts the bare and `hive:` forms and deliberately leaves another component's prefix unmatched, which restricts the tagged column rather than applying another engine's policy.
 
-### Tags on a table or schema
+### Tags on a table, schema or catalog
 
-A table or schema can carry tags of its own, in the Databricks form:
+A table, schema or catalog can carry tags of its own, in the Databricks form:
 
 ```sql
 ALTER TABLE sales.orders SET TAGS ('gold', 'owner' = 'finance');
 ALTER TABLE sales.orders UNSET TAGS ('gold');
 ALTER SCHEMA sales SET TAGS ('domain' = 'retail');
+ALTER CATALOG sales_wh SET TAGS ('region' = 'eu');
 ```
 
-Object tags are metadata only. No policy matches them, nothing is projected into Ranger, and no mask or row filter changes when they do. They describe ownership and classification for catalogs and tools that read them. A table's tags live in its `sqe.table-tags` property and a schema's in its `sqe.schema-tags` namespace property, both as a JSON list in the column format (`["gold", {"owner": "finance"}]`). `SET TAGS` merges and `UNSET TAGS` takes keys only.
+Object tags are metadata only. No policy matches them, nothing is projected into Ranger, and no mask or row filter changes when they do. They describe ownership and classification for catalogs and tools that read them. A table's tags live in its `sqe.table-tags` property, a schema's in its `sqe.schema-tags` namespace property and a catalog's in the `sqe.catalog-tags` property of the Polaris catalog. All three hold a JSON list in the column format (`["gold", {"owner": "finance"}]`). `SET TAGS` merges and `UNSET TAGS` takes keys only.
 
-The same gate applies as for column tags. Admins always pass. Under `tag_authority = "admin-role"` nobody else does. Under `ranger-delegate` a table needs the configured privilege on the table itself, so a column grant is not enough, and a schema needs it on the database with table `*`. `tag_names = "ranger-tagdefs"` checks the keys a `SET` adds. Writing `sqe.table-tags` through `SET TBLPROPERTIES` is reserved for admins in every mode. Catalog tags and tags on a Hive table or Hive root are refused.
+Here SQE stops short of Unity Catalog. In Databricks a tag on a catalog, schema or table is inherited by everything below it, and an ABAC policy that matches the tag applies to every column in that subtree. In SQE only a column tag drives a policy. Tagging a schema `pii` masks nothing. Tag policies that match object tags, with that inheritance, are tracked in #930.
+
+The same gate applies as for column tags. Admins always pass. Under `tag_authority = "admin-role"` nobody else does. Under `ranger-delegate` a table needs the configured privilege on the table itself, so a column grant is not enough, and a schema needs it on the database with table `*`. A catalog has no resource in the query service, so Polaris decides. SQE writes the property through the Polaris management API with the caller's own token, and Polaris refuses a caller without catalog-properties write on that catalog, much as Unity Catalog asks for ownership or `MANAGE` on the catalog. Each update carries the catalog's entity version, so two writers cannot overwrite each other. `tag_names = "ranger-tagdefs"` checks the keys a `SET` adds. Writing `sqe.table-tags` through `SET TBLPROPERTIES` is reserved for admins in every mode. Catalog tags need a Polaris REST catalog, and tags on a Hive table or Hive root are refused.
 
 ## Tag row filters need one Ranger Admin property
 

@@ -6129,3 +6129,74 @@ async fn system_catalog_split_tag_mask_applies_and_ungranted_user_is_refused() {
         )
         .await;
 }
+
+/// The `sqe.catalog-tags` property of `ops_wh`, read as `who` reads it.
+async fn ops_wh_catalog_tags(who: &Session) -> Option<String> {
+    let config = sqe_core::SqeConfig::load(&crate::common::ranger_config_path())
+        .expect("load tests/sqe-ranger-test.toml");
+    let catalog = sqe_catalog::SessionCatalog::for_session_with(
+        &config.catalogs["ops_wh"],
+        &config.storage,
+        None,
+        who.access_token().expose(),
+    )
+    .await
+    .expect("ops_wh session catalog");
+    catalog
+        .catalog_properties()
+        .await
+        .expect("read ops_wh properties")
+        .remove(sqe_core::object_tags::CATALOG_PROP_KEY)
+}
+
+/// Catalog tags (#922) go to the Polaris management API on the caller's own
+/// token. carol (`sqe_admin`, catalog-properties write in Polaris) writes
+/// them; under `ranger-delegate` SQE lets alice through to Polaris, which
+/// refuses her because she can read the catalog but not change it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn catalog_tags_are_written_through_polaris_on_the_callers_token() {
+    ac_gate!();
+    let ctx = ac_setup().await;
+    let before = ops_wh_catalog_tags(&ctx.carol).await;
+
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        "ALTER CATALOG ops_wh SET TAGS ('gold', 'region' = 'eu')",
+    )
+    .await;
+    let tagged = ops_wh_catalog_tags(&ctx.carol).await;
+
+    let (delegate, _cache) =
+        crate::common::setup_ranger_handler_audited(Some(ctx.cache.clone()), None, |c| {
+            c.access_control.tag_authority = sqe_core::config::TagAuthority::RangerDelegate;
+        })
+        .await;
+    let denied = delegate
+        .execute(&ctx.alice, "ALTER CATALOG ops_wh UNSET TAGS ('gold')", None)
+        .await;
+    let after_denial = ops_wh_catalog_tags(&ctx.carol).await;
+
+    // Unset before asserting, so a failure cannot leave the catalog tagged.
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        "ALTER CATALOG ops_wh UNSET TAGS ('gold', 'region')",
+    )
+    .await;
+    let cleared = ops_wh_catalog_tags(&ctx.carol).await;
+
+    assert_eq!(
+        tagged.as_deref(),
+        Some(r#"["gold",{"region":"eu"}]"#),
+        "before: {before:?}"
+    );
+    let err = denied.expect_err("Polaris must refuse alice's catalog update");
+    assert!(
+        err.to_string().contains("UPDATE_CATALOG"),
+        "expected the Polaris denial: {err}"
+    );
+    assert_eq!(after_denial, tagged, "a refused update changes nothing");
+    assert_eq!(cleared.as_deref(), Some("[]"));
+}
