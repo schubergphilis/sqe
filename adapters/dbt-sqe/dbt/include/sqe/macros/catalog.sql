@@ -17,8 +17,8 @@
       c.ordinal_position AS "column_index",
       c.data_type AS "column_type",
       NULL AS "column_comment"
-    FROM information_schema.columns c
-    JOIN information_schema.tables t
+    FROM {{ sqe__information_schema_view(information_schema.database, 'columns') }} c
+    JOIN {{ sqe__information_schema_view(information_schema.database, 'tables') }} t
       ON t.table_catalog = c.table_catalog
      AND t.table_schema = c.table_schema
      AND t.table_name = c.table_name
