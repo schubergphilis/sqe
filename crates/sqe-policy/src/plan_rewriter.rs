@@ -596,9 +596,9 @@ impl PolicyPlanRewriter {
                                     &identity,
                                     self.mask_precedence,
                                 );
-                                // `refuse` precedence: policies that disagree
-                                // fail the statement before any row is read
-                                // (#918).
+                                // Policies that disagree fail the statement
+                                // before any row is read: masks under `refuse`
+                                // (#918), row filters always (TA-13).
                                 if let Some(conflict) = conflicts.first() {
                                     warn!(
                                         user = %username,
@@ -1002,7 +1002,7 @@ pub async fn resolve_effective_policy(
             &identity,
             precedence,
         );
-        // A statement on this table is refused (#918); the callers here only
+        // A statement on this table is refused (#918, TA-13); the callers here only
         // read the policy, so they see it denied, fail closed.
         if !conflicts.is_empty() {
             let mut deny = ResolvedPolicy::default();
@@ -1023,8 +1023,10 @@ pub async fn resolve_effective_policy(
 /// 2. **Resource masks win over tag masks.** If `policy.column_masks` already
 ///    contains a mask for a column (from `store.resolve()`), that resource-
 ///    level mask is more specific and MUST NOT be overwritten by a tag mask.
-/// 3. **Tag row filters are ANDed with resource row filters.** Both sets
-///    apply; the result is the most restrictive combination.
+/// 3. **One row filter per table and user.** A tag row filter and a
+///    different resource filter (or two different tag filters) are a
+///    [`PolicyConflict::RowFilter`] under every precedence (TA-13); see
+///    [`merge_tag_row_filters`]. Until TA-13 they were ANDed.
 /// 4. **Within-column tag ordering is deterministic.** The first tag in the
 ///    stored tag list that has a matching mask in `tag_masks_by_tag` wins.
 ///    This is stable because `col_tags` comes from Iceberg property JSON
@@ -1043,8 +1045,9 @@ pub async fn resolve_effective_policy(
 ///    restricted (fail-closed).
 ///
 /// Under [`MaskPrecedence::Refuse`](sqe_core::config::MaskPrecedence::Refuse)
-/// nothing wins: see [`merge_tag_masks_refusing`]. The returned conflicts are
-/// empty under every other precedence.
+/// nothing wins: see [`merge_tag_masks_refusing`]. Under every other
+/// precedence the returned conflicts hold at most the row filter conflict
+/// (rule 3).
 pub(crate) fn merge_tag_masks(
     policy: &mut ResolvedPolicy,
     col_tags: &HashMap<String, Vec<String>>,
@@ -1151,18 +1154,20 @@ pub(crate) fn merge_tag_masks(
             }
         }
     }
-    // Tag row filters AND with resource row filters (most restrictive).
-    policy.row_filters.extend(tag_filters);
-    Vec::new()
+    // One row filter per table and user, whatever the mask precedence (TA-13).
+    merge_tag_row_filters(policy, tag_filters)
+        .into_iter()
+        .collect()
 }
 
-/// A column or table for which policies resolve to different answers under
-/// [`MaskPrecedence::Refuse`](sqe_core::config::MaskPrecedence::Refuse).
+/// A column or table for which policies resolve to different answers.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PolicyConflict {
-    /// Two different masks resolve for this column.
+    /// Two different masks resolve for this column, under
+    /// [`MaskPrecedence::Refuse`](sqe_core::config::MaskPrecedence::Refuse).
     Mask(String),
-    /// Tag row filters and a different filter resolve for the table.
+    /// Tag row filters and a different filter resolve for the table, under
+    /// every precedence (TA-13).
     RowFilter,
 }
 
@@ -1252,28 +1257,43 @@ fn merge_tag_masks_refusing(
         }
     }
 
-    // Row filters: the deny-all sentinel is not a filter a policy chose, so it
-    // is kept as is and never counted.
-    if !tag_filters.is_empty() {
-        let (mut sentinels, mut filters): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut policy.row_filters)
-                .into_iter()
-                .partition(is_deny_all_expr);
-        for f in tag_filters {
-            if is_deny_all_expr(&f) {
-                sentinels.push(f);
-            } else if !filters.contains(&f) {
-                filters.push(f);
-            }
-        }
-        if filters.len() > 1 {
-            conflicts.push(PolicyConflict::RowFilter);
-        }
-        policy.row_filters = sentinels;
-        policy.row_filters.extend(filters);
-    }
+    conflicts.extend(merge_tag_row_filters(policy, tag_filters));
     conflicts.sort();
     conflicts
+}
+
+/// One row filter per table and user (TA-13), under every precedence, the
+/// rule Unity Catalog ABAC follows. Once a tag contributes a row filter,
+/// every distinct filter that resolves for the table (the resource filter and
+/// each tag's) is counted, and more than one is a conflict. The same filter
+/// from two sources is one filter. The deny-all sentinel is not a filter a
+/// policy chose, so it is kept as is and never counted.
+///
+/// Every filter stays in the policy, so a caller that ignores the conflict
+/// still reads the most restrictive combination. Resource filters with no tag
+/// filter are left alone: several resource policies matching one user still
+/// AND, as before.
+fn merge_tag_row_filters(
+    policy: &mut ResolvedPolicy,
+    tag_filters: Vec<datafusion::logical_expr::Expr>,
+) -> Option<PolicyConflict> {
+    if tag_filters.is_empty() {
+        return None;
+    }
+    let (mut sentinels, mut filters): (Vec<_>, Vec<_>) = std::mem::take(&mut policy.row_filters)
+        .into_iter()
+        .partition(is_deny_all_expr);
+    for f in tag_filters {
+        if is_deny_all_expr(&f) {
+            sentinels.push(f);
+        } else if !filters.contains(&f) {
+            filters.push(f);
+        }
+    }
+    let conflict = (filters.len() > 1).then_some(PolicyConflict::RowFilter);
+    policy.row_filters = sentinels;
+    policy.row_filters.extend(filters);
+    conflict
 }
 
 /// Derive the `(namespace, table)` policy key from a structured DataFusion
@@ -1952,28 +1972,104 @@ mod tests {
         );
     }
 
-    #[test]
-    fn merge_tag_masks_tag_filters_appended() {
-        let mut policy = ResolvedPolicy::default();
-        // Pre-existing resource filter.
-        policy.row_filters.push(lit(true));
+    /// Merge `tag_filters` over `resource_filters` for a table with one tagged
+    /// column, returning the conflicts and the resulting row filters.
+    fn merge_row_filters(
+        resource_filters: Vec<Expr>,
+        tag_filters: Vec<Expr>,
+        precedence: MaskPrecedence,
+    ) -> (Vec<PolicyConflict>, Vec<Expr>) {
+        let mut policy = ResolvedPolicy {
+            row_filters: resource_filters,
+            ..Default::default()
+        };
         let col_tags = make_col_tags(&[("region", &["RESTRICTED"])]);
-        let tag_masks: HashMap<String, TagMaskSpec> = HashMap::new(); // no masks
-        let tag_filter = datafusion::logical_expr::col("region").eq(lit("EU"));
-        merge_tag_masks(
+        let conflicts = merge_tag_masks(
             &mut policy,
             &col_tags,
-            &tag_masks,
-            vec![tag_filter],
+            &HashMap::new(),
+            tag_filters,
             &no_unmappable(),
             &default_identity(),
-            MaskPrecedence::Tag,
+            precedence,
         );
-        assert_eq!(
-            policy.row_filters.len(),
-            2,
-            "tag filter must be ANDed (appended) with resource filters"
-        );
+        (conflicts, policy.row_filters)
+    }
+
+    fn eu() -> Expr {
+        datafusion::logical_expr::col("region").eq(lit("EU"))
+    }
+
+    fn id_over_one() -> Expr {
+        datafusion::logical_expr::col("id").gt(lit(1))
+    }
+
+    const ALL_PRECEDENCES: [MaskPrecedence; 3] = [
+        MaskPrecedence::Tag,
+        MaskPrecedence::Resource,
+        MaskPrecedence::Refuse,
+    ];
+
+    /// TA-13: a tag row filter and a resource row filter are refused, not
+    /// ANDed, whatever the mask precedence.
+    #[test]
+    fn a_tag_and_a_resource_row_filter_conflict_under_every_precedence() {
+        for precedence in ALL_PRECEDENCES {
+            let (conflicts, filters) =
+                merge_row_filters(vec![id_over_one()], vec![eu()], precedence);
+            assert_eq!(conflicts, vec![PolicyConflict::RowFilter], "{precedence:?}");
+            // Both stay in the policy: a caller that ignores the conflict
+            // still reads the most restrictive combination.
+            assert_eq!(filters, vec![id_over_one(), eu()], "{precedence:?}");
+        }
+    }
+
+    #[test]
+    fn two_tag_row_filters_conflict_under_every_precedence() {
+        for precedence in ALL_PRECEDENCES {
+            let (conflicts, _) = merge_row_filters(vec![], vec![eu(), id_over_one()], precedence);
+            assert_eq!(conflicts, vec![PolicyConflict::RowFilter], "{precedence:?}");
+        }
+    }
+
+    #[test]
+    fn the_same_row_filter_from_two_sources_is_one_filter() {
+        for precedence in ALL_PRECEDENCES {
+            let (conflicts, filters) = merge_row_filters(vec![eu()], vec![eu(), eu()], precedence);
+            assert!(conflicts.is_empty(), "{precedence:?}: {conflicts:?}");
+            assert_eq!(filters, vec![eu()], "{precedence:?}");
+        }
+    }
+
+    #[test]
+    fn a_tag_row_filter_alone_applies() {
+        for precedence in ALL_PRECEDENCES {
+            let (conflicts, filters) = merge_row_filters(vec![], vec![eu()], precedence);
+            assert!(conflicts.is_empty(), "{precedence:?}: {conflicts:?}");
+            assert_eq!(filters, vec![eu()], "{precedence:?}");
+        }
+    }
+
+    /// The deny-all sentinel is not a filter a policy chose: it never makes a
+    /// conflict, and it is kept.
+    #[test]
+    fn the_deny_all_sentinel_is_not_counted() {
+        for precedence in ALL_PRECEDENCES {
+            let (conflicts, filters) = merge_row_filters(vec![lit(false)], vec![eu()], precedence);
+            assert!(conflicts.is_empty(), "{precedence:?}: {conflicts:?}");
+            assert_eq!(filters, vec![lit(false), eu()], "{precedence:?}");
+        }
+    }
+
+    /// Outside TA-13: resource filters with no tag filter still AND.
+    #[test]
+    fn two_resource_row_filters_without_a_tag_filter_still_and() {
+        for precedence in ALL_PRECEDENCES {
+            let (conflicts, filters) =
+                merge_row_filters(vec![id_over_one(), eu()], vec![], precedence);
+            assert!(conflicts.is_empty(), "{precedence:?}: {conflicts:?}");
+            assert_eq!(filters, vec![id_over_one(), eu()], "{precedence:?}");
+        }
     }
 
     #[test]
