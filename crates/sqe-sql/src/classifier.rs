@@ -3029,6 +3029,21 @@ mod tests {
     }
 
     #[test]
+    fn databricks_column_tag_forms_classify_as_set_tags() {
+        for sql in [
+            "ALTER TABLE t ALTER COLUMN email SET TAGS ('lt_uc' = 'v')",
+            "ALTER TABLE t ALTER COLUMN email SET TAGS ('lt_uc')",
+            "ALTER TABLE t ALTER COLUMN email UNSET TAGS ('lt_uc')",
+        ] {
+            let result = parse_and_classify(sql);
+            assert!(
+                matches!(result, Ok(StatementKind::SetTags(_))),
+                "expected SetTags for {sql}, got: {result:?}"
+            );
+        }
+    }
+
+    #[test]
     fn set_tblproperties_still_classifies_as_alter_table_props() {
         // Guard: the new pre-scan must not steal SET TBLPROPERTIES.
         let result = parse_and_classify(
