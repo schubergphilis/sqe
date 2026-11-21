@@ -1836,6 +1836,68 @@ async fn tag_row_filter_restricts_rows() {
     assert_eq!(col_strings(&alice, "id"), vec!["1", "2", "3"]);
 }
 
+/// TA-13: one row filter per table and user, as Unity Catalog ABAC. A tag row
+/// filter and a resource row filter that both apply to bob refuse his query
+/// under the default mask precedence, where they used to be ANDed. A write
+/// reads its target through the same policy, so it is refused too.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn tag_and_resource_row_filter_refuse_the_query() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    ctx.ranger
+        .create_policy(hive_rowfilter_policy(
+            &format!("{PREFIX}rowfilter"),
+            "id > 1",
+        ))
+        .await
+        .expect("create row filter");
+    set_column_tag(&ctx, "region", "RESTRICTED").await;
+    ctx.ranger
+        .create_policy(tag_rowfilter_policy(
+            &format!("{PREFIX}tag-rowfilter"),
+            "RESTRICTED",
+            "region = 'EU'",
+        ))
+        .await
+        .expect("create tag row filter");
+
+    let sql = format!("SELECT id FROM {ORDERS} ORDER BY id");
+    let err = crate::common::eventually("bob's two row filters to conflict", || async {
+        match ctx.handler.execute(&ctx.bob, &sql, None).await {
+            Err(e) if e.to_string().contains("row filter conflict on") => Ok(e.to_string()),
+            Err(e) => Err(format!("refused for another reason: {e}")),
+            Ok(b) => Err(format!("read {:?}", col_strings(&b, "id"))),
+        }
+    })
+    .await;
+    assert!(err.contains("orders"), "the error names the table: {err}");
+
+    // bob may write, so the only refusal left for a DELETE is the conflict.
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT INSERT ON {ORDERS} TO ROLE \"engineer\""),
+    )
+    .await;
+    let delete = format!("DELETE FROM {ORDERS} WHERE id = 999");
+    crate::common::eventually("bob's DELETE to be refused for the conflict", || async {
+        match ctx.handler.execute(&ctx.bob, &delete, None).await {
+            Err(e) if e.to_string().contains("row filter conflict on") => Ok(()),
+            Err(e) => Err(format!("refused for another reason: {e}")),
+            Ok(_) => Err("the DELETE ran".to_string()),
+        }
+    })
+    .await;
+
+    // alice is analyst-only: neither filter targets her.
+    let alice = exec_ok(&ctx, &ctx.alice, &sql).await;
+    assert_eq!(col_strings(&alice, "id"), vec!["1", "2", "3"]);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn unmappable_tag_mask_fails_closed() {
