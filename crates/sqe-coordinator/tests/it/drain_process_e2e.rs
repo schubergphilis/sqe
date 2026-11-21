@@ -226,7 +226,7 @@ fn refusal_reason(err: &FlightError) -> Option<String> {
 /// statement sent after the signal is refused with reason `draining`, and the
 /// process exits shortly after the query ends, not at `shutdown_drain_secs`.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs:sqe-server binary; run `cargo dev-server` first"]
+#[ignore = "needs:sqe-server; run `cargo dev-server` first"]
 async fn drain_process_sigterm_lets_the_running_query_finish() {
     let polaris = mount_empty_polaris().await;
     let dir = tempfile::tempdir().expect("tempdir");

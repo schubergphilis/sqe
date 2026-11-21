@@ -49,6 +49,7 @@ pub const STACKS: &[(&str, &str)] = &[
     ("unity", "Unity Catalog, docker-compose stack or M2M credentials"),
     ("minio", "MinIO-backed warehouse, SQE_TEST_MINIO_URL"),
     ("aws", "live AWS credentials: Glue catalog, S3 bucket or S3 Tables"),
+    ("sqe-server", "a built `sqe-server` binary (the test spawns the process); `cargo dev-server` first"),
 ];
 
 /// Non-environment reasons. `bug:#<n>` is matched by prefix.
