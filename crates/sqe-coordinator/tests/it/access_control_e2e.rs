@@ -6527,3 +6527,90 @@ async fn catalog_tags_are_written_through_polaris_on_the_callers_token() {
     assert_eq!(after_denial, tagged, "a refused update changes nothing");
     assert_eq!(cleared.as_deref(), Some("[]"));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #926: `tag_names = "ranger-tagdefs"` against a live Ranger tag store
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// dave (no admin role, `alter` through the fixture's `public` item) may set
+/// a tag Ranger defines and is refused a typo of it. A definition added after
+/// the handler cached the list is accepted on the re-read, and an untag is
+/// never refused. The list comes from the live `GET /service/tags/tagdefs`,
+/// so the response parser is exercised against a real Ranger.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn tag_names_checks_the_live_ranger_tag_definitions() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    let defined = format!("{PREFIX}pii");
+    let typo = format!("{PREFIX}pi");
+    let late = format!("{PREFIX}late");
+    ctx.ranger
+        .create_tagdef(&defined)
+        .await
+        .expect("define the tag");
+    // Strict: a leftover `late` definition would let step 3 pass without
+    // ever exercising the re-read on a miss.
+    ctx.ranger
+        .delete_tagdef(&late)
+        .await
+        .expect("clear the late tag");
+    tag_authority_grant_dave_in_polaris(&ctx).await;
+    let (handler, _cache) =
+        crate::common::setup_ranger_handler_audited(Some(ctx.cache.clone()), None, |c| {
+            c.access_control.tag_authority = sqe_core::config::TagAuthority::RangerDelegate;
+            c.access_control.tag_names = sqe_core::config::TagNames::RangerTagdefs;
+        })
+        .await;
+    let rig = TagAuthorityRig {
+        handler,
+        audit: None,
+        _audit_dir: None,
+    };
+    let set = |tag: &str| format!("ALTER TABLE {ORDERS} SET TAGS (ssn = ('{tag}'))");
+
+    crate::common::eventually("dave to set a defined tag", || async {
+        rig.handler
+            .execute(&ctx.dave, &set(&defined), None)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await;
+
+    let err = rig
+        .handler
+        .execute(&ctx.dave, &set(&typo), None)
+        .await
+        .expect_err("an undefined tag must be refused")
+        .to_string();
+    assert!(
+        err.contains(&format!("tag '{typo}' is not defined in Ranger")),
+        "{err}"
+    );
+
+    // Defined after the list was cached: the miss is re-read once.
+    ctx.ranger
+        .create_tagdef(&late)
+        .await
+        .expect("define the late tag");
+    rig.handler
+        .execute(&ctx.dave, &set(&late), None)
+        .await
+        .expect("a tag defined after the cache filled is accepted on the re-read");
+
+    rig.handler
+        .execute(
+            &ctx.dave,
+            &format!("ALTER TABLE {ORDERS} UNSET TAGS (ssn)"),
+            None,
+        )
+        .await
+        .expect("an untag is never refused");
+
+    tag_authority_cleanup(&ctx, &rig, &[]).await;
+    for name in [&defined, &late] {
+        let _ = ctx.ranger.delete_tagdef(name).await;
+    }
+}
