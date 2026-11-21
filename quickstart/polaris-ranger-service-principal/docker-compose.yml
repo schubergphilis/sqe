@@ -191,6 +191,10 @@ services:
   # ── Polaris — Iceberg REST catalog, Ranger authorizer + Keycloak OIDC ─
   polaris:
     image: apache/polaris:1.9.0
+    # The image sizes its heap at 80% of visible memory; uncapped that is the
+    # whole Docker VM, and per-request S3 FileIO garbage grows until the VM's
+    # OOM killer stops the JVM. Capped, it collects (live set < 200 MB).
+    mem_limit: 3g
     environment:
       POLARIS_PERSISTENCE_TYPE: in-memory
       POLARIS_BOOTSTRAP_CREDENTIALS: iceberg-ranger,root,${POLARIS_BOOTSTRAP_SECRET:-polaris-root-secret}
