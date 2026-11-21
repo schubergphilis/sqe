@@ -39,7 +39,7 @@
       ]
     },
     "sqe-catalog": {
-      "lines": 67000,
+      "lines": 68500,
       "deps": [
         "sqe-core",
         "sqe-geo",
