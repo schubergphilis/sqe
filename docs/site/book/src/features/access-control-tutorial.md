@@ -634,6 +634,17 @@ while the coordinator was down stays in Ranger until
 `CALL system.reproject_column_tags` repairs it. The same CALL covers tables
 tagged before the projector existed.
 
+Table DDL projects its own change. `SET TBLPROPERTIES ('sqe.column-tags' = ...)`,
+`CREATE [OR REPLACE] TABLE` and CTAS bring Ranger in line with the committed
+tags. `RENAME` moves them to the new name, and every drop (`DROP TABLE`,
+`PURGE`, `CALL system.drop_table`, `DROP SCHEMA ... CASCADE`) clears them. When
+Ranger fails part-way, Spark masks more than SQE, never less: a new tag reaches
+Ranger before the property commits, a renamed table's tags land on the new name
+before the old name is cleared, and a clean-up that fails after a drop or
+rename only logs a warning. If tagging a table created by CREATE or CTAS
+fails, the statement reports that the table was committed and names the
+`reproject_column_tags` CALL that repairs it.
+
 One enforcement detail does not carry over, and it is pinned by
 `scripts/access-control-parity-demo.sh`: Kyuubi places its masking projection
 below its row-filter marker, so a row filter that reads a tag-masked column

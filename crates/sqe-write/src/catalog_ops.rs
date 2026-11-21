@@ -69,6 +69,9 @@ pub struct CatalogOps {
     /// Projects column tags into Ranger's tag store so engines other than SQE can
     /// see them. `NoopTagProjector` unless `[policy.ranger] project-tags` is on.
     tag_projector: StdArc<dyn sqe_policy::tag_projector::TagProjector>,
+    /// What the load observer (#903) last projected per table. DDL that
+    /// projects a table itself forgets it here (#928).
+    tag_load_memory: crate::tag_load_observer::TagLoadMemory,
     /// The coordinator's Polaris discovery for a non-default catalog
     /// qualifier, the same hook `WriteHandler` takes. `None` refuses one.
     catalog_discovery: Option<Arc<dyn CatalogDiscovery>>,
@@ -80,6 +83,34 @@ pub struct CatalogOps {
 /// A table's live `sqe.column-tags`, or why it does not parse as a tag map.
 pub type LiveTagMap = Result<ColumnTagMap, serde_json::Error>;
 
+/// `column -> [tag keys]`: what Ranger's tag store holds for a table.
+type TagKeys = HashMap<String, Vec<String>>;
+
+/// The tags of a table a procedure is about to drop, with its table lock
+/// held until they are cleared (#928).
+pub struct ProcedureDropTags {
+    catalog: String,
+    ident: TableIdent,
+    tags: TagKeys,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+/// Each column's tag keys in `a` or in `b`. Ranger holds this while a change
+/// from `a` to `b` is in flight, so other engines mask at least what either
+/// side masks (#928).
+fn union_tag_keys(a: &TagKeys, b: &TagKeys) -> TagKeys {
+    let mut all = a.clone();
+    for (column, keys) in b {
+        let held = all.entry(column.clone()).or_default();
+        for key in keys {
+            if !held.contains(key) {
+                held.push(key.clone());
+            }
+        }
+    }
+    all
+}
+
 impl CatalogOps {
     pub fn new(config: SqeConfig) -> Self {
         let tag_projector = Self::build_tag_projector(&config);
@@ -88,6 +119,7 @@ impl CatalogOps {
             table_cache: None,
             table_locks: StdArc::new(std::sync::Mutex::new(HashMap::new())),
             tag_projector,
+            tag_load_memory: Default::default(),
             catalog_discovery: None,
             fixed_catalog: None,
         }
@@ -156,15 +188,117 @@ impl CatalogOps {
         previous: &ColumnTagMap,
         tags: &ColumnTagMap,
     ) -> sqe_core::Result<()> {
-        use sqe_policy::tag_projector::{project_table_tags, ColumnTags};
         // Ranger's tag store gets the keys only; tag values stay in Iceberg.
-        let to_map = |m: &ColumnTagMap| -> ColumnTags {
-            sqe_core::column_tags::keys(m).into_iter().collect()
-        };
+        let (prev, tags) = (column_tags::keys(previous), column_tags::keys(tags));
+        self.project_tag_keys(catalog, ident, &prev, &tags).await
+    }
+
+    /// [`Self::project_tags`] for maps of tag keys. Afterwards the load
+    /// observer has forgotten `ident`, so its next load projects the table
+    /// afresh rather than skip it on a stale memory (#928).
+    async fn project_tag_keys(
+        &self,
+        catalog: &str,
+        ident: &TableIdent,
+        previous: &TagKeys,
+        tags: &TagKeys,
+    ) -> sqe_core::Result<()> {
+        use sqe_policy::tag_projector::{project_table_tags, ColumnTags};
+        let to_map = |m: &TagKeys| -> ColumnTags { m.clone().into_iter().collect() };
         let (ns, name) = (ident.namespace().as_ref(), ident.name());
         let (scoped, prev, tags) = (self.catalog_scoped(), to_map(previous), to_map(tags));
         let projector = self.tag_projector.as_ref();
-        project_table_tags(projector, catalog, ns, name, scoped, &prev, &tags).await
+        let done = project_table_tags(projector, catalog, ns, name, scoped, &prev, &tags).await;
+        self.tag_load_memory.forget(ident);
+        done
+    }
+
+    /// The tag keys of `ident` before it is dropped or renamed (#928), or
+    /// `None` when projection is off, the table cannot be loaded (a drop with
+    /// `IF EXISTS` of a missing table), it has no tags, or its tag value is
+    /// not a tag map (never projected, as on load).
+    async fn tag_keys_before_ddl(
+        &self,
+        session_catalog: &SessionCatalog,
+        ident: &TableIdent,
+    ) -> Option<TagKeys> {
+        if !self.tag_projector.enabled() {
+            return None;
+        }
+        let table = session_catalog.load_table(ident).await.ok()?;
+        match crate::tag_source_impl::parse_column_tags(table.metadata().properties()) {
+            Ok(tags) if !tags.is_empty() => Some(tags),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(table = %ident, error = %e, "malformed sqe.column-tags; not projected");
+                None
+            }
+        }
+    }
+
+    /// Clear the Ranger tags of a table that is gone: dropped, or renamed
+    /// away (#928). A failure is a warning, not an error: the statement
+    /// already happened, and the resource left behind only over-masks, in
+    /// other engines, a table created later under this name.
+    async fn clear_tags_of_gone_table(&self, catalog: &str, ident: &TableIdent, tags: &TagKeys) {
+        if let Err(e) = self
+            .project_tag_keys(catalog, ident, tags, &TagKeys::new())
+            .await
+        {
+            tracing::warn!(
+                table = %ident,
+                error = %e,
+                "the table is gone but clearing its column tags in Ranger failed; other \
+                 engines mask a table created later under this name with the old tags"
+            );
+        }
+    }
+
+    /// Read the tags of the table `CALL system.drop_table` (or `DROP TABLE
+    /// ... PURGE`, which runs it) is about to drop, and hold its table lock
+    /// until [`Self::clear_tags_after_procedure_drop`] (#928). `None` when
+    /// projection is off or the table has no tags to clear. The table is
+    /// resolved as the procedure resolves it.
+    pub async fn tags_before_procedure_drop(
+        &self,
+        session: &Session,
+        table: &TableRef,
+    ) -> Option<ProcedureDropTags> {
+        if !self.tag_projector.enabled() {
+            return None;
+        }
+        let ident = crate::procedures::to_table_ident(table);
+        let session_default = session.default_catalog.as_deref().filter(|c| !c.is_empty());
+        let target = table.catalog.as_deref().or(session_default);
+        let session_catalog = match self.session_catalog_for(session, target).await {
+            Ok(catalog) => catalog,
+            Err(e) => {
+                tracing::warn!(table = %ident, error = %e, "no catalog to read dropped tags from");
+                return None;
+            }
+        };
+        let _ = session_catalog.list_namespaces().await;
+        let guard = self.table_lock_for(&ident).lock_owned().await;
+        let tags = self.tag_keys_before_ddl(&session_catalog, &ident).await?;
+        let catalog = self.planner_catalog(session, table.catalog.clone());
+        Some(ProcedureDropTags {
+            catalog,
+            ident,
+            tags,
+            _guard: guard,
+        })
+    }
+
+    /// Clear the Ranger tags read by [`Self::tags_before_procedure_drop`]
+    /// once the table is dropped, then release its table lock.
+    pub async fn clear_tags_after_procedure_drop(&self, dropped: ProcedureDropTags) {
+        let ProcedureDropTags {
+            catalog,
+            ident,
+            tags,
+            ..
+        } = &dropped;
+        self.clear_tags_of_gone_table(catalog, ident, tags).await;
     }
 
     fn catalog_scoped(&self) -> bool {
@@ -177,9 +311,10 @@ impl CatalogOps {
         &self,
     ) -> Option<Arc<dyn sqe_catalog::load_observer::TableLoadObserver>> {
         let projector = self.tag_projector.clone();
-        let locks = self.table_locks.clone();
+        let (locks, memory) = (self.table_locks.clone(), self.tag_load_memory.clone());
+        let scoped = self.catalog_scoped();
         let observer =
-            crate::tag_load_observer::TagLoadObserver::new(projector, self.catalog_scoped(), locks);
+            crate::tag_load_observer::TagLoadObserver::new(projector, scoped, locks, memory);
         self.tag_projector
             .enabled()
             .then(|| Arc::new(observer) as Arc<_>)
@@ -285,12 +420,28 @@ impl CatalogOps {
         // as INSERT/CTAS/DELETE resolve it, not from the default warehouse:
         // with IF EXISTS the latter swallowed "not found" and dropped nothing.
         let target = resolve_target_catalog(catalog_qualifier(table_name), session);
-        let catalog = self
-            .create_catalog_bridge(session, target.as_deref())
-            .await?;
+        let session_catalog = self.session_catalog_for(session, target.as_deref()).await?;
+        // Warm up the REST catalog, as `create_catalog_bridge` does.
+        let _ = session_catalog.list_namespaces().await;
+        // Read before the drop: afterwards there is nothing to read them from.
+        // The table lock keeps a tag write or load projection from landing in
+        // between (#928).
+        let table_lock = self.table_lock_for(&table_ident);
+        let _guard = table_lock.lock().await;
+        let tags = self
+            .tag_keys_before_ddl(&session_catalog, &table_ident)
+            .await;
+        let catalog = session_catalog.as_catalog();
 
         match catalog.drop_table(&table_ident).await {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if let Some(tags) = tags {
+                    let planner = self.planner_catalog(session, catalog_qualifier(table_name));
+                    self.clear_tags_of_gone_table(&planner, &table_ident, &tags)
+                        .await;
+                }
+                Ok(())
+            }
             // IF EXISTS only swallows "table missing inside an existing
             // namespace". A missing namespace is a different failure that
             // typically points at an upstream CREATE SCHEMA that didn't
@@ -524,8 +675,9 @@ impl CatalogOps {
         let _ = session_catalog.list_namespaces().await;
 
         if cascade {
+            let planner = self.planner_catalog(session, schema_catalog_qualifier(schema_name_obj));
             let found = self
-                .drop_schema_contents(&session_catalog, &namespace)
+                .drop_schema_contents(&session_catalog, &planner, &namespace)
                 .await?;
             if !found {
                 if if_exists {
@@ -569,10 +721,12 @@ impl CatalogOps {
     /// never purges data files. The catalog has no multi-object drop, so the
     /// cascade is not atomic: a failure part-way names what was dropped and
     /// what remains. An object that is already gone (a concurrent drop) is
-    /// skipped.
+    /// skipped. A dropped table's Ranger tags are cleared as in
+    /// [`Self::drop_table`]; `planner` is the catalog name they are keyed by.
     async fn drop_schema_contents(
         &self,
         session_catalog: &Arc<SessionCatalog>,
+        planner: &str,
         namespace: &NamespaceIdent,
     ) -> sqe_core::Result<bool> {
         let schema = namespace.join(".");
@@ -637,8 +791,15 @@ impl CatalogOps {
             info!(schema = %schema, view = %view, "DROP SCHEMA CASCADE: dropped view");
         }
         for (i, table) in tables.iter().enumerate() {
+            let table_lock = self.table_lock_for(table);
+            let _guard = table_lock.lock().await;
+            let tags = self.tag_keys_before_ddl(session_catalog, table).await;
             match bridge.drop_table(table).await {
-                Ok(()) => {}
+                Ok(()) => {
+                    if let Some(tags) = tags {
+                        self.clear_tags_of_gone_table(planner, table, &tags).await;
+                    }
+                }
                 Err(e) if is_table_not_found(&e) => {}
                 Err(e) => return Err(failed(views.len() + i, e.to_string())),
             }
@@ -724,15 +885,63 @@ impl CatalogOps {
             "Renaming table"
         );
 
-        let catalog = self
-            .create_catalog_bridge(session, target_catalog.as_deref())
+        let session_catalog = self
+            .session_catalog_for(session, target_catalog.as_deref())
             .await?;
-        catalog
-            .rename_table(&src_ident, &dest_ident)
-            .await
-            .map_err(|e| SqeError::Catalog(format!("Failed to rename table: {e}")))?;
+        // Warm up the REST catalog, as `create_catalog_bridge` does.
+        let _ = session_catalog.list_namespaces().await;
 
-        Ok(())
+        // Both names locked, in a fixed order, so no tag write or load
+        // projection lands between the steps below (#928).
+        let (src_lock, dest_lock) = (
+            self.table_lock_for(&src_ident),
+            self.table_lock_for(&dest_ident),
+        );
+        let (first, second) = match src_ident.to_string() <= dest_ident.to_string() {
+            true => (&src_lock, &dest_lock),
+            false => (&dest_lock, &src_lock),
+        };
+        let _first = first.lock().await;
+        let _second = match StdArc::ptr_eq(first, second) {
+            true => None,
+            false => Some(second.lock().await),
+        };
+
+        // The new name is tagged in Ranger before the rename and the old one
+        // cleared after it, so other engines never see the table untagged. A
+        // destination that exists makes the rename fail; its tags are left
+        // alone.
+        let planner = self.planner_catalog(session, catalog_qualifier(source_name));
+        let mut tags = self.tag_keys_before_ddl(&session_catalog, &src_ident).await;
+        if tags.is_some() && session_catalog.table_exists(&dest_ident).await? {
+            tags = None;
+        }
+        if let Some(tags) = &tags {
+            let none = TagKeys::new();
+            let tagged = self.project_tag_keys(&planner, &dest_ident, &none, tags);
+            tagged.await.map_err(|e| {
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!(
+                        "could not tag '{dest_ident}' in Ranger before renaming '{src_ident}' \
+                         to it ({e}); nothing was renamed"
+                    ),
+                )
+            })?;
+        }
+        let renamed = session_catalog
+            .as_catalog()
+            .rename_table(&src_ident, &dest_ident)
+            .await;
+        if let Some(tags) = &tags {
+            let gone = if renamed.is_ok() {
+                &src_ident
+            } else {
+                &dest_ident
+            };
+            self.clear_tags_of_gone_table(&planner, gone, tags).await;
+        }
+        renamed.map_err(|e| SqeError::Catalog(format!("Failed to rename table: {e}")))
     }
 
     /// Create a view via the Polaris REST API.
@@ -1676,10 +1885,13 @@ impl CatalogOps {
             )
             .await?;
 
-        // Held across the re-check and the commit; `set_column_tags` takes the
-        // same lock for its read-merge-commit.
+        // Held across the re-check, the commit and the Ranger projection;
+        // `set_column_tags` takes the same lock for its read-merge-commit.
+        let checked = authorised_tag_columns.is_some()
+            || conflict_guard.is_some()
+            || self.tag_projector.enabled();
         let tag_lock = match updates.get(TAG_PROP_KEY) {
-            Some(raw) if authorised_tag_columns.is_some() || conflict_guard.is_some() => {
+            Some(raw) if checked => {
                 let table_lock = self.table_lock_for(&table_ident);
                 let held = table_lock.lock_owned().await;
                 let table = session_catalog.load_table(&table_ident).await?;
@@ -1723,10 +1935,35 @@ impl CatalogOps {
                     let (before, after) = (column_tags::keys(&live), column_tags::keys(wanted));
                     guard.check(&before, &after).await?;
                 }
-                Some(held)
+                Some((held, live, wanted))
             }
             _ => None,
         };
+        // The tag change Ranger gets (#928): `(before, in flight, after)`. A
+        // value that is not a tag map is not projected, as on load.
+        let projection = match &tag_lock {
+            Some((_, live, Some(wanted))) if self.tag_projector.enabled() => {
+                let (before, after) = (column_tags::keys(live), column_tags::keys(wanted));
+                let during = union_tag_keys(&before, &after);
+                Some((before, during, after))
+            }
+            _ => None,
+        };
+        let planner = self.planner_catalog(session, catalog_qualifier(table_name));
+        // Added tags reach Ranger before the commit, so other engines never
+        // mask less than SQE does.
+        if let Some((before, during, _)) = projection.as_ref().filter(|(b, d, _)| b != d) {
+            let added = self.project_tag_keys(&planner, &table_ident, before, during);
+            added.await.map_err(|e| {
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!(
+                        "could not project the new column tags of '{table_ident}' into Ranger \
+                         ({e}); nothing was committed"
+                    ),
+                )
+            })?;
+        }
 
         let mut table_updates = Vec::new();
         let mut requirements = vec![];
@@ -1773,9 +2010,32 @@ impl CatalogOps {
             return Ok(());
         }
 
-        session_catalog
+        let committed = session_catalog
             .commit_schema_update(&table_ident, table_updates, requirements)
-            .await?;
+            .await;
+        if let Some((before, during, after)) = &projection {
+            // Committed: Ranger goes from the union to the new tags. Not
+            // committed: back to the old ones. Either step only removes tags.
+            let target = if committed.is_ok() { after } else { before };
+            let removed = match during == target {
+                true => Ok(()),
+                false => {
+                    self.project_tag_keys(&planner, &table_ident, during, target)
+                        .await
+                }
+            };
+            // A failure here leaves extra tags only: other engines over-mask.
+            if let Err(e) = removed {
+                tracing::warn!(
+                    table = %table_ident,
+                    committed = committed.is_ok(),
+                    error = %e,
+                    "removing column tags from Ranger failed; other engines mask the columns \
+                     that lost a tag until a tag write on them succeeds"
+                );
+            }
+        }
+        committed?;
         drop(tag_lock);
 
         // No metadata-cache eviction here: `commit_schema_update` now evicts
@@ -2151,6 +2411,79 @@ impl CatalogOps {
         Ok(Some(parse_column_tag_entries(
             table.metadata().properties(),
         )))
+    }
+
+    /// The tag keys of `table` before a CREATE [OR REPLACE] TABLE or CTAS
+    /// writes it, for [`Self::project_created_table_tags`] (#928). `None`
+    /// when projection is off; empty when the table does not exist yet or
+    /// cannot be read.
+    pub async fn tags_before_create(
+        &self,
+        session: &Session,
+        table: &ObjectName,
+    ) -> Option<HashMap<String, Vec<String>>> {
+        if !self.tag_projector.enabled() {
+            return None;
+        }
+        let before = match self.live_column_tags(session, table).await {
+            Ok(Some(Ok(live))) => column_tags::keys(&live),
+            _ => TagKeys::new(),
+        };
+        Some(before)
+    }
+
+    /// Project the tags a CREATE [OR REPLACE] TABLE or CTAS committed:
+    /// tags written in its properties, or a replaced table's tags trimmed to
+    /// the surviving columns (#928). `before` is
+    /// [`Self::tags_before_create`]'s answer.
+    ///
+    /// The table is already committed, so a failed projection is reported
+    /// with the repair rather than undone.
+    pub async fn project_created_table_tags(
+        &self,
+        session: &Session,
+        table: &ObjectName,
+        before: Option<HashMap<String, Vec<String>>>,
+    ) -> sqe_core::Result<()> {
+        let Some(before) = before else {
+            return Ok(());
+        };
+        let table_ident = resolve_table_ident(table, session)?;
+        let table_lock = self.table_lock_for(&table_ident);
+        let _guard = table_lock.lock().await;
+        let after = match self.live_column_tags(session, table).await {
+            Ok(Some(Ok(live))) => column_tags::keys(&live),
+            Ok(None) => return Ok(()),
+            Ok(Some(Err(e))) => {
+                tracing::warn!(table = %table_ident, error = %e, "malformed sqe.column-tags; not projected");
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    table = %table_ident,
+                    error = %e,
+                    "could not read the created table's column tags back; the next load \
+                     projects them"
+                );
+                return Ok(());
+            }
+        };
+        if after == before {
+            return Ok(());
+        }
+        let planner = self.planner_catalog(session, catalog_qualifier(table));
+        let projected = self.project_tag_keys(&planner, &table_ident, &before, &after);
+        projected.await.map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!(
+                    "'{table_ident}' was created and COMMITTED, but projecting its column tags \
+                     into Ranger failed ({e}). Do not re-run the statement. Until \
+                     `CALL system.reproject_column_tags(table => '{table_ident}')` succeeds, \
+                     engines that read Ranger's tag store return its tagged columns raw."
+                ),
+            )
+        })
     }
 
     /// Project existing Iceberg `sqe.column-tags` into Ranger for tables
@@ -3623,6 +3956,28 @@ mod tests {
         assert_eq!(row.status, "error");
         assert!(row.message.contains("ranger down"), "got: {}", row.message);
         assert_eq!(row.columns_projected, 0);
+    }
+
+    /// Ranger holds the union while a tag change is in flight (#928).
+    #[test]
+    fn union_tag_keys_keeps_every_key_of_both_sides_once() {
+        let keys = |pairs: &[(&str, &[&str])]| -> TagKeys {
+            let to_vec = |ks: &[&str]| ks.iter().map(ToString::to_string).collect();
+            pairs
+                .iter()
+                .map(|(c, ks)| (c.to_string(), to_vec(ks)))
+                .collect()
+        };
+        let before = keys(&[("ssn", &["pii"]), ("email", &["pii"])]);
+        let after = keys(&[("ssn", &["pii", "gdpr"]), ("phone", &["pii"])]);
+        let union = union_tag_keys(&before, &after);
+        let want = keys(&[
+            ("ssn", &["pii", "gdpr"]),
+            ("email", &["pii"]),
+            ("phone", &["pii"]),
+        ]);
+        assert_eq!(union, want);
+        assert_eq!(union_tag_keys(&before, &TagKeys::new()), before);
     }
 
     #[test]
