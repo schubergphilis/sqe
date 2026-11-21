@@ -2353,8 +2353,14 @@ impl QueryHandler {
                     // under `ranger-delegate` the changed columns are checked
                     // here and again inside the write's table lock.
                     let authorised = self.authorise_tag_property(session, stmt).await?;
+                    let conflicts = self.tag_property_conflict_guard(session, stmt)?;
                     self.catalog_ops
-                        .set_table_properties_guarded(session, stmt, authorised.as_ref())
+                        .set_table_properties_guarded(
+                            session,
+                            stmt,
+                            authorised.as_ref(),
+                            conflicts.as_ref(),
+                        )
                         .await?;
                     crate::session_context::invalidate_session_cache(&session.user.username).await;
                     // Flush cached tag policies so a SET TBLPROPERTIES on sqe.column-tags
@@ -2376,7 +2382,10 @@ impl QueryHandler {
                         "ALTER TABLE ... SET TAGS",
                         3,
                     )?;
-                    self.catalog_ops.set_column_tags(session, stmt).await?;
+                    let conflicts = self.tag_statement_conflict_guard(session, stmt)?;
+                    self.catalog_ops
+                        .set_column_tags(session, stmt, conflicts.as_ref())
+                        .await?;
                     crate::session_context::invalidate_session_cache(&session.user.username).await;
                     // Tag->column associations changed; flush cached tag policies so
                     // the next query re-resolves masks against the new tags.
@@ -2403,7 +2412,10 @@ impl QueryHandler {
                     )
                     .await?;
                     let stmt = self.masking_policy_to_tag_op(op).await?;
-                    self.catalog_ops.set_column_tags(session, &stmt).await?;
+                    let conflicts = self.tag_statement_conflict_guard(session, &stmt)?;
+                    self.catalog_ops
+                        .set_column_tags(session, &stmt, conflicts.as_ref())
+                        .await?;
                     crate::session_context::invalidate_session_cache(&session.user.username).await;
                     self.invalidate_policy_cache();
                     Ok(vec![])

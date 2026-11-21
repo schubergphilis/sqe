@@ -7,6 +7,7 @@ pub mod policy_store;
 pub mod ranger_store;
 pub mod session_udf;
 pub mod sha256_udf;
+pub mod tag_conflict_guard;
 pub mod tag_projector;
 pub mod tag_scope;
 pub mod tag_source;

@@ -1400,9 +1400,10 @@ async fn tag_from_out_of_band_commit_masks_the_next_query() {
     let ident = TableIdent::new(ns, "orders".to_string());
     let table = catalog.load_table(&ident).await.expect("load orders");
     let raw = table.metadata().properties().get("sqe.column-tags");
-    let mut tags: HashMap<String, Vec<String>> =
+    // Entries are a tag or a one-entry `{tag: value}` object since tag values.
+    let mut tags: HashMap<String, Vec<serde_json::Value>> =
         serde_json::from_str(raw.expect("email is tagged")).unwrap();
-    tags.insert("ssn".to_string(), vec!["PII".to_string()]);
+    tags.insert("ssn".to_string(), vec![serde_json::json!("PII")]);
     let tx = Transaction::new(&table);
     let action = tx.update_table_properties().set(
         "sqe.column-tags".to_string(),
@@ -2969,6 +2970,270 @@ async fn tag_mask_beats_resource_mask_live() {
             "the tag MASK_NULL must win; an xxx-xx- value is the resource mask's rendering"
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// mask_precedence = refuse, at write time (#918)
+//
+// Under `refuse` a read already fails when a resource policy and a tag policy
+// give one principal two different masks (or row filters). These prove the tag
+// write that would cause the conflict is refused instead, on every path that
+// writes `sqe.column-tags`, while a write that creates no conflict, and every
+// tag removal, still goes through.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A second handler on the same cache, differing only in `mask_precedence`.
+async fn refuse_handler(ctx: &AcCtx) -> QueryHandler {
+    use sqe_core::config::MaskPrecedence;
+    let (handler, _) =
+        crate::common::setup_ranger_handler_sharing(Some(ctx.cache.clone()), |cfg| {
+            cfg.policy.mask_precedence = MaskPrecedence::Refuse;
+        })
+        .await;
+    handler
+}
+
+/// Wait until `handler` refuses `sql` as a tag conflict; returns the message.
+async fn refused_as_conflict(handler: &QueryHandler, s: &Session, sql: &str) -> String {
+    crate::common::eventually(&format!("refuse: {sql}"), || async {
+        match handler.execute(s, sql, None).await {
+            Err(e) if e.to_string().contains("tag change refused") => Ok(e.to_string()),
+            Err(e) => Err(format!("other error: {e}")),
+            Ok(_) => Err("write went through".to_string()),
+        }
+    })
+    .await
+}
+
+/// Resource `MASK_SHOW_LAST_4` on `ssn` and a tag `MASK_NULL` on `PII`, both
+/// for role engineer. `role` binds the tag policy (`engineer` conflicts).
+async fn refuse_at_write_mask_policies(ctx: &AcCtx, role: &str) {
+    let mut tag = tag_mask_policy(
+        &format!("{PREFIX}refuse-tag-null-pii"),
+        "PII",
+        serde_json::json!({"dataMaskType": "hive:MASK_NULL"}),
+    );
+    tag["dataMaskPolicyItems"][0]["roles"] = serde_json::json!([role]);
+    ctx.ranger
+        .create_policy(tag)
+        .await
+        .expect("create tag mask");
+    ctx.ranger
+        .create_policy(tag_mask_policy(
+            &format!("{PREFIX}refuse-tag-last4"),
+            "LAST4",
+            serde_json::json!({"dataMaskType": "hive:MASK_SHOW_LAST_4"}),
+        ))
+        .await
+        .expect("create same-mask tag policy");
+    ctx.ranger
+        .create_policy(hive_mask_policy(
+            &format!("{PREFIX}refuse-mask-ssn-last4"),
+            "ssn",
+            serde_json::json!({"dataMaskType": "MASK_SHOW_LAST_4"}),
+        ))
+        .await
+        .expect("create resource mask");
+}
+
+/// 4.1, 4.2, 4.5, 4.6, 4.7: a tag that gives engineer a second mask on `ssn`
+/// is refused through SET TAGS, MODIFY COLUMN and a raw property write, and
+/// leaves the tags as they were. A tag carrying the same mask, and removing
+/// the conflicting tag, are allowed. The default `tag` mode writes it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn refuse_at_write_mask_conflict() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+    refuse_at_write_mask_policies(&ctx, "engineer").await;
+    let refuse = refuse_handler(&ctx).await;
+
+    let set = format!("ALTER TABLE {ORDERS} SET TAGS (ssn = ('PII'))");
+    let err = refused_as_conflict(&refuse, &ctx.carol, &set).await;
+    assert!(
+        err.contains("mask conflict on sales_wh.ac.orders.ssn"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("engineer"),
+        "the principal is not named: {err}"
+    );
+    let modify = format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn SET TAG PII = 'true'");
+    refused_as_conflict(&refuse, &ctx.carol, &modify).await;
+    let raw = format!(
+        r#"ALTER TABLE {ORDERS} SET TBLPROPERTIES ('sqe.column-tags' = '{{"ssn":["PII"]}}')"#
+    );
+    refused_as_conflict(&refuse, &ctx.carol, &raw).await;
+    // Nothing was written: bob still reads the resource mask, not the tag's.
+    bob_sees(&ctx, "ssn", &SSN_MASKED).await;
+
+    // The same mask from the tag is no conflict.
+    let same = format!("ALTER TABLE {ORDERS} SET TAGS (ssn = ('LAST4'))");
+    refuse
+        .execute(&ctx.carol, &same, None)
+        .await
+        .expect("same mask is allowed");
+    let unset = format!("ALTER TABLE {ORDERS} UNSET TAGS (ssn)");
+    exec_ok(&ctx, &ctx.carol, &unset).await;
+
+    // `tag` mode writes the conflicting tag, and the refuse read then fails:
+    // the write check refused a conflict that is real.
+    exec_ok(&ctx, &ctx.carol, &set).await;
+    bob_sees(&ctx, "ssn", &["NULL", "NULL", "NULL"]).await;
+    let read = format!("SELECT ssn FROM {ORDERS}");
+    crate::common::eventually("the refuse read to fail on the conflict", || async {
+        match refuse.execute(&ctx.bob, &read, None).await {
+            Err(_) => Ok(()),
+            Ok(b) => Err(format!("read went through: {:?}", col_strings(&b, "ssn"))),
+        }
+    })
+    .await;
+
+    // Removing the conflicting tag is never checked.
+    refuse
+        .execute(&ctx.carol, &unset, None)
+        .await
+        .expect("UNSET is allowed");
+    bob_sees(&ctx, "ssn", &SSN_MASKED).await;
+}
+
+/// 4.3: the tag mask binds analyst, the resource mask engineer. No single role
+/// gets two masks, so the write is allowed. bob holds both roles and his read
+/// is refused: the check keys on each principal a policy names, not on every
+/// combination of them (design D1).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn refuse_at_write_disjoint_roles_allowed() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+    refuse_at_write_mask_policies(&ctx, "analyst").await;
+    let refuse = refuse_handler(&ctx).await;
+
+    let set = format!("ALTER TABLE {ORDERS} SET TAGS (ssn = ('PII'))");
+    crate::common::eventually("the disjoint-role tag to be written", || async {
+        refuse
+            .execute(&ctx.carol, &set, None)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await;
+
+    let read = format!("SELECT ssn FROM {ORDERS} ORDER BY id");
+    crate::common::eventually("alice to read the tag mask only", || async {
+        match refuse.execute(&ctx.alice, &read, None).await {
+            Ok(b) if col_strings(&b, "ssn").iter().all(|v| v == "NULL") => Ok(()),
+            Ok(b) => Err(format!("got {:?}", col_strings(&b, "ssn"))),
+            Err(e) => Err(format!("query failed: {e}")),
+        }
+    })
+    .await;
+    crate::common::eventually("bob's mixed-membership read to be refused", || async {
+        match refuse.execute(&ctx.bob, &read, None).await {
+            Err(_) => Ok(()),
+            Ok(b) => Err(format!("read went through: {:?}", col_strings(&b, "ssn"))),
+        }
+    })
+    .await;
+    let unset = format!("ALTER TABLE {ORDERS} UNSET TAGS (ssn)");
+    refuse
+        .execute(&ctx.carol, &unset, None)
+        .await
+        .expect("UNSET is allowed");
+}
+
+/// 4.4: a tag row filter that differs from engineer's resource row filter is
+/// refused, and the table keeps its tags.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn refuse_at_write_row_filter_conflict() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+    ctx.ranger
+        .create_policy(hive_rowfilter_policy(
+            &format!("{PREFIX}refuse-rowfilter-eu"),
+            "region = 'EU'",
+        ))
+        .await
+        .expect("create resource row filter");
+    ctx.ranger
+        .create_policy(tag_rowfilter_policy(
+            &format!("{PREFIX}refuse-tag-rowfilter-us"),
+            "GEO",
+            "region = 'US'",
+        ))
+        .await
+        .expect("create tag row filter");
+    let refuse = refuse_handler(&ctx).await;
+
+    let set = format!("ALTER TABLE {ORDERS} SET TAGS (region = ('GEO'))");
+    let err = refused_as_conflict(&refuse, &ctx.carol, &set).await;
+    assert!(
+        err.contains("row filter conflict on sales_wh.ac.orders"),
+        "{err}"
+    );
+    // Nothing was written: bob's refuse read keeps only the resource filter.
+    let read = format!("SELECT id FROM {ORDERS} ORDER BY id");
+    crate::common::eventually("bob to read the EU rows only", || async {
+        match refuse.execute(&ctx.bob, &read, None).await {
+            Ok(b) if col_strings(&b, "id") == ["1", "3"] => Ok(()),
+            Ok(b) => Err(format!("got {:?}", col_strings(&b, "id"))),
+            Err(e) => Err(format!("query failed: {e}")),
+        }
+    })
+    .await;
+}
+
+/// #918 with #919: under `catalog_scoped` the check resolves tags as the read
+/// does, so a `sales_wh.PII` tag policy that disagrees with the `LAST4` mask
+/// on `ssn` refuses the PII tag, and an unscoped handler, for which the
+/// qualified policy matches nothing, writes it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn refuse_at_write_catalog_scoped_tag_policy() {
+    use sqe_core::config::MaskPrecedence;
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+    for (name, tag, mask) in [
+        ("refuse-scoped-last4", "LAST4", "hive:MASK_SHOW_LAST_4"),
+        ("refuse-scoped-null", "sales_wh.PII", "hive:MASK_NULL"),
+    ] {
+        let mask = serde_json::json!({ "dataMaskType": mask });
+        let policy = tag_mask_policy(&format!("{PREFIX}{name}"), tag, mask);
+        ctx.ranger
+            .create_policy(policy)
+            .await
+            .expect("create tag mask");
+    }
+    let (scoped, _) = crate::common::setup_ranger_handler_sharing(Some(ctx.cache.clone()), |cfg| {
+        cfg.policy.mask_precedence = MaskPrecedence::Refuse;
+        cfg.policy.ranger.catalog_scoped = true;
+    })
+    .await;
+
+    let last4 = format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn SET TAG LAST4 = 'true'");
+    let done = scoped.execute(&ctx.carol, &last4, None).await;
+    done.expect("one mask is no conflict");
+    let pii = format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn SET TAG PII = 'true'");
+    let err = refused_as_conflict(&scoped, &ctx.carol, &pii).await;
+    assert!(
+        err.contains("mask conflict on sales_wh.ac.orders.ssn"),
+        "{err}"
+    );
+
+    let unscoped = refuse_handler(&ctx).await;
+    let done = unscoped.execute(&ctx.carol, &pii, None).await;
+    done.expect("unscoped: sales_wh.PII matches nothing");
+    let unset = format!("ALTER TABLE {ORDERS} UNSET TAGS (ssn)");
+    exec_ok(&ctx, &ctx.carol, &unset).await;
 }
 
 /// `GRANT SELECT ON ALL TABLES IN SCHEMA` covers every table in the namespace

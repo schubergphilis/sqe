@@ -34,7 +34,8 @@ use crate::write_handler::{
     geospatial_iceberg_type, parse_partition_transform_sql, requested_format_version,
     resolve_target_catalog, sql_type_to_arrow, sql_type_to_arrow_for, CatalogDiscovery,
 };
-use sqe_core::column_tags::ColumnTagMap;
+use sqe_core::column_tags::{self, ColumnTagMap};
+use sqe_policy::tag_conflict_guard::TagConflictGuard;
 
 /// `format-version` (Iceberg) or `format_version` (Trino).
 fn is_format_version_key(key: &str) -> bool {
@@ -1583,7 +1584,8 @@ impl CatalogOps {
         session: &Session,
         stmt: &Statement,
     ) -> sqe_core::Result<()> {
-        self.set_table_properties_guarded(session, stmt, None).await
+        self.set_table_properties_guarded(session, stmt, None, None)
+            .await
     }
 
     /// [`Self::set_table_properties`] for a caller that authorised a write of
@@ -1596,12 +1598,18 @@ impl CatalogOps {
     /// changed the map in between fails this statement instead of being
     /// overwritten unauthorised. A live or new value that is not a tag map is
     /// refused too.
+    ///
+    /// With `conflict_guard` (`mask_precedence = refuse`), a statement that
+    /// sets the key takes the same lock and refuses a new map that creates a
+    /// policy conflict (#918), whoever writes it. A live value that is not a
+    /// tag map counts as empty there, so an admin can still repair it.
     #[instrument(skip_all, fields(username = %session.user.username))]
     pub async fn set_table_properties_guarded(
         &self,
         session: &Session,
         stmt: &Statement,
         authorised_tag_columns: Option<&std::collections::BTreeSet<String>>,
+        conflict_guard: Option<&TagConflictGuard>,
     ) -> sqe_core::Result<()> {
         let (table_name, operations) = match stmt {
             Statement::AlterTable(at) => (&at.name, &at.operations),
@@ -1668,36 +1676,45 @@ impl CatalogOps {
 
         // Held across the re-check and the commit; `set_column_tags` takes the
         // same lock for its read-merge-commit.
-        let tag_lock = match (authorised_tag_columns, updates.get(TAG_PROP_KEY)) {
-            (Some(authorised), Some(raw)) => {
+        let tag_lock = match updates.get(TAG_PROP_KEY) {
+            Some(raw) if authorised_tag_columns.is_some() || conflict_guard.is_some() => {
                 let table_lock = self.table_lock_for(&table_ident);
-                let guard = table_lock.lock_owned().await;
+                let held = table_lock.lock_owned().await;
                 let table = session_catalog.load_table(&table_ident).await?;
-                let live =
-                    parse_column_tag_entries(table.metadata().properties()).map_err(|e| {
-                        SqeError::Catalog(format!(
-                        "403 Forbidden: {TAG_PROP_KEY} on '{table_ident}' is not a tag map ({e}); \
-                         only an admin can overwrite it"
-                    ))
-                    })?;
+                let live = match parse_column_tag_entries(table.metadata().properties()) {
+                    Ok(live) => live,
+                    Err(_) if authorised_tag_columns.is_none() => ColumnTagMap::new(),
+                    Err(e) => {
+                        return Err(SqeError::Catalog(format!(
+                            "403 Forbidden: {TAG_PROP_KEY} on '{table_ident}' is not a tag map \
+                             ({e}); only an admin can overwrite it"
+                        )))
+                    }
+                };
                 let wanted = sqe_core::column_tags::parse(raw).map_err(|e| {
                     SqeError::Catalog(format!(
                         "403 Forbidden: {TAG_PROP_KEY} must be a JSON object of column to \
                          tag list ({e})"
                     ))
                 })?;
-                let unauthorised: Vec<String> = changed_tag_columns(&live, &wanted)
-                    .into_iter()
-                    .filter(|c| !authorised.contains(c))
-                    .collect();
-                if !unauthorised.is_empty() {
-                    return Err(SqeError::Catalog(format!(
-                        "403 Forbidden: the tags of '{table_ident}' changed while the statement \
-                         was checked; it would also change column(s) {} - retry",
-                        unauthorised.join(", ")
-                    )));
+                if let Some(authorised) = authorised_tag_columns {
+                    let unauthorised: Vec<String> = changed_tag_columns(&live, &wanted)
+                        .into_iter()
+                        .filter(|c| !authorised.contains(c))
+                        .collect();
+                    if !unauthorised.is_empty() {
+                        return Err(SqeError::Catalog(format!(
+                            "403 Forbidden: the tags of '{table_ident}' changed while the \
+                             statement was checked; it would also change column(s) {} - retry",
+                            unauthorised.join(", ")
+                        )));
+                    }
                 }
-                Some(guard)
+                if let Some(guard) = conflict_guard {
+                    let (before, after) = (column_tags::keys(&live), column_tags::keys(&wanted));
+                    guard.check(&before, &after).await?;
+                }
+                Some(held)
             }
             _ => None,
         };
@@ -1911,11 +1928,16 @@ impl CatalogOps {
     /// Snowflake column forms). Reads the current `sqe.column-tags` property,
     /// applies merge semantics, and commits the new map as a single
     /// `TableUpdate::SetProperties`.
-    #[instrument(skip(self, session, stmt), fields(username = %session.user.username))]
+    ///
+    /// `conflict_guard` (set under `mask_precedence = refuse`) runs inside the
+    /// table lock on the live map and refuses a change that creates a policy
+    /// conflict (#918).
+    #[instrument(skip(self, session, stmt, conflict_guard), fields(username = %session.user.username))]
     pub async fn set_column_tags(
         &self,
         session: &Session,
         stmt: &sqe_sql::tags::SetTagsStatement,
+        conflict_guard: Option<&TagConflictGuard>,
     ) -> sqe_core::Result<()> {
         let object_name = parse_object_name(&stmt.table)?;
         let table_ident = resolve_table_ident(&object_name, session)?;
@@ -1951,6 +1973,10 @@ impl CatalogOps {
         })?;
 
         let new_map = crate::tag_source_impl::apply_tag_ops(&current, &stmt.ops);
+        if let Some(guard) = conflict_guard {
+            let (before, after) = (column_tags::keys(&current), column_tags::keys(&new_map));
+            guard.check(&before, &after).await?;
+        }
         let json = sqe_core::column_tags::to_json(&new_map).map_err(|e| {
             SqeError::with_code(
                 SqeErrorCode::ExecutionFailed,
