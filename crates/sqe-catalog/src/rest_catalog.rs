@@ -1422,6 +1422,8 @@ macro_rules! dispatch_catalog {
 #[allow(unused_imports)]
 pub(crate) use dispatch_catalog;
 
+mod catalog_properties;
+
 /// Per-session Iceberg REST catalog wrapper.
 ///
 /// Each authenticated user session gets its own `SessionCatalog` instance

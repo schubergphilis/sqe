@@ -1,4 +1,4 @@
-//! `ALTER TABLE|SCHEMA ... SET|UNSET TAGS ('k' = 'v')`: tags on the object
+//! `ALTER TABLE|SCHEMA|CATALOG ... SET|UNSET TAGS ('k' = 'v')`: tags on the object
 //! itself (#922), stored in the format [`sqe_core::object_tags`] defines. The
 //! query handler gates the statement first (`require_object_tag_authority`).
 //!
@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use iceberg::{NamespaceIdent, TableUpdate};
 use sqe_core::column_tags::ColumnTag;
-use sqe_core::object_tags::{self, SCHEMA_PROP_KEY, TABLE_PROP_KEY};
+use sqe_core::object_tags::{self, CATALOG_PROP_KEY, SCHEMA_PROP_KEY, TABLE_PROP_KEY};
 use sqe_core::{Session, SqeError, SqeErrorCode};
 use sqe_sql::object_tags::{ObjectTagsStatement, TagObject};
 use sqe_sql::tags::TagAction;
@@ -52,8 +52,7 @@ fn next_tags(
 }
 
 impl CatalogOps {
-    /// Write the tags of the table or schema `stmt` names. Catalog tags are
-    /// refused: there is no catalog property this path can write yet.
+    /// Write the tags of the table, schema or catalog `stmt` names.
     pub async fn set_object_tags(
         &self,
         session: &Session,
@@ -62,8 +61,33 @@ impl CatalogOps {
         match &stmt.object {
             TagObject::Table(name) => self.set_table_tags(session, name, stmt).await,
             TagObject::Schema(name) => self.set_schema_tags(session, name, stmt).await,
-            TagObject::Catalog(_) => Err(catalog_tags_unsupported()),
+            TagObject::Catalog(name) => self.set_catalog_tags(session, name, stmt).await,
         }
+    }
+
+    /// Catalog tags are a Polaris catalog property, written through the
+    /// management API on the caller's token: Polaris authorizes the update
+    /// (`UPDATE_CATALOG`) and its entity version makes it a compare and set.
+    async fn set_catalog_tags(
+        &self,
+        session: &Session,
+        name: &str,
+        stmt: &ObjectTagsStatement,
+    ) -> sqe_core::Result<()> {
+        let catalog = catalog_target(&parse_object_name(name)?)?;
+        let session_catalog = self.session_catalog_for(session, Some(&catalog)).await?;
+        info!(
+            username = %session.user.username,
+            catalog = %catalog,
+            action = ?stmt.action,
+            "Authoring catalog tags"
+        );
+        let on = format!("catalog '{catalog}'");
+        session_catalog
+            .update_catalog_property(CATALOG_PROP_KEY, |raw| {
+                next_tags(raw, stmt, CATALOG_PROP_KEY, &on).map(Some)
+            })
+            .await
     }
 
     async fn set_table_tags(
@@ -176,13 +200,21 @@ pub fn schema_target(
     Ok((target, namespace_without_catalog(name)?))
 }
 
-/// The refusal for `ALTER CATALOG ... SET|UNSET TAGS`.
-pub fn catalog_tags_unsupported() -> SqeError {
-    SqeError::NotImplemented(
-        "ALTER CATALOG ... SET TAGS: tags on a catalog are not supported yet. \
-         Tag its schemas or tables instead"
-            .to_string(),
-    )
+/// The catalog `ALTER CATALOG <name>` names: exactly one identifier.
+pub fn catalog_target(name: &sqlparser::ast::ObjectName) -> sqe_core::Result<String> {
+    let parts: Vec<&str> = name
+        .0
+        .iter()
+        .filter_map(|p| p.as_ident())
+        .map(|i| i.value.as_str())
+        .collect();
+    match parts.as_slice() {
+        [catalog] if name.0.len() == 1 => Ok((*catalog).to_string()),
+        _ => Err(SqeError::with_code(
+            SqeErrorCode::InvalidArguments,
+            format!("ALTER CATALOG takes a single catalog name, got '{name}'"),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -213,6 +245,14 @@ mod tests {
             next_tags(None, &set, "k", "t").unwrap(),
             r#"[{"owner":"risk"},"gold"]"#
         );
+    }
+
+    #[test]
+    fn a_catalog_target_is_one_name() {
+        let one = super::super::parse_object_name("sales_wh").unwrap();
+        assert_eq!(catalog_target(&one).unwrap(), "sales_wh");
+        let two = super::super::parse_object_name("a.b").unwrap();
+        assert!(catalog_target(&two).is_err());
     }
 
     #[test]

@@ -1,8 +1,9 @@
-//! Tags on a table or a schema, as opposed to its columns (#922).
+//! Tags on a table, a schema or a catalog, as opposed to its columns (#922).
 //!
 //! A table's tags live in the table property [`TABLE_PROP_KEY`], a schema's
-//! in the namespace property [`SCHEMA_PROP_KEY`]. Both hold a JSON list in
-//! the entry format `sqe.column-tags` uses for one column:
+//! in the namespace property [`SCHEMA_PROP_KEY`], a catalog's in the Polaris
+//! catalog property [`CATALOG_PROP_KEY`]. Each holds a JSON list in the
+//! entry format `sqe.column-tags` uses for one column:
 //!
 //! ```json
 //! ["gold", {"owner": "finance"}]
@@ -21,6 +22,9 @@ pub const TABLE_PROP_KEY: &str = "sqe.table-tags";
 
 /// Namespace property key holding the schema's tags.
 pub const SCHEMA_PROP_KEY: &str = "sqe.schema-tags";
+
+/// Polaris catalog property key holding the catalog's tags.
+pub const CATALOG_PROP_KEY: &str = "sqe.catalog-tags";
 
 /// Parse an object tag property value. A missing or blank value is no tags.
 pub fn parse(raw: Option<&str>) -> Result<Vec<ColumnTag>, serde_json::Error> {

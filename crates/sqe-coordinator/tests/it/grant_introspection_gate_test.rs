@@ -1548,14 +1548,53 @@ async fn object_tags_raw_table_property_is_reserved_for_admins() {
     }
 }
 
+const CATALOG_TAG_STMTS: [&str; 2] = [
+    "ALTER CATALOG iceberg SET TAGS ('gold', 'owner' = 'finance')",
+    "ALTER CATALOG iceberg UNSET TAGS ('gold')",
+];
+
 #[tokio::test]
-async fn object_tags_on_a_catalog_are_refused() {
-    let handler = make_delegate_handler(Arc::new(RecordingStore::default()));
+async fn catalog_tags_admin_role_refuses_a_steward_and_passes_an_admin() {
+    let handler = make_handler(
+        Arc::new(RecordingBackend::default()),
+        Arc::new(RecordingStore::default()),
+    );
+    let steward = session_for("alice", vec!["analyst"]);
     let admin = session_for("root", vec!["service_admin"]);
-    let sql = "ALTER CATALOG iceberg SET TAGS ('gold')";
-    let err = handler.execute(&admin, sql, None).await.expect_err(sql);
+    for sql in CATALOG_TAG_STMTS {
+        assert_refused_by_tag_gate(handler.execute(&steward, sql, None).await, sql);
+        assert_passed_tag_gate(handler.execute(&admin, sql, None).await, sql);
+    }
+}
+
+/// Under `ranger-delegate` the query service has no catalog resource to
+/// grant on: the write goes to Polaris on the caller's token, which decides.
+#[tokio::test]
+async fn catalog_tags_delegate_leaves_the_privilege_to_polaris() {
+    let handler = make_delegate_handler(Arc::new(RecordingStore::default()));
+    let steward = session_for("alice", vec!["analyst"]);
+    for sql in CATALOG_TAG_STMTS {
+        assert_passed_tag_gate(handler.execute(&steward, sql, None).await, sql);
+    }
+}
+
+#[tokio::test]
+async fn catalog_tags_refuse_an_undefined_key_and_a_dotted_name() {
+    use sqe_core::config::TagAuthority::RangerDelegate;
+    let store = Arc::new(Tagdefs {
+        defs: Some(vec!["gold"]),
+        ..Default::default()
+    });
+    let handler = tagdef_handler(store, RangerDelegate);
+    let steward = session_for("steward", vec!["analyst"]);
+    let sql = "ALTER CATALOG iceberg SET TAGS ('gold', 'silver')";
+    assert_undefined(handler.execute(&steward, sql, None).await, sql, "silver");
+    let sql = "ALTER CATALOG iceberg UNSET TAGS ('silver')";
+    assert_passed_name_check(handler.execute(&steward, sql, None).await, sql);
+    let sql = "ALTER CATALOG a.b SET TAGS ('gold')";
+    let err = handler.execute(&steward, sql, None).await.expect_err(sql);
     assert!(
-        err.to_string().contains("not supported yet"),
+        err.to_string().contains("single catalog name"),
         "{sql}: {err}"
     );
 }
