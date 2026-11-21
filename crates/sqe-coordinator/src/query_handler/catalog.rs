@@ -124,6 +124,7 @@ impl QueryHandler {
                 let policy = sqe_policy::plan_rewriter::resolve_effective_policy(
                     store,
                     &session.user,
+                    Some(&catalog_name),
                     &policy_table,
                     &policy_ns,
                     &col_tags,

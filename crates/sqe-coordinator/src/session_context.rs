@@ -775,6 +775,7 @@ pub async fn create_session_context(
                             let policy = sqe_policy::plan_rewriter::resolve_effective_policy(
                                 store.as_ref(),
                                 &user,
+                                Some(&root),
                                 &table,
                                 &format!("{root}.{database}"),
                                 &std::collections::HashMap::new(),
@@ -924,12 +925,18 @@ pub async fn create_session_context(
             // table_files / table_partitions expose per-column bounds, counts
             // and partition values: withhold the ones the caller's policy on
             // the target governs (masks, restrictions, row filters).
+            // The target's catalog is the call's catalog argument, else the
+            // session's; a `catalog_scoped` store keys on it, as the rewriter
+            // does (it used to get the bare namespace, which no scoped
+            // policy matches).
             let metadata_policy = policy_store.map(|store| {
                 let store = Arc::clone(store);
                 let user = session.user.clone();
                 let precedence = config.policy.mask_precedence;
+                let session_catalog = default_catalog.clone();
                 sqe_catalog::iceberg_metadata_tvf::MetadataPolicy::new(
-                    move |namespace,
+                    move |catalog,
+                          namespace,
                           table,
                           col_tags|
                           -> futures::future::BoxFuture<
@@ -937,12 +944,19 @@ pub async fn create_session_context(
                         sqe_policy::ResolvedPolicy,
                     > {
                         let (store, user) = (Arc::clone(&store), user.clone());
+                        let catalog = catalog.unwrap_or_else(|| session_catalog.clone());
                         Box::pin(async move {
+                            let key_ns = if store.catalog_scoped() {
+                                format!("{catalog}.{namespace}")
+                            } else {
+                                namespace
+                            };
                             sqe_policy::plan_rewriter::resolve_effective_policy(
                                 store.as_ref(),
                                 &user,
+                                Some(&catalog),
                                 &table,
-                                &namespace,
+                                &key_ns,
                                 &col_tags,
                                 precedence,
                             )

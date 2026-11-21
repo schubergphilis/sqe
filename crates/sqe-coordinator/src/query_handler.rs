@@ -6012,6 +6012,7 @@ async fn deny_hidden_metadata_tvf_targets(
         let policy = sqe_policy::plan_rewriter::resolve_effective_policy(
             store,
             user,
+            Some(catalog),
             table,
             &key_ns,
             &no_tags,

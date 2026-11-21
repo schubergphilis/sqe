@@ -1268,6 +1268,7 @@ impl HiveDdlHandler {
         resolve_effective_policy(
             store,
             user,
+            Some(root),
             table,
             &namespace,
             &col_tags,

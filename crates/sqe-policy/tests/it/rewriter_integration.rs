@@ -1843,6 +1843,7 @@ async fn effective_policy_reports_the_precedence_the_rewriter_applies() {
         let got = sqe_policy::plan_rewriter::resolve_effective_policy(
             &store,
             &user("bob", &[]),
+            None,
             "employees",
             "ns1.ns2",
             &col_tags,

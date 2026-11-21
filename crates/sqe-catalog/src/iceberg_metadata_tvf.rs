@@ -97,23 +97,42 @@ use crate::rest_catalog::SessionCatalog;
 const COLUMN_TAGS_PROP: &str = "sqe.column-tags";
 
 type PolicyFuture = futures::future::BoxFuture<'static, ResolvedPolicy>;
-type PolicyResolverFn = dyn Fn(String, String, HashMap<String, Vec<String>>) -> PolicyFuture + Send + Sync;
+type PolicyResolverFn = dyn Fn(Option<String>, String, String, HashMap<String, Vec<String>>) -> PolicyFuture
+    + Send
+    + Sync;
 
 /// Resolves the caller's effective policy on a metadata TVF's target table,
-/// given `(namespace, table, column tags)`. Built by the coordinator from its
-/// policy store; `sqe-catalog` cannot depend on `sqe-policy`.
+/// given `(catalog, namespace, table, column tags)`. The catalog is the TVF's
+/// catalog argument, `None` when the call names none (the session's catalog).
+/// Built by the coordinator from its policy store; `sqe-catalog` cannot depend
+/// on `sqe-policy`.
 #[derive(Clone)]
-pub struct MetadataPolicy(Arc<PolicyResolverFn>);
+pub struct MetadataPolicy {
+    resolve: Arc<PolicyResolverFn>,
+    catalog: Option<String>,
+}
 
 impl MetadataPolicy {
     pub fn new<F>(resolve: F) -> Self
     where
-        F: Fn(String, String, HashMap<String, Vec<String>>) -> PolicyFuture
+        F: Fn(Option<String>, String, String, HashMap<String, Vec<String>>) -> PolicyFuture
             + Send
             + Sync
             + 'static,
     {
-        Self(Arc::new(resolve))
+        Self {
+            resolve: Arc::new(resolve),
+            catalog: None,
+        }
+    }
+
+    /// This policy for a call that names `catalog`: a `catalog_scoped` store
+    /// keys the target's policies on it (#919).
+    fn for_catalog(&self, catalog: Option<&str>) -> Self {
+        Self {
+            resolve: Arc::clone(&self.resolve),
+            catalog: catalog.map(str::to_string),
+        }
     }
 }
 
@@ -192,7 +211,8 @@ async fn resolve_governance(
             }
         },
     };
-    let resolved = (policy.0)(
+    let resolved = (policy.resolve)(
+        policy.catalog.clone(),
         ident.namespace().as_ref().join("."),
         ident.name().to_string(),
         col_tags,
@@ -396,12 +416,7 @@ impl CatalogSource {
     /// optional trailing catalog name. The name is returned only when it
     /// picked the catalog (a `Fixed` source ignores it).
     fn target(&self, fn_name: &str, exprs: &[Expr]) -> DFResult<Target> {
-        let (table_args, catalog) = match exprs {
-            [ns, table, Expr::Literal(ScalarValue::Utf8(Some(c)) | ScalarValue::LargeUtf8(Some(c)), _)] => {
-                (vec![ns.clone(), table.clone()], Some(c.as_str()))
-            }
-            _ => (exprs.to_vec(), None),
-        };
+        let (table_args, catalog) = split_catalog_arg(exprs);
         let (namespace, table_name) = parse_two_string_args(fn_name, &table_args)?;
         let (catalog, catalog_name) = match self {
             Self::Fixed(fixed) => (Arc::clone(fixed), None),
@@ -418,6 +433,17 @@ type Target = (Arc<SessionCatalog>, Option<String>, TableIdent);
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared argument parsing
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// A call's `(namespace, table)` arguments and its optional trailing catalog
+/// name.
+fn split_catalog_arg(exprs: &[Expr]) -> (Vec<Expr>, Option<&str>) {
+    match exprs {
+        [ns, table, Expr::Literal(ScalarValue::Utf8(Some(c)) | ScalarValue::LargeUtf8(Some(c)), _)] => {
+            (vec![ns.clone(), table.clone()], Some(c.as_str()))
+        }
+        _ => (exprs.to_vec(), None),
+    }
+}
 
 /// Parse `(namespace, table_name)` positional string literals from a TVF call.
 fn parse_two_string_args(fn_name: &str, exprs: &[Expr]) -> DFResult<(String, String)> {
@@ -900,7 +926,10 @@ impl TableFunctionImpl for TableFilesFunction {
             catalog_name,
             ident,
             kind: MetadataKind::Files,
-            policy: self.policy.clone(),
+            policy: self
+                .policy
+                .as_ref()
+                .map(|p| p.for_catalog(split_catalog_arg(exprs).1)),
         }))
     }
 }
@@ -1189,7 +1218,10 @@ impl TableFunctionImpl for TablePartitionsFunction {
             catalog_name,
             ident,
             kind: MetadataKind::Partitions,
-            policy: self.policy.clone(),
+            policy: self
+                .policy
+                .as_ref()
+                .map(|p| p.for_catalog(split_catalog_arg(exprs).1)),
         }))
     }
 }

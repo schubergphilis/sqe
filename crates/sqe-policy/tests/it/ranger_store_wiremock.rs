@@ -581,6 +581,120 @@ async fn catalog_scoped_mask_through_the_rewriter_covers_one_catalog() {
     }
 }
 
+/// #919 through the real store and the rewriter: `ws_a` and `ws_b` both hold
+/// `finance.orders` with `ssn` tagged `pii`. Under `catalog_scoped` a tag
+/// policy on `ws_a.pii` masks `ws_a` only, and a bare `pii` policy still masks
+/// every catalog. With the setting off, the qualified name matches nothing.
+#[tokio::test]
+async fn catalog_scoped_tag_policy_through_the_rewriter_covers_one_catalog() {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow::array::{RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::catalog::{MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider};
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+    use sqe_policy::plan_rewriter::PolicyPlanRewriter;
+    use sqe_policy::{PolicyEnforcer, TableScope, TagSource};
+
+    /// `ssn` carries the bare tag `pii` in every catalog.
+    struct PiiTags;
+    impl TagSource for PiiTags {
+        fn column_tags(
+            &self,
+            _catalog: Option<&str>,
+            _namespace: &[String],
+            _table: &str,
+        ) -> Option<HashMap<String, Vec<String>>> {
+            let pii = vec!["pii".to_string()];
+            Some(HashMap::from([("ssn".to_string(), pii)]))
+        }
+    }
+
+    let ctx = SessionContext::new();
+    let schema = Arc::new(Schema::new(vec![Field::new("ssn", DataType::Utf8, true)]));
+    for catalog in ["ws_a", "ws_b"] {
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["123-45-6789"]))],
+        )
+        .unwrap();
+        let finance = Arc::new(MemorySchemaProvider::new());
+        finance
+            .register_table(
+                "orders".into(),
+                Arc::new(MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap()),
+            )
+            .unwrap();
+        let cat = Arc::new(MemoryCatalogProvider::new());
+        datafusion::catalog::CatalogProvider::register_schema(cat.as_ref(), "finance", finance)
+            .unwrap();
+        ctx.register_catalog(catalog, cat);
+    }
+
+    let tag_mask = |tag: &str| {
+        serde_json::json!({
+            "policyVersion": 1,
+            "policies": [],
+            "tagPolicies": {
+                "serviceName": "tag",
+                "policies": [
+                    {"id": 1, "name": "pii", "policyType": 1, "isEnabled": true,
+                     "resources": {"tag": {"values": [tag]}},
+                     "dataMaskPolicyItems": [
+                        {"groups": ["public"], "dataMaskInfo": {"dataMaskType": "MASK_NULL"}}]}
+                ]
+            }
+        })
+    };
+    let analyst = SessionUser {
+        username: "ann".into(),
+        roles: vec![],
+        subject: None,
+        email: None,
+        groups: vec!["SG-DataAnalysts".into()],
+    };
+
+    for (scoped, tag, masked_in) in [
+        (true, "ws_a.pii", &["ws_a"][..]),
+        (true, "pii", &["ws_a", "ws_b"][..]),
+        (false, "ws_a.pii", &[][..]),
+        (false, "pii", &["ws_a", "ws_b"][..]),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/service/plugins/secure/policies/download/hive"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(tag_mask(tag)))
+            .mount(&server)
+            .await;
+        let store = RangerStore::from_config(&RangerPolicyConfig {
+            catalog_scoped: scoped,
+            ..cfg(&server.uri())
+        })
+        .unwrap();
+        let rewriter = PolicyPlanRewriter::new(Arc::new(store)).with_tag_source(Arc::new(PiiTags));
+        for catalog in ["ws_a", "ws_b"] {
+            let sql = format!("SELECT ssn FROM {catalog}.finance.orders");
+            let plan = ctx.sql(&sql).await.unwrap().logical_plan().clone();
+            let scope = TableScope::of(&ctx);
+            let (enforced, _) = rewriter.evaluate(&analyst, &scope, plan).await.unwrap();
+            let batches = ctx
+                .execute_logical_plan(enforced)
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                batches[0].column(0).is_null(0),
+                masked_in.contains(&catalog),
+                "catalog_scoped={scoped}, tag policy on `{tag}`, reading {catalog}"
+            );
+        }
+    }
+}
+
 // ── GRANT ... MASKED WITH / ROWS WHERE ────────────────────────────────
 
 /// The spec the coordinator builds for `GRANT SELECT ON <table> TO ROLE
