@@ -149,10 +149,12 @@ mod scan_tag_state_tests {
 /// provider type lives in `sqe-catalog`.
 pub type ScanTags = fn(&dyn datafusion::catalog::TableProvider) -> ScanTagState;
 
-/// `(namespace, table)` a metadata TVF provider reads, `None` for any other
-/// provider. Injected because the TVF type lives in `sqe-catalog`.
+/// `(catalog, namespace, table)` a metadata TVF provider reads, `None` for
+/// any other provider. The catalog is the one the call named
+/// (`table_files('ns', 't', 'cat')`), `None` when it named none. Injected
+/// because the TVF type lives in `sqe-catalog`.
 pub type MetadataTarget =
-    fn(&dyn datafusion::catalog::TableProvider) -> Option<(String, String)>;
+    fn(&dyn datafusion::catalog::TableProvider) -> Option<(Option<String>, String, String)>;
 
 /// Whether a provider is a file table function's. Injected because the type
 /// lives in `sqe-catalog`.
@@ -309,8 +311,9 @@ impl PolicyPlanRewriter {
         let mut view_scans: HashSet<String> = HashSet::new();
         // Tables described by metadata TVF scans. The scan itself is keyed by
         // the function name, so the target's own policy is checked below.
-        // The TVF reads the catalog it is registered on, so the target lives
-        // in the catalog the function name resolves to.
+        // The target lives in the catalog the call names
+        // (`table_files('ns', 't', 'cat')`), else in the catalog the function
+        // name resolves to.
         let mut metadata_targets: Vec<(Option<String>, String, String)> = Vec::new();
         // Scan names some file table function scan carries, and scan names
         // some other scan carries. Policies are keyed by scan name, so a name
@@ -344,13 +347,17 @@ impl PolicyPlanRewriter {
                     other_scans.insert(table_name.clone());
                 }
                 if let Ok(provider) = datafusion::datasource::source_as_provider(&scan.source) {
-                    if let Some((ns, table)) =
+                    if let Some((named, ns, table)) =
                         self.metadata_target.and_then(|f| f(provider.as_ref()))
                     {
-                        let catalog = scope
-                            .qualify(&scan.table_name)
-                            .catalog()
-                            .map(str::to_string);
+                        // The catalog the call named, else the one the
+                        // function name resolved in.
+                        let catalog = named.or_else(|| {
+                            scope
+                                .qualify(&scan.table_name)
+                                .catalog()
+                                .map(str::to_string)
+                        });
                         let target = (catalog, ns, table);
                         if !metadata_targets.contains(&target) {
                             metadata_targets.push(target);
@@ -2674,6 +2681,70 @@ mod tests {
         );
     }
 
+    /// `table_files('finance', 'orders', 'ws_b')` run from catalog `ws_a`
+    /// reads `ws_b`, so a `catalog_scoped` store checks `ws_b.finance`, not
+    /// the session's `ws_a.finance`. Keyed on the session's catalog, a
+    /// caller denied `ws_b.finance.orders` read its metadata from `ws_a`.
+    #[tokio::test]
+    async fn catalog_scoped_metadata_tvf_is_checked_in_the_catalog_it_names() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::catalog::TableProvider;
+        use datafusion::datasource::empty::EmptyTable;
+        use datafusion::datasource::provider_as_source;
+
+        fn names_ws_b(p: &dyn TableProvider) -> Option<(Option<String>, String, String)> {
+            (p as &dyn std::any::Any)
+                .downcast_ref::<EmptyTable>()
+                .map(|_| (Some("ws_b".into()), "finance".into(), "orders".into()))
+        }
+        fn names_none(p: &dyn TableProvider) -> Option<(Option<String>, String, String)> {
+            names_ws_b(p).map(|(_, ns, t)| (None, ns, t))
+        }
+
+        let inner = crate::policy_store::InMemoryPolicyStore::new();
+        let mut deny = ResolvedPolicy::default();
+        deny.row_filters.push(lit(false));
+        inner.add_table_policy("ws_b.finance", "orders", deny).await;
+        let store = Arc::new(CatalogScopedStore(inner));
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let plan = LogicalPlanBuilder::scan(
+            "table_files",
+            provider_as_source(Arc::new(EmptyTable::new(schema))),
+            None,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let scope = |c: &str| crate::TableScope {
+            catalog: Some(c.to_string()),
+            schema: Some("public".to_string()),
+        };
+        let user = diag_user(&[]);
+
+        let err = PolicyPlanRewriter::new(store.clone())
+            .with_metadata_target(names_ws_b)
+            .evaluate(&user, &scope("ws_a"), plan.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::TableNotFound);
+
+        let rewriter = PolicyPlanRewriter::new(store).with_metadata_target(names_none);
+        assert!(
+            rewriter
+                .evaluate(&user, &scope("ws_a"), plan.clone())
+                .await
+                .is_ok(),
+            "no catalog named: the session's ws_a, which has no policy"
+        );
+        assert!(
+            rewriter
+                .evaluate(&user, &scope("ws_b"), plan)
+                .await
+                .is_err(),
+            "no catalog named, session in ws_b: denied"
+        );
+    }
+
     // ── is_reserved_virtual_ref ──────────────────────────────────
     // Reserved virtual relations are skipped from the tag lookup so an
     // unknown tag state never denies information_schema / system queries.
@@ -2919,10 +2990,10 @@ mod tests {
 
         // Stand-in for `table_files('sales','orders')`: an EmptyTable that the
         // injected lookup maps to its target.
-        fn target(p: &dyn TableProvider) -> Option<(String, String)> {
+        fn target(p: &dyn TableProvider) -> Option<(Option<String>, String, String)> {
             (p as &dyn std::any::Any)
                 .downcast_ref::<EmptyTable>()
-                .map(|_| ("sales".to_string(), "orders".to_string()))
+                .map(|_| (None, "sales".to_string(), "orders".to_string()))
         }
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
         let tvf = LogicalPlanBuilder::scan(
