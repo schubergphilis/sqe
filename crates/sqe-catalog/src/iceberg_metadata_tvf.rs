@@ -92,10 +92,6 @@ use crate::rest_catalog::SessionCatalog;
 // Caller policy on the target table
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Table property holding the column -> tag-label JSON map (the same key the
-/// coordinator's tag source reads).
-const COLUMN_TAGS_PROP: &str = "sqe.column-tags";
-
 type PolicyFuture = futures::future::BoxFuture<'static, ResolvedPolicy>;
 type PolicyResolverFn = dyn Fn(Option<String>, String, String, HashMap<String, Vec<String>>) -> PolicyFuture
     + Send
@@ -199,17 +195,20 @@ async fn resolve_governance(
     let Some(policy) = policy else {
         return StatsGovernance::default();
     };
-    let col_tags = match table.metadata().properties().get(COLUMN_TAGS_PROP) {
-        None => HashMap::new(),
-        Some(raw) => match sqe_core::column_tags::parse_keys(raw) {
-            Ok(tags) => tags,
-            Err(_) => {
-                return StatsGovernance {
-                    all: true,
-                    columns: HashSet::new(),
-                }
+    // Resolved by field id against the current schema (#920), the columns
+    // the metadata tables report on.
+    let metadata = table.metadata();
+    let col_tags = match crate::column_tag_ids::resolve_table_tags(
+        metadata.properties(),
+        metadata.current_schema(),
+    ) {
+        Ok(resolved) => sqe_core::column_tags::keys(&resolved.applied),
+        Err(_) => {
+            return StatsGovernance {
+                all: true,
+                columns: HashSet::new(),
             }
-        },
+        }
     };
     let resolved = (policy.resolve)(
         policy.catalog.clone(),

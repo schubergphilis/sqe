@@ -521,18 +521,19 @@ impl TagViewProvider {
                 }
                 Err(e) => return Err(self.fail(&format!("failed to load table '{ident}'"), e)),
             };
-            let properties = table.metadata().properties();
+            let metadata = table.metadata();
+            let properties = metadata.properties();
             // The column tags decide the policy verdict for either view, so
             // a table whose column tags cannot be read is left out of both.
-            let column_tags = match properties.get(sqe_core::column_tags::PROP_KEY) {
-                None => sqe_core::column_tags::ColumnTagMap::new(),
-                Some(raw) => match sqe_core::column_tags::parse(raw) {
-                    Ok(tags) => tags,
-                    Err(e) => {
-                        warn!(table = %ident, error = %e, view = self.view.name(), "unreadable sqe.column-tags, table left out");
-                        return Ok(Vec::new());
-                    }
-                },
+            // Only the entries that apply are listed, under the column's
+            // current name (#920).
+            let current = metadata.current_schema();
+            let column_tags = match crate::column_tag_ids::resolve_table_tags(properties, current) {
+                Ok(resolved) => resolved.applied,
+                Err(e) => {
+                    warn!(table = %ident, error = %e, view = self.view.name(), "unreadable sqe.column-tags, table left out");
+                    return Ok(Vec::new());
+                }
             };
             let keys = sqe_core::column_tags::keys(&column_tags);
             let rows: Vec<TagRow> = match self.view {

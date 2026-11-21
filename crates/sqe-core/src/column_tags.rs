@@ -26,6 +26,8 @@ use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+pub mod ids;
+
 /// Table property key holding the column tags.
 pub const PROP_KEY: &str = "sqe.column-tags";
 

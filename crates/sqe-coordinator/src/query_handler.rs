@@ -8953,13 +8953,23 @@ mod tests {
             ],
         );
         map.insert("id".to_string(), vec![ColumnTag::key("PK")]);
+        let mut map = sqe_core::column_tags::ids::Resolved {
+            applied: map,
+            ..Default::default()
+        };
+        map.orphaned
+            .insert("old".into(), (9, vec![ColumnTag::key("PII")]));
 
         let batches = QueryHandler::tags_to_record_batch(&map).unwrap();
         let b = &batches[0];
         let cols = string_col(b, 0);
         let tags = string_col(b, 1);
         let values = string_col(b, 2);
-        assert_eq!(b.num_rows(), 3);
+        assert_eq!(b.num_rows(), 4);
+        // A dropped column's entry is listed, not applied (#920).
+        let applied = b.column(3).as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(cols[3].as_deref(), Some("old"));
+        assert!(!applied.value(3) && applied.value(0) && applied.value(2));
         // Sorted by (column, tag): (email, CONTACT), (email, PII), (id, PK).
         assert_eq!(cols[0].as_deref(), Some("email"));
         assert_eq!(tags[0].as_deref(), Some("CONTACT"));
@@ -8975,7 +8985,7 @@ mod tests {
 
     #[test]
     fn tags_batch_empty_when_no_tags() {
-        let map = sqe_core::column_tags::ColumnTagMap::new();
+        let map = sqe_core::column_tags::ids::Resolved::default();
         let batches = QueryHandler::tags_to_record_batch(&map).unwrap();
         assert_eq!(batches[0].num_rows(), 0);
     }

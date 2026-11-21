@@ -95,8 +95,8 @@ impl TagSource for CacheTagSource {
             }
         };
 
-        let props = match self.cache.properties_for(catalog, &ns_display, table) {
-            Some(p) => p,
+        let metadata = match self.cache.metadata_for(catalog, &ns_display, table) {
+            Some(m) => m,
             None => {
                 debug!(
                     namespace = %ns_display,
@@ -113,7 +113,9 @@ impl TagSource for CacheTagSource {
         // Cache hit: absent `sqe.column-tags` is known-empty (untagged).
         // Malformed or wrong-shape JSON is UNKNOWN, same as a cache miss:
         // return None so the rewriter fail-closes instead of unmasking.
-        match parse_column_tags(&props) {
+        // Entries recorded with a field id resolve against the current schema
+        // (#920), so a renamed column keeps its tags.
+        match resolved_column_tags(metadata.properties(), metadata.current_schema()) {
             Ok(map) => Some(map),
             Err(e) => {
                 debug!(
@@ -156,21 +158,29 @@ pub fn scan_column_tags(
         return ScanTagState::Known(HashMap::new());
     }
     let any = provider as &dyn std::any::Any;
-    let properties = if let Some(iceberg) =
+    // Tags recorded with a field id resolve against the schema the scan
+    // reads (the snapshot's under time travel), so a rename applies them
+    // under the column's name in that schema (#920).
+    let (properties, schema) = if let Some(iceberg) =
         any.downcast_ref::<sqe_catalog::table_provider::SqeTableProvider>()
     {
-        iceberg.table().metadata().properties()
-    } else if let Some(properties) = any
-        .downcast_ref::<sqe_catalog::incremental_provider::IncrementalTableProvider>()
-        .and_then(|incremental| incremental.table_properties())
+        (
+            iceberg.table().metadata().properties(),
+            iceberg.scan_schema(),
+        )
+    } else if let Some(incremental) =
+        any.downcast_ref::<sqe_catalog::incremental_provider::IncrementalTableProvider>()
     {
         // A `FOR INCREMENTAL BETWEEN SNAPSHOT` scan carries the properties
-        // its planning load read (#844).
-        properties
+        // and schema its planning load read (#844).
+        match (incremental.table_properties(), incremental.table_schema()) {
+            (Some(properties), Some(schema)) => (properties, schema.clone()),
+            _ => return ScanTagState::NotRecognised,
+        }
     } else {
         return ScanTagState::NotRecognised;
     };
-    match parse_column_tags(properties) {
+    match resolved_column_tags(properties, &schema) {
         Ok(map) => ScanTagState::Known(map),
         Err(e) => {
             debug!(
@@ -209,6 +219,36 @@ pub fn parse_column_tags(
     props: &HashMap<String, String>,
 ) -> Result<HashMap<String, Vec<String>>, serde_json::Error> {
     parse_column_tag_entries(props).map(|map| column_tags::keys(&map))
+}
+
+/// The tag keys that apply to `schema`'s columns, under their names there.
+///
+/// Like [`parse_column_tags`], but entries recorded with a field id in
+/// `sqe.column-tag-ids` follow the column through a rename, and an entry
+/// whose column was dropped is not applied (#920). Malformed tags or ids are
+/// `Err`: the tag state is unknown and the caller fails closed.
+pub fn resolved_column_tags(
+    props: &HashMap<String, String>,
+    schema: &iceberg::spec::Schema,
+) -> Result<HashMap<String, Vec<String>>, serde_json::Error> {
+    applied_column_tag_entries(props, schema).map(|applied| column_tags::keys(&applied))
+}
+
+/// [`resolved_column_tags`] keeping each tag's value: the entries that apply
+/// to `schema`'s columns, under their current names (#920).
+pub fn applied_column_tag_entries(
+    props: &HashMap<String, String>,
+    schema: &iceberg::spec::Schema,
+) -> Result<ColumnTagMap, serde_json::Error> {
+    sqe_catalog::column_tag_ids::resolve_table_tags(props, schema).map(|r| r.applied)
+}
+
+/// [`resolved_column_tags`] against `table`'s current schema.
+pub fn table_column_tags(
+    table: &iceberg::table::Table,
+) -> Result<HashMap<String, Vec<String>>, serde_json::Error> {
+    let metadata = table.metadata();
+    resolved_column_tags(metadata.properties(), metadata.current_schema())
 }
 
 /// [`parse_column_tags`] keeping each tag's value (`["pii", {"kind": "card"}]`).
@@ -1096,7 +1136,21 @@ mod scan_column_tags_tests {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use iceberg::{Catalog, CatalogBuilder, TableCreation};
     use sqe_catalog::table_provider::SqeTableProvider;
+    use sqe_core::column_tags::ids::IDS_PROP_KEY;
     use sqe_policy::plan_rewriter::ScanTagState;
+
+    /// One column, `ssn`, field id 1.
+    fn ssn_schema() -> Schema {
+        Schema::builder()
+            .with_fields(vec![NestedField::optional(
+                1,
+                "ssn",
+                Type::Primitive(PrimitiveType::String),
+            )
+            .into()])
+            .build()
+            .unwrap()
+    }
 
     /// The provider planning builds for a table carrying `properties`.
     async fn provider_with(properties: &[(&str, &str)]) -> SqeTableProvider {
@@ -1112,15 +1166,7 @@ mod scan_column_tags_tests {
             .create_namespace(&ns, Default::default())
             .await
             .unwrap();
-        let schema = Schema::builder()
-            .with_fields(vec![NestedField::optional(
-                1,
-                "ssn",
-                Type::Primitive(PrimitiveType::String),
-            )
-            .into()])
-            .build()
-            .unwrap();
+        let schema = ssn_schema();
         let table = catalog
             .create_table(
                 &ns,
@@ -1212,9 +1258,71 @@ mod scan_column_tags_tests {
                     .iter()
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
+                Arc::new(ssn_schema()),
             ),
             None => provider,
         }
+    }
+
+    /// The `sqe.column-tag-ids` value binding `tags` with `ids` (#920).
+    fn ids_for(tags: &str, ids: &str) -> String {
+        format!(
+            r#"{{"v":1,"tags_sha256":"{}","ids":{ids}}}"#,
+            column_tags::ids::digest(tags)
+        )
+    }
+
+    /// Tagged as `email` with field id 1: the column was renamed to `ssn`
+    /// since, so the tag applies under `ssn` (#920).
+    #[tokio::test]
+    async fn a_renamed_column_keeps_its_tags() {
+        let tags = r#"{"email":["PII"]}"#;
+        let ids = ids_for(tags, r#"{"email":1}"#);
+        let want = ScanTagState::Known(HashMap::from([(
+            "ssn".to_string(),
+            vec!["PII".to_string()],
+        )]));
+        let provider = provider_with(&[(PROP_KEY, tags), (IDS_PROP_KEY, &ids)]).await;
+        assert_eq!(scan_column_tags(&provider), want);
+        let incremental = incremental_with(Some(&[(PROP_KEY, tags), (IDS_PROP_KEY, &ids)]));
+        assert_eq!(scan_column_tags(&incremental), want);
+    }
+
+    /// Tagged column id 7 was dropped: a column re-added under the same
+    /// name is a new column and does not inherit the tag (#920).
+    #[tokio::test]
+    async fn a_dropped_columns_tags_do_not_apply_to_a_new_column() {
+        let tags = r#"{"ssn":["PII"]}"#;
+        let ids = ids_for(tags, r#"{"ssn":7}"#);
+        let provider = provider_with(&[(PROP_KEY, tags), (IDS_PROP_KEY, &ids)]).await;
+        assert_eq!(
+            scan_column_tags(&provider),
+            ScanTagState::Known(HashMap::new())
+        );
+    }
+
+    /// Ids bound to another tags value (a writer that does not know about
+    /// ids changed the tags) are ignored: the tags apply by name.
+    #[tokio::test]
+    async fn stale_ids_fall_back_to_names() {
+        let ids = ids_for(r#"{"other":["PII"]}"#, r#"{"ssn":7}"#);
+        let provider =
+            provider_with(&[(PROP_KEY, r#"{"ssn":["PII"]}"#), (IDS_PROP_KEY, &ids)]).await;
+        assert_eq!(
+            scan_column_tags(&provider),
+            ScanTagState::Known(HashMap::from([(
+                "ssn".to_string(),
+                vec!["PII".to_string()]
+            )]))
+        );
+    }
+
+    /// Malformed ids make the tag state unknown: fail closed.
+    #[tokio::test]
+    async fn malformed_ids_are_unknown() {
+        let provider =
+            provider_with(&[(PROP_KEY, r#"{"ssn":["PII"]}"#), (IDS_PROP_KEY, "nope")]).await;
+        assert_eq!(scan_column_tags(&provider), ScanTagState::Unknown);
     }
 
     #[test]

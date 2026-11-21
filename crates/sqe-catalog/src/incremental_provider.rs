@@ -85,6 +85,9 @@ pub struct IncrementalTableProvider {
     /// the rewriter then falls back to the cache rather than treating the
     /// table as untagged.
     table_properties: Option<HashMap<String, String>>,
+    /// The Iceberg schema the scan reads, for resolving column tags by field
+    /// id (#920). `None`: the tags cannot be resolved off the scan.
+    table_schema: Option<iceberg::spec::SchemaRef>,
 }
 
 impl std::fmt::Debug for IncrementalTableProvider {
@@ -114,18 +117,30 @@ impl IncrementalTableProvider {
             plan: Arc::new(plan),
             file_io,
             table_properties: None,
+            table_schema: None,
         }
     }
 
-    /// Attach the table's properties as loaded for planning (#844).
-    pub fn with_table_properties(mut self, properties: HashMap<String, String>) -> Self {
+    /// Attach the table's properties as loaded for planning (#844), and the
+    /// Iceberg schema the scan reads (#920).
+    pub fn with_table_properties(
+        mut self,
+        properties: HashMap<String, String>,
+        schema: iceberg::spec::SchemaRef,
+    ) -> Self {
         self.table_properties = Some(properties);
+        self.table_schema = Some(schema);
         self
     }
 
     /// The table's properties, if the builder supplied them.
     pub fn table_properties(&self) -> Option<&HashMap<String, String>> {
         self.table_properties.as_ref()
+    }
+
+    /// The Iceberg schema the scan reads, if the builder supplied it.
+    pub fn table_schema(&self) -> Option<&iceberg::spec::SchemaRef> {
+        self.table_schema.as_ref()
     }
 
     /// Return the augmented schema (base + 3 meta columns).

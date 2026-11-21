@@ -23,7 +23,7 @@ use crate::ident::{
     schema_catalog_qualifier,
 };
 use crate::tag_source_impl::{
-    changed_tag_columns, parse_column_tag_entries, PROP_KEY as TAG_PROP_KEY,
+    applied_column_tag_entries, changed_tag_columns, PROP_KEY as TAG_PROP_KEY,
 };
 use crate::write_handler::trino_props::TrinoTableOptions;
 use crate::write_handler::{
@@ -1298,6 +1298,8 @@ impl CatalogOps {
         // table `SET DATA TYPE JSON` keeps the column a string, #848) selects
         // the existing schema by id, or skips the schema update when it is
         // already current.
+        // The tag ids are recorded from the schema this commit makes current.
+        let committed_schema = new_schema.clone();
         let new_ids: std::collections::BTreeSet<i32> = new_schema.identifier_field_ids().collect();
         let same = metadata.schemas_iter().find(|s| {
             s.as_struct() == new_schema.as_struct()
@@ -1327,26 +1329,28 @@ impl CatalogOps {
         //
         // `rewrite_tag_keys` returns None when nothing changed, so a plain ALTER on
         // an untagged table adds no property write.
-        let current_tags = parse_column_tag_entries(metadata.properties()).map_err(|e| {
+        //
+        // The rewrite runs on the map resolved by field id against the schema
+        // before the change (#920), so it renames the entry of the column the
+        // statement names even when another engine renamed it earlier, and
+        // the ids come from the schema the commit makes current.
+        let live = crate::live_tags::LiveTags::read(metadata).map_err(|e| {
             SqeError::with_code(
                 SqeErrorCode::ExecutionFailed,
                 format!("malformed sqe.column-tags JSON on table '{table_ident}': {e}"),
             )
         })?;
+        let current_tags = live.applied().clone();
         let rewritten_tags =
             crate::tag_source_impl::rewrite_tag_keys(&current_tags, &tag_key_changes);
         if let Some(ref new_tags) = rewritten_tags {
-            let json = sqe_core::column_tags::to_json(new_tags).map_err(|e| {
+            let tag_updates = live.record(new_tags, &committed_schema).map_err(|e| {
                 SqeError::with_code(
                     SqeErrorCode::ExecutionFailed,
                     format!("failed to serialize column tags: {e}"),
                 )
             })?;
-            let mut tag_updates = HashMap::new();
-            tag_updates.insert(crate::tag_source_impl::PROP_KEY.to_string(), json);
-            updates.push(TableUpdate::SetProperties {
-                updates: tag_updates,
-            });
+            updates.extend(tag_updates);
             info!(
                 table = %table_ident,
                 changes = tag_key_changes.len(),
@@ -1740,12 +1744,18 @@ impl CatalogOps {
         let checked = authorised_tag_columns.is_some()
             || conflict_guard.is_some()
             || self.tag_projector.enabled();
+        // Both maps are read by field id against the schema checked, so the
+        // commit pins it (#920).
+        let mut checked_schema_id = None;
         let tag_lock = match updates.get(TAG_PROP_KEY) {
             Some(raw) if checked => {
                 let table_lock = self.table_lock_for(&table_ident);
                 let held = table_lock.lock_owned().await;
                 let table = session_catalog.load_table(&table_ident).await?;
-                let live = match parse_column_tag_entries(table.metadata().properties()) {
+                let metadata = table.metadata();
+                let (properties, schema) = (metadata.properties(), metadata.current_schema());
+                checked_schema_id = Some(schema.schema_id());
+                let live = match applied_column_tag_entries(properties, schema) {
                     Ok(live) => live,
                     Err(_) if authorised_tag_columns.is_none() => ColumnTagMap::new(),
                     Err(e) => {
@@ -1755,7 +1765,14 @@ impl CatalogOps {
                         )))
                     }
                 };
-                let wanted = match sqe_core::column_tags::parse(raw) {
+                // What applies after the commit: the written map read with the
+                // ids the commit leaves, which bind only to the map they were
+                // recorded with. A changed map is read by name (#920).
+                let mut after = properties.clone();
+                after.extend(updates.clone());
+                let wanted = match sqe_core::column_tags::parse(raw)
+                    .and_then(|_| applied_column_tag_entries(&after, schema))
+                {
                     Ok(wanted) => Some(wanted),
                     // An unrestricted writer may store a value that is not a
                     // tag map; reads of it deny everything (#840), so it
@@ -1851,6 +1868,9 @@ impl CatalogOps {
                     }
                 }
             }
+        }
+        if let Some(current_schema_id) = checked_schema_id {
+            requirements.push(TableRequirement::CurrentSchemaIdMatch { current_schema_id });
         }
         if !updates.is_empty() {
             table_updates.push(TableUpdate::SetProperties { updates });
@@ -2081,7 +2101,9 @@ impl CatalogOps {
         let _guard = table_lock.lock().await;
 
         let table = session_catalog.load_table(&table_ident).await?;
-        let current = parse_column_tag_entries(table.metadata().properties()).map_err(|e| {
+        // Resolved by field id (#920): the statement names current columns,
+        // and the write records their ids from the schema it pins below.
+        let live = crate::live_tags::LiveTags::read(table.metadata()).map_err(|e| {
             SqeError::with_code(
                 SqeErrorCode::ExecutionFailed,
                 format!(
@@ -2090,21 +2112,20 @@ impl CatalogOps {
                 ),
             )
         })?;
+        let current = live.applied().clone();
 
         let new_map = crate::tag_source_impl::apply_tag_ops(&current, &stmt.ops);
         if let Some(guard) = conflict_guard {
             let (before, after) = (column_tags::keys(&current), column_tags::keys(&new_map));
             guard.check(&before, &after).await?;
         }
-        let json = sqe_core::column_tags::to_json(&new_map).map_err(|e| {
+        let schema = table.metadata().current_schema();
+        let updates = live.record(&new_map, schema).map_err(|e| {
             SqeError::with_code(
                 SqeErrorCode::ExecutionFailed,
                 format!("failed to serialize column tags: {e}"),
             )
         })?;
-
-        let mut updates = HashMap::new();
-        updates.insert(crate::tag_source_impl::PROP_KEY.to_string(), json);
 
         info!(
             username = %session.user.username,
@@ -2113,12 +2134,13 @@ impl CatalogOps {
             "Authoring column tags"
         );
 
+        // The ids are the current schema's: a schema change committed since
+        // the load fails this write rather than record ids it did not see.
+        let pinned = vec![TableRequirement::CurrentSchemaIdMatch {
+            current_schema_id: schema.schema_id(),
+        }];
         session_catalog
-            .commit_schema_update(
-                &table_ident,
-                vec![TableUpdate::SetProperties { updates }],
-                vec![],
-            )
+            .commit_schema_update(&table_ident, updates, pinned)
             .await?;
         // Tags are read user-independently via `properties_for`, which returns
         // the first entry matching `|{ns}.{table}` from ANY token. The single
@@ -2141,29 +2163,10 @@ impl CatalogOps {
                 // ROLL BACK the property. Leaving it would mean SQE masks the column
                 // while Spark returns it raw, which is precisely the fail-open the
                 // projection exists to close, and it would be invisible because the
-                // statement reported success.
-                let previous = sqe_core::column_tags::to_json(&current).map_err(|e| {
-                    SqeError::with_code(
-                        SqeErrorCode::ExecutionFailed,
-                        format!(
-                            "column tags were committed and the Ranger projection failed \
-                         ({project_err}), and the previous tag map could not be \
-                         serialized to roll back ({e}). The Iceberg property and the \
-                         Ranger tag store are now inconsistent, so this table's tags \
-                         apply in SQE but not in other engines. RE-RUN this statement \
-                         once Ranger is reachable: the projection is idempotent and \
-                         the property already carries the tag, so a repeat converges."
-                        ),
-                    )
-                })?;
-                let mut revert = HashMap::new();
-                revert.insert(crate::tag_source_impl::PROP_KEY.to_string(), previous);
+                // statement reported success. The exact values read go back, so
+                // the field ids stay bound to their map (#920).
                 match session_catalog
-                    .commit_schema_update(
-                        &table_ident,
-                        vec![TableUpdate::SetProperties { updates: revert }],
-                        vec![],
-                    )
+                    .commit_schema_update(&table_ident, live.restore(), vec![])
                     .await
                 {
                     Ok(_) => {
@@ -2213,16 +2216,18 @@ impl CatalogOps {
         table: &str,
     ) -> sqe_core::Result<(TableIdent, HashMap<String, Vec<String>>)> {
         let (table_ident, tags) = self.load_column_tag_entries(session, table).await?;
-        Ok((table_ident, column_tags::keys(&tags)))
+        Ok((table_ident, column_tags::keys(&tags.applied)))
     }
 
-    /// [`Self::load_column_tags`] keeping each tag's value, for `SHOW TAGS`.
+    /// [`Self::load_column_tags`] keeping each tag's value and the entries
+    /// whose column is gone, for `SHOW TAGS`. Resolved by field id against
+    /// the current schema (#920).
     #[instrument(skip(self, session), fields(username = %session.user.username))]
     pub async fn load_column_tag_entries(
         &self,
         session: &Session,
         table: &str,
-    ) -> sqe_core::Result<(TableIdent, ColumnTagMap)> {
+    ) -> sqe_core::Result<(TableIdent, column_tags::ids::Resolved)> {
         let object_name = parse_object_name(table)?;
         let table_ident = resolve_table_ident(&object_name, session)?;
 
@@ -2230,7 +2235,12 @@ impl CatalogOps {
         let session_catalog = self.session_catalog_for(session, target.as_deref()).await?;
 
         let table = session_catalog.load_table(&table_ident).await?;
-        let tags = parse_column_tag_entries(table.metadata().properties()).map_err(|e| {
+        let metadata = table.metadata();
+        let tags = sqe_catalog::column_tag_ids::resolve_table_tags(
+            metadata.properties(),
+            metadata.current_schema(),
+        )
+        .map_err(|e| {
             SqeError::with_code(
                 SqeErrorCode::ExecutionFailed,
                 format!("malformed sqe.column-tags JSON on table '{table_ident}': {e}"),
@@ -2258,8 +2268,10 @@ impl CatalogOps {
             return Ok(None);
         }
         let table = session_catalog.load_table(&table_ident).await?;
-        Ok(Some(parse_column_tag_entries(
-            table.metadata().properties(),
+        let metadata = table.metadata();
+        Ok(Some(applied_column_tag_entries(
+            metadata.properties(),
+            metadata.current_schema(),
         )))
     }
 

@@ -451,7 +451,10 @@ impl QueryHandler {
         // The policy rewriter reads `sqe.column-tags` off the scan; without
         // these it fell back to the metadata cache and refused the read on
         // a miss (#844).
-        .with_table_properties(iceberg_table.metadata().properties().clone());
+        .with_table_properties(
+            iceberg_table.metadata().properties().clone(),
+            iceberg_table.metadata().current_schema().clone(),
+        );
 
         // Register under a unique alias in the `datafusion.public` schema,
         // which is a MemoryCatalogProvider and supports dynamic registration.
