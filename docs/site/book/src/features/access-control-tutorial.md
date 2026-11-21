@@ -407,6 +407,34 @@ appended to `accessTypes` of the definition from
 `PUT /service/public/v2/api/servicedef/{id}`. Other `hive` clients ignore an
 access type they do not ask for.
 
+#### Only tags Ranger knows
+
+A tag policy matches a tag by its exact name, so a steward who types `live.pi`
+for `live.pii` tags the column and protects nothing. To refuse names Ranger has
+no tag definition for:
+
+```toml
+[access_control]
+tag_names = "ranger-tagdefs"
+```
+
+A `SET TAGS` or `SET TAG` that names an undefined tag then fails with
+`tag 'live.pi' is not defined in Ranger`, and nothing is written. The check
+runs after the privilege check, so a caller without the privilege still gets the
+denial, and it covers the tags a `CREATE TABLE` or a `sqe.column-tags` property
+write adds. Names are case-sensitive, as tag policies are. Removing a tag is
+never refused, and admins are exempt: they define tags, and a tag an admin sets
+becomes a definition through the tag projection.
+
+SQE reads the list from `GET /service/tags/tagdefs` and keeps it for
+`[policy.ranger] cache_ttl_secs`, like the policy bundle. A name missing from the cached list is
+re-read once before it is refused, so a tag defined a moment ago is accepted. If
+the list cannot be read, the write is refused rather than let through. Under
+`[policy.ranger] catalog_scoped`, a definition `<catalog>.<tag>` also accepts
+`<tag>` on a table of that catalog, which is the name the tag projection writes
+for it. The setting needs `[policy] engine = "ranger"`; the default, `any`,
+accepts every name.
+
 ## 1.8 Introspection
 
 ```sql

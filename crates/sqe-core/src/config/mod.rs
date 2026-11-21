@@ -2316,6 +2316,9 @@ pub struct AccessControlConfig {
     /// `tag_authority = "ranger-delegate"`. See [`TagPrivilege`].
     #[serde(default, alias = "tag-privilege")]
     pub tag_privilege: TagPrivilege,
+    /// Which tag names a non-admin may write. See [`TagNames`].
+    #[serde(default, alias = "tag-names")]
+    pub tag_names: TagNames,
     /// Apache Ranger backend tuning. Used only when `backend = "ranger"`.
     #[serde(default)]
     pub ranger: RangerConfig,
@@ -2332,6 +2335,7 @@ impl Default for AccessControlConfig {
             grant_authority: GrantAuthority::default(),
             tag_authority: TagAuthority::default(),
             tag_privilege: TagPrivilege::default(),
+            tag_names: TagNames::default(),
             ranger: RangerConfig::default(),
         }
     }
@@ -2409,6 +2413,29 @@ pub enum TagPrivilege {
     Alter,
     #[serde(rename = "apply_tag", alias = "apply-tag")]
     ApplyTag,
+}
+
+/// Which tag names a non-admin may write to `sqe.column-tags`.
+///
+/// - `any` (default) accepts every name, as before. A typo (`live.pi` for
+///   `live.pii`) then tags the column with a name no tag policy matches, and
+///   the column stays unmasked.
+/// - `ranger-tagdefs` accepts only a name Ranger holds a tag definition for
+///   (`GET /service/tags/tagdefs`). Under `[policy.ranger] catalog_scoped`, a
+///   definition named `<catalog>.<tag>` also defines `<tag>` in that catalog.
+///   The check fails closed: when the definitions cannot be read, or the
+///   policy backend is not Ranger, a non-admin tag write is refused.
+///
+/// Admins are exempt in both modes. Only names a write sets are checked:
+/// `ALTER TABLE ... SET TAGS` checks every name it sets, a raw `sqe.column-tags`
+/// write the tags it adds to a column, and `UNSET TAGS` is never refused, so a
+/// column can always be untagged.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum TagNames {
+    #[default]
+    Any,
+    RangerTagdefs,
 }
 
 fn default_access_control_timeout() -> u64 {
@@ -9904,6 +9931,29 @@ mod ranger_config_tests {
             toml::from_str::<AccessControlConfig>(r#"tag_authority = "ranger_delegate""#).is_err(),
             "an unrecognised value must be refused, not defaulted"
         );
+    }
+
+    #[test]
+    fn tag_names_defaults_to_any_and_spells_ranger_tagdefs() {
+        let c: AccessControlConfig = toml::from_str(r#"backend = "ranger""#).unwrap();
+        assert_eq!(c.tag_names, TagNames::Any, "off by default");
+        assert_eq!(AccessControlConfig::default().tag_names, TagNames::Any);
+        for line in [
+            r#"tag_names = "ranger-tagdefs""#,
+            r#"tag-names = "ranger-tagdefs""#,
+        ] {
+            let c: AccessControlConfig =
+                toml::from_str(&format!("backend = \"ranger\"\n{line}\n")).unwrap();
+            assert_eq!(c.tag_names, TagNames::RangerTagdefs, "{line}");
+        }
+        let c: AccessControlConfig = toml::from_str(r#"tag_names = "any""#).unwrap();
+        assert_eq!(c.tag_names, TagNames::Any);
+        for bad in ["ranger_tagdefs", "ranger", "tagdefs", "RANGER-TAGDEFS", ""] {
+            assert!(
+                toml::from_str::<AccessControlConfig>(&format!("tag_names = \"{bad}\"")).is_err(),
+                "{bad:?} must be refused, not read as off"
+            );
+        }
     }
 
     #[test]

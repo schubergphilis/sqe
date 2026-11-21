@@ -424,7 +424,19 @@ fn parse_native_set_list(body: &str) -> Result<Vec<ColumnTagOp>> {
         let (col, _) = split_identifier(item[..eq].trim())?;
         let tags_part = item[eq + 1..].trim();
         let tags_inner = strip_parens(tags_part, &format!("column `{col}`"))?;
-        let tags: Vec<String> = split_top_level(tags_inner)
+        let items = split_top_level(tags_inner);
+        // This form has no value syntax: `'k' = 'v'` used to be unquoted into
+        // the key `k' = 'v` and stored as if it were a tag name.
+        if items.iter().any(|t| find_top_level_eq(t).is_some()) {
+            return Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!(
+                    "SET TAGS: column `{col}`: this form takes tag names only. To set a \
+                     value use ALTER TABLE <table> ALTER COLUMN {col} SET TAGS ('key' = 'value')"
+                ),
+            ));
+        }
+        let tags: Vec<String> = items
             .into_iter()
             .map(|t| unquote(&t))
             .filter(|t| !t.is_empty())
@@ -573,6 +585,22 @@ mod tests {
         // Tags may be bare identifiers, not just quoted strings.
         let s = parse("ALTER TABLE t SET TAGS (email = (PII, GDPR))");
         assert_eq!(s.ops[0].tags, vec!["PII", "GDPR"]);
+    }
+
+    #[test]
+    fn native_set_refuses_a_value_instead_of_storing_it_as_a_name() {
+        for sql in [
+            "ALTER TABLE t SET TAGS (ssn = ('live.pii' = 'high', 'PII'))",
+            "ALTER TABLE t SET TAGS (ssn = (PII = 'x'))",
+            "ALTER TABLE t SET TAGS (a = ('x'), ssn = ('PII', 'k'='v'))",
+        ] {
+            let err = try_parse_set_tags(sql).expect_err(sql).to_string();
+            assert!(err.contains("takes tag names only"), "{sql}: {err}");
+            assert!(err.contains("ALTER COLUMN ssn SET TAGS"), "{sql}: {err}");
+        }
+        // A quoted name holding `=` is still a name.
+        let s = parse("ALTER TABLE t SET TAGS (ssn = ('a=b'))");
+        assert_eq!(s.ops[0].tags, vec!["a=b"]);
     }
 
     #[test]

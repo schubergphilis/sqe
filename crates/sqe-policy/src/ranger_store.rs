@@ -310,6 +310,24 @@ pub struct RangerStore {
     /// `[policy.ranger] catalog_scoped`: the Ranger `database` of an Iceberg
     /// table is `{catalog}.{namespace}`, and the last-component fallback is off.
     catalog_scoped: bool,
+    /// Tag definition names from `GET /service/tags/tagdefs`, for
+    /// `[access_control] tag_names = "ranger-tagdefs"`. Same TTL as the bundle;
+    /// a fetch error is never cached.
+    tagdef_cache: Cache<&'static str, Arc<HashSet<String>>>,
+    /// Serialises tagdef downloads, so concurrent misses download once.
+    tagdef_fetch: tokio::sync::Mutex<()>,
+    /// Completed tagdef downloads: a `fresh` caller that waited on
+    /// `tagdef_fetch` while one finished takes that one instead of its own.
+    tagdef_downloads: AtomicU64,
+}
+
+/// The one key of `tagdef_cache`.
+const TAGDEF_KEY: &str = "__tagdefs__";
+
+/// The part of a Ranger `RangerTagDef` the name check reads.
+#[derive(Debug, Deserialize)]
+struct RangerTagDefName {
+    name: String,
 }
 
 impl RangerStore {
@@ -370,7 +388,45 @@ impl RangerStore {
             hive_catalogs: Arc::new(HiveCatalogs::new()),
             hive_access_policies: cfg.hive_access_policies,
             catalog_scoped: cfg.catalog_scoped,
+            tagdef_cache: Cache::builder()
+                .time_to_live(Duration::from_secs(cfg.cache_ttl_secs))
+                .max_capacity(1)
+                .build(),
+            tagdef_fetch: tokio::sync::Mutex::new(()),
+            tagdef_downloads: AtomicU64::new(0),
         })
+    }
+
+    /// Download every tag definition name. `GET /service/tags/tagdefs` answers
+    /// a bare JSON array of `RangerTagDef` (measured on the compose Ranger),
+    /// global to the Ranger instance rather than per tag service.
+    ///
+    /// Not behind the policy breaker: this is a DDL-path lookup like
+    /// `service_link`, and a misconfigured endpoint (401, 404) failing on every
+    /// tag write must not open the breaker the read path depends on.
+    async fn fetch_tag_definitions(&self) -> sqe_core::Result<HashSet<String>> {
+        let unreadable = |why: String| {
+            sqe_core::SqeError::with_code(
+                sqe_core::SqeErrorCode::ExecutionFailed,
+                format!("could not read the Ranger tag definitions: {why}"),
+            )
+        };
+        let response = self
+            .client
+            .get(format!("{}/service/tags/tagdefs", self.admin_url))
+            .basic_auth(&self.admin_user, Some(self.admin_password.expose()))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| unreadable(e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(unreadable(format!("HTTP {}", response.status())));
+        }
+        let defs: Vec<RangerTagDefName> = response
+            .json()
+            .await
+            .map_err(|e| unreadable(format!("unexpected response ({e})")))?;
+        Ok(defs.into_iter().map(|d| d.name).collect())
     }
 
     /// Attach the coordinator's Hive-root registry, so `resolve` can tell a
@@ -2355,6 +2411,30 @@ impl PolicyStore for RangerStore {
         // bundle until its TTL elapses.
         self.bundle_generation.fetch_add(1, Ordering::AcqRel);
         self.bundle_cache.invalidate_all();
+        self.tagdef_cache.invalidate_all();
+    }
+
+    /// Tag definition names, cached for the policy TTL. `fresh` skips the
+    /// cache (and refills it); concurrent callers download once.
+    async fn tag_definitions(&self, fresh: bool) -> sqe_core::Result<Arc<HashSet<String>>> {
+        if !fresh {
+            if let Some(cached) = self.tagdef_cache.get(TAGDEF_KEY).await {
+                return Ok(cached);
+            }
+        }
+        let downloads_before = self.tagdef_downloads.load(Ordering::Acquire);
+        let _guard = self.tagdef_fetch.lock().await;
+        // A download that finished while this caller waited is as fresh as
+        // one it would start now (and, for a cache miss, fills the cache).
+        if !fresh || self.tagdef_downloads.load(Ordering::Acquire) != downloads_before {
+            if let Some(cached) = self.tagdef_cache.get(TAGDEF_KEY).await {
+                return Ok(cached);
+            }
+        }
+        let defs = Arc::new(self.fetch_tag_definitions().await?);
+        self.tagdef_cache.insert(TAGDEF_KEY, defs.clone()).await;
+        self.tagdef_downloads.fetch_add(1, Ordering::AcqRel);
+        Ok(defs)
     }
 }
 
@@ -2706,6 +2786,119 @@ mod tests {
         let got = store.cached_bundle().await.expect("cached bundle served");
         assert!(Arc::ptr_eq(&got, &seeded));
         assert_eq!(downloads(&server).await, 1);
+    }
+
+    /// The body shape `GET /service/tags/tagdefs` answers on Ranger 2.x: a bare
+    /// array of `RangerTagDef` (captured from the compose Ranger).
+    const TAGDEFS: &str = r#"[
+        {"id":1,"guid":"2170fc84-f37a-4a7c-8b64-16265e27c596","isEnabled":true,"createdBy":"Admin","updatedBy":"Admin","createTime":1795207840856,"updateTime":1795207840856,"version":1,"name":"PII","source":"sqe"},
+        {"id":2,"guid":"135987b3-e881-455a-b3c9-20f82ec34977","isEnabled":true,"version":1,"name":"live.pii","source":"portal","attributeDefs":[]}
+    ]"#;
+
+    async fn mount_tagdefs(server: &wiremock::MockServer, status: u16, body: &str) {
+        use wiremock::matchers::{header_exists, method, path};
+        wiremock::Mock::given(method("GET"))
+            .and(path("/service/tags/tagdefs"))
+            .and(header_exists("authorization"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(status)
+                    .set_body_string(body)
+                    .insert_header("content-type", "application/json")
+                    .set_delay(Duration::from_millis(50)),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn tag_definitions_reads_the_names_and_serves_them_from_cache() {
+        let server = wiremock::MockServer::start().await;
+        mount_tagdefs(&server, 200, TAGDEFS).await;
+        let store = store_against(&server).await;
+
+        let defs = store.tag_definitions(false).await.expect("tagdefs");
+        let want: HashSet<String> = ["PII", "live.pii"].into_iter().map(String::from).collect();
+        assert_eq!(*defs, want);
+        // A cached read makes no request.
+        let again = store.tag_definitions(false).await.unwrap();
+        assert!(Arc::ptr_eq(&defs, &again));
+        assert_eq!(downloads(&server).await, 1);
+        // `fresh` re-reads once, and refills the cache.
+        store.tag_definitions(true).await.unwrap();
+        assert_eq!(downloads(&server).await, 2);
+        store.tag_definitions(false).await.unwrap();
+        assert_eq!(downloads(&server).await, 2);
+        // invalidate_all (GRANT, a tag write) drops the cached list.
+        store.invalidate_all();
+        store.tag_definitions(false).await.unwrap();
+        assert_eq!(downloads(&server).await, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_tagdef_misses_download_once() {
+        let server = wiremock::MockServer::start().await;
+        mount_tagdefs(&server, 200, TAGDEFS).await;
+        let store = store_against(&server).await;
+        for fresh in [false, true] {
+            let before = downloads(&server).await;
+            let tasks: Vec<_> = (0..20)
+                .map(|_| {
+                    let store = store.clone();
+                    tokio::spawn(
+                        async move { store.tag_definitions(fresh).await.expect("tagdefs") },
+                    )
+                })
+                .collect();
+            for t in tasks {
+                t.await.unwrap();
+            }
+            let made = downloads(&server).await - before;
+            // A miss downloads once; fresh callers that queued behind a running
+            // download take it, so at most the first one and one more run.
+            assert!((1..=2).contains(&made), "fresh={fresh}: {made} downloads");
+        }
+    }
+
+    /// Fails closed, and the failure is not cached: the next call asks again.
+    #[tokio::test]
+    async fn unreadable_tag_definitions_are_an_error_and_never_cached() {
+        for (status, body) in [
+            (401, "{}"),
+            (404, ""),
+            (500, "boom"),
+            (200, "{\"vXTagDefs\":[]}"),
+            (200, "not json"),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            mount_tagdefs(&server, status, body).await;
+            let store = store_against(&server).await;
+            let err = store
+                .tag_definitions(false)
+                .await
+                .expect_err("must fail closed");
+            assert!(
+                err.to_string()
+                    .contains("could not read the Ranger tag definitions"),
+                "{status} {body:?}: {err}"
+            );
+            store
+                .tag_definitions(false)
+                .await
+                .expect_err("still failing");
+            assert_eq!(
+                downloads(&server).await,
+                2,
+                "{status}: an error must not be cached"
+            );
+            // Tag-definition failures leave the policy breaker alone.
+            for _ in 0..10 {
+                let _ = store.tag_definitions(false).await;
+            }
+            assert!(
+                store.breaker.check().is_ok(),
+                "{status}: breaker must stay closed"
+            );
+        }
     }
 
     /// A download in flight when `invalidate_all` runs (a GRANT through SQE)

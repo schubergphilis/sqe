@@ -11,13 +11,17 @@
 //! privilege (`alter` or `apply_tag`) from the store: the columns of a tag
 //! statement, and for a raw property write the columns whose tags differ
 //! between the live map and the new one (a new table: every column named).
+//!
+//! Under `[access_control] tag_names = "ranger-tagdefs"` a non-admin write
+//! must also name only tags Ranger defines (#926), checked after the
+//! privilege so a refused caller learns nothing about the definitions.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::*;
 use crate::tag_source_impl::{changed_tag_columns, tag_property_write};
 use sqe_core::column_tags::ColumnTagMap;
-use sqe_core::config::{TagAuthority, TagPrivilege};
+use sqe_core::config::{TagAuthority, TagNames, TagPrivilege};
 use sqe_policy::TablePrivilege;
 
 const RAW_TAG_WRITE: &str = "setting the sqe.column-tags table property";
@@ -94,7 +98,92 @@ impl QueryHandler {
                 .collect::<Vec<_>>(),
             statement,
         )
-        .await
+        .await?;
+        let set: BTreeSet<&str> = stmt
+            .ops
+            .iter()
+            .filter(|op| op.action == sqe_sql::tags::TagAction::Set)
+            .flat_map(|op| op.tags.iter().map(String::as_str))
+            .collect();
+        self.require_defined_tags(session, &object_name, &set, statement)
+            .await
+    }
+
+    /// `[access_control] tag_names = "ranger-tagdefs"`: every name in `names`
+    /// must have a Ranger tag definition. Under `[policy.ranger]
+    /// catalog_scoped` a definition `<catalog>.<tag>` (the name the tag
+    /// projector writes for a catalog-scoped tag) also defines `<tag>` for a
+    /// table of `<catalog>`; the catalog is derived as the privilege check
+    /// derives it. The cached list is re-read once before a name is refused,
+    /// so a tag defined a moment ago is accepted. Fails closed: no policy
+    /// store, or a list that cannot be read, refuses the write. Callers
+    /// exempt admins.
+    async fn require_defined_tags(
+        &self,
+        session: &Session,
+        table: &sqlparser::ast::ObjectName,
+        names: &BTreeSet<&str>,
+        statement: &str,
+    ) -> sqe_core::Result<()> {
+        if self.config.access_control.tag_names == TagNames::Any || names.is_empty() {
+            return Ok(());
+        }
+        let Some(store) = self.policy_store.as_deref() else {
+            return Err(self.refuse_tag_write(
+                session,
+                statement,
+                "cannot check the tag names: no policy backend is configured \
+                 (tag_names = \"ranger-tagdefs\" needs [policy] engine = \"ranger\")",
+            ));
+        };
+        let catalog = store.catalog_scoped().then(|| {
+            crate::ident::catalog_qualifier(table)
+                .unwrap_or_else(|| self.session_catalog_name(session))
+        });
+        let undefined = |defs: &HashSet<String>| -> Vec<&str> {
+            names
+                .iter()
+                .copied()
+                .filter(|name| {
+                    !defs.contains(*name)
+                        && !catalog
+                            .as_ref()
+                            .is_some_and(|c| defs.contains(&format!("{c}.{name}")))
+                })
+                .collect()
+        };
+        let mut missing = Vec::new();
+        for fresh in [false, true] {
+            let defs = store.tag_definitions(fresh).await.map_err(|e| {
+                self.refuse_tag_write(
+                    session,
+                    statement,
+                    &format!("cannot check the tag names: {e}"),
+                )
+            })?;
+            missing = undefined(&defs);
+            if missing.is_empty() {
+                return Ok(());
+            }
+        }
+        let list = missing
+            .iter()
+            .map(|n| format!("'{n}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        warn!(
+            username = %session.user.username,
+            statement,
+            tags = %list,
+            "denied: undefined tag name"
+        );
+        Err(SqeError::with_code(
+            sqe_core::SqeErrorCode::InvalidArguments,
+            format!(
+                "{statement}: tag {list} is not defined in Ranger. Check the spelling, \
+                 or ask an admin to define the tag first"
+            ),
+        ))
     }
 
     /// Every column in `columns` of `table` must be granted the configured
@@ -208,10 +297,21 @@ impl QueryHandler {
         if self.config.auth.has_admin_role(&session.user.roles) {
             return Ok(None);
         }
-        let Some(store) = self.tag_delegate_store() else {
+        let Some(write) = tag_property_write(stmt)? else {
             return Ok(None);
         };
-        let Some(write) = tag_property_write(stmt)? else {
+        let Some(store) = self.tag_delegate_store() else {
+            // `admin-role`: the static gate let a non-admin through only for a
+            // plain CREATE TABLE, a new table, so every name it writes is new.
+            if self.config.access_control.tag_names != TagNames::Any {
+                let new = parse_tag_value(write.value.as_deref())
+                    .map_err(|why| self.refuse_tag_write(session, RAW_TAG_WRITE, &why))?;
+                if let Some(table) = written_table(stmt) {
+                    let names = added_tag_names(&HashMap::new(), &new);
+                    self.require_defined_tags(session, table, &names, RAW_TAG_WRITE)
+                        .await?;
+                }
+            }
             return Ok(None);
         };
         if write.off_case_key {
@@ -252,8 +352,37 @@ impl QueryHandler {
             RAW_TAG_WRITE,
         )
         .await?;
+        self.require_defined_tags(session, table, &added_tag_names(&old, &new), RAW_TAG_WRITE)
+            .await?;
         Ok(Some(changed))
     }
+}
+
+/// The table an `ALTER TABLE` or `CREATE TABLE` writes.
+fn written_table(stmt: &Statement) -> Option<&sqlparser::ast::ObjectName> {
+    match stmt {
+        Statement::AlterTable(at) => Some(&at.name),
+        Statement::CreateTable(ct) => Some(&ct.name),
+        _ => None,
+    }
+}
+
+/// The tag keys `new` gives a column that `old` did not: the names a raw
+/// `sqe.column-tags` write adds. A tag the column already carries is not
+/// re-checked, so a steward can edit a table that holds a tag written before
+/// `tag_names` was turned on.
+fn added_tag_names<'a>(old: &ColumnTagMap, new: &'a ColumnTagMap) -> BTreeSet<&'a str> {
+    new.iter()
+        .flat_map(|(column, tags)| {
+            let had: HashSet<&str> = old
+                .get(column)
+                .map(|t| t.iter().map(|t| t.key.as_str()).collect())
+                .unwrap_or_default();
+            tags.iter()
+                .map(|t| t.key.as_str())
+                .filter(move |key| !had.contains(key))
+        })
+        .collect()
 }
 
 /// The tag map a raw property write sets, or why it is refused.
@@ -261,4 +390,54 @@ fn parse_tag_value(value: Option<&str>) -> Result<ColumnTagMap, String> {
     let raw = value.ok_or_else(|| "names no sqe.column-tags value".to_string())?;
     sqe_core::column_tags::parse(raw)
         .map_err(|e| format!("sqe.column-tags must be a JSON object of column to tag list ({e})"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqe_core::column_tags::ColumnTag;
+
+    /// `(tag key, value)` pairs of one column.
+    type Tags<'a> = &'a [(&'a str, Option<&'a str>)];
+
+    fn map(entries: &[(&str, Tags<'_>)]) -> ColumnTagMap {
+        entries
+            .iter()
+            .map(|(c, tags)| {
+                let tags = tags
+                    .iter()
+                    .map(|(k, v)| match v {
+                        Some(v) => ColumnTag::with_value(*k, *v),
+                        None => ColumnTag::key(*k),
+                    })
+                    .collect();
+                (c.to_string(), tags)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn added_tag_names_are_the_keys_a_column_gains() {
+        let old = map(&[("ssn", &[("legacy.typo", None), ("PII", Some("a"))])]);
+        let new = map(&[
+            // Kept tags (a changed value included) are not re-checked.
+            (
+                "ssn",
+                &[
+                    ("legacy.typo", None),
+                    ("PII", Some("b")),
+                    ("live.pii", None),
+                ],
+            ),
+            // A tag another column already had is new on this one.
+            ("email", &[("PII", None)]),
+        ]);
+        let got: Vec<&str> = added_tag_names(&old, &new).into_iter().collect();
+        assert_eq!(got, ["PII", "live.pii"]);
+        // Removing tags adds nothing.
+        assert!(added_tag_names(&old, &HashMap::new()).is_empty());
+        // A new table adds every name.
+        let got: Vec<&str> = added_tag_names(&HashMap::new(), &old).into_iter().collect();
+        assert_eq!(got, ["PII", "legacy.typo"]);
+    }
 }
