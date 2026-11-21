@@ -197,33 +197,40 @@ printf "  principal-level: "; seed_policy principal '{"root":"*","principal":"*"
 # `sales`, which is exactly what Kyuubi sends for `sales_wh.sales.orders`
 # (Kyuubi has no catalog level). Agreeing on that is what makes one shared
 # service work for both engines.
-# The custom `apply_tag` access type on the `hive` servicedef: SQE checks it on
-# a column under `tag_privilege = "apply_tag"`, and Ranger refuses a policy that
-# names a type its servicedef lacks. No implied grants, and `all` is not amended
-# to imply it: tagging stays a grant of its own. The itemId is the next free one
-# among the access types (Ranger matches access types on update by itemId).
+# The custom `apply_tag` and `remove_tag` access types on the `hive`
+# servicedef: SQE checks `apply_tag` on a column under `tag_privilege =
+# "apply_tag"` and `remove_tag` under `tag_removal = "remove_tag"`, and Ranger
+# refuses a policy that names a type its servicedef lacks. No implied grants,
+# and `all` is not amended to imply them: each stays a grant of its own. The
+# itemId is the next free one among the access types (Ranger matches access
+# types on update by itemId), so the def is re-read before each addition.
 # Idempotent: a def that has the type is only read. sed, not jq (busybox): the
 # top-level accessTypes array is the text before the first "policyConditions",
 # after the last "accessTypes":[ in it (dataMaskDef/rowFilterDef come later).
-echo "Adding the apply_tag access type to the hive servicedef (idempotent) ..."
-HIVE_DEF=$(curl -fsS $AUTH "${RANGER_URL}/service/public/v2/api/servicedef/name/hive" 2>/dev/null || true)
-if [ -z "$HIVE_DEF" ]; then
-  echo "  APPLY_TAG FAILED -- could not read the hive servicedef."
-elif printf '%s' "$HIVE_DEF" | grep -q '"name":"apply_tag"'; then
-  echo "  apply_tag already present."
-else
-  HIVE_DEF_ID=$(printf '%s' "$HIVE_DEF" | grep -o '"id":[0-9]*' | head -1 | sed 's/.*://')
-  LAST_ITEM=$(printf '%s' "$HIVE_DEF" \
-    | sed 's/"policyConditions".*//; s/.*"accessTypes":\[//' \
-    | grep -o '"itemId":[0-9]*' | sed 's/.*://' | sort -n | tail -1)
-  APPLY_TAG_TYPE="{\"itemId\":$((LAST_ITEM + 1)),\"name\":\"apply_tag\",\"label\":\"Apply tag\",\"impliedGrants\":[]}"
-  printf '%s' "$HIVE_DEF" \
-    | sed "s/\"accessTypes\":\[/\"accessTypes\":[${APPLY_TAG_TYPE},/" > /tmp/hive-servicedef.json
-  curl -fsS $AUTH $CSRF $CT -X PUT "${RANGER_URL}/service/public/v2/api/servicedef/${HIVE_DEF_ID}" \
-    -d @/tmp/hive-servicedef.json >/dev/null \
-    && echo "  apply_tag added (itemId $((LAST_ITEM + 1)))." \
-    || echo "  APPLY_TAG FAILED -- tag_privilege = \"apply_tag\" policies will be refused (check ranger logs)."
-fi
+add_hive_access_type() {
+  name=$1 label=$2 setting=$3
+  echo "Adding the $name access type to the hive servicedef (idempotent) ..."
+  HIVE_DEF=$(curl -fsS $AUTH "${RANGER_URL}/service/public/v2/api/servicedef/name/hive" 2>/dev/null || true)
+  if [ -z "$HIVE_DEF" ]; then
+    echo "  $name FAILED -- could not read the hive servicedef."
+  elif printf '%s' "$HIVE_DEF" | grep -q "\"name\":\"$name\""; then
+    echo "  $name already present."
+  else
+    HIVE_DEF_ID=$(printf '%s' "$HIVE_DEF" | grep -o '"id":[0-9]*' | head -1 | sed 's/.*://')
+    LAST_ITEM=$(printf '%s' "$HIVE_DEF" \
+      | sed 's/"policyConditions".*//; s/.*"accessTypes":\[//' \
+      | grep -o '"itemId":[0-9]*' | sed 's/.*://' | sort -n | tail -1)
+    ACCESS_TYPE="{\"itemId\":$((LAST_ITEM + 1)),\"name\":\"$name\",\"label\":\"$label\",\"impliedGrants\":[]}"
+    printf '%s' "$HIVE_DEF" \
+      | sed "s/\"accessTypes\":\[/\"accessTypes\":[${ACCESS_TYPE},/" > /tmp/hive-servicedef.json
+    curl -fsS $AUTH $CSRF $CT -X PUT "${RANGER_URL}/service/public/v2/api/servicedef/${HIVE_DEF_ID}" \
+      -d @/tmp/hive-servicedef.json >/dev/null \
+      && echo "  $name added (itemId $((LAST_ITEM + 1)))." \
+      || echo "  $name FAILED -- $setting policies will be refused (check ranger logs)."
+  fi
+}
+add_hive_access_type apply_tag "Apply tag" 'tag_privilege = "apply_tag"'
+add_hive_access_type remove_tag "Remove tag" 'tag_removal = "remove_tag"'
 
 echo "Creating 'query' service instance for fine-grained policies (idempotent) ..."
 if curl -fsS $AUTH "${RANGER_URL}/service/public/v2/api/service/name/query" >/dev/null 2>&1; then

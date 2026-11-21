@@ -901,13 +901,16 @@ fn item_grants_access(item: &AccessPolicyItem, access_type: &str, all_counts: bo
 }
 
 /// Whether an allow item's `all` grants `access_type`. `all` carries the
-/// stock `hive` access types it lists as implied grants. `apply_tag` is a
-/// custom type added to the servicedef with no place in `all`'s implied
-/// grants, so only an item naming `apply_tag` grants it: a blanket `all`
-/// (the usual owner or `public` item) does not make its holders taggers.
+/// stock `hive` access types it lists as implied grants. `apply_tag` and
+/// `remove_tag` (#927) are custom types added to the servicedef with no place
+/// in `all`'s implied grants, so only an item naming one grants it: a blanket
+/// `all` (the usual owner or `public` item) does not make its holders taggers.
 /// A deny item's `all` still denies it; narrowing never needs the exact type.
 fn all_grants(access_type: &str) -> bool {
-    !access_type.eq_ignore_ascii_case(crate::TablePrivilege::ApplyTag.access_type())
+    use crate::TablePrivilege::{ApplyTag, RemoveTag};
+    ![ApplyTag, RemoveTag]
+        .iter()
+        .any(|p| access_type.eq_ignore_ascii_case(p.access_type()))
 }
 
 /// True when an access policy's `column` resource covers the whole table.
@@ -3754,7 +3757,7 @@ mod tests {
                     .unwrap()
             }
         };
-        use crate::TablePrivilege::{Alter, ApplyTag};
+        use crate::TablePrivilege::{Alter, ApplyTag, RemoveTag};
         // Catalog, schema and table grants each reach the column.
         assert!(tag(user("cat_owner", &[]), "lake.sales", "orders", ApplyTag).await);
         assert!(
@@ -3791,6 +3794,10 @@ mod tests {
         assert!(!tag(user("writer", &[]), "lake.sales", "orders", ApplyTag).await);
         assert!(tag(user("writer", &[]), "lake.sales", "orders", Alter).await);
         assert!(!tag(user("tbl_owner", &[]), "lake.sales", "orders", Alter).await);
+        // Nor does any of them, `apply_tag` included, carry `remove_tag` (#927).
+        for u in ["writer", "tbl_owner", "cat_owner"] {
+            assert!(!tag(user(u, &[]), "lake.sales", "orders", RemoveTag).await);
+        }
 
         // The tag guard: a deny for `public` beats every grant; only its
         // exception keeps a grant (svc has none here, so a grant is added).
@@ -3849,6 +3856,20 @@ mod tests {
             "apply_tag",
             true
         ));
+    }
+
+    #[test]
+    fn remove_tag_comes_only_from_an_item_naming_it() {
+        let u = user("steward", &[]);
+        let can = |t: &str| {
+            let item = format!(
+                r#""policyItems":[{{"users":["steward"],"accesses":[{{"type":"{t}","isAllowed":true}}]}}]"#
+            );
+            let b = column_bundle(&[(r#"{"values":["*"]}"#, item.as_str())]);
+            access_grants_column_type(&b, &u, "lake.sales", "orders", "ssn", "remove_tag", true)
+        };
+        assert!(can("remove_tag"));
+        assert!(!can("all") && !can("apply_tag") && !can("alter"));
     }
 
     /// DDL authority comes from the same access policies as `select`, asked

@@ -2399,15 +2399,7 @@ impl QueryHandler {
                     // Same write as SET TAGS, spelled differently.
                     // Gated before `masking_policy_to_tag_op` so an unauthorised
                     // caller cannot probe the policy list through its errors.
-                    let gate = sqe_sql::tags::SetTagsStatement {
-                        table: op.table.clone(),
-                        ops: vec![sqe_sql::tags::ColumnTagOp {
-                            column: op.column.clone(),
-                            tags: vec![],
-                            values: Default::default(),
-                            action: sqe_sql::tags::TagAction::Unset,
-                        }],
-                    };
+                    let gate = tag_authority::masking_policy_gate(op);
                     self.require_tag_authority(
                         session,
                         &gate,

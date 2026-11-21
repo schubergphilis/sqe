@@ -23,7 +23,8 @@ use crate::ident::{
     schema_catalog_qualifier,
 };
 use crate::tag_source_impl::{
-    applied_column_tag_entries, changed_tag_columns, PROP_KEY as TAG_PROP_KEY,
+    applied_column_tag_entries, changed_tag_columns, removed_tag_columns, TagWriteAuth,
+    PROP_KEY as TAG_PROP_KEY,
 };
 use crate::write_handler::trino_props::TrinoTableOptions;
 use crate::write_handler::{
@@ -1657,8 +1658,8 @@ impl CatalogOps {
     /// `sqe.column-tags` for a set of columns only (`tag_authority =
     /// "ranger-delegate"`, #917). With `authorised_tag_columns`, a statement
     /// that sets the key re-reads the live map under the per-table lock that
-    /// `set_column_tags` holds, recomputes the changed columns, and refuses the
-    /// write unless they are all in the authorised set. That closes the window
+    /// `set_column_tags` holds, recomputes the changed and the removed columns
+    /// (#927), and refuses the write unless each is in its authorised set. That closes the window
     /// between the caller's check and the commit: a concurrent tag write that
     /// changed the map in between fails this statement instead of being
     /// overwritten unauthorised. A live or new value that is not a tag map is
@@ -1673,7 +1674,7 @@ impl CatalogOps {
         &self,
         session: &Session,
         stmt: &Statement,
-        authorised_tag_columns: Option<&std::collections::BTreeSet<String>>,
+        authorised_tag_columns: Option<&TagWriteAuth>,
         conflict_guard: Option<&TagConflictGuard>,
     ) -> sqe_core::Result<()> {
         let (table_name, operations) = match stmt {
@@ -1786,15 +1787,16 @@ impl CatalogOps {
                     }
                 };
                 if let (Some(authorised), Some(wanted)) = (authorised_tag_columns, &wanted) {
-                    let unauthorised: Vec<String> = changed_tag_columns(&live, wanted)
-                        .into_iter()
-                        .filter(|c| !authorised.contains(c))
-                        .collect();
+                    let mut unauthorised = changed_tag_columns(&live, wanted);
+                    unauthorised.retain(|c| !authorised.changed.contains(c));
+                    let mut removed = removed_tag_columns(&live, wanted);
+                    removed.retain(|c| !authorised.removed.contains(c));
+                    unauthorised.extend(removed);
                     if !unauthorised.is_empty() {
                         return Err(SqeError::Catalog(format!(
                             "403 Forbidden: the tags of '{table_ident}' changed while the \
                              statement was checked; it would also change column(s) {} - retry",
-                            unauthorised.join(", ")
+                            Vec::from_iter(unauthorised).join(", ")
                         )));
                     }
                 }

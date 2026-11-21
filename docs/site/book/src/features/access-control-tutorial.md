@@ -407,6 +407,28 @@ appended to `accessTypes` of the definition from
 `PUT /service/public/v2/api/servicedef/{id}`. Other `hive` clients ignore an
 access type they do not ask for.
 
+#### Removing a tag
+
+A tag drives a mask, so removing it can unmask a column. By default the right to
+tag a column is also the right to untag it. To ask for more:
+
+```toml
+[access_control]
+tag_authority = "ranger-delegate"
+tag_removal = "remove_tag"   # or "admin"
+```
+
+A removal is `UNSET TAGS`, `UNSET MASKING POLICY`, or a `sqe.column-tags` write
+that drops a key a column carries. Giving a kept key a new value is not one. With
+`remove_tag`, each such column also needs the Ranger access type `remove_tag`, on
+top of the tag privilege, not instead of it. Like `apply_tag` it is implied by
+nothing, and `bootstrap-ranger.sh` adds it to the `hive` definition. With `admin`,
+only an admin may remove a tag. `ALTER TABLE` and `ALTER SCHEMA ... UNSET TAGS`
+follow the same setting at table level; an `ALTER CATALOG ... UNSET TAGS` needs
+an admin under either stricter setting, because Polaris has no `remove_tag` to
+check. Each removal a non-admin is allowed is logged with the user, statement and
+columns.
+
 #### Only tags Ranger knows
 
 A tag policy matches a tag by its exact name, so a steward who types `live.pi`
