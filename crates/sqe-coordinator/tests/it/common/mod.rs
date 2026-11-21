@@ -82,6 +82,31 @@ pub async fn setup_handler_with_policy_store(
 pub async fn setup_handler_with_store(
     store: Arc<dyn sqe_policy::PolicyStore>,
 ) -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
+    let rewriter = sqe_policy::plan_rewriter::PolicyPlanRewriter::new(Arc::clone(&store));
+    setup_handler_with_rewriter(store, rewriter, None).await
+}
+
+/// [`setup_handler_with_store`] with tags wired as production does: each
+/// Iceberg scan's tags come off its provider, and the DML policy probe
+/// (which has no provider) reads them from the shared metadata cache.
+pub async fn setup_handler_with_tag_store(
+    store: Arc<dyn sqe_policy::PolicyStore>,
+    precedence: sqe_core::config::MaskPrecedence,
+) -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
+    let cache = sqe_catalog::TableMetadataCache::new(30);
+    let tags = sqe_coordinator::tag_source_impl::CacheTagSource::new(Arc::new(cache.clone()));
+    let rewriter = sqe_policy::plan_rewriter::PolicyPlanRewriter::new(Arc::clone(&store))
+        .with_mask_precedence(precedence)
+        .with_scan_tags(sqe_coordinator::tag_source_impl::scan_column_tags)
+        .with_tag_source(Arc::new(tags));
+    setup_handler_with_rewriter(store, rewriter, Some(cache)).await
+}
+
+async fn setup_handler_with_rewriter(
+    store: Arc<dyn sqe_policy::PolicyStore>,
+    rewriter: sqe_policy::plan_rewriter::PolicyPlanRewriter,
+    table_cache: Option<sqe_catalog::TableMetadataCache>,
+) -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
     init_tracing();
     let config =
         sqe_core::SqeConfig::load(&test_config_path()).expect("Failed to load test config");
@@ -93,7 +118,7 @@ pub async fn setup_handler_with_store(
         .await
         .expect("Auth failed for root");
     let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(
-        sqe_policy::plan_rewriter::PolicyPlanRewriter::new(Arc::clone(&store))
+        rewriter
             .with_metadata_target(sqe_catalog::iceberg_metadata_tvf::metadata_tvf_target)
             .with_file_table(sqe_catalog::file_tvf_prepare::is_file_table_provider),
     );
@@ -116,6 +141,10 @@ pub async fn setup_handler_with_store(
         sqe_core::SecretStore::default(),
     )
     .expect("Failed to create QueryHandler");
+    let handler = match table_cache {
+        Some(cache) => handler.with_table_cache(cache),
+        None => handler,
+    };
     (session, handler)
 }
 

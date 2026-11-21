@@ -41,6 +41,7 @@ use tracing::debug;
 
 use sqe_catalog::TableMetadataCache;
 use sqe_core::column_tags::{self, ColumnTag, ColumnTagMap};
+use sqe_core::object_tags;
 use sqe_policy::TagSource;
 use sqe_sql::tags::{ColumnTagOp, TagAction};
 
@@ -114,13 +115,14 @@ impl TagSource for CacheTagSource {
         // Malformed or wrong-shape JSON is UNKNOWN, same as a cache miss:
         // return None so the rewriter fail-closes instead of unmasking.
         // Entries recorded with a field id resolve against the current schema
-        // (#920), so a renamed column keeps its tags.
-        match resolved_column_tags(metadata.properties(), metadata.current_schema()) {
+        // (#920), so a renamed column keeps its tags. Table tags are
+        // inherited by every column (#924).
+        match effective_column_tags(metadata.properties(), metadata.current_schema()) {
             Ok(map) => Some(map),
             Err(e) => {
                 debug!(
                     error = %e,
-                    "tag_source: malformed sqe.column-tags JSON, tag state UNKNOWN (fail closed)"
+                    "tag_source: malformed sqe.column-tags or sqe.table-tags JSON, tag state UNKNOWN (fail closed)"
                 );
                 None
             }
@@ -180,12 +182,12 @@ pub fn scan_column_tags(
     } else {
         return ScanTagState::NotRecognised;
     };
-    match resolved_column_tags(properties, &schema) {
+    match effective_column_tags(properties, &schema) {
         Ok(map) => ScanTagState::Known(map),
         Err(e) => {
             debug!(
                 error = %e,
-                "tag_source: malformed sqe.column-tags on the scanned table, tag state UNKNOWN (fail closed)"
+                "tag_source: malformed column or table tags on the scanned table, tag state UNKNOWN (fail closed)"
             );
             ScanTagState::Unknown
         }
@@ -232,6 +234,25 @@ pub fn resolved_column_tags(
     schema: &iceberg::spec::Schema,
 ) -> Result<HashMap<String, Vec<String>>, serde_json::Error> {
     applied_column_tag_entries(props, schema).map(|applied| column_tags::keys(&applied))
+}
+
+/// The tag keys tag policies match on `schema`'s columns: each column's own
+/// ([`resolved_column_tags`]) plus the table's `sqe.table-tags`, which every
+/// top-level column inherits; a column's own key wins (#924). Malformed table
+/// tags are `Err`, like malformed column tags: the caller fails closed.
+///
+/// This is the enforcement view. Tag writes and their authority compare a
+/// column's own tags ([`applied_column_tag_entries`]), never inherited ones.
+pub fn effective_column_tags(
+    props: &HashMap<String, String>,
+    schema: &iceberg::spec::Schema,
+) -> Result<HashMap<String, Vec<String>>, serde_json::Error> {
+    let own = applied_column_tag_entries(props, schema)?;
+    let table = object_tags::parse(props.get(object_tags::TABLE_PROP_KEY).map(String::as_str))?;
+    let columns = schema.as_struct().fields().iter().map(|f| f.name.as_str());
+    Ok(column_tags::keys(&object_tags::inherit_onto(
+        &own, columns, &table,
+    )))
 }
 
 /// [`resolved_column_tags`] keeping each tag's value: the entries that apply
@@ -1284,6 +1305,46 @@ mod scan_column_tags_tests {
     async fn malformed_tags_are_unknown_not_empty() {
         let provider = provider_with(&[(PROP_KEY, "not-json{{")]).await;
         assert_eq!(scan_column_tags(&provider), ScanTagState::Unknown);
+    }
+
+    /// Every column inherits the table's tags, on a plain and an incremental
+    /// scan, and a key the column carries itself is not repeated (#924).
+    #[tokio::test]
+    async fn a_table_tag_reaches_every_column() {
+        use sqe_core::object_tags::TABLE_PROP_KEY;
+        let props = [(TABLE_PROP_KEY, r#"["gold",{"PII":"all"}]"#)];
+        let want = ScanTagState::Known(HashMap::from([(
+            "ssn".to_string(),
+            vec!["gold".to_string(), "PII".to_string()],
+        )]));
+        assert_eq!(scan_column_tags(&provider_with(&props).await), want);
+        assert_eq!(scan_column_tags(&incremental_with(Some(&props))), want);
+
+        let own = [
+            (PROP_KEY, r#"{"ssn":[{"PII":"ssn"}]}"#),
+            (TABLE_PROP_KEY, r#"["gold",{"PII":"all"}]"#),
+        ];
+        let want = ScanTagState::Known(HashMap::from([(
+            "ssn".to_string(),
+            vec!["PII".to_string(), "gold".to_string()],
+        )]));
+        assert_eq!(scan_column_tags(&provider_with(&own).await), want);
+    }
+
+    /// Unreadable table tags leave the tag state unknown, so the statement
+    /// is refused rather than run without the inherited policies (#924).
+    #[tokio::test]
+    async fn malformed_table_tags_are_unknown_not_empty() {
+        use sqe_core::object_tags::TABLE_PROP_KEY;
+        let bad = [(TABLE_PROP_KEY, r#"{"not":"a list"}"#)];
+        assert_eq!(
+            scan_column_tags(&provider_with(&bad).await),
+            ScanTagState::Unknown
+        );
+        assert_eq!(
+            scan_column_tags(&incremental_with(Some(&bad))),
+            ScanTagState::Unknown
+        );
     }
 
     /// An incremental read of a table carrying `properties` (#844).

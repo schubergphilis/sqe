@@ -9,13 +9,16 @@
 //! ["gold", {"owner": "finance"}]
 //! ```
 //!
-//! Object tags are metadata: no policy reads them. `[]` and a missing key
-//! both mean "no tags". UNSET of the last tag writes `[]`, because a
-//! namespace property update cannot remove a key.
+//! A table's tags are inherited by its columns (#924): a column carries its
+//! own tags plus the table's, and its own tag wins over the table's tag with
+//! the same key ([`inherit`]). Tag policies match the result. Schema and
+//! catalog tags are metadata only so far. `[]` and a missing key both mean
+//! "no tags". UNSET of the last tag writes `[]`, because a namespace property
+//! update cannot remove a key.
 
 use std::collections::BTreeMap;
 
-use crate::column_tags::ColumnTag;
+use crate::column_tags::{ColumnTag, ColumnTagMap};
 
 /// Table property key holding the table's own tags.
 pub const TABLE_PROP_KEY: &str = "sqe.table-tags";
@@ -65,6 +68,38 @@ pub fn apply(
             Some(existing) => *existing = tag,
             None => out.push(tag),
         }
+    }
+    out
+}
+
+/// A column's tags with its parent's added: `own` in stored order, then each
+/// `parent` tag whose key `own` does not carry. A key on the column keeps
+/// the column's value; the parent's value for that key is dropped.
+pub fn inherit(own: &[ColumnTag], parent: &[ColumnTag]) -> Vec<ColumnTag> {
+    let mut out = own.to_vec();
+    for tag in parent {
+        if !out.iter().any(|t| t.key == tag.key) {
+            out.push(tag.clone());
+        }
+    }
+    out
+}
+
+/// The effective tags of each of `columns`: its own entry in `own` with
+/// `parent` [`inherit`]ed. A column with no tags at all is left out; an entry
+/// in `own` for a column not in `columns` is kept as it is.
+pub fn inherit_onto<'a>(
+    own: &ColumnTagMap,
+    columns: impl IntoIterator<Item = &'a str>,
+    parent: &[ColumnTag],
+) -> ColumnTagMap {
+    let mut out = own.clone();
+    if parent.is_empty() {
+        return out;
+    }
+    for column in columns {
+        let tags = inherit(own.get(column).map_or(&[][..], Vec::as_slice), parent);
+        out.insert(column.to_string(), tags);
     }
     out
 }
@@ -132,5 +167,43 @@ mod tests {
         assert_eq!(got, vec![ColumnTag::key("gold")]);
         let got = apply(&got, false, &keys(&["gold"]), &BTreeMap::new());
         assert_eq!(to_json(&got).unwrap(), "[]");
+    }
+
+    #[test]
+    fn a_column_inherits_the_parent_tags_and_its_own_key_wins() {
+        let own = vec![
+            ColumnTag::with_value("owner", "risk"),
+            ColumnTag::key("pii"),
+        ];
+        let parent = vec![
+            ColumnTag::with_value("owner", "finance"),
+            ColumnTag::key("gold"),
+        ];
+        assert_eq!(
+            inherit(&own, &parent),
+            vec![
+                ColumnTag::with_value("owner", "risk"),
+                ColumnTag::key("pii"),
+                ColumnTag::key("gold"),
+            ]
+        );
+        assert_eq!(inherit(&[], &parent), parent);
+        assert_eq!(inherit(&own, &[]), own);
+    }
+
+    #[test]
+    fn every_column_inherits_and_untagged_columns_stay_out_without_a_parent() {
+        let own = ColumnTagMap::from([
+            ("ssn".to_string(), vec![ColumnTag::key("pii")]),
+            ("dropped".to_string(), vec![ColumnTag::key("old")]),
+        ]);
+        let got = inherit_onto(&own, ["id", "ssn"], &[ColumnTag::key("gold")]);
+        assert_eq!(got["id"], vec![ColumnTag::key("gold")]);
+        assert_eq!(
+            got["ssn"],
+            vec![ColumnTag::key("pii"), ColumnTag::key("gold")]
+        );
+        assert_eq!(got["dropped"], vec![ColumnTag::key("old")]);
+        assert_eq!(inherit_onto(&own, ["id", "ssn"], &[]), own);
     }
 }

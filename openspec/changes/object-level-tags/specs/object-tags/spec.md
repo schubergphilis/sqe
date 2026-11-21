@@ -39,12 +39,12 @@ A tag list that starts with an identifier SHALL be read as the native column for
 - **WHEN** a principal without catalog-properties write runs the same statement under `ranger-delegate`
 - **THEN** Polaris refuses the update and the statement fails with its denial
 
-### Requirement: Object tags are metadata only
-Object tags SHALL NOT drive masks or row filters, and SHALL NOT be projected into the Ranger tag store.
+### Requirement: Only table tags reach policies
+Object tags SHALL NOT be projected into the Ranger tag store. Schema and catalog tags SHALL NOT drive masks or row filters. Table tags are inherited by the table's columns and drive tag policies through them (change `tag-inheritance`).
 
-#### Scenario: A table tagged like a masked column
-- **WHEN** a tag policy masks `pii` and the table `ns.t` is tagged `pii`
-- **THEN** a query of `ns.t` returns the same values as before the tag
+#### Scenario: A schema tagged like a masked column
+- **WHEN** a tag policy masks `pii` and the schema `ns` is tagged `pii`
+- **THEN** a query of a table in `ns` returns the same values as before the tag
 
 ### Requirement: Object tag writes follow the tag authority
 Admins SHALL always pass. Under `tag_authority = "admin-role"`, or with no policy store, every other user SHALL be refused. Under `ranger-delegate`, a table tag write SHALL require the configured `tag_privilege` on the table. A schema tag write SHALL require it on the database's table `*`. A store error SHALL grant nothing. Under `tag_names = "ranger-tagdefs"`, a non-admin write SHALL be refused when a key it adds has no Ranger tag definition, under the same rules as column tags.

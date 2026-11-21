@@ -2203,11 +2203,12 @@ impl CatalogOps {
         Ok(())
     }
 
-    /// Read back the `sqe.column-tags` property of a table as a
-    /// `column -> [tag keys]` map, for the tag-merge step of
-    /// `SHOW EFFECTIVE POLICY`. Loads the table via the caller's token,
-    /// so the catalog's own read-access enforcement gates the call (no extra
-    /// SQE gate needed). Returns an empty map for a table with no tags.
+    /// The `column -> [tag keys]` map tag policies match on a table, for the
+    /// tag-merge step of `SHOW EFFECTIVE POLICY`: each column's own tags plus
+    /// the table's (#924), as enforcement sees them. Loads the table via the
+    /// caller's token, so the catalog's own read-access enforcement gates the
+    /// call (no extra SQE gate needed). Returns an empty map for a table with
+    /// no tags.
     ///
     /// Also returns the resolved `TableIdent` so callers can derive the policy
     /// key without re-parsing the reference.
@@ -2217,8 +2218,23 @@ impl CatalogOps {
         session: &Session,
         table: &str,
     ) -> sqe_core::Result<(TableIdent, HashMap<String, Vec<String>>)> {
-        let (table_ident, tags) = self.load_column_tag_entries(session, table).await?;
-        Ok((table_ident, column_tags::keys(&tags.applied)))
+        let object_name = parse_object_name(table)?;
+        let table_ident = resolve_table_ident(&object_name, session)?;
+        let target = resolve_target_catalog(catalog_qualifier(&object_name), session);
+        let session_catalog = self.session_catalog_for(session, target.as_deref()).await?;
+        let table = session_catalog.load_table(&table_ident).await?;
+        let metadata = table.metadata();
+        let tags = crate::tag_source_impl::effective_column_tags(
+            metadata.properties(),
+            metadata.current_schema(),
+        )
+        .map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("malformed column or table tags on table '{table_ident}': {e}"),
+            )
+        })?;
+        Ok((table_ident, tags))
     }
 
     /// [`Self::load_column_tags`] keeping each tag's value and the entries
