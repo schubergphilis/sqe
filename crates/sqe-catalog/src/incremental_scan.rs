@@ -26,7 +26,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::error::ArrowError;
-use iceberg::spec::{DataContentType, ManifestStatus, SnapshotRef, TableMetadata};
+use iceberg::spec::{DataContentType, ManifestStatus, Operation, SnapshotRef, TableMetadata};
 use iceberg::table::Table;
 use sqe_core::{Result, SqeError, SqeErrorCode};
 
@@ -143,7 +143,9 @@ pub struct IncrementalPlan {
     pub data_files: Vec<IncrementalFile>,
     /// Delete files added in the range (position or equality deletes).
     pub delete_files: Vec<IncrementalFile>,
-    /// The ordered snapshot ids included in the range `(start, end]`.
+    /// The ordered snapshot ids included in the range `(start, end]`,
+    /// including `replace` snapshots that contribute no files (see
+    /// [`change_set_snapshots`]).
     pub snapshots_in_range: Vec<i64>,
 }
 
@@ -211,6 +213,32 @@ pub fn resolve_range(metadata: &TableMetadata, start: i64, end: i64) -> Result<V
     // Reverse so we return snapshots in chronological (oldest first) order.
     chain.reverse();
     Ok(chain)
+}
+
+/// The snapshots of a resolved range whose files belong in the change set.
+///
+/// A `replace` snapshot (compaction, `rewrite_data_files`) rewrites rows that
+/// already exist without changing the table's logical contents. Its added
+/// files hold rows an earlier snapshot already produced, so emitting them
+/// would count those rows twice; its removed files must not retract rows
+/// either. So `replace` snapshots are left out entirely. The rows stay
+/// visible through the files of the snapshot that first added them: when
+/// that snapshot is in range, its (now rewritten) files are still read, and
+/// when it is before `start`, the rows were never part of the window.
+///
+/// This relies on rewritten files staying readable while the snapshot that
+/// added them is still in the table's history, which Iceberg guarantees
+/// until `expire_snapshots` removes that snapshot.
+pub fn change_set_snapshots(metadata: &TableMetadata, snapshots: &[i64]) -> Vec<i64> {
+    snapshots
+        .iter()
+        .copied()
+        .filter(|sid| {
+            metadata
+                .snapshot_by_id(*sid)
+                .is_none_or(|s| s.summary().operation != Operation::Replace)
+        })
+        .collect()
 }
 
 /// Reconcile delete files against data files in the range.
@@ -325,7 +353,7 @@ pub async fn plan_incremental(table: &Table, start: i64, end: i64) -> Result<Inc
     let mut data_files: Vec<IncrementalFile> = Vec::new();
     let mut delete_files: Vec<IncrementalFile> = Vec::new();
 
-    for sid in &snapshots {
+    for sid in &change_set_snapshots(metadata, &snapshots) {
         let snap = metadata
             .snapshot_by_id(*sid)
             .ok_or_else(|| {
@@ -457,29 +485,36 @@ mod tests {
     // pay the cost of wiring up every builder knob just to test the walker.
 
     fn metadata_with_snapshots(chain: &[(i64, Option<i64>)]) -> TableMetadata {
-        // chain is ordered oldest first, each as (snapshot_id, parent_snapshot_id).
+        let with_ops: Vec<(i64, Option<i64>, &str)> =
+            chain.iter().map(|(s, p)| (*s, *p, "append")).collect();
+        metadata_with_ops(&with_ops)
+    }
+
+    fn metadata_with_ops(chain: &[(i64, Option<i64>, &str)]) -> TableMetadata {
+        // chain is ordered oldest first, each as
+        // (snapshot_id, parent_snapshot_id, summary operation).
         let snapshots_json: Vec<String> = chain
             .iter()
             .enumerate()
-            .map(|(i, (sid, parent))| {
+            .map(|(i, (sid, parent, op))| {
                 let parent_field = parent
                     .map(|p| format!(r#","parent-snapshot-id":{p}"#))
                     .unwrap_or_default();
                 let ts = 1_600_000_000_000i64 + i as i64 * 1_000;
                 format!(
-                    r#"{{"snapshot-id":{sid}{parent_field},"sequence-number":{i},"timestamp-ms":{ts},"manifest-list":"ml_{sid}.avro","summary":{{"operation":"append"}},"schema-id":0}}"#
+                    r#"{{"snapshot-id":{sid}{parent_field},"sequence-number":{i},"timestamp-ms":{ts},"manifest-list":"ml_{sid}.avro","summary":{{"operation":"{op}"}},"schema-id":0}}"#
                 )
             })
             .collect();
         let snapshot_log: Vec<String> = chain
             .iter()
             .enumerate()
-            .map(|(i, (sid, _))| {
+            .map(|(i, (sid, _, _))| {
                 let ts = 1_600_000_000_000i64 + i as i64 * 1_000;
                 format!(r#"{{"snapshot-id":{sid},"timestamp-ms":{ts}}}"#)
             })
             .collect();
-        let current = chain.last().map(|(sid, _)| *sid).unwrap_or(0);
+        let current = chain.last().map(|(sid, _, _)| *sid).unwrap_or(0);
 
         let json = format!(
             r#"{{
@@ -578,6 +613,38 @@ mod tests {
         let md = metadata_with_snapshots(&[(100, None), (101, Some(100)), (102, Some(101))]);
         let snaps = resolve_range(&md, 0, 102).unwrap();
         assert_eq!(snaps, vec![100, 101, 102]);
+    }
+
+    #[test]
+    fn change_set_skips_replace_snapshots() {
+        // 100 append, 101 replace (compaction of 100's files), 102 append.
+        let md = metadata_with_ops(&[
+            (100, None, "append"),
+            (101, Some(100), "replace"),
+            (102, Some(101), "append"),
+        ]);
+        let from_root = resolve_range(&md, 0, 102).unwrap();
+        assert_eq!(from_root, vec![100, 101, 102], "the walk still crosses 101");
+        assert_eq!(change_set_snapshots(&md, &from_root), vec![100, 102]);
+
+        let after_append = resolve_range(&md, 100, 102).unwrap();
+        assert_eq!(change_set_snapshots(&md, &after_append), vec![102]);
+
+        // A range holding only the compaction has no changes.
+        let only_replace = resolve_range(&md, 100, 101).unwrap();
+        assert!(change_set_snapshots(&md, &only_replace).is_empty());
+    }
+
+    #[test]
+    fn change_set_keeps_overwrite_and_delete_snapshots() {
+        // Only `replace` is a no-op rewrite; overwrite and delete change rows.
+        let md = metadata_with_ops(&[
+            (100, None, "append"),
+            (101, Some(100), "overwrite"),
+            (102, Some(101), "delete"),
+        ]);
+        let snaps = resolve_range(&md, 0, 102).unwrap();
+        assert_eq!(change_set_snapshots(&md, &snaps), vec![100, 101, 102]);
     }
 
     // ── Meta column synthesis (task 8.10-8.12) ──────────────────────────

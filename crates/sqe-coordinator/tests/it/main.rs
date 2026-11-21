@@ -64,6 +64,7 @@ mod hive_tag_source_test;
 mod hive_write_test;
 mod identifier_fields_e2e;
 mod in_subquery_view_rewrite;
+mod incremental_replace_test;
 mod incremental_scan_e2e;
 mod information_schema_listing_race_e2e;
 mod insert_overwrite_e2e;
