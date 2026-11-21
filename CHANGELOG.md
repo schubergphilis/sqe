@@ -4,6 +4,54 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+## [0.56.0] — 2026-11-21
+
+### Added
+
+- Column tags by Ranger grant: `[access_control] tag_authority` (#911)
+
+    With `tag_authority = "ranger-delegate"`, a user without an admin role may `SET` / `UNSET TAGS` (and `SET` / `UNSET MASKING POLICY`) on a column when the Ranger `hive` access policies grant them `alter` on that column. Every column in the statement is checked before anything is written; deny items win. The default `admin-role` is unchanged. A broad `alter` grant becomes the right to remove a column's mask, so review the `alter` grants before switching.
+
+- Tagging as a grant of its own: `[access_control] tag_privilege = "alter" | "apply_tag"` (#917)
+
+    With `tag_authority = "ranger-delegate"` and `tag_privilege = "apply_tag"`, a user may change a column's tags when the Ranger `hive` access policies grant them `apply_tag` on that column. `apply_tag` is not implied by `alter`, write or an allow item's `all`; a deny item (including a deny on `all`) still wins. The `hive` service definition must carry an `apply_tag` access type (the quickstart bootstrap adds it). The default `alter` keeps the 0.55 behaviour, and `admin-role` is unchanged.
+
+### Changed
+
+- Polaris 1.9.0 in the integration-test stack and every quickstart, up from 1.7.0. The quickstarts had been held on 1.7.0 for the embedded Ranger authorizer.
+
+- Under `tag_authority = "ranger-delegate"`, every statement that writes `sqe.column-tags` uses the same per-column check (#917)
+
+    `ALTER TABLE ... SET TBLPROPERTIES` is checked against the columns whose tags differ between the live map and the new one (a removed column counts). `CREATE [OR REPLACE] TABLE ... TBLPROPERTIES` is checked on every column it tags (`OR REPLACE`: the columns that differ from the live table). These were admin-only (`SET TBLPROPERTIES`, `CREATE OR REPLACE`) or ungated (plain `CREATE`). A value that is not a JSON tag map, or a key spelled `sqe.column-tags` in another case, stays admin-only. `UNSET TBLPROPERTIES` does not parse, so it has no route to the tags. Refusals are `403 Forbidden` and logged.
+
+### Fixed
+
+- `ALTER TABLE <bare name> SET / UNSET TAGS` and `SHOW EFFECTIVE POLICY` now resolve a bare table name in the session's catalog (`USE CATALOG`, Trino `catalog=`), as DML does, instead of the configured default warehouse (#911)
+
+- RENAME, CREATE/DROP VIEW and ALTER TABLE act on the session catalog for one- and two-part names (#916)
+
+    `catalog_ops` resolves the catalog with `resolve_target_catalog`, as DROP TABLE, INSERT, CTAS, DELETE, UPDATE and MERGE already do. Before, after `USE other_catalog.schema`, these statements went to the default warehouse: they failed with table-not-found, or changed a same-named table there. Covered: RENAME, CREATE VIEW, DROP VIEW, ALTER TABLE (columns, nested columns, properties, branches and tags, partition and identifier fields). Column tags already resolved this way.
+
+- Cap the test stack's Polaris container at 3 GB of memory
+
+    The Polaris image sizes its heap at 80% of the memory it can see. With no
+    limit that is 80% of the whole Docker VM, and on Polaris 1.9 the heap grew
+    past 6 GB of uncollected garbage during `make test-integration` until the
+    VM's OOM killer stopped the JVM mid-suite. Every later test then failed to
+    fetch a token. With the cap the JVM collects garbage in time.
+
+- SAST: the catalog-scope test's ES256 key no longer fails `aikido-sast`
+
+    `crates/sqe-coordinator/tests/it/catalog_scope_e2e.rs` embeds a published
+    test keypair that signs only test JWTs. It now carries a `nosemgrep` for
+    `detected-private-key`, which turned the v0.55.2 tag pipeline red.
+
+### Security
+
+- `sqe.column-tags` written through Trino `extra_properties` is now gated like the plain key (#917)
+
+    The gate matched only the raw property keys, so `ALTER TABLE ... SET PROPERTIES extra_properties = MAP(ARRAY['sqe.column-tags'], ...)` or a `CREATE OR REPLACE TABLE ... WITH (extra_properties = ...)` from a non-admin could rewrite a table's tags and so remove a column's mask. The gate now reads the properties the statement will actually write.
+
 ## [0.55.2] — 2026-11-20
 
 ### Added
