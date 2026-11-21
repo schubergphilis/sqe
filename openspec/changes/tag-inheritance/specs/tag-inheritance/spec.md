@@ -17,12 +17,13 @@ A column's effective tags SHALL be its own tags plus every tag of its table whos
 - **THEN** the effective tags of `ssn` hold `owner = risk` once
 
 ### Requirement: Inherited row filters apply to reads and writes
-A row filter matched by a table tag SHALL hide rows from SELECT, and UPDATE and DELETE SHALL NOT change a hidden row. `SHOW STATS` SHALL NOT report the table's total row count to a row-filtered caller.
+A row filter matched by a table tag SHALL hide rows from SELECT; UPDATE, DELETE and MERGE SHALL NOT change a hidden row, and a MERGE INSERT of a row the filter hides SHALL be refused. `SHOW STATS` SHALL NOT report the table's total row count to a row-filtered caller.
 
-#### Scenario: UPDATE and DELETE skip hidden rows
+#### Scenario: UPDATE, DELETE and MERGE skip hidden rows
 - **WHEN** a tag row filter `id > 1` matches the table tag `eu` and `ns.t` holds ids 1 and 2
 - **THEN** `SELECT` returns id 2 only
 - **AND** `UPDATE ns.t SET ...` and `DELETE FROM ns.t` leave the row with id 1 unchanged
+- **AND** a MERGE matching id 1 (UPDATE or DELETE) leaves it unchanged, and a MERGE INSERT of id 0 is refused
 
 ### Requirement: Unreadable table tags fail closed
 When the table tags of a table cannot be read (a malformed `sqe.table-tags`), the tag state of the table SHALL be unknown and every read of it SHALL be refused.
