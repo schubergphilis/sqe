@@ -187,16 +187,14 @@ pub(crate) fn replace_shape_properties(
     if changes.set.contains_key(TAGS) {
         return changes;
     }
-    let Ok(mut tags) =
-        serde_json::from_str::<std::collections::BTreeMap<String, Vec<String>>>(live_tags)
-    else {
+    let Ok(mut tags) = sqe_core::column_tags::parse(live_tags) else {
         return changes;
     };
     let kept = |c: &str| columns.iter().any(|n| c.eq_ignore_ascii_case(n));
     tags.retain(|c, _| kept(c) || kept(c.split('.').next().unwrap_or(c)));
     if tags.is_empty() {
         changes.remove.push(TAGS.to_string());
-    } else if let Ok(kept) = serde_json::to_string(&tags) {
+    } else if let Ok(kept) = sqe_core::column_tags::to_json(&tags) {
         if kept != *live_tags {
             changes.set.insert(TAGS.to_string(), kept);
         }
@@ -388,6 +386,17 @@ mod tests {
         let changes = shape_changes(&live, &["id"]);
         assert!(changes.set.is_empty(), "{:?}", changes.set);
         assert_eq!(changes.remove, ["sqe.column-tags"]);
+    }
+
+    #[test]
+    fn replace_shape_properties_keep_tag_values() {
+        let tags = r#"{"card":[{"pci":"card"},"pii"],"gone":[{"pci":"x"}]}"#;
+        let live = map(&[("sqe.column-tags", tags)]);
+        let changes = shape_changes(&live, &["card"]);
+        assert_eq!(
+            changes.set["sqe.column-tags"],
+            r#"{"card":[{"pci":"card"},"pii"]}"#
+        );
     }
 
     #[test]

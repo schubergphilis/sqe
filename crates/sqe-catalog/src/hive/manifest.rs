@@ -491,7 +491,7 @@ impl HiveManifest {
             }
         };
         if let Some(raw) = self.parameters.get(COLUMN_TAGS_KEY) {
-            let map: BTreeMap<String, Vec<String>> = serde_json::from_str(raw).map_err(|e| {
+            let map = sqe_core::column_tags::parse_keys(raw).map_err(|e| {
                 HiveError::Validation(format!(
                     "table parameter `{COLUMN_TAGS_KEY}` is not a JSON object of tag arrays: {e}"
                 ))
@@ -507,13 +507,14 @@ impl HiveManifest {
             .chain(&self.partition_keys)
         {
             if let Some(raw) = column.parameters.get(COLUMN_TAGS_KEY) {
-                let labels: Vec<String> = serde_json::from_str(raw).map_err(|e| {
-                    HiveError::Validation(format!(
-                        "column `{}` parameter `{COLUMN_TAGS_KEY}` is not a JSON array of tags: {e}",
-                        column.name
-                    ))
-                })?;
-                add(&column.name, labels);
+                let labels: Vec<sqe_core::column_tags::ColumnTag> = serde_json::from_str(raw)
+                    .map_err(|e| {
+                        HiveError::Validation(format!(
+                            "column `{}` parameter `{COLUMN_TAGS_KEY}` is not a JSON array of tags: {e}",
+                            column.name
+                        ))
+                    })?;
+                add(&column.name, labels.into_iter().map(|t| t.key).collect());
             }
         }
         Ok(tags)

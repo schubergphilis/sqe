@@ -11,6 +11,10 @@
 //! {"email": ["PII", "GDPR"], "salary": ["PII", "CONFIDENTIAL"]}
 //! ```
 //!
+//! A tag with a value is a one-entry object in the list
+//! (`{"card": [{"pci": "card"}, "PII"]}`; see `sqe_core::column_tags`). The
+//! `TagSource` and the Ranger projection see the keys only.
+//!
 //! # Sync cache access
 //!
 //! `TagSource::column_tags` is synchronous. `TableMetadataCache` is backed by
@@ -36,11 +40,12 @@ use iceberg::NamespaceIdent;
 use tracing::debug;
 
 use sqe_catalog::TableMetadataCache;
+use sqe_core::column_tags::{self, ColumnTag, ColumnTagMap};
 use sqe_policy::TagSource;
 use sqe_sql::tags::{ColumnTagOp, TagAction};
 
 /// Iceberg table property key holding the column->tag-label JSON map.
-pub const PROP_KEY: &str = "sqe.column-tags";
+pub const PROP_KEY: &str = column_tags::PROP_KEY;
 
 /// Tag source backed by the coordinator's shared `TableMetadataCache`.
 ///
@@ -193,15 +198,24 @@ fn is_series_generator(provider: &dyn datafusion::catalog::TableProvider) -> boo
 /// * Malformed JSON or wrong shape → `Err` (unknown). Callers must not treat
 ///   this as empty: the rewriter fail-closes, and SET/UNSET TAGS must refuse
 ///   rather than wipe existing tags.
+///
+/// Tag values are dropped: policy matches on keys only. Writers that
+/// read-modify-write the property use [`parse_column_tag_entries`] so the
+/// values survive.
 pub fn parse_column_tags(
     props: &HashMap<String, String>,
 ) -> Result<HashMap<String, Vec<String>>, serde_json::Error> {
-    let raw = match props.get(PROP_KEY) {
-        Some(v) => v,
-        None => return Ok(HashMap::new()),
-    };
+    parse_column_tag_entries(props).map(|map| column_tags::keys(&map))
+}
 
-    serde_json::from_str::<HashMap<String, Vec<String>>>(raw)
+/// [`parse_column_tags`] keeping each tag's value (`["pii", {"kind": "card"}]`).
+pub fn parse_column_tag_entries(
+    props: &HashMap<String, String>,
+) -> Result<ColumnTagMap, serde_json::Error> {
+    match props.get(PROP_KEY) {
+        Some(raw) => column_tags::parse(raw),
+        None => Ok(ColumnTagMap::new()),
+    }
 }
 
 /// What a raw property write (`ALTER TABLE ... SET TBLPROPERTIES / SET
@@ -276,14 +290,15 @@ pub fn tag_property_write(
 /// has to be authorised for, the same per-column check `SET TAGS` gets.
 ///
 /// Tag lists compare as sets (order and duplicates do not matter), and an empty
-/// list is the same as no entry. Column names compare exactly, so a key whose
-/// case changes counts as two columns: one removed, one added.
+/// list is the same as no entry. A tag whose value changes is a change. Column
+/// names compare exactly, so a key whose case changes counts as two columns:
+/// one removed, one added.
 pub fn changed_tag_columns(
-    old: &HashMap<String, Vec<String>>,
-    new: &HashMap<String, Vec<String>>,
+    old: &ColumnTagMap,
+    new: &ColumnTagMap,
 ) -> std::collections::BTreeSet<String> {
     use std::collections::BTreeSet;
-    let tags = |m: &HashMap<String, Vec<String>>, c: &str| -> BTreeSet<String> {
+    let tags = |m: &ColumnTagMap, c: &str| -> BTreeSet<ColumnTag> {
         m.get(c)
             .map(|v| v.iter().cloned().collect())
             .unwrap_or_default()
@@ -296,21 +311,25 @@ pub fn changed_tag_columns(
 }
 
 /// Apply column-tag operations to the current tag map (merge semantics).
-/// `Set` unions tags (dedup, stable order). `Unset` removes the listed tags, or
-/// ALL tags on the column when the list is empty. A column whose tag list becomes
-/// empty is dropped from the map.
-pub(crate) fn apply_tag_ops(
-    current: &HashMap<String, Vec<String>>,
-    ops: &[ColumnTagOp],
-) -> HashMap<String, Vec<String>> {
+/// `Set` unions tags (dedup by key, stable order) and sets each named tag's
+/// value to the one the statement gave, or to none for a key-only tag, as
+/// Databricks does. `Unset` removes the listed tags whatever their value, or
+/// ALL tags on the column when the list is empty. A column whose tag list
+/// becomes empty is dropped from the map.
+pub(crate) fn apply_tag_ops(current: &ColumnTagMap, ops: &[ColumnTagOp]) -> ColumnTagMap {
     let mut map = current.clone();
     for op in ops {
         match op.action {
             TagAction::Set => {
                 let entry = map.entry(op.column.clone()).or_default();
                 for t in &op.tags {
-                    if !entry.contains(t) {
-                        entry.push(t.clone());
+                    let value = op.values.get(t).cloned();
+                    match entry.iter_mut().find(|e| &e.key == t) {
+                        Some(existing) => existing.value = value,
+                        None => entry.push(ColumnTag {
+                            key: t.clone(),
+                            value,
+                        }),
                     }
                 }
                 if entry.is_empty() {
@@ -321,7 +340,7 @@ pub(crate) fn apply_tag_ops(
                 if op.tags.is_empty() {
                     map.remove(&op.column);
                 } else if let Some(entry) = map.get_mut(&op.column) {
-                    entry.retain(|t| !op.tags.contains(t));
+                    entry.retain(|t| !op.tags.contains(&t.key));
                     if entry.is_empty() {
                         map.remove(&op.column);
                     }
@@ -349,6 +368,123 @@ mod tests {
             .iter()
             .map(|(c, ts)| (c.to_string(), ts.iter().map(|t| t.to_string()).collect()))
             .collect()
+    }
+
+    // The key-only tests below predate tag values; these wrappers run them
+    // through the real functions on key-only maps. The value tests call
+    // `super::` directly.
+    fn apply_tag_ops(
+        current: &HashMap<String, Vec<String>>,
+        ops: &[ColumnTagOp],
+    ) -> HashMap<String, Vec<String>> {
+        column_tags::keys(&super::apply_tag_ops(&column_tags::from_keys(current), ops))
+    }
+
+    fn changed_tag_columns(
+        old: &HashMap<String, Vec<String>>,
+        new: &HashMap<String, Vec<String>>,
+    ) -> std::collections::BTreeSet<String> {
+        super::changed_tag_columns(&column_tags::from_keys(old), &column_tags::from_keys(new))
+    }
+
+    fn set_op(column: &str, tags: &[(&str, Option<&str>)]) -> ColumnTagOp {
+        ColumnTagOp {
+            column: column.into(),
+            tags: tags.iter().map(|(k, _)| k.to_string()).collect(),
+            values: tags
+                .iter()
+                .filter_map(|(k, v)| v.map(|v| (k.to_string(), v.to_string())))
+                .collect(),
+            action: TagAction::Set,
+        }
+    }
+
+    #[test]
+    fn set_stores_replaces_and_clears_a_value() {
+        let set = super::apply_tag_ops(
+            &ColumnTagMap::new(),
+            &[set_op("card", &[("pci", Some("card")), ("pii", None)])],
+        );
+        assert_eq!(
+            set["card"],
+            vec![ColumnTag::with_value("pci", "card"), ColumnTag::key("pii")]
+        );
+        // Setting a key again replaces its value in place, no duplicate.
+        let replaced = super::apply_tag_ops(&set, &[set_op("card", &[("pci", Some("pan"))])]);
+        assert_eq!(
+            replaced["card"],
+            vec![ColumnTag::with_value("pci", "pan"), ColumnTag::key("pii")]
+        );
+        // Setting it key-only drops the value, as Databricks does.
+        let cleared = super::apply_tag_ops(&replaced, &[set_op("card", &[("pci", None)])]);
+        assert_eq!(
+            cleared["card"],
+            vec![ColumnTag::key("pci"), ColumnTag::key("pii")]
+        );
+    }
+
+    #[test]
+    fn unset_removes_a_valued_tag_by_key() {
+        let cur = super::apply_tag_ops(
+            &ColumnTagMap::new(),
+            &[set_op("card", &[("pci", Some("card")), ("pii", None)])],
+        );
+        let ops = [ColumnTagOp {
+            column: "card".into(),
+            tags: vec!["pci".into()],
+            values: Default::default(),
+            action: TagAction::Unset,
+        }];
+        assert_eq!(
+            super::apply_tag_ops(&cur, &ops)["card"],
+            vec![ColumnTag::key("pii")]
+        );
+    }
+
+    #[test]
+    fn a_value_only_change_is_a_changed_column() {
+        let old = super::apply_tag_ops(
+            &ColumnTagMap::new(),
+            &[set_op("card", &[("pci", Some("card"))])],
+        );
+        let new = super::apply_tag_ops(&old, &[set_op("card", &[("pci", Some("pan"))])]);
+        assert_eq!(
+            super::changed_tag_columns(&old, &new),
+            ["card".to_string()].into_iter().collect()
+        );
+        assert!(super::changed_tag_columns(&old, &old).is_empty());
+    }
+
+    #[test]
+    fn a_valued_tag_gives_policy_the_same_keys() {
+        let p = props(&[(PROP_KEY, r#"{"card":[{"pci":"card"},"pii"]}"#)]);
+        assert_eq!(
+            parse_column_tags(&p).expect("valued tags parse")["card"],
+            vec!["pci".to_string(), "pii".to_string()]
+        );
+        // Bad shapes stay unknown, never empty.
+        for bad in [r#"{"card":[{}]}"#, r#"{"card":[{"a":"1","b":"2"}]}"#] {
+            assert!(
+                parse_column_tags(&props(&[(PROP_KEY, bad)])).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn written_property_keeps_values_and_key_only_json_is_unchanged() {
+        let key_only = column_tags::from_keys(&map(&[("email", &["PII", "GDPR"])]));
+        assert_eq!(
+            column_tags::to_json(&key_only).unwrap(),
+            r#"{"email":["PII","GDPR"]}"#
+        );
+        let valued = super::apply_tag_ops(&key_only, &[set_op("email", &[("PII", Some("high"))])]);
+        let json = column_tags::to_json(&valued).unwrap();
+        assert_eq!(json, r#"{"email":[{"PII":"high"},"GDPR"]}"#);
+        assert_eq!(
+            parse_column_tag_entries(&props(&[(PROP_KEY, &json)])).unwrap(),
+            valued
+        );
     }
 
     #[test]
@@ -455,6 +591,7 @@ mod tests {
         let ops = vec![ColumnTagOp {
             column: "email".into(),
             tags: vec!["PII".into(), "GDPR".into()],
+            values: Default::default(),
             action: TagAction::Set,
         }];
         let got = apply_tag_ops(&cur, &ops);
@@ -470,6 +607,7 @@ mod tests {
         let ops = vec![ColumnTagOp {
             column: "email".into(),
             tags: vec!["GDPR".into()],
+            values: Default::default(),
             action: TagAction::Set,
         }];
         let got = apply_tag_ops(&cur, &ops);
@@ -482,6 +620,7 @@ mod tests {
         let ops = vec![ColumnTagOp {
             column: "email".into(),
             tags: vec!["GDPR".into()],
+            values: Default::default(),
             action: TagAction::Unset,
         }];
         let got = apply_tag_ops(&cur, &ops);
@@ -494,6 +633,7 @@ mod tests {
         let ops = vec![ColumnTagOp {
             column: "email".into(),
             tags: vec![],
+            values: Default::default(),
             action: TagAction::Unset,
         }];
         let got = apply_tag_ops(&cur, &ops);
@@ -507,6 +647,7 @@ mod tests {
         let ops = vec![ColumnTagOp {
             column: "email".into(),
             tags: vec!["PII".into()],
+            values: Default::default(),
             action: TagAction::Unset,
         }];
         let got = apply_tag_ops(&cur, &ops);
@@ -611,6 +752,7 @@ mod tests {
         let ops = vec![ColumnTagOp {
             column: "email".into(),
             tags: vec!["PII".into(), "GDPR".into()],
+            values: Default::default(),
             action: TagAction::Set,
         }];
         let merged = apply_tag_ops(&current, &ops);
@@ -637,6 +779,7 @@ mod tests {
             &[ColumnTagOp {
                 column: "email".into(),
                 tags: vec!["PII".into()],
+                values: Default::default(),
                 action: TagAction::Set,
             }],
         );
@@ -649,6 +792,7 @@ mod tests {
             &[ColumnTagOp {
                 column: "email".into(),
                 tags: vec!["GDPR".into()],
+                values: Default::default(),
                 action: TagAction::Set,
             }],
         );
@@ -693,9 +837,9 @@ pub(crate) enum TagKeyChange {
 /// * A rename of an UNtagged column is not a change, so a table with no tags never
 ///   gets a property written by a rename.
 pub(crate) fn rewrite_tag_keys(
-    current: &HashMap<String, Vec<String>>,
+    current: &ColumnTagMap,
     changes: &[TagKeyChange],
-) -> Option<HashMap<String, Vec<String>>> {
+) -> Option<ColumnTagMap> {
     if current.is_empty() || changes.is_empty() {
         return None;
     }
@@ -712,7 +856,8 @@ pub(crate) fn rewrite_tag_keys(
                     touched = true;
                     let entry = map.entry(new.clone()).or_default();
                     for tag in tags {
-                        if !entry.contains(&tag) {
+                        // By key: a tag both names carry keeps the target's value.
+                        if !entry.iter().any(|e| e.key == tag.key) {
                             entry.push(tag);
                         }
                     }
@@ -737,6 +882,48 @@ mod tag_key_rewrite_tests {
             .iter()
             .map(|(c, tags)| (c.to_string(), tags.iter().map(|t| t.to_string()).collect()))
             .collect()
+    }
+
+    /// The real rewrite on a key-only map, compared as keys.
+    fn rewrite_tag_keys(
+        current: &HashMap<String, Vec<String>>,
+        changes: &[TagKeyChange],
+    ) -> Option<HashMap<String, Vec<String>>> {
+        super::rewrite_tag_keys(&column_tags::from_keys(current), changes)
+            .map(|m| column_tags::keys(&m))
+    }
+
+    /// A rename carries tag values; on a union the target keeps its own value.
+    #[test]
+    fn a_rename_carries_values_and_the_target_keeps_its_own() {
+        let current: ColumnTagMap = HashMap::from([
+            (
+                "ssn".to_string(),
+                vec![
+                    ColumnTag::with_value("pii", "ssn"),
+                    ColumnTag::with_value("geo", "eu"),
+                ],
+            ),
+            (
+                "tax_id".to_string(),
+                vec![ColumnTag::with_value("pii", "tax")],
+            ),
+        ]);
+        let out = super::rewrite_tag_keys(
+            &current,
+            &[TagKeyChange::Rename {
+                old: "ssn".into(),
+                new: "tax_id".into(),
+            }],
+        )
+        .expect("changed");
+        assert_eq!(
+            out["tax_id"],
+            vec![
+                ColumnTag::with_value("pii", "tax"),
+                ColumnTag::with_value("geo", "eu")
+            ]
+        );
     }
 
     /// THE fix. Before this, the association kept naming `ssn` after the rename, so

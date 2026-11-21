@@ -4,6 +4,8 @@
 //! `sqe.column-tags` table property. They are DISTINCT from Iceberg snapshot
 //! tags (`CREATE TAG` / `DROP TAG`, see `ddl.rs`).
 
+use std::collections::BTreeMap;
+
 use sqe_core::{Result, SqeError, SqeErrorCode};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +20,10 @@ pub struct ColumnTagOp {
     pub column: String,
     pub tags: Vec<String>,
     pub action: TagAction,
+    /// Values of the tags in `tags` that were given one (`'k' = 'v'`,
+    /// `SET TAG k = 'v'`), by tag key. A `Set` of a key with no entry here
+    /// stores the key without a value. Always empty for `Unset`.
+    pub values: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,16 +73,14 @@ pub fn try_parse_set_tags(sql: &str) -> Result<Option<SetTagsStatement>> {
         // `ALTER COLUMN c UNSET TAGS ('k')`. Checked before the singular
         // Snowflake forms, which are prefixes of these.
         if let Some(body) = strip_kw(rest2, &rest2_upper, "SET TAGS") {
-            let tags = parse_databricks_tag_list(body, "SET TAGS")?
-                .into_iter()
-                .map(|(key, _value)| key)
-                .collect();
+            let (tags, values) = keys_and_values(parse_databricks_tag_list(body, "SET TAGS")?);
             return Ok(Some(SetTagsStatement {
                 table,
                 ops: vec![ColumnTagOp {
                     column,
                     tags,
                     action: TagAction::Set,
+                    values,
                 }],
             }));
         }
@@ -99,19 +103,21 @@ pub fn try_parse_set_tags(sql: &str) -> Result<Option<SetTagsStatement>> {
                     column,
                     tags,
                     action: TagAction::Unset,
+                    values: BTreeMap::new(),
                 }],
             }));
         }
         // SET TAG (singular) but not SET TAGS (plural, native form).
         if rest2_upper.starts_with("SET TAG") && !rest2_upper.starts_with("SET TAGS") {
             let body = rest2["SET TAG".len()..].trim_start();
-            let tags = parse_snowflake_assignments(body)?;
+            let (tags, values) = keys_and_values(parse_snowflake_assignments(body)?);
             return Ok(Some(SetTagsStatement {
                 table,
                 ops: vec![ColumnTagOp {
                     column,
                     tags,
                     action: TagAction::Set,
+                    values,
                 }],
             }));
         }
@@ -124,6 +130,7 @@ pub fn try_parse_set_tags(sql: &str) -> Result<Option<SetTagsStatement>> {
                     column,
                     tags,
                     action: TagAction::Unset,
+                    values: BTreeMap::new(),
                 }],
             }));
         }
@@ -348,9 +355,18 @@ fn parse_databricks_tag_list(body: &str, context: &str) -> Result<Vec<(String, O
     let inner = strip_parens(body, context)?;
     let mut tags = Vec::new();
     for item in split_top_level(inner) {
-        let (key, value) = match find_top_level_eq(&item) {
-            Some(eq) => (unquote(&item[..eq]), Some(unquote(&item[eq + 1..]))),
-            None => (unquote(&item), None),
+        // `'k' =` with nothing after it is an error; `'k' = ''` is an empty
+        // value, which `keys_and_values` stores as a key-only tag.
+        let (key, value, missing_value) = match find_top_level_eq(&item) {
+            Some(eq) => {
+                let raw = &item[eq + 1..];
+                (
+                    unquote(&item[..eq]),
+                    Some(unquote(raw)),
+                    raw.trim().is_empty(),
+                )
+            }
+            None => (unquote(&item), None, false),
         };
         if key.is_empty() {
             return Err(SqeError::with_code(
@@ -358,7 +374,7 @@ fn parse_databricks_tag_list(body: &str, context: &str) -> Result<Vec<(String, O
                 format!("{context}: expected a tag name, got `{item}`"),
             ));
         }
-        if value.as_deref().is_some_and(|v| v.trim().is_empty()) {
+        if missing_value {
             return Err(SqeError::with_code(
                 SqeErrorCode::ExecutionFailed,
                 format!("{context}: tag `{key}` has `=` but no value"),
@@ -423,6 +439,7 @@ fn parse_native_set_list(body: &str) -> Result<Vec<ColumnTagOp>> {
             column: col,
             tags,
             action: TagAction::Set,
+            values: BTreeMap::new(),
         });
     }
     if ops.is_empty() {
@@ -445,6 +462,7 @@ fn parse_native_unset_list(body: &str) -> Result<Vec<ColumnTagOp>> {
             column: col,
             tags: vec![],
             action: TagAction::Unset,
+            values: BTreeMap::new(),
         });
     }
     if ops.is_empty() {
@@ -457,15 +475,18 @@ fn parse_native_unset_list(body: &str) -> Result<Vec<ColumnTagOp>> {
 }
 
 /// Snowflake `name [= 'val'] [, name [= 'val']]*` -> tag names (values discarded).
-fn parse_snowflake_assignments(body: &str) -> Result<Vec<String>> {
+fn parse_snowflake_assignments(body: &str) -> Result<Vec<(String, Option<String>)>> {
     let mut names = Vec::new();
     for item in split_top_level(body) {
-        let name_part = match item.find('=') {
-            Some(eq) => item[..eq].trim(),
-            None => item.trim(),
+        let (name_part, value) = match find_top_level_eq(&item) {
+            Some(eq) => {
+                let value = unquote(item[eq + 1..].trim());
+                (item[..eq].trim(), (!value.is_empty()).then_some(value))
+            }
+            None => (item.trim(), None),
         };
         let (name, _) = split_identifier(&unquote(name_part))?;
-        names.push(name);
+        names.push((name, value));
     }
     if names.is_empty() {
         return Err(SqeError::with_code(
@@ -474,6 +495,31 @@ fn parse_snowflake_assignments(body: &str) -> Result<Vec<String>> {
         ));
     }
     Ok(names)
+}
+
+/// Split parsed `(key, value)` pairs into the op's key list and value map.
+/// Keys keep their first position; a key given twice keeps its last value.
+/// An empty value (`'k' = ''`) is stored as a key-only tag, which is how
+/// Databricks reports a key-only tag.
+fn keys_and_values(
+    pairs: Vec<(String, Option<String>)>,
+) -> (Vec<String>, BTreeMap<String, String>) {
+    let mut tags: Vec<String> = Vec::new();
+    let mut values = BTreeMap::new();
+    for (key, value) in pairs {
+        match value.filter(|v| !v.is_empty()) {
+            Some(v) => {
+                values.insert(key.clone(), v);
+            }
+            None => {
+                values.remove(&key);
+            }
+        }
+        if !tags.contains(&key) {
+            tags.push(key);
+        }
+    }
+    (tags, values)
 }
 
 /// Snowflake `name [, name]*` -> tag names.
@@ -541,18 +587,38 @@ mod tests {
     }
 
     #[test]
-    fn snowflake_modify_column_set_tag_value_ignored() {
+    fn snowflake_modify_column_set_tag_keeps_the_value() {
         let s = parse("ALTER TABLE t MODIFY COLUMN email SET TAG PII = 'true'");
         assert_eq!(s.ops.len(), 1);
         assert_eq!(s.ops[0].column, "email");
         assert_eq!(s.ops[0].tags, vec!["PII"]);
         assert_eq!(s.ops[0].action, TagAction::Set);
+        assert_eq!(
+            s.ops[0].values,
+            BTreeMap::from([("PII".to_string(), "true".to_string())])
+        );
     }
 
     #[test]
     fn snowflake_modify_column_multi_tag() {
         let s = parse("ALTER TABLE t MODIFY COLUMN email SET TAG PII = 'true', GDPR = 'x'");
         assert_eq!(s.ops[0].tags, vec!["PII", "GDPR"]);
+        assert_eq!(s.ops[0].values.get("GDPR").map(String::as_str), Some("x"));
+    }
+
+    #[test]
+    fn an_empty_or_missing_value_is_key_only() {
+        let s = parse("ALTER TABLE t MODIFY COLUMN email SET TAG PII = '', GDPR");
+        assert_eq!(s.ops[0].tags, vec!["PII", "GDPR"]);
+        assert!(s.ops[0].values.is_empty(), "{:?}", s.ops[0].values);
+        let s = parse("ALTER TABLE t ALTER COLUMN email SET TAGS ('pii' = '')");
+        assert!(s.ops[0].values.is_empty());
+    }
+
+    #[test]
+    fn a_key_given_twice_keeps_the_last_value() {
+        let s = parse("ALTER TABLE t ALTER COLUMN email SET TAGS ('k' = 'a', 'k' = 'b')");
+        assert_eq!(s.ops[0].values.get("k").map(String::as_str), Some("b"));
     }
 
     #[test]
@@ -579,6 +645,10 @@ mod tests {
         assert_eq!(s.ops[0].column, "email");
         assert_eq!(s.ops[0].tags, vec!["lt_uc", "pii"]);
         assert_eq!(s.ops[0].action, TagAction::Set);
+        assert_eq!(
+            s.ops[0].values,
+            BTreeMap::from([("lt_uc".to_string(), "v".to_string())])
+        );
 
         let s = parse("alter table c.s.t alter column email set tags ('lt_uc');");
         assert_eq!(s.ops[0].tags, vec!["lt_uc"]);
@@ -602,6 +672,10 @@ mod tests {
         );
         assert_eq!(s.ops[0].column, "Email");
         assert_eq!(s.ops[0].tags, vec!["Live.PII", "x,y", "dq"]);
+        assert_eq!(
+            s.ops[0].values.get("Live.PII").map(String::as_str),
+            Some("a=b")
+        );
     }
 
     #[test]
