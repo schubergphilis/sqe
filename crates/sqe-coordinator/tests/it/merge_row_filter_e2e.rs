@@ -5,15 +5,56 @@
 //! filter used to keep the probe table's qualifier (`<table>.id > 1`), which
 //! does not resolve there, so every MERGE into a row-filtered table failed
 //! to plan its cardinality check. DELETE and UPDATE alias their scratch to
-//! the table name and never saw it.
+//! the table name and never saw it. Each case runs with a resource row
+//! filter and with a row filter matched by a table tag.
 //!
 //! Needs the local test stack:
 //! `docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh`.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
-use datafusion::logical_expr::{col, lit};
+use datafusion::logical_expr::{col, lit, Expr};
+use sqe_core::SessionUser;
+use sqe_policy::{PolicyStore, ResolvedPolicy, TagMaskSpec};
+
+/// Where the row filter `id > 1` comes from.
+#[derive(Clone, Copy, Debug)]
+enum Filter {
+    /// A row filter on the table itself.
+    Resource,
+    /// A row filter on the tag `eu`, which the table carries.
+    Tag,
+}
+
+/// The row filter `id > 1` on the tag `eu`; no resource policies.
+struct EuTagFilter;
+
+#[async_trait::async_trait]
+impl PolicyStore for EuTagFilter {
+    async fn resolve(
+        &self,
+        _user: &SessionUser,
+        _table: &str,
+        _namespace: &str,
+    ) -> sqe_core::Result<ResolvedPolicy> {
+        Ok(ResolvedPolicy::default())
+    }
+
+    async fn resolve_tags(
+        &self,
+        _user: &SessionUser,
+        tags: &HashSet<String>,
+    ) -> (HashMap<String, TagMaskSpec>, Vec<Expr>, HashSet<String>) {
+        let filters = if tags.contains("eu") {
+            vec![col("id").gt(lit(1))]
+        } else {
+            vec![]
+        };
+        (HashMap::new(), filters, HashSet::new())
+    }
+}
 
 fn unique(prefix: &str) -> String {
     format!(
@@ -50,7 +91,7 @@ fn rows(expected: &[(i64, &str)]) -> Vec<(i64, String)> {
         .collect()
 }
 
-async fn merge_under_a_row_filter(mode: &str) {
+async fn merge_under_a_row_filter(mode: &str, filter: Filter) {
     let t = unique("merge_rf");
     let (admin, plain) = crate::common::setup_handler().await;
     let create = format!(
@@ -62,13 +103,32 @@ async fn merge_under_a_row_filter(mode: &str) {
     );
     plain.execute(&admin, &create, None).await.expect("CTAS");
 
-    let store = Arc::new(sqe_policy::policy_store::InMemoryPolicyStore::new());
-    let policy = sqe_policy::ResolvedPolicy {
-        row_filters: vec![col("id").gt(lit(1))],
-        ..Default::default()
+    let (session, handler) = match filter {
+        Filter::Resource => {
+            let store = Arc::new(sqe_policy::policy_store::InMemoryPolicyStore::new());
+            let policy = ResolvedPolicy {
+                row_filters: vec![col("id").gt(lit(1))],
+                ..Default::default()
+            };
+            store.add_table_policy("test_ns", &t, policy).await;
+            crate::common::setup_handler_with_policy_store(store).await
+        }
+        Filter::Tag => {
+            let store: Arc<dyn PolicyStore> = Arc::new(EuTagFilter);
+            let precedence = sqe_core::config::MaskPrecedence::Tag;
+            let (mut session, handler) =
+                crate::common::setup_handler_with_tag_store(store, precedence).await;
+            // Tag writes are admin-only in the test config.
+            session.user.roles = vec!["service_admin".to_string()];
+            let tag = format!("ALTER TABLE test_ns.{t} SET TAGS ('eu')");
+            handler
+                .execute(&session, &tag, None)
+                .await
+                .expect("SET TAGS");
+            (session, handler)
+        }
     };
-    store.add_table_policy("test_ns", &t, policy).await;
-    let (session, handler) = crate::common::setup_handler_with_policy_store(store).await;
+    let mode = format!("{mode}, {filter:?} filter");
     let run = |sql: String| {
         let (handler, session) = (&handler, &session);
         async move { handler.execute(session, &sql, None).await.map(|_| ()) }
@@ -142,11 +202,23 @@ async fn merge_under_a_row_filter(mode: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs:polaris"]
 async fn merge_row_filter_copy_on_write() {
-    merge_under_a_row_filter("copy-on-write").await;
+    merge_under_a_row_filter("copy-on-write", Filter::Resource).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs:polaris"]
 async fn merge_row_filter_merge_on_read() {
-    merge_under_a_row_filter("merge-on-read").await;
+    merge_under_a_row_filter("merge-on-read", Filter::Resource).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs:polaris"]
+async fn merge_row_filter_tag_copy_on_write() {
+    merge_under_a_row_filter("copy-on-write", Filter::Tag).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs:polaris"]
+async fn merge_row_filter_tag_merge_on_read() {
+    merge_under_a_row_filter("merge-on-read", Filter::Tag).await;
 }

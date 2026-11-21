@@ -4,7 +4,7 @@
 - [x] 1.2 `tag_source_impl::effective_column_tags`; `scan_column_tags` and `CacheTagSource` use it; a malformed `sqe.table-tags` is unknown (D3)
 - [x] 1.3 `SHOW STATS` reads effective tags: it drops the row count under an inherited row filter (and restricted columns, as for own tags)
 - [x] 1.4 Write authority and the Ranger projection stay on own tags (D2, D5)
-- [x] 1.5 IT (in-process policy store): table-tag mask and UNSET, row filter on SELECT / UPDATE / DELETE / SHOW STATS, inherited conflict refused, malformed table tags refused
+- [x] 1.5 IT (in-process policy store): table-tag mask and UNSET, row filter on SELECT / UPDATE / DELETE / SHOW STATS (MERGE in `merge_row_filter_e2e`, tag cases), inherited conflict refused, malformed table tags refused
 - [x] 1.6 Docs: fine-grained access control page
 
 ## 2. Schema and catalog (second MR)
