@@ -236,6 +236,9 @@ impl MetadataKind {
 struct IcebergMetadataProvider {
     schema: SchemaRef,
     catalog: Arc<SessionCatalog>,
+    /// The catalog the call named and `catalog` was resolved from; `None`
+    /// when the call named none, or the function ignores the argument.
+    catalog_name: Option<String>,
     ident: TableIdent,
     kind: MetadataKind,
     /// The caller's policy on `ident`; `None` = passthrough.
@@ -333,10 +336,21 @@ pub fn is_metadata_table_provider(provider: &dyn TableProvider) -> bool {
 /// (#371). The coordinator calls this to index those entries under the real
 /// table, and to resolve the target's policy before the rewrite (#750).
 pub fn metadata_tvf_target_ident(provider: &dyn TableProvider) -> Option<(String, String)> {
+    metadata_tvf_target(provider).map(|(_, ns, table)| (ns, table))
+}
+
+/// [`metadata_tvf_target_ident`] plus the catalog the call named
+/// (`table_files('ns', 't', 'cat')`), `None` when it named none. The policy
+/// rewriter keys a `catalog_scoped` access check on it: the function name
+/// resolves in the session's catalog, but the target is read from this one.
+pub fn metadata_tvf_target(
+    provider: &dyn TableProvider,
+) -> Option<(Option<String>, String, String)> {
     (provider as &dyn std::any::Any)
         .downcast_ref::<IcebergMetadataProvider>()
         .map(|p| {
             (
+                p.catalog_name.clone(),
                 p.ident.namespace().as_ref().join("."),
                 p.ident.name().to_string(),
             )
@@ -379,8 +393,9 @@ impl std::fmt::Debug for CatalogSource {
 
 impl CatalogSource {
     /// The catalog and table a call names: `(namespace, table)` plus an
-    /// optional trailing catalog name.
-    fn target(&self, fn_name: &str, exprs: &[Expr]) -> DFResult<(Arc<SessionCatalog>, TableIdent)> {
+    /// optional trailing catalog name. The name is returned only when it
+    /// picked the catalog (a `Fixed` source ignores it).
+    fn target(&self, fn_name: &str, exprs: &[Expr]) -> DFResult<Target> {
         let (table_args, catalog) = match exprs {
             [ns, table, Expr::Literal(ScalarValue::Utf8(Some(c)) | ScalarValue::LargeUtf8(Some(c)), _)] => {
                 (vec![ns.clone(), table.clone()], Some(c.as_str()))
@@ -388,13 +403,17 @@ impl CatalogSource {
             _ => (exprs.to_vec(), None),
         };
         let (namespace, table_name) = parse_two_string_args(fn_name, &table_args)?;
-        let catalog = match self {
-            Self::Fixed(catalog) => Arc::clone(catalog),
-            Self::Resolver(resolve) => resolve(catalog)?,
+        let (catalog, catalog_name) = match self {
+            Self::Fixed(fixed) => (Arc::clone(fixed), None),
+            Self::Resolver(resolve) => (resolve(catalog)?, catalog.map(str::to_string)),
         };
-        Ok((catalog, ident_for(&namespace, &table_name)))
+        Ok((catalog, catalog_name, ident_for(&namespace, &table_name)))
     }
 }
+
+/// What [`CatalogSource::target`] resolves: the catalog, the name the call
+/// gave it, and the table.
+type Target = (Arc<SessionCatalog>, Option<String>, TableIdent);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared argument parsing
@@ -473,10 +492,11 @@ impl TableSnapshotsFunction {
 
 impl TableFunctionImpl for TableSnapshotsFunction {
     fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
-        let (catalog, ident) = self.catalogs.target("table_snapshots", exprs)?;
+        let (catalog, catalog_name, ident) = self.catalogs.target("table_snapshots", exprs)?;
         Ok(Arc::new(IcebergMetadataProvider {
             schema: snapshots_schema(),
             catalog,
+            catalog_name,
             ident,
             kind: MetadataKind::Snapshots,
             policy: None,
@@ -595,10 +615,11 @@ impl TableManifestsFunction {
 
 impl TableFunctionImpl for TableManifestsFunction {
     fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
-        let (catalog, ident) = self.catalogs.target("table_manifests", exprs)?;
+        let (catalog, catalog_name, ident) = self.catalogs.target("table_manifests", exprs)?;
         Ok(Arc::new(IcebergMetadataProvider {
             schema: manifests_schema(),
             catalog,
+            catalog_name,
             ident,
             kind: MetadataKind::Manifests,
             policy: None,
@@ -727,10 +748,11 @@ impl TableHistoryFunction {
 
 impl TableFunctionImpl for TableHistoryFunction {
     fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
-        let (catalog, ident) = self.catalogs.target("table_history", exprs)?;
+        let (catalog, catalog_name, ident) = self.catalogs.target("table_history", exprs)?;
         Ok(Arc::new(IcebergMetadataProvider {
             schema: history_schema(),
             catalog,
+            catalog_name,
             ident,
             kind: MetadataKind::History,
             policy: None,
@@ -871,10 +893,11 @@ impl TableFilesFunction {
 
 impl TableFunctionImpl for TableFilesFunction {
     fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
-        let (catalog, ident) = self.catalogs.target("table_files", exprs)?;
+        let (catalog, catalog_name, ident) = self.catalogs.target("table_files", exprs)?;
         Ok(Arc::new(IcebergMetadataProvider {
             schema: files_schema(),
             catalog,
+            catalog_name,
             ident,
             kind: MetadataKind::Files,
             policy: self.policy.clone(),
@@ -1159,10 +1182,11 @@ impl TablePartitionsFunction {
 
 impl TableFunctionImpl for TablePartitionsFunction {
     fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
-        let (catalog, ident) = self.catalogs.target("table_partitions", exprs)?;
+        let (catalog, catalog_name, ident) = self.catalogs.target("table_partitions", exprs)?;
         Ok(Arc::new(IcebergMetadataProvider {
             schema: partitions_schema(),
             catalog,
+            catalog_name,
             ident,
             kind: MetadataKind::Partitions,
             policy: self.policy.clone(),
@@ -1301,10 +1325,11 @@ impl TableRefsFunction {
 
 impl TableFunctionImpl for TableRefsFunction {
     fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
-        let (catalog, ident) = self.catalogs.target("table_refs", exprs)?;
+        let (catalog, catalog_name, ident) = self.catalogs.target("table_refs", exprs)?;
         Ok(Arc::new(IcebergMetadataProvider {
             schema: refs_schema(),
             catalog,
+            catalog_name,
             ident,
             kind: MetadataKind::Refs,
             policy: None,
