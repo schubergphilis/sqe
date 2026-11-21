@@ -5,7 +5,62 @@
 
 use super::*;
 
+/// The table a CREATE TABLE or CTAS writes.
+fn created_table_name(stmt: &Statement) -> Option<&sqlparser::ast::ObjectName> {
+    match stmt {
+        Statement::CreateTable(ct) => Some(&ct.name),
+        _ => None,
+    }
+}
+
 impl QueryHandler {
+    /// Run a maintenance procedure. A `drop_table` also clears the table's
+    /// projected Ranger tags once it has dropped it (#928).
+    pub(super) async fn run_maintenance_call(
+        &self,
+        session: &Session,
+        call: &sqe_sql::ProcedureCall,
+    ) -> sqe_core::Result<Vec<arrow_array::RecordBatch>> {
+        let sqe_sql::ProcedureCall::DropTable { table, .. } = call else {
+            return self.maintenance_handler.handle(session, call).await;
+        };
+        let tags = self
+            .catalog_ops
+            .tags_before_procedure_drop(session, table)
+            .await;
+        let dropped = self.maintenance_handler.handle(session, call).await?;
+        if let Some(tags) = tags {
+            self.catalog_ops.clear_tags_after_procedure_drop(tags).await;
+        }
+        Ok(dropped)
+    }
+
+    /// The tags of the table CREATE TABLE or CTAS `stmt` writes, read
+    /// before it writes it (#928); `None` when projection is off.
+    pub(super) async fn tags_before_create(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+    ) -> Option<std::collections::HashMap<String, Vec<String>>> {
+        let table = created_table_name(stmt)?;
+        self.catalog_ops.tags_before_create(session, table).await
+    }
+
+    /// Project into Ranger the tags CREATE TABLE or CTAS `stmt` committed:
+    /// tags in its properties, or a replaced table's trimmed tags (#928).
+    pub(super) async fn project_created_tags(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        before: Option<std::collections::HashMap<String, Vec<String>>>,
+    ) -> sqe_core::Result<()> {
+        let Some(table) = created_table_name(stmt) else {
+            return Ok(());
+        };
+        let ops = &self.catalog_ops;
+        ops.project_created_table_tags(session, table, before).await
+    }
+
     /// Runs `DROP TABLE`: records the lineage hint, routes to the Hive or
     /// Iceberg catalog (or the PURGE procedure) and invalidates the session cache.
     #[allow(clippy::borrowed_box)]
