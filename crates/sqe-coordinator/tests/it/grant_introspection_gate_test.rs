@@ -1364,6 +1364,13 @@ mod live_tag_maps {
             2,
             "the refused write did not land"
         );
+        // CREATE OR REPLACE diffs against the live map the same way.
+        let sql = "CREATE OR REPLACE TABLE t TBLPROPERTIES ('sqe.column-tags' = \
+                   '{\"ssn\":[\"PII\"],\"email\":[\"PII\"],\"phone\":[\"PII\"]}') \
+                   AS SELECT 1 AS ssn, 2 AS email, 3 AS phone";
+        let msg = r.run("steward", sql).await.unwrap_err().to_string();
+        assert!(msg.contains("requires remove_tag on"), "{msg}");
+        assert_eq!(r.tags().await["ssn"].len(), 2, "nothing replaced");
         // `email` is granted it.
         let sql = set(r#"{"ssn":["PII","GDPR"],"phone":["PII"]}"#);
         r.run("steward", &sql).await.expect("email may be untagged");
