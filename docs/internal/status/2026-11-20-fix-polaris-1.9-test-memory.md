@@ -15,5 +15,17 @@ the heap tops out near 2.4 GB and the JVM collects in time. If the live set
 itself keeps growing, the JVM now exits with an explicit OutOfMemoryError
 (the image sets `-XX:+ExitOnOutOfMemoryError`) instead of vanishing.
 
-**NEXT:** if the live set keeps growing across runs, report the AWS SDK
-attribute-map / exception growth to Polaris upstream.
+**Follow-up 2026-11-21: not a leak.** Three gate runs, two on the same
+container without a restart: after a forced GC the old generation stayed at
+45-170 MB and did not grow from run to run. The 620 MB reading above did not
+reproduce. The heap pressure is garbage. Every REST request builds and closes
+a catalog, an `S3FileIO` and an S3 client. In iceberg-aws 1.12.0,
+`S3FileIO`, `S3InputStream` and `S3OutputStream` declare `finalize()` and
+capture a stack trace, so their object graphs survive one extra GC and get
+promoted. A heap dump showed them held only through `java.lang.ref.Finalizer`,
+and the log had no "Unclosed" warnings, so nothing is left open. Uncapped, the
+80%-of-VM heap lets this garbage reach the Docker VM limit before a full
+collection. The 3 GB cap is the fix (container peak about 2.0 GiB).
+
+**NEXT:** none. An upstream note to Iceberg about finalizer-driven heap
+pressure is optional; nothing was filed.
