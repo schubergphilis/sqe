@@ -832,16 +832,26 @@ fn map_mask(
     }
 }
 
-/// True when an access-policy item carries `access_type` (or `all`) as an
-/// allowed access type. Ranger writes `isAllowed: true` on deny items too
-/// (the item list, not the flag, makes it a deny), so the flag only rules out
-/// an item an operator toggled off.
-fn item_grants_access(item: &AccessPolicyItem, access_type: &str) -> bool {
+/// True when an access-policy item carries `access_type` (or, with
+/// `all_counts`, `all`) as an allowed access type. Ranger writes
+/// `isAllowed: true` on deny items too (the item list, not the flag, makes it
+/// a deny), so the flag only rules out an item an operator toggled off.
+fn item_grants_access(item: &AccessPolicyItem, access_type: &str, all_counts: bool) -> bool {
     item.accesses.iter().any(|a| {
         a.is_allowed
             && (a.access_type.eq_ignore_ascii_case(access_type)
-                || a.access_type.eq_ignore_ascii_case("all"))
+                || (all_counts && a.access_type.eq_ignore_ascii_case("all")))
     })
+}
+
+/// Whether an allow item's `all` grants `access_type`. `all` carries the
+/// stock `hive` access types it lists as implied grants. `apply_tag` is a
+/// custom type added to the servicedef with no place in `all`'s implied
+/// grants, so only an item naming `apply_tag` grants it: a blanket `all`
+/// (the usual owner or `public` item) does not make its holders taggers.
+/// A deny item's `all` still denies it; narrowing never needs the exact type.
+fn all_grants(access_type: &str) -> bool {
+    !access_type.eq_ignore_ascii_case(crate::TablePrivilege::ApplyTag.access_type())
 }
 
 /// True when an access policy's `column` resource covers the whole table.
@@ -874,7 +884,8 @@ fn access_grants_table(
 }
 
 /// Ranger access-policy evaluation for one table and one access type
-/// (`select`, `alter`, `drop`; `all` carries each): does any enabled
+/// (`select`, `alter`, `drop`, `apply_tag`; an allow item's `all` carries
+/// each but `apply_tag`, see [`all_grants`]): does any enabled
 /// `policyType` 0 policy on this database and table grant it to the user,
 /// with no matching deny item for it?
 ///
@@ -962,18 +973,25 @@ fn access_grants_type_with(
             .collect::<Vec<_>>()
     };
 
+    // Deny items and allow exceptions narrow access, so their `all` always
+    // counts; allow items and deny exceptions widen it, so their `all` counts
+    // only for the access types `all` implies (`all_grants`).
     let applies = |items: &[AccessPolicyItem]| {
         items.iter().any(|i| {
-            item_grants_access(i, access_type) && item_matches(&i.users, &i.roles, &i.groups, user)
+            item_grants_access(i, access_type, true)
+                && item_matches(&i.users, &i.roles, &i.groups, user)
         })
     };
+    let all_widens = all_grants(access_type);
 
     // Items that widen access (allow items, deny exceptions) do not count when
     // they carry conditions SQE cannot evaluate. Deny items and allow
     // exceptions keep ignoring conditions, which only ever narrows access.
     let widens = |p: &RangerPolicy, items: &[AccessPolicyItem]| {
         items.iter().any(|i| {
-            if !(item_grants_access(i, access_type) && item_matches(&i.users, &i.roles, &i.groups, user)) {
+            if !(item_grants_access(i, access_type, all_widens)
+                && item_matches(&i.users, &i.roles, &i.groups, user))
+            {
                 return false;
             }
             if !i.conditions.is_empty() {
@@ -3427,6 +3445,199 @@ mod tests {
         let none = column_bundle(&[("", STEWARD_ALLOW)]);
         assert!(col_alter(&none, &u, "ssn"));
         assert!(col_alter(&none, &u, "email"));
+    }
+
+    /// `apply_tag` (#917) in the shapes the governance service writes, under
+    /// `catalog_scoped`: one policy per securable (catalog `lake.*`, schema
+    /// `lake.sales`, table), `column: *`, the access type alone. Plus the
+    /// catalog-wide tag guard: `apply_tag` denied to `public`, one user
+    /// excepted.
+    fn apply_tag_bundle(guard: bool) -> ServicePolicies {
+        let star = r#"{"values":["*"],"isExcludes":false,"isRecursive":false}"#;
+        let tag = r#"[{"type":"apply_tag","isAllowed":true}]"#;
+        let policy = |id: u32, db: &str, table: &str, items: &str| {
+            format!(
+                r#"{{"id":{id},"name":"p{id}","policyType":0,"isEnabled":true,
+                  "resources":{{"database":{{"values":["{db}"],"isExcludes":false,"isRecursive":false}},
+                  "table":{table},"column":{star}}},{items}}}"#
+            )
+        };
+        let one =
+            |t: &str| format!(r#"{{"values":["{t}"],"isExcludes":false,"isRecursive":false}}"#);
+        let item = |who: &str| {
+            format!(
+                r#""policyItems":[{{{who},"roles":[],"accesses":{tag},"delegateAdmin":false}}]"#
+            )
+        };
+        let mut policies = vec![
+            policy(
+                1,
+                "lake.*",
+                star,
+                &item(r#""users":["cat_owner"],"groups":[]"#),
+            ),
+            policy(
+                2,
+                "lake.sales",
+                star,
+                &item(r#""users":[],"groups":["stewards"]"#),
+            ),
+            policy(
+                3,
+                "lake.sales",
+                &one("orders"),
+                &item(r#""users":["tbl_owner"],"groups":[]"#),
+            ),
+            // Writers: `all` and the write types, never `apply_tag`.
+            policy(
+                4,
+                "lake.*",
+                star,
+                r#""policyItems":[{"users":["writer"],"groups":[],"roles":[],
+                   "accesses":[{"type":"all","isAllowed":true},{"type":"alter","isAllowed":true},
+                   {"type":"update","isAllowed":true}]}]"#,
+            ),
+        ];
+        if guard {
+            policies.push(policy(
+                5,
+                "lake.*",
+                star,
+                &format!(
+                    r#""policyItems":[],
+                       "denyPolicyItems":[{{"users":[],"groups":["public"],"roles":[],"accesses":{tag}}}],
+                       "denyExceptions":[{{"users":["svc"],"groups":[],"roles":[],"accesses":{tag}}}]"#
+                ),
+            ));
+        }
+        serde_json::from_str(&format!(r#"{{"policies":[{}]}}"#, policies.join(","))).unwrap()
+    }
+
+    #[tokio::test]
+    async fn apply_tag_comes_only_from_items_that_name_it() {
+        let can = |bundle: ServicePolicies| async move {
+            let cfg = RangerPolicyConfig {
+                catalog_scoped: true,
+                ..Default::default()
+            };
+            let store = RangerStore::from_config(&cfg).unwrap();
+            store
+                .bundle_cache
+                .insert(
+                    BUNDLE_KEY,
+                    CachedBundle {
+                        bundle: Arc::new(bundle),
+                        fetched_at: Instant::now(),
+                    },
+                )
+                .await;
+            store
+        };
+        let store = can(apply_tag_bundle(false)).await;
+        let tag = |u: SessionUser, ns: &'static str, t: &'static str, p| {
+            let store = &store;
+            async move {
+                store
+                    .grants_column_privilege(&u, t, ns, "ssn", p)
+                    .await
+                    .unwrap()
+            }
+        };
+        use crate::TablePrivilege::{Alter, ApplyTag};
+        // Catalog, schema and table grants each reach the column.
+        assert!(tag(user("cat_owner", &[]), "lake.sales", "orders", ApplyTag).await);
+        assert!(
+            tag(user("cat_owner", &[]), "lake.a.b", "t", ApplyTag).await,
+            "`lake.*` covers a nested namespace"
+        );
+        assert!(
+            tag(
+                user_with_groups("sue", &[], &["stewards"]),
+                "lake.sales",
+                "orders",
+                ApplyTag
+            )
+            .await
+        );
+        assert!(
+            !tag(
+                user_with_groups("sue", &[], &["stewards"]),
+                "lake.hr",
+                "orders",
+                ApplyTag
+            )
+            .await,
+            "a schema grant stays in its schema"
+        );
+        assert!(tag(user("tbl_owner", &[]), "lake.sales", "orders", ApplyTag).await);
+        assert!(!tag(user("tbl_owner", &[]), "lake.sales", "other", ApplyTag).await);
+        assert!(
+            !tag(user("cat_owner", &[]), "other.sales", "orders", ApplyTag).await,
+            "another catalog"
+        );
+        // Neither `all` nor `alter` nor a write type carries `apply_tag`, and
+        // `apply_tag` does not carry `alter`.
+        assert!(!tag(user("writer", &[]), "lake.sales", "orders", ApplyTag).await);
+        assert!(tag(user("writer", &[]), "lake.sales", "orders", Alter).await);
+        assert!(!tag(user("tbl_owner", &[]), "lake.sales", "orders", Alter).await);
+
+        // The tag guard: a deny for `public` beats every grant; only its
+        // exception keeps a grant (svc has none here, so a grant is added).
+        let mut guarded = apply_tag_bundle(true);
+        let extra: ServicePolicies = serde_json::from_str(
+            r#"{"policies":[{"id":6,"name":"svc","policyType":0,"isEnabled":true,
+              "resources":{"database":{"values":["lake.*"]},"table":{"values":["*"]},"column":{"values":["*"]}},
+              "policyItems":[{"users":["svc"],"accesses":[{"type":"apply_tag","isAllowed":true}]}]}]}"#,
+        )
+        .unwrap();
+        guarded.policies.extend(extra.policies);
+        let store = can(guarded).await;
+        let tag = |u: SessionUser| {
+            let store = &store;
+            async move {
+                store
+                    .grants_column_privilege(&u, "orders", "lake.sales", "ssn", ApplyTag)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert!(!tag(user("cat_owner", &[])).await, "deny wins");
+        assert!(!tag(user("tbl_owner", &[])).await, "deny wins");
+        assert!(tag(user("svc", &[])).await, "the deny exception");
+    }
+
+    #[test]
+    fn a_deny_on_all_denies_apply_tag() {
+        let u = user("steward", &[]);
+        let b = column_bundle(&[
+            (
+                r#"{"values":["*"]}"#,
+                r#""policyItems":[{"users":["steward"],"accesses":[{"type":"apply_tag","isAllowed":true}]}]"#,
+            ),
+            (
+                r#"{"values":["ssn"]}"#,
+                r#""denyPolicyItems":[{"users":["steward"],"accesses":[{"type":"all","isAllowed":true}]}]"#,
+            ),
+        ]);
+        let can =
+            |c| access_grants_column_type(&b, &u, "lake.sales", "orders", c, "apply_tag", true);
+        assert!(!can("ssn"), "a deny item's `all` narrows apply_tag too");
+        assert!(can("email"));
+        // An allow exception's `all` carves the user out as well.
+        let b = column_bundle(&[(
+            r#"{"values":["*"]}"#,
+            r#""policyItems":[{"users":["steward"],"accesses":[{"type":"apply_tag","isAllowed":true}]}],
+               "allowExceptions":[{"users":["steward"],"accesses":[{"type":"all","isAllowed":true}]}]"#,
+        )]);
+        assert!(!access_grants_column_type(
+            &b,
+            &u,
+            "lake.sales",
+            "orders",
+            "ssn",
+            "apply_tag",
+            true
+        ));
     }
 
     /// DDL authority comes from the same access policies as `select`, asked

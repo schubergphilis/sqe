@@ -46,6 +46,7 @@ mod admission_queue;
 mod catalog;
 mod ddl;
 mod show;
+mod tag_authority;
 mod time_travel;
 use time_travel::TimeTravelCleanup;
 mod write;
@@ -275,44 +276,6 @@ fn is_sorted_write(kind: &StatementKind) -> bool {
         StatementKind::Insert(stmt) => match stmt.as_ref() {
             Statement::Insert(ins) => ins.source.as_ref().is_some_and(|q| q.order_by.is_some()),
             _ => false,
-        },
-        _ => false,
-    }
-}
-
-/// Table properties that are policy state rather than table configuration.
-/// `sqe.column-tags` is what SET/UNSET TAGS writes and it drives tag masks.
-/// Other `sqe.` keys stay owner-settable: `sqe.maintenance.*` is how a table
-/// owner opts into and tunes autonomous compaction.
-const POLICY_TABLE_PROPERTIES: &[&str] = &[crate::tag_source_impl::PROP_KEY];
-
-/// True when an `ALTER TABLE ... SET TBLPROPERTIES` writes a policy property
-/// (matched case-insensitively), which needs the same admin gate as SET/UNSET
-/// TAGS. So does a `CREATE OR REPLACE TABLE` naming one: an in-place replace
-/// sets the statement's properties on the live table, whose older snapshots
-/// still hold the data those tags mask (#894).
-fn sets_reserved_table_property(stmt: &Statement) -> bool {
-    let names_policy_property = |options: &[sqlparser::ast::SqlOption]| {
-        options.iter().any(|p| match p {
-            sqlparser::ast::SqlOption::KeyValue { key, .. } => POLICY_TABLE_PROPERTIES
-                .iter()
-                .any(|reserved| key.value.eq_ignore_ascii_case(reserved)),
-            _ => false,
-        })
-    };
-    match stmt {
-        Statement::AlterTable(at) => at.operations.iter().any(|op| match op {
-            sqlparser::ast::AlterTableOperation::SetTblProperties { table_properties } => {
-                names_policy_property(table_properties)
-            }
-            _ => false,
-        }),
-        Statement::CreateTable(ct) if ct.or_replace => match &ct.table_options {
-            sqlparser::ast::CreateTableOptions::With(o)
-            | sqlparser::ast::CreateTableOptions::Options(o)
-            | sqlparser::ast::CreateTableOptions::Plain(o)
-            | sqlparser::ast::CreateTableOptions::TableProperties(o) => names_policy_property(o),
-            sqlparser::ast::CreateTableOptions::None => false,
         },
         _ => false,
     }
@@ -1920,12 +1883,12 @@ impl QueryHandler {
         // Extra writers are rejected (ResourceExhausted), not queued.
         let _sorted_write_permit = self.try_acquire_sorted_write(&kind).map_err(failed)?;
 
-        // A SET TBLPROPERTIES that writes policy state (`sqe.column-tags`) is
-        // policy DDL, gated like SET/UNSET TAGS. It runs before the catalog
-        // preflight so a non-admin is refused on the privilege, whatever the
-        // catalog qualifier, and learns nothing about which catalogs exist.
-        if kind.statement().is_some_and(sets_reserved_table_property) {
-            self.require_admin(session, "setting a policy table property")
+        // A SET TBLPROPERTIES / CREATE ... TBLPROPERTIES that writes policy
+        // state (`sqe.column-tags`) is policy DDL, gated like SET/UNSET TAGS
+        // (`tag_authority`). The static part runs before the catalog preflight
+        // so a refused caller learns nothing about which catalogs exist.
+        if let Some(stmt) = kind.statement() {
+            self.gate_tag_property_statically(session, stmt)
                 .map_err(failed)?;
         }
 
@@ -1940,6 +1903,14 @@ impl QueryHandler {
             self.preflight_resolve_catalogs(stmt, session)
                 .await
                 .map_err(failed)?;
+            // Under `ranger-delegate`, the columns a CREATE [OR REPLACE] TABLE
+            // tags need the tag privilege. ALTER is checked in its arm, which
+            // hands the columns on to the write's locked re-check.
+            if matches!(stmt, Statement::CreateTable(_)) {
+                self.authorise_tag_property(session, stmt)
+                    .await
+                    .map_err(failed)?;
+            }
         }
 
         // Review 806: the write branches below (CTAS, INSERT ... SELECT,
@@ -2378,9 +2349,13 @@ impl QueryHandler {
                     Ok(vec![])
                 }
                 StatementKind::AlterTableProps(stmt) => {
-                    // Policy-property writes were admin-gated before the
-                    // catalog preflight (`sets_reserved_table_property`).
-                    self.catalog_ops.set_table_properties(session, stmt).await?;
+                    // A `sqe.column-tags` write: statically gated in preflight;
+                    // under `ranger-delegate` the changed columns are checked
+                    // here and again inside the write's table lock.
+                    let authorised = self.authorise_tag_property(session, stmt).await?;
+                    self.catalog_ops
+                        .set_table_properties_guarded(session, stmt, authorised.as_ref())
+                        .await?;
                     crate::session_context::invalidate_session_cache(&session.user.username).await;
                     // Flush cached tag policies so a SET TBLPROPERTIES on sqe.column-tags
                     // takes effect on the next query rather than after the cache TTL.

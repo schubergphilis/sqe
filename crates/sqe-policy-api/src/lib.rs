@@ -197,25 +197,31 @@ pub struct MaskPolicyInfo {
     pub grantees: String,
 }
 
-/// A table-level DDL privilege, for statements that change or remove a table
-/// definition rather than read its rows. Only tables whose definition SQE
-/// owns (Hive-root tables) ask for one; an Iceberg table's DDL is decided by
-/// its catalog under the caller's own bearer.
+/// A table- or column-level privilege that is not a read, for statements that
+/// change or remove a table definition or its column tags. Only tables whose
+/// definition SQE owns (Hive-root tables) ask for `Alter` / `Drop` as DDL; an
+/// Iceberg table's DDL is decided by its catalog under the caller's own
+/// bearer. `Alter` or `ApplyTag` also gate column-tag writes under
+/// `[access_control] tag_authority = "ranger-delegate"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TablePrivilege {
     /// Change the definition in place (Ranger `alter`).
     Alter,
     /// Remove or replace the definition (Ranger `drop`).
     Drop,
+    /// Change a column's tags (Ranger `apply_tag`, a custom access type added
+    /// to the `hive` servicedef). Not implied by `alter`, by any write type,
+    /// or by an allow item's `all`.
+    ApplyTag,
 }
 
 impl TablePrivilege {
-    /// The `hive` servicedef access type that carries this privilege. `all`
-    /// carries every one of them.
+    /// The `hive` servicedef access type that carries this privilege.
     pub fn access_type(self) -> &'static str {
         match self {
             Self::Alter => "alter",
             Self::Drop => "drop",
+            Self::ApplyTag => "apply_tag",
         }
     }
 }

@@ -24,6 +24,7 @@ use crate::ident::{
     catalog_qualifier, fold_unquoted_ident, parse_table_ref, resolve_table_ident,
     schema_catalog_qualifier,
 };
+use crate::tag_source_impl::{changed_tag_columns, parse_column_tags, PROP_KEY as TAG_PROP_KEY};
 use crate::write_handler::trino_props::TrinoTableOptions;
 use crate::write_handler::{
     arrow_column_to_iceberg_type, configured_write_target,
@@ -69,6 +70,9 @@ pub struct CatalogOps {
     /// the session. The embedded CLI holds its catalogs itself.
     fixed_catalog: Option<Arc<SessionCatalog>>,
 }
+
+/// A table's live `sqe.column-tags`, or why it does not parse as a tag map.
+pub type LiveTagMap = Result<HashMap<String, Vec<String>>, serde_json::Error>;
 
 impl CatalogOps {
     pub fn new(config: SqeConfig) -> Self {
@@ -1576,6 +1580,26 @@ impl CatalogOps {
         session: &Session,
         stmt: &Statement,
     ) -> sqe_core::Result<()> {
+        self.set_table_properties_guarded(session, stmt, None).await
+    }
+
+    /// [`Self::set_table_properties`] for a caller that authorised a write of
+    /// `sqe.column-tags` for a set of columns only (`tag_authority =
+    /// "ranger-delegate"`, #917). With `authorised_tag_columns`, a statement
+    /// that sets the key re-reads the live map under the per-table lock that
+    /// `set_column_tags` holds, recomputes the changed columns, and refuses the
+    /// write unless they are all in the authorised set. That closes the window
+    /// between the caller's check and the commit: a concurrent tag write that
+    /// changed the map in between fails this statement instead of being
+    /// overwritten unauthorised. A live or new value that is not a tag map is
+    /// refused too.
+    #[instrument(skip_all, fields(username = %session.user.username))]
+    pub async fn set_table_properties_guarded(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+        authorised_tag_columns: Option<&std::collections::BTreeSet<String>>,
+    ) -> sqe_core::Result<()> {
         let (table_name, operations) = match stmt {
             Statement::AlterTable(at) => (&at.name, &at.operations),
             other => {
@@ -1639,6 +1663,42 @@ impl CatalogOps {
             )
             .await?;
 
+        // Held across the re-check and the commit; `set_column_tags` takes the
+        // same lock for its read-merge-commit.
+        let tag_lock = match (authorised_tag_columns, updates.get(TAG_PROP_KEY)) {
+            (Some(authorised), Some(raw)) => {
+                let table_lock = self.table_lock_for(&table_ident);
+                let guard = table_lock.lock_owned().await;
+                let table = session_catalog.load_table(&table_ident).await?;
+                let live = parse_column_tags(table.metadata().properties()).map_err(|e| {
+                    SqeError::Catalog(format!(
+                        "403 Forbidden: {TAG_PROP_KEY} on '{table_ident}' is not a tag map ({e}); \
+                         only an admin can overwrite it"
+                    ))
+                })?;
+                let wanted =
+                    serde_json::from_str::<HashMap<String, Vec<String>>>(raw).map_err(|e| {
+                        SqeError::Catalog(format!(
+                            "403 Forbidden: {TAG_PROP_KEY} must be a JSON object of column to \
+                             tag list ({e})"
+                        ))
+                    })?;
+                let unauthorised: Vec<String> = changed_tag_columns(&live, &wanted)
+                    .into_iter()
+                    .filter(|c| !authorised.contains(c))
+                    .collect();
+                if !unauthorised.is_empty() {
+                    return Err(SqeError::Catalog(format!(
+                        "403 Forbidden: the tags of '{table_ident}' changed while the statement \
+                         was checked; it would also change column(s) {} - retry",
+                        unauthorised.join(", ")
+                    )));
+                }
+                Some(guard)
+            }
+            _ => None,
+        };
+
         let mut table_updates = Vec::new();
         let mut requirements = vec![];
         if let Some(version) = requested_version {
@@ -1687,6 +1747,7 @@ impl CatalogOps {
         session_catalog
             .commit_schema_update(&table_ident, table_updates, requirements)
             .await?;
+        drop(tag_lock);
 
         // No metadata-cache eviction here: `commit_schema_update` now evicts
         // every token's entry itself, so the rule that a commit is visible to
@@ -2019,6 +2080,28 @@ impl CatalogOps {
                 )
             })?;
         Ok((table_ident, tags))
+    }
+
+    /// The live `sqe.column-tags` of `table` for a tag-authority check (#917):
+    /// `None` when the table does not exist (a `CREATE OR REPLACE` that will
+    /// create it), the inner `Err` when the live value is not a tag map. Any
+    /// other load error is returned as is.
+    #[instrument(skip(self, session, table), fields(username = %session.user.username))]
+    pub async fn live_column_tags(
+        &self,
+        session: &Session,
+        table: &ObjectName,
+    ) -> sqe_core::Result<Option<LiveTagMap>> {
+        let table_ident = resolve_table_ident(table, session)?;
+        let target = resolve_target_catalog(catalog_qualifier(table), session);
+        let session_catalog = self.session_catalog_for(session, target.as_deref()).await?;
+        // Existence first, as the CREATE OR REPLACE write decides it: not every
+        // catalog reports a missing table as a not-found error.
+        if !session_catalog.table_exists(&table_ident).await? {
+            return Ok(None);
+        }
+        let table = session_catalog.load_table(&table_ident).await?;
+        Ok(Some(parse_column_tags(table.metadata().properties())))
     }
 
     /// Project existing Iceberg `sqe.column-tags` into Ranger for tables

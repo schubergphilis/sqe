@@ -323,7 +323,7 @@ tag_authority = "ranger-delegate"
 ```
 
 SQE then allows the statement when the Ranger `hive` access policies give the user
-`alter` on every column it names. The check is made per column, so a statement
+`alter` on every column it names (or `apply_tag`, see below). The check is made per column, so a statement
 that touches one column the user may not alter is refused as a whole and writes
 nothing. Deny items win over allow items, and wildcard and exclude resources work as
 they do for reads. A refusal starts with `403 Forbidden` and is recorded in the
@@ -341,10 +341,71 @@ the right to unmask. The quickstart's wildcard policy gives `public` `alter` on 
 column; with that policy in place every user passes this check. Add deny items for
 the columns a user must not touch, or narrow the policy first.
 
-Some paths stay admin-only under either setting: writing `sqe.column-tags` through
-`SET TBLPROPERTIES` and `CALL system.reproject_column_tags`. Backends with no
-column privilege model, such as Polaris grants and passthrough, also stay
+The same check covers every other statement that writes the `sqe.column-tags`
+table property. `ALTER TABLE ... SET TBLPROPERTIES` replaces the whole map, so SQE
+compares it with the live one and checks each column whose tags it adds, changes or
+removes; a column whose tags stay the same needs nothing. `CREATE TABLE ...
+TBLPROPERTIES` is checked on every column it tags, and `CREATE OR REPLACE` on the
+columns that differ from the table it replaces. Trino's `extra_properties` spelling
+is checked the same way. A value that is not a JSON object of column to tag list,
+or a key spelled `sqe.column-tags` in another case, is refused for everyone but an
+admin, and so is overwriting a live value that does not parse. SQE's parser has no
+`UNSET TBLPROPERTIES`, so there is no unset route to the tags.
+
+```sql
+-- as dave, allowed on ssn only: removes ssn's tags, leaves email's alone
+ALTER TABLE sales_wh.acdemo.orders
+  SET TBLPROPERTIES ('sqe.column-tags' = '{"email":["PII"]}');
+```
+
+Under the default `admin-role` all of these need an admin role, except a plain
+`CREATE TABLE`, which names a table nobody reads yet. `CALL
+system.reproject_column_tags` stays admin-only under either setting. Backends with
+no column privilege model, such as Polaris grants and passthrough, also stay
 admin-only, because there is nothing to ask.
+
+#### Tagging as a grant of its own
+
+Tying tagging to `alter` hands it to everyone who may change a column's definition.
+To make it a separate right, as `APPLY TAG` is in Databricks:
+
+```toml
+[access_control]
+tag_authority = "ranger-delegate"
+tag_privilege = "apply_tag"
+```
+
+SQE then asks for the Ranger access type `apply_tag` on the column instead of
+`alter`. Nothing implies it: not `alter`, not write, and not an allow item for
+`all`. A deny item still wins, including a deny for `all`. So a writer with no
+`apply_tag` grant is refused, and a steward granted only `apply_tag` may tag but
+not write rows:
+
+```json
+{
+  "service": "query", "name": "dave-tags-ssn",
+  "resources": {
+    "database": {"values": ["acdemo"]},
+    "table": {"values": ["orders"]},
+    "column": {"values": ["ssn"]}
+  },
+  "policyItems": [{"users": ["dave"],
+                   "accesses": [{"type": "apply_tag", "isAllowed": true}]}]
+}
+```
+
+The stock `hive` service definition has no `apply_tag`, and Ranger refuses a policy
+that names a type its definition lacks. Add it once, with no implied grants; the
+quickstart's `bootstrap-ranger.sh` does this:
+
+```json
+{"itemId": <next free id>, "name": "apply_tag", "label": "Apply tag", "impliedGrants": []}
+```
+
+appended to `accessTypes` of the definition from
+`GET /service/public/v2/api/servicedef/name/hive`, then written back with
+`PUT /service/public/v2/api/servicedef/{id}`. Other `hive` clients ignore an
+access type they do not ask for.
 
 ## 1.8 Introspection
 

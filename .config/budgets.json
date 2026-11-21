@@ -11,17 +11,17 @@
     "crates/sqe-coordinator/src/maintenance.rs": 5750,
     "crates/sqe-coordinator/src/maintenance_scheduler.rs": 4000,
     "crates/sqe-coordinator/src/query_handler.rs": 10350,
-    "crates/sqe-core/src/config/mod.rs": 10000,
+    "crates/sqe-core/src/config/mod.rs": 10100,
     "crates/sqe-mcp/src/lib.rs": 5750,
     "crates/sqe-policy/src/grants/ranger.rs": 4250,
-    "crates/sqe-policy/src/ranger_store.rs": 4750,
+    "crates/sqe-policy/src/ranger_store.rs": 4900,
     "crates/sqe-server/src/main.rs": 5250,
     "crates/sqe-sql/src/classifier.rs": 4250,
     "crates/sqe-sql/src/trino_compat.rs": 3500,
     "crates/sqe-trino-compat/src/server.rs": 7000,
     "crates/sqe-worker/src/executor.rs": 3750,
     "crates/sqe-worker/src/flight_service.rs": 3500,
-    "crates/sqe-write/src/catalog_ops.rs": 3750,
+    "crates/sqe-write/src/catalog_ops.rs": 3850,
     "crates/sqe-write/src/write_handler.rs": 16500
   },
   "crates": {
@@ -68,7 +68,7 @@
       ]
     },
     "sqe-coordinator": {
-      "lines": 70000,
+      "lines": 70600,
       "deps": [
         "sqe-auth",
         "sqe-catalog",

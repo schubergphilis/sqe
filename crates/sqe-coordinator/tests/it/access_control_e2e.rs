@@ -5325,6 +5325,14 @@ async fn tag_authority_grant_dave_in_polaris(ctx: &AcCtx) {
 }
 
 async fn tag_authority_rig(ctx: &AcCtx, audited: bool) -> TagAuthorityRig {
+    tag_authority_rig_with(ctx, audited, sqe_core::config::TagPrivilege::Alter).await
+}
+
+async fn tag_authority_rig_with(
+    ctx: &AcCtx,
+    audited: bool,
+    privilege: sqe_core::config::TagPrivilege,
+) -> TagAuthorityRig {
     tag_authority_grant_dave_in_polaris(ctx).await;
     ctx.ranger
         .create_policy(tag_mask_policy(
@@ -5351,7 +5359,10 @@ async fn tag_authority_rig(ctx: &AcCtx, audited: bool) -> TagAuthorityRig {
     let (handler, _cache) = crate::common::setup_ranger_handler_audited(
         Some(ctx.cache.clone()),
         audit.as_ref().map(|(l, _)| l.clone()),
-        |c| c.access_control.tag_authority = sqe_core::config::TagAuthority::RangerDelegate,
+        |c| {
+            c.access_control.tag_authority = sqe_core::config::TagAuthority::RangerDelegate;
+            c.access_control.tag_privilege = privilege;
+        },
     )
     .await;
     TagAuthorityRig {
@@ -5601,6 +5612,159 @@ async fn tag_authority_bare_name_is_checked_against_the_session_namespace() {
     bob_sees(&ctx, "ssn", &SSN_RAW).await;
 
     tag_authority_cleanup(&ctx, &rig, &[&deny]).await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #917: tagging under its own grant (`tag_privilege = "apply_tag"`)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The fixture's `public` item grants dave `alter` (and write) on every column
+// but not `apply_tag`, which the quickstart bootstrap adds to the `hive`
+// servicedef with no implied grants. So under `apply_tag` dave starts out
+// refused, and an allow item naming `apply_tag` on one column is what lets him
+// tag it, on SET TAGS and on a raw SET TBLPROPERTIES alike. Polaris gives him
+// no data-write right, so the same grant does not let him INSERT.
+
+/// A `hive` access policy with one allow item (`apply_tag`) for user dave.
+fn apply_tag_allow_policy(name: &str, column: &str) -> serde_json::Value {
+    serde_json::json!({
+        "service": HIVE_SERVICE,
+        "name": name,
+        "policyType": 0,
+        "isEnabled": true,
+        "resources": {
+            "database": {"values": ["ac"]},
+            "table": {"values": ["orders"]},
+            "column": {"values": [column]}
+        },
+        "policyItems": [{
+            "users": ["dave"],
+            "accesses": [{"type": "apply_tag", "isAllowed": true}]
+        }]
+    })
+}
+
+/// The audit records the rig's logger wrote for `sql`.
+fn audit_records_for(
+    audit: &(
+        std::sync::Arc<sqe_metrics::audit::AuditLogger>,
+        std::path::PathBuf,
+    ),
+    sql: &str,
+) -> Vec<serde_json::Value> {
+    audit.0.flush();
+    std::fs::read_to_string(&audit.1)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("audit line is JSON"))
+        .filter(|r| r["query"]["text"] == sql)
+        .collect()
+}
+
+/// `alter` and write without `apply_tag` are refused (and audited) on both
+/// routes; an `apply_tag` grant on ssn lets dave tag and untag ssn through SET
+/// TAGS and SET TBLPROPERTIES, but not email, and not INSERT.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn tag_authority_apply_tag_is_a_grant_of_its_own() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+    let rig = tag_authority_rig_with(&ctx, true, sqe_core::config::TagPrivilege::ApplyTag).await;
+    let audit = rig.audit.clone().expect("audited rig");
+
+    let set = format!("ALTER TABLE {ORDERS} SET TAGS (ssn = ('PII'))");
+    let props =
+        |map: &str| format!("ALTER TABLE {ORDERS} SET TBLPROPERTIES ('sqe.column-tags' = '{map}')");
+    let set_raw = props(r#"{"ssn":["PII"]}"#);
+
+    // alter + write via `public`, no apply_tag: refused on both routes, audited.
+    for sql in [&set, &set_raw] {
+        // `eventually`: until Polaris polls dave's table rights, the raw
+        // route's read of the live tag map is refused by Polaris instead.
+        crate::common::eventually(&format!("{sql} refused for apply_tag"), || async {
+            match rig.handler.execute(&ctx.dave, sql, None).await {
+                Ok(_) => panic!("alter without apply_tag must be refused: {sql}"),
+                Err(e)
+                    if e.to_string()
+                        .contains("requires apply_tag on ac.orders.ssn") =>
+                {
+                    assert!(e.to_string().contains("403 Forbidden"), "{sql}: {e}");
+                    Ok(())
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        })
+        .await;
+        let recs = audit_records_for(&audit, sql);
+        // The last attempt is the apply_tag refusal.
+        let rec = recs
+            .last()
+            .unwrap_or_else(|| panic!("no audit record for {sql}"));
+        assert_eq!(rec["status"], "failure", "{rec}");
+        assert_eq!(rec["error_code"], "ACCESS_DENIED", "{rec}");
+    }
+    bob_sees(&ctx, "ssn", &SSN_RAW).await;
+
+    let allow = format!("{PREFIX}apply-tag-dave-ssn");
+    ctx.ranger
+        .create_policy(apply_tag_allow_policy(&allow, "ssn"))
+        .await
+        .expect("create apply_tag on ssn (the bootstrap adds apply_tag to the hive servicedef)");
+
+    // SET TAGS with apply_tag on ssn.
+    crate::common::eventually("dave to tag ssn under apply_tag", || async {
+        rig.handler
+            .execute(&ctx.dave, &set, None)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    bob_sees(&ctx, "ssn", &SSN_MASKED).await;
+
+    // The raw property: untagging ssn changes ssn only, so it passes...
+    rig.handler
+        .execute(&ctx.dave, &props("{}"), None)
+        .await
+        .expect("untagging ssn needs apply_tag on ssn only");
+    bob_sees(&ctx, "ssn", &SSN_RAW).await;
+    // ...and tagging email too is refused, naming email, writing nothing.
+    let both = props(r#"{"ssn":["PII"],"email":["PII"]}"#);
+    let err = rig
+        .handler
+        .execute(&ctx.dave, &both, None)
+        .await
+        .expect_err("no apply_tag on email")
+        .to_string();
+    assert!(
+        err.contains("requires apply_tag on ac.orders.email"),
+        "{err}"
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    bob_sees(&ctx, "ssn", &SSN_RAW).await;
+    bob_sees(&ctx, "email", &EMAIL_RAW).await;
+
+    // Tagging is not writing: apply_tag does not let dave INSERT.
+    let insert = format!(
+        "INSERT INTO {ORDERS} VALUES (99, 'x', 0.0, '000-00-0000', 'z@x', DATE '2020-01-01')"
+    );
+    if rig.handler.execute(&ctx.dave, &insert, None).await.is_ok() {
+        let _ = ctx
+            .handler
+            .execute(
+                &ctx.carol,
+                &format!("DELETE FROM {ORDERS} WHERE id = 99"),
+                None,
+            )
+            .await;
+        panic!("apply_tag must grant no data write");
+    }
+
+    let _ = ctx.ranger.delete_policy(HIVE_SERVICE, &allow).await;
+    tag_authority_cleanup(&ctx, &rig, &[]).await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
