@@ -24,7 +24,9 @@ use crate::ident::{
     catalog_qualifier, fold_unquoted_ident, parse_table_ref, resolve_table_ident,
     schema_catalog_qualifier,
 };
-use crate::tag_source_impl::{changed_tag_columns, parse_column_tags, PROP_KEY as TAG_PROP_KEY};
+use crate::tag_source_impl::{
+    changed_tag_columns, parse_column_tag_entries, PROP_KEY as TAG_PROP_KEY,
+};
 use crate::write_handler::trino_props::TrinoTableOptions;
 use crate::write_handler::{
     arrow_column_to_iceberg_type, configured_write_target,
@@ -32,6 +34,7 @@ use crate::write_handler::{
     geospatial_iceberg_type, parse_partition_transform_sql, requested_format_version,
     resolve_target_catalog, sql_type_to_arrow, sql_type_to_arrow_for, CatalogDiscovery,
 };
+use sqe_core::column_tags::ColumnTagMap;
 
 /// `format-version` (Iceberg) or `format_version` (Trino).
 fn is_format_version_key(key: &str) -> bool {
@@ -72,7 +75,7 @@ pub struct CatalogOps {
 }
 
 /// A table's live `sqe.column-tags`, or why it does not parse as a tag map.
-pub type LiveTagMap = Result<HashMap<String, Vec<String>>, serde_json::Error>;
+pub type LiveTagMap = Result<ColumnTagMap, serde_json::Error>;
 
 impl CatalogOps {
     pub fn new(config: SqeConfig) -> Self {
@@ -147,12 +150,13 @@ impl CatalogOps {
         &self,
         catalog: &str,
         ident: &TableIdent,
-        previous: &HashMap<String, Vec<String>>,
-        tags: &HashMap<String, Vec<String>>,
+        previous: &ColumnTagMap,
+        tags: &ColumnTagMap,
     ) -> sqe_core::Result<()> {
         use sqe_policy::tag_projector::{project_table_tags, ColumnTags};
-        let to_map = |m: &HashMap<String, Vec<String>>| -> ColumnTags {
-            m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        // Ranger's tag store gets the keys only; tag values stay in Iceberg.
+        let to_map = |m: &ColumnTagMap| -> ColumnTags {
+            sqe_core::column_tags::keys(m).into_iter().collect()
         };
         let (ns, name) = (ident.namespace().as_ref(), ident.name());
         let (scoped, prev, tags) = (self.catalog_scoped(), to_map(previous), to_map(tags));
@@ -1261,17 +1265,16 @@ impl CatalogOps {
         //
         // `rewrite_tag_keys` returns None when nothing changed, so a plain ALTER on
         // an untagged table adds no property write.
-        let current_tags = crate::tag_source_impl::parse_column_tags(metadata.properties())
-            .map_err(|e| {
-                SqeError::with_code(
-                    SqeErrorCode::ExecutionFailed,
-                    format!("malformed sqe.column-tags JSON on table '{table_ident}': {e}"),
-                )
-            })?;
+        let current_tags = parse_column_tag_entries(metadata.properties()).map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("malformed sqe.column-tags JSON on table '{table_ident}': {e}"),
+            )
+        })?;
         let rewritten_tags =
             crate::tag_source_impl::rewrite_tag_keys(&current_tags, &tag_key_changes);
         if let Some(ref new_tags) = rewritten_tags {
-            let json = serde_json::to_string(new_tags).map_err(|e| {
+            let json = sqe_core::column_tags::to_json(new_tags).map_err(|e| {
                 SqeError::with_code(
                     SqeErrorCode::ExecutionFailed,
                     format!("failed to serialize column tags: {e}"),
@@ -1670,19 +1673,19 @@ impl CatalogOps {
                 let table_lock = self.table_lock_for(&table_ident);
                 let guard = table_lock.lock_owned().await;
                 let table = session_catalog.load_table(&table_ident).await?;
-                let live = parse_column_tags(table.metadata().properties()).map_err(|e| {
-                    SqeError::Catalog(format!(
+                let live =
+                    parse_column_tag_entries(table.metadata().properties()).map_err(|e| {
+                        SqeError::Catalog(format!(
                         "403 Forbidden: {TAG_PROP_KEY} on '{table_ident}' is not a tag map ({e}); \
                          only an admin can overwrite it"
                     ))
-                })?;
-                let wanted =
-                    serde_json::from_str::<HashMap<String, Vec<String>>>(raw).map_err(|e| {
-                        SqeError::Catalog(format!(
-                            "403 Forbidden: {TAG_PROP_KEY} must be a JSON object of column to \
-                             tag list ({e})"
-                        ))
                     })?;
+                let wanted = sqe_core::column_tags::parse(raw).map_err(|e| {
+                    SqeError::Catalog(format!(
+                        "403 Forbidden: {TAG_PROP_KEY} must be a JSON object of column to \
+                         tag list ({e})"
+                    ))
+                })?;
                 let unauthorised: Vec<String> = changed_tag_columns(&live, &wanted)
                     .into_iter()
                     .filter(|c| !authorised.contains(c))
@@ -1937,19 +1940,18 @@ impl CatalogOps {
         let _guard = table_lock.lock().await;
 
         let table = session_catalog.load_table(&table_ident).await?;
-        let current = crate::tag_source_impl::parse_column_tags(table.metadata().properties())
-            .map_err(|e| {
-                SqeError::with_code(
-                    SqeErrorCode::ExecutionFailed,
-                    format!(
-                        "malformed sqe.column-tags JSON on table '{table_ident}': {e}; \
+        let current = parse_column_tag_entries(table.metadata().properties()).map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!(
+                    "malformed sqe.column-tags JSON on table '{table_ident}': {e}; \
                      refusing to apply SET/UNSET TAGS so existing tags are not wiped"
-                    ),
-                )
-            })?;
+                ),
+            )
+        })?;
 
         let new_map = crate::tag_source_impl::apply_tag_ops(&current, &stmt.ops);
-        let json = serde_json::to_string(&new_map).map_err(|e| {
+        let json = sqe_core::column_tags::to_json(&new_map).map_err(|e| {
             SqeError::with_code(
                 SqeErrorCode::ExecutionFailed,
                 format!("failed to serialize column tags: {e}"),
@@ -1995,7 +1997,7 @@ impl CatalogOps {
                 // while Spark returns it raw, which is precisely the fail-open the
                 // projection exists to close, and it would be invisible because the
                 // statement reported success.
-                let previous = serde_json::to_string(&current).map_err(|e| {
+                let previous = sqe_core::column_tags::to_json(&current).map_err(|e| {
                     SqeError::with_code(
                         SqeErrorCode::ExecutionFailed,
                         format!(
@@ -2101,7 +2103,9 @@ impl CatalogOps {
             return Ok(None);
         }
         let table = session_catalog.load_table(&table_ident).await?;
-        Ok(Some(parse_column_tags(table.metadata().properties())))
+        Ok(Some(parse_column_tag_entries(
+            table.metadata().properties(),
+        )))
     }
 
     /// Project existing Iceberg `sqe.column-tags` into Ranger for tables

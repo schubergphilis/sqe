@@ -1,5 +1,6 @@
 pub mod catalog_scope;
 pub mod circuit_breaker;
+pub mod column_tags;
 pub mod config;
 pub mod error;
 pub mod json_columns;

@@ -16,6 +16,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use super::*;
 use crate::tag_source_impl::{changed_tag_columns, tag_property_write};
+use sqe_core::column_tags::ColumnTagMap;
 use sqe_core::config::{TagAuthority, TagPrivilege};
 use sqe_policy::TablePrivilege;
 
@@ -256,8 +257,8 @@ impl QueryHandler {
 }
 
 /// The tag map a raw property write sets, or why it is refused.
-fn parse_tag_value(value: Option<&str>) -> Result<HashMap<String, Vec<String>>, String> {
+fn parse_tag_value(value: Option<&str>) -> Result<ColumnTagMap, String> {
     let raw = value.ok_or_else(|| "names no sqe.column-tags value".to_string())?;
-    serde_json::from_str(raw)
+    sqe_core::column_tags::parse(raw)
         .map_err(|e| format!("sqe.column-tags must be a JSON object of column to tag list ({e})"))
 }

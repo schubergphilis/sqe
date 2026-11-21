@@ -812,6 +812,7 @@ impl QueryHandler {
                 ops: vec![ColumnTagOp {
                     column: op.column.clone(),
                     tags: vec![],
+                    values: Default::default(),
                     action: TagAction::Unset,
                 }],
             });
@@ -832,6 +833,7 @@ impl QueryHandler {
             ops: vec![ColumnTagOp {
                 column: op.column.clone(),
                 tags: vec![tag],
+                values: Default::default(),
                 action: TagAction::Set,
             }],
         })

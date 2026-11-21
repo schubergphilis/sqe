@@ -182,7 +182,7 @@ async fn resolve_governance(
     };
     let col_tags = match table.metadata().properties().get(COLUMN_TAGS_PROP) {
         None => HashMap::new(),
-        Some(raw) => match serde_json::from_str::<HashMap<String, Vec<String>>>(raw) {
+        Some(raw) => match sqe_core::column_tags::parse_keys(raw) {
             Ok(tags) => tags,
             Err(_) => {
                 return StatsGovernance {

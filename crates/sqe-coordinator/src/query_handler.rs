@@ -2392,6 +2392,7 @@ impl QueryHandler {
                         ops: vec![sqe_sql::tags::ColumnTagOp {
                             column: op.column.clone(),
                             tags: vec![],
+                            values: Default::default(),
                             action: sqe_sql::tags::TagAction::Unset,
                         }],
                     };
