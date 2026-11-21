@@ -122,11 +122,22 @@ fn merge_into(into: &mut Vec<ColumnTag>, tags: Vec<ColumnTag>) {
 }
 
 /// What a writer stores: the `sqe.column-tags` value and the matching
-/// `sqe.column-tag-ids` value (`None`: remove the property, no id to keep).
+/// `sqe.column-tag-ids` value (`None`: no id to keep).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recorded {
     pub tags: String,
     pub ids: Option<String>,
+}
+
+/// A `sqe.column-tag-ids` value without ids, bound to `tags_value`. A writer
+/// stores it over stale ids rather than remove the property: removing a
+/// table property is a catalog privilege a tag steward need not hold (#936).
+pub fn empty_ids(tags_value: &str) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&TagIds {
+        v: VERSION,
+        tags_sha256: digest(tags_value),
+        ids: BTreeMap::new(),
+    })
 }
 
 /// The property values for `applied` (current names) plus the `orphaned`
