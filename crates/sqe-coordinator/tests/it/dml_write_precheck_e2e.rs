@@ -290,6 +290,11 @@ async fn a_reader_is_refused_dml_before_any_file_is_written() {
                  WHEN MATCHED THEN UPDATE SET name = 'm'"
             ),
             format!("TRUNCATE TABLE {TABLE}"),
+            // In place, and with a new shape: both wrote data files before
+            // the commit refused them.
+            format!("CREATE OR REPLACE TABLE {TABLE} AS SELECT * FROM {TABLE}"),
+            format!("CREATE OR REPLACE TABLE {TABLE} AS SELECT id, name, 1 AS extra FROM {TABLE}"),
+            format!("CALL system.rewrite_data_files(table => '{TABLE}', rewrite_all => true)"),
         ] {
             let err = handler
                 .execute(session, &sql, None)
@@ -312,6 +317,18 @@ async fn a_reader_is_refused_dml_before_any_file_is_written() {
         "a refused statement writes no object, the probe leaves none"
     );
 
+    // The owner's replace and compaction go through as before.
+    for sql in [
+        format!("CREATE OR REPLACE TABLE {TABLE} AS SELECT * FROM {TABLE}"),
+        format!("CALL system.rewrite_data_files(table => '{TABLE}', rewrite_all => true)"),
+    ] {
+        handler
+            .execute(&root, &sql, None)
+            .await
+            .unwrap_or_else(|e| panic!("the owner runs {sql}: {e}"));
+    }
+    assert_eq!(ids(&handler, &root).await, vec!["1", "2"]);
+
     // The owner's DELETE goes through as before.
     handler
         .execute(&root, &format!("DELETE FROM {TABLE} WHERE id = 1"), None)
@@ -322,4 +339,58 @@ async fn a_reader_is_refused_dml_before_any_file_is_written() {
     let _ = handler
         .execute(&root, &format!("DROP TABLE IF EXISTS {TABLE}"), None)
         .await;
+}
+
+/// Creating a table is not the right to write data into it. A principal
+/// that may create and drop tables but not write data is refused a new-table
+/// CTAS before any data file is written, and the table it created is rolled
+/// back.
+///
+/// The engine runs on its static storage keys here. With vended credentials
+/// Polaris refuses the create itself (`CREATE_TABLE_DIRECT_WITH_WRITE_DELEGATION`
+/// needs write), so only the static-key engine reaches the data write.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn a_creator_without_write_is_refused_ctas_before_any_file_is_written() {
+    const CREATOR: &str = "dml_precheck_creator";
+    const NEW_TABLE: &str = "test_ns.dml_precheck_ctas";
+    crate::common::init_tracing();
+    let config =
+        SqeConfig::load(&crate::common::test_config_path()).expect("Failed to load test config");
+    let authenticator = sqe_auth::Authenticator::new(&config.auth)
+        .await
+        .expect("Failed to create authenticator");
+    let root = authenticator
+        .authenticate("root", "")
+        .await
+        .expect("Auth failed for root");
+    let handler = handler(config.clone());
+    let _ = handler
+        .execute(&root, &format!("DROP TABLE IF EXISTS {NEW_TABLE}"), None)
+        .await;
+
+    let creator = session_for(
+        CREATOR,
+        principal_token(
+            root.access_token().expose(),
+            CREATOR,
+            &["TABLE_CREATE", "TABLE_DROP"],
+        )
+        .await,
+    );
+    let sql = format!("CREATE TABLE {NEW_TABLE} AS SELECT 1 AS id, 'a' AS name");
+    let err = handler
+        .execute(&creator, &sql, None)
+        .await
+        .expect_err("the creator is refused the data write");
+    assert_eq!(err.error_code(), SqeErrorCode::AccessDenied, "{sql}: {err}");
+    assert!(err.to_string().contains("no write access"), "{sql}: {err}");
+
+    let exists = handler
+        .execute(&root, &format!("SELECT * FROM {NEW_TABLE}"), None)
+        .await;
+    assert!(
+        exists.is_err(),
+        "the refused CTAS rolls its create back, got {exists:?}"
+    );
 }

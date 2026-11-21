@@ -2376,6 +2376,12 @@ impl WriteHandler {
             None
         };
         if let Some(live) = &existing {
+            // A caller who may not write is refused here, before any file
+            // (#880). The probe asserts on the live table, not the evolved
+            // replacement.
+            session_catalog
+                .check_write_access(&table_ident, live)
+                .await?;
             self.refuse_replace_under_policy(
                 session,
                 target_catalog.clone(),
@@ -2516,6 +2522,12 @@ impl WriteHandler {
             WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "ctas-streaming")
                 .with_metrics(self.metrics.clone());
         let post_create: sqe_core::Result<(usize, Option<i64>)> = async {
+            // Creating a table is not the right to write data into it: a
+            // caller with create but no write is refused before any file,
+            // and the refusal rolls the create back (#880).
+            session_catalog
+                .check_write_access(&create_ident, &table)
+                .await?;
             let stream = self.execute_source_stream(df, "CTAS").await?;
             // Puffin NDV sketches ride along on the stream when the table
             // opted in; the buffered path clones batches instead, which the
