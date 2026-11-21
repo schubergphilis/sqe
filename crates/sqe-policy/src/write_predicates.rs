@@ -193,7 +193,12 @@ pub fn unparse_predicates(rewritten: &LogicalPlan) -> sqe_core::Result<WritePoli
             .into_iter()
             .reduce(|a, b| a.and(b))
             .expect("non-empty by branch");
-        let sql = expr_to_sql(&combined).map_err(|e| unrenderable("row filter".to_string(), e))?;
+        // Bare names, as for masks: MERGE evaluates the filter over a
+        // scratch relation under another name (`__sqe_merge_target_*`), where
+        // the probe table's qualifier does not resolve. DELETE and UPDATE
+        // alias their scratch to the table name, so bare names hold there too.
+        let sql = expr_to_sql(&unnormalize_col(combined))
+            .map_err(|e| unrenderable("row filter".to_string(), e))?;
         Some(sql.to_string())
     };
 
@@ -362,6 +367,10 @@ mod tests {
         let s = out.row_filter_sql.expect("row filter present");
         assert!(s.contains("region"), "row filter sql: {s}");
         assert!(s.contains("EU"), "row filter sql: {s}");
+        assert!(
+            !s.contains("employees."),
+            "MERGE reads the filter over a renamed scratch relation, so its columns are unqualified: {s}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

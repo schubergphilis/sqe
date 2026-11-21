@@ -5585,6 +5585,10 @@ impl WriteHandler {
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
         policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // An unaliased target or source is named by its table name in ON,
+        // WHEN and SET; both merge paths rename the sides through an alias.
+        let aliased = crate::merge_sql::alias_unaliased_tables(stmt);
+        let stmt = aliased.as_ref().unwrap_or(stmt);
         // Peek at the target table to read its properties.
         let merge_table = match stmt {
             Statement::Merge(merge) => &merge.table,
