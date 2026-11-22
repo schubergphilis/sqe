@@ -282,6 +282,9 @@ snapshot_interval_secs = 60     # How often file persistence snapshots sessions 
 # issuer = "https://orchestrator.example.com"
 # jwks_url = "https://orchestrator.example.com/.well-known/jwks.json"
 # header_name = "x-sqe-catalog-scope"   # also the Flight SQL metadata key
+# mode = "binding"   # binding: narrow to the scope's catalogs (default)
+#                    # union: require and verify the scope, do not narrow
+#                    # off: ignore the header; client_id/issuer/jwks_url not needed
 
 [query]
 timeout_secs = 300              # 5 min, max execution time per query

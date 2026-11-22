@@ -1289,6 +1289,17 @@ impl QueryHandler {
         if qualifiers.is_empty() {
             return Ok(());
         }
+        // A catalog the session's scope hides is refused here, before
+        // anything resolves or discovers it, so the audit record names the
+        // reason (#295) and the planner's "table not found" never stands in.
+        if let Some(refusal) = qualifiers.iter().find_map(|q| {
+            session
+                .check_catalog_read(q)
+                .err()
+                .filter(|e| sqe_core::catalog_scope::ScopeReason::of(e).is_some())
+        }) {
+            return Err(refusal);
+        }
 
         // First pass: build the "known" set from config + attached catalogs
         // WITHOUT contacting Polaris. This preserves static-mode behavior: an
@@ -4291,7 +4302,10 @@ impl QueryHandler {
         let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, sql)
             .instrument(plan_span)
             .await
-            .map_err(SqeError::planning)?;
+            .map_err(|e| {
+                crate::catalog_scope_gate::hidden_catalog_refusal(&ctx.state(), session, sql)
+                    .unwrap_or_else(|| SqeError::planning(e))
+            })?;
         // Pinned (time-travel / incremental) scans get their real table
         // identity back before the policy rewriter sees the plan (400).
         let plan = tt_cleanup.restore_identities(df.logical_plan().clone())?;

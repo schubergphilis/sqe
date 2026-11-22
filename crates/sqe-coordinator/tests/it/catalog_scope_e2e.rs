@@ -67,14 +67,21 @@ struct Issuer {
 
 impl Issuer {
     async fn start() -> Self {
+        Self::start_in(None).await
+    }
+
+    /// The gate installed with `mode = "<mode>"`, or without the key (the
+    /// default, `binding`) for `None`.
+    async fn start_in(mode: Option<&str>) -> Self {
         crate::common::init_tracing();
         let lock = GATE_LOCK.lock().await;
         let gate = GateGuard { _lock: lock };
 
         let jwks_url = serve_jwks().await;
+        let mode_line = mode.map_or(String::new(), |m| format!("\nmode = \"{m}\""));
         let config: CatalogScopeConfig = toml::from_str(&format!(
             "client_id = \"{SCOPED_CLIENT}\"\nissuer = \"{ISSUER}\"\njwks_url = \"{jwks_url}\"\n\
-             accept_invalid_certs = true"
+             accept_invalid_certs = true{mode_line}"
         ))
         .expect("scope config parses");
         // https is required: no `allow_insecure_jwks` here.
@@ -396,6 +403,157 @@ async fn acceptance_1_scoped_client_needs_a_valid_scope() {
     }
 }
 
+/// `[session.catalog_scope] mode` (#295): the scoped client's session with
+/// no scope, a bad scope and a valid one, in each mode. `binding` is the
+/// default and acceptance 1 above; this pins the default and the other two.
+#[tokio::test(flavor = "multi_thread")]
+async fn catalog_scope_modes_union_verifies_without_narrowing_and_off_ignores() {
+    use sqe_coordinator::catalog_scope_gate::{attach, header_name, mode};
+    use sqe_core::config::CatalogScopeMode;
+    let catalogs = json!({ "alpha": "read_only" });
+
+    // No `mode` key: binding, and a valid scope narrows.
+    {
+        let _issuer = Issuer::start().await;
+        assert_eq!(mode(), CatalogScopeMode::Binding);
+        let jti = fresh_jti("m-binding");
+        let session = bound(offline_session(), Some(SCOPED_CLIENT), &jti);
+        let scoped = attach(
+            session.clone(),
+            Some(&scope_for(&jti, catalogs.clone())),
+            None,
+        )
+        .await
+        .expect("a valid scope opens the session");
+        assert!(scoped.catalog_scope().is_some(), "binding attaches");
+        assert!(
+            session.effective_scope().is_err(),
+            "binding refuses an unscoped session at context build"
+        );
+    }
+
+    // union: a scope is still required and verified, and refusals are
+    // audited, but the session is not narrowed.
+    {
+        let issuer = Issuer::start_in(Some("union")).await;
+        assert_eq!(mode(), CatalogScopeMode::Union);
+        assert!(header_name().is_some());
+        let jti = fresh_jti("m-union");
+        let session = bound(offline_session(), Some(SCOPED_CLIENT), &jti);
+        let err = attach(session.clone(), None, None)
+            .await
+            .expect_err("union still requires a scope");
+        assert!(
+            err.to_string().contains("catalog scope is required"),
+            "{err}"
+        );
+        attach(session.clone(), Some("not-a-jws"), None)
+            .await
+            .expect_err("union still verifies the scope");
+        let other_jti = scope_for("some-other-jti", catalogs.clone());
+        attach(session.clone(), Some(&other_jti), None)
+            .await
+            .expect_err("union still binds the scope to the token");
+        assert_eq!(issuer.refusals().len(), 3, "{:?}", issuer.refusals());
+
+        let opened = attach(
+            session.clone(),
+            Some(&scope_for(&jti, catalogs.clone())),
+            None,
+        )
+        .await
+        .expect("a valid scope opens the session");
+        assert!(opened.catalog_scope().is_none(), "union attaches nothing");
+        assert!(
+            opened.effective_scope().expect("no refusal").is_none(),
+            "every catalog the person can see"
+        );
+    }
+
+    // off: no gate; the header is ignored, the client is like any other.
+    {
+        let _lock = GateGuard {
+            _lock: GATE_LOCK.lock().await,
+        };
+        let config: CatalogScopeConfig =
+            toml::from_str("mode = \"off\"").expect("off needs no issuer");
+        sqe_coordinator::catalog_scope_gate::install(Some(&config), None).expect("off installs");
+        assert_eq!(mode(), CatalogScopeMode::Off);
+        assert!(header_name().is_none());
+        let jti = fresh_jti("m-off");
+        let session = bound(offline_session(), Some(SCOPED_CLIENT), &jti);
+        let passed = attach(session.clone(), None, None)
+            .await
+            .expect("off needs no scope");
+        assert!(passed.catalog_scope().is_none());
+        let ignored = attach(session.clone(), Some("not-a-jws"), None)
+            .await
+            .expect("off ignores the header");
+        assert!(ignored.catalog_scope().is_none());
+        assert!(session.effective_scope().expect("no refusal").is_none());
+
+        // No section at all is off too.
+        sqe_coordinator::catalog_scope_gate::install(None, None).expect("no section");
+        assert_eq!(mode(), CatalogScopeMode::Off);
+    }
+}
+
+/// A JWKS that cannot be fetched refuses a well-signed scope in `union` as
+/// in `binding` (#295): verification fails closed, and the refusal is
+/// audited, whether or not the mode narrows.
+#[tokio::test(flavor = "multi_thread")]
+async fn catalog_scope_unreachable_jwks_refuses_in_union_and_binding() {
+    use sqe_coordinator::catalog_scope_gate::{attach, mode};
+    use sqe_core::config::CatalogScopeMode;
+    crate::common::init_tracing();
+
+    // A loopback port nothing listens on any more.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("bind a free port")
+        .port();
+    let jwks_url = format!("https://127.0.0.1:{port}/jwks");
+
+    for (wanted, mode_key) in [
+        (CatalogScopeMode::Union, "union"),
+        (CatalogScopeMode::Binding, "binding"),
+    ] {
+        let _lock = GateGuard {
+            _lock: GATE_LOCK.lock().await,
+        };
+        let config: CatalogScopeConfig = toml::from_str(&format!(
+            "client_id = \"{SCOPED_CLIENT}\"\nissuer = \"{ISSUER}\"\njwks_url = \"{jwks_url}\"\n\
+             accept_invalid_certs = true\nmode = \"{mode_key}\""
+        ))
+        .expect("scope config parses");
+        let audit_dir = tempfile::tempdir().expect("tempdir");
+        let audit_path = audit_dir.path().join("audit.jsonl");
+        let audit = Arc::new(
+            sqe_metrics::audit::AuditLogger::new(audit_path.to_str().unwrap())
+                .expect("audit logger opens"),
+        );
+        sqe_coordinator::catalog_scope_gate::install(Some(&config), Some(Arc::clone(&audit)))
+            .expect("the gate installs without fetching the JWKS");
+        assert_eq!(mode(), wanted);
+
+        let jti = fresh_jti(&format!("jwks-down-{mode_key}"));
+        let session = bound(offline_session(), Some(SCOPED_CLIENT), &jti);
+        let scope = scope_for(&jti, json!({ "alpha": "read_only" }));
+        let err = attach(session, Some(&scope), None)
+            .await
+            .expect_err("an unverifiable scope is refused");
+        assert!(!err.to_string().is_empty(), "{mode_key}: {err}");
+
+        audit.flush();
+        let refusals = std::fs::read_to_string(&audit_path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains("CATALOG_SCOPE_REFUSED"))
+            .count();
+        assert_eq!(refusals, 1, "{mode_key}: the refusal is audited");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Live stack: acceptance 2 and 3
 // ---------------------------------------------------------------------------
@@ -501,12 +659,23 @@ async fn acceptance_2_and_3_a_scoped_session_sees_and_writes_only_its_catalogs()
     .await
     .expect("the valid scope opens the session");
 
+    // The reason each refusal carries for the audit `error_type` (#295):
+    // what `audit_emitter::outcome_of` reads from the error. A refusal
+    // without one keeps its error chain for the failure message.
+    let mut reasons: Vec<(&str, Result<&str, String>)> = Vec::new();
+    let reason_of = |e: &sqe_core::SqeError| {
+        sqe_core::catalog_scope::ScopeReason::of(e)
+            .map(|r| r.as_str())
+            .ok_or_else(|| format!("{e:?}"))
+    };
+
     async {
         // -- Acceptance 2: only A and B exist. ------------------------------
         let err = handler
             .execute(&scoped, &format!("SELECT * FROM {TABLE_C}"), None)
             .await
             .expect_err("a catalog outside the scope is hidden");
+        reasons.push(("SELECT", reason_of(&err)));
         let msg = err.to_string();
         assert!(
             msg.to_ascii_lowercase().contains("not found"),
@@ -531,10 +700,11 @@ async fn acceptance_2_and_3_a_scoped_session_sees_and_writes_only_its_catalogs()
         assert_eq!(listed, vec![CAT_A.to_string(), CAT_B.to_string()]);
 
         // USE picks only scoped catalogs; ATTACH and DCL are refused outright.
-        handler
+        let err = handler
             .execute(&scoped, &format!("USE {CAT_C}.access"), None)
             .await
             .expect_err("USE of a hidden catalog is refused");
+        reasons.push(("USE", reason_of(&err)));
         let err = handler
             .execute(
                 &scoped,
@@ -585,6 +755,7 @@ async fn acceptance_2_and_3_a_scoped_session_sees_and_writes_only_its_catalogs()
                 .execute(&scoped, &sql, None)
                 .await
                 .expect_err(&format!("{what} into a read_only catalog is refused"));
+            reasons.push((what, reason_of(&err)));
             assert!(
                 err.to_string().to_ascii_lowercase().contains("read-only"),
                 "{what}: expected a read-only refusal, got: {err}"
@@ -601,6 +772,22 @@ async fn acceptance_2_and_3_a_scoped_session_sees_and_writes_only_its_catalogs()
             .expect_err("INSERT into a hidden catalog is refused");
     }
     .await;
+
+    let missing: Vec<_> = reasons
+        .iter()
+        .filter(|(what, reason)| {
+            let want = if matches!(*what, "SELECT" | "USE") {
+                "catalog_not_in_workspace"
+            } else {
+                "catalog_read_only"
+            };
+            *reason != Ok(want)
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "refusals without their reason: {missing:#?}"
+    );
 
     // Nothing the refused statements aimed at changed (checked unscoped,
     // directly against the catalogs).

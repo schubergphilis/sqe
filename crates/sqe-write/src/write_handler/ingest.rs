@@ -487,7 +487,10 @@ impl WriteHandler {
                 .build();
             create_table_at_location(catalog.as_ref(), &namespace, creation)
                 .await
-                .map_err(|e| SqeError::Catalog(format!("Failed to create table: {e}")))?;
+                .map_err(|e| {
+                    let msg = format!("Failed to create table: {e}");
+                    sqe_core::catalog_scope::keep_scope_reason(&e, SqeError::Catalog(msg))
+                })?;
             info!(table = %table_ident, "Table created from the ingest stream schema");
             // A new table changes what the caller's cached session context
             // can resolve (507).

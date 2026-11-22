@@ -62,7 +62,12 @@ pub(crate) fn outcome_of(error: Option<&SqeError>) -> Outcome {
     match error {
         None => Outcome::Success,
         Some(e) => Outcome::Failure {
-            error_type: Some(e.error_code().trino_error_type().to_string()),
+            // A catalog scope refusal names its reason, as the Spark side
+            // of the workspace binding does (#295).
+            error_type: Some(match sqe_core::catalog_scope::ScopeReason::of(e) {
+                Some(reason) => reason.as_str().to_string(),
+                None => e.error_code().trino_error_type().to_string(),
+            }),
             error_code: Some(e.error_code().name().to_string()),
             message: Some(e.client_message()),
         },
@@ -497,6 +502,27 @@ mod tests {
             SnapshotProperties::try_new(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())))
                 .unwrap(),
         )
+    }
+
+    #[test]
+    fn a_catalog_scope_refusal_names_its_reason_as_the_error_type() {
+        let error_type = |e: &SqeError| match outcome_of(Some(e)) {
+            Outcome::Failure { error_type, .. } => error_type,
+            other => panic!("expected a failure, got {other:?}"),
+        };
+        let hidden = sqe_core::catalog_scope::catalog_not_found("sales");
+        assert_eq!(
+            error_type(&hidden).as_deref(),
+            Some("catalog_not_in_workspace")
+        );
+        let read_only = sqe_core::catalog_scope::catalog_read_only("sales");
+        assert_eq!(error_type(&read_only).as_deref(), Some("catalog_read_only"));
+        // Any other error keeps the Trino error type.
+        let other = SqeError::Execution("boom".into());
+        assert_eq!(
+            error_type(&other),
+            Some(other.error_code().trino_error_type().to_string())
+        );
     }
 
     #[test]

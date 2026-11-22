@@ -2529,7 +2529,10 @@ impl WriteHandler {
         let _created_table = trino
             .create_table(catalog.as_ref(), &namespace, table_creation)
             .await
-            .map_err(|e| SqeError::Catalog(format!("Failed to create table: {e}")))?;
+            .map_err(|e| {
+                let msg = format!("Failed to create table: {e}");
+                sqe_core::catalog_scope::keep_scope_reason(&e, SqeError::Catalog(msg))
+            })?;
 
         let table = catalog
             .load_table(&create_ident)
@@ -3202,7 +3205,10 @@ impl WriteHandler {
         trino
             .create_table(catalog.as_ref(), &namespace, table_creation)
             .await
-            .map_err(|e| SqeError::Catalog(format!("Failed to create table: {e}")))?;
+            .map_err(|e| {
+                let msg = format!("Failed to create table: {e}");
+                sqe_core::catalog_scope::keep_scope_reason(&e, SqeError::Catalog(msg))
+            })?;
 
         info!(
             namespace = %namespace,
@@ -3311,7 +3317,10 @@ impl WriteHandler {
 
         create_table_at_location(catalog.as_ref(), &namespace, table_creation)
             .await
-            .map_err(|e| SqeError::Catalog(format!("Failed to create table: {e}")))?;
+            .map_err(|e| {
+                let msg = format!("Failed to create table: {e}");
+                sqe_core::catalog_scope::keep_scope_reason(&e, SqeError::Catalog(msg))
+            })?;
 
         info!(namespace = %namespace, table = %name, "Table created successfully (LIKE)");
         self.after_commit(session, session_catalog.as_ref(), &table_ident)
