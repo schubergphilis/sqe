@@ -2,8 +2,8 @@
 
 import re
 from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Tuple
 
 import agate
 import pyarrow
@@ -91,6 +91,9 @@ class SQECredentials(Credentials):
     - OAuth client_credentials (service principal): ``method: oauth`` with
       ``client_id`` + ``client_secret``. SQE runs the grant and forwards the token.
     - Pre-obtained bearer: ``token`` (the client fetched its own OAuth token).
+
+    ``call_headers`` adds headers to every Flight SQL call
+    (``auth.flight_call_headers``).
     """
 
     host: str = "localhost"
@@ -107,6 +110,9 @@ class SQECredentials(Credentials):
     # Transport: TLS unless explicitly disabled (local plaintext stacks).
     tls: bool = True
     tls_root_certs: Optional[str] = None
+    # Extra gRPC metadata on every Flight SQL call (e.g. a signed catalog
+    # scope). Values may be credentials: never in repr or dbt debug output.
+    call_headers: Optional[Dict[str, str]] = field(default=None, repr=False)
 
     _ALIASES = {"catalog": "database"}
 
@@ -119,7 +125,7 @@ class SQECredentials(Credentials):
         return self.host
 
     def _connection_keys(self) -> Tuple[str, ...]:
-        # Never expose password / client_secret / token in dbt debug output.
+        # Never expose password / client_secret / token / call_headers in dbt debug output.
         return ("host", "port", "tls", "database", "schema", "user", "method", "client_id")
 
 
@@ -249,7 +255,11 @@ class SQEConnectionManager(SQLConnectionManager):
         try:
             from adbc_driver_flightsql.dbapi import connect
 
-            from dbt.adapters.sqe.auth import flight_db_kwargs, flight_location
+            from dbt.adapters.sqe.auth import (
+                flight_call_headers,
+                flight_db_kwargs,
+                flight_location,
+            )
 
             uri, tls_kwargs = flight_location(
                 credentials.host,
@@ -264,7 +274,7 @@ class SQEConnectionManager(SQLConnectionManager):
                 client_id=credentials.client_id,
                 client_secret=credentials.client_secret,
                 token=credentials.token,
-            )
+            ) | flight_call_headers(credentials.call_headers)
             kwargs: dict = {"uri": uri}
             if db_kwargs:
                 kwargs["db_kwargs"] = db_kwargs

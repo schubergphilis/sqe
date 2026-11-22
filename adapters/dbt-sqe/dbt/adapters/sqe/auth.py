@@ -10,9 +10,14 @@ runtime installed. The three auth styles all resolve to ADBC `db_kwargs`:
 - Pre-obtained bearer token: set the Flight SQL authorization header to
   `Bearer <token>`; SQE's `bearer_token` provider validates and forwards it.
 - Basic auth (human user): `user` / `password` as before.
+
+Extra call headers (``call_headers``) become ADBC
+``adbc.flight.sql.rpc.call_header.<name>`` options, sent as gRPC metadata on
+every Flight SQL call (for example a signed catalog scope, #908).
 """
 
-from typing import Optional, Tuple
+import re
+from typing import Mapping, Optional, Tuple
 
 
 class AuthError(ValueError):
@@ -50,6 +55,53 @@ def flight_db_kwargs(
         return {"username": user, "password": password or ""}
 
     return {}
+
+
+CALL_HEADER_PREFIX = "adbc.flight.sql.rpc.call_header."
+
+# gRPC metadata keys: lowercase letters, digits, '-', '_' and '.'.
+_HEADER_NAME = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
+# Headers the adapter or gRPC itself sets: a profile must not replace them.
+_RESERVED_HEADERS = {"authorization", "content-type", "te", "user-agent", "host"}
+# Printable ASCII, the only values gRPC allows in a non-binary header.
+_HEADER_VALUE = re.compile(r"^[\x20-\x7e]*$")
+
+
+def flight_call_headers(headers: Optional[Mapping[str, str]] = None) -> dict:
+    """Return the ADBC `db_kwargs` that send ``headers`` on every Flight SQL call.
+
+    Names are matched case-insensitively and sent lowercase, as gRPC requires.
+    A name that is not a valid gRPC metadata key, ends in ``-bin``, starts
+    with ``grpc-``, or is one the adapter or gRPC sets (``authorization`` and
+    the like) is refused, so a profile cannot replace the credentials. A value
+    must be printable ASCII; an empty value sends nothing, so a profile can
+    point a header at an environment variable that is not always set. Errors
+    name the header, never its value: values are often credentials.
+    """
+    out: dict = {}
+    seen: set = set()
+    for raw_name, value in (headers or {}).items():
+        name = str(raw_name).strip().lower()
+        if (
+            not _HEADER_NAME.match(name)
+            or name.endswith("-bin")
+            or name.startswith("grpc-")
+            or name in _RESERVED_HEADERS
+        ):
+            raise AuthError(f"dbt-sqe: call_headers: '{raw_name}' is not a header the profile may set")
+        if name in seen:
+            raise AuthError(f"dbt-sqe: call_headers: '{name}' is set twice")
+        seen.add(name)
+        key = CALL_HEADER_PREFIX + name
+        if value is None:
+            continue
+        if not isinstance(value, str) or not _HEADER_VALUE.match(value):
+            raise AuthError(
+                f"dbt-sqe: call_headers: the value of '{name}' must be printable ASCII text"
+            )
+        if value:
+            out[key] = value
+    return out
 
 
 def flight_location(

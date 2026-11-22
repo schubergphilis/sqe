@@ -72,8 +72,8 @@ token: "{{ env_var('SQE_TOKEN') }}"
 ```
 
 Precedence when several are set: `token` > OAuth (`method: oauth` or `client_id`)
-> Basic (`user`). `password`, `client_secret`, and `token` are never printed by
-`dbt debug`.
+> Basic (`user`). `password`, `client_secret`, `token` and `call_headers` values
+are never printed by `dbt debug`.
 
 ## Connection options
 
@@ -86,6 +86,30 @@ Precedence when several are set: `token` > OAuth (`method: oauth` or `client_id`
 | `catalog` (alias `database`) | `warehouse` | target catalog; every relation and `information_schema` read names it, so it need not be the server's default catalog |
 | `schema` | `default` | target schema |
 | `threads` | 1 | dbt parallelism |
+| `call_headers` | unset | extra headers sent on every Flight SQL call; see below |
+
+### Extra call headers
+
+`call_headers` maps header names to values. dbt-sqe sends them on every Flight
+SQL call next to its credentials. An orchestrator uses them to pass per-run
+context to SQE, for example a signed catalog scope
+(`[session.catalog_scope] header_name`):
+
+```yaml
+type: sqe
+host: sqe.example.org
+token: "{{ env_var('SQE_TOKEN') }}"
+call_headers:
+  x-portal-catalog-scope: "{{ env_var('DBT_ENV_SECRET_CATALOG_SCOPE', '') }}"
+```
+
+- Names are lower-cased. `authorization`, `content-type`, `host`, `te`,
+  `user-agent`, `grpc-*` and binary (`*-bin`) headers are refused, so a profile
+  cannot replace the credentials.
+- A value must be printable ASCII. An empty value sends no header.
+- Values are never printed by `dbt debug` or in dbt-sqe's errors, which name the
+  header only. A value that is a credential should come from a
+  `DBT_ENV_SECRET_*` variable, which dbt also scrubs from its own logs.
 
 ## Materializations and model configs
 

@@ -96,3 +96,60 @@ if __name__ == "__main__":
                 traceback.print_exc()
     print(f"\n{('PASS' if failures == 0 else 'FAIL')}: {failures} failure(s)")
     sys.exit(1 if failures else 0)
+
+
+# ── Extra Flight SQL call headers (#772): e.g. a signed catalog scope (#908) ──
+
+SECRET = "zz-scope-marker-772"  # gitleaks:allow
+
+
+def _refused(headers):
+    try:
+        auth.flight_call_headers(headers)
+    except auth.AuthError as e:
+        return str(e)
+    raise AssertionError(f"expected AuthError for {list(headers)}")
+
+
+def test_call_headers_map_to_adbc_rpc_call_header_options():
+    out = auth.flight_call_headers({"X-Portal-Catalog-Scope": SECRET, "traceparent": "00-ab-cd-01"})
+    assert out == {
+        "adbc.flight.sql.rpc.call_header.x-portal-catalog-scope": SECRET,
+        "adbc.flight.sql.rpc.call_header.traceparent": "00-ab-cd-01",
+    }
+
+
+def test_no_call_headers_is_nothing():
+    assert auth.flight_call_headers(None) == {}
+    assert auth.flight_call_headers({}) == {}
+
+
+def test_an_empty_value_sends_nothing():
+    # A profile may point a header at an env var that is not always set.
+    assert auth.flight_call_headers({"x-portal-catalog-scope": "", "x-other": None}) == {}
+
+
+def test_call_headers_cannot_replace_the_credentials_or_grpc_headers():
+    for name in ("authorization", "Authorization", "grpc-timeout", "content-type", "te", "user-agent", "host",
+                 "x-scope-bin", "", "x scope", "x:scope", "-x", "x\nscope"):
+        assert "may set" in _refused({name: "v"}), name
+
+
+def test_a_header_set_twice_by_case_is_refused():
+    assert "set twice" in _refused({"x-scope": "a", "X-Scope": "b"})
+
+
+def test_a_value_that_is_not_printable_ascii_is_refused_without_echoing_it():
+    for value in (SECRET + "\r\nx-injected: 1", SECRET + "é", 42):
+        msg = _refused({"x-portal-catalog-scope": value})
+        assert "x-portal-catalog-scope" in msg
+        assert SECRET not in msg and "injected" not in msg
+
+
+def test_call_headers_do_not_touch_auth_kwargs():
+    merged = auth.flight_db_kwargs(token="t") | auth.flight_call_headers({"x-portal-catalog-scope": SECRET})
+    assert merged["adbc.flight.sql.authorization_header"] == "Bearer t"
+
+
+def test_a_header_set_twice_is_refused_even_when_the_first_is_empty():
+    assert "set twice" in _refused({"x-scope": "", "X-Scope": "b"})
