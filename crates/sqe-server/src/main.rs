@@ -2542,13 +2542,9 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
     // table_cache is passed so the rewriter can wire CacheTagSource for
     // tag-based column masking (Task 4). A clone is taken here; the original
     // is passed to with_table_cache() on the QueryHandler below.
-    // Catalogs read with the engine's keys (#934) default-deny `select`.
-    let engine_catalogs: Vec<String> = config
-        .flattened_catalogs()
-        .into_iter()
-        .filter(|(_, c)| c.credentials.is_some())
-        .map(|(n, _)| n)
-        .collect();
+    // Catalogs read with the engine's keys (#934) default-deny `select`,
+    // under their config key and their warehouse alias (#940).
+    let engine_catalogs = config.engine_read_catalog_names();
     let (policy_enforcer, policy_store) =
         sqe_coordinator::policy_wiring::build_policy_enforcer_with_engine_catalogs(
             &config.policy,

@@ -24,6 +24,26 @@ impl SqeConfig {
         found
     }
 
+    /// Every SQL name an engine-identity catalog answers to: its config key
+    /// and its `warehouse`. The policy store default-denies `select` under
+    /// these names. A catalog is also reached by its warehouse alias
+    /// (`configured_session_catalog` matches either), and the read gate then
+    /// asks under the alias, so listing only the key left the alias open.
+    pub fn engine_read_catalog_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for (key, catalog) in self.flattened_catalogs() {
+            if catalog.credentials.is_none() {
+                continue;
+            }
+            for name in [key, catalog.warehouse.clone()] {
+                if !name.is_empty() && !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        names
+    }
+
     /// Refuse an unsafe engine credential identity: a mode other than
     /// `client_credentials`, a catalog that does not require vended
     /// credentials, a policy backend without default-deny `select`, or Ranger
@@ -102,6 +122,23 @@ mod tests {
         let mut errors = Vec::new();
         cfg.validate_engine_credentials(&mut errors);
         errors
+    }
+
+    #[test]
+    fn engine_read_names_cover_key_and_warehouse_alias() {
+        let mut cfg = config(Some(identity()), true, PolicyEngine::Ranger);
+        cfg.catalogs.get_mut("lake").expect("lake").warehouse = "lake_wh".into();
+        let mut open = cfg.catalog.clone();
+        open.credentials = None;
+        open.warehouse = "open_wh".into();
+        cfg.catalogs.insert("open".into(), open);
+        let names = cfg.engine_read_catalog_names();
+        assert!(names.contains(&"lake".to_string()), "{names:?}");
+        assert!(names.contains(&"lake_wh".to_string()), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n == "open" || n == "open_wh"),
+            "{names:?}"
+        );
     }
 
     #[test]
