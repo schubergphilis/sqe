@@ -11,6 +11,10 @@
 //! privilege (`alter` or `apply_tag`) from the store: the columns of a tag
 //! statement, and for a raw property write the columns whose tags differ
 //! between the live map and the new one (a new table: every column named).
+//! Before that privilege, a non-admin needs USE on the schema (#941):
+//! [`PolicyStore::grants_schema_use`], a `select` reaching the schema, keyed
+//! with the catalog under `catalog_scoped`. Table and schema tags
+//! (`object_tags`) take the same USE check; catalog tags do not.
 //!
 //! Under `[access_control] tag_names = "ranger-tagdefs"` a non-admin write
 //! must also name only tags Ranger defines (#926), checked after the
@@ -92,6 +96,8 @@ impl QueryHandler {
             return self.require_admin(session, statement);
         };
         let object_name = crate::catalog_ops::parse_object_name(&stmt.table)?;
+        self.require_table_schema_use(session, store, &object_name, statement)
+            .await?;
         self.require_tag_columns(
             session,
             store,
@@ -341,6 +347,58 @@ impl QueryHandler {
         Ok(())
     }
 
+    /// A non-admin tag writer under `ranger-delegate` must be able to use the
+    /// schema the object sits in before any tag privilege counts (#941), as
+    /// Unity's `USE CATALOG` and `USE SCHEMA`. `namespace` is the policy key
+    /// (under `catalog_scoped` it carries the catalog, so this is the catalog
+    /// check too; otherwise the catalog has no Ranger resource and Polaris
+    /// decides it when the write loads the table or namespace on the caller's
+    /// token). Checked first, so a caller without it learns nothing about
+    /// column grants. A store error grants nothing.
+    pub(super) async fn require_schema_use(
+        &self,
+        session: &Session,
+        store: &dyn PolicyStore,
+        namespace: &str,
+        statement: &str,
+    ) -> sqe_core::Result<()> {
+        let usable = store
+            .grants_schema_use(&session.user, namespace)
+            .await
+            .unwrap_or_else(|e| {
+                warn!(error = %e, namespace, "schema use check failed; treating as not granted");
+                false
+            });
+        if usable {
+            return Ok(());
+        }
+        Err(self.refuse_tag_write(
+            session,
+            statement,
+            &format!("requires select (USE) on schema {namespace}"),
+        ))
+    }
+
+    /// [`Self::require_schema_use`] for the schema holding `table`, keyed as
+    /// the column checks key it.
+    async fn require_table_schema_use(
+        &self,
+        session: &Session,
+        store: &dyn PolicyStore,
+        table: &sqlparser::ast::ObjectName,
+        statement: &str,
+    ) -> sqe_core::Result<()> {
+        let (namespace, _, _) = self.tag_policy_key(session, store, table)?.ok_or_else(|| {
+            self.refuse_tag_write(
+                session,
+                statement,
+                &format!("cannot key table '{table}' for a policy check"),
+            )
+        })?;
+        self.require_schema_use(session, store, &namespace, statement)
+            .await
+    }
+
     /// Every column in `columns` of `table` must be granted `privilege` by
     /// `store`. The policy key is derived with the same functions
     /// the tag writes resolve their table with, so the resource checked is the
@@ -501,6 +559,8 @@ impl QueryHandler {
             Statement::CreateTable(ct) => (&ct.name, ct.or_replace),
             _ => return Ok(None),
         };
+        self.require_table_schema_use(session, store, table, RAW_TAG_WRITE)
+            .await?;
         let old = if live {
             match self.catalog_ops.live_column_tags(session, table).await? {
                 Some(Ok(map)) => map,

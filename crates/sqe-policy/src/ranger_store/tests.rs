@@ -1505,6 +1505,139 @@ async fn apply_tag_comes_only_from_items_that_name_it() {
     assert!(tag(user("svc", &[])).await, "the deny exception");
 }
 
+/// Schema `USE` for a tag writer (#941): an allow granting `select` (or
+/// `all`) on any table of the schema; a schema-wide `select` deny wins.
+#[test]
+fn schema_use_is_a_select_reaching_the_schema() {
+    let policy = |id: u32, db: &str, extra: &str, items: &str| {
+        format!(
+            r#"{{"id":{id},"name":"p{id}","policyType":0,"isEnabled":true,
+               "resources":{{"database":{{"values":["{db}"]}}{extra}}},{items}}}"#
+        )
+    };
+    let t = |table: &str, column: &str| {
+        format!(r#","table":{{"values":["{table}"]}},"column":{{"values":["{column}"]}}"#)
+    };
+    let allow = |who: &str, access: &str| {
+        format!(
+            r#""policyItems":[{{"users":["{who}"],"accesses":[{{"type":"{access}","isAllowed":true}}]}}]"#
+        )
+    };
+    let deny = |who: &str| {
+        format!(
+            r#""denyPolicyItems":[{{"users":["{who}"],"accesses":[{{"type":"select","isAllowed":true}}]}}]"#
+        )
+    };
+    let policies = [
+        // A reader of one table may use its schema.
+        policy(
+            1,
+            "lake.sales",
+            &t("orders", "*"),
+            &allow("reader", "select"),
+        ),
+        // `all` carries `select`; `lake.*` reaches a nested schema.
+        policy(2, "lake.*", &t("*", "*"), &allow("owner", "all")),
+        // Tag grants alone are not `select`.
+        policy(
+            3,
+            "lake.sales",
+            &t("*", "*"),
+            &allow("steward", "apply_tag"),
+        ),
+        policy(
+            4,
+            "lake.sales",
+            &t("*", "*"),
+            &allow("steward", "remove_tag"),
+        ),
+        // A schema-wide deny beats a table allow.
+        policy(
+            5,
+            "lake.sales",
+            &t("orders", "*"),
+            &allow("blocked", "select"),
+        ),
+        policy(6, "lake.sales", &t("*", "*"), &deny("blocked")),
+        // A deny on one table, or on one column, leaves the schema usable.
+        policy(7, "lake.sales", &t("*", "*"), &allow("partly", "select")),
+        policy(8, "lake.sales", &t("orders", "*"), &deny("partly")),
+        policy(9, "lake.sales", &t("*", "ssn"), &deny("partly")),
+        // A catalog-wide deny reaches every schema of the catalog.
+        policy(10, "lake.sales", &t("*", "*"), &allow("barred", "select")),
+        policy(11, "lake.*", &t("*", "*"), &deny("barred")),
+        // A udf policy reaches no table.
+        policy(
+            12,
+            "lake.sales",
+            r#","udf":{"values":["*"]}"#,
+            &allow("udf_user", "select"),
+        ),
+        // Old-style keys: an allow and a deny on the last component only.
+        policy(13, "sales", &t("*", "*"), &allow("legacy", "select")),
+        policy(
+            14,
+            "lake.hr",
+            &t("*", "*"),
+            &allow("legacy_denied", "select"),
+        ),
+        policy(15, "hr", &t("*", "*"), &deny("legacy_denied")),
+    ];
+    let bundle: ServicePolicies =
+        serde_json::from_str(&format!(r#"{{"policies":[{}]}}"#, policies.join(","))).unwrap();
+    let scoped =
+        |who: &str, db: &str| access_grants_schema_use(&bundle, &user(who, &[]), db, false);
+    let unscoped =
+        |who: &str, db: &str| access_grants_schema_use(&bundle, &user(who, &[]), db, true);
+
+    assert!(scoped("reader", "lake.sales"));
+    assert!(
+        !scoped("reader", "lake.hr"),
+        "a select on another schema does not count"
+    );
+    assert!(
+        !scoped("reader", "other.sales"),
+        "nor one in another catalog"
+    );
+    assert!(scoped("owner", "lake.sales") && scoped("owner", "lake.a.b"));
+    assert!(
+        !scoped("steward", "lake.sales"),
+        "apply_tag / remove_tag alone are refused"
+    );
+    assert!(
+        !scoped("blocked", "lake.sales"),
+        "the schema-wide deny wins"
+    );
+    assert!(
+        scoped("partly", "lake.sales"),
+        "a table or column deny leaves USE"
+    );
+    assert!(!scoped("barred", "lake.sales"), "a catalog-wide deny wins");
+    assert!(!scoped("udf_user", "lake.sales"));
+    assert!(
+        !scoped("nobody", "lake.sales"),
+        "nothing matching is refused"
+    );
+
+    // Without `catalog_scoped` the key is the bare namespace, and a deny
+    // written on its last component still refuses (fail closed) while an
+    // allow written that way grants only the bare key.
+    assert!(unscoped("reader", "lake.sales"));
+    assert!(unscoped("legacy", "sales"));
+    assert!(
+        !unscoped("legacy", "lake.sales"),
+        "an allow never matches by last component"
+    );
+    assert!(
+        !unscoped("legacy_denied", "lake.hr"),
+        "a deny matches by last component"
+    );
+    assert!(
+        scoped("legacy_denied", "lake.hr"),
+        "not under catalog_scoped"
+    );
+}
+
 #[test]
 fn a_deny_on_all_denies_apply_tag() {
     let u = user("steward", &[]);

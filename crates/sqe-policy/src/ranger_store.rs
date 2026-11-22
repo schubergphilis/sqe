@@ -687,9 +687,28 @@ fn policy_matches_table(p: &RangerPolicy, database: &str, table: &str) -> bool {
 /// `finance`, and a policy written for `finance` would fire in every catalog --
 /// the cross-catalog match the setting exists to stop. A catalog-scoped
 /// deployment has no old-style policies to migrate.
-fn policy_matches_table_with(p: &RangerPolicy, database: &str, table: &str, last_component_fallback: bool) -> bool {
-    let db_ok = p
+fn policy_matches_table_with(
+    p: &RangerPolicy,
+    database: &str,
+    table: &str,
+    last_component_fallback: bool,
+) -> bool {
+    let tbl_ok = p
         .resources
+        .get("table")
+        .map(|r| resource_matches(r, table))
+        .unwrap_or(false);
+    policy_matches_database(p, database, last_component_fallback) && tbl_ok
+}
+
+/// The `database` half of [`policy_matches_table_with`], with the same
+/// last-component fallback.
+fn policy_matches_database(
+    p: &RangerPolicy,
+    database: &str,
+    last_component_fallback: bool,
+) -> bool {
+    p.resources
         .get("database")
         .map(|r| {
             if resource_matches(r, database) {
@@ -710,13 +729,7 @@ fn policy_matches_table_with(p: &RangerPolicy, database: &str, table: &str, last
             }
             false
         })
-        .unwrap_or(false);
-    let tbl_ok = p
-        .resources
-        .get("table")
-        .map(|r| resource_matches(r, table))
-        .unwrap_or(false);
-    db_ok && tbl_ok
+        .unwrap_or(false)
 }
 
 /// True if a policy-item applies to this user, any of their roles, or any of
@@ -1028,12 +1041,64 @@ fn access_grants_type_with(
     last_component_fallback: bool,
     column_ok: impl Fn(&RangerPolicy) -> bool,
 ) -> bool {
-    let matching = |fallback: bool| {
+    access_decision(
+        bundle,
+        user,
+        access_type,
+        |p| policy_matches_table_with(p, database, table, last_component_fallback) && column_ok(p),
+        |p| policy_matches_table_with(p, database, table, false) && column_ok(p),
+    )
+}
+
+/// May `user` use the schema `database` (#941): Hive's `USE`, which the
+/// `hive` servicedef has no access type for. A `select` deny on the whole
+/// schema (`table` and `column` covering everything) decides first; then an
+/// allow item granting `select` (or an `all`, which carries it) on any table
+/// of the schema counts. A deny on one table leaves the schema usable.
+/// `apply_tag` and `remove_tag` are not `select`, so a tag grant alone never
+/// makes a schema usable.
+fn access_grants_schema_use(
+    bundle: &ServicePolicies,
+    user: &SessionUser,
+    database: &str,
+    last_component_fallback: bool,
+) -> bool {
+    access_decision(
+        bundle,
+        user,
+        "select",
+        |p| {
+            policy_matches_table_with(p, database, "*", last_component_fallback)
+                && column_resource_covers_table(p)
+        },
+        |p| policy_matches_database(p, database, false) && reaches_a_table(p),
+    )
+}
+
+/// True when a policy's `table` resource can match some table: a `udf`
+/// policy on the same database, or one excluding every table, reaches none.
+fn reaches_a_table(p: &RangerPolicy) -> bool {
+    p.resources.get("table").is_some_and(|t| {
+        !t.values.is_empty() && !(t.is_excludes && t.values.iter().any(|v| v == "*"))
+    })
+}
+
+/// The deny-first evaluation shared by every access check. `deny_scope`
+/// picks the policies whose deny items can refuse, `allow_scope` those whose
+/// allow items can grant.
+fn access_decision(
+    bundle: &ServicePolicies,
+    user: &SessionUser,
+    access_type: &str,
+    deny_scope: impl Fn(&RangerPolicy) -> bool,
+    allow_scope: impl Fn(&RangerPolicy) -> bool,
+) -> bool {
+    let matching = |scope: &dyn Fn(&RangerPolicy) -> bool| {
         bundle
             .policies
             .iter()
             .filter(|p| p.is_enabled && p.policy_type == POLICY_TYPE_ACCESS)
-            .filter(|p| policy_matches_table_with(p, database, table, fallback) && column_ok(p))
+            .filter(|p| scope(p))
             .collect::<Vec<_>>()
     };
 
@@ -1069,16 +1134,16 @@ fn access_grants_type_with(
     // A policy outside its validity schedule is skipped. A schedule SQE cannot
     // evaluate (`None`) still lets a deny decide but never lets an allow grant.
     let now = Utc::now();
-    for p in matching(last_component_fallback) {
+    for p in matching(&deny_scope) {
         if policy_schedule_active(p, now) == Some(false) {
             continue;
         }
         if applies(&p.deny_policy_items) && !widens(p, &p.deny_exceptions) {
-            debug!(policy_id = p.id, policy = %p.name, user = %user.username, table, database, "Ranger deny item matched");
+            debug!(policy_id = p.id, policy = %p.name, user = %user.username, access_type, "Ranger deny item matched");
             return false;
         }
     }
-    for p in matching(false) {
+    for p in matching(&allow_scope) {
         if policy_schedule_active(p, now) != Some(true) {
             continue;
         }
@@ -2397,6 +2462,21 @@ impl PolicyStore for RangerStore {
             table_name,
             column,
             privilege.access_type(),
+            !self.catalog_scoped,
+        ))
+    }
+
+    /// Schema `USE` for a tag writer (#941): see `access_grants_schema_use`.
+    async fn grants_schema_use(
+        &self,
+        user: &SessionUser,
+        namespace: &str,
+    ) -> sqe_core::Result<bool> {
+        let bundle = self.cached_bundle().await?;
+        Ok(access_grants_schema_use(
+            &bundle,
+            user,
+            &hive_database(namespace),
             !self.catalog_scoped,
         ))
     }

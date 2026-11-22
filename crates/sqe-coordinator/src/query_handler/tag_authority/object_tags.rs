@@ -5,7 +5,7 @@
 //! pass. Under `admin-role` only admins may write them. Under
 //! `ranger-delegate` a table needs the configured privilege on the table
 //! (a column grant does not count) and a schema needs it on the database
-//! with table `*`. A catalog has no resource in the query service, so under
+//! with table `*`. Both first need USE on the schema (#941). A catalog has no resource in the query service, so under
 //! `ranger-delegate` Polaris decides: the write goes to its management API
 //! on the caller's token and needs catalog-properties write there. `tag_names`
 //! checks the keys a `SET` names, after the privilege, as for column tags.
@@ -109,6 +109,8 @@ impl QueryHandler {
                     &format!("cannot key '{}' for a policy check", stmt.object.name()),
                 )
             })?;
+        self.require_schema_use(session, store, &policy_ns, statement)
+            .await?;
         for privilege in privileges {
             let granted = store
                 .grants_table_privilege(&session.user, &policy_table, &policy_ns, privilege)

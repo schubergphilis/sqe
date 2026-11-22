@@ -419,6 +419,7 @@ async fn tag_authority_delegate_passes_with_a_grant() {
     store
         .grant_table_privilege("ns", "tbl", "alice", sqe_policy::TablePrivilege::Alter)
         .await;
+    store.grant_schema_use("ns", "alice").await;
     let handler = make_delegate_handler(store);
     let session = session_for("alice", vec!["analyst"]);
     for sql in TAG_STMTS {
@@ -436,6 +437,8 @@ async fn tag_authority_delegate_refuses_without_a_grant() {
     store
         .grant_table_privilege("ns", "tbl", "alice", sqe_policy::TablePrivilege::Drop)
         .await;
+    // USE passes, so the refusal is the missing privilege.
+    store.grant_schema_use("ns", "alice").await;
     let handler = make_delegate_handler(store);
     let session = session_for("alice", vec!["analyst"]);
     for sql in TAG_STMTS {
@@ -694,6 +697,16 @@ impl PolicyStore for ColumnGrants {
             .iter()
             .any(|(u, c, p)| *u == user.username && *c == column && *p == privilege))
     }
+
+    /// Everyone may use every schema here: the USE gate (#941) has its own
+    /// tests (`schema_use_*`), these test the privilege after it.
+    async fn grants_schema_use(
+        &self,
+        _user: &SessionUser,
+        _namespace: &str,
+    ) -> sqe_core::Result<bool> {
+        Ok(true)
+    }
 }
 
 fn tag_handler(
@@ -925,6 +938,14 @@ impl PolicyStore for Tagdefs {
         self.grants
             .grants_column_privilege(user, table_name, namespace, column, privilege)
             .await
+    }
+
+    async fn grants_schema_use(
+        &self,
+        user: &SessionUser,
+        namespace: &str,
+    ) -> sqe_core::Result<bool> {
+        self.grants.grants_schema_use(user, namespace).await
     }
 
     async fn tag_definitions(
@@ -1578,6 +1599,8 @@ async fn object_tags_delegate_needs_the_table_grant() {
     store
         .grant_table_privilege("ns", "tbl", "alice", sqe_policy::TablePrivilege::Alter)
         .await;
+    store.grant_schema_use("ns", "alice").await;
+    store.grant_schema_use("ns", "bob").await;
     let handler = make_delegate_handler(store);
     let alice = session_for("alice", vec!["analyst"]);
     let bob = session_for("bob", vec!["analyst"]);
@@ -1607,6 +1630,7 @@ async fn object_tags_schema_needs_the_database_wildcard_grant() {
     store
         .grant_table_privilege("ns", "*", "alice", sqe_policy::TablePrivilege::Alter)
         .await;
+    store.grant_schema_use("ns", "alice").await;
     let handler = make_delegate_handler(store);
     let alice = session_for("alice", vec!["analyst"]);
     for sql in SCHEMA_TAG_STMTS {
@@ -1819,6 +1843,8 @@ async fn tag_removal_gates_object_untags() {
         .grant_table_privilege("ns", "tbl", "alice", Alter)
         .await;
     store.grant_table_privilege("ns", "tbl", "bob", Alter).await;
+    store.grant_schema_use("ns", "alice").await;
+    store.grant_schema_use("ns", "bob").await;
     store
         .grant_table_privilege("ns", "tbl", "bob", RemoveTag)
         .await;
@@ -1891,6 +1917,14 @@ impl PolicyStore for RemoveTagUnresolvable {
     ) -> sqe_core::Result<bool> {
         Self::answer(privilege)
     }
+
+    async fn grants_schema_use(
+        &self,
+        _user: &SessionUser,
+        _namespace: &str,
+    ) -> sqe_core::Result<bool> {
+        Ok(true)
+    }
 }
 
 /// The stronger right fails closed: when `remove_tag` cannot be resolved,
@@ -1932,4 +1966,218 @@ async fn tag_removal_fails_closed_when_remove_tag_cannot_be_resolved() {
         err.to_string().contains("requires remove_tag on ns.tbl"),
         "{sql}: {err}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #941 - a tag write needs USE (a `select` reaching the schema) first
+// ---------------------------------------------------------------------------
+
+/// Grants every tag privilege, and USE only on the (user, namespace) pairs
+/// listed, so a refusal here is the USE gate's. Records the namespaces asked.
+/// What counts as USE in Ranger (deny wins, another schema's grant does not
+/// count, `apply_tag` alone is not USE) is the Ranger store's unit test
+/// `schema_use_is_a_select_reaching_the_schema`.
+#[derive(Default)]
+struct SchemaUse {
+    usable: Vec<(&'static str, &'static str)>,
+    unreachable: bool,
+    scoped: bool,
+    asked: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl PolicyStore for SchemaUse {
+    async fn resolve(
+        &self,
+        _user: &SessionUser,
+        _table_name: &str,
+        _namespace: &str,
+    ) -> sqe_core::Result<ResolvedPolicy> {
+        Ok(ResolvedPolicy::default())
+    }
+
+    fn invalidate_all(&self) {}
+
+    fn catalog_scoped(&self) -> bool {
+        self.scoped
+    }
+
+    async fn grants_table_privilege(
+        &self,
+        _user: &SessionUser,
+        _table_name: &str,
+        _namespace: &str,
+        _privilege: sqe_policy::TablePrivilege,
+    ) -> sqe_core::Result<bool> {
+        Ok(true)
+    }
+
+    async fn grants_column_privilege(
+        &self,
+        _user: &SessionUser,
+        _table_name: &str,
+        _namespace: &str,
+        _column: &str,
+        _privilege: sqe_policy::TablePrivilege,
+    ) -> sqe_core::Result<bool> {
+        Ok(true)
+    }
+
+    async fn grants_schema_use(
+        &self,
+        user: &SessionUser,
+        namespace: &str,
+    ) -> sqe_core::Result<bool> {
+        self.asked.lock().unwrap().push(namespace.to_string());
+        if self.unreachable {
+            return Err(sqe_core::SqeError::Execution(
+                "could not read the Ranger policies: HTTP 503".into(),
+            ));
+        }
+        Ok(self
+            .usable
+            .iter()
+            .any(|(u, ns)| *u == user.username && *ns == namespace))
+    }
+}
+
+fn use_handler(store: Arc<SchemaUse>) -> QueryHandler {
+    tag_handler(
+        minimal_config(),
+        store,
+        sqe_core::config::TagAuthority::RangerDelegate,
+        sqe_core::config::TagPrivilege::Alter,
+    )
+}
+
+/// Every route that writes a tag on a table or schema, in `ns`.
+fn use_gated_stmts() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = TAG_STMTS.to_vec();
+    out.extend(TABLE_TAG_STMTS);
+    out.extend(SCHEMA_TAG_STMTS);
+    out.extend([
+        r#"ALTER TABLE ns.tbl SET TBLPROPERTIES ('sqe.column-tags' = '{"ssn":["PII"]}')"#,
+        r#"CREATE TABLE ns.tbl (ssn INT) TBLPROPERTIES ('sqe.column-tags' = '{"ssn":["PII"]}')"#,
+        r#"CREATE OR REPLACE TABLE ns.tbl TBLPROPERTIES ('sqe.column-tags' = '{"ssn":["PII"]}') AS SELECT 1 AS ssn"#,
+    ]);
+    out
+}
+
+fn refused_for_use(res: sqe_core::Result<Vec<arrow_array::RecordBatch>>, sql: &str, ns: &str) {
+    let err = res.expect_err(sql);
+    let msg = err.to_string();
+    assert!(msg.contains("403 Forbidden"), "{sql}: {msg}");
+    assert!(
+        msg.contains(&format!("requires select (USE) on schema {ns}")),
+        "{sql}: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn schema_use_gates_every_table_and_schema_tag_write() {
+    let store = Arc::new(SchemaUse {
+        usable: vec![("steward", "ns"), ("elsewhere", "other")],
+        ..Default::default()
+    });
+    let handler = use_handler(store.clone());
+    let steward = session_for("steward", vec!["analyst"]);
+    let root = session_for("root", vec!["service_admin"]);
+    for sql in use_gated_stmts() {
+        assert_passed_tag_gate(handler.execute(&steward, sql, None).await, sql);
+        // Every privilege, but no USE on `ns`: USE on another schema does not
+        // count, and nobody else gets past it either.
+        for user in ["elsewhere", "outsider"] {
+            let session = session_for(user, vec!["analyst"]);
+            refused_for_use(handler.execute(&session, sql, None).await, sql, "ns");
+        }
+        // Admins are not asked.
+        assert_passed_tag_gate(handler.execute(&root, sql, None).await, sql);
+    }
+    // A catalog has no Ranger resource here: Polaris decides its tags.
+    let outsider = session_for("outsider", vec!["analyst"]);
+    store.asked.lock().unwrap().clear();
+    for sql in CATALOG_TAG_STMTS {
+        assert_passed_tag_gate(handler.execute(&outsider, sql, None).await, sql);
+    }
+    assert!(store.asked.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn schema_use_fails_closed_when_the_store_cannot_answer() {
+    let handler = use_handler(Arc::new(SchemaUse {
+        usable: vec![("steward", "ns")],
+        unreachable: true,
+        ..Default::default()
+    }));
+    let steward = session_for("steward", vec!["analyst"]);
+    for sql in use_gated_stmts() {
+        refused_for_use(handler.execute(&steward, sql, None).await, sql, "ns");
+    }
+}
+
+/// Under `catalog_scoped` the key carries the catalog, so USE on `sales.ns`
+/// is USE on that catalog and schema, and not on `ns` in another catalog.
+/// Without it the key is the bare schema (the catalog is Polaris's).
+#[tokio::test]
+async fn schema_use_is_keyed_on_the_catalog_only_under_catalog_scoped() {
+    let scoped = Arc::new(SchemaUse {
+        usable: vec![("steward", "sales.ns")],
+        scoped: true,
+        ..Default::default()
+    });
+    let handler = use_handler(scoped.clone());
+    let steward = session_for("steward", vec!["analyst"]);
+    for sql in [
+        "ALTER TABLE sales.ns.tbl SET TAGS (ssn = ('PII'))",
+        "ALTER TABLE sales.ns.tbl SET TAGS ('gold')",
+        "ALTER SCHEMA sales.ns SET TAGS ('gold')",
+    ] {
+        assert_passed_tag_gate(handler.execute(&steward, sql, None).await, sql);
+    }
+    for sql in [
+        "ALTER TABLE ops.ns.tbl SET TAGS (ssn = ('PII'))",
+        "ALTER TABLE ops.ns.tbl SET TAGS ('gold')",
+        "ALTER SCHEMA ops.ns SET TAGS ('gold')",
+    ] {
+        refused_for_use(handler.execute(&steward, sql, None).await, sql, "ops.ns");
+    }
+
+    let unscoped = Arc::new(SchemaUse {
+        usable: vec![("steward", "ns")],
+        ..Default::default()
+    });
+    let handler = use_handler(unscoped.clone());
+    for sql in [
+        "ALTER TABLE sales.ns.tbl SET TAGS (ssn = ('PII'))",
+        "ALTER TABLE ops.ns.tbl SET TAGS ('gold')",
+    ] {
+        assert_passed_tag_gate(handler.execute(&steward, sql, None).await, sql);
+    }
+    assert!(
+        unscoped.asked.lock().unwrap().iter().all(|ns| ns == "ns"),
+        "{:?}",
+        unscoped.asked.lock().unwrap()
+    );
+}
+
+/// `admin-role` never asks for USE: non-admins are refused as before, and a
+/// plain CREATE naming tags stays open to them.
+#[tokio::test]
+async fn schema_use_does_not_apply_under_admin_role() {
+    let store = Arc::new(SchemaUse::default());
+    let handler = tag_handler(
+        minimal_config(),
+        store.clone(),
+        sqe_core::config::TagAuthority::AdminRole,
+        sqe_core::config::TagPrivilege::Alter,
+    );
+    let alice = session_for("alice", vec!["analyst"]);
+    for sql in TAG_STMTS {
+        let err = handler.execute(&alice, sql, None).await.expect_err(sql);
+        assert!(!err.to_string().contains("(USE)"), "{sql}: {err}");
+    }
+    let sql =
+        r#"CREATE TABLE ns.tbl (ssn INT) TBLPROPERTIES ('sqe.column-tags' = '{"ssn":["PII"]}')"#;
+    assert_passed_tag_gate(handler.execute(&alice, sql, None).await, sql);
+    assert!(store.asked.lock().unwrap().is_empty());
 }

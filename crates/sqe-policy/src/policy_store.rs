@@ -26,6 +26,9 @@ pub struct InMemoryPolicyStore {
     /// DDL privileges keyed by "namespace.table_name": (grantee, privilege),
     /// where the grantee matches a username or any of the user's roles.
     privileges: Arc<RwLock<HashMap<String, Vec<PrivilegeGrant>>>>,
+    /// Schema `USE` (#941) keyed by namespace: the grantees (usernames or
+    /// roles) that may use it.
+    schema_use: Arc<RwLock<HashMap<String, Vec<String>>>>,
     /// Bumped on every mutation; feeds `policy_fingerprint` (finding 902).
     generation: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -36,6 +39,7 @@ impl InMemoryPolicyStore {
             policies: Arc::new(RwLock::new(HashMap::new())),
             role_policies: Arc::new(RwLock::new(HashMap::new())),
             privileges: Arc::new(RwLock::new(HashMap::new())),
+            schema_use: Arc::new(RwLock::new(HashMap::new())),
             generation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
     }
@@ -56,6 +60,19 @@ impl InMemoryPolicyStore {
             .entry(key)
             .or_default()
             .push((grantee.to_string(), privilege));
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Let `grantee` (a username or a role name) use the schema `namespace`,
+    /// which a tag writer needs (#941). Nothing is usable until registered.
+    pub async fn grant_schema_use(&self, namespace: &str, grantee: &str) {
+        self.schema_use
+            .write()
+            .await
+            .entry(namespace.to_string())
+            .or_default()
+            .push(grantee.to_string());
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
@@ -143,6 +160,24 @@ impl PolicyStore for InMemoryPolicyStore {
     ) -> sqe_core::Result<bool> {
         self.grants_table_privilege(user, table_name, namespace, privilege)
             .await
+    }
+
+    /// Only what `grant_schema_use` registered.
+    async fn grants_schema_use(
+        &self,
+        user: &SessionUser,
+        namespace: &str,
+    ) -> sqe_core::Result<bool> {
+        Ok(self
+            .schema_use
+            .read()
+            .await
+            .get(namespace)
+            .is_some_and(|grantees| {
+                grantees
+                    .iter()
+                    .any(|g| *g == user.username || user.roles.contains(g))
+            }))
     }
 }
 

@@ -56,3 +56,22 @@ Under `tag_authority = "admin-role"` the system SHALL require an admin role for 
 #### Scenario: SET TBLPROPERTIES by a non-admin
 - **WHEN** a non-admin runs `ALTER TABLE t SET TBLPROPERTIES ('sqe.column-tags' = '{}')` under `admin-role`
 - **THEN** the statement is refused with `403 Forbidden`
+
+### Requirement: A tag write needs USE on the schema first
+Under `ranger-delegate`, before any tag privilege is checked, the system SHALL require a non-admin writing column, table or schema tags to be able to use the schema the object sits in (#941). USE is a Ranger `select` (or `all`) allow on any table of that schema, decided as reads are: a `select` deny on the whole schema (`table: *`, every column) SHALL refuse whatever allows exist, while a deny on one table or column SHALL NOT. `apply_tag`, `remove_tag` and `alter` alone SHALL NOT count. Under `catalog_scoped` the schema key carries the catalog, so the check covers the catalog too; without it the catalog has no Ranger resource and Polaris decides it when the write loads the table or namespace on the caller's token. Catalog tags SHALL keep their own gate. A store that cannot answer SHALL refuse. Admins SHALL pass, and `admin-role` SHALL NOT ask.
+
+#### Scenario: Steward with apply_tag only
+- **WHEN** a user holds `apply_tag` on a column but no `select` anywhere in its schema
+- **THEN** every tag write on that table is refused with `requires select (USE) on schema <ns>`
+
+#### Scenario: select on another schema
+- **WHEN** a user holds `select` on a table in another schema only
+- **THEN** the tag write is refused
+
+#### Scenario: Schema-wide deny
+- **WHEN** a user holds `select` on a table and a `select` deny on the whole schema
+- **THEN** the tag write is refused
+
+#### Scenario: Ranger unreachable
+- **WHEN** the USE check fails at the store
+- **THEN** the tag write is refused

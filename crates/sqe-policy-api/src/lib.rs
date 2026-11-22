@@ -367,6 +367,22 @@ pub trait PolicyStore: Send + Sync {
         Ok(false)
     }
 
+    /// May `user` use the schema `namespace` (keyed like
+    /// `grants_table_privilege`)? A tag writer needs this before any tag
+    /// privilege counts (#941), as Unity's `USE SCHEMA`; under
+    /// `catalog_scoped` the key carries the catalog, so it is `USE CATALOG`
+    /// too.
+    ///
+    /// The default answers `false`: a backend that cannot tell grants
+    /// nothing, so only admins pass.
+    async fn grants_schema_use(
+        &self,
+        _user: &SessionUser,
+        _namespace: &str,
+    ) -> sqe_core::Result<bool> {
+        Ok(false)
+    }
+
     /// The tag names the policy engine holds a definition for, used to refuse
     /// a tag write naming an undefined tag (`[access_control] tag_names =
     /// "ranger-tagdefs"`). With `fresh` the backend re-reads its source instead
