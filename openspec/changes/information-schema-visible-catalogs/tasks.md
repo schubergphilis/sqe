@@ -6,9 +6,9 @@
 
 ## 2. Narrowed answering provider
 
-- [ ] 2.1 Spike: choose between D4 option (a), a per-statement rewrite, and option (b), a per-catalog mount. Prove that dbt-sqe's `get_catalog`, `get_columns_in_relation` and `list_schemas` return the same shapes.
-- [ ] 2.2 `sqe_sql::pinned_catalog` (qualifier; `table_catalog` / `catalog_name` equality), with unit tests.
-- [ ] 2.3 Enumeration `SchemaProvider` wrapper: access denied becomes `Ok(None)`; every other error passes through. Unit tests for 403, 5xx and a conversion failure.
+- [x] 2.1 Spike: choose between D4 option (a), a per-statement rewrite, and option (b), a per-catalog mount. Prove that dbt-sqe's `get_catalog`, `get_columns_in_relation` and `list_schemas` return the same shapes. Chose (a), applied at the plan; see design.md D4.
+- [x] 2.2 `sqe_sql::pinned_catalog` (qualifier; `table_catalog` / `catalog_name` equality), with unit tests.
+- [x] 2.3 Enumeration `SchemaProvider` wrapper: access denied becomes `Ok(None)`; every other error passes through. Unit tests for 403, 5xx and a conversion failure.
 
 ## 3. Visible catalogs
 

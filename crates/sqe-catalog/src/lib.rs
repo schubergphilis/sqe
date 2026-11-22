@@ -22,6 +22,7 @@ pub mod incremental_provider;
 pub mod incremental_scan;
 #[cfg(feature = "rest")]
 pub mod info_schema;
+mod info_schema_scope;
 pub mod late_materialize;
 pub mod lazy_object_store;
 #[cfg(feature = "rest")]
