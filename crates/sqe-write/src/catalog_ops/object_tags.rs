@@ -2,8 +2,11 @@
 //! itself (#922), stored in the format [`sqe_core::object_tags`] defines. The
 //! query handler gates the statement first (`require_object_tag_authority`).
 //!
-//! Object tags are metadata. Unlike column tags they drive no mask, so they
-//! are not projected into Ranger and evict no policy cache.
+//! Table tags reach every column of the table (#924), so tag policies mask
+//! through them. They are projected onto the table's table and every-column
+//! Ranger resources, so Spark masks and filters with them too (#935). Schema
+//! tags are not projected yet. Catalog tags are metadata only: nothing
+//! inherits them, so they drive no mask and are not projected.
 
 use std::collections::HashMap;
 
@@ -49,6 +52,25 @@ fn next_tags(
             format!("failed to serialize {key}: {e}"),
         )
     })
+}
+
+/// The keys of a tag list value; `next_tags` has already refused a malformed
+/// one.
+fn tag_keys(raw: Option<&str>) -> sqe_core::Result<Vec<String>> {
+    let tags = object_tags::parse(raw).map_err(|e| {
+        SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!("malformed {TABLE_PROP_KEY} JSON: {e}"),
+        )
+    })?;
+    Ok(tags.into_iter().map(|t| t.key).collect())
+}
+
+/// Each key of `a`, then each key of `b` not in `a`.
+fn union(a: &[String], b: &[String]) -> Vec<String> {
+    let mut all = a.to_vec();
+    all.extend(b.iter().filter(|k| !a.contains(k)).cloned());
+    all
 }
 
 impl CatalogOps {
@@ -109,22 +131,49 @@ impl CatalogOps {
         let _guard = table_lock.lock().await;
 
         let table = session_catalog.load_table(&table_ident).await?;
-        let json = next_tags(
-            table
-                .metadata()
-                .properties()
-                .get(TABLE_PROP_KEY)
-                .map(String::as_str),
-            stmt,
-            TABLE_PROP_KEY,
-            &format!("table '{table_ident}'"),
-        )?;
+        let raw = table
+            .metadata()
+            .properties()
+            .get(TABLE_PROP_KEY)
+            .map(String::as_str);
+        let json = next_tags(raw, stmt, TABLE_PROP_KEY, &format!("table '{table_ident}'"))?;
         info!(
             username = %session.user.username,
             table = %table_ident,
             action = ?stmt.action,
             "Authoring table tags"
         );
+        // Ranger's table-level resource (#935), in the order column tags use:
+        // what the statement adds is there before the commit, what it
+        // removes goes after, so other engines never mask less than SQE.
+        let projection = match self.tag_projector.enabled() {
+            true => Some((
+                self.planner_catalog(session, catalog_qualifier(&object_name)),
+                tag_keys(raw)?,
+                tag_keys(Some(&json))?,
+            )),
+            false => None,
+        };
+        if let Some((catalog, before, after)) = &projection {
+            let added: Vec<String> = after
+                .iter()
+                .filter(|k| !before.contains(k))
+                .cloned()
+                .collect();
+            if !added.is_empty() {
+                let during = union(before, after);
+                let run = self.project_table_level_keys(catalog, &table_ident, &[], &during);
+                run.await.map_err(|e| {
+                    SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!(
+                            "could not project the tags of '{table_ident}' into Ranger ({e}); \
+                             nothing was changed"
+                        ),
+                    )
+                })?;
+            }
+        }
         session_catalog
             .commit_schema_update(
                 &table_ident,
@@ -137,6 +186,20 @@ impl CatalogOps {
         // Every user's cached metadata, under the lock, so the next writer
         // and every reader see the new list.
         self.invalidate_table_all_tokens(&table_ident).await;
+        if let Some((catalog, before, after)) = &projection {
+            if before.iter().any(|k| !after.contains(k)) {
+                let run = self.project_table_level_keys(catalog, &table_ident, before, after);
+                if let Err(e) = run.await {
+                    tracing::warn!(
+                        table = %table_ident,
+                        error = %e,
+                        "table tags were removed but Ranger still holds them; other engines \
+                         over-mask this table until `CALL system.reproject_column_tags` or \
+                         the next tag change"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
