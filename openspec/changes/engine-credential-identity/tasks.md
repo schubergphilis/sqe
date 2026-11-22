@@ -14,3 +14,8 @@
 - [x] 1.12 Ranger store unit tests: default deny for identity catalogs, other catalogs unchanged
 - [x] 1.13 IT on the test stack with `InMemoryPolicyStore` (the Polaris stack runs passthrough; the Ranger stack does not vend): metadata-only person reads via a read-data engine; engine with write-data, reader refused each DML kind and CTAS; denied select gives 0 rows (count, fallible predicate) with no `/credentials` call
 - [x] 1.14 Docs: catalog configuration page, vended credentials page (read-only engine principal, add `select` policies first)
+
+## 2. Engine identity names (#940)
+
+- [x] 2.1 Discovery template drops `credentials`: a discovered warehouse reads with the person's delegated keys, never the engine's (fails closed, like the template's non-per-user `auth`)
+- [x] 2.2 `SqeConfig::engine_read_catalog_names`: the policy store default-denies `select` under each engine catalog's config key and its `warehouse` alias

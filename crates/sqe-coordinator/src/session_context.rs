@@ -1133,8 +1133,14 @@ pub(crate) fn discovery_template(config: &SqeConfig) -> Option<sqe_core::config:
         })
         // The template's TVF prefixes belong to the template catalog, not to
         // a warehouse the caller named.
+        // The engine credential identity (#934) is granted per configured
+        // catalog, and the policy store default-denies `select` only under
+        // the configured names. A discovered warehouse is not one, so it
+        // would get the engine's keys without that deny (#940). It reads
+        // with the person's own delegated keys instead.
         .map(|mut c| {
             c.tvf_prefixes.clear();
+            c.credentials = None;
             c
         })
 }
@@ -1572,6 +1578,23 @@ s3_path_style = true
             token: "engine-token".to_string(),
         });
         assert!(discovery_template(&config).is_none());
+    }
+
+    #[test]
+    fn discovery_template_drops_engine_credentials() {
+        let mut config = test_config_rest();
+        config.catalog.credentials = Some(sqe_core::config::CatalogAuthConfig::ClientCredentials {
+            token_endpoint: "http://idp/token".into(),
+            client_id: "sqe-engine".into(),
+            client_secret: "s".into(),
+            scope: None,
+        });
+        config.catalog.require_vended_credentials = true;
+        let template = discovery_template(&config).expect("per-user template still discovers");
+        assert!(
+            template.credentials.is_none(),
+            "a discovered warehouse must not inherit the engine identity"
+        );
     }
 
     fn two_workspace_config() -> SqeConfig {

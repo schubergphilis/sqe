@@ -493,6 +493,13 @@ using the person's delegated credentials, and the engine's keys are never used
 for a write. Views that reference a sibling warehouse are not supported on
 these catalogs.
 
+The identity belongs to the configured catalog, under its config name and its
+`warehouse` name; `select` is denied by default under both. A warehouse that
+`catalog_discovery = "polaris-auto"` finds is not configured, so it never
+inherits the engine identity, even when the template catalog has one. It reads
+with keys vended to the person's own token, so a person without storage access
+on that warehouse in Polaris cannot read it.
+
 The engine principal is a service account: give it read-only privileges on the
 catalog (`TABLE_READ_DATA`, no write privileges), supply its client secret from
 your secret manager through the environment
