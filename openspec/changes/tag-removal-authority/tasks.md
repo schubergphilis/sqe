@@ -22,3 +22,5 @@
 
 - [x] 4.1 The quickstart bootstrap adds `remove_tag` to the `hive` servicedef, idempotently
 - [x] 4.2 Docs: access-control tutorial, `sqe.toml.example`
+- [x] 4.3 Fail closed: a store that cannot answer for `remove_tag` refuses every untag (column, Databricks column form, masking policy, table) and passes the adds (coordinator test)
+- [x] 4.4 Live Ranger: under `remove_tag`, `apply_tag` on ssn tags but cannot untag through `ALTER COLUMN ... UNSET TAGS`, `UNSET TAGS` or a raw `SET TBLPROPERTIES` (audited, mask kept); a value change on the kept key passes; an allow item naming `remove_tag` lets the untag through. Under `admin`, the steward's untag is refused and an admin's passes. The refusal texts the portal maps to `remove_tag` are pinned

@@ -5846,6 +5846,16 @@ async fn tag_authority_rig_with(
     audited: bool,
     privilege: sqe_core::config::TagPrivilege,
 ) -> TagAuthorityRig {
+    let removal = sqe_core::config::TagRemoval::default();
+    tag_authority_rig_full(ctx, audited, privilege, removal).await
+}
+
+async fn tag_authority_rig_full(
+    ctx: &AcCtx,
+    audited: bool,
+    privilege: sqe_core::config::TagPrivilege,
+    removal: sqe_core::config::TagRemoval,
+) -> TagAuthorityRig {
     tag_authority_grant_dave_in_polaris(ctx).await;
     ctx.ranger
         .create_policy(tag_mask_policy(
@@ -5875,6 +5885,7 @@ async fn tag_authority_rig_with(
         |c| {
             c.access_control.tag_authority = sqe_core::config::TagAuthority::RangerDelegate;
             c.access_control.tag_privilege = privilege;
+            c.access_control.tag_removal = removal;
         },
     )
     .await;
@@ -6304,6 +6315,17 @@ async fn databricks_column_tags_take_the_tag_guard() {
 
 /// A `hive` access policy with one allow item (`apply_tag`) for user dave.
 fn apply_tag_allow_policy(name: &str, column: &str) -> serde_json::Value {
+    dave_column_allow_policy(name, column, &["apply_tag"])
+}
+
+/// A `hive` access policy with one allow item (`accesses`) for user dave on
+/// `ac.orders.<column>`. Ranger takes one policy per resource, so every grant
+/// on the column goes in this one item.
+fn dave_column_allow_policy(name: &str, column: &str, accesses: &[&str]) -> serde_json::Value {
+    let accesses: Vec<serde_json::Value> = accesses
+        .iter()
+        .map(|a| serde_json::json!({"type": a, "isAllowed": true}))
+        .collect();
     serde_json::json!({
         "service": HIVE_SERVICE,
         "name": name,
@@ -6316,7 +6338,7 @@ fn apply_tag_allow_policy(name: &str, column: &str) -> serde_json::Value {
         },
         "policyItems": [{
             "users": ["dave"],
-            "accesses": [{"type": "apply_tag", "isAllowed": true}]
+            "accesses": accesses
         }]
     })
 }
@@ -6441,6 +6463,145 @@ async fn tag_authority_apply_tag_is_a_grant_of_its_own() {
     }
 
     let _ = ctx.ranger.delete_policy(HIVE_SERVICE, &allow).await;
+    tag_authority_cleanup(&ctx, &rig, &[]).await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #927: untagging needs a stronger right than tagging (`tag_removal`)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Under `tag_removal = "remove_tag"` an untag also needs the custom `remove_tag`
+// access type, which the quickstart bootstrap adds to the `hive` servicedef
+// with no implied grants: dave's `apply_tag` (and the fixture's `alter`, write
+// and `all`) do not carry it. Under `"admin"` only an admin untags. The refusal
+// texts are pinned: the portal maps them to its 403 `remove_tag`.
+
+/// Expect `sql` from dave on `handler` to be refused with `403 Forbidden` and
+/// `reason`.
+async fn untag_refused(ctx: &AcCtx, handler: &QueryHandler, sql: &str, reason: &str) {
+    let err = handler
+        .execute(&ctx.dave, sql, None)
+        .await
+        .expect_err(sql)
+        .to_string();
+    assert!(err.contains("403 Forbidden"), "{sql}: {err}");
+    assert!(err.contains(reason), "{sql}: {err}");
+}
+
+/// `apply_tag` on ssn tags it but cannot untag it, in any spelling, and the
+/// refusal is audited; a value change on the kept key is not a removal. An
+/// allow item naming `remove_tag` is what lets dave untag.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn tag_removal_remove_tag_is_a_grant_of_its_own() {
+    use sqe_core::config::{TagPrivilege, TagRemoval};
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+    let rig =
+        tag_authority_rig_full(&ctx, true, TagPrivilege::ApplyTag, TagRemoval::RemoveTag).await;
+    let audit = rig.audit.clone().expect("audited rig");
+    let apply = format!("{PREFIX}apply-tag-dave-ssn");
+    // A run that panicked part-way leaves its policy behind; Ranger refuses a
+    // second policy on the same resource.
+    let _ = ctx.ranger.delete_policy(HIVE_SERVICE, &apply).await;
+    ctx.ranger
+        .create_policy(apply_tag_allow_policy(&apply, "ssn"))
+        .await
+        .expect("create apply_tag on ssn");
+
+    let set = |v: &str| format!("ALTER TABLE {ORDERS} ALTER COLUMN ssn SET TAGS ('PII' = '{v}')");
+    crate::common::eventually("dave to tag ssn under apply_tag", || async {
+        rig.handler
+            .execute(&ctx.dave, &set("a"), None)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    bob_sees(&ctx, "ssn", &SSN_MASKED).await;
+
+    let unset = format!("ALTER TABLE {ORDERS} ALTER COLUMN ssn UNSET TAGS ('PII')");
+    let untags = [
+        unset.clone(),
+        format!("ALTER TABLE {ORDERS} UNSET TAGS (ssn)"),
+        format!("ALTER TABLE {ORDERS} SET TBLPROPERTIES ('sqe.column-tags' = '{{}}')"),
+    ];
+    let reason = "requires remove_tag on ac.orders.ssn";
+    for sql in &untags {
+        untag_refused(&ctx, &rig.handler, sql, reason).await;
+        let recs = audit_records_for(&audit, sql);
+        let rec = recs
+            .last()
+            .unwrap_or_else(|| panic!("no audit record for {sql}"));
+        assert_eq!(rec["status"], "failure", "{rec}");
+        assert_eq!(rec["error_code"], "ACCESS_DENIED", "{rec}");
+    }
+    // A new value on the kept key is not a removal: masks resolve on keys.
+    rig.handler
+        .execute(&ctx.dave, &set("b"), None)
+        .await
+        .expect("a value change needs apply_tag only");
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    bob_sees(&ctx, "ssn", &SSN_MASKED).await;
+
+    // Replace dave's ssn policy with one that also names `remove_tag`.
+    let _ = ctx.ranger.delete_policy(HIVE_SERVICE, &apply).await;
+    let both = ["apply_tag", "remove_tag"];
+    ctx.ranger
+        .create_policy(dave_column_allow_policy(&apply, "ssn", &both))
+        .await
+        .expect("add remove_tag on ssn (the bootstrap adds remove_tag to the hive servicedef)");
+    crate::common::eventually("dave to untag ssn under remove_tag", || async {
+        rig.handler
+            .execute(&ctx.dave, &unset, None)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    bob_sees(&ctx, "ssn", &SSN_RAW).await;
+
+    let _ = ctx.ranger.delete_policy(HIVE_SERVICE, &apply).await;
+    tag_authority_cleanup(&ctx, &rig, &[]).await;
+}
+
+/// Under `tag_removal = "admin"` dave tags with `alter` but cannot untag; the
+/// admin can.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn tag_removal_admin_reserves_the_untag() {
+    use sqe_core::config::{TagPrivilege, TagRemoval};
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+    let rig = tag_authority_rig_full(&ctx, false, TagPrivilege::Alter, TagRemoval::Admin).await;
+
+    let set = format!("ALTER TABLE {ORDERS} ALTER COLUMN ssn SET TAGS ('PII')");
+    crate::common::eventually("dave to tag ssn under alter", || async {
+        rig.handler
+            .execute(&ctx.dave, &set, None)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    bob_sees(&ctx, "ssn", &SSN_MASKED).await;
+
+    let unset = format!("ALTER TABLE {ORDERS} ALTER COLUMN ssn UNSET TAGS ('PII')");
+    let reason = "tag_removal = \"admin\" reserves that for admins";
+    untag_refused(&ctx, &rig.handler, &unset, reason).await;
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    bob_sees(&ctx, "ssn", &SSN_MASKED).await;
+
+    rig.handler
+        .execute(&ctx.carol, &unset, None)
+        .await
+        .expect("an admin untags");
+    bob_sees(&ctx, "ssn", &SSN_RAW).await;
+
     tag_authority_cleanup(&ctx, &rig, &[]).await;
 }
 
