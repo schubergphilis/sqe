@@ -3181,7 +3181,7 @@ dependencies = [
  "i_overlay",
  "log",
  "num-traits",
- "rand 0.10.3",
+ "rand 0.10.4",
  "rand_pcg",
  "robust",
  "rstar",
@@ -4808,7 +4808,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "percent-encoding",
  "quick-xml 0.41.0",
- "rand 0.10.3",
+ "rand 0.10.4",
  "reqwest 0.12.28",
  "ring",
  "rustls-pki-types",
@@ -5538,7 +5538,7 @@ dependencies = [
  "chacha20",
  "core_detect",
  "num-traits",
- "rand 0.10.3",
+ "rand 0.10.4",
  "rand_xorshift",
  "regex-syntax",
  "rusty-fork",
@@ -5763,7 +5763,7 @@ dependencies = [
  "bytes",
  "getrandom 0.4.3",
  "lru-slab",
- "rand 0.10.3",
+ "rand 0.10.4",
  "rand_pcg",
  "ring",
  "rustc-hash",
@@ -5858,9 +5858,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.3"
+version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
+checksum = "8f6fa277c67e6ea590466f04c3fe82cb509f0864fe470643e5570de9514a9b11"
 dependencies = [
  "chacha20",
  "getrandom 0.4.3",
@@ -6923,7 +6923,7 @@ dependencies = [
  "hmac",
  "jsonwebtoken",
  "moka",
- "rand 0.10.3",
+ "rand 0.10.4",
  "reqwest 0.13.5",
  "serde",
  "serde_json",
@@ -6954,7 +6954,7 @@ dependencies = [
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
  "parquet",
- "rand 0.10.3",
+ "rand 0.10.4",
  "reqwest 0.13.5",
  "rustls",
  "serde",
@@ -7522,7 +7522,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot 0.13.0",
  "proptest",
- "rand 0.10.3",
+ "rand 0.10.4",
  "reqwest 0.13.5",
  "serde",
  "serde_json",
@@ -7835,7 +7835,7 @@ dependencies = [
  "log",
  "md-5 0.11.0",
  "memchr",
- "rand 0.10.3",
+ "rand 0.10.4",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -9194,7 +9194,7 @@ dependencies = [
  "prost-types",
  "quick-xml 0.41.0",
  "quote",
- "rand 0.10.3",
+ "rand 0.10.4",
  "rand 0.9.5",
  "regex",
  "regex-automata",
