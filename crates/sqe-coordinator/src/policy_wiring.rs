@@ -40,6 +40,30 @@ pub fn build_policy_enforcer(
     hive_manifest_cache: Arc<sqe_catalog::hive::provider::HiveMetadataCache>,
     metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
 ) -> anyhow::Result<(Arc<dyn PolicyEnforcer>, Option<Arc<dyn PolicyStore>>)> {
+    build_policy_enforcer_with_engine_catalogs(
+        config,
+        table_cache,
+        hive_catalogs,
+        hive_manifest_cache,
+        metrics,
+        Vec::new(),
+    )
+}
+
+/// [`build_policy_enforcer`] for a deployment where some catalogs read with
+/// the engine's keys (`[catalogs.*] credentials`, #934). `engine_catalogs`
+/// names them; the Ranger store default-denies `select` on their tables, so
+/// a table with no policy answers with no rows and the engine fetches no
+/// keys for it.
+#[allow(clippy::type_complexity)]
+pub fn build_policy_enforcer_with_engine_catalogs(
+    config: &PolicyConfig,
+    table_cache: Option<sqe_catalog::TableMetadataCache>,
+    hive_catalogs: Arc<sqe_policy::plan_rewriter::HiveCatalogs>,
+    hive_manifest_cache: Arc<sqe_catalog::hive::provider::HiveMetadataCache>,
+    metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
+    engine_catalogs: Vec<String>,
+) -> anyhow::Result<(Arc<dyn PolicyEnforcer>, Option<Arc<dyn PolicyStore>>)> {
     let mask_key: Option<Arc<Vec<u8>>> = if config.mask_key.is_empty() {
         None
     } else {
@@ -88,7 +112,8 @@ pub fn build_policy_enforcer(
                 // own (there is no Polaris in front of a Glue catalog or a
                 // sidecar warehouse), so it needs the same live root registry
                 // the rewriter keys policies with.
-                .with_hive_catalogs(hive_catalogs.clone());
+                .with_hive_catalogs(hive_catalogs.clone())
+                .with_engine_catalogs(engine_catalogs);
             if store.enforces_hive_access() {
                 tracing::info!(
                     "Ranger access policies gate Hive-root tables: a table with no `select` \

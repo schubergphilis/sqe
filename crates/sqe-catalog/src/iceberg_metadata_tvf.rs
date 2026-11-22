@@ -304,7 +304,13 @@ impl TableProvider for IcebergMetadataProvider {
                 ))
             })?;
 
+            // A table the policy engine denied the person `select` on (engine
+            // credential identity, #934) answers every metadata function with
+            // no rows: the manifests need keys it does not have, and snapshot
+            // summaries carry row counts.
+            let denied = crate::engine_identity::is_read_denied(&table);
             let batch = match self.kind {
+                _ if denied => RecordBatch::new_empty(self.schema.clone()),
                 MetadataKind::Snapshots => build_snapshots_batch(&table, &self.schema)?,
                 MetadataKind::Manifests => build_manifests_batch(&table, &self.schema).await?,
                 MetadataKind::History => build_history_batch(&table, &self.schema)?,

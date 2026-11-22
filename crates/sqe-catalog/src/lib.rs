@@ -7,6 +7,7 @@ pub mod catalog_provider;
 pub mod column_tag_ids;
 pub mod dynamic_filter_wiring;
 pub mod eliminate_cross_join;
+pub mod engine_identity;
 pub mod expr_to_predicate;
 pub mod file_tvf_common;
 pub mod file_tvf_prepare;

@@ -84,6 +84,19 @@ async fn polaris_token(client_id: &str, client_secret: &str) -> String {
 /// `extra` privileges; returns its token. Role creation answers 409 on a
 /// rerun, which is fine: the grants are idempotent.
 pub(crate) async fn principal_token(root: &str, name: &str, extra: &[&str]) -> String {
+    let read = [
+        "CATALOG_READ_PROPERTIES",
+        "NAMESPACE_LIST",
+        "NAMESPACE_READ_PROPERTIES",
+        "TABLE_LIST",
+        "TABLE_READ_DATA",
+    ];
+    let privileges: Vec<&str> = read.iter().chain(extra).copied().collect();
+    principal_token_with(root, name, &privileges).await
+}
+
+/// [`principal_token`] with exactly `privileges` on the test catalog.
+pub(crate) async fn principal_token_with(root: &str, name: &str, privileges: &[&str]) -> String {
     let principal_role = format!("{name}_role");
     let catalog_role = format!("{name}_cr");
     let http = reqwest::Client::new();
@@ -118,14 +131,7 @@ pub(crate) async fn principal_token(root: &str, name: &str, extra: &[&str]) -> S
         .json(&serde_json::json!({ "catalogRole": { "name": catalog_role } }))
         .send()
         .await;
-    let read = [
-        "CATALOG_READ_PROPERTIES",
-        "NAMESPACE_LIST",
-        "NAMESPACE_READ_PROPERTIES",
-        "TABLE_LIST",
-        "TABLE_READ_DATA",
-    ];
-    for privilege in read.iter().chain(extra) {
+    for privilege in privileges {
         http.put(format!(
             "{mgmt}/catalogs/{CATALOG}/catalog-roles/{catalog_role}/grants"
         ))
@@ -175,7 +181,7 @@ pub(crate) fn session_for(name: &str, token: String) -> Session {
 }
 
 /// Every object under the table's location, data and metadata alike.
-async fn objects_under(location: &str) -> Vec<String> {
+pub(crate) async fn objects_under(location: &str) -> Vec<String> {
     let rest = location
         .strip_prefix("s3://")
         .unwrap_or_else(|| panic!("an s3 location: {location}"));

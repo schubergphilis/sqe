@@ -1753,7 +1753,7 @@ impl CatalogOps {
             Some(raw) if checked => {
                 let table_lock = self.table_lock_for(&table_ident);
                 let held = table_lock.lock_owned().await;
-                let table = session_catalog.load_table(&table_ident).await?;
+                let table = session_catalog.load_table_for_write(&table_ident).await?;
                 let metadata = table.metadata();
                 let (properties, schema) = (metadata.properties(), metadata.current_schema());
                 checked_schema_id = Some(schema.schema_id());
@@ -1838,7 +1838,7 @@ impl CatalogOps {
         let mut table_updates = Vec::new();
         let mut requirements = vec![];
         if let Some(version) = requested_version {
-            let table = session_catalog.load_table(&table_ident).await?;
+            let table = session_catalog.load_table_for_write(&table_ident).await?;
             let live = table.metadata().format_version();
             if version < live {
                 return Err(SqeError::with_code(
@@ -1861,7 +1861,7 @@ impl CatalogOps {
             }
         }
         if !layout.is_empty() {
-            let table = session_catalog.load_table(&table_ident).await?;
+            let table = session_catalog.load_table_for_write(&table_ident).await?;
             for trino in &layout {
                 let (layout_updates, layout_requirements) = trino.alter_updates(&table)?;
                 table_updates.extend(layout_updates);
@@ -1968,7 +1968,7 @@ impl CatalogOps {
             )
             .await?;
 
-        let table = session_catalog.load_table(&table_ident).await?;
+        let table = session_catalog.load_table_for_write(&table_ident).await?;
         let metadata = table.metadata();
         let existing = metadata.reference_by_name(ref_name);
 
@@ -2103,7 +2103,7 @@ impl CatalogOps {
         let table_lock = self.table_lock_for(&table_ident);
         let _guard = table_lock.lock().await;
 
-        let table = session_catalog.load_table(&table_ident).await?;
+        let table = session_catalog.load_table_for_write(&table_ident).await?;
         // Resolved by field id (#920): the statement names current columns,
         // and the write records their ids from the schema it pins below.
         let live = crate::live_tags::LiveTags::read(table.metadata()).map_err(|e| {
@@ -2344,7 +2344,7 @@ impl CatalogOps {
             )
             .await?;
 
-        let table = session_catalog.load_table(&table_ident).await?;
+        let table = session_catalog.load_table_for_write(&table_ident).await?;
         let metadata = table.metadata();
         let current_spec = metadata.default_partition_spec();
         let current_spec_id = metadata.default_partition_spec_id();
@@ -2536,7 +2536,7 @@ impl CatalogOps {
                 resolve_target_catalog(catalog_qualifier(&object_name), session).as_deref(),
             )
             .await?;
-        let table = session_catalog.load_table(&table_ident).await?;
+        let table = session_catalog.load_table_for_write(&table_ident).await?;
         let metadata = table.metadata();
         let current = metadata.current_schema();
 
@@ -2702,6 +2702,7 @@ impl CatalogOps {
                     session.access_token().expose(),
                 )
                 .await?
+                .into_write_catalog()
                 .scoped_to(
                     session,
                     &default_write_catalog(&self.config, target_warehouse),

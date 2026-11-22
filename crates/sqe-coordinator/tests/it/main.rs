@@ -46,6 +46,7 @@ mod dml_in_subquery_row_alignment_e2e;
 mod dml_write_precheck_e2e;
 mod drain_process_e2e;
 mod drop_schema_cascade_e2e;
+mod engine_credential_e2e;
 mod equality_delete_integration;
 mod flight_ingest_e2e;
 mod flight_sql_smoke;

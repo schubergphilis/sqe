@@ -428,9 +428,13 @@ pub(crate) fn explicit_headers_from_props(props: &HashMap<String, String>) -> Re
 // properties over it, so a static key pair configured on the client silently
 // replaces the short-lived, table-scoped credentials the server vended, and
 // `storage-credentials` is parsed but never read.
+//
+// SQE PATCH (engine credential identity, #934): the three helpers below are
+// `pub` so SQE merges keys it fetches from `/credentials` with the same
+// precedence rules instead of a copy.
 
 /// Property keys that carry storage credentials a REST server can vend.
-fn is_vended_credential_key(key: &str) -> bool {
+pub fn is_vended_credential_key(key: &str) -> bool {
     matches!(
         key,
         "s3.access-key-id"
@@ -455,7 +459,7 @@ fn normalize_storage_scheme(location: &str) -> std::borrow::Cow<'_, str> {
 /// The storage credential whose `prefix` is the longest prefix of
 /// `location` (Iceberg REST spec: "choose the most specific prefix").
 /// `None` when no entry covers the location.
-pub(crate) fn select_storage_credential<'a>(
+pub fn select_storage_credential<'a>(
     credentials: Option<&'a [crate::types::StorageCredential]>,
     location: &str,
 ) -> Option<&'a crate::types::StorageCredential> {
@@ -480,7 +484,7 @@ pub(crate) fn select_storage_credential<'a>(
 ///
 /// A server that vends nothing (no delegation header was sent) leaves the
 /// result identical to upstream's `config` + local merge.
-pub(crate) fn table_file_io_props(
+pub fn table_file_io_props(
     response_config: &HashMap<String, String>,
     storage_credentials: Option<&[crate::types::StorageCredential]>,
     table_location: &str,
