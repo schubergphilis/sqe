@@ -3,10 +3,12 @@
 //! A scope is a compact JWS (ES256) minted by a configured issuer for one
 //! bearer token. It names the catalogs a session of that token may see and
 //! whether each may be written. The verifier reuses [`BearerTokenProvider`]
-//! for the JWKS fetch, key rotation, per-key algorithm pinning, `iss`, `exp`
-//! and `nbf`, then checks what is specific to a scope: the header algorithm
-//! is ES256, `sub` and `jti` equal the bearer's, and `catalogs` is a map of
-//! catalog name to `read_write` or `read_only`.
+//! for the JWKS fetch, key rotation, per-key algorithm pinning, `iss`
+//! (required, equal to the configured issuer), `exp` and `nbf`, then checks
+//! what is specific to a scope: the header algorithm is ES256, the header
+//! `typ` is one this verifier knows, `sub` and `jti` equal the bearer's, and
+//! `catalogs` is a map of catalog name to `read_write` or `read_only`.
+//! Other claims, such as `iat`, are accepted and not checked.
 //!
 //! The scope only narrows. The bearer token still goes to Polaris and S3,
 //! so the user stays the identity end to end.
@@ -40,7 +42,19 @@ fn refuse(reason: impl Into<String>) -> ScopeRefusal {
 pub struct CatalogScopeVerifier {
     client_id: String,
     header_name: String,
+    /// The configured scope `typ`, normalised by [`media_type`].
+    token_type: String,
     keys: BearerTokenProvider,
+}
+
+/// A JOSE `typ` as a comparable media type: lowercased, without the optional
+/// `application/` prefix (RFC 7515 section 4.1.9).
+fn media_type(typ: &str) -> String {
+    let typ = typ.trim().to_ascii_lowercase();
+    match typ.strip_prefix("application/") {
+        Some(rest) => rest.to_string(),
+        None => typ,
+    }
 }
 
 impl std::fmt::Debug for CatalogScopeVerifier {
@@ -73,6 +87,7 @@ impl CatalogScopeVerifier {
         Ok(Self {
             client_id: config.client_id.clone(),
             header_name: config.header_name.to_ascii_lowercase(),
+            token_type: media_type(&config.token_type),
             keys,
         })
     }
@@ -109,6 +124,7 @@ impl CatalogScopeVerifier {
         if header.alg != Algorithm::ES256 {
             return Err(refuse("the scope must be signed with ES256"));
         }
+        self.check_type(header.typ.as_deref())?;
         let claims = self
             .keys
             .verify_jwt_claims(scope_token)
@@ -118,6 +134,28 @@ impl CatalogScopeVerifier {
                 other => refuse(format!("the signature or lifetime is invalid ({other})")),
             })?;
         scope_from_claims(&claims, binding)
+    }
+
+    /// Read a scope only in a format this verifier knows. The configured
+    /// `token_type` names the format and its version. An absent `typ` and
+    /// the generic `JWT` name no version, so a producer that sets neither is
+    /// still read. Any other `typ`, such as a later version or an access
+    /// token's `at+jwt`, is refused.
+    fn check_type(&self, typ: Option<&str>) -> Result<(), ScopeRefusal> {
+        let Some(typ) = typ else {
+            return Ok(());
+        };
+        let typ = media_type(typ);
+        if typ == "jwt" || typ == self.token_type {
+            Ok(())
+        } else {
+            // The presented `typ` is unauthenticated input, so it stays out
+            // of the reason, which reaches the client and the audit log.
+            Err(refuse(format!(
+                "the scope type is not known (expected `{}`)",
+                self.token_type
+            )))
+        }
     }
 }
 
@@ -202,8 +240,13 @@ Gsk+TB4BOZOZvvRKOPj1Dj5tcKc/tv2Hx8kiS4egVEC2qWmKaBDbv9kN
     }
 
     fn sign(claims: &serde_json::Value, kid: &str) -> String {
+        sign_typed(claims, kid, Some("JWT"))
+    }
+
+    fn sign_typed(claims: &serde_json::Value, kid: &str, typ: Option<&str>) -> String {
         let mut header = Header::new(Algorithm::ES256);
         header.kid = Some(kid.to_string());
+        header.typ = typ.map(str::to_string);
         encode(
             &header,
             claims,
@@ -248,12 +291,101 @@ Gsk+TB4BOZOZvvRKOPj1Dj5tcKc/tv2Hx8kiS4egVEC2qWmKaBDbv9kN
     }
 
     async fn verifier() -> CatalogScopeVerifier {
+        verifier_with("").await
+    }
+
+    async fn verifier_with(extra_config: &str) -> CatalogScopeVerifier {
         let jwks_url = jwks_server().await;
         let config: CatalogScopeConfig = toml::from_str(&format!(
-            "client_id = \"portal-data-runs\"\nissuer = \"{ISSUER}\"\njwks_url = \"{jwks_url}\"\nallow_insecure_jwks = true"
+            "client_id = \"portal-data-runs\"\nissuer = \"{ISSUER}\"\njwks_url = \"{jwks_url}\"\nallow_insecure_jwks = true\n{extra_config}"
         ))
         .unwrap();
         CatalogScopeVerifier::new(&config).unwrap()
+    }
+
+    /// The claims of the producer's version 1 contract: item 7's `sub`,
+    /// `jti`, `catalogs` and `exp`, plus `iss` and `iat`.
+    fn contract_claims() -> serde_json::Value {
+        let mut c = claims("jti-1", 600);
+        c["iat"] = json!(Utc::now().timestamp());
+        c
+    }
+
+    #[tokio::test]
+    async fn configured_type_with_iss_and_iat_is_read() {
+        let v = verifier_with("token_type = \"portal-catalog-scope+jwt\"").await;
+        for typ in [
+            "portal-catalog-scope+jwt",
+            "Portal-Catalog-Scope+JWT",
+            "application/portal-catalog-scope+jwt",
+        ] {
+            let scope = v
+                .verify(&sign_typed(&contract_claims(), KID, Some(typ)), &binding())
+                .await
+                .unwrap_or_else(|e| panic!("typ {typ}: {e}"));
+            assert_eq!(scope.access("sales"), Some(CatalogAccess::ReadWrite));
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_or_generic_type_is_read() {
+        let v = verifier_with("token_type = \"portal-catalog-scope+jwt\"").await;
+        for typ in [None, Some("JWT"), Some("jwt")] {
+            assert!(
+                v.verify(&sign_typed(&contract_claims(), KID, typ), &binding())
+                    .await
+                    .is_ok(),
+                "typ {typ:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_type_is_refused() {
+        let v = verifier_with("token_type = \"portal-catalog-scope+jwt\"").await;
+        for typ in [
+            "portal-catalog-scope-v2+jwt",
+            "at+jwt",
+            "sqe-catalog-scope+jwt",
+            "",
+        ] {
+            let err = v
+                .verify(&sign_typed(&contract_claims(), KID, Some(typ)), &binding())
+                .await
+                .expect_err(typ);
+            assert!(err.0.contains("type is not known"), "{typ}: {err}");
+            assert!(
+                typ.is_empty() || !err.0.contains(typ),
+                "the presented typ must not be echoed: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn default_type_is_the_neutral_name() {
+        let v = verifier().await;
+        assert!(v
+            .verify(
+                &sign_typed(&contract_claims(), KID, Some("sqe-catalog-scope+jwt")),
+                &binding()
+            )
+            .await
+            .is_ok());
+        assert!(v
+            .verify(
+                &sign_typed(&contract_claims(), KID, Some("portal-catalog-scope+jwt")),
+                &binding()
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn missing_issuer_is_refused() {
+        let v = verifier().await;
+        let mut c = contract_claims();
+        c.as_object_mut().unwrap().remove("iss");
+        assert!(v.verify(&sign(&c, KID), &binding()).await.is_err());
     }
 
     #[tokio::test]

@@ -391,6 +391,7 @@ absolute_timeout_secs = 28800  # 8 hours — sessions older than this are expire
 # issuer = "https://orchestrator.example.com"
 # jwks_url = "https://orchestrator.example.com/.well-known/jwks.json"
 # header_name = "x-sqe-catalog-scope"
+# token_type = "sqe-catalog-scope+jwt"   # JOSE typ read; JWT or none also read, others refused
 # leeway_secs = 30
 # allow_insecure_jwks = false   # development only: plain-http JWKS
 

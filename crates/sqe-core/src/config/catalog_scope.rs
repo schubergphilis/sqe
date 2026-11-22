@@ -27,6 +27,13 @@ pub struct CatalogScopeConfig {
     /// scope. Matched case-insensitively.
     #[serde(default = "default_catalog_scope_header")]
     pub header_name: String,
+    /// The JOSE header `typ` that names the scope format and its version.
+    /// A scope whose `typ` is this value, the generic `JWT`, or absent is
+    /// read; any other `typ` is refused, so a later version of the format is
+    /// never read as this one. Compared case-insensitively, with an optional
+    /// `application/` prefix (RFC 7515 section 4.1.9).
+    #[serde(default = "default_catalog_scope_token_type")]
+    pub token_type: String,
     /// Accept a plain-http JWKS URL. Development only.
     #[serde(default)]
     pub allow_insecure_jwks: bool,
@@ -74,6 +81,12 @@ fn default_catalog_scope_header() -> String {
     DEFAULT_CATALOG_SCOPE_HEADER.to_string()
 }
 
+pub const DEFAULT_CATALOG_SCOPE_TOKEN_TYPE: &str = "sqe-catalog-scope+jwt";
+
+fn default_catalog_scope_token_type() -> String {
+    DEFAULT_CATALOG_SCOPE_TOKEN_TYPE.to_string()
+}
+
 fn default_catalog_scope_leeway() -> u64 {
     30
 }
@@ -91,6 +104,7 @@ impl CatalogScopeConfig {
             ("issuer", &self.issuer),
             ("jwks_url", &self.jwks_url),
             ("header_name", &self.header_name),
+            ("token_type", &self.token_type),
         ] {
             if value.trim().is_empty() {
                 return Err(format!("[session.catalog_scope] {field} must not be empty"));
@@ -122,8 +136,23 @@ issuer = "https://portal.example"
 jwks_url = "https://portal.example/jwks.json""#,
         );
         assert_eq!(c.header_name, DEFAULT_CATALOG_SCOPE_HEADER);
+        assert_eq!(c.token_type, DEFAULT_CATALOG_SCOPE_TOKEN_TYPE);
         assert_eq!(c.leeway_secs, 30);
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn token_type_is_configurable_and_not_empty() {
+        let mut c = parse(
+            r#"client_id = "c"
+issuer = "i"
+jwks_url = "https://x/jwks"
+token_type = "portal-catalog-scope+jwt""#,
+        );
+        assert_eq!(c.token_type, "portal-catalog-scope+jwt");
+        assert!(c.validate().is_ok());
+        c.token_type = " ".into();
+        assert!(c.validate().is_err());
     }
 
     #[test]

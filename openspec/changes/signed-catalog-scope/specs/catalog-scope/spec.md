@@ -2,9 +2,12 @@
 
 ### Requirement: Sessions of the configured client require a valid scope
 When `[session.catalog_scope]` is configured, the system SHALL refuse a session whose bearer token has `azp` equal to `client_id` unless it presents a catalog scope that meets all of these conditions:
-- it is signed by a key of the configured issuer;
+- it is signed by a key of the configured issuer, and its `iss` equals that issuer;
+- its JOSE `typ` is the configured `token_type`, the generic `JWT`, or absent;
 - its `sub` and `jti` equal the bearer's;
 - it has not expired.
+
+Other claims, such as `iat`, SHALL be accepted.
 
 The refusal SHALL carry a reason and SHALL be audited with the catalog names only. The requirement SHALL hold on every protocol, including those that cannot carry a scope. Tokens of other clients SHALL behave as before.
 
@@ -15,6 +18,14 @@ The refusal SHALL carry a reason and SHALL be audited with the catalog names onl
 #### Scenario: Wrong jti, expired or bad signature
 - **WHEN** the scope is for another `jti`, has expired, or is signed by an unknown key
 - **THEN** the session is refused the same way
+
+#### Scenario: Unknown scope type
+- **WHEN** the scope's `typ` names another format or version (for example a later version, or `at+jwt`)
+- **THEN** the session is refused the same way, and the reason does not repeat the presented `typ`
+
+#### Scenario: Producer claims beyond the minimum
+- **WHEN** a valid scope also carries `iat` and a `typ` equal to the configured `token_type`
+- **THEN** it is accepted
 
 #### Scenario: Other clients unaffected
 - **WHEN** a token of another client opens a session without a scope
