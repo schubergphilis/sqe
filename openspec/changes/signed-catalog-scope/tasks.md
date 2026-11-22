@@ -10,6 +10,7 @@
 - [x] 2.2 Read the scope header on HTTP/Trino and Flight SQL metadata per request; refuse with reason + audit
 - [x] 2.3 Fail closed at `create_session_context` / `build_session_catalog` for the scoped client without a valid scope (D3)
 - [x] 2.4 Both cache keys include the scope digest, only when a scope is present
+- [x] 2.5 Producer contract version 1 deltas: `iss` required and equal to `issuer` (already enforced; test for a missing `iss`), `iat` accepted, header `typ` checked against `[session.catalog_scope] token_type` (absent and `JWT` read, others refused)
 
 ## 3. Narrowing
 

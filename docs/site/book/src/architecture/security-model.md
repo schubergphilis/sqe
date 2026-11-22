@@ -16,10 +16,14 @@ The orchestrator mints the job a token issued to its runs client (`sub` is the p
 
 | Claim | Meaning |
 |---|---|
+| `iss` | Required; must equal the configured `issuer` |
 | `sub` | Must equal the bearer's `sub` |
 | `jti` | Must equal the bearer's `jti`, so the scope is bound to one token |
 | `catalogs` | Object of catalog name to `read_write` or `read_only` |
 | `exp` | Expiry; a leeway of `leeway_secs` (default 30) applies |
+| `iat` | Optional; accepted and not checked |
+
+The JOSE header's `typ` names the scope format and its version. SQE reads a scope whose `typ` is the configured `token_type` (default `sqe-catalog-scope+jwt`), the generic `JWT`, or absent, and refuses any other `typ`. A later version of an orchestrator's format is therefore never read as the one SQE knows. The comparison ignores case and an `application/` prefix.
 
 The client sends it in the `x-sqe-catalog-scope` HTTP header on the Trino path, or as Flight SQL call metadata under the same key. The name is configurable with `header_name`: an orchestrator that already sends the scope under its own header name sets `header_name` to that name, and the Flight SQL metadata key follows it. SQE verifies the signature against the issuer's JWKS and checks the binding and the expiry. A session of that client without a valid scope is refused with the reason, and the refusal is written to the audit log. The refusal also holds on protocols that cannot carry the header (MCP, Quack): such a session never gets a query context.
 
@@ -55,6 +59,7 @@ client_id = "orchestrator-runs"        # azp of the job tokens
 issuer = "https://orchestrator.example.com"  # iss of the scope JWS
 jwks_url = "https://orchestrator.example.com/.well-known/jwks.json"
 # header_name = "x-sqe-catalog-scope"
+# token_type = "sqe-catalog-scope+jwt"  # JOSE typ of the scope; others are refused
 # leeway_secs = 30
 # mode = "binding"                     # binding | union | off
 ```
