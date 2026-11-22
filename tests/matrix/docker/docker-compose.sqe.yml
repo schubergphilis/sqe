@@ -1,0 +1,149 @@
+# Self-contained stack for the SQE Iceberg feature-matrix suite: Polaris (REST
+# catalog, in-memory metastore) + RustFS (S3) + one SQE coordinator from a
+# published image. Black box: the suite only talks to the three host ports.
+#
+#   polaris       Iceberg REST catalog on :8181 (host: POLARIS_PORT, 48181)
+#   rustfs        S3 storage                (host: RUSTFS_PORT, 49000)
+#   rustfs-init   creates the warehouse bucket
+#   polaris-setup creates the "demo" catalog and grants root content access
+#   sqe           sqe-server --mode coordinator, Trino HTTP on host SQE_PORT (48080)
+#
+# Storage endpoint: the catalog hands the SAME endpoint to every client, and
+# SQE (in the compose network) and the suite's PyIceberg witness (on the host)
+# cannot share one address. The catalog therefore advertises http://rustfs:9000
+# (right for SQE); the suite overrides the endpoint on the host side with
+# ICEBERG_S3_ENDPOINT (default http://127.0.0.1:49000).
+#
+# Start with start-sqe.sh, tear down with stop-sqe.sh (drops the volumes: the
+# catalog's storage config cannot be changed in place).
+name: sqe-matrix
+
+services:
+  rustfs:
+    image: rustfs/rustfs:${RUSTFS_VERSION:-1.0.0-rc.6}
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_KEY_ID:-rustfs}
+      RUSTFS_SECRET_KEY: ${S3_SECRET:-rustfs12345}
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ENABLE: "false"
+      RUSTFS_OBS_LOGGER_LEVEL: error
+    ports:
+      - "${RUSTFS_PORT:-49000}:9000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    volumes:
+      - rustfs_data:/data
+
+  rustfs-init:
+    image: rustfs/rc:latest
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    environment:
+      KEY_ID: ${S3_KEY_ID:-rustfs}
+      SECRET: ${S3_SECRET:-rustfs12345}
+      BUCKET: ${BUCKET:-warehouse}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        until /usr/bin/rc alias set local http://rustfs:9000 "$${KEY_ID}" "$${SECRET}"; do
+          echo "[rustfs-init] waiting for RustFS..."; sleep 2
+        done
+        /usr/bin/rc ls "local/$${BUCKET}" >/dev/null 2>&1 || /usr/bin/rc mb "local/$${BUCKET}"
+        echo "[rustfs-init] bucket $${BUCKET} ready"
+
+  polaris:
+    image: ${POLARIS_IMAGE:-apache/polaris:1.7.0}
+    mem_limit: 3g
+    ports:
+      - "${POLARIS_PORT:-48181}:8181"
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    environment:
+      AWS_REGION: ${S3_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${S3_KEY_ID:-rustfs}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET:-rustfs12345}
+      POLARIS_BOOTSTRAP_CREDENTIALS: "${POLARIS_REALM:-POLARIS},${POLARIS_CLIENT_ID:-root},${POLARIS_CLIENT_SECRET:-s3cr3t}"
+      polaris.realm-context.realms: ${POLARIS_REALM:-POLARIS}
+      # SQE sends no realm header; make the one realm the default.
+      polaris.realm-context.default-realm: ${POLARIS_REALM:-POLARIS}
+      polaris.realm-context.require-header: "false"
+      polaris.features."DROP_WITH_PURGE_ENABLED": "true"
+      POLARIS_PRODUCTION_READINESS_CHECKS_ENABLED: "false"
+      quarkus.otel.sdk.disabled: "true"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8182/q/health"]
+      interval: 2s
+      timeout: 10s
+      retries: 40
+      start_period: 10s
+
+  polaris-setup:
+    image: alpine/curl:latest
+    depends_on:
+      polaris:
+        condition: service_healthy
+    environment:
+      CLIENT_ID: ${POLARIS_CLIENT_ID:-root}
+      CLIENT_SECRET: ${POLARIS_CLIENT_SECRET:-s3cr3t}
+      REALM: ${POLARIS_REALM:-POLARIS}
+      CATALOG: ${POLARIS_CATALOG:-demo}
+      BUCKET: ${BUCKET:-warehouse}
+      S3_REGION: ${S3_REGION:-us-east-1}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        apk add --no-cache jq >/dev/null
+        TOKEN=$$(curl -sS --fail-with-body http://polaris:8181/api/catalog/v1/oauth/tokens \
+          -d "client_id=$${CLIENT_ID}" -d "client_secret=$${CLIENT_SECRET}" -H "Polaris-Realm: $${REALM}" \
+          -d grant_type=client_credentials -d scope=PRINCIPAL_ROLE:ALL | jq -r .access_token)
+        [ -n "$${TOKEN}" ] && [ "$${TOKEN}" != "null" ] || { echo "[polaris-setup] no token" >&2; exit 1; }
+        code=$$(curl -sS -o /tmp/out -w '%{http_code}' \
+          -H "Authorization: Bearer $${TOKEN}" -H "Polaris-Realm: $${REALM}" \
+          -H 'Content-Type: application/json' -H 'Accept: application/json' \
+          -X POST http://polaris:8181/api/management/v1/catalogs \
+          -d '{"catalog":{"name":"'"$${CATALOG}"'","type":"INTERNAL","readOnly":false,
+                "properties":{"default-base-location":"s3://'"$${BUCKET}"'"},
+                "storageConfigInfo":{"storageType":"S3",
+                  "allowedLocations":["s3://'"$${BUCKET}"'"],
+                  "endpoint":"http://rustfs:9000",
+                  "endpointInternal":"http://rustfs:9000",
+                  "pathStyleAccess":true,
+                  "region":"'"$${S3_REGION}"'"}}}')
+        cat /tmp/out; echo
+        case "$$code" in
+          2*) echo "[polaris-setup] catalog created ($$code)" ;;
+          409) echo "[polaris-setup] catalog already present, continuing" ;;
+          *) echo "[polaris-setup] create catalog failed ($$code)" >&2; exit 1 ;;
+        esac
+        curl -sS --fail-with-body -o /dev/null \
+          -H "Authorization: Bearer $${TOKEN}" -H "Polaris-Realm: $${REALM}" \
+          -H 'Content-Type: application/json' -X PUT \
+          "http://polaris:8181/api/management/v1/catalogs/$${CATALOG}/catalog-roles/catalog_admin/grants" \
+          -d '{"type":"catalog","privilege":"CATALOG_MANAGE_CONTENT"}'
+        echo "[polaris-setup] granted CATALOG_MANAGE_CONTENT"
+
+  sqe:
+    image: ${SQE_IMAGE:?set SQE_IMAGE to the SQE image under test}
+    # sqe-server is the image entrypoint.
+    command: ["--mode", "coordinator", "--config", "/etc/sqe/config.toml"]
+    ports:
+      - "${SQE_PORT:-48080}:8080"
+      - "${SQE_FLIGHT_PORT:-48051}:50051"
+    volumes:
+      - ./sqe-config.toml:/etc/sqe/config.toml:ro
+    depends_on:
+      polaris-setup:
+        condition: service_completed_successfully
+
+volumes:
+  rustfs_data:

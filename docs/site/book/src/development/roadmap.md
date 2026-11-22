@@ -291,6 +291,7 @@ Iceberg V3 table format support landed end-to-end. V3 is the default format-vers
 - Error messages tuned for catalog and auth failures
 - Partition pruning across all predicate types
 - Iceberg parity harness (`test/iceberg-parity-harness`): DDL/DML/metadata/interop scenarios diffed against Trino on a shared catalog
+- Black-box Iceberg matrix suite (`tests/matrix/`, `make matrix-suite`): re-measures the matrix score against a running SQE image, with a reader other than SQE confirming each write. 45 of 54 cells are measured locally; the cloud catalogs need credentials
 - Security audit 2026-09-20 (#708): 33 of 38 source-first findings fixed in ten themed merge requests (2026-09-20/21). Trino OAuth2 pending sessions keyed by the client id; `aud` required when configured; SHOW GRANTS and SET TAGS gated; DML subqueries and appends under the policy enforcer; Hive metadata keyed like SELECT; worker tickets and compaction requests audience-bound; MCP fails closed on unknown table functions and the `system` catalog; redaction handles doubled quotes and ATTACH keys; production_mode refuses inline TVF credentials, HMAC tickets and unverified advertise. Open with documented seams: #716 (Hive information_schema per user), #676, #729 (Hive append), #750
 
 ---
