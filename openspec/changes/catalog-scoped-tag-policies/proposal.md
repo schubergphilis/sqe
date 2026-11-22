@@ -13,6 +13,8 @@ Under `[policy.ranger] catalog_scoped`, resource policies name `<catalog>.<names
 - Column tags stay bare in `sqe.column-tags`: a tag's catalog is its table's catalog.
 - The Ranger tag projector writes both names on the column, so Spark applies the same policies.
 - The `table_files` / `table_partitions` metadata functions key their tag and policy lookups on the catalog they read, not always on the session's.
+- Policies written in SQL follow the session's catalog: `CREATE POLICY ... ON TAG pii` stores the policy on `<catalog>.pii`, `SET MASKING POLICY` keeps the column tag bare, and `CREATE OR REPLACE POLICY` refuses to move a policy to another tag.
+- A bare tag policy from before the setting keeps applying in every catalog. That is accepted only because it adds masks and never removes one; the one exception (a column literally tagged `c.pii` in another catalog) is #943.
 - With `catalog_scoped` off, nothing changes.
 
 ## Why a qualified tag value, not a resource

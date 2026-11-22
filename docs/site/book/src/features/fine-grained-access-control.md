@@ -55,7 +55,17 @@ A tag policy names a tag, not a table, so the setting scopes it through the tag'
 - When both mask the same column, the catalog's mask wins. When both carry a different row filter, the query is refused (see [one row filter per table](#one-row-filter-per-table)). A tag policy SQE cannot map under either name restricts the column.
 - When SQE projects column tags into Ranger for Spark, it writes both names on the column, so Spark applies the same two policies.
 
-With the setting off, a policy on `ws_sales.pii` matches nothing.
+Policies written in SQL follow the session's catalog:
+
+- `CREATE POLICY ... ON TAG pii` run with `ws_sales` as the current catalog stores the policy on `ws_sales.pii`. It never writes a bare `pii` policy that would apply in every catalog. A dotted tag (`ON TAG ws_hr.pii`) names its catalog and is kept as written.
+- `ALTER TABLE ws_sales.s.t MODIFY COLUMN c SET MASKING POLICY p`, with `p` on `ws_sales.pii`, tags the column `pii`, the same tag `SET TAGS` writes.
+- `CREATE OR REPLACE POLICY` refuses to change the tag a policy is on, because that changes the catalogs it governs. Drop the policy and create it again instead. This also stops a bare `pii` policy written before the setting was on from being narrowed to one catalog by a replace.
+
+A bare `pii` policy made before the setting was on, or in Ranger Admin, still applies in every catalog. Leaving it in place is safe because it can only add a mask, never remove one. One exception: a column tagged with the literal name `ws_sales.pii` in another catalog gets `ws_sales`'s policy, and if that mask is weaker, the catalog's mask wins over the bare one. Tag writes are limited to `apply_tag` holders, but do not tag columns with dotted names.
+
+Policy names are unique per Ranger tag service, so two catalogs cannot each have a policy named `pii-mask`. Put the catalog in the name. Spark applies a new `ws_sales.pii` policy only to columns whose tags were projected under `catalog-scoped`; run `CALL system.reproject_column_tags(catalog => 'ws_sales')` for tables tagged before the setting was turned on.
+
+With the setting off, a policy on `ws_sales.pii` matches nothing, and `ON TAG pii` stays a bare policy.
 
 ### Which item and which policy wins
 

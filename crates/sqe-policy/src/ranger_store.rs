@@ -1697,19 +1697,33 @@ impl RangerStore {
             .into_iter()
             .find(|p| p.get("name").and_then(serde_json::Value::as_str) == Some(&stmt.name));
         match existing {
-            Some(_) if !stmt.or_replace => Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
-                "Policy '{}' is present; use CREATE OR REPLACE POLICY",
-                stmt.name
-            ))),
+            Some(_) if !stmt.or_replace => Err(sqe_core::SqeError::with_code(
+                sqe_core::SqeErrorCode::ExecutionFailed,
+                format!(
+                    "Policy '{}' is present; use CREATE OR REPLACE POLICY",
+                    stmt.name
+                ),
+            )),
             Some(policy) => {
+                if let Some((from, to)) = tag_policy_move(&policy, &body) {
+                    return Err(sqe_core::SqeError::with_code(
+                        sqe_core::SqeErrorCode::ExecutionFailed,
+                        format!(
+                            "CREATE OR REPLACE POLICY '{}' would move it from tag '{from}' to \
+                             tag '{to}', which changes the catalogs it governs; DROP POLICY \
+                             '{}' first",
+                            stmt.name, stmt.name
+                        ),
+                    ));
+                }
                 let id = policy
                     .get("id")
                     .and_then(serde_json::Value::as_i64)
                     .ok_or_else(|| {
-                        sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
-                            "Ranger policy '{}' has no numeric id",
-                            stmt.name
-                        ))
+                        sqe_core::SqeError::with_code(
+                            sqe_core::SqeErrorCode::ExecutionFailed,
+                            format!("Ranger policy '{}' has no numeric id", stmt.name),
+                        )
                     })?;
                 self.send_policy_ddl(
                     reqwest::Method::PUT,
@@ -2122,6 +2136,32 @@ fn grant_item(
     item[principal_key(&principal.kind)] = serde_json::json!([principal.name]);
     item[info_key] = info;
     item
+}
+
+/// The tags a stored tag policy and its replacement body name, when they
+/// differ. Under `catalog_scoped` a tag key carries its catalog (#919), so
+/// `CREATE OR REPLACE` onto a policy with another tag would silently move it to
+/// other catalogs; the caller refuses that instead. A resource policy (no `tag`
+/// resource on either side) yields `None`.
+fn tag_policy_move(
+    existing: &serde_json::Value,
+    body: &serde_json::Value,
+) -> Option<(String, String)> {
+    let tags = |policy: &serde_json::Value| -> Option<Vec<String>> {
+        let values = policy.pointer("/resources/tag/values")?.as_array()?;
+        let mut tags: Vec<String> = values
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        tags.sort();
+        Some(tags)
+    };
+    let (from, to) = (tags(existing), tags(body));
+    if from == to {
+        return None;
+    }
+    let show = |t: Option<Vec<String>>| t.map(|t| t.join(", ")).unwrap_or_default();
+    Some((show(from), show(to)))
 }
 
 fn ranger_policy_body(

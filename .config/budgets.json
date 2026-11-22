@@ -130,7 +130,7 @@
       ]
     },
     "sqe-policy": {
-      "lines": 19700,
+      "lines": 19850,
       "deps": [
         "sqe-core",
         "sqe-metrics-core",

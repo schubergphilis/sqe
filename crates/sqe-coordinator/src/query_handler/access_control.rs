@@ -759,7 +759,10 @@ impl QueryHandler {
             )
         })?;
         match stmt {
-            PolicyDdlStatement::Create(create) => store.create_policy(create).await?,
+            PolicyDdlStatement::Create(create) => {
+                let create = self.scope_tag_policy(session, store.as_ref(), create);
+                store.create_policy(&create).await?
+            }
             PolicyDdlStatement::Drop(drop) => store.drop_policy(drop).await?,
             // The one way to lift what GRANT ... MASKED WITH wrote: REVOKE
             // leaves it (see handle_revoke), so a later plain GRANT brings
@@ -775,7 +778,33 @@ impl QueryHandler {
         Ok(vec![])
     }
 
+    /// Under `[policy.ranger] catalog_scoped`, a `CREATE POLICY ... ON TAG
+    /// <tag>` with a bare tag governs the session's catalog only: the policy
+    /// keys on `<catalog>.<tag>` (#919). A dotted tag names its catalog and is
+    /// kept. Without `catalog_scoped` the statement is unchanged.
+    fn scope_tag_policy(
+        &self,
+        session: &Session,
+        store: &dyn sqe_policy::PolicyStore,
+        create: &sqe_sql::policy_ddl::CreatePolicyStatement,
+    ) -> sqe_sql::policy_ddl::CreatePolicyStatement {
+        use sqe_sql::policy_ddl::PolicyTarget;
+        let mut create = create.clone();
+        if let PolicyTarget::Tag(tag) = &create.target {
+            if store.catalog_scoped() {
+                let catalog = self.session_catalog_name(session);
+                let scoped = sqe_policy::tag_scope::policy_tag_in_catalog(tag, &catalog);
+                create.target = PolicyTarget::Tag(scoped);
+            }
+        }
+        create
+    }
+
     /// Turn `SET MASKING POLICY p` into the equivalent column-tag operation.
+    ///
+    /// Under `catalog_scoped`, a tag policy keyed on `<catalog>.<tag>` for the
+    /// table's own catalog attaches as the bare `<tag>` (#919), so the
+    /// column's tags stay bare and resolve as `SET TAGS` writes them.
     ///
     /// A named Ranger masking policy is not a free-floating definition you bind to a
     /// column: it already carries its own resource. There are two shapes, and only
@@ -794,6 +823,7 @@ impl QueryHandler {
     /// refusal explains the alternative instead of just saying no.
     pub(super) async fn masking_policy_to_tag_op(
         &self,
+        session: &Session,
         op: &sqe_sql::tags::MaskingPolicyOp,
     ) -> sqe_core::Result<sqe_sql::tags::SetTagsStatement> {
         use sqe_sql::tags::{ColumnTagOp, SetTagsStatement, TagAction};
@@ -823,7 +853,13 @@ impl QueryHandler {
             )
         })?;
         let policies = store.list_mask_policies().await?;
-        let tag = resolve_masking_policy_tag(&policies, policy_name)?;
+        let mut tag = resolve_masking_policy_tag(&policies, policy_name)?;
+        if store.catalog_scoped() {
+            let table = crate::catalog_ops::parse_object_name(&op.table)?;
+            let catalog = crate::ident::catalog_qualifier(&table)
+                .unwrap_or_else(|| self.session_catalog_name(session));
+            tag = sqe_policy::tag_scope::column_tag_in_catalog(&tag, &catalog).to_string();
+        }
 
         Ok(SetTagsStatement {
             table: op.table.clone(),
