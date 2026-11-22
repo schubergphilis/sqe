@@ -22,33 +22,12 @@ Schema tags (`sqe.schema-tags`) are projected into Ranger's tag store when
   replace; delete then add left Spark unmasked in between.
 - Live e2e `spark_mask_parity_e2e::schema_tags_mask_and_filter_every_table_in_both_engines`.
 
-Review follow-ups, fixed in this MR rather than left open:
+Known gaps: per-process memory of what is held (a second coordinator can
+re-add a removed key: over-mask); flag off or DROP SCHEMA leaves the `*`
+resources; a cold-memory reproject of a tagless schema does not delete a
+stale `*` resource; no metric or audit line for projection failures; Spark
+cannot refuse a stale projection; precedence of own/table/schema tags is #942.
 
-- Ranger, not process memory, decides what is held. `ALTER SCHEMA` and
-  `reproject_column_tags` read it (`GET /service/tags/secure/download/{service}`,
-  filtered client-side: Ranger 2.8 ignores the resource filters on its
-  tag endpoints); a failed read refuses `ALTER SCHEMA` and writes nothing.
-  The load observer trusts its schema memory for 120 s, then reads Ranger
-  once for all loads queued on the schema; an unreadable Ranger writes
-  nothing. Table-level memory older than 300 s is resent as a replace.
-  Rig test `a_set_after_another_coordinators_unset_writes_ranger` (two
-  coordinators, one fake Ranger).
-- `DROP SCHEMA` deletes the schema-wide resources; `reproject_column_tags`
-  with the setting off, or on a tagless schema, deletes what Ranger holds
-  (cold memory included). Rig test `drop_schema_clears_the_schema_wide_resource`.
-- Failures are counted: `sqe_tag_projection_failures_total{op=write|read|source}`.
-- Column-level projection is one replace per changed column, delete only
-  for a column left with no tags (folded in: same file and trait).
-- Live e2e deletes the schema-wide resource out of band and checks that
-  the next `ALTER SCHEMA SET TAGS` puts it back and Spark masks again.
-
-Limits that remain (by design, stated in D5 and Risks): a removed key can
-come back from another coordinator's memory for at most the TTL (over-mask
-only); each read downloads the whole tag store of the service; without
-`catalog_scoped`, same-named schemas in two catalogs share one resource;
-Spark cannot refuse a stale projection; precedence of own/table/schema
-tags is #942 (undecided); catalog tags stay refused pending the storage
-decision, so #930 stays open.
-
-**NEXT:** #942 precedence decision (owner), then catalog-tag storage
-decision before any catalog-level projection.
+**NEXT:** column-level projection in sqe-policy still deletes then adds;
+send a non-empty column tag set as one replace, as the table and schema
+levels now do.
