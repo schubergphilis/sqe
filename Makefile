@@ -654,6 +654,28 @@ leaks: leak-scan
 	@echo "==> Scanning the repository for internal identifiers and credentials"
 	@bash scripts/leak-scan-repo.sh
 
+# Independent Iceberg feature-matrix suite (tests/matrix/README.md). Starts a throwaway
+# catalog, object store and the SQE image, runs the black-box suite, and always tears
+# the stack down; the target's exit code is the suite's. SQE_IMAGE is required and must
+# be given on the command line (the Makefile's own SQE_IMAGE is the build name, so an
+# exported variable would be ignored).
+#   make matrix-suite SQE_IMAGE=<image>      reports land in target/matrix-suite/
+.PHONY: matrix-suite matrix-export
+MATRIX_PYTHON ?= python3
+matrix-suite:
+	@test "$(origin SQE_IMAGE)" = "command line" || { echo "SQE_IMAGE is required on the command line, e.g. make matrix-suite SQE_IMAGE=<image>"; exit 2; }
+	@export SQE_IMAGE="$(SQE_IMAGE)"; \
+	tests/matrix/docker/start-sqe.sh || { rc=$$?; tests/matrix/docker/stop-sqe.sh; exit $$rc; }; \
+	$(MATRIX_PYTHON) tests/matrix/sqe_feature_tests.py --out target/matrix-suite $(MATRIX_ARGS); rc=$$?; \
+	tests/matrix/docker/stop-sqe.sh; \
+	exit $$rc
+
+# SQE's claimed matrix levels in the upstream engine-file shape, verified first
+# against the rubric. Writes target/matrix-export/sqe.json.
+matrix-export:
+	$(MATRIX_PYTHON) tests/matrix/export_upstream.py --check
+	$(MATRIX_PYTHON) tests/matrix/export_upstream.py --out target/matrix-export/sqe.json
+
 # GitHub mirror: main + tags with the internal host and group path rewritten
 # out of commit messages (deterministic, so pushes stay fast-forwards).
 # `make mirror-github` is a dry run; PUSH=1 pushes after `make leaks` passes.

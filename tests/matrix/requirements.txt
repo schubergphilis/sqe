@@ -1,0 +1,4 @@
+pyiceberg[pyarrow]>=0.10
+requests>=2.31
+fastavro>=1.9
+adbc-driver-flightsql>=1.0
