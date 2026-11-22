@@ -1836,6 +1836,16 @@ impl CatalogOps {
             Some(raw) if checked => {
                 let table_lock = self.table_lock_for(&table_ident);
                 let held = table_lock.lock_owned().await;
+                if let Some((store, user, ns)) =
+                    authorised_tag_columns.and_then(|a| a.schema_use.as_ref())
+                {
+                    // A store error grants nothing.
+                    if !store.grants_schema_use(user, ns).await.unwrap_or(false) {
+                        return Err(SqeError::Catalog(format!(
+                            "403 Forbidden: {TAG_PROP_KEY} on '{table_ident}' requires select (USE) on schema {ns}"
+                        )));
+                    }
+                }
                 let table = session_catalog.load_table_for_write(&table_ident).await?;
                 let metadata = table.metadata();
                 let (properties, schema) = (metadata.properties(), metadata.current_schema());

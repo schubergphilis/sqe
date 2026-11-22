@@ -380,14 +380,14 @@ impl QueryHandler {
     }
 
     /// [`Self::require_schema_use`] for the schema holding `table`, keyed as
-    /// the column checks key it.
+    /// the column checks key it. Returns that key.
     async fn require_table_schema_use(
         &self,
         session: &Session,
         store: &dyn PolicyStore,
         table: &sqlparser::ast::ObjectName,
         statement: &str,
-    ) -> sqe_core::Result<()> {
+    ) -> sqe_core::Result<String> {
         let (namespace, _, _) = self.tag_policy_key(session, store, table)?.ok_or_else(|| {
             self.refuse_tag_write(
                 session,
@@ -396,7 +396,8 @@ impl QueryHandler {
             )
         })?;
         self.require_schema_use(session, store, &namespace, statement)
-            .await
+            .await?;
+        Ok(namespace)
     }
 
     /// Every column in `columns` of `table` must be granted `privilege` by
@@ -559,7 +560,8 @@ impl QueryHandler {
             Statement::CreateTable(ct) => (&ct.name, ct.or_replace),
             _ => return Ok(None),
         };
-        self.require_table_schema_use(session, store, table, RAW_TAG_WRITE)
+        let use_key = self
+            .require_table_schema_use(session, store, table, RAW_TAG_WRITE)
             .await?;
         let old = if live {
             match self.catalog_ops.live_column_tags(session, table).await? {
@@ -598,7 +600,16 @@ impl QueryHandler {
             TagRemoval::Same => changed.clone(),
             TagRemoval::RemoveTag | TagRemoval::Admin => removed,
         };
-        Ok(Some(TagWriteAuth { changed, removed }))
+        // USE again under the lock (#941); `tag_delegate_store` was Some.
+        let schema_use = self
+            .policy_store
+            .clone()
+            .map(|s| (s, session.user.clone(), use_key));
+        Ok(Some(TagWriteAuth {
+            changed,
+            removed,
+            schema_use,
+        }))
     }
 }
 

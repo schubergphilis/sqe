@@ -18,22 +18,50 @@ async fn alter_auth(
     sql: &str,
     authorised: Option<(&[&str], &[&str])>,
 ) -> sqe_core::Result<()> {
-    let dialect = sqlparser::dialect::GenericDialect {};
-    let stmt = sqlparser::parser::Parser::parse_sql(&dialect, sql)
-        .expect("parse")
-        .remove(0);
     let names = |cs: &[&str]| cs.iter().map(|c| c.to_string()).collect();
     let auth = authorised.map(|(changed, removed)| TagWriteAuth {
         changed: names(changed),
         removed: names(removed),
+        schema_use: None,
     });
+    guarded(rig, sql, auth.as_ref()).await
+}
+
+async fn guarded(rig: &SqliteRig, sql: &str, auth: Option<&TagWriteAuth>) -> sqe_core::Result<()> {
+    let dialect = sqlparser::dialect::GenericDialect {};
+    let stmt = sqlparser::parser::Parser::parse_sql(&dialect, sql)
+        .expect("parse")
+        .remove(0);
     CatalogOps::new(rig.config.clone())
-        .set_table_properties_guarded(&rig.session(), &stmt, auth.as_ref(), None)
+        .set_table_properties_guarded(&rig.session(), &stmt, auth, None)
         .await
 }
 
 async fn tags(rig: &SqliteRig) -> HashMap<String, Vec<String>> {
     parse_column_tags(rig.load(&rig.ident("t")).await.metadata().properties()).unwrap()
+}
+
+/// #941: the coordinator found USE, then a `select` deny landed before the
+/// commit. USE is asked again under the lock: refused, nothing written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_guarded_tag_write_rechecks_schema_use_under_the_lock() {
+    let rig = SqliteRig::new().await;
+    let h = WriteHandler::new(rig.config.clone());
+    run_ctas(&h, &rig, "CREATE TABLE t AS SELECT 1 AS ssn").await;
+    let sql = format!(r#"ALTER TABLE t SET TBLPROPERTIES ('{PROP_KEY}' = '{{"ssn":["PII"]}}')"#);
+    let store = Arc::new(sqe_policy::policy_store::InMemoryPolicyStore::new());
+    let user = rig.session().user;
+    let auth = TagWriteAuth {
+        changed: ["ssn".to_string()].into(),
+        schema_use: Some((store.clone(), user.clone(), "ns".into())),
+        ..Default::default()
+    };
+    let err = guarded(&rig, &sql, Some(&auth)).await.unwrap_err();
+    assert!(err.to_string().contains("USE) on schema ns"), "{err}");
+    assert!(tags(&rig).await.is_empty(), "nothing written");
+    store.grant_schema_use("ns", &user.username).await;
+    guarded(&rig, &sql, Some(&auth)).await.expect("USE back");
+    assert_eq!(tags(&rig).await.len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
