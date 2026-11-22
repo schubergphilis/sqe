@@ -351,6 +351,15 @@ impl SqeTableProvider {
             None => self.schema.clone(),
         };
 
+        // The policy engine denied the person `select` (engine credential
+        // identity, #934): the table has its schema and no keys. Return an
+        // empty plan before `plan_files` reads a manifest or the object store.
+        if crate::engine_identity::is_read_denied(&self.table) {
+            return Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
+                projected_schema,
+            )));
+        }
+
         // Shredded variant comparisons (sqe#870) prune row groups and stay out
         // of `df_filters`: those go to workers, which decode them without the
         // variant functions and would lose every other filter with them.

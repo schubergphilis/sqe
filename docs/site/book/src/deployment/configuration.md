@@ -156,6 +156,15 @@ access_delegation = "none"      # "none" or "vended-credentials": send X-Iceberg
                                 # the catalog vends table-scoped keys, which beat [storage] keys
 require_vended_credentials = false # When true, FileIO never gets [storage] keys (issue #395); implies
                                 # access_delegation = "vended-credentials"
+# credentials = { type = "client_credentials", token_endpoint = "...", client_id = "...", client_secret = "..." }
+                                # Engine credential identity (#934): reads load the table as the
+                                # person, then fetch the table's storage keys with THIS client
+                                # after the policy engine allowed `select`. The person's own
+                                # token never needs storage access. Needs
+                                # require_vended_credentials = true, client_credentials
+                                # auth, policy.engine = "ranger" and `catalog_scoped`.
+                                # Grant `select` explicitly first: no policy means no read.
+                                # Writes keep using the person's delegated credentials.
 tvf_prefixes = []               # Extra object-store prefixes file TVFs may read in sessions
                                 # scoped to THIS catalog only; added to [storage.tvf]
                                 # allowed_object_store_prefixes. Also on [catalogs.<name>].
@@ -482,6 +491,7 @@ Every config field can be overridden via environment variable. Convention: `SQE_
 | `SQE_CATALOG__WAREHOUSE` | `catalog.warehouse` | string |
 | `SQE_CATALOG__ACCESS_DELEGATION` | `catalog.access_delegation` | `none` / `vended-credentials` |
 | `SQE_CATALOG__REQUIRE_VENDED_CREDENTIALS` | `catalog.require_vended_credentials` | bool |
+| `SQE_CATALOG__CREDENTIALS__*` | `catalog.credentials.*` (`type`, `token_endpoint`, `client_id`, `client_secret`, `scope`) | table |
 | `SQE_CATALOG__METADATA_CACHE_TTL_SECS` | `catalog.metadata_cache_ttl_secs` | u64 |
 | `SQE_CATALOG__REVALIDATE_EACH_STATEMENT` | `catalog.revalidate_each_statement` | bool |
 | `SQE_CATALOG__DEFAULT_TABLE_FORMAT_VERSION` | `catalog.default_table_format_version` | u8 |

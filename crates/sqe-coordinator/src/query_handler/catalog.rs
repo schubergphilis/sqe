@@ -63,12 +63,19 @@ impl QueryHandler {
         // fraction, min/max) are not cheaply available from iceberg metadata, so
         // they are reported NULL -- the result SHAPE matches Trino so clients
         // and the CBO do not error.
-        let row_count: Option<f64> = metadata.current_snapshot().and_then(|s| {
-            s.summary()
-                .additional_properties
-                .get("total-records")
-                .and_then(|v| v.parse::<f64>().ok())
-        });
+        // A table the engine identity was not allowed to read carries no keys
+        // and no counts: the snapshot summary is the person's metadata, but
+        // the gate denied the read, so the count is not theirs to see (#934).
+        let read_denied = sqe_catalog::engine_identity::is_read_denied(&table);
+        let row_count: Option<f64> = metadata
+            .current_snapshot()
+            .filter(|_| !read_denied)
+            .and_then(|s| {
+                s.summary()
+                    .additional_properties
+                    .get("total-records")
+                    .and_then(|v| v.parse::<f64>().ok())
+            });
 
         let column_names: Vec<String> = metadata
             .current_schema()

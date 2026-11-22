@@ -186,13 +186,25 @@ pub(crate) async fn build_session_catalog(
         .clone()
         .unwrap_or_else(|| global_storage.clone());
 
-    let session_catalog = Arc::new(
+    let mut session_catalog =
         SessionCatalog::for_session_with(cat_cfg, &storage, table_cache.cloned(), &bearer)
             .await
             .map_err(Arc::new)?
             .with_catalog_scope(session.catalog_scope_arc(), sql_name)
-            .with_inherit_schema_tags(inherit_schema_tags),
-    );
+            .with_inherit_schema_tags(inherit_schema_tags);
+    // Engine credential identity (#934): reads of this catalog use keys the
+    // engine fetches after the policy gate says yes. Built per session, bound
+    // to the person; absent policy wiring fails the build, never the gate.
+    if let Some(identity) = crate::engine_identity_wiring::engine_identity_for(
+        cat_cfg.credentials.as_ref(),
+        sql_name,
+        session,
+    )
+    .map_err(Arc::new)?
+    {
+        session_catalog = session_catalog.with_engine_identity(identity);
+    }
+    let session_catalog = Arc::new(session_catalog);
 
     Ok((session_catalog, storage))
 }

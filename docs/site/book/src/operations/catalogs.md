@@ -468,3 +468,34 @@ for schema or table visibility.
 - The embedded CLI (`sqe-cli` ad-hoc mode) supports the same syntax
   as the cluster server. Embedded ATTACH targets the same in-memory
   registry but does not share state across CLI invocations.
+
+## Engine credential identity
+
+By default a catalog reads storage with keys Polaris vends to the person's own
+token, so every person needs storage access in Polaris. Set `credentials` on
+the catalog (`[catalog]` or `[catalogs.<name>]`) to read with keys the engine
+fetches instead:
+
+1. SQE loads the table as the person, without the delegation header.
+2. The policy engine decides whether the person may `select` the table.
+3. If yes, SQE calls `GET .../tables/{table}/credentials` with the engine's
+   `client_credentials` token and reads with those keys. If no, the table scans
+   as empty and its metadata functions return nothing; no keys are fetched.
+4. Each fetch is audited as an `Auth` event with the person as actor and the
+   engine's client id as application name. A failed fetch fails the statement;
+   there is no fallback to other keys.
+
+Requirements: `require_vended_credentials = true`, `client_credentials` auth,
+`policy.engine = "ranger"` with `catalog_scoped = true`, and an explicit
+`select` grant (an engine catalog denies by default, so add the `select`
+policies before you turn it on). INSERT, UPDATE, DELETE, MERGE and DDL keep
+using the person's delegated credentials, and the engine's keys are never used
+for a write. Views that reference a sibling warehouse are not supported on
+these catalogs.
+
+The engine principal is a service account: give it read-only privileges on the
+catalog (`TABLE_READ_DATA`, no write privileges), supply its client secret from
+your secret manager through the environment
+(`SQE_CATALOG__CREDENTIALS__CLIENT_SECRET`), not in the config file, and
+rotate it like any other service credential. SQE reads the secret at startup,
+so a rotation takes a restart.

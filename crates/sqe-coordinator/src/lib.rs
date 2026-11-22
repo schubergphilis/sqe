@@ -19,6 +19,7 @@ pub(crate) mod compaction_dispatch;
 pub mod credential_refresh;
 pub(crate) mod dim_build_swap;
 pub(crate) mod distributed_scan;
+pub mod engine_identity_wiring;
 pub(crate) mod explain;
 pub mod flight_client_compat;
 pub(crate) mod flight_ingest;

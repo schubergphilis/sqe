@@ -7821,6 +7821,7 @@ impl WriteHandler {
                     session.access_token().expose(),
                 )
                 .await?
+                .into_write_catalog()
                 .scoped_to(
                     session,
                     &default_write_catalog(&self.config, target_warehouse),

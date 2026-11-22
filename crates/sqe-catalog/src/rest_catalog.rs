@@ -4,8 +4,8 @@ use std::time::Instant;
 
 use dashmap::DashMap;
 use iceberg::table::Table;
-use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent, TableRequirement, TableUpdate};
-use iceberg_catalog_rest::{RestCatalog, RestCatalogBuilder};
+use iceberg::{Catalog, NamespaceIdent, TableIdent, TableRequirement, TableUpdate};
+use iceberg_catalog_rest::RestCatalog;
 use moka::future::Cache as MokaCache;
 use tracing::{debug, error, info, instrument, warn, Instrument};
 use uuid::Uuid;
@@ -1435,6 +1435,8 @@ macro_rules! dispatch_catalog {
 pub(crate) use dispatch_catalog;
 
 mod catalog_properties;
+mod engine_credentials;
+pub use engine_credentials::VendedKeys;
 
 /// Per-session Iceberg REST catalog wrapper.
 ///
@@ -1496,6 +1498,17 @@ pub struct SessionCatalog {
     /// [`Self::schema_tag_state`]. Off by default; set with
     /// [`Self::with_inherit_schema_tags`].
     inherit_schema_tags: bool,
+    /// Engine credential identity (#934): the token source, select gate and
+    /// audit sink of a catalog that reads with the engine's keys. `None`
+    /// for every other catalog. See `engine_credentials`.
+    engine: Option<crate::engine_identity::EngineIdentity>,
+    /// In engine mode, the second client: it sends the delegation header as
+    /// the person and serves writes and DDL. `inner` then holds no vended
+    /// keys of the person's. `None` outside engine mode.
+    write_inner: Option<CatalogHandle>,
+    /// Suffix of the table cache's warehouse segment: empty for reads,
+    /// `#write` for the write view of an engine-mode catalog.
+    cache_tag: &'static str,
 }
 
 #[derive(Clone)]
@@ -1817,6 +1830,9 @@ impl SessionCatalog {
             table_cache: table_cache.unwrap_or_else(|| TableMetadataCache::new(0)),
             scope_guard: None,
             inherit_schema_tags: false,
+            engine: None,
+            write_inner: None,
+            cache_tag: "",
         }
     }
 
@@ -1844,6 +1860,9 @@ impl SessionCatalog {
             table_cache: TableMetadataCache::new(0),
             scope_guard: None,
             inherit_schema_tags: false,
+            engine: None,
+            write_inner: None,
+            cache_tag: "",
         }
     }
 
@@ -1910,7 +1929,16 @@ impl SessionCatalog {
         match &catalog.backend {
             sqe_core::config::CatalogBackend::Rest => {
                 let mut extra_props = client_side_sigv4_props(catalog, storage);
-                extra_props.extend(access_delegation_props(catalog));
+                if catalog.credentials.is_some() {
+                    // Engine identity (#934): the read client sends no
+                    // delegation header; keys come from the engine.
+                    extra_props.insert(
+                        engine_credentials::ENGINE_READ_MODE_PROP.to_string(),
+                        "true".to_string(),
+                    );
+                } else {
+                    extra_props.extend(access_delegation_props(catalog));
+                }
                 Self::new_with_props(
                     &catalog.catalog_url,
                     &catalog.warehouse,
@@ -2019,6 +2047,9 @@ impl SessionCatalog {
             table_cache,
             scope_guard: None,
             inherit_schema_tags: false,
+            engine: None,
+            write_inner: None,
+            cache_tag: "",
         }
     }
 
@@ -2201,6 +2232,9 @@ impl SessionCatalog {
             table_cache,
             scope_guard: None,
             inherit_schema_tags: false,
+            engine: None,
+            write_inner: None,
+            cache_tag: "",
         }
     }
 
@@ -2221,6 +2255,14 @@ impl SessionCatalog {
             if scope.access(warehouse).is_none() {
                 return Err(sqe_core::catalog_scope::catalog_not_found(warehouse));
             }
+        }
+        if self.uses_engine_identity() {
+            // The select gate is bound to this catalog's policy keys; it
+            // cannot judge a table in another warehouse.
+            return Err(SqeError::Execution(format!(
+                "cannot reach warehouse {warehouse} from a catalog that reads with the engine \
+                 credential identity"
+            )));
         }
         let sibling = Self::new_with_props(
             &self.catalog_url,
@@ -2316,14 +2358,30 @@ impl SessionCatalog {
         // also disable opendal config/IMDS load so FileIO cannot fall
         // back to AWS_ACCESS_KEY_ID, ~/.aws/config, IRSA, or IMDSv2.
         insert_s3_location_props(&mut props, storage_config);
-        props.extend(extra_props.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let engine_mode = extra_props.contains_key(engine_credentials::ENGINE_READ_MODE_PROP);
+        props.extend(
+            extra_props
+                .iter()
+                .filter(|(k, _)| k.as_str() != engine_credentials::ENGINE_READ_MODE_PROP)
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
+        if engine_mode && !require_vended_credentials {
+            return Err(SqeError::Config(
+                "the engine credential identity needs require_vended_credentials = true"
+                    .to_string(),
+            ));
+        }
         if require_vended_credentials {
             // Vended-only: ask for credentials, and leave nothing static
-            // for FileIO to fall back to.
-            props.insert(
-                ACCESS_DELEGATION_HEADER_PROP.to_string(),
-                "vended-credentials".to_string(),
-            );
+            // for FileIO to fall back to. In engine mode the read client
+            // asks for none: its keys come from the engine, and a second
+            // client below keeps the delegation header for writes.
+            if !engine_mode {
+                props.insert(
+                    ACCESS_DELEGATION_HEADER_PROP.to_string(),
+                    "vended-credentials".to_string(),
+                );
+            }
             insert_s3_vended_isolation_props(&mut props);
         } else {
             // Static keys stay the fallback. With `access_delegation` on,
@@ -2369,28 +2427,25 @@ impl SessionCatalog {
         // (review 300). It is a separate reqwest 0.12 object only because the
         // vendored crate has not moved to 0.13 yet.
         let http_client = http_client.unwrap_or_else(shared_http_client);
-        let inner = if let Some(cached) = REST_CATALOG_CACHE.get(&catalog_key).await {
-            debug!(token_fingerprint = %token_fingerprint, "REST catalog cache hit");
-            cached
+        // Engine mode (#934): a second, delegated client serves writes. Its
+        // key differs from the read client's in `deleg`, so the two never
+        // share a cached `RestCatalog`.
+        let write_inner = if engine_mode {
+            let write_key = format!("{catalog_url}-{warehouse}-vended1-deleg1-{token_fingerprint}");
+            let write_props = engine_credentials::delegated_write_props(&props);
+            Some(CatalogHandle::Rest(
+                engine_credentials::cached_rest_catalog(write_key, &token_fingerprint, write_props)
+                    .await?,
+            ))
         } else {
-            debug!(token_fingerprint = %token_fingerprint, "REST catalog cache miss, creating");
-            let catalog = RestCatalogBuilder::default()
-                .with_client(shared_vendored_http_client())
-                .with_storage_factory(crate::storage_factory())
-                .load(format!("sqe-session-{}", token_fingerprint), props)
-                .await
-                .map_err(|e| {
-                    SqeError::catalog_src(format!("Failed to create REST catalog: {e}"), e)
-                })?;
-            let arc_catalog = Arc::new(catalog);
-            REST_CATALOG_CACHE
-                .insert(catalog_key, arc_catalog.clone())
-                .await;
-            arc_catalog
+            None
         };
+        let inner =
+            engine_credentials::cached_rest_catalog(catalog_key, &token_fingerprint, props).await?;
 
-        let circuit_breaker = circuit_breaker
-            .unwrap_or_else(|| user_circuit_breaker_for(bearer_token, &token_fingerprint, catalog_url));
+        let circuit_breaker = circuit_breaker.unwrap_or_else(|| {
+            user_circuit_breaker_for(bearer_token, &token_fingerprint, catalog_url)
+        });
 
         // Use the shared global cache when provided; fall back to a private
         // per-session cache (disabled — max_capacity 0) so that call sites that
@@ -2412,6 +2467,9 @@ impl SessionCatalog {
             table_cache,
             scope_guard: None,
             inherit_schema_tags: false,
+            engine: None,
+            write_inner,
+            cache_tag: "",
         })
     }
 
@@ -2681,7 +2739,18 @@ impl SessionCatalog {
     /// into the cached `Table` (per-user STS creds returned by Polaris) never
     /// leak across users. Issue #49.
     fn table_cache_key(&self, table_ident: &TableIdent) -> String {
-        table_metadata_cache_key(&self.token_fingerprint, &self.warehouse, table_ident)
+        self.table_cache_key_tagged(self.cache_tag, table_ident)
+    }
+
+    /// [`Self::table_cache_key`] for an explicit purpose tag (`""` read,
+    /// `#write` write). The tag sits in the warehouse segment, so eviction
+    /// by `{fp}|` prefix or `|{ns}.{name}` suffix still reaches both.
+    fn table_cache_key_tagged(&self, tag: &str, table_ident: &TableIdent) -> String {
+        table_metadata_cache_key(
+            &self.token_fingerprint,
+            &format!("{}{tag}", self.warehouse),
+            table_ident,
+        )
     }
 
     /// Load a table by its identifier.
@@ -2783,6 +2852,12 @@ impl SessionCatalog {
             let started = Instant::now();
             let result = dispatch_catalog!(self.inner, load_table(table_ident))
                 .map_err(|e| classify_iceberg_catalog_error("Failed to reload table", e));
+            // Engine mode (#934): the reload fetches fresh engine keys, after
+            // the gate; a revoked person gets a keyless table.
+            let result = match result {
+                Ok(table) => self.engine_read_table(table_ident, table).await,
+                err => err,
+            };
             match &result {
                 Ok(_) => self.circuit_breaker.record_success(),
                 Err(e) => {
@@ -2820,12 +2895,19 @@ impl SessionCatalog {
             && crate::file_tvf_prepare::first_check_in_statement(&cache_key);
 
         // Fast path: return cached table that is still within the soft TTL.
-        if let Some(cached) = self
+        let fresh = self
             .table_cache
             .get_fresh(&cache_key)
             .await
-            .filter(|_| !check_now)
-        {
+            .filter(|_| !check_now);
+        // Engine mode (#934): a cached table carries engine keys, so the
+        // gate decides again on every hit. A person denied since the entry
+        // was cached takes the full load below, which returns a keyless table.
+        let fresh = match fresh {
+            Some(t) if !self.engine_cached_still_readable(table_ident, &t).await? => None,
+            other => other,
+        };
+        if let Some(cached) = fresh {
             // A metadata cache hit must not be an authorization cache hit.
             // Polaris/Ranger grants can change out-of-band while the user's
             // bearer token and this cache key stay unchanged. Re-check the
@@ -2872,7 +2954,11 @@ impl SessionCatalog {
             {
                 Ok(resp) => {
                     let status = resp.status();
-                    if status == reqwest::StatusCode::NOT_MODIFIED {
+                    if status == reqwest::StatusCode::NOT_MODIFIED
+                        && self
+                            .engine_cached_still_readable(table_ident, &stale_table)
+                            .await?
+                    {
                         // 304: metadata unchanged, refresh the soft TTL.
                         debug!(
                             table = ?table_ident,
@@ -2933,7 +3019,16 @@ impl SessionCatalog {
         let started = Instant::now();
         let result = dispatch_catalog!(self.inner, load_table(table_ident))
             .map_err(|e| classify_iceberg_catalog_error("Failed to load table", e));
+        // Engine mode (#934): gate, then engine keys. Outside it, a no-op.
+        let result = match result {
+            Ok(table) => self.engine_read_table(table_ident, table).await,
+            err => err,
+        };
+        // A denied table is never cached: it holds no keys and the next
+        // statement must ask the gate again.
+        let denied = matches!(&result, Ok(t) if crate::engine_identity::is_read_denied(t));
         match &result {
+            Ok(_) if denied => self.circuit_breaker.record_success(),
             Ok(table) => {
                 self.circuit_breaker.record_success();
 
@@ -3627,8 +3722,12 @@ impl SessionCatalog {
     /// principal's vended credentials is the point, and for a write to a
     /// transaction branch, which `main` readers never see.
     pub async fn invalidate_table(&self, table_ident: &TableIdent) {
-        let key = self.table_cache_key(table_ident);
-        self.table_cache.invalidate(&key).await;
+        // Both purposes: an engine-mode catalog caches a read copy and a
+        // write copy of the same table.
+        for tag in ["", engine_credentials::WRITE_CACHE_TAG] {
+            let key = self.table_cache_key_tagged(tag, table_ident);
+            self.table_cache.invalidate(&key).await;
+        }
         debug!(table = %table_ident, "Table cache invalidated");
     }
 
@@ -4182,6 +4281,9 @@ impl SessionCatalog {
         table: &Table,
     ) -> sqe_core::Result<()> {
         self.ensure_writable()?;
+        // A table filled with the engine's read keys must never be written
+        // (#934): the probe would test the engine's access, not the person's.
+        crate::engine_identity::refuse_engine_keyed(table, "write")?;
         if !matches!(self.inner, CatalogHandle::Rest(_)) {
             return Ok(());
         }
@@ -4504,7 +4606,12 @@ impl Catalog for SessionCatalogBridge {
     ) -> iceberg::Result<Table> {
         self.ensure_writable()?;
         let table_name = creation.name.clone();
-        let result = dispatch_catalog!(self.session.inner, create_table(namespace, creation))?;
+        // The delegated client in engine mode (#934): the created table's
+        // FileIO holds the person's write keys, never the engine's.
+        let result = dispatch_catalog!(
+            self.session.write_handle(),
+            create_table(namespace, creation)
+        )?;
         // Evict every token's entry for this name, not just the creator's: a
         // DROP+CREATE with a different schema otherwise leaves other principals
         // holding a `Table` whose FileIO and metadata location point at the
@@ -4515,8 +4622,13 @@ impl Catalog for SessionCatalogBridge {
     }
 
     async fn load_table(&self, table: &TableIdent) -> iceberg::Result<Table> {
-        // Delegate through SessionCatalog::load_table so the cache is used.
-        self.session.load_table(table).await.map_err(bridge_error)
+        // The bridge is the write catalog: it loads with the person's
+        // delegated credentials, never the engine's read keys (#934).
+        // Delegate through SessionCatalog so the cache is used.
+        self.session
+            .load_table_for_write(table)
+            .await
+            .map_err(bridge_error)
     }
 
     async fn drop_table(&self, table: &TableIdent) -> iceberg::Result<()> {
@@ -4560,8 +4672,10 @@ impl Catalog for SessionCatalogBridge {
         metadata_location: String,
     ) -> iceberg::Result<Table> {
         self.ensure_writable()?;
-        let result =
-            dispatch_catalog!(self.session.inner, register_table(table, metadata_location));
+        let result = dispatch_catalog!(
+            self.session.write_handle(),
+            register_table(table, metadata_location)
+        );
         // Registering binds this name to a different metadata document; any
         // principal's cached entry for the name is now for the wrong table.
         self.session.invalidate_table_all_tokens(table).await;
@@ -4634,7 +4748,7 @@ impl Catalog for SessionCatalogBridge {
                 .map_err(bridge_error)?;
         }
         let branch_commit_seen = branch_commit.is_some();
-        let result = dispatch_catalog!(self.session.inner, update_table(commit));
+        let result = dispatch_catalog!(self.session.write_handle(), update_table(commit));
         if let (Some(txn), Ok(_)) = (branch_commit, &result) {
             txn.bind_catalog(
                 self.session.txn_catalog_key(),

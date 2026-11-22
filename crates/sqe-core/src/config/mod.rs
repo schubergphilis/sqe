@@ -7,6 +7,7 @@ use crate::SecretString;
 
 mod auth;
 mod catalog_scope;
+mod engine_credentials;
 mod env_overlay;
 mod hive;
 mod hive_data;
@@ -2098,6 +2099,17 @@ pub struct CatalogConfig {
     /// the static fallback. REST backend only.
     #[serde(default)]
     pub access_delegation: AccessDelegation,
+    /// Engine credential identity (`[catalogs.<name>.credentials]`, #934).
+    /// When set, a person's table load carries no delegation header, and
+    /// SQE fetches read-only storage keys from the catalog's `/credentials`
+    /// endpoint with THIS identity after the policy engine allows the
+    /// person `select`. People then need only metadata privileges in the
+    /// catalog. Writes keep the person's delegated credentials. Only
+    /// `type = "client_credentials"` is accepted, and startup requires
+    /// `require_vended_credentials = true`, `policy.engine = "ranger"` and
+    /// `[policy.ranger] catalog_scoped = true`. Off by default.
+    #[serde(default)]
+    pub credentials: Option<CatalogAuthConfig>,
     /// How unquoted identifiers that name this catalog's objects fold.
     /// `"lower"` (default) is SQE's own rule (#337). `"upper"` is Snowflake's:
     /// a table Snowflake created as `t (id INT)` is `T` with a column `ID`,
@@ -4384,6 +4396,7 @@ impl SqeConfig {
             errors.push(error);
         }
         self.validate_ticket_keys(&mut errors);
+        self.validate_engine_credentials(&mut errors);
         // A per-catalog TVF prefix that cannot match anything is a typo, not
         // a policy: fail here rather than skip it silently at query time.
         let mut catalogs: Vec<(String, &CatalogConfig)> = self
@@ -6176,6 +6189,7 @@ partial_progress_batch = 5
                 storage: None,
                 require_vended_credentials: false,
                 access_delegation: AccessDelegation::None,
+                credentials: None,
                 identifier_case: IdentifierCase::Lower,
             },
             catalogs: HashMap::new(),
@@ -7708,6 +7722,7 @@ s3_secret_key = "configured-secret"
                 storage: None,
                 require_vended_credentials: false,
                 access_delegation: AccessDelegation::None,
+                credentials: None,
                 identifier_case: IdentifierCase::Lower,
             },
         );
@@ -7751,6 +7766,7 @@ s3_secret_key = "configured-secret"
                     storage: None,
                     require_vended_credentials: false,
                     access_delegation: AccessDelegation::None,
+                    credentials: None,
                     identifier_case: IdentifierCase::Lower,
                 },
             );
@@ -7801,6 +7817,7 @@ s3_secret_key = "configured-secret"
                 storage: None,
                 require_vended_credentials: false,
                 access_delegation: AccessDelegation::None,
+                credentials: None,
                 identifier_case: IdentifierCase::Lower,
             },
         );

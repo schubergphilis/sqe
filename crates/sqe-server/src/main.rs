@@ -2299,6 +2299,9 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
         Some(audit.clone()),
     )?;
 
+    // Engine credential identity (#934): the policy store comes up below, so
+    // the install happens right after it is built.
+
     // Advisory/active auto-compaction scheduler (Phase 4a, Task 5). `Off`
     // mode (the default) constructs NOTHING here: neither the dedicated
     // maintenance service principal nor the `MaintenanceScheduler` value
@@ -2539,13 +2542,27 @@ async fn run_coordinator(mut config: SqeConfig) -> anyhow::Result<()> {
     // table_cache is passed so the rewriter can wire CacheTagSource for
     // tag-based column masking (Task 4). A clone is taken here; the original
     // is passed to with_table_cache() on the QueryHandler below.
-    let (policy_enforcer, policy_store) = sqe_coordinator::policy_wiring::build_policy_enforcer(
-        &config.policy,
-        Some(table_cache.clone()),
-        hive_catalogs.clone(),
-        hive_manifest_cache.clone(),
-        Some(Arc::clone(&metrics)),
-    )?;
+    // Catalogs read with the engine's keys (#934) default-deny `select`.
+    let engine_catalogs: Vec<String> = config
+        .flattened_catalogs()
+        .into_iter()
+        .filter(|(_, c)| c.credentials.is_some())
+        .map(|(n, _)| n)
+        .collect();
+    let (policy_enforcer, policy_store) =
+        sqe_coordinator::policy_wiring::build_policy_enforcer_with_engine_catalogs(
+            &config.policy,
+            Some(table_cache.clone()),
+            hive_catalogs.clone(),
+            hive_manifest_cache.clone(),
+            Some(Arc::clone(&metrics)),
+            engine_catalogs,
+        )?;
+    sqe_coordinator::engine_identity_wiring::install(
+        policy_store.clone(),
+        config.policy.mask_precedence,
+        Some(audit.clone()),
+    );
     if config.policy.engine != sqe_core::config::PolicyEngine::Passthrough {
         tracing::info!(
             engine = ?config.policy.engine,
