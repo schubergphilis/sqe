@@ -1,0 +1,11 @@
+**STATUS 2026-11-22: system metadata tables built lazily and scoped (`fix/system-metadata-lazy-scope-939`, #939).**
+
+- Cause: DataFusion's built-in `information_schema` walks the `system` catalog too, and `system.jdbc` (`schemas`, `tables`, `columns`) and `system.metadata` (`table_properties`, `schema_properties`, `table_comments`) built their rows in `table()`. Any `information_schema` query, and any schema-filtered `system.jdbc` listing, listed and loaded every table in every namespace; a listing error anywhere failed the query. (Load failures were already warned and skipped here. dbt's abort on an unloadable table comes from DataFusion's Iceberg-side walker, see Left open; dbt queries `information_schema` with `table_schema = '...'` and, in catalog.sql, `table_schema IN (...)`.)
+- Fix: `sqe-catalog/src/system_scope.rs`. `LazyMetaTable` keeps a static schema and builds rows in `scan()`. Filters are pushed down as Inexact (DataFusion re-applies them). `col = 'lit'` and a case-sensitive LIKE without unescaped wildcards on the catalog, schema and table columns narrow the walk: out-of-scope catalogs are skipped, namespaces before `list_tables`, tables before `load_table`.
+- Error handling unchanged: a forbidden listing is skipped quietly, any other listing error fails the query, a table that will not load is warned and skipped.
+- Tests (offline, in-memory catalog that records every list and load): `cargo test -p sqe-catalog --lib system_` (47 passed) and the full lib suite (907 passed). A mutation putting the eager build back fails `information_schema_lookup_loads_no_table`.
+- Not run: `make test-integration` and the live dbt run; Docker is read-only after the disk-full episode.
+- Budget: sqe-catalog lines 69400 -> 69500 (69460 with this change); owner decision 22 Nov 2026, #938.
+- Left open: DataFusion's `information_schema.columns` over the Iceberg catalogs still calls `table()` per table and stops at the first one that fails, so a broken table in another namespace can still fail a query on those views. Follow-up under #939.
+
+**NEXT:** scope the Iceberg-side `information_schema` walk (skip unloadable tables, push the schema filter down), then rerun the dbt probe from #897 when Docker is back.
