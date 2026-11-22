@@ -6128,6 +6128,170 @@ async fn tag_authority_bare_name_is_checked_against_the_session_namespace() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// #922: the Databricks column form `ALTER COLUMN c SET TAGS ('k' = 'v')` /
+// `UNSET TAGS ('k')` goes through the same tag write as `SET TAGS (c = (...))`:
+// projection, tag mask, SHOW TAGS values and the tag guard.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `SHOW TAGS ON orders` as sorted `(column, tag, value)` rows, waiting for
+/// the metadata cache to show `want`.
+async fn show_tags_are(ctx: &AcCtx, want: &[(&str, &str, &str)]) {
+    let sql = format!("SHOW TAGS ON {ORDERS}");
+    let want: Vec<(String, String, String)> = want
+        .iter()
+        .map(|(c, t, v)| (c.to_string(), t.to_string(), v.to_string()))
+        .collect();
+    crate::common::eventually(&format!("SHOW TAGS to be {want:?}"), || async {
+        let b = ctx
+            .handler
+            .execute(&ctx.carol, &sql, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        let rows: Vec<(String, String, String)> = col_strings(&b, "column")
+            .into_iter()
+            .zip(col_strings(&b, "tag"))
+            .zip(col_strings(&b, "value"))
+            .map(|((c, t), v)| (c, t, v))
+            .collect();
+        if rows == want {
+            Ok(())
+        } else {
+            Err(format!("got {rows:?}"))
+        }
+    })
+    .await;
+}
+
+/// An admin tags `ssn` with a value and `email` key-only through the
+/// Databricks form. The tag reaches Ranger's tag store, the tag mask applies,
+/// and SHOW TAGS shows the value (`''` for a key-only tag). `UNSET TAGS
+/// ('PII')` takes the tag, the projection and the mask away again.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn databricks_column_tags_mask_project_and_show_values() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+    let mask = format!("{PREFIX}databricks-tag-mask");
+    ctx.ranger
+        .create_policy(tag_mask_policy(
+            &mask,
+            "PII",
+            serde_json::json!({"dataMaskType": "hive:MASK_SHOW_LAST_4"}),
+        ))
+        .await
+        .expect("create tag mask");
+
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("ALTER TABLE {ORDERS} ALTER COLUMN ssn SET TAGS ('PII' = 'restricted')"),
+    )
+    .await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("ALTER TABLE {ORDERS} ALTER COLUMN email SET TAGS ('PII')"),
+    )
+    .await;
+    ranger_column_tag_named(&ctx, "ac", "ssn", "PII").await;
+    ranger_column_tag_named(&ctx, "ac", "email", "PII").await;
+    bob_sees(&ctx, "ssn", &SSN_MASKED).await;
+    show_tags_are(&ctx, &[("email", "PII", ""), ("ssn", "PII", "restricted")]).await;
+
+    for column in ["ssn", "email"] {
+        exec_ok(
+            &ctx,
+            &ctx.carol,
+            &format!("ALTER TABLE {ORDERS} ALTER COLUMN {column} UNSET TAGS ('PII')"),
+        )
+        .await;
+    }
+    ranger_column_tagged(&ctx, "ssn", false).await;
+    ranger_column_tagged(&ctx, "email", false).await;
+    bob_sees(&ctx, "ssn", &SSN_RAW).await;
+    bob_sees(&ctx, "email", &EMAIL_RAW).await;
+    show_tags_are(&ctx, &[]).await;
+
+    let _ = ctx.ranger.delete_policy(TAG_SERVICE, &mask).await;
+}
+
+/// The tag guard holds for the Databricks form as for every other tag write.
+/// The default `admin-role` gate refuses dave's SET and UNSET. Under
+/// `ranger-delegate` with `alter` on `ssn` only, he tags and untags `ssn`, and
+/// his tag on `email` is refused and writes nothing.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn databricks_column_tags_take_the_tag_guard() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+    let deny = format!("{PREFIX}tag-authority-deny-other-columns");
+    ctx.ranger
+        .create_policy(tag_authority_deny_policy(
+            &deny,
+            "ac",
+            "orders",
+            serde_json::json!({"values": ["ssn"], "isExcludes": true}),
+        ))
+        .await
+        .expect("create deny on every column but ssn");
+    let rig = tag_authority_rig(&ctx, false).await;
+
+    let set_ssn = format!("ALTER TABLE {ORDERS} ALTER COLUMN ssn SET TAGS ('PII' = 'x')");
+    let unset_ssn = format!("ALTER TABLE {ORDERS} ALTER COLUMN ssn UNSET TAGS ('PII')");
+    let set_email = format!("ALTER TABLE {ORDERS} ALTER COLUMN email SET TAGS ('PII')");
+
+    // Control: the default gate refuses a non-admin on both forms.
+    for sql in [&set_ssn, &unset_ssn] {
+        let err = ctx
+            .handler
+            .execute(&ctx.dave, sql, None)
+            .await
+            .expect_err("admin-role mode must refuse a non-admin")
+            .to_string();
+        assert!(err.contains("403 Forbidden"), "{sql}: {err}");
+    }
+    bob_sees(&ctx, "ssn", &SSN_RAW).await;
+
+    // No `alter` on email: refused, naming the column, and nothing written.
+    let err = rig
+        .handler
+        .execute(&ctx.dave, &set_email, None)
+        .await
+        .expect_err("alter on email is denied")
+        .to_string();
+    assert!(err.contains("403 Forbidden"), "{err}");
+    assert!(err.contains("ac.orders.email"), "names the column: {err}");
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    bob_sees(&ctx, "email", &EMAIL_RAW).await;
+
+    crate::common::eventually("dave to tag ssn", || async {
+        rig.handler
+            .execute(&ctx.dave, &set_ssn, None)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    bob_sees(&ctx, "ssn", &SSN_MASKED).await;
+
+    crate::common::eventually("dave to untag ssn", || async {
+        rig.handler
+            .execute(&ctx.dave, &unset_ssn, None)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    bob_sees(&ctx, "ssn", &SSN_RAW).await;
+
+    tag_authority_cleanup(&ctx, &rig, &[&deny]).await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // #917: tagging under its own grant (`tag_privilege = "apply_tag"`)
 // ─────────────────────────────────────────────────────────────────────────────
 //
