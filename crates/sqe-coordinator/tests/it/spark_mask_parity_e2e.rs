@@ -1036,3 +1036,123 @@ async fn table_tag_masks_every_column_in_both_engines() {
     run(format!("ALTER TABLE {ORDERS} UNSET TAGS ('parity_tbl_eu')")).await;
     agreed_rows(&ctx, "bob", "id", "id", |rows| rows.len() == 3).await;
 }
+
+/// #935 part 2: with `policy.inherit_schema_tags` on, a schema's tags are
+/// projected onto the schema-wide Ranger resource (`table: *`), so a tag
+/// mask and a tag row filter on the schema reach every table in Spark as
+/// they do in SQE. Its own handler: the flag must be on in the session
+/// catalog, the tag source and the DDL path, and a shared cache would keep
+/// the first handler's load observer.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger+spark; run scripts/spark-access-control-test.sh"]
+async fn schema_tags_mask_and_filter_every_table_in_both_engines() {
+    spark_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let base = ac_setup().await;
+    grant_read_to_both_roles(&base).await;
+    let (handler, cache) = crate::common::setup_ranger_handler_with(|c| {
+        c.policy.inherit_schema_tags = true;
+    })
+    .await;
+    let ctx = AcCtx {
+        handler,
+        cache,
+        ranger: crate::common::ranger_fixture::RangerAdmin::from_env(),
+        carol: base.carol.clone(),
+        alice: base.alice.clone(),
+        bob: base.bob.clone(),
+        dave: base.dave.clone(),
+    };
+
+    let tag_policy = |kind: &str, tag: &str, body: serde_json::Value| {
+        let mut policy = serde_json::json!({
+            "service": crate::common::ranger_fixture::TAG_SERVICE,
+            "name": format!("{PREFIX}parity-schema-{kind}"),
+            "isEnabled": true,
+            "resources": {"tag": {"values": [tag]}},
+        });
+        let (map, extra) = (policy.as_object_mut().unwrap(), body.as_object().unwrap());
+        map.extend(extra.clone());
+        policy
+    };
+    let item = |extra: serde_json::Value| {
+        let mut item = serde_json::json!({
+            "roles": ["engineer"],
+            "accesses": [{"type": "hive:select", "isAllowed": true}],
+        });
+        let extra = extra.as_object().unwrap().clone();
+        item.as_object_mut().unwrap().extend(extra);
+        item
+    };
+    let mask = item(serde_json::json!({"dataMaskInfo": {"dataMaskType": "hive:MASK_NULL"}}));
+    let mask = serde_json::json!({"policyType": 1, "dataMaskPolicyItems": [mask]});
+    let filter = item(serde_json::json!({"rowFilterInfo": {"filterExpr": "region = 'EU'"}}));
+    let filter = serde_json::json!({"policyType": 2, "rowFilterPolicyItems": [filter]});
+    for policy in [
+        tag_policy("tagmask", "parity_schema_pii", mask),
+        tag_policy("tagfilter", "parity_schema_eu", filter),
+    ] {
+        ctx.ranger
+            .create_policy(policy)
+            .await
+            .expect("create a schema tag policy");
+    }
+
+    let run = |sql: String| {
+        let ctx = &ctx;
+        async move {
+            ctx.handler
+                .execute(&ctx.carol, &sql, None)
+                .await
+                .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"))
+        }
+    };
+    let schema = "sales_wh.ac";
+    let unset_all =
+        format!("ALTER SCHEMA {schema} UNSET TAGS ('parity_schema_pii', 'parity_schema_eu')");
+    // A run that stopped half way leaves the tags in both stores.
+    run(unset_all.clone()).await;
+
+    run(format!(
+        "ALTER SCHEMA {schema} SET TAGS ('parity_schema_pii')"
+    ))
+    .await;
+    let all_null = |rows: &[Vec<String>]| {
+        rows.len() == 3 && rows.iter().all(|r| r.iter().all(|v| v == "NULL"))
+    };
+    agreed_rows(&ctx, "bob", "id, region, amount", "id", all_null).await;
+
+    // The repair writes the schema-wide resource too, as one row.
+    let batches = run(format!(
+        "CALL system.reproject_column_tags(table => '{ORDERS}')"
+    ))
+    .await;
+    let tables = col_strings(&batches, "table_identifier");
+    let statuses = col_strings(&batches, "status");
+    let rows: Vec<(String, String)> = tables.into_iter().zip(statuses).collect();
+    assert!(
+        rows.contains(&("ac.*".to_string(), "projected".to_string())),
+        "the schema-wide resource is reprojected: {rows:?}"
+    );
+    agreed_rows(&ctx, "bob", "id, region, amount", "id", all_null).await;
+
+    run(format!(
+        "ALTER SCHEMA {schema} UNSET TAGS ('parity_schema_pii')"
+    ))
+    .await;
+    agreed_rows(&ctx, "bob", "id, region", "id", |rows| {
+        rows.len() == 3 && rows.iter().all(|r| r.iter().all(|v| v != "NULL"))
+    })
+    .await;
+
+    // A tag row filter on the schema reaches the table in both engines.
+    run(format!(
+        "ALTER SCHEMA {schema} SET TAGS ('parity_schema_eu')"
+    ))
+    .await;
+    let rows = agreed_rows(&ctx, "bob", "id", "id", |rows| rows.len() == 2).await;
+    assert_eq!(rows, vec![vec!["1".to_string()], vec!["3".to_string()]]);
+
+    run(unset_all).await;
+    agreed_rows(&ctx, "bob", "id", "id", |rows| rows.len() == 3).await;
+}

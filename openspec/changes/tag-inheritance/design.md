@@ -29,18 +29,25 @@ For the second MR the same rule covers schema and catalog tags: a 403, any other
 
 A table tag adds the table's masks to every column. Under `mask_precedence = "refuse"`, a column whose own tag has a different mask now holds two masks and the read is refused (#918). No write-time check covers table tags: the write-time conflict guard is Ranger-specific and checks column tag writes. The read refusal is the backstop.
 
-### D5. Table tags are projected into Ranger; schema tags are next
+### D5. Table and schema tags are projected into Ranger
 
 The first MR kept the projection on own tags, so a table tag masked in SQE and not in Spark. #935 part 1 projects table tags too.
 
 - `sqe.table-tags` goes into Ranger's tag store on two resources of the tag service, in one import document: `{database, table, column: *}` and `{database, table}`. Kyuubi's Ranger plugin does not apply a tag on a bare table resource to a column mask request (checked live on the Spark stack: the bare resource left every column raw, the `column: *` one masked within seconds), so the every-column resource carries masks. The bare table resource carries tag row filters, which are table-level requests. A column is never named `*`, so the every-column resource cannot clash with a column's own resource.
 - Order, as for column tags: what a `SET TAGS` adds is in Ranger before the Iceberg commit (a failure changes nothing); what an `UNSET TAGS` removes is deleted after it (a failure leaves Spark over-masking, logged).
+- Ranger's tag import replaces: `add_or_update` sets a resource's tag list to exactly the list sent, and `delete` drops the resource whatever tags it names (checked live). A table-level change that leaves tags is therefore sent as one `add_or_update` with nothing deleted first; a delete followed by an add would leave Spark unmasked between the two calls. Only a change to no tags deletes. The column-level projection still deletes then adds (a follow-up in sqe-policy).
 - **Never shrink on an error.** In Spark a table without projected tags is not masked, so "nothing projected" fails open. When the tag load observer finds a malformed `sqe.table-tags`, it logs an error and leaves the table-level resources as they were; own column tags still project. There is no metric or audit event for projection; the error log is the signal.
 - `CALL system.reproject_column_tags` projects table tags as well, add-only.
 - Spark cannot be told to refuse a table whose projection is stale. Between a tag written outside SQE and SQE's next load of the table, Spark enforces the old projection.
 - Where a column's own tag and the table tag both carry a mask, SQE applies the own tag (D1). Kyuubi rendered the same value on the live stack (portable own-tag mask over a `MASK_NULL` table-tag mask: both engines showed the own-tag value). That is Ranger's tag policy order, not a rule SQE controls, so the parity e2e prints the pair rather than asserting it.
 
-Part 2 projects schema tags, likely on `{database, table: *, column: *}` and `{database, table: *}`, once `inherit_schema_tags` is on. Catalog tags are not inherited and not projected.
+Part 2 projects schema tags onto the schema-wide resources `{database, table: *, column: *}` and `{database, table: *}`, only with `inherit_schema_tags` on. Kyuubi applies both: a `MASK_NULL` tag mask and a tag row filter on them reached `ac.orders` in Spark on the live stack. Catalog tags are not inherited and not projected.
+
+- `ALTER SCHEMA ... SET|UNSET TAGS` keeps the order above: before the namespace commit Ranger gets the union of what it holds, the old list and the new one (a failure refuses the statement and changes nothing); after it, the exact new list, or a delete when the schema has no tags left (a failure over-masks, logged). The projection is serialised per catalog and schema with the load observer.
+- The load observer reads the schema's tags in the same step as the table (D8) and only grows the schema-wide resource: a key the schema carries that Ranger does not hold yet is added, as one replace of the held list plus the new keys. It never removes a key; `ALTER SCHEMA` and `reproject_column_tags` do. When the schema cannot be read (`Unknown`), the observer logs an error and leaves the schema-wide resource as it is, while the table's own column and table tags still project.
+- `CALL system.reproject_column_tags` writes each target's schema-wide resource exactly, as a row named `<schema>.*`. An unreadable schema is an error row and Ranger keeps what it holds.
+- What is held is remembered per process. A coordinator that has not projected a schema yet sends what it reads, so with two coordinators a key removed on one can come back from the other's memory until a statement or a repair writes the schema again: Spark over-masks, it does not leak. Turning the flag off or dropping a schema leaves the schema-wide resources in Ranger (over-mask) until they are deleted by hand.
+- Which of a column's own tag, the table's and the schema's wins when they carry different masks is #942; the parity e2e covers a schema tag alone.
 
 ### D6. Freshness follows the table metadata
 
@@ -67,4 +74,4 @@ Effective tags are column, then table, then schema: the nearest key wins (D1 app
 ## Risks
 
 - Tagging a table with a key that a row filter matches filters every query of it. That is the intent, but a broad key (`gold`) with a filter now has a wider effect than before. Release notes call it out.
-- Spark and SQE differ on schema tags until #935 part 2 lands, and on a table whose tags were written outside SQE until SQE next loads it (D5).
+- Spark and SQE differ on a table or schema whose tags were written outside SQE until SQE next loads a table of it, and on a removed schema tag that another coordinator still remembers (D5); both over-mask or under-mask only in that window, and Spark cannot be told to refuse a stale projection.

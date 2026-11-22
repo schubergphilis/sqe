@@ -568,13 +568,18 @@ enum Lookup {
 
 impl SqeSchemaProvider {
     /// The scan provider for a loaded table. The schema's tags are read in
-    /// the same step as the table, with the caller's token (#924).
+    /// the same step as the table, with the caller's token (#924), and the
+    /// load is reported with them, which projects a tag committed outside
+    /// SQE into Ranger (#903, #935).
     async fn table_provider(
         &self,
         table: iceberg::table::Table,
-        namespace: &NamespaceIdent,
+        table_ident: &iceberg::TableIdent,
     ) -> sqe_core::Result<SqeTableProvider> {
-        let schema_tags = self.session_catalog.schema_tag_state(namespace).await;
+        let session = &self.session_catalog;
+        let schema_tags = session.schema_tag_state(table_ident.namespace()).await;
+        let catalog = self.catalog_name.as_deref().unwrap_or(&self.warehouse);
+        session.notify_table_loaded(catalog, table_ident, &table, &schema_tags);
         SqeTableProvider::try_new(table, schema_tags).await
     }
 
@@ -591,14 +596,8 @@ impl SqeSchemaProvider {
 
         // First: try loading as a regular Iceberg table
         let loaded = self.session_catalog.load_table(&table_ident).await;
-        if let Ok(table) = &loaded {
-            // Projects a tag committed outside SQE into Ranger (#903).
-            let catalog = self.catalog_name.as_deref().unwrap_or(&self.warehouse);
-            self.session_catalog
-                .notify_table_loaded(catalog, &table_ident, table);
-        }
         match loaded {
-            Ok(table) => match self.table_provider(table, &ns_ident).await {
+            Ok(table) => match self.table_provider(table, &table_ident).await {
                 Ok(provider) => {
                     let provider = match self.prom_metrics {
                         Some(ref m) => provider.with_metrics(Arc::clone(m)),

@@ -16,6 +16,8 @@ use std::sync::{Arc, OnceLock};
 use iceberg::table::Table;
 use iceberg::TableIdent;
 
+use crate::schema_tags::SchemaTagState;
+
 /// Told about every table a schema provider loads for planning.
 ///
 /// Called on the planning path: an implementation must return quickly and do
@@ -23,7 +25,15 @@ use iceberg::TableIdent;
 pub trait TableLoadObserver: Send + Sync {
     /// `catalog` is the planner's name for the table's catalog, the name a
     /// catalog-scoped Ranger key carries (#899), not the warehouse.
-    fn table_loaded(&self, catalog: &str, ident: &TableIdent, table: &Table);
+    /// `schema_tags` is the state the table's scan provider is built with
+    /// (#935), read once for both.
+    fn table_loaded(
+        &self,
+        catalog: &str,
+        ident: &TableIdent,
+        table: &Table,
+        schema_tags: &SchemaTagState,
+    );
 }
 
 /// The observer slot a [`crate::TableMetadataCache`] carries. Every clone of
@@ -40,9 +50,15 @@ impl LoadObserverSlot {
     }
 
     /// Report a load to the installed observer, if any.
-    pub fn notify(&self, catalog: &str, ident: &TableIdent, table: &Table) {
+    pub fn notify(
+        &self,
+        catalog: &str,
+        ident: &TableIdent,
+        table: &Table,
+        schema_tags: &SchemaTagState,
+    ) {
         if let Some(observer) = self.0.get() {
-            observer.table_loaded(catalog, ident, table);
+            observer.table_loaded(catalog, ident, table, schema_tags);
         }
     }
 }
@@ -53,7 +69,7 @@ mod tests {
 
     struct Never;
     impl TableLoadObserver for Never {
-        fn table_loaded(&self, _: &str, _: &TableIdent, _: &Table) {}
+        fn table_loaded(&self, _: &str, _: &TableIdent, _: &Table, _: &SchemaTagState) {}
     }
 
     #[test]

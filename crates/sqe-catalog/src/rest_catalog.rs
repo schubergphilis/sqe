@@ -2810,9 +2810,17 @@ impl SessionCatalog {
     }
 
     /// Report a table loaded for planning to the shared cache's observer
-    /// (#903). `catalog` is the planner's name for this catalog.
-    pub fn notify_table_loaded(&self, catalog: &str, ident: &TableIdent, table: &Table) {
-        self.table_cache.load_observer.notify(catalog, ident, table);
+    /// (#903). `catalog` is the planner's name for this catalog;
+    /// `schema_tags` is what [`Self::schema_tag_state`] read for the load.
+    pub fn notify_table_loaded(
+        &self,
+        catalog: &str,
+        ident: &TableIdent,
+        table: &Table,
+        schema_tags: &crate::schema_tags::SchemaTagState,
+    ) {
+        let observer = &self.table_cache.load_observer;
+        observer.notify(catalog, ident, table, schema_tags);
     }
 
     /// A [`crate::vended_credentials::TableReloader`] for `table_ident` that

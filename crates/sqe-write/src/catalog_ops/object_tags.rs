@@ -4,8 +4,10 @@
 //!
 //! Table tags reach every column of the table (#924), so tag policies mask
 //! through them. They are projected onto the table's table and every-column
-//! Ranger resources, so Spark masks and filters with them too (#935). Schema
-//! tags are not projected yet. Catalog tags are metadata only: nothing
+//! Ranger resources, so Spark masks and filters with them too (#935). With
+//! `policy.inherit_schema_tags` on, schema tags reach every table of the
+//! schema and are projected onto its schema-wide resource (`table:*`), in
+//! the same never-mask-less order. Catalog tags are metadata only: nothing
 //! inherits them, so they drive no mask and are not projected.
 
 use std::collections::HashMap;
@@ -17,6 +19,8 @@ use sqe_core::{Session, SqeError, SqeErrorCode};
 use sqe_sql::object_tags::{ObjectTagsStatement, TagObject};
 use sqe_sql::tags::TagAction;
 use tracing::info;
+
+use crate::tag_load_observer::{schema_key, schema_lock_key};
 
 use super::{
     catalog_qualifier, keyed_lock, namespace_without_catalog, parse_object_name,
@@ -67,7 +71,7 @@ fn tag_keys(raw: Option<&str>) -> sqe_core::Result<Vec<String>> {
 }
 
 /// Each key of `a`, then each key of `b` not in `a`.
-fn union(a: &[String], b: &[String]) -> Vec<String> {
+pub(crate) fn union(a: &[String], b: &[String]) -> Vec<String> {
     let mut all = a.to_vec();
     all.extend(b.iter().filter(|k| !a.contains(k)).cloned());
     all
@@ -188,7 +192,10 @@ impl CatalogOps {
         self.invalidate_table_all_tokens(&table_ident).await;
         if let Some((catalog, before, after)) = &projection {
             if before.iter().any(|k| !after.contains(k)) {
-                let run = self.project_table_level_keys(catalog, &table_ident, before, after);
+                // Add-or-update replaces the resource's tags, so a non-empty
+                // list goes alone; a delete first would unmask in between.
+                let prev = if after.is_empty() { &before[..] } else { &[] };
+                let run = self.project_table_level_keys(catalog, &table_ident, prev, after);
                 if let Err(e) = run.await {
                     tracing::warn!(
                         table = %table_ident,
@@ -227,15 +234,12 @@ impl CatalogOps {
         let _guard = lock.lock().await;
 
         let current = session_catalog.get_namespace(&namespace).await?;
-        let json = next_tags(
-            current
-                .properties()
-                .get(SCHEMA_PROP_KEY)
-                .map(String::as_str),
-            stmt,
-            SCHEMA_PROP_KEY,
-            &format!("schema '{}'", namespace.join(".")),
-        )?;
+        let raw = current
+            .properties()
+            .get(SCHEMA_PROP_KEY)
+            .map(String::as_str);
+        let on = format!("schema '{}'", namespace.join("."));
+        let json = next_tags(raw, stmt, SCHEMA_PROP_KEY, &on)?;
         info!(
             username = %session.user.username,
             namespace = ?namespace,
@@ -243,12 +247,75 @@ impl CatalogOps {
             action = ?stmt.action,
             "Authoring schema tags"
         );
+        // The schema-wide Ranger resource (#935), only when schema tags
+        // reach tables at all. Same order as table tags: Ranger holds the
+        // union before the commit and the exact list after it, so other
+        // engines never mask less than SQE.
+        let projection =
+            match self.config.policy.inherit_schema_tags && self.tag_projector.enabled() {
+                true => Some((
+                    self.planner_catalog(session, schema_catalog_qualifier(&object_name)),
+                    tag_keys(raw)?,
+                    tag_keys(Some(&json))?,
+                )),
+                false => None,
+            };
+        // Held across the commit, so a load that projects this schema
+        // cannot interleave with the two writes here.
+        let projection_lock = projection
+            .as_ref()
+            .map(|(c, _, _)| keyed_lock(&self.table_locks, schema_lock_key(c, &namespace)));
+        let _projection_guard = match &projection_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        let mut during = Vec::new();
+        if let Some((catalog, before, after)) = &projection {
+            let key = schema_key(catalog, &namespace);
+            let held = self.tag_load_memory.schema_held(&key);
+            during = union(&union(&held, before), after);
+            if during.len() > held.len() {
+                let run = self.project_schema_keys(catalog, &namespace, &[], &during);
+                run.await.map_err(|e| {
+                    SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!(
+                            "could not project the tags of {on} into Ranger ({e}); \
+                             nothing was changed"
+                        ),
+                    )
+                })?;
+                self.tag_load_memory.record_schema(key, during.clone());
+            }
+        }
         session_catalog
             .update_namespace(
                 &namespace,
                 HashMap::from([(SCHEMA_PROP_KEY.to_string(), json)]),
             )
-            .await
+            .await?;
+        if let Some((catalog, _, after)) = &projection {
+            if during != *after {
+                let prev = if after.is_empty() { &during[..] } else { &[] };
+                match self
+                    .project_schema_keys(catalog, &namespace, prev, after)
+                    .await
+                {
+                    Ok(()) => {
+                        let key = schema_key(catalog, &namespace);
+                        self.tag_load_memory.record_schema(key, after.clone());
+                    }
+                    Err(e) => tracing::warn!(
+                        schema = %namespace.to_url_string(),
+                        error = %e,
+                        "schema tags were removed but Ranger still holds them; other engines \
+                         over-mask this schema until `CALL system.reproject_column_tags` or \
+                         the next tag change"
+                    ),
+                }
+            }
+        }
+        Ok(())
     }
 }
 
