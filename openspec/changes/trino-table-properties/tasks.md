@@ -27,5 +27,5 @@
 ## 4. Wire and dbt
 
 - [x] 4.1 Extend `trino_table_properties_e2e` to assert spec, sort order and properties per property
-- [ ] 4.2 dbt-trino run with `on_table_exists` = `rename`, `drop`, `replace` and `skip`, and with `views_enabled = false`
+- [x] 4.2 dbt-trino run with `on_table_exists` = `rename`, `drop`, `replace` and `skip`, and with `views_enabled = false`
 - [x] 4.3 Docs: the Trino compatibility section of the DDL reference lists every property and its mapping; fix the CTAS row that claims `WITH (partitioning = ...)` works

@@ -561,3 +561,44 @@ async fn trino_alter_properties_897() {
 
     ok(&base_url, &format!("DROP TABLE IF EXISTS {NS}.{t}")).await;
 }
+
+/// dbt-trino's `on_table_exists = 'skip'`: `create table if not exists ...
+/// as (select ...)` on every run. The first run creates and fills the table;
+/// a later run is a no-op that keeps the table and its rows, as in Trino,
+/// where it used to fail with "table already exists".
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn trino_ctas_if_not_exists_skip_897() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let handler = Arc::new(handler);
+    let base_url = start_server(&session, &handler).await;
+    let t = "trino_skip_897";
+    ok(&base_url, &format!("DROP TABLE IF EXISTS {NS}.{t}")).await;
+    let ctas = |run: i32| {
+        format!(
+            "create table if not exists {NS}.{t}\n    as (\n      \
+             select cast({run} as integer) as run, 'skip' as mode\n    );"
+        )
+    };
+
+    ok(&base_url, &ctas(1)).await;
+    let before = load(&session, t).await;
+    ok(&base_url, &ctas(2)).await;
+    let after = load(&session, t).await;
+
+    assert_eq!(
+        after.metadata().uuid(),
+        before.metadata().uuid(),
+        "same table"
+    );
+    assert_eq!(
+        after.metadata().current_snapshot_id(),
+        before.metadata().current_snapshot_id(),
+        "no commit"
+    );
+    let count = |run: i32| format!("SELECT count(*) FROM {NS}.{t} WHERE run = {run}");
+    assert_eq!(count_rows(&handler, &session, &count(1)).await, 1);
+    assert_eq!(count_rows(&handler, &session, &count(2)).await, 0);
+
+    ok(&base_url, &format!("DROP TABLE IF EXISTS {NS}.{t}")).await;
+}
