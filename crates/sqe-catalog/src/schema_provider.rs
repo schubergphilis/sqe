@@ -567,6 +567,17 @@ enum Lookup {
 }
 
 impl SqeSchemaProvider {
+    /// The scan provider for a loaded table. The schema's tags are read in
+    /// the same step as the table, with the caller's token (#924).
+    async fn table_provider(
+        &self,
+        table: iceberg::table::Table,
+        namespace: &NamespaceIdent,
+    ) -> sqe_core::Result<SqeTableProvider> {
+        let schema_tags = self.session_catalog.schema_tag_state(namespace).await;
+        SqeTableProvider::try_new(table, schema_tags).await
+    }
+
     /// Load `name` as an Iceberg table, else as an Iceberg view.
     async fn load_table_or_view(&self, name: &str) -> DFResult<Lookup> {
         debug!(
@@ -587,7 +598,7 @@ impl SqeSchemaProvider {
                 .notify_table_loaded(catalog, &table_ident, table);
         }
         match loaded {
-            Ok(table) => match SqeTableProvider::try_new(table).await {
+            Ok(table) => match self.table_provider(table, &ns_ident).await {
                 Ok(provider) => {
                     let provider = match self.prom_metrics {
                         Some(ref m) => provider.with_metrics(Arc::clone(m)),

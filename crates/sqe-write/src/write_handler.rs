@@ -1935,14 +1935,37 @@ impl WriteHandler {
         // session's, else the configured default. The read path governs the
         // same table as `catalog.ns.t` (`TableScope::qualify`), and a
         // catalog-scoped policy store keys on that catalog.
-        let catalog_name = self.policy_catalog_name(qualifier, session);
-        let (predicates, summary) = sqe_policy::write_predicates::extract_write_predicates(
+        let catalog_name = self.policy_catalog_name(qualifier.clone(), session);
+        // Inherited schema tags live on the provider, not the cache (#924).
+        let probe: Arc<dyn datafusion::datasource::TableProvider> =
+            if self.config.policy.inherit_schema_tags {
+                let target = resolve_target_catalog(qualifier, session);
+                let session_catalog = self
+                    .resolve_session_catalog(session, target.as_deref())
+                    .await?;
+                let table = session_catalog.load_table(table_ident).await?;
+                let schema_tags = session_catalog
+                    .schema_tag_state(table_ident.namespace())
+                    .await;
+                Arc::new(
+                    sqe_catalog::table_provider::SqeTableProvider::try_new(table, schema_tags)
+                        .await?,
+                )
+            } else {
+                Arc::new(MemTable::try_new(schema, vec![vec![]]).map_err(|e| {
+                    SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!("policy probe MemTable: {e}"),
+                    )
+                })?)
+            };
+        let (predicates, summary) = sqe_policy::write_predicates::extract_write_predicates_over(
             enf.as_ref(),
             &session.user,
             Some(&catalog_name),
             &namespace_key,
             table_ident.name(),
-            schema,
+            probe,
         )
         .await?;
         *policy_summary_out = Some(summary);
@@ -14859,9 +14882,12 @@ s3_path_style = true
             if table.metadata().current_snapshot_id().is_none() {
                 return Vec::new();
             }
-            let provider = sqe_catalog::table_provider::SqeTableProvider::try_new(table)
-                .await
-                .expect("table provider");
+            let provider = sqe_catalog::table_provider::SqeTableProvider::try_new(
+                table,
+                sqe_catalog::schema_tags::SchemaTagState::NotInherited,
+            )
+            .await
+            .expect("table provider");
             let ctx = DFSessionContext::new();
             ctx.register_table("t", Arc::new(provider))
                 .expect("register");
@@ -15330,9 +15356,12 @@ s3_path_style = true
             // SELECT through DataFusion over the committed table.
             let table = rig.load(&rig.ident("rt")).await;
             assert_eq!(snapshot_count(&table), 1);
-            let provider = sqe_catalog::table_provider::SqeTableProvider::try_new(table)
-                .await
-                .expect("table provider");
+            let provider = sqe_catalog::table_provider::SqeTableProvider::try_new(
+                table,
+                sqe_catalog::schema_tags::SchemaTagState::NotInherited,
+            )
+            .await
+            .expect("table provider");
             let ctx = DFSessionContext::new();
             ctx.register_table("rt", Arc::new(provider))
                 .expect("register");

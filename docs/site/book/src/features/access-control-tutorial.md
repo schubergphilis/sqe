@@ -672,7 +672,7 @@ One enforcement detail does not carry over, and it is pinned by
 below its row-filter marker, so a row filter that reads a tag-masked column
 compares the mask value and matches nothing, where SQE matches on the stored
 value. No data leaks either way. Mask precedence used to be a second difference
-and is not any more, because `policy.mask-precedence` now defaults to `tag`.
+and is not any more, because `policy.mask_precedence` now defaults to `tag`.
 
 ## 2.5 Precedence
 
@@ -680,7 +680,7 @@ and is not any more, because `policy.mask-precedence` now defaults to `tag`.
    whatever the mask says.
 2. **A tag mask beats a resource mask**, by default. This matches the Ranger
    plugin order Spark/Kyuubi uses, so the same policy set renders the same
-   value in both engines. Set `policy.mask-precedence = "resource"` for the
+   value in both engines. Set `policy.mask_precedence = "resource"` for the
    most-specific-rule-wins reading instead.
 3. **Row filters AND together.**
 4. **Row filters read stored values.** A filter is evaluated before masks are

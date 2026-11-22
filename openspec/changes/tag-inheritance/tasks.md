@@ -7,12 +7,13 @@
 - [x] 1.5 IT (in-process policy store): table-tag mask and UNSET, row filter on SELECT / UPDATE / DELETE / SHOW STATS (MERGE in `merge_row_filter_e2e`, tag cases), inherited conflict refused, malformed table tags refused
 - [x] 1.6 Docs: fine-grained access control page
 
-## 2. Schema and catalog (second MR)
+## 2. Schema (second MR), catalog later
 
-- [ ] 2.1 Read `sqe.schema-tags` and `sqe.catalog-tags` through a cache with TTL <= the policy refresh interval; invalidate on SQE's own SET/UNSET TAGS (D6)
-- [ ] 2.2 A 403, error or malformed parent property refuses the table (D3)
-- [ ] 2.3 Effective tags = column, then table, schema, catalog (nearest wins)
-- [ ] 2.4 IT: a schema tag masks a table created after the tag
+- [x] 2.0 `policy.inherit_schema_tags` (default false), TOML and env; config docs (D8)
+- [x] 2.1 Read `sqe.schema-tags` with the table load, no cache (D8); a namespace cache is a later, measured change. Catalog tags: TODO (#924)
+- [x] 2.2 A 403, error or malformed schema property refuses the table (D3, D8); the provider constructor takes the schema tag state, no default
+- [x] 2.3 Effective tags = column, then table, then schema (nearest wins); catalog later
+- [x] 2.4 IT: flag off ignores schema tags; a schema tag masks a table created after the tag and a table another session already read; UNSET restores; malformed refuses; UPDATE/DELETE skip hidden rows
 
 ## 3. Follow-ups
 

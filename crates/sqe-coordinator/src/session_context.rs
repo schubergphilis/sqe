@@ -122,9 +122,17 @@ pub(crate) async fn build_catalog_provider(
     table_cache: Option<&TableMetadataCache>,
     prom_metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
     degrade_unresolvable: bool,
+    inherit_schema_tags: bool,
 ) -> Result<(SqeCatalogProvider, Arc<SessionCatalog>), Arc<SqeError>> {
-    let (session_catalog, storage) =
-        build_session_catalog(cat_cfg, sql_name, session, global_storage, table_cache).await?;
+    let (session_catalog, storage) = build_session_catalog(
+        cat_cfg,
+        sql_name,
+        session,
+        global_storage,
+        table_cache,
+        inherit_schema_tags,
+    )
+    .await?;
 
     let mut catalog_provider = SqeCatalogProvider::try_new_with_options(
         session_catalog.clone(),
@@ -157,12 +165,16 @@ pub(crate) async fn build_catalog_provider(
 /// `sql_name` is the name SQL uses for the catalog. A session limited to a
 /// catalog scope (#908) gets "catalog not found" for a name outside it, and
 /// the catalog it does get refuses writes the scope does not allow.
+///
+/// `inherit_schema_tags` is `policy.inherit_schema_tags` (#924): the catalog
+/// then reads the namespace's schema tags next to each table it loads.
 pub(crate) async fn build_session_catalog(
     cat_cfg: &sqe_core::config::CatalogConfig,
     sql_name: &str,
     session: &Session,
     global_storage: &sqe_core::config::StorageConfig,
     table_cache: Option<&TableMetadataCache>,
+    inherit_schema_tags: bool,
 ) -> Result<(Arc<SessionCatalog>, sqe_core::config::StorageConfig), Arc<SqeError>> {
     session.check_catalog_read(sql_name).map_err(Arc::new)?;
     let auth = cat_cfg.auth.clone().unwrap_or_default();
@@ -178,7 +190,8 @@ pub(crate) async fn build_session_catalog(
         SessionCatalog::for_session_with(cat_cfg, &storage, table_cache.cloned(), &bearer)
             .await
             .map_err(Arc::new)?
-            .with_catalog_scope(session.catalog_scope_arc(), sql_name),
+            .with_catalog_scope(session.catalog_scope_arc(), sql_name)
+            .with_inherit_schema_tags(inherit_schema_tags),
     );
 
     Ok((session_catalog, storage))
@@ -564,6 +577,7 @@ pub async fn create_session_context(
                     // the whole session build and take down unrelated catalogs
                     // (#501). It registers empty and self-heals on re-list.
                     true,
+                    config.policy.inherit_schema_tags,
                 )
                 .await?;
                 if catalog_provider.listing_succeeded() && catalog_auth_is_per_user(cat_cfg) {
@@ -1218,6 +1232,7 @@ pub(crate) async fn discover_catalog_provider(
         // unresolvable discovered warehouse must not register as an empty
         // catalog and hijack the session default.
         false,
+        config.policy.inherit_schema_tags,
     )
     .await
     {
@@ -1264,7 +1279,16 @@ pub(crate) async fn configured_session_catalog(
         .find(|(n, _)| n == name)
         .or_else(|| flattened.iter().find(|(_, c)| c.warehouse == name))?;
     let cfg = (*cfg).clone();
-    match build_session_catalog(&cfg, name, session, &config.storage, table_cache).await {
+    match build_session_catalog(
+        &cfg,
+        name,
+        session,
+        &config.storage,
+        table_cache,
+        config.policy.inherit_schema_tags,
+    )
+    .await
+    {
         Ok((session_catalog, _storage)) => Some(session_catalog),
         Err(e) => {
             tracing::info!(
@@ -1323,7 +1347,16 @@ pub(crate) async fn discover_session_catalog(
     let mut cfg = discovery_template(config)?;
     cfg.warehouse = warehouse.to_string();
 
-    match build_session_catalog(&cfg, warehouse, session, &config.storage, table_cache).await {
+    match build_session_catalog(
+        &cfg,
+        warehouse,
+        session,
+        &config.storage,
+        table_cache,
+        config.policy.inherit_schema_tags,
+    )
+    .await
+    {
         Ok((session_catalog, _storage)) => Some(session_catalog),
         Err(e) => {
             tracing::info!(

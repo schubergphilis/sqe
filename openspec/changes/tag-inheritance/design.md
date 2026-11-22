@@ -45,6 +45,18 @@ For schema and catalog tags (second MR), the parent properties are read through 
 
 `SET TAGS` has no view form (#922 tags tables, schemas and catalogs). A view is expanded into its base tables before the rewriter runs, so a query of a view inherits through the base tables' tags. Hive tables refuse object tags, so they have nothing to inherit.
 
+### D8. Schema tags: behind a flag, read with the table, three states
+
+Schema tag inheritance ships behind `policy.inherit_schema_tags`, default `false`. With the flag off SQE makes no extra catalog call and enforcement is exactly the table-level behaviour above; a deployment turns it on once the tools that manage tags understand that a schema tag now masks data.
+
+With the flag on, every table load that builds a scan provider (the schema provider, time travel, incremental, prepared statements, the write paths) reads the namespace's `sqe.schema-tags` with the caller's token in the same step, and the provider carries a three-state value: not inherited (flag off), known tags, or unknown (a 403, any other error, or a malformed value). The provider constructor takes the value as an argument, so a construction site that forgets it does not compile; there is no default that means "no schema tags". Unknown refuses every read of the table (D3).
+
+There is no namespace cache in this MR: one `get_namespace` per table load, only with the flag on. That keeps freshness exact (a schema tag set by any client applies to the next statement, for every user) and avoids a cross-token cache whose eviction would have to reach other users' entries. The cache of task 2.1 is a later performance change, measured first.
+
+`CacheTagSource`, the fallback for a scan whose provider the hook does not recognise, cannot see schema tags; with the flag on it reports the tag state as unknown for an Iceberg table rather than enforce table tags alone.
+
+Effective tags are column, then table, then schema: the nearest key wins (D1 applied twice). Catalog tags stay out: `ALTER CATALOG ... SET TAGS` is refused today, and their inheritance is left to #924.
+
 ## Risks
 
 - Tagging a table with a key that a row filter matches filters every query of it. That is the intent, but a broad key (`gold`) with a filter now has a wider effect than before. Release notes call it out.

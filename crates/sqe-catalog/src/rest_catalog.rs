@@ -1491,6 +1491,11 @@ pub struct SessionCatalog {
     /// warehouse outside the scope is not found: the backstop behind the
     /// checks where writes resolve their target.
     scope_guard: Option<ScopeGuard>,
+    /// `policy.inherit_schema_tags` (#924): every table load that builds a
+    /// scan provider also reads the namespace's `sqe.schema-tags`, through
+    /// [`Self::schema_tag_state`]. Off by default; set with
+    /// [`Self::with_inherit_schema_tags`].
+    inherit_schema_tags: bool,
 }
 
 #[derive(Clone)]
@@ -1811,6 +1816,7 @@ impl SessionCatalog {
             require_vended_credentials: false,
             table_cache: table_cache.unwrap_or_else(|| TableMetadataCache::new(0)),
             scope_guard: None,
+            inherit_schema_tags: false,
         }
     }
 
@@ -1837,6 +1843,7 @@ impl SessionCatalog {
             require_vended_credentials: false,
             table_cache: TableMetadataCache::new(0),
             scope_guard: None,
+            inherit_schema_tags: false,
         }
     }
 
@@ -1880,7 +1887,11 @@ impl SessionCatalog {
         table_cache: Option<TableMetadataCache>,
         bearer_token: &str,
     ) -> sqe_core::Result<Self> {
-        Self::for_session_with(&config.catalog, &config.storage, table_cache, bearer_token).await
+        Ok(
+            Self::for_session_with(&config.catalog, &config.storage, table_cache, bearer_token)
+                .await?
+                .with_inherit_schema_tags(config.policy.inherit_schema_tags),
+        )
     }
 
     /// Per-catalog variant of `for_session`. Takes a single
@@ -2007,6 +2018,7 @@ impl SessionCatalog {
             require_vended_credentials: catalog.require_vended_credentials,
             table_cache,
             scope_guard: None,
+            inherit_schema_tags: false,
         }
     }
 
@@ -2188,6 +2200,7 @@ impl SessionCatalog {
             require_vended_credentials: false,
             table_cache,
             scope_guard: None,
+            inherit_schema_tags: false,
         }
     }
 
@@ -2221,7 +2234,9 @@ impl SessionCatalog {
             self.extra_props.clone(),
         )
         .await?;
-        Ok(sibling.with_catalog_scope(scope, warehouse))
+        Ok(sibling
+            .with_catalog_scope(scope, warehouse)
+            .with_inherit_schema_tags(self.inherit_schema_tags))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2396,6 +2411,7 @@ impl SessionCatalog {
             require_vended_credentials,
             table_cache,
             scope_guard: None,
+            inherit_schema_tags: false,
         })
     }
 
@@ -2411,6 +2427,34 @@ impl SessionCatalog {
             catalog: catalog.to_string(),
         });
         self
+    }
+
+    /// Read the schema tags of every table this catalog loads for a scan
+    /// (`policy.inherit_schema_tags`, #924).
+    pub fn with_inherit_schema_tags(mut self, on: bool) -> Self {
+        self.inherit_schema_tags = on;
+        self
+    }
+
+    /// The schema tag state a scan provider for a table in `namespace` is
+    /// built with: [`SchemaTagState::NotInherited`] without a catalog call
+    /// when the flag is off, else one `get_namespace` with this session's
+    /// token (no cache); any error, a 403 included, is `Unknown`.
+    pub async fn schema_tag_state(
+        &self,
+        namespace: &NamespaceIdent,
+    ) -> crate::schema_tags::SchemaTagState {
+        use crate::schema_tags::SchemaTagState;
+        if !self.inherit_schema_tags {
+            return SchemaTagState::NotInherited;
+        }
+        match self.get_namespace(namespace).await {
+            Ok(ns) => SchemaTagState::from_namespace_properties(ns.properties()),
+            Err(e) => {
+                debug!(error = %e, namespace = ?namespace, "cannot read the schema's tags, schema tag state UNKNOWN (fail closed)");
+                SchemaTagState::Unknown
+            }
+        }
     }
 
     /// Bind this catalog to `session`'s catalog scope under the SQL name

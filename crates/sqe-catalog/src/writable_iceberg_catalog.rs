@@ -36,6 +36,7 @@
 //! along — for free. Less code, fewer corner cases, no parser
 //! dialect to maintain.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use dashmap::DashMap;
@@ -74,9 +75,20 @@ pub struct WritableIcebergCatalog {
     /// provider in `schemas`, so [`Self::with_views`] reaches the ones
     /// already built.
     views: Arc<OnceLock<ViewSource>>,
+    /// `policy.inherit_schema_tags` (#924), shared with every schema
+    /// provider in `schemas` so [`Self::with_inherit_schema_tags`] reaches
+    /// the ones already built.
+    inherit_schema_tags: Arc<AtomicBool>,
 }
 
 impl WritableIcebergCatalog {
+    /// Read each table's schema tags when it is loaded for a scan
+    /// (`policy.inherit_schema_tags`, #924). Off by default.
+    pub fn with_inherit_schema_tags(self, on: bool) -> Self {
+        self.inherit_schema_tags.store(on, Ordering::Relaxed);
+        self
+    }
+
     /// The iceberg catalog behind this provider, for writes that commit
     /// through `sqe-write` rather than DataFusion's DML hooks.
     pub fn client(&self) -> Arc<dyn Catalog> {
@@ -108,6 +120,7 @@ impl WritableIcebergCatalog {
             catalog: Arc::clone(&self.catalog),
             namespace: namespace.to_string(),
             views: Arc::clone(&self.views),
+            inherit_schema_tags: Arc::clone(&self.inherit_schema_tags),
         })
     }
 
@@ -128,6 +141,7 @@ impl WritableIcebergCatalog {
             catalog: client,
             schemas: Arc::new(DashMap::new()),
             views: Arc::new(OnceLock::new()),
+            inherit_schema_tags: Arc::new(AtomicBool::new(false)),
         };
         for name in upstream.schema_names() {
             if let Some(provider) = upstream.schema(&name) {
@@ -385,6 +399,7 @@ struct BaseTablesOnly {
     catalog: Arc<dyn Catalog>,
     namespace: String,
     views: Arc<OnceLock<ViewSource>>,
+    inherit_schema_tags: Arc<AtomicBool>,
 }
 
 /// The view side of a REST catalog: its `SessionCatalog` for the view
@@ -551,7 +566,13 @@ impl SchemaProvider for BaseTablesOnly {
                 .load_table(&ident)
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let provider = crate::table_provider::SqeTableProvider::try_new(table)
+            let schema_tags = crate::schema_tags::SchemaTagState::load(
+                self.inherit_schema_tags.load(Ordering::Relaxed),
+                self.catalog.as_ref(),
+                &ident.namespace,
+            )
+            .await;
+            let provider = crate::table_provider::SqeTableProvider::try_new(table, schema_tags)
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
             return Ok(Some(Arc::new(provider)));
@@ -623,6 +644,7 @@ mod tests {
             catalog: memory_catalog().await,
             namespace: "ns".to_string(),
             views: Arc::new(OnceLock::new()),
+            inherit_schema_tags: Arc::new(AtomicBool::new(false)),
         };
         let mut names = wrapped.table_names();
         names.sort();

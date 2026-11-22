@@ -4,6 +4,7 @@
 //! `CREATE SECRET` / `DROP SECRET` / `SHOW SECRETS` handlers manage the secret store.
 
 use super::*;
+use sqe_catalog::schema_tags::SchemaTagState;
 
 impl QueryHandler {
     /// Handle `SHOW STATS FOR <table>` by reading the current snapshot summary.
@@ -93,9 +94,26 @@ impl QueryHandler {
                 // Malformed tags are UNKNOWN, not empty: the rewriter fails
                 // closed on them and so does this. Table tags count, as
                 // the rewriter inherits them (#924).
+                let schema_tags = match session_catalog
+                    .schema_tag_state(&table_ident.namespace)
+                    .await
+                {
+                    SchemaTagState::NotInherited => Vec::new(),
+                    SchemaTagState::Known(tags) => tags,
+                    SchemaTagState::Unknown => {
+                        return Err(SqeError::with_code(
+                            SqeErrorCode::ExecutionFailed,
+                            format!(
+                                "SHOW STATS: schema tags of {table_name} could not be read; \
+                                 tag state unknown"
+                            ),
+                        ));
+                    }
+                };
                 let col_tags = crate::tag_source_impl::effective_column_tags(
                     metadata.properties(),
                     metadata.current_schema(),
+                    &schema_tags,
                 )
                 .map_err(|e| {
                     SqeError::with_code(
@@ -301,7 +319,7 @@ impl QueryHandler {
         }
 
         self.runtime_catalogs
-            .attach(stmt, &self.secrets)
+            .attach(stmt, &self.secrets, self.config.policy.inherit_schema_tags)
             .await
             .map_err(SqeError::Execution)?;
         crate::session_context::invalidate_all_session_caches().await;

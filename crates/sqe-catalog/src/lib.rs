@@ -49,6 +49,7 @@ pub mod read_parquet;
 pub mod scan_memory;
 #[cfg(feature = "rest")]
 pub mod schema_provider;
+pub mod schema_tags;
 pub mod show_create;
 pub mod snapshot_stats;
 pub mod sort_order;

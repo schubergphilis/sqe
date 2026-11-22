@@ -60,6 +60,7 @@ use crate::incremental_scan::{
     attach_meta_columns, augment_schema_with_meta, ChangeKind, IncrementalFile, IncrementalPlan,
     CHANGE_ORDINAL_COLUMN, CHANGE_TYPE_COLUMN, COMMIT_SNAPSHOT_ID_COLUMN,
 };
+use crate::schema_tags::SchemaTagState;
 
 /// A TableProvider backed by an explicit [`IncrementalPlan`].
 ///
@@ -88,6 +89,11 @@ pub struct IncrementalTableProvider {
     /// The Iceberg schema the scan reads, for resolving column tags by field
     /// id (#920). `None`: the tags cannot be resolved off the scan.
     table_schema: Option<iceberg::spec::SchemaRef>,
+    /// The tags of the table's schema, read with the table (#924). Supplied
+    /// together with `table_properties`; `None` means the builder never
+    /// supplied them, and the rewriter treats the scan as not recognised
+    /// rather than as untagged.
+    schema_tags: Option<SchemaTagState>,
 }
 
 impl std::fmt::Debug for IncrementalTableProvider {
@@ -118,19 +124,30 @@ impl IncrementalTableProvider {
             file_io,
             table_properties: None,
             table_schema: None,
+            schema_tags: None,
         }
     }
 
     /// Attach the table's properties as loaded for planning (#844), and the
-    /// Iceberg schema the scan reads (#920).
+    /// Iceberg schema the scan reads (#920), and the schema's tags read in
+    /// the same step (#924). The schema tags are a required argument so a
+    /// provider with properties can never be mistaken for one in an untagged
+    /// schema.
     pub fn with_table_properties(
         mut self,
         properties: HashMap<String, String>,
         schema: iceberg::spec::SchemaRef,
+        schema_tags: SchemaTagState,
     ) -> Self {
         self.table_properties = Some(properties);
         self.table_schema = Some(schema);
+        self.schema_tags = Some(schema_tags);
         self
+    }
+
+    /// The tags of the table's schema, if the builder supplied them.
+    pub fn schema_tags(&self) -> Option<&SchemaTagState> {
+        self.schema_tags.as_ref()
     }
 
     /// The table's properties, if the builder supplied them.

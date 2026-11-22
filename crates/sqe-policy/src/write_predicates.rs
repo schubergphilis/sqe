@@ -90,6 +90,27 @@ pub async fn extract_write_predicates(
     table_name: &str,
     schema: Arc<ArrowSchema>,
 ) -> sqe_core::Result<(WritePolicyPredicates, crate::PolicySummary)> {
+    let empty_batches: Vec<Vec<arrow_array::RecordBatch>> = vec![vec![]];
+    let mem = Arc::new(MemTable::try_new(schema, empty_batches).map_err(|e| {
+        SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!("policy probe MemTable: {e}"),
+        )
+    })?);
+    extract_write_predicates_over(enforcer, user, catalog, namespace_key, table_name, mem).await
+}
+
+/// [`extract_write_predicates`] over a caller-supplied probe provider. The
+/// provider is only planned, never scanned; a caller whose tag state lives on
+/// the provider (schema tags, #924) passes a provider that carries it.
+pub async fn extract_write_predicates_over(
+    enforcer: &dyn PolicyEnforcer,
+    user: &SessionUser,
+    catalog: Option<&str>,
+    namespace_key: &str,
+    table_name: &str,
+    probe: Arc<dyn datafusion::datasource::TableProvider>,
+) -> sqe_core::Result<(WritePolicyPredicates, crate::PolicySummary)> {
     let table_ref = match catalog.filter(|c| !c.is_empty()) {
         Some(catalog) => TableReference::full(
             catalog.to_string(),
@@ -99,14 +120,14 @@ pub async fn extract_write_predicates(
         None => TableReference::partial(namespace_key.to_string(), table_name.to_string()),
     };
 
-    let empty_batches: Vec<Vec<arrow_array::RecordBatch>> = vec![vec![]];
-    let mem = Arc::new(
-        MemTable::try_new(schema, empty_batches)
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("policy probe MemTable: {e}")))?,
-    );
-    let plan = LogicalPlanBuilder::scan(table_ref, provider_as_source(mem), None)
+    let plan = LogicalPlanBuilder::scan(table_ref, provider_as_source(probe), None)
         .and_then(|b| b.build())
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("policy probe scan: {e}")))?;
+        .map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("policy probe scan: {e}"),
+            )
+        })?;
 
     // The reference above is already qualified; no scope to apply.
     let (rewritten, summary) = enforcer

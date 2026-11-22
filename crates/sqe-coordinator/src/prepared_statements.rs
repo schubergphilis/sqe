@@ -586,9 +586,12 @@ mod tests {
             .disable_cache()
             .build()
             .unwrap();
-        let provider = sqe_catalog::table_provider::SqeTableProvider::try_new(table)
-            .await
-            .unwrap();
+        let provider = sqe_catalog::table_provider::SqeTableProvider::try_new(
+            table,
+            sqe_catalog::schema_tags::SchemaTagState::NotInherited,
+        )
+        .await
+        .unwrap();
         datafusion::logical_expr::LogicalPlanBuilder::scan(
             "t",
             datafusion::datasource::provider_as_source(Arc::new(provider)),

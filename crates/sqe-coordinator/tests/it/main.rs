@@ -98,6 +98,7 @@ mod rewrite_files_new_delete_conflict_test;
 mod rewrite_require_mode_test;
 mod rewrite_snapshot_properties_test;
 mod runtime_catalog_test;
+mod schema_tag_inheritance_e2e;
 mod show_stats_policy_e2e;
 mod spark_access_control_e2e;
 mod spark_mask_parity_e2e;

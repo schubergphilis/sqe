@@ -39,6 +39,7 @@ use std::sync::Arc;
 use iceberg::NamespaceIdent;
 use tracing::debug;
 
+use sqe_catalog::schema_tags::SchemaTagState;
 use sqe_catalog::TableMetadataCache;
 use sqe_core::column_tags::{self, ColumnTag, ColumnTagMap};
 use sqe_core::object_tags;
@@ -64,12 +65,27 @@ pub const PROP_KEY: &str = column_tags::PROP_KEY;
 /// returns `Some(map)` even when the parsed map is empty (known: no tags).
 pub struct CacheTagSource {
     cache: Arc<TableMetadataCache>,
+    /// `policy.inherit_schema_tags`: the cache holds table properties, not
+    /// namespace properties, so with the flag on this source cannot know a
+    /// table's effective tags and reports them unknown (fail closed).
+    inherit_schema_tags: bool,
 }
 
 impl CacheTagSource {
     /// Create a new `CacheTagSource` wrapping the shared global cache.
     pub fn new(cache: Arc<TableMetadataCache>) -> Self {
-        Self { cache }
+        Self {
+            cache,
+            inherit_schema_tags: false,
+        }
+    }
+
+    /// With `policy.inherit_schema_tags` on, report every table's tag state
+    /// unknown rather than enforce table tags without the schema's (#924).
+    #[must_use = "with_inherit_schema_tags consumes self; bind the returned source"]
+    pub fn with_inherit_schema_tags(mut self, on: bool) -> Self {
+        self.inherit_schema_tags = on;
+        self
     }
 }
 
@@ -80,6 +96,10 @@ impl TagSource for CacheTagSource {
         namespace: &[String],
         table: &str,
     ) -> Option<HashMap<String, Vec<String>>> {
+        if self.inherit_schema_tags {
+            debug!(%table, "tag_source: schema tags inherited, tag state UNKNOWN");
+            return None;
+        }
         // Build the namespace display string the same way `table_cache_key` does:
         // `NamespaceIdent::Display` joins parts with `.`.
         let ns_display = match NamespaceIdent::from_vec(namespace.to_vec()) {
@@ -117,7 +137,7 @@ impl TagSource for CacheTagSource {
         // Entries recorded with a field id resolve against the current schema
         // (#920), so a renamed column keeps its tags. Table tags are
         // inherited by every column (#924).
-        match effective_column_tags(metadata.properties(), metadata.current_schema()) {
+        match effective_column_tags(metadata.properties(), metadata.current_schema(), &[]) {
             Ok(map) => Some(map),
             Err(e) => {
                 debug!(
@@ -163,26 +183,41 @@ pub fn scan_column_tags(
     // Tags recorded with a field id resolve against the schema the scan
     // reads (the snapshot's under time travel), so a rename applies them
     // under the column's name in that schema (#920).
-    let (properties, schema) = if let Some(iceberg) =
+    let (properties, schema, schema_tags) = if let Some(iceberg) =
         any.downcast_ref::<sqe_catalog::table_provider::SqeTableProvider>()
     {
         (
             iceberg.table().metadata().properties(),
             iceberg.scan_schema(),
+            iceberg.schema_tags(),
         )
     } else if let Some(incremental) =
         any.downcast_ref::<sqe_catalog::incremental_provider::IncrementalTableProvider>()
     {
         // A `FOR INCREMENTAL BETWEEN SNAPSHOT` scan carries the properties
         // and schema its planning load read (#844).
-        match (incremental.table_properties(), incremental.table_schema()) {
-            (Some(properties), Some(schema)) => (properties, schema.clone()),
+        match (
+            incremental.table_properties(),
+            incremental.table_schema(),
+            incremental.schema_tags(),
+        ) {
+            (Some(properties), Some(schema), Some(schema_tags)) => {
+                (properties, schema.clone(), schema_tags)
+            }
             _ => return ScanTagState::NotRecognised,
         }
     } else {
         return ScanTagState::NotRecognised;
     };
-    match effective_column_tags(properties, &schema) {
+    let schema_tags = match schema_tags {
+        SchemaTagState::NotInherited => &[][..],
+        SchemaTagState::Known(tags) => tags.as_slice(),
+        SchemaTagState::Unknown => {
+            debug!("tag_source: unreadable schema tags on the scanned table, tag state UNKNOWN (fail closed)");
+            return ScanTagState::Unknown;
+        }
+    };
+    match effective_column_tags(properties, &schema, schema_tags) {
         Ok(map) => ScanTagState::Known(map),
         Err(e) => {
             debug!(
@@ -237,21 +272,28 @@ pub fn resolved_column_tags(
 }
 
 /// The tag keys tag policies match on `schema`'s columns: each column's own
-/// ([`resolved_column_tags`]) plus the table's `sqe.table-tags`, which every
-/// top-level column inherits; a column's own key wins (#924). Malformed table
-/// tags are `Err`, like malformed column tags: the caller fails closed.
+/// ([`resolved_column_tags`]), then the table's `sqe.table-tags`, then
+/// `schema_tags` (the schema's, empty unless `policy.inherit_schema_tags` is
+/// on), each inherited by every top-level column; the nearest key wins
+/// (#924). Malformed table tags are `Err`, like malformed column tags: the
+/// caller fails closed.
 ///
 /// This is the enforcement view. Tag writes and their authority compare a
 /// column's own tags ([`applied_column_tag_entries`]), never inherited ones.
 pub fn effective_column_tags(
     props: &HashMap<String, String>,
     schema: &iceberg::spec::Schema,
+    schema_tags: &[ColumnTag],
 ) -> Result<HashMap<String, Vec<String>>, serde_json::Error> {
     let own = applied_column_tag_entries(props, schema)?;
     let table = object_tags::parse(props.get(object_tags::TABLE_PROP_KEY).map(String::as_str))?;
-    let columns = schema.as_struct().fields().iter().map(|f| f.name.as_str());
+    let columns = || schema.as_struct().fields().iter().map(|f| f.name.as_str());
+    let with_table = object_tags::inherit_onto(&own, columns(), &table);
+    // TODO(#924): catalog tags join the chain here, after the schema's.
     Ok(column_tags::keys(&object_tags::inherit_onto(
-        &own, columns, &table,
+        &with_table,
+        columns(),
+        schema_tags,
     )))
 }
 
@@ -1219,6 +1261,14 @@ mod scan_column_tags_tests {
 
     /// The provider planning builds for a table carrying `properties`.
     async fn provider_with(properties: &[(&str, &str)]) -> SqeTableProvider {
+        provider_with_schema_tags(properties, SchemaTagState::NotInherited).await
+    }
+
+    /// [`provider_with`] with the schema tag state planning read (#924).
+    async fn provider_with_schema_tags(
+        properties: &[(&str, &str)],
+        schema_tags: SchemaTagState,
+    ) -> SqeTableProvider {
         let catalog = iceberg::memory::MemoryCatalogBuilder::default()
             .load(
                 "memory",
@@ -1248,7 +1298,7 @@ mod scan_column_tags_tests {
             )
             .await
             .unwrap();
-        SqeTableProvider::try_new(table).await.unwrap()
+        SqeTableProvider::try_new(table, schema_tags).await.unwrap()
     }
 
     #[tokio::test]
@@ -1347,6 +1397,75 @@ mod scan_column_tags_tests {
         );
     }
 
+    fn names(tags: &[&str]) -> Vec<String> {
+        tags.iter().map(|t| t.to_string()).collect()
+    }
+
+    /// With schema tags inherited, a column holds its own, its table's and
+    /// its schema's tags; the nearest key wins (#924).
+    #[tokio::test]
+    async fn schema_tags_apply_to_every_column() {
+        let schema = SchemaTagState::Known(vec![ColumnTag::key("pii")]);
+        let provider = provider_with_schema_tags(&[], schema.clone()).await;
+        assert_eq!(
+            scan_column_tags(&provider),
+            ScanTagState::Known(HashMap::from([("ssn".to_string(), names(&["pii"]))]))
+        );
+        let off = provider_with_schema_tags(&[], SchemaTagState::NotInherited).await;
+        assert_eq!(scan_column_tags(&off), ScanTagState::Known(HashMap::new()));
+        let tagged = provider_with_schema_tags(
+            &[
+                (PROP_KEY, r#"{"ssn":["own"]}"#),
+                (object_tags::TABLE_PROP_KEY, r#"["tbl"]"#),
+            ],
+            schema,
+        )
+        .await;
+        assert_eq!(
+            scan_column_tags(&tagged),
+            ScanTagState::Known(HashMap::from([(
+                "ssn".to_string(),
+                names(&["own", "tbl", "pii"])
+            )]))
+        );
+    }
+
+    /// Schema tags that could not be read leave the tag state unknown, for
+    /// both provider kinds (#924, D3).
+    #[tokio::test]
+    async fn unknown_schema_tags_make_the_scan_unknown() {
+        let provider = provider_with_schema_tags(&[], SchemaTagState::Unknown).await;
+        assert_eq!(scan_column_tags(&provider), ScanTagState::Unknown);
+    }
+
+    /// The nearest key wins: a table's `owner` beats the schema's, and the
+    /// key appears once (#924, spec scenario).
+    #[test]
+    fn effective_tags_prefer_the_nearer_value() {
+        let props: HashMap<String, String> = [(
+            object_tags::TABLE_PROP_KEY.to_string(),
+            r#"[{"owner":"risk"}]"#.to_string(),
+        )]
+        .into();
+        let schema_tags = [ColumnTag::with_value("owner", "finance")];
+        let keys = effective_column_tags(&props, &ssn_schema(), &schema_tags).unwrap();
+        assert_eq!(keys["ssn"], names(&["owner"]));
+    }
+
+    /// The fallback cannot see schema tags, so with the flag on it reports
+    /// every table unknown even when the cache holds it (#924, D8).
+    #[tokio::test]
+    async fn cache_tag_source_is_unknown_with_schema_inheritance() {
+        let cache = Arc::new(TableMetadataCache::new(60));
+        let table = provider_with(&[]).await.table().clone();
+        cache.insert("tok|wh|ns.t".to_string(), table).await;
+        let ns = ["ns".to_string()];
+        let off = CacheTagSource::new(cache.clone());
+        assert_eq!(off.column_tags(Some("wh"), &ns, "t"), Some(HashMap::new()));
+        let on = CacheTagSource::new(cache).with_inherit_schema_tags(true);
+        assert_eq!(on.column_tags(Some("wh"), &ns, "t"), None);
+    }
+
     /// An incremental read of a table carrying `properties` (#844).
     fn incremental_with(
         properties: Option<&[(&str, &str)]>,
@@ -1364,6 +1483,7 @@ mod scan_column_tags_tests {
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
                 Arc::new(ssn_schema()),
+                SchemaTagState::NotInherited,
             ),
             None => provider,
         }

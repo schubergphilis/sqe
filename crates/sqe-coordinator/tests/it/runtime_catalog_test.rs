@@ -41,7 +41,7 @@ async fn attach_then_list_returns_name() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     registry
-        .attach(&sqlite_attach("foo", &dir), &secrets)
+        .attach(&sqlite_attach("foo", &dir), &secrets, false)
         .await
         .expect("first attach succeeds");
 
@@ -55,12 +55,12 @@ async fn attach_duplicate_name_errors() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     registry
-        .attach(&sqlite_attach("foo", &dir), &secrets)
+        .attach(&sqlite_attach("foo", &dir), &secrets, false)
         .await
         .expect("first attach succeeds");
 
     let err = registry
-        .attach(&sqlite_attach("foo", &dir), &secrets)
+        .attach(&sqlite_attach("foo", &dir), &secrets, false)
         .await
         .expect_err("duplicate attach should error");
     assert!(
@@ -91,7 +91,7 @@ async fn detach_then_attach_again_works() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     registry
-        .attach(&sqlite_attach("foo", &dir), &secrets)
+        .attach(&sqlite_attach("foo", &dir), &secrets, false)
         .await
         .expect("first attach succeeds");
 
@@ -99,7 +99,7 @@ async fn detach_then_attach_again_works() {
     assert!(registry.list().unwrap().is_empty());
 
     registry
-        .attach(&sqlite_attach("foo", &dir), &secrets)
+        .attach(&sqlite_attach("foo", &dir), &secrets, false)
         .await
         .expect("re-attach after detach should succeed");
 
@@ -129,11 +129,11 @@ async fn referenced_secrets_lists_consumers() {
     );
 
     registry
-        .attach(&stmt_a, &secrets)
+        .attach(&stmt_a, &secrets, false)
         .await
         .expect("attach cat_a");
     registry
-        .attach(&stmt_b, &secrets)
+        .attach(&stmt_b, &secrets, false)
         .await
         .expect("attach cat_b");
 
@@ -154,7 +154,7 @@ async fn referenced_secrets_empty_when_no_consumers() {
 
     // Attach without any SECRET option.
     registry
-        .attach(&sqlite_attach("plain", &dir), &secrets)
+        .attach(&sqlite_attach("plain", &dir), &secrets, false)
         .await
         .expect("attach without secret");
 
@@ -174,7 +174,7 @@ async fn providers_returns_attached_catalogs() {
     );
 
     registry
-        .attach(&sqlite_attach("foo", &dir), &secrets)
+        .attach(&sqlite_attach("foo", &dir), &secrets, false)
         .await
         .expect("attach succeeds");
 

@@ -83,33 +83,67 @@ pub async fn setup_handler_with_store(
     store: Arc<dyn sqe_policy::PolicyStore>,
 ) -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
     let rewriter = sqe_policy::plan_rewriter::PolicyPlanRewriter::new(Arc::clone(&store));
-    setup_handler_with_rewriter(store, rewriter, None).await
+    setup_handler_with_rewriter(store, rewriter, None, None).await
 }
 
 /// [`setup_handler_with_store`] with tags wired as production does: each
 /// Iceberg scan's tags come off its provider, and the DML policy probe
 /// (which has no provider) reads them from the shared metadata cache.
+///
+/// Follows the loaded config's `policy.inherit_schema_tags`, so a run with
+/// `SQE_POLICY__INHERIT_SCHEMA_TAGS=true` exercises every tag test with
+/// schema tags inherited (#924).
 pub async fn setup_handler_with_tag_store(
     store: Arc<dyn sqe_policy::PolicyStore>,
     precedence: sqe_core::config::MaskPrecedence,
 ) -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
+    setup_tag_handler(store, precedence, None).await
+}
+
+/// [`setup_handler_with_tag_store`] with `policy.inherit_schema_tags` set
+/// to `inherit`, whatever the config says. On, the namespace's
+/// `sqe.schema-tags` join the columns' effective tags (#924).
+pub async fn setup_handler_with_schema_tag_inheritance(
+    store: Arc<dyn sqe_policy::PolicyStore>,
+    precedence: sqe_core::config::MaskPrecedence,
+    inherit: bool,
+) -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
+    setup_tag_handler(store, precedence, Some(inherit)).await
+}
+
+async fn setup_tag_handler(
+    store: Arc<dyn sqe_policy::PolicyStore>,
+    precedence: sqe_core::config::MaskPrecedence,
+    inherit_override: Option<bool>,
+) -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
+    let inherit = inherit_override.unwrap_or_else(|| {
+        sqe_core::SqeConfig::load(&test_config_path())
+            .expect("Failed to load test config")
+            .policy
+            .inherit_schema_tags
+    });
     let cache = sqe_catalog::TableMetadataCache::new(30);
-    let tags = sqe_coordinator::tag_source_impl::CacheTagSource::new(Arc::new(cache.clone()));
+    let tags = sqe_coordinator::tag_source_impl::CacheTagSource::new(Arc::new(cache.clone()))
+        .with_inherit_schema_tags(inherit);
     let rewriter = sqe_policy::plan_rewriter::PolicyPlanRewriter::new(Arc::clone(&store))
         .with_mask_precedence(precedence)
         .with_scan_tags(sqe_coordinator::tag_source_impl::scan_column_tags)
         .with_tag_source(Arc::new(tags));
-    setup_handler_with_rewriter(store, rewriter, Some(cache)).await
+    setup_handler_with_rewriter(store, rewriter, Some(cache), inherit_override).await
 }
 
 async fn setup_handler_with_rewriter(
     store: Arc<dyn sqe_policy::PolicyStore>,
     rewriter: sqe_policy::plan_rewriter::PolicyPlanRewriter,
     table_cache: Option<sqe_catalog::TableMetadataCache>,
+    inherit_override: Option<bool>,
 ) -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
     init_tracing();
-    let config =
+    let mut config =
         sqe_core::SqeConfig::load(&test_config_path()).expect("Failed to load test config");
+    if let Some(inherit) = inherit_override {
+        config.policy.inherit_schema_tags = inherit;
+    }
     let authenticator = sqe_auth::Authenticator::new(&config.auth)
         .await
         .expect("Failed to create authenticator");
