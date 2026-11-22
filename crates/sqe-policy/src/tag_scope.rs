@@ -29,6 +29,30 @@ pub fn qualify_tag(catalog: &str, tag: &str) -> String {
     format!("{catalog}.{tag}")
 }
 
+/// The tag a `CREATE POLICY ... ON TAG <tag>` written in `catalog` keys on
+/// under `catalog_scoped`: a bare name is attached to that catalog
+/// (`pii` -> `<catalog>.pii`), so SQL never writes a policy that governs every
+/// catalog. A dotted name already names its catalog and is kept as written.
+pub fn policy_tag_in_catalog(tag: &str, catalog: &str) -> String {
+    if tag.contains('.') || catalog.is_empty() {
+        tag.to_string()
+    } else {
+        qualify_tag(catalog, tag)
+    }
+}
+
+/// The column tag that attaches a policy keyed on `policy_tag` to a column of
+/// `catalog` under `catalog_scoped`: the catalog's own prefix is dropped
+/// (`<catalog>.pii` -> `pii`), so column tags stay bare and resolve through
+/// [`resolve_tags_in_catalog`]. Any other name is kept as written.
+pub fn column_tag_in_catalog<'a>(policy_tag: &'a str, catalog: &str) -> &'a str {
+    policy_tag
+        .strip_prefix(catalog)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .filter(|rest| !catalog.is_empty() && !rest.is_empty())
+        .unwrap_or(policy_tag)
+}
+
 /// [`PolicyStore::resolve_tags`] for the tags of a table in `catalog`, with the
 /// catalog-scoped rules in the module doc. The result is keyed by the bare tag
 /// names in `tags`, the names the table's columns carry, so callers merge it
@@ -220,6 +244,53 @@ mod tests {
         assert_eq!(filters.len(), 2, "both row filters apply: {filters:?}");
         assert_eq!(unmappable, tag_set(&["secret"]));
         assert!(masks.keys().all(|k| tags.contains(k)), "keys stay bare");
+    }
+
+    /// The invariant #919 promises: a policy on `c.pii` never reaches a
+    /// bare-tagged column of another catalog `d`, while the bare `pii` policy
+    /// (legacy, stricter) still does.
+    #[tokio::test]
+    async fn a_catalog_policy_never_reaches_another_catalog() {
+        let store = TagStore {
+            scoped: true,
+            masks: vec![("c.pii", MaskType::Redact("weak".into()))],
+            filters: vec![("c.pii", col("r").eq(lit("c")))],
+            unmappable: vec!["c.secret"],
+        };
+        let tags = tag_set(&["pii", "secret"]);
+        let (m, f, u) = resolve_tags_in_catalog(&store, &user(), &tags, Some("d")).await;
+        assert!(m.is_empty(), "c.pii mask reached catalog d: {m:?}");
+        assert!(f.is_empty(), "c.pii filter reached catalog d: {f:?}");
+        assert!(u.is_empty(), "c.secret restricted catalog d: {u:?}");
+
+        let with_bare = TagStore {
+            masks: vec![
+                ("c.pii", MaskType::Redact("weak".into())),
+                ("pii", MaskType::Nullify),
+            ],
+            ..store
+        };
+        let (m, _, _) = resolve_tags_in_catalog(&with_bare, &user(), &tags, Some("d")).await;
+        assert!(matches!(ready(m.get("pii")), Some(MaskType::Nullify)));
+    }
+
+    #[test]
+    fn sql_policy_tags_are_keyed_to_their_catalog() {
+        assert_eq!(policy_tag_in_catalog("pii", "sales"), "sales.pii");
+        assert_eq!(policy_tag_in_catalog("PII", "sales"), "sales.PII");
+        assert_eq!(policy_tag_in_catalog("ops.pii", "sales"), "ops.pii");
+        assert_eq!(policy_tag_in_catalog("pii", ""), "pii");
+    }
+
+    #[test]
+    fn a_catalog_policy_attaches_as_a_bare_column_tag() {
+        assert_eq!(column_tag_in_catalog("sales.pii", "sales"), "pii");
+        assert_eq!(column_tag_in_catalog("sales.PII", "sales"), "PII");
+        assert_eq!(column_tag_in_catalog("pii", "sales"), "pii");
+        assert_eq!(column_tag_in_catalog("ops.pii", "sales"), "ops.pii");
+        assert_eq!(column_tag_in_catalog("salesx.pii", "sales"), "salesx.pii");
+        assert_eq!(column_tag_in_catalog("sales.", "sales"), "sales.");
+        assert_eq!(column_tag_in_catalog(".pii", ""), ".pii");
     }
 
     /// Without `catalog_scoped`, or without a catalog, a qualified policy is

@@ -17,3 +17,13 @@
 ## 4. Docs
 
 - [x] 4.1 Book: fine-grained access control, tag policies under `catalog-scoped`
+
+## 5. Policies written in SQL (#919 follow-through)
+
+- [x] 5.1 `CREATE POLICY ... ON TAG <bare>` keyed to the session catalog under `catalog_scoped` (`tag_scope::policy_tag_in_catalog`); coordinator test `catalog_scoped_policy_ddl_test`
+- [x] 5.2 `SET MASKING POLICY` strips the table catalog's own prefix (`tag_scope::column_tag_in_catalog`)
+- [x] 5.3 `CREATE OR REPLACE POLICY` refuses to move a policy to another tag (`ranger_store::tag_policy_move`); unit test
+- [x] 5.4 Unit test: a `c.pii` policy never applies in catalog `d` (`a_catalog_policy_never_reaches_another_catalog`)
+- [x] 5.5 Live Ranger: `access_control_e2e::catalog_scoped_sql_tag_policy_is_keyed_to_the_session_catalog`
+- [x] 5.6 Book: policies written in SQL, the legacy bare policy, the literal dotted-tag exception
+- [ ] 5.7 #942 (mask precedence) and #943 (literal dotted column tags): owner decision first

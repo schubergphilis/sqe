@@ -1546,6 +1546,109 @@ async fn catalog_scoped_tag_policy_masks_its_catalog_only() {
     ranger_column_tagged_in(&ctx, None, "ssn", false).await;
 }
 
+/// #919 live, SQL side: under `catalog_scoped`, `CREATE POLICY ... ON TAG PII`
+/// run with `sales_wh` as the session catalog stores the key `sales_wh.PII`,
+/// never a bare `PII` that would apply in every catalog. `SET MASKING POLICY`
+/// attaches it as the bare column tag `PII`, which masks sales_wh. A
+/// `CREATE OR REPLACE` that would move a legacy bare `PII` policy onto
+/// `sales_wh.PII` is refused.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn catalog_scoped_sql_tag_policy_is_keyed_to_the_session_catalog() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    let (scoped, _) = crate::common::setup_ranger_handler_sharing(Some(ctx.cache.clone()), |cfg| {
+        cfg.policy.ranger.catalog_scoped = true;
+    })
+    .await;
+    let mut admin = ctx.carol.clone();
+    admin.default_catalog = Some("sales_wh".to_string());
+
+    // A bare ON TAG is keyed to the session catalog.
+    let policy = format!("{PREFIX}sql-tag-sales");
+    let _ = ctx.ranger.delete_policy(TAG_SERVICE, &policy).await;
+    let create = format!(
+        "CREATE POLICY \"{policy}\" ON TAG PII COLUMN MASK MASK_SHOW_LAST_4 TO ROLE engineer"
+    );
+    exec_ok_on(&scoped, &admin, &create).await;
+    let stored = ctx
+        .ranger
+        .get_policies(TAG_SERVICE)
+        .await
+        .expect("tag policies");
+    let tags: Vec<&serde_json::Value> = stored
+        .iter()
+        .filter(|p| p["name"] == policy.as_str())
+        .map(|p| &p["resources"]["tag"]["values"])
+        .collect();
+    assert_eq!(
+        tags,
+        vec![&serde_json::json!(["sales_wh.PII"])],
+        "a bare SQL tag must be stored with its catalog"
+    );
+
+    // SET MASKING POLICY attaches it as the bare column tag; it masks sales_wh.
+    let attach = format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn SET MASKING POLICY \"{policy}\"");
+    crate::common::eventually("scoped handler to attach the policy", || async {
+        let done = scoped.execute(&admin, &attach, None).await;
+        done.map(|_| ()).map_err(|e| e.to_string())
+    })
+    .await;
+    // Both names land on the scoped `sales_wh.ac` resource. A bare `PII` there
+    // shows the column tag was stripped: an unstripped `sales_wh.PII` column
+    // tag would project `sales_wh.PII` and `sales_wh.sales_wh.PII` only.
+    ranger_column_tag_named(&ctx, "sales_wh.ac", "ssn", "PII").await;
+    ranger_column_tag_named(&ctx, "sales_wh.ac", "ssn", "sales_wh.PII").await;
+    let sql = format!("SELECT ssn FROM {ORDERS} ORDER BY id");
+    let masked = vec!["xxx-xx-1111", "xxx-xx-2222", "xxx-xx-3333"];
+    crate::common::eventually("sales_wh.PII to mask bob", || async {
+        match scoped.execute(&ctx.bob, &sql, None).await {
+            Ok(b) if col_strings(&b, "ssn") == masked => Ok(()),
+            Ok(b) => Err(format!("got {:?}", col_strings(&b, "ssn"))),
+            Err(e) => Err(format!("query failed: {e}")),
+        }
+    })
+    .await;
+
+    // OR REPLACE never moves a policy to another tag key.
+    let legacy = format!("{PREFIX}sql-tag-legacy");
+    let _ = ctx.ranger.delete_policy(TAG_SERVICE, &legacy).await;
+    let mask = serde_json::json!({"dataMaskType": "hive:MASK_NULL"});
+    let body = tag_mask_policy(&legacy, "PII", mask);
+    ctx.ranger
+        .create_policy(body)
+        .await
+        .expect("create legacy PII mask");
+    let replace = format!(
+        "CREATE OR REPLACE POLICY \"{legacy}\" ON TAG PII COLUMN MASK MASK_NULL TO ROLE engineer"
+    );
+    let err = scoped
+        .execute(&admin, &replace, None)
+        .await
+        .expect_err("moving a bare policy onto sales_wh.PII must be refused");
+    assert!(err.to_string().contains("would move it"), "{err}");
+    let stored = ctx
+        .ranger
+        .get_policies(TAG_SERVICE)
+        .await
+        .expect("tag policies");
+    let kept = stored.iter().find(|p| p["name"] == legacy.as_str());
+    let kept = kept.expect("the legacy policy is still there");
+    assert_eq!(
+        kept["resources"]["tag"]["values"],
+        serde_json::json!(["PII"])
+    );
+
+    let _ = ctx.ranger.delete_policy(TAG_SERVICE, &legacy).await;
+    let unset = format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn UNSET MASKING POLICY");
+    exec_ok_on(&scoped, &admin, &unset).await;
+    ranger_column_tagged_in(&ctx, None, "ssn", false).await;
+    let _ = ctx.ranger.delete_policy(TAG_SERVICE, &policy).await;
+}
+
 /// Run `sql` as `user` on `handler`; panic on error.
 async fn exec_ok_on(handler: &QueryHandler, user: &Session, sql: &str) -> Vec<RecordBatch> {
     match handler.execute(user, sql, None).await {

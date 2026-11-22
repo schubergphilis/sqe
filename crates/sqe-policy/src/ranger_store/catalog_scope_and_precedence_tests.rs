@@ -423,3 +423,35 @@ fn tag_policies_take_the_first_item_and_the_first_deciding_policy() {
         Some(TagMaskSpec::Ready(MaskType::Hash))
     ));
 }
+
+// ── #919: OR REPLACE never moves a tag policy ──────────────────────
+
+#[test]
+fn or_replace_refuses_to_move_a_tag_policy_to_another_tag() {
+    let body = |sql: &str| {
+        let Some(sqe_sql::policy_ddl::PolicyDdlStatement::Create(stmt)) =
+            sqe_sql::policy_ddl::try_parse_policy_ddl(sql).unwrap()
+        else {
+            panic!("expected create")
+        };
+        ranger_policy_body(&stmt, "query_tag", "hive", true).unwrap()
+    };
+    let legacy = body("CREATE POLICY p ON TAG pii COLUMN MASK MASK_NULL TO GROUP analysts");
+    let scoped =
+        body("CREATE POLICY p ON TAG sales_wh.pii COLUMN MASK MASK_NULL TO GROUP analysts");
+    let other = body("CREATE POLICY p ON TAG ops_wh.pii COLUMN MASK MASK_NULL TO GROUP analysts");
+    let same = body("CREATE POLICY p ON TAG sales_wh.pii COLUMN MASK MASK_HASH TO GROUP analysts");
+
+    // A legacy bare policy replaced by a catalog key: refused, not narrowed silently.
+    assert_eq!(
+        tag_policy_move(&legacy, &scoped),
+        Some(("pii".into(), "sales_wh.pii".into()))
+    );
+    // One catalog to another: refused.
+    assert!(tag_policy_move(&scoped, &other).is_some());
+    // Same tag, new mask: an ordinary replace.
+    assert_eq!(tag_policy_move(&scoped, &same), None);
+    // Resource policies carry no tag resource and are never refused here.
+    let table = json!({"resources": {"database": {"values": ["ws_a.finance"]}}});
+    assert_eq!(tag_policy_move(&table, &table), None);
+}

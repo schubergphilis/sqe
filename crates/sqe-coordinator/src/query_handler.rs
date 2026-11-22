@@ -2417,7 +2417,7 @@ impl QueryHandler {
                         "ALTER TABLE ... SET/UNSET MASKING POLICY",
                     )
                     .await?;
-                    let stmt = self.masking_policy_to_tag_op(op).await?;
+                    let stmt = self.masking_policy_to_tag_op(session, op).await?;
                     let conflicts = self.tag_statement_conflict_guard(session, &stmt)?;
                     self.catalog_ops
                         .set_column_tags(session, &stmt, conflicts.as_ref())
