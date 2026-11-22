@@ -297,6 +297,329 @@ pub fn pinned_table_schema_from_sql(sql: &str) -> Option<String> {
     })
 }
 
+/// The namespaces an `information_schema` read pins: the intersection of
+/// every top-level WHERE conjunct that admits only literal `table_schema`
+/// values, `table_schema = 'a'` (either operand order),
+/// `table_schema IN ('a', 'b')` or an OR of those (dbt's `get_catalog` sends
+/// the IN list). `None` when no conjunct pins it, in which case the caller
+/// refreshes every namespace.
+///
+/// Only the pre-plan snapshot refresh reads this. The walk itself narrows
+/// from the filters DataFusion pushes into the scan, so a wider answer here
+/// is only slower, never wrong.
+pub fn pinned_table_schemas_from_sql(sql: &str) -> Option<Vec<String>> {
+    let select = single_select(sql)?;
+    let values = pinned_conjunct_values(select.selection.as_ref()?, &["table_schema"])?;
+    Some(values.into_iter().collect())
+}
+
+/// The one catalog an `information_schema` read is limited to (OpenSpec
+/// `information-schema-visible-catalogs`, D4), taking the first match:
+///
+/// 1. the `information_schema` qualifier, `cat.information_schema.<view>`,
+///    when every `information_schema` relation of the statement names the
+///    same catalog. A two-part `information_schema.<view>` counts as
+///    qualified with `session_catalog` when one is set, because the front
+///    door qualifies it with that catalog before planning (#2);
+/// 2. for a statement whose `information_schema` relations are all
+///    unqualified (and no session catalog is set), a top-level conjunct
+///    `table_catalog = '<lit>'` or `catalog_name = '<lit>'` (dbt-sqe's
+///    `get_catalog`, `list_schemas` and `check_schema_exists`);
+/// 3. `None`: the read walks every registered catalog.
+///
+/// An unquoted qualifier folds to lowercase as DataFusion folds it (#337).
+/// The coordinator refreshes only the pinned catalog's snapshots before
+/// planning; the walk narrows to the same catalog from the plan's own
+/// table reference and filters.
+pub fn pinned_catalog(sql: &str, session_catalog: Option<&str>) -> Option<String> {
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    struct Qualifiers {
+        catalogs: BTreeSet<String>,
+        bare: bool,
+        session_catalog: Option<String>,
+    }
+    impl Visitor for Qualifiers {
+        type Break = ();
+        fn pre_visit_relation(&mut self, name: &ObjectName) -> ControlFlow<Self::Break> {
+            let idents: Vec<_> = name.0.iter().filter_map(|p| p.as_ident()).collect();
+            match idents.as_slice() {
+                [schema, _] if is_information_schema(schema) => match &self.session_catalog {
+                    Some(catalog) => {
+                        self.catalogs.insert(catalog.clone());
+                    }
+                    None => self.bare = true,
+                },
+                [catalog, schema, _] if is_information_schema(schema) => {
+                    let name = match catalog.quote_style {
+                        None => catalog.value.to_ascii_lowercase(),
+                        Some(_) => catalog.value.clone(),
+                    };
+                    self.catalogs.insert(name);
+                }
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    fn is_information_schema(ident: &sqlparser::ast::Ident) -> bool {
+        ident.value.eq_ignore_ascii_case("information_schema")
+    }
+
+    let statements = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
+    let [stmt] = statements.as_slice() else {
+        return None;
+    };
+    let mut found = Qualifiers {
+        catalogs: BTreeSet::new(),
+        bare: false,
+        session_catalog: session_catalog.map(str::to_string),
+    };
+    let _ = visit_named_relations(stmt, &mut found);
+    match (found.bare, found.catalogs.len()) {
+        (false, 1) => found.catalogs.into_iter().next(),
+        (true, 0) => {
+            let select = single_select(sql)?;
+            let values = pinned_conjunct_values(
+                select.selection.as_ref()?,
+                &["table_catalog", "catalog_name"],
+            )?;
+            match values.len() {
+                1 => values.into_iter().next(),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The body of `sql` when it is exactly one plain `SELECT`.
+fn single_select(sql: &str) -> Option<Box<sqlparser::ast::Select>> {
+    use sqlparser::ast::SetExpr;
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    let statements = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return None;
+    };
+    match query.body.as_ref() {
+        SetExpr::Select(select) => Some(select.clone()),
+        _ => None,
+    }
+}
+
+/// The literals the top-level conjuncts of `selection` allow for a column
+/// named one of `columns` (optionally qualified, `c.table_schema`): the
+/// intersection over every conjunct that pins one. `None` when no conjunct
+/// does.
+fn pinned_conjunct_values(
+    selection: &sqlparser::ast::Expr,
+    columns: &[&str],
+) -> Option<BTreeSet<String>> {
+    use sqlparser::ast::{BinaryOperator, Expr};
+
+    fn conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+        match expr {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
+                conjuncts(left, out);
+                conjuncts(right, out);
+            }
+            Expr::Nested(inner) => conjuncts(inner, out),
+            other => out.push(other),
+        }
+    }
+
+    let mut parts = Vec::new();
+    conjuncts(selection, &mut parts);
+    parts
+        .into_iter()
+        .filter_map(|c| literal_values(c, columns))
+        .reduce(|a, b| a.intersection(&b).cloned().collect())
+}
+
+/// The string literals `expr` admits for one of `columns`, or `None` when
+/// it admits anything else: `col = 'v'`, `col IN ('a', 'b')` (not negated,
+/// literals only), or an OR of those on the same column.
+fn literal_values(expr: &sqlparser::ast::Expr, columns: &[&str]) -> Option<BTreeSet<String>> {
+    use sqlparser::ast::{BinaryOperator, Expr, Value};
+
+    fn column(expr: &Expr) -> Option<String> {
+        let ident = match expr {
+            Expr::Identifier(id) => id,
+            Expr::CompoundIdentifier(parts) => parts.last()?,
+            _ => return None,
+        };
+        Some(ident.value.to_ascii_lowercase())
+    }
+    fn literal(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Value(v) => match &v.value {
+                Value::SingleQuotedString(s) => Some(s.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    fn pinned(expr: &Expr) -> Option<(String, BTreeSet<String>)> {
+        match expr {
+            Expr::Nested(inner) => pinned(inner),
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } => match (column(left), column(right)) {
+                (Some(c), None) => Some((c, BTreeSet::from([literal(right)?]))),
+                (None, Some(c)) => Some((c, BTreeSet::from([literal(left)?]))),
+                _ => None,
+            },
+            Expr::InList {
+                expr,
+                list,
+                negated: false,
+            } => {
+                let values = list.iter().map(literal).collect::<Option<BTreeSet<_>>>()?;
+                Some((column(expr)?, values))
+            }
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Or,
+                right,
+            } => {
+                let (lc, mut lv) = pinned(left)?;
+                let (rc, rv) = pinned(right)?;
+                if lc != rc {
+                    return None;
+                }
+                lv.extend(rv);
+                Some((lc, lv))
+            }
+            _ => None,
+        }
+    }
+
+    let (column, values) = pinned(expr)?;
+    columns.contains(&column.as_str()).then_some(values)
+}
+
+#[cfg(test)]
+mod pinned_catalog_tests {
+    use super::{pinned_catalog, pinned_table_schemas_from_sql};
+
+    #[test]
+    fn the_information_schema_qualifier_pins_the_catalog() {
+        let pin = |sql| pinned_catalog(sql, None);
+        assert_eq!(
+            pin("SELECT * FROM \"Lake\".information_schema.tables"),
+            Some("Lake".into())
+        );
+        assert_eq!(
+            pin("SELECT * FROM Lake.information_schema.tables"),
+            Some("lake".into())
+        );
+        // dbt-sqe's get_catalog: two relations, one catalog.
+        assert_eq!(
+            pin(
+                "SELECT c.table_name FROM \"dw\".information_schema.columns c \
+                 JOIN \"dw\".information_schema.tables t ON t.table_name = c.table_name \
+                 WHERE c.table_catalog = 'dw' AND c.table_schema IN ('a', 'b')"
+            ),
+            Some("dw".into())
+        );
+        // The qualifier wins over a conflicting conjunct, as in Trino: the
+        // read is answered by `a` and its filter keeps no row.
+        assert_eq!(
+            pin("SELECT * FROM a.information_schema.tables WHERE table_catalog = 'b'"),
+            Some("a".into())
+        );
+    }
+
+    #[test]
+    fn a_bare_read_takes_the_session_catalog_or_the_catalog_conjunct() {
+        let sql = "SELECT * FROM information_schema.schemata WHERE catalog_name = 'dw'";
+        assert_eq!(pinned_catalog(sql, Some("sess")), Some("sess".into()));
+        assert_eq!(pinned_catalog(sql, None), Some("dw".into()));
+        assert_eq!(
+            pinned_catalog(
+                "SELECT * FROM information_schema.tables \
+                 WHERE (table_catalog = 'dw' AND table_schema = 'x')",
+                None
+            ),
+            Some("dw".into())
+        );
+        assert_eq!(
+            pinned_catalog(
+                "SELECT * FROM information_schema.tables WHERE table_catalog IN ('dw')",
+                None
+            ),
+            Some("dw".into())
+        );
+    }
+
+    #[test]
+    fn anything_wider_than_one_catalog_does_not_pin() {
+        for sql in [
+            "SELECT * FROM information_schema.tables",
+            "SELECT * FROM information_schema.tables WHERE table_catalog IN ('a', 'b')",
+            "SELECT * FROM information_schema.tables \
+             WHERE table_catalog = 'a' OR table_schema = 'b'",
+            "SELECT * FROM information_schema.tables WHERE table_catalog LIKE 'a%'",
+            "SELECT * FROM information_schema.tables WHERE table_catalog = 'a' AND table_catalog = 'b'",
+            "SELECT * FROM a.information_schema.tables JOIN b.information_schema.columns ON true",
+            "SELECT * FROM a.information_schema.tables JOIN information_schema.columns ON true",
+            "SELECT 1; SELECT * FROM a.information_schema.tables",
+            "SELECT * FROM lake.sales.orders",
+            "not sql at all",
+        ] {
+            assert_eq!(pinned_catalog(sql, None), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn schema_in_lists_and_equalities_pin_the_namespaces() {
+        let pins = |sql| pinned_table_schemas_from_sql(sql);
+        assert_eq!(
+            pins(
+                "SELECT * FROM information_schema.columns c \
+                  WHERE c.table_catalog = 'dw' AND c.table_schema IN ('b', 'a')"
+            ),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(
+            pins(
+                "SELECT * FROM information_schema.tables \
+                  WHERE table_schema = 'a' OR (table_schema = 'b')"
+            ),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(
+            pins(
+                "SELECT * FROM information_schema.tables \
+                  WHERE table_schema IN ('a', 'b') AND table_schema = 'b'"
+            ),
+            Some(vec!["b".to_string()])
+        );
+        assert_eq!(
+            pins("SELECT * FROM information_schema.tables WHERE 'a' = table_schema"),
+            Some(vec!["a".to_string()])
+        );
+        for sql in [
+            "SELECT * FROM information_schema.tables",
+            "SELECT * FROM information_schema.tables WHERE table_schema NOT IN ('a')",
+            "SELECT * FROM information_schema.tables WHERE table_schema IN ('a', table_name)",
+            "SELECT * FROM information_schema.tables \
+             WHERE table_schema = 'a' OR table_name = 'b'",
+        ] {
+            assert_eq!(pins(sql), None, "{sql}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod pinned_table_schema_tests {
     use super::pinned_table_schema_from_sql;

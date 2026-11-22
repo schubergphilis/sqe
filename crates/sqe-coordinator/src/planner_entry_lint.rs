@@ -6,6 +6,9 @@
 //! fails with "the table function was not prepared before planning", and it
 //! did, intermittently, for CTAS under parallel dbt threads. This scans the
 //! non-test source of every crate that plans SQL and fails on a direct call.
+//! Test modules kept in their own file (`*_test.rs`, `*_tests.rs`, `tests.rs`,
+//! a `tests/` directory) are skipped: they may plan directly on purpose, for
+//! example to compare against DataFusion's own answer.
 
 use std::path::{Path, PathBuf};
 
@@ -75,6 +78,7 @@ fn every_planner_entry_point_goes_through_plan_sql() {
             let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if ALLOWED.contains(&relative.as_str())
                 || name.ends_with("_test.rs")
+                || name.ends_with("_tests.rs")
                 || name == "tests.rs"
                 || relative.contains("/tests/")
             {

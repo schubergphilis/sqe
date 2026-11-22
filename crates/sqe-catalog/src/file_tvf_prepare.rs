@@ -307,9 +307,18 @@ pub async fn plan_sql(
         })
         .await
         .map_err(explain_not_iceberg)?;
-        name_unknown_types(bind_statement_params(df)?)
+        finish_plan(df)
     })
     .await
+}
+
+/// The steps every planner entry point runs on a plan just made from SQL
+/// text, before the policy enforcer sees it.
+fn finish_plan(df: DataFrame) -> DFResult<DataFrame> {
+    let (state, plan) = bind_statement_params(df)?.into_parts();
+    let enabled = state.config().information_schema();
+    let plan = crate::info_schema_scope::scope_information_schema(plan, enabled)?;
+    name_unknown_types(DataFrame::new(state, plan))
 }
 
 /// Bind the statement's parameter values ([`crate::txn::with_params`]) into
@@ -382,7 +391,7 @@ pub async fn plan_sql_without_policy(
         })
         .await
         .map_err(explain_not_iceberg)?;
-        name_unknown_types(bind_statement_params(df)?)
+        finish_plan(df)
     })
     .await
 }
@@ -401,7 +410,7 @@ pub async fn plan_parsed(
         })
         .await
         .map_err(explain_not_iceberg)?;
-        name_unknown_types(bind_statement_params(df)?)
+        finish_plan(df)
     })
     .await
 }

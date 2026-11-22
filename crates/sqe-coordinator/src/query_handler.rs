@@ -4576,19 +4576,23 @@ impl QueryHandler {
         // rows, all `information_schema` and `runtime`, and no `ac.orders`).
         // Hive already refreshes every database for such a statement
         // (`refresh_referenced` below); do the same for the Iceberg catalogs.
-        // A `WHERE table_schema = '<ns>'` conjunct (dbt's
-        // `get_columns_in_relation`, `SHOW COLUMNS`, `DESCRIBE`) pins the
-        // rows to one namespace, so only that one is refreshed, in the
-        // catalogs the statement qualifies; the rows of every other namespace
-        // would be filtered out anyway.
-        let info_schema_catalogs: Vec<&String> = referenced
+        // The walk itself is scoped (`info_schema_scope`): it lists only the
+        // catalog the reference names (a bare one takes the session catalog,
+        // as the front door qualifies it) or its `table_catalog` /
+        // `catalog_name` conjunct, and only the namespaces a `table_schema`
+        // equality or IN list admits (dbt's `get_columns_in_relation` and
+        // `get_catalog`, `SHOW COLUMNS`, `DESCRIBE`). Refresh the same scope,
+        // never less: a namespace the walk reads must have its listing.
+        let reads_information_schema = referenced
             .iter()
-            .filter(|(_, s)| s.eq_ignore_ascii_case("information_schema"))
-            .map(|(c, _)| c)
-            .collect();
-        if !info_schema_catalogs.is_empty() {
-            let pinned = sqe_sql::pinned_table_schema_from_sql(sql);
+            .any(|(_, s)| s.eq_ignore_ascii_case("information_schema"));
+        if reads_information_schema {
+            let walked = sqe_sql::pinned_catalog(sql, session.default_catalog.as_deref());
+            let pinned = sqe_sql::pinned_table_schemas_from_sql(sql);
             for name in ctx.catalog_names() {
+                if walked.as_ref().is_some_and(|c| *c != name) {
+                    continue;
+                }
                 let Some(provider) = ctx.catalog(&name) else {
                     continue;
                 };
@@ -4599,12 +4603,13 @@ impl QueryHandler {
                     continue;
                 };
                 match &pinned {
-                    Some(ns) if info_schema_catalogs.iter().any(|c| **c == name) => {
-                        if let Err(e) = sqe.refresh_namespace(ns).await {
-                            debug!(catalog = %name, schema = %ns, error = %e, "pinned namespace refresh failed before an information_schema read");
+                    Some(schemas) => {
+                        for ns in schemas {
+                            if let Err(e) = sqe.refresh_namespace(ns).await {
+                                debug!(catalog = %name, schema = %ns, error = %e, "pinned namespace refresh failed before an information_schema read");
+                            }
                         }
                     }
-                    Some(_) => {}
                     None => sqe.refresh_all_namespaces().await,
                 }
             }

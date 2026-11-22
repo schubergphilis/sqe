@@ -82,6 +82,17 @@ Either way, the view and column shapes stay DataFusion's, because dbt-sqe parses
 
 *Behaviour change:* a qualified `cat.information_schema` read returns only `cat`'s rows. This matches Trino and Unity Catalog. Before this change it returned the rows of every registered catalog.
 
+**Decision (task 2.1): option (a), applied to the plan rather than to the SQL text.** `sqe_catalog::info_schema_scope` runs inside every planner entry point (`plan_sql`, `plan_sql_without_policy`, `plan_parsed`), before the policy enforcer. It swaps the source of each `information_schema.{tables,columns,views,schemata}` scan for a scoped provider. `df_settings`, `routines` and `parameters` walk nothing and are left alone. At scan time, the scoped provider:
+- reads the catalog, schema and table filters the optimizer pushed into the scan (`MetaScope`, shared with `system.jdbc` / `system.metadata`). Equality, exact `LIKE`, a literal `IN` list, and an `OR` of these on one column all narrow. The pushdown is `Inexact`, so DataFusion still applies every filter;
+- adds the reference's catalog qualifier;
+- runs DataFusion's own `InformationSchemaProvider` over a `CatalogProviderList` that lists only the admitted catalogs, schemas and tables, with each schema wrapped for D6.
+
+The view and column shapes are DataFusion's, unchanged. Unit tests run dbt-sqe's `get_catalog`, `get_columns_in_relation`, `list_schemas` and `list_relations_without_caching` with and without the scoping. They assert identical rows, and assert that a second catalog is never listed or loaded.
+
+Option (b) was dropped. Mounting a provider per catalog means turning off DataFusion's built-in route (`with_information_schema`), which also serves `SHOW TABLES`, `SHOW COLUMNS` and `df_settings`. An unpinned read would still need (a). Rewriting at the plan instead of in the SQL text needs no parse round trip, and it also covers the Trino door, prepared statements and derived queries.
+
+*Qualifier rule.* The front door qualifies a bare `information_schema` with the session catalog. That inserted qualifier counts like a written one, so a bare read under a session catalog lists that catalog only. This is Trino's rule, and the Trino door already scoped its result to the session catalog. A bare read with no session catalog walks every catalog its `table_catalog` / `catalog_name` conjunct admits. A qualifier that contradicts that conjunct (`"a".information_schema.tables WHERE table_catalog = 'b'`) returns no rows. The coordinator's pre-plan refresh uses `sqe_sql::pinned_catalog` and `pinned_table_schemas_from_sql`, so it covers at least what the walk will read.
+
 ### D5. Cap
 
 `[query] catalog_enumeration_max` (default 32, 0 = unlimited) bounds how many candidates one unpinned enumeration probes, counted in D1 order. The candidates in the first two sources are configured or already registered, so they cost no probe and always count. Candidates past the cap are not probed and are left out. In that case SQE:

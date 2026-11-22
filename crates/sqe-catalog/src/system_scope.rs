@@ -12,6 +12,7 @@
 //! to the builder as a [`MetaScope`], so only the matching namespaces are
 //! listed and only the matching tables loaded.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -21,6 +22,7 @@ use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::datasource::{MemTable, TableType};
 use datafusion::error::Result as DFResult;
+use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::logical_expr::{BinaryExpr, Cast, Expr, Like, Operator};
 use datafusion::physical_plan::ExecutionPlan;
@@ -38,22 +40,28 @@ pub(crate) struct ScopeColumns {
     pub table: Option<&'static str>,
 }
 
-/// The exact catalog, schema and table a query restricts a metadata table
-/// to. `None` places no restriction. A value is only taken from a filter
-/// that admits that one string and nothing else, so a scan built for the
-/// scope holds every row the query can return; DataFusion still applies
+/// The exact catalogs, schemas and tables a query restricts a metadata
+/// table to. `None` places no restriction. Values are only taken from a
+/// filter that admits those strings and nothing else, so a scan built for
+/// the scope holds every row the query can return; DataFusion still applies
 /// the filters on top (they are pushed down as `Inexact`).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct MetaScope {
-    pub catalog: Option<String>,
-    pub schema: Option<String>,
-    pub table: Option<String>,
+    pub catalog: Option<BTreeSet<String>>,
+    pub schema: Option<BTreeSet<String>>,
+    pub table: Option<BTreeSet<String>>,
 }
 
 impl MetaScope {
-    /// The scope a set of conjunct filters puts on `columns`.
+    /// The scope a set of conjunct filters puts on `columns`: for each
+    /// column, the intersection of the values every filter on it admits.
     pub(crate) fn from_filters(filters: &[Expr], columns: ScopeColumns) -> Self {
-        let pick = |column: &str| filters.iter().find_map(|f| exact_value(f, column));
+        let pick = |column: &str| {
+            filters
+                .iter()
+                .filter_map(|f| exact_values(f, column))
+                .reduce(|a, b| a.intersection(&b).cloned().collect())
+        };
         Self {
             catalog: pick(columns.catalog),
             schema: pick(columns.schema),
@@ -62,46 +70,68 @@ impl MetaScope {
     }
 
     pub(crate) fn admits_catalog(&self, name: &str) -> bool {
-        self.catalog.as_deref().is_none_or(|c| c == name)
+        self.catalog.as_ref().is_none_or(|c| c.contains(name))
     }
 
     pub(crate) fn admits_schema(&self, name: &str) -> bool {
-        self.schema.as_deref().is_none_or(|s| s == name)
+        self.schema.as_ref().is_none_or(|s| s.contains(name))
     }
 
     pub(crate) fn admits_table(&self, name: &str) -> bool {
-        self.table.as_deref().is_none_or(|t| t == name)
+        self.table.as_ref().is_none_or(|t| t.contains(name))
     }
 }
 
-/// The one string `filter` admits for `column`: `column = 'v'` (either
-/// operand order) or a case-sensitive, non-negated `column LIKE 'v'` whose
-/// pattern holds no unescaped wildcard (the Trino JDBC driver sends schema
-/// and table patterns as `LIKE '<escaped>' ESCAPE '\'`).
-fn exact_value(filter: &Expr, column: &str) -> Option<String> {
+/// The strings `filter` admits for `column`, or `None` when it admits
+/// anything else:
+/// - `column = 'v'` (either operand order);
+/// - a case-sensitive, non-negated `column LIKE 'v'` whose pattern holds no
+///   unescaped wildcard (the Trino JDBC driver sends schema and table
+///   patterns as `LIKE '<escaped>' ESCAPE '\'`);
+/// - a non-negated `column IN ('a', 'b')` of literals only (dbt's
+///   `get_catalog` sends the schema list this way);
+/// - an OR of those on the same column (DataFusion's simplifier turns a
+///   short IN list into one).
+fn exact_values(filter: &Expr, column: &str) -> Option<BTreeSet<String>> {
     match filter {
         Expr::BinaryExpr(BinaryExpr {
             left,
             op: Operator::Eq,
             right,
         }) => {
-            if column_name(left) == Some(column) {
+            let value = if column_name(left) == Some(column) {
                 string_literal(right)
             } else if column_name(right) == Some(column) {
                 string_literal(left)
             } else {
                 None
-            }
+            };
+            Some(BTreeSet::from([value?]))
         }
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::Or,
+            right,
+        }) => {
+            let mut values = exact_values(left, column)?;
+            values.extend(exact_values(right, column)?);
+            Some(values)
+        }
+        Expr::InList(InList {
+            expr,
+            list,
+            negated: false,
+        }) if column_name(expr) == Some(column) => list.iter().map(string_literal).collect(),
         Expr::Like(Like {
             negated: false,
             expr,
             pattern,
             escape_char,
             case_insensitive: false,
-        }) if column_name(expr) == Some(column) => {
-            unescape_like(&string_literal(pattern)?, *escape_char)
-        }
+        }) if column_name(expr) == Some(column) => Some(BTreeSet::from([unescape_like(
+            &string_literal(pattern)?,
+            *escape_char,
+        )?])),
         _ => None,
     }
 }
@@ -260,6 +290,10 @@ mod tests {
         table: Some("table_name"),
     };
 
+    fn set(values: &[&str]) -> Option<BTreeSet<String>> {
+        Some(values.iter().map(|v| v.to_string()).collect())
+    }
+
     fn like(column: &str, pattern: &str, escape: Option<char>) -> Expr {
         Expr::Like(Like::new(
             false,
@@ -283,10 +317,42 @@ mod tests {
         assert_eq!(
             scope,
             MetaScope {
-                catalog: Some("lake".into()),
-                schema: Some("dbt897".into()),
-                table: Some("orders".into()),
+                catalog: set(&["lake"]),
+                schema: set(&["dbt897"]),
+                table: set(&["orders"]),
             }
+        );
+    }
+
+    #[test]
+    fn in_lists_and_same_column_ors_admit_each_value() {
+        let schema = |filters: &[Expr]| MetaScope::from_filters(filters, JDBC).schema;
+        let ab = set(&["a", "b"]);
+        assert_eq!(
+            schema(&[col("table_schem").in_list(vec![lit("a"), lit("b")], false)]),
+            ab
+        );
+        assert_eq!(
+            schema(&[col("table_schem")
+                .eq(lit("a"))
+                .or(lit("b").eq(col("table_schem")))]),
+            ab
+        );
+        // Conjuncts on one column intersect.
+        assert_eq!(
+            schema(&[
+                col("table_schem").in_list(vec![lit("a"), lit("b"), lit("c")], false),
+                col("table_schem").in_list(vec![lit("b"), lit("d")], false),
+            ]),
+            set(&["b"])
+        );
+        // Contradicting conjuncts admit nothing.
+        assert_eq!(
+            schema(&[
+                col("table_schem").eq(lit("a")),
+                col("table_schem").eq(lit("b")),
+            ]),
+            Some(BTreeSet::new())
         );
     }
 
@@ -296,12 +362,9 @@ mod tests {
         // The Trino JDBC driver escapes `_` in getTables / getColumns.
         assert_eq!(
             exact(like("table_schem", "dbt\\_897", Some('\\'))),
-            Some("dbt_897".into())
+            set(&["dbt_897"])
         );
-        assert_eq!(
-            exact(like("table_schem", "sales", None)),
-            Some("sales".into())
-        );
+        assert_eq!(exact(like("table_schem", "sales", None)), set(&["sales"]));
         assert_eq!(exact(like("table_schem", "dbt_897", Some('\\'))), None);
         assert_eq!(exact(like("table_schem", "dbt%", Some('\\'))), None);
         assert_eq!(exact(like("table_schem", "a\\_b", None)), None);
@@ -331,7 +394,9 @@ mod tests {
             col("table_schem").not_eq(lit("a")),
             col("table_schem")
                 .eq(lit("a"))
-                .or(col("table_schem").eq(lit("b"))),
+                .or(col("table_name").eq(lit("b"))),
+            col("table_schem").in_list(vec![lit("a"), lit("b")], true),
+            col("table_schem").in_list(vec![lit("a"), col("table_name")], false),
             col("remarks").eq(lit("a")),
             col("table_schem").eq(col("table_name")),
         ] {
