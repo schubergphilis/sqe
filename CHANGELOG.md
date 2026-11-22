@@ -4,6 +4,277 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+## [0.57.0] — 2026-11-22
+
+### Added
+
+- `ALTER CATALOG c SET|UNSET TAGS ('k' = 'v', ...)` tags a catalog (#922)
+
+    Catalog tags are stored in the Polaris catalog property
+    `sqe.catalog-tags`, in the column-tag JSON format, and written through the
+    Polaris management API with the caller's token. Polaris authorizes the
+    update (`UPDATE_CATALOG`), so only catalog admins can write, as Unity
+    Catalog asks for ownership or `MANAGE`. The write sends back every other
+    catalog property and the entity version it read, and retries when another
+    writer got there first. Under `tag_authority = "admin-role"` only SQE
+    admins pass; `tag_names` applies to the keys a `SET` adds. A catalog that
+    is not Polaris REST, and a Hive catalog, are refused. Like table and
+    schema tags, catalog tags are metadata only; tags inheriting into policy
+    is tracked in #930.
+
+- Column tags keep their value: `SET TAGS ('pii' = 'ssn')` (Databricks) and
+  `SET TAG PII = 'true'` (Snowflake) store the value next to the key
+
+    `sqe.column-tags` list entries are now either a key (`"gdpr"`) or a
+    one-entry object (`{"pii": "ssn"}`). A table without values is written
+    byte for byte as before. Policies, the Ranger tag projection and Spark
+    still see keys only. Setting a tag again replaces its value, setting it
+    without a value clears the value, and an empty value (`'k' = ''`) stores
+    the key alone. A rename carries the values. A change to a value alone
+    counts as a tag change for tag authority.
+
+- Databricks column tag syntax: `ALTER TABLE t ALTER COLUMN c SET TAGS ('k' = 'v')`,
+  the key-only `SET TAGS ('k')` and `UNSET TAGS ('k')`
+
+    These statements write the same `sqe.column-tags` property as the
+    Snowflake and native forms, under the same tag-authority check. Tag
+    keys keep their case, dots and quoted commas. The tag value is parsed
+    but not stored yet: tags stay key-only until values are kept. `UNSET
+    TAGS` with a value, an empty list or an `=` with no value are errors.
+    `SET TAGS ('k' = 'v')` on the table itself (no `ALTER COLUMN`) is
+    refused with a pointer to the column form, because table-level tags
+    have no storage yet.
+
+- Engine credential identity for catalogs (#934)
+
+    A catalog with `credentials` (client_credentials) reads storage with keys
+    the engine fetches from the catalog's `/credentials` endpoint after the
+    policy engine allowed `select` for the person. Denied tables scan as empty
+    with no keys fetched. Every fetch is audited with the person as actor.
+    Writes keep the person's delegated credentials. Under Ranger, a catalog
+    with the identity denies `select` by default until a policy grants it, so
+    add `select` policies before turning it on. Startup requires
+    `require_vended_credentials`, `policy.engine = "ranger"` and
+    `[policy.ranger] catalog_scoped = true`. Off by default.
+
+- Unity Catalog tag views: `cat.information_schema.column_tags` lists every
+  column tag with its value (`catalog_name, schema_name, table_name,
+  column_name, tag_name, tag_value`)
+
+    Rows come only from tables the caller can load, and a table the policy
+    denies entirely is left out. A key-only tag shows an empty `tag_value`.
+    `catalog_tags`, `schema_tags` and `table_tags` answer with their columns
+    and no rows until catalogs, schemas and tables can be tagged. Hive tables
+    and Iceberg views are not listed. Results are never served from the
+    result cache, and MCP tools can read the views.
+
+- `information_schema.table_tags`, `schema_tags` and `catalog_tags` list object tags (#922)
+
+    The three views used to return no rows. `table_tags` reads each table's
+    `sqe.table-tags` and shows the same tables as `column_tags`: a table the
+    caller cannot load, or that the policy denies entirely, is left out, and
+    the policy is asked even when the table has no column tags.
+    `schema_tags` reads the namespace property `sqe.schema-tags` of every
+    schema Polaris lets the caller load, as `SHOW SCHEMAS` does.
+    `catalog_tags` reads the Polaris catalog property `sqe.catalog-tags`
+    through the management API on the caller's token; a caller Polaris does
+    not let read the catalog entity, and a catalog that is not Polaris REST,
+    get no rows. An unreadable property leaves its object out with a
+    warning.
+
+- `ALTER TABLE t SET|UNSET TAGS ('k' = 'v', ...)` and
+  `ALTER SCHEMA s SET|UNSET TAGS (...)` tag a table or schema itself (#922)
+
+    The Databricks object form. Table tags are stored in the `sqe.table-tags`
+    table property, schema tags in the `sqe.schema-tags` namespace property,
+    both as a JSON list in the column-tag format. They are metadata only: no
+    policy matches them and nothing is projected into Ranger. The write takes
+    the `tag_authority` gate (under `ranger-delegate`, the privilege on the
+    table, or on the database with table `*` for a schema; a column grant does
+    not count) and the `tag_names` check on the keys a `SET` adds. Writing
+    `sqe.table-tags` through `SET TBLPROPERTIES` is admin-only in every mode.
+    `ALTER CATALOG ... SET TAGS` and tags on Hive tables or roots are refused.
+
+- `policy.mask-precedence = "refuse"`: conflicting masks or row filters fail the statement instead of one winning (#918)
+
+    Under `refuse`, when more than one distinct column mask resolves for a column and user (a resource mask and a tag mask, or two tag masks), the statement fails with `ACCESS_DENIED` "mask conflict on <catalog>.<schema>.<table>.<column>" before any row is read. When a tag row filter and a different row filter resolve for a table and user, it fails with "row filter conflict on <catalog>.<schema>.<table>". The same mask or filter from two sources counts once. This is Unity Catalog's ABAC rule. `tag` (the default) and `resource` are unchanged.
+
+- `policy.mask-precedence = "refuse"` also refuses the tag write that would create a mask or row filter conflict (#918)
+
+    Under `refuse`, `ALTER TABLE ... SET TAGS`, `MODIFY COLUMN ... SET TAG`, `SET MASKING POLICY` and a raw `sqe.column-tags` property write fail with `ACCESS_DENIED` "tag change refused: it would create a mask conflict on <table>.<column>" (or "a row filter conflict on <table>") when, for some user, role or group a matching Ranger mask or row-filter policy names, the new tags resolve a conflict the old tags did not. Nothing is committed. The message does not name the principal. With `[policy.ranger] catalog_scoped`, tags resolve for the table's catalog as reads resolve them (#919). A write that adds no tag (UNSET) is never refused, and an error reading Ranger refuses the write. Limits: a conflict that needs two roles of one user is not caught at write time (that user's read still fails), and CREATE TABLE / CTAS carrying tags are not checked. `tag` and `resource` modes are unchanged.
+
+- Columns can inherit their schema's tags (#924)
+
+    With `[policy] inherit_schema_tags = true` (env `SQE_POLICY__INHERIT_SCHEMA_TAGS`) a tag mask or tag row filter on a schema tag covers every column of every table in the schema, including tables created later. A column's own tag value wins over its table's, and its table's over its schema's. A schema whose tags cannot be read refuses reads of its tables. Off by default; catalog tags are still metadata only.
+
+- Columns inherit their table's tags, and tag policies match the inherited tags (#924)
+
+    A column's effective tags are its own tags plus every `sqe.table-tags` key it does not carry itself; the column's own value wins. Tag masks and tag row filters match effective tags, so tagging a table `pii` under a mask on `pii` masks every column, and an inherited row filter applies to SELECT, UPDATE, DELETE, MERGE and the `SHOW STATS` row count. A malformed `sqe.table-tags` refuses every read of the table. Under `mask_precedence = "refuse"` an inherited mask and a different mask on the column's own tag refuse the read. Tag write authority still reads the tags at each level. Schema and catalog tags stay metadata. Inherited tags are enforced by SQE only; the Ranger tag projection (and so Spark) still sees own tags, so a table tag masks in SQE and not in Spark (#935).
+
+- `[access_control] tag_names = "ranger-tagdefs"` refuses a tag name Ranger has
+  no tag definition for (#926)
+
+    A non-admin `SET TAGS` / `SET TAG`, and the tags a `CREATE TABLE` or a
+    `sqe.column-tags` property write adds, fail with `tag 'x' is not defined
+    in Ranger` when `GET /service/tags/tagdefs` does not list the name. The
+    list is cached for `[policy.ranger] cache_ttl_secs` and re-read once
+    before a name is refused. If it cannot be read the write is refused
+    (fail closed). Under `catalog_scoped`, a definition `<catalog>.<tag>` also
+    accepts `<tag>` on a table of that catalog. Admins are exempt, removing a
+    tag is never refused, and the default `any` keeps the old behaviour.
+
+### Changed
+
+- Tag policies can be scoped to one catalog under `[policy.ranger] catalog_scoped` (#919)
+
+    With the setting on, a column of catalog `c` tagged `pii` is governed by tag policies on `pii` and on `c.pii`. A policy on `c.pii` applies to catalog `c` only; a policy on bare `pii` keeps applying everywhere, and the catalog's mask wins when both mask a column. Column tags stay bare. The Ranger tag projector writes both names, so Spark applies the same policies. `table_files` and `table_partitions` now key their policy lookup on the catalog they read. Nothing changes with the setting off.
+
+- Upgrade note: an SQE older than this release refuses queries on a table
+  whose `sqe.column-tags` holds a tag value, because it reads the property
+  as unknown tag state and fails closed. Upgrade every coordinator before
+  writing a tag with a value, including Snowflake `SET TAG k = 'v'`, which
+  used to drop the value.
+
+- One row filter per table and user: a tag row filter that meets a different row filter is refused under every mask precedence (#931)
+
+    When a tag row filter and a resource row filter, or two different tag row filters, apply to the same table for the same user, the statement now fails with `row filter conflict on <catalog>.<schema>.<table>` instead of ANDing them. This matches Unity Catalog ABAC. It used to happen only under `mask-precedence = "refuse"`. Reads and DELETE / UPDATE / MERGE targets are refused alike, and `SHOW EFFECTIVE POLICY`, `SHOW STATS` and the metadata functions show a contested table as denied. The same filter from two sources counts once. Several resource row filters with no tag filter still AND. Upgrade note: a user covered by both kinds of filter now gets an error where they used to get the intersection. Write the intersection as one filter to keep the old answer.
+
+- A tag write that would create a row filter conflict is refused under every mask precedence (#931)
+
+    `SET TAGS`, `MODIFY COLUMN ... SET TAG` and a raw `sqe.column-tags` property write now fail with `tag change refused: it would create a row filter conflict on <table>` when the new tag gives some user a second row filter on the table. The write guard used to run only under `mask-precedence = "refuse"`, so in the default `tag` mode such a write was accepted and every later read of the table failed. Mask conflicts are still refused at write time only under `refuse`; the other modes resolve them by precedence when the table is read.
+
+- `SHOW TAGS ON <table>` lists each tag's value (#923)
+
+    The result has a third column, `value`, next to `column` and `tag`. A tag
+    without a value shows an empty `value`, as `information_schema.column_tags`
+    does. Clients that read the first two columns are unaffected.
+
+### Fixed
+
+- Column tags follow the column's field id, not its name (#920)
+
+    A column another engine renamed kept its name in `sqe.column-tags`, so it
+    lost its tags and its tag masks; a column dropped and added again under
+    the same name inherited the old column's tags. Every SQE tag write (SET /
+    UNSET TAGS, RENAME and DROP COLUMN) now also records the tagged columns'
+    field ids in `sqe.column-tag-ids`, bound to the exact tag map by a
+    SHA-256 digest, and every reader (scans, time travel, SHOW TAGS,
+    `information_schema.column_tags`, SHOW STATS, the Ranger tag projection)
+    resolves the map against the schema it reads. `SHOW TAGS ON` gains an
+    `applied` column: a tag whose column was dropped is listed with `applied`
+    false. A map changed without SQE no longer matches its digest and applies
+    by name, as a table written before this change does; raw tag writes are
+    checked on what applies after the write. Only an admin may write
+    `sqe.column-tag-ids` as a raw property. `CREATE OR REPLACE` removes it and
+    keeps the tags under the columns' current names.
+
+- Table functions plan on a sqlite (`jdbc:sqlite`) catalog
+
+    The pure-Rust sqlite catalog, used by `sqe-cli` and `jdbc:sqlite`
+    catalogs, reported a missing table as an unexpected error,
+    not as "table not found". DataFusion looks up a table function's name
+    as a table before calling the function, so every table function query
+    on that backend (`table_snapshots`, `information_schema.column_tags`)
+    failed to plan. Missing and duplicate tables and namespaces now carry
+    the same error kinds as the upstream sql catalog.
+
+- The configuration reference spelled `policy.mask_precedence` as `mask-precedence`, a key SQE ignores
+
+- `ALTER TABLE t SET TAGS (col = ('k' = 'v'))` is refused instead of storing
+  the tag name `k' = 'v`
+
+    The native list form takes tag names only. A value there was unquoted into
+    a junk key and stored without complaint. The error points to
+    `ALTER TABLE t ALTER COLUMN col SET TAGS ('k' = 'v')`, which stores the
+    value.
+
+- dbt-sqe 1.1.1: dbt finds its own relations when the profile's catalog is not the server's default, so a second `dbt seed` keeps the CSV's rows
+
+    The adapter's metadata reads (`list_relations`, `get_columns_in_relation`,
+    `list_schemas`, `check_schema_exists`, `get_catalog`) used a bare
+    `information_schema`. SQE qualifies that with the session catalog, which
+    dbt-sqe never sets, and loads a namespace's tables before an
+    information_schema read only in the catalogs the statement names. With the
+    profile on another catalog (a workspace catalog, for example) every lookup
+    came back empty: a second `dbt seed` created nothing and appended the rows
+    again (3 became 6), and incremental and table models ran as on a first run.
+    Every read now names the profile's catalog,
+    `"<catalog>".information_schema.<view>`. A seed whose table is not found
+    also drops it before creating it, instead of `CREATE TABLE IF NOT EXISTS`,
+    so a missed lookup can no longer append.
+
+- `FOR INCREMENTAL BETWEEN SNAPSHOT` no longer counts compacted rows twice
+
+    The incremental planner walked every snapshot in the range, including
+    `replace` snapshots from compaction (`rewrite_data_files`), and emitted
+    their rewritten files as new inserts. A range covering an append and its
+    compaction returned those rows twice. `replace` snapshots are now left
+    out of the change set: their added files are not emitted and their
+    removed files do not retract rows. The rows still come back once,
+    through the files of the snapshot that first added them when that
+    snapshot is in range. `snapshots_in_range` still lists the compaction.
+
+- MERGE into a table with a row filter no longer fails, and MERGE accepts an unaliased target or source table
+
+    The row filter was rendered with its table qualifier (`orders.id > 1`) and evaluated over MERGE's scratch relation, where that name does not resolve, so every MERGE into a row-filtered table failed to plan its cardinality check. The filter is now rendered with bare column names, as masks already were. Separately, MERGE without a target alias (`MERGE INTO ns.t ... ON t.id = s.id` or `ON ns.t.id = s.id`) failed even without a policy, because the target was renamed to a default alias; an unaliased target or source is now named by its table, and qualified references to it are shortened.
+
+- A metadata table function that names a catalog is access-checked in that catalog under `[policy.ranger] catalog_scoped`
+
+    `table_files('ns', 't', 'cat')` (and the other metadata functions, and `cat.ns."t$snapshots"`) reads its target from `cat`, but the policy check that refuses a denied target keyed it on the session's catalog. A caller denied `cat.ns.t` could read its file paths, partition values and row counts from a session in another catalog. The check now keys the catalog the call names, and the session's only when it names none.
+
+- A metadata table function's access check keys the catalog under its registered name
+
+    `table_files('ns', 't', 'CAT')` resolves the catalog case-insensitively and reads `cat`; the policy check now keys `cat` too, not the spelling the call used. Ranger already matched both spellings, so this changes no result under Ranger today.
+
+- Cap Polaris at 3 GB of memory in the quickstarts
+
+    The same cap the integration test stack got: the Polaris image sizes its
+    heap at 80% of the Docker VM, and the per-request S3 FileIO garbage can
+    grow until the VM's OOM killer stops the JVM. Applies to the five
+    quickstarts that run Polaris.
+
+- `CALL system.rewrite_data_files(..., distributed => 'require')` below the healthy-worker floor fails with the worker-floor error again, before the catalog is opened
+
+    The write-access check added for #880 loaded the table first, so with the fleet below `min_workers` the caller got a catalog error (or a table-not-found) instead of the `needs >= N healthy workers` message, and two `rewrite_require_mode` tests failed on main. The worker-floor decision does not depend on the table, so it now runs before the catalog round trip; the write-access check still runs before any file is rewritten.
+- Size budgets re-baselined so `aikido-rust-extra` passes on main again: sqe-core, sqe-sql, sqe-policy and sqe-coordinator had outgrown their ceilings, and `plan_rewriter.rs` / `ranger_store.rs` their file limits
+
+- `SHOW CREATE TABLE cat.ns.t` finds a table in a catalog the session has not used yet (#921)
+
+    With `catalog_discovery = "polaris-auto"`, a `SHOW CREATE TABLE` (or `SHOW CREATE VIEW`) as the first statement against a sibling warehouse reported "table not found". The parser does not treat the name in `SHOW CREATE` as a table reference, so the pre-flight saw no catalog to discover. The name is now read like any other table reference, for catalog discovery, the namespace refresh and the `system.*` catalog check.
+
+- Table DDL keeps Ranger's tag projection in step with the table (#928)
+
+    With `[policy.ranger] project-tags = true`, `SET TBLPROPERTIES ('sqe.column-tags' = ...)`, `CREATE [OR REPLACE] TABLE`, CTAS, `RENAME` and every table drop (`DROP TABLE`, `PURGE`, `CALL system.drop_table`, `DROP SCHEMA ... CASCADE`) now project their tag change into Ranger's tag store. Before, a renamed table's new name had no tags in Ranger, so Spark returned its tagged columns raw, and a dropped table's tags stayed behind for any table later created under that name. A failure part-way leaves Spark masking more than SQE, never less. Nothing changes with projection off.
+
+- `main` builds again after the information_schema tag views (#925) crossed two policy changes
+
+    The tag-view visibility check now passes the table's catalog to `resolve_effective_policy` (#919), and the tag-view function takes the catalog resolver's registered name (!1891), which the views report as `catalog_name` and policy keys on.
+
+- A tag steward can untag a column again (#936)
+
+    Since the column tags were bound to field ids (#920), removing a column's last tag, and the rollback after a failed Ranger projection, removed the `sqe.column-tag-ids` table property. Polaris checks that as `REMOVE_TABLE_PROPERTIES`, which a steward holding only `table-properties-set` lacks, so the untag failed with a 403. Tag writes now only set properties: emptied ids are written as an empty id set bound to the new tag map, and a rollback writes back the values it read, with an absent property restored as its empty form.
+
+### Security
+
+- `tag_removal` decides who may take a tag off a column, table or schema (#927)
+
+    `access_control.tag_removal = "same"` (the default) keeps the old rule:
+    the tag privilege covers adding and removing. `"remove_tag"` also asks
+    for the Ranger `remove_tag` access type on each column or object that
+    loses a tag key; `"admin"` reserves removal for admins. A removal is an
+    `UNSET TAGS`, an `UNSET MASKING POLICY`, an object `UNSET TAGS`, or a raw
+    `sqe.column-tags` write that drops a key; the commit re-checks the
+    removed columns under the table lock. A catalog untag needs an admin
+    under either stricter mode. Ranger's `all` does not grant `remove_tag`.
+    Each authorised removal is logged with the user, table and columns. The
+    quickstart bootstrap adds `remove_tag` to the `hive` service definition.
+
+- `url` 2.5.9 (and `form_urlencoded` 1.2.3) for RUSTSEC-2026-0592; `cargo deny check advisories` passes again
+
+- `CREATE OR REPLACE TABLE ... AS SELECT`, a new-table CTAS and `CALL system.rewrite_data_files` now check write access before writing any file (#880 follow-up)
+
+    The write check that INSERT, DELETE, UPDATE and MERGE run up front (a commit Polaris cannot apply, plus a storage probe with the vended keys) did not run on these three paths. A reader's replace or compaction wrote data files before the commit refused them; with read-only vended keys it failed on the first `PutObject` with an unclear error. Now each is refused with `ACCESS_DENIED` ("no write access") before planning any write. A principal that may create a table but not write data into it is refused the CTAS, and the table it created is rolled back.
+
 ## [0.56.0] — 2026-11-21
 
 ### Added
