@@ -29,11 +29,18 @@ For the second MR the same rule covers schema and catalog tags: a 403, any other
 
 A table tag adds the table's masks to every column. Under `mask_precedence = "refuse"`, a column whose own tag has a different mask now holds two masks and the read is refused (#918). No write-time check covers table tags: the write-time conflict guard is Ranger-specific and checks column tag writes. The read refusal is the backstop.
 
-### D5. The Ranger tag projection stays on own tags
+### D5. Table tags are projected into Ranger; schema tags are next
 
-**Inherited tags are enforced by SQE only; the Ranger tag projection (and so Spark) still sees own tags.** This change gives no two-engine guarantee.
+The first MR kept the projection on own tags, so a table tag masked in SQE and not in Spark. #935 part 1 projects table tags too.
 
-`catalog_ops/tag_projection.rs` and the tag load observer project `sqe.column-tags` into Ranger's tag store, so Spark's Ranger plugin masks the same columns. They keep projecting own tags only. A table tag therefore masks in SQE and not in Spark until the projection learns inheritance, with the same override as D1 (#935, part of #924). This is no regression for Spark: table tags never masked columns before. It does keep #924 open.
+- `sqe.table-tags` goes into Ranger's tag store on two resources of the tag service, in one import document: `{database, table, column: *}` and `{database, table}`. Kyuubi's Ranger plugin does not apply a tag on a bare table resource to a column mask request (checked live on the Spark stack: the bare resource left every column raw, the `column: *` one masked within seconds), so the every-column resource carries masks. The bare table resource carries tag row filters, which are table-level requests. A column is never named `*`, so the every-column resource cannot clash with a column's own resource.
+- Order, as for column tags: what a `SET TAGS` adds is in Ranger before the Iceberg commit (a failure changes nothing); what an `UNSET TAGS` removes is deleted after it (a failure leaves Spark over-masking, logged).
+- **Never shrink on an error.** In Spark a table without projected tags is not masked, so "nothing projected" fails open. When the tag load observer finds a malformed `sqe.table-tags`, it logs an error and leaves the table-level resources as they were; own column tags still project. There is no metric or audit event for projection; the error log is the signal.
+- `CALL system.reproject_column_tags` projects table tags as well, add-only.
+- Spark cannot be told to refuse a table whose projection is stale. Between a tag written outside SQE and SQE's next load of the table, Spark enforces the old projection.
+- Where a column's own tag and the table tag both carry a mask, SQE applies the own tag (D1). Kyuubi rendered the same value on the live stack (portable own-tag mask over a `MASK_NULL` table-tag mask: both engines showed the own-tag value). That is Ranger's tag policy order, not a rule SQE controls, so the parity e2e prints the pair rather than asserting it.
+
+Part 2 projects schema tags, likely on `{database, table: *, column: *}` and `{database, table: *}`, once `inherit_schema_tags` is on. Catalog tags are not inherited and not projected.
 
 ### D6. Freshness follows the table metadata
 
@@ -60,4 +67,4 @@ Effective tags are column, then table, then schema: the nearest key wins (D1 app
 ## Risks
 
 - Tagging a table with a key that a row filter matches filters every query of it. That is the intent, but a broad key (`gold`) with a filter now has a wider effect than before. Release notes call it out.
-- Spark and SQE differ on table tags until D5's follow-up (#935) lands.
+- Spark and SQE differ on schema tags until #935 part 2 lands, and on a table whose tags were written outside SQE until SQE next loads it (D5).

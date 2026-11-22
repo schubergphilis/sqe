@@ -923,3 +923,116 @@ async fn a_renamed_column_keeps_its_mask_in_both_engines() {
         "no raw SSN may appear. Got: {sqe:?}"
     );
 }
+
+/// #935: a table's own tag masks every column in Spark as it does in SQE.
+///
+/// `ALTER TABLE ... SET TAGS` projects the tag onto the table's
+/// `column: *` resource, which Kyuubi matches for every column's mask, and
+/// onto its table resource, which it matches for a row filter. `UNSET TAGS`
+/// removes only those: the column's own tag, on its column resource, keeps
+/// masking.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger+spark; run scripts/spark-access-control-test.sh"]
+async fn table_tag_masks_every_column_in_both_engines() {
+    spark_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    ctx.ranger
+        .create_policy(tag_mask_policy_portable(
+            &format!("{PREFIX}parity-own-tagmask"),
+            "parity_own_pii",
+        ))
+        .await
+        .expect("create the column tag mask");
+    ctx.ranger
+        .create_policy(serde_json::json!({
+            "service": crate::common::ranger_fixture::TAG_SERVICE,
+            "name": format!("{PREFIX}parity-table-tagmask"),
+            "policyType": 1,
+            "isEnabled": true,
+            "resources": {"tag": {"values": ["parity_tbl_pii"]}},
+            "dataMaskPolicyItems": [{
+                "roles": ["engineer"],
+                "accesses": [{"type": "hive:select", "isAllowed": true}],
+                "dataMaskInfo": {"dataMaskType": "hive:MASK_NULL"}
+            }]
+        }))
+        .await
+        .expect("create the table tag mask");
+
+    let run = |sql: String| {
+        let ctx = &ctx;
+        async move {
+            ctx.handler
+                .execute(&ctx.carol, &sql, None)
+                .await
+                .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
+        }
+    };
+    run(format!(
+        "ALTER TABLE {ORDERS} MODIFY COLUMN ssn SET TAG parity_own_pii = 'true'"
+    ))
+    .await;
+    run(format!("ALTER TABLE {ORDERS} SET TAGS ('parity_tbl_pii')")).await;
+
+    // Columns that carry no tag of their own are masked through the table.
+    let all_null = |rows: &[Vec<String>]| {
+        rows.len() == 3 && rows.iter().all(|r| r.iter().all(|v| v == "NULL"))
+    };
+    agreed_rows(&ctx, "bob", "id, region, amount", "id", all_null).await;
+    // ssn carries both tags now. Recorded, not asserted: which tag mask wins
+    // there is a precedence question for each engine, not a leak.
+    if let Ok((sqe, spark)) = both_engines(&ctx, "bob", "ssn", "id").await {
+        eprintln!("ssn under both tag masks: sqe={sqe:?} spark={spark:?}");
+    }
+
+    run(format!(
+        "ALTER TABLE {ORDERS} UNSET TAGS ('parity_tbl_pii')"
+    ))
+    .await;
+
+    // The table tag is gone from both engines; the column's own tag stays.
+    let rows = agreed_rows(&ctx, "bob", "id, ssn", "id", |rows| {
+        rows.len() == 3
+            && rows.iter().all(|r| {
+                r.first().is_some_and(|v| v != "NULL")
+                    && r.get(1).is_some_and(|v| v.starts_with("xxx-xx-"))
+            })
+    })
+    .await;
+    assert_eq!(
+        rows.first().map(Vec::as_slice),
+        Some(["1".to_string(), "xxx-xx-1111".to_string()].as_slice()),
+        "UNSET TAGS must clear only the table-level resource"
+    );
+
+    run(format!(
+        "ALTER TABLE {ORDERS} MODIFY COLUMN ssn UNSET TAG parity_own_pii"
+    ))
+    .await;
+
+    // A tag row filter reaches the table through its table resource.
+    ctx.ranger
+        .create_policy(serde_json::json!({
+            "service": crate::common::ranger_fixture::TAG_SERVICE,
+            "name": format!("{PREFIX}parity-table-tagfilter"),
+            "policyType": 2,
+            "isEnabled": true,
+            "resources": {"tag": {"values": ["parity_tbl_eu"]}},
+            "rowFilterPolicyItems": [{
+                "roles": ["engineer"],
+                "accesses": [{"type": "hive:select", "isAllowed": true}],
+                "rowFilterInfo": {"filterExpr": "region = 'EU'"}
+            }]
+        }))
+        .await
+        .expect("create the table tag row filter");
+    run(format!("ALTER TABLE {ORDERS} SET TAGS ('parity_tbl_eu')")).await;
+    let rows = agreed_rows(&ctx, "bob", "id", "id", |rows| rows.len() == 2).await;
+    assert_eq!(rows, vec![vec!["1".to_string()], vec!["3".to_string()]]);
+
+    run(format!("ALTER TABLE {ORDERS} UNSET TAGS ('parity_tbl_eu')")).await;
+    agreed_rows(&ctx, "bob", "id", "id", |rows| rows.len() == 3).await;
+}

@@ -12,6 +12,12 @@
 //! tag removed while the coordinator was down stays in Ranger until
 //! `CALL system.reproject_column_tags` repairs it.
 //!
+//! The table's own tags (`sqe.table-tags`) go the same way, onto the
+//! table-level Ranger resource (#935). When they cannot be read, the
+//! table-level resource keeps what was last projected: Spark masks only
+//! what Ranger holds, so clearing it on an error would unmask every column
+//! there. The column tags still project.
+//!
 //! The projector writes to Ranger with the coordinator's Ranger credentials,
 //! on behalf of whoever committed the tag to Polaris. That client could
 //! already change what SQE masks; this makes Spark agree.
@@ -22,7 +28,9 @@ use std::sync::{Arc, Mutex};
 use iceberg::table::Table;
 use iceberg::TableIdent;
 use sqe_catalog::load_observer::TableLoadObserver;
-use sqe_policy::tag_projector::{project_table_tags, ColumnTags, TagProjector};
+use sqe_policy::tag_projector::{
+    project_table_level_tags, project_table_tags, ColumnTags, TagProjector,
+};
 
 use crate::catalog_ops::{keyed_lock, TableLockMap};
 
@@ -32,6 +40,8 @@ struct Projected {
     location: String,
     last_updated_ms: i64,
     tags: ColumnTags,
+    /// The table's own tag keys on the table-level resource (#935).
+    table_tags: Vec<String>,
 }
 
 /// What the observer last projected, per `{catalog}|{ns}.{table}`.
@@ -66,6 +76,9 @@ struct Observation {
     location: String,
     last_updated_ms: i64,
     tags: ColumnTags,
+    /// The keys of `sqe.table-tags`; `None` when the value could not be
+    /// read, which leaves the table-level resource as it is.
+    table_tags: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -113,13 +126,14 @@ impl TagLoadObserver {
                 {
                     return;
                 }
-                Some(p) => p.tags.clone(),
-                None => ColumnTags::new(),
+                Some(p) => (p.tags.clone(), p.table_tags.clone()),
+                None => (ColumnTags::new(), Vec::new()),
             }
         };
+        let (previous, previous_table) = previous;
+        let (ns, name) = (obs.ident.namespace().as_ref(), obs.ident.name());
         // A data commit leaves the tags alone; nothing to send.
         if previous != obs.tags {
-            let (ns, name) = (obs.ident.namespace().as_ref(), obs.ident.name());
             let (prev, tags, scoped) = (&previous, &obs.tags, self.catalog_scoped);
             let projector = self.projector.as_ref();
             let done = project_table_tags(projector, &obs.catalog, ns, name, scoped, prev, tags);
@@ -133,10 +147,40 @@ impl TagLoadObserver {
                 return;
             }
         }
+        let table_tags = match obs.table_tags {
+            // Never shrink on an error: what Ranger holds stays, and is
+            // remembered, until a load reads the tags again (#935).
+            None => {
+                tracing::error!(
+                    table = %obs.ident,
+                    "malformed sqe.table-tags; the table-level tags last projected into \
+                     Ranger are kept as they are, and a change to them is not projected"
+                );
+                previous_table
+            }
+            Some(now) if now == previous_table => now,
+            Some(now) => {
+                let (prev, scoped) = (&previous_table, self.catalog_scoped);
+                let projector = self.projector.as_ref();
+                let done =
+                    project_table_level_tags(projector, &obs.catalog, ns, name, scoped, prev, &now);
+                if let Err(e) = done.await {
+                    tracing::warn!(
+                        table = %obs.ident,
+                        error = %e,
+                        "could not project a table-tag change found on load into Ranger; \
+                         other engines keep the old tags until the next load retries"
+                    );
+                    return;
+                }
+                now
+            }
+        };
         let state = Projected {
             location: obs.location,
             last_updated_ms: obs.last_updated_ms,
             tags: obs.tags,
+            table_tags,
         };
         self.projected.lock().insert(obs.key, state);
     }
@@ -159,6 +203,7 @@ impl TableLoadObserver for TagLoadObserver {
                 return;
             }
         };
+        let table_tags = crate::catalog_ops::table_tag_keys(table).ok();
         let obs = Observation {
             key,
             catalog: catalog.to_string(),
@@ -166,6 +211,7 @@ impl TableLoadObserver for TagLoadObserver {
             location: location.to_string(),
             last_updated_ms: metadata.last_updated_ms(),
             tags,
+            table_tags,
         };
         let this = self.clone();
         tokio::spawn(async move { this.converge(obs).await });
@@ -181,10 +227,13 @@ mod tests {
 
     /// (table, previous, tags) per call.
     type Calls = Vec<(String, ColumnTags, ColumnTags)>;
+    /// (table, previous, tags) per table-level call.
+    type TableCalls = Vec<(String, Vec<String>, Vec<String>)>;
 
     #[derive(Default)]
     struct Recording {
         calls: Mutex<Calls>,
+        table_calls: Mutex<TableCalls>,
         fail: std::sync::atomic::AtomicBool,
     }
 
@@ -204,6 +253,23 @@ mod tests {
             }
             let call = (table.table.clone(), previous.clone(), tags.clone());
             self.calls.lock().unwrap().push(call);
+            Ok(())
+        }
+
+        async fn project_table_level(
+            &self,
+            table: &TagTableKey,
+            previous: &[String],
+            tags: &[String],
+        ) -> sqe_core::Result<()> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    "ranger down",
+                ));
+            }
+            let call = (table.table.clone(), previous.to_vec(), tags.to_vec());
+            self.table_calls.lock().unwrap().push(call);
             Ok(())
         }
 
@@ -231,7 +297,17 @@ mod tests {
             location: location.into(),
             last_updated_ms: updated,
             tags,
+            table_tags: Some(Vec::new()),
         }
+    }
+
+    fn with_table_tags(mut o: Observation, tags: Option<&[&str]>) -> Observation {
+        o.table_tags = tags.map(|ts| ts.iter().map(ToString::to_string).collect());
+        o
+    }
+
+    fn table_calls(rec: &Recording) -> TableCalls {
+        rec.table_calls.lock().unwrap().clone()
     }
 
     fn calls(rec: &Recording) -> Calls {
@@ -314,5 +390,60 @@ mod tests {
         let c = calls(&rec);
         assert_eq!(c.len(), 2, "the recreated table is projected: {c:?}");
         assert!(c[1].1.is_empty() && c[1].2.contains_key("ssn"));
+    }
+
+    #[tokio::test]
+    async fn table_tags_are_projected_on_the_table_level_resource() {
+        let (rec, o) = setup();
+        o.converge(with_table_tags(obs("m1", 1, &[]), Some(&["pii"])))
+            .await;
+        o.converge(with_table_tags(obs("m2", 2, &[]), Some(&["pii"])))
+            .await;
+        o.converge(with_table_tags(obs("m3", 3, &[]), Some(&[])))
+            .await;
+        let pii = vec!["pii".to_string()];
+        let want = vec![
+            ("t".to_string(), vec![], pii.clone()),
+            ("t".to_string(), pii, vec![]),
+        ];
+        assert_eq!(table_calls(&rec), want, "m2 kept the tags, so sent nothing");
+        assert!(calls(&rec).is_empty(), "no column tags, no column call");
+    }
+
+    /// #935: a parent read fails and the existing projected tags stay. The
+    /// table's tags cannot be read on m2, so the table-level resource is not
+    /// touched (Spark keeps masking), the memory keeps them, and the column
+    /// tag still projects. When m3 reads them again, only the real change is
+    /// sent.
+    #[tokio::test]
+    async fn a_failed_parent_read_keeps_the_projected_table_tags() {
+        let (rec, o) = setup();
+        o.converge(with_table_tags(obs("m1", 1, &[]), Some(&["pii"])))
+            .await;
+        assert_eq!(table_calls(&rec).len(), 1);
+
+        o.converge(with_table_tags(obs("m2", 2, &[("ssn", "PII")]), None))
+            .await;
+        assert_eq!(table_calls(&rec).len(), 1, "nothing deleted or shrunk");
+        assert_eq!(calls(&rec).len(), 1, "the column's own tag still projects");
+        let kept = o
+            .projected
+            .lock()
+            .get("cat|ns.t")
+            .map(|p| p.table_tags.clone());
+        assert_eq!(kept, Some(vec!["pii".to_string()]));
+
+        o.converge(with_table_tags(
+            obs("m3", 3, &[("ssn", "PII")]),
+            Some(&["pii", "gold"]),
+        ))
+        .await;
+        let last = table_calls(&rec).pop().unwrap();
+        assert_eq!(
+            last.1,
+            vec!["pii".to_string()],
+            "previous is what Ranger holds"
+        );
+        assert_eq!(last.2, vec!["pii".to_string(), "gold".to_string()]);
     }
 }

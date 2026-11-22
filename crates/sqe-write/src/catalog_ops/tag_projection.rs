@@ -21,12 +21,33 @@ use super::{
 /// `column -> [tag keys]`: what Ranger's tag store holds for a table.
 pub(super) type TagKeys = HashMap<String, Vec<String>>;
 
+/// Everything Ranger holds for one table: its columns' tag keys and the keys
+/// of the tags on the table itself (#935).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct DdlTags {
+    pub(super) columns: TagKeys,
+    pub(super) table: Vec<String>,
+}
+
+/// The keys of the tags on `table` itself (`sqe.table-tags`), as projected
+/// on its table-level Ranger resource (#935).
+pub(crate) fn table_tag_keys(
+    table: &iceberg::table::Table,
+) -> Result<Vec<String>, serde_json::Error> {
+    let raw = table
+        .metadata()
+        .properties()
+        .get(sqe_core::object_tags::TABLE_PROP_KEY);
+    let tags = sqe_core::object_tags::parse(raw.map(String::as_str))?;
+    Ok(tags.into_iter().map(|t| t.key).collect())
+}
+
 /// The tags of a table a procedure is about to drop, with its table lock
 /// held until they are cleared (#928).
 pub struct ProcedureDropTags {
     catalog: String,
     ident: TableIdent,
-    tags: TagKeys,
+    tags: DdlTags,
     _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
@@ -83,27 +104,81 @@ impl CatalogOps {
         done
     }
 
-    /// The tag keys of `ident` before it is dropped or renamed (#928), or
-    /// `None` when projection is off, the table cannot be loaded (a drop with
-    /// `IF EXISTS` of a missing table), it has no tags, or its tag value is
-    /// not a tag map (never projected, as on load).
+    /// Project the tags on `ident` itself onto its table-level Ranger
+    /// resource (#935): `previous` deleted, then `tags` added. Like
+    /// [`Self::project_tag_keys`] it makes the load observer forget `ident`.
+    pub(super) async fn project_table_level_keys(
+        &self,
+        catalog: &str,
+        ident: &TableIdent,
+        previous: &[String],
+        tags: &[String],
+    ) -> sqe_core::Result<()> {
+        use sqe_policy::tag_projector::project_table_level_tags;
+        let (ns, name, scoped) = (
+            ident.namespace().as_ref(),
+            ident.name(),
+            self.catalog_scoped(),
+        );
+        let projector = self.tag_projector.as_ref();
+        let run = project_table_level_tags(projector, catalog, ns, name, scoped, previous, tags);
+        let done = run.await;
+        self.tag_load_memory.forget(ident);
+        done
+    }
+
+    /// Project `tags` (columns and table level) onto `ident`, which has none
+    /// in Ranger yet: the destination of a rename (#928, #935).
+    pub(super) async fn project_ddl_tags(
+        &self,
+        catalog: &str,
+        ident: &TableIdent,
+        tags: &DdlTags,
+    ) -> sqe_core::Result<()> {
+        if !tags.columns.is_empty() {
+            let none = TagKeys::new();
+            self.project_tag_keys(catalog, ident, &none, &tags.columns)
+                .await?;
+        }
+        if !tags.table.is_empty() {
+            self.project_table_level_keys(catalog, ident, &[], &tags.table)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// What Ranger holds for `ident` before it is dropped or renamed (#928,
+    /// #935), or `None` when projection is off, the table cannot be loaded
+    /// (a drop with `IF EXISTS` of a missing table) or it has no tags. A
+    /// malformed tag value contributes nothing, as on load: it was never
+    /// projected, so there is nothing of it to move or clear.
     pub(super) async fn tag_keys_before_ddl(
         &self,
         session_catalog: &SessionCatalog,
         ident: &TableIdent,
-    ) -> Option<TagKeys> {
+    ) -> Option<DdlTags> {
         if !self.tag_projector.enabled() {
             return None;
         }
         let table = session_catalog.load_table(ident).await.ok()?;
-        match crate::tag_source_impl::table_column_tags(&table) {
-            Ok(tags) if !tags.is_empty() => Some(tags),
-            Ok(_) => None,
-            Err(e) => {
-                tracing::warn!(table = %ident, error = %e, "malformed sqe.column-tags; not projected");
-                None
-            }
-        }
+        let columns = crate::tag_source_impl::table_column_tags(&table).unwrap_or_else(|e| {
+            tracing::warn!(table = %ident, error = %e, "malformed sqe.column-tags; not projected");
+            TagKeys::new()
+        });
+        let table_level = table_tag_keys(&table).unwrap_or_else(|e| {
+            tracing::error!(
+                table = %ident,
+                error = %e,
+                "malformed sqe.table-tags; its table-level Ranger resource is not moved or \
+                 cleared"
+            );
+            Vec::new()
+        });
+        let tags = DdlTags {
+            columns,
+            table: table_level,
+        };
+        (tags != DdlTags::default()).then_some(tags)
     }
 
     /// Clear the Ranger tags of a table that is gone: dropped, or renamed
@@ -114,16 +189,28 @@ impl CatalogOps {
         &self,
         catalog: &str,
         ident: &TableIdent,
-        tags: &TagKeys,
+        tags: &DdlTags,
     ) {
-        if let Err(e) = self
-            .project_tag_keys(catalog, ident, tags, &TagKeys::new())
-            .await
-        {
+        let columns = async {
+            if tags.columns.is_empty() {
+                return Ok(());
+            }
+            let none = TagKeys::new();
+            self.project_tag_keys(catalog, ident, &tags.columns, &none)
+                .await
+        };
+        let table_level = async {
+            if tags.table.is_empty() {
+                return Ok(());
+            }
+            self.project_table_level_keys(catalog, ident, &tags.table, &[])
+                .await
+        };
+        if let Err(e) = columns.await.and(table_level.await) {
             tracing::warn!(
                 table = %ident,
                 error = %e,
-                "the table is gone but clearing its column tags in Ranger failed; other \
+                "the table is gone but clearing its tags in Ranger failed; other \
                  engines mask a table created later under this name with the old tags"
             );
         }
@@ -342,8 +429,18 @@ impl CatalogOps {
                 );
             }
         };
+        let table_tags = match table_tag_keys(&table) {
+            Ok(t) => t,
+            Err(e) => {
+                return ReprojectRow::error(
+                    ident.to_string(),
+                    format!("malformed sqe.table-tags JSON: {e}"),
+                );
+            }
+        };
         let scoped = self.catalog_scoped();
-        reproject_loaded_tags(self.tag_projector.as_ref(), catalog, scoped, ident, &tags).await
+        let projector = self.tag_projector.as_ref();
+        reproject_loaded_tags(projector, catalog, scoped, ident, &tags, &table_tags).await
     }
 }
 
@@ -370,7 +467,7 @@ impl ReprojectRow {
             table,
             status: "skipped".into(),
             columns_projected: 0,
-            message: "no column tags".into(),
+            message: "no tags".into(),
         }
     }
 
@@ -396,10 +493,11 @@ async fn reproject_loaded_tags(
     catalog_scoped: bool,
     ident: &TableIdent,
     tags: &HashMap<String, Vec<String>>,
+    table_tags: &[String],
 ) -> ReprojectRow {
-    use sqe_policy::tag_projector::{project_table_tags, ColumnTags};
+    use sqe_policy::tag_projector::{project_table_level_tags, project_table_tags, ColumnTags};
     let table = ident.to_string();
-    if tags.is_empty() {
+    if tags.is_empty() && table_tags.is_empty() {
         return ReprojectRow::skipped(table);
     }
     let projected: ColumnTags = tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -408,10 +506,20 @@ async fn reproject_loaded_tags(
     // projection of the Iceberg source of truth. Deleting-then-adding the
     // current map would briefly unmask Spark on a repair of a live table.
     let prev = ColumnTags::new();
-    match project_table_tags(projector, catalog, ns, name, scoped, &prev, &projected).await {
-        Ok(()) => ReprojectRow::projected(table, tags.len() as i64),
-        Err(e) => ReprojectRow::error(table, e.to_string()),
+    if !tags.is_empty() {
+        let run = project_table_tags(projector, catalog, ns, name, scoped, &prev, &projected);
+        if let Err(e) = run.await {
+            return ReprojectRow::error(table, e.to_string());
+        }
     }
+    // The table's own tags (#935), add-only for the same reason.
+    if !table_tags.is_empty() {
+        let run = project_table_level_tags(projector, catalog, ns, name, scoped, &[], table_tags);
+        if let Err(e) = run.await {
+            return ReprojectRow::error(table, format!("table-level tags: {e}"));
+        }
+    }
+    ReprojectRow::projected(table, (tags.len() + table_tags.len()) as i64)
 }
 
 async fn collect_reproject_targets(
@@ -480,6 +588,27 @@ mod tests {
             Ok(())
         }
 
+        /// Recorded as table `<name>#table`, so a test tells the two apart.
+        async fn project_table_level(
+            &self,
+            table: &sqe_policy::tag_projector::TagTableKey,
+            _previous: &[String],
+            tags: &[String],
+        ) -> sqe_core::Result<()> {
+            if self.fail {
+                return Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    "ranger down",
+                ));
+            }
+            self.calls.lock().unwrap().push((
+                table.database.clone(),
+                format!("{}#table", table.table),
+                tags.len(),
+            ));
+            Ok(())
+        }
+
         fn enabled(&self) -> bool {
             true
         }
@@ -496,7 +625,7 @@ mod tests {
             fail: false,
         };
         let (none, orders) = (HashMap::new(), ident("sales", "orders"));
-        let row = reproject_loaded_tags(&projector, "a", true, &orders, &none).await;
+        let row = reproject_loaded_tags(&projector, "a", true, &orders, &none, &[]).await;
         assert_eq!(row.status, "skipped");
         assert_eq!(row.columns_projected, 0);
         assert!(projector.calls.lock().unwrap().is_empty());
@@ -512,7 +641,7 @@ mod tests {
         tags.insert("ssn".into(), vec!["PII".into()]);
         tags.insert("email".into(), vec!["PII".into(), "GDPR".into()]);
         let orders = ident("sales", "orders");
-        let row = reproject_loaded_tags(&ok, "a", false, &orders, &tags).await;
+        let row = reproject_loaded_tags(&ok, "a", false, &orders, &tags, &[]).await;
         assert_eq!(row.status, "projected");
         assert_eq!(row.columns_projected, 2);
         assert_eq!(
@@ -523,7 +652,7 @@ mod tests {
         // #899: catalog-scoped, the catalog leads the key and the unscoped
         // resource from before the setting is cleared (no tags added).
         ok.calls.lock().unwrap().clear();
-        let row = reproject_loaded_tags(&ok, "a", true, &orders, &tags).await;
+        let row = reproject_loaded_tags(&ok, "a", true, &orders, &tags, &[]).await;
         assert_eq!(row.status, "projected");
         let scoped = ("a.sales".into(), "orders".into(), 2);
         let cleared = ("sales".into(), "orders".into(), 0);
@@ -533,10 +662,37 @@ mod tests {
             calls: std::sync::Mutex::new(Vec::new()),
             fail: true,
         };
-        let row = reproject_loaded_tags(&fail, "a", false, &orders, &tags).await;
+        let row = reproject_loaded_tags(&fail, "a", false, &orders, &tags, &[]).await;
         assert_eq!(row.status, "error");
         assert!(row.message.contains("ranger down"), "got: {}", row.message);
         assert_eq!(row.columns_projected, 0);
+    }
+
+    /// A table with only table tags is projected, onto the table-level
+    /// resource and add-only (#935).
+    #[tokio::test]
+    async fn reproject_loaded_tags_projects_table_level_tags() {
+        let ok = RecordingProjector {
+            calls: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        };
+        let (none, orders) = (HashMap::new(), ident("sales", "orders"));
+        let table_tags = vec!["pii".to_string()];
+        let row = reproject_loaded_tags(&ok, "a", false, &orders, &none, &table_tags).await;
+        assert_eq!(row.status, "projected");
+        assert_eq!(row.columns_projected, 1);
+        assert_eq!(
+            ok.calls.lock().unwrap().as_slice(),
+            &[("sales".into(), "orders#table".into(), 1)]
+        );
+
+        let fail = RecordingProjector {
+            calls: std::sync::Mutex::new(Vec::new()),
+            fail: true,
+        };
+        let row = reproject_loaded_tags(&fail, "a", false, &orders, &none, &table_tags).await;
+        assert_eq!(row.status, "error");
+        assert!(row.message.contains("table-level"), "got: {}", row.message);
     }
 
     /// Ranger holds the union while a tag change is in flight (#928).

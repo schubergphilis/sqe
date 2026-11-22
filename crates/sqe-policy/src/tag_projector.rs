@@ -133,6 +133,54 @@ pub async fn project_table_tags(
     Ok(())
 }
 
+/// Project the tags on the table ITSELF (`sqe.table-tags`, #935) under the same
+/// key and with the same catalog rules as [`project_table_tags`].
+///
+/// They go on two resources of the table, see
+/// [`build_table_level_import_document`]: together they reach every column
+/// of the table in Spark, including columns added later, without one
+/// association per column. The column resources [`project_table_tags`]
+/// writes are not touched.
+pub async fn project_table_level_tags(
+    projector: &dyn TagProjector,
+    catalog: &str,
+    namespace: &[String],
+    table: &str,
+    catalog_scoped: bool,
+    previous: &[String],
+    tags: &[String],
+) -> sqe_core::Result<()> {
+    let key = TagTableKey::for_table(catalog, namespace, table, catalog_scoped)?;
+    if !catalog_scoped {
+        return projector.project_table_level(&key, previous, tags).await;
+    }
+    let scoped = |names: &[String]| -> Vec<String> {
+        let mut all = names.to_vec();
+        all.extend(
+            names
+                .iter()
+                .map(|t| crate::tag_scope::qualify_tag(catalog, t)),
+        );
+        all
+    };
+    projector
+        .project_table_level(&key, &scoped(previous), &scoped(tags))
+        .await?;
+    let legacy = TagTableKey::for_table(catalog, namespace, table, false)?;
+    let mut stale = previous.to_vec();
+    stale.extend(tags.iter().cloned());
+    if let Err(e) = projector.project_table_level(&legacy, &stale, &[]).await {
+        tracing::warn!(
+            database = %legacy.database,
+            table = %legacy.table,
+            error = %e,
+            "could not delete the unscoped table-tag resource left from before \
+             catalog_scoped; other engines may still apply it in every catalog"
+        );
+    }
+    Ok(())
+}
+
 /// `tags` with each column's tags followed by their catalog-qualified names
 /// (`pii` -> `pii`, `sales.pii`).
 fn with_catalog_tags(catalog: &str, tags: &ColumnTags) -> ColumnTags {
@@ -160,6 +208,18 @@ pub trait TagProjector: Send + Sync {
         previous: &ColumnTags,
         tags: &ColumnTags,
     ) -> sqe_core::Result<()>;
+
+    /// Make the table-level resource carry `tags` (the table's own tags, not
+    /// its columns'), deleting `previous` first, as [`Self::project`] does.
+    /// An empty `previous` only adds: nothing already projected is removed.
+    async fn project_table_level(
+        &self,
+        _table: &TagTableKey,
+        _previous: &[String],
+        _tags: &[String],
+    ) -> sqe_core::Result<()> {
+        Ok(())
+    }
 
     /// False when projection is off, which lets callers skip the work and, more
     /// importantly, skip the ROLLBACK path that only exists to keep the two stores
@@ -199,6 +259,56 @@ pub fn build_import_document(
     tags: &ColumnTags,
     op: &str,
 ) -> serde_json::Value {
+    let resources = tags.iter().map(|(column, column_tags)| {
+        let elements = serde_json::json!({
+            "database": {"values": [table.database]},
+            "table":    {"values": [table.table]},
+            "column":   {"values": [column]},
+        });
+        (elements, column_tags.as_slice())
+    });
+    import_document(service, resources, op)
+}
+
+/// [`build_import_document`] for the table's own tags (#935), on two
+/// resources:
+///
+/// - `database`, `table`, `column: *`: what a column request (a mask)
+///   matches. Kyuubi's plugin does not apply a tag on the bare table
+///   resource to the table's columns, though Ranger's enricher accepts the
+///   ancestor match (checked live on the Spark stack).
+/// - `database`, `table`: what a table request (a row filter) matches.
+///
+/// A column is never named `*`, so the first resource is no column's own.
+pub fn build_table_level_import_document(
+    service: &str,
+    table: &TagTableKey,
+    tags: &[String],
+    op: &str,
+) -> serde_json::Value {
+    let every_column = serde_json::json!({
+        "database": {"values": [table.database]},
+        "table":    {"values": [table.table]},
+        "column":   {"values": ["*"]},
+    });
+    let the_table = serde_json::json!({
+        "database": {"values": [table.database]},
+        "table":    {"values": [table.table]},
+    });
+    import_document(
+        service,
+        [(every_column, tags), (the_table, tags)].into_iter(),
+        op,
+    )
+}
+
+/// One `ServiceTags` document: each resource (its `resourceElements`) with
+/// the tags it carries. A resource with no tags is left out.
+fn import_document<'a>(
+    service: &str,
+    resources: impl Iterator<Item = (serde_json::Value, &'a [String])>,
+    op: &str,
+) -> serde_json::Value {
     let mut tag_definitions = serde_json::Map::new();
     let mut tag_instances = serde_json::Map::new();
     let mut service_resources = Vec::new();
@@ -206,9 +316,9 @@ pub fn build_import_document(
 
     // One id space for tag names, one for resources.
     let mut tag_id_of: BTreeMap<&str, usize> = BTreeMap::new();
-    for (column, column_tags) in tags {
+    for (elements, resource_tags) in resources {
         let mut ids = Vec::new();
-        for tag in column_tags {
+        for tag in resource_tags {
             let next = tag_id_of.len();
             let id = *tag_id_of.entry(tag.as_str()).or_insert(next);
             tag_definitions.insert(
@@ -225,11 +335,7 @@ pub fn build_import_document(
         service_resources.push(serde_json::json!({
             "id": resource_id,
             "serviceName": service,
-            "resourceElements": {
-                "database": {"values": [table.database]},
-                "table":    {"values": [table.table]},
-                "column":   {"values": [column]},
-            }
+            "resourceElements": elements,
         }));
         resource_to_tag_ids.insert(resource_id.to_string(), serde_json::json!(ids));
     }
@@ -332,6 +438,31 @@ impl TagProjector for RangerTagProjector {
             table = %table.table,
             columns = tags.len(),
             "projected column tags into the Ranger tag store"
+        );
+        Ok(())
+    }
+
+    #[instrument(skip(self, previous, tags), fields(service = %self.service_name))]
+    async fn project_table_level(
+        &self,
+        table: &TagTableKey,
+        previous: &[String],
+        tags: &[String],
+    ) -> sqe_core::Result<()> {
+        let service = &self.service_name;
+        if !previous.is_empty() {
+            let doc = build_table_level_import_document(service, table, previous, "delete");
+            self.import(doc).await?;
+        }
+        if !tags.is_empty() {
+            let doc = build_table_level_import_document(service, table, tags, "add_or_update");
+            self.import(doc).await?;
+        }
+        debug!(
+            database = %table.database,
+            table = %table.table,
+            tags = tags.len(),
+            "projected table tags into the Ranger tag store"
         );
         Ok(())
     }
@@ -521,6 +652,84 @@ mod tests {
         );
         assert!(doc["serviceResources"].as_array().unwrap().is_empty());
         assert!(doc["tagDefinitions"].as_object().unwrap().is_empty());
+    }
+
+    /// Table tags go on the table's every-column resource (masks) and on its
+    /// table resource (row filters), both with every tag (#935).
+    #[test]
+    fn table_tags_go_on_the_table_level_resource() {
+        let names = vec!["gold".to_string(), "pii".to_string()];
+        let key = TagTableKey::new("ac", "orders");
+        let doc = build_table_level_import_document("query", &key, &names, "add_or_update");
+        let resources = doc["serviceResources"].as_array().unwrap();
+        assert_eq!(resources.len(), 2);
+        let every = &resources[0]["resourceElements"];
+        assert_eq!(every["database"]["values"][0], "ac");
+        assert_eq!(every["table"]["values"][0], "orders");
+        assert_eq!(every["column"]["values"], serde_json::json!(["*"]));
+        let table = &resources[1]["resourceElements"];
+        assert_eq!(table["table"]["values"][0], "orders");
+        assert!(table.get("column").is_none(), "no column element: {table}");
+        assert_eq!(doc["resourceToTagIds"]["0"], serde_json::json!([0, 1]));
+        assert_eq!(doc["resourceToTagIds"]["1"], serde_json::json!([0, 1]));
+        assert_eq!(doc["tagDefinitions"]["1"]["name"], "pii");
+
+        let none = build_table_level_import_document("query", &key, &[], "add_or_update");
+        assert!(none["serviceResources"].as_array().unwrap().is_empty());
+    }
+
+    /// Table-level projection keys and scopes like the column projection: the
+    /// catalog-qualified names are added under `catalog_scoped` and the
+    /// unscoped resource is cleared. Column resources are never named.
+    #[tokio::test]
+    async fn table_level_projection_is_scoped_like_columns() {
+        type Call = (String, Vec<String>, Vec<String>);
+        #[derive(Default)]
+        struct Rec(std::sync::Mutex<Vec<Call>>);
+        #[async_trait]
+        impl TagProjector for Rec {
+            async fn project(
+                &self,
+                _: &TagTableKey,
+                _: &ColumnTags,
+                _: &ColumnTags,
+            ) -> sqe_core::Result<()> {
+                panic!("table tags must not touch column resources");
+            }
+            async fn project_table_level(
+                &self,
+                t: &TagTableKey,
+                prev: &[String],
+                tags: &[String],
+            ) -> sqe_core::Result<()> {
+                let call = (t.database.clone(), prev.to_vec(), tags.to_vec());
+                self.0.lock().unwrap().push(call);
+                Ok(())
+            }
+        }
+        let ns = vec!["sales".to_string()];
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let (prev, now) = (s(&["gold"]), s(&["pii"]));
+
+        let rec = Rec::default();
+        let run = project_table_level_tags(&rec, "a", &ns, "orders", true, &prev, &now);
+        run.await.unwrap();
+        assert_eq!(
+            *rec.0.lock().unwrap(),
+            [
+                (
+                    "a.sales".into(),
+                    s(&["gold", "a.gold"]),
+                    s(&["pii", "a.pii"])
+                ),
+                ("sales".into(), s(&["gold", "pii"]), vec![]),
+            ]
+        );
+
+        let rec = Rec::default();
+        let run = project_table_level_tags(&rec, "a", &ns, "orders", false, &prev, &now);
+        run.await.unwrap();
+        assert_eq!(*rec.0.lock().unwrap(), [("sales".into(), prev, now)]);
     }
 
     /// The noop projector must report itself DISABLED, because the caller uses that

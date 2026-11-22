@@ -40,8 +40,9 @@ use sqe_policy::tag_conflict_guard::TagConflictGuard;
 pub mod object_tags;
 mod tag_projection;
 
+pub(crate) use tag_projection::table_tag_keys;
+use tag_projection::union_tag_keys;
 pub use tag_projection::ProcedureDropTags;
-use tag_projection::{union_tag_keys, TagKeys};
 
 /// `format-version` (Iceberg) or `format_version` (Trino).
 fn is_format_version_key(key: &str) -> bool {
@@ -781,8 +782,7 @@ impl CatalogOps {
             tags = None;
         }
         if let Some(tags) = &tags {
-            let none = TagKeys::new();
-            let tagged = self.project_tag_keys(&planner, &dest_ident, &none, tags);
+            let tagged = self.project_ddl_tags(&planner, &dest_ident, tags);
             tagged.await.map_err(|e| {
                 SqeError::with_code(
                     SqeErrorCode::ExecutionFailed,
