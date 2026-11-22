@@ -140,7 +140,7 @@ def test_a_header_set_twice_by_case_is_refused():
 
 
 def test_a_value_that_is_not_printable_ascii_is_refused_without_echoing_it():
-    for value in (SECRET + "\r\nx-injected: 1", SECRET + "é", 42):
+    for value in (SECRET + "\r\nx-injected: 1", SECRET + "\n", SECRET + "\r", SECRET + "\u00e9", 42):
         msg = _refused({"x-portal-catalog-scope": value})
         assert "x-portal-catalog-scope" in msg
         assert SECRET not in msg and "injected" not in msg

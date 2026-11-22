@@ -60,11 +60,11 @@ def flight_db_kwargs(
 CALL_HEADER_PREFIX = "adbc.flight.sql.rpc.call_header."
 
 # gRPC metadata keys: lowercase letters, digits, '-', '_' and '.'.
-_HEADER_NAME = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
+_HEADER_NAME = re.compile(r"[a-z0-9][a-z0-9_.-]*")
 # Headers the adapter or gRPC itself sets: a profile must not replace them.
 _RESERVED_HEADERS = {"authorization", "content-type", "te", "user-agent", "host"}
 # Printable ASCII, the only values gRPC allows in a non-binary header.
-_HEADER_VALUE = re.compile(r"^[\x20-\x7e]*$")
+_HEADER_VALUE = re.compile(r"[\x20-\x7e]*")
 
 
 def flight_call_headers(headers: Optional[Mapping[str, str]] = None) -> dict:
@@ -83,7 +83,7 @@ def flight_call_headers(headers: Optional[Mapping[str, str]] = None) -> dict:
     for raw_name, value in (headers or {}).items():
         name = str(raw_name).strip().lower()
         if (
-            not _HEADER_NAME.match(name)
+            not _HEADER_NAME.fullmatch(name)
             or name.endswith("-bin")
             or name.startswith("grpc-")
             or name in _RESERVED_HEADERS
@@ -95,7 +95,7 @@ def flight_call_headers(headers: Optional[Mapping[str, str]] = None) -> dict:
         key = CALL_HEADER_PREFIX + name
         if value is None:
             continue
-        if not isinstance(value, str) or not _HEADER_VALUE.match(value):
+        if not isinstance(value, str) or not _HEADER_VALUE.fullmatch(value):
             raise AuthError(
                 f"dbt-sqe: call_headers: the value of '{name}' must be printable ASCII text"
             )
