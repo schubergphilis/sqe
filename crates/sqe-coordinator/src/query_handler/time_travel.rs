@@ -171,21 +171,7 @@ impl QueryHandler {
         session_catalog: &Arc<SessionCatalog>,
         prefetch_concurrency: usize,
     ) -> sqe_core::Result<String> {
-        let parts: Vec<&str> = spec.table.split('.').collect();
-        let (namespace, bare_table) = match parts.len() {
-            1 => ("default", parts[0]),
-            2 => (parts[0], parts[1]),
-            3 => (parts[1], parts[2]),
-            _ => {
-                return Err(SqeError::with_code(
-                    SqeErrorCode::ExecutionFailed,
-                    format!(
-                        "Unsupported table name format for time travel: {}",
-                        spec.table
-                    ),
-                ));
-            }
-        };
+        let (namespace, bare_table) = split_time_travel_name(&spec.table, ctx)?;
 
         let ns_ident = iceberg::NamespaceIdent::new(namespace.to_string());
         let table_ident = iceberg::TableIdent::new(ns_ident, bare_table.to_string());
@@ -272,19 +258,7 @@ impl QueryHandler {
                     .resolve_reference_catalog(session, &table_name, session_catalog)
                     .await?;
 
-                // Extract namespace and table from the (possibly qualified) name
-                let parts: Vec<&str> = table_name.split('.').collect();
-                let (namespace, bare_table) = match parts.len() {
-                    1 => ("default", parts[0]),
-                    2 => (parts[0], parts[1]),
-                    3 => (parts[1], parts[2]), // catalog.schema.table — skip catalog
-                    _ => {
-                        return Err(SqeError::with_code(
-                            SqeErrorCode::ExecutionFailed,
-                            format!("Unsupported table name format for time travel: {table_name}"),
-                        ));
-                    }
-                };
+                let (namespace, bare_table) = split_time_travel_name(&table_name, ctx)?;
 
                 let ns_ident = iceberg::NamespaceIdent::new(namespace.to_string());
                 let table_ident = iceberg::TableIdent::new(ns_ident, bare_table.to_string());
@@ -490,6 +464,29 @@ impl QueryHandler {
     }
 }
 
+/// Split a time-travel table reference into `(namespace, table)`. A bare
+/// name resolves in the session's schema (`USE`, or `X-Trino-Schema`), as
+/// the same name without the clause does; `default` only when the session
+/// names none. A 3-part name's catalog is resolved by the caller.
+/// The namespace and table a time-travel reference loads. A bare name is
+/// qualified with [`sqe_policy::TableScope::of`], the scope the policy
+/// rewriter qualifies the restored scan with, so the pinned snapshot is read
+/// from the same table whose row filters and masks govern it.
+fn split_time_travel_name(table: &str, ctx: &SessionContext) -> sqe_core::Result<(String, String)> {
+    let unsupported = || {
+        SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!("Unsupported table name format for time travel: {table}"),
+        )
+    };
+    if table.split('.').count() > 3 {
+        return Err(unsupported());
+    }
+    let qualified = sqe_policy::TableScope::of(ctx).qualify(&TableReference::from(table));
+    let namespace = qualified.schema().ok_or_else(unsupported)?;
+    Ok((namespace.to_string(), qualified.table().to_string()))
+}
+
 /// RAII guard that deregisters time-travel pinned providers when the query
 /// completes (#44). The pinned provider must not survive the query that
 /// asked for it; otherwise later SQL in the same session that references
@@ -591,5 +588,53 @@ impl Drop for TimeTravelCleanup {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod split_name_tests {
+    use super::*;
+    use datafusion::prelude::SessionConfig;
+
+    fn ctx(schema: &str) -> SessionContext {
+        SessionContext::new_with_config(
+            SessionConfig::new()
+                .with_create_default_catalog_and_schema(false)
+                .with_default_catalog_and_schema("lake", schema),
+        )
+    }
+
+    fn split(table: &str, schema: &str) -> (String, String) {
+        split_time_travel_name(table, &ctx(schema)).unwrap()
+    }
+
+    /// A bare name loads from the namespace the policy rewriter keys the
+    /// restored scan on: `TableScope::of(ctx).qualify(..)`, both read from
+    /// the context's default schema.
+    #[test]
+    fn bare_name_loads_the_table_the_policy_governs() {
+        let ctx = ctx("sales");
+        let governed = sqe_policy::TableScope::of(&ctx).qualify(&TableReference::from("orders"));
+        let (namespace, table) = split_time_travel_name("orders", &ctx).unwrap();
+        assert_eq!(Some(namespace.as_str()), governed.schema());
+        assert_eq!(table, governed.table());
+        assert_eq!((namespace.as_str(), table.as_str()), ("sales", "orders"));
+    }
+
+    #[test]
+    fn qualified_names_keep_their_namespace() {
+        assert_eq!(
+            split("orders", "default"),
+            ("default".into(), "orders".into())
+        );
+        assert_eq!(
+            split("ops.orders", "sales"),
+            ("ops".into(), "orders".into())
+        );
+        assert_eq!(
+            split("lake.ops.orders", "sales"),
+            ("ops".into(), "orders".into())
+        );
+        assert!(split_time_travel_name("a.b.c.d", &ctx("sales")).is_err());
     }
 }

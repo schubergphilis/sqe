@@ -103,3 +103,19 @@ async fn begin_still_needs_a_stored_session() {
         "unexpected error: {err}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn use_succeeds_for_a_session_the_manager_does_not_hold() {
+    // The Trino HTTP layer executes USE and returns the scope to the client
+    // as X-Trino-Set-Catalog / -Schema; the coordinator has no stored
+    // session to switch and must not fail the statement for it.
+    let polaris = mount_empty_polaris().await;
+    let handler = hybrid_handler(&polaris.uri());
+    for sql in ["USE sales", "USE iceberg.sales"] {
+        let result = handler.execute(&http_session(None), sql, None).await;
+        assert!(
+            result.is_ok(),
+            "{sql} on an HTTP session failed: {result:?}"
+        );
+    }
+}

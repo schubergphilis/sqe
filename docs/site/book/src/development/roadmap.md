@@ -416,6 +416,7 @@ Complete migration from the Trino DCAF fork. The compatibility half of this phas
 - **Async statement protocol**: `POST /v1/statement` no longer executes inside the HTTP call. Fast queries return the first page inline; long ones return `QUEUED` with a poll route, so a 60s CTAS survives dbt-trino's hardcoded 30s request timeout
 - **Two test harnesses**: `testing/tempto/` runs the upstream `trino-product-tests` Iceberg suite against SQE, and a SQE-vs-Trino parity harness diffs both engines on a shared Polaris catalog
 - **Gap sweep #327-#363 closed**: parser and utility statements (SHOW CREATE SCHEMA, SET TIME ZONE, bare TABLE, nested ROW casts), scalar and aggregate functions (kurtosis, skewness, date_add/date_diff on nanosecond timestamps), type mapping (ROW/UUID/IPADDRESS casts, Trino type names in metadata), session properties and roles, time travel forms, `FETCH FIRST ... WITH TIES`, interval rendering, `SHOW STATS`, and unquoted-identifier folding to match Trino case semantics
+- **Flight SQL parity for branches and time travel**: `FOR VERSION|TIMESTAMP AS OF` and `FOR INCREMENTAL BETWEEN` run over Trino HTTP, `SET WRITE_BRANCH` travels as the `iceberg.write_branch` session property, `USE` no longer fails on the coordinator, and an unqualified time-travel table resolves in the session schema
 - **PREPARE / EXECUTE / DEALLOCATE** round-trip, `information_schema` scoped to the session catalog, `DESCRIBE` aliased to `SHOW COLUMNS`
 - ~96% function/feature coverage per [Trino Compatibility](../features/trino-compatibility.md)
 
