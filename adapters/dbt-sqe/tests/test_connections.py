@@ -1,11 +1,14 @@
 """#771/#772: DDL goes through ExecuteUpdate, queries and DML through ExecuteQuery."""
 
 import decimal
+import sys
+import types
 
 import pyarrow as pa
 import pytest
 
-from dbt.adapters.sqe.connections import SQEConnectionManager, _Cursor
+from dbt.adapters.sqe.connections import SQEConnectionManager, SQECredentials, _Cursor
+from dbt_common.exceptions import DbtRuntimeError
 
 
 class FakeCursor:
@@ -188,6 +191,60 @@ def test_open_connects_with_autocommit(monkeypatch):
 
     assert connection.state == "open"
     assert seen["autocommit"] is True
+
+
+def _open_with(monkeypatch, credentials):
+    seen = {}
+
+    def fake_connect(**kwargs):
+        seen.update(kwargs)
+        return object()
+
+    fake = types.ModuleType("adbc_driver_flightsql.dbapi")
+    fake.connect = fake_connect
+    monkeypatch.setitem(sys.modules, "adbc_driver_flightsql.dbapi", fake)
+    connection = types.SimpleNamespace(state="init", handle=None, credentials=credentials)
+    SQEConnectionManager.open(connection)
+    return connection, seen
+
+
+SCOPE = "zz-scope-marker-772"  # gitleaks:allow
+
+
+def test_open_sends_call_headers_beside_the_token(monkeypatch):
+    creds = SQECredentials(host="sqe", port=50051, database="c", schema="s", tls=False, token="run-token",
+                           call_headers={"x-portal-catalog-scope": SCOPE})
+    connection, seen = _open_with(monkeypatch, creds)
+    assert connection.state == "open"
+    assert seen["db_kwargs"] == {
+        "adbc.flight.sql.authorization_header": "Bearer run-token",
+        "adbc.flight.sql.rpc.call_header.x-portal-catalog-scope": SCOPE,
+    }
+
+
+def test_a_refused_call_header_fails_the_connection_without_its_value(monkeypatch):
+    creds = SQECredentials(host="sqe", port=50051, database="c", schema="s", tls=False,
+                           call_headers={"authorization": "Bearer " + SCOPE})
+    try:
+        _open_with(monkeypatch, creds)
+    except DbtRuntimeError as e:
+        assert "authorization" in str(e) and SCOPE not in str(e)
+    else:
+        raise AssertionError("expected the connection to fail")
+
+
+def test_call_header_values_stay_out_of_debug_output_and_repr():
+    creds = SQECredentials(host="sqe", port=50051, database="c", schema="s",
+                           call_headers={"x-portal-catalog-scope": SCOPE})
+    assert "call_headers" not in creds._connection_keys()
+    assert SCOPE not in repr(creds)
+    assert SCOPE not in str(dict(creds.connection_info()))
+
+
+def test_call_headers_load_from_a_profile_dict():
+    creds = SQECredentials.from_dict({"host": "sqe", "port": 50051, "database": "c", "schema": "s",
+                                      "call_headers": {"x-portal-catalog-scope": SCOPE}})
+    assert creds.call_headers == {"x-portal-catalog-scope": SCOPE}
 
 
 # ── Scoped transaction around a multi-statement write (delete+insert) ─────
