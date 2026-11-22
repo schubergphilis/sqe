@@ -21,7 +21,7 @@ The orchestrator mints the job a token issued to its runs client (`sub` is the p
 | `catalogs` | Object of catalog name to `read_write` or `read_only` |
 | `exp` | Expiry; a leeway of `leeway_secs` (default 30) applies |
 
-The client sends it in the `x-sqe-catalog-scope` HTTP header on the Trino path, or as Flight SQL call metadata under the same key. The name is configurable with `header_name`. SQE verifies the signature against the issuer's JWKS and checks the binding and the expiry. A session of that client without a valid scope is refused with the reason, and the refusal is written to the audit log. The refusal also holds on protocols that cannot carry the header (MCP, Quack): such a session never gets a query context.
+The client sends it in the `x-sqe-catalog-scope` HTTP header on the Trino path, or as Flight SQL call metadata under the same key. The name is configurable with `header_name`: an orchestrator that already sends the scope under its own header name sets `header_name` to that name, and the Flight SQL metadata key follows it. SQE verifies the signature against the issuer's JWKS and checks the binding and the expiry. A session of that client without a valid scope is refused with the reason, and the refusal is written to the audit log. The refusal also holds on protocols that cannot carry the header (MCP, Quack): such a session never gets a query context.
 
 A scoped session:
 
@@ -29,6 +29,23 @@ A scoped session:
 - lists only them in `SHOW CATALOGS`, and can only select them with `USE`, `SET CATALOG` or `X-Trino-Catalog`;
 - cannot run `ATTACH` / `DETACH`, `CREATE` / `DROP SECRET`, `SHOW SECRETS`, `GRANT` / `REVOKE` / `DENY`, policy DDL or tag and masking-policy statements;
 - cannot write into a `read_only` catalog. The catalog layer refuses every commit there, as a backstop under the statement checks.
+
+A refused statement is audited with the reason as its `error_type`: `catalog_not_in_workspace` for a catalog outside the scope, `catalog_read_only` for a write into a `read_only` one. The client still sees "Catalog 'x' not found" for the first, so a hidden catalog looks exactly like a missing one. The second answers "Catalog 'x' is read-only in this session (catalog_read_only)".
+
+### Modes
+
+`mode` picks how strictly the scope binds. It is server configuration only, so neither a job's code nor a client can change it.
+
+| Session of the configured client | `binding` (default) | `union` | `off` |
+|---|---|---|---|
+| no scope | refused, audited | refused, audited | allowed, unscoped |
+| bad, expired or other-token scope | refused, audited | refused, audited | header ignored |
+| issuer keys unreachable | refused | refused | not fetched |
+| valid scope | listed catalogs only, `read_only` enforced | verified and audited; every catalog the person can see | header ignored |
+
+Sessions of other clients are unchanged in every mode. Without a `[session.catalog_scope]` section the feature is off. `binding` and `union` refuse to start without `client_id`, `issuer` and `jwks_url`. The coordinator logs the active mode at startup, as a warning when a configured section sets `union` or `off`.
+
+`union` still requires a valid scope on the doors that can carry one (Trino HTTP, Flight SQL), but it does not narrow the session. Because no session is bound, MCP and Quack sessions of the client are not refused at context build in `union`, as they are in `binding`. Use `union` while an orchestrator rolls out scopes, and `binding` once every job sends one.
 
 The person stays the identity end to end. The bearer goes to Polaris and S3 exactly as it would without a scope, so grants still decide access inside the scope. The scope only narrows what the user can reach in this session; it never widens it. Tokens of every other client are unchanged.
 
@@ -39,6 +56,7 @@ issuer = "https://orchestrator.example.com"  # iss of the scope JWS
 jwks_url = "https://orchestrator.example.com/.well-known/jwks.json"
 # header_name = "x-sqe-catalog-scope"
 # leeway_secs = 30
+# mode = "binding"                     # binding | union | off
 ```
 
 ## The metadata boundary: gated per user

@@ -4545,7 +4545,12 @@ fn bridge_error(e: SqeError) -> iceberg::Error {
         SqeError::CatalogHttp { status, .. } => Some(*status),
         _ => None,
     };
-    let bridged = iceberg::Error::new(iceberg::ErrorKind::Unexpected, e.to_string());
+    let mut bridged = iceberg::Error::new(iceberg::ErrorKind::Unexpected, e.to_string());
+    // A catalog scope refusal keeps its reason across the bridge, so the
+    // audit record still names it (#295).
+    if let Some(reason) = sqe_core::catalog_scope::ScopeReason::of(&e) {
+        bridged = bridged.with_source(reason);
+    }
     match status {
         Some(status) => bridged.with_context("status", status.to_string()),
         None => bridged,

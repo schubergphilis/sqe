@@ -311,7 +311,13 @@ impl CatalogOps {
                 );
                 Ok(())
             }
-            Err(e) => Err(SqeError::Catalog(format!("Failed to drop table: {e}"))),
+            Err(e) => {
+                let msg = format!("Failed to drop table: {e}");
+                Err(sqe_core::catalog_scope::keep_scope_reason(
+                    &e,
+                    SqeError::Catalog(msg),
+                ))
+            }
         }
     }
 
@@ -367,7 +373,13 @@ impl CatalogOps {
                     )))
                 }
                 Err(e) if is_table_not_found(&e) => return Ok(None),
-                Err(e) => return Err(SqeError::Catalog(format!("Failed to drop table: {e}"))),
+                Err(e) => {
+                    let msg = format!("Failed to drop table: {e}");
+                    return Err(sqe_core::catalog_scope::keep_scope_reason(
+                        &e,
+                        SqeError::Catalog(msg),
+                    ));
+                }
             }
         }
         Ok(Some(TableRef {

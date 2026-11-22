@@ -16,16 +16,18 @@
 use std::sync::{Arc, RwLock};
 
 use sqe_auth::catalog_scope_verifier::CatalogScopeVerifier;
-use sqe_core::catalog_scope::refused_in_scoped_session;
-use sqe_core::config::CatalogScopeConfig;
+use sqe_core::catalog_scope::{refused_in_scoped_session, ScopeReason};
+use sqe_core::config::{CatalogScopeConfig, CatalogScopeMode};
 use sqe_core::{Session, SqeError};
 use sqe_metrics::audit::{Actor, AuditEvent, AuditKind, AuditLogger, Integrity, Outcome};
 use sqe_sql::StatementKind;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 struct Gate {
     verifier: CatalogScopeVerifier,
     audit: Option<Arc<AuditLogger>>,
+    /// `Binding` or `Union`; `Off` installs no gate.
+    mode: CatalogScopeMode,
 }
 
 static GATE: RwLock<Option<Arc<Gate>>> = RwLock::new(None);
@@ -35,12 +37,20 @@ fn current() -> Option<Arc<Gate>> {
 }
 
 /// Install (or, with `None`, remove) the gate. Called once at coordinator
-/// startup from `[session.catalog_scope]`; also records the scoped client in
-/// `sqe-core` so the fail-closed check at context build knows it.
+/// startup from `[session.catalog_scope]`, and logs the active mode.
+///
+/// - `binding`: the gate verifies and attaches scopes, and the scoped client
+///   is recorded in `sqe-core` so the fail-closed check at context build
+///   knows it.
+/// - `union`: the gate still refuses the client without a valid scope, but
+///   attaches nothing, so the session sees every catalog the person can.
+/// - `off`, or no section: no gate; the scope header is ignored.
 pub fn install(
     config: Option<&CatalogScopeConfig>,
     audit: Option<Arc<AuditLogger>>,
 ) -> Result<(), SqeError> {
+    let configured = config.is_some();
+    let config = config.filter(|c| c.mode != CatalogScopeMode::Off);
     let gate = match config {
         Some(cfg) => {
             let verifier = CatalogScopeVerifier::new(cfg)
@@ -48,15 +58,44 @@ pub fn install(
             if cfg.allow_insecure_jwks {
                 warn!("[session.catalog_scope] allow_insecure_jwks is set: development only");
             }
-            Some(Arc::new(Gate { verifier, audit }))
+            info!(
+                mode = cfg.mode.as_str(),
+                client_id = %cfg.client_id,
+                header = %verifier.header_name(),
+                "catalog scope enforcement"
+            );
+            if cfg.mode == CatalogScopeMode::Union {
+                warn!("[session.catalog_scope] mode = \"union\": scopes are verified but sessions are not narrowed");
+            }
+            Some(Arc::new(Gate {
+                verifier,
+                audit,
+                mode: cfg.mode,
+            }))
         }
-        None => None,
+        None if configured => {
+            warn!("[session.catalog_scope] mode = \"off\": the scope header is ignored");
+            None
+        }
+        None => {
+            info!(mode = "off", "catalog scope enforcement");
+            None
+        }
     };
-    sqe_core::catalog_scope::set_scoped_client(config.map(|c| c.client_id.clone()));
+    sqe_core::catalog_scope::set_scoped_client(
+        config
+            .filter(|c| c.mode == CatalogScopeMode::Binding)
+            .map(|c| c.client_id.clone()),
+    );
     if let Ok(mut slot) = GATE.write() {
         *slot = gate;
     }
     Ok(())
+}
+
+/// The active mode: `Off` when no gate is installed.
+pub fn mode() -> CatalogScopeMode {
+    current().map_or(CatalogScopeMode::Off, |g| g.mode)
 }
 
 /// The header / Flight metadata key carrying the scope, lowercased; `None`
@@ -99,6 +138,14 @@ pub async fn attach(
         return Err(refuse(&gate, &session, client_ip, &reason));
     };
     match gate.verifier.verify(scope, &binding).await {
+        Ok(scope) if gate.mode == CatalogScopeMode::Union => {
+            debug!(
+                user = %session.user.username,
+                catalogs = ?scope.catalog_names().collect::<Vec<_>>(),
+                "catalog scope verified, not attached (union mode)"
+            );
+            Ok(session)
+        }
         Ok(scope) => {
             debug!(
                 user = %session.user.username,
@@ -146,6 +193,34 @@ pub fn check_statement(session: &Session, kind: &StatementKind) -> Result<(), Sq
         _ => return Ok(()),
     };
     Err(refused_in_scoped_session(refused))
+}
+
+/// For a statement that failed to plan in a scoped session: the scope's own
+/// refusal when the statement names a catalog the scope hides, else `None`.
+///
+/// A hidden catalog is never registered, so DataFusion only says "table not
+/// found". This puts the scope's answer in its place: the client still sees
+/// "Catalog 'c' not found", and the audit record names the reason (#295).
+/// Runs on the failure path only.
+pub(crate) fn hidden_catalog_refusal(
+    state: &datafusion::execution::SessionState,
+    session: &Session,
+    sql: &str,
+) -> Option<SqeError> {
+    session.catalog_scope()?;
+    let statement = datafusion::sql::parser::DFParserBuilder::new(sql)
+        .with_dialect(&sqe_sql::ExecutionDialect)
+        .build()
+        .ok()?
+        .parse_statement()
+        .ok()?;
+    state
+        .resolve_table_references(&statement)
+        .ok()?
+        .iter()
+        .filter_map(|table| table.catalog())
+        .find_map(|catalog| session.check_catalog_read(catalog).err())
+        .filter(|e| ScopeReason::of(e).is_some())
 }
 
 fn refuse(gate: &Gate, session: &Session, client_ip: Option<&str>, reason: &str) -> SqeError {

@@ -179,21 +179,85 @@ pub fn scope_required(reason: &str) -> SqeError {
     SqeError::Auth(format!("catalog scope refused: {reason}"))
 }
 
+/// Why a scoped session was refused a catalog (#295). Carried as the source
+/// of the refusal so the audit record names it, with the same wire names as
+/// the Spark side of the workspace binding; the client still sees only
+/// "not found" for a catalog outside the scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeReason {
+    /// The catalog is not in the session's scope.
+    NotInWorkspace,
+    /// A write into a catalog the scope marks `read_only`.
+    ReadOnly,
+}
+
+impl ScopeReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScopeReason::NotInWorkspace => "catalog_not_in_workspace",
+            ScopeReason::ReadOnly => "catalog_read_only",
+        }
+    }
+
+    /// The reason `error` (or any error in its source chain) carries, if it
+    /// is a scope refusal.
+    pub fn of(error: &(dyn std::error::Error + 'static)) -> Option<ScopeReason> {
+        let mut next = Some(error);
+        while let Some(e) = next {
+            if let Some(reason) = e.downcast_ref::<ScopeReason>() {
+                return Some(*reason);
+            }
+            next = e.source();
+        }
+        None
+    }
+}
+
+/// `fallback`, unless `source` carries a catalog scope refusal: then the
+/// fallback's message under the refusal's code, with the reason kept as the
+/// source. For call sites that reword a lower error into text, which would
+/// otherwise drop the reason the audit record names (#295).
+pub fn keep_scope_reason(
+    source: &(dyn std::error::Error + 'static),
+    fallback: SqeError,
+) -> SqeError {
+    match ScopeReason::of(source) {
+        Some(reason) => {
+            let code = match reason {
+                ScopeReason::NotInWorkspace => SqeErrorCode::CatalogNotFound,
+                ScopeReason::ReadOnly => SqeErrorCode::AccessDenied,
+            };
+            SqeError::sourced(code, fallback.to_string(), reason)
+        }
+        None => fallback,
+    }
+}
+
+impl std::fmt::Display for ScopeReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for ScopeReason {}
+
 /// The error a scoped session gets for a catalog outside its scope: the
 /// same answer as a catalog that does not exist, so the reply does not tell
-/// a hidden catalog from a missing one.
+/// a hidden catalog from a missing one. The audit record names the reason.
 pub fn catalog_not_found(catalog: &str) -> SqeError {
-    SqeError::with_code(
+    SqeError::sourced(
         SqeErrorCode::CatalogNotFound,
         format!("Catalog '{catalog}' not found"),
+        ScopeReason::NotInWorkspace,
     )
 }
 
 /// The error for a write into a catalog the scope marks `read_only`.
 pub fn catalog_read_only(catalog: &str) -> SqeError {
-    SqeError::with_code(
+    SqeError::sourced(
         SqeErrorCode::AccessDenied,
-        format!("Catalog '{catalog}' is read-only in this session"),
+        format!("Catalog '{catalog}' is read-only in this session (catalog_read_only)"),
+        ScopeReason::ReadOnly,
     )
 }
 
@@ -302,5 +366,29 @@ mod tests {
         );
         assert_eq!(CatalogAccess::parse("READ_WRITE"), None);
         assert_eq!(CatalogAccess::parse("write"), None);
+    }
+
+    #[test]
+    fn refusals_carry_their_reason_but_not_in_the_message() {
+        let hidden = catalog_not_found("sales");
+        assert_eq!(hidden.error_code(), SqeErrorCode::CatalogNotFound);
+        assert_eq!(hidden.client_message(), "Catalog 'sales' not found");
+        assert_eq!(ScopeReason::of(&hidden), Some(ScopeReason::NotInWorkspace));
+        let read_only = catalog_read_only("sales");
+        assert_eq!(read_only.error_code(), SqeErrorCode::AccessDenied);
+        assert_eq!(
+            read_only.client_message(),
+            "Catalog 'sales' is read-only in this session (catalog_read_only)"
+        );
+        assert_eq!(ScopeReason::of(&read_only), Some(ScopeReason::ReadOnly));
+        assert_eq!(ScopeReason::ReadOnly.as_str(), "catalog_read_only");
+        assert_eq!(
+            ScopeReason::NotInWorkspace.as_str(),
+            "catalog_not_in_workspace"
+        );
+        // Found through a wrapper, as when DataFusion carries it.
+        let wrapped = SqeError::sourced(SqeErrorCode::ExecutionFailed, "outer", hidden);
+        assert_eq!(ScopeReason::of(&wrapped), Some(ScopeReason::NotInWorkspace));
+        assert_eq!(ScopeReason::of(&SqeError::Execution("x".into())), None);
     }
 }

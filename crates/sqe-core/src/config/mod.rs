@@ -18,7 +18,7 @@ mod tags;
 mod tvf_policy;
 
 pub use auth::{AuthConfig, AuthProviderConfig, ExternalAuthConfig};
-pub use catalog_scope::{CatalogScopeConfig, DEFAULT_CATALOG_SCOPE_HEADER};
+pub use catalog_scope::{CatalogScopeConfig, CatalogScopeMode, DEFAULT_CATALOG_SCOPE_HEADER};
 pub use hive::{HiveConfig, HiveRootConfig, HiveRootKind};
 pub use hive_data::{
     configured_hive_prefixes, hive_tvf_overlaps, prefixes_overlap, protect_hive_data_prefixes,
