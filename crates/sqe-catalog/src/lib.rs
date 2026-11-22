@@ -62,6 +62,8 @@ pub mod system_jdbc;
 #[cfg(feature = "rest")]
 pub mod system_metadata;
 #[cfg(feature = "rest")]
+mod system_scope;
+#[cfg(feature = "rest")]
 pub mod table_provider;
 #[cfg(feature = "rest")]
 pub mod tag_views;

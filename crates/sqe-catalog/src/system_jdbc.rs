@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow_array::builder::{BooleanBuilder, Int32Builder, StringBuilder};
 use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
@@ -12,6 +12,7 @@ use tracing::{debug, warn};
 
 use crate::rest_catalog::{listing_error_is_forbidden, SessionCatalog};
 use crate::system_catalog::SystemCatalogEntry;
+use crate::system_scope::{lazy_table, MetaScope, ScopeColumns};
 
 /// Descriptor for a single row in the `system.jdbc.types` table.
 struct JdbcTypeRow {
@@ -129,48 +130,90 @@ impl SchemaProvider for JdbcSchemaProvider {
                 let names: Vec<String> = self.catalogs.iter().map(|e| e.name.clone()).collect();
                 Ok(Some(build_catalogs_table(&names)?))
             }
-            "schemas" => Ok(Some(self.build_schemas_table().await?)),
-            "tables" => Ok(Some(self.build_tables_table().await?)),
-            "columns" => Ok(Some(self.build_columns_table().await?)),
+            // Built when scanned, for the catalog / schema / table the query
+            // filters on: a lookup alone (DataFusion's information_schema
+            // makes one per table) must not walk the warehouse (#939).
+            "schemas" => Ok(Some(lazy_table(
+                Self::schemas_schema(),
+                SCHEMAS_SCOPE,
+                &self.catalogs,
+                Self::schemas_rows,
+            ))),
+            "tables" => Ok(Some(lazy_table(
+                Self::tables_schema(),
+                TABLES_SCOPE,
+                &self.catalogs,
+                Self::tables_rows,
+            ))),
+            "columns" => Ok(Some(lazy_table(
+                Self::columns_schema(),
+                TABLES_SCOPE,
+                &self.catalogs,
+                Self::columns_rows,
+            ))),
             _ => Ok(None),
         }
     }
 }
 
+/// The scope columns of `system.jdbc.schemas`.
+const SCHEMAS_SCOPE: ScopeColumns = ScopeColumns {
+    catalog: "table_catalog",
+    schema: "table_schem",
+    table: None,
+};
+
+/// The scope columns of `system.jdbc.tables` and `system.jdbc.columns`.
+const TABLES_SCOPE: ScopeColumns = ScopeColumns {
+    catalog: "table_cat",
+    schema: "table_schem",
+    table: Some("table_name"),
+};
+
 impl JdbcSchemaProvider {
-    async fn build_schemas_table(&self) -> DFResult<Arc<dyn TableProvider>> {
-        let schema = Arc::new(Schema::new(vec![
+    fn schemas_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
             Field::new("table_schem", DataType::Utf8, false),
             Field::new("table_catalog", DataType::Utf8, false),
-        ]));
+        ]))
+    }
+
+    async fn schemas_rows(
+        catalogs: Vec<SystemCatalogEntry>,
+        scope: MetaScope,
+    ) -> DFResult<RecordBatch> {
+        let schema = Self::schemas_schema();
 
         let mut schem_builder = StringBuilder::new();
         let mut catalog_builder = StringBuilder::new();
 
-        for entry in &self.catalogs {
+        for entry in catalogs.iter().filter(|e| scope.admits_catalog(&e.name)) {
             // Every catalog exposes information_schema.
-            schem_builder.append_value("information_schema");
-            catalog_builder.append_value(&entry.name);
+            if scope.admits_schema("information_schema") {
+                schem_builder.append_value("information_schema");
+                catalog_builder.append_value(&entry.name);
+            }
 
             for (ns, _) in list_namespaces_for(&entry.catalog).await? {
+                if !scope.admits_schema(&ns) {
+                    continue;
+                }
                 schem_builder.append_value(&ns);
                 catalog_builder.append_value(&entry.name);
             }
         }
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        Ok(RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(schem_builder.finish()) as ArrayRef,
                 Arc::new(catalog_builder.finish()) as ArrayRef,
             ],
-        )?;
-
-        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+        )?)
     }
 
-    async fn build_tables_table(&self) -> DFResult<Arc<dyn TableProvider>> {
-        let schema = Arc::new(Schema::new(vec![
+    fn tables_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
             Field::new("table_cat", DataType::Utf8, true),
             Field::new("table_schem", DataType::Utf8, true),
             Field::new("table_name", DataType::Utf8, false),
@@ -181,7 +224,14 @@ impl JdbcSchemaProvider {
             Field::new("type_name", DataType::Utf8, true),
             Field::new("self_referencing_col_name", DataType::Utf8, true),
             Field::new("ref_generation", DataType::Utf8, true),
-        ]));
+        ]))
+    }
+
+    async fn tables_rows(
+        catalogs: Vec<SystemCatalogEntry>,
+        scope: MetaScope,
+    ) -> DFResult<RecordBatch> {
+        let schema = Self::tables_schema();
 
         let mut cat_b = StringBuilder::new();
         let mut schem_b = StringBuilder::new();
@@ -194,8 +244,11 @@ impl JdbcSchemaProvider {
         let mut self_ref_b = StringBuilder::new();
         let mut ref_gen_b = StringBuilder::new();
 
-        for entry in &self.catalogs {
+        for entry in catalogs.iter().filter(|e| scope.admits_catalog(&e.name)) {
             for (ns, ns_ident) in list_namespaces_for(&entry.catalog).await? {
+                if !scope.admits_schema(&ns) {
+                    continue;
+                }
                 let mut rows: Vec<(String, &'static str)> = Vec::new();
                 match entry.catalog.list_tables(&ns_ident).await {
                     Ok(tables) => {
@@ -220,7 +273,7 @@ impl JdbcSchemaProvider {
                         }
                     }
                 }
-                for (name, kind) in &rows {
+                for (name, kind) in rows.iter().filter(|(name, _)| scope.admits_table(name)) {
                     cat_b.append_value(&entry.name);
                     schem_b.append_value(&ns);
                     name_b.append_value(name);
@@ -235,8 +288,8 @@ impl JdbcSchemaProvider {
             }
         }
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        Ok(RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(cat_b.finish()) as ArrayRef,
                 Arc::new(schem_b.finish()) as ArrayRef,
@@ -249,14 +302,12 @@ impl JdbcSchemaProvider {
                 Arc::new(self_ref_b.finish()) as ArrayRef,
                 Arc::new(ref_gen_b.finish()) as ArrayRef,
             ],
-        )?;
-
-        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+        )?)
     }
 
-    async fn build_columns_table(&self) -> DFResult<Arc<dyn TableProvider>> {
+    fn columns_schema() -> SchemaRef {
         // Full JDBC getColumns() schema — all 24 columns that DBeaver/Trino JDBC expects
-        let schema = Arc::new(Schema::new(vec![
+        Arc::new(Schema::new(vec![
             Field::new("table_cat", DataType::Utf8, true),
             Field::new("table_schem", DataType::Utf8, true),
             Field::new("table_name", DataType::Utf8, false),
@@ -281,7 +332,14 @@ impl JdbcSchemaProvider {
             Field::new("source_data_type", DataType::Int32, true),
             Field::new("is_autoincrement", DataType::Utf8, false),
             Field::new("is_generatedcolumn", DataType::Utf8, false),
-        ]));
+        ]))
+    }
+
+    async fn columns_rows(
+        catalogs: Vec<SystemCatalogEntry>,
+        scope: MetaScope,
+    ) -> DFResult<RecordBatch> {
+        let schema = Self::columns_schema();
 
         let mut cat_b = StringBuilder::new();
         let mut schem_b = StringBuilder::new();
@@ -308,8 +366,11 @@ impl JdbcSchemaProvider {
         let mut is_auto_b = StringBuilder::new();
         let mut is_gen_b = StringBuilder::new();
 
-        for entry in &self.catalogs {
+        for entry in catalogs.iter().filter(|e| scope.admits_catalog(&e.name)) {
             for (ns, ns_ident) in list_namespaces_for(&entry.catalog).await? {
+                if !scope.admits_schema(&ns) {
+                    continue;
+                }
                 let tables = match entry.catalog.list_tables(&ns_ident).await {
                     Ok(t) => t,
                     Err(e) if listing_error_is_forbidden(&e) => {
@@ -321,7 +382,7 @@ impl JdbcSchemaProvider {
                     }
                 };
 
-                for table_ident in &tables {
+                for table_ident in tables.iter().filter(|t| scope.admits_table(t.name())) {
                     let full_ident =
                         iceberg::TableIdent::new(ns_ident.clone(), table_ident.name().to_string());
                     let table = match entry.catalog.load_table(&full_ident).await {
@@ -365,8 +426,8 @@ impl JdbcSchemaProvider {
             }
         }
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        Ok(RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(cat_b.finish()) as ArrayRef,
                 Arc::new(schem_b.finish()) as ArrayRef,
@@ -393,9 +454,7 @@ impl JdbcSchemaProvider {
                 Arc::new(is_auto_b.finish()) as ArrayRef,
                 Arc::new(is_gen_b.finish()) as ArrayRef,
             ],
-        )?;
-
-        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+        )?)
     }
 }
 

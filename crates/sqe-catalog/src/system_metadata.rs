@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow_array::builder::StringBuilder;
 use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
@@ -12,6 +12,21 @@ use tracing::{debug, warn};
 
 use crate::rest_catalog::{listing_error_is_forbidden, SessionCatalog};
 use crate::system_catalog::SystemCatalogEntry;
+use crate::system_scope::{lazy_table, MetaScope, ScopeColumns};
+
+/// The scope columns of `table_properties` and `table_comments`.
+const PER_TABLE: ScopeColumns = ScopeColumns {
+    catalog: "catalog_name",
+    schema: "schema_name",
+    table: Some("table_name"),
+};
+
+/// The scope columns of `schema_properties`.
+const PER_SCHEMA: ScopeColumns = ScopeColumns {
+    catalog: "catalog_name",
+    schema: "schema_name",
+    table: None,
+};
 
 /// DataFusion `SchemaProvider` for the virtual `system.metadata` schema.
 ///
@@ -72,9 +87,27 @@ impl SchemaProvider for MetadataSchemaProvider {
                 let names: Vec<String> = self.catalogs.iter().map(|e| e.name.clone()).collect();
                 Ok(Some(build_catalogs_table(&names)?))
             }
-            "table_properties" => Ok(Some(self.build_table_properties_table().await?)),
-            "schema_properties" => Ok(Some(self.build_schema_properties_table().await?)),
-            "table_comments" => Ok(Some(self.build_table_comments_table().await?)),
+            // Built when scanned, for the catalog / schema / table the query
+            // filters on: a lookup alone (DataFusion's information_schema
+            // makes one per table) must not walk the warehouse (#939).
+            "table_properties" => Ok(Some(lazy_table(
+                Self::table_properties_schema(),
+                PER_TABLE,
+                &self.catalogs,
+                Self::table_properties_rows,
+            ))),
+            "schema_properties" => Ok(Some(lazy_table(
+                Self::schema_properties_schema(),
+                PER_SCHEMA,
+                &self.catalogs,
+                Self::schema_properties_rows,
+            ))),
+            "table_comments" => Ok(Some(lazy_table(
+                Self::table_comments_schema(),
+                PER_TABLE,
+                &self.catalogs,
+                Self::table_comments_rows,
+            ))),
             "materialized_views" => Ok(Some(build_materialized_views_table()?)),
             _ => Ok(None),
         }
@@ -104,15 +137,22 @@ impl MetadataSchemaProvider {
             .join(".")
     }
 
-    /// Build `system.metadata.table_properties` — one row per property per table.
-    async fn build_table_properties_table(&self) -> DFResult<Arc<dyn TableProvider>> {
-        let schema = Arc::new(Schema::new(vec![
+    fn table_properties_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
             Field::new("catalog_name", DataType::Utf8, false),
             Field::new("schema_name", DataType::Utf8, false),
             Field::new("table_name", DataType::Utf8, false),
             Field::new("property_name", DataType::Utf8, false),
             Field::new("property_value", DataType::Utf8, true),
-        ]));
+        ]))
+    }
+
+    /// Build `system.metadata.table_properties` — one row per property per table.
+    async fn table_properties_rows(
+        catalogs: Vec<SystemCatalogEntry>,
+        scope: MetaScope,
+    ) -> DFResult<RecordBatch> {
+        let schema = Self::table_properties_schema();
 
         let mut catalog_b = StringBuilder::new();
         let mut schema_b = StringBuilder::new();
@@ -120,10 +160,13 @@ impl MetadataSchemaProvider {
         let mut prop_name_b = StringBuilder::new();
         let mut prop_value_b = StringBuilder::new();
 
-        for entry in &self.catalogs {
+        for entry in catalogs.iter().filter(|e| scope.admits_catalog(&e.name)) {
             let namespaces = Self::list_namespaces_safe(&entry.catalog).await?;
             for ns in &namespaces {
                 let ns_str = Self::namespace_to_string(ns);
+                if !scope.admits_schema(&ns_str) {
+                    continue;
+                }
                 let tables = match entry.catalog.list_tables(ns).await {
                     Ok(t) => t,
                     Err(e) if listing_error_is_forbidden(&e) => {
@@ -135,7 +178,7 @@ impl MetadataSchemaProvider {
                     }
                 };
 
-                for table_ident in &tables {
+                for table_ident in tables.iter().filter(|t| scope.admits_table(t.name())) {
                     let full_ident =
                         iceberg::TableIdent::new(ns.clone(), table_ident.name().to_string());
                     let table = match entry.catalog.load_table(&full_ident).await {
@@ -158,8 +201,8 @@ impl MetadataSchemaProvider {
             }
         }
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        Ok(RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(catalog_b.finish()) as ArrayRef,
                 Arc::new(schema_b.finish()) as ArrayRef,
@@ -167,31 +210,39 @@ impl MetadataSchemaProvider {
                 Arc::new(prop_name_b.finish()) as ArrayRef,
                 Arc::new(prop_value_b.finish()) as ArrayRef,
             ],
-        )?;
+        )?)
+    }
 
-        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    fn schema_properties_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("catalog_name", DataType::Utf8, false),
+            Field::new("schema_name", DataType::Utf8, false),
+            Field::new("property_name", DataType::Utf8, false),
+            Field::new("property_value", DataType::Utf8, true),
+        ]))
     }
 
     /// Build `system.metadata.schema_properties` — one row per property per namespace.
     ///
     /// Uses `get_namespace()` on the inner REST catalog to fetch namespace properties.
-    async fn build_schema_properties_table(&self) -> DFResult<Arc<dyn TableProvider>> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("catalog_name", DataType::Utf8, false),
-            Field::new("schema_name", DataType::Utf8, false),
-            Field::new("property_name", DataType::Utf8, false),
-            Field::new("property_value", DataType::Utf8, true),
-        ]));
+    async fn schema_properties_rows(
+        catalogs: Vec<SystemCatalogEntry>,
+        scope: MetaScope,
+    ) -> DFResult<RecordBatch> {
+        let schema = Self::schema_properties_schema();
 
         let mut catalog_b = StringBuilder::new();
         let mut schema_b = StringBuilder::new();
         let mut prop_name_b = StringBuilder::new();
         let mut prop_value_b = StringBuilder::new();
 
-        for entry in &self.catalogs {
+        for entry in catalogs.iter().filter(|e| scope.admits_catalog(&e.name)) {
             let namespaces = Self::list_namespaces_safe(&entry.catalog).await?;
             for ns in &namespaces {
                 let ns_str = Self::namespace_to_string(ns);
+                if !scope.admits_schema(&ns_str) {
+                    continue;
+                }
                 match entry.catalog.get_namespace(ns).await {
                     Ok(namespace) => {
                         let properties = namespace.properties();
@@ -212,40 +263,48 @@ impl MetadataSchemaProvider {
             }
         }
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        Ok(RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(catalog_b.finish()) as ArrayRef,
                 Arc::new(schema_b.finish()) as ArrayRef,
                 Arc::new(prop_name_b.finish()) as ArrayRef,
                 Arc::new(prop_value_b.finish()) as ArrayRef,
             ],
-        )?;
+        )?)
+    }
 
-        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    fn table_comments_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("catalog_name", DataType::Utf8, false),
+            Field::new("schema_name", DataType::Utf8, false),
+            Field::new("table_name", DataType::Utf8, false),
+            Field::new("comment", DataType::Utf8, true),
+        ]))
     }
 
     /// Build `system.metadata.table_comments` — one row per table.
     ///
     /// Extracts the `"comment"` property from each table's metadata properties.
     /// If no `"comment"` property exists, the comment column is NULL.
-    async fn build_table_comments_table(&self) -> DFResult<Arc<dyn TableProvider>> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("catalog_name", DataType::Utf8, false),
-            Field::new("schema_name", DataType::Utf8, false),
-            Field::new("table_name", DataType::Utf8, false),
-            Field::new("comment", DataType::Utf8, true),
-        ]));
+    async fn table_comments_rows(
+        catalogs: Vec<SystemCatalogEntry>,
+        scope: MetaScope,
+    ) -> DFResult<RecordBatch> {
+        let schema = Self::table_comments_schema();
 
         let mut catalog_b = StringBuilder::new();
         let mut schema_b = StringBuilder::new();
         let mut table_b = StringBuilder::new();
         let mut comment_b = StringBuilder::new();
 
-        for entry in &self.catalogs {
+        for entry in catalogs.iter().filter(|e| scope.admits_catalog(&e.name)) {
             let namespaces = Self::list_namespaces_safe(&entry.catalog).await?;
             for ns in &namespaces {
                 let ns_str = Self::namespace_to_string(ns);
+                if !scope.admits_schema(&ns_str) {
+                    continue;
+                }
                 let tables = match entry.catalog.list_tables(ns).await {
                     Ok(t) => t,
                     Err(e) if listing_error_is_forbidden(&e) => {
@@ -257,7 +316,7 @@ impl MetadataSchemaProvider {
                     }
                 };
 
-                for table_ident in &tables {
+                for table_ident in tables.iter().filter(|t| scope.admits_table(t.name())) {
                     let full_ident =
                         iceberg::TableIdent::new(ns.clone(), table_ident.name().to_string());
                     let table = match entry.catalog.load_table(&full_ident).await {
@@ -280,17 +339,15 @@ impl MetadataSchemaProvider {
             }
         }
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        Ok(RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(catalog_b.finish()) as ArrayRef,
                 Arc::new(schema_b.finish()) as ArrayRef,
                 Arc::new(table_b.finish()) as ArrayRef,
                 Arc::new(comment_b.finish()) as ArrayRef,
             ],
-        )?;
-
-        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+        )?)
     }
 }
 
