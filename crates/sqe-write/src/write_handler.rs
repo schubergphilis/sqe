@@ -2256,7 +2256,7 @@ impl WriteHandler {
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
         policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let (table_name, or_replace, partition_by, trino) = match stmt {
+        let (table_name, or_replace, if_not_exists, partition_by, trino) = match stmt {
             Statement::CreateTable(ct) => {
                 if ct.query.is_none() {
                     return Err(SqeError::with_code(
@@ -2267,6 +2267,7 @@ impl WriteHandler {
                 (
                     &ct.name,
                     ct.or_replace,
+                    ct.if_not_exists,
                     ct.partition_by.as_deref(),
                     // Trino table properties, refused before anything runs (#897).
                     trino_props::TrinoTableOptions::parse(
@@ -2287,6 +2288,15 @@ impl WriteHandler {
         let table_ident = resolve_table_ident(table_name, session)?;
         let namespace = table_ident.namespace().clone();
         let name = table_ident.name().to_string();
+
+        // `CREATE TABLE IF NOT EXISTS ... AS SELECT` on an existing table is a
+        // no-op that reports 0 rows, as in Trino, which does not analyze the
+        // query either. dbt-trino's `on_table_exists = 'skip'` sends exactly
+        // this on every run after the first (#897).
+        if if_not_exists && session_catalog.table_exists(&table_ident).await? {
+            info!(table = %table_ident, "Table already exists, skipping CTAS (IF NOT EXISTS)");
+            return affected_rows_batch(0);
+        }
 
         // Plan the SELECT without executing it; gives us the output schema
         // cheaply. Planning and the policy rewrite are recursive and run on
@@ -15781,6 +15791,41 @@ s3_path_style = true
                 "history kept and extended"
             );
             assert_eq!(rig.scan_id_v(&ident).await, vec![(7, s("z")), (8, s("y"))]);
+        }
+
+        /// #897: `CREATE TABLE IF NOT EXISTS ... AS SELECT` on an existing
+        /// table (dbt-trino `on_table_exists = 'skip'`) is a no-op reporting
+        /// 0 rows, like Trino; it used to fail with "table already exists".
+        /// On a missing table it creates and fills it as a plain CTAS.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn ctas_if_not_exists_skips_an_existing_table() {
+            let rig = SqliteRig::new().await;
+            let h = handler(&rig);
+            let out = run_ctas(
+                &h,
+                &rig,
+                "CREATE TABLE IF NOT EXISTS default.cine AS SELECT * FROM (VALUES (1, 'a')) AS s(id, v)",
+            )
+            .await;
+            assert_eq!(rows_affected(&out), 1);
+            let ident = rig.ident("cine");
+            let before = rig.load(&ident).await;
+
+            let out = run_ctas(
+                &h,
+                &rig,
+                "CREATE TABLE IF NOT EXISTS default.cine AS SELECT * FROM (VALUES (2, 'b')) AS s(id, v)",
+            )
+            .await;
+            assert_eq!(rows_affected(&out), 0);
+            let after = rig.load(&ident).await;
+            assert_eq!(
+                after.metadata().uuid(),
+                before.metadata().uuid(),
+                "same table"
+            );
+            assert_eq!(snapshot_count(&after), snapshot_count(&before), "no commit");
+            assert_eq!(rig.scan_id_v(&ident).await, vec![(1, s("a"))]);
         }
 
         /// A caller with a row filter on the target cannot replace its whole
