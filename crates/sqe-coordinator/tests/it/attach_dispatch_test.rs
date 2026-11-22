@@ -319,7 +319,7 @@ async fn drop_secret_in_use_by_attached_catalog_errors() {
         options: opts,
     };
     catalogs
-        .attach(&stmt, &secrets)
+        .attach(&stmt, &secrets, false)
         .await
         .expect("attach for in-use setup");
 

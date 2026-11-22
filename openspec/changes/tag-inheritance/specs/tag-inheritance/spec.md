@@ -45,3 +45,28 @@ The tag authority SHALL decide a tag write on the tags written at that level. A 
 #### Scenario: Untagging a column under a tagged table
 - **WHEN** `ns.t` carries `pii` and a steward unsets the column tag `fin` on `ssn`
 - **THEN** the removal check considers `fin` only
+
+### Requirement: Columns inherit their schema's tags when enabled
+With `policy.inherit_schema_tags = true`, a column's effective tags SHALL also hold every tag of its schema whose key neither the column nor its table carries. With the flag off (the default), schema tags SHALL NOT affect enforcement and SQE SHALL NOT read them when planning a query.
+
+#### Scenario: Flag off ignores schema tags
+- **WHEN** a tag policy nullifies `pii`, `inherit_schema_tags` is off and an admin runs `ALTER SCHEMA ns SET TAGS ('pii')`
+- **THEN** the columns of every table in `ns` read their values
+
+#### Scenario: A schema tag masks every table in the schema
+- **WHEN** `inherit_schema_tags` is on, a tag policy nullifies `pii` and `ns` carries `pii`
+- **THEN** every column of every table in `ns` reads as NULL, including a table created after the tag
+- **AND** a second session that read a table before the tag was set reads NULL on its next statement
+- **AND** after `ALTER SCHEMA ns UNSET TAGS ('pii')` the columns read their values again
+
+#### Scenario: The nearest key wins
+- **WHEN** `ns` carries `owner = finance`, `ns.t` carries `owner = risk`
+- **THEN** the effective tags of every column of `ns.t` hold `owner = risk` once
+
+#### Scenario: Unreadable schema tags fail closed
+- **WHEN** `inherit_schema_tags` is on and `sqe.schema-tags` on `ns` is malformed, or the caller may not read the namespace
+- **THEN** every read of a table in `ns` is refused with "tag state unknown"
+
+#### Scenario: Schema row filters apply to writes
+- **WHEN** `inherit_schema_tags` is on and a tag row filter `id > 1` matches the schema tag `eu`
+- **THEN** `UPDATE` and `DELETE` on a table in the schema leave the row with id 1 unchanged

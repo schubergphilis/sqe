@@ -2507,6 +2507,16 @@ pub struct PolicyConfig {
     /// most-specific-rule-wins reading SQE shipped before.
     #[serde(default)]
     pub mask_precedence: MaskPrecedence,
+    /// A schema's tags (`ALTER SCHEMA ... SET TAGS`) apply to every column of
+    /// its tables, like a table's tags do. Off by default: SQE then reads no
+    /// schema property when it plans a query. Turn it on once the tools that
+    /// manage schema tags know that a schema tag now masks data. With it on,
+    /// a schema whose tags cannot be read (403, error, malformed) refuses
+    /// every read of its tables.
+    ///
+    /// Can be set via the `SQE_POLICY__INHERIT_SCHEMA_TAGS` environment variable.
+    #[serde(default)]
+    pub inherit_schema_tags: bool,
 }
 
 /// Resolution order for a column that a resource mask and a tag mask both cover.
@@ -9738,6 +9748,44 @@ warehouse = "wh"
             from_env.unwrap().policy.ranger.catalog_scoped,
             "env override"
         );
+    }
+
+    /// `policy.inherit_schema_tags`: off by default, settable in TOML and
+    /// through `SQE_POLICY__INHERIT_SCHEMA_TAGS`.
+    #[test]
+    fn inherit_schema_tags_loads_from_toml_and_env() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("SQE_POLICY__INHERIT_SCHEMA_TAGS");
+        assert!(!load_with_env().policy.inherit_schema_tags, "default off");
+
+        let from_toml = SqeConfig::load_from_str(
+            &(MINIMAL_TOML.to_string() + "[policy]\ninherit_schema_tags = true\n"),
+        )
+        .unwrap();
+        assert!(from_toml.policy.inherit_schema_tags, "TOML key");
+
+        std::env::set_var("SQE_POLICY__INHERIT_SCHEMA_TAGS", "true");
+        let from_env = SqeConfig::load_from_str(MINIMAL_TOML);
+        std::env::remove_var("SQE_POLICY__INHERIT_SCHEMA_TAGS");
+        assert!(from_env.unwrap().policy.inherit_schema_tags, "env override");
+    }
+
+    /// `[policy]` keys take their snake spelling only. A kebab
+    /// `mask-precedence` is dropped without an error (the table has no
+    /// `deny_unknown_fields`), so the docs must write `mask_precedence`.
+    #[test]
+    fn policy_mask_precedence_takes_the_snake_spelling_only() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let snake = SqeConfig::load_from_str(
+            &(MINIMAL_TOML.to_string() + "[policy]\nmask_precedence = \"refuse\"\n"),
+        )
+        .unwrap();
+        assert_eq!(snake.policy.mask_precedence, MaskPrecedence::Refuse);
+        let kebab = SqeConfig::load_from_str(
+            &(MINIMAL_TOML.to_string() + "[policy]\nmask-precedence = \"refuse\"\n"),
+        )
+        .unwrap();
+        assert_eq!(kebab.policy.mask_precedence, MaskPrecedence::Tag);
     }
 
     /// Every multi-word `[policy.ranger]` key took only its kebab spelling, so

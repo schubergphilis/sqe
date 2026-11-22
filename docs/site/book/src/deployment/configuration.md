@@ -247,6 +247,13 @@ backend = "none"                # none (default) | polaris | ranger | chameleon
 # Fine-grained enforcement engine (row filters + column masks).
 # One of: passthrough (default), in-memory, ranger.
 engine = "passthrough"
+# Which mask wins on a column a resource mask and a tag mask both cover:
+# tag (default), resource or refuse.
+mask_precedence = "tag"
+# A schema's tags (ALTER SCHEMA ... SET TAGS) apply to every column of its
+# tables. Off by default; with it on, a schema whose tags cannot be read
+# refuses every read of its tables.
+inherit_schema_tags = false
 
 [session]
 idle_timeout_secs = 900         # 15 min, sessions idle longer are expired
@@ -486,6 +493,8 @@ Every config field can be overridden via environment variable. Convention: `SQE_
 | `SQE_STORAGE__S3_PATH_STYLE` | `storage.s3_path_style` | bool |
 | **Policy** | | |
 | `SQE_POLICY__ENGINE` | `policy.engine` | string |
+| `SQE_POLICY__MASK_PRECEDENCE` | `policy.mask_precedence` | string |
+| `SQE_POLICY__INHERIT_SCHEMA_TAGS` | `policy.inherit_schema_tags` | bool |
 | **Session** | | |
 | `SQE_SESSION__IDLE_TIMEOUT_SECS` | `session.idle_timeout_secs` | u64 |
 | `SQE_SESSION__ABSOLUTE_TIMEOUT_SECS` | `session.absolute_timeout_secs` | u64 |

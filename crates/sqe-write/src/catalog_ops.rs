@@ -12,6 +12,7 @@ use sqlparser::ast::{
 };
 use tracing::{error, info};
 
+use sqe_catalog::schema_tags::SchemaTagState;
 use sqe_catalog::{SessionCatalog, TableMetadataCache};
 use sqe_core::json_columns::JsonColumnChange;
 use sqe_core::{Session, SqeConfig, SqeError, SqeErrorCode};
@@ -2224,9 +2225,23 @@ impl CatalogOps {
         let session_catalog = self.session_catalog_for(session, target.as_deref()).await?;
         let table = session_catalog.load_table(&table_ident).await?;
         let metadata = table.metadata();
+        // Schema tags join the chain when inherited; unreadable means unknown (#924).
+        let schema_tags = match session_catalog
+            .schema_tag_state(&table_ident.namespace)
+            .await
+        {
+            SchemaTagState::NotInherited => Vec::new(),
+            SchemaTagState::Known(tags) => tags,
+            SchemaTagState::Unknown => {
+                let msg =
+                    format!("schema tags of '{table_ident}' could not be read: tag state unknown");
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, msg));
+            }
+        };
         let tags = crate::tag_source_impl::effective_column_tags(
             metadata.properties(),
             metadata.current_schema(),
+            &schema_tags,
         )
         .map_err(|e| {
             SqeError::with_code(

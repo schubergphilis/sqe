@@ -202,10 +202,14 @@ impl QueryHandler {
             "Time travel (FOR VERSION AS OF): pinned snapshot"
         );
 
-        let provider = sqe_catalog::table_provider::SqeTableProvider::try_new(iceberg_table)
-            .await?
-            .with_snapshot_id(snapshot_id)
-            .with_prefetch_concurrency(prefetch_concurrency);
+        let schema_tags = session_catalog
+            .schema_tag_state(&table_ident.namespace)
+            .await;
+        let provider =
+            sqe_catalog::table_provider::SqeTableProvider::try_new(iceberg_table, schema_tags)
+                .await?
+                .with_snapshot_id(snapshot_id)
+                .with_prefetch_concurrency(prefetch_concurrency);
 
         let alias = format!("__sqe_ver_{}_{}", bare_table, uuid::Uuid::now_v7().simple());
         let qualified = format!("datafusion.public.{alias}");
@@ -298,11 +302,16 @@ impl QueryHandler {
 
                 // Build a snapshot-pinned SqeTableProvider and register it
                 // under a unique alias under datafusion.public.
-                let provider =
-                    sqe_catalog::table_provider::SqeTableProvider::try_new(iceberg_table)
-                        .await?
-                        .with_snapshot_id(snapshot_id)
-                        .with_prefetch_concurrency(prefetch_concurrency);
+                let schema_tags = session_catalog
+                    .schema_tag_state(&table_ident.namespace)
+                    .await;
+                let provider = sqe_catalog::table_provider::SqeTableProvider::try_new(
+                    iceberg_table,
+                    schema_tags,
+                )
+                .await?
+                .with_snapshot_id(snapshot_id)
+                .with_prefetch_concurrency(prefetch_concurrency);
 
                 let alias = format!("__sqe_tt_{}_{}", bare_table, uuid::Uuid::now_v7().simple());
                 let qualified = format!("datafusion.public.{alias}");
@@ -391,7 +400,7 @@ impl QueryHandler {
         let reference = TableReference::from(spec.table.as_str());
         let bare_table = reference.table().to_string();
         let planned = ctx.table_provider(reference).await?;
-        let iceberg_table = (planned.as_ref() as &dyn std::any::Any)
+        let planned_provider = (planned.as_ref() as &dyn std::any::Any)
             .downcast_ref::<sqe_catalog::table_provider::SqeTableProvider>()
             .ok_or_else(|| {
                 SqeError::with_code(
@@ -401,9 +410,11 @@ impl QueryHandler {
                         spec.table
                     ),
                 )
-            })?
-            .table()
-            .clone();
+            })?;
+        let iceberg_table = planned_provider.table().clone();
+        // The planned scan already read the schema tags; the incremental
+        // provider answers the policy rewriter with the same state (#924).
+        let schema_tags = planned_provider.schema_tags().clone();
 
         // Plan the range. `plan_incremental` also calls `resolve_range`
         // internally, so range validation happens once.
@@ -454,6 +465,7 @@ impl QueryHandler {
         .with_table_properties(
             iceberg_table.metadata().properties().clone(),
             iceberg_table.metadata().current_schema().clone(),
+            schema_tags,
         );
 
         // Register under a unique alias in the `datafusion.public` schema,

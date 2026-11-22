@@ -105,6 +105,7 @@ impl RuntimeCatalogRegistry {
         &self,
         stmt: &AttachStatement,
         secrets: &SecretStore,
+        inherit_schema_tags: bool,
     ) -> Result<(), String> {
         refuse_reserved_catalog_name(&stmt.name)?;
         // 1) Refuse duplicate name (case-sensitive). Checks BOTH lanes: the
@@ -151,9 +152,8 @@ impl RuntimeCatalogRegistry {
         let provider: Arc<dyn CatalogProvider> = Arc::new(
             WritableIcebergCatalog::try_new(catalog.clone())
                 .await
-                .map_err(|e| {
-                    format!("failed to wrap catalog '{}' for DataFusion: {e}", stmt.name)
-                })?,
+                .map_err(|e| format!("failed to wrap catalog '{}' for DataFusion: {e}", stmt.name))?
+                .with_inherit_schema_tags(inherit_schema_tags),
         );
 
         // 4) Capture the optional SECRET reference so DROP SECRET can
@@ -692,7 +692,7 @@ mod hive_lane_tests {
             options: std::collections::BTreeMap::new(),
         };
         let err = registry
-            .attach(&attach_stmt, &secrets)
+            .attach(&attach_stmt, &secrets, false)
             .await
             .expect_err("must not shadow an attached hive root");
         assert!(err.contains("already attached"), "{err}");

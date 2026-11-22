@@ -408,7 +408,7 @@ returns a three-tuple:
 locked precedence contract:
 
 1. **Restricted columns always win.** A tag cannot un-restrict a column.
-2. **Tag masks win over resource masks, by default.** `policy.mask-precedence`
+2. **Tag masks win over resource masks, by default.** `policy.mask_precedence`
    selects this: `tag` (the default) matches the standard Ranger plugin order
    that Hive and Spark/Kyuubi implement, so one policy set renders one value in
    every engine. `resource` keeps the narrower most-specific-rule-wins reading

@@ -135,8 +135,14 @@ pub fn build_policy_enforcer(
             // `NoopTagSource` (already the default; this block is explicit for
             // clarity).
             if let Some(cache) = table_cache {
-                let iceberg: Arc<dyn sqe_policy::TagSource> =
-                    Arc::new(crate::tag_source_impl::CacheTagSource::new(Arc::new(cache)));
+                // With schema tags inherited the cache cannot answer (it has
+                // no namespace properties), so the source reports unknown
+                // and only the scan hook, which sees them, resolves tags
+                // (#924).
+                let iceberg: Arc<dyn sqe_policy::TagSource> = Arc::new(
+                    crate::tag_source_impl::CacheTagSource::new(Arc::new(cache))
+                        .with_inherit_schema_tags(config.inherit_schema_tags),
+                );
                 // Wrap unconditionally, and let the router read the live
                 // `hive_catalogs` set on every call. Deciding here whether to
                 // wrap based on `hive_catalogs.is_empty()` would bake in
