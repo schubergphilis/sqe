@@ -14375,6 +14375,7 @@ s3_path_style = true
     #[cfg(feature = "test-sqlite")]
     mod committing {
         mod format_version;
+        mod schema_tag_projection;
         mod shape_replace;
         mod tag_guard;
 

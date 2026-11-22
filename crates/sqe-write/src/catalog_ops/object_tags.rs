@@ -77,6 +77,11 @@ pub(crate) fn union(a: &[String], b: &[String]) -> Vec<String> {
     all
 }
 
+/// The same keys, in any order.
+fn same_set(a: &[String], b: &[String]) -> bool {
+    a.iter().all(|k| b.contains(k)) && b.iter().all(|k| a.contains(k))
+}
+
 impl CatalogOps {
     /// Write the tags of the table, schema or catalog `stmt` names.
     pub async fn set_object_tags(
@@ -272,7 +277,21 @@ impl CatalogOps {
         let mut during = Vec::new();
         if let Some((catalog, before, after)) = &projection {
             let key = schema_key(catalog, &namespace);
-            let held = self.tag_load_memory.schema_held(&key);
+            // Read from Ranger, not from this process's memory: another
+            // coordinator may have removed a key this one remembers, and a
+            // skip on memory would then leave the schema unmasked in Spark.
+            let held = self
+                .held_schema_keys(catalog, &namespace)
+                .await
+                .map_err(|e| {
+                    SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!(
+                            "could not read the tags Ranger holds for {on} ({e}); \
+                             nothing was changed"
+                        ),
+                    )
+                })?;
             during = union(&union(&held, before), after);
             if during.len() > held.len() {
                 let run = self.project_schema_keys(catalog, &namespace, &[], &during);
@@ -285,8 +304,8 @@ impl CatalogOps {
                         ),
                     )
                 })?;
-                self.tag_load_memory.record_schema(key, during.clone());
             }
+            self.tag_load_memory.record_schema(key, during.clone());
         }
         session_catalog
             .update_namespace(
@@ -295,7 +314,7 @@ impl CatalogOps {
             )
             .await?;
         if let Some((catalog, _, after)) = &projection {
-            if during != *after {
+            if !same_set(&during, after) {
                 let prev = if after.is_empty() { &during[..] } else { &[] };
                 match self
                     .project_schema_keys(catalog, &namespace, prev, after)

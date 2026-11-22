@@ -83,6 +83,10 @@ pub struct CatalogOps {
     /// Every operation runs against this catalog instead of one built from
     /// the session. The embedded CLI holds its catalogs itself.
     fixed_catalog: Option<Arc<SessionCatalog>>,
+    /// Counts Ranger tag projection failures; `None` in tests and the CLI.
+    metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
+    /// The projector came from `with_tag_projector`; `with_metrics` keeps it.
+    projector_injected: bool,
 }
 
 /// A table's live `sqe.column-tags`, or why it does not parse as a tag map.
@@ -90,7 +94,7 @@ pub type LiveTagMap = Result<ColumnTagMap, serde_json::Error>;
 
 impl CatalogOps {
     pub fn new(config: SqeConfig) -> Self {
-        let tag_projector = Self::build_tag_projector(&config);
+        let tag_projector = Self::build_tag_projector(&config, None);
         Self {
             config,
             table_cache: None,
@@ -99,7 +103,20 @@ impl CatalogOps {
             tag_load_memory: Default::default(),
             catalog_discovery: None,
             fixed_catalog: None,
+            metrics: None,
+            projector_injected: false,
         }
+    }
+
+    /// Count tag projection failures in `metrics`
+    /// (`sqe_tag_projection_failures_total`).
+    #[must_use = "with_metrics consumes self; bind the returned ops"]
+    pub fn with_metrics(mut self, metrics: Arc<sqe_metrics::MetricsRegistry>) -> Self {
+        if !self.projector_injected {
+            self.tag_projector = Self::build_tag_projector(&self.config, Some(metrics.clone()));
+        }
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Run every operation against `catalog`, whatever the statement's
@@ -125,13 +142,17 @@ impl CatalogOps {
     /// log line says so.
     fn build_tag_projector(
         config: &SqeConfig,
+        metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
     ) -> StdArc<dyn sqe_policy::tag_projector::TagProjector> {
         use sqe_policy::tag_projector::{NoopTagProjector, RangerTagProjector};
         if !config.policy.ranger.project_tags {
             return StdArc::new(NoopTagProjector);
         }
         match RangerTagProjector::new(&config.policy.ranger) {
-            Ok(p) => StdArc::new(p),
+            Ok(p) => match metrics {
+                Some(m) => StdArc::new(p.with_metrics(m)),
+                None => StdArc::new(p),
+            },
             Err(e) => {
                 tracing::error!(
                     error = %e,
@@ -151,6 +172,7 @@ impl CatalogOps {
         projector: StdArc<dyn sqe_policy::tag_projector::TagProjector>,
     ) -> Self {
         self.tag_projector = projector;
+        self.projector_injected = true;
         self
     }
 
@@ -167,7 +189,8 @@ impl CatalogOps {
         let (locks, memory) = (self.table_locks.clone(), self.tag_load_memory.clone());
         let scoped = self.catalog_scoped();
         let observer =
-            crate::tag_load_observer::TagLoadObserver::new(projector, scoped, locks, memory);
+            crate::tag_load_observer::TagLoadObserver::new(projector, scoped, locks, memory)
+                .with_metrics(self.metrics.clone());
         self.tag_projector
             .enabled()
             .then(|| Arc::new(observer) as Arc<_>)
@@ -558,7 +581,12 @@ impl CatalogOps {
 
         let bridge = session_catalog.as_catalog();
         match bridge.drop_namespace(&namespace).await {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                let planner =
+                    self.planner_catalog(session, schema_catalog_qualifier(schema_name_obj));
+                self.clear_schema_projection(&planner, &namespace).await;
+                Ok(())
+            }
             Err(e) if if_exists && is_namespace_not_found(&e) => {
                 info!(
                     namespace = ?namespace,
@@ -573,6 +601,49 @@ impl CatalogOps {
             ))),
             Err(e) => Err(SqeError::Catalog(format!("Failed to drop schema: {e}"))),
         }
+    }
+
+    /// After `DROP SCHEMA`: delete the schema-wide Ranger resource its tags
+    /// were projected onto (#935), so a schema created later under the same
+    /// name does not inherit them. Ranger is read, not this process's memory,
+    /// since another coordinator may have written it. A failure only logs:
+    /// the schema is gone, and what is left over-masks, it never unmasks.
+    /// Unscoped, the resource is shared with a same-named schema in another
+    /// catalog; that schema's next load or tag change writes it back.
+    async fn clear_schema_projection(&self, planner: &str, namespace: &NamespaceIdent) {
+        use crate::tag_load_observer::{schema_key, schema_lock_key};
+        if !self.tag_projector.enabled() {
+            return;
+        }
+        let lock = keyed_lock(&self.table_locks, schema_lock_key(planner, namespace));
+        let _guard = lock.lock().await;
+        let held = match self.held_schema_keys(planner, namespace).await {
+            Ok(held) => held,
+            Err(e) => {
+                tracing::error!(
+                    schema = %namespace.to_url_string(),
+                    error = %e,
+                    "the schema was dropped but Ranger's schema-wide tags could not be read; \
+                     they stay until `CALL system.reproject_column_tags`"
+                );
+                return;
+            }
+        };
+        if !held.is_empty() {
+            if let Err(e) = self
+                .project_schema_keys(planner, namespace, &held, &[])
+                .await
+            {
+                tracing::error!(
+                    schema = %namespace.to_url_string(),
+                    error = %e,
+                    "the schema was dropped but Ranger still holds its schema-wide tags"
+                );
+                return;
+            }
+        }
+        self.tag_load_memory
+            .forget_schema(&schema_key(planner, namespace));
     }
 
     /// The `CASCADE` part of `DROP SCHEMA` (#895): drops every view, then

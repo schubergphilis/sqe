@@ -292,6 +292,12 @@ pub struct MetricsRegistry {
     /// bundle download. These never apply unless `groups_claim` is set.
     pub ranger_group_only_items: IntCounter,
 
+    /// `sqe_tag_projection_failures_total{op}` (#935): Ranger tag-store
+    /// calls of the tag projector that failed (`op` is `write` or `read`),
+    /// and tags SQE could not read on table load (`op` is `source`), which
+    /// leave what Ranger holds as it is.
+    pub tag_projection_failures_total: IntCounterVec,
+
     /// Audit events dropped because the writer queue was full or a sink write
     /// failed. Label `reason` is `queue_full`, `io`, or `writer_gone`.
     pub audit_events_dropped_total: IntCounterVec,
@@ -871,6 +877,13 @@ impl MetricsRegistry {
              These never apply unless groups_claim is set on the auth provider.",
         )?;
 
+        let tag_projection_failures_total = register_int_counter_vec(
+            &registry,
+            "sqe_tag_projection_failures_total",
+            "Ranger tag projection failures, by op (write, read, source)",
+            &["op"],
+        )?;
+
         let write_orphan_files_total = register_int_counter_vec(
             &registry,
             "sqe_write_orphan_files_total",
@@ -1126,6 +1139,7 @@ impl MetricsRegistry {
             policy_cache_misses_total,
             policy_circuit_breaker_state,
             ranger_group_only_items,
+            tag_projection_failures_total,
             write_orphan_files_total,
             write_commit_retries_total,
             puffin_sidecar_total,

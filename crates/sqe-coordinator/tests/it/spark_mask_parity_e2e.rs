@@ -1122,6 +1122,26 @@ async fn schema_tags_mask_and_filter_every_table_in_both_engines() {
     };
     agreed_rows(&ctx, "bob", "id, region, amount", "id", all_null).await;
 
+    // Another coordinator removed the schema-wide resource; this one still
+    // remembers it. Setting the same tag again reads Ranger rather than trust
+    // that memory, and writes it back: no Spark fail-open.
+    let held = || ctx.ranger.table_level_tags(HIVE_SERVICE, "ac", "*");
+    ctx.ranger
+        .delete_table_level_tags(HIVE_SERVICE, "ac", "*")
+        .await
+        .expect("delete the schema-wide resource out of band");
+    assert!(held().await.unwrap().is_empty(), "deleted out of band");
+    run(format!(
+        "ALTER SCHEMA {schema} SET TAGS ('parity_schema_pii')"
+    ))
+    .await;
+    assert_eq!(
+        held().await.unwrap(),
+        vec!["parity_schema_pii".to_string()],
+        "SET TAGS must write back what Ranger lost"
+    );
+    agreed_rows(&ctx, "bob", "id, region, amount", "id", all_null).await;
+
     // The repair writes the schema-wide resource too, as one row.
     let batches = run(format!(
         "CALL system.reproject_column_tags(table => '{ORDERS}')"

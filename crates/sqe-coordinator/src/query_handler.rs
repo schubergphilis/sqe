@@ -530,8 +530,11 @@ impl QueryHandler {
         let ticket_signer = Arc::new(crate::ticket_credentials::load_ticket_signer(
             &config.coordinator,
         ));
-        let catalog_ops = CatalogOps::new(config.clone())
+        let mut catalog_ops = CatalogOps::new(config.clone())
             .with_catalog_discovery(Arc::new(crate::session_context::PolarisCatalogDiscovery));
+        if let Some(ref m) = metrics {
+            catalog_ops = catalog_ops.with_metrics(Arc::clone(m));
+        }
         let mut write_handler = WriteHandler::new(config.clone())
             .with_catalog_discovery(Arc::new(crate::session_context::PolarisCatalogDiscovery));
         if let Some(ref m) = metrics {
