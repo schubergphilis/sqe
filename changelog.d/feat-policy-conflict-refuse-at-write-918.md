@@ -1,5 +1,0 @@
-### Added
-
-- `policy.mask-precedence = "refuse"` also refuses the tag write that would create a mask or row filter conflict (#918)
-
-    Under `refuse`, `ALTER TABLE ... SET TAGS`, `MODIFY COLUMN ... SET TAG`, `SET MASKING POLICY` and a raw `sqe.column-tags` property write fail with `ACCESS_DENIED` "tag change refused: it would create a mask conflict on <table>.<column>" (or "a row filter conflict on <table>") when, for some user, role or group a matching Ranger mask or row-filter policy names, the new tags resolve a conflict the old tags did not. Nothing is committed. The message does not name the principal. With `[policy.ranger] catalog_scoped`, tags resolve for the table's catalog as reads resolve them (#919). A write that adds no tag (UNSET) is never refused, and an error reading Ranger refuses the write. Limits: a conflict that needs two roles of one user is not caught at write time (that user's read still fails), and CREATE TABLE / CTAS carrying tags are not checked. `tag` and `resource` modes are unchanged.
