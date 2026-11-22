@@ -47,17 +47,32 @@ impl SessionProperty {
 
 /// Every session property the engine reads. Add a row here when a new
 /// property gains a consumer; nothing else makes `SET SESSION` accept it.
-pub const SESSION_PROPERTIES: &[SessionProperty] = &[SessionProperty {
-    // Read by the write path (`Session::compression_codec`, #353): the
-    // Parquet codec for data files written in this session.
-    name: "iceberg.compression_codec",
-    type_name: "varchar",
-    default: None,
-    description: "Parquet compression codec for files written by this session \
-                  (ZSTD, SNAPPY, LZ4, NONE); the coordinator's configured codec \
-                  applies when unset",
-    allowed_values: &["ZSTD", "SNAPPY", "LZ4", "NONE"],
-}];
+pub const SESSION_PROPERTIES: &[SessionProperty] = &[
+    SessionProperty {
+        // Read by the write path (`Session::compression_codec`, #353): the
+        // Parquet codec for data files written in this session.
+        name: "iceberg.compression_codec",
+        type_name: "varchar",
+        default: None,
+        description: "Parquet compression codec for files written by this session \
+                      (ZSTD, SNAPPY, LZ4, NONE); the coordinator's configured codec \
+                      applies when unset",
+        allowed_values: &["ZSTD", "SNAPPY", "LZ4", "NONE"],
+    },
+    SessionProperty {
+        // Read by the write path (`Session::write_branch`, #829). Set by
+        // `SET WRITE_BRANCH` as well as by `SET SESSION`.
+        name: WRITE_BRANCH,
+        type_name: "varchar",
+        default: None,
+        description: "Branch that data writes outside a transaction commit to \
+                      (SET WRITE_BRANCH); main when unset",
+        allowed_values: &[],
+    },
+];
+
+/// The session property that carries `SET WRITE_BRANCH` on the Trino protocol.
+pub const WRITE_BRANCH: &str = "iceberg.write_branch";
 
 /// Look a property up by exact name (Trino property names are
 /// case-sensitive).

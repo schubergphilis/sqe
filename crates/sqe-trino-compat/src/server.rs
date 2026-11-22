@@ -651,6 +651,9 @@ pub struct TrinoClientHeaders {
     /// `X-Trino-Transaction-Id`, the explicit transaction the client is in.
     /// Clients send `NONE` in autocommit, which reads as `None` (#820).
     pub transaction_id: Option<String>,
+    /// `iceberg.write_branch` from `X-Trino-Session`: the branch a
+    /// `SET WRITE_BRANCH` selected, replayed by the client.
+    pub write_branch: Option<String>,
 }
 
 /// `peer_ip` on both methods is the port-stripped, proxy-resolved client
@@ -1415,13 +1418,32 @@ fn resolve_statement(
     use sqe_sql::{classify_normalized, SqlFrontDoor, StatementKind, WireDialect};
     use sqlparser::ast::{Expr, Statement, Use, Value};
 
+    // `FOR VERSION|TIMESTAMP AS OF` and `FOR INCREMENTAL BETWEEN` are clauses
+    // sqlparser rejects ("Expected: one of UPDATE or SHARE"). The executor
+    // resolves them against the table, as it does for Flight SQL, so they are
+    // stripped here only to classify the statement, and the executor gets the
+    // text the client wrote.
+    let stripped = sqe_sql::extract_incremental_spec(sql).and_then(|(rest, incremental)| {
+        let (rest, versions) = sqe_sql::extract_time_travel_spec(&rest)?;
+        Ok((rest, !incremental.is_empty() || !versions.is_empty()))
+    });
     let door = SqlFrontDoor::new(WireDialect::Trino).with_session_catalog(session_catalog);
-    let normalized = door.normalize(sql).map_err(|e| {
-        on_parse_error(&e);
-        TrinoError::from_sqe_error(&e, Some(query_id))
-    })?;
+    let normalized = stripped
+        .and_then(|(rest, time_travel)| {
+            door.normalize(if time_travel { &rest } else { sql })
+                .map(|n| (n, time_travel))
+        })
+        .map_err(|e| {
+            on_parse_error(&e);
+            TrinoError::from_sqe_error(&e, Some(query_id))
+        });
+    let (normalized, time_travel) = normalized?;
     let facts = StatementFacts::from_normalized(&normalized);
-    let exec_sql = normalized.sql().to_string();
+    let exec_sql = if time_travel {
+        sql.to_string()
+    } else {
+        normalized.sql().to_string()
+    };
 
     // `EXECUTE IMMEDIATE '<sql>' [USING ...]` (Trino JDBC with
     // explicitPrepare=false). sqlparser's Generic dialect reads it as
@@ -1528,6 +1550,20 @@ fn resolve_statement(
                 session_update: Some(update),
             }
         }
+        // `SET WRITE_BRANCH` / `RESET WRITE_BRANCH`. The Trino protocol keeps
+        // session state on the client, so the branch travels as the
+        // `iceberg.write_branch` session property: echoed in
+        // `X-Trino-Set-Session`, replayed in `X-Trino-Session`, and applied
+        // to the session of every later request. The executor refuses a
+        // transaction branch name, whichever way it arrives.
+        StatementKind::SetWriteBranch(Some(branch)) => immediate(protocol::UpdatedSessionState {
+            set_session: vec![(session_props::WRITE_BRANCH.to_string(), branch)],
+            ..Default::default()
+        }),
+        StatementKind::SetWriteBranch(None) => immediate(protocol::UpdatedSessionState {
+            clear_session: vec![session_props::WRITE_BRANCH.to_string()],
+            ..Default::default()
+        }),
         StatementKind::SetCatalog(catalog) => immediate(protocol::UpdatedSessionState {
             set_catalog: Some(catalog),
             ..Default::default()
@@ -1776,11 +1812,18 @@ fn apply_session_headers(
 /// Extract Trino client headers from the HTTP request.
 fn extract_trino_headers(headers: &HeaderMap) -> TrinoClientHeaders {
     // The client replays `SET SESSION` values in `X-Trino-Session`; pick out
-    // `iceberg.compression_codec` so writes in this request honour it (#353).
-    let compression_codec = incoming_session_properties(headers)
-        .into_iter()
-        .find(|(k, _)| k == "iceberg.compression_codec")
-        .map(|(_, v)| v);
+    // `iceberg.compression_codec` (#353) and `iceberg.write_branch` so writes
+    // in this request honour them.
+    let properties = incoming_session_properties(headers);
+    let property = |name: &str| {
+        properties
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .filter(|v| !v.is_empty())
+    };
+    let compression_codec = property("iceberg.compression_codec");
+    let write_branch = property(session_props::WRITE_BRANCH);
     TrinoClientHeaders {
         catalog: extract_header(headers, "x-trino-catalog"),
         schema: extract_header(headers, "x-trino-schema"),
@@ -1789,6 +1832,7 @@ fn extract_trino_headers(headers: &HeaderMap) -> TrinoClientHeaders {
         compression_codec,
         transaction_id: extract_header(headers, "x-trino-transaction-id")
             .filter(|id| !id.eq_ignore_ascii_case("NONE")),
+        write_branch,
     }
 }
 
@@ -1908,7 +1952,10 @@ fn build_show_session_batches(
 }
 
 /// Apply extracted Trino headers to a session (catalog, schema, source).
-fn apply_trino_headers(session: Session, trino_headers: &TrinoClientHeaders) -> Session {
+fn apply_trino_headers(mut session: Session, trino_headers: &TrinoClientHeaders) -> Session {
+    if trino_headers.write_branch.is_some() {
+        session.set_write_branch(trino_headers.write_branch.clone());
+    }
     session
         .with_catalog(trino_headers.catalog.clone())
         .with_schema(trino_headers.schema.clone())
@@ -4148,9 +4195,11 @@ mod tests {
             source: None,
             compression_codec: Some("SNAPPY".to_string()),
             transaction_id: None,
+            write_branch: Some("dev".to_string()),
         };
         let session = apply_trino_headers(session, &trino_headers);
         assert_eq!(session.compression_codec.as_deref(), Some("SNAPPY"));
+        assert_eq!(session.write_branch.as_deref(), Some("dev"));
     }
 
     /// The executor runs the statement under the query id the client was
@@ -4220,6 +4269,95 @@ mod tests {
         let tr: TrinoResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(tr.update_type.as_deref(), Some("SET SESSION"));
         assert_eq!(tr.columns.map(|c| c.len()), Some(0));
+    }
+
+    /// `SET WRITE_BRANCH` works over Trino as over Flight SQL: the branch
+    /// travels as the `iceberg.write_branch` session property the client
+    /// replays, and `RESET WRITE_BRANCH` clears it. Neither executes.
+    #[tokio::test]
+    async fn submit_set_write_branch_echoes_the_session_property() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let state = recording_state(seen.clone());
+
+        let resp = submit_query::<MockAuthOk, RecordingQuery>(
+            State(state.clone()),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            "SET WRITE_BRANCH = 'dev'".to_string(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-trino-set-session")
+                .and_then(|v| v.to_str().ok()),
+            Some("iceberg.write_branch=dev")
+        );
+        let tr = body_json(resp).await;
+        assert!(tr.error.is_none(), "{:?}", tr.error);
+
+        let resp = submit_query::<MockAuthOk, RecordingQuery>(
+            State(state),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            "RESET WRITE_BRANCH".to_string(),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            resp.headers()
+                .get("x-trino-clear-session")
+                .and_then(|v| v.to_str().ok()),
+            Some("iceberg.write_branch")
+        );
+        assert!(seen.lock().is_empty(), "WRITE_BRANCH never executes");
+    }
+
+    /// The replayed `iceberg.write_branch` property lands on the session the
+    /// executor sees.
+    #[test]
+    fn replayed_write_branch_reaches_the_session() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-trino-session",
+            "iceberg.compression_codec=ZSTD,iceberg.write_branch=dev"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            extract_trino_headers(&headers).write_branch.as_deref(),
+            Some("dev")
+        );
+        assert_eq!(extract_trino_headers(&HeaderMap::new()).write_branch, None);
+    }
+
+    /// `FOR VERSION|TIMESTAMP AS OF` used to fail on the Trino path with
+    /// "Expected: one of UPDATE or SHARE": the front door parsed it before
+    /// anything stripped the clause. It now reaches the executor as written,
+    /// where the time-travel resolution runs, as on Flight SQL.
+    #[tokio::test]
+    async fn submit_time_travel_reaches_the_executor_unchanged() {
+        for sql in [
+            "SELECT id FROM iceberg.s.t FOR VERSION AS OF 123",
+            "SELECT id FROM iceberg.s.t FOR VERSION AS OF 'dev'",
+            "SELECT id FROM iceberg.s.t FOR TIMESTAMP AS OF TIMESTAMP '2026-01-01 00:00:00'",
+        ] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let state = recording_state(seen.clone());
+            let resp = submit_query::<MockAuthOk, RecordingQuery>(
+                State(state.clone()),
+                test_peer(),
+                basic_auth_header("alice", "pw"),
+                sql.to_string(),
+            )
+            .await
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::OK, "{sql}");
+            let tr = follow_results(&state, resp).await;
+            assert!(tr.error.is_none(), "{sql}: {:?}", tr.error);
+            assert_eq!(*seen.lock(), vec![sql.to_string()], "{sql}");
+        }
     }
 
     /// Submit `sql` with an optional `X-Trino-Transaction-Id`, returning the
@@ -4685,7 +4823,12 @@ mod tests {
         .await
         .into_response();
         let data = follow_results(&state, resp).await.data.expect("data");
-        assert_eq!(data.len(), 1);
+        assert_eq!(data.len(), session_props::SESSION_PROPERTIES.len());
+        assert!(
+            data.iter()
+                .all(|row| row[0] != serde_json::json!("query_max_run_time")),
+            "{data:?}"
+        );
         assert_eq!(data[0][1], serde_json::json!("LZ4"));
         assert!(seen.lock().is_empty());
     }
@@ -5511,6 +5654,7 @@ mod tests {
             source: Some("trino-jdbc".to_string()),
             compression_codec: None,
             transaction_id: None,
+            write_branch: None,
         };
 
         let session = apply_trino_headers(session, &trino_headers);

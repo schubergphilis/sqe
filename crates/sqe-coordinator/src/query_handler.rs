@@ -1538,7 +1538,16 @@ impl QueryHandler {
                 .write_branch
                 .clone()
                 .filter(|_| txn.is_none())
-                .filter(|_| classify_user_sql(session, sql, &self.upper_case_catalogs()).is_ok_and(|k| k.is_data_write()));
+                .filter(|_| {
+                    classify_user_sql(session, sql, &self.upper_case_catalogs())
+                        .is_ok_and(|k| k.is_data_write())
+                });
+            // `SET WRITE_BRANCH` refuses a transaction branch, but on the
+            // Trino protocol the branch arrives in a client-held session
+            // property that never passed through it.
+            if let Some(branch) = write_branch.as_deref() {
+                sqe_catalog::txn::reject_txn_ref(branch)?;
+            }
             sqe_catalog::txn::write_scope(
                 txn,
                 write_branch,
@@ -2748,16 +2757,23 @@ impl QueryHandler {
                 StatementKind::Use(ref target) => {
                     let (catalog, schema) = parse_use_target(target)?;
                     if let Some(ref manager) = self.session_manager {
-                        let updated = manager.set_default_scope(
-                            &session.id,
-                            catalog.clone(),
-                            schema.clone(),
-                        );
+                        let updated =
+                            manager.set_default_scope(&session.id, catalog.clone(), schema.clone());
                         if !updated {
-                            return Err(SqeError::with_code(
-                                SqeErrorCode::ExecutionFailed,
-                                "USE: session not found in manager".to_string(),
-                            ));
+                            // A Trino HTTP request runs on a session built from
+                            // its headers that the manager never stores; its
+                            // scope travels back as X-Trino-Set-Catalog /
+                            // -Schema, so there is nothing to mutate here.
+                            // A Flight SQL request always gets its session from
+                            // the manager (lookup, or `session_for_bearer`,
+                            // which stores it), so it reaches this branch only
+                            // if the session was ended while USE ran; the next
+                            // request then authenticates afresh anyway.
+                            tracing::debug!(
+                                "USE {target} for a session the manager does not hold; \
+                                 the scope is carried by the protocol layer"
+                            );
+                            return Ok(vec![]);
                         }
                         tracing::info!(
                             username = %session.user.username,

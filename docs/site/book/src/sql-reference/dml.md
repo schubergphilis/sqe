@@ -233,6 +233,8 @@ Iceberg branches let you isolate writes from the production snapshot. SQE expose
 | `SET WRITE_BRANCH = NULL` | Same as `DEFAULT`. |
 | `RESET WRITE_BRANCH` | Same as `DEFAULT`. |
 
+On the Trino HTTP protocol the session lives on the client, so `SET WRITE_BRANCH` comes back as the session property `iceberg.write_branch` (`X-Trino-Set-Session`). The client sends it with every later request, the same way `SET SESSION iceberg.write_branch = 'name'` does.
+
 While a branch is set:
 
 - The branch must already exist on the table being written (`ALTER TABLE ... CREATE BRANCH`). A write to a table without it fails instead of creating it. A table with no snapshot cannot hold a branch, so write its first rows on main.
