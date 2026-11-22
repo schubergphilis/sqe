@@ -32,6 +32,15 @@ Under `ranger-delegate` with `tag_removal = "remove_tag"`, a non-admin statement
 - **WHEN** `tag_removal = "admin"` and a non-admin with every grant runs any removal
 - **THEN** it is refused, and an admin's removal is written
 
+#### Scenario: The removal right cannot be resolved
+- **WHEN** `tag_removal = "remove_tag"` and the policy store fails to answer whether the user holds `remove_tag` (an unreachable Ranger, a servicedef without the type)
+- **THEN** every removal, column or object, in either syntax, is refused as not granted
+- **AND** a statement that only adds tags is not affected
+
+#### Scenario: Databricks column syntax
+- **WHEN** the removal is written `ALTER TABLE ns.t ALTER COLUMN ssn UNSET TAGS ('PII')`
+- **THEN** it takes the same check as `UNSET TAGS (ssn)`
+
 ### Requirement: A removal is re-checked under the table lock
 The locked re-check of a raw `sqe.column-tags` write SHALL refuse the write when, against the map read under the lock, it removes a key from a column the statement was not authorised to remove from, even when the column was authorised as a change.
 

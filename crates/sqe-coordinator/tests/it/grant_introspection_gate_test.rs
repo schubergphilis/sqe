@@ -1841,3 +1841,95 @@ async fn tag_removal_gates_object_untags() {
     let [_, unset] = TABLE_TAG_STMTS;
     assert_refused_by_tag_gate(admin.execute(&bob, unset, None).await, unset);
 }
+
+/// Grants every privilege, but cannot answer for `remove_tag`: the check for
+/// the stronger right fails at the store (an unreachable Ranger, a servicedef
+/// without the type).
+struct RemoveTagUnresolvable;
+
+impl RemoveTagUnresolvable {
+    fn answer(privilege: sqe_policy::TablePrivilege) -> sqe_core::Result<bool> {
+        if privilege == sqe_policy::TablePrivilege::RemoveTag {
+            return Err(sqe_core::SqeError::Execution(
+                "could not evaluate remove_tag: HTTP 503".into(),
+            ));
+        }
+        Ok(true)
+    }
+}
+
+#[async_trait]
+impl PolicyStore for RemoveTagUnresolvable {
+    async fn resolve(
+        &self,
+        _user: &SessionUser,
+        _table_name: &str,
+        _namespace: &str,
+    ) -> sqe_core::Result<ResolvedPolicy> {
+        Ok(ResolvedPolicy::default())
+    }
+
+    fn invalidate_all(&self) {}
+
+    async fn grants_table_privilege(
+        &self,
+        _user: &SessionUser,
+        _table_name: &str,
+        _namespace: &str,
+        privilege: sqe_policy::TablePrivilege,
+    ) -> sqe_core::Result<bool> {
+        Self::answer(privilege)
+    }
+
+    async fn grants_column_privilege(
+        &self,
+        _user: &SessionUser,
+        _table_name: &str,
+        _namespace: &str,
+        _column: &str,
+        privilege: sqe_policy::TablePrivilege,
+    ) -> sqe_core::Result<bool> {
+        Self::answer(privilege)
+    }
+}
+
+/// The stronger right fails closed: when `remove_tag` cannot be resolved,
+/// every untag is refused, in both spellings and on the table itself, while
+/// adding a tag (which never asks for `remove_tag`) still passes.
+#[tokio::test]
+async fn tag_removal_fails_closed_when_remove_tag_cannot_be_resolved() {
+    use sqe_core::config::{TagPrivilege, TagRemoval};
+    let handler = removal_handler(
+        Arc::new(RemoveTagUnresolvable),
+        TagRemoval::RemoveTag,
+        TagPrivilege::ApplyTag,
+    );
+    let steward = session_for("steward", vec!["analyst"]);
+    for sql in [
+        "ALTER TABLE ns.tbl SET TAGS (ssn = ('PII'))",
+        "ALTER TABLE ns.tbl ALTER COLUMN ssn SET TAGS ('PII' = 'restricted')",
+        TABLE_TAG_STMTS[0],
+    ] {
+        assert_passed_tag_gate(handler.execute(&steward, sql, None).await, sql);
+    }
+    let untags = [
+        UNTAG_STMTS[0],
+        UNTAG_STMTS[1],
+        "ALTER TABLE ns.tbl ALTER COLUMN ssn UNSET TAGS ('PII')",
+    ];
+    for sql in untags {
+        let err = handler.execute(&steward, sql, None).await.expect_err(sql);
+        let msg = err.to_string();
+        assert!(msg.contains("403 Forbidden"), "{sql}: {msg}");
+        assert!(
+            msg.contains("requires remove_tag on ns.tbl.ssn"),
+            "{sql}: {msg}"
+        );
+    }
+    let sql = TABLE_TAG_STMTS[1];
+    let err = handler.execute(&steward, sql, None).await.expect_err(sql);
+    assert!(
+        err.to_string().contains("requires remove_tag on ns.tbl"),
+        "{sql}: {err}"
+    );
+}
