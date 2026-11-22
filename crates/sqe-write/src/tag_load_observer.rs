@@ -18,6 +18,13 @@
 //! what Ranger holds, so clearing it on an error would unmask every column
 //! there. The column tags still project.
 //!
+//! With `policy.inherit_schema_tags` on, the schema's tags go onto the
+//! schema-wide resource (`table:*`, #935), which Ranger applies to every
+//! table and column of the schema. From a load this only ever grows: a key
+//! the schema carries that Ranger does not hold yet is added, and nothing is
+//! removed. An unreadable schema keeps what was projected. `ALTER SCHEMA ...
+//! SET TAGS` and `CALL system.reproject_column_tags` are what shrink it.
+//!
 //! The projector writes to Ranger with the coordinator's Ranger credentials,
 //! on behalf of whoever committed the tag to Polaris. That client could
 //! already change what SQE masks; this makes Spark agree.
@@ -28,6 +35,7 @@ use std::sync::{Arc, Mutex};
 use iceberg::table::Table;
 use iceberg::TableIdent;
 use sqe_catalog::load_observer::TableLoadObserver;
+use sqe_catalog::schema_tags::SchemaTagState;
 use sqe_policy::tag_projector::{
     project_table_level_tags, project_table_tags, ColumnTags, TagProjector,
 };
@@ -44,18 +52,46 @@ struct Projected {
     table_tags: Vec<String>,
 }
 
-/// What the observer last projected, per `{catalog}|{ns}.{table}`.
+/// What the observer last projected, per `{catalog}|{ns}.{table}`, and the
+/// schema tag keys the schema-wide resource holds, per
+/// [`schema_key`].
 ///
 /// `CatalogOps` owns it and hands it to the observer, so a DDL statement that
 /// projects a table itself can [`forget`](Self::forget) it (#928). Without
 /// that, a dropped table's remembered tags would make the observer skip a
 /// table recreated under the same name with the same tags.
 #[derive(Clone, Default)]
-pub(crate) struct TagLoadMemory(Arc<Mutex<HashMap<String, Projected>>>);
+pub(crate) struct TagLoadMemory {
+    tables: Arc<Mutex<HashMap<String, Projected>>>,
+    schemas: Arc<Mutex<HashMap<String, Vec<String>>>>,
+}
+
+/// The [`TagLoadMemory`] key of a schema's schema-wide resource.
+pub(crate) fn schema_key(catalog: &str, namespace: &iceberg::NamespaceIdent) -> String {
+    format!("{catalog}|{}", namespace.to_url_string())
+}
+
+/// The lock a schema-wide projection takes, so the observer and `ALTER
+/// SCHEMA` never interleave their writes to it.
+pub(crate) fn schema_lock_key(catalog: &str, namespace: &iceberg::NamespaceIdent) -> String {
+    format!("schema-projection|{}", schema_key(catalog, namespace))
+}
 
 impl TagLoadMemory {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Projected>> {
-        self.0.lock().expect("projected tags mutex poisoned")
+        self.tables.lock().expect("projected tags mutex poisoned")
+    }
+
+    /// The schema tag keys Ranger is known to hold under `key`.
+    pub(crate) fn schema_held(&self, key: &str) -> Vec<String> {
+        let schemas = self.schemas.lock().expect("projected tags mutex poisoned");
+        schemas.get(key).cloned().unwrap_or_default()
+    }
+
+    /// Record what Ranger now holds under `key`.
+    pub(crate) fn record_schema(&self, key: String, tags: Vec<String>) {
+        let mut schemas = self.schemas.lock().expect("projected tags mutex poisoned");
+        schemas.insert(key, tags);
     }
 
     /// Drop what was projected for `ident` in every catalog, so its next
@@ -160,7 +196,15 @@ impl TagLoadObserver {
             }
             Some(now) if now == previous_table => now,
             Some(now) => {
-                let (prev, scoped) = (&previous_table, self.catalog_scoped);
+                // Ranger's add-or-update replaces a resource's tag set, so a
+                // non-empty set is sent alone: a delete first would leave the
+                // table unmasked between the two calls.
+                let prev = if now.is_empty() {
+                    &previous_table[..]
+                } else {
+                    &[]
+                };
+                let scoped = self.catalog_scoped;
                 let projector = self.projector.as_ref();
                 let done =
                     project_table_level_tags(projector, &obs.catalog, ns, name, scoped, prev, &now);
@@ -184,10 +228,79 @@ impl TagLoadObserver {
         };
         self.projected.lock().insert(obs.key, state);
     }
+
+    /// Add the schema tag keys in `now` that Ranger does not hold yet to the
+    /// schema-wide resource. Never removes one: the set sent is what is held
+    /// plus `now`, as one replace. Serialised with `ALTER SCHEMA`'s own.
+    async fn converge_schema(
+        &self,
+        catalog: String,
+        ns: iceberg::NamespaceIdent,
+        now: Vec<String>,
+    ) {
+        let lock = keyed_lock(&self.table_locks, schema_lock_key(&catalog, &ns));
+        let _guard = lock.lock().await;
+        let key = schema_key(&catalog, &ns);
+        let held = self.projected.schema_held(&key);
+        let want = crate::catalog_ops::object_tags::union(&held, &now);
+        if want.len() == held.len() {
+            return;
+        }
+        let (projector, scoped) = (self.projector.as_ref(), self.catalog_scoped);
+        let done =
+            project_table_level_tags(projector, &catalog, ns.as_ref(), "*", scoped, &[], &want);
+        match done.await {
+            Ok(()) => self.projected.record_schema(key, want),
+            Err(e) => tracing::warn!(
+                schema = %ns.to_url_string(),
+                error = %e,
+                "could not project a schema tag found on load into Ranger; \
+                 other engines miss it until the next load retries"
+            ),
+        }
+    }
+
+    /// The schema half of a load: the keys to converge on when the schema
+    /// carries one the schema-wide resource lacks; `None` on an unreadable
+    /// schema, which keeps what is projected.
+    fn schema_change(
+        &self,
+        catalog: &str,
+        ns: &iceberg::NamespaceIdent,
+        schema_tags: &SchemaTagState,
+    ) -> Option<Vec<String>> {
+        let now: Vec<String> = match schema_tags {
+            SchemaTagState::NotInherited => return None,
+            SchemaTagState::Unknown => {
+                tracing::error!(
+                    schema = %ns.to_url_string(),
+                    "cannot read the schema's tags; the schema tags last projected into \
+                     Ranger are kept as they are, and a change to them is not projected"
+                );
+                return None;
+            }
+            SchemaTagState::Known(tags) => tags.iter().map(|t| t.key.clone()).collect(),
+        };
+        let held = self.projected.schema_held(&schema_key(catalog, ns));
+        (!now.iter().all(|k| held.contains(k))).then_some(now)
+    }
 }
 
 impl TableLoadObserver for TagLoadObserver {
-    fn table_loaded(&self, catalog: &str, ident: &TableIdent, table: &Table) {
+    fn table_loaded(
+        &self,
+        catalog: &str,
+        ident: &TableIdent,
+        table: &Table,
+        schema_tags: &SchemaTagState,
+    ) {
+        // Before the table's own early return: a schema tag changes no
+        // table metadata.
+        let ns = ident.namespace();
+        if let Some(now) = self.schema_change(catalog, ns, schema_tags) {
+            let (this, catalog, ns) = (self.clone(), catalog.to_string(), ns.clone());
+            tokio::spawn(async move { this.converge_schema(catalog, ns, now).await });
+        }
         let Some(location) = table.metadata_location() else {
             return;
         };
@@ -392,6 +505,94 @@ mod tests {
         assert!(c[1].1.is_empty() && c[1].2.contains_key("ssn"));
     }
 
+    fn schema(keys: &[&str]) -> SchemaTagState {
+        use sqe_core::column_tags::ColumnTag;
+        SchemaTagState::Known(keys.iter().map(|k| ColumnTag::key(*k)).collect())
+    }
+
+    fn strings(keys: &[&str]) -> Vec<String> {
+        keys.iter().map(ToString::to_string).collect()
+    }
+
+    /// #935: the schema-wide resource is the table `*` of the namespace.
+    #[test]
+    fn the_schema_wide_resource_is_keyed_table_star() {
+        let ns = ["ns".to_string()];
+        let bare = TagTableKey::for_table("cat", &ns, "*", false).unwrap();
+        assert_eq!((bare.database.as_str(), bare.table.as_str()), ("ns", "*"));
+        let scoped = TagTableKey::for_table("cat", &ns, "*", true).unwrap();
+        assert_eq!(
+            (scoped.database.as_str(), scoped.table.as_str()),
+            ("cat.ns", "*")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_schema_key_sends_the_union_as_one_replace() {
+        let (rec, o) = setup();
+        let ns = NamespaceIdent::new("ns".into());
+        let now = o.schema_change("cat", &ns, &schema(&["pii"])).unwrap();
+        o.converge_schema("cat".into(), ns.clone(), now).await;
+        let now = o.schema_change("cat", &ns, &schema(&["eu"])).unwrap();
+        o.converge_schema("cat".into(), ns.clone(), now).await;
+        let want = vec![
+            ("*".to_string(), vec![], strings(&["pii"])),
+            ("*".to_string(), vec![], strings(&["pii", "eu"])),
+        ];
+        assert_eq!(table_calls(&rec), want, "never a delete, never a shrink");
+        assert_eq!(o.projected.schema_held("cat|ns"), strings(&["pii", "eu"]));
+    }
+
+    #[tokio::test]
+    async fn a_stale_schema_subset_does_not_shrink() {
+        let (rec, o) = setup();
+        let ns = NamespaceIdent::new("ns".into());
+        o.projected
+            .record_schema("cat|ns".into(), strings(&["pii", "eu"]));
+        assert!(o.schema_change("cat", &ns, &schema(&["pii"])).is_none());
+        assert!(o.schema_change("cat", &ns, &schema(&[])).is_none());
+        o.converge_schema("cat".into(), ns, strings(&["pii"])).await;
+        assert!(table_calls(&rec).is_empty());
+        assert_eq!(o.projected.schema_held("cat|ns"), strings(&["pii", "eu"]));
+    }
+
+    #[tokio::test]
+    async fn not_inherited_projects_no_schema_tags() {
+        let (_, o) = setup();
+        let ns = NamespaceIdent::new("ns".into());
+        assert!(o
+            .schema_change("cat", &ns, &SchemaTagState::NotInherited)
+            .is_none());
+    }
+
+    /// #935, fail closed: the schema cannot be read, so the schema-wide
+    /// resource keeps what was projected, while the table's column and
+    /// table-level tags still project.
+    #[tokio::test]
+    async fn an_unreadable_schema_keeps_its_projection_and_the_table_still_projects() {
+        let (rec, o) = setup();
+        let ns = NamespaceIdent::new("ns".into());
+        o.projected
+            .record_schema("cat|ns".into(), strings(&["pii"]));
+        assert!(o
+            .schema_change("cat", &ns, &SchemaTagState::Unknown)
+            .is_none());
+        assert_eq!(o.projected.schema_held("cat|ns"), strings(&["pii"]));
+
+        o.converge(with_table_tags(
+            obs("m1", 1, &[("ssn", "PII")]),
+            Some(&["gold"]),
+        ))
+        .await;
+        assert_eq!(calls(&rec).len(), 1, "the column tag projects");
+        let want = vec![("t".to_string(), vec![], strings(&["gold"]))];
+        assert_eq!(
+            table_calls(&rec),
+            want,
+            "the table tag projects, the schema is untouched"
+        );
+    }
+
     #[tokio::test]
     async fn table_tags_are_projected_on_the_table_level_resource() {
         let (rec, o) = setup();
@@ -439,10 +640,9 @@ mod tests {
         ))
         .await;
         let last = table_calls(&rec).pop().unwrap();
-        assert_eq!(
-            last.1,
-            vec!["pii".to_string()],
-            "previous is what Ranger holds"
+        assert!(
+            last.1.is_empty(),
+            "a non-empty list is one replace, no delete"
         );
         assert_eq!(last.2, vec!["pii".to_string(), "gold".to_string()]);
     }
