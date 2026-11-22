@@ -498,6 +498,62 @@ async fn catalog_scope_modes_union_verifies_without_narrowing_and_off_ignores() 
     }
 }
 
+/// A JWKS that cannot be fetched refuses a well-signed scope in `union` as
+/// in `binding` (#295): verification fails closed, and the refusal is
+/// audited, whether or not the mode narrows.
+#[tokio::test(flavor = "multi_thread")]
+async fn catalog_scope_unreachable_jwks_refuses_in_union_and_binding() {
+    use sqe_coordinator::catalog_scope_gate::{attach, mode};
+    use sqe_core::config::CatalogScopeMode;
+    crate::common::init_tracing();
+
+    // A loopback port nothing listens on any more.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("bind a free port")
+        .port();
+    let jwks_url = format!("https://127.0.0.1:{port}/jwks");
+
+    for (wanted, mode_key) in [
+        (CatalogScopeMode::Union, "union"),
+        (CatalogScopeMode::Binding, "binding"),
+    ] {
+        let _lock = GateGuard {
+            _lock: GATE_LOCK.lock().await,
+        };
+        let config: CatalogScopeConfig = toml::from_str(&format!(
+            "client_id = \"{SCOPED_CLIENT}\"\nissuer = \"{ISSUER}\"\njwks_url = \"{jwks_url}\"\n\
+             accept_invalid_certs = true\nmode = \"{mode_key}\""
+        ))
+        .expect("scope config parses");
+        let audit_dir = tempfile::tempdir().expect("tempdir");
+        let audit_path = audit_dir.path().join("audit.jsonl");
+        let audit = Arc::new(
+            sqe_metrics::audit::AuditLogger::new(audit_path.to_str().unwrap())
+                .expect("audit logger opens"),
+        );
+        sqe_coordinator::catalog_scope_gate::install(Some(&config), Some(Arc::clone(&audit)))
+            .expect("the gate installs without fetching the JWKS");
+        assert_eq!(mode(), wanted);
+
+        let jti = fresh_jti(&format!("jwks-down-{mode_key}"));
+        let session = bound(offline_session(), Some(SCOPED_CLIENT), &jti);
+        let scope = scope_for(&jti, json!({ "alpha": "read_only" }));
+        let err = attach(session, Some(&scope), None)
+            .await
+            .expect_err("an unverifiable scope is refused");
+        assert!(!err.to_string().is_empty(), "{mode_key}: {err}");
+
+        audit.flush();
+        let refusals = std::fs::read_to_string(&audit_path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains("CATALOG_SCOPE_REFUSED"))
+            .count();
+        assert_eq!(refusals, 1, "{mode_key}: the refusal is audited");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Live stack: acceptance 2 and 3
 // ---------------------------------------------------------------------------
