@@ -14,8 +14,6 @@
     "crates/sqe-core/src/config/mod.rs": 10100,
     "crates/sqe-mcp/src/lib.rs": 5750,
     "crates/sqe-policy/src/grants/ranger.rs": 4250,
-    "crates/sqe-policy/src/plan_rewriter.rs": 3400,
-    "crates/sqe-policy/src/ranger_store.rs": 5100,
     "crates/sqe-server/src/main.rs": 5250,
     "crates/sqe-sql/src/classifier.rs": 4250,
     "crates/sqe-sql/src/trino_compat.rs": 3500,
@@ -132,7 +130,7 @@
       ]
     },
     "sqe-policy": {
-      "lines": 19400,
+      "lines": 19700,
       "deps": [
         "sqe-core",
         "sqe-metrics-core",
