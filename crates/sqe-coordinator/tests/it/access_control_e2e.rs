@@ -21,6 +21,7 @@
 
 use arrow_array::RecordBatch;
 use sqe_coordinator::QueryHandler;
+use sqe_core::config::MaskPrecedence;
 use sqe_core::Session;
 
 use crate::common::ranger_fixture::{
@@ -3089,6 +3090,10 @@ async fn remaining_mask_types_apply_live() {
 /// suite exists to catch. `resource` still selects the old behaviour and is
 /// covered in-process by `contested_column_uses_the_resource_mask_when_configured`
 /// in `sqe-policy`, which does not need a live stack to be conclusive.
+///
+/// The suite can run under any precedence (`SQE_POLICY__MASK_PRECEDENCE`):
+/// under `resource` bob sees the `xxx-xx-` values, under `refuse` his read is
+/// refused, and the tag assertions below run under `tag` only.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn tag_mask_beats_resource_mask_live() {
@@ -3119,6 +3124,19 @@ async fn tag_mask_beats_resource_mask_live() {
     // the tag mask's fingerprint here and `xxx-xx-` is the resource mask's. The
     // two cannot be confused, which is what makes the assertion meaningful.
     let sql = format!("SELECT id, ssn FROM {ORDERS} ORDER BY id");
+    // `ctx.handler` runs the suite's precedence; the two other modes are
+    // asserted here too, so the case holds whichever the suite runs under.
+    match suite_precedence() {
+        MaskPrecedence::Tag => {}
+        MaskPrecedence::Resource => {
+            bob_sees(&ctx, "ssn", &SSN_MASKED).await;
+            return;
+        }
+        MaskPrecedence::Refuse => {
+            read_refused(&ctx.handler, &ctx.bob, &sql).await;
+            return;
+        }
+    }
     let bob = crate::common::eventually("the tag mask to win over the resource mask", || async {
         match ctx.handler.execute(&ctx.bob, &sql, None).await {
             Ok(b) if col_strings(&b, "ssn").iter().all(|v| v == "NULL") => Ok(b),
@@ -3148,14 +3166,36 @@ async fn tag_mask_beats_resource_mask_live() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A second handler on the same cache, differing only in `mask_precedence`.
-async fn refuse_handler(ctx: &AcCtx) -> QueryHandler {
-    use sqe_core::config::MaskPrecedence;
+async fn precedence_handler(ctx: &AcCtx, precedence: MaskPrecedence) -> QueryHandler {
     let (handler, _) =
         crate::common::setup_ranger_handler_sharing(Some(ctx.cache.clone()), |cfg| {
-            cfg.policy.mask_precedence = MaskPrecedence::Refuse;
+            cfg.policy.mask_precedence = precedence;
         })
         .await;
     handler
+}
+
+async fn refuse_handler(ctx: &AcCtx) -> QueryHandler {
+    precedence_handler(ctx, MaskPrecedence::Refuse).await
+}
+
+/// The precedence `ctx.handler` runs under: the suite config's
+/// `[policy] mask_precedence`, or `SQE_POLICY__MASK_PRECEDENCE` over it.
+fn suite_precedence() -> MaskPrecedence {
+    let path = crate::common::ranger_config_path();
+    let config = sqe_core::SqeConfig::load(&path).expect("load the suite config");
+    config.policy.mask_precedence
+}
+
+/// Wait until `handler` refuses the read `sql` for `s`.
+async fn read_refused(handler: &QueryHandler, s: &Session, sql: &str) {
+    crate::common::eventually(&format!("the read to be refused: {sql}"), || async {
+        match handler.execute(s, sql, None).await {
+            Err(_) => Ok(()),
+            Ok(b) => Err(format!("read went through: {:?}", col_strings(&b, "ssn"))),
+        }
+    })
+    .await;
 }
 
 /// Wait until `handler` refuses `sql` as a tag conflict; returns the message.
@@ -3244,17 +3284,13 @@ async fn refuse_at_write_mask_conflict() {
     exec_ok(&ctx, &ctx.carol, &unset).await;
 
     // `tag` mode writes the conflicting tag, and the refuse read then fails:
-    // the write check refused a conflict that is real.
-    exec_ok(&ctx, &ctx.carol, &set).await;
-    bob_sees(&ctx, "ssn", &["NULL", "NULL", "NULL"]).await;
+    // the write check refused a conflict that is real. An explicit `tag`
+    // handler, not `ctx.handler`, which runs the suite's precedence.
+    let tag = precedence_handler(&ctx, MaskPrecedence::Tag).await;
+    exec_ok_on(&tag, &ctx.carol, &set).await;
+    sees_on(&tag, &ctx.bob, "ssn", &["NULL", "NULL", "NULL"]).await;
     let read = format!("SELECT ssn FROM {ORDERS}");
-    crate::common::eventually("the refuse read to fail on the conflict", || async {
-        match refuse.execute(&ctx.bob, &read, None).await {
-            Err(_) => Ok(()),
-            Ok(b) => Err(format!("read went through: {:?}", col_strings(&b, "ssn"))),
-        }
-    })
-    .await;
+    read_refused(&refuse, &ctx.bob, &read).await;
 
     // Removing the conflicting tag is never checked.
     refuse
@@ -3371,7 +3407,6 @@ async fn refuse_at_write_row_filter_conflict() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn refuse_at_write_catalog_scoped_tag_policy() {
-    use sqe_core::config::MaskPrecedence;
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
     let ctx = ac_setup().await;
@@ -6033,9 +6068,15 @@ async fn tag_authority_cleanup(ctx: &AcCtx, rig: &TagAuthorityRig, deny_policies
 /// bob (engineer) reads `column` and sees these values, waiting for the
 /// policy and metadata caches.
 async fn bob_sees(ctx: &AcCtx, column: &str, want: &[&str]) {
+    sees_on(&ctx.handler, &ctx.bob, column, want).await;
+}
+
+/// `s` reads `column` through `handler` and sees these values.
+async fn sees_on(handler: &QueryHandler, s: &Session, column: &str, want: &[&str]) {
     let sql = format!("SELECT {column} FROM {ORDERS} ORDER BY id");
-    crate::common::eventually(&format!("bob to see {column} = {want:?}"), || async {
-        match ctx.handler.execute(&ctx.bob, &sql, None).await {
+    let who = &s.user.username;
+    crate::common::eventually(&format!("{who} to see {column} = {want:?}"), || async {
+        match handler.execute(s, &sql, None).await {
             Ok(b) if col_strings(&b, column) == want => Ok(()),
             Ok(b) => Err(format!("got {:?}", col_strings(&b, column))),
             Err(e) => Err(format!("query failed: {e}")),
