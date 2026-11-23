@@ -2544,6 +2544,9 @@ pub struct PolicyConfig {
 /// and stops at the first mask it finds, so "same policy, same answer in every
 /// engine" argues for `Tag`. Either choice masks the column; only the rendering
 /// differs, which is why this is configurable rather than fixed.
+///
+/// Under every precedence, several tag masks on one column join to the most
+/// restrictive one, and tag masks that cannot be joined are a conflict.
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum MaskPrecedence {

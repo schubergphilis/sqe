@@ -1,0 +1,5 @@
+### Fixed
+
+- Several tag masks on one column now join to the most restrictive one under `mask_precedence = "tag"` and `"resource"`, instead of the first tag in stored order winning (#942)
+
+    A steward holding only `apply_tag` could add a second tag with a weaker mask that sorted first and loosen the column. The masks of all the column's tags are now joined, whatever the tag order: `MASK_NULL` beats every other mask, a redaction beats the rest, and partial masks join to one that shows the fewest characters at each end and hides the character class unless they all agree (Ranger `MASK` plus `MASK_SHOW_LAST_4` shows nothing). Masks that cannot be joined (a hash next to a partial mask, two different CUSTOM masks) are a mask conflict: the column is restricted and reads fail with `mask conflict on <table>.<column>`. Columns that already carry two such tag masks therefore refuse reads after upgrade under `tag` and `resource` precedence until one tag is removed. The tag write that would create the conflict is refused. Resource-versus-tag resolution under `tag` precedence is unchanged: the tags' winning mask replaces the resource mask.
