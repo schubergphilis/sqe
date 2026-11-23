@@ -128,7 +128,7 @@ pub async fn resolve_bearer_tracked(
 ) -> sqe_core::Result<ResolvedBearer> {
     let bearer = match auth {
         CatalogAuthConfig::SessionBearer => session_bearer.to_string(),
-        CatalogAuthConfig::Static { token } => token.clone(),
+        CatalogAuthConfig::Static { token } => token.expose().to_string(),
         CatalogAuthConfig::Anonymous => String::new(),
         CatalogAuthConfig::Aws { .. } => {
             // AWS auth is handled by the SDK provider chain at the
@@ -233,6 +233,29 @@ mod tests {
         assert_eq!(resolved, "configured");
     }
 
+    /// `{:?}` on a catalog's auth (and so on `CatalogConfig` and `SqeConfig`)
+    /// never prints the configured token or client secret.
+    #[test]
+    fn debug_output_redacts_token_and_client_secret() {
+        let static_auth = CatalogAuthConfig::Static {
+            token: "tok-sentinel-1".into(),
+        };
+        let cc: CatalogAuthConfig = toml::from_str(
+            r#"
+type = "client_credentials"
+token_endpoint = "https://idp/token"
+client_id = "engine"
+client_secret = "sec-sentinel-2"
+"#,
+        )
+        .expect("deserialize");
+        for (auth, secret) in [(static_auth, "tok-sentinel-1"), (cc, "sec-sentinel-2")] {
+            let shown = format!("{auth:?} {auth:#?}");
+            assert!(!shown.contains(secret), "{shown}");
+            assert!(shown.contains("<set>"), "{shown}");
+        }
+    }
+
     #[tokio::test]
     async fn anonymous_returns_empty() {
         let auth = CatalogAuthConfig::Anonymous;
@@ -303,7 +326,7 @@ scope = "PRINCIPAL_ROLE:READ"
             } => {
                 assert_eq!(token_endpoint, "https://example.com/oauth/tokens");
                 assert_eq!(client_id, "id");
-                assert_eq!(client_secret, "secret");
+                assert_eq!(client_secret.expose(), "secret");
                 assert_eq!(scope.as_deref(), Some("PRINCIPAL_ROLE:READ"));
             }
             other => panic!("wrong variant: {other:?}"),

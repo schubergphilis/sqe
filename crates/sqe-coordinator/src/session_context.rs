@@ -1575,7 +1575,7 @@ s3_path_style = true
         config.catalog.auth = Some(sqe_core::config::CatalogAuthConfig::SessionBearer);
         assert!(discovery_template(&config).is_some());
         config.catalog.auth = Some(sqe_core::config::CatalogAuthConfig::Static {
-            token: "engine-token".to_string(),
+            token: "engine-token".into(),
         });
         assert!(discovery_template(&config).is_none());
     }
@@ -1768,7 +1768,7 @@ allowed_object_store_prefixes = ["s3://shared-landing/"]
         cat.auth = Some(sqe_core::config::CatalogAuthConfig::SessionBearer);
         assert!(catalog_auth_is_per_user(&cat));
         cat.auth = Some(sqe_core::config::CatalogAuthConfig::Static {
-            token: "engine-token".to_string(),
+            token: "engine-token".into(),
         });
         assert!(!catalog_auth_is_per_user(&cat));
     }

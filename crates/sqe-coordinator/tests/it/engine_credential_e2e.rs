@@ -27,7 +27,7 @@ fn engine_config() -> sqe_core::SqeConfig {
     config.catalog.credentials = Some(CatalogAuthConfig::ClientCredentials {
         token_endpoint: config.auth.token_endpoint.clone(),
         client_id: config.auth.client_id.clone(),
-        client_secret: config.auth.client_secret.expose().to_string(),
+        client_secret: config.auth.client_secret.clone(),
         client_secret_file: None,
         scope: None,
     });
@@ -297,7 +297,7 @@ async fn engine_credential_read_gate_and_writes() {
     let rot_auth = CatalogAuthConfig::ClientCredentials {
         token_endpoint: rot_config.auth.token_endpoint.clone(),
         client_id: rot_id,
-        client_secret: String::new(),
+        client_secret: "".into(),
         client_secret_file: Some(secret_file.to_string_lossy().into_owned()),
         scope: None,
     };

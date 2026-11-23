@@ -455,9 +455,7 @@ mod tests {
         polaris.backend = CatalogBackend::Rest;
         polaris.auth = None;
         let mut static_rest = polaris.clone();
-        static_rest.auth = Some(CatalogAuthConfig::Static {
-            token: "t".to_string(),
-        });
+        static_rest.auth = Some(CatalogAuthConfig::Static { token: "t".into() });
         let mut glue = polaris.clone();
         glue.backend = CatalogBackend::Glue {
             region: "eu-central-1".to_string(),
