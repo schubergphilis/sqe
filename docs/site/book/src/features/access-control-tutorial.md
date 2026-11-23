@@ -329,6 +329,15 @@ nothing. Deny items win over allow items, and wildcard and exclude resources wor
 they do for reads. A refusal starts with `403 Forbidden` and is recorded in the
 audit log like any other failed statement.
 
+Before any of that, the user must be able to use the schema, as Unity Catalog asks
+for `USE SCHEMA` before `APPLY TAG`. The `hive` servicedef has no `use` type, so SQE
+counts a `select` (or `all`) allow on any table of the schema. A `select` deny on the
+whole schema refuses the tag write whatever else is allowed; a deny on one table or
+column does not. A steward holding only `apply_tag` is refused with
+`requires select (USE) on schema <ns>`. With `[policy.ranger] catalog-scoped = true`
+the schema key is `<catalog>.<ns>`, so this is the catalog check too; without it,
+Polaris decides the catalog when the write loads the table on the user's token.
+
 ```sql
 -- as dave, no admin role, holding alter on the ssn column only:
 ALTER TABLE sales_wh.acdemo.orders SET TAGS (ssn = ('PII'));

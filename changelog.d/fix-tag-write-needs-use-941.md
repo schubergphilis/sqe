@@ -1,0 +1,5 @@
+### Security
+
+- A tag write under `tag_authority = "ranger-delegate"` needs USE on the schema first (#941)
+
+    Before the tag privilege is checked, a non-admin writing column, table or schema tags (`SET / UNSET TAGS`, `SET / UNSET MASKING POLICY`, a `sqe.column-tags` write through `SET TBLPROPERTIES` or `CREATE ... TBLPROPERTIES`, `ALTER TABLE | SCHEMA ... SET TAGS`) must hold a Ranger `select` (or `all`) allow on some table of that schema, with no `select` deny on the whole schema. `apply_tag`, `remove_tag` or `alter` alone no longer suffice, and a Ranger error refuses. A raw `sqe.column-tags` write asks again under the table's commit lock, so a `select` deny added after the check still refuses. With `[policy.ranger] catalog-scoped = true` the schema key carries the catalog, so the check covers it; otherwise Polaris decides the catalog when the write loads the table. Catalog tags and `admin-role` are unchanged, and admins pass. Upgrade note: a steward granted only `apply_tag` (or `alter`) with no `select` in the schema is now refused with `requires select (USE) on schema <ns>`; grant them `select` on a table there.

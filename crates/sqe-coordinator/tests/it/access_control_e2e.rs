@@ -6569,6 +6569,83 @@ async fn tag_authority_apply_tag_is_a_grant_of_its_own() {
     tag_authority_cleanup(&ctx, &rig, &[]).await;
 }
 
+/// #941: a tag write needs USE on the schema first. dave holds `apply_tag` on
+/// ssn and tags it; a `select` deny on every table of schema `ac` takes his USE
+/// away, and the same statement is refused before the tag privilege is asked,
+/// writing nothing. Dropping the deny gives it back.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn tag_authority_needs_use_on_the_schema() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+    let rig = tag_authority_rig_with(&ctx, false, sqe_core::config::TagPrivilege::ApplyTag).await;
+    let allow = format!("{PREFIX}use-apply-tag-dave-ssn");
+    ctx.ranger
+        .create_policy(apply_tag_allow_policy(&allow, "ssn"))
+        .await
+        .expect("create apply_tag on ssn");
+
+    let set = format!("ALTER TABLE {ORDERS} SET TAGS (ssn = ('PII'))");
+    let unset = format!("ALTER TABLE {ORDERS} UNSET TAGS (ssn)");
+    let dave_runs = |sql: String| {
+        let (rig, ctx) = (&rig, &ctx);
+        async move {
+            rig.handler
+                .execute(&ctx.dave, &sql, None)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+    };
+
+    // Control: with USE (the fixture's `select`) apply_tag is enough.
+    crate::common::eventually("dave to tag ssn with USE", || dave_runs(set.clone())).await;
+    bob_sees(&ctx, "ssn", &SSN_MASKED).await;
+    crate::common::eventually("dave to untag ssn with USE", || dave_runs(unset.clone())).await;
+    bob_sees(&ctx, "ssn", &SSN_RAW).await;
+
+    // A `select` deny on the whole schema: no USE, so apply_tag alone is refused.
+    let deny = format!("{PREFIX}use-deny-dave-ac");
+    let mut deny_policy =
+        tag_authority_deny_policy(&deny, "ac", "*", serde_json::json!({"values": ["*"]}));
+    deny_policy["denyPolicyItems"][0]["accesses"] =
+        serde_json::json!([{"type": "select", "isAllowed": true}]);
+    ctx.ranger
+        .create_policy(deny_policy)
+        .await
+        .expect("create select deny on schema ac");
+    crate::common::eventually("dave refused without USE", || async {
+        match dave_runs(set.clone()).await {
+            Ok(()) => {
+                // Tagged before the deny reached the cache: undo, try again.
+                let _ = dave_runs(unset.clone()).await;
+                Err("tag write passed without USE".to_string())
+            }
+            Err(e) if e.contains("requires select (USE) on schema ac") => {
+                assert!(e.contains("403 Forbidden"), "{e}");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    bob_sees(&ctx, "ssn", &SSN_RAW).await;
+
+    // Dropping the deny gives USE back.
+    let _ = ctx.ranger.delete_policy(HIVE_SERVICE, &deny).await;
+    crate::common::eventually("dave to tag ssn once USE is back", || {
+        dave_runs(set.clone())
+    })
+    .await;
+    bob_sees(&ctx, "ssn", &SSN_MASKED).await;
+
+    let _ = ctx.ranger.delete_policy(HIVE_SERVICE, &allow).await;
+    tag_authority_cleanup(&ctx, &rig, &[&deny]).await;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // #927: untagging needs a stronger right than tagging (`tag_removal`)
 // ─────────────────────────────────────────────────────────────────────────────

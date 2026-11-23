@@ -355,7 +355,9 @@ engine = "passthrough"
 # policies before switching.
 # Under "ranger-delegate" this covers every write of sqe.column-tags: the tag
 # statements, SET TBLPROPERTIES and CREATE [OR REPLACE] TABLE ... TBLPROPERTIES
-# (checked on the columns whose tags change).
+# (checked on the columns whose tags change). A non-admin also needs USE on
+# the schema first: a Ranger `select` allow on some table in it, with no
+# schema-wide `select` deny (#941).
 # tag_authority = "admin-role"
 # The Ranger access type a column tag write needs under "ranger-delegate":
 # "alter" (default) or "apply_tag", a grant of its own that alter, write and

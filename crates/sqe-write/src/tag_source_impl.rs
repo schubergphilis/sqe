@@ -43,7 +43,7 @@ use sqe_catalog::schema_tags::SchemaTagState;
 use sqe_catalog::TableMetadataCache;
 use sqe_core::column_tags::{self, ColumnTag, ColumnTagMap};
 use sqe_core::object_tags;
-use sqe_policy::TagSource;
+use sqe_policy::{PolicyStore, TagSource};
 use sqe_sql::tags::{ColumnTagOp, TagAction};
 
 /// Iceberg table property key holding the column->tag-label JSON map.
@@ -455,11 +455,15 @@ pub fn removed_tag_columns(
 /// What a non-admin's raw `sqe.column-tags` write was authorised for: the
 /// columns it may change, and the subset it may remove a tag key from. The
 /// write re-diffs under the table lock and refuses anything outside them.
-#[derive(Debug, Clone, Default)]
+/// `schema_use` is asked again there too (#941): a later `select` deny refuses.
+#[derive(Clone, Default)]
 pub struct TagWriteAuth {
     pub changed: std::collections::BTreeSet<String>,
     pub removed: std::collections::BTreeSet<String>,
+    pub schema_use: Option<SchemaUse>,
 }
+/// The store, the writer, the schema's policy key.
+pub type SchemaUse = (Arc<dyn PolicyStore>, sqe_core::SessionUser, String);
 
 /// Apply column-tag operations to the current tag map (merge semantics).
 /// `Set` unions tags (dedup by key, stable order) and sets each named tag's

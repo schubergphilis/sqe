@@ -26,3 +26,10 @@
 
 - [x] 5.1 Book access-control page: the raw property routes, `tag_privilege`, the servicedef step
 - [x] 5.2 Changelog fragment, status doc
+
+## 6. USE before a tag write (#941)
+
+- [x] 6.1 `PolicyStore::grants_schema_use` (default false); Ranger: `select` reaching a table of the schema, schema-wide deny wins, no last-component allow; in-memory store
+- [x] 6.2 Gate: checked first on column tag statements, raw `sqe.column-tags` writes, table and schema object tags; store error refuses
+- [x] 6.3 Tests: Ranger unit (deny over allow, other schema, apply_tag alone, unscoped path); coordinator (every route, store error, catalog_scoped key, admin, admin-role)
+- [x] 6.4 Live Ranger run (`make test-access-control`) with a steward lacking `select` (`tag_authority_needs_use_on_the_schema`: `apply_tag` on ssn, a `select` deny on schema `ac`)

@@ -47,4 +47,4 @@ Operators switching to `apply_tag` must add the access type to their `hive` serv
 ## Not in this change
 
 - Refusing a tag that no tag policy defines (request item 3). A follow-up.
-- A `select` / `USE` check on the catalog and schema before a tag write. Polaris already refuses a user who cannot load the table, which the write needs.
+- A `select` / `USE` check on the catalog and schema before a tag write. Done later as #941: see the requirement "A tag write needs USE on the schema first" in `specs/tag-authority/spec.md`.

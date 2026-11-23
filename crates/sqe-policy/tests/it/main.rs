@@ -6,6 +6,7 @@ mod guard_ab;
 mod identifier_case_policy;
 mod policy_fingerprint;
 mod ranger_grants_wiremock;
+mod ranger_privilege_bundles;
 mod ranger_store_wiremock;
 mod rewriter_integration;
 mod rewriter_shapes;
