@@ -994,10 +994,18 @@ async fn use_and_session_statements_echo_headers() {
     let pages = h.follow("show-session-page", &posted).await;
     assert_eq!(pages.last().expect("page").state(), "FINISHED");
     let rows = all_rows(&pages);
-    assert_eq!(rows.len(), 1, "SHOW SESSION lists exactly the allow-list");
-    assert_eq!(rows[0][0], json!("iceberg.compression_codec"));
+    let names: Vec<_> = rows.iter().map(|r| r[0].clone()).collect();
+    assert_eq!(
+        names,
+        vec![
+            json!("iceberg.compression_codec"),
+            json!("iceberg.write_branch")
+        ],
+        "SHOW SESSION lists exactly the allow-list"
+    );
     assert_eq!(rows[0][1], json!("ZSTD"), "replayed value is in effect");
     assert_eq!(rows[0][3], json!("varchar"));
+    assert_eq!(rows[1][1], json!(null), "write_branch is unset");
 
     let req = h.post_as("alice", "RESET SESSION iceberg.compression_codec");
     let reset = h.step("reset-session", req).await;
