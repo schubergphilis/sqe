@@ -1842,7 +1842,7 @@ pub enum CatalogAuthConfig {
     /// A pre-issued static bearer token. Read from a separate
     /// secrets file or env override at deploy time. Useful for
     /// internal gateways and integration tests.
-    Static { token: String },
+    Static { token: SecretString },
     /// No `Authorization` header at all. Used for public Nessie
     /// read-only access and other anonymous endpoints.
     Anonymous,
@@ -1856,7 +1856,7 @@ pub enum CatalogAuthConfig {
         token_endpoint: String,
         client_id: String,
         #[serde(default)]
-        client_secret: String,
+        client_secret: SecretString,
         /// File holding the secret, read on every token resolve, so a
         /// rotated file takes effect without a restart (#937).
         #[serde(default)]
@@ -7404,7 +7404,7 @@ s3_secret_key = "configured-secret"
         config.auth.providers = vec![AuthProviderConfig::ClientCredentials {
             token_endpoint: "https://idp/token".to_string(),
             client_id: "svc".to_string(),
-            client_secret: "secret".to_string(),
+            client_secret: "secret".into(),
         }];
         config.security.allow_shared_service_identity = true;
         assert!(config.validate_production().is_ok());
@@ -7418,7 +7418,7 @@ s3_secret_key = "configured-secret"
         config.catalog.auth = Some(CatalogAuthConfig::ClientCredentials {
             token_endpoint: "https://idp/token".to_string(),
             client_id: "svc".to_string(),
-            client_secret: "secret".to_string(),
+            client_secret: "secret".into(),
             scope: None,
             client_secret_file: None,
         });
@@ -7997,7 +7997,7 @@ type = "aws"
             }) => {
                 assert_eq!(token_endpoint, "https://partner.com/oauth/tokens");
                 assert_eq!(client_id, "sqe-partner");
-                assert_eq!(client_secret, "secret-from-env");
+                assert_eq!(client_secret.expose(), "secret-from-env");
                 assert!(scope.is_none(), "scope is optional, defaults to None");
             }
             other => panic!("partner_polaris auth wrong variant: {other:?}"),

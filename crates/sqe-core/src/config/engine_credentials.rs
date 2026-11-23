@@ -26,7 +26,7 @@ impl CatalogAuthConfig {
             None if client_secret.is_empty() => {
                 Err("client_credentials needs client_secret or client_secret_file".to_string())
             }
-            None => Ok(Some(client_secret.clone())),
+            None => Ok(Some(client_secret.expose().to_string())),
             Some(_) if !client_secret.is_empty() => {
                 Err("set either client_secret or client_secret_file, not both".to_string())
             }
@@ -174,7 +174,7 @@ mod tests {
         CatalogAuthConfig::ClientCredentials {
             token_endpoint: "http://idp/token".into(),
             client_id: "sqe-engine".into(),
-            client_secret: String::new(),
+            client_secret: "".into(),
             client_secret_file: Some(path.to_string()),
             scope: None,
         }
@@ -225,7 +225,7 @@ mod tests {
         lake.credentials = Some(CatalogAuthConfig::ClientCredentials {
             token_endpoint: "http://idp/token".into(),
             client_id: "sqe-engine".into(),
-            client_secret: String::new(),
+            client_secret: "".into(),
             client_secret_file: None,
             scope: None,
         });
