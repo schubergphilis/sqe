@@ -2,7 +2,8 @@
 # Routine MRs never build release binaries/images. Opt in with SQE_FORCE_IMAGE_BUILD=1.
 # Tests, dependency gates and SAST remain blocking on the MR.
 #
-# Main runs no test or lint jobs: the MR pipeline already ran them on the same
+# Main runs one test job, the Trino wire goldens (sqe-trino-compat-wire), and
+# no other test or lint jobs: the MR pipeline already ran them on the same
 # tree, and repeating them after every merge (test suite, clippy matrix, catalog
 # live tests: ~1 h of runner CPU, every merge cancelling the last) starved the
 # shared runner. Main keeps the security/supply-chain guardrails (.pre), the
@@ -556,6 +557,27 @@ catalog-live-tests:
         - ".gitlab-ci.yml"
         - "docker-compose.nessie.yml"
         - "docker-compose.hms.yml"
+
+# The one test job main runs (owner decision, 23 Nov 2026). The Trino wire
+# goldens (crates/sqe-trino-compat/tests/wire.rs) are the protocol contract.
+# deda8f7d5 broke them on main and main showed nothing; the next MRs' Rust
+# test jobs failed instead, on changes that had nothing to do with it. Only this
+# test binary, on the warm deps image, so main stays far from the ~1 h the full
+# suite cost. The MR arm runs it when this file changes, to prove the job.
+sqe-trino-compat-wire:
+  extends: aikido-rust-extra
+  script:
+    - cargo test -p sqe-trino-compat --test wire
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+      changes: *sqe_rust_changes
+      allow_failure: false
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - ".gitlab-ci.yml"
+      allow_failure: false
 
 vendored-profile-drift:
   stage: test
