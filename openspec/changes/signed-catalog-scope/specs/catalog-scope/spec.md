@@ -2,7 +2,7 @@
 
 ### Requirement: Sessions of the configured client require a valid scope
 When `[session.catalog_scope]` is configured, the system SHALL refuse a session whose bearer token has `azp` equal to `client_id` unless it presents a catalog scope that meets all of these conditions:
-- it is signed by a key of the configured issuer, and its `iss` equals that issuer;
+- it is signed by a key of the configured issuer, and its `iss` is one string equal to that issuer (a trailing `/` in the configured value is ignored);
 - its JOSE `typ` is the configured `token_type`, the generic `JWT`, or absent;
 - its `sub` and `jti` equal the bearer's;
 - it has not expired.
@@ -26,6 +26,18 @@ The refusal SHALL carry a reason and SHALL be audited with the catalog names onl
 #### Scenario: Producer claims beyond the minimum
 - **WHEN** a valid scope also carries `iat` and a `typ` equal to the configured `token_type`
 - **THEN** it is accepted
+
+#### Scenario: Optional claims absent
+- **WHEN** a valid scope carries no `iat`, `nbf`, `aud` or `typ`
+- **THEN** it is accepted
+
+#### Scenario: Bad issuer
+- **WHEN** the scope's `iss` is missing, another string, or not a string (for example an array that contains the issuer)
+- **THEN** the session is refused
+
+#### Scenario: Type JWT configured
+- **WHEN** `token_type` is `JWT` (any case, with or without `application/`)
+- **THEN** SQE refuses to start
 
 #### Scenario: Other clients unaffected
 - **WHEN** a token of another client opens a session without a scope
