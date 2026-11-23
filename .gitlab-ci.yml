@@ -574,6 +574,11 @@ sqe-trino-compat-wire:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
       changes: *sqe_rust_changes
       allow_failure: false
+    # A CI-only merge also runs it on main, so a rule change proves itself there.
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+      changes:
+        - ".gitlab-ci.yml"
+      allow_failure: false
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes:
         - ".gitlab-ci.yml"
